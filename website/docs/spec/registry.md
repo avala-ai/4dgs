@@ -124,19 +124,38 @@ spec §7.
 
 ## Visibility profiles
 
-Declared with the `visibility_profile` metadata key. A statement of producer intent — no wire
-fields, no decoding difference, because each of these is the existing arithmetic. See spec §3.1.
+Declared with the `visibility_profile` metadata key. A statement of producer intent — no wire fields
+and no decoding difference, because each of these is the existing arithmetic. See spec §3.1.
 
-| value      | status                          | notes                                                                                                                                                                  |
-| ---------- | ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `gaussian` | representable                   | The usual soft temporal fade: opacity follows the marginal, which is a bell over `mu_t` with width `sigma_t`                                                           |
-| `box`      | representable                   | Full opacity across the whole validity window and absent outside it, with no fade at all. Expressed by the never-fades flag plus the window                            |
-| `flat-top` | **reserved, not representable** | A plateau at full opacity over a core interval with smooth shoulders either side. Distinct from `box`, whose edges are hard, and from `gaussian`, which has no plateau |
+| value      | notes                                                                                                                                                                |
+| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gaussian` | The usual soft temporal fade: opacity follows the marginal, a bell centred on `mu_t` with width `sigma_t`                                                            |
+| `flat-top` | Full opacity across a core interval rather than peaking at a single instant. Recent literature describes this shape with smooth shoulders either side of the plateau |
 
-`flat-top` is reserved rather than defined because the version-1 wire model **cannot express it**: a
-gaussian has one width and no plateau, so a profile that is flat in the middle and smooth at the
-edges needs a temporal shape the format does not carry. Naming it here keeps the term from being
-applied loosely to `box`, which is a different curve and the one this format actually has.
+Both are reached with the fields that already exist. `gaussian` is the marginal as written.
+`flat-top` is reached by making the marginal saturate across the window — a gaussian wide enough
+that its value stays at the ceiling for the whole validity window, with the window's own edges
+bounding it.
+
+One precision worth stating, because it decides whether a producer can round-trip its intent: the
+plateau is exact, and the **shoulders are not**. A single gaussian has one width and no plateau, so
+the version-1 wire model reaches the flat top by saturation and ends it at the window edge, which is
+abrupt. A producer that needs a specific shoulder falloff cannot express it in one gaussian today,
+and should either accept the window edge or split the gaussian into several records.
+
+## Colour spaces
+
+Declared with the `color_space` metadata key. The format stores colour as linear values in [0, 1]
+and does not transform them; this key states what those values mean.
+
+| value                   | notes                                                           |
+| ----------------------- | --------------------------------------------------------------- |
+| `srgb-rec709-display`   | Non-linear sRGB display-referred values with Rec. 709 primaries |
+| `linear-rec709-display` | Linear display-referred values with Rec. 709 primaries          |
+
+A file that declares neither leaves the interpretation to the consumer, which in practice means
+display-referred sRGB. Producers SHOULD declare it: the same numbers mean visibly different things
+under the two, and a consumer cannot tell them apart by inspection.
 
 ## Camera interpolation
 

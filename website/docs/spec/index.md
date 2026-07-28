@@ -74,15 +74,18 @@ them bleeding into each other's intervals.
 
 ### 3.1 Visibility profiles
 
-The temporal fields describe a soft fade, but the model also expresses a **hard** one. A gaussian
-flagged as never-fading has a marginal of 1 across its whole validity window and is absent outside
-it: full opacity, hard edges, no fade. That is a genuinely different visibility curve from the usual
-bell, reached with the fields that already exist and no extra machinery.
+The temporal fields describe a fade, but they describe more than one shape. A gaussian whose
+`sigma_t` is small relative to its window peaks at a single instant and falls away either side. One
+whose marginal saturates across the whole window is at full opacity throughout it. Both are the same
+arithmetic with different numbers, and the difference is visible enough that producers should be
+able to say which they meant.
 
-Producers SHOULD declare which they intend with the `visibility_profile` metadata key — `gaussian`
-for the soft fade, `box` for the hard-edged one. It is a statement of intent for consumers and
-tooling; both decode by the same arithmetic, and the registry records a third profile the current
-wire model cannot express, so that the distinction stays explicit.
+The `visibility_profile` metadata key does that: `gaussian` for the peaked shape, `flat-top` for the
+saturated one. See the registry for both, including the one respect in which the version-1 model
+reaches `flat-top` only approximately.
+
+It is a statement of intent for consumers and tooling. It adds no wire fields and changes no
+decoding.
 
 **The validity window is the format's only hard temporal gate.** `mu_t` and `sigma_t` describe a
 soft fade; `win_lo`/`win_hi` describe existence. A gaussian outside its window does not exist at
@@ -394,6 +397,11 @@ set for version 1 is position, scale, rotation index, rotation, colour, opacity,
 
 Gaussians within a chunk MAY be reordered freely by the encoder; nothing in the format depends on
 their order, and readers MUST NOT rely on it.
+
+Encoders in practice order them for spatial locality, which makes the position delta stream much
+smaller. That is an **encoder technique, not a property of the format**: no decoder needs to know
+which ordering was used, and none may assume one. A future encoder that finds a better ordering
+changes nothing a decoder has to implement.
 
 ### 6.2 Colour
 

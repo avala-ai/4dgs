@@ -90,6 +90,67 @@ is where it belongs.
 
 ---
 
+## glTF interoperability
+
+Non-normative, and a moving target: the glTF gaussian-splatting extension (`KHR_gaussian_splatting`)
+was at **Release Candidate** status when this was written (2026-07). Check its current status before
+relying on any of the below, and re-read the extension rather than this summary if the two ever
+disagree.
+
+**The relationship is complementary, not competitive.** That extension describes a static set of
+gaussians. It has no temporal model — not deferred, simply absent. This format is a temporal
+container whose decoded state _at one instant_ is exactly the attribute set that extension carries,
+so a `.4dgs` decoded at time `t` maps onto it mechanically, and a producer of static splats loses
+nothing by treating this as the time dimension on top.
+
+### What matches with no conversion
+
+| quantity | glTF extension                                | 4dgs                             |
+| -------- | --------------------------------------------- | -------------------------------- |
+| rotation | quaternion, `x, y, z, w`, pre-normalized unit | identical — see spec §3 and §6.4 |
+| opacity  | linear `0–1`, post-activation                 | identical — spec §3              |
+| position | scene units                                   | identical                        |
+| scale    | per-axis, linear                              | identical                        |
+
+The quaternion order was a free choice and this format already made the same one, so no component
+shuffle is needed in either direction. Opacity is worth calling out because it is commonly
+misstated: both store the **activated** value, not a logit, so there is no sigmoid on either side of
+the conversion.
+
+### What needs a stated transform
+
+**The degree-0 term.** That extension carries spherical harmonics uniformly, with the degree-0
+coefficient required. This format stores the resolved colour instead — linear RGB in `[0, 1]`, with
+the degree-0 term already evaluated — because a decoder that only wants colour should not have to
+know what a spherical harmonic is. The conversion is one line each way, with
+`k = 0.28209479177387814`:
+
+```
+to glTF:    coef0 = (rgb - 0.5) / k
+from glTF:  rgb   = coef0 * k + 0.5
+```
+
+That `+ 0.5` is the same convention on both sides: reconstruction sums the harmonic contributions
+and adds one half.
+
+**Higher bands.** Degrees 1–3 are optional in both, and both require whole degrees — a file carries
+all of a degree's coefficients or none of them. This format stores each band as its own byte range
+so a reader can decline the higher ones (spec §5.7); declining a band yields a _lower degree_, never
+a partial one, so the rule is preserved rather than bent. Coefficient order within a band is
+lowest-`m` first in both.
+
+Producers converting either way should carry the phase convention through unchanged; both use the
+Condon–Shortley phase, so this is a no-op that is only worth stating because getting it wrong is
+silent.
+
+### Properties that have no 4dgs equivalent
+
+That extension requires a `kernel` (`"ellipse"`) and a `colorSpace`. This format has no kernel
+property because it defines exactly one gaussian kernel and does not offer a choice; a converter
+emits `"ellipse"` unconditionally. Colour space maps onto the `color_space` metadata key (see the
+registry), whose two values correspond to the two the extension defines. A 4dgs file that declares
+no colour space leaves a converter to pick, which is a good reason for producers to declare one.
+
 ## Carriage in segmented-delivery systems
 
 The chunk index is a map from time ranges to byte ranges, which is structurally what segmented

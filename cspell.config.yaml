@@ -31,6 +31,12 @@ words:
   - extrinsics
   - intrinsics
   - georeference
+  - logit
+  - coef
+  - Shortley
+  - Condon
+  - srgb
+  - rec709
   - Avala
   - bibtex
 ignorePaths:
