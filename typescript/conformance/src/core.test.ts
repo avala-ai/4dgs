@@ -1,0 +1,336 @@
+// Copyright 2026 Avala AI
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * Unit tests for the pieces the conformance corpus cannot observe on its own.
+ *
+ * The corpus proves that a whole file decodes to the right gaussians. These prove the
+ * parts underneath it against values chosen by hand — stream modes, symbol widths,
+ * spherical harmonic layout, the errors a malformed file is supposed to produce — so a
+ * failure points at a function rather than at a file.
+ */
+
+import assert from "node:assert/strict";
+import { test } from "node:test";
+
+import {
+  Cursor,
+  MalformedFile,
+  TruncatedFile,
+  UnsupportedVersion,
+  StreamDecoder,
+  bandCoefficientRange,
+  checkMagic,
+  coefficientsForDegree,
+  coefficientsInBand,
+  crc32,
+  decodeStream,
+  frameOneStream,
+  lifeClass,
+  marginalAt,
+  mergeBands,
+  motionStep,
+  muStep,
+  rctInverse,
+  supportK,
+  unshuffleAndUnzigzag,
+  DEFAULT_CODECS,
+  MAGIC,
+} from "@4dgs/core";
+
+import { roundHalfEven } from "./canonical.js";
+import { MODE_CONST, MODE_DELTA, MODE_RAW, encodeTestStream, record } from "./testing.js";
+
+async function decodeOne(bytes: Uint8Array): Promise<Int32Array> {
+  return decodeStream(frameOneStream(new Cursor(bytes)), DEFAULT_CODECS);
+}
+
+test("raw streams decode to the values they were built from", async () => {
+  const values = [0, 1, -1, 127, -128, 63];
+  const decoded = await decodeOne(
+    await encodeTestStream({ attributeId: 0, values, channels: 1, mode: MODE_RAW }),
+  );
+  assert.deepEqual([...decoded], values);
+});
+
+test("delta streams accumulate along element order, per channel", async () => {
+  const values = [10, 100, 12, 90, 15, 80, 15, 80];
+  const decoded = await decodeOne(
+    await encodeTestStream({
+      attributeId: 6,
+      values,
+      channels: 2,
+      mode: MODE_DELTA,
+      symbolWidth: 2,
+    }),
+  );
+  assert.deepEqual([...decoded], values);
+});
+
+test("constant streams repeat one element for the whole chunk", async () => {
+  const bytes = await encodeTestStream({
+    attributeId: 9,
+    values: [7, -7],
+    channels: 2,
+    mode: MODE_CONST,
+  });
+  // A constant stream stores `channels` symbols and repeats them `element_count` times;
+  // the header is rewritten here because the count is not derivable from the payload.
+  new DataView(bytes.buffer, bytes.byteOffset).setUint32(5, 4, true);
+  const decoded = await decodeOne(bytes);
+  assert.deepEqual([...decoded], [7, -7, 7, -7, 7, -7, 7, -7]);
+});
+
+test("symbol widths 1, 2 and 4 all round-trip", async () => {
+  for (const [width, value] of [
+    [1, 100],
+    [2, 30000],
+    [4, 1000000],
+  ] as const) {
+    const decoded = await decodeOne(
+      await encodeTestStream({
+        attributeId: 0,
+        values: [value, -value],
+        channels: 1,
+        symbolWidth: width,
+      }),
+    );
+    assert.deepEqual([...decoded], [value, -value], `width ${width}`);
+  }
+});
+
+test("the byte-plane unshuffle is the inverse of the plane layout", () => {
+  // Two symbols, width 2: plane 0 holds both low bytes, plane 1 both high bytes.
+  const raw = Uint8Array.from([0x02, 0x06, 0x01, 0x00]);
+  assert.deepEqual([...unshuffleAndUnzigzag(raw, 2, 2)], [129, 3]);
+});
+
+test("a stream with an impossible symbol width is refused by name", async () => {
+  const bytes = await encodeTestStream({ attributeId: 0, values: [1], channels: 1 });
+  bytes[1] = 3;
+  await assert.rejects(() => decodeOne(bytes), /symbol width 3 is not 1, 2 or 4/);
+});
+
+test("an unknown stream mode is refused rather than guessed at", async () => {
+  const bytes = await encodeTestStream({ attributeId: 0, values: [1], channels: 1 });
+  bytes[2] = 7;
+  await assert.rejects(() => decodeOne(bytes), /unknown stream mode 7/);
+});
+
+test("a stream whose payload does not decompress to its declared size is truncated", async () => {
+  const bytes = await encodeTestStream({ attributeId: 0, values: [1, 2, 3], channels: 1 });
+  new DataView(bytes.buffer, bytes.byteOffset).setUint32(5, 4, true);
+  await assert.rejects(() => decodeOne(bytes), TruncatedFile);
+});
+
+test("magic checking separates a foreign file from a future version", () => {
+  assert.doesNotThrow(() => checkMagic(MAGIC));
+  const future = Uint8Array.from(MAGIC);
+  future[5] = 0x39; // "9"
+  assert.throws(() => checkMagic(future), /major version 9 is not supported/);
+  assert.throws(() => checkMagic(new Uint8Array(8)), /not a 4dgs file/);
+  assert.throws(() => checkMagic(new Uint8Array(3)), TruncatedFile);
+});
+
+test("CRC-32 matches the IEEE values the footer is written with", () => {
+  assert.equal(crc32(new TextEncoder().encode("")), 0);
+  assert.equal(crc32(new TextEncoder().encode("123456789")), 0xcbf43926);
+  assert.equal(crc32(new TextEncoder().encode("4dgs")), 0xf2630ef0);
+});
+
+test("a cursor refuses to read past its buffer, naming the offset", () => {
+  const cursor = new Cursor(Uint8Array.from([1, 2, 3]));
+  cursor.u8();
+  assert.throws(() => cursor.u32(), /need 4 bytes at offset 1, 2 remain/);
+});
+
+test("a string map must fill its declared block", () => {
+  // Block length 4, but the key inside claims 16 bytes.
+  const bytes = Uint8Array.from([4, 0, 0, 0, 16, 0, 0, 0]);
+  assert.throws(() => new Cursor(bytes).stringMap(), TruncatedFile);
+});
+
+test("record framing yields complete records and holds the rest", () => {
+  const decoder = new StreamDecoder();
+  const whole = record(0x01, Uint8Array.from([1, 2, 3]));
+  decoder.append(MAGIC);
+  decoder.append(whole.subarray(0, 5));
+  assert.deepEqual([...decoder.records()], []);
+  decoder.append(whole.subarray(5));
+  const records = [...decoder.records()];
+  assert.equal(records.length, 1);
+  assert.equal(records[0]!.opcode, 0x01);
+  assert.deepEqual([...records[0]!.content], [1, 2, 3]);
+  assert.equal(records[0]!.offset, MAGIC.length);
+});
+
+test("a stream that ends on the trailing magic is not truncated", () => {
+  const decoder = new StreamDecoder();
+  decoder.append(MAGIC);
+  decoder.append(record(0x02, new Uint8Array(20)));
+  decoder.append(MAGIC);
+  assert.deepEqual([...decoder.records()].length, 1);
+  decoder.end();
+  assert.equal(decoder.truncated, false);
+});
+
+test("a stream that stops mid-record keeps what completed and says it was cut", () => {
+  const decoder = new StreamDecoder();
+  decoder.append(MAGIC);
+  decoder.append(record(0x02, new Uint8Array(20)));
+  decoder.append(record(0x05, new Uint8Array(400)).subarray(0, 100));
+  assert.equal([...decoder.records()].length, 1);
+  decoder.end();
+  assert.equal(decoder.truncated, true);
+});
+
+test("a file that is not ours is refused before anything else happens", () => {
+  const decoder = new StreamDecoder();
+  decoder.append(new TextEncoder().encode("ply\nformat "));
+  assert.throws(() => [...decoder.records()], UnsupportedVersion);
+});
+
+test("spherical harmonic degrees are whole", () => {
+  assert.deepEqual([0, 1, 2, 3].map(coefficientsForDegree), [0, 3, 8, 15]);
+  assert.deepEqual([1, 2, 3].map(coefficientsInBand), [3, 5, 7]);
+  assert.deepEqual(
+    [1, 2, 3].map((b) => [...bandCoefficientRange(b)]),
+    [
+      [0, 3],
+      [3, 8],
+      [8, 15],
+    ],
+  );
+});
+
+test("merging bands lays coefficients out component-major, band by band", () => {
+  // Two gaussians. Band 1 is three coefficients per component, band 2 is five.
+  const band1 = Int32Array.from([
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9, // gaussian 0: R0..2, G0..2, B0..2
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+  ]);
+  const band2 = Int32Array.from([
+    21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 41, 42, 43, 44, 45, 46, 47, 48, 49,
+    50, 51, 52, 53, 54, 55,
+  ]);
+  const merged = mergeBands(
+    2,
+    new Map([
+      [1, band1],
+      [2, band2],
+    ]),
+    3,
+  );
+  assert.equal(merged.degree, 2);
+  assert.equal(merged.coefficients, 8);
+  // Gaussian 0, red: band 1's first three, then band 2's first five.
+  assert.deepEqual([...merged.values.slice(0, 8)], [1, 2, 3, 21, 22, 23, 24, 25]);
+  // Gaussian 0, green: band 1's next three, then band 2's next five.
+  assert.deepEqual([...merged.values.slice(8, 16)], [4, 5, 6, 26, 27, 28, 29, 30]);
+  // Gaussian 1, blue.
+  assert.deepEqual([...merged.values.slice(40, 48)], [17, 18, 19, 51, 52, 53, 54, 55]);
+});
+
+test("a cap keeps whole degrees and drops the bands above it", () => {
+  const band1 = Int32Array.from([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+  const band2 = Int32Array.from(new Array(15).fill(0).map((_, i) => 20 + i));
+  const capped = mergeBands(
+    1,
+    new Map([
+      [1, band1],
+      [2, band2],
+    ]),
+    1,
+  );
+  assert.equal(capped.degree, 1);
+  assert.equal(capped.coefficients, 3);
+  assert.deepEqual([...capped.values], [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+  assert.deepEqual(capped.bands, [1]);
+});
+
+test("bands that do not form whole degrees are refused", () => {
+  const band2 = Int32Array.from(new Array(15).fill(1));
+  assert.throws(() => mergeBands(1, new Map([[2, band2]]), 3), MalformedFile);
+});
+
+test("velocity precision follows lifetime, and rounds the class up", () => {
+  const sigmaLogStep = 2 * Math.log1p(0.02);
+  const k = supportK(0.05);
+  // A short-lived gaussian gets a coarser velocity grid than a long-lived one.
+  const shortLived = motionStep(lifeClass(-200, sigmaLogStep, false, 0, k), 1);
+  const longLived = motionStep(lifeClass(0, sigmaLogStep, false, 0, k), 1);
+  assert.ok(shortLived > longLived, `${shortLived} should be coarser than ${longLived}`);
+  // The clamps are the ends of the class range, exactly.
+  assert.equal(lifeClass(-10000, sigmaLogStep, false, 0, k), -4);
+  assert.equal(lifeClass(10000, sigmaLogStep, false, 0, k), 2);
+  // A gaussian that never fades takes its lifetime from the validity window.
+  assert.equal(lifeClass(0, sigmaLogStep, true, 2.0, k), 2);
+});
+
+test("birth-time precision is a fraction of the gaussian's own sigma", () => {
+  const sigmaLogStep = 2 * Math.log1p(0.02);
+  const stepTime = 0.004;
+  // A large sigma cannot make the pitch coarser than the declared grid.
+  assert.equal(muStep(400, sigmaLogStep, false, stepTime), stepTime);
+  assert.equal(muStep(0, sigmaLogStep, true, stepTime), stepTime);
+  // A tiny sigma refines it, by powers of two, down to the floor.
+  assert.ok(muStep(-200, sigmaLogStep, false, stepTime) < stepTime);
+  assert.equal(muStep(-100000, sigmaLogStep, false, stepTime), stepTime * 2 ** -10);
+});
+
+test("the colour transform inverts (g, r - g, b - g) exactly", () => {
+  for (const rgb of [
+    [0, 0, 0],
+    [10, 200, 30],
+    [255, 1, 128],
+  ]) {
+    const [r, g, b] = rgb as [number, number, number];
+    assert.deepEqual([...rctInverse(g, r - g, b - g)], [r, g, b]);
+  }
+});
+
+test("the marginal is 1 for a gaussian that never fades", () => {
+  assert.equal(marginalAt(0.5, Infinity, 1000), 1);
+  assert.equal(marginalAt(0.5, 0.1, 0.5), 1);
+  assert.ok(marginalAt(0.5, 0.1, 0.7) < 0.14);
+});
+
+test("rounding matches Python's round, including the ties a float32 can hit", () => {
+  const cases: [number, number][] = [
+    [0.0078125, 0.007812],
+    [-0.0078125, -0.007812],
+    [0.0234375, 0.023438],
+    [0.0390625, 0.039062],
+    [3.0078125, 3.007812],
+    [0.1234565, 0.123456],
+    [0.1234575, 0.123457],
+    [1.0000005, 1.000001],
+    [-1.0000005, -1.000001],
+    [123.4567891, 123.456789],
+    [1e-7, 0],
+    [5e-7, 0],
+    [0.9999999, 1],
+    [640.0078125, 640.007812],
+    [2.5e-6, 3e-6],
+    [1.5e-6, 2e-6],
+  ];
+  for (const [input, expected] of cases) {
+    assert.equal(roundHalfEven(input, 6), expected, `round(${input}, 6)`);
+  }
+});

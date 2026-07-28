@@ -25,6 +25,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "data")
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 
+#: Where a language's built runners live, when it has a build step. A family whose
+#: entry point is missing is skipped with a note rather than reported as 51 failures:
+#: a Python-only contributor running the whole suite has not broken anything.
+TYPESCRIPT_DIST = os.path.join(ROOT, "typescript", "conformance", "dist")
+
 #: (family, name, argv-prefix). A new language adds one line.
 RUNNERS = [
     (
@@ -37,6 +42,8 @@ RUNNERS = [
         "python/decode_indexed",
         [sys.executable, os.path.join(ROOT, "python", "conformance", "decode_indexed.py")],
     ),
+    ("typescript", "typescript/decode_streamed", ["node", os.path.join(TYPESCRIPT_DIST, "decode_streamed.js")]),
+    ("typescript", "typescript/decode_indexed", ["node", os.path.join(TYPESCRIPT_DIST, "decode_indexed.js")]),
 ]
 
 
@@ -62,9 +69,14 @@ def main(argv=None) -> int:
         return 1
 
     passed = skipped = failed = 0
+    ran_families: set[str] = set()
     for family, runner_name, command in RUNNERS:
         if args.runner and family != args.runner:
             continue
+        if not os.path.exists(command[-1]):
+            print(f"skipping {runner_name}: {command[-1]} is not built")
+            continue
+        ran_families.add(family)
         for variant in names:
             if not supports(runner_name, variant):
                 skipped += 1
@@ -99,7 +111,14 @@ def main(argv=None) -> int:
                     print("  " + line)
 
     print(f"\n{passed} passed, {skipped} skipped (variant not supported), {failed} failed")
-    return 1 if failed else 0
+    if failed:
+        return 1
+    # A runner family that was asked for and never ran is a failure, not a pass. The
+    # alternative is a green suite that proved nothing, which is worse than a red one.
+    if args.runner and args.runner not in ran_families:
+        print(f"error: no runner for --runner {args.runner} was executed", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

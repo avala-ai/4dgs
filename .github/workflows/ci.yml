@@ -27,6 +27,14 @@ jobs:
             echo "conformance data: ${size_kb} KiB"
             [ "$size_kb" -le 2560 ] || { echo "::error::conformance data over budget"; exit 1; }
           fi
+      - name: TypeScript sources under 500 KB
+        # Sources only: this job installs nothing and builds nothing, so node_modules
+        # and dist are not here to measure. A vendored dependency would show up as a
+        # budget failure, which is the point.
+        run: |
+          size_kb=$(du -s typescript | cut -f1)
+          echo "typescript: ${size_kb} KiB"
+          [ "$size_kb" -le 500 ] || { echo "::error::typescript is ${size_kb} KiB, over the 500 KiB budget"; exit 1; }
 
   no-committed-binaries:
     # The corpus is generated. A committed .4dgs means someone bypassed the generator.
@@ -68,6 +76,48 @@ jobs:
         with: { node-version: "20" }
       - run: npx --yes prettier@3 --check "**/*.md"
       - run: npx --yes cspell@8 --config cspell.config.yaml "**/*.md"
+
+  typescript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      # The package manager is the one the root package.json declares.
+      - name: Install
+        run: |
+          corepack enable
+          yarn install --immutable
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+
+      - name: Format
+        run: npx --yes prettier@3 --check "typescript/**/*.ts"
+
+      # `tsc -b` is the typecheck: the packages are project references, so this also
+      # proves they build in dependency order from a clean tree.
+      - name: Typecheck and build
+        run: yarn build
+
+      # The unit tests decode real corpus files, which are generated rather than
+      # committed. Generating them first is what stops those tests skipping themselves
+      # into a green run that proved nothing — and the skip count is asserted below.
+      - name: Corpus
+        run: |
+          pip install -e ./python/fourdgs
+          python tests/conformance/generate.py
+
+      - name: Tests
+        shell: bash
+        run: |
+          node --test typescript/conformance/dist/*.test.js | tee test.log
+          grep -q '^# skipped 0' test.log || {
+            echo "::error::some tests skipped; they must all run in CI"
+            exit 1
+          }
 
   rust:
     runs-on: ubuntu-latest
