@@ -11,7 +11,7 @@ jobs:
     # are in the skeleton brief; this gate is the total.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Total tree size under 8 MB
         run: |
           size_kb=$(du -s --exclude=.git . | cut -f1)
@@ -32,7 +32,7 @@ jobs:
     # The corpus is generated. A committed .4dgs means someone bypassed the generator.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: |
           if git ls-files '*.4dgs' | grep -q .; then
             echo "::error::.4dgs files must not be committed; the generator reconstructs them"
@@ -43,7 +43,7 @@ jobs:
   python:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       # The dev extra brings pytest and ruff, so the job installs what it runs
@@ -61,7 +61,7 @@ jobs:
   markdown:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with: { node-version: "20" }
       - run: npx --yes prettier@3 --check "**/*.md"
@@ -70,5 +70,5 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: cargo build --workspace
