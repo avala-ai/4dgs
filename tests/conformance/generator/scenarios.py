@@ -142,15 +142,21 @@ def variant_name(scenario: Scenario, flags: tuple[str, ...]) -> str:
 def build_gaussians(scenario: Scenario, seed: int = 20260728) -> dict:
     """Deterministic gaussians for a scenario, as plain Python lists.
 
-    Deliberately dependency-free and written in terms of a small integer PRNG rather than
-    a library's generator: the corpus must be reproducible across versions of whatever is
-    installed, and "the numbers changed because numpy changed" is not a failure anyone
-    wants to debug.
+    Deliberately dependency-free: see the note on `rnd` for why the PRNG is hand-written
+    rather than borrowed.
     """
     state = seed & 0xFFFFFFFF
 
     def rnd() -> float:
-        """xorshift32 in [0, 1)."""
+        """xorshift32 in [0, 1).
+
+        DO NOT replace this with a library PRNG. It is hand-written on purpose: the
+        corpus must reproduce byte-for-byte across versions of every dependency, and a
+        library generator's stream is only stable as far as that library promises.
+        "The fixtures changed because numpy changed" is a debugging session nobody should
+        ever have to sit through, and the `--verify` determinism gate would fail with a
+        message pointing at the encoder rather than at the real culprit.
+        """
         nonlocal state
         state ^= (state << 13) & 0xFFFFFFFF
         state ^= state >> 17
