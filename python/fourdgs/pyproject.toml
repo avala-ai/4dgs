@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "4dgs"
+name = "fourdgs"
 version = "0.1.0"
 description = "Reader and writer for the 4dgs container format for 4D gaussian splat scenes"
 readme = "README.md"

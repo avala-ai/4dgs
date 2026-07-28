@@ -244,7 +244,7 @@ def compress(raw: bytes, codec: int, level: int) -> bytes:
         try:
             import zstandard
         except ImportError as exc:  # pragma: no cover - optional dependency
-            raise UnsupportedCodec("zstd support needs the 'zstd' extra: pip install 4dgs[zstd]") from exc
+            raise UnsupportedCodec("zstd support needs the 'zstd' extra: pip install 'fourdgs[zstd]'") from exc
         params = zstandard.ZstdCompressionParameters.from_level(level, window_log=23, source_size=len(raw))
         return zstandard.ZstdCompressor(compression_params=params).compress(raw)
     raise UnsupportedCodec(f"unknown stream codec {codec}")
@@ -257,7 +257,7 @@ def decompress(body: bytes, codec: int, expected: int) -> bytes:
         try:
             import zstandard
         except ImportError as exc:  # pragma: no cover - optional dependency
-            raise UnsupportedCodec("this file uses zstd streams: pip install 4dgs[zstd]") from exc
+            raise UnsupportedCodec("this file uses zstd streams: pip install 'fourdgs[zstd]'") from exc
         out = zstandard.ZstdDecompressor().decompress(body, max_output_size=expected)
     else:
         raise UnsupportedCodec(f"unknown stream codec {codec}")

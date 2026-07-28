@@ -4,7 +4,7 @@ The package lives in [`fourdgs/`](fourdgs/); its README is the PyPI page.
 
 |                      |                                |
 | -------------------- | ------------------------------ |
-| Install              | `pip install 4dgs`             |
+| Install              | `pip install fourdgs`          |
 | Import               | `import fourdgs`               |
 | Conformance runners  | [`conformance/`](conformance/) |
 | Examples (run in CI) | [`examples/`](examples/)       |

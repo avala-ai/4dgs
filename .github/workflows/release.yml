@@ -1,0 +1,132 @@
+name: Release
+
+# Publishing is tag-driven and per package. Nothing here fires on an ordinary
+# push: every job is guarded on a tag matching that package's scheme, so a
+# release is always something someone did on purpose.
+#
+# Tag scheme (see RELEASING.md):
+#   releases/python/vX.Y.Z
+#   releases/rust/vX.Y.Z
+#   releases/typescript/<package>/vX.Y.Z
+#
+# Every job authenticates with OIDC trusted publishing. There are no stored
+# registry tokens in this repository and there should never be one: a token in
+# a secret is a credential that outlives the job it was created for.
+
+on:
+  push:
+    tags:
+      - "releases/**"
+  workflow_dispatch:
+
+jobs:
+  python:
+    name: Publish 4dgs to PyPI
+    if: startsWith(github.ref, 'refs/tags/releases/python/')
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      # The only permission a trusted-publishing job needs. No token, no secret.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Version matches the tag
+        # Run before anything is built. A package whose version constant and tag
+        # disagree is the one mistake that cannot be fixed after publication,
+        # because the version number is the thing you cannot take back.
+        run: |
+          tag="${GITHUB_REF#refs/tags/releases/python/v}"
+          manifest=$(grep -m1 '^version = ' python/fourdgs/pyproject.toml | cut -d'"' -f2)
+          source=$(grep -m1 '^__version__ = ' python/fourdgs/fourdgs/__init__.py | cut -d'"' -f2)
+          echo "tag=$tag manifest=$manifest source=$source"
+          if [ "$tag" != "$manifest" ] || [ "$tag" != "$source" ]; then
+            echo "::error::version mismatch — tag $tag, pyproject $manifest, __init__ $source"
+            exit 1
+          fi
+
+      - name: Build
+        run: |
+          python -m pip install --upgrade build
+          python -m build python/fourdgs --outdir dist
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+  rust:
+    name: Publish fourdgs to crates.io
+    if: startsWith(github.ref, 'refs/tags/releases/rust/')
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version matches the tag
+        run: |
+          tag="${GITHUB_REF#refs/tags/releases/rust/v}"
+          manifest=$(grep -m1 '^version = ' rust/fourdgs/Cargo.toml | cut -d'"' -f2)
+          echo "tag=$tag manifest=$manifest"
+          if [ "$tag" != "$manifest" ]; then
+            echo "::error::version mismatch — tag $tag, Cargo.toml $manifest"
+            exit 1
+          fi
+
+      - name: Build
+        run: cargo build --manifest-path rust/fourdgs/Cargo.toml
+
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish
+        run: cargo publish --manifest-path rust/fourdgs/Cargo.toml
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  typescript:
+    name: Publish an @4dgs package to npm
+    # Disabled until the TypeScript packages are publishable. When enabling,
+    # re-read npm's trusted-publishing documentation rather than trusting this
+    # block: npm's OIDC support is newer than the other two registries' and its
+    # syntax has moved. What is certain is the shape — id-token: write, no
+    # NODE_AUTH_TOKEN, and a recent npm CLI.
+    if: false
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Version matches the tag
+        run: |
+          rest="${GITHUB_REF#refs/tags/releases/typescript/}"
+          package="${rest%/v*}"
+          tag="${rest##*/v}"
+          manifest=$(node -p "require('./typescript/${package}/package.json').version")
+          echo "package=$package tag=$tag manifest=$manifest"
+          if [ "$tag" != "$manifest" ]; then
+            echo "::error::version mismatch — tag $tag, package.json $manifest"
+            exit 1
+          fi
+
+      - name: Publish
+        # TODO: confirm against npm's current trusted-publishing docs before
+        # this job is enabled. Provenance requires the repository to be public
+        # and the workflow to be the configured trusted publisher.
+        run: |
+          rest="${GITHUB_REF#refs/tags/releases/typescript/}"
+          npm publish --workspace "typescript/${rest%/v*}" --provenance --access public

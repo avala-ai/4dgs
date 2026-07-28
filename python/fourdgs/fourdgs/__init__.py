@@ -3,7 +3,7 @@
 
 """4dgs — reader and writer for the 4dgs container format.
 
-Install `4dgs`, import `fourdgs`: Python identifiers cannot start with a digit.
+Distributed as `fourdgs` on PyPI.
 
     import fourdgs
 

@@ -5,10 +5,15 @@ Packages are versioned and released independently. A release is a tag; CI does t
 ## Tag format
 
 ```
-releases/<language>/<package>/vX.Y.Z
+releases/python/vX.Y.Z
+releases/rust/vX.Y.Z
+releases/typescript/<package>/vX.Y.Z
 ```
 
-for example `releases/python/4dgs/v0.2.0`.
+for example `releases/python/v0.2.0` or `releases/typescript/core/v0.2.0`. Languages that ship one
+package do not repeat its name in the tag; TypeScript ships four, so it does.
+
+`releases/dart/vX.Y.Z` is reserved and unused.
 
 ## Checklist, per package
 
@@ -23,16 +28,19 @@ for example `releases/python/4dgs/v0.2.0`.
 
 ## Naming
 
-The format, the repository, the CLI and the distribution are all **4dgs**. The only exception is
-where a language forbids an identifier starting with a digit:
+The format, the repository, the CLI and the file extension are always **4dgs** and **`.4dgs`**.
+Package names are a different matter, and not because we chose them: three registries impose three
+different constraints, and the honest thing is to write down what each one is rather than imply a
+consistency that does not exist.
 
-- **Python**: install `4dgs`, import `fourdgs`.
-- **TypeScript**: `@4dgs/core` and friends — no alias needed.
-- **Rust**: the crate is `fourdgs` (Cargo identifiers cannot start with a digit); the format is
-  still `4dgs` everywhere in prose and on disk.
+| Registry  | Name                                                          | Why                                                                                                                                     |
+| --------- | ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| PyPI      | `fourdgs`                                                     | `4dgs` is taken by an unrelated project. `pip install fourdgs`, `import fourdgs` — the two now agree, so there is no alias to remember  |
+| crates.io | `fourdgs`                                                     | Cargo rejects a crate name beginning with a digit, so `4dgs` is not available to anyone. The `[lib] name` matches                       |
+| npm       | `@4dgs/core`, `@4dgs/browser`, `@4dgs/nodejs`, `@4dgs/codecs` | Scoped names may begin with a digit. The unscoped `4dgs` was refused by npm's similarity filter, so the scope is not a stylistic choice |
 
-Never write `fourdgs` in prose except in the one install-versus-import sentence a package README
-needs.
+In prose, in the specification, in the CLI and on disk: always `4dgs`. `fourdgs` appears only as a
+package name, and only where a registry requires it.
 
 ## Pre-1.0
 
