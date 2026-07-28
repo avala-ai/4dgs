@@ -1,7 +1,7 @@
 # @4dgs/core
 
-The 4dgs decoder. No I/O: everything comes through `IReadable`, so the same code runs in a
-browser, on a server, and in a test over a byte array.
+The 4dgs decoder. No I/O: everything comes through `IReadable`, so the same code runs in a browser,
+on a server, and in a test over a byte array.
 
 ```ts
 export interface IReadable {

@@ -46,13 +46,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - run: pip install ruff numpy
+      # The dev extra brings pytest and ruff, so the job installs what it runs
+      # rather than assuming the runner already has it.
+      - run: pip install -e './python/fourdgs[dev]'
       - run: ruff check --line-length 120 tests/conformance python
       - run: ruff format --check --line-length 120 tests/conformance python
       - name: Tests
+        run: python -m pytest python/fourdgs/tests -q
+
+      - name: Examples run, so they cannot rot into snippets that no longer work
         run: |
-          pip install -e ./python/fourdgs
-          python -m pytest python/fourdgs/tests -q
+          cd python/fourdgs && python ../examples/encode_synthetic.py && python ../examples/decode_summary.py
 
   markdown:
     runs-on: ubuntu-latest

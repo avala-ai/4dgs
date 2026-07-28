@@ -17,3 +17,7 @@ target/
 __docs__/
 site/
 website/build/
+
+# Rust build output
+target/
+Cargo.lock

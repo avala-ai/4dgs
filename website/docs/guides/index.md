@@ -5,5 +5,5 @@
 - [Decode in a browser](./getting-started/decode-web.md)
 - [Decode in Python](./getting-started/decode-python.md)
 
-The [specification](../spec/index.md) is the normative reference; these guides are the
-readable path in.
+The [specification](../spec/index.md) is the normative reference; these guides are the readable path
+in.

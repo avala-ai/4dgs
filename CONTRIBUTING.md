@@ -1,11 +1,9 @@
 # Contributing
 
-> This repository is the 4dgs format: its specification, its conformance suite, and SDKs
-> for reading and writing it. Viewers, renderers, engine integrations, and performance
-> tooling are out of scope.
+> This repository is the 4dgs format: its specification, its conformance suite, and SDKs for reading
+> and writing it. Viewers, renderers, engine integrations, and performance tooling are out of scope.
 
-That sentence is the charter, and it decides most scope questions before they become
-arguments.
+That sentence is the charter, and it decides most scope questions before they become arguments.
 
 ## In scope
 
@@ -23,36 +21,33 @@ arguments.
 - Product or engine integrations
 - Comparisons against other formats or products
 
-These are declined by policy, not by judgement of quality. Decoding ends at reconstructed
-gaussian state at time `t`; everything downstream belongs to whatever draws it.
+These are declined by policy, not by judgement of quality. Decoding ends at reconstructed gaussian
+state at time `t`; everything downstream belongs to whatever draws it.
 
 ## Spec changes
 
-Wire-format changes need an issue before a pull request, using the spec-change template.
-The issue states the motivation, the wire impact, the backward-compatibility analysis, and
-which SDKs are affected. A spec change needs two approvals and a conformance scenario that
-would fail without it.
+Wire-format changes need an issue before a pull request, using the spec-change template. The issue
+states the motivation, the wire impact, the backward-compatibility analysis, and which SDKs are
+affected. A spec change needs two approvals and a conformance scenario that would fail without it.
 
-Remember the compatibility rules the format is built on: records may gain appended fields;
-existing fields in frozen records may not change; unknown records are skipped, so a new
-opcode is usually cheaper than a change to an old one.
+Remember the compatibility rules the format is built on: records may gain appended fields; existing
+fields in frozen records may not change; unknown records are skipped, so a new opcode is usually
+cheaper than a change to an old one.
 
 ## Adding a language SDK
 
-1. Implement the decoder against the conformance corpus, and a runner that prints the
-   canonical JSON to stdout.
-2. Declare which variants you support with `supportsVariant()`, and let the harness skip
-   the rest — a partial SDK is welcome and honest.
+1. Implement the decoder against the conformance corpus, and a runner that prints the canonical JSON
+   to stdout.
+2. Declare which variants you support with `supportsVariant()`, and let the harness skip the rest —
+   a partial SDK is welcome and honest.
 3. Add a column to the feature matrix, filled in from what the suite actually proves.
 
 ## Pull requests
 
-Title prefixes: `spec:`, `python:`, `typescript:`, `rust:`, `cpp:`, `conformance:`,
-`docs:`, `ci:`.
+Title prefixes: `spec:`, `python:`, `typescript:`, `rust:`, `cpp:`, `conformance:`, `docs:`, `ci:`.
 
-Every PR confirms the scope checkbox in the template. Conformance must pass; the corpus
-`--verify` gate must be green, which means regenerating it if your change touches the
-encoder.
+Every PR confirms the scope checkbox in the template. Conformance must pass; the corpus `--verify`
+gate must be green, which means regenerating it if your change touches the encoder.
 
 ## Code of conduct
 

@@ -1,6 +1,7 @@
 version: "0.2"
-language: en
+language: en,en-GB
 words:
+  # Domain vocabulary
   - gaussian
   - gaussians
   - splat
@@ -10,15 +11,25 @@ words:
   - quantize
   - quantized
   - dequantize
+  - dequantization
+  - exponentiated
   - zigzag
+  - unshuffle
+  - xyzw
+  - aabb
   - deflate
   - zstd
+  # Format and project vocabulary
+  - fourdgs
+  - seekable
+  - streamable
   - Kaitai
   - typedoc
   - visionOS
   - RealityKit
-  - fourdgs
-  - unshuffle
+  - Catmull
+  - Avala
+  - bibtex
 ignorePaths:
   - "**/node_modules/**"
   - "**/dist/**"

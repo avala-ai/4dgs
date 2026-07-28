@@ -14,6 +14,6 @@ Viewers, renderers, engine integrations and rendering benchmarks are out of scop
 
 - [ ] Conformance passes, including the corpus `--verify` gate
 - [ ] If this touches the encoder, the corpus was regenerated and the checksums updated
-- [ ] If this changes the wire format, there is a linked spec-change issue and a
-      conformance scenario that fails without this change
+- [ ] If this changes the wire format, there is a linked spec-change issue and a conformance
+      scenario that fails without this change
 - [ ] The feature matrix still reflects reality
