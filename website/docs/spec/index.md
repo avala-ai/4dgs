@@ -74,18 +74,16 @@ them bleeding into each other's intervals.
 
 ### 3.1 Visibility profiles
 
-The temporal fields describe a fade, but they describe more than one shape. A gaussian whose
-`sigma_t` is small relative to its window peaks at a single instant and falls away either side. One
-whose marginal saturates across the whole window is at full opacity throughout it. Both are the same
-arithmetic with different numbers, and the difference is visible enough that producers should be
-able to say which they meant.
+The temporal fields describe a soft fade, but the model also expresses a **hard** one. A gaussian
+flagged as never-fading has a marginal of 1 across its whole validity window and is absent outside
+it: full opacity, hard edges, no fade. That is a genuinely different visibility curve from the usual
+bell, reached with fields that already exist and no extra machinery.
 
-The `visibility_profile` metadata key does that: `gaussian` for the peaked shape, `flat-top` for the
-saturated one. See the registry for both, including the one respect in which the version-1 model
-reaches `flat-top` only approximately.
-
-It is a statement of intent for consumers and tooling. It adds no wire fields and changes no
-decoding.
+Producers SHOULD declare which they intend with the `visibility_profile` metadata key — `gaussian`
+for the soft fade, `box` for the hard-edged one. It is a statement of intent for consumers and
+tooling; both decode by the same arithmetic. The registry also reserves a third profile that this
+version's wire model cannot express, so that the distinction stays explicit rather than being
+blurred into `box`.
 
 **The validity window is the format's only hard temporal gate.** `mu_t` and `sigma_t` describe a
 soft fade; `win_lo`/`win_hi` describe existence. A gaussian outside its window does not exist at
@@ -539,6 +537,14 @@ Declared here so implementers know the direction, **not implemented and not to b
 
 The reference implementation ships a converter for **sequences of standard 3D gaussian splat PLY
 frames**, the common interchange form.
+
+Content that is simply a sequence of independent time steps — no correspondence between them —
+imports into this format's temporal model **always, and always correctly**: one validity window per
+step, zero velocity. That is what the reference converter does. It is worth being plain about what
+that does and does not claim: the result is a correct scene at every instant, and it exploits no
+correspondence the source may have had, because a frame sequence asserts none. A source that _does_
+track gaussians across steps carries information this import discards, and a converter that knows
+about that tracking can do better.
 
 Sources whose motion is analytic or field-based can be imported to the baked model by **adaptive
 temporal sampling**: subdivide a gaussian's window only where the residual against linear motion

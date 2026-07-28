@@ -125,23 +125,23 @@ spec §7.
 ## Visibility profiles
 
 Declared with the `visibility_profile` metadata key. A statement of producer intent — no wire fields
-and no decoding difference, because each of these is the existing arithmetic. See spec §3.1.
+and no decoding difference, because each representable profile is the existing arithmetic. See spec
+§3.1.
 
-| value      | notes                                                                                                                                                                |
-| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `gaussian` | The usual soft temporal fade: opacity follows the marginal, a bell centred on `mu_t` with width `sigma_t`                                                            |
-| `flat-top` | Full opacity across a core interval rather than peaking at a single instant. Recent literature describes this shape with smooth shoulders either side of the plateau |
+| value      | status                          | notes                                                                                                                                                                  |
+| ---------- | ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gaussian` | representable                   | The usual soft temporal fade: opacity follows the marginal, a bell centred on `mu_t` with width `sigma_t`                                                              |
+| `box`      | representable                   | Full opacity across the whole validity window and absent outside it, with no fade. Reached with the never-fades flag plus the window                                   |
+| `flat-top` | **reserved, not representable** | A plateau at full opacity over a core interval with smooth shoulders either side. Distinct from `box`, whose edges are hard, and from `gaussian`, which has no plateau |
 
-Both are reached with the fields that already exist. `gaussian` is the marginal as written.
-`flat-top` is reached by making the marginal saturate across the window — a gaussian wide enough
-that its value stays at the ceiling for the whole validity window, with the window's own edges
-bounding it.
+`flat-top` is reserved rather than defined because the version-1 wire model **cannot express it**: a
+gaussian has one width and no plateau, so a curve that is flat in the middle and smooth at the edges
+needs a temporal shape this format does not carry. Recent literature describes profiles of that
+shape, which is exactly why the name is reserved here — it stops the term being applied loosely to
+`box`, which is a different curve and the one this format actually has.
 
-One precision worth stating, because it decides whether a producer can round-trip its intent: the
-plateau is exact, and the **shoulders are not**. A single gaussian has one width and no plateau, so
-the version-1 wire model reaches the flat top by saturation and ends it at the window edge, which is
-abrupt. A producer that needs a specific shoulder falloff cannot express it in one gaussian today,
-and should either accept the window edge or split the gaussian into several records.
+A producer needing a specific shoulder falloff cannot express it in a single gaussian today. It can
+approximate one with several records, or accept the hard window edge that `box` gives.
 
 ## Colour spaces
 
