@@ -12,8 +12,19 @@ ignore = [
   # The conformance harness and runners must extend sys.path before importing
   # the package under test, which is exactly what E402 forbids.
   "E402",
-  "PLR0913", # a record with many fields is a record, not a design problem
-  "PLR2004", # magic values in a binary format are the format
+  # A binary format is made of magic numbers and records with many fields;
+  # these rules would only be satisfied by hiding that, not by improving it.
+  "PLR0913", # too many arguments
+  "PLR0917", # too many positional arguments
+  "PLR2004", # magic value in comparison
+  # A codec's encode and dispatch paths are long and linear on purpose. Cutting
+  # them into helpers to satisfy a counter would scatter one readable sequence
+  # across six call sites; the complexity is in the format, not in the code.
+  "PLR0912", # too many branches
+  "PLR0915", # too many statements
+  # Deferred imports break genuine cycles (the encoder verifies itself by
+  # calling the decoder) and keep optional dependencies optional.
+  "PLC0415",
 ]
 
 [lint.per-file-ignores]

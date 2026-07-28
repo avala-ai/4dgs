@@ -85,7 +85,7 @@ def cmd_decode(args) -> int:
     state = scene.gaussians.state_at(args.time)
     out = {
         "time": args.time,
-        "visible": int(len(state["indices"])),
+        "visible": len(state["indices"]),
         "total": scene.gaussians.count,
     }
     print(json.dumps(out, indent=2))

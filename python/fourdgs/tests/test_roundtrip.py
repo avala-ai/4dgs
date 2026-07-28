@@ -8,10 +8,9 @@ from __future__ import annotations
 import io
 import math
 
+import fourdgs
 import numpy as np
 import pytest
-
-import fourdgs
 from fourdgs import opcode as op
 from fourdgs.serialization import MAGIC, Cursor, decode_stream, encode_stream, put_record
 

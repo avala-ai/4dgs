@@ -33,10 +33,9 @@ from .stream_reader import Scene, read
 from .writer import WriteOptions, write
 
 __all__ = [
-    "__version__",
     "AudioTrack",
-    "Bounds",
     "BoundViolation",
+    "Bounds",
     "CameraTrajectory",
     "FourdgsError",
     "GaussianSet",
@@ -47,6 +46,7 @@ __all__ = [
     "UnsupportedCodec",
     "UnsupportedVersion",
     "WriteOptions",
+    "__version__",
     "read",
     "write",
 ]

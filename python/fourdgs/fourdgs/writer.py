@@ -255,8 +255,9 @@ def _encode(g: GaussianSet, duration_sec, opts, audio, camera) -> bytes:
     index: list[rec.ChunkIndexEntry] = []
     worst: dict[str, float] = {}
 
-    for t0, t1, level, members in plans:
-        members = members[morton_order(g.positions[members])]
+    for t0, t1, level, plan_members in plans:
+        # Morton order within the chunk is what makes the position delta small.
+        members = plan_members[morton_order(g.positions[plan_members])]
         streams = b"".join(
             [
                 encode_stream(op.A_POSITION, q_pos[members], channels=3, codec=opts.codec, level=opts.level),
@@ -383,4 +384,4 @@ def _assert_bounds(worst: dict[str, float], bounds: Bounds) -> None:
             raise BoundViolation(f"encoder verification failed: {key} deviated {measured:.6g}, bound is {limit:.6g}")
 
 
-__all__ = ["WriteOptions", "write", "dequantize", "dequantize_rotation", "rct_inverse"]
+__all__ = ["WriteOptions", "dequantize", "dequantize_rotation", "rct_inverse", "write"]
