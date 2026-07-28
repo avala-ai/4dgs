@@ -21,11 +21,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "fourdgs"))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "tests", "conformance"))
 
-from canonical import canonical, summarize  # noqa: E402
-
-import fourdgs  # noqa: E402
-from fourdgs.indexed_reader import open_indexed, read_audio, read_chunk  # noqa: E402
-from fourdgs.readable import FileReadable  # noqa: E402
+import fourdgs
+from canonical import canonical, summarize
+from fourdgs.indexed_reader import open_indexed, read_audio, read_chunk
+from fourdgs.readable import FileReadable
 
 UNSUPPORTED: frozenset[str] = frozenset()
 

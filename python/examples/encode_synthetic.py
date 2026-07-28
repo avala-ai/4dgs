@@ -11,9 +11,8 @@ from __future__ import annotations
 
 import io
 
-import numpy as np
-
 import fourdgs
+import numpy as np
 
 rng = np.random.default_rng(1)
 n, windows, duration = 5000, 4, 8.0

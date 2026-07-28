@@ -19,7 +19,7 @@ from __future__ import annotations
 #: against the tag it was invoked with.
 __version__ = "0.1.0"
 
-from .exceptions import (  # noqa: E402
+from .exceptions import (
     BoundViolation,
     FourdgsError,
     MalformedFile,
@@ -27,10 +27,10 @@ from .exceptions import (  # noqa: E402
     UnsupportedCodec,
     UnsupportedVersion,
 )
-from .model import AudioTrack, CameraTrajectory, GaussianSet  # noqa: E402
-from .quantization import Bounds, Steps  # noqa: E402
-from .stream_reader import Scene, read  # noqa: E402
-from .writer import WriteOptions, write  # noqa: E402
+from .model import AudioTrack, CameraTrajectory, GaussianSet
+from .quantization import Bounds, Steps
+from .stream_reader import Scene, read
+from .writer import WriteOptions, write
 
 __all__ = [
     "__version__",

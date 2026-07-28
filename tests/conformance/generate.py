@@ -35,12 +35,11 @@ sys.path.insert(0, os.path.join(HERE, "generator"))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "..", "python", "fourdgs"))
 
-import scenarios  # noqa: E402
-from canonical import canonical, summarize  # noqa: E402
-
-import fourdgs  # noqa: E402
-from fourdgs.records import Attachment  # noqa: E402
-from fourdgs.serialization import put_record  # noqa: E402
+import fourdgs
+import scenarios
+from canonical import canonical, summarize
+from fourdgs.records import Attachment
+from fourdgs.serialization import put_record
 
 MAX_DATA_BYTES = 2_500_000
 
@@ -174,6 +173,11 @@ def main(argv=None) -> int:
         print(f"wrote {CHECKSUMS}")
         return 0
 
+    return 0 if _verify(checksums) else 1
+
+
+def _verify(checksums: dict[str, str]) -> bool:
+    """Assert the corpus matches what is committed and that the encoder is stable."""
     committed = read_checksums()
     failures = []
     if not committed:
@@ -201,10 +205,10 @@ def main(argv=None) -> int:
         for f in failures:
             print(f"  {f}", file=sys.stderr)
         print("\nif the change was intended, rerun without --verify and commit the result", file=sys.stderr)
-        return 1
+        return False
 
     print(f"verified {len(checksums)} variants: checksums match and the encoder is deterministic")
-    return 0
+    return True
 
 
 if __name__ == "__main__":

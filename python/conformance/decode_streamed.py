@@ -17,9 +17,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "fourdgs"))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "tests", "conformance"))
 
-from canonical import canonical, summarize  # noqa: E402
-
-import fourdgs  # noqa: E402
+import fourdgs
+from canonical import canonical, summarize
 
 #: Variants this runner declines. Empty: the reference implementation supports the whole
 #: matrix, which is the only reason it is allowed to be the reference.

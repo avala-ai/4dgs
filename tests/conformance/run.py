@@ -71,7 +71,9 @@ def main(argv=None) -> int:
                 continue
             path = os.path.join(DATA, f"{variant}.4dgs")
             expectation_path = os.path.join(DATA, f"{variant}.json")
-            result = subprocess.run(command + [path], capture_output=True, text=True)
+            # check=False: a runner exiting non-zero is a reportable failure, not an
+            # exception — the harness prints it alongside the others.
+            result = subprocess.run([*command, path], capture_output=True, text=True, check=False)
             if result.returncode != 0:
                 failed += 1
                 print(f"FAIL {runner_name} {variant}: runner exited {result.returncode}")

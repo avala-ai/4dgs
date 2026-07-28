@@ -19,6 +19,7 @@ Adding a case here — never to one language's test — is how the contract grow
 from __future__ import annotations
 
 import math
+import struct
 from dataclasses import dataclass, field
 
 # --------------------------------------------------------------------------
@@ -131,7 +132,7 @@ def variants() -> list[tuple[Scenario, tuple[str, ...]]]:
 
 def variant_name(scenario: Scenario, flags: tuple[str, ...]) -> str:
     """Stable file stem, e.g. `TenWindows-UseChunkIndex-UseCrc-WithAudio`."""
-    return "-".join((scenario.name,) + flags) if flags else scenario.name
+    return "-".join((scenario.name, *flags)) if flags else scenario.name
 
 
 # --------------------------------------------------------------------------
@@ -226,8 +227,6 @@ def build_audio(seconds: float = 0.25, rate: int = 8000) -> bytes:
     Present so audio embedding and extraction are conformance-tested from day one without
     shipping anyone's recording.
     """
-    import struct
-
     frames = int(seconds * rate)
     samples = bytearray()
     for i in range(frames):

@@ -16,7 +16,7 @@ dependencies = ["numpy>=1.24"]
 
 [project.optional-dependencies]
 zstd = ["zstandard>=0.22"]
-dev = ["pytest>=8", "ruff>=0.6"]
+dev = ["pytest>=8", "ruff==0.16.0"]
 
 [project.scripts]
 fourdgs = "fourdgs.cli:main"
@@ -28,8 +28,5 @@ Specification = "https://github.com/avala-ai/4dgs/blob/main/website/docs/spec/in
 [tool.setuptools.packages.find]
 include = ["fourdgs*"]
 
-[tool.ruff]
-line-length = 120
-
-[tool.ruff.lint]
-select = ["E", "F", "W", "I", "UP", "B"]
+# Lint configuration lives in the repository root's ruff.toml so every
+# invocation — here, from the root, or in CI — applies the same rules.

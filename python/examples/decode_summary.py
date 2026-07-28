@@ -9,9 +9,8 @@ from __future__ import annotations
 import io
 import sys
 
-import numpy as np
-
 import fourdgs
+import numpy as np
 from fourdgs.indexed_reader import open_indexed
 from fourdgs.readable import BytesReadable, FileReadable
 

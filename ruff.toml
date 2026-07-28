@@ -1,0 +1,23 @@
+# Lint configuration for the whole repository.
+#
+# It lives at the root, and the version is pinned in every place that installs
+# ruff, because a linter that floats is a CI job that turns red without anyone
+# changing a line of code. That already happened here once.
+line-length = 120
+target-version = "py310"
+
+[lint]
+select = ["E", "F", "W", "I", "UP", "B", "RUF", "PL", "EXE"]
+ignore = [
+  # The conformance harness and runners must extend sys.path before importing
+  # the package under test, which is exactly what E402 forbids.
+  "E402",
+  "PLR0913", # a record with many fields is a record, not a design problem
+  "PLR2004", # magic values in a binary format are the format
+]
+
+[lint.per-file-ignores]
+# Runners and the generator are scripts: they take a path and print.
+"tests/conformance/*.py" = ["T201"]
+"python/conformance/*.py" = ["T201"]
+"python/examples/*.py" = ["T201"]
