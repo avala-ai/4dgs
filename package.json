@@ -2,9 +2,22 @@
   "name": "4dgs-workspace",
   "private": true,
   "packageManager": "yarn@4.5.0",
-  "workspaces": ["typescript/*", "tests/conformance", "website"],
+  "workspaces": [
+    "typescript/*",
+    "tests/conformance",
+    "website"
+  ],
+  "devDependencies": {
+    "@types/node": "22.10.2",
+    "typescript": "5.6.3"
+  },
   "scripts": {
     "lint": "prettier --check .",
-    "format": "prettier --write ."
+    "format": "prettier --write .",
+    "build": "tsc -b",
+    "typecheck": "tsc -b",
+    "clean": "tsc -b --clean",
+    "test": "tsc -b && node --test typescript/conformance/dist/*.test.js",
+    "conformance": "python3 tests/conformance/run.py --runner typescript"
   }
 }

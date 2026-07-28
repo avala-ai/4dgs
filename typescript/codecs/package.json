@@ -3,10 +3,21 @@
   "version": "0.0.0",
   "description": "4dgs codecs",
   "license": "Apache-2.0",
-  "repository": { "type": "git", "url": "https://github.com/avala-ai/4dgs.git" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/avala-ai/4dgs.git"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "files": ["dist"],
-  "scripts": { "build": "tsc -b", "test": "vitest run", "lint": "eslint src" }
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "tsc -b --clean"
+  },
+  "dependencies": {
+    "@4dgs/core": "workspace:^"
+  }
 }

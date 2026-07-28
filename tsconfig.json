@@ -1,0 +1,10 @@
+{
+  "files": [],
+  "references": [
+    { "path": "typescript/core" },
+    { "path": "typescript/browser" },
+    { "path": "typescript/nodejs" },
+    { "path": "typescript/codecs" },
+    { "path": "typescript/conformance" }
+  ]
+}

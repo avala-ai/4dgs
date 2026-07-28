@@ -12,6 +12,10 @@ node_modules/
 target/
 .pytest_cache/
 .ruff_cache/
+*.tsbuildinfo
+
+# Yarn keeps its cache globally; only the lockfile belongs in the tree
+.yarn/
 
 # Generated documentation is never committed
 __docs__/

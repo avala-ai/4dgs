@@ -1,35 +1,154 @@
-/**
- * @4dgs/core — the 4dgs decoder.
- *
- * In progress. The contract below is stable and is what every transport implements; the
- * decoder built on it lands with the TypeScript milestone.
- */
+// Copyright 2026 Avala AI
+// SPDX-License-Identifier: Apache-2.0
 
 /**
- * Anything that can report its size and read a byte range.
+ * `@4dgs/core` — the 4dgs decoder.
  *
- * The core depends on this and nothing else. A transport may be an HTTP range reader, a
- * file handle, a Blob, an in-memory buffer, or a cache wrapping another readable — the
- * decoder cannot tell the difference and does not try.
+ * No I/O: everything comes through {@link IReadable}, so the same code runs in a browser,
+ * on a server, and in a test over a byte array.
+ *
+ * ```ts
+ * import { decodeScene } from "@4dgs/core";
+ *
+ * const scene = await decodeScene(bytes);
+ * const state = scene.gaussians.stateAt(1.5); // decoding ends here
+ * ```
+ *
+ * Two read paths, both first-class: {@link decodeScene} walks a resource front to back
+ * and works on a pipe or a truncated file, and {@link IndexedDecoder} reads the index and
+ * then only the byte ranges an instant needs. Neither is an optimization of the other.
  */
-export interface IReadable {
-  /** Total size of the resource in bytes. */
-  size(): Promise<bigint>;
 
-  /**
-   * Read exactly `length` bytes starting at `offset`.
-   *
-   * Implementations MUST return the requested range or throw. Returning a short read
-   * silently is the one behaviour that breaks every caller.
-   */
-  read(offset: bigint, length: bigint): Promise<Uint8Array>;
-}
+export { BytesReadable, type IReadable } from "./readable.js";
 
-/** Gaussian state reconstructed at one instant, structure-of-arrays. */
-export interface GaussianSet {
-  count: number;
-  positions: Float32Array;
-  scales: Float32Array;
-  rotations: Float32Array;
-  colors: Float32Array;
-}
+export {
+  FourdgsError,
+  MalformedFile,
+  TruncatedFile,
+  UnsupportedCodec,
+  UnsupportedVersion,
+} from "./errors.js";
+
+export {
+  Attribute,
+  FROZEN_OPCODES,
+  GAUSSIAN_FLAG_NEVER_FADES,
+  HEADER_FLAG_CHUNKS_COMPRESSED,
+  HEADER_FLAG_HAS_AUDIO,
+  Opcode,
+  PRIVATE_OPCODE_START,
+  REQUIRED_ATTRIBUTES,
+  isPrivateOpcode,
+  opcodeName,
+} from "./opcodes.js";
+
+export {
+  CODEC_DEFLATE,
+  CODEC_ZSTD,
+  DEFAULT_CODECS,
+  type CodecRegistry,
+  type Decompressor,
+  codecName,
+  crc32,
+  inflateZlib,
+} from "./codec.js";
+
+export { Cursor } from "./cursor.js";
+
+export {
+  FOOTER_TAIL_BYTES,
+  MAGIC,
+  RECORD_HEADER_BYTES,
+  VERSION,
+  type Attachment,
+  type AudioTrack,
+  type BandRange,
+  type Camera,
+  type CameraKeyframe,
+  type ChunkHeader,
+  type ChunkIndexEntry,
+  type Footer,
+  type Header,
+  type Metadata,
+  type ParsedChunk,
+  type Quantization,
+  type RawRecord,
+  type Statistics,
+  type SummaryOffset,
+  checkMagic,
+  entryCovers,
+  iterateRecords,
+  parseAttachment,
+  parseAudio,
+  parseCamera,
+  parseChunk,
+  parseChunkIndexEntry,
+  parseFooter,
+  parseHeader,
+  parseMetadata,
+  parseQuantization,
+  parseShBandRecord,
+  parseStatistics,
+  parseSummaryOffset,
+  parseWindowTable,
+  readRecord,
+} from "./records.js";
+
+export {
+  MAX_STREAM_BYTES,
+  MODE_CONST,
+  MODE_DELTA,
+  MODE_RAW,
+  type RawStream,
+  decodeStream,
+  frameOneStream,
+  frameStreams,
+  unshuffleAndUnzigzag,
+} from "./streams.js";
+
+export {
+  DEFAULT_CUTOFF,
+  LIFE_MAX_CLASS,
+  LIFE_MIN_CLASS,
+  LIFE_REF,
+  MU_MIN_CLASS,
+  MU_REL,
+  type Steps,
+  dequantizeRotation,
+  lifeClass,
+  motionStep,
+  muStep,
+  rctInverse,
+  supportK,
+} from "./quantization.js";
+
+export {
+  MAX_SH_DEGREE,
+  type ShCoefficients,
+  bandCoefficientRange,
+  coefficientsForDegree,
+  coefficientsInBand,
+  mergeBands,
+} from "./sh.js";
+
+export {
+  type ChunkGaussians,
+  type DecodeChunkOptions,
+  chunkStreamBytes,
+  decodeChunkStreams,
+  stepsFrom,
+} from "./chunk.js";
+
+export { GaussianSet, type GaussianState, assembleGaussians, marginalAt } from "./gaussians.js";
+
+export { StreamDecoder } from "./streamDecoder.js";
+
+export { type DecodeOptions, type Scene, decodeScene } from "./scene.js";
+
+export {
+  HEAD_PROBE_BYTES,
+  IndexedDecoder,
+  type IndexedChunk,
+  type OpenIndexedOptions,
+  type ReadChunkOptions,
+} from "./indexedDecoder.js";
