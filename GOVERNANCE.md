@@ -18,6 +18,16 @@ as the project does; it is a stub, not a constitution.
 Maintained by Avala AI. A formal maintainer list and a path to maintainership will be added when
 there are contributors outside the founding organization.
 
+## Licensing intent
+
+The specification is intended to be implementable **royalty-free**, by anyone, without a licence
+negotiation. Contributors are expected to make their contributions available on the same basis,
+without asserting patents against implementations of the specification.
+
+This is a statement of intent, not yet a formal policy: the precise language will follow legal
+review. It is written down now because anyone deciding whether to implement this deserves to know
+the direction before the paperwork exists.
+
 ## Compatibility commitment
 
 Within a major version, files written by any conforming encoder remain readable by any conforming

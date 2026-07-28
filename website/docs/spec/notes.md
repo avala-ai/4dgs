@@ -90,6 +90,18 @@ is where it belongs.
 
 ---
 
+## Carriage in segmented-delivery systems
+
+The chunk index is a map from time ranges to byte ranges, which is structurally what segmented
+delivery formats want. Mapping a `.4dgs` onto a segmented-delivery manifest — one entry per chunk,
+or per group of chunks — is therefore mostly mechanical, and is a plausible future direction for
+anyone who needs to serve these through existing video infrastructure.
+
+We deliberately did not build version 1 on top of an existing media container. It would have brought
+a large amount of structure the format does not use and coupled every implementation to that
+container's toolchain, in exchange for streaming properties that length-prefixed records and a
+byte-range index already provide. The mapping stays available; the dependency does not.
+
 ## Writing
 
 - **Order matters for streaming readers.** Header first, then the records a reader needs before it

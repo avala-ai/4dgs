@@ -28,6 +28,9 @@ words:
   - visionOS
   - RealityKit
   - Catmull
+  - extrinsics
+  - intrinsics
+  - georeference
   - Avala
   - bibtex
 ignorePaths:

@@ -39,12 +39,14 @@ round-trip stable identities through the format; readers that do not need them s
 
 Used by the Attribute Stream `codec` field and the Chunk `compression` field.
 
-| value   | name      | notes                                                                  |
-| ------- | --------- | ---------------------------------------------------------------------- |
-| 0       | `deflate` | RFC 1950 zlib stream. **The default.** Universally available           |
-| 1       | `zstd`    | RFC 8878. Better on some content; requires a binding on some platforms |
-| 2–127   | reserved  |                                                                        |
-| 128–255 | private   |                                                                        |
+| value   | name      | notes                                                                                                                        |
+| ------- | --------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| 0       | `deflate` | RFC 1950 zlib stream. **The default.** Universally available                                                                 |
+| 1       | `zstd`    | RFC 8878. Better on some content; requires a binding on some platforms                                                       |
+| 2       | reserved  | `atlas-image` — attributes packed into 2D atlases and coded with a standard image codec. A research direction, unimplemented |
+| 3       | reserved  | `atlas-video` — the same, coded as video across time. A research direction, unimplemented                                    |
+| 4–127   | reserved  |                                                                                                                              |
+| 128–255 | private   |                                                                                                                              |
 
 `""` (empty string) in the Chunk `compression` field means the records are stored uncompressed.
 
@@ -53,6 +55,10 @@ the entropy coder is not where the bytes are: on representative content, deflate
 2 % of a strong zstd setting. Writers SHOULD default to `deflate`, because a reader that already
 exists on every platform is worth more than the difference. `zstd` is appropriate for archival
 encodes where every byte counts and the consumer is known.
+
+Rows 2 and 3 are named because packing attributes into images to let mature hardware codecs do the
+compression is a real line of work — not because it is planned. Nothing here commits to either, and
+no writer should emit them.
 
 Because the codec is per-stream, a writer MAY mix them within one file.
 
@@ -72,10 +78,32 @@ Used by the Quantization record's `scheme` field.
 
 Used by the Header's `temporal_model` field.
 
-| value               | notes                                                                                                                             |
-| ------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `gaussian-birth`    | Per-gaussian birth time, temporal sigma, linear velocity and validity window, as in spec §3. The only model defined for version 1 |
-| `deformation-field` | **Reserved, not implemented.** See spec §10.1                                                                                     |
+Dynamic gaussian scenes are produced by several distinct approaches, and a container that hard-codes
+one of them is useless to the rest. This format implements one model and reserves names for the
+others, so a producer from any of these lineages has somewhere to put its data without a
+specification change.
+
+| value               | status          | notes                                                                                                                                                                    |
+| ------------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `gaussian-birth`    | **implemented** | Per-gaussian birth time, temporal sigma, linear velocity and validity window, as in spec §3. Motion belongs to each gaussian and is evaluated in closed form at any time |
+| `frame-sequence`    | reserved        | Each time step is an independent set of gaussians, with no correspondence between steps                                                                                  |
+| `keyframe-delta`    | reserved        | A base set plus per-step deltas against it, with correspondence maintained across steps                                                                                  |
+| `deformation-field` | reserved        | Motion comes from a learned field evaluated per time step rather than baked per gaussian. See spec §10.1                                                                 |
+
+**`frame-sequence`** would need a per-step record carrying that step's complete gaussian set, a
+step-to-time mapping, and a statement of whether steps are uniformly spaced. The chunk and index
+machinery already addresses time ranges, so the work is the record, not the container. Note that
+importing such content into `gaussian-birth` — one validity window per step, zero velocity — is
+always possible and always correct, and is what the reference converter does; it simply does not
+exploit any correspondence the source had.
+
+**`keyframe-delta`** would need a base gaussian set, delta records typed per attribute, a rule for
+which gaussians a delta applies to, and a declared keyframe interval so a reader knows how far back
+it must go to reconstruct a step. Its natural chunk boundary is the keyframe, which the existing
+index expresses unchanged.
+
+Both are reserved rather than designed. Naming them fixes the vocabulary and stops the names being
+spent elsewhere; neither is implemented, and a version-1 writer must not emit them.
 
 ---
 
@@ -93,6 +121,22 @@ understand. A file with **no** audio names nothing, because it carries no Audio 
 spec §7.
 
 ---
+
+## Visibility profiles
+
+Declared with the `visibility_profile` metadata key. A statement of producer intent — no wire
+fields, no decoding difference, because each of these is the existing arithmetic. See spec §3.1.
+
+| value      | status                          | notes                                                                                                                                                                  |
+| ---------- | ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gaussian` | representable                   | The usual soft temporal fade: opacity follows the marginal, which is a bell over `mu_t` with width `sigma_t`                                                           |
+| `box`      | representable                   | Full opacity across the whole validity window and absent outside it, with no fade at all. Expressed by the never-fades flag plus the window                            |
+| `flat-top` | **reserved, not representable** | A plateau at full opacity over a core interval with smooth shoulders either side. Distinct from `box`, whose edges are hard, and from `gaussian`, which has no plateau |
+
+`flat-top` is reserved rather than defined because the version-1 wire model **cannot express it**: a
+gaussian has one width and no plateau, so a profile that is flat in the middle and smooth at the
+edges needs a temporal shape the format does not carry. Naming it here keeps the term from being
+applied loosely to `box`, which is a different curve and the one this format actually has.
 
 ## Camera interpolation
 

@@ -72,6 +72,18 @@ opacity  =  color.a * marginal
 allows one file to hold gaussians fitted independently over different spans of the timeline without
 them bleeding into each other's intervals.
 
+### 3.1 Visibility profiles
+
+The temporal fields describe a soft fade, but the model also expresses a **hard** one. A gaussian
+flagged as never-fading has a marginal of 1 across its whole validity window and is absent outside
+it: full opacity, hard edges, no fade. That is a genuinely different visibility curve from the usual
+bell, reached with the fields that already exist and no extra machinery.
+
+Producers SHOULD declare which they intend with the `visibility_profile` metadata key — `gaussian`
+for the soft fade, `box` for the hard-edged one. It is a statement of intent for consumers and
+tooling; both decode by the same arithmetic, and the registry records a third profile the current
+wire model cannot express, so that the distinction stays explicit.
+
 **The validity window is the format's only hard temporal gate.** `mu_t` and `sigma_t` describe a
 soft fade; `win_lo`/`win_hi` describe existence. A gaussian outside its window does not exist at
 that time, regardless of its marginal.
@@ -343,6 +355,31 @@ u64  group_length
 ```
 
 Lets a reader range-read one class of index record without reading the others.
+
+### 5.15 Provenance family — opcodes `0x20`–`0x2F`, RESERVED
+
+**Reserved, not normative, and not to be emitted by a version-1 writer.** Recorded here so the shape
+is known before anyone needs it, and so the opcodes are not spent on something else.
+
+Scenes reconstructed from sensors carry context that consumers downstream — analysis, simulation,
+quality review — need and that nothing in the format currently expresses. The reserved family
+covers:
+
+- **Sensor description** — per-sensor intrinsics and extrinsics, with the rig they were measured
+  against.
+- **Rig and ego trajectory** — the pose of the capture platform over the scene clock, distinct from
+  the camera trajectory in §5.10, which is a viewing suggestion rather than a measurement.
+- **Source timing** — per-chunk or per-gaussian acquisition timestamps, so a consumer can
+  distinguish scene time from capture time when a rolling or multi-sensor capture makes them differ.
+- **Semantic and instance labels** — per-gaussian class or instance identifiers.
+- **Static and dynamic segmentation** — which gaussians belong to the fixed scene and which to
+  moving content, which a producer often knows and a consumer otherwise has to infer.
+- **Spatial framing** — coordinate frame, units, up-axis, and an optional georeference.
+
+Some of this is expressible today as metadata keys (see the registry) for producers who need it
+before the records exist. The distinction is that metadata is free-form text and these records would
+be typed and indexable; a scene that only needs to say "z is up" should use metadata and always
+will.
 
 ---
 
