@@ -7,34 +7,37 @@ says so.
 **A `Yes` means the conformance suite proves it.** Each SDK declares the variants it
 supports via `supportsVariant()`, the harness runs exactly those, and this table is kept
 in lockstep with those declarations. Nothing is marked `Yes` on the strength of code
-existing.
+existing — which is why every cell below currently reads `Planned`: the specification and
+the conformance scenarios are defined, and no implementation has yet been run against
+them in this repository. Cells flip to `Yes` as the suite starts passing, one row at a
+time.
 
-| Feature | Python | TypeScript | Rust | C++ |
-|---|---|---|---|---|
-| Streaming decode | Yes | Planned | Planned | Planned |
-| Indexed / seeking decode | Yes | Planned | Planned | Planned |
-| Range-request decode | Yes | Planned | Planned | Planned |
-| Truncated-file recovery | Yes | Planned | Planned | Planned |
-| Chunk index | Yes | Planned | Planned | Planned |
-| Summary offsets | Yes | Planned | Planned | Planned |
-| CRC validation | Yes | Planned | Planned | Planned |
-| Quantized attributes | Yes | Planned | Planned | Planned |
-| Spherical harmonics, degree 1 | Yes | Planned | Planned | Planned |
-| Spherical harmonics, degree 2 | Yes | Planned | Planned | Planned |
-| Spherical harmonics, degree 3 | Yes | Planned | Planned | Planned |
-| SH band range-skipping | Yes | Planned | Planned | Planned |
-| Embedded audio (optional, zero-overhead when absent) | Yes | Planned | Planned | Planned |
-| Camera trajectory | Yes | Planned | Planned | Planned |
-| Metadata | Yes | Planned | Planned | Planned |
-| Attachments | Yes | Planned | Planned | Planned |
-| Statistics | Yes | Planned | Planned | Planned |
-| Unknown-record skipping | Yes | Planned | Planned | Planned |
-| Private-range records | Yes | Planned | Planned | Planned |
-| Encode | Yes | Planned | Planned | Planned |
-| Chunked encode | Yes | Planned | Planned | Planned |
-| Summary writing | Yes | Planned | Planned | Planned |
-| Convert from PLY frame sequences | Yes | No | No | No |
-| Inspect and validate | Yes | Planned | Planned | Planned |
+| Feature | Python | TypeScript | Rust | C++ | Swift |
+|---|---|---|---|---|---|
+| Streaming decode | Planned | Planned | Planned | Planned | Planned |
+| Indexed / seeking decode | Planned | Planned | Planned | Planned | Planned |
+| Range-request decode | Planned | Planned | Planned | Planned | Planned |
+| Truncated-file recovery | Planned | Planned | Planned | Planned | Planned |
+| Chunk index | Planned | Planned | Planned | Planned | Planned |
+| Summary offsets | Planned | Planned | Planned | Planned | Planned |
+| CRC validation | Planned | Planned | Planned | Planned | Planned |
+| Quantized attributes | Planned | Planned | Planned | Planned | Planned |
+| Spherical harmonics, degree 1 | Planned | Planned | Planned | Planned | Planned |
+| Spherical harmonics, degree 2 | Planned | Planned | Planned | Planned | Planned |
+| Spherical harmonics, degree 3 | Planned | Planned | Planned | Planned | Planned |
+| SH band range-skipping | Planned | Planned | Planned | Planned | Planned |
+| Embedded audio (optional, zero-overhead when absent) | Planned | Planned | Planned | Planned | Planned |
+| Camera trajectory | Planned | Planned | Planned | Planned | Planned |
+| Metadata | Planned | Planned | Planned | Planned | Planned |
+| Attachments | Planned | Planned | Planned | Planned | Planned |
+| Statistics | Planned | Planned | Planned | Planned | Planned |
+| Unknown-record skipping | Planned | Planned | Planned | Planned | Planned |
+| Private-range records | Planned | Planned | Planned | Planned | Planned |
+| Encode | Planned | Planned | Planned | Planned | Planned |
+| Chunked encode | Planned | Planned | Planned | Planned | Planned |
+| Summary writing | Planned | Planned | Planned | Planned | Planned |
+| Convert from PLY frame sequences | Planned | No | No | No | No |
+| Inspect and validate | Planned | Planned | Planned | Planned | Planned |
 
 ## Reading this table
 
@@ -60,6 +63,7 @@ Python package because it is a batch operation.
 machinery are real, and its bodies are unimplemented. Python is the reference
 implementation until it lands.
 
-**C++** is declared, not started. When Rust lands, the intended path is to generate the
-C++ surface from Rust's C ABI — a header plus a thin shim — rather than hand-writing and
-then maintaining a parallel implementation.
+**C++** and **Swift** are declared, not started. When Rust lands, the intended path for
+both is to generate their surface from Rust's C ABI — a header or a binding plus a thin
+shim — rather than hand-writing and then maintaining parallel implementations. Swift
+targets visionOS and iOS.

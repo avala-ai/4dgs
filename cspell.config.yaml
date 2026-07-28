@@ -1,0 +1,26 @@
+version: "0.2"
+language: en
+words:
+  - gaussian
+  - gaussians
+  - splat
+  - splats
+  - harmonics
+  - quantization
+  - quantize
+  - quantized
+  - dequantize
+  - zigzag
+  - deflate
+  - zstd
+  - Kaitai
+  - typedoc
+  - visionOS
+  - RealityKit
+  - fourdgs
+  - unshuffle
+ignorePaths:
+  - "**/node_modules/**"
+  - "**/dist/**"
+  - "tests/conformance/data/**"
+  - LICENSE

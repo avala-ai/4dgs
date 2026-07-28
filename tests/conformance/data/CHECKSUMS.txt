@@ -1,0 +1,3 @@
+# SHA-256 of each generated .4dgs variant, asserted by `generate.py --verify`.
+# Written by the generator; do not edit by hand.
+# (Populated when the Python encoder lands — see the repository's feature matrix.)

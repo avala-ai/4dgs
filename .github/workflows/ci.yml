@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  size-budget:
+    # The repository stays small enough to clone without thinking about it. Sub-budgets
+    # are in the skeleton brief; this gate is the total.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Total tree size under 8 MB
+        run: |
+          size_kb=$(du -s --exclude=.git . | cut -f1)
+          echo "tree: ${size_kb} KiB"
+          if [ "$size_kb" -gt 8192 ]; then
+            echo "::error::tree is ${size_kb} KiB, over the 8192 KiB budget"
+            exit 1
+          fi
+      - name: Conformance data under 2.5 MB
+        run: |
+          if [ -d tests/conformance/data ]; then
+            size_kb=$(du -s tests/conformance/data | cut -f1)
+            echo "conformance data: ${size_kb} KiB"
+            [ "$size_kb" -le 2560 ] || { echo "::error::conformance data over budget"; exit 1; }
+          fi
+
+  no-committed-binaries:
+    # The corpus is generated. A committed .4dgs means someone bypassed the generator.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          if git ls-files '*.4dgs' | grep -q .; then
+            echo "::error::.4dgs files must not be committed; the generator reconstructs them"
+            git ls-files '*.4dgs'
+            exit 1
+          fi
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install ruff
+      - run: ruff check tests/conformance python || true # becomes blocking with the package
+      - name: Tests
+        run: |
+          if [ -f python/fourdgs/pyproject.toml ]; then
+            pip install -e ./python/fourdgs
+            python -m pytest python/fourdgs/tests -q
+          else
+            echo "python package not landed yet; skipping"
+          fi
+
+  markdown:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - run: npx --yes prettier@3 --check "**/*.md"
+      - run: npx --yes cspell@8 --config cspell.config.yaml "**/*.md"
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --workspace

@@ -1,0 +1,3 @@
+# Specification changes need format-owner review.
+/website/docs/spec/  @avala-ai/format-owners
+/tests/conformance/  @avala-ai/format-owners

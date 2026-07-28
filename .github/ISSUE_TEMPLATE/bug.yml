@@ -1,0 +1,25 @@
+name: Bug report
+description: Something in an SDK or the conformance suite behaves incorrectly
+labels: [bug]
+body:
+  - type: dropdown
+    id: package
+    attributes:
+      label: Package
+      options: [python, typescript, rust, cpp, swift, conformance, spec, docs]
+    validations: { required: true }
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: Include the file that reproduces it if you can share one.
+    validations: { required: true }
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations: { required: true }
+  - type: input
+    id: version
+    attributes:
+      label: Package version

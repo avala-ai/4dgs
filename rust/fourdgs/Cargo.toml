@@ -1,0 +1,11 @@
+[package]
+name = "fourdgs"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Reader and writer for the 4dgs container format (planned)"
+repository = "https://github.com/avala-ai/4dgs"
+publish = false
+
+[lib]
+name = "fourdgs"

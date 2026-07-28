@@ -1,0 +1,12 @@
+{
+  "name": "@4dgs/nodejs",
+  "version": "0.0.0",
+  "description": "4dgs nodejs",
+  "license": "Apache-2.0",
+  "repository": { "type": "git", "url": "https://github.com/avala-ai/4dgs.git" },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": { "build": "tsc -b", "test": "vitest run", "lint": "eslint src" }
+}

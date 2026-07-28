@@ -44,6 +44,7 @@ video.
 | TypeScript | [typescript/](typescript/) | `@4dgs/core` | In progress |
 | Rust | [rust/](rust/) | — | Planned |
 | C++ | [cpp/](cpp/) | — | Planned |
+| Swift | [swift/](swift/) | — | Planned (visionOS) |
 
 Support is per-feature, not per-language: see the
 [feature matrix](website/docs/reference/index.md), which the conformance suite enforces.

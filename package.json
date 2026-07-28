@@ -1,0 +1,10 @@
+{
+  "name": "4dgs-workspace",
+  "private": true,
+  "packageManager": "yarn@4.5.0",
+  "workspaces": ["typescript/*", "tests/conformance", "website"],
+  "scripts": {
+    "lint": "prettier --check .",
+    "format": "prettier --write ."
+  }
+}
