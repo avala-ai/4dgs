@@ -46,16 +46,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - run: pip install ruff
-      - run: ruff check tests/conformance python || true # becomes blocking with the package
+      - run: pip install ruff numpy
+      - run: ruff check --line-length 120 tests/conformance python
+      - run: ruff format --check --line-length 120 tests/conformance python
       - name: Tests
         run: |
-          if [ -f python/fourdgs/pyproject.toml ]; then
-            pip install -e ./python/fourdgs
-            python -m pytest python/fourdgs/tests -q
-          else
-            echo "python package not landed yet; skipping"
-          fi
+          pip install -e ./python/fourdgs
+          python -m pytest python/fourdgs/tests -q
 
   markdown:
     runs-on: ubuntu-latest

@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "4dgs"
+version = "0.1.0"
+description = "Reader and writer for the 4dgs container format for 4D gaussian splat scenes"
+readme = "../README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{ name = "Avala AI" }]
+keywords = ["gaussian-splatting", "4d", "container-format", "volumetric-video"]
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+zstd = ["zstandard>=0.22"]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+fourdgs = "fourdgs.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/avala-ai/4dgs"
+Specification = "https://github.com/avala-ai/4dgs/blob/main/website/docs/spec/index.md"
+
+[tool.setuptools.packages.find]
+include = ["fourdgs*"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]

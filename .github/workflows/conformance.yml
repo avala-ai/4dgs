@@ -16,12 +16,8 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: |
-          if [ -f python/fourdgs/pyproject.toml ]; then
-            pip install -e ./python/fourdgs
-            python tests/conformance/generate.py --verify
-          else
-            echo "encoder not landed yet; corpus generation skipped"
-          fi
+          pip install -e ./python/fourdgs
+          python tests/conformance/generate.py --verify
 
   python:
     runs-on: ubuntu-latest
@@ -31,12 +27,9 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: |
-          if [ -f python/fourdgs/pyproject.toml ]; then
-            pip install -e ./python/fourdgs
-            python tests/conformance/run.py --runner python
-          else
-            echo "python runner not landed yet"
-          fi
+          pip install -e ./python/fourdgs
+          python tests/conformance/generate.py
+          python tests/conformance/run.py --runner python
 
   typescript:
     runs-on: ubuntu-latest

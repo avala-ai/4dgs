@@ -1,0 +1,31 @@
+{
+  "aggregate": {
+    "neverFadesCount": "0",
+    "opacitySum": 0.0,
+    "positionSum": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "zeroMotionCount": "0"
+  },
+  "audio": null,
+  "chunkIntervals": [],
+  "durationSec": 0.0,
+  "gaussianCount": "0",
+  "hasAudio": false,
+  "sample": {
+    "colors": [],
+    "indices": [],
+    "motions": [],
+    "muT": [],
+    "positions": [],
+    "rotations": [],
+    "scales": [],
+    "sigmaT": [],
+    "winHi": [],
+    "winLo": []
+  },
+  "shDegree": 0,
+  "temporalModel": "gaussian-birth"
+}

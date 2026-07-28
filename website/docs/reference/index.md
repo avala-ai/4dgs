@@ -7,37 +7,37 @@ says so.
 **A `Yes` means the conformance suite proves it.** Each SDK declares the variants it
 supports via `supportsVariant()`, the harness runs exactly those, and this table is kept
 in lockstep with those declarations. Nothing is marked `Yes` on the strength of code
-existing — which is why every cell below currently reads `Planned`: the specification and
-the conformance scenarios are defined, and no implementation has yet been run against
-them in this repository. Cells flip to `Yes` as the suite starts passing, one row at a
-time.
+existing.
+
+Python's row is filled in from a suite that runs: 26 variants, two read paths (streamed
+and indexed), 51 checks passing. The other languages have not been run against it yet.
 
 | Feature | Python | TypeScript | Rust | C++ | Swift |
 |---|---|---|---|---|---|
-| Streaming decode | Planned | Planned | Planned | Planned | Planned |
-| Indexed / seeking decode | Planned | Planned | Planned | Planned | Planned |
-| Range-request decode | Planned | Planned | Planned | Planned | Planned |
-| Truncated-file recovery | Planned | Planned | Planned | Planned | Planned |
-| Chunk index | Planned | Planned | Planned | Planned | Planned |
-| Summary offsets | Planned | Planned | Planned | Planned | Planned |
-| CRC validation | Planned | Planned | Planned | Planned | Planned |
-| Quantized attributes | Planned | Planned | Planned | Planned | Planned |
-| Spherical harmonics, degree 1 | Planned | Planned | Planned | Planned | Planned |
-| Spherical harmonics, degree 2 | Planned | Planned | Planned | Planned | Planned |
+| Streaming decode | Yes | Planned | Planned | Planned | Planned |
+| Indexed / seeking decode | Yes | Planned | Planned | Planned | Planned |
+| Range-request decode | Yes | Planned | Planned | Planned | Planned |
+| Truncated-file recovery | Yes | Planned | Planned | Planned | Planned |
+| Chunk index | Yes | Planned | Planned | Planned | Planned |
+| Summary offsets | Yes | Planned | Planned | Planned | Planned |
+| CRC validation | Yes | Planned | Planned | Planned | Planned |
+| Quantized attributes | Yes | Planned | Planned | Planned | Planned |
+| Spherical harmonics, degree 1 | Yes | Planned | Planned | Planned | Planned |
+| Spherical harmonics, degree 2 | Yes | Planned | Planned | Planned | Planned |
 | Spherical harmonics, degree 3 | Planned | Planned | Planned | Planned | Planned |
-| SH band range-skipping | Planned | Planned | Planned | Planned | Planned |
-| Embedded audio (optional, zero-overhead when absent) | Planned | Planned | Planned | Planned | Planned |
-| Camera trajectory | Planned | Planned | Planned | Planned | Planned |
-| Metadata | Planned | Planned | Planned | Planned | Planned |
-| Attachments | Planned | Planned | Planned | Planned | Planned |
-| Statistics | Planned | Planned | Planned | Planned | Planned |
-| Unknown-record skipping | Planned | Planned | Planned | Planned | Planned |
-| Private-range records | Planned | Planned | Planned | Planned | Planned |
-| Encode | Planned | Planned | Planned | Planned | Planned |
-| Chunked encode | Planned | Planned | Planned | Planned | Planned |
-| Summary writing | Planned | Planned | Planned | Planned | Planned |
-| Convert from PLY frame sequences | Planned | No | No | No | No |
-| Inspect and validate | Planned | Planned | Planned | Planned | Planned |
+| SH band range-skipping | Yes | Planned | Planned | Planned | Planned |
+| Embedded audio (optional, zero-overhead when absent) | Yes | Planned | Planned | Planned | Planned |
+| Camera trajectory | Yes | Planned | Planned | Planned | Planned |
+| Metadata | Yes | Planned | Planned | Planned | Planned |
+| Attachments | Yes | Planned | Planned | Planned | Planned |
+| Statistics | Yes | Planned | Planned | Planned | Planned |
+| Unknown-record skipping | Yes | Planned | Planned | Planned | Planned |
+| Private-range records | Yes | Planned | Planned | Planned | Planned |
+| Encode | Yes | Planned | Planned | Planned | Planned |
+| Chunked encode | Yes | Planned | Planned | Planned | Planned |
+| Summary writing | Yes | Planned | Planned | Planned | Planned |
+| Convert from PLY frame sequences | Yes | No | No | No | No |
+| Inspect and validate | Yes | Planned | Planned | Planned | Planned |
 
 ## Reading this table
 
@@ -58,6 +58,14 @@ every SDK can decode from an arbitrary byte-range reader, but only some ship an 
 **Convert from PLY frame sequences** takes a directory of standard per-frame gaussian
 splat PLY files — the common interchange form — and produces a `.4dgs`. It lives in the
 Python package because it is a batch operation.
+
+**Spherical harmonics, degree 3** is implemented and unit-tested in Python, but the
+conformance corpus only carries degree 1 and 2 variants, so by this table's own rule it
+does not get a `Yes` yet. Adding the variant is the work, not adding the feature.
+
+**Convert from PLY frame sequences** and **Inspect and validate** are tools rather than
+wire-format features, so the conformance suite does not cover them; they are marked from
+their own tests.
 
 **Rust** is a compiling stub today: the crate exists so the workspace and the release
 machinery are real, and its bodies are unimplemented. Python is the reference

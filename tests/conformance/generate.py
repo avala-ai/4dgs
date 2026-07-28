@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+# Copyright 2026 Avala AI
+# SPDX-License-Identifier: Apache-2.0
+
+"""Generate the conformance corpus, or verify the committed one.
+
+    python3 tests/conformance/generate.py            # write data/*.4dgs and *.json
+    python3 tests/conformance/generate.py --verify   # regenerate and check nothing moved
+
+`--verify` is the gate that keeps the corpus honest. It asserts three things:
+
+1. every generated file matches its committed SHA-256;
+2. every committed expectation matches a fresh decode;
+3. two consecutive generator runs are byte-identical.
+
+The third is the one that earns its keep: accidental nondeterminism in an encoder —
+iteration order, a hash seed, a timestamp — is invisible locally and shows up as somebody
+else's failing CI.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import io
+import os
+import sys
+
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DATA = os.path.join(HERE, "data")
+CHECKSUMS = os.path.join(DATA, "CHECKSUMS.txt")
+sys.path.insert(0, os.path.join(HERE, "generator"))
+sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(HERE, "..", "..", "python", "fourdgs"))
+
+import scenarios  # noqa: E402
+from canonical import canonical, summarize  # noqa: E402
+
+import fourdgs  # noqa: E402
+from fourdgs.records import Attachment  # noqa: E402
+from fourdgs.serialization import put_record  # noqa: E402
+
+MAX_DATA_BYTES = 2_500_000
+
+
+def build(scenario, flags) -> tuple[bytes, str]:
+    """Encode one variant and produce its expectation."""
+    raw = scenarios.build_gaussians(scenario)
+    n = len(raw["positions"])
+    sh_degree = 2 if "SHDegree2" in flags else (1 if "SHDegree1" in flags else 0)
+    coeffs = {0: 0, 1: 9, 2: 24}[sh_degree]
+
+    gaussians = fourdgs.GaussianSet(
+        positions=np.asarray(raw["positions"], dtype=np.float32).reshape(n, 3),
+        scales=np.asarray(raw["scales"], dtype=np.float32).reshape(n, 3),
+        rotations=np.asarray(raw["rotations"], dtype=np.float32).reshape(n, 4),
+        colors=np.asarray(raw["colors"], dtype=np.float32).reshape(n, 4),
+        motions=np.asarray(raw["motions"], dtype=np.float32).reshape(n, 3),
+        mu_t=np.asarray(raw["mu_t"], dtype=np.float32),
+        sigma_t=np.asarray(raw["sigma_t"], dtype=np.float32),
+        win_lo=np.asarray(raw["win_lo"], dtype=np.float32),
+        win_hi=np.asarray(raw["win_hi"], dtype=np.float32),
+        sh=(np.arange(n * coeffs, dtype=np.int64) % 251).astype(np.uint8).reshape(n, coeffs) if coeffs else None,
+        sh_degree=sh_degree,
+    )
+
+    audio = None
+    if "WithAudio" in flags:
+        audio = fourdgs.AudioTrack(codec="wav", data=scenarios.build_audio(), start_sec=0.0)
+    camera = None
+    if "WithCamera" in flags:
+        camera = fourdgs.CameraTrajectory(
+            fov_y_deg=45.0,
+            position=(0.0, 1.0, 3.0),
+            target=(0.0, 0.0, 0.0),
+            times=[0.0, raw["duration_sec"]],
+            positions=[(0.0, 1.0, 3.0), (1.0, 1.0, 3.0)],
+            targets=[(0.0, 0.0, 0.0), (0.0, 0.0, 0.0)],
+        )
+
+    extra: list[bytes] = []
+    if "AddExtraDataToRecords" in flags:
+        # A private-range record and an unknown spec-range record, written BY the encoder
+        # so the index offsets account for them. A conforming reader steps over both.
+        extra.append(put_record(0x91, b"private application record"))
+        extra.append(put_record(0x7D, b"unknown future record"))
+    if "WithAttachment" in flags:
+        extra.append(Attachment(name="note.txt", media_type="text/plain", data=b"conformance").encode())
+
+    options = fourdgs.WriteOptions(
+        profile="coarse" if "Quantized" in flags else "default",
+        min_chunk_gaussians=8 if "UseChunks" in flags else 10**9,
+        max_depth=4 if "UseChunks" in flags else 0,
+        write_index="UseChunkIndex" in flags,
+        write_statistics="UseStatistics" in flags,
+        write_summary_offsets="UseSummaryOffset" in flags,
+        write_crc="UseCrc" in flags,
+        library="4dgs conformance generator",
+        scene_profile="baked" if scenario.long_lived else "capture",
+        metadata={"scenario": scenario.name} if "WithMetadata" in flags else None,
+        extra_records=tuple(extra),
+    )
+
+    buf = io.BytesIO()
+    fourdgs.write(buf, gaussians, raw["duration_sec"], options=options, audio=audio, camera=camera)
+    data = buf.getvalue()
+
+    scene = fourdgs.read(data)
+    expectation = canonical(
+        summarize(
+            scene.header,
+            scene.gaussians,
+            scene.audio,
+            [(e.t0, e.t1) for e in scene.chunk_index],
+        )
+    )
+    return data, expectation
+
+
+def write_corpus(target: str) -> dict[str, str]:
+    os.makedirs(target, exist_ok=True)
+    checksums: dict[str, str] = {}
+    for scenario, flags in scenarios.variants():
+        name = scenarios.variant_name(scenario, flags)
+        data, expectation = build(scenario, flags)
+        with open(os.path.join(target, f"{name}.4dgs"), "wb") as fh:
+            fh.write(data)
+        with open(os.path.join(target, f"{name}.json"), "w", encoding="utf-8") as fh:
+            fh.write(expectation + "\n")
+        checksums[name] = hashlib.sha256(data).hexdigest()
+    return checksums
+
+
+def write_checksums(checksums: dict[str, str]) -> None:
+    lines = [
+        "# SHA-256 of each generated .4dgs variant, asserted by `generate.py --verify`.",
+        "# Written by the generator; do not edit by hand.",
+    ]
+    lines += [f"{digest}  {name}.4dgs" for name, digest in sorted(checksums.items())]
+    with open(CHECKSUMS, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+def read_checksums() -> dict[str, str]:
+    out: dict[str, str] = {}
+    if not os.path.exists(CHECKSUMS):
+        return out
+    with open(CHECKSUMS, encoding="utf-8") as fh:
+        for line in fh:
+            if line.startswith("#") or not line.strip():
+                continue
+            digest, name = line.split()
+            out[name[: -len(".4dgs")]] = digest
+    return out
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="generate or verify the 4dgs conformance corpus")
+    parser.add_argument("--verify", action="store_true", help="regenerate and assert nothing moved")
+    args = parser.parse_args(argv)
+
+    checksums = write_corpus(DATA)
+    total = sum(os.path.getsize(os.path.join(DATA, f)) for f in os.listdir(DATA))
+    print(f"{len(checksums)} variants, {total / 1024:.0f} KiB in {DATA}")
+
+    if total > MAX_DATA_BYTES:
+        print(f"error: corpus is {total} bytes, over the {MAX_DATA_BYTES} cap — prune variants", file=sys.stderr)
+        return 1
+
+    if not args.verify:
+        write_checksums(checksums)
+        print(f"wrote {CHECKSUMS}")
+        return 0
+
+    committed = read_checksums()
+    failures = []
+    if not committed:
+        failures.append("CHECKSUMS.txt is missing or empty")
+    for name, digest in sorted(checksums.items()):
+        if name not in committed:
+            failures.append(f"{name}: no committed checksum")
+        elif committed[name] != digest:
+            failures.append(f"{name}: checksum {digest[:16]}… != committed {committed[name][:16]}…")
+    for name in committed:
+        if name not in checksums:
+            failures.append(f"{name}: committed checksum has no variant")
+
+    # Determinism: a second run must produce the same bytes.
+    second = {}
+    for scenario, flags in scenarios.variants():
+        data, _ = build(scenario, flags)
+        second[scenarios.variant_name(scenario, flags)] = hashlib.sha256(data).hexdigest()
+    for name, digest in checksums.items():
+        if second.get(name) != digest:
+            failures.append(f"{name}: encoder is not deterministic between runs")
+
+    if failures:
+        print("conformance corpus verification FAILED:", file=sys.stderr)
+        for f in failures:
+            print(f"  {f}", file=sys.stderr)
+        print("\nif the change was intended, rerun without --verify and commit the result", file=sys.stderr)
+        return 1
+
+    print(f"verified {len(checksums)} variants: checksums match and the encoder is deterministic")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
