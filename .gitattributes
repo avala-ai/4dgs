@@ -1,0 +1,7 @@
+# Conformance expectations are generated; keep them out of diffs and language stats.
+tests/conformance/data/** linguist-generated=true
+
+# Normalize line endings for text; the format's magic is CRLF-sensitive by design,
+# so binary fixtures must never be filtered.
+* text=auto
+*.4dgs binary

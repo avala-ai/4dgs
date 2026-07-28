@@ -1,0 +1,19 @@
+# Generated conformance binaries — reconstructed deterministically before every run.
+tests/conformance/data/*.4dgs
+
+# Build and tooling output
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+build/
+*.egg-info/
+node_modules/
+target/
+.pytest_cache/
+.ruff_cache/
+
+# Generated documentation is never committed
+__docs__/
+site/
+website/build/
