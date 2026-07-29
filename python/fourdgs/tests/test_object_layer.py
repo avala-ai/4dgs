@@ -295,6 +295,46 @@ def test_refusals(build, code):
     assert caught.value.code == code, f"expected {code!r}, refused as {caught.value.code!r}"
 
 
+@pytest.mark.parametrize(
+    ("table", "field", "code"),
+    [
+        (rec.ObjectTable(embedding_dim=-1), "embedding_dim", "invalid-object-embedding-dim"),
+        (rec.ObjectTable(embedding_dim=65536), "embedding_dim", "invalid-object-embedding-dim"),
+        (rec.ObjectTable(embedding_dim=1.5), "embedding_dim", "invalid-object-embedding-dim"),
+        (
+            rec.ObjectTable(entries=[rec.ObjectTableEntry(object_id=7, anchor=(1e100, 0.0, 0.0))]),
+            "anchor[0]",
+            "object-value-out-of-f32-range",
+        ),
+        (
+            rec.ObjectTable(
+                entries=[
+                    rec.ObjectTableEntry(
+                        object_id=7,
+                        dynamics=([1e100, 0.0, 0.0], [0.0] * 3, [0.0] * 3),
+                    )
+                ]
+            ),
+            "velocity[0]",
+            "object-value-out-of-f32-range",
+        ),
+        (
+            rec.ObjectTable(
+                embedding_dim=1,
+                entries=[rec.ObjectTableEntry(object_id=7, embedding=[1e100])],
+            ),
+            "embedding[0]",
+            "object-value-out-of-f32-range",
+        ),
+    ],
+)
+def test_object_table_writer_names_values_that_do_not_fit_the_wire(table, field, code):
+    with pytest.raises(MalformedFile) as caught:
+        table.encode()
+    assert field in str(caught.value)
+    assert caught.value.code == code
+
+
 # --------------------------------------------------------------------------
 # Full-file integration: writer -> reader, both streamed and indexed
 # --------------------------------------------------------------------------

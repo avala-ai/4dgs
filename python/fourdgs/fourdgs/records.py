@@ -34,6 +34,7 @@ from .serialization import (
 
 FLAG_HAS_AUDIO = 1 << 0
 FLAG_CHUNKS_COMPRESSED = 1 << 1
+_F32_MAX = float.fromhex("0x1.fffffep+127")
 
 
 @dataclass
@@ -948,6 +949,7 @@ class ObjectTable:
     entries: list[ObjectTableEntry] = field(default_factory=list)
 
     def encode(self, trailer: bytes = b"") -> bytes:
+        self.check()
         body = put_u32(len(self.entries)) + put_u16(self.embedding_dim)
         for e in self.entries:
             body += put_u32(e.object_id) + put_string(e.label) + put_f32s(e.anchor)
@@ -1003,6 +1005,15 @@ class ObjectTable:
         is a coin toss. A non-finite embedding is not a weak match, it poisons every
         cosine similarity computed against it, so it is refused rather than surfaced.
         """
+        try:
+            embedding_dim = operator.index(self.embedding_dim)
+        except TypeError:
+            embedding_dim = -1
+        if not 0 <= embedding_dim <= 0xFFFF:
+            raise MalformedFile(
+                f"ObjectTable embedding_dim is {self.embedding_dim!r}; expected an integer in [0, 65535]",
+                code="invalid-object-embedding-dim",
+            )
         seen: set[int] = set()
         for e in self.entries:
             try:
@@ -1022,15 +1033,11 @@ class ObjectTable:
                 )
             seen.add(e.object_id)
             for k, value in enumerate(e.anchor):
-                if not math.isfinite(value):
-                    raise MalformedFile(f"object {e.object_id}: anchor[{k}] is {value}", code="non-finite-object-value")
+                _check_object_f32(value, f"object {e.object_id}: anchor[{k}]")
             if e.dynamics is not None:
                 for name, vector in zip(("velocity", "angular_velocity", "acceleration"), e.dynamics, strict=True):
                     for k, value in enumerate(vector):
-                        if not math.isfinite(value):
-                            raise MalformedFile(
-                                f"object {e.object_id}: {name}[{k}] is {value}", code="non-finite-object-value"
-                            )
+                        _check_object_f32(value, f"object {e.object_id}: {name}[{k}]")
             if e.embedding is not None:
                 if self.embedding_dim == 0:
                     raise MalformedFile(
@@ -1044,10 +1051,23 @@ class ObjectTable:
                         code="invalid-object-embedding-shape",
                     )
                 for k, value in enumerate(e.embedding):
-                    if not math.isfinite(value):
-                        raise MalformedFile(
-                            f"object {e.object_id}: embedding[{k}] is {value}", code="non-finite-object-value"
-                        )
+                    _check_object_f32(value, f"object {e.object_id}: embedding[{k}]")
+
+
+def _check_object_f32(value, field: str) -> None:
+    try:
+        finite = math.isfinite(value)
+        magnitude = abs(value)
+    except (TypeError, OverflowError):
+        finite = False
+        magnitude = math.inf
+    if not finite:
+        raise MalformedFile(f"{field} is {value!r}, expected a finite f32", code="non-finite-object-value")
+    if magnitude > _F32_MAX:
+        raise MalformedFile(
+            f"{field} is {value!r}, outside the finite f32 range [-{_F32_MAX}, {_F32_MAX}]",
+            code="object-value-out-of-f32-range",
+        )
 
 
 @dataclass
