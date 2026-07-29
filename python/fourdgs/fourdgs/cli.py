@@ -83,9 +83,7 @@ def cmd_info(args) -> int:
                 detail += f", {sensor.width_px}x{sensor.height_px}, f=({sensor.fx:g}, {sensor.fy:g})"
             print(f"  sensor       {sensor.name}  [{detail}]  posed against {posed}")
         for trajectory in provenance.trajectories:
-            span = (
-                f"{trajectory.times[0]:.3f}..{trajectory.times[-1]:.3f} s" if trajectory.sample_count else "empty"
-            )
+            span = f"{trajectory.times[0]:.3f}..{trajectory.times[-1]:.3f} s" if trajectory.sample_count else "empty"
             print(
                 f"  rig          {trajectory.name or '(capture rig)'}  {trajectory.sample_count} samples, "
                 f"{span}, {name_of(TRAJECTORY_INTERPOLATION_NAMES, trajectory.interpolation)}"

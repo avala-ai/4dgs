@@ -103,6 +103,10 @@ pub struct SceneExtras {
     pub camera: Option<rec::Camera>,
     pub metadata: Vec<rec::Metadata>,
     pub attachments: Vec<rec::Attachment>,
+    /// Provenance records to emit (spec section 5.15). Empty writes none, which is the
+    /// default and costs nothing — no record, no placeholder, no Header flag. A scene with
+    /// no sensors behind it is a complete file, not an under-specified one.
+    pub provenance: crate::provenance::Provenance,
 }
 
 /// Encode a scene into a byte vector.
@@ -602,6 +606,30 @@ fn encode(
             .encode(),
         );
     }
+    // Provenance, in ascending opcode order: the frame the poses are expressed in, then
+    // the sensors, then the trajectories, then the georeference. Nothing requires that
+    // order of a reader — records are dispatched by opcode, not position — but a file
+    // written this way reads close to the order a human would explain it.
+    if !extras.provenance.is_empty() {
+        extras.provenance.check()?;
+        for frame in &extras.provenance.frames {
+            frame.check()?;
+            out.extend_from_slice(&frame.encode(&[]));
+        }
+        for sensor in &extras.provenance.sensors {
+            sensor.check()?;
+            out.extend_from_slice(&sensor.encode(&[]));
+        }
+        for trajectory in &extras.provenance.trajectories {
+            trajectory.check()?;
+            out.extend_from_slice(&trajectory.encode(&[]));
+        }
+        for anchor in &extras.provenance.anchors {
+            anchor.check()?;
+            out.extend_from_slice(&anchor.encode(&[]));
+        }
+    }
+
     if let Some(camera) = &extras.camera {
         out.extend_from_slice(&camera.encode());
     }

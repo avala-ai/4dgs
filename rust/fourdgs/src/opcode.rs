@@ -23,6 +23,25 @@ pub const ATTACHMENT: u8 = 0x0D;
 pub const ATTACHMENT_INDEX: u8 = 0x0E;
 pub const SUMMARY_OFFSET: u8 = 0x0F;
 
+// The provenance family, spec section 5.15. The first three run in dependency order —
+// a sensor's extrinsic and a rig's pose are poses in a frame, and `0x20` names that
+// frame. `GEODETIC_ANCHOR` holds `0x23` because it was defined after them; an opcode is
+// not something a later revision gets to renumber for tidiness.
+pub const COORDINATE_FRAME: u8 = 0x20;
+pub const SENSOR_CALIBRATION: u8 = 0x21;
+pub const RIG_TRAJECTORY: u8 = 0x22;
+pub const GEODETIC_ANCHOR: u8 = 0x23;
+
+/// First opcode of the provenance family, and one past its last. `0x24`-`0x2F` are
+/// reserved for source timing and the per-gaussian label work (spec section 5.15.6).
+pub const PROVENANCE_START: u8 = 0x20;
+pub const PROVENANCE_END: u8 = 0x30;
+
+/// True for the provenance family, defined and reserved alike.
+pub fn is_provenance(opcode: u8) -> bool {
+    (PROVENANCE_START..PROVENANCE_END).contains(&opcode)
+}
+
 /// First opcode of the application range, which this specification never defines.
 pub const PRIVATE_START: u8 = 0x80;
 
@@ -49,6 +68,10 @@ pub fn name(opcode: u8) -> String {
         ATTACHMENT => "Attachment",
         ATTACHMENT_INDEX => "AttachmentIndex",
         SUMMARY_OFFSET => "SummaryOffset",
+        COORDINATE_FRAME => "CoordinateFrame",
+        SENSOR_CALIBRATION => "SensorCalibration",
+        RIG_TRAJECTORY => "RigTrajectory",
+        GEODETIC_ANCHOR => "GeodeticAnchor",
         _ => {
             return if is_private(opcode) {
                 format!("Private(0x{opcode:02X})")

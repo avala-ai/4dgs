@@ -110,7 +110,7 @@ def _normalize(q) -> tuple[float, float, float, float]:
 def slerp(a, b, u: float) -> tuple[float, float, float, float]:
     """Shortest-arc spherical interpolation between two unit quaternions.
 
-    The sign flip is a correctness rule, not an optimization: `q` and `−q` are the
+    The sign flip is a correctness rule, not an optimization: `q` and `-q` are the
     same rotation, so without it a trajectory takes the long way round between two
     poses a degree apart — for one interval, once per sign flip, which is exactly
     the kind of defect that survives a demo and shows up in someone's analysis.
@@ -261,8 +261,7 @@ class Provenance:
         trajectory = self.trajectory(sensor.rig_name)
         if trajectory is None:
             raise MalformedFile(
-                f"sensor {sensor.name!r} is posed against rig {sensor.rig_name!r}, "
-                "which this file does not carry"
+                f"sensor {sensor.name!r} is posed against rig {sensor.rig_name!r}, which this file does not carry"
             )
         rig = pose_at(trajectory, t)
         return extrinsic if rig is None else rig.compose(extrinsic)

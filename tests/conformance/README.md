@@ -94,6 +94,26 @@ Every scene is generated from a fixed seed by `build_gaussians`, and the audio t
 sine sweep. There is no captured data in this repository and there will not be: the corpus must be
 redistributable without a licence question and reproducible without a download.
 
+## Declining a feature is how a partial SDK stays honest
+
+`run.py` lets a whole language family decline the variants carrying a feature it has not
+implemented, alongside the per-runner `supportsVariant`. The provenance variants (spec §5.15) are
+the first users of it: TypeScript, C++ and Swift decline them, and the feature matrix records the
+`No`.
+
+The alternative was worse in a way worth writing down. The canonical summary emits its `provenance`
+section **only when the file carries provenance** — unlike `audio`, which is `null` when absent
+because audio presence is a property of every file and both paths must stay visible. Had provenance
+followed the `audio` convention, every one of the 34 pre-existing expectations would have gained a
+`"provenance": null`, and three SDKs that correctly skip the records by length would have gone red
+on all of them. The suite would have reported the format's forward-compatibility mechanism working
+as 34 failures.
+
+So the shape is: a file without provenance is byte-identical to what it was before the family
+existed, its expectation is unchanged, and every SDK passes it untouched — that is the assertion. A
+file with provenance is compared in full by the SDKs that implement it, and declined by the ones
+that do not.
+
 ## Known gaps
 
 Recorded here rather than left implicit, because a gap nobody wrote down is indistinguishable from

@@ -41,6 +41,7 @@ pub mod error;
 pub mod indexed_reader;
 pub mod model;
 pub mod opcode;
+pub mod provenance;
 pub mod quantization;
 pub mod readable;
 pub mod reader;
@@ -53,11 +54,12 @@ pub mod writer;
 
 pub use crate::error::{Error, Result};
 pub use crate::model::{AudioTrack, CameraTrajectory, GaussianSet, StateAt};
+pub use crate::provenance::{pose_at, slerp, Pose, Provenance};
 pub use crate::readable::{BytesReadable, FileReadable, Readable};
 pub use crate::reader::{Mode, SceneReader};
 pub use crate::records::{
-    Attachment, Camera, ChunkIndexEntry, Footer, Header, Metadata, Quantization, Statistics,
-    SummaryOffset, WindowTable,
+    Attachment, Camera, ChunkIndexEntry, CoordinateFrame, Footer, GeodeticAnchor, Header, Metadata,
+    Quantization, RigTrajectory, SensorCalibration, Statistics, SummaryOffset, WindowTable,
 };
 pub use crate::serialization::{MAGIC, VERSION};
 pub use crate::stream_reader::{read_bytes, read_from, read_path, ReadOptions, Scene};

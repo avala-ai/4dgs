@@ -161,6 +161,7 @@ fn seed_file(gaussians: usize, audio: bool, sh_degree: u8, index: bool) -> Vec<u
             media_type: "text/plain".into(),
             data: b"attached".to_vec(),
         }],
+        ..Default::default()
     };
     fourdgs::write_to_vec(&g, 2.0, &options, &extras).expect("the seed encodes")
 }

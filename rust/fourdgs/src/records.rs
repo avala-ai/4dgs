@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::opcode as op;
 use crate::serialization::{
     put_blob, put_f64, put_f64s, put_record, put_str_map, put_string, put_u32, put_u64, put_u8,
@@ -559,6 +559,470 @@ impl SummaryOffset {
         put_u64(&mut body, self.group_length);
         let mut out = Vec::new();
         put_record(&mut out, op::SUMMARY_OFFSET, &body);
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Provenance family (spec section 5.15)
+//
+// Four optional records, none announced by a Header flag. Absence is the common case
+// and costs nothing: a scene with no provenance carries no record, no placeholder and
+// no reserved bytes, exactly as a scene without audio does.
+//
+// What `parse` refuses here is narrower than what a validator reports. A parse refuses
+// only the structurally impossible — a basis that is not a basis, a quaternion with no
+// direction, timestamps that make an interval ambiguous — because those are values no
+// consumer can do anything sensible with. A value that is merely unrecognized (a
+// modality this build has not heard of, a camera model it cannot project with) survives
+// parsing and reaches the caller raw, which is the distinction between "malformed" and
+// "from a newer registry" that a caller needs in order to react differently to the two.
+// ---------------------------------------------------------------------------
+
+/// Registry ids for `CoordinateFrame::camera_model`-adjacent enums live in
+/// [`crate::provenance`]; these two are wire constants the records themselves need.
+pub const POSE_TO_SCENE: u8 = 0;
+pub const POSE_TO_RIG: u8 = 1;
+
+pub const TRAJECTORY_LINEAR: u8 = 0;
+pub const TRAJECTORY_STEP: u8 = 1;
+
+/// Coefficient counts each camera model defines, keyed by its registry id. A model
+/// absent from here is one this build does not know, which is not the same as one that
+/// is wrong: `None` means "ask the caller", not "refuse".
+pub fn camera_model_coefficients(model: u8) -> Option<&'static [usize]> {
+    match model {
+        0 | 1 => Some(&[0]),
+        2 => Some(&[5, 8]),
+        3 => Some(&[4]),
+        _ => None,
+    }
+}
+
+/// The frame a file's own coordinates are expressed in. Opcode `0x20`.
+///
+/// A **fixed shape**: every field is always present, so a reader that knows these six
+/// knows exactly where an appended seventh would begin. The georeference is a separate
+/// record ([`GeodeticAnchor`], `0x23`) for that reason — a conditional block inside a
+/// record makes the offset of everything after it depend on a value, and the format
+/// already has an idiom for optional-with-zero-cost-absence: a record that is not there.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CoordinateFrame {
+    pub name: String,
+    pub handedness: u8,
+    pub up_axis: u8,
+    pub forward_axis: u8,
+    pub length_unit: u8,
+    pub metres_per_unit: f64,
+}
+
+impl CoordinateFrame {
+    pub fn parse(content: &[u8]) -> Result<CoordinateFrame> {
+        let mut c = Cursor::new(content);
+        let frame = CoordinateFrame {
+            name: c.string()?,
+            handedness: c.u8()?,
+            up_axis: c.u8()?,
+            forward_axis: c.u8()?,
+            length_unit: c.u8()?,
+            metres_per_unit: c.f64()?,
+        };
+        frame.check()?;
+        Ok(frame)
+    }
+
+    /// Refuse a frame that is not one, rather than repair it.
+    ///
+    /// The reasoning is section 5.4's, about window indices: a degenerate basis does not
+    /// announce itself. It silently re-orients everything a consumer derives from it, and
+    /// a reader that guessed the missing axis would turn a detectable fault into
+    /// plausible wrong output.
+    pub fn check(&self) -> Result<()> {
+        for (label, axis) in [
+            ("up_axis", self.up_axis),
+            ("forward_axis", self.forward_axis),
+        ] {
+            if axis > 5 {
+                return Err(Error::Malformed(format!(
+                    "CoordinateFrame {label} is {axis}; the registry defines 0..5 (section 5.15.2)"
+                )));
+            }
+        }
+        if self.up_axis % 3 == self.forward_axis % 3 {
+            return Err(Error::Malformed(format!(
+                "CoordinateFrame up_axis {} and forward_axis {} name the same axis; \
+                 a frame needs two different ones (section 5.15.2)",
+                self.up_axis, self.forward_axis
+            )));
+        }
+        if !self.metres_per_unit.is_finite() || self.metres_per_unit < 0.0 {
+            return Err(Error::Malformed(format!(
+                "CoordinateFrame metres_per_unit is {}; it must be finite and not negative \
+                 (section 5.15.2)",
+                self.metres_per_unit
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self, trailer: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        put_string(&mut body, &self.name);
+        put_u8(&mut body, self.handedness);
+        put_u8(&mut body, self.up_axis);
+        put_u8(&mut body, self.forward_axis);
+        put_u8(&mut body, self.length_unit);
+        put_f64(&mut body, self.metres_per_unit);
+        body.extend_from_slice(trailer);
+        let mut out = Vec::new();
+        put_record(&mut out, op::COORDINATE_FRAME, &body);
+        out
+    }
+}
+
+/// Where a frame's origin sits on the WGS-84 ellipsoid, and which way it faces.
+/// Opcode `0x23`.
+///
+/// It answers "roughly where on Earth is this" and stops. A producer needing a projected
+/// coordinate system, a geoid model or a datum other than WGS-84 puts it in metadata or
+/// an attachment; growing this record into a geodetic library is how a container format
+/// stops being one.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GeodeticAnchor {
+    pub frame_name: String,
+    pub latitude_deg: f64,
+    pub longitude_deg: f64,
+    pub altitude_m: f64,
+    pub heading_deg: f64,
+}
+
+impl GeodeticAnchor {
+    pub fn parse(content: &[u8]) -> Result<GeodeticAnchor> {
+        let mut c = Cursor::new(content);
+        let frame_name = c.string()?;
+        let v = c.f64s(4)?;
+        let anchor = GeodeticAnchor {
+            frame_name,
+            latitude_deg: v[0],
+            longitude_deg: v[1],
+            altitude_m: v[2],
+            heading_deg: v[3],
+        };
+        anchor.check()?;
+        Ok(anchor)
+    }
+
+    /// Refuse an out-of-range angle rather than wrap it.
+    ///
+    /// Unlike the unit disagreement in [`CoordinateFrame`], there is no second field to
+    /// fall back on here: a latitude of 130 degrees has no reading that is merely
+    /// approximate, and normalizing it would invent a location.
+    pub fn check(&self) -> Result<()> {
+        for (label, value, lo, hi) in [
+            ("latitude_deg", self.latitude_deg, -90.0, 90.0),
+            ("longitude_deg", self.longitude_deg, -180.0, 180.0),
+            (
+                "altitude_m",
+                self.altitude_m,
+                f64::NEG_INFINITY,
+                f64::INFINITY,
+            ),
+            ("heading_deg", self.heading_deg, 0.0, 360.0),
+        ] {
+            if !value.is_finite() {
+                return Err(Error::Malformed(format!(
+                    "GeodeticAnchor {label} is {value}; every field must be finite"
+                )));
+            }
+            let past_end = label == "heading_deg" && value == 360.0;
+            if value < lo || value > hi || past_end {
+                return Err(Error::Malformed(format!(
+                    "GeodeticAnchor {label} is {value}, outside its legal range (section 5.15.5)"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self, trailer: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        put_string(&mut body, &self.frame_name);
+        put_f64s(
+            &mut body,
+            &[
+                self.latitude_deg,
+                self.longitude_deg,
+                self.altitude_m,
+                self.heading_deg,
+            ],
+        );
+        body.extend_from_slice(trailer);
+        let mut out = Vec::new();
+        put_record(&mut out, op::GEODETIC_ANCHOR, &body);
+        out
+    }
+}
+
+/// One sensor's intrinsics and extrinsics. Opcode `0x21`, one record per sensor.
+///
+/// The extrinsic maps sensor coordinates into the frame `pose_reference` names, in that
+/// direction: `p_target = R(rotation) * p_sensor + translation`. The opposite convention
+/// is equally common in the field, which is why the direction is written down in both the
+/// specification and here — a consumer that assumes wrongly gets a scene that is merely
+/// mis-placed rather than one that fails.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SensorCalibration {
+    pub name: String,
+    pub modality: String,
+    pub camera_model: u8,
+    pub width_px: u32,
+    pub height_px: u32,
+    pub fx: f64,
+    pub fy: f64,
+    pub cx: f64,
+    pub cy: f64,
+    pub distortion: Vec<f64>,
+    /// Unit quaternion, `xyzw` — the same order as spec §3 and §6.4.
+    pub rotation: [f64; 4],
+    pub translation: [f64; 3],
+    pub pose_reference: u8,
+    pub rig_name: String,
+}
+
+impl SensorCalibration {
+    pub fn is_camera(&self) -> bool {
+        self.camera_model != 0
+    }
+
+    pub fn parse(content: &[u8]) -> Result<SensorCalibration> {
+        let mut c = Cursor::new(content);
+        let name = c.string()?;
+        let modality = c.string()?;
+        let camera_model = c.u8()?;
+        let width_px = c.u32()?;
+        let height_px = c.u32()?;
+        let intr = c.f64s(4)?;
+        let count = c.u8()? as usize;
+        let distortion = c.f64s(count)?;
+        let rot = c.f64s(4)?;
+        let tr = c.f64s(3)?;
+        let sensor = SensorCalibration {
+            name,
+            modality,
+            camera_model,
+            width_px,
+            height_px,
+            fx: intr[0],
+            fy: intr[1],
+            cx: intr[2],
+            cy: intr[3],
+            distortion,
+            rotation: [rot[0], rot[1], rot[2], rot[3]],
+            translation: [tr[0], tr[1], tr[2]],
+            pose_reference: c.u8()?,
+            rig_name: c.string()?,
+        };
+        sensor.check()?;
+        Ok(sensor)
+    }
+
+    pub fn check(&self) -> Result<()> {
+        let finite = |label: &str, value: f64| -> Result<()> {
+            if value.is_finite() {
+                Ok(())
+            } else {
+                Err(Error::Malformed(format!(
+                    "sensor {:?}: {label} is {value}; every value must be finite",
+                    self.name
+                )))
+            }
+        };
+        finite("fx", self.fx)?;
+        finite("fy", self.fy)?;
+        finite("cx", self.cx)?;
+        finite("cy", self.cy)?;
+        for (i, v) in self.distortion.iter().enumerate() {
+            finite(&format!("distortion[{i}]"), *v)?;
+        }
+        for (i, v) in self.rotation.iter().enumerate() {
+            finite(&format!("rotation[{i}]"), *v)?;
+        }
+        for (i, v) in self.translation.iter().enumerate() {
+            finite(&format!("translation[{i}]"), *v)?;
+        }
+
+        let norm = self.rotation.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if !norm.is_finite() || norm == 0.0 {
+            return Err(Error::Malformed(format!(
+                "sensor {:?}: rotation quaternion has no direction (norm {norm})",
+                self.name
+            )));
+        }
+
+        if let Some(legal) = camera_model_coefficients(self.camera_model) {
+            if !legal.contains(&self.distortion.len()) {
+                return Err(Error::Malformed(format!(
+                    "sensor {:?}: camera model {} defines {} distortion coefficients, \
+                     the record carries {}",
+                    self.name,
+                    self.camera_model,
+                    legal
+                        .iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" or "),
+                    self.distortion.len()
+                )));
+            }
+        }
+
+        if !self.is_camera() {
+            for (label, nonzero) in [
+                ("width_px", self.width_px != 0),
+                ("height_px", self.height_px != 0),
+                ("fx", self.fx != 0.0),
+                ("fy", self.fy != 0.0),
+                ("cx", self.cx != 0.0),
+                ("cy", self.cy != 0.0),
+            ] {
+                if nonzero {
+                    return Err(Error::Malformed(format!(
+                        "sensor {:?} declares camera_model 0 but a non-zero {label}",
+                        self.name
+                    )));
+                }
+            }
+        } else if self.fx == 0.0 || self.fy == 0.0 || self.width_px == 0 || self.height_px == 0 {
+            return Err(Error::Malformed(format!(
+                "sensor {:?} declares camera model {} but has a zero focal length or image size",
+                self.name, self.camera_model
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self, trailer: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        put_string(&mut body, &self.name);
+        put_string(&mut body, &self.modality);
+        put_u8(&mut body, self.camera_model);
+        put_u32(&mut body, self.width_px);
+        put_u32(&mut body, self.height_px);
+        put_f64s(&mut body, &[self.fx, self.fy, self.cx, self.cy]);
+        put_u8(&mut body, self.distortion.len() as u8);
+        put_f64s(&mut body, &self.distortion);
+        put_f64s(&mut body, &self.rotation);
+        put_f64s(&mut body, &self.translation);
+        put_u8(&mut body, self.pose_reference);
+        put_string(&mut body, &self.rig_name);
+        body.extend_from_slice(trailer);
+        let mut out = Vec::new();
+        put_record(&mut out, op::SENSOR_CALIBRATION, &body);
+        out
+    }
+}
+
+/// The measured pose of the capture platform over the scene clock. Opcode `0x22`.
+///
+/// Not the [`Camera`] record, which is a viewing suggestion a reader may ignore. This is
+/// where the sensors were, and a consumer doing analysis or simulation needs it to be
+/// right rather than plausible.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RigTrajectory {
+    pub name: String,
+    pub interpolation: u8,
+    pub times: Vec<f64>,
+    pub rotations: Vec<[f64; 4]>,
+    pub translations: Vec<[f64; 3]>,
+}
+
+impl RigTrajectory {
+    pub fn sample_count(&self) -> usize {
+        self.times.len()
+    }
+
+    pub fn parse(content: &[u8]) -> Result<RigTrajectory> {
+        let mut c = Cursor::new(content);
+        let mut trajectory = RigTrajectory {
+            name: c.string()?,
+            interpolation: c.u8()?,
+            ..Default::default()
+        };
+        let count = c.u32()? as usize;
+        // Bounded like the other count-prefixed records: a crafted count must not size an
+        // allocation before the bytes behind it have been shown to exist.
+        trajectory.times.reserve(count.min(1 << 16));
+        trajectory.rotations.reserve(count.min(1 << 16));
+        trajectory.translations.reserve(count.min(1 << 16));
+        for _ in 0..count {
+            trajectory.times.push(c.f64()?);
+            let r = c.f64s(4)?;
+            trajectory.rotations.push([r[0], r[1], r[2], r[3]]);
+            let t = c.f64s(3)?;
+            trajectory.translations.push([t[0], t[1], t[2]]);
+        }
+        trajectory.check()?;
+        Ok(trajectory)
+    }
+
+    /// Refuse times that are not strictly increasing, naming the sample.
+    ///
+    /// Every interpolation rule is stated in terms of the interval a query lands in, and
+    /// a repeated or reversed timestamp makes that interval ambiguous. There is no
+    /// reading of such a trajectory that is merely approximate.
+    pub fn check(&self) -> Result<()> {
+        for (i, t) in self.times.iter().enumerate() {
+            if !t.is_finite() {
+                return Err(Error::Malformed(format!(
+                    "trajectory {:?}: sample {i} has a non-finite time ({t})",
+                    self.name
+                )));
+            }
+            if i > 0 && *t <= self.times[i - 1] {
+                return Err(Error::Malformed(format!(
+                    "trajectory {:?}: sample {i} is at t={t}, not after sample {} at t={}; \
+                     times must strictly increase (section 5.15.4)",
+                    self.name,
+                    i - 1,
+                    self.times[i - 1]
+                )));
+            }
+        }
+        for (i, q) in self.rotations.iter().enumerate() {
+            let norm = q.iter().map(|v| v * v).sum::<f64>().sqrt();
+            if !norm.is_finite() || norm == 0.0 {
+                return Err(Error::Malformed(format!(
+                    "trajectory {:?}: sample {i} rotation has no direction (norm {norm})",
+                    self.name
+                )));
+            }
+        }
+        for (i, tr) in self.translations.iter().enumerate() {
+            for (k, v) in tr.iter().enumerate() {
+                if !v.is_finite() {
+                    return Err(Error::Malformed(format!(
+                        "trajectory {:?}: sample {i} translation[{k}] is {v}",
+                        self.name
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self, trailer: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        put_string(&mut body, &self.name);
+        put_u8(&mut body, self.interpolation);
+        put_u32(&mut body, self.times.len() as u32);
+        for i in 0..self.times.len() {
+            put_f64(&mut body, self.times[i]);
+            put_f64s(&mut body, &self.rotations[i]);
+            put_f64s(&mut body, &self.translations[i]);
+        }
+        body.extend_from_slice(trailer);
+        let mut out = Vec::new();
+        put_record(&mut out, op::RIG_TRAJECTORY, &body);
         out
     }
 }

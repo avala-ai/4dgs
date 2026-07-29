@@ -517,9 +517,7 @@ class GeodeticAnchor:
             if not math.isfinite(value):
                 raise MalformedFile(f"GeodeticAnchor {label} is {value}; every field must be finite")
             if not lo <= value <= hi or (label == "heading_deg" and value == 360.0):
-                raise MalformedFile(
-                    f"GeodeticAnchor {label} is {value}, outside its legal range (section 5.15.5)"
-                )
+                raise MalformedFile(f"GeodeticAnchor {label} is {value}, outside its legal range (section 5.15.5)")
 
 
 #: Coefficient counts each camera model defines, keyed by its registry id. A model
