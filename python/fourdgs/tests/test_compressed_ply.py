@@ -270,6 +270,61 @@ def test_rejects_a_declared_chunk_count_that_disagrees(tmp_path):
         read_compressed_ply(str(p))
 
 
+@pytest.mark.parametrize(
+    ("header_line", "match"),
+    [
+        ("element vertex nope", "non-integer count"),
+        ("element vertex", "malformed element declaration"),
+        ("element vertex -5", "negative count"),
+    ],
+)
+def test_malformed_element_declarations_are_named(tmp_path, header_line, match):
+    """An untrusted header must not surface as a bare ValueError or IndexError.
+
+    A caller parsing someone else's bytes needs the offending declaration; a raw
+    built-in exception is not a diagnosis.
+    """
+    raw = build_ply(temporal=False, count=1)
+    broken = raw.replace(b"element vertex 1", header_line.encode("ascii"), 1)
+    p = tmp_path / "hdr.ply"
+    p.write_bytes(broken)
+    with pytest.raises(fourdgs.MalformedFile, match=match):
+        read_compressed_ply(str(p))
+
+
+def test_reads_bytes_as_well_as_a_path(tmp_path):
+    """Callers already holding the file should not have to spill it to disk."""
+    raw = build_ply(temporal=True, count=3)
+    p = tmp_path / "b.ply"
+    p.write_bytes(raw)
+    from_path = read_compressed_ply(str(p))
+    from_bytes = read_compressed_ply(raw)
+    np.testing.assert_array_equal(from_path["positions"], from_bytes["positions"])
+    np.testing.assert_array_equal(from_path["mu_t"], from_bytes["mu_t"])
+
+
+def test_trailing_data_past_the_declared_body_is_ignored(tmp_path):
+    """Only the body the header declares is read, so junk appended cannot be pulled in."""
+    raw = build_ply(temporal=True, count=2)
+    p = tmp_path / "trail.ply"
+    p.write_bytes(raw + b"\xde\xad\xbe\xef" * 4096)
+    got = read_compressed_ply(str(p))
+    assert got["positions"].shape == (2, 3)
+
+
+def test_an_absurd_gaussian_count_is_refused_before_allocating(tmp_path):
+    """The cap is enforced from the header, so a crafted count never sizes a buffer.
+
+    The file on disk is a few hundred bytes; only the declaration is enormous.
+    """
+    raw = build_ply(temporal=False, count=1)
+    crafted = raw.replace(b"element vertex 1", b"element vertex 999999999", 1)
+    p = tmp_path / "huge.ply"
+    p.write_bytes(crafted)
+    with pytest.raises(fourdgs.MalformedFile, match="exceeds the"):
+        read_compressed_ply(str(p))
+
+
 def test_rejects_a_truncated_body(tmp_path):
     raw = build_ply(temporal=True, count=8)
     p = tmp_path / "short.ply"

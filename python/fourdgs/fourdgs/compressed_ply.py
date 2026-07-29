@@ -74,8 +74,11 @@ _TEMPORAL_CHUNK_FLOATS = 28
 _STATIC_VERTEX_UINTS = 4
 _TEMPORAL_VERTEX_UINTS = 6
 
-# A crafted header must not force a multi-GB allocation before it can be checked.
+# A crafted header must not force a multi-GB allocation before it can be checked, which
+# is why the header is read and validated from a bounded probe before the body is sized.
 _MAX_GAUSSIANS = 50_000_000
+_HEADER_PROBE_BYTES = 1 << 16
+_MAX_HEADER_BYTES = 1 << 20
 
 
 def _hi11(p: np.ndarray) -> np.ndarray:
@@ -135,9 +138,22 @@ def _parse_header(data: bytes) -> _Header:
     for raw in text.split("\n"):
         line = raw.strip()
         if line.startswith("element "):
+            # An untrusted header must not reach here as a bare ValueError or IndexError:
+            # the caller needs the offending declaration, not a stack trace.
             parts = line.split()
+            if len(parts) < 3:
+                raise MalformedFile(
+                    f"compressed PLY: malformed element declaration {line!r} (want 'element <name> <count>')"
+                )
             element = parts[1]
-            count = int(parts[2])
+            try:
+                count = int(parts[2])
+            except ValueError:
+                raise MalformedFile(
+                    f"compressed PLY: element {element!r} declares a non-integer count {parts[2]!r}"
+                ) from None
+            if count < 0:
+                raise MalformedFile(f"compressed PLY: element {element!r} declares a negative count {count}")
             if element == "chunk":
                 chunks = count
             elif element == "vertex":
@@ -224,22 +240,58 @@ def decode_sh_byte(b: np.ndarray) -> np.ndarray:
     return norm * _SH_RANGE + _SH_OFFSET
 
 
-def read_compressed_ply(path: str) -> dict:
+def _body_bytes(h: _Header) -> int:
+    return h.data_start + h.chunks * h.chunk_floats * 4 + h.vertices * h.vertex_uints * 4 + h.vertices * h.sh_fields
+
+
+def _load(source: str | bytes) -> tuple[_Header, bytes]:
+    """Read a compressed PLY's header, then exactly the body that header declares.
+
+    The header is parsed from a bounded probe first, so the gaussian cap is enforced
+    *before* anything sizes an allocation from it — "every allocation sized from a value
+    the reader has already validated". Reading exactly `_body_bytes` also means trailing
+    data past the declared body is never pulled into memory.
+
+    Accepts bytes as well as a path so callers holding the file already — a cache, a
+    pipe they have drained, a range transport — do not have to spill it to disk first.
+    """
+    if isinstance(source, (bytes, bytearray, memoryview)):
+        raw = bytes(source)
+        h = _parse_header(raw)
+        if len(raw) < _body_bytes(h):
+            raise MalformedFile(f"compressed PLY truncated: need {_body_bytes(h)} bytes and have {len(raw)}")
+        return h, raw
+
+    with open(source, "rb") as fh:
+        probe = fh.read(_HEADER_PROBE_BYTES)
+        while b"end_header" not in probe:
+            more = fh.read(_HEADER_PROBE_BYTES)
+            if not more:
+                raise MalformedFile(f"{source}: not a PLY (no end_header)")
+            probe += more
+            if len(probe) > _MAX_HEADER_BYTES:
+                raise MalformedFile(f"{source}: no end_header in the first {_MAX_HEADER_BYTES} bytes")
+        h = _parse_header(probe)  # the cap is enforced here, before the body is sized
+        needed = _body_bytes(h)
+        fh.seek(0)
+        raw = fh.read(needed)
+    if len(raw) < needed:
+        raise MalformedFile(f"{source}: truncated, need {needed} bytes and have {len(raw)}")
+    return h, raw
+
+
+def read_compressed_ply(source: str | bytes) -> dict:
     """Unpack one compressed PLY into raw arrays, on whatever clock the file carries.
+
+    `source` is a path or the bytes themselves.
 
     Returned as a mapping rather than a `GaussianSet` because a segment is not yet a
     scene: it has no validity window until its place on the shared timeline is known.
     """
-    with open(path, "rb") as fh:
-        raw = fh.read()
-
-    h = _parse_header(raw)
+    h, raw = _load(source)
     n = h.vertices
     chunk_bytes = h.chunks * h.chunk_floats * 4
     vertex_bytes = n * h.vertex_uints * 4
-    needed = h.data_start + chunk_bytes + vertex_bytes + n * h.sh_fields
-    if len(raw) < needed:
-        raise MalformedFile(f"{path}: truncated, need {needed} bytes and have {len(raw)}")
 
     chunks = np.frombuffer(raw, dtype="<f4", count=h.chunks * h.chunk_floats, offset=h.data_start)
     chunks = chunks.reshape(h.chunks, h.chunk_floats).astype(np.float64)
