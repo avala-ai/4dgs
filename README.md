@@ -45,7 +45,7 @@ self-contained resource you can range-request and seek like a video.
 | TypeScript | [typescript/](typescript/) | `@4dgs/core` | Decoder, conformance-verified                    |
 | Rust       | [rust/](rust/)             | `fourdgs`    | Decoder, conformance-verified                    |
 | C++        | [cpp/](cpp/)               | —            | Binding over Rust; decoding, conformance pending |
-| Swift      | [swift/](swift/)           | —            | Planned (visionOS)                               |
+| Swift      | [swift/](swift/)           | —            | Binding over Rust; decoding, conformance pending |
 
 Package names are `fourdgs` where a registry will not take `4dgs`; the format, the CLI and the file
 extension are always `4dgs`. [RELEASING.md](RELEASING.md) has the constraint per registry.
