@@ -26,10 +26,19 @@ const sidebars = {
     },
   ],
 
+  // Proposals are listed rather than hidden. A design that is under review is easier to
+  // review when it is readable at the same address as the text it would change, and each
+  // proposal says in its first line that it is not normative and not implemented.
   specSidebar: [
     { type: "doc", id: "spec/index", label: "Specification" },
     { type: "doc", id: "spec/registry", label: "Registry" },
     { type: "doc", id: "spec/notes", label: "Implementation notes" },
+    {
+      type: "category",
+      label: "Proposals",
+      collapsed: true,
+      items: [{ type: "doc", id: "spec/proposals/keyframe-delta", label: "keyframe-delta" }],
+    },
   ],
 
   referenceSidebar: [
