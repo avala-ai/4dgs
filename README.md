@@ -55,6 +55,7 @@ self-contained resource you can range-request and seek like a video.
 | Rust       | [rust/](rust/)             | `fourdgs`    | Decoder, conformance-verified                    | [crates.io][crates] |
 | C++        | [cpp/](cpp/)               | —            | Decoder over Rust's C ABI, conformance-verified  | build from source   |
 | Swift      | [swift/](swift/)           | —            | Binding over Rust; decoder, conformance-verified | build from source   |
+| Dart       | [dart/](dart/)             | `fourdgs`    | Decoder, conformance-verified                    | not yet — see below |
 
 **The `@4dgs` packages are not on npm yet.** They are built, conformance-verified and versioned at
 0.1.0 here, and the release job is written and its gates pass; what is missing is a trusted
@@ -63,6 +64,12 @@ There is no badge above for npm, because the only version the registry would sho
 reservation with no implementation in it. Until then the TypeScript packages are used from a
 checkout. `fourdgs-cli`, which installs the `4dgs` command, is unpublished for the same class of
 reason — its manifest says which.
+
+**`fourdgs` is not on pub.dev yet**, and for a different reason worth stating separately: pub.dev
+will not accept an automated publish for a package that does not exist. Automated publishing is a
+setting _on a package_, so the name has to be claimed by a human running `dart pub publish` once
+before any workflow can take over. The release job is written and gated `if: false` until that
+happens; [RELEASING.md](RELEASING.md) has the three steps and their order.
 
 Package names are `fourdgs` where a registry will not take `4dgs`; the format, the CLI and the file
 extension are always `4dgs`. [RELEASING.md](RELEASING.md) has the constraint per registry.
@@ -80,6 +87,7 @@ which the conformance suite enforces.
 - [Decode in a browser](website/docs/guides/getting-started/decode-web.md)
 - [Decode in Python](website/docs/guides/getting-started/decode-python.md)
 - [Decode in C++](website/docs/guides/getting-started/decode-cpp.md)
+- [Decode in Dart](website/docs/guides/getting-started/decode-dart.md)
 
 ## Conformance
 

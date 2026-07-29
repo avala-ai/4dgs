@@ -1,0 +1,724 @@
+// Copyright 2026 Avala AI
+// SPDX-License-Identifier: Apache-2.0
+
+/// Indexed reading: the Footer, then the index, then only what an instant needs.
+///
+/// The seek rule is one line and it is the whole algorithm:
+///
+///     chunksForTime(t) == every index entry whose [t0, t1) contains t
+///
+/// Whether that is cheap depends on the content, not on this code. Gaussians
+/// with finite lifetimes partition into many small chunks; content where
+/// everything lives for the whole clip collapses to a single entry and an
+/// instant costs the scene. Both are correct files.
+library;
+
+import 'dart:math' as math;
+import 'dart:typed_data';
+
+import 'chunk_decoder.dart';
+import 'exceptions.dart';
+import 'model.dart';
+import 'opcode.dart';
+import 'quantization.dart';
+import 'readable.dart';
+import 'records.dart';
+import 'serialization.dart';
+
+/// One read of this size from the front covers the header records of every
+/// scene measured so far. A larger header costs one extra round trip, never a
+/// wrong parse.
+const int fourdgsHeadProbeBytes = 64 * 1024;
+
+/// A scene opened over byte ranges: everything needed to decide what to fetch,
+/// and nothing that had to be fetched to decide it.
+class FourdgsIndexedScene {
+  const FourdgsIndexedScene({
+    required this.header,
+    required this.quantization,
+    required this.windows,
+    required this.index,
+    required this.headerBytes,
+    required this.resourceBytes,
+    this.audioRange,
+    this.audioCodec,
+    this.audioStartSec = 0.0,
+    this.summaryCrcOk,
+    this.cameraRange,
+    this.metadataRanges = const <({int offset, int length})>[],
+    this.attachmentRanges = const <({int offset, int length})>[],
+    this.statistics,
+    this.summaryOffsets = const <FourdgsSummaryOffset>[],
+  });
+
+  final FourdgsHeader header;
+  final FourdgsQuantization quantization;
+  final List<FourdgsWindow> windows;
+  final List<FourdgsChunkIndexEntry> index;
+
+  /// Bytes of the file that had to be read to open it — the header probe. Kept
+  /// so a caller can report what opening actually cost.
+  final int headerBytes;
+
+  /// Total size of the resource. Kept because every byte range this reader
+  /// later issues comes out of the index, and an index is just bytes in the
+  /// file: without something true to check them against, a corrupt entry asks a
+  /// server for a range that does not exist and a browser for the memory to
+  /// hold it.
+  final int resourceBytes;
+
+  /// Byte range of the whole Audio record, or `null` when the scene has none.
+  ///
+  /// A range, not the bytes: audio may be megabytes and a caller that only
+  /// wants to know whether a soundtrack exists must not pay for it.
+  final ({int offset, int length})? audioRange;
+
+  final String? audioCodec;
+  final double audioStartSec;
+
+  /// `true` / `false` when the Footer declared a CRC and it was checked,
+  /// `null` when it declared none.
+  final bool? summaryCrcOk;
+
+  /// Byte range of the Camera record, or `null` when the scene has none.
+  ///
+  /// A range rather than the record, for the same reason audio is: opening a
+  /// scene frames what is there and reads only what a reader must have. A camera
+  /// nobody asked for costs nothing, and neither does an attachment the size of
+  /// a thumbnail sheet.
+  final ({int offset, int length})? cameraRange;
+
+  final List<({int offset, int length})> metadataRanges;
+  final List<({int offset, int length})> attachmentRanges;
+
+  /// Advisory totals from the summary block. A reader that needs certainty
+  /// computes from the chunks instead.
+  final FourdgsStatistics? statistics;
+
+  /// Where each class of index record begins, so one group can be fetched
+  /// without the others.
+  final List<FourdgsSummaryOffset> summaryOffsets;
+
+  /// Answered from the Header alone, per the format's audio-discovery rule.
+  bool get hasAudio => header.hasAudio;
+
+  double get durationSec => header.durationSec;
+
+  /// The normative seek rule.
+  List<FourdgsChunkIndexEntry> chunksForTime(double t) => index
+      .where((FourdgsChunkIndexEntry e) => e.covers(t))
+      .toList(growable: false);
+
+  /// Every chunk that can hold a gaussian visible anywhere in `[a, b)`.
+  List<FourdgsChunkIndexEntry> chunksForRange(double a, double b) => index
+      .where((FourdgsChunkIndexEntry e) => e.overlaps(a, b))
+      .toList(growable: false);
+
+  /// What a seek to [t] will transfer, so a caller can budget before asking.
+  int bytesForTime(double t, {int maxShBand = 0}) =>
+      _bytesFor(chunksForTime(t), maxShBand);
+
+  /// What covering `[a, b)` will transfer.
+  int bytesForRange(double a, double b, {int maxShBand = 0}) =>
+      _bytesFor(chunksForRange(a, b), maxShBand);
+
+  int _bytesFor(List<FourdgsChunkIndexEntry> entries, int maxShBand) {
+    int total = 0;
+    for (final entry in entries) {
+      total += entry.chunkLength;
+      for (final band in entry.bands) {
+        if (band.band <= maxShBand) total += band.length;
+      }
+    }
+    return total;
+  }
+}
+
+/// Opens a scene: a bounded read from the front, then the index. Never the file.
+///
+/// [probeBytes] is how much of the front to read at once. The default covers
+/// every scene measured so far in one request; a smaller value is correct and
+/// simply costs more round trips, which is what makes it the honest way to test
+/// the multi-read paths without fabricating a scene with a 64 KiB header.
+Future<FourdgsIndexedScene> openFourdgsIndexed(
+  FourdgsReadable source, {
+  int probeBytes = fourdgsHeadProbeBytes,
+}) async {
+  final size = await source.size();
+  if (size <= 0) throw const FourdgsTruncatedFile('resource is empty');
+  if (probeBytes < recordHeaderBytes + fourdgsMagic.length) {
+    throw ArgumentError(
+      '4dgs: a probe of $probeBytes bytes cannot hold the magic and one record header',
+    );
+  }
+
+  final front = await _readFrontMatter(source, size, probeBytes);
+  if (front.header == null || front.quantization == null) {
+    throw const FourdgsMalformedFile(
+      'the file has no Header or no Quantization record before its first chunk',
+    );
+  }
+  if (front.windows.isEmpty && front.header!.gaussianCount > 0) {
+    // Gaussians reference their validity window by index, so a scene with
+    // gaussians and no table has no windows to resolve them against. Every one
+    // would land on [0, 0] and be invisible at every instant — a file that
+    // opens, decodes, and renders nothing.
+    throw const FourdgsMalformedFile(
+      'the file has gaussians but no Window Table',
+    );
+  }
+  if (front.header!.hasAudio && front.audioRange == null) {
+    // The header's audio bit is the whole discovery rule; a reader that trusts
+    // it and finds no record has been told something untrue about the file.
+    throw const FourdgsMalformedFile(
+      'the header declares audio but the file carries no Audio record',
+    );
+  }
+
+  // Footer record (9 + 20 bytes) then the trailing magic.
+  final footerBytes = recordHeaderBytes + 20 + fourdgsMagic.length;
+  if (size < footerBytes) {
+    throw const FourdgsTruncatedFile('file is too short to hold a footer');
+  }
+  final tail = await source.read(size - footerBytes, footerBytes);
+  for (int i = 0; i < fourdgsMagic.length; i++) {
+    if (tail[tail.length - fourdgsMagic.length + i] != fourdgsMagic[i]) {
+      throw const FourdgsMalformedFile(
+        'file does not end with the magic; it may be truncated',
+      );
+    }
+  }
+  final footerRecord = readRecord(FourdgsCursor(tail));
+  if (footerRecord.opcode != opFooter) {
+    throw FourdgsMalformedFile(
+      'expected a Footer at the tail, found opcode 0x${footerRecord.opcode.toRadixString(16)}',
+    );
+  }
+  final footer = FourdgsFooter.parse(footerRecord.content);
+
+  final index = <FourdgsChunkIndexEntry>[];
+  final summaryOffsets = <FourdgsSummaryOffset>[];
+  FourdgsStatistics? statistics;
+  bool? crcOk;
+  if (footer.summaryStart != 0) {
+    final summaryLength = size - footerBytes - footer.summaryStart;
+    if (summaryLength < 0) {
+      throw const FourdgsMalformedFile(
+        'the footer points its summary past the end of the file',
+      );
+    }
+    if (summaryLength > maxFrontMatterBytes) {
+      throw FourdgsMalformedFile(
+        'the footer points at a $summaryLength byte summary, past the $maxFrontMatterBytes ceiling',
+      );
+    }
+    final summary = await source.read(footer.summaryStart, summaryLength);
+    if (footer.summaryCrc != 0) {
+      crcOk = fourdgsCrc32(summary) == footer.summaryCrc;
+      if (!crcOk) {
+        // The index is the one structure a seeking reader cannot sanity-check
+        // by reading it — every offset in it looks equally plausible. When the
+        // file itself says the bytes are wrong, believing them anyway means
+        // seeking on corrupt offsets for the rest of the session.
+        throw const FourdgsMalformedFile(
+          'the chunk index does not match the CRC the footer declared for it',
+        );
+      }
+    }
+    for (final record in iterRecords(summary)) {
+      switch (record.opcode) {
+        case opChunkIndex:
+          // Checked inside the loop, not after it. Unlike the window table there
+          // is no declared count to disprove against the bytes — entries are
+          // discovered by walking records — so the only bound available is a
+          // ceiling, and it is worth nothing unless it stops the walk. A 64 MiB
+          // summary holds well over a million minimal chunk-index records, each
+          // materialized here as an object with its own band list.
+          if (index.length == maxChunkIndexEntries) {
+            throw FourdgsMalformedFile(
+              'the chunk index holds more than $maxChunkIndexEntries entries',
+            );
+          }
+          index.add(FourdgsChunkIndexEntry.parse(record.content));
+        case opStatistics:
+          statistics = FourdgsStatistics.parse(record.content);
+        case opSummaryOffset:
+          summaryOffsets.add(FourdgsSummaryOffset.parse(record.content));
+        default:
+          break;
+      }
+    }
+  }
+
+  return FourdgsIndexedScene(
+    header: front.header!,
+    quantization: front.quantization!,
+    windows: front.windows,
+    index: index,
+    headerBytes: front.bytesRead,
+    resourceBytes: size,
+    audioRange: front.audioRange,
+    audioCodec: front.audioCodec,
+    audioStartSec: front.audioStartSec,
+    summaryCrcOk: crcOk,
+    cameraRange: front.cameraRange,
+    metadataRanges: front.metadataRanges,
+    attachmentRanges: front.attachmentRanges,
+    statistics: statistics,
+    summaryOffsets: summaryOffsets,
+  );
+}
+
+/// Fetches and decodes one chunk, plus only the SH bands asked for.
+Future<FourdgsDecodedChunk> readFourdgsChunk(
+  FourdgsReadable source,
+  FourdgsIndexedScene scene,
+  FourdgsChunkIndexEntry entry, {
+  int maxShBand = 0,
+}) async {
+  _checkRange(scene, entry.chunkOffset, entry.chunkLength, 'chunk');
+  final blob = await source.read(entry.chunkOffset, entry.chunkLength);
+  final body = parseChunk(_recordContent(blob, opChunk, 'chunk'));
+  if (body.header.t0 != entry.t0 || body.header.t1 != entry.t1) {
+    // The index's interval is what selected this chunk. If the chunk disagrees
+    // it is being played at the wrong time, which shows up as a cohort missing
+    // from the moment it belongs to rather than as an error.
+    throw FourdgsMalformedFile(
+      'index says this chunk covers [${entry.t0}, ${entry.t1}), the chunk says [${body.header.t0}, ${body.header.t1})',
+    );
+  }
+  if (body.header.count != entry.gaussianCount) {
+    // The index is a summary of the chunks, so the two saying different things
+    // means one of them is wrong and there is no way to tell which. Cheap to
+    // check, and it catches an index built against a different revision of the
+    // file — which otherwise shows up as a scene that is quietly missing part
+    // of itself.
+    throw FourdgsMalformedFile(
+      'index says this chunk holds ${entry.gaussianCount} gaussians, the chunk says ${body.header.count}',
+    );
+  }
+
+  final bandRecords = <int, Uint8List>{};
+  for (final band in entry.bands) {
+    if (band.band > maxShBand) continue;
+    _checkRange(scene, band.offset, band.length, 'SH band ${band.band}');
+    final bandBlob = await source.read(band.offset, band.length);
+    bandRecords[band.band] = _recordContent(
+      bandBlob,
+      opShBandStream,
+      'SH band ${band.band}',
+    );
+  }
+
+  return decodeChunkStreams(
+    body.streams,
+    body.header.count,
+    FourdgsSteps.of(scene.quantization),
+    scene.quantization.posOrigin,
+    scene.windows,
+    cutoff: scene.header.cutoff,
+    compression: body.header.compression,
+    shBandRecords: bandRecords,
+  );
+}
+
+/// The embedded track's bytes, fetched independently of any gaussian data.
+///
+/// `null` when the scene has none — a normal value, not an error.
+Future<FourdgsAudioTrack?> readFourdgsAudio(
+  FourdgsReadable source,
+  FourdgsIndexedScene scene,
+) async {
+  final range = scene.audioRange;
+  if (range == null) return null;
+  // The audio span comes from the same attacker-controlled `u64` fields every
+  // other range does, and the front-matter scan records it and can stop as soon
+  // as it has enough — so nothing has checked it fits the file yet. Chunk and
+  // SH ranges have been guarded here since they were written; this one was
+  // reading straight through, which let a crafted container name a span past
+  // EOF or one large enough to be worth materializing. Same guard, same
+  // ceiling, so an embedded track cannot be the one range that skips it.
+  _checkRange(scene, range.offset, range.length, 'audio');
+  final blob = await source.read(range.offset, range.length);
+  final audio = FourdgsAudio.parse(_recordContent(blob, opAudio, 'audio'));
+  return FourdgsAudioTrack(
+    codec: audio.codec,
+    data: audio.data,
+    startSec: audio.startSec,
+  );
+}
+
+/// The suggested camera trajectory, fetched only when a caller wants it.
+///
+/// `null` when the scene has none. Advisory in the format and advisory here:
+/// nothing in decoding depends on it.
+Future<FourdgsCameraTrajectory?> readFourdgsCamera(
+  FourdgsReadable source,
+  FourdgsIndexedScene scene,
+) async {
+  final range = scene.cameraRange;
+  if (range == null) return null;
+  _checkRange(scene, range.offset, range.length, 'camera');
+  final blob = await source.read(range.offset, range.length);
+  final camera = FourdgsCamera.parse(_recordContent(blob, opCamera, 'camera'));
+  return FourdgsCameraTrajectory(
+    fovYDeg: camera.fovYDeg,
+    position: camera.position,
+    target: camera.target,
+    times: camera.times,
+    positions: camera.positions,
+    targets: camera.targets,
+    interpolation: camera.interpolation,
+    loop: camera.loop,
+  );
+}
+
+/// Every Metadata record, by range.
+Future<List<FourdgsMetadata>> readFourdgsMetadata(
+  FourdgsReadable source,
+  FourdgsIndexedScene scene,
+) async {
+  final out = <FourdgsMetadata>[];
+  for (final range in scene.metadataRanges) {
+    _checkRange(scene, range.offset, range.length, 'metadata');
+    final blob = await source.read(range.offset, range.length);
+    out.add(
+      FourdgsMetadata.parse(_recordContent(blob, opMetadata, 'metadata')),
+    );
+  }
+  return out;
+}
+
+/// Every Attachment record, by range. Each one costs exactly its own bytes, so
+/// a caller that wants a thumbnail does not pay for a licence file beside it.
+Future<List<FourdgsAttachment>> readFourdgsAttachments(
+  FourdgsReadable source,
+  FourdgsIndexedScene scene,
+) async {
+  final out = <FourdgsAttachment>[];
+  for (final range in scene.attachmentRanges) {
+    _checkRange(scene, range.offset, range.length, 'attachment');
+    final blob = await source.read(range.offset, range.length);
+    out.add(
+      FourdgsAttachment.parse(_recordContent(blob, opAttachment, 'attachment')),
+    );
+  }
+  return out;
+}
+
+/// Refuses a byte range the index asked for but the file cannot contain.
+///
+/// Checked *before* the read, not after: `_recordContent` validates framing,
+/// but by then the bytes have already been requested from a server and
+/// materialized in memory. An index entry is attacker-controlled `u64`, so
+/// without this a single corrupt field asks for the whole address space.
+void _checkRange(
+  FourdgsIndexedScene scene,
+  int offset,
+  int length,
+  String what,
+) {
+  if (offset < 0 || length < 0 || offset + length > scene.resourceBytes) {
+    throw FourdgsMalformedFile(
+      'the index puts the $what at [$offset, ${offset + length}) of a ${scene.resourceBytes} byte file',
+    );
+  }
+  if (length > maxFrontMatterBytes) {
+    throw FourdgsMalformedFile(
+      'the index gives the $what $length bytes, past the $maxFrontMatterBytes ceiling',
+    );
+  }
+}
+
+/// Unwraps a record fetched by byte range, checking it is the record the index
+/// said it would be.
+///
+/// The index could have been written with every offset shifted, and a decoder
+/// that trusted it would produce plausible nonsense from the wrong bytes. One
+/// opcode comparison turns that into an immediate, named failure.
+Uint8List _recordContent(Uint8List blob, int expectedOpcode, String what) {
+  if (blob.length < recordHeaderBytes) {
+    throw FourdgsTruncatedFile('$what range is shorter than a record header');
+  }
+  final cursor = FourdgsCursor(blob);
+  final opcode = cursor.u8();
+  final length = cursor.u64();
+  if (opcode != expectedOpcode) {
+    throw FourdgsMalformedFile(
+      '$what range starts with opcode 0x${opcode.toRadixString(16)}, expected 0x${expectedOpcode.toRadixString(16)}',
+    );
+  }
+  if (recordHeaderBytes + length > blob.length) {
+    throw FourdgsTruncatedFile(
+      '$what record declares $length content bytes, range holds ${blob.length - recordHeaderBytes}',
+    );
+  }
+  // And the range must not be LONGER than the record either. Trailing bytes
+  // look harmless — they were simply ignored — but they are what lets a crafted
+  // index name one chunk many times: pad each entry's length differently and
+  // every `offset:length` pair is distinct, so the slice's duplicate-range
+  // check waves them through while all of them decode the same record and
+  // duplicate its splats and its allocation. An index entry describes exactly
+  // one framed record; anything else is a disagreement worth refusing.
+  if (recordHeaderBytes + length != blob.length) {
+    throw FourdgsMalformedFile(
+      '$what range holds ${blob.length} bytes for a ${recordHeaderBytes + length} byte record; the index must name the record exactly',
+    );
+  }
+  return Uint8List.sublistView(
+    blob,
+    recordHeaderBytes,
+    recordHeaderBytes + length,
+  );
+}
+
+/// What the front of the file yielded.
+class _FrontMatter {
+  FourdgsHeader? header;
+  FourdgsQuantization? quantization;
+  List<FourdgsWindow> windows = const <FourdgsWindow>[];
+  ({int offset, int length})? audioRange;
+  String? audioCodec;
+  double audioStartSec = 0.0;
+  ({int offset, int length})? cameraRange;
+  final List<({int offset, int length})> metadataRanges =
+      <({int offset, int length})>[];
+  final List<({int offset, int length})> attachmentRanges =
+      <({int offset, int length})>[];
+
+  /// Bytes actually transferred to open the scene.
+  int bytesRead = 0;
+}
+
+/// Round-trip cap for reading the front matter.
+///
+/// Not an expected count — one or two reads cover every real scene, and the loop
+/// is guaranteed to advance because every record is at least its own 9-byte
+/// header. This is a ceiling on what a pathological file can cost a reader
+/// before it gives up and reports what it could not find. It is generous because
+/// the scan now runs to the first Chunk: a file may legitimately carry several
+/// records larger than the probe before it, and each costs a round.
+const int _maxFrontMatterReads = 256;
+
+/// Enough of an Audio record to hold its codec name and start time, when those
+/// fell outside the probe. The registry's names are `wav` and `opus`; this
+/// leaves room for a private one without ever pulling in the track.
+const int _audioPrefixBytes = 512;
+
+/// The most this reader will transfer in one go for a header record or for the
+/// whole summary block.
+///
+/// Both lengths come out of the file itself, so without a ceiling a hostile —
+/// or merely corrupt — file can name a multi-gigabyte Window Table and have a
+/// reader ask a server for it before a single field has been parsed. Sixty-four
+/// megabytes is four orders of magnitude above any real one, and still a
+/// request that fails rather than a machine that swaps.
+const int maxFrontMatterBytes = 64 * 1024 * 1024;
+
+/// Reads the records before the first Chunk.
+///
+/// The scan runs to the first Chunk rather than stopping as soon as the records
+/// it must have are in hand, and that is a deliberate trade. The specification
+/// fixes the Header first and the Footer last and leaves the order of everything
+/// between them free, so a Camera, a Metadata record or an Attachment may sit
+/// after the Window Table — and a scan that stopped early would report a scene
+/// without them. What a reader says about a file must not depend on where its
+/// probe happened to stop.
+///
+/// It costs at most one extra round trip, and only on a scene whose front matter
+/// is bigger than the probe — in practice one with an embedded audio track. It
+/// does not cost the track: a record whose content this reader does not parse is
+/// stepped over by arithmetic and remembered as a byte range, so opening a
+/// 51 MiB scene with a 6 MiB soundtrack still transfers kilobytes.
+///
+/// A record larger than the probe whose content *is* wanted is fetched by its
+/// own range rather than by re-probing, since its length is already known.
+///
+/// Nothing is ever parsed from bytes that were not read.
+Future<_FrontMatter> _readFrontMatter(
+  FourdgsReadable source,
+  int size,
+  int probeBytes,
+) async {
+  final out = _FrontMatter();
+  int at = 0;
+  Uint8List buf = await source.read(0, math.min(probeBytes, size));
+  out.bytesRead += buf.length;
+  checkMagic(buf);
+  int start = fourdgsMagic.length;
+
+  for (int round = 0; round < _maxFrontMatterReads; round++) {
+    FourdgsRecordSpan? unread;
+    bool sawChunk = false;
+    // Where the scan got to, in file coordinates. Tracked rather than inferred
+    // from the buffer's end: the scanner stops as soon as a record's own 9-byte
+    // header no longer fits, so up to 8 bytes of a real record header can be
+    // left in the buffer. Resuming at the buffer's end would swallow them and
+    // start the next scan in the middle of a record.
+    int scanned = start;
+
+    for (final local in scanRecordSpans(buf, start - at)) {
+      // File-relative view of a span the scanner reported buffer-relative.
+      final span = FourdgsRecordSpan(
+        opcode: local.opcode,
+        offset: at + local.offset,
+        contentOffset: at + local.contentOffset,
+        contentLength: local.contentLength,
+      );
+      // The first chunk ends the front matter: everything a reader needs in
+      // order to plan its fetches is written before it.
+      if (span.opcode == opChunk) {
+        sawChunk = true;
+        break;
+      }
+      if (local.end > buf.length) {
+        unread = span;
+        break;
+      }
+      _applyFrontRecord(
+        out,
+        span,
+        Uint8List.sublistView(buf, local.contentOffset, local.end),
+      );
+      scanned = span.end;
+    }
+
+    if (sawChunk) break;
+    if (unread == null) {
+      // The buffer ran out cleanly. Either the file ended or the probe did.
+      if (scanned >= size) break;
+      at = start = scanned;
+      buf = await source.read(at, math.min(probeBytes, size - at));
+      out.bytesRead += buf.length;
+      continue;
+    }
+
+    if (unread.opcode == opAudio) {
+      // Its range is all a caller needs; the payload stays where it is.
+      _applyFrontRecord(
+        out,
+        unread,
+        Uint8List.sublistView(
+          buf,
+          math.min(unread.contentOffset - at, buf.length),
+        ),
+      );
+      if (out.audioCodec == null) {
+        // The record began within a few bytes of the buffer's end, so its codec
+        // and start time were not in it. Fetch just that prefix rather than
+        // leave them out: what a reader reports about a file must not depend on
+        // where its probe happened to stop.
+        final want = math.min(_audioPrefixBytes, unread.framedLength);
+        final prefix = await source.read(unread.offset, want);
+        out.bytesRead += prefix.length;
+        _applyFrontRecord(
+          out,
+          unread,
+          Uint8List.sublistView(
+            prefix,
+            math.min(recordHeaderBytes, prefix.length),
+          ),
+        );
+      }
+    } else if (!_wantsContent(unread.opcode)) {
+      // Camera, Metadata, Attachment: the range is the whole answer here too, so
+      // a record larger than the probe is framed and stepped over rather than
+      // transferred. An empty view because none of the content arrived is
+      // correct — nothing below reads it.
+      _applyFrontRecord(out, unread, Uint8List(0));
+    }
+
+    if (_wantsContent(unread.opcode)) {
+      if (unread.end > size) {
+        throw const FourdgsTruncatedFile(
+          'a header record runs past the end of the file',
+        );
+      }
+      if (unread.framedLength > maxFrontMatterBytes) {
+        throw FourdgsMalformedFile(
+          'a header record declares ${unread.framedLength} bytes, past the $maxFrontMatterBytes ceiling',
+        );
+      }
+      final blob = await source.read(unread.offset, unread.framedLength);
+      out.bytesRead += blob.length;
+      _applyFrontRecord(
+        out,
+        unread,
+        Uint8List.sublistView(blob, recordHeaderBytes),
+      );
+    }
+
+    if (unread.end >= size) break;
+    at = start = unread.end;
+    buf = await source.read(at, math.min(probeBytes, size - at));
+    out.bytesRead += buf.length;
+  }
+  return out;
+}
+
+/// The three records this reader parses out of the front matter. Everything
+/// else there is framed and remembered as a byte range, never transferred.
+bool _wantsContent(int opcode) =>
+    opcode == opHeader || opcode == opQuantization || opcode == opWindowTable;
+
+/// Applies one front-matter record.
+///
+/// [content] is a prefix for Audio, whose interesting fields are at the front
+/// and whose payload is deliberately not transferred here, and empty for the
+/// records this reader only records the range of.
+void _applyFrontRecord(
+  _FrontMatter out,
+  FourdgsRecordSpan span,
+  Uint8List content,
+) {
+  switch (span.opcode) {
+    case opHeader:
+      out.header = FourdgsHeader.parse(content);
+    case opQuantization:
+      out.quantization = FourdgsQuantization.parse(content);
+    case opWindowTable:
+      out.windows = FourdgsWindowTable.parse(content).windows;
+    case opAudio:
+      out.audioRange = (offset: span.offset, length: span.framedLength);
+      try {
+        final prefix = FourdgsCursor(content);
+        // Both fields into locals first. Committing the codec before the start
+        // time succeeds would leave the caller thinking the prefix was read,
+        // skipping its refetch, and reporting a start of zero for a track that
+        // does not begin at zero — which plays the whole scene out of sync.
+        final codec = prefix.string();
+        final startSec = prefix.f64();
+        out.audioCodec = codec;
+        out.audioStartSec = startSec;
+      } on FourdgsTruncatedFile {
+        // Not enough of the record is here. The range is already correct; the
+        // caller fetches the prefix and tries again.
+      }
+    case opCamera:
+      out.cameraRange = (offset: span.offset, length: span.framedLength);
+    case opMetadata:
+      out.metadataRanges.add((offset: span.offset, length: span.framedLength));
+    case opAttachment:
+      out.attachmentRanges.add((
+        offset: span.offset,
+        length: span.framedLength,
+      ));
+    default:
+      break;
+  }
+}
+
+/// The most chunk-index entries one scene may declare.
+///
+/// Not a format limit. Every entry becomes a Dart object with its own band
+/// list, built while opening the file and before any per-chunk budget is
+/// consulted — so the count is an allocation the file gets to choose, and a
+/// 64 MiB summary has room for over a million minimal ones.
+///
+/// 262,144 is far past anything plausible and still cheap to hold. The largest
+/// scene measured while this decoder was written indexes 3,429,566 gaussians in
+/// 107 chunks (~32,000 each); at a thousand gaussians per chunk — far finer than
+/// any encoder writes, since the chunk is the unit of range-fetching and smaller
+/// chunks mean more round trips — this ceiling still admits a
+/// quarter-billion-gaussian scene.
+const int maxChunkIndexEntries = 262144;

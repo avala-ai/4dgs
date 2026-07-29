@@ -10,13 +10,16 @@ per-package changelogs and lists every release in order.
 ```
 releases/python/vX.Y.Z
 releases/rust/vX.Y.Z
+releases/dart/vX.Y.Z
 releases/typescript/<package>/vX.Y.Z
 ```
 
 for example `releases/python/v0.2.0` or `releases/typescript/core/v0.2.0`. Languages that ship one
 package do not repeat its name in the tag; TypeScript ships four, so it does.
 
-`releases/dart/vX.Y.Z` is reserved and unused.
+Dart's changelog is `dart/fourdgs/CHANGELOG.md` rather than `dart/CHANGELOG.md`, one level deeper
+than every other language's. That is pub.dev's requirement rather than a preference: it renders the
+changelog from the package root, so a file beside the package would not be published with it.
 
 ## Checklist, per package
 
@@ -60,8 +63,8 @@ the drift this rule exists to prevent, and it is easier to refuse the tag than t
 ## Naming
 
 The format, the repository, the CLI and the file extension are always **4dgs** and **`.4dgs`**.
-Package names are a different matter, and not because we chose them: three registries and two
-language-identifier rules impose five constraints, and the honest thing is to write down what each
+Package names are a different matter, and not because we chose them: four registries and two
+language-identifier rules impose six constraints, and the honest thing is to write down what each
 one is rather than imply a consistency that does not exist.
 
 | Registry  | Name                                                          | Why                                                                                                                                            |
@@ -70,6 +73,7 @@ one is rather than imply a consistency that does not exist.
 | crates.io | `fourdgs`                                                     | Cargo rejects a crate name beginning with a digit, so `4dgs` is not available to anyone. The `[lib] name` matches                              |
 | crates.io | `fourdgs-cli`, binary `4dgs`                                  | The same constraint applies to the CLI's crate, but not to what it installs: a `[[bin]] name` may begin with a digit, so the command is `4dgs` |
 | npm       | `@4dgs/core`, `@4dgs/browser`, `@4dgs/nodejs`, `@4dgs/codecs` | Scoped names may begin with a digit. The unscoped `4dgs` was refused by npm's similarity filter, so the scope is not a stylistic choice        |
+| pub.dev   | `fourdgs`                                                     | A pub.dev package name is a Dart identifier and may not begin with a digit — the same rule as Cargo and Swift. `import 'package:fourdgs/…'`    |
 | Swift     | module `FourDGS`, C seam `CFourDGS`                           | A Swift module name is an identifier and may not begin with a digit. The casing is Swift's own convention for acronyms, not a rename           |
 | Kaitai    | `kaitai/fourdgs.ksy`, type id `fourdgs`                       | A `.ksy` type id becomes an identifier in every target the compiler emits, so the same rule as Swift and Cargo applies                         |
 
@@ -90,6 +94,29 @@ release, and it is a blocker for the release itself.
 **Platforms.** The core builds for visionOS on stable toolchains — the Apple targets ship a
 distributed standard library, so no nightly and no `-Z build-std`, and CI cross-compiles and links
 against them. That was the strategy's biggest open question and it is settled.
+
+## Dart, before its first release
+
+**The first publish must be done by hand, and this is a pub.dev constraint rather than a choice.**
+Every other registry here accepts an OIDC-authenticated publish for a name nobody has claimed;
+pub.dev does not, because automated publishing is configured _on a package_, and until the package
+exists there is nothing to configure it on. So the order is fixed:
+
+1. `cd dart/fourdgs && dart pub publish`, once, from a machine logged in with a Google account. This
+   claims the name and puts the first version on the registry.
+2. On pub.dev, the package's **Admin** tab → **Automated publishing**, enabled for `avala-ai/4dgs`
+   with the tag pattern `releases/dart/v{{version}}`.
+3. Delete the `if: false` on the `dart` job in
+   [`.github/workflows/release.yml`](.github/workflows/release.yml).
+
+The gate is there so that step 3 cannot happen before step 2. Flipping it early does not fail loudly
+in a useful way — it produces a job that fails authentication on every tag, which reads as a broken
+workflow rather than as a missing setting on a web page.
+
+**Verified publisher.** The intent is to take `fourdgs` to verified-publisher status under the
+`4dgs.dev` domain, so the package page carries the domain rather than an individual account. That is
+a separate pub.dev setting from automated publishing and gates nothing above; it can be done before
+or after step 2.
 
 ## Pre-1.0
 

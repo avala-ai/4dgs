@@ -7,6 +7,7 @@ name: Release
 # Tag scheme (see RELEASING.md):
 #   releases/python/vX.Y.Z
 #   releases/rust/vX.Y.Z
+#   releases/dart/vX.Y.Z
 #   releases/typescript/<package>/vX.Y.Z
 #
 # Every job authenticates with OIDC trusted publishing. There are no stored
@@ -161,6 +162,102 @@ jobs:
           case "$version" in 0.*) prerelease=--prerelease ;; *) prerelease= ;; esac
           gh release create "${GITHUB_REF#refs/tags/}" $prerelease \
             --title "fourdgs (Rust) $version" \
+            --notes-file "$RUNNER_TEMP/notes.md"
+
+  dart:
+    name: Publish fourdgs to pub.dev
+    # DISABLED ON PURPOSE — do not delete this gate without doing the two manual steps
+    # below first, in this order.
+    #
+    # pub.dev will not accept an automated publish for a package that does not exist
+    # yet. A brand-new package name must be claimed by a human running
+    # `dart pub publish` from a machine logged in with a Google account; there is no
+    # OIDC path to a first publish, because there is no package for a publisher to be
+    # configured on. So:
+    #
+    #   1. `cd dart/fourdgs && dart pub publish` — by hand, once. This claims the
+    #      `fourdgs` name and puts 0.1.0 on the registry.
+    #   2. On pub.dev, open the package's Admin tab and enable **Automated
+    #      publishing** for this repository, with the tag pattern
+    #      `releases/dart/v{{version}}`. That is what makes the OIDC exchange below
+    #      succeed; without it every run of this job fails authentication.
+    #   3. Then, and only then, delete this `if: false`.
+    #
+    # Flipping the gate before step 2 produces a job that fails on every tag, which is
+    # the failure this comment exists to prevent — it looks like a broken workflow
+    # rather than a missing setting.
+    #
+    # The maintainer intends to take the package to **verified publisher** status under
+    # the `4dgs.dev` domain, which is a separate pub.dev setting from automated
+    # publishing and does not gate this job.
+    if: false
+    # if: startsWith(github.ref, 'refs/tags/releases/dart/')
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      # The only permission a trusted-publishing job needs. No token, no secret.
+      id-token: write
+      # For the release step alone, as in the Python job.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dart-lang/setup-dart@v1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Version matches the tag
+        # Three places one number is written, all checked before anything is built. A
+        # package whose version and tag disagree is the one mistake that cannot be
+        # fixed after publication.
+        run: |
+          tag="${GITHUB_REF#refs/tags/releases/dart/v}"
+          manifest=$(grep -m1 '^version: ' dart/fourdgs/pubspec.yaml | cut -d' ' -f2)
+          source=$(grep -m1 "^const String fourdgsPackageVersion = " dart/fourdgs/lib/fourdgs.dart | cut -d"'" -f2)
+          echo "tag=$tag manifest=$manifest source=$source"
+          if [ "$tag" != "$manifest" ] || [ "$tag" != "$source" ]; then
+            echo "::error::version mismatch — tag $tag, pubspec $manifest, fourdgs.dart $source"
+            exit 1
+          fi
+
+      - name: Release notes from the changelog
+        run: |
+          version="${GITHUB_REF#refs/tags/releases/dart/v}"
+          python scripts/changelog_section.py dart/fourdgs/CHANGELOG.md "$version" > "$RUNNER_TEMP/section.md"
+          {
+            echo "## What's changed"
+            echo
+            cat "$RUNNER_TEMP/section.md"
+            echo
+            echo "---"
+            echo
+            echo "\`dart pub add fourdgs:$version\` | [pub.dev](https://pub.dev/packages/fourdgs/versions/$version) | [full changelog](https://github.com/avala-ai/4dgs/blob/main/dart/fourdgs/CHANGELOG.md)"
+          } > "$RUNNER_TEMP/notes.md"
+
+      - name: Build what is about to be published
+        run: |
+          cd dart/fourdgs
+          dart pub get
+          dart analyze --fatal-infos
+          dart test
+          dart pub publish --dry-run
+
+      - name: Publish
+        # No token: `dart pub publish --force` uses the OIDC identity pub.dev's
+        # automated-publishing setting is configured to trust. `--force` skips the
+        # interactive confirmation, not any of the validation.
+        run: cd dart/fourdgs && dart pub publish --force
+
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF#refs/tags/releases/dart/v}"
+          case "$version" in 0.*) prerelease=--prerelease ;; *) prerelease= ;; esac
+          gh release create "${GITHUB_REF#refs/tags/}" $prerelease \
+            --title "fourdgs (Dart) $version" \
             --notes-file "$RUNNER_TEMP/notes.md"
 
   typescript:
