@@ -10,32 +10,32 @@ declarations. Nothing is marked `Yes` on the strength of code existing.
 Every row is filled in from a suite that runs: 34 variants, two read paths (streamed and indexed),
 67 checks passing for each language.
 
-| Feature                                              | Python  | TypeScript | Rust    | C++     | Swift   |
-| ---------------------------------------------------- | ------- | ---------- | ------- | ------- | ------- |
-| Streaming decode                                     | Yes     | Yes        | Yes     | Yes     | Yes     |
-| Indexed / seeking decode                             | Yes     | Yes        | Yes     | Yes     | Yes     |
-| Range-request decode                                 | Yes     | Yes        | Yes     | Yes     | Yes     |
-| Truncated-file recovery                              | Yes     | Yes        | Yes     | Yes     | Yes     |
-| Chunk index                                          | Yes     | Yes        | Yes     | Yes     | Yes     |
-| Summary offsets                                      | Yes     | Yes        | Yes     | Yes     | Yes     |
-| CRC validation                                       | Yes     | Yes        | Yes     | Yes     | Yes     |
-| Quantized attributes                                 | Yes     | Yes        | Yes     | Yes     | Yes     |
-| Spherical harmonics, degree 1                        | Yes     | Yes        | Yes     | Yes     | Yes     |
-| Spherical harmonics, degree 2                        | Yes     | Yes        | Yes     | Yes     | Yes     |
-| Spherical harmonics, degree 3                        | Planned | Planned    | Planned | Planned | Planned |
-| SH band range-skipping                               | Yes     | Yes        | Yes     | Yes     | Yes     |
-| Embedded audio (optional, zero-overhead when absent) | Yes     | Yes        | Yes     | Yes     | Yes     |
-| Camera trajectory                                    | Yes     | Yes        | Yes     | Yes     | Yes     |
-| Metadata                                             | Yes     | Yes        | Yes     | Yes     | Yes     |
-| Attachments                                          | Yes     | Yes        | Yes     | Yes     | Yes     |
-| Statistics                                           | Yes     | Yes        | Yes     | Yes     | Yes     |
-| Unknown-record skipping                              | Yes     | Yes        | Yes     | Yes     | Yes     |
-| Private-range records                                | Yes     | Yes        | Yes     | Yes     | Yes     |
-| Encode                                               | Yes     | Planned    | Yes     | Planned | Planned |
-| Chunked encode                                       | Yes     | Planned    | Yes     | Planned | Planned |
-| Summary writing                                      | Yes     | Planned    | Yes     | Planned | Planned |
-| Convert from PLY frame sequences                     | Yes     | No         | No      | No      | No      |
-| Inspect and validate                                 | Yes     | Planned    | Planned | Planned | Planned |
+| Feature                                              | Python | TypeScript | Rust    | C++     | Swift   |
+| ---------------------------------------------------- | ------ | ---------- | ------- | ------- | ------- |
+| Streaming decode                                     | Yes    | Yes        | Yes     | Yes     | Yes     |
+| Indexed / seeking decode                             | Yes    | Yes        | Yes     | Yes     | Yes     |
+| Range-request decode                                 | Yes    | Yes        | Yes     | Yes     | Yes     |
+| Truncated-file recovery                              | Yes    | Yes        | Yes     | Yes     | Yes     |
+| Chunk index                                          | Yes    | Yes        | Yes     | Yes     | Yes     |
+| Summary offsets                                      | Yes    | Yes        | Yes     | Yes     | Yes     |
+| CRC validation                                       | Yes    | Yes        | Yes     | Yes     | Yes     |
+| Quantized attributes                                 | Yes    | Yes        | Yes     | Yes     | Yes     |
+| Spherical harmonics, degree 1                        | Yes    | Yes        | Yes     | Yes     | Yes     |
+| Spherical harmonics, degree 2                        | Yes    | Yes        | Yes     | Yes     | Yes     |
+| Spherical harmonics, degree 3                        | Yes    | Yes        | Yes     | Yes     | Yes     |
+| SH band range-skipping                               | Yes    | Yes        | Yes     | Yes     | Yes     |
+| Embedded audio (optional, zero-overhead when absent) | Yes    | Yes        | Yes     | Yes     | Yes     |
+| Camera trajectory                                    | Yes    | Yes        | Yes     | Yes     | Yes     |
+| Metadata                                             | Yes    | Yes        | Yes     | Yes     | Yes     |
+| Attachments                                          | Yes    | Yes        | Yes     | Yes     | Yes     |
+| Statistics                                           | Yes    | Yes        | Yes     | Yes     | Yes     |
+| Unknown-record skipping                              | Yes    | Yes        | Yes     | Yes     | Yes     |
+| Private-range records                                | Yes    | Yes        | Yes     | Yes     | Yes     |
+| Encode                                               | Yes    | Planned    | Yes     | Planned | Planned |
+| Chunked encode                                       | Yes    | Planned    | Yes     | Planned | Planned |
+| Summary writing                                      | Yes    | Planned    | Yes     | Planned | Planned |
+| Convert from PLY frame sequences                     | Yes    | No         | No      | No      | No      |
+| Inspect and validate                                 | Yes    | Planned    | Planned | Planned | Planned |
 
 ## Reading this table
 
@@ -66,9 +66,18 @@ decode; Python's encoder is the reference and Rust's is the production one.
 files — the common interchange form — and produces a `.4dgs`. It lives in the Python package because
 it is a batch operation.
 
-**Spherical harmonics, degree 3** is implemented and unit-tested in Python, but the conformance
-corpus only carries degree 1 and 2 variants, so by this table's own rule it does not get a `Yes`
-yet. Adding the variant is the work, not adding the feature.
+**Spherical harmonics, degree 3** moved from `Planned` to `Yes` when the corpus gained two degree-3
+variants — one split across chunks, one not — and every SDK decoded both on both read paths in this
+repository's CI. Nothing about any decoder changed — the code was already right in all five, and the
+cells said `Planned` because the corpus could not prove it. That is the rule working as intended,
+and it is worth being precise about what the `Yes` now rests on: Python and Rust carry the band
+ranges as a table, TypeScript derives them from `(d + 1)^2 - 1`, and C++ and Swift reach the Rust
+core through the C ABI. So the row proves four independent derivations agree, not five.
+
+**The Header's `profile` and `library`** are asserted by the canonical summary rather than having a
+row of their own. They were readable in every SDK from the start and asserted by none, which meant a
+runner that returned an empty string for both was indistinguishable from one that decoded them — the
+C++ binding did exactly that once. Several rows above rest a little more firmly for it.
 
 **Spherical harmonics, degrees 1 and 2** are proved by a checksum of the decoded coefficients, taken
 in content order so two decoders that visit gaussians differently still agree. Before that checksum
