@@ -6,8 +6,9 @@
 //! The test that earns its keep is `track_composes_onto_base_center`. It checks the claim
 //! the layer rests on — that a track transforms the base state rather than replacing it —
 //! and the record round-trips prove the wire format. The `object_id` stream through a full
-//! chunk decode is covered cross-implementation by the conformance corpus (Python writes,
-//! Rust decodes), which is where an end-to-end object file is exercised.
+//! chunk decode is covered here across the full u32 range and cross-implementation by
+//! the conformance corpus (Python writes, Rust decodes), which is where an end-to-end
+//! object file is exercised.
 
 use std::collections::BTreeMap;
 
@@ -405,7 +406,7 @@ fn omitted_object_stream_defaults_only_that_chunk_to_background() {
 }
 
 #[test]
-fn malformed_object_stream_values_and_shapes_are_refused() {
+fn object_stream_preserves_all_u32_bit_patterns_and_refuses_wrong_shape() {
     let steps = Steps {
         pos: 1.0,
         scale_log: 1.0,
@@ -417,18 +418,51 @@ fn malformed_object_stream_values_and_shapes_are_refused() {
         sigma_log: 1.0,
         sh: 1,
     };
-    for (values, channels, problem) in [(vec![-1], 1, "-1"), (vec![7, 8], 2, "channels")] {
-        let err = fourdgs::chunk::decode_streams(
-            &streams_with_object_id(&values, channels),
-            1,
-            &steps,
-            &[0.0; 3],
-            &[(0.0, 1.0)],
-            0.05,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains(problem), "{err}");
-    }
+    let signed_codes = [0, i32::MAX as i64, i32::MIN as i64, -1];
+    let decoded = fourdgs::chunk::decode_streams(
+        &streams_with_object_id(&signed_codes, 1),
+        signed_codes.len(),
+        &steps,
+        &[0.0; 3],
+        &[(0.0, 1.0)],
+        0.05,
+    )
+    .unwrap();
+    assert_eq!(
+        decoded.object_id,
+        Some(vec![0, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff])
+    );
+
+    let err = fourdgs::chunk::decode_streams(
+        &streams_with_object_id(&[7, 8], 2),
+        1,
+        &steps,
+        &[0.0; 3],
+        &[(0.0, 1.0)],
+        0.05,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("channels"), "{err}");
+
+    // A malicious delta stream can leave the signed 32-bit domain even though each
+    // encoded delta fits in it. Reject that value before reinterpreting its bits.
+    let values = [i32::MAX as i64, 1];
+    let encoded_object =
+        encode_stream(op::A_OBJECT_ID, &values, 1, codec::DEFLATE, 1, false).unwrap();
+    let mut streams = streams_with_object_id(&values, 1);
+    let mode_offset = streams.len() - encoded_object.len() + 2;
+    streams[mode_offset] = fourdgs::stream::MODE_DELTA;
+    let err = fourdgs::chunk::decode_streams(
+        &streams,
+        values.len(),
+        &steps,
+        &[0.0; 3],
+        &[(0.0, 1.0)],
+        0.05,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("element 1"), "{err}");
+    assert!(err.to_string().contains("2147483648"), "{err}");
 }
 
 #[test]

@@ -32,7 +32,8 @@ pub struct DecodedChunk {
     pub window_index: Vec<u32>,
     pub source_index: Option<Vec<i64>>,
     /// Per-gaussian object membership, or `None` when the chunk carries no `object_id`
-    /// stream. Exact: the stored bins are the ids, used as read, never dequantized.
+    /// stream. Exact: each signed stream code contributes its same 32 bits to the
+    /// unsigned id, with no dequantization.
     pub object_id: Option<Vec<u32>>,
     /// Band number to its decoded coefficients, populated only for the bands a caller
     /// asked for.
@@ -240,12 +241,12 @@ pub fn decode_streams(
         let mut object_ids = Vec::with_capacity(count);
         for i in 0..count {
             let value = ids.get(i, 0);
-            object_ids.push(u32::try_from(value).map_err(|_| {
+            let signed = i32::try_from(value).map_err(|_| {
                 Error::Malformed(format!(
-                    "object_id element {i} is {value}; expected an integer in [0, {}]",
-                    u32::MAX
+                    "object_id element {i} has signed stream code {value}; expected an i32"
                 ))
-            })?);
+            })?;
+            object_ids.push(signed as u32);
         }
         out.object_id = Some(object_ids);
     }
