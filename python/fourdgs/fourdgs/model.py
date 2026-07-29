@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .quantization import K_SUPPORT
+from .quantization import DEFAULT_CUTOFF, support_k
 
 
 @dataclass
@@ -65,7 +65,7 @@ class GaussianSet:
     def count(self) -> int:
         return int(self.positions.shape[0])
 
-    def support(self) -> tuple[np.ndarray, np.ndarray]:
+    def support(self, cutoff: float = DEFAULT_CUTOFF) -> tuple[np.ndarray, np.ndarray]:
         """Per-gaussian visible interval, clipped to the validity window.
 
         This is what the chunker partitions on, and it is why content whose gaussians all
@@ -74,7 +74,7 @@ class GaussianSet:
         """
         sigma = self.sigma_t.astype(np.float64)
         mu = self.mu_t.astype(np.float64)
-        half = np.where(np.isfinite(sigma), K_SUPPORT * sigma, np.inf)
+        half = np.where(np.isfinite(sigma), support_k(cutoff) * sigma, np.inf)
         lo = np.maximum(mu - half, self.win_lo.astype(np.float64))
         hi = np.minimum(mu + half, self.win_hi.astype(np.float64))
         return lo, hi
@@ -84,8 +84,11 @@ class GaussianSet:
             return [0.0] * 6
         return [float(v) for v in self.positions.min(axis=0)] + [float(v) for v in self.positions.max(axis=0)]
 
-    def state_at(self, t: float) -> dict:
+    def state_at(self, t: float, cutoff: float = DEFAULT_CUTOFF) -> dict:
         """Reconstructed state at scene time `t`, exactly as the specification defines it.
+
+        `cutoff` is the file's own threshold, from its Header. It defaults to the default
+        so a caller holding only a `GaussianSet` still gets the common case right.
 
         Returned as index arrays plus attributes so a caller can do what it likes with
         them. This is where decoding ends: what happens to these numbers afterwards is
@@ -98,7 +101,7 @@ class GaussianSet:
             np.exp(-0.5 * np.square((t - mu) / np.maximum(sigma, 1e-30))),
             1.0,
         )
-        visible = (self.win_lo <= t) & (t < self.win_hi) & (marginal >= 0.05)
+        visible = (self.win_lo <= t) & (t < self.win_hi) & (marginal >= cutoff)
         idx = np.flatnonzero(visible)
         centers = self.positions[idx].astype(np.float64) + self.motions[idx].astype(np.float64) * (t - mu[idx])[:, None]
         return {

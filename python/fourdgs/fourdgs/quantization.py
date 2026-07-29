@@ -29,8 +29,23 @@ import numpy as np
 
 PROFILES = ("fine", "default", "coarse")
 
-#: `marginal >= cutoff` <=> `|t - mu| <= K * sigma`, for the default cutoff of 0.05.
-K_SUPPORT = math.sqrt(-2.0 * math.log(0.05))
+#: The Header's default marginal visibility threshold.
+DEFAULT_CUTOFF = 0.05
+
+#: `marginal >= cutoff` <=> `|t - mu| <= K * sigma`, for the default cutoff.
+K_SUPPORT = math.sqrt(-2.0 * math.log(DEFAULT_CUTOFF))
+
+
+def support_k(cutoff: float = DEFAULT_CUTOFF) -> float:
+    """Half-width of a gaussian's visible support, in sigmas, for a file's own cutoff.
+
+    Reading this from the Header rather than assuming the default is not cosmetic: it feeds
+    the velocity precision class, so a decoder that assumes 0.05 decodes different
+    velocities than the encoder wrote for any file that declares something else, and
+    nothing in the file tells it that it did.
+    """
+    return math.sqrt(-2.0 * math.log(cutoff))
+
 
 # Velocity precision classes (spec section 6.3).
 LIFE_REF = 0.5
@@ -130,15 +145,18 @@ def dequantize(bins, step: float, origin=0.0) -> np.ndarray:
 # --------------------------------------------------------------------------
 
 
-def life_class(sigma_bins, sigma_log_step: float, never_fades, window_len) -> np.ndarray:
+def life_class(sigma_bins, sigma_log_step: float, never_fades, window_len, k: float = K_SUPPORT) -> np.ndarray:
     """Velocity precision class, from the sigma bin a decoder has already read.
 
     `ceil`, not `round`: the class's nominal lifetime has to be an upper bound on the real
     one, or the displacement guarantee fails by up to sqrt(2). This is not hypothetical —
     the encoder's own verification caught exactly that on the first run.
+
+    `k` comes from the file's own cutoff (spec section 6.3); it defaults to the default
+    cutoff's value so a caller that has no header still gets the common case right.
     """
     sigma = np.exp(np.asarray(sigma_bins, dtype=np.float64) * sigma_log_step)
-    half = np.where(never_fades, np.asarray(window_len, dtype=np.float64), K_SUPPORT * sigma)
+    half = np.where(never_fades, np.asarray(window_len, dtype=np.float64), k * sigma)
     half = np.clip(half, LIFE_HALF_MIN, LIFE_HALF_MAX)
     cls = np.ceil(np.log2(half / LIFE_REF))
     return np.clip(cls, LIFE_MIN_CLASS, LIFE_MAX_CLASS).astype(np.int64)

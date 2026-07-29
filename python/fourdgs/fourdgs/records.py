@@ -53,7 +53,7 @@ class Header:
         """
         return bool(self.flags & FLAG_HAS_AUDIO)
 
-    def encode(self) -> bytes:
+    def encode(self, trailer: bytes = b"") -> bytes:
         body = (
             put_string(self.profile)
             + put_string(self.library)
@@ -66,7 +66,9 @@ class Header:
             + put_u8(self.flags)
             + put_str_map(self.attributes)
         )
-        return put_record(op.HEADER, body)
+        # A newer writer may append fields; a reader uses content_length and steps over
+        # what it does not know. `trailer` is how a test writes that newer file.
+        return put_record(op.HEADER, body + trailer)
 
     @staticmethod
     def parse(content) -> Header:
@@ -118,7 +120,7 @@ class Quantization:
     step_sh: int
     bounds: dict[str, str] = field(default_factory=dict)
 
-    def encode(self) -> bytes:
+    def encode(self, trailer: bytes = b"") -> bytes:
         body = (
             put_string(self.scheme)
             + put_f64s(self.pos_origin)
@@ -137,7 +139,7 @@ class Quantization:
             + put_u8(self.step_sh)
             + put_str_map(self.bounds)
         )
-        return put_record(op.QUANTIZATION, body)
+        return put_record(op.QUANTIZATION, body + trailer)
 
     @staticmethod
     def parse(content) -> Quantization:

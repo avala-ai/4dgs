@@ -135,8 +135,10 @@ export {
   type ChunkGaussians,
   type DecodeChunkOptions,
   chunkStreamBytes,
+  checkWindowIndex,
   decodeChunkStreams,
   stepsFrom,
+  windowTableOrDefault,
 } from "./chunk.js";
 
 export { GaussianSet, type GaussianState, assembleGaussians, marginalAt } from "./gaussians.js";

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import struct
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -25,7 +25,7 @@ from . import records as rec
 from .exceptions import MalformedFile
 from .readable import Readable
 from .serialization import MAGIC, Cursor, check_magic, crc32, iter_records, read_record
-from .stream_reader import decode_streams, steps_from
+from .stream_reader import chunk_stream_bytes, decode_streams, steps_from
 
 #: One read of this size from the front covers the header records of every scene measured
 #: so far. A larger header costs one extra round trip, never a wrong parse.
@@ -129,6 +129,14 @@ class IndexedScene:
     audio_range: tuple[int, int] | None
     audio_codec: str | None
     summary_crc_ok: bool | None
+    #: `(offset, length)` of the front-matter records this reader did not parse. Opening a
+    #: file frames them and stops: a camera nobody asked for costs nothing, and neither
+    #: does an attachment the size of a thumbnail sheet.
+    camera_range: tuple[int, int] | None = None
+    metadata_ranges: list[tuple[int, int]] = field(default_factory=list)
+    attachment_ranges: list[tuple[int, int]] = field(default_factory=list)
+    statistics: rec.Statistics | None = None
+    summary_offsets: list[rec.SummaryOffset] = field(default_factory=list)
 
     @property
     def has_audio(self) -> bool:
@@ -158,9 +166,11 @@ def open_indexed(source: Readable) -> IndexedScene:
 
     header = quant = None
     windows: list[tuple[float, float]] = []
-    seen_window_table = False
     audio_range = None
     audio_codec = None
+    camera_range = None
+    metadata_ranges: list[tuple[int, int]] = []
+    attachment_ranges: list[tuple[int, int]] = []
     for record in front.records(len(MAGIC)):
         if record.opcode == op.CHUNK:
             break
@@ -170,18 +180,18 @@ def open_indexed(source: Readable) -> IndexedScene:
             quant = rec.Quantization.parse(front.content(record))
         elif record.opcode == op.WINDOW_TABLE:
             windows = rec.WindowTable.parse(front.content(record)).windows
-            seen_window_table = True
         elif record.opcode == op.AUDIO:
             # The track's bytes are not read here, and the record is not stepped into: a
             # caller may want the gaussians and never the audio. Only the codec name is
             # parsed, out of a prefix, so a scene with a large track costs nothing to open.
             audio_codec = _audio_codec(front.content(record, limit=AUDIO_CODEC_PREFIX))
             audio_range = (record.offset, record.total_length)
-        # Everything the indexed path needs is in hand; the rest of the front matter is
-        # somebody else's business and is not worth another read.
-        audio_settled = audio_range is not None or (header is not None and not header.has_audio)
-        if header is not None and quant is not None and seen_window_table and audio_settled:
-            break
+        elif record.opcode == op.CAMERA:
+            camera_range = (record.offset, record.total_length)
+        elif record.opcode == op.METADATA:
+            metadata_ranges.append((record.offset, record.total_length))
+        elif record.opcode == op.ATTACHMENT:
+            attachment_ranges.append((record.offset, record.total_length))
     if header is None or quant is None:
         raise MalformedFile("the file has no Header or no Quantization record before its first Chunk")
 
@@ -192,6 +202,8 @@ def open_indexed(source: Readable) -> IndexedScene:
     footer = rec.Footer.parse(read_record(Cursor(tail)).content)
 
     index: list[rec.ChunkIndexEntry] = []
+    statistics = None
+    summary_offsets: list[rec.SummaryOffset] = []
     crc_ok = None
     if footer.summary_start:
         summary_len = size - footer_size - footer.summary_start
@@ -201,6 +213,10 @@ def open_indexed(source: Readable) -> IndexedScene:
         for record in iter_records(summary):
             if record.opcode == op.CHUNK_INDEX:
                 index.append(rec.ChunkIndexEntry.parse(record.content))
+            elif record.opcode == op.STATISTICS:
+                statistics = rec.Statistics.parse(record.content)
+            elif record.opcode == op.SUMMARY_OFFSET:
+                summary_offsets.append(rec.SummaryOffset.parse(record.content))
 
     return IndexedScene(
         header=header,
@@ -210,6 +226,11 @@ def open_indexed(source: Readable) -> IndexedScene:
         audio_range=audio_range,
         audio_codec=audio_codec,
         summary_crc_ok=crc_ok,
+        camera_range=camera_range,
+        metadata_ranges=metadata_ranges,
+        attachment_ranges=attachment_ranges,
+        statistics=statistics,
+        summary_offsets=summary_offsets,
     )
 
 
@@ -218,7 +239,12 @@ def read_chunk(source: Readable, scene: IndexedScene, entry: rec.ChunkIndexEntry
     blob = source.read(entry.chunk_offset, entry.chunk_length)
     head, streams = rec.parse_chunk(Cursor(blob, 9).take(len(blob) - 9))
     decoded = decode_streams(
-        streams, head.count, steps_from(scene.quantization), np.asarray(scene.quantization.pos_origin), scene.windows
+        chunk_stream_bytes(head, streams),
+        head.count,
+        steps_from(scene.quantization),
+        np.asarray(scene.quantization.pos_origin),
+        scene.windows,
+        scene.header.cutoff,
     )
     decoded["sh"] = {}
     for band, offset, length in entry.bands:
@@ -232,6 +258,30 @@ def read_chunk(source: Readable, scene: IndexedScene, entry: rec.ChunkIndexEntry
         _, values = decode_stream(cur)
         decoded["sh"][band] = values
     return decoded
+
+
+def read_camera(source: Readable, scene: IndexedScene) -> rec.Camera | None:
+    """The suggested camera trajectory, fetched only when a caller wants it."""
+    if scene.camera_range is None:
+        return None
+    offset, length = scene.camera_range
+    return rec.Camera.parse(Cursor(source.read(offset, length), 9).take(length - 9))
+
+
+def read_metadata(source: Readable, scene: IndexedScene) -> list[rec.Metadata]:
+    """Every Metadata record, by range."""
+    out = []
+    for offset, length in scene.metadata_ranges:
+        out.append(rec.Metadata.parse(Cursor(source.read(offset, length), 9).take(length - 9)))
+    return out
+
+
+def read_attachments(source: Readable, scene: IndexedScene) -> list[rec.Attachment]:
+    """Every Attachment record, by range. Each one costs exactly its own bytes."""
+    out = []
+    for offset, length in scene.attachment_ranges:
+        out.append(rec.Attachment.parse(Cursor(source.read(offset, length), 9).take(length - 9)))
+    return out
 
 
 def _audio_codec(prefix: bytes) -> str:

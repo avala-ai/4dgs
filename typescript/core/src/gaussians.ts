@@ -12,7 +12,7 @@
  * numbers afterwards is not this package's concern.
  */
 
-import type { ChunkGaussians } from "./chunk.js";
+import { checkWindowIndex, windowTableOrDefault, type ChunkGaussians } from "./chunk.js";
 import { DEFAULT_CUTOFF, supportK } from "./quantization.js";
 import type { ShCoefficients } from "./sh.js";
 
@@ -163,7 +163,8 @@ export function assembleGaussians(
   const winLo = new Float32Array(count);
   const winHi = new Float32Array(count);
 
-  const windowCount = windows.length >>> 1;
+  const table = windowTableOrDefault(windows);
+  const windowCount = table.length >>> 1;
   let at = 0;
   for (const chunk of chunks) {
     positions.set(chunk.positions, at * 3);
@@ -174,9 +175,9 @@ export function assembleGaussians(
     muT.set(chunk.muT, at);
     sigmaT.set(chunk.sigmaT, at);
     for (let i = 0; i < chunk.count; i++) {
-      const w = Math.min(Math.max(chunk.windowIndex[i]!, 0), Math.max(windowCount - 1, 0));
-      winLo[at + i] = windowCount > 0 ? windows[w * 2]! : 0;
-      winHi[at + i] = windowCount > 0 ? windows[w * 2 + 1]! : 0;
+      const w = checkWindowIndex(chunk.windowIndex[i]!, windowCount);
+      winLo[at + i] = table[w * 2]!;
+      winHi[at + i] = table[w * 2 + 1]!;
     }
     at += chunk.count;
   }

@@ -14,7 +14,7 @@ consumers will trust it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -23,6 +23,7 @@ from . import records as rec
 from .exceptions import BoundViolation
 from .model import AudioTrack, CameraTrajectory, GaussianSet, window_table
 from .quantization import (
+    DEFAULT_CUTOFF,
     Bounds,
     Steps,
     dequantize,
@@ -35,6 +36,7 @@ from .quantization import (
     quantize_rotation,
     rct_forward,
     rct_inverse,
+    support_k,
 )
 from .serialization import CODEC_DEFLATE, MAGIC, crc32, encode_stream, put_record, put_u8
 
@@ -44,6 +46,10 @@ SH_BAND_COEFFS = {1: (0, 3), 2: (3, 8), 3: (8, 15)}
 @dataclass
 class WriteOptions:
     profile: str = "default"
+    #: The Header's marginal visibility threshold. It is not only metadata: it sets the
+    #: support constant the per-gaussian velocity grid is derived from, so encoder and
+    #: decoder must agree on it, and they do by reading it from the file.
+    cutoff: float = DEFAULT_CUTOFF
     codec: int = CODEC_DEFLATE
     level: int = 6
     #: Depth of the temporal partition below each window. 0 writes one chunk per window.
@@ -59,6 +65,10 @@ class WriteOptions:
     library: str = "4dgs-python reference encoder"
     scene_profile: str = ""
     metadata: dict[str, str] | None = None
+    #: Bytes appended to the content of the record with the given opcode, as a newer
+    #: writer that added a field would produce. A reader that honours content_length steps
+    #: over them; one that assumes a record ends where its own knowledge does does not.
+    record_trailers: dict[int, bytes] = field(default_factory=dict)
     #: Pre-encoded records emitted verbatim after the window table. Used to place
     #: unknown-opcode and private-range records in a file whose offsets are still
     #: correct — splicing them in afterwards would shift every offset the index holds,
@@ -165,7 +175,8 @@ def _encode(g: GaussianSet, duration_sec, opts, audio, camera) -> bytes:
     flags = never_fades.astype(np.int64)
 
     win_len = (g.win_hi - g.win_lo).astype(np.float64)
-    m_step = motion_steps(life_class(q_sigma, steps.sigma_log, never_fades, win_len), steps.motion)
+    k = support_k(opts.cutoff)
+    m_step = motion_steps(life_class(q_sigma, steps.sigma_log, never_fades, win_len, k), steps.motion)
     q_motion = (
         np.rint(g.motions.astype(np.float64) / m_step[:, None]).astype(np.int64) if n else np.zeros((0, 3), np.int64)
     )
@@ -210,10 +221,11 @@ def _encode(g: GaussianSet, duration_sec, opts, audio, camera) -> bytes:
             profile=opts.scene_profile,
             library=opts.library,
             temporal_model="gaussian-birth",
+            cutoff=opts.cutoff,
             sh_degree=g.sh_degree if sh_cols else 0,
             flags=header_flags,
             attributes=opts.metadata or {},
-        ).encode()
+        ).encode(trailer=opts.record_trailers.get(op.HEADER, b""))
     )
     emit(
         rec.Quantization(
@@ -229,7 +241,7 @@ def _encode(g: GaussianSet, duration_sec, opts, audio, camera) -> bytes:
             step_sigma_log=steps.sigma_log,
             step_sh=steps.sh,
             bounds=bounds.as_strings(),
-        ).encode()
+        ).encode(trailer=opts.record_trailers.get(op.QUANTIZATION, b""))
     )
     emit(rec.WindowTable(windows=[(float(a), float(b)) for a, b in table]).encode())
     for blob in opts.extra_records:
@@ -310,7 +322,7 @@ def _encode(g: GaussianSet, duration_sec, opts, audio, camera) -> bytes:
         )
 
         if opts.verify:
-            _verify_chunk(g, members, chunk_blob, steps, bounds, worst, origin, table)
+            _verify_chunk(g, members, chunk_blob, steps, bounds, worst, origin, table, opts.cutoff)
 
     if opts.verify and worst:
         _assert_bounds(worst, bounds)
@@ -350,11 +362,11 @@ def _ids(arr, members) -> np.ndarray:
     return np.asarray(arr, dtype=np.int64)[members]
 
 
-def _verify_chunk(g, members, chunk_blob, steps, bounds, worst, origin, windows) -> None:
+def _verify_chunk(g, members, chunk_blob, steps, bounds, worst, origin, windows, cutoff) -> None:
     """Decode what was just encoded and record the worst deviation seen."""
     from .stream_reader import decode_chunk_blob
 
-    decoded = decode_chunk_blob(chunk_blob, steps, np.asarray(origin, dtype=np.float64), windows)
+    decoded = decode_chunk_blob(chunk_blob, steps, np.asarray(origin, dtype=np.float64), windows, cutoff)
 
     def upd(key, value):
         worst[key] = max(worst.get(key, 0.0), float(value))

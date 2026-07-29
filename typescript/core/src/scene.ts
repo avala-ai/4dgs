@@ -16,7 +16,7 @@ import {
   type DecodeChunkOptions,
   stepsFrom,
 } from "./chunk.js";
-import { DEFAULT_CODECS, type CodecRegistry } from "./codec.js";
+import { crc32, DEFAULT_CODECS, type CodecRegistry } from "./codec.js";
 import { MalformedFile, TruncatedFile } from "./errors.js";
 import { assembleGaussians, type GaussianSet } from "./gaussians.js";
 import { Opcode } from "./opcodes.js";
@@ -41,6 +41,7 @@ import {
   parseQuantization,
   parseShBandRecord,
   parseStatistics,
+  parseFooter,
   parseSummaryOffset,
   parseWindowTable,
 } from "./records.js";
@@ -64,6 +65,14 @@ export interface Scene {
   readonly statistics: Statistics | null;
   readonly chunkIndex: readonly ChunkIndexEntry[];
   readonly summaryOffsets: readonly SummaryOffset[];
+  /**
+   * Whether the Footer's summary CRC matched, or `null` when the file declares none.
+   *
+   * A front-to-back reader can answer this too: it has seen the bytes the CRC covers, so
+   * it retains the summary region — the index, which is small by design — until the
+   * Footer arrives and says where that region began.
+   */
+  readonly summaryCrcOk: boolean | null;
   /** Opcodes seen but not understood, in the order they appeared. */
   readonly skippedOpcodes: readonly number[];
   /** True when the resource ended before the file did. What decoded still stands. */
@@ -119,6 +128,11 @@ export async function decodeScene(
   const chunkIndex: ChunkIndexEntry[] = [];
   const summaryOffsets: SummaryOffset[] = [];
   const skippedOpcodes: number[] = [];
+  // The summary region, retained from the first record that belongs to it so the Footer's
+  // CRC can be checked. Bounded by the index, which every reader has to hold anyway.
+  const summaryParts: Uint8Array[] = [];
+  let summaryPartsStart = -1;
+  let summaryCrcOk: boolean | null = null;
   let audio: AudioTrack | null = null;
   let camera: Camera | null = null;
   let statistics: Statistics | null = null;
@@ -133,7 +147,12 @@ export async function decodeScene(
     // Records complete as bytes arrive. A record that is not complete yet is simply not
     // yielded, which is the whole of truncation recovery: what is complete is decoded,
     // what is cut is not, and nothing has to be undone.
-    for (const { opcode, content } of decoder.records()) {
+    for (const record of decoder.records()) {
+      const { opcode, content } = record;
+      if (SUMMARY_OPCODES.has(opcode)) {
+        if (summaryPartsStart < 0) summaryPartsStart = record.offset;
+        summaryParts.push(record.raw);
+      }
       switch (opcode) {
         case Opcode.Header:
           header = parseHeader(content);
@@ -190,7 +209,19 @@ export async function decodeScene(
         case Opcode.SummaryOffset:
           summaryOffsets.push(parseSummaryOffset(content));
           break;
-        case Opcode.Footer:
+        case Opcode.Footer: {
+          const footer = parseFooter(content);
+          if (footer.summaryStart > 0 && footer.summaryCrc !== 0) {
+            summaryCrcOk = checkSummaryCrc(
+              summaryParts,
+              summaryPartsStart,
+              footer.summaryStart,
+              record.offset,
+              footer.summaryCrc,
+            );
+          }
+          break;
+        }
         case Opcode.AttachmentIndex:
           break;
         default:
@@ -228,8 +259,46 @@ export async function decodeScene(
     chunkIndex,
     summaryOffsets,
     skippedOpcodes,
+    summaryCrcOk,
     truncated,
   };
+}
+
+/** Records that belong to the summary region a Footer CRC covers. */
+const SUMMARY_OPCODES: ReadonlySet<number> = new Set([
+  Opcode.ChunkIndex,
+  Opcode.Statistics,
+  Opcode.SummaryOffset,
+  Opcode.AttachmentIndex,
+]);
+
+/**
+ * Check the Footer's CRC over `[summaryStart, footerStart)` against the retained bytes.
+ *
+ * `null` rather than `false` when the retained region does not reach back to where the
+ * Footer says the summary began: that is a reader which cannot answer, not a file that
+ * failed.
+ */
+function checkSummaryCrc(
+  parts: readonly Uint8Array[],
+  partsStart: number,
+  summaryStart: number,
+  footerStart: number,
+  expected: number,
+): boolean | null {
+  if (partsStart < 0 || summaryStart < partsStart) return null;
+  let total = 0;
+  for (const part of parts) total += part.byteLength;
+  const joined = new Uint8Array(total);
+  let at = 0;
+  for (const part of parts) {
+    joined.set(part, at);
+    at += part.byteLength;
+  }
+  const from = summaryStart - partsStart;
+  const to = footerStart - partsStart;
+  if (to > joined.byteLength || from > to) return null;
+  return crc32(joined.subarray(from, to)) === expected;
 }
 
 /**

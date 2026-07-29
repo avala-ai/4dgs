@@ -30,6 +30,33 @@ import {
 import type { ParsedChunk, Quantization } from "./records.js";
 import { decodeStream, frameStreams, type RawStream } from "./streams.js";
 
+/**
+ * The Window Table as flattened `[lo, hi]` pairs, or the one-window default.
+ *
+ * A file with no Window Table, or one whose count is zero, reads as though it declared
+ * exactly one window `(0, 0)`: every gaussian references index 0 and nothing is visible at
+ * any time. Degenerate, well defined, and not an error.
+ */
+export function windowTableOrDefault(windows: Float64Array): Float64Array {
+  return windows.length >= 2 ? windows : new Float64Array(2);
+}
+
+/**
+ * Refuse a window index outside the table rather than clamping it.
+ *
+ * Clamping substitutes one gaussian's lifetime for another's, in a file that is already
+ * wrong in some way nobody has diagnosed — it turns a detectable fault into plausible
+ * wrong output.
+ */
+export function checkWindowIndex(index: number, windowCount: number): number {
+  if (index < 0 || index >= windowCount) {
+    throw new MalformedFile(
+      `window index ${index} is outside the ${windowCount}-entry window table`,
+    );
+  }
+  return index;
+}
+
 /** The grids from a Quantization record, in the shape the decoder uses them. */
 export function stepsFrom(q: Quantization): Steps {
   return {
@@ -138,7 +165,7 @@ function assemble(
   decoded: ReadonlyMap<number, Int32Array>,
   options: DecodeChunkOptions,
 ): ChunkGaussians {
-  const { steps, posOrigin, windows } = options;
+  const { steps, posOrigin } = options;
   const posBins = decoded.get(Attribute.Position)!;
   const scaleBins = decoded.get(Attribute.Scale)!;
   const rotIndex = decoded.get(Attribute.RotationIndex)!;
@@ -160,6 +187,7 @@ function assemble(
   const sigmaT = new Float32Array(count);
   const windowIndex = new Int32Array(count);
 
+  const windows = windowTableOrDefault(options.windows);
   const windowCount = windows.length >>> 1;
   const originX = posOrigin[0] ?? 0;
   const originY = posOrigin[1] ?? 0;
@@ -195,11 +223,9 @@ function assemble(
     // the decoder has already read. There is no side channel and no lookup table.
     const neverFades = (flagBins[i]! & 1) !== 0;
     const sigmaBin = sigmaBins[i]!;
-    const rawIndex = windowBins[i]!;
-    const safeIndex = clamp(rawIndex, 0, Math.max(windowCount - 1, 0));
-    windowIndex[i] = safeIndex;
-    const windowLength =
-      windowCount > 0 ? windows[safeIndex * 2 + 1]! - windows[safeIndex * 2]! : 0;
+    const index = checkWindowIndex(windowBins[i]!, windowCount);
+    windowIndex[i] = index;
+    const windowLength = windows[index * 2 + 1]! - windows[index * 2]!;
 
     const step = motionStep(
       lifeClass(sigmaBin, steps.sigmaLog, neverFades, windowLength, options.supportK),

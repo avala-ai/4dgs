@@ -33,7 +33,11 @@ import {
   type ChunkIndexEntry,
   type Footer,
   type Header,
+  type Attachment,
+  type Camera,
+  type Metadata,
   type Quantization,
+  type Statistics,
   type SummaryOffset,
   FOOTER_TAIL_BYTES,
   MAGIC,
@@ -43,11 +47,15 @@ import {
   iterateRecords,
   parseAudio,
   parseChunk,
+  parseAttachment,
+  parseCamera,
   parseChunkIndexEntry,
   parseFooter,
+  parseMetadata,
   parseHeader,
   parseQuantization,
   parseShBandRecord,
+  parseStatistics,
   parseSummaryOffset,
   parseWindowTable,
   readRecord,
@@ -69,6 +77,12 @@ export const HEAD_PROBE_BYTES = 64 * 1024;
  * stays where it is until somebody asks for it.
  */
 const AUDIO_CODEC_PREFIX_BYTES = 4096;
+
+/** Where a record the reader has not parsed lives. */
+interface ByteRange {
+  readonly offset: number;
+  readonly length: number;
+}
 
 export interface OpenIndexedOptions {
   readonly codecs?: CodecRegistry;
@@ -104,6 +118,17 @@ export class IndexedDecoder {
     readonly footer: Footer,
     readonly summaryOffsets: readonly SummaryOffset[],
     private readonly audioRange: { offset: number; length: number; codec: string } | null,
+    /**
+     * Front-matter records this reader framed and did not parse. Opening a file learns
+     * where they are and stops: a camera nobody asked for costs nothing, and neither does
+     * an attachment the size of a thumbnail sheet.
+     */
+    private readonly deferred: {
+      camera: ByteRange | null;
+      metadata: ByteRange[];
+      attachments: ByteRange[];
+    },
+    readonly statistics: Statistics | null,
     /** Whether the summary CRC matched, or `null` when the file declares none. */
     readonly summaryCrcOk: boolean | null,
     readonly size: number,
@@ -124,8 +149,13 @@ export class IndexedDecoder {
     let header: Header | null = null;
     let quantization: Quantization | null = null;
     let windows = new Float64Array(0);
-    let seenWindowTable = false;
     let audioRange: { offset: number; length: number; codec: string } | null = null;
+    const deferred: { camera: ByteRange | null; metadata: ByteRange[]; attachments: ByteRange[] } =
+      {
+        camera: null,
+        metadata: [],
+        attachments: [],
+      };
     for await (const record of scanner.records(MAGIC.length)) {
       if (record.opcode === Opcode.Chunk) break;
       if (record.opcode === Opcode.Header) {
@@ -134,7 +164,6 @@ export class IndexedDecoder {
         quantization = parseQuantization(await scanner.content(record));
       } else if (record.opcode === Opcode.WindowTable) {
         windows = parseWindowTable(await scanner.content(record));
-        seenWindowTable = true;
       } else if (record.opcode === Opcode.Audio) {
         // The track's bytes are not read here, and neither is the record stepped into: a
         // caller may want the gaussians and never the audio. Only the codec name is
@@ -144,11 +173,13 @@ export class IndexedDecoder {
           length: record.totalLength,
           codec: readAudioCodec(await scanner.content(record, AUDIO_CODEC_PREFIX_BYTES)),
         };
+      } else if (record.opcode === Opcode.Camera) {
+        deferred.camera = { offset: record.offset, length: record.totalLength };
+      } else if (record.opcode === Opcode.Metadata) {
+        deferred.metadata.push({ offset: record.offset, length: record.totalLength });
+      } else if (record.opcode === Opcode.Attachment) {
+        deferred.attachments.push({ offset: record.offset, length: record.totalLength });
       }
-      // Everything the indexed path needs is in hand; the rest of the front matter is
-      // somebody else's business and is not worth another read.
-      const audioSettled = audioRange !== null || (header !== null && !header.hasAudio);
-      if (header !== null && quantization !== null && seenWindowTable && audioSettled) break;
     }
     if (header === null || quantization === null) {
       throw new MalformedFile(
@@ -164,6 +195,7 @@ export class IndexedDecoder {
 
     const index: ChunkIndexEntry[] = [];
     const summaryOffsets: SummaryOffset[] = [];
+    let statistics: Statistics | null = null;
     let summaryCrcOk: boolean | null = null;
     if (footer.summaryStart > 0) {
       const summaryLength = size - FOOTER_TAIL_BYTES - footer.summaryStart;
@@ -179,6 +211,8 @@ export class IndexedDecoder {
         if (record.opcode === Opcode.ChunkIndex) index.push(parseChunkIndexEntry(record.content));
         else if (record.opcode === Opcode.SummaryOffset) {
           summaryOffsets.push(parseSummaryOffset(record.content));
+        } else if (record.opcode === Opcode.Statistics) {
+          statistics = parseStatistics(record.content);
         }
       }
     }
@@ -193,9 +227,48 @@ export class IndexedDecoder {
       footer,
       summaryOffsets,
       audioRange,
+      deferred,
+      statistics,
       summaryCrcOk,
       size,
     );
+  }
+
+  /** The suggested camera trajectory, fetched only when a caller wants it. */
+  async readCamera(): Promise<Camera | null> {
+    const range = this.deferred.camera;
+    if (range === null) return null;
+    return parseCamera(await this.readRecordAt(range, Opcode.Camera));
+  }
+
+  /** Every Metadata record, by range. */
+  async readMetadata(): Promise<Metadata[]> {
+    const out: Metadata[] = [];
+    for (const range of this.deferred.metadata) {
+      out.push(parseMetadata(await this.readRecordAt(range, Opcode.Metadata)));
+    }
+    return out;
+  }
+
+  /** Every Attachment record, by range. Each one costs exactly its own bytes. */
+  async readAttachments(): Promise<Attachment[]> {
+    const out: Attachment[] = [];
+    for (const range of this.deferred.attachments) {
+      out.push(parseAttachment(await this.readRecordAt(range, Opcode.Attachment)));
+    }
+    return out;
+  }
+
+  private async readRecordAt(range: ByteRange, expected: number): Promise<Uint8Array> {
+    const blob = await this.source.read(BigInt(range.offset), BigInt(range.length));
+    const record = readRecord(new Cursor(blob, 0, range.offset));
+    if (record.opcode !== expected) {
+      throw new MalformedFile(
+        `offset ${range.offset} holds opcode 0x${record.opcode.toString(16)}, expected ` +
+          `0x${expected.toString(16)}`,
+      );
+    }
+    return record.content;
   }
 
   /** Whether the scene has audio, from the Header alone. */

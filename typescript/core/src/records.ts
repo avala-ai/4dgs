@@ -38,6 +38,8 @@ export interface RawRecord {
   readonly offset: number;
   /** Total bytes the record occupies, header included. */
   readonly length: number;
+  /** The whole record, header included — the bytes a checksum over a range covers. */
+  readonly raw: Uint8Array;
 }
 
 export function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
@@ -73,11 +75,18 @@ export function checkMagic(head: Uint8Array): void {
 
 /** Read one record at the cursor. */
 export function readRecord(cursor: Cursor, base = 0): RawRecord {
-  const offset = base + cursor.pos;
+  const start = cursor.pos;
+  const offset = base + start;
   const opcode = cursor.u8();
   const length = cursor.u64();
   const content = cursor.take(length);
-  return { opcode, content, offset, length: length + RECORD_HEADER_BYTES };
+  return {
+    opcode,
+    content,
+    offset,
+    length: length + RECORD_HEADER_BYTES,
+    raw: cursor.bytes.subarray(start, start + RECORD_HEADER_BYTES + length),
+  };
 }
 
 /**

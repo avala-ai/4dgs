@@ -88,8 +88,9 @@ export class StreamDecoder {
       if (this.buffered < RECORD_HEADER_BYTES + length) return;
       const start = this.cursor + RECORD_HEADER_BYTES;
       const content = this.pending.subarray(start, start + length);
+      const raw = this.pending.subarray(this.cursor, start + length);
       this.cursor = start + length;
-      yield { opcode, content, offset, length: length + RECORD_HEADER_BYTES };
+      yield { opcode, content, offset, length: length + RECORD_HEADER_BYTES, raw };
     }
   }
 
