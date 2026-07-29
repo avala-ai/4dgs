@@ -5,7 +5,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/avala-ai/4dgs.git"
+    "url": "git+https://github.com/avala-ai/4dgs.git"
   },
   "type": "module",
   "main": "./dist/index.js",
