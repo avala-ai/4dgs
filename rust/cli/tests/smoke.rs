@@ -225,6 +225,39 @@ fn the_usage_message_is_served_rather_than_run() {
     assert_eq!(run(&["frobnicate", "x"]).status.code(), Some(1));
 }
 
+#[test]
+fn a_reader_that_goes_away_is_not_an_error() {
+    let Some(path) = file(INDEXED) else {
+        return;
+    };
+    // `4dgs info x | grep -q y` closes the pipe on grep's first match, and `| head` closes
+    // it after n lines. Rust's `println!` panics on the write that follows — exit 101 —
+    // which took a CI step red on the leg whose scheduler let grep exit first.
+    //
+    // Closing the read end before the child writes is the same condition without the
+    // race, and it is not probabilistic: against the code that had this bug it reproduced
+    // 40 times out of 40. The loop is here because a scheduler is still involved, not
+    // because one run would be inconclusive.
+    for _ in 0..5 {
+        let mut child = Command::new(BIN)
+            .args(["info", path.to_str().unwrap()])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("the binary this test was built alongside");
+        drop(child.stdout.take());
+        let status = child.wait().expect("the child to exit");
+        assert_ne!(
+            status.code(),
+            Some(101),
+            "a closed pipe panicked instead of ending the run"
+        );
+        assert!(
+            matches!(status.code(), Some(0) | None),
+            "a closed pipe should end the run quietly, got {status:?}"
+        );
+    }
+}
+
 /// CI generates the corpus before this suite, so a run with nothing to decode there is a
 /// green suite that proved nothing. This is the assertion that stops it.
 #[test]

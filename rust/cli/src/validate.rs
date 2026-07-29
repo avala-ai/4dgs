@@ -65,13 +65,13 @@ pub fn run(args: &Args) -> Result<u8> {
     let data = std::fs::read(&args.file)?;
     let report = validate(&data);
     for (severity, message) in &report.findings {
-        println!("{}: {message}", severity.as_str());
+        out!("{}: {message}", severity.as_str());
     }
     if !report.ok() {
         eprintln!("INVALID");
         return Ok(EXIT_FAILED);
     }
-    println!(
+    out!(
         "{}",
         if report.findings.is_empty() {
             "valid"

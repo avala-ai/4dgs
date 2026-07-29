@@ -42,7 +42,7 @@ impl Args {
                 return Ok(None);
             }
             "-V" | "--version" | "version" => {
-                println!("{}", env!("CARGO_PKG_VERSION"));
+                out!("{}", env!("CARGO_PKG_VERSION"));
                 return Ok(None);
             }
             _ => {}
