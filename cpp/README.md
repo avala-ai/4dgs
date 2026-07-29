@@ -52,6 +52,5 @@ are what somebody gets.
 Conformance-verified: **67 checks over 34 variants on both read paths, the same numbers as the
 reference implementation**, with the read path forced at open rather than left to the opener, so the
 streamed and indexed rows rest on two paths and not one. The
-[feature matrix](../website/docs/reference/index.md) records exactly what that proves; degree-3
-spherical harmonics stay `Planned` because the corpus carries no degree-3 variant, and the encode
+[feature matrix](../website/docs/reference/index.md) records exactly what that proves; the encode
 rows stay `Planned` because this package decodes only at v1.
