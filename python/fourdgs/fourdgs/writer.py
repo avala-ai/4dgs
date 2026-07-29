@@ -230,6 +230,20 @@ def _check_finite_input(g: GaussianSet) -> None:
     NaN there becomes a deliberate-looking value, and a NaN window makes every comparison
     false so the gaussian silently never appears.
     """
+    if g.object_id is not None:
+        object_ids = np.asarray(g.object_id)
+        if object_ids.shape != (g.count,):
+            raise InvalidInput(
+                f"object_id has shape {object_ids.shape}, expected ({g.count},); "
+                "there must be one exact u32 label per gaussian"
+            )
+        valid = np.isfinite(object_ids) & (object_ids == np.floor(object_ids))
+        valid &= (object_ids >= 0) & (object_ids <= np.iinfo(np.uint32).max)
+        if not np.all(valid):
+            bad = int(np.flatnonzero(~valid)[0])
+            raise InvalidInput(
+                f"object_id[{bad}] is {object_ids[bad]!r}; expected an exact integer in [0, {np.iinfo(np.uint32).max}]"
+            )
     if not g.count:
         return
     for name in _FINITE_FIELDS:
@@ -443,9 +457,21 @@ def _encode(g: GaussianSet, duration_sec, opts, audio, camera) -> bytes:
                 if opts.preserve_source_ids
                 else []
             )
-            # object_id is exact: its bins are the ids as-is, never a quantization grid.
+            # Attribute streams carry signed 32-bit symbols. Preserve all u32 labels by
+            # writing their two's-complement i32 code; the decoder reverses that bit view.
+            # This is exact and is still not a quantization grid.
             + (
-                [encode_stream(op.A_OBJECT_ID, _ids(g.object_id, members), codec=opts.codec, level=opts.level)]
+                [
+                    encode_stream(
+                        op.A_OBJECT_ID,
+                        _object_id_codes(g.object_id, members),
+                        codec=opts.codec,
+                        level=opts.level,
+                        # Adjacent u32 ids can cross the signed bridge and produce a
+                        # 33-bit delta even though each raw code is exactly 32 bits.
+                        allow_delta=False,
+                    )
+                ]
                 if g.object_id is not None
                 else []
             )
@@ -523,6 +549,12 @@ def _ids(arr, members) -> np.ndarray:
     if arr is None:
         return np.asarray(members, dtype=np.int64)
     return np.asarray(arr, dtype=np.int64)[members]
+
+
+def _object_id_codes(arr, members) -> np.ndarray:
+    """Map exact u32 labels onto the stream's complete signed-32-bit symbol domain."""
+    ids = np.asarray(arr, dtype=np.uint32)[members]
+    return ids.view(np.int32).astype(np.int64)
 
 
 def _verify_chunk(g, members, chunk_blob, steps, bounds, worst, origin, windows, cutoff) -> None:

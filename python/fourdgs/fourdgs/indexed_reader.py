@@ -341,6 +341,8 @@ def read_provenance(source: Readable, scene: IndexedScene) -> Provenance:
     """
     out = Provenance()
     for opcode, offset, length in scene.provenance_ranges:
+        if opcode not in (op.COORDINATE_FRAME, op.SENSOR_CALIBRATION, op.RIG_TRAJECTORY, op.GEODETIC_ANCHOR):
+            continue
         blob = _read_range(source, offset, length, f"a {op.name(opcode)} record")
         content = Cursor(blob, 9).take(length - 9)
         if opcode == op.COORDINATE_FRAME:
@@ -369,6 +371,12 @@ def read_objects(source: Readable, scene: IndexedScene) -> ObjectLayer:
         blob = _read_range(source, offset, length, f"a {op.name(opcode)} record")
         content = Cursor(blob, 9).take(length - 9)
         if opcode == op.OBJECT_TABLE:
+            if out.table is not None:
+                raise MalformedFile(
+                    f"a second ObjectTable record appears at byte {offset}; "
+                    "a file may carry exactly one scene-wide object table",
+                    code="duplicate-object-table",
+                )
             out.table = rec.ObjectTable.parse(content)
         else:
             out.tracks.append(rec.ObjectTrack.parse(content))

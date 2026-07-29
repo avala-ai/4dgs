@@ -131,6 +131,15 @@ of arrays, delta-coded and codec-compressed like any other stream.
   which are exact indices for the same reason. A reader that multiplies `object_id` by anything has
   misread this section.
 
+  Attribute Stream symbols are signed 32-bit values after zigzag, while `object_id` owns the full
+  unsigned 32-bit domain. The exact bridge is the two's-complement bit view: a writer maps the `u32`
+  label to the `i32` with the same 32 bits before stream encoding, and a reader maps that signed
+  code back to the `u32` with the same bits after stream decoding. Thus `0x7FFF_FFFF` maps to
+  `2147483647`, `0x8000_0000` maps to `-2147483648`, and `0xFFFF_FFFF` maps to `-1`. This is a
+  representation, not quantization: it is bijective, changes no label and gives every `u32` one
+  legal four-byte stream code. An encoder MAY delta-code those signed codes only when every
+  resulting delta still fits the stream's 32-bit symbol width; raw mode is always available.
+
 This is `object_id` in full for a `gaussian-birth` file. Its behaviour under `keyframe-delta` is one
 paragraph and it is in §3.4.
 

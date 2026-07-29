@@ -161,6 +161,24 @@ def decode_streams(
     motion_step = motion_steps(
         life_class(sigma_bins, steps.sigma_log, never_fades, win_len, support_k(cutoff)), steps.motion
     )[:, None]
+    object_id = None
+    if op.A_OBJECT_ID in got:
+        codes = got[op.A_OBJECT_ID]
+        if codes.shape[1] != 1:
+            raise MalformedFile(
+                f"the object_id stream declares {codes.shape[1]} channels, the format defines 1",
+                code="invalid-object-id-stream",
+            )
+        codes = codes[:, 0]
+        if np.any(codes < np.iinfo(np.int32).min) or np.any(codes > np.iinfo(np.int32).max):
+            index = int(np.flatnonzero((codes < np.iinfo(np.int32).min) | (codes > np.iinfo(np.int32).max))[0])
+            raise MalformedFile(
+                f"object_id element {index} has signed stream code {int(codes[index])}; "
+                "expected a signed 32-bit code that maps exactly onto u32",
+                code="invalid-object-id-stream",
+            )
+        object_id = codes.astype(np.int32).view(np.uint32)
+
     return {
         "positions": dequantize(got[op.A_POSITION], steps.pos, origin),
         "scales": np.exp(dequantize(got[op.A_SCALE], steps.scale_log)),
@@ -178,8 +196,8 @@ def decode_streams(
         "sigma_t": sigma,
         "window_index": window_index,
         "source_index": got[op.A_SOURCE_INDEX][:, 0] if op.A_SOURCE_INDEX in got else None,
-        # Exact: the stored bins are the object ids, used as read, never dequantized.
-        "object_id": got[op.A_OBJECT_ID][:, 0] if op.A_OBJECT_ID in got else None,
+        # Exact: signed stream codes are the two's-complement bit view of all u32 ids.
+        "object_id": object_id,
     }
 
 
@@ -352,6 +370,12 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
             elif record.opcode == op.GEODETIC_ANCHOR:
                 scene.provenance.anchors.append(rec.GeodeticAnchor.parse(record.content))
             elif record.opcode == op.OBJECT_TABLE:
+                if scene.objects.table is not None:
+                    raise MalformedFile(
+                        f"a second ObjectTable record appears at byte {record.offset}; "
+                        "a file may carry exactly one scene-wide object table",
+                        code="duplicate-object-table",
+                    )
                 scene.objects.table = rec.ObjectTable.parse(record.content)
             elif record.opcode == op.OBJECT_TRACK:
                 scene.objects.tracks.append(rec.ObjectTrack.parse(record.content))
@@ -422,6 +446,16 @@ def _assemble(chunks: list[dict], windows, header, chunk_bands=None) -> Gaussian
     check_window_indices(idx, len(table))
     src = [c["source_index"] for c in chunks]
     oid = [c["object_id"] for c in chunks]
+    object_id = (
+        np.concatenate(
+            [
+                np.zeros(len(chunk["mu_t"]), dtype=np.uint32) if ids is None else ids
+                for chunk, ids in zip(chunks, oid, strict=True)
+            ]
+        )
+        if any(ids is not None for ids in oid)
+        else None
+    )
     sh = merge_chunk_bands([len(c["mu_t"]) for c in chunks], chunk_bands or [])
     return GaussianSet(
         positions=np.concatenate([c["positions"] for c in chunks]).astype(np.float32),
@@ -436,5 +470,5 @@ def _assemble(chunks: list[dict], windows, header, chunk_bands=None) -> Gaussian
         sh=sh,
         sh_degree=header.sh_degree,
         source_index=np.concatenate(src) if all(s is not None for s in src) else None,
-        object_id=np.concatenate(oid) if all(o is not None for o in oid) else None,
+        object_id=object_id,
     )

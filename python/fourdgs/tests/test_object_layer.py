@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 from fourdgs import records as rec
 from fourdgs.exceptions import MalformedFile
-from fourdgs.indexed_reader import open_indexed, read_objects
+from fourdgs.indexed_reader import open_indexed, read_chunk, read_objects, read_provenance
 from fourdgs.object_layer import ObjectLayer
 from fourdgs.readable import BytesReadable
 
@@ -310,12 +310,29 @@ def test_object_id_and_records_round_trip_through_a_file():
     assert out.gaussians.object_id is not None
     assert set(np.unique(out.gaussians.object_id)) == {0, 7}
     assert int((out.gaussians.object_id == 7).sum()) == int((scene.object_id == 7).sum())
-
     # The front-matter records survived.
     assert out.objects.table is not None
     assert out.objects.table.entries[0].label == "vehicle"
     assert out.objects.table.entries[0].embedding == pytest.approx([0.1, 0.2, 0.3])
     assert out.objects.track(7) is not None
+
+
+def test_object_id_round_trips_the_complete_u32_domain():
+    scene = _scene_with_objects(4)
+    scene.object_id = np.array([0, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFF], dtype=np.uint32)
+    buf = io.BytesIO()
+    fourdgs.write(buf, scene, 6.0, options=fourdgs.WriteOptions(write_index=True))
+    expected = sorted(int(v) for v in scene.object_id)
+
+    streamed = fourdgs.read(buf.getvalue()).gaussians.object_id
+    assert streamed is not None
+    assert sorted(int(v) for v in streamed) == expected
+
+    source = BytesReadable(buf.getvalue())
+    indexed = open_indexed(source)
+    chunks = [read_chunk(source, indexed, entry) for entry in indexed.index]
+    decoded = np.concatenate([chunk["object_id"] for chunk in chunks])
+    assert sorted(int(v) for v in decoded) == expected
 
 
 def test_composition_moves_the_tracked_object_in_a_real_file():
@@ -346,6 +363,28 @@ def test_indexed_reader_reads_the_object_layer():
     assert layer.table is not None
     assert layer.table.entries[0].object_id == 7
     assert layer.track(7) is not None
+
+
+def test_reading_provenance_does_not_fetch_object_ranges():
+    class CountingBytesReadable(BytesReadable):
+        def __init__(self, data):
+            super().__init__(data)
+            self.ranges = []
+
+        def read(self, offset, length):
+            self.ranges.append((offset, length))
+            return super().read(offset, length)
+
+    scene = _scene_with_objects()
+    buf = io.BytesIO()
+    fourdgs.write(buf, scene, 6.0, options=fourdgs.WriteOptions(objects=_layer(), write_index=True))
+    source = CountingBytesReadable(buf.getvalue())
+    indexed = open_indexed(source)
+    source.ranges.clear()
+
+    provenance = read_provenance(source, indexed)
+    assert not provenance
+    assert source.ranges == []
 
 
 def test_a_file_with_no_objects_is_unchanged():

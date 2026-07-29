@@ -130,6 +130,12 @@ class Quantization:
     sh_bit_depths: list[int] = field(default_factory=list)
 
     def encode(self, trailer: bytes = b"") -> bytes:
+        if "object_id" in self.bounds:
+            raise MalformedFile(
+                f"Quantization.bounds contains object_id={self.bounds['object_id']!r}; "
+                "object_id is an exact label and MUST NOT carry a bound",
+                code="invalid-object-id-bound",
+            )
         body = (
             put_string(self.scheme)
             + put_f64s(self.pos_origin)
@@ -158,6 +164,14 @@ class Quantization:
         scheme = c.string()
         origin = c.f64s(3)
         steps = c.f64s(8)
+        step_sh = c.u8()
+        bounds = c.str_map()
+        if "object_id" in bounds:
+            raise MalformedFile(
+                f"Quantization.bounds contains object_id={bounds['object_id']!r}; "
+                "object_id is an exact label and MUST NOT carry a bound",
+                code="invalid-object-id-bound",
+            )
         return Quantization(
             scheme=scheme,
             pos_origin=origin,
@@ -169,8 +183,8 @@ class Quantization:
             step_motion=steps[5],
             step_time=steps[6],
             step_sigma_log=steps[7],
-            step_sh=c.u8(),
-            bounds=c.str_map(),
+            step_sh=step_sh,
+            bounds=bounds,
             sh_bit_depths=_sh_bit_depths(c),
         )
 
