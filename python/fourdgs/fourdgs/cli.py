@@ -17,6 +17,7 @@ import numpy as np
 
 from . import __version__, read
 from .convert import convert_ply_sequence
+from .exceptions import InvalidInput
 from .gltf import from_gltf, to_gltf
 from .indexed_reader import open_indexed, read_provenance
 from .provenance import (
@@ -28,6 +29,7 @@ from .provenance import (
     name_of,
 )
 from .readable import FileReadable
+from .usd import from_usd, to_usd
 from .validate import validate
 from .writer import WriteOptions, write
 
@@ -155,6 +157,57 @@ def cmd_to_gltf(args) -> int:
     return 0
 
 
+def cmd_from_usd(args) -> int:
+    try:
+        imported = from_usd(args.source)
+    except InvalidInput as exc:
+        # The `usd-core` extra is not installed. One sentence and a non-zero exit, rather
+        # than a traceback for a dependency the user simply has not asked for yet.
+        print(exc, file=sys.stderr)
+        return 1
+    written = write(
+        args.out,
+        imported.gaussians,
+        # A static asset has nothing to play. Its gaussians carry an infinite validity
+        # window, so they are present at whatever instant a reader asks for.
+        0.0,
+        options=WriteOptions(profile=args.profile, scene_profile="baked", metadata=imported.metadata),
+    )
+    print(f"{imported.gaussians.count:,} gaussians (static) -> {args.out} ({written / 2**20:.2f} MiB)")
+    return 0
+
+
+def cmd_to_usd(args) -> int:
+    scene = read(args.file)
+    attributes = scene.header.attributes
+    meters_per_unit = args.meters_per_unit
+    if meters_per_unit is None:
+        meters_per_unit = float(attributes.get("meters_per_unit", 1.0))
+    try:
+        written = to_usd(
+            args.out,
+            scene.gaussians,
+            args.time,
+            cutoff=scene.header.cutoff,
+            coordinate_system=args.coordinate_system or attributes.get("coordinate_system", ""),
+            color_space=args.color_space or attributes.get("color_space"),
+            meters_per_unit=meters_per_unit,
+            max_sh_degree=args.sh_degree,
+            animated=args.animated,
+            fps=args.fps,
+            duration_sec=scene.header.duration_sec,
+        )
+    except InvalidInput as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    if args.animated:
+        mib = written / 2**20
+        print(f"animated over {scene.header.duration_sec:.3f}s at {args.fps:g} fps -> {args.out} ({mib:.2f} MiB)")
+    else:
+        print(f"state at t={args.time:.3f}s -> {args.out} ({written / 2**20:.2f} MiB)")
+    return 0
+
+
 def cmd_decode(args) -> int:
     scene = read(args.file)
     # The file's own threshold, from its Header. Letting this default meant a file that
@@ -207,6 +260,38 @@ def build_parser() -> argparse.ArgumentParser:
     tg.add_argument("--color-space", help="override the scene's own")
     tg.add_argument("--sh-degree", type=int, default=3, choices=(0, 1, 2, 3), help="cap the exported degree")
     tg.set_defaults(func=cmd_to_gltf)
+
+    fu = sub.add_parser("from-usd", help="a static ParticleField3DGaussianSplat USD -> .4dgs")
+    fu.add_argument("source", help="a .usd/.usda/.usdc/.usdz carrying a ParticleField3DGaussianSplat prim")
+    fu.add_argument("-o", "--out", required=True)
+    fu.add_argument("--profile", default="default", choices=("fine", "default", "coarse"))
+    fu.set_defaults(func=cmd_from_usd)
+
+    tu = sub.add_parser(
+        "to-usd", help="the state at one instant, or the whole animation, -> a ParticleField3DGaussianSplat USD"
+    )
+    tu.add_argument("file")
+    tu.add_argument("-o", "--out", required=True, help="a .usd, .usda or .usdc")
+    tu.add_argument("-t", "--time", type=float, default=0.0, help="the instant to snapshot (ignored with --animated)")
+    tu.add_argument(
+        "--animated",
+        action="store_true",
+        help="write the whole scene as USD time samples (a per-frame flipbook) instead of one snapshot",
+    )
+    tu.add_argument("--fps", type=float, default=30.0, help="sampling rate for --animated")
+    tu.add_argument(
+        "--coordinate-system",
+        help="override the scene's own; required when it declares none, since USD's up axis is not a guess",
+    )
+    tu.add_argument("--color-space", help="override the scene's own")
+    tu.add_argument(
+        "--meters-per-unit",
+        type=float,
+        default=None,
+        help="override the scene's own length unit; sets the stage's metersPerUnit",
+    )
+    tu.add_argument("--sh-degree", type=int, default=3, choices=(0, 1, 2, 3), help="cap the exported degree")
+    tu.set_defaults(func=cmd_to_usd)
 
     d = sub.add_parser("decode", help="report the gaussians visible at an instant")
     d.add_argument("file")

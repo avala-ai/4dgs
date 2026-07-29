@@ -129,6 +129,29 @@ jobs:
         run: |
           cd python/fourdgs && python ../examples/encode_synthetic.py && python ../examples/decode_summary.py
 
+  python-usd:
+    # The OpenUSD bridge's tests skip themselves when `usd-core` is absent, which is right
+    # for a contributor who has not installed the heavy optional runtime and wrong here: a
+    # green run that silently tested nothing. This job installs the `usd` extra so those
+    # tests RUN, and asserts none of them skipped. One platform is enough — the bridge is
+    # pure Python over `pxr`, and `usd-core` publishes a Linux wheel, so a second OS would
+    # answer the same question at the cost of a second heavyweight install.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e './python/fourdgs[dev,usd]'
+      - name: The USD bridge's tests run, rather than skipping into a green nothing
+        run: |
+          python -m pytest python/fourdgs/tests/test_usd.py -q -rs | tee usd.log
+          # importorskip prints one skip line for the whole module when pxr is missing; if
+          # usd-core installed, the module runs and this asserts it did.
+          if grep -q 'no tests ran' usd.log || grep -Eq '[1-9][0-9]* skipped' usd.log; then
+            echo "::error::the USD bridge tests skipped; usd-core must be installed so they run in CI"
+            exit 1
+          fi
+
   markdown:
     runs-on: ubuntu-latest
     steps:

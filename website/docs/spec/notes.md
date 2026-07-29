@@ -205,6 +205,33 @@ emits `"ellipse"` unconditionally. Colour space maps onto the `color_space` meta
 registry), whose two values correspond to the two the extension defines. A 4dgs file that declares
 no colour space leaves a converter to pick, which is a good reason for producers to declare one.
 
+## OpenUSD interoperability
+
+Non-normative, and the same complementary relationship as the glTF mapping above. OpenUSD carries
+gaussian splats natively as of **v26.03** through the `ParticleField3DGaussianSplat` prim (the
+Alliance for OpenUSD's Emerging Geometry Interest Group). It describes a static set of gaussians, so
+a `.4dgs` decoded at time `t` maps onto it mechanically. The reference SDK implements this in both
+directions (`4dgs from-usd`, `4dgs to-usd`); the guide
+[OpenUSD interoperability](../guides/interop-usd.md) is the operational version of this section,
+including what it refuses and why.
+
+The attribute mapping matches the glTF one — `positions`, `scales` (linear), `orientations` (a USD
+`quatf` reads as `x, y, z, w`), `opacities` (activated `0–1`), and the degree-0 term resolved to
+colour by the same `k = 0.28209479177387814` — so the conversions above apply unchanged. Two
+differences are USD's, not this format's, and both are advantages:
+
+- **Coordinate system and units are stage metadata**, not geometry. USD's `upAxis` (`Y` or `Z`, both
+  right-handed) carries `coordinate_system`, and `metersPerUnit` carries `meters_per_unit`, so no
+  axis flip is baked in and a Z-up scene with higher-degree harmonics round-trips without the
+  Wigner-D rotation the glTF node transform would force.
+- **Attributes can be time-sampled**, so the whole temporal scene can be exported as one USD file
+  that plays — a per-frame flipbook — rather than glTF's single snapshot. What the static schema
+  still cannot carry is the continuous per-gaussian temporal model, which resolves into the frames.
+
+USD's schema carries no colour-space token (its radiance is linear spherical-harmonic coefficients),
+so a `.4dgs`'s `color_space` is preserved through a round trip in the prim's `customData` rather
+than converted.
+
 ## Carriage in segmented-delivery systems
 
 The chunk index is a map from time ranges to byte ranges, which is structurally what segmented

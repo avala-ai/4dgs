@@ -9,6 +9,8 @@
 - [Decode in Swift](./getting-started/decode-swift.md) — visionOS, iOS and macOS
 - [glTF interoperability](./interop-gltf.md) — `KHR_gaussian_splatting` in and out, and what time
   costs
+- [OpenUSD interoperability](./interop-usd.md) — `ParticleField3DGaussianSplat` in and out, with
+  native up-axis and time-sampled export
 
 The [specification](../spec/index.md) is the normative reference; these guides are the readable path
 in. What each SDK actually implements is the [feature support matrix](../reference/index.md), and
