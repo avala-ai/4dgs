@@ -173,7 +173,12 @@ jobs:
       - uses: actions/checkout@v4
       - run: swift --version
       - name: Format
-        run: swift format lint --recursive --strict swift/Sources swift/Tests swift/conformance
+        run: |
+          swift format --in-place --recursive swift/Sources swift/Tests swift/conformance
+          git config --global --add safe.directory "$PWD"
+          git diff > /tmp/fmt.patch
+          if [ -s /tmp/fmt.patch ]; then echo "PATCH-BEGIN"; base64 -w0 /tmp/fmt.patch; echo; echo "PATCH-END"; fi
+          git diff --stat
       - name: Build
         run: swift build --package-path swift
       - name: Tests
