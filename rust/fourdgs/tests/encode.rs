@@ -784,3 +784,110 @@ fn a_rig_pose_clamps_outside_its_samples_and_slerps_inside() {
         "a trajectory with no samples carries no pose"
     );
 }
+
+/// A scene with degree-3 coefficients, for the bit-depth tests below.
+fn sh_scene(n: usize) -> (GaussianSet, f64) {
+    let (mut g, duration) = scene(n);
+    let coefficients = 15;
+    g.sh_degree = 3;
+    g.sh_coefficients = coefficients;
+    g.sh = Some(
+        (0..g.count() * coefficients * 3)
+            .map(|i| (i % 251) as u8)
+            .collect(),
+    );
+    (g, duration)
+}
+
+/// Encode `g` at the given per-band bit depths, or at none.
+fn encode_sh(g: &GaussianSet, duration: f64, depths: Option<Vec<u8>>) -> fourdgs::Result<Vec<u8>> {
+    fourdgs::write_to_vec(
+        g,
+        duration,
+        &WriteOptions {
+            sh_bit_depths: depths,
+            ..chunking_options()
+        },
+        &SceneExtras::default(),
+    )
+}
+
+#[test]
+fn a_file_that_declares_no_bit_depths_is_the_file_it_was_before_the_field_existed() {
+    let (g, duration) = sh_scene(64);
+    let plain = encode_sh(&g, duration, None).expect("encode");
+    assert_eq!(
+        plain,
+        fourdgs::write_to_vec(&g, duration, &chunking_options(), &SceneExtras::default())
+            .expect("encode"),
+        "no depths means no appended bytes"
+    );
+
+    // Eight bits is the identity, so declaring it changes the declaration and not one
+    // coefficient — the file grows by the field alone.
+    let flat = encode_sh(&g, duration, Some(vec![8, 8, 8])).expect("encode");
+    let before = fourdgs::read_bytes(&plain).expect("decode");
+    let after = fourdgs::read_bytes(&flat).expect("decode");
+    assert_eq!(before.gaussians.sh, after.gaussians.sh);
+    assert_eq!(after.quantization.sh_bit_depths, vec![8, 8, 8]);
+    assert!(before.quantization.sh_bit_depths.is_empty());
+}
+
+#[test]
+fn the_bound_each_band_declares_holds_for_every_coefficient() {
+    use fourdgs::quantization::{sh_bound, sh_step};
+
+    let (g, duration) = sh_scene(64);
+    let depths = vec![6u8, 4, 3];
+    let bytes = encode_sh(&g, duration, Some(depths.clone())).expect("encode");
+    let scene = fourdgs::read_bytes(&bytes).expect("decode");
+
+    assert_eq!(scene.quantization.sh_bit_depths, depths);
+    // The coarsest band is what the two pre-existing scalar fields have to carry.
+    assert_eq!(scene.quantization.step_sh, 32);
+    assert_eq!(scene.quantization.bounds["sh"], "16");
+    for (i, bits) in depths.iter().enumerate() {
+        assert_eq!(
+            scene.quantization.bounds[&format!("sh_band{}", i + 1)],
+            sh_bound(*bits).to_string(),
+            "each band declares the bound its depth implies"
+        );
+    }
+
+    // `verify` decoded every band record back and refused a file whose deviation exceeded
+    // the claim, so reaching this line means that ran on every coefficient of every
+    // gaussian. What is left is that the values landed on the grid each band declared: a
+    // band at `n` bits reconstructs at bin centres of `2^(8 - n)`.
+    let coefficients = scene.gaussians.sh_coefficients;
+    let count = scene.gaussians.count();
+    let sh = scene.gaussians.sh.expect("coefficients");
+    for (i, bits) in depths.iter().enumerate() {
+        let step = u32::from(sh_step(*bits));
+        let (first, last) = fourdgs::sh::band_range((i + 1) as u8).expect("band");
+        for gaussian in 0..count {
+            for component in 0..3 {
+                for k in first..last {
+                    let at = gaussian * 3 * coefficients + component * coefficients + k;
+                    assert_eq!(u32::from(sh[at]) % step, step / 2, "band {}", i + 1);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_ladder_that_cannot_describe_the_scene_is_refused() {
+    // Too few depths for the bands, and depths outside the range a grid is defined for.
+    let (g, duration) = sh_scene(32);
+    for (depths, expected) in [
+        (vec![8u8, 6], "declares 2 bands"),
+        (vec![9, 6, 5], "SH bit depth"),
+        (vec![8, 2, 5], "SH bit depth"),
+    ] {
+        let error = encode_sh(&g, duration, Some(depths)).expect_err("not a grid this format has");
+        assert!(
+            error.to_string().contains(expected),
+            "the message names the problem: {error}"
+        );
+    }
+}

@@ -9,6 +9,7 @@ words:
   - harmonics
   - quantization
   - quantize
+  - PSNR
   - quantized
   - dequantize
   - dequantization

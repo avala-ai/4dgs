@@ -174,6 +174,14 @@ pub fn info(args: &Args) -> Result<u8> {
     };
     out!("library        {library}");
     out!("spherical harm degree {}", h.sh_degree);
+    // On its own line, and only when the file declares them: a file that declares nothing
+    // is not a file at eight bits, it is a file that says nothing about the question. The
+    // degree line above stays exactly what it was, which is what other tools grep for.
+    let sh_bits = &scene.quantization.sh_bit_depths;
+    if !sh_bits.is_empty() {
+        let bits: Vec<String> = sh_bits.iter().map(|b| b.to_string()).collect();
+        out!("sh band bits   {}", bits.join("/"));
+    }
     out!(
         "audio          {}",
         match (scene.has_audio(), scene.audio_codec.as_deref()) {

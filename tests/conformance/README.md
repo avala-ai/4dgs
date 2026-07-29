@@ -170,9 +170,11 @@ a failure, but the error names the runner rather than the platform and reads lik
 ## Platforms
 
 The suite runs on GitHub-hosted runners for Python, TypeScript and Rust on Linux, macOS and Windows;
-C++ and Swift run it on Linux. Every platform decodes the same 34 variants and compares against the
-same committed expectations — 67 passing comparisons per family, with the single `decode_indexed`
-variant that declares no chunk index skipped.
+C++, Swift and Dart run it on Linux. Every platform decodes the same 44 valid variants and compares
+against the same committed expectations — 77 passing comparisons for a family that declines the
+provenance variants and the refusal expectations, 87 for Rust, which answers the provenance ones,
+and 99 for Python, which answers both. The single `decode_indexed` variant that declares no chunk
+index is skipped everywhere.
 
 That the corpus is bytes is the whole reason this is worth doing on more than one platform: a
 decoder that agrees with the expectation on Linux and disagrees on Windows is exactly the bug this

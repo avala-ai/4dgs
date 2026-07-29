@@ -49,6 +49,7 @@ fn minimal_file() -> Vec<u8> {
             step_sigma_log: 0.04,
             step_sh: 1,
             bounds: BTreeMap::new(),
+            sh_bit_depths: Vec::new(),
         }
         .encode(&[]),
     );

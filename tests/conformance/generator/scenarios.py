@@ -36,6 +36,10 @@ FLAGS = (
     "SHDegree1",
     "SHDegree2",
     "SHDegree3",
+    # Per-band SH bit depths, declared in the Quantization record's appended fields. The
+    # coefficients stay bytes; what changes is how many distinct values they take.
+    "SHBitsHigh",  # (8, 7, 6) — near-lossless, and the band-1 entry is exact
+    "SHBitsLow",  # (5, 4, 3) — the coarse end of the legal range
     "DeltaStreams",  # delta-coded attribute streams rather than raw
     "WithAudio",  # embed an audio track
     "WithLargeAudio",  # embed a track larger than an indexed reader's head probe
@@ -193,6 +197,18 @@ def variants() -> list[tuple[Scenario, tuple[str, ...]]]:
     # band width computed from the wrong count stops landing on a boundary by luck.
     add(mixed, "SHDegree3")
     add(mixed, "SHDegree3", "UseChunks")
+
+    # Per-band SH bit depths, at both ends of the legal range and at both degrees where
+    # more than one band exists to spend them differently. The low variants are also the
+    # only files in the corpus whose coefficients are demonstrably not the ones that went
+    # in — the SH digest is what proves a decoder read what was stored rather than what
+    # it expected. The `Quantized` pairing is the precedence case: that profile sets the
+    # uniform `step_sh` as well, and the per-band depths are what must win.
+    add(mixed, "SHDegree2", "SHBitsHigh")
+    add(mixed, "SHDegree2", "SHBitsLow")
+    add(mixed, "SHDegree2", "SHBitsLow", "Quantized")
+    add(mixed, "SHDegree3", "SHBitsHigh")
+    add(mixed, "SHDegree3", "SHBitsLow", "UseChunks")
 
     # Audio: exactly one scenario carries a track, and one asserts clean absence.
     add(SCENARIOS[2], "WithAudio")

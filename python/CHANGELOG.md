@@ -8,6 +8,34 @@ All notable changes to the Python package are documented here, following
 
 ### Added
 
+- **Per-band spherical harmonic bit depths.** `WriteOptions.sh_bit_depths` takes a depth of 3–8 per
+  band, or one of the `flat` / `balanced` / `aggressive` ladder names, and the encoder rounds each
+  band's coefficients onto the grid that depth implies, declares the depths in the Quantization
+  record's appended fields and the per-band bounds under `bounds.sh_band<b>`, and — as it already
+  did for position, scale and colour — decodes each band record it wrote and checks the bound on
+  every coefficient before it hands the file back. Eight bits is the identity, so a file that
+  declares nothing is a file at eight bits and no existing output moved: every previously committed
+  conformance checksum is unchanged.
+
+  The saving is entropy, not packing. A coefficient is still a byte and no decoder changes; a band
+  at five bits takes 32 distinct values, which is what the stream codec acts on. On the synthetic
+  scene in `python/tools/rd_benchmark.py`, a degree-3 file's band streams fall to 44 % of their
+  eight-bit size at five bits, or to 61 % on the `balanced` ladder, which leaves band 1 exact.
+
+- `python/tools/rd_benchmark.py`, which sweeps bit depths against codecs and reports bytes against
+  reconstruction error. Its README carries the committed tables and the command that regenerates
+  them. It exits non-zero if any file's decoded coefficients fall outside the bound that file
+  declares, so it is a check as well as a measurement.
+
+- `validate` reports the per-band depths against the Header's degree: a count that disagrees with
+  the declared degree is an error, and a `bounds.sh_band<b>` or a `step_sh` that does not follow
+  from the depths is a warning.
+
+- `sh_coefficient` and `sh_bound_float`, for consumers that work in coefficients rather than in
+  bytes, now that spec §6.5 pins the byte-to-coefficient map that `SH_QUANT_LO` / `SH_QUANT_HI`
+  already held. The constants keep their values and their meaning; what changed is that the
+  specification now says them, so a second implementation cannot pick a different interval and be
+  conforming.
 - `InvalidInput`, raised when the encoder is handed a scene it cannot write a conforming file from —
   a non-finite value in a quantized field (position, scale, rotation, colour, velocity, `mu_t`). It
   refused these before, but from inside the codec, with a message about a symbol exceeding 32 bits

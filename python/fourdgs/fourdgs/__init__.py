@@ -31,12 +31,13 @@ from .exceptions import (
 from .gltf import GltfImport, from_gltf, to_gltf
 from .model import AudioTrack, CameraTrajectory, GaussianSet
 from .provenance import Pose, Provenance, pose_at
-from .quantization import Bounds, Steps
+from .quantization import SH_LADDERS, Bounds, Steps, sh_bound, sh_step
 from .records import CoordinateFrame, GeodeticAnchor, RigTrajectory, SensorCalibration
 from .stream_reader import Scene, read
 from .writer import WriteOptions, write
 
 __all__ = [
+    "SH_LADDERS",
     "AudioTrack",
     "BoundViolation",
     "Bounds",
@@ -62,6 +63,8 @@ __all__ = [
     "from_gltf",
     "pose_at",
     "read",
+    "sh_bound",
+    "sh_step",
     "to_gltf",
     "write",
 ]
