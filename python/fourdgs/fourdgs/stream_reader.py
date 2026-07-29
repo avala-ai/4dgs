@@ -18,7 +18,7 @@ import numpy as np
 from . import opcode as op
 from . import records as rec
 from .exceptions import MalformedFile, TruncatedFile, UnsupportedCodec
-from .model import AudioSource, AudioSourceKeyframe, AudioTrack, CameraTrajectory, GaussianSet
+from .model import AudioSource, AudioSourceKeyframe, CameraTrajectory, GaussianSet
 from .object_layer import ObjectLayer
 from .provenance import Provenance
 from .quantization import (

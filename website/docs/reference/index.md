@@ -190,7 +190,7 @@ directions.
 **Encode**, **Chunked encode** and **Summary writing** are proved by a gate rather than by a runner,
 and the encoders are gated by their role.
 
-Python's is proved by the corpus gate: `generate.py --verify` re-encodes all 45 valid variants,
+Python's is proved by the corpus gate: `generate.py --verify` re-encodes all 46 valid variants,
 asserts every committed checksum, and asserts that two consecutive runs are byte-identical. Every
 variant is an encode; the chunked and summary-bearing ones are the flags that say so.
 
