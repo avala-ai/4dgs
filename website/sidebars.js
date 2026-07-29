@@ -38,7 +38,10 @@ const sidebars = {
       type: "category",
       label: "Proposals",
       collapsed: true,
-      items: [{ type: "doc", id: "spec/proposals/keyframe-delta", label: "keyframe-delta" }],
+      items: [
+        { type: "doc", id: "spec/proposals/keyframe-delta", label: "keyframe-delta" },
+        { type: "doc", id: "spec/proposals/object-layer", label: "object layer" },
+      ],
     },
   ],
 
