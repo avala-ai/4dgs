@@ -117,14 +117,28 @@ class ObjectLayer:
         out_centers = centers.copy()
         out_orientations = orientations.copy()
 
-        for object_id in np.unique(object_ids):
-            pose = self.pose_at(int(object_id), t)
-            if pose is None:
+        # Group rows once. Building a fresh full-scene mask for every tracked object makes
+        # composition O(gaussians * tracks); a stable sort visits every row in one group and
+        # keeps all of the per-group arithmetic in typed arrays.
+        tracks: dict[int, ObjectTrack] = {}
+        for track in self.tracks:
+            if track.object_id != BACKGROUND and track.sample_count > 0:
+                tracks.setdefault(track.object_id, track)
+        if not tracks or object_ids.size == 0:
+            return out_centers, out_orientations
+        order = np.argsort(object_ids, kind="stable")
+        sorted_ids = object_ids[order]
+        starts = np.flatnonzero(np.r_[True, sorted_ids[1:] != sorted_ids[:-1]])
+        ends = np.r_[starts[1:], sorted_ids.size]
+        for start, end in zip(starts, ends, strict=True):
+            track = tracks.get(int(sorted_ids[start]))
+            if track is None:
                 continue
-            mask = object_ids == object_id
+            pose = pose_at(track, t)
+            rows = order[start:end]
             matrix = _rotation_matrix(pose.rotation)
-            out_centers[mask] = centers[mask] @ matrix.T + np.asarray(pose.translation, dtype=np.float64)
-            out_orientations[mask] = _quaternion_left_multiply(pose.rotation, orientations[mask])
+            out_centers[rows] = centers[rows] @ matrix.T + np.asarray(pose.translation, dtype=np.float64)
+            out_orientations[rows] = _quaternion_left_multiply(pose.rotation, orientations[rows])
 
         return out_centers, out_orientations
 

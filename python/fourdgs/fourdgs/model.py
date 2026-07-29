@@ -60,6 +60,10 @@ class GaussianSet:
     sh_degree: int = 0
     source_group: np.ndarray | None = None
     source_index: np.ndarray | None = None
+    #: Per-gaussian object membership (spec section 5.15.6), or `None` when the file
+    #: carries no `object_id` stream. Exact integers, `0` = background/unassigned; the
+    #: object layer's tracks transform the gaussians of a given id (see `object_layer`).
+    object_id: np.ndarray | None = None
 
     @property
     def count(self) -> int:

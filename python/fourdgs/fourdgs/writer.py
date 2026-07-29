@@ -22,6 +22,7 @@ from . import opcode as op
 from . import records as rec
 from .exceptions import BoundViolation, InvalidInput
 from .model import AudioTrack, CameraTrajectory, GaussianSet, window_table
+from .object_layer import ObjectLayer
 from .provenance import Provenance
 from .quantization import (
     DEFAULT_CUTOFF,
@@ -81,6 +82,11 @@ class WriteOptions:
     #: the default and costs nothing — no record, no placeholder, no Header flag. A
     #: scene with no sensors behind it is a complete file, not an under-specified one.
     provenance: Provenance | None = None
+    #: The object layer to emit (spec section 5.15.6): the Object Table and the SE(3)
+    #: tracks. `None` writes neither, the default. The per-gaussian `object_id` stream is
+    #: written whenever the `GaussianSet` carries one, independently of this — a file may
+    #: group gaussians without naming the groups.
+    objects: ObjectLayer | None = None
     #: Bytes appended to the content of the record with the given opcode, as a newer
     #: writer that added a field would produce. A reader that honours content_length steps
     #: over them; one that assumes a record ends where its own knowledge does does not.
@@ -383,6 +389,18 @@ def _encode(g: GaussianSet, duration_sec, opts, audio, camera) -> bytes:
             anchor.check()
             emit(anchor.encode(trailer=opts.record_trailers.get(op.GEODETIC_ANCHOR, b"")))
 
+    # The object layer, after provenance and in ascending opcode order: the table (0x24)
+    # that names the objects, then the tracks (0x25) that move them. Advisory front matter
+    # in the same sense as provenance — a reader that skips it decodes a valid base scene.
+    if opts.objects is not None:
+        opts.objects.check()
+        if opts.objects.table is not None:
+            opts.objects.table.check()
+            emit(opts.objects.table.encode(trailer=opts.record_trailers.get(op.OBJECT_TABLE, b"")))
+        for track in opts.objects.tracks:
+            track.check()
+            emit(track.encode(trailer=opts.record_trailers.get(op.OBJECT_TRACK, b"")))
+
     if camera is not None:
         emit(
             rec.Camera(
@@ -423,6 +441,12 @@ def _encode(g: GaussianSet, duration_sec, opts, audio, camera) -> bytes:
                     encode_stream(op.A_SOURCE_INDEX, _ids(g.source_index, members), codec=opts.codec, level=opts.level),
                 ]
                 if opts.preserve_source_ids
+                else []
+            )
+            # object_id is exact: its bins are the ids as-is, never a quantization grid.
+            + (
+                [encode_stream(op.A_OBJECT_ID, _ids(g.object_id, members), codec=opts.codec, level=opts.level)]
+                if g.object_id is not None
                 else []
             )
         )

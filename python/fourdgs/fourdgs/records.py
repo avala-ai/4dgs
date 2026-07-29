@@ -989,6 +989,17 @@ class ObjectTable:
                                 f"object {e.object_id}: {name}[{k}] is {value}", code="non-finite-object-value"
                             )
             if e.embedding is not None:
+                if self.embedding_dim == 0:
+                    raise MalformedFile(
+                        f"object {e.object_id}: an embedding is present but embedding_dim is 0",
+                        code="invalid-object-embedding-shape",
+                    )
+                if len(e.embedding) != self.embedding_dim:
+                    raise MalformedFile(
+                        f"object {e.object_id}: embedding has {len(e.embedding)} values, "
+                        f"embedding_dim declares {self.embedding_dim}",
+                        code="invalid-object-embedding-shape",
+                    )
                 for k, value in enumerate(e.embedding):
                     if not math.isfinite(value):
                         raise MalformedFile(
@@ -1052,6 +1063,13 @@ class ObjectTrack:
                 "to move (section 5.15.6)",
                 code="track-names-background",
             )
+        if len(self.rotations) != self.sample_count or len(self.translations) != self.sample_count:
+            raise MalformedFile(
+                f"track for object {self.object_id}: {self.sample_count} times, "
+                f"{len(self.rotations)} rotations, and {len(self.translations)} translations; "
+                "every sample needs all three",
+                code="invalid-object-track-shape",
+            )
         for i, t in enumerate(self.times):
             if not math.isfinite(t):
                 raise MalformedFile(
@@ -1065,6 +1083,11 @@ class ObjectTrack:
                     code="non-increasing-track-time",
                 )
         for i, quaternion in enumerate(self.rotations):
+            if len(quaternion) != 4:
+                raise MalformedFile(
+                    f"track for object {self.object_id}: sample {i} rotation has {len(quaternion)} values, expected 4",
+                    code="invalid-object-track-shape",
+                )
             norm = math.sqrt(sum(v * v for v in quaternion))
             if not math.isfinite(norm) or norm == 0.0:
                 raise MalformedFile(
@@ -1072,6 +1095,12 @@ class ObjectTrack:
                     code="non-unit-track-quaternion",
                 )
         for i, translation in enumerate(self.translations):
+            if len(translation) != 3:
+                raise MalformedFile(
+                    f"track for object {self.object_id}: sample {i} translation has "
+                    f"{len(translation)} values, expected 3",
+                    code="invalid-object-track-shape",
+                )
             for k, value in enumerate(translation):
                 if not math.isfinite(value):
                     raise MalformedFile(

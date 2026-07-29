@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from typing import Protocol
 
 from .exceptions import MalformedFile
 from .records import (
@@ -32,6 +33,26 @@ from .records import (
     RigTrajectory,
     SensorCalibration,
 )
+
+
+class PoseSampled(Protocol):
+    """A record `pose_at` can sample: time-stamped rigid poses with an interpolation mode.
+
+    Both `RigTrajectory` (a capture platform) and the object layer's `ObjectTrack` (a
+    scene object) satisfy this structurally, which is the point — the clamp-and-slerp of
+    `pose_at` is written once and both records share it, rather than each carrying its own
+    interpolation that could drift from the other. `name` is what a refusal message uses.
+    """
+
+    name: str
+    interpolation: int
+    times: list[float]
+    rotations: list[list[float]]
+    translations: list[list[float]]
+
+    @property
+    def sample_count(self) -> int: ...
+
 
 # Registry names, so a tool printing a file says "right-handed" rather than "1".
 # An id this build does not know comes back as its number, which is the honest
@@ -132,8 +153,8 @@ def slerp(a, b, u: float) -> tuple[float, float, float, float]:
     return tuple(wa * x + wb * y for x, y in zip(a, b, strict=True))  # type: ignore[return-value]
 
 
-def pose_at(trajectory: RigTrajectory, t: float) -> Pose | None:
-    """The rig's pose at scene time `t`, or `None` when the trajectory has no samples.
+def pose_at(trajectory: PoseSampled, t: float) -> Pose | None:
+    """The pose at scene time `t`, or `None` when the record has no samples.
 
     Outside the sample range the pose is **clamped**, never extrapolated: before the
     first sample it is the first sample, at or after the last it is the last.
@@ -178,7 +199,7 @@ def pose_at(trajectory: RigTrajectory, t: float) -> Pose | None:
     )
 
 
-def _sample(trajectory: RigTrajectory, i: int) -> Pose:
+def _sample(trajectory: PoseSampled, i: int) -> Pose:
     return Pose(
         rotation=_normalize(trajectory.rotations[i]),
         translation=tuple(float(v) for v in trajectory.translations[i]),  # type: ignore[arg-type]

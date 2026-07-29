@@ -19,6 +19,7 @@ from . import opcode as op
 from . import records as rec
 from .exceptions import MalformedFile, TruncatedFile, UnsupportedCodec
 from .model import AudioTrack, CameraTrajectory, GaussianSet
+from .object_layer import ObjectLayer
 from .provenance import Provenance
 from .quantization import (
     DEFAULT_CUTOFF,
@@ -66,6 +67,10 @@ class Scene:
     #: carried none, which is the common case and not an error: absence costs nothing
     #: and no Header flag announces the family, so this is filled by the walk itself.
     provenance: Provenance = field(default_factory=Provenance)
+    #: The object layer the file carried (spec section 5.15.6): the Object Table and the
+    #: SE(3) tracks. Empty when the file names no objects, which is the common case and
+    #: not an error, exactly as with provenance.
+    objects: ObjectLayer = field(default_factory=ObjectLayer)
     chunk_index: list[rec.ChunkIndexEntry] = field(default_factory=list)
     summary_offsets: list[rec.SummaryOffset] = field(default_factory=list)
     #: Whether the Footer's summary CRC matched, or `None` when the file declares none.
@@ -142,6 +147,7 @@ def decode_streams(
             "sigma_t": np.zeros(0),
             "window_index": np.zeros(0, dtype=np.int64),
             "source_index": None,
+            "object_id": None,
         }
 
     never_fades = got[op.A_FLAGS][:, 0] != 0
@@ -172,6 +178,8 @@ def decode_streams(
         "sigma_t": sigma,
         "window_index": window_index,
         "source_index": got[op.A_SOURCE_INDEX][:, 0] if op.A_SOURCE_INDEX in got else None,
+        # Exact: the stored bins are the object ids, used as read, never dequantized.
+        "object_id": got[op.A_OBJECT_ID][:, 0] if op.A_OBJECT_ID in got else None,
     }
 
 
@@ -343,6 +351,10 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
                 scene.provenance.trajectories.append(rec.RigTrajectory.parse(record.content))
             elif record.opcode == op.GEODETIC_ANCHOR:
                 scene.provenance.anchors.append(rec.GeodeticAnchor.parse(record.content))
+            elif record.opcode == op.OBJECT_TABLE:
+                scene.objects.table = rec.ObjectTable.parse(record.content)
+            elif record.opcode == op.OBJECT_TRACK:
+                scene.objects.tracks.append(rec.ObjectTrack.parse(record.content))
             elif record.opcode == op.STATISTICS:
                 scene.statistics = rec.Statistics.parse(record.content)
             elif record.opcode == op.CHUNK_INDEX:
@@ -379,6 +391,7 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
     # the recovery contract is that everything complete before the cut still stands.
     if not truncated:
         scene.provenance.check()
+        scene.objects.check()
 
     scene.header = header
     scene.quantization = quant
@@ -408,6 +421,7 @@ def _assemble(chunks: list[dict], windows, header, chunk_bands=None) -> Gaussian
     idx = np.concatenate([c["window_index"] for c in chunks])
     check_window_indices(idx, len(table))
     src = [c["source_index"] for c in chunks]
+    oid = [c["object_id"] for c in chunks]
     sh = merge_chunk_bands([len(c["mu_t"]) for c in chunks], chunk_bands or [])
     return GaussianSet(
         positions=np.concatenate([c["positions"] for c in chunks]).astype(np.float32),
@@ -422,4 +436,5 @@ def _assemble(chunks: list[dict], windows, header, chunk_bands=None) -> Gaussian
         sh=sh,
         sh_degree=header.sh_degree,
         source_index=np.concatenate(src) if all(s is not None for s in src) else None,
+        object_id=np.concatenate(oid) if all(o is not None for o in oid) else None,
     )

@@ -23,6 +23,7 @@ import numpy as np
 from . import opcode as op
 from . import records as rec
 from .exceptions import MalformedFile
+from .object_layer import ObjectLayer
 from .provenance import Provenance
 from .readable import Readable
 from .registry import check_quantization_scheme, check_temporal_model
@@ -331,10 +332,12 @@ def read_provenance(source: Readable, scene: IndexedScene) -> Provenance:
     Opening a file frames these and stops, so a scene with a long rig trajectory costs
     the same to open as one with none. This is where a caller says it wants them.
 
-    A reserved opcode in the family — `0x24`-`0x2F`, which no version-1 writer emits —
-    is framed by the walk and skipped here. That is the forward-compatibility rule
-    doing its job inside a family rather than across the whole opcode space, and it is
-    why the ranges carry their opcode: skipping requires knowing what was skipped.
+    The object-layer records (`0x24`, `0x25`) are in the same opcode family and are
+    framed by the same walk, but they belong to the object layer rather than provenance,
+    so they are skipped here and read by `read_objects`. A still-reserved opcode
+    (`0x26`-`0x2F`, which no version-1 writer emits) is framed and skipped by both, which
+    is the forward-compatibility rule doing its job inside a family — and why the ranges
+    carry their opcode: skipping requires knowing what was skipped.
     """
     out = Provenance()
     for opcode, offset, length in scene.provenance_ranges:
@@ -348,6 +351,27 @@ def read_provenance(source: Readable, scene: IndexedScene) -> Provenance:
             out.trajectories.append(rec.RigTrajectory.parse(content))
         elif opcode == op.GEODETIC_ANCHOR:
             out.anchors.append(rec.GeodeticAnchor.parse(content))
+    out.check()
+    return out
+
+
+def read_objects(source: Readable, scene: IndexedScene) -> ObjectLayer:
+    """The object layer — the Object Table and the SE(3) tracks — fetched by range.
+
+    Framed by the same front-matter walk as provenance (both families share the opcode
+    range), and read only when a caller asks. A file that names no objects returns an
+    empty layer, which is a value and not an error.
+    """
+    out = ObjectLayer()
+    for opcode, offset, length in scene.provenance_ranges:
+        if opcode not in (op.OBJECT_TABLE, op.OBJECT_TRACK):
+            continue
+        blob = _read_range(source, offset, length, f"a {op.name(opcode)} record")
+        content = Cursor(blob, 9).take(length - 9)
+        if opcode == op.OBJECT_TABLE:
+            out.table = rec.ObjectTable.parse(content)
+        else:
+            out.tracks.append(rec.ObjectTrack.parse(content))
     out.check()
     return out
 
