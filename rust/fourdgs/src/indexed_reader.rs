@@ -743,45 +743,30 @@ fn sample_object_track<R: Readable + ?Sized>(
     }
 
     let first_time = read_object_time(source, range, 0)?;
+    let mut previous_time = first_time;
+    let mut bracket = None;
+    for sample in 1..count {
+        let sample_time = read_object_time(source, range, sample)?;
+        if sample_time <= previous_time {
+            return Err(Error::Malformed(format!(
+                "track for object {}: sample {sample} is at t={sample_time}, not after sample {} \
+                 at t={previous_time}; times must strictly increase (section 5.15.4)",
+                range.object_id,
+                sample - 1
+            )));
+        }
+        if bracket.is_none() && previous_time <= t && t < sample_time {
+            bracket = Some((sample - 1, previous_time, sample, sample_time));
+        }
+        previous_time = sample_time;
+    }
     if count == 1 || t <= first_time {
         return Ok(Some(read_object_sample(source, range, 0)?.pose));
     }
-    let last_time = read_object_time(source, range, count - 1)?;
-    if first_time >= last_time {
-        return Err(Error::Malformed(format!(
-            "track for object {}: sample {} is at t={}, not after sample 0 at t={}; times \
-             must strictly increase (section 5.15.4)",
-            range.object_id,
-            count - 1,
-            last_time,
-            first_time
-        )));
-    }
-    if t >= last_time {
+    if t >= previous_time {
         return Ok(Some(read_object_sample(source, range, count - 1)?.pose));
     }
-
-    let (mut lo, mut hi) = (0usize, count - 1);
-    let (mut lo_time, mut hi_time) = (first_time, last_time);
-    while hi - lo > 1 {
-        let mid = lo + (hi - lo) / 2;
-        let mid_time = read_object_time(source, range, mid)?;
-        if !(lo_time < mid_time && mid_time < hi_time) {
-            return Err(Error::Malformed(format!(
-                "track for object {}: sample {mid} at t={mid_time} does not lie strictly \
-                 between sample {lo} at t={lo_time} and sample {hi} at t={hi_time}; times \
-                 must strictly increase (section 5.15.4)",
-                range.object_id
-            )));
-        }
-        if mid_time <= t {
-            lo = mid;
-            lo_time = mid_time;
-        } else {
-            hi = mid;
-            hi_time = mid_time;
-        }
-    }
+    let (lo, lo_time, hi, hi_time) = bracket.expect("a finite t inside validated endpoints");
 
     let a = read_object_sample(source, range, lo)?;
     if range.interpolation == rec::TRAJECTORY_STEP {
@@ -1104,4 +1089,34 @@ fn record_content(blob: &[u8], expect: u8) -> Result<&[u8]> {
         )));
     }
     Ok(&blob[RECORD_HEADER_SIZE..RECORD_HEADER_SIZE + declared as usize])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::readable::BytesReadable;
+
+    #[test]
+    fn indexed_sampling_validates_times_it_does_not_bracket() {
+        let mut bytes = vec![0; OBJECT_TRACK_HEADER_BYTES as usize];
+        for time in [0.0f64, 1.0, 0.25, 2.0] {
+            bytes.extend(time.to_le_bytes());
+            for value in [0.0f64, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0] {
+                bytes.extend(value.to_le_bytes());
+            }
+        }
+        let range = ObjectTrackRange {
+            object_id: 7,
+            interpolation: rec::TRAJECTORY_LINEAR,
+            sample_count: 4,
+            record_offset: 41,
+            record_length: bytes.len() as u64,
+            content_offset: 0,
+        };
+        let mut source = BytesReadable::new(&bytes);
+        let error = sample_object_track(&mut source, &range, 0.7).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("sample 2"), "{message}");
+        assert!(message.contains("sample 1"), "{message}");
+    }
 }

@@ -698,9 +698,9 @@ fn indexed_state_range_samples_long_tracks_and_keeps_only_one_instant() {
         .collect();
     let transferred = track_reads.iter().map(|range| range.1).sum::<u64>();
     assert!(
-        transferred <= 2 * 64 + 14 * 8,
-        "4096 samples should cost two poses plus logarithmic time probes, got \
-         {transferred} bytes in {track_reads:?}"
+        transferred <= 4096 * 8 + 2 * 64,
+        "4096 samples should cost each time plus two poses, got {transferred} bytes in \
+         {track_reads:?}"
     );
     assert!(
         !track_reads.contains(&track_range),
