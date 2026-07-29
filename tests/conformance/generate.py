@@ -191,6 +191,8 @@ def build_invalid() -> list[tuple[str, bytes, str]]:
             raise AssertionError(f"{refusal.name}: the mutation changed nothing")
         out.append((refusal.name, data, canonical({"refused": refusal.code})))
     return out
+
+
 def _provenance(raw) -> Provenance | None:
     """Turn the generator's plain description into records.
 

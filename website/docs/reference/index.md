@@ -9,8 +9,9 @@ declarations. Nothing is marked `Yes` on the strength of code existing.
 
 Every row is filled in from a suite that runs: 39 valid variants and 6 invalid ones, over two read
 paths (streamed and indexed). A language takes the variants it declares support for, and what it
-declines is what the table records — TypeScript, C++ and Swift decline the five variants carrying
-provenance records, and Python is so far the only one answering a refusal expectation.
+declines is what this table records — 89 checks passing for Python, 77 for Rust, 67 each for
+TypeScript, C++ and Swift. Rust declines the refusal expectations; TypeScript, C++ and Swift decline
+those and the five variants that carry provenance records.
 
 | Feature                                              | Python | TypeScript | Rust    | C++     | Swift   |
 | ---------------------------------------------------- | ------ | ---------- | ------- | ------- | ------- |
