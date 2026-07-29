@@ -305,3 +305,19 @@ fn spherical_harmonic_bands_must_form_whole_degrees() {
     let err = fourdgs::sh::merge_chunk_bands(&[1], &[only_band_two]).unwrap_err();
     assert!(err.to_string().contains("whole degrees"), "got {err}");
 }
+
+/// A default Header declares a temporal model the registry lists.
+///
+/// This was empty, and the emptiness only surfaced through a cross-language test: the
+/// Python validator refused a fixture the Rust one accepted, because Python's dataclass
+/// has always defaulted the field to `gaussian-birth` and Rust's derived `Default` left
+/// it blank. Nothing in one language could see it. Pinning it here means the next person
+/// to add a field to `Header` and reach for `#[derive(Default)]` finds out immediately.
+#[test]
+fn a_default_header_declares_the_temporal_model_this_version_defines() {
+    assert_eq!(
+        fourdgs::records::Header::default().temporal_model,
+        "gaussian-birth",
+        "a Header built from Default must not describe a file every conforming reader refuses"
+    );
+}
