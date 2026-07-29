@@ -76,7 +76,9 @@ was asked for by name and never ran.
 ## Known gaps
 
 Gaps are recorded rather than left implicit, because a gap nobody wrote down is indistinguishable
-from coverage. The current one is spherical harmonics of degree 3: the corpus carries degree 1 and 2
-only, so no implementation can claim degree 3 however complete its code is. The
+from coverage. Degree-3 spherical harmonics used to be the one worth naming here; the corpus now
+carries two degree-3 variants and every SDK decodes them, so the current entry is a smaller one —
+the Header's `library` is the same string in every variant, which catches a runner that drops the
+field but not one that hardcodes it. The
 [conformance README](https://github.com/avala-ai/4dgs/blob/main/tests/conformance/README.md) keeps
 that list current.
