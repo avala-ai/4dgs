@@ -625,6 +625,146 @@ int fourdgs_scene_load_chunk(fourdgs_scene *scene, uint32_t i, uint8_t max_sh_ba
 uint64_t fourdgs_scene_bytes_for_chunk(const fourdgs_scene *scene, uint32_t i,
                                        uint8_t max_sh_band);
 
+/* -------------------------------------------------------------------------
+ * Encoding
+ *
+ * The decode surface above ends at gaussian state; this is the other direction. The C++
+ * and Swift packages are bindings over the core rather than parallel encoders, so an
+ * authoring surface for the native tier is these `fourdgs_writer_*` functions and a thin
+ * shim per language — the same shape as the decode surface.
+ *
+ * The four rules hold unchanged. Encoding adds one owned type, fourdgs_buffer: the encoder
+ * produces a whole file at once rather than streaming, and the caller owns those bytes
+ * until it has written them somewhere. Free it with fourdgs_buffer_free.
+ *
+ * TYPICAL USE
+ *
+ *     fourdgs_writer *writer = fourdgs_writer_new();
+ *     fourdgs_writer_set_duration(writer, 2.0);
+ *     fourdgs_writer_set_gaussians(writer, count, positions, scales, rotations, colors,
+ *                                  motions, mu_t, sigma_t, win_lo, win_hi);
+ *
+ *     fourdgs_buffer *out = NULL;
+ *     if (fourdgs_writer_encode(writer, &out) == FOURDGS_STATUS_OK) {
+ *         fwrite(fourdgs_buffer_data(out), 1, fourdgs_buffer_len(out), file);
+ *         fourdgs_buffer_free(out);
+ *     } else {
+ *         fprintf(stderr, "%s\n", fourdgs_last_error());
+ *     }
+ *     fourdgs_writer_free(writer);
+ * ------------------------------------------------------------------------- */
+
+/** A scene being assembled for encoding. Free with fourdgs_writer_free. */
+typedef struct fourdgs_writer fourdgs_writer;
+
+/** An owned buffer of encoded bytes. Free with fourdgs_buffer_free. */
+typedef struct fourdgs_buffer fourdgs_buffer;
+
+/**
+ * Create an empty writer with the encoder's default options, or null on allocation
+ * failure — checked exactly as a failed open is.
+ */
+fourdgs_writer *fourdgs_writer_new(void);
+
+/** Release a writer. Null is ignored. */
+void fourdgs_writer_free(fourdgs_writer *writer);
+
+/** Scene length in seconds; playback will cover [0, duration). */
+int fourdgs_writer_set_duration(fourdgs_writer *writer, double duration_sec);
+
+/**
+ * The Header's marginal visibility threshold. It sets the support constant the per-gaussian
+ * velocity grid is derived from, so it must be the one the decoder will read back.
+ */
+int fourdgs_writer_set_cutoff(fourdgs_writer *writer, double cutoff);
+
+/**
+ * The temporal partition's depth and the smallest chunk worth its own record. `max_depth`
+ * of 0 writes one chunk per window.
+ */
+int fourdgs_writer_set_chunking(fourdgs_writer *writer, uint32_t max_depth,
+                                size_t min_chunk_gaussians);
+
+/**
+ * Which parts of the summary the file carries. Each argument is a boolean: non-zero writes
+ * that part. The index is what makes seeking work; the rest are advisory.
+ */
+int fourdgs_writer_set_summary(fourdgs_writer *writer, int write_index, int write_statistics,
+                               int write_summary_offsets, int write_crc);
+
+/** The highest spherical harmonic band to write, 0 to 3. Excess coefficients are dropped. */
+int fourdgs_writer_set_sh_bands(fourdgs_writer *writer, uint8_t sh_bands);
+
+/**
+ * Per-band spherical harmonic bit depths, band 1 first. A null pointer or a zero count
+ * clears the ladder, leaving the coefficients as the profile alone decides.
+ */
+int fourdgs_writer_set_sh_bit_depths(fourdgs_writer *writer, const uint8_t *depths,
+                                     size_t count);
+
+/**
+ * The Header's `profile`. A (pointer, length) UTF-8 string, not NUL-terminated: the
+ * format's `string` may legally contain a NUL.
+ */
+int fourdgs_writer_set_profile(fourdgs_writer *writer, const char *data, size_t length);
+
+/** The Header's `library`. The same (pointer, length) UTF-8 convention as the profile. */
+int fourdgs_writer_set_library(fourdgs_writer *writer, const char *data, size_t length);
+
+/**
+ * Add one key/value pair to the Header's attributes map. Both are (pointer, length) UTF-8
+ * strings. A repeated key overwrites.
+ */
+int fourdgs_writer_add_attribute(fourdgs_writer *writer, const char *key, size_t key_length,
+                                 const char *value, size_t value_length);
+
+/**
+ * Set every gaussian column at once, structure-of-arrays. The columns are copied, so the
+ * caller's arrays may be released as soon as this returns.
+ *
+ * Widths are per gaussian: `positions`, `scales` and `motions` are three floats each,
+ * `rotations` and `colors` four, and `mu_t`, `sigma_t`, `win_lo` and `win_hi` one. A null
+ * column is FOURDGS_STATUS_INVALID_ARGUMENT unless `count` is zero. `sigma_t` may hold
+ * positive infinity for a gaussian that never fades. Setting the columns clears any
+ * harmonics previously attached — set the gaussians first, then the harmonics.
+ */
+int fourdgs_writer_set_gaussians(fourdgs_writer *writer, uint32_t count,
+                                 const float *positions, const float *scales,
+                                 const float *rotations, const float *colors,
+                                 const float *motions, const float *mu_t,
+                                 const float *sigma_t, const float *win_lo,
+                                 const float *win_hi);
+
+/**
+ * Attach spherical harmonic coefficients to the gaussians already set.
+ *
+ * `coefficients` is the count per colour component, so a row is three times that wide and
+ * the payload is `count * 3 * coefficients` bytes, component-major. A null payload, a zero
+ * degree or a zero coefficient count clears the harmonics. A payload whose length does not
+ * match the gaussians already set is FOURDGS_STATUS_MALFORMED. The payload is copied.
+ */
+int fourdgs_writer_set_sh(fourdgs_writer *writer, uint8_t degree, uint32_t coefficients,
+                          const uint8_t *sh, size_t length);
+
+/**
+ * Encode the scene into an owned buffer.
+ *
+ * The encoder verifies its own bounds before returning — it decodes every chunk back and
+ * refuses a file whose measured deviation exceeds what it declares — so a success is a file
+ * whose Quantization record was checked on every gaussian. On failure the out parameter is
+ * untouched and fourdgs_last_error names the reason.
+ */
+int fourdgs_writer_encode(fourdgs_writer *writer, fourdgs_buffer **out);
+
+/** The encoded bytes, borrowed until the buffer is freed. Null for an empty buffer. */
+const uint8_t *fourdgs_buffer_data(const fourdgs_buffer *buffer);
+
+/** How many bytes the buffer holds. 0 for a null buffer. */
+size_t fourdgs_buffer_len(const fourdgs_buffer *buffer);
+
+/** Release an encoded buffer. Null is ignored. */
+void fourdgs_buffer_free(fourdgs_buffer *buffer);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

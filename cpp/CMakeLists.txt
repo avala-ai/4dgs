@@ -65,7 +65,7 @@ else()
 endif()
 
 add_library(fourdgs-cpp STATIC src/scene.cpp src/model.cpp src/readable.cpp src/result.cpp
-                               ${FOURDGS_BACKEND_SOURCE})
+                               src/writer.cpp ${FOURDGS_BACKEND_SOURCE})
 add_library(fourdgs::cpp ALIAS fourdgs-cpp)
 
 target_include_directories(
@@ -143,8 +143,9 @@ if(FOURDGS_BUILD_CONFORMANCE)
   target_link_libraries(fourdgs-canonical PUBLIC fourdgs-cpp)
 
   # The harness invokes a runner as a subprocess with a path, so the entry points live at a
-  # fixed place it can name in one line.
-  foreach(runner decode_streamed decode_indexed)
+  # fixed place it can name in one line. The decode runners print canonical JSON; the encode
+  # runner re-encodes a variant's gaussians and writes a file the encode gate diffs.
+  foreach(runner decode_streamed decode_indexed encode_roundtrip)
     add_executable(${runner} conformance/${runner}.cpp)
     target_link_libraries(${runner} PRIVATE fourdgs-canonical)
     fourdgs_pin_runtime_output(${runner} ${CMAKE_BINARY_DIR}/conformance)
@@ -162,7 +163,7 @@ endif()
 
 if(FOURDGS_BUILD_TESTS)
   enable_testing()
-  foreach(test test_model test_result test_readable test_seam test_decode)
+  foreach(test test_model test_result test_readable test_seam test_decode test_writer)
     add_executable(${test} tests/${test}.cpp)
     target_link_libraries(${test} PRIVATE fourdgs-cpp)
     target_include_directories(${test} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)

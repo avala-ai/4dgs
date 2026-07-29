@@ -13,6 +13,7 @@
 #include "fourdgs/model.hpp"
 #include "fourdgs/readable.hpp"
 #include "fourdgs/result.hpp"
+#include "fourdgs/writer.hpp"
 
 /// The seam.
 ///
@@ -101,6 +102,11 @@ bool hasStatistics(const Handle& handle);
 Result<Statistics> statistics(const Handle& handle);
 std::vector<SummaryOffset> summaryOffsets(const Handle& handle);
 int summaryCrcState(const Handle& handle);
+
+/// Encode. The gaussians are borrowed for the call and copied into the core's writer, so a
+/// view from a decoder's working set is a valid argument.
+Result<std::vector<std::uint8_t>> encodeScene(const GaussianView& gaussians, double durationSec,
+                                              const WriteOptions& options);
 
 /// Release. Both are safe on a handle that never opened, and on a null one.
 void closeScene(Handle& handle) noexcept;

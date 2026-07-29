@@ -25,3 +25,10 @@ fourdgs = { path = "../fourdgs" }
 [[bin]]
 name = "encode_roundtrip"
 path = "src/bin/encode_roundtrip.rs"
+
+# The shared encode reference for the cross-language gate. It re-encodes a variant's
+# gaussians alone, with a fixed option preset, so the C++, Swift and TypeScript encoders can
+# be diffed against one baseline that carries no extras they cannot reproduce.
+[[bin]]
+name = "encode_gaussians"
+path = "src/bin/encode_gaussians.rs"

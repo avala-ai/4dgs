@@ -165,6 +165,15 @@ jobs:
           python tests/conformance/generate.py
           python tests/conformance/run.py --runner cpp
 
+      # The other direction: the binding re-encodes each variant's gaussians through the
+      # core's writer, and the gate requires the Python decoder to read the result identically
+      # to the Rust reference's encode of the same input — proving the C ABI encode was wired
+      # through correctly. The Rust workspace build supplies the reference encoder.
+      - name: The binding encodes files the reference agrees with
+        run: |
+          cargo build -p fourdgs-conformance --release
+          python tests/conformance/encode_roundtrip.py --encoder cpp
+
   dart:
     runs-on: ubuntu-latest
     needs: corpus
@@ -240,3 +249,14 @@ jobs:
           python3 -m pip install --break-system-packages -e ./python/fourdgs >/dev/null
           python3 tests/conformance/generate.py
           LD_LIBRARY_PATH=$PWD/target/release python3 tests/conformance/run.py --runner swift
+
+      # The other direction: the binding re-encodes each variant's gaussians through the
+      # core's writer, and the gate requires the Python decoder to read the result identically
+      # to the Rust reference's encode of the same input — proving the C ABI encode was wired
+      # through correctly. The reference encoder is a workspace binary built here with the
+      # cached toolchain.
+      - name: The binding encodes files the reference agrees with
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo build -p fourdgs-conformance --release
+          LD_LIBRARY_PATH=$PWD/target/release python3 tests/conformance/encode_roundtrip.py --encoder swift

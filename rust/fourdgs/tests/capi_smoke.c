@@ -205,6 +205,89 @@ static void check_forced_paths(const char *path) {
           "an unknown open mode is an invalid argument");
 }
 
+/* The encode surface, exercised the way a binding authors a file: build a tiny scene, encode
+ * it, and reopen the bytes to prove they are a real 4dgs file. Independent of the corpus, so
+ * it runs even when no path is given anything unusual. */
+static void check_writer(void) {
+    /* Null is safe on every writer entry point, because a binding will pass it eventually. */
+    check(fourdgs_writer_set_duration(NULL, 1.0) == FOURDGS_STATUS_INVALID_ARGUMENT,
+          "setting duration on a null writer is an invalid argument");
+    check(fourdgs_writer_encode(NULL, NULL) == FOURDGS_STATUS_INVALID_ARGUMENT,
+          "encoding a null writer is an invalid argument");
+    check(fourdgs_buffer_len(NULL) == 0, "the length of a null buffer is 0");
+    check(fourdgs_buffer_data(NULL) == NULL, "the data of a null buffer is null");
+    fourdgs_writer_free(NULL);
+    fourdgs_buffer_free(NULL);
+
+    fourdgs_writer *writer = fourdgs_writer_new();
+    check(writer != NULL, "a writer is created");
+    if (writer == NULL) return;
+
+    const uint32_t count = 3;
+    const float positions[9] = {0.0f, 0.0f, 0.0f, 1.0f, 0.5f, -0.5f, -1.0f, 2.0f, 0.25f};
+    const float scales[9] = {0.1f, 0.1f, 0.1f, 0.2f, 0.15f, 0.1f, 0.05f, 0.05f, 0.05f};
+    const float rotations[12] = {0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+                                 0.0f, 0.0f, 0.0f, 1.0f};
+    const float colors[12] = {0.9f, 0.1f, 0.1f, 1.0f, 0.1f, 0.9f, 0.1f, 0.8f,
+                              0.1f, 0.1f, 0.9f, 0.5f};
+    const float motions[9] = {0.0f, 0.0f, 0.0f, 0.1f, 0.0f, 0.0f, 0.0f, -0.1f, 0.0f};
+    const float mu_t[3] = {0.5f, 1.0f, 1.5f};
+    /* A never-fading gaussian's sigma is +inf, a value the encoder must accept and preserve. */
+    const float sigma_t[3] = {0.3f, INFINITY, 0.4f};
+    const float win_lo[3] = {0.0f, 0.0f, 0.0f};
+    const float win_hi[3] = {2.0f, 2.0f, 2.0f};
+
+    check(fourdgs_writer_set_duration(writer, 2.0) == FOURDGS_STATUS_OK, "duration is set");
+    check(fourdgs_writer_set_chunking(writer, 4, 1) == FOURDGS_STATUS_OK, "chunking is set");
+    check(fourdgs_writer_set_profile(writer, "test", 4) == FOURDGS_STATUS_OK, "profile is set");
+    check(fourdgs_writer_add_attribute(writer, "k", 1, "v", 1) == FOURDGS_STATUS_OK,
+          "an attribute is added");
+    check(fourdgs_writer_set_gaussians(writer, count, positions, scales, rotations, colors,
+                                       motions, mu_t, sigma_t, win_lo, win_hi) ==
+              FOURDGS_STATUS_OK,
+          "the gaussian columns are set");
+    /* A null column with a non-zero count is refused rather than read. */
+    check(fourdgs_writer_set_gaussians(writer, count, NULL, scales, rotations, colors, motions,
+                                       mu_t, sigma_t, win_lo, win_hi) ==
+              FOURDGS_STATUS_INVALID_ARGUMENT,
+          "a null column is an invalid argument");
+    /* Re-set the columns after the deliberate failure above left them cleared. */
+    fourdgs_writer_set_gaussians(writer, count, positions, scales, rotations, colors, motions,
+                                 mu_t, sigma_t, win_lo, win_hi);
+
+    fourdgs_buffer *buffer = NULL;
+    check(fourdgs_writer_encode(writer, &buffer) == FOURDGS_STATUS_OK, "the scene encodes");
+    check(buffer != NULL, "a successful encode yields a buffer");
+    if (buffer != NULL) {
+        const uint8_t *data = fourdgs_buffer_data(buffer);
+        const size_t length = fourdgs_buffer_len(buffer);
+        check(data != NULL && length > 0, "the buffer holds bytes");
+
+        fourdgs_scene *reopened = NULL;
+        check(fourdgs_open_memory(data, length, &reopened) == FOURDGS_STATUS_OK,
+              "the encoder's own output reopens");
+        if (reopened != NULL) {
+            check(fourdgs_scene_gaussian_count(reopened) == count,
+                  "the reopened scene holds every gaussian written");
+            check(fourdgs_scene_duration_sec(reopened) == 2.0, "the duration survives a round trip");
+            check(fourdgs_scene_load_all(reopened, 3) == FOURDGS_STATUS_OK,
+                  "the reopened scene decodes");
+            check(fourdgs_scene_loaded_count(reopened) == count,
+                  "every written gaussian is resident after decode");
+            const float *sigma = fourdgs_scene_sigma_t(reopened);
+            if (sigma != NULL) {
+                int found_inf = 0;
+                for (uint32_t i = 0; i < count; ++i)
+                    if (isinf(sigma[i])) found_inf = 1;
+                check(found_inf == 1, "the never-fading gaussian's infinite sigma survives");
+            }
+            fourdgs_scene_free(reopened);
+        }
+        fourdgs_buffer_free(buffer);
+    }
+    fourdgs_writer_free(writer);
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "usage: capi_smoke <file.4dgs>\n");
@@ -214,6 +297,7 @@ int main(int argc, char **argv) {
     check(fourdgs_format_version() == 1, "this build implements format version 1");
     check_null_safety();
     check_bad_magic();
+    check_writer();
 
     fourdgs_scene *scene = NULL;
     int status = fourdgs_open_path(argv[1], &scene);
