@@ -16,6 +16,7 @@ import { test } from "node:test";
 
 import {
   BytesReadable,
+  Cursor,
   IndexedDecoder,
   MAGIC,
   MAX_SH_DEGREE,
@@ -106,6 +107,31 @@ async function indexed(path: string): Promise<string> {
     await source.close();
   }
 }
+
+test("truncation does not excuse a complete audio source when the Header flag is clear", async (t) => {
+  const path = corpus("OneWindow-UseChunkIndex-UseCrc-WithSpatialAudio");
+  if (path === null) return t.skip("corpus not generated");
+
+  const bytes = Uint8Array.from(readFileSync(path));
+  const header = [...iterateRecords(bytes, MAGIC.length)].find(
+    (record) => record.opcode === Opcode.Header,
+  );
+  assert.ok(header);
+  const cursor = new Cursor(header.content);
+  cursor.string();
+  cursor.string();
+  cursor.skip(8 + 8 + 8);
+  cursor.string();
+  cursor.skip(6 * 8);
+  cursor.u8();
+  const flags = header.offset + RECORD_HEADER_BYTES + cursor.pos;
+  bytes[flags] = bytes[flags]! & ~1;
+
+  await assert.rejects(
+    () => decodeScene(bytes.subarray(0, bytes.length - 1)),
+    /Header audio flag is clear.*1 complete audio source/,
+  );
+});
 
 test("the two read paths agree on the same file", async (t) => {
   const path = corpus("MixedLifetimes-SHDegree2-UseChunkIndex-UseCrc");

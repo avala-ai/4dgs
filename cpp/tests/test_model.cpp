@@ -151,6 +151,17 @@ void audioNormalizationPreservesExtremeAndTinyFiniteDirections() {
   CHECK_EQ(tiny.rotation[3], 0.0);
 }
 
+void loopingAudioTimeDoesNotOverflow() {
+  fourdgs::AudioSource source;
+  source.startSec = -1e308;
+  source.durationSec = 1.0;
+  source.loop = true;
+  const fourdgs::AudioSourceState state = source.stateAt(1e308);
+  CHECK(state.active);
+  CHECK_EQ(state.localTime, 0.0);
+  CHECK(std::isfinite(state.localTime));
+}
+
 void runTests() {
   windowIsTheOnlyHardGate();
   cutoffComesFromTheFile();
@@ -159,6 +170,7 @@ void runTests() {
   appendKeepsTheDegree();
   movingAudioUsesExactKeyframesAndShortestPathSlerp();
   audioNormalizationPreservesExtremeAndTinyFiniteDirections();
+  loopingAudioTimeDoesNotOverflow();
 }
 
 }  // namespace

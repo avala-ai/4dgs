@@ -497,7 +497,9 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
                 spatial=False,
             )
         )
-    if header.has_audio != bool(scene.audio_sources) and not truncated:
+    if (not header.has_audio and scene.audio_sources) or (
+        header.has_audio and not scene.audio_sources and not truncated
+    ):
         state = "set" if header.has_audio else "clear"
         raise MalformedFile(
             f"the Header audio flag is {state}, but the file contains {len(scene.audio_sources)} complete audio sources"

@@ -103,6 +103,15 @@ final class TimeTests: XCTestCase {
         source.rotation = [Double.leastNonzeroMagnitude, 0, 0, 0]
         XCTAssertEqual(source.state(at: 1).rotation, [1, 0, 0, 0])
     }
+
+    func testLoopingAudioTimeDoesNotOverflow() {
+        let source = AudioSource(
+            sourceId: 1, codec: "wav", startSec: -1e308, durationSec: 1, loop: true)
+        let state = source.state(at: 1e308)
+        XCTAssertTrue(state.active)
+        XCTAssertEqual(state.localTime, 0)
+        XCTAssertTrue(state.localTime.isFinite)
+    }
 }
 
 final class LiveTests: XCTestCase {

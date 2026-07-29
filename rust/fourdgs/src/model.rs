@@ -85,11 +85,12 @@ impl AudioSource {
     /// player, which combines this with its listener pose.
     pub fn state_at(&self, t: f64) -> AudioSourceState {
         let active = t >= self.start_sec && (self.loop_ || t < self.start_sec + self.duration_sec);
-        let elapsed = (t - self.start_sec).max(0.0);
         let local_time = if self.loop_ && self.duration_sec > 0.0 {
-            elapsed % self.duration_sec
+            looping_local_time(t, self.start_sec, self.duration_sec)
         } else {
-            elapsed.min(self.duration_sec.max(0.0))
+            (t - self.start_sec)
+                .max(0.0)
+                .min(self.duration_sec.max(0.0))
         };
         let (position, rotation) = self.pose_at(t);
         AudioSourceState {
@@ -130,6 +131,15 @@ impl AudioSource {
         }
         (position, slerp(a.rotation, b.rotation, u))
     }
+}
+
+fn looping_local_time(t: f64, start_sec: f64, duration_sec: f64) -> f64 {
+    if t <= start_sec {
+        return 0.0;
+    }
+    let time_remainder = t.rem_euclid(duration_sec);
+    let start_remainder = start_sec.rem_euclid(duration_sec);
+    (time_remainder - start_remainder).rem_euclid(duration_sec)
 }
 
 fn normalized_quaternion(value: [f64; 4]) -> [f64; 4] {

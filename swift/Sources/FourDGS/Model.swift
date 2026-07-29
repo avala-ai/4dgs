@@ -161,11 +161,10 @@ extension AudioSource {
     /// Reconstruct timing and moving pose. Listener-relative playback stays in the player.
     public func state(at t: Double) -> AudioSourceState {
         let active = t >= startSec && (loop || t < startSec + durationSec)
-        let elapsed = max(0, t - startSec)
         let localTime =
             loop && durationSec > 0
-            ? elapsed.truncatingRemainder(dividingBy: durationSec)
-            : min(elapsed, max(0, durationSec))
+            ? loopingLocalTime(t, startSec, durationSec)
+            : min(max(0, t - startSec), max(0, durationSec))
 
         let pose: ([Double], [Double])
         if keyframes.isEmpty {
@@ -194,6 +193,22 @@ extension AudioSource {
         return AudioSourceState(
             active: active, localTime: localTime, position: pose.0, rotation: pose.1, gain: gain)
     }
+}
+
+private func loopingLocalTime(_ t: Double, _ startSec: Double, _ durationSec: Double) -> Double {
+    if t <= startSec {
+        return 0
+    }
+    var timeRemainder = t.truncatingRemainder(dividingBy: durationSec)
+    if timeRemainder < 0 {
+        timeRemainder += durationSec
+    }
+    var startRemainder = startSec.truncatingRemainder(dividingBy: durationSec)
+    if startRemainder < 0 {
+        startRemainder += durationSec
+    }
+    let difference = timeRemainder - startRemainder
+    return difference < 0 ? difference + durationSec : difference
 }
 
 private func normalizedQuaternion(_ value: [Double]) -> [Double] {

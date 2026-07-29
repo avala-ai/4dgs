@@ -175,6 +175,40 @@ class TestAudio:
         source.rotation = (math.ulp(0.0), 0.0, 0.0, 0.0)
         assert source.state_at(1.0).rotation == pytest.approx((1.0, 0.0, 0.0, 0.0))
 
+    def test_looping_audio_time_does_not_overflow(self):
+        source = fourdgs.AudioSource(
+            source_id=1,
+            codec="wav",
+            data=b"x",
+            start_sec=-1e308,
+            duration_sec=1.0,
+            loop=True,
+        )
+        state = source.state_at(1e308)
+        assert state.active is True
+        assert state.local_time == 0.0
+        assert math.isfinite(state.local_time)
+
+    def test_truncation_does_not_excuse_audio_when_the_header_flag_is_clear(self):
+        buf = io.BytesIO()
+        source = fourdgs.AudioSource(source_id=1, codec="wav", data=b"RIFF", duration_sec=6.0)
+        fourdgs.write(buf, make_scene(), 6.0, audio_sources=[source])
+        data = bytearray(buf.getvalue())
+        from fourdgs.serialization import iter_records
+
+        header = next(record for record in iter_records(data, len(MAGIC)) if record.opcode == op.HEADER)
+        cursor = Cursor(header.content)
+        cursor.string()
+        cursor.string()
+        cursor.take(8 + 8 + 8)
+        cursor.string()
+        cursor.take(6 * 8)
+        cursor.u8()
+        data[header.offset + 9 + cursor.pos] &= ~1
+
+        with pytest.raises(fourdgs.MalformedFile, match=r"Header audio flag is clear.*1 complete audio source"):
+            fourdgs.read(bytes(data[:-1]), recover_truncated=True)
+
     def test_the_writer_normalizes_an_extreme_audio_orientation_without_overflow(self):
         source = fourdgs.AudioSource(
             source_id=1, codec="wav", data=b"x", duration_sec=2.0, rotation=(1e308, 0.0, 0.0, 0.0)

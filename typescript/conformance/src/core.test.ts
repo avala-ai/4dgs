@@ -222,6 +222,16 @@ test("audio normalization preserves extreme and tiny finite directions", () => {
     audioSourceStateAt(source([Number.MIN_VALUE, 0, 0, 0]), 1).rotation,
     [1, 0, 0, 0],
   );
+  const looping = {
+    ...source([0, 0, 0, 1]),
+    startSec: -1e308,
+    durationSec: 1,
+    loop: true,
+  };
+  const extremeTime = audioSourceStateAt(looping, 1e308);
+  assert.equal(extremeTime.active, true);
+  assert.equal(extremeTime.localTime, 0);
+  assert.equal(Number.isFinite(extremeTime.localTime), true);
 });
 
 test("a stream that ends on the trailing magic is not truncated", () => {

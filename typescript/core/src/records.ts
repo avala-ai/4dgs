@@ -444,13 +444,20 @@ export function parseAudioData(content: Uint8Array): AudioData {
 /** Reconstruct source-local timing and pose. Spatialization remains player-owned. */
 export function audioSourceStateAt(source: AudioSourceDescriptor, t: number): AudioSourceState {
   const active = t >= source.startSec && (source.loop || t < source.startSec + source.durationSec);
-  const elapsed = Math.max(0, t - source.startSec);
   const localTime =
     source.loop && source.durationSec > 0
-      ? elapsed % source.durationSec
-      : Math.min(elapsed, Math.max(0, source.durationSec));
+      ? loopingLocalTime(t, source.startSec, source.durationSec)
+      : Math.min(Math.max(0, t - source.startSec), Math.max(0, source.durationSec));
   const [position, rotation] = audioPoseAt(source, t);
   return { active, localTime, position, rotation, gain: source.gain };
+}
+
+function loopingLocalTime(t: number, startSec: number, durationSec: number): number {
+  if (t <= startSec) return 0;
+  const timeRemainder = ((t % durationSec) + durationSec) % durationSec;
+  const startRemainder = ((startSec % durationSec) + durationSec) % durationSec;
+  const difference = timeRemainder - startRemainder;
+  return difference < 0 ? difference + durationSec : difference;
 }
 
 function audioPoseAt(

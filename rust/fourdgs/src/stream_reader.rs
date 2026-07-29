@@ -408,7 +408,9 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
             ..AudioSource::default()
         });
     }
-    if header.has_audio() == scene.audio_sources.is_empty() && !truncated {
+    if (!header.has_audio() && !scene.audio_sources.is_empty())
+        || (header.has_audio() && scene.audio_sources.is_empty() && !truncated)
+    {
         return Err(Error::Malformed(format!(
             "the Header audio flag is {}, but the file contains {} complete audio sources",
             if header.has_audio() { "set" } else { "clear" },

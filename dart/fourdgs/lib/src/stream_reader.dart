@@ -384,7 +384,8 @@ List<FourdgsAudioSource> _assembleAudioSources(
       ),
     );
   }
-  if (header.hasAudio != sources.isNotEmpty && !truncated) {
+  if ((!header.hasAudio && sources.isNotEmpty) ||
+      (header.hasAudio && sources.isEmpty && !truncated)) {
     throw FourdgsMalformedFile(
       'the Header audio flag is ${header.hasAudio ? 'set' : 'clear'}, but '
       'the file contains ${sources.length} complete audio sources',

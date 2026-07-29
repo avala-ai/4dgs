@@ -311,6 +311,61 @@ fn an_extreme_but_finite_audio_orientation_normalizes_without_overflow() {
 }
 
 #[test]
+fn looping_audio_time_does_not_overflow() {
+    let source = AudioSource {
+        start_sec: -1e308,
+        duration_sec: 1.0,
+        loop_: true,
+        ..AudioSource::default()
+    };
+    let state = source.state_at(1e308);
+    assert!(state.active);
+    assert_eq!(state.local_time, 0.0);
+    assert!(state.local_time.is_finite());
+}
+
+#[test]
+fn truncation_does_not_excuse_audio_when_the_header_flag_is_clear() {
+    use fourdgs::serialization::{read_record, Cursor, RECORD_HEADER_SIZE};
+
+    let (g, duration) = scene(32);
+    let extras = SceneExtras {
+        audio_sources: vec![AudioSource {
+            source_id: 1,
+            codec: "wav".into(),
+            duration_sec: duration,
+            data: b"RIFF".to_vec(),
+            ..AudioSource::default()
+        }],
+        ..SceneExtras::default()
+    };
+    let mut bytes =
+        fourdgs::write_to_vec(&g, duration, &chunking_options(), &extras).expect("encode");
+    let mut records = Cursor::at(&bytes, fourdgs::MAGIC.len());
+    let header = read_record(&mut records).expect("Header");
+    assert_eq!(header.opcode, fourdgs::opcode::HEADER);
+    let header_offset = header.offset;
+    let mut content = Cursor::new(header.content);
+    content.string().unwrap();
+    content.string().unwrap();
+    content.take(8 + 8 + 8).unwrap();
+    content.string().unwrap();
+    content.take(6 * 8).unwrap();
+    content.u8().unwrap();
+    let flags = header_offset + RECORD_HEADER_SIZE + content.position();
+    bytes[flags] &= !fourdgs::records::FLAG_HAS_AUDIO;
+    bytes.pop();
+
+    let error = fourdgs::read_bytes(&bytes).expect_err("the complete source contradicts Header");
+    assert!(
+        matches!(&error, fourdgs::Error::Malformed(message)
+            if message.contains("Header audio flag is clear")
+                && message.contains("1 complete audio source")),
+        "{error}"
+    );
+}
+
+#[test]
 fn the_writer_normalizes_an_extreme_audio_orientation_without_overflow() {
     let (g, duration) = scene(0);
     let extras = SceneExtras {

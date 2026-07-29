@@ -94,11 +94,10 @@ class AudioSource:
         it starts at `start_sec` and wraps by `duration_sec` only when `loop` is set.
         """
         active = t >= self.start_sec and (self.loop or t < self.start_sec + self.duration_sec)
-        elapsed = max(0.0, t - self.start_sec)
         local_time = (
-            math.fmod(elapsed, self.duration_sec)
+            _looping_local_time(t, self.start_sec, self.duration_sec)
             if self.loop and self.duration_sec > 0.0
-            else min(elapsed, max(self.duration_sec, 0.0))
+            else min(max(0.0, t - self.start_sec), max(self.duration_sec, 0.0))
         )
         position, rotation = _audio_pose_at(self, t)
         return AudioSourceState(
@@ -108,6 +107,21 @@ class AudioSource:
             rotation=rotation,
             gain=self.gain,
         )
+
+
+def _looping_local_time(t: float, start_sec: float, duration_sec: float) -> float:
+    if t <= start_sec:
+        return 0.0
+    time_remainder = math.fmod(t, duration_sec)
+    if time_remainder < 0.0:
+        time_remainder += duration_sec
+    start_remainder = math.fmod(start_sec, duration_sec)
+    if start_remainder < 0.0:
+        start_remainder += duration_sec
+    difference = time_remainder - start_remainder
+    if difference < 0.0:
+        difference += duration_sec
+    return difference
 
 
 def _audio_pose_at(

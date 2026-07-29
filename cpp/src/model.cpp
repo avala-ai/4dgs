@@ -8,6 +8,16 @@
 namespace fourdgs {
 namespace {
 
+double loopingLocalTime(double t, double startSec, double durationSec) {
+  if (t <= startSec) return 0.0;
+  double timeRemainder = std::fmod(t, durationSec);
+  if (timeRemainder < 0.0) timeRemainder += durationSec;
+  double startRemainder = std::fmod(startSec, durationSec);
+  if (startRemainder < 0.0) startRemainder += durationSec;
+  const double difference = timeRemainder - startRemainder;
+  return difference < 0.0 ? difference + durationSec : difference;
+}
+
 void normalizeQuaternion(const double value[4], double out[4]) {
   const double scale =
       std::max({std::abs(value[0]), std::abs(value[1]), std::abs(value[2]), std::abs(value[3])});
@@ -54,9 +64,9 @@ void slerp(const double a[4], const double b[4], double u, double out[4]) {
 AudioSourceState AudioSource::stateAt(double t) const {
   AudioSourceState state;
   state.active = t >= startSec && (loop || t < startSec + durationSec);
-  const double elapsed = std::max(0.0, t - startSec);
-  state.localTime = loop && durationSec > 0.0 ? std::fmod(elapsed, durationSec)
-                                              : std::min(elapsed, std::max(0.0, durationSec));
+  state.localTime = loop && durationSec > 0.0
+                        ? loopingLocalTime(t, startSec, durationSec)
+                        : std::min(std::max(0.0, t - startSec), std::max(0.0, durationSec));
   state.gain = gain;
 
   if (keyframes.empty()) {

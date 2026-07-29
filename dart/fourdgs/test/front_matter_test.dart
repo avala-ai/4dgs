@@ -73,6 +73,37 @@ void main() {
     }
   });
 
+  test('truncation does not excuse audio when the Header flag is clear', () {
+    final bytes = Uint8List.fromList(File(path).readAsBytesSync());
+    final header = iterRecords(
+      bytes,
+      fourdgsMagic.length,
+    ).firstWhere((record) => record.opcode == opHeader);
+    final cursor =
+        FourdgsCursor(header.content)
+          ..string()
+          ..string()
+          ..skip(8 + 8 + 8)
+          ..string()
+          ..skip(6 * 8)
+          ..u8();
+    header.content[cursor.pos] &= ~headerFlagHasAudio;
+
+    expect(
+      () => readFourdgsBytes(Uint8List.sublistView(bytes, 0, bytes.length - 1)),
+      throwsA(
+        isA<FourdgsMalformedFile>().having(
+          (error) => error.toString(),
+          'message',
+          allOf(
+            contains('Header audio flag is clear'),
+            contains('1 complete audio source'),
+          ),
+        ),
+      ),
+    );
+  });
+
   group('the front-matter scan reaches the first Chunk', () {
     // 64 bytes cannot hold the magic plus the Header, so every record after the
     // first costs a round trip. If anything is going to be missed, it is missed

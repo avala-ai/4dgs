@@ -128,11 +128,10 @@ class FourdgsAudioSourceDescriptor {
   /// Reconstruct source timing and pose at scene time [t].
   FourdgsAudioSourceState stateAt(double t) {
     final active = t >= startSec && (loop || t < startSec + durationSec);
-    final elapsed = math.max(0.0, t - startSec);
     final localTime =
         loop && durationSec > 0.0
-            ? elapsed % durationSec
-            : math.min(elapsed, math.max(0.0, durationSec));
+            ? _loopingLocalTime(t, startSec, durationSec)
+            : math.min(math.max(0.0, t - startSec), math.max(0.0, durationSec));
     final pose = _audioPoseAt(this, t);
     return FourdgsAudioSourceState(
       active: active,
@@ -142,6 +141,16 @@ class FourdgsAudioSourceDescriptor {
       gain: gain,
     );
   }
+}
+
+double _loopingLocalTime(double t, double startSec, double durationSec) {
+  if (t <= startSec) return 0.0;
+  var timeRemainder = t.remainder(durationSec);
+  if (timeRemainder < 0.0) timeRemainder += durationSec;
+  var startRemainder = startSec.remainder(durationSec);
+  if (startRemainder < 0.0) startRemainder += durationSec;
+  final difference = timeRemainder - startRemainder;
+  return difference < 0.0 ? difference + durationSec : difference;
 }
 
 /// One independently timed, optionally spatial audio source.

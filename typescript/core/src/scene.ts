@@ -444,7 +444,10 @@ function assembleAudioSourceDescriptors(
       interpolation: "linear",
     });
   }
-  if (header.hasAudio !== sources.length > 0 && !truncated) {
+  if (
+    (!header.hasAudio && sources.length > 0) ||
+    (header.hasAudio && sources.length === 0 && !truncated)
+  ) {
     throw new MalformedFile(
       `the Header audio flag is ${header.hasAudio ? "set" : "clear"}, but the file contains ` +
         `${sources.length} complete audio sources`,
