@@ -15,7 +15,7 @@ Every row is filled in from a suite that runs: 32 variants, two read paths (stre
 | Streaming decode                                     | Yes     | Yes        | Yes     | Yes     | Yes     |
 | Indexed / seeking decode                             | Yes     | Yes        | Yes     | Yes     | Yes     |
 | Range-request decode                                 | Yes     | Yes        | Yes     | Yes     | Yes     |
-| Truncated-file recovery                              | Yes     | Yes        | Yes     | Yes     | Planned |
+| Truncated-file recovery                              | Yes     | Yes        | Yes     | Yes     | Yes     |
 | Chunk index                                          | Yes     | Yes        | Yes     | Yes     | Yes     |
 | Summary offsets                                      | Yes     | Yes        | Yes     | Yes     | Yes     |
 | CRC validation                                       | Yes     | Yes        | Yes     | Yes     | Yes     |
@@ -23,7 +23,7 @@ Every row is filled in from a suite that runs: 32 variants, two read paths (stre
 | Spherical harmonics, degree 1                        | Yes     | Yes        | Yes     | Yes     | Yes     |
 | Spherical harmonics, degree 2                        | Yes     | Yes        | Yes     | Yes     | Yes     |
 | Spherical harmonics, degree 3                        | Planned | Planned    | Planned | Planned | Planned |
-| SH band range-skipping                               | Yes     | Yes        | Yes     | Yes     | Planned |
+| SH band range-skipping                               | Yes     | Yes        | Yes     | Yes     | Yes     |
 | Embedded audio (optional, zero-overhead when absent) | Yes     | Yes        | Yes     | Yes     | Yes     |
 | Camera trajectory                                    | Yes     | Yes        | Yes     | Yes     | Yes     |
 | Metadata                                             | Yes     | Yes        | Yes     | Yes     | Yes     |
@@ -128,12 +128,10 @@ their own bindings. See
 [the fuzzing notes](https://github.com/avala-ai/4dgs/blob/main/tests/fuzz/README.md) and
 `rust/fourdgs/tests/fuzz.rs`.
 
-**Swift** passes the suite by both read paths — 63 checks, 0 failures — and two of its rows stay
-`Planned` anyway, because the suite does not prove them for Swift. **Truncated-file recovery** and
-**SH band range-skipping** are proved by a runner doing work beyond printing a summary: decoding a
-deliberately cut file, and measuring bytes at the transport. The Swift runners do not do that work
-yet. The decoder has `isTruncated` and `bytesForChunk` behind it, which is precisely why those cells
-are not `Yes` — code existing is what this table refuses to accept as evidence.
+**Swift**'s band-skipping check asserts the byte **count**, not that the call succeeded. A cache
+that answers a narrow cap from a wider entry returns the wider count while looking perfectly healthy
+— that bug existed in the core and was fixed — so the runner requires that capping harmonics away
+costs strictly fewer bytes than carrying them, and that no cap ever moves more than a wider one.
 
 **Convert from PLY frame sequences** and **Inspect and validate** are tools rather than wire-format
 features, so the conformance suite does not cover them; they are marked from their own tests, which

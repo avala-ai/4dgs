@@ -64,6 +64,16 @@ public enum Runner {
             gaussians = GaussianState.concatenated(parts)
         }
 
+        // The two rows the canonical JSON cannot carry, each on the runner that owns it: a cut
+        // file must be read front to back, and a band cap is only meaningful where there is an
+        // index to skip ranges in.
+        switch mode {
+        case .streamed:
+            try ExtraChecks.truncationRecovery(path: path, wholeCount: gaussians.count)
+        case .indexed:
+            try ExtraChecks.bandRangeSkipping(reader)
+        }
+
         return Summary.build(
             scene: scene,
             gaussians: gaussians,

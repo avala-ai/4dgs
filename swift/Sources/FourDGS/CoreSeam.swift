@@ -42,9 +42,16 @@ enum Core {
     /// this design exists to prevent.
     final class SceneHandle {
         let raw: OpaquePointer
+        /// The size of the resource this scene was opened over, captured once at open time.
+        ///
+        /// A plain number rather than a reference to the transport: the core owns the reader
+        /// for the scene's lifetime, and a second owner here would be a second thing to get
+        /// wrong. All this needs to answer is "could a declared length possibly fit".
+        let resourceByteCount: Int64?
 
-        init(raw: OpaquePointer) {
+        init(raw: OpaquePointer, resourceByteCount: Int64?) {
             self.raw = raw
+            self.resourceByteCount = resourceByteCount
         }
 
         deinit {
@@ -114,13 +121,17 @@ enum Core {
         descriptor.read = readerRead
         descriptor.release = readerRelease
 
+        // Asked before the open, because afterwards the core owns the reader.
+        var probe = reader
+        let resourceByteCount = try? probe.byteCount()
+
         var scene: OpaquePointer?
         let status = fourdgs_open_reader_ex(descriptor, mode.rawValue, &scene)
         guard status == ok, let scene else {
             // The core has already released the box on this path; nothing to undo.
             throw error(status)
         }
-        return SceneHandle(raw: scene)
+        return SceneHandle(raw: scene, resourceByteCount: resourceByteCount)
     }
 
     // MARK: - The scene's own statements
@@ -195,6 +206,16 @@ enum Core {
         guard fourdgs_scene_has_audio(scene.raw) != 0 else { return nil }
         let codec = fourdgs_scene_audio_codec(scene.raw).map { String(cString: $0) } ?? ""
         let size = fourdgs_scene_audio_size(scene.raw)
+        // Defense in depth, not a known bug: the core validates this and is fuzzed, so a wild
+        // length should never arrive here. But this is the one place the binding turns a
+        // file-derived number straight into an allocation, and the cost of proving it against
+        // the resource that supplied it is one comparison. A length that cannot fit in the
+        // bytes behind it is refused rather than reserved.
+        if let resourceSize = scene.resourceByteCount, size > UInt64(max(resourceSize, 0)) {
+            throw FourDGSError.malformed(
+                offset: 0, record: "Audio", field: "data",
+                reason: "declares \(size) bytes, more than the \(resourceSize) the whole file holds")
+        }
         var data = [UInt8](repeating: 0, count: Int(size))
         if size > 0 {
             let status = data.withUnsafeMutableBufferPointer { buffer in
