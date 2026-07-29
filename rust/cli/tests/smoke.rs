@@ -307,6 +307,13 @@ fn file_with_grids(count: usize, bad_at: Option<usize>) -> Vec<u8> {
             duration_sec: 1.0,
             gaussian_count: 0,
             aabb: vec![0.0; 6],
+            // Default's empty string is not a temporal model, and a fixture named
+            // "clean" must be clean: Python refuses the empty model at open (as the
+            // spec requires) while the Rust core does not gate it yet, and the
+            // cross-validator turned that divergence into a red main within hours
+            // of landing. The core-side gate lands with the keyframe-delta reader
+            // work, which pins the refusal wording normatively.
+            temporal_model: "gaussian-birth".into(),
             ..Default::default()
         }
         .encode(&[]),
