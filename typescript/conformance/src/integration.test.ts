@@ -142,6 +142,46 @@ test("truncation does not excuse a complete audio source when the Header flag is
   await assert.rejects(() => decodeScene(bytes.subarray(0, payload.offset)), location);
 });
 
+test("a clear Header diagnostic retains a streamed Audio Data source id", async (t) => {
+  const path = corpus("OneWindow-UseChunkIndex-UseCrc-WithSpatialAudio");
+  if (path === null) return t.skip("corpus not generated");
+
+  const bytes = Uint8Array.from(readFileSync(path));
+  const records = [...iterateRecords(bytes, MAGIC.length)];
+  const header = records.find((record) => record.opcode === Opcode.Header);
+  const descriptor = records.find((record) => record.opcode === Opcode.AudioSource);
+  const payload = records.find((record) => record.opcode === Opcode.AudioData);
+  assert.ok(header && descriptor && payload);
+  assert.equal(descriptor.offset + descriptor.length, payload.offset);
+
+  const headerCursor = new Cursor(header.content);
+  headerCursor.string();
+  headerCursor.string();
+  headerCursor.skip(8 + 8 + 8);
+  headerCursor.string();
+  headerCursor.skip(6 * 8);
+  headerCursor.u8();
+  const flags = header.offset + RECORD_HEADER_BYTES + headerCursor.pos;
+  bytes[flags] = bytes[flags]! & ~1;
+
+  // Put Audio Data first while preserving the front matter's total length and all indexed
+  // offsets. A small block splits its 12-byte prefix, so the observation predates parsing.
+  const reordered = new Uint8Array(bytes.byteLength);
+  reordered.set(bytes.subarray(0, descriptor.offset));
+  reordered.set(payload.raw, descriptor.offset);
+  reordered.set(descriptor.raw, descriptor.offset + payload.length);
+  reordered.set(
+    bytes.subarray(payload.offset + payload.length),
+    descriptor.offset + payload.length + descriptor.length,
+  );
+
+  const sourceId = new Cursor(payload.content).u32();
+  await assert.rejects(
+    () => decodeScene(reordered, { blockSize: 8 }),
+    new RegExp(`Audio Data record for source id ${sourceId} at byte ${descriptor.offset}`),
+  );
+});
+
 test("the two read paths agree on the same file", async (t) => {
   const path = corpus("MixedLifetimes-SHDegree2-UseChunkIndex-UseCrc");
   if (path === null) return t.skip("corpus not generated");

@@ -136,7 +136,7 @@ interface LegacyAudioDescriptor {
 interface ObservedAudioRecord {
   readonly name: "Audio" | "Audio Source" | "Audio Data";
   readonly offset: number;
-  readonly sourceId?: number;
+  sourceId?: number;
 }
 
 interface StreamingAudioData {
@@ -242,11 +242,15 @@ export async function decodeScene(
           streamingLegacyAudio = consumed.state;
           if (consumed.descriptor !== null) legacyAudio = consumed.descriptor;
         } else {
-          firstAudioRecord ??= { name: "Audio Data", offset: item.recordOffset };
+          const observed = (firstAudioRecord ??= {
+            name: "Audio Data",
+            offset: item.recordOffset,
+          });
           streamingAudioData = await consumeAudioDataPart(
             item,
             streamingAudioData,
             audioPayloadLengths,
+            observed,
             options.onAudioData,
           );
         }
@@ -610,6 +614,7 @@ async function consumeAudioDataPart(
   part: StreamedRecordPart,
   current: StreamingAudioData | null,
   payloadLengths: Map<number, number>,
+  observed: ObservedAudioRecord,
   onAudioData: DecodeOptions["onAudioData"],
 ): Promise<StreamingAudioData | null> {
   let state = current;
@@ -643,6 +648,9 @@ async function consumeAudioDataPart(
       const dataLength = prefix.u64();
       state.sourceId = sourceId;
       state.dataLength = dataLength;
+      if (observed.name === "Audio Data" && observed.offset === state.recordOffset) {
+        observed.sourceId = sourceId;
+      }
       if (state.contentLength < state.prefix.byteLength + dataLength) {
         throw new MalformedFile(
           `Audio Data id ${sourceId} declares ${dataLength} bytes, ` +
