@@ -63,6 +63,15 @@
 
   --ifm-font-family-base:
     "Lexend Deca", system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  /* Lexend Deca draws heavier than the system stacks at the same nominal
+     weight, and it is a variable font, so every tier steps down ~100 across
+     the board: body text sits at 350, emphasis at 500, headings at 600. */
+  --ifm-font-weight-light: 250;
+  --ifm-font-weight-normal: 350;
+  --ifm-font-weight-semibold: 500;
+  --ifm-font-weight-bold: 600;
+  --ifm-heading-font-weight: 600;
+
   --ifm-font-family-monospace:
     ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
 
