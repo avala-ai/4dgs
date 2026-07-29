@@ -28,11 +28,25 @@ top-level record — see spec §5.6.
 | 10     | `window_index`   | 1        | index into the Window Table                                      |
 | 11     | `source_group`   | 1        | optional producer-side grouping id                               |
 | 12     | `source_index`   | 1        | optional producer-side stable id                                 |
-| 13–63  | reserved         |          |                                                                  |
+| 13–31  | reserved         |          |                                                                  |
+| 32     | `surface_normal` | 3        | reserved — relighting block, see below                           |
+| 33     | `base_color`     | 3        | reserved — relighting block, see below                           |
+| 34     | `roughness`      | 1        | reserved — relighting block, see below                           |
+| 35     | `metalness`      | 1        | reserved — relighting block, see below                           |
+| 36     | `sh_response`    | —        | reserved — relighting block, see below                           |
+| 37–47  | reserved         |          | reserved — relighting block, see below                           |
+| 48–63  | reserved         |          |                                                                  |
 | 64–127 | private          |          | application-defined, readers skip                                |
 
 Ids 0–10 are required in every chunk. Ids 11 and 12 are optional and exist so a producer can
 round-trip stable identities through the format; readers that do not need them skip the streams.
+
+Ids 13–63 are the reserved pool for per-gaussian attributes a later revision may define. Spec
+§5.15.6 already points the per-gaussian label and segmentation work at this range; ids 32–47 are
+further carved out of it as the **relighting block** below, so the two future directions do not
+compete for the same numbers. Everything in 13–63 not named here stays reserved: a version-1 writer
+emits none of it, and a version-1 reader that meets an id it does not know treats the stream as
+unknown and skips it by its `payload_length` (§5.6), exactly as it does for a private-range id.
 
 **Spherical harmonics have no attribute id.** They travel in SH Band Stream records (`0x07`), one
 per band, and the stream header inside such a record carries `0x07` in its `attribute_id` field —
@@ -43,6 +57,47 @@ stored: `step_sh` records what the encoder did and is not applied at decode (spe
 means the coefficient `-4 + b * 8 / 255`, which a decoder needs only if it hands its caller floats;
 how coarsely the bytes were quantized before they were stored is declared per band under "SH bit
 depths" below.
+
+### Relighting block — attribute ids 32–47
+
+**Reserved for a future relighting extension; not normative; a version-1 writer MUST NOT emit these;
+a version-1 reader treats them as unknown attribute streams and skips them by length.** Recorded so
+the shape is known and so the ids are not spent on something else.
+
+Version-1 gaussians carry radiance directly: colour and spherical harmonics store how a gaussian
+looks under the lighting it was captured in, baked in. A relightable gaussian instead carries the
+surface quantities a shading model needs to compute appearance under new lighting — the direction it
+faces, what it is made of, how rough it is — which is a strictly larger attribute set. Path-traced
+relighting and physically-based material models are beginning to treat gaussians as shadeable
+primitives rather than as fixed emitters, and radiance-only spherical harmonics start to read as
+baked lighting the moment that happens. This block reserves the names those attributes will take, so
+a version-1 file that already carries them in the private range, or a producer choosing where to put
+them, has a settled home rather than a fork of the id space.
+
+Five ids are named because their role is clear; the rest of the block stays reserved for the
+parameters a real material model carries beyond them:
+
+| id    | name             | channels  | intended role                                                                |
+| ----- | ---------------- | --------- | ---------------------------------------------------------------------------- |
+| 32    | `surface_normal` | 3         | The unit surface direction a shading model evaluates against                 |
+| 33    | `base_color`     | 3         | Diffuse reflectance / albedo, the lighting-independent colour                |
+| 34    | `roughness`      | 1         | Microfacet spread of the specular response                                   |
+| 35    | `metalness`      | 1         | Dielectric-to-conductor blend, or a specular term in its place               |
+| 36    | `sh_response`    | undefined | A slot for an environment-response term or an SH-to-material factorization   |
+| 37–47 | reserved         |           | Held for the same extension: further material parameters, tangents, emission |
+
+The block is sixteen ids wide, hex-aligned, and placed above the label and segmentation reservation
+(§5.15.6) so the two future directions in the 13–63 pool do not collide.
+
+**What is not being decided.** This reservation fixes names, not semantics. It does not decide the
+material model or its BRDF, the quantization domain or channel layout of any of these attributes,
+whether `sh_response` factorizes the existing harmonics against a material or replaces them, or
+whether a surface normal is stored at all rather than derived from the covariance at shading time.
+Those are the questions a relighting extension answers; naming the ids now only keeps them from
+being answered by accident, and keeps a version-1 file a forward-compatible target for when they are
+answered. Like the temporal models and the reserved provenance opcodes, this is reserved rather than
+designed: naming it fixes the vocabulary and stops the names being spent elsewhere; it is not
+implemented, and a version-1 writer must not emit it.
 
 ---
 
@@ -224,14 +279,23 @@ Used by the Header's `profile` field. A profile is a promise about what a file c
 consumer can reject an unsuitable file up front instead of discovering a missing attribute
 mid-decode.
 
-| value     | promises                                                                                                                                                                                                       |
-| --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `""`      | Nothing beyond the base format                                                                                                                                                                                 |
-| `capture` | Content fitted from a real capture: finite validity windows, a chunk index with more than one entry, statistics present. Seeks cheaply (spec §8)                                                               |
-| `baked`   | Content baked from a temporal field or otherwise long-lived: gaussians may span the whole timeline, the index may hold a single entry, and an instant may cost the whole scene. Correct, but not cheap to seek |
+| value         | promises                                                                                                                                                                                                                                                             |
+| ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `""`          | Nothing beyond the base format                                                                                                                                                                                                                                       |
+| `capture`     | Content fitted from a real capture: finite validity windows, a chunk index with more than one entry, statistics present. Seeks cheaply (spec §8)                                                                                                                     |
+| `baked`       | Content baked from a temporal field or otherwise long-lived: gaussians may span the whole timeline, the index may hold a single entry, and an instant may cost the whole scene. Correct, but not cheap to seek                                                       |
+| `relightable` | **Reserved for a future relighting extension; not normative; a version-1 writer MUST NOT emit it.** Would promise the relighting-block attributes (see "Attribute ids") are present, so a consumer can reject a radiance-only file up front when it needs to relight |
 
 Profiles constrain writers, not readers: a reader MUST be able to read any conforming file
 regardless of its profile.
+
+`relightable` is reserved for the same reason its attribute block is: the seam should exist at the
+scene level too, so that when a relighting extension ships, a file can promise the surface
+attributes are present and a consumer that requires them can reject an unsuitable file before
+decoding rather than discovering the absence mid-scene — which is what a profile is for. What the
+profile would actually require is deferred with the rest of the extension; naming it now only
+reserves the word. Like the temporal models it is reserved rather than designed, and a version-1
+writer must not emit it.
 
 ---
 

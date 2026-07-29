@@ -1056,6 +1056,18 @@ and the text was the bug.
 | §5.15.2 added: a Coordinate Frame record supersedes the `coordinate_system` metadata key                                        | rule added                |
 | §6.5 added: a stored SH byte is the coefficient `-4 + b * 8 / 255`, on a fixed interval                                         | clarification, rule added |
 | §5.3/§6.5 added: per-band SH bit depths, appended to the Quantization record                                                    | rule added                |
+| Registry: reserved attribute ids 32–47 and the `relightable` profile for a future relighting extension; named, not defined      | reserved, rule added      |
+
+The relighting row reserves names and defines nothing. It changes no existing file — it forbids
+nothing a version-1 writer does today, adds no field to any record, and touches no byte in any of
+the conformance variants, which carry none of these ids and none of this profile. What it adds is a
+rule about what a **new** file may say: ids 32–47 and the `relightable` profile are reserved, a
+version-1 writer MUST NOT emit them, and a version-1 reader skips an attribute stream it does not
+know by its length exactly as it already skips a private-range one. The registry entry states what
+the eventual relighting attributes will be called; it deliberately decides nothing about the
+material model, the quantization of any attribute, or whether surface normals are stored or derived.
+It is the temporal models' and the reserved provenance opcodes' precedent applied once more: reserve
+the ground, define nothing speculative.
 
 The two §5.15 rows add records rather than tighten a rule, and they **change no existing file**. The
 opcodes they define were reserved and unemitted, so no file in the world carries one; all
