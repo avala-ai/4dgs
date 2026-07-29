@@ -22,6 +22,9 @@ All notable changes to the Python package are documented here, following
 
 ### Fixed
 
+- `open_indexed` raised `ValueError` — not a `FourdgsError` — on a footer whose `summary_start`
+  points past the footer itself, so `validate` could not catch it and a malformed file crashed the
+  tool meant to diagnose it. It is now a `MalformedFile` naming both offsets.
 - `open_indexed` could not open a file whose front matter held a record larger than its 64 KiB
   probe. An Audio record lives in the front matter, so any scene with a real soundtrack failed — on
   the seekable path, on the format's flagship case. The walk now steps over a record by arithmetic

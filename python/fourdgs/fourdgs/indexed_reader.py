@@ -207,6 +207,11 @@ def open_indexed(source: Readable) -> IndexedScene:
     crc_ok = None
     if footer.summary_start:
         summary_len = size - footer_size - footer.summary_start
+        if summary_len < 0:
+            raise MalformedFile(
+                f"the footer says the summary starts at {footer.summary_start}, "
+                f"past the footer itself at {size - footer_size}"
+            )
         summary = source.read(footer.summary_start, summary_len)
         if footer.summary_crc:
             crc_ok = crc32(summary) == footer.summary_crc

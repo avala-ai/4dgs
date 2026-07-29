@@ -35,6 +35,17 @@ Every scene is generated from a fixed seed by `build_gaussians`, and the audio t
 sine sweep. There is no captured data in this repository and there will not be: the corpus must be
 redistributable without a licence question and reproducible without a download.
 
+## Known gaps
+
+Recorded here rather than left implicit, because a gap nobody wrote down is indistinguishable from
+coverage.
+
+- **Spherical harmonics, degree 3.** The corpus carries degree 1 and 2 only, so no implementation
+  can claim degree 3 however complete its code is. Adding it is one line in `scenarios.py` — degree
+  3 is 45 coefficients per gaussian against degree 2's 24, so the variant should use a small
+  scenario to stay inside the size cap, and `SH_BAND_RANGE`'s band 3 entry already describes the
+  layout.
+
 ## Fixture scale is a feature to cover, not a detail
 
 Small fixtures hide a whole class of bug: anything that only appears once a record is larger than a

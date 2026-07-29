@@ -11,32 +11,32 @@ Python's row and TypeScript's are filled in from a suite that runs: 28 variants,
 (streamed and indexed), 55 checks passing for each. The other languages have not been run against it
 yet.
 
-| Feature                                              | Python   | TypeScript | Rust    | C++     | Swift   |
-| ---------------------------------------------------- | -------- | ---------- | ------- | ------- | ------- |
-| Streaming decode                                     | Yes      | Yes        | Planned | Planned | Planned |
-| Indexed / seeking decode                             | Yes      | Yes        | Planned | Planned | Planned |
-| Range-request decode                                 | Yes      | Yes        | Planned | Planned | Planned |
-| Truncated-file recovery                              | Yes      | Yes        | Planned | Planned | Planned |
-| Chunk index                                          | Yes      | Yes        | Planned | Planned | Planned |
-| Summary offsets                                      | Yes      | Yes        | Planned | Planned | Planned |
-| CRC validation                                       | Yes      | Yes        | Planned | Planned | Planned |
-| Quantized attributes                                 | Yes      | Yes        | Planned | Planned | Planned |
-| Spherical harmonics, degree 1                        | Yes      | Yes        | Planned | Planned | Planned |
-| Spherical harmonics, degree 2                        | Yes      | Yes        | Planned | Planned | Planned |
-| Spherical harmonics, degree 3                        | Planned  | Planned    | Planned | Planned | Planned |
-| SH band range-skipping                               | Yes      | Yes        | Planned | Planned | Planned |
-| Embedded audio (optional, zero-overhead when absent) | Yes      | Yes        | Planned | Planned | Planned |
-| Camera trajectory                                    | Yes      | Yes        | Planned | Planned | Planned |
-| Metadata                                             | Yes      | Yes        | Planned | Planned | Planned |
-| Attachments                                          | Yes      | Yes        | Planned | Planned | Planned |
-| Statistics                                           | Yes      | Yes        | Planned | Planned | Planned |
-| Unknown-record skipping                              | Yes      | Yes        | Planned | Planned | Planned |
-| Private-range records                                | Yes      | Yes        | Planned | Planned | Planned |
-| Encode                                               | Yes      | Planned    | Planned | Planned | Planned |
-| Chunked encode                                       | Yes      | Planned    | Planned | Planned | Planned |
-| Summary writing                                      | Yes      | Planned    | Planned | Planned | Planned |
-| Convert from PLY frame sequences                     | Untested | No         | No      | No      | No      |
-| Inspect and validate                                 | Untested | Planned    | Planned | Planned | Planned |
+| Feature                                              | Python  | TypeScript | Rust    | C++     | Swift   |
+| ---------------------------------------------------- | ------- | ---------- | ------- | ------- | ------- |
+| Streaming decode                                     | Yes     | Yes        | Planned | Planned | Planned |
+| Indexed / seeking decode                             | Yes     | Yes        | Planned | Planned | Planned |
+| Range-request decode                                 | Yes     | Yes        | Planned | Planned | Planned |
+| Truncated-file recovery                              | Yes     | Yes        | Planned | Planned | Planned |
+| Chunk index                                          | Yes     | Yes        | Planned | Planned | Planned |
+| Summary offsets                                      | Yes     | Yes        | Planned | Planned | Planned |
+| CRC validation                                       | Yes     | Yes        | Planned | Planned | Planned |
+| Quantized attributes                                 | Yes     | Yes        | Planned | Planned | Planned |
+| Spherical harmonics, degree 1                        | Yes     | Yes        | Planned | Planned | Planned |
+| Spherical harmonics, degree 2                        | Yes     | Yes        | Planned | Planned | Planned |
+| Spherical harmonics, degree 3                        | Planned | Planned    | Planned | Planned | Planned |
+| SH band range-skipping                               | Yes     | Yes        | Planned | Planned | Planned |
+| Embedded audio (optional, zero-overhead when absent) | Yes     | Yes        | Planned | Planned | Planned |
+| Camera trajectory                                    | Yes     | Yes        | Planned | Planned | Planned |
+| Metadata                                             | Yes     | Yes        | Planned | Planned | Planned |
+| Attachments                                          | Yes     | Yes        | Planned | Planned | Planned |
+| Statistics                                           | Yes     | Yes        | Planned | Planned | Planned |
+| Unknown-record skipping                              | Yes     | Yes        | Planned | Planned | Planned |
+| Private-range records                                | Yes     | Yes        | Planned | Planned | Planned |
+| Encode                                               | Yes     | Planned    | Planned | Planned | Planned |
+| Chunked encode                                       | Yes     | Planned    | Planned | Planned | Planned |
+| Summary writing                                      | Yes     | Planned    | Planned | Planned | Planned |
+| Convert from PLY frame sequences                     | Yes     | No         | No      | No      | No      |
+| Inspect and validate                                 | Yes     | Planned    | Planned | Planned | Planned |
 
 ## Reading this table
 
@@ -90,9 +90,11 @@ asserts that two consecutive runs are byte-identical. Every variant is an encode
 summary-bearing ones are the flags that say so.
 
 **Convert from PLY frame sequences** and **Inspect and validate** are tools rather than wire-format
-features, so the conformance suite does not cover them. This table said they were marked from their
-own tests. They have none — not a partial suite, none — so they are `Untested` until they do. The
-code exists and may well be correct; that is not the same claim and this table does not make it.
+features, so the conformance suite does not cover them; they are marked from their own tests, which
+now exist. The converter's fixtures are PLY frames generated into a temporary directory from a fixed
+seed — the corpus rule applied to a different file format — and the validator is tested against
+files built byte by byte, because a validator tested only on files its own encoder wrote is a
+validator tested against nothing.
 
 **Rust** is a compiling stub today: the crate exists so the workspace and the release machinery are
 real, and its bodies are unimplemented. Python is the reference implementation until it lands.

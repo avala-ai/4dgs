@@ -50,6 +50,10 @@ class Scene:
     header: rec.Header
     gaussians: GaussianSet
     duration_sec: float
+    #: The grids and the error bounds the file declares. A consumer that wants to know
+    #: how wrong a value may be has to be able to reach them, and the bounds are the
+    #: producer's own statement about that.
+    quantization: rec.Quantization | None = None
     #: `None` when the scene has no soundtrack, which is the common case and not an error.
     audio: AudioTrack | None = None
     camera: CameraTrajectory | None = None
@@ -341,6 +345,7 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
         raise MalformedFile("file has no Header or no Quantization record")
 
     scene.header = header
+    scene.quantization = quant
     scene.duration_sec = header.duration_sec
     scene.skipped_opcodes = skipped
     scene.truncated = truncated
