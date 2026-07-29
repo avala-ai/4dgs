@@ -80,6 +80,11 @@ const config = {
             label: "Reference",
           },
           {
+            href: "https://avala.ai",
+            label: "An Avala project",
+            position: "right",
+          },
+          {
             href: repositoryUrl,
             label: "GitHub",
             position: "right",
@@ -114,7 +119,9 @@ const config = {
             ],
           },
         ],
-        copyright: "The 4dgs format specification and SDKs are licensed under Apache-2.0.",
+        copyright:
+          'An <a href="https://avala.ai" style="color: inherit">Avala</a> project. ' +
+          "The 4dgs format specification and SDKs are licensed under Apache-2.0.",
       },
       prism: {
         theme: themes.github,
