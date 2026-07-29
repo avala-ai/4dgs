@@ -65,6 +65,10 @@ pub struct Scene {
     /// carried none, which is the common case and not an error: absence costs nothing and
     /// no Header flag announces the family, so this is filled by the walk itself.
     pub provenance: crate::provenance::Provenance,
+    /// The object layer the file carried (spec section 5.15.6): the Object Table and the
+    /// SE(3) tracks. Empty when the file names no objects, which is the common case and not
+    /// an error, exactly as with provenance.
+    pub objects: crate::object_layer::ObjectLayer,
     pub statistics: Option<rec::Statistics>,
     pub chunk_index: Vec<rec::ChunkIndexEntry>,
     pub summary_offsets: Vec<rec::SummaryOffset>,
@@ -163,6 +167,8 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
                 | op::SENSOR_CALIBRATION
                 | op::RIG_TRAJECTORY
                 | op::GEODETIC_ANCHOR
+                | op::OBJECT_TABLE
+                | op::OBJECT_TRACK
                 | op::STATISTICS
                 | op::CHUNK_INDEX
                 | op::SUMMARY_OFFSET
@@ -294,6 +300,11 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
                 .provenance
                 .anchors
                 .push(rec::GeodeticAnchor::parse(&content)?),
+            op::OBJECT_TABLE => scene.objects.table = Some(rec::ObjectTable::parse(&content)?),
+            op::OBJECT_TRACK => scene
+                .objects
+                .tracks
+                .push(rec::ObjectTrack::parse(&content)?),
             op::STATISTICS => scene.statistics = Some(rec::Statistics::parse(&content)?),
             op::CHUNK_INDEX => scene
                 .chunk_index
@@ -351,6 +362,7 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
     // recovery contract is that everything complete before the cut still stands.
     if !truncated {
         scene.provenance.check()?;
+        scene.objects.check()?;
     }
 
     if !header.has_audio()
@@ -537,6 +549,7 @@ pub fn assemble(
     out.win_hi.reserve(total);
 
     let mut source_index: Option<Vec<i64>> = Some(Vec::with_capacity(total));
+    let mut object_id: Option<Vec<u32>> = Some(Vec::with_capacity(total));
     for chunk in chunks {
         out.positions.extend_from_slice(&chunk.positions);
         out.scales.extend_from_slice(&chunk.scales);
@@ -554,8 +567,13 @@ pub fn assemble(
             (Some(acc), Some(src)) => acc.extend_from_slice(src),
             _ => source_index = None,
         }
+        match (&mut object_id, &chunk.object_id) {
+            (Some(acc), Some(ids)) => acc.extend_from_slice(ids),
+            _ => object_id = None,
+        }
     }
     out.source_index = source_index.filter(|s| s.len() == total && total > 0);
+    out.object_id = object_id.filter(|s| s.len() == total && total > 0);
 
     if header.sh_degree > 0 {
         let counts: Vec<usize> = chunks.iter().map(|c| c.count).collect();

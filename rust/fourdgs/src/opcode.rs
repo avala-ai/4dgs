@@ -34,8 +34,15 @@ pub const SENSOR_CALIBRATION: u8 = 0x21;
 pub const RIG_TRAJECTORY: u8 = 0x22;
 pub const GEODETIC_ANCHOR: u8 = 0x23;
 
-/// First opcode of the provenance family, and one past its last. `0x24`-`0x2F` are
-/// reserved for source timing and the per-gaussian label work (spec section 5.15.6).
+// The object layer, spec section 5.15.6's per-gaussian label work realized. The Object
+// Table names the scene's objects; the SE(3) Track carries one object's rigid pose. Both
+// are advisory front matter in the provenance family's sense — a reader that skips them
+// decodes a valid base scene — and took the next two free numbers after the georeference.
+pub const OBJECT_TABLE: u8 = 0x24;
+pub const OBJECT_TRACK: u8 = 0x25;
+
+/// First opcode of the provenance family, and one past its last. `0x26`-`0x2F` are
+/// reserved for source timing (spec section 5.15.6).
 pub const PROVENANCE_START: u8 = 0x20;
 pub const PROVENANCE_END: u8 = 0x30;
 
@@ -76,6 +83,8 @@ pub fn name(opcode: u8) -> String {
         SENSOR_CALIBRATION => "SensorCalibration",
         RIG_TRAJECTORY => "RigTrajectory",
         GEODETIC_ANCHOR => "GeodeticAnchor",
+        OBJECT_TABLE => "ObjectTable",
+        OBJECT_TRACK => "ObjectTrack",
         _ => {
             return if is_private(opcode) {
                 format!("Private(0x{opcode:02X})")
@@ -101,6 +110,11 @@ pub const A_FLAGS: u8 = 9;
 pub const A_WINDOW_INDEX: u8 = 10;
 pub const A_SOURCE_GROUP: u8 = 11;
 pub const A_SOURCE_INDEX: u8 = 12;
+
+/// Object membership (spec section 5.15.6). A `u32`, `0` = background/unassigned. Exact:
+/// an id is a label, not a metric, so it is never dequantized and the Quantization record
+/// carries no step or bound for it, as with the other index attributes.
+pub const A_OBJECT_ID: u8 = 14;
 
 /// Ids every chunk must carry.
 pub const REQUIRED_ATTRIBUTES: [u8; 11] = [

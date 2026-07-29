@@ -31,6 +31,9 @@ pub struct DecodedChunk {
     pub sigma_t: Vec<f32>,
     pub window_index: Vec<u32>,
     pub source_index: Option<Vec<i64>>,
+    /// Per-gaussian object membership, or `None` when the chunk carries no `object_id`
+    /// stream. Exact: the stored bins are the ids, used as read, never dequantized.
+    pub object_id: Option<Vec<u32>>,
     /// Band number to its decoded coefficients, populated only for the bands a caller
     /// asked for.
     pub bands: BTreeMap<u8, DecodedStream>,
@@ -226,6 +229,9 @@ pub fn decode_streams(
 
     if let Some(src) = got.get(&op::A_SOURCE_INDEX) {
         out.source_index = Some((0..count).map(|i| src.get(i, 0)).collect());
+    }
+    if let Some(ids) = got.get(&op::A_OBJECT_ID) {
+        out.object_id = Some((0..count).map(|i| ids.get(i, 0) as u32).collect());
     }
 
     Ok(out)

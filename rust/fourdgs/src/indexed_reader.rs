@@ -531,10 +531,11 @@ pub fn read_attachments<R: Readable + ?Sized>(
 /// Opening a file frames these and stops, so a scene with a long rig trajectory costs the
 /// same to open as one with none. This is where a caller says it wants them.
 ///
-/// A reserved opcode in the family — `0x24`-`0x2F`, which no version-1 writer emits — is
-/// framed by the walk and skipped here. That is the forward-compatibility rule doing its
-/// job inside a family rather than across the whole opcode space, and it is why the ranges
-/// carry their opcode: skipping requires knowing what was skipped.
+/// The object-layer records (`0x24`, `0x25`) are in the same opcode family and framed by
+/// the same walk, but they belong to the object layer rather than provenance, so they are
+/// skipped here and read by [`read_objects`]. A still-reserved opcode (`0x26`-`0x2F`, which
+/// no version-1 writer emits) is framed and skipped by both — the forward-compatibility
+/// rule doing its job inside a family, and why the ranges carry their opcode.
 pub fn read_provenance<R: Readable + ?Sized>(
     source: &mut R,
     scene: &IndexedScene,
@@ -548,6 +549,32 @@ pub fn read_provenance<R: Readable + ?Sized>(
             op::SENSOR_CALIBRATION => out.sensors.push(rec::SensorCalibration::parse(content)?),
             op::RIG_TRAJECTORY => out.trajectories.push(rec::RigTrajectory::parse(content)?),
             op::GEODETIC_ANCHOR => out.anchors.push(rec::GeodeticAnchor::parse(content)?),
+            _ => {}
+        }
+    }
+    out.check()?;
+    Ok(out)
+}
+
+/// The object layer — the Object Table and the SE(3) tracks — fetched by range.
+///
+/// Framed by the same front-matter walk as provenance (both families share the opcode
+/// range) and read only when a caller asks. A file that names no objects returns an empty
+/// layer, which is a value and not an error.
+pub fn read_objects<R: Readable + ?Sized>(
+    source: &mut R,
+    scene: &IndexedScene,
+) -> Result<crate::object_layer::ObjectLayer> {
+    let mut out = crate::object_layer::ObjectLayer::default();
+    for (opcode, offset, length) in &scene.provenance_ranges {
+        if *opcode != op::OBJECT_TABLE && *opcode != op::OBJECT_TRACK {
+            continue;
+        }
+        let blob = source.read(*offset, *length)?;
+        let content = record_content(&blob, *opcode)?;
+        match *opcode {
+            op::OBJECT_TABLE => out.table = Some(rec::ObjectTable::parse(content)?),
+            op::OBJECT_TRACK => out.tracks.push(rec::ObjectTrack::parse(content)?),
             _ => {}
         }
     }

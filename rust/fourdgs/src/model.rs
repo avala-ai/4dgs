@@ -221,6 +221,10 @@ pub struct GaussianSet {
     pub sh_coefficients: usize,
     pub sh_degree: u8,
     pub source_index: Option<Vec<i64>>,
+    /// Per-gaussian object membership (spec section 5.15.6), or `None` when the file
+    /// carries no `object_id` stream. Exact integers, `0` = background/unassigned; the
+    /// object layer's tracks transform the gaussians of a given id (see [`crate::object_layer`]).
+    pub object_id: Option<Vec<u32>>,
 }
 
 /// Reconstructed state at one instant: which gaussians exist, where they are, and how
