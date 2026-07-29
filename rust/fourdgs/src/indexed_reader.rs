@@ -274,6 +274,7 @@ pub fn open_indexed<R: Readable + ?Sized>(source: &mut R) -> Result<IndexedScene
     let mut source_ranges: BTreeMap<u32, (u64, u64)> = BTreeMap::new();
     let mut data_ranges: BTreeMap<u32, (u64, u64)> = BTreeMap::new();
     let mut legacy_audio: Option<IndexedAudioSource> = None;
+    let mut object_track_offsets = HashMap::new();
     {
         let mut front = FrontMatter::new(source, size);
         crate::serialization::check_magic(&front.head(MAGIC.len() as u64)?)?;
@@ -369,6 +370,16 @@ pub fn open_indexed<R: Readable + ?Sized>(source: &mut R) -> Result<IndexedScene
                     let object_id = header.u32()?;
                     let interpolation = header.u8()?;
                     let sample_count = header.u32()?;
+                    if let Some(first_offset) =
+                        object_track_offsets.insert(object_id, record.offset)
+                    {
+                        return Err(Error::Malformed(format!(
+                            "ObjectTrack for object {object_id} at byte {} duplicates the track at \
+                             byte {first_offset}; expected at most one track per object (section \
+                             5.15.6)",
+                            record.offset
+                        )));
+                    }
                     let sample_bytes = u64::from(sample_count)
                         .checked_mul(OBJECT_TRACK_SAMPLE_BYTES)
                         .and_then(|bytes| bytes.checked_add(OBJECT_TRACK_HEADER_BYTES))
@@ -679,17 +690,17 @@ pub fn read_object_poses<R: Readable + ?Sized>(
     t: f64,
 ) -> Result<HashMap<u32, crate::provenance::Pose>> {
     let mut out = HashMap::with_capacity(object_ids.len().min(scene.object_track_ranges.len()));
-    let mut seen = HashSet::with_capacity(out.capacity());
+    let mut seen = HashMap::with_capacity(scene.object_track_ranges.len());
     for range in &scene.object_track_ranges {
+        if let Some(first_offset) = seen.insert(range.object_id, range.record_offset) {
+            return Err(Error::Malformed(format!(
+                "ObjectTrack for object {} at byte {} duplicates the track at byte \
+                 {first_offset}; expected at most one track per object (section 5.15.6)",
+                range.object_id, range.record_offset
+            )));
+        }
         if !object_ids.contains(&range.object_id) {
             continue;
-        }
-        if !seen.insert(range.object_id) {
-            return Err(Error::Malformed(format!(
-                "two ObjectTrack records move object {}; a gaussian has one object and cannot \
-                 be transported by two poses (section 5.15.6)",
-                range.object_id
-            )));
         }
         let Some(pose) = sample_object_track(source, range, t)? else {
             continue;

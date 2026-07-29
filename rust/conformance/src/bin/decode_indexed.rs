@@ -12,7 +12,8 @@ use std::collections::BTreeMap;
 use std::process::ExitCode;
 
 use fourdgs::indexed_reader::{
-    open_indexed, read_attachments, read_audio_sources, read_camera, read_chunk, IndexedScene,
+    open_indexed, read_attachments, read_audio_sources, read_camera, read_chunk, read_objects,
+    IndexedScene,
 };
 use fourdgs::readable::{FileReadable, Readable};
 use fourdgs::records::ChunkIndexEntry;
@@ -74,6 +75,7 @@ fn run(path: &str) -> Result<String, String> {
     // have, and the reason no Header flag announces the family.
     let provenance =
         fourdgs::indexed_reader::read_provenance(&mut source, &scene).map_err(|e| e.to_string())?;
+    let objects = read_objects(&mut source, &scene).map_err(|e| e.to_string())?;
     check_band_skipping(&mut source, &scene)?;
 
     let bands: Vec<BTreeMap<u8, fourdgs::stream::DecodedStream>> =
@@ -96,6 +98,7 @@ fn run(path: &str) -> Result<String, String> {
             summary_offsets: &scene.summary_offsets,
             summary_crc_ok: scene.summary_crc_ok,
             provenance: Some(&provenance),
+            objects: Some(&objects),
         },
     )
     .map_err(|e| e.to_string())

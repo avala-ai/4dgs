@@ -17,7 +17,8 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use fourdgs::model::{AudioSource, GaussianSet};
-use fourdgs::provenance::{pose_at, Pose, Provenance};
+use fourdgs::object_layer::ObjectLayer;
+use fourdgs::provenance::{pose_at, Pose, PoseSampled, Provenance};
 use fourdgs::records::{
     Attachment, Camera, Header, Metadata, RigTrajectory, Statistics, SummaryOffset,
 };
@@ -151,6 +152,7 @@ pub struct Extras<'a> {
     pub summary_offsets: &'a [SummaryOffset],
     pub summary_crc_ok: Option<bool>,
     pub provenance: Option<&'a Provenance>,
+    pub objects: Option<&'a ObjectLayer>,
 }
 
 /// The statement every implementation must agree on for a variant.
@@ -193,6 +195,24 @@ pub fn summarize(
         if speed == 0.0 {
             still += 1;
         }
+    }
+
+    let mut sample_pairs = vec![
+        ("positions", rows(&gaussians.positions, 3)),
+        ("scales", rows(&gaussians.scales, 3)),
+        ("rotations", rows(&gaussians.rotations, 4)),
+        ("colors", rows(&gaussians.colors, 4)),
+        ("motions", rows(&gaussians.motions, 3)),
+        ("muT", scalars(&gaussians.mu_t)),
+        ("sigmaT", scalars(&gaussians.sigma_t)),
+        ("winLo", scalars(&gaussians.win_lo)),
+        ("winHi", scalars(&gaussians.win_hi)),
+    ];
+    if let Some(object_ids) = &gaussians.object_id {
+        sample_pairs.push((
+            "objectIds",
+            J::Arr(sample.iter().map(|i| int(object_ids[*i] as u64)).collect()),
+        ));
     }
 
     let mut pairs: Vec<(&str, J)> = vec![
@@ -301,20 +321,7 @@ pub fn summarize(
             },
         ),
         ("sh", spherical_harmonics(gaussians, &order)),
-        (
-            "sample",
-            J::obj(vec![
-                ("positions", rows(&gaussians.positions, 3)),
-                ("scales", rows(&gaussians.scales, 3)),
-                ("rotations", rows(&gaussians.rotations, 4)),
-                ("colors", rows(&gaussians.colors, 4)),
-                ("motions", rows(&gaussians.motions, 3)),
-                ("muT", scalars(&gaussians.mu_t)),
-                ("sigmaT", scalars(&gaussians.sigma_t)),
-                ("winLo", scalars(&gaussians.win_lo)),
-                ("winHi", scalars(&gaussians.win_hi)),
-            ]),
-        ),
+        ("sample", J::obj(sample_pairs)),
         (
             "aggregate",
             J::obj(vec![
@@ -342,7 +349,243 @@ pub fn summarize(
         }
     }
 
+    let empty_objects = ObjectLayer::default();
+    let objects = extras.objects.unwrap_or(&empty_objects);
+    if !objects.is_empty() || gaussians.object_id.is_some() {
+        let (object_summary, states) = objects_and_states(header, gaussians, objects, &order)?;
+        pairs.push(("objects", object_summary));
+        pairs.push(("states", states));
+    }
+
     Ok(J::obj(pairs).to_json())
+}
+
+/// Object records and post-track state at three canonical probes.
+fn objects_and_states(
+    header: &Header,
+    gaussians: &GaussianSet,
+    layer: &ObjectLayer,
+    order: &[usize],
+) -> Result<(J, J)> {
+    let mut tracks = Vec::with_capacity(layer.tracks.len());
+    for track in &layer.tracks {
+        let mut poses = Vec::new();
+        for probe in probe_times(track) {
+            poses.push(pose_row(probe, pose_at(track, probe)?.as_ref(), None));
+        }
+        tracks.push(J::obj(vec![
+            ("objectId", int(track.object_id as u64)),
+            ("interpolation", J::Num(track.interpolation as f64)),
+            ("sampleCount", int(track.sample_count() as u64)),
+            ("posesAt", J::Arr(poses)),
+        ]));
+    }
+
+    let mut entries = Vec::new();
+    let embedding_dim = match &layer.table {
+        None => 0,
+        Some(table) => {
+            entries.reserve(table.entries.len());
+            for entry in &table.entries {
+                let embedding_crc = match &entry.embedding {
+                    None => J::Null,
+                    Some(embedding) => {
+                        let mut bytes =
+                            Vec::with_capacity(embedding.len() * std::mem::size_of::<f32>());
+                        for value in embedding {
+                            bytes.extend_from_slice(&value.to_le_bytes());
+                        }
+                        crc(&bytes)
+                    }
+                };
+                entries.push(J::obj(vec![
+                    ("objectId", int(entry.object_id as u64)),
+                    ("label", J::Str(entry.label.clone())),
+                    (
+                        "anchor",
+                        J::Arr(entry.anchor.iter().map(|value| numf(*value)).collect()),
+                    ),
+                    ("hasDynamics", J::Bool(entry.dynamics.is_some())),
+                    ("hasEmbedding", J::Bool(entry.embedding.is_some())),
+                    ("embeddingCrc", embedding_crc),
+                ]));
+            }
+            table.embedding_dim
+        }
+    };
+    let objects = J::obj(vec![
+        ("embeddingDim", J::Num(embedding_dim as f64)),
+        ("table", J::Arr(entries)),
+        ("tracks", J::Arr(tracks)),
+    ]);
+
+    let duration = header.duration_sec.max(0.0);
+    let state_times = [0.0, 0.5 * duration, (duration - 1e-6).max(0.0)];
+    let mut states = Vec::with_capacity(state_times.len());
+    for t in state_times {
+        let state = canonical_object_state_at(gaussians, layer, t, header.cutoff)?;
+
+        let mut row_for_index = vec![None; gaussians.count()];
+        for (row, index) in state.indices.iter().enumerate() {
+            row_for_index[*index] = Some(row);
+        }
+        let sample_rows: Vec<usize> = order
+            .iter()
+            .filter_map(|index| row_for_index[*index])
+            .take(SAMPLE)
+            .collect();
+        let rows = |values: &[f64], width: usize| {
+            J::Arr(
+                sample_rows
+                    .iter()
+                    .map(|row| {
+                        J::Arr(
+                            (0..width)
+                                .map(|axis| num(values[row * width + axis]))
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        let position_sum = (0..3)
+            .map(|axis| {
+                num((0..state.indices.len())
+                    .map(|row| state.centers[row * 3 + axis])
+                    .sum())
+            })
+            .collect();
+        let opacity_sum = state.opacity.iter().sum();
+        states.push(J::obj(vec![
+            ("t", num(t)),
+            ("liveCount", int(state.indices.len() as u64)),
+            (
+                "sample",
+                J::obj(vec![
+                    ("positions", rows(&state.centers, 3)),
+                    ("orientations", rows(&state.orientations, 4)),
+                    (
+                        "objectIds",
+                        J::Arr(
+                            sample_rows
+                                .iter()
+                                .map(|row| int(state.object_ids[*row] as u64))
+                                .collect(),
+                        ),
+                    ),
+                ]),
+            ),
+            (
+                "aggregate",
+                J::obj(vec![
+                    ("positionSum", J::Arr(position_sum)),
+                    ("opacitySum", num(opacity_sum)),
+                ]),
+            ),
+        ]));
+    }
+
+    Ok((objects, J::Arr(states)))
+}
+
+struct CanonicalObjectState {
+    indices: Vec<usize>,
+    centers: Vec<f64>,
+    orientations: Vec<f64>,
+    opacity: Vec<f64>,
+    object_ids: Vec<u32>,
+}
+
+/// Reconstruct in f64 for the canonical six-decimal comparison. Production state arrays
+/// are f32; widening decoded fields first matches the Python reference and keeps the
+/// comparison independent of an SDK's output storage type.
+fn canonical_object_state_at(
+    gaussians: &GaussianSet,
+    layer: &ObjectLayer,
+    t: f64,
+    cutoff: f64,
+) -> Result<CanonicalObjectState> {
+    let mut state = CanonicalObjectState {
+        indices: Vec::new(),
+        centers: Vec::new(),
+        orientations: Vec::new(),
+        opacity: Vec::new(),
+        object_ids: Vec::new(),
+    };
+    for i in 0..gaussians.count() {
+        if !(gaussians.win_lo[i] as f64 <= t && t < gaussians.win_hi[i] as f64) {
+            continue;
+        }
+        let mu = gaussians.mu_t[i] as f64;
+        let sigma = gaussians.sigma_t[i] as f64;
+        let marginal = if sigma.is_finite() {
+            let z = (t - mu) / sigma.max(1e-30);
+            (-0.5 * z * z).exp()
+        } else {
+            1.0
+        };
+        if marginal < cutoff {
+            continue;
+        }
+        state.indices.push(i);
+        for axis in 0..3 {
+            state.centers.push(
+                gaussians.positions[i * 3 + axis] as f64
+                    + gaussians.motions[i * 3 + axis] as f64 * (t - mu),
+            );
+        }
+        state.orientations.extend(
+            gaussians.rotations[i * 4..i * 4 + 4]
+                .iter()
+                .map(|value| *value as f64),
+        );
+        state
+            .opacity
+            .push(gaussians.colors[i * 4 + 3] as f64 * marginal);
+        state
+            .object_ids
+            .push(gaussians.object_id.as_ref().map_or(0, |ids| ids[i]));
+    }
+
+    let referenced: std::collections::HashSet<u32> = state
+        .object_ids
+        .iter()
+        .copied()
+        .filter(|id| *id != 0)
+        .collect();
+    let mut poses = BTreeMap::new();
+    for track in &layer.tracks {
+        if referenced.contains(&track.object_id) {
+            if let Some(pose) = pose_at(track, t)? {
+                poses.insert(track.object_id, pose);
+            }
+        }
+    }
+    for (row, object_id) in state.object_ids.iter().enumerate() {
+        let Some(pose) = poses.get(object_id) else {
+            continue;
+        };
+        let center = [
+            state.centers[row * 3],
+            state.centers[row * 3 + 1],
+            state.centers[row * 3 + 2],
+        ];
+        let moved = pose.apply(center);
+        state.centers[row * 3..row * 3 + 3].copy_from_slice(&moved);
+
+        let [ax, ay, az, aw] = pose.rotation;
+        let bx = state.orientations[row * 4];
+        let by = state.orientations[row * 4 + 1];
+        let bz = state.orientations[row * 4 + 2];
+        let bw = state.orientations[row * 4 + 3];
+        state.orientations[row * 4..row * 4 + 4].copy_from_slice(&[
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz,
+        ]);
+    }
+    Ok(state)
 }
 
 /// Every readable provenance field, plus the arithmetic the fields imply.
@@ -491,12 +734,12 @@ fn provenance(prov: &Provenance) -> Result<J> {
 ///
 /// Two of the five are outside the sample range on purpose: clamping is a rule, and a rule
 /// no expectation exercises is a rule an implementation can decline to have.
-fn probe_times(trajectory: &RigTrajectory) -> Vec<f64> {
+fn probe_times<T: PoseSampled + ?Sized>(trajectory: &T) -> Vec<f64> {
     if trajectory.sample_count() == 0 {
         return Vec::new();
     }
-    let first = trajectory.times[0];
-    let last = trajectory.times[trajectory.sample_count() - 1];
+    let first = trajectory.time(0);
+    let last = trajectory.time(trajectory.sample_count() - 1);
     vec![first - 0.5, first, 0.5 * (first + last), last, last + 0.5]
 }
 
@@ -693,6 +936,9 @@ pub fn stable_order(gaussians: &GaussianSet) -> Vec<usize> {
             for k in 0..sh_width {
                 row.push(sh[i * sh_width + k] as f64);
             }
+        }
+        if let Some(object_ids) = &gaussians.object_id {
+            row.push(object_ids[i] as f64);
         }
         keys.push((row, i));
     }

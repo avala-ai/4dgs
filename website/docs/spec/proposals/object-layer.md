@@ -874,5 +874,4 @@ The sequence is now an audit trail:
 3. The Python reference implements streamed and indexed decode, encode, and reconstruction.
 4. The public corpus carries membership, a table, an embedding, a moving track, and post-transform
    states on both read paths.
-5. The feature matrix marks only Python `Yes`; Rust moves only after its runner passes the same
-   variant.
+5. Python and Rust are marked `Yes` only after both of their runners pass the same public variant.

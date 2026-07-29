@@ -1,14 +1,7 @@
 // Copyright 2026 Avala AI
 // SPDX-License-Identifier: Apache-2.0
 
-//! The object layer: the two records round-trip, and a track composes onto base state.
-//!
-//! The test that earns its keep is `track_composes_onto_base_center`. It checks the claim
-//! the layer rests on — that a track transforms the base state rather than replacing it —
-//! and the record round-trips prove the wire format. The `object_id` stream through a full
-//! chunk decode is covered here across the full u32 range and cross-implementation by
-//! the conformance corpus (Python writes, Rust decodes), which is where an end-to-end
-//! object file is exercised.
+//! Object record round trips, base-then-track state, full-u32 membership, and indexed I/O.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -172,6 +165,12 @@ fn object_file_with_track(indexed: bool, duplicate_table: bool, track: ObjectTra
 type ByteRange = (u64, u64);
 
 fn object_file_with_unrelated_ranges() -> (Vec<u8>, ByteRange, ByteRange, ByteRange) {
+    object_file_with_unrelated_ranges_and_duplicate(false)
+}
+
+fn object_file_with_unrelated_ranges_and_duplicate(
+    duplicate_unrelated_track: bool,
+) -> (Vec<u8>, ByteRange, ByteRange, ByteRange) {
     let mut out = MAGIC.to_vec();
     out.extend(
         Header {
@@ -235,7 +234,10 @@ fn object_file_with_unrelated_ranges() -> (Vec<u8>, ByteRange, ByteRange, ByteRa
     .encode(b"")
     .unwrap();
     let track8_range = (out.len() as u64, track8.len() as u64);
-    out.extend(track8);
+    out.extend(&track8);
+    if duplicate_unrelated_track {
+        out.extend(&track8);
+    }
     // A future registry value on an unrelated track must not affect object 7's instant.
     out[track8_range.0 as usize + 9 + 4] = 2;
 
@@ -656,6 +658,22 @@ fn indexed_state_range_samples_and_caches_only_referenced_object_poses() {
     assert!(
         reads.borrow().is_empty(),
         "the gaussian chunk and object track are cached"
+    );
+}
+
+#[test]
+fn indexed_open_rejects_duplicate_unrelated_tracks_from_bounded_prefixes() {
+    let (bytes, _, _, track_range) = object_file_with_unrelated_ranges_and_duplicate(true);
+    let err = match SceneReader::open_with(BytesReadable::new(&bytes), OpenMode::Indexed) {
+        Ok(_) => panic!("indexed opening accepted duplicate ObjectTrack records"),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    assert!(message.contains("object 8"), "{message}");
+    assert!(message.contains("duplicates"), "{message}");
+    assert!(
+        message.contains(&format!("byte {}", track_range.0)),
+        "{message}"
     );
 }
 
