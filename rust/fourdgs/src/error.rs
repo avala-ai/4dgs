@@ -24,6 +24,18 @@ pub enum Error {
     Malformed(String),
     /// A legal but unimplemented codec. The file is fine; this build cannot read it.
     UnsupportedCodec(String),
+    /// A well-known value this reader does not implement — a temporal model, a
+    /// quantization scheme. The file is fine and conforming; this build cannot read it,
+    /// and the registry requires it to say so by name rather than guess.
+    ///
+    /// Its `Display` is the message alone, where every other variant prefixes its kind.
+    /// The wording is contract: the specification's refusal table writes the sentence so
+    /// that two readers refusing one file say the same thing about it, and the CLI
+    /// cross-validator compares it against the Python reader's line for line. An
+    /// `"unsupported codec: "` in front of it would be wrong twice — a temporal model is
+    /// neither a codec nor a version — and would put this crate's taxonomy ahead of the
+    /// specification's sentence.
+    UnsupportedModel(String),
     /// An encoder's own verification failed: a decoded value fell outside the bound the
     /// file was about to declare. Always a bug in the encoder, never in the input.
     BoundViolation(String),
@@ -47,6 +59,7 @@ impl fmt::Display for Error {
             Error::Truncated(m) => write!(f, "truncated: {m}"),
             Error::Malformed(m) => write!(f, "malformed: {m}"),
             Error::UnsupportedCodec(m) => write!(f, "unsupported codec: {m}"),
+            Error::UnsupportedModel(m) => write!(f, "{m}"),
             Error::BoundViolation(m) => write!(f, "bound violation: {m}"),
             Error::UnsupportedOperation(m) => write!(f, "unsupported operation: {m}"),
             Error::InvalidInput(m) => write!(f, "invalid input: {m}"),

@@ -216,10 +216,22 @@ pub fn check_magic(head: &[u8]) -> Result<()> {
     if head[..MAGIC.len()] == MAGIC {
         return Ok(());
     }
-    if head[1..5] == *b"4DGS" {
+    // Two different failures, and the fix differs: a newer reader, or a different file.
+    // They are told apart by whether the version byte is the ONLY difference — every
+    // other byte of the magic is a fixed sentinel, so a file that differs elsewhere is not
+    // a 4dgs file whatever its version byte happens to say.
+    //
+    // Testing only `head[1..5] == b"4DGS"` reported a corrupt first byte as an unsupported
+    // version 1, which sends its holder looking for a newer reader that would not have
+    // helped. The Python reader had the same bug, found the same way: by a corpus of files
+    // that must be refused, comparing what the two say about them.
+    const VERSION_AT: usize = 5;
+    let elsewhere = head[..VERSION_AT] != MAGIC[..VERSION_AT]
+        || head[VERSION_AT + 1..MAGIC.len()] != MAGIC[VERSION_AT + 1..];
+    if !elsewhere {
         return Err(Error::UnsupportedVersion(format!(
             "4dgs major version {:?} is not supported by this reader",
-            head[5] as char
+            head[VERSION_AT] as char
         )));
     }
     Err(Error::UnsupportedVersion(

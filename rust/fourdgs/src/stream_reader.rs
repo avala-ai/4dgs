@@ -191,8 +191,16 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
         }
 
         match opcode {
-            op::HEADER => header = Some(rec::Header::parse(&content)?),
-            op::QUANTIZATION => quant = Some(rec::Quantization::parse(&content)?),
+            op::HEADER => {
+                let parsed = rec::Header::parse(&content)?;
+                crate::registry::check_temporal_model(&parsed.temporal_model)?;
+                header = Some(parsed);
+            }
+            op::QUANTIZATION => {
+                let parsed = rec::Quantization::parse(&content)?;
+                crate::registry::check_quantization_scheme(&parsed.scheme)?;
+                quant = Some(parsed);
+            }
             op::WINDOW_TABLE => scene.windows = rec::WindowTable::parse(&content)?.windows,
             op::CHUNK => {
                 let quantization = quant.as_ref().ok_or_else(|| {

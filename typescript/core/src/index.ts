@@ -93,6 +93,12 @@ export {
   parseWindowTable,
   readRecord,
 } from "./records.js";
+export {
+  checkQuantizationScheme,
+  checkTemporalModel,
+  KNOWN_QUANTIZATION_SCHEMES,
+  KNOWN_TEMPORAL_MODELS,
+} from "./registry.js";
 
 export {
   MAX_STREAM_BYTES,

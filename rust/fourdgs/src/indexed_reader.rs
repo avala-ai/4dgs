@@ -248,9 +248,15 @@ pub fn open_indexed<R: Readable + ?Sized>(source: &mut R) -> Result<IndexedScene
                 break;
             }
             match record.opcode {
-                op::HEADER => header = Some(rec::Header::parse(&front.content(&record, None)?)?),
+                op::HEADER => {
+                    let parsed = rec::Header::parse(&front.content(&record, None)?)?;
+                    crate::registry::check_temporal_model(&parsed.temporal_model)?;
+                    header = Some(parsed)
+                }
                 op::QUANTIZATION => {
-                    quant = Some(rec::Quantization::parse(&front.content(&record, None)?)?)
+                    let parsed = rec::Quantization::parse(&front.content(&record, None)?)?;
+                    crate::registry::check_quantization_scheme(&parsed.scheme)?;
+                    quant = Some(parsed)
                 }
                 op::WINDOW_TABLE => {
                     scene.windows = rec::WindowTable::parse(&front.content(&record, None)?)?.windows

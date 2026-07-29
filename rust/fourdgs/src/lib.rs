@@ -46,6 +46,7 @@ pub mod quantization;
 pub mod readable;
 pub mod reader;
 pub mod records;
+pub mod registry;
 pub mod serialization;
 pub mod sh;
 pub mod stream;

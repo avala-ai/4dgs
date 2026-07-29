@@ -83,6 +83,23 @@ decoded as though they were the known value, silently, into a scene that looks e
 And a file whose first byte was corrupt was reported as an unsupported _version 1_ — an error that
 sends its holder looking for a newer reader that would have refused it too.
 
+### Two gaps the invalid corpus has surfaced but does not yet close
+
+Recorded here because a gap nobody wrote down is indistinguishable from coverage.
+
+**The validators do not decode streams.** `validate` walks the framing and opens the file the way a
+seeking client would; it never decodes a chunk's attribute streams. So neither the Rust nor the
+Python validator reports anything about `UnknownStreamCodec.4dgs`, whose only fault is a codec byte
+inside a stream. The _decoders_ refuse it — the conformance runners prove that — so this is a
+thinness in the validators rather than a hole in the readers, and the cross-validator test exempts
+that class explicitly rather than passing over it silently.
+
+**The two languages word the magic and version refusals differently.** Rust prefixes its error kind
+(`unsupported version: not a 4dgs file (bad magic)`) where Python does not, and Python spells a byte
+`b'2'` where Rust spells it `'2'`. The temporal-model and quantization-scheme refusals are compared
+line for line because the specification writes those sentences; the magic and version ones are not,
+yet. Closing it means changing messages in both languages, which is its own change.
+
 ### Truncation is not in here
 
 A cut file is recoverable, not refusable: records are length-prefixed and a reader should salvage
