@@ -783,10 +783,11 @@ fn sample_object_track<R: Readable + ?Sized>(
             range.object_id
         )));
     }
-    let u = interpolation_fraction(t, a.time, b.time);
+    let u = crate::provenance::interpolation_fraction(t, a.time, b.time);
     let mut translation = [0.0; 3];
     for (axis, value) in translation.iter_mut().enumerate() {
-        *value = finite_lerp(a.pose.translation[axis], b.pose.translation[axis], u);
+        *value =
+            crate::provenance::finite_lerp(a.pose.translation[axis], b.pose.translation[axis], u);
     }
     Ok(Some(crate::provenance::Pose {
         rotation: crate::provenance::slerp(a.pose.rotation, b.pose.rotation, u)?,
@@ -897,23 +898,6 @@ fn object_sample_offset(range: &ObjectTrackRange, sample: usize) -> Result<u64> 
                 range.object_id
             ))
         })
-}
-
-fn interpolation_fraction(t: f64, a: f64, b: f64) -> f64 {
-    let span = b - a;
-    if span.is_finite() {
-        return (t - a) / span;
-    }
-    let scale = a.abs().max(b.abs());
-    ((t / scale) - (a / scale)) / ((b / scale) - (a / scale))
-}
-
-fn finite_lerp(a: f64, b: f64, u: f64) -> f64 {
-    if (a < 0.0) == (b < 0.0) {
-        a + u * (b - a)
-    } else {
-        (1.0 - u) * a + u * b
-    }
 }
 
 /// The embedded track, fetched independently of any gaussian data.

@@ -173,6 +173,29 @@ fn sample<T: PoseSampled + ?Sized>(track: &T, i: usize) -> Result<Pose> {
     })
 }
 
+/// The normalized position of `t` between finite, strictly increasing `a` and `b`.
+///
+/// Scaling is necessary when the mathematical span is finite but cannot be represented
+/// as an `f64`, for example `-1e308..1e308`. Keeping this next to [`pose_at`] also gives
+/// materialized and range-sampled tracks one interpolation formula.
+pub(crate) fn interpolation_fraction(t: f64, a: f64, b: f64) -> f64 {
+    let span = b - a;
+    if span.is_finite() {
+        return (t - a) / span;
+    }
+    let scale = a.abs().max(b.abs());
+    ((t / scale) - (a / scale)) / ((b / scale) - (a / scale))
+}
+
+/// Interpolate two finite values without overflowing their difference across zero.
+pub(crate) fn finite_lerp(a: f64, b: f64, u: f64) -> f64 {
+    if (a < 0.0) == (b < 0.0) {
+        a + u * (b - a)
+    } else {
+        (1.0 - u) * a + u * b
+    }
+}
+
 /// The pose at scene time `t`, or `None` when the record has no samples.
 ///
 /// Outside the sample range the pose is **clamped**, never extrapolated: before the first
@@ -216,12 +239,12 @@ pub fn pose_at<T: PoseSampled + ?Sized>(track: &T, t: f64) -> Result<Option<Pose
         )));
     }
 
-    let u = (t - track.time(lo)) / (track.time(lo + 1) - track.time(lo));
+    let u = interpolation_fraction(t, track.time(lo), track.time(lo + 1));
     let a = sample(track, lo)?;
     let b = sample(track, lo + 1)?;
     let mut translation = [0.0; 3];
     for (i, slot) in translation.iter_mut().enumerate() {
-        *slot = a.translation[i] + u * (b.translation[i] - a.translation[i]);
+        *slot = finite_lerp(a.translation[i], b.translation[i], u);
     }
     Ok(Some(Pose {
         rotation: slerp(a.rotation, b.rotation, u)?,

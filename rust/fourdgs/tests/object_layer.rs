@@ -87,6 +87,20 @@ fn streams_with_object_id(values: &[i64], channels: usize) -> Vec<u8> {
 }
 
 fn object_file(indexed: bool, duplicate_table: bool) -> Vec<u8> {
+    object_file_with_track(
+        indexed,
+        duplicate_table,
+        ObjectTrack {
+            object_id: 7,
+            interpolation: TRAJECTORY_LINEAR,
+            times: vec![0.0, 1.0],
+            rotations: vec![Q_Z90, Q_Z90],
+            translations: vec![[10.0, 0.0, 0.0], [10.0, 0.0, 0.0]],
+        },
+    )
+}
+
+fn object_file_with_track(indexed: bool, duplicate_table: bool, track: ObjectTrack) -> Vec<u8> {
     let mut out = MAGIC.to_vec();
     out.extend(
         Header {
@@ -120,17 +134,7 @@ fn object_file(indexed: bool, duplicate_table: bool) -> Vec<u8> {
     if duplicate_table {
         out.extend(&table);
     }
-    out.extend(
-        ObjectTrack {
-            object_id: 7,
-            interpolation: TRAJECTORY_LINEAR,
-            times: vec![0.0, 1.0],
-            rotations: vec![Q_Z90, Q_Z90],
-            translations: vec![[10.0, 0.0, 0.0], [10.0, 0.0, 0.0]],
-        }
-        .encode(b"")
-        .unwrap(),
-    );
+    out.extend(track.encode(b"").unwrap());
 
     let chunk_at = out.len() as u64;
     let chunk = fourdgs::records::encode_chunk(0.0, 1.0, 0, 1, &streams_with_object_id(&[7], 1));
@@ -569,6 +573,36 @@ fn scene_reader_composes_authoritative_object_motion_on_both_paths() {
         }
         assert_eq!(reader.provenance_count(), 0);
         assert_eq!(reader.objects().unwrap().tracks.len(), 1);
+    }
+}
+
+#[test]
+fn extreme_track_times_reconstruct_identically_across_read_modes_and_call_order() {
+    let track = ObjectTrack {
+        object_id: 7,
+        interpolation: TRAJECTORY_LINEAR,
+        times: vec![-1e308, 1e308],
+        rotations: vec![Q_ID, Q_ID],
+        translations: vec![[0.0, 0.0, 0.0], [20.0, 0.0, 0.0]],
+    };
+
+    for mode in [OpenMode::Sequential, OpenMode::Indexed] {
+        let bytes = object_file_with_track(mode == OpenMode::Indexed, false, track.clone());
+
+        let mut lazy =
+            SceneReader::open_with(BytesReadable::new(&bytes), mode).expect("open object file");
+        let lazy_state = lazy.state_at(0.0, 0).expect("range-sample the track");
+
+        let mut materialized =
+            SceneReader::open_with(BytesReadable::new(&bytes), mode).expect("open object file");
+        assert_eq!(materialized.objects().unwrap().tracks.len(), 1);
+        let materialized_state = materialized
+            .state_at(0.0, 0)
+            .expect("sample the materialized track");
+
+        assert!((lazy_state.centers[0] - 11.0).abs() < 1e-4);
+        assert_eq!(materialized_state.centers, lazy_state.centers);
+        assert_eq!(materialized_state.orientations, lazy_state.orientations);
     }
 }
 
