@@ -26,6 +26,12 @@ ATTACHMENT = 0x0D
 ATTACHMENT_INDEX = 0x0E
 SUMMARY_OFFSET = 0x0F
 
+#: A keyframe-delta file's delta chunks. Deliberately NOT a flag on `Chunk`: a Chunk is
+#: independently decodable and a Delta Chunk is exactly the record that is not, so a
+#: reader that does not implement the model skips these rather than decoding bin
+#: differences as absolute positions.
+DELTA_CHUNK = 0x10
+
 # The provenance family, spec section 5.15. Assigned in dependency order: the two records
 # that carry poses come after the one that names the frame those poses are in.
 COORDINATE_FRAME = 0x20
@@ -61,6 +67,7 @@ NAMES = {
     ATTACHMENT: "Attachment",
     ATTACHMENT_INDEX: "AttachmentIndex",
     SUMMARY_OFFSET: "SummaryOffset",
+    DELTA_CHUNK: "DeltaChunk",
     COORDINATE_FRAME: "CoordinateFrame",
     SENSOR_CALIBRATION: "SensorCalibration",
     RIG_TRAJECTORY: "RigTrajectory",
@@ -98,6 +105,11 @@ A_FLAGS = 9
 A_WINDOW_INDEX = 10
 A_SOURCE_GROUP = 11
 A_SOURCE_INDEX = 12
+
+#: Identity, required in every chunk of a `keyframe-delta` file and absent from a
+#: `gaussian-birth` one. Distinct from `A_SOURCE_INDEX`, which is a producer-side handle a
+#: reader may skip; this is what a delta names its gaussians by.
+A_GAUSSIAN_ID = 13
 
 REQUIRED_ATTRIBUTES = (
     A_POSITION,

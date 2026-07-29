@@ -25,6 +25,7 @@ from .serialization import (
     put_str_map,
     put_string,
     put_u8,
+    put_u16,
     put_u32,
     put_u64,
 )
@@ -252,6 +253,99 @@ def parse_chunk(content) -> tuple[ChunkHeader, memoryview]:
 
 
 @dataclass
+class DeltaChunkHeader:
+    """A delta chunk's own fields; its three groups follow inside `records`."""
+
+    t0: float
+    t1: float
+    level: int
+    delta_mode: int
+    reference_offset: int
+    keyframe_offset: int
+    depth: int
+    update_count: int
+    birth_count: int
+    death_count: int
+    compression: str
+    uncompressed_size: int
+
+
+#: `delta_mode` values. Per chunk, not per file: an encoder that knows an instant is a
+#: likely seek target can make it cost two records regardless of how deep into the group
+#: it falls, without spending a whole keyframe on it.
+DELTA_MODE_KEYFRAME = 0
+DELTA_MODE_CHAINED = 1
+
+
+def encode_delta_chunk(
+    t0: float,
+    t1: float,
+    level: int,
+    delta_mode: int,
+    reference_offset: int,
+    keyframe_offset: int,
+    depth: int,
+    updates: bytes,
+    births: bytes,
+    deaths: bytes,
+    counts: tuple[int, int, int],
+) -> bytes:
+    """A Delta Chunk record.
+
+    The three groups are framed by length inside one `records` blob rather than tagged
+    with a group byte on every stream. That spends no second opcode, leaves the Attribute
+    Stream record untouched, and lets a reader take the death list — which is small and
+    which a consumer often wants alone — by stepping over two lengths.
+    """
+    update_count, birth_count, death_count = counts
+    records = put_blob(updates) + put_blob(births) + put_blob(deaths)
+    body = (
+        put_f64(t0)
+        + put_f64(t1)
+        + put_u32(level)
+        + put_u8(delta_mode)
+        + put_u64(reference_offset)
+        + put_u64(keyframe_offset)
+        + put_u16(depth)
+        + put_u32(update_count)
+        + put_u32(birth_count)
+        + put_u32(death_count)
+        + put_string("")  # chunk-level compression: streams carry their own
+        + put_u64(len(records))
+        + put_blob(records)
+    )
+    return put_record(op.DELTA_CHUNK, body)
+
+
+def parse_delta_chunk(content) -> tuple[DeltaChunkHeader, memoryview, memoryview, memoryview]:
+    c = Cursor(content)
+    head = DeltaChunkHeader(
+        t0=c.f64(),
+        t1=c.f64(),
+        level=c.u32(),
+        delta_mode=c.u8(),
+        reference_offset=c.u64(),
+        keyframe_offset=c.u64(),
+        depth=c.u16(),
+        update_count=c.u32(),
+        birth_count=c.u32(),
+        death_count=c.u32(),
+        compression=c.string(),
+        uncompressed_size=c.u64(),
+    )
+    records = Cursor(c.take(c.u64()))
+    return head, records.take(records.u64()), records.take(records.u64()), records.take(records.u64())
+
+
+#: Bytes the `keyframe-delta` block appends to a Chunk Index entry. A reader takes the
+#: record's length from its header, so an entry with at least this many bytes left after
+#: the band array carries the block and one without simply does not — which is how a
+#: `gaussian-birth` file written before this revision still parses, unchanged, to the same
+#: values.
+_INDEX_DELTA_BLOCK = 1 + 1 + 8 + 8 + 2 + 8
+
+
+@dataclass
 class ChunkIndexEntry:
     t0: float
     t1: float
@@ -259,6 +353,24 @@ class ChunkIndexEntry:
     chunk_length: int
     gaussian_count: int
     bands: list[tuple[int, int, int]] = field(default_factory=list)  # (band, offset, length)
+    #: True when this entry carries the `keyframe-delta` block below. False for every
+    #: `gaussian-birth` file, whose entries must stay byte-identical.
+    extended: bool = False
+    #: 0 keyframe (a Chunk record), 1 delta (a Delta Chunk record).
+    kind: int = 0
+    delta_mode: int = 0
+    #: The chunk this delta applies to. Strictly less than `chunk_offset`: references
+    #: point backwards only, so the chain walk terminates, cycles are unrepresentable, and
+    #: any complete prefix of a truncated file is a complete set of chains.
+    reference_offset: int = 0
+    #: The keyframe at the head of this group. Equals `chunk_offset` for a keyframe.
+    keyframe_offset: int = 0
+    #: Delta chunks that must be composed to reach this one. The exact read cost, known
+    #: from the index before anything is fetched.
+    depth: int = 0
+    #: Gaussians live over [t0, t1) after composition. `gaussian_count` cannot answer
+    #: this for a delta entry — there it is the size of the delta, not of the population.
+    live_count: int = 0
 
     def covers(self, t: float) -> bool:
         return self.t0 <= t < self.t1
@@ -274,6 +386,15 @@ class ChunkIndexEntry:
         )
         for band, offset, length in self.bands:
             body += put_u8(band) + put_u64(offset) + put_u64(length)
+        if self.extended:
+            body += (
+                put_u8(self.kind)
+                + put_u8(self.delta_mode)
+                + put_u64(self.reference_offset)
+                + put_u64(self.keyframe_offset)
+                + put_u16(self.depth)
+                + put_u64(self.live_count)
+            )
         return put_record(op.CHUNK_INDEX, body)
 
     @staticmethod
@@ -287,6 +408,14 @@ class ChunkIndexEntry:
             gaussian_count=c.u32(),
         )
         entry.bands = [(c.u8(), c.u64(), c.u64()) for _ in range(c.u32())]
+        if c.remaining() >= _INDEX_DELTA_BLOCK:
+            entry.extended = True
+            entry.kind = c.u8()
+            entry.delta_mode = c.u8()
+            entry.reference_offset = c.u64()
+            entry.keyframe_offset = c.u64()
+            entry.depth = c.u16()
+            entry.live_count = c.u64()
         return entry
 
 
