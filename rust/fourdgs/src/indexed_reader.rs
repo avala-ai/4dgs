@@ -14,7 +14,7 @@
 //! whole clip collapses to a single entry and an instant costs the scene. Both are correct
 //! files.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::chunk::{decode_streams, DecodedChunk};
 use crate::error::{Error, Result};
@@ -40,6 +40,9 @@ pub const HEAD_PROBE: u64 = 8 * 1024;
 /// first field, so a prefix answers it; the track stays where it is.
 pub const AUDIO_CODEC_PREFIX: u64 = 4096;
 
+const OBJECT_TRACK_HEADER_BYTES: u64 = 4 + 1 + 4;
+const OBJECT_TRACK_SAMPLE_BYTES: u64 = 8 + 4 * 8 + 3 * 8;
+
 /// One record's framing: everything except its bytes.
 #[derive(Debug, Clone, Copy)]
 struct FrontRecord {
@@ -47,6 +50,21 @@ struct FrontRecord {
     /// Offset of the record's opcode byte.
     offset: u64,
     content_length: u64,
+}
+
+/// The fixed-width portion of one Object Track, discovered without reading its samples.
+///
+/// The record range remains available for [`read_objects`], while indexed reconstruction
+/// uses the content offset and sample count to range-read only the samples bracketing its
+/// requested instant.
+#[derive(Debug, Clone, Copy)]
+pub struct ObjectTrackRange {
+    pub object_id: u32,
+    pub interpolation: u8,
+    pub sample_count: u32,
+    pub record_offset: u64,
+    pub record_length: u64,
+    pub content_offset: u64,
 }
 
 impl FrontRecord {
@@ -197,10 +215,9 @@ pub struct IndexedScene {
     /// Object Tables stay fully lazy because reconstructed state never needs labels,
     /// embeddings, anchors, or dynamics.
     pub object_table_ranges: Vec<(u64, u64)>,
-    /// `(object_id, offset, length)` for each Object Track. Opening reads only the
-    /// four-byte id prefix, which lets an indexed instant fetch exactly the tracks its
-    /// resident memberships reference.
-    pub object_track_ranges: Vec<(u32, u64, u64)>,
+    /// The framing and fixed-width header of each Object Track. Opening reads no samples;
+    /// an indexed instant range-samples only tracks its resident memberships reference.
+    pub object_track_ranges: Vec<ObjectTrackRange>,
     pub statistics: Option<rec::Statistics>,
     pub summary_offsets: Vec<rec::SummaryOffset>,
 }
@@ -339,13 +356,45 @@ pub fn open_indexed<R: Readable + ?Sized>(source: &mut R) -> Result<IndexedScene
                     .object_table_ranges
                     .push((record.offset, record.total_length())),
                 op::OBJECT_TRACK => {
-                    let prefix = front.content(&record, Some(4))?;
-                    let object_id = Cursor::new(&prefix).u32()?;
-                    scene.object_track_ranges.push((
+                    let prefix = front.content(&record, Some(OBJECT_TRACK_HEADER_BYTES))?;
+                    if prefix.len() < OBJECT_TRACK_HEADER_BYTES as usize {
+                        return Err(Error::Truncated(format!(
+                            "ObjectTrack at byte {} has {} content bytes; its object id, \
+                             interpolation, and sample count need {OBJECT_TRACK_HEADER_BYTES}",
+                            record.offset,
+                            prefix.len()
+                        )));
+                    }
+                    let mut header = Cursor::new(&prefix);
+                    let object_id = header.u32()?;
+                    let interpolation = header.u8()?;
+                    let sample_count = header.u32()?;
+                    let sample_bytes = u64::from(sample_count)
+                        .checked_mul(OBJECT_TRACK_SAMPLE_BYTES)
+                        .and_then(|bytes| bytes.checked_add(OBJECT_TRACK_HEADER_BYTES))
+                        .ok_or_else(|| {
+                            Error::Malformed(format!(
+                                "ObjectTrack for object {object_id} at byte {} declares \
+                                 {sample_count} samples whose byte length overflows",
+                                record.offset
+                            ))
+                        })?;
+                    if sample_bytes > record.content_length {
+                        return Err(Error::Truncated(format!(
+                            "ObjectTrack for object {object_id} at byte {} declares \
+                             {sample_count} samples needing {sample_bytes} content bytes, but \
+                             its content length is {}",
+                            record.offset, record.content_length
+                        )));
+                    }
+                    scene.object_track_ranges.push(ObjectTrackRange {
                         object_id,
-                        record.offset,
-                        record.total_length(),
-                    ));
+                        interpolation,
+                        sample_count,
+                        record_offset: record.offset,
+                        record_length: record.total_length(),
+                        content_offset: record.offset + RECORD_HEADER_SIZE as u64,
+                    });
                 }
                 code if op::is_provenance(code) => {
                     scene
@@ -607,8 +656,8 @@ pub fn read_objects<R: Readable + ?Sized>(
             op::OBJECT_TABLE,
         )?)?);
     }
-    for (_, offset, length) in &scene.object_track_ranges {
-        let blob = source.read(*offset, *length)?;
+    for range in &scene.object_track_ranges {
+        let blob = source.read(range.record_offset, range.record_length)?;
         out.tracks.push(rec::ObjectTrack::parse(record_content(
             &blob,
             op::OBJECT_TRACK,
@@ -618,33 +667,253 @@ pub fn read_objects<R: Readable + ?Sized>(
     Ok(out)
 }
 
-/// Fetch only Object Tracks referenced by the resident gaussian memberships.
+/// Sample only Object Tracks referenced by the resident gaussian memberships.
 ///
-/// Object Tables and unrelated tracks remain lazy behind [`read_objects`]. The four-byte
-/// object id prefix was recorded during the front-matter walk, so this function can skip a
-/// long unreferenced track without touching any of its range.
-pub fn read_object_tracks<R: Readable + ?Sized>(
+/// Object Tables, unrelated tracks, and unrelated samples remain lazy behind
+/// [`read_objects`]. Each requested track costs logarithmic eight-byte time probes and at
+/// most two fixed-width pose samples, regardless of its total sample count.
+pub fn read_object_poses<R: Readable + ?Sized>(
     source: &mut R,
     scene: &IndexedScene,
     object_ids: &HashSet<u32>,
-) -> Result<Vec<rec::ObjectTrack>> {
-    let mut out = Vec::new();
-    for (object_id, offset, length) in &scene.object_track_ranges {
-        if !object_ids.contains(object_id) {
+    t: f64,
+) -> Result<HashMap<u32, crate::provenance::Pose>> {
+    let mut out = HashMap::with_capacity(object_ids.len().min(scene.object_track_ranges.len()));
+    let mut seen = HashSet::with_capacity(out.capacity());
+    for range in &scene.object_track_ranges {
+        if !object_ids.contains(&range.object_id) {
             continue;
         }
-        let blob = source.read(*offset, *length)?;
-        let track = rec::ObjectTrack::parse(record_content(&blob, op::OBJECT_TRACK)?)?;
-        if track.object_id != *object_id {
+        if !seen.insert(range.object_id) {
             return Err(Error::Malformed(format!(
-                "ObjectTrack at byte {offset} changed object id from the indexed prefix \
-                 {object_id} to {}",
-                track.object_id
+                "two ObjectTrack records move object {}; a gaussian has one object and cannot \
+                 be transported by two poses (section 5.15.6)",
+                range.object_id
             )));
         }
-        out.push(track);
+        let Some(pose) = sample_object_track(source, range, t)? else {
+            continue;
+        };
+        out.insert(range.object_id, pose);
     }
     Ok(out)
+}
+
+#[derive(Clone, Copy)]
+struct IndexedObjectSample {
+    time: f64,
+    pose: crate::provenance::Pose,
+}
+
+fn sample_object_track<R: Readable + ?Sized>(
+    source: &mut R,
+    range: &ObjectTrackRange,
+    t: f64,
+) -> Result<Option<crate::provenance::Pose>> {
+    if range.object_id == crate::object_layer::BACKGROUND {
+        return Err(Error::Malformed(format!(
+            "ObjectTrack at byte {} names object 0, which is background/unassigned",
+            range.record_offset
+        )));
+    }
+    if !matches!(
+        range.interpolation,
+        rec::TRAJECTORY_LINEAR | rec::TRAJECTORY_STEP
+    ) {
+        return Err(Error::Malformed(format!(
+            "track for object {} at byte {} uses interpolation {}; this reader supports \
+             trajectory interpolation registry values 0 (linear) and 1 (step)",
+            range.object_id, range.record_offset, range.interpolation
+        )));
+    }
+    let count = range.sample_count as usize;
+    if count == 0 {
+        return Ok(None);
+    }
+
+    let first_time = read_object_time(source, range, 0)?;
+    if count == 1 || t <= first_time {
+        return Ok(Some(read_object_sample(source, range, 0)?.pose));
+    }
+    let last_time = read_object_time(source, range, count - 1)?;
+    if first_time >= last_time {
+        return Err(Error::Malformed(format!(
+            "track for object {}: sample {} is at t={}, not after sample 0 at t={}; times \
+             must strictly increase (section 5.15.4)",
+            range.object_id,
+            count - 1,
+            last_time,
+            first_time
+        )));
+    }
+    if t >= last_time {
+        return Ok(Some(read_object_sample(source, range, count - 1)?.pose));
+    }
+
+    let (mut lo, mut hi) = (0usize, count - 1);
+    let (mut lo_time, mut hi_time) = (first_time, last_time);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        let mid_time = read_object_time(source, range, mid)?;
+        if !(lo_time < mid_time && mid_time < hi_time) {
+            return Err(Error::Malformed(format!(
+                "track for object {}: sample {mid} at t={mid_time} does not lie strictly \
+                 between sample {lo} at t={lo_time} and sample {hi} at t={hi_time}; times \
+                 must strictly increase (section 5.15.4)",
+                range.object_id
+            )));
+        }
+        if mid_time <= t {
+            lo = mid;
+            lo_time = mid_time;
+        } else {
+            hi = mid;
+            hi_time = mid_time;
+        }
+    }
+
+    let a = read_object_sample(source, range, lo)?;
+    if range.interpolation == rec::TRAJECTORY_STEP {
+        return Ok(Some(a.pose));
+    }
+    let b = read_object_sample(source, range, hi)?;
+    if a.time != lo_time || b.time != hi_time {
+        return Err(Error::Malformed(format!(
+            "track for object {} changed while its samples were being range-read",
+            range.object_id
+        )));
+    }
+    let u = interpolation_fraction(t, a.time, b.time);
+    let mut translation = [0.0; 3];
+    for (axis, value) in translation.iter_mut().enumerate() {
+        *value = finite_lerp(a.pose.translation[axis], b.pose.translation[axis], u);
+    }
+    Ok(Some(crate::provenance::Pose {
+        rotation: crate::provenance::slerp(a.pose.rotation, b.pose.rotation, u)?,
+        translation,
+    }))
+}
+
+fn read_object_time<R: Readable + ?Sized>(
+    source: &mut R,
+    range: &ObjectTrackRange,
+    sample: usize,
+) -> Result<f64> {
+    let offset = object_sample_offset(range, sample)?;
+    let bytes = source.read(offset, 8)?;
+    let time = Cursor::new(&bytes).f64()?;
+    if !time.is_finite() {
+        return Err(Error::Malformed(format!(
+            "track for object {}: sample {sample} has a non-finite time ({time})",
+            range.object_id
+        )));
+    }
+    Ok(time)
+}
+
+fn read_object_sample<R: Readable + ?Sized>(
+    source: &mut R,
+    range: &ObjectTrackRange,
+    sample: usize,
+) -> Result<IndexedObjectSample> {
+    let offset = object_sample_offset(range, sample)?;
+    let bytes = source.read(offset, OBJECT_TRACK_SAMPLE_BYTES)?;
+    let mut cursor = Cursor::new(&bytes);
+    let time = cursor.f64()?;
+    if !time.is_finite() {
+        return Err(Error::Malformed(format!(
+            "track for object {}: sample {sample} has a non-finite time ({time})",
+            range.object_id
+        )));
+    }
+    let rotation_values = cursor.f64s(4)?;
+    let mut rotation = [
+        rotation_values[0],
+        rotation_values[1],
+        rotation_values[2],
+        rotation_values[3],
+    ];
+    let norm = rotation
+        .iter()
+        .map(|value| value * value)
+        .sum::<f64>()
+        .sqrt();
+    if !norm.is_finite() || norm == 0.0 {
+        return Err(Error::Malformed(format!(
+            "track for object {}: sample {sample} rotation has no direction (norm {norm})",
+            range.object_id
+        )));
+    }
+    for value in &mut rotation {
+        *value /= norm;
+    }
+    let translation_values = cursor.f64s(3)?;
+    let translation = [
+        translation_values[0],
+        translation_values[1],
+        translation_values[2],
+    ];
+    for (axis, value) in translation.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(Error::Malformed(format!(
+                "track for object {}: sample {sample} translation[{axis}] is {value}",
+                range.object_id
+            )));
+        }
+    }
+    Ok(IndexedObjectSample {
+        time,
+        pose: crate::provenance::Pose {
+            rotation,
+            translation,
+        },
+    })
+}
+
+fn object_sample_offset(range: &ObjectTrackRange, sample: usize) -> Result<u64> {
+    if sample >= range.sample_count as usize {
+        return Err(Error::Malformed(format!(
+            "sample {sample} is outside ObjectTrack {}'s {} samples",
+            range.object_id, range.sample_count
+        )));
+    }
+    let sample = u64::try_from(sample).map_err(|_| {
+        Error::Malformed(format!(
+            "sample {sample} of ObjectTrack {} is past this platform's range",
+            range.object_id
+        ))
+    })?;
+    range
+        .content_offset
+        .checked_add(OBJECT_TRACK_HEADER_BYTES)
+        .and_then(|offset| {
+            sample
+                .checked_mul(OBJECT_TRACK_SAMPLE_BYTES)
+                .and_then(|bytes| offset.checked_add(bytes))
+        })
+        .ok_or_else(|| {
+            Error::Malformed(format!(
+                "sample {sample} offset overflows for ObjectTrack {}",
+                range.object_id
+            ))
+        })
+}
+
+fn interpolation_fraction(t: f64, a: f64, b: f64) -> f64 {
+    let span = b - a;
+    if span.is_finite() {
+        return (t - a) / span;
+    }
+    let scale = a.abs().max(b.abs());
+    ((t / scale) - (a / scale)) / ((b / scale) - (a / scale))
+}
+
+fn finite_lerp(a: f64, b: f64, u: f64) -> f64 {
+    if (a < 0.0) == (b < 0.0) {
+        a + u * (b - a)
+    } else {
+        (1.0 - u) * a + u * b
+    }
 }
 
 /// The embedded track, fetched independently of any gaussian data.

@@ -12,7 +12,7 @@
 //! Both paths remain first-class and directly usable: this is a convenience over them,
 //! not a replacement for either.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 
 use crate::chunk::DecodedChunk;
@@ -65,10 +65,9 @@ pub struct SceneReader<R: Readable> {
     /// Object records are independent of the other front matter: asking for a camera must
     /// not also fetch every object track in the file.
     objects: Option<crate::object_layer::ObjectLayer>,
-    /// False when `objects` contains only tracks fetched for prior indexed instants. A
-    /// direct [`objects`](Self::objects) call replaces that partial cache with the full
-    /// layer, including the Object Table.
-    objects_complete: bool,
+    /// Poses sampled for exactly one indexed instant. Replaced on the next distinct seek,
+    /// so memory is bounded by the objects referenced by the resident gaussian state.
+    sampled_object_poses: Option<SampledObjectPoses>,
 }
 
 /// The front-matter records a caller asked for, once they have been fetched.
@@ -78,6 +77,12 @@ struct Records {
     metadata: Vec<rec::Metadata>,
     attachments: Vec<rec::Attachment>,
     provenance: crate::provenance::Provenance,
+}
+
+struct SampledObjectPoses {
+    t_bits: u64,
+    max_sh_band: u8,
+    poses: HashMap<u32, crate::provenance::Pose>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -116,7 +121,7 @@ impl<R: Readable> SceneReader<R> {
                 loaded_key: None,
                 records: None,
                 objects: None,
-                objects_complete: false,
+                sampled_object_poses: None,
             });
         }
         let scene = stream_reader::read_from(
@@ -134,7 +139,7 @@ impl<R: Readable> SceneReader<R> {
             loaded_key: Some(LoadKey::All),
             records: None,
             objects: None,
-            objects_complete: false,
+            sampled_object_poses: None,
         })
     }
 
@@ -406,8 +411,8 @@ impl<R: Readable> SceneReader<R> {
     /// The Object Table and object tracks the file carries (spec section 5.15.6).
     ///
     /// On the indexed path these records are fetched on first use. Reconstruction through
-    /// [`state_at`](Self::state_at) also fetches them when resident gaussians carry object
-    /// memberships, because the tracks are authoritative motion rather than metadata.
+    /// [`state_at`](Self::state_at) instead range-samples only the poses its resident
+    /// memberships need, because tracks are authoritative motion rather than metadata.
     pub fn objects(&mut self) -> Result<crate::object_layer::ObjectLayer> {
         self.ensure_objects()?;
         Ok(self.objects.clone().unwrap_or_default())
@@ -468,7 +473,7 @@ impl<R: Readable> SceneReader<R> {
     }
 
     fn ensure_objects(&mut self) -> Result<()> {
-        if self.objects_complete {
+        if self.objects.is_some() {
             return Ok(());
         }
         self.objects = Some(if let Some(scene) = &self.indexed {
@@ -480,32 +485,7 @@ impl<R: Readable> SceneReader<R> {
                 .objects
                 .clone()
         });
-        self.objects_complete = true;
-        Ok(())
-    }
-
-    fn ensure_object_tracks(&mut self, object_ids: &HashSet<u32>) -> Result<()> {
-        if self.objects_complete {
-            return Ok(());
-        }
-        if self.indexed.is_none() {
-            return self.ensure_objects();
-        }
-
-        let cached: HashSet<u32> = self
-            .objects
-            .as_ref()
-            .map(|layer| layer.tracks.iter().map(|track| track.object_id).collect())
-            .unwrap_or_default();
-        let missing: HashSet<u32> = object_ids.difference(&cached).copied().collect();
-        if missing.is_empty() {
-            return Ok(());
-        }
-        let scene = self.indexed.as_ref().expect("indexed path");
-        let tracks = indexed_reader::read_object_tracks(&mut self.source, scene, &missing)?;
-        let layer = self.objects.get_or_insert_with(Default::default);
-        layer.tracks.extend(tracks);
-        layer.check()?;
+        self.sampled_object_poses = None;
         Ok(())
     }
 
@@ -579,11 +559,39 @@ impl<R: Readable> SceneReader<R> {
                 .copied()
                 .filter(|id| *id != crate::object_layer::BACKGROUND)
                 .collect();
-            self.ensure_object_tracks(&referenced)?;
-            self.objects
-                .as_ref()
-                .expect("ensure_object_tracks populated the cache")
-                .apply(&mut state.centers, &mut state.orientations, &object_ids, t)?;
+            if self.mode == Mode::Streamed {
+                self.streamed
+                    .as_ref()
+                    .expect("streamed path")
+                    .objects
+                    .apply(&mut state.centers, &mut state.orientations, &object_ids, t)?;
+            } else if let Some(layer) = &self.objects {
+                layer.apply(&mut state.centers, &mut state.orientations, &object_ids, t)?;
+            } else {
+                let cache_matches = self.sampled_object_poses.as_ref().is_some_and(|cache| {
+                    cache.t_bits == t.to_bits() && cache.max_sh_band == max_sh_band
+                });
+                if !cache_matches {
+                    let scene = self.indexed.as_ref().expect("indexed path");
+                    let poses =
+                        indexed_reader::read_object_poses(&mut self.source, scene, &referenced, t)?;
+                    self.sampled_object_poses = Some(SampledObjectPoses {
+                        t_bits: t.to_bits(),
+                        max_sh_band,
+                        poses,
+                    });
+                }
+                crate::object_layer::apply_poses(
+                    &mut state.centers,
+                    &mut state.orientations,
+                    &object_ids,
+                    &self
+                        .sampled_object_poses
+                        .as_ref()
+                        .expect("indexed poses were sampled")
+                        .poses,
+                )?;
+            }
         }
         Ok(state)
     }

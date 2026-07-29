@@ -129,26 +129,6 @@ impl ObjectLayer {
         object_ids: &[u32],
         t: f64,
     ) -> Result<()> {
-        let count = object_ids.len();
-        if centers.len() != count * 3 {
-            return Err(Error::Malformed(format!(
-                "object-layer composition received {} center values for {count} gaussians; \
-                 expected {}",
-                centers.len(),
-                count * 3
-            )));
-        }
-        if orientations.len() != count * 4 {
-            return Err(Error::Malformed(format!(
-                "object-layer composition received {} orientation values for {count} gaussians; \
-                 expected {}",
-                orientations.len(),
-                count * 4
-            )));
-        }
-        if self.tracks.is_empty() {
-            return Ok(());
-        }
         self.check()?;
         let referenced: HashSet<u32> = object_ids
             .iter()
@@ -165,31 +145,61 @@ impl ObjectLayer {
                 poses.insert(track.object_id, pose);
             }
         }
-        for (i, &object_id) in object_ids.iter().enumerate() {
-            let Some(pose) = poses.get(&object_id) else {
-                continue;
-            };
-            let c0 = [
-                centers[i * 3] as f64,
-                centers[i * 3 + 1] as f64,
-                centers[i * 3 + 2] as f64,
-            ];
-            let moved = pose.apply(c0);
-            centers[i * 3] = moved[0] as f32;
-            centers[i * 3 + 1] = moved[1] as f32;
-            centers[i * 3 + 2] = moved[2] as f32;
-
-            let r0 = [
-                orientations[i * 4] as f64,
-                orientations[i * 4 + 1] as f64,
-                orientations[i * 4 + 2] as f64,
-                orientations[i * 4 + 3] as f64,
-            ];
-            let moved_orientation = quaternion_multiply(pose.rotation, r0);
-            for (axis, value) in moved_orientation.iter().enumerate() {
-                orientations[i * 4 + axis] = *value as f32;
-            }
-        }
-        Ok(())
+        apply_poses(centers, orientations, object_ids, &poses)
     }
+}
+
+/// Compose already-sampled object poses onto one reconstructed instant.
+///
+/// Indexed readers use this entry point so they can range-sample a track without
+/// materializing its complete sample arrays. The same transform implementation is shared
+/// with [`ObjectLayer::apply`], keeping streamed and indexed reconstruction identical.
+pub(crate) fn apply_poses(
+    centers: &mut [f32],
+    orientations: &mut [f32],
+    object_ids: &[u32],
+    poses: &HashMap<u32, Pose>,
+) -> Result<()> {
+    let count = object_ids.len();
+    if centers.len() != count * 3 {
+        return Err(Error::Malformed(format!(
+            "object-layer composition received {} center values for {count} gaussians; expected {}",
+            centers.len(),
+            count * 3
+        )));
+    }
+    if orientations.len() != count * 4 {
+        return Err(Error::Malformed(format!(
+            "object-layer composition received {} orientation values for {count} gaussians; \
+             expected {}",
+            orientations.len(),
+            count * 4
+        )));
+    }
+    for (i, &object_id) in object_ids.iter().enumerate() {
+        let Some(pose) = poses.get(&object_id) else {
+            continue;
+        };
+        let c0 = [
+            centers[i * 3] as f64,
+            centers[i * 3 + 1] as f64,
+            centers[i * 3 + 2] as f64,
+        ];
+        let moved = pose.apply(c0);
+        centers[i * 3] = moved[0] as f32;
+        centers[i * 3 + 1] = moved[1] as f32;
+        centers[i * 3 + 2] = moved[2] as f32;
+
+        let r0 = [
+            orientations[i * 4] as f64,
+            orientations[i * 4 + 1] as f64,
+            orientations[i * 4 + 2] as f64,
+            orientations[i * 4 + 3] as f64,
+        ];
+        let moved_orientation = quaternion_multiply(pose.rotation, r0);
+        for (axis, value) in moved_orientation.iter().enumerate() {
+            orientations[i * 4 + axis] = *value as f32;
+        }
+    }
+    Ok(())
 }

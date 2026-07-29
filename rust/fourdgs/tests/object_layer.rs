@@ -262,6 +262,68 @@ fn object_file_with_unrelated_ranges() -> (Vec<u8>, ByteRange, ByteRange, ByteRa
     (out, table_range, track7_range, track8_range)
 }
 
+fn object_file_with_long_track(sample_count: usize) -> (Vec<u8>, ByteRange) {
+    let duration = sample_count as f64;
+    let mut out = MAGIC.to_vec();
+    out.extend(
+        Header {
+            duration_sec: duration,
+            gaussian_count: 1,
+            aabb: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            cutoff: 0.05,
+            temporal_model: "gaussian-birth".into(),
+            ..Default::default()
+        }
+        .encode(&[]),
+    );
+    out.extend(quantization().encode(&[]));
+    out.extend(
+        WindowTable {
+            windows: vec![(0.0, duration)],
+        }
+        .encode(),
+    );
+    let times: Vec<f64> = (0..sample_count).map(|i| i as f64).collect();
+    let track = ObjectTrack {
+        object_id: 7,
+        interpolation: TRAJECTORY_LINEAR,
+        rotations: vec![Q_ID; sample_count],
+        translations: times.iter().map(|time| [*time, 0.0, 0.0]).collect(),
+        times,
+    }
+    .encode(b"")
+    .unwrap();
+    let track_range = (out.len() as u64, track.len() as u64);
+    out.extend(track);
+
+    let chunk_at = out.len() as u64;
+    let chunk =
+        fourdgs::records::encode_chunk(0.0, duration, 0, 1, &streams_with_object_id(&[7], 1));
+    out.extend(&chunk);
+    let summary_start = out.len() as u64;
+    out.extend(
+        ChunkIndexEntry {
+            t0: 0.0,
+            t1: duration,
+            chunk_offset: chunk_at,
+            chunk_length: chunk.len() as u64,
+            gaussian_count: 1,
+            bands: Vec::new(),
+        }
+        .encode(),
+    );
+    out.extend(
+        Footer {
+            summary_start,
+            summary_offset_start: 0,
+            summary_crc: 0,
+        }
+        .encode(),
+    );
+    out.extend(MAGIC);
+    (out, track_range)
+}
+
 struct CountingSource {
     bytes: Vec<u8>,
     reads: Rc<RefCell<Vec<ByteRange>>>,
@@ -511,7 +573,7 @@ fn scene_reader_composes_authoritative_object_motion_on_both_paths() {
 }
 
 #[test]
-fn indexed_state_fetches_and_caches_only_referenced_object_tracks() {
+fn indexed_state_range_samples_and_caches_only_referenced_object_poses() {
     let (bytes, table_range, track7_range, track8_range) = object_file_with_unrelated_ranges();
     let reads = Rc::new(RefCell::new(Vec::new()));
     let source = CountingSource {
@@ -524,9 +586,23 @@ fn indexed_state_fetches_and_caches_only_referenced_object_tracks() {
     let state = reader.state_at(0.5, 0).expect("reconstruct object 7");
     assert!((state.centers[0] - 10.0).abs() < 1e-4);
     let state_reads = reads.borrow().clone();
+    let track7_reads: Vec<ByteRange> = state_reads
+        .iter()
+        .copied()
+        .filter(|range| overlaps(*range, track7_range))
+        .collect();
     assert!(
-        state_reads.contains(&track7_range),
-        "the visible object's track is fetched: {state_reads:?}"
+        !track7_reads.is_empty(),
+        "the visible object's samples are fetched: {state_reads:?}"
+    );
+    assert!(
+        track7_reads.iter().map(|range| range.1).sum::<u64>() <= 2 * 64 + 2 * 8,
+        "a two-sample track needs only two time probes and two fixed-width samples: \
+         {track7_reads:?}"
+    );
+    assert!(
+        !track7_reads.contains(&track7_range),
+        "state_at must not materialize the whole ObjectTrack: {track7_reads:?}"
     );
     assert!(
         state_reads
@@ -546,6 +622,59 @@ fn indexed_state_fetches_and_caches_only_referenced_object_tracks() {
     assert!(
         reads.borrow().is_empty(),
         "the gaussian chunk and object track are cached"
+    );
+}
+
+#[test]
+fn indexed_state_range_samples_long_tracks_and_keeps_only_one_instant() {
+    let (bytes, track_range) = object_file_with_long_track(4096);
+    let reads = Rc::new(RefCell::new(Vec::new()));
+    let source = CountingSource {
+        bytes,
+        reads: Rc::clone(&reads),
+    };
+    let mut reader = SceneReader::open_with(source, OpenMode::Indexed).expect("open indexed");
+    reads.borrow_mut().clear();
+
+    let state = reader.state_at(2048.5, 0).expect("sample the long track");
+    assert!((state.centers[0] - 2049.5).abs() < 1e-4);
+    let track_reads: Vec<ByteRange> = reads
+        .borrow()
+        .iter()
+        .copied()
+        .filter(|range| overlaps(*range, track_range))
+        .collect();
+    let transferred = track_reads.iter().map(|range| range.1).sum::<u64>();
+    assert!(
+        transferred <= 2 * 64 + 14 * 8,
+        "4096 samples should cost two poses plus logarithmic time probes, got \
+         {transferred} bytes in {track_reads:?}"
+    );
+    assert!(
+        !track_reads.contains(&track_range),
+        "state_at must not materialize a long ObjectTrack"
+    );
+
+    reads.borrow_mut().clear();
+    reader
+        .state_at(2048.5, 0)
+        .expect("reuse the sampled instant");
+    assert!(
+        reads.borrow().is_empty(),
+        "the current gaussian state and sampled poses are cached"
+    );
+
+    reader.state_at(1024.5, 0).expect("seek to another instant");
+    reads.borrow_mut().clear();
+    reader
+        .state_at(2048.5, 0)
+        .expect("seek back after the one-instant cache was replaced");
+    assert!(
+        reads
+            .borrow()
+            .iter()
+            .any(|range| overlaps(*range, track_range)),
+        "a prior instant's pose must not remain in an unbounded cross-instant cache"
     );
 }
 
