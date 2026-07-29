@@ -160,7 +160,8 @@ These records and their currently defined fields are **frozen**: their existing 
 change meaning, type, or order in any version 1 revision. Only appended fields may be added.
 
 `Header (0x01)`, `Footer (0x02)`, `Quantization (0x03)`, `Window Table (0x04)`, `Chunk (0x05)`,
-`Attribute Stream (0x06)`, `Chunk Index (0x08)`.
+`Attribute Stream (0x06)`, `Chunk Index (0x08)`. The Attribute Stream is a structure rather than a
+top-level record (§5.6); it is frozen on the same terms, and `0x06` is its registry number.
 
 Anything else is provisional and MAY change before version 1 is declared stable.
 
@@ -215,9 +216,22 @@ u64  summary_offset_start -- byte offset of the first Summary Offset record, or 
 u32  summary_crc          -- CRC-32 (IEEE) over [summary_start, footer_start), or 0
 ```
 
-A reader seeking a random instant reads the last `8 + 1 + 8 + 20` bytes, takes `summary_start`, and
+A reader seeking a random instant reads the last **37 bytes**, takes `summary_start`, and
 range-reads the index from there. `0` in `summary_start` means the file has no index and MUST be
 read sequentially.
+
+The 37 is worth spelling out, because it is the one number every seeking reader hardcodes and the
+only way to check it is to know what it is made of:
+
+| bytes | what                                                          |
+| ----- | ------------------------------------------------------------- |
+| 8     | the trailing magic (§4.1)                                     |
+| 1     | the Footer's opcode (§4.2)                                    |
+| 8     | the Footer's `content_length` (§4.2)                          |
+| 20    | the Footer's content — `8 + 8 + 4` for the three fields above |
+
+A reader that gets this wrong does not fail cleanly: it lands mid-field and reads a plausible
+`summary_start` that points nowhere in particular.
 
 ### 5.3 Quantization — opcode `0x03`
 
@@ -293,8 +307,14 @@ u32     level         -- producer's hierarchy level; informational only
 u32     count         -- gaussians in this chunk
 string  compression   -- codec applied to the records below (see registry), or ""
 u64     uncompressed_size
-bytes   records       -- concatenated Attribute Stream records
+bytes   records       -- concatenated attribute streams (§5.6), back to back
 ```
+
+The `records` block is **not** a sequence of records. It is a bare run of §5.6 field layouts laid
+end to end, with no opcode and no length in front of each — the first byte of the block is the first
+stream's `attribute_id`. A reader walks it by decoding each stream's header and stepping over its
+`payload_length`, not by the record framing of §4.2. The field keeps the name `records` because it
+is frozen (§4.4); the name is a misnomer, and this paragraph is the correction.
 
 Chunks are **independently decodable**: nothing in a chunk references another chunk.
 
@@ -308,9 +328,20 @@ the file and name the codec, which is a different failure from a corrupt one.
 Compression is normally per stream, because that lets a reader decompress a chunk's attributes in
 parallel and skip the ones it does not want. A chunk-level codec is the exception, not the default.
 
-### 5.6 Attribute Stream — opcode `0x06`
+### 5.6 Attribute Stream — structure `0x06`
 
-Appears only inside a Chunk's `records` block.
+**This is a structure, not a top-level record, and `0x06` is not an opcode that appears on the
+wire.** An attribute stream exists only inside a Chunk's `records` block (§5.5), where it is written
+bare — no opcode byte, no `content_length` — so `0x06` never frames anything. The number is the
+registry identifier for the structure, and it is what a stream carries in its own `attribute_id`
+field; it is listed among the frozen records in §4.4 for the same reason, as a registry entry rather
+than as a record a reader will ever encounter at the top level.
+
+The distinction matters to anyone writing a parser from this document: a reader that expects §4.2
+framing here finds an `attribute_id` where it expects an opcode, and a `symbol_width` where it
+expects the first byte of a 64-bit length. §5.7's SH Band Stream **is** a real top-level record —
+`0x07` does appear on the wire — and its content is a `u8 band` followed by one of these bare
+structures, which is the only place a stream is wrapped in record framing.
 
 ```
 u8   attribute_id     -- see registry
@@ -408,7 +439,7 @@ f64[6] aabb
 A summary a reader can trust without scanning chunks. Advisory: a reader that needs certainty MUST
 compute from the chunks.
 
-### 5.13 Attachment / Attachment Index — opcodes `0x0D` / `0x0E`
+### 5.13 Attachment — opcode `0x0D`
 
 ```
 string  name
@@ -418,6 +449,13 @@ bytes   data
 
 Arbitrary payloads — thumbnails, provenance, licences. Attachments are NOT the mechanism for audio;
 audio has its own record because it is a first-class part of the scene.
+
+**`0x0E` (Attachment Index) is reserved; its body is not yet defined.** Earlier drafts of this
+section gave `0x0D` and `0x0E` a single layout, which cannot have been right: the body above is one
+attachment's name, type and payload, and an index over attachments is a different shape entirely.
+Nothing has ever emitted `0x0E`, so no file is affected. It keeps its number, and a reader treats it
+as it treats any record it does not recognize — step over it by `content_length` (§4.2). A writer
+MUST NOT emit `0x0E` until this section defines it.
 
 ### 5.14 Summary Offset — opcode `0x0F`
 
@@ -663,6 +701,9 @@ and the text was the bug.
 | §6.5 added: spherical harmonic layout, whole degrees, and that `step_sh` is not applied at decode     | clarification             |
 | §4.5 added: the summary is exactly Chunk Index, Statistics and Summary Offset, and is contiguous      | rule added                |
 | §5.3 added: every quantization step and origin MUST be finite                                         | rule added                |
+| §5.5/§5.6 corrected: a chunk's streams are bare structures, not records, and `0x06` is not an opcode  | correction                |
+| §5.13 stated that `0x0E` is reserved with no defined body, rather than sharing the Attachment's       | clarification             |
+| §5.2 named the terms of the 37-byte tail a seeking reader reads                                       | clarification             |
 
 The §5.3 row is a tightening of what a **writer** may emit, and it changes no existing file: every
 quantization parameter any encoder here has ever written is finite, all 34 conformance variants
@@ -679,6 +720,16 @@ file: all 34 conformance variants already satisfy it, none was regenerated, and 
 meaning move. What it forbids is a shape the layout diagram used to permit — an Attachment record
 sitting between the Statistics and Summary Offset records — which no encoder ever produced and which
 would have made a streamed checksum cost whatever the attachment weighed.
+
+The §5.5/§5.6 row is the `aabb` row's sibling, and it was found the same way: by writing a Kaitai
+grammar from the published document and discovering it could not parse a file. §5.5 called a chunk's
+payload "concatenated Attribute Stream records" and §5.6 was headed with an opcode, so a reader
+built from the text alone looked for §4.2 framing — an opcode byte and a `content_length` — where
+the wire has an `attribute_id` and a `symbol_width`. It then desynchronized on the first stream and
+every byte after it. The wire is the format and the text was the bug: `0x06` appears **zero** times
+as a top-level opcode across all 34 conformance variants, while `0x07`, which really is a record,
+appears 158 times. No file changes; what changes is that a parser written from this document now
+works.
 
 The `aabb` row is the one worth reading twice. The text said `f32[6]` from the first draft and every
 implementation wrote `f64[6]`, so a reader built from the specification alone desynchronized on the

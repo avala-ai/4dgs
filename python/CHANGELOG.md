@@ -8,6 +8,22 @@ All notable changes to the Python package are documented here, following
 
 ### Added
 
+- `InvalidInput`, raised when the encoder is handed a scene it cannot write a conforming file from —
+  a non-finite value in a quantized field (position, scale, rotation, colour, velocity, `mu_t`). It
+  refused these before, but from inside the codec, with a message about a symbol exceeding 32 bits
+  that named neither the field nor the gaussian; the one thing the caller needed to know was the one
+  thing it could not say. The fields that are not quantized are left alone: `+inf` in `sigma_t`
+  means a gaussian that never fades, and `+inf` in `win_hi` means a static asset present at every
+  instant, which is what the glTF import writes. NaN is refused in those three too — it is
+  meaningful in none of them, and it is the quiet kind of wrong, since a NaN sigma reads as
+  never-fading and a NaN window makes every visibility comparison false.
+
+- `validate` checks **every** Quantization record as it walks the file, not only the one left in
+  hand at the end. Nothing in the framing forbids a second, and a streamed decoder takes the first
+  grid it meets — so a file carrying a non-finite grid followed by a clean one used to validate
+  green while decoding entirely through the broken one. The report names which copy when there is
+  more than one.
+
 - `validate` reports a non-finite quantization step or position origin as an error, naming the
   field, per the new spec §5.3. This changes no file anything here has ever written — every grid the
   encoder emits is finite — and it adds nothing to what a decoder does: dequantization still

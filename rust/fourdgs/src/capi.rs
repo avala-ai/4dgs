@@ -72,6 +72,9 @@ fn status_of(error: &Error) -> c_int {
         Error::UnsupportedCodec(_) => FOURDGS_STATUS_UNSUPPORTED_CODEC,
         Error::BoundViolation(_) => FOURDGS_STATUS_MALFORMED,
         Error::UnsupportedOperation(_) => FOURDGS_STATUS_UNSUPPORTED_MODE,
+        // The C ABI exposes no encoder, so this cannot arise through it today; mapped
+        // rather than left to a catch-all so that it stays correct when one is added.
+        Error::InvalidInput(_) => FOURDGS_STATUS_INVALID_ARGUMENT,
         Error::Io(_) => FOURDGS_STATUS_IO,
     }
 }

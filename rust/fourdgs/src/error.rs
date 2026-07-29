@@ -31,6 +31,11 @@ pub enum Error {
     /// chunk by index, for instance. Neither the file nor the caller is malformed; the
     /// operation simply belongs to the other path.
     UnsupportedOperation(String),
+    /// A caller handed the encoder a scene it cannot write a conforming file from — a
+    /// non-finite position, for instance, which would land in a quantization grid the
+    /// specification forbids (§5.3). The mirror of `Malformed`: that describes a file that
+    /// arrived broken, this describes a scene that never should have been offered.
+    InvalidInput(String),
     /// The transport failed.
     Io(std::io::Error),
 }
@@ -44,6 +49,7 @@ impl fmt::Display for Error {
             Error::UnsupportedCodec(m) => write!(f, "unsupported codec: {m}"),
             Error::BoundViolation(m) => write!(f, "bound violation: {m}"),
             Error::UnsupportedOperation(m) => write!(f, "unsupported operation: {m}"),
+            Error::InvalidInput(m) => write!(f, "invalid input: {m}"),
             Error::Io(e) => write!(f, "io: {e}"),
         }
     }

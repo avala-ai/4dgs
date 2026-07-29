@@ -457,3 +457,165 @@ fn the_summary_is_one_contiguous_run_before_the_footer() {
         "a contiguous summary lets a front-to-back reader verify the checksum"
     );
 }
+
+/// One gaussian, every field finite and legal. The base the tests below perturb.
+fn one_gaussian() -> GaussianSet {
+    let mut g = GaussianSet::default();
+    g.positions.extend_from_slice(&[0.1, 0.2, 0.3]);
+    g.scales.extend_from_slice(&[1e-3, 1e-3, 1e-3]);
+    g.rotations.extend_from_slice(&[0.0, 0.0, 0.0, 1.0]);
+    g.colors.extend_from_slice(&[0.5, 0.5, 0.5, 0.5]);
+    g.motions.extend_from_slice(&[0.0, 0.0, 0.0]);
+    g.mu_t.push(0.5);
+    g.sigma_t.push(0.1);
+    g.win_lo.push(0.0);
+    g.win_hi.push(1.0);
+    g
+}
+
+/// The three components of `pos_origin` and the eight steps, read off the wire.
+///
+/// Straight off the bytes rather than through the decoder's model, because the point is
+/// what the encoder *wrote* — a check that went through a type which had already dropped
+/// the value would prove nothing.
+fn quantization_parameters(bytes: &[u8]) -> Vec<f64> {
+    use fourdgs::opcode as op;
+    let mut at = 8usize;
+    while at + 9 <= bytes.len() {
+        let opcode = bytes[at];
+        let length = u64::from_le_bytes(bytes[at + 1..at + 9].try_into().unwrap()) as usize;
+        let body = &bytes[at + 9..at + 9 + length];
+        if opcode == op::QUANTIZATION {
+            let scheme_len = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+            let mut p = 4 + scheme_len;
+            let mut out = Vec::new();
+            for _ in 0..11 {
+                out.push(f64::from_le_bytes(body[p..p + 8].try_into().unwrap()));
+                p += 8;
+            }
+            return out;
+        }
+        at += 9 + length;
+    }
+    panic!("no Quantization record");
+}
+
+#[test]
+fn a_well_formed_scene_writes_finite_quantization_parameters() {
+    let bytes = fourdgs::write_to_vec(
+        &one_gaussian(),
+        1.0,
+        &WriteOptions::default(),
+        &SceneExtras::default(),
+    )
+    .unwrap();
+    for value in quantization_parameters(&bytes) {
+        assert!(
+            value.is_finite(),
+            "every step and origin must be finite (§5.3)"
+        );
+    }
+}
+
+#[test]
+fn a_non_finite_position_is_refused_rather_than_written() {
+    // `f64::min` returns the other operand when one is NaN, and the origin fold is seeded
+    // with `f64::INFINITY`. So before this check existed, ONE NaN on an axis left that
+    // axis at the seed and the encoder wrote `inf` as a position origin — silently, no
+    // error, a file §5.3 forbids. A whole axis of NaN was never needed; one gaussian was.
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        for axis in 0..3 {
+            let mut g = one_gaussian();
+            g.positions[axis] = bad;
+            let result =
+                fourdgs::write_to_vec(&g, 1.0, &WriteOptions::default(), &SceneExtras::default());
+            let error = result.expect_err("a non-finite position must be refused");
+            assert!(
+                matches!(error, fourdgs::Error::InvalidInput(_)),
+                "expected InvalidInput, got {error}"
+            );
+            assert!(
+                error.to_string().contains("positions"),
+                "the error must name the field: {error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn every_per_gaussian_field_is_checked_for_finiteness() {
+    // A field added to the model and forgotten by the check would be a hole that writes a
+    // spec-violating file, so each is perturbed in turn and each must be refused by name.
+    type Perturb = fn(&mut GaussianSet);
+    let cases: [(&str, Perturb); 8] = [
+        ("positions", |g| g.positions[1] = f32::NAN),
+        ("scales", |g| g.scales[0] = f32::INFINITY),
+        ("rotations", |g| g.rotations[3] = f32::NAN),
+        ("colors", |g| g.colors[2] = f32::INFINITY),
+        ("motions", |g| g.motions[0] = f32::NAN),
+        ("mu_t", |g| g.mu_t[0] = f32::INFINITY),
+        // Not quantized, so an infinity is legal here — but a NaN never is.
+        ("win_lo", |g| g.win_lo[0] = f32::NAN),
+        ("win_hi", |g| g.win_hi[0] = f32::NAN),
+    ];
+    for (name, break_it) in cases {
+        let mut g = one_gaussian();
+        break_it(&mut g);
+        let error =
+            fourdgs::write_to_vec(&g, 1.0, &WriteOptions::default(), &SceneExtras::default())
+                .expect_err(&format!("a non-finite {name} must be refused"));
+        assert!(
+            error.to_string().contains(name),
+            "the error must name {name}: {error}"
+        );
+    }
+}
+
+#[test]
+fn an_infinite_sigma_still_means_never_fades() {
+    // The one non-finite value the format defines (§3). Refusing it would break the
+    // feature the rest of this check exists to protect.
+    let mut g = one_gaussian();
+    g.sigma_t[0] = f32::INFINITY;
+    let bytes = fourdgs::write_to_vec(&g, 1.0, &WriteOptions::default(), &SceneExtras::default())
+        .expect("+inf sigma_t is legal and means the gaussian never fades");
+    for value in quantization_parameters(&bytes) {
+        assert!(value.is_finite());
+    }
+
+    // NaN and -inf are not that value. The decoder treats every non-finite sigma as
+    // never-fading, so accepting NaN would turn a mistake into a deliberate-looking value.
+    for bad in [f32::NAN, f32::NEG_INFINITY] {
+        let mut g = one_gaussian();
+        g.sigma_t[0] = bad;
+        let error =
+            fourdgs::write_to_vec(&g, 1.0, &WriteOptions::default(), &SceneExtras::default())
+                .expect_err("NaN and -inf sigma_t must be refused");
+        assert!(error.to_string().contains("sigma_t"), "{error}");
+    }
+}
+
+#[test]
+fn a_static_asset_encodes_with_an_infinite_window() {
+    // The degenerate temporal case: a 3D splat with no time in it, present at every
+    // instant. `sigma_t = +inf` and `win_hi = +inf` are how this format says that, and it
+    // is what the glTF import writes for every gaussian in a static asset.
+    //
+    // Neither field is quantized — the window goes into the Window Table as f64 verbatim —
+    // so an over-broad "everything must be finite" check refuses a whole legitimate class
+    // of file. It did, until the glTF suite said so.
+    let mut g = one_gaussian();
+    g.sigma_t[0] = f32::INFINITY;
+    g.win_lo[0] = 0.0;
+    g.win_hi[0] = f32::INFINITY;
+    let bytes = fourdgs::write_to_vec(&g, 1.0, &WriteOptions::default(), &SceneExtras::default())
+        .expect("a static asset is a legal scene");
+    for value in quantization_parameters(&bytes) {
+        assert!(value.is_finite(), "and its grid is still finite (§5.3)");
+    }
+    let scene = fourdgs::read_bytes(&bytes).expect("decode");
+    assert!(
+        scene.gaussians.win_hi[0].is_infinite(),
+        "the window survives"
+    );
+}

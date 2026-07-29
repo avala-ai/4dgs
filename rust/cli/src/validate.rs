@@ -104,7 +104,8 @@ pub fn validate(data: &[u8]) -> Report {
 
     let mut seen: Vec<u8> = Vec::new();
     let mut header: Option<rec::Header> = None;
-    let mut quantization: Option<rec::Quantization> = None;
+    let mut quantization = false;
+    let mut quantization_count = 0usize;
     let mut footer: Option<rec::Footer> = None;
     let mut chunk_count = 0u64;
     let mut counted = 0u64;
@@ -128,7 +129,13 @@ pub fn validate(data: &[u8]) -> Report {
                 Err(error) => report.error(format!("Header does not parse: {error}")),
             },
             op::QUANTIZATION => match rec::Quantization::parse(record.content) {
-                Ok(parsed) => quantization = Some(parsed),
+                Ok(parsed) => {
+                    // Checked here, as the record is met, rather than once at the end on
+                    // whichever copy survived. See `check_quantization_finite`.
+                    check_quantization_finite(&parsed, &mut report, quantization_count);
+                    quantization_count += 1;
+                    quantization = true;
+                }
                 Err(error) => report.error(format!("Quantization does not parse: {error}")),
             },
             op::CHUNK => match rec::parse_chunk(record.content) {
@@ -179,7 +186,7 @@ pub fn validate(data: &[u8]) -> Report {
     if header.is_none() {
         report.error("no Header record".into());
     }
-    if quantization.is_none() {
+    if !quantization {
         report.error("no Quantization record".into());
     }
     if footer.is_none() {
@@ -234,10 +241,6 @@ pub fn validate(data: &[u8]) -> Report {
         }
     }
 
-    if let Some(quant) = &quantization {
-        check_quantization_finite(quant, &mut report);
-    }
-
     if header.is_some() && index.is_empty() {
         report.warn("no chunk index: this file can only be read front to back, not seeked".into());
     }
@@ -259,7 +262,19 @@ pub fn validate(data: &[u8]) -> Report {
 /// renderer drawing an empty frame, which points at the renderer.
 ///
 /// Reported per field, because "the file is broken" is what the caller already knows.
-fn check_quantization_finite(quant: &rec::Quantization, report: &mut Report) {
+///
+/// Called once per Quantization record as it is walked, not once on whichever record
+/// survived the loop. Nothing in the framing forbids a second one, and a streamed decoder
+/// takes the first grid it meets — so checking only the last would pass a file whose first
+/// grid is non-finite while the whole scene decodes through it.
+fn check_quantization_finite(quant: &rec::Quantization, report: &mut Report, ordinal: usize) {
+    // Named when there is more than one, so the report points at the offending copy
+    // rather than at "the" Quantization record.
+    let where_ = if ordinal == 0 {
+        "Quantization".to_string()
+    } else {
+        format!("Quantization record {}", ordinal + 1)
+    };
     let origin = |i: usize| quant.pos_origin.get(i).copied().unwrap_or(f64::NAN);
     for (name, value) in [
         ("pos_origin[0]", origin(0)),
@@ -276,7 +291,7 @@ fn check_quantization_finite(quant: &rec::Quantization, report: &mut Report) {
     ] {
         if !value.is_finite() {
             report.error(format!(
-                "Quantization {name} is {}; every step and origin must be finite (§5.3)",
+                "{where_} {name} is {}; every step and origin must be finite (§5.3)",
                 spell(value)
             ));
         }
@@ -372,6 +387,12 @@ mod tests {
 
     /// The smallest thing that is meant to validate: header, grids, windows, footer.
     fn minimal_file(quant: &rec::Quantization) -> Vec<u8> {
+        minimal_file_with(std::slice::from_ref(quant))
+    }
+
+    /// The same, with however many Quantization records the caller wants. More than one is
+    /// legal framing, and the case the per-record check exists for.
+    fn minimal_file_with(quants: &[rec::Quantization]) -> Vec<u8> {
         let header = rec::Header {
             duration_sec: 1.0,
             gaussian_count: 0,
@@ -380,7 +401,9 @@ mod tests {
         };
         let mut out = MAGIC.to_vec();
         out.extend_from_slice(&header.encode(&[]));
-        out.extend_from_slice(&quant.encode(&[]));
+        for quant in quants {
+            out.extend_from_slice(&quant.encode(&[]));
+        }
         out.extend_from_slice(
             &rec::WindowTable {
                 windows: vec![(0.0, 1.0)],
@@ -436,6 +459,42 @@ mod tests {
         let report = validate(&minimal_file(&quant));
         assert!(errors(&report).iter().any(|m| m
             == "Quantization pos_origin[1] is -inf; every step and origin must be finite (§5.3)"));
+    }
+
+    #[test]
+    fn a_bad_quantization_record_is_not_masked_by_a_later_good_one() {
+        // Nothing in the framing forbids a second Quantization record, and a streamed
+        // decoder takes the first grid it meets. A validator that inspected only the one
+        // left in hand after the walk would pass this file while the whole scene decodes
+        // through the broken grid. Mirrors the Python suite's test of the same name.
+        let mut bad = grids();
+        bad.step_pos = f64::INFINITY;
+        let report = validate(&minimal_file_with(&[bad, grids()]));
+        assert!(!report.ok(), "{:?}", errors(&report));
+        assert!(
+            errors(&report)
+                .iter()
+                .any(|m| m.contains("step_pos is inf")),
+            "{:?}",
+            errors(&report)
+        );
+    }
+
+    #[test]
+    fn the_offending_quantization_record_is_named_when_there_is_more_than_one() {
+        // The reverse order: the good grid first. The report has to say which copy, or the
+        // reader is left looking at a record that is perfectly fine.
+        let mut bad = grids();
+        bad.step_time = f64::NAN;
+        let report = validate(&minimal_file_with(&[grids(), bad]));
+        assert!(!report.ok());
+        assert!(
+            errors(&report)
+                .iter()
+                .any(|m| m.contains("Quantization record 2 step_time is nan")),
+            "{:?}",
+            errors(&report)
+        );
     }
 
     #[test]

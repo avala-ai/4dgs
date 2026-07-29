@@ -47,7 +47,7 @@ class Report:
         self.findings.append(Finding("note", msg))
 
 
-def _check_quantization_finite(quant: rec.Quantization, report: Report) -> None:
+def _check_quantization_finite(quant: rec.Quantization, report: Report, ordinal: int = 0) -> None:
     """Every step and origin must be finite (spec §5.3).
 
     A non-finite step is the one corrupt field that ruins every gaussian rather than one:
@@ -57,7 +57,15 @@ def _check_quantization_finite(quant: rec.Quantization, report: Report) -> None:
     renderer drawing an empty frame, which points at the renderer.
 
     Reported per field, because "the file is broken" is what the caller already knows.
+
+    Called once per Quantization record as it is walked, not once on whichever record
+    happened to survive. A file may carry more than one — nothing in the framing prevents
+    it — and a validator that only inspected the last would pass a file whose first grid is
+    non-finite while a streamed decoder, which takes the first it meets, decodes the whole
+    scene through it. `ordinal` names the record when there is more than one, so the report
+    points at the offending copy rather than at "the" Quantization record.
     """
+    where = "Quantization" if ordinal == 0 else f"Quantization record {ordinal + 1}"
     for name, value in (
         ("pos_origin[0]", quant.pos_origin[0]),
         ("pos_origin[1]", quant.pos_origin[1]),
@@ -72,7 +80,7 @@ def _check_quantization_finite(quant: rec.Quantization, report: Report) -> None:
         ("step_sigma_log", quant.step_sigma_log),
     ):
         if not math.isfinite(value):
-            report.error(f"Quantization {name} is {value}; every step and origin must be finite (§5.3)")
+            report.error(f"{where} {name} is {value}; every step and origin must be finite (§5.3)")
 
 
 def validate(data: bytes) -> Report:
@@ -89,6 +97,7 @@ def validate(data: bytes) -> Report:
     seen: list[int] = []
     header = None
     quant = None
+    quant_count = 0
     chunk_count = 0
     counted = 0
     index: list[rec.ChunkIndexEntry] = []
@@ -101,6 +110,10 @@ def validate(data: bytes) -> Report:
                 header = rec.Header.parse(record.content)
             elif record.opcode == op.QUANTIZATION:
                 quant = rec.Quantization.parse(record.content)
+                # Checked here, as the record is met, rather than once at the end on
+                # whichever copy survived the loop. See `_check_quantization_finite`.
+                _check_quantization_finite(quant, report, quant_count)
+                quant_count += 1
             elif record.opcode == op.CHUNK:
                 head, _ = rec.parse_chunk(record.content)
                 chunk_count += 1
@@ -131,9 +144,6 @@ def validate(data: bytes) -> Report:
         report.error("no Quantization record")
     if footer is None:
         report.error("no Footer record")
-
-    if quant is not None:
-        _check_quantization_finite(quant, report)
 
     if header is not None and counted != header.gaussian_count:
         report.error(f"Header declares {header.gaussian_count} gaussians; chunks contain {counted}")

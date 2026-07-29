@@ -22,6 +22,7 @@ __version__ = "0.1.0"
 from .exceptions import (
     BoundViolation,
     FourdgsError,
+    InvalidInput,
     MalformedFile,
     TruncatedFile,
     UnsupportedCodec,
@@ -41,6 +42,7 @@ __all__ = [
     "FourdgsError",
     "GaussianSet",
     "GltfImport",
+    "InvalidInput",
     "MalformedFile",
     "Scene",
     "Steps",
