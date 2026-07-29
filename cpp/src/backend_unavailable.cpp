@@ -78,6 +78,10 @@ Result<Statistics> statistics(const Handle&) { return notImplemented(); }
 std::vector<SummaryOffset> summaryOffsets(const Handle&) { return std::vector<SummaryOffset>(); }
 int summaryCrcState(const Handle&) { return -1; }
 
+Result<std::vector<std::uint8_t>> encodeScene(const GaussianView&, double, const WriteOptions&) {
+  return notImplemented();
+}
+
 void closeScene(Handle& handle) noexcept { handle.scene = nullptr; }
 void closeState(StateHandle& state) noexcept { state.state = nullptr; }
 

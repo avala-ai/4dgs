@@ -8,6 +8,13 @@ All notable changes to the C++ package are documented here, following
 
 ### Added
 
+- The encode surface: `fourdgs::encodeScene`, binding the core's `fourdgs_writer_*` C ABI, so the
+  package authors files through the same core it decodes through rather than a second encoder. A
+  `test_writer` unit test builds a tiny scene, encodes it and reopens the bytes, and an
+  `encode_roundtrip` conformance runner re-encodes each variant's gaussians for the cross-language
+  gate, which requires the Python decoder to read the binding's output the same as the Rust
+  reference's.
+
 - The package: a CMake project (`fourdgs-cpp`, target `fourdgs::cpp`), the public C++17 API over the
   spec's data model, `Result<T>` error handling, `Readable` transports, and the two conformance
   runners.

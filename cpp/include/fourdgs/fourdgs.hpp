@@ -19,6 +19,7 @@
 #include "fourdgs/result.hpp"
 #include "fourdgs/scene.hpp"
 #include "fourdgs/span.hpp"
+#include "fourdgs/writer.hpp"
 
 namespace fourdgs {
 

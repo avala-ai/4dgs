@@ -14,12 +14,15 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  BytesReadable,
   Cursor,
   MalformedFile,
   TruncatedFile,
   UnsupportedVersion,
   StreamDecoder,
   bandCoefficientRange,
+  decodeScene,
+  encodeScene,
   checkMagic,
   coefficientsForDegree,
   coefficientsInBand,
@@ -332,5 +335,46 @@ test("rounding matches Python's round, including the ties a float32 can hit", ()
   ];
   for (const [input, expected] of cases) {
     assert.equal(roundHalfEven(input, 6), expected, `round(${input}, 6)`);
+  }
+});
+
+test("the encoder writes a file that decodes back to what went in", async () => {
+  const count = 3;
+  const gaussians = {
+    count,
+    positions: [0, 0, 0, 1, 0.5, -0.5, -1, 2, 0.25],
+    scales: [0.1, 0.1, 0.1, 0.2, 0.15, 0.1, 0.05, 0.05, 0.05],
+    rotations: [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+    colors: [0.9, 0.1, 0.1, 1, 0.1, 0.9, 0.1, 0.8, 0.1, 0.1, 0.9, 0.5],
+    motions: [0, 0, 0, 0.1, 0, 0, 0, -0.1, 0],
+    muT: [0.5, 1, 1.5],
+    // The middle gaussian never fades: +Infinity must survive as +Infinity.
+    sigmaT: [0.3, Number.POSITIVE_INFINITY, 0.4],
+    winLo: [0, 0, 0],
+    winHi: [2, 2, 2],
+  };
+
+  const bytes = await encodeScene(gaussians, 2, {
+    maxDepth: 4,
+    minChunkGaussians: 1,
+    profile: "test",
+  });
+  const scene = await decodeScene(new BytesReadable(bytes));
+
+  assert.equal(scene.header.durationSec, 2);
+  assert.equal(scene.header.profile, "test");
+  assert.equal(scene.header.temporalModel, "gaussian-birth");
+  assert.equal(scene.gaussians.count, count);
+
+  let infinities = 0;
+  for (let i = 0; i < count; i++) {
+    assert.ok(!Number.isNaN(scene.gaussians.sigmaT[i]));
+    if (!Number.isFinite(scene.gaussians.sigmaT[i]!)) infinities += 1;
+  }
+  assert.equal(infinities, 1);
+
+  // Every decoded position lands within the grid's bound of the input it came from.
+  for (let i = 0; i < count * 3; i++) {
+    assert.ok(Math.abs(scene.gaussians.positions[i]! - gaussians.positions[i]!) < 0.05);
   }
 });

@@ -31,9 +31,10 @@ use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use crate::error::Error;
-use crate::model::StateAt;
+use crate::model::{GaussianSet, StateAt};
 use crate::readable::{FileReadable, Readable};
 use crate::reader::SceneReader;
+use crate::writer::{write_to_vec, SceneExtras, WriteOptions};
 
 // --------------------------------------------------------------------------
 // Status codes
@@ -1445,4 +1446,449 @@ pub unsafe extern "C" fn fourdgs_scene_bytes_for_chunk(
         .inner
         .bytes_for_chunk(i, max_sh_band)
         .unwrap_or(0)
+}
+
+// --------------------------------------------------------------------------
+// Encoding
+// --------------------------------------------------------------------------
+//
+// The decode surface above ends at gaussian state; this is the other direction. The C++
+// and Swift packages are bindings over the core rather than parallel encoders, so an
+// authoring surface for the native tier is a handful of `fourdgs_writer_*` functions here
+// and a thin shim per language — the same shape the decode surface already has.
+//
+// The four rules the header states hold unchanged: nothing unwinds (every entry point runs
+// inside `catch_unwind`), every fallible call returns a `fourdgs_status`, null is safe, and
+// borrowed pointers state their lifetime. Encoding adds one owned type — `fourdgs_buffer` —
+// because the encoder produces a whole file at once rather than streaming, and the caller
+// has to own those bytes until it has written them somewhere.
+//
+// These functions are additions to a frozen ABI: they appear after everything above and
+// change no signature there.
+
+/// A scene being assembled for encoding. Opaque to C.
+///
+/// Structure-of-arrays like the core it wraps: the gaussian columns are set in one call,
+/// spherical harmonics in another, and the write options through the small setters below.
+pub struct fourdgs_writer {
+    gaussians: GaussianSet,
+    duration_sec: f64,
+    options: WriteOptions,
+}
+
+/// An owned buffer of encoded bytes. Opaque to C, freed with `fourdgs_buffer_free`.
+pub struct fourdgs_buffer {
+    data: Vec<u8>,
+}
+
+/// Borrow a writer mutably, or report a null argument.
+macro_rules! writer_mut {
+    ($writer:expr) => {
+        match unsafe { $writer.as_mut() } {
+            Some(w) => w,
+            None => {
+                set_last_error("the writer pointer is null".into());
+                return FOURDGS_STATUS_INVALID_ARGUMENT;
+            }
+        }
+    };
+}
+
+/// Copy `len` floats out of a caller-owned column, or `None` when the pointer is null and
+/// `len` is not zero. An empty column is a valid empty vector, never a null-pointer error.
+unsafe fn copy_f32(ptr: *const f32, len: usize) -> Option<Vec<f32>> {
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: the caller states `ptr` points at `len` readable floats.
+    Some(unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec())
+}
+
+/// Read a borrowed `(pointer, length)` string as UTF-8. Null with length zero is the empty
+/// string; null with a non-zero length is an error, as is invalid UTF-8.
+unsafe fn read_utf8(data: *const c_char, length: usize) -> Result<String, c_int> {
+    if length == 0 {
+        return Ok(String::new());
+    }
+    if data.is_null() {
+        set_last_error("a non-empty string was passed as null".into());
+        return Err(FOURDGS_STATUS_INVALID_ARGUMENT);
+    }
+    // SAFETY: the caller states `data` points at `length` readable bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, length) };
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Ok(text.to_string()),
+        Err(_) => {
+            set_last_error("a string argument is not valid UTF-8".into());
+            Err(FOURDGS_STATUS_INVALID_ARGUMENT)
+        }
+    }
+}
+
+/// Create an empty writer with the encoder's default options. Null on allocation failure,
+/// which a caller checks exactly as it checks a failed open.
+#[no_mangle]
+pub extern "C" fn fourdgs_writer_new() -> *mut fourdgs_writer {
+    match catch_unwind(AssertUnwindSafe(|| {
+        Box::into_raw(Box::new(fourdgs_writer {
+            gaussians: GaussianSet::default(),
+            duration_sec: 0.0,
+            options: WriteOptions::default(),
+        }))
+    })) {
+        Ok(ptr) => ptr,
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Release a writer. Null is accepted and ignored.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_writer_free(writer: *mut fourdgs_writer) {
+    if writer.is_null() {
+        return;
+    }
+    // SAFETY: `writer` came from `Box::into_raw` in `fourdgs_writer_new`.
+    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+        drop(Box::from_raw(writer));
+    }));
+}
+
+/// Scene length in seconds; playback will cover `[0, duration)`.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_writer_set_duration(
+    writer: *mut fourdgs_writer,
+    duration_sec: f64,
+) -> c_int {
+    guarded(|| {
+        let w = writer_mut!(writer);
+        w.duration_sec = duration_sec;
+        FOURDGS_STATUS_OK
+    })
+}
+
+/// The Header's marginal visibility threshold. It sets the support constant the per-gaussian
+/// velocity grid is derived from, so encoder and decoder must agree on it — which they do by
+/// its living in the file.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_writer_set_cutoff(
+    writer: *mut fourdgs_writer,
+    cutoff: f64,
+) -> c_int {
+    guarded(|| {
+        let w = writer_mut!(writer);
+        w.options.cutoff = cutoff;
+        FOURDGS_STATUS_OK
+    })
+}
+
+/// The temporal partition's depth and the smallest chunk worth its own record. `max_depth`
+/// of 0 writes one chunk per window; a larger `min_chunk_gaussians` collapses fine nodes
+/// back into their parent.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_writer_set_chunking(
+    writer: *mut fourdgs_writer,
+    max_depth: u32,
+    min_chunk_gaussians: usize,
+) -> c_int {
+    guarded(|| {
+        let w = writer_mut!(writer);
+        w.options.max_depth = max_depth;
+        w.options.min_chunk_gaussians = min_chunk_gaussians;
+        FOURDGS_STATUS_OK
+    })
+}
+
+/// Which parts of the summary the file carries. Each argument is a boolean: non-zero writes
+/// that part, zero omits it. The index is what makes seeking work; the others are advisory.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_writer_set_summary(
+    writer: *mut fourdgs_writer,
+    write_index: c_int,
+    write_statistics: c_int,
+    write_summary_offsets: c_int,
+    write_crc: c_int,
+) -> c_int {
+    guarded(|| {
+        let w = writer_mut!(writer);
+        w.options.write_index = write_index != 0;
+        w.options.write_statistics = write_statistics != 0;
+        w.options.write_summary_offsets = write_summary_offsets != 0;
+        w.options.write_crc = write_crc != 0;
+        FOURDGS_STATUS_OK
+    })
+}
+
+/// The highest spherical harmonic band to write, 0 to 3. A scene may carry more coefficients
+/// than are written; the excess is dropped rather than an error.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_writer_set_sh_bands(
+    writer: *mut fourdgs_writer,
+    sh_bands: u8,
+) -> c_int {
+    guarded(|| {
+        let w = writer_mut!(writer);
+        w.options.sh_bands = sh_bands;
+        FOURDGS_STATUS_OK
+    })
+}
+
+/// Per-band spherical harmonic bit depths, band 1 first. A null pointer or a zero count
+/// clears the ladder, leaving the coefficients as the profile alone decides — which is what
+/// a file written before this option existed did, byte for byte.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_writer_set_sh_bit_depths(
+    writer: *mut fourdgs_writer,
+    depths: *const u8,
+    count: usize,
+) -> c_int {
+    guarded(|| {
+        let w = writer_mut!(writer);
+        if depths.is_null() || count == 0 {
+            w.options.sh_bit_depths = None;
+        } else {
+            // SAFETY: the caller states `depths` points at `count` readable bytes.
+            let slice = unsafe { std::slice::from_raw_parts(depths, count) };
+            w.options.sh_bit_depths = Some(slice.to_vec());
+        }
+        FOURDGS_STATUS_OK
+    })
+}
+
+/// The Header's `profile`: a promise about the file's shape. A `(pointer, length)` string,
+/// UTF-8, not NUL-terminated — the format's `string` may legally contain a NUL.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_writer_set_profile(
+    writer: *mut fourdgs_writer,
+    data: *const c_char,
+    length: usize,
+) -> c_int {
+    guarded(|| {
+        let w = writer_mut!(writer);
+        match unsafe { read_utf8(data, length) } {
+            Ok(text) => {
+                w.options.scene_profile = text;
+                FOURDGS_STATUS_OK
+            }
+            Err(status) => status,
+        }
+    })
+}
+
+/// The Header's `library`: free-form producer identification. The same string convention as
+/// `fourdgs_writer_set_profile`.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_writer_set_library(
+    writer: *mut fourdgs_writer,
+    data: *const c_char,
+    length: usize,
+) -> c_int {
+    guarded(|| {
+        let w = writer_mut!(writer);
+        match unsafe { read_utf8(data, length) } {
+            Ok(text) => {
+                w.options.library = text;
+                FOURDGS_STATUS_OK
+            }
+            Err(status) => status,
+        }
+    })
+}
+
+/// Add one key/value pair to the Header's attributes map. Both are `(pointer, length)`
+/// UTF-8 strings. A repeated key overwrites, so the map a caller builds is the map the file
+/// carries.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_writer_add_attribute(
+    writer: *mut fourdgs_writer,
+    key: *const c_char,
+    key_length: usize,
+    value: *const c_char,
+    value_length: usize,
+) -> c_int {
+    guarded(|| {
+        let w = writer_mut!(writer);
+        let key = match unsafe { read_utf8(key, key_length) } {
+            Ok(text) => text,
+            Err(status) => return status,
+        };
+        let value = match unsafe { read_utf8(value, value_length) } {
+            Ok(text) => text,
+            Err(status) => return status,
+        };
+        w.options.metadata.insert(key, value);
+        FOURDGS_STATUS_OK
+    })
+}
+
+/// Set the gaussian columns, structure-of-arrays, all `count` gaussians at once.
+///
+/// The columns are copied, so the caller's arrays may be released as soon as this returns.
+/// Widths are per gaussian: `positions`, `scales` and `motions` are three floats each,
+/// `rotations` and `colors` four, and `mu_t`, `sigma_t`, `win_lo` and `win_hi` one. A null
+/// column is an error unless `count` is zero. Setting the columns clears any spherical
+/// harmonics previously attached, because their row count is tied to this one — set the
+/// gaussians first, then the harmonics.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn fourdgs_writer_set_gaussians(
+    writer: *mut fourdgs_writer,
+    count: u32,
+    positions: *const f32,
+    scales: *const f32,
+    rotations: *const f32,
+    colors: *const f32,
+    motions: *const f32,
+    mu_t: *const f32,
+    sigma_t: *const f32,
+    win_lo: *const f32,
+    win_hi: *const f32,
+) -> c_int {
+    guarded(|| {
+        let w = writer_mut!(writer);
+        let n = count as usize;
+        macro_rules! column {
+            ($ptr:expr, $width:expr, $name:literal) => {
+                match unsafe { copy_f32($ptr, n * $width) } {
+                    Some(values) => values,
+                    None => {
+                        set_last_error(
+                            concat!($name, " is null for a non-empty gaussian set").into(),
+                        );
+                        return FOURDGS_STATUS_INVALID_ARGUMENT;
+                    }
+                }
+            };
+        }
+        let positions = column!(positions, 3, "positions");
+        let scales = column!(scales, 3, "scales");
+        let rotations = column!(rotations, 4, "rotations");
+        let colors = column!(colors, 4, "colors");
+        let motions = column!(motions, 3, "motions");
+        let mu_t = column!(mu_t, 1, "mu_t");
+        let sigma_t = column!(sigma_t, 1, "sigma_t");
+        let win_lo = column!(win_lo, 1, "win_lo");
+        let win_hi = column!(win_hi, 1, "win_hi");
+
+        w.gaussians = GaussianSet {
+            positions,
+            scales,
+            rotations,
+            colors,
+            motions,
+            mu_t,
+            sigma_t,
+            win_lo,
+            win_hi,
+            sh: None,
+            sh_coefficients: 0,
+            sh_degree: 0,
+            source_index: None,
+        };
+        FOURDGS_STATUS_OK
+    })
+}
+
+/// Attach spherical harmonic coefficients to the gaussians already set.
+///
+/// `coefficients` is the count per colour component, so a row is three times that wide and
+/// the payload is `count * 3 * coefficients` bytes, component-major: every coefficient of
+/// red, then of green, then of blue. A null payload, a zero degree or a zero coefficient
+/// count clears the harmonics. The payload is copied.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_writer_set_sh(
+    writer: *mut fourdgs_writer,
+    degree: u8,
+    coefficients: u32,
+    sh: *const u8,
+    length: usize,
+) -> c_int {
+    guarded(|| {
+        let w = writer_mut!(writer);
+        if degree == 0 || coefficients == 0 || sh.is_null() || length == 0 {
+            w.gaussians.sh = None;
+            w.gaussians.sh_degree = 0;
+            w.gaussians.sh_coefficients = 0;
+            return FOURDGS_STATUS_OK;
+        }
+        let n = w.gaussians.count();
+        let expected = n.saturating_mul(3).saturating_mul(coefficients as usize);
+        if length != expected {
+            set_last_error(format!(
+                "sh payload is {length} bytes; {n} gaussians at {coefficients} coefficients need {expected}"
+            ));
+            return FOURDGS_STATUS_MALFORMED;
+        }
+        // SAFETY: the caller states `sh` points at `length` readable bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(sh, length) }.to_vec();
+        w.gaussians.sh = Some(bytes);
+        w.gaussians.sh_degree = degree;
+        w.gaussians.sh_coefficients = coefficients as usize;
+        FOURDGS_STATUS_OK
+    })
+}
+
+/// Encode the scene into an owned buffer.
+///
+/// The encoder verifies its own bounds before returning — it decodes every chunk back and
+/// refuses a file whose measured deviation exceeds what it is about to declare — so a
+/// success here is a file whose Quantization record was checked on every gaussian. On
+/// failure the out parameter is left untouched and `fourdgs_last_error` names the reason.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_writer_encode(
+    writer: *mut fourdgs_writer,
+    out: *mut *mut fourdgs_buffer,
+) -> c_int {
+    guarded(|| {
+        let w = writer_mut!(writer);
+        if out.is_null() {
+            set_last_error("the out parameter is null".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        }
+        let extras = SceneExtras::default();
+        match write_to_vec(&w.gaussians, w.duration_sec, &w.options, &extras) {
+            Ok(bytes) => {
+                let buffer = Box::new(fourdgs_buffer { data: bytes });
+                // SAFETY: `out` was checked non-null; the caller frees the result with
+                // `fourdgs_buffer_free`.
+                unsafe { *out = Box::into_raw(buffer) };
+                FOURDGS_STATUS_OK
+            }
+            Err(e) => report(e),
+        }
+    })
+}
+
+/// The encoded bytes, borrowed until the buffer is freed. Null for an empty buffer.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_buffer_data(buffer: *const fourdgs_buffer) -> *const u8 {
+    // SAFETY: null is handled; otherwise the caller guarantees a live buffer.
+    match unsafe { buffer.as_ref() } {
+        Some(b) if !b.data.is_empty() => b.data.as_ptr(),
+        _ => std::ptr::null(),
+    }
+}
+
+/// How many bytes the buffer holds. 0 for a null buffer.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_buffer_len(buffer: *const fourdgs_buffer) -> usize {
+    // SAFETY: null is handled; otherwise the caller guarantees a live buffer.
+    match unsafe { buffer.as_ref() } {
+        Some(b) => b.data.len(),
+        None => 0,
+    }
+}
+
+/// Release an encoded buffer. Null is accepted and ignored.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_buffer_free(buffer: *mut fourdgs_buffer) {
+    if buffer.is_null() {
+        return;
+    }
+    // SAFETY: `buffer` came from `Box::into_raw` in `fourdgs_writer_encode`.
+    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+        drop(Box::from_raw(buffer));
+    }));
 }

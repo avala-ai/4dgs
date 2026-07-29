@@ -28,7 +28,7 @@ Dart decline those and the five variants that carry provenance records.
 | Spherical harmonics, degree 3                        | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | SH band range-skipping                               | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | SH per-band bit depth, decode                        | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| SH per-band bit depth, encode                        | Yes    | Planned    | Yes     | Planned | Planned | Planned |
+| SH per-band bit depth, encode                        | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
 | Embedded audio (optional, zero-overhead when absent) | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Camera trajectory                                    | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Metadata                                             | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
@@ -40,9 +40,9 @@ Dart decline those and the five variants that carry provenance records.
 | Unknown-record skipping                              | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Refusal diagnosis (named, not merely refused)        | Yes    | No         | No      | No      | No      | No      |
 | Private-range records                                | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Encode                                               | Yes    | Planned    | Yes     | Planned | Planned | Planned |
-| Chunked encode                                       | Yes    | Planned    | Yes     | Planned | Planned | Planned |
-| Summary writing                                      | Yes    | Planned    | Yes     | Planned | Planned | Planned |
+| Encode                                               | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
+| Chunked encode                                       | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
+| Summary writing                                      | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
 | Convert from PLY frame sequences                     | Yes    | No         | No      | No      | No      | No      |
 | Inspect and validate                                 | Yes    | Planned    | Planned | Planned | Planned | Planned |
 
@@ -89,8 +89,13 @@ same thing as callbacks, so an HTTP reader belongs to the consumer. Dart is the 
 decoder takes a `FourdgsReadable`, ships an in-memory and a file transport, and leaves HTTP to the
 consumer.
 
-**Encode** stays `Planned` for TypeScript because there is no TypeScript encoder. The packages there
-decode; Python's encoder is the reference and Rust's is the production one.
+**Encode** is now `Yes` for TypeScript, C++ and Swift, and the two kinds of encoder are proved
+differently. TypeScript is a second implementation — a from-scratch encoder in `@4dgs/core`, so a
+browser can author a file — and it is diffed against the reference the way a second decoder is: on
+decoded content, not bytes. C++ and Swift are bindings over the Rust core's writer
+(`fourdgs_writer_*` in the C ABI), so their gate proves the binding passed the gaussians and options
+through correctly rather than that a second encoder agrees. Python remains the reference encoder and
+Rust the production one.
 
 **Convert from PLY frame sequences** takes a directory of standard per-frame gaussian splat PLY
 files — the common interchange form — and produces a `.4dgs`. It lives in the Python package because
@@ -129,7 +134,10 @@ The encode row is proved the way the other encode rows are: Python's by the corp
 re-encodes every variant and asserts its checksum, and Rust's by `encode-roundtrip.sh`, which now
 re-encodes every SH-bearing variant at per-band depths and requires the Python decoder to agree with
 the Rust one about the result — and, separately, to read back the depths that were declared. A file
-whose coefficients and whose declaration disagree fails one check or the other.
+whose coefficients and whose declaration disagree fails one check or the other. TypeScript, C++ and
+Swift are proved by the cross-language encode gate below, which runs the same per-band pass: the
+coefficients each encoder coarsened must come back out of the Python decoder as the same bytes, and
+the appended depths must read as the ones written.
 
 **SH band range-skipping** is proved by a byte count taken at the transport rather than by a decoded
 value: each runner reads a chunk at every band cap and asserts the bytes transferred equal exactly
@@ -164,7 +172,7 @@ same centre and opacity, and every gaussian it calls visible must appear in the 
 check cannot pass against a decoder that returns nothing.
 
 **Encode**, **Chunked encode** and **Summary writing** are proved by a gate rather than by a runner,
-and the two encoders are gated differently because they play different roles.
+and the encoders are gated by their role.
 
 Python's is proved by the corpus gate: `generate.py --verify` re-encodes all 44 valid variants,
 asserts every committed checksum, and asserts that two consecutive runs are byte-identical. Every
@@ -182,6 +190,21 @@ decodes each chunk back and refuses to return a file whose measured deviation ex
 is about to declare — so the Quantization record's numbers are checked on every gaussian of every
 scene rather than sampled. The chunk tree is exercised by the same run: the corpus scenes partition
 into up to 42 chunks each.
+
+TypeScript, C++ and Swift are proved by the cross-language encode gate,
+`tests/conformance/encode_roundtrip.py`. It re-encodes every variant's decoded gaussians twice —
+once with the language under test, once with a shared Rust reference that writes gaussians alone
+(`encode_gaussians`) — and requires the Python decoder to read both files to the same summary. What
+"the same" means depends on the encoder. C++ and Swift reach the Rust writer through the C ABI
+(`fourdgs_writer_*`), so their files match the reference on every field; the gate therefore proves
+the binding wired the gaussians and options through correctly, which is the only thing a binding can
+get wrong. TypeScript is a genuine second encoder, so it makes its own byte-layout choices — how
+well `deflate` did, which order gaussians sit in a chunk — that a decoder cannot see and the
+specification does not fix; those fields are set aside and the diff rests on decoded content: the
+gaussian values, the chunk intervals, the statistics, the spherical-harmonic digest. The chunked and
+summary rows ride the same gate — the small chunk threshold the preset uses partitions the corpus
+scenes into a tree whose intervals both encoders must agree on, and the statistics record they both
+write carries the chunk count.
 
 **Fuzzed** is a property of an implementation, not a feature of the format, so it is not a row in
 this table — a row would imply the format has something called fuzzing that an SDK can support.
@@ -213,12 +236,17 @@ the other two; its encode rows come from the cross-implementation gate described
 remains the reference encoder — the one the corpus is generated from — and Rust's is the production
 one, which is why it verifies its own bounds exhaustively rather than trusting the grid arithmetic.
 The crate also carries the C ABI — `rust/fourdgs/include/fourdgs.h` — which is the surface the
-native tier binds to rather than hand-writing and then maintaining parallel implementations. That
-header is checked by a C program compiled and run in CI, not by the corpus, because a drift between
-a header and the symbols behind it is not something a decode suite can see.
+native tier binds to rather than hand-writing and then maintaining parallel implementations. It
+covers both directions: the decode surface and, appended to it without disturbing a frozen
+signature, a `fourdgs_writer_*` surface the native tier authors through. That header is checked by a
+C program compiled and run in CI — which now also builds a tiny scene, encodes it and reopens the
+bytes — not by the corpus, because a drift between a header and the symbols behind it is not
+something a decode suite can see.
 
-**C++** and **Swift** take their surface from that C ABI — the header plus a thin shim per language.
-Swift targets visionOS and iOS.
+**C++** and **Swift** take their surface from that C ABI — the header plus a thin shim per language
+— in both directions: they decode through it and, now, encode through it, `fourdgs::encodeScene` and
+`SceneWriter.encode` binding the core's `fourdgs_writer_*` functions rather than reimplementing the
+quantizer. Swift targets visionOS and iOS.
 
 **Dart** is an independent decoder rather than a binding: pure Dart, no Flutter dependency, sharing
 no code with the other five. That is what makes its agreement with them worth something — the row it

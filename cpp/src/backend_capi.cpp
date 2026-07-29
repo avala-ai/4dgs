@@ -458,6 +458,86 @@ int summaryCrcState(const Handle& handle) {
   return fourdgs_scene_summary_crc_state(asScene(handle));
 }
 
+/// A writer owned for exactly the length of an encode. The core copies every column in, so
+/// nothing the caller lent has to outlive this scope.
+struct WriterGuard {
+  fourdgs_writer* writer = fourdgs_writer_new();
+  WriterGuard() = default;
+  ~WriterGuard() { fourdgs_writer_free(writer); }
+  WriterGuard(const WriterGuard&) = delete;
+  WriterGuard& operator=(const WriterGuard&) = delete;
+};
+
+Result<std::vector<std::uint8_t>> encodeScene(const GaussianView& gaussians, double durationSec,
+                                              const WriteOptions& options) {
+  WriterGuard guard;
+  if (guard.writer == nullptr) {
+    return Error(ErrorCode::kInternal, "the core could not allocate a writer");
+  }
+  fourdgs_writer* writer = guard.writer;
+
+  // Options first, then the columns: setting the columns clears any harmonics, so the sh
+  // call has to come after them.
+  Result<void> staged = check(fourdgs_writer_set_duration(writer, durationSec));
+  if (!staged) return staged.error();
+  staged = check(fourdgs_writer_set_cutoff(writer, options.cutoff));
+  if (!staged) return staged.error();
+  staged = check(fourdgs_writer_set_chunking(writer, options.maxDepth, options.minChunkGaussians));
+  if (!staged) return staged.error();
+  staged = check(fourdgs_writer_set_summary(
+      writer, options.writeIndex ? 1 : 0, options.writeStatistics ? 1 : 0,
+      options.writeSummaryOffsets ? 1 : 0, options.writeCrc ? 1 : 0));
+  if (!staged) return staged.error();
+  staged = check(fourdgs_writer_set_sh_bands(writer, options.shBands));
+  if (!staged) return staged.error();
+  staged = check(fourdgs_writer_set_sh_bit_depths(
+      writer, options.shBitDepths.empty() ? nullptr : options.shBitDepths.data(),
+      options.shBitDepths.size()));
+  if (!staged) return staged.error();
+  if (!options.profile.empty()) {
+    staged =
+        check(fourdgs_writer_set_profile(writer, options.profile.data(), options.profile.size()));
+    if (!staged) return staged.error();
+  }
+  if (!options.library.empty()) {
+    staged =
+        check(fourdgs_writer_set_library(writer, options.library.data(), options.library.size()));
+    if (!staged) return staged.error();
+  }
+  for (const auto& [key, value] : options.attributes) {
+    staged = check(
+        fourdgs_writer_add_attribute(writer, key.data(), key.size(), value.data(), value.size()));
+    if (!staged) return staged.error();
+  }
+
+  const auto count = static_cast<std::uint32_t>(gaussians.count);
+  staged = check(fourdgs_writer_set_gaussians(writer, count, gaussians.positions.data(),
+                                              gaussians.scales.data(), gaussians.rotations.data(),
+                                              gaussians.colors.data(), gaussians.motions.data(),
+                                              gaussians.muT.data(), gaussians.sigmaT.data(),
+                                              gaussians.winLo.data(), gaussians.winHi.data()));
+  if (!staged) return staged.error();
+  if (gaussians.shDegree > 0 && gaussians.shCoefficients > 0 && !gaussians.sh.empty()) {
+    staged = check(fourdgs_writer_set_sh(writer, static_cast<std::uint8_t>(gaussians.shDegree),
+                                         static_cast<std::uint32_t>(gaussians.shCoefficients),
+                                         gaussians.sh.data(), gaussians.sh.size()));
+    if (!staged) return staged.error();
+  }
+
+  fourdgs_buffer* buffer = nullptr;
+  const int status = fourdgs_writer_encode(writer, &buffer);
+  if (status != FOURDGS_STATUS_OK) return failure(status).error();
+
+  // Copied out before the buffer is freed: the bytes are the caller's to keep, and the ABI's
+  // pointer lives only until fourdgs_buffer_free.
+  const std::uint8_t* data = fourdgs_buffer_data(buffer);
+  const std::size_t length = fourdgs_buffer_len(buffer);
+  std::vector<std::uint8_t> out(length);
+  if (length != 0 && data != nullptr) std::memcpy(out.data(), data, length);
+  fourdgs_buffer_free(buffer);
+  return out;
+}
+
 void closeScene(Handle& handle) noexcept {
   // Null is ignored by the ABI, and freeing invalidates every pointer borrowed from it —
   // which is why nothing in this package holds one across a close.

@@ -29,6 +29,11 @@ let package = Package(
         .executableTarget(
             name: "decode_indexed", dependencies: ["ConformanceSupport"], path: "conformance/decode_indexed"),
 
+        // The other direction: re-encode a variant's gaussians through the core's writer and
+        // write a file the cross-language encode gate diffs against the Rust reference.
+        .executableTarget(
+            name: "encode_roundtrip", dependencies: ["FourDGS"], path: "conformance/encode_roundtrip"),
+
         // Prints the canonical JSON for a scene built from a fixed seed, with no decoding
         // involved, so that the Swift emitter can be diffed against canonical.py before
         // there is a decoder. See conformance/selftest.py.

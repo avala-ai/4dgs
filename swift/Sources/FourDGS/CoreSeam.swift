@@ -414,6 +414,134 @@ enum Core {
         fourdgs_scene_bytes_for_chunk(scene.raw, i, bandCapByte(bandCap))
     }
 
+    // MARK: - Encoding
+
+    /// Encode a set of gaussians into a `.4dgs` byte buffer through the core's writer.
+    ///
+    /// Every column is lent to the core for the length of one call — rule 2 — and the core
+    /// copies it in, so nothing here outlives the buffer pointers. The finished bytes are
+    /// copied out of the core's buffer before it is freed, exactly as the resident arrays are
+    /// on the decode side, so what this returns is owned Swift storage the caller keeps.
+    static func encode(
+        _ gaussians: GaussianState, durationSec: Double, options: WriteOptions
+    ) throws
+        -> [UInt8]
+    {
+        guard let writer = fourdgs_writer_new() else {
+            throw FourDGSError.core(
+                code: Int32(FOURDGS_STATUS_INTERNAL.rawValue),
+                message: "the core could not allocate a writer")
+        }
+        defer { fourdgs_writer_free(writer) }
+
+        try check(fourdgs_writer_set_duration(writer, durationSec))
+        try check(fourdgs_writer_set_cutoff(writer, options.cutoff))
+        try check(fourdgs_writer_set_chunking(writer, options.maxDepth, options.minChunkGaussians))
+        try check(
+            fourdgs_writer_set_summary(
+                writer, Int32(options.writeIndex ? 1 : 0), Int32(options.writeStatistics ? 1 : 0),
+                Int32(options.writeSummaryOffsets ? 1 : 0), Int32(options.writeCrc ? 1 : 0)))
+        try check(fourdgs_writer_set_sh_bands(writer, options.shBands))
+        try options.shBitDepths.withUnsafeBufferPointer { buffer in
+            try check(fourdgs_writer_set_sh_bit_depths(writer, buffer.baseAddress, buffer.count))
+        }
+        if !options.profile.isEmpty {
+            try setString(options.profile) { fourdgs_writer_set_profile(writer, $0, $1) }
+        }
+        if !options.library.isEmpty {
+            try setString(options.library) { fourdgs_writer_set_library(writer, $0, $1) }
+        }
+        for (key, value) in options.attributes {
+            var keyBytes = Array(key.utf8)
+            var valueBytes = Array(value.utf8)
+            try keyBytes.withUnsafeMutableBufferPointer { keyBuffer in
+                try valueBytes.withUnsafeMutableBufferPointer { valueBuffer in
+                    let keyPtr = keyBuffer.baseAddress.map {
+                        UnsafeRawPointer($0).assumingMemoryBound(to: CChar.self)
+                    }
+                    let valuePtr = valueBuffer.baseAddress.map {
+                        UnsafeRawPointer($0).assumingMemoryBound(to: CChar.self)
+                    }
+                    try check(
+                        fourdgs_writer_add_attribute(
+                            writer, keyPtr, keyBuffer.count, valuePtr, valueBuffer.count))
+                }
+            }
+        }
+
+        // All nine columns have to be valid at once, because the ABI reads them in one call —
+        // hence the nest rather than nine sequential borrows.
+        try withColumns(
+            [
+                gaussians.positions, gaussians.scales, gaussians.rotations, gaussians.colors,
+                gaussians.motions, gaussians.muT, gaussians.sigmaT, gaussians.winLo, gaussians.winHi,
+            ]
+        ) { column in
+            try check(
+                fourdgs_writer_set_gaussians(
+                    writer, UInt32(gaussians.count), column[0], column[1], column[2], column[3],
+                    column[4], column[5], column[6], column[7], column[8]))
+        }
+
+        if gaussians.shDegree > 0, !gaussians.sh.isEmpty {
+            let coefficients = gaussians.shCoefficientsPerComponent
+            try gaussians.sh.withUnsafeBufferPointer { buffer in
+                try check(
+                    fourdgs_writer_set_sh(
+                        writer, UInt8(gaussians.shDegree), UInt32(coefficients), buffer.baseAddress,
+                        buffer.count))
+            }
+        }
+
+        var buffer: OpaquePointer?
+        let status = fourdgs_writer_encode(writer, &buffer)
+        guard status == ok, let buffer else { throw error(status) }
+        defer { fourdgs_buffer_free(buffer) }
+
+        let length = fourdgs_buffer_len(buffer)
+        guard length > 0, let data = fourdgs_buffer_data(buffer) else { return [] }
+        return Array(UnsafeBufferPointer(start: data, count: length))
+    }
+
+    /// Lend a string to the core as `(pointer, length)` UTF-8, not NUL-terminated: the
+    /// format's own `string` may legally contain a NUL. An empty string crosses as a null
+    /// pointer with length zero, which the ABI reads as empty.
+    private static func setString(
+        _ text: String, _ apply: (UnsafePointer<CChar>?, Int) -> Int32
+    ) throws {
+        var bytes = Array(text.utf8)
+        try bytes.withUnsafeMutableBufferPointer { buffer in
+            let chars = buffer.baseAddress.map {
+                UnsafeRawPointer($0).assumingMemoryBound(to: CChar.self)
+            }
+            try check(apply(chars, buffer.count))
+        }
+    }
+
+    /// Hold every column's pointer valid at once, so the ABI can read them all in one call.
+    private static func withColumns(
+        _ columns: [[Float]], _ body: ([UnsafePointer<Float>?]) throws -> Void
+    ) throws {
+        var pointers: [UnsafePointer<Float>?] = []
+        func descend(_ i: Int) throws {
+            if i == columns.count {
+                try body(pointers)
+                return
+            }
+            try columns[i].withUnsafeBufferPointer { buffer in
+                pointers.append(buffer.baseAddress)
+                try descend(i + 1)
+                pointers.removeLast()
+            }
+        }
+        try descend(0)
+    }
+
+    /// A status that is not OK becomes the same typed error the decode side throws.
+    private static func check(_ status: Int32) throws {
+        guard status == ok else { throw error(status) }
+    }
+
     // MARK: - Strings
 
     /// A string the core lends us, copied into Swift storage before the call returns.
