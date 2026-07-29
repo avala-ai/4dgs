@@ -154,8 +154,13 @@ jobs:
         with: { node-version: "22" }
 
       - name: Corpus and build
+        # `dev` brings pytest; `zstd` is not optional here even though it is for the
+        # package. A corrupt codec byte can select zstd on any file, and without the
+        # decompressor that input is refused as an unsupported codec before it ever
+        # reaches the code that has to survive a corrupt zstd frame — the fuzzer would
+        # pass by never running the branch one of its recorded crashes lives in.
         run: |
-          pip install -e ./python/fourdgs
+          pip install -e './python/fourdgs[dev,zstd]'
           python tests/conformance/generate.py
           corepack enable
           yarn install --immutable
