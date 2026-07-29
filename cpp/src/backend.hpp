@@ -4,8 +4,9 @@
 #ifndef FOURDGS_SRC_BACKEND_HPP
 #define FOURDGS_SRC_BACKEND_HPP
 
+#include <cstdint>
+#include <memory>
 #include <string>
-#include <vector>
 
 #include "fourdgs/model.hpp"
 #include "fourdgs/readable.hpp"
@@ -13,19 +14,16 @@
 
 /// The seam.
 ///
-/// Everything above this line is ordinary C++ — RAII, views, `Result`. Everything below it is
-/// the Rust core's C ABI. Exactly one translation unit implements these functions against
+/// Everything above this line is ordinary C++ — RAII, views, `Result`. Everything below it
+/// is the Rust core's C ABI. Exactly one translation unit implements these functions against
 /// that ABI (`backend_capi.cpp`) and exactly one implements them as honest refusals for a
 /// build made without a core (`backend_unavailable.cpp`); CMake picks between them. Nothing
 /// else in the package includes `fourdgs.h`, so the ABI's shape stays a detail of one file.
 namespace fourdgs {
 namespace detail {
 
-/// The state one open decoder holds.
-///
-/// The model objects are C++-owned so the public API can hand out references and views into
-/// them. `core` is whatever the ABI's opaque reader pointer is, owned by the backend and
-/// released in `closeHandle`.
+/// An open scene: the core's opaque pointer, plus whatever the binding must keep alive for
+/// as long as the core holds it.
 class Handle {
  public:
   Handle() = default;
@@ -33,60 +31,59 @@ class Handle {
   Handle(const Handle&) = delete;
   Handle& operator=(const Handle&) = delete;
 
-  Readable* source = nullptr;
-  void* core = nullptr;
-
-  Header header;
-  bool hasCamera = false;
-  Camera camera;
-  bool hasAudio = false;
-  AudioTrack audio;
-  std::vector<MetadataRecord> metadata;
-
-  /// The chunk a streaming decoder currently holds, and the view handed to callers.
-  GaussianData chunk;
-  GaussianView view;
-  double chunkT0 = 0.0;
-  double chunkT1 = 0.0;
-  bool ended = false;
-  bool truncated = false;
-
-  /// Trailing records.
-  std::vector<ChunkIndexEntry> index;
-  bool hasStatistics = false;
-  Statistics statistics;
-  std::vector<Attachment> attachments;
-  std::vector<SummaryOffset> summaryOffsets;
-  bool hasSummaryCrcOk = false;
-  bool summaryCrcOk = false;
-
-  /// Refresh `view` from `chunk`, after the backend has filled the arrays.
-  void refreshView() { view = GaussianView(chunk); }
+  void* scene = nullptr;
 };
 
-/// Open for front-to-back decode; fills the header and the front matter.
-Result<void> openStream(Handle& handle);
+/// Reconstructed state at an instant, owned by the caller and freed with it.
+class StateHandle {
+ public:
+  StateHandle() = default;
+  ~StateHandle();
+  StateHandle(const StateHandle&) = delete;
+  StateHandle& operator=(const StateHandle&) = delete;
 
-/// Decode the next chunk into `handle.chunk`, or report the end of the stream. On `false`
-/// the trailing records and `truncated` are filled in.
-Result<bool> nextChunk(Handle& handle);
+  void* state = nullptr;
+};
 
-/// Open for indexed decode; fills the header, the index and the trailing records by range.
-Result<void> openIndexed(Handle& handle);
+/// Open, three ways. The `Readable` overload borrows the source: the caller keeps ownership
+/// and must outlive the handle.
+Result<void> openPath(Handle& handle, const std::string& path);
+Result<void> openMemory(Handle& handle, Span<const std::uint8_t> bytes);
+Result<void> openReadable(Handle& handle, Readable& source);
 
-/// Read one chunk by its index entry, transferring only the SH bands at or below `maxShBand`.
-Result<void> readChunk(Handle& handle, const ChunkIndexEntry& entry, int maxShBand,
-                       GaussianData& out);
+/// Header fields, none of which can fail once a scene is open.
+double durationSec(const Handle& handle);
+double cutoff(const Handle& handle);
+std::uint64_t gaussianCount(const Handle& handle);
+int shDegree(const Handle& handle);
+bool isIndexed(const Handle& handle);
 
-/// Front matter by byte range, for an indexed reader. `false` means the file has none, which
-/// is a value and not an error.
-Result<bool> readAudio(Handle& handle, AudioTrack* out);
-Result<bool> readCamera(Handle& handle, Camera* out);
-Result<std::vector<MetadataRecord>> readMetadata(Handle& handle);
-Result<std::vector<Attachment>> readAttachments(Handle& handle);
+/// The chunk index.
+std::uint32_t chunkCount(const Handle& handle);
+Result<void> chunkInterval(const Handle& handle, std::uint32_t index, double* t0, double* t1);
+std::uint64_t bytesForTime(const Handle& handle, double t, int maxShBand);
 
-/// Release the core's reader. Called from `~Handle`, and safe on a handle that never opened.
-void closeHandle(Handle& handle) noexcept;
+/// Audio. Absence is a value: `hasAudio` false, an empty codec, a zero size.
+bool hasAudio(const Handle& handle);
+std::string audioCodec(Handle& handle);
+std::uint64_t audioSize(const Handle& handle);
+Result<void> readAudio(Handle& handle, std::uint64_t offset, Span<std::uint8_t> into);
+
+/// Fill the working set, and view what is in it. The view is invalidated by the next load.
+Result<void> loadAll(Handle& handle, int maxShBand);
+Result<void> loadAt(Handle& handle, double t, int maxShBand);
+GaussianView loadedGaussians(const Handle& handle);
+
+/// Reconstruct at an instant.
+Result<void> stateAt(Handle& handle, double t, int maxShBand, StateHandle& out);
+std::size_t stateCount(const StateHandle& state);
+Span<const std::uint32_t> stateIndices(const StateHandle& state);
+Span<const float> stateCenters(const StateHandle& state);
+Span<const float> stateOpacity(const StateHandle& state);
+
+/// Release. Both are safe on a handle that never opened, and on a null one.
+void closeScene(Handle& handle) noexcept;
+void closeState(StateHandle& state) noexcept;
 
 /// What the linked core reports, or null when there is none.
 const char* coreVersionString() noexcept;

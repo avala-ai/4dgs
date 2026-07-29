@@ -49,7 +49,7 @@ else()
                  "building the binding without a decoder")
 endif()
 
-add_library(fourdgs-cpp STATIC src/decoder.cpp src/model.cpp src/readable.cpp src/result.cpp
+add_library(fourdgs-cpp STATIC src/scene.cpp src/model.cpp src/readable.cpp src/result.cpp
                                ${FOURDGS_BACKEND_SOURCE})
 add_library(fourdgs::cpp ALIAS fourdgs-cpp)
 
@@ -67,9 +67,12 @@ endif()
 if(FOURDGS_HAVE_CORE)
   target_include_directories(fourdgs-cpp PRIVATE ${FOURDGS_CORE_HEADER_DIR})
   if(FOURDGS_CORE_LIBRARY STREQUAL "")
+    # The static library first. The crate builds a cdylib too, and linking that would make
+    # every consumer's binary need it on their loader path at run time — a surprise for an
+    # integrator who asked for one static archive.
     find_library(
       FOURDGS_CORE_FOUND_LIBRARY
-      NAMES fourdgs
+      NAMES libfourdgs.a fourdgs
       HINTS "${CMAKE_CURRENT_SOURCE_DIR}/../target/release"
             "${CMAKE_CURRENT_SOURCE_DIR}/../target/debug")
     if(NOT FOURDGS_CORE_FOUND_LIBRARY)

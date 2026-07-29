@@ -50,6 +50,7 @@ words:
   - staticlib
   - lpthread
   - clippy
+  - fprintf
 ignorePaths:
   - "**/node_modules/**"
   - "**/dist/**"

@@ -14,10 +14,10 @@
 /// level of detail, anything touching a GPU — is out of scope for this repository and lives
 /// wherever the splats are drawn.
 
-#include "fourdgs/decoder.hpp"
 #include "fourdgs/model.hpp"
 #include "fourdgs/readable.hpp"
 #include "fourdgs/result.hpp"
+#include "fourdgs/scene.hpp"
 #include "fourdgs/span.hpp"
 
 namespace fourdgs {

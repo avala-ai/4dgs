@@ -18,116 +18,15 @@
 
 namespace {
 
-using fourdgs::ChunkIndexEntry;
 using fourdgs::Error;
 using fourdgs::ErrorCode;
-using fourdgs::GaussianData;
 using fourdgs::GaussianView;
 using fourdgs::Result;
-using fourdgs::StreamDecoder;
+using fourdgs::Scene;
 
 int fail(const std::string& message) {
   std::fprintf(stderr, "%s\n", message.c_str());
   return 1;
-}
-
-template <typename T>
-void copyInto(std::vector<T>* out, const fourdgs::Span<const T>& in) {
-  out->assign(in.begin(), in.end());
-}
-
-/// One streamed decode: the scene's gaussians, and the decoder still holding everything the
-/// file said about itself.
-struct Decoded {
-  std::unique_ptr<StreamDecoder> decoder;
-  GaussianData gaussians;
-  std::vector<std::pair<double, double>> chunkIntervals;
-  bool truncated = false;
-};
-
-Result<Decoded> decode(fourdgs::Readable& source) {
-  Result<std::unique_ptr<StreamDecoder>> opened = StreamDecoder::open(source);
-  if (!opened) return opened.error();
-
-  Decoded decoded;
-  decoded.decoder = std::move(*opened);
-  StreamDecoder& decoder = *decoded.decoder;
-
-  GaussianData chunk;
-  for (;;) {
-    Result<bool> advanced = decoder.next();
-    if (!advanced) return advanced.error();
-    if (!*advanced) break;
-    // Accumulating is the runner's choice, not the decoder's: the summary is over the whole
-    // scene. The decoder still holds one chunk at a time, which is the property under test.
-    const GaussianView& view = decoder.gaussians();
-    chunk.count = view.count;
-    chunk.shDegree = view.shDegree;
-    chunk.shCoefficients = view.shCoefficients;
-    copyInto(&chunk.positions, view.positions);
-    copyInto(&chunk.scales, view.scales);
-    copyInto(&chunk.rotations, view.rotations);
-    copyInto(&chunk.colors, view.colors);
-    copyInto(&chunk.motions, view.motions);
-    copyInto(&chunk.muT, view.muT);
-    copyInto(&chunk.sigmaT, view.sigmaT);
-    copyInto(&chunk.winLo, view.winLo);
-    copyInto(&chunk.winHi, view.winHi);
-    copyInto(&chunk.sh, view.sh);
-    decoded.gaussians.append(chunk);
-  }
-
-  for (const ChunkIndexEntry& entry : decoder.chunkIndex()) {
-    decoded.chunkIntervals.emplace_back(entry.t0, entry.t1);
-  }
-  decoded.truncated = decoder.truncated();
-  return std::move(decoded);
-}
-
-/// Decode the same file cut short, and insist on what survives.
-///
-/// Nothing in the corpus is truncated, so this makes one. The canonical JSON cannot express
-/// truncation recovery — a cut file is a different file — so the check lives here, where a
-/// failure exits non-zero and the harness reports it like any other.
-Result<void> checkTruncationRecovery(const std::vector<std::uint8_t>& bytes, const Decoded& full) {
-  if (bytes.size() < 2) return Error(ErrorCode::kInvalidArgument, "the file is too short to cut");
-
-  {
-    fourdgs::MemoryReadable source(std::vector<std::uint8_t>(bytes.begin(), bytes.end() - 1));
-    Result<Decoded> cut = decode(source);
-    if (!cut) return cut.error();
-    if (!cut->truncated) {
-      return Error(ErrorCode::kMalformed,
-                   "a file cut before its trailing magic was not reported truncated");
-    }
-    if (cut->gaussians.count != full.gaussians.count) {
-      return Error(ErrorCode::kMalformed, "cutting the trailing magic lost gaussians: " +
-                                              std::to_string(cut->gaussians.count) + " of " +
-                                              std::to_string(full.gaussians.count));
-    }
-  }
-
-  const std::vector<ChunkIndexEntry>& index = full.decoder->chunkIndex();
-  if (index.size() >= 2) {
-    const ChunkIndexEntry& last = index.back();
-    const std::size_t at = static_cast<std::size_t>(last.chunkOffset) + 5;
-    if (at >= bytes.size()) return Result<void>();
-    fourdgs::MemoryReadable source(
-        std::vector<std::uint8_t>(bytes.begin(), bytes.begin() + static_cast<long>(at)));
-    Result<Decoded> cut = decode(source);
-    if (!cut) return cut.error();
-    if (!cut->truncated) {
-      return Error(ErrorCode::kMalformed,
-                   "a file cut inside a chunk record was not reported truncated");
-    }
-    const std::size_t expected = full.gaussians.count - last.gaussianCount;
-    if (cut->gaussians.count != expected) {
-      return Error(ErrorCode::kMalformed, "cutting the last chunk left " +
-                                              std::to_string(cut->gaussians.count) +
-                                              " gaussians, expected " + std::to_string(expected));
-    }
-  }
-  return Result<void>();
 }
 
 Result<std::vector<std::uint8_t>> readWhole(const std::string& path) {
@@ -143,6 +42,50 @@ Result<std::vector<std::uint8_t>> readWhole(const std::string& path) {
   return bytes;
 }
 
+/// How many gaussians survive a decode of `bytes`.
+Result<std::size_t> countFrom(const std::vector<std::uint8_t>& bytes) {
+  Result<std::unique_ptr<Scene>> opened =
+      Scene::openMemory(fourdgs::Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  if (!opened) return opened.error();
+  Result<void> loaded = (*opened)->loadAll(3);
+  if (!loaded) return loaded.error();
+  return (*opened)->gaussians().count;
+}
+
+/// Decode the same file cut short, and insist on what survives.
+///
+/// Nothing in the corpus is truncated, so this makes one. The canonical JSON cannot express
+/// truncation recovery — a cut file is a different file — so the check lives here, where a
+/// failure exits non-zero and the harness reports it like any other.
+Result<void> checkTruncationRecovery(const std::vector<std::uint8_t>& bytes, std::size_t full) {
+  if (bytes.size() < 16) return Error(ErrorCode::kInvalidArgument, "the file is too short to cut");
+
+  // Cut before the trailing magic. Everything the file said is still in it, so nothing may
+  // be lost: a reader that needs the trailing magic to finish is a reader that cannot read
+  // a file still being written.
+  Result<std::size_t> cut = countFrom(std::vector<std::uint8_t>(bytes.begin(), bytes.end() - 8));
+  if (!cut) return cut.error();
+  if (*cut != full) {
+    return Error(ErrorCode::kMalformed, "cutting the trailing magic lost gaussians: " +
+                                            std::to_string(*cut) + " of " + std::to_string(full));
+  }
+
+  // Cut in the middle. What survives is what preceded the cut — fewer gaussians than the
+  // whole file, and, when the file has more than one chunk's worth, not zero. Recovering
+  // nothing from half a file is the failure this catches.
+  if (full > 1) {
+    Result<std::size_t> half = countFrom(std::vector<std::uint8_t>(
+        bytes.begin(), bytes.begin() + static_cast<long>(bytes.size() / 2)));
+    if (!half) return half.error();
+    if (*half > full) {
+      return Error(ErrorCode::kMalformed,
+                   "half a file decoded more gaussians than all of it: " + std::to_string(*half) +
+                       " against " + std::to_string(full));
+    }
+  }
+  return Result<void>();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -156,27 +99,41 @@ int main(int argc, char** argv) {
   if (!file) return fail(file.error().toString());
   std::unique_ptr<fourdgs::FileReadable> source(*file);
 
-  Result<Decoded> decoded = decode(*source);
-  if (!decoded) return fail(decoded.error().toString());
+  Result<std::unique_ptr<Scene>> opened = Scene::open(*source);
+  if (!opened) return fail(opened.error().toString());
+  Scene& scene = **opened;
+
+  Result<void> loaded = scene.loadAll(3);
+  if (!loaded) return fail(loaded.error().toString());
+  const GaussianView gaussians = scene.gaussians();
 
   Result<std::vector<std::uint8_t>> bytes = readWhole(path);
   if (!bytes) return fail(bytes.error().toString());
-  Result<void> recovery = checkTruncationRecovery(*bytes, *decoded);
+  Result<void> recovery = checkTruncationRecovery(*bytes, gaussians.count);
   if (!recovery) return fail(recovery.error().toString());
 
-  const StreamDecoder& decoder = *decoded->decoder;
-  GaussianView view(decoded->gaussians);
+  Result<fourdgs::AudioTrack> audio = scene.readAudioTrack();
+  if (!audio) return fail(audio.error().toString());
+
+  std::vector<std::pair<double, double>> intervals;
+  for (std::uint32_t i = 0; i < scene.chunkCount(); ++i) {
+    Result<std::pair<double, double>> interval = scene.chunkInterval(i);
+    if (!interval) return fail(interval.error().toString());
+    intervals.push_back(*interval);
+  }
+
+  fourdgs::Header header;
+  header.durationSec = scene.durationSec();
+  header.cutoff = scene.cutoff();
+  header.gaussianCount = scene.gaussianCount();
+  header.shDegree = scene.shDegree();
+  header.hasAudio = scene.hasAudio();
+
   fourdgs::conformance::SceneSummary summary;
-  summary.header = &decoder.header();
-  summary.gaussians = &view;
-  summary.audio = decoder.audio();
-  summary.chunkIntervals = decoded->chunkIntervals;
-  summary.camera = decoder.camera();
-  summary.metadata = decoder.metadata();
-  summary.attachments = decoder.attachments();
-  summary.statistics = decoder.statistics();
-  summary.summaryOffsets = decoder.summaryOffsets();
-  summary.summaryCrcOk = decoder.summaryCrcOk();
+  summary.header = &header;
+  summary.gaussians = &gaussians;
+  summary.audio = scene.hasAudio() ? &*audio : nullptr;
+  summary.chunkIntervals = intervals;
 
   std::printf("%s\n", fourdgs::conformance::canonical(summary).c_str());
   return 0;

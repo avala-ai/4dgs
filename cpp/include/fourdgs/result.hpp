@@ -5,6 +5,7 @@
 #define FOURDGS_RESULT_HPP
 
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -72,42 +73,44 @@ class Exception : public std::runtime_error {
 template <typename T>
 class Result {
  public:
-  Result(T value) : ok_(true), value_(std::move(value)) {}       // NOLINT(runtime/explicit)
-  Result(Error error) : ok_(false), error_(std::move(error)) {}  // NOLINT(runtime/explicit)
-  Result(ErrorCode code, std::string message) : ok_(false), error_(code, std::move(message)) {}
+  Result(T value) : value_(std::move(value)) {}      // NOLINT(runtime/explicit)
+  Result(Error error) : error_(std::move(error)) {}  // NOLINT(runtime/explicit)
+  Result(ErrorCode code, std::string message) : error_(code, std::move(message)) {}
 
   Result(const Result&) = default;
   Result(Result&&) = default;
   Result& operator=(const Result&) = default;
   Result& operator=(Result&&) = default;
 
-  bool ok() const noexcept { return ok_; }
-  explicit operator bool() const noexcept { return ok_; }
+  bool ok() const noexcept { return value_.has_value(); }
+  explicit operator bool() const noexcept { return ok(); }
 
   /// Undefined unless `ok()`. The checked accessor is `value()`.
-  const T& operator*() const noexcept { return value_; }
-  T& operator*() noexcept { return value_; }
-  const T* operator->() const noexcept { return &value_; }
-  T* operator->() noexcept { return &value_; }
+  const T& operator*() const noexcept { return *value_; }
+  T& operator*() noexcept { return *value_; }
+  const T* operator->() const noexcept { return &*value_; }
+  T* operator->() noexcept { return &*value_; }
 
   /// Throws `Exception` when this holds an error.
   const T& value() const {
-    if (!ok_) throw Exception(error_);
-    return value_;
+    if (!ok()) throw Exception(error_);
+    return *value_;
   }
   T& value() {
-    if (!ok_) throw Exception(error_);
-    return value_;
+    if (!ok()) throw Exception(error_);
+    return *value_;
   }
 
-  T valueOr(T fallback) const { return ok_ ? value_ : std::move(fallback); }
+  T valueOr(T fallback) const { return ok() ? *value_ : std::move(fallback); }
 
   /// Undefined unless `!ok()`.
   const Error& error() const noexcept { return error_; }
 
  private:
-  bool ok_;
-  T value_{};
+  // `std::optional` rather than a default-constructed member, so that a `T` which cannot be
+  // default-constructed — an RAII handle, which is most of what this API returns — can still
+  // be carried.
+  std::optional<T> value_;
   Error error_;
 };
 

@@ -1,0 +1,116 @@
+// Copyright 2026 Avala AI
+// SPDX-License-Identifier: Apache-2.0
+
+#include "fourdgs/scene.hpp"
+
+#include <utility>
+
+#include "backend.hpp"
+
+namespace fourdgs {
+
+State::State(std::unique_ptr<detail::StateHandle> handle) : handle_(std::move(handle)) {}
+
+State::~State() = default;
+
+State::State(State&&) noexcept = default;
+
+State& State::operator=(State&&) noexcept = default;
+
+std::size_t State::count() const { return detail::stateCount(*handle_); }
+
+Span<const std::uint32_t> State::indices() const { return detail::stateIndices(*handle_); }
+
+Span<const float> State::centers() const { return detail::stateCenters(*handle_); }
+
+Span<const float> State::opacity() const { return detail::stateOpacity(*handle_); }
+
+Scene::Scene(std::unique_ptr<detail::Handle> handle) : handle_(std::move(handle)) {}
+
+Scene::~Scene() = default;
+
+Result<std::unique_ptr<Scene>> Scene::openPath(const std::string& path) {
+  auto handle = std::unique_ptr<detail::Handle>(new detail::Handle());
+  Result<void> opened = detail::openPath(*handle, path);
+  if (!opened) return opened.error();
+  return std::unique_ptr<Scene>(new Scene(std::move(handle)));
+}
+
+Result<std::unique_ptr<Scene>> Scene::openMemory(Span<const std::uint8_t> bytes) {
+  auto handle = std::unique_ptr<detail::Handle>(new detail::Handle());
+  Result<void> opened = detail::openMemory(*handle, bytes);
+  if (!opened) return opened.error();
+  return std::unique_ptr<Scene>(new Scene(std::move(handle)));
+}
+
+Result<std::unique_ptr<Scene>> Scene::open(Readable& source) {
+  auto handle = std::unique_ptr<detail::Handle>(new detail::Handle());
+  Result<void> opened = detail::openReadable(*handle, source);
+  if (!opened) return opened.error();
+  return std::unique_ptr<Scene>(new Scene(std::move(handle)));
+}
+
+double Scene::durationSec() const { return detail::durationSec(*handle_); }
+
+double Scene::cutoff() const { return detail::cutoff(*handle_); }
+
+std::uint64_t Scene::gaussianCount() const { return detail::gaussianCount(*handle_); }
+
+int Scene::shDegree() const { return detail::shDegree(*handle_); }
+
+bool Scene::isIndexed() const { return detail::isIndexed(*handle_); }
+
+std::uint32_t Scene::chunkCount() const { return detail::chunkCount(*handle_); }
+
+Result<std::pair<double, double>> Scene::chunkInterval(std::uint32_t index) const {
+  double t0 = 0.0;
+  double t1 = 0.0;
+  Result<void> read = detail::chunkInterval(*handle_, index, &t0, &t1);
+  if (!read) return read.error();
+  return std::make_pair(t0, t1);
+}
+
+std::uint64_t Scene::bytesForTime(double t, int maxShBand) const {
+  return detail::bytesForTime(*handle_, t, maxShBand);
+}
+
+bool Scene::hasAudio() const { return detail::hasAudio(*handle_); }
+
+std::string Scene::audioCodec() const { return detail::audioCodec(*handle_); }
+
+std::uint64_t Scene::audioSize() const { return detail::audioSize(*handle_); }
+
+Result<void> Scene::readAudio(std::uint64_t offset, Span<std::uint8_t> into) {
+  return detail::readAudio(*handle_, offset, into);
+}
+
+Result<AudioTrack> Scene::readAudioTrack() {
+  AudioTrack track;
+  if (!hasAudio()) return track;
+  track.codec = audioCodec();
+  // Sized from a value the reader has already validated, and known without fetching the
+  // track: the allocation is never larger than the file says the track is.
+  const std::uint64_t size = audioSize();
+  track.data.resize(static_cast<std::size_t>(size));
+  if (size == 0) return track;
+  Result<void> read = readAudio(0, Span<std::uint8_t>(track.data.data(), track.data.size()));
+  if (!read) return read.error();
+  return track;
+}
+
+Result<void> Scene::loadAll(int maxShBand) { return detail::loadAll(*handle_, maxShBand); }
+
+Result<void> Scene::loadAt(double t, int maxShBand) {
+  return detail::loadAt(*handle_, t, maxShBand);
+}
+
+GaussianView Scene::gaussians() const { return detail::loadedGaussians(*handle_); }
+
+Result<State> Scene::stateAt(double t, int maxShBand) {
+  auto handle = std::unique_ptr<detail::StateHandle>(new detail::StateHandle());
+  Result<void> reconstructed = detail::stateAt(*handle_, t, maxShBand, *handle);
+  if (!reconstructed) return reconstructed.error();
+  return State(std::move(handle));
+}
+
+}  // namespace fourdgs

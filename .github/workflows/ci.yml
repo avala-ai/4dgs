@@ -181,9 +181,10 @@ jobs:
           done
 
   cpp:
-    # The binding compiles and its unit tests run whether or not a core is linked. Without
-    # one, every entry point returns kNotImplemented and the tests assert exactly that — a
-    # build that quietly decoded nothing would pass a laxer job.
+    # Both supported configurations are built, because both ship: with the Rust core linked,
+    # and without one. The no-core build is not a placeholder — it is what an integrator gets
+    # before they have built the crate, and its tests assert that every call refuses with
+    # kNotImplemented rather than quietly decoding nothing.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -197,21 +198,43 @@ jobs:
           pip install clang-format==22.1.8
           clang-format --dry-run --Werror $(git ls-files 'cpp/*.cpp' 'cpp/*.hpp')
 
-      - name: Configure and build
+      - name: Build and test without a core
         run: |
+          cmake -S cpp -B cpp/build-nocore -DCMAKE_BUILD_TYPE=Debug \
+            -DFOURDGS_CORE_HEADER_DIR=/nonexistent
+          cmake --build cpp/build-nocore -j
+          ctest --test-dir cpp/build-nocore --output-on-failure
+
+      - name: Build and test against the core
+        run: |
+          cargo build -p fourdgs --release
           cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Debug
           cmake --build cpp/build -j
-      - name: Tests
-        run: ctest --test-dir cpp/build --output-on-failure
+          ctest --test-dir cpp/build --output-on-failure
 
-      # The binding owns handles that come from across an FFI boundary, so the leak and the
-      # out-of-bounds read are the two bugs it is actually exposed to. `test_seam` opens and
-      # closes two hundred times for this step to have something to measure.
+      # The binding owns handles that come from across an FFI boundary, so a leak and a read
+      # past the end of a buffer the ABI handed over are the two bugs it is exposed to. The
+      # runners decode a real file here rather than the tests' synthetic data, because an
+      # open/decode/close cycle over a real one is what the sanitizers need to see.
       - name: Sanitizers
         run: |
           cmake -S cpp -B cpp/build-asan -DCMAKE_BUILD_TYPE=Debug -DFOURDGS_ASAN=ON
           cmake --build cpp/build-asan -j
           ctest --test-dir cpp/build-asan --output-on-failure
+          pip install -e ./python/fourdgs
+          python tests/conformance/generate.py
+          # This step gates on memory, not on decoding: a sanitizer report exits 99 and fails
+          # the job, while a decoder refusing a file exits 1 and is the conformance job's
+          # business. Conflating the two would either hide a leak or make this job red for a
+          # reason it cannot diagnose.
+          for f in tests/conformance/data/*.4dgs; do
+            ./cpp/build-asan/conformance/decode_streamed "$f" > /dev/null || {
+              [ "$?" -eq 99 ] && { echo "::error::sanitizer report decoding $f"; exit 1; }
+            }
+          done
+        env:
+          ASAN_OPTIONS: detect_leaks=1:exitcode=99
+
   swift:
     # The official Swift image rather than a toolchain-installer action: the job installs
     # nothing, and the version it builds against is a line in this file.

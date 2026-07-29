@@ -4,22 +4,31 @@ A C++17 binding over the Rust core's C ABI, for engine, DCC and native-viewer in
 second decoder: the bytes are parsed once, in one place, so two implementations cannot drift apart
 on what a file means. Decode only at v1; rendering is out of scope for this repository.
 
-|          |                                                                                      |
-| -------- | ------------------------------------------------------------------------------------ |
-| Standard | C++17, no third-party dependencies                                                   |
-| Build    | `cmake -S cpp -B cpp/build && cmake --build cpp/build && ctest --test-dir cpp/build` |
-| Headers  | [`include/fourdgs/`](include/fourdgs/)                                               |
-| Target   | `fourdgs::cpp` (static), installs a CMake package                                    |
-| Runners  | [`conformance/`](conformance/)                                                       |
+|          |                                                                                                 |
+| -------- | ----------------------------------------------------------------------------------------------- |
+| Standard | C++17, no third-party dependencies                                                              |
+| Build    | `cargo build -p fourdgs --release`, then `cmake -S cpp -B cpp/build && cmake --build cpp/build` |
+| Test     | `ctest --test-dir cpp/build`, or `make -C cpp test`                                             |
+| Headers  | [`include/fourdgs/`](include/fourdgs/)                                                          |
+| Target   | `fourdgs::cpp` (static), installs a CMake package                                               |
+| Runners  | [`conformance/`](conformance/)                                                                  |
 
 ```cpp
-auto file = fourdgs::FileReadable::open("scene.4dgs");
-auto reader = fourdgs::IndexedReader::open(**file).value();
-for (const auto* entry : reader->chunksFor(2.5)) {          // spec §8, the whole seek
-  auto chunk = reader->readChunk(*entry, /*maxShBand=*/1);  // bands above 1 never transfer
-  auto state = fourdgs::stateAt(fourdgs::GaussianView(*chunk), 0, 2.5, reader->header().cutoff);
+auto opened = fourdgs::Scene::openPath("scene.4dgs");
+if (!opened) return std::fprintf(stderr, "%s\n", opened.error().toString().c_str());
+fourdgs::Scene& scene = **opened;
+
+auto state = scene.stateAt(2.5, /*maxShBand=*/1);   // seeks, and skips the bands above 1
+for (std::size_t i = 0; i < state->count(); ++i) {
+  std::uint32_t g = state->indices()[i];            // into scene.gaussians()
+  // state->centers()[3 * i ...], state->opacity()[i]
 }
 ```
+
+A scene has a working set: `loadAll()` fills it with every chunk, `loadAt(t, cap)` with only the
+chunks that instant needs, and `gaussians()` views it. The views point into the decoder's memory and
+are invalidated by the next load, so a caller who wants to keep them copies them. `Scene::open`
+takes any `Readable`, which is where an HTTP range reader or a cache plugs in.
 
 ## Errors are returned, not thrown
 
@@ -30,10 +39,20 @@ than an exceptional condition. `Result::value()` throws `fourdgs::Exception` for
 the other style, so the choice stays theirs. `kUnsupported` (a legal file this build cannot decode)
 and `kMalformed` (a bad file) are separate codes, because the fix is different.
 
+## Two builds, and both are supported
+
+With the core, this is a decoder. Without it — before anyone has run `cargo build -p fourdgs` — the
+package still compiles and every call returns `ErrorCode::kNotImplemented` with a sentence naming
+the fix, while `fourdgs::backendAvailable()` returns `false`. CI builds and tests both, because both
+are what somebody gets.
+
 ## Status
 
-The API is complete and the decoder behind it is not. Until the core lands this builds without one:
-every call returns `ErrorCode::kNotImplemented`, `fourdgs::backendAvailable()` returns `false`, and
-nothing claims a `Yes` in the [feature matrix](../website/docs/reference/index.md). CMake compiles
-the binding against the ABI instead when `../rust/fourdgs/include/fourdgs.h` exists and the crate
-has been built with `cargo build -p fourdgs --release`.
+Decoding works: across the conformance corpus the binding reproduces the reference implementation's
+canonical JSON exactly for every gaussian-derived value — the sample, the aggregates, the spherical
+harmonic digest, the chunk intervals, the audio digest. It does not yet reproduce the summary's
+non-gaussian records — `temporalModel`, header attributes, metadata, attachments, camera,
+statistics, summary offsets and the summary CRC — because the C ABI does not expose them yet. Until
+it does, no C++ cell in the [feature matrix](../website/docs/reference/index.md) moves off `Planned`
+and the `conformance-cpp` job stays disabled: the suite is what promotes a cell, and it has not
+passed.
