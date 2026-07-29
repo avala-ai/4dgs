@@ -890,6 +890,12 @@ class RigTrajectory:
         and a repeated or reversed timestamp makes that interval ambiguous. There is
         no reading of such a trajectory that is merely approximate.
         """
+        if self.interpolation not in (TRAJECTORY_LINEAR, TRAJECTORY_STEP):
+            raise MalformedFile(
+                f"trajectory {self.name!r} uses interpolation {self.interpolation}; "
+                "this reader supports trajectory interpolation registry values "
+                "0 (linear) and 1 (step)"
+            )
         for i, t in enumerate(self.times):
             if not math.isfinite(t):
                 raise MalformedFile(f"trajectory {self.name!r}: sample {i} has a non-finite time ({t})")
@@ -1108,6 +1114,13 @@ class ObjectTrack:
                 "an ObjectTrack names object 0, which is background/unassigned; a track needs an object "
                 "to move (section 5.15.7)",
                 code="track-names-background",
+            )
+        if self.interpolation not in (TRAJECTORY_LINEAR, TRAJECTORY_STEP):
+            raise MalformedFile(
+                f"track for object {self.object_id} uses interpolation {self.interpolation}; "
+                "this reader supports trajectory interpolation registry values "
+                "0 (linear) and 1 (step)",
+                code="unsupported-trajectory-interpolation",
             )
         if len(self.rotations) != self.sample_count or len(self.translations) != self.sample_count:
             raise MalformedFile(

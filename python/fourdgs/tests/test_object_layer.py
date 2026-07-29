@@ -234,6 +234,10 @@ def _parse_object_table_with_presence_flag(*, embedding_dim: int, offset: int, v
             "invalid-object-id",
         ),
         (
+            lambda: rec.ObjectTrack(object_id=7, interpolation=2).check(),
+            "unsupported-trajectory-interpolation",
+        ),
+        (
             lambda: rec.ObjectTrack(
                 object_id=7,
                 times=[1.0, 1.0],
