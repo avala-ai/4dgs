@@ -127,12 +127,19 @@ endif()
 
 if(FOURDGS_BUILD_TESTS)
   enable_testing()
-  foreach(test test_model test_result test_readable test_seam)
+  foreach(test test_model test_result test_readable test_seam test_decode)
     add_executable(${test} tests/${test}.cpp)
     target_link_libraries(${test} PRIVATE fourdgs-cpp)
     target_include_directories(${test} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     add_test(NAME ${test} COMMAND ${test})
   endforeach()
+
+  # The corpus is generated, not committed, and it lives outside this project. Baking its
+  # absolute path in means the test finds it however it was launched; FOURDGS_CORPUS still
+  # overrides for a corpus somewhere else.
+  target_compile_definitions(
+    test_decode PRIVATE
+    FOURDGS_CORPUS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../tests/conformance/data")
 
   if(FOURDGS_BUILD_CONFORMANCE)
     add_executable(test_canonical tests/test_canonical.cpp)

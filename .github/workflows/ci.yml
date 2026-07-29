@@ -203,6 +203,14 @@ jobs:
           pip install clang-format==22.1.8
           clang-format --dry-run --Werror $(git ls-files 'cpp/*.cpp' 'cpp/*.hpp')
 
+      # The unit tests decode real corpus files, which are generated rather than committed.
+      # Generating them first is what stops those tests skipping themselves into a green run
+      # that proved nothing — a missing corpus fails test_decode rather than passing it.
+      - name: Corpus
+        run: |
+          pip install -e ./python/fourdgs
+          python tests/conformance/generate.py
+
       - name: Build and test without a core
         run: |
           cmake -S cpp -B cpp/build-nocore -DCMAKE_BUILD_TYPE=Debug \
@@ -219,22 +227,18 @@ jobs:
 
       - name: The example runs, so it cannot rot into a snippet that no longer works
         run: |
-          pip install -e ./python/fourdgs
-          python tests/conformance/generate.py
           ./cpp/build/examples/decode_summary \
             tests/conformance/data/OneWindow-UseChunkIndex-UseCrc-WithAudio.4dgs
 
       # The binding owns handles that come from across an FFI boundary, so a leak and a read
       # past the end of a buffer the ABI handed over are the two bugs it is exposed to. The
-      # runners decode a real file here rather than the tests' synthetic data, because an
-      # open/decode/close cycle over a real one is what the sanitizers need to see.
+      # runners decode every corpus file here rather than the tests' synthetic data, because
+      # an open/decode/close cycle over real files is what the sanitizers need to see.
       - name: Sanitizers
         run: |
           cmake -S cpp -B cpp/build-asan -DCMAKE_BUILD_TYPE=Debug -DFOURDGS_ASAN=ON
           cmake --build cpp/build-asan -j
           ctest --test-dir cpp/build-asan --output-on-failure
-          pip install -e ./python/fourdgs
-          python tests/conformance/generate.py
           # This step gates on memory, not on decoding: a sanitizer report exits 99 and fails
           # the job, while a decoder refusing a file exits 1 and is the conformance job's
           # business. Conflating the two would either hide a leak or make this job red for a
