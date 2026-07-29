@@ -85,12 +85,12 @@
  *     if (fourdgs_scene_state_at(scene, 1.5, 3, &state) == FOURDGS_STATUS_OK) {
  *         const uint32_t *indices = fourdgs_state_indices(state);
  *         const float *centers = fourdgs_state_centers(state);
+ *         const float *orientations = fourdgs_state_orientations(state);
  *         const float *opacity = fourdgs_state_opacity(state);
  *         const float *scales = fourdgs_scene_scales(scene);
- *         const float *rotations = fourdgs_scene_rotations(scene);
  *         for (uint32_t i = 0; i < fourdgs_state_count(state); ++i) {
  *             uint32_t g = indices[i];
- *             // centers[3*i .. 3*i+2], opacity[i], scales[3*g .. ], rotations[4*g .. ]
+ *             // centers[3*i ..], orientations[4*i ..], opacity[i], scales[3*g ..]
  *         }
  *         fourdgs_state_free(state);
  *     }
@@ -288,8 +288,10 @@ int fourdgs_scene_chunk_interval(const fourdgs_scene *scene, uint32_t i,
                                  double *out_t0, double *out_t1);
 
 /**
- * What a seek to `t` will transfer with spherical harmonics capped at `max_sh_band`, so a
- * caller can budget before asking.
+ * A conservative upper bound on a cold seek to `t`, with spherical harmonics capped at
+ * `max_sh_band`, so a caller can budget before asking. It includes every Object Track
+ * that the chunks could reference; actual transfer may be lower after membership is
+ * decoded or track validation is cached.
  *
  * Seek efficiency is a property of the content, not of the container: a scene whose
  * gaussians all live for the whole clip has one chunk covering everything, and this will
@@ -503,6 +505,7 @@ uint32_t fourdgs_scene_sh_coefficients(const fourdgs_scene *scene);
  *     visible  =  win_lo <= t < win_hi  AND  marginal >= cutoff
  *     marginal =  sigma_t == +inf ? 1 : exp(-0.5 * ((t - mu_t) / sigma_t)^2)
  *     center   =  position + motion * (t - mu_t)
+ *     orientation = rotation
  *     opacity  =  color.a * marginal
  *
  * The result is owned by the caller and freed with fourdgs_state_free. Its indices refer
@@ -532,6 +535,14 @@ const uint32_t *fourdgs_state_indices(const fourdgs_state *state);
  * Borrowed: valid until the state is freed. Null when nothing is visible.
  */
 const float *fourdgs_state_centers(const fourdgs_state *state);
+
+/**
+ * Reconstructed orientation, 4 xyzw floats per visible gaussian, packed by visible index.
+ * Object tracks are composed onto the base rotation.
+ *
+ * Borrowed: valid until the state is freed. Null when nothing is visible.
+ */
+const float *fourdgs_state_orientations(const fourdgs_state *state);
 
 /**
  * color.a * marginal, 1 float per visible gaussian, packed by visible index.

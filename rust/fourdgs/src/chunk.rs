@@ -31,6 +31,10 @@ pub struct DecodedChunk {
     pub sigma_t: Vec<f32>,
     pub window_index: Vec<u32>,
     pub source_index: Option<Vec<i64>>,
+    /// Per-gaussian object membership, or `None` when the chunk carries no `object_id`
+    /// stream. Exact: each signed stream code contributes its same 32 bits to the
+    /// unsigned id, with no dequantization.
+    pub object_id: Option<Vec<u32>>,
     /// Band number to its decoded coefficients, populated only for the bands a caller
     /// asked for.
     pub bands: BTreeMap<u8, DecodedStream>,
@@ -226,6 +230,25 @@ pub fn decode_streams(
 
     if let Some(src) = got.get(&op::A_SOURCE_INDEX) {
         out.source_index = Some((0..count).map(|i| src.get(i, 0)).collect());
+    }
+    if let Some(ids) = got.get(&op::A_OBJECT_ID) {
+        if ids.channels != 1 {
+            return Err(Error::Malformed(format!(
+                "the object_id stream declares {} channels, the format defines 1",
+                ids.channels
+            )));
+        }
+        let mut object_ids = Vec::with_capacity(count);
+        for i in 0..count {
+            let value = ids.get(i, 0);
+            let signed = i32::try_from(value).map_err(|_| {
+                Error::Malformed(format!(
+                    "object_id element {i} has signed stream code {value}; expected an i32"
+                ))
+            })?;
+            object_ids.push(signed as u32);
+        }
+        out.object_id = Some(object_ids);
     }
 
     Ok(out)

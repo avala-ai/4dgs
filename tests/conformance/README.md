@@ -35,7 +35,7 @@ A corpus of valid files can only prove that a decoder accepts what it should. It
 decoder **refuses** what it should — and a large part of this specification is rules whose entire
 content is a refusal: a window index outside its table, a codec this build does not implement, a
 temporal model this reader has never heard of. A decoder that ignores every one of them passes all
-34 valid variants.
+46 valid variants.
 
 `generator/invalid.py` declares the other half. Each entry is a length-preserving byte mutation of
 one valid base file, chosen so that **exactly one** rule is broken, paired with the **refusal
@@ -189,9 +189,9 @@ a failure, but the error names the runner rather than the platform and reads lik
 The suite runs on GitHub-hosted runners for Python, TypeScript and Rust on Linux, macOS and Windows;
 C++, Swift and Dart run it on Linux. Every platform decodes the same 46 valid variants and compares
 against the same committed expectations — 79 passing comparisons for a family that declines the
-provenance and object variants plus the refusal expectations, 89 for Rust, which answers provenance
-but declines objects, and 105 for Python, which answers all of them. The single `decode_indexed`
-variant that declares no chunk index is skipped everywhere.
+provenance and object variants plus the refusal expectations, 91 for Rust, which answers the
+provenance and object variants, and 105 for Python, which answers all of them. The single
+`decode_indexed` variant that declares no chunk index is skipped everywhere.
 
 That the corpus is bytes is the whole reason this is worth doing on more than one platform: a
 decoder that agrees with the expectation on Linux and disagrees on Windows is exactly the bug this

@@ -445,8 +445,7 @@ pub unsafe extern "C" fn fourdgs_scene_chunk_interval(
     })
 }
 
-/// What a seek to `t` will transfer with SH capped at `max_sh_band`, so a caller can budget
-/// before asking.
+/// A conservative upper bound on a cold seek to `t` with SH capped at `max_sh_band`.
 #[no_mangle]
 pub unsafe extern "C" fn fourdgs_scene_bytes_for_time(
     scene: *const fourdgs_scene,
@@ -454,20 +453,7 @@ pub unsafe extern "C" fn fourdgs_scene_bytes_for_time(
     max_sh_band: u8,
 ) -> u64 {
     let scene = scene_or!(scene, 0);
-    scene
-        .inner
-        .chunk_index()
-        .iter()
-        .filter(|e| e.covers(t))
-        .map(|e| {
-            e.bands
-                .iter()
-                .filter(|(band, _, _)| *band <= max_sh_band)
-                .fold(e.chunk_length, |total, (_, _, length)| {
-                    total.saturating_add(*length)
-                })
-        })
-        .fold(0u64, u64::saturating_add)
+    scene.inner.bytes_for_time(t, max_sh_band)
 }
 
 // --------------------------------------------------------------------------
@@ -1003,6 +989,16 @@ pub unsafe extern "C" fn fourdgs_state_centers(state: *const fourdgs_state) -> *
     // SAFETY: null is handled; otherwise the caller guarantees a live state.
     match unsafe { state.as_ref() } {
         Some(s) if !s.inner.centers.is_empty() => s.inner.centers.as_ptr(),
+        _ => std::ptr::null(),
+    }
+}
+
+/// Reconstructed orientation, 4 xyzw floats per visible gaussian.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_state_orientations(state: *const fourdgs_state) -> *const f32 {
+    // SAFETY: null is handled; otherwise the caller guarantees a live state.
+    match unsafe { state.as_ref() } {
+        Some(s) if !s.inner.orientations.is_empty() => s.inner.orientations.as_ptr(),
         _ => std::ptr::null(),
     }
 }
@@ -2056,6 +2052,9 @@ pub unsafe extern "C" fn fourdgs_writer_set_gaussians(
             sh_coefficients: 0,
             sh_degree: 0,
             source_index: None,
+            // The C ABI encode surface does not carry object_id; a file written through it
+            // groups nothing. The reader still surfaces it when a file has one.
+            object_id: None,
         };
         FOURDGS_STATUS_OK
     })

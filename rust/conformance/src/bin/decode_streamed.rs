@@ -47,6 +47,7 @@ fn run(path: &str) -> Result<String, String> {
             summary_offsets: &scene.summary_offsets,
             summary_crc_ok: scene.summary_crc_ok,
             provenance: Some(&scene.provenance),
+            objects: Some(&scene.objects),
         },
     )
     .map_err(|e| format!("{path}: {e}"))

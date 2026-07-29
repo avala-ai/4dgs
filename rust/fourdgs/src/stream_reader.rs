@@ -65,6 +65,10 @@ pub struct Scene {
     /// carried none, which is the common case and not an error: absence costs nothing and
     /// no Header flag announces the family, so this is filled by the walk itself.
     pub provenance: crate::provenance::Provenance,
+    /// The object layer the file carried (spec section 5.15.6): the Object Table and the
+    /// SE(3) tracks. Empty when the file names no objects, which is the common case and not
+    /// an error, exactly as with provenance.
+    pub objects: crate::object_layer::ObjectLayer,
     pub statistics: Option<rec::Statistics>,
     pub chunk_index: Vec<rec::ChunkIndexEntry>,
     pub summary_offsets: Vec<rec::SummaryOffset>,
@@ -77,6 +81,27 @@ pub struct Scene {
     pub truncated: bool,
     /// Chunk intervals in file order, for callers that want them without the index.
     pub chunk_intervals: Vec<(f64, f64)>,
+}
+
+impl Scene {
+    /// Reconstructed gaussian state at scene time `t`, including authoritative Object
+    /// Tracks. This is the front-to-back counterpart of [`crate::reader::SceneReader::state_at`].
+    pub fn state_at(&self, t: f64) -> Result<crate::model::StateAt> {
+        crate::provenance::check_scene_time(t)?;
+        let mut state = self.gaussians.state_at(t, self.header.cutoff);
+        let visible_object_ids = self.gaussians.object_id.as_ref().map(|object_ids| {
+            state
+                .indices
+                .iter()
+                .map(|&index| object_ids[index as usize])
+                .collect::<Vec<u32>>()
+        });
+        if let Some(object_ids) = visible_object_ids.filter(|ids| ids.iter().any(|id| *id != 0)) {
+            self.objects
+                .apply(&mut state.centers, &mut state.orientations, &object_ids, t)?;
+        }
+        Ok(state)
+    }
 }
 
 /// Decode a whole file from any byte source.
@@ -163,6 +188,8 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
                 | op::SENSOR_CALIBRATION
                 | op::RIG_TRAJECTORY
                 | op::GEODETIC_ANCHOR
+                | op::OBJECT_TABLE
+                | op::OBJECT_TRACK
                 | op::STATISTICS
                 | op::CHUNK_INDEX
                 | op::SUMMARY_OFFSET
@@ -294,6 +321,19 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
                 .provenance
                 .anchors
                 .push(rec::GeodeticAnchor::parse(&content)?),
+            op::OBJECT_TABLE => {
+                if scene.objects.table.is_some() {
+                    return Err(Error::Malformed(format!(
+                        "a second ObjectTable record appears at byte {offset}; a file may carry \
+                         exactly one scene-wide object table"
+                    )));
+                }
+                scene.objects.table = Some(rec::ObjectTable::parse(&content)?);
+            }
+            op::OBJECT_TRACK => scene
+                .objects
+                .tracks
+                .push(rec::ObjectTrack::parse(&content)?),
             op::STATISTICS => scene.statistics = Some(rec::Statistics::parse(&content)?),
             op::CHUNK_INDEX => scene
                 .chunk_index
@@ -351,6 +391,7 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
     // recovery contract is that everything complete before the cut still stands.
     if !truncated {
         scene.provenance.check()?;
+        scene.objects.check()?;
     }
 
     if !header.has_audio()
@@ -537,6 +578,8 @@ pub fn assemble(
     out.win_hi.reserve(total);
 
     let mut source_index: Option<Vec<i64>> = Some(Vec::with_capacity(total));
+    let mut object_id: Vec<u32> = Vec::with_capacity(total);
+    let mut saw_object_id = false;
     for chunk in chunks {
         out.positions.extend_from_slice(&chunk.positions);
         out.scales.extend_from_slice(&chunk.scales);
@@ -554,8 +597,16 @@ pub fn assemble(
             (Some(acc), Some(src)) => acc.extend_from_slice(src),
             _ => source_index = None,
         }
+        match &chunk.object_id {
+            Some(ids) => {
+                object_id.extend_from_slice(ids);
+                saw_object_id = true;
+            }
+            None => object_id.resize(object_id.len() + chunk.count, 0),
+        }
     }
     out.source_index = source_index.filter(|s| s.len() == total && total > 0);
+    out.object_id = (saw_object_id && object_id.len() == total && total > 0).then_some(object_id);
 
     if header.sh_degree > 0 {
         let counts: Vec<usize> = chunks.iter().map(|c| c.count).collect();

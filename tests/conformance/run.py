@@ -113,7 +113,6 @@ REFUSAL_FAMILIES = frozenset({"python"})
 FAMILY_DECLINES: dict[str, tuple[str, ...]] = {
     "typescript": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig", "WithObjects"),
     "cpp": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig", "WithObjects"),
-    "rust": ("WithObjects",),
     "swift": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig", "WithObjects"),
     "dart": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig", "WithObjects"),
 }

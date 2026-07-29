@@ -9,9 +9,9 @@ declarations. Nothing is marked `Yes` on the strength of code existing.
 
 Every row is filled in from a suite that runs: 46 valid variants and 7 invalid ones, over two read
 paths (streamed and indexed). A language takes the variants it declares support for, and what it
-declines is what this table records — 105 checks passing for Python, 89 for Rust, 79 each for
-TypeScript, C++, Swift and Dart. Rust declines the object variant and refusal expectations;
-TypeScript, C++, Swift and Dart decline those and the five variants that carry provenance records.
+declines is what this table records — 105 checks passing for Python, 91 for Rust, 79 each for
+TypeScript, C++, Swift and Dart. Rust declines the refusal expectations; TypeScript, C++, Swift and
+Dart also decline the five variants that carry provenance records and the object variant.
 
 | Feature                                         | Python | TypeScript | Rust    | C++     | Swift   | Dart    |
 | ----------------------------------------------- | ------ | ---------- | ------- | ------- | ------- | ------- |
@@ -40,9 +40,9 @@ TypeScript, C++, Swift and Dart decline those and the five variants that carry p
 | Provenance: coordinate frame + georeference     | Yes    | No         | Yes     | No      | No      | No      |
 | Provenance: sensor calibration                  | Yes    | No         | Yes     | No      | No      | No      |
 | Provenance: rig trajectory + pose interpolation | Yes    | No         | Yes     | No      | No      | No      |
-| Object membership (`object_id`)                 | Yes    | No         | Planned | No      | No      | No      |
-| Object Table: labels, anchors, embeddings       | Yes    | No         | Planned | No      | No      | No      |
-| Object Track: rigid state composition           | Yes    | No         | Planned | No      | No      | No      |
+| Object membership (`object_id`)                 | Yes    | No         | Yes     | No      | No      | No      |
+| Object Table: labels, anchors, embeddings       | Yes    | No         | Yes     | No      | No      | No      |
+| Object Track: rigid state composition           | Yes    | No         | Yes     | No      | No      | No      |
 | Unknown-record skipping                         | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Refusal diagnosis (named, not merely refused)   | Yes    | No         | No      | No      | No      | No      |
 | Private-range records                           | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
@@ -91,7 +91,7 @@ which of the two it is.
 variant carries exact per-gaussian membership, a table with dynamics and an embedding, and a rigid
 track whose first, interpolated and last poses are sampled. Canonical `states` contain post-track
 centers and orientations from both Python read paths, so skipping the track or composing it before
-per-gaussian motion fails. Rust remains `Planned` until its runner emits the same states; the other
+per-gaussian motion fails. Rust's streamed and indexed runners emit those same states; the other
 SDKs skip the optional records and stream and report `No`.
 
 **Range-request decode** is a property of the transport an SDK offers, not of the format: every SDK

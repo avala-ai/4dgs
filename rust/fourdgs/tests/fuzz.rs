@@ -391,7 +391,14 @@ fn exercise_c_abi(input: &[u8]) {
         if fourdgs_scene_state_at(scene, 1.0, 3, &mut state) == FOURDGS_STATUS_OK {
             let count = fourdgs_state_count(state);
             let indices = fourdgs_state_indices(state);
+            let orientations = fourdgs_state_orientations(state);
             let resident = fourdgs_scene_loaded_count(scene);
+            if count > 0 {
+                assert!(
+                    !orientations.is_null(),
+                    "a non-empty state must carry orientations"
+                );
+            }
             if count > 0 && !indices.is_null() {
                 let slice = std::slice::from_raw_parts(indices, count as usize);
                 for i in slice {

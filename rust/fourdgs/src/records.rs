@@ -8,13 +8,13 @@
 //! that is the compatibility rule, and honouring it is one line per record rather than a
 //! policy nobody remembers.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::error::{Error, Result};
 use crate::opcode as op;
 use crate::serialization::{
-    put_blob, put_f64, put_f64s, put_record, put_str_map, put_string, put_u32, put_u64, put_u8,
-    Cursor,
+    put_blob, put_f32s, put_f64, put_f64s, put_record, put_str_map, put_string, put_u16, put_u32,
+    put_u64, put_u8, Cursor,
 };
 
 pub const FLAG_HAS_AUDIO: u8 = 1 << 0;
@@ -163,7 +163,7 @@ impl Quantization {
         let scheme = c.string()?;
         let pos_origin = c.f64s(3)?;
         let steps = c.f64s(8)?;
-        Ok(Quantization {
+        let quantization = Quantization {
             scheme,
             pos_origin,
             step_pos: steps[0],
@@ -177,7 +177,14 @@ impl Quantization {
             step_sh: c.u8()?,
             bounds: c.str_map()?,
             sh_bit_depths: sh_bit_depths(c.rest()),
-        })
+        };
+        if let Some(value) = quantization.bounds.get("object_id") {
+            return Err(Error::Malformed(format!(
+                "Quantization.bounds contains object_id={value:?}; object_id is an exact label \
+                 and MUST NOT carry a bound"
+            )));
+        }
+        Ok(quantization)
     }
 
     pub fn steps(&self) -> crate::quantization::Steps {
@@ -1253,6 +1260,13 @@ impl RigTrajectory {
     /// a repeated or reversed timestamp makes that interval ambiguous. There is no
     /// reading of such a trajectory that is merely approximate.
     pub fn check(&self) -> Result<()> {
+        if !matches!(self.interpolation, TRAJECTORY_LINEAR | TRAJECTORY_STEP) {
+            return Err(Error::Malformed(format!(
+                "trajectory {:?} uses interpolation {}; this reader supports trajectory \
+                 interpolation registry values 0 (linear) and 1 (step)",
+                self.name, self.interpolation
+            )));
+        }
         for (i, t) in self.times.iter().enumerate() {
             if !t.is_finite() {
                 return Err(Error::Malformed(format!(
@@ -1306,5 +1320,339 @@ impl RigTrajectory {
         let mut out = Vec::new();
         put_record(&mut out, op::RIG_TRAJECTORY, &body);
         out
+    }
+}
+
+/// One object the file names. Everything here is advisory — no field moves a gaussian.
+///
+/// `anchor` is a representative point for a label or camera focus, not the transform pivot
+/// (a track folds its pivot into its translation). `dynamics`, when present, is a coarse
+/// constant-acceleration summary a consumer may read instead of a track; reconstruction
+/// never reads it. `embedding`, when present, is the object's point in the file's one
+/// text-aligned vector space.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ObjectTableEntry {
+    pub object_id: u32,
+    pub label: String,
+    pub anchor: [f32; 3],
+    /// `(velocity, angular_velocity, acceleration)`, each a 3-vector, or `None`.
+    pub dynamics: Option<([f32; 3], [f32; 3], [f32; 3])>,
+    pub embedding: Option<Vec<f32>>,
+}
+
+/// The scene-wide table of objects. Opcode 0x24, one per file, front matter.
+///
+/// `embedding_dim` is declared once for the whole file: every embedding is a vector of
+/// exactly this many `f32`, and `0` means the file declares no embedding space at all. A
+/// per-entry flag then says whether an object carries a vector.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ObjectTable {
+    pub embedding_dim: u16,
+    pub entries: Vec<ObjectTableEntry>,
+}
+
+impl ObjectTable {
+    pub fn parse(content: &[u8]) -> Result<ObjectTable> {
+        let mut c = Cursor::new(content);
+        let count = c.u32()? as usize;
+        let embedding_dim = c.u16()?;
+        // Each entry has an id, an empty length-prefixed label, an anchor, the dynamics
+        // flag, and (when an embedding space exists) the embedding-presence flag. Prove
+        // the declared count can fit before allocating from it.
+        let minimum_entry = 4 + 4 + 3 * 4 + 1 + usize::from(embedding_dim > 0);
+        if count > c.remaining() / minimum_entry {
+            return Err(Error::Truncated(format!(
+                "ObjectTable declares {count} entries at content offset 0, but {} bytes remain \
+                 after its header and each entry needs at least {minimum_entry}",
+                c.remaining()
+            )));
+        }
+        let mut table = ObjectTable {
+            embedding_dim,
+            entries: Vec::with_capacity(count),
+        };
+        for entry_index in 0..count {
+            let object_id = c.u32()?;
+            let label = c.string()?;
+            let a = c.f32s(3)?;
+            let mut entry = ObjectTableEntry {
+                object_id,
+                label,
+                anchor: [a[0], a[1], a[2]],
+                ..Default::default()
+            };
+            match c.u8()? {
+                0 => {}
+                1 => {
+                    let v = c.f32s(3)?;
+                    let w = c.f32s(3)?;
+                    let acc = c.f32s(3)?;
+                    entry.dynamics = Some((
+                        [v[0], v[1], v[2]],
+                        [w[0], w[1], w[2]],
+                        [acc[0], acc[1], acc[2]],
+                    ));
+                }
+                flag => {
+                    return Err(Error::Malformed(format!(
+                        "ObjectTable entry {entry_index} for object {object_id} has \
+                         dynamics_present={flag}; expected 0 or 1"
+                    )))
+                }
+            }
+            if table.embedding_dim > 0 {
+                match c.u8()? {
+                    0 => {}
+                    1 => {
+                        let dimensions = table.embedding_dim as usize;
+                        let bytes = dimensions * std::mem::size_of::<f32>();
+                        if bytes > c.remaining() {
+                            return Err(Error::Truncated(format!(
+                                "ObjectTable entry {entry_index} for object {object_id} declares \
+                                 an embedding of {dimensions} f32 values ({bytes} bytes), but {} \
+                                 bytes remain",
+                                c.remaining()
+                            )));
+                        }
+                        entry.embedding = Some(c.f32s(dimensions)?);
+                    }
+                    flag => {
+                        return Err(Error::Malformed(format!(
+                            "ObjectTable entry {entry_index} for object {object_id} has \
+                             has_embedding={flag}; expected 0 or 1"
+                        )))
+                    }
+                }
+            }
+            table.entries.push(entry);
+        }
+        table.check()?;
+        Ok(table)
+    }
+
+    /// Distinct object ids, and every stored float finite.
+    ///
+    /// A duplicate id makes every reference to that object ambiguous — the duplicate-name
+    /// failure section 5.15.2 refuses for frames. A non-finite embedding is not a weak
+    /// match, it poisons every cosine similarity computed against it.
+    pub fn check(&self) -> Result<()> {
+        let mut seen: HashSet<u32> = HashSet::with_capacity(self.entries.len());
+        for e in &self.entries {
+            if !seen.insert(e.object_id) {
+                return Err(Error::Malformed(format!(
+                    "two ObjectTable entries describe object {}; an object is referred to by id \
+                     and nothing else (section 5.15.6)",
+                    e.object_id
+                )));
+            }
+            let check_finite = |vs: &[f32], what: &str| -> Result<()> {
+                for (k, v) in vs.iter().enumerate() {
+                    if !v.is_finite() {
+                        return Err(Error::Malformed(format!(
+                            "object {}: {what}[{k}] is {v}",
+                            e.object_id
+                        )));
+                    }
+                }
+                Ok(())
+            };
+            check_finite(&e.anchor, "anchor")?;
+            if let Some((v, w, a)) = &e.dynamics {
+                check_finite(v, "velocity")?;
+                check_finite(w, "angular_velocity")?;
+                check_finite(a, "acceleration")?;
+            }
+            if let Some(embedding) = &e.embedding {
+                if self.embedding_dim == 0 {
+                    return Err(Error::Malformed(format!(
+                        "object {} carries an embedding, but ObjectTable.embedding_dim is 0 and \
+                         declares no embedding space",
+                        e.object_id
+                    )));
+                }
+                if embedding.len() != self.embedding_dim as usize {
+                    return Err(Error::Malformed(format!(
+                        "object {} embedding has {} values; ObjectTable.embedding_dim declares {}",
+                        e.object_id,
+                        embedding.len(),
+                        self.embedding_dim
+                    )));
+                }
+                check_finite(embedding, "embedding")?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self, trailer: &[u8]) -> Result<Vec<u8>> {
+        self.check()?;
+        let mut body = Vec::new();
+        put_u32(&mut body, self.entries.len() as u32);
+        put_u16(&mut body, self.embedding_dim);
+        for e in &self.entries {
+            put_u32(&mut body, e.object_id);
+            put_string(&mut body, &e.label);
+            put_f32s(&mut body, &e.anchor);
+            match &e.dynamics {
+                None => put_u8(&mut body, 0),
+                Some((v, w, a)) => {
+                    put_u8(&mut body, 1);
+                    put_f32s(&mut body, v);
+                    put_f32s(&mut body, w);
+                    put_f32s(&mut body, a);
+                }
+            }
+            if self.embedding_dim > 0 {
+                match &e.embedding {
+                    None => put_u8(&mut body, 0),
+                    Some(embedding) => {
+                        put_u8(&mut body, 1);
+                        put_f32s(&mut body, embedding);
+                    }
+                }
+            }
+        }
+        body.extend_from_slice(trailer);
+        let mut out = Vec::new();
+        put_record(&mut out, op::OBJECT_TABLE, &body);
+        Ok(out)
+    }
+}
+
+/// One object's rigid pose sampled over the scene clock. Opcode 0x25, front matter.
+///
+/// The Rig Trajectory of section 5.15.4 pointed at a scene object instead of the capture
+/// platform: same strictly-increasing times, same clamp-never-extrapolate rule, same
+/// shortest-arc slerp. It reuses the trajectory interpolation registry (0 linear, 1 step)
+/// and the [`crate::provenance::pose_at`] machinery through the `PoseSampled` trait.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ObjectTrack {
+    pub object_id: u32,
+    pub interpolation: u8,
+    pub times: Vec<f64>,
+    pub rotations: Vec<[f64; 4]>,
+    pub translations: Vec<[f64; 3]>,
+}
+
+impl ObjectTrack {
+    pub fn sample_count(&self) -> usize {
+        self.times.len()
+    }
+
+    pub fn parse(content: &[u8]) -> Result<ObjectTrack> {
+        let mut c = Cursor::new(content);
+        let mut track = ObjectTrack {
+            object_id: c.u32()?,
+            interpolation: c.u8()?,
+            ..Default::default()
+        };
+        let count = c.u32()? as usize;
+        const SAMPLE_BYTES: usize = 8 + 4 * 8 + 3 * 8;
+        if count > c.remaining() / SAMPLE_BYTES {
+            return Err(Error::Truncated(format!(
+                "ObjectTrack for object {} declares {count} samples at content offset 5, but {} \
+                 bytes remain after its header and each sample needs {SAMPLE_BYTES}",
+                track.object_id,
+                c.remaining()
+            )));
+        }
+        track.times.reserve(count);
+        track.rotations.reserve(count);
+        track.translations.reserve(count);
+        for _ in 0..count {
+            track.times.push(c.f64()?);
+            let r = c.f64s(4)?;
+            track.rotations.push([r[0], r[1], r[2], r[3]]);
+            let t = c.f64s(3)?;
+            track.translations.push([t[0], t[1], t[2]]);
+        }
+        track.check()?;
+        Ok(track)
+    }
+
+    /// The object-track rules: not the background, increasing times, real rotations.
+    ///
+    /// `object_id = 0` is "no object", and a track needs an object to move, so it is
+    /// refused rather than treated as a whole-scene transform. The time and quaternion
+    /// rules are section 5.15.4's, for the same reasons.
+    pub fn check(&self) -> Result<()> {
+        if self.object_id == 0 {
+            return Err(Error::Malformed(
+                "an ObjectTrack names object 0, which is background/unassigned; a track needs an \
+                 object to move (section 5.15.6)"
+                    .to_string(),
+            ));
+        }
+        if !matches!(self.interpolation, TRAJECTORY_LINEAR | TRAJECTORY_STEP) {
+            return Err(Error::Malformed(format!(
+                "track for object {} uses interpolation {}; this reader supports trajectory \
+                 interpolation registry values 0 (linear) and 1 (step)",
+                self.object_id, self.interpolation
+            )));
+        }
+        if self.rotations.len() != self.times.len() || self.translations.len() != self.times.len() {
+            return Err(Error::Malformed(format!(
+                "track for object {} has {} times, {} rotations, and {} translations; expected \
+                 equal sample counts",
+                self.object_id,
+                self.times.len(),
+                self.rotations.len(),
+                self.translations.len()
+            )));
+        }
+        for (i, t) in self.times.iter().enumerate() {
+            if !t.is_finite() {
+                return Err(Error::Malformed(format!(
+                    "track for object {}: sample {i} has a non-finite time ({t})",
+                    self.object_id
+                )));
+            }
+            if i > 0 && *t <= self.times[i - 1] {
+                return Err(Error::Malformed(format!(
+                    "track for object {}: sample {i} is at t={t}, not after sample {} at t={}; \
+                     times must strictly increase (section 5.15.4)",
+                    self.object_id,
+                    i - 1,
+                    self.times[i - 1]
+                )));
+            }
+        }
+        for (i, q) in self.rotations.iter().enumerate() {
+            let norm = q.iter().map(|v| v * v).sum::<f64>().sqrt();
+            if !norm.is_finite() || norm == 0.0 {
+                return Err(Error::Malformed(format!(
+                    "track for object {}: sample {i} rotation has no direction (norm {norm})",
+                    self.object_id
+                )));
+            }
+        }
+        for (i, tr) in self.translations.iter().enumerate() {
+            for (k, v) in tr.iter().enumerate() {
+                if !v.is_finite() {
+                    return Err(Error::Malformed(format!(
+                        "track for object {}: sample {i} translation[{k}] is {v}",
+                        self.object_id
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self, trailer: &[u8]) -> Result<Vec<u8>> {
+        self.check()?;
+        let mut body = Vec::new();
+        put_u32(&mut body, self.object_id);
+        put_u8(&mut body, self.interpolation);
+        put_u32(&mut body, self.times.len() as u32);
+        for i in 0..self.times.len() {
+            put_f64(&mut body, self.times[i]);
+            put_f64s(&mut body, &self.rotations[i]);
+            put_f64s(&mut body, &self.translations[i]);
+        }
+        body.extend_from_slice(trailer);
+        let mut out = Vec::new();
+        put_record(&mut out, op::OBJECT_TRACK, &body);
+        Ok(out)
     }
 }

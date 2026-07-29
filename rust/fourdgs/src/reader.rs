@@ -12,7 +12,7 @@
 //! Both paths remain first-class and directly usable: this is a convenience over them,
 //! not a replacement for either.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 
 use crate::chunk::DecodedChunk;
@@ -62,6 +62,16 @@ pub struct SceneReader<R: Readable> {
     loaded_key: Option<LoadKey>,
     /// Records that live behind byte ranges on the indexed path, fetched on first use.
     records: Option<Records>,
+    /// Object records are independent of the other front matter: asking for a camera must
+    /// not also fetch every object track in the file.
+    objects: Option<crate::object_layer::ObjectLayer>,
+    /// Poses sampled for exactly one indexed instant. Replaced on the next distinct seek,
+    /// so memory is bounded by the objects referenced by the resident gaussian state.
+    sampled_object_poses: Option<SampledObjectPoses>,
+    /// Record offsets whose complete Object Track time order has been checked. One integer
+    /// per framed track, never samples; this keeps later seeks logarithmic without making
+    /// the one-instant pose cache unbounded.
+    validated_object_tracks: HashSet<u64>,
 }
 
 /// The front-matter records a caller asked for, once they have been fetched.
@@ -71,6 +81,12 @@ struct Records {
     metadata: Vec<rec::Metadata>,
     attachments: Vec<rec::Attachment>,
     provenance: crate::provenance::Provenance,
+}
+
+struct SampledObjectPoses {
+    t_bits: u64,
+    max_sh_band: u8,
+    poses: HashMap<u32, crate::provenance::Pose>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -108,6 +124,9 @@ impl<R: Readable> SceneReader<R> {
                 loaded_band: 0,
                 loaded_key: None,
                 records: None,
+                objects: None,
+                sampled_object_poses: None,
+                validated_object_tracks: HashSet::new(),
             });
         }
         let scene = stream_reader::read_from(
@@ -124,6 +143,9 @@ impl<R: Readable> SceneReader<R> {
             loaded_band: 3,
             loaded_key: Some(LoadKey::All),
             records: None,
+            objects: None,
+            sampled_object_poses: None,
+            validated_object_tracks: HashSet::new(),
         })
     }
 
@@ -362,7 +384,19 @@ impl<R: Readable> SceneReader<R> {
     /// How many provenance records the file carries, known at open from the ranges alone.
     pub fn provenance_count(&self) -> usize {
         match (&self.indexed, &self.streamed) {
-            (Some(s), _) => s.provenance_ranges.len(),
+            (Some(s), _) => s
+                .provenance_ranges
+                .iter()
+                .filter(|(opcode, _, _)| {
+                    matches!(
+                        *opcode,
+                        crate::opcode::COORDINATE_FRAME
+                            | crate::opcode::SENSOR_CALIBRATION
+                            | crate::opcode::RIG_TRAJECTORY
+                            | crate::opcode::GEODETIC_ANCHOR
+                    )
+                })
+                .count(),
             (_, Some(s)) => {
                 let p = &s.provenance;
                 p.frames.len() + p.sensors.len() + p.trajectories.len() + p.anchors.len()
@@ -378,6 +412,16 @@ impl<R: Readable> SceneReader<R> {
             .as_ref()
             .map(|r| r.attachments.clone())
             .unwrap_or_default())
+    }
+
+    /// The Object Table and object tracks the file carries (spec section 5.15.6).
+    ///
+    /// On the indexed path these records are fetched on first use. Reconstruction through
+    /// [`state_at`](Self::state_at) instead range-samples only the poses its resident
+    /// memberships need, because tracks are authoritative motion rather than metadata.
+    pub fn objects(&mut self) -> Result<crate::object_layer::ObjectLayer> {
+        self.ensure_objects()?;
+        Ok(self.objects.clone().unwrap_or_default())
     }
 
     /// How many records of each kind the file carries, known at open from the ranges alone
@@ -434,6 +478,23 @@ impl<R: Readable> SceneReader<R> {
         Ok(())
     }
 
+    fn ensure_objects(&mut self) -> Result<()> {
+        if self.objects.is_some() {
+            return Ok(());
+        }
+        self.objects = Some(if let Some(scene) = &self.indexed {
+            indexed_reader::read_objects(&mut self.source, scene)?
+        } else {
+            self.streamed
+                .as_ref()
+                .expect("one path or the other")
+                .objects
+                .clone()
+        });
+        self.sampled_object_poses = None;
+        Ok(())
+    }
+
     /// The fetched records, or `None` when nothing has asked for them yet.
     pub fn records(&self) -> Option<(&Option<rec::Camera>, &[rec::Metadata], &[rec::Attachment])> {
         self.records
@@ -448,6 +509,7 @@ impl<R: Readable> SceneReader<R> {
 
     /// Decode only the chunks the seek rule names for `t`.
     pub fn load_at(&mut self, t: f64, max_sh_band: u8) -> Result<&GaussianSet> {
+        crate::provenance::check_scene_time(t)?;
         self.load(LoadKey::At(t.to_bits()), max_sh_band)
     }
 
@@ -485,12 +547,88 @@ impl<R: Readable> SceneReader<R> {
         &self.loaded
     }
 
+    /// A conservative upper bound on a cold seek at `t`.
+    ///
+    /// On the indexed path this includes chunk and SH bytes plus every Object Track that
+    /// could be referenced once those chunks reveal their memberships. A later seek may
+    /// cost less because track validation is cached.
+    pub fn bytes_for_time(&self, t: f64, max_sh_band: u8) -> u64 {
+        if let Some(scene) = &self.indexed {
+            return scene.bytes_for_time(t, max_sh_band);
+        }
+        self.chunk_index()
+            .iter()
+            .filter(|e| e.covers(t))
+            .map(|e| {
+                e.bands
+                    .iter()
+                    .filter(|(band, _, _)| *band <= max_sh_band)
+                    .fold(e.chunk_length, |total, (_, _, length)| {
+                        total.saturating_add(*length)
+                    })
+            })
+            .fold(0u64, u64::saturating_add)
+    }
+
     /// Reconstructed state at `t` over whatever is currently resident. Indices index into
     /// `loaded()`.
     pub fn state_at(&mut self, t: f64, max_sh_band: u8) -> Result<crate::model::StateAt> {
         let cutoff = self.header().cutoff;
         self.load_at(t, max_sh_band)?;
-        Ok(self.loaded.state_at(t, cutoff))
+        let mut state = self.loaded.state_at(t, cutoff);
+        let visible_object_ids = self.loaded.object_id.as_ref().map(|object_ids| {
+            state
+                .indices
+                .iter()
+                .map(|&i| object_ids[i as usize])
+                .collect::<Vec<u32>>()
+        });
+        if let Some(object_ids) = visible_object_ids.filter(|ids| ids.iter().any(|id| *id != 0)) {
+            let referenced: HashSet<u32> = object_ids
+                .iter()
+                .copied()
+                .filter(|id| *id != crate::object_layer::BACKGROUND)
+                .collect();
+            if self.mode == Mode::Streamed {
+                self.streamed
+                    .as_ref()
+                    .expect("streamed path")
+                    .objects
+                    .apply(&mut state.centers, &mut state.orientations, &object_ids, t)?;
+            } else if let Some(layer) = &self.objects {
+                layer.apply(&mut state.centers, &mut state.orientations, &object_ids, t)?;
+            } else {
+                let cache_matches = self.sampled_object_poses.as_ref().is_some_and(|cache| {
+                    cache.t_bits == t.to_bits() && cache.max_sh_band == max_sh_band
+                });
+                if !cache_matches {
+                    let scene = self.indexed.as_ref().expect("indexed path");
+                    let poses = indexed_reader::read_object_poses_cached(
+                        &mut self.source,
+                        scene,
+                        &referenced,
+                        t,
+                        &mut self.validated_object_tracks,
+                    )?;
+                    self.sampled_object_poses = Some(SampledObjectPoses {
+                        t_bits: t.to_bits(),
+                        max_sh_band,
+                        poses,
+                    });
+                }
+                crate::object_layer::apply_poses(
+                    &mut state.centers,
+                    &mut state.orientations,
+                    &object_ids,
+                    &self
+                        .sampled_object_poses
+                        .as_ref()
+                        .expect("indexed poses were sampled")
+                        .poses,
+                )?;
+            }
+        }
+        Ok(state)
     }
 
     fn load(&mut self, key: LoadKey, max_sh_band: u8) -> Result<&GaussianSet> {

@@ -74,7 +74,7 @@ impl Pose {
     }
 }
 
-fn quaternion_multiply(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
+pub(crate) fn quaternion_multiply(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
     let [ax, ay, az, aw] = a;
     let [bx, by, bz, bw] = b;
     [
@@ -129,62 +129,133 @@ pub fn slerp(a: [f64; 4], b: [f64; 4], u: f64) -> Result<[f64; 4]> {
     Ok(out)
 }
 
-fn sample(trajectory: &RigTrajectory, i: usize) -> Result<Pose> {
+/// A record [`pose_at`] can sample: time-stamped rigid poses with an interpolation mode.
+///
+/// Both [`RigTrajectory`] (a capture platform) and the object layer's
+/// [`crate::records::ObjectTrack`] (a scene object) implement this, which is the point —
+/// the clamp-and-slerp of [`pose_at`] is written once and both records share it, rather
+/// than each carrying its own interpolation that could drift from the other. `name` is
+/// what a refusal message uses.
+pub trait PoseSampled {
+    fn name(&self) -> &str;
+    fn interpolation(&self) -> u8;
+    fn sample_count(&self) -> usize;
+    fn time(&self, i: usize) -> f64;
+    fn rotation(&self, i: usize) -> [f64; 4];
+    fn translation(&self, i: usize) -> [f64; 3];
+}
+
+impl PoseSampled for RigTrajectory {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn interpolation(&self) -> u8 {
+        self.interpolation
+    }
+    fn sample_count(&self) -> usize {
+        self.times.len()
+    }
+    fn time(&self, i: usize) -> f64 {
+        self.times[i]
+    }
+    fn rotation(&self, i: usize) -> [f64; 4] {
+        self.rotations[i]
+    }
+    fn translation(&self, i: usize) -> [f64; 3] {
+        self.translations[i]
+    }
+}
+
+fn sample<T: PoseSampled + ?Sized>(track: &T, i: usize) -> Result<Pose> {
     Ok(Pose {
-        rotation: normalize(trajectory.rotations[i])?,
-        translation: trajectory.translations[i],
+        rotation: normalize(track.rotation(i))?,
+        translation: track.translation(i),
     })
 }
 
-/// The rig's pose at scene time `t`, or `None` when the trajectory has no samples.
+/// The normalized position of `t` between finite, strictly increasing `a` and `b`.
+///
+/// Scaling is necessary when the mathematical span is finite but cannot be represented
+/// as an `f64`, for example `-1e308..1e308`. Keeping this next to [`pose_at`] also gives
+/// materialized and range-sampled tracks one interpolation formula.
+pub(crate) fn interpolation_fraction(t: f64, a: f64, b: f64) -> f64 {
+    let span = b - a;
+    if span.is_finite() {
+        return (t - a) / span;
+    }
+    let scale = a.abs().max(b.abs());
+    ((t / scale) - (a / scale)) / ((b / scale) - (a / scale))
+}
+
+/// Interpolate two finite values without overflowing their difference across zero.
+pub(crate) fn finite_lerp(a: f64, b: f64, u: f64) -> f64 {
+    if (a < 0.0) == (b < 0.0) {
+        a + u * (b - a)
+    } else {
+        (1.0 - u) * a + u * b
+    }
+}
+
+pub(crate) fn check_scene_time(t: f64) -> Result<()> {
+    if t.is_finite() {
+        Ok(())
+    } else {
+        Err(Error::InvalidInput(format!(
+            "scene query time is {t}; expected a finite value"
+        )))
+    }
+}
+
+/// The pose at scene time `t`, or `None` when the record has no samples.
 ///
 /// Outside the sample range the pose is **clamped**, never extrapolated: before the first
 /// sample it is the first sample, at or after the last it is the last. Extrapolating
 /// produces a platform that accelerates away from the scene at the ends of the clip,
 /// which is never what the capture did.
-pub fn pose_at(trajectory: &RigTrajectory, t: f64) -> Result<Option<Pose>> {
-    let n = trajectory.sample_count();
+pub fn pose_at<T: PoseSampled + ?Sized>(track: &T, t: f64) -> Result<Option<Pose>> {
+    check_scene_time(t)?;
+    let n = track.sample_count();
     if n == 0 {
         return Ok(None);
     }
-    let times = &trajectory.times;
-    if t <= times[0] {
-        return Ok(Some(sample(trajectory, 0)?));
+    if t <= track.time(0) {
+        return Ok(Some(sample(track, 0)?));
     }
-    if t >= times[n - 1] {
-        return Ok(Some(sample(trajectory, n - 1)?));
+    if t >= track.time(n - 1) {
+        return Ok(Some(sample(track, n - 1)?));
     }
 
     // Times are strictly increasing (enforced at parse), so a bisection is exact.
     let (mut lo, mut hi) = (0usize, n - 1);
     while hi - lo > 1 {
         let mid = (lo + hi) / 2;
-        if times[mid] <= t {
+        if track.time(mid) <= t {
             lo = mid;
         } else {
             hi = mid;
         }
     }
 
-    if trajectory.interpolation == TRAJECTORY_STEP {
-        return Ok(Some(sample(trajectory, lo)?));
+    if track.interpolation() == TRAJECTORY_STEP {
+        return Ok(Some(sample(track, lo)?));
     }
-    if trajectory.interpolation != TRAJECTORY_LINEAR {
+    if track.interpolation() != TRAJECTORY_LINEAR {
         // Unknown-but-legal, not malformed — but there is no defensible way to invent the
         // rule, and picking linear would silently answer a question the file asked
         // differently. Naming it is the whole obligation.
         return Err(Error::Malformed(format!(
             "trajectory {:?} uses interpolation {}, which this build does not implement",
-            trajectory.name, trajectory.interpolation
+            track.name(),
+            track.interpolation()
         )));
     }
 
-    let u = (t - times[lo]) / (times[lo + 1] - times[lo]);
-    let a = sample(trajectory, lo)?;
-    let b = sample(trajectory, lo + 1)?;
+    let u = interpolation_fraction(t, track.time(lo), track.time(lo + 1));
+    let a = sample(track, lo)?;
+    let b = sample(track, lo + 1)?;
     let mut translation = [0.0; 3];
     for (i, slot) in translation.iter_mut().enumerate() {
-        *slot = a.translation[i] + u * (b.translation[i] - a.translation[i]);
+        *slot = finite_lerp(a.translation[i], b.translation[i], u);
     }
     Ok(Some(Pose {
         rotation: slerp(a.rotation, b.rotation, u)?,

@@ -80,6 +80,11 @@ impl<'a> Cursor<'a> {
         Ok(self.take(1)?[0])
     }
 
+    pub fn u16(&mut self) -> Result<u16> {
+        let b = self.take(2)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+
     pub fn u32(&mut self) -> Result<u32> {
         let b = self.take(4)?;
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -103,6 +108,19 @@ impl<'a> Cursor<'a> {
         let mut out = Vec::with_capacity(n);
         for _ in 0..n {
             out.push(self.f64()?);
+        }
+        Ok(out)
+    }
+
+    pub fn f32(&mut self) -> Result<f32> {
+        let b = self.take(4)?;
+        Ok(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    pub fn f32s(&mut self, n: usize) -> Result<Vec<f32>> {
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(self.f32()?);
         }
         Ok(out)
     }
@@ -247,6 +265,10 @@ pub fn put_u8(out: &mut Vec<u8>, v: u8) {
     out.push(v);
 }
 
+pub fn put_u16(out: &mut Vec<u8>, v: u16) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
 pub fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
 }
@@ -262,6 +284,16 @@ pub fn put_f64(out: &mut Vec<u8>, v: f64) {
 pub fn put_f64s(out: &mut Vec<u8>, vs: &[f64]) {
     for v in vs {
         put_f64(out, *v);
+    }
+}
+
+pub fn put_f32(out: &mut Vec<u8>, v: f32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+pub fn put_f32s(out: &mut Vec<u8>, vs: &[f32]) {
+    for v in vs {
+        put_f32(out, *v);
     }
 }
 
