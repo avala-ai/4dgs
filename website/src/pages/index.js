@@ -57,7 +57,9 @@ export default function Home() {
     >
       <header className={styles.hero}>
         <div className="container">
-          <h1 className={styles.heroTitle}>.4dgs</h1>
+          <h1 className={styles.heroTitle}>
+            <span aria-hidden="true">🧊</span> .4dgs
+          </h1>
           <p className={styles.heroSubtitle}>
             An open container format for 4D gaussian splat scenes — gaussians whose position,
             opacity and existence vary continuously over time, optionally with an embedded audio

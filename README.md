@@ -1,4 +1,4 @@
-# 4dgs
+# 🧊 4dgs
 
 [![PyPI][pypi-badge]][pypi] [![npm][npm-badge]][npm] [![crates.io][crates-badge]][crates]
 [![CI][ci-badge]][ci] [![Conformance][conformance-badge]][conformance]
