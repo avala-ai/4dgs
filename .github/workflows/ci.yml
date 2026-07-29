@@ -323,6 +323,10 @@ jobs:
     # kNotImplemented rather than quietly decoding nothing.
     name: ${{ matrix.os == 'ubuntu-latest' && 'cpp' || format('cpp ({0})', matrix.os) }}
     runs-on: ${{ matrix.os }}
+    # A ceiling, not an estimate: the job runs in about a minute. It is here because a
+    # Windows executable that cannot find a DLL it imports blocks on an error dialog
+    # instead of exiting, and an unbounded job turns that into six hours of a runner.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -369,14 +373,15 @@ jobs:
             -DFOURDGS_CORE_HEADER_DIR=/nonexistent
           cmake --build cpp/build-nocore --config "$FOURDGS_CMAKE_CONFIG" -j
           ctest --test-dir cpp/build-nocore --build-config "$FOURDGS_CMAKE_CONFIG" \
-            --output-on-failure
+            --output-on-failure --timeout 120
 
       - name: Build and test against the core
         run: |
           cargo build -p fourdgs --release
           cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE="$FOURDGS_CMAKE_CONFIG"
           cmake --build cpp/build --config "$FOURDGS_CMAKE_CONFIG" -j
-          ctest --test-dir cpp/build --build-config "$FOURDGS_CMAKE_CONFIG" --output-on-failure
+          ctest --test-dir cpp/build --build-config "$FOURDGS_CMAKE_CONFIG" \
+            --output-on-failure --timeout 120
 
       - name: The example runs, so it cannot rot into a snippet that no longer works
         run: |

@@ -85,11 +85,25 @@ if(FOURDGS_HAVE_CORE)
     # The static library first. The crate builds a cdylib too, and linking that would make
     # every consumer's binary need it on their loader path at run time — a surprise for an
     # integrator who asked for one static archive.
+    #
+    # Saying that is not enough on Windows. Cargo writes both `fourdgs.lib` (the staticlib)
+    # and `fourdgs.dll.lib` (the cdylib's import library) into the same directory, and
+    # CMake's MSVC suffix list puts `.dll.lib` ahead of `.lib` — so the default search
+    # returns the DLL, which is the outcome the paragraph above rules out. It is not a
+    # theoretical preference: an executable that references any fourdgs_* symbol then gets
+    # a load-time dependency on fourdgs.dll, and with the DLL absent from the loader path
+    # the process does not start. Narrowing the suffix list for this one search asks for
+    # the archive the comment says it wants.
+    set(FOURDGS_SAVED_FIND_SUFFIXES ${CMAKE_FIND_LIBRARY_SUFFIXES})
+    if(MSVC)
+      set(CMAKE_FIND_LIBRARY_SUFFIXES ".lib")
+    endif()
     find_library(
       FOURDGS_CORE_FOUND_LIBRARY
       NAMES libfourdgs.a fourdgs
       HINTS "${CMAKE_CURRENT_SOURCE_DIR}/../target/release"
             "${CMAKE_CURRENT_SOURCE_DIR}/../target/debug")
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ${FOURDGS_SAVED_FIND_SUFFIXES})
     if(NOT FOURDGS_CORE_FOUND_LIBRARY)
       message(
         FATAL_ERROR
