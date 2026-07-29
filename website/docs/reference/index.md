@@ -32,9 +32,9 @@ against it yet.
 | Statistics                                           | Yes     | Yes        | Yes     | Planned | Planned |
 | Unknown-record skipping                              | Yes     | Yes        | Yes     | Planned | Planned |
 | Private-range records                                | Yes     | Yes        | Yes     | Planned | Planned |
-| Encode                                               | Yes     | Planned    | Planned | Planned | Planned |
-| Chunked encode                                       | Yes     | Planned    | Planned | Planned | Planned |
-| Summary writing                                      | Yes     | Planned    | Planned | Planned | Planned |
+| Encode                                               | Yes     | Planned    | Yes     | Planned | Planned |
+| Chunked encode                                       | Yes     | Planned    | Yes     | Planned | Planned |
+| Summary writing                                      | Yes     | Planned    | Yes     | Planned | Planned |
 | Convert from PLY frame sequences                     | Yes     | No         | No      | No      | No      |
 | Inspect and validate                                 | Yes     | Planned    | Planned | Planned | Planned |
 
@@ -60,8 +60,8 @@ transport TypeScript ships in `@4dgs/browser` is covered by that package's own t
 corpus. Rust ships no HTTP transport at all — its core takes a `Readable`, and the C ABI takes the
 same thing as callbacks, so an HTTP reader belongs to the consumer.
 
-**Encode** stays `Planned` for TypeScript and Rust because neither has an encoder yet. Those
-packages decode; the reference encoder is Python's.
+**Encode** stays `Planned` for TypeScript because there is no TypeScript encoder. The packages there
+decode; Python's encoder is the reference and Rust's is the production one.
 
 **Convert from PLY frame sequences** takes a directory of standard per-frame gaussian splat PLY
 files — the common interchange form — and produces a `.4dgs`. It lives in the Python package because
@@ -86,10 +86,25 @@ different file. Each runner decodes its variant twice more — once cut before t
 once cut inside the last chunk — and asserts what survives. A failure exits the runner non-zero and
 the harness reports it like a diff.
 
-**Encode**, **Chunked encode** and **Summary writing** are proved by the corpus gate rather than by
-a runner: `generate.py --verify` re-encodes all 28 variants, asserts every committed checksum, and
-asserts that two consecutive runs are byte-identical. Every variant is an encode; the chunked and
-summary-bearing ones are the flags that say so.
+**Encode**, **Chunked encode** and **Summary writing** are proved by a gate rather than by a runner,
+and the two encoders are gated differently because they play different roles.
+
+Python's is proved by the corpus gate: `generate.py --verify` re-encodes all 28 variants, asserts
+every committed checksum, and asserts that two consecutive runs are byte-identical. Every variant is
+an encode; the chunked and summary-bearing ones are the flags that say so.
+
+Rust's cannot use that gate, because Rust does not generate the corpus and a second encoder that
+produced byte-identical files would be a reimplementation rather than an implementation.
+`rust/encode-roundtrip.sh` re-encodes every variant with the Rust encoder and then requires the
+**Rust and Python decoders to produce identical canonical JSON** from the result, asserting
+byte-identical output across two encodes on the way. An encoder checked only against its own decoder
+proves that two halves of one implementation share an opinion, which is the failure mode this suite
+exists to catch; agreement with a decoder written in another language against the same specification
+is a real claim. Every encode inside that gate also runs the encoder's own verification, which
+decodes each chunk back and refuses to return a file whose measured deviation exceeds the bounds it
+is about to declare — so the Quantization record's numbers are checked on every gaussian of every
+scene rather than sampled. The chunk tree is exercised by the same run: the corpus scenes partition
+into up to 42 chunks each.
 
 **Convert from PLY frame sequences** and **Inspect and validate** are tools rather than wire-format
 features, so the conformance suite does not cover them; they are marked from their own tests, which
@@ -98,12 +113,14 @@ seed — the corpus rule applied to a different file format — and the validato
 files built byte by byte, because a validator tested only on files its own encoder wrote is a
 validator tested against nothing.
 
-**Rust** decodes, and its decode row is filled in from the same suite on the same terms as the other
-two. Its encode rows stay `Planned`: there is no Rust encoder yet, and the reference encoder is
-Python's. The crate also carries the C ABI — `rust/fourdgs/include/fourdgs.h` — which is the surface
-the native tier binds to rather than hand-writing and then maintaining parallel implementations.
-That header is checked by a C program compiled and run in CI, not by the corpus, because a drift
-between a header and the symbols behind it is not something a decode suite can see.
+**Rust** decodes and encodes. Its decode rows are filled in from the same suite on the same terms as
+the other two; its encode rows come from the cross-implementation gate described above. Python
+remains the reference encoder — the one the corpus is generated from — and Rust's is the production
+one, which is why it verifies its own bounds exhaustively rather than trusting the grid arithmetic.
+The crate also carries the C ABI — `rust/fourdgs/include/fourdgs.h` — which is the surface the
+native tier binds to rather than hand-writing and then maintaining parallel implementations. That
+header is checked by a C program compiled and run in CI, not by the corpus, because a drift between
+a header and the symbols behind it is not something a decode suite can see.
 
 **C++** and **Swift** take their surface from that C ABI — the header plus a thin shim per language.
 Swift targets visionOS and iOS.

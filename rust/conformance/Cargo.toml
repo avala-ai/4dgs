@@ -20,3 +20,7 @@ path = "src/bin/decode_indexed.rs"
 
 [dependencies]
 fourdgs = { path = "../fourdgs" }
+
+[[bin]]
+name = "encode_roundtrip"
+path = "src/bin/encode_roundtrip.rs"

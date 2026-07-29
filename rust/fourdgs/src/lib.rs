@@ -49,6 +49,7 @@ pub mod serialization;
 pub mod sh;
 pub mod stream;
 pub mod stream_reader;
+pub mod writer;
 
 pub use crate::error::{Error, Result};
 pub use crate::model::{AudioTrack, CameraTrajectory, GaussianSet, StateAt};
@@ -60,3 +61,4 @@ pub use crate::records::{
 };
 pub use crate::serialization::{MAGIC, VERSION};
 pub use crate::stream_reader::{read_bytes, read_from, read_path, ReadOptions, Scene};
+pub use crate::writer::{write_path, write_to_vec, SceneExtras, WriteOptions};

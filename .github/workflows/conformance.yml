@@ -80,6 +80,14 @@ jobs:
           python tests/conformance/generate.py
           python tests/conformance/run.py --runner rust
 
+      # The corpus proves decoders against files the reference encoder wrote; this proves
+      # the Rust encoder, by requiring the Rust and Python decoders to agree on files it
+      # wrote. An encoder checked only by its own decoder proves that two halves of one
+      # implementation share an opinion, which is the failure mode this suite exists to
+      # catch. Every encode inside it also runs the encoder's own bound verification.
+      - name: The encoder writes files another implementation agrees with
+        run: rust/encode-roundtrip.sh
+
   cpp:
     runs-on: ubuntu-latest
     needs: corpus

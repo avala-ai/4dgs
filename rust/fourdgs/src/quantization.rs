@@ -131,6 +131,23 @@ impl Steps {
     }
 }
 
+/// The span a velocity error is judged over: a gaussian's visible half-width, or the
+/// length of its window when it never fades, clamped to the range the classes cover.
+///
+/// The clamp at two seconds is why the format's promise reads "over `min(lifetime, 2 s)`"
+/// rather than over the whole lifetime.
+pub fn life_half(
+    sigma_bin: i64,
+    sigma_log_step: f64,
+    never_fades: bool,
+    window_len: f64,
+    k: f64,
+) -> f64 {
+    let sigma = (sigma_bin as f64 * sigma_log_step).exp();
+    let half = if never_fades { window_len } else { k * sigma };
+    half.clamp(LIFE_HALF_MIN, LIFE_HALF_MAX)
+}
+
 /// Velocity precision class, from the sigma bin a decoder has already read.
 ///
 /// `ceil`, not `round`: the class's nominal lifetime has to be an upper bound on the real
@@ -142,9 +159,7 @@ pub fn life_class(
     window_len: f64,
     k: f64,
 ) -> f64 {
-    let sigma = (sigma_bin as f64 * sigma_log_step).exp();
-    let half = if never_fades { window_len } else { k * sigma };
-    let half = half.clamp(LIFE_HALF_MIN, LIFE_HALF_MAX);
+    let half = life_half(sigma_bin, sigma_log_step, never_fades, window_len, k);
     (half / LIFE_REF)
         .log2()
         .ceil()

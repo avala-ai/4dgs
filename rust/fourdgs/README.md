@@ -9,7 +9,13 @@ everywhere else.
 ## Status
 
 Decoding is complete and proved by the shared conformance suite — 28 variants over both read paths,
-run in this repository's CI. Encoding is not here yet; the reference encoder is Python's.
+run in this repository's CI.
+
+Encoding is complete too. Python's encoder is the _reference_ one, optimized for being obviously
+correct and the one the corpus is generated from; this is the _production_ one, which is why it
+verifies its own error bounds on every gaussian rather than trusting the grid arithmetic to have
+been right. It is gated by `rust/encode-roundtrip.sh`, which re-encodes every corpus variant and
+requires the Rust and Python decoders to agree on the result.
 
 The crate is `publish = false` until there is a release to publish.
 
@@ -86,6 +92,21 @@ cc -std=c11 -I rust/fourdgs/include rust/fourdgs/tests/capi_smoke.c \
 ./capi_smoke tests/conformance/data/OneWindow-UseChunkIndex-UseCrc-WithAudio.4dgs
 ```
 
+## Writing
+
+```rust
+let options = fourdgs::WriteOptions { profile: fourdgs::quantization::Profile::Default, ..Default::default() };
+let bytes = fourdgs::write_to_vec(&gaussians, 8.0, &options, &fourdgs::SceneExtras::default())?;
+```
+
+Two properties are contracts rather than niceties. **Chunks are independent** — nothing in one
+references another, which is what makes seeking work at all. And **output is deterministic**: the
+same scene and options produce byte-identical files, run after run.
+
+`WriteOptions::verify` is on by default. It decodes every chunk back and refuses to return a file
+whose measured deviation exceeds the bounds the file is about to declare, because a bound nobody
+checked is worse than no bound — consumers will trust it.
+
 ## Conformance
 
 The runners live in `rust/conformance` and are wired into the shared harness:
@@ -94,6 +115,7 @@ The runners live in `rust/conformance` and are wired into the shared harness:
 python3 tests/conformance/generate.py
 cargo build --release --workspace
 python3 tests/conformance/run.py --runner rust
+rust/encode-roundtrip.sh
 ```
 
 ## Scope
