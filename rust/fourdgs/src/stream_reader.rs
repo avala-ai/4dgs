@@ -87,6 +87,7 @@ impl Scene {
     /// Reconstructed gaussian state at scene time `t`, including authoritative Object
     /// Tracks. This is the front-to-back counterpart of [`crate::reader::SceneReader::state_at`].
     pub fn state_at(&self, t: f64) -> Result<crate::model::StateAt> {
+        crate::provenance::check_scene_time(t)?;
         let mut state = self.gaussians.state_at(t, self.header.cutoff);
         let visible_object_ids = self.gaussians.object_id.as_ref().map(|object_ids| {
             state

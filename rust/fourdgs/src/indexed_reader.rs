@@ -721,6 +721,7 @@ fn sample_object_track<R: Readable + ?Sized>(
     range: &ObjectTrackRange,
     t: f64,
 ) -> Result<Option<crate::provenance::Pose>> {
+    crate::provenance::check_scene_time(t)?;
     if range.object_id == crate::object_layer::BACKGROUND {
         return Err(Error::Malformed(format!(
             "ObjectTrack at byte {} names object 0, which is background/unassigned",
@@ -1118,5 +1119,24 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("sample 2"), "{message}");
         assert!(message.contains("sample 1"), "{message}");
+    }
+
+    #[test]
+    fn indexed_sampling_rejects_a_non_finite_query_time() {
+        let bytes =
+            vec![0; OBJECT_TRACK_HEADER_BYTES as usize + 2 * OBJECT_TRACK_SAMPLE_BYTES as usize];
+        let range = ObjectTrackRange {
+            object_id: 7,
+            interpolation: rec::TRAJECTORY_LINEAR,
+            sample_count: 2,
+            record_offset: 41,
+            record_length: bytes.len() as u64,
+            content_offset: 0,
+        };
+        let mut source = BytesReadable::new(&bytes);
+        let error = sample_object_track(&mut source, &range, f64::NAN).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("scene query time is NaN"), "{message}");
+        assert!(message.contains("expected a finite value"), "{message}");
     }
 }

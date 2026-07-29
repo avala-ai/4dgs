@@ -196,6 +196,16 @@ pub(crate) fn finite_lerp(a: f64, b: f64, u: f64) -> f64 {
     }
 }
 
+pub(crate) fn check_scene_time(t: f64) -> Result<()> {
+    if t.is_finite() {
+        Ok(())
+    } else {
+        Err(Error::InvalidInput(format!(
+            "scene query time is {t}; expected a finite value"
+        )))
+    }
+}
+
 /// The pose at scene time `t`, or `None` when the record has no samples.
 ///
 /// Outside the sample range the pose is **clamped**, never extrapolated: before the first
@@ -203,6 +213,7 @@ pub(crate) fn finite_lerp(a: f64, b: f64, u: f64) -> f64 {
 /// produces a platform that accelerates away from the scene at the ends of the clip,
 /// which is never what the capture did.
 pub fn pose_at<T: PoseSampled + ?Sized>(track: &T, t: f64) -> Result<Option<Pose>> {
+    check_scene_time(t)?;
     let n = track.sample_count();
     if n == 0 {
         return Ok(None);

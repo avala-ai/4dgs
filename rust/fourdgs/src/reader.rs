@@ -503,6 +503,7 @@ impl<R: Readable> SceneReader<R> {
 
     /// Decode only the chunks the seek rule names for `t`.
     pub fn load_at(&mut self, t: f64, max_sh_band: u8) -> Result<&GaussianSet> {
+        crate::provenance::check_scene_time(t)?;
         self.load(LoadKey::At(t.to_bits()), max_sh_band)
     }
 
