@@ -138,3 +138,12 @@ jobs:
           cmake --build cpp/build -j
       - name: Tests
         run: ctest --test-dir cpp/build --output-on-failure
+
+      # The binding owns handles that come from across an FFI boundary, so the leak and the
+      # out-of-bounds read are the two bugs it is actually exposed to. `test_seam` opens and
+      # closes two hundred times for this step to have something to measure.
+      - name: Sanitizers
+        run: |
+          cmake -S cpp -B cpp/build-asan -DCMAKE_BUILD_TYPE=Debug -DFOURDGS_ASAN=ON
+          cmake --build cpp/build-asan -j
+          ctest --test-dir cpp/build-asan --output-on-failure
