@@ -55,6 +55,44 @@ the run silently — no failure, no red mark, just an absence that looks like wa
 `main` and push again. Worth knowing because the natural reading of an empty checks list is the
 wrong one.
 
+## Platforms exercised in CI
+
+Every runner is GitHub-hosted, so this is reproducible by anyone with a fork. The table is what
+actually runs green, not what is expected to work — an SDK is only listed on a platform its jobs
+really build and test there.
+
+| SDK        | Linux x86-64              | Linux arm64  | macOS                             | Windows                   |
+| ---------- | ------------------------- | ------------ | --------------------------------- | ------------------------- |
+| Python     | build, tests, conformance | build, tests | build, tests, conformance         | build, tests, conformance |
+| TypeScript | build, tests, conformance | build, tests | build, tests, conformance         | build, tests, conformance |
+| Rust       | build, tests, conformance | build, tests | build, tests, conformance         | build, tests, conformance |
+| C++        | build, tests, conformance | build, tests | build, tests                      | build, tests (MSVC)       |
+| Swift      | build, tests, conformance | —            | build for macOS, iOS and visionOS | —                         |
+
+This is a statement about platforms, not about features. Which parts of the format each SDK
+implements is the feature matrix's job, and that matrix stays per-feature — a decoder does not
+support a different set of records on Windows than it does on Linux.
+
+Some jobs stay on Linux deliberately, each for a reason that is not "nobody got to it":
+
+- **fuzz** bounds the decoder's address space with `ulimit -v`, and "never allocates without bound"
+  cannot be checked on a machine willing to satisfy the allocation. There is no portable equivalent.
+- **browser** needs a Chrome driven over the DevTools protocol, which the other images do not have.
+- The C++ **sanitizer** leg looks for leaks and over-reads in the binding's own logic, which is the
+  same code on every platform, so one platform finds them.
+- **size-budget**, **markdown** and **no-committed-binaries** read the repository. Reading it four
+  times returns the same answer four times.
+
+Checks that read source rather than exercise a machine — `ruff`, `clippy`, `rustfmt`, `prettier`,
+`clang-format` — also run on one leg only, for the same reason.
+
+Two platform notes worth keeping if you touch these workflows:
+
+- **Cache keys need `runner.arch`, not just `runner.os`.** `ubuntu-latest` and `ubuntu-24.04-arm`
+  both report `Linux`, so an OS-keyed cache would hand the arm leg x86-64 binaries.
+- **The default shell on `windows-latest` is PowerShell.** The jobs with an OS matrix declare
+  `defaults.run.shell: bash` so one script serves every leg.
+
 ## Disabled CI jobs
 
 A job behind `if: false` is a promise, and **it is untested by construction** — nothing runs it, so
