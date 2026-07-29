@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from . import opcode as op
 from . import records as rec
 from .exceptions import FourdgsError
+from .object_layer import ObjectLayer
 from .provenance import LENGTH_UNIT_METRES, Provenance
 from .quantization import sh_bound, sh_step
 from .readable import BytesReadable
@@ -213,6 +214,7 @@ def validate(data: bytes) -> Report:
     index: list[rec.ChunkIndexEntry] = []
     footer = None
     provenance = Provenance()
+    objects = ObjectLayer()
 
     try:
         for record in iter_records(data, len(MAGIC)):
@@ -244,6 +246,16 @@ def validate(data: bytes) -> Report:
                 provenance.trajectories.append(rec.RigTrajectory.parse(record.content))
             elif record.opcode == op.GEODETIC_ANCHOR:
                 provenance.anchors.append(rec.GeodeticAnchor.parse(record.content))
+            elif record.opcode == op.OBJECT_TABLE:
+                if objects.table is not None:
+                    report.error(
+                        f"a second ObjectTable record appears at byte {record.offset}; "
+                        "a file may carry exactly one scene-wide object table"
+                    )
+                else:
+                    objects.table = rec.ObjectTable.parse(record.content)
+            elif record.opcode == op.OBJECT_TRACK:
+                objects.tracks.append(rec.ObjectTrack.parse(record.content))
             elif op.is_provenance(record.opcode):
                 report.note(
                     f"reserved provenance record 0x{record.opcode:02X} — skipped, as required "
@@ -275,6 +287,10 @@ def validate(data: bytes) -> Report:
     except FourdgsError as exc:
         report.error(str(exc))
     _check_provenance(provenance, report)
+    try:
+        objects.check()
+    except FourdgsError as exc:
+        report.error(str(exc))
 
     if header is not None and counted != header.gaussian_count:
         report.error(f"Header declares {header.gaussian_count} gaussians; chunks contain {counted}")

@@ -1096,6 +1096,7 @@ class ObjectTrack:
         return len(self.times)
 
     def encode(self, trailer: bytes = b"") -> bytes:
+        self.check()
         body = put_u32(self.object_id) + put_u8(self.interpolation) + put_u32(len(self.times))
         for i, t in enumerate(self.times):
             body += put_f64(t) + put_f64s(self.rotations[i]) + put_f64s(self.translations[i])

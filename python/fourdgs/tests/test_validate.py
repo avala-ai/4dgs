@@ -88,6 +88,20 @@ class TestGoodFiles:
         report = validate(minimal_file())
         assert report.ok, errors(report)
 
+    def test_defined_object_records_are_parsed_not_reported_as_reserved(self):
+        table = rec.ObjectTable(entries=[rec.ObjectTableEntry(object_id=7)]).encode()
+        track = rec.ObjectTrack(
+            object_id=7,
+            times=[0.0],
+            rotations=[[0.0, 0.0, 0.0, 1.0]],
+            translations=[[0.0, 0.0, 0.0]],
+        ).encode()
+        report = validate(minimal_file(extra=table + track))
+        assert report.ok, errors(report)
+        notes = [finding.message for finding in report.findings if finding.severity == "note"]
+        assert not any("reserved provenance record 0x24" in message for message in notes)
+        assert not any("reserved provenance record 0x25" in message for message in notes)
+
     def test_notes_and_warnings_do_not_make_a_file_invalid(self):
         # No index: readable front to back, not seekable. A warning, not an error.
         report = validate(real_file(write_index=False))
@@ -118,6 +132,31 @@ class TestRefusals:
         report = validate(minimal_file(header=header))
         assert not report.ok
         assert any("declares 5 gaussians; chunks contain 0" in m for m in errors(report))
+
+    def test_duplicate_object_tracks_are_rejected_across_records(self):
+        track = rec.ObjectTrack(
+            object_id=7,
+            times=[0.0],
+            rotations=[[0.0, 0.0, 0.0, 1.0]],
+            translations=[[0.0, 0.0, 0.0]],
+        ).encode()
+        report = validate(minimal_file(extra=track + track))
+        assert not report.ok
+        assert any("two ObjectTrack records move object 7" in message for message in errors(report))
+
+    def test_malformed_object_tracks_are_rejected_by_the_validator(self):
+        track = bytearray(
+            rec.ObjectTrack(
+                object_id=7,
+                times=[0.0],
+                rotations=[[0.0, 0.0, 0.0, 1.0]],
+                translations=[[0.0, 0.0, 0.0]],
+            ).encode()
+        )
+        track[9 + 4] = 2
+        report = validate(minimal_file(extra=bytes(track)))
+        assert not report.ok
+        assert any("interpolation 2" in message for message in errors(report))
 
     def test_the_audio_flag_and_the_audio_record_must_agree(self):
         # Flag set, no record.

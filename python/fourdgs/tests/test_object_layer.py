@@ -335,6 +335,28 @@ def test_object_table_writer_names_values_that_do_not_fit_the_wire(table, field,
     assert caught.value.code == code
 
 
+@pytest.mark.parametrize(
+    ("track", "code"),
+    [
+        (rec.ObjectTrack(object_id=-1), "invalid-object-id"),
+        (rec.ObjectTrack(object_id=7, interpolation=2), "unsupported-trajectory-interpolation"),
+        (
+            rec.ObjectTrack(
+                object_id=7,
+                times=[0.0],
+                rotations=[],
+                translations=[[0.0, 0.0, 0.0]],
+            ),
+            "invalid-object-track-shape",
+        ),
+    ],
+)
+def test_object_track_encoder_runs_structural_validation(track, code):
+    with pytest.raises(MalformedFile) as caught:
+        track.encode()
+    assert caught.value.code == code
+
+
 # --------------------------------------------------------------------------
 # Full-file integration: writer -> reader, both streamed and indexed
 # --------------------------------------------------------------------------
