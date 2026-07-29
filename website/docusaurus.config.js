@@ -12,8 +12,8 @@ const config = {
   favicon: "img/favicon.svg",
 
   // GitHub Pages serves this project site from a subpath of the organization domain.
-  url: "https://avala-ai.github.io",
-  baseUrl: "/4dgs/",
+  url: "https://4dgs.dev",
+  baseUrl: "/",
 
   // The docs cross-reference each other with relative paths, and a link that no longer
   // resolves is a documentation bug rather than a cosmetic one — fail the build on it.
