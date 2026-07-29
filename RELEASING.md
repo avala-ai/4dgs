@@ -60,9 +60,9 @@ the drift this rule exists to prevent, and it is easier to refuse the tag than t
 ## Naming
 
 The format, the repository, the CLI and the file extension are always **4dgs** and **`.4dgs`**.
-Package names are a different matter, and not because we chose them: three registries impose three
-different constraints, and the honest thing is to write down what each one is rather than imply a
-consistency that does not exist.
+Package names are a different matter, and not because we chose them: three registries and two
+language-identifier rules impose five constraints, and the honest thing is to write down what each
+one is rather than imply a consistency that does not exist.
 
 | Registry  | Name                                                          | Why                                                                                                                                     |
 | --------- | ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
@@ -70,9 +70,10 @@ consistency that does not exist.
 | crates.io | `fourdgs`                                                     | Cargo rejects a crate name beginning with a digit, so `4dgs` is not available to anyone. The `[lib] name` matches                       |
 | npm       | `@4dgs/core`, `@4dgs/browser`, `@4dgs/nodejs`, `@4dgs/codecs` | Scoped names may begin with a digit. The unscoped `4dgs` was refused by npm's similarity filter, so the scope is not a stylistic choice |
 | Swift     | module `FourDGS`, C seam `CFourDGS`                           | A Swift module name is an identifier and may not begin with a digit. The casing is Swift's own convention for acronyms, not a rename    |
+| Kaitai    | `kaitai/fourdgs.ksy`, type id `fourdgs`                       | A `.ksy` type id becomes an identifier in every target the compiler emits, so the same rule as Swift and Cargo applies                  |
 
 In prose, in the specification, in the CLI and on disk: always `4dgs`. `fourdgs` appears only as a
-package name, and only where a registry requires it.
+package name or a language identifier, and only where a registry or a compiler requires it.
 
 ## Swift, before its first release
 

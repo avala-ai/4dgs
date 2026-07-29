@@ -36,6 +36,8 @@ self-contained resource you can range-request and seek like a video.
 - [Implementation notes](website/docs/spec/notes.md) — non-normative decode guidance
 - [Feature support matrix](website/docs/reference/index.md) — what each SDK implements
 - [Concepts](website/docs/guides/concepts.md) — the vocabulary every SDK uses
+- [Kaitai Struct grammar](kaitai/) — the file's structure, machine-readable, for tooling that does
+  not link an SDK. Not a decoder and not on the matrix
 
 ## Libraries
 
