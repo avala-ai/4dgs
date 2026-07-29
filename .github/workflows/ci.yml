@@ -252,14 +252,10 @@ jobs:
       - run: swift --version
       # Style comes from swift/.swift-format, so this is the same command a contributor
       # runs locally: `swift format --in-place --recursive` fixes what this reports.
+      # Style comes from swift/.swift-format, so this is the same command a contributor
+      # runs locally: `swift format --in-place --recursive` fixes what this reports.
       - name: Format
-        run: |
-          swift format --in-place --recursive swift/Sources swift/Tests swift/conformance
-          git config --global --add safe.directory "$PWD"
-          if ! git diff --quiet; then
-            echo "PATCH-BEGIN"; git diff | base64 -w0; echo; echo "PATCH-END"
-          fi
-          git diff --stat
+        run: swift format lint --recursive --strict swift/Sources swift/Tests swift/conformance
 
       # The package is a binding, so its dependency is a library and not a source tree: the
       # core has to exist before anything here links. The image has no Rust, so the job
@@ -275,17 +271,22 @@ jobs:
       # SPM links a system library by name, so the staticlib's directory has to be on the
       # linker's search path. It is passed here rather than written into Package.swift as
       # an unsafe flag, which would make the package undependable as a versioned dependency.
+      # `cargo` emits libfourdgs.a and libfourdgs.so side by side, and the linker prefers
+      # the shared one. That is fine — but then everything that runs needs it on the
+      # loader's path too, which is what LD_LIBRARY_PATH is for. Apple platforms link the
+      # staticlib and need no equivalent.
       - name: Build
         run: swift build --package-path swift -Xlinker -L$PWD/target/release
       - name: Tests
-        run: swift test --package-path swift -Xlinker -L$PWD/target/release
+        run: LD_LIBRARY_PATH=$PWD/target/release swift test --package-path swift -Xlinker -L$PWD/target/release
 
       # The canonical JSON is a contract between languages, and this is where Swift's half
       # of it is checked — against canonical.py, on a synthetic scene, with no decoding in
       # the way. It means a conformance mismatch is about the decode and nothing else.
       - name: Canonical JSON agrees with canonical.py
         run: |
-          swift run --package-path swift -Xlinker -L$PWD/target/release canonical_selftest > /tmp/swift.json
+          LD_LIBRARY_PATH=$PWD/target/release swift run --package-path swift \
+            -Xlinker -L$PWD/target/release canonical_selftest > /tmp/swift.json
           python3 swift/conformance/selftest.py --compare /tmp/swift.json
 
       # End to end over the ABI, on a real file: the runner opens a generated corpus
@@ -301,7 +302,7 @@ jobs:
           variant=$(ls tests/conformance/data/*.4dgs | head -1)
           echo "decoding $variant"
           set +e
-          ./swift/.build/release/decode_streamed "$variant" 2>/tmp/err.txt
+          LD_LIBRARY_PATH=$PWD/target/release ./swift/.build/release/decode_streamed "$variant" 2>/tmp/err.txt
           code=$?
           set -e
           cat /tmp/err.txt

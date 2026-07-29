@@ -292,17 +292,17 @@ enum Core {
 // closures: a `@convention(c)` function may not capture, so everything they need arrives
 // through `ctx`.
 
-private let readerSize:
-    @convention(c) (UnsafeMutableRawPointer?, UnsafeMutablePointer<UInt64>?) -> Int32 = { ctx, out in
-        guard let ctx, let out else { return Int32(FOURDGS_STATUS_INVALID_ARGUMENT.rawValue) }
-        let box = Unmanaged<Core.ReaderBox>.fromOpaque(ctx).takeUnretainedValue()
-        do {
-            out.pointee = UInt64(try box.reader.byteCount())
-            return Int32(FOURDGS_STATUS_OK.rawValue)
-        } catch {
-            return Int32(FOURDGS_STATUS_IO.rawValue)
-        }
+private let readerSize: @convention(c) (UnsafeMutableRawPointer?, UnsafeMutablePointer<UInt64>?) -> Int32 = {
+    ctx, out in
+    guard let ctx, let out else { return Int32(FOURDGS_STATUS_INVALID_ARGUMENT.rawValue) }
+    let box = Unmanaged<Core.ReaderBox>.fromOpaque(ctx).takeUnretainedValue()
+    do {
+        out.pointee = UInt64(try box.reader.byteCount())
+        return Int32(FOURDGS_STATUS_OK.rawValue)
+    } catch {
+        return Int32(FOURDGS_STATUS_IO.rawValue)
     }
+}
 
 private let readerRead:
     @convention(c) (UnsafeMutableRawPointer?, UInt64, UInt64, UnsafeMutablePointer<UInt8>?) -> Int32 = {

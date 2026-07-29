@@ -59,7 +59,9 @@ public struct Scene: Sendable, Equatable {
 
     /// §8's whole seek algorithm: every chunk whose `[t0, t1)` contains `t`.
     public func chunks(containing t: Double) -> [Int] {
-        chunkIntervals.indices.filter { t >= chunkIntervals[$0].lowerBound && t < chunkIntervals[$0].upperBound }
+        chunkIntervals.indices.filter {
+            t >= chunkIntervals[$0].lowerBound && t < chunkIntervals[$0].upperBound
+        }
     }
 }
 
@@ -137,7 +139,9 @@ public final class SceneReader {
     ///
     /// Transfers only those chunks' byte ranges, and under a band cap only the bands at or
     /// below it.
-    public func loadedGaussians(at t: Double, options: DecodeOptions = DecodeOptions()) throws
+    public func loadedGaussians(
+        at t: Double, options: DecodeOptions = DecodeOptions()
+    ) throws
         -> GaussianState
     {
         try Core.load(handle, at: t, bandCap: options.bandCap)
@@ -148,7 +152,9 @@ public final class SceneReader {
     /// §3's rule in full: inside the half-open validity window, and marginal at or above
     /// **this file's** cutoff. Positions come back as decoded rest positions; call
     /// ``Gaussian/state(at:)`` for one moved and faded to `t`.
-    public func gaussians(at t: Double, options: DecodeOptions = DecodeOptions()) throws
+    public func gaussians(
+        at t: Double, options: DecodeOptions = DecodeOptions()
+    ) throws
         -> GaussianState
     {
         try loadedGaussians(at: t, options: options).live(at: t, cutoff: scene.header.cutoff)

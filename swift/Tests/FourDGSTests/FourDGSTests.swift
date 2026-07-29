@@ -234,14 +234,14 @@ final class SeamTests: XCTestCase {
 final class ReaderTests: XCTestCase {
 
     func testInMemoryReaderShortReadsAtTheEndRatherThanThrowing() throws {
-        var reader = InMemoryReader([1, 2, 3, 4])
+        let reader = InMemoryReader([1, 2, 3, 4])
         XCTAssertEqual(try reader.read(offset: 2, count: 10), [3, 4])
         XCTAssertEqual(try reader.read(offset: 9, count: 2), [])
         XCTAssertEqual(try reader.byteCount(), 4)
     }
 
     func testNegativeRangesAreRefused() {
-        var reader = InMemoryReader([1, 2, 3, 4])
+        let reader = InMemoryReader([1, 2, 3, 4])
         XCTAssertThrowsError(try reader.read(offset: -1, count: 2))
     }
 
