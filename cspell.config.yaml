@@ -51,6 +51,16 @@ words:
   - coef
   - Shortley
   - Condon
+  # Relighting extension seam (registry attribute ids 32-47, relightable profile)
+  - albedo
+  - metalness
+  - BRDF
+  - relight
+  - relightable
+  - relighting
+  - shadeable
+  - microfacet
+  - dielectric
   # glTF and the Khronos extension registry
   - Khronos
   - gltf
