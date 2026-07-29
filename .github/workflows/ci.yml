@@ -296,13 +296,26 @@ jobs:
       - name: The CLI runs over the corpus
         run: |
           set -eo pipefail
-          indexed=tests/conformance/data/MixedLifetimes-SHDegree2-UseChunkIndex-UseCrc.4dgs
-          unindexed=tests/conformance/data/TenWindows-UseCrc.4dgs
+          # Chosen by the properties the assertions below are about, not by filename. The
+          # corpus is generated and grows; a name literal here would either rot into a
+          # broken step or, worse, into one that quietly stopped covering anything.
+          indexed=$(ls tests/conformance/data/*SHDegree2*UseChunkIndex*UseCrc*.4dgs | sort | head -1)
+          unindexed=$(ls tests/conformance/data/*.4dgs | grep -v UseChunkIndex | sort | head -1)
+          for f in "$indexed" "$unindexed"; do
+            [ -n "$f" ] || { echo "::error::no corpus variant matches; the corpus was renamed"; exit 1; }
+          done
+          echo "indexed: $indexed"
+          echo "unindexed: $unindexed"
           if [ "$RUNNER_OS" = "Windows" ]; then cli=target/debug/4dgs.exe; else cli=target/debug/4dgs; fi
+          # Degree 2 because the file was picked for `SHDegree2`, so the selector and the
+          # assertion cannot drift apart.
           "$cli" info "$indexed" | grep -q '^spherical harm degree 2$'
           "$cli" inspect "$indexed" | grep -q 'Footer'
           "$cli" inspect --json "$indexed" | grep -q '"trailing_magic": true'
-          "$cli" decode "$indexed" --time 4 --json | grep -q '"total": 512'
+          # The gaussian count comes from `info` rather than a literal, so this asserts the
+          # two commands agree about the file instead of asserting one variant's size.
+          declared=$("$cli" info "$indexed" | sed -n 's/^gaussians  *//p' | tr -d ',')
+          "$cli" decode "$indexed" --time 4 --json | grep -q "\"total\": $declared"
           "$cli" validate "$indexed"
           # A file with no index is valid, says so, and exits 2 rather than 0 — which is
           # the whole reason the warning has a code of its own.

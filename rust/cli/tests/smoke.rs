@@ -31,9 +31,49 @@ fn corpus() -> Option<PathBuf> {
         .then_some(dir)
 }
 
-fn file(name: &str) -> Option<PathBuf> {
-    let path = corpus()?.join(format!("{name}.4dgs"));
-    path.exists().then_some(path)
+/// The variants this suite selects on, by the property each one has to have.
+///
+/// A corpus variant's name is a list of the properties it was built with, so selecting on
+/// the property is both what the test means and what survives the corpus growing. Naming a
+/// whole filename couples the suite to a file list that is generated and expected to
+/// change; this couples it to the property the assertion is actually about.
+/// Substrings a variant's name must have, and substrings it must not.
+type Selector = (&'static [&'static str], &'static [&'static str]);
+
+const SH_DEGREE_2: Selector = (&["SHDegree2", "UseChunkIndex", "UseCrc"], &[]);
+const WITH_AUDIO: Selector = (&["WithAudio"], &[]);
+const CUSTOM_CUTOFF: Selector = (&["CustomCutoff"], &[]);
+const INDEXED: Selector = (&["UseChunkIndex"], &["WithAudio"]);
+const NO_INDEX: Selector = (&[], &["UseChunkIndex"]);
+
+/// Every selector above, so the CI check can prove each one still resolves.
+const SELECTORS: [(&str, Selector); 5] = [
+    ("SH_DEGREE_2", SH_DEGREE_2),
+    ("WITH_AUDIO", WITH_AUDIO),
+    ("CUSTOM_CUTOFF", CUSTOM_CUTOFF),
+    ("INDEXED", INDEXED),
+    ("NO_INDEX", NO_INDEX),
+];
+
+/// The first corpus file, in name order, carrying every `must` property and none of the
+/// `must_not` ones. Sorted so that a growing corpus does not change which file is chosen
+/// while an existing one still matches.
+fn file(selector: Selector) -> Option<PathBuf> {
+    let (must, must_not) = selector;
+    let dir = corpus()?;
+    let mut names: Vec<String> = dir
+        .read_dir()
+        .ok()?
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "4dgs"))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|name| {
+            must.iter().all(|part| name.contains(part))
+                && !must_not.iter().any(|part| name.contains(part))
+        })
+        .collect();
+    names.sort();
+    names.first().map(|name| dir.join(name))
 }
 
 fn run(args: &[&str]) -> Output {
@@ -49,14 +89,15 @@ fn stdout(out: &Output) -> String {
 
 #[test]
 fn info_reports_the_header_without_decoding_anything() {
-    let Some(path) = file("MixedLifetimes-SHDegree2-UseChunkIndex-UseCrc") else {
+    let Some(path) = file(SH_DEGREE_2) else {
         return;
     };
     let out = run(&["info", path.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(0));
     let text = stdout(&out);
-    // The variant's name is a promise about its content, and these are the two halves of
-    // it that `info` is responsible for reading correctly.
+    // Each of these is a property the file was selected for, so the assertion and the
+    // selector cannot drift apart: `SHDegree2` means degree 2, `UseCrc` means the summary
+    // checksum is there and agrees, `UseChunkIndex` means there is something to seek in.
     assert!(text.contains("spherical harm degree 2"), "{text}");
     assert!(text.contains("summary crc    ok"), "{text}");
     assert!(text.contains("seek cost"), "{text}");
@@ -64,7 +105,7 @@ fn info_reports_the_header_without_decoding_anything() {
 
 #[test]
 fn info_names_the_audio_codec_from_the_header_alone() {
-    let Some(path) = file("OneWindow-UseChunkIndex-UseCrc-WithAudio") else {
+    let Some(path) = file(WITH_AUDIO) else {
         return;
     };
     let text = stdout(&run(&["info", path.to_str().unwrap()]));
@@ -74,7 +115,7 @@ fn info_names_the_audio_codec_from_the_header_alone() {
 
 #[test]
 fn validate_passes_the_corpus_and_says_why_when_it_does_not() {
-    let Some(path) = file("MixedLifetimes-UseChunkIndex-UseCrc") else {
+    let Some(path) = file(INDEXED) else {
         return;
     };
     let out = run(&["validate", path.to_str().unwrap()]);
@@ -84,7 +125,7 @@ fn validate_passes_the_corpus_and_says_why_when_it_does_not() {
 
 #[test]
 fn a_file_with_no_index_is_valid_with_a_warning_and_its_own_exit_code() {
-    let Some(path) = file("TenWindows-UseCrc") else {
+    let Some(path) = file(NO_INDEX) else {
         return;
     };
     let out = run(&["validate", path.to_str().unwrap()]);
@@ -94,7 +135,7 @@ fn a_file_with_no_index_is_valid_with_a_warning_and_its_own_exit_code() {
 
 #[test]
 fn inspect_walks_the_framing_and_json_says_the_same_thing() {
-    let Some(path) = file("OneWindow-UseChunkIndex-UseCrc-WithAudio") else {
+    let Some(path) = file(WITH_AUDIO) else {
         return;
     };
     let text = stdout(&run(&["inspect", path.to_str().unwrap()]));
@@ -121,39 +162,43 @@ fn inspect_walks_the_framing_and_json_says_the_same_thing() {
 
 #[test]
 fn decode_reports_state_at_an_instant() {
-    let Some(path) = file("MixedLifetimes-UseChunkIndex-UseCrc") else {
+    let Some(path) = file(INDEXED) else {
         return;
     };
     let out = run(&["decode", path.to_str().unwrap(), "-t", "0.5", "--json"]);
     assert_eq!(out.status.code(), Some(0));
     let json = stdout(&out);
     assert!(json.contains("\"time\": 0.5"), "{json}");
-    // `total` is the file's declared count, so it does not move with the seek.
-    assert!(json.contains("\"total\": 512"), "{json}");
-    let visible: u64 = json
+
+    // `total` is the file's declared count, so it does not move with the seek — and the
+    // count itself comes from `info` rather than from a literal, which makes this the
+    // cross-command invariant it was trying to be rather than a note about one variant.
+    let declared: u64 = stdout(&run(&["info", path.to_str().unwrap()]))
         .lines()
-        .find(|l| l.contains("\"visible\""))
-        .and_then(|l| {
-            l.trim()
-                .trim_end_matches(',')
-                .rsplit(' ')
-                .next()?
-                .parse()
-                .ok()
-        })
-        .expect("a visible count");
-    assert!(visible > 0 && visible <= 512, "{json}");
+        .find_map(|l| l.strip_prefix("gaussians      "))
+        .map(|n| n.replace(',', ""))
+        .and_then(|n| n.parse().ok())
+        .expect("a gaussian count from info");
+    assert_eq!(field(&json, "total"), declared, "{json}");
+    let visible = field(&json, "visible");
+    assert!(visible > 0 && visible <= declared, "{json}");
 }
 
 #[test]
 fn decode_honours_the_header_cutoff_rather_than_the_default() {
-    let Some(path) = file("MixedLifetimes-CustomCutoff-UseChunkIndex-UseCrc") else {
+    let Some(path) = file(CUSTOM_CUTOFF) else {
         return;
     };
     let text = stdout(&run(&["decode", path.to_str().unwrap(), "-t", "0.5"]));
-    // The variant exists because its Header declares a cutoff of its own; decoding it
-    // against the format's default is the bug this asserts against.
-    assert!(text.contains("cutoff         0.2"), "{text}");
+    // The variant exists because its Header declares a cutoff of its own, so what this
+    // asserts is that the printed cutoff is that one and not the format's default —
+    // decoding against the default is the bug, and its value is what the file says, not
+    // what this test remembers.
+    let cutoff = text
+        .lines()
+        .find_map(|l| l.strip_prefix("cutoff         "))
+        .expect("a cutoff line");
+    assert_ne!(cutoff.trim(), "0.05", "the default cutoff, not the file's");
 }
 
 #[test]
@@ -191,4 +236,23 @@ fn the_corpus_is_present_in_ci() {
         corpus().is_some(),
         "no corpus: run tests/conformance/generate.py before the suite"
     );
+    // And every selector still names something. Without this a renamed variant would take
+    // its test out of the run silently, which is the shape of green this repo keeps
+    // finding: a suite that passed by testing nothing.
+    for (name, selector) in SELECTORS {
+        assert!(
+            file(selector).is_some(),
+            "no corpus variant matches {name}; the corpus was renamed under this suite"
+        );
+    }
+}
+
+/// One unsigned field out of the tool's own JSON. Enough for `{"key": 123}` one per line,
+/// which is the only shape this suite reads.
+fn field(json: &str, key: &str) -> u64 {
+    json.lines()
+        .find_map(|l| l.trim().strip_prefix(&format!("\"{key}\": ")))
+        .map(|v| v.trim_end_matches(','))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("no {key} in {json}"))
 }

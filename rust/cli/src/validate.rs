@@ -234,6 +234,13 @@ pub fn validate(data: &[u8]) -> Report {
         }
     }
 
+    // TODO(#13): mirror `_check_quantization_finite`. Every Quantization step and every
+    // component of `pos_origin` must be finite (spec §5.3) — a non-finite step is the one
+    // corrupt field that ruins every gaussian rather than one, and nothing downstream
+    // complains because dequantization is arithmetic. The Python check lands with the
+    // conformance PR; until it does, this validator would report an error that one does
+    // not, which is the divergence the two are supposed to be free of.
+
     if header.is_some() && index.is_empty() {
         report.warn("no chunk index: this file can only be read front to back, not seeked".into());
     }
