@@ -69,9 +69,25 @@ consistency that does not exist.
 | PyPI      | `fourdgs`                                                     | `4dgs` is taken by an unrelated project. `pip install fourdgs`, `import fourdgs` — the two now agree, so there is no alias to remember  |
 | crates.io | `fourdgs`                                                     | Cargo rejects a crate name beginning with a digit, so `4dgs` is not available to anyone. The `[lib] name` matches                       |
 | npm       | `@4dgs/core`, `@4dgs/browser`, `@4dgs/nodejs`, `@4dgs/codecs` | Scoped names may begin with a digit. The unscoped `4dgs` was refused by npm's similarity filter, so the scope is not a stylistic choice |
+| Swift     | module `FourDGS`, C seam `CFourDGS`                           | A Swift module name is an identifier and may not begin with a digit. The casing is Swift's own convention for acronyms, not a rename    |
 
 In prose, in the specification, in the CLI and on disk: always `4dgs`. `fourdgs` appears only as a
 package name, and only where a registry requires it.
+
+## Swift, before its first release
+
+Two decisions are recorded here rather than left to the day someone tries to publish.
+
+**Linking.** The package is a binding, so it needs the core's staticlib on the linker's search path
+— today that is `-Xlinker -L…` on the command line, deliberately not an `unsafeFlags` entry in
+`Package.swift`, because that would make the package undependable as a versioned dependency. A
+published package needs one of two answers instead: a prebuilt `.xcframework` as a binary target, or
+a build plugin that compiles the core. **Not yet chosen.** It is not a blocker for anything before a
+release, and it is a blocker for the release itself.
+
+**Platforms.** The core builds for visionOS on stable toolchains — the Apple targets ship a
+distributed standard library, so no nightly and no `-Z build-std`, and CI cross-compiles and links
+against them. That was the strategy's biggest open question and it is settled.
 
 ## Pre-1.0
 

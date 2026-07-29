@@ -112,18 +112,30 @@ jobs:
     runs-on: ubuntu-latest
     container: swift:6.1
     needs: corpus
-    # Enabled when the Swift package decodes: its seam onto the Rust core's C ABI is
-    # unimplemented, so every runner would exit non-zero on every variant. Turning this on
-    # is the milestone, and the feature matrix moves with it and not before.
+    # Enabled when the C ABI can reach the non-gaussian records. The binding decodes
+    # today, but the canonical summary covers what a file says and not only its gaussians,
+    # so the runners refuse to emit a partial one and every variant would fail. Deleting
+    # this line is the milestone, and the feature matrix moves with it and not before.
+    #
+    # Everything below is otherwise the real invocation and is meant to be correct now:
+    # a job that only becomes true on the day it is enabled is a job nobody has tested.
     if: false
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.12" }
+      # The Swift package is a binding, so the core has to exist before it links. The
+      # image carries neither Rust nor pip, so the job installs what it runs.
+      - name: Build the core
+        run: |
+          apt-get update -qq && apt-get install -y -qq curl build-essential python3-pip >/dev/null
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          . "$HOME/.cargo/env"
+          cargo build -p fourdgs --release
       # `run.py --runner swift` fails if no Swift runner executed, so a build that silently
-      # produced nothing is a red suite rather than a green one.
+      # produced nothing is a red suite rather than a green one. LD_LIBRARY_PATH is needed
+      # because cargo emits the staticlib and the cdylib side by side and the linker
+      # prefers the shared one.
       - run: |
-          swift build --package-path swift --configuration release
-          pip install -e ./python/fourdgs
-          python tests/conformance/generate.py
-          python tests/conformance/run.py --runner swift
+          swift build --package-path swift --configuration release -Xlinker -L$PWD/target/release
+          python3 -m pip install --break-system-packages -e ./python/fourdgs >/dev/null
+          python3 tests/conformance/generate.py
+          LD_LIBRARY_PATH=$PWD/target/release python3 tests/conformance/run.py --runner swift

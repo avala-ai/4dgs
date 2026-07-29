@@ -29,6 +29,7 @@ words:
   - visionOS
   - selftest
   - Xlinker
+  - xcframework
   - RealityKit
   - Catmull
   - extrinsics

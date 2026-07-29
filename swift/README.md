@@ -50,3 +50,26 @@ ship a binary target instead; that is a distribution decision and not settled.
 
 `conformance/` builds `decode_streamed` and `decode_indexed`, registered in
 `tests/conformance/run.py` and skipped until built.
+
+### Platforms
+
+The core builds for visionOS, iOS, macOS and Linux on stable toolchains — the Apple targets ship a
+distributed standard library, so nothing here needs a nightly compiler. CI cross-compiles and links
+against each of them, because a Linux build proves nothing about the platforms this package is for.
+
+### Two things that will bite an integrator
+
+Both were found by CI rather than by reading, and both are properties of linking a Rust staticlib
+rather than anything specific to this package.
+
+**The linker prefers the shared library.** `cargo` emits `libfourdgs.a` and `libfourdgs.so` into the
+same directory, and a linker given that directory takes the `.so`. Everything then builds and fails
+at _load_ time instead — on Linux, set `LD_LIBRARY_PATH` alongside `-L`, or link the archive
+explicitly. Apple platforms take the staticlib and never show this, so a green macOS build is not
+evidence that a Linux one will run.
+
+**A short read must be reported as a failure.** If you supply your own byte-range reader, returning
+success after delivering fewer bytes than asked for breaks the decoder rather than truncating it
+gracefully. `FourDGS` returns a truncation status in that case, and a custom transport should do the
+same — an HTTP server answering `200` to a range request is a failure to report, not a response to
+slice client-side.

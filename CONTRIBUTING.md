@@ -49,6 +49,12 @@ Title prefixes: `spec:`, `python:`, `typescript:`, `rust:`, `cpp:`, `conformance
 Every PR confirms the scope checkbox in the template. Conformance must pass; the corpus `--verify`
 gate must be green, which means regenerating it if your change touches the encoder.
 
+**A pull request with no CI run at all has a conflict, not a slow queue.** GitHub runs
+`pull_request` workflows against the merge commit, and when that merge cannot be computed it skips
+the run silently — no failure, no red mark, just an absence that looks like waiting. Rebase on
+`main` and push again. Worth knowing because the natural reading of an empty checks list is the
+wrong one.
+
 ## Code of conduct
 
 By participating you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
