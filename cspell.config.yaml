@@ -45,6 +45,11 @@ words:
   - georeference
   - georeferenced
   - geodetic
+  # Object-layer vocabulary (proposal): editing verbs and the geometry terms
+  - Editability
+  - editability
+  - dequantized
+  - circumradius
   - ellipsoid
   - WGS
   - logit
