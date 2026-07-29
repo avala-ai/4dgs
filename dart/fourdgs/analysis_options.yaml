@@ -1,0 +1,22 @@
+# Copyright 2026 Avala AI
+# SPDX-License-Identifier: Apache-2.0
+
+include: package:lints/recommended.yaml
+
+analyzer:
+  language:
+    strict-casts: true
+    strict-inference: true
+    strict-raw-types: true
+  errors:
+    # A public API without a doc comment is the one lint this package treats as an
+    # error rather than a suggestion: everything exported here is something an
+    # implementer reads instead of the specification.
+    public_member_api_docs: ignore
+
+linter:
+  rules:
+    - always_declare_return_types
+    - avoid_dynamic_calls
+    - prefer_final_locals
+    - unawaited_futures

@@ -83,6 +83,10 @@ words:
   - radar
   - extrinsic
   - intrinsic
+  # Dart and pub.dev vocabulary
+  - pubspec
+  - Wasm
+  - writeln
   # Rust and C toolchain vocabulary
   - capi
   - libfourdgs

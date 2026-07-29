@@ -22,6 +22,7 @@ const sidebars = {
         { type: "doc", id: "guides/getting-started/decode-rust", label: "Decode in Rust" },
         { type: "doc", id: "guides/getting-started/decode-cpp", label: "Decode in C++" },
         { type: "doc", id: "guides/getting-started/decode-swift", label: "Decode in Swift" },
+        { type: "doc", id: "guides/getting-started/decode-dart", label: "Decode in Dart" },
       ],
     },
   ],

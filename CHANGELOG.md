@@ -4,11 +4,12 @@ Packages here are versioned and released independently, so there is no single ve
 single list of changes. The notes live next to the code they describe; this file is the index and
 the release log.
 
-| Package                                                                    | Changelog                                          | Registry                                        |
-| -------------------------------------------------------------------------- | -------------------------------------------------- | ----------------------------------------------- |
-| Python — `fourdgs`                                                         | [python/CHANGELOG.md](python/CHANGELOG.md)         | [PyPI](https://pypi.org/project/fourdgs/)       |
-| TypeScript — `@4dgs/core`, `@4dgs/browser`, `@4dgs/nodejs`, `@4dgs/codecs` | [typescript/CHANGELOG.md](typescript/CHANGELOG.md) | [npm](https://www.npmjs.com/package/@4dgs/core) |
-| Rust — `fourdgs`                                                           | [rust/CHANGELOG.md](rust/CHANGELOG.md)             | [crates.io](https://crates.io/crates/fourdgs)   |
+| Package                                                                    | Changelog                                              | Registry                                        |
+| -------------------------------------------------------------------------- | ------------------------------------------------------ | ----------------------------------------------- |
+| Python — `fourdgs`                                                         | [python/CHANGELOG.md](python/CHANGELOG.md)             | [PyPI](https://pypi.org/project/fourdgs/)       |
+| TypeScript — `@4dgs/core`, `@4dgs/browser`, `@4dgs/nodejs`, `@4dgs/codecs` | [typescript/CHANGELOG.md](typescript/CHANGELOG.md)     | [npm](https://www.npmjs.com/package/@4dgs/core) |
+| Rust — `fourdgs`                                                           | [rust/CHANGELOG.md](rust/CHANGELOG.md)                 | [crates.io](https://crates.io/crates/fourdgs)   |
+| Dart — `fourdgs`                                                           | [dart/fourdgs/CHANGELOG.md](dart/fourdgs/CHANGELOG.md) | not yet published                               |
 
 The specification is versioned separately from every package: a package release does not imply a
 wire-format change, and a wire-format change is recorded in the

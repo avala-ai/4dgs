@@ -55,6 +55,14 @@ jobs:
           size_kb=$(du -s typescript | cut -f1)
           echo "typescript: ${size_kb} KiB"
           [ "$size_kb" -le 500 ] || { echo "::error::typescript is ${size_kb} KiB, over the 500 KiB budget"; exit 1; }
+      - name: Dart sources under 300 KB
+        # Sources only, same as TypeScript's and Swift's: this job builds nothing, so
+        # .dart_tool and the compiled runners are not here to measure, and a vendored
+        # dependency would show up as a budget failure.
+        run: |
+          size_kb=$(du -s dart | cut -f1)
+          echo "dart: ${size_kb} KiB"
+          [ "$size_kb" -le 300 ] || { echo "::error::dart is ${size_kb} KiB, over the 300 KiB budget"; exit 1; }
       - name: Swift sources under 300 KB
         # Sources only, same as TypeScript's: this job builds nothing, so .build is not
         # here to measure and a vendored dependency would show up as a budget failure.
@@ -471,6 +479,81 @@ jobs:
           done
         env:
           ASAN_OPTIONS: detect_leaks=1:exitcode=99
+
+  dart:
+    # The decoder is pure Dart with no Flutter dependency, so this is a Dart SDK job and
+    # not a Flutter one — and it runs on three operating systems for the reason every
+    # other decoder does: the corpus is bytes, and a decoder that agrees with it on Linux
+    # and disagrees on Windows is exactly the bug a conformance suite is for.
+    name: ${{ matrix.os == 'ubuntu-latest' && 'dart' || format('dart ({0})', matrix.os) }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      # The floor the package declares, not the newest SDK. A package whose CI only ever
+      # ran on the latest Dart is a package whose lower bound is a guess.
+      - uses: dart-lang/setup-dart@v1
+        with: { sdk: "3.7" }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: dart --version
+
+      - name: Resolve
+        run: |
+          cd dart/fourdgs && dart pub get
+          cd ../conformance && dart pub get
+
+      # The front-matter tests decode real corpus files, which are generated
+      # rather than committed. They fail rather than skip without one, so
+      # generating it first is what stops them skipping themselves into a green
+      # run that proved nothing.
+      - name: Corpus
+        run: |
+          pip install -e ./python/fourdgs
+          python tests/conformance/generate.py
+
+      # Formatting and analysis read source and nothing else, so running them on three
+      # operating systems would report the same answer three times.
+      - name: Format
+        if: matrix.os == 'ubuntu-latest'
+        run: dart format --output=none --set-exit-if-changed dart/fourdgs dart/conformance
+
+      - name: Analyze
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cd dart/fourdgs && dart analyze --fatal-infos
+          cd ../conformance && dart analyze --fatal-infos
+
+      - name: Tests
+        run: cd dart/fourdgs && dart test
+
+      # The one gate that would otherwise be discovered on release day. It is cheap, it
+      # needs no credentials, and a package that cannot be packed is a package whose first
+      # publish fails in front of whoever is doing it by hand.
+      - name: The package is publishable
+        if: matrix.os == 'ubuntu-latest'
+        run: cd dart/fourdgs && dart pub publish --dry-run
+
+      # The version constant, the manifest and the changelog are three places one number
+      # is written. The release workflow asserts the first two against the tag; this
+      # asserts them against each other on every pull request, which is where a mismatch
+      # is still cheap to fix.
+      - name: The version constant matches the manifest
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          manifest=$(grep -m1 '^version: ' dart/fourdgs/pubspec.yaml | cut -d' ' -f2)
+          source=$(grep -m1 "^const String fourdgsPackageVersion = " dart/fourdgs/lib/fourdgs.dart | cut -d"'" -f2)
+          echo "manifest=$manifest source=$source"
+          if [ "$manifest" != "$source" ]; then
+            echo "::error::version mismatch — pubspec.yaml $manifest, fourdgs.dart $source"
+            exit 1
+          fi
 
   swift:
     # The official Swift image rather than a toolchain-installer action: the job installs
