@@ -10,11 +10,11 @@ All notable changes to the Rust crate are documented here, following
 
 - **An encode surface on the C ABI.** `fourdgs_writer_*` in `include/fourdgs.h` — a builder that
   takes the gaussian columns, spherical harmonics and write options and encodes to an owned
-  `fourdgs_buffer` — so the C++ and Swift packages author files through the core rather than a second
-  encoder. Appended after the decode surface; no existing signature moved. `capi_smoke.c` now builds
-  a tiny scene, encodes it and reopens the bytes, so a drift between the header and the symbols is
-  caught in CI. A shared `encode_gaussians` conformance runner re-encodes a variant's gaussians alone
-  as the baseline the C++, Swift and TypeScript encoders are diffed against.
+  `fourdgs_buffer` — so the C++ and Swift packages author files through the core rather than a
+  second encoder. Appended after the decode surface; no existing signature moved. `capi_smoke.c` now
+  builds a tiny scene, encodes it and reopens the bytes, so a drift between the header and the
+  symbols is caught in CI. A shared `encode_gaussians` conformance runner re-encodes a variant's
+  gaussians alone as the baseline the C++, Swift and TypeScript encoders are diffed against.
 
 - **Per-band spherical harmonic bit depths.** `WriteOptions::sh_bit_depths` takes a depth of 3–8 per
   band; the encoder rounds each band's coefficients onto the implied grid, declares the depths in

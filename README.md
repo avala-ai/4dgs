@@ -48,14 +48,14 @@ self-contained resource you can range-request and seek like a video.
 
 ## Libraries
 
-| Language   | Readme                     | Package      | Status                                           | Published           |
-| ---------- | -------------------------- | ------------ | ------------------------------------------------ | ------------------- |
-| Python     | [python/](python/)         | `fourdgs`    | Reference implementation                         | [PyPI][pypi]        |
-| TypeScript | [typescript/](typescript/) | `@4dgs/core` | Decoder and encoder, conformance-verified        | not yet — see below |
-| Rust       | [rust/](rust/)             | `fourdgs`    | Decoder and encoder, conformance-verified        | [crates.io][crates] |
-| C++        | [cpp/](cpp/)               | —            | Decode and encode over Rust's C ABI, verified    | build from source   |
-| Swift      | [swift/](swift/)           | —            | Binding over Rust; decode and encode, verified   | build from source   |
-| Dart       | [dart/](dart/)             | `fourdgs`    | Decoder, conformance-verified                    | not yet — see below |
+| Language   | Readme                     | Package      | Status                                         | Published           |
+| ---------- | -------------------------- | ------------ | ---------------------------------------------- | ------------------- |
+| Python     | [python/](python/)         | `fourdgs`    | Reference implementation                       | [PyPI][pypi]        |
+| TypeScript | [typescript/](typescript/) | `@4dgs/core` | Decoder and encoder, conformance-verified      | not yet — see below |
+| Rust       | [rust/](rust/)             | `fourdgs`    | Decoder and encoder, conformance-verified      | [crates.io][crates] |
+| C++        | [cpp/](cpp/)               | —            | Decode and encode over Rust's C ABI, verified  | build from source   |
+| Swift      | [swift/](swift/)           | —            | Binding over Rust; decode and encode, verified | build from source   |
+| Dart       | [dart/](dart/)             | `fourdgs`    | Decoder, conformance-verified                  | not yet — see below |
 
 **The `@4dgs` packages are not on npm yet.** They are built, conformance-verified and versioned at
 0.1.0 here, and the release job is written and its gates pass; what is missing is a trusted

@@ -1754,7 +1754,9 @@ pub unsafe extern "C" fn fourdgs_writer_set_gaussians(
                 match unsafe { copy_f32($ptr, n * $width) } {
                     Some(values) => values,
                     None => {
-                        set_last_error(concat!($name, " is null for a non-empty gaussian set").into());
+                        set_last_error(
+                            concat!($name, " is null for a non-empty gaussian set").into(),
+                        );
                         return FOURDGS_STATUS_INVALID_ARGUMENT;
                     }
                 }
@@ -1812,9 +1814,7 @@ pub unsafe extern "C" fn fourdgs_writer_set_sh(
             return FOURDGS_STATUS_OK;
         }
         let n = w.gaussians.count();
-        let expected = n
-            .saturating_mul(3)
-            .saturating_mul(coefficients as usize);
+        let expected = n.saturating_mul(3).saturating_mul(coefficients as usize);
         if length != expected {
             set_last_error(format!(
                 "sh payload is {length} bytes; {n} gaussians at {coefficients} coefficients need {expected}"

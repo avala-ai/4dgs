@@ -27,7 +27,7 @@ jobs:
             echo "conformance data: ${size_kb} KiB"
             [ "$size_kb" -le 2560 ] || { echo "::error::conformance data over budget"; exit 1; }
           fi
-      - name: Rust sources under 640 KB
+      - name: Rust sources under 680 KB
         # Sources only: this job builds nothing, so target/ is not here to measure. A
         # vendored dependency would show up as a budget failure, which is the point —
         # everything these crates need comes from crates.io via Cargo.toml.
@@ -35,11 +35,13 @@ jobs:
         # 500 when `rust/` was the core and the conformance runners; 600 when the `4dgs`
         # tool became a third crate beside them; 640 after the provenance records, the
         # per-band SH bit depths, the registry module and the cross-validator's pass over
-        # the invalid corpus — the last raise left four kilobytes of headroom, and a
-        # budget that tight stops being a budget and starts being a tax on the next
-        # feature. The number moves when the tree grows deliberately, which is the one
-        # thing it is not meant to catch — it exists so that a vendored dependency,
-        # which arrives in hundreds of KiB, fails loudly.
+        # the invalid corpus; 680 after the C ABI grew an encode surface
+        # (`fourdgs_writer_*`) with its C smoke coverage and the shared `encode_gaussians`
+        # conformance baseline. A budget that tight stops being a budget and starts being a
+        # tax on the next feature, so each raise leaves a little headroom. The number moves
+        # when the tree grows deliberately, which is the one thing it is not meant to catch
+        # — it exists so that a vendored dependency, which arrives in hundreds of KiB, fails
+        # loudly.
         #
         # Worth knowing when it next trips: `du` rounds every file to a 4 KiB block, so a
         # crate of forty small source files carries roughly 150 KiB of slack and a single
@@ -48,7 +50,7 @@ jobs:
         run: |
           size_kb=$(du -s rust | cut -f1)
           echo "rust: ${size_kb} KiB"
-          [ "$size_kb" -le 640 ] || { echo "::error::rust is ${size_kb} KiB, over the 640 KiB budget"; exit 1; }
+          [ "$size_kb" -le 680 ] || { echo "::error::rust is ${size_kb} KiB, over the 680 KiB budget"; exit 1; }
 
       - name: TypeScript sources under 500 KB
         # Sources only: this job installs nothing and builds nothing, so node_modules

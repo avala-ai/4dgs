@@ -139,13 +139,25 @@ function median(values: ArrayLike<number>): number {
   return n % 2 === 1 ? sorted[mid]! : 0.5 * (sorted[mid - 1]! + sorted[mid]!);
 }
 
-function lifeHalf(sigmaBin: number, sigmaLogStep: number, neverFades: boolean, windowLen: number, k: number): number {
+function lifeHalf(
+  sigmaBin: number,
+  sigmaLogStep: number,
+  neverFades: boolean,
+  windowLen: number,
+  k: number,
+): number {
   const sigma = Math.exp(sigmaBin * sigmaLogStep);
   const half = neverFades ? windowLen : k * sigma;
   return Math.min(Math.max(half, LIFE_HALF_MIN), LIFE_HALF_MAX);
 }
 
-function lifeClass(sigmaBin: number, sigmaLogStep: number, neverFades: boolean, windowLen: number, k: number): number {
+function lifeClass(
+  sigmaBin: number,
+  sigmaLogStep: number,
+  neverFades: boolean,
+  windowLen: number,
+  k: number,
+): number {
   const half = lifeHalf(sigmaBin, sigmaLogStep, neverFades, windowLen, k);
   return Math.min(Math.max(Math.ceil(Math.log2(half / LIFE_REF)), LIFE_MIN_CLASS), LIFE_MAX_CLASS);
 }
@@ -154,7 +166,12 @@ function motionStep(cls: number, stepRef: number): number {
   return stepRef * Math.pow(2, -cls);
 }
 
-function muStep(sigmaBin: number, sigmaLogStep: number, neverFades: boolean, stepRef: number): number {
+function muStep(
+  sigmaBin: number,
+  sigmaLogStep: number,
+  neverFades: boolean,
+  stepRef: number,
+): number {
   const sigma = Math.exp(sigmaBin * sigmaLogStep);
   const target = neverFades ? stepRef : Math.min(stepRef, MU_REL * sigma);
   const cls = Math.min(Math.max(Math.floor(Math.log2(target / stepRef)), MU_MIN_CLASS), 0);
@@ -169,7 +186,13 @@ const REST: readonly (readonly [number, number, number])[] = [
 ];
 
 /** The forward smallest-three quaternion transform: largest index and three residual bins. */
-function quantizeRotation(q0: number, q1: number, q2: number, q3: number, step: number): [number, [number, number, number]] {
+function quantizeRotation(
+  q0: number,
+  q1: number,
+  q2: number,
+  q3: number,
+  step: number,
+): [number, [number, number, number]] {
   const norm = Math.max(Math.sqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3), 1e-30);
   const q = [q0 / norm, q1 / norm, q2 / norm, q3 / norm];
   let largest = 0;
@@ -336,7 +359,11 @@ async function deflate(raw: Uint8Array): Promise<Uint8Array> {
  * chosen. Picking the smallest is a size optimization this encoder forgoes for simplicity —
  * what it must get exactly right is the decoded integers, not the byte count.
  */
-async function encodeStream(attributeId: number, values: number[], channels: number): Promise<Uint8Array> {
+async function encodeStream(
+  attributeId: number,
+  values: number[],
+  channels: number,
+): Promise<Uint8Array> {
   const count = values.length / channels;
   const header = new ByteWriter(17);
   if (count === 0) {
@@ -446,7 +473,7 @@ function windowTable(g: GaussianInput): { windows: [number, number][]; index: nu
       distinct.push([lo, hi]);
     }
   }
-  distinct.sort((a, b) => (a[0] - b[0]) || (a[1] - b[1]));
+  distinct.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
   const rank = new Map<string, number>();
   distinct.forEach(([lo, hi], i) => rank.set(`${lo},${hi}`, i));
   const index = new Array<number>(g.count);
@@ -499,7 +526,9 @@ function quantizeScene(g: GaussianInput, cutoff: number): Quantized {
     q.alpha.push(rint(g.colors[i * 4 + 3]! / grid.stepAlpha));
 
     const neverFades = !Number.isFinite(g.sigmaT[i]!);
-    const sigmaBin = neverFades ? 0 : rint(Math.log(Math.max(g.sigmaT[i]!, 1e-30)) / grid.stepSigmaLog);
+    const sigmaBin = neverFades
+      ? 0
+      : rint(Math.log(Math.max(g.sigmaT[i]!, 1e-30)) / grid.stepSigmaLog);
     q.sigma.push(sigmaBin);
     q.flags.push(neverFades ? 1 : 0);
     q.windowIndex.push(index[i]!);
@@ -537,7 +566,13 @@ function support(g: GaussianInput, cutoff: number): { lo: number[]; hi: number[]
   return { lo, hi };
 }
 
-function planChunks(lo: number[], hi: number[], tops: number[], maxDepth: number, minGaussians: number): Plan[] {
+function planChunks(
+  lo: number[],
+  hi: number[],
+  tops: number[],
+  maxDepth: number,
+  minGaussians: number,
+): Plan[] {
   const n = lo.length;
   const assigned = new Array<number>(n).fill(-1);
   const nodes: [number, number, number][] = [];
@@ -553,10 +588,7 @@ function planChunks(lo: number[], hi: number[], tops: number[], maxDepth: number
       else if (lo[i]! >= mid) right.push(i);
       else stay.push(i);
     }
-    for (const [ca, cb, child] of [
-      [a, mid, left] as const,
-      [mid, b, right] as const,
-    ]) {
+    for (const [ca, cb, child] of [[a, mid, left] as const, [mid, b, right] as const]) {
       if (child.length < minGaussians) {
         for (const i of child) stay.push(i);
         continue;
@@ -601,7 +633,7 @@ function planChunks(lo: number[], hi: number[], tops: number[], maxDepth: number
     for (let i = 0; i < n; i++) if (assigned[i] === node) members.push(i);
     if (members.length > 0) plans.push({ t0: a, t1: b, level: Math.max(level, 0), members });
   });
-  plans.sort((x, y) => (x.level - y.level) || (x.t0 - y.t0));
+  plans.sort((x, y) => x.level - y.level || x.t0 - y.t0);
   return plans;
 }
 
@@ -632,7 +664,11 @@ function gather(values: number[], members: number[], channels: number): number[]
  * Async because `deflate` is: the runtime's compressor is a stream. The result is a complete
  * file — magic, header, quantization, the chunk tree, an optional index and summary, a footer.
  */
-export async function encodeScene(gaussians: GaussianInput, durationSec: number, options: WriteOptions = {}): Promise<Uint8Array> {
+export async function encodeScene(
+  gaussians: GaussianInput,
+  durationSec: number,
+  options: WriteOptions = {},
+): Promise<Uint8Array> {
   const cutoff = options.cutoff ?? 0.05;
   const maxDepth = options.maxDepth ?? 6;
   const minChunk = options.minChunkGaussians ?? 2048;
@@ -660,7 +696,14 @@ export async function encodeScene(gaussians: GaussianInput, durationSec: number,
   const { lo, hi } = support(gaussians, cutoff);
   let plans = n === 0 ? [] : planChunks(lo, hi, topsArr, maxDepth, minChunk);
   if (n > 0 && plans.length === 0) {
-    plans = [{ t0: topsArr[0]!, t1: topsArr[topsArr.length - 1]!, level: 0, members: Array.from({ length: n }, (_, i) => i) }];
+    plans = [
+      {
+        t0: topsArr[0]!,
+        t1: topsArr[topsArr.length - 1]!,
+        level: 0,
+        members: Array.from({ length: n }, (_, i) => i),
+      },
+    ];
   }
 
   // Which SH bands are written, and their columns within a scene coefficient row.
@@ -674,7 +717,8 @@ export async function encodeScene(gaussians: GaussianInput, durationSec: number,
       const last = Math.min(lastRaw, shCoefficients);
       if (first >= last) continue;
       const columns: number[] = [];
-      for (let c = 0; c < 3; c++) for (let coef = first; coef < last; coef++) columns.push(c * shCoefficients + coef);
+      for (let c = 0; c < 3; c++)
+        for (let coef = first; coef < last; coef++) columns.push(c * shCoefficients + coef);
       bandColumns.set(band, columns);
       bands.push(band);
     }
@@ -855,7 +899,13 @@ export async function encodeScene(gaussians: GaussianInput, durationSec: number,
   return out.finish().slice();
 }
 
-function encodeChunk(t0: number, t1: number, level: number, count: number, streams: Uint8Array): Uint8Array {
+function encodeChunk(
+  t0: number,
+  t1: number,
+  level: number,
+  count: number,
+  streams: Uint8Array,
+): Uint8Array {
   const body = new ByteWriter(streams.length + 64);
   body.f64(t0);
   body.f64(t1);
@@ -871,7 +921,9 @@ function encodeChunk(t0: number, t1: number, level: number, count: number, strea
 function resolveDepths(requested: number[], bands: number[]): number[] {
   if (requested.length === 0 || bands.length === 0) return [];
   if (requested.length < bands.length) {
-    throw new Error(`sh_bit_depths declares ${requested.length} bands; this scene writes ${bands.length}`);
+    throw new Error(
+      `sh_bit_depths declares ${requested.length} bands; this scene writes ${bands.length}`,
+    );
   }
   const out: number[] = [];
   for (let i = 0; i < bands.length; i++) {
@@ -884,7 +936,12 @@ function resolveDepths(requested: number[], bands: number[]): number[] {
   return out;
 }
 
-function declaredBounds(grid: Grid, sh: number, bands: number[], depths: number[]): Record<string, string> {
+function declaredBounds(
+  grid: Grid,
+  sh: number,
+  bands: number[],
+  depths: number[],
+): Record<string, string> {
   const map: Record<string, string> = {
     pos: String(grid.boundPos),
     scale_rel: "0.02",

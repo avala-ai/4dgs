@@ -36,7 +36,8 @@ func parseDepths(_ spec: String) -> [UInt8] {
 
 let arguments = CommandLine.arguments
 guard arguments.count == 3 || arguments.count == 4 else {
-    FileHandle.standardError.write(Data("usage: encode_roundtrip <in.4dgs> <out.4dgs> [sh-bit-depths]\n".utf8))
+    FileHandle.standardError.write(
+        Data("usage: encode_roundtrip <in.4dgs> <out.4dgs> [sh-bit-depths]\n".utf8))
     exit(2)
 }
 let input = arguments[1]

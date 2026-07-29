@@ -354,7 +354,11 @@ test("the encoder writes a file that decodes back to what went in", async () => 
     winHi: [2, 2, 2],
   };
 
-  const bytes = await encodeScene(gaussians, 2, { maxDepth: 4, minChunkGaussians: 1, profile: "test" });
+  const bytes = await encodeScene(gaussians, 2, {
+    maxDepth: 4,
+    minChunkGaussians: 1,
+    profile: "test",
+  });
   const scene = await decodeScene(new BytesReadable(bytes));
 
   assert.equal(scene.header.durationSec, 2);

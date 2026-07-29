@@ -484,10 +484,9 @@ Result<std::vector<std::uint8_t>> encodeScene(const GaussianView& gaussians, dou
   if (!staged) return staged.error();
   staged = check(fourdgs_writer_set_chunking(writer, options.maxDepth, options.minChunkGaussians));
   if (!staged) return staged.error();
-  staged = check(fourdgs_writer_set_summary(writer, options.writeIndex ? 1 : 0,
-                                            options.writeStatistics ? 1 : 0,
-                                            options.writeSummaryOffsets ? 1 : 0,
-                                            options.writeCrc ? 1 : 0));
+  staged = check(fourdgs_writer_set_summary(
+      writer, options.writeIndex ? 1 : 0, options.writeStatistics ? 1 : 0,
+      options.writeSummaryOffsets ? 1 : 0, options.writeCrc ? 1 : 0));
   if (!staged) return staged.error();
   staged = check(fourdgs_writer_set_sh_bands(writer, options.shBands));
   if (!staged) return staged.error();
@@ -496,25 +495,27 @@ Result<std::vector<std::uint8_t>> encodeScene(const GaussianView& gaussians, dou
       options.shBitDepths.size()));
   if (!staged) return staged.error();
   if (!options.profile.empty()) {
-    staged = check(fourdgs_writer_set_profile(writer, options.profile.data(), options.profile.size()));
+    staged =
+        check(fourdgs_writer_set_profile(writer, options.profile.data(), options.profile.size()));
     if (!staged) return staged.error();
   }
   if (!options.library.empty()) {
-    staged = check(fourdgs_writer_set_library(writer, options.library.data(), options.library.size()));
+    staged =
+        check(fourdgs_writer_set_library(writer, options.library.data(), options.library.size()));
     if (!staged) return staged.error();
   }
   for (const auto& [key, value] : options.attributes) {
-    staged = check(fourdgs_writer_add_attribute(writer, key.data(), key.size(), value.data(),
-                                                value.size()));
+    staged = check(
+        fourdgs_writer_add_attribute(writer, key.data(), key.size(), value.data(), value.size()));
     if (!staged) return staged.error();
   }
 
   const auto count = static_cast<std::uint32_t>(gaussians.count);
-  staged = check(fourdgs_writer_set_gaussians(
-      writer, count, gaussians.positions.data(), gaussians.scales.data(),
-      gaussians.rotations.data(), gaussians.colors.data(), gaussians.motions.data(),
-      gaussians.muT.data(), gaussians.sigmaT.data(), gaussians.winLo.data(),
-      gaussians.winHi.data()));
+  staged = check(fourdgs_writer_set_gaussians(writer, count, gaussians.positions.data(),
+                                              gaussians.scales.data(), gaussians.rotations.data(),
+                                              gaussians.colors.data(), gaussians.motions.data(),
+                                              gaussians.muT.data(), gaussians.sigmaT.data(),
+                                              gaussians.winLo.data(), gaussians.winHi.data()));
   if (!staged) return staged.error();
   if (gaussians.shDegree > 0 && gaussians.shCoefficients > 0 && !gaussians.sh.empty()) {
     staged = check(fourdgs_writer_set_sh(writer, static_cast<std::uint8_t>(gaussians.shDegree),

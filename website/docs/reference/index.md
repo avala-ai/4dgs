@@ -92,10 +92,10 @@ consumer.
 **Encode** is now `Yes` for TypeScript, C++ and Swift, and the two kinds of encoder are proved
 differently. TypeScript is a second implementation — a from-scratch encoder in `@4dgs/core`, so a
 browser can author a file — and it is diffed against the reference the way a second decoder is: on
-decoded content, not bytes. C++ and Swift are bindings over the Rust core's writer (`fourdgs_writer_*`
-in the C ABI), so their gate proves the binding passed the gaussians and options through correctly
-rather than that a second encoder agrees. Python remains the reference encoder and Rust the
-production one.
+decoded content, not bytes. C++ and Swift are bindings over the Rust core's writer
+(`fourdgs_writer_*` in the C ABI), so their gate proves the binding passed the gaussians and options
+through correctly rather than that a second encoder agrees. Python remains the reference encoder and
+Rust the production one.
 
 **Convert from PLY frame sequences** takes a directory of standard per-frame gaussian splat PLY
 files — the common interchange form — and produces a `.4dgs`. It lives in the Python package because
@@ -192,19 +192,19 @@ scene rather than sampled. The chunk tree is exercised by the same run: the corp
 into up to 42 chunks each.
 
 TypeScript, C++ and Swift are proved by the cross-language encode gate,
-`tests/conformance/encode_roundtrip.py`. It re-encodes every variant's decoded gaussians twice — once
-with the language under test, once with a shared Rust reference that writes gaussians alone
+`tests/conformance/encode_roundtrip.py`. It re-encodes every variant's decoded gaussians twice —
+once with the language under test, once with a shared Rust reference that writes gaussians alone
 (`encode_gaussians`) — and requires the Python decoder to read both files to the same summary. What
 "the same" means depends on the encoder. C++ and Swift reach the Rust writer through the C ABI
-(`fourdgs_writer_*`), so their files match the reference on every field; the gate therefore proves the
-binding wired the gaussians and options through correctly, which is the only thing a binding can get
-wrong. TypeScript is a genuine second encoder, so it makes its own byte-layout choices — how well
-`deflate` did, which order gaussians sit in a chunk — that a decoder cannot see and the specification
-does not fix; those fields are set aside and the diff rests on decoded content: the gaussian values,
-the chunk intervals, the statistics, the spherical-harmonic digest. The chunked and summary rows ride
-the same gate — the small chunk threshold the preset uses partitions the corpus scenes into a tree
-whose intervals both encoders must agree on, and the statistics record they both write carries the
-chunk count.
+(`fourdgs_writer_*`), so their files match the reference on every field; the gate therefore proves
+the binding wired the gaussians and options through correctly, which is the only thing a binding can
+get wrong. TypeScript is a genuine second encoder, so it makes its own byte-layout choices — how
+well `deflate` did, which order gaussians sit in a chunk — that a decoder cannot see and the
+specification does not fix; those fields are set aside and the diff rests on decoded content: the
+gaussian values, the chunk intervals, the statistics, the spherical-harmonic digest. The chunked and
+summary rows ride the same gate — the small chunk threshold the preset uses partitions the corpus
+scenes into a tree whose intervals both encoders must agree on, and the statistics record they both
+write carries the chunk count.
 
 **Fuzzed** is a property of an implementation, not a feature of the format, so it is not a row in
 this table — a row would imply the format has something called fuzzing that an SDK can support.
@@ -237,14 +237,14 @@ remains the reference encoder — the one the corpus is generated from — and R
 one, which is why it verifies its own bounds exhaustively rather than trusting the grid arithmetic.
 The crate also carries the C ABI — `rust/fourdgs/include/fourdgs.h` — which is the surface the
 native tier binds to rather than hand-writing and then maintaining parallel implementations. It
-covers both directions: the decode surface and, appended to it without disturbing a frozen signature,
-a `fourdgs_writer_*` surface the native tier authors through. That header is checked by a C program
-compiled and run in CI — which now also builds a tiny scene, encodes it and reopens the bytes — not
-by the corpus, because a drift between a header and the symbols behind it is not something a decode
-suite can see.
+covers both directions: the decode surface and, appended to it without disturbing a frozen
+signature, a `fourdgs_writer_*` surface the native tier authors through. That header is checked by a
+C program compiled and run in CI — which now also builds a tiny scene, encodes it and reopens the
+bytes — not by the corpus, because a drift between a header and the symbols behind it is not
+something a decode suite can see.
 
-**C++** and **Swift** take their surface from that C ABI — the header plus a thin shim per language —
-in both directions: they decode through it and, now, encode through it, `fourdgs::encodeScene` and
+**C++** and **Swift** take their surface from that C ABI — the header plus a thin shim per language
+— in both directions: they decode through it and, now, encode through it, `fourdgs::encodeScene` and
 `SceneWriter.encode` binding the core's `fourdgs_writer_*` functions rather than reimplementing the
 quantizer. Swift targets visionOS and iOS.
 

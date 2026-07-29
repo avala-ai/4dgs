@@ -57,7 +57,8 @@ void encodeRoundTrips() {
   options.minChunkGaussians = 1;
   options.profile = "test";
 
-  Result<std::vector<std::uint8_t>> encoded = fourdgs::encodeScene(GaussianView(data), 2.0, options);
+  Result<std::vector<std::uint8_t>> encoded =
+      fourdgs::encodeScene(GaussianView(data), 2.0, options);
   CHECK(encoded.ok());
   if (!encoded.ok()) return;
 

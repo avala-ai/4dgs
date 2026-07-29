@@ -45,8 +45,8 @@ ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, os.path.join(ROOT, "python", "fourdgs"))
 sys.path.insert(0, HERE)
 
-import fourdgs  # noqa: E402
-from canonical import canonical, summarize  # noqa: E402
+import fourdgs
+from canonical import canonical, summarize
 
 EXE = ".exe" if os.name == "nt" else ""
 
@@ -169,7 +169,9 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     if not os.path.exists(REFERENCE[-1]):
-        print(f"error: the reference {REFERENCE[-1]} is not built; run cargo build --release --workspace", file=sys.stderr)
+        print(
+            f"error: the reference {REFERENCE[-1]} is not built; run cargo build --release --workspace", file=sys.stderr
+        )
         return 1
     command = ENCODERS[args.encoder]
     if not os.path.exists(command[-1]):

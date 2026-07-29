@@ -48,10 +48,12 @@ Result<std::vector<std::uint8_t>> parseDepths(const std::string& spec) {
   while (std::getline(stream, part, ',')) {
     try {
       const int value = std::stoi(part);
-      if (value < 0 || value > 255) return Error(ErrorCode::kInvalidArgument, spec + ": a bit depth is out of range");
+      if (value < 0 || value > 255)
+        return Error(ErrorCode::kInvalidArgument, spec + ": a bit depth is out of range");
       depths.push_back(static_cast<std::uint8_t>(value));
     } catch (const std::exception&) {
-      return Error(ErrorCode::kInvalidArgument, spec + ": not a comma-separated list of bit depths");
+      return Error(ErrorCode::kInvalidArgument,
+                   spec + ": not a comma-separated list of bit depths");
     }
   }
   return depths;
@@ -106,7 +108,8 @@ int main(int argc, char** argv) {
   options.profile = scene.profile();
   options.attributes = scene.attributes();
 
-  Result<std::vector<std::uint8_t>> encoded = fourdgs::encodeScene(scene.gaussians(), scene.durationSec(), options);
+  Result<std::vector<std::uint8_t>> encoded =
+      fourdgs::encodeScene(scene.gaussians(), scene.durationSec(), options);
   if (!encoded) return fail(encoded.error().toString());
 
   Result<void> written = writeWhole(output, *encoded);

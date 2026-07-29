@@ -422,7 +422,9 @@ enum Core {
     /// copies it in, so nothing here outlives the buffer pointers. The finished bytes are
     /// copied out of the core's buffer before it is freed, exactly as the resident arrays are
     /// on the decode side, so what this returns is owned Swift storage the caller keeps.
-    static func encode(_ gaussians: GaussianState, durationSec: Double, options: WriteOptions) throws
+    static func encode(
+        _ gaussians: GaussianState, durationSec: Double, options: WriteOptions
+    ) throws
         -> [UInt8]
     {
         guard let writer = fourdgs_writer_new() else {
