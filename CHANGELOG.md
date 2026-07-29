@@ -28,6 +28,8 @@ hand-kept index of the same thing, so that the log is readable without leaving t
 | ---------- | ---------------- | ------- | -------------------------------------------------------------------------------------------------- |
 | 2026-07-28 | Python `fourdgs` | 0.1.0   | [releases/python/v0.1.0](https://github.com/avala-ai/4dgs/releases/tag/releases%2Fpython%2Fv0.1.0) |
 | 2026-07-29 | Rust `fourdgs`   | 0.1.0   | [releases/rust/v0.1.0](https://github.com/avala-ai/4dgs/releases/tag/releases%2Frust%2Fv0.1.0)     |
+| 2026-07-29 | Python `fourdgs` | 0.2.0   | [releases/python/v0.2.0](https://github.com/avala-ai/4dgs/releases/tag/releases%2Fpython%2Fv0.2.0) |
+| 2026-07-29 | Rust `fourdgs`   | 0.2.0   | [releases/rust/v0.2.0](https://github.com/avala-ai/4dgs/releases/tag/releases%2Frust%2Fv0.2.0)     |
 
 `fourdgs 0.0.1` on PyPI, `fourdgs 0.0.1` on crates.io and `@4dgs/core`, `@4dgs/browser`,
 `@4dgs/nodejs` and `@4dgs/codecs` at `0.0.1` on npm are name reservations, published by hand before
