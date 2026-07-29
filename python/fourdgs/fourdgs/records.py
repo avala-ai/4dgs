@@ -121,6 +121,11 @@ class Quantization:
     step_sigma_log: float
     step_sh: int
     bounds: dict[str, str] = field(default_factory=dict)
+    #: Per-band spherical harmonic bit depths, band 1 first. Appended after the record's
+    #: original fields, so a file that declares none is byte-identical to one written
+    #: before the field existed — an empty list is written as no bytes at all, not as a
+    #: zero count.
+    sh_bit_depths: list[int] = field(default_factory=list)
 
     def encode(self, trailer: bytes = b"") -> bytes:
         body = (
@@ -141,6 +146,8 @@ class Quantization:
             + put_u8(self.step_sh)
             + put_str_map(self.bounds)
         )
+        if self.sh_bit_depths:
+            body += put_u8(len(self.sh_bit_depths)) + bytes(bytearray(self.sh_bit_depths))
         return put_record(op.QUANTIZATION, body + trailer)
 
     @staticmethod
@@ -162,7 +169,32 @@ class Quantization:
             step_sigma_log=steps[7],
             step_sh=c.u8(),
             bounds=c.str_map(),
+            sh_bit_depths=_sh_bit_depths(c),
         )
+
+
+def _sh_bit_depths(c: Cursor) -> list[int]:
+    """Read the appended per-band SH bit depths, or nothing.
+
+    Deliberately tolerant. Appended fields are positional, so anything sitting after the
+    bounds map lands where this field is — including bytes a *different* newer writer
+    appended, or the arbitrary trailer a forward-compatibility fixture puts there. The
+    declaration describes encoding that already happened and no decoded value depends on
+    it, so a count the record is too short for, or a depth outside the legal range, is
+    read as "this file declares none" rather than as a corrupt file (spec §5.3).
+    """
+    if c.remaining() < 1:
+        return []
+    at = c.pos
+    count = c.u8()
+    if count == 0 or c.remaining() < count:
+        c.pos = at
+        return []
+    depths = [c.u8() for _ in range(count)]
+    if any(not (3 <= d <= 8) for d in depths):
+        c.pos = at
+        return []
+    return depths
 
 
 @dataclass

@@ -25,6 +25,9 @@ from .model import AudioTrack, CameraTrajectory, GaussianSet, window_table
 from .provenance import Provenance
 from .quantization import (
     DEFAULT_CUTOFF,
+    SH_LADDERS,
+    SH_MAX_BITS,
+    SH_MIN_BITS,
     Bounds,
     Steps,
     dequantize,
@@ -35,8 +38,11 @@ from .quantization import (
     mu_steps,
     quantize,
     quantize_rotation,
+    quantize_sh,
     rct_forward,
     rct_inverse,
+    sh_bound,
+    sh_step,
     support_k,
 )
 from .serialization import CODEC_DEFLATE, MAGIC, crc32, encode_stream, put_record, put_u8
@@ -62,6 +68,11 @@ class WriteOptions:
     write_crc: bool = True
     preserve_source_ids: bool = False
     sh_bands: int = 3
+    #: Per-band spherical harmonic bit depths, band 1 first, or a ladder name from
+    #: `SH_LADDERS`. `None` leaves the coefficients as the profile alone decides, which is
+    #: what every file written before this option existed did — the appended field is not
+    #: emitted at all, so those files are byte-identical.
+    sh_bit_depths: tuple[int, ...] | list[int] | str | None = None
     verify: bool = True
     library: str = "4dgs-python reference encoder"
     scene_profile: str = ""
@@ -79,6 +90,28 @@ class WriteOptions:
     #: correct — splicing them in afterwards would shift every offset the index holds,
     #: which produces a corrupt file rather than a forward-compatibility test.
     extra_records: tuple[bytes, ...] = ()
+
+
+def _sh_depths(requested, bands: list[int]) -> dict[int, int]:
+    """Resolve the option into `{band: bit depth}` for the bands actually written.
+
+    A ladder shorter than the file's degree is an error rather than a default: the depth
+    of the highest band is the one that decides most of the size, and silently filling it
+    in with eight bits would hand back a file that quietly ignored what was asked for.
+    """
+    if requested is None or not bands:
+        return {}
+    if isinstance(requested, str):
+        if requested not in SH_LADDERS:
+            raise ValueError(f"unknown SH bit-depth ladder {requested!r}; known ladders are {sorted(SH_LADDERS)}")
+        requested = SH_LADDERS[requested]
+    depths = [int(d) for d in requested]
+    if len(depths) < len(bands):
+        raise ValueError(f"sh_bit_depths declares {len(depths)} bands; this scene writes {len(bands)}")
+    for d in depths[: len(bands)]:
+        if not (SH_MIN_BITS <= d <= SH_MAX_BITS):
+            raise ValueError(f"an SH bit depth must be {SH_MIN_BITS}..{SH_MAX_BITS}, got {d}")
+    return {band: depths[i] for i, band in enumerate(bands)}
 
 
 def _plan_chunks(lo, hi, tops, max_depth, min_gaussians):
@@ -267,6 +300,16 @@ def _encode(g: GaussianSet, duration_sec, opts, audio, camera) -> bytes:
             if cols:
                 sh_cols[band] = np.array(cols, dtype=np.int64)
 
+    depths = _sh_depths(opts.sh_bit_depths, sorted(sh_cols))
+    if depths:
+        # One pitch has to go in `step_sh`, which is a single byte and predates per-band
+        # depths. The coarsest band's is the only honest answer: a consumer that reads it
+        # and not the appended field then holds an upper bound rather than a number that
+        # is true of some bands and wrong for others. `bounds.sh` is worst-case for the
+        # same reason, with the per-band truth beside it.
+        steps.sh = max(sh_step(d) for d in depths.values())
+        bounds.sh = max(sh_bound(d) for d in depths.values())
+
     parts: list[bytes] = [MAGIC]
     cursor = len(MAGIC)
 
@@ -305,7 +348,8 @@ def _encode(g: GaussianSet, duration_sec, opts, audio, camera) -> bytes:
             step_time=steps.time,
             step_sigma_log=steps.sigma_log,
             step_sh=steps.sh,
-            bounds=bounds.as_strings(),
+            bounds=bounds.as_strings() | {f"sh_band{b}": str(sh_bound(d)) for b, d in depths.items()},
+            sh_bit_depths=[depths[b] for b in sorted(depths)],
         ).encode(trailer=opts.record_trailers.get(op.QUANTIZATION, b""))
     )
     emit(rec.WindowTable(windows=[(float(a), float(b)) for a, b in table]).encode())
@@ -382,9 +426,13 @@ def _encode(g: GaussianSet, duration_sec, opts, audio, camera) -> bytes:
 
         bands: list[tuple[int, int, int]] = []
         for band, cols in sh_cols.items():
-            vals = g.sh[np.ix_(members, cols)].astype(np.int64)
-            if steps.sh > 1:
-                vals = (vals // steps.sh) * steps.sh + steps.sh // 2
+            original = g.sh[np.ix_(members, cols)].astype(np.int64)
+            if band in depths:
+                vals = quantize_sh(original, depths[band])
+            elif steps.sh > 1:
+                vals = (original // steps.sh) * steps.sh + steps.sh // 2
+            else:
+                vals = original
             # Each band is its own record, so a reader that has capped its SH degree
             # skips the higher ones by byte range and never transfers them.
             payload = put_u8(band) + encode_stream(
@@ -393,6 +441,8 @@ def _encode(g: GaussianSet, duration_sec, opts, audio, camera) -> bytes:
             band_blob = put_record(op.SH_BAND_STREAM, payload)
             band_at = emit(band_blob)
             bands.append((band, band_at, len(band_blob)))
+            if opts.verify and band in depths:
+                _verify_band(band_blob, original, sh_bound(depths[band]), band, worst)
 
         index.append(
             rec.ChunkIndexEntry(
@@ -409,7 +459,7 @@ def _encode(g: GaussianSet, duration_sec, opts, audio, camera) -> bytes:
             _verify_chunk(g, members, chunk_blob, steps, bounds, worst, origin, table, opts.cutoff)
 
     if opts.verify and worst:
-        _assert_bounds(worst, bounds)
+        _assert_bounds(worst, bounds, depths)
 
     summary_start = 0
     summary_offset_start = 0
@@ -467,13 +517,40 @@ def _verify_chunk(g, members, chunk_blob, steps, bounds, worst, origin, windows,
         upd("rot", np.minimum(np.abs(a - b).max(axis=1), np.abs(a + b).max(axis=1)).max())
 
 
-def _assert_bounds(worst: dict[str, float], bounds: Bounds) -> None:
+def _verify_band(band_blob: bytes, original: np.ndarray, bound: int, band: int, worst: dict[str, float]) -> None:
+    """Decode the band record just written and record the worst coefficient deviation.
+
+    Decoded rather than computed: the arithmetic that produced these bytes is three lines
+    and would agree with itself if it were wrong. What the file will hand a consumer is
+    what came back out of the record, so that is what the declared bound is measured
+    against — every coefficient of every gaussian, not a sample.
+    """
+    from .serialization import Cursor, decode_stream
+
+    cursor = Cursor(band_blob)
+    cursor.take(1)  # opcode
+    cursor.take(8)  # content length
+    content = Cursor(cursor.buf[cursor.pos :])
+    content.u8()  # band
+    _, values = decode_stream(content)
+    deviation = np.abs(values.reshape(original.shape).astype(np.int64) - original).max(initial=0)
+    key = f"sh_band{band}"
+    worst[key] = max(worst.get(key, 0.0), float(deviation))
+    if deviation > bound:
+        raise BoundViolation(
+            f"encoder verification failed: SH band {band} deviated {int(deviation)} code units, bound is {bound}"
+        )
+
+
+def _assert_bounds(worst: dict[str, float], bounds: Bounds, depths: dict[int, int] | None = None) -> None:
     limits = {
         "pos": bounds.pos,
         "scale_rel": np.log1p(bounds.scale_rel),
         "rgb": bounds.rgb,
         "alpha": bounds.alpha,
     }
+    for band, bits in (depths or {}).items():
+        limits[f"sh_band{band}"] = float(sh_bound(bits))
     for key, limit in limits.items():
         measured = worst.get(key, 0.0)
         if measured > limit + 1e-9:

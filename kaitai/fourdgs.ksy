@@ -273,7 +273,18 @@ types:
         type: str_map
         doc: |
           Declared max deviation per attribute, as decimal strings. Keys are `pos`,
-          `scale_rel`, `rot`, `rgb`, `alpha`, `motion`, `time`, `sigma_rel`, `sh`.
+          `scale_rel`, `rot`, `rgb`, `alpha`, `motion`, `time`, `sigma_rel`, `sh`, plus
+          `sh_band1`..`sh_band3` when the file declares per-band SH bit depths.
+      - id: appended
+        size-eos: true
+        doc: |
+          Fields appended after this record's original ones (§4.2). Present as bytes rather
+          than as typed fields on purpose: the per-band SH bit depths live here — a `u1`
+          count followed by that many `u1` depths in 3..8, band 1 first (§5.3, §6.5) — but
+          appended fields are positional, so bytes a *different* writer appended begin at
+          exactly this offset. A grammar that typed them would read one writer's trailer as
+          another's field. A reader takes the depths only if the count fits and every depth
+          is in range, and reads the record as declaring none otherwise.
 
   window_table:
     doc: |

@@ -332,6 +332,7 @@ fn file_with_grids(count: usize, bad_at: Option<usize>) -> Vec<u8> {
             step_sigma_log: 0.04,
             step_sh: 1,
             bounds: Default::default(),
+            sh_bit_depths: Vec::new(),
         };
         if bad_at == Some(i) {
             quant.step_pos = f64::INFINITY;

@@ -6,6 +6,26 @@ All notable changes to the Rust crate are documented here, following
 
 ## [Unreleased]
 
+### Added
+
+- **Per-band spherical harmonic bit depths.** `WriteOptions::sh_bit_depths` takes a depth of 3–8 per
+  band; the encoder rounds each band's coefficients onto the implied grid, declares the depths in
+  the Quantization record's appended fields and the per-band bounds under `bounds.sh_band<b>`, and
+  decodes each band record it wrote to check the bound on every coefficient before returning the
+  file. Eight bits is the identity, so a file that declares nothing is unchanged in every byte.
+  `Quantization::sh_bit_depths` exposes the declaration to readers; nothing at decode depends on it,
+  because the byte a band stream carries is already the quantized value.
+
+- `encode_roundtrip` takes an optional ladder or depth list, and `encode-roundtrip.sh` uses it to
+  re-encode every spherical-harmonic variant at per-band depths and require the Python decoder to
+  agree with this one about the result — and to read back the depths this encoder declared.
+
+- `sh_step`, `sh_bound`, `sh_bound_float`, `quantize_sh`, `sh_coefficient` and the `SH_QUANT_LO` /
+  `SH_QUANT_HI` interval that spec §6.5 now pins, for consumers that hand their callers floats.
+
+- `4dgs info` prints the per-band bit depths on their own line when a file declares them, and
+  `4dgs validate` checks them against the Header's degree.
+
 ### Fixed
 
 - **The encoder wrote files the specification forbids, silently, when handed a non-finite

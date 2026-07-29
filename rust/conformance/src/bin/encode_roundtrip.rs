@@ -19,7 +19,13 @@
 //!   a file whose measured deviation exceeds what it is about to declare, so reaching this
 //!   line at all means the claim in the Quantization record was checked on every gaussian.
 //!
-//! Usage: encode_roundtrip <in.4dgs> <out.4dgs>
+//! An optional third argument names the per-band spherical harmonic bit depths to
+//! re-encode with — a ladder from the registry or a comma-separated list. That is how the
+//! harness proves the depths across implementations: the coefficients this encoder
+//! coarsened have to come back out of the Python decoder as the same bytes, and the
+//! appended field it wrote has to parse there as the depths it meant.
+//!
+//! Usage: encode_roundtrip <in.4dgs> <out.4dgs> [sh-bit-depths]
 
 use std::process::ExitCode;
 
@@ -27,11 +33,19 @@ use fourdgs::writer::{SceneExtras, WriteOptions};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 3 {
-        eprintln!("usage: encode_roundtrip <in.4dgs> <out.4dgs>");
+    if args.len() < 3 || args.len() > 4 {
+        eprintln!("usage: encode_roundtrip <in.4dgs> <out.4dgs> [sh-bit-depths]");
         return ExitCode::from(2);
     }
-    match run(&args[1], &args[2]) {
+    let depths = match args.get(3).map(|spec| parse_depths(spec)) {
+        Some(Ok(depths)) => Some(depths),
+        Some(Err(message)) => {
+            eprintln!("{message}");
+            return ExitCode::from(2);
+        }
+        None => None,
+    };
+    match run(&args[1], &args[2], depths) {
         Ok(note) => {
             println!("{note}");
             ExitCode::SUCCESS
@@ -43,7 +57,21 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(input: &str, output: &str) -> Result<String, String> {
+/// A registry ladder name, or a comma-separated list of depths, band 1 first.
+fn parse_depths(spec: &str) -> Result<Vec<u8>, String> {
+    if let Some(ladder) = fourdgs::quantization::sh_ladder(spec) {
+        return Ok(ladder.to_vec());
+    }
+    spec.split(',')
+        .map(|part| {
+            part.trim()
+                .parse::<u8>()
+                .map_err(|_| format!("{spec}: not a ladder name or a list of bit depths"))
+        })
+        .collect()
+}
+
+fn run(input: &str, output: &str, sh_bit_depths: Option<Vec<u8>>) -> Result<String, String> {
     let scene = fourdgs::read_path(input).map_err(|e| format!("{input}: {e}"))?;
 
     let options = WriteOptions {
@@ -57,6 +85,7 @@ fn run(input: &str, output: &str) -> Result<String, String> {
         write_summary_offsets: true,
         scene_profile: scene.header.profile.clone(),
         metadata: scene.header.attributes.clone(),
+        sh_bit_depths,
         ..Default::default()
     };
     let extras = SceneExtras {
@@ -95,8 +124,9 @@ fn run(input: &str, output: &str) -> Result<String, String> {
     }
 
     std::fs::write(output, &first).map_err(|e| format!("{output}: {e}"))?;
+    let declared = reread.quantization.sh_bit_depths.clone();
     Ok(format!(
-        "{} gaussians, {} chunks, {} bytes, deterministic",
+        "{} gaussians, {} chunks, {} bytes, deterministic, sh bits {declared:?}",
         reread.gaussians.count(),
         reread.chunk_index.len(),
         first.len()

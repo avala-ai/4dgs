@@ -70,6 +70,13 @@ def build(scenario, flags) -> tuple[bytes, str]:
     # Coefficients per gaussian: three colour components times the coefficients a whole
     # degree carries (3, 8, 15 — the cumulative sum of `2b + 1` over its bands).
     coeffs = {0: 0, 1: 9, 2: 24, 3: 45}[sh_degree]
+    # Per-band bit depths, band 1 first. Absent unless a flag asks for them, which is what
+    # keeps every other variant byte-identical to the file it was before the field existed.
+    sh_bit_depths = None
+    if "SHBitsHigh" in flags:
+        sh_bit_depths = (8, 7, 6)
+    elif "SHBitsLow" in flags:
+        sh_bit_depths = (5, 4, 3)
 
     gaussians = fourdgs.GaussianSet(
         positions=np.asarray(raw["positions"], dtype=np.float32).reshape(n, 3),
@@ -150,6 +157,7 @@ def build(scenario, flags) -> tuple[bytes, str]:
         extra_records=tuple(extra),
         record_trailers=trailers,
         cutoff=0.2 if "CustomCutoff" in flags else 0.05,
+        sh_bit_depths=sh_bit_depths,
     )
 
     buf = io.BytesIO()

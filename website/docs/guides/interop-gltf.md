@@ -70,21 +70,22 @@ both, and both use the Condon–Shortley phase, so the phase convention carries 
 This is a no-op only worth stating because getting it wrong is silent.
 
 The lossy part is precision. The extension stores coefficients as **float**; this format stores them
-as **unsigned bytes** (spec §6.5). The reference codec maps the byte onto the interval `[-4, +4]`,
-so a coefficient round-trips to within one step of `8/255 ≈ 0.031`, and a coefficient outside that
-interval is clamped.
+as **unsigned bytes** (spec §6.5), on the interval `[-4, +4]` — a byte `b` is the coefficient
+`-4 + b * 8 / 255`. A coefficient round-trips to within one step of `8/255 ≈ 0.031`, and a
+coefficient outside the interval is clamped.
 
-:::caution The byte-to-coefficient mapping is a codec convention, not a format guarantee
+That mapping is now the **specification's**, not this converter's. It was a convention shared by the
+PLY importer and this bridge before it was a rule, and the rule was written because a convention is
+exactly what a second implementation cannot see: another exporter could pick a different interval,
+be conforming by the text as it then stood, and shift the higher bands' colour on every conversion
+with nothing in the file to point at. Both paths still read one constant
+(`fourdgs.quantization.SH_QUANT_LO` / `_HI`); what changed is that the constant now has a document
+behind it.
 
-The specification is deliberate that "the stored byte is the coefficient" and that `step_sh` is an
-encode-side record a decoder does nothing with. It therefore does **not** pin the affine map from
-byte to float, and the extension needs a float. This converter uses `[-4, +4]`, the same interval
-the PLY importer uses, and both read it from one constant (`fourdgs.quantization.SH_QUANT_LO` /
-`_HI`) so that a scene converted in through one path and out through the other keeps its appearance.
-A producer using a different interval will see higher-degree colour shift on conversion; pinning
-this belongs in the specification, and is tracked as such.
-
-:::
+A file may also carry its coefficients at a lower bit depth per band (spec §6.5). That is invisible
+here — the byte is still the byte, and the export is still exact through the map — but it does mean
+a coefficient exported from such a file lands on a coarser grid than `8/255`, and the file's
+`bounds.sh_band<b>` says which.
 
 ### Colour space
 

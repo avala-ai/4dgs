@@ -27,18 +27,21 @@ jobs:
             echo "conformance data: ${size_kb} KiB"
             [ "$size_kb" -le 2560 ] || { echo "::error::conformance data over budget"; exit 1; }
           fi
-      - name: Rust sources under 600 KB
+      - name: Rust sources under 640 KB
         # Sources only: this job builds nothing, so target/ is not here to measure. A
         # vendored dependency would show up as a budget failure, which is the point —
         # everything these crates need comes from crates.io via Cargo.toml.
         #
-        # 500 when `rust/` was the core and the conformance runners; 600 now that the
-        # `4dgs` tool is a third crate beside them. The number moves when a package is
-        # added deliberately, which is the one thing it is not meant to catch.
+        # 500 when `rust/` was the core and the conformance runners; 600 when the `4dgs`
+        # tool became a third crate beside them; 640 after the provenance records and the
+        # per-band SH bit depths, which left 596 KiB of tree against a 600 KiB ceiling —
+        # a budget with four kilobytes of headroom stops being a budget and starts being
+        # a tax on the next feature. The number moves when the tree grows deliberately,
+        # which is the one thing it is not meant to catch.
         run: |
           size_kb=$(du -s rust | cut -f1)
           echo "rust: ${size_kb} KiB"
-          [ "$size_kb" -le 600 ] || { echo "::error::rust is ${size_kb} KiB, over the 600 KiB budget"; exit 1; }
+          [ "$size_kb" -le 640 ] || { echo "::error::rust is ${size_kb} KiB, over the 640 KiB budget"; exit 1; }
 
       - name: TypeScript sources under 500 KB
         # Sources only: this job installs nothing and builds nothing, so node_modules
