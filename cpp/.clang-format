@@ -1,0 +1,10 @@
+# Copyright 2026 Avala AI
+# SPDX-License-Identifier: Apache-2.0
+
+# Google's style, at the line length the rest of the repository uses: prettier wraps markdown
+# and TypeScript at 100, ruff wraps Python at 110, and a C++ file that disagreed with both
+# would be the only one anybody had to think about.
+BasedOnStyle: Google
+ColumnLimit: 100
+DerivePointerAlignment: false
+PointerAlignment: Left

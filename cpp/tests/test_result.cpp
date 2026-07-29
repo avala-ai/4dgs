@@ -43,8 +43,7 @@ void valueThrowsForCallersWhoWantThat() {
   } catch (const Exception& error) {
     threw = true;
     CHECK_EQ(error.error().code, ErrorCode::kTruncated);
-    CHECK_EQ(std::string(error.what()),
-             std::string("kTruncated: the file ends inside chunk 3"));
+    CHECK_EQ(std::string(error.what()), std::string("kTruncated: the file ends inside chunk 3"));
   }
   CHECK(threw);
 }

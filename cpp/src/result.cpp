@@ -3,8 +3,8 @@
 
 #include "fourdgs/result.hpp"
 
-#include "fourdgs/fourdgs.hpp"
 #include "backend.hpp"
+#include "fourdgs/fourdgs.hpp"
 
 namespace fourdgs {
 

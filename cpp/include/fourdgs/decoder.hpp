@@ -34,9 +34,9 @@ class StreamDecoder {
 
   /// Available as soon as the decoder is open: the file's front matter.
   const Header& header() const;
-  bool hasAudio() const;                          ///< Header flag alone; no probing, spec §7.
-  const AudioTrack* audio() const;                ///< Null when the scene has none.
-  const Camera* camera() const;                   ///< Null when the file declares none.
+  bool hasAudio() const;            ///< Header flag alone; no probing, spec §7.
+  const AudioTrack* audio() const;  ///< Null when the scene has none.
+  const Camera* camera() const;     ///< Null when the file declares none.
   const std::vector<MetadataRecord>& metadata() const;
 
   /// Decode the next chunk. `false` means the stream ended; check `truncated()` to learn

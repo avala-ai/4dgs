@@ -30,31 +30,30 @@ inline void report(const char* file, int line, const char* expression, const std
 }  // namespace testing
 }  // namespace fourdgs
 
-#define CHECK(expression)                                                        \
-  do {                                                                           \
-    if (!(expression)) {                                                         \
+#define CHECK(expression)                                                         \
+  do {                                                                            \
+    if (!(expression)) {                                                          \
       ::fourdgs::testing::report(__FILE__, __LINE__, #expression, std::string()); \
-    }                                                                            \
+    }                                                                             \
   } while (false)
 
-#define CHECK_EQ(actual, expected)                                                          \
-  do {                                                                                      \
-    const auto actualValue = (actual);                                                      \
-    const auto expectedValue = (expected);                                                  \
-    if (!(actualValue == expectedValue)) {                                                  \
+#define CHECK_EQ(actual, expected)                                                             \
+  do {                                                                                         \
+    const auto actualValue = (actual);                                                         \
+    const auto expectedValue = (expected);                                                     \
+    if (!(actualValue == expectedValue)) {                                                     \
       ::fourdgs::testing::report(__FILE__, __LINE__, #actual " == " #expected, "they differ"); \
-    }                                                                                       \
+    }                                                                                          \
   } while (false)
 
-#define TEST_MAIN                                                       \
-  int main() {                                                          \
-    runTests();                                                         \
-    if (::fourdgs::testing::failures() != 0) {                          \
-      std::fprintf(stderr, "%d check(s) failed\n",                      \
-                   ::fourdgs::testing::failures());                     \
-      return 1;                                                         \
-    }                                                                   \
-    return 0;                                                           \
+#define TEST_MAIN                                                                   \
+  int main() {                                                                      \
+    runTests();                                                                     \
+    if (::fourdgs::testing::failures() != 0) {                                      \
+      std::fprintf(stderr, "%d check(s) failed\n", ::fourdgs::testing::failures()); \
+      return 1;                                                                     \
+    }                                                                               \
+    return 0;                                                                       \
   }
 
 #endif  // FOURDGS_TESTS_CHECK_HPP

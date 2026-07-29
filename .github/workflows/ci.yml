@@ -132,6 +132,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      # Pinned, because clang-format's output changes between releases and an unpinned
+      # formatter is a gate that fails on somebody else's upgrade.
+      - name: Format
+        run: |
+          pip install clang-format==22.1.8
+          clang-format --dry-run --Werror $(git ls-files 'cpp/*.cpp' 'cpp/*.hpp')
+
       - name: Configure and build
         run: |
           cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Debug

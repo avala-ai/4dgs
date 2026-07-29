@@ -9,8 +9,7 @@
 
 namespace fourdgs {
 
-StreamDecoder::StreamDecoder(std::unique_ptr<detail::Handle> handle)
-    : handle_(std::move(handle)) {}
+StreamDecoder::StreamDecoder(std::unique_ptr<detail::Handle> handle) : handle_(std::move(handle)) {}
 
 StreamDecoder::~StreamDecoder() = default;
 
@@ -67,8 +66,7 @@ const bool* StreamDecoder::summaryCrcOk() const {
 
 bool StreamDecoder::truncated() const { return handle_->truncated; }
 
-IndexedReader::IndexedReader(std::unique_ptr<detail::Handle> handle)
-    : handle_(std::move(handle)) {}
+IndexedReader::IndexedReader(std::unique_ptr<detail::Handle> handle) : handle_(std::move(handle)) {}
 
 IndexedReader::~IndexedReader() = default;
 

@@ -60,8 +60,7 @@ class FileReadable : public Readable {
 class MemoryReadable : public Readable {
  public:
   explicit MemoryReadable(std::vector<std::uint8_t> bytes) : bytes_(std::move(bytes)) {}
-  explicit MemoryReadable(Span<const std::uint8_t> bytes)
-      : bytes_(bytes.begin(), bytes.end()) {}
+  explicit MemoryReadable(Span<const std::uint8_t> bytes) : bytes_(bytes.begin(), bytes.end()) {}
 
   Result<std::uint64_t> size() override;
   Result<std::size_t> read(std::uint64_t offset, Span<std::uint8_t> into) override;

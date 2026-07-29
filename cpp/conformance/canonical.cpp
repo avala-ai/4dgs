@@ -364,8 +364,7 @@ std::string canonical(const SceneSummary& summary) {
     audio = Json::object({
         {"byteLength", integer(static_cast<std::uint64_t>(summary.audio->data.size()))},
         {"codec", Json::string(summary.audio->codec)},
-        {"crc",
-         Json::string(crc32String(summary.audio->data.data(), summary.audio->data.size()))},
+        {"crc", Json::string(crc32String(summary.audio->data.data(), summary.audio->data.size()))},
     });
   }
 
@@ -380,13 +379,12 @@ std::string canonical(const SceneSummary& summary) {
   }
 
   Json root = Json::object({
-      {"aggregate",
-       Json::object({
-           {"neverFadesCount", integer(neverFades)},
-           {"opacitySum", num(opacitySum)},
-           {"positionSum", doubleArray(positionSum, 3)},
-           {"zeroMotionCount", integer(zeroMotion)},
-       })},
+      {"aggregate", Json::object({
+                        {"neverFadesCount", integer(neverFades)},
+                        {"opacitySum", num(opacitySum)},
+                        {"positionSum", doubleArray(positionSum, 3)},
+                        {"zeroMotionCount", integer(zeroMotion)},
+                    })},
       {"attachments", Json::array(std::move(attachments))},
       {"audio", std::move(audio)},
       {"camera", summary.camera == nullptr ? Json::null() : cameraJson(*summary.camera)},
@@ -397,18 +395,17 @@ std::string canonical(const SceneSummary& summary) {
       {"hasAudio", Json::boolean(header.hasAudio)},
       {"headerAttributes", stringMap(header.attributes)},
       {"metadataRecords", Json::array(std::move(metadata))},
-      {"sample",
-       Json::object({
-           {"colors", floatRows(gaussians.colors, sample, 4)},
-           {"motions", floatRows(gaussians.motions, sample, 3)},
-           {"muT", scalarRow(gaussians.muT, sample)},
-           {"positions", floatRows(gaussians.positions, sample, 3)},
-           {"rotations", floatRows(gaussians.rotations, sample, 4)},
-           {"scales", floatRows(gaussians.scales, sample, 3)},
-           {"sigmaT", scalarRow(gaussians.sigmaT, sample)},
-           {"winHi", scalarRow(gaussians.winHi, sample)},
-           {"winLo", scalarRow(gaussians.winLo, sample)},
-       })},
+      {"sample", Json::object({
+                     {"colors", floatRows(gaussians.colors, sample, 4)},
+                     {"motions", floatRows(gaussians.motions, sample, 3)},
+                     {"muT", scalarRow(gaussians.muT, sample)},
+                     {"positions", floatRows(gaussians.positions, sample, 3)},
+                     {"rotations", floatRows(gaussians.rotations, sample, 4)},
+                     {"scales", floatRows(gaussians.scales, sample, 3)},
+                     {"sigmaT", scalarRow(gaussians.sigmaT, sample)},
+                     {"winHi", scalarRow(gaussians.winHi, sample)},
+                     {"winLo", scalarRow(gaussians.winLo, sample)},
+                 })},
       {"sh", sphericalHarmonics(gaussians, order)},
       {"shDegree", Json::number(std::to_string(header.shDegree))},
       {"statistics", std::move(statistics)},

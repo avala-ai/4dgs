@@ -101,10 +101,9 @@ Result<void> checkTruncationRecovery(const std::vector<std::uint8_t>& bytes, con
                    "a file cut before its trailing magic was not reported truncated");
     }
     if (cut->gaussians.count != full.gaussians.count) {
-      return Error(ErrorCode::kMalformed,
-                   "cutting the trailing magic lost gaussians: " +
-                       std::to_string(cut->gaussians.count) + " of " +
-                       std::to_string(full.gaussians.count));
+      return Error(ErrorCode::kMalformed, "cutting the trailing magic lost gaussians: " +
+                                              std::to_string(cut->gaussians.count) + " of " +
+                                              std::to_string(full.gaussians.count));
     }
   }
 
@@ -123,9 +122,9 @@ Result<void> checkTruncationRecovery(const std::vector<std::uint8_t>& bytes, con
     }
     const std::size_t expected = full.gaussians.count - last.gaussianCount;
     if (cut->gaussians.count != expected) {
-      return Error(ErrorCode::kMalformed,
-                   "cutting the last chunk left " + std::to_string(cut->gaussians.count) +
-                       " gaussians, expected " + std::to_string(expected));
+      return Error(ErrorCode::kMalformed, "cutting the last chunk left " +
+                                              std::to_string(cut->gaussians.count) +
+                                              " gaussians, expected " + std::to_string(expected));
     }
   }
   return Result<void>();

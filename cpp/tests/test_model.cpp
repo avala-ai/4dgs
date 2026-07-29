@@ -69,8 +69,8 @@ void neverFadingHasMarginalOne() {
 }
 
 void centerFollowsMotionFromBirth() {
-  const GaussianData data = one(1.0f, std::numeric_limits<float>::infinity(), 0.0f, 10.0f, 1.0f,
-                                2.0f);
+  const GaussianData data =
+      one(1.0f, std::numeric_limits<float>::infinity(), 0.0f, 10.0f, 1.0f, 2.0f);
   const GaussianView view(data);
   const GaussianState state = fourdgs::stateAt(view, 0, 3.0, 0.05);
   // position.x + velocity.x × (t − mu_t) = 1 + 2 × 2.

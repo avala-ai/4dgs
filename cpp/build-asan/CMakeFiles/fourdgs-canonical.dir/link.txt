@@ -1,0 +1,2 @@
+/usr/bin/ar qc libfourdgs-canonical.a "CMakeFiles/fourdgs-canonical.dir/conformance/canonical.cpp.o"
+/usr/bin/ranlib libfourdgs-canonical.a

@@ -1,0 +1,2 @@
+/usr/bin/ar qc libfourdgs-cpp.a "CMakeFiles/fourdgs-cpp.dir/src/decoder.cpp.o" "CMakeFiles/fourdgs-cpp.dir/src/model.cpp.o" "CMakeFiles/fourdgs-cpp.dir/src/readable.cpp.o" "CMakeFiles/fourdgs-cpp.dir/src/result.cpp.o" "CMakeFiles/fourdgs-cpp.dir/src/backend_unavailable.cpp.o"
+/usr/bin/ranlib libfourdgs-cpp.a

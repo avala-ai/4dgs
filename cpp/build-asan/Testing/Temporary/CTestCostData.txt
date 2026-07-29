@@ -1,0 +1,6 @@
+test_model 1 0.00549233
+test_result 1 0.00293512
+test_readable 1 0.00315543
+test_seam 1 0.00379442
+test_canonical 1 0.0117828
+---

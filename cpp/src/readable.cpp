@@ -35,9 +35,9 @@ Result<std::uint64_t> FileReadable::size() { return size_; }
 
 Result<std::size_t> FileReadable::read(std::uint64_t offset, Span<std::uint8_t> into) {
   if (offset > size_) {
-    return Error(ErrorCode::kInvalidArgument,
-                 "read at offset " + std::to_string(offset) + " past the end of " + path_ +
-                     ", which is " + std::to_string(size_) + " bytes");
+    return Error(ErrorCode::kInvalidArgument, "read at offset " + std::to_string(offset) +
+                                                  " past the end of " + path_ + ", which is " +
+                                                  std::to_string(size_) + " bytes");
   }
   if (std::fseek(handle_, static_cast<long>(offset), SEEK_SET) != 0) {  // NOLINT(runtime/int)
     return Error(ErrorCode::kIo, "cannot seek " + path_ + ": " + std::strerror(errno));
@@ -51,15 +51,13 @@ Result<std::size_t> FileReadable::read(std::uint64_t offset, Span<std::uint8_t> 
   return got;
 }
 
-Result<std::uint64_t> MemoryReadable::size() {
-  return static_cast<std::uint64_t>(bytes_.size());
-}
+Result<std::uint64_t> MemoryReadable::size() { return static_cast<std::uint64_t>(bytes_.size()); }
 
 Result<std::size_t> MemoryReadable::read(std::uint64_t offset, Span<std::uint8_t> into) {
   if (offset > bytes_.size()) {
-    return Error(ErrorCode::kInvalidArgument,
-                 "read at offset " + std::to_string(offset) + " past the end of a " +
-                     std::to_string(bytes_.size()) + " byte buffer");
+    return Error(ErrorCode::kInvalidArgument, "read at offset " + std::to_string(offset) +
+                                                  " past the end of a " +
+                                                  std::to_string(bytes_.size()) + " byte buffer");
   }
   const std::size_t available = bytes_.size() - static_cast<std::size_t>(offset);
   const std::size_t got = available < into.size() ? available : into.size();

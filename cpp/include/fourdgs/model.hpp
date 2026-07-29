@@ -22,16 +22,16 @@ namespace fourdgs {
 
 /// Header, spec §5.1.
 struct Header {
-  std::string profile;         ///< Well-known profile name, or empty for the base format.
-  std::string library;         ///< Free-form producer identification.
-  double durationSec = 0.0;    ///< Playback covers [0, durationSec).
+  std::string profile;       ///< Well-known profile name, or empty for the base format.
+  std::string library;       ///< Free-form producer identification.
+  double durationSec = 0.0;  ///< Playback covers [0, durationSec).
   std::uint64_t gaussianCount = 0;
-  double cutoff = 0.05;        ///< Marginal visibility threshold.
-  std::string temporalModel;   ///< `"gaussian-birth"` for version 1.
+  double cutoff = 0.05;                 ///< Marginal visibility threshold.
+  std::string temporalModel;            ///< `"gaussian-birth"` for version 1.
   double aabb[6] = {0, 0, 0, 0, 0, 0};  ///< min xyz, max xyz over rest positions.
-  int shDegree = 0;            ///< 0..3; 0 means no spherical harmonics.
-  bool hasAudio = false;       ///< Flags bit 0. The whole audio-discovery rule, spec §7.
-  bool chunksCompressed = false;  ///< Flags bit 1.
+  int shDegree = 0;                     ///< 0..3; 0 means no spherical harmonics.
+  bool hasAudio = false;                ///< Flags bit 0. The whole audio-discovery rule, spec §7.
+  bool chunksCompressed = false;        ///< Flags bit 1.
   std::map<std::string, std::string> attributes;
 };
 
@@ -163,7 +163,7 @@ struct GaussianState {
   bool visible = false;
   double center[3] = {0, 0, 0};  ///< position + motion × (t − mu_t)
   double marginal = 0.0;
-  double opacity = 0.0;          ///< color.a × marginal
+  double opacity = 0.0;  ///< color.a × marginal
 };
 
 /// Evaluate gaussian `i` at scene time `t`, exactly as spec §3 defines it.

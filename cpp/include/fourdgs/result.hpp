@@ -22,12 +22,12 @@ enum class ErrorCode : std::int32_t {
   kOk = 0,
   kNotImplemented = 1,  ///< This build has no decoder behind it. See the README.
   kInvalidArgument = 2,
-  kIo = 3,               ///< The transport failed; `Error::message` carries its report.
-  kBadMagic = 4,         ///< Not a 4dgs file.
+  kIo = 3,        ///< The transport failed; `Error::message` carries its report.
+  kBadMagic = 4,  ///< Not a 4dgs file.
   kUnsupportedVersion = 5,
-  kTruncated = 6,        ///< The file ends inside a record. Partial results may still be valid.
-  kMalformed = 7,        ///< Structurally wrong: a length, an offset, or a value out of range.
-  kUnsupported = 8,      ///< Legal but unimplemented here: an unknown codec, a future feature.
+  kTruncated = 6,    ///< The file ends inside a record. Partial results may still be valid.
+  kMalformed = 7,    ///< Structurally wrong: a length, an offset, or a value out of range.
+  kUnsupported = 8,  ///< Legal but unimplemented here: an unknown codec, a future feature.
   kChecksumMismatch = 9,
   kInternal = 10,
 };
@@ -54,7 +54,8 @@ struct Error {
 /// Thrown only by `Result::value()`, and only by callers who asked for exceptions.
 class Exception : public std::runtime_error {
  public:
-  explicit Exception(Error error) : std::runtime_error(error.toString()), error_(std::move(error)) {}
+  explicit Exception(Error error)
+      : std::runtime_error(error.toString()), error_(std::move(error)) {}
   const Error& error() const noexcept { return error_; }
 
  private:
@@ -71,8 +72,8 @@ class Exception : public std::runtime_error {
 template <typename T>
 class Result {
  public:
-  Result(T value) : ok_(true), value_(std::move(value)) {}          // NOLINT(runtime/explicit)
-  Result(Error error) : ok_(false), error_(std::move(error)) {}     // NOLINT(runtime/explicit)
+  Result(T value) : ok_(true), value_(std::move(value)) {}       // NOLINT(runtime/explicit)
+  Result(Error error) : ok_(false), error_(std::move(error)) {}  // NOLINT(runtime/explicit)
   Result(ErrorCode code, std::string message) : ok_(false), error_(code, std::move(message)) {}
 
   Result(const Result&) = default;

@@ -128,8 +128,8 @@ void absentAudioIsAValue() {
 void checksumMatchesTheReference() {
   // The check value every CRC-32 (IEEE) implementation agrees on for "123456789".
   const std::string input = "123456789";
-  CHECK_EQ(fourdgs::conformance::crc32String(
-               reinterpret_cast<const std::uint8_t*>(input.data()), input.size()),
+  CHECK_EQ(fourdgs::conformance::crc32String(reinterpret_cast<const std::uint8_t*>(input.data()),
+                                             input.size()),
            std::string("3421780262"));
   CHECK_EQ(fourdgs::conformance::crc32String(nullptr, 0), std::string("0"));
 }

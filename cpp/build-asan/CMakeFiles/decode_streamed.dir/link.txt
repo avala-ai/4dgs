@@ -1,0 +1,1 @@
+/usr/bin/c++ -g -fsanitize=address,undefined CMakeFiles/decode_streamed.dir/conformance/decode_streamed.cpp.o -o conformance/decode_streamed  libfourdgs-canonical.a libfourdgs-cpp.a 

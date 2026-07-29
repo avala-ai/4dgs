@@ -1,0 +1,1 @@
+/usr/bin/c++ -g -fsanitize=address,undefined CMakeFiles/test_readable.dir/tests/test_readable.cpp.o -o test_readable  libfourdgs-cpp.a 
