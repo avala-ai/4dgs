@@ -7,31 +7,31 @@ documented state — not a defect — and this table is the public contract that
 `supportsVariant()`, the harness runs exactly those, and this table is kept in lockstep with those
 declarations. Nothing is marked `Yes` on the strength of code existing.
 
-Python's row and TypeScript's are filled in from a suite that runs: 28 variants, two read paths
-(streamed and indexed), 55 checks passing for each. The other languages have not been run against it
-yet.
+Python's row, TypeScript's and Rust's are filled in from a suite that runs: 28 variants, two read
+paths (streamed and indexed), 55 checks passing for each. The other languages have not been run
+against it yet.
 
 | Feature                                              | Python  | TypeScript | Rust    | C++     | Swift   |
 | ---------------------------------------------------- | ------- | ---------- | ------- | ------- | ------- |
-| Streaming decode                                     | Yes     | Yes        | Planned | Planned | Planned |
-| Indexed / seeking decode                             | Yes     | Yes        | Planned | Planned | Planned |
-| Range-request decode                                 | Yes     | Yes        | Planned | Planned | Planned |
-| Truncated-file recovery                              | Yes     | Yes        | Planned | Planned | Planned |
-| Chunk index                                          | Yes     | Yes        | Planned | Planned | Planned |
-| Summary offsets                                      | Yes     | Yes        | Planned | Planned | Planned |
-| CRC validation                                       | Yes     | Yes        | Planned | Planned | Planned |
-| Quantized attributes                                 | Yes     | Yes        | Planned | Planned | Planned |
-| Spherical harmonics, degree 1                        | Yes     | Yes        | Planned | Planned | Planned |
-| Spherical harmonics, degree 2                        | Yes     | Yes        | Planned | Planned | Planned |
+| Streaming decode                                     | Yes     | Yes        | Yes     | Planned | Planned |
+| Indexed / seeking decode                             | Yes     | Yes        | Yes     | Planned | Planned |
+| Range-request decode                                 | Yes     | Yes        | Yes     | Planned | Planned |
+| Truncated-file recovery                              | Yes     | Yes        | Yes     | Planned | Planned |
+| Chunk index                                          | Yes     | Yes        | Yes     | Planned | Planned |
+| Summary offsets                                      | Yes     | Yes        | Yes     | Planned | Planned |
+| CRC validation                                       | Yes     | Yes        | Yes     | Planned | Planned |
+| Quantized attributes                                 | Yes     | Yes        | Yes     | Planned | Planned |
+| Spherical harmonics, degree 1                        | Yes     | Yes        | Yes     | Planned | Planned |
+| Spherical harmonics, degree 2                        | Yes     | Yes        | Yes     | Planned | Planned |
 | Spherical harmonics, degree 3                        | Planned | Planned    | Planned | Planned | Planned |
-| SH band range-skipping                               | Yes     | Yes        | Planned | Planned | Planned |
-| Embedded audio (optional, zero-overhead when absent) | Yes     | Yes        | Planned | Planned | Planned |
-| Camera trajectory                                    | Yes     | Yes        | Planned | Planned | Planned |
-| Metadata                                             | Yes     | Yes        | Planned | Planned | Planned |
-| Attachments                                          | Yes     | Yes        | Planned | Planned | Planned |
-| Statistics                                           | Yes     | Yes        | Planned | Planned | Planned |
-| Unknown-record skipping                              | Yes     | Yes        | Planned | Planned | Planned |
-| Private-range records                                | Yes     | Yes        | Planned | Planned | Planned |
+| SH band range-skipping                               | Yes     | Yes        | Yes     | Planned | Planned |
+| Embedded audio (optional, zero-overhead when absent) | Yes     | Yes        | Yes     | Planned | Planned |
+| Camera trajectory                                    | Yes     | Yes        | Yes     | Planned | Planned |
+| Metadata                                             | Yes     | Yes        | Yes     | Planned | Planned |
+| Attachments                                          | Yes     | Yes        | Yes     | Planned | Planned |
+| Statistics                                           | Yes     | Yes        | Yes     | Planned | Planned |
+| Unknown-record skipping                              | Yes     | Yes        | Yes     | Planned | Planned |
+| Private-range records                                | Yes     | Yes        | Yes     | Planned | Planned |
 | Encode                                               | Yes     | Planned    | Planned | Planned | Planned |
 | Chunked encode                                       | Yes     | Planned    | Planned | Planned | Planned |
 | Summary writing                                      | Yes     | Planned    | Planned | Planned | Planned |
@@ -54,12 +54,14 @@ and every SDK exposes audio as an optional value rather than an error state. Mos
 none; that is the common case, and it costs nothing.
 
 **Range-request decode** is a property of the transport an SDK offers, not of the format: every SDK
-can decode from an arbitrary byte-range reader, but only some ship an HTTP one. TypeScript's `Yes`
-covers the decode, which the indexed runner exercises over ranged reads; the HTTP transport it ships
-in `@4dgs/browser` is covered by that package's own tests, not by the corpus.
+can decode from an arbitrary byte-range reader, but only some ship an HTTP one. TypeScript's and
+Rust's `Yes` cover the decode, which each indexed runner exercises over ranged reads; the HTTP
+transport TypeScript ships in `@4dgs/browser` is covered by that package's own tests, not by the
+corpus. Rust ships no HTTP transport at all — its core takes a `Readable`, and the C ABI takes the
+same thing as callbacks, so an HTTP reader belongs to the consumer.
 
-**Encode** stays `Planned` for TypeScript because there is no TypeScript encoder. The packages there
-decode; the reference encoder is Python's.
+**Encode** stays `Planned` for TypeScript and Rust because neither has an encoder yet. Those
+packages decode; the reference encoder is Python's.
 
 **Convert from PLY frame sequences** takes a directory of standard per-frame gaussian splat PLY
 files — the common interchange form — and produces a `.4dgs`. It lives in the Python package because
@@ -96,9 +98,12 @@ seed — the corpus rule applied to a different file format — and the validato
 files built byte by byte, because a validator tested only on files its own encoder wrote is a
 validator tested against nothing.
 
-**Rust** is a compiling stub today: the crate exists so the workspace and the release machinery are
-real, and its bodies are unimplemented. Python is the reference implementation until it lands.
+**Rust** decodes, and its decode row is filled in from the same suite on the same terms as the other
+two. Its encode rows stay `Planned`: there is no Rust encoder yet, and the reference encoder is
+Python's. The crate also carries the C ABI — `rust/fourdgs/include/fourdgs.h` — which is the surface
+the native tier binds to rather than hand-writing and then maintaining parallel implementations.
+That header is checked by a C program compiled and run in CI, not by the corpus, because a drift
+between a header and the symbols behind it is not something a decode suite can see.
 
-**C++** and **Swift** are declared, not started. When Rust lands, the intended path for both is to
-generate their surface from Rust's C ABI — a header or a binding plus a thin shim — rather than
-hand-writing and then maintaining parallel implementations. Swift targets visionOS and iOS.
+**C++** and **Swift** take their surface from that C ABI — the header plus a thin shim per language.
+Swift targets visionOS and iOS.

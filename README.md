@@ -43,7 +43,7 @@ self-contained resource you can range-request and seek like a video.
 | ---------- | -------------------------- | ------------ | ----------------------------- |
 | Python     | [python/](python/)         | `fourdgs`    | Reference implementation      |
 | TypeScript | [typescript/](typescript/) | `@4dgs/core` | Decoder, conformance-verified |
-| Rust       | [rust/](rust/)             | `fourdgs`    | Planned                       |
+| Rust       | [rust/](rust/)             | `fourdgs`    | Decoder, conformance-verified |
 | C++        | [cpp/](cpp/)               | —            | Planned                       |
 | Swift      | [swift/](swift/)           | —            | Planned (visionOS)            |
 
