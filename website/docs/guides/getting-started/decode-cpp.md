@@ -30,6 +30,12 @@ for (std::size_t i = 0; i < state->count(); ++i) {
   std::uint32_t g = state->indices()[i];   // indexes scene.gaussians()
   // state->centers()[3 * i ...], state->opacity()[i]
 }
+
+for (std::uint32_t i = 0; i < scene.audioSourceCount(); ++i) {
+  auto source = scene.audioSource(i);                  // descriptor only
+  auto audio = scene.readAudioSource(i);               // encoded payload too
+  auto sourceState = scene.audioSourceStateAt(i, 2.5); // moving scene-space pose
+}
 ```
 
 A scene has a working set: `loadAll()` fills it with every chunk, `loadAt(t, cap)` with only the
@@ -59,8 +65,9 @@ the decoder recovers from, rather than an error the transport should raise.
 
 ## Where decoding ends
 
-At reconstructed gaussian state at time `t`. Ordering, culling, level of detail and anything
-touching a GPU belong to whatever draws the splats, which is not this repository.
+At reconstructed gaussian state and audio source state at time `t`. Ordering, culling and GPU work
+belong to the renderer; listener pose, HRTF/panning, attenuation, occlusion and mixing belong to the
+player.
 
 [`cpp/examples/decode_summary.cpp`](https://github.com/avala-ai/4dgs/blob/main/cpp/examples/decode_summary.cpp)
 is the whole of the above in one file, and CI runs it.

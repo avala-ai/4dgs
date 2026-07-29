@@ -17,6 +17,16 @@ The four packages version together.
   `CompressionStream`, the mirror of the decoder's `DecompressionStream`, so the package keeps no
   dependency and runs in a browser. The cross-language encode gate re-encodes every corpus variant
   and requires the Python decoder to read the result the same as the Rust reference.
+- Native multiple-source spatial audio in `@4dgs/core`, including moving position and quaternion
+  rotation, independent timing, gain and looping. `audioSourceStateAt` reconstructs source facts at
+  scene time `t`; listener-relative rendering remains a player concern.
+- `IndexedDecoder.readAudioSourceDescriptors`, `readAudioSourceState` and `readAudioRange`, so
+  players can inspect and schedule audio without transferring whole encoded payloads.
+- `decodeScene` returns the same small descriptors and delivers `Audio Data` through the awaited
+  `onAudioData` callback in block-sized pieces, so front-to-back decoding never retains every source
+  payload.
+- Audio Source and Audio Data parsing on both read paths, with legacy Audio records normalized to a
+  single non-spatial compatibility source.
 
 ## [0.1.0] - 2026-07-29
 

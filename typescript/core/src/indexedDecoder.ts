@@ -30,6 +30,9 @@ import { DEFAULT_CUTOFF, supportK } from "./quantization.js";
 import { checkQuantizationScheme, checkTemporalModel } from "./registry.js";
 import type { IReadable } from "./readable.js";
 import {
+  type AudioSource,
+  type AudioSourceDescriptor,
+  type AudioSourceState,
   type AudioTrack,
   type ChunkIndexEntry,
   type Footer,
@@ -47,7 +50,8 @@ import {
   checkMagic,
   entryCovers,
   iterateRecords,
-  parseAudio,
+  audioSourceStateAt,
+  parseAudioSource,
   parseChunk,
   parseAttachment,
   parseCamera,
@@ -86,6 +90,15 @@ interface ByteRange {
   readonly length: number;
 }
 
+interface IndexedAudioSource {
+  readonly sourceId: number;
+  readonly descriptor: ByteRange | null;
+  readonly dataOffset: number;
+  readonly dataLength: number;
+  readonly legacyCodec?: string;
+  readonly legacyStartSec?: number;
+}
+
 export interface OpenIndexedOptions {
   readonly codecs?: CodecRegistry;
   readonly headProbeBytes?: number;
@@ -109,6 +122,7 @@ export interface IndexedChunk {
  */
 export class IndexedDecoder {
   private cachedChunkOptions: DecodeChunkOptions | null = null;
+  private readonly audioDescriptorCache = new Map<number, AudioSourceDescriptor>();
 
   private constructor(
     private readonly source: IReadable,
@@ -119,7 +133,7 @@ export class IndexedDecoder {
     readonly index: readonly ChunkIndexEntry[],
     readonly footer: Footer,
     readonly summaryOffsets: readonly SummaryOffset[],
-    private readonly audioRange: { offset: number; length: number; codec: string } | null,
+    private readonly audioSources: readonly IndexedAudioSource[],
     /**
      * Front-matter records this reader framed and did not parse. Opening a file learns
      * where they are and stops: a camera nobody asked for costs nothing, and neither does
@@ -151,7 +165,9 @@ export class IndexedDecoder {
     let header: Header | null = null;
     let quantization: Quantization | null = null;
     let windows = new Float64Array(0);
-    let audioRange: { offset: number; length: number; codec: string } | null = null;
+    const sourceRanges = new Map<number, ByteRange>();
+    const dataRanges = new Map<number, { offset: number; length: number }>();
+    let legacyAudio: IndexedAudioSource | null = null;
     const deferred: { camera: ByteRange | null; metadata: ByteRange[]; attachments: ByteRange[] } =
       {
         camera: null,
@@ -172,11 +188,34 @@ export class IndexedDecoder {
         // The track's bytes are not read here, and neither is the record stepped into: a
         // caller may want the gaussians and never the audio. Only the codec name is
         // parsed, out of a prefix, so a scene with a large track costs nothing to open.
-        audioRange = {
-          offset: record.offset,
-          length: record.totalLength,
-          codec: readAudioCodec(await scanner.content(record, AUDIO_CODEC_PREFIX_BYTES)),
-        };
+        legacyAudio = readLegacyAudioRange(
+          await scanner.content(record, AUDIO_CODEC_PREFIX_BYTES),
+          record.offset,
+          record.contentLength,
+        );
+      } else if (record.opcode === Opcode.AudioSource) {
+        const sourceId = readSourceId(await scanner.content(record, 4), "Audio Source");
+        if (sourceRanges.has(sourceId)) {
+          throw new MalformedFile(`Audio Source id ${sourceId} appears more than once`);
+        }
+        sourceRanges.set(sourceId, { offset: record.offset, length: record.totalLength });
+      } else if (record.opcode === Opcode.AudioData) {
+        const prefix = new Cursor(await scanner.content(record, 12));
+        const sourceId = prefix.u32();
+        const dataLength = prefix.u64();
+        if (dataRanges.has(sourceId)) {
+          throw new MalformedFile(`Audio Data id ${sourceId} appears more than once`);
+        }
+        if (record.contentLength < 12 + dataLength) {
+          throw new MalformedFile(
+            `Audio Data id ${sourceId} declares ${dataLength} bytes, ` +
+              `but its record content is only ${record.contentLength} bytes`,
+          );
+        }
+        dataRanges.set(sourceId, {
+          offset: record.offset + RECORD_HEADER_BYTES + 12,
+          length: dataLength,
+        });
       } else if (record.opcode === Opcode.Camera) {
         deferred.camera = { offset: record.offset, length: record.totalLength };
       } else if (record.opcode === Opcode.Metadata) {
@@ -188,6 +227,41 @@ export class IndexedDecoder {
     if (header === null || quantization === null) {
       throw new MalformedFile(
         "the file has no Header or no Quantization record before its first Chunk",
+      );
+    }
+    if (legacyAudio !== null && sourceRanges.size > 0) {
+      throw new MalformedFile("the file mixes a legacy Audio record with Audio Source records");
+    }
+    if (legacyAudio !== null && dataRanges.size > 0) {
+      const sourceId = Math.min(...dataRanges.keys());
+      throw new MalformedFile(`Audio Data id ${sourceId} has no matching Audio Source record`);
+    }
+    const audioSources: IndexedAudioSource[] = [];
+    if (legacyAudio !== null) {
+      audioSources.push(legacyAudio);
+    } else {
+      for (const sourceId of [...sourceRanges.keys()].sort((a, b) => a - b)) {
+        const data = dataRanges.get(sourceId);
+        if (data === undefined) {
+          throw new MalformedFile(`Audio Source id ${sourceId} has no matching Audio Data record`);
+        }
+        dataRanges.delete(sourceId);
+        audioSources.push({
+          sourceId,
+          descriptor: sourceRanges.get(sourceId)!,
+          dataOffset: data.offset,
+          dataLength: data.length,
+        });
+      }
+      if (dataRanges.size > 0) {
+        const sourceId = Math.min(...dataRanges.keys());
+        throw new MalformedFile(`Audio Data id ${sourceId} has no matching Audio Source record`);
+      }
+    }
+    if (header.hasAudio !== audioSources.length > 0) {
+      throw new MalformedFile(
+        `the Header audio flag is ${header.hasAudio ? "set" : "clear"}, but the file contains ` +
+          `${audioSources.length} audio sources`,
       );
     }
 
@@ -230,7 +304,7 @@ export class IndexedDecoder {
       index,
       footer,
       summaryOffsets,
-      audioRange,
+      audioSources,
       deferred,
       statistics,
       summaryCrcOk,
@@ -298,6 +372,11 @@ export class IndexedDecoder {
   /** Whether the scene has audio, from the Header alone. */
   get hasAudio(): boolean {
     return this.header.hasAudio;
+  }
+
+  /** Number of independent sources, learned without fetching any encoded audio bytes. */
+  get audioSourceCount(): number {
+    return this.audioSources.length;
   }
 
   /** The normative seek rule: every index entry whose `[t0, t1)` contains `t`. */
@@ -381,10 +460,108 @@ export class IndexedDecoder {
    * `null` when the scene has none — a normal value, not an error and not a warning.
    */
   async readAudio(): Promise<AudioTrack | null> {
-    if (this.audioRange === null) return null;
-    const { offset, length } = this.audioRange;
-    const blob = await this.readRange(offset, length, "the Audio record");
-    return parseAudio(readRecord(new Cursor(blob, 0, offset)).content);
+    const source = (await this.readAudioSources())[0];
+    return source === undefined
+      ? null
+      : { codec: source.codec, startSec: source.startSec, data: source.data };
+  }
+
+  /** Fetch every source descriptor and payload. */
+  async readAudioSources(): Promise<AudioSource[]> {
+    const out: AudioSource[] = [];
+    for (const entry of this.audioSources) out.push(await this.readAudioSource(entry));
+    return out;
+  }
+
+  /** Fetch every small descriptor without transferring encoded payload bytes. */
+  async readAudioSourceDescriptors(): Promise<AudioSourceDescriptor[]> {
+    const out: AudioSourceDescriptor[] = [];
+    for (const entry of this.audioSources) {
+      out.push(await this.readAudioSourceDescriptor(entry));
+    }
+    return out;
+  }
+
+  /** Reconstruct one source without transferring its encoded payload. */
+  async readAudioSourceState(sourceId: number, t: number): Promise<AudioSourceState> {
+    const entry = this.audioSources.find((item) => item.sourceId === sourceId);
+    if (entry === undefined)
+      throw new MalformedFile(`this scene has no audio source id ${sourceId}`);
+    return audioSourceStateAt(await this.readAudioSourceDescriptor(entry), t);
+  }
+
+  /** Validate/cache the small descriptor, then read one source-relative payload range. */
+  async readAudioRange(sourceId: number, offset: number, length: number): Promise<Uint8Array> {
+    const source = this.audioSources.find((item) => item.sourceId === sourceId);
+    if (source === undefined)
+      throw new MalformedFile(`this scene has no audio source id ${sourceId}`);
+    await this.readAudioSourceDescriptor(source);
+    if (offset < 0 || length < 0 || offset + length > source.dataLength) {
+      throw new MalformedFile(
+        `audio source ${sourceId} range [${offset}, ${offset + length}) is outside ` +
+          `its ${source.dataLength}-byte payload`,
+      );
+    }
+    return this.source.read(BigInt(source.dataOffset + offset), BigInt(length));
+  }
+
+  private async readAudioSource(entry: IndexedAudioSource): Promise<AudioSource> {
+    const descriptor = await this.readAudioSourceDescriptor(entry);
+    const data = await this.source.read(BigInt(entry.dataOffset), BigInt(entry.dataLength));
+    return { ...descriptor, data };
+  }
+
+  private async readAudioSourceDescriptor(
+    entry: IndexedAudioSource,
+  ): Promise<AudioSourceDescriptor> {
+    const cached = this.audioDescriptorCache.get(entry.sourceId);
+    if (cached !== undefined) return cached;
+    if (entry.descriptor === null) {
+      const startSec = entry.legacyStartSec ?? 0;
+      const descriptor: AudioSourceDescriptor = {
+        sourceId: entry.sourceId,
+        name: "",
+        codec: entry.legacyCodec ?? "",
+        channelLayout: "",
+        dataLength: entry.dataLength,
+        startSec,
+        durationSec: Math.max(0, this.header.durationSec - startSec),
+        gain: 1,
+        spatial: false,
+        loop: false,
+        position: [0, 0, 0],
+        rotation: [0, 0, 0, 1],
+        keyframes: [],
+        interpolation: "linear",
+      };
+      this.audioDescriptorCache.set(entry.sourceId, descriptor);
+      return descriptor;
+    }
+    const descriptor = parseAudioSource(
+      await this.readRecordAt(entry.descriptor, Opcode.AudioSource),
+    );
+    if (descriptor.sourceId !== entry.sourceId) {
+      throw new MalformedFile(
+        `Audio Source range for id ${entry.sourceId} contains id ${descriptor.sourceId}`,
+      );
+    }
+    if (descriptor.dataLength !== entry.dataLength) {
+      throw new MalformedFile(
+        `Audio Source id ${entry.sourceId} declares ${descriptor.dataLength} bytes, ` +
+          `its Audio Data record declares ${entry.dataLength}`,
+      );
+    }
+    for (let i = 0; i < descriptor.keyframes.length; i++) {
+      const time = descriptor.keyframes[i]!.time;
+      if (time < 0 || time > this.header.durationSec) {
+        throw new MalformedFile(
+          `Audio Source id ${entry.sourceId} keyframe ${i} time ${time} is outside ` +
+            `[0, ${this.header.durationSec}]`,
+        );
+      }
+    }
+    this.audioDescriptorCache.set(entry.sourceId, descriptor);
+    return descriptor;
   }
 
   private chunkOptions(): DecodeChunkOptions {
@@ -400,12 +577,42 @@ export class IndexedDecoder {
 }
 
 /** The `codec` field at the front of an Audio record, read out of a prefix of it. */
-function readAudioCodec(prefix: Uint8Array): string {
+function readSourceId(prefix: Uint8Array, recordName: string): number {
   try {
-    return new Cursor(prefix).string();
+    return new Cursor(prefix).u32();
   } catch {
+    throw new MalformedFile(`the ${recordName} record does not contain its u32 source id`);
+  }
+}
+
+function readLegacyAudioRange(
+  prefix: Uint8Array,
+  recordOffset: number,
+  contentLength: number,
+): IndexedAudioSource {
+  try {
+    const cursor = new Cursor(prefix);
+    const codec = cursor.string();
+    const startSec = cursor.f64();
+    const dataLength = cursor.u64();
+    if (contentLength < cursor.pos + dataLength) {
+      throw new MalformedFile(
+        `the legacy Audio record declares ${dataLength} data bytes, but its content is only ` +
+          `${contentLength} bytes`,
+      );
+    }
+    return {
+      sourceId: 0,
+      descriptor: null,
+      dataOffset: recordOffset + RECORD_HEADER_BYTES + cursor.pos,
+      dataLength,
+      legacyCodec: codec,
+      legacyStartSec: startSec,
+    };
+  } catch (error) {
+    if (error instanceof MalformedFile) throw error;
     throw new MalformedFile(
-      `the Audio record's codec name does not fit the first ${AUDIO_CODEC_PREFIX_BYTES} bytes of the record`,
+      `the legacy Audio descriptor does not fit the first ${AUDIO_CODEC_PREFIX_BYTES} bytes`,
     );
   }
 }

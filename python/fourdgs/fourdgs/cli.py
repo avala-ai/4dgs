@@ -52,7 +52,7 @@ def cmd_info(args) -> int:
     print(f"profile        {h.profile or '(none)'}   temporal model: {h.temporal_model}")
     print(f"library        {h.library or '(unstated)'}")
     print(f"spherical harm degree {h.sh_degree}")
-    print(f"audio          {scene.audio_codec if scene.has_audio else 'none'}")
+    print(f"audio sources  {len(scene.audio_sources) if scene.has_audio else 'none'}")
     print(f"chunks         {len(scene.index)}")
     print(f"windows        {len(scene.windows)}")
     print(f"aabb           {[round(v, 4) for v in h.aabb]}")

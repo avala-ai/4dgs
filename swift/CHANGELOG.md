@@ -12,7 +12,11 @@ All notable changes to the Swift package are documented here, following
   `CoreSeam`, so the package authors files through the same core it decodes through. An
   `encode_roundtrip` runner re-encodes each variant's gaussians for the cross-language encode gate,
   which requires the Python decoder to read the binding's output the same as the Rust reference's.
-
+- Multiple spatial `AudioSource` values with independent timing, encoded payloads, gain, looping and
+  fixed or keyframed scene-space poses. `audioSourceState(_:at:)` reconstructs moving source state;
+  listener-relative rendering remains the app or player's responsibility.
+- Descriptor-only source discovery and bounded `audioSourceData` reads, keeping payload allocation
+  under caller control and preserving the package's byte-range I/O boundary.
 - The package is a real SPM package rather than a skeleton: `FourDGS` for visionOS, iOS and macOS,
   with the value types, errors and readers the spec's data model calls for.
 - `StreamedReader` and `IndexedReader`, the two read paths, with `ByteRangeReader` as the single
@@ -39,12 +43,10 @@ All notable changes to the Swift package are documented here, following
   code could not keep, and the suite runs two runners precisely so the paths can disagree. They come
   back when the ABI can be told which to use. Nothing is released, so nothing depended on them.
 
-### Not yet
+### Notes
 
-A conformance summary. The ABI reaches the Header's numbers, the audio, the chunk intervals and the
-gaussians; it has no accessor for the metadata, attachment, camera, statistics or summary-offset
-records, nor the Footer's summary CRC. `Scene.recordsAvailable` says so rather than letting an empty
-array read as a fact, and the runners refuse to print a partial summary. No Swift cell in the
-feature matrix moves until the conformance suite says otherwise.
+The shared suite proves 79 comparisons across the 45 valid variants Swift supports, including fixed,
+moving and multiple audio-source scenes. Swift's runners materialize payloads only for canonical
+comparison; the public `SceneReader` leaves them deferred.
 
 Nothing is released. There is no Swift package registry entry and nothing should depend on this yet.

@@ -35,9 +35,28 @@ fourdgs.write("scene.4dgs", gaussians, 8.0)
 `sigma_t` may hold `inf`, meaning the gaussian never fades inside its window. That is a value rather
 than a sentinel: it survives encode and decode as infinity, and readers expose it as such.
 
-`write` takes a path or any file-like object and returns the number of bytes written. An
-`AudioTrack` and a `CameraTrajectory` are optional keyword arguments; a scene without them carries
-nothing at all for them.
+`write` takes a path or any file-like object and returns the number of bytes written. Audio sources
+and a `CameraTrajectory` are optional; a scene without them carries nothing for them.
+
+```python
+source = fourdgs.AudioSource(
+    source_id=7,
+    name="speaker",
+    codec="opus",
+    channel_layout="mono",
+    data=encoded_opus,
+    duration_sec=8.0,
+    position=(1.5, 0.75, -0.5),
+    keyframes=[
+        fourdgs.AudioSourceKeyframe(0.0, (1.5, 0.75, -0.5), (0, 0, 0, 1)),
+        fourdgs.AudioSourceKeyframe(8.0, (-1.5, 1.0, 0.5), (0, 1, 0, 0)),
+    ],
+)
+fourdgs.write("scene.4dgs", gaussians, 8.0, audio_sources=[source])
+```
+
+Positions interpolate linearly and rotations use shortest-path quaternion SLERP. `AudioTrack`
+remains accepted as a legacy non-spatial writer input.
 
 A complete, runnable version of the above — including generating the arrays — is
 [`python/examples/encode_synthetic.py`](https://github.com/avala-ai/4dgs/blob/main/python/examples/encode_synthetic.py),

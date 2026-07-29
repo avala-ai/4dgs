@@ -4,7 +4,7 @@
 /// A decoder for the `.4dgs` container: a single, self-contained, seekable file
 /// holding a 4D gaussian splat scene — gaussians whose position, opacity and
 /// existence vary continuously over time, optionally with an embedded audio
-/// track and a default camera trajectory.
+/// sources and a default camera trajectory.
 ///
 /// The format is renderer-agnostic and so is this decoder. It reconstructs
 /// splat state at a given time and stops there; how that state is drawn is out

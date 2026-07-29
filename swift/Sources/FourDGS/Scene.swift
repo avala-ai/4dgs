@@ -11,9 +11,11 @@
 /// ask", and it is now always `true` for a scene this package opened.
 public struct Scene: Sendable, Equatable {
     public var header: Header
-    /// `nil` when the scene has no audio, which is the common case and not an error. The
-    /// Header's audio flag alone decides this; no probing and no speculative range read.
-    public var audio: Audio?
+    /// Independently timed spatial or non-spatial descriptors, sorted by source id.
+    ///
+    /// Their `data` arrays are empty on open; `dataSize` describes the resource and
+    /// `SceneReader.audioSourceData` performs bounded payload reads.
+    public var audioSources: [AudioSource]
     public var camera: Camera?
     public var metadata: [MetadataRecord]
     public var attachments: [Attachment]
@@ -40,13 +42,14 @@ public struct Scene: Sendable, Equatable {
     public var recordsAvailable: Bool
 
     public init(
-        header: Header, audio: Audio? = nil, camera: Camera? = nil, metadata: [MetadataRecord] = [],
+        header: Header, audioSources: [AudioSource] = [], camera: Camera? = nil,
+        metadata: [MetadataRecord] = [],
         attachments: [Attachment] = [], statistics: Statistics? = nil, summaryOffsets: [SummaryOffset] = [],
         chunkIntervals: [ClosedRange<Double>] = [], isIndexed: Bool = false, isTruncated: Bool = false,
         summaryChecksumVerified: Bool? = nil, recordsAvailable: Bool = false
     ) {
         self.header = header
-        self.audio = audio
+        self.audioSources = audioSources
         self.camera = camera
         self.metadata = metadata
         self.attachments = attachments
@@ -141,7 +144,7 @@ public final class SceneReader {
         try Core.loadRecords(handle)
         self.scene = Scene(
             header: try Core.header(handle),
-            audio: try Core.audio(handle),
+            audioSources: try Core.audioSources(handle),
             camera: try Core.camera(handle),
             metadata: try Core.metadata(handle),
             attachments: try Core.attachments(handle),
@@ -212,5 +215,32 @@ public final class SceneReader {
     /// will say so rather than let anyone discover it by fetching the file.
     public func bytesForTime(_ t: Double, options: DecodeOptions = DecodeOptions()) -> UInt64 {
         Core.bytesForTime(handle, t, bandCap: options.bandCap)
+    }
+
+    /// Read a bounded range of one source's encoded payload.
+    public func audioSourceData(
+        _ index: Int, offset: UInt64 = 0, length: UInt64
+    ) throws -> [UInt8] {
+        guard index >= 0, index < scene.audioSources.count else {
+            throw FourDGSError.invalidRange(offset: Int64(index), count: 1)
+        }
+        let size = scene.audioSources[index].dataSize
+        guard offset <= size, length <= size - offset else {
+            throw FourDGSError.malformed(
+                offset: 0, record: "Audio Data", field: "range",
+                reason: "offset \(offset) plus length \(length) is outside the \(size)-byte payload")
+        }
+        return try Core.audioSourceData(handle, index: UInt32(index), offset: offset, length: length)
+    }
+
+    /// Reconstruct a source's active state, local playback time and moving pose.
+    ///
+    /// The player combines this scene-space state with its listener orientation and owns
+    /// HRTF/panning, distance attenuation, occlusion and mixing.
+    public func audioSourceState(_ index: Int, at t: Double) throws -> AudioSourceState {
+        guard index >= 0, index < scene.audioSources.count else {
+            throw FourDGSError.invalidRange(offset: Int64(index), count: 1)
+        }
+        return try Core.audioSourceState(handle, index: UInt32(index), at: t)
     }
 }

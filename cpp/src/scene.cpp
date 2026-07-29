@@ -3,6 +3,7 @@
 
 #include "fourdgs/scene.hpp"
 
+#include <limits>
 #include <utility>
 
 #include "backend.hpp"
@@ -125,6 +126,50 @@ Scene::CrcState Scene::summaryCrcState() const {
 
 bool Scene::hasAudio() const { return detail::hasAudio(*handle_); }
 
+std::uint32_t Scene::audioSourceCount() const { return detail::audioSourceCount(*handle_); }
+
+Result<AudioSource> Scene::audioSource(std::uint32_t index) {
+  return detail::audioSource(*handle_, index);
+}
+
+Result<AudioSourceState> Scene::audioSourceStateAt(std::uint32_t index, double t) {
+  return detail::audioSourceStateAt(*handle_, index, t);
+}
+
+Result<void> Scene::readAudioSource(std::uint32_t index, std::uint64_t offset,
+                                    Span<std::uint8_t> into) {
+  return detail::readAudioSource(*handle_, index, offset, into);
+}
+
+Result<AudioSource> Scene::readAudioSource(std::uint32_t index) {
+  Result<AudioSource> descriptor = audioSource(index);
+  if (!descriptor) return descriptor.error();
+  if (descriptor->dataSize > std::numeric_limits<std::size_t>::max()) {
+    return Error(ErrorCode::kMalformed,
+                 "Audio Source id " + std::to_string(descriptor->sourceId) + " declares " +
+                     std::to_string(descriptor->dataSize) +
+                     " payload bytes; this platform can address at most " +
+                     std::to_string(std::numeric_limits<std::size_t>::max()));
+  }
+  descriptor->data.resize(static_cast<std::size_t>(descriptor->dataSize));
+  if (descriptor->data.empty()) return descriptor;
+  Result<void> read = readAudioSource(
+      index, 0, Span<std::uint8_t>(descriptor->data.data(), descriptor->data.size()));
+  if (!read) return read.error();
+  return descriptor;
+}
+
+Result<std::vector<AudioSource>> Scene::readAudioSources() {
+  std::vector<AudioSource> sources;
+  sources.reserve(audioSourceCount());
+  for (std::uint32_t index = 0; index < audioSourceCount(); ++index) {
+    Result<AudioSource> source = readAudioSource(index);
+    if (!source) return source.error();
+    sources.push_back(std::move(*source));
+  }
+  return sources;
+}
+
 std::string Scene::audioCodec() const { return detail::audioCodec(*handle_); }
 
 std::uint64_t Scene::audioSize() const { return detail::audioSize(*handle_); }
@@ -140,6 +185,12 @@ Result<AudioTrack> Scene::readAudioTrack() {
   // Sized from a value the reader has already validated, and known without fetching the
   // track: the allocation is never larger than the file says the track is.
   const std::uint64_t size = audioSize();
+  if (size > std::numeric_limits<std::size_t>::max()) {
+    return Error(ErrorCode::kMalformed,
+                 "legacy Audio declares " + std::to_string(size) +
+                     " payload bytes; this platform can address at most " +
+                     std::to_string(std::numeric_limits<std::size_t>::max()));
+  }
   track.data.resize(static_cast<std::size_t>(size));
   if (size == 0) return track;
   Result<void> read = readAudio(0, Span<std::uint8_t>(track.data.data(), track.data.size()));

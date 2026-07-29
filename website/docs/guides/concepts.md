@@ -7,10 +7,22 @@ differ in casing or style, follow the language; do not rename the concept.
 that say when it exists and how it moves. The atom of the format.
 
 **Scene** — everything one `.4dgs` file describes: its gaussians, its timeline, and optionally its
-audio and camera.
+audio sources and camera.
 
-**Scene clock** — time in seconds from 0, the single timeline everything in the file refers to. When
-the file has audio, the audio track is the clock's master.
+**Scene clock** — time in seconds from 0, the single authoritative timeline every gaussian,
+audio-source start and audio pose keyframe refers to. No audio payload is its master.
+
+**Audio source** — one independently timed encoded payload plus a source id, gain, channel layout,
+and optional scene-space pose trajectory. A spatial point source is mono; a non-spatial source is a
+scene-global channel bed.
+
+**Audio source state** — the source facts reconstructed at scene time `t`: whether it is active, its
+source-local playback time, gain, position and orientation. This is where format audio
+reconstruction ends.
+
+**Listener pose** — the listener's position and orientation in scene space. It is runtime state
+supplied by the player, not stored in the file. The player combines it with audio source state to
+choose HRTF or speaker panning, attenuation, occlusion and mixing.
 
 **Validity window** — the half-open interval `[win_lo, win_hi)` during which a gaussian exists at
 all. The format's only hard temporal gate: outside its window a gaussian is not faded, it is absent.

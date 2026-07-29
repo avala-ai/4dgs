@@ -22,7 +22,8 @@ That sentence is the charter, and it decides most scope questions before they be
 - Comparisons against other formats or products
 
 These are declined by policy, not by judgement of quality. Decoding ends at reconstructed gaussian
-state at time `t`; everything downstream belongs to whatever draws it.
+state and audio-source state at time `t`; drawing and listener-relative audio spatialization belong
+to the consuming renderer/player.
 
 ## Spec changes
 

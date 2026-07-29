@@ -40,7 +40,7 @@ else:
 
 scene = open_indexed(source)
 print(f"{scene.header.gaussian_count:,} gaussians, {scene.header.duration_sec:g}s, {len(scene.index)} chunks")
-print(f"audio: {scene.audio_codec if scene.has_audio else 'none'}")
+print(f"audio sources: {len(scene.audio_sources) if scene.has_audio else 'none'}")
 for t in (0.0, 2.5, 5.0):
     entries = scene.chunks_for_time(t)
     print(f"  t={t:4.1f}s  {len(entries)} ranges, {scene.bytes_for_time(t) / 1024:.1f} KiB")

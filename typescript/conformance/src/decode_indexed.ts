@@ -39,7 +39,7 @@ export async function run(path: string): Promise<string> {
       chunks.push(chunk.gaussians);
       if (chunk.sh !== null) shParts.push(chunk.sh);
     }
-    const audio = await scene.readAudio();
+    const audioSources = await scene.readAudioSources();
     const camera = await scene.readCamera();
     const metadata = await scene.readMetadata();
     const attachments = await scene.readAttachments();
@@ -55,7 +55,7 @@ export async function run(path: string): Promise<string> {
           scene.header.shDegree,
           concatenateSh(shParts),
         ),
-        audio,
+        audioSources,
         chunkIntervals: scene.index.map((entry) => [entry.t0, entry.t1] as const),
         camera,
         metadata,

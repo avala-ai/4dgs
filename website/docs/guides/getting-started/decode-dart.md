@@ -70,9 +70,34 @@ property of the content, not of the container: gaussians with finite validity wi
 many small chunks, while content baked from a temporal field can leave the index with one entry
 spanning the whole timeline. Both are conforming files, and only one of them seeks cheaply.
 
-`readFourdgsAudio`, `readFourdgsCamera`, `readFourdgsMetadata` and `readFourdgsAttachments` fetch
-the front-matter records the same way, each by its own byte range, so opening a scene with a large
-embedded audio track costs nothing beyond the header until something asks for the track.
+Audio sources are independent and may move on the scene clock. Reading their small descriptors and
+reconstructing pose does not transfer encoded audio:
+
+```dart
+final sources = await readFourdgsAudioSourceDescriptors(file, scene);
+for (final source in sources) {
+  final audio = source.stateAt(2.5);
+  audio.active;
+  audio.localTime;
+  audio.position;
+  audio.rotation;
+}
+
+final packet = await readFourdgsAudioRange(
+  file,
+  scene,
+  sources.first.sourceId,
+  0,
+  4096,
+);
+```
+
+The decoder stops at source pose, gain and local playback time. Listener orientation, HRTF, distance
+attenuation, occlusion and mixing are renderer/player decisions. Use `readFourdgsAudioSources` when
+the complete payloads are wanted.
+
+`readFourdgsCamera`, `readFourdgsMetadata` and `readFourdgsAttachments` similarly fetch deferred
+front-matter records by their own byte ranges.
 
 ## Where decoding ends
 

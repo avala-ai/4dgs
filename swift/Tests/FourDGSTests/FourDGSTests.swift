@@ -78,6 +78,56 @@ final class TimeTests: XCTestCase {
         header.cutoff = 0.01
         XCTAssertEqual(header.lifetimeConstantK, 3.034854258770293, accuracy: 1e-12)
     }
+
+    func testMovingAudioUsesExactStepKeyframe() {
+        let source = AudioSource(
+            sourceId: 1, codec: "wav", durationSec: 2,
+            keyframes: [
+                .init(time: 0, position: [0, 0, 0], rotation: [0, 0, 0, 1]),
+                .init(time: 1, position: [1, 2, 3], rotation: [0, 1, 0, 1]),
+                .init(time: 2, position: [9, 9, 9], rotation: [0, 0, 0, 1]),
+            ], interpolation: "step")
+        let state = source.state(at: 1)
+        XCTAssertEqual(state.position, [1, 2, 3])
+        XCTAssertEqual(state.rotation[1], 1 / sqrt(2), accuracy: 1e-12)
+        XCTAssertEqual(state.rotation[3], 1 / sqrt(2), accuracy: 1e-12)
+    }
+
+    func testAudioNormalizationPreservesExtremeAndTinyFiniteDirections() {
+        var source = AudioSource(
+            sourceId: 1, codec: "wav", durationSec: 2,
+            rotation: [1e308, 1e308, 1e308, 1e308])
+        for component in source.state(at: 1).rotation {
+            XCTAssertEqual(component, 0.5, accuracy: 1e-12)
+        }
+        source.rotation = [Double.leastNonzeroMagnitude, 0, 0, 0]
+        XCTAssertEqual(source.state(at: 1).rotation, [1, 0, 0, 0])
+    }
+
+    func testLoopingAudioTimeDoesNotOverflow() {
+        let source = AudioSource(
+            sourceId: 1, codec: "wav", startSec: -1e308, durationSec: 1, loop: true)
+        let state = source.state(at: 1e308)
+        XCTAssertTrue(state.active)
+        XCTAssertEqual(state.localTime, 0)
+        XCTAssertTrue(state.localTime.isFinite)
+
+        let shortAtLargeTime = AudioSource(
+            sourceId: 2, codec: "wav", startSec: 1e308, durationSec: 1)
+        XCTAssertTrue(shortAtLargeTime.state(at: 1e308).active)
+    }
+
+    func testExtremeAudioPositionsInterpolateWithoutOverflow() {
+        let source = AudioSource(
+            sourceId: 1, codec: "wav", startSec: -1e308, durationSec: 1, loop: true,
+            keyframes: [
+                .init(time: -1e308, position: [-1e308, 0, 0], rotation: [0, 0, 0, 1]),
+                .init(time: 1e308, position: [1e308, 0, 0], rotation: [0, 0, 0, 1]),
+            ])
+        let state = source.state(at: 0)
+        XCTAssertEqual(state.position, [0, 0, 0])
+        XCTAssertTrue(state.position.allSatisfy { $0.isFinite })
+    }
 }
 
 final class LiveTests: XCTestCase {
@@ -275,7 +325,7 @@ final class ReaderTests: XCTestCase {
                 profile: "", library: "t", durationSec: 1, gaussianCount: 0, cutoff: 0.05,
                 temporalModel: "gaussian-birth", aabb: [0, 0, 0, 0, 0, 0], shDegree: 0, hasAudio: false,
                 hasCompressedChunks: false, attributes: [:]))
-        XCTAssertNil(scene.audio)
+        XCTAssertTrue(scene.audioSources.isEmpty)
         XCTAssertFalse(scene.header.hasAudio)
     }
 }

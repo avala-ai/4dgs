@@ -35,7 +35,7 @@ const ROOT = fileURLToPath(new URL("../../../", import.meta.url));
  * transport, so the ordering rule is worth holding on this path too and not only in Node.
  */
 const VARIANTS = [
-  "OneWindow-UseChunkIndex-UseCrc-WithAudio-WithCamera-WithMetadata",
+  "OneWindow-UseChunkIndex-UseCrc-WithCamera-WithMetadata-WithSpatialAudio",
   "MixedLifetimes-Quantized-SHDegree2-UseChunkIndex-UseChunks-UseCrc",
   "RepeatedPositions-SHDegree2-UseChunkIndex-UseChunks-UseCrc",
 ];

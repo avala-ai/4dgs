@@ -30,6 +30,29 @@ import 'serialization.dart';
 /// wrong parse.
 const int fourdgsHeadProbeBytes = 64 * 1024;
 
+/// The independently readable ranges belonging to one audio source.
+///
+/// [descriptorRange] is `null` only for a legacy Audio record. [dataOffset] and
+/// [dataLength] point directly at codec bytes, so a caller can fetch a slice
+/// without transferring record framing or another source.
+class FourdgsIndexedAudioSource {
+  const FourdgsIndexedAudioSource({
+    required this.sourceId,
+    required this.descriptorRange,
+    required this.dataOffset,
+    required this.dataLength,
+    this.legacyCodec,
+    this.legacyStartSec,
+  });
+
+  final int sourceId;
+  final ({int offset, int length})? descriptorRange;
+  final int dataOffset;
+  final int dataLength;
+  final String? legacyCodec;
+  final double? legacyStartSec;
+}
+
 /// A scene opened over byte ranges: everything needed to decide what to fetch,
 /// and nothing that had to be fetched to decide it.
 class FourdgsIndexedScene {
@@ -40,9 +63,7 @@ class FourdgsIndexedScene {
     required this.index,
     required this.headerBytes,
     required this.resourceBytes,
-    this.audioRange,
-    this.audioCodec,
-    this.audioStartSec = 0.0,
+    required this.audioSourceRanges,
     this.summaryCrcOk,
     this.cameraRange,
     this.metadataRanges = const <({int offset, int length})>[],
@@ -67,14 +88,26 @@ class FourdgsIndexedScene {
   /// hold it.
   final int resourceBytes;
 
-  /// Byte range of the whole Audio record, or `null` when the scene has none.
-  ///
-  /// A range, not the bytes: audio may be megabytes and a caller that only
-  /// wants to know whether a soundtrack exists must not pay for it.
-  final ({int offset, int length})? audioRange;
+  /// Descriptor and payload ranges for every independent source.
+  final List<FourdgsIndexedAudioSource> audioSourceRanges;
 
-  final String? audioCodec;
-  final double audioStartSec;
+  /// Compatibility view of the first encoded payload range.
+  ({int offset, int length})? get audioRange =>
+      audioSourceRanges.isEmpty
+          ? null
+          : (
+            offset: audioSourceRanges.first.dataOffset,
+            length: audioSourceRanges.first.dataLength,
+          );
+
+  /// Available without fetching a descriptor only for a legacy Audio record.
+  String? get audioCodec =>
+      audioSourceRanges.isEmpty ? null : audioSourceRanges.first.legacyCodec;
+
+  double get audioStartSec =>
+      audioSourceRanges.isEmpty
+          ? 0.0
+          : audioSourceRanges.first.legacyStartSec ?? 0.0;
 
   /// `true` / `false` when the Footer declared a CRC and it was checked,
   /// `null` when it declared none.
@@ -101,6 +134,9 @@ class FourdgsIndexedScene {
 
   /// Answered from the Header alone, per the format's audio-discovery rule.
   bool get hasAudio => header.hasAudio;
+
+  /// Learned from record prefixes without transferring encoded audio bytes.
+  int get audioSourceCount => audioSourceRanges.length;
 
   double get durationSec => header.durationSec;
 
@@ -167,11 +203,11 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
       'the file has gaussians but no Window Table',
     );
   }
-  if (front.header!.hasAudio && front.audioRange == null) {
-    // The header's audio bit is the whole discovery rule; a reader that trusts
-    // it and finds no record has been told something untrue about the file.
-    throw const FourdgsMalformedFile(
-      'the header declares audio but the file carries no Audio record',
+  final audioSourceRanges = _pairIndexedAudioSources(front);
+  if (front.header!.hasAudio != audioSourceRanges.isNotEmpty) {
+    throw FourdgsMalformedFile(
+      'the Header audio flag is ${front.header!.hasAudio ? 'set' : 'clear'}, '
+      'but the file contains ${audioSourceRanges.length} audio sources',
     );
   }
 
@@ -257,9 +293,7 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
     index: index,
     headerBytes: front.bytesRead,
     resourceBytes: size,
-    audioRange: front.audioRange,
-    audioCodec: front.audioCodec,
-    audioStartSec: front.audioStartSec,
+    audioSourceRanges: audioSourceRanges,
     summaryCrcOk: crcOk,
     cameraRange: front.cameraRange,
     metadataRanges: front.metadataRanges,
@@ -329,23 +363,200 @@ Future<FourdgsAudioTrack?> readFourdgsAudio(
   FourdgsReadable source,
   FourdgsIndexedScene scene,
 ) async {
-  final range = scene.audioRange;
-  if (range == null) return null;
-  // The audio span comes from the same attacker-controlled `u64` fields every
-  // other range does, and the front-matter scan records it and can stop as soon
-  // as it has enough — so nothing has checked it fits the file yet. Chunk and
-  // SH ranges have been guarded here since they were written; this one was
-  // reading straight through, which let a crafted container name a span past
-  // EOF or one large enough to be worth materializing. Same guard, same
-  // ceiling, so an embedded track cannot be the one range that skips it.
-  _checkRange(scene, range.offset, range.length, 'audio');
-  final blob = await source.read(range.offset, range.length);
-  final audio = FourdgsAudio.parse(_recordContent(blob, opAudio, 'audio'));
+  if (scene.audioSourceRanges.isEmpty) return null;
+  final audio = await _readAudioSource(
+    source,
+    scene,
+    scene.audioSourceRanges.first,
+  );
   return FourdgsAudioTrack(
     codec: audio.codec,
     data: audio.data,
     startSec: audio.startSec,
   );
+}
+
+/// Fetches every source descriptor and encoded payload.
+Future<List<FourdgsAudioSource>> readFourdgsAudioSources(
+  FourdgsReadable source,
+  FourdgsIndexedScene scene,
+) async {
+  final out = <FourdgsAudioSource>[];
+  for (final entry in scene.audioSourceRanges) {
+    out.add(await _readAudioSource(source, scene, entry));
+  }
+  return out;
+}
+
+/// Fetches small source descriptors without transferring encoded payloads.
+Future<List<FourdgsAudioSourceDescriptor>> readFourdgsAudioSourceDescriptors(
+  FourdgsReadable source,
+  FourdgsIndexedScene scene,
+) async {
+  final out = <FourdgsAudioSourceDescriptor>[];
+  for (final entry in scene.audioSourceRanges) {
+    out.add(await _readAudioSourceDescriptor(source, scene, entry));
+  }
+  return out;
+}
+
+/// Reconstructs one source at scene time [t] without transferring its payload.
+Future<FourdgsAudioSourceState> readFourdgsAudioSourceState(
+  FourdgsReadable source,
+  FourdgsIndexedScene scene,
+  int sourceId,
+  double t,
+) async {
+  final entry = _audioEntry(scene, sourceId);
+  return (await _readAudioSourceDescriptor(source, scene, entry)).stateAt(t);
+}
+
+/// Validates the small descriptor, then reads one source-relative payload range.
+Future<Uint8List> readFourdgsAudioRange(
+  FourdgsReadable source,
+  FourdgsIndexedScene scene,
+  int sourceId,
+  int offset,
+  int length,
+) async {
+  final entry = _audioEntry(scene, sourceId);
+  await _readAudioSourceDescriptor(source, scene, entry);
+  if (offset < 0 || length < 0 || offset + length > entry.dataLength) {
+    throw FourdgsMalformedFile(
+      'audio source $sourceId range [$offset, ${offset + length}) is outside '
+      'its ${entry.dataLength}-byte payload',
+    );
+  }
+  _checkRange(
+    scene,
+    entry.dataOffset + offset,
+    length,
+    'audio source $sourceId payload',
+  );
+  return source.read(entry.dataOffset + offset, length);
+}
+
+FourdgsIndexedAudioSource _audioEntry(FourdgsIndexedScene scene, int sourceId) {
+  for (final entry in scene.audioSourceRanges) {
+    if (entry.sourceId == sourceId) return entry;
+  }
+  throw FourdgsMalformedFile('this scene has no audio source id $sourceId');
+}
+
+Future<FourdgsAudioSource> _readAudioSource(
+  FourdgsReadable source,
+  FourdgsIndexedScene scene,
+  FourdgsIndexedAudioSource entry,
+) async {
+  final descriptor = await _readAudioSourceDescriptor(source, scene, entry);
+  _checkRange(
+    scene,
+    entry.dataOffset,
+    entry.dataLength,
+    'audio source ${entry.sourceId} payload',
+  );
+  final data = await source.read(entry.dataOffset, entry.dataLength);
+  return FourdgsAudioSource(
+    sourceId: descriptor.sourceId,
+    name: descriptor.name,
+    codec: descriptor.codec,
+    channelLayout: descriptor.channelLayout,
+    dataLength: descriptor.dataLength,
+    startSec: descriptor.startSec,
+    durationSec: descriptor.durationSec,
+    gain: descriptor.gain,
+    spatial: descriptor.spatial,
+    loop: descriptor.loop,
+    position: descriptor.position,
+    rotation: descriptor.rotation,
+    keyframes: descriptor.keyframes,
+    interpolation: descriptor.interpolation,
+    data: data,
+  );
+}
+
+Future<FourdgsAudioSourceDescriptor> _readAudioSourceDescriptor(
+  FourdgsReadable source,
+  FourdgsIndexedScene scene,
+  FourdgsIndexedAudioSource entry,
+) async {
+  final range = entry.descriptorRange;
+  if (range == null) {
+    final startSec = entry.legacyStartSec ?? 0.0;
+    return FourdgsAudioSourceDescriptor(
+      sourceId: entry.sourceId,
+      name: '',
+      codec: entry.legacyCodec ?? '',
+      channelLayout: '',
+      dataLength: entry.dataLength,
+      startSec: startSec,
+      durationSec: math.max(0.0, scene.header.durationSec - startSec),
+      gain: 1.0,
+      spatial: false,
+      loop: false,
+      position: const <double>[0.0, 0.0, 0.0],
+      rotation: const <double>[0.0, 0.0, 0.0, 1.0],
+      keyframes: const <FourdgsAudioSourceKeyframe>[],
+      interpolation: 'linear',
+    );
+  }
+
+  _checkRange(scene, range.offset, range.length, 'Audio Source descriptor');
+  final blob = await source.read(range.offset, range.length);
+  final parsed = FourdgsAudioSourceRecord.parse(
+    _recordContent(blob, opAudioSource, 'Audio Source descriptor'),
+  );
+  if (parsed.sourceId != entry.sourceId) {
+    throw FourdgsMalformedFile(
+      'Audio Source range for id ${entry.sourceId} contains id '
+      '${parsed.sourceId}',
+    );
+  }
+  if (parsed.dataLength != entry.dataLength) {
+    throw FourdgsMalformedFile(
+      'Audio Source id ${entry.sourceId} declares ${parsed.dataLength} bytes, '
+      'its Audio Data record declares ${entry.dataLength}',
+    );
+  }
+  _checkIndexedAudioKeyframeTimes(parsed, scene.header.durationSec);
+  return FourdgsAudioSourceDescriptor(
+    sourceId: parsed.sourceId,
+    name: parsed.name,
+    codec: parsed.codec,
+    channelLayout: parsed.channelLayout,
+    dataLength: parsed.dataLength,
+    startSec: parsed.startSec,
+    durationSec: parsed.durationSec,
+    gain: parsed.gain,
+    spatial: parsed.spatial,
+    loop: parsed.loop,
+    position: parsed.position,
+    rotation: parsed.rotation,
+    keyframes: <FourdgsAudioSourceKeyframe>[
+      for (final keyframe in parsed.keyframes)
+        FourdgsAudioSourceKeyframe(
+          time: keyframe.time,
+          position: keyframe.position,
+          rotation: keyframe.rotation,
+        ),
+    ],
+    interpolation: parsed.interpolation,
+  );
+}
+
+void _checkIndexedAudioKeyframeTimes(
+  FourdgsAudioSourceRecord source,
+  double sceneDuration,
+) {
+  for (int i = 0; i < source.keyframes.length; i++) {
+    final time = source.keyframes[i].time;
+    if (time < 0.0 || time > sceneDuration) {
+      throw FourdgsMalformedFile(
+        'Audio Source id ${source.sourceId} keyframe $i time $time is outside '
+        '[0, $sceneDuration]',
+      );
+    }
+  }
 }
 
 /// The suggested camera trajectory, fetched only when a caller wants it.
@@ -420,12 +631,13 @@ void _checkRange(
 ) {
   if (offset < 0 || length < 0 || offset + length > scene.resourceBytes) {
     throw FourdgsMalformedFile(
-      'the index puts the $what at [$offset, ${offset + length}) of a ${scene.resourceBytes} byte file',
+      'the $what range is [$offset, ${offset + length}) of a '
+      '${scene.resourceBytes} byte file',
     );
   }
   if (length > maxFrontMatterBytes) {
     throw FourdgsMalformedFile(
-      'the index gives the $what $length bytes, past the $maxFrontMatterBytes ceiling',
+      'the $what range is $length bytes, past the $maxFrontMatterBytes ceiling',
     );
   }
 }
@@ -477,9 +689,11 @@ class _FrontMatter {
   FourdgsHeader? header;
   FourdgsQuantization? quantization;
   List<FourdgsWindow> windows = const <FourdgsWindow>[];
-  ({int offset, int length})? audioRange;
-  String? audioCodec;
-  double audioStartSec = 0.0;
+  FourdgsIndexedAudioSource? legacyAudio;
+  final Map<int, ({int offset, int length})> audioSourceRanges =
+      <int, ({int offset, int length})>{};
+  final Map<int, ({int offset, int length})> audioDataRanges =
+      <int, ({int offset, int length})>{};
   ({int offset, int length})? cameraRange;
   final List<({int offset, int length})> metadataRanges =
       <({int offset, int length})>[];
@@ -500,10 +714,8 @@ class _FrontMatter {
 /// records larger than the probe before it, and each costs a round.
 const int _maxFrontMatterReads = 256;
 
-/// Enough of an Audio record to hold its codec name and start time, when those
-/// fell outside the probe. The registry's names are `wav` and `opus`; this
-/// leaves room for a private one without ever pulling in the track.
-const int _audioPrefixBytes = 512;
+/// Enough of a legacy Audio record to hold its descriptor without its payload.
+const int _legacyAudioPrefixBytes = 512;
 
 /// The most this reader will transfer in one go for a header record or for the
 /// whole summary block.
@@ -547,6 +759,12 @@ Future<_FrontMatter> _readFrontMatter(
   checkMagic(buf);
   int start = fourdgsMagic.length;
 
+  // The scan terminates properly only when it reaches the first Chunk or the end of the
+  // file. If the round cap is hit first — a file with more oversized-payload records than
+  // the cap allows, since the format sets no source-count limit — the front matter is
+  // incomplete, and returning it would frame a partial scene the Header still agrees with.
+  // The reader refuses at its stated limit rather than accept that. See `_maxFrontMatterReads`.
+  bool complete = false;
   for (int round = 0; round < _maxFrontMatterReads; round++) {
     FourdgsRecordSpan? unread;
     bool sawChunk = false;
@@ -583,43 +801,40 @@ Future<_FrontMatter> _readFrontMatter(
       scanned = span.end;
     }
 
-    if (sawChunk) break;
+    if (sawChunk) {
+      complete = true;
+      break;
+    }
     if (unread == null) {
-      // The buffer ran out cleanly. Either the file ended or the probe did.
-      if (scanned >= size) break;
+      // Every record in the buffer was parsed whole. If what remains is smaller than a
+      // record header it is the trailing magic — the scan has reached the end of the front
+      // matter of a scene with no Chunk (an empty scene has none), which is a proper
+      // termination, not the round cap running out mid-file. Otherwise more records remain
+      // than this probe held, so read on.
+      if (size - scanned < recordHeaderBytes) {
+        complete = true;
+        break;
+      }
       at = start = scanned;
       buf = await source.read(at, math.min(probeBytes, size - at));
       out.bytesRead += buf.length;
       continue;
     }
 
-    if (unread.opcode == opAudio) {
-      // Its range is all a caller needs; the payload stays where it is.
+    if (_usesPrefix(unread.opcode)) {
+      // Pairing audio records needs only their ids and declared lengths.
+      // Fetch a bounded prefix even when the encoded payload is gigabytes.
+      final want = math.min(_prefixBytes(unread.opcode), unread.framedLength);
+      final prefix = await source.read(unread.offset, want);
+      out.bytesRead += prefix.length;
       _applyFrontRecord(
         out,
         unread,
         Uint8List.sublistView(
-          buf,
-          math.min(unread.contentOffset - at, buf.length),
+          prefix,
+          math.min(recordHeaderBytes, prefix.length),
         ),
       );
-      if (out.audioCodec == null) {
-        // The record began within a few bytes of the buffer's end, so its codec
-        // and start time were not in it. Fetch just that prefix rather than
-        // leave them out: what a reader reports about a file must not depend on
-        // where its probe happened to stop.
-        final want = math.min(_audioPrefixBytes, unread.framedLength);
-        final prefix = await source.read(unread.offset, want);
-        out.bytesRead += prefix.length;
-        _applyFrontRecord(
-          out,
-          unread,
-          Uint8List.sublistView(
-            prefix,
-            math.min(recordHeaderBytes, prefix.length),
-          ),
-        );
-      }
     } else if (!_wantsContent(unread.opcode)) {
       // Camera, Metadata, Attachment: the range is the whole answer here too, so
       // a record larger than the probe is framed and stepped over rather than
@@ -648,10 +863,24 @@ Future<_FrontMatter> _readFrontMatter(
       );
     }
 
-    if (unread.end >= size) break;
+    if (unread.end > size) {
+      throw const FourdgsTruncatedFile(
+        'a header record runs past the end of the file',
+      );
+    }
+    if (unread.end == size) {
+      complete = true;
+      break;
+    }
     at = start = unread.end;
     buf = await source.read(at, math.min(probeBytes, size - at));
     out.bytesRead += buf.length;
+  }
+  if (!complete) {
+    throw FourdgsMalformedFile(
+      'the front matter needs more than $_maxFrontMatterReads reads to reach the first '
+      'Chunk or the end of the file',
+    );
   }
   return out;
 }
@@ -661,11 +890,27 @@ Future<_FrontMatter> _readFrontMatter(
 bool _wantsContent(int opcode) =>
     opcode == opHeader || opcode == opQuantization || opcode == opWindowTable;
 
+bool _usesPrefix(int opcode) =>
+    opcode == opAudio || opcode == opAudioSource || opcode == opAudioData;
+
+int _prefixBytes(int opcode) {
+  switch (opcode) {
+    case opAudio:
+      return recordHeaderBytes + _legacyAudioPrefixBytes;
+    case opAudioSource:
+      return recordHeaderBytes + 4;
+    case opAudioData:
+      return recordHeaderBytes + 12;
+    default:
+      return recordHeaderBytes;
+  }
+}
+
 /// Applies one front-matter record.
 ///
-/// [content] is a prefix for Audio, whose interesting fields are at the front
-/// and whose payload is deliberately not transferred here, and empty for the
-/// records this reader only records the range of.
+/// [content] is a prefix for audio records, whose pairing fields are at the
+/// front and whose payload is deliberately not transferred here, and empty for
+/// records this reader only records by range.
 void _applyFrontRecord(
   _FrontMatter out,
   FourdgsRecordSpan span,
@@ -679,21 +924,59 @@ void _applyFrontRecord(
     case opWindowTable:
       out.windows = FourdgsWindowTable.parse(content).windows;
     case opAudio:
-      out.audioRange = (offset: span.offset, length: span.framedLength);
-      try {
-        final prefix = FourdgsCursor(content);
-        // Both fields into locals first. Committing the codec before the start
-        // time succeeds would leave the caller thinking the prefix was read,
-        // skipping its refetch, and reporting a start of zero for a track that
-        // does not begin at zero — which plays the whole scene out of sync.
-        final codec = prefix.string();
-        final startSec = prefix.f64();
-        out.audioCodec = codec;
-        out.audioStartSec = startSec;
-      } on FourdgsTruncatedFile {
-        // Not enough of the record is here. The range is already correct; the
-        // caller fetches the prefix and tries again.
+      if (out.legacyAudio != null) {
+        throw const FourdgsMalformedFile(
+          'the file carries more than one legacy Audio record',
+        );
       }
+      final prefix = FourdgsCursor(content);
+      final codec = prefix.string();
+      final startSec = prefix.f64();
+      final dataLength = prefix.u64();
+      if (span.contentLength < prefix.pos + dataLength) {
+        throw FourdgsMalformedFile(
+          'the legacy Audio record declares $dataLength data bytes, but its '
+          'content is only ${span.contentLength} bytes',
+        );
+      }
+      out.legacyAudio = FourdgsIndexedAudioSource(
+        sourceId: 0,
+        descriptorRange: null,
+        dataOffset: span.contentOffset + prefix.pos,
+        dataLength: dataLength,
+        legacyCodec: codec,
+        legacyStartSec: startSec,
+      );
+    case opAudioSource:
+      final sourceId = FourdgsCursor(content).u32();
+      if (out.audioSourceRanges.containsKey(sourceId)) {
+        throw FourdgsMalformedFile(
+          'Audio Source id $sourceId appears more than once',
+        );
+      }
+      out.audioSourceRanges[sourceId] = (
+        offset: span.offset,
+        length: span.framedLength,
+      );
+    case opAudioData:
+      final prefix = FourdgsCursor(content);
+      final sourceId = prefix.u32();
+      final dataLength = prefix.u64();
+      if (span.contentLength < prefix.pos + dataLength) {
+        throw FourdgsMalformedFile(
+          'Audio Data id $sourceId declares $dataLength bytes, but its record '
+          'content is only ${span.contentLength} bytes',
+        );
+      }
+      if (out.audioDataRanges.containsKey(sourceId)) {
+        throw FourdgsMalformedFile(
+          'Audio Data id $sourceId appears more than once',
+        );
+      }
+      out.audioDataRanges[sourceId] = (
+        offset: span.contentOffset + prefix.pos,
+        length: dataLength,
+      );
     case opCamera:
       out.cameraRange = (offset: span.offset, length: span.framedLength);
     case opMetadata:
@@ -706,6 +989,51 @@ void _applyFrontRecord(
     default:
       break;
   }
+}
+
+List<FourdgsIndexedAudioSource> _pairIndexedAudioSources(_FrontMatter front) {
+  if (front.legacyAudio != null && front.audioSourceRanges.isNotEmpty) {
+    throw const FourdgsMalformedFile(
+      'the file mixes a legacy Audio record with Audio Source records',
+    );
+  }
+  if (front.legacyAudio != null) {
+    if (front.audioDataRanges.isNotEmpty) {
+      final sourceId = front.audioDataRanges.keys.reduce(
+        (a, b) => a < b ? a : b,
+      );
+      throw FourdgsMalformedFile(
+        'Audio Data id $sourceId has no matching Audio Source record',
+      );
+    }
+    return <FourdgsIndexedAudioSource>[front.legacyAudio!];
+  }
+
+  final out = <FourdgsIndexedAudioSource>[];
+  final ids = front.audioSourceRanges.keys.toList()..sort();
+  for (final sourceId in ids) {
+    final data = front.audioDataRanges.remove(sourceId);
+    if (data == null) {
+      throw FourdgsMalformedFile(
+        'Audio Source id $sourceId has no matching Audio Data record',
+      );
+    }
+    out.add(
+      FourdgsIndexedAudioSource(
+        sourceId: sourceId,
+        descriptorRange: front.audioSourceRanges[sourceId],
+        dataOffset: data.offset,
+        dataLength: data.length,
+      ),
+    );
+  }
+  if (front.audioDataRanges.isNotEmpty) {
+    final sourceId = front.audioDataRanges.keys.reduce((a, b) => a < b ? a : b);
+    throw FourdgsMalformedFile(
+      'Audio Data id $sourceId has no matching Audio Source record',
+    );
+  }
+  return out;
 }
 
 /// The most chunk-index entries one scene may declare.

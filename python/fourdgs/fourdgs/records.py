@@ -16,7 +16,7 @@ import operator
 from dataclasses import dataclass, field
 
 from . import opcode as op
-from .exceptions import MalformedFile
+from .exceptions import MalformedFile, TruncatedFile
 from .serialization import (
     Cursor,
     put_blob,
@@ -35,6 +35,8 @@ from .serialization import (
 FLAG_HAS_AUDIO = 1 << 0
 FLAG_CHUNKS_COMPRESSED = 1 << 1
 _F32_MAX = float.fromhex("0x1.fffffep+127")
+AUDIO_SOURCE_SPATIAL = 1 << 0
+AUDIO_SOURCE_LOOP = 1 << 1
 
 
 @dataclass
@@ -55,7 +57,7 @@ class Header:
         """Answered from the header alone — no probing, no speculative range request.
 
         This is the whole audio-discovery rule, and it is why a scene without a
-        soundtrack costs nothing: the bit is clear and there is no record.
+        audio costs nothing: the bit is clear and there is no record.
         """
         return bool(self.flags & FLAG_HAS_AUDIO)
 
@@ -438,6 +440,8 @@ class ChunkIndexEntry:
 
 @dataclass
 class Audio:
+    """The legacy single-track record (opcode 0x09), read for compatibility only."""
+
     codec: str
     data: bytes
     start_sec: float = 0.0
@@ -449,6 +453,142 @@ class Audio:
     def parse(content) -> Audio:
         c = Cursor(content)
         return Audio(codec=c.string(), start_sec=c.f64(), data=c.blob())
+
+
+@dataclass
+class AudioSourceKeyframe:
+    time: float
+    position: list[float]
+    rotation: list[float]
+
+
+@dataclass
+class AudioSource:
+    """A small spatial descriptor; its encoded bytes live in a paired Audio Data record."""
+
+    source_id: int
+    name: str
+    codec: str
+    channel_layout: str
+    data_length: int
+    start_sec: float
+    duration_sec: float
+    gain: float
+    flags: int
+    position: list[float]
+    rotation: list[float]
+    keyframes: list[AudioSourceKeyframe] = field(default_factory=list)
+    interpolation: str = "linear"
+
+    @property
+    def spatial(self) -> bool:
+        return bool(self.flags & AUDIO_SOURCE_SPATIAL)
+
+    @property
+    def loop(self) -> bool:
+        return bool(self.flags & AUDIO_SOURCE_LOOP)
+
+    def encode(self) -> bytes:
+        body = (
+            put_u32(self.source_id)
+            + put_string(self.name)
+            + put_string(self.codec)
+            + put_string(self.channel_layout)
+            + put_u64(self.data_length)
+            + put_f64(self.start_sec)
+            + put_f64(self.duration_sec)
+            + put_f64(self.gain)
+            + put_u8(self.flags)
+            + put_f64s(self.position)
+            + put_f64s(self.rotation)
+            + put_u32(len(self.keyframes))
+        )
+        for keyframe in self.keyframes:
+            body += put_f64(keyframe.time) + put_f64s(keyframe.position) + put_f64s(keyframe.rotation)
+        return put_record(op.AUDIO_SOURCE, body + put_string(self.interpolation))
+
+    @staticmethod
+    def parse(content) -> AudioSource:
+        c = Cursor(content)
+        source = AudioSource(
+            source_id=c.u32(),
+            name=c.string(),
+            codec=c.string(),
+            channel_layout=c.string(),
+            data_length=c.u64(),
+            start_sec=c.f64(),
+            duration_sec=c.f64(),
+            gain=c.f64(),
+            flags=c.u8(),
+            position=c.f64s(3),
+            rotation=c.f64s(4),
+        )
+        count = c.u32()
+        needed = count * 64
+        if needed > c.remaining():
+            raise TruncatedFile(
+                f"Audio Source {source.source_id} declares {count} keyframes needing "
+                f"{needed} bytes, {c.remaining()} remain"
+            )
+        source.keyframes = [
+            AudioSourceKeyframe(time=c.f64(), position=c.f64s(3), rotation=c.f64s(4)) for _ in range(count)
+        ]
+        source.interpolation = c.string()
+        _validate_audio_source(source)
+        return source
+
+
+def _validate_audio_source(source: AudioSource) -> None:
+    allowed_flags = AUDIO_SOURCE_SPATIAL | AUDIO_SOURCE_LOOP
+    if source.flags & ~allowed_flags:
+        raise MalformedFile(f"Audio Source {source.source_id} has reserved flag bits set")
+    if not source.codec:
+        raise MalformedFile(f"Audio Source {source.source_id} has an empty codec")
+    if not math.isfinite(source.start_sec):
+        raise MalformedFile(f"Audio Source {source.source_id} start_sec is not finite")
+    if not math.isfinite(source.duration_sec) or source.duration_sec <= 0:
+        raise MalformedFile(f"Audio Source {source.source_id} duration_sec must be finite and positive")
+    if not math.isfinite(source.gain) or source.gain < 0:
+        raise MalformedFile(f"Audio Source {source.source_id} gain must be finite and non-negative")
+    if source.spatial and source.channel_layout != "mono":
+        raise MalformedFile(f'spatial Audio Source {source.source_id} must use channel layout "mono"')
+    if not all(math.isfinite(value) for value in source.position):
+        raise MalformedFile(f"Audio Source {source.source_id} position must contain three finite values")
+    if not all(math.isfinite(value) for value in source.rotation) or not any(source.rotation):
+        raise MalformedFile(f"Audio Source {source.source_id} rotation must be a finite non-zero quaternion")
+    last_time = -math.inf
+    for index, keyframe in enumerate(source.keyframes):
+        if not math.isfinite(keyframe.time) or keyframe.time <= last_time:
+            raise MalformedFile(
+                f"Audio Source {source.source_id} keyframe {index} time must be finite and strictly increasing"
+            )
+        if not all(math.isfinite(value) for value in keyframe.position):
+            raise MalformedFile(
+                f"Audio Source {source.source_id} keyframe {index} position must contain three finite values"
+            )
+        if not all(math.isfinite(value) for value in keyframe.rotation) or not any(keyframe.rotation):
+            raise MalformedFile(
+                f"Audio Source {source.source_id} keyframe {index} rotation must be a finite non-zero quaternion"
+            )
+        last_time = keyframe.time
+    if source.interpolation not in {"linear", "step"}:
+        raise MalformedFile(f"Audio Source {source.source_id} uses unknown interpolation {source.interpolation!r}")
+
+
+@dataclass
+class AudioData:
+    """One encoded payload, identified without decoding the codec container."""
+
+    source_id: int
+    data: bytes
+
+    def encode(self) -> bytes:
+        return put_record(op.AUDIO_DATA, put_u32(self.source_id) + put_blob(self.data))
+
+    @staticmethod
+    def parse(content) -> AudioData:
+        c = Cursor(content)
+        return AudioData(source_id=c.u32(), data=c.blob())
 
 
 @dataclass

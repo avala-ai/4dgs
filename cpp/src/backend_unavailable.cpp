@@ -54,6 +54,14 @@ std::uint64_t bytesForChunk(const Handle&, std::uint32_t, int) { return 0; }
 Result<void> loadChunk(Handle&, std::uint32_t, int) { return notImplemented(); }
 
 bool hasAudio(const Handle&) { return false; }
+std::uint32_t audioSourceCount(const Handle&) { return 0; }
+Result<AudioSource> audioSource(Handle&, std::uint32_t) { return notImplemented(); }
+Result<AudioSourceState> audioSourceStateAt(Handle&, std::uint32_t, double) {
+  return notImplemented();
+}
+Result<void> readAudioSource(Handle&, std::uint32_t, std::uint64_t, Span<std::uint8_t>) {
+  return notImplemented();
+}
 std::string audioCodec(Handle&) { return std::string(); }
 std::uint64_t audioSize(const Handle&) { return 0; }
 Result<void> readAudio(Handle&, std::uint64_t, Span<std::uint8_t>) { return notImplemented(); }

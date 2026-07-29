@@ -120,7 +120,7 @@ void floatsAreRoundedToSixDecimals() {
 
 void absentAudioIsAValue() {
   const std::string json = summarize(scene(4, 5));
-  CHECK(json.find("\"audio\": null") != std::string::npos);
+  CHECK(json.find("\"audioSources\": []") != std::string::npos);
   // Both paths visible in every implementation's output, rather than one being invisible.
   CHECK(json.find("\"hasAudio\": false") != std::string::npos);
 }

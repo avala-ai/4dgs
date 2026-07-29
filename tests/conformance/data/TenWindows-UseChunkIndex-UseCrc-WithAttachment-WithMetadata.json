@@ -17,7 +17,7 @@
       "name": "note.txt"
     }
   ],
-  "audio": null,
+  "audioSources": [],
   "camera": null,
   "chunkIntervals": [
     [

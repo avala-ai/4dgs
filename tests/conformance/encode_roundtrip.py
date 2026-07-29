@@ -94,7 +94,7 @@ def decode_canonical(path: str) -> str:
         summarize(
             scene.header,
             scene.gaussians,
-            scene.audio,
+            scene.audio_sources,
             [(e.t0, e.t1) for e in scene.chunk_index],
             camera=scene.camera,
             metadata=scene.metadata,

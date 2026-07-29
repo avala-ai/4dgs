@@ -4,7 +4,7 @@
 /// CRC-32 (IEEE), the same one `zlib.crc32` computes.
 ///
 /// Used where a summary has to prove it read the bytes and not merely their length: an
-/// attachment, an audio track, and the spherical-harmonic coefficients — all of which a
+/// attachment, audio source payloads, and the spherical-harmonic coefficients — all of which a
 /// decoder could throw away and still match a summary that only counted them.
 public enum CRC32 {
     private static let table: [UInt32] = {

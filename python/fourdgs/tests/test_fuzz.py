@@ -32,7 +32,17 @@ import time
 import fourdgs
 import pytest
 from fourdgs.exceptions import FourdgsError
-from fourdgs.indexed_reader import open_indexed, read_attachments, read_audio, read_camera, read_chunk, read_metadata
+from fourdgs.indexed_reader import (
+    open_indexed,
+    read_attachments,
+    read_audio,
+    read_audio_range,
+    read_audio_source_descriptors,
+    read_audio_source_state,
+    read_camera,
+    read_chunk,
+    read_metadata,
+)
 from fourdgs.readable import BytesReadable
 from fourdgs.serialization import MAGIC
 
@@ -193,6 +203,10 @@ def decode_every_way(data: bytes) -> None:
     for entry in indexed.index:
         read_chunk(source, indexed, entry, max_sh_band=3)
     read_audio(source, indexed)
+    descriptors = read_audio_source_descriptors(source, indexed)
+    for descriptor in descriptors:
+        read_audio_source_state(source, indexed, descriptor.source_id, 0.5)
+        read_audio_range(source, indexed, descriptor.source_id, 0, min(descriptor.data_size or 0, 16))
     read_camera(source, indexed)
     read_metadata(source, indexed)
     read_attachments(source, indexed)

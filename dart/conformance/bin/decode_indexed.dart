@@ -37,7 +37,7 @@ Future<String> run(String path) async {
         await readFourdgsChunk(source, scene, entry, maxShBand: allBands),
       );
     }
-    final audio = await readFourdgsAudio(source, scene);
+    final audioSources = await readFourdgsAudioSources(source, scene);
     final camera = await readFourdgsCamera(source, scene);
     final metadata = await readFourdgsMetadata(source, scene);
     final attachments = await readFourdgsAttachments(source, scene);
@@ -56,7 +56,7 @@ Future<String> run(String path) async {
       summarize(
         header: scene.header,
         gaussians: assembleGaussians(chunks, scene.header.shDegree, sh: sh),
-        audio: audio,
+        audioSources: audioSources,
         chunkIntervals: <(double, double)>[
           for (final e in scene.index) (e.t0, e.t1),
         ],

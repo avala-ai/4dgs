@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use fourdgs::model::{AudioTrack, GaussianSet};
+use fourdgs::model::{AudioSource, AudioSourceKeyframe, AudioTrack, GaussianSet};
 use fourdgs::quantization::Profile;
 use fourdgs::writer::{SceneExtras, WriteOptions};
 
@@ -200,15 +200,376 @@ fn a_scene_without_audio_carries_no_audio_record() {
     let quiet = fourdgs::read_bytes(&silent).expect("decode");
     assert!(!quiet.header.has_audio());
     assert!(
-        quiet.audio.is_none(),
-        "absence is None, never an empty track"
+        quiet.audio_sources.is_empty(),
+        "absence is an empty source list, never a silent placeholder"
     );
 
     let loud = fourdgs::read_bytes(&with_audio).expect("decode");
     assert!(loud.header.has_audio());
-    let track = loud.audio.expect("a track");
+    let track = loud.audio_sources.first().expect("a source");
     assert_eq!(track.codec, "wav");
     assert_eq!(track.data.len(), 2048);
+}
+
+#[test]
+fn multiple_fixed_and_moving_audio_sources_round_trip() {
+    let (g, duration) = scene(32);
+    let moving = AudioSource {
+        source_id: 42,
+        name: "moving microphone".into(),
+        codec: "wav".into(),
+        duration_sec: 2.0,
+        gain: 0.5,
+        loop_: true,
+        keyframes: vec![
+            AudioSourceKeyframe {
+                time: 0.0,
+                position: [2.0, 0.5, 1.0],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+            },
+            AudioSourceKeyframe {
+                time: duration,
+                position: [-2.0, 1.5, -1.0],
+                rotation: [0.0, 1.0, 0.0, 0.0],
+            },
+        ],
+        data: vec![0x5A; 4096],
+        ..AudioSource::default()
+    };
+    let extras = SceneExtras {
+        audio_sources: vec![
+            AudioSource {
+                source_id: 7,
+                name: "fixed speaker".into(),
+                codec: "opus".into(),
+                duration_sec: duration,
+                position: [1.5, 0.75, -0.5],
+                data: vec![0x33; 2048],
+                ..AudioSource::default()
+            },
+            moving,
+        ],
+        ..SceneExtras::default()
+    };
+    let bytes = fourdgs::write_to_vec(&g, duration, &chunking_options(), &extras).expect("encode");
+    let decoded = fourdgs::read_bytes(&bytes).expect("decode");
+    assert_eq!(decoded.audio_sources.len(), 2);
+    assert_eq!(decoded.audio_sources[0].source_id, 7);
+    assert_eq!(decoded.audio_sources[1].source_id, 42);
+    let state = decoded.audio_sources[1].state_at(duration / 2.0);
+    assert_eq!(state.position, [0.0, 1.0, 0.0]);
+    assert!((state.rotation[1] - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-12);
+    assert!((state.rotation[3] - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-12);
+
+    let step = AudioSource {
+        duration_sec: duration,
+        interpolation: "step".into(),
+        keyframes: vec![
+            AudioSourceKeyframe {
+                time: 0.0,
+                position: [0.0; 3],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+            },
+            AudioSourceKeyframe {
+                time: 1.0,
+                position: [1.0, 2.0, 3.0],
+                rotation: [0.0, 1.0, 0.0, 1.0],
+            },
+            AudioSourceKeyframe {
+                time: duration,
+                position: [9.0; 3],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+            },
+        ],
+        ..AudioSource::default()
+    };
+    let exact = step.state_at(1.0);
+    assert_eq!(exact.position, [1.0, 2.0, 3.0]);
+    assert!((exact.rotation[1] - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-12);
+    assert!((exact.rotation[3] - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-12);
+}
+
+#[test]
+fn an_extreme_but_finite_audio_orientation_normalizes_without_overflow() {
+    // Normalize the direction without ever constructing a magnitude that can overflow or
+    // underflow. Both vectors are finite, non-zero orientations.
+    let mut source = AudioSource {
+        source_id: 1,
+        codec: "wav".into(),
+        duration_sec: 2.0,
+        rotation: [1e308; 4],
+        data: vec![0x00; 4],
+        ..AudioSource::default()
+    };
+    let state = source.state_at(1.0);
+    assert!(state
+        .rotation
+        .iter()
+        .all(|value| (*value - 0.5).abs() < 1e-12));
+    source.rotation = [f64::from_bits(1), 0.0, 0.0, 0.0];
+    assert_eq!(source.state_at(1.0).rotation, [1.0, 0.0, 0.0, 0.0]);
+}
+
+#[test]
+fn looping_audio_time_does_not_overflow() {
+    let source = AudioSource {
+        start_sec: -1e308,
+        duration_sec: 1.0,
+        loop_: true,
+        ..AudioSource::default()
+    };
+    let state = source.state_at(1e308);
+    assert!(state.active);
+    assert_eq!(state.local_time, 0.0);
+    assert!(state.local_time.is_finite());
+
+    let short_at_large_time = AudioSource {
+        start_sec: 1e308,
+        duration_sec: 1.0,
+        ..AudioSource::default()
+    };
+    assert!(short_at_large_time.state_at(1e308).active);
+}
+
+#[test]
+fn extreme_audio_positions_interpolate_without_overflow() {
+    let source = AudioSource {
+        start_sec: -1e308,
+        duration_sec: 1.0,
+        loop_: true,
+        keyframes: vec![
+            AudioSourceKeyframe {
+                time: -1e308,
+                position: [-1e308, 0.0, 0.0],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+            },
+            AudioSourceKeyframe {
+                time: 1e308,
+                position: [1e308, 0.0, 0.0],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+            },
+        ],
+        ..AudioSource::default()
+    };
+    let state = source.state_at(0.0);
+    assert_eq!(state.position, [0.0, 0.0, 0.0]);
+    assert!(state.position.iter().all(|value| value.is_finite()));
+}
+
+#[test]
+fn truncation_does_not_excuse_audio_when_the_header_flag_is_clear() {
+    use fourdgs::serialization::{read_record, Cursor, Records, RECORD_HEADER_SIZE};
+
+    let (g, duration) = scene(32);
+    let extras = SceneExtras {
+        audio_sources: vec![AudioSource {
+            source_id: 1,
+            codec: "wav".into(),
+            duration_sec: duration,
+            data: b"RIFF".to_vec(),
+            ..AudioSource::default()
+        }],
+        ..SceneExtras::default()
+    };
+    let mut bytes =
+        fourdgs::write_to_vec(&g, duration, &chunking_options(), &extras).expect("encode");
+    let mut records = Cursor::at(&bytes, fourdgs::MAGIC.len());
+    let header = read_record(&mut records).expect("Header");
+    assert_eq!(header.opcode, fourdgs::opcode::HEADER);
+    let header_offset = header.offset;
+    let mut content = Cursor::new(header.content);
+    content.string().unwrap();
+    content.string().unwrap();
+    content.take(8 + 8 + 8).unwrap();
+    content.string().unwrap();
+    content.take(6 * 8).unwrap();
+    content.u8().unwrap();
+    let flags = header_offset + RECORD_HEADER_SIZE + content.position();
+    bytes[flags] &= !fourdgs::records::FLAG_HAS_AUDIO;
+    let (descriptor_offset, payload_offset) = {
+        let mut descriptor_offset = None;
+        let mut payload_offset = None;
+        for record in Records::new(&bytes, fourdgs::MAGIC.len()) {
+            let record = record.expect("well-formed generated record");
+            if record.opcode == fourdgs::opcode::AUDIO_SOURCE {
+                descriptor_offset = Some(record.offset);
+            } else if record.opcode == fourdgs::opcode::AUDIO_DATA {
+                payload_offset = Some(record.offset);
+            }
+        }
+        (
+            descriptor_offset.expect("Audio Source"),
+            payload_offset.expect("Audio Data"),
+        )
+    };
+    let orphan = fourdgs::read_bytes(&bytes[..payload_offset])
+        .expect_err("a complete descriptor contradicts the clear Header");
+    assert!(
+        matches!(&orphan, fourdgs::Error::Malformed(message)
+            if message.contains("Audio Source record for source id 1")
+                && message.contains(&format!("byte {descriptor_offset}"))),
+        "{orphan}"
+    );
+    bytes.pop();
+
+    let error = fourdgs::read_bytes(&bytes).expect_err("the complete source contradicts Header");
+    assert!(
+        matches!(&error, fourdgs::Error::Malformed(message)
+            if message.contains("Audio Source record for source id 1")
+                && message.contains(&format!("byte {descriptor_offset}"))),
+        "{error}"
+    );
+}
+
+#[test]
+fn indexed_audio_ranges_validate_descriptor_and_payload_lengths_first() {
+    use fourdgs::serialization::{Cursor, Records, RECORD_HEADER_SIZE};
+
+    let (g, duration) = scene(8);
+    let extras = SceneExtras {
+        audio_sources: vec![AudioSource {
+            source_id: 1,
+            codec: "wav".into(),
+            duration_sec: duration,
+            data: b"RIFF".to_vec(),
+            ..AudioSource::default()
+        }],
+        ..SceneExtras::default()
+    };
+    let mut bytes =
+        fourdgs::write_to_vec(&g, duration, &chunking_options(), &extras).expect("encode");
+    let data_length_at = {
+        let record = Records::new(&bytes, fourdgs::MAGIC.len())
+            .find_map(|record| {
+                let record = record.expect("well-formed generated record");
+                (record.opcode == fourdgs::opcode::AUDIO_SOURCE).then_some(record)
+            })
+            .expect("Audio Source");
+        let mut content = Cursor::new(record.content);
+        assert_eq!(content.u32().unwrap(), 1);
+        content.string().unwrap();
+        content.string().unwrap();
+        content.string().unwrap();
+        record.offset + RECORD_HEADER_SIZE + content.position()
+    };
+    let declared = u64::from_le_bytes(
+        bytes[data_length_at..data_length_at + 8]
+            .try_into()
+            .expect("u64"),
+    );
+    bytes[data_length_at..data_length_at + 8].copy_from_slice(&(declared + 1).to_le_bytes());
+
+    let mut source = OwnedSource(bytes);
+    let indexed = fourdgs::indexed_reader::open_indexed(&mut source).expect("indexed open");
+    let error = fourdgs::indexed_reader::read_audio_range(&mut source, &indexed, 1, 0, 1)
+        .expect_err("the descriptor disagrees with Audio Data");
+    assert!(
+        matches!(&error, fourdgs::Error::Malformed(message)
+            if message.contains("Audio Data record declares")),
+        "{error}"
+    );
+}
+
+#[test]
+fn the_writer_normalizes_an_extreme_audio_orientation_without_overflow() {
+    let (g, duration) = scene(0);
+    let extras = SceneExtras {
+        audio_sources: vec![AudioSource {
+            source_id: 1,
+            codec: "wav".into(),
+            duration_sec: duration,
+            rotation: [1e308, 0.0, 0.0, 0.0],
+            data: vec![0x00; 4],
+            ..AudioSource::default()
+        }],
+        ..SceneExtras::default()
+    };
+    let bytes = fourdgs::write_to_vec(&g, duration, &chunking_options(), &extras).expect("encode");
+    let decoded = fourdgs::read_bytes(&bytes).expect("decode");
+    assert_eq!(decoded.audio_sources[0].rotation, [1.0, 0.0, 0.0, 0.0]);
+}
+
+#[test]
+fn an_audio_data_record_beside_a_legacy_audio_record_is_an_orphan() {
+    // A legacy Audio record stands alone: it carries its own payload and there is no
+    // separate Audio Data to pair with it. A file that puts an Audio Data record next to a
+    // legacy Audio record therefore has an orphan — an Audio Data with no descriptor to
+    // match — which the streamed reader has always refused. The indexed reader took a
+    // legacy shortcut that never looked at the leftover data ranges, so it accepted the
+    // same malformed file; this pins both paths to the same answer.
+    //
+    // The file is built by rewriting a spatial source's descriptor in place into an empty
+    // legacy Audio record of the same framed length, leaving its paired Audio Data behind.
+    // The summary CRC covers only the summary run, not front-matter audio, so the rewrite
+    // leaves an otherwise well-formed file whose only fault is the orphan.
+    use fourdgs::opcode as op;
+
+    let (g, duration) = scene(16);
+    let extras = SceneExtras {
+        audio_sources: vec![AudioSource {
+            source_id: 3,
+            name: "solo".into(),
+            codec: "wav".into(),
+            duration_sec: duration,
+            position: [1.0, 0.0, -1.0],
+            data: vec![0x7E; 1024],
+            ..AudioSource::default()
+        }],
+        ..SceneExtras::default()
+    };
+    let mut bytes =
+        fourdgs::write_to_vec(&g, duration, &chunking_options(), &extras).expect("encode");
+
+    // Walk the framing (opcode byte, then an eight-byte little-endian length) to the Audio
+    // Source descriptor.
+    let mut at = fourdgs::MAGIC.len();
+    let descriptor = loop {
+        assert!(at + 9 <= bytes.len(), "the file has an Audio Source record");
+        let opcode = bytes[at];
+        let length = u64::from_le_bytes(bytes[at + 1..at + 9].try_into().expect("eight")) as usize;
+        if opcode == op::AUDIO_SOURCE {
+            break (at, length);
+        }
+        at += 9 + length;
+    };
+    let (offset, length) = descriptor;
+
+    // Rewrite the record as an empty legacy Audio record: codec "wav", start 0.0, no data.
+    // Its framed length is unchanged, so every later offset — including the index — still
+    // lands, and the trailing bytes are ignorable padding past the fields a reader knows.
+    bytes[offset] = op::AUDIO;
+    let content = offset + 9;
+    for byte in &mut bytes[content..content + length] {
+        *byte = 0;
+    }
+    bytes[content..content + 4].copy_from_slice(&3u32.to_le_bytes());
+    bytes[content + 4..content + 7].copy_from_slice(b"wav");
+    // start_sec (f64 at content+7) and data_length (u64 at content+15) stay zero.
+
+    let streamed = fourdgs::read_bytes(&bytes).expect_err("the streamed reader refuses the orphan");
+    assert!(
+        matches!(&streamed, fourdgs::Error::Malformed(m) if m.contains("no matching Audio Source")),
+        "the streamed reader names the orphan: {streamed}"
+    );
+
+    let indexed = fourdgs::indexed_reader::open_indexed(&mut OwnedSource(bytes.clone()))
+        .expect_err("the indexed reader refuses the same file");
+    assert!(
+        matches!(&indexed, fourdgs::Error::Malformed(m) if m.contains("no matching Audio Source")),
+        "the indexed reader refuses the orphan exactly as the streamed one does: {indexed}"
+    );
+
+    // The recovery path refuses it too. A truncated tail can legitimize an unmatched *new*
+    // descriptor (its Audio Data may have been the part that was cut), but never an Audio
+    // Data beside a legacy record — the two representations cannot be mixed, so no missing
+    // bytes could complete it. Drop the trailing magic to mark the file truncated.
+    let mut cut = bytes;
+    cut.truncate(cut.len() - fourdgs::MAGIC.len());
+    let recovered = fourdgs::read_bytes(&cut).expect_err("recovery still refuses the mix");
+    assert!(
+        matches!(&recovered, fourdgs::Error::Malformed(m) if m.contains("no matching Audio Source")),
+        "recovering a truncated file still refuses the legacy-plus-orphan mix: {recovered}"
+    );
 }
 
 #[test]

@@ -13,7 +13,7 @@
 import { decodeScene, type IReadable, type Scene } from "@4dgs/core";
 import { FileHandleReadable } from "@4dgs/nodejs";
 
-import { canonical, summarize } from "./canonical.js";
+import { AudioPayloadDigests, canonical, summarize } from "./canonical.js";
 import { checkStreamedRecords, checkTruncationRecovery } from "./checks.js";
 
 /** Reads small enough that even the smallest variant arrives in several of them. */
@@ -27,7 +27,11 @@ export async function run(path: string): Promise<string> {
   const source = await FileHandleReadable.open(path);
   try {
     const size = Number(await source.size());
-    const scene = await decode(source);
+    const payloads = new AudioPayloadDigests();
+    const scene = await decodeScene(source, {
+      blockSize: BLOCK_SIZE,
+      onAudioData: payloads.consume,
+    });
 
     checkStreamedRecords(scene, size);
     await checkTruncationRecovery(source, size, scene, decode);
@@ -36,7 +40,7 @@ export async function run(path: string): Promise<string> {
       summarize({
         header: scene.header,
         gaussians: scene.gaussians,
-        audio: scene.audio,
+        audioSources: payloads.sources(scene.audioSources),
         chunkIntervals: scene.chunkIndex.map((entry) => [entry.t0, entry.t1] as const),
         camera: scene.camera,
         metadata: scene.metadata,

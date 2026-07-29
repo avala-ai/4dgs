@@ -41,8 +41,9 @@ FLAGS = (
     "SHBitsHigh",  # (8, 7, 6) — near-lossless, and the band-1 entry is exact
     "SHBitsLow",  # (5, 4, 3) — the coarse end of the legal range
     "DeltaStreams",  # delta-coded attribute streams rather than raw
-    "WithAudio",  # embed an audio track
-    "WithLargeAudio",  # embed a track larger than an indexed reader's head probe
+    "WithSpatialAudio",  # embed one positioned audio source
+    "WithMultipleAudioSources",  # independent static and moving sources
+    "WithLargeAudio",  # embed source data larger than an indexed reader's head probe
     "WithCamera",  # embed a camera trajectory
     "WithMetadata",
     "WithAttachment",
@@ -212,8 +213,9 @@ def variants() -> list[tuple[Scenario, tuple[str, ...]]]:
     add(mixed, "SHDegree3", "SHBitsLow", "UseChunks")
 
     # Audio: exactly one scenario carries a track, and one asserts clean absence.
-    add(SCENARIOS[2], "WithAudio")
-    add(SCENARIOS[2], "WithAudio", "WithCamera", "WithMetadata")
+    add(SCENARIOS[2], "WithSpatialAudio")
+    add(SCENARIOS[2], "WithSpatialAudio", "WithCamera", "WithMetadata")
+    add(SCENARIOS[2], "WithMultipleAudioSources")
     add(SCENARIOS[2])  # the no-audio twin of the above, same scene
 
     # A track larger than the 64 KiB probe an indexed reader opens a file with. The Audio
@@ -259,7 +261,7 @@ def variants() -> list[tuple[Scenario, tuple[str, ...]]]:
 
 
 def variant_name(scenario: Scenario, flags: tuple[str, ...]) -> str:
-    """Stable file stem, e.g. `TenWindows-UseChunkIndex-UseCrc-WithAudio`."""
+    """Stable file stem, e.g. `OneWindow-UseChunkIndex-UseCrc-WithSpatialAudio`."""
     return "-".join((scenario.name, *flags)) if flags else scenario.name
 
 

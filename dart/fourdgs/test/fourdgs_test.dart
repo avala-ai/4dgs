@@ -44,6 +44,170 @@ List<int> _u64(int value) {
 }
 
 void main() {
+  group('spatial audio source reconstruction', () {
+    test('linear keyframes interpolate position and quaternion', () {
+      final source = FourdgsAudioSourceDescriptor(
+        sourceId: 42,
+        name: 'moving',
+        codec: 'wav',
+        channelLayout: 'mono',
+        dataLength: 0,
+        startSec: 0.25,
+        durationSec: 0.5,
+        gain: 0.75,
+        spatial: true,
+        loop: true,
+        position: const <double>[9, 9, 9],
+        rotation: const <double>[0, 0, 0, 1],
+        keyframes: const <FourdgsAudioSourceKeyframe>[
+          FourdgsAudioSourceKeyframe(time: 0, position: <double>[0, 0, 0]),
+          FourdgsAudioSourceKeyframe(
+            time: 2,
+            position: <double>[2, 4, 6],
+            rotation: <double>[0, 1, 0, 0],
+          ),
+        ],
+        interpolation: 'linear',
+      );
+
+      final state = source.stateAt(1);
+      expect(state.active, isTrue);
+      expect(state.localTime, closeTo(0.25, 1e-12));
+      expect(state.position, <double>[1, 2, 3]);
+      expect(state.rotation[1], closeTo(0.7071067812, 1e-9));
+      expect(state.rotation[3], closeTo(0.7071067812, 1e-9));
+      expect(state.gain, 0.75);
+    });
+
+    test('step interpolation holds the preceding pose', () {
+      final source = FourdgsAudioSourceDescriptor(
+        sourceId: 1,
+        name: '',
+        codec: 'wav',
+        channelLayout: 'mono',
+        dataLength: 0,
+        startSec: 0,
+        durationSec: 2,
+        gain: 1,
+        spatial: true,
+        loop: false,
+        position: const <double>[0, 0, 0],
+        rotation: const <double>[0, 0, 0, 1],
+        keyframes: const <FourdgsAudioSourceKeyframe>[
+          FourdgsAudioSourceKeyframe(time: 0, position: <double>[1, 2, 3]),
+          FourdgsAudioSourceKeyframe(time: 2, position: <double>[4, 5, 6]),
+        ],
+        interpolation: 'step',
+      );
+
+      expect(source.stateAt(1).position, <double>[1, 2, 3]);
+    });
+
+    test('normalization preserves extreme and tiny finite directions', () {
+      FourdgsAudioSourceDescriptor source(List<double> rotation) =>
+          FourdgsAudioSourceDescriptor(
+            sourceId: 1,
+            name: '',
+            codec: 'wav',
+            channelLayout: 'mono',
+            dataLength: 0,
+            startSec: 0,
+            durationSec: 2,
+            gain: 1,
+            spatial: true,
+            loop: false,
+            position: const <double>[0, 0, 0],
+            rotation: rotation,
+            keyframes: const <FourdgsAudioSourceKeyframe>[],
+            interpolation: 'linear',
+          );
+
+      expect(
+        source(<double>[1e308, 1e308, 1e308, 1e308]).stateAt(1).rotation,
+        everyElement(closeTo(0.5, 1e-12)),
+      );
+      expect(
+        source(<double>[double.minPositive, 0, 0, 0]).stateAt(1).rotation,
+        <double>[1, 0, 0, 0],
+      );
+    });
+
+    test('looping source time does not overflow', () {
+      final source = FourdgsAudioSourceDescriptor(
+        sourceId: 1,
+        name: '',
+        codec: 'wav',
+        channelLayout: 'mono',
+        dataLength: 0,
+        startSec: -1e308,
+        durationSec: 1,
+        gain: 1,
+        spatial: true,
+        loop: true,
+        position: const <double>[0, 0, 0],
+        rotation: const <double>[0, 0, 0, 1],
+        keyframes: const <FourdgsAudioSourceKeyframe>[],
+        interpolation: 'linear',
+      );
+      final state = source.stateAt(1e308);
+      expect(state.active, isTrue);
+      expect(state.localTime, 0);
+      expect(state.localTime.isFinite, isTrue);
+
+      final shortAtLargeTime = FourdgsAudioSourceDescriptor(
+        sourceId: 2,
+        name: '',
+        codec: 'wav',
+        channelLayout: 'mono',
+        dataLength: 0,
+        startSec: 1e308,
+        durationSec: 1,
+        gain: 1,
+        spatial: true,
+        loop: false,
+        position: const <double>[0, 0, 0],
+        rotation: const <double>[0, 0, 0, 1],
+        keyframes: const <FourdgsAudioSourceKeyframe>[],
+        interpolation: 'linear',
+      );
+      expect(shortAtLargeTime.stateAt(1e308).active, isTrue);
+    });
+
+    test('extreme positions interpolate without overflow', () {
+      final source = FourdgsAudioSourceDescriptor(
+        sourceId: 1,
+        name: '',
+        codec: 'wav',
+        channelLayout: 'mono',
+        dataLength: 0,
+        startSec: -1e308,
+        durationSec: 1,
+        gain: 1,
+        spatial: true,
+        loop: true,
+        position: const <double>[0, 0, 0],
+        rotation: const <double>[0, 0, 0, 1],
+        keyframes: const <FourdgsAudioSourceKeyframe>[
+          FourdgsAudioSourceKeyframe(
+            time: -1e308,
+            position: <double>[-1e308, 0, 0],
+          ),
+          FourdgsAudioSourceKeyframe(
+            time: 1e308,
+            position: <double>[1e308, 0, 0],
+          ),
+        ],
+        interpolation: 'linear',
+      );
+      final state = source.stateAt(0);
+      expect(state.position, <double>[0, 0, 0]);
+      expect(
+        state.position,
+        everyElement(isA<double>().having((v) => v.isFinite, 'finite', isTrue)),
+      );
+    });
+  });
+
   group('the magic gates the file', () {
     test('a file that is not 4dgs is refused by name', () {
       expect(

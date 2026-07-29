@@ -298,28 +298,109 @@ int fourdgs_scene_chunk_interval(const fourdgs_scene *scene, uint32_t i,
 uint64_t fourdgs_scene_bytes_for_time(const fourdgs_scene *scene, double t,
                                       uint8_t max_sh_band);
 
-/* --- Audio -------------------------------------------------------------- */
+/* --- Audio sources ------------------------------------------------------ */
 
 /**
- * Whether the scene has a soundtrack.
+ * One independently timed encoded payload and its scene-space pose.
+ *
+ * String fields are pointer/length pairs and may contain NUL. They and this descriptor's
+ * other borrowed pointers remain valid until the scene is freed. `data_size` describes
+ * the encoded payload; fetching a descriptor never transfers those bytes.
+ */
+typedef struct fourdgs_audio_source {
+    uint32_t source_id;
+    const char *name;
+    size_t name_length;
+    const char *codec;
+    size_t codec_length;
+    const char *channel_layout;
+    size_t channel_layout_length;
+    double start_sec;
+    double duration_sec;
+    double gain;
+    int spatial;
+    int loop_playback;
+    double position[3];
+    /** Unit quaternion in xyzw order. */
+    double rotation[4];
+    uint32_t keyframe_count;
+    const char *interpolation;
+    size_t interpolation_length;
+    uint64_t data_size;
+} fourdgs_audio_source;
+
+typedef struct fourdgs_audio_source_keyframe {
+    /** Scene time in seconds. */
+    double time;
+    double position[3];
+    /** Unit quaternion in xyzw order. */
+    double rotation[4];
+} fourdgs_audio_source_keyframe;
+
+/**
+ * Format reconstruction for one source at scene time t.
+ *
+ * The player combines this with its own listener pose and chooses HRTF/panning, distance
+ * attenuation, occlusion and mixing. Those playback policies are intentionally not
+ * format state.
+ */
+typedef struct fourdgs_audio_source_state {
+    int active;
+    double local_time;
+    double position[3];
+    double rotation[4];
+    double gain;
+} fourdgs_audio_source_state;
+
+/**
+ * Whether the scene has one or more audio sources.
  *
  * Answered from the Header alone — no probing, no speculative range request. A scene
  * without audio carries no audio record at all, and that is a normal, complete file.
  */
 int fourdgs_scene_has_audio(const fourdgs_scene *scene);
 
+/** Number of independently timed sources. */
+uint32_t fourdgs_scene_audio_source_count(const fourdgs_scene *scene);
+
 /**
- * The audio codec's registry name ("wav", "opus", ...), or null when there is no track.
+ * Fetch source `index` without transferring its encoded payload.
+ *
+ * Sources are ordered by source_id. Returns FOURDGS_STATUS_OUT_OF_RANGE for an invalid
+ * index.
+ */
+int fourdgs_scene_audio_source(fourdgs_scene *scene, uint32_t index,
+                               fourdgs_audio_source *out);
+
+/** Fetch one pose keyframe from a moving source. */
+int fourdgs_scene_audio_source_keyframe(fourdgs_scene *scene, uint32_t source_index,
+                                        uint32_t keyframe_index,
+                                        fourdgs_audio_source_keyframe *out);
+
+/** Reconstruct source timing and pose at scene time `t`. */
+int fourdgs_scene_audio_source_state_at(fourdgs_scene *scene, uint32_t source_index,
+                                        double t, fourdgs_audio_source_state *out);
+
+/**
+ * Copy a range of source `index`'s encoded payload into `out`.
+ *
+ * Offsets are relative to that payload. Only the requested range is transferred.
+ */
+int fourdgs_scene_audio_source_read(fourdgs_scene *scene, uint32_t index,
+                                    uint64_t offset, uint64_t length, uint8_t *out);
+
+/**
+ * The first source's codec, retained for compatibility with the pre-spatial ABI.
  *
  * Borrowed: valid until the scene is freed.
  */
 const char *fourdgs_scene_audio_codec(fourdgs_scene *scene);
 
-/** The track's length in bytes, computed without fetching it. 0 when there is no track. */
+/** The first source's payload length, retained for compatibility. */
 uint64_t fourdgs_scene_audio_size(const fourdgs_scene *scene);
 
 /**
- * Copy `length` bytes of the track from `offset` into `out`.
+ * Copy bytes from the first source, retained for compatibility.
  *
  * Offsets are relative to the track, not to the file, and the read touches only those
  * bytes — the audio can be streamed independently of any gaussian data, or skipped

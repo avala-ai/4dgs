@@ -44,7 +44,8 @@ std::string corpusDirectory() {
 /// The corpus variants this test decodes. Named rather than globbed, so a corpus that failed
 /// to generate is a failing test rather than a loop over nothing.
 const char* kVariants[] = {
-    "OneWindow-UseChunkIndex-UseCrc-WithAudio",
+    "OneWindow-UseChunkIndex-UseCrc-WithSpatialAudio",
+    "OneWindow-UseChunkIndex-UseCrc-WithMultipleAudioSources",
     "TenWindows-UseChunkIndex-UseChunks-UseCrc",
     "MixedLifetimes-UseChunkIndex-UseCrc",
     // Declares a cutoff other than the 0.05 default, which is the only way the "use the
@@ -192,18 +193,22 @@ void reconstructionAgreesWithTheCore(Scene& scene) {
   }
 }
 
-/// A track is read whole, and its length is the length the header promised without fetching
-/// it. Absence stays absence: no silent empty track for a scene that has none.
+/// Every source is independently readable at its declared length. Absence stays absence.
 void audioReadsBackAtItsDeclaredLength(Scene& scene) {
-  Result<fourdgs::AudioTrack> track = scene.readAudioTrack();
-  CHECK(track.ok());
-  if (!track.ok()) return;
+  Result<std::vector<fourdgs::AudioSource>> sources = scene.readAudioSources();
+  CHECK(sources.ok());
+  if (!sources.ok()) return;
   if (scene.hasAudio()) {
-    CHECK_EQ(static_cast<std::uint64_t>(track->data.size()), scene.audioSize());
-    CHECK(!track->codec.empty());
+    CHECK(!sources->empty());
+    CHECK_EQ(sources->size(), static_cast<std::size_t>(scene.audioSourceCount()));
+    for (const fourdgs::AudioSource& source : *sources) {
+      CHECK_EQ(static_cast<std::uint64_t>(source.data.size()), source.dataSize);
+      CHECK(!source.codec.empty());
+    }
+    Result<fourdgs::AudioSourceState> state = scene.audioSourceStateAt(0, 0.25);
+    CHECK(state.ok());
   } else {
-    CHECK(track->data.empty());
-    CHECK(track->codec.empty());
+    CHECK(sources->empty());
   }
 }
 

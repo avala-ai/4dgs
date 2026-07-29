@@ -5,8 +5,8 @@
 //!
 //! Representation is pinned so that a disagreement is always about the format and never
 //! about how a language spells a number: integers are strings, floats are rounded to a
-//! fixed number of decimals, a never-fading gaussian's sigma is `null`, `audio` is `null`
-//! when absent and an object when present, and keys are sorted.
+//! fixed number of decimals, a never-fading gaussian's sigma is `null`, audio sources are
+//! an array (empty when absent), and keys are sorted.
 //!
 //! **Nothing here may depend on decoded order.** Gaussians may be reordered freely by an
 //! encoder and readers must not rely on their order, so a summary that did would be asking
@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use fourdgs::model::GaussianSet;
+use fourdgs::model::{AudioSource, GaussianSet};
 use fourdgs::provenance::{pose_at, Pose, Provenance};
 use fourdgs::records::{
     Attachment, Camera, Header, Metadata, RigTrajectory, Statistics, SummaryOffset,
@@ -32,6 +32,7 @@ pub const CAMERA_KEYFRAMES: usize = 4;
 /// The same cap for a rig trajectory, which is unbounded for the same reason and worse: a
 /// ten-minute capture at 100 Hz is sixty thousand samples.
 pub const RIG_SAMPLES: usize = 4;
+pub const AUDIO_KEYFRAMES: usize = 4;
 
 /// A JSON value, with objects sorted by key.
 pub enum J {
@@ -152,17 +153,11 @@ pub struct Extras<'a> {
     pub provenance: Option<&'a Provenance>,
 }
 
-/// An embedded track, as the summary sees it.
-pub struct AudioSummary {
-    pub codec: String,
-    pub data: Vec<u8>,
-}
-
 /// The statement every implementation must agree on for a variant.
 pub fn summarize(
     header: &Header,
     gaussians: &GaussianSet,
-    audio: Option<&AudioSummary>,
+    audio_sources: &[AudioSource],
     chunk_intervals: &[(f64, f64)],
     extras: &Extras<'_>,
 ) -> Result<String> {
@@ -210,17 +205,16 @@ pub fn summarize(
         ("shDegree", J::Num(header.sh_degree as f64)),
         ("temporalModel", J::Str(header.temporal_model.clone())),
         ("hasAudio", J::Bool(header.has_audio())),
-        // Absent audio is a value, not a missing key: both paths are conformance-visible.
         (
-            "audio",
-            match audio {
-                None => J::Null,
-                Some(a) => J::obj(vec![
-                    ("codec", J::Str(a.codec.clone())),
-                    ("byteLength", int(a.data.len() as u64)),
-                    ("crc", crc(&a.data)),
-                ]),
-            },
+            "audioSources",
+            J::Arr({
+                let mut sources: Vec<&AudioSource> = audio_sources.iter().collect();
+                sources.sort_by_key(|source| source.source_id);
+                sources
+                    .into_iter()
+                    .map(|source| audio_source(source, header.duration_sec / 2.0))
+                    .collect()
+            }),
         ),
         (
             "chunkIntervals",
@@ -336,12 +330,12 @@ pub fn summarize(
     ];
 
     // Omitted entirely when the file carries no provenance, which is deliberate and is NOT
-    // the `audio` convention above. `audio` is `null` when absent because audio presence is
-    // a property of every file — the Header declares it either way — so both paths have to
-    // be visible in every variant. Provenance has no such flag and no such duty: a file
-    // that carries none is a file the record family does not apply to, and announcing it
-    // would have changed every pre-existing expectation and reported three SDKs that
-    // correctly skip these records by length as failures.
+    // the `audioSources` convention above. `audioSources` is empty when absent because
+    // audio presence is a property of every file — the Header declares it either way — so
+    // both paths have to be visible in every variant. Provenance has no such flag and no
+    // such duty: a file that carries none is a file the record family does not apply to,
+    // and announcing it would have changed every pre-existing expectation and reported
+    // three SDKs that correctly skip these records by length as failures.
     if let Some(prov) = extras.provenance {
         if !prov.is_empty() {
             pairs.push(("provenance", provenance(prov)?));
@@ -539,6 +533,72 @@ fn pose_row(t: f64, pose: Option<&Pose>, sensor: Option<&str>) -> J {
         }
     }
     J::obj(pairs)
+}
+
+fn audio_source(source: &AudioSource, sample_time: f64) -> J {
+    let state = source.state_at(sample_time);
+    J::obj(vec![
+        ("sourceId", int(source.source_id as u64)),
+        ("name", J::Str(source.name.clone())),
+        ("codec", J::Str(source.codec.clone())),
+        ("channelLayout", J::Str(source.channel_layout.clone())),
+        ("startSec", num(source.start_sec)),
+        ("durationSec", num(source.duration_sec)),
+        ("gain", num(source.gain)),
+        ("spatial", J::Bool(source.spatial)),
+        ("loop", J::Bool(source.loop_)),
+        (
+            "position",
+            J::Arr(source.position.iter().map(|value| num(*value)).collect()),
+        ),
+        (
+            "rotation",
+            J::Arr(source.rotation.iter().map(|value| num(*value)).collect()),
+        ),
+        ("keyframeCount", int(source.keyframes.len() as u64)),
+        (
+            "keyframes",
+            J::Arr(
+                source
+                    .keyframes
+                    .iter()
+                    .take(AUDIO_KEYFRAMES)
+                    .map(|keyframe| {
+                        J::obj(vec![
+                            ("time", num(keyframe.time)),
+                            (
+                                "position",
+                                J::Arr(keyframe.position.iter().map(|value| num(*value)).collect()),
+                            ),
+                            (
+                                "rotation",
+                                J::Arr(keyframe.rotation.iter().map(|value| num(*value)).collect()),
+                            ),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        ("interpolation", J::Str(source.interpolation.clone())),
+        (
+            "stateAtHalf",
+            J::obj(vec![
+                ("active", J::Bool(state.active)),
+                ("localTime", num(state.local_time)),
+                (
+                    "position",
+                    J::Arr(state.position.iter().map(|value| num(*value)).collect()),
+                ),
+                (
+                    "rotation",
+                    J::Arr(state.rotation.iter().map(|value| num(*value)).collect()),
+                ),
+                ("gain", num(state.gain)),
+            ]),
+        ),
+        ("byteLength", int(source.data.len() as u64)),
+        ("crc", crc(&source.data)),
+    ])
 }
 
 fn camera(c: &Camera) -> J {

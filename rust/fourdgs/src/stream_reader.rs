@@ -19,7 +19,7 @@ use std::path::Path;
 
 use crate::chunk::{decode_streams, window_table_or_default, DecodedChunk};
 use crate::error::{Error, Result};
-use crate::model::{AudioTrack, GaussianSet};
+use crate::model::{AudioSource, AudioSourceKeyframe, GaussianSet};
 use crate::opcode as op;
 use crate::records as rec;
 use crate::serialization::{crc32, Cursor, MAGIC, RECORD_HEADER_SIZE};
@@ -56,8 +56,8 @@ pub struct Scene {
     pub windows: Vec<(f64, f64)>,
     pub gaussians: GaussianSet,
     pub duration_sec: f64,
-    /// `None` when the scene has no soundtrack, which is the common case and not an error.
-    pub audio: Option<AudioTrack>,
+    /// Empty when the scene has no audio, which is the common case and not an error.
+    pub audio_sources: Vec<AudioSource>,
     pub camera: Option<rec::Camera>,
     pub metadata: Vec<rec::Metadata>,
     pub attachments: Vec<rec::Attachment>,
@@ -92,6 +92,10 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
     let mut quant: Option<rec::Quantization> = None;
     let mut chunks: Vec<DecodedChunk> = Vec::new();
     let mut chunk_bands: Vec<BTreeMap<u8, DecodedStream>> = Vec::new();
+    let mut audio_descriptors: BTreeMap<u32, rec::AudioSource> = BTreeMap::new();
+    let mut audio_payloads: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+    let mut legacy_audio: Option<rec::Audio> = None;
+    let mut first_audio_record: Option<(&'static str, u64, Option<u32>)> = None;
     let mut truncated = false;
 
     // The Footer's CRC covers `[summary_start, footer_start)`, and a front-to-back reader
@@ -150,6 +154,8 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
                 | op::CHUNK
                 | op::SH_BAND_STREAM
                 | op::AUDIO
+                | op::AUDIO_SOURCE
+                | op::AUDIO_DATA
                 | op::CAMERA
                 | op::METADATA
                 | op::ATTACHMENT
@@ -237,12 +243,37 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
                 }
             }
             op::AUDIO => {
-                let a = rec::Audio::parse(&content)?;
-                scene.audio = Some(AudioTrack {
-                    codec: a.codec,
-                    start_sec: a.start_sec,
-                    data: a.data,
-                });
+                first_audio_record.get_or_insert(("Audio", offset, None));
+                legacy_audio = Some(rec::Audio::parse(&content)?);
+            }
+            op::AUDIO_SOURCE => {
+                if !chunks.is_empty() {
+                    return Err(Error::Malformed(
+                        "an Audio Source record appears after the first Chunk".into(),
+                    ));
+                }
+                let source = rec::AudioSource::parse(&content)?;
+                let id = source.source_id;
+                first_audio_record.get_or_insert(("Audio Source", offset, Some(id)));
+                if audio_descriptors.insert(id, source).is_some() {
+                    return Err(Error::Malformed(format!(
+                        "Audio Source id {id} appears more than once"
+                    )));
+                }
+            }
+            op::AUDIO_DATA => {
+                if !chunks.is_empty() {
+                    return Err(Error::Malformed(
+                        "an Audio Data record appears after the first Chunk".into(),
+                    ));
+                }
+                let (id, data) = rec::AudioData::into_payload(content)?;
+                first_audio_record.get_or_insert(("Audio Data", offset, Some(id)));
+                if audio_payloads.insert(id, data).is_some() {
+                    return Err(Error::Malformed(format!(
+                        "Audio Data id {id} appears more than once"
+                    )));
+                }
             }
             op::CAMERA => scene.camera = Some(rec::Camera::parse(&content)?),
             op::METADATA => scene.metadata.push(rec::Metadata::parse(&content)?),
@@ -322,12 +353,121 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
         scene.provenance.check()?;
     }
 
+    if !header.has_audio()
+        && (!audio_descriptors.is_empty() || !audio_payloads.is_empty() || legacy_audio.is_some())
+    {
+        let (name, offset, source_id) =
+            first_audio_record.expect("an audio record was retained above");
+        let source = source_id.map_or_else(String::new, |id| format!(" for source id {id}"));
+        return Err(Error::Malformed(format!(
+            "the Header audio flag is clear, but an {name} record{source} at byte {offset} is \
+             present; expected no audio records"
+        )));
+    }
+    if !audio_descriptors.is_empty() && legacy_audio.is_some() {
+        return Err(Error::Malformed(
+            "the file mixes a legacy Audio record with Audio Source records".into(),
+        ));
+    }
+    // A legacy Audio record can never coexist with new-format audio. Unlike an unmatched new
+    // descriptor — which a lost Audio Source could still have matched in a truncated file — a
+    // payload beside a legacy record is an orphan no later bytes can legitimize, so it is
+    // refused even in recovery, matching the indexed reader.
+    if legacy_audio.is_some() && !audio_payloads.is_empty() {
+        let source_id = *audio_payloads.keys().next().expect("not empty");
+        return Err(Error::Malformed(format!(
+            "Audio Data id {source_id} has no matching Audio Source record"
+        )));
+    }
+    for (source_id, descriptor) in audio_descriptors {
+        let Some(data) = audio_payloads.remove(&source_id) else {
+            if truncated {
+                continue;
+            }
+            return Err(Error::Malformed(format!(
+                "Audio Source id {source_id} has no matching Audio Data record"
+            )));
+        };
+        if data.len() as u64 != descriptor.data_length {
+            return Err(Error::Malformed(format!(
+                "Audio Source id {source_id} declares {} data bytes, its Audio Data record contains {}",
+                descriptor.data_length,
+                data.len()
+            )));
+        }
+        for (index, keyframe) in descriptor.keyframes.iter().enumerate() {
+            if keyframe.time < 0.0 || keyframe.time > header.duration_sec {
+                return Err(Error::Malformed(format!(
+                    "Audio Source id {source_id} keyframe {index} time {} is outside [0, {}]",
+                    keyframe.time, header.duration_sec
+                )));
+            }
+        }
+        scene.audio_sources.push(audio_source(descriptor, data));
+    }
+    if !audio_payloads.is_empty() && !truncated {
+        let source_id = *audio_payloads.keys().next().expect("not empty");
+        return Err(Error::Malformed(format!(
+            "Audio Data id {source_id} has no matching Audio Source record"
+        )));
+    }
+    if let Some(audio) = legacy_audio {
+        scene.audio_sources.push(AudioSource {
+            source_id: 0,
+            codec: audio.codec,
+            start_sec: audio.start_sec,
+            duration_sec: (header.duration_sec - audio.start_sec).max(0.0),
+            spatial: false,
+            channel_layout: String::new(),
+            data: audio.data,
+            ..AudioSource::default()
+        });
+    }
+    if (!header.has_audio() && !scene.audio_sources.is_empty())
+        || (header.has_audio() && scene.audio_sources.is_empty() && !truncated)
+    {
+        return Err(Error::Malformed(format!(
+            "the Header audio flag is {}, but the file contains {} complete audio sources",
+            if header.has_audio() { "set" } else { "clear" },
+            scene.audio_sources.len()
+        )));
+    }
+
     scene.gaussians = assemble(&chunks, &chunk_bands, &scene.windows, &header)?;
     scene.duration_sec = header.duration_sec;
     scene.header = header;
     scene.quantization = quant;
     scene.truncated = truncated;
     Ok(scene)
+}
+
+fn audio_source(source: rec::AudioSource, data: Vec<u8>) -> AudioSource {
+    let spatial = source.spatial();
+    let loop_ = source.loop_();
+    AudioSource {
+        source_id: source.source_id,
+        name: source.name,
+        codec: source.codec,
+        channel_layout: source.channel_layout,
+        start_sec: source.start_sec,
+        duration_sec: source.duration_sec,
+        gain: source.gain,
+        spatial,
+        loop_,
+        position: source.position,
+        rotation: source.rotation,
+        keyframes: source
+            .keyframes
+            .into_iter()
+            .map(|frame| AudioSourceKeyframe {
+                time: frame.time,
+                position: frame.position,
+                rotation: frame.rotation,
+            })
+            .collect(),
+        interpolation: source.interpolation,
+        data,
+    }
 }
 
 /// Decode a whole file already in memory.

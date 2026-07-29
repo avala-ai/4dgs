@@ -182,14 +182,7 @@ pub fn info(args: &Args) -> Result<u8> {
         let bits: Vec<String> = sh_bits.iter().map(|b| b.to_string()).collect();
         out!("sh band bits   {}", bits.join("/"));
     }
-    out!(
-        "audio          {}",
-        match (scene.has_audio(), scene.audio_codec.as_deref()) {
-            (true, Some(codec)) => codec,
-            (true, None) => "(unstated)",
-            (false, _) => "none",
-        }
-    );
+    out!("audio sources  {}", scene.audio_sources.len());
     out!("chunks         {}", scene.index.len());
     out!("windows        {}", scene.windows.len());
     let aabb: Vec<String> = h.aabb.iter().map(|v| round4(*v)).collect();
@@ -308,7 +301,7 @@ fn seek_cost(scene: &IndexedScene) {
 /// Walk the records: offset, opcode, length.
 ///
 /// Framing only. A record's content is never read, so this is as cheap on a file with an
-/// embedded film soundtrack as on one without, and an opcode nobody here has heard of is
+/// embedded audio payloads as on one without, and an opcode nobody here has heard of is
 /// stepped over by its own declared length — which is the whole forward-compatibility
 /// story, exercised rather than described.
 pub fn inspect(args: &Args) -> Result<u8> {

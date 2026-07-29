@@ -75,6 +75,16 @@ All notable changes to the Python package are documented here, following
   green while decoding entirely through the broken one. The report names which copy when there is
   more than one.
 
+- Native spatial audio sources. A scene may carry multiple independently timed encoded payloads,
+  each with an ID, channel layout, gain, looping policy and scene-space pose. Position and
+  quaternion-rotation keyframes reconstruct moving source state at scene time `t`; spatial rendering
+  from that state and the listener pose remains the player's responsibility.
+- Indexed audio access through `read_audio_source_descriptors`, `read_audio_source_state` and
+  `read_audio_range`. Descriptors expose the validated payload size without fetching the payload, so
+  a player can schedule bounded range reads for only the sources it needs.
+- Reference-writer support for Audio Source and Audio Data records. The writer validates source
+  timing and keyframes, normalizes rotations, and retains read compatibility with legacy Audio
+  records while emitting only the new representation.
 - `validate` reports a non-finite quantization step or position origin as an error, naming the
   field, per the new spec §5.3. This changes no file anything here has ever written — every grid the
   encoder emits is finite — and it adds nothing to what a decoder does: dequantization still

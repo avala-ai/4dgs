@@ -15,8 +15,8 @@
 ///
 /// A restatement of `tests/conformance/canonical.py` in C++, and it has to agree with it to
 /// the digit: integers as strings so a 64-bit value survives a JSON parser backed by doubles,
-/// floats rounded to six decimals, a never-fading gaussian's sigma as `null`, absent audio as
-/// `null` rather than a missing key, keys sorted.
+/// floats rounded to six decimals, a never-fading gaussian's sigma as `null`, audio sources
+/// as an array (empty when absent), keys sorted.
 ///
 /// **Nothing here may depend on decoded order.** Gaussians may be reordered freely by an
 /// encoder, so every per-gaussian number — the sample, the aggregates, the spherical harmonic
@@ -68,7 +68,7 @@ std::vector<std::size_t> stableOrder(const GaussianView& gaussians);
 struct SceneSummary {
   const Header* header = nullptr;
   const GaussianView* gaussians = nullptr;
-  const AudioTrack* audio = nullptr;  ///< Null when the scene has none.
+  std::vector<AudioSource> audioSources;
   std::vector<std::pair<double, double>> chunkIntervals;
   const Camera* camera = nullptr;
   std::vector<MetadataRecord> metadata;

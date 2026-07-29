@@ -15,17 +15,29 @@ Four packages, split so a browser bundle carries only what a browser needs:
 ## Both read paths
 
 ```ts
-import { decodeScene, IndexedDecoder } from "@4dgs/core";
+import { audioSourceStateAt, decodeScene, IndexedDecoder } from "@4dgs/core";
 
 // Front to back: works on a pipe, on a file with no index, and on a truncated file.
-const scene = await decodeScene(readable);
+const scene = await decodeScene(readable, {
+  // Each awaited call receives at most one input block. Consume it here; decodeScene
+  // retains only the source descriptors.
+  onAudioData({ sourceId, offset, bytes, final }) {
+    audioSink.write(sourceId, offset, bytes, final);
+  },
+});
 const state = scene.gaussians.stateAt(1.5); // decoding ends here
+for (const source of scene.audioSources) {
+  const sourceState = audioSourceStateAt(source, 1.5);
+}
 
 // Or the index, then only the byte ranges an instant needs.
 const seekable = await IndexedDecoder.open(readable);
 for (const entry of seekable.chunksForTime(1.5)) {
   const { gaussians } = await seekable.readChunk(entry, { maxShBand: 1 });
 }
+const sourceDescriptors = await seekable.readAudioSourceDescriptors();
+const movingState = await seekable.readAudioSourceState(sourceId, 1.5);
+const encodedRange = await seekable.readAudioRange(sourceId, offset, length);
 ```
 
 Neither is an optimization of the other. `seekable.bytesForTime(t)` says what a seek will transfer

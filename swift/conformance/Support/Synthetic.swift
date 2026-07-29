@@ -99,7 +99,12 @@ public enum Synthetic {
                     // how — a quote, a backslash and a newline in one value.
                     "note": "quote\" and \\ and \n",
                 ]),
-            audio: Audio(codec: "opus", startSec: 0.25, data: (0..<5000).map { UInt8($0 % 251) }),
+            audioSources: [
+                AudioSource(
+                    sourceId: 7, name: "speaker", codec: "opus", startSec: 0.25,
+                    durationSec: 4.0, position: [1, 0.5, -1],
+                    data: (0..<5000).map { UInt8($0 % 251) })
+            ],
             camera: Camera(
                 fovYDeg: 62.5, position: [1, 2, 3], target: [0, 0, 0],
                 keyframes: (0..<6).map {

@@ -12,11 +12,11 @@ use std::collections::BTreeMap;
 use std::process::ExitCode;
 
 use fourdgs::indexed_reader::{
-    open_indexed, read_attachments, read_audio, read_camera, read_chunk, IndexedScene,
+    open_indexed, read_attachments, read_audio_sources, read_camera, read_chunk, IndexedScene,
 };
 use fourdgs::readable::{FileReadable, Readable};
 use fourdgs::records::ChunkIndexEntry;
-use fourdgs_conformance::{summarize, AudioSummary, Extras};
+use fourdgs_conformance::{summarize, Extras};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -65,7 +65,7 @@ fn run(path: &str) -> Result<String, String> {
     for entry in &scene.index {
         chunks.push(read_chunk(&mut source, &scene, entry, 3).map_err(|e| e.to_string())?);
     }
-    let audio_bytes = read_audio(&mut source, &scene).map_err(|e| e.to_string())?;
+    let audio_sources = read_audio_sources(&mut source, &scene).map_err(|e| e.to_string())?;
     let camera = read_camera(&mut source, &scene).map_err(|e| e.to_string())?;
     let metadata =
         fourdgs::indexed_reader::read_metadata(&mut source, &scene).map_err(|e| e.to_string())?;
@@ -82,15 +82,11 @@ fn run(path: &str) -> Result<String, String> {
         fourdgs::stream_reader::assemble(&chunks, &bands, &scene.windows, &scene.header)
             .map_err(|e| e.to_string())?;
 
-    let audio = audio_bytes.map(|data| AudioSummary {
-        codec: scene.audio_codec.clone().unwrap_or_default(),
-        data,
-    });
     let intervals: Vec<(f64, f64)> = scene.index.iter().map(|e| (e.t0, e.t1)).collect();
     summarize(
         &scene.header,
         &gaussians,
-        audio.as_ref(),
+        &audio_sources,
         &intervals,
         &Extras {
             camera: camera.as_ref(),

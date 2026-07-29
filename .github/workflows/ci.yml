@@ -27,7 +27,7 @@ jobs:
             echo "conformance data: ${size_kb} KiB"
             [ "$size_kb" -le 2560 ] || { echo "::error::conformance data over budget"; exit 1; }
           fi
-      - name: Rust sources under 680 KB
+      - name: Rust sources under 760 KB
         # Sources only: this job builds nothing, so target/ is not here to measure. A
         # vendored dependency would show up as a budget failure, which is the point —
         # everything these crates need comes from crates.io via Cargo.toml.
@@ -37,11 +37,12 @@ jobs:
         # per-band SH bit depths, the registry module and the cross-validator's pass over
         # the invalid corpus; 680 after the C ABI grew an encode surface
         # (`fourdgs_writer_*`) with its C smoke coverage and the shared `encode_gaussians`
-        # conformance baseline. A budget that tight stops being a budget and starts being a
-        # tax on the next feature, so each raise leaves a little headroom. The number moves
-        # when the tree grows deliberately, which is the one thing it is not meant to catch
-        # — it exists so that a vendored dependency, which arrives in hundreds of KiB, fails
-        # loudly.
+        # conformance baseline; 760 after native multi-source spatial audio landed on top
+        # of that encode surface. A budget that tight stops being a budget and starts being
+        # a tax on the next feature, so each raise leaves a little headroom. The number
+        # moves when the tree grows deliberately, which is the one thing it is not meant
+        # to catch — it exists so that a vendored dependency, which arrives in hundreds
+        # of KiB, fails loudly.
         #
         # Worth knowing when it next trips: `du` rounds every file to a 4 KiB block, so a
         # crate of forty small source files carries roughly 150 KiB of slack and a single
@@ -50,7 +51,7 @@ jobs:
         run: |
           size_kb=$(du -s rust | cut -f1)
           echo "rust: ${size_kb} KiB"
-          [ "$size_kb" -le 680 ] || { echo "::error::rust is ${size_kb} KiB, over the 680 KiB budget"; exit 1; }
+          [ "$size_kb" -le 760 ] || { echo "::error::rust is ${size_kb} KiB, over the 760 KiB budget"; exit 1; }
 
       - name: TypeScript sources under 500 KB
         # Sources only: this job installs nothing and builds nothing, so node_modules
@@ -60,14 +61,14 @@ jobs:
           size_kb=$(du -s typescript | cut -f1)
           echo "typescript: ${size_kb} KiB"
           [ "$size_kb" -le 500 ] || { echo "::error::typescript is ${size_kb} KiB, over the 500 KiB budget"; exit 1; }
-      - name: Dart sources under 300 KB
+      - name: Dart sources under 360 KB
         # Sources only, same as TypeScript's and Swift's: this job builds nothing, so
         # .dart_tool and the compiled runners are not here to measure, and a vendored
         # dependency would show up as a budget failure.
         run: |
           size_kb=$(du -s dart | cut -f1)
           echo "dart: ${size_kb} KiB"
-          [ "$size_kb" -le 300 ] || { echo "::error::dart is ${size_kb} KiB, over the 300 KiB budget"; exit 1; }
+          [ "$size_kb" -le 360 ] || { echo "::error::dart is ${size_kb} KiB, over the 360 KiB budget"; exit 1; }
       - name: Swift sources under 300 KB
         # Sources only, same as TypeScript's: this job builds nothing, so .build is not
         # here to measure and a vendored dependency would show up as a budget failure.
@@ -400,7 +401,8 @@ jobs:
             rust/fourdgs/tests/capi_smoke.c -o capi_smoke \
             target/release/libfourdgs.a $runtime
           for variant in \
-            OneWindow-UseChunkIndex-UseCrc-WithAudio \
+            OneWindow-UseChunkIndex-UseCrc-WithSpatialAudio \
+            OneWindow-UseChunkIndex-UseCrc-WithMultipleAudioSources \
             OneWindow-UseChunkIndex-UseCrc-WithLargeAudio \
             MixedLifetimes-SHDegree2-UseChunkIndex-UseCrc \
             NoData-UseChunkIndex-UseCrc \
@@ -478,7 +480,7 @@ jobs:
       - name: The example runs, so it cannot rot into a snippet that no longer works
         run: |
           ./cpp/build/examples/decode_summary \
-            tests/conformance/data/OneWindow-UseChunkIndex-UseCrc-WithAudio.4dgs
+            tests/conformance/data/OneWindow-UseChunkIndex-UseCrc-WithSpatialAudio.4dgs
 
       # The binding owns handles that come from across an FFI boundary, so a leak and a read
       # past the end of a buffer the ABI handed over are the two bugs it is exposed to. The
@@ -591,8 +593,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: swift --version
-      # Style comes from swift/.swift-format, so this is the same command a contributor
-      # runs locally: `swift format --in-place --recursive` fixes what this reports.
       # Style comes from swift/.swift-format, so this is the same command a contributor
       # runs locally: `swift format --in-place --recursive` fixes what this reports.
       - name: Format

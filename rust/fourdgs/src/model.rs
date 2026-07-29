@@ -12,12 +12,182 @@
 
 use crate::quantization::{support_k, DEFAULT_CUTOFF};
 
-/// An embedded track. Absent scenes hold `None`, never an empty track.
+/// A legacy non-spatial track, retained as a read compatibility type.
 #[derive(Debug, Clone, Default)]
 pub struct AudioTrack {
     pub codec: String,
     pub start_sec: f64,
     pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AudioSourceKeyframe {
+    pub time: f64,
+    pub position: [f64; 3],
+    /// Unit quaternion, xyzw.
+    pub rotation: [f64; 4],
+}
+
+/// One independently timed audio payload and its scene-space pose.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioSource {
+    pub source_id: u32,
+    pub name: String,
+    pub codec: String,
+    pub channel_layout: String,
+    pub start_sec: f64,
+    pub duration_sec: f64,
+    pub gain: f64,
+    pub spatial: bool,
+    pub loop_: bool,
+    pub position: [f64; 3],
+    /// Unit quaternion, xyzw.
+    pub rotation: [f64; 4],
+    pub keyframes: Vec<AudioSourceKeyframe>,
+    pub interpolation: String,
+    /// The encoded payload, verbatim and independently range-readable.
+    pub data: Vec<u8>,
+}
+
+impl Default for AudioSource {
+    fn default() -> Self {
+        AudioSource {
+            source_id: 0,
+            name: String::new(),
+            codec: String::new(),
+            channel_layout: "mono".into(),
+            start_sec: 0.0,
+            duration_sec: 0.0,
+            gain: 1.0,
+            spatial: true,
+            loop_: false,
+            position: [0.0; 3],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            keyframes: Vec::new(),
+            interpolation: "linear".into(),
+            data: Vec::new(),
+        }
+    }
+}
+
+/// The source facts a player needs at scene time `t`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioSourceState {
+    pub active: bool,
+    pub local_time: f64,
+    pub position: [f64; 3],
+    pub rotation: [f64; 4],
+    pub gain: f64,
+}
+
+impl AudioSource {
+    /// Reconstruct timing and pose. HRTF, panning, attenuation and mixing stay in the
+    /// player, which combines this with its listener pose.
+    pub fn state_at(&self, t: f64) -> AudioSourceState {
+        let active = t >= self.start_sec && (self.loop_ || t - self.start_sec < self.duration_sec);
+        let local_time = if self.loop_ && self.duration_sec > 0.0 {
+            looping_local_time(t, self.start_sec, self.duration_sec)
+        } else {
+            (t - self.start_sec)
+                .max(0.0)
+                .min(self.duration_sec.max(0.0))
+        };
+        let (position, rotation) = self.pose_at(t);
+        AudioSourceState {
+            active,
+            local_time,
+            position,
+            rotation,
+            gain: self.gain,
+        }
+    }
+
+    fn pose_at(&self, t: f64) -> ([f64; 3], [f64; 4]) {
+        if self.keyframes.is_empty() {
+            return (self.position, normalized_quaternion(self.rotation));
+        }
+        if t <= self.keyframes[0].time {
+            let frame = &self.keyframes[0];
+            return (frame.position, normalized_quaternion(frame.rotation));
+        }
+        let last = self.keyframes.len() - 1;
+        if t >= self.keyframes[last].time {
+            let frame = &self.keyframes[last];
+            return (frame.position, normalized_quaternion(frame.rotation));
+        }
+        let high = self
+            .keyframes
+            .partition_point(|frame| frame.time <= t)
+            .min(last);
+        let a = &self.keyframes[high - 1];
+        let b = &self.keyframes[high];
+        if self.interpolation == "step" {
+            return (a.position, normalized_quaternion(a.rotation));
+        }
+        let u = interpolation_fraction(t, a.time, b.time);
+        let mut position = [0.0; 3];
+        for (i, value) in position.iter_mut().enumerate() {
+            *value = finite_lerp(a.position[i], b.position[i], u);
+        }
+        (position, slerp(a.rotation, b.rotation, u))
+    }
+}
+
+fn interpolation_fraction(t: f64, a: f64, b: f64) -> f64 {
+    let span = b - a;
+    if span.is_finite() {
+        return (t - a) / span;
+    }
+    let scale = a.abs().max(b.abs());
+    (t / scale - a / scale) / (b / scale - a / scale)
+}
+
+fn finite_lerp(a: f64, b: f64, u: f64) -> f64 {
+    if (a <= 0.0 && b >= 0.0) || (a >= 0.0 && b <= 0.0) {
+        a * (1.0 - u) + b * u
+    } else {
+        a + (b - a) * u
+    }
+}
+
+fn looping_local_time(t: f64, start_sec: f64, duration_sec: f64) -> f64 {
+    if t <= start_sec {
+        return 0.0;
+    }
+    let time_remainder = t.rem_euclid(duration_sec);
+    let start_remainder = start_sec.rem_euclid(duration_sec);
+    (time_remainder - start_remainder).rem_euclid(duration_sec)
+}
+
+fn normalized_quaternion(value: [f64; 4]) -> [f64; 4] {
+    // Normalize the scaled components directly. Reconstructing the original magnitude can
+    // still overflow even when every component is finite: the norm of [1e308; 4] is 2e308.
+    let scale = value.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+    if !scale.is_finite() || scale == 0.0 {
+        return [0.0, 0.0, 0.0, 1.0];
+    }
+    let scaled = value.map(|v| v / scale);
+    let length = scaled.iter().map(|v| v * v).sum::<f64>().sqrt();
+    scaled.map(|v| v / length)
+}
+
+fn slerp(a: [f64; 4], b: [f64; 4], u: f64) -> [f64; 4] {
+    let qa = normalized_quaternion(a);
+    let mut qb = normalized_quaternion(b);
+    let mut dot = qa.iter().zip(qb).map(|(x, y)| x * y).sum::<f64>();
+    if dot < 0.0 {
+        qb = qb.map(|v| -v);
+        dot = -dot;
+    }
+    dot = dot.clamp(-1.0, 1.0);
+    if dot > 0.9995 {
+        return normalized_quaternion(std::array::from_fn(|i| qa[i] + (qb[i] - qa[i]) * u));
+    }
+    let theta = dot.acos();
+    let sin_theta = theta.sin();
+    let wa = ((1.0 - u) * theta).sin() / sin_theta;
+    let wb = (u * theta).sin() / sin_theta;
+    normalized_quaternion(std::array::from_fn(|i| wa * qa[i] + wb * qb[i]))
 }
 
 /// A default viewpoint and optional suggested path. Purely advisory.

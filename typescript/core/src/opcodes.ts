@@ -25,6 +25,8 @@ export const Opcode = {
   Attachment: 0x0d,
   AttachmentIndex: 0x0e,
   SummaryOffset: 0x0f,
+  AudioSource: 0x11,
+  AudioData: 0x12,
 } as const;
 
 /** Records whose currently defined fields are frozen for the life of version 1. */
@@ -92,8 +94,12 @@ export const REQUIRED_ATTRIBUTES: readonly number[] = [
 /** Bit 0 of the per-gaussian flags attribute: this gaussian never fades. */
 export const GAUSSIAN_FLAG_NEVER_FADES = 1;
 
-/** Bit 0 of the Header `flags` field: the file contains an Audio record. */
+/** Bit 0 of Header flags: the file contains legacy Audio or Audio Source/Data records. */
 export const HEADER_FLAG_HAS_AUDIO = 1 << 0;
 
 /** Bit 1 of the Header `flags` field: chunk data is compressed. */
 export const HEADER_FLAG_CHUNKS_COMPRESSED = 1 << 1;
+
+/** Audio Source flag bits, spec §5.16. */
+export const AUDIO_SOURCE_FLAG_SPATIAL = 1 << 0;
+export const AUDIO_SOURCE_FLAG_LOOP = 1 << 1;

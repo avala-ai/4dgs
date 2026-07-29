@@ -24,8 +24,8 @@ const properties = [
     body: "Every read path is streamable. No conforming reader ever needs the whole file resident, on any path.",
   },
   {
-    title: "Audio in the file",
-    body: "A scene with a soundtrack carries it inline, and the audio track is the scene clock's master. A scene without one carries nothing at all.",
+    title: "Native spatial audio",
+    body: "Independent sources carry encoded audio, timing, gain and fixed or moving 3D poses. The scene clock stays authoritative; a scene without audio carries nothing at all.",
   },
   {
     title: "Forward compatible by construction",
@@ -37,7 +37,7 @@ const properties = [
   },
   {
     title: "Renderer-agnostic",
-    body: "The format defines how to reconstruct splat state at a given time and nothing beyond that. How that state is drawn is out of scope.",
+    body: "The format reconstructs gaussian and audio-source state at a given time. Drawing, listener pose, HRTF, attenuation and mixing stay in the renderer/player.",
   },
 ];
 

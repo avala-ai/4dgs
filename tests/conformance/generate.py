@@ -97,13 +97,66 @@ def build(scenario, flags, *, read_back: bool = True, **overrides) -> tuple[byte
         object_id=(np.where(np.arange(n) % 3 == 0, 7, 0).astype(np.uint32) if "WithObjects" in flags else None),
     )
 
-    audio = None
+    audio_sources = []
     if "WithLargeAudio" in flags:
         # Six seconds at 8 kHz is ~96 KiB: comfortably past the 64 KiB an indexed reader
         # probes the front of a file with, and comfortably inside the corpus size cap.
-        audio = fourdgs.AudioTrack(codec="wav", data=scenarios.build_audio(seconds=6.0), start_sec=0.0)
-    elif "WithAudio" in flags:
-        audio = fourdgs.AudioTrack(codec="wav", data=scenarios.build_audio(), start_sec=0.0)
+        audio_sources = [
+            fourdgs.AudioSource(
+                source_id=7,
+                name="large-source",
+                codec="wav",
+                data=scenarios.build_audio(seconds=6.0),
+                duration_sec=6.0,
+                position=(-2.0, 0.5, 1.0),
+            )
+        ]
+    elif "WithMultipleAudioSources" in flags:
+        audio_sources = [
+            fourdgs.AudioSource(
+                source_id=7,
+                name="fixed-source",
+                codec="wav",
+                data=scenarios.build_audio(),
+                duration_sec=0.25,
+                gain=0.75,
+                position=(-2.0, 0.5, 1.0),
+            ),
+            fourdgs.AudioSource(
+                source_id=42,
+                name="moving-source",
+                codec="wav",
+                data=scenarios.build_audio(seconds=0.5),
+                start_sec=0.125,
+                duration_sec=0.5,
+                gain=0.5,
+                loop=True,
+                position=(2.0, 0.5, 1.0),
+                keyframes=[
+                    fourdgs.AudioSourceKeyframe(
+                        time=0.0,
+                        position=(2.0, 0.5, 1.0),
+                        rotation=(0.0, 0.0, 0.0, 1.0),
+                    ),
+                    fourdgs.AudioSourceKeyframe(
+                        time=raw["duration_sec"],
+                        position=(-2.0, 1.5, -1.0),
+                        rotation=(0.0, 1.0, 0.0, 0.0),
+                    ),
+                ],
+            ),
+        ]
+    elif "WithSpatialAudio" in flags:
+        audio_sources = [
+            fourdgs.AudioSource(
+                source_id=7,
+                name="speaker",
+                codec="wav",
+                data=scenarios.build_audio(),
+                duration_sec=0.25,
+                position=(1.5, 0.75, -0.5),
+            )
+        ]
     camera = None
     if "WithCamera" in flags:
         camera = fourdgs.CameraTrajectory(
@@ -168,7 +221,14 @@ def build(scenario, flags, *, read_back: bool = True, **overrides) -> tuple[byte
     )
 
     buf = io.BytesIO()
-    fourdgs.write(buf, gaussians, raw["duration_sec"], options=options, audio=audio, camera=camera)
+    fourdgs.write(
+        buf,
+        gaussians,
+        raw["duration_sec"],
+        options=options,
+        audio_sources=audio_sources,
+        camera=camera,
+    )
     data = buf.getvalue()
 
     if not read_back:
@@ -182,7 +242,7 @@ def build(scenario, flags, *, read_back: bool = True, **overrides) -> tuple[byte
         summarize(
             scene.header,
             scene.gaussians,
-            scene.audio,
+            scene.audio_sources,
             [(e.t0, e.t1) for e in scene.chunk_index],
             camera=scene.camera,
             metadata=scene.metadata,

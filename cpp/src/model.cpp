@@ -3,7 +3,118 @@
 
 #include "fourdgs/model.hpp"
 
+#include <algorithm>
+
 namespace fourdgs {
+namespace {
+
+double loopingLocalTime(double t, double startSec, double durationSec) {
+  if (t <= startSec) return 0.0;
+  double timeRemainder = std::fmod(t, durationSec);
+  if (timeRemainder < 0.0) timeRemainder += durationSec;
+  double startRemainder = std::fmod(startSec, durationSec);
+  if (startRemainder < 0.0) startRemainder += durationSec;
+  const double difference = timeRemainder - startRemainder;
+  return difference < 0.0 ? difference + durationSec : difference;
+}
+
+double interpolationFraction(double t, double a, double b) {
+  const double span = b - a;
+  if (std::isfinite(span)) return (t - a) / span;
+  const double scale = std::max(std::abs(a), std::abs(b));
+  return (t / scale - a / scale) / (b / scale - a / scale);
+}
+
+double finiteLerp(double a, double b, double u) {
+  if ((a <= 0.0 && b >= 0.0) || (a >= 0.0 && b <= 0.0)) {
+    return a * (1.0 - u) + b * u;
+  }
+  return a + (b - a) * u;
+}
+
+void normalizeQuaternion(const double value[4], double out[4]) {
+  const double scale =
+      std::max({std::abs(value[0]), std::abs(value[1]), std::abs(value[2]), std::abs(value[3])});
+  if (!std::isfinite(scale) || scale == 0.0) {
+    out[0] = out[1] = out[2] = 0.0;
+    out[3] = 1.0;
+    return;
+  }
+  double scaled[4];
+  for (int i = 0; i < 4; ++i) scaled[i] = value[i] / scale;
+  const double length = std::sqrt(scaled[0] * scaled[0] + scaled[1] * scaled[1] +
+                                  scaled[2] * scaled[2] + scaled[3] * scaled[3]);
+  for (int i = 0; i < 4; ++i) out[i] = scaled[i] / length;
+}
+
+void slerp(const double a[4], const double b[4], double u, double out[4]) {
+  double qa[4];
+  double qb[4];
+  normalizeQuaternion(a, qa);
+  normalizeQuaternion(b, qb);
+  double dot = 0.0;
+  for (int i = 0; i < 4; ++i) dot += qa[i] * qb[i];
+  if (dot < 0.0) {
+    for (double& value : qb) value = -value;
+    dot = -dot;
+  }
+  dot = std::max(-1.0, std::min(1.0, dot));
+  if (dot > 0.9995) {
+    for (int i = 0; i < 4; ++i) out[i] = qa[i] + (qb[i] - qa[i]) * u;
+    double normalized[4];
+    normalizeQuaternion(out, normalized);
+    std::copy(normalized, normalized + 4, out);
+    return;
+  }
+  const double theta = std::acos(dot);
+  const double sinTheta = std::sin(theta);
+  const double wa = std::sin((1.0 - u) * theta) / sinTheta;
+  const double wb = std::sin(u * theta) / sinTheta;
+  for (int i = 0; i < 4; ++i) out[i] = wa * qa[i] + wb * qb[i];
+}
+
+}  // namespace
+
+AudioSourceState AudioSource::stateAt(double t) const {
+  AudioSourceState state;
+  state.active = t >= startSec && (loop || t - startSec < durationSec);
+  state.localTime = loop && durationSec > 0.0
+                        ? loopingLocalTime(t, startSec, durationSec)
+                        : std::min(std::max(0.0, t - startSec), std::max(0.0, durationSec));
+  state.gain = gain;
+
+  if (keyframes.empty()) {
+    std::copy(position, position + 3, state.position);
+    normalizeQuaternion(rotation, state.rotation);
+    return state;
+  }
+  if (t <= keyframes.front().time) {
+    std::copy(keyframes.front().position, keyframes.front().position + 3, state.position);
+    normalizeQuaternion(keyframes.front().rotation, state.rotation);
+    return state;
+  }
+  if (t >= keyframes.back().time) {
+    std::copy(keyframes.back().position, keyframes.back().position + 3, state.position);
+    normalizeQuaternion(keyframes.back().rotation, state.rotation);
+    return state;
+  }
+  const auto high = std::upper_bound(
+      keyframes.begin(), keyframes.end(), t,
+      [](double time, const AudioSource::Keyframe& frame) { return time < frame.time; });
+  const AudioSource::Keyframe& a = *(high - 1);
+  const AudioSource::Keyframe& b = *high;
+  if (interpolation == "step") {
+    std::copy(a.position, a.position + 3, state.position);
+    normalizeQuaternion(a.rotation, state.rotation);
+    return state;
+  }
+  const double u = interpolationFraction(t, a.time, b.time);
+  for (int i = 0; i < 3; ++i) {
+    state.position[i] = finiteLerp(a.position[i], b.position[i], u);
+  }
+  slerp(a.rotation, b.rotation, u, state.rotation);
+  return state;
+}
 
 void GaussianData::clear() {
   count = 0;

@@ -121,9 +121,21 @@ class Scene {
   /// index to fetch from and has already decoded every chunk.
   Result<void> loadChunk(std::uint32_t index, int maxShBand);
 
-  /// Audio presence, answered from the header alone: no probing, no speculative range
-  /// request, and absence is a normal complete file rather than an error (spec §7).
+  /// Audio presence, answered from the Header alone.
   bool hasAudio() const;
+  std::uint32_t audioSourceCount() const;
+  /// Fetch a source descriptor without its encoded payload.
+  Result<AudioSource> audioSource(std::uint32_t index);
+  /// Reconstruct timing and scene-space pose; the player supplies the listener and
+  /// spatialization policy.
+  Result<AudioSourceState> audioSourceStateAt(std::uint32_t index, double t);
+  /// Read a byte range relative to one encoded source payload.
+  Result<void> readAudioSource(std::uint32_t index, std::uint64_t offset, Span<std::uint8_t> into);
+  /// Fetch one complete encoded source, bounded by its validated `dataSize`.
+  Result<AudioSource> readAudioSource(std::uint32_t index);
+  Result<std::vector<AudioSource>> readAudioSources();
+
+  /// Pre-spatial compatibility accessors over the first source.
   std::string audioCodec() const;
   std::uint64_t audioSize() const;
   /// Read a byte range of the track. Offsets are relative to the track, not to the file.

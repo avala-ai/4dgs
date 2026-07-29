@@ -19,6 +19,14 @@ import 'quantization.dart';
 import 'records.dart';
 import 'serialization.dart';
 
+class _ObservedAudioRecord {
+  const _ObservedAudioRecord(this.name, this.offset, [this.sourceId]);
+
+  final String name;
+  final int offset;
+  final int? sourceId;
+}
+
 /// A whole file, decoded.
 class FourdgsScene {
   FourdgsScene({
@@ -30,9 +38,9 @@ class FourdgsScene {
     required this.metadata,
     required this.attachments,
     required this.summaryOffsets,
+    required this.audioSources,
     required this.skippedOpcodes,
     required this.truncated,
-    this.audio,
     this.camera,
     this.statistics,
     this.summaryCrcOk,
@@ -51,6 +59,9 @@ class FourdgsScene {
   /// mentions is a record an implementation can decline to decode.
   final List<FourdgsSummaryOffset> summaryOffsets;
 
+  /// Every independently timed source, ordered by source id.
+  final List<FourdgsAudioSource> audioSources;
+
   /// Opcodes seen but not understood. Kept so a caller can report them and so a
   /// test can prove they were skipped rather than tripped over.
   final List<int> skippedOpcodes;
@@ -58,9 +69,19 @@ class FourdgsScene {
   /// True when the file ended mid-record and the decode stopped there.
   final bool truncated;
 
-  /// `null` when the scene has no soundtrack, which is the common case and not
-  /// an error.
-  final FourdgsAudioTrack? audio;
+  /// Compatibility view of the first source as a legacy track.
+  ///
+  /// New code should use [audioSources], which preserves source identity,
+  /// spatial pose, motion and independent timing.
+  FourdgsAudioTrack? get audio {
+    if (audioSources.isEmpty) return null;
+    final source = audioSources.first;
+    return FourdgsAudioTrack(
+      codec: source.codec,
+      data: source.data,
+      startSec: source.startSec,
+    );
+  }
 
   final FourdgsCameraTrajectory? camera;
   final FourdgsStatistics? statistics;
@@ -103,7 +124,10 @@ FourdgsScene readFourdgsBytes(
   final attachments = <FourdgsAttachment>[];
   final summaryOffsets = <FourdgsSummaryOffset>[];
   final skipped = <int>[];
-  FourdgsAudioTrack? audio;
+  FourdgsAudioTrack? legacyAudio;
+  final audioDescriptors = <int, FourdgsAudioSourceRecord>{};
+  final audioPayloads = <int, Uint8List>{};
+  _ObservedAudioRecord? firstAudioRecord;
   FourdgsCameraTrajectory? camera;
   FourdgsStatistics? statistics;
   bool? summaryCrcOk;
@@ -157,12 +181,54 @@ FourdgsScene readFourdgsBytes(
             }
           }
         case opAudio:
+          firstAudioRecord ??= _ObservedAudioRecord('Audio', record.offset);
+          if (legacyAudio != null) {
+            throw const FourdgsMalformedFile(
+              'the file carries more than one legacy Audio record',
+            );
+          }
           final a = FourdgsAudio.parse(record.content);
-          audio = FourdgsAudioTrack(
+          legacyAudio = FourdgsAudioTrack(
             codec: a.codec,
             data: a.data,
             startSec: a.startSec,
           );
+        case opAudioSource:
+          if (chunks.isNotEmpty) {
+            throw const FourdgsMalformedFile(
+              'an Audio Source record appears after the first Chunk',
+            );
+          }
+          final source = FourdgsAudioSourceRecord.parse(record.content);
+          firstAudioRecord ??= _ObservedAudioRecord(
+            'Audio Source',
+            record.offset,
+            source.sourceId,
+          );
+          if (audioDescriptors.containsKey(source.sourceId)) {
+            throw FourdgsMalformedFile(
+              'Audio Source id ${source.sourceId} appears more than once',
+            );
+          }
+          audioDescriptors[source.sourceId] = source;
+        case opAudioData:
+          if (chunks.isNotEmpty) {
+            throw const FourdgsMalformedFile(
+              'an Audio Data record appears after the first Chunk',
+            );
+          }
+          final payload = FourdgsAudioData.parse(record.content);
+          firstAudioRecord ??= _ObservedAudioRecord(
+            'Audio Data',
+            record.offset,
+            payload.sourceId,
+          );
+          if (audioPayloads.containsKey(payload.sourceId)) {
+            throw FourdgsMalformedFile(
+              'Audio Data id ${payload.sourceId} appears more than once',
+            );
+          }
+          audioPayloads[payload.sourceId] = payload.data;
         case opCamera:
           final c = FourdgsCamera.parse(record.content);
           camera = FourdgsCameraTrajectory(
@@ -234,6 +300,15 @@ FourdgsScene readFourdgsBytes(
     );
   }
 
+  final audioSources = _assembleAudioSources(
+    header,
+    audioDescriptors,
+    audioPayloads,
+    legacyAudio,
+    firstAudioRecord,
+    truncated,
+  );
+
   return FourdgsScene(
     header: header,
     quantization: quantization,
@@ -250,14 +325,153 @@ FourdgsScene readFourdgsBytes(
     metadata: metadata,
     attachments: attachments,
     summaryOffsets: summaryOffsets,
+    audioSources: audioSources,
     skippedOpcodes: skipped,
     truncated: truncated,
-    audio: audio,
     camera: camera,
     statistics: statistics,
     summaryCrcOk: summaryCrcOk,
   );
 }
+
+List<FourdgsAudioSource> _assembleAudioSources(
+  FourdgsHeader header,
+  Map<int, FourdgsAudioSourceRecord> descriptors,
+  Map<int, Uint8List> payloads,
+  FourdgsAudioTrack? legacy,
+  _ObservedAudioRecord? firstAudioRecord,
+  bool truncated,
+) {
+  if (!header.hasAudio &&
+      (descriptors.isNotEmpty || payloads.isNotEmpty || legacy != null)) {
+    final record = firstAudioRecord!;
+    final source =
+        record.sourceId == null ? '' : ' for source id ${record.sourceId}';
+    throw FourdgsMalformedFile(
+      'the Header audio flag is clear, but an ${record.name} record$source '
+      'at byte ${record.offset} is present; expected no audio records',
+    );
+  }
+  if (descriptors.isNotEmpty && legacy != null) {
+    throw const FourdgsMalformedFile(
+      'the file mixes a legacy Audio record with Audio Source records',
+    );
+  }
+  // A legacy Audio record can never coexist with new-format audio. Unlike an unmatched new
+  // descriptor — which a lost Audio Source could still have matched in a truncated file — a
+  // payload beside a legacy record is an orphan no later bytes can legitimize, so it is
+  // refused even in recovery, matching the indexed reader.
+  if (legacy != null && payloads.isNotEmpty) {
+    final sourceId = payloads.keys.reduce(mathMin);
+    throw FourdgsMalformedFile(
+      'Audio Data id $sourceId has no matching Audio Source record',
+    );
+  }
+
+  final sources = <FourdgsAudioSource>[];
+  final sourceIds = descriptors.keys.toList()..sort();
+  for (final sourceId in sourceIds) {
+    final descriptor = descriptors[sourceId]!;
+    final data = payloads.remove(sourceId);
+    if (data == null) {
+      if (truncated) continue;
+      throw FourdgsMalformedFile(
+        'Audio Source id $sourceId has no matching Audio Data record',
+      );
+    }
+    if (data.length != descriptor.dataLength) {
+      throw FourdgsMalformedFile(
+        'Audio Source id $sourceId declares ${descriptor.dataLength} data '
+        'bytes, its Audio Data record contains ${data.length}',
+      );
+    }
+    _checkAudioKeyframeTimes(descriptor, header.durationSec);
+    sources.add(_audioSource(descriptor, data));
+  }
+
+  if (payloads.isNotEmpty && !truncated) {
+    final sourceId = payloads.keys.reduce(mathMin);
+    throw FourdgsMalformedFile(
+      'Audio Data id $sourceId has no matching Audio Source record',
+    );
+  }
+  if (legacy != null) {
+    sources.add(
+      FourdgsAudioSource(
+        sourceId: 0,
+        name: '',
+        codec: legacy.codec,
+        channelLayout: '',
+        dataLength: legacy.data.length,
+        startSec: legacy.startSec,
+        durationSec: mathMax(0.0, header.durationSec - legacy.startSec),
+        gain: 1.0,
+        spatial: false,
+        loop: false,
+        position: const <double>[0.0, 0.0, 0.0],
+        rotation: const <double>[0.0, 0.0, 0.0, 1.0],
+        keyframes: const <FourdgsAudioSourceKeyframe>[],
+        interpolation: 'linear',
+        data: legacy.data,
+      ),
+    );
+  }
+  if ((!header.hasAudio && sources.isNotEmpty) ||
+      (header.hasAudio && sources.isEmpty && !truncated)) {
+    throw FourdgsMalformedFile(
+      'the Header audio flag is ${header.hasAudio ? 'set' : 'clear'}, but '
+      'the file contains ${sources.length} complete audio sources',
+    );
+  }
+  return sources;
+}
+
+int mathMin(int a, int b) => a < b ? a : b;
+
+double mathMax(double a, double b) => a > b ? a : b;
+
+void _checkAudioKeyframeTimes(
+  FourdgsAudioSourceRecord source,
+  double sceneDuration,
+) {
+  for (int i = 0; i < source.keyframes.length; i++) {
+    final time = source.keyframes[i].time;
+    if (time < 0.0 || time > sceneDuration) {
+      throw FourdgsMalformedFile(
+        'Audio Source id ${source.sourceId} keyframe $i time $time is '
+        'outside [0, $sceneDuration]',
+      );
+    }
+  }
+}
+
+FourdgsAudioSource _audioSource(
+  FourdgsAudioSourceRecord source,
+  Uint8List data,
+) => FourdgsAudioSource(
+  sourceId: source.sourceId,
+  name: source.name,
+  codec: source.codec,
+  channelLayout: source.channelLayout,
+  dataLength: source.dataLength,
+  startSec: source.startSec,
+  durationSec: source.durationSec,
+  gain: source.gain,
+  spatial: source.spatial,
+  loop: source.loop,
+  position: source.position,
+  rotation: source.rotation,
+  keyframes: <FourdgsAudioSourceKeyframe>[
+    for (final keyframe in source.keyframes)
+      FourdgsAudioSourceKeyframe(
+        time: keyframe.time,
+        position: keyframe.position,
+        rotation: keyframe.rotation,
+      ),
+  ],
+  interpolation: source.interpolation,
+  data: data,
+);
 
 bool _endsWithMagic(Uint8List data) {
   if (data.length < fourdgsMagic.length) return false;

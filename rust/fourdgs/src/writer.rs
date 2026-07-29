@@ -23,7 +23,7 @@ use std::path::Path;
 
 use crate::codec;
 use crate::error::{Error, Result};
-use crate::model::{AudioTrack, GaussianSet};
+use crate::model::{AudioSource, AudioTrack, GaussianSet};
 use crate::opcode as op;
 use crate::quantization::{
     life_class, life_half, morton_order, motion_step, mu_step, quantize_rotation, quantize_sh,
@@ -105,7 +105,11 @@ impl Default for WriteOptions {
 /// Everything that travels with the gaussians.
 #[derive(Debug, Clone, Default)]
 pub struct SceneExtras {
-    /// Absence is the signal: no audio means no record at all, not an empty one.
+    /// Spatial and non-spatial sources written as Audio Source / Audio Data pairs.
+    pub audio_sources: Vec<AudioSource>,
+    /// Pre-spatial compatibility input, normalized into source id 0 by the writer.
+    ///
+    /// New code should use `audio_sources`; passing both forms is an error.
     pub audio: Option<AudioTrack>,
     pub camera: Option<rec::Camera>,
     pub metadata: Vec<rec::Metadata>,
@@ -476,6 +480,138 @@ fn plan_chunks(
     plans
 }
 
+fn normalized_audio_sources(extras: &SceneExtras, scene_duration: f64) -> Result<Vec<AudioSource>> {
+    if extras.audio.is_some() && !extras.audio_sources.is_empty() {
+        return Err(Error::Malformed(
+            "pass audio_sources or the legacy audio field, not both".into(),
+        ));
+    }
+    let sources = match &extras.audio {
+        None => extras.audio_sources.clone(),
+        Some(audio) => vec![AudioSource {
+            source_id: 0,
+            codec: audio.codec.clone(),
+            channel_layout: "unspecified".into(),
+            start_sec: audio.start_sec,
+            duration_sec: (scene_duration - audio.start_sec).max(0.0),
+            spatial: false,
+            data: audio.data.clone(),
+            ..AudioSource::default()
+        }],
+    };
+
+    let mut ids = std::collections::BTreeSet::new();
+    for source in &sources {
+        if !ids.insert(source.source_id) {
+            return Err(Error::Malformed(format!(
+                "audio source id {} is duplicated",
+                source.source_id
+            )));
+        }
+        if source.codec.is_empty() {
+            return Err(Error::Malformed(format!(
+                "audio source {} has an empty codec",
+                source.source_id
+            )));
+        }
+        if source.data.is_empty() {
+            return Err(Error::Malformed(format!(
+                "audio source {} has no encoded data",
+                source.source_id
+            )));
+        }
+        if !source.start_sec.is_finite() {
+            return Err(Error::Malformed(format!(
+                "audio source {} start_sec is not finite",
+                source.source_id
+            )));
+        }
+        if !source.duration_sec.is_finite() || source.duration_sec <= 0.0 {
+            return Err(Error::Malformed(format!(
+                "audio source {} duration_sec must be finite and positive",
+                source.source_id
+            )));
+        }
+        if !source.gain.is_finite() || source.gain < 0.0 {
+            return Err(Error::Malformed(format!(
+                "audio source {} gain must be finite and non-negative",
+                source.source_id
+            )));
+        }
+        if source.spatial && source.channel_layout != "mono" {
+            return Err(Error::Malformed(format!(
+                "spatial audio source {} must use the mono channel layout",
+                source.source_id
+            )));
+        }
+        if !source.position.iter().all(|value| value.is_finite()) {
+            return Err(Error::Malformed(format!(
+                "audio source {} position must contain three finite values",
+                source.source_id
+            )));
+        }
+        if !source.rotation.iter().all(|value| value.is_finite())
+            || source.rotation.iter().all(|value| *value == 0.0)
+        {
+            return Err(Error::Malformed(format!(
+                "audio source {} rotation must be a finite non-zero quaternion",
+                source.source_id
+            )));
+        }
+        if source.interpolation != "linear" && source.interpolation != "step" {
+            return Err(Error::Malformed(format!(
+                "audio source {} uses unknown interpolation {:?}",
+                source.source_id, source.interpolation
+            )));
+        }
+        let mut last = f64::NEG_INFINITY;
+        for (index, keyframe) in source.keyframes.iter().enumerate() {
+            if !keyframe.position.iter().all(|value| value.is_finite()) {
+                return Err(Error::Malformed(format!(
+                    "audio source {} keyframe {index} position must contain three finite values",
+                    source.source_id
+                )));
+            }
+            if !keyframe.rotation.iter().all(|value| value.is_finite())
+                || keyframe.rotation.iter().all(|value| *value == 0.0)
+            {
+                return Err(Error::Malformed(format!(
+                    "audio source {} keyframe {index} rotation must be a finite non-zero quaternion",
+                    source.source_id
+                )));
+            }
+            if !keyframe.time.is_finite() || keyframe.time <= last {
+                return Err(Error::Malformed(format!(
+                    "audio source {} keyframe {index} time must be finite and strictly increasing",
+                    source.source_id
+                )));
+            }
+            if keyframe.time < 0.0 || keyframe.time > scene_duration {
+                return Err(Error::Malformed(format!(
+                    "audio source {} keyframe {index} time {} is outside [0, {scene_duration}]",
+                    source.source_id, keyframe.time
+                )));
+            }
+            last = keyframe.time;
+        }
+    }
+    Ok(sources)
+}
+
+fn normalized_audio_rotation(value: [f64; 4]) -> [f64; 4] {
+    let scale = value
+        .iter()
+        .map(|component| component.abs())
+        .fold(0.0_f64, f64::max);
+    let scaled = value.map(|component| component / scale);
+    let length = scaled
+        .iter()
+        .map(|component| component * component)
+        .sum::<f64>()
+        .sqrt();
+    scaled.map(|component| component / length)
+}
+
 fn encode(
     g: &GaussianSet,
     duration_sec: f64,
@@ -484,6 +620,7 @@ fn encode(
 ) -> Result<Vec<u8>> {
     let n = g.count();
     let q = quantize_scene(g, opts)?;
+    let audio_sources = normalized_audio_sources(extras, duration_sec)?;
 
     // Window boundaries are the top level of the partition. Anything strictly inside the
     // clip becomes a split point; the ends are always present.
@@ -582,7 +719,7 @@ fn encode(
                 g.sh_degree
             },
             // Absence is the whole signal: the bit is clear and there is no record.
-            flags: if extras.audio.is_some() {
+            flags: if !audio_sources.is_empty() {
                 rec::FLAG_HAS_AUDIO
             } else {
                 0
@@ -619,12 +756,46 @@ fn encode(
         out.extend_from_slice(blob);
     }
 
-    if let Some(audio) = &extras.audio {
+    for source in &audio_sources {
+        let flags = (if source.spatial {
+            rec::AUDIO_SOURCE_SPATIAL
+        } else {
+            0
+        }) | (if source.loop_ {
+            rec::AUDIO_SOURCE_LOOP
+        } else {
+            0
+        });
         out.extend_from_slice(
-            &rec::Audio {
-                codec: audio.codec.clone(),
-                start_sec: audio.start_sec,
-                data: audio.data.clone(),
+            &rec::AudioSource {
+                source_id: source.source_id,
+                name: source.name.clone(),
+                codec: source.codec.clone(),
+                channel_layout: source.channel_layout.clone(),
+                data_length: source.data.len() as u64,
+                start_sec: source.start_sec,
+                duration_sec: source.duration_sec,
+                gain: source.gain,
+                flags,
+                position: source.position,
+                rotation: normalized_audio_rotation(source.rotation),
+                keyframes: source
+                    .keyframes
+                    .iter()
+                    .map(|frame| rec::AudioSourceKeyframe {
+                        time: frame.time,
+                        position: frame.position,
+                        rotation: normalized_audio_rotation(frame.rotation),
+                    })
+                    .collect(),
+                interpolation: source.interpolation.clone(),
+            }
+            .encode(),
+        );
+        out.extend_from_slice(
+            &rec::AudioData {
+                source_id: source.source_id,
+                data: source.data.clone(),
             }
             .encode(),
         );

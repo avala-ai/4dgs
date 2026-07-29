@@ -63,6 +63,16 @@ All notable changes to the Rust crate are documented here, following
   been offered. It maps to `FOURDGS_STATUS_INVALID_ARGUMENT`, which already existed in the C header,
   so the ABI does not move.
 
+- Native spatial audio sources across the Rust model, streamed and indexed readers, writer and C
+  ABI. Sources have independent encoded payloads, timing, gain, looping, scene-space pose and moving
+  pose keyframes; reconstructed `AudioSourceState` deliberately stops before listener-relative
+  rendering.
+- Descriptor-only, source-state and bounded payload-range access. The payload size is validated and
+  available before allocation, allowing C, C++ and Swift players to stream encoded source data
+  without reading the whole file or source.
+- Audio Source and Audio Data records with legacy Audio read compatibility. Writers validate timing
+  and keyframes and normalize quaternions before emission.
+
 ## [0.1.0] - 2026-07-29
 
 The first release of the Rust crate, and the first cut from a tag. It is the decoder and the

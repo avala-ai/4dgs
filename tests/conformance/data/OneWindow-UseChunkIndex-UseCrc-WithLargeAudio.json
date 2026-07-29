@@ -10,11 +10,51 @@
     "zeroMotionCount": "0"
   },
   "attachments": [],
-  "audio": {
-    "byteLength": "96044",
-    "codec": "wav",
-    "crc": "1939450109"
-  },
+  "audioSources": [
+    {
+      "byteLength": "96044",
+      "channelLayout": "mono",
+      "codec": "wav",
+      "crc": "1939450109",
+      "durationSec": 6.0,
+      "gain": 1.0,
+      "interpolation": "linear",
+      "keyframeCount": "0",
+      "keyframes": [],
+      "loop": false,
+      "name": "large-source",
+      "position": [
+        -2.0,
+        0.5,
+        1.0
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "sourceId": "7",
+      "spatial": true,
+      "startSec": 0.0,
+      "stateAtHalf": {
+        "active": true,
+        "gain": 1.0,
+        "localTime": 1.0,
+        "position": [
+          -2.0,
+          0.5,
+          1.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      }
+    }
+  ],
   "camera": null,
   "chunkIntervals": [
     [

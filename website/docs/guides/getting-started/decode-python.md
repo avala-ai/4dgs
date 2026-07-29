@@ -27,9 +27,20 @@ Pass the file's own `cutoff` rather than relying on the default whenever you hav
 threshold is the file's, and it is the same constant the encoder derived its velocity grid from.
 
 A `Scene` carries more than its gaussians: `header`, `quantization` (the grids and the error bounds
-the file declares), `audio`, `camera`, `metadata`, `attachments`, `statistics`, `chunk_index`,
-`summary_offsets`, `summary_crc_ok`, `skipped_opcodes` and `truncated`. `audio` is `None` when the
-scene has no soundtrack, which is the common case and not an error.
+the file declares), `audio_sources`, `camera`, `metadata`, `attachments`, `statistics`,
+`chunk_index`, `summary_offsets`, `summary_crc_ok`, `skipped_opcodes` and `truncated`.
+`audio_sources` is empty when the scene has no audio.
+
+Each source reconstructs independently on the scene clock:
+
+```python
+for source in scene.audio_sources:
+    source_state = source.state_at(1.5)
+    # active, local_time, gain, scene-space position and rotation
+```
+
+The player combines that state with its listener pose. HRTF/panning, distance attenuation, occlusion
+and mixing are deliberately not format logic.
 
 `read(..., recover_truncated=True)` is the default: a file cut short mid-write yields everything
 complete before the cut, with `scene.truncated` set. Pass `max_sh_band` to stop short of the file's
@@ -55,9 +66,10 @@ for entry in scene.chunks_for_time(2.5):
     chunk = read_chunk(FileReadable("scene.4dgs"), scene, entry)
 ```
 
-`read_camera`, `read_metadata`, `read_attachments` and `read_audio` fetch the front-matter records
-the same way, each by its own byte range, so opening a scene with a large embedded audio track costs
-nothing extra.
+`read_camera`, `read_metadata` and `read_attachments` fetch front-matter records the same way.
+`read_audio_source_descriptors` and `read_audio_source_state` fetch only small source metadata;
+`read_audio_range(source_id, offset, length)` transfers only the requested payload bytes.
+`read_audio_sources` is the explicit convenience call that materializes every payload.
 
 ## Any transport
 

@@ -8,8 +8,8 @@ everywhere else.
 
 ## Status
 
-Decoding is complete and proved by the shared conformance suite — 34 variants over both read paths,
-run in this repository's CI.
+Decoding is complete and proved by the shared conformance suite — 89 comparisons across 45 valid
+variants over both read paths, run in this repository's CI.
 
 Encoding is complete too. Python's encoder is the _reference_ one, optimized for being obviously
 correct and the one the corpus is generated from; this is the _production_ one, which is why it
@@ -58,8 +58,9 @@ belongs in the consumer, not here.
 No path in this crate reads a whole file. The streamed reader takes an `io::Read` and reads one
 record at a time, growing a buffer only as bytes actually arrive — a crafted length cannot make it
 allocate what the resource does not contain. The indexed reader walks the front matter by stepping
-over record **headers**, so a scene with an embedded audio track costs nothing to open, and fetches
-each chunk and each spherical harmonic band by its own byte range.
+over record **headers**, so a scene with large audio payloads costs nothing to open. It fetches
+source descriptors, source-relative payload ranges, chunks and spherical harmonic bands
+independently.
 
 ## Features
 
@@ -88,9 +89,9 @@ openers take a `fourdgs_open_mode` so a caller can force the sequential or index
 auto-selection is the convenient answer and the wrong one for a conformance suite, where two runners
 that both take whichever path was picked test one path twice.
 
-The surface covers the whole file, not only its gaussians — `temporal_model`, header attributes,
-metadata, attachment bytes, camera, statistics, summary offsets, a tri-state summary CRC and a
-truncated flag — because a binding that can only report the gaussians cannot state what it read.
+The surface covers the whole file, not only its gaussians — moving audio source descriptors and
+state, `temporal_model`, header attributes, metadata, attachment bytes, camera, statistics, summary
+offsets, a tri-state summary CRC and a truncated flag.
 
 `cargo build` produces `libfourdgs.a` and `libfourdgs.{so,dylib}` alongside the rlib.
 `tests/capi_smoke.c` is a C program that links against them and checks the header compiles as C,
@@ -100,7 +101,7 @@ every symbol links, and the documented null and error behaviour holds:
 cargo build --release -p fourdgs
 cc -std=c11 -I rust/fourdgs/include rust/fourdgs/tests/capi_smoke.c \
    -o capi_smoke target/release/libfourdgs.a -lm -lpthread -ldl
-./capi_smoke tests/conformance/data/OneWindow-UseChunkIndex-UseCrc-WithAudio.4dgs
+./capi_smoke tests/conformance/data/OneWindow-UseChunkIndex-UseCrc-WithSpatialAudio.4dgs
 ```
 
 ## Writing

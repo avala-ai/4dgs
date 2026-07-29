@@ -14,7 +14,11 @@ All notable changes to the C++ package are documented here, following
   `encode_roundtrip` conformance runner re-encodes each variant's gaussians for the cross-language
   gate, which requires the Python decoder to read the binding's output the same as the Rust
   reference's.
-
+- Multiple spatial `AudioSource` values with independently timed payloads, fixed or keyframed
+  scene-space poses, quaternion rotation, gain and looping. `audioSourceStateAt` reconstructs the
+  source state at time `t`; spatialization against a listener remains player-owned.
+- Descriptor-only source inspection and bounded payload range reads, plus explicit whole-source
+  helpers for callers that have already accepted the validated allocation size.
 - The package: a CMake project (`fourdgs-cpp`, target `fourdgs::cpp`), the public C++17 API over the
   spec's data model, `Result<T>` error handling, `Readable` transports, and the two conformance
   runners.
@@ -29,7 +33,6 @@ All notable changes to the C++ package are documented here, following
 
 ### Notes
 
-Conformance-verified: 67 checks over 34 variants on both read paths, the same numbers as the
-reference implementation, and the feature matrix records exactly what that proves. Nothing is
-released yet — the package has no version to release from, and the encode rows stay `Planned`
-because it decodes only at v1.
+Conformance-verified: 79 checks across the 45 valid variants this binding supports, and the feature
+matrix records exactly what that proves. Nothing is released yet — the package has no version to
+release from.

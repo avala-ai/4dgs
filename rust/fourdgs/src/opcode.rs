@@ -22,6 +22,8 @@ pub const STATISTICS: u8 = 0x0C;
 pub const ATTACHMENT: u8 = 0x0D;
 pub const ATTACHMENT_INDEX: u8 = 0x0E;
 pub const SUMMARY_OFFSET: u8 = 0x0F;
+pub const AUDIO_SOURCE: u8 = 0x11;
+pub const AUDIO_DATA: u8 = 0x12;
 
 // The provenance family, spec section 5.15. The first three run in dependency order —
 // a sensor's extrinsic and a rig's pose are poses in a frame, and `0x20` names that
@@ -68,6 +70,8 @@ pub fn name(opcode: u8) -> String {
         ATTACHMENT => "Attachment",
         ATTACHMENT_INDEX => "AttachmentIndex",
         SUMMARY_OFFSET => "SummaryOffset",
+        AUDIO_SOURCE => "Audio Source",
+        AUDIO_DATA => "Audio Data",
         COORDINATE_FRAME => "CoordinateFrame",
         SENSOR_CALIBRATION => "SensorCalibration",
         RIG_TRAJECTORY => "RigTrajectory",

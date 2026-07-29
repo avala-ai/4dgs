@@ -33,6 +33,7 @@ static void check(int condition, const char *what) {
 static void check_null_safety(void) {
     check(fourdgs_scene_duration_sec(NULL) == 0.0, "duration of a null scene is 0");
     check(fourdgs_scene_gaussian_count(NULL) == 0, "gaussian count of a null scene is 0");
+    check(fourdgs_scene_audio_source_count(NULL) == 0, "audio count of a null scene is 0");
     check(fourdgs_scene_loaded_count(NULL) == 0, "loaded count of a null scene is 0");
     check(fourdgs_scene_positions(NULL) == NULL, "positions of a null scene is null");
     check(fourdgs_scene_sh(NULL) == NULL, "sh of a null scene is null");
@@ -360,20 +361,42 @@ int main(int argc, char **argv) {
     check_summary_surface(scene);
     check(fourdgs_scene_truncated(scene) == 0, "a complete file is not truncated");
 
-    /* Audio is optional in every sense: absence is a value, and it costs nothing. */
+    /* Audio is zero or more independently range-readable, reconstructable sources. */
     if (fourdgs_scene_has_audio(scene)) {
-        uint64_t size = fourdgs_scene_audio_size(scene);
-        const char *codec = fourdgs_scene_audio_codec(scene);
-        check(codec != NULL && strlen(codec) > 0, "an audio-bearing scene names its codec");
-        check(size > 0, "an audio-bearing scene has a non-empty track");
-        if (size > 0) {
-            uint8_t head[4] = {0};
-            check(fourdgs_scene_audio_read(scene, 0, 4, head) == FOURDGS_STATUS_OK,
-                  "a range of the track is readable");
-            check(fourdgs_scene_audio_read(scene, size, 4, head) != FOURDGS_STATUS_OK,
-                  "a range past the track is refused");
+        uint32_t count = fourdgs_scene_audio_source_count(scene);
+        check(count > 0, "an audio-bearing scene has at least one source");
+        for (uint32_t i = 0; i < count; ++i) {
+            fourdgs_audio_source source;
+            check(fourdgs_scene_audio_source(scene, i, &source) == FOURDGS_STATUS_OK,
+                  "each audio source descriptor is readable");
+            check(source.codec != NULL && source.codec_length > 0,
+                  "each source names its codec");
+            check(source.data_size > 0, "each source has encoded data");
+            for (uint32_t k = 0; k < source.keyframe_count; ++k) {
+                fourdgs_audio_source_keyframe keyframe;
+                check(fourdgs_scene_audio_source_keyframe(scene, i, k, &keyframe) ==
+                          FOURDGS_STATUS_OK,
+                      "each moving-source keyframe is readable");
+            }
+            fourdgs_audio_source_state state;
+            check(fourdgs_scene_audio_source_state_at(scene, i, duration / 2.0, &state) ==
+                      FOURDGS_STATUS_OK,
+                  "source timing and moving pose reconstruct at scene time");
+            if (source.data_size >= 4) {
+                uint8_t head[4] = {0};
+                check(fourdgs_scene_audio_source_read(scene, i, 0, 4, head) ==
+                          FOURDGS_STATUS_OK,
+                      "a source payload range is readable");
+                check(fourdgs_scene_audio_source_read(scene, i, source.data_size, 4, head) !=
+                          FOURDGS_STATUS_OK,
+                      "a range past one source is refused");
+            }
         }
+        check(fourdgs_scene_audio_source(scene, count, NULL) == FOURDGS_STATUS_INVALID_ARGUMENT,
+              "a null descriptor out parameter is invalid");
     } else {
+        check(fourdgs_scene_audio_source_count(scene) == 0,
+              "a scene without audio has no sources");
         check(fourdgs_scene_audio_codec(scene) == NULL,
               "a scene without audio names no codec");
         check(fourdgs_scene_audio_size(scene) == 0,

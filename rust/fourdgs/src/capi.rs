@@ -31,7 +31,7 @@ use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use crate::error::Error;
-use crate::model::{GaussianSet, StateAt};
+use crate::model::{AudioSource, GaussianSet, StateAt};
 use crate::readable::{FileReadable, Readable};
 use crate::reader::SceneReader;
 use crate::writer::{write_to_vec, SceneExtras, WriteOptions};
@@ -237,6 +237,9 @@ pub struct fourdgs_scene {
     inner: SceneReader<Box<dyn Readable>>,
     /// Strings handed out as borrowed pointers, kept alive alongside the scene.
     strings: Vec<CString>,
+    /// Source descriptors are small and fetched lazily. Keeping them here gives all
+    /// pointer-and-length string fields a scene lifetime across the C boundary.
+    audio_descriptors: Vec<Option<AudioSource>>,
 }
 
 /// Reconstructed state at one instant. Opaque to C.
@@ -251,9 +254,11 @@ fn open_from(source: Box<dyn Readable>, out: *mut *mut fourdgs_scene) -> c_int {
     }
     match SceneReader::open(source) {
         Ok(inner) => {
+            let audio_descriptors = vec![None; inner.audio_source_count()];
             let scene = Box::new(fourdgs_scene {
                 inner,
                 strings: Vec::new(),
+                audio_descriptors,
             });
             // SAFETY: `out` was checked non-null; the caller owns the result and frees it
             // with `fourdgs_scene_free`.
@@ -469,40 +474,299 @@ pub unsafe extern "C" fn fourdgs_scene_bytes_for_time(
 // Audio
 // --------------------------------------------------------------------------
 
-/// Whether the scene has a soundtrack, answered from the Header alone — no probing and no
-/// speculative range request. Absence is a normal value, never an error.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct fourdgs_audio_source {
+    pub source_id: u32,
+    pub name: *const c_char,
+    pub name_length: usize,
+    pub codec: *const c_char,
+    pub codec_length: usize,
+    pub channel_layout: *const c_char,
+    pub channel_layout_length: usize,
+    pub start_sec: f64,
+    pub duration_sec: f64,
+    pub gain: f64,
+    pub spatial: c_int,
+    pub loop_playback: c_int,
+    pub position: [f64; 3],
+    pub rotation: [f64; 4],
+    pub keyframe_count: u32,
+    pub interpolation: *const c_char,
+    pub interpolation_length: usize,
+    pub data_size: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct fourdgs_audio_source_keyframe {
+    pub time: f64,
+    pub position: [f64; 3],
+    pub rotation: [f64; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct fourdgs_audio_source_state {
+    pub active: c_int,
+    pub local_time: f64,
+    pub position: [f64; 3],
+    pub rotation: [f64; 4],
+    pub gain: f64,
+}
+
+fn cache_audio_descriptor(scene: &mut fourdgs_scene, index: usize) -> crate::Result<()> {
+    if scene.audio_descriptors.get(index).is_none() {
+        return Err(Error::Malformed(format!(
+            "audio source index {index} is outside the {}-source scene",
+            scene.audio_descriptors.len()
+        )));
+    }
+    if scene.audio_descriptors[index].is_none() {
+        let descriptor = scene.inner.audio_source(index)?.ok_or_else(|| {
+            Error::Malformed(format!(
+                "audio source index {index} disappeared after the scene was opened"
+            ))
+        })?;
+        scene.audio_descriptors[index] = Some(descriptor);
+    }
+    Ok(())
+}
+
+/// Whether the scene has audio sources, answered from the Header alone — no probing and
+/// no speculative range request. Absence is a normal value, never an error.
 #[no_mangle]
 pub unsafe extern "C" fn fourdgs_scene_has_audio(scene: *const fourdgs_scene) -> c_int {
     c_int::from(scene_or!(scene, 0).inner.has_audio())
 }
 
-/// The audio codec's registry name, or null when the scene has no track. Borrowed; valid
-/// until the scene is freed.
+/// Number of independently timed audio sources.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_scene_audio_source_count(scene: *const fourdgs_scene) -> u32 {
+    scene_or!(scene, 0).inner.audio_source_count() as u32
+}
+
+/// Fetch one small source descriptor. Encoded audio bytes are not transferred.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_scene_audio_source(
+    scene: *mut fourdgs_scene,
+    index: u32,
+    out: *mut fourdgs_audio_source,
+) -> c_int {
+    guarded(|| {
+        let Some(scene) = (unsafe { scene.as_mut() }) else {
+            set_last_error("the scene pointer is null".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        };
+        let Some(out) = (unsafe { out.as_mut() }) else {
+            set_last_error("the audio source out parameter is null".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        };
+        let index = index as usize;
+        if index >= scene.audio_descriptors.len() {
+            set_last_error(format!(
+                "audio source index {index} is outside the {}-source scene",
+                scene.audio_descriptors.len()
+            ));
+            return FOURDGS_STATUS_OUT_OF_RANGE;
+        }
+        if let Err(error) = cache_audio_descriptor(scene, index) {
+            return report(error);
+        }
+        let source = scene.audio_descriptors[index]
+            .as_ref()
+            .expect("cached above");
+        *out = fourdgs_audio_source {
+            source_id: source.source_id,
+            name: source.name.as_ptr().cast(),
+            name_length: source.name.len(),
+            codec: source.codec.as_ptr().cast(),
+            codec_length: source.codec.len(),
+            channel_layout: source.channel_layout.as_ptr().cast(),
+            channel_layout_length: source.channel_layout.len(),
+            start_sec: source.start_sec,
+            duration_sec: source.duration_sec,
+            gain: source.gain,
+            spatial: c_int::from(source.spatial),
+            loop_playback: c_int::from(source.loop_),
+            position: source.position,
+            rotation: source.rotation,
+            keyframe_count: source.keyframes.len() as u32,
+            interpolation: source.interpolation.as_ptr().cast(),
+            interpolation_length: source.interpolation.len(),
+            data_size: scene.inner.audio_source_len(index).unwrap_or(0),
+        };
+        FOURDGS_STATUS_OK
+    })
+}
+
+/// One moving-source pose keyframe.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_scene_audio_source_keyframe(
+    scene: *mut fourdgs_scene,
+    source_index: u32,
+    keyframe_index: u32,
+    out: *mut fourdgs_audio_source_keyframe,
+) -> c_int {
+    guarded(|| {
+        let Some(scene) = (unsafe { scene.as_mut() }) else {
+            set_last_error("the scene pointer is null".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        };
+        let Some(out) = (unsafe { out.as_mut() }) else {
+            set_last_error("the audio keyframe out parameter is null".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        };
+        let source_index = source_index as usize;
+        if source_index >= scene.audio_descriptors.len() {
+            set_last_error(format!(
+                "audio source index {source_index} is outside the {}-source scene",
+                scene.audio_descriptors.len()
+            ));
+            return FOURDGS_STATUS_OUT_OF_RANGE;
+        }
+        if let Err(error) = cache_audio_descriptor(scene, source_index) {
+            return report(error);
+        }
+        let source = scene.audio_descriptors[source_index]
+            .as_ref()
+            .expect("cached above");
+        let Some(keyframe) = source.keyframes.get(keyframe_index as usize) else {
+            set_last_error(format!(
+                "audio source {} keyframe {keyframe_index} is outside its {} keyframes",
+                source.source_id,
+                source.keyframes.len()
+            ));
+            return FOURDGS_STATUS_OUT_OF_RANGE;
+        };
+        *out = fourdgs_audio_source_keyframe {
+            time: keyframe.time,
+            position: keyframe.position,
+            rotation: keyframe.rotation,
+        };
+        FOURDGS_STATUS_OK
+    })
+}
+
+/// Reconstruct one source's timing and scene-space pose at scene time `t`.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_scene_audio_source_state_at(
+    scene: *mut fourdgs_scene,
+    source_index: u32,
+    t: f64,
+    out: *mut fourdgs_audio_source_state,
+) -> c_int {
+    guarded(|| {
+        let Some(scene) = (unsafe { scene.as_mut() }) else {
+            set_last_error("the scene pointer is null".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        };
+        let Some(out) = (unsafe { out.as_mut() }) else {
+            set_last_error("the audio source state out parameter is null".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        };
+        let source_index = source_index as usize;
+        if source_index >= scene.audio_descriptors.len() {
+            set_last_error(format!(
+                "audio source index {source_index} is outside the {}-source scene",
+                scene.audio_descriptors.len()
+            ));
+            return FOURDGS_STATUS_OUT_OF_RANGE;
+        }
+        if let Err(error) = cache_audio_descriptor(scene, source_index) {
+            return report(error);
+        }
+        let state = scene.audio_descriptors[source_index]
+            .as_ref()
+            .expect("cached above")
+            .state_at(t);
+        *out = fourdgs_audio_source_state {
+            active: c_int::from(state.active),
+            local_time: state.local_time,
+            position: state.position,
+            rotation: state.rotation,
+            gain: state.gain,
+        };
+        FOURDGS_STATUS_OK
+    })
+}
+
+/// Copy one source payload range. The caller selects by stable descriptor ordinal.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_scene_audio_source_read(
+    scene: *mut fourdgs_scene,
+    index: u32,
+    offset: u64,
+    length: u64,
+    out: *mut u8,
+) -> c_int {
+    guarded(|| {
+        let Some(scene) = (unsafe { scene.as_mut() }) else {
+            set_last_error("the scene pointer is null".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        };
+        if out.is_null() && length != 0 {
+            set_last_error("the output buffer is null".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        }
+        let index = index as usize;
+        if index >= scene.audio_descriptors.len() {
+            set_last_error(format!(
+                "audio source index {index} is outside the {}-source scene",
+                scene.audio_descriptors.len()
+            ));
+            return FOURDGS_STATUS_OUT_OF_RANGE;
+        }
+        if let Err(error) = cache_audio_descriptor(scene, index) {
+            return report(error);
+        }
+        let source_id = scene.audio_descriptors[index]
+            .as_ref()
+            .expect("cached above")
+            .source_id;
+        match scene
+            .inner
+            .read_audio_source_range(source_id, offset, length)
+        {
+            Ok(bytes) => {
+                if !bytes.is_empty() {
+                    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len()) };
+                }
+                FOURDGS_STATUS_OK
+            }
+            Err(error) => report(error),
+        }
+    })
+}
+
+/// The first source's codec, retained for ABI compatibility. Borrowed until scene free.
 #[no_mangle]
 pub unsafe extern "C" fn fourdgs_scene_audio_codec(scene: *mut fourdgs_scene) -> *const c_char {
     // SAFETY: null is handled; otherwise the caller guarantees a live scene.
     let Some(scene) = (unsafe { scene.as_mut() }) else {
         return std::ptr::null();
     };
-    let Some(codec) = scene.inner.audio_codec() else {
+    if scene.audio_descriptors.is_empty() || cache_audio_descriptor(scene, 0).is_err() {
         return std::ptr::null();
-    };
-    let Ok(owned) = CString::new(codec) else {
+    }
+    let codec = &scene.audio_descriptors[0]
+        .as_ref()
+        .expect("cached above")
+        .codec;
+    let Ok(owned) = CString::new(codec.as_str()) else {
         return std::ptr::null();
     };
     scene.strings.push(owned);
     scene.strings.last().expect("just pushed").as_ptr()
 }
 
-/// The track's length in bytes, without fetching it. 0 when there is no track.
+/// The first source's payload length, retained for ABI compatibility.
 #[no_mangle]
 pub unsafe extern "C" fn fourdgs_scene_audio_size(scene: *const fourdgs_scene) -> u64 {
     scene_or!(scene, 0).inner.audio_len().unwrap_or(0)
 }
 
-/// Copy `length` bytes of the track from `offset` into `out`, which must have room for
-/// them. Offsets are relative to the track, not to the file, and the read touches only
-/// those bytes.
+/// Read the first source payload, retained for ABI compatibility.
 #[no_mangle]
 pub unsafe extern "C" fn fourdgs_scene_audio_read(
     scene: *mut fourdgs_scene,
@@ -523,7 +787,9 @@ pub unsafe extern "C" fn fourdgs_scene_audio_read(
             Ok(bytes) => {
                 // SAFETY: the caller states `out` has room for `length` bytes, and
                 // `read_audio_range` returned exactly that many.
-                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len()) };
+                if !bytes.is_empty() {
+                    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len()) };
+                }
                 FOURDGS_STATUS_OK
             }
             Err(e) => report(e),
@@ -782,9 +1048,11 @@ fn open_from_with(source: Box<dyn Readable>, mode: c_int, out: *mut *mut fourdgs
     };
     match SceneReader::open_with(source, mode) {
         Ok(inner) => {
+            let audio_descriptors = vec![None; inner.audio_source_count()];
             let scene = Box::new(fourdgs_scene {
                 inner,
                 strings: Vec::new(),
+                audio_descriptors,
             });
             // SAFETY: `out` was checked non-null; the caller frees the result.
             unsafe { *out = Box::into_raw(scene) };
@@ -1181,7 +1449,9 @@ pub unsafe extern "C" fn fourdgs_scene_attachment_read(
         }
         // SAFETY: the caller states `out` has room for `length` bytes, and the range was
         // just checked against the payload.
-        unsafe { std::ptr::copy_nonoverlapping(record.data[start..end].as_ptr(), out, want) };
+        if want != 0 {
+            unsafe { std::ptr::copy_nonoverlapping(record.data[start..end].as_ptr(), out, want) };
+        }
         FOURDGS_STATUS_OK
     })
 }
