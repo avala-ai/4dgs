@@ -8,6 +8,14 @@ The four packages version together.
 
 ## [Unreleased]
 
+### Fixed
+
+- `@4dgs/core`: the window-table parser allocated its output from the record's declared count before
+  reading a byte, so a corrupt count named a 68 GB allocation and crashed a memory-limited runtime
+  instead of refusing the file. The count is now proven against the bytes that remain first. The
+  chunk-level `uncompressedSize` had the same shape on the decompression path and is now held to the
+  same cap as a stream's.
+
 ### Added
 
 - `@4dgs/core`: the decoder. Record framing that skips unknown opcodes by length, attribute streams

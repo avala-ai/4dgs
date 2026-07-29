@@ -202,6 +202,15 @@ export function parseQuantization(content: Uint8Array): Quantization {
 export function parseWindowTable(content: Uint8Array): Float64Array {
   const c = new Cursor(content);
   const count = c.u32();
+  // The allocation is sized from the count, so the count must be proven against the
+  // bytes that remain before anything is allocated. A corrupt count of 2^32 - 1 names
+  // a 68 GB table; reading would refuse it eight bytes in, but the allocation comes
+  // first, and an allocation the runtime cannot satisfy is a crash, not a diagnosis.
+  if (count * 16 > c.remaining) {
+    throw new TruncatedFile(
+      `window table declares ${count} windows (${count * 16} bytes), ${c.remaining} remain`,
+    );
+  }
   const out = new Float64Array(count * 2);
   for (let i = 0; i < count * 2; i++) out[i] = c.f64();
   return out;

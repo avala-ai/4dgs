@@ -28,7 +28,7 @@ import {
   type Steps,
 } from "./quantization.js";
 import type { ParsedChunk, Quantization } from "./records.js";
-import { decodeStream, frameStreams, type RawStream } from "./streams.js";
+import { decodeStream, frameStreams, MAX_STREAM_BYTES, type RawStream } from "./streams.js";
 
 /**
  * The Window Table as flattened `[lo, hi]` pairs, or the one-window default.
@@ -278,6 +278,14 @@ export async function chunkStreamBytes(
   if (codec === undefined) {
     throw new UnsupportedCodec(
       `chunk at t0=${t0} is compressed with "${compression}", which this build does not know`,
+    );
+  }
+  // The decompressor allocates its declared output in one call, so the declaration is
+  // bounded here the same way decodeStream bounds a stream's: a header field is not a
+  // validated number until something has refused the absurd end of its range.
+  if (uncompressedSize > MAX_STREAM_BYTES) {
+    throw new MalformedFile(
+      `chunk at t0=${t0} declares ${uncompressedSize} uncompressed bytes, past the ${MAX_STREAM_BYTES} cap`,
     );
   }
   return decompressorFor(codec, codecs)(chunk.streams, uncompressedSize);

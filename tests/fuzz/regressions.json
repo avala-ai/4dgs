@@ -70,6 +70,13 @@
       "operator": "flip_bit",
       "seed": 1296533904,
       "found": "1.4 seconds and gigabytes of allocation from one flipped bit: a constant stream declaring 2^30 elements expands a one-byte payload, which the payload-size cap never saw"
+    },
+    {
+      "name": "window-table-count-allocated-before-read",
+      "variant": "OneGaussian-Quantized-UseChunkIndex-UseCrc",
+      "operator": "max_run",
+      "seed": 1296514791,
+      "found": "RangeError: Array buffer allocation failed on a memory-limited runner; a 0xff run over the window-table count named a 68 GB table and the allocation preceded the read that would have refused it"
     }
   ]
 }
