@@ -1,13 +1,16 @@
 # Proposal: the object layer — per-gaussian objects, labels and rigid tracks
 
-**Status: proposed design, open for maintainer review. Not accepted, not normative, not implemented,
-and not to be emitted by any writer.** Nothing in this document changes what a conforming file looks
-like today. It is a design written at wire precision, offered for the same disposition process the
-[keyframe-delta proposal](./keyframe-delta.md) went through: the maintainer rules on the open
-questions in §12, the rulings fold back into the sections they touch, and only then does any of it
-become a revision of [the specification](../index.md) and a set of entries in
-[the registry](../registry.md). Until that happens the specification is the format and this is a
-plan.
+**Status: accepted design. Not yet normative, not yet implemented, and not to be emitted by any
+writer.** Nothing in this document changes what a conforming file looks like today. It is the
+approved design, written at wire precision, and it becomes a revision of
+[the specification](../index.md) and a set of entries in [the registry](../registry.md) as the
+implementation lands. Until it does, the specification is the format and this is a plan.
+
+Every question this design left open has been decided; the decisions are recorded in §12 and folded
+into the sections they affect, so no section contradicts a ruling. Implementation follows the
+keyframe-delta sequence — normative spec move and changelog, the Python reference then the Rust
+production codec, the corpus of §10, the canonical shape, and the feature-matrix rows moved only by
+a passing suite.
 
 Unlike keyframe-delta, this layer is **not a temporal model**. It composes with either of the two
 that exist — `gaussian-birth` today, `keyframe-delta` once it lands — and adds nothing to the
@@ -734,11 +737,31 @@ a gate on old readers, and without touching the seek path — which is the argum
 
 ---
 
-## 12. Open questions for the maintainer
+## 12. Disposition
 
-Each carries a recommendation, in the shape keyframe-delta §13 used, but these are **open** — the
-disposition is the maintainer's, and the sections above are written to the recommendation so that a
-different ruling changes them cleanly.
+The design was reviewed and **accepted**. Every question it left open was ruled on; each ruling is
+recorded here and folded into the section it affects, so the document has no section that
+contradicts a decision and no reader has to hold both a recommendation and its outcome in mind.
+Every ruling matched the design as written, which is why the sections above needed no change to
+agree with them.
+
+| #   | question                                          | ruling                                                      | folded into |
+| --- | ------------------------------------------------- | ----------------------------------------------------------- | ----------- |
+| 1   | Object-track interpolation enum                   | Reuse §5.15.4's registry; no naive lerp, no spline          | §3.3, §4.4  |
+| 2   | `object_id` GOP-invariance under keyframe-delta   | Allow relabelling; absolute restatement, not invariant      | §3.4        |
+| 3   | Embedding type and dimensionality                 | `f32`, file-level dimension, per-object presence; one space | §3.2, §4.4  |
+| 4   | The `object_track_role` degraded-view hint        | Adopt it, advisory, default `enhancement`; no hard flag     | §4.4, §4.6  |
+| 5   | `object_id` without an Object Table               | Valid, not refused                                          | §4.6, §9    |
+| 6   | Number coordination with keyframe-delta and audio | `0x24`/`0x25`/id `14` stand; re-verify against main at impl | §4.4        |
+
+Three of these are the same judgement applied more than once, and it is the judgement the existing
+specification makes everywhere: the format takes on the smaller thing. Ruling 1 declines a spline
+and a naive quaternion-lerp because a measured pose does not want invented intermediates — §5.15.4's
+argument, reused. Ruling 4 declines a hard refusal flag because a capable reader should not be
+denied a file it renders perfectly — keyframe-delta §5's argument, reused. Ruling 5 declines to
+couple two independently-optional pieces, which is the §5.15.1 discipline the provenance family is
+built on. In each case the alternative would have been decided by implementation rather than by
+design.
 
 ### 12.1 Object-track interpolation: reuse the trajectory enum, or a distinct one?
 
@@ -749,13 +772,13 @@ it is the rotation half of `linear`, and a "linear" that lerped quaternion compo
 take the long way round between nearby poses, which §5.15.4 spells out as the bug the shortest-arc
 negation exists to prevent.
 
-**Recommendation: reuse §5.15.4's interpolation registry unchanged** — `0` linear (lerp +
-shortest-arc slerp), `1` step — and offer neither a naive quaternion-lerp nor a `spline`. §5.15.4
-declines `spline` for measured poses because it invents intermediate poses the platform never
-occupied; an object track is the same kind of measurement and the same argument applies. This maps
-the brief's three names onto two modes with no loss: `step`, and `linear` with `slerp` as its
-rotation. If the maintainer wants a genuine spline for _authored_ (non-measured) object motion, that
-is a distinct registry value with its own argument, and adding it later is an append.
+**Decided: reuse §5.15.4's interpolation registry unchanged** — `0` linear (lerp + shortest-arc
+slerp), `1` step — and offer neither a naive quaternion-lerp nor a `spline`. §5.15.4 declines
+`spline` for measured poses because it invents intermediate poses the platform never occupied; an
+object track is the same kind of measurement and the same argument applies. This maps the brief's
+three names onto two modes with no loss: `step`, and `linear` with `slerp` as its rotation. If the
+maintainer wants a genuine spline for _authored_ (non-measured) object motion, that is a distinct
+registry value with its own argument, and adding it later is an append.
 
 ### 12.2 Is `object_id` GOP-invariant under keyframe-delta?
 
@@ -763,49 +786,56 @@ is a distinct registry value with its own argument, and adding it later is an ap
 object relabel mid-GOP is representable. §3.4 recommends allowing it, **restated absolutely** (like
 `rotation_index`), rather than adding it to keyframe-delta §3.5's invariant set.
 
-**Recommendation: allow relabelling, absolute restatement.** It costs nothing to permit, an id
-difference is meaningless so absolute is the only sensible form, and forbidding it would be a rule
-with no failure behind it. If the maintainer prefers objects be fixed for a gaussian's life, the
-stricter rule is "`object_id` MUST NOT appear in an update group" and it folds into keyframe-delta
-§3.5's table as a fifth row.
+**Decided: allow relabelling, absolute restatement.** It costs nothing to permit, an id difference
+is meaningless so absolute is the only sensible form, and forbidding it would be a rule with no
+failure behind it — "a rule with no failure behind it" is exactly the reason not to add one. The
+stricter alternative, had it been chosen, was "`object_id` MUST NOT appear in an update group"
+folded into keyframe-delta §3.5's table as a fifth row; it was not.
 
 ### 12.3 Embedding type and dimensionality
 
 The design stores one `embedding_dim`-dimensional `f32` vector per object, dimension declared once
-for the file. **Recommendation: `f32`, file-level dimension, per-object presence flag** — the vector
-is per-object and therefore cheap, so precision is the safe default and `f16` or a quantized form is
-a later append if the object counts ever make it matter. Two questions the maintainer may want to
-pin: whether a file may carry **more than one** embedding space (recommendation: no, one space per
-file for now — a second is an append), and whether `embedding_dim` should have a stated maximum to
-bound the front matter (recommendation: no hard cap, but the count-before-alloc rule of §3.2 makes
-an absurd one a refusal rather than an allocation).
+for the file. **Decided: `f32`, file-level dimension, per-object presence flag** — the vector is
+per-object and therefore cheap, so precision is the safe default and `f16` or a quantized form is a
+later append if the object counts ever make it matter. Two adjacent questions were pinned the same
+way: a file carries **one** embedding space, not more (a second is an append); and `embedding_dim`
+has **no hard cap**, because the count-before-alloc rule of §3.2 already makes an absurd one a
+refusal rather than an allocation.
 
 ### 12.4 The `object_track_role` degraded-view hint
 
 §4.6 recommends an advisory metadata key so a reader that cannot apply tracks knows whether the base
 positions are world-correct (`enhancement`) or a rest pose the track moves (`authoritative`).
-**Recommendation: adopt the key, advisory, default `enhancement`.** The alternative — a hard flag
-that makes an old reader refuse an `authoritative` file — was considered and rejected for
-keyframe-delta §5's reason: a well-formed file a capable reader renders perfectly should not be
-refused by a reader that merely lacks a feature. If the maintainer would rather the layer carry
-**no** such hint and leave the degraded-view question entirely to producers, the key drops with no
-other change, since nothing in reconstruction reads it.
+**Decided: adopt the key, advisory, default `enhancement`.** The alternative — a hard flag that
+makes an old reader refuse an `authoritative` file — was considered and rejected for keyframe-delta
+§5's reason: a well-formed file a capable reader renders perfectly should not be refused by a reader
+that merely lacks a feature. The key carries no weight in reconstruction, which reads none of it, so
+it stays purely a hint to a degraded consumer.
 
 ### 12.5 Should `object_id` without an Object Table be a refusal?
 
 The brief floats it. §4.6 and §9 answer **no**: the grouping stands alone, isolation and transform
 work from the id and the tracks without a single label, and the table only adds names and search.
-**Recommendation: valid, not refused** — an unlabelled grouping is a real and useful file, and
-refusing it would couple two independently-optional pieces the way §5.15.1 is at pains not to.
+**Decided: valid, not refused** — an unlabelled grouping is a real and useful file, and refusing it
+would couple two independently-optional pieces the way §5.15.1 is at pains not to.
 
-### 12.6 Opcode and attribute-id coordination with keyframe-delta
+### 12.6 Opcode and attribute-id coordination
 
-Both proposals are unmerged and both spend numbers. keyframe-delta takes opcode `0x10` and attribute
-id `13`; this takes opcodes `0x24`/`0x25` and attribute id `14`. There is no collision, and the two
-are designed to coexist in one file (§4.1). **Recommendation: land them in either order**; whichever
-is second confirms the other's numbers are still free, and the registry rows do not overlap. The
-only shared surface is the refusal-expectation harness contract (§10.3), which keyframe-delta §11.5
-introduces first and this reuses.
+This layer spends opcodes `0x24`/`0x25` from the provenance family and attribute id `14`.
+keyframe-delta, now merged, spends opcode `0x10` (Delta Chunk) and attribute id `13`. None of these
+overlap, and a single file may carry all of them (§4.1) — a `keyframe-delta` scene with objects has
+`gaussian_id` (13) tying deltas to gaussians and `object_id` (14) tying gaussians to objects.
+
+**Decided: `0x24`/`0x25` and id `14` stand, and the opcode table is re-verified against `main` at
+implementation time.** The verification is not a formality. While this design was under review a
+separate change claimed opcode `0x10` for an Audio Source record — the number keyframe-delta's Delta
+Chunk already holds on `main` — so there is now a live opcode collision in the tree, and it is being
+resolved separately. It does not touch this layer's numbers, which are in a different range
+entirely, but it is the reason the ruling is "re-verify" rather than "land in either order": the
+opcode space is being spent by more than one design at once, and the only safe assignment is one
+checked against the merged table at the moment of landing, not one assumed free from when it was
+written. The one shared surface with keyframe-delta remains the refusal-expectation harness contract
+(§10.3), which keyframe-delta §11.5 introduced and this reuses.
 
 ---
 
@@ -827,3 +857,24 @@ Named so the boundary is a decision rather than an omission, in the shape spec �
   (§12.3). Both are appends when the evidence asks for them.
 - **Source timing.** The third item §5.15.6 reserved — per-gaussian acquisition timestamps — is
   untouched here and stays reserved; it is unrelated to objects.
+
+## 14. Implementation sequence
+
+The same sequence keyframe-delta followed, and for the same reasons.
+
+1. **Re-verify the opcode table against `main`** (§12.6) before a single byte is written. `0x24` and
+   `0x25` are expected free, but the opcode space is under contention and the check is the point.
+2. **The normative move.** The specification text leaves `proposals/` and enters the normative
+   document with a changelog row of the kind §5.15's rows already are — additive, changing no
+   existing file, since the layer is optional and no writer has emitted it. The registry gains
+   attribute id `14`, opcodes `0x24`/`0x25`, the shared object-track interpolation row, the
+   `object_track_role` key and the `objects` profile.
+3. **The reference then the production codec.** The Python reference implements decode and encode;
+   the Rust production codec follows. Composition (§3.4) is the load-bearing path and is written
+   from this document, not from the other implementation, so the §6 discipline of a reader built
+   from the text alone is kept.
+4. **The corpus.** The scenarios of §10.2, the refusal set of §10.3 (reusing keyframe-delta's
+   harness contract), and the post-transform `states` of §10.1, which are the only check that proves
+   §3.4's arithmetic rather than a file summary.
+5. **The feature matrix**, last. The rows of §10.4 start at `No` and move only when the public suite
+   proves them in CI — the rule the matrix has always had.
