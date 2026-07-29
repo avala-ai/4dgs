@@ -358,7 +358,7 @@ fn extreme_audio_positions_interpolate_without_overflow() {
 
 #[test]
 fn truncation_does_not_excuse_audio_when_the_header_flag_is_clear() {
-    use fourdgs::serialization::{read_record, Cursor, RECORD_HEADER_SIZE};
+    use fourdgs::serialization::{read_record, Cursor, Records, RECORD_HEADER_SIZE};
 
     let (g, duration) = scene(32);
     let extras = SceneExtras {
@@ -386,13 +386,25 @@ fn truncation_does_not_excuse_audio_when_the_header_flag_is_clear() {
     content.u8().unwrap();
     let flags = header_offset + RECORD_HEADER_SIZE + content.position();
     bytes[flags] &= !fourdgs::records::FLAG_HAS_AUDIO;
+    let payload_offset = Records::new(&bytes, fourdgs::MAGIC.len())
+        .find_map(|record| {
+            let record = record.expect("well-formed generated record");
+            (record.opcode == fourdgs::opcode::AUDIO_DATA).then_some(record.offset)
+        })
+        .expect("Audio Data");
+    let orphan = fourdgs::read_bytes(&bytes[..payload_offset])
+        .expect_err("a complete descriptor contradicts the clear Header");
+    assert!(
+        matches!(&orphan, fourdgs::Error::Malformed(message)
+            if message.contains("Header audio flag is clear")),
+        "{orphan}"
+    );
     bytes.pop();
 
     let error = fourdgs::read_bytes(&bytes).expect_err("the complete source contradicts Header");
     assert!(
         matches!(&error, fourdgs::Error::Malformed(message)
-            if message.contains("Header audio flag is clear")
-                && message.contains("1 complete audio source")),
+            if message.contains("Header audio flag is clear")),
         "{error}"
     );
 }

@@ -454,8 +454,10 @@ export function audioSourceStateAt(source: AudioSourceDescriptor, t: number): Au
 
 function loopingLocalTime(t: number, startSec: number, durationSec: number): number {
   if (t <= startSec) return 0;
-  const timeRemainder = ((t % durationSec) + durationSec) % durationSec;
-  const startRemainder = ((startSec % durationSec) + durationSec) % durationSec;
+  let timeRemainder = t % durationSec;
+  if (timeRemainder < 0) timeRemainder += durationSec;
+  let startRemainder = startSec % durationSec;
+  if (startRemainder < 0) startRemainder += durationSec;
   const difference = timeRemainder - startRemainder;
   return difference < 0 ? difference + durationSec : difference;
 }

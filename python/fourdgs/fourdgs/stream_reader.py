@@ -454,6 +454,8 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
     scene.header = header
     scene.quantization = quant
     scene.duration_sec = header.duration_sec
+    if not header.has_audio and (audio_descriptors or audio_payloads or legacy_audio is not None):
+        raise MalformedFile("the Header audio flag is clear, but the file contains audio records")
     if audio_descriptors and legacy_audio is not None:
         raise MalformedFile("the file mixes a legacy Audio record with Audio Source records")
     # A legacy Audio record can never coexist with new-format audio. Unlike an unmatched new

@@ -129,7 +129,16 @@ test("truncation does not excuse a complete audio source when the Header flag is
 
   await assert.rejects(
     () => decodeScene(bytes.subarray(0, bytes.length - 1)),
-    /Header audio flag is clear.*1 complete audio source/,
+    /Header audio flag is clear/,
+  );
+
+  const payload = [...iterateRecords(bytes, MAGIC.length)].find(
+    (record) => record.opcode === Opcode.AudioData,
+  );
+  assert.ok(payload);
+  await assert.rejects(
+    () => decodeScene(bytes.subarray(0, payload.offset)),
+    /Header audio flag is clear/,
   );
 });
 

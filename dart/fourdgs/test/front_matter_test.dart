@@ -79,6 +79,10 @@ void main() {
       bytes,
       fourdgsMagic.length,
     ).firstWhere((record) => record.opcode == opHeader);
+    final payload = iterRecords(
+      bytes,
+      fourdgsMagic.length,
+    ).firstWhere((record) => record.opcode == opAudioData);
     final cursor =
         FourdgsCursor(header.content)
           ..string()
@@ -95,10 +99,17 @@ void main() {
         isA<FourdgsMalformedFile>().having(
           (error) => error.toString(),
           'message',
-          allOf(
-            contains('Header audio flag is clear'),
-            contains('1 complete audio source'),
-          ),
+          contains('Header audio flag is clear'),
+        ),
+      ),
+    );
+    expect(
+      () => readFourdgsBytes(Uint8List.sublistView(bytes, 0, payload.offset)),
+      throwsA(
+        isA<FourdgsMalformedFile>().having(
+          (error) => error.toString(),
+          'message',
+          contains('Header audio flag is clear'),
         ),
       ),
     );

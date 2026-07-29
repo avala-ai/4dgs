@@ -232,6 +232,7 @@ test("audio normalization preserves extreme and tiny finite directions", () => {
   assert.equal(extremeTime.active, true);
   assert.equal(extremeTime.localTime, 0);
   assert.equal(Number.isFinite(extremeTime.localTime), true);
+  assert.equal(audioSourceStateAt({ ...looping, startSec: 1e-20 }, 1).localTime, 1);
 
   const shortAtLargeTime = {
     ...source([0, 0, 0, 1]),

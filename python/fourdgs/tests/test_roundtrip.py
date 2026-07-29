@@ -232,8 +232,11 @@ class TestAudio:
         cursor.u8()
         data[header.offset + 9 + cursor.pos] &= ~1
 
-        with pytest.raises(fourdgs.MalformedFile, match=r"Header audio flag is clear.*1 complete audio source"):
+        with pytest.raises(fourdgs.MalformedFile, match="Header audio flag is clear"):
             fourdgs.read(bytes(data[:-1]), recover_truncated=True)
+        payload = next(record for record in iter_records(data, len(MAGIC)) if record.opcode == op.AUDIO_DATA)
+        with pytest.raises(fourdgs.MalformedFile, match="Header audio flag is clear"):
+            fourdgs.read(bytes(data[: payload.offset]), recover_truncated=True)
 
     def test_the_writer_normalizes_an_extreme_audio_orientation_without_overflow(self):
         source = fourdgs.AudioSource(

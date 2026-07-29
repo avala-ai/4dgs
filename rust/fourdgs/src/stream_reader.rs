@@ -349,6 +349,13 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
         scene.provenance.check()?;
     }
 
+    if !header.has_audio()
+        && (!audio_descriptors.is_empty() || !audio_payloads.is_empty() || legacy_audio.is_some())
+    {
+        return Err(Error::Malformed(
+            "the Header audio flag is clear, but the file contains audio records".into(),
+        ));
+    }
     if !audio_descriptors.is_empty() && legacy_audio.is_some() {
         return Err(Error::Malformed(
             "the file mixes a legacy Audio record with Audio Source records".into(),

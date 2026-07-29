@@ -320,6 +320,12 @@ List<FourdgsAudioSource> _assembleAudioSources(
   FourdgsAudioTrack? legacy,
   bool truncated,
 ) {
+  if (!header.hasAudio &&
+      (descriptors.isNotEmpty || payloads.isNotEmpty || legacy != null)) {
+    throw const FourdgsMalformedFile(
+      'the Header audio flag is clear, but the file contains audio records',
+    );
+  }
   if (descriptors.isNotEmpty && legacy != null) {
     throw const FourdgsMalformedFile(
       'the file mixes a legacy Audio record with Audio Source records',

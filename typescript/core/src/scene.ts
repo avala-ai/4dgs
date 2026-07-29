@@ -385,6 +385,9 @@ function assembleAudioSourceDescriptors(
   legacy: LegacyAudioDescriptor | null,
   truncated: boolean,
 ): AudioSourceDescriptor[] {
+  if (!header.hasAudio && (descriptors.size > 0 || payloadLengths.size > 0 || legacy !== null)) {
+    throw new MalformedFile("the Header audio flag is clear, but the file contains audio records");
+  }
   if (descriptors.size > 0 && legacy !== null) {
     throw new MalformedFile("the file mixes a legacy Audio record with Audio Source records");
   }
