@@ -25,3 +25,6 @@ website/build/
 # Rust build output
 target/
 Cargo.lock
+
+# Sanitizer and other out-of-tree CMake build directories
+build-*/
