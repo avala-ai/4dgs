@@ -37,6 +37,17 @@
  *    the function name says `_free` exists for it.
  *
  * ---------------------------------------------------------------------------
+ * STRINGS ARE NOT NUL-TERMINATED
+ *
+ * Anything read out of the file's bytes crosses as a (pointer, length) pair, never as a C
+ * string. The format's `string` is length-prefixed and may legally contain a NUL, so a
+ * C-string accessor would silently truncate there — and silently is the problem. Copy into
+ * std::string(ptr, len), String(bytes:), or the equivalent.
+ *
+ * The one exception is `fourdgs_scene_audio_codec`, which predates this rule and returns a
+ * NUL-terminated registry name.
+ *
+ * ---------------------------------------------------------------------------
  * THREADING
  *
  * A fourdgs_scene is not internally synchronised: one scene belongs to one thread at a
@@ -105,7 +116,13 @@ typedef enum fourdgs_status {
     /** An index or range argument was outside what the scene holds. */
     FOURDGS_STATUS_OUT_OF_RANGE = 7,
     /** A defect inside the decoder, caught at the boundary. Please report it. */
-    FOURDGS_STATUS_INTERNAL = 8
+    FOURDGS_STATUS_INTERNAL = 8,
+    /**
+     * A legal request on the wrong read path — asking a sequential reader for one chunk
+     * by index, for instance. Neither the file nor the call is malformed; the operation
+     * belongs to the other path, and a caller that meets this should skip rather than fail.
+     */
+    FOURDGS_STATUS_UNSUPPORTED_MODE = 9
 } fourdgs_status;
 
 /**
@@ -178,6 +195,39 @@ int fourdgs_open_path(const char *path, fourdgs_scene **out);
  * scene is freed — including when this call itself fails.
  */
 int fourdgs_open_reader(fourdgs_reader reader, fourdgs_scene **out);
+
+/**
+ * Which read path to open on.
+ *
+ * `AUTO` is the convenient answer and the wrong one for a conformance suite: two runners
+ * that both take whichever path AUTO picked test one path twice, and the whole reason there
+ * are two is that the paths may differ in everything except what they decode a file to
+ * mean. Force the path when you are proving one.
+ */
+typedef enum fourdgs_open_mode {
+    /** Indexed when the file has a usable index, front-to-back otherwise. */
+    FOURDGS_OPEN_AUTO = 0,
+    /** Front to back, whatever the file carries. Truncation recovery lives here. */
+    FOURDGS_OPEN_SEQUENTIAL = 1,
+    /**
+     * The indexed path. A file with no index still opens — it simply has an empty index
+     * and nothing to seek to, which is a property of that file rather than a failure.
+     */
+    FOURDGS_OPEN_INDEXED = 2
+} fourdgs_open_mode;
+
+/** As fourdgs_open_memory, on a chosen read path. */
+int fourdgs_open_memory_ex(const uint8_t *data, size_t length, int mode,
+                           fourdgs_scene **out);
+
+/** As fourdgs_open_path, on a chosen read path. */
+int fourdgs_open_path_ex(const char *path, int mode, fourdgs_scene **out);
+
+/**
+ * As fourdgs_open_reader, on a chosen read path. Ownership of `reader.ctx` transfers
+ * identically, including when this call fails.
+ */
+int fourdgs_open_reader_ex(fourdgs_reader reader, int mode, fourdgs_scene **out);
 
 /**
  * Release a scene and invalidate every pointer borrowed from it. Null is ignored.
@@ -391,6 +441,172 @@ const float *fourdgs_state_centers(const fourdgs_state *state);
  * Borrowed: valid until the state is freed. Null when nothing is visible.
  */
 const float *fourdgs_state_opacity(const fourdgs_state *state);
+
+/* -------------------------------------------------------------------------
+ * The rest of the file
+ *
+ * A scene is more than its gaussians, and a consumer that can only report the gaussians
+ * cannot state what it read. Everything below is what the file says about itself.
+ *
+ * Strings here are (pointer, length) and borrowed until the scene is freed. Accessors
+ * taking a non-const `fourdgs_scene *` may perform I/O on first use, because the records
+ * behind them live at byte ranges an indexed open deliberately did not read.
+ * ------------------------------------------------------------------------- */
+
+/** The Header's `temporal_model`: "gaussian-birth" for version 1. */
+int fourdgs_scene_temporal_model(const fourdgs_scene *scene, const char **out,
+                                 size_t *out_length);
+
+/** The Header's `profile`: a promise about the file's shape, or empty for none. */
+int fourdgs_scene_profile(const fourdgs_scene *scene, const char **out, size_t *out_length);
+
+/** The Header's `library`: free-form producer identification. */
+int fourdgs_scene_library(const fourdgs_scene *scene, const char **out, size_t *out_length);
+
+/** Key/value pairs in the Header's attributes map. */
+uint32_t fourdgs_scene_attribute_count(const fourdgs_scene *scene);
+
+/** Attribute `i`, in sorted key order. */
+int fourdgs_scene_attribute_at(const fourdgs_scene *scene, uint32_t i,
+                               const char **out_key, size_t *out_key_length,
+                               const char **out_value, size_t *out_value_length);
+
+/**
+ * Fetch the Camera, Metadata and Attachment records.
+ *
+ * Opening a file frames these and stops, so a camera nobody asked for costs nothing. Every
+ * accessor below calls this implicitly; calling it directly is how you find out whether
+ * those records are readable at all, rather than discovering it one accessor at a time.
+ */
+int fourdgs_scene_load_records(fourdgs_scene *scene);
+
+/** Metadata records the file carries. Known at open from the ranges: no I/O. */
+uint32_t fourdgs_scene_metadata_count(const fourdgs_scene *scene);
+
+/** The name of Metadata record `i`. */
+int fourdgs_scene_metadata_name(fourdgs_scene *scene, uint32_t i, const char **out,
+                                size_t *out_length);
+
+/** Entries in Metadata record `i`, or 0 when `i` is out of range. */
+uint32_t fourdgs_scene_metadata_entry_count(fourdgs_scene *scene, uint32_t i);
+
+/** Entry `j` of Metadata record `i`, in sorted key order. */
+int fourdgs_scene_metadata_entry_at(fourdgs_scene *scene, uint32_t i, uint32_t j,
+                                    const char **out_key, size_t *out_key_length,
+                                    const char **out_value, size_t *out_value_length);
+
+/** Attachment records the file carries. Known at open from the ranges: no I/O. */
+uint32_t fourdgs_scene_attachment_count(const fourdgs_scene *scene);
+
+/** The name of attachment `i`. */
+int fourdgs_scene_attachment_name(fourdgs_scene *scene, uint32_t i, const char **out,
+                                  size_t *out_length);
+
+/** The media type of attachment `i`. */
+int fourdgs_scene_attachment_media_type(fourdgs_scene *scene, uint32_t i, const char **out,
+                                        size_t *out_length);
+
+/** The payload length of attachment `i`, or 0 when `i` is out of range. */
+uint64_t fourdgs_scene_attachment_size(fourdgs_scene *scene, uint32_t i);
+
+/**
+ * Copy `length` bytes of attachment `i` from `offset` into `out`.
+ *
+ * The bytes, not just their length: a decoder that reported the length and discarded the
+ * payload would otherwise be indistinguishable from one that read it.
+ */
+int fourdgs_scene_attachment_read(fourdgs_scene *scene, uint32_t i, uint64_t offset,
+                                  uint64_t length, uint8_t *out);
+
+/** A default viewpoint and optional suggested path. Purely advisory. */
+typedef struct fourdgs_camera {
+    double fov_y_deg;
+    double position[3];
+    double target[3];
+    uint32_t keyframe_count;
+    /** 0 or 1. */
+    int loop_enabled;
+    /** Registry name, "linear" or "spline". Borrowed; not NUL-terminated. */
+    const char *interpolation;
+    size_t interpolation_length;
+} fourdgs_camera;
+
+/** Whether the file carries a Camera record. Known at open from the ranges: no I/O. */
+int fourdgs_scene_has_camera(const fourdgs_scene *scene);
+
+/** The camera's own fields. FOURDGS_STATUS_OUT_OF_RANGE when the file carries none. */
+int fourdgs_scene_camera(fourdgs_scene *scene, fourdgs_camera *out);
+
+/**
+ * Keyframe `i` of the suggested path. Any out parameter may be null; `out_position` and
+ * `out_target` must have room for three doubles each.
+ */
+int fourdgs_scene_camera_keyframe(fourdgs_scene *scene, uint32_t i, double *out_time,
+                                  double *out_position, double *out_target);
+
+/** Whether the file carries a Statistics record. */
+int fourdgs_scene_has_statistics(const fourdgs_scene *scene);
+
+/**
+ * The Statistics record's fields. Advisory — a reader that needs certainty computes from
+ * the chunks. Any out parameter may be null; `out_aabb` must have room for six doubles.
+ */
+int fourdgs_scene_statistics(const fourdgs_scene *scene, uint64_t *out_gaussian_count,
+                             uint32_t *out_chunk_count, double *out_duration_sec,
+                             double *out_aabb);
+
+/** Summary Offset records the file carries. */
+uint32_t fourdgs_scene_summary_offset_count(const fourdgs_scene *scene);
+
+/** Summary Offset `i`. Any out parameter may be null. */
+int fourdgs_scene_summary_offset_at(const fourdgs_scene *scene, uint32_t i,
+                                    uint8_t *out_group_opcode, uint64_t *out_group_start,
+                                    uint64_t *out_group_length);
+
+/**
+ * The three states the summary CRC can be in.
+ *
+ * Three, not two: "not checked" and "did not match" are different claims about a file, and
+ * collapsing them reports corruption nobody observed. A mismatch means the index is
+ * untrustworthy — it does not implicate the chunks, and a front-to-back read is the correct
+ * recovery rather than a refusal.
+ */
+typedef enum fourdgs_crc_state {
+    FOURDGS_CRC_NOT_CHECKED = -1,
+    FOURDGS_CRC_FAILED = 0,
+    FOURDGS_CRC_VERIFIED = 1
+} fourdgs_crc_state;
+
+/** Which of the three the summary CRC is. */
+int fourdgs_scene_summary_crc_state(const fourdgs_scene *scene);
+
+/**
+ * Whether the file ended inside a record, with everything complete before the cut still
+ * decoded. Always 0 on the indexed path, which requires a complete file.
+ *
+ * A file cut short mid-write is common and recoverable, and this is how a caller tells a
+ * short scene from a complete one.
+ */
+int fourdgs_scene_truncated(const fourdgs_scene *scene);
+
+/**
+ * Decode exactly chunk `i` into the working set.
+ *
+ * fourdgs_scene_load_at cannot isolate a chunk when intervals overlap, and isolating one is
+ * what a byte-budget check needs: load this chunk at this cap, then compare what your
+ * transport moved against fourdgs_scene_bytes_for_chunk.
+ *
+ * FOURDGS_STATUS_UNSUPPORTED_MODE on a sequential reader, which has no index to fetch from
+ * and has already decoded every chunk.
+ */
+int fourdgs_scene_load_chunk(fourdgs_scene *scene, uint32_t i, uint8_t max_sh_band);
+
+/**
+ * What reading chunk `i` at `max_sh_band` will transfer, from the index alone. 0 when `i`
+ * is outside the index.
+ */
+uint64_t fourdgs_scene_bytes_for_chunk(const fourdgs_scene *scene, uint32_t i,
+                                       uint8_t max_sh_band);
 
 #ifdef __cplusplus
 } /* extern "C" */

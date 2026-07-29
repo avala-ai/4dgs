@@ -66,6 +66,30 @@ NOT interpret a partial record.
 The Footer's `summary_crc` covers the index only. A mismatch means the index is untrustworthy, not
 that the chunks are — falling back to a streamed read is the correct recovery, not failing.
 
+**A cut between a chunk and its spherical harmonic bands.** Each band is its own record after the
+chunk it belongs to, so a cut can land between them and leave the last chunk carrying fewer bands
+than the rest of the file. That is not corruption and a reader should not refuse the file over it:
+bands are whole (§6.5), so the chunk cannot be given the band it never received, and zero-filling it
+would fabricate appearance. Dropping the trailing chunks whose band sets are short — keeping the
+longest prefix that arrived intact — is the recovery that preserves both rules at once. A reader
+that treats "this chunk has fewer bands than the file" as malformed will refuse a large fraction of
+all possible cut points on any file with spherical harmonics, which is a lot of recoverable files.
+
+**Verifying the summary CRC without buffering the file.** A front-to-back reader does not learn
+where the CRC's range starts until it reads the Footer, which is the last record — by which point a
+reader that kept nothing has nothing to check. Buffering the whole file to solve this gives up the
+property the format exists to provide, so the bounded answer is to retain the trailing run of
+records that may legally sit inside a summary and check it against the Footer at the end. Per §4's
+layout that run is Chunk Index, Statistics, Attachment, Attachment Index and Summary Offset records;
+any other opcode means the summary has not started yet, and the run resets. The cost is the index,
+which an indexed reader would have loaded anyway.
+
+When the retained run cannot be shown to be exactly the range the Footer names, the honest report is
+**"not verified"** — which is a third state, distinct from "did not match". A reader that collapses
+them tells its caller a file is corrupt when all it did was decline to buffer. Readers that hold the
+whole file, as the Python reference does, sidestep this entirely and can always answer verified or
+failed; that is a property of how that reader was built and not a requirement on any other.
+
 ---
 
 ## Decoding efficiently

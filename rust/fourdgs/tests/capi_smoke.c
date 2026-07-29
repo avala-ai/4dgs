@@ -61,6 +61,150 @@ static void check_bad_magic(void) {
     check(strlen(fourdgs_last_error()) > 0, "a failure leaves a message behind");
 }
 
+/* Everything a binding needs to state what it read, exercised the way one would. */
+static void check_summary_surface(fourdgs_scene *scene) {
+    const char *text = NULL;
+    size_t len = 0;
+    check(fourdgs_scene_temporal_model(scene, &text, &len) == FOURDGS_STATUS_OK,
+          "the temporal model is readable");
+    check(text != NULL && len > 0, "the temporal model is a non-empty string");
+    /* Length-carrying, not NUL-terminated: compare on the length the accessor gave. */
+    check(len == strlen("gaussian-birth") && memcmp(text, "gaussian-birth", len) == 0,
+          "version 1 declares the gaussian-birth temporal model");
+
+    check(fourdgs_scene_profile(scene, &text, &len) == FOURDGS_STATUS_OK,
+          "the profile is readable");
+    check(fourdgs_scene_library(scene, &text, &len) == FOURDGS_STATUS_OK,
+          "the library string is readable");
+
+    for (uint32_t i = 0; i < fourdgs_scene_attribute_count(scene); ++i) {
+        const char *k = NULL, *v = NULL;
+        size_t kl = 0, vl = 0;
+        check(fourdgs_scene_attribute_at(scene, i, &k, &kl, &v, &vl) == FOURDGS_STATUS_OK,
+              "each header attribute is readable");
+        check(k != NULL && v != NULL, "an attribute has a key and a value");
+    }
+
+    /* Records behind byte ranges: an indexed open framed them and read nothing. */
+    check(fourdgs_scene_load_records(scene) == FOURDGS_STATUS_OK,
+          "the front-matter records are fetchable");
+
+    for (uint32_t i = 0; i < fourdgs_scene_metadata_count(scene); ++i) {
+        check(fourdgs_scene_metadata_name(scene, i, &text, &len) == FOURDGS_STATUS_OK,
+              "each metadata record has a readable name");
+        for (uint32_t j = 0; j < fourdgs_scene_metadata_entry_count(scene, i); ++j) {
+            const char *k = NULL, *v = NULL;
+            size_t kl = 0, vl = 0;
+            check(fourdgs_scene_metadata_entry_at(scene, i, j, &k, &kl, &v, &vl) ==
+                      FOURDGS_STATUS_OK,
+                  "each metadata entry is readable");
+        }
+    }
+
+    for (uint32_t i = 0; i < fourdgs_scene_attachment_count(scene); ++i) {
+        check(fourdgs_scene_attachment_name(scene, i, &text, &len) == FOURDGS_STATUS_OK,
+              "each attachment has a readable name");
+        check(fourdgs_scene_attachment_media_type(scene, i, &text, &len) == FOURDGS_STATUS_OK,
+              "each attachment has a readable media type");
+        uint64_t size = fourdgs_scene_attachment_size(scene, i);
+        if (size > 0) {
+            uint8_t *payload = malloc((size_t)size);
+            check(payload != NULL, "the attachment payload fits in memory");
+            if (payload) {
+                /* The bytes, because the summary checksums them. */
+                check(fourdgs_scene_attachment_read(scene, i, 0, size, payload) ==
+                          FOURDGS_STATUS_OK,
+                      "an attachment's bytes are readable");
+                check(fourdgs_scene_attachment_read(scene, i, size, 1, payload) !=
+                          FOURDGS_STATUS_OK,
+                      "a range past an attachment is refused");
+                free(payload);
+            }
+        }
+    }
+
+    if (fourdgs_scene_has_camera(scene)) {
+        fourdgs_camera camera;
+        check(fourdgs_scene_camera(scene, &camera) == FOURDGS_STATUS_OK,
+              "a camera-bearing scene yields its camera");
+        check(camera.interpolation != NULL, "the camera names its interpolation");
+        for (uint32_t i = 0; i < camera.keyframe_count; ++i) {
+            double t = 0.0, position[3] = {0}, target[3] = {0};
+            check(fourdgs_scene_camera_keyframe(scene, i, &t, position, target) ==
+                      FOURDGS_STATUS_OK,
+                  "each keyframe is readable");
+        }
+        check(fourdgs_scene_camera_keyframe(scene, camera.keyframe_count, NULL, NULL, NULL) !=
+                  FOURDGS_STATUS_OK,
+              "a keyframe past the end is refused");
+    } else {
+        fourdgs_camera camera;
+        check(fourdgs_scene_camera(scene, &camera) != FOURDGS_STATUS_OK,
+              "a scene without a camera says so rather than inventing one");
+    }
+
+    if (fourdgs_scene_has_statistics(scene)) {
+        uint64_t count = 0;
+        uint32_t chunks = 0;
+        double duration = 0.0, aabb[6] = {0};
+        check(fourdgs_scene_statistics(scene, &count, &chunks, &duration, aabb) ==
+                  FOURDGS_STATUS_OK,
+              "statistics are readable when present");
+    }
+
+    for (uint32_t i = 0; i < fourdgs_scene_summary_offset_count(scene); ++i) {
+        uint8_t opcode = 0;
+        uint64_t start = 0, length = 0;
+        check(fourdgs_scene_summary_offset_at(scene, i, &opcode, &start, &length) ==
+                  FOURDGS_STATUS_OK,
+              "each summary offset is readable");
+    }
+
+    int crc = fourdgs_scene_summary_crc_state(scene);
+    check(crc == FOURDGS_CRC_NOT_CHECKED || crc == FOURDGS_CRC_FAILED ||
+              crc == FOURDGS_CRC_VERIFIED,
+          "the CRC state is one of the three");
+    check(fourdgs_scene_summary_crc_state(NULL) == FOURDGS_CRC_NOT_CHECKED,
+          "a null scene has not checked anything");
+}
+
+/* The two read paths have to be selectable, or two runners test one path twice. */
+static void check_forced_paths(const char *path) {
+    fourdgs_scene *sequential = NULL;
+    check(fourdgs_open_path_ex(path, FOURDGS_OPEN_SEQUENTIAL, &sequential) ==
+              FOURDGS_STATUS_OK,
+          "a file opens front to back on request");
+    if (sequential) {
+        check(fourdgs_scene_is_indexed(sequential) == 0,
+              "a forced sequential open reports the sequential path");
+        check(fourdgs_scene_load_chunk(sequential, 0, 3) == FOURDGS_STATUS_UNSUPPORTED_MODE,
+              "one chunk by index is unsupported on the sequential path, not an error");
+        fourdgs_scene_free(sequential);
+    }
+
+    fourdgs_scene *indexed = NULL;
+    check(fourdgs_open_path_ex(path, FOURDGS_OPEN_INDEXED, &indexed) == FOURDGS_STATUS_OK,
+          "a file opens indexed on request");
+    if (indexed) {
+        check(fourdgs_scene_is_indexed(indexed) == 1,
+              "a forced indexed open reports the indexed path");
+        /* The band-skipping claim: what moved must equal what the index declared. */
+        for (uint32_t i = 0; i < fourdgs_scene_chunk_count(indexed); ++i) {
+            for (uint8_t cap = 0; cap <= 3; ++cap) {
+                check(fourdgs_scene_load_chunk(indexed, i, cap) == FOURDGS_STATUS_OK,
+                      "one chunk loads at every band cap");
+                check(fourdgs_scene_bytes_for_chunk(indexed, i, cap) > 0,
+                      "the index predicts what that chunk costs");
+            }
+        }
+        fourdgs_scene_free(indexed);
+    }
+
+    fourdgs_scene *bogus = NULL;
+    check(fourdgs_open_path_ex(path, 99, &bogus) == FOURDGS_STATUS_INVALID_ARGUMENT,
+          "an unknown open mode is an invalid argument");
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "usage: capi_smoke <file.4dgs>\n");
@@ -129,6 +273,9 @@ int main(int argc, char **argv) {
         fourdgs_state_free(state);
     }
 
+    check_summary_surface(scene);
+    check(fourdgs_scene_truncated(scene) == 0, "a complete file is not truncated");
+
     /* Audio is optional in every sense: absence is a value, and it costs nothing. */
     if (fourdgs_scene_has_audio(scene)) {
         uint64_t size = fourdgs_scene_audio_size(scene);
@@ -150,6 +297,7 @@ int main(int argc, char **argv) {
     }
 
     fourdgs_scene_free(scene);
+    check_forced_paths(argv[1]);
 
     if (failures > 0) {
         fprintf(stderr, "%d C ABI checks failed\n", failures);

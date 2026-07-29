@@ -24,9 +24,16 @@ use crate::records as rec;
 use crate::serialization::{crc32, Cursor, Records, MAGIC, RECORD_HEADER_SIZE};
 use crate::stream::decode_stream;
 
-/// One read of this size from the front covers the header records of every scene measured
-/// so far. A larger front matter costs one extra round trip, never a wrong parse.
-pub const HEAD_PROBE: u64 = 64 * 1024;
+/// The first read from the front of a resource.
+///
+/// Deliberately small. The front matter a reader must parse is the Header, the Quantization
+/// grids and the Window Table — a few hundred bytes on every scene measured so far — and
+/// everything else there is stepped over by arithmetic rather than read. A larger probe
+/// would not save a round trip, because this is one request either way; it would only
+/// transfer bytes nobody asked for, and on a small file it would pull the whole thing in
+/// while the caller was still deciding whether to seek. A record bigger than this is still
+/// fetched whole, by `content`, so the probe bounds waste rather than capability.
+pub const HEAD_PROBE: u64 = 8 * 1024;
 
 /// How much of an Audio record is read to learn its codec. The codec name is the record's
 /// first field, so a prefix answers it; the track stays where it is.

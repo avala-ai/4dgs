@@ -27,6 +27,10 @@ pub enum Error {
     /// An encoder's own verification failed: a decoded value fell outside the bound the
     /// file was about to declare. Always a bug in the encoder, never in the input.
     BoundViolation(String),
+    /// A legal request on the wrong read path — asking a front-to-back reader for one
+    /// chunk by index, for instance. Neither the file nor the caller is malformed; the
+    /// operation simply belongs to the other path.
+    UnsupportedOperation(String),
     /// The transport failed.
     Io(std::io::Error),
 }
@@ -39,6 +43,7 @@ impl fmt::Display for Error {
             Error::Malformed(m) => write!(f, "malformed: {m}"),
             Error::UnsupportedCodec(m) => write!(f, "unsupported codec: {m}"),
             Error::BoundViolation(m) => write!(f, "bound violation: {m}"),
+            Error::UnsupportedOperation(m) => write!(f, "unsupported operation: {m}"),
             Error::Io(e) => write!(f, "io: {e}"),
         }
     }

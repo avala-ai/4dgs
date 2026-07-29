@@ -81,6 +81,17 @@ across the whole surface:
 3. **Null is always safe to pass.**
 4. **Borrowed pointers have a stated lifetime**, documented per function in the header.
 
+Two rules the surface adds beyond those four. Strings read out of file bytes cross as a
+`(pointer, length)` pair rather than as C strings, because the format's `string` is length-prefixed
+and may legally contain a NUL — a C-string accessor would truncate there, silently. And the `_ex`
+openers take a `fourdgs_open_mode` so a caller can force the sequential or indexed path:
+auto-selection is the convenient answer and the wrong one for a conformance suite, where two runners
+that both take whichever path was picked test one path twice.
+
+The surface covers the whole file, not only its gaussians — `temporal_model`, header attributes,
+metadata, attachment bytes, camera, statistics, summary offsets, a tri-state summary CRC and a
+truncated flag — because a binding that can only report the gaussians cannot state what it read.
+
 `cargo build` produces `libfourdgs.a` and `libfourdgs.{so,dylib}` alongside the rlib.
 `tests/capi_smoke.c` is a C program that links against them and checks the header compiles as C,
 every symbol links, and the documented null and error behaviour holds:

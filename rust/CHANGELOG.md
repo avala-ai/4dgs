@@ -6,6 +6,18 @@ All notable changes to the Rust crate are documented here, following
 
 ## [Unreleased]
 
+### Fixed
+
+- A file cut between a chunk and its spherical harmonic band records was refused as malformed
+  instead of recovering the complete prefix. Bands are whole, so the short trailing chunks are
+  dropped and everything that arrived intact is kept.
+- Asking for fewer spherical harmonic bands than were already resident answered from the cache,
+  handing back a higher degree than requested and transferring nothing — which is exactly what a
+  band-skipping byte budget measures.
+- The front-matter probe read 64 KiB, which on a small file was the whole thing. It is 8 KiB now:
+  the records an indexed open must parse are a few hundred bytes, and everything else in the front
+  matter is stepped over rather than read.
+
 ### Added
 
 - Decoder: TLV container, streamed and indexed readers, both adaptive-precision rules, validity
@@ -18,6 +30,11 @@ All notable changes to the Rust crate are documented here, following
   independent chunks, an index, and deterministic output. It verifies its own claim before returning
   a file — every chunk is decoded back and every value checked against the bounds the Quantization
   record is about to declare, so a file whose bounds have not been measured never reaches a caller.
+- C ABI: the rest of the file. `temporal_model`, header attributes, metadata records, attachment
+  names/media types/**bytes**, camera and keyframes, statistics, summary offsets, a tri-state
+  summary CRC, a truncated flag, per-chunk load and per-chunk byte prediction, and `_ex` openers
+  that force the sequential or indexed path. Strings read from file bytes cross as (pointer,
+  length), never NUL-terminated, because the format's `string` may legally contain a NUL.
 - Structural fuzzing over seeded mutations, covering both read paths and the C ABI, with a counting
   allocator and a timer enforcing that no input causes an unbounded allocation or a hang. It found
   two allocation bugs and an integer overflow on its first run.

@@ -32,6 +32,24 @@ pub enum Mode {
     Streamed,
 }
 
+/// Which read path a caller wants.
+///
+/// `Auto` is the convenient answer and the wrong one for a conformance suite: two runners
+/// that both get whichever path `Auto` picked test one path twice, and the whole reason
+/// there are two runners is that the paths are allowed to differ in everything except what
+/// they decode a file to mean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OpenMode {
+    /// Indexed when the file has a usable index, front-to-back otherwise.
+    #[default]
+    Auto,
+    /// Front to back, whatever the file carries.
+    Sequential,
+    /// The indexed path. A file with no index still opens — it simply has an empty index
+    /// and no chunks to seek to, which is a property of the file rather than a failure.
+    Indexed,
+}
+
 /// A scene opened for reading, over either path.
 pub struct SceneReader<R: Readable> {
     source: R,
@@ -42,19 +60,45 @@ pub struct SceneReader<R: Readable> {
     loaded: GaussianSet,
     loaded_band: u8,
     loaded_key: Option<LoadKey>,
+    /// Records that live behind byte ranges on the indexed path, fetched on first use.
+    records: Option<Records>,
+}
+
+/// The front-matter records a caller asked for, once they have been fetched.
+#[derive(Default)]
+struct Records {
+    camera: Option<rec::Camera>,
+    metadata: Vec<rec::Metadata>,
+    attachments: Vec<rec::Attachment>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum LoadKey {
     All,
     At(u64),
+    Chunk(u32),
 }
 
 impl<R: Readable> SceneReader<R> {
     /// Open a scene, using the index when the file has one.
-    pub fn open(mut source: R) -> Result<SceneReader<R>> {
-        match indexed_reader::open_indexed(&mut source) {
-            Ok(scene) if !scene.index.is_empty() => Ok(SceneReader {
+    pub fn open(source: R) -> Result<SceneReader<R>> {
+        SceneReader::open_with(source, OpenMode::Auto)
+    }
+
+    /// Open a scene on a chosen read path.
+    pub fn open_with(mut source: R, mode: OpenMode) -> Result<SceneReader<R>> {
+        let indexed = match mode {
+            OpenMode::Sequential => None,
+            OpenMode::Indexed => Some(indexed_reader::open_indexed(&mut source)?),
+            // No index, or an index-less file the indexed open could not make sense of:
+            // a front-to-back read is the defined answer, not a failure.
+            OpenMode::Auto => match indexed_reader::open_indexed(&mut source) {
+                Ok(scene) if !scene.index.is_empty() => Some(scene),
+                _ => None,
+            },
+        };
+        if let Some(scene) = indexed {
+            return Ok(SceneReader {
                 source,
                 mode: Mode::Indexed,
                 indexed: Some(scene),
@@ -62,26 +106,30 @@ impl<R: Readable> SceneReader<R> {
                 loaded: GaussianSet::default(),
                 loaded_band: 0,
                 loaded_key: None,
-            }),
-            // No index, or an index-less file the indexed open could not make sense of:
-            // a front-to-back read is the defined answer, not a failure.
-            _ => {
-                let scene = stream_reader::read_from(
-                    SequentialSource::new(&mut source),
-                    &stream_reader::ReadOptions::default(),
-                )?;
-                let loaded = scene.gaussians.clone();
-                Ok(SceneReader {
-                    source,
-                    mode: Mode::Streamed,
-                    indexed: None,
-                    streamed: Some(scene),
-                    loaded,
-                    loaded_band: 3,
-                    loaded_key: Some(LoadKey::All),
-                })
-            }
+                records: None,
+            });
         }
+        let scene = stream_reader::read_from(
+            SequentialSource::new(&mut source),
+            &stream_reader::ReadOptions::default(),
+        )?;
+        let loaded = scene.gaussians.clone();
+        Ok(SceneReader {
+            source,
+            mode: Mode::Streamed,
+            indexed: None,
+            streamed: Some(scene),
+            loaded,
+            loaded_band: 3,
+            loaded_key: Some(LoadKey::All),
+            records: None,
+        })
+    }
+
+    /// Whether the file ended inside a record, with everything complete before the cut
+    /// still decoded. Always false on the indexed path, which requires a complete file.
+    pub fn truncated(&self) -> bool {
+        self.streamed.as_ref().is_some_and(|s| s.truncated)
     }
 
     pub fn mode(&self) -> Mode {
@@ -125,6 +173,14 @@ impl<R: Readable> SceneReader<R> {
             (Some(s), _) => s.statistics.as_ref(),
             (_, Some(s)) => s.statistics.as_ref(),
             _ => None,
+        }
+    }
+
+    pub fn summary_offsets(&self) -> &[rec::SummaryOffset] {
+        match (&self.indexed, &self.streamed) {
+            (Some(s), _) => &s.summary_offsets,
+            (_, Some(s)) => &s.summary_offsets,
+            _ => &[],
         }
     }
 
@@ -221,32 +277,85 @@ impl<R: Readable> SceneReader<R> {
     }
 
     pub fn camera(&mut self) -> Result<Option<rec::Camera>> {
-        if let Some(scene) = &self.indexed {
-            return indexed_reader::read_camera(&mut self.source, scene);
-        }
-        Ok(self.streamed.as_ref().and_then(|s| s.camera.clone()))
+        self.ensure_records()?;
+        Ok(self.records.as_ref().and_then(|r| r.camera.clone()))
     }
 
     pub fn metadata(&mut self) -> Result<Vec<rec::Metadata>> {
-        if let Some(scene) = &self.indexed {
-            return indexed_reader::read_metadata(&mut self.source, scene);
-        }
+        self.ensure_records()?;
         Ok(self
-            .streamed
+            .records
             .as_ref()
-            .map(|s| s.metadata.clone())
+            .map(|r| r.metadata.clone())
             .unwrap_or_default())
     }
 
     pub fn attachments(&mut self) -> Result<Vec<rec::Attachment>> {
-        if let Some(scene) = &self.indexed {
-            return indexed_reader::read_attachments(&mut self.source, scene);
-        }
+        self.ensure_records()?;
         Ok(self
-            .streamed
+            .records
             .as_ref()
-            .map(|s| s.attachments.clone())
+            .map(|r| r.attachments.clone())
             .unwrap_or_default())
+    }
+
+    /// How many records of each kind the file carries, known at open from the ranges alone
+    /// — no fetch, so a caller can ask what is there before deciding to pay for it.
+    pub fn metadata_count(&self) -> usize {
+        match (&self.indexed, &self.streamed) {
+            (Some(s), _) => s.metadata_ranges.len(),
+            (_, Some(s)) => s.metadata.len(),
+            _ => 0,
+        }
+    }
+
+    pub fn attachment_count(&self) -> usize {
+        match (&self.indexed, &self.streamed) {
+            (Some(s), _) => s.attachment_ranges.len(),
+            (_, Some(s)) => s.attachments.len(),
+            _ => 0,
+        }
+    }
+
+    pub fn has_camera(&self) -> bool {
+        match (&self.indexed, &self.streamed) {
+            (Some(s), _) => s.camera_range.is_some(),
+            (_, Some(s)) => s.camera.is_some(),
+            _ => false,
+        }
+    }
+
+    /// The records that sit behind byte ranges, fetched once and kept.
+    ///
+    /// Opening a file frames these and stops, so a camera nobody asked for costs nothing.
+    /// This is where a caller says it wants them.
+    pub fn ensure_records(&mut self) -> Result<()> {
+        if self.records.is_some() {
+            return Ok(());
+        }
+        let records = if let Some(scene) = &self.indexed {
+            Records {
+                camera: indexed_reader::read_camera(&mut self.source, scene)?,
+                metadata: indexed_reader::read_metadata(&mut self.source, scene)?,
+                attachments: indexed_reader::read_attachments(&mut self.source, scene)?,
+            }
+        } else {
+            let scene = self.streamed.as_ref().expect("one path or the other");
+            Records {
+                camera: scene.camera.clone(),
+                metadata: scene.metadata.clone(),
+                attachments: scene.attachments.clone(),
+            }
+        };
+        self.records = Some(records);
+        Ok(())
+    }
+
+    /// The fetched records, or `None` when nothing has asked for them yet.
+    pub fn records(&self) -> Option<(&Option<rec::Camera>, &[rec::Metadata], &[rec::Attachment])> {
+        self.records
+            .as_ref()
+            .map(|r| (&r.camera, r.metadata.as_slice(), r.attachments.as_slice()))
     }
 
     /// Decode every chunk. Use `load_at` when only one instant is wanted.
@@ -257,6 +366,35 @@ impl<R: Readable> SceneReader<R> {
     /// Decode only the chunks the seek rule names for `t`.
     pub fn load_at(&mut self, t: f64, max_sh_band: u8) -> Result<&GaussianSet> {
         self.load(LoadKey::At(t.to_bits()), max_sh_band)
+    }
+
+    /// Decode exactly one chunk of the index.
+    ///
+    /// `load_at` cannot isolate a chunk when intervals overlap, and isolating one is what a
+    /// byte-budget check needs: read this chunk at this cap, and compare what moved against
+    /// what the index declares for it.
+    pub fn load_chunk(&mut self, chunk: u32, max_sh_band: u8) -> Result<&GaussianSet> {
+        if self.mode == Mode::Streamed {
+            return Err(Error::UnsupportedOperation(
+                "a front-to-back reader has no index to fetch one chunk from; it decoded them all"
+                    .into(),
+            ));
+        }
+        self.load(LoadKey::Chunk(chunk), max_sh_band)
+    }
+
+    /// What reading chunk `chunk` at `max_sh_band` will transfer.
+    pub fn bytes_for_chunk(&self, chunk: u32, max_sh_band: u8) -> Option<u64> {
+        let entry = self.chunk_index().get(chunk as usize)?;
+        Some(
+            entry
+                .bands
+                .iter()
+                .filter(|(band, _, _)| *band <= max_sh_band)
+                .fold(entry.chunk_length, |total, (_, _, length)| {
+                    total.saturating_add(*length)
+                }),
+        )
     }
 
     /// The gaussians currently resident.
@@ -273,7 +411,11 @@ impl<R: Readable> SceneReader<R> {
     }
 
     fn load(&mut self, key: LoadKey, max_sh_band: u8) -> Result<&GaussianSet> {
-        if self.loaded_key == Some(key) && self.loaded_band >= max_sh_band {
+        // The cap has to match exactly rather than merely be covered. A request for fewer
+        // bands is a request for a LOWER DEGREE and for fewer bytes to move; answering it
+        // from a higher-degree cache would hand back coefficients the caller declined and
+        // transfer nothing, which is precisely what the band-skipping check measures.
+        if self.loaded_key == Some(key) && self.loaded_band == max_sh_band {
             return Ok(&self.loaded);
         }
         if self.mode == Mode::Streamed {
@@ -294,6 +436,15 @@ impl<R: Readable> SceneReader<R> {
                     .cloned()
                     .collect()
             }
+            LoadKey::Chunk(i) => match scene.index.get(i as usize) {
+                Some(entry) => vec![entry.clone()],
+                None => {
+                    return Err(Error::Malformed(format!(
+                        "chunk {i} is outside the {}-entry index",
+                        scene.index.len()
+                    )))
+                }
+            },
         };
         let scene = self.indexed.as_ref().expect("indexed path");
         let mut chunks: Vec<DecodedChunk> = Vec::with_capacity(wanted.len());

@@ -323,3 +323,53 @@ impl fourdgs::Readable for OwnedSource {
         fourdgs::BytesReadable::new(&self.0).read(offset, length)
     }
 }
+
+#[test]
+fn a_cut_between_a_chunk_and_its_bands_recovers_rather_than_refusing() {
+    // The cut that lands after a chunk record but before one of its spherical harmonic
+    // band records leaves that chunk carrying fewer bands than the rest of the file. That
+    // is not corruption, it is the part that did not arrive — and refusing the file over it
+    // throws away every complete record before the cut, which is the one thing truncation
+    // recovery exists to keep. Found by the C++ binding against the corpus.
+    let (mut g, duration) = scene(96);
+    g.sh_degree = 2;
+    g.sh_coefficients = 8;
+    g.sh = Some((0..g.count() * 24).map(|i| (i % 251) as u8).collect());
+    let bytes = fourdgs::write_to_vec(&g, duration, &chunking_options(), &SceneExtras::default())
+        .expect("encode");
+
+    let mut recovered = 0;
+    for cut in (64..bytes.len()).step_by(7) {
+        match fourdgs::read_bytes(&bytes[..cut]) {
+            Ok(scene) => {
+                recovered += 1;
+                // Whatever survived is a whole degree or nothing — never a partial one.
+                let coefficients = scene.gaussians.sh_coefficients;
+                assert!(
+                    coefficients == 0 || coefficients == 3 || coefficients == 8,
+                    "a cut file yielded {coefficients} coefficients per component, which is \
+                     not a whole degree"
+                );
+                if let Some(sh) = &scene.gaussians.sh {
+                    assert_eq!(
+                        sh.len(),
+                        scene.gaussians.count() * coefficients * 3,
+                        "every surviving gaussian has a full row of coefficients"
+                    );
+                }
+            }
+            Err(e) => {
+                // Only the region before the Header and Quantization records are complete
+                // may refuse, and it must refuse by naming what is missing.
+                assert!(
+                    e.to_string().contains("no Header"),
+                    "a cut at {cut} was refused with: {e}"
+                );
+            }
+        }
+    }
+    assert!(
+        recovered > 100,
+        "most cut points should recover; {recovered} did"
+    );
+}

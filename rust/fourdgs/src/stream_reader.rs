@@ -275,6 +275,15 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
     let quant = quant
         .ok_or_else(|| Error::Malformed("file has no Header or no Quantization record".into()))?;
 
+    // A cut that lands between a chunk and its spherical harmonic band records leaves the
+    // trailing chunk carrying fewer bands than the rest of the file. In a complete file
+    // that is corruption and stays an error; in a truncated one it is simply the part that
+    // did not arrive, and refusing the whole file over it would throw away every complete
+    // record before the cut — which is the one thing truncation recovery exists to keep.
+    if truncated {
+        drop_incomplete_trailing_bands(&mut chunks, &mut chunk_bands, &mut scene.chunk_intervals);
+    }
+
     scene.gaussians = assemble(&chunks, &chunk_bands, &scene.windows, &header)?;
     scene.duration_sec = header.duration_sec;
     scene.header = header;
@@ -292,6 +301,37 @@ pub fn read_bytes(data: &[u8]) -> Result<Scene> {
 pub fn read_path<P: AsRef<Path>>(path: P) -> Result<Scene> {
     let file = std::fs::File::open(path)?;
     read_from(file, &ReadOptions::default())
+}
+
+/// Keep the longest prefix of chunks whose spherical harmonic bands all match the first
+/// chunk's, and drop the rest.
+///
+/// Bands are whole and a reader must never assemble a partial degree, so a chunk that lost
+/// a band record to a truncation cannot be given one — and zero-filling it would fabricate
+/// appearance the file never carried. Dropping those gaussians is the honest recovery: what
+/// survives is exactly the prefix that arrived intact, which is what a truncated file
+/// promises and all it promises.
+fn drop_incomplete_trailing_bands(
+    chunks: &mut Vec<DecodedChunk>,
+    chunk_bands: &mut Vec<BTreeMap<u8, DecodedStream>>,
+    intervals: &mut Vec<(f64, f64)>,
+) {
+    let Some(full) = chunk_bands
+        .first()
+        .map(|b| b.keys().copied().collect::<Vec<u8>>())
+    else {
+        return;
+    };
+    let keep = chunk_bands
+        .iter()
+        .position(|b| b.keys().copied().collect::<Vec<u8>>() != full)
+        .unwrap_or(chunk_bands.len());
+    if keep == chunk_bands.len() {
+        return;
+    }
+    chunks.truncate(keep);
+    chunk_bands.truncate(keep);
+    intervals.truncate(keep.min(intervals.len()));
 }
 
 /// Concatenate decoded chunks into one scene-wide set.
