@@ -1,7 +1,7 @@
 # 🧊 4dgs
 
-[![PyPI][pypi-badge]][pypi] [![npm][npm-badge]][npm] [![crates.io][crates-badge]][crates]
-[![CI][ci-badge]][ci] [![Conformance][conformance-badge]][conformance]
+[![PyPI][pypi-badge]][pypi] [![crates.io][crates-badge]][crates] [![CI][ci-badge]][ci]
+[![Conformance][conformance-badge]][conformance]
 
 **4D gaussian splat video with native audio — one file, seekable.**
 
@@ -31,6 +31,10 @@ self-contained resource you can range-request and seek like a video.
 - **Stated error bounds.** Lossy encodings declare the maximum deviation per attribute, and encoders
   verify it.
 - **Renderer-agnostic.** Decoding ends at reconstructed gaussian state at time `t`.
+- **One temporal model, implemented; three names reserved.** Version 1 implements `gaussian-birth`,
+  where motion and lifetime belong to each gaussian. `frame-sequence`, `keyframe-delta` and
+  `deformation-field` are reserved in the [registry](website/docs/spec/registry.md) and specified
+  far enough to say what each would need — they are not implemented, and nothing here emits them.
 
 ## Specification
 
@@ -44,13 +48,21 @@ self-contained resource you can range-request and seek like a video.
 
 ## Libraries
 
-| Language   | Readme                     | Package      | Status                                           |
-| ---------- | -------------------------- | ------------ | ------------------------------------------------ |
-| Python     | [python/](python/)         | `fourdgs`    | Reference implementation                         |
-| TypeScript | [typescript/](typescript/) | `@4dgs/core` | Decoder, conformance-verified                    |
-| Rust       | [rust/](rust/)             | `fourdgs`    | Decoder, conformance-verified                    |
-| C++        | [cpp/](cpp/)               | —            | Decoder over Rust's C ABI, conformance-verified  |
-| Swift      | [swift/](swift/)           | —            | Binding over Rust; decoder, conformance-verified |
+| Language   | Readme                     | Package      | Status                                           | Published           |
+| ---------- | -------------------------- | ------------ | ------------------------------------------------ | ------------------- |
+| Python     | [python/](python/)         | `fourdgs`    | Reference implementation                         | [PyPI][pypi]        |
+| TypeScript | [typescript/](typescript/) | `@4dgs/core` | Decoder, conformance-verified                    | not yet — see below |
+| Rust       | [rust/](rust/)             | `fourdgs`    | Decoder, conformance-verified                    | [crates.io][crates] |
+| C++        | [cpp/](cpp/)               | —            | Decoder over Rust's C ABI, conformance-verified  | build from source   |
+| Swift      | [swift/](swift/)           | —            | Binding over Rust; decoder, conformance-verified | build from source   |
+
+**The `@4dgs` packages are not on npm yet.** They are built, conformance-verified and versioned at
+0.1.0 here, and the release job is written and its gates pass; what is missing is a trusted
+publisher for the scope on npm, without which the job's OIDC exchange has nothing to exchange with.
+There is no badge above for npm, because the only version the registry would show is a name
+reservation with no implementation in it. Until then the TypeScript packages are used from a
+checkout. `fourdgs-cli`, which installs the `4dgs` command, is unpublished for the same class of
+reason — its manifest says which.
 
 Package names are `fourdgs` where a registry will not take `4dgs`; the format, the CLI and the file
 extension are always `4dgs`. [RELEASING.md](RELEASING.md) has the constraint per registry.
@@ -96,8 +108,6 @@ changes follow a defined process; new language SDKs have a three-step recipe.
 
 [pypi-badge]: https://img.shields.io/pypi/v/fourdgs?style=flat-square&label=PyPI
 [pypi]: https://pypi.org/project/fourdgs/
-[npm-badge]: https://img.shields.io/npm/v/%404dgs%2Fcore?style=flat-square&label=npm
-[npm]: https://www.npmjs.com/package/@4dgs/core
 [crates-badge]: https://img.shields.io/crates/v/fourdgs?style=flat-square&label=crates.io
 [crates]: https://crates.io/crates/fourdgs
 [ci-badge]:
