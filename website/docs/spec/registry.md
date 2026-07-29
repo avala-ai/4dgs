@@ -39,7 +39,10 @@ per band, and the stream header inside such a record carries `0x07` in its `attr
 the record's own opcode, which collides with `mu_t`'s id of 7. A reader identifies a band stream by
 the record that contains it, never by that field. The collision is a version-1 quirk that a future
 major version may clean up; see spec §5.7. Coefficients are `u8`, stored as written and read as
-stored: `step_sh` records what the encoder did and is not applied at decode (spec §6.5).
+stored: `step_sh` records what the encoder did and is not applied at decode (spec §6.5). A byte `b`
+means the coefficient `-4 + b * 8 / 255`, which a decoder needs only if it hands its caller floats;
+how coarsely the bytes were quantized before they were stored is declared per band under "SH bit
+depths" below.
 
 ---
 
@@ -79,6 +82,47 @@ Used by the Quantization record's `scheme` field.
 | value        | notes                                                                                                                                                                            |
 | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `uniform-v1` | Uniform grids of pitch `2ε` per attribute, log domain for scale and sigma, per-gaussian steps for velocity and birth time as in spec §6.3. The only scheme defined for version 1 |
+
+Per-band spherical harmonic bit depths (below) are **not** a second scheme. A file that declares
+them still declares `uniform-v1`, because the depths refine one attribute's grid rather than replace
+the set. Spending a scheme name on them would make every file that used them unreadable to a reader
+that validates the name — which is the one reader the name exists for.
+
+---
+
+## SH bit depths
+
+Carried in the Quantization record's appended fields, one per band (spec §5.3, §6.5).
+
+A depth `n` stores a coefficient byte on a grid of pitch `2^(8 − n)` code units, reconstructed at
+bin centres, so the bound is half the pitch. Eight bits is the identity — the byte as it arrived —
+and a file that declares no depths is a file at eight bits in every band.
+
+| bits | grid pitch | bound, code units | bound, coefficient units | distinct values |
+| ---- | ---------- | ----------------- | ------------------------ | --------------- |
+| 8    | 1          | 0                 | 0                        | 256             |
+| 7    | 2          | 1                 | 0.031                    | 128             |
+| 6    | 4          | 2                 | 0.063                    | 64              |
+| 5    | 8          | 4                 | 0.125                    | 32              |
+| 4    | 16         | 8                 | 0.251                    | 16              |
+| 3    | 32         | 16                | 0.502                    | 8               |
+
+Coefficient units are code units times `8 / 255`, through the byte-to-coefficient map spec §6.5
+fixes. Depths outside 3–8 are not legal: eight is the byte, and below three a band has fewer levels
+than it has coefficients to spend them on.
+
+Ladders are conventions, not wire values — a producer may declare any legal combination. These three
+are named so that tooling and documentation have the same words for them.
+
+| ladder       | band 1 | band 2 | band 3 | intent                                                                      |
+| ------------ | ------ | ------ | ------ | --------------------------------------------------------------------------- |
+| `flat`       | 8      | 8      | 8      | Declares the identity explicitly, for a file that wants the field to say so |
+| `balanced`   | 8      | 6      | 5      | Band 1 exact, the higher bands coarser as their energy falls                |
+| `aggressive` | 6      | 4      | 3      | The coarse end of the range, where the coefficients are most of the payload |
+
+Depths SHOULD fall with band index: band 3 carries seven coefficients per colour component to band
+1's three, and its energy is the lowest, so it is both the cheapest place to spend precision and the
+most expensive place to keep it.
 
 ---
 

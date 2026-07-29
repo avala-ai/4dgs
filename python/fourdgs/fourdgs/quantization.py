@@ -31,14 +31,13 @@ from .exceptions import MalformedFile
 
 PROFILES = ("fine", "default", "coarse")
 
-#: The interval this codec maps unsigned-byte spherical-harmonic coefficients onto.
+#: The interval unsigned-byte spherical-harmonic coefficients map onto.
 #:
-#: The format is deliberate that "the stored byte is the coefficient" and that `step_sh`
-#: is an encode-side record a decoder does nothing with (spec section 6.5), so the
-#: byte-to-float mapping is this **codec's** convention rather than a format guarantee.
-#: It lives here because two importers have to agree on it — the PLY one and the glTF
-#: one — and a file converted through one and out through the other would otherwise
-#: change appearance for no stated reason.
+#: **The specification pins this** (section 6.5): a stored byte `b` is the coefficient
+#: `SH_QUANT_LO + b * (SH_QUANT_HI - SH_QUANT_LO) / 255`. It was a convention shared by
+#: this package's two importers before it was a rule, which is how it came to be written
+#: down — a producer that assumed a different interval got silent colour shift in the
+#: higher bands and nothing in the file to point at.
 SH_QUANT_LO = -4.0
 SH_QUANT_HI = 4.0
 
@@ -75,6 +74,76 @@ LIFE_HALF_MAX = 2.0
 # Birth-time precision classes.
 MU_REL = 0.05
 MU_MIN_CLASS = -10
+
+# Spherical harmonic bit depths (spec section 6.5).
+#: The narrowest and widest a band may declare. Eight is the coefficient as stored, so a
+#: band that declares it is exact; three leaves eight levels, which is the point at which
+#: a band stops describing a direction and starts describing a mood.
+SH_MIN_BITS = 3
+SH_MAX_BITS = 8
+
+#: Named ladders, band 1 first. Band energy falls with degree, so every ladder here spends
+#: fewer bits as the band index rises; a producer may pass any tuple in the legal range.
+SH_LADDERS: dict[str, tuple[int, ...]] = {
+    "flat": (8, 8, 8),
+    "balanced": (8, 6, 5),
+    "aggressive": (6, 4, 3),
+}
+
+
+def sh_step(bits: int) -> int:
+    """The grid pitch, in code units, that a bit depth implies.
+
+    A coefficient is a byte whatever the depth: `n` bits means the byte is rounded onto a
+    grid of `2^(8 - n)` code units, which leaves `2^n` distinct values in a stream that is
+    still bytes. Nothing sub-byte is packed, and no decoder changes — the saving is
+    realized by the stream codec, which has that many fewer symbols to code.
+    """
+    if not (SH_MIN_BITS <= bits <= SH_MAX_BITS):
+        raise ValueError(f"an SH bit depth must be {SH_MIN_BITS}..{SH_MAX_BITS}, got {bits}")
+    return 1 << (SH_MAX_BITS - bits)
+
+
+def sh_bound(bits: int) -> int:
+    """The maximum deviation, in code units, a bit depth guarantees.
+
+    Exactly half the pitch, which is the same relationship every other attribute's grid
+    has to its bound. Eight bits is pitch 1 and bound 0: the byte is stored as it arrived.
+    """
+    return sh_step(bits) // 2
+
+
+def quantize_sh(values, bits: int) -> np.ndarray:
+    """Round coefficient bytes onto the grid `bits` names, reconstructing at bin centres.
+
+    Centring is what makes the bound half the pitch rather than the whole of it, and it
+    keeps the operation idempotent: a coefficient already on the grid is left alone, so
+    re-encoding a file at the depth it already carries changes no byte.
+    """
+    step = sh_step(bits)
+    v = np.asarray(values, dtype=np.int64)
+    if step == 1:
+        return v
+    return (v // step) * step + step // 2
+
+
+def sh_coefficient(bytes_) -> np.ndarray:
+    """The float coefficients stored bytes stand for (spec section 6.5).
+
+    The affine map is the format's, not this codec's: `SH_QUANT_LO + byte * span / 255`.
+    """
+    span = SH_QUANT_HI - SH_QUANT_LO
+    return np.asarray(bytes_, dtype=np.float64) * (span / 255.0) + SH_QUANT_LO
+
+
+def sh_bound_float(bits: int) -> float:
+    """The same bound `sh_bound` gives, expressed in coefficient units.
+
+    Code units are what the file declares, because they are exact integers; a consumer
+    working in floats wants the same number through the mapping, and doing the conversion
+    in two places is how the two stop agreeing.
+    """
+    return sh_bound(bits) * (SH_QUANT_HI - SH_QUANT_LO) / 255.0
 
 
 @dataclass

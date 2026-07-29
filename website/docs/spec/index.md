@@ -251,13 +251,29 @@ f64     step_time
 f64     step_sigma_log
 u8      step_sh
 map<string,string> bounds  -- declared max deviation per attribute, as decimal strings
+-- appended fields follow; a record that ends here declares none of them
+u8      sh_depth_count     -- number of per-band SH bit depths; the field is absent, not 0,
+                           -- when a file declares none
+        sh_depth_count × u8   -- band b's bit depth, 3..8, band 1 first (see §6.5)
 ```
 
 The `bounds` keys are `pos`, `scale_rel`, `rot`, `rgb`, `alpha`, `motion`, `time`, `sigma_rel` and
-`sh`. `scale_rel` and `sigma_rel` are relative deviations in the log domain; the rest are absolute,
-in the unit of the attribute they name. A reader MAY ignore the map entirely — it is a producer's
-declaration, not an instruction — but a reader that surfaces it MUST use these names, so that two
-readers report the same number for the same file.
+`sh`, plus `sh_band1`, `sh_band2` and `sh_band3` on a file that declares per-band SH bit depths.
+`scale_rel` and `sigma_rel` are relative deviations in the log domain; the rest are absolute, in the
+unit of the attribute they name, and the `sh` keys are in **code units** — a stored byte's grid, not
+a coefficient's — because that is the domain the bytes live in. A reader MAY ignore the map entirely
+— it is a producer's declaration, not an instruction — but a reader that surfaces it MUST use these
+names, so that two readers report the same number for the same file.
+
+**The SH bit depths are a declaration, not an instruction.** A writer that quantizes coefficients by
+bit depth MUST emit one entry per band it writes, in band order, each in the range 3–8, and MUST set
+`bounds.sh_band<b>` from each depth by the rule in §6.5. A reader MAY ignore the field: nothing at
+decode depends on it, because the byte a band stream carries is already the quantized value. A
+reader that finds it malformed — a count the record is too short for, or a depth outside 3–8 — MUST
+read the file as declaring none rather than refuse it. Appended fields are positional, so bytes
+appended by some other writer land exactly where this field is, and a declaration about encoding
+that has already happened is not worth failing a decodable file over. A validator SHOULD report the
+inconsistency.
 
 **Every numeric parameter in this record MUST be finite** — the three components of `pos_origin` and
 all eight steps. Neither an infinity nor a NaN is a legal value for any of them.
@@ -852,6 +868,58 @@ coefficients records the pitch it used so the file declares its own error, and a
 nothing with it. The stored byte is the coefficient. Multiplying by `step_sh` at decode scales
 appearance by a factor of one to three and is the single most likely way to misread this record.
 
+#### What a stored byte means
+
+A coefficient byte `b` is the value
+
+```
+coefficient = -4 + b * 8 / 255
+```
+
+on the closed interval `[-4, +4]`, and a producer whose coefficients fall outside it MUST clamp
+them. This is fixed for version 1 and is not declared anywhere in the file, because there is nothing
+to declare: every byte in every conforming file already means this.
+
+The rule exists because "the stored byte is the coefficient" answers a different question than the
+one a consumer asks. It says a decoder must not rescale, and it is right about that. But anything
+that hands a renderer or another format _floats_ — an exporter, a converter, a shader that evaluates
+the basis — needs the affine map, and a specification that does not state it invites each consumer
+to invent one. Two that disagree do not fail: they produce a scene whose higher-degree colour shifts
+on the way through, silently, with nothing in the file to point at.
+
+#### Bit depth
+
+A band MAY be quantized more coarsely than its byte allows. Each band declares a **bit depth** `n`
+in the range 3–8, carried in the Quantization record's appended SH bit-depth fields (§5.3). Its
+coefficients are stored on a grid of pitch
+
+```
+q     = 2^(8 - n)                 -- code units
+b     = floor(original / q) * q + floor(q / 2)
+bound = floor(q / 2)              -- code units; bound * 8 / 255 in coefficient units
+```
+
+Reconstruction is at the bin centre, which is what makes the bound half the pitch rather than the
+whole of it and what makes the operation idempotent — a coefficient already on the grid is left
+alone, so re-encoding a file at the depth it already carries changes no byte. **Eight bits is the
+identity**: pitch 1, bound 0, the byte stored as it arrived. A file that declares no depths is a
+file at eight bits in every band, which is what every file written before the field existed does,
+and the general rule and the original one are therefore the same rule.
+
+Nothing sub-byte is packed. A band stream at three bits is still a stream of bytes, taking eight
+distinct values; the size it saves is saved by the stream codec, which has that many fewer symbols
+to code. **No decoder changes for this**, and none may treat a declared depth as an instruction to
+unpack anything.
+
+Depths SHOULD fall with band index. A band's energy falls with its degree, so the coefficients that
+tolerate the coarsest grid are the ones there are most of — band 3 carries seven coefficients per
+colour component to band 1's three.
+
+When a file declares per-band depths, `step_sh` MUST carry the **coarsest** band's pitch and
+`bounds.sh` the coarsest band's bound. Both fields predate per-band depths and a consumer may read
+only them; the worst case is the only value that is true of the whole file rather than of some of
+it.
+
 ---
 
 ## 7. Audio
@@ -933,6 +1001,10 @@ Declared here so implementers know the direction, **not implemented and not to b
   per-frame work on the consumer's critical path — a fundamentally different performance profile
   from the baked model, where a gaussian's motion is three numbers read once.
 - **Per-gaussian SH degree**, so a scene can spend coefficients where they matter.
+- **A declared SH coefficient interval.** §6.5 fixes the byte-to-coefficient map to `[-4, +4]`, and
+  content whose coefficients leave that interval has to clamp. Declaring the interval per file would
+  lift the clamp, at the cost of a value every consumer must read and no consumer can default. It is
+  named here so that the fixed interval reads as a decision rather than an oversight.
 - **Spatial subdivision within a temporal chunk**, for level-of-detail by region.
 
 ---
@@ -982,6 +1054,8 @@ and the text was the bug.
 | §5.2 named the terms of the 37-byte tail a seeking reader reads                                                                 | clarification             |
 | §5.15 added: Coordinate Frame `0x20`, Sensor Calibration `0x21`, Rig Trajectory `0x22` and Geodetic Anchor `0x23`, all optional | rule added                |
 | §5.15.2 added: a Coordinate Frame record supersedes the `coordinate_system` metadata key                                        | rule added                |
+| §6.5 added: a stored SH byte is the coefficient `-4 + b * 8 / 255`, on a fixed interval                                         | clarification, rule added |
+| §5.3/§6.5 added: per-band SH bit depths, appended to the Quantization record                                                    | rule added                |
 
 The two §5.15 rows add records rather than tighten a rule, and they **change no existing file**. The
 opcodes they define were reserved and unemitted, so no file in the world carries one; all
@@ -996,17 +1070,36 @@ for.
 What changes is what a **new** file may say. The precedence row is the one with teeth: a producer
 that has been writing `coordinate_system` as metadata keeps working unchanged, and only a file
 carrying both the key and the record has a question to answer — which is why the answer is stated
-before anyone can write that file rather than after.
+before anyone can write that file rather than after. The §5.3 row is a tightening of what a
+**writer** may emit, and it changes no existing file: every quantization parameter any encoder here
+has ever written is finite, all 34 conformance variants already satisfy it, none was regenerated for
+it, and no file's bytes or meaning move. What it forbids is a value that only ever arrives by
+corruption. It is stated because the failure was silent in the wrong direction — a non-finite step
+decodes without complaint into geometry that is entirely infinity or NaN, and the first sign of it
+is a renderer drawing nothing rather than a reader saying why. Making it a rule is what lets a
+validator name the field instead of leaving the reader to infer it. It adds nothing to what a
+decoder must do; §6's arithmetic and every decoder's succeed-or-refuse behaviour are untouched.
 
-The §5.3 row is a tightening of what a **writer** may emit, and it changes no existing file: every
-quantization parameter any encoder here has ever written is finite, all 34 conformance variants
-already satisfy it, none was regenerated for it, and no file's bytes or meaning move. What it
-forbids is a value that only ever arrives by corruption. It is stated because the failure was silent
-in the wrong direction — a non-finite step decodes without complaint into geometry that is entirely
-infinity or NaN, and the first sign of it is a renderer drawing nothing rather than a reader saying
-why. Making it a rule is what lets a validator name the field instead of leaving the reader to infer
-it. It adds nothing to what a decoder must do; §6's arithmetic and every decoder's succeed-or-refuse
-behaviour are untouched.
+The two §6.5 rows are the same kind of change from opposite directions, and neither moves a byte in
+any file that exists.
+
+The **mapping** row writes down what every implementation already did. The text said the stored byte
+is the coefficient and stopped there, which is a complete answer for a decoder and no answer at all
+for an exporter, and an exporter needs one — so the reference codec picked `[-4, +4]`, its PLY
+importer and its glTF bridge shared the constant, and the specification said nothing. That is the
+shape of defect worth naming: not a disagreement between implementations, but an interval that
+existed in code and not in the document, so that a second implementation could pick a different one,
+be conforming by the text, and produce scenes whose higher bands drift in colour on every conversion
+with nothing to point at. Stating it costs nothing, because it is what the bytes already meant.
+
+The **bit depth** row adds a field, and adds it where a frozen record can take one: appended, after
+the bounds map, absent entirely on a file that declares nothing. All 44 conformance variants that
+predate it are byte-identical, none was regenerated, and the five variants that use it are new
+files. It is also, deliberately, not a second scheme — eight bits is the identity, so a file that
+declares no depths is a file at eight bits, and one rule covers both. What it does not do is change
+what a decoder must implement: the byte in a band stream is the quantized coefficient either way,
+and a decoder that ignores the whole declaration decodes every such file correctly. That is the
+property being paid for by not packing sub-byte values.
 
 The §4.5 row is a tightening of what a **writer** may emit, not a migration. It changes no existing
 file: all 34 conformance variants already satisfy it, none was regenerated, and no file's bytes or

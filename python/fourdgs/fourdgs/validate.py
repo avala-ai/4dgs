@@ -17,6 +17,7 @@ from . import opcode as op
 from . import records as rec
 from .exceptions import FourdgsError
 from .provenance import LENGTH_UNIT_METRES, Provenance
+from .quantization import sh_bound, sh_step
 from .readable import BytesReadable
 from .serialization import MAGIC, check_magic, crc32, iter_records
 
@@ -161,6 +162,37 @@ def _check_provenance(prov: Provenance, report: Report) -> None:
         )
 
 
+def _check_sh_bit_depths(quant: rec.Quantization, sh_degree: int, report: Report) -> None:
+    """The per-band SH bit depths, against the degree the Header declares (spec §6.5).
+
+    Only checked when the file actually carries bands. Appended fields are positional, so
+    a record that ends in bytes some other writer appended can parse as a depth list by
+    coincidence; on a file with no coefficients that is a false alarm waiting to happen,
+    and there is nothing for the declaration to be wrong about.
+    """
+    if not quant.sh_bit_depths or sh_degree <= 0:
+        return
+    if len(quant.sh_bit_depths) != sh_degree:
+        report.error(
+            f"Quantization declares {len(quant.sh_bit_depths)} SH bit depths; "
+            f"the Header declares degree {sh_degree}, and there is one band per degree (§6.5)"
+        )
+    for i, bits in enumerate(quant.sh_bit_depths[:sh_degree], start=1):
+        key = f"sh_band{i}"
+        declared = quant.bounds.get(key)
+        expected = str(sh_bound(bits))
+        if declared is None:
+            report.warn(f"Quantization declares {bits} bits for SH band {i} but no `{key}` bound (§5.3)")
+        elif declared != expected:
+            report.warn(f"Quantization declares `{key}` as {declared}; {bits} bits gives a bound of {expected} (§6.5)")
+    coarsest = max(sh_step(b) for b in quant.sh_bit_depths[:sh_degree])
+    if quant.step_sh != coarsest:
+        report.warn(
+            f"Quantization step_sh is {quant.step_sh}; the coarsest declared band has a pitch of {coarsest}, "
+            "which is what a consumer that reads only step_sh has to be given (§6.5)"
+        )
+
+
 def validate(data: bytes) -> Report:
     report = Report()
     try:
@@ -192,6 +224,7 @@ def validate(data: bytes) -> Report:
                 # Checked here, as the record is met, rather than once at the end on
                 # whichever copy survived the loop. See `_check_quantization_finite`.
                 _check_quantization_finite(quant, report, quant_count)
+                _check_sh_bit_depths(quant, header.sh_degree if header is not None else 0, report)
                 quant_count += 1
             elif record.opcode == op.CHUNK:
                 head, _ = rec.parse_chunk(record.content)

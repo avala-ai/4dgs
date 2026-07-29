@@ -7,9 +7,9 @@ documented state — not a defect — and this table is the public contract that
 `supportsVariant()`, the harness runs exactly those, and this table is kept in lockstep with those
 declarations. Nothing is marked `Yes` on the strength of code existing.
 
-Every row is filled in from a suite that runs: 39 valid variants and 6 invalid ones, over two read
+Every row is filled in from a suite that runs: 44 valid variants and 6 invalid ones, over two read
 paths (streamed and indexed). A language takes the variants it declares support for, and what it
-declines is what this table records — 89 checks passing for Python, 77 for Rust, 67 each for
+declines is what this table records — 99 checks passing for Python, 87 for Rust, 77 each for
 TypeScript, C++, Swift and Dart. Rust declines the refusal expectations; TypeScript, C++, Swift and
 Dart decline those and the five variants that carry provenance records.
 
@@ -27,6 +27,8 @@ Dart decline those and the five variants that carry provenance records.
 | Spherical harmonics, degree 2                        | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Spherical harmonics, degree 3                        | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | SH band range-skipping                               | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| SH per-band bit depth, decode                        | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| SH per-band bit depth, encode                        | Yes    | Planned    | Yes     | Planned | Planned | Planned |
 | Embedded audio (optional, zero-overhead when absent) | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Camera trajectory                                    | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Metadata                                             | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
@@ -114,6 +116,21 @@ in content order so two decoders that visit gaussians differently still agree. B
 existed, every SH variant passed for a decoder that threw the coefficients away — which is why these
 cells said `Planned` while the code was already written.
 
+**SH per-band bit depth** splits into two rows because it is two different claims, and the decode
+one is the surprising half: it is a `Yes` that cost no decoder a line of code. A band's coefficient
+is a byte whatever depth it was quantized at, and the depths themselves ride in fields appended to
+the Quantization record, which every SDK already steps over by length. So the row is not "six
+implementations wrote this feature"; it is "six implementations were asked to decode files that use
+it and did", which the five new corpus variants check on both read paths — the spherical-harmonic
+digest is taken over coefficients that are demonstrably not the ones that went in, so a decoder
+substituting its own expectation fails.
+
+The encode row is proved the way the other encode rows are: Python's by the corpus gate, which
+re-encodes every variant and asserts its checksum, and Rust's by `encode-roundtrip.sh`, which now
+re-encodes every SH-bearing variant at per-band depths and requires the Python decoder to agree with
+the Rust one about the result — and, separately, to read back the depths that were declared. A file
+whose coefficients and whose declaration disagree fails one check or the other.
+
 **SH band range-skipping** is proved by a byte count taken at the transport rather than by a decoded
 value: each runner reads a chunk at every band cap and asserts the bytes transferred equal exactly
 what the chunk index declares for the bands at or below it. Never transferring a band you will not
@@ -149,9 +166,9 @@ check cannot pass against a decoder that returns nothing.
 **Encode**, **Chunked encode** and **Summary writing** are proved by a gate rather than by a runner,
 and the two encoders are gated differently because they play different roles.
 
-Python's is proved by the corpus gate: `generate.py --verify` re-encodes all 34 variants, asserts
-every committed checksum, and asserts that two consecutive runs are byte-identical. Every variant is
-an encode; the chunked and summary-bearing ones are the flags that say so.
+Python's is proved by the corpus gate: `generate.py --verify` re-encodes all 44 valid variants,
+asserts every committed checksum, and asserts that two consecutive runs are byte-identical. Every
+variant is an encode; the chunked and summary-bearing ones are the flags that say so.
 
 Rust's cannot use that gate, because Rust does not generate the corpus and a second encoder that
 produced byte-identical files would be a reimplementation rather than an implementation.

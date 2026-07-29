@@ -11,8 +11,8 @@ test:
 	python3 -m pytest fourdgs/tests -q
 
 lint:
-	python3 -m ruff check fourdgs conformance examples
-	python3 -m ruff format --check fourdgs conformance examples
+	python3 -m ruff check fourdgs conformance examples tools
+	python3 -m ruff format --check fourdgs conformance examples tools
 
 examples:
 	python3 examples/encode_synthetic.py

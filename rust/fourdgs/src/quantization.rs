@@ -28,6 +28,82 @@ const LIFE_HALF_MAX: f64 = 2.0;
 const MU_REL: f64 = 0.05;
 const MU_MIN_CLASS: f64 = -10.0;
 
+/// The interval unsigned-byte spherical harmonic coefficients map onto (spec §6.5).
+///
+/// A stored byte `b` is the coefficient `SH_QUANT_LO + b * (SH_QUANT_HI - SH_QUANT_LO) /
+/// 255`. Decoding a `.4dgs` never needs this — the format's gaussian state carries the
+/// bytes, and §6.5's rule is that the byte *is* the coefficient — but anything that hands
+/// a renderer or another format floats does, and a consumer that invents its own interval
+/// shifts the higher bands' colour with nothing in the file to point at.
+pub const SH_QUANT_LO: f64 = -4.0;
+/// The upper end of the interval; see [`SH_QUANT_LO`].
+pub const SH_QUANT_HI: f64 = 4.0;
+
+/// The float coefficient a stored byte stands for.
+pub fn sh_coefficient(byte: u8) -> f64 {
+    f64::from(byte) * ((SH_QUANT_HI - SH_QUANT_LO) / 255.0) + SH_QUANT_LO
+}
+
+// Spherical harmonic bit depths (spec §6.5).
+/// The narrowest a band may declare. Below this a band stops describing a direction.
+pub const SH_MIN_BITS: u8 = 3;
+/// The widest, and the coefficient as stored: a band that declares it is exact.
+pub const SH_MAX_BITS: u8 = 8;
+
+/// Named ladders, band 1 first. Band energy falls with degree, so every ladder here
+/// spends fewer bits as the band index rises; a producer may pass any legal tuple.
+pub const SH_LADDERS: [(&str, [u8; 3]); 3] = [
+    ("flat", [8, 8, 8]),
+    ("balanced", [8, 6, 5]),
+    ("aggressive", [6, 4, 3]),
+];
+
+/// The ladder a name refers to, if it is one this build knows.
+pub fn sh_ladder(name: &str) -> Option<[u8; 3]> {
+    SH_LADDERS
+        .iter()
+        .find(|(known, _)| *known == name)
+        .map(|(_, depths)| *depths)
+}
+
+/// The grid pitch, in code units, that a bit depth implies.
+///
+/// A coefficient is a byte whatever the depth: `n` bits means the byte is rounded onto a
+/// grid of `2^(8 - n)` code units, which leaves `2^n` distinct values in a stream that is
+/// still bytes. Nothing sub-byte is packed and no decoder changes — the saving is realized
+/// by the stream codec, which has that many fewer symbols to code.
+pub fn sh_step(bits: u8) -> u8 {
+    1u8 << (SH_MAX_BITS - bits.clamp(SH_MIN_BITS, SH_MAX_BITS))
+}
+
+/// The maximum deviation, in code units, a bit depth guarantees: half the pitch, the same
+/// relationship every other attribute's grid has to its bound.
+pub fn sh_bound(bits: u8) -> u8 {
+    sh_step(bits) / 2
+}
+
+/// The same bound in coefficient units, through the mapping in [`SH_QUANT_LO`].
+///
+/// Code units are what the file declares, because they are exact integers; a consumer
+/// working in floats wants the same number through the mapping, and doing the conversion
+/// in two places is how the two stop agreeing.
+pub fn sh_bound_float(bits: u8) -> f64 {
+    f64::from(sh_bound(bits)) * (SH_QUANT_HI - SH_QUANT_LO) / 255.0
+}
+
+/// Round one coefficient byte onto the grid `bits` names, reconstructing at bin centres.
+///
+/// Centring is what makes the bound half the pitch rather than the whole of it, and it
+/// keeps the operation idempotent: a coefficient already on the grid is left alone, so
+/// re-encoding a file at the depth it already carries changes no byte.
+pub fn quantize_sh(value: u8, bits: u8) -> u8 {
+    let step = sh_step(bits);
+    if step == 1 {
+        return value;
+    }
+    (value / step) * step + step / 2
+}
+
 /// Half-width of a gaussian's visible support, in sigmas, for a file's own cutoff.
 ///
 /// Reading this from the Header rather than assuming the default is not cosmetic: it feeds

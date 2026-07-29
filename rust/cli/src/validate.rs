@@ -11,6 +11,7 @@
 //! Two validators that disagree about whether a file conforms are worse than one, so where
 //! the two differ the Python module is the reference and this is the bug.
 
+use fourdgs::quantization::{sh_bound, sh_step};
 use fourdgs::serialization::{crc32, Records, MAGIC, RECORD_HEADER_SIZE};
 use fourdgs::{opcode as op, records as rec, BytesReadable, Result};
 
@@ -133,6 +134,8 @@ pub fn validate(data: &[u8]) -> Report {
                     // Checked here, as the record is met, rather than once at the end on
                     // whichever copy survived. See `check_quantization_finite`.
                     check_quantization_finite(&parsed, &mut report, quantization_count);
+                    let degree = header.as_ref().map(|h| h.sh_degree).unwrap_or(0);
+                    check_sh_bit_depths(&parsed, degree, &mut report);
                     quantization_count += 1;
                     quantization = true;
                 }
@@ -298,6 +301,49 @@ fn check_quantization_finite(quant: &rec::Quantization, report: &mut Report, ord
     }
 }
 
+/// The per-band SH bit depths, against the degree the Header declares (spec §6.5).
+///
+/// Only checked when the file actually carries bands. Appended fields are positional, so a
+/// record that ends in bytes some other writer appended can parse as a depth list by
+/// coincidence; on a file with no coefficients that is a false alarm waiting to happen, and
+/// there is nothing for the declaration to be wrong about.
+fn check_sh_bit_depths(quant: &rec::Quantization, sh_degree: u8, report: &mut Report) {
+    if quant.sh_bit_depths.is_empty() || sh_degree == 0 {
+        return;
+    }
+    let degree = sh_degree as usize;
+    if quant.sh_bit_depths.len() != degree {
+        report.error(format!(
+            "Quantization declares {} SH bit depths; the Header declares degree {sh_degree}, \
+             and there is one band per degree (§6.5)",
+            quant.sh_bit_depths.len()
+        ));
+    }
+    let declared: Vec<u8> = quant.sh_bit_depths.iter().copied().take(degree).collect();
+    for (i, bits) in declared.iter().enumerate() {
+        let band = i + 1;
+        let key = format!("sh_band{band}");
+        let expected = sh_bound(*bits).to_string();
+        match quant.bounds.get(&key) {
+            None => report.warn(format!(
+                "Quantization declares {bits} bits for SH band {band} but no `{key}` bound (§5.3)"
+            )),
+            Some(found) if *found != expected => report.warn(format!(
+                "Quantization declares `{key}` as {found}; {bits} bits gives a bound of {expected} (§6.5)"
+            )),
+            Some(_) => {}
+        }
+    }
+    let coarsest = declared.iter().map(|b| sh_step(*b)).max().unwrap_or(1);
+    if quant.step_sh != coarsest {
+        report.warn(format!(
+            "Quantization step_sh is {}; the coarsest declared band has a pitch of {coarsest}, \
+             which is what a consumer that reads only step_sh has to be given (§6.5)",
+            quant.step_sh
+        ));
+    }
+}
+
 /// A non-finite value spelled the way Python spells it, so that the two validators'
 /// findings are the same string rather than the same complaint. Rust writes `NaN` where
 /// Python writes `nan`, and a report a caller diffs is a report where that matters.
@@ -382,6 +428,7 @@ mod tests {
             step_sigma_log: 0.04,
             step_sh: 1,
             bounds: Default::default(),
+            sh_bit_depths: Vec::new(),
         }
     }
 

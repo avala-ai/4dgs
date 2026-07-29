@@ -26,8 +26,9 @@ use crate::error::{Error, Result};
 use crate::model::{AudioTrack, GaussianSet};
 use crate::opcode as op;
 use crate::quantization::{
-    life_class, life_half, morton_order, motion_step, mu_step, quantize_rotation, rct_forward,
-    rint, support_k, Bounds, Profile, Steps,
+    life_class, life_half, morton_order, motion_step, mu_step, quantize_rotation, quantize_sh,
+    rct_forward, rint, sh_bound, sh_step, support_k, Bounds, Profile, Steps, SH_MAX_BITS,
+    SH_MIN_BITS,
 };
 use crate::records as rec;
 use crate::serialization::{crc32, put_record, MAGIC};
@@ -54,6 +55,11 @@ pub struct WriteOptions {
     pub write_crc: bool,
     /// Highest spherical harmonic band to write.
     pub sh_bands: u8,
+    /// Per-band spherical harmonic bit depths, band 1 first. `None` leaves the
+    /// coefficients as the profile alone decides, which is what every file written before
+    /// this option existed did — the appended field is not emitted at all, so those files
+    /// are byte-identical.
+    pub sh_bit_depths: Option<Vec<u8>>,
     /// Decode every chunk back and check the declared bounds before returning. Turning
     /// this off is a performance choice a producer has to make deliberately.
     pub verify: bool,
@@ -85,6 +91,7 @@ impl Default for WriteOptions {
             write_summary_offsets: false,
             write_crc: true,
             sh_bands: 3,
+            sh_bit_depths: None,
             verify: true,
             library: "4dgs-rust encoder".into(),
             scene_profile: String::new(),
@@ -534,6 +541,21 @@ fn encode(
         }
     }
 
+    let bands: Vec<u8> = sh_columns.keys().copied().collect();
+    let depths = resolve_sh_depths(opts.sh_bit_depths.as_deref(), &bands)?;
+
+    // One pitch has to go in `step_sh`, which is a single byte and predates per-band
+    // depths. The coarsest band's is the only honest answer: a consumer that reads it and
+    // not the appended field then holds an upper bound rather than a number that is true
+    // of some bands and wrong for others. `bounds.sh` is worst-case for the same reason,
+    // with the per-band truth beside it.
+    let mut steps = q.steps;
+    let mut sh_bounds = q.bounds.sh;
+    if !depths.is_empty() {
+        steps.sh = depths.values().map(|d| sh_step(*d)).max().unwrap_or(1);
+        sh_bounds = depths.values().map(|d| sh_bound(*d)).max().unwrap_or(0);
+    }
+
     let mut out: Vec<u8> = Vec::new();
     out.extend_from_slice(&MAGIC);
 
@@ -581,8 +603,9 @@ fn encode(
             step_motion: q.steps.motion,
             step_time: q.steps.time,
             step_sigma_log: q.steps.sigma_log,
-            step_sh: q.steps.sh,
-            bounds: declared_bounds(&q.bounds),
+            step_sh: steps.sh,
+            bounds: declared_bounds(&q.bounds, sh_bounds, &depths),
+            sh_bit_depths: depths.values().copied().collect(),
         }
         .encode(trailer(op::QUANTIZATION)),
     );
@@ -682,13 +705,19 @@ fn encode(
             let row = g.sh_coefficients * 3;
             for (band, columns) in &sh_columns {
                 let mut values: Vec<i64> = Vec::with_capacity(members.len() * columns.len());
+                let mut original: Vec<u8> = Vec::with_capacity(members.len() * columns.len());
                 for i in &members {
                     for c in columns {
-                        let mut v = sh[i * row + c] as i64;
-                        if q.steps.sh > 1 {
-                            let step = q.steps.sh as i64;
-                            v = (v / step) * step + step / 2;
-                        }
+                        let raw = sh[i * row + c];
+                        original.push(raw);
+                        let v = match depths.get(band) {
+                            Some(bits) => quantize_sh(raw, *bits) as i64,
+                            None if q.steps.sh > 1 => {
+                                let step = q.steps.sh as i64;
+                                (raw as i64 / step) * step + step / 2
+                            }
+                            None => raw as i64,
+                        };
                         values.push(v);
                     }
                 }
@@ -708,6 +737,11 @@ fn encode(
                 let band_at = out.len() as u64;
                 out.extend_from_slice(&band_blob);
                 bands.push((*band, band_at, band_blob.len() as u64));
+                if opts.verify {
+                    if let Some(bits) = depths.get(band) {
+                        verify_band(&band_blob, &original, sh_bound(*bits), *band)?;
+                    }
+                }
             }
         }
 
@@ -780,9 +814,63 @@ fn encode(
     Ok(out)
 }
 
+/// Resolve the option into `{band: bit depth}` for the bands actually written.
+///
+/// A ladder shorter than the file's degree is an error rather than a default: the depth of
+/// the highest band is the one that decides most of the size, and silently filling it in
+/// with eight bits would hand back a file that quietly ignored what was asked for.
+fn resolve_sh_depths(requested: Option<&[u8]>, bands: &[u8]) -> Result<BTreeMap<u8, u8>> {
+    let mut out = BTreeMap::new();
+    let (Some(requested), false) = (requested, bands.is_empty()) else {
+        return Ok(out);
+    };
+    if requested.len() < bands.len() {
+        return Err(Error::Malformed(format!(
+            "sh_bit_depths declares {} bands; this scene writes {}",
+            requested.len(),
+            bands.len()
+        )));
+    }
+    for (i, band) in bands.iter().enumerate() {
+        let bits = requested[i];
+        if !(SH_MIN_BITS..=SH_MAX_BITS).contains(&bits) {
+            return Err(Error::Malformed(format!(
+                "an SH bit depth must be {SH_MIN_BITS}..{SH_MAX_BITS}, got {bits}"
+            )));
+        }
+        out.insert(*band, bits);
+    }
+    Ok(out)
+}
+
+/// Decode the band record just written and check the bound it is about to declare.
+///
+/// Decoded rather than computed: the arithmetic that produced these bytes is three lines
+/// and would agree with itself if it were wrong. What the file will hand a consumer is
+/// what came back out of the record, so that is what the bound is measured against — every
+/// coefficient of every gaussian, not a sample.
+fn verify_band(band_blob: &[u8], original: &[u8], bound: u8, band: u8) -> Result<()> {
+    let content = &band_blob[crate::serialization::RECORD_HEADER_SIZE..];
+    let mut cursor = crate::serialization::Cursor::new(content);
+    cursor.u8()?;
+    let (_, stream) = crate::stream::decode_stream(&mut cursor, None)?;
+    let channels = stream.channels.max(1);
+    let mut worst = 0i64;
+    for (i, reference) in original.iter().enumerate() {
+        let got = stream.get(i / channels, i % channels);
+        worst = worst.max((got - i64::from(*reference)).abs());
+    }
+    if worst > bound as i64 {
+        return Err(Error::BoundViolation(format!(
+            "encoder verification failed: SH band {band} deviated {worst} code units, bound is {bound}"
+        )));
+    }
+    Ok(())
+}
+
 /// The bounds map the file declares, keyed as the specification names them so that two
 /// readers report the same number for the same file.
-fn declared_bounds(b: &Bounds) -> BTreeMap<String, String> {
+fn declared_bounds(b: &Bounds, sh: u8, depths: &BTreeMap<u8, u8>) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     for (key, value) in [
         ("pos", b.pos),
@@ -796,7 +884,10 @@ fn declared_bounds(b: &Bounds) -> BTreeMap<String, String> {
     ] {
         map.insert(key.to_string(), format!("{value:?}"));
     }
-    map.insert("sh".to_string(), b.sh.to_string());
+    map.insert("sh".to_string(), sh.to_string());
+    for (band, bits) in depths {
+        map.insert(format!("sh_band{band}"), sh_bound(*bits).to_string());
+    }
     map
 }
 

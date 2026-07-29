@@ -148,6 +148,11 @@ pub struct Quantization {
     pub step_sigma_log: f64,
     pub step_sh: u8,
     pub bounds: BTreeMap<String, String>,
+    /// Per-band spherical harmonic bit depths, band 1 first. Appended after the record's
+    /// original fields, so a file that declares none is byte-identical to one written
+    /// before the field existed — an empty list is written as no bytes at all, not as a
+    /// zero count.
+    pub sh_bit_depths: Vec<u8>,
 }
 
 impl Quantization {
@@ -169,6 +174,7 @@ impl Quantization {
             step_sigma_log: steps[7],
             step_sh: c.u8()?,
             bounds: c.str_map()?,
+            sh_bit_depths: sh_bit_depths(c.rest()),
         })
     }
 
@@ -205,10 +211,39 @@ impl Quantization {
         );
         put_u8(&mut body, self.step_sh);
         put_str_map(&mut body, &self.bounds);
+        if !self.sh_bit_depths.is_empty() {
+            put_u8(&mut body, self.sh_bit_depths.len() as u8);
+            body.extend_from_slice(&self.sh_bit_depths);
+        }
         body.extend_from_slice(trailer);
         let mut out = Vec::new();
         put_record(&mut out, op::QUANTIZATION, &body);
         out
+    }
+}
+
+/// Read the appended per-band SH bit depths, or nothing.
+///
+/// Deliberately tolerant. Appended fields are positional, so anything sitting after the
+/// bounds map lands where this field is — including bytes a *different* newer writer
+/// appended, or the arbitrary trailer a forward-compatibility fixture puts there. The
+/// declaration describes encoding that already happened and no decoded value depends on
+/// it, so a count the record is too short for, or a depth outside the legal range, reads
+/// as "this file declares none" rather than as a corrupt file (spec §5.3).
+fn sh_bit_depths(tail: &[u8]) -> Vec<u8> {
+    let Some((count, depths)) = tail.split_first() else {
+        return Vec::new();
+    };
+    let count = *count as usize;
+    if count == 0 || depths.len() < count {
+        return Vec::new();
+    }
+    let depths = &depths[..count];
+    let legal = crate::quantization::SH_MIN_BITS..=crate::quantization::SH_MAX_BITS;
+    if depths.iter().all(|d| legal.contains(d)) {
+        depths.to_vec()
+    } else {
+        Vec::new()
     }
 }
 

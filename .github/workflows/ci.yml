@@ -33,14 +33,17 @@ jobs:
         # everything these crates need comes from crates.io via Cargo.toml.
         #
         # 500 when `rust/` was the core and the conformance runners; 600 when the `4dgs`
-        # tool became a third crate beside them; 640 for the registry module and the
-        # cross-validator's pass over the invalid corpus. The number moves when source is
-        # added deliberately, which is the one thing it is not meant to catch — it exists
-        # so that a vendored dependency, which arrives in hundreds of KiB, fails loudly.
+        # tool became a third crate beside them; 640 after the provenance records, the
+        # per-band SH bit depths, the registry module and the cross-validator's pass over
+        # the invalid corpus — the last raise left four kilobytes of headroom, and a
+        # budget that tight stops being a budget and starts being a tax on the next
+        # feature. The number moves when the tree grows deliberately, which is the one
+        # thing it is not meant to catch — it exists so that a vendored dependency,
+        # which arrives in hundreds of KiB, fails loudly.
         #
         # Worth knowing when it next trips: `du` rounds every file to a 4 KiB block, so a
         # crate of forty small source files carries roughly 150 KiB of slack and a single
-        # NEW FILE costs 4 KiB whatever it contains. Trimming prose does not move this
+        # new file costs 4 KiB whatever it contains. Trimming prose does not move this
         # number; adding or removing files does.
         run: |
           size_kb=$(du -s rust | cut -f1)
