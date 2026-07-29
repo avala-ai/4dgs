@@ -56,8 +56,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "%s\n", state.error().toString().c_str());
     return 1;
   }
-  std::printf("%zu gaussians visible of %zu resident\n", state->count(),
-              scene.gaussians().count);
+  std::printf("%zu gaussians visible of %zu resident\n", state->count(), scene.gaussians().count);
 
   // Decoding ends here: positions and opacities at an instant. What draws them is somebody
   // else's library.
