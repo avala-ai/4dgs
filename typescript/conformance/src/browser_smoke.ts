@@ -332,9 +332,25 @@ async function main(): Promise<number> {
     return failed === 0 ? 0 : 1;
   } finally {
     devtools?.close();
-    chrome?.child.kill("SIGKILL");
+    if (chrome) {
+      // The kill returns before the process dies, and Chrome keeps writing to its
+      // profile while it goes down — removing the directory at that moment is a
+      // teardown race that fails a run whose assertions all passed. Wait for the
+      // exit event (bounded, in case it already fired), then remove with retries
+      // for whatever the filesystem is still settling.
+      const child = chrome.child;
+      const gone =
+        child.exitCode !== null
+          ? Promise.resolve()
+          : new Promise<void>((resolve) => {
+              child.once("exit", () => resolve());
+              setTimeout(resolve, 5000).unref();
+            });
+      child.kill("SIGKILL");
+      await gone;
+    }
     server.close();
-    await rm(profile, { recursive: true, force: true });
+    await rm(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   }
 }
 
