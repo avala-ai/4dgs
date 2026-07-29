@@ -19,9 +19,7 @@ use std::fmt::Write as _;
 use fourdgs::model::{AudioSource, GaussianSet};
 use fourdgs::object_layer::ObjectLayer;
 use fourdgs::provenance::{pose_at, Pose, PoseSampled, Provenance};
-use fourdgs::records::{
-    Attachment, Camera, Header, Metadata, RigTrajectory, Statistics, SummaryOffset,
-};
+use fourdgs::records::{Attachment, Camera, Header, Metadata, Statistics, SummaryOffset};
 use fourdgs::Result;
 
 pub const FLOAT_DECIMALS: usize = 6;

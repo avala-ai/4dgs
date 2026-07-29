@@ -35,7 +35,7 @@ A corpus of valid files can only prove that a decoder accepts what it should. It
 decoder **refuses** what it should — and a large part of this specification is rules whose entire
 content is a refusal: a window index outside its table, a codec this build does not implement, a
 temporal model this reader has never heard of. A decoder that ignores every one of them passes all
-34 valid variants.
+46 valid variants.
 
 `generator/invalid.py` declares the other half. Each entry is a length-preserving byte mutation of
 one valid base file, chosen so that **exactly one** rule is broken, paired with the **refusal
