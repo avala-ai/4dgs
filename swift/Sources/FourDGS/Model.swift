@@ -259,7 +259,8 @@ public struct GaussianState: Sendable, Equatable {
     public let sh: [UInt8]
 
     public init(
-        count: Int, positions: [Float], scales: [Float], rotations: [Float], colors: [Float], motions: [Float],
+        count: Int, positions: [Float], scales: [Float], rotations: [Float], colors: [Float],
+        motions: [Float],
         muT: [Float], sigmaT: [Float], winLo: [Float], winHi: [Float], shDegree: Int, sh: [UInt8]
     ) {
         self.count = count

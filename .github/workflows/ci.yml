@@ -172,13 +172,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: swift --version
+      # Style comes from swift/.swift-format, so this is the same command a contributor
+      # runs locally: `swift format --in-place --recursive` fixes what this reports.
       - name: Format
-        run: |
-          swift format --in-place --recursive swift/Sources swift/Tests swift/conformance
-          git config --global --add safe.directory "$PWD"
-          git diff > /tmp/fmt.patch
-          if [ -s /tmp/fmt.patch ]; then echo "PATCH-BEGIN"; base64 -w0 /tmp/fmt.patch; echo; echo "PATCH-END"; fi
-          git diff --stat
+        run: swift format lint --recursive --strict swift/Sources swift/Tests swift/conformance
       - name: Build
         run: swift build --package-path swift
       - name: Tests

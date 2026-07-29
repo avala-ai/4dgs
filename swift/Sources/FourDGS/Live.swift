@@ -81,7 +81,8 @@ extension GaussianState {
         }
         return GaussianState(
             count: n, positions: positions, scales: scales, rotations: rotations, colors: colors,
-            motions: motions, muT: muT, sigmaT: sigmaT, winLo: winLo, winHi: winHi, shDegree: shDegree, sh: sh)
+            motions: motions, muT: muT, sigmaT: sigmaT, winLo: winLo, winHi: winHi, shDegree: shDegree, sh: sh
+        )
     }
 
     /// Concatenate states that agree on spherical-harmonic degree — which every state from

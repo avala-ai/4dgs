@@ -132,7 +132,9 @@ public struct IndexedReader<Source: ByteRangeReader> {
 
     /// Decode one indexed chunk, transferring only its bytes — and, under a band cap, only
     /// the bands at or below it.
-    public mutating func chunk(_ entry: ChunkIndexEntry, options: DecodeOptions = DecodeOptions()) throws
+    public mutating func chunk(
+        _ entry: ChunkIndexEntry, options: DecodeOptions = DecodeOptions()
+    ) throws
         -> DecodedChunk
     {
         try Core.decodeChunk(&source, entry: entry, options: options)
@@ -143,7 +145,9 @@ public struct IndexedReader<Source: ByteRangeReader> {
     /// "Live" is §3's rule in full: inside the validity window, and marginal at or above
     /// the file's own cutoff. Positions are the rest positions as decoded — call
     /// ``Gaussian/state(at:)`` for a gaussian moved and faded to `t`.
-    public mutating func gaussians(at t: Double, options: DecodeOptions = DecodeOptions()) throws
+    public mutating func gaussians(
+        at t: Double, options: DecodeOptions = DecodeOptions()
+    ) throws
         -> GaussianState
     {
         var decoded: [DecodedChunk] = []
