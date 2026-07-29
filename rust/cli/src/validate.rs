@@ -104,7 +104,7 @@ pub fn validate(data: &[u8]) -> Report {
 
     let mut seen: Vec<u8> = Vec::new();
     let mut header: Option<rec::Header> = None;
-    let mut quantization = false;
+    let mut quantization: Option<rec::Quantization> = None;
     let mut footer: Option<rec::Footer> = None;
     let mut chunk_count = 0u64;
     let mut counted = 0u64;
@@ -128,7 +128,7 @@ pub fn validate(data: &[u8]) -> Report {
                 Err(error) => report.error(format!("Header does not parse: {error}")),
             },
             op::QUANTIZATION => match rec::Quantization::parse(record.content) {
-                Ok(_) => quantization = true,
+                Ok(parsed) => quantization = Some(parsed),
                 Err(error) => report.error(format!("Quantization does not parse: {error}")),
             },
             op::CHUNK => match rec::parse_chunk(record.content) {
@@ -179,7 +179,7 @@ pub fn validate(data: &[u8]) -> Report {
     if header.is_none() {
         report.error("no Header record".into());
     }
-    if !quantization {
+    if quantization.is_none() {
         report.error("no Quantization record".into());
     }
     if footer.is_none() {
@@ -234,12 +234,9 @@ pub fn validate(data: &[u8]) -> Report {
         }
     }
 
-    // TODO(#13): mirror `_check_quantization_finite`. Every Quantization step and every
-    // component of `pos_origin` must be finite (spec §5.3) — a non-finite step is the one
-    // corrupt field that ruins every gaussian rather than one, and nothing downstream
-    // complains because dequantization is arithmetic. The Python check lands with the
-    // conformance PR; until it does, this validator would report an error that one does
-    // not, which is the divergence the two are supposed to be free of.
+    if let Some(quant) = &quantization {
+        check_quantization_finite(quant, &mut report);
+    }
 
     if header.is_some() && index.is_empty() {
         report.warn("no chunk index: this file can only be read front to back, not seeked".into());
@@ -251,6 +248,50 @@ pub fn validate(data: &[u8]) -> Report {
     }
 
     report
+}
+
+/// Every step and origin must be finite (spec §5.3).
+///
+/// A non-finite step is the one corrupt field that ruins every gaussian rather than one:
+/// each bin multiplied by it decodes to infinity or NaN, so the whole scene comes out with
+/// no position to occupy. Nothing downstream complains — dequantization is arithmetic and
+/// arithmetic on infinity is defined — so without this check the first symptom is a
+/// renderer drawing an empty frame, which points at the renderer.
+///
+/// Reported per field, because "the file is broken" is what the caller already knows.
+fn check_quantization_finite(quant: &rec::Quantization, report: &mut Report) {
+    let origin = |i: usize| quant.pos_origin.get(i).copied().unwrap_or(f64::NAN);
+    for (name, value) in [
+        ("pos_origin[0]", origin(0)),
+        ("pos_origin[1]", origin(1)),
+        ("pos_origin[2]", origin(2)),
+        ("step_pos", quant.step_pos),
+        ("step_scale_log", quant.step_scale_log),
+        ("step_rot", quant.step_rot),
+        ("step_rgb", quant.step_rgb),
+        ("step_alpha", quant.step_alpha),
+        ("step_motion", quant.step_motion),
+        ("step_time", quant.step_time),
+        ("step_sigma_log", quant.step_sigma_log),
+    ] {
+        if !value.is_finite() {
+            report.error(format!(
+                "Quantization {name} is {}; every step and origin must be finite (§5.3)",
+                spell(value)
+            ));
+        }
+    }
+}
+
+/// A non-finite value spelled the way Python spells it, so that the two validators'
+/// findings are the same string rather than the same complaint. Rust writes `NaN` where
+/// Python writes `nan`, and a report a caller diffs is a report where that matters.
+fn spell(v: f64) -> String {
+    if v.is_nan() {
+        "nan".into()
+    } else {
+        format!("{v}")
+    }
 }
 
 /// True for the opcodes the specification defines. Everything else is either the
@@ -309,6 +350,140 @@ fn minimal() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A well-formed Quantization record, with any field replaceable — the Rust half of
+    /// the Python suite's `grids()`, field for field.
+    fn grids() -> rec::Quantization {
+        rec::Quantization {
+            scheme: "uniform-v1".into(),
+            pos_origin: vec![0.0, 0.0, 0.0],
+            step_pos: 1e-4,
+            step_scale_log: 0.04,
+            step_rot: 0.004,
+            step_rgb: 0.008,
+            step_alpha: 0.008,
+            step_motion: 2e-4,
+            step_time: 0.004,
+            step_sigma_log: 0.04,
+            step_sh: 1,
+            bounds: Default::default(),
+        }
+    }
+
+    /// The smallest thing that is meant to validate: header, grids, windows, footer.
+    fn minimal_file(quant: &rec::Quantization) -> Vec<u8> {
+        let header = rec::Header {
+            duration_sec: 1.0,
+            gaussian_count: 0,
+            aabb: vec![0.0; 6],
+            ..Default::default()
+        };
+        let mut out = MAGIC.to_vec();
+        out.extend_from_slice(&header.encode(&[]));
+        out.extend_from_slice(&quant.encode(&[]));
+        out.extend_from_slice(
+            &rec::WindowTable {
+                windows: vec![(0.0, 1.0)],
+            }
+            .encode(),
+        );
+        out.extend_from_slice(&rec::Footer::default().encode());
+        out.extend_from_slice(&MAGIC);
+        out
+    }
+
+    fn errors(report: &Report) -> Vec<String> {
+        report
+            .findings
+            .iter()
+            .filter(|(s, _)| *s == Severity::Error)
+            .map(|(_, m)| m.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_minimal_handmade_file_validates_clean() {
+        let report = validate(&minimal_file(&grids()));
+        assert!(report.ok(), "{:?}", errors(&report));
+        assert!(errors(&report).is_empty(), "{:?}", errors(&report));
+    }
+
+    #[test]
+    fn a_non_finite_quantization_step_is_an_error() {
+        // Spec §5.3. The corrupt field that ruins every gaussian rather than one: each bin
+        // times an infinite step decodes to a position that does not exist, and nothing
+        // downstream complains because arithmetic on infinity is defined.
+        let mut quant = grids();
+        quant.step_pos = f64::INFINITY;
+        let report = validate(&minimal_file(&quant));
+        assert!(!report.ok());
+        assert!(
+            errors(&report).contains(
+                &"Quantization step_pos is inf; every step and origin must be finite (§5.3)"
+                    .to_string()
+            ),
+            "{:?}",
+            errors(&report)
+        );
+    }
+
+    #[test]
+    fn a_non_finite_position_origin_is_an_error() {
+        // The origin is added after the step multiply, so an infinite one is just as fatal
+        // and just as quiet as an infinite step.
+        let mut quant = grids();
+        quant.pos_origin[1] = f64::NEG_INFINITY;
+        let report = validate(&minimal_file(&quant));
+        assert!(errors(&report).iter().any(|m| m
+            == "Quantization pos_origin[1] is -inf; every step and origin must be finite (§5.3)"));
+    }
+
+    #[test]
+    fn a_nan_is_spelled_the_way_the_other_validator_spells_it() {
+        // Rust writes `NaN` and Python writes `nan`. A report a caller diffs between the
+        // two tools is a report where that is a difference, so it is spelled once.
+        let mut quant = grids();
+        quant.step_rot = f64::NAN;
+        let report = validate(&minimal_file(&quant));
+        assert!(
+            errors(&report).iter().any(|m| m
+                == "Quantization step_rot is nan; every step and origin must be finite (§5.3)"),
+            "{:?}",
+            errors(&report)
+        );
+    }
+
+    #[test]
+    fn every_quantization_parameter_is_covered() {
+        // One field at a time, so a parameter nobody checks fails here rather than in a
+        // file somebody ships.
+        /// A field's name and the one-liner that makes it non-finite.
+        type Breaker = (&'static str, fn(&mut rec::Quantization));
+        let fields: [Breaker; 11] = [
+            ("pos_origin[0]", |q| q.pos_origin[0] = f64::INFINITY),
+            ("pos_origin[1]", |q| q.pos_origin[1] = f64::INFINITY),
+            ("pos_origin[2]", |q| q.pos_origin[2] = f64::INFINITY),
+            ("step_pos", |q| q.step_pos = f64::INFINITY),
+            ("step_scale_log", |q| q.step_scale_log = f64::INFINITY),
+            ("step_rot", |q| q.step_rot = f64::INFINITY),
+            ("step_rgb", |q| q.step_rgb = f64::INFINITY),
+            ("step_alpha", |q| q.step_alpha = f64::INFINITY),
+            ("step_motion", |q| q.step_motion = f64::INFINITY),
+            ("step_time", |q| q.step_time = f64::INFINITY),
+            ("step_sigma_log", |q| q.step_sigma_log = f64::INFINITY),
+        ];
+        for (name, break_it) in fields {
+            let mut quant = grids();
+            break_it(&mut quant);
+            let report = validate(&minimal_file(&quant));
+            assert!(
+                errors(&report)
+                    .iter()
+                    .any(|m| m.starts_with(&format!("Quantization {name} is"))),
+                "{name} is not checked"
+            );
+        }
+    }
 
     #[test]
     fn a_conforming_file_has_nothing_to_report() {
