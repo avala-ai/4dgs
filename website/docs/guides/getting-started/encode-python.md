@@ -18,15 +18,15 @@ units per second.
 import fourdgs
 
 gaussians = fourdgs.GaussianSet(
-    positions=positions,   # (n, 3)
-    scales=scales,         # (n, 3), linear
-    rotations=rotations,   # (n, 4), xyzw, normalized
-    colors=colors,         # (n, 4), red, green, blue, alpha
-    motions=motions,       # (n, 3), units per second
-    mu_t=mu_t,             # (n,) birth time
-    sigma_t=sigma_t,       # (n,) temporal extent; inf means "never fades"
-    win_lo=win_lo,         # (n,) validity window start
-    win_hi=win_hi,         # (n,) validity window end
+    positions=positions,  # (n, 3)
+    scales=scales,  # (n, 3), linear
+    rotations=rotations,  # (n, 4), xyzw, normalized
+    colors=colors,  # (n, 4), red, green, blue, alpha
+    motions=motions,  # (n, 3), units per second
+    mu_t=mu_t,  # (n,) birth time
+    sigma_t=sigma_t,  # (n,) temporal extent; inf means "never fades"
+    win_lo=win_lo,  # (n,) validity window start
+    win_hi=win_hi,  # (n,) validity window end
 )
 
 fourdgs.write("scene.4dgs", gaussians, 8.0)
@@ -50,9 +50,9 @@ deflate-compressed file at the `default` quantization profile.
 
 ```python
 options = fourdgs.WriteOptions(
-    profile="default",          # "fine" | "default" | "coarse"
-    min_chunk_gaussians=2048,   # chunk granularity, together with max_depth
-    write_index=True,           # the chunk index; without it a reader must stream
+    profile="default",  # "fine" | "default" | "coarse"
+    min_chunk_gaussians=2048,  # chunk granularity, together with max_depth
+    write_index=True,  # the chunk index; without it a reader must stream
     write_crc=True,
     sh_bands=3,
 )

@@ -12,12 +12,12 @@ pip install fourdgs
 ```python
 import fourdgs
 
-scene = fourdgs.read("scene.4dgs")          # a path, bytes, or a file-like object
+scene = fourdgs.read("scene.4dgs")  # a path, bytes, or a file-like object
 state = scene.gaussians.state_at(1.5, scene.header.cutoff)
 
-state["indices"]   # which gaussians exist at t = 1.5
-state["centers"]   # their positions, moved by their own velocity
-state["opacity"]   # their alpha, faded by their own marginal
+state["indices"]  # which gaussians exist at t = 1.5
+state["centers"]  # their positions, moved by their own velocity
+state["opacity"]  # their alpha, faded by their own marginal
 ```
 
 This is where decoding ends. `state_at` returns index arrays plus attributes so a caller can do what
@@ -47,9 +47,9 @@ from fourdgs.readable import FileReadable
 scene = open_indexed(FileReadable("scene.4dgs"))
 
 scene.header.gaussian_count, scene.header.duration_sec, len(scene.index)
-scene.chunks_for_time(2.5)     # the entries covering an instant
+scene.chunks_for_time(2.5)  # the entries covering an instant
 scene.chunks_for_range(2.0, 4.0)
-scene.bytes_for_time(2.5)      # what that seek transfers, before asking for it
+scene.bytes_for_time(2.5)  # what that seek transfers, before asking for it
 
 for entry in scene.chunks_for_time(2.5):
     chunk = read_chunk(FileReadable("scene.4dgs"), scene, entry)
