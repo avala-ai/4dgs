@@ -27,6 +27,7 @@ from .exceptions import (
     UnsupportedCodec,
     UnsupportedVersion,
 )
+from .gltf import GltfImport, from_gltf, to_gltf
 from .model import AudioTrack, CameraTrajectory, GaussianSet
 from .quantization import Bounds, Steps
 from .stream_reader import Scene, read
@@ -39,6 +40,7 @@ __all__ = [
     "CameraTrajectory",
     "FourdgsError",
     "GaussianSet",
+    "GltfImport",
     "MalformedFile",
     "Scene",
     "Steps",
@@ -47,6 +49,8 @@ __all__ = [
     "UnsupportedVersion",
     "WriteOptions",
     "__version__",
+    "from_gltf",
     "read",
+    "to_gltf",
     "write",
 ]
