@@ -343,14 +343,35 @@ jobs:
       - name: Format
         run: swift format lint --recursive --strict swift/Sources swift/Tests swift/conformance
 
-      # The package is a binding, so its dependency is a library and not a source tree: the
-      # core has to exist before anything here links. The image has no Rust, so the job
-      # installs the toolchain it needs rather than assuming one.
+      # The toolchain and the core's build are cached separately on purpose: a Rust
+      # source change should not throw away the compiler. On a hit the job fetches no
+      # toolchain at all, which is the point — an unretried network dependency on the
+      # critical path of two workflows is what took conformance red on its first run.
+      - name: Cache the Rust toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.rustup
+          key: rust-toolchain-stable-${{ hashFiles('rust/**/Cargo.toml', 'Cargo.toml') }}
+      - name: Cache the core's build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: rust-build-${{ runner.os }}-${{ hashFiles('rust/**/*.rs', 'rust/**/Cargo.toml') }}
+          restore-keys: rust-build-${{ runner.os }}-
+
       - name: Build the core
         run: |
           apt-get update -qq && apt-get install -y -qq curl build-essential python3-numpy python3-pip >/dev/null
-          curl -sSf --retry 5 --retry-all-errors --retry-delay 3 https://sh.rustup.rs |
-            sh -s -- -y --profile minimal --default-toolchain stable
+          if [ -x "$HOME/.cargo/bin/cargo" ]; then
+            echo "rust toolchain: restored from cache, nothing fetched"
+          else
+            echo "rust toolchain: cache miss, fetching rustup"
+            curl -sSf --retry 5 --retry-all-errors --retry-delay 3 https://sh.rustup.rs |
+              sh -s -- -y --profile minimal --default-toolchain stable
+          fi
           . "$HOME/.cargo/env"
           cargo build -p fourdgs --release
           ls -l target/release/libfourdgs.a
@@ -407,6 +428,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: swift --version
+      # The toolchain and the core's build are cached separately on purpose: a Rust
+      # source change should not throw away the compiler. On a hit the job fetches no
+      # toolchain at all, which is the point — an unretried network dependency on the
+      # critical path of two workflows is what took conformance red on its first run.
+      - name: Cache the Rust toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.rustup
+          key: rust-toolchain-stable-${{ hashFiles('rust/**/Cargo.toml', 'Cargo.toml') }}
+      - name: Cache the core's build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: rust-build-${{ runner.os }}-${{ hashFiles('rust/**/*.rs', 'rust/**/Cargo.toml') }}
+          restore-keys: rust-build-${{ runner.os }}-
+
       - name: Build the core for macOS, visionOS and iOS
         run: |
           rustup target add aarch64-apple-visionos aarch64-apple-ios

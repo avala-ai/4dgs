@@ -55,6 +55,27 @@ the run silently — no failure, no red mark, just an absence that looks like wa
 `main` and push again. Worth knowing because the natural reading of an empty checks list is the
 wrong one.
 
+## Disabled CI jobs
+
+A job behind `if: false` is a promise, and **it is untested by construction** — nothing runs it, so
+nothing can tell you it has stopped being true. Four ways one goes wrong, all of which have happened
+here:
+
+- **Stale invocation.** It ran once and the world moved: a path changed, a package gained a
+  dependency, a tool left the image. Fails loudly the moment anyone enables it.
+- **Placeholder that would go green.** It never was an invocation — an `echo` standing in for work
+  nobody has done. Enabling it produces a passing job that checked nothing, which is worse than a
+  red one because it looks like coverage.
+- **Publishes green but broken.** It succeeds and ships something wrong. A publish that fails is
+  loud; a publish that succeeds broken is found by the first user.
+- **Correct but fragile.** The invocation is right and it still dies on somebody else's outage — an
+  network fetch with no retry, a registry that rate-limits. This is the one that survives an audit,
+  because reading the job cannot reveal it.
+
+So: keep a disabled job's steps correct as of today rather than as of whenever it was written, say
+in the gate comment which kind it is and what enabling actually costs, and remember that fixing a
+disabled job does not graduate it. **Only running it does.**
+
 ## Code of conduct
 
 By participating you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
