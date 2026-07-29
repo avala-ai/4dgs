@@ -85,6 +85,16 @@ different file. Each runner decodes its variant twice more — once cut before t
 once cut inside the last chunk — and asserts what survives. A failure exits the runner non-zero and
 the harness reports it like a diff.
 
+**Reconstruction at an instant is the one thing the canonical JSON does not carry**, and so the one
+thing the suite cannot compare. The summary is a statement about a file, not about a moment in it:
+two implementations could disagree about §3's arithmetic — the marginal, the centre, the visibility
+test — and pass every check. Where an SDK implements that arithmetic itself rather than only calling
+into a decoder, it is checked against the decoder's own answer. C++ is the case that exists today:
+its unit tests reconstruct at four instants per variant, with the file's own cutoff, and assert the
+sets agree in both directions — every gaussian the core calls visible must be visible there with the
+same centre and opacity, and every gaussian it calls visible must appear in the core's set, so the
+check cannot pass against a decoder that returns nothing.
+
 **Encode**, **Chunked encode** and **Summary writing** are proved by a gate rather than by a runner,
 and the two encoders are gated differently because they play different roles.
 
