@@ -27,6 +27,15 @@ jobs:
             echo "conformance data: ${size_kb} KiB"
             [ "$size_kb" -le 2560 ] || { echo "::error::conformance data over budget"; exit 1; }
           fi
+      - name: Rust sources under 500 KB
+        # Sources only: this job builds nothing, so target/ is not here to measure. A
+        # vendored dependency would show up as a budget failure, which is the point —
+        # everything this crate needs comes from crates.io via Cargo.toml.
+        run: |
+          size_kb=$(du -s rust | cut -f1)
+          echo "rust: ${size_kb} KiB"
+          [ "$size_kb" -le 500 ] || { echo "::error::rust is ${size_kb} KiB, over the 500 KiB budget"; exit 1; }
+
       - name: TypeScript sources under 500 KB
         # Sources only: this job installs nothing and builds nothing, so node_modules
         # and dist are not here to measure. A vendored dependency would show up as a
@@ -123,7 +132,46 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: cargo build --workspace
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: rustup component add rustfmt clippy
+
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Build
+        run: cargo build --workspace
+
+      # These cover what the corpus cannot: a file that is not ours, a version we do not
+      # implement, a record we have never seen, a length that points past the end.
+      - name: Tests
+        run: cargo test --workspace
+
+      # The optional codec has to keep compiling, or it rots until the first person who
+      # needs it finds out.
+      - name: The zstd feature builds
+        run: cargo build -p fourdgs --features zstd
+
+      # The C++ and Swift packages bind to include/fourdgs.h, so a drift between that
+      # header and the symbols the library exports is their outage. This compiles a C
+      # program against both and runs it, which is the only check that catches it here.
+      - name: The C ABI links and behaves
+        run: |
+          cargo build -p fourdgs --release
+          pip install -e ./python/fourdgs
+          python tests/conformance/generate.py
+          cc -Wall -Wextra -Werror -std=c11 -I rust/fourdgs/include \
+            rust/fourdgs/tests/capi_smoke.c -o capi_smoke \
+            target/release/libfourdgs.a -lm -lpthread -ldl
+          for variant in \
+            OneWindow-UseChunkIndex-UseCrc-WithAudio \
+            OneWindow-UseChunkIndex-UseCrc-WithLargeAudio \
+            MixedLifetimes-SHDegree2-UseChunkIndex-UseCrc \
+            NoData-UseChunkIndex-UseCrc \
+            TenWindows-UseCrc; do
+            ./capi_smoke "tests/conformance/data/$variant.4dgs"
+          done
 
   cpp:
     # The binding compiles and its unit tests run whether or not a core is linked. Without
