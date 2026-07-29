@@ -1007,6 +1007,16 @@ pub unsafe extern "C" fn fourdgs_state_centers(state: *const fourdgs_state) -> *
     }
 }
 
+/// Reconstructed orientation, 4 xyzw floats per visible gaussian.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_state_orientations(state: *const fourdgs_state) -> *const f32 {
+    // SAFETY: null is handled; otherwise the caller guarantees a live state.
+    match unsafe { state.as_ref() } {
+        Some(s) if !s.inner.orientations.is_empty() => s.inner.orientations.as_ptr(),
+        _ => std::ptr::null(),
+    }
+}
+
 /// `color.a * marginal`, 1 float per visible gaussian.
 #[no_mangle]
 pub unsafe extern "C" fn fourdgs_state_opacity(state: *const fourdgs_state) -> *const f32 {

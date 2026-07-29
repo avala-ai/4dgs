@@ -74,7 +74,7 @@ impl Pose {
     }
 }
 
-fn quaternion_multiply(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
+pub(crate) fn quaternion_multiply(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
     let [ax, ay, az, aw] = a;
     let [bx, by, bz, bw] = b;
     [

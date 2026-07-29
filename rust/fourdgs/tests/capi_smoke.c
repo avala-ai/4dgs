@@ -39,6 +39,7 @@ static void check_null_safety(void) {
     check(fourdgs_scene_sh(NULL) == NULL, "sh of a null scene is null");
     check(fourdgs_state_count(NULL) == 0, "count of a null state is 0");
     check(fourdgs_state_centers(NULL) == NULL, "centers of a null state is null");
+    check(fourdgs_state_orientations(NULL) == NULL, "orientations of a null state is null");
     check(fourdgs_scene_load_all(NULL, 3) == FOURDGS_STATUS_INVALID_ARGUMENT,
           "loading a null scene is an invalid argument");
     check(fourdgs_scene_state_at(NULL, 0.0, 3, NULL) == FOURDGS_STATUS_INVALID_ARGUMENT,
@@ -347,12 +348,14 @@ int main(int argc, char **argv) {
     if (status == FOURDGS_STATUS_OK) {
         uint32_t visible = fourdgs_state_count(state);
         const uint32_t *indices = fourdgs_state_indices(state);
+        const float *orientations = fourdgs_state_orientations(state);
         const float *opacity = fourdgs_state_opacity(state);
         check(visible <= fourdgs_scene_loaded_count(scene),
               "no more gaussians are visible than are resident");
         for (uint32_t i = 0; i < visible; ++i) {
             check(indices[i] < fourdgs_scene_loaded_count(scene),
                   "every index points into the resident set");
+            check(orientations != NULL, "visible state carries reconstructed orientations");
             check(opacity[i] >= 0.0f && opacity[i] <= 1.0f, "state opacity is in [0, 1]");
         }
         fourdgs_state_free(state);

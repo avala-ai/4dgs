@@ -231,7 +231,23 @@ pub fn decode_streams(
         out.source_index = Some((0..count).map(|i| src.get(i, 0)).collect());
     }
     if let Some(ids) = got.get(&op::A_OBJECT_ID) {
-        out.object_id = Some((0..count).map(|i| ids.get(i, 0) as u32).collect());
+        if ids.channels != 1 {
+            return Err(Error::Malformed(format!(
+                "the object_id stream declares {} channels, the format defines 1",
+                ids.channels
+            )));
+        }
+        let mut object_ids = Vec::with_capacity(count);
+        for i in 0..count {
+            let value = ids.get(i, 0);
+            object_ids.push(u32::try_from(value).map_err(|_| {
+                Error::Malformed(format!(
+                    "object_id element {i} is {value}; expected an integer in [0, {}]",
+                    u32::MAX
+                ))
+            })?);
+        }
+        out.object_id = Some(object_ids);
     }
 
     Ok(out)

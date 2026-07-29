@@ -9,8 +9,22 @@
 //! chunk decode is covered cross-implementation by the conformance corpus (Python writes,
 //! Rust decodes), which is where an end-to-end object file is exercised.
 
+use std::collections::BTreeMap;
+
+use fourdgs::chunk::DecodedChunk;
+use fourdgs::codec;
 use fourdgs::object_layer::ObjectLayer;
-use fourdgs::records::{ObjectTable, ObjectTableEntry, ObjectTrack, TRAJECTORY_LINEAR};
+use fourdgs::opcode as op;
+use fourdgs::quantization::Steps;
+use fourdgs::readable::BytesReadable;
+use fourdgs::reader::OpenMode;
+use fourdgs::records::{
+    ChunkIndexEntry, Footer, Header, ObjectTable, ObjectTableEntry, ObjectTrack, Quantization,
+    WindowTable, TRAJECTORY_LINEAR,
+};
+use fourdgs::serialization::MAGIC;
+use fourdgs::stream::encode_stream;
+use fourdgs::SceneReader;
 
 // xyzw quaternion for a +90 degree rotation about z: R*(1,0,0) = (0,1,0).
 const Q_Z90: [f64; 4] = [
@@ -24,6 +38,128 @@ const Q_ID: [f64; 4] = [0.0, 0.0, 0.0, 1.0];
 fn content(encoded: &[u8]) -> &[u8] {
     // Strip the 1-byte opcode and 8-byte length framing.
     &encoded[9..]
+}
+
+fn quantization() -> Quantization {
+    Quantization {
+        scheme: "uniform-v1".into(),
+        pos_origin: vec![0.0; 3],
+        step_pos: 1.0,
+        step_scale_log: 1.0,
+        step_rot: 1.0,
+        step_rgb: 1.0,
+        step_alpha: 1.0,
+        step_motion: 1.0,
+        step_time: 1.0,
+        step_sigma_log: 1.0,
+        step_sh: 1,
+        bounds: BTreeMap::new(),
+        sh_bit_depths: Vec::new(),
+    }
+}
+
+fn streams_with_object_id(values: &[i64], channels: usize) -> Vec<u8> {
+    let count = values.len() / channels;
+    let mut streams = Vec::new();
+    let rows: [(u8, Vec<i64>, usize); 11] = [
+        (op::A_POSITION, [1, 0, 0].repeat(count), 3),
+        (op::A_SCALE, [0, 0, 0].repeat(count), 3),
+        (op::A_ROTATION_INDEX, vec![3; count], 1),
+        (op::A_ROTATION, [0, 0, 0].repeat(count), 3),
+        (op::A_COLOR, [0, 0, 0].repeat(count), 3),
+        (op::A_OPACITY, vec![1; count], 1),
+        (op::A_MOTION, [0, 0, 0].repeat(count), 3),
+        (op::A_MU_T, vec![0; count], 1),
+        (op::A_SIGMA_T, vec![0; count], 1),
+        (op::A_FLAGS, vec![op::FLAG_NEVER_FADES; count], 1),
+        (op::A_WINDOW_INDEX, vec![0; count], 1),
+    ];
+    for (attribute, bins, width) in rows {
+        streams.extend(encode_stream(attribute, &bins, width, codec::DEFLATE, 1, false).unwrap());
+    }
+    streams.extend(
+        encode_stream(op::A_OBJECT_ID, values, channels, codec::DEFLATE, 1, false).unwrap(),
+    );
+    streams
+}
+
+fn object_file(indexed: bool, duplicate_table: bool) -> Vec<u8> {
+    let mut out = MAGIC.to_vec();
+    out.extend(
+        Header {
+            duration_sec: 1.0,
+            gaussian_count: 1,
+            aabb: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            cutoff: 0.05,
+            temporal_model: "gaussian-birth".into(),
+            ..Default::default()
+        }
+        .encode(&[]),
+    );
+    out.extend(quantization().encode(&[]));
+    out.extend(
+        WindowTable {
+            windows: vec![(0.0, 1.0)],
+        }
+        .encode(),
+    );
+    let table = ObjectTable {
+        embedding_dim: 0,
+        entries: vec![ObjectTableEntry {
+            object_id: 7,
+            label: "tracked".into(),
+            ..Default::default()
+        }],
+    }
+    .encode(b"")
+    .unwrap();
+    out.extend(&table);
+    if duplicate_table {
+        out.extend(&table);
+    }
+    out.extend(
+        ObjectTrack {
+            object_id: 7,
+            interpolation: TRAJECTORY_LINEAR,
+            times: vec![0.0, 1.0],
+            rotations: vec![Q_Z90, Q_Z90],
+            translations: vec![[10.0, 0.0, 0.0], [10.0, 0.0, 0.0]],
+        }
+        .encode(b"")
+        .unwrap(),
+    );
+
+    let chunk_at = out.len() as u64;
+    let chunk = fourdgs::records::encode_chunk(0.0, 1.0, 0, 1, &streams_with_object_id(&[7], 1));
+    out.extend(&chunk);
+
+    let summary_start = if indexed {
+        let start = out.len() as u64;
+        out.extend(
+            ChunkIndexEntry {
+                t0: 0.0,
+                t1: 1.0,
+                chunk_offset: chunk_at,
+                chunk_length: chunk.len() as u64,
+                gaussian_count: 1,
+                bands: Vec::new(),
+            }
+            .encode(),
+        );
+        start
+    } else {
+        0
+    };
+    out.extend(
+        Footer {
+            summary_start,
+            summary_offset_start: 0,
+            summary_crc: 0,
+        }
+        .encode(),
+    );
+    out.extend(MAGIC);
+    out
 }
 
 #[test]
@@ -44,7 +180,7 @@ fn object_table_round_trips_with_and_without_optional_fields() {
             },
         ],
     };
-    let parsed = ObjectTable::parse(content(&table.encode(b""))).unwrap();
+    let parsed = ObjectTable::parse(content(&table.encode(b"").unwrap())).unwrap();
     assert_eq!(parsed, table);
     // Object 8 carried neither dynamics nor an embedding, and reads back that way.
     assert!(parsed.entries[1].dynamics.is_none());
@@ -61,7 +197,7 @@ fn object_table_no_embedding_space_omits_the_flag() {
             ..Default::default()
         }],
     };
-    let parsed = ObjectTable::parse(content(&table.encode(b""))).unwrap();
+    let parsed = ObjectTable::parse(content(&table.encode(b"").unwrap())).unwrap();
     assert_eq!(parsed.embedding_dim, 0);
     assert!(parsed.entries[0].embedding.is_none());
 }
@@ -75,17 +211,22 @@ fn object_track_round_trips() {
         rotations: vec![Q_ID, Q_ID, Q_Z90],
         translations: vec![[0.0, 0.0, 0.0], [5.0, 0.0, 0.0], [10.0, 0.0, 0.0]],
     };
-    let parsed = ObjectTrack::parse(content(&track.encode(b""))).unwrap();
+    let parsed = ObjectTrack::parse(content(&track.encode(b"").unwrap())).unwrap();
     assert_eq!(parsed, track);
 }
 
 #[test]
-fn track_composes_onto_base_center() {
+fn track_composes_onto_base_center_and_orientation() {
     // A tracked object (id 7) of two gaussians and one background gaussian (id 0). The
     // base centre here stands in for position + motion*(t - mu_t): the per-gaussian motion
     // has already moved the gaussian inside the object's frame, and the track transports
     // it. That is the compose, base first, the design turns on.
     let mut centers: Vec<f32> = vec![1.0, 0.0, 0.0, 2.0, 0.0, 0.0, -5.0, -5.0, -5.0];
+    let mut orientations: Vec<f32> = vec![
+        0.0, 0.0, 0.0, 1.0, // tracked identity
+        0.0, 0.0, 0.0, 1.0, // tracked identity
+        0.0, 0.0, 0.0, 1.0, // background identity
+    ];
     let object_ids = [7, 7, 0];
     let layer = ObjectLayer {
         table: None,
@@ -97,27 +238,41 @@ fn track_composes_onto_base_center() {
             translations: vec![[10.0, 0.0, 0.0], [10.0, 0.0, 0.0]],
         }],
     };
-    layer.apply(&mut centers, &object_ids, 0.5).unwrap();
+    layer
+        .apply(&mut centers, &mut orientations, &object_ids, 0.5)
+        .unwrap();
 
     // (1,0,0) rotated +90 about z is (0,1,0), then +T -> (10,1,0); likewise (2,0,0)->(10,2,0).
     assert!((centers[0] - 10.0).abs() < 1e-4 && (centers[1] - 1.0).abs() < 1e-4);
     assert!((centers[3] - 10.0).abs() < 1e-4 && (centers[4] - 2.0).abs() < 1e-4);
+    for row in 0..2 {
+        for axis in 0..4 {
+            assert!(
+                (orientations[row * 4 + axis] - Q_Z90[axis] as f32).abs() < 1e-5,
+                "tracked orientation row {row}, axis {axis}"
+            );
+        }
+    }
     // Background (id 0) is never touched.
     assert_eq!(&centers[6..9], &[-5.0, -5.0, -5.0]);
+    assert_eq!(&orientations[8..12], &[0.0, 0.0, 0.0, 1.0]);
 }
 
 #[test]
 fn no_track_is_identity() {
     let mut centers: Vec<f32> = vec![1.0, 2.0, 3.0];
+    let mut orientations: Vec<f32> = vec![0.0, 0.0, 0.0, 1.0];
     ObjectLayer::default()
-        .apply(&mut centers, &[7], 0.0)
+        .apply(&mut centers, &mut orientations, &[7], 0.0)
         .unwrap();
     assert_eq!(centers, vec![1.0, 2.0, 3.0]);
+    assert_eq!(orientations, vec![0.0, 0.0, 0.0, 1.0]);
 }
 
 #[test]
 fn track_clamps_outside_sample_range() {
     let mut centers: Vec<f32> = vec![0.0, 0.0, 0.0];
+    let mut orientations: Vec<f32> = vec![0.0, 0.0, 0.0, 1.0];
     let layer = ObjectLayer {
         table: None,
         tracks: vec![ObjectTrack {
@@ -129,7 +284,9 @@ fn track_clamps_outside_sample_range() {
         }],
     };
     // Before the first sample the pose is clamped to the first, never extrapolated.
-    layer.apply(&mut centers, &[7], 0.0).unwrap();
+    layer
+        .apply(&mut centers, &mut orientations, &[7], 0.0)
+        .unwrap();
     assert_eq!(&centers[..], &[3.0, 0.0, 0.0]);
 }
 
@@ -202,4 +359,197 @@ fn refusals_name_their_fault() {
         ],
     };
     assert!(two.check().is_err());
+}
+
+#[test]
+fn scene_reader_composes_authoritative_object_motion_on_both_paths() {
+    for mode in [OpenMode::Sequential, OpenMode::Indexed] {
+        let bytes = object_file(mode == OpenMode::Indexed, false);
+        let mut reader =
+            SceneReader::open_with(BytesReadable::new(&bytes), mode).expect("open object file");
+        let state = reader.state_at(0.5, 0).expect("reconstruct tracked state");
+        assert_eq!(state.count(), 1);
+        assert!((state.centers[0] - 10.0).abs() < 1e-4);
+        assert!((state.centers[1] - 1.0).abs() < 1e-4);
+        for (got, want) in state.orientations.iter().zip(Q_Z90) {
+            assert!((*got - want as f32).abs() < 1e-5);
+        }
+        assert_eq!(reader.provenance_count(), 0);
+        assert_eq!(reader.objects().unwrap().tracks.len(), 1);
+    }
+}
+
+#[test]
+fn omitted_object_stream_defaults_only_that_chunk_to_background() {
+    fn chunk(object_id: Option<Vec<u32>>) -> DecodedChunk {
+        DecodedChunk {
+            count: 1,
+            positions: vec![0.0; 3],
+            scales: vec![1.0; 3],
+            rotations: vec![0.0, 0.0, 0.0, 1.0],
+            colors: vec![0.0; 4],
+            motions: vec![0.0; 3],
+            mu_t: vec![0.0],
+            sigma_t: vec![f32::INFINITY],
+            window_index: vec![0],
+            object_id,
+            ..Default::default()
+        }
+    }
+    let chunks = vec![chunk(Some(vec![7])), chunk(None), chunk(Some(vec![8]))];
+    let bands = vec![BTreeMap::new(); chunks.len()];
+    let assembled =
+        fourdgs::stream_reader::assemble(&chunks, &bands, &[(0.0, 1.0)], &Header::default())
+            .unwrap();
+    assert_eq!(assembled.object_id, Some(vec![7, 0, 8]));
+}
+
+#[test]
+fn malformed_object_stream_values_and_shapes_are_refused() {
+    let steps = Steps {
+        pos: 1.0,
+        scale_log: 1.0,
+        rot: 1.0,
+        rgb: 1.0,
+        alpha: 1.0,
+        motion: 1.0,
+        time: 1.0,
+        sigma_log: 1.0,
+        sh: 1,
+    };
+    for (values, channels, problem) in [(vec![-1], 1, "-1"), (vec![7, 8], 2, "channels")] {
+        let err = fourdgs::chunk::decode_streams(
+            &streams_with_object_id(&values, channels),
+            1,
+            &steps,
+            &[0.0; 3],
+            &[(0.0, 1.0)],
+            0.05,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains(problem), "{err}");
+    }
+}
+
+#[test]
+fn duplicate_scene_wide_object_tables_are_refused_on_both_paths() {
+    let sequential = object_file(false, true);
+    let err = fourdgs::read_bytes(&sequential).unwrap_err();
+    assert!(err.to_string().contains("second ObjectTable"), "{err}");
+
+    let indexed = object_file(true, true);
+    let mut reader =
+        SceneReader::open_with(BytesReadable::new(&indexed), OpenMode::Indexed).unwrap();
+    let err = reader.objects().unwrap_err();
+    assert!(err.to_string().contains("second ObjectTable"), "{err}");
+}
+
+#[test]
+fn record_counts_are_bounded_by_the_record_before_allocation() {
+    let mut table = Vec::new();
+    table.extend(u32::MAX.to_le_bytes());
+    table.extend(0u16.to_le_bytes());
+    let err = ObjectTable::parse(&table).unwrap_err();
+    assert!(err.to_string().contains("4294967295"), "{err}");
+    assert!(err.to_string().contains("each entry"), "{err}");
+
+    let mut track = Vec::new();
+    track.extend(7u32.to_le_bytes());
+    track.push(TRAJECTORY_LINEAR);
+    track.extend(u32::MAX.to_le_bytes());
+    let err = ObjectTrack::parse(&track).unwrap_err();
+    assert!(err.to_string().contains("4294967295"), "{err}");
+    assert!(err.to_string().contains("each sample"), "{err}");
+
+    // The count itself fits, but the present embedding does not. Its dimensionality is
+    // checked against the bytes before `f32s` reserves from it.
+    let mut embedding = Vec::new();
+    embedding.extend(1u32.to_le_bytes());
+    embedding.extend(u16::MAX.to_le_bytes());
+    embedding.extend(7u32.to_le_bytes());
+    embedding.extend(0u32.to_le_bytes()); // empty label
+    embedding.extend([0u8; 12]); // anchor
+    embedding.push(0); // no dynamics
+    embedding.push(1); // embedding present, but no vector follows
+    let err = ObjectTable::parse(&embedding).unwrap_err();
+    assert!(err.to_string().contains("65535 f32"), "{err}");
+    assert!(err.to_string().contains("0 bytes remain"), "{err}");
+}
+
+#[test]
+fn object_table_encoder_refuses_an_embedding_width_mismatch() {
+    let table = ObjectTable {
+        embedding_dim: 4,
+        entries: vec![ObjectTableEntry {
+            object_id: 7,
+            embedding: Some(vec![1.0, 2.0, 3.0]),
+            ..Default::default()
+        }],
+    };
+    let err = table.encode(b"").unwrap_err();
+    assert!(err.to_string().contains("3 values"), "{err}");
+    assert!(err.to_string().contains("declares 4"), "{err}");
+}
+
+#[test]
+fn object_record_encoders_refuse_structurally_ambiguous_values() {
+    let track = ObjectTrack {
+        object_id: 7,
+        times: vec![0.0],
+        rotations: Vec::new(),
+        translations: vec![[0.0; 3]],
+        ..Default::default()
+    };
+    let err = track.encode(b"").unwrap_err();
+    assert!(err.to_string().contains("1 times, 0 rotations"), "{err}");
+
+    let mut table = Vec::new();
+    table.extend(1u32.to_le_bytes());
+    table.extend(0u16.to_le_bytes());
+    table.extend(7u32.to_le_bytes());
+    table.extend(0u32.to_le_bytes());
+    table.extend([0u8; 12]);
+    table.push(2); // dynamics_present must be a boolean
+    let err = ObjectTable::parse(&table).unwrap_err();
+    assert!(err.to_string().contains("dynamics_present=2"), "{err}");
+}
+
+#[test]
+fn object_id_cannot_carry_a_quantization_bound() {
+    let mut quantization = quantization();
+    quantization.bounds.insert("object_id".into(), "0".into());
+    let encoded = quantization.encode(b"");
+    let err = Quantization::parse(content(&encoded)).unwrap_err();
+    assert!(err.to_string().contains("object_id"), "{err}");
+    assert!(err.to_string().contains("MUST NOT"), "{err}");
+}
+
+#[test]
+fn composition_scales_with_objects_plus_gaussians_and_preserves_membership() {
+    const COUNT: usize = 2048;
+    let tracks = (1..=COUNT)
+        .map(|id| ObjectTrack {
+            object_id: id as u32,
+            interpolation: TRAJECTORY_LINEAR,
+            times: vec![0.0],
+            rotations: vec![Q_ID],
+            translations: vec![[id as f64, 0.0, 0.0]],
+        })
+        .collect();
+    let layer = ObjectLayer {
+        table: None,
+        tracks,
+    };
+    let mut centers = vec![0.0; COUNT * 3];
+    let mut orientations = vec![0.0; COUNT * 4];
+    for q in orientations.chunks_exact_mut(4) {
+        q[3] = 1.0;
+    }
+    let object_ids: Vec<u32> = (1..=COUNT).rev().map(|id| id as u32).collect();
+    layer
+        .apply(&mut centers, &mut orientations, &object_ids, 0.0)
+        .unwrap();
+    for (row, object_id) in object_ids.iter().enumerate() {
+        assert_eq!(centers[row * 3], *object_id as f32);
+    }
 }

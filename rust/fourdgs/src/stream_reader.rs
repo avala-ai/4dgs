@@ -300,7 +300,15 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
                 .provenance
                 .anchors
                 .push(rec::GeodeticAnchor::parse(&content)?),
-            op::OBJECT_TABLE => scene.objects.table = Some(rec::ObjectTable::parse(&content)?),
+            op::OBJECT_TABLE => {
+                if scene.objects.table.is_some() {
+                    return Err(Error::Malformed(format!(
+                        "a second ObjectTable record appears at byte {offset}; a file may carry \
+                         exactly one scene-wide object table"
+                    )));
+                }
+                scene.objects.table = Some(rec::ObjectTable::parse(&content)?);
+            }
             op::OBJECT_TRACK => scene
                 .objects
                 .tracks
@@ -549,7 +557,8 @@ pub fn assemble(
     out.win_hi.reserve(total);
 
     let mut source_index: Option<Vec<i64>> = Some(Vec::with_capacity(total));
-    let mut object_id: Option<Vec<u32>> = Some(Vec::with_capacity(total));
+    let mut object_id: Vec<u32> = Vec::with_capacity(total);
+    let mut saw_object_id = false;
     for chunk in chunks {
         out.positions.extend_from_slice(&chunk.positions);
         out.scales.extend_from_slice(&chunk.scales);
@@ -567,13 +576,16 @@ pub fn assemble(
             (Some(acc), Some(src)) => acc.extend_from_slice(src),
             _ => source_index = None,
         }
-        match (&mut object_id, &chunk.object_id) {
-            (Some(acc), Some(ids)) => acc.extend_from_slice(ids),
-            _ => object_id = None,
+        match &chunk.object_id {
+            Some(ids) => {
+                object_id.extend_from_slice(ids);
+                saw_object_id = true;
+            }
+            None => object_id.resize(object_id.len() + chunk.count, 0),
         }
     }
     out.source_index = source_index.filter(|s| s.len() == total && total > 0);
-    out.object_id = object_id.filter(|s| s.len() == total && total > 0);
+    out.object_id = (saw_object_id && object_id.len() == total && total > 0).then_some(object_id);
 
     if header.sh_degree > 0 {
         let counts: Vec<usize> = chunks.iter().map(|c| c.count).collect();

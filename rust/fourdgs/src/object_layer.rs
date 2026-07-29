@@ -16,21 +16,24 @@
 //!
 //! ```text
 //! center(t) = R * c0 + T
+//! orientation(t) = rotation(R) ⊗ orientation0
 //! ```
 //!
 //! The pose is relative to the object's stored (rest) configuration, so ignoring the whole
 //! layer leaves every object at rest — a valid scene — rather than a pile at the origin.
-//! The transform is rigid: it moves the centre and touches neither opacity nor the temporal
-//! fields, so section 3's visibility runs unchanged on the base. A gaussian that carries
-//! per-gaussian motion AND belongs to a moving track is neither forbidden nor track-wins:
-//! its motion moves it inside the object's frame (folded into `c0`), and the track then
-//! transports the object. The two compose, base first.
+//! The transform is rigid: it moves the centre, composes the orientation, and touches
+//! neither opacity nor the temporal fields, so section 3's visibility runs unchanged on
+//! the base. A gaussian that carries per-gaussian motion AND belongs to a moving track is
+//! neither forbidden nor track-wins: its motion moves it inside the object's frame (folded
+//! into `c0`), and the track then transports the object. The two compose, base first.
 //!
 //! Nothing here is required to decode gaussians. A file with no object layer produces an
 //! empty [`ObjectLayer`], which is a value and never an error.
 
+use std::collections::{HashMap, HashSet};
+
 use crate::error::{Error, Result};
-use crate::provenance::{pose_at, PoseSampled};
+use crate::provenance::{pose_at, quaternion_multiply, Pose, PoseSampled};
 use crate::records::{ObjectTable, ObjectTrack};
 
 /// Background / unassigned. A gaussian carrying this id belongs to no object and is never
@@ -84,16 +87,15 @@ impl ObjectLayer {
     /// duplicate-name failure section 5.15.2 refuses for frames and sensors. Each track's
     /// own rules are enforced at parse; this is the one rule no single record can see.
     pub fn check(&self) -> Result<()> {
-        let mut seen: Vec<u32> = Vec::with_capacity(self.tracks.len());
+        let mut seen: HashSet<u32> = HashSet::with_capacity(self.tracks.len());
         for t in &self.tracks {
-            if seen.contains(&t.object_id) {
+            if !seen.insert(t.object_id) {
                 return Err(Error::Malformed(format!(
                     "two ObjectTrack records move object {}; a gaussian has one object and cannot \
                      be transported by two poses (section 5.15.6)",
                     t.object_id
                 )));
             }
-            seen.push(t.object_id);
         }
         Ok(())
     }
@@ -114,18 +116,48 @@ impl ObjectLayer {
         }
     }
 
-    /// Compose the tracks onto reconstructed centres: `center = R * c0 + T`.
+    /// Compose tracks onto reconstructed centres and orientations.
     ///
-    /// `centers` is `3 * n` flat, `object_ids` is `n`. Each gaussian whose object has a
-    /// track is transformed in place; the rest pass through unchanged, so a file with no
-    /// tracks is a no-op. The transform is applied once, after the base state is fully
-    /// reconstructed.
-    pub fn apply(&self, centers: &mut [f32], object_ids: &[u32], t: f64) -> Result<()> {
+    /// `centers` is `3 * n` flat, `orientations` is `4 * n` xyzw, and `object_ids` is
+    /// `n`. Each gaussian whose object has a track is transformed in place; the rest pass
+    /// through unchanged. Poses are sampled once per track and looked up by id, so
+    /// composition is O(gaussians + tracks), not O(gaussians × tracks).
+    pub fn apply(
+        &self,
+        centers: &mut [f32],
+        orientations: &mut [f32],
+        object_ids: &[u32],
+        t: f64,
+    ) -> Result<()> {
+        let count = object_ids.len();
+        if centers.len() != count * 3 {
+            return Err(Error::Malformed(format!(
+                "object-layer composition received {} center values for {count} gaussians; \
+                 expected {}",
+                centers.len(),
+                count * 3
+            )));
+        }
+        if orientations.len() != count * 4 {
+            return Err(Error::Malformed(format!(
+                "object-layer composition received {} orientation values for {count} gaussians; \
+                 expected {}",
+                orientations.len(),
+                count * 4
+            )));
+        }
         if self.tracks.is_empty() {
             return Ok(());
         }
+        self.check()?;
+        let mut poses: HashMap<u32, Pose> = HashMap::with_capacity(self.tracks.len());
+        for track in &self.tracks {
+            if let Some(pose) = pose_at(track, t)? {
+                poses.insert(track.object_id, pose);
+            }
+        }
         for (i, &object_id) in object_ids.iter().enumerate() {
-            let Some(pose) = self.pose_at(object_id, t)? else {
+            let Some(pose) = poses.get(&object_id) else {
                 continue;
             };
             let c0 = [
@@ -137,6 +169,17 @@ impl ObjectLayer {
             centers[i * 3] = moved[0] as f32;
             centers[i * 3 + 1] = moved[1] as f32;
             centers[i * 3 + 2] = moved[2] as f32;
+
+            let r0 = [
+                orientations[i * 4] as f64,
+                orientations[i * 4 + 1] as f64,
+                orientations[i * 4 + 2] as f64,
+                orientations[i * 4 + 3] as f64,
+            ];
+            let moved_orientation = quaternion_multiply(pose.rotation, r0);
+            for (axis, value) in moved_orientation.iter().enumerate() {
+                orientations[i * 4 + axis] = *value as f32;
+            }
         }
         Ok(())
     }

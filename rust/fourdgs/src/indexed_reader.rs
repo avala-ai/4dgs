@@ -573,7 +573,15 @@ pub fn read_objects<R: Readable + ?Sized>(
         let blob = source.read(*offset, *length)?;
         let content = record_content(&blob, *opcode)?;
         match *opcode {
-            op::OBJECT_TABLE => out.table = Some(rec::ObjectTable::parse(content)?),
+            op::OBJECT_TABLE => {
+                if out.table.is_some() {
+                    return Err(Error::Malformed(format!(
+                        "a second ObjectTable record appears at byte {offset}; a file may carry \
+                         exactly one scene-wide object table"
+                    )));
+                }
+                out.table = Some(rec::ObjectTable::parse(content)?);
+            }
             op::OBJECT_TRACK => out.tracks.push(rec::ObjectTrack::parse(content)?),
             _ => {}
         }

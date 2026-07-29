@@ -227,13 +227,15 @@ pub struct GaussianSet {
     pub object_id: Option<Vec<u32>>,
 }
 
-/// Reconstructed state at one instant: which gaussians exist, where they are, and how
-/// opaque they are. This is where decoding ends.
+/// Reconstructed state at one instant: which gaussians exist, where and how they are
+/// oriented, and how opaque they are. This is where decoding ends.
 #[derive(Debug, Clone, Default)]
 pub struct StateAt {
     pub indices: Vec<u32>,
     /// 3 per visible gaussian.
     pub centers: Vec<f32>,
+    /// 4 per visible gaussian, unit quaternion, xyzw.
+    pub orientations: Vec<f32>,
     /// 1 per visible gaussian.
     pub opacity: Vec<f32>,
 }
@@ -301,6 +303,7 @@ impl GaussianSet {
     /// visible  =  win_lo <= t < win_hi  AND  marginal >= cutoff
     /// marginal =  sigma_t == +inf ? 1 : exp(-0.5 * ((t - mu_t) / sigma_t)^2)
     /// center   =  position + motion * (t - mu_t)
+    /// orientation = rotation
     /// opacity  =  color.a * marginal
     /// ```
     ///
@@ -330,6 +333,8 @@ impl GaussianSet {
                 let v = self.motions[i * 3 + k] as f64;
                 out.centers.push((p + v * (t - mu)) as f32);
             }
+            out.orientations
+                .extend_from_slice(&self.rotations[i * 4..i * 4 + 4]);
             out.opacity
                 .push((self.colors[i * 4 + 3] as f64 * marginal) as f32);
         }

@@ -62,6 +62,9 @@ pub struct SceneReader<R: Readable> {
     loaded_key: Option<LoadKey>,
     /// Records that live behind byte ranges on the indexed path, fetched on first use.
     records: Option<Records>,
+    /// Object records are independent of the other front matter: asking for a camera must
+    /// not also fetch every object track in the file.
+    objects: Option<crate::object_layer::ObjectLayer>,
 }
 
 /// The front-matter records a caller asked for, once they have been fetched.
@@ -108,6 +111,7 @@ impl<R: Readable> SceneReader<R> {
                 loaded_band: 0,
                 loaded_key: None,
                 records: None,
+                objects: None,
             });
         }
         let scene = stream_reader::read_from(
@@ -124,6 +128,7 @@ impl<R: Readable> SceneReader<R> {
             loaded_band: 3,
             loaded_key: Some(LoadKey::All),
             records: None,
+            objects: None,
         })
     }
 
@@ -362,7 +367,19 @@ impl<R: Readable> SceneReader<R> {
     /// How many provenance records the file carries, known at open from the ranges alone.
     pub fn provenance_count(&self) -> usize {
         match (&self.indexed, &self.streamed) {
-            (Some(s), _) => s.provenance_ranges.len(),
+            (Some(s), _) => s
+                .provenance_ranges
+                .iter()
+                .filter(|(opcode, _, _)| {
+                    matches!(
+                        *opcode,
+                        crate::opcode::COORDINATE_FRAME
+                            | crate::opcode::SENSOR_CALIBRATION
+                            | crate::opcode::RIG_TRAJECTORY
+                            | crate::opcode::GEODETIC_ANCHOR
+                    )
+                })
+                .count(),
             (_, Some(s)) => {
                 let p = &s.provenance;
                 p.frames.len() + p.sensors.len() + p.trajectories.len() + p.anchors.len()
@@ -378,6 +395,16 @@ impl<R: Readable> SceneReader<R> {
             .as_ref()
             .map(|r| r.attachments.clone())
             .unwrap_or_default())
+    }
+
+    /// The Object Table and object tracks the file carries (spec section 5.15.6).
+    ///
+    /// On the indexed path these records are fetched on first use. Reconstruction through
+    /// [`state_at`](Self::state_at) also fetches them when resident gaussians carry object
+    /// memberships, because the tracks are authoritative motion rather than metadata.
+    pub fn objects(&mut self) -> Result<crate::object_layer::ObjectLayer> {
+        self.ensure_objects()?;
+        Ok(self.objects.clone().unwrap_or_default())
     }
 
     /// How many records of each kind the file carries, known at open from the ranges alone
@@ -431,6 +458,22 @@ impl<R: Readable> SceneReader<R> {
             }
         };
         self.records = Some(records);
+        Ok(())
+    }
+
+    fn ensure_objects(&mut self) -> Result<()> {
+        if self.objects.is_some() {
+            return Ok(());
+        }
+        self.objects = Some(if let Some(scene) = &self.indexed {
+            indexed_reader::read_objects(&mut self.source, scene)?
+        } else {
+            self.streamed
+                .as_ref()
+                .expect("one path or the other")
+                .objects
+                .clone()
+        });
         Ok(())
     }
 
@@ -490,7 +533,22 @@ impl<R: Readable> SceneReader<R> {
     pub fn state_at(&mut self, t: f64, max_sh_band: u8) -> Result<crate::model::StateAt> {
         let cutoff = self.header().cutoff;
         self.load_at(t, max_sh_band)?;
-        Ok(self.loaded.state_at(t, cutoff))
+        let mut state = self.loaded.state_at(t, cutoff);
+        let visible_object_ids = self.loaded.object_id.as_ref().map(|object_ids| {
+            state
+                .indices
+                .iter()
+                .map(|&i| object_ids[i as usize])
+                .collect::<Vec<u32>>()
+        });
+        if let Some(object_ids) = visible_object_ids.filter(|ids| ids.iter().any(|id| *id != 0)) {
+            self.ensure_objects()?;
+            self.objects
+                .as_ref()
+                .expect("ensure_objects populated the cache")
+                .apply(&mut state.centers, &mut state.orientations, &object_ids, t)?;
+        }
+        Ok(state)
     }
 
     fn load(&mut self, key: LoadKey, max_sh_band: u8) -> Result<&GaussianSet> {
