@@ -41,9 +41,10 @@ allocation; never a hang. A single input that takes longer than the ceiling is a
 test.
 
 `tests/fuzz/` has the operator list, the shared seed scheme — the same seed names the same bytes in
-every language, so a crash found by one implementation is handed to another as two integers — and
-`regressions.json`, which records every input that has ever found something and replays all of them
-on every run. The fuzzers run in CI on both implementations.
+Python and TypeScript, so a crash found by one implementation is handed to the other as two
+integers — and `regressions.json`, which records every input that has ever found something and
+replays all of them on every run. Rust fuzzes separately in `rust/fourdgs/tests/fuzz.rs`, against
+seeds it encodes itself and across the C ABI as well as the two read paths. All three run in CI.
 
 The first pass found ten crash classes, including one that was not an exception at all: a
 constant-mode attribute stream declaring 2^30 elements, which expanded a one-byte payload into

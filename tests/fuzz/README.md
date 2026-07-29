@@ -9,6 +9,12 @@ allocation; never a hang. "It crashed" and "it refused" are different outcomes f
 running it, and only one of them is acceptable. This is the executable half of
 [SECURITY.md](../../SECURITY.md)'s threat model.
 
+This directory is the **Python and TypeScript** fuzzers: they mutate the shared corpus and share a
+seed scheme, which is what the rest of this file describes. Rust fuzzes in
+`rust/fourdgs/tests/fuzz.rs` against seeds it encodes itself, so `cargo test` needs nothing
+generated first, and covers the C ABI as well as the two read paths. Same invariant, different
+inputs — deliberately, because two fuzzers that explore the same inputs find the same bugs.
+
 ## What it does
 
 Mutations are structural rather than purely random, because a byte-flipper spends almost all of its

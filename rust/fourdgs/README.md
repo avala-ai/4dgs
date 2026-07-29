@@ -8,7 +8,7 @@ everywhere else.
 
 ## Status
 
-Decoding is complete and proved by the shared conformance suite — 28 variants over both read paths,
+Decoding is complete and proved by the shared conformance suite — 32 variants over both read paths,
 run in this repository's CI.
 
 Encoding is complete too. Python's encoder is the _reference_ one, optimized for being obviously

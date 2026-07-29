@@ -29,10 +29,15 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = fileURLToPath(new URL("../../../", import.meta.url));
 
-/** Two variants: the simple case, and one with harmonics, chunks and quantization. */
+/**
+ * Three variants: the simple case, one with harmonics, chunks and quantization, and one
+ * whose gaussians share positions — the browser assembles chunks itself over the range
+ * transport, so the ordering rule is worth holding on this path too and not only in Node.
+ */
 const VARIANTS = [
   "OneWindow-UseChunkIndex-UseCrc-WithAudio-WithCamera-WithMetadata",
   "MixedLifetimes-Quantized-SHDegree2-UseChunkIndex-UseChunks-UseCrc",
+  "RepeatedPositions-SHDegree2-UseChunkIndex-UseChunks-UseCrc",
 ];
 
 const CHROME_NAMES = [

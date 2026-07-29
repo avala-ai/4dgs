@@ -7,8 +7,8 @@ documented state — not a defect — and this table is the public contract that
 `supportsVariant()`, the harness runs exactly those, and this table is kept in lockstep with those
 declarations. Nothing is marked `Yes` on the strength of code existing.
 
-Python's row, TypeScript's and Rust's are filled in from a suite that runs: 28 variants, two read
-paths (streamed and indexed), 55 checks passing for each. The other languages have not been run
+Python's row, TypeScript's and Rust's are filled in from a suite that runs: 32 variants, two read
+paths (streamed and indexed), 63 checks passing for each. The other languages have not been run
 against it yet.
 
 | Feature                                              | Python  | TypeScript | Rust    | C++     | Swift   |
@@ -89,7 +89,7 @@ the harness reports it like a diff.
 **Encode**, **Chunked encode** and **Summary writing** are proved by a gate rather than by a runner,
 and the two encoders are gated differently because they play different roles.
 
-Python's is proved by the corpus gate: `generate.py --verify` re-encodes all 28 variants, asserts
+Python's is proved by the corpus gate: `generate.py --verify` re-encodes all 32 variants, asserts
 every committed checksum, and asserts that two consecutive runs are byte-identical. Every variant is
 an encode; the chunked and summary-bearing ones are the flags that say so.
 
@@ -105,6 +105,18 @@ decodes each chunk back and refuses to return a file whose measured deviation ex
 is about to declare — so the Quantization record's numbers are checked on every gaussian of every
 scene rather than sampled. The chunk tree is exercised by the same run: the corpus scenes partition
 into up to 42 chunks each.
+
+**Fuzzed** is a property of an implementation, not a feature of the format, so it is not a row in
+this table — a row would imply the format has something called fuzzing that an SDK can support.
+Python's, TypeScript's and Rust's decoders are fuzzed in CI, each holding one invariant: for any
+input at all, a decoder either succeeds or raises the format's own error type — never a codec
+library's exception or a panic, never unbounded allocation, never a hang. Python's and TypeScript's
+mutate the shared corpus and share a seed scheme, so a crash found by one reproduces in the other
+from two integers; Rust's encodes its own seeds and additionally fuzzes the C ABI, where a panic
+crossing the boundary would be undefined behaviour rather than an error the caller can handle. C++
+and Swift are not fuzzed yet — they bind to the Rust core, so its fuzzing covers the decode but not
+their own bindings. See [the fuzzing
+notes](https://github.com/avala-ai/4dgs/blob/main/tests/fuzz/README.md) and `rust/fourdgs/tests/fuzz.rs`.
 
 **Convert from PLY frame sequences** and **Inspect and validate** are tools rather than wire-format
 features, so the conformance suite does not cover them; they are marked from their own tests, which
