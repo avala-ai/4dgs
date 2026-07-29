@@ -84,6 +84,14 @@ jobs:
     runs-on: ubuntu-latest
     needs: corpus
     if: false # enabled when the binding has a core behind it
+  swift:
+    runs-on: ubuntu-latest
+    container: swift:6.1
+    needs: corpus
+    # Enabled when the Swift package decodes: its seam onto the Rust core's C ABI is
+    # unimplemented, so every runner would exit non-zero on every variant. Turning this on
+    # is the milestone, and the feature matrix moves with it and not before.
+    if: false
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -99,3 +107,10 @@ jobs:
           pip install -e ./python/fourdgs
           python tests/conformance/generate.py
           python tests/conformance/run.py --runner cpp
+      # `run.py --runner swift` fails if no Swift runner executed, so a build that silently
+      # produced nothing is a red suite rather than a green one.
+      - run: |
+          swift build --package-path swift --configuration release
+          pip install -e ./python/fourdgs
+          python tests/conformance/generate.py
+          python tests/conformance/run.py --runner swift
