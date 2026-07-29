@@ -172,6 +172,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # The tool's output is UTF-8 wherever it goes. Unpiped, Python already does
+    # this; piped on Windows it falls back to the locale encoding, so the same
+    # findings arrive as different bytes from this tool and the Rust one. What
+    # a validator says should not depend on what its stdout was plugged into.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     args = build_parser().parse_args(argv)
     return args.func(args)
 
