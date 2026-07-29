@@ -283,7 +283,7 @@ enum Core {
             gain: raw.gain)
     }
 
-    /// What a seek to `t` would transfer, so a consumer can budget before asking.
+    /// A conservative upper bound on a cold seek, including potentially referenced Object Tracks.
     static func bytesForTime(_ scene: SceneHandle, _ t: Double, bandCap: Int?) -> UInt64 {
         fourdgs_scene_bytes_for_time(scene.raw, t, bandCapByte(bandCap))
     }

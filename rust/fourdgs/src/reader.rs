@@ -547,6 +547,29 @@ impl<R: Readable> SceneReader<R> {
         &self.loaded
     }
 
+    /// A conservative upper bound on a cold seek at `t`.
+    ///
+    /// On the indexed path this includes chunk and SH bytes plus every Object Track that
+    /// could be referenced once those chunks reveal their memberships. A later seek may
+    /// cost less because track validation is cached.
+    pub fn bytes_for_time(&self, t: f64, max_sh_band: u8) -> u64 {
+        if let Some(scene) = &self.indexed {
+            return scene.bytes_for_time(t, max_sh_band);
+        }
+        self.chunk_index()
+            .iter()
+            .filter(|e| e.covers(t))
+            .map(|e| {
+                e.bands
+                    .iter()
+                    .filter(|(band, _, _)| *band <= max_sh_band)
+                    .fold(e.chunk_length, |total, (_, _, length)| {
+                        total.saturating_add(*length)
+                    })
+            })
+            .fold(0u64, u64::saturating_add)
+    }
+
     /// Reconstructed state at `t` over whatever is currently resident. Indices index into
     /// `loaded()`.
     pub fn state_at(&mut self, t: f64, max_sh_band: u8) -> Result<crate::model::StateAt> {

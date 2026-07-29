@@ -208,11 +208,10 @@ public final class SceneReader {
         try loadedGaussians(at: t, options: options).live(at: t, cutoff: scene.header.cutoff)
     }
 
-    /// What a seek to `t` would transfer, so a consumer can budget before asking for it.
-    ///
-    /// Seek cost is a property of the content, not of the container: a scene whose
-    /// gaussians all live for the whole clip has one chunk covering everything, and this
-    /// will say so rather than let anyone discover it by fetching the file.
+    /// A conservative upper bound on a cold seek to `t`, so a consumer can budget before
+    /// asking for it. It includes every Object Track the
+    /// decoded memberships could reference; actual transfer may be lower after validation
+    /// is cached.
     public func bytesForTime(_ t: Double, options: DecodeOptions = DecodeOptions()) -> UInt64 {
         Core.bytesForTime(handle, t, bandCap: options.bandCap)
     }

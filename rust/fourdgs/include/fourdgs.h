@@ -288,8 +288,10 @@ int fourdgs_scene_chunk_interval(const fourdgs_scene *scene, uint32_t i,
                                  double *out_t0, double *out_t1);
 
 /**
- * What a seek to `t` will transfer with spherical harmonics capped at `max_sh_band`, so a
- * caller can budget before asking.
+ * A conservative upper bound on a cold seek to `t`, with spherical harmonics capped at
+ * `max_sh_band`, so a caller can budget before asking. It includes every Object Track
+ * that the chunks could reference; actual transfer may be lower after membership is
+ * decoded or track validation is cached.
  *
  * Seek efficiency is a property of the content, not of the container: a scene whose
  * gaussians all live for the whole clip has one chunk covering everything, and this will

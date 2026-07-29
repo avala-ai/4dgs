@@ -686,10 +686,17 @@ fn indexed_state_range_samples_long_tracks_and_keeps_only_one_instant() {
         reads: Rc::clone(&reads),
     };
     let mut reader = SceneReader::open_with(source, OpenMode::Indexed).expect("open indexed");
+    let budget = reader.bytes_for_time(2048.5, 0);
     reads.borrow_mut().clear();
 
     let state = reader.state_at(2048.5, 0).expect("sample the long track");
     assert!((state.centers[0] - 2049.5).abs() < 1e-4);
+    let total_transferred = reads.borrow().iter().map(|range| range.1).sum::<u64>();
+    assert!(
+        total_transferred <= budget,
+        "the {budget}-byte cold-seek budget must cover chunks and Object Tracks; \
+         transferred {total_transferred}"
+    );
     let track_reads: Vec<ByteRange> = reads
         .borrow()
         .iter()

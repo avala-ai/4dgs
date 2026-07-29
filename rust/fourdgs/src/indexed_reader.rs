@@ -216,9 +216,10 @@ pub struct IndexedScene {
     /// Object Tables stay fully lazy because reconstructed state never needs labels,
     /// embeddings, anchors, or dynamics.
     pub object_table_ranges: Vec<(u64, u64)>,
-    /// The framing and fixed-width header of each Object Track. Opening reads no samples;
-    /// an indexed instant range-samples only tracks its resident memberships reference.
-    pub object_track_ranges: Vec<ObjectTrackRange>,
+    /// The framing and fixed-width header of each Object Track, keyed by object id.
+    /// Opening reads no samples; the lookup lets an indexed instant visit only the tracks
+    /// its resident memberships reference.
+    pub object_track_ranges: BTreeMap<u32, ObjectTrackRange>,
     pub statistics: Option<rec::Statistics>,
     pub summary_offsets: Vec<rec::SummaryOffset>,
 }
@@ -249,9 +250,16 @@ impl IndexedScene {
         self.index.iter().filter(|e| e.t0 < b && a < e.t1).collect()
     }
 
-    /// What a seek to `t` will transfer, so a caller can budget before asking.
+    /// A conservative upper bound on what a cold seek to `t` will transfer.
+    ///
+    /// Object membership lives inside the chunks, so it is unknowable before those bytes
+    /// arrive. The bound therefore includes first-use validation and pose sampling for
+    /// every framed Object Track. Actual transfer is lower when the instant references
+    /// fewer tracks, and later seeks reuse the bounded validation cache in
+    /// [`crate::SceneReader`].
     pub fn bytes_for_time(&self, t: f64, max_sh_band: u8) -> u64 {
-        self.chunks_for_time(t)
+        let chunks = self
+            .chunks_for_time(t)
             .iter()
             .map(|e| {
                 e.bands
@@ -261,8 +269,31 @@ impl IndexedScene {
                         total.saturating_add(*length)
                     })
             })
-            .fold(0u64, u64::saturating_add)
+            .fold(0u64, u64::saturating_add);
+        self.object_track_ranges
+            .values()
+            .map(object_track_cold_seek_bytes)
+            .fold(chunks, u64::saturating_add)
     }
+}
+
+fn object_track_cold_seek_bytes(range: &ObjectTrackRange) -> u64 {
+    let count = u64::from(range.sample_count);
+    if count == 0 {
+        return 0;
+    }
+    let validation = count.saturating_mul(OBJECT_TRACK_SAMPLE_BYTES);
+    if count == 1 {
+        return validation
+            .saturating_add(8)
+            .saturating_add(OBJECT_TRACK_SAMPLE_BYTES);
+    }
+    // This deliberately rounds the bisection probes up: the API promises a budget
+    // ceiling, not an average for a particular query time.
+    let bisection_upper = u64::from(range.sample_count.ilog2()) + 1;
+    validation
+        .saturating_add((2 + bisection_upper).saturating_mul(8))
+        .saturating_add(2 * OBJECT_TRACK_SAMPLE_BYTES)
 }
 
 /// Open a scene: a bounded read from the front, then the index. Never the file.
@@ -275,7 +306,6 @@ pub fn open_indexed<R: Readable + ?Sized>(source: &mut R) -> Result<IndexedScene
     let mut source_ranges: BTreeMap<u32, (u64, u64)> = BTreeMap::new();
     let mut data_ranges: BTreeMap<u32, (u64, u64)> = BTreeMap::new();
     let mut legacy_audio: Option<IndexedAudioSource> = None;
-    let mut object_track_offsets = HashMap::new();
     {
         let mut front = FrontMatter::new(source, size);
         crate::serialization::check_magic(&front.head(MAGIC.len() as u64)?)?;
@@ -371,14 +401,13 @@ pub fn open_indexed<R: Readable + ?Sized>(source: &mut R) -> Result<IndexedScene
                     let object_id = header.u32()?;
                     let interpolation = header.u8()?;
                     let sample_count = header.u32()?;
-                    if let Some(first_offset) =
-                        object_track_offsets.insert(object_id, record.offset)
-                    {
+                    if let Some(first) = scene.object_track_ranges.get(&object_id) {
                         return Err(Error::Malformed(format!(
                             "ObjectTrack for object {object_id} at byte {} duplicates the track at \
                              byte {first_offset}; expected at most one track per object (section \
                              5.15.6)",
-                            record.offset
+                            record.offset,
+                            first_offset = first.record_offset
                         )));
                     }
                     let sample_bytes = u64::from(sample_count)
@@ -399,14 +428,17 @@ pub fn open_indexed<R: Readable + ?Sized>(source: &mut R) -> Result<IndexedScene
                             record.offset, record.content_length
                         )));
                     }
-                    scene.object_track_ranges.push(ObjectTrackRange {
+                    scene.object_track_ranges.insert(
                         object_id,
-                        interpolation,
-                        sample_count,
-                        record_offset: record.offset,
-                        record_length: record.total_length(),
-                        content_offset: record.offset + RECORD_HEADER_SIZE as u64,
-                    });
+                        ObjectTrackRange {
+                            object_id,
+                            interpolation,
+                            sample_count,
+                            record_offset: record.offset,
+                            record_length: record.total_length(),
+                            content_offset: record.offset + RECORD_HEADER_SIZE as u64,
+                        },
+                    );
                 }
                 code if op::is_provenance(code) => {
                     scene
@@ -668,7 +700,7 @@ pub fn read_objects<R: Readable + ?Sized>(
             op::OBJECT_TABLE,
         )?)?);
     }
-    for range in &scene.object_track_ranges {
+    for range in scene.object_track_ranges.values() {
         let blob = source.read(range.record_offset, range.record_length)?;
         out.tracks.push(rec::ObjectTrack::parse(record_content(
             &blob,
@@ -708,18 +740,10 @@ pub(crate) fn read_object_poses_cached<R: Readable + ?Sized>(
     validated: &mut HashSet<u64>,
 ) -> Result<HashMap<u32, crate::provenance::Pose>> {
     let mut out = HashMap::with_capacity(object_ids.len().min(scene.object_track_ranges.len()));
-    let mut seen = HashMap::with_capacity(scene.object_track_ranges.len());
-    for range in &scene.object_track_ranges {
-        if let Some(first_offset) = seen.insert(range.object_id, range.record_offset) {
-            return Err(Error::Malformed(format!(
-                "ObjectTrack for object {} at byte {} duplicates the track at byte \
-                 {first_offset}; expected at most one track per object (section 5.15.6)",
-                range.object_id, range.record_offset
-            )));
-        }
-        if !object_ids.contains(&range.object_id) {
+    for object_id in object_ids {
+        let Some(range) = scene.object_track_ranges.get(object_id) else {
             continue;
-        }
+        };
         let needs_validation = !validated.contains(&range.record_offset);
         let Some(pose) = sample_object_track(source, range, t, needs_validation)? else {
             validated.insert(range.record_offset);

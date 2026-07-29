@@ -111,8 +111,8 @@ class Scene {
   /// Chunk index entries; 0 for a file with no index, which must be read sequentially.
   std::uint32_t chunkCount() const;
   Result<std::pair<double, double>> chunkInterval(std::uint32_t index) const;
-  /// What a seek to `t` would transfer at this band cap, so a caller can budget before
-  /// asking. Seek cost is a property of the content, not of the container.
+  /// A conservative upper bound on a cold seek at this band cap, including Object Tracks
+  /// the decoded memberships could reference.
   std::uint64_t bytesForTime(double t, int maxShBand) const;
   /// The same, for exactly one chunk, which is what a byte-budget check needs: `loadAt`
   /// cannot isolate a chunk when intervals overlap.

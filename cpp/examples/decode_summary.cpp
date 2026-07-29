@@ -43,9 +43,8 @@ int main(int argc, char** argv) {
 
   const double t = argc == 3 ? std::atof(argv[2]) : scene.durationSec() / 2.0;
 
-  // What this instant will cost before paying for it. Seek efficiency is a property of the
-  // content: a scene whose gaussians all live for the whole clip has one chunk covering
-  // everything, and this says so.
+  // A conservative cold-seek bound, including any Object Track the decoded memberships
+  // could reference.
   std::printf("\nat t = %.3f s, %llu bytes to transfer\n", t,
               static_cast<unsigned long long>(scene.bytesForTime(t, 3)));
 

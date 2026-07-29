@@ -17,7 +17,7 @@ rendering and listener-relative spatialization are out of scope.**
 let reader = try SceneReader(path: "scene.4dgs")   // or readPath: .streamed / .indexed
 let live = try reader.gaussians(at: 1.5)   // §3: the window, then marginal against the file's cutoff
 let moved = live[0].state(at: 1.5)         // centre moved, opacity faded
-let cost = reader.bytesForTime(1.5)        // what that seek transfers, before asking for it
+let cost = reader.bytesForTime(1.5)        // conservative cold-seek transfer bound
 let sourceState = try reader.audioSourceState(0, at: 1.5)
 ```
 
