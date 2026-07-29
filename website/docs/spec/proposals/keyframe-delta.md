@@ -1,12 +1,14 @@
 # Proposal: the `keyframe-delta` temporal model
 
-**Status: proposal. Not normative, not implemented, and not to be emitted by any writer.** Nothing
-in this document changes what a conforming file looks like today. It is a design put up for review,
-written at wire precision so that the review is about the design and not about what the design would
-have been.
+**Status: accepted design. Not yet normative, not yet implemented, and not to be emitted by any
+writer.** Nothing in this document changes what a conforming file looks like today. It is the
+approved design, written at wire precision, and it becomes a revision of
+[the specification](../index.md) and a set of entries in [the registry](../registry.md) as the
+implementation lands. Until it does, the specification is the format and this is a plan.
 
-If it is accepted it becomes a revision of [the specification](../index.md) and a set of entries in
-[the registry](../registry.md), and the text below is the draft of both.
+Every question this design left open has been decided; the decisions are recorded in §13 and folded
+into the sections they affect, so no section contradicts a ruling. Implementation is sequenced: the
+refusal-corpus harness change lands first and on its own (§11.5), then the model.
 
 ---
 
@@ -52,7 +54,7 @@ the conformance corpus the model needs.
   choice and to state its cost; it is not to make it. This follows the existing division in
   AGENTS.md §4 — the reference encoder is a reference, and rate and quality heuristics are where
   encoders differentiate.
-- **Spherical harmonic deltas.** See §11 and the open question in §13.
+- **Spherical harmonic deltas.** Ruled out for this revision; see §8 and §13.3.
 - **Spatial subdivision within a temporal chunk.** Reserved by spec §10.1; §7 notes where this
   design would have to be revisited if it lands.
 
@@ -213,6 +215,25 @@ the strongest statement available for any attribute here.
 A producer that must change `sigma_t`, `flags` or `window_index` emits a death and a birth, or a
 keyframe. Both are representable; neither is silent.
 
+### 3.6 A delta's reference shares its `level`
+
+Both chunk records carry a `level` field, the producer's hierarchy level, which the specification
+describes as informational only. **A delta chunk's reference MUST have the same `level`**, and a
+reader MUST refuse a file where it does not, naming both levels.
+
+**Decided (§13.7).** This is the one constraint this design puts on level-of-detail, and it is
+deliberately the weakest one that keeps the question open. Whether a GOP may mix levels, whether
+levels are separate GOPs with separate keyframes, and how a reader chooses between them are
+undesigned here — they belong with the reserved spatial-subdivision work, which is where the
+level-of-detail design track lives.
+
+The rule exists because the alternative is not neutrality. A format that says nothing about levels
+here would let a delta at one level reference a keyframe at another, and once such files exist the
+meaning of that combination is decided by whatever the first decoder did with it. Requiring the
+levels to match costs a producer nothing today — every file the model is designed for has one level
+— and leaves every option available to the design that eventually needs them, because relaxing a
+rule is an append and tightening one is not.
+
 ---
 
 ## 4. Wire mapping
@@ -232,7 +253,12 @@ chunks restate the same gaussians would count each of them many times and mean n
 `keyframe-delta` it is **the number of distinct `gaussian_id` values in the file**. This is a
 reading of a field for a model that did not exist when it was written, not a change to what it means
 in any `gaussian-birth` file, of which there are many and none of which move. It is also the field's
-only useful reading here. See §13 — this is a judgement call and the reviewer should confirm it.
+only useful reading here.
+
+**Decided (§13.1): accepted, and it goes in the normative text rather than being left to be
+inferred.** A reading that has to be reconstructed from first principles by each implementer is a
+reading that two implementers will reconstruct differently, which is how the `f32[6]` / `f64[6]`
+divergence happened to a field whose type was stated.
 
 ### 4.2 Keyframe chunk — `Chunk` (`0x05`), unchanged
 
@@ -385,6 +411,24 @@ Registry additions, none of which change the format version:
 - `Metadata keys`: `keyframe_interval_sec` and `gop_max_depth`, both advisory, both authoritative
   only in the index.
 
+### 4.7 `frame-sequence` is subsumed, and the name is kept as a tombstone
+
+A `keyframe-delta` file whose every chunk is a keyframe — cadence one, no delta chunks at all — is
+structurally exactly what the reserved `frame-sequence` model describes: independent time steps with
+no correspondence between them. That shape is legal here and is the `KeyframeOnly` corpus scenario.
+
+**Decided (§13.5): one wire shape gets one implemented name.** `frame-sequence` is not separately
+defined, now or later. The registry row stays, with its status changed from `reserved` to
+`subsumed`, and says plainly that the shape it names is covered by `keyframe-delta` at cadence one
+and that no separate definition will follow.
+
+The reservation is kept rather than retired because retiring it frees the name, and a freed name is
+one somebody spends on something else — at which point the format has a `frame-sequence` that is not
+the frame sequence anyone meant. A tombstone that points at the covering model costs one table row
+and answers the question permanently. This is the same reasoning that put `flat-top` in the
+visibility-profile table: a name is reserved to stop a term being applied loosely, and that job does
+not end when the underlying capability arrives by another route.
+
 ---
 
 ## 5. Versioning: this is version 1.1
@@ -422,11 +466,16 @@ knot at the origin with no error anywhere.
 
 **The rejected alternative: Header `flags` bit 2.** Bits 2–7 are reserved and MUST be 0 in version
 1, so defining bit 2 as "chunk data is delta-coded" would make an old reader refuse mechanically,
-before it parses a string, and impossible to skip. It was rejected because it produces a worse
-diagnosis: the reader would report a reserved flag bit set, which says the file is malformed, when
-in fact the file is well-formed and the reader is old. AGENTS.md §6 asks that errors name the
-problem and distinguish "unknown but legal" from "malformed", and `temporal_model` does exactly
-that. See §13; a reviewer may weigh the mechanical gate differently.
+before it parses a string, and impossible to skip. It produces a worse diagnosis: the reader would
+report a reserved flag bit set, which says the file is malformed, when in fact the file is
+well-formed and the reader is old. AGENTS.md §6 asks that errors name the problem and distinguish
+"unknown but legal" from "malformed", and `temporal_model` does exactly that.
+
+**Decided (§13.2): the bit is not spent. A well-formed file must never be reported malformed.** The
+mechanical gate is cheaper for the reader and more expensive for the person holding the file, and
+the person is who the error message is for. Bits 2–7 stay reserved and a `keyframe-delta` writer
+leaves them 0, so the only thing an old reader has to get right is the rule the registry has always
+had.
 
 ---
 
@@ -598,10 +647,13 @@ quantity no consumer cares about.
 - **Rotation** — never composed at all. §3.5 makes rotation an absolute restatement, so the bound is
   §6.4's post-reconstruction bound applied once, exactly as in a `gaussian-birth` file. This is the
   only attribute for which the delta model changes nothing whatsoever.
-- **Spherical harmonics** — not delta-coded in this proposal. A band's coefficients are `u8` stored
-  as written and consumed as read (§6.5), which gives a difference no defined domain to live in. A
-  gaussian's coefficients are therefore fixed for its lifetime within a GOP; changing them needs a
-  keyframe, or a death and a birth. §13 asks whether that is acceptable.
+- **Spherical harmonics** — not delta-coded. A band's coefficients are `u8` stored as written and
+  consumed as read (§6.5), which gives a difference no defined domain to live in. A gaussian's
+  coefficients are therefore fixed for its lifetime within a GOP; changing them needs a keyframe, or
+  a death and a birth. **Decided (§13.3): accepted as a limitation, to be revisited only against
+  content that demonstrates the need.** Inventing a signed band form on the strength of an argument
+  rather than a file is how a format acquires a record nobody writes; this is precisely what a later
+  minor revision is for, and the door stays open because adding a stream form is an append.
 
 ### Representability
 
@@ -644,6 +696,7 @@ against a list. Every one of these names the offending value in its message.
 | `sigma_t`, `flags` or `window_index` in an update group | the per-gaussian grids would differ across the delta     |
 | a stream's `element_count` ≠ its group's declared count | the alignment between ids and values is unknown          |
 | a composed bin outside `i32`                            | wrapping produces a plausible wrong value                |
+| a delta's `level` differs from its reference's          | the combination has no defined meaning (§3.6)            |
 
 ---
 
@@ -784,15 +837,23 @@ what survives:
 
 ### 11.5 Files a reader must refuse
 
-§9's table is thirteen conditions, and none of them is provable by a corpus of valid files. This
+§9's table is fourteen conditions, and none of them is provable by a corpus of valid files. This
 needs a second, small corpus of deliberately invalid files, each paired with the identifier of the
 refusal it must produce — `forward-reference`, `unknown-death-id`, `duplicate-id`,
-`invariant-changed-in-update`, `non-tiling-chunks`, `depth-mismatch`, `bin-overflow`.
+`invariant-changed-in-update`, `non-tiling-chunks`, `depth-mismatch`, `bin-overflow`,
+`level-mismatch`.
 
-That is a **new contract for the harness**: today an expectation is canonical JSON, and this would
-make it "JSON, or a named refusal". It is the right shape — a decoder that refuses nothing is not
-safer than one that refuses correctly, it is less safe — but it is a change to the suite rather than
-an addition to the corpus, and §13 flags it as needing the maintainer's call.
+That is a **new contract for the harness**: today an expectation is canonical JSON, and this makes
+it "JSON, or a named refusal". It is the right shape — a decoder that refuses nothing is not safer
+than one that refuses correctly, it is less safe.
+
+**Decided (§13.4): accepted, and it lands first, as its own change.** The harness change is
+reviewable on its own and the model's is not reviewable while carrying it. Sequencing it first also
+has a property worth naming: the refusal contract can be introduced against conditions that already
+exist in version 1 — a window index outside its table, a non-finite quantization step, an unknown
+codec — which means it ships proven by rules the format already has, rather than arriving
+simultaneously with the rules it is meant to police. A harness feature whose only exercise is the
+feature it was built for has not been tested; it has been co-designed with its single test.
 
 ### 11.6 Feature matrix rows
 
@@ -818,7 +879,7 @@ Stated together so a reviewer can weigh them without assembling them from the se
 2. **A larger file for content that does not move.** §7 quantifies it: a floor of `T / T_gop` full
    restatements regardless of content.
 3. **A larger working set for a streamed reader** — one population rather than one chunk (§7).
-4. **A new invariant class in readers.** §9 lists thirteen refusal conditions that do not exist
+4. **A new invariant class in readers.** §9 lists fourteen refusal conditions that do not exist
    today, most of them about referential integrity. That is real implementation surface in five
    SDKs.
 5. **A second corpus shape** for refusal expectations (§11.5), if it is accepted.
@@ -828,37 +889,45 @@ Stated together so a reviewer can weigh them without assembling them from the se
 
 ---
 
-## 13. Open questions for the maintainer
+## 13. Disposition
 
-Deliberately left open. Each has a recommendation, and each is a decision this document should not
-make alone.
+The design was reviewed and **accepted**. Every question it left open was ruled on; each ruling is
+recorded here and folded into the section it affects, so the document has no section that
+contradicts a decision and no reader has to hold both a recommendation and its outcome in mind.
 
-1. **`gaussian_count` under this model** (§4.1). Reading it as "distinct ids in the file" is the
-   only useful reading, but it is a new reading of an existing field rather than a new field. The
-   alternatives are a new appended Header field, or leaving it undefined for this model.
-   _Recommendation: the re-reading, stated in the spec text so no one has to infer it._
-2. **The mechanical old-reader gate** (§5). Defining Header `flags` bit 2 would make an old reader
-   refuse without parsing a string, at the cost of a message that says "malformed" about a
-   well-formed file. _Recommendation: do not spend the bit; `temporal_model` names the problem
-   correctly._
-3. **Spherical harmonic deltas** (§8). This proposal freezes a gaussian's coefficients for its
-   lifetime within a GOP, because `u8`-stored-as-written has no defined difference domain. Content
-   with changing view-dependent appearance therefore needs a keyframe or a death-and-birth.
-   _Recommendation: accept the limitation now and revisit it with content that demonstrates the
-   need, rather than inventing a signed band form speculatively._
-4. **The refusal corpus** (§11.5). It changes what an expectation is. _Recommendation: accept, but
-   as its own change, landing before the model rather than with it, so the harness change is
-   reviewable on its own._
-5. **A single-keyframe file.** `KeyframeOnly` with a cadence of one is legal here and is
-   structurally what the reserved `frame-sequence` model describes. Two names for one wire shape is
-   the sort of thing a registry exists to prevent. _Recommendation: keep it legal, and say plainly
-   in the registry that `frame-sequence` is now the name of a shape this model covers — or retire
-   the reservation._
-6. **Per-chunk `delta_mode`** (§3.4). One byte per chunk to let an encoder place a cheap seek point
-   mid-GOP. _Recommendation: keep it; the alternative is spending a whole keyframe to get the same
-   effect._
-7. **Interaction with `level`** (LOD). Both chunk records carry a `level` field that is
-   informational today. Whether a GOP may mix levels, or whether levels are separate GOPs, is
-   undesigned here and interacts with the reserved spatial-subdivision work. _Recommendation: leave
-   undesigned, and state in the spec that a delta's reference MUST have the same `level`, so the
-   question stays open rather than being answered by accident._
+| #   | question                                   | ruling                                                      | folded into |
+| --- | ------------------------------------------ | ----------------------------------------------------------- | ----------- |
+| 1   | `gaussian_count` under this model          | Accept the re-reading; state it in normative text           | §4.1        |
+| 2   | Header `flags` bit 2 as a mechanical gate  | Do not spend the bit                                        | §5          |
+| 3   | Spherical harmonic deltas                  | Accept the limitation; revisit only against real content    | §8          |
+| 4   | The refusal corpus                         | Accept, sequenced first, as its own change                  | §11.5       |
+| 5   | A single-keyframe file vs `frame-sequence` | Subsume; keep the reserved name as a tombstone              | §4.7        |
+| 6   | Per-chunk `delta_mode`                     | Keep it                                                     | §3.4        |
+| 7   | Interaction with `level`                   | The reference MUST share `level`; the rest stays undesigned | §3.6        |
+
+Three of these are worth reading as a set, because they are the same judgement applied three times.
+Ruling 2 declines a cheaper mechanism because it would produce a worse error message. Ruling 3
+declines a wire form that no file needs yet. Ruling 7 adds the smallest rule that stops a question
+being answered by accident, and answers nothing else. In each case the format takes on less than it
+could have, and in each case the reason is that the alternative would have been decided by
+implementation rather than by design — a reserved bit spent to save a string comparison, a signed
+band form written before the content that wants it, a level combination whose meaning is whatever
+the first decoder did.
+
+Ruling 5 goes the other way and is the one that removes something: `frame-sequence` will never be
+separately defined, because this model covers its shape and two names for one wire shape is what a
+registry exists to prevent. The name stays as a tombstone rather than being freed, since a freed
+name gets spent.
+
+## 14. Implementation sequence
+
+1. **The refusal-corpus harness change**, on its own, first (§11.5). It introduces "an expectation
+   may be a named refusal" against conditions version 1 already has, so it arrives proven by rules
+   that predate it.
+2. **The model.** Specification text moves out of `proposals/` and into the normative document with
+   a changelog row; the registry entries land; the Python reference and the Rust production encoder
+   and decoder implement it; the corpus gains the scenarios of §11.3 and the truncation cuts of
+   §11.4; the canonical summary gains the `states` array of §11.2.
+3. **The feature matrix**, last and only then. The rows of §11.6 start at `No` and move when the
+   public suite proves them, in the repository's own CI, which is the rule the matrix has always had
+   and the reason its cells mean anything.
