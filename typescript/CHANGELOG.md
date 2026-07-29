@@ -8,6 +8,8 @@ The four packages version together.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-29
+
 ### Added
 
 - `@4dgs/core`: `encodeScene`, a native TypeScript encoder — not a binding, a second implementation,
