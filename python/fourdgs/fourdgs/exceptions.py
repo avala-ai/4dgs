@@ -13,7 +13,26 @@ from __future__ import annotations
 
 
 class FourdgsError(Exception):
-    """Base class for every error raised by this library."""
+    """Base class for every error raised by this library.
+
+    `code` is an optional **refusal identifier**: a short, stable, language-independent
+    name for *which* rule the file broke. The message says it in words and is where a
+    human looks; the code is what two implementations in two languages can be compared
+    on, and what the conformance suite's refusal expectations are written against.
+
+    It is deliberately not derived from the exception type. `MalformedFile` covers a
+    dozen distinct faults, and "both decoders raised MalformedFile" is not agreement —
+    one of them may have refused for the wrong reason, which is the failure that hides
+    inside a passing negative test. The vocabulary lives in `refusals.REFUSALS`.
+
+    An empty code means "this refusal has no identifier yet", which is the normal state
+    for the many faults the suite does not name. It is never a promise that the file is
+    fine.
+    """
+
+    def __init__(self, message: str, *, code: str = "") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class UnsupportedVersion(FourdgsError):

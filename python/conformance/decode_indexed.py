@@ -149,11 +149,29 @@ def _merge_sh(chunks, degree: int):
     return merge_chunk_bands([len(c["mu_t"]) for c in chunks], [c.get("sh", {}) for c in chunks])
 
 
+def _refusal(exc) -> str:
+    """The canonical answer for a file this reader refused.
+
+    A refusal is a result, not a crash: the runner prints it on stdout and exits 0, and
+    the harness diffs it against the expectation like any other answer. Exiting non-zero
+    instead would collapse "refused correctly" and "fell over" into one outcome, and the
+    whole point of the invalid corpus is that those are different.
+
+    An exception carrying no identifier prints an empty one, which matches no expectation
+    and fails with a readable diff. That is deliberate: a refusal the library cannot name
+    is a refusal the suite cannot check, and it should look like a gap rather than a pass.
+    """
+    return canonical({"refused": getattr(exc, "code", "")})
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print("usage: decode_indexed.py <file.4dgs>", file=sys.stderr)
         return 2
-    print(run(argv[1]))
+    try:
+        print(run(argv[1]))
+    except fourdgs.FourdgsError as exc:
+        print(_refusal(exc))
     return 0
 
 

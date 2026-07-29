@@ -193,9 +193,23 @@ def check_magic(head: bytes) -> None:
     if len(head) < len(MAGIC):
         raise TruncatedFile("file is shorter than the magic")
     if head[: len(MAGIC)] != MAGIC:
-        if head[1:5] == b"4DGS":
-            raise UnsupportedVersion(f"4dgs major version {head[5:6]!r} is not supported by this reader")
-        raise UnsupportedVersion("not a 4dgs file (bad magic)")
+        # Two different failures, and the fix differs: a newer reader, or a different
+        # file. They are told apart by whether the version byte is the ONLY difference —
+        # every other byte of the magic is a fixed sentinel, so a file that differs
+        # elsewhere is not a 4dgs file whatever its version byte happens to say.
+        # Testing only `head[1:5] == b"4DGS"` reported a corrupt first byte as an
+        # unsupported version 1, which sends its holder looking for a newer reader that
+        # would not have helped.
+        VERSION_AT = 5
+        before = head[:VERSION_AT] != MAGIC[:VERSION_AT]
+        after = head[VERSION_AT + 1 : len(MAGIC)] != MAGIC[VERSION_AT + 1 :]
+        elsewhere = before or after
+        if not elsewhere:
+            raise UnsupportedVersion(
+                f"4dgs major version {head[VERSION_AT : VERSION_AT + 1]!r} is not supported by this reader",
+                code="unsupported-major-version",
+            )
+        raise UnsupportedVersion("not a 4dgs file (bad magic)", code="magic-mismatch")
 
 
 # --------------------------------------------------------------------------
@@ -252,7 +266,7 @@ def compress(raw: bytes, codec: int, level: int) -> bytes:
             raise UnsupportedCodec("zstd support needs the 'zstd' extra: pip install 'fourdgs[zstd]'") from exc
         params = zstandard.ZstdCompressionParameters.from_level(level, window_log=23, source_size=len(raw))
         return zstandard.ZstdCompressor(compression_params=params).compress(raw)
-    raise UnsupportedCodec(f"unknown stream codec {codec}")
+    raise UnsupportedCodec(f"unknown stream codec {codec}", code="unknown-stream-codec")
 
 
 def decompress(body: bytes, codec: int, expected: int) -> bytes:
@@ -277,7 +291,7 @@ def decompress(body: bytes, codec: int, expected: int) -> bytes:
         except zstandard.ZstdError as exc:
             raise MalformedFile(f"zstd stream is corrupt: {exc}") from exc
     else:
-        raise UnsupportedCodec(f"unknown stream codec {codec}")
+        raise UnsupportedCodec(f"unknown stream codec {codec}", code="unknown-stream-codec")
     if len(out) != expected:
         raise TruncatedFile(f"stream decompressed to {len(out)} bytes, header declared {expected}")
     return out

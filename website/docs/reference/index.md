@@ -7,8 +7,9 @@ documented state — not a defect — and this table is the public contract that
 `supportsVariant()`, the harness runs exactly those, and this table is kept in lockstep with those
 declarations. Nothing is marked `Yes` on the strength of code existing.
 
-Every row is filled in from a suite that runs: 34 variants, two read paths (streamed and indexed),
-67 checks passing for each language.
+Every row is filled in from a suite that runs: 34 valid variants and 6 invalid ones, two read paths
+(streamed and indexed) — 79 checks passing for Python, 67 for each language that does not yet answer
+a refusal expectation.
 
 | Feature                                              | Python | TypeScript | Rust    | C++     | Swift   |
 | ---------------------------------------------------- | ------ | ---------- | ------- | ------- | ------- |
@@ -30,6 +31,7 @@ Every row is filled in from a suite that runs: 34 variants, two read paths (stre
 | Attachments                                          | Yes    | Yes        | Yes     | Yes     | Yes     |
 | Statistics                                           | Yes    | Yes        | Yes     | Yes     | Yes     |
 | Unknown-record skipping                              | Yes    | Yes        | Yes     | Yes     | Yes     |
+| Refusal diagnosis (named, not merely refused)        | Yes    | No         | No      | No      | No      |
 | Private-range records                                | Yes    | Yes        | Yes     | Yes     | Yes     |
 | Encode                                               | Yes    | Planned    | Yes     | Planned | Planned |
 | Chunked encode                                       | Yes    | Planned    | Yes     | Planned | Planned |
@@ -89,6 +91,18 @@ cells said `Planned` while the code was already written.
 value: each runner reads a chunk at every band cap and asserts the bytes transferred equal exactly
 what the chunk index declares for the bands at or below it. Never transferring a band you will not
 evaluate is the whole feature, and that is what is measured.
+
+**Refusal diagnosis** is a `Yes` only where a runner names _which_ rule a file broke, not merely
+that it refused one. The invalid corpus pairs each deliberately broken file with a refusal
+identifier, and a runner prints that identifier as its answer. The distinction is the whole row: a
+decoder that refuses every invalid file for the wrong reason is indistinguishable, to a suite that
+only checks that something was raised, from one that refuses correctly. The four `No` cells are the
+honest state — those SDKs refuse these files today, and nothing here proves they refuse them for the
+right reason.
+
+The row was also the first thing to find a gap in the reference: neither an unknown `temporal_model`
+nor an unknown quantization `scheme` was refused at all before it existed, despite the registry
+requiring both. Each decoded as though it carried the known value.
 
 **Truncated-file recovery** is the one row no expectation can carry, because a cut file is a
 different file. Each runner decodes its variant twice more — once cut before the trailing magic,
