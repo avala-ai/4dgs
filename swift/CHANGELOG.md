@@ -8,6 +8,11 @@ All notable changes to the Swift package are documented here, following
 
 ### Added
 
+- The encode surface: `SceneWriter.encode`, binding the core's `fourdgs_writer_*` C ABI through
+  `CoreSeam`, so the package authors files through the same core it decodes through. An
+  `encode_roundtrip` runner re-encodes each variant's gaussians for the cross-language encode gate,
+  which requires the Python decoder to read the binding's output the same as the Rust reference's.
+
 - The package is a real SPM package rather than a skeleton: `FourDGS` for visionOS, iOS and macOS,
   with the value types, errors and readers the spec's data model calls for.
 - `StreamedReader` and `IndexedReader`, the two read paths, with `ByteRangeReader` as the single

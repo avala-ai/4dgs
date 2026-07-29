@@ -8,6 +8,16 @@ The four packages version together.
 
 ## [Unreleased]
 
+### Added
+
+- `@4dgs/core`: `encodeScene`, a native TypeScript encoder — not a binding, a second
+  implementation, so a browser can author a `.4dgs`. It quantizes every attribute onto the grids the
+  reference does, partitions gaussians into the same deterministic chunk tree, and writes the index,
+  the summary and the CRC, including per-band spherical harmonic bit depths. `deflate` is reached
+  through `CompressionStream`, the mirror of the decoder's `DecompressionStream`, so the package
+  keeps no dependency and runs in a browser. The cross-language encode gate re-encodes every corpus
+  variant and requires the Python decoder to read the result the same as the Rust reference.
+
 ## [0.1.0] - 2026-07-29
 
 The first release of the TypeScript packages, and the first cut from a tag. The four packages
