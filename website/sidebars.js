@@ -49,6 +49,7 @@ const sidebars = {
   referenceSidebar: [
     { type: "doc", id: "reference/index", label: "Feature support matrix" },
     { type: "doc", id: "reference/conformance", label: "Conformance suite" },
+    { type: "doc", id: "reference/compression", label: "Compression — measured" },
   ],
 };
 
