@@ -105,7 +105,6 @@ jobs:
   cpp:
     runs-on: ubuntu-latest
     needs: corpus
-    if: false # enabled when the binding has a core behind it
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

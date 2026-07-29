@@ -5,8 +5,10 @@
 #define FOURDGS_SRC_BACKEND_HPP
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "fourdgs/model.hpp"
 #include "fourdgs/readable.hpp"
@@ -47,9 +49,9 @@ class StateHandle {
 
 /// Open, three ways. The `Readable` overload borrows the source: the caller keeps ownership
 /// and must outlive the handle.
-Result<void> openPath(Handle& handle, const std::string& path);
-Result<void> openMemory(Handle& handle, Span<const std::uint8_t> bytes);
-Result<void> openReadable(Handle& handle, Readable& source);
+Result<void> openPath(Handle& handle, const std::string& path, int mode);
+Result<void> openMemory(Handle& handle, Span<const std::uint8_t> bytes, int mode);
+Result<void> openReadable(Handle& handle, Readable& source, int mode);
 
 /// Header fields, none of which can fail once a scene is open.
 double durationSec(const Handle& handle);
@@ -57,11 +59,18 @@ double cutoff(const Handle& handle);
 std::uint64_t gaussianCount(const Handle& handle);
 int shDegree(const Handle& handle);
 bool isIndexed(const Handle& handle);
+bool truncated(const Handle& handle);
+std::string temporalModel(const Handle& handle);
+std::string profile(const Handle& handle);
+std::string library(const Handle& handle);
+std::map<std::string, std::string> attributes(const Handle& handle);
 
 /// The chunk index.
 std::uint32_t chunkCount(const Handle& handle);
 Result<void> chunkInterval(const Handle& handle, std::uint32_t index, double* t0, double* t1);
 std::uint64_t bytesForTime(const Handle& handle, double t, int maxShBand);
+std::uint64_t bytesForChunk(const Handle& handle, std::uint32_t index, int maxShBand);
+Result<void> loadChunk(Handle& handle, std::uint32_t index, int maxShBand);
 
 /// Audio. Absence is a value: `hasAudio` false, an empty codec, a zero size.
 bool hasAudio(const Handle& handle);
@@ -80,6 +89,18 @@ std::size_t stateCount(const StateHandle& state);
 Span<const std::uint32_t> stateIndices(const StateHandle& state);
 Span<const float> stateCenters(const StateHandle& state);
 Span<const float> stateOpacity(const StateHandle& state);
+
+/// The rest of the file. The record accessors may fetch on first use, which is why they
+/// take a mutable handle and return a `Result`.
+Result<void> loadRecords(Handle& handle);
+Result<std::vector<MetadataRecord>> metadata(Handle& handle);
+Result<std::vector<Attachment>> attachments(Handle& handle);
+bool hasCamera(const Handle& handle);
+Result<Camera> camera(Handle& handle);
+bool hasStatistics(const Handle& handle);
+Result<Statistics> statistics(const Handle& handle);
+std::vector<SummaryOffset> summaryOffsets(const Handle& handle);
+int summaryCrcState(const Handle& handle);
 
 /// Release. Both are safe on a handle that never opened, and on a null one.
 void closeScene(Handle& handle) noexcept;

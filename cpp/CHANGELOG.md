@@ -22,8 +22,7 @@ All notable changes to the C++ package are documented here, following
 
 ### Notes
 
-The binding decodes: over the conformance corpus it reproduces the reference implementation's
-canonical JSON exactly for every gaussian-derived value. It does not yet reproduce the summary's
-non-gaussian records, which the C ABI does not expose. Every C++ cell in the feature matrix stays
-`Planned` and the conformance job stays disabled until the suite passes. Nothing is released from
-this state.
+Conformance-verified: 63 checks over 32 variants on both read paths, the same numbers as the
+reference implementation, and the feature matrix records exactly what that proves. Nothing is
+released yet — the package has no version to release from, and the encode rows stay `Planned`
+because it decodes only at v1.

@@ -32,6 +32,8 @@ const char* toString(ErrorCode code) noexcept {
       return "kChecksumMismatch";
     case ErrorCode::kInternal:
       return "kInternal";
+    case ErrorCode::kUnsupportedMode:
+      return "kUnsupportedMode";
   }
   return "kInternal";
 }

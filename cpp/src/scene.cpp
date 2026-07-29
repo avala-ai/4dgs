@@ -29,23 +29,23 @@ Scene::Scene(std::unique_ptr<detail::Handle> handle) : handle_(std::move(handle)
 
 Scene::~Scene() = default;
 
-Result<std::unique_ptr<Scene>> Scene::openPath(const std::string& path) {
+Result<std::unique_ptr<Scene>> Scene::openPath(const std::string& path, ReadMode mode) {
   auto handle = std::unique_ptr<detail::Handle>(new detail::Handle());
-  Result<void> opened = detail::openPath(*handle, path);
+  Result<void> opened = detail::openPath(*handle, path, static_cast<int>(mode));
   if (!opened) return opened.error();
   return std::unique_ptr<Scene>(new Scene(std::move(handle)));
 }
 
-Result<std::unique_ptr<Scene>> Scene::openMemory(Span<const std::uint8_t> bytes) {
+Result<std::unique_ptr<Scene>> Scene::openMemory(Span<const std::uint8_t> bytes, ReadMode mode) {
   auto handle = std::unique_ptr<detail::Handle>(new detail::Handle());
-  Result<void> opened = detail::openMemory(*handle, bytes);
+  Result<void> opened = detail::openMemory(*handle, bytes, static_cast<int>(mode));
   if (!opened) return opened.error();
   return std::unique_ptr<Scene>(new Scene(std::move(handle)));
 }
 
-Result<std::unique_ptr<Scene>> Scene::open(Readable& source) {
+Result<std::unique_ptr<Scene>> Scene::open(Readable& source, ReadMode mode) {
   auto handle = std::unique_ptr<detail::Handle>(new detail::Handle());
-  Result<void> opened = detail::openReadable(*handle, source);
+  Result<void> opened = detail::openReadable(*handle, source, static_cast<int>(mode));
   if (!opened) return opened.error();
   return std::unique_ptr<Scene>(new Scene(std::move(handle)));
 }
@@ -60,6 +60,18 @@ int Scene::shDegree() const { return detail::shDegree(*handle_); }
 
 bool Scene::isIndexed() const { return detail::isIndexed(*handle_); }
 
+bool Scene::truncated() const { return detail::truncated(*handle_); }
+
+std::string Scene::temporalModel() const { return detail::temporalModel(*handle_); }
+
+std::string Scene::profile() const { return detail::profile(*handle_); }
+
+std::string Scene::library() const { return detail::library(*handle_); }
+
+std::map<std::string, std::string> Scene::attributes() const {
+  return detail::attributes(*handle_);
+}
+
 std::uint32_t Scene::chunkCount() const { return detail::chunkCount(*handle_); }
 
 Result<std::pair<double, double>> Scene::chunkInterval(std::uint32_t index) const {
@@ -72,6 +84,43 @@ Result<std::pair<double, double>> Scene::chunkInterval(std::uint32_t index) cons
 
 std::uint64_t Scene::bytesForTime(double t, int maxShBand) const {
   return detail::bytesForTime(*handle_, t, maxShBand);
+}
+
+std::uint64_t Scene::bytesForChunk(std::uint32_t index, int maxShBand) const {
+  return detail::bytesForChunk(*handle_, index, maxShBand);
+}
+
+Result<void> Scene::loadChunk(std::uint32_t index, int maxShBand) {
+  return detail::loadChunk(*handle_, index, maxShBand);
+}
+
+Result<void> Scene::loadRecords() { return detail::loadRecords(*handle_); }
+
+Result<std::vector<MetadataRecord>> Scene::metadata() { return detail::metadata(*handle_); }
+
+Result<std::vector<Attachment>> Scene::attachments() { return detail::attachments(*handle_); }
+
+bool Scene::hasCamera() const { return detail::hasCamera(*handle_); }
+
+Result<Camera> Scene::camera() { return detail::camera(*handle_); }
+
+bool Scene::hasStatistics() const { return detail::hasStatistics(*handle_); }
+
+Result<Statistics> Scene::statistics() const { return detail::statistics(*handle_); }
+
+std::vector<SummaryOffset> Scene::summaryOffsets() const {
+  return detail::summaryOffsets(*handle_);
+}
+
+Scene::CrcState Scene::summaryCrcState() const {
+  switch (detail::summaryCrcState(*handle_)) {
+    case 0:
+      return CrcState::kFailed;
+    case 1:
+      return CrcState::kVerified;
+    default:
+      return CrcState::kNotChecked;
+  }
 }
 
 bool Scene::hasAudio() const { return detail::hasAudio(*handle_); }

@@ -28,21 +28,30 @@ Handle::~Handle() { closeScene(*this); }
 
 StateHandle::~StateHandle() { closeState(*this); }
 
-Result<void> openPath(Handle&, const std::string&) { return notImplemented(); }
-Result<void> openMemory(Handle&, Span<const std::uint8_t>) { return notImplemented(); }
-Result<void> openReadable(Handle&, Readable&) { return notImplemented(); }
+Result<void> openPath(Handle&, const std::string&, int) { return notImplemented(); }
+Result<void> openMemory(Handle&, Span<const std::uint8_t>, int) { return notImplemented(); }
+Result<void> openReadable(Handle&, Readable&, int) { return notImplemented(); }
 
 double durationSec(const Handle&) { return 0.0; }
 double cutoff(const Handle&) { return 0.0; }
 std::uint64_t gaussianCount(const Handle&) { return 0; }
 int shDegree(const Handle&) { return 0; }
 bool isIndexed(const Handle&) { return false; }
+bool truncated(const Handle&) { return false; }
+std::string temporalModel(const Handle&) { return std::string(); }
+std::string profile(const Handle&) { return std::string(); }
+std::string library(const Handle&) { return std::string(); }
+std::map<std::string, std::string> attributes(const Handle&) {
+  return std::map<std::string, std::string>();
+}
 
 std::uint32_t chunkCount(const Handle&) { return 0; }
 Result<void> chunkInterval(const Handle&, std::uint32_t, double*, double*) {
   return notImplemented();
 }
 std::uint64_t bytesForTime(const Handle&, double, int) { return 0; }
+std::uint64_t bytesForChunk(const Handle&, std::uint32_t, int) { return 0; }
+Result<void> loadChunk(Handle&, std::uint32_t, int) { return notImplemented(); }
 
 bool hasAudio(const Handle&) { return false; }
 std::string audioCodec(Handle&) { return std::string(); }
@@ -58,6 +67,16 @@ std::size_t stateCount(const StateHandle&) { return 0; }
 Span<const std::uint32_t> stateIndices(const StateHandle&) { return Span<const std::uint32_t>(); }
 Span<const float> stateCenters(const StateHandle&) { return Span<const float>(); }
 Span<const float> stateOpacity(const StateHandle&) { return Span<const float>(); }
+
+Result<void> loadRecords(Handle&) { return notImplemented(); }
+Result<std::vector<MetadataRecord>> metadata(Handle&) { return notImplemented(); }
+Result<std::vector<Attachment>> attachments(Handle&) { return notImplemented(); }
+bool hasCamera(const Handle&) { return false; }
+Result<Camera> camera(Handle&) { return notImplemented(); }
+bool hasStatistics(const Handle&) { return false; }
+Result<Statistics> statistics(const Handle&) { return notImplemented(); }
+std::vector<SummaryOffset> summaryOffsets(const Handle&) { return std::vector<SummaryOffset>(); }
+int summaryCrcState(const Handle&) { return -1; }
 
 void closeScene(Handle& handle) noexcept { handle.scene = nullptr; }
 void closeState(StateHandle& state) noexcept { state.state = nullptr; }

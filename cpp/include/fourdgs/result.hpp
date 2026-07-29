@@ -31,6 +31,10 @@ enum class ErrorCode : std::int32_t {
   kUnsupported = 8,  ///< Legal but unimplemented here: an unknown codec, a future feature.
   kChecksumMismatch = 9,
   kInternal = 10,
+  /// A legal request on the wrong read path — one chunk by index from a sequential reader.
+  /// Neither the file nor the call is wrong, so a caller that meets this skips rather than
+  /// fails.
+  kUnsupportedMode = 11,
 };
 
 const char* toString(ErrorCode code) noexcept;

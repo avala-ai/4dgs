@@ -49,11 +49,9 @@ are what somebody gets.
 
 ## Status
 
-Decoding works: across the conformance corpus the binding reproduces the reference implementation's
-canonical JSON exactly for every gaussian-derived value — the sample, the aggregates, the spherical
-harmonic digest, the chunk intervals, the audio digest. It does not yet reproduce the summary's
-non-gaussian records — `temporalModel`, header attributes, metadata, attachments, camera,
-statistics, summary offsets and the summary CRC — because the C ABI does not expose them yet. Until
-it does, no C++ cell in the [feature matrix](../website/docs/reference/index.md) moves off `Planned`
-and the `conformance-cpp` job stays disabled: the suite is what promotes a cell, and it has not
-passed.
+Conformance-verified: **63 checks over 32 variants on both read paths, the same numbers as the
+reference implementation**, with the read path forced at open rather than left to the opener, so the
+streamed and indexed rows rest on two paths and not one. The
+[feature matrix](../website/docs/reference/index.md) records exactly what that proves; degree-3
+spherical harmonics stay `Planned` because the corpus carries no degree-3 variant, and the encode
+rows stay `Planned` because this package decodes only at v1.

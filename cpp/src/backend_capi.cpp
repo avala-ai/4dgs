@@ -47,6 +47,8 @@ ErrorCode translate(int status) {
       return ErrorCode::kIo;
     case FOURDGS_STATUS_OUT_OF_RANGE:
       return ErrorCode::kInvalidArgument;
+    case FOURDGS_STATUS_UNSUPPORTED_MODE:
+      return ErrorCode::kUnsupportedMode;
     case FOURDGS_STATUS_INTERNAL:
     default:
       return ErrorCode::kInternal;
@@ -111,6 +113,15 @@ int bridgeRead(void* ctx, std::uint64_t offset, std::uint64_t length, std::uint8
 
 void bridgeRelease(void* ctx) { delete static_cast<ReadableBridge*>(ctx); }
 
+/// A borrowed (pointer, length) string from the ABI, copied.
+///
+/// Not NUL-terminated and valid only until the scene is freed, so it is copied here rather
+/// than held — the same rule as the error message.
+std::string borrowedString(int status, const char* data, std::size_t length) {
+  if (status != FOURDGS_STATUS_OK || data == nullptr || length == 0) return std::string();
+  return std::string(data, length);
+}
+
 template <typename T>
 Span<const T> spanOf(const T* data, std::size_t count) {
   if (data == nullptr || count == 0) return Span<const T>();
@@ -123,23 +134,23 @@ Handle::~Handle() { closeScene(*this); }
 
 StateHandle::~StateHandle() { closeState(*this); }
 
-Result<void> openPath(Handle& handle, const std::string& path) {
+Result<void> openPath(Handle& handle, const std::string& path, int mode) {
   fourdgs_scene* scene = nullptr;
-  const int status = fourdgs_open_path(path.c_str(), &scene);
+  const int status = fourdgs_open_path_ex(path.c_str(), mode, &scene);
   if (status != FOURDGS_STATUS_OK) return failure(status);
   handle.scene = scene;
   return Result<void>();
 }
 
-Result<void> openMemory(Handle& handle, Span<const std::uint8_t> bytes) {
+Result<void> openMemory(Handle& handle, Span<const std::uint8_t> bytes, int mode) {
   fourdgs_scene* scene = nullptr;
-  const int status = fourdgs_open_memory(bytes.data(), bytes.size(), &scene);
+  const int status = fourdgs_open_memory_ex(bytes.data(), bytes.size(), mode, &scene);
   if (status != FOURDGS_STATUS_OK) return failure(status);
   handle.scene = scene;
   return Result<void>();
 }
 
-Result<void> openReadable(Handle& handle, Readable& source) {
+Result<void> openReadable(Handle& handle, Readable& source, int mode) {
   ReadableBridge* bridge = new (std::nothrow) ReadableBridge();
   if (bridge == nullptr) return Error(ErrorCode::kInternal, "out of memory opening a scene");
   bridge->source = &source;
@@ -153,7 +164,7 @@ Result<void> openReadable(Handle& handle, Readable& source) {
   reader.release = &bridgeRelease;
 
   fourdgs_scene* scene = nullptr;
-  const int status = fourdgs_open_reader(reader, &scene);
+  const int status = fourdgs_open_reader_ex(reader, mode, &scene);
   if (status != FOURDGS_STATUS_OK) return failure(status);
   handle.scene = scene;
   return Result<void>();
@@ -259,6 +270,192 @@ Span<const float> stateCenters(const StateHandle& state) {
 
 Span<const float> stateOpacity(const StateHandle& state) {
   return spanOf(fourdgs_state_opacity(asState(state)), stateCount(state));
+}
+
+bool truncated(const Handle& handle) { return fourdgs_scene_truncated(asScene(handle)) != 0; }
+
+std::string temporalModel(const Handle& handle) {
+  const char* data = nullptr;
+  std::size_t length = 0;
+  // Sequenced deliberately: passing the call and its out parameters as three arguments of
+  // one expression reads `data` and `length` before the call has filled them, because the
+  // order of argument evaluation is unspecified. It compiles, and it returns empty.
+  const int status = fourdgs_scene_temporal_model(asScene(handle), &data, &length);
+  return borrowedString(status, data, length);
+}
+
+std::string profile(const Handle& handle) {
+  const char* data = nullptr;
+  std::size_t length = 0;
+  // Sequenced deliberately: passing the call and its out parameters as three arguments of
+  // one expression reads `data` and `length` before the call has filled them, because the
+  // order of argument evaluation is unspecified. It compiles, and it returns empty.
+  const int status = fourdgs_scene_profile(asScene(handle), &data, &length);
+  return borrowedString(status, data, length);
+}
+
+std::string library(const Handle& handle) {
+  const char* data = nullptr;
+  std::size_t length = 0;
+  // Sequenced deliberately: passing the call and its out parameters as three arguments of
+  // one expression reads `data` and `length` before the call has filled them, because the
+  // order of argument evaluation is unspecified. It compiles, and it returns empty.
+  const int status = fourdgs_scene_library(asScene(handle), &data, &length);
+  return borrowedString(status, data, length);
+}
+
+std::map<std::string, std::string> attributes(const Handle& handle) {
+  std::map<std::string, std::string> out;
+  const std::uint32_t count = fourdgs_scene_attribute_count(asScene(handle));
+  for (std::uint32_t i = 0; i < count; ++i) {
+    const char* key = nullptr;
+    const char* value = nullptr;
+    std::size_t keyLength = 0;
+    std::size_t valueLength = 0;
+    const int status =
+        fourdgs_scene_attribute_at(asScene(handle), i, &key, &keyLength, &value, &valueLength);
+    if (status != FOURDGS_STATUS_OK) continue;
+    out.emplace(borrowedString(status, key, keyLength), borrowedString(status, value, valueLength));
+  }
+  return out;
+}
+
+std::uint64_t bytesForChunk(const Handle& handle, std::uint32_t index, int maxShBand) {
+  return fourdgs_scene_bytes_for_chunk(asScene(handle), index,
+                                       static_cast<std::uint8_t>(maxShBand));
+}
+
+Result<void> loadChunk(Handle& handle, std::uint32_t index, int maxShBand) {
+  return check(
+      fourdgs_scene_load_chunk(asScene(handle.scene), index, static_cast<std::uint8_t>(maxShBand)));
+}
+
+Result<void> loadRecords(Handle& handle) {
+  return check(fourdgs_scene_load_records(asScene(handle.scene)));
+}
+
+Result<std::vector<MetadataRecord>> metadata(Handle& handle) {
+  Result<void> ready = loadRecords(handle);
+  if (!ready) return ready.error();
+
+  std::vector<MetadataRecord> out;
+  fourdgs_scene* scene = asScene(handle.scene);
+  const std::uint32_t count = fourdgs_scene_metadata_count(scene);
+  for (std::uint32_t i = 0; i < count; ++i) {
+    MetadataRecord record;
+    const char* name = nullptr;
+    std::size_t nameLength = 0;
+    const int named = fourdgs_scene_metadata_name(scene, i, &name, &nameLength);
+    if (named != FOURDGS_STATUS_OK) return failure(named).error();
+    record.name = borrowedString(named, name, nameLength);
+
+    const std::uint32_t entries = fourdgs_scene_metadata_entry_count(scene, i);
+    for (std::uint32_t j = 0; j < entries; ++j) {
+      const char* key = nullptr;
+      const char* value = nullptr;
+      std::size_t keyLength = 0;
+      std::size_t valueLength = 0;
+      const int status =
+          fourdgs_scene_metadata_entry_at(scene, i, j, &key, &keyLength, &value, &valueLength);
+      if (status != FOURDGS_STATUS_OK) return failure(status).error();
+      record.entries.emplace(borrowedString(status, key, keyLength),
+                             borrowedString(status, value, valueLength));
+    }
+    out.push_back(std::move(record));
+  }
+  return out;
+}
+
+Result<std::vector<Attachment>> attachments(Handle& handle) {
+  Result<void> ready = loadRecords(handle);
+  if (!ready) return ready.error();
+
+  std::vector<Attachment> out;
+  fourdgs_scene* scene = asScene(handle.scene);
+  const std::uint32_t count = fourdgs_scene_attachment_count(scene);
+  for (std::uint32_t i = 0; i < count; ++i) {
+    Attachment attachment;
+    const char* name = nullptr;
+    std::size_t nameLength = 0;
+    const int named = fourdgs_scene_attachment_name(scene, i, &name, &nameLength);
+    if (named != FOURDGS_STATUS_OK) return failure(named).error();
+    attachment.name = borrowedString(named, name, nameLength);
+
+    const char* mediaType = nullptr;
+    std::size_t mediaTypeLength = 0;
+    const int typed = fourdgs_scene_attachment_media_type(scene, i, &mediaType, &mediaTypeLength);
+    if (typed != FOURDGS_STATUS_OK) return failure(typed).error();
+    attachment.mediaType = borrowedString(typed, mediaType, mediaTypeLength);
+
+    // The bytes, not just their length: a summary that reported the length and discarded
+    // the payload would be indistinguishable from one that never read it.
+    const std::uint64_t size = fourdgs_scene_attachment_size(scene, i);
+    attachment.data.resize(static_cast<std::size_t>(size));
+    if (size != 0) {
+      const int read = fourdgs_scene_attachment_read(scene, i, 0, size, attachment.data.data());
+      if (read != FOURDGS_STATUS_OK) return failure(read).error();
+    }
+    out.push_back(std::move(attachment));
+  }
+  return out;
+}
+
+bool hasCamera(const Handle& handle) { return fourdgs_scene_has_camera(asScene(handle)) != 0; }
+
+Result<Camera> camera(Handle& handle) {
+  fourdgs_scene* scene = asScene(handle.scene);
+  fourdgs_camera raw;
+  const int status = fourdgs_scene_camera(scene, &raw);
+  if (status != FOURDGS_STATUS_OK) return failure(status).error();
+
+  Camera out;
+  out.fovYDeg = raw.fov_y_deg;
+  for (std::size_t k = 0; k < 3; ++k) {
+    out.position[k] = raw.position[k];
+    out.target[k] = raw.target[k];
+  }
+  out.loop = raw.loop_enabled != 0;
+  out.interpolation =
+      borrowedString(FOURDGS_STATUS_OK, raw.interpolation, raw.interpolation_length);
+
+  for (std::uint32_t i = 0; i < raw.keyframe_count; ++i) {
+    Camera::Keyframe frame;
+    const int read =
+        fourdgs_scene_camera_keyframe(scene, i, &frame.time, frame.position, frame.target);
+    if (read != FOURDGS_STATUS_OK) return failure(read).error();
+    out.keyframes.push_back(frame);
+  }
+  return out;
+}
+
+bool hasStatistics(const Handle& handle) {
+  return fourdgs_scene_has_statistics(asScene(handle)) != 0;
+}
+
+Result<Statistics> statistics(const Handle& handle) {
+  Statistics out;
+  const int status = fourdgs_scene_statistics(asScene(handle), &out.gaussianCount, &out.chunkCount,
+                                              &out.durationSec, out.aabb);
+  if (status != FOURDGS_STATUS_OK) return failure(status).error();
+  return out;
+}
+
+std::vector<SummaryOffset> summaryOffsets(const Handle& handle) {
+  std::vector<SummaryOffset> out;
+  const std::uint32_t count = fourdgs_scene_summary_offset_count(asScene(handle));
+  for (std::uint32_t i = 0; i < count; ++i) {
+    SummaryOffset offset;
+    if (fourdgs_scene_summary_offset_at(asScene(handle), i, &offset.groupOpcode, &offset.groupStart,
+                                        &offset.groupLength) != FOURDGS_STATUS_OK) {
+      continue;
+    }
+    out.push_back(offset);
+  }
+  return out;
+}
+
+int summaryCrcState(const Handle& handle) {
+  return fourdgs_scene_summary_crc_state(asScene(handle));
 }
 
 void closeScene(Handle& handle) noexcept {

@@ -3,16 +3,10 @@
 
 /// Conformance runner: indexed decode.
 ///
-/// Reads the footer, then the index, then the byte ranges the index names — the path a
-/// seeking client takes — and produces the same canonical JSON the streamed runner does.
-/// Agreeing with itself across two different read paths is most of what makes an indexed
-/// implementation trustworthy.
-///
-/// The summary is taken from a whole-scene load rather than by concatenating a seek to every
-/// chunk. Chunk intervals overlap by design — a scene is chunked at several temporal
-/// resolutions, so `[0, 2)`, `[0, 1)` and `[0, 0.5)` all exist and all contain `t = 0` — and
-/// a runner that summed a seek per entry would count the same gaussians repeatedly and report
-/// a scene the file does not describe. The seek path is exercised on its own terms below.
+/// The footer, then the index, then only the byte ranges the index names — the path a
+/// seeking client takes, forced rather than left to the opener, and producing the same
+/// canonical JSON the streamed runner does. Agreeing with itself across two different read
+/// paths is most of what makes an indexed implementation trustworthy.
 
 #include <cstdio>
 #include <memory>
@@ -22,11 +16,13 @@
 
 #include "canonical.hpp"
 #include "fourdgs/fourdgs.hpp"
+#include "scene_summary.hpp"
 
 namespace {
 
 using fourdgs::Error;
 using fourdgs::ErrorCode;
+using fourdgs::ReadMode;
 using fourdgs::Result;
 using fourdgs::Scene;
 
@@ -35,23 +31,20 @@ int fail(const std::string& message) {
   return 1;
 }
 
-/// A seek transfers exactly what the index says it will, and a band cap removes bytes from
-/// the wire rather than values after they arrive.
+/// A chunk read costs exactly what the index says, and a band cap removes bytes from the
+/// wire rather than values after they arrive.
 ///
-/// Counted at the transport, because that is the claim. Each measurement gets its own scene:
-/// a decoder that has already fetched a range does not fetch it twice, which is correct
-/// behaviour and would otherwise be indistinguishable from never fetching it at all.
-Result<void> checkSeekCost(const std::string& path, Scene& scene) {
-  const std::uint32_t chunks = scene.chunkCount();
-  // Every cap is worth measuring only where the bands exist to skip; without spherical
-  // harmonics all four caps describe the same bytes.
+/// Counted at the transport, because that is the claim: not that the coefficients are
+/// dropped after arriving, but that their bytes were never asked for. One chunk at a time,
+/// because `loadAt` cannot isolate a chunk when intervals overlap — and each measurement
+/// gets its own scene, because a decoder that has already fetched a range does not fetch it
+/// twice, which is correct and would otherwise look identical to never fetching it.
+Result<void> checkChunkCost(const std::string& path, Scene& scene) {
+  // Every cap is worth measuring only where there are bands to skip; without spherical
+  // harmonics all four describe the same bytes.
   const int caps = scene.shDegree() > 0 ? 3 : 0;
 
-  for (std::uint32_t i = 0; i < chunks; ++i) {
-    Result<std::pair<double, double>> interval = scene.chunkInterval(i);
-    if (!interval) return interval.error();
-    const double t = interval->first;
-
+  for (std::uint32_t i = 0; i < scene.chunkCount(); ++i) {
     std::uint64_t previous = 0;
     for (int cap = 0; cap <= caps; ++cap) {
       Result<fourdgs::FileReadable*> file = fourdgs::FileReadable::open(path);
@@ -59,25 +52,29 @@ Result<void> checkSeekCost(const std::string& path, Scene& scene) {
       std::unique_ptr<fourdgs::FileReadable> raw(*file);
       fourdgs::CountingReadable counting(raw.get());
 
-      Result<std::unique_ptr<Scene>> fresh = Scene::open(counting);
+      Result<std::unique_ptr<Scene>> fresh = Scene::open(counting, ReadMode::kIndexed);
       if (!fresh) return fresh.error();
-      const std::uint64_t predicted = (*fresh)->bytesForTime(t, cap);
-      const std::uint64_t beforeLoad = counting.bytesRead();
-      Result<void> loaded = (*fresh)->loadAt(t, cap);
-      if (!loaded) return loaded.error();
-      const std::uint64_t moved = counting.bytesRead() - beforeLoad;
+      const std::uint64_t predicted = (*fresh)->bytesForChunk(i, cap);
+      const std::uint64_t before = counting.bytesRead();
+      Result<void> loaded = (*fresh)->loadChunk(i, cap);
+      if (!loaded) {
+        // A legal request on the wrong path is a skip, not a failure.
+        if (loaded.error().code == ErrorCode::kUnsupportedMode) return Result<void>();
+        return loaded.error();
+      }
+      const std::uint64_t moved = counting.bytesRead() - before;
 
       if (moved != predicted) {
         return Error(ErrorCode::kMalformed,
-                     "seeking to " + std::to_string(t) + " with maxShBand=" + std::to_string(cap) +
-                         " transferred " + std::to_string(moved) + " bytes, the index says " +
-                         std::to_string(predicted));
+                     "reading chunk " + std::to_string(i) + " with maxShBand=" +
+                         std::to_string(cap) + " transferred " + std::to_string(moved) +
+                         " bytes, the index says " + std::to_string(predicted));
       }
       if (predicted < previous) {
         return Error(ErrorCode::kMalformed,
-                     "raising the band cap to " + std::to_string(cap) + " at " + std::to_string(t) +
-                         " transferred fewer bytes, " + std::to_string(predicted) + " against " +
-                         std::to_string(previous));
+                     "raising the band cap to " + std::to_string(cap) + " on chunk " +
+                         std::to_string(i) + " transferred fewer bytes, " +
+                         std::to_string(predicted) + " against " + std::to_string(previous));
       }
       previous = predicted;
     }
@@ -99,46 +96,28 @@ int main(int argc, char** argv) {
   std::unique_ptr<fourdgs::FileReadable> raw(*file);
   fourdgs::CountingReadable source(raw.get());
 
-  Result<std::unique_ptr<Scene>> opened = Scene::open(source);
+  Result<std::unique_ptr<Scene>> opened = Scene::open(source, ReadMode::kIndexed);
   if (!opened) return fail(opened.error().toString());
   Scene& scene = **opened;
-  // A scene with no chunks has nothing to index, and a file written without an index cannot
-  // be read this way at all. The first is a legal file; the second the harness never hands
-  // to this runner.
-  if (!scene.isIndexed() && scene.chunkCount() > 0) {
-    return fail("the file has a chunk index, but it was not opened on the seeking path");
-  }
 
+  // The summary comes from a whole-scene load rather than from concatenating a seek per
+  // entry: chunk intervals overlap by design — a scene is chunked at several temporal
+  // resolutions, so [0, 2), [0, 1) and [0, 0.5) all contain t = 0 — and summing them would
+  // count the same gaussians repeatedly and report a scene the file does not describe. The
+  // seek path is exercised on its own terms in checkChunkCost.
   Result<void> loaded = scene.loadAll(3);
   if (!loaded) return fail(loaded.error().toString());
   const fourdgs::GaussianView gaussians = scene.gaussians();
 
-  Result<fourdgs::AudioTrack> audio = scene.readAudioTrack();
-  if (!audio) return fail(audio.error().toString());
+  fourdgs::conformance::SceneRecords records;
+  Result<void> collected = fourdgs::conformance::collectRecords(scene, &records);
+  if (!collected) return fail(collected.error().toString());
 
-  std::vector<std::pair<double, double>> intervals;
-  for (std::uint32_t i = 0; i < scene.chunkCount(); ++i) {
-    Result<std::pair<double, double>> interval = scene.chunkInterval(i);
-    if (!interval) return fail(interval.error().toString());
-    intervals.push_back(*interval);
-  }
+  Result<void> costs = checkChunkCost(path, scene);
+  if (!costs) return fail(costs.error().toString());
 
-  Result<void> seeks = checkSeekCost(path, scene);
-  if (!seeks) return fail(seeks.error().toString());
-
-  fourdgs::Header header;
-  header.durationSec = scene.durationSec();
-  header.cutoff = scene.cutoff();
-  header.gaussianCount = scene.gaussianCount();
-  header.shDegree = scene.shDegree();
-  header.hasAudio = scene.hasAudio();
-
-  fourdgs::conformance::SceneSummary summary;
-  summary.header = &header;
-  summary.gaussians = &gaussians;
-  summary.audio = scene.hasAudio() ? &*audio : nullptr;
-  summary.chunkIntervals = intervals;
-
-  std::printf("%s\n", fourdgs::conformance::canonical(summary).c_str());
+  std::printf(
+      "%s\n",
+      fourdgs::conformance::canonical(fourdgs::conformance::summaryOf(records, gaussians)).c_str());
   return 0;
 }

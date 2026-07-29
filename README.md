@@ -44,7 +44,7 @@ self-contained resource you can range-request and seek like a video.
 | Python     | [python/](python/)         | `fourdgs`    | Reference implementation                         |
 | TypeScript | [typescript/](typescript/) | `@4dgs/core` | Decoder, conformance-verified                    |
 | Rust       | [rust/](rust/)             | `fourdgs`    | Decoder, conformance-verified                    |
-| C++        | [cpp/](cpp/)               | —            | Binding over Rust; decoding, conformance pending |
+| C++        | [cpp/](cpp/)               | —            | Decoder over Rust's C ABI, conformance-verified  |
 | Swift      | [swift/](swift/)           | —            | Binding over Rust; decoding, conformance pending |
 
 Package names are `fourdgs` where a registry will not take `4dgs`; the format, the CLI and the file

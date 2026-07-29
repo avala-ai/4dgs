@@ -7,31 +7,31 @@ documented state — not a defect — and this table is the public contract that
 `supportsVariant()`, the harness runs exactly those, and this table is kept in lockstep with those
 declarations. Nothing is marked `Yes` on the strength of code existing.
 
-Python's row, TypeScript's and Rust's are filled in from a suite that runs: 32 variants, two read
-paths (streamed and indexed), 63 checks passing for each. The other languages have not been run
+Python's row, TypeScript's, Rust's and C++'s are filled in from a suite that runs: 32 variants, two
+read paths (streamed and indexed), 63 checks passing for each. The other languages have not been run
 against it yet.
 
 | Feature                                              | Python  | TypeScript | Rust    | C++     | Swift   |
 | ---------------------------------------------------- | ------- | ---------- | ------- | ------- | ------- |
-| Streaming decode                                     | Yes     | Yes        | Yes     | Planned | Planned |
-| Indexed / seeking decode                             | Yes     | Yes        | Yes     | Planned | Planned |
-| Range-request decode                                 | Yes     | Yes        | Yes     | Planned | Planned |
-| Truncated-file recovery                              | Yes     | Yes        | Yes     | Planned | Planned |
-| Chunk index                                          | Yes     | Yes        | Yes     | Planned | Planned |
-| Summary offsets                                      | Yes     | Yes        | Yes     | Planned | Planned |
-| CRC validation                                       | Yes     | Yes        | Yes     | Planned | Planned |
-| Quantized attributes                                 | Yes     | Yes        | Yes     | Planned | Planned |
-| Spherical harmonics, degree 1                        | Yes     | Yes        | Yes     | Planned | Planned |
-| Spherical harmonics, degree 2                        | Yes     | Yes        | Yes     | Planned | Planned |
+| Streaming decode                                     | Yes     | Yes        | Yes     | Yes     | Planned |
+| Indexed / seeking decode                             | Yes     | Yes        | Yes     | Yes     | Planned |
+| Range-request decode                                 | Yes     | Yes        | Yes     | Yes     | Planned |
+| Truncated-file recovery                              | Yes     | Yes        | Yes     | Yes     | Planned |
+| Chunk index                                          | Yes     | Yes        | Yes     | Yes     | Planned |
+| Summary offsets                                      | Yes     | Yes        | Yes     | Yes     | Planned |
+| CRC validation                                       | Yes     | Yes        | Yes     | Yes     | Planned |
+| Quantized attributes                                 | Yes     | Yes        | Yes     | Yes     | Planned |
+| Spherical harmonics, degree 1                        | Yes     | Yes        | Yes     | Yes     | Planned |
+| Spherical harmonics, degree 2                        | Yes     | Yes        | Yes     | Yes     | Planned |
 | Spherical harmonics, degree 3                        | Planned | Planned    | Planned | Planned | Planned |
-| SH band range-skipping                               | Yes     | Yes        | Yes     | Planned | Planned |
-| Embedded audio (optional, zero-overhead when absent) | Yes     | Yes        | Yes     | Planned | Planned |
-| Camera trajectory                                    | Yes     | Yes        | Yes     | Planned | Planned |
-| Metadata                                             | Yes     | Yes        | Yes     | Planned | Planned |
-| Attachments                                          | Yes     | Yes        | Yes     | Planned | Planned |
-| Statistics                                           | Yes     | Yes        | Yes     | Planned | Planned |
-| Unknown-record skipping                              | Yes     | Yes        | Yes     | Planned | Planned |
-| Private-range records                                | Yes     | Yes        | Yes     | Planned | Planned |
+| SH band range-skipping                               | Yes     | Yes        | Yes     | Yes     | Planned |
+| Embedded audio (optional, zero-overhead when absent) | Yes     | Yes        | Yes     | Yes     | Planned |
+| Camera trajectory                                    | Yes     | Yes        | Yes     | Yes     | Planned |
+| Metadata                                             | Yes     | Yes        | Yes     | Yes     | Planned |
+| Attachments                                          | Yes     | Yes        | Yes     | Yes     | Planned |
+| Statistics                                           | Yes     | Yes        | Yes     | Yes     | Planned |
+| Unknown-record skipping                              | Yes     | Yes        | Yes     | Yes     | Planned |
+| Private-range records                                | Yes     | Yes        | Yes     | Yes     | Planned |
 | Encode                                               | Yes     | Planned    | Yes     | Planned | Planned |
 | Chunked encode                                       | Yes     | Planned    | Yes     | Planned | Planned |
 | Summary writing                                      | Yes     | Planned    | Yes     | Planned | Planned |
