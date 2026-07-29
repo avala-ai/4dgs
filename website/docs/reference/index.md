@@ -115,8 +115,9 @@ mutate the shared corpus and share a seed scheme, so a crash found by one reprod
 from two integers; Rust's encodes its own seeds and additionally fuzzes the C ABI, where a panic
 crossing the boundary would be undefined behaviour rather than an error the caller can handle. C++
 and Swift are not fuzzed yet — they bind to the Rust core, so its fuzzing covers the decode but not
-their own bindings. See [the fuzzing
-notes](https://github.com/avala-ai/4dgs/blob/main/tests/fuzz/README.md) and `rust/fourdgs/tests/fuzz.rs`.
+their own bindings. See
+[the fuzzing notes](https://github.com/avala-ai/4dgs/blob/main/tests/fuzz/README.md) and
+`rust/fourdgs/tests/fuzz.rs`.
 
 **Convert from PLY frame sequences** and **Inspect and validate** are tools rather than wire-format
 features, so the conformance suite does not cover them; they are marked from their own tests, which
