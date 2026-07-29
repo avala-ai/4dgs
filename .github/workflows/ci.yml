@@ -375,31 +375,27 @@ jobs:
             -Xlinker -L$PWD/target/release canonical_selftest > /tmp/swift.json
           python3 swift/conformance/selftest.py --compare /tmp/swift.json
 
-      # End to end over the ABI, on a real file: the runner opens a generated corpus
-      # variant, decodes every gaussian through the core, and then refuses to emit a
-      # summary because the ABI cannot reach the non-gaussian records. Asserting *that*
-      # specific refusal is what distinguishes "the binding decodes" from "the binding
-      # failed somewhere earlier", which an exit code alone would not.
+      # End to end over the ABI, on a real file, by both read paths. The conformance
+      # workflow runs the full corpus; this is the fast check that the binding still
+      # decodes at all, so a break shows up in the job that owns the package.
       - name: Decode a real file through the C ABI
+        # bash for process substitution below; the container's default shell is sh.
+        shell: bash
         run: |
           python3 -m pip install --break-system-packages -e ./python/fourdgs >/dev/null
           python3 tests/conformance/generate.py >/dev/null
           swift build --package-path swift --configuration release -Xlinker -L$PWD/target/release
-          variant=$(ls tests/conformance/data/*.4dgs | head -1)
+          variant=$(ls tests/conformance/data/*UseChunkIndex*.4dgs | head -1)
           echo "decoding $variant"
-          set +e
-          LD_LIBRARY_PATH=$PWD/target/release ./swift/.build/release/decode_streamed "$variant" 2>/tmp/err.txt
-          code=$?
-          set -e
-          cat /tmp/err.txt
-          if [ "$code" -eq 0 ]; then
-            echo "::error::the runner cannot be complete yet; the ABI has no record accessors"
-            exit 1
-          fi
-          grep -q "decoded the gaussians but cannot emit a canonical summary" /tmp/err.txt || {
-            echo "::error::the runner failed before it got to the known gap"
-            exit 1
-          }
+          export LD_LIBRARY_PATH=$PWD/target/release
+          ./swift/.build/release/decode_streamed "$variant" > /tmp/streamed.json
+          ./swift/.build/release/decode_indexed "$variant" > /tmp/indexed.json
+          # The two paths must agree. As far as this suite is concerned they are separate
+          # decoders, and a difference between them is the bug the pair exists to find.
+          diff <(python3 -m json.tool --sort-keys /tmp/streamed.json) \
+               <(python3 -m json.tool --sort-keys /tmp/indexed.json) \
+            || { echo "::error::the streamed and indexed read paths disagree"; exit 1; }
+          echo "both read paths agree"
 
   swift-darwin:
     # visionOS and iOS are the platforms this package exists for, and a Linux build proves

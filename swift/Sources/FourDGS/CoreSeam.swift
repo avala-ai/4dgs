@@ -80,13 +80,33 @@ enum Core {
 
     // MARK: - Opening
 
+    /// Which read path the core should take.
+    ///
+    /// Not a performance knob. Streamed and indexed are two different consumers, and the
+    /// conformance suite runs a runner for each precisely so they can disagree — with one
+    /// auto-selecting open, both runners would exercise whichever path the core happened
+    /// to pick and a green suite would have tested one thing twice.
+    enum OpenMode {
+        case auto
+        case sequential
+        case indexed
+
+        var rawValue: Int32 {
+            switch self {
+            case .auto: return Int32(FOURDGS_OPEN_AUTO.rawValue)
+            case .sequential: return Int32(FOURDGS_OPEN_SEQUENTIAL.rawValue)
+            case .indexed: return Int32(FOURDGS_OPEN_INDEXED.rawValue)
+            }
+        }
+    }
+
     /// Open a scene over a Swift byte-range reader.
     ///
     /// The box is passed **retained**. The core takes ownership of it and calls `release`
     /// once, when the scene is freed; `release` balances that retain. There is no path
     /// where this leaks and none where it double-frees, which is the property that matters
     /// most here — a transport is the one object whose lifetime spans every later call.
-    static func open(_ reader: any ByteRangeReader) throws -> SceneHandle {
+    static func open(_ reader: any ByteRangeReader, mode: OpenMode = .auto) throws -> SceneHandle {
         let box = ReaderBox(reader)
         var descriptor = fourdgs_reader()
         descriptor.ctx = Unmanaged.passRetained(box).toOpaque()
@@ -95,7 +115,7 @@ enum Core {
         descriptor.release = readerRelease
 
         var scene: OpaquePointer?
-        let status = fourdgs_open_reader(descriptor, &scene)
+        let status = fourdgs_open_reader_ex(descriptor, mode.rawValue, &scene)
         guard status == ok, let scene else {
             // The core has already released the box on this path; nothing to undo.
             throw error(status)
@@ -105,19 +125,47 @@ enum Core {
 
     // MARK: - The scene's own statements
 
-    static func header(_ scene: SceneHandle) -> Header {
-        Header(
-            profile: "",
-            library: "",
+    static func header(_ scene: SceneHandle) throws -> Header {
+        var attributes: [String: String] = [:]
+        for i in 0..<fourdgs_scene_attribute_count(scene.raw) {
+            var key: UnsafePointer<CChar>?
+            var keyLength = 0
+            var value: UnsafePointer<CChar>?
+            var valueLength = 0
+            let status = fourdgs_scene_attribute_at(scene.raw, i, &key, &keyLength, &value, &valueLength)
+            guard status == ok else { throw error(status) }
+            attributes[string(key, keyLength)] = string(value, valueLength)
+        }
+        return Header(
+            profile: try borrowedString(scene, fourdgs_scene_profile),
+            library: try borrowedString(scene, fourdgs_scene_library),
             durationSec: fourdgs_scene_duration_sec(scene.raw),
             gaussianCount: fourdgs_scene_gaussian_count(scene.raw),
             cutoff: fourdgs_scene_cutoff(scene.raw),
-            temporalModel: "",
+            temporalModel: try borrowedString(scene, fourdgs_scene_temporal_model),
             aabb: [],
             shDegree: Int(fourdgs_scene_sh_degree(scene.raw)),
             hasAudio: fourdgs_scene_has_audio(scene.raw) != 0,
             hasCompressedChunks: false,
-            attributes: [:])
+            attributes: attributes)
+    }
+
+    /// Whether the file was cut short. The records that were read are still valid; this
+    /// says the file ended before the ones after them.
+    static func isTruncated(_ scene: SceneHandle) -> Bool {
+        fourdgs_scene_truncated(scene.raw) != 0
+    }
+
+    /// Whether the Footer's CRC over the summary region verified.
+    ///
+    /// Three states, not two: `nil` means nothing declared a CRC or nothing checked one,
+    /// which is a different claim from a check that ran and failed.
+    static func summaryChecksum(_ scene: SceneHandle) -> Bool? {
+        switch fourdgs_scene_summary_crc_state(scene.raw) {
+        case Int32(FOURDGS_CRC_VERIFIED.rawValue): return true
+        case Int32(FOURDGS_CRC_FAILED.rawValue): return false
+        default: return nil
+        }
     }
 
     /// Whether the core opened this file on the indexed path.
@@ -212,6 +260,163 @@ enum Core {
             winHi: floats(fourdgs_scene_win_hi(scene.raw), 1),
             shDegree: Int(fourdgs_scene_sh_degree(scene.raw)),
             sh: sh)
+    }
+
+    // MARK: - The records that are not gaussians
+
+    /// Read the metadata, attachment, camera, statistics and summary-offset records.
+    ///
+    /// A separate step because these live in the front matter and the tail, and a consumer
+    /// that only wants gaussians should not pay for them.
+    static func loadRecords(_ scene: SceneHandle) throws {
+        let status = fourdgs_scene_load_records(scene.raw)
+        guard status == ok else { throw error(status) }
+    }
+
+    static func metadata(_ scene: SceneHandle) throws -> [MetadataRecord] {
+        var records: [MetadataRecord] = []
+        for i in 0..<fourdgs_scene_metadata_count(scene.raw) {
+            var name: UnsafePointer<CChar>?
+            var nameLength = 0
+            var status = fourdgs_scene_metadata_name(scene.raw, i, &name, &nameLength)
+            guard status == ok else { throw error(status) }
+            var entries: [String: String] = [:]
+            for j in 0..<fourdgs_scene_metadata_entry_count(scene.raw, i) {
+                var key: UnsafePointer<CChar>?
+                var keyLength = 0
+                var value: UnsafePointer<CChar>?
+                var valueLength = 0
+                status = fourdgs_scene_metadata_entry_at(
+                    scene.raw, i, j, &key, &keyLength, &value, &valueLength)
+                guard status == ok else { throw error(status) }
+                entries[string(key, keyLength)] = string(value, valueLength)
+            }
+            records.append(MetadataRecord(name: string(name, nameLength), entries: entries))
+        }
+        return records
+    }
+
+    static func attachments(_ scene: SceneHandle) throws -> [Attachment] {
+        var attachments: [Attachment] = []
+        for i in 0..<fourdgs_scene_attachment_count(scene.raw) {
+            var name: UnsafePointer<CChar>?
+            var nameLength = 0
+            var mediaType: UnsafePointer<CChar>?
+            var mediaTypeLength = 0
+            var status = fourdgs_scene_attachment_name(scene.raw, i, &name, &nameLength)
+            guard status == ok else { throw error(status) }
+            status = fourdgs_scene_attachment_media_type(scene.raw, i, &mediaType, &mediaTypeLength)
+            guard status == ok else { throw error(status) }
+
+            let size = fourdgs_scene_attachment_size(scene.raw, i)
+            var data = [UInt8](repeating: 0, count: Int(size))
+            if size > 0 {
+                status = data.withUnsafeMutableBufferPointer { buffer in
+                    fourdgs_scene_attachment_read(scene.raw, i, 0, size, buffer.baseAddress)
+                }
+                guard status == ok else { throw error(status) }
+            }
+            attachments.append(
+                Attachment(
+                    name: string(name, nameLength), mediaType: string(mediaType, mediaTypeLength),
+                    data: data))
+        }
+        return attachments
+    }
+
+    static func camera(_ scene: SceneHandle) throws -> Camera? {
+        guard fourdgs_scene_has_camera(scene.raw) != 0 else { return nil }
+        var raw = fourdgs_camera()
+        let status = fourdgs_scene_camera(scene.raw, &raw)
+        guard status == ok else { throw error(status) }
+
+        var keyframes: [Camera.Keyframe] = []
+        keyframes.reserveCapacity(Int(raw.keyframe_count))
+        for i in 0..<raw.keyframe_count {
+            var time = 0.0
+            var position = [Double](repeating: 0, count: 3)
+            var target = [Double](repeating: 0, count: 3)
+            let status = position.withUnsafeMutableBufferPointer { p in
+                target.withUnsafeMutableBufferPointer { t in
+                    fourdgs_scene_camera_keyframe(scene.raw, i, &time, p.baseAddress, t.baseAddress)
+                }
+            }
+            guard status == ok else { throw error(status) }
+            keyframes.append(Camera.Keyframe(time: time, position: position, target: target))
+        }
+        return Camera(
+            fovYDeg: raw.fov_y_deg,
+            position: [raw.position.0, raw.position.1, raw.position.2],
+            target: [raw.target.0, raw.target.1, raw.target.2],
+            keyframes: keyframes,
+            interpolation: string(raw.interpolation, raw.interpolation_length),
+            loop: raw.loop_enabled != 0)
+    }
+
+    static func statistics(_ scene: SceneHandle) throws -> Statistics? {
+        guard fourdgs_scene_has_statistics(scene.raw) != 0 else { return nil }
+        var gaussianCount: UInt64 = 0
+        var chunkCount: UInt32 = 0
+        var durationSec = 0.0
+        var aabb = [Double](repeating: 0, count: 6)
+        let status = aabb.withUnsafeMutableBufferPointer { box in
+            fourdgs_scene_statistics(scene.raw, &gaussianCount, &chunkCount, &durationSec, box.baseAddress)
+        }
+        guard status == ok else { throw error(status) }
+        return Statistics(
+            gaussianCount: gaussianCount, chunkCount: chunkCount, durationSec: durationSec, aabb: aabb)
+    }
+
+    static func summaryOffsets(_ scene: SceneHandle) throws -> [SummaryOffset] {
+        var offsets: [SummaryOffset] = []
+        for i in 0..<fourdgs_scene_summary_offset_count(scene.raw) {
+            var opcode: UInt8 = 0
+            var start: UInt64 = 0
+            var length: UInt64 = 0
+            let status = fourdgs_scene_summary_offset_at(scene.raw, i, &opcode, &start, &length)
+            guard status == ok else { throw error(status) }
+            offsets.append(SummaryOffset(groupOpcode: opcode, groupStart: start, groupLength: length))
+        }
+        return offsets
+    }
+
+    /// Decode one chunk by index, transferring only its bytes — and, under a band cap,
+    /// only the bands at or below it.
+    static func loadChunk(_ scene: SceneHandle, _ i: UInt32, bandCap: Int?) throws -> GaussianState {
+        let status = fourdgs_scene_load_chunk(scene.raw, i, bandCapByte(bandCap))
+        guard status == ok else { throw error(status) }
+        return resident(scene)
+    }
+
+    /// What reading chunk `i` would transfer at this band cap.
+    static func bytesForChunk(_ scene: SceneHandle, _ i: UInt32, bandCap: Int?) -> UInt64 {
+        fourdgs_scene_bytes_for_chunk(scene.raw, i, bandCapByte(bandCap))
+    }
+
+    // MARK: - Strings
+
+    /// A string the core lends us, copied into Swift storage before the call returns.
+    ///
+    /// Length-delimited rather than NUL-terminated, because the format's own `string` type
+    /// is length-prefixed and may legally contain a NUL: reading to the first zero byte
+    /// would silently truncate a legal value.
+    static func string(_ pointer: UnsafePointer<CChar>?, _ length: Int) -> String {
+        guard let pointer, length > 0 else { return "" }
+        return pointer.withMemoryRebound(to: UInt8.self, capacity: length) { bytes in
+            String(decoding: UnsafeBufferPointer(start: bytes, count: length), as: UTF8.self)
+        }
+    }
+
+    private static func borrowedString(
+        _ scene: SceneHandle,
+        _ accessor: (OpaquePointer?, UnsafeMutablePointer<UnsafePointer<CChar>?>?, UnsafeMutablePointer<Int>?)
+            -> Int32
+    ) throws -> String {
+        var pointer: UnsafePointer<CChar>?
+        var length = 0
+        let status = accessor(scene.raw, &pointer, &length)
+        guard status == ok else { throw error(status) }
+        return string(pointer, length)
     }
 
     // MARK: - Errors

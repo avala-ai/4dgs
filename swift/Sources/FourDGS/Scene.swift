@@ -6,11 +6,9 @@
 /// A `Scene` is a value, so holding one costs nothing and keeps nothing open. The reader it
 /// came from owns the file.
 ///
-/// **Not every field is populated yet.** The C ABI reaches the Header's numbers, the audio
-/// track and the chunk intervals; it has no accessor for the metadata, attachment, camera,
-/// statistics or summary-offset records, so those stay empty here — not because the file
-/// lacks them, but because this binding cannot yet ask. ``recordsAvailable`` says which of
-/// the two it is, so nothing downstream mistakes "not readable yet" for "not present".
+/// Every field is read from the file. An empty `metadata` means the file carries none —
+/// ``recordsAvailable`` is the flag that used to distinguish that from "this build cannot
+/// ask", and it is now always `true` for a scene this package opened.
 public struct Scene: Sendable, Equatable {
     public var header: Header
     /// `nil` when the scene has no audio, which is the common case and not an error. The
@@ -26,22 +24,25 @@ public struct Scene: Sendable, Equatable {
     public var chunkIntervals: [ClosedRange<Double>]
     /// Whether the core opened this file on the indexed path.
     public var isIndexed: Bool
+    /// Whether the file was cut short. What was read before the cut is still valid; this
+    /// says the file ended before the rest of it.
+    public var isTruncated: Bool
     /// Whether the Footer's CRC over the summary region matched. `nil` when no CRC was
     /// declared or none was checked — a different statement from `false`.
     public var summaryChecksumVerified: Bool?
 
     /// Whether the non-gaussian records above could be read at all.
     ///
-    /// `false` means this build of the binding has no way to reach them, so an empty
-    /// `metadata` is silence rather than a statement. It exists because the alternative —
-    /// an empty array that looks like a fact — is exactly how a consumer ends up believing
-    /// a file carries no licence when nobody ever looked.
+    /// `false` would mean an empty `metadata` is silence rather than a statement — that
+    /// nobody looked, not that the file carries none. It is `true` for every scene this
+    /// package opens now that the ABI can reach those records; it stays in the API because
+    /// the distinction is real and a future build could lose the ability again.
     public var recordsAvailable: Bool
 
     public init(
         header: Header, audio: Audio? = nil, camera: Camera? = nil, metadata: [MetadataRecord] = [],
         attachments: [Attachment] = [], statistics: Statistics? = nil, summaryOffsets: [SummaryOffset] = [],
-        chunkIntervals: [ClosedRange<Double>] = [], isIndexed: Bool = false,
+        chunkIntervals: [ClosedRange<Double>] = [], isIndexed: Bool = false, isTruncated: Bool = false,
         summaryChecksumVerified: Bool? = nil, recordsAvailable: Bool = false
     ) {
         self.header = header
@@ -53,6 +54,7 @@ public struct Scene: Sendable, Equatable {
         self.summaryOffsets = summaryOffsets
         self.chunkIntervals = chunkIntervals
         self.isIndexed = isIndexed
+        self.isTruncated = isTruncated
         self.summaryChecksumVerified = summaryChecksumVerified
         self.recordsAvailable = recordsAvailable
     }
@@ -100,30 +102,73 @@ public final class SceneReader {
 
     private let handle: Core.SceneHandle
 
+    /// Which path to read the file by.
+    ///
+    /// Streamed and indexed are two consumers, not two speeds: streaming works on a pipe
+    /// and on a file with no index, and an indexed read touches only what an instant needs.
+    /// Neither is an optimization of the other, and the conformance suite runs one runner
+    /// for each so that they are able to disagree.
+    public enum ReadPath {
+        /// Let the core choose: indexed when the file has an index, sequential otherwise.
+        case automatic
+        /// Front to back, no seeking. Works on a file with no index and on a truncated one.
+        case streamed
+        /// Footer, then index, then only the byte ranges asked for.
+        case indexed
+
+        var mode: Core.OpenMode {
+            switch self {
+            case .automatic: return .auto
+            case .streamed: return .sequential
+            case .indexed: return .indexed
+            }
+        }
+    }
+
     /// Open a scene over any byte-range reader.
     ///
     /// The reader is retained for the scene's whole life and released exactly once when
     /// this object is deallocated.
-    public init(_ source: any ByteRangeReader) throws {
+    public init(_ source: any ByteRangeReader, path readPath: ReadPath = .automatic) throws {
         var probe = source
         // Eight bytes and one comparison, before anything untrusted crosses into code that
         // cannot throw. The core checks the magic too; a binding checking what it cheaply
         // can at the boundary is the job, not duplication for its own sake.
         try Core.validateMagic(&probe)
 
-        let handle = try Core.open(source)
+        let handle = try Core.open(source, mode: readPath.mode)
         self.handle = handle
+        try Core.loadRecords(handle)
         self.scene = Scene(
-            header: Core.header(handle),
+            header: try Core.header(handle),
             audio: try Core.audio(handle),
+            camera: try Core.camera(handle),
+            metadata: try Core.metadata(handle),
+            attachments: try Core.attachments(handle),
+            statistics: try Core.statistics(handle),
+            summaryOffsets: try Core.summaryOffsets(handle),
             chunkIntervals: try Core.chunkIntervals(handle).map { $0.0...$0.1 },
             isIndexed: Core.isIndexed(handle),
-            recordsAvailable: false)
+            isTruncated: Core.isTruncated(handle),
+            summaryChecksumVerified: Core.summaryChecksum(handle),
+            recordsAvailable: true)
     }
 
     /// Open a file on disk.
-    public convenience init(path: String) throws {
-        try self.init(FileReader(path: path))
+    public convenience init(path: String, readPath: ReadPath = .automatic) throws {
+        try self.init(FileReader(path: path), path: readPath)
+    }
+
+    /// Decode chunk `i` on its own, transferring only its byte ranges.
+    public func chunk(_ i: Int, options: DecodeOptions = DecodeOptions()) throws -> GaussianState {
+        try Core.loadChunk(handle, UInt32(i), bandCap: options.bandCap)
+    }
+
+    /// What reading chunk `i` would transfer at this band cap — measured at the transport,
+    /// which is what makes "never fetch a band you will not evaluate" a checkable claim
+    /// rather than an intention.
+    public func bytesForChunk(_ i: Int, options: DecodeOptions = DecodeOptions()) -> UInt64 {
+        Core.bytesForChunk(handle, UInt32(i), bandCap: options.bandCap)
     }
 
     /// Every gaussian in the file, decoded.

@@ -15,7 +15,7 @@ Scope: decoding a `.4dgs` to gaussian state at a time `t`. **RealityKit and Meta
 of scope for this repository — the SDK ends at decoded state.**
 
 ```swift
-let reader = try SceneReader(path: "scene.4dgs")
+let reader = try SceneReader(path: "scene.4dgs")   // or readPath: .streamed / .indexed
 let live = try reader.gaussians(at: 1.5)   // §3: the window, then marginal against the file's cutoff
 let moved = live[0].state(at: 1.5)         // centre moved, opacity faded
 let cost = reader.bytesForTime(1.5)        // what that seek transfers, before asking for it

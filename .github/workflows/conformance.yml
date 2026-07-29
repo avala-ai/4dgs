@@ -125,14 +125,6 @@ jobs:
     runs-on: ubuntu-latest
     container: swift:6.1
     needs: corpus
-    # Enabled when the C ABI can reach the non-gaussian records. The binding decodes
-    # today, but the canonical summary covers what a file says and not only its gaussians,
-    # so the runners refuse to emit a partial one and every variant would fail. Deleting
-    # this line is the milestone, and the feature matrix moves with it and not before.
-    #
-    # Everything below is otherwise the real invocation and is meant to be correct now:
-    # a job that only becomes true on the day it is enabled is a job nobody has tested.
-    if: false
     steps:
       - uses: actions/checkout@v4
       # The Swift package is a binding, so the core has to exist before it links. The
