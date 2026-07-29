@@ -34,6 +34,7 @@ from .provenance import Pose, Provenance, pose_at
 from .quantization import SH_LADDERS, Bounds, Steps, sh_bound, sh_step
 from .records import CoordinateFrame, GeodeticAnchor, RigTrajectory, SensorCalibration
 from .stream_reader import Scene, read
+from .usd import UsdImport, from_usd, to_usd
 from .writer import WriteOptions, write
 
 __all__ = [
@@ -58,13 +59,16 @@ __all__ = [
     "TruncatedFile",
     "UnsupportedCodec",
     "UnsupportedVersion",
+    "UsdImport",
     "WriteOptions",
     "__version__",
     "from_gltf",
+    "from_usd",
     "pose_at",
     "read",
     "sh_bound",
     "sh_step",
     "to_gltf",
+    "to_usd",
     "write",
 ]

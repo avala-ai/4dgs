@@ -11,6 +11,7 @@ const sidebars = {
     { type: "doc", id: "guides/index", label: "Overview" },
     { type: "doc", id: "guides/concepts", label: "Concepts" },
     { type: "doc", id: "guides/interop-gltf", label: "glTF interoperability" },
+    { type: "doc", id: "guides/interop-usd", label: "OpenUSD interoperability" },
     {
       type: "category",
       label: "Getting started",

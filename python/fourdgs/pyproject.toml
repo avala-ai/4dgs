@@ -16,6 +16,12 @@ dependencies = ["numpy>=1.24"]
 
 [project.optional-dependencies]
 zstd = ["zstandard>=0.22"]
+# OpenUSD interop (the `4dgs from-usd` / `to-usd` commands) needs the reference USD
+# runtime. It is heavy, so it is an optional extra: the core package stays lean and the
+# USD commands gate on its presence with a clear "install fourdgs[usd]" message. Pinned to
+# a lower bound at OpenUSD 26.03, the release that shipped the ParticleField3DGaussianSplat
+# schema this bridge targets.
+usd = ["usd-core>=26.3"]
 dev = ["pytest>=8", "ruff==0.16.0"]
 
 [project.scripts]

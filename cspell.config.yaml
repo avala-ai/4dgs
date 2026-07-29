@@ -76,6 +76,18 @@ words:
   - Avala
   - bibtex
   - ctest
+  # OpenUSD interoperability (the ParticleField3DGaussianSplat schema bridge)
+  - openusd
+  - AOUSD
+  - quatf
+  - usda
+  - usdc
+  - usdz
+  - instancer
+  - flipbook
+  - positionsh
+  - scalesh
+  - metersPerUnit
   # Provenance vocabulary (spec section 5.15): camera-distortion model names, the
   # interpolation verbs, and the record family's own terms
   - Conrady
