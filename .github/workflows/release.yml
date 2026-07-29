@@ -292,11 +292,19 @@ jobs:
         # and passing the flag is how a job ends up asking for provenance it is
         # not configured to produce. `repository.url` in each package.json must
         # match this repository exactly or the exchange is refused.
+        #
+        # --loglevel verbose is not debugging left behind. npm's OIDC exchange
+        # is best-effort by design: every way it can fail returns quietly and
+        # publishing continues unauthenticated, so a missing or mismatched
+        # trusted publisher arrives as `404 PUT` with no mention of OIDC
+        # anywhere in the log. The reasons are logged, at verbose. This is the
+        # one step in this workflow whose failure mode is silent, so it is the
+        # one step that asks for the volume.
         run: |
           npm install -g npm@latest
           npm --version
           rest="${GITHUB_REF#refs/tags/releases/typescript/}"
-          npm publish --workspace "typescript/${rest%/v*}" --access public
+          npm publish --workspace "typescript/${rest%/v*}" --access public --loglevel verbose
 
       - name: GitHub Release
         env:
