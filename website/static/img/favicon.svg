@@ -1,15 +1,3 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="4dgs">
-  <rect width="64" height="64" rx="13" fill="#7c8798" />
-  <text
-    x="32"
-    y="42"
-    text-anchor="middle"
-    font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
-    font-size="28"
-    font-weight="700"
-    letter-spacing="-1.5"
-    fill="#ffffff"
-  >
-    4d
-  </text>
+  <text x="32" y="52" font-size="56" text-anchor="middle">🧊</text>
 </svg>
