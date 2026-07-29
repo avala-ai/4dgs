@@ -24,19 +24,19 @@ pub fn info(args: &Args) -> Result<u8> {
     let scene = open_indexed(&mut source)?;
     let h = &scene.header;
 
-    println!(
+    out!(
         "file           {}  ({:.2} MiB)",
         args.file,
         size as f64 / MIB
     );
-    println!("gaussians      {}", commas(h.gaussian_count));
-    println!("duration       {:.3} s", h.duration_sec);
+    out!("gaussians      {}", commas(h.gaussian_count));
+    out!("duration       {:.3} s", h.duration_sec);
     let profile = if h.profile.is_empty() {
         "(none)"
     } else {
         &h.profile
     };
-    println!(
+    out!(
         "profile        {profile}   temporal model: {}",
         h.temporal_model
     );
@@ -45,9 +45,9 @@ pub fn info(args: &Args) -> Result<u8> {
     } else {
         &h.library
     };
-    println!("library        {library}");
-    println!("spherical harm degree {}", h.sh_degree);
-    println!(
+    out!("library        {library}");
+    out!("spherical harm degree {}", h.sh_degree);
+    out!(
         "audio          {}",
         match (scene.has_audio(), scene.audio_codec.as_deref()) {
             (true, Some(codec)) => codec,
@@ -55,17 +55,17 @@ pub fn info(args: &Args) -> Result<u8> {
             (false, _) => "none",
         }
     );
-    println!("chunks         {}", scene.index.len());
-    println!("windows        {}", scene.windows.len());
+    out!("chunks         {}", scene.index.len());
+    out!("windows        {}", scene.windows.len());
     let aabb: Vec<String> = h.aabb.iter().map(|v| round4(*v)).collect();
-    println!("aabb           [{}]", aabb.join(", "));
+    out!("aabb           [{}]", aabb.join(", "));
     if let Some(ok) = scene.summary_crc_ok {
-        println!("summary crc    {}", if ok { "ok" } else { "MISMATCH" });
+        out!("summary crc    {}", if ok { "ok" } else { "MISMATCH" });
     }
     if !h.attributes.is_empty() {
-        println!("attributes");
+        out!("attributes");
         for (k, v) in &h.attributes {
-            println!("  {k} = {v}");
+            out!("  {k} = {v}");
         }
     }
 
@@ -79,8 +79,8 @@ pub fn info(args: &Args) -> Result<u8> {
 
 /// Where the file's parts are, from the index alone.
 fn layout(scene: &IndexedScene) {
-    println!("\nlayout:");
-    println!(
+    out!("\nlayout:");
+    out!(
         "  camera         {}",
         if scene.camera_range.is_some() {
             "present"
@@ -88,26 +88,26 @@ fn layout(scene: &IndexedScene) {
             "none"
         }
     );
-    println!("  metadata       {} records", scene.metadata_ranges.len());
-    println!(
+    out!("  metadata       {} records", scene.metadata_ranges.len());
+    out!(
         "  attachments    {} records ({} bytes)",
         scene.attachment_ranges.len(),
         commas(scene.attachment_ranges.iter().map(|(_, n)| n).sum::<u64>())
     );
     match &scene.statistics {
-        Some(stats) => println!(
+        Some(stats) => out!(
             "  statistics     {} gaussians, {} chunks, {:.3} s",
             commas(stats.gaussian_count),
             stats.chunk_count,
             stats.duration_sec
         ),
-        None => println!("  statistics     none"),
+        None => out!("  statistics     none"),
     }
     if scene.summary_offsets.is_empty() {
-        println!("  summary        no summary offsets");
+        out!("  summary        no summary offsets");
     }
     for offset in &scene.summary_offsets {
-        println!(
+        out!(
             "  summary        {:<16} at {:>12}  {:>12} bytes",
             op::name(offset.group_opcode),
             commas(offset.group_start),
@@ -126,20 +126,20 @@ fn names(path: &str) -> Result<()> {
     let metadata = reader.metadata()?;
     let attachments = reader.attachments()?;
     if !metadata.is_empty() {
-        println!("\nmetadata:");
+        out!("\nmetadata:");
         for record in &metadata {
-            println!("  {} ({} entries)", record.name, record.entries.len());
+            out!("  {} ({} entries)", record.name, record.entries.len());
         }
     }
     if !attachments.is_empty() {
-        println!("\nattachments:");
+        out!("\nattachments:");
         for record in &attachments {
             let media = if record.media_type.is_empty() {
                 "(no media type)"
             } else {
                 &record.media_type
             };
-            println!(
+            out!(
                 "  {}  {media}  {} bytes",
                 record.name,
                 commas(record.data.len() as u64)
@@ -154,13 +154,13 @@ fn seek_cost(scene: &IndexedScene) {
     if scene.index.is_empty() {
         return;
     }
-    println!("\nseek cost (bytes to render an instant):");
+    out!("\nseek cost (bytes to render an instant):");
     for i in 0..5 {
         let t = scene.header.duration_sec * (i as f64) / 5.0;
         let entries = scene.chunks_for_time(t);
         let bytes = scene.bytes_for_time(t, 0);
         let gaussians: u64 = entries.iter().map(|e| e.gaussian_count as u64).sum();
-        println!(
+        out!(
             "  t={t:7.3}s  {:3} ranges  {:8.3} MiB  ({} gaussians)",
             entries.len(),
             bytes as f64 / MIB,
@@ -238,13 +238,16 @@ fn print_inspect_text(
     trailing_magic: bool,
     stopped: Option<&str>,
 ) {
-    println!(
+    out!(
         "{:>12}  {:<18} {:>14}  {:>14}",
-        "offset", "record", "content", "total"
+        "offset",
+        "record",
+        "content",
+        "total"
     );
-    println!("{:>12}  {:<18} {:>14}  {:>14}", 0, "(magic)", "", 8);
+    out!("{:>12}  {:<18} {:>14}  {:>14}", 0, "(magic)", "", 8);
     for (at, opcode, length) in rows {
-        println!(
+        out!(
             "{:>12}  {:<18} {:>14}  {:>14}",
             commas(*at),
             op::name(*opcode),
@@ -253,7 +256,7 @@ fn print_inspect_text(
         );
     }
     if trailing_magic {
-        println!(
+        out!(
             "{:>12}  {:<18} {:>14}  {:>14}",
             commas(size - 8),
             "(magic)",
@@ -261,7 +264,7 @@ fn print_inspect_text(
             8
         );
     }
-    println!(
+    out!(
         "\n{} records, {} bytes{}",
         rows.len(),
         commas(size),
@@ -272,7 +275,7 @@ fn print_inspect_text(
         }
     );
     if !trailing_magic && stopped.is_none() {
-        println!("note: the file does not end with the magic");
+        out!("note: the file does not end with the magic");
     }
     if let Some(reason) = stopped {
         eprintln!("4dgs: stopped: {reason}");
@@ -285,24 +288,24 @@ fn print_inspect_json(
     trailing_magic: bool,
     stopped: Option<&str>,
 ) {
-    println!("{{");
-    println!("  \"size\": {size},");
-    println!("  \"trailing_magic\": {trailing_magic},");
+    out!("{{");
+    out!("  \"size\": {size},");
+    out!("  \"trailing_magic\": {trailing_magic},");
     match stopped {
-        Some(reason) => println!("  \"stopped\": {},", json_string(reason)),
-        None => println!("  \"stopped\": null,"),
+        Some(reason) => out!("  \"stopped\": {},", json_string(reason)),
+        None => out!("  \"stopped\": null,"),
     }
-    println!("  \"records\": [");
+    out!("  \"records\": [");
     for (i, (at, opcode, length)) in rows.iter().enumerate() {
         let comma = if i + 1 == rows.len() { "" } else { "," };
-        println!(
+        out!(
             "    {{\"offset\": {at}, \"opcode\": {opcode}, \"name\": {}, \"content_length\": {length}, \"total_length\": {}}}{comma}",
             json_string(&op::name(*opcode)),
             length + fourdgs::serialization::RECORD_HEADER_SIZE as u64
         );
     }
-    println!("  ]");
-    println!("}}");
+    out!("  ]");
+    out!("}}");
 }
 
 /// Report the gaussians visible at an instant.
@@ -322,11 +325,11 @@ pub fn decode(args: &Args) -> Result<u8> {
     let visible = state.count() as u64;
 
     if args.json {
-        println!("{{");
-        println!("  \"time\": {},", json_f64(args.time));
-        println!("  \"visible\": {visible},");
-        println!("  \"total\": {total}");
-        println!("}}");
+        out!("{{");
+        out!("  \"time\": {},", json_f64(args.time));
+        out!("  \"visible\": {visible},");
+        out!("  \"total\": {total}");
+        out!("}}");
         return Ok(EXIT_OK);
     }
 
@@ -341,40 +344,40 @@ pub fn decode(args: &Args) -> Result<u8> {
         .filter_map(|i| reader.bytes_for_chunk(i as u32, 0))
         .fold(0, u64::saturating_add);
 
-    println!("file           {}", args.file);
-    println!("mode           {:?}", reader.mode());
-    println!(
+    out!("file           {}", args.file);
+    out!("mode           {:?}", reader.mode());
+    out!(
         "time           {:.3} s of {:.3} s",
         args.time,
         reader.header().duration_sec
     );
-    println!("cutoff         {}", round4(reader.header().cutoff));
+    out!("cutoff         {}", round4(reader.header().cutoff));
     let percent = if total == 0 {
         0.0
     } else {
         100.0 * visible as f64 / total as f64
     };
-    println!(
+    out!(
         "visible        {} of {} gaussians  ({percent:.1}%)",
         commas(visible),
         commas(total)
     );
-    println!(
+    out!(
         "chunks read    {ranges} ranges, {:.3} MiB",
         bytes as f64 / MIB
     );
     if visible == 0 {
-        println!("nothing exists at this instant");
+        out!("nothing exists at this instant");
         return Ok(EXIT_OK);
     }
     let bounds = extent(&state.centers);
-    println!(
+    out!(
         "centre         [{}, {}, {}]",
         round4(mean(&state.centers, 3, 0)),
         round4(mean(&state.centers, 3, 1)),
         round4(mean(&state.centers, 3, 2))
     );
-    println!(
+    out!(
         "bounds         [{}]",
         bounds
             .iter()
@@ -390,7 +393,7 @@ pub fn decode(args: &Args) -> Result<u8> {
             .copied()
             .fold(f32::NEG_INFINITY, f32::max),
     );
-    println!(
+    out!(
         "opacity        min {}  mean {}  max {}",
         round4(lo as f64),
         round4(mean(&state.opacity, 1, 0)),

@@ -12,6 +12,9 @@
 //! records, prints the same values in the same order, and exits the same way; a difference
 //! between them on one file is a bug in one of them, not a matter of taste.
 
+// Declared first: the modules below print through its macro.
+#[macro_use]
+mod out;
 mod args;
 mod commands;
 mod validate;
@@ -131,5 +134,5 @@ pub fn json_string(s: &str) -> String {
 }
 
 pub fn print_usage() {
-    print!("{USAGE}");
+    out::write_all(USAGE);
 }
