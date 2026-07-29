@@ -153,6 +153,58 @@ void main() {
       expect(state.active, isTrue);
       expect(state.localTime, 0);
       expect(state.localTime.isFinite, isTrue);
+
+      final shortAtLargeTime = FourdgsAudioSourceDescriptor(
+        sourceId: 2,
+        name: '',
+        codec: 'wav',
+        channelLayout: 'mono',
+        dataLength: 0,
+        startSec: 1e308,
+        durationSec: 1,
+        gain: 1,
+        spatial: true,
+        loop: false,
+        position: const <double>[0, 0, 0],
+        rotation: const <double>[0, 0, 0, 1],
+        keyframes: const <FourdgsAudioSourceKeyframe>[],
+        interpolation: 'linear',
+      );
+      expect(shortAtLargeTime.stateAt(1e308).active, isTrue);
+    });
+
+    test('extreme positions interpolate without overflow', () {
+      final source = FourdgsAudioSourceDescriptor(
+        sourceId: 1,
+        name: '',
+        codec: 'wav',
+        channelLayout: 'mono',
+        dataLength: 0,
+        startSec: -1e308,
+        durationSec: 1,
+        gain: 1,
+        spatial: true,
+        loop: true,
+        position: const <double>[0, 0, 0],
+        rotation: const <double>[0, 0, 0, 1],
+        keyframes: const <FourdgsAudioSourceKeyframe>[
+          FourdgsAudioSourceKeyframe(
+            time: -1e308,
+            position: <double>[-1e308, 0, 0],
+          ),
+          FourdgsAudioSourceKeyframe(
+            time: 1e308,
+            position: <double>[1e308, 0, 0],
+          ),
+        ],
+        interpolation: 'linear',
+      );
+      final state = source.stateAt(0);
+      expect(state.position, <double>[0, 0, 0]);
+      expect(
+        state.position,
+        everyElement(isA<double>().having((v) => v.isFinite, 'finite', isTrue)),
+      );
     });
   });
 

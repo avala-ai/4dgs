@@ -322,6 +322,38 @@ fn looping_audio_time_does_not_overflow() {
     assert!(state.active);
     assert_eq!(state.local_time, 0.0);
     assert!(state.local_time.is_finite());
+
+    let short_at_large_time = AudioSource {
+        start_sec: 1e308,
+        duration_sec: 1.0,
+        ..AudioSource::default()
+    };
+    assert!(short_at_large_time.state_at(1e308).active);
+}
+
+#[test]
+fn extreme_audio_positions_interpolate_without_overflow() {
+    let source = AudioSource {
+        start_sec: -1e308,
+        duration_sec: 1.0,
+        loop_: true,
+        keyframes: vec![
+            AudioSourceKeyframe {
+                time: -1e308,
+                position: [-1e308, 0.0, 0.0],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+            },
+            AudioSourceKeyframe {
+                time: 1e308,
+                position: [1e308, 0.0, 0.0],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+            },
+        ],
+        ..AudioSource::default()
+    };
+    let state = source.state_at(0.0);
+    assert_eq!(state.position, [0.0, 0.0, 0.0]);
+    assert!(state.position.iter().all(|value| value.is_finite()));
 }
 
 #[test]

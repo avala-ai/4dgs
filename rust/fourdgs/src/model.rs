@@ -84,7 +84,7 @@ impl AudioSource {
     /// Reconstruct timing and pose. HRTF, panning, attenuation and mixing stay in the
     /// player, which combines this with its listener pose.
     pub fn state_at(&self, t: f64) -> AudioSourceState {
-        let active = t >= self.start_sec && (self.loop_ || t < self.start_sec + self.duration_sec);
+        let active = t >= self.start_sec && (self.loop_ || t - self.start_sec < self.duration_sec);
         let local_time = if self.loop_ && self.duration_sec > 0.0 {
             looping_local_time(t, self.start_sec, self.duration_sec)
         } else {
@@ -124,12 +124,29 @@ impl AudioSource {
         if self.interpolation == "step" {
             return (a.position, normalized_quaternion(a.rotation));
         }
-        let u = (t - a.time) / (b.time - a.time);
+        let u = interpolation_fraction(t, a.time, b.time);
         let mut position = [0.0; 3];
         for (i, value) in position.iter_mut().enumerate() {
-            *value = a.position[i] + (b.position[i] - a.position[i]) * u;
+            *value = finite_lerp(a.position[i], b.position[i], u);
         }
         (position, slerp(a.rotation, b.rotation, u))
+    }
+}
+
+fn interpolation_fraction(t: f64, a: f64, b: f64) -> f64 {
+    let span = b - a;
+    if span.is_finite() {
+        return (t - a) / span;
+    }
+    let scale = a.abs().max(b.abs());
+    (t / scale - a / scale) / (b / scale - a / scale)
+}
+
+fn finite_lerp(a: f64, b: f64, u: f64) -> f64 {
+    if (a <= 0.0 && b >= 0.0) || (a >= 0.0 && b <= 0.0) {
+        a * (1.0 - u) + b * u
+    } else {
+        a + (b - a) * u
     }
 }
 

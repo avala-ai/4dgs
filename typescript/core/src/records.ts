@@ -443,7 +443,7 @@ export function parseAudioData(content: Uint8Array): AudioData {
 
 /** Reconstruct source-local timing and pose. Spatialization remains player-owned. */
 export function audioSourceStateAt(source: AudioSourceDescriptor, t: number): AudioSourceState {
-  const active = t >= source.startSec && (source.loop || t < source.startSec + source.durationSec);
+  const active = t >= source.startSec && (source.loop || t - source.startSec < source.durationSec);
   const localTime =
     source.loop && source.durationSec > 0
       ? loopingLocalTime(t, source.startSec, source.durationSec)
@@ -480,11 +480,22 @@ function audioPoseAt(
   if (source.interpolation === "step") {
     return [a.position, normalizedQuaternion(a.rotation)];
   }
-  const u = (t - a.time) / (b.time - a.time);
+  const u = interpolationFraction(t, a.time, b.time);
   return [
-    a.position.map((value, i) => value + (b.position[i]! - value) * u),
+    a.position.map((value, i) => finiteLerp(value, b.position[i]!, u)),
     slerp(a.rotation, b.rotation, u),
   ];
+}
+
+function interpolationFraction(t: number, a: number, b: number): number {
+  const span = b - a;
+  if (Number.isFinite(span)) return (t - a) / span;
+  const scale = Math.max(Math.abs(a), Math.abs(b));
+  return (t / scale - a / scale) / (b / scale - a / scale);
+}
+
+function finiteLerp(a: number, b: number, u: number): number {
+  return (a <= 0 && b >= 0) || (a >= 0 && b <= 0) ? a * (1 - u) + b * u : a + (b - a) * u;
 }
 
 function normalizedQuaternion(value: readonly number[]): readonly number[] {

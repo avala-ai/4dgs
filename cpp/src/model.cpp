@@ -18,6 +18,20 @@ double loopingLocalTime(double t, double startSec, double durationSec) {
   return difference < 0.0 ? difference + durationSec : difference;
 }
 
+double interpolationFraction(double t, double a, double b) {
+  const double span = b - a;
+  if (std::isfinite(span)) return (t - a) / span;
+  const double scale = std::max(std::abs(a), std::abs(b));
+  return (t / scale - a / scale) / (b / scale - a / scale);
+}
+
+double finiteLerp(double a, double b, double u) {
+  if ((a <= 0.0 && b >= 0.0) || (a >= 0.0 && b <= 0.0)) {
+    return a * (1.0 - u) + b * u;
+  }
+  return a + (b - a) * u;
+}
+
 void normalizeQuaternion(const double value[4], double out[4]) {
   const double scale =
       std::max({std::abs(value[0]), std::abs(value[1]), std::abs(value[2]), std::abs(value[3])});
@@ -63,7 +77,7 @@ void slerp(const double a[4], const double b[4], double u, double out[4]) {
 
 AudioSourceState AudioSource::stateAt(double t) const {
   AudioSourceState state;
-  state.active = t >= startSec && (loop || t < startSec + durationSec);
+  state.active = t >= startSec && (loop || t - startSec < durationSec);
   state.localTime = loop && durationSec > 0.0
                         ? loopingLocalTime(t, startSec, durationSec)
                         : std::min(std::max(0.0, t - startSec), std::max(0.0, durationSec));
@@ -94,9 +108,9 @@ AudioSourceState AudioSource::stateAt(double t) const {
     normalizeQuaternion(a.rotation, state.rotation);
     return state;
   }
-  const double u = (t - a.time) / (b.time - a.time);
+  const double u = interpolationFraction(t, a.time, b.time);
   for (int i = 0; i < 3; ++i) {
-    state.position[i] = a.position[i] + (b.position[i] - a.position[i]) * u;
+    state.position[i] = finiteLerp(a.position[i], b.position[i], u);
   }
   slerp(a.rotation, b.rotation, u, state.rotation);
   return state;

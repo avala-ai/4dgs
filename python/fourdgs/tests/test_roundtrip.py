@@ -189,6 +189,32 @@ class TestAudio:
         assert state.local_time == 0.0
         assert math.isfinite(state.local_time)
 
+        short_at_large_time = fourdgs.AudioSource(
+            source_id=2,
+            codec="wav",
+            data=b"x",
+            start_sec=1e308,
+            duration_sec=1.0,
+        )
+        assert short_at_large_time.state_at(1e308).active is True
+
+    def test_extreme_audio_positions_interpolate_without_overflow(self):
+        source = fourdgs.AudioSource(
+            source_id=1,
+            codec="wav",
+            data=b"x",
+            start_sec=-1e308,
+            duration_sec=1.0,
+            loop=True,
+            keyframes=[
+                fourdgs.AudioSourceKeyframe(-1e308, (-1e308, 0.0, 0.0)),
+                fourdgs.AudioSourceKeyframe(1e308, (1e308, 0.0, 0.0)),
+            ],
+        )
+        state = source.state_at(0.0)
+        assert state.position == (0.0, 0.0, 0.0)
+        assert all(math.isfinite(value) for value in state.position)
+
     def test_truncation_does_not_excuse_audio_when_the_header_flag_is_clear(self):
         buf = io.BytesIO()
         source = fourdgs.AudioSource(source_id=1, codec="wav", data=b"RIFF", duration_sec=6.0)

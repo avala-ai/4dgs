@@ -111,6 +111,22 @@ final class TimeTests: XCTestCase {
         XCTAssertTrue(state.active)
         XCTAssertEqual(state.localTime, 0)
         XCTAssertTrue(state.localTime.isFinite)
+
+        let shortAtLargeTime = AudioSource(
+            sourceId: 2, codec: "wav", startSec: 1e308, durationSec: 1)
+        XCTAssertTrue(shortAtLargeTime.state(at: 1e308).active)
+    }
+
+    func testExtremeAudioPositionsInterpolateWithoutOverflow() {
+        let source = AudioSource(
+            sourceId: 1, codec: "wav", startSec: -1e308, durationSec: 1, loop: true,
+            keyframes: [
+                .init(time: -1e308, position: [-1e308, 0, 0], rotation: [0, 0, 0, 1]),
+                .init(time: 1e308, position: [1e308, 0, 0], rotation: [0, 0, 0, 1]),
+            ])
+        let state = source.state(at: 0)
+        XCTAssertEqual(state.position, [0, 0, 0])
+        XCTAssertTrue(state.position.allSatisfy { $0.isFinite })
     }
 }
 

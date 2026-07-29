@@ -232,6 +232,25 @@ test("audio normalization preserves extreme and tiny finite directions", () => {
   assert.equal(extremeTime.active, true);
   assert.equal(extremeTime.localTime, 0);
   assert.equal(Number.isFinite(extremeTime.localTime), true);
+
+  const shortAtLargeTime = {
+    ...source([0, 0, 0, 1]),
+    startSec: 1e308,
+    durationSec: 1,
+  };
+  assert.equal(audioSourceStateAt(shortAtLargeTime, 1e308).active, true);
+
+  const extremeMotion = {
+    ...source([0, 0, 0, 1]),
+    startSec: -1e308,
+    durationSec: 1,
+    loop: true,
+    keyframes: [
+      { time: -1e308, position: [-1e308, 0, 0], rotation: [0, 0, 0, 1] },
+      { time: 1e308, position: [1e308, 0, 0], rotation: [0, 0, 0, 1] },
+    ],
+  };
+  assert.deepEqual(audioSourceStateAt(extremeMotion, 0).position, [0, 0, 0]);
 });
 
 test("a stream that ends on the trailing magic is not truncated", () => {

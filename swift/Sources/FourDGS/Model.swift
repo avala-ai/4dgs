@@ -160,7 +160,7 @@ public struct AudioSourceState: Sendable, Equatable {
 extension AudioSource {
     /// Reconstruct timing and moving pose. Listener-relative playback stays in the player.
     public func state(at t: Double) -> AudioSourceState {
-        let active = t >= startSec && (loop || t < startSec + durationSec)
+        let active = t >= startSec && (loop || t - startSec < durationSec)
         let localTime =
             loop && durationSec > 0
             ? loopingLocalTime(t, startSec, durationSec)
@@ -181,10 +181,10 @@ extension AudioSource {
             if interpolation == "step" {
                 pose = (a.position, normalizedQuaternion(a.rotation))
             } else {
-                let u = (t - a.time) / (b.time - a.time)
+                let u = interpolationFraction(t, a.time, b.time)
                 pose = (
                     zip(a.position, b.position).map { pair in
-                        pair.0 + (pair.1 - pair.0) * u
+                        finiteLerp(pair.0, pair.1, u)
                     },
                     quaternionSlerp(a.rotation, b.rotation, u)
                 )
@@ -193,6 +193,22 @@ extension AudioSource {
         return AudioSourceState(
             active: active, localTime: localTime, position: pose.0, rotation: pose.1, gain: gain)
     }
+}
+
+private func interpolationFraction(_ t: Double, _ a: Double, _ b: Double) -> Double {
+    let span = b - a
+    if span.isFinite {
+        return (t - a) / span
+    }
+    let scale = max(abs(a), abs(b))
+    return (t / scale - a / scale) / (b / scale - a / scale)
+}
+
+private func finiteLerp(_ a: Double, _ b: Double, _ u: Double) -> Double {
+    if (a <= 0 && b >= 0) || (a >= 0 && b <= 0) {
+        return a * (1 - u) + b * u
+    }
+    return a + (b - a) * u
 }
 
 private func loopingLocalTime(_ t: Double, _ startSec: Double, _ durationSec: Double) -> Double {

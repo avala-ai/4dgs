@@ -93,7 +93,7 @@ class AudioSource:
         Pose keyframes live on the scene clock. Audio sample time is local to this source:
         it starts at `start_sec` and wraps by `duration_sec` only when `loop` is set.
         """
-        active = t >= self.start_sec and (self.loop or t < self.start_sec + self.duration_sec)
+        active = t >= self.start_sec and (self.loop or t - self.start_sec < self.duration_sec)
         local_time = (
             _looping_local_time(t, self.start_sec, self.duration_sec)
             if self.loop and self.duration_sec > 0.0
@@ -139,9 +139,23 @@ def _audio_pose_at(
     a, b = frames[hi - 1], frames[hi]
     if source.interpolation == "step":
         return a.position, _normalized_quaternion(a.rotation)
-    u = (t - a.time) / (b.time - a.time)
-    position = tuple(float(x + (y - x) * u) for x, y in zip(a.position, b.position, strict=True))
+    u = _interpolation_fraction(t, a.time, b.time)
+    position = tuple(float(_finite_lerp(x, y, u)) for x, y in zip(a.position, b.position, strict=True))
     return position, _slerp(a.rotation, b.rotation, u)
+
+
+def _interpolation_fraction(t: float, a: float, b: float) -> float:
+    span = b - a
+    if math.isfinite(span):
+        return (t - a) / span
+    scale = max(abs(a), abs(b))
+    return (t / scale - a / scale) / (b / scale - a / scale)
+
+
+def _finite_lerp(a: float, b: float, u: float) -> float:
+    if (a <= 0.0 <= b) or (b <= 0.0 <= a):
+        return a * (1.0 - u) + b * u
+    return a + (b - a) * u
 
 
 def _normalized_quaternion(q) -> tuple[float, float, float, float]:

@@ -160,6 +160,28 @@ void loopingAudioTimeDoesNotOverflow() {
   CHECK(state.active);
   CHECK_EQ(state.localTime, 0.0);
   CHECK(std::isfinite(state.localTime));
+
+  source.loop = false;
+  source.startSec = 1e308;
+  source.durationSec = 1.0;
+  CHECK(source.stateAt(1e308).active);
+}
+
+void extremeAudioPositionsInterpolateWithoutOverflow() {
+  fourdgs::AudioSource source;
+  source.startSec = -1e308;
+  source.durationSec = 1.0;
+  source.loop = true;
+  fourdgs::AudioSource::Keyframe first;
+  first.time = -1e308;
+  first.position[0] = -1e308;
+  fourdgs::AudioSource::Keyframe last;
+  last.time = 1e308;
+  last.position[0] = 1e308;
+  source.keyframes = {first, last};
+  const fourdgs::AudioSourceState state = source.stateAt(0.0);
+  CHECK_EQ(state.position[0], 0.0);
+  for (double value : state.position) CHECK(std::isfinite(value));
 }
 
 void runTests() {
@@ -171,6 +193,7 @@ void runTests() {
   movingAudioUsesExactKeyframesAndShortestPathSlerp();
   audioNormalizationPreservesExtremeAndTinyFiniteDirections();
   loopingAudioTimeDoesNotOverflow();
+  extremeAudioPositionsInterpolateWithoutOverflow();
 }
 
 }  // namespace

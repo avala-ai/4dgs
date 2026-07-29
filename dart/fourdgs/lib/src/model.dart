@@ -127,7 +127,7 @@ class FourdgsAudioSourceDescriptor {
 
   /// Reconstruct source timing and pose at scene time [t].
   FourdgsAudioSourceState stateAt(double t) {
-    final active = t >= startSec && (loop || t < startSec + durationSec);
+    final active = t >= startSec && (loop || t - startSec < durationSec);
     final localTime =
         loop && durationSec > 0.0
             ? _loopingLocalTime(t, startSec, durationSec)
@@ -216,14 +216,27 @@ class FourdgsAudioSource extends FourdgsAudioSourceDescriptor {
   if (source.interpolation == 'step') {
     return (a.position, _normalizedQuaternion(a.rotation));
   }
-  final u = (t - a.time) / (b.time - a.time);
+  final u = _interpolationFraction(t, a.time, b.time);
   return (
     <double>[
-      for (int i = 0; i < 3; i++)
-        a.position[i] + (b.position[i] - a.position[i]) * u,
+      for (int i = 0; i < 3; i++) _finiteLerp(a.position[i], b.position[i], u),
     ],
     _slerp(a.rotation, b.rotation, u),
   );
+}
+
+double _interpolationFraction(double t, double a, double b) {
+  final span = b - a;
+  if (span.isFinite) return (t - a) / span;
+  final scale = math.max(a.abs(), b.abs());
+  return (t / scale - a / scale) / (b / scale - a / scale);
+}
+
+double _finiteLerp(double a, double b, double u) {
+  if ((a <= 0.0 && b >= 0.0) || (a >= 0.0 && b <= 0.0)) {
+    return a * (1.0 - u) + b * u;
+  }
+  return a + (b - a) * u;
 }
 
 List<double> _normalizedQuaternion(List<double> value) {
