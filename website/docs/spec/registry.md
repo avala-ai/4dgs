@@ -10,7 +10,8 @@ cleanly with a message naming it, rather than guess.
 
 ## Attribute ids
 
-Used by the Attribute Stream record (`0x06`).
+Used by the Attribute Stream structure (`0x06`), which lives bare inside a Chunk rather than as a
+top-level record — see spec §5.6.
 
 | id     | name             | channels | domain                                                           |
 | ------ | ---------------- | -------- | ---------------------------------------------------------------- |
