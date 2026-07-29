@@ -40,11 +40,13 @@ redistributable without a licence question and reproducible without a download.
 Recorded here rather than left implicit, because a gap nobody wrote down is indistinguishable from
 coverage.
 
-- **Spherical harmonics, degree 3.** The corpus carries degree 1 and 2 only, so no implementation
-  can claim degree 3 however complete its code is. Adding it is one line in `scenarios.py` — degree
-  3 is 45 coefficients per gaussian against degree 2's 24, so the variant should use a small
-  scenario to stay inside the size cap, and `SH_BAND_RANGE`'s band 3 entry already describes the
-  layout.
+- **The Header's `library` is the same string in every variant.** `profile` varies — `baked` in the
+  two `LongLived` variants, `capture` everywhere else — so an implementation that drops it fails.
+  `library` is always `4dgs conformance generator`, which catches a runner that omits the field or
+  returns an empty string, but not one that hardcodes the expected value. Fixing it means varying
+  the generator's `library` per variant, which moves every checksum; it is recorded rather than done
+  because the failure it would catch is one nobody has ever made, and the one it does catch —
+  omission — is the one that actually happened.
 
 ## Fixture scale is a feature to cover, not a detail
 
@@ -89,8 +91,8 @@ a failure, but the error names the runner rather than the platform and reads lik
 ## Platforms
 
 The suite runs on GitHub-hosted runners for Python, TypeScript and Rust on Linux, macOS and Windows;
-C++ and Swift run it on Linux. Every platform decodes the same 32 variants and compares against the
-same committed expectations — 63 passing comparisons per family, with the single `decode_indexed`
+C++ and Swift run it on Linux. Every platform decodes the same 34 variants and compares against the
+same committed expectations — 67 passing comparisons per family, with the single `decode_indexed`
 variant that declares no chunk index skipped.
 
 That the corpus is bytes is the whole reason this is worth doing on more than one platform: a
@@ -116,6 +118,11 @@ So that two languages can be diffed without arguing about representation:
   statistics, the summary offsets, and whether the footer's CRC verified. A record that changes
   nothing here is a record an implementation could ignore entirely and still pass, which is how a
   feature matrix ends up claiming things the suite never checked
+- the same holds field by field. The Header's `profile` and `library` are emitted for that reason:
+  every SDK could read them and none asserted them, so a runner that returned an empty string for
+  both produced a summary identical to a correct one. A field no expectation mentions is a field an
+  implementation can decline to decode, and the failure that hides is the dangerous kind — a pass
+  that proves less than it looks like it does
 
 `--update` rewrites the expectations from the current implementation. Use it when you have decided a
 change is correct, never to make a red suite green.

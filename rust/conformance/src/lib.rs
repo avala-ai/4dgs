@@ -196,6 +196,9 @@ pub fn summarize(
         ("gaussianCount", int(n as u64)),
         ("durationSec", num(header.duration_sec)),
         ("cutoff", num(header.cutoff)),
+        // The Header's first two fields: readable everywhere, asserted nowhere until now.
+        ("profile", J::Str(header.profile.clone())),
+        ("library", J::Str(header.library.clone())),
         ("shDegree", J::Num(header.sh_degree as f64)),
         ("temporalModel", J::Str(header.temporal_model.clone())),
         ("hasAudio", J::Bool(header.has_audio())),

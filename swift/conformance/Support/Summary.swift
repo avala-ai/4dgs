@@ -52,6 +52,9 @@ public enum Summary {
             "gaussianCount": .integer(gaussians.count),
             "durationSec": .number(scene.header.durationSec),
             "cutoff": .number(scene.header.cutoff),
+            // The Header's first two fields: readable everywhere, asserted nowhere until now.
+            "profile": .string(scene.header.profile),
+            "library": .string(scene.header.library),
             "shDegree": .number(String(scene.header.shDegree)),
             "temporalModel": .string(scene.header.temporalModel),
             "hasAudio": .bool(scene.header.hasAudio),

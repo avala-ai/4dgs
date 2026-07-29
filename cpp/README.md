@@ -49,7 +49,7 @@ are what somebody gets.
 
 ## Status
 
-Conformance-verified: **63 checks over 32 variants on both read paths, the same numbers as the
+Conformance-verified: **67 checks over 34 variants on both read paths, the same numbers as the
 reference implementation**, with the read path forced at open rather than left to the opener, so the
 streamed and indexed rows rest on two paths and not one. The
 [feature matrix](../website/docs/reference/index.md) records exactly what that proves; degree-3

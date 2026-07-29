@@ -102,7 +102,9 @@
   "gaussianCount": "640",
   "hasAudio": false,
   "headerAttributes": {},
+  "library": "4dgs conformance generator",
   "metadataRecords": [],
+  "profile": "capture",
   "sample": {
     "colors": [
       [

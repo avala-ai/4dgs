@@ -26,7 +26,7 @@ DATA = os.path.join(HERE, "data")
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 
 #: Where a language's built runners live, when it has a build step. A family whose
-#: entry point is missing is skipped with a note rather than reported as 51 failures:
+#: entry point is missing is skipped with a note rather than reported as 67 failures:
 #: a Python-only contributor running the whole suite has not broken anything.
 TYPESCRIPT_DIST = os.path.join(ROOT, "typescript", "conformance", "dist")
 CPP_BUILD = os.path.join(ROOT, "cpp", "build", "conformance")

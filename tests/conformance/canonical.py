@@ -23,6 +23,12 @@ which is derived from decoded values alone.
 The summary covers what the file says, not only its gaussians. A record that changes
 nothing here is a record an implementation could ignore entirely and still pass, which is
 how a feature matrix ends up claiming things the suite never checked.
+
+The same applies field by field, not only record by record. `profile` and `library` are
+the Header's first two fields; every SDK could read them and none asserted them, so an
+implementation returning an empty string for both was indistinguishable here from one that
+decoded them properly. That is the worst shape a gap can take — not a failure, but a
+success that proves less than it appears to.
 """
 
 from __future__ import annotations
@@ -106,6 +112,14 @@ def summarize(
         "gaussianCount": str(n),
         "durationSec": num(header.duration_sec),
         "cutoff": num(header.cutoff),
+        # The Header's first two fields. Readable in every SDK from the start and asserted
+        # by none of them, which is a hiding place rather than an omission: a binding that
+        # returned an empty string for both — because it never wired them through — read
+        # successfully, produced a summary identical to a correct one, and passed. The C++
+        # binding did exactly that once. A field that no expectation mentions is a field an
+        # implementation can decline to decode.
+        "profile": header.profile,
+        "library": header.library,
         "shDegree": int(header.sh_degree),
         "temporalModel": header.temporal_model,
         "hasAudio": bool(header.has_audio),

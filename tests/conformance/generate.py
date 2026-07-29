@@ -49,8 +49,10 @@ def build(scenario, flags) -> tuple[bytes, str]:
     """Encode one variant and produce its expectation."""
     raw = scenarios.build_gaussians(scenario)
     n = len(raw["positions"])
-    sh_degree = 2 if "SHDegree2" in flags else (1 if "SHDegree1" in flags else 0)
-    coeffs = {0: 0, 1: 9, 2: 24}[sh_degree]
+    sh_degree = next((d for d in (3, 2, 1) if f"SHDegree{d}" in flags), 0)
+    # Coefficients per gaussian: three colour components times the coefficients a whole
+    # degree carries (3, 8, 15 — the cumulative sum of `2b + 1` over its bands).
+    coeffs = {0: 0, 1: 9, 2: 24, 3: 45}[sh_degree]
 
     gaussians = fourdgs.GaussianSet(
         positions=np.asarray(raw["positions"], dtype=np.float32).reshape(n, 3),

@@ -23,7 +23,9 @@
   "gaussianCount": "256",
   "hasAudio": false,
   "headerAttributes": {},
+  "library": "4dgs conformance generator",
   "metadataRecords": [],
+  "profile": "baked",
   "sample": {
     "colors": [
       [

@@ -22,7 +22,7 @@ All notable changes to the C++ package are documented here, following
 
 ### Notes
 
-Conformance-verified: 63 checks over 32 variants on both read paths, the same numbers as the
+Conformance-verified: 67 checks over 34 variants on both read paths, the same numbers as the
 reference implementation, and the feature matrix records exactly what that proves. Nothing is
 released yet — the package has no version to release from, and the encode rows stay `Planned`
 because it decodes only at v1.

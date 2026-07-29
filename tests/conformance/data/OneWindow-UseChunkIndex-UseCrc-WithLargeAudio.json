@@ -27,7 +27,9 @@
   "gaussianCount": "64",
   "hasAudio": true,
   "headerAttributes": {},
+  "library": "4dgs conformance generator",
   "metadataRecords": [],
+  "profile": "capture",
   "sample": {
     "colors": [
       [

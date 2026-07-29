@@ -394,7 +394,11 @@ std::string canonical(const SceneSummary& summary) {
       {"gaussianCount", integer(static_cast<std::uint64_t>(gaussians.count))},
       {"hasAudio", Json::boolean(header.hasAudio)},
       {"headerAttributes", stringMap(header.attributes)},
+      // The Header's first two fields: read into this summary's struct since the binding
+      // existed, emitted by nothing until now. Keys stay alphabetical.
+      {"library", Json::string(header.library)},
       {"metadataRecords", Json::array(std::move(metadata))},
+      {"profile", Json::string(header.profile)},
       {"sample", Json::object({
                      {"colors", floatRows(gaussians.colors, sample, 4)},
                      {"motions", floatRows(gaussians.motions, sample, 3)},
