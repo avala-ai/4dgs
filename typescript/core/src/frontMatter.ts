@@ -18,6 +18,7 @@
  */
 
 import { Cursor } from "./cursor.js";
+import { MalformedFile } from "./errors.js";
 import type { IReadable } from "./readable.js";
 import { RECORD_HEADER_BYTES } from "./records.js";
 
@@ -93,6 +94,11 @@ export class FrontMatterScanner {
 
   private async ensure(at: number, length: number): Promise<void> {
     if (this.covers(at, length)) return;
+    if (at < 0 || at + length > this.size) {
+      throw new MalformedFile(
+        `a record spans [${at}, ${at + length}), outside the ${this.size}-byte file`,
+      );
+    }
     const want = Math.min(Math.max(this.probeBytes, length), this.size - at);
     this.window = await this.source.read(BigInt(at), BigInt(want));
     this.windowAt = at;

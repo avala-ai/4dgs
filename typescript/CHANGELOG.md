@@ -24,9 +24,23 @@ The four packages version together.
   retains the summary region until the Footer says where that region began.
 - `IndexedDecoder.readCamera`, `readMetadata` and `readAttachments`, each fetching exactly its own
   record.
+- A fuzz suite holding one invariant: for any input at all, the decoder either succeeds or throws a
+  `FourdgsError` — never a `RangeError` from a transport, never unbounded allocation, never a hang.
+  It shares its generator and its mutation operators with the Python fuzzer seed for seed, so a
+  crash found by one implementation reproduces in the other from two integers.
+- A browser smoke test that decodes corpus fixtures in a real headless Chrome, through both
+  `BlobReadable` and `HttpRangeReadable` against a server answering `206 Partial Content`, with the
+  browser's own `DecompressionStream` doing the inflating. Node can prove the decoder decodes; it
+  cannot prove either of those two things, which is why they were previously unproven.
 
 ### Fixed
 
+- **Crash classes found by fuzzing.** A corrupt payload escaped as whatever the runtime's inflater
+  throws — a `TypeError` from Node's `DecompressionStream` — and a chunk, band, audio or record
+  range pointing outside the file escaped as a `RangeError` from the transport. Both are
+  `MalformedFile` now. The same fuzzer found a denial of service shared with the Python decoder: a
+  constant-mode stream declaring 2^30 elements expanded a one-byte payload into gigabytes, because
+  the size cap bounded what arrives rather than what it becomes.
 - `IndexedDecoder.open` could not open a file whose front matter held a record larger than its 64
   KiB probe — the same bug the Python reader had, found by the same corpus variant. The walk now
   steps over a record by arithmetic and fetches only what it wants.

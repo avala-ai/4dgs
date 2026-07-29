@@ -117,6 +117,12 @@ def decode_streams(
     missing = [a for a in op.REQUIRED_ATTRIBUTES if a not in got]
     if missing and count:
         raise MalformedFile(f"chunk is missing required attributes {missing}")
+    for attribute, values in got.items():
+        if values.shape[0] != count or values.shape[1] < 1:
+            raise MalformedFile(
+                f"attribute {attribute} decoded to {values.shape[0]}x{values.shape[1]}, "
+                f"the chunk declares {count} gaussians"
+            )
     if not count:
         empty = np.zeros((0, 3), dtype=np.float64)
         return {
@@ -189,7 +195,10 @@ def merge_chunk_bands(counts: list[int], chunk_bands: list[dict[int, np.ndarray]
                 raise MalformedFile(f"a chunk carries SH bands {sorted(bands)}, the file carries {present}")
             first, last = SH_BAND_RANGE[band]
             width = last - first
-            values = np.asarray(bands[band], dtype=np.int64).reshape(count, 3 * width)
+            values = np.asarray(bands[band], dtype=np.int64)
+            if values.size != count * 3 * width:
+                raise MalformedFile(f"SH band {band} decoded {values.size} values, expected {count * 3 * width}")
+            values = values.reshape(count, 3 * width)
             if values.min(initial=0) < 0 or values.max(initial=0) > 255:
                 raise MalformedFile("an SH coefficient is outside the 0..255 range this version stores")
             for c in range(3):

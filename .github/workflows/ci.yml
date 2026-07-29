@@ -77,6 +77,11 @@ jobs:
       # the same one a contributor runs locally.
       - run: ruff check .
       - run: ruff format --check .
+      # The fuzzer mutates real corpus files, so the corpus has to exist before
+      # the suite runs. It fails rather than skips without one: a fuzz run that
+      # quietly tested nothing is worse than no fuzz run.
+      - name: Corpus
+        run: python tests/conformance/generate.py
       - name: Tests
         run: python -m pytest python/fourdgs/tests -q
 
@@ -134,6 +139,39 @@ jobs:
             echo "::error::some tests skipped; they must all run in CI"
             exit 1
           }
+
+  fuzz:
+    # The invariant: for any input at all, a decoder either succeeds or raises the
+    # format's own error type. Both languages, the same mutations, the same seeds —
+    # a crash found by one is handed to the other as two integers.
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+
+      - name: Corpus and build
+        run: |
+          pip install -e ./python/fourdgs
+          python tests/conformance/generate.py
+          corepack enable
+          yarn install --immutable
+          yarn build
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+
+      - name: Python
+        run: python -m pytest python/fourdgs/tests/test_fuzz.py -q
+        env:
+          FOURDGS_FUZZ_ITERATIONS: "15000"
+
+      - name: TypeScript
+        run: node --test typescript/conformance/dist/fuzz.test.js
+        env:
+          FOURDGS_FUZZ_ITERATIONS: "8000"
 
   rust:
     runs-on: ubuntu-latest

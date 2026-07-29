@@ -22,6 +22,9 @@ words:
   # Format and project vocabulary
   - fourdgs
   - pread
+  - PRNG
+  - pytest
+  - xorshift
   - seekable
   - streamable
   - Kaitai

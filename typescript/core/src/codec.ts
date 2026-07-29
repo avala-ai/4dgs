@@ -77,6 +77,13 @@ export const inflateZlib: Decompressor = async (input, expectedLength) => {
       out.set(value, filled);
       filled += value.byteLength;
     }
+  } catch (error) {
+    // A corrupt payload surfaces as whatever the runtime's inflater throws — a TypeError
+    // in Node, a DOMException in a browser. A caller decoding an untrusted file should
+    // not have to know which, or which runtime it is on.
+    if (error instanceof MalformedFile) throw error;
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new MalformedFile(`deflate stream is corrupt${detail ? `: ${detail}` : ""}`);
   } finally {
     reader.releaseLock();
     await written;

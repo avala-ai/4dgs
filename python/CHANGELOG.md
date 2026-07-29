@@ -6,7 +6,27 @@ All notable changes to the Python package are documented here, following
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- A fuzz suite, `tests/test_fuzz.py`, holding one invariant: for any input at all, a decoder either
+  succeeds or raises a `FourdgsError`. Never a codec library's exception, never unbounded
+  allocation, never a hang — an input that exceeds the time ceiling is a failure, not a slow test.
+  Mutations are structural (truncations at record boundaries, impossible lengths, spliced and
+  dropped records, corrupted footers) rather than purely random, and the generator is shared with
+  the TypeScript fuzzer seed for seed, so a crash found by one implementation reproduces in the
+  other from two integers. Every input that has ever found a crash is replayed on every run.
+
+### Fixed
+
+- **Ten crash classes found by fuzzing, and one denial of service.** A corrupt deflate or zstd
+  payload escaped as the codec library's own exception; a string field that was not UTF-8 escaped as
+  `UnicodeDecodeError`; an index entry, band range or audio range pointing outside the file escaped
+  as the transport's error; a spherical-harmonic band whose element count disagreed with its chunk
+  raised `ValueError`; an attribute stream with no columns raised `IndexError`; a rotation index
+  outside 0..3 indexed off the end of a table; and a header cutoff of zero reached a logarithm. All
+  are `MalformedFile` now. The denial of service is separate: a constant-mode stream declaring 2^30
+  elements expanded a one-byte payload into gigabytes, because the size cap bounded what arrives
+  rather than what it becomes. One flipped bit cost 1.4 seconds; it now costs a refusal.
 
 ## [0.1.0] - 2026-07-28
 

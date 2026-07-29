@@ -28,3 +28,24 @@ Every decoder here validates before it allocates: lengths are checked against th
 decompressed sizes against the declared size, and counts against a documented ceiling. A file that
 fails validation is refused with a message that names the offending field — never partially decoded
 into a caller's buffer.
+
+## How that is checked
+
+The section above is a claim, so it is fuzzed rather than asserted. Every implementation holds one
+invariant:
+
+> For any input at all, a decoder either succeeds or raises the format's own error type.
+
+Never an uncaught error from a codec library, a transport or a maths function; never unbounded
+allocation; never a hang. A single input that takes longer than the ceiling is a failure, not a slow
+test.
+
+`tests/fuzz/` has the operator list, the shared seed scheme — the same seed names the same bytes in
+every language, so a crash found by one implementation is handed to another as two integers — and
+`regressions.json`, which records every input that has ever found something and replays all of them
+on every run. The fuzzers run in CI on both implementations.
+
+The first pass found ten crash classes, including one that was not an exception at all: a
+constant-mode attribute stream declaring 2^30 elements, which expanded a one-byte payload into
+gigabytes. The cap it evaded bounded what arrives rather than what it becomes — the distinction is
+now checked in both decoders, and the input that found it is case `constant-stream-expansion-bomb`.

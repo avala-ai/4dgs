@@ -18,6 +18,7 @@
     "typecheck": "tsc -b",
     "clean": "tsc -b --clean",
     "test": "tsc -b && node --test typescript/conformance/dist/*.test.js",
-    "conformance": "python3 tests/conformance/run.py --runner typescript"
+    "conformance": "python3 tests/conformance/run.py --runner typescript",
+    "fuzz": "tsc -b && node --test typescript/conformance/dist/fuzz.test.js"
   }
 }

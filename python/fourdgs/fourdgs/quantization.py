@@ -27,6 +27,8 @@ from dataclasses import asdict, dataclass
 
 import numpy as np
 
+from .exceptions import MalformedFile
+
 PROFILES = ("fine", "default", "coarse")
 
 #: The Header's default marginal visibility threshold.
@@ -43,7 +45,12 @@ def support_k(cutoff: float = DEFAULT_CUTOFF) -> float:
     the velocity precision class, so a decoder that assumes 0.05 decodes different
     velocities than the encoder wrote for any file that declares something else, and
     nothing in the file tells it that it did.
+
+    A threshold outside `(0, 1]` is not a threshold. It comes from a corrupt header, and
+    it has to be refused here rather than become a domain error inside a logarithm.
     """
+    if not (0.0 < cutoff <= 1.0) or math.isnan(cutoff):
+        raise MalformedFile(f"the Header's cutoff is {cutoff}; a marginal threshold must be in (0, 1]")
     return math.sqrt(-2.0 * math.log(cutoff))
 
 
@@ -200,6 +207,11 @@ def quantize_rotation(quats, step: float) -> tuple[np.ndarray, np.ndarray]:
 
 def dequantize_rotation(largest, bins, step: float) -> np.ndarray:
     largest = np.asarray(largest, dtype=np.int64)
+    if largest.size and (largest.min() < 0 or largest.max() > 3):
+        raise MalformedFile(
+            f"rotation index {largest.min() if largest.min() < 0 else largest.max()} is outside 0..3; "
+            "it names which quaternion component was omitted"
+        )
     rest = np.clip(dequantize(bins, step), -1.0, 1.0)
     out = np.zeros((len(largest), 4), dtype=np.float64)
     np.put_along_axis(out, _REST[largest], rest, axis=1)

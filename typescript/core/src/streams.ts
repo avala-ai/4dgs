@@ -105,6 +105,19 @@ export async function decodeStream(stream: RawStream, codecs: CodecRegistry): Pr
     );
   }
 
+  // The cap above bounds what arrives; this one bounds what it becomes. A constant stream
+  // stores `channels` symbols and repeats them `elementCount` times, so a header declaring
+  // 2^30 elements expands a one-byte payload into gigabytes — and a raw stream of one-byte
+  // symbols still expands fourfold into Int32. Neither is caught by a cap on the payload,
+  // and both are a few bytes of input away from any file.
+  const produced = elementCount * channels * 4;
+  if (produced > MAX_STREAM_BYTES) {
+    throw new MalformedFile(
+      `attribute ${attributeId} declares ${elementCount} elements x ${channels} channels, ` +
+        `which would decode to ${produced} bytes, past the ${MAX_STREAM_BYTES} cap`,
+    );
+  }
+
   const decompress = decompressorFor(stream.codec, codecs);
   const raw = await decompress(stream.payload, expected);
   const values = unshuffleAndUnzigzag(raw, symbolWidth, symbols);

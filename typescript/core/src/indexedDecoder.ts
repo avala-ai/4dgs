@@ -41,6 +41,7 @@ import {
   type SummaryOffset,
   FOOTER_TAIL_BYTES,
   MAGIC,
+  RECORD_HEADER_BYTES,
   bytesEqual,
   checkMagic,
   entryCovers,
@@ -260,7 +261,7 @@ export class IndexedDecoder {
   }
 
   private async readRecordAt(range: ByteRange, expected: number): Promise<Uint8Array> {
-    const blob = await this.source.read(BigInt(range.offset), BigInt(range.length));
+    const blob = await this.readRange(range.offset, range.length, `the record at ${range.offset}`);
     const record = readRecord(new Cursor(blob, 0, range.offset));
     if (record.opcode !== expected) {
       throw new MalformedFile(
@@ -269,6 +270,26 @@ export class IndexedDecoder {
       );
     }
     return record.content;
+  }
+
+  /**
+   * Read a byte range a record pointed at, refusing one that leaves the file.
+   *
+   * An index entry is data, and data in an untrusted file can say anything. A range that
+   * runs off the end has to come back as a malformed file rather than as whatever the
+   * transport happens to throw — a caller decoding a hostile file should not have to
+   * catch the error type of somebody's HTTP client.
+   */
+  private async readRange(offset: number, length: number, what: string): Promise<Uint8Array> {
+    if (offset < 0 || length < 0 || offset + length > this.size) {
+      throw new MalformedFile(
+        `${what} spans [${offset}, ${offset + length}), outside the ${this.size}-byte file`,
+      );
+    }
+    if (length < RECORD_HEADER_BYTES) {
+      throw new MalformedFile(`${what} is ${length} bytes, too short to be a record`);
+    }
+    return this.source.read(BigInt(offset), BigInt(length));
   }
 
   /** Whether the scene has audio, from the Header alone. */
@@ -305,7 +326,7 @@ export class IndexedDecoder {
    */
   async readChunk(entry: ChunkIndexEntry, options: ReadChunkOptions = {}): Promise<IndexedChunk> {
     const maxShBand = options.maxShBand ?? 0;
-    const blob = await this.source.read(BigInt(entry.chunkOffset), BigInt(entry.chunkLength));
+    const blob = await this.readRange(entry.chunkOffset, entry.chunkLength, "a chunk index entry");
     const record = readRecord(new Cursor(blob, 0, entry.chunkOffset));
     if (record.opcode !== Opcode.Chunk) {
       throw new MalformedFile(
@@ -330,7 +351,7 @@ export class IndexedDecoder {
     const bands = new Map<number, Int32Array>();
     for (const band of entry.bands) {
       if (band.band > maxShBand) continue;
-      const bandBlob = await this.source.read(BigInt(band.offset), BigInt(band.length));
+      const bandBlob = await this.readRange(band.offset, band.length, `index band ${band.band}`);
       const bandRecord = readRecord(new Cursor(bandBlob, 0, band.offset));
       if (bandRecord.opcode !== Opcode.ShBandStream) {
         throw new MalformedFile(
@@ -359,7 +380,7 @@ export class IndexedDecoder {
   async readAudio(): Promise<AudioTrack | null> {
     if (this.audioRange === null) return null;
     const { offset, length } = this.audioRange;
-    const blob = await this.source.read(BigInt(offset), BigInt(length));
+    const blob = await this.readRange(offset, length, "the Audio record");
     return parseAudio(readRecord(new Cursor(blob, 0, offset)).content);
   }
 

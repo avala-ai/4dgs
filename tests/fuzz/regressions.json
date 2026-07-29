@@ -1,0 +1,75 @@
+{
+  "comment": "Inputs that have found a crash. Every one of these runs on every fuzz run, forever, the same way a corpus variant does. A case is a seed plus the variant and operator that seed selected: recording those two explicitly is what keeps a case reproducing the same bytes after the corpus grows.",
+  "cases": [
+    {
+      "name": "corrupt-deflate-payload",
+      "variant": "TenWindows-AddExtraDataToRecords-UseChunkIndex-UseCrc",
+      "operator": "max_run",
+      "seed": 1296512270,
+      "found": "zlib.error / TypeError escaped from the inflater; a corrupt payload is a malformed file, not the codec library's exception type"
+    },
+    {
+      "name": "string-field-that-is-not-utf8",
+      "variant": "OneGaussian-UseChunkIndex-UseCrc",
+      "operator": "swap_records",
+      "seed": 1296512512,
+      "found": "UnicodeDecodeError escaped from a string field"
+    },
+    {
+      "name": "sh-band-element-count-mismatch",
+      "variant": "MixedLifetimes-Quantized-SHDegree2-UseChunkIndex-UseChunks-UseCrc",
+      "operator": "drop_record",
+      "seed": 1296512384,
+      "found": "ValueError from reshaping a band stream whose element count disagreed with its chunk"
+    },
+    {
+      "name": "corrupt-zstd-payload",
+      "variant": "MixedLifetimes-SHDegree2-UseChunkIndex-UseCrc",
+      "operator": "flip_bit",
+      "seed": 1296513123,
+      "found": "ZstdError escaped when a corrupted codec byte selected zstd"
+    },
+    {
+      "name": "attribute-stream-with-no-columns",
+      "variant": "MixedLifetimes-Quantized-UseChunkIndex-UseCrc",
+      "operator": "zero_run",
+      "seed": 1296513882,
+      "found": "IndexError from a stream that decoded to zero channels"
+    },
+    {
+      "name": "index-entry-pointing-outside-the-file",
+      "variant": "TenWindows-UseChunkIndex-UseCrc-WithCamera",
+      "operator": "impossible_length",
+      "seed": 1296512529,
+      "found": "ValueError / RangeError from the transport when a record's declared range left the file"
+    },
+    {
+      "name": "footer-summary-past-the-footer",
+      "variant": "MixedLifetimes-UseChunkIndex-UseCrc",
+      "operator": "corrupt_footer",
+      "seed": 1296512273,
+      "found": "ValueError from a negative read length; the bug that made validate() crash on the file it exists to diagnose"
+    },
+    {
+      "name": "rotation-index-outside-0-3",
+      "variant": "TenWindows-DeltaStreams-Quantized-UseChunkIndex-UseChunks-UseCrc",
+      "operator": "flip_bit",
+      "seed": 1296544336,
+      "found": "IndexError from a rotation index naming a component that does not exist"
+    },
+    {
+      "name": "cutoff-outside-0-1",
+      "variant": "OneWindow-Quantized-UseChunkIndex-UseCrc",
+      "operator": "zero_run",
+      "seed": 1296535141,
+      "found": "math domain error from log(cutoff) when a corrupt header declared a threshold of zero"
+    },
+    {
+      "name": "constant-stream-expansion-bomb",
+      "variant": "TenWindows-UseChunkIndex-UseCrc-WithAttachment-WithMetadata",
+      "operator": "flip_bit",
+      "seed": 1296533904,
+      "found": "1.4 seconds and gigabytes of allocation from one flipped bit: a constant stream declaring 2^30 elements expands a one-byte payload, which the payload-size cap never saw"
+    }
+  ]
+}

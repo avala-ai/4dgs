@@ -20,7 +20,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .exceptions import TruncatedFile, UnsupportedCodec, UnsupportedVersion
+from .exceptions import MalformedFile, TruncatedFile, UnsupportedCodec, UnsupportedVersion
 
 #: `0x89 4 D G S 1 CR LF`. The high bit stops byte-oriented tooling treating the file as
 #: text; the `1` is the major version; the CR LF catches transports that mangle line
@@ -90,7 +90,12 @@ class Cursor:
         return [float(v) for v in struct.unpack_from(f"<{n}d", self.take(8 * n))]
 
     def string(self) -> str:
-        return bytes(self.take(self.u32())).decode("utf-8")
+        at = self.pos
+        raw = bytes(self.take(self.u32()))
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise MalformedFile(f"string at offset {at} is not valid UTF-8") from exc
 
     def blob(self) -> bytes:
         return bytes(self.take(self.u64()))
@@ -251,14 +256,26 @@ def compress(raw: bytes, codec: int, level: int) -> bytes:
 
 
 def decompress(body: bytes, codec: int, expected: int) -> bytes:
+    """Undo one stream's compression, refusing a payload that is not what it claims.
+
+    A codec library's own exception type is not this library's, and a caller decoding an
+    untrusted file should not have to catch `zlib.error` to find out that the file was
+    corrupt. Every failure in here comes back as a `MalformedFile`.
+    """
     if codec == CODEC_DEFLATE:
-        out = zlib.decompress(body, bufsize=min(expected, 1 << 20))
+        try:
+            out = zlib.decompress(body, bufsize=min(expected, 1 << 20))
+        except zlib.error as exc:
+            raise MalformedFile(f"deflate stream is corrupt: {exc}") from exc
     elif codec == CODEC_ZSTD:
         try:
             import zstandard
         except ImportError as exc:  # pragma: no cover - optional dependency
             raise UnsupportedCodec("this file uses zstd streams: pip install 'fourdgs[zstd]'") from exc
-        out = zstandard.ZstdDecompressor().decompress(body, max_output_size=expected)
+        try:
+            out = zstandard.ZstdDecompressor().decompress(body, max_output_size=expected)
+        except zstandard.ZstdError as exc:
+            raise MalformedFile(f"zstd stream is corrupt: {exc}") from exc
     else:
         raise UnsupportedCodec(f"unknown stream codec {codec}")
     if len(out) != expected:
@@ -322,12 +339,26 @@ def decode_stream(cursor: Cursor) -> tuple[int, np.ndarray]:
         cursor.take(payload_len)
         return attribute_id, np.zeros((0, channels), dtype=np.int64)
     if width not in (1, 2, 4):
-        raise TruncatedFile(f"attribute {attribute_id}: bad symbol width {width}")
+        raise MalformedFile(f"attribute {attribute_id}: bad symbol width {width}")
+    if channels == 0:
+        raise MalformedFile(f"attribute {attribute_id}: zero channels")
 
     symbols = channels if mode == MODE_CONST else count * channels
     expected = symbols * width
     if expected > MAX_STREAM_BYTES:
-        raise TruncatedFile(f"attribute {attribute_id} declares {expected} bytes, past the {MAX_STREAM_BYTES} cap")
+        raise MalformedFile(f"attribute {attribute_id} declares {expected} bytes, past the {MAX_STREAM_BYTES} cap")
+
+    # The cap above bounds what arrives; this one bounds what it becomes. A constant
+    # stream stores `channels` symbols and repeats them `count` times, so a header
+    # declaring 2^30 elements expands a one-byte payload into gigabytes — and a raw
+    # stream of one-byte symbols still expands eightfold into int64. Neither is caught by
+    # a cap on the payload, and both are a few bytes of input away from any file.
+    produced = count * channels * 8
+    if produced > MAX_STREAM_BYTES:
+        raise MalformedFile(
+            f"attribute {attribute_id} declares {count} elements x {channels} channels, "
+            f"which would decode to {produced} bytes, past the {MAX_STREAM_BYTES} cap"
+        )
 
     raw = decompress(bytes(cursor.take(payload_len)), codec, expected)
     sym = _unshuffle(raw, width, symbols)

@@ -12,6 +12,8 @@
  * different numbers than the encoder wrote.
  */
 
+import { MalformedFile } from "./errors.js";
+
 /** Grid pitches, as the Quantization record declares them. */
 export interface Steps {
   readonly pos: number;
@@ -45,6 +47,11 @@ export const DEFAULT_CUTOFF = 0.05;
  * exactly while `|t - mu_t| <= K * sigma_t`.
  */
 export function supportK(cutoff: number): number {
+  if (!(cutoff > 0 && cutoff <= 1)) {
+    throw new MalformedFile(
+      `the Header's cutoff is ${cutoff}; a marginal threshold must be in (0, 1]`,
+    );
+  }
   return Math.sqrt(-2 * Math.log(cutoff));
 }
 
@@ -124,7 +131,12 @@ export function dequantizeRotation(
   out: Float32Array,
   outOffset: number,
 ): void {
-  const rest = REST_COMPONENTS[largest & 3]!;
+  const rest = REST_COMPONENTS[largest];
+  if (rest === undefined) {
+    throw new MalformedFile(
+      `rotation index ${largest} is outside 0..3; it names which quaternion component was omitted`,
+    );
+  }
   const a = clamp(bin0 * step, -1, 1);
   const b = clamp(bin1 * step, -1, 1);
   const c = clamp(bin2 * step, -1, 1);
@@ -132,7 +144,7 @@ export function dequantizeRotation(
   q[rest[0]] = a;
   q[rest[1]] = b;
   q[rest[2]] = c;
-  q[largest & 3] = Math.sqrt(Math.max(1 - (a * a + b * b + c * c), 0));
+  q[largest] = Math.sqrt(Math.max(1 - (a * a + b * b + c * c), 0));
   let norm = Math.sqrt(q[0]! * q[0]! + q[1]! * q[1]! + q[2]! * q[2]! + q[3]! * q[3]!);
   if (norm === 0) norm = 1;
   out[outOffset] = q[0]! / norm;

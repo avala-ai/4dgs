@@ -103,6 +103,8 @@ class _FrontMatter:
         if self._covers(at, length):
             start = at - self._window_at
             return self._window[start : start + length]
+        if at + length > self._size:
+            raise MalformedFile(f"a record spans [{at}, {at + length}), outside the {self._size}-byte file")
         if length <= self._probe:
             self._ensure(at, length)
             start = at - self._window_at
@@ -115,6 +117,8 @@ class _FrontMatter:
     def _ensure(self, at: int, length: int) -> None:
         if self._covers(at, length):
             return
+        if at < 0 or at + length > self._size:
+            raise MalformedFile(f"a record spans [{at}, {at + length}), outside the {self._size}-byte file")
         want = min(max(self._probe, length), self._size - at)
         self._window = self._source.read(at, want)
         self._window_at = at
@@ -241,7 +245,7 @@ def open_indexed(source: Readable) -> IndexedScene:
 
 def read_chunk(source: Readable, scene: IndexedScene, entry: rec.ChunkIndexEntry, *, max_sh_band: int = 0) -> dict:
     """Fetch and decode one chunk, plus only the SH bands asked for."""
-    blob = source.read(entry.chunk_offset, entry.chunk_length)
+    blob = _read_range(source, entry.chunk_offset, entry.chunk_length, "a chunk index entry")
     head, streams = rec.parse_chunk(Cursor(blob, 9).take(len(blob) - 9))
     decoded = decode_streams(
         chunk_stream_bytes(head, streams),
@@ -255,7 +259,7 @@ def read_chunk(source: Readable, scene: IndexedScene, entry: rec.ChunkIndexEntry
     for band, offset, length in entry.bands:
         if band > max_sh_band:
             continue
-        band_blob = source.read(offset, length)
+        band_blob = _read_range(source, offset, length, f"index band {band}")
         cur = Cursor(band_blob, 9)
         cur.u8()  # band index, already known from the index
         from .serialization import decode_stream
@@ -265,19 +269,36 @@ def read_chunk(source: Readable, scene: IndexedScene, entry: rec.ChunkIndexEntry
     return decoded
 
 
+def _read_range(source: Readable, offset: int, length: int, what: str) -> bytes:
+    """Read a byte range a record pointed at, refusing one that leaves the file.
+
+    An index entry is data, and data in an untrusted file can say anything. A range that
+    runs off the end has to come back as a malformed file rather than as whatever the
+    transport happens to raise — a caller decoding a hostile file should not have to catch
+    the exception type of somebody's HTTP client.
+    """
+    size = source.size()
+    if offset < 0 or length < 0 or offset + length > size:
+        raise MalformedFile(f"{what} spans [{offset}, {offset + length}), outside the {size}-byte file")
+    if length < 9:
+        raise MalformedFile(f"{what} is {length} bytes, too short to be a record")
+    return source.read(offset, length)
+
+
 def read_camera(source: Readable, scene: IndexedScene) -> rec.Camera | None:
     """The suggested camera trajectory, fetched only when a caller wants it."""
     if scene.camera_range is None:
         return None
     offset, length = scene.camera_range
-    return rec.Camera.parse(Cursor(source.read(offset, length), 9).take(length - 9))
+    return rec.Camera.parse(Cursor(_read_range(source, offset, length, "the Camera record"), 9).take(length - 9))
 
 
 def read_metadata(source: Readable, scene: IndexedScene) -> list[rec.Metadata]:
     """Every Metadata record, by range."""
     out = []
     for offset, length in scene.metadata_ranges:
-        out.append(rec.Metadata.parse(Cursor(source.read(offset, length), 9).take(length - 9)))
+        blob = _read_range(source, offset, length, "a Metadata record")
+        out.append(rec.Metadata.parse(Cursor(blob, 9).take(length - 9)))
     return out
 
 
@@ -285,7 +306,8 @@ def read_attachments(source: Readable, scene: IndexedScene) -> list[rec.Attachme
     """Every Attachment record, by range. Each one costs exactly its own bytes."""
     out = []
     for offset, length in scene.attachment_ranges:
-        out.append(rec.Attachment.parse(Cursor(source.read(offset, length), 9).take(length - 9)))
+        blob = _read_range(source, offset, length, "an Attachment record")
+        out.append(rec.Attachment.parse(Cursor(blob, 9).take(length - 9)))
     return out
 
 
@@ -307,4 +329,5 @@ def read_audio(source: Readable, scene: IndexedScene) -> bytes | None:
     if scene.audio_range is None:
         return None
     offset, length = scene.audio_range
-    return rec.Audio.parse(Cursor(source.read(offset, length), 9).take(length - 9)).data
+    blob = _read_range(source, offset, length, "the Audio record")
+    return rec.Audio.parse(Cursor(blob, 9).take(length - 9)).data
