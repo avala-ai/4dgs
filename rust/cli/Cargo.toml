@@ -1,0 +1,24 @@
+[package]
+name = "fourdgs-cli"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.82"
+license = "Apache-2.0"
+description = "Command line tool for the 4dgs container format"
+repository = "https://github.com/avala-ai/4dgs"
+# Unpublished for the same reason the core is: the crate ships when the maintainer says
+# so, not when a tag happens to exist.
+publish = false
+
+# The tool is `4dgs` everywhere a user types it. The crate is `fourdgs-cli` because
+# crates.io refuses a name beginning with a digit — a registry constraint, not a rename.
+# RELEASING.md's naming table records the same thing for every registry.
+[[bin]]
+name = "4dgs"
+path = "src/main.rs"
+
+# Nothing but the library. A format repository's tool that pulls a dependency tree wider
+# than the format's own is a tool nobody can audit, so the argument parser is the fifty
+# lines in `args.rs` rather than a crate.
+[dependencies]
+fourdgs = { path = "../fourdgs" }

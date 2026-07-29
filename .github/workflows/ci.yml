@@ -27,14 +27,18 @@ jobs:
             echo "conformance data: ${size_kb} KiB"
             [ "$size_kb" -le 2560 ] || { echo "::error::conformance data over budget"; exit 1; }
           fi
-      - name: Rust sources under 500 KB
+      - name: Rust sources under 600 KB
         # Sources only: this job builds nothing, so target/ is not here to measure. A
         # vendored dependency would show up as a budget failure, which is the point —
-        # everything this crate needs comes from crates.io via Cargo.toml.
+        # everything these crates need comes from crates.io via Cargo.toml.
+        #
+        # 500 when `rust/` was the core and the conformance runners; 600 now that the
+        # `4dgs` tool is a third crate beside them. The number moves when a package is
+        # added deliberately, which is the one thing it is not meant to catch.
         run: |
           size_kb=$(du -s rust | cut -f1)
           echo "rust: ${size_kb} KiB"
-          [ "$size_kb" -le 500 ] || { echo "::error::rust is ${size_kb} KiB, over the 500 KiB budget"; exit 1; }
+          [ "$size_kb" -le 600 ] || { echo "::error::rust is ${size_kb} KiB, over the 600 KiB budget"; exit 1; }
 
       - name: TypeScript sources under 500 KB
         # Sources only: this job installs nothing and builds nothing, so node_modules
@@ -266,6 +270,15 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
+      # The CLI's tests decode real corpus files, which are generated rather than committed.
+      # They skip themselves without one, which is right for a contributor and wrong here,
+      # so the suite asserts the corpus exists whenever CI is set — and this is the step
+      # that makes that assertion pass rather than fail.
+      - name: Corpus
+        run: |
+          pip install -e ./python/fourdgs
+          python tests/conformance/generate.py
+
       # These cover what the corpus cannot: a file that is not ours, a version we do not
       # implement, a record we have never seen, a length that points past the end.
       #
@@ -275,6 +288,29 @@ jobs:
       # is around 45,000 decodes and takes well under a minute.
       - name: Tests, including the structural fuzz pass
         run: cargo test --workspace
+
+      # The tool as a user meets it: four commands, real files, exit codes asserted. The
+      # crate's own tests already check the fields it prints; what this adds is that the
+      # binary is named `4dgs`, runs on this platform, and answers 2 rather than 0 for a
+      # file it has a warning about — the parts of a CLI that only exist once it is one.
+      - name: The CLI runs over the corpus
+        run: |
+          set -eo pipefail
+          indexed=tests/conformance/data/MixedLifetimes-SHDegree2-UseChunkIndex-UseCrc.4dgs
+          unindexed=tests/conformance/data/TenWindows-UseCrc.4dgs
+          if [ "$RUNNER_OS" = "Windows" ]; then cli=target/debug/4dgs.exe; else cli=target/debug/4dgs; fi
+          "$cli" info "$indexed" | grep -q '^spherical harm degree 2$'
+          "$cli" inspect "$indexed" | grep -q 'Footer'
+          "$cli" inspect --json "$indexed" | grep -q '"trailing_magic": true'
+          "$cli" decode "$indexed" --time 4 --json | grep -q '"total": 512'
+          "$cli" validate "$indexed"
+          # A file with no index is valid, says so, and exits 2 rather than 0 — which is
+          # the whole reason the warning has a code of its own.
+          set +e
+          "$cli" validate "$unindexed"
+          code=$?
+          set -e
+          [ "$code" -eq 2 ] || { echo "::error::a file with no index must exit 2, got $code"; exit 1; }
 
       # The optional codec has to keep compiling, or it rots until the first person who
       # needs it finds out.
