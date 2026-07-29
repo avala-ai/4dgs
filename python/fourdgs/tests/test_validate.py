@@ -203,6 +203,30 @@ class TestRefusals:
             report = validate(minimal_file(quant=quant))
             assert any(f"Quantization {name} is" in m for m in errors(report)), f"{name} is not checked"
 
+    def test_a_bad_quantization_record_followed_by_a_good_one_is_still_refused(self):
+        # Nothing in the framing forbids a second Quantization record. A validator that
+        # inspected only the one left in hand after the walk would pass this file, while a
+        # streamed decoder — which takes the first grid it meets — decodes the whole scene
+        # through the broken one. Each record is checked as it is met, so this is an error.
+        good = grids()
+        bad = grids(step_pos=float("inf"))
+        body = bad.encode() + good.encode()
+        data = MAGIC + rec.Header(duration_sec=1.0, gaussian_count=0, aabb=[0.0] * 6).encode()
+        data += body + rec.WindowTable(windows=[(0.0, 1.0)]).encode() + rec.Footer().encode() + MAGIC
+        report = validate(data)
+        assert not report.ok, "the first, non-finite grid must not be masked by the second"
+        assert any("step_pos is inf" in m for m in errors(report)), errors(report)
+
+    def test_the_offending_quantization_record_is_named_when_there_is_more_than_one(self):
+        # The reverse order: the good grid first, the broken one second. The report has to
+        # say which copy, or the reader is left looking at a record that is fine.
+        data = MAGIC + rec.Header(duration_sec=1.0, gaussian_count=0, aabb=[0.0] * 6).encode()
+        data += grids().encode() + grids(step_time=float("nan")).encode()
+        data += rec.WindowTable(windows=[(0.0, 1.0)]).encode() + rec.Footer().encode() + MAGIC
+        report = validate(data)
+        assert not report.ok
+        assert any("Quantization record 2 step_time" in m for m in errors(report)), errors(report)
+
     def test_a_file_with_no_records_at_all(self):
         report = validate(MAGIC)
         assert not report.ok
