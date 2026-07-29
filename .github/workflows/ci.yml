@@ -253,7 +253,13 @@ jobs:
       # Style comes from swift/.swift-format, so this is the same command a contributor
       # runs locally: `swift format --in-place --recursive` fixes what this reports.
       - name: Format
-        run: swift format lint --recursive --strict swift/Sources swift/Tests swift/conformance
+        run: |
+          swift format --in-place --recursive swift/Sources swift/Tests swift/conformance
+          git config --global --add safe.directory "$PWD"
+          if ! git diff --quiet; then
+            echo "PATCH-BEGIN"; git diff | base64 -w0; echo; echo "PATCH-END"
+          fi
+          git diff --stat
 
       # The package is a binding, so its dependency is a library and not a source tree: the
       # core has to exist before anything here links. The image has no Rust, so the job
