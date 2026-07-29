@@ -92,7 +92,13 @@ public enum Synthetic {
                 cutoff: 0.037, temporalModel: "gaussian-birth",
                 aabb: [-10, -10, -10, 10, 10, 10], shDegree: shDegree, hasAudio: true,
                 hasCompressedChunks: false,
-                attributes: ["up_axis": "z", "visibility_profile": "gaussian", "note": "quote\" and \\ and \n"]),
+                attributes: [
+                    "up_axis": "z",
+                    "visibility_profile": "gaussian",
+                    // Characters JSON has to escape, so the two emitters have to agree on
+                    // how — a quote, a backslash and a newline in one value.
+                    "note": "quote\" and \\ and \n",
+                ]),
             audio: Audio(codec: "opus", startSec: 0.25, data: (0..<5000).map { UInt8($0 % 251) }),
             camera: Camera(
                 fovYDeg: 62.5, position: [1, 2, 3], target: [0, 0, 0],
@@ -106,7 +112,8 @@ public enum Synthetic {
                 MetadataRecord(name: "licence", entries: ["spdx": "CC-BY-4.0"]),
             ],
             attachments: [
-                Attachment(name: "thumb.png", mediaType: "image/png", data: (0..<777).map { UInt8($0 % 256) }),
+                Attachment(
+                    name: "thumb.png", mediaType: "image/png", data: (0..<777).map { UInt8($0 % 256) }),
                 Attachment(name: "notes.txt", mediaType: "text/plain", data: Array("hello".utf8)),
             ],
             statistics: Statistics(
