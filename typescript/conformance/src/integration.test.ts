@@ -281,6 +281,46 @@ test("legacy audio payloads arrive in bounded streamed pieces", async (t) => {
   assert.ok(largestPart <= 32, `one legacy payload part retained ${largestPart} bytes`);
 });
 
+test("a truncated legacy descriptor cannot allocate from its codec length", async (t) => {
+  const path = corpus("OneWindow-UseChunkIndex-UseCrc-WithSpatialAudio");
+  if (path === null) return t.skip("corpus not generated");
+
+  const bytes = Uint8Array.from(readFileSync(path));
+  const descriptor = [...iterateRecords(bytes, MAGIC.length)].find(
+    (record) => record.opcode === Opcode.AudioSource,
+  );
+  assert.ok(descriptor);
+  bytes[descriptor.offset] = Opcode.Audio;
+  const view = new DataView(bytes.buffer, bytes.byteOffset);
+  view.setBigUint64(descriptor.offset + 1, BigInt(bytes.byteLength), true);
+  view.setUint32(descriptor.offset + RECORD_HEADER_BYTES, 0xffff_ffff, true);
+
+  const scene = await decodeScene(bytes, { blockSize: 32 });
+  assert.equal(scene.truncated, true);
+  assert.equal(scene.audioSources.length, 0);
+});
+
+test("a legacy codec descriptor has a fixed allocation bound", async (t) => {
+  const path = corpus("OneWindow-UseChunkIndex-UseCrc-WithLargeAudio");
+  if (path === null) return t.skip("corpus not generated");
+
+  const bytes = Uint8Array.from(readFileSync(path));
+  const audio = [...iterateRecords(bytes, MAGIC.length)].find(
+    (record) => record.opcode === Opcode.AudioData,
+  );
+  assert.ok(audio);
+  bytes[audio.offset] = Opcode.Audio;
+  new DataView(bytes.buffer, bytes.byteOffset).setUint32(
+    audio.offset + RECORD_HEADER_BYTES,
+    5000,
+    true,
+  );
+  await assert.rejects(
+    () => decodeScene(bytes, { blockSize: 32 }),
+    /descriptor exceeds the bounded 4096-byte limit/,
+  );
+});
+
 test("indexed opening rejects orphan Audio Data beside legacy audio", async (t) => {
   const path = corpus("OneWindow-UseChunkIndex-UseCrc-WithSpatialAudio");
   if (path === null) return t.skip("corpus not generated");
@@ -305,6 +345,26 @@ test("indexed opening rejects orphan Audio Data beside legacy audio", async (t) 
   await assert.rejects(
     () => IndexedDecoder.open(new BytesReadable(bytes)),
     /Audio Data id \d+ has no matching Audio Source record/,
+  );
+});
+
+test("indexed opening rejects Audio Data framing that passes EOF", async (t) => {
+  const path = corpus("OneWindow-UseChunkIndex-UseCrc-WithSpatialAudio");
+  if (path === null) return t.skip("corpus not generated");
+
+  const bytes = Uint8Array.from(readFileSync(path));
+  const payload = [...iterateRecords(bytes, MAGIC.length)].find(
+    (record) => record.opcode === Opcode.AudioData,
+  );
+  assert.ok(payload);
+  new DataView(bytes.buffer, bytes.byteOffset).setBigUint64(
+    payload.offset + 1,
+    BigInt(bytes.byteLength),
+    true,
+  );
+  await assert.rejects(
+    () => IndexedDecoder.open(new BytesReadable(bytes)),
+    /spans .* outside the .*byte file/,
   );
 });
 

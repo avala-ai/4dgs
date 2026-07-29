@@ -121,6 +121,10 @@ export interface AudioPayloadChunk {
 }
 
 const DEFAULT_BLOCK_SIZE = 1 << 20;
+// Kept in step with the indexed reader's bounded prefix read. A codec name is a registry
+// descriptor, not payload; letting its u32 length size an allocation would give a few
+// hostile bytes a multi-gigabyte memory effect.
+const MAX_LEGACY_AUDIO_DESCRIPTOR_BYTES = 4096;
 const STREAMED_RECORD_OPCODES: ReadonlySet<number> = new Set([Opcode.Audio, Opcode.AudioData]);
 
 interface LegacyAudioDescriptor {
@@ -209,6 +213,14 @@ export async function decodeScene(
     // what is cut is not, and nothing has to be undone.
     for (const item of decoder.recordsStreaming(STREAMED_RECORD_OPCODES)) {
       if ("bytes" in item) {
+        const recordEnd = item.recordOffset + RECORD_HEADER_BYTES + item.contentLength;
+        if (!Number.isSafeInteger(recordEnd) || recordEnd > size) {
+          // The resource ends inside this streamed record. Do not parse a partial prefix:
+          // in particular, do not allocate from a codec length whose containing record
+          // has not been shown to exist. `decoder.end()` records the truncation.
+          truncated = true;
+          continue;
+        }
         if (chunks.length > 0) {
           const name = item.opcode === Opcode.Audio ? "Audio" : "Audio Data";
           throw new MalformedFile(`an ${name} record appears after the first Chunk`);
@@ -489,6 +501,13 @@ async function consumeLegacyAudioPart(
         throw new MalformedFile(
           `legacy Audio record at offset ${state.recordOffset} declares a ${codecLength}-byte ` +
             `codec, but its content is only ${state.contentLength} bytes`,
+        );
+      }
+      if (prefixLength > MAX_LEGACY_AUDIO_DESCRIPTOR_BYTES) {
+        throw new MalformedFile(
+          `legacy Audio record at offset ${state.recordOffset} declares a ${codecLength}-byte ` +
+            `codec; its ${prefixLength}-byte descriptor exceeds the bounded ` +
+            `${MAX_LEGACY_AUDIO_DESCRIPTOR_BYTES}-byte limit`,
         );
       }
       const expanded = new Uint8Array(prefixLength);

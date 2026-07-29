@@ -63,8 +63,16 @@ export class FrontMatterScanner {
       const cursor = new Cursor(this.window, at - this.windowAt, this.windowAt);
       const opcode = cursor.u8();
       const contentLength = cursor.u64();
-      yield { opcode, offset: at, contentLength, totalLength: contentLength + RECORD_HEADER_BYTES };
-      at += RECORD_HEADER_BYTES + contentLength;
+      const totalLength = contentLength + RECORD_HEADER_BYTES;
+      const end = at + totalLength;
+      if (!Number.isSafeInteger(totalLength) || !Number.isSafeInteger(end) || end > this.size) {
+        throw new MalformedFile(
+          `record opcode 0x${opcode.toString(16).padStart(2, "0")} at offset ${at} spans ` +
+            `[${at}, ${end}), outside the ${this.size}-byte file`,
+        );
+      }
+      yield { opcode, offset: at, contentLength, totalLength };
+      at = end;
     }
   }
 
