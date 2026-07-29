@@ -62,6 +62,7 @@ which the conformance suite enforces.
 - [Encode a scene (Python)](website/docs/guides/getting-started/encode-python.md)
 - [Decode in a browser](website/docs/guides/getting-started/decode-web.md)
 - [Decode in Python](website/docs/guides/getting-started/decode-python.md)
+- [Decode in C++](website/docs/guides/getting-started/decode-cpp.md)
 
 ## Conformance
 
