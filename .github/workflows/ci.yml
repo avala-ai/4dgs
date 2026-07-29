@@ -35,6 +35,13 @@ jobs:
           size_kb=$(du -s typescript | cut -f1)
           echo "typescript: ${size_kb} KiB"
           [ "$size_kb" -le 500 ] || { echo "::error::typescript is ${size_kb} KiB, over the 500 KiB budget"; exit 1; }
+      - name: Swift sources under 300 KB
+        # Sources only, same as TypeScript's: this job builds nothing, so .build is not
+        # here to measure and a vendored dependency would show up as a budget failure.
+        run: |
+          size_kb=$(du -s swift | cut -f1)
+          echo "swift: ${size_kb} KiB"
+          [ "$size_kb" -le 300 ] || { echo "::error::swift is ${size_kb} KiB, over the 300 KiB budget"; exit 1; }
 
   no-committed-binaries:
     # The corpus is generated. A committed .4dgs means someone bypassed the generator.
@@ -157,3 +164,37 @@ jobs:
           cmake -S cpp -B cpp/build-asan -DCMAKE_BUILD_TYPE=Debug -DFOURDGS_ASAN=ON
           cmake --build cpp/build-asan -j
           ctest --test-dir cpp/build-asan --output-on-failure
+  swift:
+    # The official Swift image rather than a toolchain-installer action: the job installs
+    # nothing, and the version it builds against is a line in this file.
+    runs-on: ubuntu-latest
+    container: swift:6.1
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift --version
+      - name: Format
+        run: swift format lint --recursive --strict swift/Sources swift/Tests swift/conformance
+      - name: Build
+        run: swift build --package-path swift
+      - name: Tests
+        run: swift test --package-path swift
+
+  swift-darwin:
+    # visionOS and iOS are the platforms this package exists for, and a Linux build proves
+    # nothing about either. The macOS runner is where the platform declarations in
+    # Package.swift are actually checked against an SDK.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift --version
+      - name: Build for macOS
+        run: swift build --package-path swift
+      - name: Build for visionOS and iOS
+        working-directory: swift
+        run: |
+          for platform in visionOS iOS; do
+            echo "::group::$platform"
+            xcodebuild -scheme FourDGS -destination "generic/platform=$platform" \
+              -skipPackagePluginValidation build | tail -5
+            echo "::endgroup::"
+          done

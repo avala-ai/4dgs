@@ -1,5 +1,6 @@
 // swift-tools-version:5.9
-// Skeleton only: the target has no sources yet. See README.md.
+// The tools version is pinned to 5.9 deliberately: CI's macOS runner ships Swift 5.10, so
+// anything newer would build on Linux and fail on the platforms this package exists for.
 import PackageDescription
 
 let package = Package(
@@ -9,6 +10,19 @@ let package = Package(
         .library(name: "FourDGS", targets: ["FourDGS"])
     ],
     targets: [
-        .target(name: "FourDGS")
+        // The SDK. Pure Swift today: every call into the Rust core goes through one file,
+        // Sources/FourDGS/CoreSeam.swift, whose bodies currently throw `.notImplemented`.
+        // Wiring the C ABI replaces those bodies and adds a CFourDGS system-library target
+        // here; nothing else in the package moves.
+        .target(name: "FourDGS"),
+        .testTarget(name: "FourDGSTests", dependencies: ["FourDGS"]),
+
+        // The conformance runners. Two executables, because the suite tests two read paths
+        // and they have to be able to disagree.
+        .target(name: "ConformanceSupport", dependencies: ["FourDGS"], path: "conformance/Support"),
+        .executableTarget(
+            name: "decode_streamed", dependencies: ["ConformanceSupport"], path: "conformance/decode_streamed"),
+        .executableTarget(
+            name: "decode_indexed", dependencies: ["ConformanceSupport"], path: "conformance/decode_indexed"),
     ]
 )

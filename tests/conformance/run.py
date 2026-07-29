@@ -32,6 +32,7 @@ TYPESCRIPT_DIST = os.path.join(ROOT, "typescript", "conformance", "dist")
 CPP_BUILD = os.path.join(ROOT, "cpp", "build", "conformance")
 #: Cargo puts workspace binaries in one place regardless of which crate declares them.
 RUST_BIN = os.path.join(ROOT, "target", "release")
+SWIFT_BIN = os.path.join(ROOT, "swift", ".build", "release")
 
 #: (family, name, argv-prefix). A new language adds one line.
 RUNNERS = [
@@ -51,6 +52,8 @@ RUNNERS = [
     ("cpp", "cpp/decode_indexed", [os.path.join(CPP_BUILD, "decode_indexed")]),
     ("rust", "rust/decode_streamed", [os.path.join(RUST_BIN, "decode_streamed")]),
     ("rust", "rust/decode_indexed", [os.path.join(RUST_BIN, "decode_indexed")]),
+    ("swift", "swift/decode_streamed", [os.path.join(SWIFT_BIN, "decode_streamed")]),
+    ("swift", "swift/decode_indexed", [os.path.join(SWIFT_BIN, "decode_indexed")]),
 ]
 
 
