@@ -1,0 +1,22 @@
+[package]
+name = "fourdgs-conformance"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.82"
+license = "Apache-2.0"
+description = "Conformance runners for the 4dgs Rust SDK"
+repository = "https://github.com/avala-ai/4dgs"
+publish = false
+
+# Two runners, invoked by tests/conformance/run.py with a path and expected to print the
+# canonical JSON to stdout. That is the whole interface between an SDK and the harness.
+[[bin]]
+name = "decode_streamed"
+path = "src/bin/decode_streamed.rs"
+
+[[bin]]
+name = "decode_indexed"
+path = "src/bin/decode_indexed.rs"
+
+[dependencies]
+fourdgs = { path = "../fourdgs" }

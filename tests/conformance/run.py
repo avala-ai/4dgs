@@ -30,6 +30,8 @@ ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 #: a Python-only contributor running the whole suite has not broken anything.
 TYPESCRIPT_DIST = os.path.join(ROOT, "typescript", "conformance", "dist")
 CPP_BUILD = os.path.join(ROOT, "cpp", "build", "conformance")
+#: Cargo puts workspace binaries in one place regardless of which crate declares them.
+RUST_BIN = os.path.join(ROOT, "target", "release")
 
 #: (family, name, argv-prefix). A new language adds one line.
 RUNNERS = [
@@ -47,6 +49,8 @@ RUNNERS = [
     ("typescript", "typescript/decode_indexed", ["node", os.path.join(TYPESCRIPT_DIST, "decode_indexed.js")]),
     ("cpp", "cpp/decode_streamed", [os.path.join(CPP_BUILD, "decode_streamed")]),
     ("cpp", "cpp/decode_indexed", [os.path.join(CPP_BUILD, "decode_indexed")]),
+    ("rust", "rust/decode_streamed", [os.path.join(RUST_BIN, "decode_streamed")]),
+    ("rust", "rust/decode_indexed", [os.path.join(RUST_BIN, "decode_indexed")]),
 ]
 
 

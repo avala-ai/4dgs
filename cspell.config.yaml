@@ -41,6 +41,14 @@ words:
   - Avala
   - bibtex
   - ctest
+  # Rust and C toolchain vocabulary
+  - capi
+  - libfourdgs
+  - rlib
+  - cdylib
+  - staticlib
+  - lpthread
+  - clippy
 ignorePaths:
   - "**/node_modules/**"
   - "**/dist/**"

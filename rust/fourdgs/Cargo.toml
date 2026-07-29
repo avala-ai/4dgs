@@ -2,10 +2,25 @@
 name = "fourdgs"
 version = "0.0.0"
 edition = "2021"
+rust-version = "1.82"
 license = "Apache-2.0"
-description = "Reader and writer for the 4dgs container format (planned)"
+description = "Reader and writer for the 4dgs container format"
 repository = "https://github.com/avala-ai/4dgs"
 publish = false
 
 [lib]
 name = "fourdgs"
+# `cdylib` and `staticlib` are what the C, C++ and Swift packages link against; `rlib` is
+# what the conformance binaries and any Rust consumer use.
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[features]
+default = []
+# zstd is a registry codec but not the default one: deflate is universally available and
+# lands within a couple of percent on this data. A build without this feature refuses a
+# zstd stream by name rather than decoding it wrongly.
+zstd = ["dep:zstd"]
+
+[dependencies]
+flate2 = "1"
+zstd = { version = "0.13", optional = true }
