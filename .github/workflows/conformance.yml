@@ -156,7 +156,10 @@ jobs:
             curl -sSf --retry 5 --retry-all-errors --retry-delay 3 https://sh.rustup.rs |
               sh -s -- -y --profile minimal --default-toolchain stable
           fi
-          . "$HOME/.cargo/env"
+          # PATH rather than sourcing ~/.cargo/env: that file lives beside the cached
+          # directories, not inside them, so on a cache hit it does not exist. Depending on
+          # rustup's layout is what broke the hit path the first time this ran.
+          export PATH="$HOME/.cargo/bin:$PATH"
           cargo build -p fourdgs --release
       # `run.py --runner swift` fails if no Swift runner executed, so a build that silently
       # produced nothing is a red suite rather than a green one. LD_LIBRARY_PATH is needed
