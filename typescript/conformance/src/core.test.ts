@@ -15,11 +15,13 @@ import { test } from "node:test";
 
 import {
   BytesReadable,
+  Crc32,
   Cursor,
   MalformedFile,
   TruncatedFile,
   UnsupportedVersion,
   StreamDecoder,
+  audioSourceStateAt,
   bandCoefficientRange,
   decodeScene,
   encodeScene,
@@ -39,10 +41,11 @@ import {
   unshuffleAndUnzigzag,
   DEFAULT_CODECS,
   MAGIC,
+  Opcode,
 } from "@4dgs/core";
 
 import { roundHalfEven } from "./canonical.js";
-import { MODE_CONST, MODE_DELTA, MODE_RAW, encodeTestStream, record } from "./testing.js";
+import { MODE_CONST, MODE_DELTA, MODE_RAW, concat, encodeTestStream, record } from "./testing.js";
 
 async function decodeOne(bytes: Uint8Array): Promise<Int32Array> {
   return decodeStream(frameOneStream(new Cursor(bytes)), DEFAULT_CODECS);
@@ -139,6 +142,10 @@ test("CRC-32 matches the IEEE values the footer is written with", () => {
   assert.equal(crc32(new TextEncoder().encode("")), 0);
   assert.equal(crc32(new TextEncoder().encode("123456789")), 0xcbf43926);
   assert.equal(crc32(new TextEncoder().encode("4dgs")), 0xf2630ef0);
+  const incremental = new Crc32();
+  incremental.update(new TextEncoder().encode("1234"));
+  incremental.update(new TextEncoder().encode("56789"));
+  assert.equal(incremental.digest(), 0xcbf43926);
 });
 
 test("a cursor refuses to read past its buffer, naming the offset", () => {
@@ -165,6 +172,56 @@ test("record framing yields complete records and holds the rest", () => {
   assert.equal(records[0]!.opcode, 0x01);
   assert.deepEqual([...records[0]!.content], [1, 2, 3]);
   assert.equal(records[0]!.offset, MAGIC.length);
+});
+
+test("selected record bodies stream without buffering a complete record", () => {
+  const decoder = new StreamDecoder();
+  const content = Uint8Array.from({ length: 1024 }, (_, i) => i & 0xff);
+  const whole = concat([MAGIC, record(Opcode.AudioData, content), MAGIC]);
+  const parts: Uint8Array[] = [];
+  let finalParts = 0;
+  let maxPart = 0;
+  for (let at = 0; at < whole.byteLength; at += 31) {
+    decoder.append(whole.subarray(at, Math.min(at + 31, whole.byteLength)));
+    for (const item of decoder.recordsStreaming(new Set([Opcode.AudioData]))) {
+      assert.ok("bytes" in item, "the selected opcode was buffered as a complete record");
+      parts.push(Uint8Array.from(item.bytes));
+      maxPart = Math.max(maxPart, item.bytes.byteLength);
+      if (item.final) finalParts += 1;
+    }
+  }
+  decoder.end();
+  assert.equal(decoder.truncated, false);
+  assert.equal(finalParts, 1);
+  assert.ok(maxPart <= 31);
+  assert.deepEqual(concat(parts), content);
+});
+
+test("audio normalization preserves extreme and tiny finite directions", () => {
+  const source = (rotation: readonly number[]) => ({
+    sourceId: 1,
+    name: "",
+    codec: "wav",
+    channelLayout: "mono",
+    dataLength: 0,
+    startSec: 0,
+    durationSec: 2,
+    gain: 1,
+    spatial: true,
+    loop: false,
+    position: [0, 0, 0],
+    rotation,
+    keyframes: [],
+    interpolation: "linear",
+  });
+  assert.deepEqual(
+    audioSourceStateAt(source([1e308, 1e308, 1e308, 1e308]), 1).rotation,
+    [0.5, 0.5, 0.5, 0.5],
+  );
+  assert.deepEqual(
+    audioSourceStateAt(source([Number.MIN_VALUE, 0, 0, 0]), 1).rotation,
+    [1, 0, 0, 0],
+  );
 });
 
 test("a stream that ends on the trailing magic is not truncated", () => {

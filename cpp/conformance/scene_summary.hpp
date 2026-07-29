@@ -26,7 +26,7 @@ struct SceneRecords {
   std::vector<SummaryOffset> summaryOffsets;
   Camera camera;
   Statistics statistics;
-  AudioTrack audio;
+  std::vector<AudioSource> audioSources;
   bool hasCamera = false;
   bool hasStatistics = false;
   bool crcKnown = false;
@@ -46,9 +46,9 @@ inline Result<void> collectRecords(Scene& scene, SceneRecords* out) {
   out->header.library = scene.library();
   out->header.attributes = scene.attributes();
 
-  Result<AudioTrack> audio = scene.readAudioTrack();
-  if (!audio) return audio.error();
-  out->audio = *audio;
+  Result<std::vector<AudioSource>> audioSources = scene.readAudioSources();
+  if (!audioSources) return audioSources.error();
+  out->audioSources = std::move(*audioSources);
 
   Result<std::vector<MetadataRecord>> metadata = scene.metadata();
   if (!metadata) return metadata.error();
@@ -93,7 +93,7 @@ inline SceneSummary summaryOf(const SceneRecords& records, const GaussianView& g
   SceneSummary summary;
   summary.header = &records.header;
   summary.gaussians = &gaussians;
-  summary.audio = records.header.hasAudio ? &records.audio : nullptr;
+  summary.audioSources = records.audioSources;
   summary.chunkIntervals = records.chunkIntervals;
   summary.camera = records.hasCamera ? &records.camera : nullptr;
   summary.metadata = records.metadata;

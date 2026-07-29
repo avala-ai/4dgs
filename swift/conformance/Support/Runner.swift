@@ -46,7 +46,14 @@ public enum Runner {
 
     static func summarize(path: String, mode: Mode) throws -> JSON {
         let reader = try SceneReader(path: path, readPath: mode.readPath)
-        let scene = reader.scene
+        var scene = reader.scene
+        // Canonical JSON proves payload bytes too, but normal SDK opening deliberately
+        // leaves them deferred. The conformance runner opts in, one bounded source at a
+        // time, because materializing the whole file is runner-only behaviour.
+        for index in scene.audioSources.indices {
+            scene.audioSources[index].data = try reader.audioSourceData(
+                index, length: scene.audioSources[index].dataSize)
+        }
 
         // The indexed runner reads chunk by chunk through the index, so the path being
         // measured is the one this runner claims to measure. The streamed runner takes the

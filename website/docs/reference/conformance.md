@@ -26,9 +26,9 @@ that two consecutive generator runs produce byte-identical files. That second ch
 accidental nondeterminism in an encoder — an iteration order, a timestamp, a hash seed — before it
 becomes somebody else's failing build.
 
-Every scene is synthetic, generated from a fixed seed, and the audio is a generated sine sweep.
-There is no captured data in the repository: the corpus has to be redistributable without a licence
-question and reproducible without a download.
+Every scene is synthetic, generated from a fixed seed, and audio payloads are generated sine sweeps.
+The spatial cases include fixed and moving sources; there is no captured data in the repository. The
+corpus has to be redistributable without a licence question and reproducible without a download.
 
 ## Runners
 

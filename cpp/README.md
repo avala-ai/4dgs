@@ -24,6 +24,15 @@ for (std::size_t i = 0; i < state->count(); ++i) {
   std::uint32_t g = state->indices()[i];            // into scene.gaussians()
   // state->centers()[3 * i ...], state->opacity()[i]
 }
+
+for (std::uint32_t i = 0; i < scene.audioSourceCount(); ++i) {
+  auto source = scene.audioSource(i);               // descriptor only; no payload transfer
+  auto sourceState = scene.audioSourceStateAt(i, 2.5);
+  if (sourceState && sourceState->active) {
+    // Combine sourceState->position/rotation with the player's listener pose.
+    // The player owns HRTF/panning, distance attenuation, occlusion and mixing.
+  }
+}
 ```
 
 A scene has a working set: `loadAll()` fills it with every chunk, `loadAt(t, cap)` with only the
@@ -49,8 +58,7 @@ are what somebody gets.
 
 ## Status
 
-Conformance-verified: **67 checks over 34 variants on both read paths, the same numbers as the
-reference implementation**, with the read path forced at open rather than left to the opener, so the
-streamed and indexed rows rest on two paths and not one. The
-[feature matrix](../website/docs/reference/index.md) records exactly what that proves; the encode
-rows stay `Planned` because this package decodes only at v1.
+Conformance-verified: **79 checks across the 45 valid variants this binding supports**, with the
+read path forced at open rather than left to the opener, so the streamed and indexed rows rest on
+two paths and not one. The [feature matrix](../website/docs/reference/index.md) records exactly what
+that proves; the encode rows stay `Planned` because this package decodes only at v1.

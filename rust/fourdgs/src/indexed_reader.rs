@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 
 use crate::chunk::{decode_streams, DecodedChunk};
 use crate::error::{Error, Result};
+use crate::model::{AudioSource, AudioSourceKeyframe};
 use crate::opcode as op;
 use crate::readable::Readable;
 use crate::records as rec;
@@ -61,11 +62,10 @@ impl FrontRecord {
 /// A sliding window over the front of a resource, walked by header.
 ///
 /// An indexed reader wants four things from the front matter — the Header, the
-/// Quantization grids, the Window Table, and the byte range of the audio track if there is
-/// one — and none of them requires reading a record it does not care about. That
-/// distinction is not academic: an embedded audio track is a first-class part of a scene
-/// and sits in the front matter at whatever size the track is, so a walk that materializes
-/// every record's content fails on the format's flagship case, a single file with sound.
+/// Quantization grids, the Window Table, and the byte ranges of any audio sources — and
+/// none requires reading a payload it does not care about. Encoded audio is a first-class
+/// part of a scene and may be arbitrarily large, so materializing every record's content
+/// defeats bounded indexed opening.
 ///
 /// So a record is stepped over by arithmetic. Its length is in its header, and its bytes
 /// are not needed to find the next one.
@@ -128,7 +128,7 @@ impl<'a, R: Readable + ?Sized> FrontMatter<'a, R> {
     /// that record when it is not.
     ///
     /// A Window Table larger than the probe is therefore fetched rather than refused, and
-    /// an audio track nobody asked for is never fetched at all.
+    /// audio payloads nobody asked for are never fetched at all.
     fn content(&mut self, record: &FrontRecord, limit: Option<u64>) -> Result<Vec<u8>> {
         let at = record.offset + RECORD_HEADER_SIZE as u64;
         if at > self.size {
@@ -180,9 +180,7 @@ pub struct IndexedScene {
     pub quantization: rec::Quantization,
     pub windows: Vec<(f64, f64)>,
     pub index: Vec<rec::ChunkIndexEntry>,
-    /// `(offset, length)` of the whole Audio record, or `None`.
-    pub audio_range: Option<(u64, u64)>,
-    pub audio_codec: Option<String>,
+    pub audio_sources: Vec<IndexedAudioSource>,
     pub summary_crc_ok: Option<bool>,
     /// `(offset, length)` of the front-matter records this reader did not parse. Opening a
     /// file frames them and stops: a camera nobody asked for costs nothing, and neither
@@ -198,6 +196,18 @@ pub struct IndexedScene {
     pub provenance_ranges: Vec<(u8, u64, u64)>,
     pub statistics: Option<rec::Statistics>,
     pub summary_offsets: Vec<rec::SummaryOffset>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct IndexedAudioSource {
+    pub source_id: u32,
+    /// Whole Audio Source record, absent for a legacy Audio record.
+    pub descriptor_range: Option<(u64, u64)>,
+    /// Raw encoded bytes only, excluding Audio Data framing and its id/length prefix.
+    pub data_offset: u64,
+    pub data_length: u64,
+    pub legacy_codec: Option<String>,
+    pub legacy_start_sec: f64,
 }
 
 impl IndexedScene {
@@ -237,6 +247,9 @@ pub fn open_indexed<R: Readable + ?Sized>(source: &mut R) -> Result<IndexedScene
 
     let mut header: Option<rec::Header> = None;
     let mut quant: Option<rec::Quantization> = None;
+    let mut source_ranges: BTreeMap<u32, (u64, u64)> = BTreeMap::new();
+    let mut data_ranges: BTreeMap<u32, (u64, u64)> = BTreeMap::new();
+    let mut legacy_audio: Option<IndexedAudioSource> = None;
     {
         let mut front = FrontMatter::new(source, size);
         crate::serialization::check_magic(&front.head(MAGIC.len() as u64)?)?;
@@ -267,8 +280,46 @@ pub fn open_indexed<R: Readable + ?Sized>(source: &mut R) -> Result<IndexedScene
                     // codec name is parsed, out of a prefix, so a scene with a large track
                     // costs nothing to open.
                     let prefix = front.content(&record, Some(AUDIO_CODEC_PREFIX))?;
-                    scene.audio_codec = Some(audio_codec(&prefix)?);
-                    scene.audio_range = Some((record.offset, record.total_length()));
+                    legacy_audio = Some(legacy_audio_range(
+                        &prefix,
+                        record.offset,
+                        record.content_length,
+                    )?);
+                }
+                op::AUDIO_SOURCE => {
+                    let prefix = front.content(&record, Some(4))?;
+                    let source_id = source_id(&prefix, "Audio Source")?;
+                    if source_ranges
+                        .insert(source_id, (record.offset, record.total_length()))
+                        .is_some()
+                    {
+                        return Err(Error::Malformed(format!(
+                            "Audio Source id {source_id} appears more than once"
+                        )));
+                    }
+                }
+                op::AUDIO_DATA => {
+                    let prefix = front.content(&record, Some(12))?;
+                    let mut cursor = Cursor::new(&prefix);
+                    let source_id = cursor.u32()?;
+                    let data_length = cursor.u64()?;
+                    if record.content_length < 12u64.saturating_add(data_length) {
+                        return Err(Error::Malformed(format!(
+                            "Audio Data id {source_id} declares {data_length} bytes, but its record content is only {} bytes",
+                            record.content_length
+                        )));
+                    }
+                    if data_ranges
+                        .insert(
+                            source_id,
+                            (record.offset + RECORD_HEADER_SIZE as u64 + 12, data_length),
+                        )
+                        .is_some()
+                    {
+                        return Err(Error::Malformed(format!(
+                            "Audio Data id {source_id} appears more than once"
+                        )));
+                    }
                 }
                 op::CAMERA => scene.camera_range = Some((record.offset, record.total_length())),
                 op::METADATA => scene
@@ -298,6 +349,55 @@ pub fn open_indexed<R: Readable + ?Sized>(source: &mut R) -> Result<IndexedScene
             "the file has no Header or no Quantization record before its first Chunk".into(),
         )
     })?;
+    if legacy_audio.is_some() && !source_ranges.is_empty() {
+        return Err(Error::Malformed(
+            "the file mixes a legacy Audio record with Audio Source records".into(),
+        ));
+    }
+    // A legacy Audio record stands alone: an Audio Data record beside it has no descriptor
+    // to match, exactly the orphan the streamed reader rejects. The legacy branch below
+    // otherwise never inspects `data_ranges`, so this is where it is caught.
+    if legacy_audio.is_some() && !data_ranges.is_empty() {
+        let source_id = *data_ranges.keys().next().expect("not empty");
+        return Err(Error::Malformed(format!(
+            "Audio Data id {source_id} has no matching Audio Source record"
+        )));
+    }
+    if let Some(legacy) = legacy_audio {
+        scene.audio_sources.push(legacy);
+    } else {
+        for (source_id, descriptor_range) in source_ranges {
+            let Some((data_offset, data_length)) = data_ranges.remove(&source_id) else {
+                return Err(Error::Malformed(format!(
+                    "Audio Source id {source_id} has no matching Audio Data record"
+                )));
+            };
+            scene.audio_sources.push(IndexedAudioSource {
+                source_id,
+                descriptor_range: Some(descriptor_range),
+                data_offset,
+                data_length,
+                legacy_codec: None,
+                legacy_start_sec: 0.0,
+            });
+        }
+        if let Some(source_id) = data_ranges.keys().next() {
+            return Err(Error::Malformed(format!(
+                "Audio Data id {source_id} has no matching Audio Source record"
+            )));
+        }
+    }
+    if scene.header.has_audio() == scene.audio_sources.is_empty() {
+        return Err(Error::Malformed(format!(
+            "the Header audio flag is {}, but the file contains {} audio sources",
+            if scene.header.has_audio() {
+                "set"
+            } else {
+                "clear"
+            },
+            scene.audio_sources.len()
+        )));
+    }
 
     // The three-read open: the tail carries the magic and the Footer, and the Footer says
     // where the index is.
@@ -462,23 +562,153 @@ pub fn read_audio<R: Readable + ?Sized>(
     source: &mut R,
     scene: &IndexedScene,
 ) -> Result<Option<Vec<u8>>> {
-    match scene.audio_range {
+    match scene.audio_sources.first() {
         None => Ok(None),
-        Some((offset, length)) => {
-            let blob = source.read(offset, length)?;
-            Ok(Some(
-                rec::Audio::parse(record_content(&blob, op::AUDIO)?)?.data,
-            ))
-        }
+        Some(entry) => Ok(Some(source.read(entry.data_offset, entry.data_length)?)),
     }
 }
 
-/// The `codec` field at the front of an Audio record, read out of a prefix of it.
-fn audio_codec(prefix: &[u8]) -> Result<String> {
-    Cursor::new(prefix).string().map_err(|_| {
+pub fn read_audio_sources<R: Readable + ?Sized>(
+    source: &mut R,
+    scene: &IndexedScene,
+) -> Result<Vec<AudioSource>> {
+    let mut out = Vec::with_capacity(scene.audio_sources.len());
+    for entry in &scene.audio_sources {
+        let mut descriptor = read_audio_source_descriptor(source, scene, entry)?;
+        descriptor.data = source.read(entry.data_offset, entry.data_length)?;
+        out.push(descriptor);
+    }
+    Ok(out)
+}
+
+pub fn read_audio_range<R: Readable + ?Sized>(
+    source: &mut R,
+    scene: &IndexedScene,
+    source_id: u32,
+    offset: u64,
+    length: u64,
+) -> Result<Vec<u8>> {
+    let entry = scene
+        .audio_sources
+        .iter()
+        .find(|entry| entry.source_id == source_id)
+        .ok_or_else(|| {
+            Error::Malformed(format!("this scene has no audio source id {source_id}"))
+        })?;
+    let end = offset.checked_add(length).ok_or_else(|| {
         Error::Malformed(format!(
-            "the Audio record's codec name does not fit the first {AUDIO_CODEC_PREFIX} bytes of the record"
+            "audio source {source_id} range [{offset}, +{length}) overflows"
         ))
+    })?;
+    if end > entry.data_length {
+        return Err(Error::Malformed(format!(
+            "audio source {source_id} range [{offset}, {end}) is outside its {}-byte payload",
+            entry.data_length
+        )));
+    }
+    source.read(entry.data_offset + offset, length)
+}
+
+pub fn read_audio_source_descriptor<R: Readable + ?Sized>(
+    source: &mut R,
+    scene: &IndexedScene,
+    entry: &IndexedAudioSource,
+) -> Result<AudioSource> {
+    let Some((offset, length)) = entry.descriptor_range else {
+        let start_sec = entry.legacy_start_sec;
+        return Ok(AudioSource {
+            source_id: entry.source_id,
+            codec: entry.legacy_codec.clone().unwrap_or_default(),
+            channel_layout: String::new(),
+            start_sec,
+            duration_sec: (scene.header.duration_sec - start_sec).max(0.0),
+            spatial: false,
+            ..AudioSource::default()
+        });
+    };
+    let blob = source.read(offset, length)?;
+    let descriptor = rec::AudioSource::parse(record_content(&blob, op::AUDIO_SOURCE)?)?;
+    if descriptor.source_id != entry.source_id {
+        return Err(Error::Malformed(format!(
+            "Audio Source range for id {} contains id {}",
+            entry.source_id, descriptor.source_id
+        )));
+    }
+    if descriptor.data_length != entry.data_length {
+        return Err(Error::Malformed(format!(
+            "Audio Source id {} declares {} bytes, its Audio Data record declares {}",
+            entry.source_id, descriptor.data_length, entry.data_length
+        )));
+    }
+    for (index, keyframe) in descriptor.keyframes.iter().enumerate() {
+        if keyframe.time < 0.0 || keyframe.time > scene.header.duration_sec {
+            return Err(Error::Malformed(format!(
+                "Audio Source id {} keyframe {index} time {} is outside [0, {}]",
+                entry.source_id, keyframe.time, scene.header.duration_sec
+            )));
+        }
+    }
+    let spatial = descriptor.spatial();
+    let loop_ = descriptor.loop_();
+    Ok(AudioSource {
+        source_id: descriptor.source_id,
+        name: descriptor.name,
+        codec: descriptor.codec,
+        channel_layout: descriptor.channel_layout,
+        start_sec: descriptor.start_sec,
+        duration_sec: descriptor.duration_sec,
+        gain: descriptor.gain,
+        spatial,
+        loop_,
+        position: descriptor.position,
+        rotation: descriptor.rotation,
+        keyframes: descriptor
+            .keyframes
+            .into_iter()
+            .map(|frame| AudioSourceKeyframe {
+                time: frame.time,
+                position: frame.position,
+                rotation: frame.rotation,
+            })
+            .collect(),
+        interpolation: descriptor.interpolation,
+        data: Vec::new(),
+    })
+}
+
+fn source_id(prefix: &[u8], record_name: &str) -> Result<u32> {
+    Cursor::new(prefix).u32().map_err(|_| {
+        Error::Malformed(format!(
+            "the {record_name} record does not contain its u32 source id"
+        ))
+    })
+}
+
+fn legacy_audio_range(
+    prefix: &[u8],
+    record_offset: u64,
+    content_length: u64,
+) -> Result<IndexedAudioSource> {
+    let mut cursor = Cursor::new(prefix);
+    let codec = cursor.string().map_err(|_| {
+        Error::Malformed(format!(
+            "the legacy Audio descriptor does not fit the first {AUDIO_CODEC_PREFIX} bytes"
+        ))
+    })?;
+    let start_sec = cursor.f64()?;
+    let data_length = cursor.u64()?;
+    if content_length < cursor.position() as u64 + data_length {
+        return Err(Error::Malformed(format!(
+            "the legacy Audio record declares {data_length} data bytes, but its content is only {content_length} bytes"
+        )));
+    }
+    Ok(IndexedAudioSource {
+        source_id: 0,
+        descriptor_range: None,
+        data_offset: record_offset + RECORD_HEADER_SIZE as u64 + cursor.position() as u64,
+        data_length,
+        legacy_codec: Some(codec),
+        legacy_start_sec: start_sec,
     })
 }
 

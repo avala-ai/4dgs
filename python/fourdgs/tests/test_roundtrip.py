@@ -82,13 +82,15 @@ class TestRoundTrip:
 class TestAudio:
     def test_absent_audio_costs_nothing_and_is_not_an_error(self):
         out = roundtrip(make_scene())
-        assert out.audio is None
+        assert out.audio_sources == []
         assert out.header.has_audio is False
         # Nothing in the file even mentions audio.
         buf = io.BytesIO()
         fourdgs.write(buf, make_scene(), 6.0)
         opcodes = _opcodes(buf.getvalue())
         assert op.AUDIO not in opcodes
+        assert op.AUDIO_SOURCE not in opcodes
+        assert op.AUDIO_DATA not in opcodes
 
     def test_present_audio_round_trips_byte_exact(self):
         track = fourdgs.AudioTrack(codec="wav", data=b"RIFF" + bytes(range(256)) * 4, start_sec=0.0)
@@ -96,9 +98,91 @@ class TestAudio:
         fourdgs.write(buf, make_scene(), 6.0, audio=track)
         out = fourdgs.read(buf.getvalue())
         assert out.header.has_audio is True
-        assert out.audio is not None
-        assert out.audio.data == track.data
-        assert out.audio.codec == "wav"
+        assert len(out.audio_sources) == 1
+        assert out.audio_sources[0].data == track.data
+        assert out.audio_sources[0].codec == "wav"
+        assert out.audio_sources[0].spatial is False
+
+    def test_multiple_moving_sources_round_trip_and_reconstruct_pose(self):
+        sources = [
+            fourdgs.AudioSource(
+                source_id=3,
+                name="fixed",
+                codec="wav",
+                data=b"RIFF-fixed",
+                duration_sec=1.0,
+                position=(-1.0, 0.0, 0.0),
+            ),
+            fourdgs.AudioSource(
+                source_id=9,
+                name="moving",
+                codec="wav",
+                data=b"RIFF-moving",
+                duration_sec=2.0,
+                keyframes=[
+                    fourdgs.AudioSourceKeyframe(0.0, (0.0, 0.0, 0.0)),
+                    fourdgs.AudioSourceKeyframe(2.0, (2.0, 4.0, 6.0), (0.0, 1.0, 0.0, 0.0)),
+                ],
+            ),
+        ]
+        buf = io.BytesIO()
+        fourdgs.write(buf, make_scene(), 6.0, audio_sources=sources)
+        out = fourdgs.read(buf.getvalue())
+        assert [source.source_id for source in out.audio_sources] == [3, 9]
+        state = out.audio_sources[1].state_at(1.0)
+        assert state.position == pytest.approx((1.0, 2.0, 3.0))
+        assert state.rotation == pytest.approx((0.0, 2**-0.5, 0.0, 2**-0.5))
+
+        from fourdgs.indexed_reader import (
+            open_indexed,
+            read_audio_source_descriptors,
+            read_audio_source_state,
+        )
+        from fourdgs.readable import BytesReadable
+
+        source = BytesReadable(buf.getvalue())
+        indexed = open_indexed(source)
+        descriptors = read_audio_source_descriptors(source, indexed)
+        assert [descriptor.data for descriptor in descriptors] == [b"", b""]
+        assert descriptors[1].data_size == len(sources[1].data)
+        indexed_state = read_audio_source_state(source, indexed, 9, 1.0)
+        assert indexed_state.position == pytest.approx((1.0, 2.0, 3.0))
+
+    def test_step_audio_pose_uses_the_keyframe_at_an_exact_time(self):
+        source = fourdgs.AudioSource(
+            source_id=1,
+            codec="wav",
+            data=b"x",
+            duration_sec=2.0,
+            interpolation="step",
+            keyframes=[
+                fourdgs.AudioSourceKeyframe(0.0, (0.0, 0.0, 0.0)),
+                fourdgs.AudioSourceKeyframe(1.0, (1.0, 2.0, 3.0), (0.0, 1.0, 0.0, 1.0)),
+                fourdgs.AudioSourceKeyframe(2.0, (9.0, 9.0, 9.0)),
+            ],
+        )
+        state = source.state_at(1.0)
+        assert state.position == (1.0, 2.0, 3.0)
+        assert state.rotation == pytest.approx((0.0, 2**-0.5, 0.0, 2**-0.5))
+
+    def test_an_extreme_but_finite_orientation_normalizes_without_overflow(self):
+        # Normalize the direction without ever constructing a magnitude that can overflow or
+        # underflow. Both vectors are finite, non-zero orientations.
+        source = fourdgs.AudioSource(
+            source_id=1, codec="wav", data=b"x", duration_sec=2.0, rotation=(1e308, 1e308, 1e308, 1e308)
+        )
+        assert source.state_at(1.0).rotation == pytest.approx((0.5, 0.5, 0.5, 0.5))
+        source.rotation = (math.ulp(0.0), 0.0, 0.0, 0.0)
+        assert source.state_at(1.0).rotation == pytest.approx((1.0, 0.0, 0.0, 0.0))
+
+    def test_the_writer_normalizes_an_extreme_audio_orientation_without_overflow(self):
+        source = fourdgs.AudioSource(
+            source_id=1, codec="wav", data=b"x", duration_sec=2.0, rotation=(1e308, 0.0, 0.0, 0.0)
+        )
+        buf = io.BytesIO()
+        fourdgs.write(buf, make_scene(n=0), 2.0, audio_sources=[source])
+        decoded = fourdgs.read(buf.getvalue())
+        assert decoded.audio_sources[0].rotation == pytest.approx((1.0, 0.0, 0.0, 0.0))
 
     def test_audio_presence_is_answerable_from_the_header_alone(self):
         buf = io.BytesIO()
@@ -111,6 +195,48 @@ class TestAudio:
 
         header = Header.parse(read_record(c).content)
         assert header.has_audio is True
+
+    def test_an_audio_data_record_beside_a_legacy_audio_record_is_an_orphan(self):
+        # A legacy Audio record carries its own payload and pairs with no separate Audio
+        # Data record. A file that puts an Audio Data record next to a legacy Audio record
+        # therefore leaves that data orphaned, and the streamed reader has always refused
+        # it. The indexed reader took a legacy shortcut that never inspected the leftover
+        # data ranges, so it accepted the same malformed file; both paths must agree.
+        from fourdgs.indexed_reader import open_indexed
+        from fourdgs.readable import BytesReadable
+        from fourdgs.serialization import iter_records
+
+        buf = io.BytesIO()
+        source = fourdgs.AudioSource(source_id=3, name="solo", codec="wav", data=b"RIFF" + bytes(256), duration_sec=6.0)
+        fourdgs.write(buf, make_scene(), 6.0, audio_sources=[source])
+        data = bytearray(buf.getvalue())
+
+        # Rewrite the Audio Source descriptor in place as an empty legacy Audio record
+        # (codec "wav", start 0.0, no data). Its framed length is unchanged so every later
+        # offset still lands, and its paired Audio Data record is left orphaned. The summary
+        # CRC covers only the summary run, not front-matter audio, so the file is otherwise
+        # well-formed.
+        record = next(r for r in iter_records(data, len(MAGIC)) if r.opcode == op.AUDIO_SOURCE)
+        content = record.offset + 9
+        length = len(record.content)
+        data[record.offset] = op.AUDIO
+        data[content : content + length] = bytes(length)
+        data[content : content + 4] = (3).to_bytes(4, "little")
+        data[content + 4 : content + 7] = b"wav"
+        # start_sec (f64 at content+7) and data_length (u64 at content+15) stay zero.
+
+        with pytest.raises(fourdgs.MalformedFile, match="no matching Audio Source"):
+            fourdgs.read(bytes(data))
+        with pytest.raises(fourdgs.MalformedFile, match="no matching Audio Source"):
+            open_indexed(BytesReadable(bytes(data)))
+
+        # The recovery path refuses it too. A truncated tail can legitimize an unmatched new
+        # descriptor, but never an Audio Data beside a legacy record — the representations
+        # cannot be mixed, so no missing bytes could complete it. Drop the trailing magic to
+        # mark the file truncated; recovery is on by default.
+        cut = bytes(data[: -len(MAGIC)])
+        with pytest.raises(fourdgs.MalformedFile, match="no matching Audio Source"):
+            fourdgs.read(cut, recover_truncated=True)
 
 
 class TestForwardCompatibility:

@@ -25,11 +25,16 @@ happened.
   at the edges, so the decoder can be tested without a network and shipped without a platform.
 - §3's reconstruction arithmetic: `FourdgsGaussianSet.stateAt` gives the marginal, the validity
   window, the advected centre and the scaled opacity at a time `t`, and decoding ends there.
+- Multiple spatial `FourdgsAudioSource` values with independent timing, payloads, gain, looping and
+  fixed or keyframed scene-space poses. `stateAt` reconstructs source-local playback time and moving
+  pose; listener-relative HRTF, attenuation, occlusion and mixing remain player-owned.
+- Descriptor-only audio inspection, source-state reconstruction and bounded source-relative payload
+  reads, so an indexed caller never has to materialize an entire track to update a moving source.
 - Spherical harmonics on both read paths, bands 1 to 3, merged into whole scene-wide degrees. The
   indexed path fetches only the bands asked for, since each band is its own byte range in the chunk
   index.
 - `conformance/`, building `decode_streamed` and `decode_indexed`, registered in
-  `tests/conformance/run.py` and skipped until built. 67 checks pass across both read paths — every
+  `tests/conformance/run.py` and skipped until built. 79 checks pass across both read paths — every
   variant this SDK declares support for. It declines the five that carry provenance records and the
   invalid corpus's refusal expectations, the same way TypeScript, C++ and Swift do.
 - Tests for the one behaviour the corpus cannot reach: the indexed reader's front-matter scan runs

@@ -10,7 +10,7 @@
     "zeroMotionCount": "128"
   },
   "attachments": [],
-  "audio": null,
+  "audioSources": [],
   "camera": null,
   "chunkIntervals": [
     [

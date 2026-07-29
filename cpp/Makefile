@@ -17,7 +17,7 @@ format:
 	clang-format -i $(shell git ls-files '*.cpp' '*.hpp')
 
 examples: build
-	$(BUILD)/examples/decode_summary ../tests/conformance/data/OneWindow-UseChunkIndex-UseCrc-WithAudio.4dgs
+	$(BUILD)/examples/decode_summary ../tests/conformance/data/OneWindow-UseChunkIndex-UseCrc-WithSpatialAudio.4dgs
 
 # The leak and the out-of-bounds read are the two bugs a binding over an FFI boundary is
 # exposed to, so they get their own build directory rather than a flag somebody remembers.

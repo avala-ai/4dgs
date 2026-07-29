@@ -198,6 +198,67 @@ std::uint64_t bytesForTime(const Handle& handle, double t, int maxShBand) {
 
 bool hasAudio(const Handle& handle) { return fourdgs_scene_has_audio(asScene(handle)) != 0; }
 
+std::uint32_t audioSourceCount(const Handle& handle) {
+  return fourdgs_scene_audio_source_count(asScene(handle));
+}
+
+Result<AudioSource> audioSource(Handle& handle, std::uint32_t index) {
+  fourdgs_audio_source raw{};
+  Result<void> decoded = check(fourdgs_scene_audio_source(asScene(handle.scene), index, &raw));
+  if (!decoded) return decoded.error();
+
+  const auto text = [](const char* data, std::size_t length) {
+    return length == 0 ? std::string() : std::string(data, length);
+  };
+  AudioSource source;
+  source.sourceId = raw.source_id;
+  source.name = text(raw.name, raw.name_length);
+  source.codec = text(raw.codec, raw.codec_length);
+  source.channelLayout = text(raw.channel_layout, raw.channel_layout_length);
+  source.startSec = raw.start_sec;
+  source.durationSec = raw.duration_sec;
+  source.gain = raw.gain;
+  source.spatial = raw.spatial != 0;
+  source.loop = raw.loop_playback != 0;
+  std::memcpy(source.position, raw.position, sizeof(source.position));
+  std::memcpy(source.rotation, raw.rotation, sizeof(source.rotation));
+  source.interpolation = text(raw.interpolation, raw.interpolation_length);
+  source.dataSize = raw.data_size;
+  source.keyframes.reserve(raw.keyframe_count);
+  for (std::uint32_t i = 0; i < raw.keyframe_count; ++i) {
+    fourdgs_audio_source_keyframe frame{};
+    decoded = check(fourdgs_scene_audio_source_keyframe(asScene(handle.scene), index, i, &frame));
+    if (!decoded) return decoded.error();
+    AudioSource::Keyframe keyframe;
+    keyframe.time = frame.time;
+    std::memcpy(keyframe.position, frame.position, sizeof(keyframe.position));
+    std::memcpy(keyframe.rotation, frame.rotation, sizeof(keyframe.rotation));
+    source.keyframes.push_back(keyframe);
+  }
+  return source;
+}
+
+Result<AudioSourceState> audioSourceStateAt(Handle& handle, std::uint32_t index, double t) {
+  fourdgs_audio_source_state raw{};
+  Result<void> decoded =
+      check(fourdgs_scene_audio_source_state_at(asScene(handle.scene), index, t, &raw));
+  if (!decoded) return decoded.error();
+  AudioSourceState state;
+  state.active = raw.active != 0;
+  state.localTime = raw.local_time;
+  state.gain = raw.gain;
+  std::memcpy(state.position, raw.position, sizeof(state.position));
+  std::memcpy(state.rotation, raw.rotation, sizeof(state.rotation));
+  return state;
+}
+
+Result<void> readAudioSource(Handle& handle, std::uint32_t index, std::uint64_t offset,
+                             Span<std::uint8_t> into) {
+  if (into.empty()) return Result<void>();
+  return check(fourdgs_scene_audio_source_read(asScene(handle.scene), index, offset, into.size(),
+                                               into.data()));
+}
+
 std::string audioCodec(Handle& handle) {
   const char* codec = fourdgs_scene_audio_codec(asScene(handle.scene));
   return codec == nullptr ? std::string() : std::string(codec);

@@ -18,6 +18,34 @@ import { MAGIC, RECORD_HEADER_BYTES, type RawRecord, bytesEqual, checkMagic } fr
 import { Cursor } from "./cursor.js";
 
 /**
+ * One bounded piece of a record selected for incremental consumption.
+ *
+ * `bytes` is a view into the last appended block. Consumers must finish with it before
+ * requesting more records, or copy the bounded portion they intend to retain.
+ */
+export interface StreamedRecordPart {
+  readonly opcode: number;
+  /** Resource offset of the record's opcode byte. */
+  readonly recordOffset: number;
+  /** Total declared bytes in the record body. */
+  readonly contentLength: number;
+  /** Offset of `bytes[0]` within the record body. */
+  readonly contentOffset: number;
+  readonly bytes: Uint8Array;
+  /** True for the last part, including an empty record body. */
+  readonly final: boolean;
+}
+
+interface ActiveStreamedRecord {
+  readonly opcode: number;
+  readonly recordOffset: number;
+  readonly contentLength: number;
+  emitted: number;
+}
+
+const NO_STREAMED_OPCODES: ReadonlySet<number> = new Set();
+
+/**
  * Incremental record framing over an append-only byte stream.
  *
  * Yielded records are views into the bytes fed in, not copies. They stay valid after
@@ -33,6 +61,7 @@ export class StreamDecoder {
   private magicChecked = false;
   private ended = false;
   private truncatedFlag = false;
+  private activeStreamedRecord: ActiveStreamedRecord | null = null;
 
   /** Bytes consumed as complete records, plus the magic. */
   get consumed(): number {
@@ -73,6 +102,25 @@ export class StreamDecoder {
 
   /** Every record the bytes seen so far complete. Consumes what it yields. */
   *records(): Generator<RawRecord> {
+    for (const item of this.frame(NO_STREAMED_OPCODES)) {
+      if ("bytes" in item) throw new Error("internal error: records() yielded a streamed part");
+      yield item;
+    }
+  }
+
+  /**
+   * Frame ordinary records and yield selected record bodies incrementally.
+   *
+   * A selected record never has to fit in `pending`: its header is consumed once, then
+   * each appended block is yielded and released before the next block arrives.
+   */
+  *recordsStreaming(
+    streamedOpcodes: ReadonlySet<number>,
+  ): Generator<RawRecord | StreamedRecordPart> {
+    yield* this.frame(streamedOpcodes);
+  }
+
+  private *frame(streamedOpcodes: ReadonlySet<number>): Generator<RawRecord | StreamedRecordPart> {
     if (!this.magicChecked) {
       if (this.buffered < MAGIC.length) return;
       checkMagic(this.pending.subarray(this.cursor));
@@ -80,11 +128,54 @@ export class StreamDecoder {
       this.magicChecked = true;
     }
     for (;;) {
+      const active = this.activeStreamedRecord;
+      if (active !== null) {
+        const remaining = active.contentLength - active.emitted;
+        if (remaining === 0) {
+          this.activeStreamedRecord = null;
+          yield {
+            opcode: active.opcode,
+            recordOffset: active.recordOffset,
+            contentLength: active.contentLength,
+            contentOffset: active.emitted,
+            bytes: new Uint8Array(0),
+            final: true,
+          };
+          continue;
+        }
+        if (this.buffered === 0) return;
+        const length = Math.min(this.buffered, remaining);
+        const contentOffset = active.emitted;
+        const bytes = this.pending.subarray(this.cursor, this.cursor + length);
+        this.cursor += length;
+        active.emitted += length;
+        const final = active.emitted === active.contentLength;
+        if (final) this.activeStreamedRecord = null;
+        yield {
+          opcode: active.opcode,
+          recordOffset: active.recordOffset,
+          contentLength: active.contentLength,
+          contentOffset,
+          bytes,
+          final,
+        };
+        continue;
+      }
       if (this.buffered < RECORD_HEADER_BYTES) return;
       const head = new Cursor(this.pending, this.cursor, this.base);
       const offset = this.consumed;
       const opcode = head.u8();
       const length = head.u64();
+      if (streamedOpcodes.has(opcode)) {
+        this.cursor += RECORD_HEADER_BYTES;
+        this.activeStreamedRecord = {
+          opcode,
+          recordOffset: offset,
+          contentLength: length,
+          emitted: 0,
+        };
+        continue;
+      }
       if (this.buffered < RECORD_HEADER_BYTES + length) return;
       const start = this.cursor + RECORD_HEADER_BYTES;
       const content = this.pending.subarray(start, start + length);
@@ -104,6 +195,10 @@ export class StreamDecoder {
   end(): void {
     this.ended = true;
     const leftover = this.pending.subarray(this.cursor);
-    this.truncatedFlag = !(this.magicChecked && bytesEqual(leftover, MAGIC));
+    this.truncatedFlag = !(
+      this.magicChecked &&
+      this.activeStreamedRecord === null &&
+      bytesEqual(leftover, MAGIC)
+    );
   }
 }

@@ -218,7 +218,7 @@ spent elsewhere; neither is implemented, and a version-1 writer must not emit th
 
 ## Audio codecs
 
-Used by the Audio record's `codec` field.
+Used by Audio Source descriptors and the legacy Audio record.
 
 | value  | media type  | notes                                                                                |
 | ------ | ----------- | ------------------------------------------------------------------------------------ |
@@ -226,8 +226,28 @@ Used by the Audio record's `codec` field.
 | `opus` | `audio/ogg` | Preferred for delivery: roughly an order of magnitude smaller at transparent quality |
 
 An audio-bearing file MUST name one of these, or a private value the consumer is known to
-understand. A file with **no** audio names nothing, because it carries no Audio record at all — see
-spec §7.
+understand. A file with no audio names nothing because it carries no audio records — see spec §7.
+
+## Audio channel layouts
+
+Used by Audio Source `channel_layout`.
+
+| value         | notes                                                                          |
+| ------------- | ------------------------------------------------------------------------------ |
+| `mono`        | One channel. Required for a spatial point source                               |
+| `stereo`      | Left/right channel bed. The source's spatial flag must be clear                |
+| `unspecified` | Legacy compatibility input with unknown layout. The spatial flag must be clear |
+
+The layout describes channels inside the encoded payload; it does not select speakers or an HRTF.
+Those are player decisions. A consumer-specific multichannel layout may use an unregistered value,
+but a reader that cannot interpret it must name it rather than guess.
+
+## Audio source interpolation
+
+| value    | notes                                                                                  |
+| -------- | -------------------------------------------------------------------------------------- |
+| `linear` | Linear position and shortest-path quaternion SLERP between keyed poses                 |
+| `step`   | Hold the last keyframe whose scene time is less than or equal to the requested instant |
 
 ---
 

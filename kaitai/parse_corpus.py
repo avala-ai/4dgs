@@ -25,7 +25,8 @@ is checked three ways:
 3. the structural claims the grammar states but cannot enforce: that every offset/length
    pair in a Chunk Index frames a whole record (§5.8), that the Footer's `summary_start`
    points at the first of them and its CRC covers a contiguous run (§4.5, §5.2), and that
-   the Header's audio bit agrees with whether an Audio record exists (§7).
+   the Header's audio bit agrees with whether audio records exist and every source has one
+   matching payload (§7).
 
 Check 3 is worth its lines because those rules are what a *seeking* reader depends on, and
 nothing else in the suite asserts them directly: a decoder that got them wrong would fail
@@ -60,6 +61,8 @@ OP_METADATA = 0x0B
 OP_STATISTICS = 0x0C
 OP_ATTACHMENT = 0x0D
 OP_SUMMARY_OFFSET = 0x0F
+OP_AUDIO_SOURCE = 0x11
+OP_AUDIO_DATA = 0x12
 
 MAGIC_LEN = 8
 RECORD_HEADER = struct.Struct("<BQ")
@@ -69,6 +72,7 @@ RECORD_HEADER = struct.Struct("<BQ")
 FLOAT_DECIMALS = 6
 #: `canonical.py` emits at most this many camera keyframes in full.
 CAMERA_KEYFRAMES = 4
+AUDIO_KEYFRAMES = 4
 
 #: The keys of the canonical summary that follow from structure alone. The rest —
 #: `sample`, `aggregate`, `sh` — needs the attribute streams decoded, dequantized and
@@ -80,7 +84,7 @@ STRUCTURAL_KEYS = (
     "shDegree",
     "temporalModel",
     "hasAudio",
-    "audio",
+    "audioSources",
     "chunkIntervals",
     "headerAttributes",
     "metadataRecords",
@@ -146,6 +150,94 @@ def mapping(field) -> dict:
     return {text(e.key): text(e.value) for e in sorted(field.entries.entries, key=lambda e: text(e.key))}
 
 
+def normalized_quaternion(value) -> list[float]:
+    length = math.sqrt(sum(float(component) ** 2 for component in value))
+    if not math.isfinite(length) or length == 0:
+        return [0.0, 0.0, 0.0, 1.0]
+    return [float(component) / length for component in value]
+
+
+def slerp(a, b, u: float) -> list[float]:
+    qa = normalized_quaternion(a)
+    qb = normalized_quaternion(b)
+    dot = sum(x * y for x, y in zip(qa, qb, strict=True))
+    if dot < 0:
+        qb = [-value for value in qb]
+        dot = -dot
+    dot = min(1.0, max(-1.0, dot))
+    if dot > 0.9995:
+        return normalized_quaternion([x + (y - x) * u for x, y in zip(qa, qb, strict=True)])
+    theta = math.acos(dot)
+    sin_theta = math.sin(theta)
+    wa = math.sin((1 - u) * theta) / sin_theta
+    wb = math.sin(u * theta) / sin_theta
+    return normalized_quaternion([wa * x + wb * y for x, y in zip(qa, qb, strict=True)])
+
+
+def audio_state(source, t: float) -> dict:
+    start = float(source.start_sec)
+    duration = float(source.duration_sec)
+    loop = bool(source.loop_playback)
+    elapsed = max(0.0, t - start)
+    local_time = elapsed % duration if loop and duration > 0 else min(elapsed, max(0.0, duration))
+    frames = source.keyframes
+    if not frames:
+        position = source.position
+        rotation = normalized_quaternion(source.rotation)
+    elif t <= frames[0].time:
+        position = frames[0].position
+        rotation = normalized_quaternion(frames[0].rotation)
+    elif t >= frames[-1].time:
+        position = frames[-1].position
+        rotation = normalized_quaternion(frames[-1].rotation)
+    else:
+        high = next(i for i, frame in enumerate(frames) if frame.time > t)
+        a, b = frames[high - 1], frames[high]
+        if text(source.interpolation) == "step":
+            position = a.position
+            rotation = normalized_quaternion(a.rotation)
+        else:
+            u = (t - a.time) / (b.time - a.time)
+            position = [x + (y - x) * u for x, y in zip(a.position, b.position, strict=True)]
+            rotation = slerp(a.rotation, b.rotation, u)
+    return {
+        "active": t >= start and (loop or t < start + duration),
+        "localTime": num(local_time),
+        "position": [num(value) for value in position],
+        "rotation": [num(value) for value in rotation],
+        "gain": num(source.gain),
+    }
+
+
+def audio_source_summary(source, payload: bytes, sample_time: float) -> dict:
+    return {
+        "sourceId": str(source.source_id),
+        "name": text(source.name),
+        "codec": text(source.codec),
+        "channelLayout": text(source.channel_layout),
+        "startSec": num(source.start_sec),
+        "durationSec": num(source.duration_sec),
+        "gain": num(source.gain),
+        "spatial": bool(source.spatial),
+        "loop": bool(source.loop_playback),
+        "position": [num(value) for value in source.position],
+        "rotation": [num(value) for value in source.rotation],
+        "keyframeCount": str(source.num_keyframes),
+        "keyframes": [
+            {
+                "time": num(frame.time),
+                "position": [num(value) for value in frame.position],
+                "rotation": [num(value) for value in frame.rotation],
+            }
+            for frame in source.keyframes[:AUDIO_KEYFRAMES]
+        ],
+        "interpolation": text(source.interpolation),
+        "stateAtHalf": audio_state(source, sample_time),
+        "byteLength": str(len(payload)),
+        "crc": str(zlib.crc32(payload) & 0xFFFFFFFF),
+    }
+
+
 def summarize(parsed, data: bytes) -> dict:
     """The structural half of the canonical summary, read only through the grammar."""
     by_opcode: dict[int, list] = {}
@@ -161,7 +253,40 @@ def summarize(parsed, data: bytes) -> dict:
     header = by_opcode[OP_HEADER][0]
     footer = by_opcode[OP_FOOTER][0]
 
-    audio = by_opcode.get(OP_AUDIO, [None])[0]
+    legacy_audio = by_opcode.get(OP_AUDIO, [None])[0]
+    audio_payloads = {record.source_id: record.data.data for record in by_opcode.get(OP_AUDIO_DATA, [])}
+    audio_sources = [
+        audio_source_summary(source, audio_payloads[source.source_id], header.duration_sec / 2)
+        for source in sorted(by_opcode.get(OP_AUDIO_SOURCE, []), key=lambda item: item.source_id)
+    ]
+    if legacy_audio is not None:
+        audio_sources = [
+            {
+                "sourceId": "0",
+                "name": "",
+                "codec": text(legacy_audio.codec),
+                "channelLayout": "",
+                "startSec": num(legacy_audio.start_sec),
+                "durationSec": num(max(0, header.duration_sec - legacy_audio.start_sec)),
+                "gain": num(1),
+                "spatial": False,
+                "loop": False,
+                "position": [num(0), num(0), num(0)],
+                "rotation": [num(0), num(0), num(0), num(1)],
+                "keyframeCount": "0",
+                "keyframes": [],
+                "interpolation": "linear",
+                "stateAtHalf": {
+                    "active": header.duration_sec / 2 >= legacy_audio.start_sec,
+                    "localTime": num(max(0, header.duration_sec / 2 - legacy_audio.start_sec)),
+                    "position": [num(0), num(0), num(0)],
+                    "rotation": [num(0), num(0), num(0), num(1)],
+                    "gain": num(1),
+                },
+                "byteLength": str(len(legacy_audio.data.data)),
+                "crc": str(zlib.crc32(legacy_audio.data.data) & 0xFFFFFFFF),
+            }
+        ]
     camera = by_opcode.get(OP_CAMERA, [None])[0]
     statistics = by_opcode.get(OP_STATISTICS, [None])[0]
 
@@ -179,13 +304,7 @@ def summarize(parsed, data: bytes) -> dict:
         "shDegree": int(header.sh_degree),
         "temporalModel": text(header.temporal_model),
         "hasAudio": bool(header.has_audio),
-        "audio": None
-        if audio is None
-        else {
-            "codec": text(audio.codec),
-            "byteLength": str(len(audio.data.data)),
-            "crc": str(zlib.crc32(audio.data.data) & 0xFFFFFFFF),
-        },
+        "audioSources": audio_sources,
         "chunkIntervals": [[num(e.t0), num(e.t1)] for e in by_opcode.get(OP_CHUNK_INDEX, [])],
         "headerAttributes": mapping(header.attributes),
         "metadataRecords": [
@@ -298,11 +417,18 @@ def check_index_ranges(parsed, data: bytes) -> None:
 def check_audio_bit(parsed) -> None:
     """§7: the Header's bit 0 is the entire audio signal, so it must not lie."""
     header = parsed.records[0].content
-    present = any(opcode_of(r) == OP_AUDIO for r in parsed.records)
+    opcodes = [opcode_of(record) for record in parsed.records]
+    present = OP_AUDIO in opcodes or OP_AUDIO_SOURCE in opcodes or OP_AUDIO_DATA in opcodes
     if header.has_audio != present:
         raise ValueError(
-            f"header flags say audio={header.has_audio} but an Audio record is {'present' if present else 'absent'}"
+            f"header flags say audio={header.has_audio} but audio records are {'present' if present else 'absent'}"
         )
+    if OP_AUDIO in opcodes and (OP_AUDIO_SOURCE in opcodes or OP_AUDIO_DATA in opcodes):
+        raise ValueError("file mixes a legacy Audio record with Audio Source/Data records")
+    sources = [r.content.source_id for r in parsed.records if opcode_of(r) == OP_AUDIO_SOURCE]
+    payloads = [r.content.source_id for r in parsed.records if opcode_of(r) == OP_AUDIO_DATA]
+    if sorted(sources) != sorted(payloads):
+        raise ValueError(f"Audio Source ids {sorted(sources)} do not match Audio Data ids {sorted(payloads)}")
 
 
 def check_against_expectation(parsed, data: bytes, expectation_path: str) -> None:

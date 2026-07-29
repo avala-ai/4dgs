@@ -23,6 +23,7 @@ import numpy as np
 from . import opcode as op
 from . import records as rec
 from .exceptions import MalformedFile
+from .model import AudioSource, AudioSourceKeyframe
 from .object_layer import ObjectLayer
 from .provenance import Provenance
 from .readable import Readable
@@ -59,12 +60,10 @@ class _FrontMatter:
     """A sliding window over the front of a resource, walked by header.
 
     An indexed reader wants four things from the front matter — the Header, the
-    Quantization grids, the Window Table, and the byte range of the audio track if there
-    is one — and none of them requires reading a record it does not care about. That
-    distinction is not academic: an embedded audio track is a first-class part of a scene
-    and sits in the front matter at whatever size the track is, so a walk that
-    materializes every record's content fails on the format's flagship case, a single
-    file with sound.
+    Quantization grids, the Window Table, and the byte ranges of any audio sources — and
+    none requires reading a payload it does not care about. Encoded audio is a
+    first-class part of a scene and may be arbitrarily large, so materializing every
+    record's content defeats bounded indexed opening.
 
     So a record is stepped over by arithmetic. Its length is in its header, and its bytes
     are not needed to find the next one.
@@ -97,7 +96,7 @@ class _FrontMatter:
         that record when it is not.
 
         A Window Table larger than the probe is therefore fetched rather than refused, and
-        an audio track nobody asked for is never fetched at all.
+        audio payloads nobody asked for are never fetched at all.
         """
         at = record.offset + _RECORD_HEADER.size
         length = min(record.content_length, self._size - at)
@@ -133,8 +132,7 @@ class IndexedScene:
     quantization: rec.Quantization
     windows: list[tuple[float, float]]
     index: list[rec.ChunkIndexEntry]
-    audio_range: tuple[int, int] | None
-    audio_codec: str | None
+    audio_sources: list[IndexedAudioSource]
     summary_crc_ok: bool | None
     #: `(offset, length)` of the front-matter records this reader did not parse. Opening a
     #: file frames them and stops: a camera nobody asked for costs nothing, and neither
@@ -171,6 +169,18 @@ class IndexedScene:
         return total
 
 
+@dataclass(frozen=True)
+class IndexedAudioSource:
+    """Ranges for one source; opening a scene does not fetch either record."""
+
+    source_id: int
+    descriptor_range: tuple[int, int] | None
+    data_offset: int
+    data_length: int
+    legacy_codec: str | None = None
+    legacy_start_sec: float = 0.0
+
+
 def open_indexed(source: Readable) -> IndexedScene:
     """Open a scene: a bounded read from the front, then the index. Never the file."""
     size = source.size()
@@ -179,8 +189,9 @@ def open_indexed(source: Readable) -> IndexedScene:
 
     header = quant = None
     windows: list[tuple[float, float]] = []
-    audio_range = None
-    audio_codec = None
+    source_ranges: dict[int, tuple[int, int]] = {}
+    data_ranges: dict[int, tuple[int, int]] = {}
+    legacy_audio: IndexedAudioSource | None = None
     camera_range = None
     metadata_ranges: list[tuple[int, int]] = []
     attachment_ranges: list[tuple[int, int]] = []
@@ -200,8 +211,32 @@ def open_indexed(source: Readable) -> IndexedScene:
             # The track's bytes are not read here, and the record is not stepped into: a
             # caller may want the gaussians and never the audio. Only the codec name is
             # parsed, out of a prefix, so a scene with a large track costs nothing to open.
-            audio_codec = _audio_codec(front.content(record, limit=AUDIO_CODEC_PREFIX))
-            audio_range = (record.offset, record.total_length)
+            prefix = front.content(record, limit=AUDIO_CODEC_PREFIX)
+            codec, start_sec, data_at, data_length = _legacy_audio_prefix(prefix, record.offset, record.content_length)
+            legacy_audio = IndexedAudioSource(
+                source_id=0,
+                descriptor_range=None,
+                data_offset=data_at,
+                data_length=data_length,
+                legacy_codec=codec,
+                legacy_start_sec=start_sec,
+            )
+        elif record.opcode == op.AUDIO_SOURCE:
+            source_id = _source_id(front.content(record, limit=4), "Audio Source")
+            if source_id in source_ranges:
+                raise MalformedFile(f"Audio Source id {source_id} appears more than once")
+            source_ranges[source_id] = (record.offset, record.total_length)
+        elif record.opcode == op.AUDIO_DATA:
+            prefix = front.content(record, limit=12)
+            source_id, data_length = _audio_data_prefix(prefix)
+            if source_id in data_ranges:
+                raise MalformedFile(f"Audio Data id {source_id} appears more than once")
+            if record.content_length < 12 + data_length:
+                raise MalformedFile(
+                    f"Audio Data id {source_id} declares {data_length} bytes, "
+                    f"but its record content is only {record.content_length} bytes"
+                )
+            data_ranges[source_id] = (record.offset + _RECORD_HEADER.size + 12, data_length)
         elif record.opcode == op.CAMERA:
             camera_range = (record.offset, record.total_length)
         elif record.opcode == op.METADATA:
@@ -212,6 +247,38 @@ def open_indexed(source: Readable) -> IndexedScene:
             provenance_ranges.append((record.opcode, record.offset, record.total_length))
     if header is None or quant is None:
         raise MalformedFile("the file has no Header or no Quantization record before its first Chunk")
+    if legacy_audio is not None and source_ranges:
+        raise MalformedFile("the file mixes a legacy Audio record with Audio Source records")
+    # A legacy Audio record stands alone: an Audio Data record beside it has no descriptor to
+    # match, the orphan the streamed reader rejects. The legacy branch below never inspects
+    # ``data_ranges``, so it is caught here.
+    if legacy_audio is not None and data_ranges:
+        source_id = min(data_ranges)
+        raise MalformedFile(f"Audio Data id {source_id} has no matching Audio Source record")
+    audio_sources: list[IndexedAudioSource] = []
+    if legacy_audio is not None:
+        audio_sources.append(legacy_audio)
+    else:
+        for source_id in sorted(source_ranges):
+            if source_id not in data_ranges:
+                raise MalformedFile(f"Audio Source id {source_id} has no matching Audio Data record")
+            data_offset, data_length = data_ranges.pop(source_id)
+            audio_sources.append(
+                IndexedAudioSource(
+                    source_id=source_id,
+                    descriptor_range=source_ranges[source_id],
+                    data_offset=data_offset,
+                    data_length=data_length,
+                )
+            )
+        if data_ranges:
+            source_id = min(data_ranges)
+            raise MalformedFile(f"Audio Data id {source_id} has no matching Audio Source record")
+    if header.has_audio != bool(audio_sources):
+        state = "set" if header.has_audio else "clear"
+        raise MalformedFile(
+            f"the Header audio flag is {state}, but the file contains {len(audio_sources)} audio sources"
+        )
 
     footer_size = 9 + 20 + len(MAGIC)
     tail = source.read(max(size - footer_size, 0), min(footer_size, size))
@@ -246,8 +313,7 @@ def open_indexed(source: Readable) -> IndexedScene:
         quantization=quant,
         windows=windows,
         index=index,
-        audio_range=audio_range,
-        audio_codec=audio_codec,
+        audio_sources=audio_sources,
         summary_crc_ok=crc_ok,
         camera_range=camera_range,
         metadata_ranges=metadata_ranges,
@@ -384,23 +450,132 @@ def read_objects(source: Readable, scene: IndexedScene) -> ObjectLayer:
     return out
 
 
-def _audio_codec(prefix: bytes) -> str:
-    """The `codec` field at the front of an Audio record, read out of a prefix of it."""
+def _source_id(prefix: bytes, record_name: str) -> int:
     try:
-        return Cursor(prefix).string()
+        return Cursor(prefix).u32()
+    except Exception as exc:
+        raise MalformedFile(f"the {record_name} record does not contain its u32 source id") from exc
+
+
+def _audio_data_prefix(prefix: bytes) -> tuple[int, int]:
+    try:
+        c = Cursor(prefix)
+        return c.u32(), c.u64()
+    except Exception as exc:
+        raise MalformedFile("the Audio Data record does not contain its source id and byte length") from exc
+
+
+def _legacy_audio_prefix(prefix: bytes, record_at: int, content_length: int) -> tuple[str, float, int, int]:
+    """Read the old descriptor fields without fetching the old payload."""
+    try:
+        c = Cursor(prefix)
+        codec = c.string()
+        start_sec = c.f64()
+        data_length = c.u64()
     except Exception as exc:
         raise MalformedFile(
-            f"the Audio record's codec name does not fit the first {AUDIO_CODEC_PREFIX} bytes of the record"
+            f"the legacy Audio descriptor does not fit the first {AUDIO_CODEC_PREFIX} bytes of the record"
         ) from exc
+    if content_length < c.pos + data_length:
+        raise MalformedFile(
+            f"the legacy Audio record declares {data_length} data bytes, but its content is only {content_length} bytes"
+        )
+    return codec, start_sec, record_at + _RECORD_HEADER.size + c.pos, data_length
 
 
 def read_audio(source: Readable, scene: IndexedScene) -> bytes | None:
-    """The embedded track, fetched independently of any gaussian data.
-
-    `None` when the scene has none — a normal value, not an error.
-    """
-    if scene.audio_range is None:
+    """Compatibility accessor for the first source's encoded bytes."""
+    if not scene.audio_sources:
         return None
-    offset, length = scene.audio_range
-    blob = _read_range(source, offset, length, "the Audio record")
-    return rec.Audio.parse(Cursor(blob, 9).take(length - 9)).data
+    entry = scene.audio_sources[0]
+    return source.read(entry.data_offset, entry.data_length)
+
+
+def read_audio_sources(source: Readable, scene: IndexedScene) -> list[AudioSource]:
+    """Fetch every descriptor and payload. Use `read_audio_range` to stream one instead."""
+    return [_read_audio_source(source, scene, entry) for entry in scene.audio_sources]
+
+
+def read_audio_source_descriptors(source: Readable, scene: IndexedScene) -> list[AudioSource]:
+    """Fetch every small descriptor without transferring any encoded payload bytes."""
+    return [_read_audio_source(source, scene, entry, include_data=False) for entry in scene.audio_sources]
+
+
+def read_audio_source_state(source: Readable, scene: IndexedScene, source_id: int, t: float):
+    """Reconstruct one source at scene time `t` without fetching its encoded payload."""
+    entry = next((item for item in scene.audio_sources if item.source_id == source_id), None)
+    if entry is None:
+        raise MalformedFile(f"this scene has no audio source id {source_id}")
+    return _read_audio_source(source, scene, entry, include_data=False).state_at(t)
+
+
+def read_audio_range(source: Readable, scene: IndexedScene, source_id: int, offset: int, length: int) -> bytes:
+    """Read exactly one source-relative payload range."""
+    entry = next((item for item in scene.audio_sources if item.source_id == source_id), None)
+    if entry is None:
+        raise MalformedFile(f"this scene has no audio source id {source_id}")
+    if offset < 0 or length < 0 or offset + length > entry.data_length:
+        raise MalformedFile(
+            f"audio source {source_id} range [{offset}, {offset + length}) is outside "
+            f"its {entry.data_length}-byte payload"
+        )
+    return source.read(entry.data_offset + offset, length)
+
+
+def _read_audio_source(
+    source: Readable, scene: IndexedScene, entry: IndexedAudioSource, *, include_data: bool = True
+) -> AudioSource:
+    if entry.descriptor_range is None:
+        data = source.read(entry.data_offset, entry.data_length) if include_data else b""
+        return AudioSource(
+            source_id=entry.source_id,
+            codec=entry.legacy_codec or "",
+            data=data,
+            data_size=entry.data_length,
+            channel_layout="",
+            start_sec=entry.legacy_start_sec,
+            duration_sec=max(0.0, scene.header.duration_sec - entry.legacy_start_sec),
+            spatial=False,
+        )
+    offset, length = entry.descriptor_range
+    descriptor = rec.AudioSource.parse(
+        Cursor(_read_range(source, offset, length, "the Audio Source record"), 9).take(length - 9)
+    )
+    if descriptor.source_id != entry.source_id:
+        raise MalformedFile(f"Audio Source range for id {entry.source_id} contains id {descriptor.source_id}")
+    if descriptor.data_length != entry.data_length:
+        raise MalformedFile(
+            f"Audio Source id {entry.source_id} declares {descriptor.data_length} bytes, "
+            f"its Audio Data record declares {entry.data_length}"
+        )
+    for index, keyframe in enumerate(descriptor.keyframes):
+        if keyframe.time < 0 or keyframe.time > scene.header.duration_sec:
+            raise MalformedFile(
+                f"Audio Source id {entry.source_id} keyframe {index} time {keyframe.time} "
+                f"is outside [0, {scene.header.duration_sec}]"
+            )
+    data = source.read(entry.data_offset, entry.data_length) if include_data else b""
+    return AudioSource(
+        source_id=descriptor.source_id,
+        name=descriptor.name,
+        codec=descriptor.codec,
+        channel_layout=descriptor.channel_layout,
+        data=data,
+        data_size=entry.data_length,
+        start_sec=descriptor.start_sec,
+        duration_sec=descriptor.duration_sec,
+        gain=descriptor.gain,
+        spatial=descriptor.spatial,
+        loop=descriptor.loop,
+        position=tuple(descriptor.position),
+        rotation=tuple(descriptor.rotation),
+        keyframes=[
+            AudioSourceKeyframe(
+                time=keyframe.time,
+                position=tuple(keyframe.position),
+                rotation=tuple(keyframe.rotation),
+            )
+            for keyframe in descriptor.keyframes
+        ],
+        interpolation=descriptor.interpolation,
+    )

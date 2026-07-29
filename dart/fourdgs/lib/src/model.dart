@@ -12,7 +12,10 @@ library;
 import 'dart:math' as math;
 import 'dart:typed_data';
 
-/// An embedded track. A scene without audio holds `null`, never an empty track.
+/// A legacy, non-spatial track.
+///
+/// Kept as an API compatibility view for version-1 files written before native
+/// spatial sources were introduced. New code uses [FourdgsAudioSource].
 class FourdgsAudioTrack {
   const FourdgsAudioTrack({
     required this.codec,
@@ -38,6 +41,225 @@ class FourdgsAudioTrack {
         return 'application/octet-stream';
     }
   }
+}
+
+/// One source pose on the scene clock.
+class FourdgsAudioSourceKeyframe {
+  const FourdgsAudioSourceKeyframe({
+    required this.time,
+    required this.position,
+    this.rotation = const <double>[0.0, 0.0, 0.0, 1.0],
+  });
+
+  final double time;
+  final List<double> position;
+
+  /// Unit quaternion, xyzw.
+  final List<double> rotation;
+}
+
+/// The source-local timing and pose reconstructed at one scene instant.
+///
+/// This is where audio decoding ends. Panning, HRTF, attenuation, occlusion and
+/// mixing combine this state with a player-owned listener pose and therefore
+/// belong to the player.
+class FourdgsAudioSourceState {
+  const FourdgsAudioSourceState({
+    required this.active,
+    required this.localTime,
+    required this.position,
+    required this.rotation,
+    required this.gain,
+  });
+
+  final bool active;
+  final double localTime;
+  final List<double> position;
+  final List<double> rotation;
+  final double gain;
+}
+
+/// A small source descriptor, independent of its encoded payload.
+///
+/// Indexed readers return these without transferring audio bytes. Pose
+/// keyframes use the scene clock, while [startSec] and [durationSec] determine
+/// playback on the source-local clock.
+class FourdgsAudioSourceDescriptor {
+  const FourdgsAudioSourceDescriptor({
+    required this.sourceId,
+    required this.name,
+    required this.codec,
+    required this.channelLayout,
+    required this.dataLength,
+    required this.startSec,
+    required this.durationSec,
+    required this.gain,
+    required this.spatial,
+    required this.loop,
+    required this.position,
+    required this.rotation,
+    required this.keyframes,
+    required this.interpolation,
+  });
+
+  final int sourceId;
+  final String name;
+  final String codec;
+  final String channelLayout;
+  final int dataLength;
+  final double startSec;
+  final double durationSec;
+  final double gain;
+
+  /// False for a global/non-spatial source. Spatial point sources are mono.
+  final bool spatial;
+
+  final bool loop;
+  final List<double> position;
+
+  /// Unit quaternion, xyzw.
+  final List<double> rotation;
+
+  final List<FourdgsAudioSourceKeyframe> keyframes;
+
+  /// `linear` or `step`.
+  final String interpolation;
+
+  /// Reconstruct source timing and pose at scene time [t].
+  FourdgsAudioSourceState stateAt(double t) {
+    final active = t >= startSec && (loop || t < startSec + durationSec);
+    final elapsed = math.max(0.0, t - startSec);
+    final localTime =
+        loop && durationSec > 0.0
+            ? elapsed % durationSec
+            : math.min(elapsed, math.max(0.0, durationSec));
+    final pose = _audioPoseAt(this, t);
+    return FourdgsAudioSourceState(
+      active: active,
+      localTime: localTime,
+      position: pose.$1,
+      rotation: pose.$2,
+      gain: gain,
+    );
+  }
+}
+
+/// One independently timed, optionally spatial audio source.
+class FourdgsAudioSource extends FourdgsAudioSourceDescriptor {
+  FourdgsAudioSource({
+    required super.sourceId,
+    required super.name,
+    required super.codec,
+    required super.channelLayout,
+    required super.dataLength,
+    required super.startSec,
+    required super.durationSec,
+    required super.gain,
+    required super.spatial,
+    required super.loop,
+    required super.position,
+    required super.rotation,
+    required super.keyframes,
+    required super.interpolation,
+    required this.data,
+  });
+
+  /// The encoded codec payload, verbatim.
+  final Uint8List data;
+
+  /// The media type a consumer should hand a codec implementation.
+  String get mediaType {
+    switch (codec) {
+      case 'wav':
+        return 'audio/wav';
+      case 'opus':
+        return 'audio/ogg';
+      default:
+        return 'application/octet-stream';
+    }
+  }
+}
+
+(List<double>, List<double>) _audioPoseAt(
+  FourdgsAudioSourceDescriptor source,
+  double t,
+) {
+  final frames = source.keyframes;
+  if (frames.isEmpty) {
+    return (source.position, _normalizedQuaternion(source.rotation));
+  }
+  if (t <= frames.first.time) {
+    return (
+      frames.first.position,
+      _normalizedQuaternion(frames.first.rotation),
+    );
+  }
+  if (t >= frames.last.time) {
+    return (frames.last.position, _normalizedQuaternion(frames.last.rotation));
+  }
+
+  int high = 1;
+  while (frames[high].time <= t) {
+    high++;
+  }
+  final a = frames[high - 1];
+  final b = frames[high];
+  if (source.interpolation == 'step') {
+    return (a.position, _normalizedQuaternion(a.rotation));
+  }
+  final u = (t - a.time) / (b.time - a.time);
+  return (
+    <double>[
+      for (int i = 0; i < 3; i++)
+        a.position[i] + (b.position[i] - a.position[i]) * u,
+    ],
+    _slerp(a.rotation, b.rotation, u),
+  );
+}
+
+List<double> _normalizedQuaternion(List<double> value) {
+  // Divide out the largest component before squaring so a finite but very large component
+  // cannot overflow to `inf` — which would make the norm `inf`, trip the guard below, and
+  // collapse a valid extreme orientation to the identity instead of the unit quaternion in
+  // its own direction. `dart:math` has no `hypot`, so this scales by hand.
+  final scale = value.fold<double>(0.0, (m, c) => math.max(m, c.abs()));
+  if (!scale.isFinite || scale == 0.0) {
+    return <double>[0.0, 0.0, 0.0, 1.0];
+  }
+  final scaled = <double>[for (final component in value) component / scale];
+  final length = math.sqrt(
+    scaled.fold<double>(0.0, (sum, component) => sum + component * component),
+  );
+  if (!length.isFinite || length == 0.0) {
+    return <double>[0.0, 0.0, 0.0, 1.0];
+  }
+  return <double>[for (final component in scaled) component / length];
+}
+
+List<double> _slerp(List<double> a, List<double> b, double u) {
+  final qa = _normalizedQuaternion(a);
+  var qb = _normalizedQuaternion(b);
+  var dot = 0.0;
+  for (int i = 0; i < 4; i++) {
+    dot += qa[i] * qb[i];
+  }
+  if (dot < 0.0) {
+    qb = <double>[for (final component in qb) -component];
+    dot = -dot;
+  }
+  dot = dot.clamp(-1.0, 1.0).toDouble();
+  if (dot > 0.9995) {
+    return _normalizedQuaternion(<double>[
+      for (int i = 0; i < 4; i++) qa[i] + (qb[i] - qa[i]) * u,
+    ]);
+  }
+  final theta = math.acos(dot);
+  final sinTheta = math.sin(theta);
+  final wa = math.sin((1.0 - u) * theta) / sinTheta;
+  final wb = math.sin(u * theta) / sinTheta;
+  return _normalizedQuaternion(<double>[
+    for (int i = 0; i < 4; i++) wa * qa[i] + wb * qb[i],
+  ]);
 }
 
 /// A default viewpoint and an optional suggested path. Advisory in the format

@@ -8,7 +8,7 @@
 
 use std::process::ExitCode;
 
-use fourdgs_conformance::{summarize, AudioSummary, Extras};
+use fourdgs_conformance::{summarize, Extras};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -33,15 +33,11 @@ fn run(path: &str) -> Result<String, String> {
     let scene = fourdgs::read_bytes(&data).map_err(|e| format!("{path}: {e}"))?;
     check_truncation_recovery(&data, &scene)?;
 
-    let audio = scene.audio.as_ref().map(|a| AudioSummary {
-        codec: a.codec.clone(),
-        data: a.data.clone(),
-    });
     let intervals: Vec<(f64, f64)> = scene.chunk_index.iter().map(|e| (e.t0, e.t1)).collect();
     summarize(
         &scene.header,
         &scene.gaussians,
-        audio.as_ref(),
+        &scene.audio_sources,
         &intervals,
         &Extras {
             camera: scene.camera.as_ref(),

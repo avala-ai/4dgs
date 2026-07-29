@@ -31,7 +31,7 @@ from .exceptions import (
     UnsupportedVersion,
 )
 from .gltf import GltfImport, from_gltf, to_gltf
-from .model import AudioTrack, CameraTrajectory, GaussianSet
+from .model import AudioSource, AudioSourceKeyframe, AudioSourceState, AudioTrack, CameraTrajectory, GaussianSet
 from .object_layer import ObjectLayer
 from .provenance import Pose, Provenance, pose_at
 from .quantization import SH_LADDERS, Bounds, Steps, sh_bound, sh_step
@@ -50,6 +50,9 @@ from .writer import WriteOptions, write
 
 __all__ = [
     "SH_LADDERS",
+    "AudioSource",
+    "AudioSourceKeyframe",
+    "AudioSourceState",
     "AudioTrack",
     "BoundViolation",
     "Bounds",

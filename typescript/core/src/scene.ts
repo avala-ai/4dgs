@@ -17,6 +17,7 @@ import {
   stepsFrom,
 } from "./chunk.js";
 import { crc32, DEFAULT_CODECS, type CodecRegistry } from "./codec.js";
+import { Cursor } from "./cursor.js";
 import { MalformedFile, TruncatedFile } from "./errors.js";
 import { assembleGaussians, type GaussianSet } from "./gaussians.js";
 import { Opcode } from "./opcodes.js";
@@ -24,7 +25,7 @@ import { DEFAULT_CUTOFF, supportK } from "./quantization.js";
 import { checkQuantizationScheme, checkTemporalModel } from "./registry.js";
 import {
   type Attachment,
-  type AudioTrack,
+  type AudioSourceDescriptor,
   type Camera,
   type ChunkIndexEntry,
   type Header,
@@ -32,8 +33,9 @@ import {
   type Quantization,
   type Statistics,
   type SummaryOffset,
+  RECORD_HEADER_BYTES,
   parseAttachment,
-  parseAudio,
+  parseAudioSource,
   parseCamera,
   parseChunk,
   parseChunkIndexEntry,
@@ -48,7 +50,7 @@ import {
 } from "./records.js";
 import { type IReadable, BytesReadable } from "./readable.js";
 import { MAX_SH_DEGREE, mergeBands, type ShCoefficients } from "./sh.js";
-import { StreamDecoder } from "./streamDecoder.js";
+import { StreamDecoder, type StreamedRecordPart } from "./streamDecoder.js";
 import { decodeStream, frameOneStream } from "./streams.js";
 
 /** Everything a `.4dgs` file describes, decoded. */
@@ -58,8 +60,13 @@ export interface Scene {
   /** Flattened `[lo, hi]` pairs from the Window Table record. */
   readonly windows: Float64Array;
   readonly gaussians: GaussianSet;
-  /** `null` when the scene has no soundtrack, which is the common case and not an error. */
-  readonly audio: AudioTrack | null;
+  /**
+   * Small source descriptors, empty when the scene has no audio.
+   *
+   * Encoded payload bytes are delivered through `DecodeOptions.onAudioData` while the
+   * resource is consumed; they are never retained in the completed scene.
+   */
+  readonly audioSources: readonly AudioSourceDescriptor[];
   readonly camera: Camera | null;
   readonly metadata: readonly Metadata[];
   readonly attachments: readonly Attachment[];
@@ -94,9 +101,57 @@ export interface DecodeOptions {
    * flag says so without the caller having to catch anything.
    */
   readonly recoverTruncated?: boolean;
+  /**
+   * Consume one bounded piece of encoded audio as it arrives.
+   *
+   * The callback is awaited before the decoder reads another block. `bytes` is a view
+   * into that block and should be consumed before the callback returns; retaining it is
+   * an explicit caller-owned copy/ownership decision.
+   */
+  readonly onAudioData?: (chunk: AudioPayloadChunk) => void | Promise<void>;
+}
+
+/** One source-relative piece of an encoded payload on the streamed read path. */
+export interface AudioPayloadChunk {
+  readonly sourceId: number;
+  readonly offset: number;
+  readonly dataLength: number;
+  readonly bytes: Uint8Array;
+  readonly final: boolean;
 }
 
 const DEFAULT_BLOCK_SIZE = 1 << 20;
+const STREAMED_RECORD_OPCODES: ReadonlySet<number> = new Set([Opcode.Audio, Opcode.AudioData]);
+
+interface LegacyAudioDescriptor {
+  readonly codec: string;
+  readonly startSec: number;
+  readonly dataLength: number;
+}
+
+interface StreamingAudioData {
+  readonly recordOffset: number;
+  readonly contentLength: number;
+  readonly prefix: Uint8Array;
+  prefixLength: number;
+  sourceId: number | null;
+  dataLength: number | null;
+  emitted: number;
+  finalCallbackEmitted: boolean;
+}
+
+interface StreamingLegacyAudio {
+  readonly recordOffset: number;
+  readonly contentLength: number;
+  prefix: Uint8Array;
+  prefixLength: number;
+  codecLength: number | null;
+  codec: string | null;
+  startSec: number | null;
+  dataLength: number | null;
+  emitted: number;
+  finalCallbackEmitted: boolean;
+}
 
 /**
  * Decode a whole scene, front to back.
@@ -134,7 +189,11 @@ export async function decodeScene(
   const summaryParts: Uint8Array[] = [];
   let summaryPartsStart = -1;
   let summaryCrcOk: boolean | null = null;
-  let audio: AudioTrack | null = null;
+  let legacyAudio: LegacyAudioDescriptor | null = null;
+  const audioDescriptors = new Map<number, AudioSourceDescriptor>();
+  const audioPayloadLengths = new Map<number, number>();
+  let streamingAudioData: StreamingAudioData | null = null;
+  let streamingLegacyAudio: StreamingLegacyAudio | null = null;
   let camera: Camera | null = null;
   let statistics: Statistics | null = null;
   let truncated = false;
@@ -148,7 +207,31 @@ export async function decodeScene(
     // Records complete as bytes arrive. A record that is not complete yet is simply not
     // yielded, which is the whole of truncation recovery: what is complete is decoded,
     // what is cut is not, and nothing has to be undone.
-    for (const record of decoder.records()) {
+    for (const item of decoder.recordsStreaming(STREAMED_RECORD_OPCODES)) {
+      if ("bytes" in item) {
+        if (chunks.length > 0) {
+          const name = item.opcode === Opcode.Audio ? "Audio" : "Audio Data";
+          throw new MalformedFile(`an ${name} record appears after the first Chunk`);
+        }
+        if (item.opcode === Opcode.Audio) {
+          const consumed = await consumeLegacyAudioPart(
+            item,
+            streamingLegacyAudio,
+            options.onAudioData,
+          );
+          streamingLegacyAudio = consumed.state;
+          if (consumed.descriptor !== null) legacyAudio = consumed.descriptor;
+        } else {
+          streamingAudioData = await consumeAudioDataPart(
+            item,
+            streamingAudioData,
+            audioPayloadLengths,
+            options.onAudioData,
+          );
+        }
+        continue;
+      }
+      const record = item;
       const { opcode, content } = record;
       if (SUMMARY_OPCODES.has(opcode)) {
         if (summaryPartsStart < 0) summaryPartsStart = record.offset;
@@ -191,9 +274,17 @@ export async function decodeScene(
           chunkBands[chunkBands.length - 1]!.set(band, values);
           break;
         }
-        case Opcode.Audio:
-          audio = parseAudio(content);
+        case Opcode.AudioSource: {
+          if (chunks.length > 0) {
+            throw new MalformedFile("an Audio Source record appears after the first Chunk");
+          }
+          const source = parseAudioSource(content);
+          if (audioDescriptors.has(source.sourceId)) {
+            throw new MalformedFile(`Audio Source id ${source.sourceId} appears more than once`);
+          }
+          audioDescriptors.set(source.sourceId, source);
           break;
+        }
         case Opcode.Camera:
           camera = parseCamera(content);
           break;
@@ -244,6 +335,14 @@ export async function decodeScene(
     throw new MalformedFile("file has no Header or no Quantization record");
   }
 
+  const audioSources = assembleAudioSourceDescriptors(
+    header,
+    audioDescriptors,
+    audioPayloadLengths,
+    legacyAudio,
+    truncated,
+  );
+
   return {
     header,
     quantization,
@@ -254,7 +353,7 @@ export async function decodeScene(
       header.shDegree,
       mergeChunkBands(chunks, chunkBands, maxShBand),
     ),
-    audio,
+    audioSources,
     camera,
     metadata,
     attachments,
@@ -265,6 +364,293 @@ export async function decodeScene(
     summaryCrcOk,
     truncated,
   };
+}
+
+function assembleAudioSourceDescriptors(
+  header: Header,
+  descriptors: ReadonlyMap<number, AudioSourceDescriptor>,
+  payloadLengths: Map<number, number>,
+  legacy: LegacyAudioDescriptor | null,
+  truncated: boolean,
+): AudioSourceDescriptor[] {
+  if (descriptors.size > 0 && legacy !== null) {
+    throw new MalformedFile("the file mixes a legacy Audio record with Audio Source records");
+  }
+  // A legacy Audio record can never coexist with new-format audio. Unlike an unmatched new
+  // descriptor — which a lost Audio Source could still have matched in a truncated file — a
+  // payload beside a legacy record is an orphan no later bytes can legitimize, so it is
+  // refused even in recovery, matching the indexed reader.
+  if (legacy !== null && payloadLengths.size > 0) {
+    const sourceId = Math.min(...payloadLengths.keys());
+    throw new MalformedFile(`Audio Data id ${sourceId} has no matching Audio Source record`);
+  }
+  const sources: AudioSourceDescriptor[] = [];
+  for (const sourceId of [...descriptors.keys()].sort((a, b) => a - b)) {
+    const descriptor = descriptors.get(sourceId)!;
+    const dataLength = payloadLengths.get(sourceId);
+    if (dataLength === undefined) {
+      if (truncated) continue;
+      throw new MalformedFile(`Audio Source id ${sourceId} has no matching Audio Data record`);
+    }
+    payloadLengths.delete(sourceId);
+    if (dataLength !== descriptor.dataLength) {
+      throw new MalformedFile(
+        `Audio Source id ${sourceId} declares ${descriptor.dataLength} data bytes, ` +
+          `its Audio Data record contains ${dataLength}`,
+      );
+    }
+    for (let i = 0; i < descriptor.keyframes.length; i++) {
+      const time = descriptor.keyframes[i]!.time;
+      if (time < 0 || time > header.durationSec) {
+        throw new MalformedFile(
+          `Audio Source id ${sourceId} keyframe ${i} time ${time} is outside ` +
+            `[0, ${header.durationSec}]`,
+        );
+      }
+    }
+    sources.push(descriptor);
+  }
+  if (payloadLengths.size > 0 && !truncated) {
+    const sourceId = Math.min(...payloadLengths.keys());
+    throw new MalformedFile(`Audio Data id ${sourceId} has no matching Audio Source record`);
+  }
+  if (legacy !== null) {
+    sources.push({
+      sourceId: 0,
+      name: "",
+      codec: legacy.codec,
+      channelLayout: "",
+      dataLength: legacy.dataLength,
+      startSec: legacy.startSec,
+      durationSec: Math.max(0, header.durationSec - legacy.startSec),
+      gain: 1,
+      spatial: false,
+      loop: false,
+      position: [0, 0, 0],
+      rotation: [0, 0, 0, 1],
+      keyframes: [],
+      interpolation: "linear",
+    });
+  }
+  if (header.hasAudio !== sources.length > 0 && !truncated) {
+    throw new MalformedFile(
+      `the Header audio flag is ${header.hasAudio ? "set" : "clear"}, but the file contains ` +
+        `${sources.length} complete audio sources`,
+    );
+  }
+  return sources;
+}
+
+async function consumeLegacyAudioPart(
+  part: StreamedRecordPart,
+  current: StreamingLegacyAudio | null,
+  onAudioData: DecodeOptions["onAudioData"],
+): Promise<{ state: StreamingLegacyAudio | null; descriptor: LegacyAudioDescriptor | null }> {
+  let state = current;
+  if (state === null) {
+    state = {
+      recordOffset: part.recordOffset,
+      contentLength: part.contentLength,
+      prefix: new Uint8Array(4),
+      prefixLength: 0,
+      codecLength: null,
+      codec: null,
+      startSec: null,
+      dataLength: null,
+      emitted: 0,
+      finalCallbackEmitted: false,
+    };
+  } else if (
+    state.recordOffset !== part.recordOffset ||
+    state.contentLength !== part.contentLength
+  ) {
+    throw new Error("internal error: interleaved streamed records");
+  }
+
+  let at = 0;
+  while (state.dataLength === null && at < part.bytes.byteLength) {
+    const taken = Math.min(
+      state.prefix.byteLength - state.prefixLength,
+      part.bytes.byteLength - at,
+    );
+    state.prefix.set(part.bytes.subarray(at, at + taken), state.prefixLength);
+    state.prefixLength += taken;
+    at += taken;
+    if (state.prefixLength !== state.prefix.byteLength) break;
+
+    if (state.codecLength === null) {
+      const codecLength = new DataView(
+        state.prefix.buffer,
+        state.prefix.byteOffset,
+        state.prefix.byteLength,
+      ).getUint32(0, true);
+      const prefixLength = 4 + codecLength + 8 + 8;
+      if (!Number.isSafeInteger(prefixLength) || prefixLength > state.contentLength) {
+        throw new MalformedFile(
+          `legacy Audio record at offset ${state.recordOffset} declares a ${codecLength}-byte ` +
+            `codec, but its content is only ${state.contentLength} bytes`,
+        );
+      }
+      const expanded = new Uint8Array(prefixLength);
+      expanded.set(state.prefix);
+      state.prefix = expanded;
+      state.codecLength = codecLength;
+      continue;
+    }
+
+    const prefix = new Cursor(state.prefix, 0, state.recordOffset + RECORD_HEADER_BYTES);
+    state.codec = prefix.string();
+    state.startSec = prefix.f64();
+    state.dataLength = prefix.u64();
+    if (state.contentLength < state.prefix.byteLength + state.dataLength) {
+      throw new MalformedFile(
+        `legacy Audio record at offset ${state.recordOffset} declares ${state.dataLength} ` +
+          `data bytes, but its content is only ${state.contentLength} bytes`,
+      );
+    }
+  }
+
+  if (state.dataLength !== null) {
+    const remaining = state.dataLength - state.emitted;
+    const taken = Math.min(remaining, part.bytes.byteLength - at);
+    if (taken > 0) {
+      const bytes = part.bytes.subarray(at, at + taken);
+      const offset = state.emitted;
+      state.emitted += taken;
+      const final = state.emitted === state.dataLength;
+      await onAudioData?.({
+        sourceId: 0,
+        offset,
+        dataLength: state.dataLength,
+        bytes,
+        final,
+      });
+      state.finalCallbackEmitted ||= final;
+    }
+  }
+
+  if (!part.final) return { state, descriptor: null };
+  if (state.codec === null || state.startSec === null || state.dataLength === null) {
+    throw new MalformedFile(
+      `legacy Audio record at offset ${state.recordOffset} is shorter than its prefix`,
+    );
+  }
+  if (state.emitted !== state.dataLength) {
+    throw new MalformedFile(
+      `legacy Audio record at offset ${state.recordOffset} ended after ${state.emitted} of ` +
+        `${state.dataLength} declared data bytes`,
+    );
+  }
+  if (!state.finalCallbackEmitted) {
+    await onAudioData?.({
+      sourceId: 0,
+      offset: 0,
+      dataLength: 0,
+      bytes: new Uint8Array(0),
+      final: true,
+    });
+  }
+  return {
+    state: null,
+    descriptor: {
+      codec: state.codec,
+      startSec: state.startSec,
+      dataLength: state.dataLength,
+    },
+  };
+}
+
+async function consumeAudioDataPart(
+  part: StreamedRecordPart,
+  current: StreamingAudioData | null,
+  payloadLengths: Map<number, number>,
+  onAudioData: DecodeOptions["onAudioData"],
+): Promise<StreamingAudioData | null> {
+  let state = current;
+  if (state === null) {
+    state = {
+      recordOffset: part.recordOffset,
+      contentLength: part.contentLength,
+      prefix: new Uint8Array(12),
+      prefixLength: 0,
+      sourceId: null,
+      dataLength: null,
+      emitted: 0,
+      finalCallbackEmitted: false,
+    };
+  } else if (
+    state.recordOffset !== part.recordOffset ||
+    state.contentLength !== part.contentLength
+  ) {
+    throw new Error("internal error: interleaved streamed records");
+  }
+
+  let at = 0;
+  if (state.prefixLength < state.prefix.byteLength) {
+    const taken = Math.min(state.prefix.byteLength - state.prefixLength, part.bytes.byteLength);
+    state.prefix.set(part.bytes.subarray(0, taken), state.prefixLength);
+    state.prefixLength += taken;
+    at += taken;
+    if (state.prefixLength === state.prefix.byteLength) {
+      const prefix = new Cursor(state.prefix, 0, state.recordOffset + RECORD_HEADER_BYTES);
+      const sourceId = prefix.u32();
+      const dataLength = prefix.u64();
+      state.sourceId = sourceId;
+      state.dataLength = dataLength;
+      if (state.contentLength < state.prefix.byteLength + dataLength) {
+        throw new MalformedFile(
+          `Audio Data id ${sourceId} declares ${dataLength} bytes, ` +
+            `but its record content is only ${state.contentLength} bytes`,
+        );
+      }
+      if (payloadLengths.has(sourceId)) {
+        throw new MalformedFile(`Audio Data id ${sourceId} appears more than once`);
+      }
+    }
+  }
+
+  if (state.sourceId !== null && state.dataLength !== null) {
+    const remaining = state.dataLength - state.emitted;
+    const taken = Math.min(remaining, part.bytes.byteLength - at);
+    if (taken > 0) {
+      const bytes = part.bytes.subarray(at, at + taken);
+      const offset = state.emitted;
+      state.emitted += taken;
+      const final = state.emitted === state.dataLength;
+      await onAudioData?.({
+        sourceId: state.sourceId,
+        offset,
+        dataLength: state.dataLength,
+        bytes,
+        final,
+      });
+      state.finalCallbackEmitted ||= final;
+    }
+  }
+
+  if (!part.final) return state;
+  if (state.sourceId === null || state.dataLength === null) {
+    throw new MalformedFile(
+      `Audio Data record at offset ${state.recordOffset} is shorter than its 12-byte prefix`,
+    );
+  }
+  if (state.emitted !== state.dataLength) {
+    throw new MalformedFile(
+      `Audio Data id ${state.sourceId} ended after ${state.emitted} of ` +
+        `${state.dataLength} declared bytes`,
+    );
+  }
+  if (!state.finalCallbackEmitted) {
+    await onAudioData?.({
+      sourceId: state.sourceId,
+      offset: 0,
+      dataLength: 0,
+      bytes: new Uint8Array(0),
+      final: true,
+    });
+  }
+  payloadLengths.set(state.sourceId, state.dataLength);
+  return null;
 }
 
 /** Records that belong to the summary region a Footer CRC covers. */

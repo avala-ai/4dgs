@@ -375,6 +375,188 @@ class FourdgsAudio {
   }
 }
 
+/// Opcode `0x11`. A small source descriptor paired with [FourdgsAudioData].
+class FourdgsAudioSourceRecord {
+  const FourdgsAudioSourceRecord({
+    required this.sourceId,
+    required this.name,
+    required this.codec,
+    required this.channelLayout,
+    required this.dataLength,
+    required this.startSec,
+    required this.durationSec,
+    required this.gain,
+    required this.flags,
+    required this.position,
+    required this.rotation,
+    required this.keyframes,
+    required this.interpolation,
+  });
+
+  final int sourceId;
+  final String name;
+  final String codec;
+  final String channelLayout;
+  final int dataLength;
+  final double startSec;
+  final double durationSec;
+  final double gain;
+  final int flags;
+  final List<double> position;
+  final List<double> rotation;
+  final List<FourdgsAudioSourceKeyframeRecord> keyframes;
+  final String interpolation;
+
+  bool get spatial => flags & audioSourceFlagSpatial != 0;
+  bool get loop => flags & audioSourceFlagLoop != 0;
+
+  static FourdgsAudioSourceRecord parse(Uint8List content) {
+    final c = FourdgsCursor(content);
+    final sourceId = c.u32();
+    final name = c.string();
+    final codec = c.string();
+    final channelLayout = c.string();
+    final dataLength = c.u64();
+    final startSec = c.f64();
+    final durationSec = c.f64();
+    final gain = c.f64();
+    final flags = c.u8();
+    final position = c.f64s(3);
+    final rotation = c.f64s(4);
+    final count = c.u32();
+    if (count > c.remaining ~/ audioSourceKeyframeBytes) {
+      throw FourdgsTruncatedFile(
+        'Audio Source $sourceId declares $count keyframes needing '
+        '${count * audioSourceKeyframeBytes} bytes, ${c.remaining} remain',
+      );
+    }
+    final keyframes = <FourdgsAudioSourceKeyframeRecord>[];
+    double lastTime = double.negativeInfinity;
+    for (int i = 0; i < count; i++) {
+      final keyframe = FourdgsAudioSourceKeyframeRecord(
+        time: c.f64(),
+        position: c.f64s(3),
+        rotation: c.f64s(4),
+      );
+      if (!keyframe.time.isFinite || keyframe.time <= lastTime) {
+        throw FourdgsMalformedFile(
+          'Audio Source $sourceId keyframe $i time must be finite and strictly increasing',
+        );
+      }
+      lastTime = keyframe.time;
+      keyframes.add(keyframe);
+    }
+    final interpolation = c.string();
+    final source = FourdgsAudioSourceRecord(
+      sourceId: sourceId,
+      name: name,
+      codec: codec,
+      channelLayout: channelLayout,
+      dataLength: dataLength,
+      startSec: startSec,
+      durationSec: durationSec,
+      gain: gain,
+      flags: flags,
+      position: position,
+      rotation: rotation,
+      keyframes: keyframes,
+      interpolation: interpolation,
+    );
+    _validateAudioSource(source);
+    return source;
+  }
+}
+
+class FourdgsAudioSourceKeyframeRecord {
+  const FourdgsAudioSourceKeyframeRecord({
+    required this.time,
+    required this.position,
+    required this.rotation,
+  });
+
+  final double time;
+  final List<double> position;
+  final List<double> rotation;
+}
+
+/// Opcode `0x12`. One source's encoded codec payload.
+class FourdgsAudioData {
+  const FourdgsAudioData({required this.sourceId, required this.data});
+
+  final int sourceId;
+  final Uint8List data;
+
+  static FourdgsAudioData parse(Uint8List content) {
+    final c = FourdgsCursor(content);
+    return FourdgsAudioData(sourceId: c.u32(), data: c.blob());
+  }
+}
+
+void _validateAudioSource(FourdgsAudioSourceRecord source) {
+  const allowedFlags = audioSourceFlagSpatial | audioSourceFlagLoop;
+  if (source.flags & ~allowedFlags != 0) {
+    throw FourdgsMalformedFile(
+      'Audio Source ${source.sourceId} has reserved flag bits set',
+    );
+  }
+  if (source.codec.isEmpty) {
+    throw FourdgsMalformedFile(
+      'Audio Source ${source.sourceId} has an empty codec',
+    );
+  }
+  if (!source.startSec.isFinite) {
+    throw FourdgsMalformedFile(
+      'Audio Source ${source.sourceId} start_sec is not finite',
+    );
+  }
+  if (!source.durationSec.isFinite || source.durationSec <= 0.0) {
+    throw FourdgsMalformedFile(
+      'Audio Source ${source.sourceId} duration_sec must be finite and positive',
+    );
+  }
+  if (!source.gain.isFinite || source.gain < 0.0) {
+    throw FourdgsMalformedFile(
+      'Audio Source ${source.sourceId} gain must be finite and non-negative',
+    );
+  }
+  if (source.spatial && source.channelLayout != 'mono') {
+    throw FourdgsMalformedFile(
+      'spatial Audio Source ${source.sourceId} must use channel layout "mono"',
+    );
+  }
+  if (!source.position.every((value) => value.isFinite)) {
+    throw FourdgsMalformedFile(
+      'Audio Source ${source.sourceId} position must contain three finite values',
+    );
+  }
+  if (!source.rotation.every((value) => value.isFinite) ||
+      source.rotation.every((value) => value == 0.0)) {
+    throw FourdgsMalformedFile(
+      'Audio Source ${source.sourceId} rotation must be a finite non-zero quaternion',
+    );
+  }
+  for (int i = 0; i < source.keyframes.length; i++) {
+    final keyframe = source.keyframes[i];
+    if (!keyframe.position.every((value) => value.isFinite)) {
+      throw FourdgsMalformedFile(
+        'Audio Source ${source.sourceId} keyframe $i position must contain three finite values',
+      );
+    }
+    if (!keyframe.rotation.every((value) => value.isFinite) ||
+        keyframe.rotation.every((value) => value == 0.0)) {
+      throw FourdgsMalformedFile(
+        'Audio Source ${source.sourceId} keyframe $i rotation must be a finite non-zero quaternion',
+      );
+    }
+  }
+  if (source.interpolation != 'linear' && source.interpolation != 'step') {
+    throw FourdgsMalformedFile(
+      'Audio Source ${source.sourceId} uses unknown interpolation '
+      '"${source.interpolation}"',
+    );
+  }
+}
+
 /// Opcode `0x0A`. A default viewpoint and an optional suggested path. Purely
 /// advisory: a reader MAY ignore it entirely.
 class FourdgsCamera {
@@ -516,6 +698,9 @@ const int windowBytes = 16;
 
 /// Encoded size of one SH band descriptor: `u8 band`, `u64 offset`, `u64 length`.
 const int bandRangeBytes = 17;
+
+/// `f64 time`, three `f64` position values and four `f64` quaternion values.
+const int audioSourceKeyframeBytes = 64;
 
 /// The most validity windows one scene may declare.
 ///

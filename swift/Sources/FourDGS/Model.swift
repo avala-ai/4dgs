@@ -1,6 +1,8 @@
 // Copyright 2026 Avala AI
 // SPDX-License-Identifier: Apache-2.0
 
+import Foundation
+
 /// The records a `.4dgs` file describes, as Swift values.
 ///
 /// Every type here is a `struct` and every one is `Sendable`: a decoded scene is data, it
@@ -32,8 +34,8 @@ public struct Header: Sendable, Equatable {
     public var aabb: [Double]
     /// 0...3; 0 means no spherical harmonics.
     public var shDegree: Int
-    /// `true` when the file carries an Audio record. §7's discovery rule: this answers
-    /// "does this scene have audio?" from the Header alone, with no further reads.
+    /// `true` when the file carries any audio representation. §7's discovery rule answers
+    /// this from the Header alone, with no further reads.
     public var hasAudio: Bool
     /// `true` when chunk data is compressed.
     public var hasCompressedChunks: Bool
@@ -61,10 +63,7 @@ public struct Header: Sendable, Equatable {
 
 // MARK: - Optional records
 
-/// An embedded audio track. §5.9.
-///
-/// Modelled as an `Optional` on `Scene`, per §7: absence is a normal value, never an error
-/// and never a warning, and it is the common case.
+/// Legacy non-spatial audio result, retained for source compatibility.
 public struct Audio: Sendable, Equatable {
     /// A well-known audio codec name from the registry.
     public var codec: String
@@ -78,6 +77,156 @@ public struct Audio: Sendable, Equatable {
         self.startSec = startSec
         self.data = data
     }
+}
+
+/// One independently timed encoded payload and its scene-space pose.
+public struct AudioSource: Sendable, Equatable {
+    public struct Keyframe: Sendable, Equatable {
+        public var time: Double
+        public var position: [Double]
+        /// Unit quaternion in xyzw order.
+        public var rotation: [Double]
+
+        public init(time: Double, position: [Double], rotation: [Double]) {
+            self.time = time
+            self.position = position
+            self.rotation = rotation
+        }
+    }
+
+    public var sourceId: UInt32
+    public var name: String
+    public var codec: String
+    public var channelLayout: String
+    public var startSec: Double
+    public var durationSec: Double
+    public var gain: Double
+    public var spatial: Bool
+    public var loop: Bool
+    public var position: [Double]
+    /// Unit quaternion in xyzw order.
+    public var rotation: [Double]
+    public var keyframes: [Keyframe]
+    public var interpolation: String
+    /// Encoded payload length. The bytes are fetched separately on indexed paths.
+    public var dataSize: UInt64
+    public var data: [UInt8]
+
+    public init(
+        sourceId: UInt32, name: String = "", codec: String, channelLayout: String = "mono",
+        startSec: Double = 0, durationSec: Double, gain: Double = 1, spatial: Bool = true,
+        loop: Bool = false, position: [Double] = [0, 0, 0],
+        rotation: [Double] = [0, 0, 0, 1], keyframes: [Keyframe] = [],
+        interpolation: String = "linear", dataSize: UInt64? = nil, data: [UInt8] = []
+    ) {
+        self.sourceId = sourceId
+        self.name = name
+        self.codec = codec
+        self.channelLayout = channelLayout
+        self.startSec = startSec
+        self.durationSec = durationSec
+        self.gain = gain
+        self.spatial = spatial
+        self.loop = loop
+        self.position = position
+        self.rotation = rotation
+        self.keyframes = keyframes
+        self.interpolation = interpolation
+        self.dataSize = dataSize ?? UInt64(data.count)
+        self.data = data
+    }
+}
+
+/// Format reconstruction at one scene time. Listener-relative spatialization is
+/// deliberately player-owned.
+public struct AudioSourceState: Sendable, Equatable {
+    public var active: Bool
+    public var localTime: Double
+    public var position: [Double]
+    public var rotation: [Double]
+    public var gain: Double
+
+    public init(
+        active: Bool, localTime: Double, position: [Double], rotation: [Double], gain: Double
+    ) {
+        self.active = active
+        self.localTime = localTime
+        self.position = position
+        self.rotation = rotation
+        self.gain = gain
+    }
+}
+
+extension AudioSource {
+    /// Reconstruct timing and moving pose. Listener-relative playback stays in the player.
+    public func state(at t: Double) -> AudioSourceState {
+        let active = t >= startSec && (loop || t < startSec + durationSec)
+        let elapsed = max(0, t - startSec)
+        let localTime =
+            loop && durationSec > 0
+            ? elapsed.truncatingRemainder(dividingBy: durationSec)
+            : min(elapsed, max(0, durationSec))
+
+        let pose: ([Double], [Double])
+        if keyframes.isEmpty {
+            pose = (position, normalizedQuaternion(rotation))
+        } else if t <= keyframes[0].time {
+            pose = (keyframes[0].position, normalizedQuaternion(keyframes[0].rotation))
+        } else if t >= keyframes[keyframes.count - 1].time {
+            let last = keyframes[keyframes.count - 1]
+            pose = (last.position, normalizedQuaternion(last.rotation))
+        } else {
+            let high = keyframes.firstIndex { $0.time > t }!
+            let a = keyframes[high - 1]
+            let b = keyframes[high]
+            if interpolation == "step" {
+                pose = (a.position, normalizedQuaternion(a.rotation))
+            } else {
+                let u = (t - a.time) / (b.time - a.time)
+                pose = (
+                    zip(a.position, b.position).map { pair in
+                        pair.0 + (pair.1 - pair.0) * u
+                    },
+                    quaternionSlerp(a.rotation, b.rotation, u)
+                )
+            }
+        }
+        return AudioSourceState(
+            active: active, localTime: localTime, position: pose.0, rotation: pose.1, gain: gain)
+    }
+}
+
+private func normalizedQuaternion(_ value: [Double]) -> [Double] {
+    // Divide out the largest component before squaring so a finite but very large component
+    // cannot overflow to `inf` — which would make the norm `inf`, trip the guard below, and
+    // collapse a valid extreme orientation to the identity instead of the unit quaternion in
+    // its own direction.
+    let scale = value.map { abs($0) }.max() ?? 0
+    guard scale.isFinite, scale > 0 else { return [0, 0, 0, 1] }
+    let scaled = value.map { $0 / scale }
+    let length = sqrt(scaled.reduce(0) { $0 + $1 * $1 })
+    guard length.isFinite, length > 0 else { return [0, 0, 0, 1] }
+    return scaled.map { $0 / length }
+}
+
+private func quaternionSlerp(_ a: [Double], _ b: [Double], _ u: Double) -> [Double] {
+    let qa = normalizedQuaternion(a)
+    var qb = normalizedQuaternion(b)
+    var dot = zip(qa, qb).reduce(0) { $0 + $1.0 * $1.1 }
+    if dot < 0 {
+        qb = qb.map { -$0 }
+        dot = -dot
+    }
+    dot = min(1, max(-1, dot))
+    if dot > 0.9995 {
+        return normalizedQuaternion(
+            zip(qa, qb).map { pair in pair.0 + (pair.1 - pair.0) * u })
+    }
+    let theta = acos(dot)
+    let sinTheta = sin(theta)
+    let wa = sin((1 - u) * theta) / sinTheta
+    let wb = sin(u * theta) / sinTheta
+    return normalizedQuaternion(zip(qa, qb).map { pair in wa * pair.0 + wb * pair.1 })
 }
 
 /// A default viewpoint and optional suggested path. §5.10. Purely advisory.

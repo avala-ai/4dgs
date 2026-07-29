@@ -14,7 +14,7 @@ import { decodeScene, IndexedDecoder, MAX_SH_DEGREE, assembleGaussians } from "@
 import type { ChunkGaussians, ShCoefficients } from "@4dgs/core";
 import { BlobReadable, HttpRangeReadable } from "@4dgs/browser";
 
-import { canonical, summarize } from "./canonical.js";
+import { AudioPayloadDigests, canonical, summarize } from "./canonical.js";
 
 export interface PageResult {
   readonly variant: string;
@@ -45,12 +45,15 @@ function concatSh(parts: readonly ShCoefficients[], count: number): ShCoefficien
 /** Decode front to back from a `Blob`, the way a dropped file arrives. */
 async function viaBlob(variant: string): Promise<string> {
   const response = await fetch(`/data/${variant}.4dgs`);
-  const scene = await decodeScene(new BlobReadable(await response.blob()));
+  const payloads = new AudioPayloadDigests();
+  const scene = await decodeScene(new BlobReadable(await response.blob()), {
+    onAudioData: payloads.consume,
+  });
   return canonical(
     summarize({
       header: scene.header,
       gaussians: scene.gaussians,
-      audio: scene.audio,
+      audioSources: payloads.sources(scene.audioSources),
       chunkIntervals: scene.chunkIndex.map((e) => [e.t0, e.t1] as const),
       camera: scene.camera,
       metadata: scene.metadata,
@@ -84,7 +87,7 @@ async function viaRange(variant: string): Promise<string> {
         scene.header.shDegree,
         concatSh(shParts, count),
       ),
-      audio: await scene.readAudio(),
+      audioSources: await scene.readAudioSources(),
       chunkIntervals: scene.index.map((e) => [e.t0, e.t1] as const),
       camera: await scene.readCamera(),
       metadata: await scene.readMetadata(),

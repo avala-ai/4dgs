@@ -32,6 +32,10 @@ SUMMARY_OFFSET = 0x0F
 #: differences as absolute positions.
 DELTA_CHUNK = 0x10
 
+# Multi-source audio follows the already-assigned Delta Chunk opcode.
+AUDIO_SOURCE = 0x11
+AUDIO_DATA = 0x12
+
 # The provenance family, spec section 5.15. Assigned in dependency order: the two records
 # that carry poses come after the one that names the frame those poses are in.
 COORDINATE_FRAME = 0x20
@@ -76,6 +80,8 @@ NAMES = {
     ATTACHMENT_INDEX: "AttachmentIndex",
     SUMMARY_OFFSET: "SummaryOffset",
     DELTA_CHUNK: "DeltaChunk",
+    AUDIO_SOURCE: "AudioSource",
+    AUDIO_DATA: "AudioData",
     COORDINATE_FRAME: "CoordinateFrame",
     SENSOR_CALIBRATION: "SensorCalibration",
     RIG_TRAJECTORY: "RigTrajectory",

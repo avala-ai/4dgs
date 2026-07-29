@@ -200,31 +200,87 @@ enum Core {
         return intervals
     }
 
-    /// The soundtrack, or `nil`. Answered from the Header alone — §7's discovery rule — so
-    /// a scene without audio costs no read at all.
-    static func audio(_ scene: SceneHandle) throws -> Audio? {
-        guard fourdgs_scene_has_audio(scene.raw) != 0 else { return nil }
-        let codec = fourdgs_scene_audio_codec(scene.raw).map { String(cString: $0) } ?? ""
-        let size = fourdgs_scene_audio_size(scene.raw)
-        // Defense in depth, not a known bug: the core validates this and is fuzzed, so a wild
-        // length should never arrive here. But this is the one place the binding turns a
-        // file-derived number straight into an allocation, and the cost of proving it against
-        // the resource that supplied it is one comparison. A length that cannot fit in the
-        // bytes behind it is refused rather than reserved.
-        if let resourceSize = scene.resourceByteCount, size > UInt64(max(resourceSize, 0)) {
-            throw FourDGSError.malformed(
-                offset: 0, record: "Audio", field: "data",
-                reason: "declares \(size) bytes, more than the \(resourceSize) the whole file holds")
+    /// Every source descriptor, without its encoded payload. A scene with none costs no
+    /// descriptor read; payload bytes move only through `audioSourceData`.
+    static func audioSources(_ scene: SceneHandle) throws -> [AudioSource] {
+        let count = fourdgs_scene_audio_source_count(scene.raw)
+        var sources: [AudioSource] = []
+        sources.reserveCapacity(Int(count))
+        for index in 0..<count {
+            var raw = fourdgs_audio_source()
+            var status = fourdgs_scene_audio_source(scene.raw, index, &raw)
+            guard status == ok else { throw error(status) }
+
+            var keyframes: [AudioSource.Keyframe] = []
+            keyframes.reserveCapacity(Int(raw.keyframe_count))
+            for keyframeIndex in 0..<raw.keyframe_count {
+                var frame = fourdgs_audio_source_keyframe()
+                status = fourdgs_scene_audio_source_keyframe(scene.raw, index, keyframeIndex, &frame)
+                guard status == ok else { throw error(status) }
+                keyframes.append(
+                    AudioSource.Keyframe(
+                        time: frame.time,
+                        position: [frame.position.0, frame.position.1, frame.position.2],
+                        rotation: [
+                            frame.rotation.0, frame.rotation.1, frame.rotation.2, frame.rotation.3,
+                        ]))
+            }
+
+            sources.append(
+                AudioSource(
+                    sourceId: raw.source_id,
+                    name: string(raw.name, raw.name_length),
+                    codec: string(raw.codec, raw.codec_length),
+                    channelLayout: string(raw.channel_layout, raw.channel_layout_length),
+                    startSec: raw.start_sec,
+                    durationSec: raw.duration_sec,
+                    gain: raw.gain,
+                    spatial: raw.spatial != 0,
+                    loop: raw.loop_playback != 0,
+                    position: [raw.position.0, raw.position.1, raw.position.2],
+                    rotation: [raw.rotation.0, raw.rotation.1, raw.rotation.2, raw.rotation.3],
+                    keyframes: keyframes,
+                    interpolation: string(raw.interpolation, raw.interpolation_length),
+                    dataSize: raw.data_size))
         }
-        var data = [UInt8](repeating: 0, count: Int(size))
-        if size > 0 {
+        return sources
+    }
+
+    static func audioSourceData(
+        _ scene: SceneHandle, index: UInt32, offset: UInt64, length: UInt64
+    ) throws -> [UInt8] {
+        if let resourceSize = scene.resourceByteCount, length > UInt64(max(resourceSize, 0)) {
+            throw FourDGSError.malformed(
+                offset: 0, record: "Audio Data", field: "data",
+                reason: "requests \(length) bytes, more than the \(resourceSize) the whole file holds")
+        }
+        guard length <= UInt64(Int.max) else {
+            throw FourDGSError.malformed(
+                offset: 0, record: "Audio Data", field: "data",
+                reason: "length \(length) is past this platform's allocation limit")
+        }
+        var data = [UInt8](repeating: 0, count: Int(length))
+        if length > 0 {
             let status = data.withUnsafeMutableBufferPointer { buffer in
-                fourdgs_scene_audio_read(scene.raw, 0, size, buffer.baseAddress)
+                fourdgs_scene_audio_source_read(scene.raw, index, offset, length, buffer.baseAddress)
             }
             guard status == ok else { throw error(status) }
         }
-        // `start_sec` has no accessor yet; the ABI exposes the track, not its offset.
-        return Audio(codec: codec, startSec: 0, data: data)
+        return data
+    }
+
+    static func audioSourceState(
+        _ scene: SceneHandle, index: UInt32, at t: Double
+    ) throws -> AudioSourceState {
+        var raw = fourdgs_audio_source_state()
+        let status = fourdgs_scene_audio_source_state_at(scene.raw, index, t, &raw)
+        guard status == ok else { throw error(status) }
+        return AudioSourceState(
+            active: raw.active != 0,
+            localTime: raw.local_time,
+            position: [raw.position.0, raw.position.1, raw.position.2],
+            rotation: [raw.rotation.0, raw.rotation.1, raw.rotation.2, raw.rotation.3],
+            gain: raw.gain)
     }
 
     /// What a seek to `t` would transfer, so a consumer can budget before asking.

@@ -26,7 +26,7 @@ from canonical import canonical, summarize
 from fourdgs.indexed_reader import (
     open_indexed,
     read_attachments,
-    read_audio,
+    read_audio_sources,
     read_camera,
     read_chunk,
     read_metadata,
@@ -85,7 +85,7 @@ def run(path: str) -> str:
         source = _Counting(raw)
         scene = open_indexed(source)
         chunks = [read_chunk(source, scene, entry, max_sh_band=3) for entry in scene.index]
-        audio_bytes = read_audio(source, scene)
+        audio_sources = read_audio_sources(source, scene)
         camera = read_camera(source, scene)
         metadata = read_metadata(source, scene)
         attachments = read_attachments(source, scene)
@@ -139,14 +139,11 @@ def run(path: str) -> str:
             sh_degree=scene.header.sh_degree,
         )
 
-    audio = None
-    if audio_bytes is not None:
-        audio = fourdgs.AudioTrack(codec=scene.audio_codec or "", data=audio_bytes)
     return canonical(
         summarize(
             scene.header,
             gaussians,
-            audio,
+            audio_sources,
             [(e.t0, e.t1) for e in scene.index],
             camera=camera,
             metadata=metadata,

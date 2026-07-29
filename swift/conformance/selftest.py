@@ -26,6 +26,7 @@ import json
 import os
 import sys
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -88,9 +89,31 @@ class Gaussians:
 
 
 @dataclass
-class Audio:
+class AudioSource:
+    source_id: int
+    name: str
     codec: str
+    channel_layout: str
+    start_sec: float
+    duration_sec: float
+    gain: float
+    spatial: bool
+    loop: bool
+    position: list
+    rotation: list
+    keyframes: list
+    interpolation: str
     data: bytes
+
+    def state_at(self, t: float):
+        elapsed = max(0.0, t - self.start_sec)
+        return SimpleNamespace(
+            active=t >= self.start_sec and (self.loop or t < self.start_sec + self.duration_sec),
+            local_time=elapsed % self.duration_sec if self.loop else min(elapsed, self.duration_sec),
+            position=self.position,
+            rotation=self.rotation,
+            gain=self.gain,
+        )
 
 
 @dataclass
@@ -228,7 +251,24 @@ def main() -> int:
     summary = canonical.summarize(
         header,
         gaussians,
-        Audio(codec="opus", data=bytes(i % 251 for i in range(5000))),
+        [
+            AudioSource(
+                source_id=7,
+                name="speaker",
+                codec="opus",
+                channel_layout="mono",
+                start_sec=0.25,
+                duration_sec=4.0,
+                gain=1.0,
+                spatial=True,
+                loop=False,
+                position=[1.0, 0.5, -1.0],
+                rotation=[0.0, 0.0, 0.0, 1.0],
+                keyframes=[],
+                interpolation="linear",
+                data=bytes(i % 251 for i in range(5000)),
+            )
+        ],
         [(0.0, 1.5), (1.5, 3.0), (3.0, 4.5)],
         camera=Camera(
             fov_y_deg=62.5,

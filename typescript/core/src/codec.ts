@@ -120,11 +120,23 @@ const CRC_TABLE = (() => {
   return table;
 })();
 
+/** Incremental CRC-32 (IEEE), for records consumed in bounded pieces. */
+export class Crc32 {
+  private state = 0xffffffff;
+
+  update(bytes: Uint8Array): this {
+    for (let i = 0; i < bytes.length; i++) {
+      this.state = CRC_TABLE[(this.state ^ bytes[i]!) & 0xff]! ^ (this.state >>> 8);
+    }
+    return this;
+  }
+
+  digest(): number {
+    return (this.state ^ 0xffffffff) >>> 0;
+  }
+}
+
 /** CRC-32 (IEEE), as the Footer's `summary_crc` uses it. */
 export function crc32(bytes: Uint8Array): number {
-  let c = 0xffffffff;
-  for (let i = 0; i < bytes.length; i++) {
-    c = CRC_TABLE[(c ^ bytes[i]!) & 0xff]! ^ (c >>> 8);
-  }
-  return (c ^ 0xffffffff) >>> 0;
+  return new Crc32().update(bytes).digest();
 }

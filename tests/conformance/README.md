@@ -107,9 +107,9 @@ the intact prefix. Truncation stays where it was, checked by each runner against
 
 ## Synthetic only
 
-Every scene is generated from a fixed seed by `build_gaussians`, and the audio track is a generated
-sine sweep. There is no captured data in this repository and there will not be: the corpus must be
-redistributable without a licence question and reproducible without a download.
+Every scene is generated from a fixed seed by `build_gaussians`, and audio source payloads are
+generated sine sweeps. There is no captured data in this repository and there will not be: the
+corpus must be redistributable without a licence question and reproducible without a download.
 
 ## Declining a feature is how a partial SDK stays honest
 
@@ -119,12 +119,12 @@ the first users of it: TypeScript, C++ and Swift decline them, and the feature m
 `No`.
 
 The alternative was worse in a way worth writing down. The canonical summary emits its `provenance`
-section **only when the file carries provenance** — unlike `audio`, which is `null` when absent
-because audio presence is a property of every file and both paths must stay visible. Had provenance
-followed the `audio` convention, every one of the 34 pre-existing expectations would have gained a
-`"provenance": null`, and three SDKs that correctly skip the records by length would have gone red
-on all of them. The suite would have reported the format's forward-compatibility mechanism working
-as 34 failures.
+section **only when the file carries provenance** — unlike `audioSources`, which is empty when
+absent because audio presence is a property of every file and both paths must stay visible. Had
+provenance followed the `audioSources` convention, every one of the 34 pre-existing expectations
+would have gained `"provenance": null`, and three SDKs that correctly skip the records by length
+would have gone red on all of them. The suite would have reported the format's forward-compatibility
+mechanism working as 34 failures.
 
 So the shape is: a file without provenance is byte-identical to what it was before the family
 existed, its expectation is unchanged, and every SDK passes it untouched — that is the assertion. A
@@ -148,9 +148,9 @@ coverage.
 
 Small fixtures hide a whole class of bug: anything that only appears once a record is larger than a
 buffer, a window, or a threshold an implementation chose. `WithLargeAudio` exists for exactly that
-reason — its track is bigger than the 64 KiB probe an indexed reader opens a file with, and an Audio
-record lives in the front matter, so a reader that walks the front matter by materializing each
-record instead of stepping over it by length fails on that variant and on no other. Both
+reason — its Audio Data payload is bigger than the 64 KiB probe an indexed reader opens a file with,
+and source pairs live in the front matter. A reader that walks the front matter by materializing
+each record instead of stepping over it by length fails on that variant and on no other. Both
 implementations in this repository had that bug, and every other fixture was too small to say so.
 
 A new variant that exists to cross a size threshold should say which threshold, and why, in its
@@ -187,11 +187,11 @@ a failure, but the error names the runner rather than the platform and reads lik
 ## Platforms
 
 The suite runs on GitHub-hosted runners for Python, TypeScript and Rust on Linux, macOS and Windows;
-C++, Swift and Dart run it on Linux. Every platform decodes the same 45 valid variants and compares
-against the same committed expectations — 77 passing comparisons for a family that declines the
-provenance and object variants plus the refusal expectations, 87 for Rust, which answers the
-provenance ones, and 103 for Python, which answers all of them. The single `decode_indexed` variant
-that declares no chunk index is skipped everywhere.
+C++, Swift and Dart run it on Linux. Every platform decodes the same 46 valid variants and compares
+against the same committed expectations — 79 passing comparisons for a family that declines the
+provenance and object variants plus the refusal expectations, 89 for Rust, which answers provenance
+but declines objects, and 105 for Python, which answers all of them. The single `decode_indexed`
+variant that declares no chunk index is skipped everywhere.
 
 That the corpus is bytes is the whole reason this is worth doing on more than one platform: a
 decoder that agrees with the expectation on Linux and disagrees on Windows is exactly the bug this
@@ -205,8 +205,8 @@ So that two languages can be diffed without arguing about representation:
 - byte strings are arrays of numbers
 - floats are rounded to a fixed number of decimals before comparison
 - `sigma_t` for a never-fading gaussian is `null`, never a sentinel number
-- `"audio"` is `null` when absent and an object when present, so both paths are visible in every
-  implementation's output
+- `"audioSources"` is an array, empty when absent, containing every descriptor, midpoint moving-pose
+  reconstruction and payload digest, so absence and multiplicity are visible in every implementation
 - keys are sorted; the harness stable-stringifies before diffing and colourizes the first divergence
 - **nothing depends on decoded order.** Gaussians may be reordered freely by an encoder, so the
   sample, the aggregates and the spherical harmonic digest are all taken in a content order derived

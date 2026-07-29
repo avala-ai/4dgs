@@ -23,6 +23,12 @@ let state = scene.gaussians.state_at(1.5, scene.header.cutoff);
 let source = fourdgs::FileReadable::open("scene.4dgs")?;
 let mut reader = fourdgs::SceneReader::open(source)?;
 let state = reader.state_at(1.5, 3)?;
+
+for index in 0..reader.audio_source_count() {
+    let source = reader.audio_source(index)?.expect("in range");
+    let source_state = source.state_at(1.5);
+    // The player combines this scene-space pose with its listener pose.
+}
 ```
 
 `SceneReader` uses the index when the file has one and falls back to a front-to-back read when it
@@ -48,8 +54,8 @@ belongs in the consumer.
 No path in the crate reads a whole file. The streamed reader takes an `io::Read` and reads one
 record at a time, growing a buffer only as bytes actually arrive, so a crafted length cannot make it
 allocate what the resource does not contain. The indexed reader steps over front-matter records by
-their headers, so a scene with an embedded audio track costs nothing to open, and fetches each chunk
-and each spherical-harmonic band by its own byte range.
+their headers, so a scene with large audio payloads costs nothing to open. Audio descriptors and
+source-relative payload ranges, chunks and spherical-harmonic bands are fetched independently.
 
 ## Writing
 
@@ -85,5 +91,6 @@ auto-selection.
 
 ## Scope
 
-Decoding ends at reconstructed gaussian state at time `t`. Nothing in the crate describes how that
-state is drawn, ordered, culled or budgeted — the format is renderer-agnostic and so is the SDK.
+Gaussian decoding ends at reconstructed gaussian state. Audio reconstruction ends at active/local
+time, gain and scene-space source pose. Nothing here chooses rendering strategy, listener pose,
+HRTF/panning, attenuation, occlusion or mixing.

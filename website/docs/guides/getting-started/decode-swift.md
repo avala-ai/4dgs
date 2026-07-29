@@ -18,10 +18,18 @@ let reader = try SceneReader(path: "scene.4dgs")   // or readPath: .streamed / .
 let live = try reader.gaussians(at: 1.5)   // the window, then marginal against the file's cutoff
 let moved = live[0].state(at: 1.5)         // centre moved, opacity faded
 let cost = reader.bytesForTime(1.5)        // what that seek transfers, before asking for it
+
+for (index, source) in reader.scene.audioSources.enumerated() {
+    let sourceState = try reader.audioSourceState(index, at: 1.5)
+    let encodedPrefix = try reader.audioSourceData(index, length: min(source.dataSize, 4096))
+    // scene-space pose + local playback time; the player supplies the listener
+}
 ```
 
 A `SceneReader` is a class and is not `Sendable` — one open scene belongs to one thread. What comes
 out of it is `Sendable`, because every array is copied out of the core's memory before it returns.
+Source descriptors are populated on open, but their `data` arrays remain empty; `dataSize` is known
+without transfer and `audioSourceData` performs the requested bounded payload read.
 
 ## Building
 
@@ -56,5 +64,5 @@ to slice client-side.
 
 ## Scope
 
-Decoding a `.4dgs` to gaussian state at a time `t`. Rendering is out of scope for this repository:
-the SDK ends at decoded state.
+Decoding a `.4dgs` to gaussian state and audio source state at `t`. Rendering and listener-relative
+spatialization are out of scope: the player owns HRTF/panning, attenuation, occlusion and mixing.

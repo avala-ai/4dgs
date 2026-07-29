@@ -89,7 +89,8 @@ fn run(input: &str, output: &str, sh_bit_depths: Option<Vec<u8>>) -> Result<Stri
         ..Default::default()
     };
     let extras = SceneExtras {
-        audio: scene.audio.clone(),
+        audio_sources: scene.audio_sources.clone(),
+        audio: None,
         camera: scene.camera.clone(),
         metadata: scene.metadata.clone(),
         attachments: scene.attachments.clone(),

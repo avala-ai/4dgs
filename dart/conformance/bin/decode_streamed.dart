@@ -24,7 +24,7 @@ String run(String path) {
     summarize(
       header: scene.header,
       gaussians: scene.gaussians,
-      audio: scene.audio,
+      audioSources: scene.audioSources,
       chunkIntervals: <(double, double)>[
         for (final e in scene.chunkIndex) (e.t0, e.t1),
       ],

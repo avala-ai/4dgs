@@ -11,8 +11,12 @@
  */
 
 import { Cursor } from "./cursor.js";
-import { TruncatedFile, UnsupportedVersion } from "./errors.js";
-import { HEADER_FLAG_HAS_AUDIO } from "./opcodes.js";
+import { MalformedFile, TruncatedFile, UnsupportedVersion } from "./errors.js";
+import {
+  AUDIO_SOURCE_FLAG_LOOP,
+  AUDIO_SOURCE_FLAG_SPATIAL,
+  HEADER_FLAG_HAS_AUDIO,
+} from "./opcodes.js";
 
 /**
  * `0x89 4 D G S 1 CR LF`.
@@ -290,6 +294,217 @@ export interface AudioTrack {
 export function parseAudio(content: Uint8Array): AudioTrack {
   const c = new Cursor(content);
   return { codec: c.string(), startSec: c.f64(), data: c.blob() };
+}
+
+export interface AudioSourceKeyframe {
+  readonly time: number;
+  readonly position: readonly number[];
+  /** Unit quaternion, xyzw. */
+  readonly rotation: readonly number[];
+}
+
+/** A small descriptor whose encoded bytes live in a paired Audio Data record. */
+export interface AudioSourceDescriptor {
+  readonly sourceId: number;
+  readonly name: string;
+  readonly codec: string;
+  readonly channelLayout: string;
+  readonly dataLength: number;
+  readonly startSec: number;
+  readonly durationSec: number;
+  readonly gain: number;
+  readonly spatial: boolean;
+  readonly loop: boolean;
+  readonly position: readonly number[];
+  readonly rotation: readonly number[];
+  readonly keyframes: readonly AudioSourceKeyframe[];
+  readonly interpolation: string;
+}
+
+/** One independently timed, optionally spatial audio source. */
+export interface AudioSource extends AudioSourceDescriptor {
+  /** The encoded payload, verbatim. */
+  readonly data: Uint8Array;
+}
+
+export interface AudioSourceState {
+  readonly active: boolean;
+  readonly localTime: number;
+  readonly position: readonly number[];
+  readonly rotation: readonly number[];
+  readonly gain: number;
+}
+
+export function parseAudioSource(content: Uint8Array): AudioSourceDescriptor {
+  const c = new Cursor(content);
+  const sourceId = c.u32();
+  const name = c.string();
+  const codec = c.string();
+  const channelLayout = c.string();
+  const dataLength = c.u64();
+  const startSec = c.f64();
+  const durationSec = c.f64();
+  const gain = c.f64();
+  const flags = c.u8();
+  const position = c.f64s(3);
+  const rotation = c.f64s(4);
+  const count = c.u32();
+  if (count * 64 > c.remaining) {
+    throw new TruncatedFile(
+      `Audio Source ${sourceId} declares ${count} keyframes needing ${count * 64} bytes, ` +
+        `${c.remaining} remain`,
+    );
+  }
+  const keyframes: AudioSourceKeyframe[] = [];
+  let lastTime = Number.NEGATIVE_INFINITY;
+  for (let i = 0; i < count; i++) {
+    const keyframe = { time: c.f64(), position: c.f64s(3), rotation: c.f64s(4) };
+    if (!Number.isFinite(keyframe.time) || keyframe.time <= lastTime) {
+      throw new MalformedFile(
+        `Audio Source ${sourceId} keyframe ${i} time must be finite and strictly increasing`,
+      );
+    }
+    lastTime = keyframe.time;
+    keyframes.push(keyframe);
+  }
+  const interpolation = c.string();
+  if ((flags & ~(AUDIO_SOURCE_FLAG_SPATIAL | AUDIO_SOURCE_FLAG_LOOP)) !== 0) {
+    throw new MalformedFile(`Audio Source ${sourceId} has reserved flag bits set`);
+  }
+  if (codec.length === 0) throw new MalformedFile(`Audio Source ${sourceId} has an empty codec`);
+  if (!Number.isFinite(startSec)) {
+    throw new MalformedFile(`Audio Source ${sourceId} start_sec is not finite`);
+  }
+  if (!Number.isFinite(durationSec) || durationSec <= 0) {
+    throw new MalformedFile(`Audio Source ${sourceId} duration_sec must be finite and positive`);
+  }
+  if (!Number.isFinite(gain) || gain < 0) {
+    throw new MalformedFile(`Audio Source ${sourceId} gain must be finite and non-negative`);
+  }
+  if (!position.every(Number.isFinite)) {
+    throw new MalformedFile(`Audio Source ${sourceId} position must contain three finite values`);
+  }
+  if (!rotation.every(Number.isFinite) || rotation.every((value) => value === 0)) {
+    throw new MalformedFile(
+      `Audio Source ${sourceId} rotation must be a finite non-zero quaternion`,
+    );
+  }
+  for (let i = 0; i < keyframes.length; i++) {
+    const keyframe = keyframes[i]!;
+    if (!keyframe.position.every(Number.isFinite)) {
+      throw new MalformedFile(
+        `Audio Source ${sourceId} keyframe ${i} position must contain three finite values`,
+      );
+    }
+    if (
+      !keyframe.rotation.every(Number.isFinite) ||
+      keyframe.rotation.every((value) => value === 0)
+    ) {
+      throw new MalformedFile(
+        `Audio Source ${sourceId} keyframe ${i} rotation must be a finite non-zero quaternion`,
+      );
+    }
+  }
+  if ((flags & AUDIO_SOURCE_FLAG_SPATIAL) !== 0 && channelLayout !== "mono") {
+    throw new MalformedFile(`spatial Audio Source ${sourceId} must use channel layout "mono"`);
+  }
+  if (interpolation !== "linear" && interpolation !== "step") {
+    throw new MalformedFile(
+      `Audio Source ${sourceId} uses unknown interpolation ${JSON.stringify(interpolation)}`,
+    );
+  }
+  return {
+    sourceId,
+    name,
+    codec,
+    channelLayout,
+    dataLength,
+    startSec,
+    durationSec,
+    gain,
+    spatial: (flags & AUDIO_SOURCE_FLAG_SPATIAL) !== 0,
+    loop: (flags & AUDIO_SOURCE_FLAG_LOOP) !== 0,
+    position,
+    rotation,
+    keyframes,
+    interpolation,
+  };
+}
+
+export interface AudioData {
+  readonly sourceId: number;
+  readonly data: Uint8Array;
+}
+
+export function parseAudioData(content: Uint8Array): AudioData {
+  const c = new Cursor(content);
+  return { sourceId: c.u32(), data: c.blob() };
+}
+
+/** Reconstruct source-local timing and pose. Spatialization remains player-owned. */
+export function audioSourceStateAt(source: AudioSourceDescriptor, t: number): AudioSourceState {
+  const active = t >= source.startSec && (source.loop || t < source.startSec + source.durationSec);
+  const elapsed = Math.max(0, t - source.startSec);
+  const localTime =
+    source.loop && source.durationSec > 0
+      ? elapsed % source.durationSec
+      : Math.min(elapsed, Math.max(0, source.durationSec));
+  const [position, rotation] = audioPoseAt(source, t);
+  return { active, localTime, position, rotation, gain: source.gain };
+}
+
+function audioPoseAt(
+  source: AudioSourceDescriptor,
+  t: number,
+): readonly [readonly number[], readonly number[]] {
+  const frames = source.keyframes;
+  if (frames.length === 0) return [source.position, normalizedQuaternion(source.rotation)];
+  if (t <= frames[0]!.time) {
+    return [frames[0]!.position, normalizedQuaternion(frames[0]!.rotation)];
+  }
+  if (t >= frames[frames.length - 1]!.time) {
+    const last = frames[frames.length - 1]!;
+    return [last.position, normalizedQuaternion(last.rotation)];
+  }
+  let high = 1;
+  while (frames[high]!.time <= t) high++;
+  const a = frames[high - 1]!;
+  const b = frames[high]!;
+  if (source.interpolation === "step") {
+    return [a.position, normalizedQuaternion(a.rotation)];
+  }
+  const u = (t - a.time) / (b.time - a.time);
+  return [
+    a.position.map((value, i) => value + (b.position[i]! - value) * u),
+    slerp(a.rotation, b.rotation, u),
+  ];
+}
+
+function normalizedQuaternion(value: readonly number[]): readonly number[] {
+  const scale = Math.max(...value.map(Math.abs));
+  if (!Number.isFinite(scale) || scale === 0) return [0, 0, 0, 1];
+  const scaled = value.map((component) => component / scale);
+  const length = Math.sqrt(scaled.reduce((sum, component) => sum + component * component, 0));
+  return scaled.map((component) => component / length);
+}
+
+function slerp(a: readonly number[], b: readonly number[], u: number): readonly number[] {
+  const qa = normalizedQuaternion(a);
+  let qb = normalizedQuaternion(b);
+  let dot = qa.reduce((sum, value, i) => sum + value * qb[i]!, 0);
+  if (dot < 0) {
+    qb = qb.map((value) => -value);
+    dot = -dot;
+  }
+  dot = Math.min(1, Math.max(-1, dot));
+  if (dot > 0.9995) {
+    return normalizedQuaternion(qa.map((value, i) => value + (qb[i]! - value) * u));
+  }
+  const theta = Math.acos(dot);
+  const sinTheta = Math.sin(theta);
+  const wa = Math.sin((1 - u) * theta) / sinTheta;
+  const wb = Math.sin(u * theta) / sinTheta;
+  return normalizedQuaternion(qa.map((value, i) => wa * value + wb * qb[i]!));
 }
 
 export interface CameraKeyframe {

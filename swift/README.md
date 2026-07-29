@@ -1,8 +1,7 @@
 # 4dgs — Swift
 
-**In progress.** The package decodes real files through the Rust core's C ABI. It cannot yet emit a
-conformance summary, so every Swift cell in the [feature matrix](../website/docs/reference/index.md)
-stays `Planned`.
+The package decodes real files through the Rust core's C ABI and is checked by the shared
+conformance corpus on both read paths.
 
 `FourDGS` is a thin Swift layer over `rust/fourdgs`, for visionOS, iOS and macOS — a binding, not a
 second decoder. Every call into the core goes through one file,
@@ -11,26 +10,19 @@ buffer-ownership rules the boundary holds to. Above it is ordinary Swift: value 
 separate a malformed file from a legal one this build is too old for, and §3's reconstruction
 arithmetic.
 
-Scope: decoding a `.4dgs` to gaussian state at a time `t`. **RealityKit and Metal rendering are out
-of scope for this repository — the SDK ends at decoded state.**
+Scope: decoding a `.4dgs` to gaussian state and audio source state at time `t`. **RealityKit, Metal
+rendering and listener-relative spatialization are out of scope.**
 
 ```swift
 let reader = try SceneReader(path: "scene.4dgs")   // or readPath: .streamed / .indexed
 let live = try reader.gaussians(at: 1.5)   // §3: the window, then marginal against the file's cutoff
 let moved = live[0].state(at: 1.5)         // centre moved, opacity faded
 let cost = reader.bytesForTime(1.5)        // what that seek transfers, before asking for it
+let sourceState = try reader.audioSourceState(0, at: 1.5)
 ```
 
 A `SceneReader` is a class and is not `Sendable` — one open scene belongs to one thread. What comes
 out of it is `Sendable`, because every array is copied out of the core's memory before it returns.
-
-## What is not reachable yet
-
-The ABI exposes the Header's numbers, the audio track, the chunk intervals and the gaussians. It has
-no accessor for the metadata, attachment, camera, statistics or summary-offset records, nor for the
-Footer's summary CRC. `Scene.recordsAvailable` reports that, so an empty `metadata` is never
-mistaken for a file that carries none. The conformance runners refuse to print a partial summary for
-the same reason, and their CI job stays disabled until the accessors exist.
 
 ## Building
 

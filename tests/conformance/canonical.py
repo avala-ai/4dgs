@@ -10,8 +10,8 @@ about how a language spells a number:
 * floats are rounded to a fixed number of decimals before comparison;
 * a never-fading gaussian's sigma is `null`, never a sentinel a decoder could produce by
   accident;
-* `audio` is `null` when absent and an object when present, so both paths are visible in
-  every implementation's output rather than one of them being invisible;
+* `audioSources` is an array, empty when absent, so multiplicity and absence are both
+  visible in every implementation's output;
 * keys are sorted.
 
 **Nothing here may depend on decoded order.** Gaussians may be reordered freely by an
@@ -47,6 +47,7 @@ CAMERA_KEYFRAMES = 4
 #: The same cap for a rig trajectory, which is unbounded for the same reason and worse:
 #: a ten-minute capture at 100 Hz is sixty thousand samples.
 RIG_SAMPLES = 4
+AUDIO_KEYFRAMES = 4
 
 
 def num(value) -> float | None:
@@ -76,7 +77,7 @@ def canonical(scene_summary: dict) -> str:
 def summarize(
     header,
     gaussians,
-    audio,
+    audio_sources,
     chunk_intervals,
     *,
     camera=None,
@@ -129,10 +130,10 @@ def summarize(
         "shDegree": int(header.sh_degree),
         "temporalModel": header.temporal_model,
         "hasAudio": bool(header.has_audio),
-        # Absent audio is a value, not a missing key: both paths are conformance-visible.
-        "audio": None
-        if audio is None
-        else {"codec": audio.codec, "byteLength": str(len(audio.data)), "crc": crc(audio.data)},
+        "audioSources": [
+            _audio_source(source, header.duration_sec / 2)
+            for source in sorted(audio_sources, key=lambda s: s.source_id)
+        ],
         "chunkIntervals": [[num(a), num(b)] for a, b in chunk_intervals],
         "headerAttributes": {k: v for k, v in sorted(dict(header.attributes).items())},
         "metadataRecords": [
@@ -166,13 +167,13 @@ def summarize(
         ],
         "summaryCrcOk": summary_crc_ok,
         # Omitted entirely when the file carries no provenance, which is deliberate and
-        # is NOT the `audio` convention above.
+        # is NOT the `audioSources` convention above.
         #
-        # `audio` is `null` when absent because audio presence is a property of every
-        # file — the Header declares it either way — so both paths have to be visible in
-        # every variant or one of them is never checked. Provenance has no such flag and
-        # no such duty: a file that carries none is a file the record family does not
-        # apply to. Emitting `"provenance": null` on all thirty-four pre-existing variants
+        # `audioSources` is empty when absent because audio presence is a property of
+        # every file — the Header declares it either way — so both paths have to be
+        # visible in every variant or one of them is never checked. Provenance has no such
+        # flag and no such duty: a file that carries none is a file the record family does
+        # not apply to. Emitting `"provenance": null` on all thirty-four pre-existing variants
         # would have changed every committed expectation and broken three SDKs that
         # correctly skip the records by length — which is to say it would have reported
         # the forward-compatibility mechanism working as a conformance failure. Absence
@@ -428,6 +429,42 @@ def _camera(camera) -> dict:
         ],
         "interpolation": camera.interpolation,
         "loop": bool(camera.loop),
+    }
+
+
+def _audio_source(source, sample_time: float) -> dict:
+    state = source.state_at(sample_time)
+    return {
+        "sourceId": str(source.source_id),
+        "name": source.name,
+        "codec": source.codec,
+        "channelLayout": source.channel_layout,
+        "startSec": num(source.start_sec),
+        "durationSec": num(source.duration_sec),
+        "gain": num(source.gain),
+        "spatial": bool(source.spatial),
+        "loop": bool(source.loop),
+        "position": [num(v) for v in source.position],
+        "rotation": [num(v) for v in source.rotation],
+        "keyframeCount": str(len(source.keyframes)),
+        "keyframes": [
+            {
+                "time": num(keyframe.time),
+                "position": [num(v) for v in keyframe.position],
+                "rotation": [num(v) for v in keyframe.rotation],
+            }
+            for keyframe in source.keyframes[:AUDIO_KEYFRAMES]
+        ],
+        "interpolation": source.interpolation,
+        "stateAtHalf": {
+            "active": bool(state.active),
+            "localTime": num(state.local_time),
+            "position": [num(v) for v in state.position],
+            "rotation": [num(v) for v in state.rotation],
+            "gain": num(state.gain),
+        },
+        "byteLength": str(len(source.data)),
+        "crc": crc(source.data),
     }
 
 

@@ -5,11 +5,11 @@
  * Walking the records at the front of a file by header, never by content.
  *
  * An indexed reader wants four things from the front matter — the Header, the
- * Quantization grids, the Window Table, and the byte range of the audio track if there is
- * one — and none of them requires reading a record it does not care about. That
- * distinction is not academic: an embedded audio track is a first-class part of a scene
- * and lands in the front matter at whatever size the track is, so a walk that materializes
- * every record's content fails on the format's flagship case, a single file with sound.
+ * Quantization grids, the Window Table, and the byte ranges of any audio sources — and
+ * none of them requires reading a record it does not care about. That distinction is not
+ * academic: encoded audio payloads are first-class parts of a scene and land in the front
+ * matter at arbitrary sizes, so a walk that materializes every record's content defeats
+ * bounded indexed opening.
  *
  * So this steps over a record by arithmetic. The length is in the header; the bytes are
  * not needed to find the next record. Content is fetched only for records the caller asks
@@ -73,7 +73,7 @@ export class FrontMatterScanner {
    *
    * Served from the window when the record happens to be in it, and by a read of exactly
    * that record otherwise — so a Window Table larger than the probe is fetched rather
-   * than refused, and an audio track that nobody asked for is never fetched at all.
+   * than refused, and audio payloads that nobody asked for are never fetched at all.
    */
   async content(record: FrontMatterRecord, limit = Number.POSITIVE_INFINITY): Promise<Uint8Array> {
     const at = record.offset + RECORD_HEADER_BYTES;

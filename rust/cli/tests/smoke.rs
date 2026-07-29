@@ -41,9 +41,12 @@ fn corpus() -> Option<PathBuf> {
 type Selector = (&'static [&'static str], &'static [&'static str]);
 
 const SH_DEGREE_2: Selector = (&["SHDegree2", "UseChunkIndex", "UseCrc"], &[]);
-const WITH_AUDIO: Selector = (&["WithAudio"], &[]);
+const WITH_AUDIO: Selector = (&["WithSpatialAudio"], &[]);
 const CUSTOM_CUTOFF: Selector = (&["CustomCutoff"], &[]);
-const INDEXED: Selector = (&["UseChunkIndex"], &["WithAudio"]);
+const INDEXED: Selector = (
+    &["UseChunkIndex"],
+    &["WithSpatialAudio", "WithMultipleAudioSources"],
+);
 const NO_INDEX: Selector = (&[], &["UseChunkIndex"]);
 
 /// Every selector above, so the CI check can prove each one still resolves.
@@ -104,13 +107,12 @@ fn info_reports_the_header_without_decoding_anything() {
 }
 
 #[test]
-fn info_names_the_audio_codec_from_the_header_alone() {
+fn info_names_the_audio_source_count_from_the_header_walk() {
     let Some(path) = file(WITH_AUDIO) else {
         return;
     };
     let text = stdout(&run(&["info", path.to_str().unwrap()]));
-    assert!(text.contains("audio          "), "{text}");
-    assert!(!text.contains("audio          none"), "{text}");
+    assert!(text.contains("audio sources  1"), "{text}");
 }
 
 #[test]

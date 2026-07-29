@@ -7,48 +7,50 @@ documented state — not a defect — and this table is the public contract that
 `supportsVariant()`, the harness runs exactly those, and this table is kept in lockstep with those
 declarations. Nothing is marked `Yes` on the strength of code existing.
 
-Every row is filled in from a suite that runs: 45 valid variants and 7 invalid ones, over two read
+Every row is filled in from a suite that runs: 46 valid variants and 7 invalid ones, over two read
 paths (streamed and indexed). A language takes the variants it declares support for, and what it
-declines is what this table records — 103 checks passing for Python, 87 for Rust, 77 each for
+declines is what this table records — 105 checks passing for Python, 89 for Rust, 79 each for
 TypeScript, C++, Swift and Dart. Rust declines the object variant and refusal expectations;
-TypeScript, C++, Swift and Dart also decline the five variants that carry capture-provenance
-records.
+TypeScript, C++, Swift and Dart decline those and the five variants that carry provenance records.
 
-| Feature                                              | Python | TypeScript | Rust    | C++     | Swift   | Dart    |
-| ---------------------------------------------------- | ------ | ---------- | ------- | ------- | ------- | ------- |
-| Streaming decode                                     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Indexed / seeking decode                             | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Range-request decode                                 | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Truncated-file recovery                              | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Chunk index                                          | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Summary offsets                                      | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| CRC validation                                       | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Quantized attributes                                 | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Spherical harmonics, degree 1                        | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Spherical harmonics, degree 2                        | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Spherical harmonics, degree 3                        | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| SH band range-skipping                               | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| SH per-band bit depth, decode                        | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| SH per-band bit depth, encode                        | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
-| Embedded audio (optional, zero-overhead when absent) | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Camera trajectory                                    | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Metadata                                             | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Attachments                                          | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Statistics                                           | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Provenance: coordinate frame + georeference          | Yes    | No         | Yes     | No      | No      | No      |
-| Provenance: sensor calibration                       | Yes    | No         | Yes     | No      | No      | No      |
-| Provenance: rig trajectory + pose interpolation      | Yes    | No         | Yes     | No      | No      | No      |
-| Object membership (`object_id`)                      | Yes    | No         | Planned | No      | No      | No      |
-| Object Table: labels, anchors, embeddings            | Yes    | No         | Planned | No      | No      | No      |
-| Object Track: rigid state composition                | Yes    | No         | Planned | No      | No      | No      |
-| Unknown-record skipping                              | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Refusal diagnosis (named, not merely refused)        | Yes    | No         | No      | No      | No      | No      |
-| Private-range records                                | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Encode                                               | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
-| Chunked encode                                       | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
-| Summary writing                                      | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
-| Convert from PLY frame sequences                     | Yes    | No         | No      | No      | No      | No      |
-| Inspect and validate                                 | Yes    | Planned    | Planned | Planned | Planned | Planned |
+| Feature                                         | Python | TypeScript | Rust    | C++     | Swift   | Dart    |
+| ----------------------------------------------- | ------ | ---------- | ------- | ------- | ------- | ------- |
+| Streaming decode                                | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Indexed / seeking decode                        | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Range-request decode                            | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Truncated-file recovery                         | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Chunk index                                     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Summary offsets                                 | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| CRC validation                                  | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Quantized attributes                            | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Spherical harmonics, degree 1                   | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Spherical harmonics, degree 2                   | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Spherical harmonics, degree 3                   | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| SH band range-skipping                          | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| SH per-band bit depth, decode                   | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| SH per-band bit depth, encode                   | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
+| Spatial audio sources (optional)                | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Multiple independent audio sources              | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Moving audio source reconstruction              | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Per-source audio payload range reads            | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Camera trajectory                               | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Metadata                                        | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Attachments                                     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Statistics                                      | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Provenance: coordinate frame + georeference     | Yes    | No         | Yes     | No      | No      | No      |
+| Provenance: sensor calibration                  | Yes    | No         | Yes     | No      | No      | No      |
+| Provenance: rig trajectory + pose interpolation | Yes    | No         | Yes     | No      | No      | No      |
+| Object membership (`object_id`)                 | Yes    | No         | Planned | No      | No      | No      |
+| Object Table: labels, anchors, embeddings       | Yes    | No         | Planned | No      | No      | No      |
+| Object Track: rigid state composition           | Yes    | No         | Planned | No      | No      | No      |
+| Unknown-record skipping                         | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Refusal diagnosis (named, not merely refused)   | Yes    | No         | No      | No      | No      | No      |
+| Private-range records                           | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Encode                                          | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
+| Chunked encode                                  | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
+| Summary writing                                 | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
+| Convert from PLY frame sequences                | Yes    | No         | No      | No      | No      | No      |
+| Inspect and validate                            | Yes    | Planned    | Planned | Planned | Planned | Planned |
 
 ## Reading this table
 
@@ -61,9 +63,10 @@ records.
 
 ## Notes
 
-**Embedded audio** is optional in every sense. A scene without audio carries no audio record at all,
-and every SDK exposes audio as an optional value rather than an error state. Most files will have
-none; that is the common case, and it costs nothing.
+**Spatial audio** is optional in every sense. A scene without it carries no audio records, and every
+SDK exposes an empty source collection rather than an error state. A source carries scene-space pose
+and timing; SDKs reconstruct moving source state, while listener-relative HRTF/panning, attenuation,
+occlusion and mixing remain player-owned.
 
 **Provenance** (spec §5.15) is the newest feature here and the clearest illustration of what this
 table is for. Python and Rust decode the four records and surface them; TypeScript, C++, Swift and
@@ -172,15 +175,17 @@ different file. Each runner decodes its variant twice more — once cut before t
 once cut inside the last chunk — and asserts what survives. A failure exits the runner non-zero and
 the harness reports it like a diff.
 
-**Reconstruction at an instant is the one thing the canonical JSON does not carry**, and so the one
-thing the suite cannot compare. The summary is a statement about a file, not about a moment in it:
-two implementations could disagree about §3's arithmetic — the marginal, the centre, the visibility
-test — and pass every check. Where an SDK implements that arithmetic itself rather than only calling
-into a decoder, it is checked against the decoder's own answer. C++ is the case that exists today:
-its unit tests reconstruct at four instants per variant, with the file's own cutoff, and assert the
-sets agree in both directions — every gaussian the core calls visible must be visible there with the
-same centre and opacity, and every gaussian it calls visible must appear in the core's set, so the
-check cannot pass against a decoder that returns nothing.
+**Moving audio-source reconstruction is compared at the scene midpoint.** Each canonical source
+contains `stateAtHalf`, including its active flag, local payload time, gain, interpolated position
+and shortest-path SLERP rotation. The player-owned listener pose and spatialization policy are not
+part of that state.
+
+Gaussian reconstruction at an instant is not carried by the canonical JSON. The summary is chiefly a
+statement about a file, not an exhaustive sample of §3's continuous arithmetic: two implementations
+could disagree about a marginal, centre or visibility boundary and pass the cross-SDK comparison.
+SDK unit tests therefore check that arithmetic directly. C++, for example, reconstructs at four
+instants per variant with the file's own cutoff and compares the resident and core results in both
+directions.
 
 **Encode**, **Chunked encode** and **Summary writing** are proved by a gate rather than by a runner,
 and the encoders are gated by their role.

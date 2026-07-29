@@ -66,6 +66,10 @@ words:
   - shadeable
   - microfacet
   - dielectric
+  # Spatial-audio vocabulary
+  - HRTF
+  - spatialize
+  - spatialization
   # glTF and the Khronos extension registry
   - Khronos
   - gltf

@@ -146,6 +146,7 @@ fn seed_file(gaussians: usize, audio: bool, sh_degree: u8, index: bool) -> Vec<u
         ..Default::default()
     };
     let extras = SceneExtras {
+        audio_sources: Vec::new(),
         audio: audio.then(|| AudioTrack {
             codec: "wav".into(),
             start_sec: 0.0,
@@ -354,6 +355,33 @@ fn exercise_c_abi(input: &[u8]) {
         let _ = fourdgs_scene_positions(scene);
         let _ = fourdgs_scene_sh(scene);
         let _ = fourdgs_scene_audio_codec(scene);
+        let source_count = fourdgs_scene_audio_source_count(scene);
+        for index in 0..source_count {
+            let mut descriptor = std::mem::MaybeUninit::<fourdgs_audio_source>::uninit();
+            if fourdgs_scene_audio_source(scene, index, descriptor.as_mut_ptr())
+                == FOURDGS_STATUS_OK
+            {
+                let descriptor = descriptor.assume_init();
+                let mut source_state =
+                    std::mem::MaybeUninit::<fourdgs_audio_source_state>::uninit();
+                let _ = fourdgs_scene_audio_source_state_at(
+                    scene,
+                    index,
+                    1.0,
+                    source_state.as_mut_ptr(),
+                );
+                if descriptor.data_size > 0 {
+                    let mut head = [0u8; 8];
+                    let _ = fourdgs_scene_audio_source_read(
+                        scene,
+                        index,
+                        0,
+                        8.min(descriptor.data_size),
+                        head.as_mut_ptr(),
+                    );
+                }
+            }
+        }
         let size = fourdgs_scene_audio_size(scene);
         if size > 0 {
             let mut head = [0u8; 8];

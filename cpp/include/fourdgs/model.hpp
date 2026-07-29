@@ -52,11 +52,51 @@ struct ChunkIndexEntry {
   std::vector<Band> bands;
 };
 
-/// Audio, spec §5.9. Absent audio is an absent `std::optional`, never a silent track.
+/// Legacy non-spatial track, retained as a source-compatibility result.
 struct AudioTrack {
   std::string codec;
   double startSec = 0.0;
   std::vector<std::uint8_t> data;  ///< The encoded track, verbatim.
+};
+
+struct AudioSourceState;
+
+/// One independently timed encoded payload and its scene-space pose.
+struct AudioSource {
+  struct Keyframe {
+    double time = 0.0;
+    double position[3] = {0, 0, 0};
+    double rotation[4] = {0, 0, 0, 1};
+  };
+
+  std::uint32_t sourceId = 0;
+  std::string name;
+  std::string codec;
+  std::string channelLayout = "mono";
+  double startSec = 0.0;
+  double durationSec = 0.0;
+  double gain = 1.0;
+  bool spatial = true;
+  bool loop = false;
+  double position[3] = {0, 0, 0};
+  double rotation[4] = {0, 0, 0, 1};
+  std::vector<Keyframe> keyframes;
+  std::string interpolation = "linear";
+  std::uint64_t dataSize = 0;
+  std::vector<std::uint8_t> data;
+
+  /// Reconstruct timing and moving pose. Listener-relative playback stays in the player.
+  AudioSourceState stateAt(double t) const;
+};
+
+/// The source facts reconstructed at one scene time. Listener-relative spatialization is
+/// deliberately player-owned.
+struct AudioSourceState {
+  bool active = false;
+  double localTime = 0.0;
+  double position[3] = {0, 0, 0};
+  double rotation[4] = {0, 0, 0, 1};
+  double gain = 1.0;
 };
 
 /// Camera, spec §5.10. Advisory: a consumer may ignore it entirely.

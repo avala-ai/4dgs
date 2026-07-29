@@ -162,7 +162,7 @@ class TestRefusals:
         # Flag set, no record.
         header = rec.Header(duration_sec=1.0, gaussian_count=0, aabb=[0.0] * 6, flags=rec.FLAG_HAS_AUDIO)
         report = validate(minimal_file(header=header))
-        assert any("no Audio record" in m for m in errors(report))
+        assert any("no Audio Source or legacy Audio record" in m for m in errors(report))
 
         # Record present, flag clear. Absence is the signal, so its opposite is an error.
         audio = rec.Audio(codec="wav", data=b"RIFF....").encode()

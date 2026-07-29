@@ -34,11 +34,9 @@ int main(int argc, char** argv) {
   std::printf("gaussians     %llu\n", static_cast<unsigned long long>(scene.gaussianCount()));
   std::printf("sh degree     %d\n", scene.shDegree());
   std::printf("chunks        %u%s\n", scene.chunkCount(), scene.isIndexed() ? ", indexed" : "");
-  // Audio presence comes from the header alone. A scene without a soundtrack carries no
-  // audio record at all, and that is a complete, ordinary file.
+  // Audio presence comes from the header alone. Descriptors and payloads are per source.
   if (scene.hasAudio()) {
-    std::printf("audio         %s, %llu bytes\n", scene.audioCodec().c_str(),
-                static_cast<unsigned long long>(scene.audioSize()));
+    std::printf("audio sources %u\n", scene.audioSourceCount());
   } else {
     std::printf("audio         none\n");
   }

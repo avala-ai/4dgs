@@ -16,6 +16,7 @@ public enum Summary {
     /// How many camera keyframes appear in full, so a long trajectory cannot bloat a
     /// summary.
     static let cameraKeyframes = 4
+    static let audioKeyframes = 4
 
     public static func build(
         scene: Scene,
@@ -58,7 +59,10 @@ public enum Summary {
             "shDegree": .number(String(scene.header.shDegree)),
             "temporalModel": .string(scene.header.temporalModel),
             "hasAudio": .bool(scene.header.hasAudio),
-            "audio": audio(scene.audio),
+            "audioSources": .array(
+                scene.audioSources.sorted { $0.sourceId < $1.sourceId }.map {
+                    audioSource($0, sampleTime: scene.header.durationSec / 2)
+                }),
             "chunkIntervals": .array(chunkIntervals.map { .array([.number($0.0), .number($0.1)]) }),
             "headerAttributes": jsonMap(scene.header.attributes),
             "metadataRecords": .array(
@@ -110,10 +114,37 @@ public enum Summary {
     // implementation could ignore entirely and still pass — which is how a feature matrix
     // ends up claiming things the suite never checked.
 
-    private static func audio(_ audio: Audio?) -> JSON {
-        guard let audio else { return .null }
+    private static func audioSource(_ audio: AudioSource, sampleTime: Double) -> JSON {
+        let state = audio.state(at: sampleTime)
         return .object([
+            "sourceId": .integer(audio.sourceId),
+            "name": .string(audio.name),
             "codec": .string(audio.codec),
+            "channelLayout": .string(audio.channelLayout),
+            "startSec": .number(audio.startSec),
+            "durationSec": .number(audio.durationSec),
+            "gain": .number(audio.gain),
+            "spatial": .bool(audio.spatial),
+            "loop": .bool(audio.loop),
+            "position": .array(audio.position.map { .number($0) }),
+            "rotation": .array(audio.rotation.map { .number($0) }),
+            "keyframeCount": .integer(audio.keyframes.count),
+            "keyframes": .array(
+                audio.keyframes.prefix(audioKeyframes).map {
+                    .object([
+                        "time": .number($0.time),
+                        "position": .array($0.position.map { .number($0) }),
+                        "rotation": .array($0.rotation.map { .number($0) }),
+                    ])
+                }),
+            "interpolation": .string(audio.interpolation),
+            "stateAtHalf": .object([
+                "active": .bool(state.active),
+                "localTime": .number(state.localTime),
+                "position": .array(state.position.map { .number($0) }),
+                "rotation": .array(state.rotation.map { .number($0) }),
+                "gain": .number(state.gain),
+            ]),
             "byteLength": .integer(audio.data.count),
             "crc": .integer(CRC32.compute(audio.data)),
         ])

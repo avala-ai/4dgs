@@ -19,6 +19,8 @@ use crate::serialization::{
 
 pub const FLAG_HAS_AUDIO: u8 = 1 << 0;
 pub const FLAG_CHUNKS_COMPRESSED: u8 = 1 << 1;
+pub const AUDIO_SOURCE_SPATIAL: u8 = 1 << 0;
+pub const AUDIO_SOURCE_LOOP: u8 = 1 << 1;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Header {
@@ -63,7 +65,7 @@ impl Default for Header {
 impl Header {
     /// Answered from the header alone — no probing, no speculative range request.
     ///
-    /// This is the whole audio-discovery rule, and it is why a scene without a soundtrack
+    /// This is the whole audio-discovery rule, and it is why a scene without audio
     /// costs nothing: the bit is clear and there is no record.
     pub fn has_audio(&self) -> bool {
         self.flags & FLAG_HAS_AUDIO != 0
@@ -402,6 +404,251 @@ impl Audio {
         put_blob(&mut body, &self.data);
         let mut out = Vec::new();
         put_record(&mut out, op::AUDIO, &body);
+        out
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AudioSourceKeyframe {
+    pub time: f64,
+    pub position: [f64; 3],
+    pub rotation: [f64; 4],
+}
+
+/// The small descriptor in an Audio Source record. Its bytes are in Audio Data.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AudioSource {
+    pub source_id: u32,
+    pub name: String,
+    pub codec: String,
+    pub channel_layout: String,
+    pub data_length: u64,
+    pub start_sec: f64,
+    pub duration_sec: f64,
+    pub gain: f64,
+    pub flags: u8,
+    pub position: [f64; 3],
+    pub rotation: [f64; 4],
+    pub keyframes: Vec<AudioSourceKeyframe>,
+    pub interpolation: String,
+}
+
+impl AudioSource {
+    pub fn spatial(&self) -> bool {
+        self.flags & AUDIO_SOURCE_SPATIAL != 0
+    }
+
+    pub fn loop_(&self) -> bool {
+        self.flags & AUDIO_SOURCE_LOOP != 0
+    }
+
+    pub fn parse(content: &[u8]) -> Result<AudioSource> {
+        let mut c = Cursor::new(content);
+        let source_id = c.u32()?;
+        let name = c.string()?;
+        let codec = c.string()?;
+        let channel_layout = c.string()?;
+        let data_length = c.u64()?;
+        let start_sec = c.f64()?;
+        let duration_sec = c.f64()?;
+        let gain = c.f64()?;
+        let flags = c.u8()?;
+        let position: [f64; 3] = c.f64s(3)?.try_into().expect("three values");
+        let rotation: [f64; 4] = c.f64s(4)?.try_into().expect("four values");
+        let count = c.u32()?;
+        let needed = usize::try_from(count)
+            .unwrap_or(usize::MAX)
+            .checked_mul(64)
+            .ok_or_else(|| {
+                Error::Malformed(format!(
+                    "Audio Source {source_id} keyframe count {count} overflows"
+                ))
+            })?;
+        if needed > c.remaining() {
+            return Err(Error::Malformed(format!(
+                "Audio Source {source_id} declares {count} keyframes needing {needed} bytes, {} remain",
+                c.remaining()
+            )));
+        }
+        let mut keyframes = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            keyframes.push(AudioSourceKeyframe {
+                time: c.f64()?,
+                position: c.f64s(3)?.try_into().expect("three values"),
+                rotation: c.f64s(4)?.try_into().expect("four values"),
+            });
+        }
+        let source = AudioSource {
+            source_id,
+            name,
+            codec,
+            channel_layout,
+            data_length,
+            start_sec,
+            duration_sec,
+            gain,
+            flags,
+            position,
+            rotation,
+            keyframes,
+            interpolation: c.string()?,
+        };
+        validate_audio_source(&source)?;
+        Ok(source)
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut body = Vec::new();
+        put_u32(&mut body, self.source_id);
+        put_string(&mut body, &self.name);
+        put_string(&mut body, &self.codec);
+        put_string(&mut body, &self.channel_layout);
+        put_u64(&mut body, self.data_length);
+        put_f64(&mut body, self.start_sec);
+        put_f64(&mut body, self.duration_sec);
+        put_f64(&mut body, self.gain);
+        put_u8(&mut body, self.flags);
+        put_f64s(&mut body, &self.position);
+        put_f64s(&mut body, &self.rotation);
+        put_u32(&mut body, self.keyframes.len() as u32);
+        for keyframe in &self.keyframes {
+            put_f64(&mut body, keyframe.time);
+            put_f64s(&mut body, &keyframe.position);
+            put_f64s(&mut body, &keyframe.rotation);
+        }
+        put_string(&mut body, &self.interpolation);
+        let mut out = Vec::new();
+        put_record(&mut out, op::AUDIO_SOURCE, &body);
+        out
+    }
+}
+
+fn validate_audio_source(source: &AudioSource) -> Result<()> {
+    if source.flags & !(AUDIO_SOURCE_SPATIAL | AUDIO_SOURCE_LOOP) != 0 {
+        return Err(Error::Malformed(format!(
+            "Audio Source {} has reserved flag bits set",
+            source.source_id
+        )));
+    }
+    if source.codec.is_empty() {
+        return Err(Error::Malformed(format!(
+            "Audio Source {} has an empty codec",
+            source.source_id
+        )));
+    }
+    if !source.start_sec.is_finite() {
+        return Err(Error::Malformed(format!(
+            "Audio Source {} start_sec is not finite",
+            source.source_id
+        )));
+    }
+    if !source.duration_sec.is_finite() || source.duration_sec <= 0.0 {
+        return Err(Error::Malformed(format!(
+            "Audio Source {} duration_sec must be finite and positive",
+            source.source_id
+        )));
+    }
+    if !source.gain.is_finite() || source.gain < 0.0 {
+        return Err(Error::Malformed(format!(
+            "Audio Source {} gain must be finite and non-negative",
+            source.source_id
+        )));
+    }
+    if source.spatial() && source.channel_layout != "mono" {
+        return Err(Error::Malformed(format!(
+            "spatial Audio Source {} must use channel layout \"mono\"",
+            source.source_id
+        )));
+    }
+    if !source.position.iter().all(|value| value.is_finite()) {
+        return Err(Error::Malformed(format!(
+            "Audio Source {} position must contain three finite values",
+            source.source_id
+        )));
+    }
+    if !source.rotation.iter().all(|value| value.is_finite())
+        || source.rotation.iter().all(|value| *value == 0.0)
+    {
+        return Err(Error::Malformed(format!(
+            "Audio Source {} rotation must be a finite non-zero quaternion",
+            source.source_id
+        )));
+    }
+    let mut last = f64::NEG_INFINITY;
+    for (index, frame) in source.keyframes.iter().enumerate() {
+        if !frame.time.is_finite() || frame.time <= last {
+            return Err(Error::Malformed(format!(
+                "Audio Source {} keyframe {index} time must be finite and strictly increasing",
+                source.source_id
+            )));
+        }
+        if !frame.position.iter().all(|value| value.is_finite()) {
+            return Err(Error::Malformed(format!(
+                "Audio Source {} keyframe {index} position must contain three finite values",
+                source.source_id
+            )));
+        }
+        if !frame.rotation.iter().all(|value| value.is_finite())
+            || frame.rotation.iter().all(|value| *value == 0.0)
+        {
+            return Err(Error::Malformed(format!(
+                "Audio Source {} keyframe {index} rotation must be a finite non-zero quaternion",
+                source.source_id
+            )));
+        }
+        last = frame.time;
+    }
+    if source.interpolation != "linear" && source.interpolation != "step" {
+        return Err(Error::Malformed(format!(
+            "Audio Source {} uses unknown interpolation {:?}",
+            source.source_id, source.interpolation
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AudioData {
+    pub source_id: u32,
+    pub data: Vec<u8>,
+}
+
+impl AudioData {
+    pub fn parse(content: &[u8]) -> Result<AudioData> {
+        let mut c = Cursor::new(content);
+        Ok(AudioData {
+            source_id: c.u32()?,
+            data: c.blob()?.to_vec(),
+        })
+    }
+
+    /// Consume a record's content buffer and move its payload out, rather than parsing it
+    /// into a fresh allocation the way `parse` does. The streamed reader keeps one payload
+    /// per source until the whole file has gone past; for a mostly-audio file that is most
+    /// of the bytes it holds, and copying each one out would keep it in memory twice at
+    /// once. Reusing the record's own allocation avoids that transient duplication. The
+    /// validation is identical to `parse`: a `source_id`, then a length-prefixed blob.
+    pub fn into_payload(mut content: Vec<u8>) -> Result<(u32, Vec<u8>)> {
+        let (source_id, start, len) = {
+            let mut c = Cursor::new(&content);
+            let source_id = c.u32()?;
+            let data = c.blob()?;
+            let len = data.len();
+            // The blob's bytes sit between the fields already read and whatever the cursor
+            // has not reached, so its start is fixed without hardcoding the framing width.
+            (source_id, content.len() - c.remaining() - len, len)
+        };
+        content.truncate(start + len);
+        content.drain(..start);
+        Ok((source_id, content))
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut body = Vec::new();
+        put_u32(&mut body, self.source_id);
+        put_blob(&mut body, &self.data);
+        let mut out = Vec::new();
+        put_record(&mut out, op::AUDIO_DATA, &body);
         out
     }
 }

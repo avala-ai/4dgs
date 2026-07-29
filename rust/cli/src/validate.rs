@@ -11,6 +11,8 @@
 //! Two validators that disagree about whether a file conforms are worse than one, so where
 //! the two differ the Python module is the reference and this is the bug.
 
+use std::collections::BTreeMap;
+
 use fourdgs::quantization::{sh_bound, sh_step};
 use fourdgs::serialization::{crc32, Records, MAGIC, RECORD_HEADER_SIZE};
 use fourdgs::{opcode as op, records as rec, BytesReadable, Result};
@@ -111,6 +113,9 @@ pub fn validate(data: &[u8]) -> Report {
     let mut chunk_count = 0u64;
     let mut counted = 0u64;
     let mut index: Vec<rec::ChunkIndexEntry> = Vec::new();
+    let mut audio_sources: BTreeMap<u32, rec::AudioSource> = BTreeMap::new();
+    let mut audio_data: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut first_chunk_seen = false;
 
     for record in Records::new(data, MAGIC.len()) {
         let record = match record {
@@ -143,6 +148,7 @@ pub fn validate(data: &[u8]) -> Report {
             },
             op::CHUNK => match rec::parse_chunk(record.content) {
                 Ok((head, _)) => {
+                    first_chunk_seen = true;
                     chunk_count += 1;
                     counted += head.count as u64;
                     if head.t1 < head.t0 {
@@ -153,6 +159,7 @@ pub fn validate(data: &[u8]) -> Report {
                     }
                 }
                 Err(error) => {
+                    first_chunk_seen = true;
                     chunk_count += 1;
                     report.error(format!("chunk {chunk_count} does not parse: {error}"));
                 }
@@ -164,6 +171,36 @@ pub fn validate(data: &[u8]) -> Report {
             op::FOOTER => match rec::Footer::parse(record.content) {
                 Ok(parsed) => footer = Some(parsed),
                 Err(error) => report.error(format!("Footer does not parse: {error}")),
+            },
+            op::AUDIO_SOURCE => match rec::AudioSource::parse(record.content) {
+                Ok(source) => {
+                    if first_chunk_seen {
+                        report.error(format!(
+                            "Audio Source id {} appears after the first Chunk",
+                            source.source_id
+                        ));
+                    }
+                    let id = source.source_id;
+                    if audio_sources.insert(id, source).is_some() {
+                        report.error(format!("Audio Source id {id} appears more than once"));
+                    }
+                }
+                Err(error) => report.error(format!("Audio Source does not parse: {error}")),
+            },
+            op::AUDIO_DATA => match rec::AudioData::parse(record.content) {
+                Ok(payload) => {
+                    if first_chunk_seen {
+                        report.error(format!(
+                            "Audio Data id {} appears after the first Chunk",
+                            payload.source_id
+                        ));
+                    }
+                    let id = payload.source_id;
+                    if audio_data.insert(id, payload.data.len()).is_some() {
+                        report.error(format!("Audio Data id {id} appears more than once"));
+                    }
+                }
+                Err(error) => report.error(format!("Audio Data does not parse: {error}")),
             },
             opcode if op::is_private(opcode) => report.note(format!(
                 "private record 0x{opcode:02X} ({} bytes) — skipped, as required",
@@ -203,12 +240,44 @@ pub fn validate(data: &[u8]) -> Report {
                 header.gaussian_count
             ));
         }
-        let audio_record = seen.contains(&op::AUDIO);
-        if header.has_audio() && !audio_record {
-            report.error("Header says the file has audio, but there is no Audio record".into());
+        let has_audio_records =
+            seen.contains(&op::AUDIO) || !audio_sources.is_empty() || !audio_data.is_empty();
+        if header.has_audio() && !has_audio_records {
+            report.error(
+                "Header says the file has audio, but there is no Audio Source or legacy Audio record"
+                    .into(),
+            );
         }
-        if !header.has_audio() && audio_record {
-            report.error("there is an Audio record, but the Header's audio flag is clear".into());
+        if !header.has_audio() && has_audio_records {
+            report.error(
+                "there is an Audio Source or legacy Audio record, but the Header's audio flag is clear"
+                    .into(),
+            );
+        }
+        for source in audio_sources.values() {
+            validate_audio_source(source, header.duration_sec, &mut report);
+        }
+    }
+    if seen.contains(&op::AUDIO) && !audio_sources.is_empty() {
+        report.error("legacy Audio and Audio Source records must not be mixed".into());
+    }
+    for (source_id, source) in &audio_sources {
+        match audio_data.get(source_id) {
+            None => report.error(format!(
+                "Audio Source id {source_id} has no matching Audio Data record"
+            )),
+            Some(length) if source.data_length != *length as u64 => report.error(format!(
+                "Audio Source id {source_id} declares {} bytes; Audio Data contains {length}",
+                source.data_length
+            )),
+            Some(_) => {}
+        }
+    }
+    for source_id in audio_data.keys() {
+        if !audio_sources.contains_key(source_id) {
+            report.error(format!(
+                "Audio Data id {source_id} has no matching Audio Source record"
+            ));
         }
     }
 
@@ -359,7 +428,87 @@ fn spell(v: f64) -> String {
 /// application range or a record from a version this build does not implement, and both
 /// are skipped rather than refused.
 fn is_specified(opcode: u8) -> bool {
-    (op::HEADER..=op::SUMMARY_OFFSET).contains(&opcode)
+    (op::HEADER..=op::AUDIO_DATA).contains(&opcode)
+}
+
+fn validate_audio_source(source: &rec::AudioSource, scene_duration: f64, report: &mut Report) {
+    let finite = source.start_sec.is_finite()
+        && source.duration_sec.is_finite()
+        && source.gain.is_finite()
+        && source.position.iter().all(|value| value.is_finite())
+        && source.rotation.iter().all(|value| value.is_finite());
+    if !finite {
+        report.error(format!(
+            "Audio Source id {} has a non-finite numeric field",
+            source.source_id
+        ));
+    }
+    if source.rotation.iter().all(|value| *value == 0.0) {
+        report.error(format!(
+            "Audio Source id {} has a zero rotation quaternion",
+            source.source_id
+        ));
+    }
+    if source.codec.is_empty() {
+        report.error(format!(
+            "Audio Source id {} has an empty codec",
+            source.source_id
+        ));
+    }
+    if source.duration_sec <= 0.0 {
+        report.error(format!(
+            "Audio Source id {} duration_sec must be positive",
+            source.source_id
+        ));
+    }
+    if source.gain < 0.0 {
+        report.error(format!(
+            "Audio Source id {} gain must be non-negative",
+            source.source_id
+        ));
+    }
+    if source.spatial() && source.channel_layout != "mono" {
+        report.error(format!(
+            "spatial Audio Source id {} must use channel_layout 'mono'",
+            source.source_id
+        ));
+    }
+    if source.flags & !(rec::AUDIO_SOURCE_SPATIAL | rec::AUDIO_SOURCE_LOOP) != 0 {
+        report.error(format!(
+            "Audio Source id {} has reserved flag bits set",
+            source.source_id
+        ));
+    }
+    if source.interpolation != "linear" && source.interpolation != "step" {
+        report.error(format!(
+            "Audio Source id {} uses unknown interpolation {:?}",
+            source.source_id, source.interpolation
+        ));
+    }
+    let mut last = f64::NEG_INFINITY;
+    for (index, keyframe) in source.keyframes.iter().enumerate() {
+        let pose_finite = keyframe.position.iter().all(|value| value.is_finite())
+            && keyframe.rotation.iter().all(|value| value.is_finite());
+        if !keyframe.time.is_finite() || keyframe.time <= last || !pose_finite {
+            report.error(format!(
+                "Audio Source id {} keyframe {index} must have a finite, strictly increasing time and finite pose",
+                source.source_id
+            ));
+        }
+        if keyframe.rotation.iter().all(|value| *value == 0.0) {
+            report.error(format!(
+                "Audio Source id {} keyframe {index} has a zero rotation quaternion",
+                source.source_id
+            ));
+        }
+        if keyframe.time < 0.0 || keyframe.time > scene_duration {
+            report.error(format!(
+                "Audio Source id {} keyframe {index} time {} is outside [0, {scene_duration}]",
+                source.source_id, keyframe.time
+            ));
+        }
+        last = keyframe.time;
+    }
 }
 
 /// A conforming file, for the tests below. Written by the library's own encoder so that

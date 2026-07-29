@@ -18,6 +18,7 @@ namespace {
 constexpr std::size_t kSample = 16;
 /// How many camera keyframes appear in full, so a long trajectory cannot bloat a summary.
 constexpr std::size_t kCameraKeyframes = 4;
+constexpr std::size_t kAudioKeyframes = 4;
 constexpr int kFloatDecimals = 6;
 
 /// Six decimals, correctly rounded, then read back — the same value Python's `round(v, 6)`
@@ -132,6 +133,45 @@ Json cameraJson(const Camera& camera) {
       {"loop", Json::boolean(camera.loop)},
       {"position", doubleArray(camera.position, 3)},
       {"target", doubleArray(camera.target, 3)},
+  });
+}
+
+Json audioSourceJson(const AudioSource& source, double sampleTime) {
+  const AudioSourceState state = source.stateAt(sampleTime);
+  std::vector<Json> keyframes;
+  const std::size_t shown = std::min(source.keyframes.size(), kAudioKeyframes);
+  for (std::size_t i = 0; i < shown; ++i) {
+    const AudioSource::Keyframe& frame = source.keyframes[i];
+    keyframes.push_back(Json::object({
+        {"position", doubleArray(frame.position, 3)},
+        {"rotation", doubleArray(frame.rotation, 4)},
+        {"time", num(frame.time)},
+    }));
+  }
+  return Json::object({
+      {"byteLength", integer(static_cast<std::uint64_t>(source.data.size()))},
+      {"channelLayout", Json::string(source.channelLayout)},
+      {"codec", Json::string(source.codec)},
+      {"crc", Json::string(crc32String(source.data.data(), source.data.size()))},
+      {"durationSec", num(source.durationSec)},
+      {"gain", num(source.gain)},
+      {"interpolation", Json::string(source.interpolation)},
+      {"keyframeCount", integer(static_cast<std::uint64_t>(source.keyframes.size()))},
+      {"keyframes", Json::array(std::move(keyframes))},
+      {"loop", Json::boolean(source.loop)},
+      {"name", Json::string(source.name)},
+      {"position", doubleArray(source.position, 3)},
+      {"rotation", doubleArray(source.rotation, 4)},
+      {"sourceId", integer(static_cast<std::uint64_t>(source.sourceId))},
+      {"spatial", Json::boolean(source.spatial)},
+      {"startSec", num(source.startSec)},
+      {"stateAtHalf", Json::object({
+                          {"active", Json::boolean(state.active)},
+                          {"gain", num(state.gain)},
+                          {"localTime", num(state.localTime)},
+                          {"position", doubleArray(state.position, 3)},
+                          {"rotation", doubleArray(state.rotation, 4)},
+                      })},
   });
 }
 
@@ -358,14 +398,13 @@ std::string canonical(const SceneSummary& summary) {
     }));
   }
 
-  // Absent audio is a value, not a missing key: both paths are conformance-visible.
-  Json audio = Json::null();
-  if (summary.audio != nullptr) {
-    audio = Json::object({
-        {"byteLength", integer(static_cast<std::uint64_t>(summary.audio->data.size()))},
-        {"codec", Json::string(summary.audio->codec)},
-        {"crc", Json::string(crc32String(summary.audio->data.data(), summary.audio->data.size()))},
-    });
+  std::vector<AudioSource> orderedAudio = summary.audioSources;
+  std::sort(orderedAudio.begin(), orderedAudio.end(),
+            [](const AudioSource& a, const AudioSource& b) { return a.sourceId < b.sourceId; });
+  std::vector<Json> audioSources;
+  audioSources.reserve(orderedAudio.size());
+  for (const AudioSource& source : orderedAudio) {
+    audioSources.push_back(audioSourceJson(source, header.durationSec / 2.0));
   }
 
   Json statistics = Json::null();
@@ -386,7 +425,7 @@ std::string canonical(const SceneSummary& summary) {
                         {"zeroMotionCount", integer(zeroMotion)},
                     })},
       {"attachments", Json::array(std::move(attachments))},
-      {"audio", std::move(audio)},
+      {"audioSources", Json::array(std::move(audioSources))},
       {"camera", summary.camera == nullptr ? Json::null() : cameraJson(*summary.camera)},
       {"chunkIntervals", Json::array(std::move(intervals))},
       {"cutoff", num(header.cutoff)},

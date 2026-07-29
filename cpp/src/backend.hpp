@@ -73,8 +73,14 @@ std::uint64_t bytesForTime(const Handle& handle, double t, int maxShBand);
 std::uint64_t bytesForChunk(const Handle& handle, std::uint32_t index, int maxShBand);
 Result<void> loadChunk(Handle& handle, std::uint32_t index, int maxShBand);
 
-/// Audio. Absence is a value: `hasAudio` false, an empty codec, a zero size.
+/// Independently timed audio sources. Descriptor reads never fetch encoded payload bytes.
 bool hasAudio(const Handle& handle);
+std::uint32_t audioSourceCount(const Handle& handle);
+Result<AudioSource> audioSource(Handle& handle, std::uint32_t index);
+Result<AudioSourceState> audioSourceStateAt(Handle& handle, std::uint32_t index, double t);
+Result<void> readAudioSource(Handle& handle, std::uint32_t index, std::uint64_t offset,
+                             Span<std::uint8_t> into);
+/// Pre-spatial first-source compatibility accessors.
 std::string audioCodec(Handle& handle);
 std::uint64_t audioSize(const Handle& handle);
 Result<void> readAudio(Handle& handle, std::uint64_t offset, Span<std::uint8_t> into);

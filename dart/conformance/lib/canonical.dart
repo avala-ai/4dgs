@@ -9,8 +9,7 @@
 /// Representation is pinned so that a disagreement is always about the format
 /// and never about how a language spells a number: integers are strings, floats
 /// are rounded to six decimals, a never-fading gaussian's sigma is `null`, and
-/// `audio` is `null` when absent and an object when present so that both paths
-/// are visible in every implementation's output.
+/// `audioSources` is empty when absent and contains every independent source.
 ///
 /// **Nothing here may depend on decoded order.** Gaussians may be reordered
 /// freely by an encoder and readers must not rely on their order, so a summary
@@ -35,6 +34,7 @@ const int sampleSize = 16;
 /// How many camera keyframes appear in full, so a long trajectory cannot bloat a
 /// summary.
 const int cameraKeyframes = 4;
+const int audioKeyframes = 4;
 
 /// Rounds for comparison; a non-finite value becomes `null`, which is the only
 /// thing JSON can say about one.
@@ -69,7 +69,7 @@ Object? _sorted(Object? value) {
 Map<String, Object?> summarize({
   required FourdgsHeader header,
   required FourdgsGaussianSet gaussians,
-  required FourdgsAudioTrack? audio,
+  required List<FourdgsAudioSource> audioSources,
   required List<(double, double)> chunkIntervals,
   FourdgsCameraTrajectory? camera,
   List<FourdgsMetadata> metadata = const <FourdgsMetadata>[],
@@ -120,16 +120,12 @@ Map<String, Object?> summarize({
     'shDegree': header.shDegree,
     'temporalModel': header.temporalModel,
     'hasAudio': header.hasAudio,
-    // Absent audio is a value, not a missing key: both paths are
-    // conformance-visible.
-    'audio':
-        audio == null
-            ? null
-            : <String, Object?>{
-              'codec': audio.codec,
-              'byteLength': audio.data.length.toString(),
-              'crc': crcOf(audio.data),
-            },
+    'audioSources': <Object?>[
+      for (final source
+          in (audioSources.toList()
+            ..sort((a, b) => a.sourceId.compareTo(b.sourceId))))
+        _audioSource(source, header.durationSec / 2.0),
+    ],
     'chunkIntervals': <Object?>[
       for (final (double a, double b) in chunkIntervals)
         <Object?>[num6(a), num6(b)],
@@ -188,6 +184,49 @@ Map<String, Object?> summarize({
       'neverFadesCount': neverFades.toString(),
       'zeroMotionCount': zeroMotion.toString(),
     },
+  };
+}
+
+Map<String, Object?> _audioSource(
+  FourdgsAudioSource source,
+  double sampleTime,
+) {
+  final state = source.stateAt(sampleTime);
+  return <String, Object?>{
+    'sourceId': source.sourceId.toString(),
+    'name': source.name,
+    'codec': source.codec,
+    'channelLayout': source.channelLayout,
+    'startSec': num6(source.startSec),
+    'durationSec': num6(source.durationSec),
+    'gain': num6(source.gain),
+    'spatial': source.spatial,
+    'loop': source.loop,
+    'position': <Object?>[for (final v in source.position) num6(v)],
+    'rotation': <Object?>[for (final v in source.rotation) num6(v)],
+    'keyframeCount': source.keyframes.length.toString(),
+    'keyframes': <Object?>[
+      for (int i = 0; i < source.keyframes.length && i < audioKeyframes; i++)
+        <String, Object?>{
+          'time': num6(source.keyframes[i].time),
+          'position': <Object?>[
+            for (final v in source.keyframes[i].position) num6(v),
+          ],
+          'rotation': <Object?>[
+            for (final v in source.keyframes[i].rotation) num6(v),
+          ],
+        },
+    ],
+    'interpolation': source.interpolation,
+    'stateAtHalf': <String, Object?>{
+      'active': state.active,
+      'localTime': num6(state.localTime),
+      'position': <Object?>[for (final v in state.position) num6(v)],
+      'rotation': <Object?>[for (final v in state.rotation) num6(v)],
+      'gain': num6(state.gain),
+    },
+    'byteLength': source.data.length.toString(),
+    'crc': crcOf(source.data),
   };
 }
 

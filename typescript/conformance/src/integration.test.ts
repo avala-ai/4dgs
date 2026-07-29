@@ -17,16 +17,21 @@ import { test } from "node:test";
 import {
   BytesReadable,
   IndexedDecoder,
+  MAGIC,
   MAX_SH_DEGREE,
+  Opcode,
+  RECORD_HEADER_BYTES,
+  audioSourceStateAt,
   assembleGaussians,
   decodeScene,
+  iterateRecords,
   type ChunkGaussians,
 } from "@4dgs/core";
 import { BlobReadable, HttpRangeReadable } from "@4dgs/browser";
 import { withCodec } from "@4dgs/codecs";
 import { FileHandleReadable } from "@4dgs/nodejs";
 
-import { canonical, summarize } from "./canonical.js";
+import { AudioPayloadDigests, canonical, summarize } from "./canonical.js";
 import { CountingReadable } from "./checks.js";
 import { concat } from "./testing.js";
 
@@ -40,12 +45,16 @@ function corpus(variant: string): string | null {
 /** The canonical JSON of a file, decoded front to back. */
 async function streamed(path: string): Promise<string> {
   const bytes = new Uint8Array(readFileSync(path));
-  const scene = await decodeScene(new BytesReadable(bytes), { blockSize: 4096 });
+  const payloads = new AudioPayloadDigests();
+  const scene = await decodeScene(new BytesReadable(bytes), {
+    blockSize: 4096,
+    onAudioData: payloads.consume,
+  });
   return canonical(
     summarize({
       header: scene.header,
       gaussians: scene.gaussians,
-      audio: scene.audio,
+      audioSources: payloads.sources(scene.audioSources),
       chunkIntervals: scene.chunkIndex.map((e) => [e.t0, e.t1] as const),
       camera: scene.camera,
       metadata: scene.metadata,
@@ -83,7 +92,7 @@ async function indexed(path: string): Promise<string> {
       summarize({
         header: scene.header,
         gaussians: assembleGaussians(chunks, scene.windows, scene.header.shDegree, merged),
-        audio: await scene.readAudio(),
+        audioSources: await scene.readAudioSources(),
         chunkIntervals: scene.index.map((e) => [e.t0, e.t1] as const),
         camera: await scene.readCamera(),
         metadata: await scene.readMetadata(),
@@ -184,32 +193,150 @@ test("the seek rule returns the chunks whose interval contains the instant", asy
   }
 });
 
-test("absent audio is a value, and present audio comes back verbatim", async (t) => {
-  const withAudio = corpus("OneWindow-UseChunkIndex-UseCrc-WithAudio");
+test("spatial audio sources and their payloads come back independently", async (t) => {
+  const withAudio = corpus("OneWindow-UseChunkIndex-UseCrc-WithSpatialAudio");
   const without = corpus("OneWindow-UseChunkIndex-UseCrc");
   if (withAudio === null || without === null) return t.skip("corpus not generated");
 
   const quiet = await decodeScene(new Uint8Array(readFileSync(without)));
-  assert.equal(quiet.audio, null);
+  assert.deepEqual(quiet.audioSources, []);
   assert.equal(quiet.header.hasAudio, false);
 
-  const loud = await decodeScene(new Uint8Array(readFileSync(withAudio)));
+  let payloadBytes = 0;
+  let payloadParts = 0;
+  let largestPart = 0;
+  const riff = new Uint8Array(4);
+  const loud = await decodeScene(new Uint8Array(readFileSync(withAudio)), {
+    blockSize: 128,
+    onAudioData: ({ offset, bytes }) => {
+      payloadBytes += bytes.byteLength;
+      payloadParts += 1;
+      largestPart = Math.max(largestPart, bytes.byteLength);
+      if (offset < riff.byteLength) {
+        riff.set(bytes.subarray(0, riff.byteLength - offset), offset);
+      }
+    },
+  });
   assert.equal(loud.header.hasAudio, true);
-  assert.equal(loud.audio?.codec, "wav");
-  assert.ok(loud.audio!.data.byteLength > 1000);
-  // A RIFF header, byte for byte, out of the middle of a container.
-  assert.equal(new TextDecoder().decode(loud.audio!.data.subarray(0, 4)), "RIFF");
+  assert.equal(loud.audioSources[0]?.codec, "wav");
+  assert.deepEqual(loud.audioSources[0]?.position, [1.5, 0.75, -0.5]);
+  assert.ok(loud.audioSources[0]!.dataLength > 1000);
+  assert.equal("data" in loud.audioSources[0]!, false, "the completed scene retained the payload");
+  assert.equal(payloadBytes, loud.audioSources[0]!.dataLength);
+  assert.ok(payloadParts > 1, "the payload should arrive incrementally");
+  assert.ok(largestPart <= 128, `one payload part retained ${largestPart} bytes`);
+  // A RIFF header, byte for byte, consumed from the bounded payload pieces.
+  assert.equal(new TextDecoder().decode(riff), "RIFF");
 
   // The indexed path fetches the same bytes without touching a chunk.
   const source = await FileHandleReadable.open(withAudio);
   try {
     const scene = await IndexedDecoder.open(source);
-    const track = await scene.readAudio();
-    assert.deepEqual(track?.data.byteLength, loud.audio!.data.byteLength);
-    assert.equal(track?.codec, "wav");
+    const sources = await scene.readAudioSources();
+    assert.deepEqual(sources[0]?.data.byteLength, loud.audioSources[0]!.dataLength);
+    assert.equal(sources[0]?.codec, "wav");
+    assert.equal(scene.audioSourceCount, 1);
   } finally {
     await source.close();
   }
+});
+
+test("legacy audio payloads arrive in bounded streamed pieces", async (t) => {
+  const path = corpus("OneWindow-UseChunkIndex-UseCrc-WithSpatialAudio");
+  if (path === null) return t.skip("corpus not generated");
+
+  // Reframe the source pair without moving later offsets: the descriptor becomes an
+  // unknown, legal record, and the Audio Data body becomes a legacy Audio body. Its
+  // variable-size prefix is deliberately split across the decoder's small input blocks.
+  const bytes = Uint8Array.from(readFileSync(path));
+  const records = [...iterateRecords(bytes, MAGIC.length)];
+  const descriptor = records.find((entry) => entry.opcode === Opcode.AudioSource);
+  const payload = records.find((entry) => entry.opcode === Opcode.AudioData);
+  assert.ok(descriptor && payload);
+  bytes[descriptor.offset] = 0x7f;
+  bytes[payload.offset] = Opcode.Audio;
+  const contentStart = payload.offset + RECORD_HEADER_BYTES;
+  const contentLength = payload.length - RECORD_HEADER_BYTES;
+  const view = new DataView(bytes.buffer, bytes.byteOffset + contentStart, contentLength);
+  view.setUint32(0, 3, true);
+  bytes.set(new TextEncoder().encode("wav"), contentStart + 4);
+  view.setFloat64(7, 0, true);
+  view.setBigUint64(15, BigInt(contentLength - 23), true);
+
+  let payloadBytes = 0;
+  let payloadParts = 0;
+  let largestPart = 0;
+  const scene = await decodeScene(bytes, {
+    blockSize: 32,
+    onAudioData: ({ bytes: part }) => {
+      payloadBytes += part.byteLength;
+      payloadParts += 1;
+      largestPart = Math.max(largestPart, part.byteLength);
+    },
+  });
+  assert.equal(scene.audioSources.length, 1);
+  assert.equal(scene.audioSources[0]!.codec, "wav");
+  assert.equal(payloadBytes, scene.audioSources[0]!.dataLength);
+  assert.ok(payloadParts > 1);
+  assert.ok(largestPart <= 32, `one legacy payload part retained ${largestPart} bytes`);
+});
+
+test("indexed opening rejects orphan Audio Data beside legacy audio", async (t) => {
+  const path = corpus("OneWindow-UseChunkIndex-UseCrc-WithSpatialAudio");
+  if (path === null) return t.skip("corpus not generated");
+
+  // Rewrite the descriptor record in place as a valid, empty legacy Audio record. The
+  // paired Audio Data record remains, so accepting this would silently ignore an orphan.
+  const bytes = Uint8Array.from(readFileSync(path));
+  const descriptor = [...iterateRecords(bytes, MAGIC.length)].find(
+    (record) => record.opcode === Opcode.AudioSource,
+  );
+  assert.ok(descriptor);
+  bytes[descriptor.offset] = Opcode.Audio;
+  const contentStart = descriptor.offset + RECORD_HEADER_BYTES;
+  const contentLength = descriptor.length - RECORD_HEADER_BYTES;
+  bytes.fill(0, contentStart, contentStart + contentLength);
+  const view = new DataView(bytes.buffer, bytes.byteOffset + contentStart, contentLength);
+  view.setUint32(0, 3, true);
+  bytes.set(new TextEncoder().encode("wav"), contentStart + 4);
+  view.setFloat64(7, 0, true);
+  view.setBigUint64(15, 0n, true);
+
+  await assert.rejects(
+    () => IndexedDecoder.open(new BytesReadable(bytes)),
+    /Audio Data id \d+ has no matching Audio Source record/,
+  );
+});
+
+test("moving audio source pose is reconstructed at scene time", async (t) => {
+  const path = corpus("OneWindow-UseChunkIndex-UseCrc-WithMultipleAudioSources");
+  if (path === null) return t.skip("corpus not generated");
+
+  const decoded = await decodeScene(new Uint8Array(readFileSync(path)));
+  assert.equal(decoded.audioSources.length, 2);
+  const moving = decoded.audioSources.find((source) => source.sourceId === 42);
+  assert.ok(moving);
+  assert.equal(moving.keyframes.length, 2);
+  const halfway = audioSourceStateAt(moving, decoded.header.durationSec / 2);
+  assert.deepEqual(halfway.position, [0, 1, 0]);
+  assert.ok(Math.abs(halfway.rotation[1]! - Math.SQRT1_2) < 1e-12);
+  assert.ok(Math.abs(halfway.rotation[3]! - Math.SQRT1_2) < 1e-12);
+
+  const exactStep = audioSourceStateAt(
+    {
+      ...moving,
+      interpolation: "step",
+      keyframes: [
+        { time: 0, position: [0, 0, 0], rotation: [0, 0, 0, 1] },
+        { time: 1, position: [1, 2, 3], rotation: [0, 1, 0, 1] },
+        { time: 2, position: [9, 9, 9], rotation: [0, 0, 0, 1] },
+      ],
+    },
+    1,
+  );
+  assert.deepEqual(exactStep.position, [1, 2, 3]);
+  assert.ok(Math.abs(exactStep.rotation[1]! - Math.SQRT1_2) < 1e-12);
+  assert.ok(Math.abs(exactStep.rotation[3]! - Math.SQRT1_2) < 1e-12);
 });
 
 test("a track larger than the head probe does not cost anything to open", async (t) => {
@@ -221,16 +348,25 @@ test("a track larger than the head probe does not cost anything to open", async 
     const counter = new CountingReadable(file);
     const scene = await IndexedDecoder.open(counter);
     const toOpen = counter.bytesRead;
+    const beforeDescriptors = counter.bytesRead;
+    const descriptors = await scene.readAudioSourceDescriptors();
+    const descriptorBytes = counter.bytesRead - beforeDescriptors;
+    assert.equal(descriptors.length, 1);
+    assert.ok(descriptors[0]!.dataLength > 64 * 1024);
+    assert.ok(
+      descriptorBytes < 4096,
+      `fetching the descriptor transferred ${descriptorBytes} bytes of encoded audio`,
+    );
 
     // The audio record sits in the front matter and is bigger than the probe. Opening the
     // file has to step over it rather than read it, so the cost of opening is the probe
     // and the tail, not the track.
-    const track = await scene.readAudio();
-    assert.equal(track?.codec, "wav");
-    assert.ok(track!.data.byteLength > 64 * 1024, "this variant's track must exceed the probe");
+    const source = (await scene.readAudioSources())[0]!;
+    assert.equal(source.codec, "wav");
+    assert.ok(source.data.byteLength > 64 * 1024, "this variant's track must exceed the probe");
     assert.ok(
-      toOpen < track!.data.byteLength,
-      `opening transferred ${toOpen} bytes, more than the ${track!.data.byteLength}-byte track it should have skipped`,
+      toOpen < source.data.byteLength,
+      `opening transferred ${toOpen} bytes, more than the ${source.data.byteLength}-byte track it should have skipped`,
     );
     assert.equal(scene.index.length, 1);
     assert.equal(scene.header.gaussianCount, 64);

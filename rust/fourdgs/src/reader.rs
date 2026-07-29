@@ -18,7 +18,7 @@ use std::io::Read;
 use crate::chunk::DecodedChunk;
 use crate::error::{Error, Result};
 use crate::indexed_reader::{self, IndexedScene};
-use crate::model::GaussianSet;
+use crate::model::{AudioSource, GaussianSet};
 use crate::readable::Readable;
 use crate::records as rec;
 use crate::stream_reader::{self, Scene};
@@ -198,33 +198,75 @@ impl<R: Readable> SceneReader<R> {
         self.header().has_audio()
     }
 
-    /// The audio codec's registry name, or `None` when the scene has no track.
+    /// The first legacy track's codec, retained for source compatibility.
+    ///
+    /// New spatial source descriptors are fetched lazily on the indexed path, so new
+    /// callers should use [`audio_source`](Self::audio_source).
     pub fn audio_codec(&self) -> Option<&str> {
         match (&self.indexed, &self.streamed) {
-            (Some(s), _) => s.audio_codec.as_deref(),
-            (_, Some(s)) => s.audio.as_ref().map(|a| a.codec.as_str()),
+            (Some(s), _) => s
+                .audio_sources
+                .first()
+                .and_then(|a| a.legacy_codec.as_deref()),
+            (_, Some(s)) => s.audio_sources.first().map(|a| a.codec.as_str()),
             _ => None,
         }
     }
 
-    /// The track's length in bytes, without fetching it.
-    pub fn audio_len(&self) -> Option<u64> {
+    /// Number of independently timed audio sources.
+    pub fn audio_source_count(&self) -> usize {
         match (&self.indexed, &self.streamed) {
-            (Some(s), _) => s.audio_range.map(|_| self.audio_declared_len()),
-            (_, Some(s)) => s.audio.as_ref().map(|a| a.data.len() as u64),
+            (Some(s), _) => s.audio_sources.len(),
+            (_, Some(s)) => s.audio_sources.len(),
+            _ => 0,
+        }
+    }
+
+    /// One source's descriptor, without its encoded payload.
+    pub fn audio_source(&mut self, index: usize) -> Result<Option<AudioSource>> {
+        if let Some(scene) = &self.indexed {
+            let Some(entry) = scene.audio_sources.get(index).cloned() else {
+                return Ok(None);
+            };
+            return Ok(Some(indexed_reader::read_audio_source_descriptor(
+                &mut self.source,
+                scene,
+                &entry,
+            )?));
+        }
+        Ok(self.streamed.as_ref().and_then(|scene| {
+            scene.audio_sources.get(index).map(|source| {
+                let mut descriptor = source.clone();
+                descriptor.data.clear();
+                descriptor
+            })
+        }))
+    }
+
+    /// Every source and payload. Prefer descriptors and range reads for large audio.
+    pub fn read_audio_sources(&mut self) -> Result<Vec<AudioSource>> {
+        if let Some(scene) = &self.indexed {
+            return indexed_reader::read_audio_sources(&mut self.source, scene);
+        }
+        Ok(self
+            .streamed
+            .as_ref()
+            .map(|s| s.audio_sources.clone())
+            .unwrap_or_default())
+    }
+
+    /// One source's encoded payload length, without fetching it.
+    pub fn audio_source_len(&self, index: usize) -> Option<u64> {
+        match (&self.indexed, &self.streamed) {
+            (Some(s), _) => s.audio_sources.get(index).map(|a| a.data_length),
+            (_, Some(s)) => s.audio_sources.get(index).map(|a| a.data.len() as u64),
             _ => None,
         }
     }
 
-    fn audio_declared_len(&self) -> u64 {
-        // The Audio record is `string codec`, `f64 start_sec`, then `bytes data`, so the
-        // track is the record minus its framing and those two fields. Computed rather than
-        // fetched: a caller asking how big the audio is has not asked for the audio.
-        let scene = self.indexed.as_ref().expect("indexed path");
-        let (_, total) = scene.audio_range.expect("audio present");
-        let codec_len = scene.audio_codec.as_ref().map_or(0, |c| c.len()) as u64;
-        total
-            .saturating_sub(crate::serialization::RECORD_HEADER_SIZE as u64 + 4 + codec_len + 8 + 8)
+    /// The first source's length, retained for source compatibility.
+    pub fn audio_len(&self) -> Option<u64> {
+        self.audio_source_len(0)
     }
 
     /// The embedded track, fetched independently of any gaussian data. `None` when the
@@ -236,45 +278,57 @@ impl<R: Readable> SceneReader<R> {
         Ok(self
             .streamed
             .as_ref()
-            .and_then(|s| s.audio.as_ref())
+            .and_then(|s| s.audio_sources.first())
             .map(|a| a.data.clone()))
     }
 
-    /// A byte range of the embedded track, for a consumer that streams it rather than
-    /// holding it. Offsets are relative to the track, not to the file.
-    pub fn read_audio_range(&mut self, offset: u64, length: u64) -> Result<Vec<u8>> {
+    /// A byte range of a source payload. Offsets are relative to its encoded bytes.
+    pub fn read_audio_source_range(
+        &mut self,
+        source_id: u32,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>> {
         if let Some(scene) = &self.indexed {
-            let (record_at, total) = scene
-                .audio_range
-                .ok_or_else(|| Error::Malformed("this scene has no audio track".into()))?;
-            let codec_len = scene.audio_codec.as_ref().map_or(0, |c| c.len()) as u64;
-            let data_at =
-                record_at + crate::serialization::RECORD_HEADER_SIZE as u64 + 4 + codec_len + 8 + 8;
-            let data_len = (record_at + total).saturating_sub(data_at);
-            let end = offset.checked_add(length).ok_or_else(|| {
-                Error::Malformed(format!("audio range [{offset}, +{length}) overflows"))
-            })?;
-            if end > data_len {
-                return Err(Error::Malformed(format!(
-                    "audio range [{offset}, {end}) is outside the {data_len}-byte track"
-                )));
-            }
-            return self.source.read(data_at + offset, length);
+            return indexed_reader::read_audio_range(
+                &mut self.source,
+                scene,
+                source_id,
+                offset,
+                length,
+            );
         }
-        let track = self
+        let source = self
             .streamed
             .as_ref()
-            .and_then(|s| s.audio.as_ref())
-            .ok_or_else(|| Error::Malformed("this scene has no audio track".into()))?;
+            .and_then(|s| {
+                s.audio_sources
+                    .iter()
+                    .find(|source| source.source_id == source_id)
+            })
+            .ok_or_else(|| {
+                Error::Malformed(format!("this scene has no audio source id {source_id}"))
+            })?;
         let start = usize::try_from(offset).unwrap_or(usize::MAX);
         let end = start.saturating_add(usize::try_from(length).unwrap_or(usize::MAX));
-        if end > track.data.len() {
+        if end > source.data.len() {
             return Err(Error::Malformed(format!(
-                "audio range [{start}, {end}) is outside the {}-byte track",
-                track.data.len()
+                "audio source {source_id} range [{start}, {end}) is outside its {}-byte payload",
+                source.data.len()
             )));
         }
-        Ok(track.data[start..end].to_vec())
+        Ok(source.data[start..end].to_vec())
+    }
+
+    /// A byte range of the first source, retained for source compatibility.
+    pub fn read_audio_range(&mut self, offset: u64, length: u64) -> Result<Vec<u8>> {
+        let source_id = match (&self.indexed, &self.streamed) {
+            (Some(s), _) => s.audio_sources.first().map(|a| a.source_id),
+            (_, Some(s)) => s.audio_sources.first().map(|a| a.source_id),
+            _ => None,
+        }
+        .ok_or_else(|| Error::Malformed("this scene has no audio source".into()))?;
+        self.read_audio_source_range(source_id, offset, length)
     }
 
     pub fn camera(&mut self) -> Result<Option<rec::Camera>> {

@@ -5,17 +5,19 @@ MAY are to be interpreted as described in RFC 2119.
 
 A `.4dgs` file is a single, self-contained, seekable container for a **4D gaussian splat scene**:
 gaussians whose position, opacity and existence vary continuously over time, optionally with an
-embedded audio track and a default camera trajectory.
+embedded spatial sound field and a default camera trajectory. The sound field may contain multiple
+independently timed sources, each fixed or moving in scene space.
 
-The format is **renderer-agnostic**. It defines how to reconstruct splat state at a given time and
-nothing beyond that. How that state is drawn is out of scope.
+The format is **renderer- and player-agnostic**. It defines how to reconstruct gaussian state and
+audio-source state at a given scene time. How gaussians are drawn, and how sources are combined with
+a listener pose through HRTF, panning, attenuation, occlusion and mixing, are out of scope.
 
 ---
 
 ## 1. Design goals
 
-1. **One resource.** A whole scene — geometry, appearance, motion, audio, camera — is one file, one
-   URL, one cache entry.
+1. **One resource.** A whole scene — geometry, appearance, motion, spatial audio, camera — is one
+   file, one URL, one cache entry.
 2. **Seekable without a sidecar.** Displaying an arbitrary instant reads the file's own index and
    then only the byte ranges that instant needs.
 3. **Bounded memory.** Every read path is streamable; no conforming reader ever needs the whole file
@@ -114,7 +116,9 @@ that time, regardless of its marginal.
 <Header record>
 <Quantization record>
 <Window Table record>
-[<Audio record>]                 -- omitted entirely when the scene has no audio
+[<Audio record> |                -- legacy, mutually exclusive with source/data pairs
+ (<Audio Source record>
+  <Audio Data record>) ...]      -- new files use one pair per source; omitted when absent
 [<Provenance record> ...]        -- 0x20-0x2F; omitted entirely when the scene has none
 [<Camera record>]
 [<Metadata record> ...]
@@ -216,7 +220,7 @@ f64     cutoff           -- marginal visibility threshold, default 0.05
 string  temporal_model   -- "gaussian-birth" for version 1 (see registry)
 f64[6]  aabb             -- min xyz, max xyz over all rest positions
 u8      sh_degree        -- 0..3; 0 means no spherical harmonics
-u8      flags            -- bit 0: file contains an Audio record
+u8      flags            -- bit 0: file contains audio (legacy Audio or source/data pairs)
                          -- bit 1: chunk data is compressed
                          -- bits 2-7: reserved, MUST be 0
 map<string,string> attributes   -- free-form; see registry for well-known keys
@@ -433,9 +437,12 @@ a reader fetches `[offset, offset + length)` and parses it exactly as it would p
 mid-stream. That holds for `chunk_offset`/`chunk_length` and for each band's pair alike; there is no
 range in this record that points at a record's content rather than at the record.
 
-### 5.9 Audio — opcode `0x09`
+### 5.9 Audio — opcode `0x09` (legacy)
 
-See §7. Present only when the scene has audio.
+The pre-spatial single-track representation. Readers MUST continue to accept it; writers SHOULD emit
+Audio Source and Audio Data pairs instead. A legacy Audio record is interpreted as source id 0,
+non-spatial, gain 1, no loop, with an empty channel layout and duration
+`max(0, Header.duration_sec - start_sec)`.
 
 ```
 string  codec        -- well-known audio codec name (see registry)
@@ -855,6 +862,61 @@ Object Table entry remains valid.
 source timing: per-chunk or per-gaussian acquisition timestamps that distinguish scene time from
 capture time when a rolling or multi-sensor capture makes them differ.
 
+### 5.16 Audio Source — opcode `0x11`
+
+The small, independently readable descriptor for one source. Its encoded bytes are carried by the
+matching Audio Data record.
+
+```
+u32     source_id
+string  name
+string  codec
+string  channel_layout
+u64     data_length
+f64     start_sec
+f64     duration_sec
+f64     gain
+u8      flags             -- bit 0: spatial point source
+                          -- bit 1: loop payload playback
+                          -- bits 2-7: reserved, MUST be 0
+f64[3]  position
+f64[4]  rotation          -- unit quaternion, xyzw
+u32     keyframe_count
+        keyframe_count × {
+          f64 time;
+          f64[3] position;
+          f64[4] rotation;
+        }
+string  interpolation     -- "linear" or "step"; see registry
+```
+
+`source_id` MUST be unique in the file. `codec` MUST be non-empty. `duration_sec` MUST be finite and
+positive; `start_sec` and `gain` MUST be finite, and `gain` MUST be non-negative. Positions and
+rotations MUST contain only finite values, and rotations MUST be non-zero quaternions. Readers
+normalize rotations before use, and writers MUST normalize them on output.
+
+A spatial point source MUST use `channel_layout = "mono"`. A multichannel or scene-global bed is
+represented with the spatial flag clear; its channel layout still describes the encoded payload.
+
+Keyframe times are scene times, MUST be finite and strictly increasing, and MUST lie in
+`[0, Header.duration_sec]`. With no keyframes, `position` and `rotation` are the source pose. With
+keyframes, the first pose applies before the first keyframe and the last applies after the last; the
+base pose remains useful as a compact preview but does not override the keyed trajectory.
+
+### 5.17 Audio Data — opcode `0x12`
+
+```
+u32    source_id
+bytes  data
+```
+
+Exactly one Audio Data record MUST match every Audio Source record, and vice versa; **a reader MUST
+refuse a file with an Audio Data record that matches no Audio Source, or an Audio Source that
+matches no Audio Data**, naming the unmatched `source_id`. Its payload length MUST equal the
+descriptor's `data_length`. Each pair MUST appear before the first Chunk so an indexed reader can
+frame every source and range-read its encoded bytes without fetching a gaussian chunk or the payload
+itself.
+
 ---
 
 ## 6. Gaussian attributes
@@ -1022,24 +1084,67 @@ is unambiguous. Decoding ends at that reconstructed gaussian state.
 
 ## 7. Audio
 
-Audio is a first-class part of a 4dgs scene, and **its absence is equally first-class**.
+Audio is a first-class, multi-source part of a 4dgs scene, and **its absence is equally
+first-class**.
 
-- A scene without audio contains **no Audio record, no placeholder, and no reserved bytes**. Header
-  `flags` bit 0 is clear, and that is the entire signal.
-- **Encoders MUST NOT embed a silent track** to satisfy the format. There is nothing to satisfy:
-  absence is a valid, complete, conforming file, and it is the common case.
-- A reader determines audio presence from the Header alone — no probing, no speculative range
-  request.
-- Readers SHOULD expose audio as an optional value (`Option`, nullable, `null`). Absence is a normal
-  value, never an error and never a warning.
-- The Audio record's `data` is the encoded track verbatim. A reader MAY range-read it independently
-  of any gaussian data, and MAY skip it entirely.
+- A scene without audio contains no Audio, Audio Source or Audio Data record, no placeholder and no
+  reserved bytes. Header `flags` bit 0 is clear, and that is the entire discovery signal.
+- Encoders MUST NOT embed a silent source to satisfy the format. Absence is a valid, complete,
+  conforming file and is expected to be common.
+- A reader determines whether any source exists from the Header alone. It does not probe for records
+  or speculatively range-read payloads.
+- Readers expose zero or more audio sources. Absence is an empty collection, never an error or a
+  warning.
+- Every `data` payload is an encoded audio resource verbatim. It may be range-read independently of
+  gaussian data and may be skipped entirely.
+- A file MUST NOT mix the legacy Audio record with Audio Source or Audio Data records, and **a
+  reader MUST refuse one that does**. A legacy track carries its own payload, so a new-format Audio
+  Data record beside it is an orphan with no descriptor to match.
 
-**Clock rule.** When audio is present, the scene clock is the audio clock: scene time `t`
-corresponds to audio time `t - start_sec`, and a player SHOULD treat the audio track as the timing
-master. When audio is absent, the scene clock is self-contained — defined by the Header's
-`duration_sec` and the gaussians' own windows — and playback semantics are fully defined without
-reference to audio.
+### 7.1 One clock, independent source timelines
+
+The scene clock is always authoritative; no audio source is a clock master. At scene time `t`, a
+source is active when:
+
+```
+t >= start_sec AND (loop OR t < start_sec + duration_sec)
+```
+
+Its encoded stream is addressed at source-local time:
+
+```
+elapsed    = max(0, t - start_sec)
+local_time = loop ? elapsed mod duration_sec : min(elapsed, duration_sec)
+```
+
+This rule permits sources to start independently, overlap, end, and loop without forcing unrelated
+sources or gaussians onto one payload's clock. A player synchronizes decoder output to the scene
+clock and applies codec/container-specific seeking to reach `local_time`.
+
+### 7.2 Moving source reconstruction
+
+`state_at(source, t)` returns the active flag and local time above, the source gain, and one
+scene-space pose:
+
+- Without keyframes, use the descriptor's base position and normalized rotation.
+- Before the first keyframe, use the first keyed pose; after the last, use the last.
+- With `step`, use the last keyframe whose time is less than or equal to `t`.
+- With `linear`, linearly interpolate position and apply shortest-path quaternion SLERP to rotation
+  between the surrounding keyframes. Normalize the result.
+
+This reconstruction is deterministic format logic and belongs in an SDK. It ends at source state,
+just as gaussian decoding ends at gaussian state.
+
+### 7.3 Player-owned spatialization
+
+The file does not contain a listener pose. A renderer/player supplies the listener's scene-space
+position and orientation at playback time, transforms each spatial source into listener-relative
+coordinates, and chooses the playback policy. HRTF or speaker panning, distance attenuation,
+directional cones, Doppler, occlusion, reverberation, priority and mixing are all player-owned.
+
+The format therefore carries the facts that must survive interchange — source identity, timing,
+gain, encoded layout, and moving scene-space pose — without freezing one headset, speaker layout,
+room model, device tier or audio engine into the file.
 
 ---
 

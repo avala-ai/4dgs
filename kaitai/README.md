@@ -40,7 +40,8 @@ grammar produces structure. Specifically, it does not:
   `payload` bytes here. Everything a decoder does after decompression — the byte-plane unshuffle,
   zigzag, delta and constant modes, dequantization by the grids in the Quantization record, the
   per-gaussian velocity and birth-time steps of §6.3 — is arithmetic, and Kaitai is not where
-  arithmetic belongs. Neither does it decode audio, which the format carries verbatim by design.
+  arithmetic belongs. Neither does it decode audio payloads, which the format carries verbatim by
+  design; it does expose source descriptors and moving-pose keyframes.
 - **validate semantics.** It will happily parse a file whose window index points past the end of the
   Window Table, whose Chunk Index disagrees with the chunks, or whose Header claims a gaussian count
   no chunk supports. Those are all _refusals_ a conforming reader owes (§5.4, §5.5) and none of them
@@ -70,9 +71,9 @@ no decoder test states them directly:
 - every offset/length pair in a Chunk Index frames a whole record, opcode byte included (§5.8);
 - the Footer's `summary_start` points at the first Chunk Index record, and its CRC covers the run
   from there to the Footer (§4.5, §5.2);
-- the Header's `flags` bit 0 agrees with whether an Audio record is present (§7) — the bit is the
-  entire audio-discovery signal, so a file where it disagrees is one a conforming reader would
-  answer wrongly about without ever reading a byte of it.
+- the Header's `flags` bit 0 agrees with whether legacy Audio or Audio Source/Data records are
+  present (§7), every source id has one matching payload id, and the legacy and spatial
+  representations are not mixed.
 
 ## Naming
 

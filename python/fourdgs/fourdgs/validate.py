@@ -215,6 +215,9 @@ def validate(data: bytes) -> Report:
     footer = None
     provenance = Provenance()
     objects = ObjectLayer()
+    audio_sources: dict[int, rec.AudioSource] = {}
+    audio_data: dict[int, int] = {}
+    first_chunk_seen = False
 
     try:
         for record in iter_records(data, len(MAGIC)):
@@ -229,6 +232,7 @@ def validate(data: bytes) -> Report:
                 _check_sh_bit_depths(quant, header.sh_degree if header is not None else 0, report)
                 quant_count += 1
             elif record.opcode == op.CHUNK:
+                first_chunk_seen = True
                 head, _ = rec.parse_chunk(record.content)
                 chunk_count += 1
                 counted += head.count
@@ -236,6 +240,58 @@ def validate(data: bytes) -> Report:
                     report.error(f"chunk {chunk_count} has t1 ({head.t1}) before t0 ({head.t0})")
             elif record.opcode == op.CHUNK_INDEX:
                 index.append(rec.ChunkIndexEntry.parse(record.content))
+            elif record.opcode == op.AUDIO_SOURCE:
+                source = rec.AudioSource.parse(record.content)
+                if first_chunk_seen:
+                    report.error(f"Audio Source id {source.source_id} appears after the first Chunk")
+                if source.source_id in audio_sources:
+                    report.error(f"Audio Source id {source.source_id} appears more than once")
+                audio_sources[source.source_id] = source
+                if not source.codec:
+                    report.error(f"Audio Source id {source.source_id} has an empty codec")
+                if not all(
+                    math.isfinite(v)
+                    for v in (
+                        source.start_sec,
+                        source.duration_sec,
+                        source.gain,
+                        *source.position,
+                        *source.rotation,
+                    )
+                ):
+                    report.error(f"Audio Source id {source.source_id} has a non-finite numeric field")
+                if not any(source.rotation):
+                    report.error(f"Audio Source id {source.source_id} has a zero rotation quaternion")
+                if source.duration_sec <= 0:
+                    report.error(f"Audio Source id {source.source_id} duration_sec must be positive")
+                if source.gain < 0:
+                    report.error(f"Audio Source id {source.source_id} gain must be non-negative")
+                if source.spatial and source.channel_layout != "mono":
+                    report.error(f"spatial Audio Source id {source.source_id} must use channel_layout 'mono'")
+                if source.flags & ~(rec.AUDIO_SOURCE_SPATIAL | rec.AUDIO_SOURCE_LOOP):
+                    report.error(f"Audio Source id {source.source_id} has reserved flag bits set")
+                if source.interpolation not in {"linear", "step"}:
+                    report.error(
+                        f"Audio Source id {source.source_id} uses unknown interpolation {source.interpolation!r}"
+                    )
+                last = -math.inf
+                for i, keyframe in enumerate(source.keyframes):
+                    finite_pose = all(math.isfinite(v) for v in (*keyframe.position, *keyframe.rotation))
+                    if not math.isfinite(keyframe.time) or keyframe.time <= last or not finite_pose:
+                        report.error(
+                            f"Audio Source id {source.source_id} keyframe {i} must have a finite, "
+                            "strictly increasing time and finite pose"
+                        )
+                    if not any(keyframe.rotation):
+                        report.error(f"Audio Source id {source.source_id} keyframe {i} has a zero rotation quaternion")
+                    last = keyframe.time
+            elif record.opcode == op.AUDIO_DATA:
+                payload = rec.AudioData.parse(record.content)
+                if first_chunk_seen:
+                    report.error(f"Audio Data id {payload.source_id} appears after the first Chunk")
+                if payload.source_id in audio_data:
+                    report.error(f"Audio Data id {payload.source_id} appears more than once")
+                audio_data[payload.source_id] = len(payload.data)
             elif record.opcode == op.FOOTER:
                 footer = rec.Footer.parse(record.content)
             elif record.opcode == op.COORDINATE_FRAME:
@@ -294,11 +350,32 @@ def validate(data: bytes) -> Report:
 
     if header is not None and counted != header.gaussian_count:
         report.error(f"Header declares {header.gaussian_count} gaussians; chunks contain {counted}")
+    if header is not None:
+        for source in audio_sources.values():
+            for i, keyframe in enumerate(source.keyframes):
+                if keyframe.time < 0 or keyframe.time > header.duration_sec:
+                    report.error(
+                        f"Audio Source id {source.source_id} keyframe {i} time {keyframe.time} "
+                        f"is outside [0, {header.duration_sec}]"
+                    )
 
-    if header is not None and header.has_audio and op.AUDIO not in seen:
-        report.error("Header says the file has audio, but there is no Audio record")
-    if header is not None and not header.has_audio and op.AUDIO in seen:
-        report.error("there is an Audio record, but the Header's audio flag is clear")
+    has_audio_records = op.AUDIO in seen or bool(audio_sources) or bool(audio_data)
+    if header is not None and header.has_audio and not has_audio_records:
+        report.error("Header says the file has audio, but there is no Audio Source or legacy Audio record")
+    if header is not None and not header.has_audio and has_audio_records:
+        report.error("there is an Audio Source or legacy Audio record, but the Header's audio flag is clear")
+    if op.AUDIO in seen and audio_sources:
+        report.error("legacy Audio and Audio Source records must not be mixed")
+    for source_id, source in audio_sources.items():
+        if source_id not in audio_data:
+            report.error(f"Audio Source id {source_id} has no matching Audio Data record")
+        elif source.data_length != audio_data[source_id]:
+            report.error(
+                f"Audio Source id {source_id} declares {source.data_length} bytes; "
+                f"Audio Data contains {audio_data[source_id]}"
+            )
+    for source_id in audio_data.keys() - audio_sources.keys():
+        report.error(f"Audio Data id {source_id} has no matching Audio Source record")
 
     for i, entry in enumerate(index):
         if entry.chunk_offset + entry.chunk_length > len(data):

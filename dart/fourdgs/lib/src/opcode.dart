@@ -24,6 +24,13 @@ const int opStatistics = 0x0C;
 const int opAttachment = 0x0D;
 const int opAttachmentIndex = 0x0E;
 const int opSummaryOffset = 0x0F;
+const int opDeltaChunk = 0x10;
+const int opAudioSource = 0x11;
+const int opAudioData = 0x12;
+
+// Audio Source flags (spec §5.16).
+const int audioSourceFlagSpatial = 1 << 0;
+const int audioSourceFlagLoop = 1 << 1;
 
 /// First opcode of the application range, which the specification never
 /// defines and a conforming reader always skips.

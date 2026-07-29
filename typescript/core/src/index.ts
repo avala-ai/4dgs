@@ -35,6 +35,8 @@ export {
   GAUSSIAN_FLAG_NEVER_FADES,
   HEADER_FLAG_CHUNKS_COMPRESSED,
   HEADER_FLAG_HAS_AUDIO,
+  AUDIO_SOURCE_FLAG_LOOP,
+  AUDIO_SOURCE_FLAG_SPATIAL,
   Opcode,
   PRIVATE_OPCODE_START,
   REQUIRED_ATTRIBUTES,
@@ -45,6 +47,7 @@ export {
 export {
   CODEC_DEFLATE,
   CODEC_ZSTD,
+  Crc32,
   DEFAULT_CODECS,
   type CodecRegistry,
   type Decompressor,
@@ -62,6 +65,11 @@ export {
   VERSION,
   type Attachment,
   type AudioTrack,
+  type AudioData,
+  type AudioSource,
+  type AudioSourceDescriptor,
+  type AudioSourceKeyframe,
+  type AudioSourceState,
   type BandRange,
   type Camera,
   type CameraKeyframe,
@@ -80,6 +88,9 @@ export {
   iterateRecords,
   parseAttachment,
   parseAudio,
+  parseAudioData,
+  parseAudioSource,
+  audioSourceStateAt,
   parseCamera,
   parseChunk,
   parseChunkIndexEntry,
@@ -151,11 +162,11 @@ export { GaussianSet, type GaussianState, assembleGaussians, marginalAt } from "
 
 export { type GaussianInput, type WriteOptions, encodeScene } from "./writer.js";
 
-export { StreamDecoder } from "./streamDecoder.js";
+export { StreamDecoder, type StreamedRecordPart } from "./streamDecoder.js";
 
 export { FrontMatterScanner, type FrontMatterRecord } from "./frontMatter.js";
 
-export { type DecodeOptions, type Scene, decodeScene } from "./scene.js";
+export { type AudioPayloadChunk, type DecodeOptions, type Scene, decodeScene } from "./scene.js";
 
 export {
   HEAD_PROBE_BYTES,

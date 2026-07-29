@@ -14,6 +14,8 @@ consumers will trust it.
 
 from __future__ import annotations
 
+import math
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -21,7 +23,7 @@ import numpy as np
 from . import opcode as op
 from . import records as rec
 from .exceptions import BoundViolation, InvalidInput
-from .model import AudioTrack, CameraTrajectory, GaussianSet, window_table
+from .model import AudioSource, AudioTrack, CameraTrajectory, GaussianSet, window_table
 from .object_layer import ObjectLayer
 from .provenance import Provenance
 from .quantization import (
@@ -187,12 +189,33 @@ def write(
     duration_sec: float,
     *,
     options: WriteOptions | None = None,
+    audio_sources: Sequence[AudioSource] = (),
     audio: AudioTrack | None = None,
     camera: CameraTrajectory | None = None,
 ) -> int:
-    """Write a scene. Returns the number of bytes written."""
+    """Write a scene. Returns the number of bytes written.
+
+    `audio` is the pre-spatial compatibility input. It is normalized into one global
+    Audio Source; new code should pass `audio_sources`.
+    """
     opts = options or WriteOptions()
-    out = _encode(gaussians, duration_sec, opts, audio, camera)
+    if audio is not None and audio_sources:
+        raise ValueError("pass audio_sources or the legacy audio argument, not both")
+    sources = list(audio_sources)
+    if audio is not None:
+        sources = [
+            AudioSource(
+                source_id=0,
+                codec=audio.codec,
+                data=audio.data,
+                channel_layout="unspecified",
+                start_sec=audio.start_sec,
+                duration_sec=max(0.0, duration_sec - audio.start_sec),
+                spatial=False,
+            )
+        ]
+    _validate_audio_sources(sources, duration_sec)
+    out = _encode(gaussians, duration_sec, opts, sources, camera)
     if hasattr(path_or_file, "write"):
         path_or_file.write(out)
     else:
@@ -274,7 +297,71 @@ def _check_finite_input(g: GaussianSet) -> None:
             )
 
 
-def _encode(g: GaussianSet, duration_sec, opts, audio, camera) -> bytes:
+def _validate_audio_sources(sources: Sequence[AudioSource], scene_duration: float) -> None:
+    ids: set[int] = set()
+    for source in sources:
+        if source.source_id < 0 or source.source_id > 0xFFFFFFFF:
+            raise ValueError(f"audio source id {source.source_id} is outside u32")
+        if source.source_id in ids:
+            raise ValueError(f"audio source id {source.source_id} is duplicated")
+        ids.add(source.source_id)
+        if not source.codec:
+            raise ValueError(f"audio source {source.source_id} has an empty codec")
+        if not source.data:
+            raise ValueError(f"audio source {source.source_id} has no encoded data")
+        if not math.isfinite(source.start_sec):
+            raise ValueError(f"audio source {source.source_id} start_sec is not finite")
+        if not math.isfinite(source.duration_sec) or source.duration_sec <= 0:
+            raise ValueError(f"audio source {source.source_id} duration_sec must be finite and positive")
+        if not math.isfinite(source.gain) or source.gain < 0:
+            raise ValueError(f"audio source {source.source_id} gain must be finite and non-negative")
+        if source.spatial and source.channel_layout != "mono":
+            raise ValueError(f"spatial audio source {source.source_id} must use the mono channel layout")
+        if len(source.position) != 3 or not all(math.isfinite(value) for value in source.position):
+            raise ValueError(f"audio source {source.source_id} position must contain three finite values")
+        if (
+            len(source.rotation) != 4
+            or not all(math.isfinite(value) for value in source.rotation)
+            or not any(value != 0 for value in source.rotation)
+        ):
+            raise ValueError(f"audio source {source.source_id} rotation must be a finite non-zero quaternion")
+        if source.interpolation not in {"linear", "step"}:
+            raise ValueError(f"audio source {source.source_id} uses unknown interpolation {source.interpolation!r}")
+        last = -math.inf
+        for i, keyframe in enumerate(source.keyframes):
+            if len(keyframe.position) != 3 or not all(math.isfinite(value) for value in keyframe.position):
+                raise ValueError(
+                    f"audio source {source.source_id} keyframe {i} position must contain three finite values"
+                )
+            if (
+                len(keyframe.rotation) != 4
+                or not all(math.isfinite(value) for value in keyframe.rotation)
+                or not any(value != 0 for value in keyframe.rotation)
+            ):
+                raise ValueError(
+                    f"audio source {source.source_id} keyframe {i} rotation must be a finite non-zero quaternion"
+                )
+            if not math.isfinite(keyframe.time) or keyframe.time <= last:
+                raise ValueError(
+                    f"audio source {source.source_id} keyframe {i} time must be finite and strictly increasing"
+                )
+            if keyframe.time < 0 or keyframe.time > scene_duration:
+                raise ValueError(
+                    f"audio source {source.source_id} keyframe {i} time {keyframe.time} "
+                    f"is outside [0, {scene_duration}]"
+                )
+            last = keyframe.time
+
+
+def _unit_quaternion(values) -> list[float]:
+    components = [float(value) for value in values]
+    scale = max(abs(value) for value in components)
+    scaled = [value / scale for value in components]
+    length = math.sqrt(sum(value * value for value in scaled))
+    return [value / length for value in scaled]
+
+
+def _encode(g: GaussianSet, duration_sec, opts, audio_sources, camera) -> bytes:
     _check_finite_input(g)
     if opts.scene_profile == "objects":
         if g.object_id is None:
@@ -353,7 +440,7 @@ def _encode(g: GaussianSet, duration_sec, opts, audio, camera) -> bytes:
         cursor += len(blob)
         return at
 
-    header_flags = rec.FLAG_HAS_AUDIO if audio is not None else 0
+    header_flags = rec.FLAG_HAS_AUDIO if audio_sources else 0
     emit(
         rec.Header(
             duration_sec=float(duration_sec),
@@ -389,9 +476,39 @@ def _encode(g: GaussianSet, duration_sec, opts, audio, camera) -> bytes:
     for blob in opts.extra_records:
         emit(blob)
 
-    # Absence is the signal: no audio means no record at all, not an empty one.
-    if audio is not None:
-        emit(rec.Audio(codec=audio.codec, data=audio.data, start_sec=audio.start_sec).encode())
+    # Descriptors stay small and payloads stay independently range-readable. Every pair
+    # precedes the first Chunk so an indexed reader can frame all sources without fetching
+    # any encoded audio bytes.
+    for source in audio_sources:
+        source_flags = (rec.AUDIO_SOURCE_SPATIAL if source.spatial else 0) | (
+            rec.AUDIO_SOURCE_LOOP if source.loop else 0
+        )
+        emit(
+            rec.AudioSource(
+                source_id=source.source_id,
+                name=source.name,
+                codec=source.codec,
+                channel_layout=source.channel_layout,
+                data_length=len(source.data),
+                start_sec=source.start_sec,
+                duration_sec=source.duration_sec,
+                gain=source.gain,
+                flags=source_flags,
+                position=list(source.position),
+                rotation=_unit_quaternion(source.rotation),
+                keyframes=[
+                    rec.AudioSourceKeyframe(
+                        time=keyframe.time,
+                        position=list(keyframe.position),
+                        rotation=_unit_quaternion(keyframe.rotation),
+                    )
+                    for keyframe in source.keyframes
+                ],
+                interpolation=source.interpolation,
+            ).encode()
+        )
+        emit(rec.AudioData(source_id=source.source_id, data=source.data).encode())
+
     # Provenance, in ascending opcode order: the frame that the poses are expressed in,
     # then the sensors, then the trajectories. Nothing requires that order of a reader —
     # records are dispatched by opcode, not position — but a file written this way reads

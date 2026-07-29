@@ -5,7 +5,7 @@
 //!
 //! A `.4dgs` file is a single, self-contained, seekable container for a 4D gaussian splat
 //! scene: gaussians whose position, opacity and existence vary continuously over time,
-//! optionally with an embedded audio track and a default camera trajectory.
+//! optionally with multiple fixed or moving audio sources and a default camera trajectory.
 //!
 //! **Decoding ends at reconstructed gaussian state at time `t`.** The format is
 //! renderer-agnostic and so is this crate: nothing here describes how that state should be
@@ -54,7 +54,10 @@ pub mod stream_reader;
 pub mod writer;
 
 pub use crate::error::{Error, Result};
-pub use crate::model::{AudioTrack, CameraTrajectory, GaussianSet, StateAt};
+pub use crate::model::{
+    AudioSource, AudioSourceKeyframe, AudioSourceState, AudioTrack, CameraTrajectory, GaussianSet,
+    StateAt,
+};
 pub use crate::provenance::{pose_at, slerp, Pose, Provenance};
 pub use crate::readable::{BytesReadable, FileReadable, Readable};
 pub use crate::reader::{Mode, SceneReader};

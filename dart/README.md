@@ -4,13 +4,13 @@
 binding: it shares no code with the other SDKs, which is what makes its agreement with them in the
 [conformance suite](../tests/conformance/) worth something.
 
-Both read paths pass every variant this SDK declares support for — 67 checks — so every decode row
+Both read paths pass every variant this SDK declares support for — 79 checks — so every decode row
 in the [feature matrix](../website/docs/reference/index.md) is filled in from a suite that runs. It
 declines the five variants carrying provenance records (spec section 5.15) and the invalid corpus's
 refusal expectations, which is what the `No` cells in that table record.
 
-Scope: decoding a `.4dgs` to gaussian state at a time `t`. **Rendering is out of scope for this
-repository — the SDK ends at decoded state.**
+Scope: decoding a `.4dgs` to gaussian state and audio-source state at a time `t`. **Rendering and
+listener-relative spatialization are out of scope — the SDK ends at decoded state.**
 
 ```dart
 import 'dart:io';
@@ -19,6 +19,9 @@ import 'package:fourdgs/fourdgs.dart';
 final scene = readFourdgsBytes(File('scene.4dgs').readAsBytesSync());
 final live = scene.gaussians.stateAt(1.5); // §3: the window, then the marginal against the cutoff
 print('${live.count} gaussians at t=1.5');
+for (final source in scene.audioSources) {
+  print('${source.name} at ${source.stateAt(1.5).position}');
+}
 ```
 
 Seeking reads the index and then only the ranges an instant needs:
@@ -80,7 +83,7 @@ The corpus comes first because `test/front_matter_test.dart` decodes real files 
 test. The rest of the suite needs nothing but the package.
 
 The conformance runners are compiled rather than run from source, so that a machine without a Dart
-SDK reports them as _not built_ and skips them instead of failing 67 checks:
+SDK reports them as _not built_ and skips them instead of failing 79 checks:
 
 ```bash
 cd dart/conformance

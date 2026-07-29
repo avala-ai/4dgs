@@ -10,11 +10,51 @@
     "zeroMotionCount": "0"
   },
   "attachments": [],
-  "audio": {
-    "byteLength": "4044",
-    "codec": "wav",
-    "crc": "1756903858"
-  },
+  "audioSources": [
+    {
+      "byteLength": "4044",
+      "channelLayout": "mono",
+      "codec": "wav",
+      "crc": "1756903858",
+      "durationSec": 0.25,
+      "gain": 1.0,
+      "interpolation": "linear",
+      "keyframeCount": "0",
+      "keyframes": [],
+      "loop": false,
+      "name": "speaker",
+      "position": [
+        1.5,
+        0.75,
+        -0.5
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "sourceId": "7",
+      "spatial": true,
+      "startSec": 0.0,
+      "stateAtHalf": {
+        "active": false,
+        "gain": 1.0,
+        "localTime": 0.25,
+        "position": [
+          1.5,
+          0.75,
+          -0.5
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      }
+    }
+  ],
   "camera": {
     "fovYDeg": 45.0,
     "interpolation": "spline",

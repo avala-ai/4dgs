@@ -6,7 +6,7 @@
  *
  * A readable with `pread` semantics, so one open file can serve concurrent range reads
  * without a shared seek position, and a writable for the byte sinks around a decoder —
- * extracting an audio track, splitting an attachment out of a scene.
+ * extracting audio source payloads, splitting an attachment out of a scene.
  */
 
 import { open, type FileHandle } from "node:fs/promises";

@@ -18,7 +18,7 @@ import numpy as np
 from . import opcode as op
 from . import records as rec
 from .exceptions import MalformedFile, TruncatedFile, UnsupportedCodec
-from .model import AudioTrack, CameraTrajectory, GaussianSet
+from .model import AudioSource, AudioSourceKeyframe, AudioTrack, CameraTrajectory, GaussianSet
 from .object_layer import ObjectLayer
 from .provenance import Provenance
 from .quantization import (
@@ -57,8 +57,8 @@ class Scene:
     #: how wrong a value may be has to be able to reach them, and the bounds are the
     #: producer's own statement about that.
     quantization: rec.Quantization | None = None
-    #: `None` when the scene has no soundtrack, which is the common case and not an error.
-    audio: AudioTrack | None = None
+    #: Empty when the scene has no audio, which is the common case and not an error.
+    audio_sources: list[AudioSource] = field(default_factory=list)
     camera: CameraTrajectory | None = None
     metadata: list[rec.Metadata] = field(default_factory=list)
     attachments: list[rec.Attachment] = field(default_factory=list)
@@ -321,6 +321,9 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
     scene = Scene(header=None, gaussians=None, duration_sec=0.0)  # type: ignore[arg-type]
     skipped: list[int] = []
     truncated = False
+    audio_descriptors: dict[int, rec.AudioSource] = {}
+    audio_payloads: dict[int, bytes] = {}
+    legacy_audio: rec.Audio | None = None
 
     pos = len(MAGIC)
     end = pos
@@ -361,8 +364,21 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
                         _, values = decode_stream(band_cursor)
                         chunk_bands[-1][band] = values
             elif record.opcode == op.AUDIO:
-                a = rec.Audio.parse(record.content)
-                scene.audio = AudioTrack(codec=a.codec, data=a.data, start_sec=a.start_sec)
+                legacy_audio = rec.Audio.parse(record.content)
+            elif record.opcode == op.AUDIO_SOURCE:
+                if chunks:
+                    raise MalformedFile("an Audio Source record appears after the first Chunk")
+                source = rec.AudioSource.parse(record.content)
+                if source.source_id in audio_descriptors:
+                    raise MalformedFile(f"Audio Source id {source.source_id} appears more than once")
+                audio_descriptors[source.source_id] = source
+            elif record.opcode == op.AUDIO_DATA:
+                if chunks:
+                    raise MalformedFile("an Audio Data record appears after the first Chunk")
+                payload = rec.AudioData.parse(record.content)
+                if payload.source_id in audio_payloads:
+                    raise MalformedFile(f"Audio Data id {payload.source_id} appears more than once")
+                audio_payloads[payload.source_id] = payload.data
             elif record.opcode == op.CAMERA:
                 c = rec.Camera.parse(record.content)
                 scene.camera = CameraTrajectory(
@@ -438,10 +454,84 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
     scene.header = header
     scene.quantization = quant
     scene.duration_sec = header.duration_sec
+    if audio_descriptors and legacy_audio is not None:
+        raise MalformedFile("the file mixes a legacy Audio record with Audio Source records")
+    # A legacy Audio record can never coexist with new-format audio. Unlike an unmatched new
+    # descriptor — which a lost Audio Source could still have matched in a truncated file — a
+    # payload beside a legacy record is an orphan no later bytes can legitimize, so it is
+    # refused even in recovery, matching the indexed reader.
+    if legacy_audio is not None and audio_payloads:
+        source_id = min(audio_payloads)
+        raise MalformedFile(f"Audio Data id {source_id} has no matching Audio Source record")
+    for source_id in sorted(audio_descriptors):
+        descriptor = audio_descriptors[source_id]
+        data = audio_payloads.pop(source_id, None)
+        if data is None:
+            if truncated:
+                continue
+            raise MalformedFile(f"Audio Source id {source_id} has no matching Audio Data record")
+        if len(data) != descriptor.data_length:
+            raise MalformedFile(
+                f"Audio Source id {source_id} declares {descriptor.data_length} data bytes, "
+                f"its Audio Data record contains {len(data)}"
+            )
+        for index, keyframe in enumerate(descriptor.keyframes):
+            if keyframe.time < 0 or keyframe.time > header.duration_sec:
+                raise MalformedFile(
+                    f"Audio Source id {source_id} keyframe {index} time {keyframe.time} "
+                    f"is outside [0, {header.duration_sec}]"
+                )
+        scene.audio_sources.append(_audio_source(descriptor, data))
+    if audio_payloads and not truncated:
+        source_id = min(audio_payloads)
+        raise MalformedFile(f"Audio Data id {source_id} has no matching Audio Source record")
+    if legacy_audio is not None:
+        scene.audio_sources.append(
+            AudioSource(
+                source_id=0,
+                codec=legacy_audio.codec,
+                data=legacy_audio.data,
+                channel_layout="",
+                start_sec=legacy_audio.start_sec,
+                duration_sec=max(0.0, header.duration_sec - legacy_audio.start_sec),
+                spatial=False,
+            )
+        )
+    if header.has_audio != bool(scene.audio_sources) and not truncated:
+        state = "set" if header.has_audio else "clear"
+        raise MalformedFile(
+            f"the Header audio flag is {state}, but the file contains {len(scene.audio_sources)} complete audio sources"
+        )
     scene.skipped_opcodes = skipped
     scene.truncated = truncated
     scene.gaussians = _assemble(chunks, windows, header, chunk_bands)
     return scene
+
+
+def _audio_source(source: rec.AudioSource, data: bytes) -> AudioSource:
+    return AudioSource(
+        source_id=source.source_id,
+        name=source.name,
+        codec=source.codec,
+        channel_layout=source.channel_layout,
+        data=data,
+        start_sec=source.start_sec,
+        duration_sec=source.duration_sec,
+        gain=source.gain,
+        spatial=source.spatial,
+        loop=source.loop,
+        position=tuple(source.position),
+        rotation=tuple(source.rotation),
+        keyframes=[
+            AudioSourceKeyframe(
+                time=keyframe.time,
+                position=tuple(keyframe.position),
+                rotation=tuple(keyframe.rotation),
+            )
+            for keyframe in source.keyframes
+        ],
+        interpolation=source.interpolation,
+    )
 
 
 def _assemble(chunks: list[dict], windows, header, chunk_bands=None) -> GaussianSet:

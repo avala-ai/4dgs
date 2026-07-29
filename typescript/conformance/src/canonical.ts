@@ -11,7 +11,7 @@
  * - integers are strings, so a 64-bit value survives a JSON parser backed by doubles;
  * - floats are rounded to a fixed number of decimals before comparison;
  * - a never-fading gaussian's sigma is `null`, never a sentinel;
- * - `audio` is `null` when absent and an object when present, so both paths are visible;
+ * - `audioSources` is empty when absent and contains every independent source;
  * - keys are sorted.
  *
  * Nothing here may depend on decoded order. Gaussians may be reordered freely by an
@@ -26,9 +26,13 @@
  */
 
 import {
+  type AudioPayloadChunk,
+  Crc32,
+  audioSourceStateAt,
   crc32,
   type Attachment,
-  type AudioTrack,
+  type AudioSource,
+  type AudioSourceDescriptor,
   type Camera,
   type GaussianSet,
   type Header,
@@ -47,6 +51,60 @@ export const SAMPLE = 16;
 
 /** How many camera keyframes appear in full, so a long trajectory cannot bloat a summary. */
 export const CAMERA_KEYFRAMES = 4;
+export const AUDIO_KEYFRAMES = 4;
+
+/** A descriptor plus the digest computed while its payload streamed past. */
+export interface DigestedAudioSource extends AudioSourceDescriptor {
+  readonly payloadCrc: string;
+}
+
+type CanonicalAudioSource = AudioSource | DigestedAudioSource;
+
+/** Retain only one CRC state per source while streamed payload pieces are consumed. */
+export class AudioPayloadDigests {
+  private readonly states = new Map<
+    number,
+    { crc: Crc32; offset: number; dataLength: number; complete: boolean }
+  >();
+
+  readonly consume = (chunk: AudioPayloadChunk): void => {
+    let state = this.states.get(chunk.sourceId);
+    if (state === undefined) {
+      if (chunk.offset !== 0) {
+        throw new Error(`audio source ${chunk.sourceId} starts at payload offset ${chunk.offset}`);
+      }
+      state = {
+        crc: new Crc32(),
+        offset: 0,
+        dataLength: chunk.dataLength,
+        complete: false,
+      };
+      this.states.set(chunk.sourceId, state);
+    }
+    if (state.complete) throw new Error(`audio source ${chunk.sourceId} continued after its end`);
+    if (state.dataLength !== chunk.dataLength || state.offset !== chunk.offset) {
+      throw new Error(`audio source ${chunk.sourceId} payload pieces are not contiguous`);
+    }
+    state.crc.update(chunk.bytes);
+    state.offset += chunk.bytes.byteLength;
+    state.complete = chunk.final;
+  };
+
+  sources(descriptors: readonly AudioSourceDescriptor[]): DigestedAudioSource[] {
+    return descriptors.map((descriptor) => {
+      const state = this.states.get(descriptor.sourceId);
+      if (
+        state === undefined ||
+        !state.complete ||
+        state.offset !== descriptor.dataLength ||
+        state.dataLength !== descriptor.dataLength
+      ) {
+        throw new Error(`audio source ${descriptor.sourceId} has no complete streamed payload`);
+      }
+      return { ...descriptor, payloadCrc: String(state.crc.digest()) };
+    });
+  }
+}
 
 /** CRC-32 of a payload, as a string: a summary proving it read bytes, not just lengths. */
 export function crc(data: Uint8Array): string {
@@ -106,7 +164,7 @@ export interface SceneSummaryInput {
     | "attributes"
   >;
   readonly gaussians: GaussianSet;
-  readonly audio: AudioTrack | null;
+  readonly audioSources: readonly CanonicalAudioSource[];
   readonly chunkIntervals: readonly (readonly [number, number])[];
   readonly camera?: Camera | null;
   readonly metadata?: readonly Metadata[];
@@ -118,7 +176,7 @@ export interface SceneSummaryInput {
 
 /** The statement every implementation must agree on for a variant. */
 export function summarize(input: SceneSummaryInput): unknown {
-  const { header, gaussians, audio, chunkIntervals } = input;
+  const { header, gaussians, audioSources, chunkIntervals } = input;
   const n = gaussians.count;
   const order = stableOrder(gaussians);
   const sample = order.slice(0, SAMPLE);
@@ -154,15 +212,9 @@ export function summarize(input: SceneSummaryInput): unknown {
     shDegree: header.shDegree,
     temporalModel: header.temporalModel,
     hasAudio: header.hasAudio,
-    // Absent audio is a value, not a missing key: both paths are conformance-visible.
-    audio:
-      audio === null
-        ? null
-        : {
-            codec: audio.codec,
-            byteLength: String(audio.data.byteLength),
-            crc: crc(audio.data),
-          },
+    audioSources: [...audioSources]
+      .sort((a, b) => a.sourceId - b.sourceId)
+      .map((source) => summarizeAudioSource(source, header.durationSec / 2)),
     chunkIntervals: chunkIntervals.map(([a, b]) => [num(a), num(b)]),
     headerAttributes: sortedMap(header.attributes),
     metadataRecords: (input.metadata ?? []).map((m) => ({
@@ -209,6 +261,39 @@ export function summarize(input: SceneSummaryInput): unknown {
       neverFadesCount: String(neverFades),
       zeroMotionCount: String(still),
     },
+  };
+}
+
+function summarizeAudioSource(source: CanonicalAudioSource, sampleTime: number): unknown {
+  const state = audioSourceStateAt(source, sampleTime);
+  return {
+    sourceId: String(source.sourceId),
+    name: source.name,
+    codec: source.codec,
+    channelLayout: source.channelLayout,
+    startSec: num(source.startSec),
+    durationSec: num(source.durationSec),
+    gain: num(source.gain),
+    spatial: source.spatial,
+    loop: source.loop,
+    position: source.position.map(num),
+    rotation: source.rotation.map(num),
+    keyframeCount: String(source.keyframes.length),
+    keyframes: source.keyframes.slice(0, AUDIO_KEYFRAMES).map((keyframe) => ({
+      time: num(keyframe.time),
+      position: keyframe.position.map(num),
+      rotation: keyframe.rotation.map(num),
+    })),
+    interpolation: source.interpolation,
+    stateAtHalf: {
+      active: state.active,
+      localTime: num(state.localTime),
+      position: state.position.map(num),
+      rotation: state.rotation.map(num),
+      gain: num(state.gain),
+    },
+    byteLength: String(source.dataLength),
+    crc: "data" in source ? crc(source.data) : source.payloadCrc,
   };
 }
 

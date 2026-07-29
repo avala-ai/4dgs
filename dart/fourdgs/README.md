@@ -34,6 +34,13 @@ void main() {
   // the validity window, then the temporal marginal against the file's cutoff.
   final live = scene.gaussians.stateAt(1.5, cutoff: scene.header.cutoff);
   print('${live.count} visible at t=1.5');
+
+  for (final source in scene.audioSources) {
+    // The format reconstructs source-local timing and scene-space pose. The
+    // player combines this with its listener pose to spatialize and mix.
+    final audio = source.stateAt(1.5);
+    print('${source.name}: ${audio.position}, local ${audio.localTime}s');
+  }
 }
 ```
 
@@ -61,9 +68,27 @@ Future<void> main() async {
 ```
 
 Opening a scene reads the front matter and the index, never the file. Audio, camera, metadata and
-attachments are byte ranges until you ask for them — `readFourdgsAudio`, `readFourdgsCamera`,
-`readFourdgsMetadata`, `readFourdgsAttachments` — so an embedded soundtrack is never transferred to
-open a scene, and a scene without one carries no audio record at all.
+attachments are byte ranges until you ask for them. `readFourdgsAudioSourceDescriptors` reconstructs
+moving source poses without transferring codec payloads; `readFourdgsAudioRange` reads one slice of
+one source; and `readFourdgsAudioSources` materializes every source. Camera, metadata and
+attachments have corresponding deferred reads. A scene without audio carries no source records at
+all.
+
+```dart
+final descriptors = await readFourdgsAudioSourceDescriptors(source, scene);
+for (final descriptor in descriptors) {
+  final state = descriptor.stateAt(1.5);
+  print('${descriptor.sourceId}: ${state.position}');
+}
+
+final packet = await readFourdgsAudioRange(
+  source,
+  scene,
+  descriptors.first.sourceId,
+  0,
+  4096,
+);
+```
 
 **What opening actually costs.** One read of 64 KiB from the front, plus one for the footer and one
 for the index. `scene.headerBytes` reports what the front-matter scan transferred — every read it
@@ -110,12 +135,13 @@ subtypes separate the cases worth telling apart: `FourdgsTruncatedFile`,
 
 ## Scope
 
-Decoding ends at reconstructed gaussian state at time `t`. How that state is drawn is out of scope,
-and nothing here knows or cares.
+Decoding ends at reconstructed gaussian state and reconstructed audio-source state at time `t`.
+Rendering and spatial audio playback—including listener orientation, HRTF, attenuation, occlusion
+and mixing—belong to the renderer/player.
 
 ## Conformance
 
-Checked against the same generated corpus every other 4dgs SDK is, on both read paths: 67 checks.
+Checked against the same generated corpus every other 4dgs SDK is, on both read paths: 79 checks.
 See the [feature matrix](https://4dgs.dev/reference/) for what this SDK implements and what it
 declines.
 

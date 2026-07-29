@@ -61,6 +61,8 @@ enums:
     0x0d: attachment
     0x0e: attachment_index
     0x0f: summary_offset
+    0x11: audio_source
+    0x12: audio_data
     # §5.15, the provenance family. 0x24–0x2F stay reserved and unemitted, so they are
     # absent here for the same reason every other unassigned opcode is.
     0x20: coordinate_frame
@@ -166,6 +168,8 @@ types:
             'opcode::statistics': statistics
             'opcode::attachment': attachment
             'opcode::summary_offset': summary_offset
+            'opcode::audio_source': audio_source
+            'opcode::audio_data': audio_data
             'opcode::coordinate_frame': coordinate_frame
             'opcode::sensor_calibration': sensor_calibration
             'opcode::rig_trajectory': rig_trajectory
@@ -432,20 +436,82 @@ types:
 
   audio:
     doc: |
-      Spec §5.9 and §7. Opcode 0x09, present only when the scene has audio — a scene
-      without it carries no record, no placeholder and no reserved bytes.
+      Legacy spec §5.9 representation. Readers accept it; new writers emit Audio Source
+      and Audio Data pairs.
     seq:
       - id: codec
         type: str_field
         doc: Well-known audio codec name; see the registry.
       - id: start_sec
         type: f8
-        doc: |
-          Scene time at which the track's first sample plays. When audio is present the
-          scene clock is the audio clock: scene time t is audio time t - start_sec.
+        doc: Scene time at which the track's first sample plays.
       - id: data
         type: blob
         doc: The encoded track, verbatim. Opaque here by construction.
+
+  audio_source:
+    doc: Spec §5.16 and §7. A small descriptor; encoded bytes live in Audio Data.
+    seq:
+      - id: source_id
+        type: u4
+      - id: name
+        type: str_field
+      - id: codec
+        type: str_field
+      - id: channel_layout
+        type: str_field
+      - id: data_length
+        type: u8
+      - id: start_sec
+        type: f8
+      - id: duration_sec
+        type: f8
+      - id: gain
+        type: f8
+      - id: flags
+        type: u1
+      - id: position
+        type: f8
+        repeat: expr
+        repeat-expr: 3
+      - id: rotation
+        type: f8
+        repeat: expr
+        repeat-expr: 4
+      - id: num_keyframes
+        type: u4
+      - id: keyframes
+        type: audio_source_keyframe
+        repeat: expr
+        repeat-expr: num_keyframes
+      - id: interpolation
+        type: str_field
+    instances:
+      spatial:
+        value: (flags & 1) != 0
+      loop_playback:
+        value: (flags & 2) != 0
+
+  audio_source_keyframe:
+    seq:
+      - id: time
+        type: f8
+      - id: position
+        type: f8
+        repeat: expr
+        repeat-expr: 3
+      - id: rotation
+        type: f8
+        repeat: expr
+        repeat-expr: 4
+
+  audio_data:
+    doc: Spec §5.17. Encoded payload paired by source_id.
+    seq:
+      - id: source_id
+        type: u4
+      - id: data
+        type: blob
 
   camera:
     doc: |

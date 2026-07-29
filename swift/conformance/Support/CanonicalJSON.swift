@@ -13,7 +13,7 @@ import Foundation
 /// - floats are rounded to six decimals before comparison, and a non-finite one is `null`;
 /// - a never-fading gaussian's sigma is `null`, never a sentinel a decoder could reach by
 ///   accident;
-/// - `audio` is `null` when absent and an object when present, so both paths are visible;
+/// - `audioSources` is an array, empty when absent, so multiplicity and both paths are visible;
 /// - keys are sorted.
 public enum JSON {
     case null
