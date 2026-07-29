@@ -65,7 +65,21 @@ jobs:
           fi
 
   python:
-    runs-on: ubuntu-latest
+    # The ubuntu leg keeps the bare job name so anything referring to `python` by name
+    # still finds it; the other legs are suffixed. Same trick in every matrixed job below.
+    name: ${{ matrix.os == 'ubuntu-latest' && 'python' || format('python ({0})', matrix.os) }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # A Windows failure and a macOS failure are different bugs, and cancelling one
+      # because the other went red costs a round of CI to learn the second one.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest, ubuntu-24.04-arm]
+    defaults:
+      run:
+        # windows-latest defaults to pwsh, where the quoting below means something else.
+        # One declaration here rather than `shell: bash` on every step.
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -74,9 +88,13 @@ jobs:
       # rather than assuming the runner already has it.
       - run: pip install -e './python/fourdgs[dev]'
       # Rules and line length come from the root ruff.toml, so this command is
-      # the same one a contributor runs locally.
-      - run: ruff check .
-      - run: ruff format --check .
+      # the same one a contributor runs locally. Lint reads source and nothing else,
+      # so running it four times would report the same answer four times.
+      - name: Lint
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          ruff check .
+          ruff format --check .
       # The fuzzer mutates real corpus files, so the corpus has to exist before
       # the suite runs. It fails rather than skips without one: a fuzz run that
       # quietly tested nothing is worse than no fuzz run.
@@ -99,7 +117,15 @@ jobs:
       - run: npx --yes cspell@8 --config cspell.config.yaml "**/*.md"
 
   typescript:
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os == 'ubuntu-latest' && 'typescript' || format('typescript ({0})', matrix.os) }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest, ubuntu-24.04-arm]
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -115,7 +141,9 @@ jobs:
         env:
           COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
 
+      # Formatting is a property of the source, not of the machine reading it.
       - name: Format
+        if: matrix.os == 'ubuntu-latest'
         run: npx --yes prettier@3 --check "typescript/**/*.ts"
 
       # `tsc -b` is the typecheck: the packages are project references, so this also
@@ -213,16 +241,27 @@ jobs:
         run: node typescript/conformance/dist/browser_smoke.js
 
   rust:
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os == 'ubuntu-latest' && 'rust' || format('rust ({0})', matrix.os) }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest, ubuntu-24.04-arm]
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: rustup component add rustfmt clippy
 
+      # rustfmt and clippy read source, not the machine. One leg is the whole answer.
       - name: Format
+        if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --all --check
       - name: Lint
+        if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Build
         run: cargo build --workspace
@@ -245,14 +284,29 @@ jobs:
       # The C++ and Swift packages bind to include/fourdgs.h, so a drift between that
       # header and the symbols the library exports is their outage. This compiles a C
       # program against both and runs it, which is the only check that catches it here.
+      #
+      # Not on Windows, and that is a scope decision rather than a gap. Reaching cl.exe
+      # from a plain shell means driving vcvarsall by hand, and the drift this step looks
+      # for is already caught on Windows by the cpp job, which compiles the same header
+      # and links the same fourdgs.lib under MSVC. Two ways to run one check is not worth
+      # a hand-rolled toolchain bootstrap.
       - name: The C ABI links and behaves
+        if: runner.os != 'Windows'
         run: |
           cargo build -p fourdgs --release
           pip install -e ./python/fourdgs
           python tests/conformance/generate.py
+          # A Rust staticlib pulls in the platform's runtime. On Linux that is three
+          # explicit libraries; on macOS they all live in libSystem, which is linked
+          # anyway, and naming them is an error rather than a no-op.
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            runtime=""
+          else
+            runtime="-lm -lpthread -ldl"
+          fi
           cc -Wall -Wextra -Werror -std=c11 -I rust/fourdgs/include \
             rust/fourdgs/tests/capi_smoke.c -o capi_smoke \
-            target/release/libfourdgs.a -lm -lpthread -ldl
+            target/release/libfourdgs.a $runtime
           for variant in \
             OneWindow-UseChunkIndex-UseCrc-WithAudio \
             OneWindow-UseChunkIndex-UseCrc-WithLargeAudio \
@@ -267,15 +321,36 @@ jobs:
     # and without one. The no-core build is not a placeholder — it is what an integrator gets
     # before they have built the crate, and its tests assert that every call refuses with
     # kNotImplemented rather than quietly decoding nothing.
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os == 'ubuntu-latest' && 'cpp' || format('cpp ({0})', matrix.os) }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest, ubuntu-24.04-arm]
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Debug everywhere but Windows, where it cannot be. Rust's *-pc-windows-msvc
+      # staticlib is compiled against the release CRT (/MD); an MSVC Debug build asks for
+      # /MDd, and the linker refuses the mixture with LNK2038 rather than producing
+      # something that half works. Forcing the C++ side onto /MD while keeping Debug
+      # would link a release CRT into a debug binary — the same mixture, unreported.
+      # Release on Windows is the configuration that is actually consistent.
+      #
+      # `--config` and `--build-config` are no-ops for single-config generators, so the
+      # same three commands serve every leg.
+      FOURDGS_CMAKE_CONFIG: ${{ matrix.os == 'windows-latest' && 'Release' || 'Debug' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
 
       # Pinned, because clang-format's output changes between releases and an unpinned
-      # formatter is a gate that fails on somebody else's upgrade.
+      # formatter is a gate that fails on somebody else's upgrade. Style is a property of
+      # the source, so one leg answers for all four.
       - name: Format
+        if: matrix.os == 'ubuntu-latest'
         run: |
           pip install clang-format==22.1.8
           clang-format --dry-run --Werror $(git ls-files 'cpp/*.cpp' 'cpp/*.hpp')
@@ -290,17 +365,18 @@ jobs:
 
       - name: Build and test without a core
         run: |
-          cmake -S cpp -B cpp/build-nocore -DCMAKE_BUILD_TYPE=Debug \
+          cmake -S cpp -B cpp/build-nocore -DCMAKE_BUILD_TYPE="$FOURDGS_CMAKE_CONFIG" \
             -DFOURDGS_CORE_HEADER_DIR=/nonexistent
-          cmake --build cpp/build-nocore -j
-          ctest --test-dir cpp/build-nocore --output-on-failure
+          cmake --build cpp/build-nocore --config "$FOURDGS_CMAKE_CONFIG" -j
+          ctest --test-dir cpp/build-nocore --build-config "$FOURDGS_CMAKE_CONFIG" \
+            --output-on-failure
 
       - name: Build and test against the core
         run: |
           cargo build -p fourdgs --release
-          cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Debug
-          cmake --build cpp/build -j
-          ctest --test-dir cpp/build --output-on-failure
+          cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE="$FOURDGS_CMAKE_CONFIG"
+          cmake --build cpp/build --config "$FOURDGS_CMAKE_CONFIG" -j
+          ctest --test-dir cpp/build --build-config "$FOURDGS_CMAKE_CONFIG" --output-on-failure
 
       - name: The example runs, so it cannot rot into a snippet that no longer works
         run: |
@@ -311,7 +387,14 @@ jobs:
       # past the end of a buffer the ABI handed over are the two bugs it is exposed to. The
       # runners decode every corpus file here rather than the tests' synthetic data, because
       # an open/decode/close cycle over real files is what the sanitizers need to see.
+      #
+      # Linux only. The bugs this looks for — a leaked handle from across the FFI boundary,
+      # a read past the end of a buffer the ABI handed over — are in the binding's own
+      # logic, which is the same code on every platform, so one platform finds them. macOS
+      # could run ASAN and Windows would need a different mechanism entirely; neither adds
+      # a bug this leg would not already have caught.
       - name: Sanitizers
+        if: runner.os == 'Linux'
         run: |
           cmake -S cpp -B cpp/build-asan -DCMAKE_BUILD_TYPE=Debug -DFOURDGS_ASAN=ON
           cmake --build cpp/build-asan -j
