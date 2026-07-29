@@ -149,6 +149,8 @@ export {
 
 export { GaussianSet, type GaussianState, assembleGaussians, marginalAt } from "./gaussians.js";
 
+export { type GaussianInput, type WriteOptions, encodeScene } from "./writer.js";
+
 export { StreamDecoder } from "./streamDecoder.js";
 
 export { FrontMatterScanner, type FrontMatterRecord } from "./frontMatter.js";

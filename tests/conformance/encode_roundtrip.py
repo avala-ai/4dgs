@@ -73,6 +73,16 @@ ENCODERS = {
 SH_LADDER_DEPTHS = [6, 4, 3]
 SH_LADDER = ",".join(str(depth) for depth in SH_LADDER_DEPTHS)
 
+#: Encoders that are genuine second implementations rather than bindings over the Rust core.
+#: A binding produces byte-identical files to the reference, so the gate compares everything;
+#: a second encoder makes its own byte-layout choices — how well deflate did, which order
+#: gaussians sit in a chunk — that are legitimately its own and are not part of what the file
+#: means. For those, the summary's byte offsets and the producer's `library` string are
+#: dropped before the comparison, which then rests on decoded content: the gaussian values,
+#: the chunk intervals, the statistics, the spherical-harmonic digest.
+SECOND_ENCODERS = frozenset({"typescript"})
+LAYOUT_DEPENDENT_KEYS = ("summaryOffsets", "library")
+
 
 def variants() -> list[str]:
     return sorted(f[: -len(".json")] for f in os.listdir(DATA) if f.endswith(".json"))
@@ -106,15 +116,21 @@ def encode(command: list[str], source: str, out: str, ladder: str | None) -> Non
         raise RuntimeError(f"{' '.join(command)} failed on {os.path.basename(source)}:\n{result.stderr.strip()}")
 
 
-def compare(reference: list[str], candidate: list[str], source: str, tmp: str, ladder: str | None) -> None:
+def compare(
+    reference: list[str], candidate: list[str], source: str, tmp: str, ladder: str | None, second_encoder: bool
+) -> None:
     ref_out = os.path.join(tmp, "reference.4dgs")
     cand_out = os.path.join(tmp, "candidate.4dgs")
     encode(reference, source, ref_out, ladder)
     encode(candidate, source, cand_out, ladder)
-    ref_json = decode_canonical(ref_out)
-    cand_json = decode_canonical(cand_out)
-    if json.loads(ref_json) != json.loads(cand_json):
-        raise AssertionError(_diff(ref_json, cand_json))
+    ref = json.loads(decode_canonical(ref_out))
+    cand = json.loads(decode_canonical(cand_out))
+    if second_encoder:
+        for key in LAYOUT_DEPENDENT_KEYS:
+            ref.pop(key, None)
+            cand.pop(key, None)
+    if ref != cand:
+        raise AssertionError(_diff(json.dumps(ref), json.dumps(cand)))
     if ladder is not None:
         _check_declared_depths(cand_out)
 
@@ -165,12 +181,13 @@ def main(argv=None) -> int:
         print("no corpus; run tests/conformance/generate.py first", file=sys.stderr)
         return 1
 
+    second_encoder = args.encoder in SECOND_ENCODERS
     agreed = graded = failed = 0
     with tempfile.TemporaryDirectory() as tmp:
         for variant in names:
             source = os.path.join(DATA, f"{variant}.4dgs")
             try:
-                compare(REFERENCE, command, source, tmp, None)
+                compare(REFERENCE, command, source, tmp, None, second_encoder)
                 agreed += 1
             except (AssertionError, RuntimeError) as exc:
                 failed += 1
@@ -178,7 +195,7 @@ def main(argv=None) -> int:
                 continue
             if "SHDegree" in variant:
                 try:
-                    compare(REFERENCE, command, source, tmp, SH_LADDER)
+                    compare(REFERENCE, command, source, tmp, SH_LADDER, second_encoder)
                     graded += 1
                 except (AssertionError, RuntimeError) as exc:
                     failed += 1
