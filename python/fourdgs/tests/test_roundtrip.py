@@ -232,11 +232,37 @@ class TestAudio:
         cursor.u8()
         data[header.offset + 9 + cursor.pos] &= ~1
 
-        with pytest.raises(fourdgs.MalformedFile, match="Header audio flag is clear"):
-            fourdgs.read(bytes(data[:-1]), recover_truncated=True)
+        descriptor = next(record for record in iter_records(data, len(MAGIC)) if record.opcode == op.AUDIO_SOURCE)
         payload = next(record for record in iter_records(data, len(MAGIC)) if record.opcode == op.AUDIO_DATA)
-        with pytest.raises(fourdgs.MalformedFile, match="Header audio flag is clear"):
+        location = rf"Audio Source record for source id 1 at byte {descriptor.offset}"
+        with pytest.raises(fourdgs.MalformedFile, match=location):
+            fourdgs.read(bytes(data[:-1]), recover_truncated=True)
+        with pytest.raises(fourdgs.MalformedFile, match=location):
             fourdgs.read(bytes(data[: payload.offset]), recover_truncated=True)
+
+    def test_indexed_audio_range_validates_descriptor_and_payload_lengths_first(self):
+        from fourdgs.indexed_reader import open_indexed, read_audio_range
+        from fourdgs.readable import BytesReadable
+        from fourdgs.serialization import iter_records
+
+        buf = io.BytesIO()
+        source = fourdgs.AudioSource(source_id=1, codec="wav", data=b"RIFF", duration_sec=6.0)
+        fourdgs.write(buf, make_scene(), 6.0, audio_sources=[source])
+        data = bytearray(buf.getvalue())
+        descriptor = next(record for record in iter_records(data, len(MAGIC)) if record.opcode == op.AUDIO_SOURCE)
+        cursor = Cursor(descriptor.content)
+        assert cursor.u32() == source.source_id
+        cursor.string()
+        cursor.string()
+        cursor.string()
+        data_length_at = descriptor.offset + 9 + cursor.pos
+        declared = int.from_bytes(data[data_length_at : data_length_at + 8], "little")
+        data[data_length_at : data_length_at + 8] = (declared + 1).to_bytes(8, "little")
+
+        readable = BytesReadable(bytes(data))
+        indexed = open_indexed(readable)
+        with pytest.raises(fourdgs.MalformedFile, match="Audio Data record declares"):
+            read_audio_range(readable, indexed, source.source_id, 0, 1)
 
     def test_the_writer_normalizes_an_extreme_audio_orientation_without_overflow(self):
         source = fourdgs.AudioSource(

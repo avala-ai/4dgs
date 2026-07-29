@@ -133,6 +133,12 @@ interface LegacyAudioDescriptor {
   readonly dataLength: number;
 }
 
+interface ObservedAudioRecord {
+  readonly name: "Audio" | "Audio Source" | "Audio Data";
+  readonly offset: number;
+  readonly sourceId?: number;
+}
+
 interface StreamingAudioData {
   readonly recordOffset: number;
   readonly contentLength: number;
@@ -196,6 +202,7 @@ export async function decodeScene(
   let legacyAudio: LegacyAudioDescriptor | null = null;
   const audioDescriptors = new Map<number, AudioSourceDescriptor>();
   const audioPayloadLengths = new Map<number, number>();
+  let firstAudioRecord: ObservedAudioRecord | null = null;
   let streamingAudioData: StreamingAudioData | null = null;
   let streamingLegacyAudio: StreamingLegacyAudio | null = null;
   let camera: Camera | null = null;
@@ -226,6 +233,7 @@ export async function decodeScene(
           throw new MalformedFile(`an ${name} record appears after the first Chunk`);
         }
         if (item.opcode === Opcode.Audio) {
+          firstAudioRecord ??= { name: "Audio", offset: item.recordOffset };
           const consumed = await consumeLegacyAudioPart(
             item,
             streamingLegacyAudio,
@@ -234,6 +242,7 @@ export async function decodeScene(
           streamingLegacyAudio = consumed.state;
           if (consumed.descriptor !== null) legacyAudio = consumed.descriptor;
         } else {
+          firstAudioRecord ??= { name: "Audio Data", offset: item.recordOffset };
           streamingAudioData = await consumeAudioDataPart(
             item,
             streamingAudioData,
@@ -294,6 +303,11 @@ export async function decodeScene(
           if (audioDescriptors.has(source.sourceId)) {
             throw new MalformedFile(`Audio Source id ${source.sourceId} appears more than once`);
           }
+          firstAudioRecord ??= {
+            name: "Audio Source",
+            offset: record.offset,
+            sourceId: source.sourceId,
+          };
           audioDescriptors.set(source.sourceId, source);
           break;
         }
@@ -352,6 +366,7 @@ export async function decodeScene(
     audioDescriptors,
     audioPayloadLengths,
     legacyAudio,
+    firstAudioRecord,
     truncated,
   );
 
@@ -383,10 +398,16 @@ function assembleAudioSourceDescriptors(
   descriptors: ReadonlyMap<number, AudioSourceDescriptor>,
   payloadLengths: Map<number, number>,
   legacy: LegacyAudioDescriptor | null,
+  firstAudioRecord: ObservedAudioRecord | null,
   truncated: boolean,
 ): AudioSourceDescriptor[] {
   if (!header.hasAudio && (descriptors.size > 0 || payloadLengths.size > 0 || legacy !== null)) {
-    throw new MalformedFile("the Header audio flag is clear, but the file contains audio records");
+    const record = firstAudioRecord!;
+    const source = record.sourceId === undefined ? "" : ` for source id ${record.sourceId}`;
+    throw new MalformedFile(
+      `the Header audio flag is clear, but an ${record.name} record${source} at byte ` +
+        `${record.offset} is present; expected no audio records`,
+    );
   }
   if (descriptors.size > 0 && legacy !== null) {
     throw new MalformedFile("the file mixes a legacy Audio record with Audio Source records");

@@ -127,19 +127,19 @@ test("truncation does not excuse a complete audio source when the Header flag is
   const flags = header.offset + RECORD_HEADER_BYTES + cursor.pos;
   bytes[flags] = bytes[flags]! & ~1;
 
-  await assert.rejects(
-    () => decodeScene(bytes.subarray(0, bytes.length - 1)),
-    /Header audio flag is clear/,
+  const descriptor = [...iterateRecords(bytes, MAGIC.length)].find(
+    (record) => record.opcode === Opcode.AudioSource,
   );
-
   const payload = [...iterateRecords(bytes, MAGIC.length)].find(
     (record) => record.opcode === Opcode.AudioData,
   );
-  assert.ok(payload);
-  await assert.rejects(
-    () => decodeScene(bytes.subarray(0, payload.offset)),
-    /Header audio flag is clear/,
+  assert.ok(descriptor && payload);
+  const sourceId = new Cursor(descriptor.content).u32();
+  const location = new RegExp(
+    `Audio Source record for source id ${sourceId} at byte ${descriptor.offset}`,
   );
+  await assert.rejects(() => decodeScene(bytes.subarray(0, bytes.length - 1)), location);
+  await assert.rejects(() => decodeScene(bytes.subarray(0, payload.offset)), location);
 });
 
 test("the two read paths agree on the same file", async (t) => {
@@ -468,6 +468,32 @@ test("a track larger than the head probe does not cost anything to open", async 
   } finally {
     await file.close();
   }
+});
+
+test("an indexed audio range validates descriptor and payload lengths first", async (t) => {
+  const path = corpus("OneWindow-UseChunkIndex-UseCrc-WithSpatialAudio");
+  if (path === null) return t.skip("corpus not generated");
+
+  const bytes = Uint8Array.from(readFileSync(path));
+  const descriptor = [...iterateRecords(bytes, MAGIC.length)].find(
+    (record) => record.opcode === Opcode.AudioSource,
+  );
+  assert.ok(descriptor);
+  const cursor = new Cursor(descriptor.content);
+  const sourceId = cursor.u32();
+  cursor.string();
+  cursor.string();
+  cursor.string();
+  const dataLengthAt = descriptor.offset + RECORD_HEADER_BYTES + cursor.pos;
+  const view = new DataView(bytes.buffer, bytes.byteOffset);
+  const declared = view.getBigUint64(dataLengthAt, true);
+  view.setBigUint64(dataLengthAt, declared + 1n, true);
+
+  const scene = await IndexedDecoder.open(new BytesReadable(bytes));
+  await assert.rejects(
+    () => scene.readAudioRange(sourceId, 0, 1),
+    /Audio Source id .* declares .* Audio Data record declares/,
+  );
 });
 
 test("the front matter is walked in windows, however small the probe", async (t) => {

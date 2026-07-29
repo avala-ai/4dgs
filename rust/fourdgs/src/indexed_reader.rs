@@ -564,7 +564,10 @@ pub fn read_audio<R: Readable + ?Sized>(
 ) -> Result<Option<Vec<u8>>> {
     match scene.audio_sources.first() {
         None => Ok(None),
-        Some(entry) => Ok(Some(source.read(entry.data_offset, entry.data_length)?)),
+        Some(entry) => {
+            read_audio_source_descriptor(source, scene, entry)?;
+            Ok(Some(source.read(entry.data_offset, entry.data_length)?))
+        }
     }
 }
 
@@ -581,6 +584,7 @@ pub fn read_audio_sources<R: Readable + ?Sized>(
     Ok(out)
 }
 
+/// Validate the small descriptor, then read one source-relative payload range.
 pub fn read_audio_range<R: Readable + ?Sized>(
     source: &mut R,
     scene: &IndexedScene,
@@ -595,6 +599,7 @@ pub fn read_audio_range<R: Readable + ?Sized>(
         .ok_or_else(|| {
             Error::Malformed(format!("this scene has no audio source id {source_id}"))
         })?;
+    read_audio_source_descriptor(source, scene, entry)?;
     let end = offset.checked_add(length).ok_or_else(|| {
         Error::Malformed(format!(
             "audio source {source_id} range [{offset}, +{length}) overflows"

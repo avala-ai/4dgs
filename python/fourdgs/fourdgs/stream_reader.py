@@ -324,6 +324,7 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
     audio_descriptors: dict[int, rec.AudioSource] = {}
     audio_payloads: dict[int, bytes] = {}
     legacy_audio: rec.Audio | None = None
+    first_audio_record: tuple[str, int, int | None] | None = None
 
     pos = len(MAGIC)
     end = pos
@@ -364,11 +365,15 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
                         _, values = decode_stream(band_cursor)
                         chunk_bands[-1][band] = values
             elif record.opcode == op.AUDIO:
+                if first_audio_record is None:
+                    first_audio_record = ("Audio", record.offset, None)
                 legacy_audio = rec.Audio.parse(record.content)
             elif record.opcode == op.AUDIO_SOURCE:
                 if chunks:
                     raise MalformedFile("an Audio Source record appears after the first Chunk")
                 source = rec.AudioSource.parse(record.content)
+                if first_audio_record is None:
+                    first_audio_record = ("Audio Source", record.offset, source.source_id)
                 if source.source_id in audio_descriptors:
                     raise MalformedFile(f"Audio Source id {source.source_id} appears more than once")
                 audio_descriptors[source.source_id] = source
@@ -376,6 +381,8 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
                 if chunks:
                     raise MalformedFile("an Audio Data record appears after the first Chunk")
                 payload = rec.AudioData.parse(record.content)
+                if first_audio_record is None:
+                    first_audio_record = ("Audio Data", record.offset, payload.source_id)
                 if payload.source_id in audio_payloads:
                     raise MalformedFile(f"Audio Data id {payload.source_id} appears more than once")
                 audio_payloads[payload.source_id] = payload.data
@@ -455,7 +462,13 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
     scene.quantization = quant
     scene.duration_sec = header.duration_sec
     if not header.has_audio and (audio_descriptors or audio_payloads or legacy_audio is not None):
-        raise MalformedFile("the Header audio flag is clear, but the file contains audio records")
+        assert first_audio_record is not None
+        name, offset, source_id = first_audio_record
+        source = "" if source_id is None else f" for source id {source_id}"
+        raise MalformedFile(
+            f"the Header audio flag is clear, but an {name} record{source} at byte {offset} "
+            "is present; expected no audio records"
+        )
     if audio_descriptors and legacy_audio is not None:
         raise MalformedFile("the file mixes a legacy Audio record with Audio Source records")
     # A legacy Audio record can never coexist with new-format audio. Unlike an unmatched new

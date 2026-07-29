@@ -386,17 +386,28 @@ fn truncation_does_not_excuse_audio_when_the_header_flag_is_clear() {
     content.u8().unwrap();
     let flags = header_offset + RECORD_HEADER_SIZE + content.position();
     bytes[flags] &= !fourdgs::records::FLAG_HAS_AUDIO;
-    let payload_offset = Records::new(&bytes, fourdgs::MAGIC.len())
-        .find_map(|record| {
+    let (descriptor_offset, payload_offset) = {
+        let mut descriptor_offset = None;
+        let mut payload_offset = None;
+        for record in Records::new(&bytes, fourdgs::MAGIC.len()) {
             let record = record.expect("well-formed generated record");
-            (record.opcode == fourdgs::opcode::AUDIO_DATA).then_some(record.offset)
-        })
-        .expect("Audio Data");
+            if record.opcode == fourdgs::opcode::AUDIO_SOURCE {
+                descriptor_offset = Some(record.offset);
+            } else if record.opcode == fourdgs::opcode::AUDIO_DATA {
+                payload_offset = Some(record.offset);
+            }
+        }
+        (
+            descriptor_offset.expect("Audio Source"),
+            payload_offset.expect("Audio Data"),
+        )
+    };
     let orphan = fourdgs::read_bytes(&bytes[..payload_offset])
         .expect_err("a complete descriptor contradicts the clear Header");
     assert!(
         matches!(&orphan, fourdgs::Error::Malformed(message)
-            if message.contains("Header audio flag is clear")),
+            if message.contains("Audio Source record for source id 1")
+                && message.contains(&format!("byte {descriptor_offset}"))),
         "{orphan}"
     );
     bytes.pop();
@@ -404,7 +415,57 @@ fn truncation_does_not_excuse_audio_when_the_header_flag_is_clear() {
     let error = fourdgs::read_bytes(&bytes).expect_err("the complete source contradicts Header");
     assert!(
         matches!(&error, fourdgs::Error::Malformed(message)
-            if message.contains("Header audio flag is clear")),
+            if message.contains("Audio Source record for source id 1")
+                && message.contains(&format!("byte {descriptor_offset}"))),
+        "{error}"
+    );
+}
+
+#[test]
+fn indexed_audio_ranges_validate_descriptor_and_payload_lengths_first() {
+    use fourdgs::serialization::{Cursor, Records, RECORD_HEADER_SIZE};
+
+    let (g, duration) = scene(8);
+    let extras = SceneExtras {
+        audio_sources: vec![AudioSource {
+            source_id: 1,
+            codec: "wav".into(),
+            duration_sec: duration,
+            data: b"RIFF".to_vec(),
+            ..AudioSource::default()
+        }],
+        ..SceneExtras::default()
+    };
+    let mut bytes =
+        fourdgs::write_to_vec(&g, duration, &chunking_options(), &extras).expect("encode");
+    let data_length_at = {
+        let record = Records::new(&bytes, fourdgs::MAGIC.len())
+            .find_map(|record| {
+                let record = record.expect("well-formed generated record");
+                (record.opcode == fourdgs::opcode::AUDIO_SOURCE).then_some(record)
+            })
+            .expect("Audio Source");
+        let mut content = Cursor::new(record.content);
+        assert_eq!(content.u32().unwrap(), 1);
+        content.string().unwrap();
+        content.string().unwrap();
+        content.string().unwrap();
+        record.offset + RECORD_HEADER_SIZE + content.position()
+    };
+    let declared = u64::from_le_bytes(
+        bytes[data_length_at..data_length_at + 8]
+            .try_into()
+            .expect("u64"),
+    );
+    bytes[data_length_at..data_length_at + 8].copy_from_slice(&(declared + 1).to_le_bytes());
+
+    let mut source = OwnedSource(bytes);
+    let indexed = fourdgs::indexed_reader::open_indexed(&mut source).expect("indexed open");
+    let error = fourdgs::indexed_reader::read_audio_range(&mut source, &indexed, 1, 0, 1)
+        .expect_err("the descriptor disagrees with Audio Data");
+    assert!(
+        matches!(&error, fourdgs::Error::Malformed(message)
+            if message.contains("Audio Data record declares")),
         "{error}"
     );
 }

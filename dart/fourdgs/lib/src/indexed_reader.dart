@@ -411,7 +411,7 @@ Future<FourdgsAudioSourceState> readFourdgsAudioSourceState(
   return (await _readAudioSourceDescriptor(source, scene, entry)).stateAt(t);
 }
 
-/// Reads one source-relative encoded byte range and nothing else.
+/// Validates the small descriptor, then reads one source-relative payload range.
 Future<Uint8List> readFourdgsAudioRange(
   FourdgsReadable source,
   FourdgsIndexedScene scene,
@@ -420,6 +420,7 @@ Future<Uint8List> readFourdgsAudioRange(
   int length,
 ) async {
   final entry = _audioEntry(scene, sourceId);
+  await _readAudioSourceDescriptor(source, scene, entry);
   if (offset < 0 || length < 0 || offset + length > entry.dataLength) {
     throw FourdgsMalformedFile(
       'audio source $sourceId range [$offset, ${offset + length}) is outside '

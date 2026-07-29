@@ -95,6 +95,7 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
     let mut audio_descriptors: BTreeMap<u32, rec::AudioSource> = BTreeMap::new();
     let mut audio_payloads: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
     let mut legacy_audio: Option<rec::Audio> = None;
+    let mut first_audio_record: Option<(&'static str, u64, Option<u32>)> = None;
     let mut truncated = false;
 
     // The Footer's CRC covers `[summary_start, footer_start)`, and a front-to-back reader
@@ -242,6 +243,7 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
                 }
             }
             op::AUDIO => {
+                first_audio_record.get_or_insert(("Audio", offset, None));
                 legacy_audio = Some(rec::Audio::parse(&content)?);
             }
             op::AUDIO_SOURCE => {
@@ -252,6 +254,7 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
                 }
                 let source = rec::AudioSource::parse(&content)?;
                 let id = source.source_id;
+                first_audio_record.get_or_insert(("Audio Source", offset, Some(id)));
                 if audio_descriptors.insert(id, source).is_some() {
                     return Err(Error::Malformed(format!(
                         "Audio Source id {id} appears more than once"
@@ -265,6 +268,7 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
                     ));
                 }
                 let (id, data) = rec::AudioData::into_payload(content)?;
+                first_audio_record.get_or_insert(("Audio Data", offset, Some(id)));
                 if audio_payloads.insert(id, data).is_some() {
                     return Err(Error::Malformed(format!(
                         "Audio Data id {id} appears more than once"
@@ -352,9 +356,13 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
     if !header.has_audio()
         && (!audio_descriptors.is_empty() || !audio_payloads.is_empty() || legacy_audio.is_some())
     {
-        return Err(Error::Malformed(
-            "the Header audio flag is clear, but the file contains audio records".into(),
-        ));
+        let (name, offset, source_id) =
+            first_audio_record.expect("an audio record was retained above");
+        let source = source_id.map_or_else(String::new, |id| format!(" for source id {id}"));
+        return Err(Error::Malformed(format!(
+            "the Header audio flag is clear, but an {name} record{source} at byte {offset} is \
+             present; expected no audio records"
+        )));
     }
     if !audio_descriptors.is_empty() && legacy_audio.is_some() {
         return Err(Error::Malformed(

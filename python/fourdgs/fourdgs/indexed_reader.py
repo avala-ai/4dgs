@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import struct
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -148,6 +148,7 @@ class IndexedScene:
     provenance_ranges: list[tuple[int, int, int]] = field(default_factory=list)
     statistics: rec.Statistics | None = None
     summary_offsets: list[rec.SummaryOffset] = field(default_factory=list)
+    _audio_descriptor_cache: dict[int, AudioSource] = field(default_factory=dict, repr=False)
 
     @property
     def has_audio(self) -> bool:
@@ -488,6 +489,7 @@ def read_audio(source: Readable, scene: IndexedScene) -> bytes | None:
     if not scene.audio_sources:
         return None
     entry = scene.audio_sources[0]
+    _read_audio_source(source, scene, entry, include_data=False)
     return source.read(entry.data_offset, entry.data_length)
 
 
@@ -510,10 +512,11 @@ def read_audio_source_state(source: Readable, scene: IndexedScene, source_id: in
 
 
 def read_audio_range(source: Readable, scene: IndexedScene, source_id: int, offset: int, length: int) -> bytes:
-    """Read exactly one source-relative payload range."""
+    """Validate/cache the small descriptor, then read one source-relative payload range."""
     entry = next((item for item in scene.audio_sources if item.source_id == source_id), None)
     if entry is None:
         raise MalformedFile(f"this scene has no audio source id {source_id}")
+    _read_audio_source(source, scene, entry, include_data=False)
     if offset < 0 or length < 0 or offset + length > entry.data_length:
         raise MalformedFile(
             f"audio source {source_id} range [{offset}, {offset + length}) is outside "
@@ -525,9 +528,14 @@ def read_audio_range(source: Readable, scene: IndexedScene, source_id: int, offs
 def _read_audio_source(
     source: Readable, scene: IndexedScene, entry: IndexedAudioSource, *, include_data: bool = True
 ) -> AudioSource:
+    cached = scene._audio_descriptor_cache.get(entry.source_id)
+    if cached is not None:
+        if not include_data:
+            return cached
+        return replace(cached, data=source.read(entry.data_offset, entry.data_length))
     if entry.descriptor_range is None:
         data = source.read(entry.data_offset, entry.data_length) if include_data else b""
-        return AudioSource(
+        descriptor = AudioSource(
             source_id=entry.source_id,
             codec=entry.legacy_codec or "",
             data=data,
@@ -537,6 +545,8 @@ def _read_audio_source(
             duration_sec=max(0.0, scene.header.duration_sec - entry.legacy_start_sec),
             spatial=False,
         )
+        scene._audio_descriptor_cache[entry.source_id] = replace(descriptor, data=b"")
+        return descriptor
     offset, length = entry.descriptor_range
     descriptor = rec.AudioSource.parse(
         Cursor(_read_range(source, offset, length, "the Audio Source record"), 9).take(length - 9)
@@ -554,13 +564,12 @@ def _read_audio_source(
                 f"Audio Source id {entry.source_id} keyframe {index} time {keyframe.time} "
                 f"is outside [0, {scene.header.duration_sec}]"
             )
-    data = source.read(entry.data_offset, entry.data_length) if include_data else b""
-    return AudioSource(
+    descriptor = AudioSource(
         source_id=descriptor.source_id,
         name=descriptor.name,
         codec=descriptor.codec,
         channel_layout=descriptor.channel_layout,
-        data=data,
+        data=b"",
         data_size=entry.data_length,
         start_sec=descriptor.start_sec,
         duration_sec=descriptor.duration_sec,
@@ -579,3 +588,7 @@ def _read_audio_source(
         ],
         interpolation=descriptor.interpolation,
     )
+    scene._audio_descriptor_cache[entry.source_id] = descriptor
+    if include_data:
+        return replace(descriptor, data=source.read(entry.data_offset, entry.data_length))
+    return descriptor

@@ -83,6 +83,11 @@ void main() {
       bytes,
       fourdgsMagic.length,
     ).firstWhere((record) => record.opcode == opAudioData);
+    final descriptor = iterRecords(
+      bytes,
+      fourdgsMagic.length,
+    ).firstWhere((record) => record.opcode == opAudioSource);
+    final sourceId = FourdgsCursor(descriptor.content).u32();
     final cursor =
         FourdgsCursor(header.content)
           ..string()
@@ -99,7 +104,10 @@ void main() {
         isA<FourdgsMalformedFile>().having(
           (error) => error.toString(),
           'message',
-          contains('Header audio flag is clear'),
+          contains(
+            'Audio Source record for source id $sourceId at byte '
+            '${descriptor.offset}',
+          ),
         ),
       ),
     );
@@ -109,7 +117,10 @@ void main() {
         isA<FourdgsMalformedFile>().having(
           (error) => error.toString(),
           'message',
-          contains('Header audio flag is clear'),
+          contains(
+            'Audio Source record for source id $sourceId at byte '
+            '${descriptor.offset}',
+          ),
         ),
       ),
     );
@@ -405,6 +416,38 @@ void main() {
       } finally {
         await file.close();
       }
+    });
+
+    test('range reads validate descriptor and payload lengths first', () async {
+      final bytes = Uint8List.fromList(
+        await File('$corpus/$withEverything.4dgs').readAsBytes(),
+      );
+      final descriptor = iterRecords(
+        bytes,
+        fourdgsMagic.length,
+      ).firstWhere((record) => record.opcode == opAudioSource);
+      final cursor = FourdgsCursor(descriptor.content);
+      final sourceId = cursor.u32();
+      cursor
+        ..string()
+        ..string()
+        ..string();
+      final view = ByteData.sublistView(descriptor.content);
+      final declared = view.getUint64(cursor.pos, Endian.little);
+      view.setUint64(cursor.pos, declared + 1, Endian.little);
+
+      final source = FourdgsBytes(bytes);
+      final scene = await openFourdgsIndexed(source);
+      await expectLater(
+        readFourdgsAudioRange(source, scene, sourceId, 0, 1),
+        throwsA(
+          isA<FourdgsMalformedFile>().having(
+            (error) => error.toString(),
+            'message',
+            contains('Audio Data record declares'),
+          ),
+        ),
+      );
     });
   });
 }

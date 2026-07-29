@@ -19,6 +19,14 @@ import 'quantization.dart';
 import 'records.dart';
 import 'serialization.dart';
 
+class _ObservedAudioRecord {
+  const _ObservedAudioRecord(this.name, this.offset, [this.sourceId]);
+
+  final String name;
+  final int offset;
+  final int? sourceId;
+}
+
 /// A whole file, decoded.
 class FourdgsScene {
   FourdgsScene({
@@ -119,6 +127,7 @@ FourdgsScene readFourdgsBytes(
   FourdgsAudioTrack? legacyAudio;
   final audioDescriptors = <int, FourdgsAudioSourceRecord>{};
   final audioPayloads = <int, Uint8List>{};
+  _ObservedAudioRecord? firstAudioRecord;
   FourdgsCameraTrajectory? camera;
   FourdgsStatistics? statistics;
   bool? summaryCrcOk;
@@ -172,6 +181,7 @@ FourdgsScene readFourdgsBytes(
             }
           }
         case opAudio:
+          firstAudioRecord ??= _ObservedAudioRecord('Audio', record.offset);
           if (legacyAudio != null) {
             throw const FourdgsMalformedFile(
               'the file carries more than one legacy Audio record',
@@ -190,6 +200,11 @@ FourdgsScene readFourdgsBytes(
             );
           }
           final source = FourdgsAudioSourceRecord.parse(record.content);
+          firstAudioRecord ??= _ObservedAudioRecord(
+            'Audio Source',
+            record.offset,
+            source.sourceId,
+          );
           if (audioDescriptors.containsKey(source.sourceId)) {
             throw FourdgsMalformedFile(
               'Audio Source id ${source.sourceId} appears more than once',
@@ -203,6 +218,11 @@ FourdgsScene readFourdgsBytes(
             );
           }
           final payload = FourdgsAudioData.parse(record.content);
+          firstAudioRecord ??= _ObservedAudioRecord(
+            'Audio Data',
+            record.offset,
+            payload.sourceId,
+          );
           if (audioPayloads.containsKey(payload.sourceId)) {
             throw FourdgsMalformedFile(
               'Audio Data id ${payload.sourceId} appears more than once',
@@ -285,6 +305,7 @@ FourdgsScene readFourdgsBytes(
     audioDescriptors,
     audioPayloads,
     legacyAudio,
+    firstAudioRecord,
     truncated,
   );
 
@@ -318,12 +339,17 @@ List<FourdgsAudioSource> _assembleAudioSources(
   Map<int, FourdgsAudioSourceRecord> descriptors,
   Map<int, Uint8List> payloads,
   FourdgsAudioTrack? legacy,
+  _ObservedAudioRecord? firstAudioRecord,
   bool truncated,
 ) {
   if (!header.hasAudio &&
       (descriptors.isNotEmpty || payloads.isNotEmpty || legacy != null)) {
-    throw const FourdgsMalformedFile(
-      'the Header audio flag is clear, but the file contains audio records',
+    final record = firstAudioRecord!;
+    final source =
+        record.sourceId == null ? '' : ' for source id ${record.sourceId}';
+    throw FourdgsMalformedFile(
+      'the Header audio flag is clear, but an ${record.name} record$source '
+      'at byte ${record.offset} is present; expected no audio records',
     );
   }
   if (descriptors.isNotEmpty && legacy != null) {

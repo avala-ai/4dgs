@@ -122,6 +122,7 @@ export interface IndexedChunk {
  */
 export class IndexedDecoder {
   private cachedChunkOptions: DecodeChunkOptions | null = null;
+  private readonly audioDescriptorCache = new Map<number, AudioSourceDescriptor>();
 
   private constructor(
     private readonly source: IReadable,
@@ -489,11 +490,12 @@ export class IndexedDecoder {
     return audioSourceStateAt(await this.readAudioSourceDescriptor(entry), t);
   }
 
-  /** Read one source-relative encoded byte range and nothing else. */
+  /** Validate/cache the small descriptor, then read one source-relative payload range. */
   async readAudioRange(sourceId: number, offset: number, length: number): Promise<Uint8Array> {
     const source = this.audioSources.find((item) => item.sourceId === sourceId);
     if (source === undefined)
       throw new MalformedFile(`this scene has no audio source id ${sourceId}`);
+    await this.readAudioSourceDescriptor(source);
     if (offset < 0 || length < 0 || offset + length > source.dataLength) {
       throw new MalformedFile(
         `audio source ${sourceId} range [${offset}, ${offset + length}) is outside ` +
@@ -512,9 +514,11 @@ export class IndexedDecoder {
   private async readAudioSourceDescriptor(
     entry: IndexedAudioSource,
   ): Promise<AudioSourceDescriptor> {
+    const cached = this.audioDescriptorCache.get(entry.sourceId);
+    if (cached !== undefined) return cached;
     if (entry.descriptor === null) {
       const startSec = entry.legacyStartSec ?? 0;
-      return {
+      const descriptor: AudioSourceDescriptor = {
         sourceId: entry.sourceId,
         name: "",
         codec: entry.legacyCodec ?? "",
@@ -530,6 +534,8 @@ export class IndexedDecoder {
         keyframes: [],
         interpolation: "linear",
       };
+      this.audioDescriptorCache.set(entry.sourceId, descriptor);
+      return descriptor;
     }
     const descriptor = parseAudioSource(
       await this.readRecordAt(entry.descriptor, Opcode.AudioSource),
@@ -554,6 +560,7 @@ export class IndexedDecoder {
         );
       }
     }
+    this.audioDescriptorCache.set(entry.sourceId, descriptor);
     return descriptor;
   }
 
