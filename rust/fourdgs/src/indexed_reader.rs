@@ -42,6 +42,7 @@ pub const AUDIO_CODEC_PREFIX: u64 = 4096;
 
 const OBJECT_TRACK_HEADER_BYTES: u64 = 4 + 1 + 4;
 const OBJECT_TRACK_SAMPLE_BYTES: u64 = 8 + 4 * 8 + 3 * 8;
+const OBJECT_TRACK_VALIDATION_BLOCK_BYTES: u64 = 64 * 1024;
 
 /// One record's framing: everything except its bytes.
 #[derive(Debug, Clone, Copy)]
@@ -681,13 +682,30 @@ pub fn read_objects<R: Readable + ?Sized>(
 /// Sample only Object Tracks referenced by the resident gaussian memberships.
 ///
 /// Object Tables, unrelated tracks, and unrelated samples remain lazy behind
-/// [`read_objects`]. Each requested track costs logarithmic eight-byte time probes and at
-/// most two fixed-width pose samples, regardless of its total sample count.
+/// [`read_objects`]. A referenced track's complete time order is validated in bounded
+/// contiguous blocks, then sampling costs logarithmic eight-byte probes and at most two
+/// fixed-width pose samples.
 pub fn read_object_poses<R: Readable + ?Sized>(
     source: &mut R,
     scene: &IndexedScene,
     object_ids: &HashSet<u32>,
     t: f64,
+) -> Result<HashMap<u32, crate::provenance::Pose>> {
+    let mut validated = HashSet::new();
+    read_object_poses_cached(source, scene, object_ids, t, &mut validated)
+}
+
+/// [`read_object_poses`] with the per-reader validation cache used by [`crate::SceneReader`].
+///
+/// The cache stores one record offset per validated track, never samples or payload bytes.
+/// It is therefore bounded by the already-framed Object Track ranges while avoiding a
+/// second full-order scan when a caller seeks to another instant.
+pub(crate) fn read_object_poses_cached<R: Readable + ?Sized>(
+    source: &mut R,
+    scene: &IndexedScene,
+    object_ids: &HashSet<u32>,
+    t: f64,
+    validated: &mut HashSet<u64>,
 ) -> Result<HashMap<u32, crate::provenance::Pose>> {
     let mut out = HashMap::with_capacity(object_ids.len().min(scene.object_track_ranges.len()));
     let mut seen = HashMap::with_capacity(scene.object_track_ranges.len());
@@ -702,9 +720,12 @@ pub fn read_object_poses<R: Readable + ?Sized>(
         if !object_ids.contains(&range.object_id) {
             continue;
         }
-        let Some(pose) = sample_object_track(source, range, t)? else {
+        let needs_validation = !validated.contains(&range.record_offset);
+        let Some(pose) = sample_object_track(source, range, t, needs_validation)? else {
+            validated.insert(range.record_offset);
             continue;
         };
+        validated.insert(range.record_offset);
         out.insert(range.object_id, pose);
     }
     Ok(out)
@@ -720,6 +741,7 @@ fn sample_object_track<R: Readable + ?Sized>(
     source: &mut R,
     range: &ObjectTrackRange,
     t: f64,
+    validate_times: bool,
 ) -> Result<Option<crate::provenance::Pose>> {
     crate::provenance::check_scene_time(t)?;
     if range.object_id == crate::object_layer::BACKGROUND {
@@ -742,32 +764,32 @@ fn sample_object_track<R: Readable + ?Sized>(
     if count == 0 {
         return Ok(None);
     }
+    if validate_times {
+        validate_object_track_times(source, range)?;
+    }
 
     let first_time = read_object_time(source, range, 0)?;
-    let mut previous_time = first_time;
-    let mut bracket = None;
-    for sample in 1..count {
-        let sample_time = read_object_time(source, range, sample)?;
-        if sample_time <= previous_time {
-            return Err(Error::Malformed(format!(
-                "track for object {}: sample {sample} is at t={sample_time}, not after sample {} \
-                 at t={previous_time}; times must strictly increase (section 5.15.4)",
-                range.object_id,
-                sample - 1
-            )));
-        }
-        if bracket.is_none() && previous_time <= t && t < sample_time {
-            bracket = Some((sample - 1, previous_time, sample, sample_time));
-        }
-        previous_time = sample_time;
-    }
     if count == 1 || t <= first_time {
         return Ok(Some(read_object_sample(source, range, 0)?.pose));
     }
-    if t >= previous_time {
+    let last_time = read_object_time(source, range, count - 1)?;
+    if t >= last_time {
         return Ok(Some(read_object_sample(source, range, count - 1)?.pose));
     }
-    let (lo, lo_time, hi, hi_time) = bracket.expect("a finite t inside validated endpoints");
+
+    let (mut lo, mut hi) = (0usize, count - 1);
+    let (mut lo_time, mut hi_time) = (first_time, last_time);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        let mid_time = read_object_time(source, range, mid)?;
+        if mid_time <= t {
+            lo = mid;
+            lo_time = mid_time;
+        } else {
+            hi = mid;
+            hi_time = mid_time;
+        }
+    }
 
     let a = read_object_sample(source, range, lo)?;
     if range.interpolation == rec::TRAJECTORY_STEP {
@@ -792,6 +814,51 @@ fn sample_object_track<R: Readable + ?Sized>(
     }))
 }
 
+fn validate_object_track_times<R: Readable + ?Sized>(
+    source: &mut R,
+    range: &ObjectTrackRange,
+) -> Result<()> {
+    let count = range.sample_count as usize;
+    if count == 0 {
+        return Ok(());
+    }
+    let samples_per_block =
+        (OBJECT_TRACK_VALIDATION_BLOCK_BYTES / OBJECT_TRACK_SAMPLE_BYTES) as usize;
+    let mut previous = None;
+    for first in (0..count).step_by(samples_per_block) {
+        let block_samples = samples_per_block.min(count - first);
+        let offset = object_sample_offset(range, first)?;
+        let length = u64::try_from(block_samples)
+            .ok()
+            .and_then(|samples| samples.checked_mul(OBJECT_TRACK_SAMPLE_BYTES))
+            .ok_or_else(|| {
+                Error::Malformed(format!(
+                    "validation block length overflows for ObjectTrack {} at sample {first}",
+                    range.object_id
+                ))
+            })?;
+        let bytes = source.read(offset, length)?;
+        for local in 0..block_samples {
+            let sample = first + local;
+            let at = local * OBJECT_TRACK_SAMPLE_BYTES as usize;
+            let time = Cursor::new(&bytes[at..]).f64()?;
+            let time = check_object_time(range, sample, time)?;
+            if let Some(previous_time) = previous {
+                if time <= previous_time {
+                    return Err(Error::Malformed(format!(
+                        "track for object {}: sample {sample} is at t={time}, not after sample {} \
+                         at t={previous_time}; times must strictly increase (section 5.15.4)",
+                        range.object_id,
+                        sample - 1
+                    )));
+                }
+            }
+            previous = Some(time);
+        }
+    }
+    Ok(())
+}
+
 fn read_object_time<R: Readable + ?Sized>(
     source: &mut R,
     range: &ObjectTrackRange,
@@ -800,6 +867,10 @@ fn read_object_time<R: Readable + ?Sized>(
     let offset = object_sample_offset(range, sample)?;
     let bytes = source.read(offset, 8)?;
     let time = Cursor::new(&bytes).f64()?;
+    check_object_time(range, sample, time)
+}
+
+fn check_object_time(range: &ObjectTrackRange, sample: usize, time: f64) -> Result<f64> {
     if !time.is_finite() {
         return Err(Error::Malformed(format!(
             "track for object {}: sample {sample} has a non-finite time ({time})",
@@ -1115,7 +1186,7 @@ mod tests {
             content_offset: 0,
         };
         let mut source = BytesReadable::new(&bytes);
-        let error = sample_object_track(&mut source, &range, 0.7).unwrap_err();
+        let error = sample_object_track(&mut source, &range, 0.7, true).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("sample 2"), "{message}");
         assert!(message.contains("sample 1"), "{message}");
@@ -1134,7 +1205,7 @@ mod tests {
             content_offset: 0,
         };
         let mut source = BytesReadable::new(&bytes);
-        let error = sample_object_track(&mut source, &range, f64::NAN).unwrap_err();
+        let error = sample_object_track(&mut source, &range, f64::NAN, true).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("scene query time is NaN"), "{message}");
         assert!(message.contains("expected a finite value"), "{message}");

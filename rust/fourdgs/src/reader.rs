@@ -68,6 +68,10 @@ pub struct SceneReader<R: Readable> {
     /// Poses sampled for exactly one indexed instant. Replaced on the next distinct seek,
     /// so memory is bounded by the objects referenced by the resident gaussian state.
     sampled_object_poses: Option<SampledObjectPoses>,
+    /// Record offsets whose complete Object Track time order has been checked. One integer
+    /// per framed track, never samples; this keeps later seeks logarithmic without making
+    /// the one-instant pose cache unbounded.
+    validated_object_tracks: HashSet<u64>,
 }
 
 /// The front-matter records a caller asked for, once they have been fetched.
@@ -122,6 +126,7 @@ impl<R: Readable> SceneReader<R> {
                 records: None,
                 objects: None,
                 sampled_object_poses: None,
+                validated_object_tracks: HashSet::new(),
             });
         }
         let scene = stream_reader::read_from(
@@ -140,6 +145,7 @@ impl<R: Readable> SceneReader<R> {
             records: None,
             objects: None,
             sampled_object_poses: None,
+            validated_object_tracks: HashSet::new(),
         })
     }
 
@@ -574,8 +580,13 @@ impl<R: Readable> SceneReader<R> {
                 });
                 if !cache_matches {
                     let scene = self.indexed.as_ref().expect("indexed path");
-                    let poses =
-                        indexed_reader::read_object_poses(&mut self.source, scene, &referenced, t)?;
+                    let poses = indexed_reader::read_object_poses_cached(
+                        &mut self.source,
+                        scene,
+                        &referenced,
+                        t,
+                        &mut self.validated_object_tracks,
+                    )?;
                     self.sampled_object_poses = Some(SampledObjectPoses {
                         t_bits: t.to_bits(),
                         max_sh_band,

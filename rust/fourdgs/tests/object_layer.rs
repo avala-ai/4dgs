@@ -632,9 +632,9 @@ fn indexed_state_range_samples_and_caches_only_referenced_object_poses() {
         "the visible object's samples are fetched: {state_reads:?}"
     );
     assert!(
-        track7_reads.iter().map(|range| range.1).sum::<u64>() <= 2 * 64 + 2 * 8,
-        "a two-sample track needs only two time probes and two fixed-width samples: \
-         {track7_reads:?}"
+        track7_reads.iter().map(|range| range.1).sum::<u64>() <= 2 * 64 + 2 * 8 + 2 * 64,
+        "a two-sample track needs one bounded validation block, two time probes, and two \
+         fixed-width samples: {track7_reads:?}"
     );
     assert!(
         !track7_reads.contains(&track7_range),
@@ -698,9 +698,13 @@ fn indexed_state_range_samples_long_tracks_and_keeps_only_one_instant() {
         .collect();
     let transferred = track_reads.iter().map(|range| range.1).sum::<u64>();
     assert!(
-        transferred <= 4096 * 8 + 2 * 64,
-        "4096 samples should cost each time plus two poses, got {transferred} bytes in \
-         {track_reads:?}"
+        transferred <= 4096 * 64 + 14 * 8 + 2 * 64,
+        "4096 samples should cost four contiguous validation blocks, logarithmic time \
+         probes, and two poses, got {transferred} bytes in {track_reads:?}"
+    );
+    assert!(
+        track_reads.len() <= 20,
+        "validation must be coalesced rather than one request per timestamp: {track_reads:?}"
     );
     assert!(
         !track_reads.contains(&track_range),
@@ -716,7 +720,20 @@ fn indexed_state_range_samples_long_tracks_and_keeps_only_one_instant() {
         "the current gaussian state and sampled poses are cached"
     );
 
+    reads.borrow_mut().clear();
     reader.state_at(1024.5, 0).expect("seek to another instant");
+    let next_reads: Vec<ByteRange> = reads
+        .borrow()
+        .iter()
+        .copied()
+        .filter(|range| overlaps(*range, track_range))
+        .collect();
+    let next_transferred = next_reads.iter().map(|range| range.1).sum::<u64>();
+    assert!(
+        next_transferred <= 14 * 8 + 2 * 64,
+        "a validated track should need only logarithmic probes and two poses at the next \
+         instant, got {next_transferred} bytes in {next_reads:?}"
+    );
     reads.borrow_mut().clear();
     reader
         .state_at(2048.5, 0)
