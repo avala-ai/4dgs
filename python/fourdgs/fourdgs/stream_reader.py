@@ -67,7 +67,7 @@ class Scene:
     #: carried none, which is the common case and not an error: absence costs nothing
     #: and no Header flag announces the family, so this is filled by the walk itself.
     provenance: Provenance = field(default_factory=Provenance)
-    #: The object layer the file carried (spec section 5.15.6): the Object Table and the
+    #: The object layer the file carried (spec sections 5.15.6-5.15.7): the Object Table and the
     #: SE(3) tracks. Empty when the file names no objects, which is the common case and
     #: not an error, exactly as with provenance.
     objects: ObjectLayer = field(default_factory=ObjectLayer)
@@ -80,6 +80,24 @@ class Scene:
     #: test can prove they were skipped rather than tripped over.
     skipped_opcodes: list[int] = field(default_factory=list)
     truncated: bool = False
+
+    def state_at(self, t: float) -> dict:
+        """Reconstruct gaussian state at `t`, including authoritative object tracks.
+
+        The temporal model produces the base centers and orientations first. The matching
+        Object Track is then applied exactly once, which is the normative order in spec
+        section 3. Decoding ends at the returned gaussian state.
+        """
+        state = self.gaussians.state_at(t, self.header.cutoff)
+        centers, orientations = self.objects.apply(
+            centers=state["centers"],
+            orientations=state["orientations"],
+            object_ids=state["object_id"],
+            t=t,
+        )
+        state["centers"] = centers
+        state["orientations"] = orientations
+        return state
 
 
 def steps_from(q: rec.Quantization) -> Steps:

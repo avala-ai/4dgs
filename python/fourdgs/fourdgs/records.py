@@ -12,6 +12,7 @@ nobody remembers.
 from __future__ import annotations
 
 import math
+import operator
 from dataclasses import dataclass, field
 
 from . import opcode as op
@@ -967,10 +968,23 @@ class ObjectTable:
                 label=c.string(),
                 anchor=tuple(c.f32s(3)),  # type: ignore[arg-type]
             )
-            if c.u8():
+            dynamics_present = c.u8()
+            if dynamics_present not in (0, 1):
+                raise MalformedFile(
+                    f"object {entry.object_id}: dynamics_present is {dynamics_present}, expected 0 or 1",
+                    code="invalid-object-presence-flag",
+                )
+            if dynamics_present:
                 entry.dynamics = (c.f32s(3), c.f32s(3), c.f32s(3))
-            if table.embedding_dim > 0 and c.u8():
-                entry.embedding = c.f32s(table.embedding_dim)
+            if table.embedding_dim > 0:
+                has_embedding = c.u8()
+                if has_embedding not in (0, 1):
+                    raise MalformedFile(
+                        f"object {entry.object_id}: has_embedding is {has_embedding}, expected 0 or 1",
+                        code="invalid-object-presence-flag",
+                    )
+                if has_embedding:
+                    entry.embedding = c.f32s(table.embedding_dim)
             table.entries.append(entry)
         table.check()
         return table
@@ -985,6 +999,15 @@ class ObjectTable:
         """
         seen: set[int] = set()
         for e in self.entries:
+            try:
+                object_id = operator.index(e.object_id)
+            except TypeError:
+                object_id = -1
+            if not 0 <= object_id <= 0xFFFF_FFFF:
+                raise MalformedFile(
+                    f"ObjectTable entry has object_id {e.object_id!r}; expected an integer in [0, 4294967295]",
+                    code="invalid-object-id",
+                )
             if e.object_id in seen:
                 raise MalformedFile(
                     f"two ObjectTable entries describe object {e.object_id}; an object is referred to "
@@ -1071,10 +1094,19 @@ class ObjectTrack:
         rules are section 5.15.4's, for the same reasons: a repeated timestamp makes an
         interval ambiguous and a zero-norm quaternion is not a rotation.
         """
+        try:
+            object_id = operator.index(self.object_id)
+        except TypeError:
+            object_id = -1
+        if not 0 <= object_id <= 0xFFFF_FFFF:
+            raise MalformedFile(
+                f"ObjectTrack has object_id {self.object_id!r}; expected an integer in [0, 4294967295]",
+                code="invalid-object-id",
+            )
         if self.object_id == 0:
             raise MalformedFile(
                 "an ObjectTrack names object 0, which is background/unassigned; a track needs an object "
-                "to move (section 5.15.6)",
+                "to move (section 5.15.7)",
                 code="track-names-background",
             )
         if len(self.rotations) != self.sample_count or len(self.translations) != self.sample_count:

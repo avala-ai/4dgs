@@ -82,7 +82,7 @@ class WriteOptions:
     #: the default and costs nothing — no record, no placeholder, no Header flag. A
     #: scene with no sensors behind it is a complete file, not an under-specified one.
     provenance: Provenance | None = None
-    #: The object layer to emit (spec section 5.15.6): the Object Table and the SE(3)
+    #: The object layer to emit (spec sections 5.15.6-5.15.7): the Object Table and the SE(3)
     #: tracks. `None` writes neither, the default. The per-gaussian `object_id` stream is
     #: written whenever the `GaussianSet` carries one, independently of this — a file may
     #: group gaussians without naming the groups.
@@ -276,6 +276,14 @@ def _check_finite_input(g: GaussianSet) -> None:
 
 def _encode(g: GaussianSet, duration_sec, opts, audio, camera) -> bytes:
     _check_finite_input(g)
+    if opts.scene_profile == "objects":
+        if g.object_id is None:
+            raise InvalidInput(
+                "the objects profile requires an object_id stream in every non-empty chunk, "
+                "but the GaussianSet carries none"
+            )
+        if opts.objects is None or opts.objects.table is None:
+            raise InvalidInput("the objects profile requires one ObjectTable record, but none was supplied")
     n = g.count
     median_scale = float(np.median(g.scales)) if n else 1e-3
     bounds = Bounds.for_profile(opts.profile, median_scale=median_scale)

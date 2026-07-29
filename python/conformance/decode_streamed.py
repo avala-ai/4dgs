@@ -45,6 +45,7 @@ def run(path: str) -> str:
             summary_offsets=scene.summary_offsets,
             summary_crc_ok=scene.summary_crc_ok,
             provenance=scene.provenance,
+            objects=scene.objects,
         )
     )
 

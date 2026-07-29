@@ -18,7 +18,7 @@ import fourdgs
 import numpy as np
 import pytest
 from fourdgs import records as rec
-from fourdgs.exceptions import MalformedFile
+from fourdgs.exceptions import InvalidInput, MalformedFile
 from fourdgs.indexed_reader import open_indexed, read_chunk, read_objects, read_provenance
 from fourdgs.object_layer import ObjectLayer
 from fourdgs.readable import BytesReadable
@@ -180,6 +180,16 @@ def test_interleaved_objects_are_grouped_without_losing_row_order():
 # --------------------------------------------------------------------------
 
 
+def _parse_object_table_with_presence_flag(*, embedding_dim: int, offset: int, value: int):
+    encoded = rec.ObjectTable(
+        embedding_dim=embedding_dim,
+        entries=[rec.ObjectTableEntry(object_id=7)],
+    ).encode()
+    content = bytearray(encoded[9:])
+    content[offset] = value
+    return rec.ObjectTable.parse(content)
+
+
 @pytest.mark.parametrize(
     ("build", "code"),
     [
@@ -188,6 +198,14 @@ def test_interleaved_objects_are_grouped_without_losing_row_order():
                 entries=[rec.ObjectTableEntry(object_id=7), rec.ObjectTableEntry(object_id=7)]
             ).check(),
             "duplicate-object-id",
+        ),
+        (
+            lambda: rec.ObjectTable(entries=[rec.ObjectTableEntry(object_id=-1)]).check(),
+            "invalid-object-id",
+        ),
+        (
+            lambda: rec.ObjectTable(entries=[rec.ObjectTableEntry(object_id=2**32)]).check(),
+            "invalid-object-id",
         ),
         (
             lambda: rec.ObjectTable(
@@ -206,6 +224,14 @@ def test_interleaved_objects_are_grouped_without_losing_row_order():
                 object_id=0, times=[0.0], rotations=[Q_IDENTITY], translations=[[0.0, 0.0, 0.0]]
             ).check(),
             "track-names-background",
+        ),
+        (
+            lambda: rec.ObjectTrack(object_id=-1).check(),
+            "invalid-object-id",
+        ),
+        (
+            lambda: rec.ObjectTrack(object_id=2**32).check(),
+            "invalid-object-id",
         ),
         (
             lambda: rec.ObjectTrack(
@@ -248,6 +274,14 @@ def test_interleaved_objects_are_grouped_without_losing_row_order():
                 ]
             ).check(),
             "duplicate-object-track",
+        ),
+        (
+            lambda: _parse_object_table_with_presence_flag(embedding_dim=0, offset=26, value=2),
+            "invalid-object-presence-flag",
+        ),
+        (
+            lambda: _parse_object_table_with_presence_flag(embedding_dim=1, offset=27, value=2),
+            "invalid-object-presence-flag",
         ),
     ],
 )
@@ -317,6 +351,21 @@ def test_object_id_and_records_round_trip_through_a_file():
     assert out.objects.track(7) is not None
 
 
+def test_objects_profile_enforces_its_membership_and_table_promises():
+    scene = _scene_with_objects()
+    with pytest.raises(InvalidInput, match="ObjectTable"):
+        fourdgs.write(io.BytesIO(), scene, 6.0, options=fourdgs.WriteOptions(scene_profile="objects"))
+
+    scene.object_id = None
+    with pytest.raises(InvalidInput, match="object_id"):
+        fourdgs.write(
+            io.BytesIO(),
+            scene,
+            6.0,
+            options=fourdgs.WriteOptions(scene_profile="objects", objects=_layer()),
+        )
+
+
 def test_object_id_round_trips_the_complete_u32_domain():
     scene = _scene_with_objects(4)
     scene.object_id = np.array([0, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFF], dtype=np.uint32)
@@ -349,6 +398,14 @@ def test_composition_moves_the_tracked_object_in_a_real_file():
     # The tracked gaussians are displaced by +100 in x; the background is untouched.
     assert np.allclose(moved[is_object, 0], base[is_object, 0] + 100.0, atol=1e-3)
     assert np.allclose(moved[~is_object], base[~is_object])
+
+    state = out.state_at(3.0)
+    rows = state["indices"]
+    tracked = g.object_id[rows] == 7
+    assert np.allclose(state["centers"][tracked, 0], base[rows][tracked, 0] + 100.0, atol=1e-3)
+    assert np.allclose(state["centers"][~tracked], base[rows][~tracked], atol=1e-3)
+    assert state["orientations"].shape == (rows.size, 4)
+    assert np.array_equal(state["object_id"], g.object_id[rows])
 
 
 def test_indexed_reader_reads_the_object_layer():

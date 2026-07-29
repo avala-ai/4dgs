@@ -60,7 +60,7 @@ class GaussianSet:
     sh_degree: int = 0
     source_group: np.ndarray | None = None
     source_index: np.ndarray | None = None
-    #: Per-gaussian object membership (spec section 5.15.6), or `None` when the file
+    #: Per-gaussian object membership (spec section 6.6), or `None` when the file
     #: carries no `object_id` stream. Exact integers, `0` = background/unassigned; the
     #: object layer's tracks transform the gaussians of a given id (see `object_layer`).
     object_id: np.ndarray | None = None
@@ -111,7 +111,13 @@ class GaussianSet:
         return {
             "indices": idx,
             "centers": centers,
+            "orientations": self.rotations[idx].astype(np.float64),
             "opacity": self.colors[idx, 3].astype(np.float64) * marginal[idx],
+            "object_id": (
+                np.zeros(idx.size, dtype=np.uint32)
+                if self.object_id is None
+                else np.asarray(self.object_id, dtype=np.uint32).reshape(-1)[idx]
+            ),
         }
 
 

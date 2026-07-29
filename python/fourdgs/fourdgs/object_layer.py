@@ -7,7 +7,7 @@
 spans more than one record — that at most one track moves any object.
 
 The layer changes a reconstructed instant in exactly one way, and it is the load-bearing
-rule of the whole design (spec section 5.15.6):
+rule of the whole design (spec sections 3 and 6.6):
 
     A track transforms the base state; it does not replace it.
 
@@ -76,7 +76,7 @@ class ObjectLayer:
             if t.object_id in seen:
                 raise MalformedFile(
                     f"two ObjectTrack records move object {t.object_id}; a gaussian has one object "
-                    f"and cannot be transported by two poses (section 5.15.6)",
+                    f"and cannot be transported by two poses (section 5.15.7)",
                     code="duplicate-object-track",
                 )
             seen.add(t.object_id)

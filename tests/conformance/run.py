@@ -111,10 +111,11 @@ REFUSAL_FAMILIES = frozenset({"python"})
 #: their summaries would omit a key the expectation carries, and a diff cannot tell that
 #: apart from a decoder that got it wrong.
 FAMILY_DECLINES: dict[str, tuple[str, ...]] = {
-    "typescript": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig"),
-    "cpp": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig"),
-    "swift": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig"),
-    "dart": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig"),
+    "typescript": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig", "WithObjects"),
+    "cpp": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig", "WithObjects"),
+    "rust": ("WithObjects",),
+    "swift": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig", "WithObjects"),
+    "dart": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig", "WithObjects"),
 }
 
 

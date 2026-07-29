@@ -1,16 +1,14 @@
 # Proposal: the object layer — per-gaussian objects, labels and rigid tracks
 
-**Status: accepted design. Not yet normative, not yet implemented, and not to be emitted by any
-writer.** Nothing in this document changes what a conforming file looks like today. It is the
-approved design, written at wire precision, and it becomes a revision of
-[the specification](../index.md) and a set of entries in [the registry](../registry.md) as the
-implementation lands. Until it does, the specification is the format and this is a plan.
+**Status: adopted.** The normative wire and reconstruction rules are now in
+[the specification](../index.md), the assigned values are in [the registry](../registry.md), and the
+Python reference plus conformance corpus implement them. This document remains the design rationale
+and records the decisions behind those shorter normative sections; where wording differs, the
+specification is authoritative.
 
 Every question this design left open has been decided; the decisions are recorded in §12 and folded
-into the sections they affect, so no section contradicts a ruling. Implementation follows the
-keyframe-delta sequence — normative spec move and changelog, the Python reference then the Rust
-production codec, the corpus of §10, the canonical shape, and the feature-matrix rows moved only by
-a passing suite.
+into the normative text. The Rust production codec follows the normative Python reference, and
+feature-matrix rows move only when the public suite proves them.
 
 Unlike keyframe-delta, this layer is **not a temporal model**. It composes with either of the two
 that exist — `gaussian-birth` today, `keyframe-delta` once it lands — and adds nothing to the
@@ -869,21 +867,12 @@ Named so the boundary is a decision rather than an omission, in the shape spec �
 
 ## 14. Implementation sequence
 
-The same sequence keyframe-delta followed, and for the same reasons.
+The sequence is now an audit trail:
 
-1. **Re-verify the opcode table against `main`** (§12.6) before a single byte is written. `0x24` and
-   `0x25` are expected free, but the opcode space is under contention and the check is the point.
-2. **The normative move.** The specification text leaves `proposals/` and enters the normative
-   document with a changelog row of the kind §5.15's rows already are — additive, changing no
-   existing file, since the layer is optional and no writer has emitted it. The registry gains
-   attribute id `14`, opcodes `0x24`/`0x25`, the shared object-track interpolation row, the
-   `object_track_role` key and the `objects` profile.
-3. **The reference then the production codec.** The Python reference implements decode and encode;
-   the Rust production codec follows. Composition (§3.4) is the load-bearing path and is written
-   from this document, not from the other implementation, so the §6 discipline of a reader built
-   from the text alone is kept.
-4. **The corpus.** The scenarios of §10.2, the refusal set of §10.3 (reusing keyframe-delta's
-   harness contract), and the post-transform `states` of §10.1, which are the only check that proves
-   §3.4's arithmetic rather than a file summary.
-5. **The feature matrix**, last. The rows of §10.4 start at `No` and move only when the public suite
-   proves them in CI — the rule the matrix has always had.
+1. `0x24`, `0x25` and attribute id `14` were re-verified free against `main`.
+2. The normative specification, changelog and registry entries landed together.
+3. The Python reference implements streamed and indexed decode, encode, and reconstruction.
+4. The public corpus carries membership, a table, an embedding, a moving track, and post-transform
+   states on both read paths.
+5. The feature matrix marks only Python `Yes`; Rust moves only after its runner passes the same
+   variant.

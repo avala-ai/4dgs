@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import math
+import struct
 import zlib
 
 FLOAT_DECIMALS = 6
@@ -85,6 +86,7 @@ def summarize(
     summary_offsets=(),
     summary_crc_ok=None,
     provenance=None,
+    objects=None,
 ) -> dict:
     """The statement every implementation must agree on for a variant."""
     n = gaussians.count
@@ -177,6 +179,11 @@ def summarize(
         # here is the section not applying; the thirty-four variants without it are the
         # assertion that a file without provenance is unchanged by the family existing.
         **({} if not provenance else {"provenance": _provenance(provenance)}),
+        **(
+            {}
+            if not objects and getattr(gaussians, "object_id", None) is None
+            else _objects_and_states(header, gaussians, objects, order)
+        ),
         "sh": _spherical_harmonics(gaussians, order),
         "sample": {
             "positions": rows(gaussians.positions, 3),
@@ -188,6 +195,11 @@ def summarize(
             "sigmaT": [num(gaussians.sigma_t[i]) for i in sample],
             "winLo": [num(gaussians.win_lo[i]) for i in sample],
             "winHi": [num(gaussians.win_hi[i]) for i in sample],
+            **(
+                {}
+                if getattr(gaussians, "object_id", None) is None
+                else {"objectIds": [str(int(gaussians.object_id[i])) for i in sample]}
+            ),
         },
         "aggregate": {
             "positionSum": [num(v) for v in total_pos],
@@ -195,6 +207,86 @@ def summarize(
             "neverFadesCount": str(never_fades),
             "zeroMotionCount": str(still),
         },
+    }
+
+
+def _objects_and_states(header, gaussians, objects, order) -> dict:
+    """Object records plus post-track gaussian states at three scene-clock probes.
+
+    Stored fields alone do not prove reconstruction. The states make the normative
+    base-then-track order visible, including orientation, while the canonical gaussian
+    order keeps the result independent of chunk and decoder order.
+    """
+    from fourdgs.object_layer import ObjectLayer
+    from fourdgs.provenance import pose_at
+
+    layer = objects if objects is not None else ObjectLayer()
+    table = layer.table
+    tracks = []
+    for track in layer.tracks:
+        probes = _probe_times(track)
+        tracks.append(
+            {
+                "objectId": str(track.object_id),
+                "interpolation": int(track.interpolation),
+                "sampleCount": str(track.sample_count),
+                "posesAt": [_pose_row(probe, pose_at(track, probe)) for probe in probes],
+            }
+        )
+
+    duration = max(0.0, float(header.duration_sec))
+    probe_times = [0.0, 0.5 * duration, max(0.0, duration - 1e-6)]
+    states = []
+    for t in probe_times:
+        base = gaussians.state_at(t, header.cutoff)
+        centers, orientations = layer.apply(
+            centers=base["centers"],
+            orientations=base["orientations"],
+            object_ids=base["object_id"],
+            t=t,
+        )
+        row_for_index = {int(index): row for row, index in enumerate(base["indices"])}
+        sample_indices = [index for index in order if index in row_for_index][:SAMPLE]
+        sample_rows = [row_for_index[index] for index in sample_indices]
+        states.append(
+            {
+                "t": num(t),
+                "liveCount": str(len(base["indices"])),
+                "sample": {
+                    "positions": [[num(value) for value in centers[row]] for row in sample_rows],
+                    "orientations": [[num(value) for value in orientations[row]] for row in sample_rows],
+                    "objectIds": [str(int(base["object_id"][row])) for row in sample_rows],
+                },
+                "aggregate": {
+                    "positionSum": [num(sum(float(row[axis]) for row in centers)) for axis in range(3)],
+                    "opacitySum": num(sum(float(value) for value in base["opacity"])),
+                },
+            }
+        )
+
+    entries = []
+    if table is not None:
+        for entry in table.entries:
+            embedding = entry.embedding
+            embedding_bytes = b"" if embedding is None else struct.pack(f"<{len(embedding)}f", *embedding)
+            entries.append(
+                {
+                    "objectId": str(entry.object_id),
+                    "label": entry.label,
+                    "anchor": [num(value) for value in entry.anchor],
+                    "hasDynamics": entry.dynamics is not None,
+                    "hasEmbedding": embedding is not None,
+                    "embeddingCrc": None if embedding is None else crc(embedding_bytes),
+                }
+            )
+
+    return {
+        "objects": {
+            "embeddingDim": 0 if table is None else int(table.embedding_dim),
+            "table": entries,
+            "tracks": tracks,
+        },
+        "states": states,
     }
 
 
@@ -390,6 +482,9 @@ def _stable_order(gaussians) -> list[int]:
         ]
         if sh is not None:
             row += [int(v) for v in sh[i]]
+        object_id = getattr(gaussians, "object_id", None)
+        if object_id is not None:
+            row.append(int(object_id[i]))
         keys.append((row, i))
     keys.sort(key=lambda k: k[0])
     return [k[1] for k in keys]

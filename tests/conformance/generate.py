@@ -40,6 +40,7 @@ import fourdgs
 import invalid
 import scenarios
 from canonical import canonical, summarize
+from fourdgs.object_layer import ObjectLayer
 from fourdgs.opcode import (
     COORDINATE_FRAME,
     GEODETIC_ANCHOR,
@@ -54,6 +55,9 @@ from fourdgs.records import (
     CoordinateFrame,
     GeodeticAnchor,
     Metadata,
+    ObjectTable,
+    ObjectTableEntry,
+    ObjectTrack,
     RigTrajectory,
     SensorCalibration,
 )
@@ -90,6 +94,7 @@ def build(scenario, flags, *, read_back: bool = True, **overrides) -> tuple[byte
         win_hi=np.asarray(raw["win_hi"], dtype=np.float32),
         sh=(np.arange(n * coeffs, dtype=np.int64) % 251).astype(np.uint8).reshape(n, coeffs) if coeffs else None,
         sh_degree=sh_degree,
+        object_id=(np.where(np.arange(n) % 3 == 0, 7, 0).astype(np.uint32) if "WithObjects" in flags else None),
     )
 
     audio = None
@@ -151,9 +156,10 @@ def build(scenario, flags, *, read_back: bool = True, **overrides) -> tuple[byte
         write_summary_offsets="UseSummaryOffset" in flags,
         write_crc="UseCrc" in flags,
         library="4dgs conformance generator",
-        scene_profile="baked" if scenario.long_lived else "capture",
+        scene_profile="objects" if "WithObjects" in flags else ("baked" if scenario.long_lived else "capture"),
         metadata={"scenario": scenario.name} if "WithMetadata" in flags else None,
         provenance=_provenance(scenarios.build_provenance(scenario, flags)),
+        objects=_objects(raw["duration_sec"]) if "WithObjects" in flags else None,
         extra_records=tuple(extra),
         record_trailers=trailers,
         cutoff=0.2 if "CustomCutoff" in flags else 0.05,
@@ -185,6 +191,7 @@ def build(scenario, flags, *, read_back: bool = True, **overrides) -> tuple[byte
             summary_offsets=scene.summary_offsets,
             summary_crc_ok=scene.summary_crc_ok,
             provenance=scene.provenance,
+            objects=scene.objects,
         )
     )
     return data, expectation
@@ -228,6 +235,32 @@ def _provenance(raw) -> Provenance | None:
     prov.trajectories = [RigTrajectory(**t) for t in raw["trajectories"]]
     prov.anchors = [GeodeticAnchor(**a) for a in raw["anchors"]]
     return prov
+
+
+def _objects(duration_sec: float) -> ObjectLayer:
+    """A labelled object whose rigid pose exercises interpolation and end clamping."""
+    return ObjectLayer(
+        table=ObjectTable(
+            embedding_dim=4,
+            entries=[
+                ObjectTableEntry(
+                    object_id=7,
+                    label="synthetic vehicle",
+                    anchor=(1.0, -2.0, 0.5),
+                    dynamics=([2.0, 0.0, 0.0], [0.0, 0.0, 0.5], [0.0, 0.0, 0.0]),
+                    embedding=[0.25, -0.5, 0.75, 1.0],
+                )
+            ],
+        ),
+        tracks=[
+            ObjectTrack(
+                object_id=7,
+                times=[1.0, duration_sec - 1.0],
+                rotations=[[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 0.0]],
+                translations=[[0.0, 0.0, 0.0], [10.0, 4.0, 0.0]],
+            )
+        ],
+    )
 
 
 def write_corpus(target: str) -> dict[str, str]:

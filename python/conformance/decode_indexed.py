@@ -30,6 +30,7 @@ from fourdgs.indexed_reader import (
     read_camera,
     read_chunk,
     read_metadata,
+    read_objects,
     read_provenance,
 )
 from fourdgs.readable import FileReadable
@@ -91,12 +92,24 @@ def run(path: str) -> str:
         # Framed at open, fetched here — the same contract the camera and the
         # attachments have, and the reason no Header flag announces the family.
         provenance = read_provenance(source, scene)
+        objects = read_objects(source, scene)
         _check_band_skipping(source, scene)
 
     table = np.asarray(scene.windows, dtype=np.float64).reshape(-1, 2) if scene.windows else np.zeros((1, 2))
     if chunks:
         idx = np.clip(np.concatenate([c["window_index"] for c in chunks]), 0, max(len(table) - 1, 0))
         sh = _merge_sh(chunks, scene.header.sh_degree)
+        object_chunks = [chunk.get("object_id") for chunk in chunks]
+        object_id = (
+            np.concatenate(
+                [
+                    np.zeros(len(chunk["mu_t"]), dtype=np.uint32) if ids is None else ids
+                    for chunk, ids in zip(chunks, object_chunks, strict=True)
+                ]
+            )
+            if any(ids is not None for ids in object_chunks)
+            else None
+        )
         gaussians = fourdgs.GaussianSet(
             positions=np.concatenate([c["positions"] for c in chunks]).astype(np.float32),
             scales=np.concatenate([c["scales"] for c in chunks]).astype(np.float32),
@@ -109,6 +122,7 @@ def run(path: str) -> str:
             win_hi=table[idx, 1].astype(np.float32),
             sh=sh,
             sh_degree=scene.header.sh_degree,
+            object_id=object_id,
         )
     else:
         z3 = np.zeros((0, 3), dtype=np.float32)
@@ -141,6 +155,7 @@ def run(path: str) -> str:
             summary_offsets=scene.summary_offsets,
             summary_crc_ok=scene.summary_crc_ok,
             provenance=provenance,
+            objects=objects,
         )
     )
 
