@@ -42,6 +42,10 @@ words:
   - extrinsics
   - intrinsics
   - georeference
+  - georeferenced
+  - geodetic
+  - ellipsoid
+  - WGS
   - logit
   - coef
   - Shortley
@@ -56,6 +60,29 @@ words:
   - Avala
   - bibtex
   - ctest
+  # Provenance vocabulary (spec section 5.15): camera-distortion model names, the
+  # interpolation verbs, and the record family's own terms
+  - Conrady
+  - conrady
+  - Kannala
+  - kannala
+  - Brandt
+  - equidistant
+  - undistort
+  - undistorted
+  - undistorting
+  - lerp
+  - lerped
+  - lerps
+  - slerp
+  - slerped
+  - slerps
+  - unemitted
+  - unchunked
+  - lidar
+  - radar
+  - extrinsic
+  - intrinsic
   # Rust and C toolchain vocabulary
   - capi
   - libfourdgs

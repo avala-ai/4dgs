@@ -11,9 +11,11 @@ nobody remembers.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 from . import opcode as op
+from .exceptions import MalformedFile
 from .serialization import (
     Cursor,
     put_blob,
@@ -366,3 +368,364 @@ class SummaryOffset:
     def parse(content) -> SummaryOffset:
         c = Cursor(content)
         return SummaryOffset(group_opcode=c.u8(), group_start=c.u64(), group_length=c.u64())
+
+
+# --------------------------------------------------------------------------
+# Provenance family (spec section 5.15)
+#
+# Three optional records, none of them announced by a Header flag. Absence is the
+# common case and costs nothing: a scene with no provenance carries no record, no
+# placeholder and no reserved bytes, exactly as a scene without audio does.
+#
+# What `parse` refuses here is narrower than what a validator reports. A parse
+# refuses only the structurally impossible — a basis that is not a basis, a
+# quaternion with no direction, timestamps that make an interval ambiguous —
+# because those are values no consumer can do anything sensible with. A value that
+# is merely unrecognized (a modality this build has not heard of, a camera model it
+# cannot project with) survives parsing and reaches the caller raw, which is the
+# distinction between "malformed" and "from a newer registry" that the caller needs
+# in order to react differently to the two.
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class CoordinateFrame:
+    """The frame the file's own coordinates are expressed in. Opcode 0x20.
+
+    A **fixed shape**: every field is always present, so a reader that knows these
+    six knows exactly where an appended seventh would begin. The georeference is a
+    separate record (`GeodeticAnchor`, 0x23) for that reason — a conditional block
+    inside a record makes the offset of everything after it depend on a value, and
+    the format already has an idiom for optional-with-zero-cost-absence: a record
+    that is not there.
+
+    This supersedes the free-form `coordinate_system` metadata key: where a file
+    carries both, the record wins in whole and a reader must not merge them (spec
+    section 5.15.2). Merging is the tempting move and the wrong one — the key names
+    one entire convention, so half of it cannot be true.
+    """
+
+    name: str = ""
+    handedness: int = 0
+    up_axis: int = 0
+    forward_axis: int = 0
+    length_unit: int = 0
+    metres_per_unit: float = 0.0
+
+    def encode(self, trailer: bytes = b"") -> bytes:
+        body = (
+            put_string(self.name)
+            + put_u8(self.handedness)
+            + put_u8(self.up_axis)
+            + put_u8(self.forward_axis)
+            + put_u8(self.length_unit)
+            + put_f64(self.metres_per_unit)
+        )
+        return put_record(op.COORDINATE_FRAME, body + trailer)
+
+    @staticmethod
+    def parse(content) -> CoordinateFrame:
+        c = Cursor(content)
+        frame = CoordinateFrame(
+            name=c.string(),
+            handedness=c.u8(),
+            up_axis=c.u8(),
+            forward_axis=c.u8(),
+            length_unit=c.u8(),
+            metres_per_unit=c.f64(),
+        )
+        frame.check()
+        return frame
+
+    def check(self) -> None:
+        """Refuse a frame that is not one, rather than repair it.
+
+        The reasoning is section 5.4's, about window indices: a degenerate basis does
+        not announce itself. It silently re-orients everything a consumer derives from
+        it, and a reader that guessed the missing axis would turn a detectable fault
+        into plausible wrong output.
+        """
+        for name, axis in (("up_axis", self.up_axis), ("forward_axis", self.forward_axis)):
+            if axis > 5:
+                raise MalformedFile(f"CoordinateFrame {name} is {axis}; the registry defines 0..5 (section 5.15.2)")
+        if self.up_axis % 3 == self.forward_axis % 3:
+            raise MalformedFile(
+                f"CoordinateFrame up_axis {self.up_axis} and forward_axis {self.forward_axis} "
+                "name the same axis; a frame needs two different ones (section 5.15.2)"
+            )
+        if not math.isfinite(self.metres_per_unit) or self.metres_per_unit < 0.0:
+            raise MalformedFile(
+                f"CoordinateFrame metres_per_unit is {self.metres_per_unit}; "
+                "it must be finite and not negative (section 5.15.2)"
+            )
+
+
+@dataclass
+class GeodeticAnchor:
+    """Where a frame's origin sits on the WGS-84 ellipsoid, and which way it faces.
+
+    Opcode 0x23, and its own record rather than a tail on the Coordinate Frame: a
+    scene with no georeference carries no anchor, which costs nothing and keeps
+    every record in the format one shape (spec section 5.15.5).
+
+    It answers "roughly where on Earth is this" and stops. A producer needing a
+    projected coordinate system, a geoid model or a datum other than WGS-84 puts it
+    in metadata or an attachment; growing this record into a geodetic library is how
+    a container format stops being one.
+    """
+
+    frame_name: str = ""
+    latitude_deg: float = 0.0
+    longitude_deg: float = 0.0
+    altitude_m: float = 0.0
+    heading_deg: float = 0.0
+
+    def encode(self, trailer: bytes = b"") -> bytes:
+        body = put_string(self.frame_name) + put_f64s(
+            [self.latitude_deg, self.longitude_deg, self.altitude_m, self.heading_deg]
+        )
+        return put_record(op.GEODETIC_ANCHOR, body + trailer)
+
+    @staticmethod
+    def parse(content) -> GeodeticAnchor:
+        c = Cursor(content)
+        frame_name = c.string()
+        values = c.f64s(4)
+        anchor = GeodeticAnchor(
+            frame_name=frame_name,
+            latitude_deg=values[0],
+            longitude_deg=values[1],
+            altitude_m=values[2],
+            heading_deg=values[3],
+        )
+        anchor.check()
+        return anchor
+
+    def check(self) -> None:
+        """Refuse an out-of-range angle rather than wrap it.
+
+        Unlike the unit disagreement in `CoordinateFrame`, there is no second field
+        to fall back on here: a latitude of 130 degrees has no reading that is merely
+        approximate, and normalizing it would invent a location.
+        """
+        for label, value, lo, hi in (
+            ("latitude_deg", self.latitude_deg, -90.0, 90.0),
+            ("longitude_deg", self.longitude_deg, -180.0, 180.0),
+            ("altitude_m", self.altitude_m, -math.inf, math.inf),
+            ("heading_deg", self.heading_deg, 0.0, 360.0),
+        ):
+            if not math.isfinite(value):
+                raise MalformedFile(f"GeodeticAnchor {label} is {value}; every field must be finite")
+            if not lo <= value <= hi or (label == "heading_deg" and value == 360.0):
+                raise MalformedFile(f"GeodeticAnchor {label} is {value}, outside its legal range (section 5.15.5)")
+
+
+#: Coefficient counts each camera model defines, keyed by its registry id. A model
+#: absent from here is one this build does not know, which is not the same as one
+#: that is wrong: `None` means "ask the caller", not "refuse".
+CAMERA_MODEL_COEFFICIENTS: dict[int, tuple[int, ...]] = {
+    0: (0,),  # none — the sensor is not a camera
+    1: (0,),  # pinhole
+    2: (5, 8),  # brown-conrady, plain or rational
+    3: (4,),  # kannala-brandt
+}
+
+CAMERA_MODEL_NONE = 0
+POSE_TO_SCENE = 0
+POSE_TO_RIG = 1
+
+
+@dataclass
+class SensorCalibration:
+    """One sensor's intrinsics and extrinsics. Opcode 0x21, one record per sensor.
+
+    One record each rather than one record listing all of them, which is the shape
+    the rest of the format already uses for anything there can be several of: a
+    consumer that wants one sensor fetches one record's byte range.
+
+    The extrinsic maps sensor coordinates into the frame `pose_reference` names,
+    in that direction: `p_target = R(rotation) * p_sensor + translation`. The
+    opposite convention is equally common in the field, which is why the direction
+    is written down in both the specification and here — a consumer that assumes
+    wrongly gets a scene that is merely mis-placed rather than one that fails.
+    """
+
+    name: str
+    modality: str = ""
+    camera_model: int = CAMERA_MODEL_NONE
+    width_px: int = 0
+    height_px: int = 0
+    fx: float = 0.0
+    fy: float = 0.0
+    cx: float = 0.0
+    cy: float = 0.0
+    distortion: list[float] = field(default_factory=list)
+    rotation: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0, 1.0])
+    translation: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    pose_reference: int = POSE_TO_SCENE
+    rig_name: str = ""
+
+    @property
+    def is_camera(self) -> bool:
+        return self.camera_model != CAMERA_MODEL_NONE
+
+    def encode(self, trailer: bytes = b"") -> bytes:
+        body = (
+            put_string(self.name)
+            + put_string(self.modality)
+            + put_u8(self.camera_model)
+            + put_u32(self.width_px)
+            + put_u32(self.height_px)
+            + put_f64s([self.fx, self.fy, self.cx, self.cy])
+            + put_u8(len(self.distortion))
+            + put_f64s(self.distortion)
+            + put_f64s(self.rotation)
+            + put_f64s(self.translation)
+            + put_u8(self.pose_reference)
+            + put_string(self.rig_name)
+        )
+        return put_record(op.SENSOR_CALIBRATION, body + trailer)
+
+    @staticmethod
+    def parse(content) -> SensorCalibration:
+        c = Cursor(content)
+        name = c.string()
+        modality = c.string()
+        camera_model = c.u8()
+        width_px = c.u32()
+        height_px = c.u32()
+        intrinsics = c.f64s(4)
+        distortion = c.f64s(c.u8())
+        rotation = c.f64s(4)
+        translation = c.f64s(3)
+        sensor = SensorCalibration(
+            name=name,
+            modality=modality,
+            camera_model=camera_model,
+            width_px=width_px,
+            height_px=height_px,
+            fx=intrinsics[0],
+            fy=intrinsics[1],
+            cx=intrinsics[2],
+            cy=intrinsics[3],
+            distortion=distortion,
+            rotation=rotation,
+            translation=translation,
+            pose_reference=c.u8(),
+            rig_name=c.string(),
+        )
+        sensor.check()
+        return sensor
+
+    def check(self) -> None:
+        for label, value in (
+            ("fx", self.fx),
+            ("fy", self.fy),
+            ("cx", self.cx),
+            ("cy", self.cy),
+            *((f"distortion[{i}]", v) for i, v in enumerate(self.distortion)),
+            *((f"rotation[{i}]", v) for i, v in enumerate(self.rotation)),
+            *((f"translation[{i}]", v) for i, v in enumerate(self.translation)),
+        ):
+            if not math.isfinite(value):
+                raise MalformedFile(f"sensor {self.name!r}: {label} is {value}; every value must be finite")
+
+        norm = math.sqrt(sum(v * v for v in self.rotation))
+        if not math.isfinite(norm) or norm == 0.0:
+            raise MalformedFile(f"sensor {self.name!r}: rotation quaternion has no direction (norm {norm})")
+
+        legal = CAMERA_MODEL_COEFFICIENTS.get(self.camera_model)
+        if legal is not None and len(self.distortion) not in legal:
+            raise MalformedFile(
+                f"sensor {self.name!r}: camera model {self.camera_model} defines "
+                f"{' or '.join(str(v) for v in legal)} distortion coefficients, the record carries "
+                f"{len(self.distortion)}"
+            )
+        if not self.is_camera:
+            for label, value in (
+                ("width_px", self.width_px),
+                ("height_px", self.height_px),
+                ("fx", self.fx),
+                ("fy", self.fy),
+                ("cx", self.cx),
+                ("cy", self.cy),
+            ):
+                if value:
+                    raise MalformedFile(
+                        f"sensor {self.name!r} declares camera_model 0 but a non-zero {label} ({value})"
+                    )
+        elif self.fx == 0.0 or self.fy == 0.0 or not self.width_px or not self.height_px:
+            raise MalformedFile(
+                f"sensor {self.name!r} declares camera model {self.camera_model} but has a zero "
+                "focal length or image size"
+            )
+
+    def unit_rotation(self) -> list[float]:
+        """The extrinsic quaternion, renormalized as section 6.4 renormalizes its own."""
+        norm = math.sqrt(sum(v * v for v in self.rotation))
+        return [v / norm for v in self.rotation]
+
+
+TRAJECTORY_LINEAR = 0
+TRAJECTORY_STEP = 1
+
+
+@dataclass
+class RigTrajectory:
+    """The measured pose of the capture platform over the scene clock. Opcode 0x22.
+
+    Not the Camera record of section 5.10, which is a viewing suggestion a reader may
+    ignore. This is where the sensors were, and a consumer doing analysis or
+    simulation needs it to be right rather than plausible.
+    """
+
+    name: str = ""
+    interpolation: int = TRAJECTORY_LINEAR
+    times: list[float] = field(default_factory=list)
+    rotations: list[list[float]] = field(default_factory=list)
+    translations: list[list[float]] = field(default_factory=list)
+
+    @property
+    def sample_count(self) -> int:
+        return len(self.times)
+
+    def encode(self, trailer: bytes = b"") -> bytes:
+        body = put_string(self.name) + put_u8(self.interpolation) + put_u32(len(self.times))
+        for i, t in enumerate(self.times):
+            body += put_f64(t) + put_f64s(self.rotations[i]) + put_f64s(self.translations[i])
+        return put_record(op.RIG_TRAJECTORY, body + trailer)
+
+    @staticmethod
+    def parse(content) -> RigTrajectory:
+        c = Cursor(content)
+        trajectory = RigTrajectory(name=c.string(), interpolation=c.u8())
+        for _ in range(c.u32()):
+            trajectory.times.append(c.f64())
+            trajectory.rotations.append(c.f64s(4))
+            trajectory.translations.append(c.f64s(3))
+        trajectory.check()
+        return trajectory
+
+    def check(self) -> None:
+        """Refuse times that are not strictly increasing, naming the sample.
+
+        Every interpolation rule is stated in terms of the interval a query lands in,
+        and a repeated or reversed timestamp makes that interval ambiguous. There is
+        no reading of such a trajectory that is merely approximate.
+        """
+        for i, t in enumerate(self.times):
+            if not math.isfinite(t):
+                raise MalformedFile(f"trajectory {self.name!r}: sample {i} has a non-finite time ({t})")
+            if i and t <= self.times[i - 1]:
+                raise MalformedFile(
+                    f"trajectory {self.name!r}: sample {i} is at t={t}, not after sample {i - 1} "
+                    f"at t={self.times[i - 1]}; times must strictly increase (section 5.15.4)"
+                )
+        for i, quaternion in enumerate(self.rotations):
+            norm = math.sqrt(sum(v * v for v in quaternion))
+            if not math.isfinite(norm) or norm == 0.0:
+                raise MalformedFile(f"trajectory {self.name!r}: sample {i} rotation has no direction (norm {norm})")
+        for i, translation in enumerate(self.translations):
+            for k, value in enumerate(translation):
+                if not math.isfinite(value):
+                    raise MalformedFile(f"trajectory {self.name!r}: sample {i} translation[{k}] is {value}")

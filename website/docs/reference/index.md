@@ -7,9 +7,11 @@ documented state — not a defect — and this table is the public contract that
 `supportsVariant()`, the harness runs exactly those, and this table is kept in lockstep with those
 declarations. Nothing is marked `Yes` on the strength of code existing.
 
-Every row is filled in from a suite that runs: 34 valid variants and 6 invalid ones, two read paths
-(streamed and indexed) — 79 checks passing for Python, 67 for each language that does not yet answer
-a refusal expectation.
+Every row is filled in from a suite that runs: 39 valid variants and 6 invalid ones, over two read
+paths (streamed and indexed). A language takes the variants it declares support for, and what it
+declines is what this table records — 89 checks passing for Python, 77 for Rust, 67 each for
+TypeScript, C++ and Swift. Rust declines the refusal expectations; TypeScript, C++ and Swift decline
+those and the five variants that carry provenance records.
 
 | Feature                                              | Python | TypeScript | Rust    | C++     | Swift   |
 | ---------------------------------------------------- | ------ | ---------- | ------- | ------- | ------- |
@@ -30,6 +32,9 @@ a refusal expectation.
 | Metadata                                             | Yes    | Yes        | Yes     | Yes     | Yes     |
 | Attachments                                          | Yes    | Yes        | Yes     | Yes     | Yes     |
 | Statistics                                           | Yes    | Yes        | Yes     | Yes     | Yes     |
+| Provenance: coordinate frame + georeference          | Yes    | No         | Yes     | No      | No      |
+| Provenance: sensor calibration                       | Yes    | No         | Yes     | No      | No      |
+| Provenance: rig trajectory + pose interpolation      | Yes    | No         | Yes     | No      | No      |
 | Unknown-record skipping                              | Yes    | Yes        | Yes     | Yes     | Yes     |
 | Refusal diagnosis (named, not merely refused)        | Yes    | No         | No      | No      | No      |
 | Private-range records                                | Yes    | Yes        | Yes     | Yes     | Yes     |
@@ -53,6 +58,16 @@ a refusal expectation.
 **Embedded audio** is optional in every sense. A scene without audio carries no audio record at all,
 and every SDK exposes audio as an optional value rather than an error state. Most files will have
 none; that is the common case, and it costs nothing.
+
+**Provenance** (spec §5.15) is the newest feature here and the clearest illustration of what this
+table is for. Python and Rust decode the four records and surface them; TypeScript, C++ and Swift do
+not, and say so. That is not a gap anyone has to close before the format is usable, because the
+records are optional and no Header flag announces them: an SDK that has never heard of opcode `0x20`
+skips it by length and decodes every gaussian in the file correctly. It was verified rather than
+assumed — TypeScript, given a file carrying all four records plus appended fields on them, produces
+output identical to the expectation with the provenance section removed, with no change to a line of
+TypeScript. C++ and Swift are bindings over the Rust core rather than independent decoders, so their
+`No` means the binding does not surface the records, not that nothing there can read them.
 
 **Range-request decode** is a property of the transport an SDK offers, not of the format: every SDK
 can decode from an arbitrary byte-range reader, but only some ship an HTTP one. TypeScript's and

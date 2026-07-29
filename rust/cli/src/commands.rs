@@ -18,6 +18,133 @@ const MIB: f64 = (1024 * 1024) as f64;
 /// matter and the index, so `info` on a gigabyte file transfers a few kilobytes. The lines
 /// through `attributes` are the Python tool's, in its order and its wording, because two
 /// tools describing one file differently is the confusion neither of them is worth.
+/// Registry names, so the output says "right-handed" rather than "1". An id this build
+/// does not know prints as its number, which is the honest answer: an unrecognized
+/// registry value is not a malformed one.
+fn named(table: &[(u8, &'static str)], value: u8) -> String {
+    table
+        .iter()
+        .find(|(k, _)| *k == value)
+        .map(|(_, name)| (*name).to_string())
+        .unwrap_or_else(|| value.to_string())
+}
+
+const HANDEDNESS: &[(u8, &str)] = &[(0, "unspecified"), (1, "right"), (2, "left")];
+const AXES: &[(u8, &str)] = &[
+    (0, "+x"),
+    (1, "+y"),
+    (2, "+z"),
+    (3, "-x"),
+    (4, "-y"),
+    (5, "-z"),
+];
+const LENGTH_UNITS: &[(u8, &str)] = &[
+    (0, "unspecified"),
+    (1, "metre"),
+    (2, "centimetre"),
+    (3, "millimetre"),
+    (4, "kilometre"),
+    (5, "foot"),
+    (6, "inch"),
+];
+const CAMERA_MODELS: &[(u8, &str)] = &[
+    (0, "none"),
+    (1, "pinhole"),
+    (2, "brown-conrady"),
+    (3, "kannala-brandt"),
+];
+const TRAJECTORY_INTERPOLATION: &[(u8, &str)] = &[(0, "linear"), (1, "step")];
+
+/// What the file says about where it came from (spec section 5.15).
+///
+/// Prints nothing at all when the file carries no provenance, which is the point: absence
+/// is not a missing feature to report on, and a scene with no sensors behind it is a
+/// complete file rather than an under-specified one.
+fn provenance(
+    source: &mut FileReadable,
+    scene: &fourdgs::indexed_reader::IndexedScene,
+) -> Result<()> {
+    if scene.provenance_ranges.is_empty() {
+        return Ok(());
+    }
+    let prov = fourdgs::indexed_reader::read_provenance(source, scene)?;
+    out!("");
+    out!("provenance");
+    for frame in &prov.frames {
+        let label = if frame.name.is_empty() {
+            "(scene frame)"
+        } else {
+            &frame.name
+        };
+        out!(
+            "  frame        {label}  {}-handed, up {}, forward {}",
+            named(HANDEDNESS, frame.handedness),
+            named(AXES, frame.up_axis),
+            named(AXES, frame.forward_axis)
+        );
+        let unit = named(LENGTH_UNITS, frame.length_unit);
+        match prov.metres_per_unit(&frame.name) {
+            Some(m) => out!("  units        {unit}  ({m} m per unit)"),
+            None => out!("  units        {unit}"),
+        }
+    }
+    for anchor in &prov.anchors {
+        let suffix = if anchor.frame_name.is_empty() {
+            String::new()
+        } else {
+            format!("  [frame {}]", anchor.frame_name)
+        };
+        out!(
+            "  georeference {:.6}, {:.6} at {:.2} m, heading {:.1} deg{suffix}",
+            anchor.latitude_deg,
+            anchor.longitude_deg,
+            anchor.altitude_m,
+            anchor.heading_deg
+        );
+    }
+    for sensor in &prov.sensors {
+        let posed = if sensor.pose_reference == 0 {
+            "scene frame".to_string()
+        } else {
+            format!("rig {:?}", sensor.rig_name)
+        };
+        let modality = if sensor.modality.is_empty() {
+            "unstated"
+        } else {
+            &sensor.modality
+        };
+        let mut detail = format!("{modality}, {}", named(CAMERA_MODELS, sensor.camera_model));
+        if sensor.is_camera() {
+            detail.push_str(&format!(
+                ", {}x{}, f=({}, {})",
+                sensor.width_px, sensor.height_px, sensor.fx, sensor.fy
+            ));
+        }
+        out!(
+            "  sensor       {}  [{detail}]  posed against {posed}",
+            sensor.name
+        );
+    }
+    for t in &prov.trajectories {
+        let name = if t.name.is_empty() {
+            "(capture rig)"
+        } else {
+            &t.name
+        };
+        let span = if t.sample_count() > 0 {
+            format!("{:.3}..{:.3} s", t.times[0], t.times[t.sample_count() - 1])
+        } else {
+            "empty".to_string()
+        };
+        out!(
+            "  rig          {name}  {} samples, {span}, {}",
+            t.sample_count(),
+            named(TRAJECTORY_INTERPOLATION, t.interpolation)
+        );
+    }
+    Ok(())
+}
+
 pub fn info(args: &Args) -> Result<u8> {
     let mut source = FileReadable::open(&args.file)?;
     let size = source.size()?;
@@ -69,6 +196,7 @@ pub fn info(args: &Args) -> Result<u8> {
         }
     }
 
+    provenance(&mut source, &scene)?;
     layout(&scene);
     if args.names {
         names(&args.file)?;

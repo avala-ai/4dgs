@@ -70,6 +70,7 @@ struct Records {
     camera: Option<rec::Camera>,
     metadata: Vec<rec::Metadata>,
     attachments: Vec<rec::Attachment>,
+    provenance: crate::provenance::Provenance,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -290,6 +291,32 @@ impl<R: Readable> SceneReader<R> {
             .unwrap_or_default())
     }
 
+    /// Every provenance record the file carries (spec section 5.15).
+    ///
+    /// Empty when it carries none, which is the common case and never an error. On the
+    /// indexed path these live behind byte ranges framed at open and fetched here, so a
+    /// caller that never asks pays nothing for a long rig trajectory.
+    pub fn provenance(&mut self) -> Result<crate::provenance::Provenance> {
+        self.ensure_records()?;
+        Ok(self
+            .records
+            .as_ref()
+            .map(|r| r.provenance.clone())
+            .unwrap_or_default())
+    }
+
+    /// How many provenance records the file carries, known at open from the ranges alone.
+    pub fn provenance_count(&self) -> usize {
+        match (&self.indexed, &self.streamed) {
+            (Some(s), _) => s.provenance_ranges.len(),
+            (_, Some(s)) => {
+                let p = &s.provenance;
+                p.frames.len() + p.sensors.len() + p.trajectories.len() + p.anchors.len()
+            }
+            _ => 0,
+        }
+    }
+
     pub fn attachments(&mut self) -> Result<Vec<rec::Attachment>> {
         self.ensure_records()?;
         Ok(self
@@ -338,6 +365,7 @@ impl<R: Readable> SceneReader<R> {
                 camera: indexed_reader::read_camera(&mut self.source, scene)?,
                 metadata: indexed_reader::read_metadata(&mut self.source, scene)?,
                 attachments: indexed_reader::read_attachments(&mut self.source, scene)?,
+                provenance: indexed_reader::read_provenance(&mut self.source, scene)?,
             }
         } else {
             let scene = self.streamed.as_ref().expect("one path or the other");
@@ -345,6 +373,7 @@ impl<R: Readable> SceneReader<R> {
                 camera: scene.camera.clone(),
                 metadata: scene.metadata.clone(),
                 attachments: scene.attachments.clone(),
+                provenance: scene.provenance.clone(),
             }
         };
         self.records = Some(records);

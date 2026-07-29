@@ -619,3 +619,168 @@ fn a_static_asset_encodes_with_an_infinite_window() {
         "the window survives"
     );
 }
+
+/// The provenance records survive an encode, and their absence costs nothing.
+///
+/// This one is written from a real miss rather than from a checklist. The
+/// cross-implementation gate in `encode-roundtrip.sh` re-encodes every variant and requires
+/// the Rust and Python decoders to agree on the *result* — which cannot catch an encoder
+/// that drops a record, because both decoders then agree it is not there. An encoder
+/// omission is invisible to a check whose two sides both read the encoder's own output, so
+/// it needs an assertion that compares against what went in.
+#[test]
+fn provenance_records_survive_an_encode() {
+    use fourdgs::provenance::Provenance;
+    use fourdgs::records::{CoordinateFrame, GeodeticAnchor, RigTrajectory, SensorCalibration};
+
+    let (g, duration) = scene(256);
+
+    let provenance = Provenance {
+        frames: vec![CoordinateFrame {
+            name: String::new(),
+            handedness: 1,
+            up_axis: 2,
+            forward_axis: 0,
+            length_unit: 1,
+            metres_per_unit: 1.0,
+        }],
+        sensors: vec![
+            SensorCalibration {
+                name: "front_camera".into(),
+                modality: "camera".into(),
+                camera_model: 2,
+                width_px: 1920,
+                height_px: 1080,
+                fx: 1234.5,
+                fy: 1230.25,
+                cx: 960.5,
+                cy: 540.25,
+                distortion: vec![-0.32, 0.115, 0.0008, -0.0012, 0.0045],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                translation: [0.25, -0.125, 1.5],
+                pose_reference: 1,
+                rig_name: "rig".into(),
+            },
+            // The non-camera shape: `camera_model` 0 obliges every intrinsic to be zero,
+            // and a reader that treats those zeros as a broken calibration rather than as
+            // "this sensor has no projection model" refuses a conforming file.
+            SensorCalibration {
+                name: "top_lidar".into(),
+                modality: "lidar".into(),
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                translation: [0.0, 0.0, 1.875],
+                pose_reference: 1,
+                rig_name: "rig".into(),
+                ..Default::default()
+            },
+        ],
+        trajectories: vec![RigTrajectory {
+            name: "rig".into(),
+            interpolation: 0,
+            times: vec![0.0, 0.5 * duration, duration],
+            rotations: vec![[0.0, 0.0, 0.0, 1.0]; 3],
+            translations: vec![[0.0; 3], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+        }],
+        anchors: vec![GeodeticAnchor {
+            frame_name: String::new(),
+            latitude_deg: 12.5,
+            longitude_deg: -145.25,
+            altitude_m: 8.75,
+            heading_deg: 37.5,
+        }],
+    };
+
+    let options = chunking_options();
+    let extras = SceneExtras {
+        provenance: provenance.clone(),
+        ..Default::default()
+    };
+    let bytes = fourdgs::write_to_vec(&g, duration, &options, &extras).expect("encode");
+    let decoded = fourdgs::read_bytes(&bytes).expect("decode");
+    assert_eq!(
+        decoded.provenance, provenance,
+        "every provenance record must survive the encode unchanged"
+    );
+
+    // The indexed path frames these at open and fetches them separately, so agreeing with
+    // the streamed path is a second claim rather than the same one twice.
+    let mut source = fourdgs::BytesReadable::new(&bytes);
+    let indexed = fourdgs::indexed_reader::open_indexed(&mut source).expect("open");
+    let by_range =
+        fourdgs::indexed_reader::read_provenance(&mut source, &indexed).expect("read provenance");
+    assert_eq!(by_range, provenance, "the indexed path must agree");
+
+    // And absence costs nothing: no record, no placeholder, no Header flag. The two files
+    // differ by exactly the provenance records and nothing else.
+    let bare =
+        fourdgs::write_to_vec(&g, duration, &options, &SceneExtras::default()).expect("encode");
+    assert!(
+        fourdgs::read_bytes(&bare)
+            .expect("decode")
+            .provenance
+            .is_empty(),
+        "a scene written without provenance must carry none"
+    );
+    assert!(
+        bare.len() < bytes.len(),
+        "the provenance-bearing file must be the larger of the two"
+    );
+}
+
+/// A rig pose is clamped outside its sample range and slerped inside it.
+///
+/// The specification states both rules in prose; this is the arithmetic. Clamping is the
+/// one an implementation is most likely to skip, because extrapolation falls out of the
+/// interpolation formula for free and looks reasonable until the ends of a clip.
+#[test]
+fn a_rig_pose_clamps_outside_its_samples_and_slerps_inside() {
+    use fourdgs::provenance::pose_at;
+    use fourdgs::records::RigTrajectory;
+
+    // A half-turn about +z across two seconds, expressed so that the two endpoints have
+    // opposite quaternion signs. That is the case the shortest-arc rule exists for: read
+    // naively, the interpolation takes the long way round.
+    let trajectory = RigTrajectory {
+        name: String::new(),
+        interpolation: 0,
+        times: vec![0.0, 2.0],
+        rotations: vec![[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, -1.0, 0.0]],
+        translations: vec![[0.0; 3], [4.0, 0.0, 0.0]],
+    };
+
+    let before = pose_at(&trajectory, -10.0).unwrap().unwrap();
+    assert_eq!(
+        before.translation, [0.0; 3],
+        "before the first sample, clamp"
+    );
+    let after = pose_at(&trajectory, 99.0).unwrap().unwrap();
+    assert_eq!(
+        after.translation,
+        [4.0, 0.0, 0.0],
+        "after the last sample, clamp"
+    );
+
+    let mid = pose_at(&trajectory, 1.0).unwrap().unwrap();
+    assert!(
+        (mid.translation[0] - 2.0).abs() < 1e-12,
+        "translation is linear between samples"
+    );
+    // Shortest arc: a quarter turn the short way, so the z component is negative — the
+    // sign the naive formula gets wrong.
+    assert!(
+        mid.rotation[2] < 0.0,
+        "slerp must take the shortest arc; got z={}",
+        mid.rotation[2]
+    );
+    assert!(
+        (mid.rotation[3].abs() - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-9,
+        "a quarter turn has w = 1/sqrt(2); got {}",
+        mid.rotation[3]
+    );
+
+    let empty = RigTrajectory::default();
+    assert!(
+        pose_at(&empty, 0.0).unwrap().is_none(),
+        "a trajectory with no samples carries no pose"
+    );
+}

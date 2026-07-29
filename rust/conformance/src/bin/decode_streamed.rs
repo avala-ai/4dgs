@@ -38,7 +38,7 @@ fn run(path: &str) -> Result<String, String> {
         data: a.data.clone(),
     });
     let intervals: Vec<(f64, f64)> = scene.chunk_index.iter().map(|e| (e.t0, e.t1)).collect();
-    Ok(summarize(
+    summarize(
         &scene.header,
         &scene.gaussians,
         audio.as_ref(),
@@ -50,8 +50,10 @@ fn run(path: &str) -> Result<String, String> {
             statistics: scene.statistics.as_ref(),
             summary_offsets: &scene.summary_offsets,
             summary_crc_ok: scene.summary_crc_ok,
+            provenance: Some(&scene.provenance),
         },
-    ))
+    )
+    .map_err(|e| format!("{path}: {e}"))
 }
 
 /// Decode the same file cut short, and insist on what survives.

@@ -70,6 +70,10 @@ fn run(path: &str) -> Result<String, String> {
     let metadata =
         fourdgs::indexed_reader::read_metadata(&mut source, &scene).map_err(|e| e.to_string())?;
     let attachments = read_attachments(&mut source, &scene).map_err(|e| e.to_string())?;
+    // Framed at open, fetched here — the same contract the camera and the attachments
+    // have, and the reason no Header flag announces the family.
+    let provenance =
+        fourdgs::indexed_reader::read_provenance(&mut source, &scene).map_err(|e| e.to_string())?;
     check_band_skipping(&mut source, &scene)?;
 
     let bands: Vec<BTreeMap<u8, fourdgs::stream::DecodedStream>> =
@@ -83,7 +87,7 @@ fn run(path: &str) -> Result<String, String> {
         data,
     });
     let intervals: Vec<(f64, f64)> = scene.index.iter().map(|e| (e.t0, e.t1)).collect();
-    Ok(summarize(
+    summarize(
         &scene.header,
         &gaussians,
         audio.as_ref(),
@@ -95,8 +99,10 @@ fn run(path: &str) -> Result<String, String> {
             statistics: scene.statistics.as_ref(),
             summary_offsets: &scene.summary_offsets,
             summary_crc_ok: scene.summary_crc_ok,
+            provenance: Some(&provenance),
         },
-    ))
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// A reader that has capped its SH degree never transfers the bands above it.

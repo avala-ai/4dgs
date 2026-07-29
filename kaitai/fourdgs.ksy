@@ -61,6 +61,12 @@ enums:
     0x0d: attachment
     0x0e: attachment_index
     0x0f: summary_offset
+    # §5.15, the provenance family. 0x24–0x2F stay reserved and unemitted, so they are
+    # absent here for the same reason every other unassigned opcode is.
+    0x20: coordinate_frame
+    0x21: sensor_calibration
+    0x22: rig_trajectory
+    0x23: geodetic_anchor
 
   # §5.6 `mode`.
   stream_mode:
@@ -160,6 +166,10 @@ types:
             'opcode::statistics': statistics
             'opcode::attachment': attachment
             'opcode::summary_offset': summary_offset
+            'opcode::coordinate_frame': coordinate_frame
+            'opcode::sensor_calibration': sensor_calibration
+            'opcode::rig_trajectory': rig_trajectory
+            'opcode::geodetic_anchor': geodetic_anchor
             # Deliberately absent:
             #   opcode::attribute_stream (0x06) — never framed as a top-level record; see
             #     the `chunk` type.
@@ -462,6 +472,142 @@ types:
         repeat: expr
         repeat-expr: 3
       - id: target
+        type: f8
+        repeat: expr
+        repeat-expr: 3
+
+  coordinate_frame:
+    doc: |
+      Spec §5.15.2. Opcode 0x20. The frame the file's own coordinates are expressed in.
+
+      A fixed shape: every field is always present, so a reader that knows these six knows
+      exactly where an appended seventh would begin. The georeference is `geodetic_anchor`
+      (0x23) rather than an optional tail here, because a conditional block inside a record
+      makes the offset of everything after it depend on a value.
+    seq:
+      - id: name
+        type: str_field
+        doc: Frame identifier. Empty is the file's own scene frame.
+      - id: handedness
+        type: u1
+      - id: up_axis
+        type: u1
+      - id: forward_axis
+        type: u1
+        doc: |
+          Signed axis, 0..5 for +x +y +z -x -y -z. Must name a different axis from
+          `up_axis` ignoring sign; a reader refuses a file where it does not.
+      - id: length_unit
+        type: u1
+      - id: metres_per_unit
+        type: f8
+        doc: |
+          Length of one file unit in metres; 0.0 means unknown. Must agree with
+          `length_unit`, and is the authority for a consumer handed a file where it does
+          not.
+
+  geodetic_anchor:
+    doc: |
+      Spec §5.15.5. Opcode 0x23. Where a frame's origin sits on the WGS-84 ellipsoid.
+
+      Its own record rather than a tail on `coordinate_frame`, so a scene with no
+      georeference carries no anchor at all.
+    seq:
+      - id: frame_name
+        type: str_field
+        doc: The `coordinate_frame` this anchors. Empty is the scene frame.
+      - id: latitude_deg
+        type: f8
+      - id: longitude_deg
+        type: f8
+      - id: altitude_m
+        type: f8
+      - id: heading_deg
+        type: f8
+        doc: Bearing of the frame's forward axis, degrees clockwise from true north.
+
+  sensor_calibration:
+    doc: |
+      Spec §5.15.3. Opcode 0x21, one record per sensor.
+
+      The extrinsic maps sensor coordinates into the frame `pose_reference` names, in that
+      direction: `p_target = R(rotation) * p_sensor + translation`.
+    seq:
+      - id: name
+        type: str_field
+        doc: Unique within the file; a reader refuses two records sharing a name.
+      - id: modality
+        type: str_field
+      - id: camera_model
+        type: u1
+        doc: 0 when the sensor is not a camera, in which case every intrinsic below is 0.
+      - id: width_px
+        type: u4
+      - id: height_px
+        type: u4
+      - id: fx
+        type: f8
+      - id: fy
+        type: f8
+      - id: cx
+        type: f8
+      - id: cy
+        type: f8
+      - id: num_distortion
+        type: u1
+      - id: distortion
+        type: f8
+        repeat: expr
+        repeat-expr: num_distortion
+        doc: In the order the named `camera_model` defines. See the registry.
+      - id: rotation
+        type: f8
+        repeat: expr
+        repeat-expr: 4
+        doc: Unit quaternion, xyzw — the same order and convention as §3 and §6.4.
+      - id: translation
+        type: f8
+        repeat: expr
+        repeat-expr: 3
+      - id: pose_reference
+        type: u1
+        doc: |
+          0: the pose maps sensor to the scene frame. 1: it maps sensor to a rig frame and
+          composes with the `rig_trajectory` named below.
+      - id: rig_name
+        type: str_field
+
+  rig_trajectory:
+    doc: |
+      Spec §5.15.4. Opcode 0x22. The measured pose of the capture platform over the scene
+      clock — a measurement, not the advisory viewing path of §5.10.
+    seq:
+      - id: name
+        type: str_field
+        doc: Empty is the file's capture rig.
+      - id: interpolation
+        type: u1
+        doc: 0 linear (lerp plus shortest-arc slerp), 1 step.
+      - id: num_samples
+        type: u4
+      - id: samples
+        type: rig_sample
+        repeat: expr
+        repeat-expr: num_samples
+
+  rig_sample:
+    seq:
+      - id: time
+        type: f8
+        doc: |
+          Seconds on the scene clock. Strictly increasing across a trajectory; a reader
+          refuses one where it is not, because every interpolation rule is stated in terms
+          of the interval a query lands in.
+      - id: rotation
+        type: f8
+        repeat: expr
+        repeat-expr: 4
+      - id: translation
         type: f8
         repeat: expr
         repeat-expr: 3

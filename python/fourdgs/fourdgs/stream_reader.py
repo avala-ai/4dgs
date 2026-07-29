@@ -19,6 +19,7 @@ from . import opcode as op
 from . import records as rec
 from .exceptions import MalformedFile, TruncatedFile, UnsupportedCodec
 from .model import AudioTrack, CameraTrajectory, GaussianSet
+from .provenance import Provenance
 from .quantization import (
     DEFAULT_CUTOFF,
     Steps,
@@ -61,6 +62,10 @@ class Scene:
     metadata: list[rec.Metadata] = field(default_factory=list)
     attachments: list[rec.Attachment] = field(default_factory=list)
     statistics: rec.Statistics | None = None
+    #: Every provenance record the file carried (spec section 5.15). Empty when it
+    #: carried none, which is the common case and not an error: absence costs nothing
+    #: and no Header flag announces the family, so this is filled by the walk itself.
+    provenance: Provenance = field(default_factory=Provenance)
     chunk_index: list[rec.ChunkIndexEntry] = field(default_factory=list)
     summary_offsets: list[rec.SummaryOffset] = field(default_factory=list)
     #: Whether the Footer's summary CRC matched, or `None` when the file declares none.
@@ -330,6 +335,14 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
                 scene.metadata.append(rec.Metadata.parse(record.content))
             elif record.opcode == op.ATTACHMENT:
                 scene.attachments.append(rec.Attachment.parse(record.content))
+            elif record.opcode == op.COORDINATE_FRAME:
+                scene.provenance.frames.append(rec.CoordinateFrame.parse(record.content))
+            elif record.opcode == op.SENSOR_CALIBRATION:
+                scene.provenance.sensors.append(rec.SensorCalibration.parse(record.content))
+            elif record.opcode == op.RIG_TRAJECTORY:
+                scene.provenance.trajectories.append(rec.RigTrajectory.parse(record.content))
+            elif record.opcode == op.GEODETIC_ANCHOR:
+                scene.provenance.anchors.append(rec.GeodeticAnchor.parse(record.content))
             elif record.opcode == op.STATISTICS:
                 scene.statistics = rec.Statistics.parse(record.content)
             elif record.opcode == op.CHUNK_INDEX:
@@ -359,6 +372,13 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
 
     if header is None or quant is None:
         raise MalformedFile("file has no Header or no Quantization record")
+
+    # The cross-record rules — unique sensor names, a rig reference that resolves —
+    # can only run once the whole front matter has gone past. A truncated file may
+    # legitimately be missing the trajectory a sensor names, so this is skipped there:
+    # the recovery contract is that everything complete before the cut still stands.
+    if not truncated:
+        scene.provenance.check()
 
     scene.header = header
     scene.quantization = quant

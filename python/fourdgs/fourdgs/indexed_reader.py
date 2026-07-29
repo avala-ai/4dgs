@@ -23,6 +23,7 @@ import numpy as np
 from . import opcode as op
 from . import records as rec
 from .exceptions import MalformedFile
+from .provenance import Provenance
 from .readable import Readable
 from .registry import check_quantization_scheme, check_temporal_model
 from .serialization import MAGIC, Cursor, check_magic, crc32, iter_records, read_record
@@ -140,6 +141,12 @@ class IndexedScene:
     camera_range: tuple[int, int] | None = None
     metadata_ranges: list[tuple[int, int]] = field(default_factory=list)
     attachment_ranges: list[tuple[int, int]] = field(default_factory=list)
+    #: `(opcode, offset, length)` of every provenance record framed during the walk.
+    #: Framed, not read: a Rig Trajectory is unbounded — a ten-minute capture logged at
+    #: 100 Hz is sixty thousand samples — and a consumer that wants the gaussians should
+    #: not pay for it. This is also the whole discovery mechanism for the family, which
+    #: is why no Header flag announces it: the walk was already happening.
+    provenance_ranges: list[tuple[int, int, int]] = field(default_factory=list)
     statistics: rec.Statistics | None = None
     summary_offsets: list[rec.SummaryOffset] = field(default_factory=list)
 
@@ -176,6 +183,7 @@ def open_indexed(source: Readable) -> IndexedScene:
     camera_range = None
     metadata_ranges: list[tuple[int, int]] = []
     attachment_ranges: list[tuple[int, int]] = []
+    provenance_ranges: list[tuple[int, int, int]] = []
     for record in front.records(len(MAGIC)):
         if record.opcode == op.CHUNK:
             break
@@ -199,6 +207,8 @@ def open_indexed(source: Readable) -> IndexedScene:
             metadata_ranges.append((record.offset, record.total_length))
         elif record.opcode == op.ATTACHMENT:
             attachment_ranges.append((record.offset, record.total_length))
+        elif op.is_provenance(record.opcode):
+            provenance_ranges.append((record.opcode, record.offset, record.total_length))
     if header is None or quant is None:
         raise MalformedFile("the file has no Header or no Quantization record before its first Chunk")
 
@@ -241,6 +251,7 @@ def open_indexed(source: Readable) -> IndexedScene:
         camera_range=camera_range,
         metadata_ranges=metadata_ranges,
         attachment_ranges=attachment_ranges,
+        provenance_ranges=provenance_ranges,
         statistics=statistics,
         summary_offsets=summary_offsets,
     )
@@ -311,6 +322,33 @@ def read_attachments(source: Readable, scene: IndexedScene) -> list[rec.Attachme
     for offset, length in scene.attachment_ranges:
         blob = _read_range(source, offset, length, "an Attachment record")
         out.append(rec.Attachment.parse(Cursor(blob, 9).take(length - 9)))
+    return out
+
+
+def read_provenance(source: Readable, scene: IndexedScene) -> Provenance:
+    """Every provenance record, by range, fetched only when a caller wants them.
+
+    Opening a file frames these and stops, so a scene with a long rig trajectory costs
+    the same to open as one with none. This is where a caller says it wants them.
+
+    A reserved opcode in the family — `0x24`-`0x2F`, which no version-1 writer emits —
+    is framed by the walk and skipped here. That is the forward-compatibility rule
+    doing its job inside a family rather than across the whole opcode space, and it is
+    why the ranges carry their opcode: skipping requires knowing what was skipped.
+    """
+    out = Provenance()
+    for opcode, offset, length in scene.provenance_ranges:
+        blob = _read_range(source, offset, length, f"a {op.name(opcode)} record")
+        content = Cursor(blob, 9).take(length - 9)
+        if opcode == op.COORDINATE_FRAME:
+            out.frames.append(rec.CoordinateFrame.parse(content))
+        elif opcode == op.SENSOR_CALIBRATION:
+            out.sensors.append(rec.SensorCalibration.parse(content))
+        elif opcode == op.RIG_TRAJECTORY:
+            out.trajectories.append(rec.RigTrajectory.parse(content))
+        elif opcode == op.GEODETIC_ANCHOR:
+            out.anchors.append(rec.GeodeticAnchor.parse(content))
+    out.check()
     return out
 
 

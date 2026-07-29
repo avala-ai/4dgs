@@ -44,7 +44,22 @@ FLAGS = (
     "WithAttachment",
     "AddExtraDataToRecords",  # append unknown trailing fields + a private-range record
     "CustomCutoff",  # a Header cutoff other than the default
+    # The provenance family, spec section 5.15. Flagged rather than default for the same
+    # reason audio is: most files in the world carry none, and a variant that omits them
+    # is the assertion that omitting them costs nothing.
+    "WithFrame",  # a Coordinate Frame record (0x20)
+    "WithGeodetic",  # ... carrying the optional geodetic anchor
+    "WithSensors",  # Sensor Calibration records (0x21), a camera and a lidar
+    "WithRig",  # a Rig Trajectory (0x22), with the sensors posed against it
 )
+
+#: Flags that put a provenance record in the file. The harness uses this to skip these
+#: variants for a family that has not implemented the record family — which is a
+#: published gap in the feature matrix, not a failure. Skipping is only correct because
+#: the records are optional and flagged: every other variant is byte-identical to what
+#: it was before the family existed, so an implementation that skips 0x20-0x2F by length
+#: stays green on all of them without a line of change.
+PROVENANCE_FLAGS = ("WithFrame", "WithGeodetic", "WithSensors", "WithRig")
 
 
 @dataclass(frozen=True)
@@ -198,6 +213,22 @@ def variants() -> list[tuple[Scenario, tuple[str, ...]]]:
     repeated = SCENARIOS[7]
     add(repeated, "UseChunks")
     add(repeated, "SHDegree2", "UseChunks")
+
+    # Provenance. Each record alone, then the combination whose arithmetic no single
+    # record states: sensors posed against a moving rig, whose scene pose is the rig's
+    # pose at an instant composed with the extrinsic.
+    one = SCENARIOS[2]
+    add(one, "WithFrame")
+    add(one, "WithFrame", "WithGeodetic")
+    # Deliberately no frame: sensors whose poses are in a frame the file never names is
+    # a legal file and a validator note, and a reader must not invent one.
+    add(ten, "WithSensors")
+    add(ten, "WithFrame", "WithSensors", "WithRig")
+    # Appended fields on the provenance records themselves. They are new and not frozen,
+    # so they are exactly where a later revision will append — and the rule that a reader
+    # takes a record's length from its header rather than from where its own knowledge
+    # stops has to hold for them on the day they ship, not after someone appends to one.
+    add(ten, "WithFrame", "WithGeodetic", "WithSensors", "WithRig", "AddExtraDataToRecords")
 
     # Streaming without an index: a writer piping to stdout cannot seek back.
     out.append((ten, ("UseCrc",)))
@@ -381,3 +412,122 @@ def build_audio(seconds: float = 0.25, rate: int = 8000) -> bytes:
     header += b"fmt " + struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16)
     header += b"data" + struct.pack("<I", data_len)
     return bytes(header + samples)
+
+
+# --------------------------------------------------------------------------
+# Synthetic provenance
+# --------------------------------------------------------------------------
+
+#: The rig every provenance variant that carries one names. Sensors posed against a rig
+#: reference it by this string, and a reader must refuse a file where that reference does
+#: not resolve — so the name is shared here rather than spelled twice.
+RIG_NAME = "capture-rig"
+
+
+def build_provenance(scenario: Scenario, flags: tuple[str, ...]) -> dict | None:
+    """Provenance records for a variant, as plain Python values.
+
+    Synthetic like everything else here: a plausible rig, not anyone's rig. The camera's
+    intrinsics are a 1920x1080 sensor with a five-coefficient Brown-Conrady distortion,
+    which is the shape almost every real calibration file has; the lidar carries the
+    zeroed intrinsics the specification requires of a non-camera, which is the case a
+    reader is most likely to mis-handle because it looks like missing data.
+    """
+    wants = [f for f in PROVENANCE_FLAGS if f in flags]
+    if not wants:
+        return None
+
+    out: dict = {"frames": [], "sensors": [], "trajectories": [], "anchors": []}
+
+    if "WithFrame" in flags:
+        out["frames"] = [
+            {
+                "name": "",  # the file's own scene frame
+                "handedness": 1,  # right
+                "up_axis": 2,  # +z, the convention almost every capture rig is logged in
+                "forward_axis": 0,  # +x
+                "length_unit": 1,  # metre
+                "metres_per_unit": 1.0,
+            }
+        ]
+
+    if "WithGeodetic" in flags:
+        # Its own record, so this variant also covers the case the split was made for:
+        # a frame with no anchor is one record, a frame with one is two, and neither
+        # shape has a conditional block inside it. A point in the Pacific well off any
+        # coast, chosen so nothing here reads as a real capture site.
+        out["anchors"] = [
+            {
+                "frame_name": "",
+                "latitude_deg": 12.5,
+                "longitude_deg": -145.25,
+                "altitude_m": 8.75,
+                "heading_deg": 37.5,
+            }
+        ]
+
+    posed_to_rig = "WithRig" in flags
+    if "WithSensors" in flags:
+        out["sensors"] = [
+            {
+                "name": "front_camera",
+                "modality": "camera",
+                "camera_model": 2,  # brown-conrady
+                "width_px": 1920,
+                "height_px": 1080,
+                "fx": 1234.5,
+                "fy": 1230.25,
+                "cx": 960.5,
+                "cy": 540.25,
+                "distortion": [-0.32, 0.115, 0.0008, -0.0012, 0.0045],
+                # A quarter turn about +z, exactly representable so the summary's
+                # rounding cannot be what two implementations disagree about.
+                "rotation": _unit([0.0, 0.0, 1.0, 1.0]),
+                "translation": [0.25, -0.125, 1.5],
+                "pose_reference": 1 if posed_to_rig else 0,
+                "rig_name": RIG_NAME if posed_to_rig else "",
+            },
+            {
+                # The non-camera case: camera_model 0 obliges every intrinsic to be zero,
+                # and a reader that treats those zeros as a broken calibration rather than
+                # as "this sensor has no projection model" refuses a conforming file.
+                "name": "top_lidar",
+                "modality": "lidar",
+                "camera_model": 0,
+                "width_px": 0,
+                "height_px": 0,
+                "fx": 0.0,
+                "fy": 0.0,
+                "cx": 0.0,
+                "cy": 0.0,
+                "distortion": [],
+                "rotation": [0.0, 0.0, 0.0, 1.0],
+                "translation": [0.0, 0.0, 1.875],
+                "pose_reference": 1 if posed_to_rig else 0,
+                "rig_name": RIG_NAME if posed_to_rig else "",
+            },
+        ]
+
+    if posed_to_rig:
+        duration = scenario.duration_sec or 1.0
+        samples = 5
+        times, rotations, translations = [], [], []
+        for i in range(samples):
+            u = i / (samples - 1)
+            times.append(u * duration)
+            # A yaw sweep about +z. Half-angle in the quaternion, so a sixth of a turn
+            # across the clip: enough that a reader which slerps the long way round, or
+            # which lerps the components without renormalizing, disagrees visibly.
+            half = 0.5 * (math.pi / 3.0) * u
+            rotations.append([0.0, 0.0, math.sin(half), math.cos(half)])
+            translations.append([2.0 * u, 0.5 * u * u, 0.75])
+        out["trajectories"] = [
+            {"name": RIG_NAME, "interpolation": 0, "times": times, "rotations": rotations, "translations": translations}
+        ]
+
+    return out
+
+
+def _unit(q: list[float]) -> list[float]:
+    norm = math.sqrt(sum(c * c for c in q))
+    return [c / norm for c in q]

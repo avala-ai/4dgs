@@ -18,7 +18,15 @@ import numpy as np
 from . import __version__, read
 from .convert import convert_ply_sequence
 from .gltf import from_gltf, to_gltf
-from .indexed_reader import open_indexed
+from .indexed_reader import open_indexed, read_provenance
+from .provenance import (
+    AXIS_NAMES,
+    CAMERA_MODEL_NAMES,
+    HANDEDNESS_NAMES,
+    LENGTH_UNIT_NAMES,
+    TRAJECTORY_INTERPOLATION_NAMES,
+    name_of,
+)
 from .readable import FileReadable
 from .validate import validate
 from .writer import WriteOptions, write
@@ -28,6 +36,10 @@ def cmd_info(args) -> int:
     with FileReadable(args.file) as src:
         scene = open_indexed(src)
         size = src.size()
+        # Framed at open, fetched here. A file with none produces an empty Provenance
+        # and this whole section prints nothing, which is the point: absence is not a
+        # missing feature to report on.
+        provenance = read_provenance(src, scene)
     h = scene.header
     print(f"file           {args.file}  ({size / 2**20:.2f} MiB)")
     print(f"gaussians      {h.gaussian_count:,}")
@@ -45,6 +57,38 @@ def cmd_info(args) -> int:
         print("attributes")
         for k, v in sorted(h.attributes.items()):
             print(f"  {k} = {v}")
+    if provenance:
+        print("\nprovenance")
+        for frame in provenance.frames:
+            metres = provenance.metres_per_unit(frame.name)
+            label = frame.name or "(scene frame)"
+            print(
+                f"  frame        {label}  {name_of(HANDEDNESS_NAMES, frame.handedness)}-handed, "
+                f"up {name_of(AXIS_NAMES, frame.up_axis)}, forward {name_of(AXIS_NAMES, frame.forward_axis)}"
+            )
+            print(
+                f"  units        {name_of(LENGTH_UNIT_NAMES, frame.length_unit)}"
+                + (f"  ({metres:g} m per unit)" if metres else "")
+            )
+        for anchor in provenance.anchors:
+            print(
+                f"  georeference {anchor.latitude_deg:.6f}, {anchor.longitude_deg:.6f} at "
+                f"{anchor.altitude_m:.2f} m, heading {anchor.heading_deg:.1f} deg"
+                + (f"  [frame {anchor.frame_name}]" if anchor.frame_name else "")
+            )
+        for sensor in provenance.sensors:
+            posed = "scene frame" if sensor.pose_reference == 0 else f"rig {sensor.rig_name!r}"
+            detail = f"{sensor.modality or 'unstated'}, {name_of(CAMERA_MODEL_NAMES, sensor.camera_model)}"
+            if sensor.is_camera:
+                detail += f", {sensor.width_px}x{sensor.height_px}, f=({sensor.fx:g}, {sensor.fy:g})"
+            print(f"  sensor       {sensor.name}  [{detail}]  posed against {posed}")
+        for trajectory in provenance.trajectories:
+            span = f"{trajectory.times[0]:.3f}..{trajectory.times[-1]:.3f} s" if trajectory.sample_count else "empty"
+            print(
+                f"  rig          {trajectory.name or '(capture rig)'}  {trajectory.sample_count} samples, "
+                f"{span}, {name_of(TRAJECTORY_INTERPOLATION_NAMES, trajectory.interpolation)}"
+            )
+
     if scene.index:
         print("\nseek cost (bytes to render an instant):")
         for t in np.linspace(0, h.duration_sec, 6)[:-1]:

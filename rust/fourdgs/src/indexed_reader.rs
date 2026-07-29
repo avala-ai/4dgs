@@ -190,6 +190,12 @@ pub struct IndexedScene {
     pub camera_range: Option<(u64, u64)>,
     pub metadata_ranges: Vec<(u64, u64)>,
     pub attachment_ranges: Vec<(u64, u64)>,
+    /// `(opcode, offset, length)` of every provenance record framed during the walk.
+    /// Framed, not read: a Rig Trajectory is unbounded — a ten-minute capture logged at
+    /// 100 Hz is sixty thousand samples — and a consumer that wants the gaussians should
+    /// not pay for it. This is also the whole discovery mechanism for the family, which is
+    /// why no Header flag announces it: the walk was already happening.
+    pub provenance_ranges: Vec<(u8, u64, u64)>,
     pub statistics: Option<rec::Statistics>,
     pub summary_offsets: Vec<rec::SummaryOffset>,
 }
@@ -265,6 +271,11 @@ pub fn open_indexed<R: Readable + ?Sized>(source: &mut R) -> Result<IndexedScene
                 op::ATTACHMENT => scene
                     .attachment_ranges
                     .push((record.offset, record.total_length())),
+                code if op::is_provenance(code) => {
+                    scene
+                        .provenance_ranges
+                        .push((code, record.offset, record.total_length()))
+                }
                 _ => {}
             }
             at += record.total_length();
@@ -406,6 +417,35 @@ pub fn read_attachments<R: Readable + ?Sized>(
             op::ATTACHMENT,
         )?)?);
     }
+    Ok(out)
+}
+
+/// Every provenance record, by range, fetched only when a caller wants them.
+///
+/// Opening a file frames these and stops, so a scene with a long rig trajectory costs the
+/// same to open as one with none. This is where a caller says it wants them.
+///
+/// A reserved opcode in the family — `0x24`-`0x2F`, which no version-1 writer emits — is
+/// framed by the walk and skipped here. That is the forward-compatibility rule doing its
+/// job inside a family rather than across the whole opcode space, and it is why the ranges
+/// carry their opcode: skipping requires knowing what was skipped.
+pub fn read_provenance<R: Readable + ?Sized>(
+    source: &mut R,
+    scene: &IndexedScene,
+) -> Result<crate::provenance::Provenance> {
+    let mut out = crate::provenance::Provenance::default();
+    for (opcode, offset, length) in &scene.provenance_ranges {
+        let blob = source.read(*offset, *length)?;
+        let content = record_content(&blob, *opcode)?;
+        match *opcode {
+            op::COORDINATE_FRAME => out.frames.push(rec::CoordinateFrame::parse(content)?),
+            op::SENSOR_CALIBRATION => out.sensors.push(rec::SensorCalibration::parse(content)?),
+            op::RIG_TRAJECTORY => out.trajectories.push(rec::RigTrajectory::parse(content)?),
+            op::GEODETIC_ANCHOR => out.anchors.push(rec::GeodeticAnchor::parse(content)?),
+            _ => {}
+        }
+    }
+    out.check()?;
     Ok(out)
 }
 

@@ -64,6 +64,7 @@ fn run(input: &str, output: &str) -> Result<String, String> {
         camera: scene.camera.clone(),
         metadata: scene.metadata.clone(),
         attachments: scene.attachments.clone(),
+        provenance: scene.provenance.clone(),
     };
 
     let first = fourdgs::write_to_vec(&scene.gaussians, scene.duration_sec, &options, &extras)

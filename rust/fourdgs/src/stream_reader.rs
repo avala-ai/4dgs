@@ -61,6 +61,10 @@ pub struct Scene {
     pub camera: Option<rec::Camera>,
     pub metadata: Vec<rec::Metadata>,
     pub attachments: Vec<rec::Attachment>,
+    /// Every provenance record the file carried (spec section 5.15). Empty when it
+    /// carried none, which is the common case and not an error: absence costs nothing and
+    /// no Header flag announces the family, so this is filled by the walk itself.
+    pub provenance: crate::provenance::Provenance,
     pub statistics: Option<rec::Statistics>,
     pub chunk_index: Vec<rec::ChunkIndexEntry>,
     pub summary_offsets: Vec<rec::SummaryOffset>,
@@ -149,6 +153,10 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
                 | op::CAMERA
                 | op::METADATA
                 | op::ATTACHMENT
+                | op::COORDINATE_FRAME
+                | op::SENSOR_CALIBRATION
+                | op::RIG_TRAJECTORY
+                | op::GEODETIC_ANCHOR
                 | op::STATISTICS
                 | op::CHUNK_INDEX
                 | op::SUMMARY_OFFSET
@@ -231,6 +239,22 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
             op::CAMERA => scene.camera = Some(rec::Camera::parse(&content)?),
             op::METADATA => scene.metadata.push(rec::Metadata::parse(&content)?),
             op::ATTACHMENT => scene.attachments.push(rec::Attachment::parse(&content)?),
+            op::COORDINATE_FRAME => scene
+                .provenance
+                .frames
+                .push(rec::CoordinateFrame::parse(&content)?),
+            op::SENSOR_CALIBRATION => scene
+                .provenance
+                .sensors
+                .push(rec::SensorCalibration::parse(&content)?),
+            op::RIG_TRAJECTORY => scene
+                .provenance
+                .trajectories
+                .push(rec::RigTrajectory::parse(&content)?),
+            op::GEODETIC_ANCHOR => scene
+                .provenance
+                .anchors
+                .push(rec::GeodeticAnchor::parse(&content)?),
             op::STATISTICS => scene.statistics = Some(rec::Statistics::parse(&content)?),
             op::CHUNK_INDEX => scene
                 .chunk_index
@@ -280,6 +304,14 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
     // record before the cut — which is the one thing truncation recovery exists to keep.
     if truncated {
         drop_incomplete_trailing_bands(&mut chunks, &mut chunk_bands, &mut scene.chunk_intervals);
+    }
+
+    // The cross-record rules — unique names, a rig reference and an anchor that resolve —
+    // can only run once the whole front matter has gone past. A truncated file may
+    // legitimately be missing the trajectory a sensor names, so this is skipped there: the
+    // recovery contract is that everything complete before the cut still stands.
+    if !truncated {
+        scene.provenance.check()?;
     }
 
     scene.gaussians = assemble(&chunks, &chunk_bands, &scene.windows, &header)?;

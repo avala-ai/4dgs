@@ -17,7 +17,11 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use fourdgs::model::GaussianSet;
-use fourdgs::records::{Attachment, Camera, Header, Metadata, Statistics, SummaryOffset};
+use fourdgs::provenance::{pose_at, Pose, Provenance};
+use fourdgs::records::{
+    Attachment, Camera, Header, Metadata, RigTrajectory, Statistics, SummaryOffset,
+};
+use fourdgs::Result;
 
 pub const FLOAT_DECIMALS: usize = 6;
 /// How many gaussians appear in full. The aggregates cover the rest, so a decoder cannot
@@ -25,6 +29,9 @@ pub const FLOAT_DECIMALS: usize = 6;
 pub const SAMPLE: usize = 16;
 /// How many camera keyframes appear in full, so a long trajectory cannot bloat a summary.
 pub const CAMERA_KEYFRAMES: usize = 4;
+/// The same cap for a rig trajectory, which is unbounded for the same reason and worse: a
+/// ten-minute capture at 100 Hz is sixty thousand samples.
+pub const RIG_SAMPLES: usize = 4;
 
 /// A JSON value, with objects sorted by key.
 pub enum J {
@@ -142,6 +149,7 @@ pub struct Extras<'a> {
     pub statistics: Option<&'a Statistics>,
     pub summary_offsets: &'a [SummaryOffset],
     pub summary_crc_ok: Option<bool>,
+    pub provenance: Option<&'a Provenance>,
 }
 
 /// An embedded track, as the summary sees it.
@@ -157,7 +165,7 @@ pub fn summarize(
     audio: Option<&AudioSummary>,
     chunk_intervals: &[(f64, f64)],
     extras: &Extras<'_>,
-) -> String {
+) -> Result<String> {
     let n = gaussians.count();
     let order = stable_order(gaussians);
     let sample = &order[..SAMPLE.min(order.len())];
@@ -192,7 +200,7 @@ pub fn summarize(
         }
     }
 
-    let summary = J::obj(vec![
+    let mut pairs: Vec<(&str, J)> = vec![
         ("gaussianCount", int(n as u64)),
         ("durationSec", num(header.duration_sec)),
         ("cutoff", num(header.cutoff)),
@@ -325,8 +333,212 @@ pub fn summarize(
                 ("zeroMotionCount", int(still)),
             ]),
         ),
-    ]);
-    summary.to_json()
+    ];
+
+    // Omitted entirely when the file carries no provenance, which is deliberate and is NOT
+    // the `audio` convention above. `audio` is `null` when absent because audio presence is
+    // a property of every file — the Header declares it either way — so both paths have to
+    // be visible in every variant. Provenance has no such flag and no such duty: a file
+    // that carries none is a file the record family does not apply to, and announcing it
+    // would have changed every pre-existing expectation and reported three SDKs that
+    // correctly skip these records by length as failures.
+    if let Some(prov) = extras.provenance {
+        if !prov.is_empty() {
+            pairs.push(("provenance", provenance(prov)?));
+        }
+    }
+
+    Ok(J::obj(pairs).to_json())
+}
+
+/// Every readable provenance field, plus the arithmetic the fields imply.
+///
+/// The fields alone would not be enough. `Header.profile` was readable in every SDK and
+/// asserted by none, so a binding that returned an empty string passed — and the same
+/// hiding place exists one level up here: two implementations can agree on every stored
+/// quaternion and still disagree about the pose halfway between two of them, because slerp
+/// has a sign convention and clamping has an edge. So the summary carries the interpolated
+/// poses as well as the samples, at probe times derived from the decoded data alone,
+/// including one before the first sample and one after the last.
+fn provenance(prov: &Provenance) -> Result<J> {
+    let mut trajectories = Vec::with_capacity(prov.trajectories.len());
+    for t in &prov.trajectories {
+        let mut poses = Vec::new();
+        for probe in probe_times(t) {
+            poses.push(pose_row(probe, pose_at(t, probe)?.as_ref(), None));
+        }
+        trajectories.push(J::obj(vec![
+            ("name", J::Str(t.name.clone())),
+            ("interpolation", J::Num(t.interpolation as f64)),
+            ("sampleCount", int(t.sample_count() as u64)),
+            (
+                "samples",
+                J::Arr(
+                    (0..t.sample_count().min(RIG_SAMPLES))
+                        .map(|i| {
+                            J::obj(vec![
+                                ("time", num(t.times[i])),
+                                (
+                                    "rotation",
+                                    J::Arr(t.rotations[i].iter().map(|v| num(*v)).collect()),
+                                ),
+                                (
+                                    "translation",
+                                    J::Arr(t.translations[i].iter().map(|v| num(*v)).collect()),
+                                ),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+            ("posesAt", J::Arr(poses)),
+        ]));
+    }
+
+    // The composition rule, which is the one thing here no single record states and every
+    // consumer of a moving rig depends on.
+    let mut sensor_poses = Vec::with_capacity(prov.sensors.len());
+    for s in &prov.sensors {
+        let probe = sensor_probe_time(prov, &s.rig_name);
+        sensor_poses.push(pose_row(
+            probe,
+            prov.sensor_pose_at(&s.name, probe)?.as_ref(),
+            Some(&s.name),
+        ));
+    }
+
+    Ok(J::obj(vec![
+        (
+            "frames",
+            J::Arr(
+                prov.frames
+                    .iter()
+                    .map(|f| {
+                        J::obj(vec![
+                            ("name", J::Str(f.name.clone())),
+                            ("handedness", J::Num(f.handedness as f64)),
+                            ("upAxis", J::Num(f.up_axis as f64)),
+                            ("forwardAxis", J::Num(f.forward_axis as f64)),
+                            ("lengthUnit", J::Num(f.length_unit as f64)),
+                            ("metresPerUnit", num(f.metres_per_unit)),
+                            // The resolution rule, per frame: a consumer handed a file
+                            // whose two unit fields disagree still has to produce one
+                            // number, and this is it.
+                            (
+                                "metresPerUnitResolved",
+                                match prov.metres_per_unit(&f.name) {
+                                    None => J::Null,
+                                    Some(v) => num(v),
+                                },
+                            ),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        (
+            "anchors",
+            J::Arr(
+                prov.anchors
+                    .iter()
+                    .map(|a| {
+                        J::obj(vec![
+                            ("frameName", J::Str(a.frame_name.clone())),
+                            ("latitudeDeg", num(a.latitude_deg)),
+                            ("longitudeDeg", num(a.longitude_deg)),
+                            ("altitudeM", num(a.altitude_m)),
+                            ("headingDeg", num(a.heading_deg)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        (
+            "sensors",
+            J::Arr(
+                prov.sensors
+                    .iter()
+                    .map(|s| {
+                        J::obj(vec![
+                            ("name", J::Str(s.name.clone())),
+                            ("modality", J::Str(s.modality.clone())),
+                            ("cameraModel", J::Num(s.camera_model as f64)),
+                            ("widthPx", int(s.width_px as u64)),
+                            ("heightPx", int(s.height_px as u64)),
+                            ("fx", num(s.fx)),
+                            ("fy", num(s.fy)),
+                            ("cx", num(s.cx)),
+                            ("cy", num(s.cy)),
+                            (
+                                "distortion",
+                                J::Arr(s.distortion.iter().map(|v| num(*v)).collect()),
+                            ),
+                            (
+                                "rotation",
+                                J::Arr(s.rotation.iter().map(|v| num(*v)).collect()),
+                            ),
+                            (
+                                "translation",
+                                J::Arr(s.translation.iter().map(|v| num(*v)).collect()),
+                            ),
+                            ("poseReference", J::Num(s.pose_reference as f64)),
+                            ("rigName", J::Str(s.rig_name.clone())),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        ("trajectories", J::Arr(trajectories)),
+        ("sensorPosesAt", J::Arr(sensor_poses)),
+    ]))
+}
+
+/// Times a summary evaluates a trajectory at, derived from the trajectory itself.
+///
+/// Two of the five are outside the sample range on purpose: clamping is a rule, and a rule
+/// no expectation exercises is a rule an implementation can decline to have.
+fn probe_times(trajectory: &RigTrajectory) -> Vec<f64> {
+    if trajectory.sample_count() == 0 {
+        return Vec::new();
+    }
+    let first = trajectory.times[0];
+    let last = trajectory.times[trajectory.sample_count() - 1];
+    vec![first - 0.5, first, 0.5 * (first + last), last, last + 0.5]
+}
+
+/// When to evaluate a sensor's scene pose: the midpoint of the rig it rides.
+fn sensor_probe_time(prov: &Provenance, rig_name: &str) -> f64 {
+    if rig_name.is_empty() {
+        return 0.0;
+    }
+    match prov.trajectory(rig_name) {
+        Some(t) if t.sample_count() > 0 => 0.5 * (t.times[0] + t.times[t.sample_count() - 1]),
+        _ => 0.0,
+    }
+}
+
+fn pose_row(t: f64, pose: Option<&Pose>, sensor: Option<&str>) -> J {
+    let mut pairs: Vec<(&str, J)> = vec![("time", num(t))];
+    if let Some(name) = sensor {
+        pairs.push(("sensor", J::Str(name.to_string())));
+    }
+    match pose {
+        None => {
+            pairs.push(("rotation", J::Null));
+            pairs.push(("translation", J::Null));
+        }
+        Some(p) => {
+            pairs.push((
+                "rotation",
+                J::Arr(p.rotation.iter().map(|v| num(*v)).collect()),
+            ));
+            pairs.push((
+                "translation",
+                J::Arr(p.translation.iter().map(|v| num(*v)).collect()),
+            ));
+        }
+    }
+    J::obj(pairs)
 }
 
 fn camera(c: &Camera) -> J {

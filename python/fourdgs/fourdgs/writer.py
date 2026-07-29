@@ -22,6 +22,7 @@ from . import opcode as op
 from . import records as rec
 from .exceptions import BoundViolation, InvalidInput
 from .model import AudioTrack, CameraTrajectory, GaussianSet, window_table
+from .provenance import Provenance
 from .quantization import (
     DEFAULT_CUTOFF,
     Bounds,
@@ -65,6 +66,10 @@ class WriteOptions:
     library: str = "4dgs-python reference encoder"
     scene_profile: str = ""
     metadata: dict[str, str] | None = None
+    #: Provenance records to emit (spec section 5.15). `None` writes none, which is
+    #: the default and costs nothing — no record, no placeholder, no Header flag. A
+    #: scene with no sensors behind it is a complete file, not an under-specified one.
+    provenance: Provenance | None = None
     #: Bytes appended to the content of the record with the given opcode, as a newer
     #: writer that added a field would produce. A reader that honours content_length steps
     #: over them; one that assumes a record ends where its own knowledge does does not.
@@ -310,6 +315,25 @@ def _encode(g: GaussianSet, duration_sec, opts, audio, camera) -> bytes:
     # Absence is the signal: no audio means no record at all, not an empty one.
     if audio is not None:
         emit(rec.Audio(codec=audio.codec, data=audio.data, start_sec=audio.start_sec).encode())
+    # Provenance, in ascending opcode order: the frame that the poses are expressed in,
+    # then the sensors, then the trajectories. Nothing requires that order of a reader —
+    # records are dispatched by opcode, not position — but a file written this way reads
+    # in the order a human would explain it.
+    if opts.provenance is not None:
+        opts.provenance.check()
+        for frame in opts.provenance.frames:
+            frame.check()
+            emit(frame.encode(trailer=opts.record_trailers.get(op.COORDINATE_FRAME, b"")))
+        for sensor in opts.provenance.sensors:
+            sensor.check()
+            emit(sensor.encode(trailer=opts.record_trailers.get(op.SENSOR_CALIBRATION, b"")))
+        for trajectory in opts.provenance.trajectories:
+            trajectory.check()
+            emit(trajectory.encode(trailer=opts.record_trailers.get(op.RIG_TRAJECTORY, b"")))
+        for anchor in opts.provenance.anchors:
+            anchor.check()
+            emit(anchor.encode(trailer=opts.record_trailers.get(op.GEODETIC_ANCHOR, b"")))
+
     if camera is not None:
         emit(
             rec.Camera(

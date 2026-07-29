@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from . import opcode as op
 from . import records as rec
 from .exceptions import FourdgsError
+from .provenance import LENGTH_UNIT_METRES, Provenance
 from .readable import BytesReadable
 from .serialization import MAGIC, check_magic, crc32, iter_records
 
@@ -83,6 +84,83 @@ def _check_quantization_finite(quant: rec.Quantization, report: Report, ordinal:
             report.error(f"{where} {name} is {value}; every step and origin must be finite (§5.3)")
 
 
+def _check_provenance(prov: Provenance, report: Report) -> None:
+    """Findings a parse deliberately does not raise on.
+
+    The reader refuses what is structurally impossible and surfaces everything else
+    raw, because "from a newer registry" and "malformed" call for different reactions
+    from a caller. A validator is the tool whose job is to name the difference, so the
+    unrecognized values and the writer-side inconsistencies are reported here — as
+    warnings and notes, not errors, since a file carrying them still decodes.
+    """
+    for frame in prov.frames:
+        where = f"CoordinateFrame {frame.name!r}"
+        if frame.handedness not in (0, 1, 2):
+            report.warn(f"{where} handedness {frame.handedness} is not in the registry")
+        if frame.length_unit not in LENGTH_UNIT_METRES and frame.length_unit != 0:
+            report.warn(f"{where} length_unit {frame.length_unit} is not in the registry")
+        declared = LENGTH_UNIT_METRES.get(frame.length_unit)
+        if declared is not None and frame.metres_per_unit > 0.0:
+            # An error, not a warning. A writer MUST make the two agree, so a file where
+            # they differ is non-conforming — and reporting it as a warning would bless
+            # the shape. That a consumer still has a defined answer (the number wins) is a
+            # rule about the file it was handed, not a licence to write one.
+            if abs(frame.metres_per_unit - declared) > 1e-12 * max(declared, 1.0):
+                report.error(
+                    f"{where} declares length_unit {frame.length_unit} ({declared} m per unit) and "
+                    f"metres_per_unit {frame.metres_per_unit}; a writer must make them agree. A "
+                    f"consumer handed this file takes metres_per_unit (section 5.15.2)"
+                )
+        if frame.handedness == 0:
+            report.note(f"{where} does not state a handedness, so a consumer cannot mirror-correct it")
+
+    for anchor in prov.anchors:
+        # The ranges themselves are refused at parse; what is left for a validator is the
+        # anchor that is legal and useless.
+        if anchor.latitude_deg == 0.0 and anchor.longitude_deg == 0.0:
+            report.warn(
+                f"a GeodeticAnchor for frame {anchor.frame_name!r} sits at exactly (0, 0), which is "
+                f"far more often an unset field than a location in the Gulf of Guinea"
+            )
+        frame = prov.frame_named(anchor.frame_name)
+        if frame is not None and frame.forward_axis == frame.up_axis:
+            report.error(
+                f"a GeodeticAnchor anchors frame {anchor.frame_name!r}, whose forward axis its "
+                f"heading is measured against is degenerate"
+            )
+
+    for sensor in prov.sensors:
+        if sensor.camera_model not in rec.CAMERA_MODEL_COEFFICIENTS:
+            report.warn(
+                f"sensor {sensor.name!r} names camera model {sensor.camera_model}, which is not in "
+                f"the registry; a reader that cannot project with it must decline rather than "
+                f"apply part of it (section 5.15.3)"
+            )
+        if sensor.is_camera and not (0.0 <= sensor.cx <= sensor.width_px and 0.0 <= sensor.cy <= sensor.height_px):
+            report.warn(
+                f"sensor {sensor.name!r} has a principal point ({sensor.cx}, {sensor.cy}) outside its "
+                f"{sensor.width_px}x{sensor.height_px} image"
+            )
+
+    for trajectory in prov.trajectories:
+        if trajectory.sample_count == 0:
+            report.warn(
+                f"trajectory {trajectory.name!r} carries no samples; it is read as though absent "
+                f"and should have been omitted (section 5.15.4)"
+            )
+        if trajectory.interpolation not in (0, 1):
+            report.warn(
+                f"trajectory {trajectory.name!r} names interpolation {trajectory.interpolation}, "
+                f"which is not in the registry"
+            )
+
+    if not prov.frames and (prov.sensors or prov.trajectories):
+        report.note(
+            "the file carries sensor or rig provenance but no CoordinateFrame record, so the frame "
+            "those poses are expressed in is whatever the consumer assumes"
+        )
+
+
 def validate(data: bytes) -> Report:
     report = Report()
     try:
@@ -102,6 +180,7 @@ def validate(data: bytes) -> Report:
     counted = 0
     index: list[rec.ChunkIndexEntry] = []
     footer = None
+    provenance = Provenance()
 
     try:
         for record in iter_records(data, len(MAGIC)):
@@ -124,6 +203,19 @@ def validate(data: bytes) -> Report:
                 index.append(rec.ChunkIndexEntry.parse(record.content))
             elif record.opcode == op.FOOTER:
                 footer = rec.Footer.parse(record.content)
+            elif record.opcode == op.COORDINATE_FRAME:
+                provenance.frames.append(rec.CoordinateFrame.parse(record.content))
+            elif record.opcode == op.SENSOR_CALIBRATION:
+                provenance.sensors.append(rec.SensorCalibration.parse(record.content))
+            elif record.opcode == op.RIG_TRAJECTORY:
+                provenance.trajectories.append(rec.RigTrajectory.parse(record.content))
+            elif record.opcode == op.GEODETIC_ANCHOR:
+                provenance.anchors.append(rec.GeodeticAnchor.parse(record.content))
+            elif op.is_provenance(record.opcode):
+                report.note(
+                    f"reserved provenance record 0x{record.opcode:02X} — skipped, as required "
+                    f"(0x24-0x2F, section 5.15.6)"
+                )
             elif op.is_private(record.opcode):
                 report.note(
                     f"private record 0x{record.opcode:02X} ({len(record.content)} bytes) — skipped, as required"
@@ -144,6 +236,12 @@ def validate(data: bytes) -> Report:
         report.error("no Quantization record")
     if footer is None:
         report.error("no Footer record")
+
+    try:
+        provenance.check()
+    except FourdgsError as exc:
+        report.error(str(exc))
+    _check_provenance(provenance, report)
 
     if header is not None and counted != header.gaussian_count:
         report.error(f"Header declares {header.gaussian_count} gaussians; chunks contain {counted}")
