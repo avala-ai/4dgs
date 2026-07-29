@@ -175,6 +175,15 @@ jobs:
     # npmAuthToken — which is the credential this repository refuses to have.
     # A token in a secret outlives the job that created it; an OIDC exchange
     # does not. So Yarn installs and builds, npm publishes.
+    #
+    # One consequence of that split is handled explicitly below: npm packs
+    # `workspace:^` dependency ranges verbatim (verified against npm 12.0.1),
+    # so without the resolve step this job would publish tarballs no
+    # consumer's npm can install — and it would do so with a green run.
+    #
+    # First real release must version past 0.0.1: the placeholder publishes
+    # that claimed the @4dgs scope sit at 0.0.1 on the registry, and npm
+    # refuses to tag a lower version as latest.
     if: false
     runs-on: ubuntu-latest
     environment: release
@@ -235,6 +244,50 @@ jobs:
           yarn build
         env:
           COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+
+      - name: Resolve workspace ranges to the release version
+        # Yarn understands `workspace:^`; npm does not, and `npm pack` puts
+        # the specifier into the tarball untranslated. The four packages
+        # version together, so every internal range resolves to the version
+        # being tagged. This rewrites the manifests in the runner's checkout
+        # only — the repository keeps the workspace ranges.
+        run: |
+          rest="${GITHUB_REF#refs/tags/releases/typescript/}"
+          version="${rest##*/v}"
+          node - "$version" <<'EOF'
+          const fs = require("fs");
+          const version = process.argv[2];
+          for (const dir of fs.readdirSync("typescript", { withFileTypes: true })) {
+            const path = `typescript/${dir.name}/package.json`;
+            if (!dir.isDirectory() || !fs.existsSync(path)) continue;
+            const manifest = JSON.parse(fs.readFileSync(path, "utf8"));
+            let changed = false;
+            for (const field of ["dependencies", "peerDependencies", "optionalDependencies"]) {
+              for (const [name, range] of Object.entries(manifest[field] ?? {})) {
+                if (!range.startsWith("workspace:")) continue;
+                manifest[field][name] = `^${version}`;
+                changed = true;
+              }
+            }
+            if (!changed) continue;
+            fs.writeFileSync(path, JSON.stringify(manifest, null, 2) + "\n");
+            console.log(`${path}: workspace ranges -> ^${version}`);
+          }
+          EOF
+
+      - name: No workspace range survives into the tarball
+        # The proof the step above worked, taken from the artifact itself
+        # rather than the manifest: pack the package about to be published
+        # and refuse if the specifier npm cannot install is still inside.
+        run: |
+          rest="${GITHUB_REF#refs/tags/releases/typescript/}"
+          package="${rest%/v*}"
+          tarball=$(cd "typescript/$package" && npm pack --silent)
+          if tar -xzOf "typescript/$package/$tarball" package/package.json | grep -q '"workspace:'; then
+            echo "::error::the packed manifest still carries a workspace: range — publishing it would ship an uninstallable package"
+            exit 1
+          fi
+          rm "typescript/$package/$tarball"
 
       - name: Publish
         # No --provenance: under trusted publishing npm attests automatically,
