@@ -26,14 +26,15 @@ from fourdgs.compressed_ply import CHUNK_SIZE, import_scene, is_compressed_ply, 
 from fourdgs.quantization import SH_QUANT_HI, SH_QUANT_LO
 
 _STATIC_PROPS = ["packed_position", "packed_rotation", "packed_scale", "packed_color"]
-_TEMPORAL_PROPS = _STATIC_PROPS + ["packed_motion", "packed_time"]
+_TEMPORAL_PROPS = [*_STATIC_PROPS, "packed_motion", "packed_time"]
 
 _CHUNK_FIELDS_18 = [
     "min_x", "min_y", "min_z", "max_x", "max_y", "max_z",
     "min_scale_x", "min_scale_y", "min_scale_z", "max_scale_x", "max_scale_y", "max_scale_z",
     "min_r", "min_g", "min_b", "max_r", "max_g", "max_b",
 ]  # fmt: skip
-_CHUNK_FIELDS_28 = _CHUNK_FIELDS_18 + [
+_CHUNK_FIELDS_28 = [
+    *_CHUNK_FIELDS_18,
     "min_motion_x", "min_motion_y", "min_motion_z", "max_motion_x", "max_motion_y", "max_motion_z",
     "min_time_scale", "max_time_scale", "min_time", "max_time",
 ]  # fmt: skip
@@ -160,7 +161,9 @@ def test_time_cutoff_bits_are_ignored(tmp_path):
     base = pack_11_10_11(0.5, 0.5, 0.0)
     noisy = pack_11_10_11(0.5, 0.5, 1.0)
     p = tmp_path / "cut.ply"
-    p.write_bytes(build_ply(temporal=True, count=2, bounds=bounds, vertices=[{"packed_time": base}, {"packed_time": noisy}]))
+    p.write_bytes(
+        build_ply(temporal=True, count=2, bounds=bounds, vertices=[{"packed_time": base}, {"packed_time": noisy}])
+    )
     got = read_compressed_ply(str(p))
     assert got["mu_t"][0] == pytest.approx(got["mu_t"][1])
     assert got["sigma_t"][0] == pytest.approx(got["sigma_t"][1])
