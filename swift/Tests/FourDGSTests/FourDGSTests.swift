@@ -60,7 +60,7 @@ final class TimeTests: XCTestCase {
     func testStateAtTimeMovesAndFades() {
         let g = gaussian(muT: 0, sigmaT: 1, winLo: 0, winHi: 10)
         let s = g.state(at: 1)
-        XCTAssertEqual(s.position.x, 10, accuracy: 1e-5)
+        XCTAssertEqual(s.position.x, 11, accuracy: 1e-5)  // rest 1 + velocity 10 × (1 − muT 0)
         XCTAssertEqual(s.color.w, 0.8 * Float(_exp(-0.5)), accuracy: 1e-6)
         // Everything else is untouched — decode ends at state, it does not reinterpret it.
         XCTAssertEqual(s.scale, g.scale)

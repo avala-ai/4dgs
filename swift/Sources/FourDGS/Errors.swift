@@ -86,12 +86,14 @@ extension FourDGSError: CustomStringConvertible {
             return
                 "summary CRC mismatch at byte \(offset): the Footer declares \(declared), the bytes compute \(computed)"
         case .unsupportedCodec(let offset, let record, let name):
-            return "unsupported codec \"\(name)\" named by \(record) at byte \(offset); the file is legal, this reader is not new enough"
+            return
+                "unsupported codec \"\(name)\" named by \(record) at byte \(offset); the file is legal, this reader is not new enough"
         case .unsupportedValue(let offset, let record, let field, let value):
             return
                 "unsupported \(record).\(field) value \"\(value)\" at byte \(offset); the file is legal, this reader is not new enough"
         case .noChunkIndex:
-            return "this file declares no chunk index (Footer.summary_start is 0) and must be read sequentially"
+            return
+                "this file declares no chunk index (Footer.summary_start is 0) and must be read sequentially"
         case .invalidRange(let offset, let count):
             return "invalid range: offset \(offset), count \(count)"
         case .unreadableSource(let description):
