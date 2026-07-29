@@ -20,7 +20,7 @@ use crate::serialization::{
 pub const FLAG_HAS_AUDIO: u8 = 1 << 0;
 pub const FLAG_CHUNKS_COMPRESSED: u8 = 1 << 1;
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Header {
     pub profile: String,
     pub library: String,
@@ -32,6 +32,32 @@ pub struct Header {
     pub sh_degree: u8,
     pub flags: u8,
     pub attributes: BTreeMap<String, String>,
+}
+
+impl Default for Header {
+    /// A default Header declares the temporal model this version defines.
+    ///
+    /// Deriving `Default` left `temporal_model` empty, which is not a value the registry
+    /// lists — so a Header built this way and written out produced a file every
+    /// conforming reader must refuse, by a rule that names the field. It never reached a
+    /// real file because the writer sets the model explicitly, but the two SDKs disagreed
+    /// about what an unspecified Header means, and the Python dataclass has always
+    /// defaulted to `gaussian-birth`. Two implementations of one format do not get to
+    /// have different defaults.
+    fn default() -> Self {
+        Self {
+            profile: String::new(),
+            library: String::new(),
+            duration_sec: 0.0,
+            gaussian_count: 0,
+            cutoff: 0.0,
+            temporal_model: "gaussian-birth".into(),
+            aabb: Vec::new(),
+            sh_degree: 0,
+            flags: 0,
+            attributes: BTreeMap::new(),
+        }
+    }
 }
 
 impl Header {
