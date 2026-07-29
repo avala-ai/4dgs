@@ -181,6 +181,16 @@ jobs:
       - name: Tests
         run: swift test --package-path swift
 
+      # The canonical JSON is a contract between languages, and this is where Swift's half
+      # of it is checked — against canonical.py, on a synthetic scene, with no decoding in
+      # the way. Doing it now means that when the C ABI lands, a conformance mismatch is
+      # about the decode and nothing else.
+      - name: Canonical JSON agrees with canonical.py
+        run: |
+          apt-get update -qq && apt-get install -y -qq python3-numpy >/dev/null
+          swift run --package-path swift canonical_selftest > /tmp/swift.json
+          python3 swift/conformance/selftest.py --compare /tmp/swift.json
+
   swift-darwin:
     # visionOS and iOS are the platforms this package exists for, and a Linux build proves
     # nothing about either. The macOS runner is where the platform declarations in

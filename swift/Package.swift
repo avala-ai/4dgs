@@ -24,5 +24,12 @@ let package = Package(
             name: "decode_streamed", dependencies: ["ConformanceSupport"], path: "conformance/decode_streamed"),
         .executableTarget(
             name: "decode_indexed", dependencies: ["ConformanceSupport"], path: "conformance/decode_indexed"),
+
+        // Prints the canonical JSON for a scene built from a fixed seed, with no decoding
+        // involved, so that the Swift emitter can be diffed against canonical.py before
+        // there is a decoder. See conformance/selftest.py.
+        .executableTarget(
+            name: "canonical_selftest", dependencies: ["ConformanceSupport"],
+            path: "conformance/canonical_selftest"),
     ]
 )

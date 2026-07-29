@@ -16,6 +16,10 @@ All notable changes to the Swift package are documented here, following
   the tests that pin it, including that the cutoff comes from the file's own Header.
 - `conformance/`, building `decode_streamed` and `decode_indexed`, registered in
   `tests/conformance/run.py` and skipped until built.
+- A canonical-JSON self-test: `canonical_selftest` and `conformance/selftest.py` build the same
+  synthetic scene from the same seed in each language, and CI asserts that the Swift emitter and
+  `tests/conformance/canonical.py` produce documents that parse equal. It runs with no decoding
+  involved, so a conformance mismatch once the ABI lands is about the decode and nothing else.
 
 ### Not yet
 

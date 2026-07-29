@@ -27,6 +27,7 @@ words:
   - Kaitai
   - typedoc
   - visionOS
+  - selftest
   - RealityKit
   - Catmull
   - extrinsics
