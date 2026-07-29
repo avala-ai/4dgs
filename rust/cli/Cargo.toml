@@ -7,8 +7,12 @@ license = "Apache-2.0"
 description = "Command line tool for the 4dgs container format"
 homepage = "https://4dgs.dev"
 repository = "https://github.com/avala-ai/4dgs"
-# Unpublished for the same reason the core is: the crate ships when the maintainer says
-# so, not when a tag happens to exist.
+# The core is published; this is not, and the reason is specific rather than a policy.
+# crates.io trusted publishing is configured per crate, and a crate has to exist before
+# a publisher can be attached to it — `fourdgs-cli` does not, so the release job has no
+# way to authenticate for it and would fall back to a stored token, which this repository
+# does not have and should not acquire. Claiming the name and attaching a publisher is
+# the prerequisite; until then the tool is `cargo install --git` or a build from source.
 publish = false
 
 # The tool is `4dgs` everywhere a user types it. The crate is `fourdgs-cli` because

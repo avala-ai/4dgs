@@ -6,23 +6,18 @@ All notable changes to the Rust crate are documented here, following
 
 ## [Unreleased]
 
-### Fixed
+## [0.1.0] - 2026-07-29
 
-- A file cut between a chunk and its spherical harmonic band records was refused as malformed
-  instead of recovering the complete prefix. Bands are whole, so the short trailing chunks are
-  dropped and everything that arrived intact is kept.
-- Asking for fewer spherical harmonic bands than were already resident answered from the cache,
-  handing back a higher degree than requested and transferring nothing — which is exactly what a
-  band-skipping byte budget measures.
-- The front-matter probe read 64 KiB, which on a small file was the whole thing. It is 8 KiB now:
-  the records an indexed open must parse are a few hundred bytes, and everything else in the front
-  matter is stepped over rather than read.
+The first release of the Rust crate, and the first cut from a tag. It is the decoder and the
+production encoder, and it is what the C++ and Swift packages bind to: the C ABI in
+`include/fourdgs.h` is part of this release, not a side effect of it.
 
-### Changed
+`fourdgs-cli`, which installs the `4dgs` tool, is not released here. It is unpublished for a reason
+recorded in its manifest.
 
-- The streamed reader's retained summary run narrowed to Chunk Index, Statistics and Summary Offset,
-  matching the new spec §4.5. Attachments are no longer retained: their size is unbounded, and
-  admitting them would have made verifying a checksum cost whatever the payload weighed.
+_Fixed_ and _Changed_ below describe behaviour that changed against the pre-release code in this
+repository, which people do vendor from git — not against `0.0.1`, which held the name on crates.io
+and contained nothing.
 
 ### Added
 
@@ -48,7 +43,26 @@ All notable changes to the Rust crate are documented here, following
   Rust and Python decoders to agree on the result, because an encoder checked only against its own
   decoder proves nothing about the format.
 
-Not released. `fourdgs 0.0.1` on crates.io is a name reservation, published by hand to hold the name
-against Cargo's rule that a crate name may not begin with a digit; it contains no implementation and
-nothing should depend on it. The first release with a decoder in it will be `0.1.0`, and it will be
-cut from a tag like every other release here.
+### Fixed
+
+- A file cut between a chunk and its spherical harmonic band records was refused as malformed
+  instead of recovering the complete prefix. Bands are whole, so the short trailing chunks are
+  dropped and everything that arrived intact is kept.
+- Asking for fewer spherical harmonic bands than were already resident answered from the cache,
+  handing back a higher degree than requested and transferring nothing — which is exactly what a
+  band-skipping byte budget measures.
+- The front-matter probe read 64 KiB, which on a small file was the whole thing. It is 8 KiB now:
+  the records an indexed open must parse are a few hundred bytes, and everything else in the front
+  matter is stepped over rather than read.
+
+### Changed
+
+- The streamed reader's retained summary run narrowed to Chunk Index, Statistics and Summary Offset,
+  matching the new spec §4.5. Attachments are no longer retained: their size is unbounded, and
+  admitting them would have made verifying a checksum cost whatever the payload weighed.
+
+## [0.0.1] - 2026-07-28
+
+A name reservation, published by hand before the release workflow existed, to hold the name against
+Cargo's rule that a crate name may not begin with a digit. It contains no implementation, has no tag
+and no GitHub Release, and nothing should depend on it.
