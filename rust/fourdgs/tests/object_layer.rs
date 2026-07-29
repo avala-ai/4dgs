@@ -364,6 +364,17 @@ fn refusals_name_their_fault() {
 
 #[test]
 fn scene_reader_composes_authoritative_object_motion_on_both_paths() {
+    let streamed = fourdgs::read_bytes(&object_file(false, false)).expect("stream object file");
+    let state = streamed
+        .state_at(0.5)
+        .expect("reconstruct streamed public state");
+    assert_eq!(state.count(), 1);
+    assert!((state.centers[0] - 10.0).abs() < 1e-4);
+    assert!((state.centers[1] - 1.0).abs() < 1e-4);
+    for (got, want) in state.orientations.iter().zip(Q_Z90) {
+        assert!((*got - want as f32).abs() < 1e-5);
+    }
+
     for mode in [OpenMode::Sequential, OpenMode::Indexed] {
         let bytes = object_file(mode == OpenMode::Indexed, false);
         let mut reader =

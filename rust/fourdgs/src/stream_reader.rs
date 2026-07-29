@@ -83,6 +83,26 @@ pub struct Scene {
     pub chunk_intervals: Vec<(f64, f64)>,
 }
 
+impl Scene {
+    /// Reconstructed gaussian state at scene time `t`, including authoritative Object
+    /// Tracks. This is the front-to-back counterpart of [`crate::reader::SceneReader::state_at`].
+    pub fn state_at(&self, t: f64) -> Result<crate::model::StateAt> {
+        let mut state = self.gaussians.state_at(t, self.header.cutoff);
+        let visible_object_ids = self.gaussians.object_id.as_ref().map(|object_ids| {
+            state
+                .indices
+                .iter()
+                .map(|&index| object_ids[index as usize])
+                .collect::<Vec<u32>>()
+        });
+        if let Some(object_ids) = visible_object_ids.filter(|ids| ids.iter().any(|id| *id != 0)) {
+            self.objects
+                .apply(&mut state.centers, &mut state.orientations, &object_ids, t)?;
+        }
+        Ok(state)
+    }
+}
+
 /// Decode a whole file from any byte source.
 pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
     let mut source = io::BufReader::new(source);

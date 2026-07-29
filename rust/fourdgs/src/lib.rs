@@ -18,7 +18,7 @@
 //! ```no_run
 //! // Front to back: works on a pipe, on a file with no index, on a file cut short.
 //! let scene = fourdgs::read_path("scene.4dgs")?;
-//! let state = scene.gaussians.state_at(1.5, scene.header.cutoff);
+//! let state = scene.state_at(1.5)?;
 //! println!("{} gaussians visible at t=1.5", state.count());
 //!
 //! // Indexed: the Footer, then the index, then only the byte ranges an instant needs.
