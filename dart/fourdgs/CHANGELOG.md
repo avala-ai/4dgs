@@ -32,6 +32,12 @@ happened.
   `tests/conformance/run.py` and skipped until built. 67 checks pass across both read paths — every
   variant this SDK declares support for. It declines the five that carry provenance records and the
   invalid corpus's refusal expectations, the same way TypeScript, C++ and Swift do.
+- Tests for the one behaviour the corpus cannot reach: the indexed reader's front-matter scan runs
+  to the first Chunk, so a Camera, Metadata or Attachment record sitting behind a large embedded
+  audio track is still found. The harness only ever exercises the default 64 KiB probe on scenes
+  that fit inside it, so a scan that stopped early would pass every check; these decode a real
+  corpus file at probes down to 64 bytes and assert that shrinking it changes the number of round
+  trips and nothing else. They fail rather than skip when the corpus is absent.
 
 ### Security
 

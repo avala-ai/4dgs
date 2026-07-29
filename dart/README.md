@@ -68,11 +68,16 @@ The Dart SDK, 3.7 or newer. It ships with Flutter, so `dart` is already on the p
 Flutter installed.
 
 ```bash
+python3 tests/conformance/generate.py   # from the repository root, first
 cd dart/fourdgs
 dart pub get
 dart analyze
 dart test
 ```
+
+The corpus comes first because `test/front_matter_test.dart` decodes real files from it. Those tests
+**fail rather than skip** when it is absent — a test that quietly tested nothing is worse than no
+test. The rest of the suite needs nothing but the package.
 
 The conformance runners are compiled rather than run from source, so that a machine without a Dart
 SDK reports them as _not built_ and skips them instead of failing 67 checks:

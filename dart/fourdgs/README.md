@@ -62,8 +62,26 @@ Future<void> main() async {
 
 Opening a scene reads the front matter and the index, never the file. Audio, camera, metadata and
 attachments are byte ranges until you ask for them — `readFourdgsAudio`, `readFourdgsCamera`,
-`readFourdgsMetadata`, `readFourdgsAttachments` — so a scene with a soundtrack costs nothing to open
-and a scene without one carries no audio record at all.
+`readFourdgsMetadata`, `readFourdgsAttachments` — so an embedded soundtrack is never transferred to
+open a scene, and a scene without one carries no audio record at all.
+
+**What opening actually costs.** One read of 64 KiB from the front, plus one for the footer and one
+for the index. `scene.headerBytes` reports what the front-matter scan transferred — every read it
+made, not just the first — so a caller can measure the part that varies rather than assume it.
+
+A scene whose front matter is larger than that probe costs **one extra round trip** — in practice,
+one with an embedded audio track, because the track sits in the front matter and the scan has to
+reach the first Chunk to know what else is there. The record itself is still stepped over by
+arithmetic rather than transferred, so the extra request is another 64 KiB and not another six
+megabytes.
+
+That is a deliberate trade against an earlier design that stopped as soon as the Header, the
+Quantization grids and the Window Table were in hand. The specification fixes the Header first and
+the Footer last and leaves the order of everything between them free, so a Camera, a Metadata record
+or an Attachment may legally sit after the Window Table — and a scan that stopped early reported a
+scene without them. What a reader says about a file must not depend on where its probe happened to
+stop. Pass a larger `probeBytes` to `openFourdgsIndexed` if you know your scenes have big front
+matter and would rather spend one bigger request than two.
 
 ## Any transport
 

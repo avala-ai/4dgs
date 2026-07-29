@@ -493,12 +493,23 @@ jobs:
       # ran on the latest Dart is a package whose lower bound is a guess.
       - uses: dart-lang/setup-dart@v1
         with: { sdk: "3.7" }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
       - run: dart --version
 
       - name: Resolve
         run: |
           cd dart/fourdgs && dart pub get
           cd ../conformance && dart pub get
+
+      # The front-matter tests decode real corpus files, which are generated
+      # rather than committed. They fail rather than skip without one, so
+      # generating it first is what stops them skipping themselves into a green
+      # run that proved nothing.
+      - name: Corpus
+        run: |
+          pip install -e ./python/fourdgs
+          python tests/conformance/generate.py
 
       # Formatting and analysis read source and nothing else, so running them on three
       # operating systems would report the same answer three times.
