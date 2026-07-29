@@ -57,6 +57,20 @@ jobs:
   kaitai:
     # The .ksy grammar is an executable restatement of the spec: if it stops parsing the
     # corpus, the spec and the implementation have diverged.
+    #
+    # This job is a placeholder, not an invocation. There is no `.ksy` file in this
+    # repository — the step below echoes and exits, and deleting the `if: false` would
+    # produce a green job that validated nothing, which is worse than a disabled one.
+    # Recorded explicitly because a disabled job is untested by construction and the two
+    # kinds are not equally safe: a job that once ran and has since gone stale looks real
+    # and fails when enabled, while this one never ran and would pass while proving
+    # nothing. Enabling it is three pieces of work, not a one-line flip:
+    #
+    #   1. write the grammar, covering at least the Header, the record framing and the
+    #      Chunk Index — the structures a reader has to get right to seek at all;
+    #   2. add a step that installs the Kaitai Struct compiler and a runtime;
+    #   3. parse every generated corpus variant with it and fail on the first that does
+    #      not, which is the check the comment above describes.
     runs-on: ubuntu-latest
     needs: corpus
     if: false # enabled with the grammar
