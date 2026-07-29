@@ -36,13 +36,16 @@ self-contained resource you can range-request and seek like a video.
 
 ## Libraries
 
-| Language   | Readme                     | Package      | Status                   |
-| ---------- | -------------------------- | ------------ | ------------------------ |
-| Python     | [python/](python/)         | `4dgs`       | Reference implementation |
-| TypeScript | [typescript/](typescript/) | `@4dgs/core` | In progress              |
-| Rust       | [rust/](rust/)             | —            | Planned                  |
-| C++        | [cpp/](cpp/)               | —            | Planned                  |
-| Swift      | [swift/](swift/)           | —            | Planned (visionOS)       |
+| Language   | Readme                     | Package      | Status                        |
+| ---------- | -------------------------- | ------------ | ----------------------------- |
+| Python     | [python/](python/)         | `fourdgs`    | Reference implementation      |
+| TypeScript | [typescript/](typescript/) | `@4dgs/core` | Decoder, conformance-verified |
+| Rust       | [rust/](rust/)             | `fourdgs`    | Planned                       |
+| C++        | [cpp/](cpp/)               | —            | Planned                       |
+| Swift      | [swift/](swift/)           | —            | Planned (visionOS)            |
+
+Package names are `fourdgs` where a registry will not take `4dgs`; the format, the CLI and the file
+extension are always `4dgs`. [RELEASING.md](RELEASING.md) has the constraint per registry.
 
 Support is per-feature, not per-language: see the [feature matrix](website/docs/reference/index.md),
 which the conformance suite enforces.
