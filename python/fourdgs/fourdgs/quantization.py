@@ -31,6 +31,17 @@ from .exceptions import MalformedFile
 
 PROFILES = ("fine", "default", "coarse")
 
+#: The interval this codec maps unsigned-byte spherical-harmonic coefficients onto.
+#:
+#: The format is deliberate that "the stored byte is the coefficient" and that `step_sh`
+#: is an encode-side record a decoder does nothing with (spec section 6.5), so the
+#: byte-to-float mapping is this **codec's** convention rather than a format guarantee.
+#: It lives here because two importers have to agree on it — the PLY one and the glTF
+#: one — and a file converted through one and out through the other would otherwise
+#: change appearance for no stated reason.
+SH_QUANT_LO = -4.0
+SH_QUANT_HI = 4.0
+
 #: The Header's default marginal visibility threshold.
 DEFAULT_CUTOFF = 0.05
 

@@ -17,6 +17,7 @@ import numpy as np
 
 from . import __version__, read
 from .convert import convert_ply_sequence
+from .gltf import from_gltf, to_gltf
 from .indexed_reader import open_indexed
 from .readable import FileReadable
 from .validate import validate
@@ -80,6 +81,36 @@ def cmd_convert(args) -> int:
     return 0
 
 
+def cmd_from_gltf(args) -> int:
+    imported = from_gltf(args.source)
+    written = write(
+        args.out,
+        imported.gaussians,
+        # A static asset has nothing to play. Its gaussians carry an infinite validity
+        # window, so they are present at whatever instant a reader asks for.
+        0.0,
+        options=WriteOptions(profile=args.profile, scene_profile="baked", metadata=imported.metadata),
+    )
+    print(f"{imported.gaussians.count:,} gaussians (static) -> {args.out} ({written / 2**20:.2f} MiB)")
+    return 0
+
+
+def cmd_to_gltf(args) -> int:
+    scene = read(args.file)
+    attributes = scene.header.attributes
+    written = to_gltf(
+        args.out,
+        scene.gaussians,
+        args.time,
+        cutoff=scene.header.cutoff,
+        coordinate_system=args.coordinate_system or attributes.get("coordinate_system", ""),
+        color_space=args.color_space or attributes.get("color_space"),
+        max_sh_degree=args.sh_degree,
+    )
+    print(f"state at t={args.time:.3f}s -> {args.out} ({written / 2**20:.2f} MiB)")
+    return 0
+
+
 def cmd_decode(args) -> int:
     scene = read(args.file)
     # The file's own threshold, from its Header. Letting this default meant a file that
@@ -114,6 +145,24 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--fps", type=float, default=30.0)
     c.add_argument("--profile", default="default", choices=("fine", "default", "coarse"))
     c.set_defaults(func=cmd_convert)
+
+    fg = sub.add_parser("from-gltf", help="a static KHR_gaussian_splatting glTF/GLB -> .4dgs")
+    fg.add_argument("source", help="a .gltf or .glb carrying the KHR_gaussian_splatting extension")
+    fg.add_argument("-o", "--out", required=True)
+    fg.add_argument("--profile", default="default", choices=("fine", "default", "coarse"))
+    fg.set_defaults(func=cmd_from_gltf)
+
+    tg = sub.add_parser("to-gltf", help="the state at one instant -> a static KHR_gaussian_splatting glTF/GLB")
+    tg.add_argument("file")
+    tg.add_argument("-o", "--out", required=True, help="a .glb, or a .gltf written beside its .bin")
+    tg.add_argument("-t", "--time", type=float, default=0.0)
+    tg.add_argument(
+        "--coordinate-system",
+        help="override the scene's own; required when it declares none, since glTF's frame is not a guess",
+    )
+    tg.add_argument("--color-space", help="override the scene's own")
+    tg.add_argument("--sh-degree", type=int, default=3, choices=(0, 1, 2, 3), help="cap the exported degree")
+    tg.set_defaults(func=cmd_to_gltf)
 
     d = sub.add_parser("decode", help="report the gaussians visible at an instant")
     d.add_argument("file")

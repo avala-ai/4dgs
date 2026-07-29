@@ -27,6 +27,7 @@ import numpy as np
 
 from .exceptions import MalformedFile
 from .model import GaussianSet
+from .quantization import SH_QUANT_HI, SH_QUANT_LO
 
 _PLY_TYPES = {
     "char": "i1",
@@ -160,7 +161,8 @@ def convert_ply_sequence(directory: str, *, fps: float = 30.0) -> tuple[Gaussian
             sh_degree = {9: 1, 24: 2, 45: 3}.get(len(rest), 0)
             if sh_degree:
                 coeffs = np.stack([f[k] for k in rest], axis=1)
-                sh_rows.append(np.clip(np.rint((coeffs + 4.0) / 8.0 * 255.0), 0, 255).astype(np.uint8))
+                span = SH_QUANT_HI - SH_QUANT_LO
+                sh_rows.append(np.clip(np.rint((coeffs - SH_QUANT_LO) / span * 255.0), 0, 255).astype(np.uint8))
 
         positions.append(pos)
         scales.append(scale)

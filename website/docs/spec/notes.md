@@ -147,7 +147,9 @@ is where it belongs.
 Non-normative, and a moving target: the glTF gaussian-splatting extension (`KHR_gaussian_splatting`)
 was at **Release Candidate** status when this was written (2026-07). Check its current status before
 relying on any of the below, and re-read the extension rather than this summary if the two ever
-disagree.
+disagree. The reference SDK implements this mapping in both directions (`4dgs from-gltf`,
+`4dgs to-gltf`); the guide [glTF interoperability](../guides/interop-gltf.md) is the operational
+version of this section, including what it refuses and why.
 
 **The relationship is complementary, not competitive.** That extension describes a static set of
 gaussians. It has no temporal model — not deferred, simply absent. This format is a temporal

@@ -10,6 +10,7 @@ const sidebars = {
   guidesSidebar: [
     { type: "doc", id: "guides/index", label: "Overview" },
     { type: "doc", id: "guides/concepts", label: "Concepts" },
+    { type: "doc", id: "guides/interop-gltf", label: "glTF interoperability" },
     {
       type: "category",
       label: "Getting started",

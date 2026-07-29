@@ -42,6 +42,11 @@ words:
   - coef
   - Shortley
   - Condon
+  # glTF and the Khronos extension registry
+  - Khronos
+  - gltf
+  - meshopt
+  - Wigner
   - srgb
   - rec709
   - Avala
