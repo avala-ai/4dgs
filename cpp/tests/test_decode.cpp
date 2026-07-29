@@ -69,6 +69,27 @@ std::vector<std::uint8_t> readWhole(const std::string& path, bool* found) {
   return bytes;
 }
 
+/// The codes this package documents. Anything else — or an empty message — means a caller
+/// cannot tell what to do about the failure, which is the whole point of the enum.
+bool isDocumented(const fourdgs::Error& error) {
+  switch (error.code) {
+    case fourdgs::ErrorCode::kInvalidArgument:
+    case fourdgs::ErrorCode::kIo:
+    case fourdgs::ErrorCode::kBadMagic:
+    case fourdgs::ErrorCode::kUnsupportedVersion:
+    case fourdgs::ErrorCode::kTruncated:
+    case fourdgs::ErrorCode::kMalformed:
+    case fourdgs::ErrorCode::kUnsupported:
+    case fourdgs::ErrorCode::kChecksumMismatch:
+    case fourdgs::ErrorCode::kInternal:
+      return !error.message.empty();
+    case fourdgs::ErrorCode::kOk:
+    case fourdgs::ErrorCode::kNotImplemented:
+      return false;
+  }
+  return false;
+}
+
 /// Three entry points, one decoder. A path, a buffer and a caller's transport must not
 /// disagree about what a file contains.
 void everyDoorOpensTheSameScene(const std::string& path, const std::vector<std::uint8_t>& bytes) {
@@ -186,6 +207,52 @@ void audioReadsBackAtItsDeclaredLength(Scene& scene) {
   }
 }
 
+/// Every refusal is a documented error, and no input is a crash.
+///
+/// The corpus is all well-formed files, so this makes ill-formed ones: cut the file at a
+/// dozen points, flip a byte in each region, blank the magic. What comes back must be a
+/// `Result` carrying one of this package's codes with a sentence in it — never a throw
+/// across the ABI, never a partial read past the end of the buffer, never silence. Under the
+/// sanitizers this is also where a malformed length that made the decoder index out of
+/// bounds would show up.
+void malformedInputIsRefusedAndNamed(const std::vector<std::uint8_t>& original) {
+  std::vector<std::vector<std::uint8_t>> broken;
+
+  for (int cut = 1; cut <= 12; ++cut) {
+    const std::size_t at = original.size() * static_cast<std::size_t>(cut) / 13;
+    broken.push_back(std::vector<std::uint8_t>(original.begin(), original.begin() + at));
+  }
+  for (int at : {0, 3, 7, 9, 17, 33, 64, 129}) {
+    if (static_cast<std::size_t>(at) >= original.size()) continue;
+    std::vector<std::uint8_t> flipped = original;
+    flipped[static_cast<std::size_t>(at)] ^= 0xFF;
+    broken.push_back(std::move(flipped));
+  }
+  std::vector<std::uint8_t> blanked = original;
+  for (std::size_t i = 0; i < 8 && i < blanked.size(); ++i) blanked[i] = 0;
+  broken.push_back(std::move(blanked));
+  broken.push_back(std::vector<std::uint8_t>());
+
+  for (const std::vector<std::uint8_t>& bytes : broken) {
+    Result<std::unique_ptr<Scene>> opened =
+        Scene::openMemory(fourdgs::Span<const std::uint8_t>(bytes.data(), bytes.size()));
+    if (!opened.ok()) {
+      CHECK(isDocumented(opened.error()));
+      continue;
+    }
+    // Opening succeeded, which is legitimate for a file cut after its header. Loading it is
+    // the other half of the boundary, and it has the same obligation.
+    Result<void> loaded = (*opened)->loadAll(3);
+    if (!loaded.ok()) CHECK(isDocumented(loaded.error()));
+
+    Result<fourdgs::State> state = (*opened)->stateAt(0.0, 3);
+    if (!state.ok()) CHECK(isDocumented(state.error()));
+
+    Result<fourdgs::AudioTrack> audio = (*opened)->readAudioTrack();
+    if (!audio.ok()) CHECK(isDocumented(audio.error()));
+  }
+}
+
 void runTests() {
   if (!fourdgs::backendAvailable()) {
     // Nothing to decode, and nothing claimed. The no-core build's contract is `test_seam`'s
@@ -216,6 +283,7 @@ void runTests() {
     theWorkingSetMatchesTheHeader(scene);
     reconstructionAgreesWithTheCore(scene);
     audioReadsBackAtItsDeclaredLength(scene);
+    malformedInputIsRefusedAndNamed(bytes);
   }
 }
 
