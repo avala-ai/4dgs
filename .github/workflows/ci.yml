@@ -173,6 +173,33 @@ jobs:
         env:
           FOURDGS_FUZZ_ITERATIONS: "8000"
 
+  browser:
+    # Two things no Node test can reach: the browser's own DecompressionStream
+    # inflating these streams, and HttpRangeReadable against a server that really
+    # answers 206. Chrome is driven over the DevTools protocol with the WebSocket
+    # client Node already has — no browser-automation dependency.
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+
+      - name: Corpus and build
+        run: |
+          pip install -e ./python/fourdgs
+          python tests/conformance/generate.py
+          corepack enable
+          yarn install --immutable
+          yarn build
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+
+      - name: Decode in Chrome
+        run: node typescript/conformance/dist/browser_smoke.js
+
   rust:
     runs-on: ubuntu-latest
     steps:
