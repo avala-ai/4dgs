@@ -132,7 +132,8 @@ jobs:
       - name: Build the core
         run: |
           apt-get update -qq && apt-get install -y -qq curl build-essential python3-pip >/dev/null
-          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          curl -sSf --retry 5 --retry-all-errors --retry-delay 3 https://sh.rustup.rs |
+            sh -s -- -y --profile minimal --default-toolchain stable
           . "$HOME/.cargo/env"
           cargo build -p fourdgs --release
       # `run.py --runner swift` fails if no Swift runner executed, so a build that silently
