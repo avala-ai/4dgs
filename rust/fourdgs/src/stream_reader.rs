@@ -121,15 +121,13 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
         // wrap it into a value that looks like a plausible position in the file.
         at = at.saturating_add(RECORD_HEADER_SIZE as u64);
 
-        // §4's layout puts Chunk Index, Statistics, Attachment and Summary Offset records
-        // between the chunks and the Footer, so all four can fall inside the CRC's range.
+        // The summary is exactly these three, and §4.5 requires them contiguous immediately
+        // before the Footer — which is what makes this retention exact rather than a guess.
+        // Attachments are deliberately not here: their size is unbounded, and admitting them
+        // would make verifying a checksum cost whatever the payload happens to weigh.
         let is_summary = matches!(
             opcode,
-            op::CHUNK_INDEX
-                | op::STATISTICS
-                | op::ATTACHMENT
-                | op::ATTACHMENT_INDEX
-                | op::SUMMARY_OFFSET
+            op::CHUNK_INDEX | op::STATISTICS | op::SUMMARY_OFFSET
         );
         // The Footer closes the range rather than falling outside it, so it must not reset
         // what the range holds.

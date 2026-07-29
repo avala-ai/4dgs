@@ -18,6 +18,12 @@ All notable changes to the Rust crate are documented here, following
   the records an indexed open must parse are a few hundred bytes, and everything else in the front
   matter is stepped over rather than read.
 
+### Changed
+
+- The streamed reader's retained summary run narrowed to Chunk Index, Statistics and Summary Offset,
+  matching the new spec §4.5. Attachments are no longer retained: their size is unbounded, and
+  admitting them would have made verifying a checksum cost whatever the payload weighed.
+
 ### Added
 
 - Decoder: TLV container, streamed and indexed readers, both adaptive-precision rules, validity

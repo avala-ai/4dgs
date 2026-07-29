@@ -78,17 +78,27 @@ all possible cut points on any file with spherical harmonics, which is a lot of 
 **Verifying the summary CRC without buffering the file.** A front-to-back reader does not learn
 where the CRC's range starts until it reads the Footer, which is the last record — by which point a
 reader that kept nothing has nothing to check. Buffering the whole file to solve this gives up the
-property the format exists to provide, so the bounded answer is to retain the trailing run of
-records that may legally sit inside a summary and check it against the Footer at the end. Per §4's
-layout that run is Chunk Index, Statistics, Attachment, Attachment Index and Summary Offset records;
-any other opcode means the summary has not started yet, and the run resets. The cost is the index,
-which an indexed reader would have loaded anyway.
+property the format exists to provide. The bounded answer is to retain the trailing run of summary
+records as they go past and check it at the end, which §4.5 makes exact by requiring that run to be
+contiguous: it is the Chunk Index, Statistics and Summary Offset records and nothing else, so any
+other opcode means the summary has not started yet and the retained run resets. The cost is the
+index, which an indexed reader would have loaded anyway.
 
-When the retained run cannot be shown to be exactly the range the Footer names, the honest report is
-**"not verified"** — which is a third state, distinct from "did not match". A reader that collapses
-them tells its caller a file is corrupt when all it did was decline to buffer. Readers that hold the
+When the retained run cannot be shown to be exactly the range the Footer names — a file from a
+writer that predates §4.5, or one that simply does not conform — the honest report is **"not
+verified"**, which is a third state distinct from "did not match". A reader that collapses them
+tells its caller a file is corrupt when all it did was decline to buffer. Readers that hold the
 whole file, as the Python reference does, sidestep this entirely and can always answer verified or
 failed; that is a property of how that reader was built and not a requirement on any other.
+
+**If cheap attachment discovery is ever needed, do not widen the summary.** §4.5 keeps attachments
+out of the summary because their size is unbounded and a checksum whose cost scales with payload is
+the wrong contract. The temptation later will be to move them back in so a reader can enumerate them
+without a scan. The append-only way to get that is the opposite move: a future index-class record,
+inside the summary, that points at attachments by offset and length — the attachments themselves
+stay where they are. That is the same shape the rest of the format already uses for chunks and for
+bands, it costs a reader one small record rather than every payload, and it leaves §4.5 true forever
+instead of re-opening it.
 
 ---
 

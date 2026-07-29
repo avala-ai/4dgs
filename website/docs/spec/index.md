@@ -101,18 +101,18 @@ that time, regardless of its marginal.
 [<Audio record>]                 -- omitted entirely when the scene has no audio
 [<Camera record>]
 [<Metadata record> ...]
-<Chunk record> ...               -- the gaussian data
-<Chunk Index record> ...         -- one per chunk
-[<Statistics record>]
 [<Attachment record> ...]
+<Chunk record> ...               -- the gaussian data
+<Chunk Index record> ...         -- one per chunk, THE SUMMARY starts here
+[<Statistics record>]
 [<Summary Offset record> ...]
 <Footer record>
 <magic>
 ```
 
-Order is normative only where stated: the Header MUST be the first record, and the Footer MUST be
-the last. The magic appears at both ends so a reader that has only the tail of a file can still
-identify it and locate the Footer.
+Order is normative only where stated: the Header MUST be the first record, the Footer MUST be the
+last, and the summary MUST be contiguous (§4.5). The magic appears at both ends so a reader that has
+only the tail of a file can still identify it and locate the Footer.
 
 ### 4.1 Magic
 
@@ -163,6 +163,25 @@ change meaning, type, or order in any version 1 revision. Only appended fields m
 `Attribute Stream (0x06)`, `Chunk Index (0x08)`.
 
 Anything else is provisional and MAY change before version 1 is declared stable.
+
+### 4.5 The summary is contiguous
+
+The **summary** is exactly the Chunk Index, Statistics and Summary Offset records — the records that
+describe where things are rather than carrying content. A writer MUST emit them as one contiguous
+run immediately preceding the Footer, and MUST NOT emit any other record inside that run. The
+Footer's `summary_start` names its first byte, so the run is precisely the range `summary_crc`
+covers.
+
+This exists so a **streamed** reader can verify that checksum without buffering the file. Front to
+back, a reader does not learn where the range starts until it reads the Footer, which is the last
+record; contiguity lets it instead retain the trailing run of summary records as it goes and check
+that at the end. The cost of doing so is the index, which an indexed reader would have loaded
+anyway.
+
+**Attachments are not summary records.** They carry payload, and payload of unbounded size — a
+thumbnail sheet, a provenance blob. Admitting them into the run would make verifying a checksum cost
+whatever the attachments happen to weigh, which defeats the reason the rule exists. They belong with
+the other content records ahead of the chunks.
 
 ---
 
@@ -630,6 +649,13 @@ and the text was the bug.
 | §5.8 stated that every offset and length in the index frames a whole record                           | clarification             |
 | §6.3 stated that `K` uses the Header's `cutoff` rather than the default                               | clarification             |
 | §6.5 added: spherical harmonic layout, whole degrees, and that `step_sh` is not applied at decode     | clarification             |
+| §4.5 added: the summary is exactly Chunk Index, Statistics and Summary Offset, and is contiguous      | rule added                |
+
+The §4.5 row is a tightening of what a **writer** may emit, not a migration. It changes no existing
+file: all 32 conformance variants already satisfy it, none was regenerated, and no file's bytes or
+meaning move. What it forbids is a shape the layout diagram used to permit — an Attachment record
+sitting between the Statistics and Summary Offset records — which no encoder ever produced and which
+would have made a streamed checksum cost whatever the attachment weighed.
 
 The `aabb` row is the one worth reading twice. The text said `f32[6]` from the first draft and every
 implementation wrote `f64[6]`, so a reader built from the specification alone desynchronized on the

@@ -373,3 +373,87 @@ fn a_cut_between_a_chunk_and_its_bands_recovers_rather_than_refusing() {
         "most cut points should recover; {recovered} did"
     );
 }
+
+#[test]
+fn the_summary_is_one_contiguous_run_before_the_footer() {
+    // §4.5. The rule exists so a front-to-back reader can verify the summary CRC by
+    // retaining the trailing run of summary records rather than the whole file, so an
+    // encoder that scattered them would quietly cost every streamed reader that property.
+    // Attachments are deliberately outside the run: their size is unbounded.
+    use fourdgs::opcode as op;
+
+    let (g, duration) = scene(128);
+    let options = WriteOptions {
+        write_statistics: true,
+        write_summary_offsets: true,
+        ..chunking_options()
+    };
+    let extras = SceneExtras {
+        attachments: vec![fourdgs::records::Attachment {
+            name: "thumbnails.bin".into(),
+            media_type: "application/octet-stream".into(),
+            data: vec![0xAB; 4096],
+        }],
+        ..Default::default()
+    };
+    let bytes = fourdgs::write_to_vec(&g, duration, &options, &extras).expect("encode");
+
+    // Walk the framing without interpreting anything.
+    let mut records: Vec<(usize, u8)> = Vec::new();
+    let mut at = fourdgs::MAGIC.len();
+    while at + 9 <= bytes.len() {
+        let opcode = bytes[at];
+        let length = u64::from_le_bytes(bytes[at + 1..at + 9].try_into().expect("eight bytes"));
+        records.push((at, opcode));
+        at += 9 + length as usize;
+    }
+
+    let footer_at = records
+        .iter()
+        .rev()
+        .find(|(_, opcode)| *opcode == op::FOOTER)
+        .expect("a footer")
+        .0;
+    let summary_start = u64::from_le_bytes(
+        bytes[footer_at + 9..footer_at + 17]
+            .try_into()
+            .expect("eight"),
+    ) as usize;
+    assert!(summary_start > 0, "this file declares a summary");
+
+    let is_summary = |o: u8| matches!(o, op::CHUNK_INDEX | op::STATISTICS | op::SUMMARY_OFFSET);
+    for (offset, opcode) in &records {
+        if *offset >= summary_start && *offset < footer_at {
+            assert!(
+                is_summary(*opcode),
+                "{} sits inside the summary range",
+                op::name(*opcode)
+            );
+        } else if *offset < summary_start {
+            assert!(
+                !is_summary(*opcode),
+                "{} sits before summary_start",
+                op::name(*opcode)
+            );
+        }
+    }
+
+    // And the attachment really is in the file, ahead of the run rather than absent.
+    let attachment_at = records
+        .iter()
+        .find(|(_, opcode)| *opcode == op::ATTACHMENT)
+        .expect("the attachment was written")
+        .0;
+    assert!(
+        attachment_at < summary_start,
+        "an attachment belongs with the content records, ahead of the summary"
+    );
+
+    // The whole point: a streamed read verifies the CRC from the retained run alone.
+    let scene = fourdgs::read_bytes(&bytes).expect("decode");
+    assert_eq!(
+        scene.summary_crc_ok,
+        Some(true),
+        "a contiguous summary lets a front-to-back reader verify the checksum"
+    );
+}
