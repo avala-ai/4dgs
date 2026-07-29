@@ -10,7 +10,9 @@
 //! the conformance corpus (Python writes, Rust decodes), which is where an end-to-end
 //! object file is exercised.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 use fourdgs::chunk::DecodedChunk;
 use fourdgs::codec;
@@ -161,6 +163,123 @@ fn object_file(indexed: bool, duplicate_table: bool) -> Vec<u8> {
     );
     out.extend(MAGIC);
     out
+}
+
+type ByteRange = (u64, u64);
+
+fn object_file_with_unrelated_ranges() -> (Vec<u8>, ByteRange, ByteRange, ByteRange) {
+    let mut out = MAGIC.to_vec();
+    out.extend(
+        Header {
+            duration_sec: 1.0,
+            gaussian_count: 1,
+            aabb: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            cutoff: 0.05,
+            temporal_model: "gaussian-birth".into(),
+            ..Default::default()
+        }
+        .encode(&[]),
+    );
+    out.extend(quantization().encode(&[]));
+    out.extend(
+        WindowTable {
+            windows: vec![(0.0, 1.0)],
+        }
+        .encode(),
+    );
+
+    let table = ObjectTable {
+        embedding_dim: 4096,
+        entries: vec![
+            ObjectTableEntry {
+                object_id: 7,
+                label: "visible".into(),
+                ..Default::default()
+            },
+            ObjectTableEntry {
+                object_id: 8,
+                label: "unrelated".into(),
+                embedding: Some(vec![0.0; 4096]),
+                ..Default::default()
+            },
+        ],
+    }
+    .encode(b"")
+    .unwrap();
+    let table_range = (out.len() as u64, table.len() as u64);
+    out.extend(table);
+
+    let track7 = ObjectTrack {
+        object_id: 7,
+        interpolation: TRAJECTORY_LINEAR,
+        times: vec![0.0, 1.0],
+        rotations: vec![Q_Z90, Q_Z90],
+        translations: vec![[10.0, 0.0, 0.0], [10.0, 0.0, 0.0]],
+    }
+    .encode(b"")
+    .unwrap();
+    let track7_range = (out.len() as u64, track7.len() as u64);
+    out.extend(track7);
+
+    let track8 = ObjectTrack {
+        object_id: 8,
+        interpolation: TRAJECTORY_LINEAR,
+        times: vec![0.0, 1.0],
+        rotations: vec![Q_ID, Q_ID],
+        translations: vec![[0.0; 3], [1.0, 0.0, 0.0]],
+    }
+    .encode(b"")
+    .unwrap();
+    let track8_range = (out.len() as u64, track8.len() as u64);
+    out.extend(track8);
+    // A future registry value on an unrelated track must not affect object 7's instant.
+    out[track8_range.0 as usize + 9 + 4] = 2;
+
+    let chunk_at = out.len() as u64;
+    let chunk = fourdgs::records::encode_chunk(0.0, 1.0, 0, 1, &streams_with_object_id(&[7], 1));
+    out.extend(&chunk);
+    let summary_start = out.len() as u64;
+    out.extend(
+        ChunkIndexEntry {
+            t0: 0.0,
+            t1: 1.0,
+            chunk_offset: chunk_at,
+            chunk_length: chunk.len() as u64,
+            gaussian_count: 1,
+            bands: Vec::new(),
+        }
+        .encode(),
+    );
+    out.extend(
+        Footer {
+            summary_start,
+            summary_offset_start: 0,
+            summary_crc: 0,
+        }
+        .encode(),
+    );
+    out.extend(MAGIC);
+    (out, table_range, track7_range, track8_range)
+}
+
+struct CountingSource {
+    bytes: Vec<u8>,
+    reads: Rc<RefCell<Vec<ByteRange>>>,
+}
+
+impl fourdgs::Readable for CountingSource {
+    fn size(&mut self) -> fourdgs::Result<u64> {
+        Ok(self.bytes.len() as u64)
+    }
+
+    fn read(&mut self, offset: u64, length: u64) -> fourdgs::Result<Vec<u8>> {
+        self.reads.borrow_mut().push((offset, length));
+        fourdgs::BytesReadable::new(&self.bytes).read(offset, length)
+    }
+}
+
+fn overlaps(a: ByteRange, b: ByteRange) -> bool {
+    a.0 < b.0 + b.1 && b.0 < a.0 + a.1
 }
 
 #[test]
@@ -392,6 +511,97 @@ fn scene_reader_composes_authoritative_object_motion_on_both_paths() {
 }
 
 #[test]
+fn indexed_state_fetches_and_caches_only_referenced_object_tracks() {
+    let (bytes, table_range, track7_range, track8_range) = object_file_with_unrelated_ranges();
+    let reads = Rc::new(RefCell::new(Vec::new()));
+    let source = CountingSource {
+        bytes,
+        reads: Rc::clone(&reads),
+    };
+    let mut reader = SceneReader::open_with(source, OpenMode::Indexed).expect("open indexed");
+    reads.borrow_mut().clear();
+
+    let state = reader.state_at(0.5, 0).expect("reconstruct object 7");
+    assert!((state.centers[0] - 10.0).abs() < 1e-4);
+    let state_reads = reads.borrow().clone();
+    assert!(
+        state_reads.contains(&track7_range),
+        "the visible object's track is fetched: {state_reads:?}"
+    );
+    assert!(
+        state_reads
+            .iter()
+            .all(|range| !overlaps(*range, table_range)),
+        "state_at must leave the Object Table lazy: {state_reads:?}"
+    );
+    assert!(
+        state_reads
+            .iter()
+            .all(|range| !overlaps(*range, track8_range)),
+        "state_at must leave unrelated tracks lazy: {state_reads:?}"
+    );
+
+    reads.borrow_mut().clear();
+    reader.state_at(0.5, 0).expect("reuse the same instant");
+    assert!(
+        reads.borrow().is_empty(),
+        "the gaussian chunk and object track are cached"
+    );
+}
+
+#[test]
+fn applying_a_layer_does_not_sample_unreferenced_tracks() {
+    let layer = ObjectLayer {
+        table: None,
+        tracks: vec![
+            ObjectTrack {
+                object_id: 7,
+                interpolation: TRAJECTORY_LINEAR,
+                times: vec![0.0],
+                rotations: vec![Q_ID],
+                translations: vec![[3.0, 0.0, 0.0]],
+            },
+            ObjectTrack {
+                object_id: 8,
+                interpolation: 2,
+                times: vec![0.0, 1.0],
+                rotations: vec![Q_ID, Q_ID],
+                translations: vec![[0.0; 3], [1.0, 0.0, 0.0]],
+            },
+        ],
+    };
+    let mut centers = vec![0.0, 0.0, 0.0];
+    let mut orientations = vec![0.0, 0.0, 0.0, 1.0];
+    layer
+        .apply(&mut centers, &mut orientations, &[7], 0.5)
+        .expect("object 8 is unrelated to this state");
+    assert_eq!(centers, [3.0, 0.0, 0.0]);
+}
+
+#[test]
+fn provenance_does_not_fetch_object_ranges() {
+    let (bytes, table_range, track7_range, track8_range) = object_file_with_unrelated_ranges();
+    let reads = Rc::new(RefCell::new(Vec::new()));
+    let source = CountingSource {
+        bytes,
+        reads: Rc::clone(&reads),
+    };
+    let mut reader = SceneReader::open_with(source, OpenMode::Indexed).expect("open indexed");
+    reads.borrow_mut().clear();
+
+    assert!(reader.provenance().expect("read provenance").is_empty());
+    let provenance_reads = reads.borrow().clone();
+    assert!(
+        provenance_reads.iter().all(|range| {
+            !overlaps(*range, table_range)
+                && !overlaps(*range, track7_range)
+                && !overlaps(*range, track8_range)
+        }),
+        "provenance must skip every object range before reading: {provenance_reads:?}"
+    );
+}
+
+#[test]
 fn omitted_object_stream_defaults_only_that_chunk_to_background() {
     fn chunk(object_id: Option<Vec<u32>>) -> DecodedChunk {
         DecodedChunk {
@@ -547,6 +757,21 @@ fn object_record_encoders_refuse_structurally_ambiguous_values() {
     };
     let err = track.encode(b"").unwrap_err();
     assert!(err.to_string().contains("1 times, 0 rotations"), "{err}");
+
+    let unknown_interpolation = ObjectTrack {
+        object_id: 7,
+        interpolation: 2,
+        ..Default::default()
+    };
+    let err = unknown_interpolation
+        .check()
+        .expect_err("future interpolation is unsupported at parse time");
+    assert!(
+        err.to_string().contains("interpolation 2")
+            && err.to_string().contains("0 (linear)")
+            && err.to_string().contains("1 (step)"),
+        "{err}"
+    );
 
     let mut table = Vec::new();
     table.extend(1u32.to_le_bytes());

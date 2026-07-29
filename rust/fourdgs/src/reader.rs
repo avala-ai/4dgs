@@ -12,7 +12,7 @@
 //! Both paths remain first-class and directly usable: this is a convenience over them,
 //! not a replacement for either.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
 
 use crate::chunk::DecodedChunk;
@@ -65,6 +65,10 @@ pub struct SceneReader<R: Readable> {
     /// Object records are independent of the other front matter: asking for a camera must
     /// not also fetch every object track in the file.
     objects: Option<crate::object_layer::ObjectLayer>,
+    /// False when `objects` contains only tracks fetched for prior indexed instants. A
+    /// direct [`objects`](Self::objects) call replaces that partial cache with the full
+    /// layer, including the Object Table.
+    objects_complete: bool,
 }
 
 /// The front-matter records a caller asked for, once they have been fetched.
@@ -112,6 +116,7 @@ impl<R: Readable> SceneReader<R> {
                 loaded_key: None,
                 records: None,
                 objects: None,
+                objects_complete: false,
             });
         }
         let scene = stream_reader::read_from(
@@ -129,6 +134,7 @@ impl<R: Readable> SceneReader<R> {
             loaded_key: Some(LoadKey::All),
             records: None,
             objects: None,
+            objects_complete: false,
         })
     }
 
@@ -462,7 +468,7 @@ impl<R: Readable> SceneReader<R> {
     }
 
     fn ensure_objects(&mut self) -> Result<()> {
-        if self.objects.is_some() {
+        if self.objects_complete {
             return Ok(());
         }
         self.objects = Some(if let Some(scene) = &self.indexed {
@@ -474,6 +480,32 @@ impl<R: Readable> SceneReader<R> {
                 .objects
                 .clone()
         });
+        self.objects_complete = true;
+        Ok(())
+    }
+
+    fn ensure_object_tracks(&mut self, object_ids: &HashSet<u32>) -> Result<()> {
+        if self.objects_complete {
+            return Ok(());
+        }
+        if self.indexed.is_none() {
+            return self.ensure_objects();
+        }
+
+        let cached: HashSet<u32> = self
+            .objects
+            .as_ref()
+            .map(|layer| layer.tracks.iter().map(|track| track.object_id).collect())
+            .unwrap_or_default();
+        let missing: HashSet<u32> = object_ids.difference(&cached).copied().collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let scene = self.indexed.as_ref().expect("indexed path");
+        let tracks = indexed_reader::read_object_tracks(&mut self.source, scene, &missing)?;
+        let layer = self.objects.get_or_insert_with(Default::default);
+        layer.tracks.extend(tracks);
+        layer.check()?;
         Ok(())
     }
 
@@ -542,10 +574,15 @@ impl<R: Readable> SceneReader<R> {
                 .collect::<Vec<u32>>()
         });
         if let Some(object_ids) = visible_object_ids.filter(|ids| ids.iter().any(|id| *id != 0)) {
-            self.ensure_objects()?;
+            let referenced: HashSet<u32> = object_ids
+                .iter()
+                .copied()
+                .filter(|id| *id != crate::object_layer::BACKGROUND)
+                .collect();
+            self.ensure_object_tracks(&referenced)?;
             self.objects
                 .as_ref()
-                .expect("ensure_objects populated the cache")
+                .expect("ensure_object_tracks populated the cache")
                 .apply(&mut state.centers, &mut state.orientations, &object_ids, t)?;
         }
         Ok(state)

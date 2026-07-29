@@ -1260,6 +1260,13 @@ impl RigTrajectory {
     /// a repeated or reversed timestamp makes that interval ambiguous. There is no
     /// reading of such a trajectory that is merely approximate.
     pub fn check(&self) -> Result<()> {
+        if !matches!(self.interpolation, TRAJECTORY_LINEAR | TRAJECTORY_STEP) {
+            return Err(Error::Malformed(format!(
+                "trajectory {:?} uses interpolation {}; this reader supports trajectory \
+                 interpolation registry values 0 (linear) and 1 (step)",
+                self.name, self.interpolation
+            )));
+        }
         for (i, t) in self.times.iter().enumerate() {
             if !t.is_finite() {
                 return Err(Error::Malformed(format!(
@@ -1575,6 +1582,13 @@ impl ObjectTrack {
                  object to move (section 5.15.6)"
                     .to_string(),
             ));
+        }
+        if !matches!(self.interpolation, TRAJECTORY_LINEAR | TRAJECTORY_STEP) {
+            return Err(Error::Malformed(format!(
+                "track for object {} uses interpolation {}; this reader supports trajectory \
+                 interpolation registry values 0 (linear) and 1 (step)",
+                self.object_id, self.interpolation
+            )));
         }
         if self.rotations.len() != self.times.len() || self.translations.len() != self.times.len() {
             return Err(Error::Malformed(format!(

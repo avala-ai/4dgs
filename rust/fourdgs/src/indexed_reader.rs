@@ -14,7 +14,7 @@
 //! whole clip collapses to a single entry and an instant costs the scene. Both are correct
 //! files.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::chunk::{decode_streams, DecodedChunk};
 use crate::error::{Error, Result};
@@ -194,6 +194,13 @@ pub struct IndexedScene {
     /// not pay for it. This is also the whole discovery mechanism for the family, which is
     /// why no Header flag announces it: the walk was already happening.
     pub provenance_ranges: Vec<(u8, u64, u64)>,
+    /// Object Tables stay fully lazy because reconstructed state never needs labels,
+    /// embeddings, anchors, or dynamics.
+    pub object_table_ranges: Vec<(u64, u64)>,
+    /// `(object_id, offset, length)` for each Object Track. Opening reads only the
+    /// four-byte id prefix, which lets an indexed instant fetch exactly the tracks its
+    /// resident memberships reference.
+    pub object_track_ranges: Vec<(u32, u64, u64)>,
     pub statistics: Option<rec::Statistics>,
     pub summary_offsets: Vec<rec::SummaryOffset>,
 }
@@ -328,6 +335,18 @@ pub fn open_indexed<R: Readable + ?Sized>(source: &mut R) -> Result<IndexedScene
                 op::ATTACHMENT => scene
                     .attachment_ranges
                     .push((record.offset, record.total_length())),
+                op::OBJECT_TABLE => scene
+                    .object_table_ranges
+                    .push((record.offset, record.total_length())),
+                op::OBJECT_TRACK => {
+                    let prefix = front.content(&record, Some(4))?;
+                    let object_id = Cursor::new(&prefix).u32()?;
+                    scene.object_track_ranges.push((
+                        object_id,
+                        record.offset,
+                        record.total_length(),
+                    ));
+                }
                 code if op::is_provenance(code) => {
                     scene
                         .provenance_ranges
@@ -542,6 +561,15 @@ pub fn read_provenance<R: Readable + ?Sized>(
 ) -> Result<crate::provenance::Provenance> {
     let mut out = crate::provenance::Provenance::default();
     for (opcode, offset, length) in &scene.provenance_ranges {
+        if !matches!(
+            *opcode,
+            op::COORDINATE_FRAME
+                | op::SENSOR_CALIBRATION
+                | op::RIG_TRAJECTORY
+                | op::GEODETIC_ANCHOR
+        ) {
+            continue;
+        }
         let blob = source.read(*offset, *length)?;
         let content = record_content(&blob, *opcode)?;
         match *opcode {
@@ -566,27 +594,56 @@ pub fn read_objects<R: Readable + ?Sized>(
     scene: &IndexedScene,
 ) -> Result<crate::object_layer::ObjectLayer> {
     let mut out = crate::object_layer::ObjectLayer::default();
-    for (opcode, offset, length) in &scene.provenance_ranges {
-        if *opcode != op::OBJECT_TABLE && *opcode != op::OBJECT_TRACK {
+    for (offset, length) in &scene.object_table_ranges {
+        if out.table.is_some() {
+            return Err(Error::Malformed(format!(
+                "a second ObjectTable record appears at byte {offset}; a file may carry \
+                 exactly one scene-wide object table"
+            )));
+        }
+        let blob = source.read(*offset, *length)?;
+        out.table = Some(rec::ObjectTable::parse(record_content(
+            &blob,
+            op::OBJECT_TABLE,
+        )?)?);
+    }
+    for (_, offset, length) in &scene.object_track_ranges {
+        let blob = source.read(*offset, *length)?;
+        out.tracks.push(rec::ObjectTrack::parse(record_content(
+            &blob,
+            op::OBJECT_TRACK,
+        )?)?);
+    }
+    out.check()?;
+    Ok(out)
+}
+
+/// Fetch only Object Tracks referenced by the resident gaussian memberships.
+///
+/// Object Tables and unrelated tracks remain lazy behind [`read_objects`]. The four-byte
+/// object id prefix was recorded during the front-matter walk, so this function can skip a
+/// long unreferenced track without touching any of its range.
+pub fn read_object_tracks<R: Readable + ?Sized>(
+    source: &mut R,
+    scene: &IndexedScene,
+    object_ids: &HashSet<u32>,
+) -> Result<Vec<rec::ObjectTrack>> {
+    let mut out = Vec::new();
+    for (object_id, offset, length) in &scene.object_track_ranges {
+        if !object_ids.contains(object_id) {
             continue;
         }
         let blob = source.read(*offset, *length)?;
-        let content = record_content(&blob, *opcode)?;
-        match *opcode {
-            op::OBJECT_TABLE => {
-                if out.table.is_some() {
-                    return Err(Error::Malformed(format!(
-                        "a second ObjectTable record appears at byte {offset}; a file may carry \
-                         exactly one scene-wide object table"
-                    )));
-                }
-                out.table = Some(rec::ObjectTable::parse(content)?);
-            }
-            op::OBJECT_TRACK => out.tracks.push(rec::ObjectTrack::parse(content)?),
-            _ => {}
+        let track = rec::ObjectTrack::parse(record_content(&blob, op::OBJECT_TRACK)?)?;
+        if track.object_id != *object_id {
+            return Err(Error::Malformed(format!(
+                "ObjectTrack at byte {offset} changed object id from the indexed prefix \
+                 {object_id} to {}",
+                track.object_id
+            )));
         }
+        out.push(track);
     }
-    out.check()?;
     Ok(out)
 }
 

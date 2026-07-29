@@ -150,8 +150,17 @@ impl ObjectLayer {
             return Ok(());
         }
         self.check()?;
-        let mut poses: HashMap<u32, Pose> = HashMap::with_capacity(self.tracks.len());
+        let referenced: HashSet<u32> = object_ids
+            .iter()
+            .copied()
+            .filter(|id| *id != BACKGROUND)
+            .collect();
+        let mut poses: HashMap<u32, Pose> =
+            HashMap::with_capacity(self.tracks.len().min(referenced.len()));
         for track in &self.tracks {
+            if !referenced.contains(&track.object_id) {
+                continue;
+            }
             if let Some(pose) = pose_at(track, t)? {
                 poses.insert(track.object_id, pose);
             }
