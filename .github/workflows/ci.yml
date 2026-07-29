@@ -262,7 +262,7 @@ jobs:
       # installs the toolchain it needs rather than assuming one.
       - name: Build the core
         run: |
-          apt-get update -qq && apt-get install -y -qq curl build-essential python3-numpy >/dev/null
+          apt-get update -qq && apt-get install -y -qq curl build-essential python3-numpy python3-pip >/dev/null
           curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
           . "$HOME/.cargo/env"
           cargo build -p fourdgs --release
@@ -296,7 +296,7 @@ jobs:
       # failed somewhere earlier", which an exit code alone would not.
       - name: Decode a real file through the C ABI
         run: |
-          pip install --break-system-packages -e ./python/fourdgs >/dev/null
+          python3 -m pip install --break-system-packages -e ./python/fourdgs >/dev/null
           python3 tests/conformance/generate.py >/dev/null
           swift build --package-path swift --configuration release -Xlinker -L$PWD/target/release
           variant=$(ls tests/conformance/data/*.4dgs | head -1)
