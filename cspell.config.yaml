@@ -21,6 +21,7 @@ words:
   - zstd
   # Format and project vocabulary
   - fourdgs
+  - pread
   - seekable
   - streamable
   - Kaitai

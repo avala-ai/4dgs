@@ -38,6 +38,12 @@ export async function run(path: string): Promise<string> {
         gaussians: scene.gaussians,
         audio: scene.audio,
         chunkIntervals: scene.chunkIndex.map((entry) => [entry.t0, entry.t1] as const),
+        camera: scene.camera,
+        metadata: scene.metadata,
+        attachments: scene.attachments,
+        statistics: scene.statistics,
+        summaryOffsets: scene.summaryOffsets,
+        summaryCrcOk: scene.summaryCrcOk,
       }),
     );
   } finally {

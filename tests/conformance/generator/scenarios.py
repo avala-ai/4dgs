@@ -42,6 +42,7 @@ FLAGS = (
     "WithMetadata",
     "WithAttachment",
     "AddExtraDataToRecords",  # append unknown trailing fields + a private-range record
+    "CustomCutoff",  # a Header cutoff other than the default
 )
 
 
@@ -116,6 +117,10 @@ def variants() -> list[tuple[Scenario, tuple[str, ...]]]:
 
     # Spherical harmonics, including the band-skipping path.
     mixed = SCENARIOS[4]
+    # A cutoff other than the default. It is not decoration: the cutoff sets the support
+    # constant the per-gaussian velocity grid is derived from, so a decoder that assumes
+    # 0.05 decodes different velocities here and nowhere else in the corpus.
+    add(mixed, "CustomCutoff")
     add(mixed, "SHDegree1")
     add(mixed, "SHDegree2")
     add(mixed, "SHDegree2", "Quantized", "UseChunks")

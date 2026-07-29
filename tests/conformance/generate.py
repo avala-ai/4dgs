@@ -38,7 +38,8 @@ sys.path.insert(0, os.path.join(HERE, "..", "..", "python", "fourdgs"))
 import fourdgs
 import scenarios
 from canonical import canonical, summarize
-from fourdgs.records import Attachment
+from fourdgs.opcode import HEADER, QUANTIZATION
+from fourdgs.records import Attachment, Metadata
 from fourdgs.serialization import put_record
 
 MAX_DATA_BYTES = 2_500_000
@@ -84,13 +85,28 @@ def build(scenario, flags) -> tuple[bytes, str]:
         )
 
     extra: list[bytes] = []
+    trailers: dict[int, bytes] = {}
     if "AddExtraDataToRecords" in flags:
         # A private-range record and an unknown spec-range record, written BY the encoder
         # so the index offsets account for them. A conforming reader steps over both.
         extra.append(put_record(0x91, b"private application record"))
         extra.append(put_record(0x7D, b"unknown future record"))
+        # And fields appended to two frozen records, as a later minor revision would add
+        # them. This is the other half of the compatibility rule: a reader must take a
+        # record's length from its header, not from where its own knowledge runs out.
+        trailers[HEADER] = b"\x01\x00\x00\x00appended-header-field"
+        trailers[QUANTIZATION] = b"\x02\x00\x00\x00appended-quantization-field"
     if "WithAttachment" in flags:
         extra.append(Attachment(name="note.txt", media_type="text/plain", data=b"conformance").encode())
+    if "WithMetadata" in flags:
+        # A Metadata record, distinct from the Header's attributes map: both carry
+        # key-value pairs and an implementation that reads one is not reading the other.
+        extra.append(
+            Metadata(
+                name=scenario.name,
+                entries={"scenario": scenario.name, "visibility_profile": "gaussian"},
+            ).encode()
+        )
 
     options = fourdgs.WriteOptions(
         profile="coarse" if "Quantized" in flags else "default",
@@ -104,6 +120,8 @@ def build(scenario, flags) -> tuple[bytes, str]:
         scene_profile="baked" if scenario.long_lived else "capture",
         metadata={"scenario": scenario.name} if "WithMetadata" in flags else None,
         extra_records=tuple(extra),
+        record_trailers=trailers,
+        cutoff=0.2 if "CustomCutoff" in flags else 0.05,
     )
 
     buf = io.BytesIO()
@@ -117,6 +135,12 @@ def build(scenario, flags) -> tuple[bytes, str]:
             scene.gaussians,
             scene.audio,
             [(e.t0, e.t1) for e in scene.chunk_index],
+            camera=scene.camera,
+            metadata=scene.metadata,
+            attachments=scene.attachments,
+            statistics=scene.statistics,
+            summary_offsets=scene.summary_offsets,
+            summary_crc_ok=scene.summary_crc_ok,
         )
     )
     return data, expectation

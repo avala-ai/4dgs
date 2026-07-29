@@ -9,9 +9,55 @@
     ],
     "zeroMotionCount": "0"
   },
+  "attachments": [],
   "audio": {
     "byteLength": "4044",
-    "codec": "wav"
+    "codec": "wav",
+    "crc": "1756903858"
+  },
+  "camera": {
+    "fovYDeg": 45.0,
+    "interpolation": "spline",
+    "keyframeCount": "2",
+    "keyframes": [
+      {
+        "position": [
+          0.0,
+          1.0,
+          3.0
+        ],
+        "target": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "time": 0.0
+      },
+      {
+        "position": [
+          1.0,
+          1.0,
+          3.0
+        ],
+        "target": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "time": 2.0
+      }
+    ],
+    "loop": true,
+    "position": [
+      0.0,
+      1.0,
+      3.0
+    ],
+    "target": [
+      0.0,
+      0.0,
+      0.0
+    ]
   },
   "chunkIntervals": [
     [
@@ -19,9 +65,22 @@
       2.0
     ]
   ],
+  "cutoff": 0.05,
   "durationSec": 2.0,
   "gaussianCount": "64",
   "hasAudio": true,
+  "headerAttributes": {
+    "scenario": "OneWindow"
+  },
+  "metadataRecords": [
+    {
+      "entries": {
+        "scenario": "OneWindow",
+        "visibility_profile": "gaussian"
+      },
+      "name": "OneWindow"
+    }
+  ],
   "sample": {
     "colors": [
       [
@@ -120,24 +179,6 @@
         0.917647,
         0.854902
       ]
-    ],
-    "indices": [
-      "54",
-      "47",
-      "36",
-      "53",
-      "30",
-      "1",
-      "35",
-      "33",
-      "31",
-      "13",
-      "32",
-      "14",
-      "37",
-      "52",
-      "3",
-      "11"
     ],
     "motions": [
       [
@@ -556,6 +597,10 @@
       0.0
     ]
   },
+  "sh": null,
   "shDegree": 0,
+  "statistics": null,
+  "summaryCrcOk": true,
+  "summaryOffsets": [],
   "temporalModel": "gaussian-birth"
 }

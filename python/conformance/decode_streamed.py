@@ -31,7 +31,49 @@ def supports_variant(name: str) -> bool:
 
 def run(path: str) -> str:
     scene = fourdgs.read(path)
-    return canonical(summarize(scene.header, scene.gaussians, scene.audio, [(e.t0, e.t1) for e in scene.chunk_index]))
+    _check_truncation_recovery(path, scene)
+    return canonical(
+        summarize(
+            scene.header,
+            scene.gaussians,
+            scene.audio,
+            [(e.t0, e.t1) for e in scene.chunk_index],
+            camera=scene.camera,
+            metadata=scene.metadata,
+            attachments=scene.attachments,
+            statistics=scene.statistics,
+            summary_offsets=scene.summary_offsets,
+            summary_crc_ok=scene.summary_crc_ok,
+        )
+    )
+
+
+def _check_truncation_recovery(path: str, full) -> None:
+    """Decode the same file cut short, and insist on what survives.
+
+    Nothing in the corpus is truncated, so this makes one. The canonical JSON cannot
+    express truncation recovery — a cut file is a different file — so the check lives
+    here, where a failure exits non-zero and the harness reports it like any other.
+    """
+    with open(path, "rb") as fh:
+        data = fh.read()
+
+    cut = fourdgs.read(data[:-1])
+    if not cut.truncated:
+        raise AssertionError("a file cut before its trailing magic was not reported truncated")
+    if cut.gaussians.count != full.gaussians.count:
+        raise AssertionError(
+            f"cutting the trailing magic lost gaussians: {cut.gaussians.count} of {full.gaussians.count}"
+        )
+
+    if len(full.chunk_index) >= 2:
+        last = full.chunk_index[-1]
+        mid = fourdgs.read(data[: last.chunk_offset + 5])
+        if not mid.truncated:
+            raise AssertionError("a file cut inside a chunk record was not reported truncated")
+        expected = full.gaussians.count - last.gaussian_count
+        if mid.gaussians.count != expected:
+            raise AssertionError(f"cutting the last chunk left {mid.gaussians.count} gaussians, expected {expected}")
 
 
 def main(argv: list[str]) -> int:

@@ -28,6 +28,7 @@ import { FileHandleReadable } from "@4dgs/nodejs";
 
 import { canonical, summarize } from "./canonical.js";
 import { CountingReadable } from "./checks.js";
+import { concat } from "./testing.js";
 
 const DATA = fileURLToPath(new URL("../../../tests/conformance/data/", import.meta.url));
 
@@ -46,6 +47,12 @@ async function streamed(path: string): Promise<string> {
       gaussians: scene.gaussians,
       audio: scene.audio,
       chunkIntervals: scene.chunkIndex.map((e) => [e.t0, e.t1] as const),
+      camera: scene.camera,
+      metadata: scene.metadata,
+      attachments: scene.attachments,
+      statistics: scene.statistics,
+      summaryOffsets: scene.summaryOffsets,
+      summaryCrcOk: scene.summaryCrcOk,
     }),
   );
 }
@@ -56,15 +63,34 @@ async function indexed(path: string): Promise<string> {
   try {
     const scene = await IndexedDecoder.open(source);
     const chunks: ChunkGaussians[] = [];
+    const shParts = [];
     for (const entry of scene.index) {
-      chunks.push((await scene.readChunk(entry, { maxShBand: MAX_SH_DEGREE })).gaussians);
+      const chunk = await scene.readChunk(entry, { maxShBand: MAX_SH_DEGREE });
+      chunks.push(chunk.gaussians);
+      if (chunk.sh !== null) shParts.push(chunk.sh);
     }
+    const merged =
+      shParts.length === 0
+        ? null
+        : {
+            degree: shParts[0]!.degree,
+            coefficients: shParts[0]!.coefficients,
+            count: chunks.reduce((n, c) => n + c.count, 0),
+            values: concat(shParts.map((p) => p.values)),
+            bands: shParts[0]!.bands,
+          };
     return canonical(
       summarize({
         header: scene.header,
-        gaussians: assembleGaussians(chunks, scene.windows, scene.header.shDegree),
+        gaussians: assembleGaussians(chunks, scene.windows, scene.header.shDegree, merged),
         audio: await scene.readAudio(),
         chunkIntervals: scene.index.map((e) => [e.t0, e.t1] as const),
+        camera: await scene.readCamera(),
+        metadata: await scene.readMetadata(),
+        attachments: await scene.readAttachments(),
+        statistics: scene.statistics,
+        summaryOffsets: scene.summaryOffsets,
+        summaryCrcOk: scene.summaryCrcOk,
       }),
     );
   } finally {

@@ -14,13 +14,28 @@
  * - `audio` is `null` when absent and an object when present, so both paths are visible;
  * - keys are sorted.
  *
+ * Nothing here may depend on decoded order. Gaussians may be reordered freely by an
+ * encoder and readers must not rely on their order, so a summary that did would be asking
+ * two correct decoders to disagree. Everything per-gaussian is taken in the content order
+ * defined by `stableOrder`, which is derived from decoded values alone.
+ *
  * Rounding is round-half-to-even on the value's exact decimal expansion, which is what
  * Python's `round` does. `toFixed` rounds halves away from zero, so it cannot be used on
  * its own: the two disagree on values like `0.0078125`, and every value a decoder
  * produces is a float32, whose exact ties are precisely those numbers.
  */
 
-import type { AudioTrack, GaussianSet, Header } from "@4dgs/core";
+import {
+  crc32,
+  type Attachment,
+  type AudioTrack,
+  type Camera,
+  type GaussianSet,
+  type Header,
+  type Metadata,
+  type Statistics,
+  type SummaryOffset,
+} from "@4dgs/core";
 
 export const FLOAT_DECIMALS = 6;
 
@@ -29,6 +44,14 @@ const EXACT_DECIMALS = 100;
 
 /** How many gaussians appear in full. The aggregates cover the rest. */
 export const SAMPLE = 16;
+
+/** How many camera keyframes appear in full, so a long trajectory cannot bloat a summary. */
+export const CAMERA_KEYFRAMES = 4;
+
+/** CRC-32 of a payload, as a string: a summary proving it read bytes, not just lengths. */
+export function crc(data: Uint8Array): string {
+  return String(crc32(data));
+}
 
 /** Round for comparison; a non-finite value becomes `null`, which JSON can spell. */
 export function num(value: number | null | undefined): number | null {
@@ -71,17 +94,27 @@ export function roundHalfEven(value: number, decimals: number): number {
 }
 
 export interface SceneSummaryInput {
-  readonly header: Pick<Header, "durationSec" | "shDegree" | "temporalModel" | "hasAudio">;
+  readonly header: Pick<
+    Header,
+    "durationSec" | "cutoff" | "shDegree" | "temporalModel" | "hasAudio" | "attributes"
+  >;
   readonly gaussians: GaussianSet;
   readonly audio: AudioTrack | null;
   readonly chunkIntervals: readonly (readonly [number, number])[];
+  readonly camera?: Camera | null;
+  readonly metadata?: readonly Metadata[];
+  readonly attachments?: readonly Attachment[];
+  readonly statistics?: Statistics | null;
+  readonly summaryOffsets?: readonly SummaryOffset[];
+  readonly summaryCrcOk?: boolean | null;
 }
 
 /** The statement every implementation must agree on for a variant. */
 export function summarize(input: SceneSummaryInput): unknown {
   const { header, gaussians, audio, chunkIntervals } = input;
   const n = gaussians.count;
-  const sample = stableOrder(gaussians).slice(0, SAMPLE);
+  const order = stableOrder(gaussians);
+  const sample = order.slice(0, SAMPLE);
 
   const rows = (array: Float32Array, width: number): (number | null)[][] =>
     sample.map((i) => {
@@ -94,7 +127,7 @@ export function summarize(input: SceneSummaryInput): unknown {
   let alphaSum = 0;
   let neverFades = 0;
   let still = 0;
-  for (let i = 0; i < n; i++) {
+  for (const i of order) {
     positionSum[0]! += gaussians.positions[i * 3]!;
     positionSum[1]! += gaussians.positions[i * 3 + 1]!;
     positionSum[2]! += gaussians.positions[i * 3 + 2]!;
@@ -107,15 +140,49 @@ export function summarize(input: SceneSummaryInput): unknown {
   return {
     gaussianCount: String(n),
     durationSec: num(header.durationSec),
+    cutoff: num(header.cutoff),
     shDegree: header.shDegree,
     temporalModel: header.temporalModel,
     hasAudio: header.hasAudio,
     // Absent audio is a value, not a missing key: both paths are conformance-visible.
     audio:
-      audio === null ? null : { codec: audio.codec, byteLength: String(audio.data.byteLength) },
+      audio === null
+        ? null
+        : {
+            codec: audio.codec,
+            byteLength: String(audio.data.byteLength),
+            crc: crc(audio.data),
+          },
     chunkIntervals: chunkIntervals.map(([a, b]) => [num(a), num(b)]),
+    headerAttributes: sortedMap(header.attributes),
+    metadataRecords: (input.metadata ?? []).map((m) => ({
+      name: m.name,
+      entries: sortedMap(m.entries),
+    })),
+    attachments: (input.attachments ?? []).map((a) => ({
+      name: a.name,
+      mediaType: a.mediaType,
+      byteLength: String(a.data.byteLength),
+      crc: crc(a.data),
+    })),
+    camera: input.camera == null ? null : summarizeCamera(input.camera),
+    statistics:
+      input.statistics == null
+        ? null
+        : {
+            gaussianCount: String(input.statistics.gaussianCount),
+            chunkCount: String(input.statistics.chunkCount),
+            durationSec: num(input.statistics.durationSec),
+            aabb: input.statistics.aabb.map((v) => num(v)),
+          },
+    summaryOffsets: (input.summaryOffsets ?? []).map((s) => ({
+      groupOpcode: String(s.groupOpcode),
+      groupStart: String(s.groupStart),
+      groupLength: String(s.groupLength),
+    })),
+    summaryCrcOk: input.summaryCrcOk ?? null,
+    sh: summarizeSh(gaussians, order),
     sample: {
-      indices: sample.map((i) => String(i)),
       positions: rows(gaussians.positions, 3),
       scales: rows(gaussians.scales, 3),
       rotations: rows(gaussians.rotations, 4),
@@ -135,25 +202,109 @@ export function summarize(input: SceneSummaryInput): unknown {
   };
 }
 
+function sortedMap(map: ReadonlyMap<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const key of [...map.keys()].sort()) out[key] = map.get(key)!;
+  return out;
+}
+
+function summarizeCamera(camera: Camera): unknown {
+  return {
+    fovYDeg: num(camera.fovYDeg),
+    position: camera.position.map((v) => num(v)),
+    target: camera.target.map((v) => num(v)),
+    keyframeCount: String(camera.keyframes.length),
+    keyframes: camera.keyframes.slice(0, CAMERA_KEYFRAMES).map((k) => ({
+      time: num(k.time),
+      position: k.position.map((v) => num(v)),
+      target: k.target.map((v) => num(v)),
+    })),
+    interpolation: camera.interpolation,
+    loop: camera.loop,
+  };
+}
+
+/**
+ * Degree, width and a checksum of the coefficients in content order.
+ *
+ * A digest rather than the coefficients themselves: degree 2 over 512 gaussians is 12,288
+ * bytes, which would swamp the expectation without proving anything the checksum does
+ * not. Taken in content order so that two decoders which visit gaussians differently
+ * still agree.
+ */
+function summarizeSh(gaussians: GaussianSet, order: readonly number[]): unknown {
+  const sh = gaussians.sh;
+  if (sh === null || gaussians.shDegree === 0) return null;
+  const width = sh.coefficients * 3;
+  const payload = new Uint8Array(order.length * width);
+  let at = 0;
+  for (const i of order) {
+    payload.set(sh.values.subarray(i * width, i * width + width), at);
+    at += width;
+  }
+  return {
+    degree: gaussians.shDegree,
+    coefficients: String(sh.coefficients),
+    crc: crc(payload),
+  };
+}
+
 /**
  * Sort gaussians into an order both implementations can reproduce.
  *
  * Chunking and spatial ordering are encoder choices, so decoded order is not part of the
- * contract — but a comparison needs some order. Sorting on decoded values gives one
- * without making the encoder's choices normative.
+ * contract — but a comparison needs some order. The key is the gaussian's whole decoded
+ * state, rounded exactly as the summary rounds it, with its spherical harmonic
+ * coefficients last. Two gaussians that tie on all of it are identical in every value
+ * this summary emits, so their relative order cannot change the output.
  */
 function stableOrder(gaussians: GaussianSet): number[] {
-  const keys = new Array<[number, number, number, number]>(gaussians.count);
+  const keys: number[][] = new Array<number[]>(gaussians.count);
+  const shWidth = gaussians.sh === null ? 0 : gaussians.sh.coefficients * 3;
   for (let i = 0; i < gaussians.count; i++) {
-    keys[i] = [
-      roundHalfEven(gaussians.positions[i * 3]!, 6),
-      roundHalfEven(gaussians.positions[i * 3 + 1]!, 6),
-      roundHalfEven(gaussians.positions[i * 3 + 2]!, 6),
-      i,
-    ];
+    const row: number[] = [];
+    for (const [array, width] of [
+      [gaussians.positions, 3],
+      [gaussians.scales, 3],
+      [gaussians.rotations, 4],
+      [gaussians.colors, 4],
+      [gaussians.motions, 3],
+    ] as const) {
+      for (let k = 0; k < width; k++) row.push(sortable(array[i * width + k]!));
+    }
+    row.push(
+      sortable(gaussians.muT[i]!),
+      sortable(gaussians.sigmaT[i]!),
+      sortable(gaussians.winLo[i]!),
+      sortable(gaussians.winHi[i]!),
+    );
+    for (let k = 0; k < shWidth; k++) row.push(gaussians.sh!.values[i * shWidth + k]!);
+    row.push(i);
+    keys[i] = row;
   }
-  keys.sort((a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2] || a[3] - b[3]);
-  return keys.map((k) => k[3]);
+  keys.sort(compareRows);
+  return keys.map((row) => row[row.length - 1]!);
+}
+
+/**
+ * Lexicographic comparison, written out rather than subtracted: infinity minus infinity
+ * is not a number, and a never-fading gaussian's sigma is infinity.
+ */
+function compareRows(a: readonly number[], b: readonly number[]): number {
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i]!;
+    const y = b[i]!;
+    if (x < y) return -1;
+    if (x > y) return 1;
+  }
+  return 0;
+}
+
+/** A comparison key: rounded like the summary, with infinity kept as infinity. */
+function sortable(value: number): number {
+  if (Number.isNaN(value)) return Infinity;
+  if (!Number.isFinite(value)) return value;
+  return roundHalfEven(value, FLOAT_DECIMALS);
 }
 
 /** Stable JSON: sorted keys, two-space indent, the shape the expectations are stored in. */

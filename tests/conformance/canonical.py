@@ -13,17 +13,30 @@ about how a language spells a number:
 * `audio` is `null` when absent and an object when present, so both paths are visible in
   every implementation's output rather than one of them being invisible;
 * keys are sorted.
+
+**Nothing here may depend on decoded order.** Gaussians may be reordered freely by an
+encoder and readers must not rely on their order, so a summary that did would be asking
+two correct decoders to disagree. Everything per-gaussian — the sample, the aggregates,
+the spherical harmonic digest — is taken in the content order defined by `_stable_order`,
+which is derived from decoded values alone.
+
+The summary covers what the file says, not only its gaussians. A record that changes
+nothing here is a record an implementation could ignore entirely and still pass, which is
+how a feature matrix ends up claiming things the suite never checked.
 """
 
 from __future__ import annotations
 
 import json
 import math
+import zlib
 
 FLOAT_DECIMALS = 6
 #: How many gaussians appear in full. The aggregates cover the rest, so a decoder cannot
 #: pass by getting a prefix right.
 SAMPLE = 16
+#: How many camera keyframes appear in full, so a long trajectory cannot bloat a summary.
+CAMERA_KEYFRAMES = 4
 
 
 def num(value) -> float | None:
@@ -40,11 +53,29 @@ def num(value) -> float | None:
     return round(v, FLOAT_DECIMALS)
 
 
+def crc(data) -> str:
+    """CRC-32 of a byte payload, as a string. Used where a summary needs to prove it read
+    the bytes and not merely their length."""
+    return str(zlib.crc32(bytes(data)) & 0xFFFFFFFF)
+
+
 def canonical(scene_summary: dict) -> str:
     return json.dumps(scene_summary, sort_keys=True, indent=2, allow_nan=False)
 
 
-def summarize(header, gaussians, audio, chunk_intervals) -> dict:
+def summarize(
+    header,
+    gaussians,
+    audio,
+    chunk_intervals,
+    *,
+    camera=None,
+    metadata=(),
+    attachments=(),
+    statistics=None,
+    summary_offsets=(),
+    summary_crc_ok=None,
+) -> dict:
     """The statement every implementation must agree on for a variant."""
     n = gaussians.count
     order = _stable_order(gaussians)
@@ -57,7 +88,7 @@ def summarize(header, gaussians, audio, chunk_intervals) -> dict:
     alpha_sum = 0.0
     never_fades = 0
     still = 0
-    for i in range(n):
+    for i in order:
         for k in range(3):
             total_pos[k] += float(gaussians.positions[i][k])
         alpha_sum += float(gaussians.colors[i][3])
@@ -74,14 +105,48 @@ def summarize(header, gaussians, audio, chunk_intervals) -> dict:
     return {
         "gaussianCount": str(n),
         "durationSec": num(header.duration_sec),
+        "cutoff": num(header.cutoff),
         "shDegree": int(header.sh_degree),
         "temporalModel": header.temporal_model,
         "hasAudio": bool(header.has_audio),
         # Absent audio is a value, not a missing key: both paths are conformance-visible.
-        "audio": None if audio is None else {"codec": audio.codec, "byteLength": str(len(audio.data))},
+        "audio": None
+        if audio is None
+        else {"codec": audio.codec, "byteLength": str(len(audio.data)), "crc": crc(audio.data)},
         "chunkIntervals": [[num(a), num(b)] for a, b in chunk_intervals],
+        "headerAttributes": {k: v for k, v in sorted(dict(header.attributes).items())},
+        "metadataRecords": [
+            {"name": m.name, "entries": {k: v for k, v in sorted(dict(m.entries).items())}} for m in metadata
+        ],
+        "attachments": [
+            {
+                "name": a.name,
+                "mediaType": a.media_type,
+                "byteLength": str(len(a.data)),
+                "crc": crc(a.data),
+            }
+            for a in attachments
+        ],
+        "camera": None if camera is None else _camera(camera),
+        "statistics": None
+        if statistics is None
+        else {
+            "gaussianCount": str(statistics.gaussian_count),
+            "chunkCount": str(statistics.chunk_count),
+            "durationSec": num(statistics.duration_sec),
+            "aabb": [num(v) for v in statistics.aabb],
+        },
+        "summaryOffsets": [
+            {
+                "groupOpcode": str(s.group_opcode),
+                "groupStart": str(s.group_start),
+                "groupLength": str(s.group_length),
+            }
+            for s in summary_offsets
+        ],
+        "summaryCrcOk": summary_crc_ok,
+        "sh": _spherical_harmonics(gaussians, order),
         "sample": {
-            "indices": [str(i) for i in sample],
             "positions": rows(gaussians.positions, 3),
             "scales": rows(gaussians.scales, 3),
             "rotations": rows(gaussians.rotations, 4),
@@ -101,16 +166,87 @@ def summarize(header, gaussians, audio, chunk_intervals) -> dict:
     }
 
 
+def _camera(camera) -> dict:
+    return {
+        "fovYDeg": num(camera.fov_y_deg),
+        "position": [num(v) for v in camera.position],
+        "target": [num(v) for v in camera.target],
+        "keyframeCount": str(len(camera.times)),
+        "keyframes": [
+            {
+                "time": num(camera.times[i]),
+                "position": [num(v) for v in camera.positions[i]],
+                "target": [num(v) for v in camera.targets[i]],
+            }
+            for i in range(min(len(camera.times), CAMERA_KEYFRAMES))
+        ],
+        "interpolation": camera.interpolation,
+        "loop": bool(camera.loop),
+    }
+
+
+def _spherical_harmonics(gaussians, order) -> dict | None:
+    """Degree, width and a checksum of the coefficients in content order.
+
+    A digest rather than the coefficients themselves: degree 2 over 512 gaussians is
+    12,288 bytes, which would swamp the expectation without proving anything the checksum
+    does not. Taken in content order so that two decoders which visit gaussians
+    differently still agree.
+    """
+    sh = getattr(gaussians, "sh", None)
+    if sh is None or gaussians.sh_degree == 0:
+        return None
+    coefficients = sh.shape[1] // 3
+    payload = bytearray()
+    for i in order:
+        payload += bytes(bytearray(int(v) for v in sh[i]))
+    return {
+        "degree": int(gaussians.sh_degree),
+        "coefficients": str(coefficients),
+        "crc": crc(payload),
+    }
+
+
 def _stable_order(gaussians) -> list[int]:
     """Sort gaussians into an order both implementations can reproduce.
 
     Chunking and Morton ordering are encoder choices, so decoded order is not part of the
-    contract — but a comparison needs *some* order. Sorting on decoded values gives one
-    without making the encoder's choices normative.
+    contract — but a comparison needs *some* order. The key is the gaussian's whole
+    decoded state, rounded exactly as the summary rounds it, with its spherical harmonic
+    coefficients last. Two gaussians that tie on all of it are identical in every value
+    this summary emits, so their relative order cannot change the output.
     """
+    sh = getattr(gaussians, "sh", None)
     keys = []
     for i in range(gaussians.count):
-        p = gaussians.positions[i]
-        keys.append((round(float(p[0]), 6), round(float(p[1]), 6), round(float(p[2]), 6), i))
-    keys.sort()
-    return [k[3] for k in keys]
+        row = []
+        for arr, width in (
+            (gaussians.positions, 3),
+            (gaussians.scales, 3),
+            (gaussians.rotations, 4),
+            (gaussians.colors, 4),
+            (gaussians.motions, 3),
+        ):
+            row += [_sortable(arr[i][k]) for k in range(width)]
+        row += [
+            _sortable(gaussians.mu_t[i]),
+            _sortable(gaussians.sigma_t[i]),
+            _sortable(gaussians.win_lo[i]),
+            _sortable(gaussians.win_hi[i]),
+        ]
+        if sh is not None:
+            row += [int(v) for v in sh[i]]
+        keys.append((row, i))
+    keys.sort(key=lambda k: k[0])
+    return [k[1] for k in keys]
+
+
+def _sortable(value) -> float:
+    """A comparison key: rounded like the summary, with infinity kept as infinity so the
+    two languages order never-fading gaussians identically."""
+    v = float(value)
+    if math.isnan(v):
+        return math.inf
+    if math.isinf(v):
+        return v
+    return round(v, FLOAT_DECIMALS)

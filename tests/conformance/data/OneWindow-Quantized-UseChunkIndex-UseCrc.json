@@ -9,16 +9,21 @@
     ],
     "zeroMotionCount": "0"
   },
+  "attachments": [],
   "audio": null,
+  "camera": null,
   "chunkIntervals": [
     [
       0.0,
       2.0
     ]
   ],
+  "cutoff": 0.05,
   "durationSec": 2.0,
   "gaussianCount": "64",
   "hasAudio": false,
+  "headerAttributes": {},
+  "metadataRecords": [],
   "sample": {
     "colors": [
       [
@@ -117,24 +122,6 @@
         0.917647,
         0.847059
       ]
-    ],
-    "indices": [
-      "54",
-      "47",
-      "36",
-      "53",
-      "30",
-      "1",
-      "35",
-      "33",
-      "31",
-      "13",
-      "32",
-      "14",
-      "37",
-      "52",
-      "3",
-      "11"
     ],
     "motions": [
       [
@@ -553,6 +540,10 @@
       0.0
     ]
   },
+  "sh": null,
   "shDegree": 0,
+  "statistics": null,
+  "summaryCrcOk": true,
+  "summaryOffsets": [],
   "temporalModel": "gaussian-birth"
 }

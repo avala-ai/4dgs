@@ -9,7 +9,9 @@
     ],
     "zeroMotionCount": "0"
   },
+  "attachments": [],
   "audio": null,
+  "camera": null,
   "chunkIntervals": [
     [
       0.0,
@@ -180,9 +182,12 @@
       2.25
     ]
   ],
+  "cutoff": 0.05,
   "durationSec": 20.0,
   "gaussianCount": "640",
   "hasAudio": false,
+  "headerAttributes": {},
+  "metadataRecords": [],
   "sample": {
     "colors": [
       [
@@ -281,24 +286,6 @@
         0.25098,
         0.070588
       ]
-    ],
-    "indices": [
-      "347",
-      "561",
-      "370",
-      "290",
-      "108",
-      "420",
-      "23",
-      "412",
-      "550",
-      "287",
-      "57",
-      "413",
-      "309",
-      "342",
-      "502",
-      "77"
     ],
     "motions": [
       [
@@ -717,6 +704,28 @@
       8.0
     ]
   },
+  "sh": null,
   "shDegree": 0,
+  "statistics": {
+    "aabb": [
+      -0.995582,
+      -0.994886,
+      -0.999433,
+      0.996117,
+      0.998656,
+      0.993365
+    ],
+    "chunkCount": "42",
+    "durationSec": 20.0,
+    "gaussianCount": "640"
+  },
+  "summaryCrcOk": true,
+  "summaryOffsets": [
+    {
+      "groupLength": "2135",
+      "groupOpcode": "8",
+      "groupStart": "30493"
+    }
+  ],
   "temporalModel": "gaussian-birth"
 }

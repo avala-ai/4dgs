@@ -9,7 +9,16 @@
     ],
     "zeroMotionCount": "0"
   },
+  "attachments": [
+    {
+      "byteLength": "11",
+      "crc": "3893695975",
+      "mediaType": "text/plain",
+      "name": "note.txt"
+    }
+  ],
   "audio": null,
+  "camera": null,
   "chunkIntervals": [
     [
       0.0,
@@ -52,9 +61,22 @@
       20.0
     ]
   ],
+  "cutoff": 0.05,
   "durationSec": 20.0,
   "gaussianCount": "640",
   "hasAudio": false,
+  "headerAttributes": {
+    "scenario": "TenWindows"
+  },
+  "metadataRecords": [
+    {
+      "entries": {
+        "scenario": "TenWindows",
+        "visibility_profile": "gaussian"
+      },
+      "name": "TenWindows"
+    }
+  ],
   "sample": {
     "colors": [
       [
@@ -153,24 +175,6 @@
         0.25098,
         0.070588
       ]
-    ],
-    "indices": [
-      "282",
-      "150",
-      "325",
-      "167",
-      "361",
-      "432",
-      "71",
-      "403",
-      "79",
-      "158",
-      "195",
-      "407",
-      "216",
-      "269",
-      "579",
-      "260"
     ],
     "motions": [
       [
@@ -589,6 +593,10 @@
       8.0
     ]
   },
+  "sh": null,
   "shDegree": 0,
+  "statistics": null,
+  "summaryCrcOk": true,
+  "summaryOffsets": [],
   "temporalModel": "gaussian-birth"
 }

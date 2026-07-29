@@ -63,8 +63,11 @@ Each declares `name` and `supportsVariant(variant)`. **A partial implementation 
 runner that returns `False` for a variant is skipped, not failed, and the feature matrix is where
 that shows up publicly.
 
-Python runners are invoked as subprocesses that print JSON to stdout; TypeScript runners run in
-process. A new language needs one stdout CLI and one small entry in the harness.
+Every runner is invoked the same way: as a subprocess, with a path, printing canonical JSON to
+stdout. A new language needs one stdout CLI and one line in `RUNNERS`. A language with a build step
+adds its built entry point there; the harness skips a family whose entry point is missing, so a
+contributor who has not built it still gets a clean run, and fails if a family was asked for by name
+and never ran.
 
 ## Canonical JSON
 
@@ -77,6 +80,14 @@ So that two languages can be diffed without arguing about representation:
 - `"audio"` is `null` when absent and an object when present, so both paths are visible in every
   implementation's output
 - keys are sorted; the harness stable-stringifies before diffing and colourizes the first divergence
+- **nothing depends on decoded order.** Gaussians may be reordered freely by an encoder, so the
+  sample, the aggregates and the spherical harmonic digest are all taken in a content order derived
+  from decoded values alone. Two gaussians that tie on every decoded value are identical in every
+  number the summary emits, so their relative order cannot change it
+- records that are not gaussians are summarized too — the camera, the metadata, the attachments, the
+  statistics, the summary offsets, and whether the footer's CRC verified. A record that changes
+  nothing here is a record an implementation could ignore entirely and still pass, which is how a
+  feature matrix ends up claiming things the suite never checked
 
 `--update` rewrites the expectations from the current implementation. Use it when you have decided a
 change is correct, never to make a red suite green.
