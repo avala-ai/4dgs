@@ -19,5 +19,6 @@
   },
   "dependencies": {
     "@4dgs/core": "workspace:^"
-  }
+  },
+  "homepage": "https://4dgs.dev"
 }

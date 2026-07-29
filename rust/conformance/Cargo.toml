@@ -5,6 +5,7 @@ edition = "2021"
 rust-version = "1.82"
 license = "Apache-2.0"
 description = "Conformance runners for the 4dgs Rust SDK"
+homepage = "https://4dgs.dev"
 repository = "https://github.com/avala-ai/4dgs"
 publish = false
 

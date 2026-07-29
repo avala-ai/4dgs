@@ -5,6 +5,7 @@ edition = "2021"
 rust-version = "1.82"
 license = "Apache-2.0"
 description = "Command line tool for the 4dgs container format"
+homepage = "https://4dgs.dev"
 repository = "https://github.com/avala-ai/4dgs"
 # Unpublished for the same reason the core is: the crate ships when the maintainer says
 # so, not when a tag happens to exist.

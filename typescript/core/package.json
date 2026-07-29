@@ -16,5 +16,6 @@
   "scripts": {
     "build": "tsc -b",
     "clean": "tsc -b --clean"
-  }
+  },
+  "homepage": "https://4dgs.dev"
 }
