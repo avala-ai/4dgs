@@ -26,8 +26,14 @@ hand-kept index of the same thing, so that the log is readable without leaving t
 | Date       | Package          | Version | Release                                                                                            |
 | ---------- | ---------------- | ------- | -------------------------------------------------------------------------------------------------- |
 | 2026-07-28 | Python `fourdgs` | 0.1.0   | [releases/python/v0.1.0](https://github.com/avala-ai/4dgs/releases/tag/releases%2Fpython%2Fv0.1.0) |
+| 2026-07-29 | Rust `fourdgs`   | 0.1.0   | [releases/rust/v0.1.0](https://github.com/avala-ai/4dgs/releases/tag/releases%2Frust%2Fv0.1.0)     |
 
 `fourdgs 0.0.1` on PyPI, `fourdgs 0.0.1` on crates.io and `@4dgs/core`, `@4dgs/browser`,
 `@4dgs/nodejs` and `@4dgs/codecs` at `0.0.1` on npm are name reservations, published by hand before
 the release workflow existed. They contain no implementation, have no tag and no release, and
 nothing should depend on them.
+
+The TypeScript packages are at 0.1.0 in this repository and have a written 0.1.0 changelog section,
+and are absent from the log above because nothing has been published: the release job's OIDC
+exchange has no trusted publisher to exchange with on npm. The tag will be pushed when it can
+publish, which is the only thing that puts a line here.
