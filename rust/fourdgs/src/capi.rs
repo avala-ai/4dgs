@@ -2056,6 +2056,9 @@ pub unsafe extern "C" fn fourdgs_writer_set_gaussians(
             sh_coefficients: 0,
             sh_degree: 0,
             source_index: None,
+            // The C ABI encode surface does not carry object_id; a file written through it
+            // groups nothing. The reader still surfaces it when a file has one.
+            object_id: None,
         };
         FOURDGS_STATUS_OK
     })
