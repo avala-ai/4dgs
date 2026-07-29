@@ -11,11 +11,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 import numpy as np
 
 from . import __version__, read
+from .compressed_ply import import_scene as import_compressed_ply
+from .compressed_ply import sorted_segments
 from .convert import convert_ply_sequence
 from .exceptions import InvalidInput
 from .gltf import from_gltf, to_gltf
@@ -124,6 +127,20 @@ def cmd_convert(args) -> int:
         options=WriteOptions(profile=args.profile, scene_profile="capture"),
     )
     print(f"{gaussians.count:,} gaussians over {duration:.3f} s -> {args.out} ({written / 2**20:.2f} MiB)")
+    return 0
+
+
+def cmd_from_compressed_ply(args) -> int:
+    paths = sorted_segments(args.source) if os.path.isdir(args.source) else list(args.source_files or [args.source])
+    gaussians, duration = import_compressed_ply(paths, segment_duration=args.segment_duration)
+    written = write(
+        args.out,
+        gaussians,
+        duration,
+        options=WriteOptions(profile=args.profile, scene_profile="capture"),
+    )
+    parts = f"{len(paths)} segments" if len(paths) > 1 else "1 file"
+    print(f"{gaussians.count:,} gaussians over {duration:.3f} s from {parts} -> {args.out} ({written / 2**20:.2f} MiB)")
     return 0
 
 
@@ -242,6 +259,18 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--fps", type=float, default=30.0)
     c.add_argument("--profile", default="default", choices=("fine", "default", "coarse"))
     c.set_defaults(func=cmd_convert)
+
+    fc = sub.add_parser("from-compressed-ply", help="a chunk-compressed PLY (or a segmented set) -> .4dgs")
+    fc.add_argument("source", help="a .ply, or a directory of segment .ply files in timeline order")
+    fc.add_argument("source_files", nargs="*", help="further segments, if listing them explicitly")
+    fc.add_argument("-o", "--out", required=True)
+    fc.add_argument(
+        "--segment-duration",
+        type=float,
+        help="seconds each segment covers; required for a segmented set, ignored for a single file",
+    )
+    fc.add_argument("--profile", default="default", choices=("fine", "default", "coarse"))
+    fc.set_defaults(func=cmd_from_compressed_ply)
 
     fg = sub.add_parser("from-gltf", help="a static KHR_gaussian_splatting glTF/GLB -> .4dgs")
     fg.add_argument("source", help="a .gltf or .glb carrying the KHR_gaussian_splatting extension")

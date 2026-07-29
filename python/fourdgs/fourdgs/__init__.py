@@ -19,6 +19,8 @@ from __future__ import annotations
 #: against the tag it was invoked with.
 __version__ = "0.1.0"
 
+from .compressed_ply import import_scene as from_compressed_ply
+from .compressed_ply import is_compressed_ply, read_compressed_ply, sorted_segments
 from .exceptions import (
     BoundViolation,
     FourdgsError,
@@ -62,12 +64,16 @@ __all__ = [
     "UsdImport",
     "WriteOptions",
     "__version__",
+    "from_compressed_ply",
     "from_gltf",
     "from_usd",
+    "is_compressed_ply",
     "pose_at",
     "read",
+    "read_compressed_ply",
     "sh_bound",
     "sh_step",
+    "sorted_segments",
     "to_gltf",
     "to_usd",
     "write",
