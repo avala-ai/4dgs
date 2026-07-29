@@ -34,6 +34,12 @@ CPP_BUILD = os.path.join(ROOT, "cpp", "build", "conformance")
 RUST_BIN = os.path.join(ROOT, "target", "release")
 SWIFT_BIN = os.path.join(ROOT, "swift", ".build", "release")
 
+#: Windows puts a suffix on an executable. The harness finds a runner by testing its path
+#: for existence, so without this every compiled family looks "not built" on Windows — and
+#: because a family that never ran is a failure rather than a pass, `--runner rust` then
+#: goes red for a reason that has nothing to do with the runner.
+EXE = ".exe" if os.name == "nt" else ""
+
 #: (family, name, argv-prefix). A new language adds one line.
 RUNNERS = [
     (
@@ -48,12 +54,12 @@ RUNNERS = [
     ),
     ("typescript", "typescript/decode_streamed", ["node", os.path.join(TYPESCRIPT_DIST, "decode_streamed.js")]),
     ("typescript", "typescript/decode_indexed", ["node", os.path.join(TYPESCRIPT_DIST, "decode_indexed.js")]),
-    ("cpp", "cpp/decode_streamed", [os.path.join(CPP_BUILD, "decode_streamed")]),
-    ("cpp", "cpp/decode_indexed", [os.path.join(CPP_BUILD, "decode_indexed")]),
-    ("rust", "rust/decode_streamed", [os.path.join(RUST_BIN, "decode_streamed")]),
-    ("rust", "rust/decode_indexed", [os.path.join(RUST_BIN, "decode_indexed")]),
-    ("swift", "swift/decode_streamed", [os.path.join(SWIFT_BIN, "decode_streamed")]),
-    ("swift", "swift/decode_indexed", [os.path.join(SWIFT_BIN, "decode_indexed")]),
+    ("cpp", "cpp/decode_streamed", [os.path.join(CPP_BUILD, "decode_streamed" + EXE)]),
+    ("cpp", "cpp/decode_indexed", [os.path.join(CPP_BUILD, "decode_indexed" + EXE)]),
+    ("rust", "rust/decode_streamed", [os.path.join(RUST_BIN, "decode_streamed" + EXE)]),
+    ("rust", "rust/decode_indexed", [os.path.join(RUST_BIN, "decode_indexed" + EXE)]),
+    ("swift", "swift/decode_streamed", [os.path.join(SWIFT_BIN, "decode_streamed" + EXE)]),
+    ("swift", "swift/decode_indexed", [os.path.join(SWIFT_BIN, "decode_indexed" + EXE)]),
 ]
 
 

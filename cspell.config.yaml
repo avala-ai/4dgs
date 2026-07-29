@@ -55,6 +55,7 @@ words:
   - staticlib
   - lpthread
   - clippy
+  - MSVC
   - fprintf
   - DFOURDGS
 ignorePaths:

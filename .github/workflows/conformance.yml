@@ -20,8 +20,19 @@ jobs:
           python tests/conformance/generate.py --verify
 
   python:
-    runs-on: ubuntu-latest
+    # The corpus is bytes, and a decoder that agrees with it on Linux and disagrees on
+    # Windows is exactly the bug a conformance suite is for. The ubuntu leg keeps the
+    # bare job name; the others are suffixed.
+    name: ${{ matrix.os == 'ubuntu-latest' && 'python' || format('python ({0})', matrix.os) }}
+    runs-on: ${{ matrix.os }}
     needs: corpus
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -32,8 +43,16 @@ jobs:
           python tests/conformance/run.py --runner python
 
   typescript:
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os == 'ubuntu-latest' && 'typescript' || format('typescript ({0})', matrix.os) }}
+    runs-on: ${{ matrix.os }}
     needs: corpus
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -79,8 +98,16 @@ jobs:
       - run: echo "kaitai struct validation"
 
   rust:
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os == 'ubuntu-latest' && 'rust' || format('rust ({0})', matrix.os) }}
+    runs-on: ${{ matrix.os }}
     needs: corpus
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

@@ -80,6 +80,23 @@ adds its built entry point there; the harness skips a family whose entry point i
 contributor who has not built it still gets a clean run, and fails if a family was asked for by name
 and never ran.
 
+**A new entry in `RUNNERS` needs the `EXE` suffix if it is compiled.** Windows names an executable
+`decode_streamed.exe`, and the harness finds a runner by testing its path for existence — so a
+compiled family without the suffix is reported "not built" on Windows and silently contributes
+nothing. It does not stay silent for long, because a family asked for by name and never executed is
+a failure, but the error names the runner rather than the platform and reads like a build problem.
+
+## Platforms
+
+The suite runs on GitHub-hosted runners for Python, TypeScript and Rust on Linux, macOS and Windows;
+C++ and Swift run it on Linux. Every platform decodes the same 32 variants and compares against the
+same committed expectations — 63 passing comparisons per family, with the single `decode_indexed`
+variant that declares no chunk index skipped.
+
+That the corpus is bytes is the whole reason this is worth doing on more than one platform: a
+decoder that agrees with the expectation on Linux and disagrees on Windows is exactly the bug this
+suite exists to find, and it is invisible to a suite that only ever runs in one place.
+
 ## Canonical JSON
 
 So that two languages can be diffed without arguing about representation:

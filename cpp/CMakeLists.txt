@@ -15,6 +15,21 @@ if(NOT DEFINED CMAKE_POSITION_INDEPENDENT_CODE)
   set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 endif()
 
+# Multi-config generators — Visual Studio is the one that matters here — append the
+# configuration name to every output directory, so a runner the harness expects at
+# build/conformance/decode_streamed lands at build/conformance/Release/decode_streamed.exe
+# instead. Setting the per-configuration property as well as the plain one pins the
+# output back to a single place on every generator, which is what lets the conformance
+# harness name these paths in one line rather than guessing at a configuration.
+function(fourdgs_pin_runtime_output target directory)
+  set_target_properties(${target} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${directory}")
+  foreach(config IN LISTS CMAKE_CONFIGURATION_TYPES)
+    string(TOUPPER "${config}" config_upper)
+    set_target_properties(${target} PROPERTIES RUNTIME_OUTPUT_DIRECTORY_${config_upper}
+                                               "${directory}")
+  endforeach()
+endfunction()
+
 option(FOURDGS_BUILD_TESTS "Build the unit tests" ON)
 option(FOURDGS_BUILD_CONFORMANCE "Build the conformance runners" ON)
 option(FOURDGS_ASAN "Build with the address and undefined-behaviour sanitizers" OFF)
@@ -70,11 +85,25 @@ if(FOURDGS_HAVE_CORE)
     # The static library first. The crate builds a cdylib too, and linking that would make
     # every consumer's binary need it on their loader path at run time — a surprise for an
     # integrator who asked for one static archive.
+    #
+    # Saying that is not enough on Windows. Cargo writes both `fourdgs.lib` (the staticlib)
+    # and `fourdgs.dll.lib` (the cdylib's import library) into the same directory, and
+    # CMake's MSVC suffix list puts `.dll.lib` ahead of `.lib` — so the default search
+    # returns the DLL, which is the outcome the paragraph above rules out. It is not a
+    # theoretical preference: an executable that references any fourdgs_* symbol then gets
+    # a load-time dependency on fourdgs.dll, and with the DLL absent from the loader path
+    # the process does not start. Narrowing the suffix list for this one search asks for
+    # the archive the comment says it wants.
+    set(FOURDGS_SAVED_FIND_SUFFIXES ${CMAKE_FIND_LIBRARY_SUFFIXES})
+    if(MSVC)
+      set(CMAKE_FIND_LIBRARY_SUFFIXES ".lib")
+    endif()
     find_library(
       FOURDGS_CORE_FOUND_LIBRARY
       NAMES libfourdgs.a fourdgs
       HINTS "${CMAKE_CURRENT_SOURCE_DIR}/../target/release"
             "${CMAKE_CURRENT_SOURCE_DIR}/../target/debug")
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ${FOURDGS_SAVED_FIND_SUFFIXES})
     if(NOT FOURDGS_CORE_FOUND_LIBRARY)
       message(
         FATAL_ERROR
@@ -86,8 +115,16 @@ if(FOURDGS_HAVE_CORE)
   message(STATUS "fourdgs: linking the core from ${FOURDGS_CORE_LIBRARY}")
   target_link_libraries(fourdgs-cpp PUBLIC "${FOURDGS_CORE_LIBRARY}")
   # A Rust staticlib brings its own runtime requirements; these are what it needs on the
-  # platforms this package is built for.
-  if(UNIX AND NOT APPLE)
+  # platforms this package is built for. The archive does not record them, so a consumer
+  # that omits them gets a page of unresolved symbols with no hint of where they came
+  # from. `cargo rustc -p fourdgs --crate-type staticlib -- --print native-static-libs`
+  # prints the authoritative list per target if this ever needs revisiting.
+  #
+  # macOS needs nothing named: its equivalents are all in libSystem, which is linked
+  # already, and asking for them by name is an error rather than a no-op.
+  if(WIN32)
+    target_link_libraries(fourdgs-cpp PUBLIC ws2_32 userenv ntdll bcrypt advapi32 kernel32)
+  elseif(UNIX AND NOT APPLE)
     target_link_libraries(fourdgs-cpp PUBLIC pthread dl m)
   endif()
 endif()
@@ -110,8 +147,7 @@ if(FOURDGS_BUILD_CONFORMANCE)
   foreach(runner decode_streamed decode_indexed)
     add_executable(${runner} conformance/${runner}.cpp)
     target_link_libraries(${runner} PRIVATE fourdgs-canonical)
-    set_target_properties(${runner} PROPERTIES RUNTIME_OUTPUT_DIRECTORY
-                                               ${CMAKE_BINARY_DIR}/conformance)
+    fourdgs_pin_runtime_output(${runner} ${CMAKE_BINARY_DIR}/conformance)
   endforeach()
 endif()
 
@@ -121,8 +157,7 @@ if(FOURDGS_BUILD_EXAMPLES)
   # Built and run in CI, so an example cannot rot into a snippet that no longer compiles.
   add_executable(decode_summary examples/decode_summary.cpp)
   target_link_libraries(decode_summary PRIVATE fourdgs-cpp)
-  set_target_properties(decode_summary PROPERTIES RUNTIME_OUTPUT_DIRECTORY
-                                                  ${CMAKE_BINARY_DIR}/examples)
+  fourdgs_pin_runtime_output(decode_summary ${CMAKE_BINARY_DIR}/examples)
 endif()
 
 if(FOURDGS_BUILD_TESTS)

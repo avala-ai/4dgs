@@ -25,8 +25,19 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 out="${1:-$(mktemp -d)}"
 mkdir -p "$out"
 
-encode="$root/target/release/encode_roundtrip"
-decode_rust="$root/target/release/decode_streamed"
+# Windows names an executable with a suffix, and the interpreter is `python` there rather
+# than `python3` — a Windows Python installation ships no `python3.exe`. Both are resolved
+# once here so the rest of the script reads the same on every platform.
+exe=""
+[ "${OS:-}" = "Windows_NT" ] && exe=".exe"
+if command -v python3 >/dev/null 2>&1; then
+  python=python3
+else
+  python=python
+fi
+
+encode="$root/target/release/encode_roundtrip$exe"
+decode_rust="$root/target/release/decode_streamed$exe"
 decode_python="$root/python/conformance/decode_streamed.py"
 
 for binary in "$encode" "$decode_rust"; do
@@ -48,8 +59,8 @@ for source in "${variants[@]}"; do
   name="$(basename "$source" .4dgs)"
   "$encode" "$source" "$out/$name.4dgs" >"$out/$name.note"
   "$decode_rust" "$out/$name.4dgs" >"$out/$name.rust.json"
-  python3 "$decode_python" "$out/$name.4dgs" >"$out/$name.python.json"
-  python3 - "$out/$name.rust.json" "$out/$name.python.json" "$name" <<'PY'
+  "$python" "$decode_python" "$out/$name.4dgs" >"$out/$name.python.json"
+  "$python" - "$out/$name.rust.json" "$out/$name.python.json" "$name" <<'PY'
 import json
 import sys
 
