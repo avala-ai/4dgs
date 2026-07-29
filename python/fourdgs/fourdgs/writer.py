@@ -90,6 +90,11 @@ class WriteOptions:
     #: correct — splicing them in afterwards would shift every offset the index holds,
     #: which produces a corrupt file rather than a forward-compatibility test.
     extra_records: tuple[bytes, ...] = ()
+    #: The Header's `temporal_model`. Version 1 defines exactly one, and this exists so a
+    #: conformance fixture can declare something else — a reader that does not enforce the
+    #: registry's refusal rule cannot be caught by a corpus that only ever writes the one
+    #: legal value. Producers have no reason to set it.
+    temporal_model: str = "gaussian-birth"
 
 
 def _sh_depths(requested, bands: list[int]) -> dict[int, int]:
@@ -328,7 +333,7 @@ def _encode(g: GaussianSet, duration_sec, opts, audio, camera) -> bytes:
             aabb=g.aabb(),
             profile=opts.scene_profile,
             library=opts.library,
-            temporal_model="gaussian-birth",
+            temporal_model=opts.temporal_model,
             cutoff=opts.cutoff,
             sh_degree=g.sh_degree if sh_cols else 0,
             flags=header_flags,

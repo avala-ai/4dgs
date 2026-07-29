@@ -177,6 +177,27 @@ REFUSALS: tuple[Refusal, ...] = (
     Refusal("UnknownStreamCodec", "unknown-stream-codec", "spec 5.5, registry stream codecs", _unknown_stream_codec),
 )
 
+#: Invalid variants the encoder writes directly rather than a mutation producing.
+#:
+#: A byte patch cannot make this one: shortening a length-prefixed string moves every
+#: Header field after it, so the file would be wrong in two ways and a reader could pass
+#: by noticing the alignment rather than the rule. `WriteOptions.temporal_model` lets the
+#: encoder lay the record out correctly around the value under test.
+#:
+#: The empty string is worth its own case rather than folding into `UnknownTemporalModel`:
+#: it is what a struct initialized to its zero value produces, so it is the shape a *bug*
+#: writes rather than the shape a future version writes. Two of these SDKs disagreed about
+#: exactly this — one defaulted the field to `gaussian-birth`, the other left it blank —
+#: and nothing inside either language could see it.
+ENCODED: tuple[tuple[str, str, str, dict], ...] = (
+    (
+        "EmptyTemporalModel",
+        "unknown-temporal-model",
+        "registry, temporal models",
+        {"temporal_model": ""},
+    ),
+)
+
 #: Every identifier the suite knows. A runner may produce no other, and a new refusal is
 #: added here rather than invented in one language.
-CODES = frozenset(r.code for r in REFUSALS)
+CODES = frozenset(r.code for r in REFUSALS) | {code for _, code, _, _ in ENCODED}

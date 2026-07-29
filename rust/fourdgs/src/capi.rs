@@ -70,6 +70,12 @@ fn status_of(error: &Error) -> c_int {
         Error::Truncated(_) => FOURDGS_STATUS_TRUNCATED,
         Error::Malformed(_) => FOURDGS_STATUS_MALFORMED,
         Error::UnsupportedCodec(_) => FOURDGS_STATUS_UNSUPPORTED_CODEC,
+        // Mapped onto the existing "legal but unimplemented" status rather than given a
+        // new one. The status codes are the C ABI's public contract, and every consumer
+        // that already handles UNSUPPORTED_CODEC handles this correctly: the file is
+        // conforming and this build cannot read it. Which value it is stays in the
+        // message, which the registry requires to name it.
+        Error::UnsupportedModel(_) => FOURDGS_STATUS_UNSUPPORTED_CODEC,
         Error::BoundViolation(_) => FOURDGS_STATUS_MALFORMED,
         Error::UnsupportedOperation(_) => FOURDGS_STATUS_UNSUPPORTED_MODE,
         // The C ABI exposes no encoder, so this cannot arise through it today; mapped

@@ -436,3 +436,90 @@ fn both_validators_say_the_same_thing_about_the_same_bytes() {
     }
     assert_eq!(compared, 4, "every case must actually have been compared");
 }
+
+/// The same comparison, over the corpus of files a reader must refuse.
+///
+/// The four hand-built cases above isolate one rule each; these are the suite's own
+/// invalid variants, and they are where a missing check actually shows. Every one of them
+/// is a file that is well-formed apart from a single rule, so a reader without that check
+/// decodes it into a plausible scene and says nothing — which is precisely how this
+/// implementation shipped with no temporal-model gate at all while passing every valid
+/// variant.
+///
+/// The refusal wording is contract here, not prose. Both CLIs print the same sentence
+/// because the specification writes it, and this test is what keeps that true.
+#[test]
+fn both_validators_refuse_the_invalid_corpus_the_same_way() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/conformance/data/invalid");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        // The corpus is generated, not committed. CI generates it before this suite.
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI generates the corpus before this suite, so a run that could not find it \
+             is a comparison that silently did not happen"
+        );
+        return;
+    };
+
+    let mut paths: Vec<std::path::PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "4dgs"))
+        .collect();
+    paths.sort();
+
+    let mut compared = 0;
+    let mut gated = 0;
+    for path in &paths {
+        let ours = findings(&stdout(&run(&["validate", path.to_str().unwrap()])));
+        let Some(theirs) = python_findings(path) else {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "CI installs the Python package before this suite"
+            );
+            return;
+        };
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+
+        // The two must say the same thing about the same bytes, wherever they say
+        // anything. That is the property this file exists to hold, and it is what a check
+        // present in one implementation and missing from the other breaks.
+        //
+        // Two classes are exempt from the wording comparison for now, and both are
+        // recorded as gaps rather than quietly skipped:
+        //
+        // * the magic and version refusals, which the two word differently — this crate
+        //   prefixes its error kind and Python does not. Closing that means changing
+        //   messages in both languages.
+        // * files whose only fault is inside a chunk's streams, such as an unimplemented
+        //   stream codec. NEITHER validator reports those, because `validate` walks the
+        //   framing and opens the file the way a seeking client would; it never decodes a
+        //   stream. The decoders do refuse them — the conformance runners prove that —
+        //   so this is a thinness in the validators, not a hole in the readers.
+        let wording_is_contract =
+            name.contains("TemporalModel") || name.contains("QuantizationScheme");
+        if wording_is_contract {
+            assert_eq!(ours, theirs, "the two validators disagree about {name}");
+            for (who, found) in [("this reader", &ours), ("the Python reader", &theirs)] {
+                assert!(
+                    found.iter().any(|l| l.starts_with("error: ")),
+                    "{name} declares a value neither reader implements and {who} said \
+                     nothing about it: {found:?}"
+                );
+            }
+            gated += 1;
+        }
+
+        compared += 1;
+    }
+    assert!(
+        compared >= 7,
+        "the invalid corpus should have been compared file by file, saw {compared}"
+    );
+    // Both the unknown model and the empty one, on the gate this whole comparison exists
+    // for. A run where neither was reached is a green test that checked nothing.
+    assert!(
+        gated >= 3,
+        "the temporal-model and scheme refusals must have been compared, saw {gated}"
+    );
+}

@@ -21,6 +21,7 @@ import { MalformedFile, TruncatedFile } from "./errors.js";
 import { assembleGaussians, type GaussianSet } from "./gaussians.js";
 import { Opcode } from "./opcodes.js";
 import { DEFAULT_CUTOFF, supportK } from "./quantization.js";
+import { checkQuantizationScheme, checkTemporalModel } from "./registry.js";
 import {
   type Attachment,
   type AudioTrack,
@@ -156,9 +157,11 @@ export async function decodeScene(
       switch (opcode) {
         case Opcode.Header:
           header = parseHeader(content);
+          checkTemporalModel(header.temporalModel);
           break;
         case Opcode.Quantization:
           quantization = parseQuantization(content);
+          checkQuantizationScheme(quantization.scheme);
           break;
         case Opcode.WindowTable:
           windows = parseWindowTable(content);

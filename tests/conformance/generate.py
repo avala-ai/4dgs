@@ -62,7 +62,7 @@ from fourdgs.serialization import put_record
 MAX_DATA_BYTES = 2_500_000
 
 
-def build(scenario, flags) -> tuple[bytes, str]:
+def build(scenario, flags, *, read_back: bool = True, **overrides) -> tuple[bytes, str]:
     """Encode one variant and produce its expectation."""
     raw = scenarios.build_gaussians(scenario)
     n = len(raw["positions"])
@@ -158,11 +158,18 @@ def build(scenario, flags) -> tuple[bytes, str]:
         record_trailers=trailers,
         cutoff=0.2 if "CustomCutoff" in flags else 0.05,
         sh_bit_depths=sh_bit_depths,
+        **overrides,
     )
 
     buf = io.BytesIO()
     fourdgs.write(buf, gaussians, raw["duration_sec"], options=options, audio=audio, camera=camera)
     data = buf.getvalue()
+
+    if not read_back:
+        # An invalid variant is not summarized: the expectation is the refusal, and
+        # reading it back would be asking a correct decoder to decode a file it must
+        # refuse. Returning the bytes alone is the point.
+        return data, ""
 
     scene = fourdgs.read(data)
     expectation = canonical(
@@ -198,6 +205,11 @@ def build_invalid() -> list[tuple[str, bytes, str]]:
         if data == base:
             raise AssertionError(f"{refusal.name}: the mutation changed nothing")
         out.append((refusal.name, data, canonical({"refused": refusal.code})))
+    for name, code, _rule, overrides in invalid.ENCODED:
+        data, _ = build(base_scenario, tuple(sorted(invalid.BASE_FLAGS)), read_back=False, **overrides)
+        if data == base:
+            raise AssertionError(f"{name}: the override changed nothing")
+        out.append((name, data, canonical({"refused": code})))
     return out
 
 

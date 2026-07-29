@@ -27,6 +27,7 @@ import { MalformedFile } from "./errors.js";
 import { FrontMatterScanner } from "./frontMatter.js";
 import { Opcode } from "./opcodes.js";
 import { DEFAULT_CUTOFF, supportK } from "./quantization.js";
+import { checkQuantizationScheme, checkTemporalModel } from "./registry.js";
 import type { IReadable } from "./readable.js";
 import {
   type AudioTrack,
@@ -161,8 +162,10 @@ export class IndexedDecoder {
       if (record.opcode === Opcode.Chunk) break;
       if (record.opcode === Opcode.Header) {
         header = parseHeader(await scanner.content(record));
+        checkTemporalModel(header.temporalModel);
       } else if (record.opcode === Opcode.Quantization) {
         quantization = parseQuantization(await scanner.content(record));
+        checkQuantizationScheme(quantization.scheme);
       } else if (record.opcode === Opcode.WindowTable) {
         windows = parseWindowTable(await scanner.content(record));
       } else if (record.opcode === Opcode.Audio) {
