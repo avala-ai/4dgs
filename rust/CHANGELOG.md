@@ -6,6 +6,33 @@ All notable changes to the Rust crate are documented here, following
 
 ## [Unreleased]
 
+### Fixed
+
+- **The encoder wrote files the specification forbids, silently, when handed a non-finite
+  position.** The position origin is a fold of `f64::min` seeded with `f64::INFINITY`, and
+  `f64::min` returns the other operand when one is NaN — so a single NaN on an axis left that axis
+  at the seed and `inf` was written as a quantization origin, against §5.3. One gaussian was enough;
+  a whole axis of NaN was never needed, and no error was raised. `write_to_vec` now refuses a
+  non-finite value in any **quantized** field — positions, scales, rotations, colours, motions,
+  `mu_t` — with `Error::InvalidInput`, naming the field and the gaussian. The unquantized fields are
+  deliberately left alone: `+inf` in `sigma_t` means a gaussian that never fades, and `+inf` in
+  `win_hi` means a static asset present at every instant, which is what the glTF import writes. NaN
+  is refused in those three too, since it is meaningful in none of them and quietly passes for a
+  deliberate value.
+
+- `4dgs validate` checked only the last Quantization record parsed. Nothing in the framing forbids a
+  second, and a streamed decoder takes the first grid it meets, so a file carrying a non-finite grid
+  followed by a clean one validated green while decoding entirely through the broken one. Each
+  record is now checked as it is walked, and the report names which copy when there is more than
+  one.
+
+### Added
+
+- `Error::InvalidInput`, for a scene the encoder cannot write a conforming file from. The mirror of
+  `Malformed`: that describes a file that arrived broken, this describes one that never should have
+  been offered. It maps to `FOURDGS_STATUS_INVALID_ARGUMENT`, which already existed in the C header,
+  so the ABI does not move.
+
 ## [0.1.0] - 2026-07-29
 
 The first release of the Rust crate, and the first cut from a tag. It is the decoder and the

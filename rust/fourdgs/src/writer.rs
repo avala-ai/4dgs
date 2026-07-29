@@ -147,7 +147,72 @@ struct Quantized {
     windows: Vec<(f64, f64)>,
 }
 
+/// Refuse a scene this encoder cannot write a conforming file from (spec §5.3).
+///
+/// The position origin is the per-axis minimum of `positions`, so a non-finite value there
+/// reaches the Quantization record — and §5.3 requires every step and origin to be finite.
+///
+/// The failure this prevents is specific to how the minimum is taken. `f64::min` returns
+/// the *other* operand when one is NaN, and the fold is seeded with `f64::INFINITY`, so a
+/// single NaN on an axis leaves that axis at the seed and the encoder writes `inf` as an
+/// origin — silently, with no error, producing a file the specification forbids. It does
+/// not take a whole axis of NaN; one gaussian is enough.
+///
+/// Three fields are deliberately exempt, because they are not quantized and an infinity in
+/// them is meaningful rather than broken:
+///
+/// * `sigma_t` — `+inf` is its documented spelling for a gaussian that never fades (§3).
+/// * `win_lo` and `win_hi` — the validity window goes into the Window Table as `f64`
+///   verbatim (§5.4), touching no grid at all. `win_hi = +inf` is how a static asset says
+///   it is present at every instant.
+///
+/// NaN is refused in all three. It is never meaningful in any of them, and it is the quiet
+/// kind of wrong: the decoder reads every non-finite sigma as never-fading, so a NaN there
+/// becomes a deliberate-looking value, and a NaN window makes every visibility comparison
+/// false so the gaussian silently never appears.
+fn check_finite_input(g: &GaussianSet) -> Result<()> {
+    let n = g.count();
+    if n == 0 {
+        return Ok(());
+    }
+    for (name, values, width) in [
+        ("positions", &g.positions, 3),
+        ("scales", &g.scales, 3),
+        ("rotations", &g.rotations, 4),
+        ("colors", &g.colors, 4),
+        ("motions", &g.motions, 3),
+        ("mu_t", &g.mu_t, 1),
+    ] {
+        if let Some(at) = values.iter().position(|v| !v.is_finite()) {
+            return Err(Error::InvalidInput(format!(
+                "{name} is not finite at gaussian {}; it is quantized onto a grid, and a \
+                 non-finite value there violates spec §5.3",
+                at / width
+            )));
+        }
+    }
+    if let Some(at) = g
+        .sigma_t
+        .iter()
+        .position(|v| v.is_nan() || (v.is_infinite() && v.is_sign_negative()))
+    {
+        return Err(Error::InvalidInput(format!(
+            "sigma_t is NaN or -inf at gaussian {at}; use +inf for a gaussian that never fades"
+        )));
+    }
+    for (name, values) in [("win_lo", &g.win_lo), ("win_hi", &g.win_hi)] {
+        if let Some(at) = values.iter().position(|v| v.is_nan()) {
+            return Err(Error::InvalidInput(format!(
+                "{name} is NaN at gaussian {at}; a NaN window makes every visibility comparison \
+                 false, so the gaussian silently never appears"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn quantize_scene(g: &GaussianSet, opts: &WriteOptions) -> Result<Quantized> {
+    check_finite_input(g)?;
     let n = g.count();
     // Position tolerance is a fraction of the median gaussian radius rather than an
     // absolute distance, so a profile means the same thing on a tabletop capture and on a

@@ -20,7 +20,7 @@ import numpy as np
 
 from . import opcode as op
 from . import records as rec
-from .exceptions import BoundViolation
+from .exceptions import BoundViolation, InvalidInput
 from .model import AudioTrack, CameraTrajectory, GaussianSet, window_table
 from .quantization import (
     DEFAULT_CUTOFF,
@@ -152,7 +152,67 @@ def write(
     return len(out)
 
 
+#: Per-gaussian arrays that are quantized onto a grid, so a non-finite value in one either
+#: sets a non-finite grid parameter or rounds to a meaningless bin. `sigma_t`, `win_lo` and
+#: `win_hi` are deliberately absent — see `_check_finite_input`.
+_FINITE_FIELDS = ("positions", "scales", "rotations", "colors", "motions", "mu_t")
+
+
+def _check_finite_input(g: GaussianSet) -> None:
+    """Refuse a scene the encoder cannot write a conforming file from (spec §5.3).
+
+    The position origin is the per-axis minimum of `positions`, and the steps are derived
+    from the median scale, so a single non-finite value there propagates straight into the
+    Quantization record — and §5.3 requires every step and origin to be finite. Refusing
+    here rather than at the codec is the whole point: the codec's complaint is about a
+    symbol width and names neither the field nor the gaussian, so the one thing the caller
+    needs to know is the one thing it cannot say.
+
+    Three fields are deliberately not on that list, because they are not quantized and an
+    infinity in them is meaningful rather than broken:
+
+    * `sigma_t` — `+inf` is its documented spelling for a gaussian that never fades (§3).
+    * `win_lo` and `win_hi` — the validity window goes into the Window Table as `f64`
+      verbatim (§5.4), touching no grid at all. `win_hi = +inf` is how a static asset says
+      it is present at every instant, which is exactly what the glTF import writes.
+
+    NaN is refused in all three. It is never a meaningful value in any of them, and it is
+    the quiet kind of wrong: the decoder reads every non-finite sigma as never-fading, so a
+    NaN there becomes a deliberate-looking value, and a NaN window makes every comparison
+    false so the gaussian silently never appears.
+    """
+    if not g.count:
+        return
+    for name in _FINITE_FIELDS:
+        values = np.asarray(getattr(g, name))
+        bad = np.flatnonzero(~np.isfinite(values).reshape(len(values), -1).all(axis=1))
+        if bad.size:
+            raise InvalidInput(
+                f"{name} is not finite at gaussian {int(bad[0])} "
+                f"({bad.size} of {len(values)} affected); it is quantized onto a grid, and a "
+                f"non-finite value there violates spec §5.3"
+            )
+
+    sigma = np.asarray(g.sigma_t, dtype=np.float64)
+    bad = np.flatnonzero(np.isnan(sigma) | (sigma == -np.inf))
+    if bad.size:
+        raise InvalidInput(
+            f"sigma_t is NaN or -inf at gaussian {int(bad[0])} ({bad.size} affected); "
+            f"use +inf for a gaussian that never fades"
+        )
+
+    for name in ("win_lo", "win_hi"):
+        values = np.asarray(getattr(g, name), dtype=np.float64)
+        bad = np.flatnonzero(np.isnan(values))
+        if bad.size:
+            raise InvalidInput(
+                f"{name} is NaN at gaussian {int(bad[0])} ({bad.size} affected); a NaN window "
+                f"makes every visibility comparison false, so the gaussian silently never appears"
+            )
+
+
 def _encode(g: GaussianSet, duration_sec, opts, audio, camera) -> bytes:
+    _check_finite_input(g)
     n = g.count
     median_scale = float(np.median(g.scales)) if n else 1e-3
     bounds = Bounds.for_profile(opts.profile, median_scale=median_scale)

@@ -43,3 +43,15 @@ class UnsupportedCodec(FourdgsError):
 class BoundViolation(FourdgsError):
     """An encoder's own verification failed: a decoded value fell outside the bound the
     file was about to declare. Always a bug in the encoder, never in the input."""
+
+
+class InvalidInput(FourdgsError):
+    """A caller handed the encoder something it cannot write a conforming file from.
+
+    The mirror of every other error here: those describe a file that arrived broken,
+    this one describes a scene that never should have been offered. It exists because
+    the alternative is worse than an exception — an encoder that accepts a non-finite
+    position and writes it into a quantization grid produces a file the specification
+    forbids (§5.3), and one that nothing downstream will complain about, because
+    arithmetic on infinity is perfectly well defined.
+    """

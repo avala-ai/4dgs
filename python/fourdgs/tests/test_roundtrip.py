@@ -199,3 +199,62 @@ def _opcodes(data: bytes) -> set[int]:
     from fourdgs.serialization import iter_records
 
     return {r.opcode for r in iter_records(data, len(MAGIC))}
+
+
+class TestEncoderRefusals:
+    """What the encoder must refuse, and — just as important — what it must not."""
+
+    def test_a_non_finite_quantized_field_is_refused_by_name(self):
+        # Spec §5.3. The position origin is the per-axis minimum of `positions` and the
+        # steps come from the median scale, so a non-finite value there lands in the
+        # Quantization record. Refused at the boundary, where the field can still be named:
+        # the codec's own complaint is about a symbol width and names nothing useful.
+        for field, index in (
+            ("positions", (0, 0)),
+            ("scales", (1, 2)),
+            ("rotations", (2, 3)),
+            ("colors", (3, 1)),
+            ("motions", (4, 0)),
+            ("mu_t", 5),
+        ):
+            for bad in (np.inf, -np.inf, np.nan):
+                scene = make_scene(n=32, windows=2)
+                getattr(scene, field)[index] = bad
+                with pytest.raises(fourdgs.InvalidInput, match=field):
+                    fourdgs.write(io.BytesIO(), scene, 6.0)
+
+    def test_a_static_asset_encodes_with_infinite_sigma_and_window(self):
+        # The degenerate temporal case: no time in the scene, present at every instant.
+        # `sigma_t = +inf` and `win_hi = +inf` are how the format says that, and neither is
+        # quantized — the window goes into the Window Table as f64 verbatim. An over-broad
+        # finiteness check refuses a whole legitimate class of file, which is exactly what
+        # the glTF import writes for a static asset.
+        scene = make_scene(n=32, windows=1)
+        scene.sigma_t[:] = np.inf
+        scene.win_lo[:] = 0.0
+        scene.win_hi[:] = np.inf
+        buf = io.BytesIO()
+        fourdgs.write(buf, scene, 1.0)
+        decoded = fourdgs.read(buf.getvalue())
+        assert np.isinf(decoded.gaussians.sigma_t).all(), "never-fades survives"
+        assert np.isinf(decoded.gaussians.win_hi).all(), "the open window survives"
+
+    def test_a_nan_window_or_sigma_is_still_refused(self):
+        # NaN is meaningful in none of them. The decoder reads any non-finite sigma as
+        # never-fading, so a NaN would pass for a deliberate value; a NaN window makes
+        # every visibility comparison false, so the gaussian silently never appears.
+        for field in ("sigma_t", "win_lo", "win_hi"):
+            scene = make_scene(n=16, windows=1)
+            getattr(scene, field)[0] = np.nan
+            with pytest.raises(fourdgs.InvalidInput, match=field):
+                fourdgs.write(io.BytesIO(), scene, 6.0)
+
+    def test_a_negative_infinite_sigma_is_refused_but_a_positive_one_is_not(self):
+        scene = make_scene(n=16, windows=1)
+        scene.sigma_t[0] = -np.inf
+        with pytest.raises(fourdgs.InvalidInput, match="sigma_t"):
+            fourdgs.write(io.BytesIO(), scene, 6.0)
+
+        scene = make_scene(n=16, windows=1)
+        scene.sigma_t[0] = np.inf
+        fourdgs.write(io.BytesIO(), scene, 6.0)
