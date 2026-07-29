@@ -27,6 +27,7 @@ import { withCodec } from "@4dgs/codecs";
 import { FileHandleReadable } from "@4dgs/nodejs";
 
 import { canonical, summarize } from "./canonical.js";
+import { CountingReadable } from "./checks.js";
 
 const DATA = fileURLToPath(new URL("../../../tests/conformance/data/", import.meta.url));
 
@@ -182,6 +183,53 @@ test("absent audio is a value, and present audio comes back verbatim", async (t)
     assert.equal(track?.codec, "wav");
   } finally {
     await source.close();
+  }
+});
+
+test("a track larger than the head probe does not cost anything to open", async (t) => {
+  const path = corpus("OneWindow-UseChunkIndex-UseCrc-WithLargeAudio");
+  if (path === null) return t.skip("corpus not generated");
+
+  const file = await FileHandleReadable.open(path);
+  try {
+    const counter = new CountingReadable(file);
+    const scene = await IndexedDecoder.open(counter);
+    const toOpen = counter.bytesRead;
+
+    // The audio record sits in the front matter and is bigger than the probe. Opening the
+    // file has to step over it rather than read it, so the cost of opening is the probe
+    // and the tail, not the track.
+    const track = await scene.readAudio();
+    assert.equal(track?.codec, "wav");
+    assert.ok(track!.data.byteLength > 64 * 1024, "this variant's track must exceed the probe");
+    assert.ok(
+      toOpen < track!.data.byteLength,
+      `opening transferred ${toOpen} bytes, more than the ${track!.data.byteLength}-byte track it should have skipped`,
+    );
+    assert.equal(scene.index.length, 1);
+    assert.equal(scene.header.gaussianCount, 64);
+  } finally {
+    await file.close();
+  }
+});
+
+test("the front matter is walked in windows, however small the probe", async (t) => {
+  const path = corpus("OneWindow-UseChunkIndex-UseCrc-WithLargeAudio");
+  if (path === null) return t.skip("corpus not generated");
+
+  const file = await FileHandleReadable.open(path);
+  try {
+    // A probe far too small for even one record forces the scanner to slide repeatedly,
+    // and a record larger than the whole window has to be stepped over by arithmetic.
+    const cramped = await IndexedDecoder.open(file, { headProbeBytes: 128 });
+    const roomy = await IndexedDecoder.open(file);
+    assert.equal(cramped.header.gaussianCount, roomy.header.gaussianCount);
+    assert.equal(cramped.header.hasAudio, true);
+    assert.deepEqual([...cramped.windows], [...roomy.windows]);
+    assert.equal(cramped.index.length, roomy.index.length);
+    assert.equal((await cramped.readAudio())?.data.byteLength, 96044);
+  } finally {
+    await file.close();
   }
 });
 

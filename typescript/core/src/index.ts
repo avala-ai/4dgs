@@ -143,6 +143,8 @@ export { GaussianSet, type GaussianState, assembleGaussians, marginalAt } from "
 
 export { StreamDecoder } from "./streamDecoder.js";
 
+export { FrontMatterScanner, type FrontMatterRecord } from "./frontMatter.js";
+
 export { type DecodeOptions, type Scene, decodeScene } from "./scene.js";
 
 export {

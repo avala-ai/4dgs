@@ -35,6 +35,20 @@ Every scene is generated from a fixed seed by `build_gaussians`, and the audio t
 sine sweep. There is no captured data in this repository and there will not be: the corpus must be
 redistributable without a licence question and reproducible without a download.
 
+## Fixture scale is a feature to cover, not a detail
+
+Small fixtures hide a whole class of bug: anything that only appears once a record is larger than a
+buffer, a window, or a threshold an implementation chose. `WithLargeAudio` exists for exactly that
+reason — its track is bigger than the 64 KiB probe an indexed reader opens a file with, and an Audio
+record lives in the front matter, so a reader that walks the front matter by materializing each
+record instead of stepping over it by length fails on that variant and on no other. Both
+implementations in this repository had that bug, and every other fixture was too small to say so.
+
+A new variant that exists to cross a size threshold should say which threshold, and why, in its
+scenario comment. Keep them few and keep them just past the line: the corpus cap is 2.5 MB, and a
+fixture that is merely large proves nothing that one which is deliberately one byte too big does
+not.
+
 ## Runners
 
 A runner is three abstractions:

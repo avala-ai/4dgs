@@ -37,6 +37,7 @@ FLAGS = (
     "SHDegree2",
     "DeltaStreams",  # delta-coded attribute streams rather than raw
     "WithAudio",  # embed an audio track
+    "WithLargeAudio",  # embed a track larger than an indexed reader's head probe
     "WithCamera",  # embed a camera trajectory
     "WithMetadata",
     "WithAttachment",
@@ -123,6 +124,13 @@ def variants() -> list[tuple[Scenario, tuple[str, ...]]]:
     add(SCENARIOS[2], "WithAudio")
     add(SCENARIOS[2], "WithAudio", "WithCamera", "WithMetadata")
     add(SCENARIOS[2])  # the no-audio twin of the above, same scene
+
+    # A track larger than the 64 KiB probe an indexed reader opens a file with. The Audio
+    # record lives in the front matter, so this is the variant that catches a reader which
+    # walks the front matter by materializing each record instead of stepping over it by
+    # length. Every other fixture here is small enough that the distinction is invisible,
+    # which is exactly why the bug it catches survived until a real scene with sound.
+    add(SCENARIOS[2], "WithLargeAudio")
 
     # Streaming without an index: a writer piping to stdout cannot seek back.
     out.append((ten, ("UseCrc",)))
@@ -222,10 +230,12 @@ def build_gaussians(scenario: Scenario, seed: int = 20260728) -> dict:
 
 
 def build_audio(seconds: float = 0.25, rate: int = 8000) -> bytes:
-    """A few kilobytes of synthetic WAV — a sine sweep, generated, never sampled.
+    """A synthetic WAV — a sine sweep, generated, never sampled.
 
     Present so audio embedding and extraction are conformance-tested from day one without
-    shipping anyone's recording.
+    shipping anyone's recording. `seconds` is a deliberate knob: one variant asks for a
+    track big enough to exceed a reader's head probe, because fixture scale is itself a
+    thing the corpus has to cover.
     """
     frames = int(seconds * rate)
     samples = bytearray()

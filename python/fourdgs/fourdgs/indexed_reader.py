@@ -14,6 +14,8 @@ clip collapses to a single entry and an instant costs the scene. Both are correc
 
 from __future__ import annotations
 
+import struct
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 import numpy as np
@@ -28,6 +30,94 @@ from .stream_reader import decode_streams, steps_from
 #: One read of this size from the front covers the header records of every scene measured
 #: so far. A larger header costs one extra round trip, never a wrong parse.
 HEAD_PROBE = 64 * 1024
+
+#: How much of an Audio record is read to learn its codec. The codec name is the record's
+#: first field, so a prefix answers it; the track stays where it is.
+AUDIO_CODEC_PREFIX = 4096
+
+_RECORD_HEADER = struct.Struct("<BQ")
+
+
+@dataclass(frozen=True)
+class _FrontRecord:
+    """One record's framing: everything except its bytes."""
+
+    opcode: int
+    #: Offset of the record's opcode byte.
+    offset: int
+    content_length: int
+
+    @property
+    def total_length(self) -> int:
+        return self.content_length + _RECORD_HEADER.size
+
+
+class _FrontMatter:
+    """A sliding window over the front of a resource, walked by header.
+
+    An indexed reader wants four things from the front matter — the Header, the
+    Quantization grids, the Window Table, and the byte range of the audio track if there
+    is one — and none of them requires reading a record it does not care about. That
+    distinction is not academic: an embedded audio track is a first-class part of a scene
+    and sits in the front matter at whatever size the track is, so a walk that
+    materializes every record's content fails on the format's flagship case, a single
+    file with sound.
+
+    So a record is stepped over by arithmetic. Its length is in its header, and its bytes
+    are not needed to find the next one.
+    """
+
+    def __init__(self, source: Readable, size: int, probe: int = HEAD_PROBE) -> None:
+        self._source = source
+        self._size = size
+        self._probe = probe
+        self._window = b""
+        self._window_at = 0
+
+    def head(self, length: int) -> bytes:
+        """The first `length` bytes of the resource, for the magic check."""
+        want = min(length, self._size)
+        self._ensure(0, want)
+        return self._window[:want]
+
+    def records(self, start: int) -> Iterator[_FrontRecord]:
+        """Every record from `start`, in file order, a bounded window at a time."""
+        at = start
+        while at + _RECORD_HEADER.size <= self._size:
+            self._ensure(at, _RECORD_HEADER.size)
+            opcode, length = _RECORD_HEADER.unpack_from(self._window, at - self._window_at)
+            yield _FrontRecord(opcode=opcode, offset=at, content_length=length)
+            at += _RECORD_HEADER.size + length
+
+    def content(self, record: _FrontRecord, limit: int | None = None) -> bytes:
+        """One record's content, from the window when it is there and by a read of exactly
+        that record when it is not.
+
+        A Window Table larger than the probe is therefore fetched rather than refused, and
+        an audio track nobody asked for is never fetched at all.
+        """
+        at = record.offset + _RECORD_HEADER.size
+        length = min(record.content_length, self._size - at)
+        if limit is not None:
+            length = min(length, limit)
+        if self._covers(at, length):
+            start = at - self._window_at
+            return self._window[start : start + length]
+        if length <= self._probe:
+            self._ensure(at, length)
+            start = at - self._window_at
+            return self._window[start : start + length]
+        return self._source.read(at, length)
+
+    def _covers(self, at: int, length: int) -> bool:
+        return at >= self._window_at and at + length <= self._window_at + len(self._window)
+
+    def _ensure(self, at: int, length: int) -> None:
+        if self._covers(at, length):
+            return
+        want = min(max(self._probe, length), self._size - at)
+        self._window = self._source.read(at, want)
+        self._window_at = at
 
 
 @dataclass
@@ -63,28 +153,37 @@ class IndexedScene:
 def open_indexed(source: Readable) -> IndexedScene:
     """Open a scene: a bounded read from the front, then the index. Never the file."""
     size = source.size()
-    head = source.read(0, min(HEAD_PROBE, size))
-    check_magic(head)
+    front = _FrontMatter(source, size)
+    check_magic(front.head(len(MAGIC)))
 
     header = quant = None
     windows: list[tuple[float, float]] = []
+    seen_window_table = False
     audio_range = None
     audio_codec = None
-    for record in iter_records(head, len(MAGIC)):
+    for record in front.records(len(MAGIC)):
+        if record.opcode == op.CHUNK:
+            break
         if record.opcode == op.HEADER:
-            header = rec.Header.parse(record.content)
+            header = rec.Header.parse(front.content(record))
         elif record.opcode == op.QUANTIZATION:
-            quant = rec.Quantization.parse(record.content)
+            quant = rec.Quantization.parse(front.content(record))
         elif record.opcode == op.WINDOW_TABLE:
-            windows = rec.WindowTable.parse(record.content).windows
+            windows = rec.WindowTable.parse(front.content(record)).windows
+            seen_window_table = True
         elif record.opcode == op.AUDIO:
-            audio = rec.Audio.parse(record.content)
-            audio_codec = audio.codec
-            audio_range = (record.offset, len(record.content) + 9)
-        elif record.opcode == op.CHUNK:
+            # The track's bytes are not read here, and the record is not stepped into: a
+            # caller may want the gaussians and never the audio. Only the codec name is
+            # parsed, out of a prefix, so a scene with a large track costs nothing to open.
+            audio_codec = _audio_codec(front.content(record, limit=AUDIO_CODEC_PREFIX))
+            audio_range = (record.offset, record.total_length)
+        # Everything the indexed path needs is in hand; the rest of the front matter is
+        # somebody else's business and is not worth another read.
+        audio_settled = audio_range is not None or (header is not None and not header.has_audio)
+        if header is not None and quant is not None and seen_window_table and audio_settled:
             break
     if header is None or quant is None:
-        raise MalformedFile("header records did not fit the probe read; a larger probe is needed")
+        raise MalformedFile("the file has no Header or no Quantization record before its first Chunk")
 
     footer_size = 9 + 20 + len(MAGIC)
     tail = source.read(max(size - footer_size, 0), min(footer_size, size))
@@ -133,6 +232,16 @@ def read_chunk(source: Readable, scene: IndexedScene, entry: rec.ChunkIndexEntry
         _, values = decode_stream(cur)
         decoded["sh"][band] = values
     return decoded
+
+
+def _audio_codec(prefix: bytes) -> str:
+    """The `codec` field at the front of an Audio record, read out of a prefix of it."""
+    try:
+        return Cursor(prefix).string()
+    except Exception as exc:
+        raise MalformedFile(
+            f"the Audio record's codec name does not fit the first {AUDIO_CODEC_PREFIX} bytes of the record"
+        ) from exc
 
 
 def read_audio(source: Readable, scene: IndexedScene) -> bytes | None:

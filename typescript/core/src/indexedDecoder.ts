@@ -24,6 +24,7 @@ import {
 } from "./chunk.js";
 import { crc32, DEFAULT_CODECS, type CodecRegistry } from "./codec.js";
 import { MalformedFile } from "./errors.js";
+import { FrontMatterScanner } from "./frontMatter.js";
 import { Opcode } from "./opcodes.js";
 import { DEFAULT_CUTOFF, supportK } from "./quantization.js";
 import type { IReadable } from "./readable.js";
@@ -60,6 +61,14 @@ import { decodeStream, frameOneStream } from "./streams.js";
  * so far. A larger header costs one extra round trip, never a wrong parse.
  */
 export const HEAD_PROBE_BYTES = 64 * 1024;
+
+/**
+ * How much of an Audio record is read to learn its codec.
+ *
+ * The codec name is the record's first field, so a prefix answers it. The track itself
+ * stays where it is until somebody asks for it.
+ */
+const AUDIO_CODEC_PREFIX_BYTES = 4096;
 
 export interface OpenIndexedOptions {
   readonly codecs?: CodecRegistry;
@@ -109,32 +118,41 @@ export class IndexedDecoder {
       throw new MalformedFile(`file is ${size} bytes, too short to hold a header and a footer`);
     }
 
-    const head = await source.read(0n, BigInt(Math.min(probeSize, size)));
-    checkMagic(head);
+    const scanner = new FrontMatterScanner(source, size, probeSize);
+    checkMagic(await scanner.head(MAGIC.length));
 
     let header: Header | null = null;
     let quantization: Quantization | null = null;
     let windows = new Float64Array(0);
+    let seenWindowTable = false;
     let audioRange: { offset: number; length: number; codec: string } | null = null;
-    for (const record of iterateRecords(head, MAGIC.length)) {
-      if (record.opcode === Opcode.Header) header = parseHeader(record.content);
-      else if (record.opcode === Opcode.Quantization)
-        quantization = parseQuantization(record.content);
-      else if (record.opcode === Opcode.WindowTable) windows = parseWindowTable(record.content);
-      else if (record.opcode === Opcode.Audio) {
-        // The track's bytes are not read here. A caller may want the gaussians and never
-        // the audio, or the audio and never the gaussians.
+    for await (const record of scanner.records(MAGIC.length)) {
+      if (record.opcode === Opcode.Chunk) break;
+      if (record.opcode === Opcode.Header) {
+        header = parseHeader(await scanner.content(record));
+      } else if (record.opcode === Opcode.Quantization) {
+        quantization = parseQuantization(await scanner.content(record));
+      } else if (record.opcode === Opcode.WindowTable) {
+        windows = parseWindowTable(await scanner.content(record));
+        seenWindowTable = true;
+      } else if (record.opcode === Opcode.Audio) {
+        // The track's bytes are not read here, and neither is the record stepped into: a
+        // caller may want the gaussians and never the audio. Only the codec name is
+        // parsed, out of a prefix, so a scene with a large track costs nothing to open.
         audioRange = {
           offset: record.offset,
-          length: record.length,
-          codec: parseAudio(record.content).codec,
+          length: record.totalLength,
+          codec: readAudioCodec(await scanner.content(record, AUDIO_CODEC_PREFIX_BYTES)),
         };
-      } else if (record.opcode === Opcode.Chunk) break;
+      }
+      // Everything the indexed path needs is in hand; the rest of the front matter is
+      // somebody else's business and is not worth another read.
+      const audioSettled = audioRange !== null || (header !== null && !header.hasAudio);
+      if (header !== null && quantization !== null && seenWindowTable && audioSettled) break;
     }
     if (header === null || quantization === null) {
       throw new MalformedFile(
-        `Header and Quantization records did not fit the first ${probeSize} bytes; ` +
-          "open with a larger headProbeBytes",
+        "the file has no Header or no Quantization record before its first Chunk",
       );
     }
 
@@ -281,5 +299,16 @@ export class IndexedDecoder {
       codecs: this.codecs,
     };
     return this.cachedChunkOptions;
+  }
+}
+
+/** The `codec` field at the front of an Audio record, read out of a prefix of it. */
+function readAudioCodec(prefix: Uint8Array): string {
+  try {
+    return new Cursor(prefix).string();
+  } catch {
+    throw new MalformedFile(
+      `the Audio record's codec name does not fit the first ${AUDIO_CODEC_PREFIX_BYTES} bytes of the record`,
+    );
   }
 }

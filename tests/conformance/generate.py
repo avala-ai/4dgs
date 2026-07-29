@@ -66,7 +66,11 @@ def build(scenario, flags) -> tuple[bytes, str]:
     )
 
     audio = None
-    if "WithAudio" in flags:
+    if "WithLargeAudio" in flags:
+        # Six seconds at 8 kHz is ~96 KiB: comfortably past the 64 KiB an indexed reader
+        # probes the front of a file with, and comfortably inside the corpus size cap.
+        audio = fourdgs.AudioTrack(codec="wav", data=scenarios.build_audio(seconds=6.0), start_sec=0.0)
+    elif "WithAudio" in flags:
         audio = fourdgs.AudioTrack(codec="wav", data=scenarios.build_audio(), start_sec=0.0)
     camera = None
     if "WithCamera" in flags:
