@@ -14,21 +14,17 @@ remain outside the package.
 
 ### Added
 
-- **Object-layer decoding, encoding and reconstruction.** Exact `u32` `object_id` membership,
-  optional Object Tables and time-sampled SE(3) Object Tracks now round-trip through the reference
-  reader and writer. Both read paths compose each referenced object's rigid pose onto gaussian
-  centres and orientations after base temporal reconstruction; background and untracked gaussians
-  remain unchanged, and indexed reads do not fetch unrelated tracks.
+- **Object-layer records and streamed reconstruction.** Exact `u32` `object_id` membership, optional
+  Object Tables and time-sampled SE(3) Object Tracks now round-trip through the reference reader and
+  writer. `Scene.state_at` composes each object's rigid pose onto gaussian centres and orientations
+  after base temporal reconstruction; background and untracked gaussians remain unchanged. The
+  indexed API exposes the records through `read_objects`, but does not yet compose them in
+  `read_chunk` or promise referenced-track-only reads.
 
 - **Scene provenance.** Coordinate Frame, Geodetic Anchor, Sensor Calibration and Rig Trajectory
   records round-trip through streamed and indexed reads. Pose reconstruction clamps outside the
   sampled interval, uses shortest-arc quaternion interpolation inside it and composes rig-relative
   sensor poses without making provenance a prerequisite for gaussian decoding.
-
-- **The `keyframe-delta` temporal model.** Reference composition and encoding operate on quantized
-  bins, preserve explicit gaussian identities across births, updates and deaths, and support chained
-  or keyframe-relative groups. Indexed reconstruction follows only the bounded chain needed for the
-  requested instant.
 
 - **glTF interoperability.** `from_gltf` imports static `KHR_gaussian_splatting` assets, while
   `to_gltf` exports the reconstructed state at a requested instant. Coordinate systems, colour

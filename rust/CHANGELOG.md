@@ -21,9 +21,9 @@ responsibilities.
   blocks, fetch no unrelated tracks and cache only one instant's reconstructed poses.
 
 - **Scene provenance.** Coordinate Frame, Geodetic Anchor, Sensor Calibration and Rig Trajectory
-  records round-trip through the Rust records, scene model, writer and C ABI. Pose reconstruction
-  clamps outside the sampled interval, uses shortest-arc quaternion interpolation and composes
-  rig-relative sensor poses without requiring provenance when only gaussian state is requested.
+  records round-trip through the Rust records, scene model and writer. Pose reconstruction clamps
+  outside the sampled interval, uses shortest-arc quaternion interpolation and composes rig-relative
+  sensor poses without requiring provenance when only gaussian state is requested.
 
 - **An encode surface on the C ABI.** `fourdgs_writer_*` in `include/fourdgs.h` — a builder that
   takes the gaussian columns, spherical harmonics and write options and encodes to an owned
