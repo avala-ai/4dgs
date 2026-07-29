@@ -64,17 +64,27 @@ fn decompress_zstd(_body: &[u8], _expected: usize) -> Result<Vec<u8>> {
 /// Both halves matter. Short output means the payload was cut; long output means the
 /// stream header's declared size is not the size of what it holds, and a reader that
 /// silently accepted either would be sizing arrays from a number the file contradicts.
+/// The buffer grows as output actually arrives rather than being sized from `expected`, so
+/// a header that claims far more than its payload can produce costs nothing until the
+/// bytes exist. Sizing up front would let a few hundred compressed bytes reserve hundreds
+/// of megabytes, which is the same allocation bug the record reader had.
 fn exact<R: Read>(mut source: R, expected: usize, name: &str) -> Result<Vec<u8>> {
-    let mut out = vec![0u8; expected];
-    source.read_exact(&mut out).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::UnexpectedEof {
-            Error::Truncated(format!(
-                "a {name} stream ended early; the header declared {expected} bytes"
-            ))
-        } else {
+    const BLOCK: usize = 64 * 1024;
+    let mut out: Vec<u8> = Vec::new();
+    let mut block = vec![0u8; BLOCK.min(expected.max(1))];
+    while out.len() < expected {
+        let want = (expected - out.len()).min(block.len());
+        let got = source.read(&mut block[..want]).map_err(|e| {
             Error::Malformed(format!("a {name} stream could not be decompressed: {e}"))
+        })?;
+        if got == 0 {
+            return Err(Error::Truncated(format!(
+                "a {name} stream ended after {} bytes; the header declared {expected}",
+                out.len()
+            )));
         }
-    })?;
+        out.extend_from_slice(&block[..got]);
+    }
     let mut spare = [0u8; 1];
     match source.read(&mut spare) {
         Ok(0) => Ok(out),

@@ -17,24 +17,39 @@ pub const MODE_DELTA: u8 = 1;
 pub const MODE_CONST: u8 = 2;
 
 /// One decoded stream: `count` elements of `channels` symbols each, row-major.
+///
+/// A constant stream keeps its single row rather than the `count` copies of it the wire
+/// format describes. That is not only cheaper: materializing the repeat is an amplification
+/// a crafted file can aim at, since `mode = 2` stores `channels` symbols and an element
+/// count that owes nothing to the payload's size.
 #[derive(Debug, Clone, Default)]
 pub struct DecodedStream {
     pub values: Vec<i64>,
     pub count: usize,
     pub channels: usize,
+    /// When set, `values` holds exactly one element and every index yields it.
+    pub constant: bool,
 }
 
 impl DecodedStream {
     /// Channel `c` of element `i`.
     #[inline]
     pub fn get(&self, i: usize, c: usize) -> i64 {
-        self.values[i * self.channels + c]
+        if self.constant {
+            self.values[c]
+        } else {
+            self.values[i * self.channels + c]
+        }
     }
 
     /// Element `i`'s channels.
     #[inline]
     pub fn row(&self, i: usize) -> &[i64] {
-        &self.values[i * self.channels..(i + 1) * self.channels]
+        if self.constant {
+            &self.values[..self.channels]
+        } else {
+            &self.values[i * self.channels..(i + 1) * self.channels]
+        }
     }
 }
 
@@ -43,7 +58,10 @@ impl DecodedStream {
 /// A caller must never dispatch on the returned id for a stream that came out of an SH
 /// Band Stream record: those carry `0x07` there, which collides with `mu_t`'s id of 7.
 /// Band streams are identified by the record that contains them (spec §5.7).
-pub fn decode_stream(cursor: &mut Cursor<'_>) -> Result<(u8, DecodedStream)> {
+pub fn decode_stream(
+    cursor: &mut Cursor<'_>,
+    expected_elements: Option<usize>,
+) -> Result<(u8, DecodedStream)> {
     let head = cursor.take(STREAM_HEADER_SIZE)?;
     let attribute_id = head[0];
     let width = head[1];
@@ -60,6 +78,17 @@ pub fn decode_stream(cursor: &mut Cursor<'_>) -> Result<(u8, DecodedStream)> {
         ))
     })?;
 
+    // Checked before anything is sized from `count`. A stream that disagrees with the
+    // chunk it sits in is rejected rather than decoded and then discarded, which is the
+    // difference between refusing a file and allocating for it first.
+    if let Some(want) = expected_elements {
+        if count != want {
+            return Err(Error::Malformed(format!(
+                "attribute {attribute_id} carries {count} elements, the chunk declares {want}"
+            )));
+        }
+    }
+
     if count == 0 {
         cursor.take(payload_length)?;
         return Ok((
@@ -68,6 +97,7 @@ pub fn decode_stream(cursor: &mut Cursor<'_>) -> Result<(u8, DecodedStream)> {
                 values: Vec::new(),
                 count: 0,
                 channels,
+                constant: false,
             },
         ));
     }
@@ -105,14 +135,10 @@ pub fn decode_stream(cursor: &mut Cursor<'_>) -> Result<(u8, DecodedStream)> {
 
     let mut values: Vec<i64> = symbols_out.into_iter().map(unzigzag).collect();
 
+    let mut constant = false;
     match mode {
-        MODE_CONST => {
-            let mut repeated = Vec::with_capacity(count * channels);
-            for _ in 0..count {
-                repeated.extend_from_slice(&values);
-            }
-            values = repeated;
-        }
+        // The repeat is not materialized; `DecodedStream` performs it on access.
+        MODE_CONST => constant = true,
         MODE_DELTA => {
             // Delta runs along element order, independently per channel.
             for i in 1..count {
@@ -137,6 +163,7 @@ pub fn decode_stream(cursor: &mut Cursor<'_>) -> Result<(u8, DecodedStream)> {
             values,
             count,
             channels,
+            constant,
         },
     ))
 }

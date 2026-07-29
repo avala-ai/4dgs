@@ -18,6 +18,9 @@ All notable changes to the Rust crate are documented here, following
   independent chunks, an index, and deterministic output. It verifies its own claim before returning
   a file — every chunk is decoded back and every value checked against the bounds the Quantization
   record is about to declare, so a file whose bounds have not been measured never reaches a caller.
+- Structural fuzzing over seeded mutations, covering both read paths and the C ABI, with a counting
+  allocator and a timer enforcing that no input causes an unbounded allocation or a hang. It found
+  two allocation bugs and an integer overflow on its first run.
 - `rust/encode-roundtrip.sh`: the encoder's gate. Re-encodes every corpus variant and requires the
   Rust and Python decoders to agree on the result, because an encoder checked only against its own
   decoder proves nothing about the format.

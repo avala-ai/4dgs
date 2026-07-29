@@ -299,6 +299,7 @@ fn spherical_harmonic_bands_must_form_whole_degrees() {
             values: vec![0; 15],
             count: 1,
             channels: 15,
+            constant: false,
         },
     );
     let err = fourdgs::sh::merge_chunk_bands(&[1], &[only_band_two]).unwrap_err();

@@ -194,10 +194,12 @@ impl<R: Readable> SceneReader<R> {
             let data_at =
                 record_at + crate::serialization::RECORD_HEADER_SIZE as u64 + 4 + codec_len + 8 + 8;
             let data_len = (record_at + total).saturating_sub(data_at);
-            if offset + length > data_len {
+            let end = offset.checked_add(length).ok_or_else(|| {
+                Error::Malformed(format!("audio range [{offset}, +{length}) overflows"))
+            })?;
+            if end > data_len {
                 return Err(Error::Malformed(format!(
-                    "audio range [{offset}, {}) is outside the {data_len}-byte track",
-                    offset + length
+                    "audio range [{offset}, {end}) is outside the {data_len}-byte track"
                 )));
             }
             return self.source.read(data_at + offset, length);

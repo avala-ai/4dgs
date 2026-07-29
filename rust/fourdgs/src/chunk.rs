@@ -110,7 +110,7 @@ pub fn decode_streams(
     let mut got: BTreeMap<u8, DecodedStream> = BTreeMap::new();
     let mut cursor = Cursor::new(streams);
     while cursor.remaining() > 0 {
-        let (attribute_id, values) = decode_stream(&mut cursor)?;
+        let (attribute_id, values) = decode_stream(&mut cursor, Some(count))?;
         got.insert(attribute_id, values);
     }
 
@@ -133,16 +133,9 @@ pub fn decode_streams(
         )));
     }
 
+    // Element counts were checked against `count` as each stream was read, before
+    // anything was sized from them.
     let need = |id: u8| -> &DecodedStream { got.get(&id).expect("required attribute present") };
-    for id in op::REQUIRED_ATTRIBUTES {
-        let s = need(id);
-        if s.count != count {
-            return Err(Error::Malformed(format!(
-                "attribute {id} carries {} elements, the chunk declares {count}",
-                s.count
-            )));
-        }
-    }
 
     let position = need(op::A_POSITION);
     let scale = need(op::A_SCALE);

@@ -152,7 +152,12 @@ jobs:
 
       # These cover what the corpus cannot: a file that is not ours, a version we do not
       # implement, a record we have never seen, a length that points past the end.
-      - name: Tests
+      #
+      # The structural fuzz test runs here too, and the debug build is the point rather
+      # than an accident: an integer overflow is a panic in debug and a silent wrap in
+      # release, and a wrapped offset is exactly the kind of bug this is looking for. It
+      # is around 45,000 decodes and takes well under a minute.
+      - name: Tests, including the structural fuzz pass
         run: cargo test --workspace
 
       # The optional codec has to keep compiling, or it rots until the first person who

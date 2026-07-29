@@ -118,6 +118,24 @@ python3 tests/conformance/run.py --runner rust
 rust/encode-roundtrip.sh
 ```
 
+## Fuzzing
+
+`tests/fuzz.rs` mutates files this crate's own encoder produced and asserts one invariant: **any
+input at all produces either a decoded scene or a typed error.** Never a panic, never a hang, never
+an allocation out of proportion to the input. Three things are measured rather than hoped for — a
+counting global allocator caps the peak of each decode, each decode is timed, and every one runs
+inside `catch_unwind`. The C ABI is fuzzed alongside the two Rust read paths, because a panic
+crossing that boundary is undefined behaviour in the caller's runtime rather than an error it can
+handle.
+
+Seeds are encoded rather than read from the corpus, so `cargo test` runs it with nothing generated
+first. Mutations are seeded, so a failure names the seed and step that produced it.
+
+It has already earned its keep. It found a record reader that reserved a declared length before
+checking it against the file — `Read::read_to_end` on a `Take` reserves the limit up front — and an
+offset that overflowed on a corrupt length field. Both are the class of bug that a corpus of
+well-formed files cannot reach.
+
 ## Scope
 
 Decoding ends at reconstructed gaussian state at time `t`. Nothing in this crate describes how that

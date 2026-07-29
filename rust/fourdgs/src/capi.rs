@@ -441,14 +441,14 @@ pub unsafe extern "C" fn fourdgs_scene_bytes_for_time(
         .iter()
         .filter(|e| e.covers(t))
         .map(|e| {
-            e.chunk_length
-                + e.bands
-                    .iter()
-                    .filter(|(band, _, _)| *band <= max_sh_band)
-                    .map(|(_, _, length)| *length)
-                    .sum::<u64>()
+            e.bands
+                .iter()
+                .filter(|(band, _, _)| *band <= max_sh_band)
+                .fold(e.chunk_length, |total, (_, _, length)| {
+                    total.saturating_add(*length)
+                })
         })
-        .sum()
+        .fold(0u64, u64::saturating_add)
 }
 
 // --------------------------------------------------------------------------

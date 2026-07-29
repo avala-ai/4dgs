@@ -117,7 +117,9 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
             head[1], head[2], head[3], head[4], head[5], head[6], head[7], head[8],
         ]);
         let offset = at;
-        at += RECORD_HEADER_SIZE as u64;
+        // Saturating: `at` is only used to frame offsets, and a corrupt length must not
+        // wrap it into a value that looks like a plausible position in the file.
+        at = at.saturating_add(RECORD_HEADER_SIZE as u64);
 
         // §4's layout puts Chunk Index, Statistics, Attachment and Summary Offset records
         // between the chunks and the Footer, so all four can fall inside the CRC's range.
@@ -157,7 +159,7 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
         if !known {
             scene.skipped_opcodes.push(opcode);
             if skip_exactly(&mut source, length)? {
-                at += length;
+                at = at.saturating_add(length);
                 continue;
             }
             truncated = true;
@@ -172,7 +174,7 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
             }
             Err(e) => return Err(e),
         };
-        at += length;
+        at = at.saturating_add(length);
 
         if is_summary {
             if summary_tail.is_empty() {
@@ -211,11 +213,11 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
                 // Bands belong to the chunk that precedes them, and are identified by the
                 // record that contains them — never by the `attribute_id` in the stream
                 // header, which carries 0x07 and collides with `mu_t` (spec §5.7).
-                if let Some(bands) = chunk_bands.last_mut() {
+                if let (Some(bands), Some(chunk)) = (chunk_bands.last_mut(), chunks.last()) {
                     let mut cursor = Cursor::new(&content);
                     let band = cursor.u8()?;
                     if band <= options.max_sh_band {
-                        let (_, values) = decode_stream(&mut cursor)?;
+                        let (_, values) = decode_stream(&mut cursor, Some(chunk.count))?;
                         bands.insert(band, values);
                     }
                 }
@@ -375,15 +377,29 @@ fn read_up_to<R: Read>(source: &mut R, buf: &mut [u8]) -> Result<usize> {
     Ok(filled)
 }
 
-/// One record's content. The buffer grows as bytes arrive rather than being sized from the
-/// declared length, so a crafted length cannot make this allocate what the file lacks.
+/// One record's content, read in bounded blocks.
+///
+/// The buffer grows as bytes actually arrive rather than being sized from the declared
+/// length, so a crafted length cannot make this allocate what the file does not contain.
+/// `Read::read_to_end` on a `Take` will not do: it reserves the limit up front, which is
+/// exactly the allocation this has to avoid — a fuzz case with a 115 MB length field in a
+/// 3 KB file is what said so.
 fn read_content<R: Read>(source: &mut R, length: u64) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    let got = source.take(length).read_to_end(&mut out)?;
-    if got as u64 != length {
-        return Err(Error::Truncated(format!(
-            "a record declares {length} bytes of content and only {got} remain"
-        )));
+    const BLOCK: usize = 64 * 1024;
+    let mut out: Vec<u8> = Vec::new();
+    let mut block = vec![0u8; BLOCK];
+    let mut remaining = length;
+    while remaining > 0 {
+        let want = remaining.min(BLOCK as u64) as usize;
+        let got = read_up_to(source, &mut block[..want])?;
+        if got == 0 {
+            return Err(Error::Truncated(format!(
+                "a record declares {length} bytes of content and only {} remain",
+                out.len()
+            )));
+        }
+        out.extend_from_slice(&block[..got]);
+        remaining -= got as u64;
     }
     Ok(out)
 }

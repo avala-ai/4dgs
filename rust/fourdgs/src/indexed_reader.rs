@@ -42,8 +42,12 @@ struct FrontRecord {
 }
 
 impl FrontRecord {
+    /// Saturating, because `content_length` comes off the wire: a corrupt one must produce
+    /// an error from the caller's bounds check rather than wrap around into a small number
+    /// and send the walk backwards.
     fn total_length(&self) -> u64 {
-        self.content_length + RECORD_HEADER_SIZE as u64
+        self.content_length
+            .saturating_add(RECORD_HEADER_SIZE as u64)
     }
 }
 
@@ -85,17 +89,32 @@ impl<'a, R: Readable + ?Sized> FrontMatter<'a, R> {
     }
 
     /// The framing of the record at `at`, without its content.
+    ///
+    /// A front-matter record has to fit inside the resource, so a declared length that
+    /// runs past the end — or overflows on the way there — is refused here rather than
+    /// carried forward into arithmetic that would wrap.
     fn record_at(&mut self, at: u64) -> Result<FrontRecord> {
         self.ensure(at, RECORD_HEADER_SIZE as u64)?;
         let start = (at - self.window_at) as usize;
         let head = &self.window[start..start + RECORD_HEADER_SIZE];
-        Ok(FrontRecord {
-            opcode: head[0],
-            offset: at,
-            content_length: u64::from_le_bytes([
-                head[1], head[2], head[3], head[4], head[5], head[6], head[7], head[8],
-            ]),
-        })
+        let content_length = u64::from_le_bytes([
+            head[1], head[2], head[3], head[4], head[5], head[6], head[7], head[8],
+        ]);
+        let end = at
+            .checked_add(RECORD_HEADER_SIZE as u64)
+            .and_then(|v| v.checked_add(content_length));
+        match end {
+            Some(end) if end <= self.size => Ok(FrontRecord {
+                opcode: head[0],
+                offset: at,
+                content_length,
+            }),
+            _ => Err(Error::Truncated(format!(
+                "a {} record at offset {at} declares {content_length} bytes of content, past the end of a {}-byte resource",
+                op::name(head[0]),
+                self.size
+            ))),
+        }
     }
 
     /// One record's content, from the window when it is there and by a read of exactly
@@ -124,17 +143,18 @@ impl<'a, R: Readable + ?Sized> FrontMatter<'a, R> {
     }
 
     fn covers(&self, at: u64, length: u64) -> bool {
-        at >= self.window_at && at + length <= self.window_at + self.window.len() as u64
+        at >= self.window_at
+            && at.saturating_add(length) <= self.window_at + self.window.len() as u64
     }
 
     fn ensure(&mut self, at: u64, length: u64) -> Result<()> {
         if self.covers(at, length) {
             return Ok(());
         }
-        if at + length > self.size {
+        if at.saturating_add(length) > self.size {
             return Err(Error::Truncated(format!(
                 "the front matter needs bytes [{at}, {}) of a {}-byte resource",
-                at + length,
+                at.saturating_add(length),
                 self.size
             )));
         }
@@ -186,14 +206,14 @@ impl IndexedScene {
         self.chunks_for_time(t)
             .iter()
             .map(|e| {
-                e.chunk_length
-                    + e.bands
-                        .iter()
-                        .filter(|(band, _, _)| *band <= max_sh_band)
-                        .map(|(_, _, length)| *length)
-                        .sum::<u64>()
+                e.bands
+                    .iter()
+                    .filter(|(band, _, _)| *band <= max_sh_band)
+                    .fold(e.chunk_length, |total, (_, _, length)| {
+                        total.saturating_add(*length)
+                    })
             })
-            .sum()
+            .fold(0u64, u64::saturating_add)
     }
 }
 
@@ -329,7 +349,7 @@ pub fn read_chunk<R: Readable + ?Sized>(
         let content = record_content(&blob, op::SH_BAND_STREAM)?;
         let mut cursor = Cursor::new(content);
         cursor.u8()?; // the band index, already known from the index
-        let (_, values) = decode_stream(&mut cursor)?;
+        let (_, values) = decode_stream(&mut cursor, Some(head.count as usize))?;
         bands.insert(*band, values);
     }
     decoded.bands = bands;
