@@ -264,6 +264,27 @@ class TestAudio:
         with pytest.raises(fourdgs.MalformedFile, match="Audio Data record declares"):
             read_audio_range(readable, indexed, source.source_id, 0, 1)
 
+    def test_indexed_open_rejects_audio_data_framed_past_eof(self):
+        from fourdgs.indexed_reader import open_indexed
+        from fourdgs.readable import BytesReadable
+        from fourdgs.serialization import iter_records
+
+        buf = io.BytesIO()
+        source = fourdgs.AudioSource(source_id=1, codec="wav", data=b"RIFF", duration_sec=6.0)
+        fourdgs.write(buf, make_scene(), 6.0, audio_sources=[source])
+        data = bytearray(buf.getvalue())
+        payload = next(record for record in iter_records(data, len(MAGIC)) if record.opcode == op.AUDIO_DATA)
+
+        # Keep the inner source id, byte length, and payload valid, but make the outer
+        # framing run nine bytes beyond the resource. The front-matter walker must reject
+        # that declaration instead of clamping its prefix read and jumping past EOF.
+        content_length = len(data) - payload.offset
+        data[payload.offset + 1 : payload.offset + 9] = content_length.to_bytes(8, "little")
+
+        location = rf"AudioData record at byte {payload.offset} spans .* outside the {len(data)}-byte file"
+        with pytest.raises(fourdgs.MalformedFile, match=location):
+            open_indexed(BytesReadable(bytes(data)))
+
     def test_the_writer_normalizes_an_extreme_audio_orientation_without_overflow(self):
         source = fourdgs.AudioSource(
             source_id=1, codec="wav", data=b"x", duration_sec=2.0, rotation=(1e308, 0.0, 0.0, 0.0)

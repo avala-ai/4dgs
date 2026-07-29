@@ -88,8 +88,13 @@ class _FrontMatter:
         while at + _RECORD_HEADER.size <= self._size:
             self._ensure(at, _RECORD_HEADER.size)
             opcode, length = _RECORD_HEADER.unpack_from(self._window, at - self._window_at)
+            end = at + _RECORD_HEADER.size + length
+            if end > self._size:
+                raise MalformedFile(
+                    f"{op.name(opcode)} record at byte {at} spans [{at}, {end}), outside the {self._size}-byte file"
+                )
             yield _FrontRecord(opcode=opcode, offset=at, content_length=length)
-            at += _RECORD_HEADER.size + length
+            at = end
 
     def content(self, record: _FrontRecord, limit: int | None = None) -> bytes:
         """One record's content, from the window when it is there and by a read of exactly
