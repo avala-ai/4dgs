@@ -42,13 +42,24 @@
 }
 
 :root {
-  --ifm-color-primary: #2f6f8f;
-  --ifm-color-primary-dark: #2a6480;
-  --ifm-color-primary-darker: #285f79;
-  --ifm-color-primary-darkest: #214e64;
-  --ifm-color-primary-light: #347a9e;
-  --ifm-color-primary-lighter: #367fa5;
-  --ifm-color-primary-lightest: #3d90ba;
+  /* Brand palette: #6fc1e0 accent, #101010 ink, #f2e8de canvas (light),
+     #101010 canvas / #ffffff ink (dark). Light-mode primary is a darker cut
+     of the brand hue so links keep AA contrast on the cream canvas; the pure
+     accent takes over in dark mode where it reads against near-black. */
+  --ifm-color-primary: #2b7ea7;
+  --ifm-color-primary-dark: #27718f;
+  --ifm-color-primary-darker: #256b87;
+  --ifm-color-primary-darkest: #1e5870;
+  --ifm-color-primary-light: #308bb8;
+  --ifm-color-primary-lighter: #3b97c4;
+  --ifm-color-primary-lightest: #6fc1e0;
+
+  --ifm-background-color: #f2e8de;
+  --ifm-background-surface-color: #f8f1e9;
+  --ifm-font-color-base: #101010;
+  --ifm-heading-color: #101010;
+  --ifm-navbar-background-color: #f2e8de;
+  --ifm-footer-background-color: #ebdfd2;
 
   --ifm-font-family-base:
     "Lexend Deca", system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -60,13 +71,20 @@
 }
 
 [data-theme="dark"] {
-  --ifm-color-primary: #7fc4e4;
-  --ifm-color-primary-dark: #63b8de;
-  --ifm-color-primary-darker: #55b2db;
-  --ifm-color-primary-darkest: #2b9dd0;
-  --ifm-color-primary-light: #9bd0ea;
-  --ifm-color-primary-lighter: #a9d6ed;
-  --ifm-color-primary-lightest: #d3e9f6;
+  --ifm-color-primary: #6fc1e0;
+  --ifm-color-primary-dark: #55b6da;
+  --ifm-color-primary-darker: #48b0d7;
+  --ifm-color-primary-darkest: #2b9dc9;
+  --ifm-color-primary-light: #89cce6;
+  --ifm-color-primary-lighter: #96d2e9;
+  --ifm-color-primary-lightest: #bde3f1;
+
+  --ifm-background-color: #101010;
+  --ifm-background-surface-color: #1a1a1a;
+  --ifm-font-color-base: #ffffff;
+  --ifm-heading-color: #ffffff;
+  --ifm-navbar-background-color: #101010;
+  --ifm-footer-background-color: #0a0a0a;
 
   --docusaurus-highlighted-code-line-bg: rgb(0 0 0 / 30%);
 }
