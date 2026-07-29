@@ -1,5 +1,5 @@
 # Target names are the same in every language directory of this repository.
-.PHONY: build test lint format asan clean
+.PHONY: build test lint format examples asan clean
 
 BUILD ?= build
 
@@ -15,6 +15,9 @@ lint:
 
 format:
 	clang-format -i $(shell git ls-files '*.cpp' '*.hpp')
+
+examples: build
+	$(BUILD)/examples/decode_summary ../tests/conformance/data/OneWindow-UseChunkIndex-UseCrc-WithAudio.4dgs
 
 # The leak and the out-of-bounds read are the two bugs a binding over an FFI boundary is
 # exposed to, so they get their own build directory rather than a flag somebody remembers.

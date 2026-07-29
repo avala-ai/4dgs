@@ -115,6 +115,16 @@ if(FOURDGS_BUILD_CONFORMANCE)
   endforeach()
 endif()
 
+option(FOURDGS_BUILD_EXAMPLES "Build the examples" ON)
+
+if(FOURDGS_BUILD_EXAMPLES)
+  # Built and run in CI, so an example cannot rot into a snippet that no longer compiles.
+  add_executable(decode_summary examples/decode_summary.cpp)
+  target_link_libraries(decode_summary PRIVATE fourdgs-cpp)
+  set_target_properties(decode_summary PROPERTIES RUNTIME_OUTPUT_DIRECTORY
+                                                  ${CMAKE_BINARY_DIR}/examples)
+endif()
+
 if(FOURDGS_BUILD_TESTS)
   enable_testing()
   foreach(test test_model test_result test_readable test_seam)

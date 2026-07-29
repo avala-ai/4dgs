@@ -212,6 +212,13 @@ jobs:
           cmake --build cpp/build -j
           ctest --test-dir cpp/build --output-on-failure
 
+      - name: The example runs, so it cannot rot into a snippet that no longer works
+        run: |
+          pip install -e ./python/fourdgs
+          python tests/conformance/generate.py
+          ./cpp/build/examples/decode_summary \
+            tests/conformance/data/OneWindow-UseChunkIndex-UseCrc-WithAudio.4dgs
+
       # The binding owns handles that come from across an FFI boundary, so a leak and a read
       # past the end of a buffer the ABI handed over are the two bugs it is exposed to. The
       # runners decode a real file here rather than the tests' synthetic data, because an

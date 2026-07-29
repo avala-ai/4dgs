@@ -11,6 +11,7 @@ on what a file means. Decode only at v1; rendering is out of scope for this repo
 | Test     | `ctest --test-dir cpp/build`, or `make -C cpp test`                                             |
 | Headers  | [`include/fourdgs/`](include/fourdgs/)                                                          |
 | Target   | `fourdgs::cpp` (static), installs a CMake package                                               |
+| Example  | [`examples/decode_summary.cpp`](examples/decode_summary.cpp), run in CI                         |
 | Runners  | [`conformance/`](conformance/)                                                                  |
 
 ```cpp

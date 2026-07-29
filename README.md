@@ -39,13 +39,13 @@ self-contained resource you can range-request and seek like a video.
 
 ## Libraries
 
-| Language   | Readme                     | Package      | Status                        |
-| ---------- | -------------------------- | ------------ | ----------------------------- |
-| Python     | [python/](python/)         | `fourdgs`    | Reference implementation      |
-| TypeScript | [typescript/](typescript/) | `@4dgs/core` | Decoder, conformance-verified |
-| Rust       | [rust/](rust/)             | `fourdgs`    | Decoder, conformance-verified |
-| C++        | [cpp/](cpp/)               | —            | Planned                       |
-| Swift      | [swift/](swift/)           | —            | Planned (visionOS)            |
+| Language   | Readme                     | Package      | Status                                           |
+| ---------- | -------------------------- | ------------ | ------------------------------------------------ |
+| Python     | [python/](python/)         | `fourdgs`    | Reference implementation                         |
+| TypeScript | [typescript/](typescript/) | `@4dgs/core` | Decoder, conformance-verified                    |
+| Rust       | [rust/](rust/)             | `fourdgs`    | Decoder, conformance-verified                    |
+| C++        | [cpp/](cpp/)               | —            | Binding over Rust; decoding, conformance pending |
+| Swift      | [swift/](swift/)           | —            | Planned (visionOS)                               |
 
 Package names are `fourdgs` where a registry will not take `4dgs`; the format, the CLI and the file
 extension are always `4dgs`. [RELEASING.md](RELEASING.md) has the constraint per registry.
