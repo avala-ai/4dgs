@@ -124,3 +124,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: cargo build --workspace
+
+  cpp:
+    # The binding compiles and its unit tests run whether or not a core is linked. Without
+    # one, every entry point returns kNotImplemented and the tests assert exactly that — a
+    # build that quietly decoded nothing would pass a laxer job.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure and build
+        run: |
+          cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Debug
+          cmake --build cpp/build -j
+      - name: Tests
+        run: ctest --test-dir cpp/build --output-on-failure

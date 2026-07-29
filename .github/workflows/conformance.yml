@@ -71,3 +71,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: echo "rust conformance runner"
+
+  cpp:
+    runs-on: ubuntu-latest
+    needs: corpus
+    if: false # enabled when the binding has a core behind it
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Build the core, then the binding
+        run: |
+          cargo build -p fourdgs --release
+          cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build cpp/build -j
+      # `run.py --runner cpp` fails if no C++ runner executed, so a build that silently
+      # produced nothing is a red suite rather than a green one.
+      - run: |
+          pip install -e ./python/fourdgs
+          python tests/conformance/generate.py
+          python tests/conformance/run.py --runner cpp

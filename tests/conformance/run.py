@@ -29,6 +29,7 @@ ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 #: entry point is missing is skipped with a note rather than reported as 51 failures:
 #: a Python-only contributor running the whole suite has not broken anything.
 TYPESCRIPT_DIST = os.path.join(ROOT, "typescript", "conformance", "dist")
+CPP_BUILD = os.path.join(ROOT, "cpp", "build", "conformance")
 
 #: (family, name, argv-prefix). A new language adds one line.
 RUNNERS = [
@@ -44,6 +45,8 @@ RUNNERS = [
     ),
     ("typescript", "typescript/decode_streamed", ["node", os.path.join(TYPESCRIPT_DIST, "decode_streamed.js")]),
     ("typescript", "typescript/decode_indexed", ["node", os.path.join(TYPESCRIPT_DIST, "decode_indexed.js")]),
+    ("cpp", "cpp/decode_streamed", [os.path.join(CPP_BUILD, "decode_streamed")]),
+    ("cpp", "cpp/decode_indexed", [os.path.join(CPP_BUILD, "decode_indexed")]),
 ]
 
 
