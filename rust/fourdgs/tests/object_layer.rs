@@ -36,6 +36,21 @@ fn content(encoded: &[u8]) -> &[u8] {
     &encoded[9..]
 }
 
+fn first_record_offset(encoded: &[u8], wanted_opcode: u8) -> usize {
+    let mut offset = MAGIC.len();
+    while offset + 9 <= encoded.len() {
+        if encoded[offset] == wanted_opcode {
+            return offset;
+        }
+        let content_length =
+            u64::from_le_bytes(encoded[offset + 1..offset + 9].try_into().unwrap()) as usize;
+        offset = offset
+            .checked_add(9 + content_length)
+            .expect("test record offset");
+    }
+    panic!("record opcode {wanted_opcode:#04x} not found");
+}
+
 fn quantization() -> Quantization {
     Quantization {
         scheme: "uniform-v1".into(),
@@ -675,6 +690,26 @@ fn indexed_open_rejects_duplicate_unrelated_tracks_from_bounded_prefixes() {
         message.contains(&format!("byte {}", track_range.0)),
         "{message}"
     );
+}
+
+#[test]
+fn indexed_open_rejects_a_background_object_track_from_its_header() {
+    let mut bytes = object_file(true, false);
+    let track_offset = first_record_offset(&bytes, op::OBJECT_TRACK);
+    bytes[track_offset + 9..track_offset + 13].copy_from_slice(&0u32.to_le_bytes());
+
+    let err = match SceneReader::open_with(BytesReadable::new(&bytes), OpenMode::Indexed) {
+        Ok(_) => panic!("indexed opening accepted an ObjectTrack for background object 0"),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    assert!(message.contains("ObjectTrack"), "{message}");
+    assert!(
+        message.contains(&format!("byte {track_offset}")),
+        "{message}"
+    );
+    assert!(message.contains("object 0"), "{message}");
+    assert!(message.contains("background/unassigned"), "{message}");
 }
 
 #[test]

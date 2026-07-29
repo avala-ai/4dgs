@@ -399,6 +399,12 @@ pub fn open_indexed<R: Readable + ?Sized>(source: &mut R) -> Result<IndexedScene
                     }
                     let mut header = Cursor::new(&prefix);
                     let object_id = header.u32()?;
+                    if object_id == crate::object_layer::BACKGROUND {
+                        return Err(Error::Malformed(format!(
+                            "ObjectTrack at byte {} names object 0, which is background/unassigned",
+                            record.offset
+                        )));
+                    }
                     let interpolation = header.u8()?;
                     let sample_count = header.u32()?;
                     if let Some(first) = scene.object_track_ranges.get(&object_id) {
