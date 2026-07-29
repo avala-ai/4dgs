@@ -82,7 +82,10 @@ def cmd_convert(args) -> int:
 
 def cmd_decode(args) -> int:
     scene = read(args.file)
-    state = scene.gaussians.state_at(args.time)
+    # The file's own threshold, from its Header. Letting this default meant a file that
+    # declared a cutoff was decoded against a different one, and the answer was wrong by
+    # however far the two differed.
+    state = scene.gaussians.state_at(args.time, scene.header.cutoff)
     out = {
         "time": args.time,
         "visible": len(state["indices"]),

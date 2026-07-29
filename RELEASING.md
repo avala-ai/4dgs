@@ -64,13 +64,14 @@ Package names are a different matter, and not because we chose them: three regis
 language-identifier rules impose five constraints, and the honest thing is to write down what each
 one is rather than imply a consistency that does not exist.
 
-| Registry  | Name                                                          | Why                                                                                                                                     |
-| --------- | ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| PyPI      | `fourdgs`                                                     | `4dgs` is taken by an unrelated project. `pip install fourdgs`, `import fourdgs` — the two now agree, so there is no alias to remember  |
-| crates.io | `fourdgs`                                                     | Cargo rejects a crate name beginning with a digit, so `4dgs` is not available to anyone. The `[lib] name` matches                       |
-| npm       | `@4dgs/core`, `@4dgs/browser`, `@4dgs/nodejs`, `@4dgs/codecs` | Scoped names may begin with a digit. The unscoped `4dgs` was refused by npm's similarity filter, so the scope is not a stylistic choice |
-| Swift     | module `FourDGS`, C seam `CFourDGS`                           | A Swift module name is an identifier and may not begin with a digit. The casing is Swift's own convention for acronyms, not a rename    |
-| Kaitai    | `kaitai/fourdgs.ksy`, type id `fourdgs`                       | A `.ksy` type id becomes an identifier in every target the compiler emits, so the same rule as Swift and Cargo applies                  |
+| Registry  | Name                                                          | Why                                                                                                                                            |
+| --------- | ------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| PyPI      | `fourdgs`                                                     | `4dgs` is taken by an unrelated project. `pip install fourdgs`, `import fourdgs` — the two now agree, so there is no alias to remember         |
+| crates.io | `fourdgs`                                                     | Cargo rejects a crate name beginning with a digit, so `4dgs` is not available to anyone. The `[lib] name` matches                              |
+| crates.io | `fourdgs-cli`, binary `4dgs`                                  | The same constraint applies to the CLI's crate, but not to what it installs: a `[[bin]] name` may begin with a digit, so the command is `4dgs` |
+| npm       | `@4dgs/core`, `@4dgs/browser`, `@4dgs/nodejs`, `@4dgs/codecs` | Scoped names may begin with a digit. The unscoped `4dgs` was refused by npm's similarity filter, so the scope is not a stylistic choice        |
+| Swift     | module `FourDGS`, C seam `CFourDGS`                           | A Swift module name is an identifier and may not begin with a digit. The casing is Swift's own convention for acronyms, not a rename           |
+| Kaitai    | `kaitai/fourdgs.ksy`, type id `fourdgs`                       | A `.ksy` type id becomes an identifier in every target the compiler emits, so the same rule as Swift and Cargo applies                         |
 
 In prose, in the specification, in the CLI and on disk: always `4dgs`. `fourdgs` appears only as a
 package name or a language identifier, and only where a registry or a compiler requires it.
