@@ -467,30 +467,256 @@ u64  group_length
 
 Lets a reader range-read one class of index record without reading the others.
 
-### 5.15 Provenance family — opcodes `0x20`–`0x2F`, RESERVED
-
-**Reserved, not normative, and not to be emitted by a version-1 writer.** Recorded here so the shape
-is known before anyone needs it, and so the opcodes are not spent on something else.
+### 5.15 Provenance family — opcodes `0x20`–`0x2F`
 
 Scenes reconstructed from sensors carry context that consumers downstream — analysis, simulation,
-quality review — need and that nothing in the format currently expresses. The reserved family
-covers:
+quality review — need and that the rest of the format does not express. Three of the family's
+opcodes are defined here; the rest stay reserved (§5.15.5).
 
-- **Sensor description** — per-sensor intrinsics and extrinsics, with the rig they were measured
-  against.
-- **Rig and ego trajectory** — the pose of the capture platform over the scene clock, distinct from
-  the camera trajectory in §5.10, which is a viewing suggestion rather than a measurement.
+| opcode | record              | §        | status      |
+| ------ | ------------------- | -------- | ----------- |
+| `0x20` | Coordinate Frame    | §5.15.2 | defined     |
+| `0x21` | Sensor Calibration  | §5.15.3 | defined     |
+| `0x22` | Rig Trajectory      | §5.15.4 | defined     |
+| `0x23`–`0x2F` | —            | §5.15.5 | reserved    |
+
+The assignment runs in dependency order, lowest first: a sensor's extrinsic and a rig's pose are
+poses **in** a frame, and `0x20` is the record that names that frame. Nothing requires a reader to
+see them in that order — records are skipped and dispatched by opcode, not by position — but a
+writer that emits them in ascending opcode order produces a file whose front matter reads in the
+order a human would explain it.
+
+These records are **provisional** in the sense of §4.4: they are not frozen, and their fields may
+change before version 1 is declared stable. They may only be extended by appending, like every
+other record.
+
+#### 5.15.1 What the family costs when it is absent
+
+**Nothing, and that is a rule rather than an accident.** A scene with no provenance carries no
+Coordinate Frame record, no Sensor Calibration record, no Rig Trajectory record, no placeholder and
+no reserved bytes. All three records are OPTIONAL in every file, whatever its profile.
+
+This is the audio precedent (§7) applied one record family further out, and it decides one question
+explicitly: **the Header gets no presence flags for provenance.** Audio has one because audio
+presence changes how the scene's clock is defined — when a track is present the audio clock is the
+timing master — so a reader must know the answer *before* it can interpret a time, and the Header is
+the only place it can learn that without a read it might not otherwise make. Provenance changes
+nothing a decoder does: §3's arithmetic, §6's grids and §8's seek rule are identical whether these
+records are present or absent. A consumer that wants them is already walking the front matter
+record-by-record — that walk is paid for by the Audio record regardless — and learns which
+provenance records exist, and their byte ranges, at no read beyond it. A flag would announce one
+record-header hop early something a reader is about to learn anyway, and would spend the Header's
+scarce reserved flag bits doing it.
+
+So the discovery rule for this family is: **walk the front matter; what is there is there.** A
+reader MUST NOT infer the absence of a provenance record from anything but the walk, and MUST NOT
+treat absence as an error or a warning. A file with no georeference is not an incomplete file.
+
+**Provenance records are not summary records** (§4.5). They carry content, and a Rig Trajectory's
+content is unbounded — a ten-minute capture logged at 100 Hz is sixty thousand samples. They belong
+with the other content records ahead of the chunks, for exactly the reason attachments do.
+
+#### 5.15.2 Coordinate Frame — opcode `0x20`
+
+```
+u8   handedness        -- see registry
+u8   up_axis           -- signed axis, see registry
+u8   forward_axis      -- signed axis, see registry
+u8   length_unit       -- see registry; 0 means unspecified
+f64  metres_per_unit   -- length of one file unit in metres; 0.0 means unknown
+u8   geodetic_present  -- 0 or 1
+     -- the following four fields are present only when geodetic_present is 1
+f64  latitude_deg      -- WGS-84 geodetic latitude of the scene origin, degrees
+f64  longitude_deg     -- WGS-84 longitude of the scene origin, degrees
+f64  altitude_m        -- height of the scene origin above the WGS-84 ellipsoid, metres
+f64  heading_deg       -- bearing of the frame's forward axis, degrees clockwise from true north
+```
+
+The record describes **the frame the file's own coordinates are expressed in** — the frame §2 refers
+to as "the file's own coordinate units" and declines to constrain. Every position, scale, velocity
+and pose in the file is in this frame, including the extrinsics of §5.15.3 and the poses of §5.15.4.
+
+`up_axis` and `forward_axis` MUST name different axes, ignoring sign: a frame whose up and forward
+are the same axis, or exact opposites, is not a basis. **A reader MUST refuse a file that declares
+one**, naming both fields. The reasoning is §5.4's: a degenerate basis does not announce itself, it
+silently re-orients everything a consumer computes from it, and a reader that repairs it by guessing
+the third axis has turned a detectable fault into plausible wrong output.
+
+`metres_per_unit` MUST be finite and MUST NOT be negative, for the reason §5.3 gives about
+quantization steps: a non-finite scale is not a coarse scale, it is not a scale, and every
+measurement derived from it becomes infinity at once. `0.0` is the legal way to say the scene has no
+known physical size, which is the honest state of a great deal of reconstructed content.
+
+**When `length_unit` and `metres_per_unit` disagree, `metres_per_unit` wins.** A writer MUST make
+them agree — a file that declares `metre` and `0.01` is malformed and a validator SHOULD say so —
+but a reader needs a rule for the file it has rather than the file it wanted, and the number is what
+a consumer computes with while the enum is what it prints.
+
+`geodetic_present` is `0` in a scene with no georeference, and the four anchor fields are then
+**absent from the record, not zeroed**. A reader that has read `geodetic_present` knows exactly how
+many bytes follow, so appended fields from a future revision sit at a position the reader can still
+compute; this is the one place in the format where a field's presence depends on an earlier one, and
+it is bounded to those four fields.
+
+The anchor places the **scene origin** — the point `(0, 0, 0)` in file coordinates — on the WGS-84
+ellipsoid, and `heading_deg` states where the frame's `forward_axis` points. Together with
+`metres_per_unit` that is enough to put the scene on a map; it is deliberately not a full geodetic
+transform, and a producer needing one should carry it in a Metadata record or an Attachment rather
+than expect this record to grow into one.
+
+**Precedence over the `coordinate_system` metadata key.** The registry defines a free-form
+`coordinate_system` key (e.g. `y-up-right-handed`), and files written before this record existed use
+it. When a file carries **both** a Coordinate Frame record and a `coordinate_system` metadata entry:
+
+- **the record wins, in whole**;
+- a reader MUST NOT merge them, and MUST NOT fall back to the key for a field it did not like in the
+  record;
+- a writer SHOULD emit only the record, and a writer that emits both MUST make them agree.
+
+Merging is called out because it is the tempting thing to do and it is wrong: the key is one string
+describing a whole convention, so half of it cannot be true. A reader that took the handedness from
+the record and the up-axis from the key would produce a frame no producer ever described.
+
+#### 5.15.3 Sensor Calibration — opcode `0x21`
+
+**One record per sensor.** A file with five cameras carries five of these, each with its own `name`,
+each independently range-readable. This follows §5.7's shape for spherical harmonic bands and
+§5.11's for metadata: a consumer that wants one sensor fetches one record.
+
+```
+string  name              -- sensor identifier, unique within the file
+string  modality          -- see registry; "" when unstated
+u8      camera_model      -- see registry; 0 when the sensor is not a camera
+u32     width_px          -- 0 when camera_model is 0
+u32     height_px         -- 0 when camera_model is 0
+f64     fx, fy            -- focal length in pixels
+f64     cx, cy            -- principal point in pixels, from the top-left corner
+u8      distortion_count
+        distortion_count × f64   -- coefficients, in the order the model defines
+f64[4]  rotation          -- unit quaternion, xyzw
+f64[3]  translation
+u8      pose_reference    -- 0: the pose maps sensor to the scene frame
+                          -- 1: the pose maps sensor to a rig frame; compose with §5.15.4
+string  rig_name          -- the Rig Trajectory this composes with; "" when pose_reference is 0
+```
+
+`name` MUST be unique within a file. **A reader MUST refuse a file with two Sensor Calibration
+records of the same name**, naming it: sensors are referred to by name and nothing else, so a
+duplicate makes every such reference ambiguous, and picking the first or the last is a coin toss
+performed silently.
+
+**The extrinsic maps sensor coordinates into the frame `pose_reference` names**, in that direction:
+
+```
+p_target = R(rotation) * p_sensor + translation
+```
+
+The direction is stated because the opposite convention is equally common in the field, both are
+plausible, and a consumer that assumes wrongly gets a scene that is merely mis-placed rather than
+one that fails. `rotation` is a unit quaternion in `xyzw` order — the same order and the same
+convention as §3 and §6.4, so no component shuffle is ever needed inside this format. A reader
+SHOULD renormalize it, as §6.4 does, and MUST refuse one whose norm is zero or non-finite.
+
+`pose_reference` exists because "the sensor's pose" has two different answers depending on whether
+the rig moved. A static rig has one pose per sensor and `pose_reference = 0` says so directly. A
+moving rig's sensors have a fixed pose **relative to the rig** and a time-varying pose in the scene,
+and `pose_reference = 1` says that the extrinsic is the fixed part, to be composed with the named
+Rig Trajectory:
+
+```
+p_scene(t) = R(q_rig(t)) * (R(rotation) * p_sensor + translation) + t_rig(t)
+```
+
+When `pose_reference` is `1`, `rig_name` MUST match the `name` of a Rig Trajectory record in the
+same file, and **a reader MUST refuse a file where it does not**, naming the missing trajectory. An
+extrinsic relative to a rig that is not in the file is not a pose at all, and a reader that fell back
+to treating it as a scene-frame pose would place every sensor at the rig's origin — plausible,
+wrong, and silent, which is the combination this format refuses everywhere else.
+
+**Intrinsics.** Every `f64` in this record MUST be finite. When `camera_model` is not `0`, `fx` and
+`fy` MUST be non-zero and `width_px` and `height_px` MUST be non-zero. When `camera_model` **is** `0`
+— a lidar, a radar, an IMU, or a camera whose intrinsics were not recovered — `width_px`,
+`height_px`, `fx`, `fy`, `cx`, `cy` MUST all be `0` and `distortion_count` MUST be `0`. Those
+thirty-two zero bytes are the one place this design accepts a placeholder, and it buys a single
+record shape for every sensor a rig carries: the alternative is a second record type that differs
+only by omission, and two shapes to keep in step forever.
+
+`distortion_count` MUST match what the named model defines (see the registry). **A reader that does
+not implement the named `camera_model` MUST NOT apply a partial correction** — it MUST either
+decline to undistort and report the sensor as uncorrected, or refuse the file, naming the model. A
+half-applied distortion model is worse than none: undistorting with the first two coefficients of a
+five-coefficient model produces an image that looks corrected and is not.
+
+#### 5.15.4 Rig Trajectory — opcode `0x22`
+
+The measured pose of the capture platform over the scene clock.
+
+```
+string  name             -- the platform this describes; "" is the file's capture rig
+u8      interpolation    -- see registry
+u32     sample_count
+        sample_count × { f64 time; f64[4] rotation; f64[3] translation }
+```
+
+This is **a measurement**, and it is not the Camera record of §5.10, which is a viewing suggestion a
+reader may ignore entirely. Nothing about a Rig Trajectory is advisory to a consumer doing analysis
+or simulation: it is where the sensors were.
+
+`time` is on the **scene clock** — `f64` seconds from 0, exactly as §2 defines it and exactly as
+`mu_t`, the window table and the chunk intervals use it. When the file carries audio, §7's clock
+rule applies here too and the audio track is the timing master, because there is one clock in a
+`.4dgs` file and this record is on it. A producer whose capture timestamps are on some other epoch
+MUST convert them; carrying the original epoch is what a Metadata record is for.
+
+`rotation` and `translation` mean what they mean in §5.15.3: `p_scene = R(rotation) * p_rig +
+translation`, with the quaternion in `xyzw` order.
+
+`time` MUST be **strictly increasing** across the samples. **A reader MUST refuse a trajectory whose
+times are not**, naming the sample index: a repeated or reversed timestamp makes the interval
+containing it ambiguous, and every rule below is stated in terms of the interval a query lands in.
+
+**Interpolation.** Between consecutive samples `i` and `i + 1`, with `u = (t - time[i]) / (time[i+1]
+- time[i])`:
+
+- `linear` — translation is `lerp(t[i], t[i+1], u)`; rotation is the **shortest-arc** slerp, which
+  means negating the second quaternion when the dot product of the two is negative. That negation is
+  not an optimization: `q` and `−q` are the same rotation, so without it a trajectory takes the long
+  way round between two poses that were a degree apart, for one interval, once per sign flip.
+- `step` — both are held at sample `i` until `time[i+1]`.
+
+**Outside the sample range the pose is clamped, never extrapolated**: before `time[0]` it is sample
+`0`, at or after `time[sample_count - 1]` it is the last sample. Extrapolating a rig pose from two
+samples produces a platform that accelerates away from the scene at the ends of the clip, which is
+never what the capture did.
+
+A trajectory with `sample_count == 0` carries no pose and MUST be read as though the record were
+absent; a producer SHOULD omit the record instead. A trajectory with exactly one sample is a static
+rig, and every query returns that sample — which is the clamping rule with nothing to interpolate
+between, not a special case.
+
+#### 5.15.5 Still reserved — opcodes `0x23`–`0x2F`
+
+**Reserved, not normative, and not to be emitted by a version-1 writer.** Recorded so the shape is
+known and so the opcodes are not spent on something else:
+
 - **Source timing** — per-chunk or per-gaussian acquisition timestamps, so a consumer can
   distinguish scene time from capture time when a rolling or multi-sensor capture makes them differ.
 - **Semantic and instance labels** — per-gaussian class or instance identifiers.
 - **Static and dynamic segmentation** — which gaussians belong to the fixed scene and which to
   moving content, which a producer often knows and a consumer otherwise has to infer.
-- **Spatial framing** — coordinate frame, units, up-axis, and an optional georeference.
+
+The last two are grouped for a reason that decides their eventual shape: both are **per-gaussian**,
+and per-gaussian data in this format travels in attribute streams inside a chunk (§5.6, §6.1), not
+in a front-matter record. Their design is therefore an attribute-id question — how a label id is
+quantized, whether a scene-wide label table lives in front matter, what a reader does with a stream
+it cannot name — and it is a larger question than the three records defined above, which is why they
+are not answered here. The reserved attribute ids in the registry's `13`–`63` range are where that
+work will land.
 
 Some of this is expressible today as metadata keys (see the registry) for producers who need it
-before the records exist. The distinction is that metadata is free-form text and these records would
-be typed and indexable; a scene that only needs to say "z is up" should use metadata and always
-will.
+before the records exist. The distinction is that metadata is free-form text and these records are
+typed and indexable; a scene that only needs to say "z is up" may still say it in metadata, though
+§5.15.2 is now the better answer even for that.
 
 ---
 
@@ -704,6 +930,18 @@ and the text was the bug.
 | §5.5/§5.6 corrected: a chunk's streams are bare structures, not records, and `0x06` is not an opcode  | correction                |
 | §5.13 stated that `0x0E` is reserved with no defined body, rather than sharing the Attachment's       | clarification             |
 | §5.2 named the terms of the 37-byte tail a seeking reader reads                                       | clarification             |
+| §5.15 added: Coordinate Frame `0x20`, Sensor Calibration `0x21` and Rig Trajectory `0x22`, all optional | rule added              |
+| §5.15.2 added: a Coordinate Frame record supersedes the `coordinate_system` metadata key              | rule added                |
+
+The two §5.15 rows add records rather than tighten a rule, and they **change no existing file**. The
+opcodes they define were reserved and unemitted, so no file in the world carries one; every
+conformance variant that existed before them still encodes to the same bytes and decodes to the same
+meaning; and because all three records are optional with no Header flag announcing them (§5.15.1), a
+file that does not want provenance is byte-identical to the file it would have been. What changes is
+what a **new** file may say. The precedence row is the one with teeth: a producer that has been
+writing `coordinate_system` as metadata keeps working unchanged, and only a file carrying both the
+key and the record has a question to answer — which is why the answer is stated before anyone can
+write that file rather than after.
 
 The §5.3 row is a tightening of what a **writer** may emit, and it changes no existing file: every
 quantization parameter any encoder here has ever written is finite, all 34 conformance variants

@@ -191,14 +191,121 @@ regardless of its profile.
 
 ---
 
+## Provenance
+
+Values used by the provenance records of spec §5.15. All three records are optional; a file that
+carries none of them is complete, and no Header flag announces them (spec §5.15.1).
+
+### Handedness
+
+Used by the Coordinate Frame record's `handedness` field.
+
+| value | name          | notes                                                                       |
+| ----- | ------------- | --------------------------------------------------------------------------- |
+| 0     | `unspecified` | The producer did not state one. Not the same as either answer below         |
+| 1     | `right`       | Right-handed: `x × y = z` for the frame's own axes                          |
+| 2     | `left`        | Left-handed                                                                  |
+
+`unspecified` is a value rather than an omission because a Coordinate Frame record that states an
+up-axis and declines to state a handedness is a real and useful thing to write, and a reader has to
+be able to tell that from a producer who meant `right` and wrote a zero.
+
+### Signed axes
+
+Used by the Coordinate Frame record's `up_axis` and `forward_axis` fields.
+
+| value | axis |
+| ----- | ---- |
+| 0     | `+x` |
+| 1     | `+y` |
+| 2     | `+z` |
+| 3     | `-x` |
+| 4     | `-y` |
+| 5     | `-z` |
+
+`up_axis` and `forward_axis` must name different axes ignoring sign, so `+y` with `-y` is refused
+along with `+y` with `+y`. See spec §5.15.2.
+
+### Units of length
+
+Used by the Coordinate Frame record's `length_unit` field. The record also carries
+`metres_per_unit`, and that number wins where the two disagree (spec §5.15.2).
+
+| value | name          | metres per unit |
+| ----- | ------------- | --------------- |
+| 0     | `unspecified` | —               |
+| 1     | `metre`       | 1               |
+| 2     | `centimetre`  | 0.01            |
+| 3     | `millimetre`  | 0.001           |
+| 4     | `kilometre`   | 1000            |
+| 5     | `foot`        | 0.3048          |
+| 6     | `inch`        | 0.0254          |
+
+A unit not on this list is spelled by leaving `length_unit` at `unspecified` and putting the ratio in
+`metres_per_unit`, which is exactly the case the second field exists for.
+
+### Sensor modalities
+
+Used by the Sensor Calibration record's `modality` field. Unlike the fields above this one is a
+string, because the set of things a rig can carry is open in a way an axis is not.
+
+| value    | notes                                                          |
+| -------- | -------------------------------------------------------------- |
+| `""`     | Unstated                                                       |
+| `camera` | Any imaging sensor with a projection model                     |
+| `lidar`  | Time-of-flight ranging, spinning or solid-state                |
+| `radar`  | Radio ranging                                                  |
+| `imu`    | Inertial measurement, no geometry of its own beyond its pose   |
+| `depth`  | A sensor producing per-pixel range, with a camera-like model   |
+
+A reader that does not recognize a modality still reads the record: `modality` describes the sensor,
+`camera_model` describes the arithmetic, and it is the latter a consumer needs to project with.
+
+### Camera models
+
+Used by the Sensor Calibration record's `camera_model` field. `distortion_count` must match the
+count this table gives, and the coefficients appear in the stated order.
+
+| value | name             | coefficients | order                                   |
+| ----- | ---------------- | ------------ | --------------------------------------- |
+| 0     | `none`           | 0            | The sensor is not a camera, or its intrinsics were not recovered |
+| 1     | `pinhole`        | 0            | No distortion term                      |
+| 2     | `brown-conrady`  | 5 or 8       | `k1 k2 p1 p2 k3` or `k1 k2 p1 p2 k3 k4 k5 k6` |
+| 3     | `kannala-brandt` | 4            | `k1 k2 k3 k4` — the equidistant fisheye model |
+
+Two lengths are legal for `brown-conrady` because the rational eight-coefficient form is a superset
+of the five-coefficient one and both are in wide use; a reader implementing the five-coefficient form
+that meets an eight-coefficient sensor has not met an unknown model, it has met one it can only
+partly apply, and spec §5.15.3 says what to do about that — decline, and say so.
+
+### Trajectory interpolation
+
+Used by the Rig Trajectory record's `interpolation` field.
+
+| value | name     | notes                                                                                  |
+| ----- | -------- | -------------------------------------------------------------------------------------- |
+| 0     | `linear` | Translation lerped, rotation slerped along the shortest arc. See spec §5.15.4          |
+| 1     | `step`   | Both held at the earlier sample until the next one                                     |
+
+Distinct from the Camera record's `interpolation` field, which is a string and offers `spline`. A rig
+trajectory is a measurement and a `spline` through measured poses invents intermediate poses the
+platform did not occupy, so the name is deliberately not offered here.
+
+---
+
 ## Metadata keys
 
 Used by Metadata records and the Header's `attributes` map. All optional.
 
-| key                              | meaning                                           |
-| -------------------------------- | ------------------------------------------------- |
-| `coordinate_system`              | e.g. `y-up-right-handed`; the format imposes none |
-| `source`                         | how the scene was produced, free-form             |
-| `license`                        | licence of the scene content                      |
-| `title`, `description`, `author` | human-facing scene identification                 |
-| `application`                    | producer of any private-range records in the file |
+| key                              | meaning                                                            |
+| -------------------------------- | ------------------------------------------------------------------ |
+| `coordinate_system`              | e.g. `y-up-right-handed`. **Superseded** by the Coordinate Frame record (`0x20`); where both appear the record wins, in whole — see spec §5.15.2 |
+| `source`                         | how the scene was produced, free-form                              |
+| `license`                        | licence of the scene content                                       |
+| `title`, `description`, `author` | human-facing scene identification                                  |
+| `application`                    | producer of any private-range records in the file                  |
+
+`coordinate_system` is superseded rather than removed. Files that predate the Coordinate Frame record
+use it, it is the only way to say anything about a frame in a file whose reader is older than §5.15,
+and a registry entry that vanished would make those files unreadable by the document that described
+them. New producers should write the record.
