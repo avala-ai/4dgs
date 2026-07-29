@@ -8,6 +8,29 @@ All notable changes to the Python package are documented here, following
 
 ### Added
 
+- **Chunk-compressed PLY import.** `fourdgs.from_compressed_ply` and the `4dgs from-compressed-ply`
+  subcommand read the chunked, quantized `.ply` that splat editors export — per-chunk float bounds
+  for every 256 gaussians, each gaussian a handful of packed `uint32` — including its temporal
+  extension, which adds per-chunk motion, time-scale and time bounds and the `packed_motion` /
+  `packed_time` vertex words. `convert` already imported a directory of per-frame _uncompressed_
+  PLYs; this is the other interchange form, and the only one that carries per-gaussian velocity and
+  a temporal centre and extent, which is exactly the state this format stores natively.
+
+  A temporal capture is commonly split across segment files that share one timeline, each stored on
+  a clock relative to its own start with a sidecar naming the parts. Passing the segments in
+  timeline order with `--segment-duration` collapses them into one continuous scene: segment `k`'s
+  scene time is `local + k × duration`, and its own span becomes the validity window of the
+  gaussians it contributes. Each segment also carries a tail of gaussians centred outside its span
+  that a player never shows; those are dropped rather than smeared. The sidecar and its parts become
+  a single seekable file, which is the point.
+
+  Four vertex words share one 11-10-11 field split, so position, scale, motion and time all go
+  through the same three helpers rather than re-deriving the shifts per call site. That is not
+  tidiness: the low 11 bits of the time word are identically zero in real captures, so a hand-rolled
+  16/16 reading leaves the temporal _extent_ near-correct while quietly destroying the temporal
+  _centre_ — plausible numbers, wrong timing, and no way to tell the layouts apart by inspecting the
+  extent. The suite asserts on the centre for that reason.
+
 - **Per-band spherical harmonic bit depths.** `WriteOptions.sh_bit_depths` takes a depth of 3–8 per
   band, or one of the `flat` / `balanced` / `aggressive` ladder names, and the encoder rounds each
   band's coefficients onto the grid that depth implies, declares the depths in the Quantization
