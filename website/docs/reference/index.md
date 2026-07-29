@@ -7,11 +7,12 @@ documented state — not a defect — and this table is the public contract that
 `supportsVariant()`, the harness runs exactly those, and this table is kept in lockstep with those
 declarations. Nothing is marked `Yes` on the strength of code existing.
 
-Every row is filled in from a suite that runs: 44 valid variants and 6 invalid ones, over two read
+Every row is filled in from a suite that runs: 45 valid variants and 7 invalid ones, over two read
 paths (streamed and indexed). A language takes the variants it declares support for, and what it
-declines is what this table records — 99 checks passing for Python, 87 for Rust, 77 each for
-TypeScript, C++, Swift and Dart. Rust declines the refusal expectations; TypeScript, C++, Swift and
-Dart decline those and the five variants that carry provenance records.
+declines is what this table records — 103 checks passing for Python, 87 for Rust, 77 each for
+TypeScript, C++, Swift and Dart. Rust declines the object variant and refusal expectations;
+TypeScript, C++, Swift and Dart also decline the five variants that carry capture-provenance
+records.
 
 | Feature                                              | Python | TypeScript | Rust    | C++     | Swift   | Dart    |
 | ---------------------------------------------------- | ------ | ---------- | ------- | ------- | ------- | ------- |
@@ -37,6 +38,9 @@ Dart decline those and the five variants that carry provenance records.
 | Provenance: coordinate frame + georeference          | Yes    | No         | Yes     | No      | No      | No      |
 | Provenance: sensor calibration                       | Yes    | No         | Yes     | No      | No      | No      |
 | Provenance: rig trajectory + pose interpolation      | Yes    | No         | Yes     | No      | No      | No      |
+| Object membership (`object_id`)                      | Yes    | No         | Planned | No      | No      | No      |
+| Object Table: labels, anchors, embeddings            | Yes    | No         | Planned | No      | No      | No      |
+| Object Track: rigid state composition                | Yes    | No         | Planned | No      | No      | No      |
 | Unknown-record skipping                              | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Refusal diagnosis (named, not merely refused)        | Yes    | No         | No      | No      | No      | No      |
 | Private-range records                                | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
@@ -79,6 +83,13 @@ five of those variants' gaussians correctly — including
 to the records as well. What it does not do is put the family in its summary, so a diff would see a
 missing key and could not tell that apart from a decoder that got it wrong. Declining is how it says
 which of the two it is.
+
+**The object layer** is proved separately because reading its records is not enough. Its corpus
+variant carries exact per-gaussian membership, a table with dynamics and an embedding, and a rigid
+track whose first, interpolated and last poses are sampled. Canonical `states` contain post-track
+centers and orientations from both Python read paths, so skipping the track or composing it before
+per-gaussian motion fails. Rust remains `Planned` until its runner emits the same states; the other
+SDKs skip the optional records and stream and report `No`.
 
 **Range-request decode** is a property of the transport an SDK offers, not of the format: every SDK
 can decode from an arbitrary byte-range reader, but only some ship an HTTP one. TypeScript's and
@@ -174,7 +185,7 @@ check cannot pass against a decoder that returns nothing.
 **Encode**, **Chunked encode** and **Summary writing** are proved by a gate rather than by a runner,
 and the encoders are gated by their role.
 
-Python's is proved by the corpus gate: `generate.py --verify` re-encodes all 44 valid variants,
+Python's is proved by the corpus gate: `generate.py --verify` re-encodes all 45 valid variants,
 asserts every committed checksum, and asserts that two consecutive runs are byte-identical. Every
 variant is an encode; the chunked and summary-bearing ones are the flags that say so.
 

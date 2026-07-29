@@ -22,6 +22,7 @@ from . import opcode as op
 from . import records as rec
 from .exceptions import BoundViolation, InvalidInput
 from .model import AudioTrack, CameraTrajectory, GaussianSet, window_table
+from .object_layer import ObjectLayer
 from .provenance import Provenance
 from .quantization import (
     DEFAULT_CUTOFF,
@@ -81,6 +82,11 @@ class WriteOptions:
     #: the default and costs nothing — no record, no placeholder, no Header flag. A
     #: scene with no sensors behind it is a complete file, not an under-specified one.
     provenance: Provenance | None = None
+    #: The object layer to emit (spec sections 5.15.6-5.15.7): the Object Table and the SE(3)
+    #: tracks. `None` writes neither, the default. The per-gaussian `object_id` stream is
+    #: written whenever the `GaussianSet` carries one, independently of this — a file may
+    #: group gaussians without naming the groups.
+    objects: ObjectLayer | None = None
     #: Bytes appended to the content of the record with the given opcode, as a newer
     #: writer that added a field would produce. A reader that honours content_length steps
     #: over them; one that assumes a record ends where its own knowledge does does not.
@@ -224,6 +230,20 @@ def _check_finite_input(g: GaussianSet) -> None:
     NaN there becomes a deliberate-looking value, and a NaN window makes every comparison
     false so the gaussian silently never appears.
     """
+    if g.object_id is not None:
+        object_ids = np.asarray(g.object_id)
+        if object_ids.shape != (g.count,):
+            raise InvalidInput(
+                f"object_id has shape {object_ids.shape}, expected ({g.count},); "
+                "there must be one exact u32 label per gaussian"
+            )
+        valid = np.isfinite(object_ids) & (object_ids == np.floor(object_ids))
+        valid &= (object_ids >= 0) & (object_ids <= np.iinfo(np.uint32).max)
+        if not np.all(valid):
+            bad = int(np.flatnonzero(~valid)[0])
+            raise InvalidInput(
+                f"object_id[{bad}] is {object_ids[bad]!r}; expected an exact integer in [0, {np.iinfo(np.uint32).max}]"
+            )
     if not g.count:
         return
     for name in _FINITE_FIELDS:
@@ -256,6 +276,14 @@ def _check_finite_input(g: GaussianSet) -> None:
 
 def _encode(g: GaussianSet, duration_sec, opts, audio, camera) -> bytes:
     _check_finite_input(g)
+    if opts.scene_profile == "objects":
+        if g.object_id is None:
+            raise InvalidInput(
+                "the objects profile requires an object_id stream in every non-empty chunk, "
+                "but the GaussianSet carries none"
+            )
+        if opts.objects is None or opts.objects.table is None:
+            raise InvalidInput("the objects profile requires one ObjectTable record, but none was supplied")
     n = g.count
     median_scale = float(np.median(g.scales)) if n else 1e-3
     bounds = Bounds.for_profile(opts.profile, median_scale=median_scale)
@@ -383,6 +411,18 @@ def _encode(g: GaussianSet, duration_sec, opts, audio, camera) -> bytes:
             anchor.check()
             emit(anchor.encode(trailer=opts.record_trailers.get(op.GEODETIC_ANCHOR, b"")))
 
+    # The object layer, after provenance and in ascending opcode order: the table (0x24)
+    # that names the objects, then the tracks (0x25) that move them. Advisory front matter
+    # in the same sense as provenance — a reader that skips it decodes a valid base scene.
+    if opts.objects is not None:
+        opts.objects.check()
+        if opts.objects.table is not None:
+            opts.objects.table.check()
+            emit(opts.objects.table.encode(trailer=opts.record_trailers.get(op.OBJECT_TABLE, b"")))
+        for track in opts.objects.tracks:
+            track.check()
+            emit(track.encode(trailer=opts.record_trailers.get(op.OBJECT_TRACK, b"")))
+
     if camera is not None:
         emit(
             rec.Camera(
@@ -423,6 +463,24 @@ def _encode(g: GaussianSet, duration_sec, opts, audio, camera) -> bytes:
                     encode_stream(op.A_SOURCE_INDEX, _ids(g.source_index, members), codec=opts.codec, level=opts.level),
                 ]
                 if opts.preserve_source_ids
+                else []
+            )
+            # Attribute streams carry signed 32-bit symbols. Preserve all u32 labels by
+            # writing their two's-complement i32 code; the decoder reverses that bit view.
+            # This is exact and is still not a quantization grid.
+            + (
+                [
+                    encode_stream(
+                        op.A_OBJECT_ID,
+                        _object_id_codes(g.object_id, members),
+                        codec=opts.codec,
+                        level=opts.level,
+                        # Adjacent u32 ids can cross the signed bridge and produce a
+                        # 33-bit delta even though each raw code is exactly 32 bits.
+                        allow_delta=False,
+                    )
+                ]
+                if g.object_id is not None
                 else []
             )
         )
@@ -499,6 +557,12 @@ def _ids(arr, members) -> np.ndarray:
     if arr is None:
         return np.asarray(members, dtype=np.int64)
     return np.asarray(arr, dtype=np.int64)[members]
+
+
+def _object_id_codes(arr, members) -> np.ndarray:
+    """Map exact u32 labels onto the stream's complete signed-32-bit symbol domain."""
+    ids = np.asarray(arr, dtype=np.uint32)[members]
+    return ids.view(np.int32).astype(np.int64)
 
 
 def _verify_chunk(g, members, chunk_blob, steps, bounds, worst, origin, windows, cutoff) -> None:

@@ -19,6 +19,7 @@ from . import opcode as op
 from . import records as rec
 from .exceptions import MalformedFile, TruncatedFile, UnsupportedCodec
 from .model import AudioTrack, CameraTrajectory, GaussianSet
+from .object_layer import ObjectLayer
 from .provenance import Provenance
 from .quantization import (
     DEFAULT_CUTOFF,
@@ -66,6 +67,10 @@ class Scene:
     #: carried none, which is the common case and not an error: absence costs nothing
     #: and no Header flag announces the family, so this is filled by the walk itself.
     provenance: Provenance = field(default_factory=Provenance)
+    #: The object layer the file carried (spec sections 5.15.6-5.15.7): the Object Table and the
+    #: SE(3) tracks. Empty when the file names no objects, which is the common case and
+    #: not an error, exactly as with provenance.
+    objects: ObjectLayer = field(default_factory=ObjectLayer)
     chunk_index: list[rec.ChunkIndexEntry] = field(default_factory=list)
     summary_offsets: list[rec.SummaryOffset] = field(default_factory=list)
     #: Whether the Footer's summary CRC matched, or `None` when the file declares none.
@@ -75,6 +80,24 @@ class Scene:
     #: test can prove they were skipped rather than tripped over.
     skipped_opcodes: list[int] = field(default_factory=list)
     truncated: bool = False
+
+    def state_at(self, t: float) -> dict:
+        """Reconstruct gaussian state at `t`, including authoritative object tracks.
+
+        The temporal model produces the base centers and orientations first. The matching
+        Object Track is then applied exactly once, which is the normative order in spec
+        section 3. Decoding ends at the returned gaussian state.
+        """
+        state = self.gaussians.state_at(t, self.header.cutoff)
+        centers, orientations = self.objects.apply(
+            centers=state["centers"],
+            orientations=state["orientations"],
+            object_ids=state["object_id"],
+            t=t,
+        )
+        state["centers"] = centers
+        state["orientations"] = orientations
+        return state
 
 
 def steps_from(q: rec.Quantization) -> Steps:
@@ -142,6 +165,7 @@ def decode_streams(
             "sigma_t": np.zeros(0),
             "window_index": np.zeros(0, dtype=np.int64),
             "source_index": None,
+            "object_id": None,
         }
 
     never_fades = got[op.A_FLAGS][:, 0] != 0
@@ -155,6 +179,24 @@ def decode_streams(
     motion_step = motion_steps(
         life_class(sigma_bins, steps.sigma_log, never_fades, win_len, support_k(cutoff)), steps.motion
     )[:, None]
+    object_id = None
+    if op.A_OBJECT_ID in got:
+        codes = got[op.A_OBJECT_ID]
+        if codes.shape[1] != 1:
+            raise MalformedFile(
+                f"the object_id stream declares {codes.shape[1]} channels, the format defines 1",
+                code="invalid-object-id-stream",
+            )
+        codes = codes[:, 0]
+        if np.any(codes < np.iinfo(np.int32).min) or np.any(codes > np.iinfo(np.int32).max):
+            index = int(np.flatnonzero((codes < np.iinfo(np.int32).min) | (codes > np.iinfo(np.int32).max))[0])
+            raise MalformedFile(
+                f"object_id element {index} has signed stream code {int(codes[index])}; "
+                "expected a signed 32-bit code that maps exactly onto u32",
+                code="invalid-object-id-stream",
+            )
+        object_id = codes.astype(np.int32).view(np.uint32)
+
     return {
         "positions": dequantize(got[op.A_POSITION], steps.pos, origin),
         "scales": np.exp(dequantize(got[op.A_SCALE], steps.scale_log)),
@@ -172,6 +214,8 @@ def decode_streams(
         "sigma_t": sigma,
         "window_index": window_index,
         "source_index": got[op.A_SOURCE_INDEX][:, 0] if op.A_SOURCE_INDEX in got else None,
+        # Exact: signed stream codes are the two's-complement bit view of all u32 ids.
+        "object_id": object_id,
     }
 
 
@@ -343,6 +387,16 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
                 scene.provenance.trajectories.append(rec.RigTrajectory.parse(record.content))
             elif record.opcode == op.GEODETIC_ANCHOR:
                 scene.provenance.anchors.append(rec.GeodeticAnchor.parse(record.content))
+            elif record.opcode == op.OBJECT_TABLE:
+                if scene.objects.table is not None:
+                    raise MalformedFile(
+                        f"a second ObjectTable record appears at byte {record.offset}; "
+                        "a file may carry exactly one scene-wide object table",
+                        code="duplicate-object-table",
+                    )
+                scene.objects.table = rec.ObjectTable.parse(record.content)
+            elif record.opcode == op.OBJECT_TRACK:
+                scene.objects.tracks.append(rec.ObjectTrack.parse(record.content))
             elif record.opcode == op.STATISTICS:
                 scene.statistics = rec.Statistics.parse(record.content)
             elif record.opcode == op.CHUNK_INDEX:
@@ -379,6 +433,7 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
     # the recovery contract is that everything complete before the cut still stands.
     if not truncated:
         scene.provenance.check()
+        scene.objects.check()
 
     scene.header = header
     scene.quantization = quant
@@ -408,6 +463,17 @@ def _assemble(chunks: list[dict], windows, header, chunk_bands=None) -> Gaussian
     idx = np.concatenate([c["window_index"] for c in chunks])
     check_window_indices(idx, len(table))
     src = [c["source_index"] for c in chunks]
+    oid = [c["object_id"] for c in chunks]
+    object_id = (
+        np.concatenate(
+            [
+                np.zeros(len(chunk["mu_t"]), dtype=np.uint32) if ids is None else ids
+                for chunk, ids in zip(chunks, oid, strict=True)
+            ]
+        )
+        if any(ids is not None for ids in oid)
+        else None
+    )
     sh = merge_chunk_bands([len(c["mu_t"]) for c in chunks], chunk_bands or [])
     return GaussianSet(
         positions=np.concatenate([c["positions"] for c in chunks]).astype(np.float32),
@@ -422,4 +488,5 @@ def _assemble(chunks: list[dict], windows, header, chunk_bands=None) -> Gaussian
         sh=sh,
         sh_degree=header.sh_degree,
         source_index=np.concatenate(src) if all(s is not None for s in src) else None,
+        object_id=object_id,
     )

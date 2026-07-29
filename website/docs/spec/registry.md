@@ -28,7 +28,9 @@ top-level record — see spec §5.6.
 | 10     | `window_index`   | 1        | index into the Window Table                                      |
 | 11     | `source_group`   | 1        | optional producer-side grouping id                               |
 | 12     | `source_index`   | 1        | optional producer-side stable id                                 |
-| 13–31  | reserved         |          |                                                                  |
+| 13     | reserved         |          | `gaussian_id` for the not-yet-normative keyframe-delta proposal  |
+| 14     | `object_id`      | 1        | exact `u32` membership; same-bit signed stream code; spec §6.6   |
+| 15–31  | reserved         |          |                                                                  |
 | 32     | `surface_normal` | 3        | reserved — relighting block, see below                           |
 | 33     | `base_color`     | 3        | reserved — relighting block, see below                           |
 | 34     | `roughness`      | 1        | reserved — relighting block, see below                           |
@@ -38,15 +40,15 @@ top-level record — see spec §5.6.
 | 48–63  | reserved         |          |                                                                  |
 | 64–127 | private          |          | application-defined, readers skip                                |
 
-Ids 0–10 are required in every chunk. Ids 11 and 12 are optional and exist so a producer can
-round-trip stable identities through the format; readers that do not need them skip the streams.
+Ids 0–10 are required in every chunk. Ids 11, 12 and 14 are optional. The first two let a producer
+round-trip stable source identities; id 14 carries exact object membership and defaults to `0` when
+omitted from a chunk.
 
-Ids 13–63 are the reserved pool for per-gaussian attributes a later revision may define. Spec
-§5.15.6 already points the per-gaussian label and segmentation work at this range; ids 32–47 are
-further carved out of it as the **relighting block** below, so the two future directions do not
-compete for the same numbers. Everything in 13–63 not named here stays reserved: a version-1 writer
-emits none of it, and a version-1 reader that meets an id it does not know treats the stream as
-unknown and skips it by its `payload_length` (§5.6), exactly as it does for a private-range id.
+Ids 13–63 are the extension pool for per-gaussian attributes. Object membership has taken id 14; ids
+32–47 remain the **relighting block** below. Everything in 13–63 not defined here stays reserved: a
+version-1 writer emits none of it, and a version-1 reader that meets an id it does not know treats
+the stream as unknown and skips it by its `payload_length` (§5.6), exactly as it does for a
+private-range id.
 
 **Spherical harmonics have no attribute id.** They travel in SH Band Stream records (`0x07`), one
 per band, and the stream header inside such a record carries `0x07` in its `attribute_id` field —
@@ -284,6 +286,7 @@ mid-decode.
 | `""`          | Nothing beyond the base format                                                                                                                                                                                                                                       |
 | `capture`     | Content fitted from a real capture: finite validity windows, a chunk index with more than one entry, statistics present. Seeks cheaply (spec §8)                                                                                                                     |
 | `baked`       | Content baked from a temporal field or otherwise long-lived: gaussians may span the whole timeline, the index may hold a single entry, and an instant may cost the whole scene. Correct, but not cheap to seek                                                       |
+| `objects`     | Every non-empty chunk carries `object_id`, and one Object Table is present. Tracks and embeddings remain optional                                                                                                                                                    |
 | `relightable` | **Reserved for a future relighting extension; not normative; a version-1 writer MUST NOT emit it.** Would promise the relighting-block attributes (see "Attribute ids") are present, so a consumer can reject a radiance-only file up front when it needs to relight |
 
 Profiles constrain writers, not readers: a reader MUST be able to read any conforming file
@@ -393,7 +396,7 @@ partly apply, and spec §5.15.3 says what to do about that — decline, and say 
 
 ### Trajectory interpolation
 
-Used by the Rig Trajectory record's `interpolation` field.
+Used by the Rig Trajectory and Object Track records' `interpolation` fields.
 
 | value | name     | notes                                                                         |
 | ----- | -------- | ----------------------------------------------------------------------------- |
@@ -417,6 +420,8 @@ Used by Metadata records and the Header's `attributes` map. All optional.
 | `license`                        | licence of the scene content                                                                                                                     |
 | `title`, `description`, `author` | human-facing scene identification                                                                                                                |
 | `application`                    | producer of any private-range records in the file                                                                                                |
+| `object_track_role`              | `enhancement` (default) or `authoritative`; whether tracks enhance world-correct base positions or carry an object's world motion                |
+| `object_count`                   | advisory decimal count of objects, for selection before the Object Table is fetched                                                              |
 
 `coordinate_system` is superseded rather than removed. Files that predate the Coordinate Frame
 record use it, it is the only way to say anything about a frame in a file whose reader is older than

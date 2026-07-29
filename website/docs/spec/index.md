@@ -43,7 +43,7 @@ nothing beyond that. How that state is drawn is out of scope.
 
 ---
 
-## 3. Rendering semantics
+## 3. Reconstruction semantics
 
 A decoder reconstructs, for each gaussian, this state:
 
@@ -58,19 +58,35 @@ A decoder reconstructs, for each gaussian, this state:
 | `sigma_t`          | f32     | temporal standard deviation, seconds; `+inf` means "never fades" |
 | `win_lo`, `win_hi` | f32     | validity window, seconds                                         |
 | `sh[band]`         | varies  | optional view-dependent colour coefficients                      |
+| `object_id`        | u32     | optional object membership; `0` means background / unassigned    |
 
 At scene time `t`:
 
 ```
 visible  =  win_lo <= t < win_hi  AND  marginal >= cutoff
 marginal =  sigma_t == +inf ? 1 : exp(-0.5 * ((t - mu_t) / sigma_t)^2)
-center   =  position + motion * (t - mu_t)
+base_center = position + motion * (t - mu_t)
+center      = base_center
+orientation = rotation
 opacity  =  color.a * marginal
 ```
 
 `cutoff` is declared in the Header (default `0.05`). Decoders MUST apply the window test; it is what
 allows one file to hold gaussians fitted independently over different spans of the timeline without
 them bleeding into each other's intervals.
+
+When a non-zero `object_id` has an Object Track (§5.15.7), the decoder then applies that track's
+pose `(R(t), T(t))` exactly once, after reconstructing the base state:
+
+```
+center      = R(t) * base_center + T(t)
+orientation = R(t) ⊗ rotation
+```
+
+The track is rigid: it changes only center and orientation. Scale, colour, temporal fields,
+visibility and opacity remain the base values. A gaussian that also carries per-gaussian motion
+therefore composes base first, track second; neither source of motion replaces the other. A gaussian
+with `object_id = 0`, or whose object has no track, keeps the base center and orientation.
 
 ### 3.1 Visibility profiles
 
@@ -264,6 +280,10 @@ unit of the attribute they name, and the `sh` keys are in **code units** — a s
 a coefficient's — because that is the domain the bytes live in. A reader MAY ignore the map entirely
 — it is a producer's declaration, not an instruction — but a reader that surfaces it MUST use these
 names, so that two readers report the same number for the same file.
+
+`object_id` is an exact label (§6.6), not a metric value. A writer MUST NOT put `object_id` in
+`bounds`, and a reader MUST refuse a Quantization record that does: there is no meaningful error
+bound between two different labels.
 
 **The SH bit depths are a declaration, not an instruction.** A writer that quantizes coefficients by
 bit depth MUST emit one entry per band it writes, in band order, each in the range 3–8, and MUST set
@@ -487,8 +507,9 @@ Lets a reader range-read one class of index record without reading the others.
 ### 5.15 Provenance family — opcodes `0x20`–`0x2F`
 
 Scenes reconstructed from sensors carry context that consumers downstream — analysis, simulation,
-quality review — need and that the rest of the format does not express. Four of the family's opcodes
-are defined here; the rest stay reserved (§5.15.6).
+quality review — need and that the rest of the format does not express. The family also carries the
+scene's optional object table and rigid object tracks. Six opcodes are defined here; the rest stay
+reserved (§5.15.8).
 
 | opcode        | record             | §       | status   |
 | ------------- | ------------------ | ------- | -------- |
@@ -496,7 +517,9 @@ are defined here; the rest stay reserved (§5.15.6).
 | `0x21`        | Sensor Calibration | §5.15.3 | defined  |
 | `0x22`        | Rig Trajectory     | §5.15.4 | defined  |
 | `0x23`        | Geodetic Anchor    | §5.15.5 | defined  |
-| `0x24`–`0x2F` | —                  | §5.15.6 | reserved |
+| `0x24`        | Object Table       | §5.15.6 | defined  |
+| `0x25`        | Object Track       | §5.15.7 | defined  |
+| `0x26`–`0x2F` | —                  | §5.15.8 | reserved |
 
 The first three run in dependency order, lowest first: a sensor's extrinsic and a rig's pose are
 poses **in** a frame, and `0x20` is the record that names that frame. Geodetic Anchor holds `0x23`
@@ -507,10 +530,11 @@ Nothing requires a reader to see these in any order; records are skipped and dis
 not by position. But a writer that emits them in ascending opcode order produces a file whose front
 matter reads close to the order a human would explain it.
 
-Every one of the four is **independently optional**. A file may carry a frame and nothing else, or
-sensors with no frame, or a rig trajectory alone. The records reference each other by name where
-they compose, and every such reference either resolves or the file is refused — there is no
-half-resolved state.
+Every record in the family is **optional**. A file may carry a frame and nothing else, a rig
+trajectory alone, object membership without a table, or a track for an object the table does not
+name. References among the four capture-provenance records resolve as their sections require. The
+three pieces of the object layer — membership, table and tracks — are independently optional by
+design (§6.6).
 
 These records are **provisional** in the sense of §4.4: they are not frozen, and their fields may
 change before version 1 is declared stable. They may only be extended by appending, like every other
@@ -518,29 +542,26 @@ record.
 
 #### 5.15.1 What the family costs when it is absent
 
-**Nothing, and that is a rule rather than an accident.** A scene with no provenance carries no
-Coordinate Frame record, no Sensor Calibration record, no Rig Trajectory record, no placeholder and
-no reserved bytes. All three records are OPTIONAL in every file, whatever its profile.
+**Nothing, and that is a rule rather than an accident.** A scene that uses none of this family
+carries none of its records, no placeholder and no reserved bytes. Every record is optional,
+whatever the profile, except that the `objects` profile makes its own promises (registry).
 
 This is the audio precedent (§7) applied one record family further out, and it decides one question
 explicitly: **the Header gets no presence flags for provenance.** Audio has one because audio
 presence changes how the scene's clock is defined — when a track is present the audio clock is the
 timing master — so a reader must know the answer _before_ it can interpret a time, and the Header is
-the only place it can learn that without a read it might not otherwise make. Provenance changes
-nothing a decoder does: §3's arithmetic, §6's grids and §8's seek rule are identical whether these
-records are present or absent. A consumer that wants them is already walking the front matter
-record-by-record — that walk is paid for by the Audio record regardless — and learns which
-provenance records exist, and their byte ranges, at no read beyond it. A flag would announce one
-record-header hop early something a reader is about to learn anyway, and would spend the Header's
-scarce reserved flag bits doing it.
+the only place it can learn that without a read it might not otherwise make. A consumer already
+walks the front matter record-by-record and learns which family records exist, and their byte
+ranges, at no read beyond it. A flag would announce one record-header hop early something a reader
+is about to learn anyway, and would spend the Header's scarce reserved flag bits doing it.
 
 So the discovery rule for this family is: **walk the front matter; what is there is there.** A
 reader MUST NOT infer the absence of a provenance record from anything but the walk, and MUST NOT
 treat absence as an error or a warning. A file with no georeference is not an incomplete file.
 
-**Provenance records are not summary records** (§4.5). They carry content, and a Rig Trajectory's
-content is unbounded — a ten-minute capture logged at 100 Hz is sixty thousand samples. They belong
-with the other content records ahead of the chunks, for exactly the reason attachments do.
+**These are not summary records** (§4.5). They carry content, and trajectories are unbounded — a
+ten-minute capture logged at 100 Hz is sixty thousand samples. They belong with the other content
+records ahead of the chunks, for exactly the reason attachments do.
 
 #### 5.15.2 Coordinate Frame — opcode `0x20`
 
@@ -760,29 +781,79 @@ At most one Geodetic Anchor may name any one frame. **A reader MUST refuse a fil
 for the same frame**, naming it, for the same reason it refuses two frames or two sensors sharing a
 name: picking one silently is a coin toss with a scene's location on it.
 
-#### 5.15.6 Still reserved — opcodes `0x24`–`0x2F`
+#### 5.15.6 Object Table — opcode `0x24`
 
-**Reserved, not normative, and not to be emitted by a version-1 writer.** Recorded so the shape is
-known and so the opcodes are not spent on something else:
+One scene-wide record names and describes objects. Everything in it is advisory: no field in the
+table transforms a gaussian. Object membership comes from the `object_id` attribute (§6.6), and
+geometry changes only through Object Tracks (§5.15.7).
 
-- **Source timing** — per-chunk or per-gaussian acquisition timestamps, so a consumer can
-  distinguish scene time from capture time when a rolling or multi-sensor capture makes them differ.
-- **Semantic and instance labels** — per-gaussian class or instance identifiers.
-- **Static and dynamic segmentation** — which gaussians belong to the fixed scene and which to
-  moving content, which a producer often knows and a consumer otherwise has to infer.
+```
+u32     object_count
+u16     embedding_dim         -- dimensionality of every embedding; 0 = no embedding space
+        object_count × {
+  u32     object_id
+  string  label
+  f32[3]  anchor
+  u8      dynamics_present    -- 0 or 1
+  [ f32[3] velocity           -- present iff dynamics_present == 1
+    f32[3] angular_velocity
+    f32[3] acceleration ]
+  u8      has_embedding       -- present iff embedding_dim > 0; 0 or 1
+  [ embedding_dim × f32 embedding ] -- present iff embedding_dim > 0 and has_embedding == 1
+}
+```
 
-The last two are grouped for a reason that decides their eventual shape: both are **per-gaussian**,
-and per-gaussian data in this format travels in attribute streams inside a chunk (§5.6, §6.1), not
-in a front-matter record. Their design is therefore an attribute-id question — how a label id is
-quantized, whether a scene-wide label table lives in front matter, what a reader does with a stream
-it cannot name — and it is a larger question than the three records defined above, which is why they
-are not answered here. The reserved attribute ids in the registry's `13`–`63` range are where that
-work will land.
+`object_id` matches the per-gaussian attribute. Entries MUST have distinct ids; a reader MUST refuse
+a table with two entries for the same id, naming it. An entry for `0` is legal and may label the
+background. `label` is free-form UTF-8 and may be empty.
 
-Some of this is expressible today as metadata keys (see the registry) for producers who need it
-before the records exist. The distinction is that metadata is free-form text and these records are
-typed and indexable; a scene that only needs to say "z is up" may still say it in metadata, though
-§5.15.2 is now the better answer even for that.
+`anchor` is a representative point for labelling or navigation. It is not a transform pivot.
+`velocity`, `angular_velocity` and `acceleration` are an optional coarse motion summary. They never
+replace an Object Track and reconstruction reads none of them. `embedding` is one optional
+text-aligned vector per object. One file declares one embedding space and dimension; cosine
+similarity is the comparison for a query encoded into the same space, while the model that creates
+either vector is outside the format.
+
+Every stored `f32` MUST be finite. `dynamics_present` and `has_embedding` MUST be `0` or `1`.
+`object_count`, `embedding_dim` and every conditional block MUST be checked against the record's
+remaining bytes before allocation. A reader MUST refuse a declared count that cannot fit, naming the
+count and record.
+
+A file carries at most one Object Table. A reader MUST refuse a second one. A missing table is valid
+even when gaussians carry non-zero object ids or Object Tracks exist: grouping, description and
+motion are independent capabilities.
+
+#### 5.15.7 Object Track — opcode `0x25`
+
+One record carries one object's rigid pose sampled over the scene clock:
+
+```
+u32     object_id
+u8      interpolation      -- trajectory interpolation registry: 0 linear, 1 step
+u32     sample_count
+        sample_count × { f64 time; f64[4] rotation; f64[3] translation }
+```
+
+The pose is relative to the object's stored rest configuration. At time `t`, it transforms the fully
+reconstructed base center and orientation by §3. It does not replace the base state and does not
+change scale, colour, temporal fields, visibility or opacity.
+
+The record uses Rig Trajectory's pose rules (§5.15.4): times MUST be finite and strictly increasing;
+rotations are `xyzw` quaternions, renormalized by readers, with zero or non-finite norms refused;
+translations MUST be finite; `linear` lerps translation and shortest-arc slerps rotation; `step`
+holds the earlier pose; and queries outside the sample range clamp to the nearest sample rather than
+extrapolate. A zero-sample track has no pose and is read as absent; one sample is a static
+placement. `sample_count` MUST be checked against the record's remaining bytes before allocation.
+
+`object_id` MUST NOT be `0`, because `0` means no object. A file carries at most one track for any
+object; a reader MUST refuse a duplicate and name the id. A track whose id appears in no gaussian or
+Object Table entry remains valid.
+
+#### 5.15.8 Still reserved — opcodes `0x26`–`0x2F`
+
+**Reserved, not normative, and not to be emitted by a version-1 writer.** This range remains for
+source timing: per-chunk or per-gaussian acquisition timestamps that distinguish scene time from
+capture time when a rolling or multi-sensor capture makes them differ.
 
 ---
 
@@ -793,7 +864,7 @@ typed and indexable; a scene that only needs to say "z is up" may still say it i
 A chunk stores one Attribute Stream per attribute, structure-of-arrays, all with the same
 `element_count` equal to the chunk's `count`. Registry §"Attribute ids" lists the ids; the required
 set for version 1 is position, scale, rotation index, rotation, colour, opacity, motion, `mu_t`,
-`sigma_t`, flags and window index.
+`sigma_t`, flags and window index. `source_group`, `source_index` and `object_id` are optional.
 
 Gaussians within a chunk MAY be reordered freely by the encoder; nothing in the format depends on
 their order, and readers MUST NOT rely on it.
@@ -919,6 +990,33 @@ When a file declares per-band depths, `step_sh` MUST carry the **coarsest** band
 `bounds.sh` the coarsest band's bound. Both fields predate per-band depths and a consumer may read
 only them; the worst case is the only value that is true of the whole file rather than of some of
 it.
+
+### 6.6 Object membership
+
+`object_id` is an optional one-channel `u32` Attribute Stream with attribute id `14`. `0` means
+background / unassigned. A chunk that omits the stream is read as though every gaussian in that
+chunk carried `0`; mixed scenes may therefore omit it from chunks containing only background.
+
+The id is exact and is never dequantized. Attribute Stream symbols are signed 32-bit values after
+zigzag decoding, while the id owns the full unsigned 32-bit domain. The bridge is a same-bits
+two's-complement view:
+
+- before stream encoding, a writer views each `u32` id as the `i32` with the same 32 bits;
+- after stream decoding, a reader verifies the code fits `i32` and views those same bits as `u32`.
+
+Thus `0x7FFF_FFFF` maps to `2147483647`, `0x8000_0000` maps to `-2147483648`, and `0xFFFF_FFFF` maps
+to `-1`. This mapping is bijective and changes no label. A writer MAY delta-code the signed codes
+only when every resulting delta fits the stream's 32-bit symbol width; raw mode is always available.
+
+The Object Table (§5.15.6), Object Tracks (§5.15.7) and `object_id` stream are independently
+optional. A file with ids and no table still groups gaussians; a table may describe an object no
+current chunk carries; and a track may move an object without a table entry. None is a reason to
+invent or discard another.
+
+At reconstruction time, a track is selected by the gaussian's `object_id` and composed exactly as §3
+defines: first reconstruct the complete base state, including per-gaussian motion, then apply the
+one matching rigid track to center and orientation. At most one track may name an id, so the mapping
+is unambiguous. Decoding ends at that reconstructed gaussian state.
 
 ---
 
@@ -1057,6 +1155,15 @@ and the text was the bug.
 | §6.5 added: a stored SH byte is the coefficient `-4 + b * 8 / 255`, on a fixed interval                                         | clarification, rule added |
 | §5.3/§6.5 added: per-band SH bit depths, appended to the Quantization record                                                    | rule added                |
 | Registry: reserved attribute ids 32–47 and the `relightable` profile for a future relighting extension; named, not defined      | reserved, rule added      |
+| §3/§5.15.6–§6.6 added: exact `object_id`, Object Table `0x24`, Object Track `0x25`, and base-then-track composition             | rule added                |
+
+The object-layer row is additive and changes no existing file. Attribute id `14` and opcodes
+`0x24`/`0x25` were reserved and unemitted; a file that carries none of them is byte-identical to the
+file it was before the layer existed. A reader that does not know the layer skips its streams and
+records by their declared lengths and reconstructs the valid base scene. A reader that does know it
+additionally returns exact membership, descriptions, and the post-track center and orientation
+defined in §3. The conformance corpus contains a tracked-object variant whose streamed and indexed
+reconstructions agree on that post-transform state.
 
 The relighting row reserves names and defines nothing. It changes no existing file — it forbids
 nothing a version-1 writer does today, adds no field to any record, and touches no byte in any of

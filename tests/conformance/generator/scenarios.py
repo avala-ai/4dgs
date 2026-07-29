@@ -55,6 +55,7 @@ FLAGS = (
     "WithGeodetic",  # ... carrying the optional geodetic anchor
     "WithSensors",  # Sensor Calibration records (0x21), a camera and a lidar
     "WithRig",  # a Rig Trajectory (0x22), with the sensors posed against it
+    "WithObjects",  # object_id, Object Table and a moving rigid Object Track
 )
 
 #: Flags that put a provenance record in the file. The harness uses this to skip these
@@ -245,6 +246,11 @@ def variants() -> list[tuple[Scenario, tuple[str, ...]]]:
     # takes a record's length from its header rather than from where its own knowledge
     # stops has to hold for them on the day they ship, not after someone appends to one.
     add(ten, "WithFrame", "WithGeodetic", "WithSensors", "WithRig", "AddExtraDataToRecords")
+
+    # Object membership plus both front-matter records. Long-lived gaussians keep every
+    # probe visible, so the canonical states test the identity, interpolated, and clamped
+    # track poses rather than accidentally testing an empty instant.
+    add(SCENARIOS[5], "WithObjects")
 
     # Streaming without an index: a writer piping to stdout cannot seek back.
     out.append((ten, ("UseCrc",)))

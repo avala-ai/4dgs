@@ -41,8 +41,16 @@ RIG_TRAJECTORY = 0x22
 # one. An opcode is not something a later revision gets to renumber.
 GEODETIC_ANCHOR = 0x23
 
-#: First opcode of the provenance family, and one past its last. `0x24`-`0x2F` are
-#: reserved for source timing and the per-gaussian label work (spec section 5.15.6).
+#: The object layer, spec sections 5.15.6-5.15.7. The Object
+#: Table names the scene's objects (labels, embeddings, anchors); the SE(3) Track carries
+#: one object's rigid pose over the scene clock. Both are advisory front matter in the
+#: provenance family's sense — a reader that skips them decodes a valid base scene — and
+#: they took the next two free numbers after the georeference.
+OBJECT_TABLE = 0x24
+OBJECT_TRACK = 0x25
+
+#: First opcode of the provenance family, and one past its last. `0x26`-`0x2F` are
+#: reserved for source timing (spec section 5.15.8).
 PROVENANCE_START = 0x20
 PROVENANCE_END = 0x30
 
@@ -72,6 +80,8 @@ NAMES = {
     SENSOR_CALIBRATION: "SensorCalibration",
     RIG_TRAJECTORY: "RigTrajectory",
     GEODETIC_ANCHOR: "GeodeticAnchor",
+    OBJECT_TABLE: "ObjectTable",
+    OBJECT_TRACK: "ObjectTrack",
 }
 
 
@@ -110,6 +120,13 @@ A_SOURCE_INDEX = 12
 #: `gaussian-birth` one. Distinct from `A_SOURCE_INDEX`, which is a producer-side handle a
 #: reader may skip; this is what a delta names its gaussians by.
 A_GAUSSIAN_ID = 13
+
+#: Object membership, spec section 6.6. A `u32`, `0` = background/unassigned. Optional
+#: and orthogonal to the temporal model: a `gaussian-birth` or `keyframe-delta` file may
+#: carry it. It is EXACT — an id is a label, not a metric, so it is never dequantized and
+#: the Quantization record carries no step or bound for it, exactly as for the other index
+#: attributes (`A_ROTATION_INDEX`, `A_WINDOW_INDEX`).
+A_OBJECT_ID = 14
 
 REQUIRED_ATTRIBUTES = (
     A_POSITION,

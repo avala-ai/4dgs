@@ -12,6 +12,7 @@ nobody remembers.
 from __future__ import annotations
 
 import math
+import operator
 from dataclasses import dataclass, field
 
 from . import opcode as op
@@ -19,6 +20,7 @@ from .exceptions import MalformedFile
 from .serialization import (
     Cursor,
     put_blob,
+    put_f32s,
     put_f64,
     put_f64s,
     put_record,
@@ -32,6 +34,7 @@ from .serialization import (
 
 FLAG_HAS_AUDIO = 1 << 0
 FLAG_CHUNKS_COMPRESSED = 1 << 1
+_F32_MAX = float.fromhex("0x1.fffffep+127")
 
 
 @dataclass
@@ -129,6 +132,12 @@ class Quantization:
     sh_bit_depths: list[int] = field(default_factory=list)
 
     def encode(self, trailer: bytes = b"") -> bytes:
+        if "object_id" in self.bounds:
+            raise MalformedFile(
+                f"Quantization.bounds contains object_id={self.bounds['object_id']!r}; "
+                "object_id is an exact label and MUST NOT carry a bound",
+                code="invalid-object-id-bound",
+            )
         body = (
             put_string(self.scheme)
             + put_f64s(self.pos_origin)
@@ -157,6 +166,14 @@ class Quantization:
         scheme = c.string()
         origin = c.f64s(3)
         steps = c.f64s(8)
+        step_sh = c.u8()
+        bounds = c.str_map()
+        if "object_id" in bounds:
+            raise MalformedFile(
+                f"Quantization.bounds contains object_id={bounds['object_id']!r}; "
+                "object_id is an exact label and MUST NOT carry a bound",
+                code="invalid-object-id-bound",
+            )
         return Quantization(
             scheme=scheme,
             pos_origin=origin,
@@ -168,8 +185,8 @@ class Quantization:
             step_motion=steps[5],
             step_time=steps[6],
             step_sigma_log=steps[7],
-            step_sh=c.u8(),
-            bounds=c.str_map(),
+            step_sh=step_sh,
+            bounds=bounds,
             sh_bit_depths=_sh_bit_depths(c),
         )
 
@@ -874,6 +891,12 @@ class RigTrajectory:
         and a repeated or reversed timestamp makes that interval ambiguous. There is
         no reading of such a trajectory that is merely approximate.
         """
+        if self.interpolation not in (TRAJECTORY_LINEAR, TRAJECTORY_STEP):
+            raise MalformedFile(
+                f"trajectory {self.name!r} uses interpolation {self.interpolation}; "
+                "this reader supports trajectory interpolation registry values "
+                "0 (linear) and 1 (step)"
+            )
         for i, t in enumerate(self.times):
             if not math.isfinite(t):
                 raise MalformedFile(f"trajectory {self.name!r}: sample {i} has a non-finite time ({t})")
@@ -890,3 +913,277 @@ class RigTrajectory:
             for k, value in enumerate(translation):
                 if not math.isfinite(value):
                     raise MalformedFile(f"trajectory {self.name!r}: sample {i} translation[{k}] is {value}")
+
+
+@dataclass
+class ObjectTableEntry:
+    """One object the file names. Everything here is advisory — no field moves a gaussian.
+
+    `object_id` ties the entry to the gaussians carrying that id in their `object_id`
+    attribute stream. `anchor` is a representative point for a label or a camera focus,
+    NOT the transform pivot (a track folds its pivot into its translation). `dynamics`, when
+    present, is a coarse constant-acceleration summary a consumer may read instead of a
+    track; it is never read by reconstruction. `embedding`, when present, is the object's
+    point in the file's one text-aligned vector space.
+    """
+
+    object_id: int
+    label: str = ""
+    anchor: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    #: (velocity, angular_velocity, acceleration), each a 3-vector, or `None`.
+    dynamics: tuple[list[float], list[float], list[float]] | None = None
+    embedding: list[float] | None = None
+
+
+@dataclass
+class ObjectTable:
+    """The scene-wide table of objects. Opcode 0x24, one per file, front matter.
+
+    `embedding_dim` is declared once for the whole file: every embedding is a vector of
+    exactly this many `f32`, and `0` means the file declares no embedding space at all.
+    A per-entry flag then says whether that object carries a vector, so an object without
+    one costs a single byte.
+    """
+
+    embedding_dim: int = 0
+    entries: list[ObjectTableEntry] = field(default_factory=list)
+
+    def encode(self, trailer: bytes = b"") -> bytes:
+        self.check()
+        body = put_u32(len(self.entries)) + put_u16(self.embedding_dim)
+        for e in self.entries:
+            body += put_u32(e.object_id) + put_string(e.label) + put_f32s(e.anchor)
+            if e.dynamics is None:
+                body += put_u8(0)
+            else:
+                velocity, angular, acceleration = e.dynamics
+                body += put_u8(1) + put_f32s(velocity) + put_f32s(angular) + put_f32s(acceleration)
+            if self.embedding_dim > 0:
+                if e.embedding is None:
+                    body += put_u8(0)
+                else:
+                    body += put_u8(1) + put_f32s(e.embedding)
+        return put_record(op.OBJECT_TABLE, body + trailer)
+
+    @staticmethod
+    def parse(content) -> ObjectTable:
+        c = Cursor(content)
+        count = c.u32()
+        table = ObjectTable(embedding_dim=c.u16())
+        for _ in range(count):
+            entry = ObjectTableEntry(
+                object_id=c.u32(),
+                label=c.string(),
+                anchor=tuple(c.f32s(3)),  # type: ignore[arg-type]
+            )
+            dynamics_present = c.u8()
+            if dynamics_present not in (0, 1):
+                raise MalformedFile(
+                    f"object {entry.object_id}: dynamics_present is {dynamics_present}, expected 0 or 1",
+                    code="invalid-object-presence-flag",
+                )
+            if dynamics_present:
+                entry.dynamics = (c.f32s(3), c.f32s(3), c.f32s(3))
+            if table.embedding_dim > 0:
+                has_embedding = c.u8()
+                if has_embedding not in (0, 1):
+                    raise MalformedFile(
+                        f"object {entry.object_id}: has_embedding is {has_embedding}, expected 0 or 1",
+                        code="invalid-object-presence-flag",
+                    )
+                if has_embedding:
+                    entry.embedding = c.f32s(table.embedding_dim)
+            table.entries.append(entry)
+        table.check()
+        return table
+
+    def check(self) -> None:
+        """Distinct object ids, and every stored float finite.
+
+        A duplicate id makes every reference to that object ambiguous, which is the
+        duplicate-name failure section 5.15.2 refuses for frames — picking one silently
+        is a coin toss. A non-finite embedding is not a weak match, it poisons every
+        cosine similarity computed against it, so it is refused rather than surfaced.
+        """
+        try:
+            embedding_dim = operator.index(self.embedding_dim)
+        except TypeError:
+            embedding_dim = -1
+        if not 0 <= embedding_dim <= 0xFFFF:
+            raise MalformedFile(
+                f"ObjectTable embedding_dim is {self.embedding_dim!r}; expected an integer in [0, 65535]",
+                code="invalid-object-embedding-dim",
+            )
+        seen: set[int] = set()
+        for e in self.entries:
+            try:
+                object_id = operator.index(e.object_id)
+            except TypeError:
+                object_id = -1
+            if not 0 <= object_id <= 0xFFFF_FFFF:
+                raise MalformedFile(
+                    f"ObjectTable entry has object_id {e.object_id!r}; expected an integer in [0, 4294967295]",
+                    code="invalid-object-id",
+                )
+            if e.object_id in seen:
+                raise MalformedFile(
+                    f"two ObjectTable entries describe object {e.object_id}; an object is referred to "
+                    f"by id and nothing else (section 5.15.6)",
+                    code="duplicate-object-id",
+                )
+            seen.add(e.object_id)
+            for k, value in enumerate(e.anchor):
+                _check_object_f32(value, f"object {e.object_id}: anchor[{k}]")
+            if e.dynamics is not None:
+                for name, vector in zip(("velocity", "angular_velocity", "acceleration"), e.dynamics, strict=True):
+                    for k, value in enumerate(vector):
+                        _check_object_f32(value, f"object {e.object_id}: {name}[{k}]")
+            if e.embedding is not None:
+                if self.embedding_dim == 0:
+                    raise MalformedFile(
+                        f"object {e.object_id}: an embedding is present but embedding_dim is 0",
+                        code="invalid-object-embedding-shape",
+                    )
+                if len(e.embedding) != self.embedding_dim:
+                    raise MalformedFile(
+                        f"object {e.object_id}: embedding has {len(e.embedding)} values, "
+                        f"embedding_dim declares {self.embedding_dim}",
+                        code="invalid-object-embedding-shape",
+                    )
+                for k, value in enumerate(e.embedding):
+                    _check_object_f32(value, f"object {e.object_id}: embedding[{k}]")
+
+
+def _check_object_f32(value, field: str) -> None:
+    try:
+        finite = math.isfinite(value)
+        magnitude = abs(value)
+    except (TypeError, OverflowError):
+        finite = False
+        magnitude = math.inf
+    if not finite:
+        raise MalformedFile(f"{field} is {value!r}, expected a finite f32", code="non-finite-object-value")
+    if magnitude > _F32_MAX:
+        raise MalformedFile(
+            f"{field} is {value!r}, outside the finite f32 range [-{_F32_MAX}, {_F32_MAX}]",
+            code="object-value-out-of-f32-range",
+        )
+
+
+@dataclass
+class ObjectTrack:
+    """One object's rigid pose sampled over the scene clock. Opcode 0x25, front matter.
+
+    The Rig Trajectory of section 5.15.4 pointed at a scene object instead of the capture
+    platform: same strictly-increasing times, same clamp-never-extrapolate rule, same
+    shortest-arc slerp. It reuses the trajectory interpolation registry (0 linear, 1 step)
+    and the `pose_at` machinery in `provenance`, which is why it exposes a `name`.
+    """
+
+    object_id: int
+    interpolation: int = TRAJECTORY_LINEAR
+    times: list[float] = field(default_factory=list)
+    rotations: list[list[float]] = field(default_factory=list)
+    translations: list[list[float]] = field(default_factory=list)
+
+    @property
+    def name(self) -> str:
+        """A label for messages, so `pose_at` (written against a trajectory) can reuse it."""
+        return f"object {self.object_id}"
+
+    @property
+    def sample_count(self) -> int:
+        return len(self.times)
+
+    def encode(self, trailer: bytes = b"") -> bytes:
+        self.check()
+        body = put_u32(self.object_id) + put_u8(self.interpolation) + put_u32(len(self.times))
+        for i, t in enumerate(self.times):
+            body += put_f64(t) + put_f64s(self.rotations[i]) + put_f64s(self.translations[i])
+        return put_record(op.OBJECT_TRACK, body + trailer)
+
+    @staticmethod
+    def parse(content) -> ObjectTrack:
+        c = Cursor(content)
+        track = ObjectTrack(object_id=c.u32(), interpolation=c.u8())
+        for _ in range(c.u32()):
+            track.times.append(c.f64())
+            track.rotations.append(c.f64s(4))
+            track.translations.append(c.f64s(3))
+        track.check()
+        return track
+
+    def check(self) -> None:
+        """The object-track rules: not the background, increasing times, real rotations.
+
+        `object_id = 0` is "no object", and a track needs an object to move, so it is
+        refused rather than treated as a whole-scene transform. The time and quaternion
+        rules are section 5.15.4's, for the same reasons: a repeated timestamp makes an
+        interval ambiguous and a zero-norm quaternion is not a rotation.
+        """
+        try:
+            object_id = operator.index(self.object_id)
+        except TypeError:
+            object_id = -1
+        if not 0 <= object_id <= 0xFFFF_FFFF:
+            raise MalformedFile(
+                f"ObjectTrack has object_id {self.object_id!r}; expected an integer in [0, 4294967295]",
+                code="invalid-object-id",
+            )
+        if self.object_id == 0:
+            raise MalformedFile(
+                "an ObjectTrack names object 0, which is background/unassigned; a track needs an object "
+                "to move (section 5.15.7)",
+                code="track-names-background",
+            )
+        if self.interpolation not in (TRAJECTORY_LINEAR, TRAJECTORY_STEP):
+            raise MalformedFile(
+                f"track for object {self.object_id} uses interpolation {self.interpolation}; "
+                "this reader supports trajectory interpolation registry values "
+                "0 (linear) and 1 (step)",
+                code="unsupported-trajectory-interpolation",
+            )
+        if len(self.rotations) != self.sample_count or len(self.translations) != self.sample_count:
+            raise MalformedFile(
+                f"track for object {self.object_id}: {self.sample_count} times, "
+                f"{len(self.rotations)} rotations, and {len(self.translations)} translations; "
+                "every sample needs all three",
+                code="invalid-object-track-shape",
+            )
+        for i, t in enumerate(self.times):
+            if not math.isfinite(t):
+                raise MalformedFile(
+                    f"track for object {self.object_id}: sample {i} has a non-finite time ({t})",
+                    code="non-finite-object-value",
+                )
+            if i and t <= self.times[i - 1]:
+                raise MalformedFile(
+                    f"track for object {self.object_id}: sample {i} is at t={t}, not after sample "
+                    f"{i - 1} at t={self.times[i - 1]}; times must strictly increase (section 5.15.4)",
+                    code="non-increasing-track-time",
+                )
+        for i, quaternion in enumerate(self.rotations):
+            if len(quaternion) != 4:
+                raise MalformedFile(
+                    f"track for object {self.object_id}: sample {i} rotation has {len(quaternion)} values, expected 4",
+                    code="invalid-object-track-shape",
+                )
+            norm = math.sqrt(sum(v * v for v in quaternion))
+            if not math.isfinite(norm) or norm == 0.0:
+                raise MalformedFile(
+                    f"track for object {self.object_id}: sample {i} rotation has no direction (norm {norm})",
+                    code="non-unit-track-quaternion",
+                )
+        for i, translation in enumerate(self.translations):
+            if len(translation) != 3:
+                raise MalformedFile(
+                    f"track for object {self.object_id}: sample {i} translation has "
+                    f"{len(translation)} values, expected 3",
+                    code="invalid-object-track-shape",
+                )
+            for k, value in enumerate(translation):
+                if not math.isfinite(value):
+                    raise MalformedFile(
+                        f"track for object {self.object_id}: sample {i} translation[{k}] is {value}",
+                        code="non-finite-object-value",
+                    )

@@ -32,9 +32,18 @@ from .exceptions import (
 )
 from .gltf import GltfImport, from_gltf, to_gltf
 from .model import AudioTrack, CameraTrajectory, GaussianSet
+from .object_layer import ObjectLayer
 from .provenance import Pose, Provenance, pose_at
 from .quantization import SH_LADDERS, Bounds, Steps, sh_bound, sh_step
-from .records import CoordinateFrame, GeodeticAnchor, RigTrajectory, SensorCalibration
+from .records import (
+    CoordinateFrame,
+    GeodeticAnchor,
+    ObjectTable,
+    ObjectTableEntry,
+    ObjectTrack,
+    RigTrajectory,
+    SensorCalibration,
+)
 from .stream_reader import Scene, read
 from .usd import UsdImport, from_usd, to_usd
 from .writer import WriteOptions, write
@@ -52,6 +61,10 @@ __all__ = [
     "GltfImport",
     "InvalidInput",
     "MalformedFile",
+    "ObjectLayer",
+    "ObjectTable",
+    "ObjectTableEntry",
+    "ObjectTrack",
     "Pose",
     "Provenance",
     "RigTrajectory",
