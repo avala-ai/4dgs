@@ -2,6 +2,9 @@
 
 Packages are versioned and released independently. A release is a tag; CI does the rest.
 
+The log of what has been released is [CHANGELOG.md](CHANGELOG.md) at the root, which indexes the
+per-package changelogs and lists every release in order.
+
 ## Tag format
 
 ```
@@ -18,13 +21,41 @@ package do not repeat its name in the tag; TypeScript ships four, so it does.
 ## Checklist, per package
 
 1. Conformance is green on `main`, including the corpus `--verify` gate.
-2. The package's `CHANGELOG.md` has a released section for this version, following Keep a Changelog.
+2. The package's `CHANGELOG.md` has a released section for this version, following Keep a Changelog
+   — a heading with the version in it, not `Unreleased`. This is a gate, not a reminder: the release
+   workflow extracts that section as the GitHub Release body and fails before it builds anything if
+   there is nothing to extract. Read what the release will say first:
+
+   ```
+   python scripts/changelog_section.py python/CHANGELOG.md 0.2.0
+   ```
+
 3. The version constant in the package source matches the version in the tag. CI asserts this and
    fails the release if they diverge — there is exactly one version constant per package and it is
    the source of truth.
 4. The feature matrix reflects what this version actually implements.
-5. Tag and push. The release workflow builds, verifies the version-vs-tag assertion, and publishes
-   via trusted publishing (no long-lived tokens).
+5. Tag and push. The release workflow builds, verifies the version-vs-tag assertion, publishes via
+   trusted publishing (no long-lived tokens), and creates the GitHub Release.
+6. Add the line to the release log in [CHANGELOG.md](CHANGELOG.md).
+
+## Every release gets a GitHub Release
+
+A tag that publishes a package and leaves nothing behind is a version whose reason lives in a file
+you have to know to look for. So the publish job creates a release for its own tag, and the notes
+are the changelog section rather than a second description written for the occasion — one text, so
+there is nothing for the two to disagree about.
+
+| Field      | Value                                                                                          |
+| ---------- | ---------------------------------------------------------------------------------------------- |
+| Tag        | the release tag exactly as pushed, `releases/python/v0.1.0`                                    |
+| Name       | `fourdgs (Python) 0.1.0`, `fourdgs (Rust) 0.1.0`, `@4dgs/core 0.1.0`                           |
+| Body       | `## What's changed`, that version's changelog section, then the install line and registry link |
+| Prerelease | set while the major version is `0`, because the wire format may still change                   |
+| Assets     | none — the artifact of record is on the registry, published with its provenance attestation    |
+
+**A missing changelog section fails the release.** `scripts/changelog_section.py` runs before the
+build, so a version nobody wrote notes for never reaches a registry; a release with an empty body is
+the drift this rule exists to prevent, and it is easier to refuse the tag than to fix it afterwards.
 
 ## Naming
 

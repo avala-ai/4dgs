@@ -12,6 +12,12 @@ name: Release
 # Every job authenticates with OIDC trusted publishing. There are no stored
 # registry tokens in this repository and there should never be one: a token in
 # a secret is a credential that outlives the job it was created for.
+#
+# Every job also leaves a GitHub Release behind, with that version's changelog
+# section as its body. A tag that publishes a package and leaves no release is a
+# version nobody can read the reason for, and the two drift from there. The
+# section is required: the check runs before the build, so a missing one stops
+# the release while it can still be abandoned.
 
 on:
   push:
@@ -28,6 +34,9 @@ jobs:
     permissions:
       # The only permission a trusted-publishing job needs. No token, no secret.
       id-token: write
+      # For the release step alone. Scoped to this job rather than the workflow,
+      # so the token that publishes has no more reach than it did before.
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -49,6 +58,23 @@ jobs:
             exit 1
           fi
 
+      - name: Release notes from the changelog
+        # Before the build as well, and for the same reason: the section is what
+        # the release will say, and a version that has nothing written about it
+        # should not reach a registry at all.
+        run: |
+          version="${GITHUB_REF#refs/tags/releases/python/v}"
+          python scripts/changelog_section.py python/CHANGELOG.md "$version" > "$RUNNER_TEMP/section.md"
+          {
+            echo "## What's changed"
+            echo
+            cat "$RUNNER_TEMP/section.md"
+            echo
+            echo "---"
+            echo
+            echo "\`pip install fourdgs==$version\` | [PyPI](https://pypi.org/project/fourdgs/$version/) | [full changelog](https://github.com/avala-ai/4dgs/blob/main/python/CHANGELOG.md)"
+          } > "$RUNNER_TEMP/notes.md"
+
       - name: Build
         run: |
           python -m pip install --upgrade build
@@ -59,6 +85,22 @@ jobs:
         with:
           packages-dir: dist
 
+      - name: GitHub Release
+        # After the publish, because a release that points at a version the
+        # registry does not have is worse than no release at all. No assets: the
+        # artifact of record is the one on the registry, published with its
+        # provenance attestation, and a second copy here is a second thing to
+        # keep true.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF#refs/tags/releases/python/v}"
+          # 0.x is a draft wire format; the release page should say so.
+          case "$version" in 0.*) prerelease=--prerelease ;; *) prerelease= ;; esac
+          gh release create "${GITHUB_REF#refs/tags/}" $prerelease \
+            --title "fourdgs (Python) $version" \
+            --notes-file "$RUNNER_TEMP/notes.md"
+
   rust:
     name: Publish fourdgs to crates.io
     if: startsWith(github.ref, 'refs/tags/releases/rust/')
@@ -66,8 +108,14 @@ jobs:
     environment: release
     permissions:
       id-token: write
+      # For the release step alone, as in the Python job.
+      contents: write
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       - name: Version matches the tag
         run: |
@@ -78,6 +126,20 @@ jobs:
             echo "::error::version mismatch — tag $tag, Cargo.toml $manifest"
             exit 1
           fi
+
+      - name: Release notes from the changelog
+        run: |
+          version="${GITHUB_REF#refs/tags/releases/rust/v}"
+          python scripts/changelog_section.py rust/CHANGELOG.md "$version" > "$RUNNER_TEMP/section.md"
+          {
+            echo "## What's changed"
+            echo
+            cat "$RUNNER_TEMP/section.md"
+            echo
+            echo "---"
+            echo
+            echo "\`cargo add fourdgs@$version\` | [crates.io](https://crates.io/crates/fourdgs/$version) | [full changelog](https://github.com/avala-ai/4dgs/blob/main/rust/CHANGELOG.md)"
+          } > "$RUNNER_TEMP/notes.md"
 
       - name: Build
         run: cargo build --manifest-path rust/fourdgs/Cargo.toml
@@ -90,6 +152,16 @@ jobs:
         run: cargo publish --manifest-path rust/fourdgs/Cargo.toml
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF#refs/tags/releases/rust/v}"
+          case "$version" in 0.*) prerelease=--prerelease ;; *) prerelease= ;; esac
+          gh release create "${GITHUB_REF#refs/tags/}" $prerelease \
+            --title "fourdgs (Rust) $version" \
+            --notes-file "$RUNNER_TEMP/notes.md"
 
   typescript:
     name: Publish an @4dgs package to npm
@@ -109,7 +181,8 @@ jobs:
     permissions:
       # The only permission a trusted-publishing job needs. No token, no secret.
       id-token: write
-      contents: read
+      # For the release step alone, as in the Python job.
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -119,6 +192,10 @@ jobs:
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       - name: Version matches the tag
         run: |
@@ -131,6 +208,25 @@ jobs:
             echo "::error::version mismatch — tag $tag, package.json $manifest"
             exit 1
           fi
+
+      - name: Release notes from the changelog
+        # The four packages version together and share one changelog, so the
+        # section is looked up by version and the package name only names the
+        # release.
+        run: |
+          rest="${GITHUB_REF#refs/tags/releases/typescript/}"
+          package="${rest%/v*}"
+          version="${rest##*/v}"
+          python scripts/changelog_section.py typescript/CHANGELOG.md "$version" > "$RUNNER_TEMP/section.md"
+          {
+            echo "## What's changed"
+            echo
+            cat "$RUNNER_TEMP/section.md"
+            echo
+            echo "---"
+            echo
+            echo "\`npm install @4dgs/$package@$version\` | [npm](https://www.npmjs.com/package/@4dgs/$package/v/$version) | [full changelog](https://github.com/avala-ai/4dgs/blob/main/typescript/CHANGELOG.md)"
+          } > "$RUNNER_TEMP/notes.md"
 
       - name: Build what is about to be published
         run: |
@@ -150,3 +246,15 @@ jobs:
           npm --version
           rest="${GITHUB_REF#refs/tags/releases/typescript/}"
           npm publish --workspace "typescript/${rest%/v*}" --access public
+
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rest="${GITHUB_REF#refs/tags/releases/typescript/}"
+          package="${rest%/v*}"
+          version="${rest##*/v}"
+          case "$version" in 0.*) prerelease=--prerelease ;; *) prerelease= ;; esac
+          gh release create "${GITHUB_REF#refs/tags/}" $prerelease \
+            --title "@4dgs/$package $version" \
+            --notes-file "$RUNNER_TEMP/notes.md"
