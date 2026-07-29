@@ -138,7 +138,7 @@ jobs:
             ~/.cargo/bin
             ~/.cargo/registry
             ~/.rustup
-          key: rust-toolchain-stable-${{ hashFiles('rust/**/Cargo.toml', 'Cargo.toml') }}
+          key: rust-toolchain-stable-${{ runner.os }}-${{ hashFiles('rust/**/Cargo.toml', 'Cargo.toml') }}
       - name: Cache the core's build
         uses: actions/cache@v4
         with:

@@ -354,7 +354,7 @@ jobs:
             ~/.cargo/bin
             ~/.cargo/registry
             ~/.rustup
-          key: rust-toolchain-stable-${{ hashFiles('rust/**/Cargo.toml', 'Cargo.toml') }}
+          key: rust-toolchain-stable-${{ runner.os }}-${{ hashFiles('rust/**/Cargo.toml', 'Cargo.toml') }}
       - name: Cache the core's build
         uses: actions/cache@v4
         with:
@@ -431,25 +431,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: swift --version
-      # The toolchain and the core's build are cached separately on purpose: a Rust
-      # source change should not throw away the compiler. On a hit the job fetches no
-      # toolchain at all, which is the point — an unretried network dependency on the
-      # critical path of two workflows is what took conformance red on its first run.
-      - name: Cache the Rust toolchain
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin
-            ~/.cargo/registry
-            ~/.rustup
-          key: rust-toolchain-stable-${{ hashFiles('rust/**/Cargo.toml', 'Cargo.toml') }}
-      - name: Cache the core's build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: rust-build-${{ runner.os }}-${{ hashFiles('rust/**/*.rs', 'rust/**/Cargo.toml') }}
-          restore-keys: rust-build-${{ runner.os }}-
-
+      # No cache here, and that is a measured decision rather than an oversight. The
+      # macOS runner already ships Rust, so there is no toolchain to fetch, and the crate
+      # builds in about four seconds per target. Caching it cost 13s to save and returned
+      # nothing: the whole job runs in under 70s. The Linux container is the only place
+      # the cache pays, because that is the only place a toolchain has to be downloaded.
       - name: Build the core for macOS, visionOS and iOS
         run: |
           rustup target add aarch64-apple-visionos aarch64-apple-ios
