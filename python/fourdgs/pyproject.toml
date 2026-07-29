@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fourdgs"
-version = "0.1.0"
+version = "0.2.0"
 description = "Reader and writer for the 4dgs container format for 4D gaussian splat scenes"
 readme = "README.md"
 requires-python = ">=3.10"

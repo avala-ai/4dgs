@@ -6,7 +6,38 @@ All notable changes to the Python package are documented here, following
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-29
+
+This release adds the format's new scene-description layers while keeping reconstruction bounded,
+range-seekable and renderer-agnostic. Spatial rendering, object presentation and rate-control policy
+remain outside the package.
+
 ### Added
+
+- **Object-layer decoding, encoding and reconstruction.** Exact `u32` `object_id` membership,
+  optional Object Tables and time-sampled SE(3) Object Tracks now round-trip through the reference
+  reader and writer. Both read paths compose each referenced object's rigid pose onto gaussian
+  centres and orientations after base temporal reconstruction; background and untracked gaussians
+  remain unchanged, and indexed reads do not fetch unrelated tracks.
+
+- **Scene provenance.** Coordinate Frame, Geodetic Anchor, Sensor Calibration and Rig Trajectory
+  records round-trip through streamed and indexed reads. Pose reconstruction clamps outside the
+  sampled interval, uses shortest-arc quaternion interpolation inside it and composes rig-relative
+  sensor poses without making provenance a prerequisite for gaussian decoding.
+
+- **The `keyframe-delta` temporal model.** Reference composition and encoding operate on quantized
+  bins, preserve explicit gaussian identities across births, updates and deaths, and support chained
+  or keyframe-relative groups. Indexed reconstruction follows only the bounded chain needed for the
+  requested instant.
+
+- **glTF interoperability.** `from_gltf` imports static `KHR_gaussian_splatting` assets, while
+  `to_gltf` exports the reconstructed state at a requested instant. Coordinate systems, colour
+  spaces and whole spherical-harmonic degrees are converted explicitly rather than guessed.
+
+- **OpenUSD interoperability.** The optional `usd` extra adds `from_usd` and `to_usd` for
+  `ParticleField3DGaussianSplat` prims. Static imports preserve USD stage units and up-axis
+  metadata; exports can write one reconstructed snapshot or a time-sampled sequence without claiming
+  that USD stores the continuous temporal model.
 
 - **Chunk-compressed PLY import.** `fourdgs.from_compressed_ply` and the `4dgs from-compressed-ply`
   subcommand read the chunked, quantized `.ply` that splat editors export — per-chunk float bounds

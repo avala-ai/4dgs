@@ -6,7 +6,24 @@ All notable changes to the Rust crate are documented here, following
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-29
+
+This release adds native spatial audio, provenance and object motion while preserving the crate's
+bounded-memory, range-seekable reconstruction contract. Rendering and playback remain consumer
+responsibilities.
+
 ### Added
+
+- **Object-layer decoding and reconstruction.** Exact `u32` `object_id` membership, optional Object
+  Tables and time-sampled SE(3) Object Tracks are available through streamed and indexed readers.
+  `Scene::state_at` and `SceneReader::state_at` compose referenced object poses onto gaussian
+  centres and orientations after base temporal reconstruction; indexed reads validate bounded track
+  blocks, fetch no unrelated tracks and cache only one instant's reconstructed poses.
+
+- **Scene provenance.** Coordinate Frame, Geodetic Anchor, Sensor Calibration and Rig Trajectory
+  records round-trip through the Rust records, scene model, writer and C ABI. Pose reconstruction
+  clamps outside the sampled interval, uses shortest-arc quaternion interpolation and composes
+  rig-relative sensor poses without requiring provenance when only gaussian state is requested.
 
 - **An encode surface on the C ABI.** `fourdgs_writer_*` in `include/fourdgs.h` — a builder that
   takes the gaussian columns, spherical harmonics and write options and encodes to an owned
