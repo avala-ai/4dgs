@@ -28,6 +28,7 @@ words:
   - typedoc
   - visionOS
   - selftest
+  - Xlinker
   - RealityKit
   - Catmull
   - extrinsics

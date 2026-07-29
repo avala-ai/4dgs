@@ -254,37 +254,87 @@ jobs:
       # runs locally: `swift format --in-place --recursive` fixes what this reports.
       - name: Format
         run: swift format lint --recursive --strict swift/Sources swift/Tests swift/conformance
+
+      # The package is a binding, so its dependency is a library and not a source tree: the
+      # core has to exist before anything here links. The image has no Rust, so the job
+      # installs the toolchain it needs rather than assuming one.
+      - name: Build the core
+        run: |
+          apt-get update -qq && apt-get install -y -qq curl build-essential python3-numpy >/dev/null
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          . "$HOME/.cargo/env"
+          cargo build -p fourdgs --release
+          ls -l target/release/libfourdgs.a
+
+      # SPM links a system library by name, so the staticlib's directory has to be on the
+      # linker's search path. It is passed here rather than written into Package.swift as
+      # an unsafe flag, which would make the package undependable as a versioned dependency.
       - name: Build
-        run: swift build --package-path swift
+        run: swift build --package-path swift -Xlinker -L$PWD/target/release
       - name: Tests
-        run: swift test --package-path swift
+        run: swift test --package-path swift -Xlinker -L$PWD/target/release
 
       # The canonical JSON is a contract between languages, and this is where Swift's half
       # of it is checked — against canonical.py, on a synthetic scene, with no decoding in
-      # the way. Doing it now means that when the C ABI lands, a conformance mismatch is
-      # about the decode and nothing else.
+      # the way. It means a conformance mismatch is about the decode and nothing else.
       - name: Canonical JSON agrees with canonical.py
         run: |
-          apt-get update -qq && apt-get install -y -qq python3-numpy >/dev/null
-          swift run --package-path swift canonical_selftest > /tmp/swift.json
+          swift run --package-path swift -Xlinker -L$PWD/target/release canonical_selftest > /tmp/swift.json
           python3 swift/conformance/selftest.py --compare /tmp/swift.json
+
+      # End to end over the ABI, on a real file: the runner opens a generated corpus
+      # variant, decodes every gaussian through the core, and then refuses to emit a
+      # summary because the ABI cannot reach the non-gaussian records. Asserting *that*
+      # specific refusal is what distinguishes "the binding decodes" from "the binding
+      # failed somewhere earlier", which an exit code alone would not.
+      - name: Decode a real file through the C ABI
+        run: |
+          pip install --break-system-packages -e ./python/fourdgs >/dev/null
+          python3 tests/conformance/generate.py >/dev/null
+          swift build --package-path swift --configuration release -Xlinker -L$PWD/target/release
+          variant=$(ls tests/conformance/data/*.4dgs | head -1)
+          echo "decoding $variant"
+          set +e
+          ./swift/.build/release/decode_streamed "$variant" 2>/tmp/err.txt
+          code=$?
+          set -e
+          cat /tmp/err.txt
+          if [ "$code" -eq 0 ]; then
+            echo "::error::the runner cannot be complete yet; the ABI has no record accessors"
+            exit 1
+          fi
+          grep -q "decoded the gaussians but cannot emit a canonical summary" /tmp/err.txt || {
+            echo "::error::the runner failed before it got to the known gap"
+            exit 1
+          }
 
   swift-darwin:
     # visionOS and iOS are the platforms this package exists for, and a Linux build proves
     # nothing about either. The macOS runner is where the platform declarations in
-    # Package.swift are actually checked against an SDK.
+    # Package.swift meet a real SDK — and, now that the package links the core, where the
+    # Rust staticlib is proved to cross-compile for those platforms at all.
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - run: swift --version
-      - name: Build for macOS
-        run: swift build --package-path swift
-      - name: Build for visionOS and iOS
-        working-directory: swift
+      - name: Build the core for macOS, visionOS and iOS
         run: |
-          for platform in visionOS iOS; do
-            echo "::group::$platform"
-            xcodebuild -scheme FourDGS -destination "generic/platform=$platform" \
-              -skipPackagePluginValidation build | tail -5
+          rustup target add aarch64-apple-visionos aarch64-apple-ios
+          cargo build -p fourdgs --release
+          cargo build -p fourdgs --release --target aarch64-apple-visionos
+          cargo build -p fourdgs --release --target aarch64-apple-ios
+      - name: Build for macOS
+        run: swift build --package-path swift -Xlinker -L$PWD/target/release
+      - name: Build for visionOS and iOS
+        run: |
+          set -e
+          root="$PWD"
+          cd swift
+          for spec in "visionOS aarch64-apple-visionos" "iOS aarch64-apple-ios"; do
+            set -- $spec
+            echo "::group::$1"
+            xcodebuild -scheme FourDGS -destination "generic/platform=$1" \
+              -skipPackagePluginValidation \
+              OTHER_LDFLAGS="-L$root/target/$2/release" build | tail -5
             echo "::endgroup::"
           done

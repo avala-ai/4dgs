@@ -1,0 +1,11 @@
+// The C ABI, imported directly from the core's own header rather than from a copy.
+//
+// A copy would be a second source of truth that drifts silently: the day rust/fourdgs
+// changes a signature, a stale duplicate here still compiles and then miscalls it. The
+// relative path is resolved from this file, so it survives the package being built from
+// anywhere.
+module CFourDGS {
+    header "../../../rust/fourdgs/include/fourdgs.h"
+    link "fourdgs"
+    export *
+}

@@ -171,51 +171,6 @@ public struct SummaryOffset: Sendable, Equatable {
     }
 }
 
-// MARK: - Index
-
-/// One chunk's entry in the index: its interval and its byte ranges. §5.8.
-///
-/// Every offset and length here frames a **whole record**, opcode byte and content length
-/// included, so `[offset, offset + length)` parses exactly as the record would mid-stream.
-public struct ChunkIndexEntry: Sendable, Equatable {
-    /// One spherical-harmonic band's own byte range, which is what lets a reader that has
-    /// decided to evaluate fewer bands never transfer the ones it will not use.
-    public struct Band: Sendable, Equatable {
-        public var band: UInt8
-        public var offset: UInt64
-        public var length: UInt64
-
-        public init(band: UInt8, offset: UInt64, length: UInt64) {
-            self.band = band
-            self.offset = offset
-            self.length = length
-        }
-    }
-
-    public var t0: Double
-    public var t1: Double
-    public var chunkOffset: UInt64
-    public var chunkLength: UInt64
-    public var gaussianCount: UInt32
-    public var bands: [Band]
-
-    public init(
-        t0: Double, t1: Double, chunkOffset: UInt64, chunkLength: UInt64, gaussianCount: UInt32, bands: [Band]
-    ) {
-        self.t0 = t0
-        self.t1 = t1
-        self.chunkOffset = chunkOffset
-        self.chunkLength = chunkLength
-        self.gaussianCount = gaussianCount
-        self.bands = bands
-    }
-
-    /// §8's whole seek algorithm, for one entry.
-    public func contains(_ t: Double) -> Bool {
-        t >= t0 && t < t1
-    }
-}
-
 // MARK: - Gaussian state
 
 /// Reconstructed gaussian state, structure-of-arrays.

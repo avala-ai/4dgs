@@ -128,9 +128,8 @@ final class LiveTests: XCTestCase {
     }
 
     func testConcatenationAcrossChunks() {
-        let chunk = DecodedChunk(t0: 0, t1: 2, level: 0, gaussians: state())
-        let both = GaussianState.live(in: [chunk, chunk], at: 1.0, cutoff: 0.05)
-        XCTAssertEqual(both.count, 4)
+        let s = state().live(at: 1.0, cutoff: 0.05)
+        XCTAssertEqual(GaussianState.concatenated([s, s]).count, 2 * s.count)
     }
 }
 
@@ -182,31 +181,52 @@ final class MagicTests: XCTestCase {
 
 final class SeamTests: XCTestCase {
 
-    /// The seam fails loudly. A binding whose unimplemented paths returned empty data would
-    /// pass a conformance run by decoding nothing, which is the failure mode this asserts
-    /// against.
-    func testDecodeIsNotImplementedYetAndSaysSo() {
-        let reader = InMemoryReader(Core.magic + Array(repeating: 0, count: 64))
-        XCTAssertThrowsError(try StreamedReader(reader)) { error in
-            guard case FourDGSError.notImplemented(let what) = error else {
-                return XCTFail("expected notImplemented, got \(error)")
-            }
-            XCTAssertEqual(what, "streamed decode")
-        }
-        XCTAssertThrowsError(try IndexedReader(reader)) { error in
-            guard case FourDGSError.notImplemented = error else {
-                return XCTFail("expected notImplemented, got \(error)")
+    /// Garbage is diagnosed as garbage on the Swift side, before anything crosses into
+    /// code that cannot throw. This is the whole reason the binding checks the magic even
+    /// though the core checks it too.
+    func testGarbageIsRefusedAtTheBoundary() {
+        let reader = InMemoryReader(Array(repeating: 0x41, count: 64))
+        XCTAssertThrowsError(try SceneReader(reader)) { error in
+            guard case FourDGSError.notFourDGS = error else {
+                return XCTFail("expected notFourDGS, got \(error)")
             }
         }
     }
 
-    func testMagicIsCheckedBeforeTheSeamIsReached() {
-        // Order matters: garbage should be diagnosed as garbage, not as "not implemented".
-        let reader = InMemoryReader(Array(repeating: 0x41, count: 64))
-        XCTAssertThrowsError(try StreamedReader(reader)) { error in
-            guard case FourDGSError.notFourDGS = error else {
-                return XCTFail("expected notFourDGS, got \(error)")
+    /// A file from a future major version is a different diagnosis from a file that is not
+    /// a `.4dgs` at all, because the fix differs: a newer reader against a different file.
+    func testFutureVersionIsADifferentDiagnosis() {
+        var bytes = Core.magic
+        bytes[5] = 0x32  // ASCII '2'
+        let reader = InMemoryReader(bytes + Array(repeating: 0, count: 64))
+        XCTAssertThrowsError(try SceneReader(reader)) { error in
+            guard case FourDGSError.unsupportedMajorVersion(let found, _) = error else {
+                return XCTFail("expected unsupportedMajorVersion, got \(error)")
             }
+            XCTAssertEqual(found, 0x32)
+        }
+    }
+
+    /// The magic alone is not a file. This one gets past the boundary check and has to be
+    /// refused by the core, which is the path that proves the ABI is actually wired: the
+    /// error comes back from Rust, carrying Rust's message.
+    func testTheCoreRefusesATruncatedFile() {
+        let reader = InMemoryReader(Core.magic)
+        XCTAssertThrowsError(try SceneReader(reader)) { error in
+            XCTAssertFalse("\(error)".isEmpty)
+            if case FourDGSError.notImplemented = error {
+                XCTFail("the seam is wired; this should be a real decode error, got \(error)")
+            }
+        }
+    }
+
+    /// The reader is retained for the scene's lifetime and released exactly once. Opening
+    /// and dropping many scenes must not grow or double-free; under the sanitizers this is
+    /// where a mistake in `passRetained`/`release` shows up.
+    func testOpeningAndDroppingRepeatedlyIsClean() {
+        for _ in 0..<200 {
+            let reader = InMemoryReader(Core.magic + Array(repeating: 0, count: 32))
+            _ = try? SceneReader(reader)
         }
     }
 }
@@ -226,20 +246,27 @@ final class ReaderTests: XCTestCase {
     }
 
     func testSeekPicksEveryChunkWhoseIntervalContainsTheInstant() {
-        let entries = [
-            ChunkIndexEntry(t0: 0, t1: 1, chunkOffset: 0, chunkLength: 10, gaussianCount: 1, bands: []),
-            ChunkIndexEntry(t0: 0.5, t1: 2, chunkOffset: 10, chunkLength: 10, gaussianCount: 1, bands: []),
-            ChunkIndexEntry(t0: 2, t1: 3, chunkOffset: 20, chunkLength: 10, gaussianCount: 1, bands: []),
-        ]
         let scene = Scene(
             header: Header(
                 profile: "", library: "t", durationSec: 3, gaussianCount: 3, cutoff: 0.05,
                 temporalModel: "gaussian-birth", aabb: [0, 0, 0, 1, 1, 1], shDegree: 0, hasAudio: false,
                 hasCompressedChunks: false, attributes: [:]),
-            chunkIndex: entries)
+            chunkIntervals: [0...1, 0.5...2, 2...3])
         XCTAssertEqual(scene.chunks(containing: 0.75).count, 2)
         XCTAssertEqual(scene.chunks(containing: 2.0).count, 1)  // half-open: not the second
         XCTAssertEqual(scene.chunks(containing: 9.0).count, 0)
+    }
+
+    /// An empty `metadata` from a build that cannot read metadata is silence, not a fact,
+    /// and the type says which.
+    func testUnreadableRecordsAreDistinguishedFromAbsentOnes() {
+        let scene = Scene(
+            header: Header(
+                profile: "", library: "t", durationSec: 1, gaussianCount: 0, cutoff: 0.05,
+                temporalModel: "gaussian-birth", aabb: [], shDegree: 0, hasAudio: false,
+                hasCompressedChunks: false, attributes: [:]))
+        XCTAssertTrue(scene.metadata.isEmpty)
+        XCTAssertFalse(scene.recordsAvailable)
     }
 
     func testAbsentAudioIsAValueNotAnError() {

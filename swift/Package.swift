@@ -14,7 +14,11 @@ let package = Package(
         // Sources/FourDGS/CoreSeam.swift, whose bodies currently throw `.notImplemented`.
         // Wiring the C ABI replaces those bodies and adds a CFourDGS system-library target
         // here; nothing else in the package moves.
-        .target(name: "FourDGS"),
+        // The C ABI, imported from rust/fourdgs/include/fourdgs.h through a module map
+        // rather than a copied header. Linking needs the core's staticlib on the linker
+        // search path — see README.md; CI builds it before this package.
+        .systemLibrary(name: "CFourDGS", path: "Sources/CFourDGS"),
+        .target(name: "FourDGS", dependencies: ["CFourDGS"]),
         .testTarget(name: "FourDGSTests", dependencies: ["FourDGS"]),
 
         // The conformance runners. Two executables, because the suite tests two read paths

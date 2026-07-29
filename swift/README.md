@@ -1,40 +1,52 @@
 # 4dgs — Swift
 
-**In progress.** The package, the API surface and the conformance runners exist; decoding does not
-yet, because this is a binding rather than a second implementation.
+**In progress.** The package decodes real files through the Rust core's C ABI. It cannot yet emit a
+conformance summary, so every Swift cell in the [feature matrix](../website/docs/reference/index.md)
+stays `Planned`.
 
-`FourDGS` is a thin Swift layer over the Rust core's C ABI, for visionOS, iOS and macOS. Every call
-into the core goes through one file —
-[`Sources/FourDGS/CoreSeam.swift`](Sources/FourDGS/CoreSeam.swift), which also states the
-buffer-ownership rule at the boundary — and its bodies throw `FourDGSError.notImplemented` until
-`rust/fourdgs/include/fourdgs.h` lands. Everything above the seam is real Swift and is tested: the
-value types, the errors, the two readers, and §3's visibility arithmetic.
+`FourDGS` is a thin Swift layer over `rust/fourdgs`, for visionOS, iOS and macOS — a binding, not a
+second decoder. Every call into the core goes through one file,
+[`Sources/FourDGS/CoreSeam.swift`](Sources/FourDGS/CoreSeam.swift), which states the four
+buffer-ownership rules the boundary holds to. Above it is ordinary Swift: value types, errors that
+separate a malformed file from a legal one this build is too old for, and §3's reconstruction
+arithmetic.
 
 Scope: decoding a `.4dgs` to gaussian state at a time `t`. **RealityKit and Metal rendering are out
 of scope for this repository — the SDK ends at decoded state.**
 
 ```swift
-var reader = try IndexedReader(FileReader(path: "scene.4dgs"))
+let reader = try SceneReader(path: "scene.4dgs")
 let live = try reader.gaussians(at: 1.5)   // §3: the window, then marginal against the file's cutoff
 let moved = live[0].state(at: 1.5)         // centre moved, opacity faded
+let cost = reader.bytesForTime(1.5)        // what that seek transfers, before asking for it
 ```
 
-Two read paths, both first class: `StreamedReader` walks a file front to back and works on a pipe or
-a truncated file; `IndexedReader` reads the Footer and the index and then only the byte ranges an
-instant needs. Neither is an optimization of the other.
+A `SceneReader` is a class and is not `Sendable` — one open scene belongs to one thread. What comes
+out of it is `Sendable`, because every array is copied out of the core's memory before it returns.
 
-Every Swift cell in the [feature matrix](../website/docs/reference/index.md) stays `Planned` until
-the conformance suite proves otherwise, which is that table's own rule.
+## What is not reachable yet
+
+The ABI exposes the Header's numbers, the audio track, the chunk intervals and the gaussians. It has
+no accessor for the metadata, attachment, camera, statistics or summary-offset records, nor for the
+Footer's summary CRC. `Scene.recordsAvailable` reports that, so an empty `metadata` is never
+mistaken for a file that carries none. The conformance runners refuse to print a partial summary for
+the same reason, and their CI job stays disabled until the accessors exist.
 
 ## Building
 
-Swift 5.9 or newer. The tools version is pinned to 5.9 because CI's macOS runner ships 5.10.
+Swift 5.9 or newer; the tools version is pinned to 5.9 because CI's macOS runner ships 5.10.
+
+The package links the core, so build that first and put it on the linker's search path:
 
 ```bash
-swift build          # from swift/
-swift test
+cargo build -p fourdgs --release
+swift build --package-path swift -Xlinker -L"$PWD/target/release"
+swift test  --package-path swift -Xlinker -L"$PWD/target/release"
 ```
 
-`conformance/` builds `decode_streamed` and `decode_indexed`, which `tests/conformance/run.py`
-invokes the way it invokes every other language's runners. They are registered there already and are
-skipped until built.
+The `-L` is passed on the command line rather than written into `Package.swift`, because an unsafe
+flag there would make the package undependable as a versioned dependency. A published package would
+ship a binary target instead; that is a distribution decision and not settled.
+
+`conformance/` builds `decode_streamed` and `decode_indexed`, registered in
+`tests/conformance/run.py` and skipped until built.

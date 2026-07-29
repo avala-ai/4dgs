@@ -19,17 +19,6 @@ extension GaussianState {
         return gather(kept)
     }
 
-    /// The live gaussians across several chunks, concatenated.
-    ///
-    /// The chunks of an instant are independent, so this is a concatenation and not a
-    /// merge. Order is not part of the contract in either direction.
-    public static func live(in chunks: [DecodedChunk], at t: Double, cutoff: Double) -> GaussianState {
-        let parts = chunks.map { $0.gaussians.live(at: t, cutoff: cutoff) }.filter { $0.count > 0 }
-        if parts.isEmpty { return .empty }
-        if parts.count == 1 { return parts[0] }
-        return concatenated(parts)
-    }
-
     /// The §3 test, without materializing a `Gaussian` per candidate: this runs once per
     /// gaussian per seek, and the struct copy is the whole cost at that scale.
     private static func isLive(_ g: GaussianState, _ i: Int, _ t: Double, _ cutoff: Double) -> Bool {
