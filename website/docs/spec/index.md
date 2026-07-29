@@ -177,7 +177,7 @@ f64     duration_sec     -- scene length; playback covers [0, duration_sec)
 u64     gaussian_count   -- total across all chunks
 f64     cutoff           -- marginal visibility threshold, default 0.05
 string  temporal_model   -- "gaussian-birth" for version 1 (see registry)
-f32[6]  aabb             -- min xyz, max xyz over all rest positions
+f64[6]  aabb             -- min xyz, max xyz over all rest positions
 u8      sh_degree        -- 0..3; 0 means no spherical harmonics
 u8      flags            -- bit 0: file contains an Audio record
                          -- bit 1: chunk data is compressed
@@ -219,6 +219,12 @@ u8      step_sh
 map<string,string> bounds  -- declared max deviation per attribute, as decimal strings
 ```
 
+The `bounds` keys are `pos`, `scale_rel`, `rot`, `rgb`, `alpha`, `motion`, `time`, `sigma_rel` and
+`sh`. `scale_rel` and `sigma_rel` are relative deviations in the log domain; the rest are absolute,
+in the unit of the attribute they name. A reader MAY ignore the map entirely — it is a producer's
+declaration, not an instruction — but a reader that surfaces it MUST use these names, so that two
+readers report the same number for the same file.
+
 Each stored integer bin is multiplied by its step (and exponentiated, for the log-domain scale and
 sigma) to recover the value. Because every grid pitch is exactly twice its declared bound,
 `|decoded - original| <= bound` holds by construction. Producers SHOULD verify this exhaustively at
@@ -234,8 +240,17 @@ u32  count
      count × { f64 lo; f64 hi }
 ```
 
+A file with no Window Table record, or one whose `count` is 0, is read as though it declared exactly
+one window `(0, 0)`. Every gaussian then references index 0 and has an empty validity window, which
+is a scene with nothing visible at any time — degenerate, but well defined, and not an error.
+
 Gaussians reference windows by index. The table is small — one entry per distinct span in the scene
 — so the per-gaussian cost is an index, not a pair of floats.
+
+**A writer MUST NOT emit a window index outside the table, and a reader MUST refuse a file that
+does**, naming the index and the table size. Clamping an out-of-range index silently substitutes one
+gaussian's lifetime for another's, and it does so in a file that is already corrupt in some way
+nobody has diagnosed yet; a decoder that clamps turns a detectable fault into wrong output.
 
 ### 5.5 Chunk — opcode `0x05`
 
@@ -251,6 +266,16 @@ bytes   records       -- concatenated Attribute Stream records
 ```
 
 Chunks are **independently decodable**: nothing in a chunk references another chunk.
+
+`compression` names a codec applied to the whole `records` block, and `uncompressed_size` is the
+length that block decompresses to. When `compression` is `""` the block is stored as-is and
+`uncompressed_size` equals its length. **A reader MUST honour `compression`**: a reader that ignores
+it decodes a compressed chunk as though the compressed bytes were attribute streams, which produces
+wrong gaussians rather than an error. A reader that does not implement the named codec MUST refuse
+the file and name the codec, which is a different failure from a corrupt one.
+
+Compression is normally per stream, because that lets a reader decompress a chunk's attributes in
+parallel and skip the ones it does not want. A chunk-level codec is the exception, not the default.
 
 ### 5.6 Attribute Stream — opcode `0x06`
 
@@ -282,6 +307,17 @@ Identical to Attribute Stream, prefixed with `u8 band` (1–3). Each band is sto
 with its own byte range in the Chunk Index, so a reader that has decided to evaluate fewer bands
 **never transfers the ones it will not use**.
 
+The stream header inside this record carries `0x07` — this record's own opcode — in its
+`attribute_id` field. That value collides with the attribute id of `mu_t`, and it is a version-1
+quirk rather than a design: **a reader MUST NOT dispatch an SH band stream by its attribute id.**
+Band streams are identified by the record that contains them and by the `band` byte in front of
+them, and a reader that routes on the attribute id decodes spherical harmonics as birth times. A
+future major version may assign the field properly; within version 1 it is fixed, because the
+records already written cannot change.
+
+Coefficients are `u8`, stored as written and consumed as read: `step_sh` describes what the encoder
+did before it stored them and is **not applied at decode**. See §6.5.
+
 ### 5.8 Chunk Index — opcode `0x08`
 
 ```
@@ -292,6 +328,11 @@ u32  gaussian_count
 u32  band_count
      band_count × { u8 band; u64 offset; u64 length }
 ```
+
+Every offset and length here frames a **whole record**, opcode byte and content length included, so
+a reader fetches `[offset, offset + length)` and parses it exactly as it would parse that record
+mid-stream. That holds for `chunk_offset`/`chunk_length` and for each band's pair alike; there is no
+range in this record that points at a record's content rather than at the record.
 
 ### 5.9 Audio — opcode `0x09`
 
@@ -423,10 +464,12 @@ class  = clamp(ceil(log2(half / 0.5)), -4, 2)
 step_i = step_motion * 2^(-class)
 ```
 
-where `K = sqrt(-2 * ln(cutoff))`. `ceil` is required: the class's nominal lifetime must be an upper
-bound on the real one, or the displacement guarantee fails by up to `sqrt(2)`. The guarantee is
-therefore on **displacement**: a decoded velocity moves its gaussian by at most `bounds.pos` over
-`min(lifetime, 2 s)`.
+where `K = sqrt(-2 * ln(cutoff))` and `cutoff` is **the value in this file's Header**, not the
+default. A decoder that substitutes a constant decodes different velocities than the encoder wrote
+for any file that declares a different threshold, and the file gives it no way to notice. `ceil` is
+required: the class's nominal lifetime must be an upper bound on the real one, or the displacement
+guarantee fails by up to `sqrt(2)`. The guarantee is therefore on **displacement**: a decoded
+velocity moves its gaussian by at most `bounds.pos` over `min(lifetime, 2 s)`.
 
 **Birth time.** The temporal term reads `(t - mu_t) / sigma_t`, never `mu_t` alone, so `mu_t`
 precision must be a fraction of the gaussian's own sigma. A gaussian with `sigma_t = 1 ms` and a 2
@@ -447,6 +490,22 @@ omitted one is recovered as `sqrt(1 - sum of squares)` before the quaternion is 
 `step_rot` bounds the three **stored** components. Reconstruction of the omitted component and the
 renormalization can amplify that; producers SHOULD measure and declare the post-reconstruction
 maximum in the Quantization record's `bounds`.
+
+### 6.5 Spherical harmonics
+
+Coefficients are unsigned bytes. A scene declares one degree for all of its gaussians in the
+Header's `sh_degree`, and each degree above the constant term is stored in its own SH Band Stream
+record: band 1 carries 3 coefficients per colour component, band 2 carries 5, band 3 carries 7,
+which is `2b + 1` for band `b` and `(d + 1)² − 1` for a whole degree `d`.
+
+Within a band's stream the channels are component-major: every coefficient of red, then of green,
+then of blue. Bands are whole and a reader takes them whole — bands 1..D give exactly a degree-D
+scene, and **a reader MUST NOT assemble a partial degree** out of part of a band.
+
+`step_sh` in the Quantization record is an **encode-side** value: an encoder that coarsens
+coefficients records the pitch it used so the file declares its own error, and a decoder does
+nothing with it. The stored byte is the coefficient. Multiplying by `step_sh` at decode scales
+appearance by a factor of one to three and is the single most likely way to misread this record.
 
 ---
 
@@ -552,3 +611,27 @@ exceeds `bounds.pos`, so a gaussian that does not move collapses to a single rec
 accelerates gets exactly as many records as its curvature requires. This keeps the import honest —
 the error bound is the same one the rest of the file declares — without inheriting a per-frame
 evaluation cost.
+
+---
+
+## 12. Changelog
+
+Corrections and clarifications to this document. A row here never changes what a conforming
+version-1 file looks like on the wire: where the text and the wire disagreed, the wire is the format
+and the text was the bug.
+
+| Change                                                                                                | Kind                      |
+| ----------------------------------------------------------------------------------------------------- | ------------------------- |
+| §5.1 Header `aabb` corrected from `f32[6]` to `f64[6]`, matching every file ever written              | correction                |
+| §5.3 named the `bounds` map's keys                                                                    | clarification             |
+| §5.4 stated the reading of an absent or empty Window Table, and that an out-of-range index is refused | clarification, rule added |
+| §5.5 stated that a reader must honour a chunk's `compression`, and what `uncompressed_size` means     | clarification             |
+| §5.7 stated that a band stream's `attribute_id` carries `0x07` and must not be dispatched on          | clarification             |
+| §5.8 stated that every offset and length in the index frames a whole record                           | clarification             |
+| §6.3 stated that `K` uses the Header's `cutoff` rather than the default                               | clarification             |
+| §6.5 added: spherical harmonic layout, whole degrees, and that `step_sh` is not applied at decode     | clarification             |
+
+The `aabb` row is the one worth reading twice. The text said `f32[6]` from the first draft and every
+implementation wrote `f64[6]`, so a reader built from the specification alone desynchronized on the
+Header and on every record after it. It was found by writing a new implementation from the published
+documents and nothing else, which is the only way that class of error is ever found.

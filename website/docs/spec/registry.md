@@ -33,6 +33,13 @@ Used by the Attribute Stream record (`0x06`).
 Ids 0–10 are required in every chunk. Ids 11 and 12 are optional and exist so a producer can
 round-trip stable identities through the format; readers that do not need them skip the streams.
 
+**Spherical harmonics have no attribute id.** They travel in SH Band Stream records (`0x07`), one
+per band, and the stream header inside such a record carries `0x07` in its `attribute_id` field —
+the record's own opcode, which collides with `mu_t`'s id of 7. A reader identifies a band stream by
+the record that contains it, never by that field. The collision is a version-1 quirk that a future
+major version may clean up; see spec §5.7. Coefficients are `u8`, stored as written and read as
+stored: `step_sh` records what the encoder did and is not applied at decode (spec §6.5).
+
 ---
 
 ## Stream codecs
