@@ -7,8 +7,8 @@ documented state — not a defect — and this table is the public contract that
 `supportsVariant()`, the harness runs exactly those, and this table is kept in lockstep with those
 declarations. Nothing is marked `Yes` on the strength of code existing.
 
-Every row is filled in from a suite that runs: 32 variants, two read paths (streamed and indexed),
-63 checks passing for each language.
+Every row is filled in from a suite that runs: 34 variants, two read paths (streamed and indexed),
+67 checks passing for each language.
 
 | Feature                                              | Python  | TypeScript | Rust    | C++     | Swift   |
 | ---------------------------------------------------- | ------- | ---------- | ------- | ------- | ------- |
@@ -98,7 +98,7 @@ check cannot pass against a decoder that returns nothing.
 **Encode**, **Chunked encode** and **Summary writing** are proved by a gate rather than by a runner,
 and the two encoders are gated differently because they play different roles.
 
-Python's is proved by the corpus gate: `generate.py --verify` re-encodes all 32 variants, asserts
+Python's is proved by the corpus gate: `generate.py --verify` re-encodes all 34 variants, asserts
 every committed checksum, and asserts that two consecutive runs are byte-identical. Every variant is
 an encode; the chunked and summary-bearing ones are the flags that say so.
 

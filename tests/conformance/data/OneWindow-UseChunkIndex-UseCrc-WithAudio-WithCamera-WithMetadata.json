@@ -72,6 +72,7 @@
   "headerAttributes": {
     "scenario": "OneWindow"
   },
+  "library": "4dgs conformance generator",
   "metadataRecords": [
     {
       "entries": {
@@ -81,6 +82,7 @@
       "name": "OneWindow"
     }
   ],
+  "profile": "capture",
   "sample": {
     "colors": [
       [

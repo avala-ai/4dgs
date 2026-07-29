@@ -96,7 +96,14 @@ export function roundHalfEven(value: number, decimals: number): number {
 export interface SceneSummaryInput {
   readonly header: Pick<
     Header,
-    "durationSec" | "cutoff" | "shDegree" | "temporalModel" | "hasAudio" | "attributes"
+    | "durationSec"
+    | "cutoff"
+    | "profile"
+    | "library"
+    | "shDegree"
+    | "temporalModel"
+    | "hasAudio"
+    | "attributes"
   >;
   readonly gaussians: GaussianSet;
   readonly audio: AudioTrack | null;
@@ -141,6 +148,9 @@ export function summarize(input: SceneSummaryInput): unknown {
     gaussianCount: String(n),
     durationSec: num(header.durationSec),
     cutoff: num(header.cutoff),
+    // The Header's first two fields: readable everywhere, asserted nowhere until now.
+    profile: header.profile,
+    library: header.library,
     shDegree: header.shDegree,
     temporalModel: header.temporalModel,
     hasAudio: header.hasAudio,

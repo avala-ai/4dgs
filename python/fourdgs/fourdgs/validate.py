@@ -10,6 +10,7 @@ record, the field and what was expected.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 from . import opcode as op
@@ -44,6 +45,34 @@ class Report:
 
     def note(self, msg: str) -> None:
         self.findings.append(Finding("note", msg))
+
+
+def _check_quantization_finite(quant: rec.Quantization, report: Report) -> None:
+    """Every step and origin must be finite (spec §5.3).
+
+    A non-finite step is the one corrupt field that ruins every gaussian rather than one:
+    each bin multiplied by it decodes to infinity or NaN, so the whole scene comes out with
+    no position to occupy. Nothing downstream complains — dequantization is arithmetic and
+    arithmetic on infinity is defined — so without this check the first symptom is a
+    renderer drawing an empty frame, which points at the renderer.
+
+    Reported per field, because "the file is broken" is what the caller already knows.
+    """
+    for name, value in (
+        ("pos_origin[0]", quant.pos_origin[0]),
+        ("pos_origin[1]", quant.pos_origin[1]),
+        ("pos_origin[2]", quant.pos_origin[2]),
+        ("step_pos", quant.step_pos),
+        ("step_scale_log", quant.step_scale_log),
+        ("step_rot", quant.step_rot),
+        ("step_rgb", quant.step_rgb),
+        ("step_alpha", quant.step_alpha),
+        ("step_motion", quant.step_motion),
+        ("step_time", quant.step_time),
+        ("step_sigma_log", quant.step_sigma_log),
+    ):
+        if not math.isfinite(value):
+            report.error(f"Quantization {name} is {value}; every step and origin must be finite (§5.3)")
 
 
 def validate(data: bytes) -> Report:
@@ -102,6 +131,9 @@ def validate(data: bytes) -> Report:
         report.error("no Quantization record")
     if footer is None:
         report.error("no Footer record")
+
+    if quant is not None:
+        _check_quantization_finite(quant, report)
 
     if header is not None and counted != header.gaussian_count:
         report.error(f"Header declares {header.gaussian_count} gaussians; chunks contain {counted}")

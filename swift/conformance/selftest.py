@@ -63,6 +63,8 @@ class LCG:
 class Header:
     duration_sec: float
     cutoff: float
+    profile: str
+    library: str
     sh_degree: int
     temporal_model: str
     has_audio: bool
@@ -213,6 +215,11 @@ def main() -> int:
     header = Header(
         duration_sec=4.5,
         cutoff=0.037,
+        # Mirrors `Synthetic.swift`. The empty profile is deliberate: it is the one value a
+        # runner that drops the field would still get right, so the pair is what separates
+        # "decoded an empty string" from "never read the field at all".
+        profile="",
+        library="4dgs synthetic",
         sh_degree=SH_DEGREE,
         temporal_model="gaussian-birth",
         has_audio=True,

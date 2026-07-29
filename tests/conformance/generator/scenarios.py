@@ -35,6 +35,7 @@ FLAGS = (
     "Quantized",  # lossy attribute quantization rather than the finest grid
     "SHDegree1",
     "SHDegree2",
+    "SHDegree3",
     "DeltaStreams",  # delta-coded attribute streams rather than raw
     "WithAudio",  # embed an audio track
     "WithLargeAudio",  # embed a track larger than an indexed reader's head probe
@@ -72,7 +73,13 @@ class Scenario:
 
 SCENARIOS: tuple[Scenario, ...] = (
     # The degenerate cases first: they are where decoders actually break.
-    Scenario("NoData", gaussians=0, duration_sec=0.0, windows=1, excludes=("SHDegree1", "SHDegree2", "DeltaStreams")),
+    Scenario(
+        "NoData",
+        gaussians=0,
+        duration_sec=0.0,
+        windows=1,
+        excludes=("SHDegree1", "SHDegree2", "SHDegree3", "DeltaStreams"),
+    ),
     Scenario("OneGaussian", gaussians=1, duration_sec=1.0, windows=1, excludes=("UseChunks", "DeltaStreams")),
     Scenario("OneWindow", gaussians=64, duration_sec=2.0, windows=1),
     Scenario("TenWindows", gaussians=640, duration_sec=20.0, windows=10),
@@ -155,6 +162,16 @@ def variants() -> list[tuple[Scenario, tuple[str, ...]]]:
     add(mixed, "SHDegree1")
     add(mixed, "SHDegree2")
     add(mixed, "SHDegree2", "Quantized", "UseChunks")
+
+    # Degree 3 — the last degree the format defines, and the one where a band-range
+    # off-by-one is arithmetically invisible at every lower degree. Bands carry `2b + 1`
+    # coefficients each, so a whole degree is 3, then 8, then 15 per colour component; the
+    # jump from band 2 to band 3 is the largest, and it is the only one where a reader that
+    # sized a band by its own index rather than by the range table still lands inside the
+    # buffer. Both a chunked and an unchunked variant, because the per-band column
+    # arithmetic only runs per chunk when there is more than one to merge.
+    add(mixed, "SHDegree3")
+    add(mixed, "SHDegree3", "UseChunks")
 
     # Audio: exactly one scenario carries a track, and one asserts clean absence.
     add(SCENARIOS[2], "WithAudio")

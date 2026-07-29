@@ -68,6 +68,7 @@
   "headerAttributes": {
     "scenario": "TenWindows"
   },
+  "library": "4dgs conformance generator",
   "metadataRecords": [
     {
       "entries": {
@@ -77,6 +78,7 @@
       "name": "TenWindows"
     }
   ],
+  "profile": "capture",
   "sample": {
     "colors": [
       [

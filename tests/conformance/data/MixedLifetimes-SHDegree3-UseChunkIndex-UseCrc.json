@@ -555,11 +555,11 @@
     ]
   },
   "sh": {
-    "coefficients": "8",
-    "crc": "2216440464",
-    "degree": 2
+    "coefficients": "15",
+    "crc": "2026714618",
+    "degree": 3
   },
-  "shDegree": 2,
+  "shDegree": 3,
   "statistics": null,
   "summaryCrcOk": true,
   "summaryOffsets": [],
