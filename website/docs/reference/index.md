@@ -7,31 +7,30 @@ documented state — not a defect — and this table is the public contract that
 `supportsVariant()`, the harness runs exactly those, and this table is kept in lockstep with those
 declarations. Nothing is marked `Yes` on the strength of code existing.
 
-Python's row, TypeScript's, Rust's and C++'s are filled in from a suite that runs: 32 variants, two
-read paths (streamed and indexed), 63 checks passing for each. The other languages have not been run
-against it yet.
+Every row is filled in from a suite that runs: 32 variants, two read paths (streamed and indexed),
+63 checks passing for each language.
 
 | Feature                                              | Python  | TypeScript | Rust    | C++     | Swift   |
 | ---------------------------------------------------- | ------- | ---------- | ------- | ------- | ------- |
-| Streaming decode                                     | Yes     | Yes        | Yes     | Yes     | Planned |
-| Indexed / seeking decode                             | Yes     | Yes        | Yes     | Yes     | Planned |
-| Range-request decode                                 | Yes     | Yes        | Yes     | Yes     | Planned |
+| Streaming decode                                     | Yes     | Yes        | Yes     | Yes     | Yes     |
+| Indexed / seeking decode                             | Yes     | Yes        | Yes     | Yes     | Yes     |
+| Range-request decode                                 | Yes     | Yes        | Yes     | Yes     | Yes     |
 | Truncated-file recovery                              | Yes     | Yes        | Yes     | Yes     | Planned |
-| Chunk index                                          | Yes     | Yes        | Yes     | Yes     | Planned |
-| Summary offsets                                      | Yes     | Yes        | Yes     | Yes     | Planned |
-| CRC validation                                       | Yes     | Yes        | Yes     | Yes     | Planned |
-| Quantized attributes                                 | Yes     | Yes        | Yes     | Yes     | Planned |
-| Spherical harmonics, degree 1                        | Yes     | Yes        | Yes     | Yes     | Planned |
-| Spherical harmonics, degree 2                        | Yes     | Yes        | Yes     | Yes     | Planned |
+| Chunk index                                          | Yes     | Yes        | Yes     | Yes     | Yes     |
+| Summary offsets                                      | Yes     | Yes        | Yes     | Yes     | Yes     |
+| CRC validation                                       | Yes     | Yes        | Yes     | Yes     | Yes     |
+| Quantized attributes                                 | Yes     | Yes        | Yes     | Yes     | Yes     |
+| Spherical harmonics, degree 1                        | Yes     | Yes        | Yes     | Yes     | Yes     |
+| Spherical harmonics, degree 2                        | Yes     | Yes        | Yes     | Yes     | Yes     |
 | Spherical harmonics, degree 3                        | Planned | Planned    | Planned | Planned | Planned |
 | SH band range-skipping                               | Yes     | Yes        | Yes     | Yes     | Planned |
-| Embedded audio (optional, zero-overhead when absent) | Yes     | Yes        | Yes     | Yes     | Planned |
-| Camera trajectory                                    | Yes     | Yes        | Yes     | Yes     | Planned |
-| Metadata                                             | Yes     | Yes        | Yes     | Yes     | Planned |
-| Attachments                                          | Yes     | Yes        | Yes     | Yes     | Planned |
-| Statistics                                           | Yes     | Yes        | Yes     | Yes     | Planned |
-| Unknown-record skipping                              | Yes     | Yes        | Yes     | Yes     | Planned |
-| Private-range records                                | Yes     | Yes        | Yes     | Yes     | Planned |
+| Embedded audio (optional, zero-overhead when absent) | Yes     | Yes        | Yes     | Yes     | Yes     |
+| Camera trajectory                                    | Yes     | Yes        | Yes     | Yes     | Yes     |
+| Metadata                                             | Yes     | Yes        | Yes     | Yes     | Yes     |
+| Attachments                                          | Yes     | Yes        | Yes     | Yes     | Yes     |
+| Statistics                                           | Yes     | Yes        | Yes     | Yes     | Yes     |
+| Unknown-record skipping                              | Yes     | Yes        | Yes     | Yes     | Yes     |
+| Private-range records                                | Yes     | Yes        | Yes     | Yes     | Yes     |
 | Encode                                               | Yes     | Planned    | Yes     | Planned | Planned |
 | Chunked encode                                       | Yes     | Planned    | Yes     | Planned | Planned |
 | Summary writing                                      | Yes     | Planned    | Yes     | Planned | Planned |
@@ -118,6 +117,13 @@ and Swift are not fuzzed yet — they bind to the Rust core, so its fuzzing cove
 their own bindings. See
 [the fuzzing notes](https://github.com/avala-ai/4dgs/blob/main/tests/fuzz/README.md) and
 `rust/fourdgs/tests/fuzz.rs`.
+
+**Swift** passes the suite by both read paths — 63 checks, 0 failures — and two of its rows stay
+`Planned` anyway, because the suite does not prove them for Swift. **Truncated-file recovery** and
+**SH band range-skipping** are proved by a runner doing work beyond printing a summary: decoding a
+deliberately cut file, and measuring bytes at the transport. The Swift runners do not do that work
+yet. The decoder has `isTruncated` and `bytesForChunk` behind it, which is precisely why those cells
+are not `Yes` — code existing is what this table refuses to accept as evidence.
 
 **Convert from PLY frame sequences** and **Inspect and validate** are tools rather than wire-format
 features, so the conformance suite does not cover them; they are marked from their own tests, which
