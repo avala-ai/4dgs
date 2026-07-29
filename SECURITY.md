@@ -46,7 +46,14 @@ Python and TypeScript, so a crash found by one implementation is handed to the o
 them on every run. Rust fuzzes separately in `rust/fourdgs/tests/fuzz.rs`, against seeds it encodes
 itself and across the C ABI as well as the two read paths. All three run in CI.
 
-The first pass found ten crash classes, including one that was not an exception at all: a
+The first pass found eleven crash classes, including one that was not an exception at all: a
 constant-mode attribute stream declaring 2^30 elements, which expanded a one-byte payload into
 gigabytes. The cap it evaded bounded what arrives rather than what it becomes — the distinction is
 now checked in both decoders, and the input that found it is case `constant-stream-expansion-bomb`.
+
+A second allocation bug came out of the same invariant and is worth stating separately, because it
+says something about how to check this claim rather than about the format. A window table sized an
+array from its declared count before checking that count against the record it arrived in, so four
+bytes of input asked for 64 GB. It passed on a developer's machine and failed in CI: with enough
+memory, an absurd allocation is merely a slow success. The TypeScript fuzzer therefore runs under an
+address-space ceiling — an allocation bound that is not enforced is not tested.

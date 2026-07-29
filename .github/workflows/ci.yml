@@ -173,8 +173,15 @@ jobs:
         env:
           FOURDGS_FUZZ_ITERATIONS: "15000"
 
+      # Under an address-space ceiling, because "never unbounded allocation" is part of
+      # the invariant and it cannot be checked on a machine with enough memory to satisfy
+      # the allocation. The window-table bug proved that: a 64 GB request from a four-byte
+      # record succeeded quietly on a developer's box and only failed here. 1.5 GB is far
+      # more than any corpus file needs and far less than a bug like that asks for.
       - name: TypeScript
-        run: node --test typescript/conformance/dist/fuzz.test.js
+        run: |
+          ulimit -v 1500000
+          node --test typescript/conformance/dist/fuzz.test.js
         env:
           FOURDGS_FUZZ_ITERATIONS: "8000"
 

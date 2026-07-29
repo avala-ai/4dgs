@@ -81,7 +81,7 @@ a fix that comes back.
 
 ## What the first pass found
 
-Ten crash classes across the two implementations, nine of them shared or mirrored:
+Eleven crash classes across the two implementations, nine of them shared or mirrored:
 
 - a corrupt payload escaping as the codec library's own exception (`zlib.error`, `ZstdError`, and a
   `TypeError` out of `DecompressionStream`);
@@ -96,3 +96,14 @@ Ten crash classes across the two implementations, nine of them shared or mirrore
 - and one that was not an exception at all: **a constant-mode stream declaring 2^30 elements**,
   which expands a one-byte payload into gigabytes. One flipped bit, 1.4 seconds, and the existing
   cap never saw it because it bounds the payload rather than what the payload becomes.
+
+The eleventh is `window-table-count-allocated-before-read`, and it is worth reading twice for where
+it was found rather than for what it was. A window table sized its output array from its declared
+`u32` count before anything checked that count against the record, so a corrupt count named a 68 GB
+table. Every other counted parser in that file appends to an array and runs out of input on its
+first read past the end; this one reserved first.
+
+It passed locally and failed in CI — on a machine with enough memory, an absurd allocation is just a
+slow success. That is why the TypeScript fuzzer runs under an address-space ceiling in CI: "never
+unbounded allocation" is not checkable on a host that can satisfy the allocation, and a bug that
+only appears on smaller machines is a bug that only appears on your users' machines.
