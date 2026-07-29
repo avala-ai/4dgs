@@ -93,19 +93,28 @@ jobs:
 
   typescript:
     name: Publish an @4dgs package to npm
-    # Disabled until the TypeScript packages are publishable. When enabling,
-    # re-read npm's trusted-publishing documentation rather than trusting this
-    # block: npm's OIDC support is newer than the other two registries' and its
-    # syntax has moved. What is certain is the shape — id-token: write, no
-    # NODE_AUTH_TOKEN, and a recent npm CLI.
+    # Disabled until the TypeScript packages are publishable.
+    #
+    # The repository's package manager is Yarn, and this job uses it for
+    # everything except the publish itself. That split is deliberate rather
+    # than sloppy: npm's trusted publishing is an OIDC token exchange the npm
+    # CLI performs, and no other client implements it. Yarn can publish
+    # (`yarn workspace <name> npm publish`), but only against a stored
+    # npmAuthToken — which is the credential this repository refuses to have.
+    # A token in a secret outlives the job that created it; an OIDC exchange
+    # does not. So Yarn installs and builds, npm publishes.
     if: false
     runs-on: ubuntu-latest
     environment: release
     permissions:
+      # The only permission a trusted-publishing job needs. No token, no secret.
       id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
+      # Node 22.14 or newer, because that is what npm 11.5.1 needs, and 11.5.1
+      # is the first npm that can exchange an OIDC token for a publish.
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -123,10 +132,21 @@ jobs:
             exit 1
           fi
 
-      - name: Publish
-        # TODO: confirm against npm's current trusted-publishing docs before
-        # this job is enabled. Provenance requires the repository to be public
-        # and the workflow to be the configured trusted publisher.
+      - name: Build what is about to be published
         run: |
+          corepack enable
+          yarn install --immutable
+          yarn build
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+
+      - name: Publish
+        # No --provenance: under trusted publishing npm attests automatically,
+        # and passing the flag is how a job ends up asking for provenance it is
+        # not configured to produce. `repository.url` in each package.json must
+        # match this repository exactly or the exchange is refused.
+        run: |
+          npm install -g npm@latest
+          npm --version
           rest="${GITHUB_REF#refs/tags/releases/typescript/}"
-          npm publish --workspace "typescript/${rest%/v*}" --provenance --access public
+          npm publish --workspace "typescript/${rest%/v*}" --access public
