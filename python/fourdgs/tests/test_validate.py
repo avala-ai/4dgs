@@ -23,22 +23,35 @@ from fourdgs.validate import validate
 RNG = np.random.default_rng(20260728)
 
 
-def minimal_file(*, header: rec.Header | None = None, extra: bytes = b"", footer: bytes | None = None) -> bytes:
+def grids(**overrides) -> rec.Quantization:
+    """A well-formed Quantization record, with any field replaceable."""
+    fields = {
+        "scheme": "uniform-v1",
+        "pos_origin": [0.0, 0.0, 0.0],
+        "step_pos": 1e-4,
+        "step_scale_log": 0.04,
+        "step_rot": 0.004,
+        "step_rgb": 0.008,
+        "step_alpha": 0.008,
+        "step_motion": 2e-4,
+        "step_time": 0.004,
+        "step_sigma_log": 0.04,
+        "step_sh": 1,
+    }
+    fields.update(overrides)
+    return rec.Quantization(**fields)
+
+
+def minimal_file(
+    *,
+    header: rec.Header | None = None,
+    quant: rec.Quantization | None = None,
+    extra: bytes = b"",
+    footer: bytes | None = None,
+) -> bytes:
     """The smallest thing that is meant to validate: header, grids, windows, footer."""
     head = header or rec.Header(duration_sec=1.0, gaussian_count=0, aabb=[0.0] * 6)
-    quant = rec.Quantization(
-        scheme="uniform-v1",
-        pos_origin=[0.0, 0.0, 0.0],
-        step_pos=1e-4,
-        step_scale_log=0.04,
-        step_rot=0.004,
-        step_rgb=0.008,
-        step_alpha=0.008,
-        step_motion=2e-4,
-        step_time=0.004,
-        step_sigma_log=0.04,
-        step_sh=1,
-    )
+    quant = quant or grids()
     body = head.encode() + quant.encode() + rec.WindowTable(windows=[(0.0, 1.0)]).encode() + extra
     return MAGIC + body + (footer if footer is not None else rec.Footer().encode()) + MAGIC
 
@@ -145,6 +158,50 @@ class TestRefusals:
         report = validate(bytes(data))
         assert not report.ok
         assert any("chunk index entry 0" in m for m in errors(report))
+
+    def test_a_non_finite_quantization_step_is_an_error(self):
+        # Spec §5.3: every step and origin must be finite. This is the corrupt field that
+        # ruins every gaussian rather than one — each bin times an infinite step decodes to
+        # infinity — and it is silent, because arithmetic on infinity is perfectly defined.
+        for name, value in (
+            ("step_pos", float("inf")),
+            ("step_motion", float("-inf")),
+            ("step_time", float("nan")),
+            ("step_sigma_log", float("inf")),
+        ):
+            report = validate(minimal_file(quant=grids(**{name: value})))
+            assert not report.ok, f"{name}={value} should be refused"
+            assert any(f"Quantization {name} is" in m and "must be finite" in m for m in errors(report)), errors(report)
+
+    def test_a_non_finite_position_origin_is_an_error(self):
+        # The origin is added after the step multiply, so an infinite one is just as fatal
+        # and just as quiet as an infinite step.
+        report = validate(minimal_file(quant=grids(pos_origin=[0.0, float("inf"), 0.0])))
+        assert not report.ok
+        assert any("Quantization pos_origin[1] is" in m for m in errors(report))
+
+    def test_every_quantization_parameter_is_covered(self):
+        # A field added to the record and forgotten here would be a hole nothing reports.
+        # Setting each in turn to infinity must produce an error naming that field.
+        numeric = [f"pos_origin[{i}]" for i in range(3)] + [
+            "step_pos",
+            "step_scale_log",
+            "step_rot",
+            "step_rgb",
+            "step_alpha",
+            "step_motion",
+            "step_time",
+            "step_sigma_log",
+        ]
+        for name in numeric:
+            if name.startswith("pos_origin"):
+                origin = [0.0, 0.0, 0.0]
+                origin[int(name[-2])] = float("inf")
+                quant = grids(pos_origin=origin)
+            else:
+                quant = grids(**{name: float("inf")})
+            report = validate(minimal_file(quant=quant))
+            assert any(f"Quantization {name} is" in m for m in errors(report)), f"{name} is not checked"
 
     def test_a_file_with_no_records_at_all(self):
         report = validate(MAGIC)

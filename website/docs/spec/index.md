@@ -244,6 +244,18 @@ in the unit of the attribute they name. A reader MAY ignore the map entirely —
 declaration, not an instruction — but a reader that surfaces it MUST use these names, so that two
 readers report the same number for the same file.
 
+**Every numeric parameter in this record MUST be finite** — the three components of `pos_origin` and
+all eight steps. Neither an infinity nor a NaN is a legal value for any of them.
+
+A non-finite step is not a coarser grid; it is not a grid at all. Every bin multiplied by it decodes
+to infinity or NaN, so a single such field turns the whole file's geometry into values with no
+position to occupy, and it does so for every gaussian at once rather than for the one that was
+corrupted. The rule constrains the parameters a writer may emit. It says nothing about the decode
+arithmetic in §6, which is unchanged, and it adds no obligation to a decoder: a decoder's duty on a
+malformed file is the one it already had, and this rule neither creates a new refusal nor removes an
+existing one. Validators are where it is enforced — a tool that reports why a file is wrong SHOULD
+report a non-finite quantization parameter as an error, naming the field.
+
 Each stored integer bin is multiplied by its step (and exponentiated, for the log-domain scale and
 sigma) to recover the value. Because every grid pitch is exactly twice its declared bound,
 `|decoded - original| <= bound` holds by construction. Producers SHOULD verify this exhaustively at
@@ -650,9 +662,20 @@ and the text was the bug.
 | §6.3 stated that `K` uses the Header's `cutoff` rather than the default                               | clarification             |
 | §6.5 added: spherical harmonic layout, whole degrees, and that `step_sh` is not applied at decode     | clarification             |
 | §4.5 added: the summary is exactly Chunk Index, Statistics and Summary Offset, and is contiguous      | rule added                |
+| §5.3 added: every quantization step and origin MUST be finite                                         | rule added                |
+
+The §5.3 row is a tightening of what a **writer** may emit, and it changes no existing file: every
+quantization parameter any encoder here has ever written is finite, all 34 conformance variants
+already satisfy it, none was regenerated for it, and no file's bytes or meaning move. What it
+forbids is a value that only ever arrives by corruption. It is stated because the failure was silent
+in the wrong direction — a non-finite step decodes without complaint into geometry that is entirely
+infinity or NaN, and the first sign of it is a renderer drawing nothing rather than a reader saying
+why. Making it a rule is what lets a validator name the field instead of leaving the reader to infer
+it. It adds nothing to what a decoder must do; §6's arithmetic and every decoder's succeed-or-refuse
+behaviour are untouched.
 
 The §4.5 row is a tightening of what a **writer** may emit, not a migration. It changes no existing
-file: all 32 conformance variants already satisfy it, none was regenerated, and no file's bytes or
+file: all 34 conformance variants already satisfy it, none was regenerated, and no file's bytes or
 meaning move. What it forbids is a shape the layout diagram used to permit — an Attachment record
 sitting between the Statistics and Summary Offset records — which no encoder ever produced and which
 would have made a streamed checksum cost whatever the attachment weighed.

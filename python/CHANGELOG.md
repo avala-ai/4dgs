@@ -8,6 +8,13 @@ All notable changes to the Python package are documented here, following
 
 ### Added
 
+- `validate` reports a non-finite quantization step or position origin as an error, naming the
+  field, per the new spec §5.3. This changes no file anything here has ever written — every grid the
+  encoder emits is finite — and it adds nothing to what a decoder does: dequantization still
+  succeeds or refuses exactly as before. What it ends is the silence. Arithmetic on infinity is
+  perfectly well defined, so a single corrupt step decoded quietly into a scene whose every gaussian
+  was infinity or NaN, and the first sign of it was a renderer drawing an empty frame.
+
 - A fuzz suite, `tests/test_fuzz.py`, holding one invariant: for any input at all, a decoder either
   succeeds or raises a `FourdgsError`. Never a codec library's exception, never unbounded
   allocation, never a hang — an input that exceeds the time ceiling is a failure, not a slow test.
