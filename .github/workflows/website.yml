@@ -1,0 +1,67 @@
+name: Website
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "website/**"
+      - "package.json"
+      - "yarn.lock"
+      - ".github/workflows/website.yml"
+  # A pull request builds but does not deploy, so a broken link or a failing build is
+  # caught before it reaches main rather than after the deploy job has already run.
+  pull_request:
+    paths:
+      - "website/**"
+      - "package.json"
+      - "yarn.lock"
+      - ".github/workflows/website.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: website-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+
+      # The package manager is the one the root package.json declares, and the website is
+      # one of its workspaces.
+      - name: Install
+        run: |
+          corepack enable
+          yarn install --immutable
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+
+      # `onBrokenLinks: throw` makes this the link check too: a relative link between docs
+      # that no longer resolves fails here rather than shipping as a 404.
+      - name: Build
+        run: yarn workspace website build
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: website/build
+
+  deploy:
+    # Only main deploys. A pull request has already proved the site builds by this point.
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,4 @@
+# The website's generated output. It is not committed, and `prettier --check .` would
+# otherwise walk a few thousand emitted files to say nothing useful about any of them.
+website/build/
+website/.docusaurus/

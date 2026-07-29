@@ -32,3 +32,6 @@ Cargo.lock
 
 # Sanitizer and other out-of-tree CMake build directories
 build-*/
+
+# Docusaurus generated output
+website/.docusaurus/

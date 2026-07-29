@@ -1,0 +1,47 @@
+/**
+ * Site-wide styling. Everything here is local: no font, stylesheet or script is
+ * fetched from a third party, so the site works offline and behind a proxy and
+ * loads nothing the reader did not ask for.
+ */
+
+:root {
+  --ifm-color-primary: #2f6f8f;
+  --ifm-color-primary-dark: #2a6480;
+  --ifm-color-primary-darker: #285f79;
+  --ifm-color-primary-darkest: #214e64;
+  --ifm-color-primary-light: #347a9e;
+  --ifm-color-primary-lighter: #367fa5;
+  --ifm-color-primary-lightest: #3d90ba;
+
+  --ifm-font-family-base:
+    system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --ifm-font-family-monospace:
+    ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+
+  --ifm-code-font-size: 92%;
+  --docusaurus-highlighted-code-line-bg: rgb(0 0 0 / 10%);
+}
+
+[data-theme="dark"] {
+  --ifm-color-primary: #7fc4e4;
+  --ifm-color-primary-dark: #63b8de;
+  --ifm-color-primary-darker: #55b2db;
+  --ifm-color-primary-darkest: #2b9dd0;
+  --ifm-color-primary-light: #9bd0ea;
+  --ifm-color-primary-lighter: #a9d6ed;
+  --ifm-color-primary-lightest: #d3e9f6;
+
+  --docusaurus-highlighted-code-line-bg: rgb(0 0 0 / 30%);
+}
+
+/* The specification and registry are dense reference tables; give them room and
+   let the wide ones scroll on their own instead of the page. */
+.markdown table {
+  display: block;
+  overflow-x: auto;
+  font-size: 0.9rem;
+}
+
+.markdown h2 {
+  margin-top: 2.4rem;
+}

@@ -1,0 +1,85 @@
+.hero {
+  padding: 5rem 0 4rem;
+  border-bottom: 1px solid var(--ifm-toc-border-color);
+}
+
+.heroTitle {
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 3.5rem;
+  letter-spacing: -0.04em;
+  margin-bottom: 0.75rem;
+}
+
+.heroSubtitle {
+  font-size: 1.35rem;
+  font-weight: 400;
+  line-height: 1.5;
+  max-width: 42rem;
+  margin: 0 0 1rem;
+}
+
+.heroDetail {
+  max-width: 42rem;
+  margin: 0 0 2rem;
+  color: var(--ifm-color-emphasis-700);
+}
+
+.buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.section {
+  padding: 3.5rem 0;
+}
+
+.sectionTitle {
+  font-size: 1.6rem;
+  margin-bottom: 2rem;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr));
+  gap: 1.75rem 2.5rem;
+}
+
+.item h3 {
+  font-size: 1.05rem;
+  margin-bottom: 0.4rem;
+}
+
+.item p {
+  color: var(--ifm-color-emphasis-700);
+  margin-bottom: 0;
+}
+
+.languages {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin-bottom: 1.5rem;
+}
+
+.language {
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.9rem;
+  padding: 0.3rem 0.7rem;
+  border: 1px solid var(--ifm-toc-border-color);
+  border-radius: var(--ifm-global-radius);
+}
+
+@media (max-width: 768px) {
+  .hero {
+    padding: 3rem 0 2.5rem;
+  }
+
+  .heroTitle {
+    font-size: 2.5rem;
+  }
+
+  .heroSubtitle {
+    font-size: 1.15rem;
+  }
+}
