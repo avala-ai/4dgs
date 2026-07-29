@@ -1,13 +1,12 @@
 [package]
 name = "fourdgs"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
 license = "Apache-2.0"
 description = "Reader and writer for the 4dgs container format"
 homepage = "https://4dgs.dev"
 repository = "https://github.com/avala-ai/4dgs"
-publish = false
 
 [lib]
 name = "fourdgs"
