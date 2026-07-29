@@ -1,5 +1,8 @@
 # 4dgs
 
+[![PyPI][pypi-badge]][pypi] [![npm][npm-badge]][npm] [![crates.io][crates-badge]][crates]
+[![CI][ci-badge]][ci] [![Conformance][conformance-badge]][conformance]
+
 **4D gaussian splat video with native audio — one file, seekable.**
 
 A `.4dgs` file holds a whole moving gaussian-splat scene: gaussians whose position, opacity and
@@ -47,6 +50,10 @@ self-contained resource you can range-request and seek like a video.
 Package names are `fourdgs` where a registry will not take `4dgs`; the format, the CLI and the file
 extension are always `4dgs`. [RELEASING.md](RELEASING.md) has the constraint per registry.
 
+Packages are versioned independently. [CHANGELOG.md](CHANGELOG.md) indexes the per-package
+changelogs and logs every release; each one is also a
+[GitHub Release](https://github.com/avala-ai/4dgs/releases) carrying the same notes.
+
 Support is per-feature, not per-language: see the [feature matrix](website/docs/reference/index.md),
 which the conformance suite enforces.
 
@@ -80,3 +87,16 @@ changes follow a defined process; new language SDKs have a three-step recipe.
 ## License
 
 [Apache-2.0](LICENSE). See [NOTICE](NOTICE).
+
+[pypi-badge]: https://img.shields.io/pypi/v/fourdgs?style=flat-square&label=PyPI
+[pypi]: https://pypi.org/project/fourdgs/
+[npm-badge]: https://img.shields.io/npm/v/%404dgs%2Fcore?style=flat-square&label=npm
+[npm]: https://www.npmjs.com/package/@4dgs/core
+[crates-badge]: https://img.shields.io/crates/v/fourdgs?style=flat-square&label=crates.io
+[crates]: https://crates.io/crates/fourdgs
+[ci-badge]:
+  https://img.shields.io/github/actions/workflow/status/avala-ai/4dgs/ci.yml?branch=main&style=flat-square&label=CI
+[ci]: https://github.com/avala-ai/4dgs/actions/workflows/ci.yml
+[conformance-badge]:
+  https://img.shields.io/github/actions/workflow/status/avala-ai/4dgs/conformance.yml?branch=main&style=flat-square&label=conformance
+[conformance]: https://github.com/avala-ai/4dgs/actions/workflows/conformance.yml
