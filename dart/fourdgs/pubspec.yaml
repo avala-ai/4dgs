@@ -1,0 +1,28 @@
+name: fourdgs
+description: >-
+  A decoder for the 4dgs container format: 4D gaussian splat scenes with native
+  audio in a single seekable file. Streamed and indexed read paths, pure Dart.
+version: 0.1.0
+homepage: https://4dgs.dev
+repository: https://github.com/avala-ai/4dgs
+issue_tracker: https://github.com/avala-ai/4dgs/issues
+documentation: https://4dgs.dev/guides/getting-started/decode-dart
+topics:
+  - gaussian-splatting
+  - graphics
+  - codec
+  - binary-format
+
+environment:
+  sdk: ^3.7.0
+
+dependencies:
+  # The format's default stream codec is deflate, wrapped in a zlib frame. `archive`
+  # is pure Dart, so this package needs no platform and runs anywhere Dart does —
+  # which is the whole reason the decoder can be tested on the VM and shipped to a
+  # browser without a second implementation.
+  archive: ^4.0.0
+
+dev_dependencies:
+  lints: ^5.0.0
+  test: ^1.25.0

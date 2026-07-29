@@ -10,39 +10,39 @@ declarations. Nothing is marked `Yes` on the strength of code existing.
 Every row is filled in from a suite that runs: 39 valid variants and 6 invalid ones, over two read
 paths (streamed and indexed). A language takes the variants it declares support for, and what it
 declines is what this table records — 89 checks passing for Python, 77 for Rust, 67 each for
-TypeScript, C++ and Swift. Rust declines the refusal expectations; TypeScript, C++ and Swift decline
-those and the five variants that carry provenance records.
+TypeScript, C++, Swift and Dart. Rust declines the refusal expectations; TypeScript, C++, Swift and
+Dart decline those and the five variants that carry provenance records.
 
-| Feature                                              | Python | TypeScript | Rust    | C++     | Swift   |
-| ---------------------------------------------------- | ------ | ---------- | ------- | ------- | ------- |
-| Streaming decode                                     | Yes    | Yes        | Yes     | Yes     | Yes     |
-| Indexed / seeking decode                             | Yes    | Yes        | Yes     | Yes     | Yes     |
-| Range-request decode                                 | Yes    | Yes        | Yes     | Yes     | Yes     |
-| Truncated-file recovery                              | Yes    | Yes        | Yes     | Yes     | Yes     |
-| Chunk index                                          | Yes    | Yes        | Yes     | Yes     | Yes     |
-| Summary offsets                                      | Yes    | Yes        | Yes     | Yes     | Yes     |
-| CRC validation                                       | Yes    | Yes        | Yes     | Yes     | Yes     |
-| Quantized attributes                                 | Yes    | Yes        | Yes     | Yes     | Yes     |
-| Spherical harmonics, degree 1                        | Yes    | Yes        | Yes     | Yes     | Yes     |
-| Spherical harmonics, degree 2                        | Yes    | Yes        | Yes     | Yes     | Yes     |
-| Spherical harmonics, degree 3                        | Yes    | Yes        | Yes     | Yes     | Yes     |
-| SH band range-skipping                               | Yes    | Yes        | Yes     | Yes     | Yes     |
-| Embedded audio (optional, zero-overhead when absent) | Yes    | Yes        | Yes     | Yes     | Yes     |
-| Camera trajectory                                    | Yes    | Yes        | Yes     | Yes     | Yes     |
-| Metadata                                             | Yes    | Yes        | Yes     | Yes     | Yes     |
-| Attachments                                          | Yes    | Yes        | Yes     | Yes     | Yes     |
-| Statistics                                           | Yes    | Yes        | Yes     | Yes     | Yes     |
-| Provenance: coordinate frame + georeference          | Yes    | No         | Yes     | No      | No      |
-| Provenance: sensor calibration                       | Yes    | No         | Yes     | No      | No      |
-| Provenance: rig trajectory + pose interpolation      | Yes    | No         | Yes     | No      | No      |
-| Unknown-record skipping                              | Yes    | Yes        | Yes     | Yes     | Yes     |
-| Refusal diagnosis (named, not merely refused)        | Yes    | No         | No      | No      | No      |
-| Private-range records                                | Yes    | Yes        | Yes     | Yes     | Yes     |
-| Encode                                               | Yes    | Planned    | Yes     | Planned | Planned |
-| Chunked encode                                       | Yes    | Planned    | Yes     | Planned | Planned |
-| Summary writing                                      | Yes    | Planned    | Yes     | Planned | Planned |
-| Convert from PLY frame sequences                     | Yes    | No         | No      | No      | No      |
-| Inspect and validate                                 | Yes    | Planned    | Planned | Planned | Planned |
+| Feature                                              | Python | TypeScript | Rust    | C++     | Swift   | Dart    |
+| ---------------------------------------------------- | ------ | ---------- | ------- | ------- | ------- | ------- |
+| Streaming decode                                     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Indexed / seeking decode                             | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Range-request decode                                 | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Truncated-file recovery                              | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Chunk index                                          | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Summary offsets                                      | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| CRC validation                                       | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Quantized attributes                                 | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Spherical harmonics, degree 1                        | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Spherical harmonics, degree 2                        | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Spherical harmonics, degree 3                        | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| SH band range-skipping                               | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Embedded audio (optional, zero-overhead when absent) | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Camera trajectory                                    | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Metadata                                             | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Attachments                                          | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Statistics                                           | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Provenance: coordinate frame + georeference          | Yes    | No         | Yes     | No      | No      | No      |
+| Provenance: sensor calibration                       | Yes    | No         | Yes     | No      | No      | No      |
+| Provenance: rig trajectory + pose interpolation      | Yes    | No         | Yes     | No      | No      | No      |
+| Unknown-record skipping                              | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Refusal diagnosis (named, not merely refused)        | Yes    | No         | No      | No      | No      | No      |
+| Private-range records                                | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Encode                                               | Yes    | Planned    | Yes     | Planned | Planned | Planned |
+| Chunked encode                                       | Yes    | Planned    | Yes     | Planned | Planned | Planned |
+| Summary writing                                      | Yes    | Planned    | Yes     | Planned | Planned | Planned |
+| Convert from PLY frame sequences                     | Yes    | No         | No      | No      | No      | No      |
+| Inspect and validate                                 | Yes    | Planned    | Planned | Planned | Planned | Planned |
 
 ## Reading this table
 
@@ -60,21 +60,32 @@ and every SDK exposes audio as an optional value rather than an error state. Mos
 none; that is the common case, and it costs nothing.
 
 **Provenance** (spec §5.15) is the newest feature here and the clearest illustration of what this
-table is for. Python and Rust decode the four records and surface them; TypeScript, C++ and Swift do
-not, and say so. That is not a gap anyone has to close before the format is usable, because the
-records are optional and no Header flag announces them: an SDK that has never heard of opcode `0x20`
-skips it by length and decodes every gaussian in the file correctly. It was verified rather than
-assumed — TypeScript, given a file carrying all four records plus appended fields on them, produces
-output identical to the expectation with the provenance section removed, with no change to a line of
-TypeScript. C++ and Swift are bindings over the Rust core rather than independent decoders, so their
-`No` means the binding does not surface the records, not that nothing there can read them.
+table is for. Python and Rust decode the four records and surface them; TypeScript, C++, Swift and
+Dart do not, and say so. That is not a gap anyone has to close before the format is usable, because
+the records are optional and no Header flag announces them: an SDK that has never heard of opcode
+`0x20` skips it by length and decodes every gaussian in the file correctly. It was verified rather
+than assumed — TypeScript, given a file carrying all four records plus appended fields on them,
+produces output identical to the expectation with the provenance section removed, with no change to
+a line of TypeScript. C++ and Swift are bindings over the Rust core rather than independent
+decoders, so their `No` means the binding does not surface the records, not that nothing there can
+read them.
+
+Dart is the case that shows why the row is about _reporting_ rather than reading. It arrived after
+the family existed and skipped every provenance record on the first run of the corpus, decoding all
+five of those variants' gaussians correctly — including
+`TenWindows-AddExtraDataToRecords-…-WithGeodetic-WithRig-WithSensors`, which appends unknown fields
+to the records as well. What it does not do is put the family in its summary, so a diff would see a
+missing key and could not tell that apart from a decoder that got it wrong. Declining is how it says
+which of the two it is.
 
 **Range-request decode** is a property of the transport an SDK offers, not of the format: every SDK
 can decode from an arbitrary byte-range reader, but only some ship an HTTP one. TypeScript's and
 Rust's `Yes` cover the decode, which each indexed runner exercises over ranged reads; the HTTP
 transport TypeScript ships in `@4dgs/browser` is covered by that package's own tests, not by the
 corpus. Rust ships no HTTP transport at all — its core takes a `Readable`, and the C ABI takes the
-same thing as callbacks, so an HTTP reader belongs to the consumer.
+same thing as callbacks, so an HTTP reader belongs to the consumer. Dart is the same shape: the
+decoder takes a `FourdgsReadable`, ships an in-memory and a file transport, and leaves HTTP to the
+consumer.
 
 **Encode** stays `Planned` for TypeScript because there is no TypeScript encoder. The packages there
 decode; Python's encoder is the reference and Rust's is the production one.
@@ -88,9 +99,10 @@ variants — one coarsely chunked, one finely, at four and twenty-four chunks �
 both on both read paths in this repository's CI. Nothing about any decoder changed — the code was
 already right in all five, and the cells said `Planned` because the corpus could not prove it. That
 is the rule working as intended, and it is worth being precise about what the `Yes` now rests on:
-Python and Rust carry the band ranges as a table, TypeScript derives them from `(d + 1)^2 - 1`, and
-C++ and Swift reach the Rust core through the C ABI. So the row proves four independent derivations
-agree, not five.
+Python, Rust and Dart carry the band ranges as a table, TypeScript derives them from
+`(d + 1)^2 - 1`, and C++ and Swift reach the Rust core through the C ABI. So the row proves four
+independent derivations agree, not six — Dart's table is a fourth arrival at the same numbers, and
+C++ and Swift still share Rust's.
 
 **The Header's `profile` and `library`** are asserted by the canonical summary rather than having a
 row of their own. They were readable in every SDK from the start and asserted by none, which meant a
@@ -190,3 +202,14 @@ a header and the symbols behind it is not something a decode suite can see.
 
 **C++** and **Swift** take their surface from that C ABI — the header plus a thin shim per language.
 Swift targets visionOS and iOS.
+
+**Dart** is an independent decoder rather than a binding: pure Dart, no Flutter dependency, sharing
+no code with the other five. That is what makes its agreement with them worth something — the row it
+fills in is a sixth derivation from the specification, not a sixth caller of the same one. It runs
+on the Dart VM, inside Flutter, and compiled to JavaScript or Wasm, and its `dart:io` transport is a
+separate import so the decoder itself stays platform-free.
+
+Its arrival moved no other cell, but it did find one: the velocity precision class is derived from
+the Header's `cutoff`, and a decoder that assumes the default 0.05 decodes a minority of gaussians'
+motion on the wrong pitch. The corpus's `CustomCutoff` variant is what catches it — a reminder that
+a variant only earns its keep when some implementation gets it wrong.

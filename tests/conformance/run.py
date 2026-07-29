@@ -33,6 +33,10 @@ CPP_BUILD = os.path.join(ROOT, "cpp", "build", "conformance")
 #: Cargo puts workspace binaries in one place regardless of which crate declares them.
 RUST_BIN = os.path.join(ROOT, "target", "release")
 SWIFT_BIN = os.path.join(ROOT, "swift", ".build", "release")
+#: Dart's runners could be `dart run <script>`, and are compiled instead. A script
+#: always exists, so the "is it built?" test below would always pass and a machine
+#: without a Dart SDK would report 67 failures rather than a skip.
+DART_BIN = os.path.join(ROOT, "dart", "conformance", "build")
 
 #: Windows puts a suffix on an executable. The harness finds a runner by testing its path
 #: for existence, so without this every compiled family looks "not built" on Windows — and
@@ -60,6 +64,8 @@ RUNNERS = [
     ("rust", "rust/decode_indexed", [os.path.join(RUST_BIN, "decode_indexed" + EXE)]),
     ("swift", "swift/decode_streamed", [os.path.join(SWIFT_BIN, "decode_streamed" + EXE)]),
     ("swift", "swift/decode_indexed", [os.path.join(SWIFT_BIN, "decode_indexed" + EXE)]),
+    ("dart", "dart/decode_streamed", [os.path.join(DART_BIN, "decode_streamed" + EXE)]),
+    ("dart", "dart/decode_indexed", [os.path.join(DART_BIN, "decode_indexed" + EXE)]),
 ]
 
 
@@ -93,15 +99,22 @@ REFUSAL_FAMILIES = frozenset({"python"})
 #: shows up publicly — and declining a variant is how a runner says so.
 #:
 #: The provenance family (spec section 5.15) is optional and flagged, so declining it
-#: costs these three families nothing anywhere else: every variant that does not carry a
+#: costs these families nothing anywhere else: every variant that does not carry a
 #: provenance record is byte-identical to what it was before the family existed, and they
 #: pass all of them with no change at all. That is the forward-compatibility mechanism
 #: working, and it would be reported as thirty-four failures if the summary announced the
 #: family on files that do not use it.
+#:
+#: Declining is not the same as failing to read. Each of these decoders steps over a
+#: provenance record by its length and finishes the file correctly — that is what the
+#: `AddExtraDataToRecords` variants prove. What they do not do is *report* the family, so
+#: their summaries would omit a key the expectation carries, and a diff cannot tell that
+#: apart from a decoder that got it wrong.
 FAMILY_DECLINES: dict[str, tuple[str, ...]] = {
     "typescript": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig"),
     "cpp": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig"),
     "swift": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig"),
+    "dart": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig"),
 }
 
 

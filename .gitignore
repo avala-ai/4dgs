@@ -18,6 +18,12 @@ target/
 .build/
 .swiftpm/
 
+# Dart tooling output. The lockfiles are ignored on purpose: `fourdgs` is a library, so
+# pub resolves it against the consumer's constraints and a committed lock would describe
+# nobody's build but ours.
+.dart_tool/
+dart/**/pubspec.lock
+
 # Yarn keeps its cache globally; only the lockfile belongs in the tree
 .yarn/
 
