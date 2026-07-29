@@ -30,6 +30,7 @@ from fourdgs.indexed_reader import (
     read_camera,
     read_chunk,
     read_metadata,
+    read_provenance,
 )
 from fourdgs.readable import FileReadable
 
@@ -87,6 +88,9 @@ def run(path: str) -> str:
         camera = read_camera(source, scene)
         metadata = read_metadata(source, scene)
         attachments = read_attachments(source, scene)
+        # Framed at open, fetched here — the same contract the camera and the
+        # attachments have, and the reason no Header flag announces the family.
+        provenance = read_provenance(source, scene)
         _check_band_skipping(source, scene)
 
     table = np.asarray(scene.windows, dtype=np.float64).reshape(-1, 2) if scene.windows else np.zeros((1, 2))
@@ -136,6 +140,7 @@ def run(path: str) -> str:
             statistics=scene.statistics,
             summary_offsets=scene.summary_offsets,
             summary_crc_ok=scene.summary_crc_ok,
+            provenance=provenance,
         )
     )
 

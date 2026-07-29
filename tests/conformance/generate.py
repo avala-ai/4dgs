@@ -40,8 +40,23 @@ import fourdgs
 import invalid
 import scenarios
 from canonical import canonical, summarize
-from fourdgs.opcode import HEADER, QUANTIZATION
-from fourdgs.records import Attachment, Metadata
+from fourdgs.opcode import (
+    COORDINATE_FRAME,
+    GEODETIC_ANCHOR,
+    HEADER,
+    QUANTIZATION,
+    RIG_TRAJECTORY,
+    SENSOR_CALIBRATION,
+)
+from fourdgs.provenance import Provenance
+from fourdgs.records import (
+    Attachment,
+    CoordinateFrame,
+    GeodeticAnchor,
+    Metadata,
+    RigTrajectory,
+    SensorCalibration,
+)
 from fourdgs.serialization import put_record
 
 MAX_DATA_BYTES = 2_500_000
@@ -100,6 +115,14 @@ def build(scenario, flags) -> tuple[bytes, str]:
         # record's length from its header, not from where its own knowledge runs out.
         trailers[HEADER] = b"\x01\x00\x00\x00appended-header-field"
         trailers[QUANTIZATION] = b"\x02\x00\x00\x00appended-quantization-field"
+        # The provenance records are new and not frozen, which makes them the likeliest
+        # place a later revision appends. A reader must take their length from the record
+        # header rather than from where its own knowledge stops, and that has to be true
+        # on the day they ship rather than the day someone first appends to one.
+        trailers[COORDINATE_FRAME] = b"\x03\x00\x00\x00appended-frame-field"
+        trailers[SENSOR_CALIBRATION] = b"\x04\x00\x00\x00appended-sensor-field"
+        trailers[RIG_TRAJECTORY] = b"\x05\x00\x00\x00appended-trajectory-field"
+        trailers[GEODETIC_ANCHOR] = b"\x06\x00\x00\x00appended-anchor-field"
     if "WithAttachment" in flags:
         extra.append(Attachment(name="note.txt", media_type="text/plain", data=b"conformance").encode())
     if "WithMetadata" in flags:
@@ -123,6 +146,7 @@ def build(scenario, flags) -> tuple[bytes, str]:
         library="4dgs conformance generator",
         scene_profile="baked" if scenario.long_lived else "capture",
         metadata={"scenario": scenario.name} if "WithMetadata" in flags else None,
+        provenance=_provenance(scenarios.build_provenance(scenario, flags)),
         extra_records=tuple(extra),
         record_trailers=trailers,
         cutoff=0.2 if "CustomCutoff" in flags else 0.05,
@@ -145,6 +169,7 @@ def build(scenario, flags) -> tuple[bytes, str]:
             statistics=scene.statistics,
             summary_offsets=scene.summary_offsets,
             summary_crc_ok=scene.summary_crc_ok,
+            provenance=scene.provenance,
         )
     )
     return data, expectation
@@ -166,6 +191,21 @@ def build_invalid() -> list[tuple[str, bytes, str]]:
             raise AssertionError(f"{refusal.name}: the mutation changed nothing")
         out.append((refusal.name, data, canonical({"refused": refusal.code})))
     return out
+def _provenance(raw) -> Provenance | None:
+    """Turn the generator's plain description into records.
+
+    `scenarios.py` stays dependency-free and returns lists and dicts; the mapping onto
+    the library's types lives here, so a fixture is still readable without the library
+    installed.
+    """
+    if raw is None:
+        return None
+    prov = Provenance()
+    prov.frames = [CoordinateFrame(**f) for f in raw["frames"]]
+    prov.sensors = [SensorCalibration(**s) for s in raw["sensors"]]
+    prov.trajectories = [RigTrajectory(**t) for t in raw["trajectories"]]
+    prov.anchors = [GeodeticAnchor(**a) for a in raw["anchors"]]
+    return prov
 
 
 def write_corpus(target: str) -> dict[str, str]:

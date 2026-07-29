@@ -30,7 +30,9 @@ from .exceptions import (
 )
 from .gltf import GltfImport, from_gltf, to_gltf
 from .model import AudioTrack, CameraTrajectory, GaussianSet
+from .provenance import Pose, Provenance, pose_at
 from .quantization import Bounds, Steps
+from .records import CoordinateFrame, GeodeticAnchor, RigTrajectory, SensorCalibration
 from .stream_reader import Scene, read
 from .writer import WriteOptions, write
 
@@ -39,12 +41,18 @@ __all__ = [
     "BoundViolation",
     "Bounds",
     "CameraTrajectory",
+    "CoordinateFrame",
     "FourdgsError",
     "GaussianSet",
+    "GeodeticAnchor",
     "GltfImport",
     "InvalidInput",
     "MalformedFile",
+    "Pose",
+    "Provenance",
+    "RigTrajectory",
     "Scene",
+    "SensorCalibration",
     "Steps",
     "TruncatedFile",
     "UnsupportedCodec",
@@ -52,6 +60,7 @@ __all__ = [
     "WriteOptions",
     "__version__",
     "from_gltf",
+    "pose_at",
     "read",
     "to_gltf",
     "write",

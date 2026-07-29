@@ -26,6 +26,20 @@ ATTACHMENT = 0x0D
 ATTACHMENT_INDEX = 0x0E
 SUMMARY_OFFSET = 0x0F
 
+# The provenance family, spec section 5.15. Assigned in dependency order: the two records
+# that carry poses come after the one that names the frame those poses are in.
+COORDINATE_FRAME = 0x20
+SENSOR_CALIBRATION = 0x21
+RIG_TRAJECTORY = 0x22
+# Defined after the three above, so it took the next free number rather than a tidier
+# one. An opcode is not something a later revision gets to renumber.
+GEODETIC_ANCHOR = 0x23
+
+#: First opcode of the provenance family, and one past its last. `0x24`-`0x2F` are
+#: reserved for source timing and the per-gaussian label work (spec section 5.15.6).
+PROVENANCE_START = 0x20
+PROVENANCE_END = 0x30
+
 #: Records a version-1 reader must understand; their fields are frozen.
 FROZEN = frozenset({HEADER, FOOTER, QUANTIZATION, WINDOW_TABLE, CHUNK, ATTRIBUTE_STREAM, CHUNK_INDEX})
 
@@ -47,7 +61,16 @@ NAMES = {
     ATTACHMENT: "Attachment",
     ATTACHMENT_INDEX: "AttachmentIndex",
     SUMMARY_OFFSET: "SummaryOffset",
+    COORDINATE_FRAME: "CoordinateFrame",
+    SENSOR_CALIBRATION: "SensorCalibration",
+    RIG_TRAJECTORY: "RigTrajectory",
+    GEODETIC_ANCHOR: "GeodeticAnchor",
 }
+
+
+def is_provenance(opcode: int) -> bool:
+    """True for the provenance family, defined and reserved alike."""
+    return PROVENANCE_START <= opcode < PROVENANCE_END
 
 
 def is_private(opcode: int) -> bool:

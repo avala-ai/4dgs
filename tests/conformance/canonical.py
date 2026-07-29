@@ -43,6 +43,9 @@ FLOAT_DECIMALS = 6
 SAMPLE = 16
 #: How many camera keyframes appear in full, so a long trajectory cannot bloat a summary.
 CAMERA_KEYFRAMES = 4
+#: The same cap for a rig trajectory, which is unbounded for the same reason and worse:
+#: a ten-minute capture at 100 Hz is sixty thousand samples.
+RIG_SAMPLES = 4
 
 
 def num(value) -> float | None:
@@ -81,6 +84,7 @@ def summarize(
     statistics=None,
     summary_offsets=(),
     summary_crc_ok=None,
+    provenance=None,
 ) -> dict:
     """The statement every implementation must agree on for a variant."""
     n = gaussians.count
@@ -159,6 +163,20 @@ def summarize(
             for s in summary_offsets
         ],
         "summaryCrcOk": summary_crc_ok,
+        # Omitted entirely when the file carries no provenance, which is deliberate and
+        # is NOT the `audio` convention above.
+        #
+        # `audio` is `null` when absent because audio presence is a property of every
+        # file — the Header declares it either way — so both paths have to be visible in
+        # every variant or one of them is never checked. Provenance has no such flag and
+        # no such duty: a file that carries none is a file the record family does not
+        # apply to. Emitting `"provenance": null` on all thirty-four pre-existing variants
+        # would have changed every committed expectation and broken three SDKs that
+        # correctly skip the records by length — which is to say it would have reported
+        # the forward-compatibility mechanism working as a conformance failure. Absence
+        # here is the section not applying; the thirty-four variants without it are the
+        # assertion that a file without provenance is unchanged by the family existing.
+        **({} if not provenance else {"provenance": _provenance(provenance)}),
         "sh": _spherical_harmonics(gaussians, order),
         "sample": {
             "positions": rows(gaussians.positions, 3),
@@ -178,6 +196,128 @@ def summarize(
             "zeroMotionCount": str(still),
         },
     }
+
+
+def _provenance(prov) -> dict:
+    """Every readable provenance field, plus the arithmetic the fields imply.
+
+    The fields alone would not be enough. `Header.profile` was readable in every SDK
+    and asserted by none, so a binding that returned an empty string passed — and the
+    same hiding place exists one level up here: two implementations can agree on every
+    stored quaternion and still disagree about the pose halfway between two of them,
+    because slerp has a sign convention and clamping has an edge. So the summary
+    carries the interpolated poses as well as the samples, at probe times derived from
+    the decoded data alone, including one before the first sample and one after the
+    last.
+    """
+    from fourdgs.provenance import pose_at
+
+    trajectories = []
+    for t in prov.trajectories:
+        probes = _probe_times(t)
+        trajectories.append(
+            {
+                "name": t.name,
+                "interpolation": int(t.interpolation),
+                "sampleCount": str(t.sample_count),
+                "samples": [
+                    {
+                        "time": num(t.times[i]),
+                        "rotation": [num(v) for v in t.rotations[i]],
+                        "translation": [num(v) for v in t.translations[i]],
+                    }
+                    for i in range(min(t.sample_count, RIG_SAMPLES))
+                ],
+                "posesAt": [_pose_row(probe, pose_at(t, probe)) for probe in probes],
+            }
+        )
+
+    return {
+        "frames": [
+            {
+                "name": f.name,
+                "handedness": int(f.handedness),
+                "upAxis": int(f.up_axis),
+                "forwardAxis": int(f.forward_axis),
+                "lengthUnit": int(f.length_unit),
+                "metresPerUnit": num(f.metres_per_unit),
+                # The resolution rule, per frame: a consumer handed a file whose two unit
+                # fields disagree still has to produce one number, and this is it.
+                "metresPerUnitResolved": num(prov.metres_per_unit(f.name)),
+            }
+            for f in prov.frames
+        ],
+        "anchors": [
+            {
+                "frameName": a.frame_name,
+                "latitudeDeg": num(a.latitude_deg),
+                "longitudeDeg": num(a.longitude_deg),
+                "altitudeM": num(a.altitude_m),
+                "headingDeg": num(a.heading_deg),
+            }
+            for a in prov.anchors
+        ],
+        "sensors": [
+            {
+                "name": s.name,
+                "modality": s.modality,
+                "cameraModel": int(s.camera_model),
+                "widthPx": str(s.width_px),
+                "heightPx": str(s.height_px),
+                "fx": num(s.fx),
+                "fy": num(s.fy),
+                "cx": num(s.cx),
+                "cy": num(s.cy),
+                "distortion": [num(v) for v in s.distortion],
+                "rotation": [num(v) for v in s.rotation],
+                "translation": [num(v) for v in s.translation],
+                "poseReference": int(s.pose_reference),
+                "rigName": s.rig_name,
+            }
+            for s in prov.sensors
+        ],
+        "trajectories": trajectories,
+        # The composition rule, which is the one thing here no single record states and
+        # every consumer of a moving rig depends on.
+        "sensorPosesAt": [
+            _pose_row(probe, prov.sensor_pose_at(s.name, probe), sensor=s.name)
+            for s in prov.sensors
+            for probe in (_sensor_probe_time(prov, s),)
+        ],
+    }
+
+
+def _probe_times(trajectory) -> list[float]:
+    """Times a summary evaluates a trajectory at, derived from the trajectory itself.
+
+    Two of the five are outside the sample range on purpose: clamping is a rule, and a
+    rule no expectation exercises is a rule an implementation can decline to have.
+    """
+    if trajectory.sample_count == 0:
+        return []
+    first, last = trajectory.times[0], trajectory.times[-1]
+    return [first - 0.5, first, 0.5 * (first + last), last, last + 0.5]
+
+
+def _sensor_probe_time(prov, sensor) -> float:
+    """When to evaluate a sensor's scene pose: the midpoint of the rig it rides."""
+    trajectory = prov.trajectory(sensor.rig_name) if sensor.rig_name else None
+    if trajectory is None or trajectory.sample_count == 0:
+        return 0.0
+    return 0.5 * (trajectory.times[0] + trajectory.times[-1])
+
+
+def _pose_row(t: float, pose, sensor: str | None = None) -> dict:
+    row = {"time": num(t)}
+    if sensor is not None:
+        row["sensor"] = sensor
+    if pose is None:
+        row["rotation"] = None
+        row["translation"] = None
+        return row
+    row["rotation"] = [num(v) for v in pose.rotation]
+    row["translation"] = [num(v) for v in pose.translation]
+    return row
 
 
 def _camera(camera) -> dict:

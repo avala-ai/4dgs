@@ -88,8 +88,27 @@ def variants() -> list[str]:
 REFUSAL_FAMILIES = frozenset({"python"})
 
 
+#: Record families a language has not implemented, by the variant-name flags that carry
+#: them. A partial implementation is a supported state — the feature matrix is where it
+#: shows up publicly — and declining a variant is how a runner says so.
+#:
+#: The provenance family (spec section 5.15) is optional and flagged, so declining it
+#: costs these three families nothing anywhere else: every variant that does not carry a
+#: provenance record is byte-identical to what it was before the family existed, and they
+#: pass all of them with no change at all. That is the forward-compatibility mechanism
+#: working, and it would be reported as thirty-four failures if the summary announced the
+#: family on files that do not use it.
+FAMILY_DECLINES: dict[str, tuple[str, ...]] = {
+    "typescript": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig"),
+    "cpp": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig"),
+    "swift": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig"),
+}
+
+
 def supports(runner_name: str, variant: str) -> bool:
     family = runner_name.split("/", maxsplit=1)[0]
+    if any(flag in variant for flag in FAMILY_DECLINES.get(family, ())):
+        return False
     if variant.startswith(INVALID_PREFIX) and family not in REFUSAL_FAMILIES:
         return False
     if not runner_name.endswith("decode_indexed"):
