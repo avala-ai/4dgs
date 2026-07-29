@@ -12,11 +12,11 @@ All notable changes to the Python package are documented here, following
   a non-finite value in a quantized field (position, scale, rotation, colour, velocity, `mu_t`). It
   refused these before, but from inside the codec, with a message about a symbol exceeding 32 bits
   that named neither the field nor the gaussian; the one thing the caller needed to know was the one
-  thing it could not say. The unquantized fields are left alone: `+inf` in `sigma_t` means a
-  gaussian that never fades, and `+inf` in `win_hi` means a static asset present at every instant,
-  which is what the glTF import writes. NaN is refused in those three too — it is meaningful in none
-  of them, and it is the quiet kind of wrong, since a NaN sigma reads as never-fading and a NaN
-  window makes every visibility comparison false.
+  thing it could not say. The fields that are not quantized are left alone: `+inf` in `sigma_t`
+  means a gaussian that never fades, and `+inf` in `win_hi` means a static asset present at every
+  instant, which is what the glTF import writes. NaN is refused in those three too — it is
+  meaningful in none of them, and it is the quiet kind of wrong, since a NaN sigma reads as
+  never-fading and a NaN window makes every visibility comparison false.
 
 - `validate` checks **every** Quantization record as it walks the file, not only the one left in
   hand at the end. Nothing in the framing forbids a second, and a streamed decoder takes the first

@@ -168,8 +168,14 @@ def variants() -> list[tuple[Scenario, tuple[str, ...]]]:
     # coefficients each, so a whole degree is 3, then 8, then 15 per colour component; the
     # jump from band 2 to band 3 is the largest, and it is the only one where a reader that
     # sized a band by its own index rather than by the range table still lands inside the
-    # buffer. Both a chunked and an unchunked variant, because the per-band column
-    # arithmetic only runs per chunk when there is more than one to merge.
+    # buffer.
+    #
+    # Two variants, coarse and fine. NEITHER is unchunked, and the distinction is not
+    # chunked-versus-not: the top level of the chunk tree is the window table, so this
+    # four-window scenario yields four chunks with `UseChunks` off and twenty-four with it
+    # on. What the flag buys is subdivision *below* the window level — many more band-merge
+    # boundaries, and chunks holding as few as eight gaussians, which is where a per-chunk
+    # band width computed from the wrong count stops landing on a boundary by luck.
     add(mixed, "SHDegree3")
     add(mixed, "SHDegree3", "UseChunks")
 

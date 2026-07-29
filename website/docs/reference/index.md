@@ -67,12 +67,13 @@ files — the common interchange form — and produces a `.4dgs`. It lives in th
 it is a batch operation.
 
 **Spherical harmonics, degree 3** moved from `Planned` to `Yes` when the corpus gained two degree-3
-variants — one split across chunks, one not — and every SDK decoded both on both read paths in this
-repository's CI. Nothing about any decoder changed — the code was already right in all five, and the
-cells said `Planned` because the corpus could not prove it. That is the rule working as intended,
-and it is worth being precise about what the `Yes` now rests on: Python and Rust carry the band
-ranges as a table, TypeScript derives them from `(d + 1)^2 - 1`, and C++ and Swift reach the Rust
-core through the C ABI. So the row proves four independent derivations agree, not five.
+variants — one coarsely chunked, one finely, at four and twenty-four chunks — and every SDK decoded
+both on both read paths in this repository's CI. Nothing about any decoder changed — the code was
+already right in all five, and the cells said `Planned` because the corpus could not prove it. That
+is the rule working as intended, and it is worth being precise about what the `Yes` now rests on:
+Python and Rust carry the band ranges as a table, TypeScript derives them from `(d + 1)^2 - 1`, and
+C++ and Swift reach the Rust core through the C ABI. So the row proves four independent derivations
+agree, not five.
 
 **The Header's `profile` and `library`** are asserted by the canonical summary rather than having a
 row of their own. They were readable in every SDK from the start and asserted by none, which meant a

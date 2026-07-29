@@ -14,11 +14,11 @@ All notable changes to the Rust crate are documented here, following
   at the seed and `inf` was written as a quantization origin, against §5.3. One gaussian was enough;
   a whole axis of NaN was never needed, and no error was raised. `write_to_vec` now refuses a
   non-finite value in any **quantized** field — positions, scales, rotations, colours, motions,
-  `mu_t` — with `Error::InvalidInput`, naming the field and the gaussian. The unquantized fields are
-  deliberately left alone: `+inf` in `sigma_t` means a gaussian that never fades, and `+inf` in
-  `win_hi` means a static asset present at every instant, which is what the glTF import writes. NaN
-  is refused in those three too, since it is meaningful in none of them and quietly passes for a
-  deliberate value.
+  `mu_t` — with `Error::InvalidInput`, naming the field and the gaussian. The fields that are not
+  quantized are deliberately left alone: `+inf` in `sigma_t` means a gaussian that never fades, and
+  `+inf` in `win_hi` means a static asset present at every instant, which is what the glTF import
+  writes. NaN is refused in those three too, since it is meaningful in none of them and quietly
+  passes for a deliberate value.
 
 - `4dgs validate` checked only the last Quantization record parsed. Nothing in the framing forbids a
   second, and a streamed decoder takes the first grid it meets, so a file carrying a non-finite grid
