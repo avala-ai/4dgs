@@ -92,6 +92,24 @@ failed; that is a property of how that reader was built and not a requirement on
 
 ---
 
+## Constant streams are a repeat, not a payload
+
+A stream in `mode = 2` stores exactly `channels` symbols and an `element_count` that says how many
+times to repeat them. That count owes **nothing** to the size of the payload: forty compressed bytes
+can legally declare four billion elements, and every field involved is one a reader takes on trust
+from the file.
+
+So a decoder should represent a constant stream **lazily** — keep the one row and answer every index
+from it — rather than materializing the repeat into an array. Materializing it allocates whatever a
+crafted file asks for, from a file small enough that nothing else about it looks suspicious. The
+lazy form is also simply faster, since the repeat is exactly the information the stream was
+compressed to avoid stating.
+
+The same reasoning applies one level up: check a stream's `element_count` against the count its
+chunk declares **before** sizing anything from it. That turns "allocate, then notice the mismatch"
+into "refuse", which is the difference between a decoder that survives a hostile file and one that
+merely reports it afterwards.
+
 ## Decoding efficiently
 
 The decode path is simple arithmetic over large arrays, so the wins come from not fighting the
