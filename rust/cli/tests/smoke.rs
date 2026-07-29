@@ -289,3 +289,142 @@ fn field(json: &str, key: &str) -> u64 {
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| panic!("no {key} in {json}"))
 }
+
+// ---------------------------------------------------------------------------------------
+// The two validators are one validator, or they are worse than one.
+
+/// Build a file with `count` Quantization records, the one at `bad_at` carrying a
+/// non-finite `step_pos`. Written by hand rather than by the encoder, because the encoder
+/// now refuses to produce a non-finite grid — which is the point of the encoder check, and
+/// would otherwise leave both validators untestable against the file they exist to catch.
+fn file_with_grids(count: usize, bad_at: Option<usize>) -> Vec<u8> {
+    use fourdgs::records as rec;
+    use fourdgs::serialization::MAGIC;
+
+    let mut out = MAGIC.to_vec();
+    out.extend_from_slice(
+        &rec::Header {
+            duration_sec: 1.0,
+            gaussian_count: 0,
+            aabb: vec![0.0; 6],
+            ..Default::default()
+        }
+        .encode(&[]),
+    );
+    for i in 0..count {
+        let mut quant = rec::Quantization {
+            scheme: "uniform-v1".into(),
+            pos_origin: vec![0.0, 0.0, 0.0],
+            step_pos: 1e-4,
+            step_scale_log: 0.04,
+            step_rot: 0.004,
+            step_rgb: 0.008,
+            step_alpha: 0.008,
+            step_motion: 2e-4,
+            step_time: 0.004,
+            step_sigma_log: 0.04,
+            step_sh: 1,
+            bounds: Default::default(),
+        };
+        if bad_at == Some(i) {
+            quant.step_pos = f64::INFINITY;
+        }
+        out.extend_from_slice(&quant.encode(&[]));
+    }
+    out.extend_from_slice(
+        &rec::WindowTable {
+            windows: vec![(0.0, 1.0)],
+        }
+        .encode(),
+    );
+    out.extend_from_slice(&rec::Footer::default().encode());
+    out.extend_from_slice(&MAGIC);
+    out
+}
+
+/// The Python validator's findings for the same bytes, or `None` if it is not installed.
+///
+/// Both interpreter names are tried: the CI job that installs the package runs on Windows
+/// too, where `setup-python` provides `python` and `python3` may not resolve at all.
+///
+/// `PYTHONIOENCODING` is not optional. Writing to a pipe, Python encodes stdout with the
+/// locale's preferred encoding, which on a Windows runner is cp1252 — so the `§` in
+/// "must be finite (§5.3)" arrives as the single byte `0xA7` while the Rust tool writes it
+/// as UTF-8 `0xC2 0xA7`. Both are correct in their own encoding and the two tools do agree
+/// about the message; only the transport disagreed. Pinning it makes this a comparison of
+/// what the validators say rather than of how a pipe happened to spell it.
+fn python_findings(path: &Path) -> Option<Vec<String>> {
+    const PROGRAM: &str =
+        "import sys\nfrom fourdgs.cli import main\nsys.exit(main(['validate', sys.argv[1]]))";
+    for interpreter in ["python3", "python"] {
+        let Ok(out) = Command::new(interpreter)
+            .env("PYTHONIOENCODING", "utf-8")
+            .args(["-c", PROGRAM, path.to_str().unwrap()])
+            .output()
+        else {
+            continue; // no such interpreter
+        };
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        // The package missing prints an ImportError to stderr and nothing to stdout.
+        if text.is_empty() && !out.stderr.is_empty() {
+            continue;
+        }
+        return Some(findings(&text));
+    }
+    None
+}
+
+/// Only the findings. The trailing status line and the exit code differ between the two
+/// tools by design — the Rust one gives a warning its own exit code — and that divergence
+/// is documented where it is made rather than asserted away here.
+fn findings(text: &str) -> Vec<String> {
+    text.lines()
+        .filter(|l| {
+            l.starts_with("error: ") || l.starts_with("warning: ") || l.starts_with("note: ")
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn both_validators_say_the_same_thing_about_the_same_bytes() {
+    // The Rust validator mirrors the Python one deliberately, and a mirror is only worth
+    // having while it is checked. The duplicate-record cases are the ones that matter: a
+    // validator that inspects only the last Quantization record it parsed passes
+    // `bad_then_good` while a streamed decoder — which takes the first grid it meets —
+    // decodes the whole scene through the broken one. Both tools have to catch it, and
+    // say the same words about it.
+    let dir = std::env::temp_dir().join("fourdgs-xvalidate");
+    std::fs::create_dir_all(&dir).expect("a scratch directory");
+
+    let cases: [(&str, Vec<u8>); 4] = [
+        ("clean", file_with_grids(1, None)),
+        ("single_bad", file_with_grids(1, Some(0))),
+        ("bad_then_good", file_with_grids(2, Some(0))),
+        ("good_then_bad", file_with_grids(2, Some(1))),
+    ];
+
+    let mut compared = 0;
+    for (name, bytes) in cases {
+        let path = dir.join(format!("{name}.4dgs"));
+        std::fs::write(&path, &bytes).expect("write the fixture");
+
+        let ours = findings(&stdout(&run(&["validate", path.to_str().unwrap()])));
+        let Some(theirs) = python_findings(&path) else {
+            // Not installed. CI installs it before this suite; locally a contributor
+            // without the Python package still gets a green run.
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "CI installs the Python package before this suite, so a run that could not \
+                 reach it is a comparison that silently did not happen"
+            );
+            return;
+        };
+        assert_eq!(
+            ours, theirs,
+            "the two validators disagree about {name}.4dgs"
+        );
+        compared += 1;
+    }
+    assert_eq!(compared, 4, "every case must actually have been compared");
+}

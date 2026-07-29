@@ -24,7 +24,9 @@ All notable changes to the Rust crate are documented here, following
   second, and a streamed decoder takes the first grid it meets, so a file carrying a non-finite grid
   followed by a clean one validated green while decoding entirely through the broken one. Each
   record is now checked as it is walked, and the report names which copy when there is more than
-  one.
+  one. A test now runs both validators over the same bytes — including the duplicate-record case —
+  and requires their findings to match line for line, so the mirror cannot drift again without
+  saying so.
 
 ### Added
 
