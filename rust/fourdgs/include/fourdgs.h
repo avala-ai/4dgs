@@ -47,6 +47,23 @@
  * The one exception is `fourdgs_scene_audio_codec`, which predates this rule and returns a
  * NUL-terminated registry name.
  *
+ * CALL FIRST, THEN READ THE OUT PARAMETERS. The two-out-parameter shape invites one
+ * specific bug, and it is silent in both C and C++: argument evaluation order is
+ * unspecified, so a helper written as
+ *
+ *     return borrowed(fourdgs_scene_temporal_model(scene, &data, &length), data, length);
+ *
+ * may read `data` and `length` BEFORE the call that fills them. No warning, no crash — an
+ * empty string every time, from a call that returned FOURDGS_STATUS_OK. Sequence it:
+ *
+ *     const char *data = NULL;
+ *     size_t length = 0;
+ *     int status = fourdgs_scene_temporal_model(scene, &data, &length);
+ *     if (status != FOURDGS_STATUS_OK) return ...;
+ *     use(data, length);
+ *
+ * The same applies to every accessor here that fills more than one out parameter.
+ *
  * ---------------------------------------------------------------------------
  * THREADING
  *
