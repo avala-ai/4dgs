@@ -30,6 +30,7 @@ from .quantization import (
     rct_inverse,
     support_k,
 )
+from .registry import check_quantization_scheme, check_temporal_model
 from .serialization import (
     CODEC_DEFLATE,
     CODEC_ZSTD,
@@ -121,7 +122,8 @@ def decode_streams(
         if values.shape[0] != count or values.shape[1] < 1:
             raise MalformedFile(
                 f"attribute {attribute} decoded to {values.shape[0]}x{values.shape[1]}, "
-                f"the chunk declares {count} gaussians"
+                f"the chunk declares {count} gaussians",
+                code="stream-element-count-mismatch",
             )
     if not count:
         empty = np.zeros((0, 3), dtype=np.float64)
@@ -230,7 +232,10 @@ def check_window_indices(window_index: np.ndarray, count: int) -> None:
     lo = int(window_index.min())
     hi = int(window_index.max())
     if lo < 0 or hi >= count:
-        raise MalformedFile(f"window index {lo if lo < 0 else hi} is outside the {count}-entry window table")
+        raise MalformedFile(
+            f"window index {lo if lo < 0 else hi} is outside the {count}-entry window table",
+            code="window-index-out-of-range",
+        )
 
 
 def chunk_stream_bytes(head: rec.ChunkHeader, streams) -> bytes:
@@ -275,8 +280,10 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
             end = record.offset + 9 + len(record.content)
             if record.opcode == op.HEADER:
                 header = rec.Header.parse(record.content)
+                check_temporal_model(header.temporal_model)
             elif record.opcode == op.QUANTIZATION:
                 quant = rec.Quantization.parse(record.content)
+                check_quantization_scheme(quant.scheme)
             elif record.opcode == op.WINDOW_TABLE:
                 windows = rec.WindowTable.parse(record.content).windows
             elif record.opcode == op.CHUNK:

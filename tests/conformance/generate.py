@@ -30,12 +30,14 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "data")
+INVALID = os.path.join(DATA, "invalid")
 CHECKSUMS = os.path.join(DATA, "CHECKSUMS.txt")
 sys.path.insert(0, os.path.join(HERE, "generator"))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "..", "python", "fourdgs"))
 
 import fourdgs
+import invalid
 import scenarios
 from canonical import canonical, summarize
 from fourdgs.opcode import HEADER, QUANTIZATION
@@ -148,6 +150,24 @@ def build(scenario, flags) -> tuple[bytes, str]:
     return data, expectation
 
 
+def build_invalid() -> list[tuple[str, bytes, str]]:
+    """Every invalid variant: `(name, bytes, expectation)`.
+
+    The base is one valid variant, mutated once per refusal. Building it here rather than
+    in `invalid.py` keeps that file a declaration — what is broken and what a reader must
+    say — with no dependency on the encoder.
+    """
+    base_scenario = next(s for s in scenarios.SCENARIOS if s.name == invalid.BASE_SCENARIO)
+    base, _ = build(base_scenario, tuple(sorted(invalid.BASE_FLAGS)))
+    out = []
+    for refusal in invalid.REFUSALS:
+        data = refusal.mutate(base)
+        if data == base:
+            raise AssertionError(f"{refusal.name}: the mutation changed nothing")
+        out.append((refusal.name, data, canonical({"refused": refusal.code})))
+    return out
+
+
 def write_corpus(target: str) -> dict[str, str]:
     os.makedirs(target, exist_ok=True)
     checksums: dict[str, str] = {}
@@ -159,6 +179,15 @@ def write_corpus(target: str) -> dict[str, str]:
         with open(os.path.join(target, f"{name}.json"), "w", encoding="utf-8") as fh:
             fh.write(expectation + "\n")
         checksums[name] = hashlib.sha256(data).hexdigest()
+
+    invalid_dir = os.path.join(target, "invalid")
+    os.makedirs(invalid_dir, exist_ok=True)
+    for name, data, expectation in build_invalid():
+        with open(os.path.join(invalid_dir, f"{name}.4dgs"), "wb") as fh:
+            fh.write(data)
+        with open(os.path.join(invalid_dir, f"{name}.json"), "w", encoding="utf-8") as fh:
+            fh.write(expectation + "\n")
+        checksums[f"invalid/{name}"] = hashlib.sha256(data).hexdigest()
     return checksums
 
 
@@ -191,7 +220,12 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     checksums = write_corpus(DATA)
-    total = sum(os.path.getsize(os.path.join(DATA, f)) for f in os.listdir(DATA))
+    total = sum(
+        os.path.getsize(os.path.join(root, f))
+        for root in (DATA, INVALID)
+        for f in os.listdir(root)
+        if os.path.isfile(os.path.join(root, f))
+    )
     print(f"{len(checksums)} variants, {total / 1024:.0f} KiB in {DATA}")
 
     if total > MAX_DATA_BYTES:
@@ -226,6 +260,8 @@ def _verify(checksums: dict[str, str]) -> bool:
     for scenario, flags in scenarios.variants():
         data, _ = build(scenario, flags)
         second[scenarios.variant_name(scenario, flags)] = hashlib.sha256(data).hexdigest()
+    for name, data, _ in build_invalid():
+        second[f"invalid/{name}"] = hashlib.sha256(data).hexdigest()
     for name, digest in checksums.items():
         if second.get(name) != digest:
             failures.append(f"{name}: encoder is not deterministic between runs")

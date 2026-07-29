@@ -46,6 +46,32 @@ A runner declares a name and a `supportsVariant(variant)` predicate. **A partial
 expected**: a variant a runner declines is skipped rather than failed, and the feature matrix is
 where that shows up publicly. Adding a language needs one stdout CLI and one line in `RUNNERS`.
 
+## Files that must be refused
+
+A corpus of valid files proves only that a decoder accepts what it should. Much of the specification
+is rules whose whole content is a refusal — an out-of-range window index, an unimplemented codec, a
+temporal model the reader does not know — and a decoder that ignores all of them passes every valid
+variant.
+
+`generator/invalid.py` declares the other half: length-preserving byte mutations of one valid base
+file, each breaking exactly one rule, each paired with the **refusal identifier** a conforming
+reader must produce. The expectation is `{ "refused": "window-index-out-of-range" }`, and the runner
+prints it on stdout and exits 0 — a refusal is a result, not a crash, and collapsing it into a
+non-zero exit would make "refused correctly" indistinguishable from "fell over".
+
+The identifier matters more than it looks. "Both decoders raised an error" is not agreement: one of
+them may have refused for the wrong reason, which is precisely the failure a negative test exists to
+catch. The identifier names the rule, and it is the same string in every language.
+
+Every rule in this corpus already existed in version 1 — nothing here is new specification, so the
+contract is proved against rules that predate it. It found three real faults on its first run:
+neither an unknown `temporal_model` nor an unknown quantization `scheme` was refused at all, both
+decoding silently as the known value, and a corrupt first byte was reported as an unsupported
+version 1.
+
+Truncation is deliberately not here. A cut file is recoverable rather than refusable, and each
+runner still checks that against the valid corpus.
+
 ## Canonical JSON
 
 So two languages can be diffed without arguing about representation, the summary each runner prints

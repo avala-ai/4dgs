@@ -29,6 +29,65 @@ seed — which is otherwise invisible until someone else's CI fails.
 Hard cap: `data/` stays under 2.5 MB. If new variants push past it, prune combinations; do not raise
 the cap.
 
+## The invalid corpus: files that must be refused
+
+A corpus of valid files can only prove that a decoder accepts what it should. It cannot prove that a
+decoder **refuses** what it should — and a large part of this specification is rules whose entire
+content is a refusal: a window index outside its table, a codec this build does not implement, a
+temporal model this reader has never heard of. A decoder that ignores every one of them passes all
+34 valid variants.
+
+`generator/invalid.py` declares the other half. Each entry is a length-preserving byte mutation of
+one valid base file, chosen so that **exactly one** rule is broken, paired with the **refusal
+identifier** a conforming reader must produce. `data/invalid/<Name>.json` is the expectation, and it
+looks like this:
+
+```json
+{ "refused": "window-index-out-of-range" }
+```
+
+### Why an identifier and not an exception type
+
+"Both decoders raised an error" is not agreement. `MalformedFile` covers a dozen distinct faults, so
+a negative test that only checks that something was raised passes when a decoder refuses for the
+wrong reason — which is the failure mode a negative test is supposed to catch. The identifier says
+**which rule**, and it is the same string in every language.
+
+The identifiers are declared once, in `invalid.py`. A language does not invent one.
+
+### The runner contract
+
+A refusal is a **result, not a crash**: the runner prints `{"refused": "<id>"}` on stdout and exits
+0, and the harness diffs it like any other answer. Exiting non-zero would collapse "refused
+correctly" and "fell over" into one outcome, and those are exactly what this corpus exists to tell
+apart.
+
+An exception carrying no identifier prints an empty one, which matches no expectation and fails with
+a readable diff. A refusal a library cannot name is one the suite cannot check, and it should look
+like a gap rather than a pass.
+
+`REFUSAL_FAMILIES` in `run.py` lists the families whose runners answer these. A family absent from
+it skips the invalid corpus exactly as it would skip any variant it declines, and the feature matrix
+is where that shows up publicly.
+
+### Every rule here already existed
+
+Nothing in the invalid corpus is new specification. That is deliberate: the contract is exercised
+against rules that predate it, rather than arriving at the same time as the rules it is meant to
+police. A harness feature whose only exercise is the feature it was built for has not been tested —
+it has been co-designed with its single test.
+
+It earned its keep on the first run. Two rules the specification states plainly were not enforced by
+the reference reader at all: an unknown `temporal_model` and an unknown quantization `scheme` both
+decoded as though they were the known value, silently, into a scene that looks entirely plausible.
+And a file whose first byte was corrupt was reported as an unsupported _version 1_ — an error that
+sends its holder looking for a newer reader that would have refused it too.
+
+### Truncation is not in here
+
+A cut file is recoverable, not refusable: records are length-prefixed and a reader should salvage
+the intact prefix. Truncation stays where it was, checked by each runner against the valid corpus.
+
 ## Synthetic only
 
 Every scene is generated from a fixed seed by `build_gaussians`, and the audio track is a generated

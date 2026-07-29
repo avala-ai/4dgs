@@ -63,14 +63,44 @@ RUNNERS = [
 ]
 
 
+INVALID = os.path.join(DATA, "invalid")
+
+#: Invalid variants are named with this prefix, which is also their subdirectory. A
+#: runner is handed the same thing either way — a path — and the harness compares the
+#: same thing either way: parsed JSON against a committed expectation. What differs is
+#: only what a correct answer looks like.
+INVALID_PREFIX = "invalid/"
+
+
 def variants() -> list[str]:
-    return sorted(f[: -len(".json")] for f in os.listdir(DATA) if f.endswith(".json"))
+    valid = sorted(f[: -len(".json")] for f in os.listdir(DATA) if f.endswith(".json"))
+    refusals = []
+    if os.path.isdir(INVALID):
+        refusals = sorted(INVALID_PREFIX + f[: -len(".json")] for f in os.listdir(INVALID) if f.endswith(".json"))
+    return valid + refusals
+
+
+#: Families whose runners answer a refusal expectation — printing `{"refused": "<id>"}`
+#: for a file they refuse, rather than exiting non-zero. A family absent here SKIPS the
+#: invalid corpus, exactly as it would skip any variant it declines, and the feature
+#: matrix is where that shows up publicly. Adding a language is one entry here plus the
+#: few lines in its runner that catch the refusal and print its identifier.
+REFUSAL_FAMILIES = frozenset({"python"})
 
 
 def supports(runner_name: str, variant: str) -> bool:
-    if runner_name.endswith("decode_indexed"):
-        return "UseChunkIndex" in variant
-    return True
+    family = runner_name.split("/", maxsplit=1)[0]
+    if variant.startswith(INVALID_PREFIX) and family not in REFUSAL_FAMILIES:
+        return False
+    if not runner_name.endswith("decode_indexed"):
+        return True
+    # The invalid corpus is cut from a variant that carries an index, so both read paths
+    # can be asked to refuse it. That matters: the two paths reach the Header by
+    # different routes — one front to back, one through the Footer — and a check placed
+    # on only one of them refuses half the files it should.
+    if variant.startswith(INVALID_PREFIX):
+        return True
+    return "UseChunkIndex" in variant
 
 
 def main(argv=None) -> int:
@@ -97,8 +127,11 @@ def main(argv=None) -> int:
             if not supports(runner_name, variant):
                 skipped += 1
                 continue
-            path = os.path.join(DATA, f"{variant}.4dgs")
-            expectation_path = os.path.join(DATA, f"{variant}.json")
+            # `variant` may carry the invalid corpus's `invalid/` prefix; split it so
+            # the separator is the platform's rather than the name's.
+            parts = variant.split("/")
+            path = os.path.join(DATA, *parts[:-1], f"{parts[-1]}.4dgs")
+            expectation_path = os.path.join(DATA, *parts[:-1], f"{parts[-1]}.json")
             # check=False: a runner exiting non-zero is a reportable failure, not an
             # exception — the harness prints it alongside the others.
             result = subprocess.run([*command, path], capture_output=True, text=True, check=False)

@@ -24,6 +24,7 @@ from . import opcode as op
 from . import records as rec
 from .exceptions import MalformedFile
 from .readable import Readable
+from .registry import check_quantization_scheme, check_temporal_model
 from .serialization import MAGIC, Cursor, check_magic, crc32, iter_records, read_record
 from .stream_reader import chunk_stream_bytes, decode_streams, steps_from
 
@@ -180,8 +181,10 @@ def open_indexed(source: Readable) -> IndexedScene:
             break
         if record.opcode == op.HEADER:
             header = rec.Header.parse(front.content(record))
+            check_temporal_model(header.temporal_model)
         elif record.opcode == op.QUANTIZATION:
             quant = rec.Quantization.parse(front.content(record))
+            check_quantization_scheme(quant.scheme)
         elif record.opcode == op.WINDOW_TABLE:
             windows = rec.WindowTable.parse(front.content(record)).windows
         elif record.opcode == op.AUDIO:
