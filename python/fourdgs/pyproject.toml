@@ -22,8 +22,9 @@ dev = ["pytest>=8", "ruff==0.16.0"]
 fourdgs = "fourdgs.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/avala-ai/4dgs"
-Specification = "https://github.com/avala-ai/4dgs/blob/main/website/docs/spec/index.md"
+Homepage = "https://4dgs.dev"
+Repository = "https://github.com/avala-ai/4dgs"
+Specification = "https://4dgs.dev/docs/spec/"
 
 [tool.setuptools.packages.find]
 include = ["fourdgs*"]

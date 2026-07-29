@@ -5,6 +5,9 @@
 
 **4D gaussian splat video with native audio — one file, seekable.**
 
+Documentation lives at **[4dgs.dev](https://4dgs.dev)** — the specification, per-language guides,
+and the conformance story, rendered from this repository.
+
 A `.4dgs` file holds a whole moving gaussian-splat scene: gaussians whose position, opacity and
 existence vary continuously over time, plus an optional soundtrack and a default camera, in a single
 self-contained resource you can range-request and seek like a video.

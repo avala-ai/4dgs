@@ -1,6 +1,6 @@
 # Website
 
-The documentation site, published to <https://avala-ai.github.io/4dgs/> by
+The documentation site, published to <https://4dgs.dev/> by
 [`.github/workflows/website.yml`](../.github/workflows/website.yml) on every push to `main` that
 touches `website/`.
 
