@@ -8,13 +8,15 @@ The four packages version together.
 
 ## [Unreleased]
 
-### Fixed
+## [0.1.0] - 2026-07-29
 
-- `@4dgs/core`: the window-table parser allocated its output from the record's declared count before
-  reading a byte, so a corrupt count named a 68 GB allocation and crashed a memory-limited runtime
-  instead of refusing the file. The count is now proven against the bytes that remain first. The
-  chunk-level `uncompressedSize` had the same shape on the decompression path and is now held to the
-  same cap as a stream's.
+The first release of the TypeScript packages, and the first cut from a tag. The four packages
+version together, so `@4dgs/core`, `@4dgs/browser`, `@4dgs/nodejs` and `@4dgs/codecs` are all 0.1.0
+and each depends on the others at that version.
+
+_Fixed_ and _Changed_ below describe behaviour that changed against the pre-release code in this
+repository, which people do vendor from git — not against `0.0.1`, which held the `@4dgs` scope on
+npm and contained nothing.
 
 ### Added
 
@@ -43,6 +45,11 @@ The four packages version together.
 
 ### Fixed
 
+- `@4dgs/core`: the window-table parser allocated its output from the record's declared count before
+  reading a byte, so a corrupt count named a 68 GB allocation and crashed a memory-limited runtime
+  instead of refusing the file. The count is now proven against the bytes that remain first. The
+  chunk-level `uncompressedSize` had the same shape on the decompression path and is now held to the
+  same cap as a stream's.
 - **Crash classes found by fuzzing.** A corrupt payload escaped as whatever the runtime's inflater
   throws — a `TypeError` from Node's `DecompressionStream` — and a chunk, band, audio or record
   range pointing outside the file escaped as a `RangeError` from the transport. Both are
@@ -57,3 +64,9 @@ The four packages version together.
 
 - **A window index outside the Window Table is refused rather than clamped**, matching the
   specification's rule. A reader that relied on the old behaviour will now see `MalformedFile`.
+
+## [0.0.1] - 2026-07-28
+
+Name reservations, published by hand before the release workflow existed: npm refused the unscoped
+`4dgs`, so the `@4dgs` scope was claimed before there was anything to put in it. All four packages
+contain no implementation, have no tag and no GitHub Release, and nothing should depend on them.

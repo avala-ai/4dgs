@@ -165,8 +165,7 @@ jobs:
 
   typescript:
     name: Publish an @4dgs package to npm
-    # Disabled until the TypeScript packages are publishable.
-    #
+    if: startsWith(github.ref, 'refs/tags/releases/typescript/')
     # The repository's package manager is Yarn, and this job uses it for
     # everything except the publish itself. That split is deliberate rather
     # than sloppy: npm's trusted publishing is an OIDC token exchange the npm
@@ -184,7 +183,6 @@ jobs:
     # First real release must version past 0.0.1: the placeholder publishes
     # that claimed the @4dgs scope sit at 0.0.1 on the registry, and npm
     # refuses to tag a lower version as latest.
-    if: false
     runs-on: ubuntu-latest
     environment: release
     permissions:
