@@ -581,3 +581,60 @@ def test_keyframe_delta_export_refuses_a_bad_fps(tmp_path):
 def test_keyframe_delta_export_refuses_an_unwritable_extension(tmp_path):
     with pytest.raises(MalformedFile, match="usda"):
         to_usd_keyframe_delta(str(tmp_path / "x.gltf"), _kd_churn_bytes(), coordinate_system="y-up-right-handed")
+
+
+def test_cli_to_usd_routes_a_keyframe_delta_file_to_the_animated_path(tmp_path):
+    """`fourdgs to-usd` on a keyframe-delta file exports animated time samples.
+
+    The ordinary reader refuses a keyframe-delta file, so the command peeks the Header's
+    temporal model and routes to the animated exporter rather than the static snapshot.
+    """
+    import types
+
+    from fourdgs import cli
+
+    source = tmp_path / "kd.4dgs"
+    source.write_bytes(_kd_churn_bytes())
+    out = tmp_path / "kd.usda"
+    args = types.SimpleNamespace(
+        file=str(source),
+        out=str(out),
+        time=0.0,
+        coordinate_system="y-up-right-handed",
+        color_space=None,
+        meters_per_unit=None,
+        sh_degree=3,
+        animated=False,  # ignored for keyframe-delta: it has no static snapshot
+        fps=2.0,
+    )
+    assert cli.cmd_to_usd(args) == 0
+    stage, _ = read_prim(str(out))
+    # 8s at 2 fps is time codes 0..16, so the export is genuinely animated.
+    assert stage.GetEndTimeCode() == 16.0
+
+
+def test_cli_to_usd_still_snapshots_a_gaussian_birth_file(tmp_path):
+    """The dispatch does not disturb the gaussian-birth path: it still writes a snapshot."""
+    import types
+
+    from fourdgs import cli
+
+    g, duration = temporal_scene(48)
+    source = tmp_path / "gb.4dgs"
+    source.write_bytes(_encode(g, duration, coordinate_system="y-up-right-handed"))
+    out = tmp_path / "gb.usda"
+    args = types.SimpleNamespace(
+        file=str(source),
+        out=str(out),
+        time=0.5,
+        coordinate_system=None,
+        color_space=None,
+        meters_per_unit=None,
+        sh_degree=3,
+        animated=False,
+        fps=30.0,
+    )
+    assert cli.cmd_to_usd(args) == 0
+    stage, _ = read_prim(str(out))
+    # A snapshot writes default values, not a time-sampled range.
+    assert stage.GetEndTimeCode() == 0.0

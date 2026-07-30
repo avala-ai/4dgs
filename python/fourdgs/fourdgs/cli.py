@@ -17,10 +17,11 @@ import sys
 import numpy as np
 
 from . import __version__, read
+from . import opcode as op
 from .compressed_ply import import_scene as import_compressed_ply
 from .compressed_ply import sorted_segments
 from .convert import convert_ply_sequence
-from .exceptions import InvalidInput
+from .exceptions import InvalidInput, MalformedFile
 from .gltf import from_gltf, to_gltf
 from .indexed_reader import open_indexed, read_provenance
 from .provenance import (
@@ -32,7 +33,9 @@ from .provenance import (
     name_of,
 )
 from .readable import FileReadable
-from .usd import from_usd, to_usd
+from .records import Header
+from .serialization import MAGIC, check_magic, iter_records
+from .usd import from_usd, to_usd, to_usd_keyframe_delta
 from .validate import validate
 from .writer import WriteOptions, write
 
@@ -194,12 +197,53 @@ def cmd_from_usd(args) -> int:
     return 0
 
 
+def _peek_header(data: bytes) -> Header:
+    """The Header without decoding the gaussians — enough to route on `temporal_model`.
+
+    A `keyframe-delta` file is refused by the ordinary reader (its chunks are not the
+    gaussian-birth shape), so the export command cannot `read()` first and then dispatch;
+    it has to know the model before it picks a path."""
+    check_magic(data)
+    for record in iter_records(data, len(MAGIC)):
+        if record.opcode == op.HEADER:
+            return Header.parse(record.content)
+    raise MalformedFile("file has no Header record")
+
+
 def cmd_to_usd(args) -> int:
-    scene = read(args.file)
-    attributes = scene.header.attributes
+    with open(args.file, "rb") as fh:
+        data = fh.read()
+    header = _peek_header(data)
+    attributes = dict(header.attributes)
     meters_per_unit = args.meters_per_unit
     if meters_per_unit is None:
         meters_per_unit = float(attributes.get("meters_per_unit", 1.0))
+    coordinate_system = args.coordinate_system or attributes.get("coordinate_system", "")
+    color_space = args.color_space or attributes.get("color_space")
+
+    if header.temporal_model == "keyframe-delta":
+        # The temporal model has no closed-form snapshot; USD time samples are its natural
+        # target, so this file always exports animated regardless of --animated/--time.
+        try:
+            written = to_usd_keyframe_delta(
+                args.out,
+                data,
+                coordinate_system=coordinate_system,
+                color_space=color_space,
+                meters_per_unit=meters_per_unit,
+                fps=args.fps,
+            )
+        except (InvalidInput, MalformedFile) as exc:
+            print(exc, file=sys.stderr)
+            return 1
+        mib = written / 2**20
+        print(
+            f"keyframe-delta, animated over {header.duration_sec:.3f}s at {args.fps:g} fps "
+            f"-> {args.out} ({mib:.2f} MiB)"
+        )
+        return 0
+
+    scene = read(args.file)
     try:
         written = to_usd(
             args.out,
