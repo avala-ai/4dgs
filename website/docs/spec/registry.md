@@ -13,32 +13,32 @@ cleanly with a message naming it, rather than guess.
 Used by the Attribute Stream structure (`0x06`), which lives bare inside a Chunk rather than as a
 top-level record — see spec §5.6.
 
-| id     | name             | channels | domain                                                           |
-| ------ | ---------------- | -------- | ---------------------------------------------------------------- |
-| 0      | `position`       | 3        | integer bins × `step_pos`, offset by `pos_origin`                |
-| 1      | `scale`          | 3        | log domain; `exp(bin × step_scale_log)`                          |
-| 2      | `rotation_index` | 1        | 0–3, index of the omitted quaternion component                   |
-| 3      | `rotation`       | 3        | integer bins × `step_rot`                                        |
-| 4      | `color`          | 3        | bins × `step_rgb`, after inverting the `(g, r−g, b−g)` transform |
-| 5      | `opacity`        | 1        | bins × `step_alpha`                                              |
-| 6      | `motion`         | 3        | bins × per-gaussian velocity step (spec §6.3)                    |
-| 7      | `mu_t`           | 1        | bins × per-gaussian birth-time step (spec §6.3)                  |
-| 8      | `sigma_t`        | 1        | log domain; `exp(bin × step_sigma_log)`                          |
-| 9      | `flags`          | 1        | bit 0: never fades (`sigma_t = +inf`)                            |
-| 10     | `window_index`   | 1        | index into the Window Table                                      |
-| 11     | `source_group`   | 1        | optional producer-side grouping id                               |
-| 12     | `source_index`   | 1        | optional producer-side stable id                                 |
-| 13     | reserved         |          | `gaussian_id` for the not-yet-normative keyframe-delta proposal  |
-| 14     | `object_id`      | 1        | exact `u32` membership; same-bit signed stream code; spec §6.6   |
-| 15–31  | reserved         |          |                                                                  |
-| 32     | `surface_normal` | 3        | reserved — relighting block, see below                           |
-| 33     | `base_color`     | 3        | reserved — relighting block, see below                           |
-| 34     | `roughness`      | 1        | reserved — relighting block, see below                           |
-| 35     | `metalness`      | 1        | reserved — relighting block, see below                           |
-| 36     | `sh_response`    | —        | reserved — relighting block, see below                           |
-| 37–47  | reserved         |          | reserved — relighting block, see below                           |
-| 48–63  | reserved         |          |                                                                  |
-| 64–127 | private          |          | application-defined, readers skip                                |
+| id     | name             | channels | domain                                                                                                       |
+| ------ | ---------------- | -------- | ------------------------------------------------------------------------------------------------------------ |
+| 0      | `position`       | 3        | integer bins × `step_pos`, offset by `pos_origin`                                                            |
+| 1      | `scale`          | 3        | log domain; `exp(bin × step_scale_log)`                                                                      |
+| 2      | `rotation_index` | 1        | 0–3, index of the omitted quaternion component                                                               |
+| 3      | `rotation`       | 3        | integer bins × `step_rot`                                                                                    |
+| 4      | `color`          | 3        | bins × `step_rgb`, after inverting the `(g, r−g, b−g)` transform                                             |
+| 5      | `opacity`        | 1        | bins × `step_alpha`                                                                                          |
+| 6      | `motion`         | 3        | bins × per-gaussian velocity step (spec §6.3)                                                                |
+| 7      | `mu_t`           | 1        | bins × per-gaussian birth-time step (spec §6.3)                                                              |
+| 8      | `sigma_t`        | 1        | log domain; `exp(bin × step_sigma_log)`                                                                      |
+| 9      | `flags`          | 1        | bit 0: never fades (`sigma_t = +inf`)                                                                        |
+| 10     | `window_index`   | 1        | index into the Window Table                                                                                  |
+| 11     | `source_group`   | 1        | optional producer-side grouping id                                                                           |
+| 12     | `source_index`   | 1        | optional producer-side stable id                                                                             |
+| 13     | `gaussian_id`    | 1        | `u32` identity; required in every chunk of a `keyframe-delta` file, absent from `gaussian-birth`; spec §11.2 |
+| 14     | `object_id`      | 1        | exact `u32` membership; same-bit signed stream code; spec §6.6                                               |
+| 15–31  | reserved         |          |                                                                                                              |
+| 32     | `surface_normal` | 3        | reserved — relighting block, see below                                                                       |
+| 33     | `base_color`     | 3        | reserved — relighting block, see below                                                                       |
+| 34     | `roughness`      | 1        | reserved — relighting block, see below                                                                       |
+| 35     | `metalness`      | 1        | reserved — relighting block, see below                                                                       |
+| 36     | `sh_response`    | —        | reserved — relighting block, see below                                                                       |
+| 37–47  | reserved         |          | reserved — relighting block, see below                                                                       |
+| 48–63  | reserved         |          |                                                                                                              |
+| 64–127 | private          |          | application-defined, readers skip                                                                            |
 
 Ids 0–10 are required in every chunk. Ids 11, 12 and 14 are optional. The first two let a producer
 round-trip stable source identities; id 14 carries exact object membership and defaults to `0` when
@@ -192,27 +192,28 @@ one of them is useless to the rest. This format implements one model and reserve
 others, so a producer from any of these lineages has somewhere to put its data without a
 specification change.
 
-| value               | status          | notes                                                                                                                                                                    |
-| ------------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `gaussian-birth`    | **implemented** | Per-gaussian birth time, temporal sigma, linear velocity and validity window, as in spec §3. Motion belongs to each gaussian and is evaluated in closed form at any time |
-| `frame-sequence`    | reserved        | Each time step is an independent set of gaussians, with no correspondence between steps                                                                                  |
-| `keyframe-delta`    | reserved        | A base set plus per-step deltas against it, with correspondence maintained across steps                                                                                  |
-| `deformation-field` | reserved        | Motion comes from a learned field evaluated per time step rather than baked per gaussian. See spec §10.1                                                                 |
+| value               | status          | notes                                                                                                                                                                                                                              |
+| ------------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gaussian-birth`    | **implemented** | Per-gaussian birth time, temporal sigma, linear velocity and validity window, as in spec §3. Motion belongs to each gaussian and is evaluated in closed form at any time                                                           |
+| `frame-sequence`    | subsumed        | Independent time steps with no correspondence between them. Subsumed by `keyframe-delta` at cadence one (every chunk a keyframe, no delta chunks); see spec §11.11. Not separately defined, now or later — the name is a tombstone |
+| `keyframe-delta`    | **implemented** | Keyframe chunks plus per-step delta chunks against a named reference, with correspondence carried by `gaussian_id` (attribute id 13). State tiles the timeline; a seek costs at most one group of pictures. Spec §11               |
+| `deformation-field` | reserved        | Motion comes from a learned field evaluated per time step rather than baked per gaussian. See spec §10.1                                                                                                                           |
 
-**`frame-sequence`** would need a per-step record carrying that step's complete gaussian set, a
-step-to-time mapping, and a statement of whether steps are uniformly spaced. The chunk and index
-machinery already addresses time ranges, so the work is the record, not the container. Note that
-importing such content into `gaussian-birth` — one validity window per step, zero velocity — is
-always possible and always correct, and is what the reference converter does; it simply does not
-exploit any correspondence the source had.
+**`keyframe-delta`** is implemented as of the spec §11 revision. A keyframe chunk is an ordinary
+Chunk record (`0x05`); a delta chunk is a Delta Chunk record (`0x10`) carrying updates, births and
+deaths as bin differences against a named reference; the Chunk Index (spec §5.8) gains six appended
+fields so a reader answers _which keyframe, which deltas, how many bytes_ from the index alone. It
+is a version-1 minor addition and changes no existing file.
 
-**`keyframe-delta`** would need a base gaussian set, delta records typed per attribute, a rule for
-which gaussians a delta applies to, and a declared keyframe interval so a reader knows how far back
-it must go to reconstruct a step. Its natural chunk boundary is the keyframe, which the existing
-index expresses unchanged.
+**`frame-sequence`** is a tombstone. A file that is every-chunk-a-keyframe under `keyframe-delta` is
+exactly the shape this name described — independent steps with no correspondence — so no separate
+model is defined for it. The row is kept rather than freed so the name is not spent on something
+that is not the frame sequence anyone meant. Importing frame-sequence content into `gaussian-birth`
+— one validity window per step, zero velocity — is also always possible and correct, and is what the
+reference converter does; it simply exploits no correspondence the source had.
 
-Both are reserved rather than designed. Naming them fixes the vocabulary and stops the names being
-spent elsewhere; neither is implemented, and a version-1 writer must not emit them.
+**`deformation-field`** is reserved rather than designed. Naming it fixes the vocabulary and stops
+the name being spent elsewhere; it is not implemented, and a version-1 writer must not emit it.
 
 ---
 
@@ -301,13 +302,14 @@ Used by the Header's `profile` field. A profile is a promise about what a file c
 consumer can reject an unsuitable file up front instead of discovering a missing attribute
 mid-decode.
 
-| value         | promises                                                                                                                                                                                                                                                             |
-| ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `""`          | Nothing beyond the base format                                                                                                                                                                                                                                       |
-| `capture`     | Content fitted from a real capture: finite validity windows, a chunk index with more than one entry, statistics present. Seeks cheaply (spec §8)                                                                                                                     |
-| `baked`       | Content baked from a temporal field or otherwise long-lived: gaussians may span the whole timeline, the index may hold a single entry, and an instant may cost the whole scene. Correct, but not cheap to seek                                                       |
-| `objects`     | Every non-empty chunk carries `object_id`, and one Object Table is present. Tracks and embeddings remain optional                                                                                                                                                    |
-| `relightable` | **Reserved for a future relighting extension; not normative; a version-1 writer MUST NOT emit it.** Would promise the relighting-block attributes (see "Attribute ids") are present, so a consumer can reject a radiance-only file up front when it needs to relight |
+| value         | promises                                                                                                                                                                                                                                                                            |
+| ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `""`          | Nothing beyond the base format                                                                                                                                                                                                                                                      |
+| `capture`     | Content fitted from a real capture: finite validity windows, a chunk index with more than one entry, statistics present. Seeks cheaply (spec §8)                                                                                                                                    |
+| `baked`       | Content baked from a temporal field or otherwise long-lived: gaussians may span the whole timeline, the index may hold a single entry, and an instant may cost the whole scene. Correct, but not cheap to seek                                                                      |
+| `objects`     | Every non-empty chunk carries `object_id`, and one Object Table is present. Tracks and embeddings remain optional                                                                                                                                                                   |
+| `keyframed`   | A `keyframe-delta` file (spec §11) whose state chunks tile the timeline, whose index holds more than one entry, whose statistics are present, and whose group-of-pictures depth is bounded — so a consumer can reject an unsuitable file up front and budget a seek before fetching |
+| `relightable` | **Reserved for a future relighting extension; not normative; a version-1 writer MUST NOT emit it.** Would promise the relighting-block attributes (see "Attribute ids") are present, so a consumer can reject a radiance-only file up front when it needs to relight                |
 
 Profiles constrain writers, not readers: a reader MUST be able to read any conforming file
 regardless of its profile.
@@ -433,15 +435,17 @@ platform did not occupy, so the name is deliberately not offered here.
 
 Used by Metadata records and the Header's `attributes` map. All optional.
 
-| key                              | meaning                                                                                                                                          |
-| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `coordinate_system`              | e.g. `y-up-right-handed`. **Superseded** by the Coordinate Frame record (`0x20`); where both appear the record wins, in whole — see spec §5.15.2 |
-| `source`                         | how the scene was produced, free-form                                                                                                            |
-| `license`                        | licence of the scene content                                                                                                                     |
-| `title`, `description`, `author` | human-facing scene identification                                                                                                                |
-| `application`                    | producer of any private-range records in the file                                                                                                |
-| `object_track_role`              | `enhancement` (default) or `authoritative`; whether tracks enhance world-correct base positions or carry an object's world motion                |
-| `object_count`                   | advisory decimal count of objects, for selection before the Object Table is fetched                                                              |
+| key                              | meaning                                                                                                                                                                                                                                                                                                               |
+| -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `coordinate_system`              | e.g. `y-up-right-handed`. **Superseded** by the Coordinate Frame record (`0x20`); where both appear the record wins, in whole — see spec §5.15.2                                                                                                                                                                      |
+| `source`                         | how the scene was produced, free-form                                                                                                                                                                                                                                                                                 |
+| `license`                        | licence of the scene content                                                                                                                                                                                                                                                                                          |
+| `title`, `description`, `author` | human-facing scene identification                                                                                                                                                                                                                                                                                     |
+| `application`                    | producer of any private-range records in the file                                                                                                                                                                                                                                                                     |
+| `object_track_role`              | `enhancement` (default) or `authoritative`; whether tracks enhance world-correct base positions or carry an object's world motion                                                                                                                                                                                     |
+| `object_count`                   | advisory decimal count of objects, for selection before the Object Table is fetched                                                                                                                                                                                                                                   |
+| `keyframe_interval_sec`          | advisory decimal seconds between keyframes in a `keyframe-delta` file, for choosing between files before downloading. **Advisory only:** a reader navigates by the per-chunk references in the index (spec §5.8), never by this declaration, which can be wrong wherever an encoder inserted a keyframe at a shot cut |
+| `gop_max_depth`                  | advisory decimal maximum group-of-pictures depth in a `keyframe-delta` file, so a consumer can bound seek cost up front. Authoritative only in the index                                                                                                                                                              |
 
 `coordinate_system` is superseded rather than removed. Files that predate the Coordinate Frame
 record use it, it is the only way to say anything about a frame in a file whose reader is older than
