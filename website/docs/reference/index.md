@@ -115,11 +115,12 @@ the streamed and indexed paths must agree, which is what proves the chain walk. 
 are `Yes` where that suite passes: all six SDKs. Python, Rust, TypeScript and Dart decode
 keyframe-delta natively; C++ and Swift decode it through the Rust C ABI's additive states-JSON
 accessor, which composes the file and computes the canonical `states` in the core, so the two
-bindings emit bytes identical to the reference with no arithmetic of their own — the runner peeks the
-`temporal_model` from the bytes, since an opened scene refuses the model, then calls the accessor on
-each read path. **Encode** is `Yes` for Python, whose writer generates the corpus, and Rust, whose
-cross-implementation gate encodes a delta file that Python decodes to an identical canonical. The C++
-and Swift encode cells stay `Planned`: the C ABI exposes no keyframe-delta encoder.
+bindings emit bytes identical to the reference with no arithmetic of their own — the runner peeks
+the `temporal_model` from the bytes, since an opened scene refuses the model, then calls the
+accessor on each read path. **Encode** is `Yes` for Python, whose writer generates the corpus, and
+Rust, whose cross-implementation gate encodes a delta file that Python decodes to an identical
+canonical. The C++ and Swift encode cells stay `Planned`: the C ABI exposes no keyframe-delta
+encoder.
 
 **Range-request decode** is a property of the transport an SDK offers, not of the format: every SDK
 can decode from an arbitrary byte-range reader, but only some ship an HTTP one. TypeScript's and

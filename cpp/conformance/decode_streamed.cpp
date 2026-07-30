@@ -119,8 +119,8 @@ int main(int argc, char** argv) {
   // is computed in Rust and printed verbatim, so it is byte-identical to every other SDK's.
   Result<std::vector<std::uint8_t>> whole = readWhole(path);
   if (!whole) return fail(whole.error().toString());
-  Result<std::string> model = fourdgs::peekTemporalModel(
-      fourdgs::Span<const std::uint8_t>(whole->data(), whole->size()));
+  Result<std::string> model =
+      fourdgs::peekTemporalModel(fourdgs::Span<const std::uint8_t>(whole->data(), whole->size()));
   if (!model) return fail(model.error().toString());
   if (*model == "keyframe-delta") {
     Result<std::string> json = fourdgs::keyframeDeltaStatesJson(

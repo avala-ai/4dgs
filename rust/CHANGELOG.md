@@ -9,12 +9,13 @@ All notable changes to the Rust crate are documented here, following
 ### Added
 
 - **keyframe-delta on the C ABI.** `fourdgs_keyframe_delta_states_json` decodes a whole
-  keyframe-delta file (either read path) to its canonical `states` JSON, `fourdgs_peek_temporal_model`
-  reads the Header's model without opening a scene, and `fourdgs_string_free` releases the owned
-  strings both return. Additive — no existing signature moved. The canonical `states` emitter moved
-  from the conformance crate into the library (`keyframe_delta_file::keyframe_delta_states_json`) so a
-  binding that decodes through the C ABI emits bytes identical to the reference; `capi_smoke.c` now
-  exercises the peek, the decode refusal on a gaussian-birth file, and the free.
+  keyframe-delta file (either read path) to its canonical `states` JSON,
+  `fourdgs_peek_temporal_model` reads the Header's model without opening a scene, and
+  `fourdgs_string_free` releases the owned strings both return. Additive — no existing signature
+  moved. The canonical `states` emitter moved from the conformance crate into the library
+  (`keyframe_delta_file::keyframe_delta_states_json`) so a binding that decodes through the C ABI
+  emits bytes identical to the reference; `capi_smoke.c` now exercises the peek, the decode refusal
+  on a gaussian-birth file, and the free.
 
 ## [0.2.0] - 2026-07-29
 
