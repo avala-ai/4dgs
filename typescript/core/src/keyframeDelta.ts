@@ -472,26 +472,48 @@ async function composeDelta(
   const updates = await decodeGroup(groups.updates, codecs);
   const births = await decodeGroup(groups.births, codecs);
   const deaths = await decodeGroup(groups.deaths, codecs);
-  // Each group's gaussian_id stream MUST carry exactly the count the header declares
-  // (§5.18/§11.9), so a declared-nonzero-but-empty group is a refusal rather than a
-  // silent zero and a streamed reader can size its working set before decompressing. The
-  // delta chunk is named by its interval and reference so a file with many of them says
-  // which one is wrong.
+  // EVERY stream in a group MUST carry exactly the count the header declares (§5.18/§11.9),
+  // not just its gaussian_id, and a death group carries the identity stream alone. Checking
+  // this before composition catches a declared-nonzero-but-empty group, a zero-count group
+  // that smuggles attribute streams (which applyDelta would ignore), and a death group with
+  // extra attributes (which would be silently discarded). The delta chunk is named by its
+  // interval and reference so a file with many of them says which one is wrong.
   const where =
     `delta chunk over [${parsed.header.t0}, ${parsed.header.t1}) ` +
     `referencing offset ${parsed.header.referenceOffset}`;
-  checkGroupCount(where, "update", updates.ids.length, parsed.header.updateCount);
-  checkGroupCount(where, "birth", births.ids.length, parsed.header.birthCount);
-  checkGroupCount(where, "death", deaths.ids.length, parsed.header.deathCount);
+  checkGroup(where, "update", updates, parsed.header.updateCount);
+  checkGroup(where, "birth", births, parsed.header.birthCount);
+  checkGroup(where, "death", deaths, parsed.header.deathCount, true);
   return applyDelta(reference, updates.ids, updates.bins, births.ids, births.bins, deaths.ids);
 }
 
-function checkGroupCount(where: string, group: string, actual: number, declared: number): void {
-  if (actual !== declared) {
+function checkGroup(
+  where: string,
+  group: string,
+  decoded: { ids: Int32Array; bins: Map<number, Column> },
+  declared: number,
+  identityOnly = false,
+): void {
+  if (decoded.ids.length !== declared) {
     throw new MalformedFile(
-      `the ${group} group of the ${where} carries ${actual} gaussian ids, but its header ` +
-        `declares ${group}_count=${declared}`,
+      `the ${group} group of the ${where} carries ${decoded.ids.length} gaussian ids, but its ` +
+        `header declares ${group}_count=${declared}`,
     );
+  }
+  if (identityOnly && decoded.bins.size > 0) {
+    const extra = [...decoded.bins.keys()].sort((a, b) => a - b).join(", ");
+    throw new MalformedFile(
+      `the ${group} group of the ${where} carries attribute streams ${extra} beyond gaussian_id; ` +
+        `a death group is the identity stream alone`,
+    );
+  }
+  for (const [attribute, column] of decoded.bins) {
+    if (columnRows(column) !== declared) {
+      throw new MalformedFile(
+        `attribute ${attribute} of the ${group} group of the ${where} carries ` +
+          `${columnRows(column)} rows, but its header declares ${group}_count=${declared}`,
+      );
+    }
   }
 }
 
@@ -701,7 +723,9 @@ export async function decodeKeyframeDeltaIndexed(
     if (record.opcode === Opcode.ChunkIndex) index.push(parseChunkIndexEntry(record.content));
     else break;
   }
-  checkTiling(index, header.durationSec);
+  // The indexed path has read the Footer, so it is a complete file: require full timeline
+  // coverage, not just adjacency (spec §11.1). The streamed path stays adjacency-only.
+  checkTiling(index, header.durationSec, true);
 
   const chunks: KeyframeDeltaChunkInfo[] = [];
   for (const entry of index) {
@@ -799,15 +823,21 @@ export interface Interval {
  * rather than a search, and it is checked on both read paths so a hole is refused whichever
  * way the file is read.
  *
- * It deliberately does NOT require the last chunk to reach `duration_sec`: that is the
- * reference contract (`keyframe_delta.check_tiling` checks adjacency only), and it is what
- * keeps a streamed reader usable on a complete prefix of a truncated file — the Header still
- * names the whole clip's duration, but every record before the cut is decodable and the last
- * decodable instant is simply the last complete chunk's `t1` (spec §11.10). `durationSec` is
- * accepted only to reject the degenerate case of a file that declares a duration but carries
- * no state chunks at all, which would otherwise reconstruct from an undefined covering chunk.
+ * The two read paths have different completeness contracts. A **streamed** reader may hold
+ * only a complete prefix of a truncated file, so it checks adjacency alone and does NOT
+ * require the last chunk to reach `duration_sec` — the last decodable instant is simply the
+ * last complete chunk's `t1` (spec §11.10). An **indexed** reader has already found the
+ * Footer, so it is looking at a whole file, and there `requireFullCoverage` additionally
+ * requires the first `t0` to be `0` and the last `t1` to be `duration_sec`, so a complete
+ * file with a hole in its declared timeline is refused. `durationSec` is also what rejects
+ * the degenerate case of a file that declares a duration but carries no state chunks, which
+ * would otherwise reconstruct from an undefined covering chunk.
  */
-export function checkTiling(intervals: readonly Interval[], durationSec?: number): void {
+export function checkTiling(
+  intervals: readonly Interval[],
+  durationSec?: number,
+  requireFullCoverage = false,
+): void {
   const ordered = [...intervals].sort((a, b) => a.t0 - b.t0);
   for (let i = 1; i < ordered.length; i++) {
     const previous = ordered[i - 1]!;
@@ -824,6 +854,22 @@ export function checkTiling(intervals: readonly Interval[], durationSec?: number
     throw new MalformedFile(
       `a keyframe-delta file declares duration_sec ${durationSec} but carries no state chunks`,
     );
+  }
+  if (requireFullCoverage && durationSec !== undefined && ordered.length > 0) {
+    const first = ordered[0]!;
+    const last = ordered[ordered.length - 1]!;
+    if (first.t0 !== 0) {
+      throw new MalformedFile(
+        `the first state chunk starts at ${first.t0}, not 0; a complete file's timeline must ` +
+          `cover [0, duration_sec)`,
+      );
+    }
+    if (last.t1 !== durationSec) {
+      throw new MalformedFile(
+        `the last state chunk ends at ${last.t1}, not the Header's duration_sec ${durationSec}; ` +
+          `a complete file's timeline must cover [0, duration_sec)`,
+      );
+    }
   }
 }
 
@@ -1071,7 +1117,14 @@ export function keyframeDeltaStatesJson(sequence: KeyframeDeltaSequence): Record
     deathCount: c.deathCount === null ? null : String(c.deathCount),
   }));
 
-  const states = probeTimes(sequence.chunks, duration).map((t) =>
+  // Probes are bounded by the last decodable instant — the last complete chunk's `t1`, not
+  // the Header's duration. For a complete file they are equal (the timeline tiles to
+  // duration), so this changes nothing there; for a streamed prefix it stops the near-end
+  // probe from falling past the last chunk and extrapolating stale state (spec §11.10).
+  const probeEnd = sequence.chunks.length
+    ? Math.max(...sequence.chunks.map((c) => c.t1))
+    : duration;
+  const states = probeTimes(sequence.chunks, probeEnd).map((t) =>
     stateRow(stateCovering(sequence.chunks, t), grids, t),
   );
 

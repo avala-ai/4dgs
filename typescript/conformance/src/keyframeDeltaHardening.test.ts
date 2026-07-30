@@ -278,18 +278,24 @@ test("decompressChunkBlock passes an empty codec through and refuses an unknown 
 
 // --- full-timeline tiling (codex P2 §11.1) --------------------------------
 
-test("checkTiling refuses a gap, an overlap, and an all-empty timeline", () => {
+test("checkTiling: adjacency always, coverage only when required", () => {
   const at = (t0: number, t1: number) => ({ t0, t1 });
   assert.throws(() => checkTiling([at(0, 1), at(2, 3)]), MalformedFile); // gap
   assert.throws(() => checkTiling([at(0, 2), at(1, 3)]), MalformedFile); // overlap
   assert.throws(() => checkTiling([], 1), MalformedFile); // duration but no chunks
   checkTiling([at(0, 1), at(1, 2)], 2); // complete: no throw
-  // Adjacency-only, like the reference: a complete PREFIX whose last chunk stops short of
+
+  // Streamed contract (adjacency only): a complete PREFIX whose last chunk stops short of
   // duration_sec is tolerated, so a streamed reader stays usable on a truncated file (§11.10).
-  checkTiling([at(0, 1)], 2); // prefix ends before duration: no throw
+  checkTiling([at(0, 1)], 2); // prefix, no coverage required: no throw
+
+  // Indexed contract (requireFullCoverage): a complete file must cover [0, duration_sec).
+  assert.throws(() => checkTiling([at(0, 1)], 2, true), MalformedFile); // ends before duration
+  assert.throws(() => checkTiling([at(0.5, 1)], 1, true), MalformedFile); // starts after 0
+  checkTiling([at(0, 1), at(1, 2)], 2, true); // full coverage: no throw
 });
 
-test("a streamed decode reads a complete prefix that stops short of duration_sec", async () => {
+test("a streamed decode reads a complete prefix and bounds probes to the last chunk", async () => {
   const data = bytes(MOVING_CHAINED);
   const { sequence, index } = await decodeKeyframeDeltaIndexed(data);
   assert.ok(index.length >= 3, "fixture has several chunks");
@@ -299,9 +305,13 @@ test("a streamed decode reads a complete prefix that stops short of duration_sec
   const prefix = data.slice(0, cut);
   const decoded = await decodeKeyframeDeltaStreamed(prefix);
   assert.equal(decoded.chunks.length, 2);
-  assert.ok(decoded.chunks[decoded.chunks.length - 1]!.t1 < sequence.header.durationSec);
-  // And it reconstructs, rather than refusing the short tiling.
-  assert.ok((keyframeDeltaStatesJson(decoded).states as unknown[]).length > 0);
+  const lastT1 = decoded.chunks[decoded.chunks.length - 1]!.t1;
+  assert.ok(lastT1 < sequence.header.durationSec);
+  // It reconstructs rather than refusing the short tiling, and no probe extrapolates past
+  // the last complete chunk — every state's instant lies within the decoded prefix.
+  const states = keyframeDeltaStatesJson(decoded).states as { t: number }[];
+  assert.ok(states.length > 0);
+  assert.ok(states.every((s) => s.t < lastT1));
 });
 
 // --- Delta Chunk header refusals, by mutating a valid file ----------------
