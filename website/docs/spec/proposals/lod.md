@@ -600,22 +600,26 @@ composes with any profile.
   _seek_, so it must be visible to a seeking reader at open. The Header is the first record and
   always read at open, so requiring the key there makes the gate first-class for both read modes.
   **A reader MUST NOT treat a file as LOD on the strength of a `lod_levels` found only in a Metadata
-  record; the gate is the Header key or it is absent.**
+  record; the gate is the Header key or it is absent.** A Metadata-only occurrence is legal but
+  inert under this layer.
 
-- **`lod_level0_complete`** — `"true"` when level 0 alone covers the timeline, so a reader that
-  fetches only level 0 gets a complete coarse scene at every instant rather than one with holes in
-  time (§3.5, §9). This is the promise the earlier draft attached to a `progressive` profile; as a
-  key it composes, and a consumer needing a cheap coarse standalone pass can require it while still
-  requiring, say, `objects`. Under `gaussian-birth`, the level-0 chunk intervals' union MUST cover
-  `[0, duration_sec)` without a gap and MAY contain overlaps. Under `keyframe-delta`, level 0 MUST
-  be one non-overlapping run from `0` through `duration_sec`. Absent or `"false"` means level 0 is
-  not guaranteed to be standalone. When present, the value grammar is exactly the lowercase ASCII
-  string `"true"` or `"false"`, with no whitespace; every other value, including `"TRUE"` and `"1"`,
-  MUST be refused as `lod-level0-complete-malformed`. It is a range-relevant promise like the gate,
-  so it **too MUST live in `Header.attributes`** when present, for the reason `lod_levels` does.
-  Within the Header it is valid only alongside a valid Header `lod_levels`; an orphaned key cannot
-  authorize LOD semantics or locate an index `level`, so a reader MUST refuse it as
-  `lod-level0-without-gate` rather than advertise a coarse pass it cannot select.
+- **Header `lod_level0_complete`** — `"true"` when level 0 alone covers the timeline, so a reader
+  that fetches only level 0 gets a complete coarse scene at every instant rather than one with holes
+  in time (§3.5, §9). This is the promise the earlier draft attached to a `progressive` profile; as
+  a key it composes, and a consumer needing a cheap coarse standalone pass can require it while
+  still requiring, say, `objects`. Under `gaussian-birth`, the level-0 chunk intervals' union MUST
+  cover `[0, duration_sec)` without a gap and MAY contain overlaps. Under `keyframe-delta`, level 0
+  MUST be one non-overlapping run from `0` through `duration_sec`. An absent Header key or Header
+  value `"false"` means level 0 is not guaranteed to be standalone. When present in the Header, the
+  value grammar is exactly the lowercase ASCII string `"true"` or `"false"`, with no whitespace;
+  every other value, including `"TRUE"` and `"1"`, MUST be refused as
+  `lod-level0-complete-malformed`. It is a range-relevant promise like the gate, so only the
+  `Header.attributes` occurrence has format semantics. Within the Header it is valid only alongside
+  a valid Header `lod_levels`; an orphaned key cannot authorize LOD semantics or locate an index
+  `level`, so a reader MUST refuse it as `lod-level0-without-gate` rather than advertise a coarse
+  pass it cannot select. A same-named key found only in a Metadata record is legal but inert: it
+  does not activate the promise, its value is not parsed by this layer, and it cannot override a
+  Header value.
 
 These two keys add no record. A level's transfer size at a chosen contiguous SH prefix is already
 derivable from the index: sum `chunk_length` **plus the lengths of every selected SH Band Stream
@@ -903,11 +907,11 @@ refuse a usable file:
   levels the Header permits. Neither case is a missing-data error inferred from the bound.
 - **A file that does not declare LOD** (Header `lod_levels` absent) carries no obligation from this
   layer at all, whatever its `level` values are (§4.1); a reader simply does not filter on `level`.
-  Its Chunk Index has no LOD `level` append; a same-named key found only in a Metadata record does
-  not change that. The one recognized malformed exception is an orphaned Header
-  `lod_level0_complete`, which §4.4 and the table above refuse because it names completeness
-  semantics for a level the Header has not authorized. Unknown trailing index bytes belong to
-  append-only extensions and MUST NOT be guessed to be `level` (§4.2).
+  Its Chunk Index has no LOD `level` append; Metadata-only `lod_levels` and `lod_level0_complete`
+  keys are legal but inert and do not change that. The one recognized malformed exception is an
+  orphaned Header `lod_level0_complete`, which §4.4 and the table above refuse because it names
+  completeness semantics for a level the Header has not authorized. Unknown trailing index bytes
+  belong to append-only extensions and MUST NOT be guessed to be `level` (§4.2).
 - **Deliberate per-chunk SH transfer caps** are valid when they are read-plan inputs (§3.3).
   Accidental EOF is not such a cap: it invokes the existing longest-intact-chunk recovery and does
   not make an otherwise incomplete trailing chunk valid.
@@ -1003,9 +1007,9 @@ transfer caps over one uniformly stored scene (§3.3) are asserted rather than a
   even if the offending id falls outside the sample. Its adapter reports the configured identity
   memory budget and `identityRetainedBytesHighWater` with §3.5's accounting boundary; conformance
   fails if the latter exceeds the former. The exhaustive runner also validates
-  `LodKfDeltaIdentityBudgetOverflow`, whose 4,096 distinct ids exceed a 4,096-byte test budget
-  before a final cross-level occurrence of id 4095. Passing therefore requires the partitioned-pass
-  or external-sort path; a scene-wide map cannot pass by keeping this small corpus below its
+  `LodKfDeltaIdentityBudgetOverflow`, whose 4,096 sparse pseudorandom ids exceed a 4,096-byte test
+  budget before a final cross-level occurrence of the last id. Passing therefore requires the
+  partitioned-pass or external-sort path; neither a dense bitmap nor a scene-wide map fits under the
   configured capacity. The indexed decode runner checks the identity evidence its selected chains
   fully expose: live uniqueness across the fetched active union and no-reuse across the histories
   present in those chains. Its adapter reports `identityScratchEntriesLive` and
@@ -1034,41 +1038,50 @@ New corpus variants. Most are crossable with both temporal models, since level i
 model (§3.5); `LodSparseLevels` and `LodKfDeltaPerLevelRuns` specifically exercise the sparse
 level-run generalization and its compatibility boundary (§3.5, §4.6):
 
-| scenario                 | shape                                                                                | what it catches                                                                          |
-| ------------------------ | ------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
-| `LodSingleLevel`         | Header `lod_levels = 1`, every chunk level 0                                         | decoded states equal the non-LOD variant; wire bytes are expected to differ              |
-| `LodTwoLevels`           | level 0 coarse, level 1 detail, both spanning the clip                               | the seek predicate; `states` at each requested level; the union rule                     |
-| `LodBoundSlack`          | levels 0 and 2, `lod_levels = 8`; requests through 7                                 | exclusive-bound semantics; absent levels add nothing; request 7 is the full union        |
-| `LodSparseLevels`        | level 0 spans the clip, level 1 has two keyframe-rooted runs with a gap              | sparse `keyframe-delta` run validity and partial timeline coverage (§3.5, §9)            |
-| `LodLevelGap`            | levels 0 and `4294967295`, `lod_levels = 4294967296`, only two actual levels         | sparse/count-independent storage and the full `u32` level domain (§4.4, §9)              |
-| `LodLevel0CompleteBirth` | `gaussian-birth`; overlapping level-0 intervals whose union covers the clip          | complete means gap-free interval union; overlap remains valid (§3.5, §4.4)               |
-| `LodLevel0CompleteKf`    | `keyframe-delta`; level 0 is one non-overlapping run covering the clip               | model-specific complete-run promise (§3.5, §4.4)                                         |
-| `LodProgressiveBands`    | every chunk stores degree 3; deliberate reads probe contiguous prefixes 0..3         | the quality axis; the contiguous-prefix rule; SH-inclusive byte footprints (§3.3)        |
-| `LodMixedReadDegree`     | every chunk stores degree 3; one read deliberately caps two chunks at 3 and two at 0 | per-chunk transfer caps and digests; a decoder substituting one global read cap fails    |
-| `LodStreamBandCut`       | degree-3 stream ends after band 1 of its final chunk                                 | longest-intact-chunk recovery; accidental EOF does not create a degree-1 cap             |
-| `LodStreamLevelCut`      | `lod_levels = 8`; stream recovers intact level-0 records before a later level-2 cut  | observed levels may be below the bound; recovery neither invents nor requires levels     |
-| `LodNoDeclare`           | chunk `level > 0`; Header gate and index `level` append both absent                  | semantic/physical iff gate: reader does not filter or infer a field, and gets full scene |
-| `LodIndexMissingLevel`   | declared indexed LOD; one Chunk Index entry omits the appended `level`               | mandatory range-seekable level predicate (§4.2)                                          |
-| `LodKfDeltaPerLevelRuns` | `keyframe-delta`, two levels; one full run and one sparse keyframe-rooted run        | run-local chains, unique active ids and one global no-reuse identity history (§3.5)      |
-| `LodKfDeltaRangeSeek`    | seek a later sparse run from the index without fetching earlier valid runs           | selected chains only; whole-file identity validation never becomes a payload scan        |
-| `LodKfDeltaChurnCount`   | one level repeats id 7, births id 8, updates both, then kills id 7                   | `gaussianCount = 2` for lifetime ids while per-instant `liveCount` changes               |
-| `LodFullEqualsUnion`     | request `lod_levels - 1` vs a non-LOD full decode, including an over-declared bound  | decoded union equality and one-level ownership under both temporal models                |
+| scenario                  | shape                                                                                | what it catches                                                                          |
+| ------------------------- | ------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
+| `LodSingleLevel`          | Header `lod_levels = 1`, every chunk level 0                                         | decoded states equal the non-LOD variant; wire bytes are expected to differ              |
+| `LodTwoLevels`            | level 0 coarse, level 1 detail, both spanning the clip                               | the seek predicate; `states` at each requested level; the union rule                     |
+| `LodBoundSlack`           | levels 0 and 2, `lod_levels = 8`; requests through 7                                 | exclusive-bound semantics; absent levels add nothing; request 7 is the full union        |
+| `LodSparseLevels`         | level 0 spans the clip, level 1 has two keyframe-rooted runs with a gap              | sparse `keyframe-delta` run validity and partial timeline coverage (§3.5, §9)            |
+| `LodLevelGap`             | levels 0 and `4294967295`, `lod_levels = 4294967296`, only two actual levels         | sparse/count-independent storage and the full `u32` level domain (§4.4, §9)              |
+| `LodLevel0CompleteBirth`  | `gaussian-birth`; overlapping level-0 intervals whose union covers the clip          | complete means gap-free interval union; overlap remains valid (§3.5, §4.4)               |
+| `LodLevel0CompleteKf`     | `keyframe-delta`; level 0 is one non-overlapping run covering the clip               | model-specific complete-run promise (§3.5, §4.4)                                         |
+| `LodProgressiveBands`     | every chunk stores degree 3; deliberate reads probe contiguous prefixes 0..3         | the quality axis; the contiguous-prefix rule; SH-inclusive byte footprints (§3.3)        |
+| `LodOutOfOrderBands`      | degree 3; one chunk completes base, band 2, band 1, then band 3                      | band 2 is held at degree 0 until band 1 closes the contiguous prefix                     |
+| `LodMixedReadDegree`      | every chunk stores degree 3; one read deliberately caps two chunks at 3 and two at 0 | per-chunk transfer caps and digests; a decoder substituting one global read cap fails    |
+| `LodStreamBandCut`        | degree-3 stream ends after band 1 of its final chunk                                 | longest-intact-chunk recovery; accidental EOF does not create a degree-1 cap             |
+| `LodStreamLevelCut`       | `lod_levels = 8`; stream recovers intact level-0 records before a later level-2 cut  | observed levels may be below the bound; recovery neither invents nor requires levels     |
+| `LodNoDeclare`            | chunk `level > 0`; Header gate and index `level` append both absent                  | semantic/physical iff gate: reader does not filter or infer a field, and gets full scene |
+| `LodMetadataOnlyComplete` | Metadata `lod_level0_complete = "true"`; Header completeness key absent              | Metadata-only promise is legal, inert and cannot affect level-0 completeness             |
+| `LodIndexMissingLevel`    | declared indexed LOD; one Chunk Index entry omits the appended `level`               | mandatory range-seekable level predicate (§4.2)                                          |
+| `LodKfDeltaPerLevelRuns`  | `keyframe-delta`, two levels; one full run and one sparse keyframe-rooted run        | run-local chains, unique active ids and one global no-reuse identity history (§3.5)      |
+| `LodKfDeltaRangeSeek`     | seek a later sparse run from the index without fetching earlier valid runs           | selected chains only; whole-file identity validation never becomes a payload scan        |
+| `LodKfDeltaChurnCount`    | one level repeats id 7, births id 8, updates both, then kills id 7                   | `gaussianCount = 2` for lifetime ids while per-instant `liveCount` changes               |
+| `LodFullEqualsUnion`      | request `lod_levels - 1` vs a non-LOD full decode, including an over-declared bound  | decoded union equality and one-level ownership under both temporal models                |
 
 Crossed with the existing flags `Quantized`, `SHDegree2`, `UseCrc`, `UseChunkIndex`, and one variant
 with no index (a streamed reader filtering level without one). `LodProgressiveBands` and
 `LodMixedReadDegree` are additionally crossed with the per-band bit-depth ladders, since the quality
-axis and the bit-depth dial share the band records. `LodKfDeltaPerLevelRuns` additionally carries a
-runner-side assertion that a **pre-LOD** `keyframe-delta` decoder _refuses_ it on the overlap or gap
-rule (spec §11.1) — the §4.6 compatibility boundary made checkable, so the non-forward-compatible
-case is proven to refuse cleanly rather than mis-decode. `LodStreamBandCut` runs only through the
-streamed recovery path and compares its state to the longest full-degree intact chunk prefix.
-`LodStreamLevelCut` likewise runs through streamed recovery and retains the Header's declared bound
-while summarizing only levels found in the intact record prefix. `LodKfDeltaRangeSeek` records every
-range request and fails if the decoder fetches a state chunk outside the index-selected chains; the
-same valid fixture is separately accepted by the exhaustive identity validator. The invalid
-selected-chain fixtures in §10.3 use the same request trace to prove that local identity validation
-does not expand the seek; the scratch counters defined above separately prove that it retains no
-keyed identity history between seeks.
+axis and the bit-depth dial share the band records. `LodOutOfOrderBands` drives the incremental band
+adapter in completion order `[base, 2, 1, 3]` for one chunk. Immediately after band 2 completes, the
+expectation remains `throughShDegree = 0` with the base-only digest; after band 1 completes it jumps
+to degree 2 with the degree-2 digest, and only the final band advances it to degree 3. A reader that
+consumes a non-contiguous band early therefore fails before the gap is repaired.
+`LodMetadataOnlyComplete` MUST produce the same completeness state as an otherwise identical file
+with no completeness key: no Header promise is visible, no value grammar is applied to the Metadata
+entry, and no level-0 coverage guarantee is inferred. `LodKfDeltaPerLevelRuns` additionally carries
+a runner-side assertion that a **pre-LOD** `keyframe-delta` decoder _refuses_ it on the overlap or
+gap rule (spec §11.1) — the §4.6 compatibility boundary made checkable, so the
+non-forward-compatible case is proven to refuse cleanly rather than mis-decode. `LodStreamBandCut`
+runs only through the streamed recovery path and compares its state to the longest full-degree
+intact chunk prefix. `LodStreamLevelCut` likewise runs through streamed recovery and retains the
+Header's declared bound while summarizing only levels found in the intact record prefix.
+`LodKfDeltaRangeSeek` records every range request and fails if the decoder fetches a state chunk
+outside the index-selected chains; the same valid fixture is separately accepted by the exhaustive
+identity validator. The invalid selected-chain fixtures in §10.3 use the same request trace to prove
+that local identity validation does not expand the seek; the scratch counters defined above
+separately prove that it retains no keyed identity history between seeks.
 
 ### 10.3 Files full-file conformance must refuse
 
@@ -1100,16 +1113,24 @@ mechanism.
 
 `LodKfDeltaIdentityBudgetOverflow` is a generated exhaustive-validation refusal case. The runner
 configures the validator with a 4,096-byte identity-memory budget. A level-0 keyframe contains the
-4,096 distinct ids `0..4095`; after those histories have been observed, a later non-overlapping
-level-1 keyframe contains id 4095 without an intervening death. The validator MUST produce
-`id-crosses-level`, and its reported `identityRetainedBytesHighWater` MUST remain at or below 4,096
-bytes. The current level-0 keyframe's validated decode buffer may exceed that budget while the chunk
-is being consumed, but before the validator advances to the later keyframe it MUST release that
-buffer or count every retained identity-bearing byte under §3.5's budget. The input's four-byte ids
-alone occupy 16,384 bytes, so a validator cannot satisfy the expectation by carrying the decoded
-keyframe forward as a scene-wide map. Implementations may make budget-sized numeric-id passes or use
-their memory-capped external sort; the expected refusal, allocation trace and budget assertion are
-the same.
+4,096 distinct sparse ids
+
+```
+id_i = (i << 20) | low20(SHA-256("4dgs-lod-identity-budget" || u32le(i)))
+```
+
+for `0 ≤ i < 4096`. The top 12 bits put one id in each of 4,096 buckets across the full `u32`
+domain; the pseudorandom 20-bit suffix prevents a range or run representation from standing in for
+the exact set. After those histories have been observed, a later non-overlapping level-1 keyframe
+contains `id_4095` without an intervening death. The validator MUST produce `id-crosses-level`, and
+its reported `identityRetainedBytesHighWater` MUST remain at or below 4,096 bytes. The current
+level-0 keyframe's validated decode buffer may exceed that budget while the chunk is being consumed,
+but before the validator advances to the later keyframe it MUST release that buffer or count every
+retained identity-bearing byte under §3.5's budget. A dense bitmap over the spanned `u32` domain is
+roughly 512 MiB; the four-byte ids alone occupy 16,384 bytes; and even storing only the 20-bit
+suffix from each implied bucket requires 10,240 bytes. Thus no exact scene-wide identity set fits
+the budget. Implementations may make budget-sized numeric-id passes or use their memory-capped
+external sort; the expected refusal, allocation trace and budget assertion are the same.
 
 Two additional invalid cases run through the **indexed seek** entry point with an instrumented byte
 source:
