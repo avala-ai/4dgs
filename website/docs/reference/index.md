@@ -7,11 +7,14 @@ documented state — not a defect — and this table is the public contract that
 `supportsVariant()`, the harness runs exactly those, and this table is kept in lockstep with those
 declarations. Nothing is marked `Yes` on the strength of code existing.
 
-Every row is filled in from a suite that runs: 46 valid variants and 7 invalid ones, over two read
-paths (streamed and indexed). A language takes the variants it declares support for, and what it
-declines is what this table records — 105 checks passing for Python, 91 for Rust, 79 each for
-TypeScript, C++, Swift and Dart. Rust declines the refusal expectations; TypeScript, C++, Swift and
-Dart also decline the five variants that carry provenance records and the object variant.
+Every row is filled in from a suite that runs: 46 valid variants and 7 invalid ones, plus 4
+keyframe-delta variants in their own subdirectory, over two read paths (streamed and indexed). A
+language takes the variants it declares support for, and what it declines is what this table records
+— 113 checks passing for Python, 99 for Rust, 87 each for TypeScript and Dart, and 79 each for C++
+and Swift. Rust declines the refusal expectations; TypeScript, C++, Swift and Dart also decline the
+five variants that carry provenance records and the object variant; C++ and Swift additionally
+decline the four keyframe-delta variants, which they do not yet decode — they read 4DGS through the
+Rust C ABI, and its delta accessors are not yet exposed.
 
 | Feature                                         | Python | TypeScript | Rust    | C++     | Swift   | Dart    |
 | ----------------------------------------------- | ------ | ---------- | ------- | ------- | ------- | ------- |
@@ -43,6 +46,12 @@ Dart also decline the five variants that carry provenance records and the object
 | Object membership (`object_id`)                 | Yes    | No         | Yes     | No      | No      | No      |
 | Object Table: labels, anchors, embeddings       | Yes    | No         | Yes     | No      | No      | No      |
 | Object Track: rigid state composition           | Yes    | No         | Yes     | No      | No      | No      |
+| Temporal model `keyframe-delta`, decode         | Yes    | Yes        | Yes     | Planned | Planned | Yes     |
+| Delta composition, chained                      | Yes    | Yes        | Yes     | Planned | Planned | Yes     |
+| Delta composition, keyframe-referenced          | Yes    | Yes        | Yes     | Planned | Planned | Yes     |
+| Births and deaths in deltas                     | Yes    | Yes        | Yes     | Planned | Planned | Yes     |
+| Reconstruction at an instant                    | Yes    | Yes        | Yes     | Planned | Planned | Yes     |
+| Encode `keyframe-delta`                         | Yes    | Planned    | Yes     | Planned | Planned | Planned |
 | Unknown-record skipping                         | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Refusal diagnosis (named, not merely refused)   | Yes    | No         | No      | No      | No      | No      |
 | Private-range records                           | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
@@ -93,6 +102,20 @@ track whose first, interpolated and last poses are sampled. Canonical `states` c
 centers and orientations from both Python read paths, so skipping the track or composing it before
 per-gaussian motion fails. Rust's streamed and indexed runners emit those same states; the other
 SDKs skip the optional records and stream and report `No`.
+
+**The `keyframe-delta` temporal model** (spec §11) is proved by four corpus variants that live in
+their own `data/keyframe/` subdirectory, the way the invalid corpus does — every whole-corpus
+consumer that is not this harness globs the top level only and assumes the single gaussian-birth
+model, so a delta file there would break the fuzzer and the Kaitai grammar rather than exercise
+them. The variants cover a keyframe-only file (the cadence-one shape that subsumes
+`frame-sequence`), chained pure-update deltas, deltas carrying births and deaths, and
+keyframe-referenced deltas. Each SDK's runner dispatches on `temporal_model` and emits the canonical
+`states` — the reconstruction at probe instants derived from the file, in `gaussian_id` order — and
+the streamed and indexed paths must agree, which is what proves the chain walk. The **decode** rows
+are `Yes` where that suite passes: Python, Rust, TypeScript and Dart. **Encode** is `Yes` for
+Python, whose writer generates the corpus, and Rust, whose cross-implementation gate encodes a delta
+file that Python decodes to an identical canonical. C++ and Swift decode 4DGS through the Rust C
+ABI, whose delta accessors are not yet exposed, so they decline the family and read `Planned`.
 
 **Range-request decode** is a property of the transport an SDK offers, not of the format: every SDK
 can decode from an arbitrary byte-range reader, but only some ship an HTTP one. TypeScript's and
