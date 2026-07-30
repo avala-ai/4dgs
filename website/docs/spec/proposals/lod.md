@@ -317,7 +317,20 @@ The reader fetches those chunks' byte ranges and reconstructs each gaussian by s
 today. Level is one more predicate on the same index scan (§4.2); it adds no read and no arithmetic.
 For `gaussian-birth`, Header `lod_level0_complete = "true"` means the **interval union** of all
 level-0 chunks covers `[0, duration_sec)` without a gap. Level-0 chunks MAY overlap, exactly as
-ordinary `gaussian-birth` chunks may; the promise is coverage, not tiling.
+ordinary `gaussian-birth` chunks may; the promise is coverage, not tiling. The promise also imposes
+one conditional physical-order rule so that coverage remains streamable: considering only level-0
+Chunk records in increasing file-offset order, their `t0` values MUST be non-decreasing.
+Higher-level chunks and non-Chunk records may still be interleaved freely.
+
+A front-to-back reader validates the promise with constant state. It starts
+`level0CoveredUntil = 0`; for each level-0 Chunk it first refuses a `t0` lower than the preceding
+level-0 `t0` as `lod-level0-birth-out-of-order`, then refuses `t0 > level0CoveredUntil` as
+`lod-level0-birth-has-holes`, and otherwise advances the marker to `max(level0CoveredUntil, t1)`. At
+clean EOF the marker MUST reach `duration_sec`. An indexed reader applies the same algorithm to
+index entries ordered by `chunk_offset`, so the two read paths validate the same physical sequence.
+Only the previous level-0 `t0` and `level0CoveredUntil` survive a chunk boundary; no interval does.
+This ordering is conditional on the Header promise; ordinary `gaussian-birth` files and level 0
+without the promise retain the base format's order independence.
 
 **Level and `keyframe-delta`, and the one place LOD changes a normative rule.** keyframe-delta tiles
 the timeline with state chunks and reaches an instant by walking a chain back to a keyframe (spec
@@ -608,17 +621,18 @@ composes with any profile.
   in time (§3.5, §9). This is the promise the earlier draft attached to a `progressive` profile; as
   a key it composes, and a consumer needing a cheap coarse standalone pass can require it while
   still requiring, say, `objects`. Under `gaussian-birth`, the level-0 chunk intervals' union MUST
-  cover `[0, duration_sec)` without a gap and MAY contain overlaps. Under `keyframe-delta`, level 0
-  MUST be one non-overlapping run from `0` through `duration_sec`. An absent Header key or Header
-  value `"false"` means level 0 is not guaranteed to be standalone. When present in the Header, the
-  value grammar is exactly the lowercase ASCII string `"true"` or `"false"`, with no whitespace;
-  every other value, including `"TRUE"` and `"1"`, MUST be refused as
-  `lod-level0-complete-malformed`. It is a range-relevant promise like the gate, so only the
-  `Header.attributes` occurrence has format semantics. Within the Header it is valid only alongside
-  a valid Header `lod_levels`; an orphaned key cannot authorize LOD semantics or locate an index
-  `level`, so a reader MUST refuse it as `lod-level0-without-gate` rather than advertise a coarse
-  pass it cannot select. A same-named key found only in a Metadata record is legal but inert: it
-  does not activate the promise, its value is not parsed by this layer, and it cannot override a
+  cover `[0, duration_sec)` without a gap, MAY contain overlaps, and MUST appear with non-decreasing
+  `t0` in the level-0 Chunk subsequence so a pipe reader can validate that union in constant memory
+  (§3.5). Under `keyframe-delta`, level 0 MUST be one non-overlapping run from `0` through
+  `duration_sec`. An absent Header key or Header value `"false"` means level 0 is not guaranteed to
+  be standalone. When present in the Header, the value grammar is exactly the lowercase ASCII string
+  `"true"` or `"false"`, with no whitespace; every other value, including `"TRUE"` and `"1"`, MUST
+  be refused as `lod-level0-complete-malformed`. It is a range-relevant promise like the gate, so
+  only the `Header.attributes` occurrence has format semantics. Within the Header it is valid only
+  alongside a valid Header `lod_levels`; an orphaned key cannot authorize LOD semantics or locate an
+  index `level`, so a reader MUST refuse it as `lod-level0-without-gate` rather than advertise a
+  coarse pass it cannot select. A same-named key found only in a Metadata record is legal but inert:
+  it does not activate the promise, its value is not parsed by this layer, and it cannot override a
   Header value.
 
 These two keys add no record. A level's transfer size at a chosen contiguous SH prefix is already
@@ -854,8 +868,15 @@ referential integrity between the index and the chunks, which the format already
 | same-level `keyframe-delta` chunks overlap                                                 | `current(t, ell)` would not be unique                                     |
 | a same-level run starts with a delta or a chain crosses a gap                              | the covered interval has no independently decodable base state            |
 | a band byte range in the index overruns the file                                           | the existing index-range rule (spec §5.8), unchanged                      |
+| promised `gaussian-birth` level-0 Chunks descend in `t0` physical order                    | a pipe reader cannot validate arbitrary interval order with bounded state |
 | `gaussian-birth` promises complete level 0 but its level-0 interval union has a gap        | overlap is legal, but an uncovered instant contradicts the promise        |
 | `keyframe-delta` promises complete level 0 but level 0 is not one full non-overlapping run | the promised standalone state is overlapping, gapped or incomplete        |
+
+The `gaussian-birth` order refusal is checked before the coverage marker is advanced for a chunk. It
+applies only when Header `lod_level0_complete = "true"`; it does not make record order normative for
+any other file. With non-decreasing `t0`, §3.5's single `level0CoveredUntil` marker proves gap-free
+coverage without retaining intervals, so both a pipe reader and an indexed reader can enforce the
+same promise with bounded state.
 
 The range and index-presence rows are load-bearing. `lod_levels` is an exclusive bound (§4.4), so a
 chunk whose `level` is at or above it sits outside the advertised range. A reader requesting the
@@ -1045,7 +1066,7 @@ level-run generalization and its compatibility boundary (§3.5, §4.6):
 | `LodBoundSlack`           | levels 0 and 2, `lod_levels = 8`; requests through 7                                 | exclusive-bound semantics; absent levels add nothing; request 7 is the full union        |
 | `LodSparseLevels`         | level 0 spans the clip, level 1 has two keyframe-rooted runs with a gap              | sparse `keyframe-delta` run validity and partial timeline coverage (§3.5, §9)            |
 | `LodLevelGap`             | levels 0 and `4294967295`, `lod_levels = 4294967296`, only two actual levels         | sparse/count-independent storage and the full `u32` level domain (§4.4, §9)              |
-| `LodLevel0CompleteBirth`  | `gaussian-birth`; overlapping level-0 intervals whose union covers the clip          | complete means gap-free interval union; overlap remains valid (§3.5, §4.4)               |
+| `LodLevel0CompleteBirth`  | `gaussian-birth`; ordered overlapping level-0 intervals whose union covers the clip  | constant-state coverage proof; overlap remains valid (§3.5, §4.4)                        |
 | `LodLevel0CompleteKf`     | `keyframe-delta`; level 0 is one non-overlapping run covering the clip               | model-specific complete-run promise (§3.5, §4.4)                                         |
 | `LodProgressiveBands`     | every chunk stores degree 3; deliberate reads probe contiguous prefixes 0..3         | the quality axis; the contiguous-prefix rule; SH-inclusive byte footprints (§3.3)        |
 | `LodOutOfOrderBands`      | degree 3; one chunk completes base, band 2, band 1, then band 3                      | band 2 is held at degree 0 until band 1 closes the contiguous prefix                     |
@@ -1053,6 +1074,7 @@ level-run generalization and its compatibility boundary (§3.5, §4.6):
 | `LodStreamBandCut`        | degree-3 stream ends after band 1 of its final chunk                                 | longest-intact-chunk recovery; accidental EOF does not create a degree-1 cap             |
 | `LodStreamLevelCut`       | `lod_levels = 8`; stream recovers intact level-0 records before a later level-2 cut  | observed levels may be below the bound; recovery neither invents nor requires levels     |
 | `LodNoDeclare`            | chunk `level > 0`; Header gate and index `level` append both absent                  | semantic/physical iff gate: reader does not filter or infer a field, and gets full scene |
+| `LodMetadataOnlyLevels`   | Metadata `lod_levels = "2"`; Header gate and index `level` append absent             | Metadata cannot activate filtering or make the index append physically present           |
 | `LodMetadataOnlyComplete` | Metadata `lod_level0_complete = "TRUE"`; Header completeness key absent              | non-canonical Metadata value is legal, inert and cannot affect level-0 completeness      |
 | `LodIndexMissingLevel`    | declared indexed LOD; one Chunk Index entry omits the appended `level`               | mandatory range-seekable level predicate (§4.2)                                          |
 | `LodKfDeltaPerLevelRuns`  | `keyframe-delta`, two levels; one full run and one sparse keyframe-rooted run        | run-local chains, unique active ids and one global no-reuse identity history (§3.5)      |
@@ -1068,20 +1090,27 @@ adapter in completion order `[base, 2, 1, 3]` for one chunk. Immediately after b
 expectation remains `throughShDegree = 0` with the base-only digest; after band 1 completes it jumps
 to degree 2 with the degree-2 digest, and only the final band advances it to degree 3. A reader that
 consumes a non-contiguous band early therefore fails before the gap is repaired.
-`LodMetadataOnlyComplete` MUST produce the same completeness state as an otherwise identical file
-with no completeness key: no Header promise is visible, no value grammar is applied to the Metadata
-entry, and no level-0 coverage guarantee is inferred. `LodKfDeltaPerLevelRuns` additionally carries
-a runner-side assertion that a **pre-LOD** `keyframe-delta` decoder _refuses_ it on the overlap or
-gap rule (spec §11.1) — the §4.6 compatibility boundary made checkable, so the
-non-forward-compatible case is proven to refuse cleanly rather than mis-decode. `LodStreamBandCut`
-runs only through the streamed recovery path and compares its state to the longest full-degree
-intact chunk prefix. `LodStreamLevelCut` likewise runs through streamed recovery and retains the
-Header's declared bound while summarizing only levels found in the intact record prefix.
-`LodKfDeltaRangeSeek` records every range request and fails if the decoder fetches a state chunk
-outside the index-selected chains; the same valid fixture is separately accepted by the exhaustive
-identity validator. The invalid selected-chain fixtures in §10.3 use the same request trace to prove
-that local identity validation does not expand the seek; the scratch counters defined above
-separately prove that it retains no keyed identity history between seeks.
+`LodMetadataOnlyLevels` carries informational chunk levels 0 and 1 but no Header gate and no LOD
+index append. It MUST expose no canonical `lod` summary, perform no level-filtered read, and decode
+the full scene exactly like `LodNoDeclare`; attempting to parse an appended index `level` fails the
+expected request/record trace. `LodMetadataOnlyComplete` MUST produce the same completeness state as
+an otherwise identical file with no completeness key: no Header promise is visible, no value grammar
+is applied to the Metadata entry, and no level-0 coverage guarantee is inferred.
+`LodKfDeltaPerLevelRuns` additionally carries a runner-side assertion that a **pre-LOD**
+`keyframe-delta` decoder _refuses_ it on the overlap or gap rule (spec §11.1) — the §4.6
+compatibility boundary made checkable, so the non-forward-compatible case is proven to refuse
+cleanly rather than mis-decode. `LodStreamBandCut` runs only through the streamed recovery path and
+compares its state to the longest full-degree intact chunk prefix. The no-index form of
+`LodLevel0CompleteBirth` serializes overlapping level-0 chunks in non-decreasing `t0`; its adapter
+reports `level0CoverageScratchScalarsHighWater <= 2` and `level0CoverageIntervalsRetained = 0` after
+every chunk. The shuffled invalid form in §10.3 proves the conditional ordering is enforced.
+`LodStreamLevelCut` likewise runs through streamed recovery and retains the Header's declared bound
+while summarizing only levels found in the intact record prefix. `LodKfDeltaRangeSeek` records every
+range request and fails if the decoder fetches a state chunk outside the index-selected chains; the
+same valid fixture is separately accepted by the exhaustive identity validator. The invalid
+selected-chain fixtures in §10.3 use the same request trace to prove that local identity validation
+does not expand the seek; the scratch counters defined above separately prove that it retains no
+keyed identity history between seeks.
 
 ### 10.3 Files full-file conformance must refuse
 
@@ -1090,26 +1119,30 @@ identifier of the refusal it must produce — `lod-levels-malformed`, `level-exc
 `lod-level0-complete-malformed`, `lod-level0-without-gate`, `level-index-missing`,
 `level-index-mismatch`, `delta-crosses-level`, `level-overlap`, `level-run-without-keyframe`,
 `level-chain-crosses-gap`, `id-crosses-level`, `duplicate-id-across-levels`,
-`id-reuse-across-levels-after-death`, `lod-level0-birth-has-holes`, `lod-level0-kf-invalid-run`.
-These files run through the exhaustive validation entry point; a single-instant indexed decode is
-not required to fetch unselected payloads merely to discover a whole-history fault. The
-malformed-completeness file carries `Header.attributes["lod_level0_complete"] = "TRUE"` alongside a
-valid LOD gate and MUST produce `lod-level0-complete-malformed`; this prevents truthiness or
-case-folding from changing the promise. The orphan-promise file carries Header
-`lod_level0_complete = "true"` without Header `lod_levels` and proves that the promise cannot
-authorize its own seek. The migration file gives id 7 a state-bearing occurrence in a level-0 run
-and a later non-overlapping level-1 run without a death; it MUST produce `id-crosses-level`. The
-duplicate-id file gives two active levels individually valid chains that both contain
-`gaussian_id = 7`; it MUST produce the more specific duplicate identifier only after the
-reconstructed union exposes the collision, naming both levels and chunks. The reuse file gives id 7
-a valid lifecycle that ends in death, then births id 7 again in a later run; it MUST produce the
-more specific reuse identifier and name the earlier lifecycle, death and later birth even though no
-reconstructed instant has two live id-7 gaussians. The two level-0 files prove the
-temporal-model-specific coverage definitions. There is no `gaussian-birth` identity-refusal file,
-because that model exposes no wire identity with which a reader could diagnose cloned source
-ownership (§3.1, §9). This reuses the refusal-expectation harness contract keyframe-delta §11.5
-introduces; if that contract has landed by the time this does, this adds rows to it rather than a
-mechanism.
+`id-reuse-across-levels-after-death`, `lod-level0-birth-out-of-order`, `lod-level0-birth-has-holes`,
+`lod-level0-kf-invalid-run`. These files run through the exhaustive validation entry point; a
+single-instant indexed decode is not required to fetch unselected payloads merely to discover a
+whole-history fault. The malformed-completeness file carries
+`Header.attributes["lod_level0_complete"] = "TRUE"` alongside a valid LOD gate and MUST produce
+`lod-level0-complete-malformed`; this prevents truthiness or case-folding from changing the promise.
+The orphan-promise file carries Header `lod_level0_complete = "true"` without Header `lod_levels`
+and proves that the promise cannot authorize its own seek. The migration file gives id 7 a
+state-bearing occurrence in a level-0 run and a later non-overlapping level-1 run without a death;
+it MUST produce `id-crosses-level`. The duplicate-id file gives two active levels individually valid
+chains that both contain `gaussian_id = 7`; it MUST produce the more specific duplicate identifier
+only after the reconstructed union exposes the collision, naming both levels and chunks. The reuse
+file gives id 7 a valid lifecycle that ends in death, then carries id 7 in a delta `births` group in
+a later run. `LodKfDeltaReuseInKeyframe` instead ends the same lifecycle, leaves a coverage gap, and
+places id 7 directly in the absolute state of the keyframe that begins the later run; there is no
+`births` group to inspect. Both MUST produce the more specific reuse identifier and name the earlier
+lifecycle, death and later occurrence even though no reconstructed instant has two live id-7
+gaussians. The level-0 coverage files prove the temporal-model-specific definitions. In particular,
+`LodLevel0BirthOutOfOrder` has overlapping intervals with `t0` sequence `0, 0.5, 0.25` whose union
+covers the clip; it MUST produce `lod-level0-birth-out-of-order`, proving a validator does not sort
+or accumulate the interval set. There is no `gaussian-birth` identity-refusal file, because that
+model exposes no wire identity with which a reader could diagnose cloned source ownership (§3.1,
+§9). This reuses the refusal-expectation harness contract keyframe-delta §11.5 introduces; if that
+contract has landed by the time this does, this adds rows to it rather than a mechanism.
 
 `LodKfDeltaIdentityBudgetOverflow` is a generated exhaustive-validation refusal case. The runner
 configures the validator with a 4,096-byte identity-memory budget. A level-0 keyframe contains the
@@ -1157,9 +1190,13 @@ seek remains an exhaustive-validation invariant.
 Added as `No` or `Planned` for every SDK, moved only by a passing suite:
 
 - Level seek and gated index field — filter by `level ≤ N` and decode the append only when Header
-  `lod_levels` declares it (§4.1, §4.2)
+  `lod_levels` declares it; a Metadata-only key leaves both semantics and index layout unchanged
+  (§4.1, §4.2)
 - Exclusive LOD bound — over-declaration and truncated-stream recovery keep observed levels sparse,
   while a `lod_levels - 1` request includes every observed level
+- Level-0 completeness — canonical Header promise grammar and model-specific coverage;
+  `gaussian-birth` validates non-decreasing physical `t0` plus gap-free union with constant state,
+  while a Metadata-only key is inert
 - Contiguous band prefixes — the highest-contiguous-prefix rule with out-of-order bands held (§3.3)
 - Per-chunk SH transfer caps — `byChunk` agrees while stored scene degree remains uniform
 - Stream truncation — an incomplete trailing band set is dropped, never treated as an implicit cap
@@ -1169,7 +1206,8 @@ Added as `No` or `Planned` for every SDK, moved only by a passing suite:
 - Keyframe-delta full-file identity — every id has one immutable level, active unions have unique
   ids, and lifecycle history never restarts across levels or separated runs, checked through
   budgeted numeric partitions or bounded-memory external sorting; the over-budget migration fixture
-  proves validation continues after the configured in-memory capacity is exceeded
+  proves validation continues after the configured in-memory capacity is exceeded, and reuse is
+  exercised through both delta births and later keyframe state
 - Full-union equivalence — a `lod_levels - 1` decode equals a non-LOD decode
 - Encode: source partition and one-level ownership — each source gaussian is emitted in exactly one
   level tranche
@@ -1224,7 +1262,7 @@ contradicts a decision and no reader has to hold both a recommendation and its o
 | 2   | Per-level quality metadata                         | Defer both key and record: no canonical omission metric or sparse string grammar is justified; transfer size remains index-derivable                                                                                      | §3.2, §12.2         |
 | 3   | A network manifest                                 | Not added; the byte-range index suffices and a manifest breaks "one resource"                                                                                                                                             | §8                  |
 | 4   | Additive levels vs replacement levels              | Additive; forward compatibility is incompatible with replacement                                                                                                                                                          | §3.1, §5            |
-| 5   | Must every level cover the whole timeline          | No; only Header `lod_level0_complete` promises level 0: gap-free interval union for `gaussian-birth`, one full non-overlapping run for `keyframe-delta`                                                                   | §3.5, §4.4, §9      |
+| 5   | Must every level cover the whole timeline          | No; only Header `lod_level0_complete` promises level 0: non-decreasing `t0`, gap-free interval union for `gaussian-birth`, one full non-overlapping run for `keyframe-delta`                                              | §3.5, §4.4, §9      |
 | 6   | How a reader knows `level` carries LOD importance  | Opt-in only via `Header.attributes["lod_levels"]`; without that exact entry, `level` keeps its §5.5 meaning and a reader never filters on it                                                                              | §4.1, §4.4          |
 | 7   | Gate and index integrity                           | Header `lod_levels` is a canonical exclusive bound in `1..4294967296`; over-declaration is valid; every level is lower; indexed LOD entries carry `level`; readers store observed levels sparsely                         | §4.2, §4.4, §9      |
 | 8   | LOD `keyframe-delta` vs the global tiling rule     | Header-gated LOD generalizes full tiling to sparse per-level runs; a pre-LOD reader cleanly refuses layouts with cross-level overlap or same-level gaps rather than silently mis-decoding                                 | §3.5, §4.6, §5      |
