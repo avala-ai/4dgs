@@ -474,18 +474,23 @@ async function composeDelta(
   const deaths = await decodeGroup(groups.deaths, codecs);
   // Each group's gaussian_id stream MUST carry exactly the count the header declares
   // (§5.18/§11.9), so a declared-nonzero-but-empty group is a refusal rather than a
-  // silent zero and a streamed reader can size its working set before decompressing.
-  checkGroupCount("update", updates.ids.length, parsed.header.updateCount);
-  checkGroupCount("birth", births.ids.length, parsed.header.birthCount);
-  checkGroupCount("death", deaths.ids.length, parsed.header.deathCount);
+  // silent zero and a streamed reader can size its working set before decompressing. The
+  // delta chunk is named by its interval and reference so a file with many of them says
+  // which one is wrong.
+  const where =
+    `delta chunk over [${parsed.header.t0}, ${parsed.header.t1}) ` +
+    `referencing offset ${parsed.header.referenceOffset}`;
+  checkGroupCount(where, "update", updates.ids.length, parsed.header.updateCount);
+  checkGroupCount(where, "birth", births.ids.length, parsed.header.birthCount);
+  checkGroupCount(where, "death", deaths.ids.length, parsed.header.deathCount);
   return applyDelta(reference, updates.ids, updates.bins, births.ids, births.bins, deaths.ids);
 }
 
-function checkGroupCount(group: string, actual: number, declared: number): void {
+function checkGroupCount(where: string, group: string, actual: number, declared: number): void {
   if (actual !== declared) {
     throw new MalformedFile(
-      `the ${group} group carries ${actual} gaussian ids, but the Delta Chunk header declares ` +
-        `${group}_count=${declared}`,
+      `the ${group} group of the ${where} carries ${actual} gaussian ids, but its header ` +
+        `declares ${group}_count=${declared}`,
     );
   }
 }
