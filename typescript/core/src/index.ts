@@ -59,6 +59,8 @@ export {
 export { Cursor } from "./cursor.js";
 
 export {
+  DELTA_MODE_CHAINED,
+  DELTA_MODE_KEYFRAME,
   FOOTER_TAIL_BYTES,
   MAGIC,
   RECORD_HEADER_BYTES,
@@ -75,10 +77,12 @@ export {
   type CameraKeyframe,
   type ChunkHeader,
   type ChunkIndexEntry,
+  type DeltaChunkHeader,
   type Footer,
   type Header,
   type Metadata,
   type ParsedChunk,
+  type ParsedDeltaChunk,
   type Quantization,
   type RawRecord,
   type Statistics,
@@ -94,6 +98,7 @@ export {
   parseCamera,
   parseChunk,
   parseChunkIndexEntry,
+  parseDeltaChunk,
   parseFooter,
   parseHeader,
   parseMetadata,
@@ -175,3 +180,17 @@ export {
   type OpenIndexedOptions,
   type ReadChunkOptions,
 } from "./indexedDecoder.js";
+
+export {
+  KEYFRAME_DELTA_BIN_MAX,
+  KEYFRAME_DELTA_BIN_MIN,
+  KeyframeDeltaState,
+  type KeyframeDeltaChunkInfo,
+  type KeyframeDeltaIndexedResult,
+  type KeyframeDeltaSequence,
+  chainFor,
+  checkTiling,
+  decodeKeyframeDeltaIndexed,
+  decodeKeyframeDeltaStreamed,
+  keyframeDeltaStatesJson,
+} from "./keyframeDelta.js";

@@ -56,14 +56,18 @@ jobs:
           echo "rust: ${size_kb} KiB"
           [ "$size_kb" -le 1000 ] || { echo "::error::rust is ${size_kb} KiB, over the 1000 KiB budget"; exit 1; }
 
-      - name: TypeScript sources under 500 KB
+      - name: TypeScript sources under 576 KB
         # Sources only: this job installs nothing and builds nothing, so node_modules
         # and dist are not here to measure. A vendored dependency would show up as a
         # budget failure, which is the point.
+        # Raised from 500 to 576 KiB for the keyframe-delta decode path: the native
+        # decoder (keyframeDelta.ts) plus its unit test and the base64 keyframe-delta
+        # fixtures it decodes — embedded because the TypeScript side is decode-only and
+        # has no encoder to write them at test time, exactly as the Dart side does.
         run: |
           size_kb=$(du -s typescript | cut -f1)
           echo "typescript: ${size_kb} KiB"
-          [ "$size_kb" -le 500 ] || { echo "::error::typescript is ${size_kb} KiB, over the 500 KiB budget"; exit 1; }
+          [ "$size_kb" -le 576 ] || { echo "::error::typescript is ${size_kb} KiB, over the 576 KiB budget"; exit 1; }
       - name: Dart sources under 360 KB
         # Sources only, same as TypeScript's and Swift's: this job builds nothing, so
         # .dart_tool and the compiled runners are not here to measure, and a vendored

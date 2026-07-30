@@ -11,10 +11,18 @@
  */
 
 import {
+  MAGIC,
+  Opcode,
   assembleGaussians,
+  checkMagic,
+  decodeKeyframeDeltaIndexed,
   IndexedDecoder,
+  iterateRecords,
+  keyframeDeltaStatesJson,
   MAX_SH_DEGREE,
+  parseHeader,
   type ChunkGaussians,
+  type IReadable,
   type ShCoefficients,
 } from "@4dgs/core";
 import { FileHandleReadable } from "@4dgs/nodejs";
@@ -22,15 +30,37 @@ import { FileHandleReadable } from "@4dgs/nodejs";
 import { canonical, summarize } from "./canonical.js";
 import { checkIndexedInvariants, CountingReadable } from "./checks.js";
 
+/** How much of the front is read to learn the temporal model without decoding gaussians. */
+const HEADER_PROBE_BYTES = 64 * 1024;
+
 /** A file written without an index cannot be read this way; the harness skips those. */
 export function supportsVariant(name: string): boolean {
   return name.includes("UseChunkIndex");
+}
+
+/** The Header's temporal model, read from a bounded prefix. */
+async function temporalModel(source: IReadable, size: number): Promise<string | null> {
+  const probe = await source.read(0n, BigInt(Math.min(size, HEADER_PROBE_BYTES)));
+  checkMagic(probe);
+  for (const record of iterateRecords(probe, MAGIC.length)) {
+    if (record.opcode === Opcode.Header) return parseHeader(record.content).temporalModel;
+  }
+  return null;
 }
 
 export async function run(path: string): Promise<string> {
   const file = await FileHandleReadable.open(path);
   const source = new CountingReadable(file);
   try {
+    const size = Number(await source.size());
+    if ((await temporalModel(source, size)) === "keyframe-delta") {
+      // Read the Footer, then the index, then compose each chunk by walking its chain — the
+      // seeking client's path — and emit the same states canonical the streamed runner does.
+      // Agreeing across the two paths is most of what makes an indexed keyframe-delta reader
+      // trustworthy.
+      const data = await source.read(0n, BigInt(size));
+      return canonical(keyframeDeltaStatesJson((await decodeKeyframeDeltaIndexed(data)).sequence));
+    }
     const scene = await IndexedDecoder.open(source);
     const chunks: ChunkGaussians[] = [];
     const shParts: ShCoefficients[] = [];

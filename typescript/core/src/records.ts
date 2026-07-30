@@ -248,6 +248,75 @@ export function parseChunk(content: Uint8Array): ParsedChunk {
   return { header, streams: c.blob() };
 }
 
+/**
+ * `delta_mode` values, per chunk rather than per file: an encoder that knows an instant is
+ * a likely seek target can make it cost two records regardless of how deep into the group
+ * it falls, without spending a whole keyframe on it.
+ */
+export const DELTA_MODE_KEYFRAME = 0;
+export const DELTA_MODE_CHAINED = 1;
+
+export interface DeltaChunkHeader {
+  readonly t0: number;
+  readonly t1: number;
+  readonly level: number;
+  readonly deltaMode: number;
+  /**
+   * The chunk this delta applies to. Strictly less than the delta's own offset: references
+   * point backwards only, so the chain walk terminates and cycles are unrepresentable.
+   */
+  readonly referenceOffset: number;
+  /** The keyframe at the head of this group. */
+  readonly keyframeOffset: number;
+  /** Delta chunks that must be composed to reach this one — the exact read cost. */
+  readonly depth: number;
+  readonly updateCount: number;
+  readonly birthCount: number;
+  readonly deathCount: number;
+  readonly compression: string;
+  readonly uncompressedSize: number;
+}
+
+export interface ParsedDeltaChunk {
+  readonly header: DeltaChunkHeader;
+  /** The update group's concatenated Attribute Stream records, still compressed. */
+  readonly updates: Uint8Array;
+  /** The birth group's streams. */
+  readonly births: Uint8Array;
+  /** The death group's stream: identities only. */
+  readonly deaths: Uint8Array;
+}
+
+/**
+ * A Delta Chunk record.
+ *
+ * The three groups are framed by length inside one records blob rather than tagged with a
+ * group byte on every stream, so a reader takes the death list — which is small and which
+ * a consumer often wants alone — by stepping over two lengths.
+ */
+export function parseDeltaChunk(content: Uint8Array): ParsedDeltaChunk {
+  const c = new Cursor(content);
+  const header: DeltaChunkHeader = {
+    t0: c.f64(),
+    t1: c.f64(),
+    level: c.u32(),
+    deltaMode: c.u8(),
+    referenceOffset: c.u64(),
+    keyframeOffset: c.u64(),
+    depth: c.u16(),
+    updateCount: c.u32(),
+    birthCount: c.u32(),
+    deathCount: c.u32(),
+    compression: c.string(),
+    uncompressedSize: c.u64(),
+  };
+  const records = new Cursor(c.blob());
+  const updates = records.blob();
+  const births = records.blob();
+  const deaths = records.blob();
+  return { header, updates, births, deaths };
+}
+
 export interface BandRange {
   readonly band: number;
   readonly offset: number;
@@ -261,7 +330,31 @@ export interface ChunkIndexEntry {
   readonly chunkLength: number;
   readonly gaussianCount: number;
   readonly bands: readonly BandRange[];
+  /**
+   * True when this entry carries the `keyframe-delta` block below. False for every
+   * `gaussian-birth` file, whose entries stay byte-identical to those written before this
+   * revision existed.
+   */
+  readonly extended: boolean;
+  /** 0 keyframe (a Chunk record), 1 delta (a Delta Chunk record). */
+  readonly kind: number;
+  readonly deltaMode: number;
+  readonly referenceOffset: number;
+  readonly keyframeOffset: number;
+  readonly depth: number;
+  /** Gaussians live over `[t0, t1)` after composition. */
+  readonly liveCount: number;
 }
+
+/**
+ * Bytes the `keyframe-delta` block appends to a Chunk Index entry: `u8` kind, `u8`
+ * delta_mode, `u64` reference_offset, `u64` keyframe_offset, `u16` depth, `u64`
+ * live_count. A reader takes the record's length from its header, so an entry with at
+ * least this many bytes left after the band array carries the block and one without simply
+ * does not — which is how a `gaussian-birth` entry still parses, unchanged, to the same
+ * values.
+ */
+const INDEX_DELTA_BLOCK_BYTES = 1 + 1 + 8 + 8 + 2 + 8;
 
 export function parseChunkIndexEntry(content: Uint8Array): ChunkIndexEntry {
   const c = new Cursor(content);
@@ -275,7 +368,37 @@ export function parseChunkIndexEntry(content: Uint8Array): ChunkIndexEntry {
   for (let i = 0; i < bandCount; i++) {
     bands.push({ band: c.u8(), offset: c.u64(), length: c.u64() });
   }
-  return { t0, t1, chunkOffset, chunkLength, gaussianCount, bands };
+  let extended = false;
+  let kind = 0;
+  let deltaMode = 0;
+  let referenceOffset = 0;
+  let keyframeOffset = 0;
+  let depth = 0;
+  let liveCount = 0;
+  if (c.remaining >= INDEX_DELTA_BLOCK_BYTES) {
+    extended = true;
+    kind = c.u8();
+    deltaMode = c.u8();
+    referenceOffset = c.u64();
+    keyframeOffset = c.u64();
+    depth = c.u16();
+    liveCount = c.u64();
+  }
+  return {
+    t0,
+    t1,
+    chunkOffset,
+    chunkLength,
+    gaussianCount,
+    bands,
+    extended,
+    kind,
+    deltaMode,
+    referenceOffset,
+    keyframeOffset,
+    depth,
+    liveCount,
+  };
 }
 
 /** The half-open interval test the seek rule is built on. */
