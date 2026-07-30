@@ -16,9 +16,14 @@ import { decodeKeyframeDeltaIndexed, keyframeDeltaStatesJson } from "@4dgs/core"
 
 import { canonical } from "./canonical.js";
 
+/** The name tokens the keyframe-delta corpus variants carry (matches run.py). */
+const KEYFRAME_DELTA_TOKENS = ["KeyframeOnly", "KeyframeDelta"] as const;
+
 /** A file written without an index cannot be read this way; keyframe-delta variants only. */
 export function supportsVariant(name: string): boolean {
-  return name.includes("KeyframeDelta") && name.includes("UseChunkIndex");
+  return (
+    KEYFRAME_DELTA_TOKENS.some((token) => name.includes(token)) && name.includes("UseChunkIndex")
+  );
 }
 
 export async function run(path: string): Promise<string> {

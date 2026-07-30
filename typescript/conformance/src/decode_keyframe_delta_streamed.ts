@@ -16,9 +16,12 @@ import { decodeKeyframeDeltaStreamed, keyframeDeltaStatesJson } from "@4dgs/core
 
 import { canonical } from "./canonical.js";
 
+/** The name tokens the keyframe-delta corpus variants carry (matches run.py). */
+const KEYFRAME_DELTA_TOKENS = ["KeyframeOnly", "KeyframeDelta"] as const;
+
 /** Only the keyframe-delta corpus variants; the gaussian-birth runners own the rest. */
 export function supportsVariant(name: string): boolean {
-  return name.includes("KeyframeDelta");
+  return KEYFRAME_DELTA_TOKENS.some((token) => name.includes(token));
 }
 
 export async function run(path: string): Promise<string> {
