@@ -10,12 +10,12 @@ Every question this design left open has been decided; the decisions are recorde
 into the sections they affect, so no section contradicts a ruling.
 
 This layer is **not a temporal model** and it does not change reconstruction. It is closest in kind
-to the object layer: a set of optional additions that a reader may ignore entirely and still decode
-every file correctly, plus one rule that fixes the meaning of a field the specification already
-carries but currently leaves informational. Where the object layer added a transform, this layer
-adds **nothing to the reconstructed scene at all** — it is a rule about which bytes a reader must
-fetch to obtain a chosen part of a scene it could already obtain in full. That difference is the
-whole of §5.
+to the object layer: a set of optional additions that a reader may ignore and either reconstruct the
+same full scene or, for a `keyframe-delta` layout that violates the old global tiling rule, refuse
+cleanly. One rule fixes the declared meaning of a field the specification already carries but
+currently leaves informational. Where the object layer added a transform, this layer adds **nothing
+to reconstructed gaussian state at all** — it is a rule about which bytes a reader must fetch to
+obtain a chosen part of a scene it could already obtain in full. That difference is the whole of §5.
 
 ---
 
@@ -89,9 +89,9 @@ layer needs.
 - **Spatial subdivision within a temporal chunk.** Spec §10.1 reserves it, and this design is the
   _between-chunk_ detail axis, not the _within-chunk_ one. §6 states exactly how the two relate and
   why this layer does not need the reserved one to be useful.
-- **Per-gaussian SH degree.** Reserved by spec §10.1. The quality axis here is whole bands dropped
-  uniformly, which the wire already supports; a per-gaussian degree is a different and larger
-  change.
+- **Per-gaussian stored SH degree.** Reserved by spec §10.1. The quality axis here selects whole
+  contiguous band ranges during a read while every chunk retains the scene-wide stored degree; a
+  per-gaussian encoded degree is a different and larger change.
 
 ---
 
@@ -147,12 +147,14 @@ reinterpreted.** Spec §5.5 defines `level` as "producer's hierarchy level; info
 a file's `level` values may already mean something that is not importance: the reference writers,
 for one, tag a chunk with its depth in the temporal partition tree, so a file in the wild can carry
 `level > 0` that has nothing to do with detail. The cumulative-subset rule above therefore applies
-**only to a file that declares it uses LOD levels** — via the `lod_levels` metadata key (§4.4).
-Absent that declaration, `level` keeps its §5.5 informational meaning untouched, so §4.4's freeze on
+**only to a file that declares it uses LOD levels** — specifically by carrying `lod_levels` in
+`Header.attributes` (§4.4). A value found anywhere else does not make the declaration. Absent that
+Header declaration, `level` keeps its §5.5 informational meaning untouched, so §4.4's freeze on
 existing field meanings holds: this proposal does not change what `level` means in any file already
 written; it gives a _new, declared_ meaning to files that opt in. §4.1 and §4.2 make the reader
-consequence exact: **a reader MUST NOT filter on `level` unless the file declares LOD**, and one
-that does not filter loads every chunk and gets the full scene regardless of what `level` meant.
+consequence exact: **a reader MUST NOT filter on `level` unless `Header.attributes` declares LOD**,
+and one that does not filter loads every chunk and gets the full scene regardless of what `level`
+meant.
 
 ### 3.2 The detail axis is exact per gaussian, lossy only by omission
 
@@ -212,19 +214,25 @@ band prefixes for exactly this reason; it is the one place the two axes differ (
 
 One reading has to be made explicit, because progressive refinement across many chunks reaches it
 and single-shot decoding does not. The Header declares one `sh_degree` for the scene (spec §6.5),
-but that is the **maximum available**, and a partially refined scene may hold some chunks at a
-higher assembled degree than others — the near chunks refined to degree 3, the far ones still at
-degree 0.
+and **every chunk stores that same complete band set**. This proposal does not change the scene-wide
+stored degree or permit a writer to omit a declared band from selected chunks: current readers
+correctly treat such a file as malformed under spec §6.5. Progressive transfer changes only which of
+those uniformly stored ranges a particular read has fetched. A partially transferred scene may
+therefore hold some chunks at a higher fetched degree than others — one chunk fetched through degree
+3, another still holding only its base colour — while the file itself remains a uniform degree-3
+file.
 
-> A gaussian is evaluated at the degree for which its bands are present. `sh_degree` is the ceiling,
-> and any per-gaussian evaluated degree at or below it is a valid scene. A scene of mixed per-chunk
-> degree is a union of valid lower-degree gaussians and is itself valid.
+> A gaussian is evaluated at the highest contiguous degree whose ranges this read has fetched.
+> `sh_degree` is both the stored scene-wide degree and the per-read ceiling. Different chunks MAY
+> have different **transfer caps** in one partial read, but every chunk in the file MUST store all
+> bands `1..sh_degree`.
 
 This is the natural reading of the per-band byte ranges already in the index — they exist precisely
-so a band can be fetched or not fetched per chunk — and it contradicts nothing in §6.5, which
-forbids assembling a _partial band_, not evaluating _whole bands_ at a per-chunk count. A reader
-still MUST NOT assemble a partial degree out of part of a band (spec §6.5); it MAY hold different
-whole-band counts for different chunks.
+so a read can fetch a band or leave its range untouched per chunk — and it preserves §6.5's
+scene-wide storage invariant for existing full decoders. A reader still MUST NOT assemble a partial
+degree out of part of a band (spec §6.5); it MAY hold different contiguous fetched-band counts for
+different chunks. An old reader fetches every stored band as before and sees the one declared
+scene-wide degree.
 
 ### 3.4 The valid-at-every-prefix property
 
@@ -286,17 +294,27 @@ multi-level LOD scene breaks that global rule head-on: level 0 and level 1 both 
 covering the same instant, so their chunks **overlap in time**, which the global rule reads as a
 malformed file.
 
-So under `keyframe-delta`, LOD does not merely add a filter; it **generalizes the tiling rule** from
-global to per-level:
+So under `keyframe-delta`, LOD does not merely add a filter; it **generalizes the global tiling rule
+to sparse, independent level runs**:
 
-> Each level's chunks independently tile the timeline, and `current(t)` becomes a **set** — one
-> entry per level that covers `t` — rather than a single entry. The chain walk _within_ a level is
-> unchanged. A delta's reference already shares its level (spec §11 / keyframe-delta §3.6), so a
-> level's chains never cross into another level.
+> Within one level, state chunks MUST NOT overlap. Sorted by `t0`, chunks that touch belong to one
+> contiguous **run**; a gap ends that run and a later chunk begins another. The first chunk of every
+> run MUST be a keyframe, and every delta in the run MUST resolve, through same-level backward
+> references, to a keyframe in that same run. A level need not start at `0`, end at `duration_sec`,
+> or cover its gaps. `current(t, ell)` is therefore either the unique entry at level `ell` whose
+> interval contains `t`, or absent.
+
+This retains the two load-bearing parts of spec §11.1 — no overlapping state at one level, and a
+unique current state wherever that level has coverage — without importing its full-clip coverage
+requirement. Importing that requirement would contradict sparse enhancement levels: a level that
+adds detail only for one part of the clip is valid (§9). A gap cannot be crossed by a delta chain;
+requiring the next run to start with a keyframe makes each covered interval independently decodable.
+When `lod_level0_complete = "true"`, level 0 has one run that does tile `[0, duration_sec)`; no
+other level is required to do so.
 
 ```
-chunks_for(t, N) = for each level ell in 0..N that has chunks covering t:
-                       the keyframe-delta chain for t within level ell   (spec §11)
+chunks_for(t, N) = for each present level ell <= N where current(t, ell) exists:
+                       the keyframe-delta chain for current(t, ell), contained in its run
                    unioned over ell
 ```
 
@@ -304,18 +322,18 @@ This is exactly the generalization keyframe-delta §7 anticipated in writing —
 subdivision within a temporal chunk is ever added, `current(t)` becomes a set rather than a single
 entry; the chain walk is unaffected" — with the set indexed by level rather than by region.
 
-**Because it changes a normative refusal rule, this generalization is gated: it is legal only in a
-declared-LOD file (`lod_levels` present, §4.1), and a reader applies per-level tiling only there.**
-The consequence for an old reader is the honest one, and it is the single exception to §5's no-gate
-story: a reader that does not implement LOD still enforces the global tiling rule, so it **refuses**
-a multi-level `keyframe-delta` file on the overlap check (spec §11.1) rather than loading its full
-union. That refusal is clean — a stated rule naming the overlapping intervals, not silent corruption
-— but it is a refusal, so multi-level `keyframe-delta` LOD is **not** forward-compatible with a
-pre-LOD `keyframe-delta` reader. §5 scopes the forward-compatibility claim precisely around this: it
-holds unconditionally for `gaussian-birth` (which has no tiling rule — chunks may overlap freely,
-spec §8) at any number of levels, and for single-level `keyframe-delta`; the one combination it does
-not cover is multi-level `keyframe-delta`, which needs an LOD-aware reader. A level that adds no
-detail over some interval simply has no chunk there and contributes nothing to the union at those
+**Because it changes a normative refusal rule, this generalization is gated: it is legal only when
+`Header.attributes` carries `lod_levels` (§4.1), and a reader applies the level-run rules only
+there.** The consequence for an old reader is the honest one, and it is the single exception to §5's
+backward-decode story: a reader that does not implement LOD still enforces the global tiling rule,
+so it **refuses** when populated levels overlap or when the only populated level leaves a gap (spec
+§11.1), rather than loading the LOD union. That refusal is clean — a stated rule naming the
+overlapping or gapped intervals, not silent corruption — but it is a refusal. §5 scopes the
+forward-compatibility claim precisely around this: it holds unconditionally for `gaussian-birth`
+(which has no tiling rule — chunks may overlap freely, spec §8) at any number of levels, and for a
+single-level `keyframe-delta` file whose sole level still satisfies spec §11.1. Any `keyframe-delta`
+layout that needs the sparse level-run rule requires an LOD-aware reader. A level that adds no
+detail over some interval simply has no run there and contributes nothing to the union at those
 instants — which is not an error (§9).
 
 **Level and the object layer.** `object_id` is a per-gaussian attribute that rides in the chunk
@@ -354,20 +372,21 @@ policy.
 
 Chunk (`0x05`) and Delta Chunk (spec `0x10`) already carry `u32 level`. No byte moves. What changes
 is that a file MAY now _declare_ that its `level` values carry cumulative LOD importance (§3.1), by
-carrying the `lod_levels` metadata key (§4.4); and the seek and reconstruction rules of this layer
-apply to such a file and to no other.
+carrying the `lod_levels` key specifically in `Header.attributes` (§4.4); and the seek and
+reconstruction rules of this layer apply to such a file and to no other. A `lod_levels` string found
+only in a Metadata record is not this declaration.
 
 This is deliberately an opt-in, and it is what keeps the change inside spec §4.4's freeze on
 existing field meanings:
 
-- **A file that declares LOD** (`lod_levels` present) uses `level` as §3.1's cumulative subset key,
-  and a LOD-aware reader MAY filter on it (§4.2).
+- **A file that declares LOD** (`Header.attributes["lod_levels"]` present) uses `level` as §3.1's
+  cumulative subset key, and a LOD-aware reader MAY filter on it (§4.2).
 - **A file that does not** keeps `level` at its spec §5.5 meaning — "producer's hierarchy level;
   informational only" — verbatim. Its `level` values may mean temporal-tree depth, or nothing, or
   anything a producer put there; the reference writers already emit `level > 0` for temporal
   partition depth, so this case is not hypothetical. **A reader MUST NOT filter on `level` in a file
-  that does not declare LOD**, and one that does not filter loads every chunk — the full scene —
-  regardless of what `level` meant.
+  whose Header does not declare LOD**, and one that does not filter loads every chunk — the full
+  scene — regardless of what `level` meant.
 
 So no file already written changes meaning, and no reader can mistake a temporal-depth `level` for
 an importance level: the importance reading exists only where a producer asked for it. This is the
@@ -395,6 +414,14 @@ both — the same cheap corruption check the keyframe-delta index fields make on
 (spec §5.8), for the same reason: a seek predicate a reader trusts must not be able to disagree with
 the record it selects.
 
+**In an indexed file whose `Header.attributes` declares LOD, the append is mandatory on every Chunk
+Index entry.** One entry without `level` would force a seeking reader to fetch that chunk merely to
+decide whether to fetch it, breaking the range-seekable contract. A reader MUST refuse such a file
+before selecting chunks, naming the entry whose appended field is absent. A non-LOD index MAY omit
+the append; in that case there is no authorized level predicate to evaluate. A streamed file with no
+Chunk Index still filters on each Chunk or Delta Chunk's existing `level` as records arrive, so the
+mandatory index append applies only when an index exists.
+
 With the field present, the seek is the one-line extension of spec §8 given in §3.5: the same index
 scan, one more comparison per entry, no chunk fetched to evaluate it. **The layer costs a seeking
 reader nothing beyond the comparison** — the index is read once at open, as it always is, and
@@ -412,17 +439,18 @@ locate either. §12.1 is the ruling. The normative layout of the appended region
 ```
 [ base Chunk Index, through the variable band array ]
 [ keyframe-delta block: the six fields above, present iff temporal_model == "keyframe-delta" ]
-[ level: u32, present iff content_length has room after the blocks above ]
+[ level: u32, mandatory when Header.attributes declares LOD; otherwise present iff content_length
+  has room after the blocks above ]
 ```
 
 `level` is the **last** appended field, the keyframe-delta block precedes it, and a reader locates
-`level` as the four bytes after all other known blocks, present when `content_length` leaves room
-for them. This is unambiguous for exactly these two appenders, and unambiguous **because one of them
-is keyed to a Header field**: `temporal_model` decides whether the six-field block is there before a
-reader reaches the appended region, and the single trailing `u32` is then decided by remaining
-length. The order is recorded in the registry so it is decided once, and re-verified against the
-merged record at implementation time, exactly as the object layer re-verifies its opcodes
-(object-layer §12.6).
+`level` as the four bytes after all other known blocks. `content_length` reveals whether those bytes
+exist; `Header.attributes["lod_levels"]` decides whether their absence is legal. This is unambiguous
+for exactly these two appenders, and unambiguous **because one of them is keyed to a Header field**:
+`temporal_model` decides whether the six-field block is there before a reader reaches the appended
+region, and the single trailing `u32` is then located by remaining length. The order is recorded in
+the registry so it is decided once, and re-verified against the merged record at implementation
+time, exactly as the object layer re-verifies its opcodes (object-layer §12.6).
 
 **This scheme does not generalize past two appenders, and the escalation is normative.** A third
 _independent-optional_ append to the Chunk Index — one whose presence is not already decided by a
@@ -450,11 +478,21 @@ with the object and temporal layers. A promise that cannot be declared alongside
 contradict that. Metadata keys are orthogonal by construction — a file carries as many as it likes —
 so LOD support is declared with keys and composes with any profile.
 
-- **`lod_levels`** — the number of levels, a decimal string for a positive integer equal to one more
-  than the maximum `level` in the file. **Its presence is the opt-in gate of §4.1**: a file that
-  carries it declares its `level` values are cumulative LOD importance levels, which is what
-  authorizes a reader to filter on `level`. A file without it is not an LOD file, whatever its
-  `level` values are. The count also lets a consumer size its ladder before fetching the index.
+- **`lod_levels`** — the level-number upper bound, encoded canonically as `[1-9][0-9]*`, equal to
+  one more than the maximum `u32 level` in the file. Its permitted numeric range is therefore
+  `1..4294967296`, inclusive; a reader parses it with checked arithmetic wide enough to represent
+  the upper endpoint. **Its presence in `Header.attributes` is the opt-in gate of §4.1**: that exact
+  Header entry declares the file's `level` values are cumulative LOD importance levels, which is
+  what authorizes a reader to filter on `level`. A file whose Header lacks it is not an LOD file,
+  whatever its `level` values or later Metadata records contain.
+
+  The value is an upper bound for validation and requested-level comparison, **not an allocation
+  count**. Gaps are legal (§9), so a reader MUST represent actual levels sparsely — for an indexed
+  read, by the distinct `level` values present in index entries — and MUST bound level bookkeeping
+  by the number of entries it has validated, never by `lod_levels`. A streamed reader likewise
+  compares each scalar level as it arrives and does not preallocate a ladder. Thus a small file with
+  levels `0` and `4294967295` is small to decode even though it correctly declares
+  `lod_levels = "4294967296"`.
 
   **This key MUST live in `Header.attributes`, not in a trailing Metadata record**, and the reason
   is the format's range-seekability (AGENTS §2). A registry metadata key may in general appear
@@ -475,16 +513,19 @@ so LOD support is declared with keys and composes with any profile.
   requiring, say, `objects`. Absent or `"false"` means level 0 is not guaranteed to be standalone.
   It is a range-relevant promise like the gate, so it **too MUST live in `Header.attributes`** when
   present, for the reason `lod_levels` does.
-- **`lod_quality`** — an optional encoder-measured quality figure per level, the advisory number of
-  §3.2, in the spirit of the measured compression table: a producer's report, never a guarantee, and
-  reconstruction reads none of it. It changes no decode and gates no seek, so it MAY live in either
-  the Header or a Metadata record.
+- **`lod_quality`** — optional encoder-measured quality figures keyed sparsely by actual level, the
+  advisory numbers of §3.2, in the spirit of the measured compression table: a producer's report,
+  never a guarantee, and reconstruction reads none of it. It changes no decode and gates no seek, so
+  it MAY live in either the Header or a Metadata record. A reader that chooses to parse it bounds
+  storage by the metadata value's encoded length, never by `lod_levels`.
 
-All three are keys, not records, because a per-level _size_ is already derivable from the index (sum
-`chunk_length` over the entries of a level) and quality is the only datum that is not; §12.2 rules
-on whether that ever justifies a dedicated record. No new **profile** value is spent, and none is
-needed: a consumer requiring LOD tests for `lod_levels`, and one requiring a standalone coarse pass
-tests `lod_level0_complete`, either alongside whatever profile the file already carries.
+All three are keys, not records, because a level's transfer size at a chosen contiguous SH prefix is
+already derivable from the index: sum `chunk_length` **plus the lengths of every selected SH Band
+Stream range** over the level's entries. Quality is the only datum that is not derivable; §12.2
+rules on whether that ever justifies a dedicated record. No new **profile** value is spent, and none
+is needed: a consumer requiring LOD tests for `Header.attributes["lod_levels"]`, and one requiring a
+standalone coarse pass tests `Header.attributes["lod_level0_complete"]`, either alongside whatever
+profile the file already carries.
 
 ### 4.5 The summary is untouched, and no manifest is added
 
@@ -503,44 +544,49 @@ object layer's, which had a transform an old reader would miss. The mechanism:
 - The `level` field on chunks is one the current specification _already_ tells a reader to treat as
   informational, so an old reader already ignores it and already **loads every chunk regardless of
   level**.
+- Every chunk still stores the Header's one complete `sh_degree` band set (§3.3), so an old reader's
+  scene-wide band validation and full-band fetch are unchanged.
 
 Loading every chunk regardless of level is the full scene, whatever `level` meant — for an LOD file
 it is the union over all levels (§3.1); for any other file it is simply every chunk, as always. So
-an old reader, ignoring this layer completely, reconstructs **the full-detail scene, byte-identical
-to what it reconstructs today** — with one exception, which §3.5 established and §5 scopes
+an old reader, ignoring this layer completely, reconstructs **the same full-detail decoded state it
+reconstructs today** — with the compatibility boundaries that §3.5 established and §5 scopes
 precisely:
 
 - **`gaussian-birth`, any number of levels — fully forward-compatible.** It has no tiling rule;
   chunks may overlap freely (spec §8), so an old reader loads every chunk and gets the full union
-  with no gate and no degraded view.
-- **Single-level `keyframe-delta` — fully forward-compatible.** One level tiles the timeline exactly
-  as spec §11.1 requires, so an old reader reads it unchanged.
-- **Multi-level `keyframe-delta` — not forward-compatible, and cleanly so.** Its per-level chunks
-  overlap in time, which the global tiling rule (spec §11.1) reads as malformed, so an old
-  `keyframe-delta` reader **refuses** it — naming the overlapping intervals, a stated rule rather
-  than silent corruption. That combination requires an LOD-aware reader, and the `lod_levels` gate
-  is what a new reader keys the per-level tiling on.
+  with no version gate and no degraded view.
+- **Single-level `keyframe-delta` with full coverage — fully forward-compatible.** When its one
+  level starts at `0`, ends at `duration_sec`, and has no gaps, it tiles the timeline exactly as
+  spec §11.1 requires, so an old reader reads it unchanged.
+- **Any `keyframe-delta` layout that needs the LOD level-run rule — not forward-compatible, and
+  cleanly so.** Multiple populated levels normally overlap in time; a sparse sole level may leave a
+  gap. The global tiling rule (spec §11.1) reads either shape as malformed, so an old
+  `keyframe-delta` reader **refuses** it — naming the overlapping or gapped intervals, a stated rule
+  rather than silent corruption. Such a layout requires an LOD-aware reader, and the Header's
+  `lod_levels` gate is what keys the sparse, per-level chain validation.
 
-For the first two cases there is nothing for an old reader to get wrong, because the layer adds no
-reconstruction step it must run; it only lets a new, LOD-aware reader fetch less, and only when the
-file opts in (§4.1). The third case is a clean refusal, not a wrong scene. §5 is the whole argument
-that this needs no _version_ gate even so.
+For the forward-compatible cases there is nothing for an old reader to get wrong, because the layer
+adds no reconstruction step it must run; it only lets a new, LOD-aware reader fetch less, and only
+when the Header opts in (§4.1). The other `keyframe-delta` layouts produce a clean refusal, not a
+wrong scene. §5 is the whole argument that this needs no _version_ gate even so.
 
 ---
 
-## 5. Versioning: additive within version 1, and why there is no gate
+## 5. Versioning: additive within version 1, and why there is no version gate
 
 **The magic's version byte does not change. Existing files do not move. No frozen field changes.**
 Every mechanism is one spec §10 already permits:
 
-| what this adds                                      | §10 rule that permits it                    |
-| --------------------------------------------------- | ------------------------------------------- |
-| declared meaning for `level`, gated by `lod_levels` | registry/spec clarification, no wire change |
-| `u32 level` on the Chunk Index                      | existing records MAY gain appended fields   |
-| `lod_levels`, `lod_level0_complete`, `lod_quality`  | registry addition                           |
+| what this adds                                             | §10 rule that permits it                    |
+| ---------------------------------------------------------- | ------------------------------------------- |
+| declared meaning for `level`, gated by Header `lod_levels` | registry/spec clarification, no wire change |
+| `u32 level` on the Chunk Index                             | existing records MAY gain appended fields   |
+| `lod_levels`, `lod_level0_complete`, `lod_quality`         | registry addition                           |
 
-There is **no _version_ gate** — no magic-byte bump, no `temporal_model` change — and for the
-primary case no gate of any kind:
+There is **no _version_ gate** — no magic-byte bump and no `temporal_model` change. Header
+`lod_levels` gates only whether a new reader may apply the optional seek predicate; in the primary
+forward-compatible layouts it does not make an old reader refuse:
 
 > A temporal model changes what the base state _means_, so keyframe-delta gates on `temporal_model`
 > and an old reader refuses (keyframe-delta §5). The object layer changes nothing about the base
@@ -548,19 +594,19 @@ primary case no gate of any kind:
 > scene (object-layer §4.6). This layer adds **neither a reconstruction step an old reader must run
 > nor a transform it would miss** — its one new reading of `level` is opt-in (§4.1) and acted on
 > only by a new reader that chose to filter; it does not change the gaussians an old reader loads.
-> For `gaussian-birth` at any number of levels, and for single-level `keyframe-delta`, an old reader
-> does not degrade; it loads everything, which is the full scene. So no gate and not even a degraded
-> view.
+> For `gaussian-birth` at any number of levels, and for a single-level `keyframe-delta` layout that
+> still tiles the full clip, an old reader does not degrade; it loads everything, which is the full
+> scene. So no version gate and not even a degraded view.
 
-The one exception is the one §3.5 and §4.6 name: **multi-level `keyframe-delta`**. There, per-level
-chunks overlap in time, and the normative global tiling rule (spec §11.1) makes an old
-`keyframe-delta` reader refuse — cleanly, naming the overlap. That is a compatibility boundary, but
-it is not a _version_ gate and it is not silent: it falls out of a rule the format already has, the
-refusal is a stated one, and it is confined to the one combination where LOD must change a normative
-invariant (the tiling rule) to do its job. Every other combination keeps the full no-gate story. So
-the design's claim is precise rather than absolute: **additive and gate-free for `gaussian-birth`
-and single-level `keyframe-delta`; a clean, rule-based refusal for an old reader on multi-level
-`keyframe-delta`; never a silent wrong scene.**
+The exception is the one §3.5 and §4.6 name: **a `keyframe-delta` layout that relies on sparse level
+runs rather than the global full-clip tiling**. Multiple populated levels normally overlap in time,
+and a sparse sole level may leave gaps; the normative global tiling rule (spec §11.1) makes an old
+`keyframe-delta` reader refuse either shape — cleanly, naming the overlap or gap. That is a
+compatibility boundary, but it is not a _version_ gate and it is not silent: it falls out of a rule
+the format already has, and the refusal is a stated one. So the design's claim is precise rather
+than absolute: **additive and backward-decodable for `gaussian-birth` and full-clip single-level
+`keyframe-delta`; a clean, rule-based refusal for an old reader on a `keyframe-delta` file that
+needs the LOD level-run rule; never a silent wrong scene.**
 
 The one thing that would have broken this is the design choice §3.1 settled, and it is worth naming
 as the reason that choice is not merely aesthetic. Had levels been **replacement** levels — each
@@ -675,15 +721,16 @@ advertise:
   cannot disagree with itself; a manifest can disagree with the index.
 
 The one thing a manifest offers that the index does not is _discovery before the index is fetched_ —
-a client choosing a level given its bandwidth without reading the file at all. Two things answer
-that. First, the advisory metadata of §4.4 (`lod_levels`, per-level quality, and per-level size
-derivable from the index) is exactly the summary such a client wants, and it rides in the front
-matter a client reads anyway. Second, and more to the point, adaptive selection — _which_ level to
-fetch given measured bandwidth and a latency target — is a **client policy fed by the index**, not a
-container feature, in exactly the division the format draws everywhere: the format carries the facts
-that must survive interchange, the client makes the choice (spec §7.3 on spatialization,
-keyframe-delta §2 on rate control). A manifest would not add a fact; it would relocate the client's
-policy into a sidecar and break "one resource" to do it.
+a client choosing a level without reading the file at all. Two things answer that. First, the
+advisory Header metadata of §4.4 gives the declared level-number bound, while the index gives the
+sparse set of actual levels, their optional quality metadata, and their exact transfer footprints.
+For a chosen contiguous SH prefix, a footprint is the selected entries' `chunk_length` values plus
+the lengths of every selected SH range; base-chunk bytes alone are not the transfer cost. Second,
+and more to the point, adaptive selection is a **client policy fed by the index**, not a container
+feature, in exactly the division the format draws everywhere: the format carries the facts that must
+survive interchange, the client makes the choice (spec §7.3 on spatialization, keyframe-delta §2 on
+rate control). A manifest would not add a fact; it would relocate the client's policy into a sidecar
+and break "one resource" to do it.
 
 So: **no manifest. The byte-range index is the manifest, and adding a second one would trade a
 design goal for nothing the index does not already give.** §12's ruling 3 records this, with the one
@@ -698,36 +745,45 @@ Collected so a reader can check itself against a list. Each names the offending 
 short because subsetting has little to get wrong; most of it is referential integrity between the
 index and the chunks, which the format already polices.
 
-| condition                                                                 | why it is not repairable                                                   |
-| ------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| `lod_levels` is present but not a decimal string for a positive integer   | the gate is unreadable; a reader cannot tell how many levels are claimed   |
-| a chunk or index `level` is `>= lod_levels` (or the two disagree)         | the declared range omits the chunk; the full union would silently lose it  |
-| an index entry's `level` differs from its Chunk / Delta Chunk's           | the seek predicate would select on a value the record denies               |
-| a `keyframe-delta` delta references a chunk of a different `level`        | spec §11 / keyframe-delta §3.6; a chain would cross levels                 |
-| within a level, the `keyframe-delta` per-level tiling/chain rules fail    | spec §11.1 applied per level (§3.5); `current(t, ell)` would not be unique |
-| a band byte range in the index overruns the file                          | the existing index-range rule (spec §5.8), unchanged                       |
-| `lod_level0_complete` is `"true"` but level 0 does not cover the timeline | the declared promise is false, and a coarse-only reader would find holes   |
+| condition                                                                        | why it is not repairable                                                  |
+| -------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| Header `lod_levels` is not canonical decimal in `1..4294967296`                  | the gate is unreadable or outside the `u32 level` domain                  |
+| a chunk or index `level` is `>= lod_levels` (or the two disagree)                | the declared range omits the chunk; the full union would silently lose it |
+| an indexed declared-LOD entry omits its appended `level`                         | the seek predicate cannot be answered from the index                      |
+| an index entry's `level` differs from its Chunk / Delta Chunk's                  | the seek predicate would select on a value the record denies              |
+| a `keyframe-delta` delta references a chunk of a different `level`               | spec §11 / keyframe-delta §3.6; a chain would cross levels                |
+| same-level `keyframe-delta` chunks overlap                                       | `current(t, ell)` would not be unique                                     |
+| a same-level run starts with a delta or a chain crosses a gap                    | the covered interval has no independently decodable base state            |
+| a band byte range in the index overruns the file                                 | the existing index-range rule (spec §5.8), unchanged                      |
+| Header `lod_level0_complete` is `"true"` but level 0 does not tile the full clip | the declared promise is false, and a coarse-only reader would find holes  |
 
-The second row is the one codex's review added and it is load-bearing: `lod_levels` is defined as
-one more than the maximum `level` (§4.4), so a chunk whose `level` is at or above the declared count
-is outside the range the file advertises. A reader that requested the advertised maximum would omit
-that chunk and silently break the full-union guarantee (§5) — so a reader MUST refuse the file,
-naming the offending `level` and the declared `lod_levels`. This is the referential-integrity check
-§4.1's gate needs to be trustworthy: the gate says "these are levels 0..lod_levels−1", and a level
-outside that range makes the gate a lie.
+The range and index-presence rows are load-bearing. `lod_levels` is one more than the maximum
+`level` (§4.4), so a chunk whose `level` is at or above it sits outside the advertised range. A
+reader that requested the advertised maximum would omit that chunk and silently break the full-union
+guarantee (§5); a reader MUST therefore refuse the file, naming the offending `level` and declared
+`lod_levels`. Likewise, an indexed LOD entry without `level` makes the predicate unknowable without
+fetching the payload. Both checks are the referential integrity that §4.1's Header gate needs before
+a reader may trust it.
+
+The upper endpoint `4294967296` is valid because it describes a maximum stored `u32 level` of
+`4294967295`; it is not a request to allocate that many slots. A reader parses the scalar with
+checked arithmetic and keeps actual levels in storage bounded by validated index entries (§4.4).
 
 Everything **not** on this list is valid and often intentional, and the layer is at pains not to
 refuse a usable file:
 
 - **A level that covers only part of the timeline** is valid — a higher level adds detail only where
-  there is detail to add (§3.5). Only level 0 is expected to cover the whole timeline, and only when
-  `lod_level0_complete` promises it; without that key even level 0 need not be standalone.
+  there is detail to add (§3.5). Under `keyframe-delta`, each separated covered run starts with its
+  own keyframe and its chains stay inside that run; the gaps themselves are valid. Only level 0 is
+  expected to cover the whole timeline, and only when Header `lod_level0_complete` promises it;
+  without that key even level 0 need not be standalone.
 - **Gaps between level numbers** — levels `0` and `2` present, `1` absent — are valid. "Union of
   `≤ N`" does not require the levels to be dense; a reader fetching level `≤ 1` simply gets level 0,
   and a reader fetching level `≤ 2` gets levels 0 and 2. A producer SHOULD keep them dense for a
   clean ladder, but a gap is not a refusal.
-- **A file that does not declare LOD** (`lod_levels` absent) carries no obligation from this layer
-  at all, whatever its `level` values are (§4.1); a reader simply does not filter on `level`.
+- **A file that does not declare LOD** (Header `lod_levels` absent) carries no obligation from this
+  layer at all, whatever its `level` values are (§4.1); a reader simply does not filter on `level`.
+  A same-named key found only in a Metadata record does not change that.
 - **`lod_quality` absent, or present for some levels only** — it is advisory (§4.4); its absence is
   not an error and reconstruction reads none of it.
 
@@ -742,19 +798,35 @@ and the canonical summary.
 
 ### 10.1 Canonical JSON
 
-A variant that declares LOD (`lod_levels` present) gains a per-level view of the scene, and the
+A variant whose `Header.attributes` declares LOD gains a per-level view of the scene, and the
 existing per-instant states gain a requested-level parameter, so that the summary can assert "level
 ≤ N at time t is exactly this set of gaussians". Where the variant also carries spherical harmonics,
-each state additionally records a per-chunk SH digest, so that mixed per-chunk degree (§3.3) is
-asserted rather than assumed.
+each state additionally records a per-chunk selected SH prefix and digest, so differing per-read
+transfer caps over one uniformly stored scene (§3.3) are asserted rather than assumed.
 
 ```json
 {
   "lod": {
     "levels": "3",
     "byLevel": [
-      { "level": "0", "chunkCount": "4", "gaussianCount": "1024", "byteSize": "48210" },
-      { "level": "1", "chunkCount": "8", "gaussianCount": "4096", "byteSize": "191044" }
+      {
+        "level": "0",
+        "chunkCount": "4",
+        "gaussianCount": "1024",
+        "byteFootprints": [
+          { "throughShDegree": 0, "byteSize": "48210" },
+          { "throughShDegree": 3, "byteSize": "91106" }
+        ]
+      },
+      {
+        "level": "1",
+        "chunkCount": "8",
+        "gaussianCount": "4096",
+        "byteFootprints": [
+          { "throughShDegree": 0, "byteSize": "191044" },
+          { "throughShDegree": 3, "byteSize": "362628" }
+        ]
+      }
     ]
   },
   "states": [
@@ -764,28 +836,29 @@ asserted rather than assumed.
       "liveCount": "1024",
       "sample": { "positions": [], "levels": [] },
       "aggregate": { "positionSum": [], "opacitySum": 0.0 },
-      "byChunk": [{ "chunkOffset": "512", "shDegree": 3, "shCrc": "…" }]
+      "byChunk": [{ "chunkOffset": "512", "throughShDegree": 3, "shCrc": "…" }]
     }
   ]
 }
 ```
 
 - `lod.byLevel` exists so that a field no expectation mentions is a field an implementation can
-  decline to decode — the reason `chunks` is in keyframe-delta's summary. `byteSize` is derivable
-  from the index and is included so a decoder that computes a level's byte footprint is checked
-  against a known number.
+  decline to decode — the reason `chunks` is in keyframe-delta's summary. The array contains only
+  levels actually present; it is never padded to `lod.levels`. Each `byteFootprints` row defines its
+  selected contiguous band prefix, and `byteSize` is the sum of `chunk_length` plus all indexed SH
+  ranges through `throughShDegree` for that level. This catches implementations that count only base
+  chunk bytes or allocate a dense array from `lod_levels`.
 - **`states` carries a requested level.** Each probe instant is summarized at one or more requested
   levels, and `sample.levels` is each sampled gaussian's level. This is the conformance teeth: a
   decoder that filters level wrongly — off-by-one on `≤`, or including a level's chunks when it
   should not — produces a different `liveCount` and a different gaussian set at that level and fails
   on that row. A requested level equal to the maximum MUST reproduce the full-scene state a non-LOD
   decode produces, which is the §5 forward-compatibility claim made checkable.
-- **`states[].byChunk` carries a per-chunk SH digest.** `shDegree` is the assembled degree of that
-  chunk's bands and `shCrc` a digest of its coefficients. This is what proves mixed per-chunk
-  degree: a decoder that applies one global SH cap to every chunk — decoding the whole scene at a
-  single degree — produces the wrong `shDegree`/`shCrc` on any chunk whose declared band set
-  differs, and fails on that chunk specifically, where a summary carrying only a scene-wide degree
-  could not tell.
+- **`states[].byChunk` carries a per-chunk transfer cap and SH digest.** `throughShDegree` is the
+  highest contiguous band prefix selected for that chunk in this read, and `shCrc` digests only the
+  coefficients through that prefix. The file still stores the same Header-declared degree for every
+  chunk. A decoder that incorrectly replaces requested per-chunk caps with one global read cap
+  produces the wrong `throughShDegree`/`shCrc` and fails on that chunk specifically.
 - **The two read paths must agree**, as keyframe-delta §11.2 requires: a streamed decode that
   filters level as chunks pass and an indexed decode that seeks with the level predicate of §3.5
   MUST produce identical `states` at every requested level.
@@ -793,44 +866,46 @@ asserted rather than assumed.
 ### 10.2 Scenarios
 
 New corpus variants. Most are crossable with both temporal models, since level is orthogonal to the
-model (§3.5); the two `keyframe-delta`-specific rows exercise the per-level tiling generalization
-and its compatibility boundary (§3.5, §4.6):
+model (§3.5); `LodSparseLevels` and `LodKfDeltaPerLevelRuns` specifically exercise the sparse
+level-run generalization and its compatibility boundary (§3.5, §4.6):
 
-| scenario                 | shape                                                               | what it catches                                                                    |
-| ------------------------ | ------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
-| `LodSingleLevel`         | `lod_levels = 1`, every chunk level 0                               | the degenerate declared-LOD file; must be byte-identical to the non-LOD variant    |
-| `LodTwoLevels`           | level 0 coarse, level 1 detail, both spanning the clip              | the seek predicate; `states` at each requested level; the union rule               |
-| `LodSparseLevels`        | level 0 spans the clip, level 1 present only over part of it        | a level that covers part of the timeline (§3.5, §9)                                |
-| `LodLevelGap`            | levels 0 and 2 present, 1 absent                                    | non-dense level numbers (§9)                                                       |
-| `LodProgressiveBands`    | one level, degree-3 SH, probed at contiguous prefixes 0..3          | the quality axis; the contiguous-prefix rule (§3.3)                                |
-| `LodMixedDegree`         | two chunks at degree 3 and two at degree 0 in one scene             | mixed per-chunk degree (§3.3); the `byChunk` SH digest; a global-cap decoder fails |
-| `LodNoDeclare`           | `level > 0` on chunks but `lod_levels` absent                       | the opt-in gate (§4.1): a reader MUST NOT filter, and decodes the full scene       |
-| `LodKfDeltaPerLevelTile` | `keyframe-delta`, two levels, each level tiling the clip on its own | per-level tiling and the `current(t)` set (§3.5); both read paths agree            |
-| `LodFullEqualsUnion`     | multiple levels; max requested level vs a non-LOD full decode       | the §5 claim: full union is byte-identical to loading all chunks                   |
+| scenario                 | shape                                                                         | what it catches                                                                       |
+| ------------------------ | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `LodSingleLevel`         | Header `lod_levels = 1`, every chunk level 0                                  | decoded states equal the non-LOD variant; wire bytes are expected to differ           |
+| `LodTwoLevels`           | level 0 coarse, level 1 detail, both spanning the clip                        | the seek predicate; `states` at each requested level; the union rule                  |
+| `LodSparseLevels`        | level 0 spans the clip, level 1 has two keyframe-rooted runs with a gap       | sparse `keyframe-delta` run validity and partial timeline coverage (§3.5, §9)         |
+| `LodLevelGap`            | levels 0 and `4294967295`, `lod_levels = 4294967296`, only two actual levels  | sparse/count-independent storage and the full `u32` level domain (§4.4, §9)           |
+| `LodProgressiveBands`    | every chunk stores degree 3; reads probe contiguous prefixes 0..3             | the quality axis; the contiguous-prefix rule; SH-inclusive byte footprints (§3.3)     |
+| `LodMixedReadDegree`     | every chunk stores degree 3; one read caps two chunks at 3 and two at 0       | per-chunk transfer caps and digests; a decoder substituting one global read cap fails |
+| `LodNoDeclare`           | `level > 0` on chunks but Header `lod_levels` absent                          | the opt-in gate (§4.1): a reader MUST NOT filter, and decodes the full scene          |
+| `LodIndexMissingLevel`   | declared indexed LOD; one Chunk Index entry omits the appended `level`        | mandatory range-seekable level predicate (§4.2)                                       |
+| `LodKfDeltaPerLevelRuns` | `keyframe-delta`, two levels; one full run and one sparse keyframe-rooted run | non-overlap, run-local chain integrity, and the `current(t, ell)` set (§3.5)          |
+| `LodFullEqualsUnion`     | multiple levels; max requested level vs a non-LOD full decode                 | the §5 claim: decoded full-union state equals the state from loading all chunks       |
 
 Crossed with the existing flags `Quantized`, `SHDegree2`, `UseCrc`, `UseChunkIndex`, and one variant
 with no index (a streamed reader filtering level without one). `LodProgressiveBands` and
-`LodMixedDegree` are additionally crossed with the per-band bit-depth ladders, since the quality
-axis and the bit-depth dial share the band records. `LodKfDeltaPerLevelTile` additionally carries a
-runner-side assertion that a **pre-LOD** `keyframe-delta` decoder _refuses_ it on the overlap rule
-(spec §11.1) — the §4.6 compatibility boundary made checkable, so the non-forward-compatible case is
-proven to refuse cleanly rather than mis-decode.
+`LodMixedReadDegree` are additionally crossed with the per-band bit-depth ladders, since the quality
+axis and the bit-depth dial share the band records. `LodKfDeltaPerLevelRuns` additionally carries a
+runner-side assertion that a **pre-LOD** `keyframe-delta` decoder _refuses_ it on the overlap or gap
+rule (spec §11.1) — the §4.6 compatibility boundary made checkable, so the non-forward-compatible
+case is proven to refuse cleanly rather than mis-decode.
 
 ### 10.3 Files a reader must refuse
 
 §9's structural faults, as a small corpus of deliberately invalid files, each paired with the
 identifier of the refusal it must produce — `lod-levels-malformed`, `level-exceeds-declared`,
-`level-index-mismatch`, `delta-crosses-level`, `level-tiling-violated`, `lod-level0-has-holes`. This
-reuses the refusal-expectation harness contract keyframe-delta §11.5 introduces; if that contract
-has landed by the time this does, this adds rows to it rather than a mechanism.
+`level-index-missing`, `level-index-mismatch`, `delta-crosses-level`, `level-overlap`,
+`level-run-without-keyframe`, `level-chain-crosses-gap`, `lod-level0-has-holes`. This reuses the
+refusal-expectation harness contract keyframe-delta §11.5 introduces; if that contract has landed by
+the time this does, this adds rows to it rather than a mechanism.
 
 ### 10.4 Feature matrix rows
 
 Added as `No` or `Planned` for every SDK, moved only by a passing suite:
 
-- Level seek — filtering the index by `level ≤ N`, only when `lod_levels` is declared (§4.1)
+- Level seek — filtering the index by `level ≤ N`, only when Header `lod_levels` declares it (§4.1)
 - Contiguous band prefixes — the highest-contiguous-prefix rule with out-of-order bands held (§3.3)
-- Mixed per-chunk degree — the `byChunk` SH digest agrees across chunks of differing degree
+- Per-chunk SH transfer caps — `byChunk` agrees while stored scene degree remains uniform
 - Full-union equivalence — a max requested-level decode equals a non-LOD decode
 - Encode: importance-ordered levels
 
@@ -840,11 +915,11 @@ Added as `No` or `Planned` for every SDK, moved only by a passing suite:
 
 Stated together so a reviewer can weigh them without assembling them from the sections above.
 
-1. **One appended field**, `u32 level` on the Chunk Index (§4.2) — four bytes per index entry, and
-   only on a file that opts into carrying it. It is the sole wire change.
-2. **A declared meaning for a field that was informational** (§4.1), gated by the `lod_levels` key
-   so it is opt-in. It changes no existing file: a file that does not declare LOD keeps `level` at
-   its §5.5 meaning, and a reader never filters on it.
+1. **One appended field**, `u32 level` on the Chunk Index (§4.2) — four bytes per index entry,
+   mandatory on every entry of an indexed declared-LOD file. It is the sole wire change.
+2. **A declared meaning for a field that was informational** (§4.1), gated specifically by Header
+   `lod_levels` so it is opt-in. It changes no existing file: a file whose Header does not declare
+   LOD keeps `level` at its §5.5 meaning, and a reader never filters on it.
 3. **A coordination constraint on the Chunk Index's appended-field order** (§4.2, §12.1), shared
    with keyframe-delta — the one genuinely fiddly part, because two extensions append to one frozen
    record.
@@ -852,13 +927,13 @@ Stated together so a reviewer can weigh them without assembling them from the se
    index/record consistency check the format already performs on other duplicated fields.
 5. **An incremental-fetch capability the consumer may use or ignore** (§3.4). The format guarantees
    every valid prefix decodes coherently; a reader that ignores it fetches everything and is correct
-   (§5). How and when a consumer fetches is the consumer's, not the format's.
-6. **One compatibility boundary**, and only one: a multi-level `keyframe-delta` file is refused by a
-   pre-LOD `keyframe-delta` reader on the existing overlap rule (§3.5, §4.6). It is a clean,
-   rule-based refusal rather than a version gate or a silent wrong scene, and it is the single
-   combination where LOD must generalize a normative invariant (the tiling rule) to work.
-   `gaussian-birth` at any number of levels, and single-level `keyframe-delta`, keep the full
-   no-gate forward-compatibility.
+   for the forward-compatible layouts (§5). How and when a consumer fetches is the consumer's, not
+   the format's.
+6. **One compatibility boundary:** a `keyframe-delta` file that relies on sparse level runs is
+   refused by a pre-LOD reader on the existing overlap or gap rule (§3.5, §4.6). It is a clean,
+   rule-based refusal rather than a version gate or a silent wrong scene. `gaussian-birth` at any
+   number of levels, and a single-level `keyframe-delta` file that still tiles the full clip, keep
+   the full no-gate forward compatibility.
 
 Against these, the layer buys level-of-detail seeking and coherent progressive refinement — the two
 capabilities of §1 — with no new record, no new codec, no manifest, no version gate, and no change
@@ -874,16 +949,18 @@ The design was reviewed and **accepted**. Every question it left open was ruled 
 recorded here and folded into the section it affects, so the document has no section that
 contradicts a decision and no reader has to hold both a recommendation and its outcome in mind.
 
-| #   | question                                           | ruling                                                                                                                                                                 | folded into    |
-| --- | -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------- |
-| 1   | Chunk Index appended-field order vs keyframe-delta | `level` appends last; keyframe-delta block keyed to `temporal_model`; presence by `content_length`; **any third appender MUST switch to a presence bitmask**           | §4.2           |
-| 2   | Per-level quality: a dedicated record, or metadata | Metadata keys now; size is index-derivable; defer a record until evidence                                                                                              | §4.4, §3.2     |
-| 3   | A network manifest                                 | Not added; the byte-range index suffices and a manifest breaks "one resource"                                                                                          | §8             |
-| 4   | Additive levels vs replacement levels              | Additive; forward compatibility is incompatible with replacement                                                                                                       | §3.1, §5       |
-| 5   | Must every level cover the whole timeline          | No; only level 0, and only when `lod_level0_complete` promises it                                                                                                      | §3.5, §9       |
-| 6   | How a reader knows `level` carries LOD importance  | Opt-in via the `lod_levels` key; absent it, `level` keeps its §5.5 meaning and a reader never filters on it (keeps §4.4's freeze)                                      | §4.1, §4.4     |
-| 7   | Where the gate lives, and its integrity            | `lod_levels`/`lod_level0_complete` MUST be in `Header.attributes` (range-readable); `lod_levels` is a positive decimal; every `level` MUST be `< lod_levels` or refuse | §4.4, §9       |
-| 8   | Multi-level `keyframe-delta` vs the global tiling  | LOD generalizes tiling to per-level, gated by `lod_levels`; a pre-LOD `keyframe-delta` reader refuses on the overlap rule — clean, not a version gate                  | §3.5, §4.6, §5 |
+| #   | question                                           | ruling                                                                                                                                                                                                       | folded into    |
+| --- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------- |
+| 1   | Chunk Index appended-field order vs keyframe-delta | `level` appends last; keyframe-delta block keyed to `temporal_model`; presence by `content_length`; **any third appender MUST switch to a presence bitmask**                                                 | §4.2           |
+| 2   | Per-level quality: a dedicated record, or metadata | Metadata keys now; size at a selected SH prefix is index-derivable from chunk and band ranges; defer a record until evidence                                                                                 | §4.4, §3.2     |
+| 3   | A network manifest                                 | Not added; the byte-range index suffices and a manifest breaks "one resource"                                                                                                                                | §8             |
+| 4   | Additive levels vs replacement levels              | Additive; forward compatibility is incompatible with replacement                                                                                                                                             | §3.1, §5       |
+| 5   | Must every level cover the whole timeline          | No; `keyframe-delta` levels use non-overlapping, keyframe-rooted covered runs; only Header `lod_level0_complete` promises a full level-0 tile                                                                | §3.5, §9       |
+| 6   | How a reader knows `level` carries LOD importance  | Opt-in only via `Header.attributes["lod_levels"]`; without that exact entry, `level` keeps its §5.5 meaning and a reader never filters on it                                                                 | §4.1, §4.4     |
+| 7   | Gate and index integrity                           | Header `lod_levels` is canonical decimal in `1..4294967296`; every level is lower; every indexed declared-LOD entry carries `level`; readers keep actual levels sparsely rather than allocate from the count | §4.2, §4.4, §9 |
+| 8   | LOD `keyframe-delta` vs the global tiling rule     | Header-gated LOD generalizes full tiling to sparse per-level runs; a pre-LOD reader cleanly refuses layouts with cross-level overlap or same-level gaps rather than silently mis-decoding                    | §3.5, §4.6, §5 |
+| 9   | Progressive SH vs scene-wide degree                | Every chunk stores the Header-declared complete band set for compatibility; a partial read may select different contiguous transfer caps per chunk                                                           | §3.3, §10      |
+| 10  | What conformance compares and counts               | LOD/non-LOD variants compare decoded state, not container bytes; transfer footprints include selected SH ranges as well as chunks                                                                            | §10            |
 
 Rulings 3, 4 and 5 are the same judgement the existing specification makes everywhere — the format
 takes on the smaller thing. Ruling 3 declines a second representation of facts the index already
@@ -893,11 +970,12 @@ to force a coverage rule on levels that only add detail locally, so an honest sp
 made a refusal. Ruling 6 is the correctness spine of the whole design — that the LOD reading of
 `level` is opt-in, so an existing file whose `level` means something else is never mis-read — and it
 is written up in §12.3. Rulings 7 and 8 are the review's later refinements of that spine: 7 makes
-the gate range-visible and self-consistent so an indexed reader can trust it, and 8 is the honest
-scope of the forward-compatibility claim — additive and gate-free everywhere except multi-level
-`keyframe-delta`, where a normative tiling invariant forces a clean refusal for a pre-LOD reader.
-Rulings 1, 2, 6 and 8 carry the most implementation weight and are written up in full below (8
-inline in §3.5/§4.6).
+the gate range-visible, bounded and self-consistent so an indexed reader can trust it without a
+count-sized allocation; 8 defines sparse level-run validity and the honest scope of forward
+compatibility. Ruling 9 preserves the normative scene-wide SH degree while keeping the existing
+per-band ranges useful for partial reads, and ruling 10 makes both consequences testable. Rulings 1,
+2, 6, 8 and 9 carry the most implementation weight and are written up in full below or inline in
+§3.3/§3.5/§4.6.
 
 ### 12.1 The Chunk Index appended-field order
 
@@ -917,10 +995,12 @@ so it is decided once:
   present exactly when the model is `keyframe-delta`, which a reader has already read from the
   Header before it parses the index — so a reader knows, before it reaches the appended region,
   whether the six-field block is there.
-- **`level` is last, and its presence is read from `content_length`.** After the band array and the
-  conditional keyframe-delta block, four remaining bytes are `level`; none means the file does not
-  carry it. A single trailing `u32` is unambiguous given the fixed order and a predecessor block
-  whose presence a Header field already decided.
+- **`level` is last, and its physical presence is read from `content_length`.** After the band array
+  and the conditional keyframe-delta block, four remaining bytes are `level`; none means the entry
+  does not carry it. Header `lod_levels` makes those four bytes mandatory on every index entry, so
+  physical presence and semantic requirement are separate checks. A single trailing `u32` is
+  unambiguous given the fixed order and a predecessor block whose presence a Header field already
+  decided.
 - **Re-verified against the merged record at implementation time**, exactly as the object layer
   re-verifies its opcode assignments against `main` (object-layer §12.6), because the append region
   is spent by more than one design at once and the only safe layout is one checked at landing.
@@ -949,12 +1029,13 @@ safe.
 dependent, so the format can only report it as an advisory figure. §4.4 puts that report in a
 `lod_quality` metadata key rather than a dedicated front-matter record.
 
-The case for a key: a per-level _size_ is already derivable from the index (sum `chunk_length` over
-a level's entries), so the only datum a record would add is quality, and one advisory scalar per
-level is exactly what a metadata key is for. The case for a record, if the maintainer wants it
-later: a record could carry a richer per-level descriptor — a measured PSNR against the full scene,
-a coverage fraction, an anchor for a per-level thumbnail — the way the Object Table carries
-per-object descriptors, and a record range-reads independently where a metadata blob does not.
+The case for a key: a per-level _size_ at any chosen contiguous SH prefix is already derivable from
+the index — sum `chunk_length` plus every selected band's indexed length over the level's entries —
+so the only datum a record would add is quality, and one advisory scalar per actual level is exactly
+what a sparse metadata key is for. The case for a record, if the maintainer wants it later: a record
+could carry a richer per-level descriptor — a measured PSNR against the full scene, a coverage
+fraction, an anchor for a per-level thumbnail — the way the Object Table carries per-object
+descriptors, and a record range-reads independently where a metadata blob does not.
 
 **Decided: a metadata key now, a record deferred until a consumer demonstrates it needs more than
 one advisory scalar per level.** This is the object-layer §12.3 judgement on embeddings reused —
@@ -979,12 +1060,13 @@ would violate spec §4.4's freeze on an existing field's meaning, and it would l
 reader filter such a file to `level ≤ 0` and return an arbitrary incomplete scene, mistaking
 partition depth for detail.
 
-**Decided: the LOD meaning is opt-in, gated by the `lod_levels` key, and a reader MUST NOT filter on
-`level` unless the file carries it.** A file that declares LOD uses `level` as the cumulative subset
-key; a file that does not keeps `level` at its §5.5 informational meaning, verbatim, and a reader
-loads all its chunks. So no existing file changes meaning, §4.4's freeze holds, and the failure mode
-— a temporal-depth `level` read as importance — cannot occur, because the importance reading exists
-only where a producer opted in.
+**Decided: the LOD meaning is opt-in, gated only by `Header.attributes["lod_levels"]`, and a reader
+MUST NOT filter on `level` unless that exact Header entry is present and valid.** A same-named key
+in a Metadata record does not declare LOD. A file whose Header declares LOD uses `level` as the
+cumulative subset key; a file whose Header does not keeps `level` at its §5.5 informational meaning,
+verbatim, and a reader loads all its chunks. So no existing file changes meaning, §4.4's freeze
+holds, and the failure mode — a temporal-depth `level` read as importance — cannot occur, because
+the importance reading exists only where a producer opted in at range-readable front matter.
 
 Two alternatives were weighed and rejected. **A new attribute** (a separate `lod_level` field
 distinct from `level`) would have avoided the overload cleanly, but it spends a field and forgoes
@@ -1007,8 +1089,9 @@ Named so the boundary is a decision rather than an omission, in the shape spec �
 - **Spatial subdivision within a temporal chunk.** The within-chunk detail axis, reserved by spec
   §10.1 and left there by §6. This layer is the between-chunk axis and composes with the reserved
   one when it lands.
-- **Per-gaussian SH degree.** Reserved by spec §10.1. The quality axis here drops whole bands
-  uniformly; spending degree per gaussian is a larger change with its own evidence.
+- **Per-gaussian stored SH degree.** Reserved by spec §10.1. The quality axis here selects whole
+  contiguous band ranges during a read while storage remains scene-wide; spending an encoded degree
+  per gaussian is a larger change with its own evidence.
 - **A presence bitmask for Chunk Index appended fields** (§12.1). Not built, because two appenders —
   one of them keyed to `temporal_model` — are safe positionally; it is normatively required of the
   _third_ appender, so the direction is pinned rather than merely noted.
