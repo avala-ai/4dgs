@@ -31,6 +31,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "data")
 INVALID = os.path.join(DATA, "invalid")
+KEYFRAME = os.path.join(DATA, "keyframe")
 CHECKSUMS = os.path.join(DATA, "CHECKSUMS.txt")
 sys.path.insert(0, os.path.join(HERE, "generator"))
 sys.path.insert(0, HERE)
@@ -449,12 +450,21 @@ def write_corpus(target: str) -> dict[str, str]:
             fh.write(expectation + "\n")
         checksums[name] = hashlib.sha256(data).hexdigest()
 
+    # keyframe-delta variants live in their own subdirectory, exactly as the invalid
+    # corpus does, and for the same structural reason: every whole-corpus consumer that
+    # is not the conformance harness — the fuzzer, the Kaitai grammar, the C++ named-list
+    # decode test — globs the top level of `data/` only, and each of those assumes the
+    # single gaussian-birth temporal model. A keyframe-delta file at the top level breaks
+    # them; under `keyframe/` it is invisible to them and visible to `run.py`, which is
+    # the one consumer that dispatches on the model.
+    keyframe_dir = os.path.join(target, "keyframe")
+    os.makedirs(keyframe_dir, exist_ok=True)
     for name, data, expectation in build_keyframe_delta_corpus():
-        with open(os.path.join(target, f"{name}.4dgs"), "wb") as fh:
+        with open(os.path.join(keyframe_dir, f"{name}.4dgs"), "wb") as fh:
             fh.write(data)
-        with open(os.path.join(target, f"{name}.json"), "w", encoding="utf-8") as fh:
+        with open(os.path.join(keyframe_dir, f"{name}.json"), "w", encoding="utf-8") as fh:
             fh.write(expectation + "\n")
-        checksums[name] = hashlib.sha256(data).hexdigest()
+        checksums[f"keyframe/{name}"] = hashlib.sha256(data).hexdigest()
 
     invalid_dir = os.path.join(target, "invalid")
     os.makedirs(invalid_dir, exist_ok=True)
@@ -498,7 +508,7 @@ def main(argv=None) -> int:
     checksums = write_corpus(DATA)
     total = sum(
         os.path.getsize(os.path.join(root, f))
-        for root in (DATA, INVALID)
+        for root in (DATA, INVALID, KEYFRAME)
         for f in os.listdir(root)
         if os.path.isfile(os.path.join(root, f))
     )
@@ -539,7 +549,7 @@ def _verify(checksums: dict[str, str]) -> bool:
     for name, data, _ in build_invalid():
         second[f"invalid/{name}"] = hashlib.sha256(data).hexdigest()
     for name, data, _ in build_keyframe_delta_corpus():
-        second[name] = hashlib.sha256(data).hexdigest()
+        second[f"keyframe/{name}"] = hashlib.sha256(data).hexdigest()
     for name, digest in checksums.items():
         if second.get(name) != digest:
             failures.append(f"{name}: encoder is not deterministic between runs")

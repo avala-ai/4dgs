@@ -70,6 +70,12 @@ RUNNERS = [
 
 
 INVALID = os.path.join(DATA, "invalid")
+#: keyframe-delta variants live in their own subdirectory, like the invalid corpus, so the
+#: top-level-only globs of the fuzzer, the Kaitai grammar and the C++ named-list test never
+#: see a temporal model they do not decode. This harness is the one consumer that dispatches
+#: on the model, so it reaches into the subdirectory explicitly.
+KEYFRAME = os.path.join(DATA, "keyframe")
+KEYFRAME_PREFIX = "keyframe/"
 
 #: Invalid variants are named with this prefix, which is also their subdirectory. A
 #: runner is handed the same thing either way — a path — and the harness compares the
@@ -80,10 +86,13 @@ INVALID_PREFIX = "invalid/"
 
 def variants() -> list[str]:
     valid = sorted(f[: -len(".json")] for f in os.listdir(DATA) if f.endswith(".json"))
+    keyframe = []
+    if os.path.isdir(KEYFRAME):
+        keyframe = sorted(KEYFRAME_PREFIX + f[: -len(".json")] for f in os.listdir(KEYFRAME) if f.endswith(".json"))
     refusals = []
     if os.path.isdir(INVALID):
         refusals = sorted(INVALID_PREFIX + f[: -len(".json")] for f in os.listdir(INVALID) if f.endswith(".json"))
-    return valid + refusals
+    return valid + keyframe + refusals
 
 
 #: Families whose runners answer a refusal expectation — printing `{"refused": "<id>"}`
