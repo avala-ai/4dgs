@@ -31,9 +31,10 @@ import numpy as np
 import pytest
 from fourdgs.convert import SH_C0
 from fourdgs.exceptions import MalformedFile
+from fourdgs.keyframe_delta_writer import KeyframeDeltaOptions, Sample
 from fourdgs.model import GaussianSet
 from fourdgs.quantization import SH_QUANT_HI, SH_QUANT_LO
-from fourdgs.usd import PRIM_TYPE, from_usd, to_usd
+from fourdgs.usd import PRIM_TYPE, from_usd, to_usd, to_usd_keyframe_delta
 
 pytest.importorskip("pxr", reason="the USD bridge needs the optional 'usd-core' extra")
 
@@ -481,3 +482,102 @@ def test_cli_converts_in_both_directions(tmp_path):
     out = str(tmp_path / "again.usda")
     assert main(["to-usd", container, "-o", out, "-t", "0.0"]) == 0
     assert from_usd(out).gaussians.count == 32
+
+
+# ---------------------------------------------------- keyframe-delta animated export
+
+
+def _kd_gaussians(positions):
+    n = len(positions)
+    return GaussianSet(
+        positions=np.asarray(positions, dtype=np.float32).reshape(n, 3),
+        scales=np.full((n, 3), 0.05, dtype=np.float32),
+        rotations=np.tile(np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32), (n, 1)),
+        colors=np.tile(np.array([0.6, 0.4, 0.2, 0.9], dtype=np.float32), (n, 1)),
+        motions=np.zeros((n, 3), dtype=np.float32),
+        mu_t=np.zeros(n, dtype=np.float32),
+        sigma_t=np.full(n, 100.0, dtype=np.float32),
+        win_lo=np.zeros(n, dtype=np.float32),
+        win_hi=np.full(n, 8.0, dtype=np.float32),
+    )
+
+
+def _kd_churn_bytes():
+    """A keyframe-delta file whose population drifts, gains id 4, then loses id 2."""
+    from fourdgs import keyframe_delta_file as kdf
+
+    samples = []
+    for i in range(8):
+        ids = [0, 1, 2, 3]
+        base = [[i * 0.1, 0.0, 0.0], [1.0, i * 0.05, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]]
+        if i >= 2:
+            ids = [*ids, 4]
+            base = [*base, [2.0, 2.0, i * 0.02]]
+        if i >= 5 and 2 in ids:
+            keep = [k for k in range(len(ids)) if ids[k] != 2]
+            ids = [ids[k] for k in keep]
+            base = [base[k] for k in keep]
+        samples.append(Sample(t0=float(i), ids=np.array(ids), gaussians=_kd_gaussians(base)))
+    return kdf.write_sequence(samples, 8.0, kd=KeyframeDeltaOptions(keyframe_every=4))
+
+
+def _sample_at(splat, getter, frame):
+    return np.asarray(getattr(splat, getter)().Get(Usd.TimeCode(float(frame))), dtype=np.float64)
+
+
+def test_keyframe_delta_animated_export_matches_the_reconstruction_each_frame(tmp_path):
+    """Every USD time sample is exactly the composed population reconstructed at that frame.
+
+    A keyframe-delta scene has no closed-form state_at to snapshot; the export composes the
+    chain per frame (keyframe_delta_file.render_at) and writes it. The only loss is float32,
+    so the written sample equals the float64 reconstruction to within it — which is what
+    makes the animated export a faithful flipbook rather than an approximation.
+    """
+    from fourdgs import keyframe_delta_file as kdf
+
+    data = _kd_churn_bytes()
+    fps = 2.0
+    out = str(tmp_path / "kd.usda")
+    to_usd_keyframe_delta(out, data, coordinate_system="y-up-right-handed", fps=fps)
+
+    _, splat = read_prim(out)
+    decoded = kdf.decode_streamed(data)
+    for frame in range(round(8.0 * fps) + 1):
+        expected = kdf.render_at(decoded, frame / fps)
+        positions = _sample_at(splat, "GetPositionsAttr", frame)
+        assert positions.shape[0] == expected["centers"].shape[0]
+        if positions.shape[0]:
+            assert np.max(np.abs(positions - expected["centers"])) <= 1e-5
+            assert np.max(np.abs(_sample_at(splat, "GetScalesAttr", frame) - expected["scales"])) <= 1e-5
+            assert np.max(np.abs(_sample_at(splat, "GetOpacitiesAttr", frame) - expected["opacity"])) <= 1e-5
+
+
+def test_keyframe_delta_export_represents_births_and_deaths_as_varying_counts(tmp_path):
+    """USD time samples permit a different length per frame, so the birth of id 4 and the
+    death of id 2 show up as the sample count moving 4 -> 5 -> 4."""
+    out = str(tmp_path / "churn.usda")
+    to_usd_keyframe_delta(out, _kd_churn_bytes(), coordinate_system="y-up-right-handed", fps=2.0)
+    _, splat = read_prim(out)
+    counts = {_sample_at(splat, "GetPositionsAttr", frame).shape[0] for frame in range(17)}
+    assert max(counts) == 5 and min(counts) == 4
+
+
+def test_keyframe_delta_export_reads_duration_and_up_axis_from_the_scene(tmp_path):
+    out = str(tmp_path / "zup.usda")
+    to_usd_keyframe_delta(out, _kd_churn_bytes(), coordinate_system="z-up-right-handed", fps=1.0)
+    stage, _ = read_prim(out)
+    assert UsdGeom.GetStageUpAxis(stage) == UsdGeom.Tokens.z
+    # The file's own 8s clock at 1 fps is nine time codes, 0..8.
+    assert stage.GetEndTimeCode() == 8.0
+
+
+def test_keyframe_delta_export_refuses_a_bad_fps(tmp_path):
+    with pytest.raises(MalformedFile, match="positive fps"):
+        to_usd_keyframe_delta(
+            str(tmp_path / "x.usda"), _kd_churn_bytes(), coordinate_system="y-up-right-handed", fps=0.0
+        )
+
+
+def test_keyframe_delta_export_refuses_an_unwritable_extension(tmp_path):
+    with pytest.raises(MalformedFile, match="usda"):
+        to_usd_keyframe_delta(str(tmp_path / "x.gltf"), _kd_churn_bytes(), coordinate_system="y-up-right-handed")
