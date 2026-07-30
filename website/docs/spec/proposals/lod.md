@@ -1072,8 +1072,8 @@ diagnose cloned source ownership (§3.1, §9). This reuses the refusal-expectati
 keyframe-delta §11.5 introduces; if that contract has landed by the time this does, this adds rows
 to it rather than a mechanism.
 
-Two additional invalid cases run through the **indexed seek** entry point with an instrumented byte
-source:
+Three additional invalid cases run through the **indexed seek** entry point with an instrumented
+byte source:
 
 - `LodKfDeltaSeekDuplicateId` selects two active level chains that both contain `gaussian_id = 7`.
   The decoder MUST produce `duplicate-id-across-levels` before returning the union, even though
@@ -1082,8 +1082,12 @@ source:
   births id 7 before the requested state. The decoder MUST produce
   `id-reuse-across-levels-after-death` from those two selected histories without reading any chunk
   outside either chain.
+- `LodKfDeltaSeekMigration` makes two ordered seeks in one reader session. The first selected chain
+  exposes id 7 at level 0; the second exposes id 7 in a later, non-overlapping level-1 run with no
+  death in either fetched history. The second seek MUST produce `id-crosses-level` from the
+  session's observed `id -> level` map without fetching the gap or any other run.
 
-For both cases the request log is part of the expectation: only the Header, Footer, summary,
+For all three cases the request log is part of the expectation: only the Header, Footer, summary,
 selected Chunk / Delta Chunk records and their selected SH ranges may be fetched. A decoder that
 skips fetched-chain identity checks fails on the missing refusal; a decoder that obtains the refusal
 by scanning the whole file fails on the range trace.
@@ -1100,8 +1104,8 @@ Added as `No` or `Planned` for every SDK, moved only by a passing suite:
 - Per-chunk SH transfer caps — `byChunk` agrees while stored scene degree remains uniform
 - Stream truncation — an incomplete trailing band set is dropped, never treated as an implicit cap
 - Keyframe-delta range seek — indexed reads fetch only selected chains and validate identity
-  evidence in those chains, including invalid duplicate/reuse cases, without scanning unrelated
-  payloads
+  evidence in those chains, including invalid migration/duplicate/reuse cases, without scanning
+  unrelated payloads
 - Keyframe-delta full-file identity — every id has one immutable level, active unions have unique
   ids, and lifecycle history never restarts across levels or separated runs
 - Full-union equivalence — a `lod_levels - 1` decode equals a non-LOD decode
