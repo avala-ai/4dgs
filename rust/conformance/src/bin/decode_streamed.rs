@@ -8,7 +8,11 @@
 
 use std::process::ExitCode;
 
-use fourdgs_conformance::{summarize, Extras};
+use fourdgs::keyframe_delta_file::decode_streamed as decode_keyframe_delta_streamed;
+use fourdgs::opcode;
+use fourdgs::records::Header;
+use fourdgs::serialization::{check_magic, Records, MAGIC};
+use fourdgs_conformance::{keyframe_delta_states_json, summarize, Extras};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -28,8 +32,36 @@ fn main() -> ExitCode {
     }
 }
 
+/// The Header's temporal model, read without decoding the gaussians. A `keyframe-delta`
+/// file composes and summarizes differently from a `gaussian-birth` one, so the runner
+/// branches on this before doing either.
+fn temporal_model(data: &[u8]) -> Result<Option<String>, String> {
+    check_magic(data).map_err(|e| e.to_string())?;
+    for record in Records::new(data, MAGIC.len()) {
+        let record = record.map_err(|e| e.to_string())?;
+        if record.opcode == opcode::HEADER {
+            return Ok(Some(
+                Header::parse(record.content)
+                    .map_err(|e| e.to_string())?
+                    .temporal_model,
+            ));
+        }
+    }
+    Ok(None)
+}
+
 fn run(path: &str) -> Result<String, String> {
     let data = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+
+    if temporal_model(&data)?.as_deref() == Some("keyframe-delta") {
+        // The whole model exists to make reconstruction-at-an-instant cheap, and that
+        // reconstruction — not a whole-population summary — is what the SDKs are diffed on.
+        // Truncation recovery is a gaussian-birth check: the states canonical is a
+        // different statement and a cut file is a different file.
+        let seq = decode_keyframe_delta_streamed(&data).map_err(|e| format!("{path}: {e}"))?;
+        return Ok(keyframe_delta_states_json(&seq));
+    }
+
     let scene = fourdgs::read_bytes(&data).map_err(|e| format!("{path}: {e}"))?;
     check_truncation_recovery(&data, &scene)?;
 

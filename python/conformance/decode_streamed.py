@@ -19,6 +19,10 @@ sys.path.insert(0, os.path.join(HERE, "..", "..", "tests", "conformance"))
 
 import fourdgs
 from canonical import canonical, summarize
+from fourdgs import keyframe_delta_file as kdf
+from fourdgs.opcode import HEADER
+from fourdgs.records import Header
+from fourdgs.serialization import MAGIC, check_magic, iter_records
 
 #: Variants this runner declines. Empty: the reference implementation supports the whole
 #: matrix, which is the only reason it is allowed to be the reference.
@@ -29,7 +33,31 @@ def supports_variant(name: str) -> bool:
     return name not in UNSUPPORTED
 
 
+def _temporal_model(data: bytes) -> str | None:
+    """The Header's temporal model, read without decoding the gaussians.
+
+    A `keyframe-delta` file composes and summarizes differently from a `gaussian-birth`
+    one — it has its own read path and its own canonical — so the runner branches on this
+    before doing either.
+    """
+    check_magic(data)
+    for record in iter_records(data, len(MAGIC)):
+        if record.opcode == HEADER:
+            return Header.parse(record.content).temporal_model
+    return None
+
+
 def run(path: str) -> str:
+    with open(path, "rb") as fh:
+        data = fh.read()
+
+    if _temporal_model(data) == "keyframe-delta":
+        # The whole model exists to make reconstruction-at-an-instant cheap, and that
+        # reconstruction — not a whole-population summary — is what the SDKs are diffed on.
+        # Truncation recovery is a gaussian-birth check: the states canonical is a
+        # different statement and a cut file is a different file.
+        return canonical(kdf.states_json(kdf.decode_streamed(data)))
+
     scene = fourdgs.read(path)
     _check_truncation_recovery(path, scene)
     return canonical(

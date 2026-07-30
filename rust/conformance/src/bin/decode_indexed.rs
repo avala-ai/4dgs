@@ -15,9 +15,12 @@ use fourdgs::indexed_reader::{
     open_indexed, read_attachments, read_audio_sources, read_camera, read_chunk, read_objects,
     IndexedScene,
 };
+use fourdgs::keyframe_delta_file::decode_indexed as decode_keyframe_delta_indexed;
+use fourdgs::opcode;
 use fourdgs::readable::{FileReadable, Readable};
-use fourdgs::records::ChunkIndexEntry;
-use fourdgs_conformance::{summarize, Extras};
+use fourdgs::records::{ChunkIndexEntry, Header};
+use fourdgs::serialization::{check_magic, Records, MAGIC};
+use fourdgs_conformance::{keyframe_delta_states_json, summarize, Extras};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -55,7 +58,32 @@ impl<R: Readable> Readable for Counting<R> {
     }
 }
 
+/// The Header's temporal model, read without decoding the gaussians.
+fn temporal_model(data: &[u8]) -> Result<Option<String>, String> {
+    check_magic(data).map_err(|e| e.to_string())?;
+    for record in Records::new(data, MAGIC.len()) {
+        let record = record.map_err(|e| e.to_string())?;
+        if record.opcode == opcode::HEADER {
+            return Ok(Some(
+                Header::parse(record.content)
+                    .map_err(|e| e.to_string())?
+                    .temporal_model,
+            ));
+        }
+    }
+    Ok(None)
+}
+
 fn run(path: &str) -> Result<String, String> {
+    let data = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    if temporal_model(&data)?.as_deref() == Some("keyframe-delta") {
+        // The indexed path composes each instant by walking its chain (spec §11.8); its
+        // canonical states must match the streamed path's, and the harness diffs it
+        // against the same committed expectation the streamed runner is held to.
+        let (seq, _) = decode_keyframe_delta_indexed(&data).map_err(|e| format!("{path}: {e}"))?;
+        return Ok(keyframe_delta_states_json(&seq));
+    }
+
     let mut source = Counting {
         inner: FileReadable::open(path).map_err(|e| format!("{path}: {e}"))?,
         bytes_read: 0,

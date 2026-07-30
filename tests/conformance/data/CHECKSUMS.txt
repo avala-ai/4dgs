@@ -1,5 +1,9 @@
 # SHA-256 of each generated .4dgs variant, asserted by `generate.py --verify`.
 # Written by the generator; do not edit by hand.
+17072aad27786c51dd33083040e910e549fc9f6ec240bf71c37d1ef75039da94  KeyframeDelta-UseChunkIndex-UseCrc-UseStatistics.4dgs
+be87009a956cdff05fc5fc45978200f43c4458a382d0e23b4ffa676b0638d6dc  KeyframeDeltaChurn-UseChunkIndex-UseCrc-UseStatistics.4dgs
+150b4b68f81887b164dcef7b6182a675ee12d43155f6b38f3f603216268bba78  KeyframeDeltaModesMixed-UseChunkIndex-UseCrc-UseStatistics.4dgs
+588aba9f8721dbdf157b1ac5ca00173d1ab5114376822a23cdb42a565230c7c5  KeyframeOnly-UseChunkIndex-UseCrc-UseStatistics.4dgs
 21e001e7cccd3795e934dd2cb34d2ed879e2f5f100e7055958ae99625bae9a7b  LongLived-Quantized-UseChunkIndex-UseCrc.4dgs
 7978d61f18a6298d3034cee4341063a5aca98303b5793334053984122f04fd53  LongLived-UseChunkIndex-UseCrc.4dgs
 370b1f4178cbe051bf0cc112fad7ccfd7f41a1d27b233c2e92f006757fb934be  LongLived-UseChunkIndex-UseCrc-WithObjects.4dgs
