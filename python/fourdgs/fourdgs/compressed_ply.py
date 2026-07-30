@@ -74,6 +74,14 @@ _TEMPORAL_CHUNK_FLOATS = 28
 _STATIC_VERTEX_UINTS = 4
 _TEMPORAL_VERTEX_UINTS = 6
 
+# 4DV's temporal shader treats these as semantic sentinels, not ordinary
+# negative timestamps. The container has explicit representations for both
+# behaviours, so normalize them while importing:
+#   mu <= -5  — fixed position (no advection), but still temporally faded
+#   mu <= -10 — fixed position and always visible inside the segment window
+_STATIC_MU_SENTINEL = -5.0
+_ALWAYS_VISIBLE_MU_SENTINEL = -10.0
+
 # A crafted header must not force a multi-GB allocation before it can be checked, which
 # is why the header is read and validated from a bounded probe before the body is sized.
 _MAX_GAUSSIANS = 50_000_000
@@ -363,55 +371,60 @@ def import_scene(paths: list[str], *, segment_duration: float | None = None) -> 
     and is stored on a clock relative to its own start, so its scene time is
     `local + k * segment_duration`.
 
-    Each segment redundantly carries gaussians whose centres fall outside its own span —
-    a tail the player never shows, because it only ever displays segment `k` inside
-    segment `k`'s window. Those are dropped, and the segment's span becomes the validity
-    window of the gaussians kept. That mapping is what lets one file replace a sidecar
-    and its parts without changing what any instant looks like.
+    Every gaussian from each segment is retained. A temporal gaussian can contribute
+    inside the segment even when its centre lies outside it, because visibility depends
+    on the gaussian's temporal extent rather than the centre alone. The segment's span
+    becomes the validity window, which reproduces the source player's "only the active
+    segment is loaded" rule without deleting temporal support or persistent background.
     """
     if not paths:
         raise ValueError("import_scene needs at least one file")
     segmented = len(paths) > 1
-    if segmented and not segment_duration:
-        raise ValueError("segment_duration is required to place multiple segments on a shared timeline")
-    span_sec = float(segment_duration) if segment_duration else 0.0
+    if segmented:
+        if segment_duration is None:
+            raise ValueError("segment_duration is required to place multiple segments on a shared timeline")
+        span_sec = float(segment_duration)
+        if not np.isfinite(span_sec) or span_sec <= 0.0:
+            raise ValueError("segment_duration must be finite and strictly positive")
+    else:
+        span_sec = 0.0
 
     parts: list[dict] = []
     sh_degrees: set[int] = set()
 
     for k, path in enumerate(paths):
         seg = read_compressed_ply(path)
+        local_mu = seg["mu_t"]
+
+        # These bands are shader semantics in the source format. Carrying their
+        # negative centres through as ordinary timestamps would advect or fade
+        # background splats that the source viewer keeps fixed.
+        static = local_mu <= _STATIC_MU_SENTINEL
+        always = local_mu <= _ALWAYS_VISIBLE_MU_SENTINEL
+        if np.any(static):
+            seg["motions"] = seg["motions"].copy()
+            seg["motions"][static] = 0.0
+        if np.any(always):
+            seg["sigma_t"] = seg["sigma_t"].copy()
+            seg["sigma_t"][always] = np.inf
+
         if not segmented:
             # One file: its own clock IS the timeline. A static file has no timeline at
             # all, and its gaussians simply never fade.
-            mu = seg["mu_t"]
+            mu = local_mu
             lo = 0.0
             hi = float(np.max(mu)) if seg["temporal"] and mu.size else 0.0
-            keep = np.ones(mu.shape[0], dtype=bool)
         else:
             lo = k * span_sec
             hi = lo + span_sec
-            mu = seg["mu_t"] + lo
+            mu = local_mu + lo
             seg["mu_t"] = mu
-            keep = (mu >= lo) & (mu < hi)
-
-        kept = int(np.count_nonzero(keep))
-        if kept == 0:
-            continue
-        if kept != keep.shape[0]:
-            for key in ("positions", "scales", "rotations", "colors", "motions", "mu_t", "sigma_t"):
-                seg[key] = seg[key][keep]
-            if seg["sh"] is not None:
-                seg["sh"] = seg["sh"][keep]
 
         if seg["sh"] is not None:
             sh_degrees.add(seg["sh_degree"])
-        seg["win_lo"] = np.full(kept, lo)
-        seg["win_hi"] = np.full(kept, hi if hi > lo else np.inf)
+        seg["win_lo"] = np.full(mu.shape[0], lo)
+        seg["win_hi"] = np.full(mu.shape[0], hi if hi > lo else np.inf)
         parts.append(seg)
-
-    if not parts:
-        raise MalformedFile("no gaussians survived segment windowing")
 
     # SH survives only if every segment agrees on a degree; concatenating mixed degrees
     # would silently mis-stride every coefficient row after the first disagreement.

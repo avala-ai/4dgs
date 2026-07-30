@@ -6,6 +6,15 @@ All notable changes to the Python package are documented here, following
 
 ## [Unreleased]
 
+### Fixed
+
+- **Chunk-compressed PLY segment fidelity.** Segmented imports now retain every source gaussian and
+  use the `.4dgs` validity window—not temporal-center filtering—to reproduce which segment is
+  active. Gaussians centred outside a segment can still overlap it through their temporal extent,
+  while the source format's static and always-visible sentinel bands are normalized to fixed motion
+  and infinite temporal extent. The previous filter could remove visible support and persistent
+  background from converted scenes.
+
 ## [0.2.0] - 2026-07-29
 
 This release adds the format's new scene-description layers while keeping reconstruction bounded,
@@ -47,9 +56,8 @@ remain outside the package.
   a clock relative to its own start with a sidecar naming the parts. Passing the segments in
   timeline order with `--segment-duration` collapses them into one continuous scene: segment `k`'s
   scene time is `local + k × duration`, and its own span becomes the validity window of the
-  gaussians it contributes. Each segment also carries a tail of gaussians centred outside its span
-  that a player never shows; those are dropped rather than smeared. The sidecar and its parts become
-  a single seekable file, which is the point.
+  gaussians it contributes. The sidecar and its parts become a single seekable file, which is the
+  point.
 
   Four vertex words share one 11-10-11 field split, so position, scale, motion and time all go
   through the same three helpers rather than re-deriving the shifts per call site. That is not
