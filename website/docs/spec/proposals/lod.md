@@ -182,24 +182,20 @@ place where the error does not compound:
 
 > **Every gaussian present at level `≤ N` is bit-identical to that same gaussian in the full scene:
 > the same bins, the same quantization, the same declared bounds. A level cut removes gaussians; it
-> never approximates one. So the only difference between a level-`N` render and the full scene is
-> the set of gaussians the cut omits — and each omitted gaussian's contribution is exactly its own,
-> not an error smeared across its neighbours.**
+> never approximates one. The reconstructed gaussian state at level `N` is therefore an exact subset
+> of the full reconstructed gaussian state.**
 
 There is no dequantization step for level, no grid, no per-level rescaling — a coarse level is not a
 coarser _encoding_ of the scene, it is a _subset_ of the same encoding. Spec §5.3's bound holds
-verbatim on every gaussian a level render contains, at every level, because the bytes those
+verbatim on every gaussian a level decode contains, at every level, because the bytes those
 gaussians are decoded from are the same bytes the full scene decodes them from.
 
 What the format therefore **cannot** declare is a numeric bound on the difference between a coarse
 level and the full scene, and it is worth being as candid about this as spec §8 is about seek cost:
 
-> The deviation a level cut introduces is the sum of the omitted gaussians' contributions, and how
-> large that is depends entirely on how important the omitted gaussians were — which is the
-> encoder's importance metric, a judgement the format does not make and cannot bound. A level cut on
-> a scene whose importance ranking is good loses almost nothing perceptible; the same cut on a scene
-> ranked badly loses a great deal. The number is real but it is a property of the _content and the
-> encoder_, not of the container, exactly as seek efficiency is (spec §8).
+> A level cut omits complete gaussian rows. The format defines neither a metric over the missing
+> rows nor a numeric bound comparing that subset with the full reconstructed state. Which rows are
+> placed in each tranche is the encoder's importance policy, not a container guarantee.
 
 This proposal therefore defines **no per-level quality scalar**. A number without a common metric,
 units, scale, direction and sparse encoding grammar would not be interoperable; calling it advisory
@@ -266,9 +262,8 @@ sets are intact. Accidental EOF MUST NOT be reinterpreted as a mixed per-chunk t
 ### 3.4 The valid-at-every-prefix property
 
 The format's contribution to progressive refinement is one property, and it is a decode property —
-about what a partial set of fetched bytes reconstructs to, not about how a renderer draws it or when
-it should ask for more (that is a consumer's concern and out of scope here, per the format's
-renderer-agnostic boundary):
+about what a partial set of fetched bytes reconstructs to, not about downstream consumption or when
+more bytes should be requested:
 
 > **Valid at every deliberate refinement prefix.** Take any set of levels the file authorizes
 > filtering on (§4.1), crossed with an explicitly selected, per-chunk **contiguous** band prefix
@@ -390,6 +385,18 @@ spill I/O, never memory that grows with cumulative identities. Consequently a di
 discover a migration that exists only in a run it did not fetch, or across two disjoint seeks; that
 is the stated limit of partial validation, not permission for the file to violate the invariant.
 
+The exhaustive validator's **identity-memory budget** covers every validator-owned identity key,
+lifecycle entry, partition table and in-memory external-sort working or staging buffer, plus any
+identity-bearing decoded chunk storage retained after the validator advances to another chunk. Its
+reported `identityRetainedBytesHighWater` is the maximum total of those allocations. An on-disk
+spill file is not memory, but every buffer used to produce or consume it counts. The counter
+excludes only the input and decoded arrays for the one current chunk while that chunk is being
+consumed; those are independently bounded by the chunk's already-validated decoded sizes (§5.6).
+Before the next chunk is fetched, identity events needed later MUST have been reduced into the
+budgeted partition state or emitted to the budgeted external sort, and the previous chunk's decoded
+identity-bearing arrays MUST be released or counted. The runner instruments allocations at this
+boundary, so retaining an earlier keyframe as an unreported identity map violates the budget.
+
 A reader always has the complete active union for its requested `t` and `N`, so if it finds the same
 live id in two fetched levels it MUST refuse, naming the id, `t`, both levels and the chunks that
 supplied it; silently overwriting one level in an id-keyed state map would produce a plausible wrong
@@ -423,12 +430,12 @@ instants — which is not an error (§9).
 **Level and the object layer.** `object_id` is a per-gaussian attribute that rides in the chunk
 (spec §6.6); an Object Track is front matter applied once after base reconstruction (spec §3,
 §5.15.7). Level filtering changes _which gaussians are present_; it changes neither. A track read at
-open applies to whichever of its object's gaussians a level render happens to have loaded, and
-because a track is rigid and identical for all of an object's gaussians, an object that is split
-across levels — coarse gaussians at level 0, fine detail at level 2 — refines correctly for free:
-the same pose moves whatever subset is present. Object filtering (keep `object_id == k`) and level
-filtering (keep `level ≤ N`) are two predicates on the loaded set and compose by intersection, in
-either order, with no interaction.
+open applies to whichever of its object's gaussians a level decode happens to include, and because a
+track is rigid and identical for all of an object's gaussians, an object that is split across levels
+— coarse gaussians at level 0, fine detail at level 2 — refines correctly for free: the same pose
+moves whatever subset is present. Object filtering (keep `object_id == k`) and level filtering (keep
+`level ≤ N`) are two predicates on the loaded set and compose by intersection, in either order, with
+no interaction.
 
 So one seek carries all three filters at once:
 
@@ -602,11 +609,13 @@ composes with any profile.
   requiring, say, `objects`. Under `gaussian-birth`, the level-0 chunk intervals' union MUST cover
   `[0, duration_sec)` without a gap and MAY contain overlaps. Under `keyframe-delta`, level 0 MUST
   be one non-overlapping run from `0` through `duration_sec`. Absent or `"false"` means level 0 is
-  not guaranteed to be standalone. It is a range-relevant promise like the gate, so it **too MUST
-  live in `Header.attributes`** when present, for the reason `lod_levels` does. Within the Header it
-  is valid only alongside a valid Header `lod_levels`; an orphaned promise cannot authorize LOD
-  semantics or locate an index `level`, so a reader MUST refuse it as `lod-level0-without-gate`
-  rather than advertise a coarse pass it cannot select.
+  not guaranteed to be standalone. When present, the value grammar is exactly the lowercase ASCII
+  string `"true"` or `"false"`, with no whitespace; every other value, including `"TRUE"` and `"1"`,
+  MUST be refused as `lod-level0-complete-malformed`. It is a range-relevant promise like the gate,
+  so it **too MUST live in `Header.attributes`** when present, for the reason `lod_levels` does.
+  Within the Header it is valid only alongside a valid Header `lod_levels`; an orphaned key cannot
+  authorize LOD semantics or locate an index `level`, so a reader MUST refuse it as
+  `lod-level0-without-gate` rather than advertise a coarse pass it cannot select.
 
 These two keys add no record. A level's transfer size at a chosen contiguous SH prefix is already
 derivable from the index: sum `chunk_length` **plus the lengths of every selected SH Band Stream
@@ -614,8 +623,8 @@ range** over the level's entries. No per-level quality key is reserved: §3.2 sh
 no omission bound, and §12.2 defers a metric until its grammar and semantics can be specified for
 interoperability. No new **profile** value is spent, and none is needed: a consumer requiring LOD
 tests for `Header.attributes["lod_levels"]`, and one requiring a standalone coarse pass tests
-`Header.attributes["lod_level0_complete"]`, either alongside whatever profile the file already
-carries.
+`Header.attributes["lod_level0_complete"] == "true"`, either alongside whatever profile the file
+already carries.
 
 ### 4.5 The summary is untouched, and no manifest is added
 
@@ -703,11 +712,12 @@ The one thing that would have broken this is the design choice §3.1 settled, an
 as the reason that choice is not merely aesthetic. Had levels been **replacement** levels — each
 level a complete representation of the scene at its own fidelity, the way a resolution pyramid
 replaces rather than adds — then "load every chunk" would have loaded the same region several times
-over, once per level, and an old reader would have rendered a scene several times too dense: a real,
-silent, wrong scene of exactly the kind this format refuses everywhere. Replacement levels would
-have _needed_ a gate, because the full union would no longer be the full scene. Additive levels need
-none, because the union over all levels _is_ the full scene. Forward compatibility does not merely
-favour the additive model; it is incompatible with the alternative.
+over, once per level, and an old reader would have reconstructed an unintended union containing
+multiple representations of the same region: a silent wrong state of exactly the kind this format
+refuses everywhere. Replacement levels would have _needed_ a gate, because the full union would no
+longer be the full scene. Additive levels need none, because the union over all levels _is_ the full
+scene. Forward compatibility does not merely favour the additive model; it is incompatible with the
+alternative.
 
 ---
 
@@ -745,36 +755,25 @@ is easy to get the second half wrong.
 
 **The detail axis: exact per gaussian, no bound on the omission.** §3.2 is the whole statement:
 every present gaussian is bit-identical to its full-scene self, so its declared bounds hold verbatim
-at every level; and the difference from the full scene is the omitted gaussians' own contributions,
-which the format cannot bound because their magnitude is the encoder's importance judgement. Candour
-of the same shape as spec §8 on seek cost: a real quantity and a property of content and encoder,
-but neither measured nor declared by this container proposal (§3.2).
+at every level. A lower level is an exact subset of the reconstructed gaussian rows, but the format
+defines no metric or numeric error bound over the rows that are absent (§3.2).
 
 **The quality axis: the same, and the tempting shortcut is wrong.** For the bands a reader keeps,
 their declared SH bounds (`sh_band<b>`, spec §5.3, §6.5) hold verbatim — the coefficients present
 are reconstructed exactly as the file declares. For the bands a reader omits, **the file provides no
 bound, and it is important not to claim one from the wrong field.** `sh_band<b>` is the
 _quantization_ error between the stored and original coefficient — how far the byte moved the
-coefficient — not the magnitude of the band's contribution to colour. An 8-bit band has
-`sh_band<b> = 0` (lossless quantization) and yet omitting it drops real view-dependent colour: its
-coefficients range over `[-4, +4]` (spec §6.5) and its basis functions are nonzero, so the colour a
-degree-`b` reader misses by stopping short is the omitted coefficients' actual evaluated
-contribution, which depends on view direction and is content-dependent — exactly like the detail
-axis's omission, and bounded by the format no more than that one is. A reader _could_ derive a
-worst-case omission figure from the coefficient magnitudes and the SH basis bounds, but that is a
-per-gaussian, view-dependent computation, not a constant the file carries; the honest statement for
-the container is that it declares none.
+coefficient — not the coefficient's magnitude. An 8-bit band has `sh_band<b> = 0` (lossless
+quantization) while its stored coefficients may still be nonzero within `[-4, +4]` (spec §6.5), so
+that zero cannot be reused as a bound on omitted coefficient state. This proposal declares no
+aggregate omission metric for a band.
 
-**Combined, the two omissions do not interact.** A gaussian present at level `≤ N` and evaluated at
-contiguous degree `b` has its position and geometry at the declared full bound (the level cut did
-not touch them) and the bands it keeps at their declared SH bounds (the degree cut did not touch
-those). The level cut omits whole gaussians; the degree cut omits top bands; neither amplifies the
-other, because one acts on _which gaussians_ and the other on _each gaussian's colour_, and those
-are disjoint — no cross term and no depth term. What neither axis bounds is its own omission, and
-that is the property both share, reached here because both are subsets of independent data rather
-than approximations of it. This is a different result from keyframe-delta §8 and object-layer §7,
-which _do_ bound their whole output: those layers transform the state and keep the bound; this layer
-omits part of the state and is candid that the omitted part is unbounded by the file.
+**Combined, retained state keeps its existing bounds.** At level `≤ N` and contiguous degree `b`,
+every retained gaussian attribute and every retained SH coefficient has exactly the bound the base
+format declares. The selection omits whole gaussian rows and top-band coefficient rows; it does not
+modify retained values. The container declares no combined error bound comparing that selected state
+with the full state. This is distinct from keyframe-delta §8 and object-layer §7, which transform
+reconstructed state and retain a bound over their whole output.
 
 ### Representability
 
@@ -839,6 +838,7 @@ referential integrity between the index and the chunks, which the format already
 | condition                                                                                  | why it is not repairable                                                  |
 | ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------- |
 | Header `lod_levels` is not a canonical exclusive bound in `1..4294967296`                  | the gate is unreadable or outside the `u32 level` domain                  |
+| Header `lod_level0_complete` is present but not exactly `"true"` or `"false"`              | SDKs would disagree on whether the completeness promise is active         |
 | Header `lod_level0_complete` is present without a valid Header `lod_levels`                | the promise has no authorized level semantics or seek predicate           |
 | a chunk or index `level` is `>= lod_levels` (or the two disagree)                          | the declared range omits the chunk; the full union would silently lose it |
 | an indexed declared-LOD entry omits its appended `level`                                   | the seek predicate cannot be answered from the index                      |
@@ -905,9 +905,9 @@ refuse a usable file:
   layer at all, whatever its `level` values are (§4.1); a reader simply does not filter on `level`.
   Its Chunk Index has no LOD `level` append; a same-named key found only in a Metadata record does
   not change that. The one recognized malformed exception is an orphaned Header
-  `lod_level0_complete`, which §4.4 and the table above refuse because it claims completeness for a
-  level the Header has not authorized. Unknown trailing index bytes belong to append-only extensions
-  and MUST NOT be guessed to be `level` (§4.2).
+  `lod_level0_complete`, which §4.4 and the table above refuse because it names completeness
+  semantics for a level the Header has not authorized. Unknown trailing index bytes belong to
+  append-only extensions and MUST NOT be guessed to be `level` (§4.2).
 - **Deliberate per-chunk SH transfer caps** are valid when they are read-plan inputs (§3.3).
   Accidental EOF is not such a cap: it invokes the existing longest-intact-chunk recovery and does
   not make an otherwise incomplete trailing chunk valid.
@@ -1001,13 +1001,14 @@ transfer caps over one uniformly stored scene (§3.3) are asserted rather than a
   a time, including uniqueness across active levels and one lifecycle across every level and
   separated run. It refuses a cross-level migration, a live duplicate, or an id reborn after death
   even if the offending id falls outside the sample. Its adapter reports the configured identity
-  memory budget and observed high-water bytes; conformance fails if the latter exceeds the former.
-  The exhaustive runner also validates `LodKfDeltaIdentityBudgetOverflow`, whose 4,096 distinct ids
-  exceed a 256-byte test budget before a final cross-level occurrence of id 4095. Passing therefore
-  requires the partitioned-pass or external-sort path; a scene-wide map cannot pass by keeping this
-  small corpus below its configured capacity. The indexed decode runner checks the identity evidence
-  its selected chains fully expose: live uniqueness across the fetched active union and no-reuse
-  across the histories present in those chains. Its adapter reports `identityScratchEntriesLive` and
+  memory budget and `identityRetainedBytesHighWater` with §3.5's accounting boundary; conformance
+  fails if the latter exceeds the former. The exhaustive runner also validates
+  `LodKfDeltaIdentityBudgetOverflow`, whose 4,096 distinct ids exceed a 4,096-byte test budget
+  before a final cross-level occurrence of id 4095. Passing therefore requires the partitioned-pass
+  or external-sort path; a scene-wide map cannot pass by keeping this small corpus below its
+  configured capacity. The indexed decode runner checks the identity evidence its selected chains
+  fully expose: live uniqueness across the fetched active union and no-reuse across the histories
+  present in those chains. Its adapter reports `identityScratchEntriesLive` and
   `identityScratchEntriesHighWater` after every seek. The former MUST be zero on return, and the
   latter MUST be no greater than the number of identity rows in that seek's selected decoded chains.
   A disjoint-seek sequence increases cumulative visited ids far beyond any one seek and asserts that
@@ -1073,35 +1074,42 @@ keyed identity history between seeks.
 
 §9's structural faults, as a small corpus of deliberately invalid files, each paired with the
 identifier of the refusal it must produce — `lod-levels-malformed`, `level-exceeds-declared`,
-`lod-level0-without-gate`, `level-index-missing`, `level-index-mismatch`, `delta-crosses-level`,
-`level-overlap`, `level-run-without-keyframe`, `level-chain-crosses-gap`, `id-crosses-level`,
-`duplicate-id-across-levels`, `id-reuse-across-levels-after-death`, `lod-level0-birth-has-holes`,
-`lod-level0-kf-invalid-run`. These files run through the exhaustive validation entry point; a
-single-instant indexed decode is not required to fetch unselected payloads merely to discover a
-whole-history fault. The orphan-promise file carries Header `lod_level0_complete = "true"` without
-Header `lod_levels` and proves that the promise cannot authorize its own seek. The migration file
-gives id 7 a state-bearing occurrence in a level-0 run and a later non-overlapping level-1 run
-without a death; it MUST produce `id-crosses-level`. The duplicate-id file gives two active levels
-individually valid chains that both contain `gaussian_id = 7`; it MUST produce the more specific
-duplicate identifier only after the reconstructed union exposes the collision, naming both levels
-and chunks. The reuse file gives id 7 a valid lifecycle that ends in death, then births id 7 again
-in a later run; it MUST produce the more specific reuse identifier and name the earlier lifecycle,
-death and later birth even though no reconstructed instant has two live id-7 gaussians. The two
-level-0 files prove the temporal-model-specific coverage definitions. There is no `gaussian-birth`
-identity-refusal file, because that model exposes no wire identity with which a reader could
-diagnose cloned source ownership (§3.1, §9). This reuses the refusal-expectation harness contract
-keyframe-delta §11.5 introduces; if that contract has landed by the time this does, this adds rows
-to it rather than a mechanism.
+`lod-level0-complete-malformed`, `lod-level0-without-gate`, `level-index-missing`,
+`level-index-mismatch`, `delta-crosses-level`, `level-overlap`, `level-run-without-keyframe`,
+`level-chain-crosses-gap`, `id-crosses-level`, `duplicate-id-across-levels`,
+`id-reuse-across-levels-after-death`, `lod-level0-birth-has-holes`, `lod-level0-kf-invalid-run`.
+These files run through the exhaustive validation entry point; a single-instant indexed decode is
+not required to fetch unselected payloads merely to discover a whole-history fault. The
+malformed-completeness file carries `Header.attributes["lod_level0_complete"] = "TRUE"` alongside a
+valid LOD gate and MUST produce `lod-level0-complete-malformed`; this prevents truthiness or
+case-folding from changing the promise. The orphan-promise file carries Header
+`lod_level0_complete = "true"` without Header `lod_levels` and proves that the promise cannot
+authorize its own seek. The migration file gives id 7 a state-bearing occurrence in a level-0 run
+and a later non-overlapping level-1 run without a death; it MUST produce `id-crosses-level`. The
+duplicate-id file gives two active levels individually valid chains that both contain
+`gaussian_id = 7`; it MUST produce the more specific duplicate identifier only after the
+reconstructed union exposes the collision, naming both levels and chunks. The reuse file gives id 7
+a valid lifecycle that ends in death, then births id 7 again in a later run; it MUST produce the
+more specific reuse identifier and name the earlier lifecycle, death and later birth even though no
+reconstructed instant has two live id-7 gaussians. The two level-0 files prove the
+temporal-model-specific coverage definitions. There is no `gaussian-birth` identity-refusal file,
+because that model exposes no wire identity with which a reader could diagnose cloned source
+ownership (§3.1, §9). This reuses the refusal-expectation harness contract keyframe-delta §11.5
+introduces; if that contract has landed by the time this does, this adds rows to it rather than a
+mechanism.
 
 `LodKfDeltaIdentityBudgetOverflow` is a generated exhaustive-validation refusal case. The runner
-configures the validator with a 256-byte identity-memory budget. A level-0 keyframe contains the
+configures the validator with a 4,096-byte identity-memory budget. A level-0 keyframe contains the
 4,096 distinct ids `0..4095`; after those histories have been observed, a later non-overlapping
 level-1 keyframe contains id 4095 without an intervening death. The validator MUST produce
-`id-crosses-level`, and its reported identity-memory high-water MUST remain at or below 256 bytes.
-The input is deliberately larger than the budget even if an implementation stored only each
-identity's four-byte key, so a validator cannot satisfy the expectation with a scene-wide in-memory
-map. Implementations may make budget-sized numeric-id passes or use their memory-capped external
-sort; the expected refusal and budget assertion are the same.
+`id-crosses-level`, and its reported `identityRetainedBytesHighWater` MUST remain at or below 4,096
+bytes. The current level-0 keyframe's validated decode buffer may exceed that budget while the chunk
+is being consumed, but before the validator advances to the later keyframe it MUST release that
+buffer or count every retained identity-bearing byte under §3.5's budget. The input's four-byte ids
+alone occupy 16,384 bytes, so a validator cannot satisfy the expectation by carrying the decoded
+keyframe forward as a scene-wide map. Implementations may make budget-sized numeric-id passes or use
+their memory-capped external sort; the expected refusal, allocation trace and budget assertion are
+the same.
 
 Two additional invalid cases run through the **indexed seek** entry point with an instrumented byte
 source:
