@@ -923,6 +923,7 @@ fn encode(
             chunk_length: chunk_blob.len() as u64,
             gaussian_count: members.len() as u32,
             bands,
+            ..Default::default()
         });
 
         if opts.verify {

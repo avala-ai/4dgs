@@ -22,6 +22,14 @@ pub const STATISTICS: u8 = 0x0C;
 pub const ATTACHMENT: u8 = 0x0D;
 pub const ATTACHMENT_INDEX: u8 = 0x0E;
 pub const SUMMARY_OFFSET: u8 = 0x0F;
+
+/// A keyframe-delta file's delta chunks. Deliberately NOT a flag on `Chunk`: a Chunk is
+/// independently decodable and a Delta Chunk is exactly the record that is not, so a
+/// reader that does not implement the model skips these rather than decoding bin
+/// differences as absolute positions.
+pub const DELTA_CHUNK: u8 = 0x10;
+
+// Multi-source audio follows the already-assigned Delta Chunk opcode.
 pub const AUDIO_SOURCE: u8 = 0x11;
 pub const AUDIO_DATA: u8 = 0x12;
 
@@ -77,6 +85,7 @@ pub fn name(opcode: u8) -> String {
         ATTACHMENT => "Attachment",
         ATTACHMENT_INDEX => "AttachmentIndex",
         SUMMARY_OFFSET => "SummaryOffset",
+        DELTA_CHUNK => "DeltaChunk",
         AUDIO_SOURCE => "Audio Source",
         AUDIO_DATA => "Audio Data",
         COORDINATE_FRAME => "CoordinateFrame",
@@ -110,6 +119,11 @@ pub const A_FLAGS: u8 = 9;
 pub const A_WINDOW_INDEX: u8 = 10;
 pub const A_SOURCE_GROUP: u8 = 11;
 pub const A_SOURCE_INDEX: u8 = 12;
+
+/// Identity, required in every chunk of a `keyframe-delta` file and absent from a
+/// `gaussian-birth` one. Distinct from `A_SOURCE_INDEX`, which is a producer-side handle a
+/// reader may skip; this is what a delta names its gaussians by.
+pub const A_GAUSSIAN_ID: u8 = 13;
 
 /// Object membership (spec section 5.15.6). A `u32`, `0` = background/unassigned. Exact:
 /// an id is a label, not a metric, so it is never dequantized and the Quantization record

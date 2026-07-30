@@ -158,6 +158,7 @@ fn object_file_with_track(indexed: bool, duplicate_table: bool, track: ObjectTra
                 chunk_length: chunk.len() as u64,
                 gaussian_count: 1,
                 bands: Vec::new(),
+                ..Default::default()
             }
             .encode(),
         );
@@ -268,6 +269,7 @@ fn object_file_with_unrelated_ranges_and_duplicate(
             chunk_length: chunk.len() as u64,
             gaussian_count: 1,
             bands: Vec::new(),
+            ..Default::default()
         }
         .encode(),
     );
@@ -330,6 +332,7 @@ fn object_file_with_long_track(sample_count: usize) -> (Vec<u8>, ByteRange) {
             chunk_length: chunk.len() as u64,
             gaussian_count: 1,
             bands: Vec::new(),
+            ..Default::default()
         }
         .encode(),
     );

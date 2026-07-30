@@ -16,9 +16,13 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
+use fourdgs::keyframe_delta_file::{
+    probe_times as kd_probe_times, reconstruct_at, state_covering, DecodedSequence,
+};
 use fourdgs::model::{AudioSource, GaussianSet};
 use fourdgs::object_layer::ObjectLayer;
 use fourdgs::provenance::{pose_at, Pose, PoseSampled, Provenance};
+use fourdgs::records::DELTA_MODE_CHAINED;
 use fourdgs::records::{Attachment, Camera, Header, Metadata, Statistics, SummaryOffset};
 use fourdgs::Result;
 
@@ -968,4 +972,114 @@ fn sortable(value: f32) -> f64 {
 fn round_decimals(v: f64) -> f64 {
     let text = format!("{v:.*}", FLOAT_DECIMALS);
     text.parse().unwrap_or(v)
+}
+
+// --------------------------------------------------------------------------
+// keyframe-delta: the states summary two implementations are diffed on
+// --------------------------------------------------------------------------
+
+/// The statement two implementations are diffed on for a `keyframe-delta` file.
+///
+/// `chunks` proves a decoder read `depth`, `deltaMode` and `liveCount` — a field no row
+/// mentions is one an implementation can decline to decode. `states` is the reconstruction
+/// at an instant: for each probe, the composed population's live count, a sample of centres
+/// and scales in id order, and the aggregate over the whole population. Reconstruction is in
+/// `f64`, matching the Python reference, so the six-decimal comparison is exact.
+pub fn keyframe_delta_states_json(seq: &DecodedSequence) -> String {
+    let duration = seq.header.duration_sec;
+
+    let chunk_rows: Vec<J> = seq
+        .chunks
+        .iter()
+        .map(|c| {
+            let delta_mode = if c.kind == 0 {
+                J::Null
+            } else if c.delta_mode == Some(DELTA_MODE_CHAINED) {
+                J::Str("chained".into())
+            } else {
+                J::Str("keyframe".into())
+            };
+            J::obj(vec![
+                ("t0", num(c.t0)),
+                ("t1", num(c.t1)),
+                (
+                    "kind",
+                    J::Str(if c.kind == 0 { "keyframe" } else { "delta" }.into()),
+                ),
+                ("deltaMode", delta_mode),
+                ("depth", int(c.depth as u64)),
+                ("liveCount", int(c.state.count() as u64)),
+                ("updateCount", opt_int(c.update_count)),
+                ("birthCount", opt_int(c.birth_count)),
+                ("deathCount", opt_int(c.death_count)),
+            ])
+        })
+        .collect();
+
+    let mut states: Vec<J> = Vec::new();
+    for t in kd_probe_times(&seq.chunks, duration) {
+        let info = state_covering(&seq.chunks, t);
+        let r = reconstruct_at(seq, &info.state, t);
+        let n = r.ids.len();
+        let sample_n = SAMPLE.min(n);
+
+        let gaussian_ids: Vec<J> = r.ids[..sample_n]
+            .iter()
+            .map(|id| J::Str(id.to_string()))
+            .collect();
+        let positions: Vec<J> = (0..sample_n)
+            .map(|i| J::Arr((0..3).map(|k| num(r.centers[i * 3 + k])).collect()))
+            .collect();
+        let scales: Vec<J> = (0..sample_n)
+            .map(|i| J::Arr((0..3).map(|k| num(r.scales[i * 3 + k])).collect()))
+            .collect();
+
+        let mut position_sum = [0.0f64; 3];
+        for i in 0..n {
+            for (axis, slot) in position_sum.iter_mut().enumerate() {
+                *slot += r.centers[i * 3 + axis];
+            }
+        }
+        let opacity_sum: f64 = r.opacity.iter().sum();
+
+        states.push(J::obj(vec![
+            ("t", num(t)),
+            ("liveCount", int(info.state.count() as u64)),
+            (
+                "sample",
+                J::obj(vec![
+                    ("gaussianIds", J::Arr(gaussian_ids)),
+                    ("positions", J::Arr(positions)),
+                    ("scales", J::Arr(scales)),
+                ]),
+            ),
+            (
+                "aggregate",
+                J::obj(vec![
+                    (
+                        "positionSum",
+                        J::Arr(position_sum.iter().map(|v| num(*v)).collect()),
+                    ),
+                    ("opacitySum", num(opacity_sum)),
+                ]),
+            ),
+        ]));
+    }
+
+    J::obj(vec![
+        ("temporalModel", J::Str("keyframe-delta".into())),
+        ("gaussianCount", int(seq.header.gaussian_count)),
+        ("durationSec", num(duration)),
+        ("cutoff", num(seq.header.cutoff)),
+        ("chunks", J::Arr(chunk_rows)),
+        ("states", J::Arr(states)),
+    ])
+    .to_json()
+}
+
+fn opt_int(v: Option<u32>) -> J {
+    match v {
+        None => J::Null,
+        Some(v) => int(v as u64),
+    }
 }
