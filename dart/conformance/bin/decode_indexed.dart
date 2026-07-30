@@ -25,7 +25,29 @@ import 'package:fourdgs_conformance/checks.dart';
 /// file carries rather than the ones a default happened to admit.
 const int allBands = 3;
 
+/// The Header's temporal model, read from the front without decoding gaussians.
+String? temporalModel(Uint8List data) {
+  checkMagic(data);
+  for (final record in iterRecords(data, fourdgsMagic.length)) {
+    if (record.opcode == opHeader) {
+      return FourdgsHeader.parse(record.content).temporalModel;
+    }
+  }
+  return null;
+}
+
 Future<String> run(String path) async {
+  final data = File(path).readAsBytesSync();
+  if (temporalModel(data) == 'keyframe-delta') {
+    // Read the Footer, then the index, then compose each chunk by walking its
+    // chain — the seeking client's path — and emit the same states canonical the
+    // streamed runner does. Agreeing across the two paths is most of what makes
+    // an indexed keyframe-delta reader trustworthy.
+    return canonical(
+      keyframeDeltaStatesJson(decodeKeyframeDeltaIndexed(data).sequence),
+    );
+  }
+
   final file = await FourdgsFileReadable.open(path);
   final source = CountingReadable(file);
   try {

@@ -90,6 +90,15 @@ class FourdgsCursor {
     return _bd.getUint8(pos++);
   }
 
+  int u16() {
+    if (pos + 2 > bytes.length) {
+      throw FourdgsTruncatedFile('need 2 bytes at offset $pos');
+    }
+    final v = _bd.getUint16(pos, Endian.little);
+    pos += 2;
+    return v;
+  }
+
   int u32() {
     if (pos + 4 > bytes.length) {
       throw FourdgsTruncatedFile('need 4 bytes at offset $pos');

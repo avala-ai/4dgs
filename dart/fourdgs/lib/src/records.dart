@@ -285,6 +285,13 @@ class FourdgsChunkIndexEntry {
     required this.chunkLength,
     required this.gaussianCount,
     required this.bands,
+    this.extended = false,
+    this.kind = 0,
+    this.deltaMode = 0,
+    this.referenceOffset = 0,
+    this.keyframeOffset = 0,
+    this.depth = 0,
+    this.liveCount = 0,
   });
 
   final double t0;
@@ -296,6 +303,39 @@ class FourdgsChunkIndexEntry {
   /// Each band is its own byte range, so a reader that has decided to evaluate
   /// fewer bands never transfers the ones it will not use.
   final List<FourdgsBandRange> bands;
+
+  /// True when this entry carries the `keyframe-delta` block below. False for
+  /// every `gaussian-birth` file, whose entries stay byte-identical: the block
+  /// is appended after the band array, so an entry with at least
+  /// [indexDeltaBlockBytes] left after the bands carries it and one without
+  /// simply does not.
+  final bool extended;
+
+  /// `0` keyframe (a Chunk record), `1` delta (a Delta Chunk record).
+  final int kind;
+
+  /// `0` reference-to-keyframe, `1` reference-to-previous. Meaningful only when
+  /// [kind] is `1`.
+  final int deltaMode;
+
+  /// The chunk this delta applies to. Strictly less than [chunkOffset]:
+  /// references point backwards only, so the chain walk terminates, cycles are
+  /// unrepresentable, and any complete prefix of a truncated file is a complete
+  /// set of chains.
+  final int referenceOffset;
+
+  /// The keyframe at the head of this group. Equals [chunkOffset] for a
+  /// keyframe.
+  final int keyframeOffset;
+
+  /// Delta chunks that must be composed to reach this one — the exact read cost,
+  /// known from the index before anything is fetched.
+  final int depth;
+
+  /// Gaussians live over `[t0, t1)` after composition. [gaussianCount] cannot
+  /// answer this for a delta entry — there it is the size of the delta, not of
+  /// the population.
+  final int liveCount;
 
   /// The normative seek rule, per entry.
   bool covers(double t) => t0 <= t && t < t1;
@@ -340,6 +380,33 @@ class FourdgsChunkIndexEntry {
       }
       bands.add(range);
     }
+    // The `keyframe-delta` block sits after the band array. A reader takes the
+    // record's length from its header, so an entry with at least this many bytes
+    // left carries the block and a `gaussian-birth` entry — which has none —
+    // reads to the same values it always did.
+    if (c.remaining >= indexDeltaBlockBytes) {
+      final kind = c.u8();
+      final deltaMode = c.u8();
+      final referenceOffset = c.u64();
+      final keyframeOffset = c.u64();
+      final depth = c.u16();
+      final liveCount = c.u64();
+      return FourdgsChunkIndexEntry(
+        t0: t0,
+        t1: t1,
+        chunkOffset: chunkOffset,
+        chunkLength: chunkLength,
+        gaussianCount: gaussianCount,
+        bands: bands,
+        extended: true,
+        kind: kind,
+        deltaMode: deltaMode,
+        referenceOffset: referenceOffset,
+        keyframeOffset: keyframeOffset,
+        depth: depth,
+        liveCount: liveCount,
+      );
+    }
     return FourdgsChunkIndexEntry(
       t0: t0,
       t1: t1,
@@ -349,6 +416,96 @@ class FourdgsChunkIndexEntry {
       bands: bands,
     );
   }
+}
+
+/// Bytes the `keyframe-delta` block appends to a Chunk Index entry:
+/// `u8 kind`, `u8 delta_mode`, `u64 reference_offset`, `u64 keyframe_offset`,
+/// `u16 depth`, `u64 live_count`.
+const int indexDeltaBlockBytes = 1 + 1 + 8 + 8 + 2 + 8;
+
+/// Opcode `0x10` — a Delta Chunk's own fields. Its three length-framed groups
+/// (updates, births, deaths) follow in the `records` blob, which
+/// [parseDeltaChunk] returns alongside.
+class FourdgsDeltaChunkHeader {
+  const FourdgsDeltaChunkHeader({
+    required this.t0,
+    required this.t1,
+    required this.level,
+    required this.deltaMode,
+    required this.referenceOffset,
+    required this.keyframeOffset,
+    required this.depth,
+    required this.updateCount,
+    required this.birthCount,
+    required this.deathCount,
+    required this.compression,
+    required this.uncompressedSize,
+  });
+
+  final double t0;
+  final double t1;
+  final int level;
+  final int deltaMode;
+  final int referenceOffset;
+  final int keyframeOffset;
+  final int depth;
+  final int updateCount;
+  final int birthCount;
+  final int deathCount;
+  final String compression;
+  final int uncompressedSize;
+}
+
+/// A Delta Chunk's header and the raw bytes of its three groups.
+class FourdgsDeltaChunkBody {
+  const FourdgsDeltaChunkBody(
+    this.header,
+    this.updates,
+    this.births,
+    this.deaths,
+  );
+
+  final FourdgsDeltaChunkHeader header;
+
+  /// Attribute streams for gaussians whose bins changed, differenced against the
+  /// reference.
+  final Uint8List updates;
+
+  /// Attribute streams for gaussians born in this delta, stated absolutely.
+  final Uint8List births;
+
+  /// A single `gaussian_id` stream naming gaussians that die here.
+  final Uint8List deaths;
+}
+
+/// `delta_mode` values (spec §5.18). Per chunk, not per file.
+const int deltaModeKeyframe = 0;
+const int deltaModeChained = 1;
+
+FourdgsDeltaChunkBody parseDeltaChunk(Uint8List content) {
+  final c = FourdgsCursor(content);
+  final head = FourdgsDeltaChunkHeader(
+    t0: c.f64(),
+    t1: c.f64(),
+    level: c.u32(),
+    deltaMode: c.u8(),
+    referenceOffset: c.u64(),
+    keyframeOffset: c.u64(),
+    depth: c.u16(),
+    updateCount: c.u32(),
+    birthCount: c.u32(),
+    deathCount: c.u32(),
+    compression: c.string(),
+    uncompressedSize: c.u64(),
+  );
+  // The three groups are framed by length inside one blob rather than tagged
+  // with a group byte on every stream, so the death list — small and often
+  // wanted alone — is reachable by stepping over two lengths.
+  final records = FourdgsCursor(c.take(c.u64()));
+  final updates = records.take(records.u64());
+  final births = records.take(records.u64());
+  final deaths = records.take(records.u64());
+  return FourdgsDeltaChunkBody(head, updates, births, deaths);
 }
 
 /// Opcode `0x09`. Present only when the scene has audio; its absence is the

@@ -20,6 +20,12 @@ happened.
 - Both read paths. `readFourdgsBytes` walks a whole file front to back, needs no index, and recovers
   what preceded a cut; `openFourdgsIndexed` reads the Footer, then the index, then only the byte
   ranges an instant needs.
+- `keyframe-delta` decode, both read paths. `decodeKeyframeDeltaStreamed` composes each chunk onto
+  the one it references front to back; `decodeKeyframeDeltaIndexed` walks only an instant's chain
+  from the index. Composition is bin-difference and telescopes, so the declared error bound holds at
+  any chain depth (spec §11); GOP-invariants are enforced and rotation is restated absolutely.
+  `keyframeDeltaStatesJson` emits the canonical reconstruction-at-an-instant the SDKs are diffed on.
+  Decode only this milestone — there is no encoder.
 - `FourdgsReadable` as the single abstraction either path needs — a size and a byte range — with
   `FourdgsBytes` in the core and `FourdgsFileReadable` in `package:fourdgs/io.dart`. Transports live
   at the edges, so the decoder can be tested without a network and shipped without a platform.
