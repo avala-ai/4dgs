@@ -276,7 +276,17 @@ export async function decompressChunkBlock(
   codecs: CodecRegistry,
   describe: string,
 ): Promise<Uint8Array> {
-  if (compression === "") return block;
+  if (compression === "") {
+    // `uncompressed_size` is the decoded block length (§5.5); with no codec the block is
+    // already decoded, so the two must agree — the same length the decompressor enforces
+    // on a compressed block, checked here rather than trusted.
+    if (uncompressedSize !== block.length) {
+      throw new MalformedFile(
+        `${describe} declares ${uncompressedSize} uncompressed bytes but carries ${block.length}`,
+      );
+    }
+    return block;
+  }
   const codec = CHUNK_COMPRESSION_IDS.get(compression);
   if (codec === undefined) {
     throw new UnsupportedCodec(

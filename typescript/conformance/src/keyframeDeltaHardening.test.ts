@@ -269,6 +269,11 @@ test("decompressChunkBlock passes an empty codec through and refuses an unknown 
     () => decompressChunkBlock(payload, "brotli", payload.length, DEFAULT_CODECS, "x"),
     (e: unknown) => e instanceof UnsupportedCodec,
   );
+  // An uncompressed block whose declared size does not match its bytes is refused (§5.5).
+  await assert.rejects(
+    () => decompressChunkBlock(payload, "", payload.length + 1, DEFAULT_CODECS, "x"),
+    (e: unknown) => e instanceof MalformedFile,
+  );
 });
 
 // --- full-timeline tiling (codex P2 §11.1) --------------------------------
@@ -279,6 +284,7 @@ test("checkTiling refuses a gap, an overlap, and an uncovered timeline", () => {
   assert.throws(() => checkTiling([at(0, 2), at(1, 3)]), MalformedFile); // overlap
   assert.throws(() => checkTiling([at(0.5, 1)], 1), MalformedFile); // first t0 != 0
   assert.throws(() => checkTiling([at(0, 1)], 2), MalformedFile); // last t1 != duration
+  assert.throws(() => checkTiling([], 1), MalformedFile); // positive duration, no chunks
   checkTiling([at(0, 1), at(1, 2)], 2); // complete: no throw
 });
 

@@ -766,7 +766,15 @@ async function composeChain(
         throw new MalformedFile("a keyframe-delta chain begins with a delta chunk");
       }
       const parsed = parseDeltaChunk(content);
-      checkLevelMatch(keyframeLevel, parsed.header.level, link.chunkOffset, entry.keyframeOffset);
+      // The reference this delta composes onto is its own `reference_offset` (the previous
+      // link for a chained delta, the keyframe for a keyframe-referenced one); name that in
+      // the diagnostic, not the GOP keyframe (§11.6).
+      checkLevelMatch(
+        keyframeLevel,
+        parsed.header.level,
+        link.chunkOffset,
+        parsed.header.referenceOffset,
+      );
       state = await composeDelta(state, parsed, codecs);
     }
   }
@@ -798,6 +806,12 @@ export function checkTiling(intervals: readonly Interval[], durationSec?: number
           `[${entry.t0}, ${entry.t1})`,
       );
     }
+  }
+  if (durationSec !== undefined && ordered.length === 0) {
+    throw new MalformedFile(
+      `a keyframe-delta file declares duration_sec ${durationSec} but carries no state chunks; ` +
+        `the timeline [0, duration_sec) is uncovered`,
+    );
   }
   if (durationSec !== undefined && ordered.length > 0) {
     const first = ordered[0]!;
