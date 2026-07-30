@@ -702,7 +702,14 @@ def reconstruct_at(state: State, grids: Grids, t: float) -> dict:
     ids = state.ids[order]
     n = ids.shape[0]
     if n == 0:
-        return dict(ids=ids, centers=np.zeros((0, 3)), opacity=np.zeros(0))
+        return dict(
+            ids=ids,
+            centers=np.zeros((0, 3)),
+            scales=np.zeros((0, 3)),
+            rotations=np.zeros((0, 4)),
+            rgb=np.zeros((0, 3)),
+            opacity=np.zeros(0),
+        )
     mu = values["mu_t"][order]
     sigma = values["sigma_t"][order]
     position = values["positions"][order]
@@ -715,8 +722,21 @@ def reconstruct_at(state: State, grids: Grids, t: float) -> dict:
         ids=ids,
         centers=centers,
         scales=values["scales"][order],
+        rotations=values["rotations"][order],
+        rgb=color[:, :3],
         opacity=color[:, 3] * marginal,
     )
+
+
+def render_at(decoded: DecodedSequence, t: float) -> dict:
+    """The full renderable composed population at instant `t`, in `gaussian_id` order.
+
+    Finds the state chunk covering `t`, composes it (the chain the streamed decode already
+    walked), reconstructs per spec §3, and returns positions, scales, rotations, linear RGB
+    and marginal-folded opacity — everything a downstream renderer or an interchange export
+    needs for one instant. This is the per-frame primitive the USD animated export drives.
+    """
+    return reconstruct_at(_state_covering(decoded.chunks, t).state, decoded.grids, t)
 
 
 def probe_times(chunks: list[ChunkInfo], duration_sec: float) -> list[float]:

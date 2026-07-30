@@ -447,6 +447,107 @@ def to_usd(
         return len(fh.read())
 
 
+def to_usd_keyframe_delta(
+    path: str,
+    data: bytes,
+    *,
+    coordinate_system: str,
+    color_space: str | None = None,
+    meters_per_unit: float = 1.0,
+    fps: float = 30.0,
+    duration_sec: float | None = None,
+) -> int:
+    """Write a `keyframe-delta` scene to an animated ``ParticleField3DGaussianSplat`` asset.
+
+    USD time samples are the one interchange target that can hold this format's temporal
+    model: `to_gltf` and the static `to_usd` snapshot end at a single instant, and a
+    `keyframe-delta` file has no closed-form ``state_at`` to snapshot anyway — it is a
+    sequence of composed populations. This export walks the file's own clock at ``fps``,
+    composes the population at each frame (spec §11 reconstruction, via
+    ``keyframe_delta_file.render_at``), and writes it as one USD time sample.
+
+    **Fidelity contract.** USD time samples permit a different array length per sample, so a
+    frame's births and deaths are represented exactly — each sample carries precisely that
+    instant's live population. What USD does **not** carry is the correspondence between
+    frames: a renderer holds each sample until the next rather than interpolating between
+    differently-sized sets, and the ``gaussian_id`` identity the deltas are coded against is
+    not exported (USD point samples have no cross-sample identity). So this is a faithful
+    flipbook of the exact reconstructed states, not a tracked-gaussian animation — the
+    per-frame geometry is exact to the format's declared bounds; the between-frame motion is
+    stepped, not the sub-frame delta motion. A frame with nothing live is written as empty
+    arrays so a gap reads as a gap rather than holding the previous frame.
+
+    ``data`` is the bytes of a `keyframe-delta` file. ``duration_sec`` defaults to the
+    file's own Header duration. Writes ``.usd``, ``.usda`` or ``.usdc`` by extension and
+    returns the number of bytes written.
+    """
+    from . import keyframe_delta_file as kdf
+
+    Gf, Usd, UsdGeom, UsdVol, Vt = _require_pxr()
+
+    up_axis = _COORD_TO_UP_AXIS.get(coordinate_system)
+    if up_axis is None:
+        raise MalformedFile(
+            f"the scene declares coordinate_system '{coordinate_system}', which this converter cannot place on a "
+            f"USD stage. Known values are {sorted(_COORD_TO_UP_AXIS)}; a file that declares none has to say which it "
+            "means before it can be exported."
+        )
+    if meters_per_unit <= 0 or not np.isfinite(meters_per_unit):
+        raise MalformedFile(f"meters_per_unit must be a positive length, not {meters_per_unit}")
+    if fps <= 0 or not np.isfinite(fps):
+        raise MalformedFile(f"animated export needs a positive fps, not {fps}")
+    if color_space is None:
+        color_space = DEFAULT_COLOR_SPACE
+    lower = path.lower()
+    if not lower.endswith((".usd", ".usda", ".usdc")):
+        raise MalformedFile(f"USD export writes '.usd', '.usda' or '.usdc'; '{path}' is none of these.")
+
+    decoded = kdf.decode_streamed(data)
+    duration = float(decoded.header.duration_sec if duration_sec is None else duration_sec)
+    if duration < 0 or not np.isfinite(duration):
+        raise MalformedFile(f"animated export needs a finite, non-negative duration, not {duration}")
+
+    stage = Usd.Stage.CreateInMemory()
+    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.y if up_axis == "Y" else UsdGeom.Tokens.z)
+    UsdGeom.SetStageMetersPerUnit(stage, float(meters_per_unit))
+    splat = UsdVol.ParticleField3DGaussianSplat.Define(stage, "/GaussianSplats")
+    splat.GetPrim().SetCustomDataByKey(_CD_COLOR_SPACE, color_space)
+    # A keyframe-delta file carries no spherical harmonics (its births restate colour, not
+    # bands), so the export is degree 0: the DC term recovered from the resolved colour.
+    splat.CreateRadianceSphericalHarmonicsDegreeAttr(0)
+
+    frames = round(duration * fps)
+    stage.SetTimeCodesPerSecond(float(fps))
+    stage.SetStartTimeCode(0.0)
+    stage.SetEndTimeCode(float(frames))
+
+    wrote_any = False
+    for frame in range(frames + 1):
+        state = kdf.render_at(decoded, frame / fps)
+        centers = state["centers"]
+        time_code = Usd.TimeCode(float(frame))
+        sh_vt = _sh_dc(Gf, Vt, np.asarray(state["rgb"], dtype=np.float64).reshape(-1, 3))
+        _write_frame(Gf, Vt, splat, centers, state["scales"], state["rotations"], state["opacity"], sh_vt, time_code)
+        wrote_any = wrote_any or centers.shape[0] > 0
+
+    if not wrote_any:
+        raise MalformedFile(
+            f"no gaussian is live at any frame over [0, {duration}]s at {fps} fps, so the animation would be empty; "
+            "check the duration and fps against the scene's own clock."
+        )
+
+    stage.GetRootLayer().Export(path)
+    with open(path, "rb") as fh:
+        return len(fh.read())
+
+
+def _sh_dc(Gf, Vt, rgb: np.ndarray):
+    """The degree-0 coefficient list USD wants, recovered from resolved colour — the whole
+    spherical-harmonic payload for a scene that carries no bands."""
+    per_vertex = (rgb - 0.5) / SH_C0
+    return Vt.Vec3fArray([Gf.Vec3f(float(r), float(g), float(b)) for r, g, b in per_vertex])
+
+
 def _write_snapshot(Gf, Usd, Vt, splat, prim, gaussians, degree, stored_coeffs, *, time_sec: float, cutoff: float):
     state = gaussians.state_at(time_sec, cutoff)
     index = state["indices"]
@@ -498,13 +599,30 @@ def _write_animated(
 
 
 def _set_frame(Gf, Vt, splat, gaussians, index, centers, opacity, degree, stored_coeffs, time_code=None):
-    """Write one reconstructed state onto the prim, at the default value or a time sample."""
+    """Write one reconstructed state onto the prim, at the default value or a time sample.
+
+    The gaussian-birth path: `scales`, `rotations` and colour are static per gaussian and
+    looked up by which are visible at this instant. The keyframe-delta path composes a fresh
+    population each frame and reaches `_write_frame` directly.
+    """
     n = int(index.size)
     centers = np.asarray(centers, dtype=np.float64).reshape(n, 3)
     scales = gaussians.scales[index].astype(np.float64)
     rotations = gaussians.rotations[index].astype(np.float64)
     opacity = np.clip(np.asarray(opacity, dtype=np.float64), 0.0, 1.0).reshape(n)
     rgb = gaussians.colors[index, :3].astype(np.float64)
+    sh_vt = _sh_array(Gf, Vt, gaussians, index, rgb, degree, stored_coeffs)
+    _write_frame(Gf, Vt, splat, centers, scales, rotations, opacity, sh_vt, time_code)
+
+
+def _write_frame(Gf, Vt, splat, centers, scales, rotations, opacity, sh_vt, time_code=None):
+    """Set the six splat attributes from ready arrays — the wire between a reconstructed
+    state and USD, shared by the static gaussian-birth path and the animated keyframe-delta
+    one. Callers reconstruct the state; this only serializes it."""
+    centers = np.asarray(centers, dtype=np.float64).reshape(-1, 3)
+    scales = np.asarray(scales, dtype=np.float64).reshape(-1, 3)
+    rotations = np.asarray(rotations, dtype=np.float64).reshape(-1, 4)
+    opacity = np.clip(np.asarray(opacity, dtype=np.float64), 0.0, 1.0).reshape(-1)
 
     positions_vt = Vt.Vec3fArray([Gf.Vec3f(*(float(v) for v in row)) for row in centers])
     scales_vt = Vt.Vec3fArray([Gf.Vec3f(*(float(v) for v in row)) for row in scales])
@@ -513,8 +631,6 @@ def _set_frame(Gf, Vt, splat, gaussians, index, centers, opacity, degree, stored
         [Gf.Quatf(float(row[3]), float(row[0]), float(row[1]), float(row[2])) for row in rotations]
     )
     opacity_vt = Vt.FloatArray([float(v) for v in opacity])
-
-    sh_vt = _sh_array(Gf, Vt, gaussians, index, rgb, degree, stored_coeffs)
     extent = _extent(Gf, Vt, centers)
 
     if time_code is None:
