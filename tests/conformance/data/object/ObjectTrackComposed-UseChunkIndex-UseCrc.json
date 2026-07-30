@@ -34,8 +34,8 @@
           0.5,
           0.0
         ],
+        "dynamics": null,
         "embeddingCrc": null,
-        "hasDynamics": false,
         "hasEmbedding": false,
         "label": "turning object",
         "objectId": "7"

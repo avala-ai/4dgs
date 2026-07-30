@@ -34,8 +34,24 @@
           -2.0,
           0.5
         ],
+        "dynamics": {
+          "acceleration": [
+            -0.4,
+            0.5,
+            -0.6
+          ],
+          "angularVelocity": [
+            0.1,
+            -0.2,
+            0.3
+          ],
+          "velocity": [
+            2.0,
+            -1.0,
+            0.5
+          ]
+        },
         "embeddingCrc": "2756106793",
-        "hasDynamics": true,
         "hasEmbedding": true,
         "label": "synthetic vehicle",
         "objectId": "7"

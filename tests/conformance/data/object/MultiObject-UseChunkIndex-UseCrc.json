@@ -34,8 +34,24 @@
           0.0,
           0.0
         ],
+        "dynamics": {
+          "acceleration": [
+            0.05,
+            -0.1,
+            0.15
+          ],
+          "angularVelocity": [
+            0.2,
+            0.1,
+            -0.3
+          ],
+          "velocity": [
+            1.0,
+            -0.5,
+            0.25
+          ]
+        },
         "embeddingCrc": "1384289393",
-        "hasDynamics": true,
         "hasEmbedding": true,
         "label": "vehicle",
         "objectId": "7"
@@ -46,8 +62,8 @@
           1.0,
           0.0
         ],
+        "dynamics": null,
         "embeddingCrc": null,
-        "hasDynamics": false,
         "hasEmbedding": false,
         "label": "pedestrian",
         "objectId": "9"
@@ -58,8 +74,8 @@
           0.5,
           0.0
         ],
+        "dynamics": null,
         "embeddingCrc": null,
-        "hasDynamics": false,
         "hasEmbedding": false,
         "label": "static sign",
         "objectId": "11"

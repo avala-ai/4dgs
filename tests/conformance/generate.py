@@ -484,7 +484,9 @@ def _obj_single() -> tuple[fourdgs.GaussianSet, ObjectLayer]:
                     object_id=7,
                     label="synthetic vehicle",
                     anchor=(1.0, -2.0, 0.5),
-                    dynamics=([2.0, 0.0, 0.0], [0.0, 0.0, 0.5], [0.0, 0.0, 0.0]),
+                    # Nine distinct nonzero values, so the canonical's dynamics block discriminates
+                    # a decoder that reads the record but exposes zeros or crosses a component.
+                    dynamics=([2.0, -1.0, 0.5], [0.1, -0.2, 0.3], [-0.4, 0.5, -0.6]),
                     embedding=[0.25, -0.5, 0.75, 1.0],
                 )
             ],
@@ -528,7 +530,7 @@ def _obj_multi() -> tuple[fourdgs.GaussianSet, ObjectLayer]:
                     object_id=7,
                     label="vehicle",
                     anchor=(0.5, 0.0, 0.0),
-                    dynamics=([1.0, 0.0, 0.0], [0.0, 0.0, 0.25], [0.0, 0.0, 0.0]),
+                    dynamics=([1.0, -0.5, 0.25], [0.2, 0.1, -0.3], [0.05, -0.1, 0.15]),
                     embedding=[0.2, -0.4, 0.6],
                 ),
                 ObjectTableEntry(object_id=9, label="pedestrian", anchor=(0.5, 1.0, 0.0)),
@@ -692,7 +694,9 @@ def _objects(duration_sec: float) -> ObjectLayer:
                     object_id=7,
                     label="synthetic vehicle",
                     anchor=(1.0, -2.0, 0.5),
-                    dynamics=([2.0, 0.0, 0.0], [0.0, 0.0, 0.5], [0.0, 0.0, 0.0]),
+                    # Nine distinct nonzero values, so the canonical's dynamics block discriminates
+                    # a decoder that reads the record but exposes zeros or crosses a component.
+                    dynamics=([2.0, -1.0, 0.5], [0.1, -0.2, 0.3], [-0.4, 0.5, -0.6]),
                     embedding=[0.25, -0.5, 0.75, 1.0],
                 )
             ],
