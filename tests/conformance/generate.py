@@ -569,9 +569,13 @@ def _obj_track_composed() -> tuple[fourdgs.GaussianSet, ObjectLayer]:
     it. The states are the assertion that motion is folded into the base center first and the
     track transports the result — `R*(c0 + motion*t) + T` — and that orientation composes as
     `R (x) r0` rather than replacing r0."""
-    # A quarter-turn about z as the rest orientation (xyzw), so composing the track's own
-    # rotations onto it is a genuine quaternion product, not a multiply by identity.
-    rest = [0.0, 0.0, 0.3826834, 0.9238795]
+    # The rest orientation turns about x and the track turns about y (xyzw). The axes must
+    # differ: quaternion multiplication commutes for two rotations about the same axis, so a
+    # same-axis pair would make `R (x) r0` and the wrong order `r0 (x) R` produce the identical
+    # canonical, and a decoder that composed backwards would pass. Non-commuting axes make the
+    # order observable — `R (x) r0` differs from `r0 (x) R` — so the row proves order, not just
+    # that some product was taken.
+    rest = [0.3826834, 0.0, 0.0, 0.9238795]
     gaussians = _obj_gaussians(
         positions=[
             [0.0, 0.0, 0.0],
@@ -595,7 +599,7 @@ def _obj_track_composed() -> tuple[fourdgs.GaussianSet, ObjectLayer]:
                 object_id=7,
                 interpolation=TRAJECTORY_LINEAR,
                 times=[0.0, 0.5 * _OBJ_DURATION, _OBJ_DURATION],
-                rotations=[[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.7071068, 0.7071068], [0.0, 0.0, 1.0, 0.0]],
+                rotations=[[0.0, 0.0, 0.0, 1.0], [0.0, 0.7071068, 0.0, 0.7071068], [0.0, 1.0, 0.0, 0.0]],
                 translations=[[0.0, 0.0, 0.0], [2.0, 1.0, 0.0], [4.0, 0.0, 0.0]],
             )
         ],
