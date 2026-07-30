@@ -151,11 +151,14 @@ identity attribute, so a reader cannot distinguish an intentional pair of simila
 logical source gaussian restated at two levels. That ownership rule is therefore tested only by
 source-aware encoder conformance: compare every requested state and the full union to the known
 source state (§10). It is not a `gaussian-birth` reader refusal. `keyframe-delta` does carry
-`gaussian_id`, so one-level ownership is structurally enforceable there: the first occurrence of an
-id fixes its level for the whole file, and every later keyframe restatement, update, birth or death
-for that id MUST remain at that level. Its scene-wide live-uniqueness and no-reuse rules remain
-separately enforceable after active level chains are united and across their full identity history
-(§3.5, §9). Level never creates a second identity namespace and an id never migrates between levels.
+`gaussian_id`, so one-level ownership is structurally enforceable there by an encoder or full-file
+validator: the first occurrence of an id fixes its level for the whole file, and every later
+keyframe restatement, update, birth or death for that id MUST remain at that level. Its scene-wide
+live-uniqueness and no-reuse rules remain separately enforceable after active level chains are
+united and across their full identity history (§3.5, §9). Level never creates a second identity
+namespace and an id never migrates between levels. An ordinary range seek validates the identity
+evidence it fetches; it does not scan the rest of the file to prove this whole-history invariant
+(§3.5).
 
 **This meaning is opt-in, and that is load-bearing — the `level` field is not being retroactively
 reinterpreted.** Spec §5.5 defines `level` as "producer's hierarchy level; informational only", and
@@ -370,15 +373,27 @@ every level and every separated run. An id that dies cannot later birth as a dif
 even at its original level and even if the two lifetimes never overlap and each run is internally
 valid.
 
-A reader that finds the same live id in two levels MUST refuse, naming the id, `t`, both levels and
-the chunks that supplied it; silently overwriting one level in an id-keyed state map would produce a
-plausible wrong scene. A reader that finds an id associated with two levels without such a live
+**Validation scope preserves range seeking.** `gaussian_id` lives inside state-chunk payloads, not
+in the Chunk Index. This proposal does not duplicate a potentially scene-sized `id -> level` map
+into the summary, and an ordinary indexed seek MUST NOT fetch unrelated chunks merely to reconstruct
+the file's complete ownership or death history. It validates every identity fact in the chains it
+actually fetches. A source-aware encoder conformance run and a full-file validator scan all
+state-bearing payloads and therefore MUST prove immutable ownership and no reuse exhaustively.
+Consequently a direct seek may not discover a migration that exists only in a run it did not fetch;
+that is the stated limit of partial validation, not permission for the file to violate the
+invariant.
+
+A reader always has the complete active union for its requested `t` and `N`, so if it finds the same
+live id in two fetched levels it MUST refuse, naming the id, `t`, both levels and the chunks that
+supplied it; silently overwriting one level in an id-keyed state map would produce a plausible wrong
+scene. A full-file validator that finds an id associated with two levels without such a live
 collision MUST refuse the cross-level migration, naming the id, both levels and the first offending
-chunks. A reader that finds reuse after death MUST separately refuse, naming the id, the earlier
-level, run and chunk in its lifecycle, the death, and the later run and birth chunk. These are
-distinct failures: the first violates uniqueness in one reconstructed union, the second violates
-immutable level ownership without requiring overlapping lifetimes, and the third violates the
-scene-wide identity history after an explicit death.
+chunks. If it finds reuse after death it MUST separately refuse, naming the id, the earlier level,
+run and chunk in its lifecycle, the death, and the later run and birth chunk. A partial reader that
+observes either history in its fetched chains issues the same refusal. These are distinct failures:
+the first violates uniqueness in one reconstructed union, the second violates immutable level
+ownership without requiring overlapping lifetimes, and the third violates the scene-wide identity
+history after an explicit death.
 
 This is exactly the generalization keyframe-delta §7 anticipated in writing — "if spatial
 subdivision within a temporal chunk is ever added, `current(t)` becomes a set rather than a single
@@ -808,11 +823,11 @@ fetched at all.
 
 ---
 
-## 9. Failure modes a reader refuses
+## 9. Failure modes a conforming implementation refuses
 
-Collected so a reader can check itself against a list. Each names the offending value. The list is
-short because subsetting has little to get wrong; most of it is referential integrity between the
-index and the chunks, which the format already polices.
+Collected so a decoder or full-file validator can check itself against a list. Each names the
+offending value. The list is short because subsetting has little to get wrong; most of it is
+referential integrity between the index and the chunks, which the format already polices.
 
 | condition                                                                                  | why it is not repairable                                                  |
 | ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------- |
@@ -843,16 +858,17 @@ The upper endpoint `4294967296` is valid because it permits the greatest stored 
 `4294967295`; it is not a request to allocate that many slots. A reader parses the bound with
 checked arithmetic and keeps actual levels in storage bounded by validated index entries (§4.4).
 
-The three identity rows are `keyframe-delta` reader refusals. The immutable-ownership check records
-the level of every id's first state-bearing occurrence and rejects any later occurrence at a
-different level, even across a gap with no death. The live-uniqueness check applies to the
-**reconstructed union**, not to each level in isolation. The no-reuse check applies to the global
-identity history across levels and separated runs, not merely to one simultaneously active union.
-Thus two individually valid active chains that carry the same live `gaussian_id` are a live
-duplicate; an id seen in disjoint level runs without a death is a migration; and an id that dies
-then births again is reuse. If one malformed history satisfies more than one predicate, the more
-specific live-duplicate or reuse identifier takes precedence over the migration identifier so
-conformance diagnostics remain deterministic (§10.3).
+The three identity rows are `keyframe-delta` conformance faults with two validation scopes. Every
+range seek reconstructs its complete active union, so the live-uniqueness check is local and
+mandatory on that seek. Immutable ownership and no reuse are whole-history checks: a full-file
+validator records the level of every id's first state-bearing occurrence and its lifecycle, while a
+partial reader applies the same checks only to history present in its fetched chains and MUST NOT
+scan unrelated payloads solely to complete them (§3.5). Thus two individually valid active chains
+that carry the same live `gaussian_id` are a live duplicate; an id seen in disjoint level runs
+without a death is a migration; and an id that dies then births again is reuse. If one malformed
+history satisfies more than one predicate, the more specific live-duplicate or reuse identifier
+takes precedence over the migration identifier so conformance diagnostics remain deterministic
+(§10.3).
 
 `gaussian-birth` has no `gaussian_id` attribute (registry §“Attribute ids”), so a file reader has no
 structural observation that can prove one logical source gaussian was restated in two tranches.
@@ -886,7 +902,9 @@ refuse a usable file:
   Accidental EOF is not such a cap: it invokes the existing longest-intact-chunk recovery and does
   not make an otherwise incomplete trailing chunk valid.
 
-A validator MAY note the unusual combinations; a reader refuses only the structural faults above.
+A validator MAY note the unusual combinations. A full-file validator refuses every structural fault
+above; a partial reader refuses the faults its selected index entries and fetched payloads expose,
+without expanding the seek merely to search for faults elsewhere.
 
 ---
 
@@ -969,11 +987,13 @@ transfer caps over one uniformly stored scene (§3.3) are asserted rather than a
   expected state and `liveCount` to prove each source gaussian appears in exactly its assigned level
   and once in the full union. A file reader cannot make that check and has no corresponding identity
   refusal. For `keyframe-delta`, `sample.gaussianIds` uses the existing canonical identity field;
-  the runner records one immutable level per id, checks uniqueness across all active levels before
-  sampling, and tracks one scene-wide lifecycle history across every level and separated run. It
-  refuses a cross-level migration, a live duplicate, or an id reborn after death even if the
-  offending id falls outside the sample. Positive multi-level rows use level-stable, never-reused
-  ids, and the invalid corpus contains separate cases for all three failures (§10.3).
+  the full-file validation runner records one immutable level per id, checks uniqueness across all
+  active levels before sampling, and tracks one scene-wide lifecycle history across every level and
+  separated run. It refuses a cross-level migration, a live duplicate, or an id reborn after death
+  even if the offending id falls outside the sample. The indexed decode runner checks the same
+  invariants over fetched chains but is instrumented to prove it never requests unrelated payloads
+  to complete a whole-file identity audit. Positive multi-level rows use level-stable, never-reused
+  ids, and the invalid corpus contains separate full-file cases for all three failures (§10.3).
 - **`states[].byChunk` carries a per-chunk transfer cap and SH digest.** `throughShDegree` is the
   highest contiguous band prefix selected for that chunk in this read, and `shCrc` digests only the
   coefficients through that prefix. The file still stores the same Header-declared degree for every
@@ -1007,6 +1027,7 @@ level-run generalization and its compatibility boundary (§3.5, §4.6):
 | `LodNoDeclare`           | chunk `level > 0`; Header gate and index `level` append both absent                  | semantic/physical iff gate: reader does not filter or infer a field, and gets full scene |
 | `LodIndexMissingLevel`   | declared indexed LOD; one Chunk Index entry omits the appended `level`               | mandatory range-seekable level predicate (§4.2)                                          |
 | `LodKfDeltaPerLevelRuns` | `keyframe-delta`, two levels; one full run and one sparse keyframe-rooted run        | run-local chains, unique active ids and one global no-reuse identity history (§3.5)      |
+| `LodKfDeltaRangeSeek`    | seek a later sparse run from the index without fetching earlier valid runs           | selected chains only; whole-file identity validation never becomes a payload scan        |
 | `LodKfDeltaChurnCount`   | one level repeats id 7, births id 8, updates both, then kills id 7                   | `gaussianCount = 2` for lifetime ids while per-instant `liveCount` changes               |
 | `LodFullEqualsUnion`     | request `lod_levels - 1` vs a non-LOD full decode, including an over-declared bound  | decoded union equality and one-level ownership under both temporal models                |
 
@@ -1019,18 +1040,22 @@ rule (spec §11.1) — the §4.6 compatibility boundary made checkable, so the n
 case is proven to refuse cleanly rather than mis-decode. `LodStreamBandCut` runs only through the
 streamed recovery path and compares its state to the longest full-degree intact chunk prefix.
 `LodStreamLevelCut` likewise runs through streamed recovery and retains the Header's declared bound
-while summarizing only levels found in the intact record prefix.
+while summarizing only levels found in the intact record prefix. `LodKfDeltaRangeSeek` records every
+range request and fails if the decoder fetches a state chunk outside the index-selected chains; the
+same valid fixture is separately accepted by the exhaustive identity validator.
 
-### 10.3 Files a reader must refuse
+### 10.3 Files full-file conformance must refuse
 
 §9's structural faults, as a small corpus of deliberately invalid files, each paired with the
 identifier of the refusal it must produce — `lod-levels-malformed`, `level-exceeds-declared`,
 `lod-level0-without-gate`, `level-index-missing`, `level-index-mismatch`, `delta-crosses-level`,
 `level-overlap`, `level-run-without-keyframe`, `level-chain-crosses-gap`, `id-crosses-level`,
 `duplicate-id-across-levels`, `id-reuse-across-levels-after-death`, `lod-level0-birth-has-holes`,
-`lod-level0-kf-invalid-run`. The orphan-promise file carries Header `lod_level0_complete = "true"`
-without Header `lod_levels` and proves that the promise cannot authorize its own seek. The migration
-file gives id 7 a state-bearing occurrence in a level-0 run and a later non-overlapping level-1 run
+`lod-level0-kf-invalid-run`. These files run through the exhaustive validation entry point; a
+single-instant indexed decode is not required to fetch unselected payloads merely to discover a
+whole-history fault. The orphan-promise file carries Header `lod_level0_complete = "true"` without
+Header `lod_levels` and proves that the promise cannot authorize its own seek. The migration file
+gives id 7 a state-bearing occurrence in a level-0 run and a later non-overlapping level-1 run
 without a death; it MUST produce `id-crosses-level`. The duplicate-id file gives two active levels
 individually valid chains that both contain `gaussian_id = 7`; it MUST produce the more specific
 duplicate identifier only after the reconstructed union exposes the collision, naming both levels
@@ -1054,7 +1079,9 @@ Added as `No` or `Planned` for every SDK, moved only by a passing suite:
 - Contiguous band prefixes — the highest-contiguous-prefix rule with out-of-order bands held (§3.3)
 - Per-chunk SH transfer caps — `byChunk` agrees while stored scene degree remains uniform
 - Stream truncation — an incomplete trailing band set is dropped, never treated as an implicit cap
-- Keyframe-delta scene-wide identity — every id has one immutable level, active unions have unique
+- Keyframe-delta range seek — indexed reads fetch only selected chains and validate identity
+  evidence in those chains without scanning unrelated payloads
+- Keyframe-delta full-file identity — every id has one immutable level, active unions have unique
   ids, and lifecycle history never restarts across levels or separated runs
 - Full-union equivalence — a `lod_levels - 1` decode equals a non-LOD decode
 - Encode: source partition and one-level ownership — each source gaussian is emitted in exactly one
@@ -1075,8 +1102,9 @@ Stated together so a reviewer can weigh them without assembling them from the se
 3. **A coordination constraint on the Chunk Index's appended-field order** (§4.2, §12.1), shared
    with keyframe-delta — the one genuinely fiddly part, because two extensions append to one frozen
    record.
-4. **A small new invariant class in readers** — §9's structural refusals, most of them the
-   index/record consistency check the format already performs on other duplicated fields.
+4. **A small new invariant class in readers and full-file validators** — §9's structural refusals,
+   most of them the index/record consistency check the format already performs on other duplicated
+   fields. Whole-history identity validation never turns a direct range seek into a payload scan.
 5. **An incremental-fetch capability the consumer may use or ignore** (§3.4). The format guarantees
    every deliberately selected refinement prefix decodes coherently; accidental EOF retains the
    existing longest-intact-chunk recovery (§3.3). A reader that ignores incremental fetches
@@ -1102,19 +1130,19 @@ The design was reviewed and **accepted**. Every question it left open was ruled 
 recorded here and folded into the section it affects, so the document has no section that
 contradicts a decision and no reader has to hold both a recommendation and its outcome in mind.
 
-| #   | question                                           | ruling                                                                                                                                                                                                    | folded into         |
-| --- | -------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- |
-| 1   | Chunk Index appended-field order vs keyframe-delta | keyframe-delta block first iff Header `temporal_model`; `level` next iff valid Header `lod_levels`; length only bounds/skips; **any third appender starts a presence-map suffix after both gated blocks** | §4.2                |
-| 2   | Per-level quality metadata                         | Defer both key and record: no canonical omission metric or sparse string grammar is justified; transfer size remains index-derivable                                                                      | §3.2, §12.2         |
-| 3   | A network manifest                                 | Not added; the byte-range index suffices and a manifest breaks "one resource"                                                                                                                             | §8                  |
-| 4   | Additive levels vs replacement levels              | Additive; forward compatibility is incompatible with replacement                                                                                                                                          | §3.1, §5            |
-| 5   | Must every level cover the whole timeline          | No; only Header `lod_level0_complete` promises level 0: gap-free interval union for `gaussian-birth`, one full non-overlapping run for `keyframe-delta`                                                   | §3.5, §4.4, §9      |
-| 6   | How a reader knows `level` carries LOD importance  | Opt-in only via `Header.attributes["lod_levels"]`; without that exact entry, `level` keeps its §5.5 meaning and a reader never filters on it                                                              | §4.1, §4.4          |
-| 7   | Gate and index integrity                           | Header `lod_levels` is a canonical exclusive bound in `1..4294967296`; over-declaration is valid; every level is lower; indexed LOD entries carry `level`; readers store observed levels sparsely         | §4.2, §4.4, §9      |
-| 8   | LOD `keyframe-delta` vs the global tiling rule     | Header-gated LOD generalizes full tiling to sparse per-level runs; a pre-LOD reader cleanly refuses layouts with cross-level overlap or same-level gaps rather than silently mis-decoding                 | §3.5, §4.6, §5      |
-| 9   | Progressive SH vs scene-wide degree                | Every chunk stores the Header-declared complete band set; deliberate reads may select different contiguous caps, while accidental EOF drops short trailing chunks                                         | §3.3, §3.4, §10     |
-| 10  | What conformance compares and counts               | LOD/non-LOD variants compare decoded state, not container bytes; footprints include selected SH ranges; per-level gaussian counts use model-specific Header-count semantics over the whole file           | §10                 |
-| 11  | Identity across level unions                       | One-level ownership is source-aware encoder conformance for both models; `keyframe-delta` fixes every id to one level, keeps live ids unique and forbids reuse across all runs                            | §3.1, §3.5, §9, §10 |
+| #   | question                                           | ruling                                                                                                                                                                                                     | folded into         |
+| --- | -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- |
+| 1   | Chunk Index appended-field order vs keyframe-delta | keyframe-delta block first iff Header `temporal_model`; `level` next iff valid Header `lod_levels`; length only bounds/skips; **any third appender starts a presence-map suffix after both gated blocks**  | §4.2                |
+| 2   | Per-level quality metadata                         | Defer both key and record: no canonical omission metric or sparse string grammar is justified; transfer size remains index-derivable                                                                       | §3.2, §12.2         |
+| 3   | A network manifest                                 | Not added; the byte-range index suffices and a manifest breaks "one resource"                                                                                                                              | §8                  |
+| 4   | Additive levels vs replacement levels              | Additive; forward compatibility is incompatible with replacement                                                                                                                                           | §3.1, §5            |
+| 5   | Must every level cover the whole timeline          | No; only Header `lod_level0_complete` promises level 0: gap-free interval union for `gaussian-birth`, one full non-overlapping run for `keyframe-delta`                                                    | §3.5, §4.4, §9      |
+| 6   | How a reader knows `level` carries LOD importance  | Opt-in only via `Header.attributes["lod_levels"]`; without that exact entry, `level` keeps its §5.5 meaning and a reader never filters on it                                                               | §4.1, §4.4          |
+| 7   | Gate and index integrity                           | Header `lod_levels` is a canonical exclusive bound in `1..4294967296`; over-declaration is valid; every level is lower; indexed LOD entries carry `level`; readers store observed levels sparsely          | §4.2, §4.4, §9      |
+| 8   | LOD `keyframe-delta` vs the global tiling rule     | Header-gated LOD generalizes full tiling to sparse per-level runs; a pre-LOD reader cleanly refuses layouts with cross-level overlap or same-level gaps rather than silently mis-decoding                  | §3.5, §4.6, §5      |
+| 9   | Progressive SH vs scene-wide degree                | Every chunk stores the Header-declared complete band set; deliberate reads may select different contiguous caps, while accidental EOF drops short trailing chunks                                          | §3.3, §3.4, §10     |
+| 10  | What conformance compares and counts               | LOD/non-LOD variants compare decoded state, not container bytes; footprints include selected SH ranges; per-level gaussian counts use model-specific Header-count semantics over the whole file            | §10                 |
+| 11  | Identity across level unions                       | One-level ownership is source-aware encoder conformance for both models; `keyframe-delta` full-file validation fixes every id to one level and forbids reuse, while direct seeks check only fetched chains | §3.1, §3.5, §9, §10 |
 
 Rulings 3, 4 and 5 are the same judgement the existing specification makes everywhere — the format
 takes on the smaller thing. Ruling 3 declines a second representation of facts the index already
@@ -1129,9 +1157,9 @@ count-sized allocation; 8 defines sparse level-run validity and the honest scope
 compatibility. Ruling 9 preserves the normative scene-wide SH degree while keeping the existing
 per-band ranges useful for deliberate partial reads without weakening truncation recovery. Ruling 10
 makes byte and state consequences testable, and ruling 11 separates source-aware ownership from
-reader-checkable `keyframe-delta` identity while keeping that identity's entire history scene-wide.
-Rulings 1, 2, 6, 8, 9 and 11 carry the most implementation weight and are written up in full below
-or inline in §3.3/§3.5/§4.6.
+wire-checkable `keyframe-delta` identity while keeping whole-history checks in exhaustive validation
+so direct seeks remain range-bounded. Rulings 1, 2, 6, 8, 9 and 11 carry the most implementation
+weight and are written up in full below or inline in §3.3/§3.5/§4.6.
 
 ### 12.1 The Chunk Index appended-field order
 
