@@ -56,6 +56,9 @@ words:
   - coef
   - Shortley
   - Condon
+  # Level-of-detail vocabulary (proposal): the set-union and subset verbs
+  - unioned
+  - subsetting
   # Relighting extension seam (registry attribute ids 32-47, relightable profile)
   - albedo
   - metalness
