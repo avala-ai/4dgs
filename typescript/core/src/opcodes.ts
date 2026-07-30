@@ -25,6 +25,13 @@ export const Opcode = {
   Attachment: 0x0d,
   AttachmentIndex: 0x0e,
   SummaryOffset: 0x0f,
+  /**
+   * A keyframe-delta file's delta chunks. Deliberately not a flag on Chunk: a Chunk is
+   * independently decodable and a Delta Chunk is exactly the record that is not, so a
+   * reader that does not implement the model skips these rather than decoding bin
+   * differences as absolute positions.
+   */
+  DeltaChunk: 0x10,
   AudioSource: 0x11,
   AudioData: 0x12,
 } as const;
@@ -74,6 +81,12 @@ export const Attribute = {
   WindowIndex: 10,
   SourceGroup: 11,
   SourceIndex: 12,
+  /**
+   * Identity, required in every chunk of a `keyframe-delta` file and absent from a
+   * `gaussian-birth` one. Distinct from `SourceIndex`, which is a producer-side handle a
+   * reader may skip; this is what a delta names its gaussians by.
+   */
+  GaussianId: 13,
 } as const;
 
 /** Attribute ids every chunk must carry. */
