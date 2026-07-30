@@ -48,10 +48,11 @@ export function windowTableOrDefault(windows: Float64Array): Float64Array {
  * wrong in some way nobody has diagnosed — it turns a detectable fault into plausible
  * wrong output.
  */
-export function checkWindowIndex(index: number, windowCount: number): number {
+export function checkWindowIndex(index: number, windowCount: number, location?: string): number {
   if (index < 0 || index >= windowCount) {
     throw new MalformedFile(
-      `window index ${index} is outside the ${windowCount}-entry window table`,
+      `${location === undefined ? "" : `${location}: `}window index ${index} is outside the ` +
+        `${windowCount}-entry window table`,
     );
   }
   return index;
@@ -261,23 +262,36 @@ const CHUNK_COMPRESSION_IDS: ReadonlyMap<string, number> = new Map([
 ]);
 
 /**
- * A chunk's attribute streams, with any chunk-level compression undone.
+ * Undo any chunk-level compression over a records block, or return it unchanged.
  *
  * Compression is normally per stream and this field is empty, but the format allows a
- * codec over the whole records block. An unrecognized name is refused by name: the file
- * may be perfectly conforming and this build simply cannot read it, which is a different
- * problem from a corrupt one.
+ * codec over the whole block — a Chunk's streams (§5.5) or a Delta Chunk's three
+ * sub-blocks (§5.18), which behave identically. An unrecognized name is refused by name:
+ * the file may be perfectly conforming and this build simply cannot read it, which is a
+ * different problem from a corrupt one. `describe` names the record for the message.
  */
-export async function chunkStreamBytes(
-  chunk: ParsedChunk,
+export async function decompressChunkBlock(
+  block: Uint8Array,
+  compression: string,
+  uncompressedSize: number,
   codecs: CodecRegistry,
+  describe: string,
 ): Promise<Uint8Array> {
-  const { compression, uncompressedSize, t0 } = chunk.header;
-  if (compression === "") return chunk.streams;
+  if (compression === "") {
+    // `uncompressed_size` is the decoded block length (§5.5); with no codec the block is
+    // already decoded, so the two must agree — the same length the decompressor enforces
+    // on a compressed block, checked here rather than trusted.
+    if (uncompressedSize !== block.length) {
+      throw new MalformedFile(
+        `${describe} declares ${uncompressedSize} uncompressed bytes but carries ${block.length}`,
+      );
+    }
+    return block;
+  }
   const codec = CHUNK_COMPRESSION_IDS.get(compression);
   if (codec === undefined) {
     throw new UnsupportedCodec(
-      `chunk at t0=${t0} is compressed with "${compression}", which this build does not know`,
+      `${describe} is compressed with "${compression}", which this build does not know`,
     );
   }
   // The decompressor allocates its declared output in one call, so the declaration is
@@ -285,8 +299,23 @@ export async function chunkStreamBytes(
   // validated number until something has refused the absurd end of its range.
   if (uncompressedSize > MAX_STREAM_BYTES) {
     throw new MalformedFile(
-      `chunk at t0=${t0} declares ${uncompressedSize} uncompressed bytes, past the ${MAX_STREAM_BYTES} cap`,
+      `${describe} declares ${uncompressedSize} uncompressed bytes, past the ${MAX_STREAM_BYTES} cap`,
     );
   }
-  return decompressorFor(codec, codecs)(chunk.streams, uncompressedSize);
+  return decompressorFor(codec, codecs)(block, uncompressedSize);
+}
+
+/** A keyframe Chunk's attribute streams, with any chunk-level compression undone. */
+export async function chunkStreamBytes(
+  chunk: ParsedChunk,
+  codecs: CodecRegistry,
+): Promise<Uint8Array> {
+  const { compression, uncompressedSize, t0 } = chunk.header;
+  return decompressChunkBlock(
+    chunk.streams,
+    compression,
+    uncompressedSize,
+    codecs,
+    `chunk at t0=${t0}`,
+  );
 }
