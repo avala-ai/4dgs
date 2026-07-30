@@ -31,6 +31,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "data")
 INVALID = os.path.join(DATA, "invalid")
+KEYFRAME = os.path.join(DATA, "keyframe")
 CHECKSUMS = os.path.join(DATA, "CHECKSUMS.txt")
 sys.path.insert(0, os.path.join(HERE, "generator"))
 sys.path.insert(0, HERE)
@@ -40,6 +41,8 @@ import fourdgs
 import invalid
 import scenarios
 from canonical import canonical, summarize
+from fourdgs import keyframe_delta_file as kdf
+from fourdgs.keyframe_delta_writer import KeyframeDeltaOptions, Sample
 from fourdgs.object_layer import ObjectLayer
 from fourdgs.opcode import (
     COORDINATE_FRAME,
@@ -51,6 +54,8 @@ from fourdgs.opcode import (
 )
 from fourdgs.provenance import Provenance
 from fourdgs.records import (
+    DELTA_MODE_CHAINED,
+    DELTA_MODE_KEYFRAME,
     Attachment,
     CoordinateFrame,
     GeodeticAnchor,
@@ -280,6 +285,116 @@ def build_invalid() -> list[tuple[str, bytes, str]]:
     return out
 
 
+# --------------------------------------------------------------------------
+# keyframe-delta corpus
+# --------------------------------------------------------------------------
+#
+# A separate generation path, deliberately NOT folded into the `Scenario`/`FLAGS`
+# cross-product in `scenarios.py`: keyframe-delta is a whole-file temporal model with its
+# own writer (`write_sequence`) and its own canonical (`states_json`), not a flag on a
+# gaussian-birth file. Its variants are built here directly and folded into `write_corpus`
+# alongside the others, so the shared harness proves them for every SDK that decodes them.
+#
+# Every name carries `UseChunkIndex` so the indexed read path is exercised (run.py routes
+# decode_indexed on it), plus `UseCrc` and `UseStatistics` — all three are what
+# `write_sequence` emits by default, so the name states what the file actually contains.
+
+#: Seconds and sample count of the synthetic sequences. Eight samples over eight seconds is
+#: enough for a genuine chain — a keyframe then three deltas per group at cadence 4 — while
+#: keeping every file well under the corpus size cap.
+_KD_STEPS = 8
+_KD_DURATION = 8.0
+
+
+def _kd_gaussians(positions: list[list[float]]) -> fourdgs.GaussianSet:
+    """A population at one instant, finite sigma, one shared full-duration window.
+
+    Mirrors the shape `python/fourdgs/tests/test_keyframe_delta_file.py` builds: identity is
+    carried by the Sample, sigma_t is finite (so the per-gaussian velocity and birth-time
+    grids stay uniform, which is all this reference needs), and the validity window is the
+    whole clip.
+    """
+    n = len(positions)
+    return fourdgs.GaussianSet(
+        positions=np.asarray(positions, dtype=np.float32).reshape(n, 3),
+        scales=np.full((n, 3), 0.05, dtype=np.float32),
+        rotations=np.tile(np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32), (n, 1)),
+        colors=np.tile(np.array([0.6, 0.4, 0.2, 0.9], dtype=np.float32), (n, 1)),
+        motions=np.zeros((n, 3), dtype=np.float32),
+        mu_t=np.zeros(n, dtype=np.float32),
+        sigma_t=np.full(n, 100.0, dtype=np.float32),  # finite, effectively non-fading over the clip
+        win_lo=np.zeros(n, dtype=np.float32),
+        win_hi=np.full(n, _KD_DURATION, dtype=np.float32),
+    )
+
+
+def _kd_drift_sequence() -> list[Sample]:
+    """A fixed population of four gaussians that drifts. No births or deaths, so every
+    delta is a pure update — the plain keyframe-delta shape."""
+    samples = []
+    for i in range(_KD_STEPS):
+        base = [
+            [float(i) * 0.1, 0.0, 0.0],
+            [1.0, float(i) * 0.05, 0.0],
+            [0.0, 1.0, float(i) * 0.03],
+            [1.0, 1.0, 0.0],
+        ]
+        t0 = float(i) * (_KD_DURATION / _KD_STEPS)
+        samples.append(Sample(t0=t0, ids=np.array([0, 1, 2, 3]), gaussians=_kd_gaussians(base)))
+    return samples
+
+
+def _kd_churn_sequence() -> list[Sample]:
+    """A drifting population with one birth (id 4) and one death (id 2), so deltas carry
+    birth and death groups, not only updates."""
+    samples = []
+    for i in range(_KD_STEPS):
+        ids = [0, 1, 2, 3]
+        base = [[float(i) * 0.1, 0.0, 0.0], [1.0, float(i) * 0.05, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]]
+        if i >= 2:  # a birth
+            ids = [*ids, 4]
+            base = [*base, [2.0, 2.0, float(i) * 0.02]]
+        if i >= 5 and 2 in ids:  # a death of id 2
+            keep = [k for k in range(len(ids)) if ids[k] != 2]
+            ids = [ids[k] for k in keep]
+            base = [base[k] for k in keep]
+        t0 = float(i) * (_KD_DURATION / _KD_STEPS)
+        samples.append(Sample(t0=t0, ids=np.array(ids), gaussians=_kd_gaussians(base)))
+    return samples
+
+
+#: (name, sequence-builder, cadence, delta-mode). Four variants, each a distinct decode:
+#: every chunk a keyframe; chained pure-update deltas; chained deltas carrying births and
+#: deaths; and keyframe-referenced deltas.
+KEYFRAME_DELTA_VARIANTS = (
+    ("KeyframeOnly-UseChunkIndex-UseCrc-UseStatistics", _kd_churn_sequence, 1, DELTA_MODE_CHAINED),
+    ("KeyframeDelta-UseChunkIndex-UseCrc-UseStatistics", _kd_drift_sequence, 4, DELTA_MODE_CHAINED),
+    ("KeyframeDeltaChurn-UseChunkIndex-UseCrc-UseStatistics", _kd_churn_sequence, 4, DELTA_MODE_CHAINED),
+    ("KeyframeDeltaModesMixed-UseChunkIndex-UseCrc-UseStatistics", _kd_churn_sequence, 4, DELTA_MODE_KEYFRAME),
+)
+
+
+def build_keyframe_delta_corpus() -> list[tuple[str, bytes, str]]:
+    """Every keyframe-delta variant: `(name, bytes, expectation)`.
+
+    The expectation is the streamed decode's canonical `states` JSON — the reconstruction
+    at an instant that the whole model exists to make cheap, and the statement every SDK
+    that decodes the model is diffed against. Built here rather than in `scenarios.py` so
+    the shared cross-product stays untouched.
+    """
+    out: list[tuple[str, bytes, str]] = []
+    for name, sequence_of, keyframe_every, delta_mode in KEYFRAME_DELTA_VARIANTS:
+        data = kdf.write_sequence(
+            sequence_of(),
+            _KD_DURATION,
+            kd=KeyframeDeltaOptions(keyframe_every=keyframe_every, delta_mode=delta_mode),
+            library="4dgs conformance generator",
+        )
+        expectation = canonical(kdf.states_json(kdf.decode_streamed(data)))
+        out.append((name, data, expectation))
+    return out
+
+
 def _provenance(raw) -> Provenance | None:
     """Turn the generator's plain description into records.
 
@@ -335,6 +450,22 @@ def write_corpus(target: str) -> dict[str, str]:
             fh.write(expectation + "\n")
         checksums[name] = hashlib.sha256(data).hexdigest()
 
+    # keyframe-delta variants live in their own subdirectory, exactly as the invalid
+    # corpus does, and for the same structural reason: every whole-corpus consumer that
+    # is not the conformance harness — the fuzzer, the Kaitai grammar, the C++ named-list
+    # decode test — globs the top level of `data/` only, and each of those assumes the
+    # single gaussian-birth temporal model. A keyframe-delta file at the top level breaks
+    # them; under `keyframe/` it is invisible to them and visible to `run.py`, which is
+    # the one consumer that dispatches on the model.
+    keyframe_dir = os.path.join(target, "keyframe")
+    os.makedirs(keyframe_dir, exist_ok=True)
+    for name, data, expectation in build_keyframe_delta_corpus():
+        with open(os.path.join(keyframe_dir, f"{name}.4dgs"), "wb") as fh:
+            fh.write(data)
+        with open(os.path.join(keyframe_dir, f"{name}.json"), "w", encoding="utf-8") as fh:
+            fh.write(expectation + "\n")
+        checksums[f"keyframe/{name}"] = hashlib.sha256(data).hexdigest()
+
     invalid_dir = os.path.join(target, "invalid")
     os.makedirs(invalid_dir, exist_ok=True)
     for name, data, expectation in build_invalid():
@@ -377,7 +508,7 @@ def main(argv=None) -> int:
     checksums = write_corpus(DATA)
     total = sum(
         os.path.getsize(os.path.join(root, f))
-        for root in (DATA, INVALID)
+        for root in (DATA, INVALID, KEYFRAME)
         for f in os.listdir(root)
         if os.path.isfile(os.path.join(root, f))
     )
@@ -417,6 +548,8 @@ def _verify(checksums: dict[str, str]) -> bool:
         second[scenarios.variant_name(scenario, flags)] = hashlib.sha256(data).hexdigest()
     for name, data, _ in build_invalid():
         second[f"invalid/{name}"] = hashlib.sha256(data).hexdigest()
+    for name, data, _ in build_keyframe_delta_corpus():
+        second[f"keyframe/{name}"] = hashlib.sha256(data).hexdigest()
     for name, digest in checksums.items():
         if second.get(name) != digest:
             failures.append(f"{name}: encoder is not deterministic between runs")

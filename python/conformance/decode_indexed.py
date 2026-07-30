@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "..", "tests", "conformance"))
 
 import fourdgs
 from canonical import canonical, summarize
+from fourdgs import keyframe_delta_file as kdf
 from fourdgs.indexed_reader import (
     open_indexed,
     read_attachments,
@@ -33,7 +34,10 @@ from fourdgs.indexed_reader import (
     read_objects,
     read_provenance,
 )
+from fourdgs.opcode import HEADER
 from fourdgs.readable import FileReadable
+from fourdgs.records import Header
+from fourdgs.serialization import MAGIC, check_magic, iter_records
 
 UNSUPPORTED: frozenset[str] = frozenset()
 
@@ -42,6 +46,15 @@ def supports_variant(name: str) -> bool:
     # A file written without an index cannot be read this way. Declining is the correct
     # answer, not a failure — that is what supportsVariant is for.
     return "UseChunkIndex" in name
+
+
+def _temporal_model(data: bytes) -> str | None:
+    """The Header's temporal model, read without decoding the gaussians."""
+    check_magic(data)
+    for record in iter_records(data, len(MAGIC)):
+        if record.opcode == HEADER:
+            return Header.parse(record.content).temporal_model
+    return None
 
 
 class _Counting:
@@ -81,6 +94,16 @@ def _check_band_skipping(source, scene) -> None:
 
 
 def run(path: str) -> str:
+    with open(path, "rb") as fh:
+        data = fh.read()
+
+    if _temporal_model(data) == "keyframe-delta":
+        # The indexed path composes each instant by walking its chain (spec §11.8); its
+        # canonical states must match the streamed path's exactly. Its own runner asserts
+        # that agreement — here we emit the indexed decode so the harness diffs it against
+        # the same committed expectation the streamed runner is held to.
+        return canonical(kdf.states_json(kdf.decode_indexed(data)[0]))
+
     with FileReadable(path) as raw:
         source = _Counting(raw)
         scene = open_indexed(source)
