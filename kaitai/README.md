@@ -10,7 +10,7 @@ someone needs to look at a file and explain what they are seeing.
 It is also a second reader of the specification, in the same sense as the implementations: a grammar
 cannot be vague, so writing one down surfaces every place the prose left a choice. That is how the
 `aabb` field's type was found to be wrong in the text but right in every file
-([spec §12](../website/docs/spec/index.md#12-changelog)), and it is the reason to keep this file
+([spec §13](../website/docs/spec/index.md#13-changelog)), and it is the reason to keep this file
 current rather than treat it as documentation.
 
 One thing it says that the specification does not say plainly: the streams inside a Chunk are **not

@@ -229,6 +229,19 @@ map<string,string> attributes   -- free-form; see registry for well-known keys
 `flags` bit 0 is the **audio discovery rule**: a reader answers "does this scene have audio?" from
 the Header alone, with no further reads. See §7.
 
+`gaussian_count` is documented as "total across all chunks". Under `gaussian-birth` a file's
+gaussians are a set and this is that set's size. Under `keyframe-delta` (§11) chunks restate the
+same gaussians step by step, so a sum across chunks would count each of them many times and mean
+nothing; there, `gaussian_count` is **the number of distinct `gaussian_id` values in the file**.
+This is a reading of the field for a model that did not exist when it was written, not a change to
+what it means in any `gaussian-birth` file, and it is the field's only useful reading under either
+model.
+
+`temporal_model` is also the compatibility gate for the new model: a reader that does not implement
+`keyframe-delta` MUST refuse such a file and name the model, by the registry's standing rule, rather
+than skip the Delta Chunk records it does not recognize and silently decode the keyframes only —
+which is a subset of the scene, not a sanctioned fallback, and a reader MUST NOT rely on it.
+
 ### 5.2 Footer — opcode `0x02`
 
 ```
@@ -425,17 +438,37 @@ did before it stored them and is **not applied at decode**. See §6.5.
 
 ```
 f64  t0, t1
-u64  chunk_offset          -- byte offset of the Chunk record
+u64  chunk_offset          -- byte offset of the Chunk or Delta Chunk record
 u64  chunk_length
 u32  gaussian_count
 u32  band_count
      band_count × { u8 band; u64 offset; u64 length }
+--- appended for keyframe-delta (§11); absent on a version-1 file that carries no such fields ---
+u8   chunk_kind            -- 0 keyframe (a Chunk record), 1 delta (a Delta Chunk record)
+u8   delta_mode            -- 0 when chunk_kind is 0
+u64  reference_offset      -- 0 when chunk_kind is 0
+u64  keyframe_offset       -- this entry's own chunk_offset when chunk_kind is 0
+u16  depth                 -- 0 when chunk_kind is 0
+u64  live_count            -- gaussians live over [t0, t1), after composition
 ```
 
 Every offset and length here frames a **whole record**, opcode byte and content length included, so
 a reader fetches `[offset, offset + length)` and parses it exactly as it would parse that record
-mid-stream. That holds for `chunk_offset`/`chunk_length` and for each band's pair alike; there is no
-range in this record that points at a record's content rather than at the record.
+mid-stream. That holds for `chunk_offset`/`chunk_length` and for each band's pair alike, for a Delta
+Chunk (`0x10`) exactly as for a Chunk (`0x05`); there is no range in this record that points at a
+record's content rather than at the record.
+
+The six appended fields exist only for `keyframe-delta`, and appending them after the variable band
+array is legal by §4.2: a reader that knows only the earlier fields parses the band array, stops on
+`content_length`, and never sees them. They let a reader answer _which keyframe, which deltas, how
+many bytes_ **from the index alone**, without fetching a chunk to learn what it references. Four of
+them (`delta_mode`, `reference_offset`, `keyframe_offset`, `depth`) duplicate what the Delta Chunk
+record states; that is deliberate, and a reader MUST refuse a file where the index and the record
+disagree, naming the field, which turns the duplication into a cheap corruption check. `live_count`
+answers a question `gaussian_count` cannot: for a delta entry `gaussian_count` is
+`update_count + birth_count + death_count`, the size of the delta rather than of the population, and
+a reader budgeting a decode needs the population. Both numbers are useful and neither substitutes
+for the other, so the entry carries both.
 
 ### 5.9 Audio — opcode `0x09` (legacy)
 
@@ -917,6 +950,64 @@ descriptor's `data_length`. Each pair MUST appear before the first Chunk so an i
 frame every source and range-read its encoded bytes without fetching a gaussian chunk or the payload
 itself.
 
+### 5.18 Delta Chunk — opcode `0x10`
+
+A Delta Chunk carries the changes between a named **reference chunk** and itself. It exists only
+under `temporal_model = "keyframe-delta"` (§11); a `gaussian-birth` file never contains one. It is a
+distinct record rather than a flag on `Chunk` (`0x05`) because §5.5 says a Chunk is independently
+decodable and references no other chunk, and a delta chunk is precisely the record that does not
+have that property — so it must not be that record.
+
+```
+f64     t0, t1              -- the interval this composed state is valid over
+u32     level               -- producer's hierarchy level; informational only
+u8      delta_mode          -- 0 keyframe-referenced, 1 chained
+u64     reference_offset    -- byte offset of the record this delta applies to
+u64     keyframe_offset     -- byte offset of the Chunk record at the head of this GOP
+u16     depth               -- Delta Chunk records that must be composed, this one included
+u32     update_count
+u32     birth_count
+u32     death_count
+string  compression         -- codec applied to the block below, or ""
+u64     uncompressed_size
+bytes   records             -- decompresses to: bytes updates; bytes births; bytes deaths
+```
+
+`records` behaves exactly as §5.5's does: `compression` names a codec applied to the whole block,
+`uncompressed_size` is what it decompresses to, and a reader MUST honour it or refuse the file
+naming the codec. What it decompresses to is three `bytes`-framed sub-blocks, back to back, in the
+order `updates`, `births`, `deaths`. Each sub-block holds concatenated Attribute Stream structures
+(§5.6) — the same layout, the same decode pipeline, with nothing added.
+
+- **`updates`** — streams whose `element_count` is `update_count`. `gaussian_id` (id 13) is required
+  and names the touched gaussians. Every other stream present carries **bin differences** against
+  the reference state, aligned element-for-element with the id stream. A stream that is absent means
+  that attribute did not change for any gaussian in this chunk. `sigma_t`, `flags` and
+  `window_index` MUST be absent (§11.5); `rotation_index` and `rotation`, when present, are absolute
+  (§11.5).
+- **`births`** — streams whose `element_count` is `birth_count`, carrying **absolute** values: the
+  full required attribute set of a keyframe chunk, plus `gaussian_id`. A born gaussian's spherical
+  harmonics ride in SH Band Stream records (§5.7) following this Delta Chunk record, exactly as they
+  do for a Chunk.
+- **`deaths`** — exactly one stream: `gaussian_id`, `element_count` equal to `death_count`.
+
+The three sub-blocks are framed by length, not by a per-stream group byte, so `0x06` is unchanged
+and a reader can read the death list — which a consumer often wants alone — by skipping the first
+two lengths. **A reader MUST NOT dispatch on group by counting element counts:** the sub-block a
+stream sits in is what says which group it belongs to. `update_count`, `birth_count` and
+`death_count` are in the record header so a streamed reader can size its working set before
+decompressing, and so a stream whose `element_count` disagrees with its group's count is a refusal
+rather than an allocation.
+
+`delta_mode` selects the reference: `0` names the keyframe at the head of the GOP, `1` the state
+chunk immediately preceding this one. `reference_offset` MUST be strictly less than this record's
+own offset — references point backwards only — which is what makes the seek walk (§11.8) terminate
+and what makes any complete prefix of a truncated file self-consistent (§11.10). `depth` is the
+number of Delta Chunk records a reader composes to reconstruct this chunk's state, this one
+included; a keyframe-referenced delta has `depth` 1 regardless of how deep into the GOP it falls.
+`level` MUST equal the reference's `level`, and a reader MUST refuse a file where it does not,
+naming both (§11.6).
+
 ---
 
 ## 6. Gaussian attributes
@@ -1167,6 +1258,10 @@ timeline, the index degenerates to a single entry, and seeking costs the whole s
 stores and decodes correctly; it simply does not seek cheaply, and producers SHOULD say so in
 metadata rather than let a consumer discover it by fetching 100 MB.
 
+This rule is `gaussian-birth`'s. The `keyframe-delta` model (§11) imposes its partition rather than
+discovering it, so a seek there costs at most one group of pictures whatever the content does; its
+seek predicate and cost model are stated in §11.8.
+
 ---
 
 ## 9. Profiles
@@ -1212,7 +1307,245 @@ Declared here so implementers know the direction, **not implemented and not to b
 
 ---
 
-## 11. Converting other representations
+## 11. The keyframe-delta temporal model
+
+`gaussian-birth` (§3) gives every gaussian its own birth time, temporal width, linear velocity and
+validity window, and reconstructs any instant in closed form. It is a good fit for content fitted as
+a cloud of independently-lived gaussians, and an instant costs only the chunks whose interval
+contains it. It is a poor fit for content produced as a **sequence of states with correspondence
+between them** — a population that persists, moves and changes step by step, with gaussians entering
+and leaving. Such content imports into `gaussian-birth` always and correctly (§12), but the import
+discards the correspondence: every step restates every gaussian, and the file is a stack of
+independent frames.
+
+`keyframe-delta` is the model that keeps the correspondence. Everything it adds rides existing
+machinery: one new record (§5.18), an attribute id from the reserved range, six appended Chunk Index
+fields (§5.8), and registry values. It is a version-1 minor addition (§10): a `gaussian-birth` file
+is unaffected byte for byte, and a reader that does not implement the model refuses a
+`keyframe-delta` file cleanly, naming the model (§5.1).
+
+### 11.1 State chunks
+
+Under `keyframe-delta` the timeline is covered by **state chunks**, each valid over its own
+half-open interval `[t0, t1)`. A **keyframe chunk** carries the complete state of every gaussian
+live over its interval; it is an ordinary Chunk record (`0x05`), unchanged in every field, its
+attribute streams being the required version-1 set plus `gaussian_id`. A **delta chunk** carries the
+changes between a named reference chunk and itself; it is a Delta Chunk record (`0x10`, §5.18). A
+**group of pictures** (GOP) is a keyframe chunk and the run of delta chunks that reach it.
+
+**The state chunks tile the timeline.** Sorted by `t0`, each chunk's `t1` equals the next chunk's
+`t0`; the first `t0` is `0`; the last `t1` is the Header's `duration_sec`. A reader MUST refuse a
+file whose state chunks overlap or leave a gap, naming the two intervals. This is what makes the
+seek predicate (§11.8) a lookup rather than a search, and it is a real constraint — under
+`gaussian-birth` chunks may overlap freely, and here they may not.
+
+### 11.2 Identity — `gaussian_id`
+
+A delta names the gaussians it applies to, so gaussians need identity, and §6.1 forbids relying on
+their order in a stream. The model adds one attribute: **`gaussian_id`**, a `u32`, attribute id `13`
+from the reserved range. Every chunk of a `keyframe-delta` file carries it, and it is the only thing
+that ties a delta to the gaussian it changes.
+
+- Within one reconstructed state, ids are **unique**. A reader that finds a duplicate MUST refuse
+  the file, naming the id.
+- An id MUST NOT be reused after the gaussian carrying it dies. Reuse is representable and makes a
+  decoder's bookkeeping wrong in a way that looks like content, so it is forbidden.
+- Ids need not be dense, ordered, or start at zero. The id stream is delta-coded like any other and
+  pays for a chunk's reordering, not for the ids.
+
+`gaussian_id` is deliberately **not** attribute id 12, `source_index`, which is a producer-side
+stable id the registry describes as optional and skippable. The two coexist: `source_index` is a
+producer's own handle, `gaussian_id` is the format's.
+
+### 11.3 Reconstruction
+
+For scene time `t`, let `K, D1..Dd` be the chain for `t` (§11.8). The state is
+`compose(K, D1, …, Dd)`, where `compose` applies each delta in order to the state it references, and
+each delta applies as:
+
+```
+1. deaths   -- remove every id in the death set
+2. updates  -- for each id in the update set, replace the attributes the delta carries
+3. births   -- insert every id in the birth set, with the full state the delta carries
+```
+
+The order is normative because a chunk that both kills and creates would otherwise be ambiguous. An
+id MUST NOT appear in more than one of the three groups of the same chunk, and a reader MUST refuse
+a file where one does.
+
+The composed state `S` is a set of gaussians in exactly the state §3 describes — the same fields,
+the same types — and **§3's arithmetic then applies verbatim**. This model changes _where the state
+comes from_ and nothing about what the state means: a consumer's decode path still ends in §3's four
+lines, so no renderer or downstream tool forks for it.
+
+The one thing it asks of a producer is that `mu_t` carry the time the state was stated at. A
+keyframe chunk sets every gaussian's `mu_t` to its own `t0` — one constant stream (§5.6, `mode = 2`)
+costing a handful of bytes — and `center` then reads `position + motion * (t - t0)`. A gaussian that
+no delta touches keeps the `mu_t` of the chunk that last stated it and keeps extrapolating from
+there, exactly and at no cost. **Untouched means no bytes**, which is the property the whole model
+exists to buy.
+
+### 11.4 Chaining and `delta_mode`
+
+A delta's reference may be the GOP's keyframe or the chunk immediately before it, chosen per chunk
+by `delta_mode`: `0` keyframe-referenced (reference is the keyframe at the head of the GOP), `1`
+chained (reference is the state chunk immediately preceding). The usual reason to prefer
+keyframe-referencing is that chained deltas accumulate error; **here they do not, at any depth**
+(§11.7), because a delta is a difference of quantization bins rather than a quantization of a
+difference. The choice is therefore decided on cost: chained deltas are smaller and adjacent in the
+file, so a range reader coalesces a chain into one request; keyframe-referenced deltas are always
+two records but not adjacent, and the delta grows towards a full restatement by the end of a long
+GOP. Chained is the recommended default. The mode is per-chunk so an encoder can place a
+keyframe-referenced delta at a likely seek target — a chapter boundary, a shot cut, a loop start —
+and make that one instant cost two records however deep into the GOP it falls, without spending a
+whole keyframe on it. The chain walk (§11.8) handles both uniformly because it follows
+`reference_offset` rather than assuming a shape.
+
+### 11.5 What a delta may not change
+
+Four attributes are **GOP-invariant per gaussian**: a delta MUST NOT carry them in its update group,
+and a reader MUST refuse a file where one appears there.
+
+| attribute        | why                                                                 |
+| ---------------- | ------------------------------------------------------------------- |
+| `sigma_t`        | derives the per-gaussian grids for `motion` and `mu_t` (§6.3)       |
+| `flags`          | bit 0 selects which branch of both of those derivations runs        |
+| `window_index`   | feeds the velocity grid for a never-fading gaussian (§6.3)          |
+| `rotation_index` | selects which quaternion component the three stored bins are (§6.4) |
+
+The first three are the same rule three times: a difference of bins is only meaningful when both
+bins are on the same grid, and these values set the grid, so changing one mid-GOP would make a
+velocity delta a difference between bins on two grids — a number that decodes silently into a wrong
+velocity rather than into an error. `rotation_index` is a different failure with the same shape: the
+smallest-three coding omits the largest-magnitude component (§6.4), so the three stored bins mean
+different components before and after the largest component changes, and a rotating object crosses
+that boundary constantly. Rotation is therefore handled specially:
+
+**Rotation in a delta's update group is an absolute restatement, not a difference.** The update
+carries `rotation_index` and the three `rotation` bins as written, and they replace the previous
+ones outright. A producer that must change `sigma_t`, `flags` or `window_index` emits a death and a
+birth, or a keyframe. Both are representable; neither is silent.
+
+### 11.6 A delta's reference shares its `level`
+
+Both chunk records carry an informational `level` field. **A delta chunk's reference MUST have the
+same `level`**, and a reader MUST refuse a file where it does not, naming both levels. This is the
+weakest rule that keeps level-of-detail open: whether a GOP may mix levels, and how a reader chooses
+between levels, is undesigned here and belongs with the reserved spatial-subdivision work (§10.1).
+The rule exists because the alternative is not neutrality — without it, a delta at one level could
+reference a keyframe at another, and the meaning of that combination would be decided by whatever
+the first decoder did with it. Requiring the levels to match costs a producer nothing today and
+leaves every option open, because relaxing a rule is an append and tightening one is not.
+
+### 11.7 Error bounds
+
+The declared-bounds contract (§5.3) holds on the **reconstructed absolute state at every instant, at
+every depth. It is not on the delta.** The mechanism is one sentence: _a delta is a difference of
+bins, never a quantization of a difference._
+
+Let `s` be an attribute's grid pitch, `ε = s/2` its declared bound, and `q(x) = round(x / s)` the
+bin stored for true value `x`, so `|s·q(x) - x| ≤ ε` (§5.3). The keyframe stores `b₀ = q(x₀)`; delta
+`j` stores the integer `Δⱼ = q(xⱼ) - q(x_{j-1})`. A decoder composes `b_d = b₀ + Δ₁ + … + Δ_d`,
+which telescopes over integers to `q(x_d)` exactly, so `|s·b_d - x_d| ≤ ε` independent of `d`. The
+reconstructed bin is not an approximation of the bin the encoder would have written at that instant;
+it **is** that bin. This works because every stage after decompression is integer arithmetic (§5.6);
+the model needs the existing property to be true one level further out, and it is.
+
+Per attribute: position, colour, opacity, motion, `mu_t` and `time` compose by telescoping with
+their declared bounds unchanged (the `(g, r−g, b−g)` colour transform is exact in the integer domain
+and commutes with the difference); scale composes in the log domain, so a bin difference is a ratio
+and `scale_rel` holds unchanged (`sigma_t` is GOP-invariant under §11.5 and never composes);
+rotation is never composed at all (§11.5), so its bound is §6.4's applied once; and spherical
+harmonics are not delta-coded — a band's coefficients are `u8` stored as written (§6.5), so a
+gaussian's coefficients are fixed for its lifetime within a GOP and changing them needs a keyframe,
+or a death and a birth.
+
+**Representability.** Bins travel as `u8`/`u16`/`u32` symbols (§5.6), but a composed bin lives in
+the decoder's accumulator. **Composed bins are `i32`.** A writer MUST NOT emit a chain any of whose
+composed bins falls outside the signed 32-bit range, and a reader that detects one MUST refuse the
+file, naming the attribute, the `gaussian_id` and the chunk — not wrap, not saturate, because a
+wrapped position bin is a gaussian at a plausible wrong place, which is the failure the bounds
+contract exists to make impossible. `i32` is not tight for any real content (a millimetre grid spans
+about 2,000 km); it is stated so two decoders agree on where the boundary is.
+
+### 11.8 Seeking
+
+The seek predicate is answerable **from the index alone** (§5.8):
+
+```
+current(t) = the unique index entry with t0 <= t < t1            -- unique, by the tiling rule (§11.1)
+
+chain(t)   = [current(t)]
+             while chain[0].chunk_kind == delta:
+                 prepend the entry whose chunk_offset == chain[0].reference_offset
+
+reads(t)   = for every entry in chain(t): [chunk_offset, chunk_offset + chunk_length)
+             plus, for the wanted bands, each band's own range
+```
+
+Four rules a reader enforces make the walk safe: `reference_offset` is strictly less than the
+entry's own `chunk_offset`, so references point backwards only and the walk terminates; `chain(t)`
+has exactly `current(t).depth + 1` entries, and a reader that walks a different number MUST refuse,
+naming both; `chain(t)[0].chunk_kind` is keyframe and every entry's `keyframe_offset` equals its
+`chunk_offset`, and a chain that reaches the front of the file without a keyframe is a refusal; and
+the total byte cost of a seek is `sum(chunk_length)` over the chain, computable before any fetch.
+
+**`keyframe-delta` has no seek cliff, and that is its central claim.** Under `gaussian-birth`, seek
+cost is a property of the content (§8): content where every gaussian lives for the whole clip
+degenerates to one index entry and an instant costs the whole scene. Here a seek costs at most one
+GOP whatever the content does, because the partition is imposed by the encoder rather than
+discovered in the gaussians. The cost is stated with equal candour: a keyframe restates gaussians
+that did not change, so a clip of length `T` at cadence `T_gop` carries a floor of `T / T_gop` full
+restatements whether or not the scene moves. The knob is cadence; a producer who does not want the
+trade should keep using `gaussian-birth`. One further cost: a `keyframe-delta` streamed reader must
+hold the composed state and mutate it as deltas arrive, so its working set is one full population
+rather than one chunk.
+
+### 11.9 Failure modes a reader refuses
+
+Collected so a reader can check itself against a list. Every one names the offending value in its
+message.
+
+| condition                                               | why it is not repairable                                 |
+| ------------------------------------------------------- | -------------------------------------------------------- |
+| state chunks overlap or leave a gap                     | `current(t)` would not be unique                         |
+| `reference_offset` ≥ the entry's own `chunk_offset`     | a forward or self reference; the walk would not end      |
+| `reference_offset` names no entry in the index          | the chain is broken                                      |
+| walked chain length ≠ `depth + 1`                       | index and file disagree about the read cost              |
+| chain reaches the file's start without a keyframe       | no absolute state to compose onto                        |
+| index and Delta Chunk disagree on any duplicated field  | one of them is corrupt and there is no way to know which |
+| an update or death names an id that is not live         | there is no gaussian to change                           |
+| a birth names an id that is already live                | ids are unique within a state                            |
+| an id appears in two groups of one chunk                | the outcome would depend on application order            |
+| a duplicate id within one state                         | every later delta naming it is ambiguous                 |
+| `sigma_t`, `flags` or `window_index` in an update group | the per-gaussian grids would differ across the delta     |
+| a stream's `element_count` ≠ its group's declared count | the alignment between ids and values is unknown          |
+| a composed bin outside `i32`                            | wrapping produces a plausible wrong value                |
+| a delta's `level` differs from its reference's          | the combination has no defined meaning (§11.6)           |
+
+### 11.10 Truncation and recovery
+
+A streamed reader recovers every complete record before a cut and MUST NOT interpret a partial one.
+Because references point strictly backwards (§11.8), every chunk's reference arrived earlier in the
+file, so any complete prefix of records is a complete set of chains: a delta chunk that survived the
+cut has everything it needs, a cut mid-GOP loses only the tail of that GOP, and the last decodable
+instant is the `t1` of the last complete chunk. The trailing-band recovery applies unchanged to both
+kinds of chunk. Had references been allowed to point forwards, "keep the longest intact prefix"
+would have stopped being a valid recovery; the backward-reference rule is load-bearing here as well
+as in the seek walk.
+
+### 11.11 `frame-sequence` is subsumed
+
+A `keyframe-delta` file whose every chunk is a keyframe — cadence one, no delta chunks — is
+structurally what the reserved `frame-sequence` name describes: independent time steps with no
+correspondence between them. That shape is legal here. **One wire shape gets one implemented name:**
+`frame-sequence` is not separately defined, now or later. The registry keeps the row as a tombstone
+pointing at `keyframe-delta` at cadence one, so the reserved name is not freed and spent on
+something that is not the frame sequence anyone meant.
+
+---
+
+## 12. Converting other representations
 
 The reference implementation ships a converter for **sequences of standard 3D gaussian splat PLY
 frames**, the common interchange form.
@@ -1234,33 +1567,50 @@ evaluation cost.
 
 ---
 
-## 12. Changelog
+## 13. Changelog
 
 Corrections and clarifications to this document. A row here never changes what a conforming
 version-1 file looks like on the wire: where the text and the wire disagreed, the wire is the format
 and the text was the bug.
 
-| Change                                                                                                                          | Kind                      |
-| ------------------------------------------------------------------------------------------------------------------------------- | ------------------------- |
-| §5.1 Header `aabb` corrected from `f32[6]` to `f64[6]`, matching every file ever written                                        | correction                |
-| §5.3 named the `bounds` map's keys                                                                                              | clarification             |
-| §5.4 stated the reading of an absent or empty Window Table, and that an out-of-range index is refused                           | clarification, rule added |
-| §5.5 stated that a reader must honour a chunk's `compression`, and what `uncompressed_size` means                               | clarification             |
-| §5.7 stated that a band stream's `attribute_id` carries `0x07` and must not be dispatched on                                    | clarification             |
-| §5.8 stated that every offset and length in the index frames a whole record                                                     | clarification             |
-| §6.3 stated that `K` uses the Header's `cutoff` rather than the default                                                         | clarification             |
-| §6.5 added: spherical harmonic layout, whole degrees, and that `step_sh` is not applied at decode                               | clarification             |
-| §4.5 added: the summary is exactly Chunk Index, Statistics and Summary Offset, and is contiguous                                | rule added                |
-| §5.3 added: every quantization step and origin MUST be finite                                                                   | rule added                |
-| §5.5/§5.6 corrected: a chunk's streams are bare structures, not records, and `0x06` is not an opcode                            | correction                |
-| §5.13 stated that `0x0E` is reserved with no defined body, rather than sharing the Attachment's                                 | clarification             |
-| §5.2 named the terms of the 37-byte tail a seeking reader reads                                                                 | clarification             |
-| §5.15 added: Coordinate Frame `0x20`, Sensor Calibration `0x21`, Rig Trajectory `0x22` and Geodetic Anchor `0x23`, all optional | rule added                |
-| §5.15.2 added: a Coordinate Frame record supersedes the `coordinate_system` metadata key                                        | rule added                |
-| §6.5 added: a stored SH byte is the coefficient `-4 + b * 8 / 255`, on a fixed interval                                         | clarification, rule added |
-| §5.3/§6.5 added: per-band SH bit depths, appended to the Quantization record                                                    | rule added                |
-| Registry: reserved attribute ids 32–47 and the `relightable` profile for a future relighting extension; named, not defined      | reserved, rule added      |
-| §3/§5.15.6–§6.6 added: exact `object_id`, Object Table `0x24`, Object Track `0x25`, and base-then-track composition             | rule added                |
+| Change                                                                                                                                    | Kind                      |
+| ----------------------------------------------------------------------------------------------------------------------------------------- | ------------------------- |
+| §5.1 Header `aabb` corrected from `f32[6]` to `f64[6]`, matching every file ever written                                                  | correction                |
+| §5.3 named the `bounds` map's keys                                                                                                        | clarification             |
+| §5.4 stated the reading of an absent or empty Window Table, and that an out-of-range index is refused                                     | clarification, rule added |
+| §5.5 stated that a reader must honour a chunk's `compression`, and what `uncompressed_size` means                                         | clarification             |
+| §5.7 stated that a band stream's `attribute_id` carries `0x07` and must not be dispatched on                                              | clarification             |
+| §5.8 stated that every offset and length in the index frames a whole record                                                               | clarification             |
+| §6.3 stated that `K` uses the Header's `cutoff` rather than the default                                                                   | clarification             |
+| §6.5 added: spherical harmonic layout, whole degrees, and that `step_sh` is not applied at decode                                         | clarification             |
+| §4.5 added: the summary is exactly Chunk Index, Statistics and Summary Offset, and is contiguous                                          | rule added                |
+| §5.3 added: every quantization step and origin MUST be finite                                                                             | rule added                |
+| §5.5/§5.6 corrected: a chunk's streams are bare structures, not records, and `0x06` is not an opcode                                      | correction                |
+| §5.13 stated that `0x0E` is reserved with no defined body, rather than sharing the Attachment's                                           | clarification             |
+| §5.2 named the terms of the 37-byte tail a seeking reader reads                                                                           | clarification             |
+| §5.15 added: Coordinate Frame `0x20`, Sensor Calibration `0x21`, Rig Trajectory `0x22` and Geodetic Anchor `0x23`, all optional           | rule added                |
+| §5.15.2 added: a Coordinate Frame record supersedes the `coordinate_system` metadata key                                                  | rule added                |
+| §6.5 added: a stored SH byte is the coefficient `-4 + b * 8 / 255`, on a fixed interval                                                   | clarification, rule added |
+| §5.3/§6.5 added: per-band SH bit depths, appended to the Quantization record                                                              | rule added                |
+| Registry: reserved attribute ids 32–47 and the `relightable` profile for a future relighting extension; named, not defined                | reserved, rule added      |
+| §3/§5.15.6–§6.6 added: exact `object_id`, Object Table `0x24`, Object Track `0x25`, and base-then-track composition                       | rule added                |
+| §11/§5.18/§5.8 added: the `keyframe-delta` temporal model, Delta Chunk `0x10`, `gaussian_id` (id 13), and six appended Chunk Index fields | rule added                |
+
+The keyframe-delta row is additive and changes no existing file. `temporal_model` gains a value,
+opcode `0x10` was unassigned, attribute id `13` was reserved, and the six Chunk Index fields append
+after the variable band array where §4.2 already permits a reader to stop. A `gaussian-birth` file
+carries none of these — no Delta Chunk, no `gaussian_id`, no appended index fields — and is
+byte-identical to the file it was before the model existed; all conformance variants that predate
+the model are untouched and must remain byte-identical, which the suite proves mechanically. The
+gate for an old reader is `temporal_model`: a version-1 reader that does not implement the model
+refuses a `keyframe-delta` file and names the model (§5.1), which is "unknown but legal" rather than
+"malformed". Header `flags` bit 2 was **not** spent to signal delta coding, deliberately — a
+reserved bit would make an old reader report the file malformed, when it is well-formed and the
+reader is old — so bits 2–7 stay reserved and a `keyframe-delta` writer leaves them 0. The model
+subsumes the reserved `frame-sequence` shape (§11.11) at cadence one; that registry row becomes a
+tombstone rather than being freed. The design was written at wire precision as an accepted proposal,
+reviewed against one implementation built from the document alone, and folded into this document as
+it landed.
 
 The object-layer row is additive and changes no existing file. Attribute id `14` and opcodes
 `0x24`/`0x25` were reserved and unemitted; a file that carries none of them is byte-identical to the
