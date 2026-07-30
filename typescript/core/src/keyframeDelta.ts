@@ -789,10 +789,18 @@ export interface Interval {
 }
 
 /**
- * State chunks tile the timeline: no overlap, no gap, and — when `durationSec` is given —
- * the first `t0` is `0` and the last `t1` is `duration_sec` (spec §11.1). This is what
- * makes the seek predicate a lookup rather than a search, and it is checked on both read
- * paths so a hole is refused whichever way the file is read.
+ * State chunks tile the timeline: sorted by `t0`, each chunk's `t1` is the next chunk's
+ * `t0` — no overlap, no gap (spec §11.1). This is what makes the seek predicate a lookup
+ * rather than a search, and it is checked on both read paths so a hole is refused whichever
+ * way the file is read.
+ *
+ * It deliberately does NOT require the last chunk to reach `duration_sec`: that is the
+ * reference contract (`keyframe_delta.check_tiling` checks adjacency only), and it is what
+ * keeps a streamed reader usable on a complete prefix of a truncated file — the Header still
+ * names the whole clip's duration, but every record before the cut is decodable and the last
+ * decodable instant is simply the last complete chunk's `t1` (spec §11.10). `durationSec` is
+ * accepted only to reject the degenerate case of a file that declares a duration but carries
+ * no state chunks at all, which would otherwise reconstruct from an undefined covering chunk.
  */
 export function checkTiling(intervals: readonly Interval[], durationSec?: number): void {
   const ordered = [...intervals].sort((a, b) => a.t0 - b.t0);
@@ -809,24 +817,8 @@ export function checkTiling(intervals: readonly Interval[], durationSec?: number
   }
   if (durationSec !== undefined && ordered.length === 0) {
     throw new MalformedFile(
-      `a keyframe-delta file declares duration_sec ${durationSec} but carries no state chunks; ` +
-        `the timeline [0, duration_sec) is uncovered`,
+      `a keyframe-delta file declares duration_sec ${durationSec} but carries no state chunks`,
     );
-  }
-  if (durationSec !== undefined && ordered.length > 0) {
-    const first = ordered[0]!;
-    const last = ordered[ordered.length - 1]!;
-    if (first.t0 !== 0) {
-      throw new MalformedFile(
-        `the first state chunk starts at ${first.t0}, not 0; the timeline must cover ` +
-          `[0, duration_sec)`,
-      );
-    }
-    if (last.t1 !== durationSec) {
-      throw new MalformedFile(
-        `the last state chunk ends at ${last.t1}, not the Header's duration_sec ${durationSec}`,
-      );
-    }
   }
 }
 

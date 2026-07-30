@@ -278,14 +278,30 @@ test("decompressChunkBlock passes an empty codec through and refuses an unknown 
 
 // --- full-timeline tiling (codex P2 §11.1) --------------------------------
 
-test("checkTiling refuses a gap, an overlap, and an uncovered timeline", () => {
+test("checkTiling refuses a gap, an overlap, and an all-empty timeline", () => {
   const at = (t0: number, t1: number) => ({ t0, t1 });
   assert.throws(() => checkTiling([at(0, 1), at(2, 3)]), MalformedFile); // gap
   assert.throws(() => checkTiling([at(0, 2), at(1, 3)]), MalformedFile); // overlap
-  assert.throws(() => checkTiling([at(0.5, 1)], 1), MalformedFile); // first t0 != 0
-  assert.throws(() => checkTiling([at(0, 1)], 2), MalformedFile); // last t1 != duration
-  assert.throws(() => checkTiling([], 1), MalformedFile); // positive duration, no chunks
+  assert.throws(() => checkTiling([], 1), MalformedFile); // duration but no chunks
   checkTiling([at(0, 1), at(1, 2)], 2); // complete: no throw
+  // Adjacency-only, like the reference: a complete PREFIX whose last chunk stops short of
+  // duration_sec is tolerated, so a streamed reader stays usable on a truncated file (§11.10).
+  checkTiling([at(0, 1)], 2); // prefix ends before duration: no throw
+});
+
+test("a streamed decode reads a complete prefix that stops short of duration_sec", async () => {
+  const data = bytes(MOVING_CHAINED);
+  const { sequence, index } = await decodeKeyframeDeltaIndexed(data);
+  assert.ok(index.length >= 3, "fixture has several chunks");
+  // Cut the file at the end of the second chunk record — before the index and Footer — so
+  // the streamed reader sees Header/Quantization/Window Table and the first two chunks only.
+  const cut = index[1]!.chunkOffset + index[1]!.chunkLength;
+  const prefix = data.slice(0, cut);
+  const decoded = await decodeKeyframeDeltaStreamed(prefix);
+  assert.equal(decoded.chunks.length, 2);
+  assert.ok(decoded.chunks[decoded.chunks.length - 1]!.t1 < sequence.header.durationSec);
+  // And it reconstructs, rather than refusing the short tiling.
+  assert.ok((keyframeDeltaStatesJson(decoded).states as unknown[]).length > 0);
 });
 
 // --- Delta Chunk header refusals, by mutating a valid file ----------------
