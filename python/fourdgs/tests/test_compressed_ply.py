@@ -258,6 +258,18 @@ def test_segmented_import_requires_a_duration(tmp_path):
         import_scene(paths)
 
 
+@pytest.mark.parametrize("segment_duration", [0.0, -1.0, float("nan"), float("inf"), float("-inf")])
+def test_segmented_import_rejects_invalid_durations(tmp_path, segment_duration):
+    paths = []
+    for k in range(2):
+        q = tmp_path / f"{k}.ply"
+        q.write_bytes(build_ply(temporal=True, count=1))
+        paths.append(str(q))
+
+    with pytest.raises(ValueError, match="finite and strictly positive"):
+        import_scene(paths, segment_duration=segment_duration)
+
+
 def test_sh_conventions_collapse_to_the_same_byte():
     """Carrying SH bytes across verbatim is exact, and this is why.
 

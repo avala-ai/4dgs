@@ -8,13 +8,12 @@ All notable changes to the Python package are documented here, following
 
 ### Fixed
 
-- **Chunk-compressed PLY segment fidelity.** Segmented imports now retain every
-  source gaussian and use the `.4dgs` validity window—not temporal-center
-  filtering—to reproduce which segment is active. Gaussians centred outside a
-  segment can still overlap it through their temporal extent, while the
-  source format's static and always-visible sentinel bands are normalized to
-  fixed motion and infinite temporal extent. The previous filter could remove
-  visible support and persistent background from converted scenes.
+- **Chunk-compressed PLY segment fidelity.** Segmented imports now retain every source gaussian and
+  use the `.4dgs` validity window—not temporal-center filtering—to reproduce which segment is
+  active. Gaussians centred outside a segment can still overlap it through their temporal extent,
+  while the source format's static and always-visible sentinel bands are normalized to fixed motion
+  and infinite temporal extent. The previous filter could remove visible support and persistent
+  background from converted scenes.
 
 ## [0.2.0] - 2026-07-29
 

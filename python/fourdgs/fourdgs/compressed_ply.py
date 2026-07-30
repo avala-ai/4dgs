@@ -380,9 +380,14 @@ def import_scene(paths: list[str], *, segment_duration: float | None = None) -> 
     if not paths:
         raise ValueError("import_scene needs at least one file")
     segmented = len(paths) > 1
-    if segmented and not segment_duration:
-        raise ValueError("segment_duration is required to place multiple segments on a shared timeline")
-    span_sec = float(segment_duration) if segment_duration else 0.0
+    if segmented:
+        if segment_duration is None:
+            raise ValueError("segment_duration is required to place multiple segments on a shared timeline")
+        span_sec = float(segment_duration)
+        if not np.isfinite(span_sec) or span_sec <= 0.0:
+            raise ValueError("segment_duration must be finite and strictly positive")
+    else:
+        span_sec = 0.0
 
     parts: list[dict] = []
     sh_degrees: set[int] = set()
