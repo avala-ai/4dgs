@@ -16,22 +16,30 @@ import { test } from "node:test";
 
 import {
   type BinColumn,
+  type Grids,
   type Group,
   type State,
   Attribute,
   MalformedFile,
+  UnsupportedCodec,
   applyDelta,
   chainFor,
   checkTiling,
   decodeKeyframeDeltaIndexed,
   decodeKeyframeDeltaStreamed,
+  decompressChunkBlock,
+  DEFAULT_CODECS,
   gridsFor,
   keyframeState,
+  lifeClass,
+  motionStep,
   reconstructAt,
   stateCount,
+  supportK,
 } from "@4dgs/core";
 
 import { canonical } from "./canonical.js";
+import { deflate } from "./testing.js";
 import { KEYFRAME_DELTA_FIXTURES } from "./keyframeDelta.fixture.js";
 import { keyframeDeltaStates } from "./keyframeDeltaCanonical.js";
 
@@ -374,3 +382,148 @@ function gaussianBirthHeaderFile(): Uint8Array {
   const header = [0x01, ...u64(body.length), ...body];
   return new Uint8Array([...magic, ...header]);
 }
+
+// --- chunk-level compression (codex P1 §5.5/§5.18) ------------------------
+
+test("decompressChunkBlock undoes chunk-level compression before framing", async () => {
+  const payload = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+
+  // Empty compression is a pass-through: the block is already the streams.
+  const passthrough = await decompressChunkBlock(payload, "", payload.length, DEFAULT_CODECS, "x");
+  assert.deepEqual([...passthrough], [...payload]);
+
+  // A deflate-compressed block is inflated to exactly its declared size — the path a
+  // compressed keyframe or Delta Chunk now takes before its streams are framed.
+  const compressed = await deflate(payload);
+  const restored = await decompressChunkBlock(
+    compressed,
+    "deflate",
+    payload.length,
+    DEFAULT_CODECS,
+    "x",
+  );
+  assert.deepEqual([...restored], [...payload]);
+
+  // An unrecognized codec is refused by name — the file may be conforming and this build
+  // simply cannot read it.
+  await assert.rejects(
+    () => decompressChunkBlock(compressed, "brotli", payload.length, DEFAULT_CODECS, "delta chunk"),
+    (e: unknown) => e instanceof UnsupportedCodec,
+  );
+});
+
+// --- per-gaussian velocity precision (codex P1 §6.3) ----------------------
+
+test("motion precision follows each gaussian's own validity window, not window 0", () => {
+  const steps = {
+    pos: 0.001,
+    scaleLog: 0.01,
+    rot: 0.001,
+    rgb: 0.01,
+    alpha: 0.01,
+    motion: 0.01,
+    time: 0.01,
+    sigmaLog: 0.01,
+    sh: 8,
+  };
+  // Two windows: a long window 0 and a short window 1. One always-visible gaussian
+  // (flags bit 0 set) references window 1, so its velocity grid must come from window 1's
+  // 0.02 s length, not window 0's 4 s.
+  const windows = new Float64Array([0, 4, 0, 0.02]);
+  const grids: Grids = { steps, origin: [0, 0, 0], windows, cutoff: 0.05 };
+
+  const c1 = (v: number): BinColumn => ({ values: new Int32Array([v]), channels: 1 });
+  const c3 = (a: number, b: number, d: number): BinColumn => ({
+    values: new Int32Array([a, b, d]),
+    channels: 3,
+  });
+  const motionBinX = 10;
+  const state = keyframeState(
+    new Int32Array([0]),
+    new Map<number, BinColumn>([
+      [Attribute.Position, c3(0, 0, 0)],
+      [Attribute.Scale, c3(0, 0, 0)],
+      [Attribute.RotationIndex, c1(3)],
+      [Attribute.Rotation, c3(0, 0, 0)],
+      [Attribute.Color, c3(0, 0, 0)],
+      [Attribute.Opacity, c1(0)],
+      [Attribute.Motion, c3(motionBinX, 0, 0)],
+      [Attribute.MuT, c1(0)],
+      [Attribute.SigmaT, c1(0)],
+      [Attribute.Flags, c1(1)], // never fades
+      [Attribute.WindowIndex, c1(1)], // references window 1
+    ]),
+  );
+
+  const r = reconstructAt(state, grids, 1);
+  const k = supportK(0.05);
+  const stepForWindow = (len: number): number =>
+    motionStep(lifeClass(0, steps.sigmaLog, true, len, k), steps.motion);
+  // The reconstructed x is `motionBinX * step(window 1)`, and demonstrably not the value a
+  // shared window-0 pitch would give.
+  assert.equal(r.centers[0], motionBinX * stepForWindow(0.02));
+  assert.notEqual(stepForWindow(0.02), stepForWindow(4));
+  assert.notEqual(r.centers[0], motionBinX * stepForWindow(4));
+});
+
+test("an out-of-range window index is refused, not clamped", () => {
+  const steps = {
+    pos: 1,
+    scaleLog: 1,
+    rot: 1,
+    rgb: 1,
+    alpha: 1,
+    motion: 1,
+    time: 1,
+    sigmaLog: 1,
+    sh: 8,
+  };
+  const grids: Grids = {
+    steps,
+    origin: [0, 0, 0],
+    windows: new Float64Array([0, 1]),
+    cutoff: 0.05,
+  };
+  const c1 = (v: number): BinColumn => ({ values: new Int32Array([v]), channels: 1 });
+  const c3 = (): BinColumn => ({ values: new Int32Array([0, 0, 0]), channels: 3 });
+  const state = keyframeState(
+    new Int32Array([0]),
+    new Map<number, BinColumn>([
+      [Attribute.Position, c3()],
+      [Attribute.Scale, c3()],
+      [Attribute.RotationIndex, c1(3)],
+      [Attribute.Rotation, c3()],
+      [Attribute.Color, c3()],
+      [Attribute.Opacity, c1(0)],
+      [Attribute.Motion, c3()],
+      [Attribute.MuT, c1(0)],
+      [Attribute.SigmaT, c1(0)],
+      [Attribute.Flags, c1(1)],
+      [Attribute.WindowIndex, c1(5)], // only window 0 exists
+    ]),
+  );
+  assert.throws(() => reconstructAt(state, grids, 0.5), MalformedFile);
+});
+
+// --- index/record cross-check on seek (codex P2 §5.8/§11.9) ---------------
+
+test("indexed decode refuses a Delta Chunk header that disagrees with its index entry", async () => {
+  const data = bytes(KEYFRAME_DELTA_FIXTURES.find((f) => f.name === "moving-chained")!.base64);
+  const { index } = await decodeKeyframeDeltaIndexed(data);
+  const delta = index.find((e) => e.kind === 1)!;
+  assert.ok(delta, "fixture has at least one delta chunk");
+
+  // Corrupt the Delta Chunk header's depth so it disagrees with the (unchanged) index
+  // depth. The chain walk uses the index, so it still composes; the cross-check is what
+  // must catch the disagreement. depth sits at content offset 8+8+4+1+8+8 = 37, after the
+  // record's 9-byte framing.
+  const mutated = data.slice();
+  const view = new DataView(mutated.buffer, mutated.byteOffset, mutated.byteLength);
+  const depthOffset = delta.chunkOffset + 9 + 37;
+  view.setUint16(depthOffset, view.getUint16(depthOffset, true) + 7, true);
+
+  await assert.rejects(
+    () => decodeKeyframeDeltaIndexed(mutated),
+    (e: unknown) => e instanceof MalformedFile && e.code === "index-record-mismatch",
+  );
+});

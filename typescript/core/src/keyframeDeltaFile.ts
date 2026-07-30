@@ -19,6 +19,12 @@
  * number, by the same arithmetic §3/§6 give a keyframe chunk.
  */
 
+import {
+  checkWindowIndex,
+  chunkStreamBytes,
+  decompressChunkBlock,
+  windowTableOrDefault,
+} from "./chunk.js";
 import { type CodecRegistry, DEFAULT_CODECS } from "./codec.js";
 import { Cursor } from "./cursor.js";
 import { MalformedFile } from "./errors.js";
@@ -41,11 +47,13 @@ import {
   muStep,
   rctInverse,
   type Steps,
+  supportK,
 } from "./quantization.js";
 import {
   type ChunkIndexEntry,
   checkMagic,
   type DeltaChunkHeader,
+  frameDeltaGroups,
   type Header,
   iterateRecords,
   MAGIC,
@@ -60,7 +68,6 @@ import {
   readRecord,
 } from "./records.js";
 import { frameStreams, decodeStream } from "./streams.js";
-import { supportK } from "./quantization.js";
 
 /** One decoded state chunk and the composed population valid over `[t0, t1)`. */
 export interface ChunkInfo {
@@ -82,8 +89,12 @@ export interface ChunkInfo {
 export interface Grids {
   readonly steps: Steps;
   readonly origin: readonly number[];
-  /** The single validity window `[lo, hi]` every gaussian references (spec §11 reference writer). */
-  readonly window: readonly [number, number];
+  /**
+   * The whole Window Table as flattened `[lo, hi]` pairs. A never-fading gaussian's
+   * velocity precision is derived from its own `window_index`'s length (spec §6.3), so the
+   * full table is kept and indexed per gaussian rather than collapsed to one window.
+   */
+  readonly windows: Float64Array;
   readonly cutoff: number;
 }
 
@@ -107,9 +118,12 @@ export function gridsFor(decoded: DecodedSequence): Grids {
     sigmaLog: q.stepSigmaLog,
     sh: q.stepSh,
   };
-  const window: [number, number] =
-    decoded.windows.length >= 2 ? [decoded.windows[0]!, decoded.windows[1]!] : [0, 0];
-  return { steps, origin: q.posOrigin, window, cutoff: decoded.header.cutoff };
+  return {
+    steps,
+    origin: q.posOrigin,
+    windows: windowTableOrDefault(decoded.windows),
+    cutoff: decoded.header.cutoff,
+  };
 }
 
 /** One length-framed sub-block: its ids, and a bin column per other attribute. */
@@ -137,8 +151,13 @@ async function decodeGroup(streamBytes: Uint8Array, codecs: CodecRegistry): Prom
 
 /** A keyframe chunk's ids and bins, with the required attribute set enforced. */
 async function keyframeFromChunk(content: Uint8Array, codecs: CodecRegistry): Promise<State> {
-  const { header, streams } = parseChunk(content);
+  const parsed = parseChunk(content);
+  // Undo any chunk-level compression (spec §5.5) before framing the streams, exactly as
+  // the gaussian-birth chunk path does; a compressed keyframe would otherwise decode the
+  // codec's output as attribute-stream headers.
+  const streams = await chunkStreamBytes(parsed, codecs);
   const group = await decodeGroup(streams, codecs);
+  const header = parsed.header;
   if (header.count > 0) {
     const missing = REQUIRED_ATTRIBUTES.filter((id) => !group.bins.has(id));
     if (missing.length > 0) {
@@ -155,7 +174,17 @@ async function composeDelta(
   content: Uint8Array,
   codecs: CodecRegistry,
 ): Promise<{ state: State; header: DeltaChunkHeader }> {
-  const { header, updates, births, deaths } = parseDeltaChunk(content);
+  const { header, records } = parseDeltaChunk(content);
+  // Undo any chunk-level compression over the whole records block before framing its three
+  // sub-blocks (spec §5.18); a compressed delta would otherwise frame the codec's output.
+  const block = await decompressChunkBlock(
+    records,
+    header.compression,
+    header.uncompressedSize,
+    codecs,
+    `delta chunk at t0=${header.t0}`,
+  );
+  const { updates, births, deaths } = frameDeltaGroups(block);
   const updateGroup = updates.length === 0 ? emptyGroup() : await decodeGroup(updates, codecs);
   const birthGroup = births.length === 0 ? emptyGroup() : await decodeGroup(births, codecs);
   const deathIds =
@@ -316,6 +345,12 @@ export async function decodeKeyframeDeltaIndexed(
       const head = parseDeltaChunk(
         recordContentAt(data, entry.chunkOffset, entry.chunkLength),
       ).header;
+      // The index duplicates four of the Delta Chunk header's fields (spec §5.8); a reader
+      // MUST refuse a file where they disagree, because the chain was selected from the
+      // index's reference_offset/depth while the record composed here is the header's, and
+      // a mismatch applies a delta meant for a different reference — plausible wrong state
+      // rather than an error (spec §11.9). Cross-check on this second parse.
+      checkIndexAgreesWithHeader(entry, head);
       updateCount = head.updateCount;
       birthCount = head.birthCount;
       deathCount = head.deathCount;
@@ -358,6 +393,32 @@ async function composeChain(
   return state;
 }
 
+/**
+ * Refuse a Delta Chunk whose header disagrees with the index entry that pointed at it
+ * (spec §5.8, §11.9). The four duplicated fields are the ones a seek is decided on, so a
+ * disagreement means the chain and the record are two different intents and there is no
+ * way to know which is right — the message names both.
+ */
+function checkIndexAgreesWithHeader(entry: ChunkIndexEntry, head: DeltaChunkHeader): void {
+  const fields: readonly [string, number, number][] = [
+    ["t0", entry.t0, head.t0],
+    ["t1", entry.t1, head.t1],
+    ["delta_mode", entry.deltaMode, head.deltaMode],
+    ["reference_offset", entry.referenceOffset, head.referenceOffset],
+    ["keyframe_offset", entry.keyframeOffset, head.keyframeOffset],
+    ["depth", entry.depth, head.depth],
+  ];
+  for (const [name, indexValue, headerValue] of fields) {
+    if (indexValue !== headerValue) {
+      throw new MalformedFile(
+        `the Chunk Index entry at offset ${entry.chunkOffset} says ${name}=${indexValue}, but the ` +
+          `Delta Chunk it points at says ${name}=${headerValue}; the index and the record disagree`,
+        "index-record-mismatch",
+      );
+    }
+  }
+}
+
 // --------------------------------------------------------------------------
 // Reconstruction — the composed bins as float gaussian state (spec §3/§6)
 // --------------------------------------------------------------------------
@@ -394,7 +455,7 @@ export function reconstructAt(state: State, grids: Grids, t: number): Reconstruc
 
   const { steps, origin } = grids;
   const k = supportK(grids.cutoff);
-  const windowLength = grids.window[1] - grids.window[0];
+  const windowCount = grids.windows.length >>> 1;
 
   const position = state.bins.get(Attribute.Position)!;
   const scaleCol = state.bins.get(Attribute.Scale)!;
@@ -406,6 +467,7 @@ export function reconstructAt(state: State, grids: Grids, t: number): Reconstruc
   const muCol = state.bins.get(Attribute.MuT)!;
   const sigmaCol = state.bins.get(Attribute.SigmaT)!;
   const flagCol = state.bins.get(Attribute.Flags)!;
+  const windowCol = state.bins.get(Attribute.WindowIndex)!;
 
   const rotationScratch = new Float32Array(4);
 
@@ -416,6 +478,12 @@ export function reconstructAt(state: State, grids: Grids, t: number): Reconstruc
     const sigmaBin = sigmaCol.values[i]!;
     const neverFades = (flagCol.values[i]! & 1) !== 0;
     const sigma = neverFades ? Infinity : Math.exp(sigmaBin * steps.sigmaLog);
+    // A never-fading gaussian's velocity precision comes from the length of *its own*
+    // validity window (spec §6.3), so the pitch is derived per gaussian from its
+    // window_index rather than from a single shared window; an out-of-range index is
+    // refused, not clamped.
+    const windowIndex = checkWindowIndex(windowCol.values[i]!, windowCount);
+    const windowLength = grids.windows[windowIndex * 2 + 1]! - grids.windows[windowIndex * 2]!;
     const mStep = motionStep(
       lifeClass(sigmaBin, steps.sigmaLog, neverFades, windowLength, k),
       steps.motion,

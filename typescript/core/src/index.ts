@@ -67,7 +67,9 @@ export {
   VERSION,
   type Attachment,
   type DeltaChunkHeader,
+  type DeltaGroups,
   type ParsedDeltaChunk,
+  frameDeltaGroups,
   type AudioTrack,
   type AudioData,
   type AudioSource,
@@ -159,6 +161,7 @@ export {
   chunkStreamBytes,
   checkWindowIndex,
   decodeChunkStreams,
+  decompressChunkBlock,
   stepsFrom,
   windowTableOrDefault,
 } from "./chunk.js";

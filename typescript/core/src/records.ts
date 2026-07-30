@@ -363,21 +363,23 @@ export interface DeltaChunkHeader {
 
 export interface ParsedDeltaChunk {
   readonly header: DeltaChunkHeader;
-  /** The three length-framed sub-blocks, still compressed per stream, in wire order. */
+  /**
+   * The records blob, exactly as `parseChunk` returns a keyframe's `streams`: still under
+   * whatever `header.compression` names. A caller undoes that (honouring
+   * `uncompressedSize`) and then frames the three sub-blocks with {@link frameDeltaGroups},
+   * so chunk-level compression is handled the same way for both kinds of chunk (§5.18).
+   */
+  readonly records: Uint8Array;
+}
+
+/** A Delta Chunk record's three length-framed sub-blocks, updates then births then deaths. */
+export interface DeltaGroups {
   readonly updates: Uint8Array;
   readonly births: Uint8Array;
   readonly deaths: Uint8Array;
 }
 
-/**
- * A Delta Chunk record (opcode `0x10`, spec §5.18).
- *
- * The `records` blob decompresses to three `bytes`-framed sub-blocks — updates, births,
- * deaths — each a run of concatenated Attribute Stream structures. Chunk-level
- * compression over the whole block is honoured by {@link parseDeltaChunk}'s caller, which
- * sees the raw sub-block views; here `compression` is read and the block framed as-is,
- * exactly as `parseChunk` does for a keyframe.
- */
+/** A Delta Chunk record (opcode `0x10`, spec §5.18): its header and its raw records blob. */
 export function parseDeltaChunk(content: Uint8Array): ParsedDeltaChunk {
   const c = new Cursor(content);
   const header: DeltaChunkHeader = {
@@ -394,11 +396,21 @@ export function parseDeltaChunk(content: Uint8Array): ParsedDeltaChunk {
     compression: c.string(),
     uncompressedSize: c.u64(),
   };
-  const records = new Cursor(c.blob());
-  const updates = records.blob();
-  const births = records.blob();
-  const deaths = records.blob();
-  return { header, updates, births, deaths };
+  return { header, records: c.blob() };
+}
+
+/**
+ * Frame the decompressed records blob into its three sub-blocks (spec §5.18).
+ *
+ * The order is `updates`, `births`, `deaths`, framed by length rather than tagged per
+ * stream, so a reader can take the death list alone by skipping the first two lengths.
+ */
+export function frameDeltaGroups(records: Uint8Array): DeltaGroups {
+  const c = new Cursor(records);
+  const updates = c.blob();
+  const births = c.blob();
+  const deaths = c.blob();
+  return { updates, births, deaths };
 }
 
 /** The half-open interval test the seek rule is built on. */
