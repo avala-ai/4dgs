@@ -66,10 +66,15 @@ jobs:
         # Sources only, same as TypeScript's and Swift's: this job builds nothing, so
         # .dart_tool and the compiled runners are not here to measure, and a vendored
         # dependency would show up as a budget failure.
+        # Raised from 360 to 400 KiB for the keyframe-delta decode path: the native
+        # decoder plus its unit-test fixtures. The fixtures are keyframe-delta files
+        # embedded as base64 because the Dart side is decode-only — there is no
+        # encoder to write them at test time — and there is deliberately headroom
+        # for the keyframe-delta corpus expansion still to land.
         run: |
           size_kb=$(du -s dart | cut -f1)
           echo "dart: ${size_kb} KiB"
-          [ "$size_kb" -le 360 ] || { echo "::error::dart is ${size_kb} KiB, over the 360 KiB budget"; exit 1; }
+          [ "$size_kb" -le 400 ] || { echo "::error::dart is ${size_kb} KiB, over the 400 KiB budget"; exit 1; }
       - name: Swift sources under 300 KB
         # Sources only, same as TypeScript's: this job builds nothing, so .build is not
         # here to measure and a vendored dependency would show up as a budget failure.

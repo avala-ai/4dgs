@@ -53,6 +53,12 @@ const int attrWindowIndex = 10;
 const int attrSourceGroup = 11;
 const int attrSourceIndex = 12;
 
+/// Identity, required in every chunk of a `keyframe-delta` file and absent from a
+/// `gaussian-birth` one. Distinct from [attrSourceIndex], which is a
+/// producer-side handle a reader may skip; this is what a delta names its
+/// gaussians by.
+const int attrGaussianId = 13;
+
 /// Ids every chunk must carry. 11 and 12 are optional producer-side identities
 /// and readers that do not need them skip the streams.
 const List<int> requiredAttributes = <int>[
