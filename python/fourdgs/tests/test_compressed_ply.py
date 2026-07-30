@@ -182,11 +182,17 @@ def test_static_file_never_fades(tmp_path):
 def test_segments_are_placed_on_a_shared_timeline(tmp_path):
     """Segment k is stored on its OWN clock, so its scene time is local + k * duration.
 
-    Each segment also carries a tail of gaussians centred outside its own span, which a
-    player never shows; those must be dropped rather than smeared across the timeline.
+    A gaussian centred outside the segment can still overlap it in time, so all source
+    gaussians must survive and the validity window alone limits them to their segment.
     """
-    bounds = {"min_time": 0.0, "max_time": 10.0, "min_time_scale": 0.0, "max_time_scale": 0.0}
-    # Local centres at 2.5 s (inside a 5 s segment) and 7.5 s (the tail, outside it).
+    bounds = {
+        "min_time": 0.0,
+        "max_time": 10.0,
+        "min_time_scale": math.log(2.0),
+        "max_time_scale": math.log(2.0),
+    }
+    # Local centres at 2.5 s (inside a 5 s segment) and 7.5 s (outside it).
+    # sigma=2 means the second still contributes near the segment's right edge.
     verts = [{"packed_time": pack_11_10_11(0.0, 0.25, 0.0)}, {"packed_time": pack_11_10_11(0.0, 0.75, 0.0)}]
     paths = []
     for k in range(3):
@@ -197,12 +203,49 @@ def test_segments_are_placed_on_a_shared_timeline(tmp_path):
     gaussians, duration = import_scene(paths, segment_duration=5.0)
 
     assert duration == 15.0
-    # One survivor per segment — the 7.5 s tail is outside every segment's own window.
-    assert gaussians.count == 3
-    np.testing.assert_allclose(sorted(gaussians.mu_t), [2.5, 7.5, 12.5], atol=1e-2)
+    assert gaussians.count == 6
+    np.testing.assert_allclose(sorted(gaussians.mu_t), [2.5, 7.5, 7.5, 12.5, 12.5, 17.5], atol=1e-2)
     # Its own span became its validity window, which is what replaces the sidecar.
-    np.testing.assert_allclose(sorted(gaussians.win_lo), [0.0, 5.0, 10.0], atol=1e-6)
-    np.testing.assert_allclose(sorted(gaussians.win_hi), [5.0, 10.0, 15.0], atol=1e-6)
+    np.testing.assert_allclose(sorted(gaussians.win_lo), [0.0, 0.0, 5.0, 5.0, 10.0, 10.0], atol=1e-6)
+    np.testing.assert_allclose(sorted(gaussians.win_hi), [5.0, 5.0, 10.0, 10.0, 15.0, 15.0], atol=1e-6)
+    # Both segment-zero gaussians are visible just before its boundary. Deleting the
+    # one centred at 7.5 s would visibly thin the source reconstruction.
+    assert len(gaussians.state_at(4.999)["indices"]) == 2
+
+
+def test_segment_import_normalizes_static_and_always_visible_sentinels(tmp_path):
+    bounds = {
+        "min_time": -20.0,
+        "max_time": 0.0,
+        "min_time_scale": math.log(0.5),
+        "max_time_scale": math.log(0.5),
+        "min_motion_x": 0.0,
+        "min_motion_y": 0.0,
+        "min_motion_z": 0.0,
+        "max_motion_x": 1.0,
+        "max_motion_y": 1.0,
+        "max_motion_z": 1.0,
+    }
+    moving = pack_11_10_11(1.0, 1.0, 1.0)
+    # -15 is always-visible; -7.5 is static-position but still fades.
+    verts = [
+        {"packed_motion": moving, "packed_time": pack_11_10_11(0.0, 0.25, 0.0)},
+        {"packed_motion": moving, "packed_time": pack_11_10_11(0.0, 0.625, 0.0)},
+    ]
+    paths = []
+    for k in range(2):
+        q = tmp_path / f"{k:02d}.ply"
+        q.write_bytes(build_ply(temporal=True, count=2, bounds=bounds, vertices=verts))
+        paths.append(str(q))
+
+    gaussians, _ = import_scene(paths, segment_duration=5.0)
+
+    assert gaussians.count == 4
+    np.testing.assert_array_equal(gaussians.motions, 0.0)
+    assert np.all(np.isinf(gaussians.sigma_t[[0, 2]]))
+    # Always-visible source splats remain visible inside each segment's explicit window.
+    assert 0 in gaussians.state_at(2.5)["indices"]
+    assert 2 in gaussians.state_at(7.5)["indices"]
 
 
 def test_segmented_import_requires_a_duration(tmp_path):
