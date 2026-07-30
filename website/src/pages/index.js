@@ -53,7 +53,7 @@ export default function Home() {
   return (
     <Layout
       title="4dgs"
-      description="An open container format for 4D gaussian splat scenes: continuous time, seekable byte ranges, streaming and indexed reads, and embedded audio."
+      description="An open container format for 4D gaussian splat scenes: continuous time, seekable byte ranges, streaming and indexed reads, and native multi-source spatial audio."
     >
       <header className={styles.hero}>
         <div className="container">
@@ -62,8 +62,8 @@ export default function Home() {
           </h1>
           <p className={styles.heroSubtitle}>
             An open container format for 4D gaussian splat scenes — gaussians whose position,
-            opacity and existence vary continuously over time, optionally with an embedded audio
-            track and a default camera trajectory.
+            opacity and existence vary continuously over time, optionally with native spatial audio
+            sources whose 3D poses can move over time, plus a default camera trajectory.
           </p>
           <p className={styles.heroDetail}>
             One self-contained, seekable file. Length-prefixed records, temporal chunking, streaming
