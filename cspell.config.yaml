@@ -59,6 +59,7 @@ words:
   # Level-of-detail vocabulary (proposal): the set-union and subset verbs
   - unioned
   - subsetting
+  - seekability
   # Relighting extension seam (registry attribute ids 32-47, relightable profile)
   - albedo
   - metalness
