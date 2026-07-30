@@ -1053,7 +1053,7 @@ level-run generalization and its compatibility boundary (§3.5, §4.6):
 | `LodStreamBandCut`        | degree-3 stream ends after band 1 of its final chunk                                 | longest-intact-chunk recovery; accidental EOF does not create a degree-1 cap             |
 | `LodStreamLevelCut`       | `lod_levels = 8`; stream recovers intact level-0 records before a later level-2 cut  | observed levels may be below the bound; recovery neither invents nor requires levels     |
 | `LodNoDeclare`            | chunk `level > 0`; Header gate and index `level` append both absent                  | semantic/physical iff gate: reader does not filter or infer a field, and gets full scene |
-| `LodMetadataOnlyComplete` | Metadata `lod_level0_complete = "true"`; Header completeness key absent              | Metadata-only promise is legal, inert and cannot affect level-0 completeness             |
+| `LodMetadataOnlyComplete` | Metadata `lod_level0_complete = "TRUE"`; Header completeness key absent              | noncanonical Metadata value is legal, inert and cannot affect level-0 completeness       |
 | `LodIndexMissingLevel`    | declared indexed LOD; one Chunk Index entry omits the appended `level`               | mandatory range-seekable level predicate (§4.2)                                          |
 | `LodKfDeltaPerLevelRuns`  | `keyframe-delta`, two levels; one full run and one sparse keyframe-rooted run        | run-local chains, unique active ids and one global no-reuse identity history (§3.5)      |
 | `LodKfDeltaRangeSeek`     | seek a later sparse run from the index without fetching earlier valid runs           | selected chains only; whole-file identity validation never becomes a payload scan        |
