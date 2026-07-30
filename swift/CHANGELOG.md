@@ -8,6 +8,11 @@ All notable changes to the Swift package are documented here, following
 
 ### Added
 
+- keyframe-delta decode: `peekTemporalModel` and `keyframeDeltaStatesJson`, binding the core's
+  additive states-JSON C ABI through `CoreSeam`. The summary is computed in the Rust core, so the
+  binding does no arithmetic of its own; the `decode_streamed` and `decode_indexed` runners peek the
+  temporal model from the bytes — an opened scene refuses the model — and print the core's JSON
+  verbatim on each read path.
 - The encode surface: `SceneWriter.encode`, binding the core's `fourdgs_writer_*` C ABI through
   `CoreSeam`, so the package authors files through the same core it decodes through. An
   `encode_roundtrip` runner re-encodes each variant's gaussians for the cross-language encode gate,

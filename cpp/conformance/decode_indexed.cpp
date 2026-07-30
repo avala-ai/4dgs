@@ -31,6 +31,19 @@ int fail(const std::string& message) {
   return 1;
 }
 
+Result<std::vector<std::uint8_t>> readWhole(const std::string& path) {
+  std::FILE* handle = std::fopen(path.c_str(), "rb");
+  if (handle == nullptr) return Error(ErrorCode::kIo, "cannot open " + path);
+  std::vector<std::uint8_t> bytes;
+  std::uint8_t buffer[65536];
+  std::size_t got = 0;
+  while ((got = std::fread(buffer, 1, sizeof(buffer), handle)) > 0) {
+    bytes.insert(bytes.end(), buffer, buffer + got);
+  }
+  std::fclose(handle);
+  return bytes;
+}
+
 /// A chunk read costs exactly what the index says, and a band cap removes bytes from the
 /// wire rather than values after they arrive.
 ///
@@ -90,6 +103,22 @@ int main(int argc, char** argv) {
     return 2;
   }
   const std::string path = argv[1];
+
+  // keyframe-delta dispatch, before opening: an opened Scene refuses the model. The indexed
+  // read path walks each instant's chain through the index; the JSON is computed in Rust and
+  // printed verbatim, and it must equal what the streamed runner prints for the same file.
+  Result<std::vector<std::uint8_t>> whole = readWhole(path);
+  if (!whole) return fail(whole.error().toString());
+  Result<std::string> model =
+      fourdgs::peekTemporalModel(fourdgs::Span<const std::uint8_t>(whole->data(), whole->size()));
+  if (!model) return fail(model.error().toString());
+  if (*model == "keyframe-delta") {
+    Result<std::string> json = fourdgs::keyframeDeltaStatesJson(
+        fourdgs::Span<const std::uint8_t>(whole->data(), whole->size()), /*indexed=*/true);
+    if (!json) return fail(json.error().toString());
+    std::printf("%s\n", json->c_str());
+    return 0;
+  }
 
   Result<fourdgs::FileReadable*> file = fourdgs::FileReadable::open(path);
   if (!file) return fail(file.error().toString());

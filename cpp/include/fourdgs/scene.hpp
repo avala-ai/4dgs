@@ -181,6 +181,19 @@ class Scene {
   std::unique_ptr<detail::Handle> handle_;
 };
 
+/// The keyframe-delta temporal model (spec §11), a whole-file format an opened `Scene`
+/// refuses because its scene reader does not implement it. These bind the core's additive
+/// byte-in / string-out surface: the summary is computed in the Rust core, so a binding does
+/// no arithmetic of its own and cannot drift from the reference.
+
+/// The Header's declared temporal model, read without opening a scene — what a runner
+/// dispatches on before choosing a read path.
+Result<std::string> peekTemporalModel(Span<const std::uint8_t> bytes);
+
+/// Decode a keyframe-delta file to its canonical states JSON. `indexed` chooses the read
+/// path: `false` composes front to back, `true` walks each instant's chain through the index.
+Result<std::string> keyframeDeltaStatesJson(Span<const std::uint8_t> bytes, bool indexed);
+
 }  // namespace fourdgs
 
 #endif  // FOURDGS_SCENE_HPP

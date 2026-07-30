@@ -114,6 +114,22 @@ int main(int argc, char** argv) {
   }
   const std::string path = argv[1];
 
+  // Dispatch on the temporal model before opening: keyframe-delta is a whole-file format an
+  // opened Scene refuses, decoded through the core's byte-in / string-out surface. The JSON
+  // is computed in Rust and printed verbatim, so it is byte-identical to every other SDK's.
+  Result<std::vector<std::uint8_t>> whole = readWhole(path);
+  if (!whole) return fail(whole.error().toString());
+  Result<std::string> model =
+      fourdgs::peekTemporalModel(fourdgs::Span<const std::uint8_t>(whole->data(), whole->size()));
+  if (!model) return fail(model.error().toString());
+  if (*model == "keyframe-delta") {
+    Result<std::string> json = fourdgs::keyframeDeltaStatesJson(
+        fourdgs::Span<const std::uint8_t>(whole->data(), whole->size()), /*indexed=*/false);
+    if (!json) return fail(json.error().toString());
+    std::printf("%s\n", json->c_str());
+    return 0;
+  }
+
   Result<fourdgs::FileReadable*> file = fourdgs::FileReadable::open(path);
   if (!file) return fail(file.error().toString());
   std::unique_ptr<fourdgs::FileReadable> source(*file);

@@ -857,6 +857,50 @@ size_t fourdgs_buffer_len(const fourdgs_buffer *buffer);
 /** Release an encoded buffer. Null is ignored. */
 void fourdgs_buffer_free(fourdgs_buffer *buffer);
 
+/* -------------------------------------------------------------------------
+ * keyframe-delta
+ *
+ * The keyframe-delta temporal model (spec section 11) is a whole-file format, not a variant
+ * of the gaussian-birth scene the accessors above read: an opened fourdgs_scene refuses a
+ * temporal model this build's scene reader does not implement. These three functions bind it
+ * additively. They take the whole file as bytes and return owned strings — the canonical
+ * states summary is computed entirely in the Rust core, so every binding emits identical
+ * bytes with no per-language arithmetic to drift.
+ *
+ * The returned string is NOT NUL-terminated — it carries its length, like every string read
+ * out of a file — and it is OWNED by the caller: free it with fourdgs_string_free, passing
+ * back the same pointer and length. The two-out-parameter sequencing rule at the top of this
+ * header applies: read `out`/`out_len` only after the call has returned FOURDGS_STATUS_OK.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The Header's declared temporal model, read from bytes without opening a scene.
+ *
+ * A binding dispatches on this: "keyframe-delta" goes to fourdgs_keyframe_delta_states_json,
+ * anything else through the ordinary open. On success `out` owns a string freed with
+ * fourdgs_string_free.
+ */
+int fourdgs_peek_temporal_model(const uint8_t *data, size_t length, const char **out,
+                                size_t *out_len);
+
+/**
+ * Decode a keyframe-delta file and return its canonical states JSON.
+ *
+ * `indexed == 0` walks the file front to back, composing each chunk onto the last; a non-zero
+ * `indexed` reads the index and walks only each instant's chain. The two must agree. On
+ * success `out` owns a string freed with fourdgs_string_free. A file whose Header is not
+ * keyframe-delta is reported FOURDGS_STATUS_MALFORMED on the streamed path.
+ */
+int fourdgs_keyframe_delta_states_json(const uint8_t *data, size_t length, int indexed,
+                                       const char **out, size_t *out_len);
+
+/**
+ * Release a string owned by the caller — the result of fourdgs_peek_temporal_model or
+ * fourdgs_keyframe_delta_states_json. Null is ignored. The length must be the one the
+ * producing call returned; the pair identifies the same allocation.
+ */
+void fourdgs_string_free(const char *data, size_t length);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

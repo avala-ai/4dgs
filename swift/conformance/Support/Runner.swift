@@ -35,7 +35,17 @@ public enum Runner {
             exit(2)
         }
         do {
-            let json = try summarize(path: arguments[1], mode: mode)
+            let path = arguments[1]
+            // keyframe-delta is a whole-file temporal model an opened scene refuses, so it is
+            // dispatched on before opening. The core computes the states JSON and it is
+            // printed verbatim — byte-identical to every other SDK's, which is the whole
+            // point of computing it once in Rust rather than in each binding.
+            let bytes = [UInt8](try Data(contentsOf: URL(fileURLWithPath: path)))
+            if try peekTemporalModel(bytes) == "keyframe-delta" {
+                print(try keyframeDeltaStatesJson(bytes, indexed: mode == .indexed))
+                exit(0)
+            }
+            let json = try summarize(path: path, mode: mode)
             print(json.serialized())
             exit(0)
         } catch {

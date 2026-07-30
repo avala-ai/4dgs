@@ -1105,3 +1105,239 @@ pub fn state_covering(chunks: &[ChunkInfo], t: f64) -> &ChunkInfo {
 fn round9(v: f64) -> f64 {
     format!("{v:.9}").parse().unwrap_or(v)
 }
+
+// --------------------------------------------------------------------------
+// The canonical states summary
+// --------------------------------------------------------------------------
+//
+// The statement two implementations are diffed on for a `keyframe-delta` file, computed
+// here in the core so every SDK — C++ and Swift bind it through the C ABI — emits the same
+// bytes. It lived in the conformance crate first; lifting it here is what lets a binding
+// that cannot open a keyframe-delta scene still produce the summary the suite compares.
+//
+// Representation is pinned exactly as the shared canonical pins it: integers are strings so
+// a 64-bit value survives a double-backed JSON parser, floats round to a fixed number of
+// decimals so two languages spell the same double, a non-finite float is `null`, and object
+// keys are sorted (a `BTreeMap`). Nothing here depends on decoded stream order: every row
+// orders by `gaussian_id`, which is unique within a state, so two decoders that compose the
+// same population agree on every row.
+
+/// Decimal places every float in the states summary carries, matching the shared canonical.
+const STATES_JSON_DECIMALS: usize = 6;
+
+/// A JSON value whose objects are sorted by key. Deliberately a private mirror of the
+/// conformance emitter rather than a dependency on it: the core does not depend on its own
+/// test crate, and the two are diffed against each other by construction — the conformance
+/// runner calls this function.
+enum Json {
+    Null,
+    Num(f64),
+    Str(String),
+    Arr(Vec<Json>),
+    Obj(BTreeMap<String, Json>),
+}
+
+impl Json {
+    fn obj(pairs: Vec<(&str, Json)>) -> Json {
+        Json::Obj(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+    }
+
+    fn write(&self, out: &mut String) {
+        use std::fmt::Write as _;
+        match self {
+            Json::Null => out.push_str("null"),
+            // Always the fixed precision: the harness compares parsed values, and a fixed
+            // precision is what makes two languages produce the same double.
+            Json::Num(v) => {
+                let _ = write!(out, "{v:.*}", STATES_JSON_DECIMALS);
+            }
+            Json::Str(s) => write_json_string(out, s),
+            Json::Arr(items) => {
+                out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    item.write(out);
+                }
+                out.push(']');
+            }
+            Json::Obj(map) => {
+                out.push('{');
+                for (i, (key, value)) in map.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write_json_string(out, key);
+                    out.push(':');
+                    value.write(out);
+                }
+                out.push('}');
+            }
+        }
+    }
+
+    fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.write(&mut out);
+        out
+    }
+}
+
+fn write_json_string(out: &mut String, s: &str) {
+    use std::fmt::Write as _;
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// Round for comparison; a non-finite value becomes `null`.
+fn num(v: f64) -> Json {
+    if v.is_finite() {
+        Json::Num(v)
+    } else {
+        Json::Null
+    }
+}
+
+/// An integer as a string, so a 64-bit value survives a JSON parser backed by doubles.
+fn int(v: u64) -> Json {
+    Json::Str(v.to_string())
+}
+
+fn opt_int(v: Option<u32>) -> Json {
+    match v {
+        None => Json::Null,
+        Some(v) => int(v as u64),
+    }
+}
+
+/// The statement two implementations are diffed on for a `keyframe-delta` file.
+///
+/// `chunks` proves a decoder read `depth`, `deltaMode` and `liveCount` — a field no row
+/// mentions is one an implementation can decline to decode. `states` is the reconstruction
+/// at an instant: for each probe, the composed population's live count, a sample of centres
+/// and scales in id order, and the aggregate over the whole population. Reconstruction is in
+/// `f64`, matching the Python reference, so the fixed-precision comparison is exact.
+pub fn keyframe_delta_states_json(seq: &DecodedSequence) -> String {
+    let duration = seq.header.duration_sec;
+
+    let chunk_rows: Vec<Json> = seq
+        .chunks
+        .iter()
+        .map(|c| {
+            let delta_mode = if c.kind == 0 {
+                Json::Null
+            } else if c.delta_mode == Some(rec::DELTA_MODE_CHAINED) {
+                Json::Str("chained".into())
+            } else {
+                Json::Str("keyframe".into())
+            };
+            Json::obj(vec![
+                ("t0", num(c.t0)),
+                ("t1", num(c.t1)),
+                (
+                    "kind",
+                    Json::Str(if c.kind == 0 { "keyframe" } else { "delta" }.into()),
+                ),
+                ("deltaMode", delta_mode),
+                ("depth", int(c.depth as u64)),
+                ("liveCount", int(c.state.count() as u64)),
+                ("updateCount", opt_int(c.update_count)),
+                ("birthCount", opt_int(c.birth_count)),
+                ("deathCount", opt_int(c.death_count)),
+            ])
+        })
+        .collect();
+
+    let mut states: Vec<Json> = Vec::new();
+    for t in probe_times(&seq.chunks, duration) {
+        let info = state_covering(&seq.chunks, t);
+        let r = reconstruct_at(seq, &info.state, t);
+        let n = r.ids.len();
+        let sample_n = SAMPLE.min(n);
+
+        let gaussian_ids: Vec<Json> = r.ids[..sample_n]
+            .iter()
+            .map(|id| Json::Str(id.to_string()))
+            .collect();
+        let positions: Vec<Json> = (0..sample_n)
+            .map(|i| Json::Arr((0..3).map(|k| num(r.centers[i * 3 + k])).collect()))
+            .collect();
+        let scales: Vec<Json> = (0..sample_n)
+            .map(|i| Json::Arr((0..3).map(|k| num(r.scales[i * 3 + k])).collect()))
+            .collect();
+
+        let mut position_sum = [0.0f64; 3];
+        for i in 0..n {
+            for (axis, slot) in position_sum.iter_mut().enumerate() {
+                *slot += r.centers[i * 3 + axis];
+            }
+        }
+        let opacity_sum: f64 = r.opacity.iter().sum();
+
+        states.push(Json::obj(vec![
+            ("t", num(t)),
+            ("liveCount", int(info.state.count() as u64)),
+            (
+                "sample",
+                Json::obj(vec![
+                    ("gaussianIds", Json::Arr(gaussian_ids)),
+                    ("positions", Json::Arr(positions)),
+                    ("scales", Json::Arr(scales)),
+                ]),
+            ),
+            (
+                "aggregate",
+                Json::obj(vec![
+                    (
+                        "positionSum",
+                        Json::Arr(position_sum.iter().map(|v| num(*v)).collect()),
+                    ),
+                    ("opacitySum", num(opacity_sum)),
+                ]),
+            ),
+        ]));
+    }
+
+    Json::obj(vec![
+        ("temporalModel", Json::Str("keyframe-delta".into())),
+        ("gaussianCount", int(seq.header.gaussian_count)),
+        ("durationSec", num(duration)),
+        ("cutoff", num(seq.header.cutoff)),
+        ("chunks", Json::Arr(chunk_rows)),
+        ("states", Json::Arr(states)),
+    ])
+    .to_json()
+}
+
+/// The Header's declared temporal model, read without decoding the body.
+///
+/// A binding that dispatches on the temporal model needs it before it commits to a read
+/// path, and the ordinary open refuses a model this build's scene reader does not implement
+/// — so a keyframe-delta file cannot answer the question through an opened scene. This walks
+/// only as far as the Header record and reads the one field.
+pub fn peek_temporal_model(data: &[u8]) -> Result<String> {
+    check_magic(data)?;
+    for record in Records::new(data, MAGIC.len()) {
+        let record = record?;
+        if record.opcode == op::HEADER {
+            return Ok(rec::Header::parse(record.content)?.temporal_model);
+        }
+    }
+    Err(Error::Malformed(
+        "file has no Header record to read a temporal model from".into(),
+    ))
+}
