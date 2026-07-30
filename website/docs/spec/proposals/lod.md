@@ -332,10 +332,16 @@ clean EOF the marker MUST reach `duration_sec`. An indexed reader applies the sa
 algorithm to index entries ordered by `chunk_offset`. In a promised indexed `gaussian-birth` file,
 each entry's `t0` and `t1` MUST be bit-for-bit identical to the fields in the Chunk it points at. An
 indexed decode verifies that equality whenever it fetches a selected Chunk; the exhaustive validator
-verifies every entry without changing an ordinary seek into a payload scan. A mismatch is
-`level-index-interval-mismatch` and names the entry, Chunk offset and both values. Thus the index
-cannot prove coverage for one physical sequence while the streamed path sees another. Only the
-previous level-0 `t0` and `level0CoveredUntil` survive a chunk boundary; no interval does. This
+verifies every entry. A mismatch is `level-index-interval-mismatch` and names the entry, Chunk
+offset and both values.
+
+That integrity check has the same range-seek boundary as every payload fact duplicated in an index.
+A corrupt interval can deselect its own Chunk, so an ordinary indexed seek MUST NOT fetch that
+unselected record merely to prove why it was unselected and is not required to discover the
+mismatch. Full-file validation compares every entry with its record; a point seek compares every
+record it selects. Indexed and streamed reconstruction are required to agree for **conforming
+files**, not to discover the same unselected corruption after reading different byte ranges. Only
+the previous level-0 `t0` and `level0CoveredUntil` survive a chunk boundary; no interval does. This
 ordering and endpoint-integrity rule are conditional on the Header promise; ordinary
 `gaussian-birth` files and level 0 without the promise retain the base format's order independence.
 
@@ -1060,11 +1066,13 @@ transfer caps over one uniformly stored scene (§3.3) are asserted rather than a
   coefficients through that prefix. The file still stores the same Header-declared degree for every
   chunk. A decoder that incorrectly replaces requested per-chunk caps with one global read cap
   produces the wrong `throughShDegree`/`shCrc` and fails on that chunk specifically.
-- **The two read paths must agree**, as keyframe-delta §11.2 requires: a streamed decode that
-  filters level as chunks pass and an indexed decode that seeks with the level predicate of §3.5
-  MUST produce identical `states` at every requested level when given the same deliberate SH read
-  plan. EOF recovery is a separate corpus expectation: an unplanned cut drops short trailing chunks
-  instead of synthesizing transfer caps (§3.3).
+- **The two read paths must agree on conforming files**, as keyframe-delta §11.2 requires: a
+  streamed decode that filters level as chunks pass and an indexed decode that seeks with the level
+  predicate of §3.5 MUST produce identical `states` at every requested level when given the same
+  deliberate SH read plan. A malformed index fact that deselects its own record is an
+  exhaustive-validation fault, not permission for an ordinary indexed seek to scan unselected
+  payloads. EOF recovery is a separate corpus expectation: an unplanned cut drops short trailing
+  chunks instead of synthesizing transfer caps (§3.3).
 
 ### 10.2 Scenarios
 
@@ -1153,19 +1161,25 @@ promised level-0 `t0`, and one promised level-0 `t1`; all nine forms MUST produc
 `lod-level0-coverage-non-finite` before an order or hole refusal through both exhaustive and
 streamed validation. `LodLevel0IndexIntervalMismatch` starts from the valid indexed completeness
 fixture, changes one index `t0` and, separately, one index `t1` without changing the pointed Chunk,
-and MUST produce `level-index-interval-mismatch`. Each form runs through exhaustive validation and
-an indexed seek that selects the changed entry; the request trace proves the decoder discovers the
-mismatch from that selected Chunk without scanning unrelated payloads. The migration file gives id 7
-a state-bearing occurrence in a level-0 run and a later non-overlapping level-1 run without a death;
-it MUST produce `id-crosses-level`. The duplicate-id file gives two active levels individually valid
-chains that both contain `gaussian_id = 7`; it MUST produce the more specific duplicate identifier
-only after the reconstructed union exposes the collision, naming both levels and chunks. The reuse
-file gives id 7 a valid lifecycle that ends in death, then carries id 7 in a delta `births` group in
-a later run. `LodKfDeltaReuseInKeyframe` instead ends the same lifecycle, leaves a coverage gap, and
-places id 7 directly in the absolute state of the keyframe that begins the later run; there is no
-`births` group to inspect. Both MUST produce the more specific reuse identifier and name the earlier
-lifecycle, death and later occurrence even though no reconstructed instant has two live id-7
-gaussians. The level-0 coverage files prove the temporal-model-specific definitions. In particular,
+and MUST produce `level-index-interval-mismatch`. The selected forms run through exhaustive
+validation and an indexed seek that selects the changed entry; the request trace proves the decoder
+discovers the mismatch from that selected Chunk without scanning unrelated payloads. A third form
+changes A's indexed interval from `[0, 1)` to `[0, 0.5)` while a second level-0 Chunk B still lets
+the index prove complete coverage. Exhaustive validation MUST refuse the A mismatch. A point seek at
+`t = 0.75` is deliberately not a refusal expectation: A deselects itself, and the request trace MUST
+show that the indexed decoder does not fetch it to perform a whole-file audit. This fixture narrows
+path equivalence to conforming files rather than letting conformance smuggle a payload scan into the
+range-seek API. The migration file gives id 7 a state-bearing occurrence in a level-0 run and a
+later non-overlapping level-1 run without a death; it MUST produce `id-crosses-level`. The
+duplicate-id file gives two active levels individually valid chains that both contain
+`gaussian_id = 7`; it MUST produce the more specific duplicate identifier only after the
+reconstructed union exposes the collision, naming both levels and chunks. The reuse file gives id 7
+a valid lifecycle that ends in death, then carries id 7 in a delta `births` group in a later run.
+`LodKfDeltaReuseInKeyframe` instead ends the same lifecycle, leaves a coverage gap, and places id 7
+directly in the absolute state of the keyframe that begins the later run; there is no `births` group
+to inspect. Both MUST produce the more specific reuse identifier and name the earlier lifecycle,
+death and later occurrence even though no reconstructed instant has two live id-7 gaussians. The
+level-0 coverage files prove the temporal-model-specific definitions. In particular,
 `LodLevel0BirthOutOfOrder` has overlapping intervals with `t0` sequence `0, 0.5, 0.25` whose union
 covers the clip; it MUST produce `lod-level0-birth-out-of-order`, proving a validator does not sort
 or accumulate the interval set. There is no `gaussian-birth` identity-refusal file, because that
@@ -1225,8 +1239,9 @@ Added as `No` or `Planned` for every SDK, moved only by a passing suite:
   while a `lod_levels - 1` request includes every observed level
 - Level-0 completeness — canonical Header promise grammar and model-specific coverage;
   `gaussian-birth` validates finite operands, the non-decreasing physical level-0 `t0` subsequence
-  and gap-free union with constant state while ignoring interleaved higher levels; a Metadata-only
-  key is inert
+  and gap-free union with constant state while ignoring interleaved higher levels; full validation
+  corroborates every duplicated index interval while a point seek checks selected records only; a
+  Metadata-only key is inert
 - Contiguous band prefixes — the highest-contiguous-prefix rule with out-of-order bands held (§3.3)
 - Per-chunk SH transfer caps — `byChunk` agrees while stored scene degree remains uniform
 - Stream truncation — an incomplete trailing band set is dropped, never treated as an implicit cap
