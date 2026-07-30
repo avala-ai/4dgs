@@ -1002,17 +1002,20 @@ transfer caps over one uniformly stored scene (§3.3) are asserted rather than a
   separated run. It refuses a cross-level migration, a live duplicate, or an id reborn after death
   even if the offending id falls outside the sample. Its adapter reports the configured identity
   memory budget and observed high-water bytes; conformance fails if the latter exceeds the former.
-  The indexed decode runner checks the identity evidence its selected chains fully expose: live
-  uniqueness across the fetched active union and no-reuse across the histories present in those
-  chains. Its adapter reports `identityScratchEntriesLive` and `identityScratchEntriesHighWater`
-  after every seek. The former MUST be zero on return, and the latter MUST be no greater than the
-  number of identity rows in that seek's selected decoded chains. A disjoint-seek sequence increases
-  cumulative visited ids far beyond any one seek and asserts that live entries remain zero and
-  high-water remains bounded by the largest single seek; reusable capacity may remain, but no keyed
-  identity history may. The request trace separately proves the runner never fetches unrelated
-  payloads to complete a whole-file identity audit. Positive multi-level rows use level-stable,
-  never-reused ids, and the invalid corpus contains both exhaustive cases and selected-chain cases
-  (§10.3).
+  The exhaustive runner also validates `LodKfDeltaIdentityBudgetOverflow`, whose 4,096 distinct ids
+  exceed a 256-byte test budget before a final cross-level occurrence of id 4095. Passing therefore
+  requires the partitioned-pass or external-sort path; a scene-wide map cannot pass by keeping this
+  small corpus below its configured capacity. The indexed decode runner checks the identity evidence
+  its selected chains fully expose: live uniqueness across the fetched active union and no-reuse
+  across the histories present in those chains. Its adapter reports `identityScratchEntriesLive` and
+  `identityScratchEntriesHighWater` after every seek. The former MUST be zero on return, and the
+  latter MUST be no greater than the number of identity rows in that seek's selected decoded chains.
+  A disjoint-seek sequence increases cumulative visited ids far beyond any one seek and asserts that
+  live entries remain zero and high-water remains bounded by the largest single seek; reusable
+  capacity may remain, but no keyed identity history may. The request trace separately proves the
+  runner never fetches unrelated payloads to complete a whole-file identity audit. Positive
+  multi-level rows use level-stable, never-reused ids, and the invalid corpus contains both
+  exhaustive cases and selected-chain cases (§10.3).
 - **`states[].byChunk` carries a per-chunk transfer cap and SH digest.** `throughShDegree` is the
   highest contiguous band prefix selected for that chunk in this read, and `shCrc` digests only the
   coefficients through that prefix. The file still stores the same Header-declared degree for every
@@ -1090,6 +1093,16 @@ diagnose cloned source ownership (§3.1, §9). This reuses the refusal-expectati
 keyframe-delta §11.5 introduces; if that contract has landed by the time this does, this adds rows
 to it rather than a mechanism.
 
+`LodKfDeltaIdentityBudgetOverflow` is a generated exhaustive-validation refusal case. The runner
+configures the validator with a 256-byte identity-memory budget. A level-0 keyframe contains the
+4,096 distinct ids `0..4095`; after those histories have been observed, a later non-overlapping
+level-1 keyframe contains id 4095 without an intervening death. The validator MUST produce
+`id-crosses-level`, and its reported identity-memory high-water MUST remain at or below 256 bytes.
+The input is deliberately larger than the budget even if an implementation stored only each
+identity's four-byte key, so a validator cannot satisfy the expectation with a scene-wide in-memory
+map. Implementations may make budget-sized numeric-id passes or use their memory-capped external
+sort; the expected refusal and budget assertion are the same.
+
 Two additional invalid cases run through the **indexed seek** entry point with an instrumented byte
 source:
 
@@ -1126,7 +1139,8 @@ Added as `No` or `Planned` for every SDK, moved only by a passing suite:
   payloads; scratch-counter high-water is bounded by one seek and live scratch is zero on return
 - Keyframe-delta full-file identity — every id has one immutable level, active unions have unique
   ids, and lifecycle history never restarts across levels or separated runs, checked through
-  budgeted numeric partitions or bounded-memory external sorting
+  budgeted numeric partitions or bounded-memory external sorting; the over-budget migration fixture
+  proves validation continues after the configured in-memory capacity is exceeded
 - Full-union equivalence — a `lod_levels - 1` decode equals a non-LOD decode
 - Encode: source partition and one-level ownership — each source gaussian is emitted in exactly one
   level tranche
