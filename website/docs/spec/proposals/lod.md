@@ -329,10 +329,15 @@ require finite Header `duration_sec` and finite `t0` and `t1` on every level-0 C
 preceding level-0 `t0` as `lod-level0-birth-out-of-order`, then refuses `t0 > level0CoveredUntil` as
 `lod-level0-birth-has-holes`, and otherwise advances the marker to `max(level0CoveredUntil, t1)`. At
 clean EOF the marker MUST reach `duration_sec`. An indexed reader applies the same checks and
-algorithm to index entries ordered by `chunk_offset`, so the two read paths validate the same
-physical sequence. Only the previous level-0 `t0` and `level0CoveredUntil` survive a chunk boundary;
-no interval does. This ordering is conditional on the Header promise; ordinary `gaussian-birth`
-files and level 0 without the promise retain the base format's order independence.
+algorithm to index entries ordered by `chunk_offset`. In a promised indexed `gaussian-birth` file,
+each entry's `t0` and `t1` MUST be bit-for-bit identical to the fields in the Chunk it points at. An
+indexed decode verifies that equality whenever it fetches a selected Chunk; the exhaustive validator
+verifies every entry without changing an ordinary seek into a payload scan. A mismatch is
+`level-index-interval-mismatch` and names the entry, Chunk offset and both values. Thus the index
+cannot prove coverage for one physical sequence while the streamed path sees another. Only the
+previous level-0 `t0` and `level0CoveredUntil` survive a chunk boundary; no interval does. This
+ordering and endpoint-integrity rule are conditional on the Header promise; ordinary
+`gaussian-birth` files and level 0 without the promise retain the base format's order independence.
 
 **Level and `keyframe-delta`, and the one place LOD changes a normative rule.** keyframe-delta tiles
 the timeline with state chunks and reaches an instant by walking a chain back to a keyframe (spec
@@ -524,9 +529,11 @@ contain `level` would force a seeking reader to fetch that chunk merely to decid
 it, breaking the range-seekable contract; the reader MUST refuse before selecting chunks and name
 the short entry. It MUST also refuse when an index `level` disagrees with the Chunk or Delta Chunk
 it points at, naming both — the same corruption check the keyframe-delta index fields make on
-duplicated facts (spec §5.8). Without the valid gate, the current schema contains no index `level`:
-a conforming producer MUST NOT emit that field, and a reader MUST NOT interpret any trailing bytes
-as it. A malformed `lod_levels` value is refused as a malformed gate (§9), not used to guess the
+duplicated facts (spec §5.8). When `gaussian-birth` also promises complete level 0, the index
+intervals are likewise duplicated coverage facts: §3.5 requires each entry's `t0` and `t1` to match
+its pointed Chunk. Without the valid gate, the current schema contains no index `level`: a
+conforming producer MUST NOT emit that field, and a reader MUST NOT interpret any trailing bytes as
+it. A malformed `lod_levels` value is refused as a malformed gate (§9), not used to guess the
 field's presence. A streamed file with no Chunk Index still filters on each Chunk or Delta Chunk's
 existing `level` as records arrive.
 
@@ -864,6 +871,7 @@ referential integrity between the index and the chunks, which the format already
 | a chunk or index `level` is `>= lod_levels` (or the two disagree)                          | the declared range omits the chunk; the full union would silently lose it |
 | an indexed declared-LOD entry omits its appended `level`                                   | the seek predicate cannot be answered from the index                      |
 | an index entry's `level` differs from its Chunk / Delta Chunk's                            | the seek predicate would select on a value the record denies              |
+| a promised `gaussian-birth` index interval differs from its pointed Chunk's                | indexed and streamed coverage would describe different physical sequences |
 | a `keyframe-delta` delta references a chunk of a different `level`                         | spec §11 / keyframe-delta §3.6; a chain would cross levels                |
 | a `keyframe-delta` `gaussian_id` is observed at more than one level                        | a wire-identifiable gaussian has migrated between ownership tranches      |
 | duplicate live `gaussian_id` values across active `keyframe-delta` level states            | level union never creates a separate live-identity namespace              |
@@ -1126,36 +1134,44 @@ separately prove that it retains no keyed identity history between seeks.
 §9's structural faults, as a small corpus of deliberately invalid files, each paired with the
 identifier of the refusal it must produce — `lod-levels-malformed`, `level-exceeds-declared`,
 `lod-level0-complete-malformed`, `lod-level0-without-gate`, `level-index-missing`,
-`level-index-mismatch`, `delta-crosses-level`, `level-overlap`, `level-run-without-keyframe`,
-`level-chain-crosses-gap`, `id-crosses-level`, `duplicate-id-across-levels`,
-`id-reuse-across-levels-after-death`, `lod-level0-coverage-non-finite`,
-`lod-level0-birth-out-of-order`, `lod-level0-birth-has-holes`, `lod-level0-kf-invalid-run`. These
-files run through the exhaustive validation entry point; a single-instant indexed decode is not
-required to fetch unselected payloads merely to discover a whole-history fault. The
-malformed-completeness file carries `Header.attributes["lod_level0_complete"] = "TRUE"` alongside a
-valid LOD gate and MUST produce `lod-level0-complete-malformed`; this prevents truthiness or
-case-folding from changing the promise. The orphan-promise file carries Header
-`lod_level0_complete = "true"` without Header `lod_levels` and proves that the promise cannot
-authorize its own seek. `LodLevel0NonFiniteCoverage` is generated with both quiet NaN and positive
-infinity in each of Header `duration_sec`, one promised level-0 `t0`, and one promised level-0 `t1`;
-every form MUST produce `lod-level0-coverage-non-finite` before an order or hole refusal. The
-migration file gives id 7 a state-bearing occurrence in a level-0 run and a later non-overlapping
-level-1 run without a death; it MUST produce `id-crosses-level`. The duplicate-id file gives two
-active levels individually valid chains that both contain `gaussian_id = 7`; it MUST produce the
-more specific duplicate identifier only after the reconstructed union exposes the collision, naming
-both levels and chunks. The reuse file gives id 7 a valid lifecycle that ends in death, then carries
-id 7 in a delta `births` group in a later run. `LodKfDeltaReuseInKeyframe` instead ends the same
-lifecycle, leaves a coverage gap, and places id 7 directly in the absolute state of the keyframe
-that begins the later run; there is no `births` group to inspect. Both MUST produce the more
-specific reuse identifier and name the earlier lifecycle, death and later occurrence even though no
-reconstructed instant has two live id-7 gaussians. The level-0 coverage files prove the
-temporal-model-specific definitions. In particular, `LodLevel0BirthOutOfOrder` has overlapping
-intervals with `t0` sequence `0, 0.5, 0.25` whose union covers the clip; it MUST produce
-`lod-level0-birth-out-of-order`, proving a validator does not sort or accumulate the interval set.
-There is no `gaussian-birth` identity-refusal file, because that model exposes no wire identity with
-which a reader could diagnose cloned source ownership (§3.1, §9). This reuses the
-refusal-expectation harness contract keyframe-delta §11.5 introduces; if that contract has landed by
-the time this does, this adds rows to it rather than a mechanism.
+`level-index-mismatch`, `level-index-interval-mismatch`, `delta-crosses-level`, `level-overlap`,
+`level-run-without-keyframe`, `level-chain-crosses-gap`, `id-crosses-level`,
+`duplicate-id-across-levels`, `id-reuse-across-levels-after-death`,
+`lod-level0-coverage-non-finite`, `lod-level0-birth-out-of-order`, `lod-level0-birth-has-holes`,
+`lod-level0-kf-invalid-run`. These files run through the exhaustive validation entry point; a
+single-instant indexed decode is not required to fetch unselected payloads merely to discover a
+whole-history fault. The non-finite, out-of-order and hole variants also run through a no-index
+streamed decode to clean EOF and MUST produce the same identifier before returning a scene. This
+separately proves the pipe path enforces the promise rather than leaving all completeness checks to
+the exhaustive validator. The malformed-completeness file carries
+`Header.attributes["lod_level0_complete"] = "TRUE"` alongside a valid LOD gate and MUST produce
+`lod-level0-complete-malformed`; this prevents truthiness or case-folding from changing the promise.
+The orphan-promise file carries Header `lod_level0_complete = "true"` without Header `lod_levels`
+and proves that the promise cannot authorize its own seek. `LodLevel0NonFiniteCoverage` is generated
+with quiet NaN, positive infinity and negative infinity in each of Header `duration_sec`, one
+promised level-0 `t0`, and one promised level-0 `t1`; all nine forms MUST produce
+`lod-level0-coverage-non-finite` before an order or hole refusal through both exhaustive and
+streamed validation. `LodLevel0IndexIntervalMismatch` starts from the valid indexed completeness
+fixture, changes one index `t0` and, separately, one index `t1` without changing the pointed Chunk,
+and MUST produce `level-index-interval-mismatch`. Each form runs through exhaustive validation and
+an indexed seek that selects the changed entry; the request trace proves the decoder discovers the
+mismatch from that selected Chunk without scanning unrelated payloads. The migration file gives id 7
+a state-bearing occurrence in a level-0 run and a later non-overlapping level-1 run without a death;
+it MUST produce `id-crosses-level`. The duplicate-id file gives two active levels individually valid
+chains that both contain `gaussian_id = 7`; it MUST produce the more specific duplicate identifier
+only after the reconstructed union exposes the collision, naming both levels and chunks. The reuse
+file gives id 7 a valid lifecycle that ends in death, then carries id 7 in a delta `births` group in
+a later run. `LodKfDeltaReuseInKeyframe` instead ends the same lifecycle, leaves a coverage gap, and
+places id 7 directly in the absolute state of the keyframe that begins the later run; there is no
+`births` group to inspect. Both MUST produce the more specific reuse identifier and name the earlier
+lifecycle, death and later occurrence even though no reconstructed instant has two live id-7
+gaussians. The level-0 coverage files prove the temporal-model-specific definitions. In particular,
+`LodLevel0BirthOutOfOrder` has overlapping intervals with `t0` sequence `0, 0.5, 0.25` whose union
+covers the clip; it MUST produce `lod-level0-birth-out-of-order`, proving a validator does not sort
+or accumulate the interval set. There is no `gaussian-birth` identity-refusal file, because that
+model exposes no wire identity with which a reader could diagnose cloned source ownership (§3.1,
+§9). This reuses the refusal-expectation harness contract keyframe-delta §11.5 introduces; if that
+contract has landed by the time this does, this adds rows to it rather than a mechanism.
 
 `LodKfDeltaIdentityBudgetOverflow` is a generated exhaustive-validation refusal case. The runner
 configures the validator with a 4,096-byte identity-memory budget. A level-0 keyframe contains the
