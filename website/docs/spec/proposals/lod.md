@@ -371,12 +371,29 @@ In an indexed file, the same check applies to every Chunk Index entry while the 
 parsed, before selection; no payload fetch is needed. The check precedes sorting, overlap, adjacency
 and run-boundary logic.
 
-> Within one level, state chunks MUST NOT overlap. Sorted by `t0`, chunks that touch belong to one
-> contiguous **run**; a gap ends that run and a later chunk begins another. The first chunk of every
-> run MUST be a keyframe, and every delta in the run MUST resolve, through same-level backward
-> references, to a keyframe in that same run. A level need not start at `0`, end at `duration_sec`,
-> or cover its gaps. `current(t, ell)` is therefore either the unique entry at level `ell` whose
-> interval contains `t`, or absent.
+The run rule also needs one conditional physical-order constraint to remain first-class on a pipe.
+Considering only Chunk and Delta Chunk state records in increasing file-offset order, a declared-LOD
+`keyframe-delta` file's `(level, t0)` tuples MUST be lexicographically non-decreasing: all state
+records for a lower observed level precede every state record for a higher level, and within one
+level `t0` never decreases. Levels may remain sparse across the full `u32` domain. SH Band Streams
+and every other non-state record may interleave freely because they do not enter run classification.
+A violation is `lod-level-state-out-of-order` and names both record offsets and tuples.
+
+> Within one level, state chunks MUST NOT overlap. In their physical — and therefore `t0` — order,
+> chunks that touch belong to one contiguous **run**; a gap ends that run and a later chunk begins
+> another. The first chunk of every run MUST be a keyframe, and every delta in the run MUST resolve,
+> through same-level backward references, to a keyframe in that same run. A level need not start at
+> `0`, end at `duration_sec`, or cover its gaps. `current(t, ell)` is therefore either the unique
+> entry at level `ell` whose interval contains `t`, or absent.
+
+A streamed validator retains only the current `level`, previous `t0` and `t1`, current run's
+keyframe offset and the existing bounded chain scalars. A greater level drops all prior run state,
+and that level's first record MUST be a keyframe. At the same level, `t0 < previousT1` is
+`level-overlap`; `t0 == previousT1` continues the run; and `t0 > previousT1` begins a run whose
+first record MUST be a keyframe. A delta's reference and keyframe offsets must remain at or after
+the current run's keyframe offset, so a chain cannot cross the gap. An indexed reader validates the
+identical physical sequence by scanning the small index in `chunk_offset` order. Neither reader
+sorts state records or retains a map from levels to intervals.
 
 This retains the two load-bearing parts of spec §11.1 — no overlapping state at one level, and a
 unique current state wherever that level has coverage — without importing its full-clip coverage
@@ -897,6 +914,7 @@ referential integrity between the index and the chunks, which the format already
 | duplicate live `gaussian_id` values across active `keyframe-delta` level states            | level union never creates a separate live-identity namespace              |
 | a dead `keyframe-delta` `gaussian_id` is later reused in any level or separated run        | level and run boundaries never restart the scene-wide identity history    |
 | a declared-LOD `keyframe-delta` state interval endpoint is NaN or infinite                 | sorting and run comparisons would differ across SDKs                      |
+| declared-LOD `keyframe-delta` state records descend lexicographically by `(level, t0)`     | a pipe reader cannot retain arbitrary per-level run state                 |
 | same-level `keyframe-delta` chunks overlap                                                 | `current(t, ell)` would not be unique                                     |
 | a same-level run starts with a delta or a chain crosses a gap                              | the covered interval has no independently decodable base state            |
 | a band byte range in the index overruns the file                                           | the existing index-range rule (spec §5.8), unchanged                      |
@@ -917,6 +935,10 @@ the per-level sort and run classification, including sparse higher levels and fi
 completeness promise. It is checked before any run comparison. The Header duration participates only
 when `"true"` compares a complete level-0 run against it, so its finiteness requirement remains
 specific to that promise.
+
+After finiteness, the physical state-record order is checked before overlap, adjacency or gap-chain
+logic. The level-major order is what turns those later checks into a constant-state fold rather than
+a per-level map: once the stream advances to a greater level, the lower level can never reappear.
 
 The range and index-presence rows are load-bearing. `lod_levels` is an exclusive bound (§4.4), so a
 chunk whose `level` is at or above it sits outside the advertised range. A reader requesting the
@@ -1112,6 +1134,7 @@ level-run generalization and its compatibility boundary (§3.5, §4.6):
 | `LodLevel0IncompleteFalse` | `gaussian-birth`; Header completeness is `"false"` and level 0 has a coverage gap    | canonical false is inactive; presence alone cannot trigger completeness checks           |
 | `LodLevel0BirthInterleave` | level-0 `t0` values 0, 0.5 with an intervening level-1 Chunk at `t0 = 0.25`          | completeness ordering examines only the level-0 Chunk subsequence                        |
 | `LodLevel0CompleteKf`      | `keyframe-delta`; level 0 is one non-overlapping run covering the clip               | model-specific complete-run promise (§3.5, §4.4)                                         |
+| `LodKfDeltaStreamOrder`    | state records level-major and `t0`-ordered; SH and Metadata records interleave       | constant-state run validation ignores non-state records and sparse missing levels        |
 | `LodProgressiveBands`      | every chunk stores degree 3; deliberate reads probe contiguous prefixes 0..3         | the quality axis; the contiguous-prefix rule; SH-inclusive byte footprints (§3.3)        |
 | `LodOutOfOrderBands`       | degree 3; one chunk completes base, band 2, band 1, then band 3                      | band 2 is held at degree 0 until band 1 closes the contiguous prefix                     |
 | `LodMixedReadDegree`       | every chunk stores degree 3; one read deliberately caps two chunks at 3 and two at 0 | per-chunk transfer caps and digests; a decoder substituting one global read cap fails    |
@@ -1143,24 +1166,29 @@ is applied to the Metadata entry, and no level-0 coverage guarantee is inferred.
 `LodLevel0IncompleteFalse` carries the exact Header value `"false"` and an intentional level-0 gap
 under `gaussian-birth`. Streamed and indexed readers MUST accept it, expose no level-0 completeness
 promise and perform no coverage-order or coverage-union checks; the streamed adapter reports both
-coverage scratch counters as zero. `LodKfDeltaPerLevelRuns` additionally carries a runner-side
-assertion that a **pre-LOD** `keyframe-delta` decoder _refuses_ it on the overlap or gap rule (spec
-§11.1) — the §4.6 compatibility boundary made checkable, so the non-forward-compatible case is
-proven to refuse cleanly rather than mis-decode. `LodStreamBandCut` runs only through the streamed
-recovery path and compares its state to the longest full-degree intact chunk prefix. The no-index
-form of `LodLevel0CompleteBirth` serializes overlapping level-0 chunks in non-decreasing `t0`; its
-adapter reports `level0CoverageScratchScalarsHighWater <= 2` and
-`level0CoverageIntervalsRetained = 0` after every chunk. The shuffled invalid form in §10.3 proves
-the conditional ordering is enforced. `LodLevel0BirthInterleave` has physical Chunk `t0` sequence
-`0` at level 0, `0.5` at level 0, then `0.25` at level 1. The whole-Chunk sequence descends, but the
-level-0 subsequence does not, so both readers MUST accept the completeness promise and the coverage
-scratch counters remain unchanged by the level-1 Chunk. `LodStreamLevelCut` likewise runs through
-streamed recovery and retains the Header's declared bound while summarizing only levels found in the
-intact record prefix. `LodKfDeltaRangeSeek` records every range request and fails if the decoder
-fetches a state chunk outside the index-selected chains; the same valid fixture is separately
-accepted by the exhaustive identity validator. The invalid selected-chain fixtures in §10.3 use the
-same request trace to prove that local identity validation does not expand the seek; the scratch
-counters defined above separately prove that it retains no keyed identity history between seeks.
+coverage scratch counters as zero. `LodKfDeltaStreamOrder` uses sparse levels 0 and 3, two ordered
+runs at level 3, and interleaves SH Band Stream, Metadata and other non-state records between state
+records. Both readers MUST accept it. After every state record the streamed adapter reports
+`runValidationLevelsRetained <= 1`, `runValidationIntervalsRetained <= 1` and
+`runValidationScratchScalarsHighWater <= 8`; non-state records leave all three counters unchanged.
+`LodKfDeltaPerLevelRuns` additionally carries a runner-side assertion that a **pre-LOD**
+`keyframe-delta` decoder _refuses_ it on the overlap or gap rule (spec §11.1) — the §4.6
+compatibility boundary made checkable, so the non-forward-compatible case is proven to refuse
+cleanly rather than mis-decode. `LodStreamBandCut` runs only through the streamed recovery path and
+compares its state to the longest full-degree intact chunk prefix. The no-index form of
+`LodLevel0CompleteBirth` serializes overlapping level-0 chunks in non-decreasing `t0`; its adapter
+reports `level0CoverageScratchScalarsHighWater <= 2` and `level0CoverageIntervalsRetained = 0` after
+every chunk. The shuffled invalid form in §10.3 proves the conditional ordering is enforced.
+`LodLevel0BirthInterleave` has physical Chunk `t0` sequence `0` at level 0, `0.5` at level 0, then
+`0.25` at level 1. The whole-Chunk sequence descends, but the level-0 subsequence does not, so both
+readers MUST accept the completeness promise and the coverage scratch counters remain unchanged by
+the level-1 Chunk. `LodStreamLevelCut` likewise runs through streamed recovery and retains the
+Header's declared bound while summarizing only levels found in the intact record prefix.
+`LodKfDeltaRangeSeek` records every range request and fails if the decoder fetches a state chunk
+outside the index-selected chains; the same valid fixture is separately accepted by the exhaustive
+identity validator. The invalid selected-chain fixtures in §10.3 use the same request trace to prove
+that local identity validation does not expand the seek; the scratch counters defined above
+separately prove that it retains no keyed identity history between seeks.
 
 ### 10.3 Files full-file conformance must refuse
 
@@ -1170,13 +1198,13 @@ identifier of the refusal it must produce — `lod-levels-malformed`, `level-exc
 `level-index-mismatch`, `level-index-interval-mismatch`, `delta-crosses-level`, `level-overlap`,
 `level-run-without-keyframe`, `level-chain-crosses-gap`, `id-crosses-level`,
 `duplicate-id-across-levels`, `id-reuse-across-levels-after-death`, `lod-level-interval-non-finite`,
-`lod-level0-coverage-non-finite`, `lod-level0-birth-out-of-order`, `lod-level0-birth-has-holes`,
-`lod-level0-kf-invalid-run`. These files run through the exhaustive validation entry point; a
-single-instant indexed decode is not required to fetch unselected payloads merely to discover a
-whole-history fault. The non-finite, out-of-order and hole variants also run through a no-index
-streamed decode to clean EOF and MUST produce the same identifier before returning a scene. This
-separately proves the pipe path enforces the promise rather than leaving all completeness checks to
-the exhaustive validator. The malformed-completeness file carries
+`lod-level-state-out-of-order`, `lod-level0-coverage-non-finite`, `lod-level0-birth-out-of-order`,
+`lod-level0-birth-has-holes`, `lod-level0-kf-invalid-run`. These files run through the exhaustive
+validation entry point; a single-instant indexed decode is not required to fetch unselected payloads
+merely to discover a whole-history fault. The non-finite, out-of-order and hole variants also run
+through a no-index streamed decode to clean EOF and MUST produce the same identifier before
+returning a scene. This separately proves the pipe path enforces the promise rather than leaving all
+completeness checks to the exhaustive validator. The malformed-completeness file carries
 `Header.attributes["lod_level0_complete"] = "TRUE"` alongside a valid LOD gate and MUST produce
 `lod-level0-complete-malformed`; this prevents truthiness or case-folding from changing the promise.
 The orphan-promise file carries Header `lod_level0_complete = "true"` without Header `lod_levels`
@@ -1191,10 +1219,16 @@ all three non-finite Header `duration_sec` values with completeness true. Every 
 `lod-level-interval-non-finite` before sorting, overlap or run-boundary logic through both
 exhaustive and no-index streamed validation. Indexed forms additionally MUST refuse while parsing
 the Chunk Index, before requesting any state-chunk payload, even when the non-finite interval
-belongs to a higher level than the caller would select. `LodIndexIntervalMismatch` is generated from
-declared-LOD indexed fixtures under both temporal models, with the Header completeness key true,
-false and absent where each value is legal. It changes one index `t0` and, separately, one index
-`t1` without changing the pointed Chunk or Delta Chunk, and MUST produce
+belongs to a higher level than the caller would select. `LodKfDeltaStateOutOfOrder` has three forms:
+one level's finite `t0` values descend, state levels descend from 3 to 2, and level 0 reappears
+after a level-3 state record. Each form interleaves non-state records that the validator must ignore
+and MUST produce `lod-level-state-out-of-order` before overlap or chain validation through
+exhaustive, no-index streamed and indexed-open paths. The streamed scratch counters MUST remain
+within the `LodKfDeltaStreamOrder` bounds through the refusal; a validator that retains a map for
+the shuffled levels fails even if it eventually finds the ordering error. `LodIndexIntervalMismatch`
+is generated from declared-LOD indexed fixtures under both temporal models, with the Header
+completeness key true, false and absent where each value is legal. It changes one index `t0` and,
+separately, one index `t1` without changing the pointed Chunk or Delta Chunk, and MUST produce
 `level-index-interval-mismatch`. The selected forms run through exhaustive validation and an indexed
 seek that selects the changed entry; the request trace proves the decoder discovers the mismatch
 from that selected record without scanning unrelated payloads. A self-deselecting `gaussian-birth`
@@ -1279,8 +1313,9 @@ Added as `No` or `Planned` for every SDK, moved only by a passing suite:
 - Contiguous band prefixes — the highest-contiguous-prefix rule with out-of-order bands held (§3.3)
 - Per-chunk SH transfer caps — `byChunk` agrees while stored scene degree remains uniform
 - Stream truncation — an incomplete trailing band set is dropped, never treated as an implicit cap
-- Keyframe-delta per-level runs — every declared-LOD state interval is finite before sorting;
-  non-overlapping sparse runs start at keyframes and chains never cross a gap
+- Keyframe-delta per-level runs — every declared-LOD state interval is finite; state records are
+  physically level-major and `t0`-ordered so a pipe validates non-overlapping sparse runs, keyframe
+  starts and gap-local chains with one retained level and interval
 - Keyframe-delta range seek — indexed reads fetch only selected chains and validate identity
   evidence in those chains, including invalid duplicate/reuse cases, without scanning unrelated
   payloads; scratch-counter high-water is bounded by one seek and live scratch is zero on return
