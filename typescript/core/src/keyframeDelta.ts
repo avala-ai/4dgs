@@ -963,7 +963,8 @@ interface Reconstruction {
  * §11.2). That is decoded-value order — not stream order, which a reader may not rely on —
  * so two implementations that compose the same population agree on every row.
  */
-function reconstructAt(state: KeyframeDeltaState, grids: Grids, t: number): Reconstruction {
+function reconstructAt(info: KeyframeDeltaChunkInfo, grids: Grids, t: number): Reconstruction {
+  const state = info.state;
   const n = state.count;
   const order = Array.from({ length: n }, (_, i) => i).sort(
     (a, b) => state.ids[a]! - state.ids[b]!,
@@ -998,7 +999,11 @@ function reconstructAt(state: KeyframeDeltaState, grids: Grids, t: number): Reco
     // validity window (spec §6.3), so the pitch is selected per gaussian from its
     // window_index rather than from a single shared window; an out-of-range index is
     // refused, not clamped.
-    const windowIndex = checkWindowIndex(windowBins[i]!, windowCount);
+    const windowIndex = checkWindowIndex(
+      windowBins[i]!,
+      windowCount,
+      `keyframe-delta chunk at byte ${info.offset}, gaussian id ${state.ids[i]!}`,
+    );
     const winLen = grids.windows[windowIndex * 2 + 1]! - grids.windows[windowIndex * 2]!;
     const mStep = motionStep(
       lifeClass(sigmaBin, steps.sigmaLog, neverFades, winLen, k),
@@ -1121,9 +1126,13 @@ export function keyframeDeltaStatesJson(sequence: KeyframeDeltaSequence): Record
   // the Header's duration. For a complete file they are equal (the timeline tiles to
   // duration), so this changes nothing there; for a streamed prefix it stops the near-end
   // probe from falling past the last chunk and extrapolating stale state (spec §11.10).
-  const probeEnd = sequence.chunks.length
-    ? Math.max(...sequence.chunks.map((c) => c.t1))
-    : duration;
+  let probeEnd = duration;
+  if (sequence.chunks.length > 0) {
+    probeEnd = sequence.chunks[0]!.t1;
+    for (let i = 1; i < sequence.chunks.length; i++) {
+      probeEnd = Math.max(probeEnd, sequence.chunks[i]!.t1);
+    }
+  }
   const states = probeTimes(sequence.chunks, probeEnd).map((t) =>
     stateRow(stateCovering(sequence.chunks, t), grids, t),
   );
@@ -1139,7 +1148,7 @@ export function keyframeDeltaStatesJson(sequence: KeyframeDeltaSequence): Record
 }
 
 function stateRow(info: KeyframeDeltaChunkInfo, grids: Grids, t: number): Record<string, unknown> {
-  const r = reconstructAt(info.state, grids, t);
+  const r = reconstructAt(info, grids, t);
   const sampleN = Math.min(SAMPLE, r.count);
   const positionSum = [0, 0, 0];
   let opacitySum = 0;

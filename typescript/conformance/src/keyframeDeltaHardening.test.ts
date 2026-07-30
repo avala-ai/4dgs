@@ -232,7 +232,14 @@ test("an out-of-range window index is refused, not clamped", async () => {
   });
   // The window index is used when the pitch is derived, i.e. during reconstruction.
   const decoded = await decodeKeyframeDeltaStreamed(file);
-  assert.throws(() => keyframeDeltaStatesJson(decoded), MalformedFile);
+  const chunkOffset = decoded.chunks[0]!.offset;
+  assert.throws(
+    () => keyframeDeltaStatesJson(decoded),
+    (error: unknown) =>
+      error instanceof MalformedFile &&
+      error.message.includes(`keyframe-delta chunk at byte ${chunkOffset}, gaussian id 0`) &&
+      error.message.includes("window index 3 is outside the 1-entry window table"),
+  );
 });
 
 // --- chunk-level compression (codex P1 §5.5/§5.18) ------------------------
@@ -312,6 +319,22 @@ test("a streamed decode reads a complete prefix and bounds probes to the last ch
   const states = keyframeDeltaStatesJson(decoded).states as { t: number }[];
   assert.ok(states.length > 0);
   assert.ok(states.every((s) => s.t < lastT1));
+});
+
+test("canonical summaries handle more chunks than V8's argument limit", async () => {
+  const decoded = await decodeKeyframeDeltaStreamed(
+    await oneKeyframeFile({
+      windows: [[0, 1]],
+      windowIndex: 0,
+      motionBinX: 0,
+      duration: 1,
+    }),
+  );
+  const chunk = decoded.chunks[0]!;
+  const chunks = Array.from({ length: 130_000 }, () => chunk);
+
+  const summary = keyframeDeltaStatesJson({ ...decoded, chunks });
+  assert.equal((summary.chunks as unknown[]).length, chunks.length);
 });
 
 // --- Delta Chunk header refusals, by mutating a valid file ----------------

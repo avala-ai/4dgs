@@ -48,10 +48,11 @@ export function windowTableOrDefault(windows: Float64Array): Float64Array {
  * wrong in some way nobody has diagnosed — it turns a detectable fault into plausible
  * wrong output.
  */
-export function checkWindowIndex(index: number, windowCount: number): number {
+export function checkWindowIndex(index: number, windowCount: number, location?: string): number {
   if (index < 0 || index >= windowCount) {
     throw new MalformedFile(
-      `window index ${index} is outside the ${windowCount}-entry window table`,
+      `${location === undefined ? "" : `${location}: `}window index ${index} is outside the ` +
+        `${windowCount}-entry window table`,
     );
   }
   return index;
