@@ -8,14 +8,14 @@ documented state — not a defect — and this table is the public contract that
 declarations. Nothing is marked `Yes` on the strength of code existing.
 
 Every row is filled in from a suite that runs: 46 valid variants and 7 invalid ones, plus 4
-keyframe-delta and 3 object-layer variants in their own subdirectories, over two read paths (streamed
-and indexed). A language takes the variants it declares support for, and what it declines is what
-this table records — 119 checks passing for Python, 105 for Rust, and 87 each for TypeScript, Dart,
-C++ and Swift. Rust declines the refusal expectations; TypeScript, C++, Swift and Dart also decline
-the five variants that carry provenance records and the four that carry the object layer. C++ and
-Swift now decode the four keyframe-delta variants on both read paths — they read 4DGS through the
-Rust C ABI, whose additive states-JSON accessor computes the summary in the core so every binding
-emits identical bytes.
+keyframe-delta and 3 object-layer variants in their own subdirectories, over two read paths
+(streamed and indexed). A language takes the variants it declares support for, and what it declines
+is what this table records — 119 checks passing for Python, 105 for Rust, and 87 each for
+TypeScript, Dart, C++ and Swift. Rust declines the refusal expectations; TypeScript, C++, Swift and
+Dart also decline the five variants that carry provenance records and the four that carry the object
+layer. C++ and Swift now decode the four keyframe-delta variants on both read paths — they read 4DGS
+through the Rust C ABI, whose additive states-JSON accessor computes the summary in the core so
+every binding emits identical bytes.
 
 | Feature                                           | Python | TypeScript | Rust    | C++     | Swift   | Dart    |
 | ------------------------------------------------- | ------ | ---------- | ------- | ------- | ------- | ------- |
@@ -102,19 +102,19 @@ which of the two it is.
 
 **The object layer** is proved separately because reading its records is not enough. Composition is
 where two implementations that agree on every stored field can still diverge: the layer transforms
-the base state rather than replacing it — `center = R*c0 + T`, `orientation = R (x) r0`, base first —
-so a summary that carried only the table and the tracks would pass a decoder that dropped the track
-or applied it before per-gaussian motion. The canonical `states` therefore carry the post-track
-centers and orientations at three scene-clock probes, in the canonical gaussian order, and the
-streamed and indexed paths must agree.
+the base state rather than replacing it — `center = R*c0 + T`, `orientation = R (x) r0`, base first
+— so a summary that carried only the table and the tracks would pass a decoder that dropped the
+track or applied it before per-gaussian motion. The canonical `states` therefore carry the
+post-track centers and orientations at three scene-clock probes, in the canonical gaussian order,
+and the streamed and indexed paths must agree.
 
 Three variants in a `data/object/` subdirectory, the way the keyframe-delta and invalid corpora sit
 in theirs, exercise that composition: a single tracked object over a static base (a table entry with
 dynamics and an embedding, and a two-sample track that turns and translates); a multi-object scene
 with a linearly tracked object, a step-tracked one, an untracked-but-labelled one whose gaussians
 pass through unchanged, and background gaussians no track may name; and a track composed over a base
-that itself moves and turns, where every gaussian carries per-gaussian motion and a non-identity rest
-orientation, so the motion must fold into the base center before the pose transports it and the
+that itself moves and turns, where every gaussian carries per-gaussian motion and a non-identity
+rest orientation, so the motion must fold into the base center before the pose transports it and the
 rotations must compose as a quaternion product rather than one replacing the other. The subdirectory
 is not a workaround the way the keyframe-delta one is — an object record is additive to the
 gaussian-birth model, and the one `WithObjects` variant at the top level is read by the Kaitai
