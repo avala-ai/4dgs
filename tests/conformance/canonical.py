@@ -275,7 +275,16 @@ def _objects_and_states(header, gaussians, objects, order) -> dict:
                     "objectId": str(entry.object_id),
                     "label": entry.label,
                     "anchor": [num(value) for value in entry.anchor],
-                    "hasDynamics": entry.dynamics is not None,
+                    # The decoded dynamics values, not merely their presence: a summary that
+                    # said only whether the record was there would pass a decoder that read
+                    # the nine floats and exposed zeros. `None` when the entry carries none.
+                    "dynamics": None
+                    if entry.dynamics is None
+                    else {
+                        "velocity": [num(v) for v in entry.dynamics[0]],
+                        "angularVelocity": [num(v) for v in entry.dynamics[1]],
+                        "acceleration": [num(v) for v in entry.dynamics[2]],
+                    },
                     "hasEmbedding": embedding is not None,
                     "embeddingCrc": None if embedding is None else crc(embedding_bytes),
                 }

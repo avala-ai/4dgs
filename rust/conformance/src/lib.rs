@@ -404,7 +404,29 @@ fn objects_and_states(
                         "anchor",
                         J::Arr(entry.anchor.iter().map(|value| numf(*value)).collect()),
                     ),
-                    ("hasDynamics", J::Bool(entry.dynamics.is_some())),
+                    // The decoded dynamics values, not merely their presence: a summary that
+                    // said only whether the record was there would pass a decoder that read
+                    // the nine floats and exposed zeros. Null when the entry carries none.
+                    (
+                        "dynamics",
+                        match &entry.dynamics {
+                            None => J::Null,
+                            Some((velocity, angular_velocity, acceleration)) => J::obj(vec![
+                                (
+                                    "velocity",
+                                    J::Arr(velocity.iter().map(|v| numf(*v)).collect()),
+                                ),
+                                (
+                                    "angularVelocity",
+                                    J::Arr(angular_velocity.iter().map(|v| numf(*v)).collect()),
+                                ),
+                                (
+                                    "acceleration",
+                                    J::Arr(acceleration.iter().map(|v| numf(*v)).collect()),
+                                ),
+                            ]),
+                        },
+                    ),
                     ("hasEmbedding", J::Bool(entry.embedding.is_some())),
                     ("embeddingCrc", embedding_crc),
                 ]));
