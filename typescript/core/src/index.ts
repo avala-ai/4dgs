@@ -59,11 +59,15 @@ export {
 export { Cursor } from "./cursor.js";
 
 export {
+  DELTA_MODE_CHAINED,
+  DELTA_MODE_KEYFRAME,
   FOOTER_TAIL_BYTES,
   MAGIC,
   RECORD_HEADER_BYTES,
   VERSION,
   type Attachment,
+  type DeltaChunkHeader,
+  type ParsedDeltaChunk,
   type AudioTrack,
   type AudioData,
   type AudioSource,
@@ -94,6 +98,7 @@ export {
   parseCamera,
   parseChunk,
   parseChunkIndexEntry,
+  parseDeltaChunk,
   parseFooter,
   parseHeader,
   parseMetadata,
@@ -167,6 +172,34 @@ export { StreamDecoder, type StreamedRecordPart } from "./streamDecoder.js";
 export { FrontMatterScanner, type FrontMatterRecord } from "./frontMatter.js";
 
 export { type AudioPayloadChunk, type DecodeOptions, type Scene, decodeScene } from "./scene.js";
+
+export {
+  ABSOLUTE_IN_UPDATE,
+  BIN_MAX,
+  BIN_MIN,
+  GOP_INVARIANT,
+  type BinColumn,
+  type Group,
+  type State,
+  applyDelta,
+  chainFor,
+  checkTiling,
+  keyframeState,
+  stateCount,
+} from "./keyframeDelta.js";
+
+export {
+  type ChunkInfo,
+  type DecodedSequence,
+  type Grids,
+  type Reconstruction,
+  decodeKeyframeDeltaIndexed,
+  decodeKeyframeDeltaStreamed,
+  gridsFor,
+  probeTimes,
+  reconstructAt,
+  stateCovering,
+} from "./keyframeDeltaFile.js";
 
 export {
   HEAD_PROBE_BYTES,

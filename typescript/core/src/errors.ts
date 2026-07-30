@@ -36,8 +36,19 @@ export class TruncatedFile extends FourdgsError {}
 /**
  * A structurally invalid file: a required record missing, a bad index, a value outside
  * its legal range.
+ *
+ * Carries an optional stable `code` naming the failure (e.g. `"forward-reference"`), so a
+ * caller — or the conformance suite's refusal expectations — can match the reason a file
+ * was refused without parsing the human message.
  */
-export class MalformedFile extends FourdgsError {}
+export class MalformedFile extends FourdgsError {
+  readonly code: string;
+
+  constructor(message: string, code = "") {
+    super(message);
+    this.code = code;
+  }
+}
 
 /**
  * A legal but unimplemented codec. The file is fine; this build cannot read it.

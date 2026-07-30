@@ -25,6 +25,7 @@ export const Opcode = {
   Attachment: 0x0d,
   AttachmentIndex: 0x0e,
   SummaryOffset: 0x0f,
+  DeltaChunk: 0x10,
   AudioSource: 0x11,
   AudioData: 0x12,
 } as const;
@@ -74,6 +75,13 @@ export const Attribute = {
   WindowIndex: 10,
   SourceGroup: 11,
   SourceIndex: 12,
+  /**
+   * Identity, required in every chunk of a `keyframe-delta` file and absent from a
+   * `gaussian-birth` one. Distinct from {@link Attribute.SourceIndex}, a producer-side
+   * handle a reader may skip; this is what a delta names its gaussians by (spec §11.2).
+   */
+  GaussianId: 13,
+  ObjectId: 14,
 } as const;
 
 /** Attribute ids every chunk must carry. */

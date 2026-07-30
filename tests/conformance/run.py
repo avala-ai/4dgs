@@ -58,6 +58,18 @@ RUNNERS = [
     ),
     ("typescript", "typescript/decode_streamed", ["node", os.path.join(TYPESCRIPT_DIST, "decode_streamed.js")]),
     ("typescript", "typescript/decode_indexed", ["node", os.path.join(TYPESCRIPT_DIST, "decode_indexed.js")]),
+    # keyframe-delta (§11) has its own `states` canonical, so it needs its own runners; the
+    # gaussian-birth runners above decline the model's variants (see `supports`).
+    (
+        "typescript",
+        "typescript/decode_keyframe_delta_streamed",
+        ["node", os.path.join(TYPESCRIPT_DIST, "decode_keyframe_delta_streamed.js")],
+    ),
+    (
+        "typescript",
+        "typescript/decode_keyframe_delta_indexed",
+        ["node", os.path.join(TYPESCRIPT_DIST, "decode_keyframe_delta_indexed.js")],
+    ),
     ("cpp", "cpp/decode_streamed", [os.path.join(CPP_BUILD, "decode_streamed" + EXE)]),
     ("cpp", "cpp/decode_indexed", [os.path.join(CPP_BUILD, "decode_indexed" + EXE)]),
     ("rust", "rust/decode_streamed", [os.path.join(RUST_BIN, "decode_streamed" + EXE)]),
@@ -118,10 +130,45 @@ FAMILY_DECLINES: dict[str, tuple[str, ...]] = {
 }
 
 
+#: The `keyframe-delta` temporal model (§11) has a different canonical statement — a
+#: reconstruction at an instant (`states`), not a per-file summary — so it gets its own
+#: runners rather than sharing the gaussian-birth ones. A variant is a keyframe-delta one
+#: when its name carries this flag, and the two runner kinds partition the corpus: a
+#: keyframe-delta runner reads only keyframe-delta variants, and a gaussian-birth runner
+#: reads only the rest (it would otherwise refuse the file by the temporal-model gate, §5.1).
+KEYFRAME_DELTA_FLAG = "KeyframeDelta"
+
+
+def _keyframe_delta_support(runner_name: str, variant: str) -> bool | None:
+    """Partition the corpus by temporal model, or `None` when neither side applies.
+
+    The two runner kinds are disjoint: a keyframe-delta runner reads only the model's
+    valid variants (its indexed form additionally needing an index, exactly as the
+    gaussian-birth indexed path does), and a gaussian-birth runner reads only the rest —
+    it would otherwise refuse the file by the temporal-model gate (§5.1). `None` means the
+    variant is not keyframe-delta and the runner is not a keyframe-delta one, so the
+    ordinary rules below decide it.
+    """
+    is_kd_runner = "keyframe_delta" in runner_name
+    is_kd_variant = KEYFRAME_DELTA_FLAG in variant and not variant.startswith(INVALID_PREFIX)
+    if is_kd_runner:
+        if not is_kd_variant:
+            return False
+        return "UseChunkIndex" in variant if runner_name.endswith("decode_indexed") else True
+    if is_kd_variant:
+        return False
+    return None
+
+
 def supports(runner_name: str, variant: str) -> bool:
     family = runner_name.split("/", maxsplit=1)[0]
     if any(flag in variant for flag in FAMILY_DECLINES.get(family, ())):
         return False
+
+    keyframe_delta = _keyframe_delta_support(runner_name, variant)
+    if keyframe_delta is not None:
+        return keyframe_delta
+
     if variant.startswith(INVALID_PREFIX) and family not in REFUSAL_FAMILIES:
         return False
     if not runner_name.endswith("decode_indexed"):

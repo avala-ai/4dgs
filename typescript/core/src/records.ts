@@ -261,7 +261,37 @@ export interface ChunkIndexEntry {
   readonly chunkLength: number;
   readonly gaussianCount: number;
   readonly bands: readonly BandRange[];
+  /**
+   * True when this entry carries the six appended `keyframe-delta` fields (spec §5.8).
+   * False for every `gaussian-birth` file, whose entries must stay byte-identical.
+   */
+  readonly extended: boolean;
+  /** 0 keyframe (a Chunk record), 1 delta (a Delta Chunk record). `0` when not extended. */
+  readonly kind: number;
+  readonly deltaMode: number;
+  /**
+   * The chunk this delta applies to. Strictly less than `chunkOffset`: references point
+   * backwards only, so the chain walk terminates and cycles are unrepresentable.
+   */
+  readonly referenceOffset: number;
+  /** The keyframe at the head of this GOP. Equals `chunkOffset` for a keyframe. */
+  readonly keyframeOffset: number;
+  /** Delta chunks that must be composed to reach this one; the exact seek read cost. */
+  readonly depth: number;
+  /**
+   * Gaussians live over `[t0, t1)` after composition. `gaussianCount` cannot answer this
+   * for a delta entry — there it is the size of the delta, not of the population.
+   */
+  readonly liveCount: number;
 }
+
+/**
+ * Bytes the `keyframe-delta` block appends to a Chunk Index entry (spec §5.8): a reader
+ * takes the record's length from its header, so an entry with at least this many bytes
+ * left after the band array carries the block and one without simply does not — which is
+ * how a `gaussian-birth` file written before this revision still parses, unchanged.
+ */
+const INDEX_DELTA_BLOCK_BYTES = 1 + 1 + 8 + 8 + 2 + 8;
 
 export function parseChunkIndexEntry(content: Uint8Array): ChunkIndexEntry {
   const c = new Cursor(content);
@@ -275,7 +305,100 @@ export function parseChunkIndexEntry(content: Uint8Array): ChunkIndexEntry {
   for (let i = 0; i < bandCount; i++) {
     bands.push({ band: c.u8(), offset: c.u64(), length: c.u64() });
   }
-  return { t0, t1, chunkOffset, chunkLength, gaussianCount, bands };
+  // The six appended fields exist only for keyframe-delta, and appending them after the
+  // variable band array is legal by §4.2: a reader that knows only the earlier fields
+  // parses the band array, stops on content_length, and never sees them.
+  if (c.remaining >= INDEX_DELTA_BLOCK_BYTES) {
+    return {
+      t0,
+      t1,
+      chunkOffset,
+      chunkLength,
+      gaussianCount,
+      bands,
+      extended: true,
+      kind: c.u8(),
+      deltaMode: c.u8(),
+      referenceOffset: c.u64(),
+      keyframeOffset: c.u64(),
+      depth: c.u16(),
+      liveCount: c.u64(),
+    };
+  }
+  return {
+    t0,
+    t1,
+    chunkOffset,
+    chunkLength,
+    gaussianCount,
+    bands,
+    extended: false,
+    kind: 0,
+    deltaMode: 0,
+    referenceOffset: 0,
+    keyframeOffset: chunkOffset,
+    depth: 0,
+    liveCount: gaussianCount,
+  };
+}
+
+/** `delta_mode` values (spec §11.4). */
+export const DELTA_MODE_KEYFRAME = 0;
+export const DELTA_MODE_CHAINED = 1;
+
+export interface DeltaChunkHeader {
+  readonly t0: number;
+  readonly t1: number;
+  readonly level: number;
+  readonly deltaMode: number;
+  readonly referenceOffset: number;
+  readonly keyframeOffset: number;
+  readonly depth: number;
+  readonly updateCount: number;
+  readonly birthCount: number;
+  readonly deathCount: number;
+  readonly compression: string;
+  readonly uncompressedSize: number;
+}
+
+export interface ParsedDeltaChunk {
+  readonly header: DeltaChunkHeader;
+  /** The three length-framed sub-blocks, still compressed per stream, in wire order. */
+  readonly updates: Uint8Array;
+  readonly births: Uint8Array;
+  readonly deaths: Uint8Array;
+}
+
+/**
+ * A Delta Chunk record (opcode `0x10`, spec §5.18).
+ *
+ * The `records` blob decompresses to three `bytes`-framed sub-blocks — updates, births,
+ * deaths — each a run of concatenated Attribute Stream structures. Chunk-level
+ * compression over the whole block is honoured by {@link parseDeltaChunk}'s caller, which
+ * sees the raw sub-block views; here `compression` is read and the block framed as-is,
+ * exactly as `parseChunk` does for a keyframe.
+ */
+export function parseDeltaChunk(content: Uint8Array): ParsedDeltaChunk {
+  const c = new Cursor(content);
+  const header: DeltaChunkHeader = {
+    t0: c.f64(),
+    t1: c.f64(),
+    level: c.u32(),
+    deltaMode: c.u8(),
+    referenceOffset: c.u64(),
+    keyframeOffset: c.u64(),
+    depth: c.u16(),
+    updateCount: c.u32(),
+    birthCount: c.u32(),
+    deathCount: c.u32(),
+    compression: c.string(),
+    uncompressedSize: c.u64(),
+  };
+  const records = new Cursor(c.blob());
+  const updates = records.blob();
+  const births = records.blob();
+  const deaths = records.blob();
+  return { header, updates, births, deaths };
 }
 
 /** The half-open interval test the seek rule is built on. */
