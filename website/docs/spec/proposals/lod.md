@@ -377,11 +377,12 @@ valid.
 in the Chunk Index. This proposal does not duplicate a potentially scene-sized `id -> level` map
 into the summary, and an ordinary indexed seek MUST NOT fetch unrelated chunks merely to reconstruct
 the file's complete ownership or death history. It validates every identity fact in the chains it
-actually fetches. A source-aware encoder conformance run and a full-file validator scan all
-state-bearing payloads and therefore MUST prove immutable ownership and no reuse exhaustively.
-Consequently a direct seek may not discover a migration that exists only in a run it did not fetch;
-that is the stated limit of partial validation, not permission for the file to violate the
-invariant.
+actually fetches for that seek, using scratch state bounded by the selected chains' validated
+decoded sizes. It MUST NOT retain a cumulative scene-wide identity map across seeks. A source-aware
+encoder conformance run and a full-file validator scan all state-bearing payloads and therefore MUST
+prove immutable ownership and no reuse exhaustively. Consequently a direct seek may not discover a
+migration that exists only in a run it did not fetch, or across two disjoint seeks; that is the
+stated limit of partial validation, not permission for the file to violate the invariant.
 
 A reader always has the complete active union for its requested `t` and `N`, so if it finds the same
 live id in two fetched levels it MUST refuse, naming the id, `t`, both levels and the chunks that
@@ -862,13 +863,15 @@ The three identity rows are `keyframe-delta` conformance faults with two validat
 range seek reconstructs its complete active union, so the live-uniqueness check is local and
 mandatory on that seek. Immutable ownership and no reuse are whole-history checks: a full-file
 validator records the level of every id's first state-bearing occurrence and its lifecycle, while a
-partial reader applies the same checks only to history present in its fetched chains and MUST NOT
-scan unrelated payloads solely to complete them (§3.5). Thus two individually valid active chains
-that carry the same live `gaussian_id` are a live duplicate; an id seen in disjoint level runs
-without a death is a migration; and an id that dies then births again is reuse. If one malformed
-history satisfies more than one predicate, the more specific live-duplicate or reuse identifier
-takes precedence over the migration identifier so conformance diagnostics remain deterministic
-(§10.3).
+partial reader applies the same checks only to history present in the current seek's fetched chains,
+MUST NOT scan unrelated payloads solely to complete them, and MUST NOT retain that history across
+seeks (§3.5). Thus two individually valid active chains that carry the same live `gaussian_id` are a
+live duplicate; an id seen in disjoint level runs without a death is a migration; and an id that
+dies then births again is reuse. If one malformed history satisfies more than one predicate in the
+current selected chains, the more specific live-duplicate or reuse identifier takes precedence over
+the migration identifier so conformance diagnostics remain deterministic (§10.3). Per-seek identity
+scratch is discarded or reused after the result; only the exhaustive validator carries identity
+history across the full file.
 
 `gaussian-birth` has no `gaussian_id` attribute (registry §“Attribute ids”), so a file reader has no
 structural observation that can prove one logical source gaussian was restated in two tranches.
@@ -992,10 +995,12 @@ transfer caps over one uniformly stored scene (§3.3) are asserted rather than a
   separated run. It refuses a cross-level migration, a live duplicate, or an id reborn after death
   even if the offending id falls outside the sample. The indexed decode runner checks the identity
   evidence its selected chains fully expose: live uniqueness across the fetched active union and
-  no-reuse across the histories present in those chains. It is instrumented to prove it never
-  requests unrelated payloads to complete a whole-file identity audit. Positive multi-level rows use
-  level-stable, never-reused ids, and the invalid corpus contains both exhaustive cases and
-  selected-chain cases (§10.3).
+  no-reuse across the histories present in those chains. Its identity scratch is scoped to one seek,
+  bounded by the selected chains' validated decoded sizes, then discarded or reused. It is
+  instrumented to prove it never requests unrelated payloads to complete a whole-file identity
+  audit, and a disjoint-seek sequence proves one call's identities do not become another call's
+  input. Positive multi-level rows use level-stable, never-reused ids, and the invalid corpus
+  contains both exhaustive cases and selected-chain cases (§10.3).
 - **`states[].byChunk` carries a per-chunk transfer cap and SH digest.** `throughShDegree` is the
   highest contiguous band prefix selected for that chunk in this read, and `shCrc` digests only the
   coefficients through that prefix. The file still stores the same Header-declared degree for every
@@ -1046,7 +1051,7 @@ while summarizing only levels found in the intact record prefix. `LodKfDeltaRang
 range request and fails if the decoder fetches a state chunk outside the index-selected chains; the
 same valid fixture is separately accepted by the exhaustive identity validator. The invalid
 selected-chain fixtures in §10.3 use the same request trace to prove that local identity validation
-does not expand the seek.
+does not expand the seek or retain unbounded history between seeks.
 
 ### 10.3 Files full-file conformance must refuse
 
@@ -1072,8 +1077,8 @@ diagnose cloned source ownership (§3.1, §9). This reuses the refusal-expectati
 keyframe-delta §11.5 introduces; if that contract has landed by the time this does, this adds rows
 to it rather than a mechanism.
 
-Three additional invalid cases run through the **indexed seek** entry point with an instrumented
-byte source:
+Two additional invalid cases run through the **indexed seek** entry point with an instrumented byte
+source:
 
 - `LodKfDeltaSeekDuplicateId` selects two active level chains that both contain `gaussian_id = 7`.
   The decoder MUST produce `duplicate-id-across-levels` before returning the union, even though
@@ -1082,15 +1087,13 @@ byte source:
   births id 7 before the requested state. The decoder MUST produce
   `id-reuse-across-levels-after-death` from those two selected histories without reading any chunk
   outside either chain.
-- `LodKfDeltaSeekMigration` makes two ordered seeks in one reader session. The first selected chain
-  exposes id 7 at level 0; the second exposes id 7 in a later, non-overlapping level-1 run with no
-  death in either fetched history. The second seek MUST produce `id-crosses-level` from the
-  session's observed `id -> level` map without fetching the gap or any other run.
 
-For all three cases the request log is part of the expectation: only the Header, Footer, summary,
+For both cases the request log is part of the expectation: only the Header, Footer, summary,
 selected Chunk / Delta Chunk records and their selected SH ranges may be fetched. A decoder that
 skips fetched-chain identity checks fails on the missing refusal; a decoder that obtains the refusal
-by scanning the whole file fails on the range trace.
+by scanning the whole file fails on the range trace. A separate sequence of disjoint valid seeks
+asserts that the reader does not accumulate an `id -> level` map across calls; cross-run migration
+that is not wholly present in one selected seek remains an exhaustive-validation invariant.
 
 ### 10.4 Feature matrix rows
 
@@ -1104,8 +1107,8 @@ Added as `No` or `Planned` for every SDK, moved only by a passing suite:
 - Per-chunk SH transfer caps — `byChunk` agrees while stored scene degree remains uniform
 - Stream truncation — an incomplete trailing band set is dropped, never treated as an implicit cap
 - Keyframe-delta range seek — indexed reads fetch only selected chains and validate identity
-  evidence in those chains, including invalid migration/duplicate/reuse cases, without scanning
-  unrelated payloads
+  evidence in those chains, including invalid duplicate/reuse cases, without scanning unrelated
+  payloads or retaining cumulative identity history
 - Keyframe-delta full-file identity — every id has one immutable level, active unions have unique
   ids, and lifecycle history never restarts across levels or separated runs
 - Full-union equivalence — a `lod_levels - 1` decode equals a non-LOD decode
