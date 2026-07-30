@@ -32,6 +32,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "data")
 INVALID = os.path.join(DATA, "invalid")
 KEYFRAME = os.path.join(DATA, "keyframe")
+OBJECT = os.path.join(DATA, "object")
 CHECKSUMS = os.path.join(DATA, "CHECKSUMS.txt")
 sys.path.insert(0, os.path.join(HERE, "generator"))
 sys.path.insert(0, HERE)
@@ -56,6 +57,8 @@ from fourdgs.provenance import Provenance
 from fourdgs.records import (
     DELTA_MODE_CHAINED,
     DELTA_MODE_KEYFRAME,
+    TRAJECTORY_LINEAR,
+    TRAJECTORY_STEP,
     Attachment,
     CoordinateFrame,
     GeodeticAnchor,
@@ -395,6 +398,261 @@ def build_keyframe_delta_corpus() -> list[tuple[str, bytes, str]]:
     return out
 
 
+# --------------------------------------------------------------------------
+# object-layer corpus
+# --------------------------------------------------------------------------
+#
+# A separate generation path, like the keyframe-delta one above and for the same reason: an
+# object-layer variant is a gaussian-birth file plus an Object Table and SE(3) tracks, and
+# the interesting thing about it is not a flag on the `Scenario`/`FLAGS` cross-product but
+# the reconstruction it composes — `center = R*c0 + T`, `orient = R (x) r0`, base first.
+# `scenarios.py` already carries one `WithObjects` variant at the top level, which is where
+# the Kaitai grammar and the fuzzer prove the records frame and skip; these variants go a
+# level deeper into decode/compose that only the conformance harness dispatches on: a
+# multi-object table with a tracked, an untracked and a background object, and a track
+# composed over a base that itself moves.
+#
+# They live in `data/object/`, not because an object record breaks a top-level consumer —
+# it does not, and the one `WithObjects` variant at the top proves that — but to keep the
+# object-layer family gathered where `run.py` reaches for it, exactly as `data/keyframe/`
+# gathers the temporal-model family. The `.4dgs` bytes stay generator-only; only the JSON
+# expectations and CHECKSUMS are committed.
+#
+# Every name carries `UseChunkIndex` so the indexed read path is exercised, plus `UseCrc`.
+
+#: Seconds of the synthetic object scenes. Short — the poses are what matter, not a long
+#: clip — and every file stays well under the corpus size cap.
+_OBJ_DURATION = 4.0
+
+
+def _obj_gaussians(
+    positions: list[list[float]],
+    object_ids: list[int],
+    *,
+    motions: list[list[float]] | None = None,
+    rotations: list[list[float]] | None = None,
+) -> fourdgs.GaussianSet:
+    """A population at one instant carrying object membership, over one full-clip window.
+
+    Sigma is finite and the window spans the whole clip, so every gaussian is live at every
+    probe and the composition — not visibility — is what the states measure. `motions` and
+    `rotations` default to still and identity; a variant that wants to prove `track ∘ base`
+    over a moving base passes non-zero ones.
+    """
+    n = len(positions)
+    return fourdgs.GaussianSet(
+        positions=np.asarray(positions, dtype=np.float32).reshape(n, 3),
+        scales=np.full((n, 3), 0.05, dtype=np.float32),
+        rotations=(
+            np.asarray(rotations, dtype=np.float32).reshape(n, 4)
+            if rotations is not None
+            else np.tile(np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32), (n, 1))
+        ),
+        colors=np.tile(np.array([0.6, 0.4, 0.2, 0.9], dtype=np.float32), (n, 1)),
+        motions=(
+            np.asarray(motions, dtype=np.float32).reshape(n, 3)
+            if motions is not None
+            else np.zeros((n, 3), dtype=np.float32)
+        ),
+        mu_t=np.zeros(n, dtype=np.float32),
+        sigma_t=np.full(n, 100.0, dtype=np.float32),  # finite, effectively non-fading over the clip
+        win_lo=np.zeros(n, dtype=np.float32),
+        win_hi=np.full(n, _OBJ_DURATION, dtype=np.float32),
+        object_id=np.asarray(object_ids, dtype=np.uint32),
+    )
+
+
+def _obj_single() -> tuple[fourdgs.GaussianSet, ObjectLayer]:
+    """One tracked object over a static base: an Object Table entry with dynamics and an
+    embedding, and a two-sample track that rotates a half-turn and translates."""
+    gaussians = _obj_gaussians(
+        positions=[
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [2.0, 2.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0],
+        ],
+        object_ids=[7, 7, 7, 0, 0, 0],
+    )
+    layer = ObjectLayer(
+        table=ObjectTable(
+            embedding_dim=4,
+            entries=[
+                ObjectTableEntry(
+                    object_id=7,
+                    label="synthetic vehicle",
+                    anchor=(1.0, -2.0, 0.5),
+                    dynamics=([2.0, 0.0, 0.0], [0.0, 0.0, 0.5], [0.0, 0.0, 0.0]),
+                    embedding=[0.25, -0.5, 0.75, 1.0],
+                )
+            ],
+        ),
+        tracks=[
+            ObjectTrack(
+                object_id=7,
+                interpolation=TRAJECTORY_LINEAR,
+                times=[1.0, _OBJ_DURATION - 1.0],
+                rotations=[[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 0.0]],
+                translations=[[0.0, 0.0, 0.0], [10.0, 4.0, 0.0]],
+            )
+        ],
+    )
+    return gaussians, layer
+
+
+def _obj_multi() -> tuple[fourdgs.GaussianSet, ObjectLayer]:
+    """Three named objects and a background: object 7 linear-tracked, object 9 step-tracked,
+    object 11 untracked (a table entry whose gaussians pass through), and object 0 the
+    background. Proves a multi-entry table, more than one track, an object that is labelled
+    but not moved, and the entries with and without dynamics/embedding side by side."""
+    gaussians = _obj_gaussians(
+        positions=[
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [2.0, 1.0, 0.0],
+            [3.0, 3.0, 0.0],
+            [3.0, 3.0, 1.0],
+        ],
+        object_ids=[7, 7, 9, 9, 11, 11, 0, 0],
+    )
+    layer = ObjectLayer(
+        table=ObjectTable(
+            embedding_dim=3,
+            entries=[
+                ObjectTableEntry(
+                    object_id=7,
+                    label="vehicle",
+                    anchor=(0.5, 0.0, 0.0),
+                    dynamics=([1.0, 0.0, 0.0], [0.0, 0.0, 0.25], [0.0, 0.0, 0.0]),
+                    embedding=[0.2, -0.4, 0.6],
+                ),
+                ObjectTableEntry(object_id=9, label="pedestrian", anchor=(0.5, 1.0, 0.0)),
+                ObjectTableEntry(object_id=11, label="static sign", anchor=(2.0, 0.5, 0.0)),
+            ],
+        ),
+        tracks=[
+            ObjectTrack(
+                object_id=7,
+                interpolation=TRAJECTORY_LINEAR,
+                times=[0.0, _OBJ_DURATION],
+                rotations=[[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 0.0]],
+                translations=[[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]],
+            ),
+            ObjectTrack(
+                object_id=9,
+                interpolation=TRAJECTORY_STEP,
+                times=[1.0, 2.0, 3.0],
+                rotations=[[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]],
+                translations=[[0.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 4.0, 0.0]],
+            ),
+        ],
+    )
+    return gaussians, layer
+
+
+def _obj_track_composed() -> tuple[fourdgs.GaussianSet, ObjectLayer]:
+    """One object whose base itself moves and turns: every gaussian carries per-gaussian
+    motion and a non-identity rest rotation, and a three-sample track rotates and translates
+    it. The states are the assertion that motion is folded into the base center first and the
+    track transports the result — `R*(c0 + motion*t) + T` — and that orientation composes as
+    `R (x) r0` rather than replacing r0."""
+    # A quarter-turn about z as the rest orientation (xyzw), so composing the track's own
+    # rotations onto it is a genuine quaternion product, not a multiply by identity.
+    rest = [0.0, 0.0, 0.3826834, 0.9238795]
+    gaussians = _obj_gaussians(
+        positions=[
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.5, 0.5, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        object_ids=[7, 7, 7, 7, 7, 7],
+        motions=[[0.2, 0.0, 0.0], [0.0, 0.2, 0.0], [0.0, 0.0, 0.1], [0.1, 0.1, 0.0], [0.0, 0.0, 0.0], [-0.1, 0.0, 0.0]],
+        rotations=[rest, rest, rest, rest, rest, rest],
+    )
+    layer = ObjectLayer(
+        table=ObjectTable(
+            embedding_dim=0,
+            entries=[ObjectTableEntry(object_id=7, label="turning object", anchor=(0.5, 0.5, 0.0))],
+        ),
+        tracks=[
+            ObjectTrack(
+                object_id=7,
+                interpolation=TRAJECTORY_LINEAR,
+                times=[0.0, 0.5 * _OBJ_DURATION, _OBJ_DURATION],
+                rotations=[[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.7071068, 0.7071068], [0.0, 0.0, 1.0, 0.0]],
+                translations=[[0.0, 0.0, 0.0], [2.0, 1.0, 0.0], [4.0, 0.0, 0.0]],
+            )
+        ],
+    )
+    return gaussians, layer
+
+
+#: (name, builder). Three variants, each a distinct decode-and-compose: a single tracked
+#: object over a static base, a multi-object table with tracked/untracked/background objects,
+#: and a track composed over a base that moves and turns.
+OBJECT_VARIANTS = (
+    ("SingleObject-UseChunkIndex-UseCrc", _obj_single),
+    ("MultiObject-UseChunkIndex-UseCrc", _obj_multi),
+    ("ObjectTrackComposed-UseChunkIndex-UseCrc", _obj_track_composed),
+)
+
+
+def build_object_corpus() -> list[tuple[str, bytes, str]]:
+    """Every object-layer variant: `(name, bytes, expectation)`.
+
+    The expectation is the read-back canonical summary, whose `objects` block carries the
+    table and tracks and whose `states` carry the post-track centers and orientations at
+    three scene-clock probes — the reconstruction `track ∘ base` that the whole layer exists
+    to make, and the statement every SDK that decodes objects is diffed against.
+    """
+    out: list[tuple[str, bytes, str]] = []
+    for name, builder in OBJECT_VARIANTS:
+        gaussians, layer = builder()
+        options = fourdgs.WriteOptions(
+            profile="default",
+            min_chunk_gaussians=10**9,
+            max_depth=0,
+            write_index=True,
+            write_crc=True,
+            library="4dgs conformance generator",
+            scene_profile="objects",
+            objects=layer,
+        )
+        buf = io.BytesIO()
+        fourdgs.write(buf, gaussians, _OBJ_DURATION, options=options)
+        data = buf.getvalue()
+        scene = fourdgs.read(data)
+        # The same full summarize the runners call, so the committed expectation matches what
+        # a decoder prints — a file written with a CRC and an index reports `summaryCrcOk`
+        # and chunk intervals, and omitting those here would diff against every runner.
+        expectation = canonical(
+            summarize(
+                scene.header,
+                scene.gaussians,
+                scene.audio_sources,
+                [(e.t0, e.t1) for e in scene.chunk_index],
+                camera=scene.camera,
+                metadata=scene.metadata,
+                attachments=scene.attachments,
+                statistics=scene.statistics,
+                summary_offsets=scene.summary_offsets,
+                summary_crc_ok=scene.summary_crc_ok,
+                provenance=scene.provenance,
+                objects=scene.objects,
+            )
+        )
+        out.append((name, data, expectation))
+    return out
+
+
 def _provenance(raw) -> Provenance | None:
     """Turn the generator's plain description into records.
 
@@ -466,6 +724,21 @@ def write_corpus(target: str) -> dict[str, str]:
             fh.write(expectation + "\n")
         checksums[f"keyframe/{name}"] = hashlib.sha256(data).hexdigest()
 
+    # Object-layer variants live in their own subdirectory too, for the same gathering
+    # reason as keyframe/: run.py is the one consumer that reaches into it. Unlike a
+    # keyframe-delta file, an object record does not break a top-level consumer — the one
+    # WithObjects variant in the cross-product sits at the top level and the Kaitai grammar
+    # and fuzzer read it — but the object-layer decode/compose family belongs together, and
+    # the harness dispatches on the subdirectory the same way.
+    object_dir = os.path.join(target, "object")
+    os.makedirs(object_dir, exist_ok=True)
+    for name, data, expectation in build_object_corpus():
+        with open(os.path.join(object_dir, f"{name}.4dgs"), "wb") as fh:
+            fh.write(data)
+        with open(os.path.join(object_dir, f"{name}.json"), "w", encoding="utf-8") as fh:
+            fh.write(expectation + "\n")
+        checksums[f"object/{name}"] = hashlib.sha256(data).hexdigest()
+
     invalid_dir = os.path.join(target, "invalid")
     os.makedirs(invalid_dir, exist_ok=True)
     for name, data, expectation in build_invalid():
@@ -508,7 +781,7 @@ def main(argv=None) -> int:
     checksums = write_corpus(DATA)
     total = sum(
         os.path.getsize(os.path.join(root, f))
-        for root in (DATA, INVALID, KEYFRAME)
+        for root in (DATA, INVALID, KEYFRAME, OBJECT)
         for f in os.listdir(root)
         if os.path.isfile(os.path.join(root, f))
     )
@@ -550,6 +823,8 @@ def _verify(checksums: dict[str, str]) -> bool:
         second[f"invalid/{name}"] = hashlib.sha256(data).hexdigest()
     for name, data, _ in build_keyframe_delta_corpus():
         second[f"keyframe/{name}"] = hashlib.sha256(data).hexdigest()
+    for name, data, _ in build_object_corpus():
+        second[f"object/{name}"] = hashlib.sha256(data).hexdigest()
     for name, digest in checksums.items():
         if second.get(name) != digest:
             failures.append(f"{name}: encoder is not deterministic between runs")

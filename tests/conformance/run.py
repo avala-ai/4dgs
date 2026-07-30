@@ -77,6 +77,14 @@ INVALID = os.path.join(DATA, "invalid")
 KEYFRAME = os.path.join(DATA, "keyframe")
 KEYFRAME_PREFIX = "keyframe/"
 
+#: Object-layer variants live in their own subdirectory too, gathered where this harness
+#: reaches for them. An object record does not break a top-level consumer the way a
+#: keyframe-delta record does — one WithObjects variant sits at the top level and the
+#: fuzzer and Kaitai grammar read it — but the object decode/compose family belongs
+#: together, and only this harness dispatches on the subdirectory.
+OBJECT = os.path.join(DATA, "object")
+OBJECT_PREFIX = "object/"
+
 #: Invalid variants are named with this prefix, which is also their subdirectory. A
 #: runner is handed the same thing either way — a path — and the harness compares the
 #: same thing either way: parsed JSON against a committed expectation. What differs is
@@ -89,10 +97,13 @@ def variants() -> list[str]:
     keyframe = []
     if os.path.isdir(KEYFRAME):
         keyframe = sorted(KEYFRAME_PREFIX + f[: -len(".json")] for f in os.listdir(KEYFRAME) if f.endswith(".json"))
+    obj = []
+    if os.path.isdir(OBJECT):
+        obj = sorted(OBJECT_PREFIX + f[: -len(".json")] for f in os.listdir(OBJECT) if f.endswith(".json"))
     refusals = []
     if os.path.isdir(INVALID):
         refusals = sorted(INVALID_PREFIX + f[: -len(".json")] for f in os.listdir(INVALID) if f.endswith(".json"))
-    return valid + keyframe + refusals
+    return valid + keyframe + obj + refusals
 
 
 #: Families whose runners answer a refusal expectation — printing `{"refused": "<id>"}`
@@ -123,11 +134,20 @@ REFUSAL_FAMILIES = frozenset({"python"})
 #: C++ and Swift decode it through the Rust C ABI's additive states-JSON accessor, which the
 #: harness dispatches to on the temporal model. No family declines the variants any longer.
 
+#: The object layer's name tokens: the `WithObjects` flag on the top-level cross-product and
+#: the `data/object/` family's own names (`SingleObject`, `MultiObject`, `ObjectTrackComposed`),
+#: all of which contain `Object`. A family that does not decode the Object Table and SE(3)
+#: tracks declines every one of them — the same optional, no-Header-flag family the provenance
+#: records are: an SDK that steps them over by length decodes every gaussian in the file
+#: correctly but does not report the family, so a diff cannot tell that apart from a decoder
+#: that got it wrong. Only Python and Rust decode objects today, so they are absent here.
+OBJECT_TOKENS = ("Object",)
+
 FAMILY_DECLINES: dict[str, tuple[str, ...]] = {
-    "typescript": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig", "WithObjects"),
-    "cpp": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig", "WithObjects"),
-    "swift": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig", "WithObjects"),
-    "dart": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig", "WithObjects"),
+    "typescript": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig", *OBJECT_TOKENS),
+    "cpp": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig", *OBJECT_TOKENS),
+    "swift": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig", *OBJECT_TOKENS),
+    "dart": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig", *OBJECT_TOKENS),
 }
 
 
