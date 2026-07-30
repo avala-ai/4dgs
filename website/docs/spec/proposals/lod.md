@@ -990,10 +990,12 @@ transfer caps over one uniformly stored scene (§3.3) are asserted rather than a
   the full-file validation runner records one immutable level per id, checks uniqueness across all
   active levels before sampling, and tracks one scene-wide lifecycle history across every level and
   separated run. It refuses a cross-level migration, a live duplicate, or an id reborn after death
-  even if the offending id falls outside the sample. The indexed decode runner checks the same
-  invariants over fetched chains but is instrumented to prove it never requests unrelated payloads
-  to complete a whole-file identity audit. Positive multi-level rows use level-stable, never-reused
-  ids, and the invalid corpus contains separate full-file cases for all three failures (§10.3).
+  even if the offending id falls outside the sample. The indexed decode runner checks the identity
+  evidence its selected chains fully expose: live uniqueness across the fetched active union and
+  no-reuse across the histories present in those chains. It is instrumented to prove it never
+  requests unrelated payloads to complete a whole-file identity audit. Positive multi-level rows use
+  level-stable, never-reused ids, and the invalid corpus contains both exhaustive cases and
+  selected-chain cases (§10.3).
 - **`states[].byChunk` carries a per-chunk transfer cap and SH digest.** `throughShDegree` is the
   highest contiguous band prefix selected for that chunk in this read, and `shCrc` digests only the
   coefficients through that prefix. The file still stores the same Header-declared degree for every
@@ -1042,7 +1044,9 @@ streamed recovery path and compares its state to the longest full-degree intact 
 `LodStreamLevelCut` likewise runs through streamed recovery and retains the Header's declared bound
 while summarizing only levels found in the intact record prefix. `LodKfDeltaRangeSeek` records every
 range request and fails if the decoder fetches a state chunk outside the index-selected chains; the
-same valid fixture is separately accepted by the exhaustive identity validator.
+same valid fixture is separately accepted by the exhaustive identity validator. The invalid
+selected-chain fixtures in §10.3 use the same request trace to prove that local identity validation
+does not expand the seek.
 
 ### 10.3 Files full-file conformance must refuse
 
@@ -1068,6 +1072,22 @@ diagnose cloned source ownership (§3.1, §9). This reuses the refusal-expectati
 keyframe-delta §11.5 introduces; if that contract has landed by the time this does, this adds rows
 to it rather than a mechanism.
 
+Two additional invalid cases run through the **indexed seek** entry point with an instrumented byte
+source:
+
+- `LodKfDeltaSeekDuplicateId` selects two active level chains that both contain `gaussian_id = 7`.
+  The decoder MUST produce `duplicate-id-across-levels` before returning the union, even though
+  unrelated earlier and later runs remain unread.
+- `LodKfDeltaSeekReuse` selects a level-0 chain that explicitly kills id 7 and a level-1 chain that
+  births id 7 before the requested state. The decoder MUST produce
+  `id-reuse-across-levels-after-death` from those two selected histories without reading any chunk
+  outside either chain.
+
+For both cases the request log is part of the expectation: only the Header, Footer, summary,
+selected Chunk / Delta Chunk records and their selected SH ranges may be fetched. A decoder that
+skips fetched-chain identity checks fails on the missing refusal; a decoder that obtains the refusal
+by scanning the whole file fails on the range trace.
+
 ### 10.4 Feature matrix rows
 
 Added as `No` or `Planned` for every SDK, moved only by a passing suite:
@@ -1080,7 +1100,8 @@ Added as `No` or `Planned` for every SDK, moved only by a passing suite:
 - Per-chunk SH transfer caps — `byChunk` agrees while stored scene degree remains uniform
 - Stream truncation — an incomplete trailing band set is dropped, never treated as an implicit cap
 - Keyframe-delta range seek — indexed reads fetch only selected chains and validate identity
-  evidence in those chains without scanning unrelated payloads
+  evidence in those chains, including invalid duplicate/reuse cases, without scanning unrelated
+  payloads
 - Keyframe-delta full-file identity — every id has one immutable level, active unions have unique
   ids, and lifecycle history never restarts across levels or separated runs
 - Full-union equivalence — a `lod_levels - 1` decode equals a non-LOD decode
