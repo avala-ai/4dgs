@@ -29,20 +29,28 @@
  * strings so a 64-bit value survives a double-backed JSON parser.
  */
 
-import { stepsFrom } from "./chunk.js";
+import {
+  checkWindowIndex,
+  chunkStreamBytes,
+  decompressChunkBlock,
+  stepsFrom,
+  windowTableOrDefault,
+} from "./chunk.js";
 import { DEFAULT_CODECS, type CodecRegistry } from "./codec.js";
 import { Cursor } from "./cursor.js";
-import { MalformedFile, UnsupportedCodec } from "./errors.js";
+import { MalformedFile } from "./errors.js";
 import { Attribute, GAUSSIAN_FLAG_NEVER_FADES } from "./opcodes.js";
 import { clamp, lifeClass, motionStep, muStep, supportK, type Steps } from "./quantization.js";
 import {
   DELTA_MODE_CHAINED,
   MAGIC,
   type ChunkIndexEntry,
+  type DeltaChunkHeader,
   type Header,
   type ParsedDeltaChunk,
   type Quantization,
   checkMagic,
+  frameDeltaGroups,
   iterateRecords,
   parseChunk,
   parseChunkIndexEntry,
@@ -401,13 +409,11 @@ async function keyframeFromChunk(
   codecs: CodecRegistry,
 ): Promise<{ ids: Int32Array; bins: Map<number, Column> }> {
   const parsed = parseChunk(content);
-  if (parsed.header.compression !== "") {
-    throw new UnsupportedCodec(
-      `chunk-level "${parsed.header.compression}" compression is not supported on the ` +
-        `keyframe-delta path`,
-    );
-  }
-  const streams = await decodeStreams(parsed.streams, codecs);
+  // Undo any chunk-level compression before framing the streams, exactly as the
+  // gaussian-birth chunk path does (§5.5); a compressed keyframe would otherwise decode
+  // the codec's output as attribute-stream headers.
+  const streamBytes = await chunkStreamBytes(parsed, codecs);
+  const streams = await decodeStreams(streamBytes, codecs);
   const gaussianId = streams.get(Attribute.GaussianId);
   if (gaussianId === undefined) {
     if (parsed.header.count === 0) return { ids: new Int32Array(0), bins: streams };
@@ -453,10 +459,74 @@ async function composeDelta(
   parsed: ParsedDeltaChunk,
   codecs: CodecRegistry,
 ): Promise<KeyframeDeltaState> {
-  const updates = await decodeGroup(parsed.updates, codecs);
-  const births = await decodeGroup(parsed.births, codecs);
-  const deaths = await decodeGroup(parsed.deaths, codecs);
+  // Undo any chunk-level compression over the whole records block, then frame its three
+  // sub-blocks (§5.18) — the same handling a keyframe Chunk gets.
+  const block = await decompressChunkBlock(
+    parsed.records,
+    parsed.header.compression,
+    parsed.header.uncompressedSize,
+    codecs,
+    `delta chunk at t0=${parsed.header.t0}`,
+  );
+  const groups = frameDeltaGroups(block);
+  const updates = await decodeGroup(groups.updates, codecs);
+  const births = await decodeGroup(groups.births, codecs);
+  const deaths = await decodeGroup(groups.deaths, codecs);
+  // Each group's gaussian_id stream MUST carry exactly the count the header declares
+  // (§5.18/§11.9), so a declared-nonzero-but-empty group is a refusal rather than a
+  // silent zero and a streamed reader can size its working set before decompressing.
+  checkGroupCount("update", updates.ids.length, parsed.header.updateCount);
+  checkGroupCount("birth", births.ids.length, parsed.header.birthCount);
+  checkGroupCount("death", deaths.ids.length, parsed.header.deathCount);
   return applyDelta(reference, updates.ids, updates.bins, births.ids, births.bins, deaths.ids);
+}
+
+function checkGroupCount(group: string, actual: number, declared: number): void {
+  if (actual !== declared) {
+    throw new MalformedFile(
+      `the ${group} group carries ${actual} gaussian ids, but the Delta Chunk header declares ` +
+        `${group}_count=${declared}`,
+    );
+  }
+}
+
+/** Refuse a delta whose reference is at a different `level` (spec §11.6). */
+function checkLevelMatch(
+  referenceLevel: number,
+  deltaLevel: number,
+  offset: number,
+  referenceOffset: number,
+): void {
+  if (referenceLevel !== deltaLevel) {
+    throw new MalformedFile(
+      `delta chunk at ${offset} is level ${deltaLevel}, but its reference at ${referenceOffset} ` +
+        `is level ${referenceLevel}; a delta's reference must share its level`,
+    );
+  }
+}
+
+/**
+ * Refuse a Delta Chunk whose header disagrees with the index entry that pointed at it
+ * (spec §5.8, §11.9). The duplicated fields are what a seek is decided on, so a
+ * disagreement means the chain and the record are two different intents.
+ */
+function checkIndexAgreesWithHeader(entry: ChunkIndexEntry, head: DeltaChunkHeader): void {
+  const fields: readonly [string, number, number][] = [
+    ["t0", entry.t0, head.t0],
+    ["t1", entry.t1, head.t1],
+    ["delta_mode", entry.deltaMode, head.deltaMode],
+    ["reference_offset", entry.referenceOffset, head.referenceOffset],
+    ["keyframe_offset", entry.keyframeOffset, head.keyframeOffset],
+    ["depth", entry.depth, head.depth],
+  ];
+  for (const [name, indexValue, headerValue] of fields) {
+    if (indexValue !== headerValue) {
+      throw new MalformedFile(
+        `the Chunk Index entry at offset ${entry.chunkOffset} says ${name}=${indexValue}, but the ` +
+          `Delta Chunk it points at says ${name}=${headerValue}; the index and the record disagree`,
+      );
+    }
+  }
 }
 
 // --------------------------------------------------------------------------
@@ -499,7 +569,9 @@ export async function decodeKeyframeDeltaStreamed(
   let quantization: Quantization | null = null;
   let windows = new Float64Array(0);
   const chunks: KeyframeDeltaChunkInfo[] = [];
-  const byOffset = new Map<number, KeyframeDeltaState>();
+  // A chunk's composed state and its `level`; the level is kept so a delta can be refused
+  // against a reference at a different level (spec §11.6).
+  const byOffset = new Map<number, { state: KeyframeDeltaState; level: number }>();
 
   for (const record of iterateRecords(data, MAGIC.length)) {
     if (record.opcode === Opcode.Header) {
@@ -518,7 +590,7 @@ export async function decodeKeyframeDeltaStreamed(
       const parsed = parseChunk(record.content);
       const decoded = await keyframeFromChunk(record.content, codecs);
       const state = keyframeState(decoded.ids, decoded.bins);
-      byOffset.set(record.offset, state);
+      byOffset.set(record.offset, { state, level: parsed.header.level });
       chunks.push({
         t0: parsed.header.t0,
         t1: parsed.header.t1,
@@ -547,8 +619,14 @@ export async function decodeKeyframeDeltaStreamed(
             `is not behind it`,
         );
       }
-      const state = await composeDelta(reference, parsed, codecs);
-      byOffset.set(record.offset, state);
+      checkLevelMatch(
+        reference.level,
+        parsed.header.level,
+        record.offset,
+        parsed.header.referenceOffset,
+      );
+      const state = await composeDelta(reference.state, parsed, codecs);
+      byOffset.set(record.offset, { state, level: parsed.header.level });
       chunks.push({
         t0: parsed.header.t0,
         t1: parsed.header.t1,
@@ -568,6 +646,9 @@ export async function decodeKeyframeDeltaStreamed(
   if (header === null || quantization === null) {
     throw new MalformedFile("keyframe-delta file has no Header or Quantization record");
   }
+  // The timeline must tile [0, duration_sec) with no overlap or gap — checked here as well
+  // as on the indexed path, so a hole is refused whichever way the file is read (§11.1).
+  checkTiling(chunks, header.durationSec);
   return { header, quantization, windows, chunks };
 }
 
@@ -615,7 +696,7 @@ export async function decodeKeyframeDeltaIndexed(
     if (record.opcode === Opcode.ChunkIndex) index.push(parseChunkIndexEntry(record.content));
     else break;
   }
-  checkTiling(index);
+  checkTiling(index, header.durationSec);
 
   const chunks: KeyframeDeltaChunkInfo[] = [];
   for (const entry of index) {
@@ -630,6 +711,10 @@ export async function decodeKeyframeDeltaIndexed(
       const head = parseDeltaChunk(
         recordContentAt(data, entry.chunkOffset, entry.chunkLength),
       ).header;
+      // The index duplicates six of the header's fields (§5.8); refuse a disagreement,
+      // because the chain was selected from the index while the composed record is the
+      // header's, and a mismatch is plausible wrong state rather than an error (§11.9).
+      checkIndexAgreesWithHeader(entry, head);
       updateCount = head.updateCount;
       birthCount = head.birthCount;
       deathCount = head.deathCount;
@@ -666,28 +751,43 @@ async function composeChain(
 ): Promise<KeyframeDeltaState> {
   const chain = chainFor(index, (entry.t0 + entry.t1) / 2.0);
   let state: KeyframeDeltaState | null = null;
+  // A GOP shares one `level`: the keyframe sets it and every delta's reference must match
+  // it (spec §11.6), so along a chain every link carries the keyframe's level. The index
+  // does not hold `level` — it is a chunk field — so the rule is enforced here.
+  let keyframeLevel = 0;
   for (const link of chain) {
     const content = recordContentAt(data, link.chunkOffset, link.chunkLength);
     if (link.kind === 0) {
       const decoded = await keyframeFromChunk(content, codecs);
       state = keyframeState(decoded.ids, decoded.bins);
+      keyframeLevel = parseChunk(content).header.level;
     } else {
       if (state === null) {
         throw new MalformedFile("a keyframe-delta chain begins with a delta chunk");
       }
-      state = await composeDelta(state, parseDeltaChunk(content), codecs);
+      const parsed = parseDeltaChunk(content);
+      checkLevelMatch(keyframeLevel, parsed.header.level, link.chunkOffset, entry.keyframeOffset);
+      state = await composeDelta(state, parsed, codecs);
     }
   }
   if (state === null) throw new MalformedFile("an empty keyframe-delta chain");
   return state;
 }
 
+/** The half-open interval a state chunk is valid over; enough to check tiling. */
+export interface Interval {
+  readonly t0: number;
+  readonly t1: number;
+}
+
 /**
- * State chunks tile the timeline: no overlap, no gap (spec §11.1). This is what makes the
- * seek predicate a lookup rather than a search.
+ * State chunks tile the timeline: no overlap, no gap, and — when `durationSec` is given —
+ * the first `t0` is `0` and the last `t1` is `duration_sec` (spec §11.1). This is what
+ * makes the seek predicate a lookup rather than a search, and it is checked on both read
+ * paths so a hole is refused whichever way the file is read.
  */
-export function checkTiling(index: readonly ChunkIndexEntry[]): void {
-  const ordered = [...index].sort((a, b) => a.t0 - b.t0);
+export function checkTiling(intervals: readonly Interval[], durationSec?: number): void {
+  const ordered = [...intervals].sort((a, b) => a.t0 - b.t0);
   for (let i = 1; i < ordered.length; i++) {
     const previous = ordered[i - 1]!;
     const entry = ordered[i]!;
@@ -696,6 +796,21 @@ export function checkTiling(index: readonly ChunkIndexEntry[]): void {
       throw new MalformedFile(
         `state chunks ${what}: [${previous.t0}, ${previous.t1}) is followed by ` +
           `[${entry.t0}, ${entry.t1})`,
+      );
+    }
+  }
+  if (durationSec !== undefined && ordered.length > 0) {
+    const first = ordered[0]!;
+    const last = ordered[ordered.length - 1]!;
+    if (first.t0 !== 0) {
+      throw new MalformedFile(
+        `the first state chunk starts at ${first.t0}, not 0; the timeline must cover ` +
+          `[0, duration_sec)`,
+      );
+    }
+    if (last.t1 !== durationSec) {
+      throw new MalformedFile(
+        `the last state chunk ends at ${last.t1}, not the Header's duration_sec ${durationSec}`,
       );
     }
   }
@@ -758,19 +873,20 @@ export function chainFor(index: readonly ChunkIndexEntry[], t: number): ChunkInd
 interface Grids {
   readonly steps: Steps;
   readonly origin: readonly number[];
-  readonly winLo: number;
-  readonly winHi: number;
+  /**
+   * The whole Window Table as flattened `[lo, hi]` pairs. A never-fading gaussian's
+   * velocity precision is derived from its own `window_index`'s length (spec §6.3), so the
+   * full table is kept and indexed per gaussian rather than collapsed to one window.
+   */
+  readonly windows: Float64Array;
   readonly cutoff: number;
 }
 
 function gridsFor(sequence: KeyframeDeltaSequence): Grids {
-  const winLo = sequence.windows.length >= 2 ? sequence.windows[0]! : 0;
-  const winHi = sequence.windows.length >= 2 ? sequence.windows[1]! : 0;
   return {
     steps: stepsFrom(sequence.quantization),
     origin: sequence.quantization.posOrigin,
-    winLo,
-    winHi,
+    windows: windowTableOrDefault(sequence.windows),
     cutoff: sequence.header.cutoff,
   };
 }
@@ -808,10 +924,11 @@ function reconstructAt(state: KeyframeDeltaState, grids: Grids, t: number): Reco
   const sigmaBinsCol = state.column(Attribute.SigmaT)!.values;
   const flags = state.column(Attribute.Flags)!.values;
   const opacityBins = state.column(Attribute.Opacity)!.values;
+  const windowBins = state.column(Attribute.WindowIndex)!.values;
 
   const steps = grids.steps;
   const k = supportK(grids.cutoff);
-  const winLen = grids.winHi - grids.winLo;
+  const windowCount = grids.windows.length >>> 1;
 
   for (let outRow = 0; outRow < n; outRow++) {
     const i = order[outRow]!;
@@ -820,6 +937,12 @@ function reconstructAt(state: KeyframeDeltaState, grids: Grids, t: number): Reco
     const sigmaBin = sigmaBinsCol[i]!;
     const neverFades = (flags[i]! & GAUSSIAN_FLAG_NEVER_FADES) !== 0;
     const sigma = neverFades ? Infinity : Math.exp(sigmaBin * steps.sigmaLog);
+    // A never-fading gaussian's velocity grid is derived from the length of its own
+    // validity window (spec §6.3), so the pitch is selected per gaussian from its
+    // window_index rather than from a single shared window; an out-of-range index is
+    // refused, not clamped.
+    const windowIndex = checkWindowIndex(windowBins[i]!, windowCount);
+    const winLen = grids.windows[windowIndex * 2 + 1]! - grids.windows[windowIndex * 2]!;
     const mStep = motionStep(
       lifeClass(sigmaBin, steps.sigmaLog, neverFades, winLen, k),
       steps.motion,
