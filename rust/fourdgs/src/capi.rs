@@ -2161,3 +2161,131 @@ pub unsafe extern "C" fn fourdgs_buffer_free(buffer: *mut fourdgs_buffer) {
         drop(Box::from_raw(buffer));
     }));
 }
+
+// --------------------------------------------------------------------------
+// keyframe-delta: decode a whole file to its canonical states JSON
+// --------------------------------------------------------------------------
+//
+// Additive surface for the keyframe-delta temporal model. The scene reader deliberately
+// refuses a model it does not implement, so C++ and Swift cannot reach these files through
+// `fourdgs_open_*`. Rather than widen the scene API, these two functions take the whole file
+// as bytes and return owned strings the caller frees with `fourdgs_string_free`: the summary
+// is computed entirely in Rust, so every binding emits the same bytes with no per-language
+// arithmetic to drift.
+
+/// Hand an owned JSON/string result across the boundary as (pointer, length).
+///
+/// The bytes are heap-allocated here and owned by the caller until `fourdgs_string_free`.
+/// Not NUL-terminated: like every string read out of a file's bytes, it carries its length.
+fn put_owned_string(text: String, out: *mut *const c_char, out_len: *mut usize) -> c_int {
+    if out.is_null() || out_len.is_null() {
+        set_last_error("a string out parameter is null".into());
+        return FOURDGS_STATUS_INVALID_ARGUMENT;
+    }
+    let boxed: Box<[u8]> = text.into_bytes().into_boxed_slice();
+    let len = boxed.len();
+    let ptr = Box::into_raw(boxed) as *mut c_char;
+    // SAFETY: both pointers were checked non-null; the bytes are owned by the caller until
+    // `fourdgs_string_free`, which reconstructs the same box from this pointer and length.
+    unsafe {
+        *out = ptr as *const c_char;
+        *out_len = len;
+    }
+    FOURDGS_STATUS_OK
+}
+
+fn borrow_bytes<'a>(data: *const u8, length: usize) -> Option<&'a [u8]> {
+    if length == 0 {
+        return Some(&[]);
+    }
+    if data.is_null() {
+        return None;
+    }
+    // SAFETY: the caller states `data` points at `length` readable bytes.
+    Some(unsafe { std::slice::from_raw_parts(data, length) })
+}
+
+/// The Header's declared temporal model, read from bytes without opening a scene.
+///
+/// A binding dispatches on this before choosing a read path: `keyframe-delta` goes to
+/// `fourdgs_keyframe_delta_states_json`, anything else through the ordinary open. On success
+/// `out` owns a string freed with `fourdgs_string_free`. As with every two-out-parameter
+/// call here, sequence it — read `out`/`out_len` only after the call returns OK.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_peek_temporal_model(
+    data: *const u8,
+    length: usize,
+    out: *mut *const c_char,
+    out_len: *mut usize,
+) -> c_int {
+    guarded(|| {
+        if out.is_null() || out_len.is_null() {
+            set_last_error("a string out parameter is null".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        }
+        let Some(bytes) = borrow_bytes(data, length) else {
+            set_last_error("a non-empty buffer was passed as null".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        };
+        match crate::keyframe_delta_file::peek_temporal_model(bytes) {
+            Ok(model) => put_owned_string(model, out, out_len),
+            Err(e) => report(e),
+        }
+    })
+}
+
+/// Decode a `keyframe-delta` file and return its canonical states JSON.
+///
+/// `indexed == 0` walks the file front to back, composing each chunk onto the last;
+/// `indexed != 0` reads the index and walks only each instant's chain. Both MUST agree, and
+/// the harness proves it by running this on both paths. On success `out` owns a string freed
+/// with `fourdgs_string_free`. A file whose Header is not `keyframe-delta` is reported
+/// `FOURDGS_STATUS_MALFORMED` on the streamed path — it is the wrong reader for that file.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_keyframe_delta_states_json(
+    data: *const u8,
+    length: usize,
+    indexed: c_int,
+    out: *mut *const c_char,
+    out_len: *mut usize,
+) -> c_int {
+    guarded(|| {
+        if out.is_null() || out_len.is_null() {
+            set_last_error("a string out parameter is null".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        }
+        let Some(bytes) = borrow_bytes(data, length) else {
+            set_last_error("a non-empty buffer was passed as null".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        };
+        let decoded = if indexed != 0 {
+            crate::keyframe_delta_file::decode_indexed(bytes).map(|(seq, _)| seq)
+        } else {
+            crate::keyframe_delta_file::decode_streamed(bytes)
+        };
+        match decoded {
+            Ok(seq) => put_owned_string(
+                crate::keyframe_delta_file::keyframe_delta_states_json(&seq),
+                out,
+                out_len,
+            ),
+            Err(e) => report(e),
+        }
+    })
+}
+
+/// Release a string owned by the caller — the result of `fourdgs_peek_temporal_model` or
+/// `fourdgs_keyframe_delta_states_json`. Null is accepted and ignored. The length must be
+/// the one the producing call returned; the pair identifies the same allocation.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_string_free(data: *const c_char, length: usize) {
+    if data.is_null() {
+        return;
+    }
+    // SAFETY: `data`/`length` name a box created by `put_owned_string`. Reconstructing the
+    // boxed slice from the same pointer and length drops exactly that allocation.
+    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+        let slice = std::slice::from_raw_parts_mut(data as *mut u8, length);
+        drop(Box::from_raw(slice as *mut [u8]));
+    }));
+}

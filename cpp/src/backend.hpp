@@ -114,6 +114,13 @@ int summaryCrcState(const Handle& handle);
 Result<std::vector<std::uint8_t>> encodeScene(const GaussianView& gaussians, double durationSec,
                                               const WriteOptions& options);
 
+/// keyframe-delta: a whole-file temporal model an opened scene refuses, decoded through the
+/// core's byte-in / owned-string-out ABI. `peekTemporalModel` names the model without
+/// opening; `keyframeDeltaStatesJson` decodes and returns the canonical states summary the
+/// core computes.
+Result<std::string> peekTemporalModel(Span<const std::uint8_t> bytes);
+Result<std::string> keyframeDeltaStatesJson(Span<const std::uint8_t> bytes, bool indexed);
+
 /// Release. Both are safe on a handle that never opened, and on a null one.
 void closeScene(Handle& handle) noexcept;
 void closeState(StateHandle& state) noexcept;

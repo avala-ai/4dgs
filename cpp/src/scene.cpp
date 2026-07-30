@@ -213,4 +213,12 @@ Result<State> Scene::stateAt(double t, int maxShBand) {
   return State(std::move(handle));
 }
 
+Result<std::string> peekTemporalModel(Span<const std::uint8_t> bytes) {
+  return detail::peekTemporalModel(bytes);
+}
+
+Result<std::string> keyframeDeltaStatesJson(Span<const std::uint8_t> bytes, bool indexed) {
+  return detail::keyframeDeltaStatesJson(bytes, indexed);
+}
+
 }  // namespace fourdgs

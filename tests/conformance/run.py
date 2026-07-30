@@ -119,16 +119,14 @@ REFUSAL_FAMILIES = frozenset({"python"})
 #: `AddExtraDataToRecords` variants prove. What they do not do is *report* the family, so
 #: their summaries would omit a key the expectation carries, and a diff cannot tell that
 #: apart from a decoder that got it wrong.
-#: The keyframe-delta variants carry these name tokens. C++ and Swift decode 4DGS through
-#: the Rust C ABI, which does not yet expose the delta accessors, so they decline the whole
-#: family — a supported partial state, reported in the feature matrix, not a failure.
-#: Python, Rust, TypeScript and Dart decode keyframe-delta natively and so are absent here.
-KEYFRAME_DELTA_TOKENS = ("KeyframeOnly", "KeyframeDelta")
+#: Every family now decodes keyframe-delta. Python, Rust, TypeScript and Dart do it natively;
+#: C++ and Swift decode it through the Rust C ABI's additive states-JSON accessor, which the
+#: harness dispatches to on the temporal model. No family declines the variants any longer.
 
 FAMILY_DECLINES: dict[str, tuple[str, ...]] = {
     "typescript": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig", "WithObjects"),
-    "cpp": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig", "WithObjects", *KEYFRAME_DELTA_TOKENS),
-    "swift": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig", "WithObjects", *KEYFRAME_DELTA_TOKENS),
+    "cpp": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig", "WithObjects"),
+    "swift": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig", "WithObjects"),
     "dart": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig", "WithObjects"),
 }
 

@@ -599,6 +599,44 @@ Result<std::vector<std::uint8_t>> encodeScene(const GaussianView& gaussians, dou
   return out;
 }
 
+namespace {
+
+/// Run an owned-string ABI call and copy its result into a std::string before freeing it.
+///
+/// The ABI hands back a heap pointer and a length the caller owns until fourdgs_string_free.
+/// The out parameters are read only after the call returns — the eval-order footgun the
+/// header warns about — and the bytes are copied out before the free so nothing dangles.
+Result<std::string> ownedStringCall(int (*call)(const std::uint8_t*, std::size_t, const char**,
+                                                std::size_t*),
+                                    Span<const std::uint8_t> bytes) {
+  const char* data = nullptr;
+  std::size_t length = 0;
+  const int status = call(bytes.data(), bytes.size(), &data, &length);
+  if (status != FOURDGS_STATUS_OK) return failure(status).error();
+  std::string out = (data != nullptr && length != 0) ? std::string(data, length) : std::string();
+  fourdgs_string_free(data, length);
+  return out;
+}
+
+}  // namespace
+
+Result<std::string> peekTemporalModel(Span<const std::uint8_t> bytes) {
+  return ownedStringCall(&fourdgs_peek_temporal_model, bytes);
+}
+
+Result<std::string> keyframeDeltaStatesJson(Span<const std::uint8_t> bytes, bool indexed) {
+  const char* data = nullptr;
+  std::size_t length = 0;
+  // Sequenced deliberately, like every two-out-parameter call: the status is read first, the
+  // out parameters only after it is OK.
+  const int status = fourdgs_keyframe_delta_states_json(bytes.data(), bytes.size(), indexed ? 1 : 0,
+                                                        &data, &length);
+  if (status != FOURDGS_STATUS_OK) return failure(status).error();
+  std::string out = (data != nullptr && length != 0) ? std::string(data, length) : std::string();
+  fourdgs_string_free(data, length);
+  return out;
+}
+
 void closeScene(Handle& handle) noexcept {
   // Null is ignored by the ABI, and freeing invalidates every pointer borrowed from it —
   // which is why nothing in this package holds one across a close.

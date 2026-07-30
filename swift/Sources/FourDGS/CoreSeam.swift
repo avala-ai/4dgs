@@ -598,6 +598,43 @@ enum Core {
         guard status == ok else { throw error(status) }
     }
 
+    // MARK: - keyframe-delta
+
+    // A whole-file temporal model an opened scene refuses, decoded through the core's
+    // byte-in / owned-string-out ABI. The core allocates the result; it is copied into Swift
+    // storage and freed with `fourdgs_string_free` before either function returns — rule 1,
+    // the same discipline the resident arrays and the encoder's buffer follow. The bytes are
+    // lent to the core for the length of one call — rule 2 — through `withUnsafeBufferPointer`.
+
+    /// The Header's declared temporal model, read from bytes without opening a scene.
+    static func peekTemporalModel(_ bytes: [UInt8]) throws -> String {
+        var out: UnsafePointer<CChar>?
+        var length = 0
+        let status = bytes.withUnsafeBufferPointer { buffer in
+            fourdgs_peek_temporal_model(buffer.baseAddress, buffer.count, &out, &length)
+        }
+        guard status == ok else { throw error(status) }
+        let result = string(out, length)
+        fourdgs_string_free(out, length)
+        return result
+    }
+
+    /// Decode a keyframe-delta file to its canonical states JSON. `indexed` chooses the read
+    /// path: `false` composes front to back, `true` walks each instant's chain through the
+    /// index. Both must agree, which is why the suite runs this on both.
+    static func keyframeDeltaStatesJson(_ bytes: [UInt8], indexed: Bool) throws -> String {
+        var out: UnsafePointer<CChar>?
+        var length = 0
+        let status = bytes.withUnsafeBufferPointer { buffer in
+            fourdgs_keyframe_delta_states_json(
+                buffer.baseAddress, buffer.count, Int32(indexed ? 1 : 0), &out, &length)
+        }
+        guard status == ok else { throw error(status) }
+        let result = string(out, length)
+        fourdgs_string_free(out, length)
+        return result
+    }
+
     // MARK: - Strings
 
     /// A string the core lends us, copied into Swift storage before the call returns.
@@ -694,6 +731,25 @@ enum Core {
         guard let bandCap else { return 3 }
         return UInt8(clamping: bandCap)
     }
+}
+
+// MARK: - keyframe-delta (public)
+
+/// The `keyframe-delta` temporal model (spec §11), a whole-file format an opened
+/// ``SceneReader`` refuses because its scene reader does not implement it. These bind the
+/// core's additive byte-in / string-out surface: the canonical states summary is computed in
+/// the Rust core, so a binding does no arithmetic of its own and cannot drift from it.
+
+/// The Header's declared temporal model, read from bytes without opening a scene — what a
+/// runner dispatches on before choosing a read path.
+public func peekTemporalModel(_ bytes: [UInt8]) throws -> String {
+    try Core.peekTemporalModel(bytes)
+}
+
+/// Decode a keyframe-delta file to its canonical states JSON. `indexed` chooses the read
+/// path: `false` composes front to back, `true` walks each instant's chain through the index.
+public func keyframeDeltaStatesJson(_ bytes: [UInt8], indexed: Bool) throws -> String {
+    try Core.keyframeDeltaStatesJson(bytes, indexed: indexed)
 }
 
 // MARK: - The reader callbacks

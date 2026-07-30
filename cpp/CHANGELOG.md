@@ -8,6 +8,11 @@ All notable changes to the C++ package are documented here, following
 
 ### Added
 
+- keyframe-delta decode: `fourdgs::keyframeDeltaStatesJson` and `fourdgs::peekTemporalModel`, binding
+  the core's additive states-JSON C ABI. The summary is computed in the Rust core, so the binding
+  does no arithmetic of its own; the `decode_streamed` and `decode_indexed` conformance runners peek
+  the temporal model from the bytes — an opened `Scene` refuses the model — and print the core's JSON
+  verbatim on each read path. The suite now passes the four keyframe-delta variants both ways.
 - The encode surface: `fourdgs::encodeScene`, binding the core's `fourdgs_writer_*` C ABI, so the
   package authors files through the same core it decodes through rather than a second encoder. A
   `test_writer` unit test builds a tiny scene, encodes it and reopens the bytes, and an

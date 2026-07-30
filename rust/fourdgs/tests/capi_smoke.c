@@ -285,6 +285,35 @@ static void check_writer(void) {
             }
             fourdgs_scene_free(reopened);
         }
+
+        /* The additive keyframe-delta surface, exercised on a real in-memory file. These
+         * bytes are a gaussian-birth scene, so peeking names that model and the
+         * keyframe-delta decoder refuses them as the wrong reader, not a bad file. */
+        const char *model = NULL;
+        size_t model_len = 0;
+        check(fourdgs_peek_temporal_model(data, length, &model, &model_len) ==
+                  FOURDGS_STATUS_OK,
+              "the temporal model is peekable from bytes");
+        check(model != NULL && model_len == strlen("gaussian-birth") &&
+                  memcmp(model, "gaussian-birth", model_len) == 0,
+              "a gaussian-birth buffer peeks as gaussian-birth");
+        fourdgs_string_free(model, model_len);
+
+        const char *states = NULL;
+        size_t states_len = 0;
+        check(fourdgs_keyframe_delta_states_json(data, length, 0, &states, &states_len) ==
+                  FOURDGS_STATUS_MALFORMED,
+              "the keyframe-delta decoder refuses a gaussian-birth file on the streamed path");
+
+        /* Null out parameters are refused; null frees are ignored. */
+        check(fourdgs_peek_temporal_model(data, length, NULL, NULL) ==
+                  FOURDGS_STATUS_INVALID_ARGUMENT,
+              "a null peek out parameter is invalid");
+        check(fourdgs_keyframe_delta_states_json(data, length, 0, NULL, NULL) ==
+                  FOURDGS_STATUS_INVALID_ARGUMENT,
+              "a null states out parameter is invalid");
+        fourdgs_string_free(NULL, 0);
+
         fourdgs_buffer_free(buffer);
     }
     fourdgs_writer_free(writer);
