@@ -106,7 +106,10 @@ the base state rather than replacing it — `center = R*c0 + T`, `orientation = 
 — so a summary that carried only the table and the tracks would pass a decoder that dropped the
 track or applied it before per-gaussian motion. The canonical `states` therefore carry the
 post-track centers and orientations at three scene-clock probes, in the canonical gaussian order,
-and the streamed and indexed paths must agree.
+and two independent implementations — Python and Rust — must agree on them, which is the cross-check
+a shared stored field alone would pass. What that proves is decode and the composition arithmetic,
+not the reader's own indexed pose-sampling path, which each runner reaches by loading the whole
+object layer rather than by range-sampling it.
 
 Three variants in a `data/object/` subdirectory, the way the keyframe-delta and invalid corpora sit
 in theirs, exercise that composition: a single tracked object over a static base (a table entry with
