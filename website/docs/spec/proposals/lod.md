@@ -48,7 +48,7 @@ nothing ties those two facts together — nothing marks a subset as _the coarse 
 lets the index hand a reader that subset's byte ranges without fetching the rest first.
 
 The specification already left the ground for this. Every Chunk record (spec §5.5) and every Delta
-Chunk (keyframe-delta §4.3) carries a `level` field:
+Chunk (spec §5.18) carries a `level` field:
 
 > `u32 level -- producer's hierarchy level; informational only`
 
@@ -329,9 +329,9 @@ The Chunk Index is frozen (spec §4.4), and this is the append that a frozen rec
 that knows only the fields before it parses the band array and stops by `content_length` (spec
 §4.2), and a reader that knows this field reads four more bytes. A reader MUST refuse a file where
 an index entry's `level` disagrees with the `level` in the Chunk or Delta Chunk it points at, naming
-both — the same cheap corruption check keyframe-delta §4.4 makes on the fields it duplicates, for
-the same reason: a seek predicate a reader trusts must not be able to disagree with the record it
-selects.
+both — the same cheap corruption check the keyframe-delta index fields make on what they duplicate
+(spec §5.8), for the same reason: a seek predicate a reader trusts must not be able to disagree with
+the record it selects.
 
 With the field present, the seek is the one-line extension of spec §8 given in §3.5: the same index
 scan, one more comparison per entry, no chunk fetched to evaluate it. **The layer costs a seeking
@@ -339,14 +339,36 @@ reader nothing beyond the comparison** — the index is read once at open, as it
 `level` rides in it.
 
 **The order of appended fields on this record is coordinated, and this is a real constraint, not a
-formality.** keyframe-delta §4.4 also appends to the Chunk Index — six fields — and appended fields
-are positional, so two independent extensions appending to one frozen record must agree on an order
-or a reader cannot locate either. §12.1 is the ruling; the short form is: `level` is defined as the
-**last** appended field, the keyframe-delta block precedes it, the keyframe-delta block's presence
-is keyed to `temporal_model` (it is present exactly when the model is `keyframe-delta`), and a
-reader locates `level` as the four bytes after all other known blocks, present when `content_length`
-leaves room for them. This is re-verified against the merged record at implementation time, exactly
-as the object layer re-verifies its opcodes (object-layer §12.6).
+formality.** keyframe-delta also appends to the Chunk Index — six fields, `chunk_kind`,
+`delta_mode`, `reference_offset`, `keyframe_offset`, `depth` and `live_count` (spec §5.8), present
+only under `temporal_model = "keyframe-delta"` — and appended fields are positional, so two
+independent extensions appending to one frozen record must agree on an order or a reader cannot
+locate either. §12.1 is the ruling. The normative layout of the appended region is fixed:
+
+```
+[ base Chunk Index, through the variable band array ]
+[ keyframe-delta block: the six fields above, present iff temporal_model == "keyframe-delta" ]
+[ level: u32, present iff content_length has room after the blocks above ]
+```
+
+`level` is the **last** appended field, the keyframe-delta block precedes it, and a reader locates
+`level` as the four bytes after all other known blocks, present when `content_length` leaves room
+for them. This is unambiguous for exactly these two appenders, and unambiguous **because one of them
+is keyed to a Header field**: `temporal_model` decides whether the six-field block is there before a
+reader reaches the appended region, and the single trailing `u32` is then decided by remaining
+length. The order is recorded in the registry so it is decided once, and re-verified against the
+merged record at implementation time, exactly as the object layer re-verifies its opcodes
+(object-layer §12.6).
+
+**This scheme does not generalize past two appenders, and the escalation is normative.** A third
+_independent-optional_ append to the Chunk Index — one whose presence is not already decided by a
+Header field the way the keyframe-delta block's is — would make "trailing bytes" ambiguous again,
+because length alone cannot say which of two unkeyed optional blocks wrote them. **Any third
+appender to the Chunk Index MUST therefore introduce a presence bitmask** — a small appended field,
+itself read first, whose bits say which later appended blocks are present — rather than adding
+another positional block. The bitmask is not built now, because two appenders with one
+`temporal_model`-keyed are safe without it; it is the pinned next step, documented here so the
+positional scheme cannot be extended silently into ambiguity (§12.1, §13).
 
 ### 4.3 Spherical harmonic bands — no wire change
 
@@ -694,57 +716,65 @@ The design was reviewed and **accepted**. Every question it left open was ruled 
 recorded here and folded into the section it affects, so the document has no section that
 contradicts a decision and no reader has to hold both a recommendation and its outcome in mind.
 
-| #   | question                                           | ruling                                                                                                                   | folded into |
-| --- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ | ----------- |
-| 1   | Chunk Index appended-field order vs keyframe-delta | `level` appends last; keyframe-delta block keyed to `temporal_model`; presence by `content_length`; re-verify at landing | §4.2        |
-| 2   | Per-level quality: a dedicated record, or metadata | Metadata keys now; size is index-derivable; defer a record until evidence                                                | §4.4, §3.2  |
-| 3   | A network manifest                                 | Not added; the byte-range index suffices and a manifest breaks "one resource"                                            | §8          |
-| 4   | Additive levels vs replacement levels              | Additive; forward compatibility is incompatible with replacement                                                         | §3.1, §5    |
-| 5   | Must every level cover the whole timeline          | No; only level 0, and only under the `progressive` profile                                                               | §3.5, §9    |
+| #   | question                                           | ruling                                                                                                                                                       | folded into |
+| --- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------- |
+| 1   | Chunk Index appended-field order vs keyframe-delta | `level` appends last; keyframe-delta block keyed to `temporal_model`; presence by `content_length`; **any third appender MUST switch to a presence bitmask** | §4.2        |
+| 2   | Per-level quality: a dedicated record, or metadata | Metadata keys now; size is index-derivable; defer a record until evidence                                                                                    | §4.4, §3.2  |
+| 3   | A network manifest                                 | Not added; the byte-range index suffices and a manifest breaks "one resource"                                                                                | §8          |
+| 4   | Additive levels vs replacement levels              | Additive; forward compatibility is incompatible with replacement                                                                                             | §3.1, §5    |
+| 5   | Must every level cover the whole timeline          | No; only level 0, and only under the `progressive` profile                                                                                                   | §3.5, §9    |
 
 Rulings 3, 4 and 5 are the same judgement the existing specification makes everywhere — the format
 takes on the smaller thing. Ruling 3 declines a second representation of facts the index already
 carries, the keyframe-delta §4.5 argument reused. Ruling 4 declines the model that would have needed
 a version gate, the object-layer §5-versus-keyframe-delta-§5 distinction reused. Ruling 5 declines
 to force a coverage rule on levels that only add detail locally, so an honest sparse level is not
-made a refusal. Rulings 1 and 2 are the two the maintainer should look at hardest, and they are
-written up in full below.
+made a refusal. Rulings 1 and 2 carry the most implementation weight and are written up in full
+below.
 
 ### 12.1 The Chunk Index appended-field order
 
-This is the one genuinely awkward part of the design, and it is awkward because the format's
-append-only extension model (spec §4.2) was built for a _single_ line of evolution and this is the
-first time two independent optional extensions append to the same frozen record. keyframe-delta
-appends six fields to the Chunk Index (keyframe-delta §4.4); this layer appends one. Appended fields
-are positional and a reader sizes them from `content_length`, so a reader that meets a Chunk Index
-with trailing bytes must know _which_ extension wrote them and _in what order_.
+This is the one genuinely load-bearing coordination in the design, and it matters because the
+format's append-only extension model (spec §4.2) was built for a _single_ line of evolution, and
+this is the first time two independent optional extensions append to the same frozen record.
+keyframe-delta appends six fields to the Chunk Index — `chunk_kind`, `delta_mode`,
+`reference_offset`, `keyframe_offset`, `depth`, `live_count` (spec §5.8) — present only under
+`temporal_model = "keyframe-delta"`; this layer appends one, `level`. Appended fields are positional
+and a reader sizes them from `content_length`, so a reader that meets a Chunk Index with trailing
+bytes must know _which_ extension wrote them and _in what order_.
 
-The recommended resolution, and the one folded into §4.2:
+**Decided.** The layout of the appended region is fixed, in this order, and recorded in the registry
+so it is decided once:
 
-- **`level` is the last appended field.** Any future append to the Chunk Index goes after it, and
-  this ordering is recorded in the registry so it is decided once.
-- **The keyframe-delta block's presence is keyed to `temporal_model`.** It is present exactly when
-  the model is `keyframe-delta`, which a reader has already read from the Header before it parses
-  the index. So a reader knows, before it reaches the appended region, whether the six-field block
-  is there.
-- **`level`'s presence is read from `content_length`.** After the band array and the (conditional)
-  keyframe-delta block, four remaining bytes are `level`; none means the file does not carry it. A
-  single trailing `u32` is unambiguous given a fixed order and a known predecessor block.
+- **The keyframe-delta block comes first, and its presence is keyed to `temporal_model`.** It is
+  present exactly when the model is `keyframe-delta`, which a reader has already read from the
+  Header before it parses the index — so a reader knows, before it reaches the appended region,
+  whether the six-field block is there.
+- **`level` is last, and its presence is read from `content_length`.** After the band array and the
+  conditional keyframe-delta block, four remaining bytes are `level`; none means the file does not
+  carry it. A single trailing `u32` is unambiguous given the fixed order and a predecessor block
+  whose presence a Header field already decided.
 - **Re-verified against the merged record at implementation time**, exactly as the object layer
   re-verifies its opcode assignments against `main` (object-layer §12.6), because the append region
-  is being spent by more than one design at once and the only safe layout is one checked at landing.
+  is spent by more than one design at once and the only safe layout is one checked at landing.
 
-**The open part, for the maintainer.** This works for _two_ appenders and a single trailing scalar.
-It does not scale: a third independent optional append to the Chunk Index, or a variable-length one,
-would make "trailing bytes" ambiguous again, and the format would then want a real presence signal —
-a small bitmask of which appended blocks are present, itself an appended field, read first. That is
-out of scope here because two appenders do not justify it, but it is the direction if the Chunk
-Index's append pool grows. **Recommendation: adopt the fixed-order + `content_length` rule for now,
-record the order in the registry, and treat a presence bitmask as the reserved next step if a third
-appender ever appears — not built speculatively, on the object-layer §12 principle that a mechanism
-built before the file that needs it is a mechanism nobody has tested.** The maintainer's call is
-whether even two appenders already justify the bitmask; this design judges not, on the grounds that
-the `temporal_model` key already disambiguates the only other block that exists.
+**And the escalation is normative, so the scheme cannot grow into ambiguity.** The layout above is
+unambiguous for _exactly these two_ appenders, and unambiguous only because one of them is keyed to
+a Header field: length alone distinguishes "keyframe-delta block present" from "absent" only because
+`temporal_model` has already answered that, leaving a single trailing scalar for length to resolve.
+A third _independent-optional_ appender — one whose presence is not already settled by a Header
+field — breaks this, because two unkeyed optional blocks make "trailing bytes" ambiguous again.
+
+> **Any third appender to the Chunk Index MUST introduce a presence bitmask** — a small appended
+> field, read first, whose bits declare which later appended blocks are present — rather than adding
+> a third positional block.
+
+The bitmask is not built now, and the reason is the object-layer §12 principle that a mechanism
+built before the file that needs it is a mechanism nobody has tested: two appenders, one of them
+`temporal_model`-keyed, are safe positionally, so the answer to "do even two appenders justify the
+bitmask" is **no**. It is the pinned next step — documented here, built at appender three — so that
+the positional scheme is safe today and cannot be extended silently past the point where it stays
+safe.
 
 ### 12.2 Per-level quality: a metadata key, or a record?
 
@@ -759,15 +789,16 @@ later: a record could carry a richer per-level descriptor — a measured PSNR ag
 a coverage fraction, an anchor for a per-level thumbnail — the way the Object Table carries
 per-object descriptors, and a record range-reads independently where a metadata blob does not.
 
-**Recommendation: a metadata key now, a record deferred until a consumer demonstrates it needs more
-than one advisory scalar per level.** This is the object-layer §12.3 judgement on embeddings reused
-— store the cheap advisory form, and let the richer form be an append when evidence asks for it —
-and the keyframe-delta §4.5 judgement against a second index reused: do not add a record whose only
-content is derivable or advisory until something cannot be served by the key. If the maintainer
-prefers to reserve a `Level Table` opcode now (in the provenance family's reserved range, or a fresh
-number) so the shape has a home, that is a defensible pre-reservation on the same principle the
-relighting block uses — reserve the ground, define nothing — but this design does not spend the
-number, because the key covers every use it can currently name.
+**Decided: a metadata key now, a record deferred until a consumer demonstrates it needs more than
+one advisory scalar per level.** This is the object-layer §12.3 judgement on embeddings reused —
+store the cheap advisory form, and let the richer form be an append when evidence asks for it — and
+the keyframe-delta judgement against a second index reused: do not add a record whose only content
+is derivable or advisory until something cannot be served by the key. No `Level Table` opcode is
+reserved now; the key covers every use this design can currently name, and reserving a number for a
+shape no consumer has asked for is exactly the speculative reservation the format declines
+elsewhere. If a consumer later needs a richer per-level descriptor, adding the record is a clean
+append on the relighting block's principle — reserve the ground then, define it against the file
+that wants it.
 
 ---
 
@@ -780,8 +811,9 @@ Named so the boundary is a decision rather than an omission, in the shape spec �
   one when it lands.
 - **Per-gaussian SH degree.** Reserved by spec §10.1. The quality axis here drops whole bands
   uniformly; spending degree per gaussian is a larger change with its own evidence.
-- **A presence bitmask for Chunk Index appended fields** (§12.1). Not built, because two appenders
-  do not justify it; named so the direction is clear if a third appears.
+- **A presence bitmask for Chunk Index appended fields** (§12.1). Not built, because two appenders —
+  one of them keyed to `temporal_model` — are safe positionally; it is normatively required of the
+  _third_ appender, so the direction is pinned rather than merely noted.
 - **A dedicated per-level descriptor record** (§12.2). Deferred to a metadata key until a consumer
   needs more than one advisory scalar per level.
 - **A network manifest and client-side adaptive selection policy** (§8). The format carries the
