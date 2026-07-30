@@ -329,11 +329,13 @@ require finite Header `duration_sec` and finite `t0` and `t1` on every level-0 C
 preceding level-0 `t0` as `lod-level0-birth-out-of-order`, then refuses `t0 > level0CoveredUntil` as
 `lod-level0-birth-has-holes`, and otherwise advances the marker to `max(level0CoveredUntil, t1)`. At
 clean EOF the marker MUST reach `duration_sec`. An indexed reader applies the same checks and
-algorithm to index entries ordered by `chunk_offset`. In a promised indexed `gaussian-birth` file,
-each entry's `t0` and `t1` MUST be bit-for-bit identical to the fields in the Chunk it points at. An
-indexed decode verifies that equality whenever it fetches a selected Chunk; the exhaustive validator
-verifies every entry. A mismatch is `level-index-interval-mismatch` and names the entry, Chunk
-offset and both values.
+algorithm to index entries ordered by `chunk_offset`.
+
+Independent of the completeness promise, every indexed file with a valid Header `lod_levels` gate
+MUST store `t0` and `t1` in each Chunk Index entry bit-for-bit identically to the fields in the
+Chunk or Delta Chunk it points at. An indexed decode verifies that equality whenever it fetches a
+selected record; the exhaustive validator verifies every entry. A mismatch is
+`level-index-interval-mismatch` and names the entry, record offset and both values.
 
 That integrity check has the same range-seek boundary as every payload fact duplicated in an index.
 A corrupt interval can deselect its own Chunk, so an ordinary indexed seek MUST NOT fetch that
@@ -342,8 +344,10 @@ mismatch. Full-file validation compares every entry with its record; a point see
 record it selects. Indexed and streamed reconstruction are required to agree for **conforming
 files**, not to discover the same unselected corruption after reading different byte ranges. Only
 the previous level-0 `t0` and `level0CoveredUntil` survive a chunk boundary; no interval does. This
-ordering and endpoint-integrity rule are conditional on the Header promise; ordinary
-`gaussian-birth` files and level 0 without the promise retain the base format's order independence.
+ordering rule is conditional on the Header completeness promise; ordinary `gaussian-birth` files and
+level 0 without that promise retain the base format's order independence. Endpoint integrity is
+instead conditional only on the Header LOD gate, because every declared-LOD seek uses the indexed
+interval predicate whether or not level 0 claims complete coverage.
 
 **Level and `keyframe-delta`, and the one place LOD changes a normative rule.** keyframe-delta tiles
 the timeline with state chunks and reaches an instant by walking a chain back to a keyframe (spec
@@ -535,13 +539,13 @@ contain `level` would force a seeking reader to fetch that chunk merely to decid
 it, breaking the range-seekable contract; the reader MUST refuse before selecting chunks and name
 the short entry. It MUST also refuse when an index `level` disagrees with the Chunk or Delta Chunk
 it points at, naming both — the same corruption check the keyframe-delta index fields make on
-duplicated facts (spec §5.8). When `gaussian-birth` also promises complete level 0, the index
-intervals are likewise duplicated coverage facts: §3.5 requires each entry's `t0` and `t1` to match
-its pointed Chunk. Without the valid gate, the current schema contains no index `level`: a
-conforming producer MUST NOT emit that field, and a reader MUST NOT interpret any trailing bytes as
-it. A malformed `lod_levels` value is refused as a malformed gate (§9), not used to guess the
-field's presence. A streamed file with no Chunk Index still filters on each Chunk or Delta Chunk's
-existing `level` as records arrive.
+duplicated facts (spec §5.8). Under the same valid gate, the index intervals are also duplicated
+seek facts whether `lod_level0_complete` is `"true"`, `"false"` or absent: §3.5 requires each
+entry's `t0` and `t1` to match its pointed Chunk or Delta Chunk. Without the valid gate, the current
+schema contains no index `level`: a conforming producer MUST NOT emit that field, and a reader MUST
+NOT interpret any trailing bytes as it. A malformed `lod_levels` value is refused as a malformed
+gate (§9), not used to guess the field's presence. A streamed file with no Chunk Index still filters
+on each Chunk or Delta Chunk's existing `level` as records arrive.
 
 With the gate present, the seek is the one-line extension of spec §8 given in §3.5: the same index
 scan, one more comparison per entry, no chunk fetched to evaluate it. **The layer costs a seeking
@@ -877,7 +881,7 @@ referential integrity between the index and the chunks, which the format already
 | a chunk or index `level` is `>= lod_levels` (or the two disagree)                          | the declared range omits the chunk; the full union would silently lose it |
 | an indexed declared-LOD entry omits its appended `level`                                   | the seek predicate cannot be answered from the index                      |
 | an index entry's `level` differs from its Chunk / Delta Chunk's                            | the seek predicate would select on a value the record denies              |
-| a promised `gaussian-birth` index interval differs from its pointed Chunk's                | indexed and streamed coverage would describe different physical sequences |
+| a declared-LOD index interval differs from its pointed Chunk / Delta Chunk's               | indexed and streamed seeks would describe different physical sequences    |
 | a `keyframe-delta` delta references a chunk of a different `level`                         | spec §11 / keyframe-delta §3.6; a chain would cross levels                |
 | a `keyframe-delta` `gaussian_id` is observed at more than one level                        | a wire-identifiable gaussian has migrated between ownership tranches      |
 | duplicate live `gaussian_id` values across active `keyframe-delta` level states            | level union never creates a separate live-identity namespace              |
@@ -1088,6 +1092,7 @@ level-run generalization and its compatibility boundary (§3.5, §4.6):
 | `LodSparseLevels`          | level 0 spans the clip, level 1 has two keyframe-rooted runs with a gap              | sparse `keyframe-delta` run validity and partial timeline coverage (§3.5, §9)            |
 | `LodLevelGap`              | levels 0 and `4294967295`, `lod_levels = 4294967296`, only two actual levels         | sparse/count-independent storage and the full `u32` level domain (§4.4, §9)              |
 | `LodLevel0CompleteBirth`   | `gaussian-birth`; ordered overlapping level-0 intervals whose union covers the clip  | constant-state coverage proof; overlap remains valid (§3.5, §4.4)                        |
+| `LodLevel0IncompleteFalse` | `gaussian-birth`; Header completeness is `"false"` and level 0 has a coverage gap    | canonical false is inactive; presence alone cannot trigger completeness checks           |
 | `LodLevel0BirthInterleave` | level-0 `t0` values 0, 0.5 with an intervening level-1 Chunk at `t0 = 0.25`          | completeness ordering examines only the level-0 Chunk subsequence                        |
 | `LodLevel0CompleteKf`      | `keyframe-delta`; level 0 is one non-overlapping run covering the clip               | model-specific complete-run promise (§3.5, §4.4)                                         |
 | `LodProgressiveBands`      | every chunk stores degree 3; deliberate reads probe contiguous prefixes 0..3         | the quality axis; the contiguous-prefix rule; SH-inclusive byte footprints (§3.3)        |
@@ -1118,24 +1123,27 @@ the full scene exactly like `LodNoDeclare`; attempting to parse an appended inde
 expected request/record trace. `LodMetadataOnlyComplete` MUST produce the same completeness state as
 an otherwise identical file with no completeness key: no Header promise is visible, no value grammar
 is applied to the Metadata entry, and no level-0 coverage guarantee is inferred.
-`LodKfDeltaPerLevelRuns` additionally carries a runner-side assertion that a **pre-LOD**
-`keyframe-delta` decoder _refuses_ it on the overlap or gap rule (spec §11.1) — the §4.6
-compatibility boundary made checkable, so the non-forward-compatible case is proven to refuse
-cleanly rather than mis-decode. `LodStreamBandCut` runs only through the streamed recovery path and
-compares its state to the longest full-degree intact chunk prefix. The no-index form of
-`LodLevel0CompleteBirth` serializes overlapping level-0 chunks in non-decreasing `t0`; its adapter
-reports `level0CoverageScratchScalarsHighWater <= 2` and `level0CoverageIntervalsRetained = 0` after
-every chunk. The shuffled invalid form in §10.3 proves the conditional ordering is enforced.
-`LodLevel0BirthInterleave` has physical Chunk `t0` sequence `0` at level 0, `0.5` at level 0, then
-`0.25` at level 1. The whole-Chunk sequence descends, but the level-0 subsequence does not, so both
-readers MUST accept the completeness promise and the coverage scratch counters remain unchanged by
-the level-1 Chunk. `LodStreamLevelCut` likewise runs through streamed recovery and retains the
-Header's declared bound while summarizing only levels found in the intact record prefix.
-`LodKfDeltaRangeSeek` records every range request and fails if the decoder fetches a state chunk
-outside the index-selected chains; the same valid fixture is separately accepted by the exhaustive
-identity validator. The invalid selected-chain fixtures in §10.3 use the same request trace to prove
-that local identity validation does not expand the seek; the scratch counters defined above
-separately prove that it retains no keyed identity history between seeks.
+`LodLevel0IncompleteFalse` carries the exact Header value `"false"` and an intentional level-0 gap
+under `gaussian-birth`. Streamed and indexed readers MUST accept it, expose no level-0 completeness
+promise and perform no coverage-order or coverage-union checks; the streamed adapter reports both
+coverage scratch counters as zero. `LodKfDeltaPerLevelRuns` additionally carries a runner-side
+assertion that a **pre-LOD** `keyframe-delta` decoder _refuses_ it on the overlap or gap rule (spec
+§11.1) — the §4.6 compatibility boundary made checkable, so the non-forward-compatible case is
+proven to refuse cleanly rather than mis-decode. `LodStreamBandCut` runs only through the streamed
+recovery path and compares its state to the longest full-degree intact chunk prefix. The no-index
+form of `LodLevel0CompleteBirth` serializes overlapping level-0 chunks in non-decreasing `t0`; its
+adapter reports `level0CoverageScratchScalarsHighWater <= 2` and
+`level0CoverageIntervalsRetained = 0` after every chunk. The shuffled invalid form in §10.3 proves
+the conditional ordering is enforced. `LodLevel0BirthInterleave` has physical Chunk `t0` sequence
+`0` at level 0, `0.5` at level 0, then `0.25` at level 1. The whole-Chunk sequence descends, but the
+level-0 subsequence does not, so both readers MUST accept the completeness promise and the coverage
+scratch counters remain unchanged by the level-1 Chunk. `LodStreamLevelCut` likewise runs through
+streamed recovery and retains the Header's declared bound while summarizing only levels found in the
+intact record prefix. `LodKfDeltaRangeSeek` records every range request and fails if the decoder
+fetches a state chunk outside the index-selected chains; the same valid fixture is separately
+accepted by the exhaustive identity validator. The invalid selected-chain fixtures in §10.3 use the
+same request trace to prove that local identity validation does not expand the seek; the scratch
+counters defined above separately prove that it retains no keyed identity history between seeks.
 
 ### 10.3 Files full-file conformance must refuse
 
@@ -1159,27 +1167,28 @@ and proves that the promise cannot authorize its own seek. `LodLevel0NonFiniteCo
 with quiet NaN, positive infinity and negative infinity in each of Header `duration_sec`, one
 promised level-0 `t0`, and one promised level-0 `t1`; all nine forms MUST produce
 `lod-level0-coverage-non-finite` before an order or hole refusal through both exhaustive and
-streamed validation. `LodLevel0IndexIntervalMismatch` starts from the valid indexed completeness
-fixture, changes one index `t0` and, separately, one index `t1` without changing the pointed Chunk,
-and MUST produce `level-index-interval-mismatch`. The selected forms run through exhaustive
-validation and an indexed seek that selects the changed entry; the request trace proves the decoder
-discovers the mismatch from that selected Chunk without scanning unrelated payloads. A third form
-changes A's indexed interval from `[0, 1)` to `[0, 0.5)` while a second level-0 Chunk B still lets
-the index prove complete coverage. Exhaustive validation MUST refuse the A mismatch. A point seek at
-`t = 0.75` is deliberately not a refusal expectation: A deselects itself, and the request trace MUST
-show that the indexed decoder does not fetch it to perform a whole-file audit. This fixture narrows
-path equivalence to conforming files rather than letting conformance smuggle a payload scan into the
-range-seek API. The migration file gives id 7 a state-bearing occurrence in a level-0 run and a
-later non-overlapping level-1 run without a death; it MUST produce `id-crosses-level`. The
-duplicate-id file gives two active levels individually valid chains that both contain
-`gaussian_id = 7`; it MUST produce the more specific duplicate identifier only after the
-reconstructed union exposes the collision, naming both levels and chunks. The reuse file gives id 7
-a valid lifecycle that ends in death, then carries id 7 in a delta `births` group in a later run.
-`LodKfDeltaReuseInKeyframe` instead ends the same lifecycle, leaves a coverage gap, and places id 7
-directly in the absolute state of the keyframe that begins the later run; there is no `births` group
-to inspect. Both MUST produce the more specific reuse identifier and name the earlier lifecycle,
-death and later occurrence even though no reconstructed instant has two live id-7 gaussians. The
-level-0 coverage files prove the temporal-model-specific definitions. In particular,
+streamed validation. `LodIndexIntervalMismatch` is generated from declared-LOD indexed fixtures
+under both temporal models, with the Header completeness key true, false and absent where each value
+is legal. It changes one index `t0` and, separately, one index `t1` without changing the pointed
+Chunk or Delta Chunk, and MUST produce `level-index-interval-mismatch`. The selected forms run
+through exhaustive validation and an indexed seek that selects the changed entry; the request trace
+proves the decoder discovers the mismatch from that selected record without scanning unrelated
+payloads. A self-deselecting `gaussian-birth` form changes A's indexed interval from `[0, 1)` to
+`[0, 0.5)` while a second level-0 Chunk B still covers `[0, 1)`. Exhaustive validation MUST refuse
+the A mismatch. A point seek at `t = 0.75` is deliberately not a refusal expectation: A deselects
+itself, and the request trace MUST show that the indexed decoder does not fetch it to perform a
+whole-file audit. This fixture narrows path equivalence to conforming files rather than letting
+conformance smuggle a payload scan into the range-seek API. The migration file gives id 7 a
+state-bearing occurrence in a level-0 run and a later non-overlapping level-1 run without a death;
+it MUST produce `id-crosses-level`. The duplicate-id file gives two active levels individually valid
+chains that both contain `gaussian_id = 7`; it MUST produce the more specific duplicate identifier
+only after the reconstructed union exposes the collision, naming both levels and chunks. The reuse
+file gives id 7 a valid lifecycle that ends in death, then carries id 7 in a delta `births` group in
+a later run. `LodKfDeltaReuseInKeyframe` instead ends the same lifecycle, leaves a coverage gap, and
+places id 7 directly in the absolute state of the keyframe that begins the later run; there is no
+`births` group to inspect. Both MUST produce the more specific reuse identifier and name the earlier
+lifecycle, death and later occurrence even though no reconstructed instant has two live id-7
+gaussians. The level-0 coverage files prove the temporal-model-specific definitions. In particular,
 `LodLevel0BirthOutOfOrder` has overlapping intervals with `t0` sequence `0, 0.5, 0.25` whose union
 covers the clip; it MUST produce `lod-level0-birth-out-of-order`, proving a validator does not sort
 or accumulate the interval set. There is no `gaussian-birth` identity-refusal file, because that
@@ -1233,15 +1242,15 @@ seek remains an exhaustive-validation invariant.
 Added as `No` or `Planned` for every SDK, moved only by a passing suite:
 
 - Level seek and gated index field — filter by `level ≤ N` and decode the append only when Header
-  `lod_levels` declares it; a Metadata-only key leaves both semantics and index layout unchanged
-  (§4.1, §4.2)
+  `lod_levels` declares it; every declared-LOD index interval matches its pointed record, with full
+  validation checking every entry and a point seek checking selected records only; a Metadata-only
+  key leaves both semantics and index layout unchanged (§4.1, §4.2)
 - Exclusive LOD bound — over-declaration and truncated-stream recovery keep observed levels sparse,
   while a `lod_levels - 1` request includes every observed level
 - Level-0 completeness — canonical Header promise grammar and model-specific coverage;
   `gaussian-birth` validates finite operands, the non-decreasing physical level-0 `t0` subsequence
-  and gap-free union with constant state while ignoring interleaved higher levels; full validation
-  corroborates every duplicated index interval while a point seek checks selected records only; a
-  Metadata-only key is inert
+  and gap-free union with constant state while ignoring interleaved higher levels; canonical
+  `"false"` leaves incomplete level 0 valid and Metadata-only keys are inert
 - Contiguous band prefixes — the highest-contiguous-prefix rule with out-of-order bands held (§3.3)
 - Per-chunk SH transfer caps — `byChunk` agrees while stored scene degree remains uniform
 - Stream truncation — an incomplete trailing band set is dropped, never treated as an implicit cap
