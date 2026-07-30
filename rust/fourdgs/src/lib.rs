@@ -39,6 +39,8 @@ pub mod chunk;
 pub mod codec;
 pub mod error;
 pub mod indexed_reader;
+pub mod keyframe_delta;
+pub mod keyframe_delta_file;
 pub mod model;
 pub mod object_layer;
 pub mod opcode;

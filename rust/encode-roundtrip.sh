@@ -46,7 +46,11 @@ encode="$root/target/release/encode_roundtrip$exe"
 decode_rust="$root/target/release/decode_streamed$exe"
 decode_python="$root/python/conformance/decode_streamed.py"
 
-for binary in "$encode" "$decode_rust"; do
+encode_kd="$root/target/release/encode_keyframe_delta$exe"
+decode_kd_rust="$root/target/release/decode_keyframe_delta$exe"
+decode_kd_python="$root/python/conformance/decode_keyframe_delta.py"
+
+for binary in "$encode" "$decode_rust" "$encode_kd" "$decode_kd_rust"; do
   [ -x "$binary" ] || {
     echo "::error::$binary is not built; run cargo build --release --workspace"
     exit 1
@@ -138,3 +142,37 @@ PY
 done
 
 echo "$graded SH variants re-encoded at per-band bit depths; both decoders agree on every one"
+
+# The keyframe-delta model, proven the same way and without a committed corpus variant: a
+# separate milestone owns the corpus, so the Rust writer synthesizes a deterministic sample
+# sequence in memory, and the claim is that the file it produces reads to an identical
+# canonical `states` summary in Rust and in the Python reference — across both read paths in
+# each language. Both delta modes are exercised: chained (contiguous deltas, a range reader
+# coalesces the chain) and keyframe-referenced (every delta points back at its group's
+# keyframe, so depth never exceeds one).
+composed=0
+for mode in chained keyframe; do
+  "$encode_kd" "$out/keyframe-delta-$mode.4dgs" "$mode" >"$out/keyframe-delta-$mode.note"
+  "$decode_kd_rust" "$out/keyframe-delta-$mode.4dgs" >"$out/keyframe-delta-$mode.rust.json"
+  "$python" "$decode_kd_python" "$out/keyframe-delta-$mode.4dgs" >"$out/keyframe-delta-$mode.python.json"
+  "$python" - "$out/keyframe-delta-$mode.rust.json" "$out/keyframe-delta-$mode.python.json" "$mode" <<'PY'
+import json
+import sys
+
+rust, python, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(rust, encoding="utf-8") as fh:
+    a = json.load(fh)
+with open(python, encoding="utf-8") as fh:
+    b = json.load(fh)
+if a != b:
+    print(f"::error::keyframe-delta ({mode}): the two decoders disagree on a file the Rust writer wrote")
+    for key in sorted(set(a) | set(b)):
+        if a.get(key) != b.get(key):
+            print(f"  {key}\n    rust:   {json.dumps(a.get(key))[:300]}\n    python: {json.dumps(b.get(key))[:300]}")
+    sys.exit(1)
+PY
+  composed=$((composed + 1))
+  echo "  keyframe-delta ($mode): $(cat "$out/keyframe-delta-$mode.note")"
+done
+
+echo "$composed keyframe-delta files written by Rust; both decoders agree on every one, both read paths"

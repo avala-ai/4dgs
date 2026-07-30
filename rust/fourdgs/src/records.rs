@@ -330,6 +330,113 @@ pub fn encode_chunk(t0: f64, t1: f64, level: u32, count: u32, streams: &[u8]) ->
     out
 }
 
+/// A delta chunk's own fields; its three groups follow inside the `records` blob.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DeltaChunkHeader {
+    pub t0: f64,
+    pub t1: f64,
+    pub level: u32,
+    pub delta_mode: u8,
+    pub reference_offset: u64,
+    pub keyframe_offset: u64,
+    pub depth: u16,
+    pub update_count: u32,
+    pub birth_count: u32,
+    pub death_count: u32,
+    pub compression: String,
+    pub uncompressed_size: u64,
+}
+
+/// `delta_mode` values. Per chunk, not per file: an encoder that knows an instant is a
+/// likely seek target can make it cost two records regardless of how deep into the group
+/// it falls, without spending a whole keyframe on it.
+pub const DELTA_MODE_KEYFRAME: u8 = 0;
+pub const DELTA_MODE_CHAINED: u8 = 1;
+
+/// Frame a Delta Chunk record.
+///
+/// The three groups are framed by length inside one `records` blob rather than tagged with
+/// a group byte on every stream. That spends no second opcode, leaves the Attribute Stream
+/// record untouched, and lets a reader take the death list — which is small and which a
+/// consumer often wants alone — by stepping over two lengths.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_delta_chunk(
+    t0: f64,
+    t1: f64,
+    level: u32,
+    delta_mode: u8,
+    reference_offset: u64,
+    keyframe_offset: u64,
+    depth: u16,
+    updates: &[u8],
+    births: &[u8],
+    deaths: &[u8],
+    counts: (u32, u32, u32),
+) -> Vec<u8> {
+    let (update_count, birth_count, death_count) = counts;
+    let mut records = Vec::new();
+    put_blob(&mut records, updates);
+    put_blob(&mut records, births);
+    put_blob(&mut records, deaths);
+
+    let mut body = Vec::new();
+    put_f64(&mut body, t0);
+    put_f64(&mut body, t1);
+    put_u32(&mut body, level);
+    put_u8(&mut body, delta_mode);
+    put_u64(&mut body, reference_offset);
+    put_u64(&mut body, keyframe_offset);
+    put_u16(&mut body, depth);
+    put_u32(&mut body, update_count);
+    put_u32(&mut body, birth_count);
+    put_u32(&mut body, death_count);
+    // Chunk-level compression: the streams carry their own.
+    put_string(&mut body, "");
+    put_u64(&mut body, records.len() as u64);
+    put_blob(&mut body, &records);
+
+    let mut out = Vec::new();
+    put_record(&mut out, op::DELTA_CHUNK, &body);
+    out
+}
+
+/// A parsed Delta Chunk: its header and its three group blobs (updates, births, deaths),
+/// each borrowed from the record content.
+pub type DeltaChunkParts<'a> = (DeltaChunkHeader, &'a [u8], &'a [u8], &'a [u8]);
+
+/// Parse a Delta Chunk record's content into its header and its three group blobs
+/// (updates, births, deaths).
+pub fn parse_delta_chunk(content: &[u8]) -> Result<DeltaChunkParts<'_>> {
+    let mut c = Cursor::new(content);
+    let head = DeltaChunkHeader {
+        t0: c.f64()?,
+        t1: c.f64()?,
+        level: c.u32()?,
+        delta_mode: c.u8()?,
+        reference_offset: c.u64()?,
+        keyframe_offset: c.u64()?,
+        depth: c.u16()?,
+        update_count: c.u32()?,
+        birth_count: c.u32()?,
+        death_count: c.u32()?,
+        compression: c.string()?,
+        uncompressed_size: c.u64()?,
+    };
+    let records = c.blob()?;
+    let mut r = Cursor::new(records);
+    let updates = r.blob()?;
+    let births = r.blob()?;
+    let deaths = r.blob()?;
+    Ok((head, updates, births, deaths))
+}
+
+/// Bytes the `keyframe-delta` block appends to a Chunk Index entry. A reader takes the
+/// record's length from its header, so an entry with at least this many bytes left after
+/// the band array carries the block and one without simply does not — which is how a
+/// `gaussian-birth` file written before this revision still parses, unchanged, to the same
+/// values.
+const INDEX_DELTA_BLOCK: usize = 1 + 1 + 8 + 8 + 2 + 8;
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ChunkIndexEntry {
     pub t0: f64,
@@ -339,6 +446,23 @@ pub struct ChunkIndexEntry {
     pub gaussian_count: u32,
     /// `(band, offset, length)`, each framing a whole SH Band Stream record.
     pub bands: Vec<(u8, u64, u64)>,
+    /// True when this entry carries the `keyframe-delta` block below. False for every
+    /// `gaussian-birth` file, whose entries must stay byte-identical.
+    pub extended: bool,
+    /// 0 keyframe (a Chunk record), 1 delta (a Delta Chunk record).
+    pub kind: u8,
+    pub delta_mode: u8,
+    /// The chunk this delta applies to. Strictly less than `chunk_offset`: references point
+    /// backwards only, so the chain walk terminates and cycles are unrepresentable.
+    pub reference_offset: u64,
+    /// The keyframe at the head of this group. Equals `chunk_offset` for a keyframe.
+    pub keyframe_offset: u64,
+    /// Delta chunks that must be composed to reach this one. The exact read cost, known
+    /// from the index before anything is fetched.
+    pub depth: u16,
+    /// Gaussians live over `[t0, t1)` after composition. `gaussian_count` cannot answer
+    /// this for a delta entry — there it is the size of the delta, not of the population.
+    pub live_count: u64,
 }
 
 impl ChunkIndexEntry {
@@ -355,7 +479,7 @@ impl ChunkIndexEntry {
             chunk_offset: c.u64()?,
             chunk_length: c.u64()?,
             gaussian_count: c.u32()?,
-            bands: Vec::new(),
+            ..Default::default()
         };
         let bands = c.u32()? as usize;
         entry.bands.reserve(bands.min(1 << 12));
@@ -364,6 +488,15 @@ impl ChunkIndexEntry {
             let offset = c.u64()?;
             let length = c.u64()?;
             entry.bands.push((band, offset, length));
+        }
+        if c.remaining() >= INDEX_DELTA_BLOCK {
+            entry.extended = true;
+            entry.kind = c.u8()?;
+            entry.delta_mode = c.u8()?;
+            entry.reference_offset = c.u64()?;
+            entry.keyframe_offset = c.u64()?;
+            entry.depth = c.u16()?;
+            entry.live_count = c.u64()?;
         }
         Ok(entry)
     }
@@ -380,6 +513,14 @@ impl ChunkIndexEntry {
             put_u8(&mut body, *band);
             put_u64(&mut body, *offset);
             put_u64(&mut body, *length);
+        }
+        if self.extended {
+            put_u8(&mut body, self.kind);
+            put_u8(&mut body, self.delta_mode);
+            put_u64(&mut body, self.reference_offset);
+            put_u64(&mut body, self.keyframe_offset);
+            put_u16(&mut body, self.depth);
+            put_u64(&mut body, self.live_count);
         }
         let mut out = Vec::new();
         put_record(&mut out, op::CHUNK_INDEX, &body);
