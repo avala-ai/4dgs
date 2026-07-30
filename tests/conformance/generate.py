@@ -543,12 +543,20 @@ def _obj_multi() -> tuple[fourdgs.GaussianSet, ObjectLayer]:
                 rotations=[[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 0.0]],
                 translations=[[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]],
             ),
+            # A two-sample step track whose samples straddle the midpoint probe. The
+            # canonical evaluates a track at 0.5*(first+last) — here 2.0, strictly between
+            # 1.0 and 3.0 with no sample on it — and the states probe at half duration is
+            # 2.0 as well, so both land in the open interval where a step track HOLDS its
+            # left sample. The two samples differ in both rotation (identity vs a half-turn)
+            # and translation, so the held value is distinct from what a linear reading would
+            # interpolate: a decoder that lerped or slerped between the samples instead of
+            # holding fails the diff rather than passing it unnoticed.
             ObjectTrack(
                 object_id=9,
                 interpolation=TRAJECTORY_STEP,
-                times=[1.0, 2.0, 3.0],
-                rotations=[[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]],
-                translations=[[0.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 4.0, 0.0]],
+                times=[1.0, 3.0],
+                rotations=[[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 0.0]],
+                translations=[[0.0, 2.0, 0.0], [0.0, 6.0, 0.0]],
             ),
         ],
     )
