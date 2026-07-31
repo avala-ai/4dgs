@@ -168,26 +168,39 @@ class FourdgsObjectLayer {
     }
     if (poses.isEmpty) return;
 
+    // Scalars and direct writes rather than a point list and a quaternion list
+    // per gaussian: composing a tracked million-gaussian object would otherwise
+    // allocate millions of short-lived objects on the per-instant path, and the
+    // collector would cost more than the arithmetic. The maths is the same as
+    // [FourdgsPose.apply] and [quaternionMultiply], inlined.
     for (int i = 0; i < count; i++) {
       final pose = poses[objectIds[i]];
       if (pose == null) continue;
-      final moved = pose.apply(<double>[
-        centers[i * 3],
-        centers[i * 3 + 1],
-        centers[i * 3 + 2],
-      ]);
-      for (int axis = 0; axis < 3; axis++) {
-        centers[i * 3 + axis] = moved[axis];
-      }
-      final turned = quaternionMultiply(pose.rotation, <double>[
-        orientations[i * 4],
-        orientations[i * 4 + 1],
-        orientations[i * 4 + 2],
-        orientations[i * 4 + 3],
-      ]);
-      for (int axis = 0; axis < 4; axis++) {
-        orientations[i * 4 + axis] = turned[axis];
-      }
+      final qx = pose.rotation[0];
+      final qy = pose.rotation[1];
+      final qz = pose.rotation[2];
+      final qw = pose.rotation[3];
+      final px = centers[i * 3];
+      final py = centers[i * 3 + 1];
+      final pz = centers[i * 3 + 2];
+      // q * (0, p) * q^-1, expanded as two cross products.
+      final tx = 2.0 * (qy * pz - qz * py);
+      final ty = 2.0 * (qz * px - qx * pz);
+      final tz = 2.0 * (qx * py - qy * px);
+      centers[i * 3] = px + qw * tx + (qy * tz - qz * ty) + pose.translation[0];
+      centers[i * 3 + 1] =
+          py + qw * ty + (qz * tx - qx * tz) + pose.translation[1];
+      centers[i * 3 + 2] =
+          pz + qw * tz + (qx * ty - qy * tx) + pose.translation[2];
+
+      final rx = orientations[i * 4];
+      final ry = orientations[i * 4 + 1];
+      final rz = orientations[i * 4 + 2];
+      final rw = orientations[i * 4 + 3];
+      orientations[i * 4] = qw * rx + qx * rw + qy * rz - qz * ry;
+      orientations[i * 4 + 1] = qw * ry - qx * rz + qy * rw + qz * rx;
+      orientations[i * 4 + 2] = qw * rz + qx * ry - qy * rx + qz * rw;
+      orientations[i * 4 + 3] = qw * rw - qx * rx - qy * ry - qz * rz;
     }
   }
 }
