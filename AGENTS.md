@@ -97,11 +97,12 @@ With the [`gh stack`](https://docs.github.com/en/pull-requests/reference/stacked
 extension (`gh extension install github/gh-stack`):
 
 ```sh
-# Name the branch: bare `gh stack init` prompts for one, which blocks an agent
-# or any non-interactive shell.
+# Every command here is the non-interactive form. Bare `gh stack init` prompts for a
+# branch name and bare `gh stack submit` opens a full-screen editor; either one blocks
+# an agent or a scripted shell.
 gh stack init typescript/provenance --base main
 gh stack add typescript/objects    # next layer, on top of the current one
-gh stack submit                    # push every branch and open or update the PRs
+gh stack submit --auto             # push every branch, open/update the PRs, no editor
 gh stack view                      # see the stack and where you are in it
 gh stack sync                      # after a merge below you: fetch, rebase, push
 gh stack link 74 75                # adopt a stack that was built by hand
