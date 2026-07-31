@@ -356,7 +356,7 @@ function probeTimes(trajectory: { readonly times: readonly number[] }): number[]
   if (trajectory.times.length === 0) return [];
   const first = trajectory.times[0]!;
   const last = trajectory.times[trajectory.times.length - 1]!;
-  return [first - 0.5, first, first + (last - first) * 0.5, last, last + 0.5];
+  return [first - 0.5, first, first / 2 + last / 2, last, last + 0.5];
 }
 
 /** When to evaluate a sensor's scene pose: the midpoint of the rig it rides. */
