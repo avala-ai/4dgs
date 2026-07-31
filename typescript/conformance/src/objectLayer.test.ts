@@ -16,12 +16,14 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  GaussianSet,
   MalformedFile,
   ObjectLayer,
   TruncatedFile,
   parseObjectTable,
   parseObjectTrack,
   parseQuantization,
+  stateAtWithObjects,
   type ObjectTrack,
 } from "@4dgs/core";
 
@@ -264,4 +266,36 @@ test("a zero-sample track has no pose and is read as absent", () => {
   const empty: ObjectTrack = parseObjectTrack(new Bytes().u32(7).u8(0).u32(0).done());
   const layer = new ObjectLayer(null, [empty]);
   assert.equal(layer.poseAt(7, 0), null);
+});
+
+test("stateAtWithObjects composes the layer that stateAt alone leaves off", async () => {
+  // The gap this closes: `gaussians.stateAt` is the temporal model alone, so a caller who
+  // never learns the object layer exists would render a tracked object at its rest place.
+  const layer = new ObjectLayer(null, [parseObjectTrack(quarterTurnTrack(7))]);
+  const gaussians = new GaussianSet({
+    count: 2,
+    positions: Float32Array.from([1, 0, 0, 1, 0, 0]),
+    scales: Float32Array.from([0.1, 0.1, 0.1, 0.1, 0.1, 0.1]),
+    rotations: Float32Array.from([0, 0, 0, 1, 0, 0, 0, 1]),
+    colors: Float32Array.from([1, 1, 1, 1, 1, 1, 1, 1]),
+    motions: new Float32Array(6),
+    muT: Float32Array.from([1, 1]),
+    sigmaT: Float32Array.from([Infinity, Infinity]),
+    winLo: Float32Array.from([0, 0]),
+    winHi: Float32Array.from([4, 4]),
+    objectId: Uint32Array.from([7, 0]),
+  });
+
+  const base = gaussians.stateAt(2);
+  assert.deepEqual([...base.centers.slice(0, 3)], [1, 0, 0]);
+
+  const composed = stateAtWithObjects(gaussians, layer, 2);
+  // Object 7 is transported; the background gaussian is not.
+  assert.ok(Math.abs(composed.centers[0]! - 5) < 1e-6);
+  assert.ok(Math.abs(composed.centers[1]! - 3) < 1e-6);
+  assert.deepEqual([...composed.centers.slice(3)], [1, 0, 0]);
+
+  // An empty layer is a no-op rather than an error.
+  const untouched = stateAtWithObjects(gaussians, new ObjectLayer(), 2);
+  assert.deepEqual([...untouched.centers.slice(0, 3)], [1, 0, 0]);
 });
