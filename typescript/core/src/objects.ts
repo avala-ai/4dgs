@@ -34,7 +34,7 @@
 
 import { MalformedFile } from "./errors.js";
 import type { GaussianSet, GaussianState } from "./gaussians.js";
-import { poseApply, poseAt, quaternionMultiply, type Pose } from "./provenance.js";
+import { poseAt, type Pose } from "./provenance.js";
 import { BACKGROUND_OBJECT, type ObjectTable, type ObjectTrack } from "./records.js";
 
 /**
@@ -158,21 +158,34 @@ export class ObjectLayer {
     }
     if (poses.size === 0) return;
 
+    // Scalars and direct writes rather than a point array and a quaternion array per
+    // gaussian: composing a tracked million-gaussian object would otherwise allocate
+    // millions of short-lived objects on the per-instant path, and the garbage collector
+    // would cost more than the arithmetic. The maths is the same as `poseApply` and
+    // `quaternionMultiply`, inlined.
     for (let i = 0; i < count; i++) {
       const pose = poses.get(objectIds[i]!);
       if (pose === undefined) continue;
-      const moved = poseApply(pose, [centers[i * 3]!, centers[i * 3 + 1]!, centers[i * 3 + 2]!]);
-      centers[i * 3] = moved[0];
-      centers[i * 3 + 1] = moved[1];
-      centers[i * 3 + 2] = moved[2];
+      const [qx, qy, qz, qw] = pose.rotation;
+      const px = centers[i * 3]!;
+      const py = centers[i * 3 + 1]!;
+      const pz = centers[i * 3 + 2]!;
+      // q * (0, p) * q^-1, expanded as two cross products.
+      const tx = 2 * (qy * pz - qz * py);
+      const ty = 2 * (qz * px - qx * pz);
+      const tz = 2 * (qx * py - qy * px);
+      centers[i * 3] = px + qw * tx + (qy * tz - qz * ty) + pose.translation[0];
+      centers[i * 3 + 1] = py + qw * ty + (qz * tx - qx * tz) + pose.translation[1];
+      centers[i * 3 + 2] = pz + qw * tz + (qx * ty - qy * tx) + pose.translation[2];
 
-      const turned = quaternionMultiply(pose.rotation, [
-        orientations[i * 4]!,
-        orientations[i * 4 + 1]!,
-        orientations[i * 4 + 2]!,
-        orientations[i * 4 + 3]!,
-      ]);
-      for (let axis = 0; axis < 4; axis++) orientations[i * 4 + axis] = turned[axis]!;
+      const rx = orientations[i * 4]!;
+      const ry = orientations[i * 4 + 1]!;
+      const rz = orientations[i * 4 + 2]!;
+      const rw = orientations[i * 4 + 3]!;
+      orientations[i * 4] = qw * rx + qx * rw + qy * rz - qz * ry;
+      orientations[i * 4 + 1] = qw * ry - qx * rz + qy * rw + qz * rx;
+      orientations[i * 4 + 2] = qw * rz + qx * ry - qy * rx + qz * rw;
+      orientations[i * 4 + 3] = qw * rw - qx * rx - qy * ry - qz * rz;
     }
   }
 }
