@@ -289,8 +289,7 @@ Map<String, Object?> _provenance(FourdgsProvenance prov) {
           },
       ],
       'posesAt': <Object?>[
-        for (final probe in probes)
-          _poseRow(probe, fourdgsRigPoseAt(t, probe)),
+        for (final probe in probes) _poseRow(probe, fourdgsRigPoseAt(t, probe)),
       ],
     });
   }
@@ -369,13 +368,7 @@ List<double> _probeTimes(FourdgsRigTrajectory trajectory) {
   if (trajectory.sampleCount == 0) return const <double>[];
   final first = trajectory.times.first;
   final last = trajectory.times.last;
-  return <double>[
-    first - 0.5,
-    first,
-    0.5 * (first + last),
-    last,
-    last + 0.5,
-  ];
+  return <double>[first - 0.5, first, 0.5 * (first + last), last, last + 0.5];
 }
 
 /// When to evaluate a sensor's scene pose: the midpoint of the rig it rides.
@@ -389,11 +382,7 @@ double _sensorProbeTime(
   return 0.5 * (trajectory.times.first + trajectory.times.last);
 }
 
-Map<String, Object?> _poseRow(
-  double t,
-  FourdgsPose? pose, {
-  String? sensor,
-}) {
+Map<String, Object?> _poseRow(double t, FourdgsPose? pose, {String? sensor}) {
   final row = <String, Object?>{'time': num6(t)};
   if (sensor != null) row['sensor'] = sensor;
   if (pose == null) {

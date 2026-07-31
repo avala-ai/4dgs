@@ -191,7 +191,8 @@ C++, Swift and Dart run it on Linux. Every platform decodes the same 46 valid va
 against the same committed expectations — 97 passing comparisons for a family that reports
 provenance but declines the object layer (TypeScript, Dart, C++, Swift), 105 for Rust, which also
 answers the object variants, and 119 for Python, which answers all of them including the refusal
-expectations. The single `decode_indexed` variant that declares no chunk index is skipped everywhere.
+expectations. The single `decode_indexed` variant that declares no chunk index is skipped
+everywhere.
 
 That the corpus is bytes is the whole reason this is worth doing on more than one platform: a
 decoder that agrees with the expectation on Linux and disagrees on Windows is exactly the bug this

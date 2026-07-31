@@ -753,7 +753,8 @@ mod tests {
         // Keys sorted; empty name is a legal frame name; resolved metres match the authority.
         assert!(json.contains(r#""frames":[{"forwardAxis":0.000000,"handedness":1.000000"#));
         assert!(json.contains(r#""metresPerUnitResolved":1.000000"#));
-        assert!(json.contains(r#""anchors":[{"altitudeM":8.750000,"frameName":"","headingDeg":37.500000"#));
+        assert!(json
+            .contains(r#""anchors":[{"altitudeM":8.750000,"frameName":"","headingDeg":37.500000"#));
         assert!(json.contains(r#""sensorPosesAt":[]"#));
         assert!(json.contains(r#""sensors":[]"#));
         assert!(json.contains(r#""trajectories":[]"#));

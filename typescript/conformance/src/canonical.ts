@@ -352,9 +352,7 @@ function summarizeProvenance(prov: Provenance): unknown {
 }
 
 /** Times a summary evaluates a trajectory at, derived from the trajectory itself. */
-function probeTimes(trajectory: {
-  readonly times: readonly number[];
-}): number[] {
+function probeTimes(trajectory: { readonly times: readonly number[] }): number[] {
   if (trajectory.times.length === 0) return [];
   const first = trajectory.times[0]!;
   const last = trajectory.times[trajectory.times.length - 1]!;
