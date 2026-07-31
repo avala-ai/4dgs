@@ -62,6 +62,8 @@ pub struct SceneReader<R: Readable> {
     loaded_key: Option<LoadKey>,
     /// Records that live behind byte ranges on the indexed path, fetched on first use.
     records: Option<Records>,
+    /// Provenance fetched on its own, for a caller that wants only that.
+    provenance_only: Option<crate::provenance::Provenance>,
     /// Object records are independent of the other front matter: asking for a camera must
     /// not also fetch every object track in the file.
     objects: Option<crate::object_layer::ObjectLayer>,
@@ -124,6 +126,7 @@ impl<R: Readable> SceneReader<R> {
                 loaded_band: 0,
                 loaded_key: None,
                 records: None,
+                provenance_only: None,
                 objects: None,
                 sampled_object_poses: None,
                 validated_object_tracks: HashSet::new(),
@@ -143,6 +146,7 @@ impl<R: Readable> SceneReader<R> {
             loaded_band: 3,
             loaded_key: Some(LoadKey::All),
             records: None,
+            provenance_only: None,
             objects: None,
             sampled_object_poses: None,
             validated_object_tracks: HashSet::new(),
@@ -373,6 +377,22 @@ impl<R: Readable> SceneReader<R> {
     /// indexed path these live behind byte ranges framed at open and fetched here, so a
     /// caller that never asks pays nothing for a long rig trajectory.
     pub fn provenance(&mut self) -> Result<crate::provenance::Provenance> {
+        if let Some(records) = &self.records {
+            return Ok(records.provenance.clone());
+        }
+        if let Some(prov) = &self.provenance_only {
+            return Ok(prov.clone());
+        }
+        // Only the provenance ranges. `ensure_records` also fetches the camera, the
+        // metadata and the attachments, and an attachment is the one record here that is
+        // routinely large — a caller asking what frame the scene is in should not pay to
+        // materialize a texture atlas sitting beside it. This is section 2's rule about
+        // indexed reads touching only what was asked for, applied to the front matter.
+        if let Some(scene) = &self.indexed {
+            let prov = indexed_reader::read_provenance(&mut self.source, scene)?;
+            self.provenance_only = Some(prov.clone());
+            return Ok(prov);
+        }
         self.ensure_records()?;
         Ok(self
             .records
