@@ -682,6 +682,12 @@ function stableOrder(gaussians: GaussianSet): number[] {
       sortable(gaussians.winHi[i]!),
     );
     for (let k = 0; k < shWidth; k++) row.push(gaussians.sh!.values[i * shWidth + k]!);
+    // Membership joins the key, after the harmonics and before the index tiebreak, exactly
+    // where the Python and Rust references put it. Two gaussians can tie on every rounded
+    // field and still belong to different objects — and then the `objectIds` sample, and the
+    // states composed from it, would be ordered by decode order, which differs between two
+    // correct readers that chunked the scene differently.
+    if (gaussians.objectId !== null) row.push(gaussians.objectId[i]!);
     row.push(i);
     keys[i] = row;
   }
