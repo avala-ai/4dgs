@@ -357,6 +357,16 @@ export async function decodeScene(
           provenance.anchors.push(parseGeodeticAnchor(content));
           break;
         case Opcode.ObjectTable:
+          // Front matter only, and the reason is the other read path: the indexed
+          // decoder's front-matter walk stops at the first Chunk, so an object record
+          // sitting after one is invisible there. Reading it here would give the same
+          // file transformed centres streamed and untransformed centres indexed — one
+          // decoder, two scenes. Ignored rather than refused, so no file this SDK used
+          // to read stops being readable.
+          if (chunks.length > 0) {
+            skippedOpcodes.push(opcode);
+            break;
+          }
           if (objects.table !== null) {
             throw new MalformedFile(
               "the file carries a second Object Table; a scene has one (section 5.15.6)",
@@ -365,6 +375,10 @@ export async function decodeScene(
           objects.table = parseObjectTable(content);
           break;
         case Opcode.ObjectTrack:
+          if (chunks.length > 0) {
+            skippedOpcodes.push(opcode);
+            break;
+          }
           objects.tracks.push(parseObjectTrack(content));
           break;
         case Opcode.Statistics:

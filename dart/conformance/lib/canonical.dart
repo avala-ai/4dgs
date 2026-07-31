@@ -530,7 +530,13 @@ List<double> _probeTimes(FourdgsRigTrajectory trajectory) {
   if (trajectory.sampleCount == 0) return const <double>[];
   final first = trajectory.times.first;
   final last = trajectory.times.last;
-  return <double>[first - 0.5, first, 0.5 * (first + last), last, last + 0.5];
+  return <double>[
+    first - 0.5,
+    first,
+    first + (last - first) * 0.5,
+    last,
+    last + 0.5,
+  ];
 }
 
 /// When to evaluate a sensor's scene pose: the midpoint of the rig it rides.
@@ -541,7 +547,8 @@ double _sensorProbeTime(
   if (sensor.rigName.isEmpty) return 0.0;
   final trajectory = prov.trajectory(sensor.rigName);
   if (trajectory == null || trajectory.sampleCount == 0) return 0.0;
-  return 0.5 * (trajectory.times.first + trajectory.times.last);
+  return trajectory.times.first +
+      (trajectory.times.last - trajectory.times.first) * 0.5;
 }
 
 Map<String, Object?> _poseRow(double t, FourdgsPose? pose, {String? sensor}) {
