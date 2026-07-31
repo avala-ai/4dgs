@@ -317,6 +317,33 @@ void main() {
     expect(centers, <double>[1, 2, 3]);
   });
 
+  test('an id in the upper half of the u32 range still matches its track', () {
+    // `object_id` is an exact label over the whole u32 range (spec section
+    // 6.6), and a stream decodes into signed bins. Held in an Int32List this
+    // id is -1, while the track parses its own id as 4294967295 — the two
+    // never meet, the object silently stops moving, and the canonical summary
+    // prints a negative label no other SDK emits. Membership is stored
+    // unsigned so the comparison is the one the format defines.
+    const big = 0xffffffff;
+    final layer = FourdgsObjectLayer(
+      tracks: <FourdgsObjectTrack>[
+        FourdgsObjectTrack.parse(_quarterTurnTrack(big)),
+      ],
+    );
+    expect(layer.tracks.single.objectId, big);
+
+    // The bins a decoded lane would hold, reinterpreted the way the chunk
+    // decoder does.
+    final ids = Uint32List.fromList(<int>[-1]);
+    expect(ids[0], big);
+
+    final centers = Float64List.fromList(<double>[1, 0, 0]);
+    final orientations = Float64List.fromList(<double>[0, 0, 0, 1]);
+    layer.apply(centers, orientations, ids, 2);
+    expect(centers[0], closeTo(5, 1e-9));
+    expect(centers[1], closeTo(3, 1e-9));
+  });
+
   test('a zero-sample track has no pose and is read as absent', () {
     final empty = FourdgsObjectTrack.parse(
       (_Bytes()
