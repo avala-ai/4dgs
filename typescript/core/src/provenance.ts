@@ -28,6 +28,8 @@ import {
   POSE_TO_RIG,
   TRAJECTORY_LINEAR,
   TRAJECTORY_STEP,
+  finiteLerp,
+  interpolationFraction,
 } from "./records.js";
 
 /** Metres per unit for each registry length unit, or `undefined` for one this build does not know. */
@@ -185,16 +187,18 @@ export function poseAt(trajectory: PoseSampled, t: number): Pose | null {
     );
   }
 
-  const span = times[lo + 1]! - times[lo]!;
-  const u = (t - times[lo]!) / span;
+  // Overflow-safe, the way the audio-source poses and the Dart decoder already are: two
+  // finite translations can still have a difference that is not — `-1e308` to `1e308` is a
+  // legal pair — and a naive lerp reports infinity where the midpoint is zero.
+  const u = interpolationFraction(t, times[lo]!, times[lo + 1]!);
   const a = sample(trajectory, lo);
   const b = sample(trajectory, lo + 1);
   return {
     rotation: slerp(a.rotation, b.rotation, u),
     translation: [
-      a.translation[0] + u * (b.translation[0] - a.translation[0]),
-      a.translation[1] + u * (b.translation[1] - a.translation[1]),
-      a.translation[2] + u * (b.translation[2] - a.translation[2]),
+      finiteLerp(a.translation[0], b.translation[0], u),
+      finiteLerp(a.translation[1], b.translation[1], u),
+      finiteLerp(a.translation[2], b.translation[2], u),
     ],
   };
 }
