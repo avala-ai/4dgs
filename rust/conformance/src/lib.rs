@@ -761,7 +761,13 @@ fn probe_times<T: PoseSampled + ?Sized>(trajectory: &T) -> Vec<f64> {
     }
     let first = trajectory.time(0);
     let last = trajectory.time(trajectory.sample_count() - 1);
-    vec![first - 0.5, first, 0.5 * (first + last), last, last + 0.5]
+    vec![
+        first - 0.5,
+        first,
+        first + (last - first) * 0.5,
+        last,
+        last + 0.5,
+    ]
 }
 
 /// When to evaluate a sensor's scene pose: the midpoint of the rig it rides.
@@ -770,7 +776,10 @@ fn sensor_probe_time(prov: &Provenance, rig_name: &str) -> f64 {
         return 0.0;
     }
     match prov.trajectory(rig_name) {
-        Some(t) if t.sample_count() > 0 => 0.5 * (t.times[0] + t.times[t.sample_count() - 1]),
+        Some(t) if t.sample_count() > 0 => {
+            let (first, last) = (t.times[0], t.times[t.sample_count() - 1]);
+            first + (last - first) * 0.5
+        }
         _ => 0.0,
     }
 }
