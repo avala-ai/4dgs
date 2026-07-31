@@ -1018,8 +1018,14 @@ export interface RigTrajectory {
  * cost a reader, matching the Dart decoder's. A million samples is a ten-minute capture at
  * more than 1.5 kHz, well past any real rig, and each one becomes 64 bytes of decoded
  * arrays here.
+ *
+ * Sized to stay under the 64 MiB front-matter range cap the indexed readers enforce: at 64
+ * bytes a sample this is 64 MB of samples, leaving room for the name, the count and the
+ * record framing. `1 << 20` would have been 64 MiB of samples *exactly*, so a trajectory at
+ * the ceiling would parse on the streamed path and be refused on the indexed one — the same
+ * file, two answers from one SDK.
  */
-export const MAX_TRAJECTORY_SAMPLES = 1 << 20;
+export const MAX_TRAJECTORY_SAMPLES = 1_000_000;
 
 export function parseRigTrajectory(content: Uint8Array): RigTrajectory {
   const c = new Cursor(content);
