@@ -313,15 +313,17 @@ Map<String, Object?> _objectsAndStates(
         ],
     ];
 
-    final positionSum = <Object?>[
-      for (int axis = 0; axis < 3; axis++)
-        num6(
-          <double>[
-            for (int row = 0; row < base.count; row++)
-              base.centers[row * 3 + axis],
-          ].fold<double>(0.0, (double a, double b) => a + b),
-        ),
-    ];
+    // Accumulated in scalars rather than through a live-count-sized list per
+    // axis: a large object scene would otherwise pay peak memory proportional to
+    // the decoded state purely to report a sum. Summed in row order, which is
+    // the canonical gaussian order these rows were built in.
+    final totals = <double>[0.0, 0.0, 0.0];
+    for (int row = 0; row < base.count; row++) {
+      for (int axis = 0; axis < 3; axis++) {
+        totals[axis] += base.centers[row * 3 + axis];
+      }
+    }
+    final positionSum = <Object?>[for (final total in totals) num6(total)];
     double opacitySum = 0.0;
     for (final value in base.opacity) {
       opacitySum += value;
