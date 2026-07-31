@@ -104,16 +104,20 @@ gh stack add typescript/objects    # next layer, on top of the current one
 gh stack submit                    # push every branch and open or update the PRs
 gh stack view                      # see the stack and where you are in it
 gh stack sync                      # after a merge below you: fetch, rebase, push
+gh stack link 74 75                # adopt a stack that was built by hand
 ```
 
-Without the extension, the same shape is three ordinary commands — branch from the layer below and
+Without the extension, the same shape is two ordinary commands — branch from the layer below, and
 pass `--base` when opening the PR:
 
 ```sh
 git checkout -b dart/objects typescript/objects
 gh pr create --base typescript/objects
-gh stack link 74 75                # optional: link existing PRs into a stack on GitHub
 ```
+
+The base branch is the whole mechanism, so a stack built this way merges bottom-up and retargets
+exactly like one the extension made. What it does not get is the stack view on the pull request;
+`gh stack link`, which adds that, is part of the extension too.
 
 **What does not belong in a stack.** A stack is for changes that genuinely depend on each other. Two
 unrelated fixes stacked together inherit each other's review latency and each other's red CI for no
