@@ -637,6 +637,18 @@ Result<std::string> keyframeDeltaStatesJson(Span<const std::uint8_t> bytes, bool
   return out;
 }
 
+Result<std::string> provenanceJson(Handle& handle) {
+  const char* data = nullptr;
+  std::size_t length = 0;
+  // Sequenced deliberately: read the out parameters only after the status is OK. Empty
+  // string means the file carries no provenance — not a failure.
+  const int status = fourdgs_scene_provenance_json(asScene(handle), &data, &length);
+  if (status != FOURDGS_STATUS_OK) return failure(status).error();
+  std::string out = (data != nullptr && length != 0) ? std::string(data, length) : std::string();
+  fourdgs_string_free(data, length);
+  return out;
+}
+
 void closeScene(Handle& handle) noexcept {
   // Null is ignored by the ABI, and freeing invalidates every pointer borrowed from it —
   // which is why nothing in this package holds one across a close.

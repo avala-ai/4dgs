@@ -23,6 +23,9 @@ public enum JSON {
     case string(String)
     case array([JSON])
     case object([String: JSON])
+    /// A value already serialized as JSON text — used for provenance, which the core emits
+    /// as a complete object so every binding shares one slerp rather than reimplementing it.
+    case raw(String)
 
     /// Six decimals, or `null` for a non-finite value.
     ///
@@ -62,6 +65,8 @@ public enum JSON {
             out += n
         case .string(let s):
             out += Self.quote(s)
+        case .raw(let text):
+            out += text
         case .array(let items):
             out += "["
             for (i, item) in items.enumerated() {

@@ -237,6 +237,15 @@ Json Json::object(std::map<std::string, Json> members) {
   return json;
 }
 
+Json Json::raw(std::string json) {
+  Json value;
+  // Rendered as text verbatim, like a pre-formatted number: the core already produced the
+  // complete object, and re-parsing it here would only risk a second rounding pass.
+  value.kind_ = Kind::kNumber;
+  value.text_ = std::move(json);
+  return value;
+}
+
 std::string Json::render(int indent) const {
   const std::string pad(static_cast<std::size_t>(indent) * 2, ' ');
   const std::string inner(static_cast<std::size_t>(indent + 1) * 2, ' ');
@@ -417,7 +426,7 @@ std::string canonical(const SceneSummary& summary) {
     });
   }
 
-  Json root = Json::object({
+  std::map<std::string, Json> rootMembers = {
       {"aggregate", Json::object({
                         {"neverFadesCount", integer(neverFades)},
                         {"opacitySum", num(opacitySum)},
@@ -456,9 +465,15 @@ std::string canonical(const SceneSummary& summary) {
        summary.summaryCrcOk == nullptr ? Json::null() : Json::boolean(*summary.summaryCrcOk)},
       {"summaryOffsets", Json::array(std::move(summaryOffsets))},
       {"temporalModel", Json::string(header.temporalModel)},
-  });
+  };
 
-  return root.render();
+  // Omitted entirely when the file carries no provenance — not the `audioSources`
+  // convention. A file without provenance is a file the record family does not apply to.
+  if (!summary.provenanceJson.empty()) {
+    rootMembers.emplace("provenance", Json::raw(summary.provenanceJson));
+  }
+
+  return Json::object(std::move(rootMembers)).render();
 }
 
 }  // namespace conformance

@@ -22,7 +22,8 @@ public enum Summary {
         scene: Scene,
         gaussians: GaussianState,
         chunkIntervals: [(Double, Double)],
-        summaryChecksumVerified: Bool?
+        summaryChecksumVerified: Bool?,
+        provenanceJson: String = ""
     ) -> JSON {
         let order = stableOrder(gaussians)
         let sampled = Array(order.prefix(sample))
@@ -49,7 +50,7 @@ public enum Summary {
             .array(sampled.map { JSON.number(array[$0]) })
         }
 
-        return .object([
+        var fields: [String: JSON] = [
             "gaussianCount": .integer(gaussians.count),
             "durationSec": .number(scene.header.durationSec),
             "cutoff": .number(scene.header.cutoff),
@@ -105,7 +106,15 @@ public enum Summary {
                 "neverFadesCount": .integer(neverFades),
                 "zeroMotionCount": .integer(zeroMotion),
             ]),
-        ])
+        ]
+
+        // Omitted entirely when the file carries no provenance — not the `audioSources`
+        // convention. A file without provenance is a file the record family does not apply to.
+        if !provenanceJson.isEmpty {
+            fields["provenance"] = .raw(provenanceJson)
+        }
+
+        return .object(fields)
     }
 
     // MARK: - Records that are not gaussians

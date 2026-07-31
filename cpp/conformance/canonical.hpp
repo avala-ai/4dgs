@@ -37,6 +37,9 @@ class Json {
   static Json string(std::string value);
   static Json array(std::vector<Json> items);
   static Json object(std::map<std::string, Json> members);
+  /// A value already serialized as JSON text — used for provenance, which the core emits
+  /// as a complete object so every binding shares one slerp rather than reimplementing it.
+  static Json raw(std::string json);
 
   std::string render(int indent = 0) const;
 
@@ -76,6 +79,8 @@ struct SceneSummary {
   const Statistics* statistics = nullptr;
   std::vector<SummaryOffset> summaryOffsets;
   const bool* summaryCrcOk = nullptr;  ///< Null renders as JSON null.
+  /// Canonical provenance object from the core. Empty omits the key entirely.
+  std::string provenanceJson;
 };
 
 /// The statement every implementation must agree on for a variant.

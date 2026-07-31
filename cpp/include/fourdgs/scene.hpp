@@ -171,6 +171,11 @@ class Scene {
   Result<Statistics> statistics() const;
   std::vector<SummaryOffset> summaryOffsets() const;
 
+  /// Canonical provenance JSON (spec §5.15), computed in the Rust core so every binding
+  /// emits the same object. Empty when the file carries none — omit the key rather than
+  /// emit null. On the indexed path the records are fetched here if not already resident.
+  Result<std::string> provenanceJson();
+
   /// Three states, not two: "not checked" and "did not match" are different claims about a
   /// file, and collapsing them reports corruption nobody observed.
   enum class CrcState { kNotChecked = -1, kFailed = 0, kVerified = 1 };

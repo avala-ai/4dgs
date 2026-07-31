@@ -94,6 +94,7 @@ Result<std::string> peekTemporalModel(Span<const std::uint8_t>) { return notImpl
 Result<std::string> keyframeDeltaStatesJson(Span<const std::uint8_t>, bool) {
   return notImplemented();
 }
+Result<std::string> provenanceJson(Handle&) { return notImplemented(); }
 
 void closeScene(Handle& handle) noexcept { handle.scene = nullptr; }
 void closeState(StateHandle& state) noexcept { state.state = nullptr; }
