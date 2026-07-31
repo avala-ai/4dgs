@@ -115,9 +115,11 @@ git checkout -b dart/objects typescript/objects
 gh pr create --base typescript/objects
 ```
 
-The base branch is the whole mechanism, so a stack built this way merges bottom-up and retargets
-exactly like one the extension made. What it does not get is the stack view on the pull request;
-`gh stack link`, which adds that, is part of the extension too.
+That gives the thing that matters most — each diff shows one layer — and the base chain is what
+makes the PRs merge in order. It does **not** make GitHub treat them as a stack: the stack map, the
+banner and the cascading rebase appear only once the pull requests are linked, with `gh stack link`
+or by confirming GitHub's recommendation banner. Until then it is a branch chain that reviews well,
+not a stack.
 
 **What does not belong in a stack.** A stack is for changes that genuinely depend on each other. Two
 unrelated fixes stacked together inherit each other's review latency and each other's red CI for no
