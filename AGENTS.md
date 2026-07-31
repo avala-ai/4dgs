@@ -112,7 +112,11 @@ pass `--base` when opening the PR:
 
 ```sh
 git checkout -b dart/objects typescript/objects
-gh pr create --base typescript/objects
+git push -u origin dart/objects
+# `--fill` takes the title and body from the commits. Without it — and without an
+# already-pushed branch — `gh pr create` prompts, which blocks an agent just as
+# bare `gh stack init` does.
+gh pr create --base typescript/objects --fill
 ```
 
 That gives the thing that matters most — each diff shows one layer — and the base chain is what
