@@ -216,6 +216,13 @@ public final class SceneReader {
         Core.bytesForTime(handle, t, bandCap: options.bandCap)
     }
 
+    /// Canonical provenance JSON (spec §5.15), computed in the Rust core so every binding
+    /// emits the same object. Empty when the file carries none — omit the key rather than
+    /// emit null. On the indexed path the records are fetched here if not already resident.
+    public func provenanceJson() throws -> String {
+        try Core.provenanceJson(handle)
+    }
+
     /// Read a bounded range of one source's encoded payload.
     public func audioSourceData(
         _ index: Int, offset: UInt64 = 0, length: UInt64

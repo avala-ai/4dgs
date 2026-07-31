@@ -6,6 +6,14 @@ All notable changes to the Rust crate are documented here, following
 
 ## [Unreleased]
 
+### Added
+
+- **Provenance on the C ABI.** `fourdgs_scene_provenance_json` returns the canonical provenance
+  object (frames, anchors, sensors, trajectories with `posesAt` probes, and `sensorPosesAt`) for an
+  opened scene, or an empty string when the file carries none. Computed by
+  `provenance::canonical_json` in the core so C++ and Swift emit the same slerp and clamp as the
+  reference; freed with the existing `fourdgs_string_free`. Additive — no existing signature moved.
+
 ## [0.3.0] - 2026-07-31
 
 This release adds the normative `keyframe-delta` temporal model in the crate and exposes whole-file

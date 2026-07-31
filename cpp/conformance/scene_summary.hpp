@@ -32,6 +32,8 @@ struct SceneRecords {
   bool crcKnown = false;
   bool crcOk = false;
   std::vector<std::pair<double, double>> chunkIntervals;
+  /// Canonical provenance JSON from the core. Empty when the file carries none.
+  std::string provenanceJson;
 };
 
 /// Read everything the summary reports beyond the gaussians.
@@ -85,6 +87,13 @@ inline Result<void> collectRecords(Scene& scene, SceneRecords* out) {
     if (!interval) return interval.error();
     out->chunkIntervals.push_back(*interval);
   }
+
+  // Provenance is computed in the Rust core (posesAt / sensorPosesAt included) so this
+  // binding cannot drift from the reference on slerp. Empty means omit the key.
+  Result<std::string> provenance = scene.provenanceJson();
+  if (!provenance) return provenance.error();
+  out->provenanceJson = std::move(*provenance);
+
   return Result<void>();
 }
 
@@ -101,6 +110,7 @@ inline SceneSummary summaryOf(const SceneRecords& records, const GaussianView& g
   summary.statistics = records.hasStatistics ? &records.statistics : nullptr;
   summary.summaryOffsets = records.summaryOffsets;
   summary.summaryCrcOk = records.crcKnown ? &records.crcOk : nullptr;
+  summary.provenanceJson = records.provenanceJson;
   return summary;
 }
 

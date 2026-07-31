@@ -635,6 +635,22 @@ enum Core {
         return result
     }
 
+    // MARK: - Provenance
+
+    /// Canonical provenance JSON for an opened scene (spec §5.15). Empty when the file
+    /// carries none — the binding should omit the key rather than emit null. On the indexed
+    /// path the records are fetched here if not already resident; the core computes posesAt
+    /// and sensorPosesAt so every binding shares one slerp.
+    static func provenanceJson(_ scene: SceneHandle) throws -> String {
+        var out: UnsafePointer<CChar>?
+        var length = 0
+        let status = fourdgs_scene_provenance_json(scene.raw, &out, &length)
+        guard status == ok else { throw error(status) }
+        let result = string(out, length)
+        fourdgs_string_free(out, length)
+        return result
+    }
+
     // MARK: - Strings
 
     /// A string the core lends us, copied into Swift storage before the call returns.

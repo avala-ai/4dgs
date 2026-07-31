@@ -154,6 +154,19 @@ static void check_summary_surface(fourdgs_scene *scene) {
               "statistics are readable when present");
     }
 
+    /* Provenance: empty string when absent is OK; non-empty when present is owned JSON. */
+    {
+        const char *prov = NULL;
+        size_t prov_len = 0;
+        check(fourdgs_scene_provenance_json(scene, &prov, &prov_len) == FOURDGS_STATUS_OK,
+              "provenance JSON is always readable");
+        /* Empty is legal: most files carry no provenance. Free the owned pair either way. */
+        if (prov_len > 0) {
+            check(prov != NULL && prov[0] == '{', "non-empty provenance is a JSON object");
+        }
+        fourdgs_string_free(prov, prov_len);
+    }
+
     for (uint32_t i = 0; i < fourdgs_scene_summary_offset_count(scene); ++i) {
         uint8_t opcode = 0;
         uint64_t start = 0, length = 0;

@@ -2274,9 +2274,42 @@ pub unsafe extern "C" fn fourdgs_keyframe_delta_states_json(
     })
 }
 
-/// Release a string owned by the caller — the result of `fourdgs_peek_temporal_model` or
-/// `fourdgs_keyframe_delta_states_json`. Null is accepted and ignored. The length must be
-/// the one the producing call returned; the pair identifies the same allocation.
+/// Canonical provenance JSON for an opened scene (spec §5.15).
+///
+/// Works on both open paths: on the indexed path the records are fetched if not already
+/// resident; on the sequential path they were read at open. An empty string means the file
+/// carries no provenance — the binding should omit the key, not emit null. On success `out`
+/// owns a string freed with `fourdgs_string_free`. Sequence the two out parameters the way
+/// every other call here does: read them only after this returns OK.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_scene_provenance_json(
+    scene: *mut fourdgs_scene,
+    out: *mut *const c_char,
+    out_len: *mut usize,
+) -> c_int {
+    guarded(|| {
+        if out.is_null() || out_len.is_null() {
+            set_last_error("a string out parameter is null".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        }
+        let Some(scene) = (unsafe { scene.as_mut() }) else {
+            set_last_error("the scene is null".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        };
+        match scene.inner.provenance() {
+            Ok(prov) => match crate::provenance::canonical_json(&prov) {
+                Ok(json) => put_owned_string(json, out, out_len),
+                Err(e) => report(e),
+            },
+            Err(e) => report(e),
+        }
+    })
+}
+
+/// Release a string owned by the caller — the result of `fourdgs_peek_temporal_model`,
+/// `fourdgs_keyframe_delta_states_json` or `fourdgs_scene_provenance_json`. Null is
+/// accepted and ignored. The length must be the one the producing call returned; the pair
+/// identifies the same allocation.
 #[no_mangle]
 pub unsafe extern "C" fn fourdgs_string_free(data: *const c_char, length: usize) {
     if data.is_null() {
