@@ -65,6 +65,15 @@ class FourdgsObjectTrackView implements FourdgsPoseSampled {
   List<double> translationAt(int i) => track.translations[i];
 }
 
+/// The pose one track holds at [t], or null when it has no samples.
+///
+/// A track is a [FourdgsPoseSampled] in everything but name, so section
+/// 5.15.4's clamp-and-slerp is reached rather than restated.
+FourdgsPose? _poseOf(FourdgsObjectTrack track, double t) {
+  if (track.sampleCount == 0) return null;
+  return fourdgsPoseAt(FourdgsObjectTrackView(track), t);
+}
+
 /// Every object-layer record a file carried, and the rule that spans the
 /// tracks.
 ///
@@ -113,8 +122,7 @@ class FourdgsObjectLayer {
   FourdgsPose? poseAt(int objectId, double t) {
     if (objectId == backgroundObject) return null;
     final found = track(objectId);
-    if (found == null || found.sampleCount == 0) return null;
-    return fourdgsPoseAt(FourdgsObjectTrackView(found), t);
+    return found == null ? null : _poseOf(found, t);
   }
 
   /// Compose tracks onto reconstructed centres and orientations, in place.
@@ -152,7 +160,10 @@ class FourdgsObjectLayer {
     final poses = <int, FourdgsPose>{};
     for (final track in tracks) {
       if (!referenced.contains(track.objectId)) continue;
-      final pose = poseAt(track.objectId, t);
+      // Sampled from the track in hand rather than through [poseAt], which
+      // would look the same track up by id and rescan the list — that is what
+      // turns the O(gaussians + tracks) this method promises into O(tracks^2).
+      final pose = _poseOf(track, t);
       if (pose != null) poses[track.objectId] = pose;
     }
     if (poses.isEmpty) return;
