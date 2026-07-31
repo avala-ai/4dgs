@@ -613,6 +613,13 @@ List<int> _stableOrder(FourdgsGaussianSet g) {
       _sortable(g.winHi[i]),
       if (sh != null)
         for (int k = 0; k < shWidth; k++) sh[i * shWidth + k].toDouble(),
+      // Membership joins the key, after the harmonics and before the index
+      // tie-break, exactly where the Python and Rust references put it. Two
+      // gaussians can tie on every rounded field and still belong to different
+      // objects — and then the `objectIds` sample, and the states composed from
+      // it, would be ordered by decode order, which differs between two correct
+      // readers that chunked the scene differently.
+      if (g.objectId != null) g.objectId![i].toDouble(),
     ];
     keys.add((row, i));
   }
