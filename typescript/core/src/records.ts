@@ -624,14 +624,21 @@ function audioPoseAt(
   ];
 }
 
-function interpolationFraction(t: number, a: number, b: number): number {
+/**
+ * The normalized position of `t` between finite, strictly increasing `a` and `b`.
+ *
+ * Scaling is necessary when the mathematical span is finite but cannot be represented as
+ * a double — `-1e308..1e308` is a legal pair of finite samples whose difference is not.
+ */
+export function interpolationFraction(t: number, a: number, b: number): number {
   const span = b - a;
   if (Number.isFinite(span)) return (t - a) / span;
   const scale = Math.max(Math.abs(a), Math.abs(b));
   return (t / scale - a / scale) / (b / scale - a / scale);
 }
 
-function finiteLerp(a: number, b: number, u: number): number {
+/** Interpolate two finite values without overflowing their difference across zero. */
+export function finiteLerp(a: number, b: number, u: number): number {
   return (a <= 0 && b >= 0) || (a >= 0 && b <= 0) ? a * (1 - u) + b * u : a + (b - a) * u;
 }
 
@@ -1004,6 +1011,16 @@ export interface RigTrajectory {
   readonly translations: readonly (readonly number[])[];
 }
 
+/**
+ * The most samples one trajectory may declare.
+ *
+ * Not a format limit — the format states none — but a ceiling on what a single record can
+ * cost a reader, matching the Dart decoder's. A million samples is a ten-minute capture at
+ * more than 1.5 kHz, well past any real rig, and each one becomes 64 bytes of decoded
+ * arrays here.
+ */
+export const MAX_TRAJECTORY_SAMPLES = 1 << 20;
+
 export function parseRigTrajectory(content: Uint8Array): RigTrajectory {
   const c = new Cursor(content);
   const name = c.string();
@@ -1016,6 +1033,12 @@ export function parseRigTrajectory(content: Uint8Array): RigTrajectory {
     throw new TruncatedFile(
       `trajectory ${JSON.stringify(name)} declares ${count} samples (${count * 64} bytes), ` +
         `${c.remaining} remain`,
+    );
+  }
+  if (count > MAX_TRAJECTORY_SAMPLES) {
+    throw new MalformedFile(
+      `trajectory ${JSON.stringify(name)} declares ${count} samples, past the ` +
+        `${MAX_TRAJECTORY_SAMPLES} ceiling`,
     );
   }
   const times: number[] = [];
