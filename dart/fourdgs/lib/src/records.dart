@@ -1295,4 +1295,11 @@ const int maxBandsPerChunk = 16;
 /// A ten-minute capture at 100 Hz is sixty thousand samples; this ceiling is an
 /// order of magnitude above that and still a refusal rather than an allocation
 /// a hostile file chooses.
-const int maxRigTrajectorySamples = 1 << 20;
+///
+/// Sized to stay under [maxFrontMatterBytes], the 64 MiB range cap the indexed
+/// path enforces: at 64 bytes a sample this is 64 MB of samples, leaving room
+/// for the name, the count and the record framing. `1 << 20` would have been 64
+/// MiB of samples *exactly*, so a trajectory at the ceiling parsed on the
+/// streamed path and was refused on the indexed one — the same file, two
+/// answers from one SDK.
+const int maxRigTrajectorySamples = 1000000;
