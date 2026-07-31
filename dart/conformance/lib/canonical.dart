@@ -368,13 +368,7 @@ List<double> _probeTimes(FourdgsRigTrajectory trajectory) {
   if (trajectory.sampleCount == 0) return const <double>[];
   final first = trajectory.times.first;
   final last = trajectory.times.last;
-  return <double>[
-    first - 0.5,
-    first,
-    first + (last - first) * 0.5,
-    last,
-    last + 0.5,
-  ];
+  return <double>[first - 0.5, first, first / 2 + last / 2, last, last + 0.5];
 }
 
 /// When to evaluate a sensor's scene pose: the midpoint of the rig it rides.
