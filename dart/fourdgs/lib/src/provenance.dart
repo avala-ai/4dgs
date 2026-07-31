@@ -93,9 +93,7 @@ List<double> normalizeQuaternion(List<double> q) {
   }
   final norm = math.sqrt(normSq);
   if (!norm.isFinite || norm == 0.0) {
-    throw FourdgsMalformedFile(
-      'a quaternion with norm $norm has no direction',
-    );
+    throw FourdgsMalformedFile('a quaternion with norm $norm has no direction');
   }
   return <double>[q[0] / norm, q[1] / norm, q[2] / norm, q[3] / norm];
 }
@@ -366,11 +364,7 @@ class FourdgsProvenance {
   /// producer ever claimed.
   void check() {
     final groups = <(String, List<String>, String)>[
-      (
-        'CoordinateFrame',
-        <String>[for (final f in frames) f.name],
-        '5.15.2',
-      ),
+      ('CoordinateFrame', <String>[for (final f in frames) f.name], '5.15.2'),
       (
         'SensorCalibration',
         <String>[for (final s in sensors) s.name],

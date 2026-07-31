@@ -943,7 +943,8 @@ export function checkSensorCalibration(sensor: SensorCalibration): void {
   finite("fy", sensor.fy);
   finite("cx", sensor.cx);
   finite("cy", sensor.cy);
-  for (let i = 0; i < sensor.distortion.length; i++) finite(`distortion[${i}]`, sensor.distortion[i]!);
+  for (let i = 0; i < sensor.distortion.length; i++)
+    finite(`distortion[${i}]`, sensor.distortion[i]!);
   for (let i = 0; i < sensor.rotation.length; i++) finite(`rotation[${i}]`, sensor.rotation[i]!);
   for (let i = 0; i < sensor.translation.length; i++) {
     finite(`translation[${i}]`, sensor.translation[i]!);
@@ -1037,7 +1038,10 @@ export function parseRigTrajectory(content: Uint8Array): RigTrajectory {
  * repeated or reversed timestamp makes that interval ambiguous.
  */
 export function checkRigTrajectory(trajectory: RigTrajectory): void {
-  if (trajectory.interpolation !== TRAJECTORY_LINEAR && trajectory.interpolation !== TRAJECTORY_STEP) {
+  if (
+    trajectory.interpolation !== TRAJECTORY_LINEAR &&
+    trajectory.interpolation !== TRAJECTORY_STEP
+  ) {
     throw new MalformedFile(
       `trajectory ${JSON.stringify(trajectory.name)} uses interpolation ${trajectory.interpolation}; ` +
         "this reader supports trajectory interpolation registry values 0 (linear) and 1 (step)",

@@ -5,9 +5,10 @@ binding: it shares no code with the other SDKs, which is what makes its agreemen
 [conformance suite](../tests/conformance/) worth something.
 
 Both read paths pass every variant this SDK declares support for — including the provenance family
-(spec section 5.15) — so every decode row in the [feature matrix](../website/docs/reference/index.md)
-is filled in from a suite that runs. It declines the object-layer variants and the invalid corpus's
-refusal expectations, which is what the remaining `No` cells in that table record.
+(spec section 5.15) — so every decode row in the
+[feature matrix](../website/docs/reference/index.md) is filled in from a suite that runs. It
+declines the object-layer variants and the invalid corpus's refusal expectations, which is what the
+remaining `No` cells in that table record.
 
 Scope: decoding a `.4dgs` to gaussian state and audio-source state at a time `t`. **Rendering and
 listener-relative spatialization are out of scope — the SDK ends at decoded state.**
