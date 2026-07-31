@@ -344,6 +344,41 @@ void main() {
     expect(centers[1], closeTo(3, 1e-9));
   });
 
+  test('a Quantization record that bounds object_id is refused', () {
+    // An id is an exact label (section 6.6), so there is no meaningful error
+    // bound between two of them; section 6.5 makes this a refusal rather than
+    // something to ignore. Python and Rust refuse it, and an SDK that accepted
+    // it would claim object-layer support while decoding a file the references
+    // reject.
+    final pairs =
+        (_Bytes()
+              ..str('object_id')
+              ..str('0.5'))
+            .done();
+    final record = _Bytes()..str('grid-v1');
+    for (int i = 0; i < 3; i++) {
+      record.f64(0); // posOrigin
+    }
+    for (int i = 0; i < 8; i++) {
+      record.f64(1); // the eight steps
+    }
+    record
+      ..u8(0) // stepSh
+      ..u32(pairs.length);
+    final withBounds = Uint8List.fromList(<int>[...record.done(), ...pairs]);
+
+    expect(
+      () => FourdgsQuantization.parse(withBounds),
+      throwsA(
+        isA<FourdgsMalformedFile>().having(
+          (FourdgsMalformedFile e) => e.toString(),
+          'message',
+          contains('object_id'),
+        ),
+      ),
+    );
+  });
+
   test('a zero-sample track has no pose and is read as absent', () {
     final empty = FourdgsObjectTrack.parse(
       (_Bytes()

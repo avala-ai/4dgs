@@ -153,6 +153,17 @@ class FourdgsQuantization {
     final scheme = c.string();
     final origin = c.f64s(3);
     final steps = c.f64s(8);
+    final stepSh = c.u8();
+    final bounds = c.strMap();
+    // `object_id` is an exact label (section 6.6), not a metric value, so there
+    // is no meaningful error bound between two different labels — section 6.5
+    // makes a bound for it a refusal rather than something to ignore.
+    if (bounds.containsKey('object_id')) {
+      throw FourdgsMalformedFile(
+        "Quantization.bounds contains object_id='${bounds['object_id']}'; "
+        'object_id is an exact label and MUST NOT carry a bound',
+      );
+    }
     return FourdgsQuantization(
       scheme: scheme,
       posOrigin: origin,
@@ -164,8 +175,8 @@ class FourdgsQuantization {
       stepMotion: steps[5],
       stepTime: steps[6],
       stepSigmaLog: steps[7],
-      stepSh: c.u8(),
-      bounds: c.strMap(),
+      stepSh: stepSh,
+      bounds: bounds,
     );
   }
 }
