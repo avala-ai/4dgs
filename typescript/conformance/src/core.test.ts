@@ -18,7 +18,10 @@ import {
   Crc32,
   Cursor,
   MalformedFile,
+  MAX_TRAJECTORY_SAMPLES,
   TruncatedFile,
+  parseRigTrajectory,
+  poseAt,
   UnsupportedVersion,
   StreamDecoder,
   audioSourceStateAt,
@@ -464,4 +467,54 @@ test("the encoder writes a file that decodes back to what went in", async () => 
   for (let i = 0; i < count * 3; i++) {
     assert.ok(Math.abs(scene.gaussians.positions[i]! - gaussians.positions[i]!) < 0.05);
   }
+});
+
+/** Little-endian record bytes for the trajectory tests below. */
+function trajectoryBytes(samples: readonly (readonly number[])[]): Uint8Array {
+  const head = [0x03, 0, 0, 0, 0x72, 0x69, 0x67, 0x00]; // "rig" as a u32-prefixed string
+  const parts: number[] = head.slice(0, 7); // u32 length 3, then the three bytes
+  parts.push(0); // interpolation: linear
+  const count = new DataView(new ArrayBuffer(4));
+  count.setUint32(0, samples.length, true);
+  for (let i = 0; i < 4; i++) parts.push(count.getUint8(i));
+  for (const sample of samples) {
+    for (const value of sample) {
+      const view = new DataView(new ArrayBuffer(8));
+      view.setFloat64(0, value, true);
+      for (let i = 0; i < 8; i++) parts.push(view.getUint8(i));
+    }
+  }
+  return Uint8Array.from(parts);
+}
+
+test("a trajectory interpolates without overflowing between extreme translations", () => {
+  // Two finite samples whose difference is not representable. A naive lerp reports
+  // infinity where the midpoint is zero, and the parser accepts these samples, so a
+  // TypeScript consumer would diverge from Dart and Python on a file all three accept.
+  const trajectory = parseRigTrajectory(
+    trajectoryBytes([
+      [0, 0, 0, 0, 1, -1e308, -1e308, -1e308],
+      [2, 0, 0, 0, 1, 1e308, 1e308, 1e308],
+    ]),
+  );
+
+  const pose = poseAt(trajectory, 1)!;
+  for (const value of pose.translation) {
+    assert.ok(Number.isFinite(value), `translation ${value} should be finite`);
+    assert.ok(Math.abs(value) < 1e-6, `midpoint should be ~0, got ${value}`);
+  }
+});
+
+test("a trajectory past the sample ceiling is refused before it is allocated", () => {
+  // The byte-length check cannot catch this on its own: the ceiling is what bounds the
+  // decoded arrays a single record can ask a reader to build, as the Dart decoder's does.
+  const declared = MAX_TRAJECTORY_SAMPLES + 1;
+  const parts: number[] = [3, 0, 0, 0, 0x72, 0x69, 0x67, 0];
+  const count = new DataView(new ArrayBuffer(4));
+  count.setUint32(0, declared, true);
+  for (let i = 0; i < 4; i++) parts.push(count.getUint8(i));
+  // Room for every declared sample, so only the ceiling can refuse it.
+  const body = new Uint8Array(parts.length + declared * 64);
+  body.set(Uint8Array.from(parts));
+  assert.throws(() => parseRigTrajectory(body), MalformedFile);
 });
