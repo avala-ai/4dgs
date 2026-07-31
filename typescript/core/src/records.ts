@@ -186,7 +186,7 @@ export function parseQuantization(content: Uint8Array): Quantization {
   const scheme = c.string();
   const posOrigin = c.f64s(3);
   const steps = c.f64s(8);
-  return {
+  const quantization: Quantization = {
     scheme,
     posOrigin,
     stepPos: steps[0]!,
@@ -200,6 +200,17 @@ export function parseQuantization(content: Uint8Array): Quantization {
     stepSh: c.u8(),
     bounds: c.stringMap(),
   };
+  // `object_id` is an exact label (spec section 6.6), not a metric value, so there is no
+  // meaningful error bound between two different labels — section 6.5 makes a bound for it
+  // a refusal rather than something to ignore.
+  const objectBound = quantization.bounds.get("object_id");
+  if (objectBound !== undefined) {
+    throw new MalformedFile(
+      `Quantization.bounds contains object_id=${JSON.stringify(objectBound)}; ` +
+        "object_id is an exact label and MUST NOT carry a bound",
+    );
+  }
+  return quantization;
 }
 
 /** Validity windows, as `[lo, hi]` pairs flattened into one array. */

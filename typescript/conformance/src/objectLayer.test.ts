@@ -21,6 +21,7 @@ import {
   TruncatedFile,
   parseObjectTable,
   parseObjectTrack,
+  parseQuantization,
   type ObjectTrack,
 } from "@4dgs/core";
 
@@ -233,6 +234,30 @@ test("an object id in the upper half of the u32 range still matches its track", 
   layer.apply(centers, orientations, ids, 2);
   assert.ok(Math.abs(centers[0]! - 5) < 1e-6);
   assert.ok(Math.abs(centers[1]! - 3) < 1e-6);
+});
+
+test("a Quantization record that bounds object_id is refused", () => {
+  // An id is an exact label (spec section 6.6), so there is no meaningful error bound
+  // between two of them; section 6.5 makes this a refusal rather than something to ignore.
+  // Python and Rust refuse it, and an SDK that accepted it would claim object-layer support
+  // while decoding a file the references reject.
+  // A string map is a u32 byte length followed by that many bytes of key/value pairs.
+  const pairs = new Bytes().string("object_id").string("0.5").done();
+  const record = new Bytes().string("grid-v1");
+  for (let i = 0; i < 3; i++) record.f64(0); // posOrigin
+  for (let i = 0; i < 8; i++) record.f64(1); // the eight steps
+  record.u8(0); // stepSh
+  record.u32(pairs.length);
+  const withBounds = Uint8Array.from([...record.done(), ...pairs]);
+
+  assert.throws(
+    () => parseQuantization(withBounds),
+    (error: Error) => {
+      assert.ok(error instanceof MalformedFile);
+      assert.match(error.message, /object_id/);
+      return true;
+    },
+  );
 });
 
 test("a zero-sample track has no pose and is read as absent", () => {
