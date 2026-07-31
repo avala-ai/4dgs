@@ -273,6 +273,16 @@ FourdgsScene readFourdgsBytes(
             FourdgsRigTrajectory.parse(record.content),
           );
         case opObjectTable:
+          // Front matter only, and the reason is the other read path: the
+          // indexed opener's front-matter walk stops at the first Chunk, so an
+          // object record after one is invisible there. Reading it here would
+          // give the same file transformed centres streamed and untransformed
+          // centres indexed — one decoder, two scenes. Ignored rather than
+          // refused, so no file this reader used to read stops being readable.
+          if (chunks.isNotEmpty) {
+            skipped.add(record.opcode);
+            break;
+          }
           if (objects.table != null) {
             throw FourdgsMalformedFile(
               'the file carries a second Object Table; a scene has one '
@@ -282,6 +292,10 @@ FourdgsScene readFourdgsBytes(
           objects.table = FourdgsObjectTable.parse(record.content);
           break;
         case opObjectTrack:
+          if (chunks.isNotEmpty) {
+            skipped.add(record.opcode);
+            break;
+          }
           objects.tracks.add(FourdgsObjectTrack.parse(record.content));
           break;
         case opGeodeticAnchor:
