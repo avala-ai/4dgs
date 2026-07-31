@@ -92,6 +92,11 @@ export interface ChunkGaussians {
   readonly windowIndex: Int32Array;
   readonly sourceGroup: Int32Array | null;
   readonly sourceIndex: Int32Array | null;
+  /**
+   * Object membership (spec §6.6), or `null` when the chunk carries none. `0` is
+   * background: a gaussian that belongs to no object and is never transformed.
+   */
+  readonly objectId: Int32Array | null;
 }
 
 export interface DecodeChunkOptions {
@@ -116,6 +121,7 @@ const EMPTY_CHUNK: ChunkGaussians = {
   windowIndex: new Int32Array(0),
   sourceGroup: null,
   sourceIndex: null,
+  objectId: null,
 };
 
 /**
@@ -158,9 +164,12 @@ export async function decodeChunkStreams(
     throw new MalformedFile(`chunk is missing required attributes ${missing.join(", ")}`);
   }
 
-  const wanted = [...REQUIRED_ATTRIBUTES, Attribute.SourceGroup, Attribute.SourceIndex].filter(
-    (id) => byId.has(id),
-  );
+  const wanted = [
+    ...REQUIRED_ATTRIBUTES,
+    Attribute.SourceGroup,
+    Attribute.SourceIndex,
+    Attribute.ObjectId,
+  ].filter((id) => byId.has(id));
   const decoded = new Map<number, Int32Array>();
   await Promise.all(
     wanted.map(async (id) => {
@@ -262,6 +271,7 @@ function assemble(
     windowIndex,
     sourceGroup: decoded.get(Attribute.SourceGroup) ?? null,
     sourceIndex: decoded.get(Attribute.SourceIndex) ?? null,
+    objectId: decoded.get(Attribute.ObjectId) ?? null,
   };
 }
 

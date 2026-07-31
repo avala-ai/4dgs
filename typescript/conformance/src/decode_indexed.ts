@@ -74,6 +74,7 @@ export async function run(path: string): Promise<string> {
     const metadata = await scene.readMetadata();
     const attachments = await scene.readAttachments();
     const provenance = await scene.readProvenance();
+    const objects = await scene.readObjects();
 
     await checkIndexedInvariants(scene, source);
 
@@ -95,6 +96,7 @@ export async function run(path: string): Promise<string> {
         summaryOffsets: scene.summaryOffsets,
         summaryCrcOk: scene.summaryCrcOk,
         provenance,
+        objects,
       }),
     );
   } finally {

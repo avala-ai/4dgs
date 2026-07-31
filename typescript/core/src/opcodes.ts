@@ -43,15 +43,29 @@ export const Opcode = {
   RigTrajectory: 0x22,
   /** Defined after the three above, so it took the next free number rather than a tidier one. */
   GeodeticAnchor: 0x23,
+  /**
+   * The object layer, spec §5.15.6–§5.15.7. The Object Table names the scene's objects
+   * (labels, anchors, embeddings); the SE(3) Track carries one object's rigid pose over
+   * the scene clock. Both are advisory front matter in the provenance family's sense — a
+   * reader that skips them by length decodes a valid base scene — so they sit inside the
+   * family range and are framed by the same walk.
+   */
+  ObjectTable: 0x24,
+  ObjectTrack: 0x25,
 } as const;
 
-/** First opcode of the provenance family, and one past its last. `0x24`–`0x2F` are reserved. */
+/** First opcode of the provenance family, and one past its last. `0x26`–`0x2F` are reserved. */
 export const PROVENANCE_START = 0x20;
 export const PROVENANCE_END = 0x30;
 
 /** True for the provenance family, defined and reserved alike. */
 export function isProvenanceOpcode(opcode: number): boolean {
   return opcode >= PROVENANCE_START && opcode < PROVENANCE_END;
+}
+
+/** True for the two object-layer opcodes, which are a family within the family. */
+export function isObjectOpcode(opcode: number): boolean {
+  return opcode === Opcode.ObjectTable || opcode === Opcode.ObjectTrack;
 }
 
 /** Records whose currently defined fields are frozen for the life of version 1. */
@@ -105,6 +119,11 @@ export const Attribute = {
    * reader may skip; this is what a delta names its gaussians by.
    */
   GaussianId: 13,
+  /**
+   * Object membership, spec §6.6. A `u32` per gaussian, `0` = background / unassigned.
+   * Optional: a chunk without it carries gaussians that belong to no object.
+   */
+  ObjectId: 14,
 } as const;
 
 /** Attribute ids every chunk must carry. */

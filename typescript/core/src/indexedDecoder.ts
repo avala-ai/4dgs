@@ -26,6 +26,7 @@ import { crc32, DEFAULT_CODECS, type CodecRegistry } from "./codec.js";
 import { MalformedFile } from "./errors.js";
 import { FrontMatterScanner } from "./frontMatter.js";
 import { isProvenanceOpcode, Opcode } from "./opcodes.js";
+import { ObjectLayer } from "./objects.js";
 import { Provenance } from "./provenance.js";
 import { DEFAULT_CUTOFF, supportK } from "./quantization.js";
 import { checkQuantizationScheme, checkTemporalModel } from "./registry.js";
@@ -62,6 +63,8 @@ import {
   parseGeodeticAnchor,
   parseMetadata,
   parseHeader,
+  parseObjectTable,
+  parseObjectTrack,
   parseQuantization,
   parseRigTrajectory,
   parseSensorCalibration,
@@ -347,7 +350,8 @@ export class IndexedDecoder {
    *
    * Opening a file frames these and stops, so a scene with a long rig trajectory costs
    * the same to open as one with none. Object-layer and still-reserved opcodes in the
-   * same family are framed and skipped here — they belong to a different layer.
+   * same family are framed and skipped here — they belong to a different layer, and
+   * {@link readObjects} reads them from the same ranges.
    */
   async readProvenance(): Promise<Provenance> {
     const out = new Provenance();
@@ -376,6 +380,36 @@ export class IndexedDecoder {
         }
       } else {
         out.anchors.push(parseGeodeticAnchor(content));
+      }
+    }
+    out.check();
+    return out;
+  }
+
+  /**
+   * Every object-layer record, from the same framed ranges as the provenance family.
+   *
+   * Deferred for the same reason: a scene with a thousand-sample track costs nothing to
+   * open, and a consumer that only wants geometry never pays for the layer at all.
+   */
+  async readObjects(): Promise<ObjectLayer> {
+    const out = new ObjectLayer();
+    for (const range of this.provenanceRanges) {
+      const { opcode } = range;
+      if (opcode !== Opcode.ObjectTable && opcode !== Opcode.ObjectTrack) continue;
+      const content = await this.readRecordAt(
+        { offset: range.offset, length: range.length },
+        opcode,
+      );
+      if (opcode === Opcode.ObjectTable) {
+        if (out.table !== null) {
+          throw new MalformedFile(
+            "the file carries a second Object Table; a scene has one (section 5.15.6)",
+          );
+        }
+        out.table = parseObjectTable(content);
+      } else {
+        out.tracks.push(parseObjectTrack(content));
       }
     }
     out.check();

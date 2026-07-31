@@ -43,6 +43,7 @@ export {
   PROVENANCE_START,
   REQUIRED_ATTRIBUTES,
   isPrivateOpcode,
+  isObjectOpcode,
   isProvenanceOpcode,
   opcodeName,
 } from "./opcodes.js";
@@ -97,13 +98,19 @@ export {
   type ParsedDeltaChunk,
   type Quantization,
   type RawRecord,
+  type ObjectTable,
+  type ObjectTableEntry,
+  type ObjectTrack,
   type RigTrajectory,
   type SensorCalibration,
   type Statistics,
   type SummaryOffset,
+  BACKGROUND_OBJECT,
   checkCoordinateFrame,
   checkGeodeticAnchor,
   checkMagic,
+  checkObjectTable,
+  checkObjectTrack,
   checkRigTrajectory,
   checkSensorCalibration,
   MAX_TRAJECTORY_SAMPLES,
@@ -127,6 +134,8 @@ export {
   parseGeodeticAnchor,
   parseHeader,
   parseMetadata,
+  parseObjectTable,
+  parseObjectTrack,
   parseQuantization,
   parseRigTrajectory,
   parseSensorCalibration,
@@ -140,6 +149,7 @@ export {
 export {
   LENGTH_UNIT_METRES,
   Provenance,
+  quaternionMultiply,
   type Pose,
   type PoseSampled,
   poseApply,
@@ -147,6 +157,7 @@ export {
   poseCompose,
   slerp,
 } from "./provenance.js";
+export { ObjectLayer } from "./objects.js";
 export {
   checkQuantizationScheme,
   checkTemporalModel,
