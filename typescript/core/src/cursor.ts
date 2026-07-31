@@ -103,6 +103,12 @@ export class Cursor {
     return this.view.getFloat64(at, true);
   }
 
+  f32s(n: number): number[] {
+    const out: number[] = new Array<number>(n);
+    for (let i = 0; i < n; i++) out[i] = this.f32();
+    return out;
+  }
+
   f64s(n: number): number[] {
     const out: number[] = new Array<number>(n);
     for (let i = 0; i < n; i++) out[i] = this.f64();

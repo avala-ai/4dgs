@@ -130,15 +130,14 @@ REFUSAL_FAMILIES = frozenset({"python"})
 #: all of which contain `Object`. A family that does not decode the Object Table and SE(3)
 #: tracks declines every one of them — the same optional, no-Header-flag family provenance
 #: used to be: an SDK that steps them over by length decodes every gaussian in the file
-#: correctly but does not report the family. Only Python and Rust decode objects today, so
-#: they are absent here.
+#: correctly but does not report the family. Python, Rust and TypeScript decode objects
+#: today, so they are absent here.
 OBJECT_TOKENS = ("Object",)
 
 FAMILY_DECLINES: dict[str, tuple[str, ...]] = {
     # TypeScript, Dart, C++ and Swift report provenance (spec §5.15) — C++ and Swift via
-    # the Rust C ABI's additive provenance-JSON accessor. All four still decline the object
-    # layer.
-    "typescript": OBJECT_TOKENS,
+    # the Rust C ABI's additive provenance-JSON accessor. TypeScript also decodes the
+    # object layer and composes its tracks natively; C++, Swift and Dart still decline it.
     "cpp": OBJECT_TOKENS,
     "swift": OBJECT_TOKENS,
     "dart": OBJECT_TOKENS,

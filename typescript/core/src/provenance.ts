@@ -75,7 +75,8 @@ export function poseCompose(self: Pose, inner: Pose): Pose {
   };
 }
 
-function quaternionMultiply(
+/** `a ⊗ b`: the rotation that applies `b` first, then `a`. */
+export function quaternionMultiply(
   a: readonly number[],
   b: readonly number[],
 ): [number, number, number, number] {

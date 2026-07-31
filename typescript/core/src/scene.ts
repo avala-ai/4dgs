@@ -21,6 +21,7 @@ import { Cursor } from "./cursor.js";
 import { MalformedFile, TruncatedFile } from "./errors.js";
 import { assembleGaussians, type GaussianSet } from "./gaussians.js";
 import { Opcode } from "./opcodes.js";
+import { ObjectLayer } from "./objects.js";
 import { Provenance } from "./provenance.js";
 import { DEFAULT_CUTOFF, supportK } from "./quantization.js";
 import { checkQuantizationScheme, checkTemporalModel } from "./registry.js";
@@ -44,6 +45,8 @@ import {
   parseGeodeticAnchor,
   parseHeader,
   parseMetadata,
+  parseObjectTable,
+  parseObjectTrack,
   parseQuantization,
   parseRigTrajectory,
   parseSensorCalibration,
@@ -86,6 +89,11 @@ export interface Scene {
    * Footer arrives and says where that region began.
    */
   readonly summaryCrcOk: boolean | null;
+  /**
+   * Every object-layer record the file carried (spec sections 5.15.6-5.15.7). Empty
+   * when it carried none, which is a value and not an error.
+   */
+  readonly objects: ObjectLayer;
   /**
    * Every provenance record the file carried (spec section 5.15). Empty when it carried
    * none — a value, never an error.
@@ -218,6 +226,7 @@ export async function decodeScene(
   let camera: Camera | null = null;
   let statistics: Statistics | null = null;
   const provenance = new Provenance();
+  const objects = new ObjectLayer();
   let truncated = false;
 
   let at = 0;
@@ -347,6 +356,17 @@ export async function decodeScene(
         case Opcode.GeodeticAnchor:
           provenance.anchors.push(parseGeodeticAnchor(content));
           break;
+        case Opcode.ObjectTable:
+          if (objects.table !== null) {
+            throw new MalformedFile(
+              "the file carries a second Object Table; a scene has one (section 5.15.6)",
+            );
+          }
+          objects.table = parseObjectTable(content);
+          break;
+        case Opcode.ObjectTrack:
+          objects.tracks.push(parseObjectTrack(content));
+          break;
         case Opcode.Statistics:
           statistics = parseStatistics(content);
           break;
@@ -392,7 +412,10 @@ export async function decodeScene(
   // can only run once the whole front matter has gone past. A truncated file may
   // legitimately be missing the trajectory a sensor names, so this is skipped there:
   // the recovery contract is that everything complete before the cut still stands.
-  if (!truncated) provenance.check();
+  if (!truncated) {
+    provenance.check();
+    objects.check();
+  }
 
   const audioSources = assembleAudioSourceDescriptors(
     header,
@@ -421,6 +444,7 @@ export async function decodeScene(
     chunkIndex,
     summaryOffsets,
     provenance,
+    objects,
     skippedOpcodes,
     summaryCrcOk,
     truncated,

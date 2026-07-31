@@ -990,6 +990,186 @@ export function checkSensorCalibration(sensor: SensorCalibration): void {
   }
 }
 
+/** Background / unassigned. A gaussian carrying this id belongs to no object. */
+export const BACKGROUND_OBJECT = 0;
+
+/** One object's advisory description. Nothing here transforms a gaussian. */
+export interface ObjectTableEntry {
+  readonly objectId: number;
+  readonly label: string;
+  readonly anchor: readonly number[];
+  /** `[velocity, angularVelocity, acceleration]`, or `null` when the entry carries none. */
+  readonly dynamics: readonly [readonly number[], readonly number[], readonly number[]] | null;
+  readonly embedding: readonly number[] | null;
+}
+
+/**
+ * The scene's one Object Table. Opcode `0x24`.
+ *
+ * Everything in it is advisory: membership comes from the `object_id` attribute (§6.6)
+ * and geometry changes only through an Object Track (§5.15.7). A reader that skips this
+ * record still decodes every gaussian correctly; what it loses is the names.
+ */
+export interface ObjectTable {
+  readonly embeddingDim: number;
+  readonly entries: readonly ObjectTableEntry[];
+}
+
+export function parseObjectTable(content: Uint8Array): ObjectTable {
+  const c = new Cursor(content);
+  const objectCount = c.u32();
+  const embeddingDim = c.u16();
+  // Bounded before anything is sized from it, like every other count-prefixed record.
+  // The smallest an entry can be is 4 (id) + 4 (empty label) + 12 (anchor) + 1 (dynamics
+  // flag), plus one more byte for the embedding flag once a space is declared.
+  const minimumEntryBytes = 4 + 4 + 12 + 1 + (embeddingDim > 0 ? 1 : 0);
+  if (objectCount * minimumEntryBytes > c.remaining) {
+    throw new TruncatedFile(
+      `ObjectTable declares ${objectCount} objects (at least ` +
+        `${objectCount * minimumEntryBytes} bytes), ${c.remaining} remain`,
+    );
+  }
+  const entries: ObjectTableEntry[] = [];
+  for (let i = 0; i < objectCount; i++) {
+    const objectId = c.u32();
+    const label = c.string();
+    const anchor = c.f32s(3);
+    const dynamicsPresent = c.u8();
+    if (dynamicsPresent > 1) {
+      throw new MalformedFile(
+        `ObjectTable entry ${i} has dynamics_present ${dynamicsPresent}; it must be 0 or 1 ` +
+          "(section 5.15.6)",
+      );
+    }
+    const dynamics =
+      dynamicsPresent === 1
+        ? ([c.f32s(3), c.f32s(3), c.f32s(3)] as [number[], number[], number[]])
+        : null;
+    let embedding: number[] | null = null;
+    if (embeddingDim > 0) {
+      const hasEmbedding = c.u8();
+      if (hasEmbedding > 1) {
+        throw new MalformedFile(
+          `ObjectTable entry ${i} has has_embedding ${hasEmbedding}; it must be 0 or 1 ` +
+            "(section 5.15.6)",
+        );
+      }
+      if (hasEmbedding === 1) {
+        if (embeddingDim * 4 > c.remaining) {
+          throw new TruncatedFile(
+            `ObjectTable entry ${i} declares a ${embeddingDim}-dimensional embedding ` +
+              `(${embeddingDim * 4} bytes), ${c.remaining} remain`,
+          );
+        }
+        embedding = c.f32s(embeddingDim);
+      }
+    }
+    entries.push({ objectId, label, anchor, dynamics, embedding });
+  }
+  const table: ObjectTable = { embeddingDim, entries };
+  checkObjectTable(table);
+  return table;
+}
+
+/**
+ * Refuse a table that cannot be indexed by id, and values that are not numbers.
+ *
+ * Two entries for one id make every lookup a coin toss, which is the duplicate-name
+ * failure section 5.15.2 refuses for frames and sensors, spelled with integers.
+ */
+export function checkObjectTable(table: ObjectTable): void {
+  const seen = new Set<number>();
+  for (const entry of table.entries) {
+    if (seen.has(entry.objectId)) {
+      throw new MalformedFile(
+        `two ObjectTable entries describe object ${entry.objectId}; entries are referred to ` +
+          "by id and nothing else (section 5.15.6)",
+      );
+    }
+    seen.add(entry.objectId);
+    const finite = (label: string, values: readonly number[]): void => {
+      for (let k = 0; k < values.length; k++) {
+        if (!Number.isFinite(values[k]!)) {
+          throw new MalformedFile(
+            `ObjectTable entry ${entry.objectId}: ${label}[${k}] is ${values[k]}; every stored ` +
+              "value must be finite (section 5.15.6)",
+          );
+        }
+      }
+    };
+    finite("anchor", entry.anchor);
+    if (entry.dynamics !== null) {
+      finite("velocity", entry.dynamics[0]);
+      finite("angular_velocity", entry.dynamics[1]);
+      finite("acceleration", entry.dynamics[2]);
+    }
+    if (entry.embedding !== null) finite("embedding", entry.embedding);
+  }
+}
+
+/**
+ * One object's rigid pose over the scene clock. Opcode `0x25`, one record per object.
+ *
+ * Structurally a {@link RigTrajectory} keyed by object id rather than by name, and
+ * deliberately so: it satisfies `PoseSampled`, so the clamp-and-slerp of section 5.15.4
+ * is the same code for both and cannot drift between them.
+ */
+export interface ObjectTrack {
+  readonly objectId: number;
+  readonly interpolation: number;
+  readonly times: readonly number[];
+  readonly rotations: readonly (readonly number[])[];
+  readonly translations: readonly (readonly number[])[];
+}
+
+export function parseObjectTrack(content: Uint8Array): ObjectTrack {
+  const c = new Cursor(content);
+  const objectId = c.u32();
+  const interpolation = c.u8();
+  const count = c.u32();
+  // Each sample is 8 + 32 + 24 = 64 bytes, as for a rig trajectory.
+  if (count * 64 > c.remaining) {
+    throw new TruncatedFile(
+      `ObjectTrack for object ${objectId} declares ${count} samples (${count * 64} bytes), ` +
+        `${c.remaining} remain`,
+    );
+  }
+  const times: number[] = [];
+  const rotations: number[][] = [];
+  const translations: number[][] = [];
+  for (let i = 0; i < count; i++) {
+    times.push(c.f64());
+    rotations.push(c.f64s(4));
+    translations.push(c.f64s(3));
+  }
+  const track: ObjectTrack = { objectId, interpolation, times, rotations, translations };
+  checkObjectTrack(track);
+  return track;
+}
+
+/**
+ * A track's own rules: it moves a real object, and its samples are a function of time.
+ *
+ * The pose rules are the trajectory's, so they are checked by the trajectory's checker
+ * rather than restated — the two records interpolate identically and a second copy of
+ * the rule is a second thing to get wrong.
+ */
+export function checkObjectTrack(track: ObjectTrack): void {
+  if (track.objectId === BACKGROUND_OBJECT) {
+    throw new MalformedFile(
+      "an ObjectTrack names object 0, which means background / unassigned; a track must move " +
+        "an object that exists (section 5.15.7)",
+    );
+  }
+  checkRigTrajectory({
+    name: `object ${track.objectId}`,
+    interpolation: track.interpolation,
+    times: track.times,
+    rotations: track.rotations,
+    translations: track.translations,
+  });
+}
+
 /**
  * The measured pose of the capture platform over the scene clock. Opcode `0x22`.
  *
