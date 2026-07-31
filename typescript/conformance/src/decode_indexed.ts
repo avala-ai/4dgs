@@ -73,6 +73,7 @@ export async function run(path: string): Promise<string> {
     const camera = await scene.readCamera();
     const metadata = await scene.readMetadata();
     const attachments = await scene.readAttachments();
+    const provenance = await scene.readProvenance();
 
     await checkIndexedInvariants(scene, source);
 
@@ -93,6 +94,7 @@ export async function run(path: string): Promise<string> {
         statistics: scene.statistics,
         summaryOffsets: scene.summaryOffsets,
         summaryCrcOk: scene.summaryCrcOk,
+        provenance,
       }),
     );
   } finally {

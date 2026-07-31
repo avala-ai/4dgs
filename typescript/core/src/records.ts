@@ -744,3 +744,339 @@ export function parseShBandRecord(content: Uint8Array): { band: number; cursor: 
   const cursor = new Cursor(content);
   return { band: cursor.u8(), cursor };
 }
+
+// ---------------------------------------------------------------------------
+// Provenance family (spec section 5.15)
+//
+// Four optional records. Absence is the common case and costs nothing: a scene with no
+// provenance carries no record, no Header flag, and no empty table. See provenance.ts
+// for the arithmetic and the rules that span more than one record.
+// ---------------------------------------------------------------------------
+
+/** Pose is expressed in the scene frame. */
+export const POSE_TO_SCENE = 0;
+/** Pose is expressed relative to a named rig trajectory. */
+export const POSE_TO_RIG = 1;
+
+export const TRAJECTORY_LINEAR = 0;
+export const TRAJECTORY_STEP = 1;
+
+export const CAMERA_MODEL_NONE = 0;
+
+/**
+ * Coefficient counts each camera model defines, keyed by its registry id. A model
+ * absent from here is one this build does not know, which is not the same as one that
+ * is wrong: `undefined` means "ask the caller", not "refuse".
+ */
+export const CAMERA_MODEL_COEFFICIENTS: ReadonlyMap<number, readonly number[]> = new Map([
+  [0, [0]], // none — the sensor is not a camera
+  [1, [0]], // pinhole
+  [2, [5, 8]], // brown-conrady, plain or rational
+  [3, [4]], // kannala-brandt
+]);
+
+/**
+ * The frame the file's own coordinates are expressed in. Opcode `0x20`.
+ *
+ * A fixed shape: every field is always present, so a reader that knows these six knows
+ * exactly where an appended seventh would begin.
+ */
+export interface CoordinateFrame {
+  readonly name: string;
+  readonly handedness: number;
+  readonly upAxis: number;
+  readonly forwardAxis: number;
+  readonly lengthUnit: number;
+  readonly metresPerUnit: number;
+}
+
+export function parseCoordinateFrame(content: Uint8Array): CoordinateFrame {
+  const c = new Cursor(content);
+  const frame: CoordinateFrame = {
+    name: c.string(),
+    handedness: c.u8(),
+    upAxis: c.u8(),
+    forwardAxis: c.u8(),
+    lengthUnit: c.u8(),
+    metresPerUnit: c.f64(),
+  };
+  checkCoordinateFrame(frame);
+  return frame;
+}
+
+/** Refuse a frame that is not one, rather than repair it. */
+export function checkCoordinateFrame(frame: CoordinateFrame): void {
+  for (const [label, axis] of [
+    ["up_axis", frame.upAxis],
+    ["forward_axis", frame.forwardAxis],
+  ] as const) {
+    if (axis > 5) {
+      throw new MalformedFile(
+        `CoordinateFrame ${label} is ${axis}; the registry defines 0..5 (section 5.15.2)`,
+      );
+    }
+  }
+  if (frame.upAxis % 3 === frame.forwardAxis % 3) {
+    throw new MalformedFile(
+      `CoordinateFrame up_axis ${frame.upAxis} and forward_axis ${frame.forwardAxis} ` +
+        "name the same axis; a frame needs two different ones (section 5.15.2)",
+    );
+  }
+  if (!Number.isFinite(frame.metresPerUnit) || frame.metresPerUnit < 0) {
+    throw new MalformedFile(
+      `CoordinateFrame metres_per_unit is ${frame.metresPerUnit}; ` +
+        "it must be finite and not negative (section 5.15.2)",
+    );
+  }
+}
+
+/**
+ * Where a frame's origin sits on the WGS-84 ellipsoid, and which way it faces.
+ * Opcode `0x23`.
+ */
+export interface GeodeticAnchor {
+  readonly frameName: string;
+  readonly latitudeDeg: number;
+  readonly longitudeDeg: number;
+  readonly altitudeM: number;
+  readonly headingDeg: number;
+}
+
+export function parseGeodeticAnchor(content: Uint8Array): GeodeticAnchor {
+  const c = new Cursor(content);
+  const frameName = c.string();
+  const values = c.f64s(4);
+  const anchor: GeodeticAnchor = {
+    frameName,
+    latitudeDeg: values[0]!,
+    longitudeDeg: values[1]!,
+    altitudeM: values[2]!,
+    headingDeg: values[3]!,
+  };
+  checkGeodeticAnchor(anchor);
+  return anchor;
+}
+
+/** Refuse an out-of-range angle rather than wrap it. */
+export function checkGeodeticAnchor(anchor: GeodeticAnchor): void {
+  for (const [label, value, lo, hi] of [
+    ["latitude_deg", anchor.latitudeDeg, -90, 90],
+    ["longitude_deg", anchor.longitudeDeg, -180, 180],
+    ["altitude_m", anchor.altitudeM, Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY],
+    ["heading_deg", anchor.headingDeg, 0, 360],
+  ] as const) {
+    if (!Number.isFinite(value)) {
+      throw new MalformedFile(`GeodeticAnchor ${label} is ${value}; every field must be finite`);
+    }
+    if (value < lo || value > hi || (label === "heading_deg" && value === 360)) {
+      throw new MalformedFile(
+        `GeodeticAnchor ${label} is ${value}, outside its legal range (section 5.15.5)`,
+      );
+    }
+  }
+}
+
+/**
+ * One sensor's intrinsics and extrinsics. Opcode `0x21`, one record per sensor.
+ *
+ * The extrinsic maps sensor coordinates into the frame `poseReference` names:
+ * `p_target = R(rotation) * p_sensor + translation`.
+ */
+export interface SensorCalibration {
+  readonly name: string;
+  readonly modality: string;
+  readonly cameraModel: number;
+  readonly widthPx: number;
+  readonly heightPx: number;
+  readonly fx: number;
+  readonly fy: number;
+  readonly cx: number;
+  readonly cy: number;
+  readonly distortion: readonly number[];
+  /** Unit quaternion, `xyzw`. */
+  readonly rotation: readonly number[];
+  readonly translation: readonly number[];
+  readonly poseReference: number;
+  readonly rigName: string;
+}
+
+export function parseSensorCalibration(content: Uint8Array): SensorCalibration {
+  const c = new Cursor(content);
+  const name = c.string();
+  const modality = c.string();
+  const cameraModel = c.u8();
+  const widthPx = c.u32();
+  const heightPx = c.u32();
+  const intrinsics = c.f64s(4);
+  const distortion = c.f64s(c.u8());
+  const rotation = c.f64s(4);
+  const translation = c.f64s(3);
+  const sensor: SensorCalibration = {
+    name,
+    modality,
+    cameraModel,
+    widthPx,
+    heightPx,
+    fx: intrinsics[0]!,
+    fy: intrinsics[1]!,
+    cx: intrinsics[2]!,
+    cy: intrinsics[3]!,
+    distortion,
+    rotation,
+    translation,
+    poseReference: c.u8(),
+    rigName: c.string(),
+  };
+  checkSensorCalibration(sensor);
+  return sensor;
+}
+
+export function checkSensorCalibration(sensor: SensorCalibration): void {
+  const finite = (label: string, value: number): void => {
+    if (!Number.isFinite(value)) {
+      throw new MalformedFile(
+        `sensor ${JSON.stringify(sensor.name)}: ${label} is ${value}; every value must be finite`,
+      );
+    }
+  };
+  finite("fx", sensor.fx);
+  finite("fy", sensor.fy);
+  finite("cx", sensor.cx);
+  finite("cy", sensor.cy);
+  for (let i = 0; i < sensor.distortion.length; i++) finite(`distortion[${i}]`, sensor.distortion[i]!);
+  for (let i = 0; i < sensor.rotation.length; i++) finite(`rotation[${i}]`, sensor.rotation[i]!);
+  for (let i = 0; i < sensor.translation.length; i++) {
+    finite(`translation[${i}]`, sensor.translation[i]!);
+  }
+
+  const norm = Math.sqrt(sensor.rotation.reduce((sum, v) => sum + v * v, 0));
+  if (!Number.isFinite(norm) || norm === 0) {
+    throw new MalformedFile(
+      `sensor ${JSON.stringify(sensor.name)}: rotation quaternion has no direction (norm ${norm})`,
+    );
+  }
+
+  const legal = CAMERA_MODEL_COEFFICIENTS.get(sensor.cameraModel);
+  if (legal !== undefined && !legal.includes(sensor.distortion.length)) {
+    throw new MalformedFile(
+      `sensor ${JSON.stringify(sensor.name)}: camera model ${sensor.cameraModel} defines ` +
+        `${legal.join(" or ")} distortion coefficients, the record carries ${sensor.distortion.length}`,
+    );
+  }
+
+  const isCamera = sensor.cameraModel !== CAMERA_MODEL_NONE;
+  if (!isCamera) {
+    for (const [label, value] of [
+      ["width_px", sensor.widthPx],
+      ["height_px", sensor.heightPx],
+      ["fx", sensor.fx],
+      ["fy", sensor.fy],
+      ["cx", sensor.cx],
+      ["cy", sensor.cy],
+    ] as const) {
+      if (value) {
+        throw new MalformedFile(
+          `sensor ${JSON.stringify(sensor.name)} declares camera_model 0 but a non-zero ` +
+            `${label} (${value})`,
+        );
+      }
+    }
+  } else if (sensor.fx === 0 || sensor.fy === 0 || !sensor.widthPx || !sensor.heightPx) {
+    throw new MalformedFile(
+      `sensor ${JSON.stringify(sensor.name)} declares camera model ${sensor.cameraModel} but ` +
+        "has a zero focal length or image size",
+    );
+  }
+}
+
+/**
+ * The measured pose of the capture platform over the scene clock. Opcode `0x22`.
+ *
+ * Not the Camera record of section 5.10, which is a viewing suggestion a reader may
+ * ignore. This is where the sensors were.
+ */
+export interface RigTrajectory {
+  readonly name: string;
+  readonly interpolation: number;
+  readonly times: readonly number[];
+  readonly rotations: readonly (readonly number[])[];
+  readonly translations: readonly (readonly number[])[];
+}
+
+export function parseRigTrajectory(content: Uint8Array): RigTrajectory {
+  const c = new Cursor(content);
+  const name = c.string();
+  const interpolation = c.u8();
+  const count = c.u32();
+  // Bounded like the other count-prefixed records: a crafted count must not size an
+  // allocation before the bytes behind it have been shown to exist. Each sample is
+  // 8 + 32 + 24 = 64 bytes.
+  if (count * 64 > c.remaining) {
+    throw new TruncatedFile(
+      `trajectory ${JSON.stringify(name)} declares ${count} samples (${count * 64} bytes), ` +
+        `${c.remaining} remain`,
+    );
+  }
+  const times: number[] = [];
+  const rotations: number[][] = [];
+  const translations: number[][] = [];
+  for (let i = 0; i < count; i++) {
+    times.push(c.f64());
+    rotations.push(c.f64s(4));
+    translations.push(c.f64s(3));
+  }
+  const trajectory: RigTrajectory = { name, interpolation, times, rotations, translations };
+  checkRigTrajectory(trajectory);
+  return trajectory;
+}
+
+/**
+ * Refuse times that are not strictly increasing, naming the sample.
+ *
+ * Every interpolation rule is stated in terms of the interval a query lands in, and a
+ * repeated or reversed timestamp makes that interval ambiguous.
+ */
+export function checkRigTrajectory(trajectory: RigTrajectory): void {
+  if (trajectory.interpolation !== TRAJECTORY_LINEAR && trajectory.interpolation !== TRAJECTORY_STEP) {
+    throw new MalformedFile(
+      `trajectory ${JSON.stringify(trajectory.name)} uses interpolation ${trajectory.interpolation}; ` +
+        "this reader supports trajectory interpolation registry values 0 (linear) and 1 (step)",
+    );
+  }
+  for (let i = 0; i < trajectory.times.length; i++) {
+    const t = trajectory.times[i]!;
+    if (!Number.isFinite(t)) {
+      throw new MalformedFile(
+        `trajectory ${JSON.stringify(trajectory.name)}: sample ${i} has a non-finite time (${t})`,
+      );
+    }
+    if (i > 0 && t <= trajectory.times[i - 1]!) {
+      throw new MalformedFile(
+        `trajectory ${JSON.stringify(trajectory.name)}: sample ${i} is at t=${t}, not after ` +
+          `sample ${i - 1} at t=${trajectory.times[i - 1]}; times must strictly increase ` +
+          "(section 5.15.4)",
+      );
+    }
+  }
+  for (let i = 0; i < trajectory.rotations.length; i++) {
+    const q = trajectory.rotations[i]!;
+    const norm = Math.sqrt(q.reduce((sum, v) => sum + v * v, 0));
+    if (!Number.isFinite(norm) || norm === 0) {
+      throw new MalformedFile(
+        `trajectory ${JSON.stringify(trajectory.name)}: sample ${i} rotation has no direction ` +
+          `(norm ${norm})`,
+      );
+    }
+  }
+  for (let i = 0; i < trajectory.translations.length; i++) {
+    const tr = trajectory.translations[i]!;
+    for (let k = 0; k < tr.length; k++) {
+      const value = tr[k]!;
+      if (!Number.isFinite(value)) {
+        throw new MalformedFile(
+          `trajectory ${JSON.stringify(trajectory.name)}: sample ${i} translation[${k}] is ${value}`,
+        );
+      }
+    }
+  }
+}

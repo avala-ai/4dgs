@@ -61,6 +61,7 @@ async function viaBlob(variant: string): Promise<string> {
       statistics: scene.statistics,
       summaryOffsets: scene.summaryOffsets,
       summaryCrcOk: scene.summaryCrcOk,
+      provenance: scene.provenance,
     }),
   );
 }
@@ -95,6 +96,7 @@ async function viaRange(variant: string): Promise<string> {
       statistics: scene.statistics,
       summaryOffsets: scene.summaryOffsets,
       summaryCrcOk: scene.summaryCrcOk,
+      provenance: await scene.readProvenance(),
     }),
   );
 }

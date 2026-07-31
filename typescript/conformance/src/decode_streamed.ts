@@ -82,6 +82,7 @@ export async function run(path: string): Promise<string> {
         statistics: scene.statistics,
         summaryOffsets: scene.summaryOffsets,
         summaryCrcOk: scene.summaryCrcOk,
+        provenance: scene.provenance,
       }),
     );
   } finally {

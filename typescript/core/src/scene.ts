@@ -21,6 +21,7 @@ import { Cursor } from "./cursor.js";
 import { MalformedFile, TruncatedFile } from "./errors.js";
 import { assembleGaussians, type GaussianSet } from "./gaussians.js";
 import { Opcode } from "./opcodes.js";
+import { Provenance } from "./provenance.js";
 import { DEFAULT_CUTOFF, supportK } from "./quantization.js";
 import { checkQuantizationScheme, checkTemporalModel } from "./registry.js";
 import {
@@ -39,9 +40,13 @@ import {
   parseCamera,
   parseChunk,
   parseChunkIndexEntry,
+  parseCoordinateFrame,
+  parseGeodeticAnchor,
   parseHeader,
   parseMetadata,
   parseQuantization,
+  parseRigTrajectory,
+  parseSensorCalibration,
   parseShBandRecord,
   parseStatistics,
   parseFooter,
@@ -81,6 +86,11 @@ export interface Scene {
    * Footer arrives and says where that region began.
    */
   readonly summaryCrcOk: boolean | null;
+  /**
+   * Every provenance record the file carried (spec section 5.15). Empty when it carried
+   * none — a value, never an error.
+   */
+  readonly provenance: Provenance;
   /** Opcodes seen but not understood, in the order they appeared. */
   readonly skippedOpcodes: readonly number[];
   /** True when the resource ended before the file did. What decoded still stands. */
@@ -207,6 +217,7 @@ export async function decodeScene(
   let streamingLegacyAudio: StreamingLegacyAudio | null = null;
   let camera: Camera | null = null;
   let statistics: Statistics | null = null;
+  const provenance = new Provenance();
   let truncated = false;
 
   let at = 0;
@@ -324,6 +335,18 @@ export async function decodeScene(
         case Opcode.Attachment:
           attachments.push(parseAttachment(content));
           break;
+        case Opcode.CoordinateFrame:
+          provenance.frames.push(parseCoordinateFrame(content));
+          break;
+        case Opcode.SensorCalibration:
+          provenance.sensors.push(parseSensorCalibration(content));
+          break;
+        case Opcode.RigTrajectory:
+          provenance.trajectories.push(parseRigTrajectory(content));
+          break;
+        case Opcode.GeodeticAnchor:
+          provenance.anchors.push(parseGeodeticAnchor(content));
+          break;
         case Opcode.Statistics:
           statistics = parseStatistics(content);
           break;
@@ -365,6 +388,12 @@ export async function decodeScene(
     throw new MalformedFile("file has no Header or no Quantization record");
   }
 
+  // The cross-record rules — unique sensor names, a rig reference that resolves —
+  // can only run once the whole front matter has gone past. A truncated file may
+  // legitimately be missing the trajectory a sensor names, so this is skipped there:
+  // the recovery contract is that everything complete before the cut still stands.
+  if (!truncated) provenance.check();
+
   const audioSources = assembleAudioSourceDescriptors(
     header,
     audioDescriptors,
@@ -391,6 +420,7 @@ export async function decodeScene(
     statistics,
     chunkIndex,
     summaryOffsets,
+    provenance,
     skippedOpcodes,
     summaryCrcOk,
     truncated,
