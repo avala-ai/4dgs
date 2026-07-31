@@ -8,7 +8,38 @@ The four packages version together.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-31
+
+This release adds native `keyframe-delta` decode on both read paths in `@4dgs/core`. Decode still
+ends at reconstructed gaussian state; rendering and player policy remain outside the package. The
+LOD proposal is documentation only and is not advertised here. Version 0.2.0 was prepared in-repo
+but never published to npm; 0.3.0 is the first post-0.0.1 registry cut that includes that work plus
+keyframe-delta.
+
+### Added
+
+- Native `keyframe-delta` decode in `@4dgs/core`, both read paths. `decodeKeyframeDeltaStreamed`
+  composes each chunk onto the state it references front to back; `decodeKeyframeDeltaIndexed` walks
+  only an instant's chain from the index. Composition is bin-difference and telescopes (spec §11);
+  GOP-invariant attributes are banned from updates and rotation is restated absolutely.
+  `keyframeDeltaStatesJson` emits the canonical reconstruction-at-an-instant the SDKs are diffed on.
+  Decode only this milestone — there is no keyframe-delta encoder in TypeScript yet.
+
+### Fixed
+
+- **Keyframe-delta decode hardening.** Velocity-grid pitch for a never-fading gaussian comes from
+  that gaussian's own validity window (§6.3); out-of-range window indices name the chunk byte and
+  gaussian ID. Chunk-level compression is honoured for both Chunk and Delta Chunk records, including
+  declared-size validation for uncompressed blocks. Update/birth/death group counts, cross-level
+  references and duplicated Delta Chunk/index fields are validated. Streamed decoding remains usable
+  on complete truncated prefixes; the indexed path requires full timeline coverage once a Footer is
+  found. Canonical probes are bounded to the last complete streamed chunk without argument
+  spreading.
+
 ## [0.2.0] - 2026-07-29
+
+Prepared in the repository; not published to npm (no trusted publisher configured). The section is
+kept so the notes match the code that carried this version number.
 
 ### Added
 

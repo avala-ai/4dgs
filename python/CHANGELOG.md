@@ -6,6 +6,32 @@ All notable changes to the Python package are documented here, following
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-31
+
+This release ships the normative `keyframe-delta` temporal model as a whole-file reference path and
+animated OpenUSD export for those sequences. Rendering and player policy remain outside the package.
+The LOD proposal is documentation only and is not advertised here.
+
+### Added
+
+- **The `keyframe-delta` temporal model (whole-file reference).**
+  `keyframe_delta_file.write_sequence` quantizes a sample sequence on one shared set of grids, then
+  emits `Header(temporal_model="keyframe-delta")`, keyframe Chunks, Delta Chunks, the extended Chunk
+  Index and the Footer. Cadence and `delta_mode` (chained or keyframe-referenced) come from
+  `KeyframeDeltaOptions`. `decode_streamed` composes each chunk onto the state it references front
+  to back; `decode_indexed` walks only the bounded chain needed for a seek (spec §11). Composition
+  is bin-difference and telescopes, so the declared error bound holds at any chain depth;
+  GOP-invariant attributes are banned from updates and rotation is restated absolutely.
+  `states_json` is the canonical §11.2 summary — a `chunks[]` table and a `states[]` array at probe
+  instants in `gaussian_id` order — which the other SDKs are diffed against.
+
+- **Animated OpenUSD export of keyframe-delta scenes.** `to_usd_keyframe_delta` (and the
+  `4dgs to-usd` path when the input is keyframe-delta) decodes the file, composes the population at
+  each frame via `render_at`, and writes one USD time sample per frame. A keyframe-delta file has no
+  closed-form `state_at` for a static snapshot, so animated USD is the interchange that can hold the
+  temporal model over time. Births and deaths are exact per frame; USD time samples do not carry
+  `gaussian_id` correspondence across samples.
+
 ### Fixed
 
 - **Chunk-compressed PLY segment fidelity.** Segmented imports now retain every source gaussian and
