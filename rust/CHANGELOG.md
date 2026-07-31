@@ -6,16 +6,31 @@ All notable changes to the Rust crate are documented here, following
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-31
+
+This release adds the normative `keyframe-delta` temporal model in the crate and exposes whole-file
+decode through an additive C ABI for the C++ and Swift bindings. Reconstruction still ends at
+composed gaussian state; rendering remains a consumer responsibility. The LOD proposal is
+documentation only and is not advertised here.
+
 ### Added
+
+- **The `keyframe-delta` temporal model.** Composition, write and both read paths mirror the Python
+  reference and the normative spec (§11). Deltas are integer bin subtractions on shared grids so
+  composition telescopes; the declared error bound holds at any chain depth. Streamed decode
+  composes front to back; indexed decode walks only the chain an instant needs. The canonical
+  `states` JSON is emitted by `keyframe_delta_file::keyframe_delta_states_json` and is the
+  cross-implementation gate. Refusal codes match the reference (`bin-overflow`,
+  `invariant-changed-in-update`, `forward-reference`, `depth-mismatch`, and the rest) without
+  changing the frozen `Error` enum shape.
 
 - **keyframe-delta on the C ABI.** `fourdgs_keyframe_delta_states_json` decodes a whole
   keyframe-delta file (either read path) to its canonical `states` JSON,
   `fourdgs_peek_temporal_model` reads the Header's model without opening a scene, and
   `fourdgs_string_free` releases the owned strings both return. Additive — no existing signature
-  moved. The canonical `states` emitter moved from the conformance crate into the library
-  (`keyframe_delta_file::keyframe_delta_states_json`) so a binding that decodes through the C ABI
-  emits bytes identical to the reference; `capi_smoke.c` now exercises the peek, the decode refusal
-  on a gaussian-birth file, and the free.
+  moved. The C++ and Swift packages decode keyframe-delta through these entry points rather than a
+  second encoder; `capi_smoke.c` exercises the peek, the decode refusal on a gaussian-birth file,
+  and the free.
 
 ## [0.2.0] - 2026-07-29
 
