@@ -42,8 +42,11 @@ export class GaussianSet {
   /**
    * `count` object ids (spec §6.6), or `null` when no chunk carried the stream. `0` is
    * background: a gaussian that belongs to no object and no track may transform.
+   *
+   * Unsigned: the ids span the whole `u32` range and are compared for equality
+   * against a track's `object_id`, which is parsed as `u32`.
    */
-  readonly objectId: Int32Array | null;
+  readonly objectId: Uint32Array | null;
 
   constructor(fields: {
     count: number;
@@ -58,7 +61,7 @@ export class GaussianSet {
     winHi: Float32Array;
     sh?: ShCoefficients | null;
     shDegree?: number;
-    objectId?: Int32Array | null;
+    objectId?: Uint32Array | null;
   }) {
     this.count = fields.count;
     this.positions = fields.positions;
@@ -108,7 +111,7 @@ export class GaussianSet {
     const centers = new Float32Array(indices.length * 3);
     const orientations = new Float32Array(indices.length * 4);
     const opacity = new Float32Array(indices.length);
-    const objectId = this.objectId === null ? null : new Int32Array(indices.length);
+    const objectId = this.objectId === null ? null : new Uint32Array(indices.length);
     for (let k = 0; k < indices.length; k++) {
       const i = indices[k]!;
       const dt = t - this.muT[i]!;
@@ -145,7 +148,7 @@ export interface GaussianState {
   readonly orientations: Float32Array;
   readonly opacity: Float32Array;
   /** `indices.length` object ids, or `null` when the scene carries no membership. */
-  readonly objectId: Int32Array | null;
+  readonly objectId: Uint32Array | null;
 }
 
 /** The soft temporal weight of a gaussian at a time. 1 for a gaussian that never fades. */
@@ -188,7 +191,7 @@ export function assembleGaussians(
   // scene has no object membership" rather than "the last chunk did not".
   let sawObjectId = false;
   for (const chunk of chunks) sawObjectId ||= chunk.objectId !== null;
-  const objectId = sawObjectId ? new Int32Array(count) : null;
+  const objectId = sawObjectId ? new Uint32Array(count) : null;
 
   const table = windowTableOrDefault(windows);
   const windowCount = table.length >>> 1;
