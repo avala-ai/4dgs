@@ -683,6 +683,15 @@ Future<FourdgsObjectLayer> readFourdgsObjects(
   for (final range in scene.provenanceRanges) {
     final opcode = range.opcode;
     if (opcode != opObjectTable && opcode != opObjectTrack) continue;
+    // Refused before the read, not after: the opcode is already known from the
+    // front-matter walk, so a second table need not be transferred and
+    // materialized — up to the front-matter cap — only to be rejected below.
+    if (opcode == opObjectTable && out.table != null) {
+      throw const FourdgsMalformedFile(
+        'the file carries a second Object Table; a scene has one '
+        '(section 5.15.6)',
+      );
+    }
     _checkRange(scene, range.offset, range.length, 'object layer');
     final blob = await source.read(range.offset, range.length);
     final content = _recordContent(blob, opcode, 'object layer');

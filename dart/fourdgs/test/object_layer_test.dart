@@ -425,6 +425,32 @@ void main() {
     );
   });
 
+  test('an object label that is not UTF-8 is refused as a malformed file', () {
+    // Labels are untrusted record bytes. A raw FormatException from the
+    // standard library says nothing about which record failed; AGENTS.md §6
+    // asks a decoder that refuses a file to name the problem, and the
+    // TypeScript reader already did.
+    final b =
+        _Bytes()
+          ..u32(1)
+          ..u16(0)
+          ..u32(7)
+          ..u32(2); // a two-byte label...
+    b
+      ..u8(0xff)
+      ..u8(0xfe); // ...that is not valid UTF-8
+    b
+      ..f32(0)
+      ..f32(0)
+      ..f32(0)
+      ..u8(0);
+
+    expect(
+      () => FourdgsObjectTable.parse(b.done()),
+      throwsA(isA<FourdgsMalformedFile>()),
+    );
+  });
+
   test('a zero-sample track has no pose and is read as absent', () {
     final empty = FourdgsObjectTrack.parse(
       (_Bytes()

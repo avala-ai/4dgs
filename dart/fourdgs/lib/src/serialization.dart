@@ -163,7 +163,21 @@ class FourdgsCursor {
   }
 
   /// `u32` byte length then that many UTF-8 bytes. Not NUL-terminated.
-  String string() => utf8.decode(take(u32()));
+  ///
+  /// Invalid UTF-8 is a malformed file, not a `FormatException` from the
+  /// standard library: every string here — a sensor name, an object label, a
+  /// metadata key — is untrusted record bytes, and a decoder that refuses one
+  /// says which byte and what was expected (AGENTS.md §6). The TypeScript
+  /// reader has always named this; Dart was letting the raw exception out.
+  String string() {
+    final at = pos;
+    final raw = take(u32());
+    try {
+      return utf8.decode(raw);
+    } on FormatException {
+      throw FourdgsMalformedFile('the string at offset $at is not valid UTF-8');
+    }
+  }
 
   /// `u64` byte length then that many bytes.
   Uint8List blob() => take(u64());
