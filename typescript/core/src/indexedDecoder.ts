@@ -98,6 +98,15 @@ interface ByteRange {
   readonly length: number;
 }
 
+/**
+ * The most bytes one front-matter record may occupy before this reader refuses it.
+ *
+ * Not a format limit; a bound on what a single declared length can cost. 64 MiB is far
+ * past any real Camera, Metadata or trajectory record, and it is the number the Dart
+ * reader uses for the same reads.
+ */
+export const MAX_FRONT_MATTER_BYTES = 64 * 1024 * 1024;
+
 /** A provenance-family record framed during the front-matter walk (opcode + range). */
 interface ProvenanceRange {
   readonly opcode: number;
@@ -462,6 +471,17 @@ export class IndexedDecoder {
    * catch the error type of somebody's HTTP client.
    */
   private async readRange(offset: number, length: number, what: string): Promise<Uint8Array> {
+    // A ceiling as well as a bound. Staying inside the file is not enough on its own: a
+    // front-matter record may declare hundreds of megabytes and still sit inside a large
+    // file, and this path allocates the whole range before a parser can ignore an appended
+    // tail or refuse an oversized count. The Dart reader caps the same reads at the same
+    // number.
+    if (length > MAX_FRONT_MATTER_BYTES) {
+      throw new MalformedFile(
+        `${what} is ${length} bytes, past the ${MAX_FRONT_MATTER_BYTES} byte ceiling ` +
+          "for a single front-matter record",
+      );
+    }
     if (offset < 0 || length < 0 || offset + length > this.size) {
       throw new MalformedFile(
         `${what} spans [${offset}, ${offset + length}), outside the ${this.size}-byte file`,

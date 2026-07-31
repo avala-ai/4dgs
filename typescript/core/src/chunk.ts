@@ -167,10 +167,21 @@ export async function decodeChunkStreams(
   // would either shift every following gaussian's membership or fail on an array
   // bound — a wrong object, or a raw RangeError, where the file is simply malformed.
   const ids = byId.get(Attribute.ObjectId);
-  if (ids !== undefined && ids.channels !== 1) {
-    throw new MalformedFile(
-      `the object_id stream declares ${ids.channels} channels, the format defines 1`,
-    );
+  if (ids !== undefined) {
+    if (ids.channels !== 1) {
+      throw new MalformedFile(
+        `the object_id stream declares ${ids.channels} channels, the format defines 1`,
+      );
+    }
+    // The zero-element exemption above does not extend to membership. An empty
+    // `object_id` stream on a populated chunk would decode to no labels at all, and the
+    // merge downstream would read every gaussian as background — a silently different
+    // scene, where the Dart reader refuses the count outright.
+    if (ids.elementCount !== count) {
+      throw new MalformedFile(
+        `the object_id stream declares ${ids.elementCount} elements, the chunk declares ${count}`,
+      );
+    }
   }
 
   if (count === 0) return EMPTY_CHUNK;
