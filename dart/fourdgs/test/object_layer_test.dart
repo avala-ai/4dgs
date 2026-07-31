@@ -12,6 +12,7 @@
 /// agree with these.
 library;
 
+import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
@@ -374,6 +375,51 @@ void main() {
           (FourdgsMalformedFile e) => e.toString(),
           'message',
           contains('object_id'),
+        ),
+      ),
+    );
+  });
+
+  test('a delta stream that leaves the 32-bit range is refused', () {
+    // An `object_id` code is a label, not a bin (section 6.6): a wrapped code is
+    // a *different object*, silently. Rust accumulates deltas in i64 and then
+    // requires the code to fit an i32, so it refuses this file; Dart accumulates
+    // into an Int32List, where the wrap would happen before anything could see
+    // it. The check has to live in the accumulation, which is where the 64-bit
+    // sum is still visible.
+    //
+    // Two 4-byte symbols in delta mode: 2147483647 then +1 leaves the range.
+    // Zigzag maps them to 4294967294 and 2.
+    const symbols = <int>[4294967294, 2];
+    const width = 4;
+    // Byte-plane order: every symbol's byte 0, then every symbol's byte 1, ...
+    final plain = Uint8List(symbols.length * width);
+    for (int j = 0; j < width; j++) {
+      for (int i = 0; i < symbols.length; i++) {
+        plain[j * symbols.length + i] = (symbols[i] >> (8 * j)) & 0xff;
+      }
+    }
+    final payload = Uint8List.fromList(ZLibCodec().encode(plain));
+
+    final b =
+        _Bytes()
+          ..u8(attrObjectId)
+          ..u8(width)
+          ..u8(1) // mode: delta
+          ..u8(codecDeflate)
+          ..u8(1) // channels
+          ..u32(symbols.length)
+          ..u32(payload.length) // payload length, low half
+          ..u32(0); // payload length, high half
+    final bytes = Uint8List.fromList(<int>[...b.done(), ...payload]);
+
+    expect(
+      () => decodeAttributeStream(FourdgsCursor(bytes)),
+      throwsA(
+        isA<FourdgsMalformedFile>().having(
+          (FourdgsMalformedFile e) => e.toString(),
+          'message',
+          contains('32-bit range'),
         ),
       ),
     );
