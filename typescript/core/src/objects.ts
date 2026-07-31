@@ -33,6 +33,7 @@
  */
 
 import { MalformedFile } from "./errors.js";
+import type { GaussianSet, GaussianState } from "./gaussians.js";
 import { poseApply, poseAt, quaternionMultiply, type Pose } from "./provenance.js";
 import { BACKGROUND_OBJECT, type ObjectTable, type ObjectTrack } from "./records.js";
 
@@ -174,4 +175,28 @@ export class ObjectLayer {
       for (let axis = 0; axis < 4; axis++) orientations[i * 4 + axis] = turned[axis]!;
     }
   }
+}
+
+/**
+ * A reconstructed instant with the object layer already composed onto it.
+ *
+ * {@link GaussianSet.stateAt} is the temporal model alone — it knows nothing about
+ * objects, and should not. This is the pairing a consumer of a scene actually wants:
+ * reconstruct, then transport whatever a track moves. Rust's reader composes at this
+ * level for the same reason, so a caller who never learns the layer exists still gets
+ * the right centres.
+ *
+ * A scene with no layer, or one whose gaussians carry no membership, returns the base
+ * state unchanged — the layer is additive, and its absence costs nothing.
+ */
+export function stateAtWithObjects(
+  gaussians: GaussianSet,
+  objects: ObjectLayer | null,
+  t: number,
+  cutoff?: number,
+): GaussianState {
+  const state = gaussians.stateAt(t, cutoff);
+  if (objects === null || objects.isEmpty || state.objectId === null) return state;
+  objects.apply(state.centers, state.orientations, state.objectId, t);
+  return state;
 }
