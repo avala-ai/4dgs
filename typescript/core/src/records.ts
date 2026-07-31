@@ -1152,6 +1152,16 @@ export function parseObjectTrack(content: Uint8Array): ObjectTrack {
         `${c.remaining} remain`,
     );
   }
+  // The same ceiling a rig trajectory gets, and for the same reason: the streamed decoder
+  // buffers a whole non-streamed record before yielding it, so a track is bounded by what
+  // one record may ask a reader to allocate rather than by how it arrives. The Dart
+  // decoder already refuses past this count.
+  if (count > MAX_TRAJECTORY_SAMPLES) {
+    throw new MalformedFile(
+      `ObjectTrack for object ${objectId} declares ${count} samples, past the ` +
+        `${MAX_TRAJECTORY_SAMPLES} ceiling`,
+    );
+  }
   const times: number[] = [];
   const rotations: number[][] = [];
   const translations: number[][] = [];
