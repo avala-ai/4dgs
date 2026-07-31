@@ -32,6 +32,7 @@ class FourdgsDecodedChunk {
     required this.winHi,
     required this.windowIndex,
     this.sourceIndex,
+    this.objectId,
     this.shBands = const <int, Uint8List>{},
   });
 
@@ -47,6 +48,10 @@ class FourdgsDecodedChunk {
   final Float32List winHi; // count
   final Int32List windowIndex; // count
   final Int32List? sourceIndex;
+
+  /// Object membership (spec section 6.6), or null when the chunk carries
+  /// none. `0` is background: a gaussian that belongs to no object.
+  final Int32List? objectId;
 
   /// Band index to that band's raw coefficient bytes, `count * channels` of
   /// them. Empty unless the caller asked for bands and the file had them.
@@ -288,6 +293,7 @@ FourdgsDecodedChunk decodeChunkStreams(
   }
 
   final source = got[attrSourceIndex];
+  final objects = got[attrObjectId];
   final shBands = <int, Uint8List>{};
   shBandRecords.forEach((int band, Uint8List content) {
     final decoded = decodeShBandRecord(
@@ -311,6 +317,7 @@ FourdgsDecodedChunk decodeChunkStreams(
     winHi: winHi,
     windowIndex: windowIndex,
     sourceIndex: source == null ? null : Int32List.fromList(source.values),
+    objectId: objects == null ? null : Int32List.fromList(objects.values),
     shBands: shBands,
   );
 }
@@ -333,6 +340,7 @@ int? _channelsFor(int attributeId) {
     case attrWindowIndex:
     case attrSourceGroup:
     case attrSourceIndex:
+    case attrObjectId:
       return 1;
     default:
       return null;

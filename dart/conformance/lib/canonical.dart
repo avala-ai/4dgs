@@ -20,6 +20,7 @@ library;
 
 import 'dart:collection';
 import 'dart:convert';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:fourdgs/fourdgs.dart';
@@ -82,6 +83,7 @@ Map<String, Object?> summarize({
   List<FourdgsSummaryOffset> summaryOffsets = const <FourdgsSummaryOffset>[],
   bool? summaryCrcOk,
   FourdgsProvenance? provenance,
+  FourdgsObjectLayer? objects,
 }) {
   final order = _stableOrder(gaussians);
   final sample = order.take(sampleSize).toList();
@@ -182,6 +184,10 @@ Map<String, Object?> summarize({
       'sigmaT': column(gaussians.sigmaT),
       'winLo': column(gaussians.winLo),
       'winHi': column(gaussians.winHi),
+      if (gaussians.objectId != null)
+        'objectIds': <Object?>[
+          for (final i in sample) gaussians.objectId![i].toString(),
+        ],
     },
     'aggregate': <String, Object?>{
       'positionSum': <Object?>[for (final v in positionSum) num6(v)],
@@ -198,7 +204,163 @@ Map<String, Object?> summarize({
   if (provenance != null && !provenance.isEmpty) {
     out['provenance'] = _provenance(provenance);
   }
+  // Same omission rule, and for the same reason: an object record is additive
+  // to the gaussian-birth model, so a file without one must summarize exactly
+  // as it did before the layer existed. Membership alone is enough to report —
+  // a scene can carry ids and no table.
+  if ((objects != null && !objects.isEmpty) || gaussians.objectId != null) {
+    out.addAll(_objectsAndStates(header, gaussians, objects, order));
+  }
   return out;
+}
+
+/// Object records plus post-track gaussian states at three scene-clock probes.
+///
+/// Stored fields alone do not prove reconstruction: two implementations can
+/// agree on every entry in the table and every sample in a track and still
+/// disagree about where a gaussian ends up, because the layer's one rule is an
+/// order — base first, track second. The states make that order visible,
+/// including orientation, and the canonical gaussian order keeps the result
+/// independent of chunk and decoder order.
+Map<String, Object?> _objectsAndStates(
+  FourdgsHeader header,
+  FourdgsGaussianSet gaussians,
+  FourdgsObjectLayer? objects,
+  List<int> order,
+) {
+  final layer = objects ?? FourdgsObjectLayer();
+
+  final tracks = <Object?>[
+    for (final track in layer.tracks)
+      <String, Object?>{
+        'objectId': track.objectId.toString(),
+        'interpolation': track.interpolation,
+        'sampleCount': track.sampleCount.toString(),
+        'posesAt': <Object?>[
+          for (final probe in _trackProbeTimes(track))
+            _poseRow(probe, layer.poseAt(track.objectId, probe)),
+        ],
+      },
+  ];
+
+  final entries = <Object?>[];
+  final table = layer.table;
+  if (table != null) {
+    for (final entry in table.entries) {
+      final embedding = entry.embedding;
+      String? embeddingCrc;
+      if (embedding != null) {
+        final bytes = Uint8List(embedding.length * 4);
+        final view = ByteData.view(bytes.buffer);
+        for (int i = 0; i < embedding.length; i++) {
+          view.setFloat32(i * 4, embedding[i], Endian.little);
+        }
+        embeddingCrc = crcOf(bytes);
+      }
+      final dynamics = entry.dynamics;
+      entries.add(<String, Object?>{
+        'objectId': entry.objectId.toString(),
+        'label': entry.label,
+        'anchor': <Object?>[for (final v in entry.anchor) num6(v)],
+        // The decoded dynamics values, not merely their presence: a summary
+        // that said only whether the record was there would pass a decoder
+        // that read the nine floats and exposed zeros. Null when absent.
+        'dynamics':
+            dynamics == null
+                ? null
+                : <String, Object?>{
+                  'velocity': <Object?>[for (final v in dynamics[0]) num6(v)],
+                  'angularVelocity': <Object?>[
+                    for (final v in dynamics[1]) num6(v),
+                  ],
+                  'acceleration': <Object?>[
+                    for (final v in dynamics[2]) num6(v),
+                  ],
+                },
+        'hasEmbedding': embedding != null,
+        'embeddingCrc': embeddingCrc,
+      });
+    }
+  }
+
+  final duration = math.max(0.0, header.durationSec);
+  final states = <Object?>[];
+  for (final t in <double>[
+    0.0,
+    0.5 * duration,
+    math.max(0.0, duration - 1e-6),
+  ]) {
+    final base = gaussians.stateAt(t, cutoff: header.cutoff);
+    final ids = base.objectId ?? Int32List(base.count);
+    layer.apply(base.centers, base.orientations, ids, t);
+
+    final rowForIndex = <int, int>{};
+    for (int row = 0; row < base.count; row++) {
+      rowForIndex[base.indices[row]] = row;
+    }
+    final sampleRows = <int>[];
+    for (final index in order) {
+      final row = rowForIndex[index];
+      if (row != null) sampleRows.add(row);
+      if (sampleRows.length == sampleSize) break;
+    }
+
+    List<Object?> rows(Float64List values, int width) => <Object?>[
+      for (final row in sampleRows)
+        <Object?>[
+          for (int axis = 0; axis < width; axis++)
+            num6(values[row * width + axis]),
+        ],
+    ];
+
+    final positionSum = <Object?>[
+      for (int axis = 0; axis < 3; axis++)
+        num6(
+          <double>[
+            for (int row = 0; row < base.count; row++)
+              base.centers[row * 3 + axis],
+          ].fold<double>(0.0, (double a, double b) => a + b),
+        ),
+    ];
+    double opacitySum = 0.0;
+    for (final value in base.opacity) {
+      opacitySum += value;
+    }
+
+    states.add(<String, Object?>{
+      't': num6(t),
+      'liveCount': base.count.toString(),
+      'sample': <String, Object?>{
+        'positions': rows(base.centers, 3),
+        'orientations': rows(base.orientations, 4),
+        'objectIds': <Object?>[
+          for (final row in sampleRows) ids[row].toString(),
+        ],
+      },
+      'aggregate': <String, Object?>{
+        'positionSum': positionSum,
+        'opacitySum': num6(opacitySum),
+      },
+    });
+  }
+
+  return <String, Object?>{
+    'objects': <String, Object?>{
+      'embeddingDim': table == null ? 0 : table.embeddingDim,
+      'table': entries,
+      'tracks': tracks,
+    },
+    'states': states,
+  };
+}
+
+/// Times a summary evaluates an object track at, derived from the track
+/// itself, the way a rig trajectory's probes are.
+List<double> _trackProbeTimes(FourdgsObjectTrack track) {
+  if (track.sampleCount == 0) return const <double>[];
+  final first = track.times.first;
+  final last = track.times.last;
+  return <double>[first - 0.5, first, 0.5 * (first + last), last, last + 0.5];
 }
 
 Map<String, Object?> _audioSource(

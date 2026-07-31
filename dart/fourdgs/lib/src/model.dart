@@ -317,7 +317,9 @@ class FourdgsState {
   const FourdgsState({
     required this.indices,
     required this.centers,
+    required this.orientations,
     required this.opacity,
+    this.objectId,
   });
 
   /// Indices into the [FourdgsGaussianSet] the state was computed from.
@@ -326,8 +328,17 @@ class FourdgsState {
   /// `indices.length * 3` centres, advected to the requested time.
   final Float64List centers;
 
+  /// `indices.length * 4` xyzw orientations. The rest orientation until an
+  /// object track composes onto it: the temporal model does not turn a
+  /// gaussian, only the object layer does.
+  final Float64List orientations;
+
   /// `indices.length` opacities, the stored alpha scaled by the marginal.
   final Float64List opacity;
+
+  /// `indices.length` object ids, or null when the scene carries no
+  /// membership.
+  final Int32List? objectId;
 
   int get count => indices.length;
 }
@@ -352,6 +363,7 @@ class FourdgsGaussianSet {
     this.sh,
     this.shCoefficients = 0,
     this.sourceIndex,
+    this.objectId,
   });
 
   /// An empty set, for a file that legitimately carries no gaussians.
@@ -395,6 +407,11 @@ class FourdgsGaussianSet {
   /// Optional producer-side stable ids, when the file carried them.
   final Int32List? sourceIndex;
 
+  /// Object membership (spec section 6.6), or null when no chunk carried the
+  /// stream. `0` is background: a gaussian that belongs to no object and no
+  /// track may transform.
+  final Int32List? objectId;
+
   int get count => muT.length;
 
   /// Reconstructed state at scene time [t], exactly as the specification
@@ -423,16 +440,29 @@ class FourdgsGaussianSet {
 
     final indices = Uint32List.sublistView(keep, 0, k);
     final centers = Float64List(k * 3);
+    final orientations = Float64List(k * 4);
     final opacity = Float64List(k);
+    final ids = objectId;
+    final stateIds = ids == null ? null : Int32List(k);
     for (int j = 0; j < k; j++) {
       final i = indices[j];
       final dt = t - muT[i];
       centers[j * 3] = positions[i * 3] + motions[i * 3] * dt;
       centers[j * 3 + 1] = positions[i * 3 + 1] + motions[i * 3 + 1] * dt;
       centers[j * 3 + 2] = positions[i * 3 + 2] + motions[i * 3 + 2] * dt;
+      for (int axis = 0; axis < 4; axis++) {
+        orientations[j * 4 + axis] = rotations[i * 4 + axis];
+      }
+      if (stateIds != null) stateIds[j] = ids![i];
       opacity[j] = colors[i * 4 + 3] * _marginal(i, t);
     }
-    return FourdgsState(indices: indices, centers: centers, opacity: opacity);
+    return FourdgsState(
+      indices: indices,
+      centers: centers,
+      orientations: orientations,
+      opacity: opacity,
+      objectId: stateIds,
+    );
   }
 
   /// The temporal marginal of gaussian [i] at [t]: 1 for a never-fading

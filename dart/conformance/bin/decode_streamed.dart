@@ -60,6 +60,7 @@ String run(String path) {
       summaryOffsets: scene.summaryOffsets,
       summaryCrcOk: scene.summaryCrcOk,
       provenance: scene.provenance,
+      objects: scene.objects,
     ),
   );
 }
