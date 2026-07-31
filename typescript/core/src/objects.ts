@@ -37,6 +37,26 @@ import { poseApply, poseAt, quaternionMultiply, type Pose } from "./provenance.j
 import { BACKGROUND_OBJECT, type ObjectTable, type ObjectTrack } from "./records.js";
 
 /**
+ * The pose one track holds at `t`, or `null` when it has no samples.
+ *
+ * A track is a {@link PoseSampled} in everything but name, so the clamp-and-slerp of
+ * section 5.15.4 is reached rather than restated.
+ */
+function poseOf(track: ObjectTrack, t: number): Pose | null {
+  if (track.times.length === 0) return null;
+  return poseAt(
+    {
+      name: `object ${track.objectId}`,
+      interpolation: track.interpolation,
+      times: track.times,
+      rotations: track.rotations,
+      translations: track.translations,
+    },
+    t,
+  );
+}
+
+/**
  * Every object-layer record a file carried, and the rule that spans the tracks.
  *
  * `table` is the file's one Object Table, or `null`. `tracks` is the SE(3) tracks, at
@@ -89,17 +109,7 @@ export class ObjectLayer {
   poseAt(objectId: number, t: number): Pose | null {
     if (objectId === BACKGROUND_OBJECT) return null;
     const track = this.track(objectId);
-    if (track === null || track.times.length === 0) return null;
-    return poseAt(
-      {
-        name: `object ${objectId}`,
-        interpolation: track.interpolation,
-        times: track.times,
-        rotations: track.rotations,
-        translations: track.translations,
-      },
-      t,
-    );
+    return track === null ? null : poseOf(track, t);
   }
 
   /**
@@ -139,7 +149,10 @@ export class ObjectLayer {
     const poses = new Map<number, Pose>();
     for (const track of this.tracks) {
       if (!referenced.has(track.objectId)) continue;
-      const pose = this.poseAt(track.objectId, t);
+      // Sampled from the track in hand rather than through `poseAt`, which would
+      // look the same track up by id and rescan the list — that is what turns the
+      // O(gaussians + tracks) this method promises into O(tracks²).
+      const pose = poseOf(track, t);
       if (pose !== null) poses.set(track.objectId, pose);
     }
     if (poses.size === 0) return;
