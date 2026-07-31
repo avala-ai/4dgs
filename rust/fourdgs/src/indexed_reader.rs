@@ -654,6 +654,25 @@ pub fn read_attachments<R: Readable + ?Sized>(
 /// skipped here and read by [`read_objects`]. A still-reserved opcode (`0x26`-`0x2F`, which
 /// no version-1 writer emits) is framed and skipped by both — the forward-compatibility
 /// rule doing its job inside a family, and why the ranges carry their opcode.
+/// The most bytes one front-matter record may occupy before this reader refuses it.
+///
+/// Not a format limit; a bound on what a single declared length can cost. Staying inside
+/// the file is not enough on its own — a record declaring hundreds of megabytes sits
+/// happily inside a large file, and these paths allocate the whole range before a parser
+/// can ignore an appended tail or refuse an oversized count. The Dart and TypeScript
+/// readers cap the same reads at the same number.
+pub const MAX_FRONT_MATTER_BYTES: u64 = 64 * 1024 * 1024;
+
+fn check_front_matter_length(length: u64, what: &str) -> Result<()> {
+    if length > MAX_FRONT_MATTER_BYTES {
+        return Err(Error::Malformed(format!(
+            "a {what} record is {length} bytes, past the {MAX_FRONT_MATTER_BYTES} byte \
+             ceiling for a single front-matter record"
+        )));
+    }
+    Ok(())
+}
+
 pub fn read_provenance<R: Readable + ?Sized>(
     source: &mut R,
     scene: &IndexedScene,
@@ -669,6 +688,7 @@ pub fn read_provenance<R: Readable + ?Sized>(
         ) {
             continue;
         }
+        check_front_matter_length(*length, "provenance")?;
         let blob = source.read(*offset, *length)?;
         let content = record_content(&blob, *opcode)?;
         match *opcode {
@@ -700,6 +720,7 @@ pub fn read_objects<R: Readable + ?Sized>(
                  exactly one scene-wide object table"
             )));
         }
+        check_front_matter_length(*length, "object layer")?;
         let blob = source.read(*offset, *length)?;
         out.table = Some(rec::ObjectTable::parse(record_content(
             &blob,
