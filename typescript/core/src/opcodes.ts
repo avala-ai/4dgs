@@ -34,7 +34,25 @@ export const Opcode = {
   DeltaChunk: 0x10,
   AudioSource: 0x11,
   AudioData: 0x12,
+  /**
+   * Provenance family, spec §5.15. Assigned in dependency order: the two records that
+   * carry poses come after the one that names the frame those poses are in.
+   */
+  CoordinateFrame: 0x20,
+  SensorCalibration: 0x21,
+  RigTrajectory: 0x22,
+  /** Defined after the three above, so it took the next free number rather than a tidier one. */
+  GeodeticAnchor: 0x23,
 } as const;
+
+/** First opcode of the provenance family, and one past its last. `0x24`–`0x2F` are reserved. */
+export const PROVENANCE_START = 0x20;
+export const PROVENANCE_END = 0x30;
+
+/** True for the provenance family, defined and reserved alike. */
+export function isProvenanceOpcode(opcode: number): boolean {
+  return opcode >= PROVENANCE_START && opcode < PROVENANCE_END;
+}
 
 /** Records whose currently defined fields are frozen for the life of version 1. */
 export const FROZEN_OPCODES: ReadonlySet<number> = new Set([

@@ -144,7 +144,8 @@ REFUSAL_FAMILIES = frozenset({"python"})
 OBJECT_TOKENS = ("Object",)
 
 FAMILY_DECLINES: dict[str, tuple[str, ...]] = {
-    "typescript": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig", *OBJECT_TOKENS),
+    # TypeScript reports provenance (spec §5.15); it still declines the object layer.
+    "typescript": OBJECT_TOKENS,
     "cpp": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig", *OBJECT_TOKENS),
     "swift": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig", *OBJECT_TOKENS),
     "dart": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig", *OBJECT_TOKENS),

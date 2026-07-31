@@ -63,6 +63,7 @@ async function streamed(path: string): Promise<string> {
       statistics: scene.statistics,
       summaryOffsets: scene.summaryOffsets,
       summaryCrcOk: scene.summaryCrcOk,
+      provenance: scene.provenance,
     }),
   );
 }
@@ -101,6 +102,7 @@ async function indexed(path: string): Promise<string> {
         statistics: scene.statistics,
         summaryOffsets: scene.summaryOffsets,
         summaryCrcOk: scene.summaryCrcOk,
+        provenance: await scene.readProvenance(),
       }),
     );
   } finally {
