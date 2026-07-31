@@ -162,6 +162,17 @@ export async function decodeChunkStreams(
     byId.set(stream.attributeId, stream);
   }
 
+  // One channel, as section 6.6 defines it. Without this a two-channel stream would
+  // decode to twice as many labels as there are gaussians, and the merge downstream
+  // would either shift every following gaussian's membership or fail on an array
+  // bound — a wrong object, or a raw RangeError, where the file is simply malformed.
+  const ids = byId.get(Attribute.ObjectId);
+  if (ids !== undefined && ids.channels !== 1) {
+    throw new MalformedFile(
+      `the object_id stream declares ${ids.channels} channels, the format defines 1`,
+    );
+  }
+
   if (count === 0) return EMPTY_CHUNK;
 
   const missing = REQUIRED_ATTRIBUTES.filter((id) => !byId.has(id));

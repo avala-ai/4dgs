@@ -157,7 +157,7 @@ export {
   poseCompose,
   slerp,
 } from "./provenance.js";
-export { ObjectLayer } from "./objects.js";
+export { ObjectLayer, stateAtWithObjects } from "./objects.js";
 export {
   checkQuantizationScheme,
   checkTemporalModel,
