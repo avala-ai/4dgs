@@ -291,7 +291,7 @@ Map<String, Object?> _objectsAndStates(
     math.max(0.0, duration - 1e-6),
   ]) {
     final base = gaussians.stateAt(t, cutoff: header.cutoff);
-    final ids = base.objectId ?? Int32List(base.count);
+    final ids = base.objectId ?? Uint32List(base.count);
     layer.apply(base.centers, base.orientations, ids, t);
 
     final rowForIndex = <int, int>{};

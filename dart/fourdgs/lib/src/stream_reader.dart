@@ -570,7 +570,7 @@ FourdgsGaussianSet assembleGaussians(
   // is what makes null mean "this scene has no object membership" rather than
   // "the last chunk did not".
   final haveObjects = chunks.any((FourdgsDecodedChunk c) => c.objectId != null);
-  final objectId = haveObjects ? Int32List(total) : null;
+  final objectId = haveObjects ? Uint32List(total) : null;
 
   int at = 0;
   for (final chunk in chunks) {

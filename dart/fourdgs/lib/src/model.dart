@@ -338,7 +338,7 @@ class FourdgsState {
 
   /// `indices.length` object ids, or null when the scene carries no
   /// membership.
-  final Int32List? objectId;
+  final Uint32List? objectId;
 
   int get count => indices.length;
 }
@@ -410,7 +410,10 @@ class FourdgsGaussianSet {
   /// Object membership (spec section 6.6), or null when no chunk carried the
   /// stream. `0` is background: a gaussian that belongs to no object and no
   /// track may transform.
-  final Int32List? objectId;
+  ///
+  /// Unsigned: the ids span the whole `u32` range and are compared for
+  /// equality against a track's `object_id`, which is parsed as `u32`.
+  final Uint32List? objectId;
 
   int get count => muT.length;
 
@@ -443,7 +446,7 @@ class FourdgsGaussianSet {
     final orientations = Float64List(k * 4);
     final opacity = Float64List(k);
     final ids = objectId;
-    final stateIds = ids == null ? null : Int32List(k);
+    final stateIds = ids == null ? null : Uint32List(k);
     for (int j = 0; j < k; j++) {
       final i = indices[j];
       final dt = t - muT[i];
