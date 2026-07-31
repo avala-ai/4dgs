@@ -66,3 +66,56 @@ rename the concept.
 An SDK claims a feature by passing the conformance suite for it, and the feature matrix records only
 what the suite proves. Implementations may differ in structure, API shape and performance; they may
 not differ in what they decode a file to mean.
+
+## 9. One language per pull request, stacked
+
+A feature that lands in four SDKs is four pull requests, not one. Principle 8 is why: each SDK
+claims a feature by passing the suite for it, and a reviewer can only check that claim against a
+diff they can hold in their head. A single PR touching Python, Rust, TypeScript and Dart hides four
+independent claims behind one approval.
+
+So when work naturally continues across SDKs, **stack the pull requests** rather than batching them
+or waiting for each to merge. Each PR targets the branch below it, so every diff shows only that
+language's change.
+
+GitHub supports this directly — see
+[About stacked pull requests](https://docs.github.com/en/pull-requests/get-started/about-stacked-prs).
+The mechanics that matter here:
+
+- **Merge order is bottom-up.** GitHub enforces it, and it is also the order the work depends in:
+  the corpus and the harness change once, at the bottom, and each language above it proves itself
+  against that same corpus.
+- **Retargeting is automatic.** When the bottom PR merges, the ones above it re-target the base
+  branch on their own. Do not hand-edit base branches to chase a merge.
+- **Branch protection and CI apply to every PR in the stack**, so a red check on layer three is not
+  excused by a green one on layer one.
+- **All branches must live in this repository.** Cross-fork stacks are not supported, which means a
+  contributor working from a fork opens ordinary sequential PRs instead — that is fine, and nothing
+  below is a requirement for outside contributions.
+
+With the [`gh stack`](https://docs.github.com/en/pull-requests/reference/stacked-prs-cli-commands)
+extension (`gh extension install github/gh-stack`):
+
+```sh
+gh stack init                      # start a stack on the current branch
+gh stack add typescript/objects    # next layer, on top of the current one
+gh stack submit                    # push every branch and open or update the PRs
+gh stack view                      # see the stack and where you are in it
+gh stack sync                      # after a merge below you: fetch, rebase, push
+```
+
+Without the extension, the same shape is three ordinary commands — branch from the layer below and
+pass `--base` when opening the PR:
+
+```sh
+git checkout -b dart/objects typescript/objects
+gh pr create --base typescript/objects
+gh stack link 74 75                # optional: link existing PRs into a stack on GitHub
+```
+
+**What does not belong in a stack.** A stack is for changes that genuinely depend on each other. Two
+unrelated fixes stacked together inherit each other's review latency and each other's red CI for no
+reason — open those side by side off `main`.
+
+Everything else about pull requests — title prefixes, the scope checkbox, the conformance gate — is
+in [CONTRIBUTING.md](CONTRIBUTING.md#pull-requests).
