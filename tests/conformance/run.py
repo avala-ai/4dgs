@@ -136,11 +136,10 @@ OBJECT_TOKENS = ("Object",)
 
 FAMILY_DECLINES: dict[str, tuple[str, ...]] = {
     # TypeScript, Dart, C++ and Swift report provenance (spec §5.15) — C++ and Swift via
-    # the Rust C ABI's additive provenance-JSON accessor. TypeScript also decodes the
-    # object layer and composes its tracks natively; C++, Swift and Dart still decline it.
+    # the Rust C ABI's additive provenance-JSON accessor. TypeScript and Dart also decode
+    # the object layer and compose its tracks natively; C++ and Swift still decline it.
     "cpp": OBJECT_TOKENS,
     "swift": OBJECT_TOKENS,
-    "dart": OBJECT_TOKENS,
 }
 
 

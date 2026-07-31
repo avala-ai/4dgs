@@ -26,6 +26,16 @@ happened.
   any chain depth (spec §11); GOP-invariants are enforced and rotation is restated absolutely.
   `keyframeDeltaStatesJson` emits the canonical reconstruction-at-an-instant the SDKs are diffed on.
   Decode only this milestone — there is no encoder.
+- Object-layer decode (spec §5.15.6-§5.15.7, §6.6). `FourdgsObjectTable.parse` and
+  `FourdgsObjectTrack.parse` read the two records, the `object_id` attribute stream (id 14) is
+  decoded onto `FourdgsGaussianSet.objectId`, and `FourdgsObjectLayer` composes an object's SE(3)
+  track onto reconstructed state — `center = R * c0 + T`, `orientation = R ⊗ r0`, base first.
+  Available on both read paths: `scene.objects` on the streamed path, `readFourdgsObjects` on the
+  indexed one, where the records are framed at open and fetched only when asked for, as provenance
+  is. A gaussian with `object_id = 0`, or whose object has no track, keeps its base state; a scene
+  that carries no layer produces an empty `FourdgsObjectLayer`, which is a value and not an error.
+  `FourdgsState` now carries `orientations` and `objectId` alongside centres and opacity, so a
+  caller can compose the layer without re-deriving either.
 - `FourdgsReadable` as the single abstraction either path needs — a size and a byte range — with
   `FourdgsBytes` in the core and `FourdgsFileReadable` in `package:fourdgs/io.dart`. Transports live
   at the edges, so the decoder can be tested without a network and shipped without a platform.

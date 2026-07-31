@@ -1283,6 +1283,228 @@ class FourdgsRigTrajectory {
   }
 }
 
+/// Background / unassigned. A gaussian carrying this id belongs to no object.
+const int backgroundObject = 0;
+
+/// One object's advisory description. Nothing here transforms a gaussian.
+class FourdgsObjectEntry {
+  FourdgsObjectEntry({
+    required this.objectId,
+    required this.label,
+    required this.anchor,
+    required this.dynamics,
+    required this.embedding,
+  });
+
+  final int objectId;
+  final String label;
+  final List<double> anchor;
+
+  /// `[velocity, angularVelocity, acceleration]`, or null when absent. Never a
+  /// substitute for a track: reconstruction reads none of these.
+  final List<List<double>>? dynamics;
+  final List<double>? embedding;
+}
+
+/// The scene's one Object Table. Opcode `0x24`.
+///
+/// Everything in it is advisory: membership comes from the `object_id`
+/// attribute (section 6.6) and geometry changes only through an Object Track
+/// (section 5.15.7). A reader that skips this record still decodes every
+/// gaussian correctly; what it loses is the names.
+class FourdgsObjectTable {
+  FourdgsObjectTable({required this.embeddingDim, required this.entries});
+
+  final int embeddingDim;
+  final List<FourdgsObjectEntry> entries;
+
+  static FourdgsObjectTable parse(Uint8List content) {
+    final c = FourdgsCursor(content);
+    final objectCount = c.u32();
+    final embeddingDim = c.u16();
+    // The smallest an entry can be: id, an empty label, the anchor and the
+    // dynamics flag, plus the embedding flag once a space is declared. Bounded
+    // before anything is sized from it, like every other count-prefixed record.
+    final minimumEntryBytes = 4 + 4 + 12 + 1 + (embeddingDim > 0 ? 1 : 0);
+    if (objectCount > c.remaining ~/ minimumEntryBytes) {
+      throw FourdgsMalformedFile(
+        'ObjectTable declares $objectCount objects but holds room for '
+        '${c.remaining ~/ minimumEntryBytes}',
+      );
+    }
+    final entries = <FourdgsObjectEntry>[];
+    for (int i = 0; i < objectCount; i++) {
+      final objectId = c.u32();
+      final label = c.string();
+      final anchor = c.f32s(3);
+      final dynamicsPresent = c.u8();
+      if (dynamicsPresent > 1) {
+        throw FourdgsMalformedFile(
+          'ObjectTable entry $i has dynamics_present $dynamicsPresent; it must '
+          'be 0 or 1 (section 5.15.6)',
+        );
+      }
+      final dynamics =
+          dynamicsPresent == 1
+              ? <List<double>>[c.f32s(3), c.f32s(3), c.f32s(3)]
+              : null;
+      List<double>? embedding;
+      if (embeddingDim > 0) {
+        final hasEmbedding = c.u8();
+        if (hasEmbedding > 1) {
+          throw FourdgsMalformedFile(
+            'ObjectTable entry $i has has_embedding $hasEmbedding; it must be '
+            '0 or 1 (section 5.15.6)',
+          );
+        }
+        if (hasEmbedding == 1) {
+          if (embeddingDim * 4 > c.remaining) {
+            throw FourdgsMalformedFile(
+              'ObjectTable entry $i declares a $embeddingDim-dimensional '
+              'embedding (${embeddingDim * 4} bytes), ${c.remaining} remain',
+            );
+          }
+          embedding = c.f32s(embeddingDim);
+        }
+      }
+      entries.add(
+        FourdgsObjectEntry(
+          objectId: objectId,
+          label: label,
+          anchor: anchor,
+          dynamics: dynamics,
+          embedding: embedding,
+        ),
+      );
+    }
+    final table = FourdgsObjectTable(
+      embeddingDim: embeddingDim,
+      entries: entries,
+    );
+    table.check();
+    return table;
+  }
+
+  /// Refuse a table that cannot be indexed by id, and values that are not
+  /// numbers. Two entries for one id make every lookup a coin toss, which is
+  /// the duplicate-name failure section 5.15.2 refuses for frames and sensors,
+  /// spelled with integers.
+  void check() {
+    final seen = <int>{};
+    for (final entry in entries) {
+      if (!seen.add(entry.objectId)) {
+        throw FourdgsMalformedFile(
+          'two ObjectTable entries describe object ${entry.objectId}; entries '
+          'are referred to by id and nothing else (section 5.15.6)',
+        );
+      }
+      void finite(String label, List<double> values) {
+        for (int k = 0; k < values.length; k++) {
+          if (!values[k].isFinite) {
+            throw FourdgsMalformedFile(
+              'ObjectTable entry ${entry.objectId}: $label[$k] is '
+              '${values[k]}; every stored value must be finite '
+              '(section 5.15.6)',
+            );
+          }
+        }
+      }
+
+      finite('anchor', entry.anchor);
+      final dynamics = entry.dynamics;
+      if (dynamics != null) {
+        finite('velocity', dynamics[0]);
+        finite('angular_velocity', dynamics[1]);
+        finite('acceleration', dynamics[2]);
+      }
+      final embedding = entry.embedding;
+      if (embedding != null) finite('embedding', embedding);
+    }
+  }
+}
+
+/// One object's rigid pose over the scene clock. Opcode `0x25`, one per object.
+///
+/// Structurally a [FourdgsRigTrajectory] keyed by object id rather than by
+/// name, and deliberately so: it satisfies [FourdgsPoseSampled] through
+/// [FourdgsObjectTrackView], so section 5.15.4's clamp-and-slerp is the same
+/// code for both and cannot drift between them.
+class FourdgsObjectTrack {
+  FourdgsObjectTrack({
+    required this.objectId,
+    required this.interpolation,
+    required this.times,
+    required this.rotations,
+    required this.translations,
+  });
+
+  final int objectId;
+  final int interpolation;
+  final List<double> times;
+  final List<List<double>> rotations;
+  final List<List<double>> translations;
+
+  int get sampleCount => times.length;
+
+  static FourdgsObjectTrack parse(Uint8List content) {
+    final c = FourdgsCursor(content);
+    final objectId = c.u32();
+    final interpolation = c.u8();
+    final count = c.u32();
+    // Each sample is 8 + 32 + 24 bytes, as for a rig trajectory.
+    if (count > c.remaining ~/ rigTrajectorySampleBytes) {
+      throw FourdgsMalformedFile(
+        'ObjectTrack for object $objectId declares $count samples but holds '
+        'room for ${c.remaining ~/ rigTrajectorySampleBytes}',
+      );
+    }
+    if (count > maxRigTrajectorySamples) {
+      throw FourdgsMalformedFile(
+        'ObjectTrack for object $objectId declares $count samples, past the '
+        '$maxRigTrajectorySamples ceiling',
+      );
+    }
+    final times = <double>[];
+    final rotations = <List<double>>[];
+    final translations = <List<double>>[];
+    for (int i = 0; i < count; i++) {
+      times.add(c.f64());
+      rotations.add(c.f64s(4));
+      translations.add(c.f64s(3));
+    }
+    final track = FourdgsObjectTrack(
+      objectId: objectId,
+      interpolation: interpolation,
+      times: times,
+      rotations: rotations,
+      translations: translations,
+    );
+    track.check();
+    return track;
+  }
+
+  /// A track's own rules: it moves a real object, and its samples are a
+  /// function of time. The pose rules are the trajectory's, so they are
+  /// checked by the trajectory's checker rather than restated — the two
+  /// records interpolate identically and a second copy is a second thing to
+  /// get wrong.
+  void check() {
+    if (objectId == backgroundObject) {
+      throw FourdgsMalformedFile(
+        'an ObjectTrack names object 0, which means background / unassigned; a '
+        'track must move an object that exists (section 5.15.7)',
+      );
+    }
+    FourdgsRigTrajectory(
+      name: 'object $objectId',
+      interpolation: interpolation,
+      times: times,
+      rotations: rotations,
+      translations: translations,
+    ).check();
+  }
+}
+
 /// Encoded size of one window table entry: two `f64` bounds.
 const int windowBytes = 16;
 

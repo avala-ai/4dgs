@@ -20,6 +20,7 @@ import 'chunk_decoder.dart';
 import 'exceptions.dart';
 import 'model.dart';
 import 'opcode.dart';
+import 'objects.dart';
 import 'provenance.dart';
 import 'quantization.dart';
 import 'readable.dart';
@@ -634,9 +635,10 @@ Future<List<FourdgsAttachment>> readFourdgsAttachments(
 ///
 /// The object-layer records (`0x24`, `0x25`) are in the same opcode family and
 /// are framed by the same walk, but they belong to the object layer rather than
-/// provenance, so they are skipped here. A still-reserved opcode (`0x26`–`0x2F`)
-/// is framed and skipped by both, which is the forward-compatibility rule doing
-/// its job inside a family — and why the ranges carry their opcode.
+/// provenance, so they are skipped here — [readFourdgsObjects] reads them from
+/// the same ranges. A still-reserved opcode (`0x26`–`0x2F`) is framed and
+/// skipped by both, which is the forward-compatibility rule doing its job
+/// inside a family — and why the ranges carry their opcode.
 Future<FourdgsProvenance> readFourdgsProvenance(
   FourdgsReadable source,
   FourdgsIndexedScene scene,
@@ -664,6 +666,38 @@ Future<FourdgsProvenance> readFourdgsProvenance(
         if (trajectory.sampleCount > 0) out.trajectories.add(trajectory);
       case opGeodeticAnchor:
         out.anchors.add(FourdgsGeodeticAnchor.parse(content));
+    }
+  }
+  out.check();
+  return out;
+}
+
+/// Every object-layer record, from the same framed ranges as provenance.
+///
+/// Deferred for the same reason: a scene with a thousand-sample track costs
+/// nothing to open, and a consumer that only wants geometry never pays for the
+/// layer at all.
+Future<FourdgsObjectLayer> readFourdgsObjects(
+  FourdgsReadable source,
+  FourdgsIndexedScene scene,
+) async {
+  final out = FourdgsObjectLayer();
+  for (final range in scene.provenanceRanges) {
+    final opcode = range.opcode;
+    if (opcode != opObjectTable && opcode != opObjectTrack) continue;
+    _checkRange(scene, range.offset, range.length, 'object layer');
+    final blob = await source.read(range.offset, range.length);
+    final content = _recordContent(blob, opcode, 'object layer');
+    if (opcode == opObjectTable) {
+      if (out.table != null) {
+        throw FourdgsMalformedFile(
+          'the file carries a second Object Table; a scene has one '
+          '(section 5.15.6)',
+        );
+      }
+      out.table = FourdgsObjectTable.parse(content);
+    } else {
+      out.tracks.add(FourdgsObjectTrack.parse(content));
     }
   }
   out.check();
