@@ -764,7 +764,7 @@ fn probe_times<T: PoseSampled + ?Sized>(trajectory: &T) -> Vec<f64> {
     vec![
         first - 0.5,
         first,
-        first + (last - first) * 0.5,
+        first / 2.0 + last / 2.0,
         last,
         last + 0.5,
     ]
@@ -778,7 +778,7 @@ fn sensor_probe_time(prov: &Provenance, rig_name: &str) -> f64 {
     match prov.trajectory(rig_name) {
         Some(t) if t.sample_count() > 0 => {
             let (first, last) = (t.times[0], t.times[t.sample_count() - 1]);
-            first + (last - first) * 0.5
+            first / 2.0 + last / 2.0
         }
         _ => 0.0,
     }

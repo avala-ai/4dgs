@@ -398,7 +398,7 @@ def _probe_times(trajectory) -> list[float]:
     if trajectory.sample_count == 0:
         return []
     first, last = trajectory.times[0], trajectory.times[-1]
-    return [first - 0.5, first, first + (last - first) * 0.5, last, last + 0.5]
+    return [first - 0.5, first, first / 2 + last / 2, last, last + 0.5]
 
 
 def _sensor_probe_time(prov, sensor) -> float:
@@ -406,7 +406,7 @@ def _sensor_probe_time(prov, sensor) -> float:
     trajectory = prov.trajectory(sensor.rig_name) if sensor.rig_name else None
     if trajectory is None or trajectory.sample_count == 0:
         return 0.0
-    return trajectory.times[0] + (trajectory.times[-1] - trajectory.times[0]) * 0.5
+    return trajectory.times[0] / 2 + trajectory.times[-1] / 2
 
 
 def _pose_row(t: float, pose, sensor: str | None = None) -> dict:
