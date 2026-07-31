@@ -15,6 +15,7 @@ import 'chunk_decoder.dart';
 import 'exceptions.dart';
 import 'model.dart';
 import 'opcode.dart';
+import 'provenance.dart';
 import 'quantization.dart';
 import 'records.dart';
 import 'serialization.dart';
@@ -44,7 +45,8 @@ class FourdgsScene {
     this.camera,
     this.statistics,
     this.summaryCrcOk,
-  });
+    FourdgsProvenance? provenance,
+  }) : provenance = provenance ?? FourdgsProvenance();
 
   final FourdgsHeader header;
   final FourdgsQuantization quantization;
@@ -68,6 +70,12 @@ class FourdgsScene {
 
   /// True when the file ended mid-record and the decode stopped there.
   final bool truncated;
+
+  /// Every provenance record the file carried (spec section 5.15). Empty when
+  /// it carried none, which is the common case and not an error: absence costs
+  /// nothing and no Header flag announces the family, so this is filled by the
+  /// walk itself.
+  final FourdgsProvenance provenance;
 
   /// Compatibility view of the first source as a legacy track.
   ///
@@ -132,6 +140,7 @@ FourdgsScene readFourdgsBytes(
   FourdgsStatistics? statistics;
   bool? summaryCrcOk;
   bool truncated = false;
+  final provenance = FourdgsProvenance();
 
   try {
     for (final record in iterRecords(data, fourdgsMagic.length)) {
@@ -245,6 +254,18 @@ FourdgsScene readFourdgsBytes(
           metadata.add(FourdgsMetadata.parse(record.content));
         case opAttachment:
           attachments.add(FourdgsAttachment.parse(record.content));
+        case opCoordinateFrame:
+          provenance.frames.add(FourdgsCoordinateFrame.parse(record.content));
+        case opSensorCalibration:
+          provenance.sensors.add(
+            FourdgsSensorCalibration.parse(record.content),
+          );
+        case opRigTrajectory:
+          provenance.trajectories.add(
+            FourdgsRigTrajectory.parse(record.content),
+          );
+        case opGeodeticAnchor:
+          provenance.anchors.add(FourdgsGeodeticAnchor.parse(record.content));
         case opStatistics:
           statistics = FourdgsStatistics.parse(record.content);
         case opChunkIndex:
@@ -309,6 +330,15 @@ FourdgsScene readFourdgsBytes(
     truncated,
   );
 
+  // The cross-record rules — unique sensor names, a rig reference that
+  // resolves — can only run once the whole front matter has gone past. A
+  // truncated file may legitimately be missing the trajectory a sensor names,
+  // so this is skipped there: the recovery contract is that everything complete
+  // before the cut still stands.
+  if (!truncated) {
+    provenance.check();
+  }
+
   return FourdgsScene(
     header: header,
     quantization: quantization,
@@ -331,6 +361,7 @@ FourdgsScene readFourdgsBytes(
     camera: camera,
     statistics: statistics,
     summaryCrcOk: summaryCrcOk,
+    provenance: provenance,
   );
 }
 

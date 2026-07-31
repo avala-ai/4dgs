@@ -20,6 +20,7 @@ import 'chunk_decoder.dart';
 import 'exceptions.dart';
 import 'model.dart';
 import 'opcode.dart';
+import 'provenance.dart';
 import 'quantization.dart';
 import 'readable.dart';
 import 'records.dart';
@@ -68,6 +69,7 @@ class FourdgsIndexedScene {
     this.cameraRange,
     this.metadataRanges = const <({int offset, int length})>[],
     this.attachmentRanges = const <({int offset, int length})>[],
+    this.provenanceRanges = const <({int opcode, int offset, int length})>[],
     this.statistics,
     this.summaryOffsets = const <FourdgsSummaryOffset>[],
   });
@@ -123,6 +125,12 @@ class FourdgsIndexedScene {
 
   final List<({int offset, int length})> metadataRanges;
   final List<({int offset, int length})> attachmentRanges;
+
+  /// `(opcode, offset, length)` of every provenance-family record framed during
+  /// the walk. Opening a file frames these and stops, so a scene with a long
+  /// rig trajectory costs the same to open as one with none. Call
+  /// [readFourdgsProvenance] when the records themselves are wanted.
+  final List<({int opcode, int offset, int length})> provenanceRanges;
 
   /// Advisory totals from the summary block. A reader that needs certainty
   /// computes from the chunks instead.
@@ -298,6 +306,7 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
     cameraRange: front.cameraRange,
     metadataRanges: front.metadataRanges,
     attachmentRanges: front.attachmentRanges,
+    provenanceRanges: front.provenanceRanges,
     statistics: statistics,
     summaryOffsets: summaryOffsets,
   );
@@ -617,6 +626,48 @@ Future<List<FourdgsAttachment>> readFourdgsAttachments(
   return out;
 }
 
+/// Every provenance record, by range, fetched only when a caller wants them.
+///
+/// Opening a file frames these and stops, so a scene with a long rig trajectory
+/// costs the same to open as one with none. This is where a caller says it
+/// wants them.
+///
+/// The object-layer records (`0x24`, `0x25`) are in the same opcode family and
+/// are framed by the same walk, but they belong to the object layer rather than
+/// provenance, so they are skipped here. A still-reserved opcode (`0x26`–`0x2F`)
+/// is framed and skipped by both, which is the forward-compatibility rule doing
+/// its job inside a family — and why the ranges carry their opcode.
+Future<FourdgsProvenance> readFourdgsProvenance(
+  FourdgsReadable source,
+  FourdgsIndexedScene scene,
+) async {
+  final out = FourdgsProvenance();
+  for (final range in scene.provenanceRanges) {
+    final opcode = range.opcode;
+    if (opcode != opCoordinateFrame &&
+        opcode != opSensorCalibration &&
+        opcode != opRigTrajectory &&
+        opcode != opGeodeticAnchor) {
+      continue;
+    }
+    _checkRange(scene, range.offset, range.length, 'provenance');
+    final blob = await source.read(range.offset, range.length);
+    final content = _recordContent(blob, opcode, 'provenance');
+    switch (opcode) {
+      case opCoordinateFrame:
+        out.frames.add(FourdgsCoordinateFrame.parse(content));
+      case opSensorCalibration:
+        out.sensors.add(FourdgsSensorCalibration.parse(content));
+      case opRigTrajectory:
+        out.trajectories.add(FourdgsRigTrajectory.parse(content));
+      case opGeodeticAnchor:
+        out.anchors.add(FourdgsGeodeticAnchor.parse(content));
+    }
+  }
+  out.check();
+  return out;
+}
+
 /// Refuses a byte range the index asked for but the file cannot contain.
 ///
 /// Checked *before* the read, not after: `_recordContent` validates framing,
@@ -699,6 +750,8 @@ class _FrontMatter {
       <({int offset, int length})>[];
   final List<({int offset, int length})> attachmentRanges =
       <({int offset, int length})>[];
+  final List<({int opcode, int offset, int length})> provenanceRanges =
+      <({int opcode, int offset, int length})>[];
 
   /// Bytes actually transferred to open the scene.
   int bytesRead = 0;
@@ -987,7 +1040,13 @@ void _applyFrontRecord(
         length: span.framedLength,
       ));
     default:
-      break;
+      if (isProvenanceOpcode(span.opcode)) {
+        out.provenanceRanges.add((
+          opcode: span.opcode,
+          offset: span.offset,
+          length: span.framedLength,
+        ));
+      }
   }
 }
 

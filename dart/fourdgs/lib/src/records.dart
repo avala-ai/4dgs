@@ -9,6 +9,7 @@
 /// one line per record rather than a policy nobody remembers.
 library;
 
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'exceptions.dart';
@@ -850,6 +851,417 @@ class FourdgsSummaryOffset {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Provenance records (spec §5.15).
+//
+// What `parse` refuses here is narrower than what a validator reports. A parse
+// refuses only the structurally impossible — a basis that is not a basis, a
+// quaternion with no direction, timestamps that make an interval ambiguous —
+// because those are values no consumer can do anything sensible with. A value
+// that is merely unrecognized (a modality this build has not heard of, a
+// camera model it cannot project with) survives parsing and reaches the caller
+// raw, which is the distinction between "malformed" and "from a newer registry"
+// that a caller needs in order to react differently to the two.
+// ---------------------------------------------------------------------------
+
+/// Wire constant: sensor extrinsic maps into the scene frame.
+const int poseToScene = 0;
+
+/// Wire constant: sensor extrinsic maps into a named rig.
+const int poseToRig = 1;
+
+/// Wire constant: linear (slerp + lerp) trajectory interpolation.
+const int trajectoryLinear = 0;
+
+/// Wire constant: hold-until-next sample trajectory interpolation.
+const int trajectoryStep = 1;
+
+/// Coefficient counts each camera model defines, keyed by its registry id.
+/// A model absent from here is one this build does not know — not the same as
+/// wrong: `null` means "ask the caller", not "refuse".
+const Map<int, List<int>> cameraModelCoefficients = <int, List<int>>{
+  0: <int>[0], // none — the sensor is not a camera
+  1: <int>[0], // pinhole
+  2: <int>[5, 8], // brown-conrady, plain or rational
+  3: <int>[4], // kannala-brandt
+};
+
+/// The frame a file's own coordinates are expressed in. Opcode `0x20`.
+///
+/// A fixed shape: every field is always present, so a reader that knows these
+/// six knows exactly where an appended seventh would begin. The georeference is
+/// a separate record ([FourdgsGeodeticAnchor], `0x23`) for that reason.
+class FourdgsCoordinateFrame {
+  const FourdgsCoordinateFrame({
+    required this.name,
+    required this.handedness,
+    required this.upAxis,
+    required this.forwardAxis,
+    required this.lengthUnit,
+    required this.metresPerUnit,
+  });
+
+  final String name;
+  final int handedness;
+  final int upAxis;
+  final int forwardAxis;
+  final int lengthUnit;
+  final double metresPerUnit;
+
+  static FourdgsCoordinateFrame parse(Uint8List content) {
+    final c = FourdgsCursor(content);
+    final frame = FourdgsCoordinateFrame(
+      name: c.string(),
+      handedness: c.u8(),
+      upAxis: c.u8(),
+      forwardAxis: c.u8(),
+      lengthUnit: c.u8(),
+      metresPerUnit: c.f64(),
+    );
+    frame.check();
+    return frame;
+  }
+
+  /// Refuse a frame that is not one, rather than repair it.
+  void check() {
+    for (final entry in <(String, int)>[
+      ('up_axis', upAxis),
+      ('forward_axis', forwardAxis),
+    ]) {
+      if (entry.$2 > 5) {
+        throw FourdgsMalformedFile(
+          'CoordinateFrame ${entry.$1} is ${entry.$2}; the registry defines '
+          '0..5 (section 5.15.2)',
+        );
+      }
+    }
+    if (upAxis % 3 == forwardAxis % 3) {
+      throw FourdgsMalformedFile(
+        'CoordinateFrame up_axis $upAxis and forward_axis $forwardAxis name '
+        'the same axis; a frame needs two different ones (section 5.15.2)',
+      );
+    }
+    if (!metresPerUnit.isFinite || metresPerUnit < 0.0) {
+      throw FourdgsMalformedFile(
+        'CoordinateFrame metres_per_unit is $metresPerUnit; it must be finite '
+        'and not negative (section 5.15.2)',
+      );
+    }
+  }
+}
+
+/// Where a frame's origin sits on the WGS-84 ellipsoid, and which way it faces.
+/// Opcode `0x23`.
+class FourdgsGeodeticAnchor {
+  const FourdgsGeodeticAnchor({
+    required this.frameName,
+    required this.latitudeDeg,
+    required this.longitudeDeg,
+    required this.altitudeM,
+    required this.headingDeg,
+  });
+
+  final String frameName;
+  final double latitudeDeg;
+  final double longitudeDeg;
+  final double altitudeM;
+  final double headingDeg;
+
+  static FourdgsGeodeticAnchor parse(Uint8List content) {
+    final c = FourdgsCursor(content);
+    final frameName = c.string();
+    final values = c.f64s(4);
+    final anchor = FourdgsGeodeticAnchor(
+      frameName: frameName,
+      latitudeDeg: values[0],
+      longitudeDeg: values[1],
+      altitudeM: values[2],
+      headingDeg: values[3],
+    );
+    anchor.check();
+    return anchor;
+  }
+
+  /// Refuse an out-of-range angle rather than wrap it.
+  void check() {
+    for (final entry in <(String, double, double, double)>[
+      ('latitude_deg', latitudeDeg, -90.0, 90.0),
+      ('longitude_deg', longitudeDeg, -180.0, 180.0),
+      ('altitude_m', altitudeM, double.negativeInfinity, double.infinity),
+      ('heading_deg', headingDeg, 0.0, 360.0),
+    ]) {
+      final label = entry.$1;
+      final value = entry.$2;
+      final lo = entry.$3;
+      final hi = entry.$4;
+      if (!value.isFinite) {
+        throw FourdgsMalformedFile(
+          'GeodeticAnchor $label is $value; every field must be finite',
+        );
+      }
+      final pastEnd = label == 'heading_deg' && value == 360.0;
+      if (value < lo || value > hi || pastEnd) {
+        throw FourdgsMalformedFile(
+          'GeodeticAnchor $label is $value, outside its legal range '
+          '(section 5.15.5)',
+        );
+      }
+    }
+  }
+}
+
+/// One sensor's intrinsics and extrinsics. Opcode `0x21`, one record per sensor.
+///
+/// The extrinsic maps sensor coordinates into the frame [poseReference] names,
+/// in that direction: `p_target = R(rotation) * p_sensor + translation`.
+class FourdgsSensorCalibration {
+  const FourdgsSensorCalibration({
+    required this.name,
+    required this.modality,
+    required this.cameraModel,
+    required this.widthPx,
+    required this.heightPx,
+    required this.fx,
+    required this.fy,
+    required this.cx,
+    required this.cy,
+    required this.distortion,
+    required this.rotation,
+    required this.translation,
+    required this.poseReference,
+    required this.rigName,
+  });
+
+  final String name;
+  final String modality;
+  final int cameraModel;
+  final int widthPx;
+  final int heightPx;
+  final double fx;
+  final double fy;
+  final double cx;
+  final double cy;
+  final List<double> distortion;
+
+  /// Unit quaternion, `xyzw` — the same order as spec §3 and §6.4.
+  final List<double> rotation;
+  final List<double> translation;
+  final int poseReference;
+  final String rigName;
+
+  bool get isCamera => cameraModel != 0;
+
+  static FourdgsSensorCalibration parse(Uint8List content) {
+    final c = FourdgsCursor(content);
+    final name = c.string();
+    final modality = c.string();
+    final cameraModel = c.u8();
+    final widthPx = c.u32();
+    final heightPx = c.u32();
+    final intr = c.f64s(4);
+    final count = c.u8();
+    final distortion = c.f64s(count);
+    final rotation = c.f64s(4);
+    final translation = c.f64s(3);
+    final sensor = FourdgsSensorCalibration(
+      name: name,
+      modality: modality,
+      cameraModel: cameraModel,
+      widthPx: widthPx,
+      heightPx: heightPx,
+      fx: intr[0],
+      fy: intr[1],
+      cx: intr[2],
+      cy: intr[3],
+      distortion: distortion,
+      rotation: rotation,
+      translation: translation,
+      poseReference: c.u8(),
+      rigName: c.string(),
+    );
+    sensor.check();
+    return sensor;
+  }
+
+  void check() {
+    void finite(String label, double value) {
+      if (!value.isFinite) {
+        throw FourdgsMalformedFile(
+          "sensor '$name': $label is $value; every value must be finite",
+        );
+      }
+    }
+
+    finite('fx', fx);
+    finite('fy', fy);
+    finite('cx', cx);
+    finite('cy', cy);
+    for (int i = 0; i < distortion.length; i++) {
+      finite('distortion[$i]', distortion[i]);
+    }
+    for (int i = 0; i < rotation.length; i++) {
+      finite('rotation[$i]', rotation[i]);
+    }
+    for (int i = 0; i < translation.length; i++) {
+      finite('translation[$i]', translation[i]);
+    }
+
+    double normSq = 0.0;
+    for (final v in rotation) {
+      normSq += v * v;
+    }
+    final norm = math.sqrt(normSq);
+    if (!norm.isFinite || norm == 0.0) {
+      throw FourdgsMalformedFile(
+        "sensor '$name': rotation quaternion has no direction (norm $norm)",
+      );
+    }
+
+    final legal = cameraModelCoefficients[cameraModel];
+    if (legal != null && !legal.contains(distortion.length)) {
+      throw FourdgsMalformedFile(
+        "sensor '$name': camera model $cameraModel defines "
+        '${legal.join(' or ')} distortion coefficients, the record carries '
+        '${distortion.length}',
+      );
+    }
+
+    if (!isCamera) {
+      for (final entry in <(String, bool)>[
+        ('width_px', widthPx != 0),
+        ('height_px', heightPx != 0),
+        ('fx', fx != 0.0),
+        ('fy', fy != 0.0),
+        ('cx', cx != 0.0),
+        ('cy', cy != 0.0),
+      ]) {
+        if (entry.$2) {
+          throw FourdgsMalformedFile(
+            "sensor '$name' declares camera_model 0 but a non-zero ${entry.$1}",
+          );
+        }
+      }
+    } else if (fx == 0.0 || fy == 0.0 || widthPx == 0 || heightPx == 0) {
+      throw FourdgsMalformedFile(
+        "sensor '$name' declares camera model $cameraModel but has a zero "
+        'focal length or image size',
+      );
+    }
+  }
+}
+
+/// Encoded size of one rig trajectory sample: time + rotation + translation.
+const int rigTrajectorySampleBytes = 8 + 32 + 24;
+
+/// The measured pose of the capture platform over the scene clock. Opcode `0x22`.
+///
+/// Not the [FourdgsCamera] record, which is a viewing suggestion a reader may
+/// ignore. This is where the sensors were.
+class FourdgsRigTrajectory {
+  FourdgsRigTrajectory({
+    required this.name,
+    required this.interpolation,
+    required this.times,
+    required this.rotations,
+    required this.translations,
+  });
+
+  final String name;
+  final int interpolation;
+  final List<double> times;
+  final List<List<double>> rotations;
+  final List<List<double>> translations;
+
+  int get sampleCount => times.length;
+
+  static FourdgsRigTrajectory parse(Uint8List content) {
+    final c = FourdgsCursor(content);
+    final name = c.string();
+    final interpolation = c.u8();
+    final count = c.u32();
+    // Bounded like the other count-prefixed records: a crafted count must not
+    // size an allocation before the bytes behind it have been shown to exist.
+    if (count > c.remaining ~/ rigTrajectorySampleBytes) {
+      throw FourdgsMalformedFile(
+        "trajectory '$name' declares $count samples but holds room for "
+        '${c.remaining ~/ rigTrajectorySampleBytes}',
+      );
+    }
+    if (count > maxRigTrajectorySamples) {
+      throw FourdgsMalformedFile(
+        "trajectory '$name' declares $count samples, past the "
+        '$maxRigTrajectorySamples ceiling',
+      );
+    }
+    final times = <double>[];
+    final rotations = <List<double>>[];
+    final translations = <List<double>>[];
+    for (int i = 0; i < count; i++) {
+      times.add(c.f64());
+      rotations.add(c.f64s(4));
+      translations.add(c.f64s(3));
+    }
+    final trajectory = FourdgsRigTrajectory(
+      name: name,
+      interpolation: interpolation,
+      times: times,
+      rotations: rotations,
+      translations: translations,
+    );
+    trajectory.check();
+    return trajectory;
+  }
+
+  /// Refuse times that are not strictly increasing, naming the sample.
+  void check() {
+    if (interpolation != trajectoryLinear && interpolation != trajectoryStep) {
+      throw FourdgsMalformedFile(
+        "trajectory '$name' uses interpolation $interpolation; this reader "
+        'supports trajectory interpolation registry values 0 (linear) and 1 '
+        '(step)',
+      );
+    }
+    for (int i = 0; i < times.length; i++) {
+      final t = times[i];
+      if (!t.isFinite) {
+        throw FourdgsMalformedFile(
+          "trajectory '$name': sample $i has a non-finite time ($t)",
+        );
+      }
+      if (i > 0 && t <= times[i - 1]) {
+        throw FourdgsMalformedFile(
+          "trajectory '$name': sample $i is at t=$t, not after sample ${i - 1} "
+          'at t=${times[i - 1]}; times must strictly increase (section 5.15.4)',
+        );
+      }
+    }
+    for (int i = 0; i < rotations.length; i++) {
+      final q = rotations[i];
+      double normSq = 0.0;
+      for (final v in q) {
+        normSq += v * v;
+      }
+      final norm = math.sqrt(normSq);
+      if (!norm.isFinite || norm == 0.0) {
+        throw FourdgsMalformedFile(
+          "trajectory '$name': sample $i rotation has no direction "
+          '(norm $norm)',
+        );
+      }
+    }
+    for (int i = 0; i < translations.length; i++) {
+      final tr = translations[i];
+      for (int k = 0; k < tr.length; k++) {
+        if (!tr[k].isFinite) {
+          throw FourdgsMalformedFile(
+            "trajectory '$name': sample $i translation[$k] is ${tr[k]}",
+          );
+        }
+      }
+    }
+  }
+}
+
 /// Encoded size of one window table entry: two `f64` bounds.
 const int windowBytes = 16;
 
@@ -877,3 +1289,10 @@ const int maxWindowsPerScene = 65536;
 /// know rather than refuse the file, so the ceiling leaves room for a later
 /// version's bands instead of pinning it at three.
 const int maxBandsPerChunk = 16;
+
+/// The most pose samples one rig trajectory may declare.
+///
+/// A ten-minute capture at 100 Hz is sixty thousand samples; this ceiling is an
+/// order of magnitude above that and still a refusal rather than an allocation
+/// a hostile file chooses.
+const int maxRigTrajectorySamples = 1 << 20;

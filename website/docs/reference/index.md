@@ -10,12 +10,12 @@ declarations. Nothing is marked `Yes` on the strength of code existing.
 Every row is filled in from a suite that runs: 46 valid variants and 7 invalid ones, plus 4
 keyframe-delta and 3 object-layer variants in their own subdirectories, over two read paths
 (streamed and indexed). A language takes the variants it declares support for, and what it declines
-is what this table records — 119 checks passing for Python, 105 for Rust, and 87 each for
-TypeScript, Dart, C++ and Swift. Rust declines the refusal expectations; TypeScript, C++, Swift and
-Dart also decline the five variants that carry provenance records and the four that carry the object
-layer. C++ and Swift now decode the four keyframe-delta variants on both read paths — they read 4DGS
-through the Rust C ABI, whose additive states-JSON accessor computes the summary in the core so
-every binding emits identical bytes.
+is what this table records — 119 checks passing for Python, 105 for Rust, 97 for TypeScript and Dart
+(provenance reported, object layer declined), and 87 each for C++ and Swift. Rust declines the
+refusal expectations; C++ and Swift still decline provenance and the object layer. C++ and Swift now
+decode the four keyframe-delta variants on both read paths — they read 4DGS through the Rust C ABI,
+whose additive states-JSON accessor computes the summary in the core so every binding emits identical
+bytes.
 
 | Feature                                           | Python | TypeScript | Rust    | C++     | Swift   | Dart    |
 | ------------------------------------------------- | ------ | ---------- | ------- | ------- | ------- | ------- |
@@ -41,9 +41,9 @@ every binding emits identical bytes.
 | Metadata                                          | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Attachments                                       | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Statistics                                        | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Provenance: coordinate frame + georeference       | Yes    | No         | Yes     | No      | No      | No      |
-| Provenance: sensor calibration                    | Yes    | No         | Yes     | No      | No      | No      |
-| Provenance: rig trajectory + pose interpolation   | Yes    | No         | Yes     | No      | No      | No      |
+| Provenance: coordinate frame + georeference       | Yes    | Yes        | Yes     | No      | No      | Yes     |
+| Provenance: sensor calibration                    | Yes    | Yes        | Yes     | No      | No      | Yes     |
+| Provenance: rig trajectory + pose interpolation   | Yes    | Yes        | Yes     | No      | No      | Yes     |
 | Object membership (`object_id`)                   | Yes    | No         | Yes     | No      | No      | No      |
 | Object Table: labels, anchors, embeddings         | Yes    | No         | Yes     | No      | No      | No      |
 | Object Track: rigid state composition             | Yes    | No         | Yes     | No      | No      | No      |
@@ -82,19 +82,15 @@ and timing; SDKs reconstruct moving source state, while listener-relative HRTF/p
 occlusion and mixing remain player-owned.
 
 **Provenance** (spec §5.15) is the newest feature here and the clearest illustration of what this
-table is for. Python and Rust decode the four records and surface them; TypeScript, C++, Swift and
-Dart do not, and say so. That is not a gap anyone has to close before the format is usable, because
+table is for. Python, Rust, TypeScript and Dart decode the four records and surface them; C++ and
+Swift do not, and say so. That is not a gap anyone has to close before the format is usable, because
 the records are optional and no Header flag announces them: an SDK that has never heard of opcode
-`0x20` skips it by length and decodes every gaussian in the file correctly. It was verified rather
-than assumed — TypeScript, given a file carrying all four records plus appended fields on them,
-produces output identical to the expectation with the provenance section removed, with no change to
-a line of TypeScript. C++ and Swift are bindings over the Rust core rather than independent
-decoders, so their `No` means the binding does not surface the records, not that nothing there can
-read them.
+`0x20` skips it by length and decodes every gaussian in the file correctly. C++ and Swift are
+bindings over the Rust core rather than independent decoders, so their `No` means the binding does
+not surface the records, not that nothing there can read them.
 
-Dart is the case that shows why the row is about _reporting_ rather than reading. It arrived after
-the family existed and skipped every provenance record on the first run of the corpus, decoding all
-five of those variants' gaussians correctly — including
+The row is about _reporting_ rather than merely reading. An SDK that steps over provenance by length
+still decodes every gaussian correctly — including
 `TenWindows-AddExtraDataToRecords-…-WithGeodetic-WithRig-WithSensors`, which appends unknown fields
 to the records as well. What it does not do is put the family in its summary, so a diff would see a
 missing key and could not tell that apart from a decoder that got it wrong. Declining is how it says
