@@ -95,8 +95,13 @@ export interface ChunkGaussians {
   /**
    * Object membership (spec §6.6), or `null` when the chunk carries none. `0` is
    * background: a gaussian that belongs to no object and is never transformed.
+   *
+   * Unsigned, unlike every other decoded lane: an `object_id` is an exact label
+   * over the whole `u32` range (spec §6.6), and the signed bins a stream decodes
+   * into would report an id above `2^31` as a negative number — one that no
+   * Object Track, parsed as `u32`, could ever match.
    */
-  readonly objectId: Int32Array | null;
+  readonly objectId: Uint32Array | null;
 }
 
 export interface DecodeChunkOptions {
@@ -271,8 +276,19 @@ function assemble(
     windowIndex,
     sourceGroup: decoded.get(Attribute.SourceGroup) ?? null,
     sourceIndex: decoded.get(Attribute.SourceIndex) ?? null,
-    objectId: decoded.get(Attribute.ObjectId) ?? null,
+    objectId: asObjectIds(decoded.get(Attribute.ObjectId)),
   };
+}
+
+/**
+ * Reinterpret a decoded lane's bits as unsigned object ids.
+ *
+ * A view rather than a copy: the bytes are already right, only their signedness
+ * was wrong.
+ */
+function asObjectIds(bins: Int32Array | undefined): Uint32Array | null {
+  if (bins === undefined) return null;
+  return new Uint32Array(bins.buffer, bins.byteOffset, bins.length);
 }
 
 /** Registry codec names, as the Chunk record's `compression` field spells them. */

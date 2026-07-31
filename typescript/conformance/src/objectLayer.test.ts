@@ -213,6 +213,28 @@ test("an empty layer is a value, not an error", () => {
   assert.deepEqual([...centers], [1, 2, 3]);
 });
 
+test("an object id in the upper half of the u32 range still matches its track", () => {
+  // `object_id` is an exact label over the whole u32 range (spec section 6.6), and a
+  // stream decodes into signed bins. Read back as an `Int32Array` this id is -1, while
+  // the track parses its own id as 4294967295 — the two would never meet, the object
+  // would silently stop moving, and the canonical summary would print a negative label
+  // no other SDK emits. Membership is therefore stored unsigned.
+  const big = 0xffffffff;
+  const layer = new ObjectLayer(null, [parseObjectTrack(quarterTurnTrack(big))]);
+  assert.equal(layer.tracks[0]!.objectId, big);
+
+  // The bits a decoded lane would hold, reinterpreted the way `chunk.ts` does.
+  const signedBins = Int32Array.from([-1]);
+  const ids = new Uint32Array(signedBins.buffer, signedBins.byteOffset, signedBins.length);
+  assert.equal(ids[0], big);
+
+  const centers = Float32Array.from([1, 0, 0]);
+  const orientations = Float32Array.from([0, 0, 0, 1]);
+  layer.apply(centers, orientations, ids, 2);
+  assert.ok(Math.abs(centers[0]! - 5) < 1e-6);
+  assert.ok(Math.abs(centers[1]! - 3) < 1e-6);
+});
+
 test("a zero-sample track has no pose and is read as absent", () => {
   const empty: ObjectTrack = parseObjectTrack(new Bytes().u32(7).u8(0).u32(0).done());
   const layer = new ObjectLayer(null, [empty]);
