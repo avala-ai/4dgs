@@ -97,7 +97,9 @@ With the [`gh stack`](https://docs.github.com/en/pull-requests/reference/stacked
 extension (`gh extension install github/gh-stack`):
 
 ```sh
-gh stack init                      # start a stack on the current branch
+# Name the branch: bare `gh stack init` prompts for one, which blocks an agent
+# or any non-interactive shell.
+gh stack init typescript/provenance --base main
 gh stack add typescript/objects    # next layer, on top of the current one
 gh stack submit                    # push every branch and open or update the PRs
 gh stack view                      # see the stack and where you are in it
