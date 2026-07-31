@@ -63,6 +63,7 @@ Future<String> run(String path) async {
     final camera = await readFourdgsCamera(source, scene);
     final metadata = await readFourdgsMetadata(source, scene);
     final attachments = await readFourdgsAttachments(source, scene);
+    final provenance = await readFourdgsProvenance(source, scene);
 
     await checkBandRangeSkipping(source, scene);
 
@@ -88,6 +89,7 @@ Future<String> run(String path) async {
         statistics: scene.statistics,
         summaryOffsets: scene.summaryOffsets,
         summaryCrcOk: scene.summaryCrcOk,
+        provenance: provenance,
       ),
     );
   } finally {
