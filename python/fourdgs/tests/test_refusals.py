@@ -221,3 +221,24 @@ def test_an_absent_object_track_still_refuses_the_background_id():
     with pytest.raises(fourdgs.MalformedFile) as caught:
         rec.ObjectTrack.parse(put_u32(0) + put_u8(0) + put_u32(0))
     assert caught.value.code == "track-names-background"
+
+
+def test_the_trajectory_sample_ceiling_is_the_same_number_in_every_sdk():
+    """A ceiling only some implementations have is a conformance split.
+
+    Rust and Python carried no ceiling while TypeScript and Dart refused past a
+    million, so a trajectory of 1,020,000 samples — 65,280,018 bytes, comfortably
+    inside the 64 MiB front-matter cap, and so a record an indexed read will hand
+    over whole — decoded here and was refused there.
+    """
+    assert rec.MAX_TRAJECTORY_SAMPLES == 1_000_000
+
+    body = put_string("rig") + put_u8(0) + put_u32(rec.MAX_TRAJECTORY_SAMPLES + 1)
+    with pytest.raises(fourdgs.MalformedFile) as caught:
+        rec.RigTrajectory.parse(body)
+    assert "ceiling" in str(caught.value)
+
+    track = put_u32(7) + put_u8(0) + put_u32(rec.MAX_TRAJECTORY_SAMPLES + 1)
+    with pytest.raises(fourdgs.MalformedFile) as caught:
+        rec.ObjectTrack.parse(track)
+    assert "ceiling" in str(caught.value)

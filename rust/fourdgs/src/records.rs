@@ -38,6 +38,19 @@ pub(crate) fn quaternion_norm(q: &[f64]) -> f64 {
             .sqrt()
 }
 
+/// The most samples one trajectory or object track may declare.
+///
+/// The byte check beside each use refuses a count the record cannot hold; this bounds
+/// what a single *legal* record may ask a reader to allocate. Sized to stay under the
+/// 64 MiB front-matter range cap the indexed readers enforce: at 64 bytes a sample this
+/// is 64 MB of samples, leaving room for the name, the count and the framing. `1 << 20`
+/// would have been 64 MiB of samples exactly, so a trajectory at the ceiling would parse
+/// streamed and be refused indexed — the same file, two answers from one SDK. Shared
+/// with the other SDKs by value: a ceiling only some implementations have is a
+/// conformance split, and a record between the two limits would decode there and be
+/// refused here.
+pub const MAX_TRAJECTORY_SAMPLES: usize = 1_000_000;
+
 pub const FLAG_HAS_AUDIO: u8 = 1 << 0;
 pub const FLAG_CHUNKS_COMPRESSED: u8 = 1 << 1;
 pub const AUDIO_SOURCE_SPATIAL: u8 = 1 << 0;
@@ -1400,6 +1413,13 @@ impl RigTrajectory {
             ..Default::default()
         };
         let count = c.u32()? as usize;
+        if count > MAX_TRAJECTORY_SAMPLES {
+            return Err(Error::Malformed(format!(
+                "trajectory {:?} declares {count} samples, past the {MAX_TRAJECTORY_SAMPLES} \
+                 ceiling",
+                trajectory.name
+            )));
+        }
         // Bounded like the other count-prefixed records: a crafted count must not size an
         // allocation before the bytes behind it have been shown to exist.
         trajectory.times.reserve(count.min(1 << 16));
@@ -1722,6 +1742,13 @@ impl ObjectTrack {
                  bytes remain after its header and each sample needs {SAMPLE_BYTES}",
                 track.object_id,
                 c.remaining()
+            )));
+        }
+        if count > MAX_TRAJECTORY_SAMPLES {
+            return Err(Error::Malformed(format!(
+                "track for object {} declares {count} samples, past the \
+                 {MAX_TRAJECTORY_SAMPLES} ceiling",
+                track.object_id
             )));
         }
         track.times.reserve(count);

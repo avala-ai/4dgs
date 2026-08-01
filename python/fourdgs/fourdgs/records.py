@@ -984,6 +984,19 @@ class SensorCalibration:
         return [v / norm for v in self.rotation]
 
 
+#: The most samples one trajectory or object track may declare.
+#:
+#: A count-prefixed record must not size an allocation before the bytes behind it are
+#: shown to exist; the byte check below does that, and this bounds what a single legal
+#: record can ask a reader to build. Sized to stay under the 64 MiB front-matter range
+#: cap the indexed readers enforce: at 64 bytes a sample this is 64 MB of samples,
+#: leaving room for the name, the count and the framing. `1 << 20` would have been 64
+#: MiB of samples exactly, so a trajectory at the ceiling would parse streamed and be
+#: refused indexed — the same file, two answers from one SDK. Shared with the other
+#: SDKs by value: a ceiling only one implementation has is a conformance split, and a
+#: record between the two limits would decode here and be refused there.
+MAX_TRAJECTORY_SAMPLES = 1_000_000
+
 TRAJECTORY_LINEAR = 0
 TRAJECTORY_STEP = 1
 
@@ -1017,7 +1030,12 @@ class RigTrajectory:
     def parse(content) -> RigTrajectory:
         c = Cursor(content)
         trajectory = RigTrajectory(name=c.string(), interpolation=c.u8())
-        for _ in range(c.u32()):
+        count = c.u32()
+        if count > MAX_TRAJECTORY_SAMPLES:
+            raise MalformedFile(
+                f"trajectory {trajectory.name!r} declares {count} samples, past the {MAX_TRAJECTORY_SAMPLES} ceiling"
+            )
+        for _ in range(count):
             trajectory.times.append(c.f64())
             trajectory.rotations.append(c.f64s(4))
             trajectory.translations.append(c.f64s(3))
@@ -1251,7 +1269,14 @@ class ObjectTrack:
     def parse(content) -> ObjectTrack:
         c = Cursor(content)
         track = ObjectTrack(object_id=c.u32(), interpolation=c.u8())
-        for _ in range(c.u32()):
+        count = c.u32()
+        if count > MAX_TRAJECTORY_SAMPLES:
+            raise MalformedFile(
+                f"track for object {track.object_id} declares {count} samples, past the "
+                f"{MAX_TRAJECTORY_SAMPLES} ceiling",
+                code="trajectory-samples-past-ceiling",
+            )
+        for _ in range(count):
             track.times.append(c.f64())
             track.rotations.append(c.f64s(4))
             track.translations.append(c.f64s(3))
