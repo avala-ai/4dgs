@@ -21,6 +21,8 @@ import {
   MAX_TRAJECTORY_SAMPLES,
   TruncatedFile,
   parseRigTrajectory,
+  quaternionNorm,
+  checkRigTrajectory,
   poseAt,
   UnsupportedVersion,
   StreamDecoder,
@@ -517,4 +519,35 @@ test("a trajectory past the sample ceiling is refused before it is allocated", (
   const body = new Uint8Array(parts.length + declared * 64);
   body.set(Uint8Array.from(parts));
   assert.throws(() => parseRigTrajectory(body), MalformedFile);
+});
+
+test("a finite quaternion near the top of the range is renormalized, not refused", () => {
+  // §5.15.4 refuses "zero or non-finite norms" — a claim about the quaternion, not about
+  // the arithmetic used to measure it. [1e308, 0, 0, 0] has a finite norm and a good
+  // direction; only the naive sum of squares overflows, so squaring first refuses a file
+  // the format allows — and refuses it here while another SDK accepts it.
+  assert.equal(quaternionNorm([1e308, 0, 0, 0]), 1e308);
+  assert.ok(Number.isFinite(quaternionNorm([1e300, 1e300, 1e300, 1e300])));
+  // A quaternion with no direction is still refused, which is what the sentence means.
+  assert.equal(quaternionNorm([0, 0, 0, 0]), 0);
+  assert.ok(!Number.isFinite(quaternionNorm([Infinity, 0, 0, 0])));
+});
+
+test("a zero-sample trajectory is read as absent rather than refused", () => {
+  // §5.15.4: it "MUST be read as though the record were absent", so reading one refuses
+  // nothing — not even interpolation 7, which describes how to read samples it does not
+  // carry. checkRigTrajectory stays strict for the writer.
+  const body = Uint8Array.from([3, 0, 0, 0, 0x72, 0x69, 0x67, 7, 0, 0, 0, 0]);
+  const trajectory = parseRigTrajectory(body);
+  assert.equal(trajectory.times.length, 0);
+  assert.throws(
+    () =>
+      checkRigTrajectory({
+        ...trajectory,
+        times: [0],
+        rotations: [[0, 0, 0, 1]],
+        translations: [[0, 0, 0]],
+      }),
+    MalformedFile,
+  );
 });

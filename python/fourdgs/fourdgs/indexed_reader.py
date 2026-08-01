@@ -455,7 +455,12 @@ def read_objects(source: Readable, scene: IndexedScene) -> ObjectLayer:
                 )
             out.table = rec.ObjectTable.parse(content)
         else:
-            out.tracks.append(rec.ObjectTrack.parse(content))
+            # Section 5.15.7: a zero-sample track "has no pose and is read as absent".
+            # Keeping it would make one empty track a non-empty object layer, and two
+            # empty tracks for an id a duplicate the layer refuses.
+            track = rec.ObjectTrack.parse(content)
+            if track.sample_count > 0:
+                out.tracks.append(track)
     out.check()
     return out
 

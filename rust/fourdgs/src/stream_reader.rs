@@ -335,10 +335,15 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
                 }
                 scene.objects.table = Some(rec::ObjectTable::parse(&content)?);
             }
-            op::OBJECT_TRACK => scene
-                .objects
-                .tracks
-                .push(rec::ObjectTrack::parse(&content)?),
+            op::OBJECT_TRACK => {
+                // Section 5.15.7: a zero-sample track "has no pose and is read as
+                // absent". Keeping it would make one empty track a non-empty object
+                // layer, and two empty tracks for an id a duplicate the layer refuses.
+                let track = rec::ObjectTrack::parse(&content)?;
+                if track.sample_count() > 0 {
+                    scene.objects.tracks.push(track);
+                }
+            }
             op::STATISTICS => scene.statistics = Some(rec::Statistics::parse(&content)?),
             op::CHUNK_INDEX => scene
                 .chunk_index

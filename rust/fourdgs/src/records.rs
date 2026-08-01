@@ -17,6 +17,27 @@ use crate::serialization::{
     put_u64, put_u8, Cursor,
 };
 
+/// The Euclidean norm of a quaternion, computed without squaring the components first.
+///
+/// A component near the top of the double range squares to infinity, so the naive sum
+/// reports an infinite norm for a rotation whose norm is finite and whose direction is
+/// perfectly good. Section 5.15.4 refuses "zero or non-finite norms" — that is a
+/// statement about the quaternion, not about the arithmetic used to measure it, and a
+/// reader that squares first refuses files the format allows. Dividing by the largest
+/// magnitude first makes the sum safe and leaves the direction untouched.
+pub(crate) fn quaternion_norm(q: &[f64]) -> f64 {
+    let scale = q.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    if !scale.is_finite() || scale == 0.0 {
+        // Left for the caller to refuse, with the message it words for its own record.
+        return scale;
+    }
+    scale
+        * q.iter()
+            .map(|v| (v / scale) * (v / scale))
+            .sum::<f64>()
+            .sqrt()
+}
+
 pub const FLAG_HAS_AUDIO: u8 = 1 << 0;
 pub const FLAG_CHUNKS_COMPRESSED: u8 = 1 << 1;
 pub const AUDIO_SOURCE_SPATIAL: u8 = 1 << 0;
@@ -1281,7 +1302,7 @@ impl SensorCalibration {
             finite(&format!("translation[{i}]"), *v)?;
         }
 
-        let norm = self.rotation.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let norm = quaternion_norm(&self.rotation);
         if !norm.is_finite() || norm == 0.0 {
             return Err(Error::Malformed(format!(
                 "sensor {:?}: rotation quaternion has no direction (norm {norm})",
@@ -1391,7 +1412,13 @@ impl RigTrajectory {
             let t = c.f64s(3)?;
             trajectory.translations.push([t[0], t[1], t[2]]);
         }
-        trajectory.check()?;
+        // Section 5.15.4: a trajectory with no samples "MUST be read as though the record
+        // were absent", so reading one refuses nothing — not even an interpolation byte
+        // outside the registry, which describes how to read samples it does not carry.
+        // `check` stays strict for the writer, which must not emit such a record.
+        if !trajectory.times.is_empty() {
+            trajectory.check()?;
+        }
         Ok(trajectory)
     }
 
@@ -1426,7 +1453,7 @@ impl RigTrajectory {
             }
         }
         for (i, q) in self.rotations.iter().enumerate() {
-            let norm = q.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let norm = quaternion_norm(q);
             if !norm.is_finite() || norm == 0.0 {
                 return Err(Error::Malformed(format!(
                     "trajectory {:?}: sample {i} rotation has no direction (norm {norm})",
@@ -1707,7 +1734,12 @@ impl ObjectTrack {
             let t = c.f64s(3)?;
             track.translations.push([t[0], t[1], t[2]]);
         }
-        track.check()?;
+        // Section 5.15.7: a zero-sample track "has no pose and is read as absent", so
+        // reading one refuses nothing. `check` stays strict for the writer, which must
+        // not emit a record whose interpolation byte is outside the registry.
+        if !track.times.is_empty() {
+            track.check()?;
+        }
         Ok(track)
     }
 
@@ -1759,7 +1791,7 @@ impl ObjectTrack {
             }
         }
         for (i, q) in self.rotations.iter().enumerate() {
-            let norm = q.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let norm = quaternion_norm(q);
             if !norm.is_finite() || norm == 0.0 {
                 return Err(Error::Malformed(format!(
                     "track for object {}: sample {i} rotation has no direction (norm {norm})",

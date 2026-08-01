@@ -424,7 +424,12 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
                     )
                 scene.objects.table = rec.ObjectTable.parse(record.content)
             elif record.opcode == op.OBJECT_TRACK:
-                scene.objects.tracks.append(rec.ObjectTrack.parse(record.content))
+                # Section 5.15.7: a zero-sample track "has no pose and is read as absent".
+                # Keeping it would make one empty track a non-empty object layer, and two
+                # empty tracks for an id a duplicate the layer refuses.
+                track = rec.ObjectTrack.parse(record.content)
+                if track.sample_count > 0:
+                    scene.objects.tracks.append(track)
             elif record.opcode == op.STATISTICS:
                 scene.statistics = rec.Statistics.parse(record.content)
             elif record.opcode == op.CHUNK_INDEX:

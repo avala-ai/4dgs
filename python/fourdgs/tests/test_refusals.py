@@ -13,14 +13,17 @@ is whichever path the consumer happens to use.
 from __future__ import annotations
 
 import io
+import math
 import os
 import sys
 
 import fourdgs
 import numpy as np
 import pytest
+from fourdgs import records as rec
 from fourdgs.indexed_reader import open_indexed, read_chunk
 from fourdgs.readable import BytesReadable
+from fourdgs.serialization import put_string, put_u8, put_u32
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "tests", "conformance", "generator"))
 import invalid
@@ -130,3 +133,48 @@ def test_an_error_without_an_identifier_is_still_an_error():
     err = fourdgs.MalformedFile("something specific went wrong")
     assert err.code == ""
     assert str(err) == "something specific went wrong"
+
+
+def test_a_finite_quaternion_near_the_top_of_the_range_is_renormalized_not_refused():
+    """Section 5.15.4 refuses "zero or non-finite norms" — a claim about the quaternion.
+
+    `[1e308, 0, 0, 0]` has a finite norm and a perfectly good direction. Only the naive
+    sum of squares overflows, so a reader that squares first refuses a file the format
+    allows, and does it in one SDK before another.
+    """
+    huge = [1e308, 0.0, 0.0, 0.0]
+    trajectory = rec.RigTrajectory(name="rig", times=[0.0], rotations=[huge], translations=[[0.0] * 3])
+    trajectory.check()
+    assert math.isclose(math.hypot(*trajectory.rotations[0]), 1e308)
+
+    sensor = rec.SensorCalibration(name="cam", rig_name="rig", rotation=huge, translation=[0.0] * 3)
+    sensor.check()
+    assert math.isclose(math.hypot(*sensor.unit_rotation()), 1.0)
+
+
+def test_a_zero_sample_trajectory_is_read_as_absent_rather_than_refused():
+    """Section 5.15.4: a trajectory with no samples "MUST be read as though the record
+    were absent" — so reading one refuses nothing, not even an interpolation byte that
+    describes how to read samples the record does not carry.
+
+    The writer is held to the opposite standard: `check()` still refuses it, because a
+    producer that emits such a record has made a mistake worth naming.
+    """
+    body = put_string("rig") + put_u8(7) + put_u32(0)
+    assert rec.RigTrajectory.parse(body).sample_count == 0
+
+    with pytest.raises(fourdgs.MalformedFile):
+        rec.RigTrajectory(name="rig", interpolation=7).check()
+
+
+def test_a_zero_sample_object_track_is_read_as_absent_rather_than_refused():
+    """The same sentence in section 5.15.7, for the object layer.
+
+    Kept, one empty track would make a non-empty object layer and two empty tracks for
+    one id would be a duplicate the layer refuses — so the readers drop them.
+    """
+    body = put_u32(7) + put_u8(7) + put_u32(0)
+    assert rec.ObjectTrack.parse(body).sample_count == 0
+
+    with pytest.raises(fourdgs.MalformedFile):
+        rec.ObjectTrack(object_id=7, interpolation=7).check()

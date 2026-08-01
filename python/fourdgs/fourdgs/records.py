@@ -948,7 +948,7 @@ class SensorCalibration:
             if not math.isfinite(value):
                 raise MalformedFile(f"sensor {self.name!r}: {label} is {value}; every value must be finite")
 
-        norm = math.sqrt(sum(v * v for v in self.rotation))
+        norm = math.hypot(*self.rotation)
         if not math.isfinite(norm) or norm == 0.0:
             raise MalformedFile(f"sensor {self.name!r}: rotation quaternion has no direction (norm {norm})")
 
@@ -980,7 +980,7 @@ class SensorCalibration:
 
     def unit_rotation(self) -> list[float]:
         """The extrinsic quaternion, renormalized as section 6.4 renormalizes its own."""
-        norm = math.sqrt(sum(v * v for v in self.rotation))
+        norm = math.hypot(*self.rotation)
         return [v / norm for v in self.rotation]
 
 
@@ -1021,7 +1021,12 @@ class RigTrajectory:
             trajectory.times.append(c.f64())
             trajectory.rotations.append(c.f64s(4))
             trajectory.translations.append(c.f64s(3))
-        trajectory.check()
+        # Section 5.15.4: a trajectory with no samples "MUST be read as though the record
+        # were absent", so reading one refuses nothing — not even an interpolation byte
+        # outside the registry, which describes how to read samples it does not carry.
+        # `check()` stays strict for the writer, which must not emit such a record.
+        if trajectory.sample_count:
+            trajectory.check()
         return trajectory
 
     def check(self) -> None:
@@ -1046,7 +1051,7 @@ class RigTrajectory:
                     f"at t={self.times[i - 1]}; times must strictly increase (section 5.15.4)"
                 )
         for i, quaternion in enumerate(self.rotations):
-            norm = math.sqrt(sum(v * v for v in quaternion))
+            norm = math.hypot(*quaternion)
             if not math.isfinite(norm) or norm == 0.0:
                 raise MalformedFile(f"trajectory {self.name!r}: sample {i} rotation has no direction (norm {norm})")
         for i, translation in enumerate(self.translations):
@@ -1250,7 +1255,11 @@ class ObjectTrack:
             track.times.append(c.f64())
             track.rotations.append(c.f64s(4))
             track.translations.append(c.f64s(3))
-        track.check()
+        # Section 5.15.7: a zero-sample track "has no pose and is read as absent", so
+        # reading one refuses nothing. `check()` stays strict for the writer, which must
+        # not emit a record whose interpolation byte is outside the registry.
+        if track.sample_count:
+            track.check()
         return track
 
     def check(self) -> None:
@@ -1308,7 +1317,7 @@ class ObjectTrack:
                     f"track for object {self.object_id}: sample {i} rotation has {len(quaternion)} values, expected 4",
                     code="invalid-object-track-shape",
                 )
-            norm = math.sqrt(sum(v * v for v in quaternion))
+            norm = math.hypot(*quaternion)
             if not math.isfinite(norm) or norm == 0.0:
                 raise MalformedFile(
                     f"track for object {self.object_id}: sample {i} rotation has no direction (norm {norm})",

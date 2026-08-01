@@ -1106,11 +1106,7 @@ class FourdgsSensorCalibration {
       finite('translation[$i]', translation[i]);
     }
 
-    double normSq = 0.0;
-    for (final v in rotation) {
-      normSq += v * v;
-    }
-    final norm = math.sqrt(normSq);
+    final norm = quaternionNorm(rotation);
     if (!norm.isFinite || norm == 0.0) {
       throw FourdgsMalformedFile(
         "sensor '$name': rotation quaternion has no direction (norm $norm)",
@@ -1157,6 +1153,29 @@ const int rigTrajectorySampleBytes = 8 + 32 + 24;
 ///
 /// Not the [FourdgsCamera] record, which is a viewing suggestion a reader may
 /// ignore. This is where the sensors were.
+/// The Euclidean norm of a quaternion, computed without squaring the components first.
+///
+/// A component near the top of the double range squares to infinity, so the naive
+/// sum reports an infinite norm for a rotation whose norm is finite and whose
+/// direction is perfectly good. Section 5.15.4 refuses "zero or non-finite norms" —
+/// a statement about the quaternion, not about the arithmetic used to measure it.
+/// Dividing by the largest magnitude first makes the sum safe.
+double quaternionNorm(List<double> q) {
+  double scale = 0.0;
+  for (final v in q) {
+    final m = v.abs();
+    if (m > scale) scale = m;
+  }
+  // Left for the caller to refuse, with the message it words for its own record.
+  if (!scale.isFinite || scale == 0.0) return scale;
+  double sum = 0.0;
+  for (final v in q) {
+    final u = v / scale;
+    sum += u * u;
+  }
+  return scale * math.sqrt(sum);
+}
+
 class FourdgsRigTrajectory {
   FourdgsRigTrajectory({
     required this.name,
@@ -1208,7 +1227,13 @@ class FourdgsRigTrajectory {
       rotations: rotations,
       translations: translations,
     );
-    trajectory.check();
+    // Section 5.15.4: a trajectory with no samples "MUST be read as though the
+    // record were absent", so reading one refuses nothing — not even an
+    // interpolation byte outside the registry, which describes how to read
+    // samples it does not carry. `check` stays strict for the writer.
+    if (trajectory.times.isNotEmpty) {
+      trajectory.check();
+    }
     return trajectory;
   }
 
@@ -1237,11 +1262,7 @@ class FourdgsRigTrajectory {
     }
     for (int i = 0; i < rotations.length; i++) {
       final q = rotations[i];
-      double normSq = 0.0;
-      for (final v in q) {
-        normSq += v * v;
-      }
-      final norm = math.sqrt(normSq);
+      final norm = quaternionNorm(q);
       if (!norm.isFinite || norm == 0.0) {
         throw FourdgsMalformedFile(
           "trajectory '$name': sample $i rotation has no direction "

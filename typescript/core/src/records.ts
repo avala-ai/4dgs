@@ -957,7 +957,7 @@ export function checkSensorCalibration(sensor: SensorCalibration): void {
     finite(`translation[${i}]`, sensor.translation[i]!);
   }
 
-  const norm = Math.sqrt(sensor.rotation.reduce((sum, v) => sum + v * v, 0));
+  const norm = quaternionNorm(sensor.rotation);
   if (!Number.isFinite(norm) || norm === 0) {
     throw new MalformedFile(
       `sensor ${JSON.stringify(sensor.name)}: rotation quaternion has no direction (norm ${norm})`,
@@ -1056,7 +1056,11 @@ export function parseRigTrajectory(content: Uint8Array): RigTrajectory {
     translations.push(c.f64s(3));
   }
   const trajectory: RigTrajectory = { name, interpolation, times, rotations, translations };
-  checkRigTrajectory(trajectory);
+  // §5.15.4: a trajectory with no samples "MUST be read as though the record were
+  // absent", so reading one refuses nothing — not even an interpolation byte outside the
+  // registry, which describes how to read samples it does not carry. The check stays
+  // strict for the writer, which must not emit such a record.
+  if (trajectory.times.length > 0) checkRigTrajectory(trajectory);
   return trajectory;
 }
 
@@ -1066,6 +1070,31 @@ export function parseRigTrajectory(content: Uint8Array): RigTrajectory {
  * Every interpolation rule is stated in terms of the interval a query lands in, and a
  * repeated or reversed timestamp makes that interval ambiguous.
  */
+/**
+ * The Euclidean norm of a quaternion, computed without squaring the components first.
+ *
+ * A component near the top of the double range squares to Infinity, so the naive sum
+ * reports an infinite norm for a rotation whose norm is finite and whose direction is
+ * perfectly good. Section 5.15.4 refuses "zero or non-finite norms" — a statement about
+ * the quaternion, not about the arithmetic used to measure it. Dividing by the largest
+ * magnitude first makes the sum safe and leaves the direction untouched.
+ */
+export function quaternionNorm(q: readonly number[]): number {
+  let scale = 0;
+  for (const v of q) {
+    const m = Math.abs(v);
+    if (m > scale) scale = m;
+  }
+  // Left for the caller to refuse, with the message it words for its own record.
+  if (!Number.isFinite(scale) || scale === 0) return scale;
+  let sum = 0;
+  for (const v of q) {
+    const u = v / scale;
+    sum += u * u;
+  }
+  return scale * Math.sqrt(sum);
+}
+
 export function checkRigTrajectory(trajectory: RigTrajectory): void {
   if (
     trajectory.interpolation !== TRAJECTORY_LINEAR &&
@@ -1093,7 +1122,7 @@ export function checkRigTrajectory(trajectory: RigTrajectory): void {
   }
   for (let i = 0; i < trajectory.rotations.length; i++) {
     const q = trajectory.rotations[i]!;
-    const norm = Math.sqrt(q.reduce((sum, v) => sum + v * v, 0));
+    const norm = quaternionNorm(q);
     if (!Number.isFinite(norm) || norm === 0) {
       throw new MalformedFile(
         `trajectory ${JSON.stringify(trajectory.name)}: sample ${i} rotation has no direction ` +

@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use fourdgs::error::Error;
 use fourdgs::opcode as op;
 use fourdgs::quantization::{life_class, mu_step, rint, support_k, Bounds, Profile, Steps};
-use fourdgs::records::{Header, Quantization, WindowTable};
+use fourdgs::records::{Header, Quantization, RigTrajectory, WindowTable};
 use fourdgs::serialization::{put_record, MAGIC};
 use fourdgs::stream::{unzigzag, zigzag};
 
@@ -321,4 +321,45 @@ fn a_default_header_declares_the_temporal_model_this_version_defines() {
         "gaussian-birth",
         "a Header built from Default must not describe a file every conforming reader refuses"
     );
+}
+
+#[test]
+fn a_finite_quaternion_near_the_top_of_the_range_is_not_refused() {
+    // Section 5.15.4 refuses "zero or non-finite norms" — a claim about the quaternion,
+    // not about the arithmetic used to measure it. Only the naive sum of squares
+    // overflows on [1e308, 0, 0, 0], so squaring first refuses a file the format allows.
+    let trajectory = RigTrajectory {
+        name: "rig".into(),
+        interpolation: 0,
+        times: vec![0.0],
+        rotations: vec![[1e308, 0.0, 0.0, 0.0]],
+        translations: vec![[0.0; 3]],
+    };
+    assert!(trajectory.check().is_ok());
+
+    // A quaternion with no direction is still refused; that is what the sentence means.
+    let zero = RigTrajectory {
+        rotations: vec![[0.0; 4]],
+        ..trajectory.clone()
+    };
+    assert!(zero.check().is_err());
+}
+
+#[test]
+fn a_zero_sample_trajectory_is_read_as_absent_rather_than_refused() {
+    // Section 5.15.4: it "MUST be read as though the record were absent", so reading one
+    // refuses nothing — not even interpolation 7, which describes how to read samples the
+    // record does not carry. `check` stays strict for the writer.
+    let body = [3u8, 0, 0, 0, b'r', b'i', b'g', 7, 0, 0, 0, 0];
+    let trajectory = RigTrajectory::parse(&body).expect("a zero-sample trajectory reads as absent");
+    assert_eq!(trajectory.sample_count(), 0);
+
+    let written = RigTrajectory {
+        name: "rig".into(),
+        interpolation: 7,
+        times: vec![0.0],
+        rotations: vec![[0.0, 0.0, 0.0, 1.0]],
+        translations: vec![[0.0; 3]],
+    };
+    assert!(written.check().is_err());
 }

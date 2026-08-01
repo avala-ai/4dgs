@@ -450,4 +450,57 @@ void main() {
       );
     });
   });
+
+  group('poses the spec asks readers to accept', () {
+    test('a finite quaternion near the top of the range is not refused', () {
+      // Section 5.15.4 refuses "zero or non-finite norms" — a claim about the
+      // quaternion, not about the arithmetic used to measure it. Only the naive
+      // sum of squares overflows on [1e308, 0, 0, 0], so squaring first refuses
+      // a file the format allows, and refuses it here while Python accepts it.
+      expect(quaternionNorm([1e308, 0.0, 0.0, 0.0]), 1e308);
+      expect(quaternionNorm([1e300, 1e300, 1e300, 1e300]).isFinite, isTrue);
+      // A quaternion with no direction is still refused; that is the sentence.
+      expect(quaternionNorm([0.0, 0.0, 0.0, 0.0]), 0.0);
+      expect(
+        quaternionNorm([double.infinity, 0.0, 0.0, 0.0]).isFinite,
+        isFalse,
+      );
+    });
+
+    test('a zero-sample trajectory is read as absent rather than refused', () {
+      // Section 5.15.4: it "MUST be read as though the record were absent", so
+      // reading one refuses nothing — not even interpolation 7, which describes
+      // how to read samples it does not carry. check() stays strict for writers.
+      final body = Uint8List.fromList(<int>[
+        3,
+        0,
+        0,
+        0,
+        0x72,
+        0x69,
+        0x67,
+        7,
+        0,
+        0,
+        0,
+        0,
+      ]);
+      expect(FourdgsRigTrajectory.parse(body).sampleCount, 0);
+      expect(
+        () =>
+            FourdgsRigTrajectory(
+              name: 'rig',
+              interpolation: 7,
+              times: <double>[0.0],
+              rotations: <List<double>>[
+                <double>[0.0, 0.0, 0.0, 1.0],
+              ],
+              translations: <List<double>>[
+                <double>[0.0, 0.0, 0.0],
+              ],
+            ).check(),
+        throwsA(isA<FourdgsMalformedFile>()),
+      );
+    });
+  });
 }

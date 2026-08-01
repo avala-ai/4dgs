@@ -110,6 +110,7 @@ export {
   entryCovers,
   finiteLerp,
   interpolationFraction,
+  quaternionNorm,
   frameDeltaGroups,
   iterateRecords,
   parseAttachment,

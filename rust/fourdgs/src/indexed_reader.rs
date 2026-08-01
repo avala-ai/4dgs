@@ -735,10 +735,11 @@ pub fn read_objects<R: Readable + ?Sized>(
     }
     for range in scene.object_track_ranges.values() {
         let blob = source.read(range.record_offset, range.record_length)?;
-        out.tracks.push(rec::ObjectTrack::parse(record_content(
-            &blob,
-            op::OBJECT_TRACK,
-        )?)?);
+        // Section 5.15.7: a zero-sample track "has no pose and is read as absent".
+        let track = rec::ObjectTrack::parse(record_content(&blob, op::OBJECT_TRACK)?)?;
+        if track.sample_count() > 0 {
+            out.tracks.push(track);
+        }
     }
     out.check()?;
     Ok(out)
