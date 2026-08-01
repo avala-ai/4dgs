@@ -66,9 +66,9 @@ same for the provenance family, so every binding emits identical bytes with no p
 
 ¹ On the `gaussian-birth` path. No implementation composes object tracks during `keyframe-delta`
 reconstruction: that path rebuilds base centres and scales from bins and never reads the object
-layer, so a scene carrying both decodes to its uncomposed state in every SDK. The object-layer
-variants the suite runs are `gaussian-birth`, so no row here is evidence either way about the
-combination — see issue #79.
+layer, so a scene carrying both decodes as though the track were absent, in every SDK. The
+object-layer variants the suite runs are `gaussian-birth`, so no row here is evidence either way
+about the combination — see issue #79.
 
 ## Reading this table
 
