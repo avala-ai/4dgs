@@ -115,8 +115,10 @@ corpus must be redistributable without a licence question and reproducible witho
 
 `run.py` lets a whole language family decline the variants carrying a feature it has not
 implemented, alongside the per-runner `supportsVariant`. The object-layer variants are the current
-users of it: TypeScript, Dart, C++ and Swift decline them, and the feature matrix records the `No`.
-Every family reports provenance (spec §5.15); C++ and Swift do so through the Rust C ABI's additive
+users of it: C++ and Swift decline them, and the feature matrix records the `No`. TypeScript and
+Dart used to sit in that list and no longer do — they decode the object layer and compose its tracks
+natively, which is what removing a family from `FAMILY_DECLINES` is supposed to look like. Every
+family reports provenance (spec §5.15); C++ and Swift do so through the Rust C ABI's additive
 provenance-JSON accessor.
 
 The alternative to optional keys was worse in a way worth writing down. The canonical summary emits
@@ -189,8 +191,8 @@ a failure, but the error names the runner rather than the platform and reads lik
 The suite runs on GitHub-hosted runners for Python, TypeScript and Rust on Linux, macOS and Windows;
 C++, Swift and Dart run it on Linux. Every platform decodes the same 46 valid variants and compares
 against the same committed expectations — 97 passing comparisons for a family that reports
-provenance but declines the object layer (TypeScript, Dart, C++, Swift), 105 for Rust, which also
-answers the object variants, and 119 for Python, which answers all of them including the refusal
+provenance but declines the object layer (C++ and Swift), 105 for Rust, TypeScript and Dart, which
+also answer the object variants, and 119 for Python, which answers all of them including the refusal
 expectations. The single `decode_indexed` variant that declares no chunk index is skipped
 everywhere.
 
