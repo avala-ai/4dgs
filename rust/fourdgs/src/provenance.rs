@@ -19,7 +19,7 @@
 
 use crate::error::{Error, Result};
 use crate::records::{
-    CoordinateFrame, GeodeticAnchor, RigTrajectory, SensorCalibration, POSE_TO_RIG,
+    CoordinateFrame, GeodeticAnchor, RigTrajectory, SensorCalibration, POSE_TO_RIG, POSE_TO_SCENE,
     TRAJECTORY_LINEAR, TRAJECTORY_STEP,
 };
 
@@ -86,13 +86,29 @@ pub(crate) fn quaternion_multiply(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
 }
 
 fn normalize(q: [f64; 4]) -> Result<[f64; 4]> {
-    let norm = q.iter().map(|v| v * v).sum::<f64>().sqrt();
+    // Scaled before squaring: a component near the top of the double range squares to
+    // infinity, so the naive norm refuses a quaternion that has a perfectly good
+    // direction and that every other reader renormalizes. Dividing by the largest
+    // magnitude first makes the sum safe and leaves the direction untouched.
+    let scale = q.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    if !scale.is_finite() || scale == 0.0 {
+        return Err(Error::Malformed(format!(
+            "a quaternion with scale {scale} has no direction"
+        )));
+    }
+    let scaled = [q[0] / scale, q[1] / scale, q[2] / scale, q[3] / scale];
+    let norm = scaled.iter().map(|v| v * v).sum::<f64>().sqrt();
     if !norm.is_finite() || norm == 0.0 {
         return Err(Error::Malformed(format!(
             "a quaternion with norm {norm} has no direction"
         )));
     }
-    Ok([q[0] / norm, q[1] / norm, q[2] / norm, q[3] / norm])
+    Ok([
+        scaled[0] / norm,
+        scaled[1] / norm,
+        scaled[2] / norm,
+        scaled[3] / norm,
+    ])
 }
 
 /// Shortest-arc spherical interpolation between two unit quaternions.
@@ -358,6 +374,16 @@ impl Provenance {
     /// plausible, wrong, and quiet; and an anchor naming a frame the file never defined
     /// would put a whole scene somewhere on Earth no producer ever claimed.
     pub fn check(&self) -> Result<()> {
+        self.check_with(false)
+    }
+
+    /// The same rules, with the reference checks deferred when the file was cut.
+    ///
+    /// `truncated` defers only what a later record could still satisfy: a sensor naming
+    /// a rig, an anchor naming a frame. A duplicate name among records that are already
+    /// complete is not one of them — no byte after the cut can make two
+    /// `SensorCalibration` records with one name unambiguous — so those still refuse.
+    pub fn check_with(&self, truncated: bool) -> Result<()> {
         let groups: [(&str, Vec<&str>, &str); 4] = [
             (
                 "CoordinateFrame",
@@ -393,9 +419,37 @@ impl Provenance {
             }
         }
 
+        // The registry defines two pose references and no more. An unrecognized value is
+        // not a future extension a reader may ignore: it says the extrinsic maps into some
+        // frame this build cannot name, and treating it as scene-relative puts the sensor
+        // somewhere plausible and wrong.
         for sensor in &self.sensors {
+            if sensor.pose_reference != POSE_TO_SCENE && sensor.pose_reference != POSE_TO_RIG {
+                return Err(Error::Malformed(format!(
+                    "sensor {:?} declares pose_reference {}; the registry defines 0 (scene) \
+                     and 1 (rig)",
+                    sensor.name, sensor.pose_reference
+                )));
+            }
+        }
+
+        // Past here the rules resolve a reference into another record. A file cut before
+        // that record arrived is missing the target rather than contradicting itself.
+        if truncated {
+            return Ok(());
+        }
+
+        for sensor in &self.sensors {
+            // A zero-sample trajectory "MUST be read as though the record were absent"
+            // (section 5.15.4), so a rig-relative sensor naming one names a rig this
+            // file does not carry — the same refusal, reached one step later. Composing
+            // it as identity would place every sensor on that rig at the rig origin:
+            // plausible, wrong, and silent.
             if sensor.pose_reference == POSE_TO_RIG
-                && !self.trajectories.iter().any(|t| t.name == sensor.rig_name)
+                && !self
+                    .trajectories
+                    .iter()
+                    .any(|t| t.name == sensor.rig_name && t.sample_count() > 0)
             {
                 return Err(Error::Malformed(format!(
                     "sensor {:?} is posed against rig {:?}, which this file does not carry \
@@ -416,5 +470,430 @@ impl Provenance {
             }
         }
         Ok(())
+    }
+}
+
+// --------------------------------------------------------------------------
+// Canonical provenance JSON (shared by Rust conformance and the C ABI)
+// --------------------------------------------------------------------------
+//
+// The statement two implementations are diffed on for the provenance family, computed here
+// so C++ and Swift — which bind the decoder through the C ABI rather than reimplementing
+// slerp — emit the same object the Python and Rust runners do. Representation matches the
+// shared canonical: six-decimal floats, integers as strings, sorted object keys, and the
+// probe poses that exercise clamp and shortest-arc slerp rather than only the stored samples.
+
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
+
+/// Decimal places every float in the provenance summary carries, matching the shared
+/// canonical (`FLOAT_DECIMALS` in the conformance crate and `canonical.py`).
+const PROVENANCE_JSON_DECIMALS: usize = 6;
+
+/// How many trajectory samples appear in full. A long capture would otherwise bloat the
+/// summary without proving anything the probes and the sample-count field do not.
+const RIG_SAMPLES: usize = 4;
+
+/// A JSON value whose objects are sorted by key. Private mirror of the conformance
+/// emitter — the core does not depend on its own test crate.
+enum Json {
+    Null,
+    Num(f64),
+    Str(String),
+    Arr(Vec<Json>),
+    Obj(BTreeMap<String, Json>),
+}
+
+impl Json {
+    fn obj(pairs: Vec<(&str, Json)>) -> Json {
+        Json::Obj(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+    }
+
+    fn write(&self, out: &mut String) {
+        match self {
+            Json::Null => out.push_str("null"),
+            Json::Num(v) => {
+                let _ = write!(out, "{v:.*}", PROVENANCE_JSON_DECIMALS);
+            }
+            Json::Str(s) => write_json_string(out, s),
+            Json::Arr(items) => {
+                out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    item.write(out);
+                }
+                out.push(']');
+            }
+            Json::Obj(map) => {
+                out.push('{');
+                for (i, (key, value)) in map.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write_json_string(out, key);
+                    out.push(':');
+                    value.write(out);
+                }
+                out.push('}');
+            }
+        }
+    }
+
+    fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.write(&mut out);
+        out
+    }
+}
+
+fn write_json_string(out: &mut String, s: &str) {
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// Round for comparison; a non-finite value becomes `null`.
+fn num(v: f64) -> Json {
+    if v.is_finite() {
+        Json::Num(v)
+    } else {
+        Json::Null
+    }
+}
+
+/// An integer as a string, so a 64-bit value survives a JSON parser backed by doubles.
+fn int(v: u64) -> Json {
+    Json::Str(v.to_string())
+}
+
+/// Times a summary evaluates a trajectory at, derived from the trajectory itself.
+///
+/// Two of the five are outside the sample range on purpose: clamping is a rule, and a rule
+/// no expectation exercises is a rule an implementation can decline to have.
+fn probe_times<T: PoseSampled + ?Sized>(trajectory: &T) -> Vec<f64> {
+    if trajectory.sample_count() == 0 {
+        return Vec::new();
+    }
+    let first = trajectory.time(0);
+    let last = trajectory.time(trajectory.sample_count() - 1);
+    vec![
+        first - 0.5,
+        first,
+        first / 2.0 + last / 2.0,
+        last,
+        last + 0.5,
+    ]
+}
+
+/// When to evaluate a sensor's scene pose: the midpoint of the rig it rides.
+fn sensor_probe_time(prov: &Provenance, rig_name: &str) -> f64 {
+    // The empty string is a legal trajectory name — the default capture rig — and
+    // `sensor_pose_at` resolves it, so skipping the lookup summarized a moving unnamed
+    // rig at t=0 and never exercised its composed pose.
+    match prov.trajectory(rig_name) {
+        Some(t) if t.sample_count() > 0 => {
+            let (first, last) = (t.times[0], t.times[t.sample_count() - 1]);
+            first / 2.0 + last / 2.0
+        }
+        _ => 0.0,
+    }
+}
+
+fn pose_row(t: f64, pose: Option<&Pose>, sensor: Option<&str>) -> Json {
+    let mut pairs: Vec<(&str, Json)> = vec![("time", num(t))];
+    if let Some(name) = sensor {
+        pairs.push(("sensor", Json::Str(name.to_string())));
+    }
+    match pose {
+        None => {
+            pairs.push(("rotation", Json::Null));
+            pairs.push(("translation", Json::Null));
+        }
+        Some(p) => {
+            pairs.push((
+                "rotation",
+                Json::Arr(p.rotation.iter().map(|v| num(*v)).collect()),
+            ));
+            pairs.push((
+                "translation",
+                Json::Arr(p.translation.iter().map(|v| num(*v)).collect()),
+            ));
+        }
+    }
+    Json::obj(pairs)
+}
+
+/// Canonical provenance JSON for the conformance suite, or an empty string when the
+/// file carries none.
+///
+/// Empty is deliberate and is **not** the `audioSources` convention: a file without
+/// provenance is a file the record family does not apply to, so the summary omits the key
+/// rather than announcing `"provenance": null`. Callers that see an empty result should
+/// omit the key.
+///
+/// On a non-empty file this is every readable field plus the arithmetic the fields imply —
+/// probe poses on each trajectory and a composed sensor pose — so two implementations that
+/// agree on every stored quaternion still have to agree on the pose halfway between them.
+pub fn canonical_json(prov: &Provenance) -> Result<String> {
+    if prov.is_empty() {
+        return Ok(String::new());
+    }
+
+    let mut trajectories = Vec::with_capacity(prov.trajectories.len());
+    for t in &prov.trajectories {
+        let mut poses = Vec::new();
+        for probe in probe_times(t) {
+            poses.push(pose_row(probe, pose_at(t, probe)?.as_ref(), None));
+        }
+        trajectories.push(Json::obj(vec![
+            ("name", Json::Str(t.name.clone())),
+            ("interpolation", Json::Num(t.interpolation as f64)),
+            ("sampleCount", int(t.sample_count() as u64)),
+            (
+                "samples",
+                Json::Arr(
+                    (0..t.sample_count().min(RIG_SAMPLES))
+                        .map(|i| {
+                            Json::obj(vec![
+                                ("time", num(t.times[i])),
+                                (
+                                    "rotation",
+                                    Json::Arr(t.rotations[i].iter().map(|v| num(*v)).collect()),
+                                ),
+                                (
+                                    "translation",
+                                    Json::Arr(t.translations[i].iter().map(|v| num(*v)).collect()),
+                                ),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+            ("posesAt", Json::Arr(poses)),
+        ]));
+    }
+
+    let mut sensor_poses = Vec::with_capacity(prov.sensors.len());
+    for s in &prov.sensors {
+        let probe = sensor_probe_time(prov, &s.rig_name);
+        sensor_poses.push(pose_row(
+            probe,
+            prov.sensor_pose_at(&s.name, probe)?.as_ref(),
+            Some(&s.name),
+        ));
+    }
+
+    Ok(Json::obj(vec![
+        (
+            "frames",
+            Json::Arr(
+                prov.frames
+                    .iter()
+                    .map(|f| {
+                        Json::obj(vec![
+                            ("name", Json::Str(f.name.clone())),
+                            ("handedness", Json::Num(f.handedness as f64)),
+                            ("upAxis", Json::Num(f.up_axis as f64)),
+                            ("forwardAxis", Json::Num(f.forward_axis as f64)),
+                            ("lengthUnit", Json::Num(f.length_unit as f64)),
+                            ("metresPerUnit", num(f.metres_per_unit)),
+                            (
+                                "metresPerUnitResolved",
+                                match prov.metres_per_unit(&f.name) {
+                                    None => Json::Null,
+                                    Some(v) => num(v),
+                                },
+                            ),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        (
+            "anchors",
+            Json::Arr(
+                prov.anchors
+                    .iter()
+                    .map(|a| {
+                        Json::obj(vec![
+                            ("frameName", Json::Str(a.frame_name.clone())),
+                            ("latitudeDeg", num(a.latitude_deg)),
+                            ("longitudeDeg", num(a.longitude_deg)),
+                            ("altitudeM", num(a.altitude_m)),
+                            ("headingDeg", num(a.heading_deg)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        (
+            "sensors",
+            Json::Arr(
+                prov.sensors
+                    .iter()
+                    .map(|s| {
+                        Json::obj(vec![
+                            ("name", Json::Str(s.name.clone())),
+                            ("modality", Json::Str(s.modality.clone())),
+                            ("cameraModel", Json::Num(s.camera_model as f64)),
+                            ("widthPx", int(s.width_px as u64)),
+                            ("heightPx", int(s.height_px as u64)),
+                            ("fx", num(s.fx)),
+                            ("fy", num(s.fy)),
+                            ("cx", num(s.cx)),
+                            ("cy", num(s.cy)),
+                            (
+                                "distortion",
+                                Json::Arr(s.distortion.iter().map(|v| num(*v)).collect()),
+                            ),
+                            (
+                                "rotation",
+                                Json::Arr(s.rotation.iter().map(|v| num(*v)).collect()),
+                            ),
+                            (
+                                "translation",
+                                Json::Arr(s.translation.iter().map(|v| num(*v)).collect()),
+                            ),
+                            ("poseReference", Json::Num(s.pose_reference as f64)),
+                            ("rigName", Json::Str(s.rig_name.clone())),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        ("trajectories", Json::Arr(trajectories)),
+        ("sensorPosesAt", Json::Arr(sensor_poses)),
+    ])
+    .to_json())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::records::{CoordinateFrame, GeodeticAnchor, RigTrajectory, SensorCalibration};
+
+    #[test]
+    fn empty_provenance_serializes_to_empty_string() {
+        let json = canonical_json(&Provenance::default()).expect("empty is always ok");
+        assert_eq!(json, "");
+    }
+
+    #[test]
+    fn frame_and_anchor_shape_matches_canonical() {
+        let prov = Provenance {
+            frames: vec![CoordinateFrame {
+                name: String::new(),
+                handedness: 1,
+                up_axis: 2,
+                forward_axis: 0,
+                length_unit: 1,
+                metres_per_unit: 1.0,
+            }],
+            anchors: vec![GeodeticAnchor {
+                frame_name: String::new(),
+                latitude_deg: 12.5,
+                longitude_deg: -145.25,
+                altitude_m: 8.75,
+                heading_deg: 37.5,
+            }],
+            ..Provenance::default()
+        };
+        let json = canonical_json(&prov).expect("frame+anchor is valid");
+        // Keys sorted; empty name is a legal frame name; resolved metres match the authority.
+        assert!(json.contains(r#""frames":[{"forwardAxis":0.000000,"handedness":1.000000"#));
+        assert!(json.contains(r#""metresPerUnitResolved":1.000000"#));
+        assert!(json
+            .contains(r#""anchors":[{"altitudeM":8.750000,"frameName":"","headingDeg":37.500000"#));
+        assert!(json.contains(r#""sensorPosesAt":[]"#));
+        assert!(json.contains(r#""sensors":[]"#));
+        assert!(json.contains(r#""trajectories":[]"#));
+    }
+
+    #[test]
+    fn trajectory_probes_include_clamped_ends() {
+        let prov = Provenance {
+            frames: vec![CoordinateFrame {
+                name: String::new(),
+                handedness: 1,
+                up_axis: 2,
+                forward_axis: 0,
+                length_unit: 1,
+                metres_per_unit: 1.0,
+            }],
+            trajectories: vec![RigTrajectory {
+                name: "rig".into(),
+                interpolation: TRAJECTORY_LINEAR,
+                times: vec![0.0, 2.0],
+                rotations: vec![[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]],
+                translations: vec![[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            }],
+            ..Provenance::default()
+        };
+        let json = canonical_json(&prov).expect("trajectory is valid");
+        // Five probes: first-0.5, first, mid, last, last+0.5. The ends are clamps.
+        assert!(json.contains(r#""time":-0.500000"#));
+        assert!(json.contains(r#""time":2.500000"#));
+        assert!(json.contains(r#""sampleCount":"2""#));
+        // Midpoint between the two samples.
+        assert!(json.contains(r#""time":1.000000"#));
+        assert!(json.contains(r#""translation":[1.000000,0.000000,0.000000]"#));
+    }
+
+    #[test]
+    fn sensor_pose_composes_with_rig() {
+        let prov = Provenance {
+            frames: vec![CoordinateFrame {
+                name: String::new(),
+                handedness: 1,
+                up_axis: 2,
+                forward_axis: 0,
+                length_unit: 1,
+                metres_per_unit: 1.0,
+            }],
+            trajectories: vec![RigTrajectory {
+                name: "rig".into(),
+                interpolation: TRAJECTORY_LINEAR,
+                times: vec![0.0, 2.0],
+                rotations: vec![[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]],
+                translations: vec![[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            }],
+            sensors: vec![SensorCalibration {
+                name: "cam".into(),
+                modality: "camera".into(),
+                camera_model: 1,
+                width_px: 100,
+                height_px: 50,
+                fx: 1.0,
+                fy: 1.0,
+                cx: 0.0,
+                cy: 0.0,
+                distortion: vec![],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                translation: [0.0, 0.0, 1.0],
+                pose_reference: POSE_TO_RIG,
+                rig_name: "rig".into(),
+            }],
+            ..Provenance::default()
+        };
+        let json = canonical_json(&prov).expect("composed sensor pose is valid");
+        // Probe is the midpoint of the rig (t=1); composition is identity R + T_rig + T_sensor.
+        assert!(json.contains(r#""sensor":"cam""#));
+        assert!(json.contains(r#""translation":[1.000000,0.000000,1.000000]"#));
+        assert!(json.contains(r#""widthPx":"100""#));
+        assert!(json.contains(r#""heightPx":"50""#));
     }
 }

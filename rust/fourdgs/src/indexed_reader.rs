@@ -654,6 +654,25 @@ pub fn read_attachments<R: Readable + ?Sized>(
 /// skipped here and read by [`read_objects`]. A still-reserved opcode (`0x26`-`0x2F`, which
 /// no version-1 writer emits) is framed and skipped by both — the forward-compatibility
 /// rule doing its job inside a family, and why the ranges carry their opcode.
+/// The most bytes one front-matter record may occupy before this reader refuses it.
+///
+/// Not a format limit; a bound on what a single declared length can cost. Staying inside
+/// the file is not enough on its own — a record declaring hundreds of megabytes sits
+/// happily inside a large file, and these paths allocate the whole range before a parser
+/// can ignore an appended tail or refuse an oversized count. The Dart and TypeScript
+/// readers cap the same reads at the same number.
+pub const MAX_FRONT_MATTER_BYTES: u64 = 64 * 1024 * 1024;
+
+fn check_front_matter_length(length: u64, what: &str) -> Result<()> {
+    if length > MAX_FRONT_MATTER_BYTES {
+        return Err(Error::Malformed(format!(
+            "a {what} record is {length} bytes, past the {MAX_FRONT_MATTER_BYTES} byte \
+             ceiling for a single front-matter record"
+        )));
+    }
+    Ok(())
+}
+
 pub fn read_provenance<R: Readable + ?Sized>(
     source: &mut R,
     scene: &IndexedScene,
@@ -669,12 +688,19 @@ pub fn read_provenance<R: Readable + ?Sized>(
         ) {
             continue;
         }
+        check_front_matter_length(*length, "provenance")?;
         let blob = source.read(*offset, *length)?;
         let content = record_content(&blob, *opcode)?;
         match *opcode {
             op::COORDINATE_FRAME => out.frames.push(rec::CoordinateFrame::parse(content)?),
             op::SENSOR_CALIBRATION => out.sensors.push(rec::SensorCalibration::parse(content)?),
-            op::RIG_TRAJECTORY => out.trajectories.push(rec::RigTrajectory::parse(content)?),
+            op::RIG_TRAJECTORY => {
+                // Section 5.15.4: a trajectory with no samples is read as though absent.
+                let trajectory = rec::RigTrajectory::parse(content)?;
+                if trajectory.sample_count() > 0 {
+                    out.trajectories.push(trajectory);
+                }
+            }
             op::GEODETIC_ANCHOR => out.anchors.push(rec::GeodeticAnchor::parse(content)?),
             _ => {}
         }
@@ -700,6 +726,7 @@ pub fn read_objects<R: Readable + ?Sized>(
                  exactly one scene-wide object table"
             )));
         }
+        check_front_matter_length(*length, "object layer")?;
         let blob = source.read(*offset, *length)?;
         out.table = Some(rec::ObjectTable::parse(record_content(
             &blob,
@@ -707,11 +734,16 @@ pub fn read_objects<R: Readable + ?Sized>(
         )?)?);
     }
     for range in scene.object_track_ranges.values() {
+        // The same ceiling the table branch above applies. A track is front matter, so a
+        // crafted record_length must not size an allocation before anything has looked at
+        // the bytes — and the parse that would reject it only runs after the read.
+        check_front_matter_length(range.record_length, "object layer")?;
         let blob = source.read(range.record_offset, range.record_length)?;
-        out.tracks.push(rec::ObjectTrack::parse(record_content(
-            &blob,
-            op::OBJECT_TRACK,
-        )?)?);
+        // Section 5.15.7: a zero-sample track "has no pose and is read as absent".
+        let track = rec::ObjectTrack::parse(record_content(&blob, op::OBJECT_TRACK)?)?;
+        if track.sample_count() > 0 {
+            out.tracks.push(track);
+        }
     }
     out.check()?;
     Ok(out)

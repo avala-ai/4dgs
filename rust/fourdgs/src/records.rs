@@ -17,6 +17,40 @@ use crate::serialization::{
     put_u64, put_u8, Cursor,
 };
 
+/// The Euclidean norm of a quaternion, computed without squaring the components first.
+///
+/// A component near the top of the double range squares to infinity, so the naive sum
+/// reports an infinite norm for a rotation whose norm is finite and whose direction is
+/// perfectly good. Section 5.15.4 refuses "zero or non-finite norms" — that is a
+/// statement about the quaternion, not about the arithmetic used to measure it, and a
+/// reader that squares first refuses files the format allows. Dividing by the largest
+/// magnitude first makes the sum safe and leaves the direction untouched.
+pub(crate) fn quaternion_norm(q: &[f64]) -> f64 {
+    let scale = q.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    if !scale.is_finite() || scale == 0.0 {
+        // Left for the caller to refuse, with the message it words for its own record.
+        return scale;
+    }
+    scale
+        * q.iter()
+            .map(|v| (v / scale) * (v / scale))
+            .sum::<f64>()
+            .sqrt()
+}
+
+/// The most samples one trajectory or object track may declare.
+///
+/// The byte check beside each use refuses a count the record cannot hold; this bounds
+/// what a single *legal* record may ask a reader to allocate. Sized to stay under the
+/// 64 MiB front-matter range cap the indexed readers enforce: at 64 bytes a sample this
+/// is 64 MB of samples, leaving room for the name, the count and the framing. `1 << 20`
+/// would have been 64 MiB of samples exactly, so a trajectory at the ceiling would parse
+/// streamed and be refused indexed — the same file, two answers from one SDK. Shared
+/// with the other SDKs by value: a ceiling only some implementations have is a
+/// conformance split, and a record between the two limits would decode there and be
+/// refused here.
+pub const MAX_TRAJECTORY_SAMPLES: usize = 1_000_000;
+
 pub const FLAG_HAS_AUDIO: u8 = 1 << 0;
 pub const FLAG_CHUNKS_COMPRESSED: u8 = 1 << 1;
 pub const AUDIO_SOURCE_SPATIAL: u8 = 1 << 0;
@@ -1281,7 +1315,7 @@ impl SensorCalibration {
             finite(&format!("translation[{i}]"), *v)?;
         }
 
-        let norm = self.rotation.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let norm = quaternion_norm(&self.rotation);
         if !norm.is_finite() || norm == 0.0 {
             return Err(Error::Malformed(format!(
                 "sensor {:?}: rotation quaternion has no direction (norm {norm})",
@@ -1379,6 +1413,13 @@ impl RigTrajectory {
             ..Default::default()
         };
         let count = c.u32()? as usize;
+        if count > MAX_TRAJECTORY_SAMPLES {
+            return Err(Error::Malformed(format!(
+                "trajectory {:?} declares {count} samples, past the {MAX_TRAJECTORY_SAMPLES} \
+                 ceiling",
+                trajectory.name
+            )));
+        }
         // Bounded like the other count-prefixed records: a crafted count must not size an
         // allocation before the bytes behind it have been shown to exist.
         trajectory.times.reserve(count.min(1 << 16));
@@ -1391,7 +1432,13 @@ impl RigTrajectory {
             let t = c.f64s(3)?;
             trajectory.translations.push([t[0], t[1], t[2]]);
         }
-        trajectory.check()?;
+        // Section 5.15.4: a trajectory with no samples "MUST be read as though the record
+        // were absent", so reading one refuses nothing — not even an interpolation byte
+        // outside the registry, which describes how to read samples it does not carry.
+        // `check` stays strict for the writer, which must not emit such a record.
+        if !trajectory.times.is_empty() {
+            trajectory.check()?;
+        }
         Ok(trajectory)
     }
 
@@ -1426,7 +1473,7 @@ impl RigTrajectory {
             }
         }
         for (i, q) in self.rotations.iter().enumerate() {
-            let norm = q.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let norm = quaternion_norm(q);
             if !norm.is_finite() || norm == 0.0 {
                 return Err(Error::Malformed(format!(
                     "trajectory {:?}: sample {i} rotation has no direction (norm {norm})",
@@ -1697,6 +1744,13 @@ impl ObjectTrack {
                 c.remaining()
             )));
         }
+        if count > MAX_TRAJECTORY_SAMPLES {
+            return Err(Error::Malformed(format!(
+                "track for object {} declares {count} samples, past the \
+                 {MAX_TRAJECTORY_SAMPLES} ceiling",
+                track.object_id
+            )));
+        }
         track.times.reserve(count);
         track.rotations.reserve(count);
         track.translations.reserve(count);
@@ -1707,7 +1761,19 @@ impl ObjectTrack {
             let t = c.f64s(3)?;
             track.translations.push([t[0], t[1], t[2]]);
         }
-        track.check()?;
+        // Section 5.15.7: a zero-sample track "has no pose and is read as absent", so
+        // reading one refuses nothing about its pose. The id is not part of the pose —
+        // the same section requires every track to refuse object 0 — so that rule holds
+        // for an absent track too, and the rest waits for the writer's own `check`.
+        if !track.times.is_empty() {
+            track.check()?;
+        } else if track.object_id == 0 {
+            return Err(Error::Malformed(
+                "an ObjectTrack names object 0, which is background/unassigned; a track \
+                 needs an object to move (section 5.15.6)"
+                    .to_string(),
+            ));
+        }
         Ok(track)
     }
 
@@ -1759,7 +1825,7 @@ impl ObjectTrack {
             }
         }
         for (i, q) in self.rotations.iter().enumerate() {
-            let norm = q.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let norm = quaternion_norm(q);
             if !norm.is_finite() || norm == 0.0 {
                 return Err(Error::Malformed(format!(
                     "track for object {}: sample {i} rotation has no direction (norm {norm})",

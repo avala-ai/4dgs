@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use fourdgs::chunk::DecodedChunk;
 use fourdgs::codec;
-use fourdgs::object_layer::ObjectLayer;
+use fourdgs::object_layer::{state_at_with_objects, ObjectLayer};
 use fourdgs::opcode as op;
 use fourdgs::quantization::Steps;
 use fourdgs::readable::BytesReadable;
@@ -1065,4 +1065,53 @@ fn composition_scales_with_objects_plus_gaussians_and_preserves_membership() {
     for (row, object_id) in object_ids.iter().enumerate() {
         assert_eq!(centers[row * 3], *object_id as f32);
     }
+}
+
+#[test]
+fn the_composed_state_path_applies_tracks_the_base_path_leaves_alone() {
+    // `state_at` is the base temporal state and is the right answer for a scene with no
+    // object layer. For one with tracks it returns the gaussians of a moving object at
+    // their rest centres, which is why the composed entry point exists rather than
+    // leaving every caller to remember `ObjectLayer::apply`.
+    let track = ObjectTrack {
+        object_id: 7,
+        interpolation: 0,
+        times: vec![0.0, 4.0],
+        rotations: vec![[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]],
+        translations: vec![[0.0; 3], [4.0, 0.0, 0.0]],
+    };
+    let layer = ObjectLayer {
+        table: None,
+        tracks: vec![track],
+    };
+
+    let gaussians = fourdgs::model::GaussianSet {
+        positions: vec![1.0, 0.0, 0.0],
+        scales: vec![1.0, 1.0, 1.0],
+        rotations: vec![0.0, 0.0, 0.0, 1.0],
+        colors: vec![1.0, 1.0, 1.0, 1.0],
+        motions: vec![0.0, 0.0, 0.0],
+        mu_t: vec![2.0],
+        sigma_t: vec![f32::INFINITY],
+        win_lo: vec![0.0],
+        win_hi: vec![10.0],
+        object_id: Some(vec![7]),
+        ..Default::default()
+    };
+
+    let base = gaussians.state_at(2.0, 0.05);
+    assert!(
+        (base.centers[0] - 1.0).abs() < 1e-6,
+        "base leaves the centre alone"
+    );
+
+    let composed = state_at_with_objects(&gaussians, Some(&layer), 2.0, 0.05).expect("composes");
+    assert!(
+        (composed.centers[0] - 3.0).abs() < 1e-6,
+        "composed moves it"
+    );
+
+    // No layer is the base state unchanged.
+    let none = state_at_with_objects(&gaussians, None, 2.0, 0.05).expect("no layer is fine");
+    assert!((none.centers[0] - 1.0).abs() < 1e-6);
 }

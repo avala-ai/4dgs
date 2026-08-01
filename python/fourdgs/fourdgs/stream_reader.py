@@ -141,6 +141,17 @@ def decode_streams(
     got: dict[int, np.ndarray] = {}
     while cursor.remaining() > 0:
         attribute_id, values = decode_stream(cursor)
+        # The format defines one stream per attribute, so a second is a chunk that cannot
+        # say which stream defines its gaussians. Overwriting resolved it silently — and
+        # differently per SDK: this reader, Rust and TypeScript kept the last stream while
+        # Dart kept the first, so one malformed chunk decoded to two memberships. It is
+        # the duplicate-name failure section 5.15.2 refuses for records, spelled with
+        # attribute ids.
+        if attribute_id in got:
+            raise MalformedFile(
+                f"a chunk carries attribute {attribute_id} twice; the format defines one stream per attribute",
+                code="duplicate-attribute-stream",
+            )
         got[attribute_id] = values
 
     missing = [a for a in op.REQUIRED_ATTRIBUTES if a not in got]
@@ -321,6 +332,7 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
     scene = Scene(header=None, gaussians=None, duration_sec=0.0)  # type: ignore[arg-type]
     skipped: list[int] = []
     truncated = False
+    saw_footer = False
     audio_descriptors: dict[int, rec.AudioSource] = {}
     audio_payloads: dict[int, bytes] = {}
     legacy_audio: rec.Audio | None = None
@@ -407,7 +419,12 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
             elif record.opcode == op.SENSOR_CALIBRATION:
                 scene.provenance.sensors.append(rec.SensorCalibration.parse(record.content))
             elif record.opcode == op.RIG_TRAJECTORY:
-                scene.provenance.trajectories.append(rec.RigTrajectory.parse(record.content))
+                # Section 5.15.4: a trajectory with no samples "MUST be read as though
+                # the record were absent". Reporting it would put a rig in the summary
+                # that carries no pose and that no sensor may reference.
+                _trajectory = rec.RigTrajectory.parse(record.content)
+                if _trajectory.sample_count > 0:
+                    scene.provenance.trajectories.append(_trajectory)
             elif record.opcode == op.GEODETIC_ANCHOR:
                 scene.provenance.anchors.append(rec.GeodeticAnchor.parse(record.content))
             elif record.opcode == op.OBJECT_TABLE:
@@ -419,7 +436,12 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
                     )
                 scene.objects.table = rec.ObjectTable.parse(record.content)
             elif record.opcode == op.OBJECT_TRACK:
-                scene.objects.tracks.append(rec.ObjectTrack.parse(record.content))
+                # Section 5.15.7: a zero-sample track "has no pose and is read as absent".
+                # Keeping it would make one empty track a non-empty object layer, and two
+                # empty tracks for an id a duplicate the layer refuses.
+                track = rec.ObjectTrack.parse(record.content)
+                if track.sample_count > 0:
+                    scene.objects.tracks.append(track)
             elif record.opcode == op.STATISTICS:
                 scene.statistics = rec.Statistics.parse(record.content)
             elif record.opcode == op.CHUNK_INDEX:
@@ -427,6 +449,7 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
             elif record.opcode == op.SUMMARY_OFFSET:
                 scene.summary_offsets.append(rec.SummaryOffset.parse(record.content))
             elif record.opcode == op.FOOTER:
+                saw_footer = True
                 footer = rec.Footer.parse(record.content)
                 if footer.summary_start and footer.summary_crc:
                     summary = data[footer.summary_start : record.offset]
@@ -452,11 +475,16 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
 
     # The cross-record rules — unique sensor names, a rig reference that resolves —
     # can only run once the whole front matter has gone past. A truncated file may
-    # legitimately be missing the trajectory a sensor names, so this is skipped there:
-    # the recovery contract is that everything complete before the cut still stands.
-    if not truncated:
-        scene.provenance.check()
-        scene.objects.check()
+    # legitimately be missing the trajectory a sensor names, so those reference rules are
+    # deferred there — but the recovery contract is that everything complete before the
+    # cut still stands, and a duplicate name among complete records is exactly that: no
+    # later byte can repair it, so it is refused whether or not the file was cut.
+    # A cut file defers only what a later record could still have supplied. If a Footer
+    # went past, the record stream is complete — the Footer is the last record a file
+    # carries — so a missing rig or frame is missing for good and refusing it is right,
+    # even though the trailing magic never arrived.
+    scene.provenance.check(truncated=truncated and not saw_footer)
+    scene.objects.check()
 
     scene.header = header
     scene.quantization = quant

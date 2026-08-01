@@ -121,6 +121,10 @@ Result<std::vector<std::uint8_t>> encodeScene(const GaussianView& gaussians, dou
 Result<std::string> peekTemporalModel(Span<const std::uint8_t> bytes);
 Result<std::string> keyframeDeltaStatesJson(Span<const std::uint8_t> bytes, bool indexed);
 
+/// Canonical provenance JSON for an opened scene (spec §5.15). Empty when the file carries
+/// none — the binding should omit the key rather than emit null.
+Result<std::string> provenanceJson(Handle& handle);
+
 /// Release. Both are safe on a handle that never opened, and on a null one.
 void closeScene(Handle& handle) noexcept;
 void closeState(StateHandle& state) noexcept;

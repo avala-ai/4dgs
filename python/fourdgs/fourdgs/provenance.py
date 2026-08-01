@@ -27,6 +27,7 @@ from typing import Protocol
 from .exceptions import MalformedFile
 from .records import (
     POSE_TO_RIG,
+    POSE_TO_SCENE,
     TRAJECTORY_STEP,
     CoordinateFrame,
     GeodeticAnchor,
@@ -122,10 +123,18 @@ def _quaternion_multiply(a, b) -> tuple[float, float, float, float]:
 
 
 def _normalize(q) -> tuple[float, float, float, float]:
-    norm = math.sqrt(sum(float(v) * float(v) for v in q))
+    # Scaled before squaring: a component near the top of the double range squares to
+    # infinity, so the naive norm refuses a quaternion that has a perfectly good
+    # direction and that every other reader renormalizes. Dividing by the largest
+    # magnitude first makes the sum safe and leaves the direction untouched.
+    scale = max(abs(float(v)) for v in q)
+    if not math.isfinite(scale) or scale == 0.0:
+        raise MalformedFile(f"a quaternion with scale {scale} has no direction")
+    scaled = [float(v) / scale for v in q]
+    norm = math.sqrt(sum(v * v for v in scaled))
     if not math.isfinite(norm) or norm == 0.0:
         raise MalformedFile(f"a quaternion with norm {norm} has no direction")
-    return tuple(float(v) / norm for v in q)  # type: ignore[return-value]
+    return tuple(v / norm for v in scaled)  # type: ignore[return-value]
 
 
 def slerp(a, b, u: float) -> tuple[float, float, float, float]:
@@ -287,8 +296,13 @@ class Provenance:
         rig = pose_at(trajectory, t)
         return extrinsic if rig is None else rig.compose(extrinsic)
 
-    def check(self) -> None:
+    def check(self, *, truncated: bool = False) -> None:
         """The rules no single record can enforce on its own.
+
+        `truncated` defers only the rules a later record could still satisfy: a sensor
+        naming a rig, an anchor naming a frame. A duplicate name among records that are
+        already complete is not one of them — no byte after the cut can make two
+        `SensorCalibration` records with one name unambiguous — so those still refuse.
 
         Both are refusals rather than repairs, for the reason section 5.4 gives about
         window indices. A duplicate sensor name makes every reference to that name a
@@ -311,7 +325,28 @@ class Provenance:
                     )
                 seen.add(name)
 
-        rigs = {t.name for t in self.trajectories}
+        # A zero-sample trajectory "MUST be read as though the record were absent"
+        # (section 5.15.4), so a rig-relative sensor naming one names a rig this file
+        # does not carry — the same refusal, reached one step later. Composing it as
+        # identity instead would place every sensor on that rig at the rig origin:
+        # plausible, wrong, and silent.
+        # The registry defines two pose references and no more. An unrecognized value
+        # is not a future extension a reader may ignore: it says the extrinsic maps into
+        # some frame this build cannot name, and treating it as scene-relative puts the
+        # sensor somewhere plausible and wrong.
+        for sensor in self.sensors:
+            if sensor.pose_reference not in (POSE_TO_SCENE, POSE_TO_RIG):
+                raise MalformedFile(
+                    f"sensor {sensor.name!r} declares pose_reference "
+                    f"{sensor.pose_reference}; the registry defines 0 (scene) and 1 (rig)"
+                )
+
+        # Past here the rules resolve a reference into another record. A file cut before
+        # that record arrived is missing the target rather than contradicting itself.
+        if truncated:
+            return
+
+        rigs = {t.name for t in self.trajectories if t.sample_count > 0}
         for sensor in self.sensors:
             if sensor.pose_reference == POSE_TO_RIG and sensor.rig_name not in rigs:
                 raise MalformedFile(

@@ -35,6 +35,7 @@ export 'src/indexed_reader.dart';
 export 'src/keyframe_delta.dart';
 export 'src/model.dart';
 export 'src/opcode.dart';
+export 'src/provenance.dart';
 export 'src/quantization.dart';
 export 'src/readable.dart';
 export 'src/records.dart';

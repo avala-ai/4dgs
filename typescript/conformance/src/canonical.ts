@@ -30,6 +30,7 @@ import {
   Crc32,
   audioSourceStateAt,
   crc32,
+  poseAt,
   type Attachment,
   type AudioSource,
   type AudioSourceDescriptor,
@@ -37,6 +38,8 @@ import {
   type GaussianSet,
   type Header,
   type Metadata,
+  type Pose,
+  type Provenance,
   type Statistics,
   type SummaryOffset,
 } from "@4dgs/core";
@@ -52,6 +55,9 @@ export const SAMPLE = 16;
 /** How many camera keyframes appear in full, so a long trajectory cannot bloat a summary. */
 export const CAMERA_KEYFRAMES = 4;
 export const AUDIO_KEYFRAMES = 4;
+
+/** How many rig trajectory samples appear in full. */
+export const RIG_SAMPLES = 4;
 
 /** A descriptor plus the digest computed while its payload streamed past. */
 export interface DigestedAudioSource extends AudioSourceDescriptor {
@@ -172,6 +178,11 @@ export interface SceneSummaryInput {
   readonly statistics?: Statistics | null;
   readonly summaryOffsets?: readonly SummaryOffset[];
   readonly summaryCrcOk?: boolean | null;
+  /**
+   * Provenance records. Omitted from the summary entirely when empty or absent — see
+   * the note in {@link summarize}.
+   */
+  readonly provenance?: Provenance | null;
 }
 
 /** The statement every implementation must agree on for a variant. */
@@ -243,6 +254,13 @@ export function summarize(input: SceneSummaryInput): unknown {
       groupLength: String(s.groupLength),
     })),
     summaryCrcOk: input.summaryCrcOk ?? null,
+    // Omitted entirely when the file carries no provenance, which is deliberate and
+    // is NOT the `audioSources` convention above. A file without provenance is
+    // byte-identical to what it was before the family existed; emitting
+    // `"provenance": null` would change every pre-existing expectation.
+    ...(input.provenance != null && !input.provenance.isEmpty
+      ? { provenance: summarizeProvenance(input.provenance) }
+      : {}),
     sh: summarizeSh(gaussians, order),
     sample: {
       positions: rows(gaussians.positions, 3),
@@ -262,6 +280,109 @@ export function summarize(input: SceneSummaryInput): unknown {
       zeroMotionCount: String(still),
     },
   };
+}
+
+/**
+ * Every readable provenance field, plus the arithmetic the fields imply.
+ *
+ * The fields alone would not be enough: two implementations can agree on every stored
+ * quaternion and still disagree about the pose halfway between two of them, because
+ * slerp has a sign convention and clamping has an edge. So the summary carries the
+ * interpolated poses as well as the samples.
+ */
+function summarizeProvenance(prov: Provenance): unknown {
+  const trajectories = prov.trajectories.map((t) => {
+    const probes = probeTimes(t);
+    return {
+      name: t.name,
+      interpolation: t.interpolation,
+      sampleCount: String(t.times.length),
+      samples: t.times.slice(0, RIG_SAMPLES).map((time, i) => ({
+        time: num(time),
+        rotation: t.rotations[i]!.map((v) => num(v)),
+        translation: t.translations[i]!.map((v) => num(v)),
+      })),
+      posesAt: probes.map((probe) => poseRow(probe, poseAt(t, probe))),
+    };
+  });
+
+  return {
+    frames: prov.frames.map((f) => ({
+      name: f.name,
+      handedness: f.handedness,
+      upAxis: f.upAxis,
+      forwardAxis: f.forwardAxis,
+      lengthUnit: f.lengthUnit,
+      metresPerUnit: num(f.metresPerUnit),
+      // The resolution rule, per frame: a consumer handed a file whose two unit fields
+      // disagree still has to produce one number, and this is it.
+      metresPerUnitResolved: num(prov.metresPerUnit(f.name)),
+    })),
+    anchors: prov.anchors.map((a) => ({
+      frameName: a.frameName,
+      latitudeDeg: num(a.latitudeDeg),
+      longitudeDeg: num(a.longitudeDeg),
+      altitudeM: num(a.altitudeM),
+      headingDeg: num(a.headingDeg),
+    })),
+    sensors: prov.sensors.map((s) => ({
+      name: s.name,
+      modality: s.modality,
+      cameraModel: s.cameraModel,
+      widthPx: String(s.widthPx),
+      heightPx: String(s.heightPx),
+      fx: num(s.fx),
+      fy: num(s.fy),
+      cx: num(s.cx),
+      cy: num(s.cy),
+      distortion: s.distortion.map((v) => num(v)),
+      rotation: s.rotation.map((v) => num(v)),
+      translation: s.translation.map((v) => num(v)),
+      poseReference: s.poseReference,
+      rigName: s.rigName,
+    })),
+    trajectories,
+    // The composition rule, which is the one thing here no single record states and
+    // every consumer of a moving rig depends on.
+    sensorPosesAt: prov.sensors.map((s) => {
+      const probe = sensorProbeTime(prov, s.rigName);
+      return poseRow(probe, prov.sensorPoseAt(s.name, probe), s.name);
+    }),
+  };
+}
+
+/** Times a summary evaluates a trajectory at, derived from the trajectory itself. */
+function probeTimes(trajectory: { readonly times: readonly number[] }): number[] {
+  if (trajectory.times.length === 0) return [];
+  const first = trajectory.times[0]!;
+  const last = trajectory.times[trajectory.times.length - 1]!;
+  return [first - 0.5, first, first / 2 + last / 2, last, last + 0.5];
+}
+
+/** When to evaluate a sensor's scene pose: the midpoint of the rig it rides. */
+function sensorProbeTime(prov: Provenance, rigName: string): number {
+  // The empty string is a legal trajectory name — the default capture rig — and
+  // `sensorPoseAt` resolves it, so skipping the lookup summarized a moving unnamed rig
+  // at t=0 and never exercised its composed pose.
+  const trajectory = prov.trajectory(rigName);
+  if (trajectory === null || trajectory.times.length === 0) return 0;
+  // Halved separately, like the trajectory probes: `first + (last - first) * 0.5`
+  // overflows when the two times straddle zero, and `0.5 * (first + last)` overflows
+  // when they are large and same-signed. Neither form survives both.
+  return trajectory.times[0]! / 2 + trajectory.times[trajectory.times.length - 1]! / 2;
+}
+
+function poseRow(t: number, pose: Pose | null, sensor?: string): unknown {
+  const row: Record<string, unknown> = { time: num(t) };
+  if (sensor !== undefined) row.sensor = sensor;
+  if (pose === null) {
+    row.rotation = null;
+    row.translation = null;
+    return row;
+  }
+  row.rotation = pose.rotation.map((v) => num(v));
+  row.translation = pose.translation.map((v) => num(v));
+  return row;
 }
 
 function summarizeAudioSource(source: CanonicalAudioSource, sampleTime: number): unknown {

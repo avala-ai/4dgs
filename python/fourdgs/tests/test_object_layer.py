@@ -523,3 +523,80 @@ def test_a_file_with_no_objects_is_unchanged():
 def _content(encoded: bytes) -> memoryview:
     """Strip the 1-byte opcode and 8-byte length framing, returning the record content."""
     return memoryview(encoded)[9:]
+
+
+def test_the_composed_state_path_applies_tracks_the_base_path_leaves_alone():
+    """`state_at` is the base temporal state; a scene with tracks needs composition.
+
+    The base path is the right answer for a scene with no layer and the wrong one for
+    a scene with tracks — the gaussians of a moving object come back at their rest
+    centres — which is why the composed entry point exists rather than leaving every
+    caller to remember `ObjectLayer.apply`.
+    """
+    track = rec.ObjectTrack(
+        object_id=7,
+        times=[0.0, 4.0],
+        rotations=[[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]],
+        translations=[[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]],
+    )
+    layer = fourdgs.ObjectLayer(tracks=[track])
+
+    class _Gaussians:
+        def state_at(self, t, cutoff=0.05):
+            return {
+                "centers": np.array([[1.0, 0.0, 0.0]]),
+                "orientations": np.array([[0.0, 0.0, 0.0, 1.0]]),
+                "object_id": np.array([7]),
+            }
+
+    gaussians = _Gaussians()
+    assert gaussians.state_at(2.0)["centers"][0][0] == 1.0
+
+    composed = fourdgs.state_at_with_objects(gaussians, layer, 2.0)
+    assert composed["centers"][0][0] == pytest.approx(3.0)
+
+    # No layer, or an empty one, is the base state unchanged.
+    assert fourdgs.state_at_with_objects(gaussians, None, 2.0)["centers"][0][0] == 1.0
+    assert fourdgs.state_at_with_objects(gaussians, fourdgs.ObjectLayer(), 2.0)["centers"][0][0] == 1.0
+
+
+def test_an_object_table_vector_of_the_wrong_width_is_refused():
+    """The wire record carries f32[3] for the anchor and each dynamics vector.
+
+    Rust cannot express a shorter one — its fields are `[f32; 3]` — and the parser
+    always builds three, so this is the writer's path: a caller handing over two
+    coordinates would have every value in them checked and accepted.
+    """
+    entry = rec.ObjectTableEntry(object_id=1, label="", anchor=[1.0, 2.0], dynamics=None, embedding=None)
+    with pytest.raises(fourdgs.MalformedFile) as caught:
+        rec.ObjectTable(embedding_dim=0, entries=[entry]).check()
+    assert caught.value.code == "invalid-object-anchor-shape"
+
+    short = rec.ObjectTableEntry(
+        object_id=1,
+        label="",
+        anchor=[0.0, 0.0, 0.0],
+        dynamics=([0.0, 0.0], [0.0] * 3, [0.0] * 3),
+        embedding=None,
+    )
+    with pytest.raises(fourdgs.MalformedFile) as caught:
+        rec.ObjectTable(embedding_dim=0, entries=[short]).check()
+    assert caught.value.code == "invalid-object-dynamics-shape"
+
+
+def test_a_dynamics_tuple_of_the_wrong_length_is_a_malformed_file():
+    """Three vectors when the flag is set — and a bad count is a file error, not a TypeError.
+
+    `zip(..., strict=True)` would notice, but as a raw ValueError: the wrong error
+    class for a bad file, naming neither the object nor the field.
+    """
+    entry = rec.ObjectTableEntry(
+        object_id=1,
+        label="",
+        anchor=[0.0, 0.0, 0.0],
+        dynamics=([0.0] * 3, [0.0] * 3),
+        embedding=None,
+    )
+    with pytest.raises(fourdgs.MalformedFile) as caught:
+        rec.ObjectTable(embedding_dim=0, entries=[entry]).check()
+    assert caught.value.code == "invalid-object-dynamics-shape"

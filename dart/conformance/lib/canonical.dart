@@ -36,6 +36,10 @@ const int sampleSize = 16;
 const int cameraKeyframes = 4;
 const int audioKeyframes = 4;
 
+/// The same cap for a rig trajectory, which is unbounded for the same reason and
+/// worse: a ten-minute capture at 100 Hz is sixty thousand samples.
+const int rigSamples = 4;
+
 /// Rounds for comparison; a non-finite value becomes `null`, which is the only
 /// thing JSON can say about one.
 double? num6(double? value) {
@@ -77,6 +81,7 @@ Map<String, Object?> summarize({
   FourdgsStatistics? statistics,
   List<FourdgsSummaryOffset> summaryOffsets = const <FourdgsSummaryOffset>[],
   bool? summaryCrcOk,
+  FourdgsProvenance? provenance,
 }) {
   final order = _stableOrder(gaussians);
   final sample = order.take(sampleSize).toList();
@@ -107,7 +112,7 @@ Map<String, Object?> summarize({
     for (final i in sample) num6(array[i]),
   ];
 
-  return <String, Object?>{
+  final out = <String, Object?>{
     'gaussianCount': gaussians.count.toString(),
     'durationSec': num6(header.durationSec),
     'cutoff': num6(header.cutoff),
@@ -185,6 +190,15 @@ Map<String, Object?> summarize({
       'zeroMotionCount': zeroMotion.toString(),
     },
   };
+
+  // Omitted entirely when the file carries no provenance, which is deliberate
+  // and is NOT the `audioSources` convention above. Absence here is the section
+  // not applying; variants without it are the assertion that a file without
+  // provenance is unchanged by the family existing.
+  if (provenance != null && !provenance.isEmpty) {
+    out['provenance'] = _provenance(provenance);
+  }
+  return out;
 }
 
 Map<String, Object?> _audioSource(
@@ -247,6 +261,144 @@ Map<String, Object?> _camera(FourdgsCameraTrajectory camera) =>
       'interpolation': camera.interpolation,
       'loop': camera.loop,
     };
+
+/// Every readable provenance field, plus the arithmetic the fields imply.
+///
+/// The fields alone would not be enough: two implementations can agree on every
+/// stored quaternion and still disagree about the pose halfway between two of
+/// them, because slerp has a sign convention and clamping has an edge. So the
+/// summary carries the interpolated poses as well as the samples, at probe times
+/// derived from the decoded data alone, including one before the first sample
+/// and one after the last.
+Map<String, Object?> _provenance(FourdgsProvenance prov) {
+  final trajectories = <Object?>[];
+  for (final t in prov.trajectories) {
+    final probes = _probeTimes(t);
+    trajectories.add(<String, Object?>{
+      'name': t.name,
+      'interpolation': t.interpolation,
+      'sampleCount': t.sampleCount.toString(),
+      'samples': <Object?>[
+        for (int i = 0; i < t.sampleCount && i < rigSamples; i++)
+          <String, Object?>{
+            'time': num6(t.times[i]),
+            'rotation': <Object?>[for (final v in t.rotations[i]) num6(v)],
+            'translation': <Object?>[
+              for (final v in t.translations[i]) num6(v),
+            ],
+          },
+      ],
+      'posesAt': <Object?>[
+        for (final probe in probes) _poseRow(probe, fourdgsRigPoseAt(t, probe)),
+      ],
+    });
+  }
+
+  return <String, Object?>{
+    'frames': <Object?>[
+      for (final f in prov.frames)
+        <String, Object?>{
+          'name': f.name,
+          'handedness': f.handedness,
+          'upAxis': f.upAxis,
+          'forwardAxis': f.forwardAxis,
+          'lengthUnit': f.lengthUnit,
+          'metresPerUnit': num6(f.metresPerUnit),
+          // The resolution rule, per frame: a consumer handed a file whose two
+          // unit fields disagree still has to produce one number, and this is it.
+          'metresPerUnitResolved': num6(prov.metresPerUnit(f.name)),
+        },
+    ],
+    'anchors': <Object?>[
+      for (final a in prov.anchors)
+        <String, Object?>{
+          'frameName': a.frameName,
+          'latitudeDeg': num6(a.latitudeDeg),
+          'longitudeDeg': num6(a.longitudeDeg),
+          'altitudeM': num6(a.altitudeM),
+          'headingDeg': num6(a.headingDeg),
+        },
+    ],
+    'sensors': <Object?>[
+      for (final s in prov.sensors)
+        <String, Object?>{
+          'name': s.name,
+          'modality': s.modality,
+          'cameraModel': s.cameraModel,
+          'widthPx': s.widthPx.toString(),
+          'heightPx': s.heightPx.toString(),
+          'fx': num6(s.fx),
+          'fy': num6(s.fy),
+          'cx': num6(s.cx),
+          'cy': num6(s.cy),
+          'distortion': <Object?>[for (final v in s.distortion) num6(v)],
+          'rotation': <Object?>[for (final v in s.rotation) num6(v)],
+          'translation': <Object?>[for (final v in s.translation) num6(v)],
+          'poseReference': s.poseReference,
+          'rigName': s.rigName,
+        },
+    ],
+    'trajectories': trajectories,
+    // The composition rule, which is the one thing here no single record states
+    // and every consumer of a moving rig depends on.
+    'sensorPosesAt': <Object?>[
+      for (final s in prov.sensors) _sensorPoseRow(prov, s),
+    ],
+  };
+}
+
+Map<String, Object?> _sensorPoseRow(
+  FourdgsProvenance prov,
+  FourdgsSensorCalibration sensor,
+) {
+  final probe = _sensorProbeTime(prov, sensor);
+  return _poseRow(
+    probe,
+    prov.sensorPoseAt(sensor.name, probe),
+    sensor: sensor.name,
+  );
+}
+
+/// Times a summary evaluates a trajectory at, derived from the trajectory itself.
+///
+/// Two of the five are outside the sample range on purpose: clamping is a rule,
+/// and a rule no expectation exercises is a rule an implementation can decline
+/// to have.
+List<double> _probeTimes(FourdgsRigTrajectory trajectory) {
+  if (trajectory.sampleCount == 0) return const <double>[];
+  final first = trajectory.times.first;
+  final last = trajectory.times.last;
+  return <double>[first - 0.5, first, first / 2 + last / 2, last, last + 0.5];
+}
+
+/// When to evaluate a sensor's scene pose: the midpoint of the rig it rides.
+double _sensorProbeTime(
+  FourdgsProvenance prov,
+  FourdgsSensorCalibration sensor,
+) {
+  // The empty string is a legal trajectory name — the default capture rig — and
+  // `sensorPoseAt` resolves it, so skipping the lookup summarized a moving
+  // unnamed rig at t=0 and never exercised its composed pose.
+  final trajectory = prov.trajectory(sensor.rigName);
+  if (trajectory == null || trajectory.sampleCount == 0) return 0.0;
+  // Halved separately, like the trajectory probes: `first + (last - first) * 0.5`
+  // overflows when the two times straddle zero, and `0.5 * (first + last)`
+  // overflows when they are large and same-signed. Neither form survives both.
+  return trajectory.times.first / 2 + trajectory.times.last / 2;
+}
+
+Map<String, Object?> _poseRow(double t, FourdgsPose? pose, {String? sensor}) {
+  final row = <String, Object?>{'time': num6(t)};
+  if (sensor != null) row['sensor'] = sensor;
+  if (pose == null) {
+    row['rotation'] = null;
+    row['translation'] = null;
+    return row;
+  }
+  row['rotation'] = <Object?>[for (final v in pose.rotation) num6(v)];
+  row['translation'] = <Object?>[for (final v in pose.translation) num6(v)];
+  return row;
+}
 
 /// Degree, width and a checksum of the coefficients in content order.
 ///

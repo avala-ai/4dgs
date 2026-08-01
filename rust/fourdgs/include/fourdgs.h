@@ -895,9 +895,24 @@ int fourdgs_keyframe_delta_states_json(const uint8_t *data, size_t length, int i
                                        const char **out, size_t *out_len);
 
 /**
- * Release a string owned by the caller — the result of fourdgs_peek_temporal_model or
- * fourdgs_keyframe_delta_states_json. Null is ignored. The length must be the one the
- * producing call returned; the pair identifies the same allocation.
+ * Canonical provenance JSON for the opened scene (spec §5.15), or an empty string when the
+ * file carries none.
+ *
+ * The object shape matches the shared conformance summary: frames, anchors, sensors,
+ * trajectories (with stored samples and `posesAt` probes), and `sensorPosesAt`. On the
+ * indexed path the records are fetched here if not already resident; on the sequential path
+ * they were read at open. An empty result is not an error — the binding should omit the
+ * `provenance` key rather than emit null. On success `out` owns a string freed with
+ * fourdgs_string_free. The two-out-parameter sequencing rule at the top of this header
+ * applies.
+ */
+int fourdgs_scene_provenance_json(fourdgs_scene *scene, const char **out, size_t *out_len);
+
+/**
+ * Release a string owned by the caller — the result of fourdgs_peek_temporal_model,
+ * fourdgs_keyframe_delta_states_json or fourdgs_scene_provenance_json. Null is ignored.
+ * The length must be the one the producing call returned; the pair identifies the same
+ * allocation.
  */
 void fourdgs_string_free(const char *data, size_t length);
 

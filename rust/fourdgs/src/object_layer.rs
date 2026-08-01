@@ -203,3 +203,38 @@ pub(crate) fn apply_poses(
     }
     Ok(())
 }
+
+/// Reconstructed state at `t` with the object layer composed onto it.
+///
+/// [`GaussianSet::state_at`] returns the base temporal state, which is the right answer
+/// for a scene with no object layer and the wrong one for a scene that has tracks: the
+/// gaussians of a moving object come back at their rest centres and orientations.
+/// Composition stays a separate step because the layer is additive and a consumer that
+/// only wants geometry should not pay for it — but leaving every caller to remember
+/// [`ObjectLayer::apply`] makes the default answer the wrong one.
+///
+/// A scene with no layer, or one whose gaussians carry no membership, returns the base
+/// state unchanged.
+pub fn state_at_with_objects(
+    gaussians: &crate::model::GaussianSet,
+    objects: Option<&ObjectLayer>,
+    t: f64,
+    cutoff: f64,
+) -> Result<crate::model::StateAt> {
+    let mut state = gaussians.state_at(t, cutoff);
+    let (Some(layer), Some(ids)) = (objects, gaussians.object_id.as_ref()) else {
+        return Ok(state);
+    };
+    if layer.is_empty() {
+        return Ok(state);
+    }
+    // `state_at` returns only the visible gaussians, so membership is gathered through
+    // the same indices rather than assumed to be aligned with the whole set.
+    let visible: Vec<u32> = state
+        .indices
+        .iter()
+        .map(|i| ids.get(*i as usize).copied().unwrap_or(BACKGROUND))
+        .collect();
+    layer.apply(&mut state.centers, &mut state.orientations, &visible, t)?;
+    Ok(state)
+}

@@ -398,15 +398,19 @@ def _probe_times(trajectory) -> list[float]:
     if trajectory.sample_count == 0:
         return []
     first, last = trajectory.times[0], trajectory.times[-1]
-    return [first - 0.5, first, 0.5 * (first + last), last, last + 0.5]
+    return [first - 0.5, first, first / 2 + last / 2, last, last + 0.5]
 
 
 def _sensor_probe_time(prov, sensor) -> float:
     """When to evaluate a sensor's scene pose: the midpoint of the rig it rides."""
-    trajectory = prov.trajectory(sensor.rig_name) if sensor.rig_name else None
+    # The empty string is a legal trajectory name — the default capture rig — and
+    # `sensor_pose_at` resolves it, so skipping the lookup summarized a moving unnamed
+    # rig at t=0 and never exercised its composed pose. Fall back to 0 only when the
+    # trajectory is genuinely absent or carries no samples.
+    trajectory = prov.trajectory(sensor.rig_name)
     if trajectory is None or trajectory.sample_count == 0:
         return 0.0
-    return 0.5 * (trajectory.times[0] + trajectory.times[-1])
+    return trajectory.times[0] / 2 + trajectory.times[-1] / 2
 
 
 def _pose_row(t: float, pose, sensor: str | None = None) -> dict:

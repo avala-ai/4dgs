@@ -122,6 +122,7 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
     let mut legacy_audio: Option<rec::Audio> = None;
     let mut first_audio_record: Option<(&'static str, u64, Option<u32>)> = None;
     let mut truncated = false;
+    let mut saw_footer = false;
 
     // The Footer's CRC covers `[summary_start, footer_start)`, and a front-to-back reader
     // does not learn where that starts until the very last record. So the trailing run of
@@ -313,10 +314,15 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
                 .provenance
                 .sensors
                 .push(rec::SensorCalibration::parse(&content)?),
-            op::RIG_TRAJECTORY => scene
-                .provenance
-                .trajectories
-                .push(rec::RigTrajectory::parse(&content)?),
+            op::RIG_TRAJECTORY => {
+                // Section 5.15.4: a trajectory with no samples "MUST be read as though
+                // the record were absent". Reporting it would put a rig in the summary
+                // that carries no pose and that no sensor may reference.
+                let trajectory = rec::RigTrajectory::parse(&content)?;
+                if trajectory.sample_count() > 0 {
+                    scene.provenance.trajectories.push(trajectory);
+                }
+            }
             op::GEODETIC_ANCHOR => scene
                 .provenance
                 .anchors
@@ -330,10 +336,15 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
                 }
                 scene.objects.table = Some(rec::ObjectTable::parse(&content)?);
             }
-            op::OBJECT_TRACK => scene
-                .objects
-                .tracks
-                .push(rec::ObjectTrack::parse(&content)?),
+            op::OBJECT_TRACK => {
+                // Section 5.15.7: a zero-sample track "has no pose and is read as
+                // absent". Keeping it would make one empty track a non-empty object
+                // layer, and two empty tracks for an id a duplicate the layer refuses.
+                let track = rec::ObjectTrack::parse(&content)?;
+                if track.sample_count() > 0 {
+                    scene.objects.tracks.push(track);
+                }
+            }
             op::STATISTICS => scene.statistics = Some(rec::Statistics::parse(&content)?),
             op::CHUNK_INDEX => scene
                 .chunk_index
@@ -342,6 +353,7 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
                 .summary_offsets
                 .push(rec::SummaryOffset::parse(&content)?),
             op::FOOTER => {
+                saw_footer = true;
                 let footer = rec::Footer::parse(&content)?;
                 if footer.summary_start != 0 && footer.summary_crc != 0 {
                     // Only claim a verdict when the retained bytes are exactly the range
@@ -387,12 +399,16 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
 
     // The cross-record rules — unique names, a rig reference and an anchor that resolve —
     // can only run once the whole front matter has gone past. A truncated file may
-    // legitimately be missing the trajectory a sensor names, so this is skipped there: the
-    // recovery contract is that everything complete before the cut still stands.
-    if !truncated {
-        scene.provenance.check()?;
-        scene.objects.check()?;
-    }
+    // legitimately be missing the trajectory a sensor names, so those reference rules are
+    // deferred there — but the recovery contract is that everything complete before the
+    // cut still stands, and a duplicate name among complete records is exactly that: no
+    // later byte can repair it, so it is refused whether or not the file was cut.
+    // A cut file defers only what a later record could still have supplied. If a Footer
+    // went past, the record stream is complete — the Footer is the last record a file
+    // carries — so a missing rig or frame is missing for good and refusing it is right,
+    // even though the trailing magic never arrived.
+    scene.provenance.check_with(truncated && !saw_footer)?;
+    scene.objects.check()?;
 
     if !header.has_audio()
         && (!audio_descriptors.is_empty() || !audio_payloads.is_empty() || legacy_audio.is_some())

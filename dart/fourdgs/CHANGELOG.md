@@ -39,10 +39,14 @@ happened.
 - Spherical harmonics on both read paths, bands 1 to 3, merged into whole scene-wide degrees. The
   indexed path fetches only the bands asked for, since each band is its own byte range in the chunk
   index.
+- Scene provenance (spec §5.15): Coordinate Frame, Sensor Calibration, Rig Trajectory and Geodetic
+  Anchor on both read paths. Streamed decode fills `FourdgsScene.provenance`; the indexed path
+  frames ranges at open and fetches them via `readFourdgsProvenance`. `FourdgsProvenance` carries
+  the cross-record rules (unique names, resolving rig and frame references) and the arithmetic the
+  records imply — shortest-arc slerp, clamped pose sampling, sensor-in-scene composition.
 - `conformance/`, building `decode_streamed` and `decode_indexed`, registered in
-  `tests/conformance/run.py` and skipped until built. 79 checks pass across both read paths — every
-  variant this SDK declares support for. It declines the five that carry provenance records and the
-  invalid corpus's refusal expectations, the same way TypeScript, C++ and Swift do.
+  `tests/conformance/run.py` and skipped until built. Both paths report provenance in the canonical
+  summary. The object-layer variants and the invalid corpus's refusal expectations are declined.
 - Tests for the one behaviour the corpus cannot reach: the indexed reader's front-matter scan runs
   to the first Chunk, so a Camera, Metadata or Attachment record sitting behind a large embedded
   audio track is still found. The harness only ever exercises the default 64 KiB probe on scenes

@@ -25,7 +25,8 @@ import {
 import { crc32, DEFAULT_CODECS, type CodecRegistry } from "./codec.js";
 import { MalformedFile } from "./errors.js";
 import { FrontMatterScanner } from "./frontMatter.js";
-import { Opcode } from "./opcodes.js";
+import { isProvenanceOpcode, Opcode } from "./opcodes.js";
+import { Provenance } from "./provenance.js";
 import { DEFAULT_CUTOFF, supportK } from "./quantization.js";
 import { checkQuantizationScheme, checkTemporalModel } from "./registry.js";
 import type { IReadable } from "./readable.js";
@@ -56,10 +57,14 @@ import {
   parseAttachment,
   parseCamera,
   parseChunkIndexEntry,
+  parseCoordinateFrame,
   parseFooter,
+  parseGeodeticAnchor,
   parseMetadata,
   parseHeader,
   parseQuantization,
+  parseRigTrajectory,
+  parseSensorCalibration,
   parseShBandRecord,
   parseStatistics,
   parseSummaryOffset,
@@ -86,6 +91,13 @@ const AUDIO_CODEC_PREFIX_BYTES = 4096;
 
 /** Where a record the reader has not parsed lives. */
 interface ByteRange {
+  readonly offset: number;
+  readonly length: number;
+}
+
+/** A provenance-family record framed during the front-matter walk (opcode + range). */
+interface ProvenanceRange {
+  readonly opcode: number;
   readonly offset: number;
   readonly length: number;
 }
@@ -144,6 +156,13 @@ export class IndexedDecoder {
       metadata: ByteRange[];
       attachments: ByteRange[];
     },
+    /**
+     * `(opcode, offset, length)` of every provenance-family record framed during the
+     * walk. Framed, not read: a Rig Trajectory is unbounded — a ten-minute capture
+     * logged at 100 Hz is sixty thousand samples — and a consumer that wants the
+     * gaussians should not pay for it.
+     */
+    private readonly provenanceRanges: readonly ProvenanceRange[],
     readonly statistics: Statistics | null,
     /** Whether the summary CRC matched, or `null` when the file declares none. */
     readonly summaryCrcOk: boolean | null,
@@ -174,6 +193,7 @@ export class IndexedDecoder {
         metadata: [],
         attachments: [],
       };
+    const provenanceRanges: ProvenanceRange[] = [];
     for await (const record of scanner.records(MAGIC.length)) {
       if (record.opcode === Opcode.Chunk) break;
       if (record.opcode === Opcode.Header) {
@@ -222,6 +242,15 @@ export class IndexedDecoder {
         deferred.metadata.push({ offset: record.offset, length: record.totalLength });
       } else if (record.opcode === Opcode.Attachment) {
         deferred.attachments.push({ offset: record.offset, length: record.totalLength });
+      } else if (isProvenanceOpcode(record.opcode)) {
+        // Framed, not read. Opening a file learns where provenance lives and stops: a
+        // long rig trajectory costs nothing to open, and reserved opcodes in the family
+        // (object layer, source timing) stay skippable by their length alone.
+        provenanceRanges.push({
+          opcode: record.opcode,
+          offset: record.offset,
+          length: record.totalLength,
+        });
       }
     }
     if (header === null || quantization === null) {
@@ -306,10 +335,51 @@ export class IndexedDecoder {
       summaryOffsets,
       audioSources,
       deferred,
+      provenanceRanges,
       statistics,
       summaryCrcOk,
       size,
     );
+  }
+
+  /**
+   * Every provenance record, by range, fetched only when a caller wants them.
+   *
+   * Opening a file frames these and stops, so a scene with a long rig trajectory costs
+   * the same to open as one with none. Object-layer and still-reserved opcodes in the
+   * same family are framed and skipped here — they belong to a different layer.
+   */
+  async readProvenance(): Promise<Provenance> {
+    const out = new Provenance();
+    for (const range of this.provenanceRanges) {
+      const { opcode } = range;
+      if (
+        opcode !== Opcode.CoordinateFrame &&
+        opcode !== Opcode.SensorCalibration &&
+        opcode !== Opcode.RigTrajectory &&
+        opcode !== Opcode.GeodeticAnchor
+      ) {
+        continue;
+      }
+      const content = await this.readRecordAt(
+        { offset: range.offset, length: range.length },
+        opcode,
+      );
+      if (opcode === Opcode.CoordinateFrame) out.frames.push(parseCoordinateFrame(content));
+      else if (opcode === Opcode.SensorCalibration) {
+        out.sensors.push(parseSensorCalibration(content));
+      } else if (opcode === Opcode.RigTrajectory) {
+        {
+          // Section 5.15.4: a trajectory with no samples is read as though absent.
+          const trajectory = parseRigTrajectory(content);
+          if (trajectory.times.length > 0) out.trajectories.push(trajectory);
+        }
+      } else {
+        out.anchors.push(parseGeodeticAnchor(content));
+      }
+    }
+    out.check();
+    return out;
   }
 
   /** The suggested camera trajectory, fetched only when a caller wants it. */

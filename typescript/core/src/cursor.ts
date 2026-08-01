@@ -109,10 +109,18 @@ export class Cursor {
     return out;
   }
 
-  /** `u32` byte length followed by that many UTF-8 bytes. Not NUL-terminated. */
+  /**
+   * `u32` byte length followed by that many UTF-8 bytes. Not NUL-terminated.
+   *
+   * The offset reported on failure is where the *bytes* start, not where the length
+   * prefix does: a reader that refuses a record says which byte is wrong (AGENTS.md
+   * §6), and pointing four bytes upstream at a length that decoded fine sends whoever
+   * is holding the file to the wrong place in it.
+   */
   string(): string {
+    const length = this.u32();
     const at = this.pos;
-    const raw = this.take(this.u32());
+    const raw = this.take(length);
     try {
       return textDecoder.decode(raw);
     } catch {

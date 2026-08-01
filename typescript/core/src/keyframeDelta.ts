@@ -375,6 +375,14 @@ async function decodeStreams(
   await Promise.all(
     framed.map(async (stream) => {
       const values = await decodeStream(stream, codecs);
+      // One stream per attribute here too: the regular chunk path refuses a second,
+      // and this path had its own loop that was still resolving it silently.
+      if (got.has(stream.attributeId)) {
+        throw new MalformedFile(
+          `a keyframe-delta group carries attribute ${stream.attributeId} twice; the format ` +
+            "defines one stream per attribute",
+        );
+      }
       got.set(stream.attributeId, { channels: stream.channels, values });
     }),
   );

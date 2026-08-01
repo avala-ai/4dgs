@@ -28,6 +28,29 @@ const int opDeltaChunk = 0x10;
 const int opAudioSource = 0x11;
 const int opAudioData = 0x12;
 
+// The provenance family, spec section 5.15. Assigned in dependency order: the
+// two records that carry poses come after the one that names the frame those
+// poses are in. GEODETIC_ANCHOR holds 0x23 because it was defined after them;
+// an opcode is not something a later revision gets to renumber for tidiness.
+const int opCoordinateFrame = 0x20;
+const int opSensorCalibration = 0x21;
+const int opRigTrajectory = 0x22;
+const int opGeodeticAnchor = 0x23;
+
+// The object layer (spec §5.15.6–5.15.7). Not decoded by this SDK yet; a
+// conforming reader steps over them by length.
+const int opObjectTable = 0x24;
+const int opObjectTrack = 0x25;
+
+/// First opcode of the provenance family, and one past its last. `0x26`–`0x2F`
+/// are reserved for source timing (spec section 5.15.6).
+const int opProvenanceStart = 0x20;
+const int opProvenanceEnd = 0x30;
+
+/// True for the provenance family, defined and reserved alike.
+bool isProvenanceOpcode(int opcode) =>
+    opcode >= opProvenanceStart && opcode < opProvenanceEnd;
+
 // Audio Source flags (spec §5.16).
 const int audioSourceFlagSpatial = 1 << 0;
 const int audioSourceFlagLoop = 1 << 1;

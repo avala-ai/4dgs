@@ -948,7 +948,7 @@ class SensorCalibration:
             if not math.isfinite(value):
                 raise MalformedFile(f"sensor {self.name!r}: {label} is {value}; every value must be finite")
 
-        norm = math.sqrt(sum(v * v for v in self.rotation))
+        norm = math.hypot(*self.rotation)
         if not math.isfinite(norm) or norm == 0.0:
             raise MalformedFile(f"sensor {self.name!r}: rotation quaternion has no direction (norm {norm})")
 
@@ -980,9 +980,22 @@ class SensorCalibration:
 
     def unit_rotation(self) -> list[float]:
         """The extrinsic quaternion, renormalized as section 6.4 renormalizes its own."""
-        norm = math.sqrt(sum(v * v for v in self.rotation))
+        norm = math.hypot(*self.rotation)
         return [v / norm for v in self.rotation]
 
+
+#: The most samples one trajectory or object track may declare.
+#:
+#: A count-prefixed record must not size an allocation before the bytes behind it are
+#: shown to exist; the byte check below does that, and this bounds what a single legal
+#: record can ask a reader to build. Sized to stay under the 64 MiB front-matter range
+#: cap the indexed readers enforce: at 64 bytes a sample this is 64 MB of samples,
+#: leaving room for the name, the count and the framing. `1 << 20` would have been 64
+#: MiB of samples exactly, so a trajectory at the ceiling would parse streamed and be
+#: refused indexed — the same file, two answers from one SDK. Shared with the other
+#: SDKs by value: a ceiling only one implementation has is a conformance split, and a
+#: record between the two limits would decode here and be refused there.
+MAX_TRAJECTORY_SAMPLES = 1_000_000
 
 TRAJECTORY_LINEAR = 0
 TRAJECTORY_STEP = 1
@@ -1017,11 +1030,21 @@ class RigTrajectory:
     def parse(content) -> RigTrajectory:
         c = Cursor(content)
         trajectory = RigTrajectory(name=c.string(), interpolation=c.u8())
-        for _ in range(c.u32()):
+        count = c.u32()
+        if count > MAX_TRAJECTORY_SAMPLES:
+            raise MalformedFile(
+                f"trajectory {trajectory.name!r} declares {count} samples, past the {MAX_TRAJECTORY_SAMPLES} ceiling"
+            )
+        for _ in range(count):
             trajectory.times.append(c.f64())
             trajectory.rotations.append(c.f64s(4))
             trajectory.translations.append(c.f64s(3))
-        trajectory.check()
+        # Section 5.15.4: a trajectory with no samples "MUST be read as though the record
+        # were absent", so reading one refuses nothing — not even an interpolation byte
+        # outside the registry, which describes how to read samples it does not carry.
+        # `check()` stays strict for the writer, which must not emit such a record.
+        if trajectory.sample_count:
+            trajectory.check()
         return trajectory
 
     def check(self) -> None:
@@ -1046,7 +1069,7 @@ class RigTrajectory:
                     f"at t={self.times[i - 1]}; times must strictly increase (section 5.15.4)"
                 )
         for i, quaternion in enumerate(self.rotations):
-            norm = math.sqrt(sum(v * v for v in quaternion))
+            norm = math.hypot(*quaternion)
             if not math.isfinite(norm) or norm == 0.0:
                 raise MalformedFile(f"trajectory {self.name!r}: sample {i} rotation has no direction (norm {norm})")
         for i, translation in enumerate(self.translations):
@@ -1172,10 +1195,34 @@ class ObjectTable:
                     code="duplicate-object-id",
                 )
             seen.add(e.object_id)
+            # The wire record carries f32[3] for each of these, so a shorter vector is a
+            # shape no conforming file can hold. Rust cannot express it — its fields are
+            # [f32; 3] — and the parser always builds three, but a caller constructing a
+            # table can hand over two and every value in it would be checked and accepted.
+            if len(e.anchor) != 3:
+                raise MalformedFile(
+                    f"object {e.object_id}: anchor has {len(e.anchor)} values, expected 3",
+                    code="invalid-object-anchor-shape",
+                )
             for k, value in enumerate(e.anchor):
                 _check_object_f32(value, f"object {e.object_id}: anchor[{k}]")
             if e.dynamics is not None:
+                # The record carries exactly three vectors when the dynamics flag is set.
+                # `strict=True` below would catch a different count, but as a raw
+                # ValueError — the wrong error class for a bad file, and one that names
+                # neither the object nor the field.
+                if len(e.dynamics) != 3:
+                    raise MalformedFile(
+                        f"object {e.object_id}: dynamics has {len(e.dynamics)} vectors, expected 3 "
+                        f"(velocity, angular_velocity, acceleration)",
+                        code="invalid-object-dynamics-shape",
+                    )
                 for name, vector in zip(("velocity", "angular_velocity", "acceleration"), e.dynamics, strict=True):
+                    if len(vector) != 3:
+                        raise MalformedFile(
+                            f"object {e.object_id}: {name} has {len(vector)} values, expected 3",
+                            code="invalid-object-dynamics-shape",
+                        )
                     for k, value in enumerate(vector):
                         _check_object_f32(value, f"object {e.object_id}: {name}[{k}]")
             if e.embedding is not None:
@@ -1246,11 +1293,29 @@ class ObjectTrack:
     def parse(content) -> ObjectTrack:
         c = Cursor(content)
         track = ObjectTrack(object_id=c.u32(), interpolation=c.u8())
-        for _ in range(c.u32()):
+        count = c.u32()
+        if count > MAX_TRAJECTORY_SAMPLES:
+            raise MalformedFile(
+                f"track for object {track.object_id} declares {count} samples, past the "
+                f"{MAX_TRAJECTORY_SAMPLES} ceiling",
+                code="trajectory-samples-past-ceiling",
+            )
+        for _ in range(count):
             track.times.append(c.f64())
             track.rotations.append(c.f64s(4))
             track.translations.append(c.f64s(3))
-        track.check()
+        # Section 5.15.7: a zero-sample track "has no pose and is read as absent", so
+        # reading one refuses nothing about its pose. The id is not part of the pose —
+        # the same section requires every track to refuse object 0 — so that rule holds
+        # for an absent track too, and the rest waits for the writer's own `check()`.
+        if track.sample_count:
+            track.check()
+        elif track.object_id == 0:
+            raise MalformedFile(
+                "an ObjectTrack names object 0, which is background/unassigned; a track needs an "
+                "object to move (section 5.15.7)",
+                code="track-names-background",
+            )
         return track
 
     def check(self) -> None:
@@ -1308,7 +1373,7 @@ class ObjectTrack:
                     f"track for object {self.object_id}: sample {i} rotation has {len(quaternion)} values, expected 4",
                     code="invalid-object-track-shape",
                 )
-            norm = math.sqrt(sum(v * v for v in quaternion))
+            norm = math.hypot(*quaternion)
             if not math.isfinite(norm) or norm == 0.0:
                 raise MalformedFile(
                     f"track for object {self.object_id}: sample {i} rotation has no direction (norm {norm})",

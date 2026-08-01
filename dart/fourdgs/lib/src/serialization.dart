@@ -163,7 +163,31 @@ class FourdgsCursor {
   }
 
   /// `u32` byte length then that many UTF-8 bytes. Not NUL-terminated.
-  String string() => utf8.decode(take(u32()));
+  ///
+  /// Invalid UTF-8 is a malformed file, not a `FormatException` from the
+  /// standard library: every string here — a sensor name, an object label, a
+  /// metadata key — is untrusted record bytes, and a caller decoding a hostile
+  /// file should not have to catch the exception type of whatever decoded it.
+  ///
+  /// The offset reported is where the bytes start, not where the length prefix
+  /// does, and the decoder's own offset names the byte inside them that failed:
+  /// a reader that refuses a record says which byte is wrong (AGENTS.md §6),
+  /// and pointing four bytes upstream at a length that decoded fine sends
+  /// whoever is holding the file to the wrong place in it.
+  String string() {
+    final length = u32();
+    final at = pos;
+    final raw = take(length);
+    try {
+      return utf8.decode(raw);
+    } on FormatException catch (error) {
+      final offset = error.offset;
+      final where = offset == null ? '' : ': byte ${at + offset}';
+      throw FourdgsMalformedFile(
+        'the string at offset $at is not valid UTF-8$where',
+      );
+    }
+  }
 
   /// `u64` byte length then that many bytes.
   Uint8List blob() => take(u64());

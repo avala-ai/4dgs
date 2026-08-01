@@ -380,6 +380,15 @@ Map<int, _Column> _decodeStreams(FourdgsCursor cursor) {
   while (cursor.remaining > 0) {
     final header = readStreamHeader(cursor);
     final stream = decodeAttributeStreamBody(cursor, header);
+    // One stream per attribute here too: the regular chunk path refuses a
+    // second, and this path had its own loop that was still resolving it
+    // silently.
+    if (got.containsKey(stream.attributeId)) {
+      throw FourdgsMalformedFile(
+        'a keyframe-delta group carries attribute ${stream.attributeId} twice; '
+        'the format defines one stream per attribute',
+      );
+    }
     got[stream.attributeId] = _Column(stream.channels, stream.values);
   }
   return got;

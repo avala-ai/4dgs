@@ -15,6 +15,7 @@ import 'chunk_decoder.dart';
 import 'exceptions.dart';
 import 'model.dart';
 import 'opcode.dart';
+import 'provenance.dart';
 import 'quantization.dart';
 import 'records.dart';
 import 'serialization.dart';
@@ -44,7 +45,8 @@ class FourdgsScene {
     this.camera,
     this.statistics,
     this.summaryCrcOk,
-  });
+    FourdgsProvenance? provenance,
+  }) : provenance = provenance ?? FourdgsProvenance();
 
   final FourdgsHeader header;
   final FourdgsQuantization quantization;
@@ -68,6 +70,12 @@ class FourdgsScene {
 
   /// True when the file ended mid-record and the decode stopped there.
   final bool truncated;
+
+  /// Every provenance record the file carried (spec section 5.15). Empty when
+  /// it carried none, which is the common case and not an error: absence costs
+  /// nothing and no Header flag announces the family, so this is filled by the
+  /// walk itself.
+  final FourdgsProvenance provenance;
 
   /// Compatibility view of the first source as a legacy track.
   ///
@@ -132,6 +140,8 @@ FourdgsScene readFourdgsBytes(
   FourdgsStatistics? statistics;
   bool? summaryCrcOk;
   bool truncated = false;
+  bool sawFooter = false;
+  final provenance = FourdgsProvenance();
 
   try {
     for (final record in iterRecords(data, fourdgsMagic.length)) {
@@ -245,6 +255,22 @@ FourdgsScene readFourdgsBytes(
           metadata.add(FourdgsMetadata.parse(record.content));
         case opAttachment:
           attachments.add(FourdgsAttachment.parse(record.content));
+        case opCoordinateFrame:
+          provenance.frames.add(FourdgsCoordinateFrame.parse(record.content));
+        case opSensorCalibration:
+          provenance.sensors.add(
+            FourdgsSensorCalibration.parse(record.content),
+          );
+        case opRigTrajectory:
+          // Section 5.15.4: a trajectory with no samples "MUST be read as though
+          // the record were absent". Reporting it would put a rig in the summary
+          // that carries no pose and that no sensor may reference.
+          final trajectory = FourdgsRigTrajectory.parse(record.content);
+          if (trajectory.sampleCount > 0) {
+            provenance.trajectories.add(trajectory);
+          }
+        case opGeodeticAnchor:
+          provenance.anchors.add(FourdgsGeodeticAnchor.parse(record.content));
         case opStatistics:
           statistics = FourdgsStatistics.parse(record.content);
         case opChunkIndex:
@@ -252,6 +278,7 @@ FourdgsScene readFourdgsBytes(
         case opSummaryOffset:
           summaryOffsets.add(FourdgsSummaryOffset.parse(record.content));
         case opFooter:
+          sawFooter = true;
           // The Footer's CRC covers `[summaryStart, footerStart)`, and this scan
           // is standing on `footerStart` — so the range is checkable here and
           // nowhere earlier, which is why the check lives in the switch rather
@@ -309,6 +336,19 @@ FourdgsScene readFourdgsBytes(
     truncated,
   );
 
+  // The cross-record rules — unique sensor names, a rig reference that
+  // resolves — can only run once the whole front matter has gone past. A
+  // truncated file may legitimately be missing the trajectory a sensor names,
+  // so those reference rules are deferred there — but the recovery contract is
+  // that everything complete before the cut still stands, and a duplicate name
+  // among complete records is exactly that: no later byte can repair it, so it
+  // is refused whether or not the file was cut.
+  // A cut file defers only what a later record could still have supplied. If a
+  // Footer went past, the record stream is complete — the Footer is the last
+  // record a file carries — so a missing rig or frame is missing for good and
+  // refusing it is right, even though the trailing magic never arrived.
+  provenance.check(truncated: truncated && !sawFooter);
+
   return FourdgsScene(
     header: header,
     quantization: quantization,
@@ -331,6 +371,7 @@ FourdgsScene readFourdgsBytes(
     camera: camera,
     statistics: statistics,
     summaryCrcOk: summaryCrcOk,
+    provenance: provenance,
   );
 }
 

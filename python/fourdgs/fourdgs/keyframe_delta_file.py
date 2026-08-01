@@ -443,6 +443,15 @@ def _decode_group(stream_bytes) -> tuple[np.ndarray, dict[int, np.ndarray]]:
     got: dict[int, np.ndarray] = {}
     while cursor.remaining() > 0:
         attribute_id, values = decode_stream(cursor)
+        # One stream per attribute here too. The regular chunk path refuses a second;
+        # this path had its own loop and was still resolving it silently, so the same
+        # malformed file was refused as a chunk and accepted as a delta group.
+        if attribute_id in got:
+            raise MalformedFile(
+                f"a keyframe-delta group carries attribute {attribute_id} twice; the format "
+                f"defines one stream per attribute",
+                code="duplicate-attribute-stream",
+            )
         got[attribute_id] = values
     if not len(stream_bytes):
         return np.zeros(0, np.int64), {}
@@ -458,6 +467,15 @@ def _keyframe_from_chunk(content) -> tuple[np.ndarray, dict[int, np.ndarray]]:
     got: dict[int, np.ndarray] = {}
     while cursor.remaining() > 0:
         attribute_id, values = decode_stream(cursor)
+        # One stream per attribute here too. The regular chunk path refuses a second;
+        # this path had its own loop and was still resolving it silently, so the same
+        # malformed file was refused as a chunk and accepted as a delta group.
+        if attribute_id in got:
+            raise MalformedFile(
+                f"a keyframe-delta group carries attribute {attribute_id} twice; the format "
+                f"defines one stream per attribute",
+                code="duplicate-attribute-stream",
+            )
         got[attribute_id] = values
     if op.A_GAUSSIAN_ID not in got:
         raise MalformedFile("a keyframe-delta chunk carries no gaussian_id stream", code="missing-gaussian-id")

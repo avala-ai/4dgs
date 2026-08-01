@@ -90,12 +90,22 @@ class Cursor:
         return [float(v) for v in struct.unpack_from(f"<{n}d", self.take(8 * n))]
 
     def string(self) -> str:
+        """`u32` byte length then that many UTF-8 bytes. Not NUL-terminated.
+
+        The offset reported on failure is where the bytes start, and the exception
+        names the byte inside them that failed: a reader that refuses a record says
+        which byte is wrong, and pointing at the length prefix — which decoded fine —
+        sends whoever is holding the file to the wrong place in it.
+        """
+        length = self.u32()
         at = self.pos
-        raw = bytes(self.take(self.u32()))
+        raw = bytes(self.take(length))
         try:
             return raw.decode("utf-8")
         except UnicodeDecodeError as exc:
-            raise MalformedFile(f"string at offset {at} is not valid UTF-8") from exc
+            raise MalformedFile(
+                f"string at offset {at} is not valid UTF-8: byte {at + exc.start} is {raw[exc.start]:#04x}"
+            ) from exc
 
     def blob(self) -> bytes:
         return bytes(self.take(self.u64()))

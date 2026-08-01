@@ -21,6 +21,7 @@ import { Cursor } from "./cursor.js";
 import { MalformedFile, TruncatedFile } from "./errors.js";
 import { assembleGaussians, type GaussianSet } from "./gaussians.js";
 import { Opcode } from "./opcodes.js";
+import { Provenance } from "./provenance.js";
 import { DEFAULT_CUTOFF, supportK } from "./quantization.js";
 import { checkQuantizationScheme, checkTemporalModel } from "./registry.js";
 import {
@@ -39,9 +40,13 @@ import {
   parseCamera,
   parseChunk,
   parseChunkIndexEntry,
+  parseCoordinateFrame,
+  parseGeodeticAnchor,
   parseHeader,
   parseMetadata,
   parseQuantization,
+  parseRigTrajectory,
+  parseSensorCalibration,
   parseShBandRecord,
   parseStatistics,
   parseFooter,
@@ -81,6 +86,11 @@ export interface Scene {
    * Footer arrives and says where that region began.
    */
   readonly summaryCrcOk: boolean | null;
+  /**
+   * Every provenance record the file carried (spec section 5.15). Empty when it carried
+   * none — a value, never an error.
+   */
+  readonly provenance: Provenance;
   /** Opcodes seen but not understood, in the order they appeared. */
   readonly skippedOpcodes: readonly number[];
   /** True when the resource ended before the file did. What decoded still stands. */
@@ -198,6 +208,7 @@ export async function decodeScene(
   // CRC can be checked. Bounded by the index, which every reader has to hold anyway.
   const summaryParts: Uint8Array[] = [];
   let summaryPartsStart = -1;
+  let sawFooter = false;
   let summaryCrcOk: boolean | null = null;
   let legacyAudio: LegacyAudioDescriptor | null = null;
   const audioDescriptors = new Map<number, AudioSourceDescriptor>();
@@ -207,6 +218,7 @@ export async function decodeScene(
   let streamingLegacyAudio: StreamingLegacyAudio | null = null;
   let camera: Camera | null = null;
   let statistics: Statistics | null = null;
+  const provenance = new Provenance();
   let truncated = false;
 
   let at = 0;
@@ -324,6 +336,24 @@ export async function decodeScene(
         case Opcode.Attachment:
           attachments.push(parseAttachment(content));
           break;
+        case Opcode.CoordinateFrame:
+          provenance.frames.push(parseCoordinateFrame(content));
+          break;
+        case Opcode.SensorCalibration:
+          provenance.sensors.push(parseSensorCalibration(content));
+          break;
+        case Opcode.RigTrajectory:
+          {
+            // Section 5.15.4: a trajectory with no samples "MUST be read as though the
+            // record were absent". Reporting it would put a rig in the summary that
+            // carries no pose and that no sensor may reference.
+            const trajectory = parseRigTrajectory(content);
+            if (trajectory.times.length > 0) provenance.trajectories.push(trajectory);
+          }
+          break;
+        case Opcode.GeodeticAnchor:
+          provenance.anchors.push(parseGeodeticAnchor(content));
+          break;
         case Opcode.Statistics:
           statistics = parseStatistics(content);
           break;
@@ -334,6 +364,7 @@ export async function decodeScene(
           summaryOffsets.push(parseSummaryOffset(content));
           break;
         case Opcode.Footer: {
+          sawFooter = true;
           const footer = parseFooter(content);
           if (footer.summaryStart > 0 && footer.summaryCrc !== 0) {
             summaryCrcOk = checkSummaryCrc(
@@ -365,6 +396,19 @@ export async function decodeScene(
     throw new MalformedFile("file has no Header or no Quantization record");
   }
 
+  // The cross-record rules — unique sensor names, a rig reference that resolves — can
+  // only run once the whole front matter has gone past. A truncated file may legitimately
+  // be missing the trajectory a sensor names, so those reference rules are deferred there
+  // — but the recovery contract is that everything complete before the cut still stands,
+  // and a duplicate name among complete records is exactly that: no later byte can repair
+  // it, so it is refused whether or not the file was cut.
+  // A cut file defers only what a later record could still have supplied. If a Footer went
+  // past, the record stream is complete — the Footer is the last record a file carries —
+  // so a missing rig or frame is missing for good and refusing it is right, even though
+  // the trailing magic never arrived. Without this, a file cut after the Footer accepted
+  // a sensor posed against a rig that is not there, while the same records uncut refused.
+  provenance.check(truncated && !sawFooter);
+
   const audioSources = assembleAudioSourceDescriptors(
     header,
     audioDescriptors,
@@ -391,6 +435,7 @@ export async function decodeScene(
     statistics,
     chunkIndex,
     summaryOffsets,
+    provenance,
     skippedOpcodes,
     summaryCrcOk,
     truncated,

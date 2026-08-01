@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from .exceptions import MalformedFile
+from .model import DEFAULT_CUTOFF
 from .provenance import Pose, pose_at
 from .records import ObjectTable, ObjectTrack
 
@@ -181,3 +182,34 @@ def _quaternion_left_multiply(q, rs: np.ndarray) -> np.ndarray:
 
 
 __all__ = ["BACKGROUND", "ObjectLayer"]
+
+
+def state_at_with_objects(
+    gaussians,
+    objects: ObjectLayer | None,
+    t: float,
+    cutoff: float = DEFAULT_CUTOFF,
+) -> dict:
+    """Reconstructed state at `t` with the object layer composed onto it.
+
+    `GaussianSet.state_at` returns the base temporal state, which is the right answer
+    for a scene with no object layer and the wrong one for a scene that has tracks: the
+    gaussians of a moving object come back at their rest centres and orientations.
+    Composition stays a separate step because the layer is additive and a consumer that
+    only wants geometry should not pay for it — but leaving every caller to remember
+    `ObjectLayer.apply` makes the default answer the wrong one.
+
+    A scene with no layer, or one whose gaussians carry no membership, returns the base
+    state unchanged.
+    """
+    state = gaussians.state_at(t, cutoff)
+    object_ids = state.get("object_id")
+    if objects is None or not objects or object_ids is None:
+        return state
+    centers, orientations = objects.apply(
+        centers=state["centers"],
+        orientations=state["orientations"],
+        object_ids=object_ids,
+        t=t,
+    )
+    return {**state, "centers": centers, "orientations": orientations}

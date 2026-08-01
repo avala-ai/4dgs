@@ -27,7 +27,7 @@ jobs:
             echo "conformance data: ${size_kb} KiB"
             [ "$size_kb" -le 2560 ] || { echo "::error::conformance data over budget"; exit 1; }
           fi
-      - name: Rust sources under 880 KB
+      - name: Rust sources under 1100 KB
         # Sources only: this job builds nothing, so target/ is not here to measure. A
         # vendored dependency would show up as a budget failure, which is the point —
         # everything these crates need comes from crates.io via Cargo.toml.
@@ -40,7 +40,8 @@ jobs:
         # conformance baseline; 880 after native multi-source spatial audio and the object
         # layer's records, composition module, indexed sampling, and conformance coverage
         # landed together; 1000 after the keyframe-delta model (composition, whole-file
-        # write/decode, both read paths, and its encode-roundtrip runners) landed. A budget
+        # write/decode, both read paths, and its encode-roundtrip runners) landed; 1100 after
+        # the object layer's composed-state entry point and its test. A budget
         # that tight stops being a budget and starts being a tax
         # on the next feature, so each raise leaves a little headroom. The number moves
         # when the tree grows deliberately, which is the one thing it is not meant to
@@ -54,9 +55,9 @@ jobs:
         run: |
           size_kb=$(du -s rust | cut -f1)
           echo "rust: ${size_kb} KiB"
-          [ "$size_kb" -le 1000 ] || { echo "::error::rust is ${size_kb} KiB, over the 1000 KiB budget"; exit 1; }
+          [ "$size_kb" -le 1100 ] || { echo "::error::rust is ${size_kb} KiB, over the 1100 KiB budget"; exit 1; }
 
-      - name: TypeScript sources under 576 KB
+      - name: TypeScript sources under 640 KB
         # Sources only: this job installs nothing and builds nothing, so node_modules
         # and dist are not here to measure. A vendored dependency would show up as a
         # budget failure, which is the point.
@@ -64,11 +65,14 @@ jobs:
         # decoder (keyframeDelta.ts) plus its unit test and the base64 keyframe-delta
         # fixtures it decodes — embedded because the TypeScript side is decode-only and
         # has no encoder to write them at test time, exactly as the Dart side does.
+        # Raised from 576 to 640 KiB for the provenance decode path (spec §5.15):
+        # provenance.ts, the record parsers it needs in records.ts, and the canonical
+        # reporting in the conformance runner — about 35 KiB of source, no fixtures.
         run: |
           size_kb=$(du -s typescript | cut -f1)
           echo "typescript: ${size_kb} KiB"
-          [ "$size_kb" -le 576 ] || { echo "::error::typescript is ${size_kb} KiB, over the 576 KiB budget"; exit 1; }
-      - name: Dart sources under 360 KB
+          [ "$size_kb" -le 640 ] || { echo "::error::typescript is ${size_kb} KiB, over the 640 KiB budget"; exit 1; }
+      - name: Dart sources under 480 KB
         # Sources only, same as TypeScript's and Swift's: this job builds nothing, so
         # .dart_tool and the compiled runners are not here to measure, and a vendored
         # dependency would show up as a budget failure.
@@ -77,10 +81,13 @@ jobs:
         # embedded as base64 because the Dart side is decode-only — there is no
         # encoder to write them at test time — and there is deliberately headroom
         # for the keyframe-delta corpus expansion still to land.
+        # Raised from 400 to 480 KiB for the provenance decode path (spec §5.15):
+        # provenance.dart, the record parsers in records.dart, and the canonical
+        # reporting in the conformance runner — about 40 KiB of source, no fixtures.
         run: |
           size_kb=$(du -s dart | cut -f1)
           echo "dart: ${size_kb} KiB"
-          [ "$size_kb" -le 400 ] || { echo "::error::dart is ${size_kb} KiB, over the 400 KiB budget"; exit 1; }
+          [ "$size_kb" -le 480 ] || { echo "::error::dart is ${size_kb} KiB, over the 480 KiB budget"; exit 1; }
       - name: Swift sources under 300 KB
         # Sources only, same as TypeScript's: this job builds nothing, so .build is not
         # here to measure and a vendored dependency would show up as a budget failure.

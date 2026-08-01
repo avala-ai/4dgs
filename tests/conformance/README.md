@@ -114,22 +114,22 @@ corpus must be redistributable without a licence question and reproducible witho
 ## Declining a feature is how a partial SDK stays honest
 
 `run.py` lets a whole language family decline the variants carrying a feature it has not
-implemented, alongside the per-runner `supportsVariant`. The provenance variants (spec §5.15) are
-the first users of it: TypeScript, C++ and Swift decline them, and the feature matrix records the
-`No`.
+implemented, alongside the per-runner `supportsVariant`. The object-layer variants are the current
+users of it: TypeScript, Dart, C++ and Swift decline them, and the feature matrix records the `No`.
+Every family reports provenance (spec §5.15); C++ and Swift do so through the Rust C ABI's additive
+provenance-JSON accessor.
 
-The alternative was worse in a way worth writing down. The canonical summary emits its `provenance`
-section **only when the file carries provenance** — unlike `audioSources`, which is empty when
-absent because audio presence is a property of every file and both paths must stay visible. Had
-provenance followed the `audioSources` convention, every one of the 34 pre-existing expectations
-would have gained `"provenance": null`, and three SDKs that correctly skip the records by length
-would have gone red on all of them. The suite would have reported the format's forward-compatibility
-mechanism working as 34 failures.
+The alternative to optional keys was worse in a way worth writing down. The canonical summary emits
+its `provenance` section **only when the file carries provenance** — unlike `audioSources`, which is
+empty when absent because audio presence is a property of every file and both paths must stay
+visible. Had provenance followed the `audioSources` convention, every one of the 34 pre-existing
+expectations would have gained `"provenance": null`, and any SDK that correctly skipped the records
+by length would have gone red on all of them. The suite would have reported the format's
+forward-compatibility mechanism working as 34 failures.
 
 So the shape is: a file without provenance is byte-identical to what it was before the family
 existed, its expectation is unchanged, and every SDK passes it untouched — that is the assertion. A
-file with provenance is compared in full by the SDKs that implement it, and declined by the ones
-that do not.
+file with provenance is compared in full by every SDK that reports the family.
 
 ## Known gaps
 
@@ -188,10 +188,11 @@ a failure, but the error names the runner rather than the platform and reads lik
 
 The suite runs on GitHub-hosted runners for Python, TypeScript and Rust on Linux, macOS and Windows;
 C++, Swift and Dart run it on Linux. Every platform decodes the same 46 valid variants and compares
-against the same committed expectations — 79 passing comparisons for a family that declines the
-provenance and object variants plus the refusal expectations, 91 for Rust, which answers the
-provenance and object variants, and 105 for Python, which answers all of them. The single
-`decode_indexed` variant that declares no chunk index is skipped everywhere.
+against the same committed expectations — 97 passing comparisons for a family that reports
+provenance but declines the object layer (TypeScript, Dart, C++, Swift), 105 for Rust, which also
+answers the object variants, and 119 for Python, which answers all of them including the refusal
+expectations. The single `decode_indexed` variant that declares no chunk index is skipped
+everywhere.
 
 That the corpus is bytes is the whole reason this is worth doing on more than one platform: a
 decoder that agrees with the expectation on Linux and disagrees on Windows is exactly the bug this

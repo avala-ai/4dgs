@@ -91,10 +91,15 @@ public enum Runner {
             try ExtraChecks.bandRangeSkipping(reader)
         }
 
+        // Provenance is computed in the Rust core (posesAt / sensorPosesAt included) so
+        // this binding cannot drift from the reference on slerp. Empty means omit the key.
+        let provenanceJson = try reader.provenanceJson()
+
         return Summary.build(
             scene: scene,
             gaussians: gaussians,
             chunkIntervals: scene.chunkIntervals.map { ($0.lowerBound, $0.upperBound) },
-            summaryChecksumVerified: scene.summaryChecksumVerified)
+            summaryChecksumVerified: scene.summaryChecksumVerified,
+            provenanceJson: provenanceJson)
     }
 }

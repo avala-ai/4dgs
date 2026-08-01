@@ -118,36 +118,30 @@ REFUSAL_FAMILIES = frozenset({"python"})
 #: them. A partial implementation is a supported state — the feature matrix is where it
 #: shows up publicly — and declining a variant is how a runner says so.
 #:
-#: The provenance family (spec section 5.15) is optional and flagged, so declining it
-#: costs these families nothing anywhere else: every variant that does not carry a
-#: provenance record is byte-identical to what it was before the family existed, and they
-#: pass all of them with no change at all. That is the forward-compatibility mechanism
-#: working, and it would be reported as thirty-four failures if the summary announced the
-#: family on files that do not use it.
-#:
-#: Declining is not the same as failing to read. Each of these decoders steps over a
-#: provenance record by its length and finishes the file correctly — that is what the
-#: `AddExtraDataToRecords` variants prove. What they do not do is *report* the family, so
-#: their summaries would omit a key the expectation carries, and a diff cannot tell that
-#: apart from a decoder that got it wrong.
-#: Every family now decodes keyframe-delta. Python, Rust, TypeScript and Dart do it natively;
-#: C++ and Swift decode it through the Rust C ABI's additive states-JSON accessor, which the
-#: harness dispatches to on the temporal model. No family declines the variants any longer.
+#: Every family now reports provenance (spec §5.15) and decodes keyframe-delta. Python, Rust,
+#: TypeScript and Dart do both natively; C++ and Swift decode both through the Rust C ABI's
+#: additive accessors (states-JSON for keyframe-delta, provenance-JSON for the four
+#: provenance records). Declining is not the same as failing to read: an SDK that steps a
+#: record over by length finishes the file correctly but omits a key the expectation carries,
+#: and a diff cannot tell that apart from a decoder that got it wrong.
 
 #: The object layer's name tokens: the `WithObjects` flag on the top-level cross-product and
 #: the `data/object/` family's own names (`SingleObject`, `MultiObject`, `ObjectTrackComposed`),
 #: all of which contain `Object`. A family that does not decode the Object Table and SE(3)
-#: tracks declines every one of them — the same optional, no-Header-flag family the provenance
-#: records are: an SDK that steps them over by length decodes every gaussian in the file
-#: correctly but does not report the family, so a diff cannot tell that apart from a decoder
-#: that got it wrong. Only Python and Rust decode objects today, so they are absent here.
+#: tracks declines every one of them — the same optional, no-Header-flag family provenance
+#: used to be: an SDK that steps them over by length decodes every gaussian in the file
+#: correctly but does not report the family. Only Python and Rust decode objects today, so
+#: they are absent here.
 OBJECT_TOKENS = ("Object",)
 
 FAMILY_DECLINES: dict[str, tuple[str, ...]] = {
-    "typescript": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig", *OBJECT_TOKENS),
-    "cpp": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig", *OBJECT_TOKENS),
-    "swift": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig", *OBJECT_TOKENS),
-    "dart": ("WithFrame", "WithGeodetic", "WithSensors", "WithRig", *OBJECT_TOKENS),
+    # TypeScript, Dart, C++ and Swift report provenance (spec §5.15) — C++ and Swift via
+    # the Rust C ABI's additive provenance-JSON accessor. All four still decline the object
+    # layer.
+    "typescript": OBJECT_TOKENS,
+    "cpp": OBJECT_TOKENS,
+    "swift": OBJECT_TOKENS,
+    "dart": OBJECT_TOKENS,
 }
 
 

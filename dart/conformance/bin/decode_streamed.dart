@@ -59,6 +59,7 @@ String run(String path) {
       statistics: scene.statistics,
       summaryOffsets: scene.summaryOffsets,
       summaryCrcOk: scene.summaryCrcOk,
+      provenance: scene.provenance,
     ),
   );
 }
