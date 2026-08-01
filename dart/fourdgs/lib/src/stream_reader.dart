@@ -278,16 +278,13 @@ FourdgsScene readFourdgsBytes(
             provenance.trajectories.add(trajectory);
           }
         case opObjectTable:
-          // Front matter only, and the reason is the other read path: the
-          // indexed opener's front-matter walk stops at the first Chunk, so an
-          // object record after one is invisible there. Reading it here would
-          // give the same file transformed centres streamed and untransformed
-          // centres indexed — one decoder, two scenes. Ignored rather than
-          // refused, so no file this reader used to read stops being readable.
-          if (chunks.isNotEmpty) {
-            skipped.add(record.opcode);
-            break;
-          }
+          // Read wherever it appears. Section 5.15 is explicit that these
+          // records are "skipped and dispatched by opcode, not by position", so
+          // a table or track after a Chunk is a legal file — and dropping one
+          // loses the post-track state its gaussians require. The indexed
+          // opener's front-matter walk stops at the first Chunk and so cannot
+          // see them; that asymmetry is a gap in the indexed reader, not a
+          // licence for this path to discard data the format allows.
           if (objects.table != null) {
             throw FourdgsMalformedFile(
               'the file carries a second Object Table; a scene has one '
@@ -297,10 +294,6 @@ FourdgsScene readFourdgsBytes(
           objects.table = FourdgsObjectTable.parse(record.content);
           break;
         case opObjectTrack:
-          if (chunks.isNotEmpty) {
-            skipped.add(record.opcode);
-            break;
-          }
           objects.tracks.add(FourdgsObjectTrack.parse(record.content));
           break;
         case opGeodeticAnchor:
