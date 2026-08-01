@@ -23,6 +23,7 @@ import {
   parseRigTrajectory,
   parseObjectTrack,
   checkObjectTrack,
+  checkObjectTable,
   quaternionNorm,
   checkRigTrajectory,
   poseAt,
@@ -605,6 +606,21 @@ test("an object track sample of the wrong width is refused, not composed into Na
   );
   assert.throws(
     () => checkObjectTrack({ ...base, rotations: [[0, 0, 1]], translations: [[1, 2, 3]] }),
+    MalformedFile,
+  );
+});
+
+test("an object table embedding must match the space the table declares", () => {
+  // embedding_dim is declared once for the whole file, so a vector of another width —
+  // or any vector when the table declares no embedding space — describes a coordinate
+  // system nothing else in the file shares. Python refuses both.
+  const entry = { objectId: 1, label: "", anchor: [0, 0, 0], dynamics: null };
+  assert.throws(
+    () => checkObjectTable({ embeddingDim: 4, entries: [{ ...entry, embedding: [1, 2, 3] }] }),
+    MalformedFile,
+  );
+  assert.throws(
+    () => checkObjectTable({ embeddingDim: 0, entries: [{ ...entry, embedding: [1, 2, 3] }] }),
     MalformedFile,
   );
 });

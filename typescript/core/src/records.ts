@@ -1121,7 +1121,26 @@ export function checkObjectTable(table: ObjectTable): void {
       finite("angular_velocity", entry.dynamics[1]);
       finite("acceleration", entry.dynamics[2]);
     }
-    if (entry.embedding !== null) finite("embedding", entry.embedding);
+    // An embedding has to match the space the table declares. `embedding_dim` is
+    // declared once for the whole file, so a vector of a different width — or any
+    // vector at all when the table declares no embedding space — describes a
+    // coordinate system nothing else in the file shares. Python refuses both
+    // (`records.py`, "invalid-object-embedding-shape"); the parser cannot build
+    // either shape, but a caller constructing a table can.
+    if (entry.embedding !== null) {
+      if (table.embeddingDim === 0) {
+        throw new MalformedFile(
+          `object ${entry.objectId}: an embedding is present but embedding_dim is 0`,
+        );
+      }
+      if (entry.embedding.length !== table.embeddingDim) {
+        throw new MalformedFile(
+          `object ${entry.objectId}: embedding has ${entry.embedding.length} values, ` +
+            `embedding_dim declares ${table.embeddingDim}`,
+        );
+      }
+      finite("embedding", entry.embedding);
+    }
   }
 }
 
