@@ -27,6 +27,7 @@ from typing import Protocol
 from .exceptions import MalformedFile
 from .records import (
     POSE_TO_RIG,
+    POSE_TO_SCENE,
     TRAJECTORY_STEP,
     CoordinateFrame,
     GeodeticAnchor,
@@ -316,6 +317,17 @@ class Provenance:
         # does not carry — the same refusal, reached one step later. Composing it as
         # identity instead would place every sensor on that rig at the rig origin:
         # plausible, wrong, and silent.
+        # The registry defines two pose references and no more. An unrecognized value
+        # is not a future extension a reader may ignore: it says the extrinsic maps into
+        # some frame this build cannot name, and treating it as scene-relative puts the
+        # sensor somewhere plausible and wrong.
+        for sensor in self.sensors:
+            if sensor.pose_reference not in (POSE_TO_SCENE, POSE_TO_RIG):
+                raise MalformedFile(
+                    f"sensor {sensor.name!r} declares pose_reference "
+                    f"{sensor.pose_reference}; the registry defines 0 (scene) and 1 (rig)"
+                )
+
         rigs = {t.name for t in self.trajectories if t.sample_count > 0}
         for sensor in self.sensors:
             if sensor.pose_reference == POSE_TO_RIG and sensor.rig_name not in rigs:

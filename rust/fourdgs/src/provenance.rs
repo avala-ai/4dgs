@@ -19,7 +19,7 @@
 
 use crate::error::{Error, Result};
 use crate::records::{
-    CoordinateFrame, GeodeticAnchor, RigTrajectory, SensorCalibration, POSE_TO_RIG,
+    CoordinateFrame, GeodeticAnchor, RigTrajectory, SensorCalibration, POSE_TO_RIG, POSE_TO_SCENE,
     TRAJECTORY_LINEAR, TRAJECTORY_STEP,
 };
 
@@ -390,6 +390,20 @@ impl Provenance {
                     )));
                 }
                 seen.push(name);
+            }
+        }
+
+        // The registry defines two pose references and no more. An unrecognized value is
+        // not a future extension a reader may ignore: it says the extrinsic maps into some
+        // frame this build cannot name, and treating it as scene-relative puts the sensor
+        // somewhere plausible and wrong.
+        for sensor in &self.sensors {
+            if sensor.pose_reference != POSE_TO_SCENE && sensor.pose_reference != POSE_TO_RIG {
+                return Err(Error::Malformed(format!(
+                    "sensor {:?} declares pose_reference {}; the registry defines 0 (scene) \
+                     and 1 (rig)",
+                    sensor.name, sensor.pose_reference
+                )));
             }
         }
 

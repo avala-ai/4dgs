@@ -397,6 +397,20 @@ class FourdgsProvenance {
       }
     }
 
+    // The registry defines two pose references and no more. An unrecognized
+    // value is not a future extension a reader may ignore: it says the
+    // extrinsic maps into some frame this build cannot name, and treating it as
+    // scene-relative puts the sensor somewhere plausible and wrong.
+    for (final sensor in sensors) {
+      if (sensor.poseReference != poseToScene &&
+          sensor.poseReference != poseToRig) {
+        throw FourdgsMalformedFile(
+          "sensor '${sensor.name}' declares pose_reference "
+          '${sensor.poseReference}; the registry defines 0 (scene) and 1 (rig)',
+        );
+      }
+    }
+
     // A zero-sample trajectory is "read as though the record were absent"
     // (section 5.15.4), so a rig-relative sensor naming one names a rig this
     // file does not carry — the same refusal, one step later. Composing it as

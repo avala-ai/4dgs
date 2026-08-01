@@ -26,6 +26,7 @@ import {
   type RigTrajectory,
   type SensorCalibration,
   POSE_TO_RIG,
+  POSE_TO_SCENE,
   TRAJECTORY_LINEAR,
   TRAJECTORY_STEP,
   finiteLerp,
@@ -330,6 +331,19 @@ export class Provenance {
           );
         }
         seen.add(name);
+      }
+    }
+
+    // The registry defines two pose references and no more. An unrecognized value is not
+    // a future extension a reader may ignore: it says the extrinsic maps into some frame
+    // this build cannot name, and treating it as scene-relative puts the sensor somewhere
+    // plausible and wrong.
+    for (const sensor of this.sensors) {
+      if (sensor.poseReference !== POSE_TO_SCENE && sensor.poseReference !== POSE_TO_RIG) {
+        throw new MalformedFile(
+          `sensor ${JSON.stringify(sensor.name)} declares pose_reference ` +
+            `${sensor.poseReference}; the registry defines 0 (scene) and 1 (rig)`,
+        );
       }
     }
 
