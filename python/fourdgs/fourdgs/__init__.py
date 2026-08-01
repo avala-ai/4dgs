@@ -32,7 +32,7 @@ from .exceptions import (
 )
 from .gltf import GltfImport, from_gltf, to_gltf
 from .model import AudioSource, AudioSourceKeyframe, AudioSourceState, AudioTrack, CameraTrajectory, GaussianSet
-from .object_layer import ObjectLayer
+from .object_layer import ObjectLayer, state_at_with_objects
 from .provenance import Pose, Provenance, pose_at
 from .quantization import SH_LADDERS, Bounds, Steps, sh_bound, sh_step
 from .records import (
@@ -90,6 +90,7 @@ __all__ = [
     "sh_bound",
     "sh_step",
     "sorted_segments",
+    "state_at_with_objects",
     "to_gltf",
     "to_usd",
     "write",
