@@ -50,6 +50,12 @@ Title prefixes: `spec:`, `python:`, `typescript:`, `rust:`, `cpp:`, `conformance
 Every PR confirms the scope checkbox in the template. Conformance must pass; the corpus `--verify`
 gate must be green, which means regenerating it if your change touches the encoder.
 
+One language per pull request. When a feature lands across several SDKs, the PRs are **stacked** —
+each targeting the branch below it, merged bottom-up — so that each diff carries one SDK's claim on
+the feature matrix. [AGENTS.md §9](AGENTS.md#9-one-language-per-pull-request-stacked) has the
+mechanics. Stacks need all branches in this repository, so if you are working from a fork, open
+ordinary sequential pull requests instead.
+
 **A pull request with no CI run at all has a conflict, not a slow queue.** GitHub runs
 `pull_request` workflows against the merge commit, and when that merge cannot be computed it skips
 the run silently — no failure, no red mark, just an absence that looks like waiting. Rebase on
