@@ -10,8 +10,8 @@ declarations. Nothing is marked `Yes` on the strength of code existing.
 Every row is filled in from a suite that runs: 46 valid variants and 7 invalid ones, plus 4
 keyframe-delta and 3 object-layer variants in their own subdirectories, over two read paths
 (streamed and indexed). A language takes the variants it declares support for, and what it declines
-is what this table records — 119 checks passing for Python, 105 each for Rust, TypeScript and Dart,
-97 each for C++ and Swift (provenance reported, object layer declined). Rust declines the refusal
+is what this table records — 119 checks passing for Python, 105 each for Rust and TypeScript, 97
+each for Dart, C++ and Swift (provenance reported, object layer declined). Rust declines the refusal
 expectations. C++ and Swift read 4DGS through the Rust C ABI: the additive states-JSON accessor
 computes keyframe-delta summaries in the core, and the additive provenance-JSON accessor does the
 same for the provenance family, so every binding emits identical bytes with no per-language slerp.
@@ -43,9 +43,9 @@ same for the provenance family, so every binding emits identical bytes with no p
 | Provenance: coordinate frame + georeference       | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Provenance: sensor calibration                    | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Provenance: rig trajectory + pose interpolation   | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Object membership (`object_id`)                   | Yes    | Yes        | Yes     | No      | No      | Yes  |
-| Object Table: labels, anchors, embeddings         | Yes    | Yes        | Yes     | No      | No      | Yes  |
-| Object Track: rigid state composition¹            | Yes    | Yes        | Yes     | No      | No      | Yes  |
+| Object membership (`object_id`)                   | Yes    | Yes        | Yes     | No      | No      | Yes     |
+| Object Table: labels, anchors, embeddings         | Yes    | Yes        | Yes     | No      | No      | Yes     |
+| Object Track: rigid state composition¹            | Yes    | Yes        | Yes     | No      | No      | Yes     |
 | Temporal model `keyframe-delta`, decode           | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Delta composition, chained                        | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Delta composition, keyframe-referenced            | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
@@ -102,8 +102,8 @@ the base state rather than replacing it — `center = R*c0 + T`, `orientation = 
 — so a summary that carried only the table and the tracks would pass a decoder that dropped the
 track or applied it before per-gaussian motion. The canonical `states` therefore carry the
 post-track centers and orientations at three scene-clock probes, in the canonical gaussian order,
-and four independent implementations — Python, Rust, TypeScript and Dart — must agree on them, which
-is the cross-check a shared stored field alone would pass. What that proves is decode and the
+and three independent implementations — Python, Rust and TypeScript — must agree on them, which is
+the cross-check a shared stored field alone would pass. What that proves is decode and the
 composition arithmetic, not the reader's own indexed pose-sampling path, which each runner reaches
 by loading the whole object layer rather than by range-sampling it.
 
