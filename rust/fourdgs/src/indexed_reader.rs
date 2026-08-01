@@ -734,6 +734,10 @@ pub fn read_objects<R: Readable + ?Sized>(
         )?)?);
     }
     for range in scene.object_track_ranges.values() {
+        // The same ceiling the table branch above applies. A track is front matter, so a
+        // crafted record_length must not size an allocation before anything has looked at
+        // the bytes — and the parse that would reject it only runs after the read.
+        check_front_matter_length(range.record_length, "object layer")?;
         let blob = source.read(range.record_offset, range.record_length)?;
         // Section 5.15.7: a zero-sample track "has no pose and is read as absent".
         let track = rec::ObjectTrack::parse(record_content(&blob, op::OBJECT_TRACK)?)?;
