@@ -24,7 +24,7 @@ from fourdgs import indexed_reader
 from fourdgs import records as rec
 from fourdgs.indexed_reader import open_indexed, read_chunk
 from fourdgs.readable import BytesReadable
-from fourdgs.serialization import put_string, put_u8, put_u32
+from fourdgs.serialization import Cursor, put_string, put_u8, put_u32
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "tests", "conformance", "generator"))
 import invalid
@@ -274,3 +274,18 @@ def test_the_front_matter_ceiling_is_the_same_number_in_every_sdk():
     # file: the same range without the flag gets as far as the transfer.
     with pytest.raises(AssertionError):
         indexed_reader._read_range(_Vast(), 0, huge, "an Attachment record")
+
+
+def test_a_bad_utf8_string_names_the_byte_that_failed():
+    """A reader that refuses a record says which byte is wrong (AGENTS.md §6).
+
+    The offset has to be where the *bytes* start rather than where the length prefix
+    does: the prefix decoded fine, so pointing at it sends whoever is holding the file
+    four bytes upstream of the problem.
+    """
+    body = put_u32(4) + b"ab\xffd"
+    with pytest.raises(fourdgs.MalformedFile) as caught:
+        Cursor(body).string()
+    message = str(caught.value)
+    assert "offset 4" in message, message
+    assert "byte 6" in message, message
