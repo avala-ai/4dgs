@@ -208,6 +208,7 @@ export async function decodeScene(
   // CRC can be checked. Bounded by the index, which every reader has to hold anyway.
   const summaryParts: Uint8Array[] = [];
   let summaryPartsStart = -1;
+  let sawFooter = false;
   let summaryCrcOk: boolean | null = null;
   let legacyAudio: LegacyAudioDescriptor | null = null;
   const audioDescriptors = new Map<number, AudioSourceDescriptor>();
@@ -363,6 +364,7 @@ export async function decodeScene(
           summaryOffsets.push(parseSummaryOffset(content));
           break;
         case Opcode.Footer: {
+          sawFooter = true;
           const footer = parseFooter(content);
           if (footer.summaryStart > 0 && footer.summaryCrc !== 0) {
             summaryCrcOk = checkSummaryCrc(
@@ -400,7 +402,12 @@ export async function decodeScene(
   // — but the recovery contract is that everything complete before the cut still stands,
   // and a duplicate name among complete records is exactly that: no later byte can repair
   // it, so it is refused whether or not the file was cut.
-  provenance.check(truncated);
+  // A cut file defers only what a later record could still have supplied. If a Footer went
+  // past, the record stream is complete — the Footer is the last record a file carries —
+  // so a missing rig or frame is missing for good and refusing it is right, even though
+  // the trailing magic never arrived. Without this, a file cut after the Footer accepted
+  // a sensor posed against a rig that is not there, while the same records uncut refused.
+  provenance.check(truncated && !sawFooter);
 
   const audioSources = assembleAudioSourceDescriptors(
     header,

@@ -140,6 +140,7 @@ FourdgsScene readFourdgsBytes(
   FourdgsStatistics? statistics;
   bool? summaryCrcOk;
   bool truncated = false;
+  bool sawFooter = false;
   final provenance = FourdgsProvenance();
 
   try {
@@ -277,6 +278,7 @@ FourdgsScene readFourdgsBytes(
         case opSummaryOffset:
           summaryOffsets.add(FourdgsSummaryOffset.parse(record.content));
         case opFooter:
+          sawFooter = true;
           // The Footer's CRC covers `[summaryStart, footerStart)`, and this scan
           // is standing on `footerStart` — so the range is checkable here and
           // nowhere earlier, which is why the check lives in the switch rather
@@ -341,7 +343,11 @@ FourdgsScene readFourdgsBytes(
   // that everything complete before the cut still stands, and a duplicate name
   // among complete records is exactly that: no later byte can repair it, so it
   // is refused whether or not the file was cut.
-  provenance.check(truncated: truncated);
+  // A cut file defers only what a later record could still have supplied. If a
+  // Footer went past, the record stream is complete — the Footer is the last
+  // record a file carries — so a missing rig or frame is missing for good and
+  // refusing it is right, even though the trailing magic never arrived.
+  provenance.check(truncated: truncated && !sawFooter);
 
   return FourdgsScene(
     header: header,

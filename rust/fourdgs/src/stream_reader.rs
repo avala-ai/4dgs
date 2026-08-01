@@ -122,6 +122,7 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
     let mut legacy_audio: Option<rec::Audio> = None;
     let mut first_audio_record: Option<(&'static str, u64, Option<u32>)> = None;
     let mut truncated = false;
+    let mut saw_footer = false;
 
     // The Footer's CRC covers `[summary_start, footer_start)`, and a front-to-back reader
     // does not learn where that starts until the very last record. So the trailing run of
@@ -352,6 +353,7 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
                 .summary_offsets
                 .push(rec::SummaryOffset::parse(&content)?),
             op::FOOTER => {
+                saw_footer = true;
                 let footer = rec::Footer::parse(&content)?;
                 if footer.summary_start != 0 && footer.summary_crc != 0 {
                     // Only claim a verdict when the retained bytes are exactly the range
@@ -401,7 +403,11 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
     // deferred there — but the recovery contract is that everything complete before the
     // cut still stands, and a duplicate name among complete records is exactly that: no
     // later byte can repair it, so it is refused whether or not the file was cut.
-    scene.provenance.check_with(truncated)?;
+    // A cut file defers only what a later record could still have supplied. If a Footer
+    // went past, the record stream is complete — the Footer is the last record a file
+    // carries — so a missing rig or frame is missing for good and refusing it is right,
+    // even though the trailing magic never arrived.
+    scene.provenance.check_with(truncated && !saw_footer)?;
     scene.objects.check()?;
 
     if !header.has_audio()

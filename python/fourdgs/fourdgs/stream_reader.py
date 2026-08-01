@@ -321,6 +321,7 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
     scene = Scene(header=None, gaussians=None, duration_sec=0.0)  # type: ignore[arg-type]
     skipped: list[int] = []
     truncated = False
+    saw_footer = False
     audio_descriptors: dict[int, rec.AudioSource] = {}
     audio_payloads: dict[int, bytes] = {}
     legacy_audio: rec.Audio | None = None
@@ -437,6 +438,7 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
             elif record.opcode == op.SUMMARY_OFFSET:
                 scene.summary_offsets.append(rec.SummaryOffset.parse(record.content))
             elif record.opcode == op.FOOTER:
+                saw_footer = True
                 footer = rec.Footer.parse(record.content)
                 if footer.summary_start and footer.summary_crc:
                     summary = data[footer.summary_start : record.offset]
@@ -466,7 +468,11 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
     # deferred there — but the recovery contract is that everything complete before the
     # cut still stands, and a duplicate name among complete records is exactly that: no
     # later byte can repair it, so it is refused whether or not the file was cut.
-    scene.provenance.check(truncated=truncated)
+    # A cut file defers only what a later record could still have supplied. If a Footer
+    # went past, the record stream is complete — the Footer is the last record a file
+    # carries — so a missing rig or frame is missing for good and refusing it is right,
+    # even though the trailing magic never arrived.
+    scene.provenance.check(truncated=truncated and not saw_footer)
     scene.objects.check()
 
     scene.header = header
