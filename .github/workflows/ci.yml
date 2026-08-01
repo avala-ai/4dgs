@@ -76,7 +76,7 @@ jobs:
           size_kb=$(du -s typescript | cut -f1)
           echo "typescript: ${size_kb} KiB"
           [ "$size_kb" -le 704 ] || { echo "::error::typescript is ${size_kb} KiB, over the 704 KiB budget"; exit 1; }
-      - name: Dart sources under 480 KB
+      - name: Dart sources under 544 KB
         # Sources only, same as TypeScript's and Swift's: this job builds nothing, so
         # .dart_tool and the compiled runners are not here to measure, and a vendored
         # dependency would show up as a budget failure.
@@ -88,10 +88,14 @@ jobs:
         # Raised from 400 to 480 KiB for the provenance decode path (spec §5.15):
         # provenance.dart, the record parsers in records.dart, and the canonical
         # reporting in the conformance runner — about 40 KiB of source, no fixtures.
+        # Raised from 480 to 544 KiB for the object layer (spec §5.15.6-§5.15.7):
+        # objects.dart, the two record parsers, the membership attribute, the canonical
+        # states and their unit tests. 468 KiB against 480 left three files of headroom,
+        # which is a budget about to trip on whatever landed next.
         run: |
           size_kb=$(du -s dart | cut -f1)
           echo "dart: ${size_kb} KiB"
-          [ "$size_kb" -le 480 ] || { echo "::error::dart is ${size_kb} KiB, over the 480 KiB budget"; exit 1; }
+          [ "$size_kb" -le 544 ] || { echo "::error::dart is ${size_kb} KiB, over the 544 KiB budget"; exit 1; }
       - name: Swift sources under 300 KB
         # Sources only, same as TypeScript's: this job builds nothing, so .build is not
         # here to measure and a vendored dependency would show up as a budget failure.

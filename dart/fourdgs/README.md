@@ -141,7 +141,7 @@ and mixing—belong to the renderer/player.
 
 ## Conformance
 
-Checked against the same generated corpus every other 4dgs SDK is, on both read paths: 79 checks.
+Checked against the same generated corpus every other 4dgs SDK is, on both read paths: 105 checks.
 See the [feature matrix](https://4dgs.dev/reference/) for what this SDK implements and what it
 declines.
 

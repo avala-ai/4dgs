@@ -505,8 +505,24 @@ FourdgsAttributeStream decodeAttributeStreamBody(
     if (mode == modeDelta) {
       // Delta runs along element order, so a channel accumulates against the
       // same channel of the previous element.
+      //
+      // The running sum is checked rather than allowed to wrap. Reading an
+      // Int32List element yields a 64-bit Dart int, so the addition below
+      // happens before any truncation and the overflow is visible here; storing
+      // it would silently turn a malformed stream into a plausible wrong
+      // number. That matters most for `object_id` (section 6.6), where the code
+      // is a label rather than a bin: a wrapped code is a *different object*,
+      // and the Rust reader — which accumulates in i64 and then requires the
+      // code to fit an i32 — refuses the same file.
       for (int i = channels; i < values.length; i++) {
-        values[i] += values[i - channels];
+        final acc = values[i] + values[i - channels];
+        if (acc > 2147483647 || acc < -2147483648) {
+          throw FourdgsMalformedFile(
+            'attribute $attributeId: delta stream leaves the 32-bit range at '
+            'element ${i ~/ channels}',
+          );
+        }
+        values[i] = acc;
       }
     } else if (mode != modeRaw) {
       throw FourdgsMalformedFile(

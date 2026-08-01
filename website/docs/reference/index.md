@@ -10,8 +10,8 @@ declarations. Nothing is marked `Yes` on the strength of code existing.
 Every row is filled in from a suite that runs: 46 valid variants and 7 invalid ones, plus 4
 keyframe-delta and 3 object-layer variants in their own subdirectories, over two read paths
 (streamed and indexed). A language takes the variants it declares support for, and what it declines
-is what this table records — 119 checks passing for Python, 105 each for Rust and TypeScript, 97
-each for Dart, C++ and Swift (provenance reported, object layer declined). Rust declines the refusal
+is what this table records — 119 checks passing for Python, 105 each for Rust, TypeScript and Dart,
+97 each for C++ and Swift (provenance reported, object layer declined). Rust declines the refusal
 expectations. C++ and Swift read 4DGS through the Rust C ABI: the additive states-JSON accessor
 computes keyframe-delta summaries in the core, and the additive provenance-JSON accessor does the
 same for the provenance family, so every binding emits identical bytes with no per-language slerp.
@@ -43,9 +43,9 @@ same for the provenance family, so every binding emits identical bytes with no p
 | Provenance: coordinate frame + georeference       | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Provenance: sensor calibration                    | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Provenance: rig trajectory + pose interpolation   | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Object membership (`object_id`)                   | Yes    | Yes        | Yes     | No      | No      | No      |
-| Object Table: labels, anchors, embeddings         | Yes    | Yes        | Yes     | No      | No      | No      |
-| Object Track: rigid state composition¹            | Yes    | Yes        | Yes     | No      | No      | No      |
+| Object membership (`object_id`)                   | Yes    | Yes        | Yes     | No      | No      | Yes     |
+| Object Table: labels, anchors, embeddings         | Yes    | Yes        | Yes     | No      | No      | Yes     |
+| Object Track: rigid state composition¹            | Yes    | Yes        | Yes     | No      | No      | Yes     |
 | Temporal model `keyframe-delta`, decode           | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Delta composition, chained                        | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Delta composition, keyframe-referenced            | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
@@ -125,9 +125,9 @@ rotations must compose as a quaternion product rather than one replacing the oth
 is not a workaround the way the keyframe-delta one is — an object record is additive to the
 gaussian-birth model, and the one `WithObjects` variant at the top level is read by the Kaitai
 grammar and the fuzzer, which is where the records' framing and length-skipping are proved — it just
-keeps the decode-and-compose family gathered where the harness reaches for it. Python, Rust and
-TypeScript emit those states from both read paths; the other SDKs skip the optional records and
-stream and report `No`.
+keeps the decode-and-compose family gathered where the harness reaches for it. Python, Rust,
+TypeScript and Dart emit those states from both read paths; C++ and Swift skip the optional records
+and stream and report `No`.
 
 **The `keyframe-delta` temporal model** (spec §11) is proved by four corpus variants that live in
 their own `data/keyframe/` subdirectory, the way the invalid corpus does — every whole-corpus

@@ -82,6 +82,11 @@ const int attrSourceIndex = 12;
 /// gaussians by.
 const int attrGaussianId = 13;
 
+/// Object membership, spec section 6.6. A `u32` per gaussian, `0` = background
+/// / unassigned. Optional: a chunk without it carries gaussians that belong to
+/// no object.
+const int attrObjectId = 14;
+
 /// Ids every chunk must carry. 11 and 12 are optional producer-side identities
 /// and readers that do not need them skip the streams.
 const List<int> requiredAttributes = <int>[

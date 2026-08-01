@@ -20,6 +20,7 @@ library;
 
 import 'dart:collection';
 import 'dart:convert';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:fourdgs/fourdgs.dart';
@@ -82,6 +83,7 @@ Map<String, Object?> summarize({
   List<FourdgsSummaryOffset> summaryOffsets = const <FourdgsSummaryOffset>[],
   bool? summaryCrcOk,
   FourdgsProvenance? provenance,
+  FourdgsObjectLayer? objects,
 }) {
   final order = _stableOrder(gaussians);
   final sample = order.take(sampleSize).toList();
@@ -182,6 +184,10 @@ Map<String, Object?> summarize({
       'sigmaT': column(gaussians.sigmaT),
       'winLo': column(gaussians.winLo),
       'winHi': column(gaussians.winHi),
+      if (gaussians.objectId != null)
+        'objectIds': <Object?>[
+          for (final i in sample) gaussians.objectId![i].toString(),
+        ],
     },
     'aggregate': <String, Object?>{
       'positionSum': <Object?>[for (final v in positionSum) num6(v)],
@@ -198,8 +204,162 @@ Map<String, Object?> summarize({
   if (provenance != null && !provenance.isEmpty) {
     out['provenance'] = _provenance(provenance);
   }
+  // Same omission rule, and for the same reason: an object record is additive
+  // to the gaussian-birth model, so a file without one must summarize exactly
+  // as it did before the layer existed. Membership alone is enough to report —
+  // a scene can carry ids and no table.
+  if ((objects != null && !objects.isEmpty) || gaussians.objectId != null) {
+    out.addAll(_objectsAndStates(header, gaussians, objects, order));
+  }
   return out;
 }
+
+/// Object records plus post-track gaussian states at three scene-clock probes.
+///
+/// Stored fields alone do not prove reconstruction: two implementations can
+/// agree on every entry in the table and every sample in a track and still
+/// disagree about where a gaussian ends up, because the layer's one rule is an
+/// order — base first, track second. The states make that order visible,
+/// including orientation, and the canonical gaussian order keeps the result
+/// independent of chunk and decoder order.
+Map<String, Object?> _objectsAndStates(
+  FourdgsHeader header,
+  FourdgsGaussianSet gaussians,
+  FourdgsObjectLayer? objects,
+  List<int> order,
+) {
+  final layer = objects ?? FourdgsObjectLayer();
+
+  final tracks = <Object?>[
+    for (final track in layer.tracks)
+      <String, Object?>{
+        'objectId': track.objectId.toString(),
+        'interpolation': track.interpolation,
+        'sampleCount': track.sampleCount.toString(),
+        'posesAt': <Object?>[
+          for (final probe in _trackProbeTimes(track))
+            _poseRow(probe, layer.poseAt(track.objectId, probe)),
+        ],
+      },
+  ];
+
+  final entries = <Object?>[];
+  final table = layer.table;
+  if (table != null) {
+    for (final entry in table.entries) {
+      final embedding = entry.embedding;
+      String? embeddingCrc;
+      if (embedding != null) {
+        final bytes = Uint8List(embedding.length * 4);
+        final view = ByteData.view(bytes.buffer);
+        for (int i = 0; i < embedding.length; i++) {
+          view.setFloat32(i * 4, embedding[i], Endian.little);
+        }
+        embeddingCrc = crcOf(bytes);
+      }
+      final dynamics = entry.dynamics;
+      entries.add(<String, Object?>{
+        'objectId': entry.objectId.toString(),
+        'label': entry.label,
+        'anchor': <Object?>[for (final v in entry.anchor) num6(v)],
+        // The decoded dynamics values, not merely their presence: a summary
+        // that said only whether the record was there would pass a decoder
+        // that read the nine floats and exposed zeros. Null when absent.
+        'dynamics':
+            dynamics == null
+                ? null
+                : <String, Object?>{
+                  'velocity': <Object?>[for (final v in dynamics[0]) num6(v)],
+                  'angularVelocity': <Object?>[
+                    for (final v in dynamics[1]) num6(v),
+                  ],
+                  'acceleration': <Object?>[
+                    for (final v in dynamics[2]) num6(v),
+                  ],
+                },
+        'hasEmbedding': embedding != null,
+        'embeddingCrc': embeddingCrc,
+      });
+    }
+  }
+
+  final duration = math.max(0.0, header.durationSec);
+  final states = <Object?>[];
+  for (final t in <double>[
+    0.0,
+    0.5 * duration,
+    math.max(0.0, duration - 1e-6),
+  ]) {
+    final base = gaussians.stateAt(t, cutoff: header.cutoff);
+    final ids = base.objectId ?? Uint32List(base.count);
+    layer.apply(base.centers, base.orientations, ids, t);
+
+    final rowForIndex = <int, int>{};
+    for (int row = 0; row < base.count; row++) {
+      rowForIndex[base.indices[row]] = row;
+    }
+    final sampleRows = <int>[];
+    for (final index in order) {
+      final row = rowForIndex[index];
+      if (row != null) sampleRows.add(row);
+      if (sampleRows.length == sampleSize) break;
+    }
+
+    List<Object?> rows(Float64List values, int width) => <Object?>[
+      for (final row in sampleRows)
+        <Object?>[
+          for (int axis = 0; axis < width; axis++)
+            num6(values[row * width + axis]),
+        ],
+    ];
+
+    // Accumulated in scalars rather than through a live-count-sized list per
+    // axis: a large object scene would otherwise pay peak memory proportional to
+    // the decoded state purely to report a sum. Summed in row order, which is
+    // the canonical gaussian order these rows were built in.
+    final totals = <double>[0.0, 0.0, 0.0];
+    for (int row = 0; row < base.count; row++) {
+      for (int axis = 0; axis < 3; axis++) {
+        totals[axis] += base.centers[row * 3 + axis];
+      }
+    }
+    final positionSum = <Object?>[for (final total in totals) num6(total)];
+    double opacitySum = 0.0;
+    for (final value in base.opacity) {
+      opacitySum += value;
+    }
+
+    states.add(<String, Object?>{
+      't': num6(t),
+      'liveCount': base.count.toString(),
+      'sample': <String, Object?>{
+        'positions': rows(base.centers, 3),
+        'orientations': rows(base.orientations, 4),
+        'objectIds': <Object?>[
+          for (final row in sampleRows) ids[row].toString(),
+        ],
+      },
+      'aggregate': <String, Object?>{
+        'positionSum': positionSum,
+        'opacitySum': num6(opacitySum),
+      },
+    });
+  }
+
+  return <String, Object?>{
+    'objects': <String, Object?>{
+      'embeddingDim': table == null ? 0 : table.embeddingDim,
+      'table': entries,
+      'tracks': tracks,
+    },
+    'states': states,
+  };
+}
+
+/// Times a summary evaluates an object track at, derived from the track
+/// itself, the way a rig trajectory's probes are.
+List<double> _trackProbeTimes(FourdgsObjectTrack track) =>
+    _probesOver(track.times);
 
 Map<String, Object?> _audioSource(
   FourdgsAudioSource source,
@@ -364,10 +524,20 @@ Map<String, Object?> _sensorPoseRow(
 /// Two of the five are outside the sample range on purpose: clamping is a rule,
 /// and a rule no expectation exercises is a rule an implementation can decline
 /// to have.
-List<double> _probeTimes(FourdgsRigTrajectory trajectory) {
-  if (trajectory.sampleCount == 0) return const <double>[];
-  final first = trajectory.times.first;
-  final last = trajectory.times.last;
+List<double> _probeTimes(FourdgsRigTrajectory trajectory) =>
+    _probesOver(trajectory.times);
+
+/// The probe times for a list of samples, shared by rigs and object tracks.
+///
+/// Halving each operand rather than halving their sum: two large same-signed
+/// times overflow `0.5 * (first + last)` to infinity, and `poseAt` refuses a
+/// non-finite query, so the summary fails on a track the format allows. The
+/// object-track copy of this list is how that bug came back after the rig one
+/// was fixed — hence one helper.
+List<double> _probesOver(List<double> times) {
+  if (times.isEmpty) return const <double>[];
+  final first = times.first;
+  final last = times.last;
   return <double>[first - 0.5, first, first / 2 + last / 2, last, last + 0.5];
 }
 
@@ -451,6 +621,13 @@ List<int> _stableOrder(FourdgsGaussianSet g) {
       _sortable(g.winHi[i]),
       if (sh != null)
         for (int k = 0; k < shWidth; k++) sh[i * shWidth + k].toDouble(),
+      // Membership joins the key, after the harmonics and before the index
+      // tie-break, exactly where the Python and Rust references put it. Two
+      // gaussians can tie on every rounded field and still belong to different
+      // objects — and then the `objectIds` sample, and the states composed from
+      // it, would be ordered by decode order, which differs between two correct
+      // readers that chunked the scene differently.
+      if (g.objectId != null) g.objectId![i].toDouble(),
     ];
     keys.add((row, i));
   }

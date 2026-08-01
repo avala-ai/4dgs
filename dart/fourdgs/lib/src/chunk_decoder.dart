@@ -32,6 +32,7 @@ class FourdgsDecodedChunk {
     required this.winHi,
     required this.windowIndex,
     this.sourceIndex,
+    this.objectId,
     this.shBands = const <int, Uint8List>{},
   });
 
@@ -47,6 +48,15 @@ class FourdgsDecodedChunk {
   final Float32List winHi; // count
   final Int32List windowIndex; // count
   final Int32List? sourceIndex;
+
+  /// Object membership (spec section 6.6), or null when the chunk carries
+  /// none. `0` is background: a gaussian that belongs to no object.
+  ///
+  /// Unsigned, unlike every other decoded lane: an `object_id` is an exact
+  /// label over the whole `u32` range (spec section 6.6), and the signed bins a
+  /// stream decodes into would report an id above `2^31` as a negative number —
+  /// one that no Object Track, parsed as `u32`, could ever match.
+  final Uint32List? objectId;
 
   /// Band index to that band's raw coefficient bytes, `count * channels` of
   /// them. Empty unless the caller asked for bands and the file had them.
@@ -298,6 +308,7 @@ FourdgsDecodedChunk decodeChunkStreams(
   }
 
   final source = got[attrSourceIndex];
+  final objects = got[attrObjectId];
   final shBands = <int, Uint8List>{};
   shBandRecords.forEach((int band, Uint8List content) {
     final decoded = decodeShBandRecord(
@@ -321,6 +332,9 @@ FourdgsDecodedChunk decodeChunkStreams(
     winHi: winHi,
     windowIndex: windowIndex,
     sourceIndex: source == null ? null : Int32List.fromList(source.values),
+    // Reinterpreted rather than truncated: the bits are already right, only
+    // their signedness was wrong.
+    objectId: objects == null ? null : Uint32List.fromList(objects.values),
     shBands: shBands,
   );
 }
@@ -343,6 +357,7 @@ int? _channelsFor(int attributeId) {
     case attrWindowIndex:
     case attrSourceGroup:
     case attrSourceIndex:
+    case attrObjectId:
       return 1;
     default:
       return null;
@@ -394,7 +409,11 @@ int chunkDecodedBytesPerGaussian(int shDegree) {
   for (int band = 1; band <= shDegree; band++) {
     shCoefficients += shBandChannels[band] ?? 0;
   }
-  return 92 + 92 + shCoefficients * 5;
+  // 96 + 96 rather than 92 + 92 since object membership joined the lanes it
+  // budgets for: `object_id` costs one decoded bin lane and one output array,
+  // four bytes each. A guard that under-counts a lane it now decodes is a
+  // guard that lets a crafted count allocate past the ceiling it states.
+  return 96 + 96 + shCoefficients * 5;
 }
 
 /// Coefficients per gaussian in each spherical-harmonic band, three channels

@@ -20,6 +20,7 @@ import 'chunk_decoder.dart';
 import 'exceptions.dart';
 import 'model.dart';
 import 'opcode.dart';
+import 'objects.dart';
 import 'provenance.dart';
 import 'quantization.dart';
 import 'readable.dart';
@@ -510,7 +511,13 @@ Future<FourdgsAudioSourceDescriptor> _readAudioSourceDescriptor(
     );
   }
 
-  _checkRange(scene, range.offset, range.length, 'Audio Source descriptor');
+  _checkRange(
+    scene,
+    range.offset,
+    range.length,
+    'Audio Source descriptor',
+    frontMatter: true,
+  );
   final blob = await source.read(range.offset, range.length);
   final parsed = FourdgsAudioSourceRecord.parse(
     _recordContent(blob, opAudioSource, 'Audio Source descriptor'),
@@ -578,7 +585,7 @@ Future<FourdgsCameraTrajectory?> readFourdgsCamera(
 ) async {
   final range = scene.cameraRange;
   if (range == null) return null;
-  _checkRange(scene, range.offset, range.length, 'camera');
+  _checkRange(scene, range.offset, range.length, 'camera', frontMatter: true);
   final blob = await source.read(range.offset, range.length);
   final camera = FourdgsCamera.parse(_recordContent(blob, opCamera, 'camera'));
   return FourdgsCameraTrajectory(
@@ -600,7 +607,13 @@ Future<List<FourdgsMetadata>> readFourdgsMetadata(
 ) async {
   final out = <FourdgsMetadata>[];
   for (final range in scene.metadataRanges) {
-    _checkRange(scene, range.offset, range.length, 'metadata');
+    _checkRange(
+      scene,
+      range.offset,
+      range.length,
+      'metadata',
+      frontMatter: true,
+    );
     final blob = await source.read(range.offset, range.length);
     out.add(
       FourdgsMetadata.parse(_recordContent(blob, opMetadata, 'metadata')),
@@ -617,6 +630,10 @@ Future<List<FourdgsAttachment>> readFourdgsAttachments(
 ) async {
   final out = <FourdgsAttachment>[];
   for (final range in scene.attachmentRanges) {
+    // Exempt from the front-matter ceiling: section 5 says attachments "carry
+    // payload, and payload of unbounded size — a thumbnail sheet, a provenance
+    // blob". Capping them refuses on the indexed path a file the streamed path
+    // reads, which is the same mistake as capping chunk data.
     _checkRange(scene, range.offset, range.length, 'attachment');
     final blob = await source.read(range.offset, range.length);
     out.add(
@@ -634,9 +651,10 @@ Future<List<FourdgsAttachment>> readFourdgsAttachments(
 ///
 /// The object-layer records (`0x24`, `0x25`) are in the same opcode family and
 /// are framed by the same walk, but they belong to the object layer rather than
-/// provenance, so they are skipped here. A still-reserved opcode (`0x26`–`0x2F`)
-/// is framed and skipped by both, which is the forward-compatibility rule doing
-/// its job inside a family — and why the ranges carry their opcode.
+/// provenance, so they are skipped here — [readFourdgsObjects] reads them from
+/// the same ranges. A still-reserved opcode (`0x26`–`0x2F`) is framed and
+/// skipped by both, which is the forward-compatibility rule doing its job
+/// inside a family — and why the ranges carry their opcode.
 Future<FourdgsProvenance> readFourdgsProvenance(
   FourdgsReadable source,
   FourdgsIndexedScene scene,
@@ -650,7 +668,13 @@ Future<FourdgsProvenance> readFourdgsProvenance(
         opcode != opGeodeticAnchor) {
       continue;
     }
-    _checkRange(scene, range.offset, range.length, 'provenance');
+    _checkRange(
+      scene,
+      range.offset,
+      range.length,
+      'provenance',
+      frontMatter: true,
+    );
     final blob = await source.read(range.offset, range.length);
     final content = _recordContent(blob, opcode, 'provenance');
     switch (opcode) {
@@ -670,6 +694,57 @@ Future<FourdgsProvenance> readFourdgsProvenance(
   return out;
 }
 
+/// Every object-layer record, from the same framed ranges as provenance.
+///
+/// Deferred for the same reason: a scene with a thousand-sample track costs
+/// nothing to open, and a consumer that only wants geometry never pays for the
+/// layer at all.
+Future<FourdgsObjectLayer> readFourdgsObjects(
+  FourdgsReadable source,
+  FourdgsIndexedScene scene,
+) async {
+  final out = FourdgsObjectLayer();
+  for (final range in scene.provenanceRanges) {
+    final opcode = range.opcode;
+    if (opcode != opObjectTable && opcode != opObjectTrack) continue;
+    // Refused before the read, not after: the opcode is already known from the
+    // front-matter walk, so a second table need not be transferred and
+    // materialized — up to the front-matter cap — only to be rejected below.
+    if (opcode == opObjectTable && out.table != null) {
+      throw const FourdgsMalformedFile(
+        'the file carries a second Object Table; a scene has one '
+        '(section 5.15.6)',
+      );
+    }
+    _checkRange(
+      scene,
+      range.offset,
+      range.length,
+      'object layer',
+      frontMatter: true,
+    );
+    final blob = await source.read(range.offset, range.length);
+    final content = _recordContent(blob, opcode, 'object layer');
+    if (opcode == opObjectTable) {
+      if (out.table != null) {
+        throw FourdgsMalformedFile(
+          'the file carries a second Object Table; a scene has one '
+          '(section 5.15.6)',
+        );
+      }
+      out.table = FourdgsObjectTable.parse(content);
+    } else {
+      // Section 5.15.7: a zero-sample track "has no pose and is read as absent".
+      final track = FourdgsObjectTrack.parse(content);
+      if (track.sampleCount > 0) {
+        out.tracks.add(track);
+      }
+    }
+  }
+  out.check();
+  return out;
+}
+
 /// Refuses a byte range the index asked for but the file cannot contain.
 ///
 /// Checked *before* the read, not after: `_recordContent` validates framing,
@@ -680,15 +755,20 @@ void _checkRange(
   FourdgsIndexedScene scene,
   int offset,
   int length,
-  String what,
-) {
+  String what, {
+  bool frontMatter = false,
+}) {
   if (offset < 0 || length < 0 || offset + length > scene.resourceBytes) {
     throw FourdgsMalformedFile(
       'the $what range is [$offset, ${offset + length}) of a '
       '${scene.resourceBytes} byte file',
     );
   }
-  if (length > maxFrontMatterBytes) {
+  // Front matter only. Chunk and SH band payloads are gaussian data, bounded by
+  // the per-stream decoded-size caps rather than by this ceiling, and a
+  // legitimate scene can carry a chunk far larger than it — capping them here
+  // refuses on the indexed path a file the streamed path decodes happily.
+  if (frontMatter && length > maxFrontMatterBytes) {
     throw FourdgsMalformedFile(
       'the $what range is $length bytes, past the $maxFrontMatterBytes ceiling',
     );

@@ -15,6 +15,7 @@ import 'chunk_decoder.dart';
 import 'exceptions.dart';
 import 'model.dart';
 import 'opcode.dart';
+import 'objects.dart';
 import 'provenance.dart';
 import 'quantization.dart';
 import 'records.dart';
@@ -46,7 +47,9 @@ class FourdgsScene {
     this.statistics,
     this.summaryCrcOk,
     FourdgsProvenance? provenance,
-  }) : provenance = provenance ?? FourdgsProvenance();
+    FourdgsObjectLayer? objects,
+  }) : provenance = provenance ?? FourdgsProvenance(),
+       objects = objects ?? FourdgsObjectLayer();
 
   final FourdgsHeader header;
   final FourdgsQuantization quantization;
@@ -76,6 +79,10 @@ class FourdgsScene {
   /// nothing and no Header flag announces the family, so this is filled by the
   /// walk itself.
   final FourdgsProvenance provenance;
+
+  /// Every object-layer record the file carried (spec sections 5.15.6-5.15.7).
+  /// Empty when it carried none, which is a value and not an error.
+  final FourdgsObjectLayer objects;
 
   /// Compatibility view of the first source as a legacy track.
   ///
@@ -142,6 +149,7 @@ FourdgsScene readFourdgsBytes(
   bool truncated = false;
   bool sawFooter = false;
   final provenance = FourdgsProvenance();
+  final objects = FourdgsObjectLayer();
 
   try {
     for (final record in iterRecords(data, fourdgsMagic.length)) {
@@ -269,6 +277,31 @@ FourdgsScene readFourdgsBytes(
           if (trajectory.sampleCount > 0) {
             provenance.trajectories.add(trajectory);
           }
+        case opObjectTable:
+          // Read wherever it appears. Section 5.15 is explicit that these
+          // records are "skipped and dispatched by opcode, not by position", so
+          // a table or track after a Chunk is a legal file — and dropping one
+          // loses the post-track state its gaussians require. The indexed
+          // opener's front-matter walk stops at the first Chunk and so cannot
+          // see them; that asymmetry is a gap in the indexed reader, not a
+          // licence for this path to discard data the format allows.
+          if (objects.table != null) {
+            throw FourdgsMalformedFile(
+              'the file carries a second Object Table; a scene has one '
+              '(section 5.15.6)',
+            );
+          }
+          objects.table = FourdgsObjectTable.parse(record.content);
+          break;
+        case opObjectTrack:
+          // Section 5.15.7: a zero-sample track "has no pose and is read as
+          // absent". Kept, one empty track would make a non-empty object layer,
+          // and two empty tracks for an id a duplicate the layer refuses.
+          final track = FourdgsObjectTrack.parse(record.content);
+          if (track.sampleCount > 0) {
+            objects.tracks.add(track);
+          }
+          break;
         case opGeodeticAnchor:
           provenance.anchors.add(FourdgsGeodeticAnchor.parse(record.content));
         case opStatistics:
@@ -348,6 +381,7 @@ FourdgsScene readFourdgsBytes(
   // record a file carries — so a missing rig or frame is missing for good and
   // refusing it is right, even though the trailing magic never arrived.
   provenance.check(truncated: truncated && !sawFooter);
+  objects.check();
 
   return FourdgsScene(
     header: header,
@@ -372,6 +406,7 @@ FourdgsScene readFourdgsBytes(
     statistics: statistics,
     summaryCrcOk: summaryCrcOk,
     provenance: provenance,
+    objects: objects,
   );
 }
 
@@ -552,6 +587,13 @@ FourdgsGaussianSet assembleGaussians(
     (FourdgsDecodedChunk c) => c.sourceIndex != null,
   );
   final sourceIndex = haveSource ? Int32List(total) : null;
+  // Membership is per chunk and optional, so a file may carry it on some
+  // chunks and not others. A chunk without the stream contributes background
+  // rather than a hole: the merged array exists when ANY chunk had one, which
+  // is what makes null mean "this scene has no object membership" rather than
+  // "the last chunk did not".
+  final haveObjects = chunks.any((FourdgsDecodedChunk c) => c.objectId != null);
+  final objectId = haveObjects ? Uint32List(total) : null;
 
   int at = 0;
   for (final chunk in chunks) {
@@ -566,6 +608,9 @@ FourdgsGaussianSet assembleGaussians(
     winHi.setRange(at, at + chunk.count, chunk.winHi);
     if (sourceIndex != null) {
       sourceIndex.setRange(at, at + chunk.count, chunk.sourceIndex!);
+    }
+    if (objectId != null && chunk.objectId != null) {
+      objectId.setRange(at, at + chunk.count, chunk.objectId!);
     }
     at += chunk.count;
   }
@@ -584,5 +629,6 @@ FourdgsGaussianSet assembleGaussians(
     sh: sh?.values,
     shCoefficients: sh?.coefficients ?? 0,
     sourceIndex: sourceIndex,
+    objectId: objectId,
   );
 }

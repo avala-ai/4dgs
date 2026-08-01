@@ -153,6 +153,17 @@ class FourdgsQuantization {
     final scheme = c.string();
     final origin = c.f64s(3);
     final steps = c.f64s(8);
+    final stepSh = c.u8();
+    final bounds = c.strMap();
+    // `object_id` is an exact label (section 6.6), not a metric value, so there
+    // is no meaningful error bound between two different labels — section 6.5
+    // makes a bound for it a refusal rather than something to ignore.
+    if (bounds.containsKey('object_id')) {
+      throw FourdgsMalformedFile(
+        "Quantization.bounds contains object_id='${bounds['object_id']}'; "
+        'object_id is an exact label and MUST NOT carry a bound',
+      );
+    }
     return FourdgsQuantization(
       scheme: scheme,
       posOrigin: origin,
@@ -164,8 +175,8 @@ class FourdgsQuantization {
       stepMotion: steps[5],
       stepTime: steps[6],
       stepSigmaLog: steps[7],
-      stepSh: c.u8(),
-      bounds: c.strMap(),
+      stepSh: stepSh,
+      bounds: bounds,
     );
   }
 }
@@ -1280,6 +1291,365 @@ class FourdgsRigTrajectory {
         }
       }
     }
+  }
+}
+
+/// Background / unassigned. A gaussian carrying this id belongs to no object.
+const int backgroundObject = 0;
+
+/// One object's advisory description. Nothing here transforms a gaussian.
+/// Refuse a value the record's field cannot hold.
+///
+/// These ids and dimensions are `u32` and `u16` on the wire, so the parser can
+/// only ever produce values inside them. A caller constructing a record can
+/// produce a negative or out-of-range id, and nothing downstream would notice:
+/// membership is compared as an unsigned integer, so a track keyed outside the
+/// range matches no gaussian while still looking valid. Rust gets this from its
+/// types and Python checks it by hand; Dart carries `int`, so it checks too.
+void _checkUnsignedField(int value, int max, String message) {
+  if (value < 0 || value > max) {
+    throw FourdgsMalformedFile(message);
+  }
+}
+
+/// The largest finite f32, the range every object-table lane is stored in.
+const double _f32Max = 3.4028234663852886e38;
+
+class FourdgsObjectEntry {
+  FourdgsObjectEntry({
+    required this.objectId,
+    required this.label,
+    required this.anchor,
+    required this.dynamics,
+    required this.embedding,
+  });
+
+  final int objectId;
+  final String label;
+  final List<double> anchor;
+
+  /// `[velocity, angularVelocity, acceleration]`, or null when absent. Never a
+  /// substitute for a track: reconstruction reads none of these.
+  final List<List<double>>? dynamics;
+  final List<double>? embedding;
+}
+
+/// The scene's one Object Table. Opcode `0x24`.
+///
+/// Everything in it is advisory: membership comes from the `object_id`
+/// attribute (section 6.6) and geometry changes only through an Object Track
+/// (section 5.15.7). A reader that skips this record still decodes every
+/// gaussian correctly; what it loses is the names.
+class FourdgsObjectTable {
+  FourdgsObjectTable({required this.embeddingDim, required this.entries});
+
+  final int embeddingDim;
+  final List<FourdgsObjectEntry> entries;
+
+  static FourdgsObjectTable parse(Uint8List content) {
+    final c = FourdgsCursor(content);
+    final objectCount = c.u32();
+    final embeddingDim = c.u16();
+    // The smallest an entry can be: id, an empty label, the anchor and the
+    // dynamics flag, plus the embedding flag once a space is declared. Bounded
+    // before anything is sized from it, like every other count-prefixed record.
+    final minimumEntryBytes = 4 + 4 + 12 + 1 + (embeddingDim > 0 ? 1 : 0);
+    if (objectCount > c.remaining ~/ minimumEntryBytes) {
+      throw FourdgsMalformedFile(
+        'ObjectTable declares $objectCount objects but holds room for '
+        '${c.remaining ~/ minimumEntryBytes}',
+      );
+    }
+    final entries = <FourdgsObjectEntry>[];
+    for (int i = 0; i < objectCount; i++) {
+      final objectId = c.u32();
+      final label = c.string();
+      final anchor = c.f32s(3);
+      final dynamicsPresent = c.u8();
+      if (dynamicsPresent > 1) {
+        throw FourdgsMalformedFile(
+          'ObjectTable entry $i has dynamics_present $dynamicsPresent; it must '
+          'be 0 or 1 (section 5.15.6)',
+        );
+      }
+      final dynamics =
+          dynamicsPresent == 1
+              ? <List<double>>[c.f32s(3), c.f32s(3), c.f32s(3)]
+              : null;
+      List<double>? embedding;
+      if (embeddingDim > 0) {
+        final hasEmbedding = c.u8();
+        if (hasEmbedding > 1) {
+          throw FourdgsMalformedFile(
+            'ObjectTable entry $i has has_embedding $hasEmbedding; it must be '
+            '0 or 1 (section 5.15.6)',
+          );
+        }
+        if (hasEmbedding == 1) {
+          if (embeddingDim * 4 > c.remaining) {
+            throw FourdgsMalformedFile(
+              'ObjectTable entry $i declares a $embeddingDim-dimensional '
+              'embedding (${embeddingDim * 4} bytes), ${c.remaining} remain',
+            );
+          }
+          embedding = c.f32s(embeddingDim);
+        }
+      }
+      entries.add(
+        FourdgsObjectEntry(
+          objectId: objectId,
+          label: label,
+          anchor: anchor,
+          dynamics: dynamics,
+          embedding: embedding,
+        ),
+      );
+    }
+    final table = FourdgsObjectTable(
+      embeddingDim: embeddingDim,
+      entries: entries,
+    );
+    table.check();
+    return table;
+  }
+
+  /// Refuse a table that cannot be indexed by id, and values that are not
+  /// numbers. Two entries for one id make every lookup a coin toss, which is
+  /// the duplicate-name failure section 5.15.2 refuses for frames and sensors,
+  /// spelled with integers.
+  void check() {
+    _checkUnsignedField(
+      embeddingDim,
+      0xFFFF,
+      'ObjectTable embedding_dim is $embeddingDim; expected an integer in '
+      '[0, 65535]',
+    );
+    final seen = <int>{};
+    for (final entry in entries) {
+      _checkUnsignedField(
+        entry.objectId,
+        0xFFFFFFFF,
+        'ObjectTable entry has object_id ${entry.objectId}; expected an '
+        'integer in [0, 4294967295]',
+      );
+      if (!seen.add(entry.objectId)) {
+        throw FourdgsMalformedFile(
+          'two ObjectTable entries describe object ${entry.objectId}; entries '
+          'are referred to by id and nothing else (section 5.15.6)',
+        );
+      }
+      // These lanes are stored as f32, so the range is the field's rather than
+      // the double's: a finite 1e100 fits no conforming record — written as f32
+      // it rounds to infinity — and Python refuses it as
+      // `object-value-out-of-f32-range`.
+      void finite(String label, List<double> values) {
+        for (int k = 0; k < values.length; k++) {
+          if (values[k].isFinite && values[k].abs() > _f32Max) {
+            throw FourdgsMalformedFile(
+              'ObjectTable entry ${entry.objectId}: $label[$k] is '
+              '${values[k]}, outside the finite f32 range',
+            );
+          }
+          if (!values[k].isFinite) {
+            throw FourdgsMalformedFile(
+              'ObjectTable entry ${entry.objectId}: $label[$k] is '
+              '${values[k]}; every stored value must be finite '
+              '(section 5.15.6)',
+            );
+          }
+        }
+      }
+
+      // The wire record carries f32[3] for each of these, so a shorter vector
+      // is a shape no conforming file can hold — Rust cannot express it, its
+      // fields are [f32; 3]. The parser always builds three; a caller
+      // constructing a table can hand over two, and every value in it would be
+      // checked and accepted.
+      void width(String label, List<double> values) {
+        if (values.length != 3) {
+          throw FourdgsMalformedFile(
+            'ObjectTable entry ${entry.objectId}: $label has '
+            '${values.length} values, expected 3',
+          );
+        }
+      }
+
+      width('anchor', entry.anchor);
+      finite('anchor', entry.anchor);
+      final dynamics = entry.dynamics;
+      if (dynamics != null) {
+        // Three vectors when the dynamics flag is set. Indexing first turns a
+        // short list into a RangeError — a library's error rather than this
+        // library naming the object and the field — and lets a longer one
+        // through with the extra vectors silently ignored.
+        if (dynamics.length != 3) {
+          throw FourdgsMalformedFile(
+            'ObjectTable entry ${entry.objectId}: dynamics has '
+            '${dynamics.length} vectors, expected 3 (velocity, '
+            'angular_velocity, acceleration)',
+          );
+        }
+        width('velocity', dynamics[0]);
+        width('angular_velocity', dynamics[1]);
+        width('acceleration', dynamics[2]);
+        finite('velocity', dynamics[0]);
+        finite('angular_velocity', dynamics[1]);
+        finite('acceleration', dynamics[2]);
+      }
+      // An embedding has to match the space the table declares. `embedding_dim`
+      // is declared once for the whole file, so a vector of a different width —
+      // or any vector at all when the table declares no embedding space —
+      // describes a coordinate system nothing else in the file shares. Python
+      // refuses both; the parser cannot build either shape, but a caller
+      // constructing a table can.
+      final embedding = entry.embedding;
+      if (embedding != null) {
+        if (embeddingDim == 0) {
+          throw FourdgsMalformedFile(
+            'object ${entry.objectId}: an embedding is present but '
+            'embedding_dim is 0',
+          );
+        }
+        if (embedding.length != embeddingDim) {
+          throw FourdgsMalformedFile(
+            'object ${entry.objectId}: embedding has ${embedding.length} '
+            'values, embedding_dim declares $embeddingDim',
+          );
+        }
+        finite('embedding', embedding);
+      }
+    }
+  }
+}
+
+/// One object's rigid pose over the scene clock. Opcode `0x25`, one per object.
+///
+/// Structurally a [FourdgsRigTrajectory] keyed by object id rather than by
+/// name, and deliberately so: it satisfies [FourdgsPoseSampled] through
+/// [FourdgsObjectTrackView], so section 5.15.4's clamp-and-slerp is the same
+/// code for both and cannot drift between them.
+class FourdgsObjectTrack {
+  FourdgsObjectTrack({
+    required this.objectId,
+    required this.interpolation,
+    required this.times,
+    required this.rotations,
+    required this.translations,
+  });
+
+  final int objectId;
+  final int interpolation;
+  final List<double> times;
+  final List<List<double>> rotations;
+  final List<List<double>> translations;
+
+  int get sampleCount => times.length;
+
+  static FourdgsObjectTrack parse(Uint8List content) {
+    final c = FourdgsCursor(content);
+    final objectId = c.u32();
+    final interpolation = c.u8();
+    final count = c.u32();
+    // Each sample is 8 + 32 + 24 bytes, as for a rig trajectory.
+    if (count > c.remaining ~/ rigTrajectorySampleBytes) {
+      throw FourdgsMalformedFile(
+        'ObjectTrack for object $objectId declares $count samples but holds '
+        'room for ${c.remaining ~/ rigTrajectorySampleBytes}',
+      );
+    }
+    if (count > maxRigTrajectorySamples) {
+      throw FourdgsMalformedFile(
+        'ObjectTrack for object $objectId declares $count samples, past the '
+        '$maxRigTrajectorySamples ceiling',
+      );
+    }
+    final times = <double>[];
+    final rotations = <List<double>>[];
+    final translations = <List<double>>[];
+    for (int i = 0; i < count; i++) {
+      times.add(c.f64());
+      rotations.add(c.f64s(4));
+      translations.add(c.f64s(3));
+    }
+    final track = FourdgsObjectTrack(
+      objectId: objectId,
+      interpolation: interpolation,
+      times: times,
+      rotations: rotations,
+      translations: translations,
+    );
+    // Section 5.15.7: a zero-sample track "has no pose and is read as absent",
+    // so reading one refuses nothing about its pose. The id is not part of the
+    // pose — the same section requires every track to refuse object 0 — so that
+    // rule holds for an absent track too, and the rest waits for the writer.
+    if (track.times.isNotEmpty) {
+      track.check();
+    } else if (track.objectId == backgroundObject) {
+      throw FourdgsMalformedFile(
+        'an ObjectTrack names object 0, which means background / unassigned; a '
+        'track must move an object that exists (section 5.15.7)',
+      );
+    }
+    return track;
+  }
+
+  /// A track's own rules: it moves a real object, and its samples are a
+  /// function of time. The pose rules are the trajectory's, so they are
+  /// checked by the trajectory's checker rather than restated — the two
+  /// records interpolate identically and a second copy is a second thing to
+  /// get wrong.
+  void check() {
+    _checkUnsignedField(
+      objectId,
+      0xFFFFFFFF,
+      'ObjectTrack has object_id $objectId; expected an integer in '
+      '[0, 4294967295]',
+    );
+    if (objectId == backgroundObject) {
+      throw FourdgsMalformedFile(
+        'an ObjectTrack names object 0, which means background / unassigned; a '
+        'track must move an object that exists (section 5.15.7)',
+      );
+    }
+    // The trajectory rules iterate each array on its own, so they cannot see a
+    // track whose arrays disagree in length — a shape the parser cannot produce
+    // but a caller building a record can. Left to them, pose sampling reads past
+    // the short array and the file comes back as a range error rather than a
+    // malformed-file error. Python and Rust check this before delegating.
+    if (rotations.length != times.length ||
+        translations.length != times.length) {
+      throw FourdgsMalformedFile(
+        'track for object $objectId: ${times.length} times, '
+        '${rotations.length} rotations, and ${translations.length} '
+        'translations; every sample needs all three',
+      );
+    }
+    // And each sample has to be the right width. The trajectory rules iterate
+    // whatever coordinates are present, so a translation of two numbers passes
+    // them and then reads past the end during composition rather than being
+    // refused. Rust cannot express this — its samples are [f64; 4] and
+    // [f64; 3] — and Python names it; here it has to be checked.
+    for (int i = 0; i < times.length; i++) {
+      if (rotations[i].length != 4) {
+        throw FourdgsMalformedFile(
+          'track for object $objectId: sample $i rotation has '
+          '${rotations[i].length} values, expected 4',
+        );
+      }
+      if (translations[i].length != 3) {
+        throw FourdgsMalformedFile(
+          'track for object $objectId: sample $i translation has '
+          '${translations[i].length} values, expected 3',
+        );
+      }
+    }
+    FourdgsRigTrajectory(
+      name: 'object $objectId',
+      interpolation: interpolation,
+      times: times,
+      rotations: rotations,
+      translations: translations,
+    ).check();
   }
 }
 

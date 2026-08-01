@@ -26,6 +26,16 @@ happened.
   any chain depth (spec §11); GOP-invariants are enforced and rotation is restated absolutely.
   `keyframeDeltaStatesJson` emits the canonical reconstruction-at-an-instant the SDKs are diffed on.
   Decode only this milestone — there is no encoder.
+- Object-layer decode (spec §5.15.6-§5.15.7, §6.6). `FourdgsObjectTable.parse` and
+  `FourdgsObjectTrack.parse` read the two records, the `object_id` attribute stream (id 14) is
+  decoded onto `FourdgsGaussianSet.objectId`, and `FourdgsObjectLayer` composes an object's SE(3)
+  track onto reconstructed state — `center = R * c0 + T`, `orientation = R ⊗ r0`, base first.
+  Available on both read paths: `scene.objects` on the streamed path, `readFourdgsObjects` on the
+  indexed one, where the records are framed at open and fetched only when asked for, as provenance
+  is. A gaussian with `object_id = 0`, or whose object has no track, keeps its base state; a scene
+  that carries no layer produces an empty `FourdgsObjectLayer`, which is a value and not an error.
+  `FourdgsState` now carries `orientations` and `objectId` alongside centres and opacity, so a
+  caller can compose the layer without re-deriving either.
 - `FourdgsReadable` as the single abstraction either path needs — a size and a byte range — with
   `FourdgsBytes` in the core and `FourdgsFileReadable` in `package:fourdgs/io.dart`. Transports live
   at the edges, so the decoder can be tested without a network and shipped without a platform.
@@ -45,8 +55,9 @@ happened.
   the cross-record rules (unique names, resolving rig and frame references) and the arithmetic the
   records imply — shortest-arc slerp, clamped pose sampling, sensor-in-scene composition.
 - `conformance/`, building `decode_streamed` and `decode_indexed`, registered in
-  `tests/conformance/run.py` and skipped until built. Both paths report provenance in the canonical
-  summary. The object-layer variants and the invalid corpus's refusal expectations are declined.
+  `tests/conformance/run.py` and skipped until built. Both paths report provenance and compose the
+  object layer in the canonical summary, which is 105 checks — the same count Rust and TypeScript
+  take. The invalid corpus's refusal expectations are declined.
 - Tests for the one behaviour the corpus cannot reach: the indexed reader's front-matter scan runs
   to the first Chunk, so a Camera, Metadata or Attachment record sitting behind a large embedded
   audio track is still found. The harness only ever exercises the default 64 KiB probe on scenes
