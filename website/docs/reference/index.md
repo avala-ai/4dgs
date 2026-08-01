@@ -45,7 +45,7 @@ same for the provenance family, so every binding emits identical bytes with no p
 | Provenance: rig trajectory + pose interpolation   | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Object membership (`object_id`)                   | Yes    | Yes        | Yes     | No      | No      | No      |
 | Object Table: labels, anchors, embeddings         | Yes    | Yes        | Yes     | No      | No      | No      |
-| Object Track: rigid state composition             | Yes    | Yes        | Yes     | No      | No      | No      |
+| Object Track: rigid state composition¹            | Yes    | Yes        | Yes     | No      | No      | No      |
 | Temporal model `keyframe-delta`, decode           | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Delta composition, chained                        | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Delta composition, keyframe-referenced            | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
@@ -61,6 +61,12 @@ same for the provenance family, so every binding emits identical bytes with no p
 | Convert from PLY frame sequences                  | Yes    | No         | No      | No      | No      | No      |
 | glTF interop (import, snapshot export)            | Yes    | No         | No      | No      | No      | No      |
 | USD interop (import, snapshot export)             | Yes    | No         | No      | No      | No      | No      |
+
+¹ On the `gaussian-birth` path. No implementation composes object tracks during
+`keyframe-delta` reconstruction: that path rebuilds base centres and scales from bins and
+never reads the object layer, so a scene carrying both decodes to its uncomposed state in
+every SDK. The object-layer variants the suite runs are `gaussian-birth`, so no row here
+is evidence either way about the combination — see issue #79.
 | USD animated export (keyframe-delta time samples) | Yes    | No         | No      | No      | No      | No      |
 | Inspect and validate                              | Yes    | Planned    | Planned | Planned | Planned | Planned |
 
