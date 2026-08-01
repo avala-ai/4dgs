@@ -485,4 +485,26 @@ void main() {
       throwsA(isA<FourdgsMalformedFile>()),
     );
   });
+
+  test('an object track with mismatched sample arrays is refused', () {
+    // The trajectory rules iterate each array independently, so a track with two
+    // times and one rotation used to pass and fail later inside pose sampling.
+    // Python and Rust refuse it at check time; this pins the same answer here.
+    expect(
+      () =>
+          FourdgsObjectTrack(
+            objectId: 7,
+            interpolation: 0,
+            times: <double>[0.0, 1.0],
+            rotations: <List<double>>[
+              <double>[0.0, 0.0, 0.0, 1.0],
+            ],
+            translations: <List<double>>[
+              <double>[0.0, 0.0, 0.0],
+              <double>[1.0, 1.0, 1.0],
+            ],
+          ).check(),
+      throwsA(isA<FourdgsMalformedFile>()),
+    );
+  });
 }

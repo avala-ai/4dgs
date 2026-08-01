@@ -1517,6 +1517,19 @@ class FourdgsObjectTrack {
         'track must move an object that exists (section 5.15.7)',
       );
     }
+    // The trajectory rules iterate each array on its own, so they cannot see a
+    // track whose arrays disagree in length — a shape the parser cannot produce
+    // but a caller building a record can. Left to them, pose sampling reads past
+    // the short array and the file comes back as a range error rather than a
+    // malformed-file error. Python and Rust check this before delegating.
+    if (rotations.length != times.length ||
+        translations.length != times.length) {
+      throw FourdgsMalformedFile(
+        'track for object $objectId: ${times.length} times, '
+        '${rotations.length} rotations, and ${translations.length} '
+        'translations; every sample needs all three',
+      );
+    }
     FourdgsRigTrajectory(
       name: 'object $objectId',
       interpolation: interpolation,
