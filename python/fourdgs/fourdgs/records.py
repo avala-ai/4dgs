@@ -1207,6 +1207,16 @@ class ObjectTable:
             for k, value in enumerate(e.anchor):
                 _check_object_f32(value, f"object {e.object_id}: anchor[{k}]")
             if e.dynamics is not None:
+                # The record carries exactly three vectors when the dynamics flag is set.
+                # `strict=True` below would catch a different count, but as a raw
+                # ValueError — the wrong error class for a bad file, and one that names
+                # neither the object nor the field.
+                if len(e.dynamics) != 3:
+                    raise MalformedFile(
+                        f"object {e.object_id}: dynamics has {len(e.dynamics)} vectors, expected 3 "
+                        f"(velocity, angular_velocity, acceleration)",
+                        code="invalid-object-dynamics-shape",
+                    )
                 for name, vector in zip(("velocity", "angular_velocity", "acceleration"), e.dynamics, strict=True):
                     if len(vector) != 3:
                         raise MalformedFile(

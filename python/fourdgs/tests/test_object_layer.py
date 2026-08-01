@@ -582,3 +582,21 @@ def test_an_object_table_vector_of_the_wrong_width_is_refused():
     with pytest.raises(fourdgs.MalformedFile) as caught:
         rec.ObjectTable(embedding_dim=0, entries=[short]).check()
     assert caught.value.code == "invalid-object-dynamics-shape"
+
+
+def test_a_dynamics_tuple_of_the_wrong_length_is_a_malformed_file():
+    """Three vectors when the flag is set — and a bad count is a file error, not a TypeError.
+
+    `zip(..., strict=True)` would notice, but as a raw ValueError: the wrong error
+    class for a bad file, naming neither the object nor the field.
+    """
+    entry = rec.ObjectTableEntry(
+        object_id=1,
+        label="",
+        anchor=[0.0, 0.0, 0.0],
+        dynamics=([0.0] * 3, [0.0] * 3),
+        embedding=None,
+    )
+    with pytest.raises(fourdgs.MalformedFile) as caught:
+        rec.ObjectTable(embedding_dim=0, entries=[entry]).check()
+    assert caught.value.code == "invalid-object-dynamics-shape"
