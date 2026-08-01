@@ -1200,6 +1200,21 @@ export function checkObjectTrack(track: ObjectTrack): void {
         "an object that exists (section 5.15.7)",
     );
   }
+  // The trajectory rules iterate each array on its own, so they cannot see a track whose
+  // arrays disagree in length — a shape the parser cannot produce but a caller building a
+  // record can. Left to them, `poseAt` reads past the short array and the file comes back
+  // as a TypeError rather than a MalformedFile. Python and Rust check this before
+  // delegating; so does this.
+  if (
+    track.rotations.length !== track.times.length ||
+    track.translations.length !== track.times.length
+  ) {
+    throw new MalformedFile(
+      `track for object ${track.objectId}: ${track.times.length} times, ` +
+        `${track.rotations.length} rotations, and ${track.translations.length} translations; ` +
+        "every sample needs all three",
+    );
+  }
   checkRigTrajectory({
     name: `object ${track.objectId}`,
     interpolation: track.interpolation,

@@ -573,3 +573,23 @@ test("a zero-sample object track is read as absent rather than refused", () => {
     MalformedFile,
   );
 });
+
+test("an object track with mismatched sample arrays is a malformed file, not a TypeError", () => {
+  // The trajectory rules iterate each array independently, so a track with two times and
+  // one rotation used to pass and fail later inside poseAt with a raw TypeError. Python
+  // and Rust refuse it at check time; this pins the same answer here.
+  assert.throws(
+    () =>
+      checkObjectTrack({
+        objectId: 7,
+        interpolation: 0,
+        times: [0, 1],
+        rotations: [[0, 0, 0, 1]],
+        translations: [
+          [0, 0, 0],
+          [1, 1, 1],
+        ],
+      }),
+    MalformedFile,
+  );
+});
