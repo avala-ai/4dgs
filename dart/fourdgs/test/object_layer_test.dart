@@ -576,4 +576,31 @@ void main() {
       throwsA(isA<FourdgsMalformedFile>()),
     );
   });
+
+  test('object ids and embedding_dim must fit the fields that carry them', () {
+    // u32 and u16 on the wire, so the parser cannot produce anything else — but
+    // a caller constructing a record can, and nothing downstream notices.
+    for (final bad in <int>[-1, 0x100000000]) {
+      expect(
+        () =>
+            FourdgsObjectTrack(
+              objectId: bad,
+              interpolation: 0,
+              times: const <double>[],
+              rotations: const <List<double>>[],
+              translations: const <List<double>>[],
+            ).check(),
+        throwsA(isA<FourdgsMalformedFile>()),
+        reason: 'object_id $bad should be refused',
+      );
+    }
+    expect(
+      () =>
+          FourdgsObjectTable(
+            embeddingDim: 0x10000,
+            entries: const <FourdgsObjectEntry>[],
+          ).check(),
+      throwsA(isA<FourdgsMalformedFile>()),
+    );
+  });
 }

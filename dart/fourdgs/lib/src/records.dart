@@ -1298,6 +1298,20 @@ class FourdgsRigTrajectory {
 const int backgroundObject = 0;
 
 /// One object's advisory description. Nothing here transforms a gaussian.
+/// Refuse a value the record's field cannot hold.
+///
+/// These ids and dimensions are `u32` and `u16` on the wire, so the parser can
+/// only ever produce values inside them. A caller constructing a record can
+/// produce a negative or out-of-range id, and nothing downstream would notice:
+/// membership is compared as an unsigned integer, so a track keyed outside the
+/// range matches no gaussian while still looking valid. Rust gets this from its
+/// types and Python checks it by hand; Dart carries `int`, so it checks too.
+void _checkUnsignedField(int value, int max, String message) {
+  if (value < 0 || value > max) {
+    throw FourdgsMalformedFile(message);
+  }
+}
+
 class FourdgsObjectEntry {
   FourdgsObjectEntry({
     required this.objectId,
@@ -1401,8 +1415,20 @@ class FourdgsObjectTable {
   /// the duplicate-name failure section 5.15.2 refuses for frames and sensors,
   /// spelled with integers.
   void check() {
+    _checkUnsignedField(
+      embeddingDim,
+      0xFFFF,
+      'ObjectTable embedding_dim is $embeddingDim; expected an integer in '
+      '[0, 65535]',
+    );
     final seen = <int>{};
     for (final entry in entries) {
+      _checkUnsignedField(
+        entry.objectId,
+        0xFFFFFFFF,
+        'ObjectTable entry has object_id ${entry.objectId}; expected an '
+        'integer in [0, 4294967295]',
+      );
       if (!seen.add(entry.objectId)) {
         throw FourdgsMalformedFile(
           'two ObjectTable entries describe object ${entry.objectId}; entries '
@@ -1531,6 +1557,12 @@ class FourdgsObjectTrack {
   /// records interpolate identically and a second copy is a second thing to
   /// get wrong.
   void check() {
+    _checkUnsignedField(
+      objectId,
+      0xFFFFFFFF,
+      'ObjectTrack has object_id $objectId; expected an integer in '
+      '[0, 4294967295]',
+    );
     if (objectId == backgroundObject) {
       throw FourdgsMalformedFile(
         'an ObjectTrack names object 0, which means background / unassigned; a '
