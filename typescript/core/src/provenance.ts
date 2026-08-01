@@ -323,8 +323,13 @@ export class Provenance {
    * Both are refusals rather than repairs: a duplicate name makes every reference a coin
    * toss; a rig reference into a file that carries no such rig would put every sensor on
    * that rig at the origin.
+   *
+   * `truncated` defers only the rules a later record could still satisfy: a sensor
+   * naming a rig, an anchor naming a frame. A duplicate name among records that are
+   * already complete is not one of them — no byte after the cut can make two
+   * SensorCalibration records with one name unambiguous — so those still refuse.
    */
-  check(): void {
+  check(truncated = false): void {
     const groups: readonly [string, readonly string[], string][] = [
       ["CoordinateFrame", this.frames.map((f) => f.name), "5.15.2"],
       ["SensorCalibration", this.sensors.map((s) => s.name), "5.15.3"],
@@ -356,6 +361,10 @@ export class Provenance {
         );
       }
     }
+
+    // Past here the rules resolve a reference into another record. A file cut before
+    // that record arrived is missing the target rather than contradicting itself.
+    if (truncated) return;
 
     // A zero-sample trajectory is "read as though the record were absent" (section
     // 5.15.4), so a rig-relative sensor naming one names a rig this file does not carry

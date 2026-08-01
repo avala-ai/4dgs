@@ -1735,10 +1735,17 @@ impl ObjectTrack {
             track.translations.push([t[0], t[1], t[2]]);
         }
         // Section 5.15.7: a zero-sample track "has no pose and is read as absent", so
-        // reading one refuses nothing. `check` stays strict for the writer, which must
-        // not emit a record whose interpolation byte is outside the registry.
+        // reading one refuses nothing about its pose. The id is not part of the pose —
+        // the same section requires every track to refuse object 0 — so that rule holds
+        // for an absent track too, and the rest waits for the writer's own `check`.
         if !track.times.is_empty() {
             track.check()?;
+        } else if track.object_id == 0 {
+            return Err(Error::Malformed(
+                "an ObjectTrack names object 0, which is background/unassigned; a track \
+                 needs an object to move (section 5.15.6)"
+                    .to_string(),
+            ));
         }
         Ok(track)
     }

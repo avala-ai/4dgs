@@ -178,3 +178,46 @@ def test_a_zero_sample_object_track_is_read_as_absent_rather_than_refused():
 
     with pytest.raises(fourdgs.MalformedFile):
         rec.ObjectTrack(object_id=7, interpolation=7).check()
+
+
+def test_a_cut_file_still_refuses_a_duplicate_name_it_already_carries():
+    """Truncation defers the rules a later record could satisfy, and only those.
+
+    A sensor naming a rig the file has not reached yet is a missing target, so that
+    refusal waits. Two complete `SensorCalibration` records with one name is not
+    missing anything — no byte after the cut makes that name unambiguous — so it is
+    refused whether or not the file was cut.
+    """
+    prov = fourdgs.Provenance()
+    prov.sensors.append(rec.SensorCalibration(name="cam", rotation=[0.0, 0.0, 0.0, 1.0], translation=[0.0] * 3))
+    prov.sensors.append(rec.SensorCalibration(name="cam", rotation=[0.0, 0.0, 0.0, 1.0], translation=[0.0] * 3))
+    with pytest.raises(fourdgs.MalformedFile) as caught:
+        prov.check(truncated=True)
+    assert "cam" in str(caught.value)
+
+    # The deferred half: a rig reference a later record could still satisfy.
+    deferred = fourdgs.Provenance()
+    deferred.sensors.append(
+        rec.SensorCalibration(
+            name="cam",
+            rig_name="rig",
+            pose_reference=1,
+            rotation=[0.0, 0.0, 0.0, 1.0],
+            translation=[0.0] * 3,
+        )
+    )
+    deferred.check(truncated=True)
+    with pytest.raises(fourdgs.MalformedFile):
+        deferred.check()
+
+
+def test_an_absent_object_track_still_refuses_the_background_id():
+    """§5.15.7 makes a zero-sample track's *pose* absent; the id rule is separate.
+
+    "`object_id` MUST NOT be `0`" is stated for every track, so an empty one that
+    names background is still malformed — dropping it as absent would let the file
+    through without the refusal the section requires.
+    """
+    with pytest.raises(fourdgs.MalformedFile) as caught:
+        rec.ObjectTrack.parse(put_u32(0) + put_u8(0) + put_u32(0))
+    assert caught.value.code == "track-names-background"

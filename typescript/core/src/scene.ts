@@ -394,11 +394,13 @@ export async function decodeScene(
     throw new MalformedFile("file has no Header or no Quantization record");
   }
 
-  // The cross-record rules — unique sensor names, a rig reference that resolves —
-  // can only run once the whole front matter has gone past. A truncated file may
-  // legitimately be missing the trajectory a sensor names, so this is skipped there:
-  // the recovery contract is that everything complete before the cut still stands.
-  if (!truncated) provenance.check();
+  // The cross-record rules — unique sensor names, a rig reference that resolves — can
+  // only run once the whole front matter has gone past. A truncated file may legitimately
+  // be missing the trajectory a sensor names, so those reference rules are deferred there
+  // — but the recovery contract is that everything complete before the cut still stands,
+  // and a duplicate name among complete records is exactly that: no later byte can repair
+  // it, so it is refused whether or not the file was cut.
+  provenance.check(truncated);
 
   const audioSources = assembleAudioSourceDescriptors(
     header,

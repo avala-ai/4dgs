@@ -296,8 +296,13 @@ class Provenance:
         rig = pose_at(trajectory, t)
         return extrinsic if rig is None else rig.compose(extrinsic)
 
-    def check(self) -> None:
+    def check(self, *, truncated: bool = False) -> None:
         """The rules no single record can enforce on its own.
+
+        `truncated` defers only the rules a later record could still satisfy: a sensor
+        naming a rig, an anchor naming a frame. A duplicate name among records that are
+        already complete is not one of them — no byte after the cut can make two
+        `SensorCalibration` records with one name unambiguous — so those still refuse.
 
         Both are refusals rather than repairs, for the reason section 5.4 gives about
         window indices. A duplicate sensor name makes every reference to that name a
@@ -335,6 +340,11 @@ class Provenance:
                     f"sensor {sensor.name!r} declares pose_reference "
                     f"{sensor.pose_reference}; the registry defines 0 (scene) and 1 (rig)"
                 )
+
+        # Past here the rules resolve a reference into another record. A file cut before
+        # that record arrived is missing the target rather than contradicting itself.
+        if truncated:
+            return
 
         rigs = {t.name for t in self.trajectories if t.sample_count > 0}
         for sensor in self.sensors:

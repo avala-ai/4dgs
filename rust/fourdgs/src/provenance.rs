@@ -374,6 +374,16 @@ impl Provenance {
     /// plausible, wrong, and quiet; and an anchor naming a frame the file never defined
     /// would put a whole scene somewhere on Earth no producer ever claimed.
     pub fn check(&self) -> Result<()> {
+        self.check_with(false)
+    }
+
+    /// The same rules, with the reference checks deferred when the file was cut.
+    ///
+    /// `truncated` defers only what a later record could still satisfy: a sensor naming
+    /// a rig, an anchor naming a frame. A duplicate name among records that are already
+    /// complete is not one of them — no byte after the cut can make two
+    /// `SensorCalibration` records with one name unambiguous — so those still refuse.
+    pub fn check_with(&self, truncated: bool) -> Result<()> {
         let groups: [(&str, Vec<&str>, &str); 4] = [
             (
                 "CoordinateFrame",
@@ -421,6 +431,12 @@ impl Provenance {
                     sensor.name, sensor.pose_reference
                 )));
             }
+        }
+
+        // Past here the rules resolve a reference into another record. A file cut before
+        // that record arrived is missing the target rather than contradicting itself.
+        if truncated {
+            return Ok(());
         }
 
         for sensor in &self.sensors {

@@ -397,12 +397,12 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
 
     // The cross-record rules — unique names, a rig reference and an anchor that resolve —
     // can only run once the whole front matter has gone past. A truncated file may
-    // legitimately be missing the trajectory a sensor names, so this is skipped there: the
-    // recovery contract is that everything complete before the cut still stands.
-    if !truncated {
-        scene.provenance.check()?;
-        scene.objects.check()?;
-    }
+    // legitimately be missing the trajectory a sensor names, so those reference rules are
+    // deferred there — but the recovery contract is that everything complete before the
+    // cut still stands, and a duplicate name among complete records is exactly that: no
+    // later byte can repair it, so it is refused whether or not the file was cut.
+    scene.provenance.check_with(truncated)?;
+    scene.objects.check()?;
 
     if !header.has_audio()
         && (!audio_descriptors.is_empty() || !audio_payloads.is_empty() || legacy_audio.is_some())

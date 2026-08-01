@@ -462,11 +462,12 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
 
     # The cross-record rules — unique sensor names, a rig reference that resolves —
     # can only run once the whole front matter has gone past. A truncated file may
-    # legitimately be missing the trajectory a sensor names, so this is skipped there:
-    # the recovery contract is that everything complete before the cut still stands.
-    if not truncated:
-        scene.provenance.check()
-        scene.objects.check()
+    # legitimately be missing the trajectory a sensor names, so those reference rules are
+    # deferred there — but the recovery contract is that everything complete before the
+    # cut still stands, and a duplicate name among complete records is exactly that: no
+    # later byte can repair it, so it is refused whether or not the file was cut.
+    scene.provenance.check(truncated=truncated)
+    scene.objects.check()
 
     scene.header = header
     scene.quantization = quant

@@ -382,7 +382,12 @@ class FourdgsProvenance {
   /// rig would put every sensor on that rig at the origin; an anchor naming a
   /// frame the file never defined would put a whole scene somewhere on Earth no
   /// producer ever claimed.
-  void check() {
+  /// `truncated` defers only the rules a later record could still satisfy: a
+  /// sensor naming a rig, an anchor naming a frame. A duplicate name among
+  /// records that are already complete is not one of them — no byte after the
+  /// cut can make two SensorCalibration records with one name unambiguous — so
+  /// those still refuse.
+  void check({bool truncated = false}) {
     final groups = <(String, List<String>, String)>[
       ('CoordinateFrame', <String>[for (final f in frames) f.name], '5.15.2'),
       (
@@ -430,6 +435,11 @@ class FourdgsProvenance {
         );
       }
     }
+
+    // Past here the rules resolve a reference into another record. A file cut
+    // before that record arrived is missing the target rather than
+    // contradicting itself.
+    if (truncated) return;
 
     // A zero-sample trajectory is "read as though the record were absent"
     // (section 5.15.4), so a rig-relative sensor naming one names a rig this

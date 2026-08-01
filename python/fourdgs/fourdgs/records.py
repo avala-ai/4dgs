@@ -1256,10 +1256,17 @@ class ObjectTrack:
             track.rotations.append(c.f64s(4))
             track.translations.append(c.f64s(3))
         # Section 5.15.7: a zero-sample track "has no pose and is read as absent", so
-        # reading one refuses nothing. `check()` stays strict for the writer, which must
-        # not emit a record whose interpolation byte is outside the registry.
+        # reading one refuses nothing about its pose. The id is not part of the pose —
+        # the same section requires every track to refuse object 0 — so that rule holds
+        # for an absent track too, and the rest waits for the writer's own `check()`.
         if track.sample_count:
             track.check()
+        elif track.object_id == 0:
+            raise MalformedFile(
+                "an ObjectTrack names object 0, which is background/unassigned; a track needs an "
+                "object to move (section 5.15.7)",
+                code="track-names-background",
+            )
         return track
 
     def check(self) -> None:
