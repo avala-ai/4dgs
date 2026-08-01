@@ -93,11 +93,21 @@ function quaternionMultiply(
 }
 
 function normalize(q: readonly number[]): [number, number, number, number] {
-  const norm = Math.sqrt(q.reduce((sum, v) => sum + v * v, 0));
+  // Scaled before squaring, the way the audio-source path already does it: a component
+  // near the top of the double range squares to infinity, so the naive norm refuses a
+  // quaternion that has a perfectly good direction and that every other reader
+  // renormalizes. Dividing by the largest magnitude first makes the sum safe and leaves
+  // the direction untouched.
+  const scale = Math.max(Math.abs(q[0]!), Math.abs(q[1]!), Math.abs(q[2]!), Math.abs(q[3]!));
+  if (!Number.isFinite(scale) || scale === 0) {
+    throw new MalformedFile(`a quaternion with scale ${scale} has no direction`);
+  }
+  const scaled = [q[0]! / scale, q[1]! / scale, q[2]! / scale, q[3]! / scale];
+  const norm = Math.sqrt(scaled.reduce((sum, v) => sum + v * v, 0));
   if (!Number.isFinite(norm) || norm === 0) {
     throw new MalformedFile(`a quaternion with norm ${norm} has no direction`);
   }
-  return [q[0]! / norm, q[1]! / norm, q[2]! / norm, q[3]! / norm];
+  return [scaled[0]! / norm, scaled[1]! / norm, scaled[2]! / norm, scaled[3]! / norm];
 }
 
 /**

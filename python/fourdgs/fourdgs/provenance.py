@@ -123,10 +123,18 @@ def _quaternion_multiply(a, b) -> tuple[float, float, float, float]:
 
 
 def _normalize(q) -> tuple[float, float, float, float]:
-    norm = math.sqrt(sum(float(v) * float(v) for v in q))
+    # Scaled before squaring: a component near the top of the double range squares to
+    # infinity, so the naive norm refuses a quaternion that has a perfectly good
+    # direction and that every other reader renormalizes. Dividing by the largest
+    # magnitude first makes the sum safe and leaves the direction untouched.
+    scale = max(abs(float(v)) for v in q)
+    if not math.isfinite(scale) or scale == 0.0:
+        raise MalformedFile(f"a quaternion with scale {scale} has no direction")
+    scaled = [float(v) / scale for v in q]
+    norm = math.sqrt(sum(v * v for v in scaled))
     if not math.isfinite(norm) or norm == 0.0:
         raise MalformedFile(f"a quaternion with norm {norm} has no direction")
-    return tuple(float(v) / norm for v in q)  # type: ignore[return-value]
+    return tuple(v / norm for v in scaled)  # type: ignore[return-value]
 
 
 def slerp(a, b, u: float) -> tuple[float, float, float, float]:

@@ -87,15 +87,35 @@ List<double> quaternionMultiply(List<double> a, List<double> b) {
 }
 
 List<double> normalizeQuaternion(List<double> q) {
+  // Scaled before squaring: a component near the top of the double range squares
+  // to infinity, so the naive norm refuses a quaternion that has a perfectly good
+  // direction and that every other reader renormalizes. Dividing by the largest
+  // magnitude first makes the sum safe and leaves the direction untouched.
+  double scale = 0.0;
+  for (final v in q) {
+    final a = v.abs();
+    if (a > scale) scale = a;
+  }
+  if (!scale.isFinite || scale == 0.0) {
+    throw FourdgsMalformedFile(
+      'a quaternion with scale $scale has no direction',
+    );
+  }
   double normSq = 0.0;
   for (final v in q) {
-    normSq += v * v;
+    final scaled = v / scale;
+    normSq += scaled * scaled;
   }
   final norm = math.sqrt(normSq);
   if (!norm.isFinite || norm == 0.0) {
     throw FourdgsMalformedFile('a quaternion with norm $norm has no direction');
   }
-  return <double>[q[0] / norm, q[1] / norm, q[2] / norm, q[3] / norm];
+  return <double>[
+    q[0] / scale / norm,
+    q[1] / scale / norm,
+    q[2] / scale / norm,
+    q[3] / scale / norm,
+  ];
 }
 
 /// Shortest-arc spherical interpolation between two unit quaternions.

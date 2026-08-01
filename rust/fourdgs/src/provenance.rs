@@ -86,13 +86,29 @@ pub(crate) fn quaternion_multiply(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
 }
 
 fn normalize(q: [f64; 4]) -> Result<[f64; 4]> {
-    let norm = q.iter().map(|v| v * v).sum::<f64>().sqrt();
+    // Scaled before squaring: a component near the top of the double range squares to
+    // infinity, so the naive norm refuses a quaternion that has a perfectly good
+    // direction and that every other reader renormalizes. Dividing by the largest
+    // magnitude first makes the sum safe and leaves the direction untouched.
+    let scale = q.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    if !scale.is_finite() || scale == 0.0 {
+        return Err(Error::Malformed(format!(
+            "a quaternion with scale {scale} has no direction"
+        )));
+    }
+    let scaled = [q[0] / scale, q[1] / scale, q[2] / scale, q[3] / scale];
+    let norm = scaled.iter().map(|v| v * v).sum::<f64>().sqrt();
     if !norm.is_finite() || norm == 0.0 {
         return Err(Error::Malformed(format!(
             "a quaternion with norm {norm} has no direction"
         )));
     }
-    Ok([q[0] / norm, q[1] / norm, q[2] / norm, q[3] / norm])
+    Ok([
+        scaled[0] / norm,
+        scaled[1] / norm,
+        scaled[2] / norm,
+        scaled[3] / norm,
+    ])
 }
 
 /// Shortest-arc spherical interpolation between two unit quaternions.
