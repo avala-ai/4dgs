@@ -35,6 +35,17 @@ from .stream_reader import chunk_stream_bytes, decode_streams, steps_from
 #: so far. A larger header costs one extra round trip, never a wrong parse.
 HEAD_PROBE = 64 * 1024
 
+#: The most bytes one deferred front-matter record may ask an indexed read to hold.
+#:
+#: An index entry is data, and a crafted one can name any length inside the file. The
+#: records this bounds — Camera, Metadata, the provenance family, the object layer, an
+#: audio source descriptor — are small by construction, so a range past this is a claim
+#: the format does not make. It deliberately does not cover chunks, spherical-harmonic
+#: bands or Attachments: those carry payloads the spec allows to be arbitrarily large,
+#: and capping them would refuse valid files. Shared by value with the Rust, TypeScript
+#: and Dart readers, so the same file is read or refused the same way everywhere.
+MAX_FRONT_MATTER_BYTES = 64 * 1024 * 1024
+
 #: How much of an Audio record is read to learn its codec. The codec name is the record's
 #: first field, so a prefix answers it; the track stays where it is.
 AUDIO_CODEC_PREFIX = 4096
@@ -356,7 +367,7 @@ def read_chunk(source: Readable, scene: IndexedScene, entry: rec.ChunkIndexEntry
     return decoded
 
 
-def _read_range(source: Readable, offset: int, length: int, what: str) -> bytes:
+def _read_range(source: Readable, offset: int, length: int, what: str, *, front_matter: bool = False) -> bytes:
     """Read a byte range a record pointed at, refusing one that leaves the file.
 
     An index entry is data, and data in an untrusted file can say anything. A range that
@@ -369,6 +380,8 @@ def _read_range(source: Readable, offset: int, length: int, what: str) -> bytes:
         raise MalformedFile(f"{what} spans [{offset}, {offset + length}), outside the {size}-byte file")
     if length < 9:
         raise MalformedFile(f"{what} is {length} bytes, too short to be a record")
+    if front_matter and length > MAX_FRONT_MATTER_BYTES:
+        raise MalformedFile(f"{what} is {length} bytes, past the {MAX_FRONT_MATTER_BYTES} byte ceiling")
     return source.read(offset, length)
 
 
@@ -377,14 +390,16 @@ def read_camera(source: Readable, scene: IndexedScene) -> rec.Camera | None:
     if scene.camera_range is None:
         return None
     offset, length = scene.camera_range
-    return rec.Camera.parse(Cursor(_read_range(source, offset, length, "the Camera record"), 9).take(length - 9))
+    return rec.Camera.parse(
+        Cursor(_read_range(source, offset, length, "the Camera record", front_matter=True), 9).take(length - 9)
+    )
 
 
 def read_metadata(source: Readable, scene: IndexedScene) -> list[rec.Metadata]:
     """Every Metadata record, by range."""
     out = []
     for offset, length in scene.metadata_ranges:
-        blob = _read_range(source, offset, length, "a Metadata record")
+        blob = _read_range(source, offset, length, "a Metadata record", front_matter=True)
         out.append(rec.Metadata.parse(Cursor(blob, 9).take(length - 9)))
     return out
 
@@ -415,7 +430,7 @@ def read_provenance(source: Readable, scene: IndexedScene) -> Provenance:
     for opcode, offset, length in scene.provenance_ranges:
         if opcode not in (op.COORDINATE_FRAME, op.SENSOR_CALIBRATION, op.RIG_TRAJECTORY, op.GEODETIC_ANCHOR):
             continue
-        blob = _read_range(source, offset, length, f"a {op.name(opcode)} record")
+        blob = _read_range(source, offset, length, f"a {op.name(opcode)} record", front_matter=True)
         content = Cursor(blob, 9).take(length - 9)
         if opcode == op.COORDINATE_FRAME:
             out.frames.append(rec.CoordinateFrame.parse(content))
@@ -444,7 +459,7 @@ def read_objects(source: Readable, scene: IndexedScene) -> ObjectLayer:
     for opcode, offset, length in scene.provenance_ranges:
         if opcode not in (op.OBJECT_TABLE, op.OBJECT_TRACK):
             continue
-        blob = _read_range(source, offset, length, f"a {op.name(opcode)} record")
+        blob = _read_range(source, offset, length, f"a {op.name(opcode)} record", front_matter=True)
         content = Cursor(blob, 9).take(length - 9)
         if opcode == op.OBJECT_TABLE:
             if out.table is not None:
@@ -563,7 +578,7 @@ def _read_audio_source(
         return descriptor
     offset, length = entry.descriptor_range
     descriptor = rec.AudioSource.parse(
-        Cursor(_read_range(source, offset, length, "the Audio Source record"), 9).take(length - 9)
+        Cursor(_read_range(source, offset, length, "the Audio Source record", front_matter=True), 9).take(length - 9)
     )
     if descriptor.source_id != entry.source_id:
         raise MalformedFile(f"Audio Source range for id {entry.source_id} contains id {descriptor.source_id}")

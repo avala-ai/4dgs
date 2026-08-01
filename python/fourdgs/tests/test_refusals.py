@@ -20,6 +20,7 @@ import sys
 import fourdgs
 import numpy as np
 import pytest
+from fourdgs import indexed_reader
 from fourdgs import records as rec
 from fourdgs.indexed_reader import open_indexed, read_chunk
 from fourdgs.readable import BytesReadable
@@ -242,3 +243,34 @@ def test_the_trajectory_sample_ceiling_is_the_same_number_in_every_sdk():
     with pytest.raises(fourdgs.MalformedFile) as caught:
         rec.ObjectTrack.parse(track)
     assert "ceiling" in str(caught.value)
+
+
+def test_the_front_matter_ceiling_is_the_same_number_in_every_sdk():
+    """Rust, TypeScript and Dart refuse a front-matter range past 64 MiB; Python did not.
+
+    An index entry is data, and a crafted one can name any length inside the file. The
+    records this bounds are small by construction, so a range past it is a claim the
+    format does not make — and a reader that honours it while three others refuse is a
+    conformance split, whichever way the file is read.
+    """
+    assert indexed_reader.MAX_FRONT_MATTER_BYTES == 64 * 1024 * 1024
+
+    class _Vast:
+        """A file big enough that the range is inside it — so only the ceiling can refuse."""
+
+        def size(self) -> int:
+            return 1 << 40
+
+        def read(self, offset: int, length: int) -> bytes:
+            raise AssertionError("the ceiling must refuse before anything is transferred")
+
+    huge = indexed_reader.MAX_FRONT_MATTER_BYTES + 1
+    with pytest.raises(fourdgs.MalformedFile) as caught:
+        indexed_reader._read_range(_Vast(), 0, huge, "a Metadata record", front_matter=True)
+    assert "ceiling" in str(caught.value)
+
+    # Chunks, SH bands and Attachments carry payloads the spec allows to be arbitrarily
+    # large. The ceiling deliberately does not reach them, so it cannot refuse a valid
+    # file: the same range without the flag gets as far as the transfer.
+    with pytest.raises(AssertionError):
+        indexed_reader._read_range(_Vast(), 0, huge, "an Attachment record")
