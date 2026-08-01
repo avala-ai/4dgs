@@ -1172,9 +1172,17 @@ export function parseObjectTrack(content: Uint8Array): ObjectTrack {
   }
   const track: ObjectTrack = { objectId, interpolation, times, rotations, translations };
   // §5.15.7: a zero-sample track "has no pose and is read as absent", so reading one
-  // refuses nothing. checkObjectTrack stays strict for the writer, which must not emit a
-  // record whose interpolation byte is outside the registry.
-  if (times.length > 0) checkObjectTrack(track);
+  // refuses nothing about its pose. The id is not part of the pose — the same section
+  // requires every track to refuse object 0 — so that rule holds for an absent track
+  // too, and the rest waits for the writer's own checkObjectTrack.
+  if (times.length > 0) {
+    checkObjectTrack(track);
+  } else if (objectId === BACKGROUND_OBJECT) {
+    throw new MalformedFile(
+      "an ObjectTrack names object 0, which means background / unassigned; a track must " +
+        "move an object that exists (section 5.15.7)",
+    );
+  }
   return track;
 }
 
