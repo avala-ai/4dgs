@@ -125,6 +125,11 @@ Result<std::string> keyframeDeltaStatesJson(Span<const std::uint8_t> bytes, bool
 /// none — the binding should omit the key rather than emit null.
 Result<std::string> provenanceJson(Handle& handle);
 
+/// Canonical object-layer JSON for an opened scene (spec §5.15.6-§5.15.7): the Object
+/// Table, the SE(3) tracks with their sampled poses, and the composed state at three
+/// probes. Empty when the file carries neither object records nor membership.
+Result<std::string> objectsJson(Handle& handle);
+
 /// Release. Both are safe on a handle that never opened, and on a null one.
 void closeScene(Handle& handle) noexcept;
 void closeState(StateHandle& state) noexcept;

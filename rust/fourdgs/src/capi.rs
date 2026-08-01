@@ -2340,9 +2340,11 @@ pub unsafe extern "C" fn fourdgs_scene_objects_json(
         };
         // The whole population, not whatever an earlier seek left resident: the summary
         // reports every gaussian's composed state, and a partial load would silently
-        // report a partial scene. Spherical harmonics are irrelevant to it, so no band
-        // is fetched for their sake.
-        if let Err(e) = scene.inner.load_all(0) {
+        // report a partial scene. The caller's band is preserved — loading at band 0
+        // would drop harmonics it had already paid for, and this accessor must not be
+        // observable in what the caller reads next.
+        let band = scene.inner.loaded_band();
+        if let Err(e) = scene.inner.load_all(band) {
             return report(e);
         }
         let gaussians = scene.inner.loaded().clone();

@@ -176,6 +176,13 @@ class Scene {
   /// emit null. On the indexed path the records are fetched here if not already resident.
   Result<std::string> provenanceJson();
 
+  /// Canonical object-layer JSON (spec §5.15.6-§5.15.7), or an empty string when the file
+  /// carries neither object records nor per-gaussian membership.
+  ///
+  /// Computed by the core, like `provenanceJson`, so that this binding and the Swift one
+  /// cannot drift from Rust on the composition order or the pose interpolation behind it.
+  Result<std::string> objectsJson();
+
   /// Three states, not two: "not checked" and "did not match" are different claims about a
   /// file, and collapsing them reports corruption nobody observed.
   enum class CrcState { kNotChecked = -1, kFailed = 0, kVerified = 1 };

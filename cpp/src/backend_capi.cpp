@@ -649,6 +649,19 @@ Result<std::string> provenanceJson(Handle& handle) {
   return out;
 }
 
+Result<std::string> objectsJson(Handle& handle) {
+  const char* data = nullptr;
+  std::size_t length = 0;
+  // Same shape as provenance, and empty means the same thing: a file with no object
+  // records and no membership, whose summary must read exactly as it did before the
+  // layer existed.
+  const int status = fourdgs_scene_objects_json(asScene(handle), &data, &length);
+  if (status != FOURDGS_STATUS_OK) return failure(status).error();
+  std::string out = (data != nullptr && length != 0) ? std::string(data, length) : std::string();
+  fourdgs_string_free(data, length);
+  return out;
+}
+
 void closeScene(Handle& handle) noexcept {
   // Null is ignored by the ABI, and freeing invalidates every pointer borrowed from it —
   // which is why nothing in this package holds one across a close.

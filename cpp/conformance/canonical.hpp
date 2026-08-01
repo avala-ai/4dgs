@@ -81,6 +81,9 @@ struct SceneSummary {
   const bool* summaryCrcOk = nullptr;  ///< Null renders as JSON null.
   /// Canonical provenance object from the core. Empty omits the key entirely.
   std::string provenanceJson;
+  /// Canonical object-layer JSON from the core: `objects` and `states`. Empty when the
+  /// file carries neither object records nor per-gaussian membership.
+  std::string objectsJson;
 };
 
 /// The statement every implementation must agree on for a variant.
