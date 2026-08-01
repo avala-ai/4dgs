@@ -1195,10 +1195,24 @@ class ObjectTable:
                     code="duplicate-object-id",
                 )
             seen.add(e.object_id)
+            # The wire record carries f32[3] for each of these, so a shorter vector is a
+            # shape no conforming file can hold. Rust cannot express it — its fields are
+            # [f32; 3] — and the parser always builds three, but a caller constructing a
+            # table can hand over two and every value in it would be checked and accepted.
+            if len(e.anchor) != 3:
+                raise MalformedFile(
+                    f"object {e.object_id}: anchor has {len(e.anchor)} values, expected 3",
+                    code="invalid-object-anchor-shape",
+                )
             for k, value in enumerate(e.anchor):
                 _check_object_f32(value, f"object {e.object_id}: anchor[{k}]")
             if e.dynamics is not None:
                 for name, vector in zip(("velocity", "angular_velocity", "acceleration"), e.dynamics, strict=True):
+                    if len(vector) != 3:
+                        raise MalformedFile(
+                            f"object {e.object_id}: {name} has {len(vector)} values, expected 3",
+                            code="invalid-object-dynamics-shape",
+                        )
                     for k, value in enumerate(vector):
                         _check_object_f32(value, f"object {e.object_id}: {name}[{k}]")
             if e.embedding is not None:

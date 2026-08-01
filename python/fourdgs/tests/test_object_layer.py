@@ -558,3 +558,27 @@ def test_the_composed_state_path_applies_tracks_the_base_path_leaves_alone():
     # No layer, or an empty one, is the base state unchanged.
     assert fourdgs.state_at_with_objects(gaussians, None, 2.0)["centers"][0][0] == 1.0
     assert fourdgs.state_at_with_objects(gaussians, fourdgs.ObjectLayer(), 2.0)["centers"][0][0] == 1.0
+
+
+def test_an_object_table_vector_of_the_wrong_width_is_refused():
+    """The wire record carries f32[3] for the anchor and each dynamics vector.
+
+    Rust cannot express a shorter one — its fields are `[f32; 3]` — and the parser
+    always builds three, so this is the writer's path: a caller handing over two
+    coordinates would have every value in them checked and accepted.
+    """
+    entry = rec.ObjectTableEntry(object_id=1, label="", anchor=[1.0, 2.0], dynamics=None, embedding=None)
+    with pytest.raises(fourdgs.MalformedFile) as caught:
+        rec.ObjectTable(embedding_dim=0, entries=[entry]).check()
+    assert caught.value.code == "invalid-object-anchor-shape"
+
+    short = rec.ObjectTableEntry(
+        object_id=1,
+        label="",
+        anchor=[0.0, 0.0, 0.0],
+        dynamics=([0.0, 0.0], [0.0] * 3, [0.0] * 3),
+        embedding=None,
+    )
+    with pytest.raises(fourdgs.MalformedFile) as caught:
+        rec.ObjectTable(embedding_dim=0, entries=[short]).check()
+    assert caught.value.code == "invalid-object-dynamics-shape"
