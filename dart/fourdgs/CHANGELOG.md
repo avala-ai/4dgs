@@ -55,8 +55,9 @@ happened.
   the cross-record rules (unique names, resolving rig and frame references) and the arithmetic the
   records imply — shortest-arc slerp, clamped pose sampling, sensor-in-scene composition.
 - `conformance/`, building `decode_streamed` and `decode_indexed`, registered in
-  `tests/conformance/run.py` and skipped until built. Both paths report provenance in the canonical
-  summary. The object-layer variants and the invalid corpus's refusal expectations are declined.
+  `tests/conformance/run.py` and skipped until built. Both paths report provenance and compose the
+  object layer in the canonical summary, which is 105 checks — the same count Rust and TypeScript
+  take. The invalid corpus's refusal expectations are declined.
 - Tests for the one behaviour the corpus cannot reach: the indexed reader's front-matter scan runs
   to the first Chunk, so a Camera, Metadata or Attachment record sitting behind a large embedded
   audio track is still found. The harness only ever exercises the default 64 KiB probe on scenes

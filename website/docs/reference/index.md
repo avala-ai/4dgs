@@ -10,8 +10,8 @@ declarations. Nothing is marked `Yes` on the strength of code existing.
 Every row is filled in from a suite that runs: 46 valid variants and 7 invalid ones, plus 4
 keyframe-delta and 3 object-layer variants in their own subdirectories, over two read paths
 (streamed and indexed). A language takes the variants it declares support for, and what it declines
-is what this table records — 119 checks passing for Python, 105 each for Rust and TypeScript, 97
-each for Dart, C++ and Swift (provenance reported, object layer declined). Rust declines the refusal
+is what this table records — 119 checks passing for Python, 105 each for Rust, TypeScript and Dart,
+97 each for C++ and Swift (provenance reported, object layer declined). Rust declines the refusal
 expectations. C++ and Swift read 4DGS through the Rust C ABI: the additive states-JSON accessor
 computes keyframe-delta summaries in the core, and the additive provenance-JSON accessor does the
 same for the provenance family, so every binding emits identical bytes with no per-language slerp.
