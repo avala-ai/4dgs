@@ -1111,6 +1111,9 @@ function checkUnsignedField(value: number, max: number, message: string): void {
   }
 }
 
+/** The largest finite f32, the range every object-table lane is stored in. */
+const F32_MAX = 3.4028234663852886e38;
+
 export function checkObjectTable(table: ObjectTable): void {
   checkUnsignedField(
     table.embeddingDim,
@@ -1132,12 +1135,23 @@ export function checkObjectTable(table: ObjectTable): void {
       );
     }
     seen.add(entry.objectId);
+    // These lanes are stored as f32, so the range is the field's, not the double's.
+    // A finite double such as 1e100 fits no conforming record — writing it would
+    // round to Infinity — and Python refuses it as `object-value-out-of-f32-range`,
+    // so accepting it here would bless a table no other reader can hold.
     const finite = (label: string, values: readonly number[]): void => {
       for (let k = 0; k < values.length; k++) {
-        if (!Number.isFinite(values[k]!)) {
+        const value = values[k]!;
+        if (!Number.isFinite(value)) {
           throw new MalformedFile(
-            `ObjectTable entry ${entry.objectId}: ${label}[${k}] is ${values[k]}; every stored ` +
+            `ObjectTable entry ${entry.objectId}: ${label}[${k}] is ${value}; every stored ` +
               "value must be finite (section 5.15.6)",
+          );
+        }
+        if (Math.abs(value) > F32_MAX) {
+          throw new MalformedFile(
+            `ObjectTable entry ${entry.objectId}: ${label}[${k}] is ${value}, outside the ` +
+              `finite f32 range [-${F32_MAX}, ${F32_MAX}]`,
           );
         }
       }

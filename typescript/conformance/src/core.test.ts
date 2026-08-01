@@ -654,3 +654,19 @@ test("object ids and embedding_dim must fit the fields that carry them", () => {
     MalformedFile,
   );
 });
+
+test("object table lanes are refused outside the f32 range they are stored in", () => {
+  // 1e100 is a finite double and fits no conforming record: written as f32 it rounds
+  // to Infinity. Python refuses it as `object-value-out-of-f32-range`, so accepting it
+  // here would bless a table no other reader can hold.
+  const entry = { objectId: 1, label: "", dynamics: null, embedding: null };
+  assert.throws(
+    () => checkObjectTable({ embeddingDim: 0, entries: [{ ...entry, anchor: [1e100, 0, 0] }] }),
+    MalformedFile,
+  );
+  // The largest finite f32 is still a legal value.
+  checkObjectTable({
+    embeddingDim: 0,
+    entries: [{ ...entry, anchor: [3.4028234663852886e38, 0, 0] }],
+  });
+});
