@@ -681,4 +681,33 @@ void main() {
       throwsA(isA<FourdgsMalformedFile>()),
     );
   });
+
+  test('a dynamics tuple of the wrong length is a malformed file', () {
+    // Indexing first turns a short list into a RangeError, and lets a longer
+    // one through with the extra vectors silently ignored.
+    FourdgsObjectTable table(List<List<double>> dynamics) => FourdgsObjectTable(
+      embeddingDim: 0,
+      entries: <FourdgsObjectEntry>[
+        FourdgsObjectEntry(
+          objectId: 1,
+          label: '',
+          anchor: <double>[0.0, 0.0, 0.0],
+          dynamics: dynamics,
+          embedding: null,
+        ),
+      ],
+    );
+    final short = <List<double>>[
+      <double>[0.0, 0.0, 0.0],
+      <double>[0.0, 0.0, 0.0],
+    ];
+    expect(() => table(short).check(), throwsA(isA<FourdgsMalformedFile>()));
+    final long = <List<double>>[
+      <double>[0.0, 0.0, 0.0],
+      <double>[0.0, 0.0, 0.0],
+      <double>[0.0, 0.0, 0.0],
+      <double>[0.0, 0.0, 0.0],
+    ];
+    expect(() => table(long).check(), throwsA(isA<FourdgsMalformedFile>()));
+  });
 }

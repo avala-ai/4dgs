@@ -1478,6 +1478,17 @@ class FourdgsObjectTable {
       finite('anchor', entry.anchor);
       final dynamics = entry.dynamics;
       if (dynamics != null) {
+        // Three vectors when the dynamics flag is set. Indexing first turns a
+        // short list into a RangeError — a library's error rather than this
+        // library naming the object and the field — and lets a longer one
+        // through with the extra vectors silently ignored.
+        if (dynamics.length != 3) {
+          throw FourdgsMalformedFile(
+            'ObjectTable entry ${entry.objectId}: dynamics has '
+            '${dynamics.length} vectors, expected 3 (velocity, '
+            'angular_velocity, acceleration)',
+          );
+        }
         width('velocity', dynamics[0]);
         width('angular_velocity', dynamics[1]);
         width('acceleration', dynamics[2]);
