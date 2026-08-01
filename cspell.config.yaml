@@ -134,6 +134,9 @@ words:
   - MSVC
   - fprintf
   - DFOURDGS
+  # Git and workflow vocabulary
+  - reflog
+  - oneline
 ignorePaths:
   - "**/node_modules/**"
   - "**/dist/**"
