@@ -154,6 +154,12 @@ class FourdgsObjectLayer {
       );
     }
 
+    // A table-only layer is valid and common — labels and anchors with nothing
+    // moving — and has no pose to apply, so the id scan below would build a set
+    // the size of the scene for nothing. The shape checks above still run: a
+    // caller passing mismatched arrays is wrong whether or not a track exists.
+    if (tracks.isEmpty) return;
+
     final referenced = <int>{};
     for (final id in objectIds) {
       if (id != backgroundObject) referenced.add(id);

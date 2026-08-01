@@ -641,4 +641,44 @@ void main() {
     final empty = fourdgsStateAtWithObjects(gaussians, FourdgsObjectLayer(), 2);
     expect(empty.centers[0], closeTo(1, 1e-9));
   });
+
+  test('an object table vector of the wrong width is refused', () {
+    // The wire record carries f32[3] for the anchor and each dynamics vector,
+    // so a shorter one is a shape no conforming file can hold.
+    expect(
+      () =>
+          FourdgsObjectTable(
+            embeddingDim: 0,
+            entries: <FourdgsObjectEntry>[
+              FourdgsObjectEntry(
+                objectId: 1,
+                label: '',
+                anchor: <double>[1.0, 2.0],
+                dynamics: null,
+                embedding: null,
+              ),
+            ],
+          ).check(),
+      throwsA(isA<FourdgsMalformedFile>()),
+    );
+  });
+
+  test('a table-only layer composes without scanning every gaussian', () {
+    // Labels and anchors with nothing moving is a valid layer with no pose to
+    // apply — but mismatched arrays are still wrong, track or no track.
+    final layer = FourdgsObjectLayer();
+    final centers = Float64List.fromList(<double>[1, 0, 0]);
+    final orientations = Float64List.fromList(<double>[0, 0, 0, 1]);
+    layer.apply(centers, orientations, Int32List.fromList(<int>[7]), 2);
+    expect(centers, <double>[1, 0, 0]);
+    expect(
+      () => layer.apply(
+        Float64List.fromList(<double>[1, 0]),
+        orientations,
+        Int32List.fromList(<int>[7]),
+        2,
+      ),
+      throwsA(isA<FourdgsMalformedFile>()),
+    );
+  });
 }

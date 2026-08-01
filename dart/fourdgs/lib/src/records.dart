@@ -1460,9 +1460,27 @@ class FourdgsObjectTable {
         }
       }
 
+      // The wire record carries f32[3] for each of these, so a shorter vector
+      // is a shape no conforming file can hold — Rust cannot express it, its
+      // fields are [f32; 3]. The parser always builds three; a caller
+      // constructing a table can hand over two, and every value in it would be
+      // checked and accepted.
+      void width(String label, List<double> values) {
+        if (values.length != 3) {
+          throw FourdgsMalformedFile(
+            'ObjectTable entry ${entry.objectId}: $label has '
+            '${values.length} values, expected 3',
+          );
+        }
+      }
+
+      width('anchor', entry.anchor);
       finite('anchor', entry.anchor);
       final dynamics = entry.dynamics;
       if (dynamics != null) {
+        width('velocity', dynamics[0]);
+        width('angular_velocity', dynamics[1]);
+        width('acceleration', dynamics[2]);
         finite('velocity', dynamics[0]);
         finite('angular_velocity', dynamics[1]);
         finite('acceleration', dynamics[2]);
