@@ -125,9 +125,9 @@ rotations must compose as a quaternion product rather than one replacing the oth
 is not a workaround the way the keyframe-delta one is — an object record is additive to the
 gaussian-birth model, and the one `WithObjects` variant at the top level is read by the Kaitai
 grammar and the fuzzer, which is where the records' framing and length-skipping are proved — it just
-keeps the decode-and-compose family gathered where the harness reaches for it. Python, Rust and
-TypeScript emit those states from both read paths; the other SDKs skip the optional records and
-stream and report `No`.
+keeps the decode-and-compose family gathered where the harness reaches for it. Python, Rust,
+TypeScript and Dart emit those states from both read paths; C++ and Swift skip the optional records
+and stream and report `No`.
 
 **The `keyframe-delta` temporal model** (spec §11) is proved by four corpus variants that live in
 their own `data/keyframe/` subdirectory, the way the invalid corpus does — every whole-corpus

@@ -507,4 +507,40 @@ void main() {
       throwsA(isA<FourdgsMalformedFile>()),
     );
   });
+
+  test('an object track sample of the wrong width is refused', () {
+    // A translation of two numbers passes the trajectory rules, which iterate
+    // whatever coordinates are there, and then reads past the end during
+    // composition. Python names this; Rust cannot express it.
+    expect(
+      () =>
+          FourdgsObjectTrack(
+            objectId: 7,
+            interpolation: 0,
+            times: <double>[0.0],
+            rotations: <List<double>>[
+              <double>[0.0, 0.0, 0.0, 1.0],
+            ],
+            translations: <List<double>>[
+              <double>[1.0, 2.0],
+            ],
+          ).check(),
+      throwsA(isA<FourdgsMalformedFile>()),
+    );
+    expect(
+      () =>
+          FourdgsObjectTrack(
+            objectId: 7,
+            interpolation: 0,
+            times: <double>[0.0],
+            rotations: <List<double>>[
+              <double>[0.0, 0.0, 1.0],
+            ],
+            translations: <List<double>>[
+              <double>[1.0, 2.0, 3.0],
+            ],
+          ).check(),
+      throwsA(isA<FourdgsMalformedFile>()),
+    );
+  });
 }

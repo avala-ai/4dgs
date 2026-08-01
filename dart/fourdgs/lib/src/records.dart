@@ -1530,6 +1530,25 @@ class FourdgsObjectTrack {
         'translations; every sample needs all three',
       );
     }
+    // And each sample has to be the right width. The trajectory rules iterate
+    // whatever coordinates are present, so a translation of two numbers passes
+    // them and then reads past the end during composition rather than being
+    // refused. Rust cannot express this — its samples are [f64; 4] and
+    // [f64; 3] — and Python names it; here it has to be checked.
+    for (int i = 0; i < times.length; i++) {
+      if (rotations[i].length != 4) {
+        throw FourdgsMalformedFile(
+          'track for object $objectId: sample $i rotation has '
+          '${rotations[i].length} values, expected 4',
+        );
+      }
+      if (translations[i].length != 3) {
+        throw FourdgsMalformedFile(
+          'track for object $objectId: sample $i translation has '
+          '${translations[i].length} values, expected 3',
+        );
+      }
+    }
     FourdgsRigTrajectory(
       name: 'object $objectId',
       interpolation: interpolation,
