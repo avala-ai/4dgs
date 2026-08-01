@@ -239,7 +239,7 @@ jobs:
       # toolchain at all, which is the point — an unretried network dependency on the
       # critical path of two workflows is what took conformance red on its first run.
       - name: Cache the Rust toolchain
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/bin
@@ -247,7 +247,7 @@ jobs:
             ~/.rustup
           key: rust-toolchain-stable-${{ runner.os }}-${{ hashFiles('rust/**/Cargo.toml', 'Cargo.toml') }}
       - name: Cache the core's build
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: target
           key: rust-build-${{ runner.os }}-${{ hashFiles('rust/**/*.rs', 'rust/**/Cargo.toml') }}
