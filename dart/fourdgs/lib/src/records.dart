@@ -1428,8 +1428,28 @@ class FourdgsObjectTable {
         finite('angular_velocity', dynamics[1]);
         finite('acceleration', dynamics[2]);
       }
+      // An embedding has to match the space the table declares. `embedding_dim`
+      // is declared once for the whole file, so a vector of a different width —
+      // or any vector at all when the table declares no embedding space —
+      // describes a coordinate system nothing else in the file shares. Python
+      // refuses both; the parser cannot build either shape, but a caller
+      // constructing a table can.
       final embedding = entry.embedding;
-      if (embedding != null) finite('embedding', embedding);
+      if (embedding != null) {
+        if (embeddingDim == 0) {
+          throw FourdgsMalformedFile(
+            'object ${entry.objectId}: an embedding is present but '
+            'embedding_dim is 0',
+          );
+        }
+        if (embedding.length != embeddingDim) {
+          throw FourdgsMalformedFile(
+            'object ${entry.objectId}: embedding has ${embedding.length} '
+            'values, embedding_dim declares $embeddingDim',
+          );
+        }
+        finite('embedding', embedding);
+      }
     }
   }
 }

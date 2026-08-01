@@ -543,4 +543,37 @@ void main() {
       throwsA(isA<FourdgsMalformedFile>()),
     );
   });
+
+  test('an object table embedding must match the declared space', () {
+    // embedding_dim is declared once for the whole file, so a vector of another
+    // width — or any vector when no embedding space is declared — describes a
+    // coordinate system nothing else in the file shares. Python refuses both.
+    FourdgsObjectEntry entry(List<double>? embedding) => FourdgsObjectEntry(
+      objectId: 1,
+      label: '',
+      anchor: <double>[0.0, 0.0, 0.0],
+      dynamics: null,
+      embedding: embedding,
+    );
+    expect(
+      () =>
+          FourdgsObjectTable(
+            embeddingDim: 4,
+            entries: <FourdgsObjectEntry>[
+              entry(<double>[1.0, 2.0, 3.0]),
+            ],
+          ).check(),
+      throwsA(isA<FourdgsMalformedFile>()),
+    );
+    expect(
+      () =>
+          FourdgsObjectTable(
+            embeddingDim: 0,
+            entries: <FourdgsObjectEntry>[
+              entry(<double>[1.0, 2.0, 3.0]),
+            ],
+          ).check(),
+      throwsA(isA<FourdgsMalformedFile>()),
+    );
+  });
 }
