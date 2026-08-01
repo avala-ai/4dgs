@@ -21,6 +21,8 @@ import {
   MAX_TRAJECTORY_SAMPLES,
   TruncatedFile,
   parseRigTrajectory,
+  parseObjectTrack,
+  checkObjectTrack,
   quaternionNorm,
   checkRigTrajectory,
   poseAt,
@@ -544,6 +546,26 @@ test("a zero-sample trajectory is read as absent rather than refused", () => {
     () =>
       checkRigTrajectory({
         ...trajectory,
+        times: [0],
+        rotations: [[0, 0, 0, 1]],
+        translations: [[0, 0, 0]],
+      }),
+    MalformedFile,
+  );
+});
+
+test("a zero-sample object track is read as absent rather than refused", () => {
+  // The same sentence as §5.15.4, in §5.15.7, for the object layer. Kept, one empty track
+  // would make a non-empty object layer and two empty tracks for an id would be a
+  // duplicate ObjectLayer.check() refuses.
+  const body = Uint8Array.from([7, 0, 0, 0, 7, 0, 0, 0, 0]);
+  const track = parseObjectTrack(body);
+  assert.equal(track.times.length, 0);
+  assert.throws(
+    () =>
+      checkObjectTrack({
+        ...track,
+        interpolation: 7,
         times: [0],
         rotations: [[0, 0, 0, 1]],
         translations: [[0, 0, 0]],

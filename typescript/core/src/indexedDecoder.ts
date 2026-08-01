@@ -418,7 +418,11 @@ export class IndexedDecoder {
         }
         out.table = parseObjectTable(content);
       } else {
-        out.tracks.push(parseObjectTrack(content));
+        // §5.15.7: a zero-sample track "has no pose and is read as absent".
+        {
+          const track = parseObjectTrack(content);
+          if (track.times.length > 0) out.tracks.push(track);
+        }
       }
     }
     out.check();

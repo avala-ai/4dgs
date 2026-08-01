@@ -1171,7 +1171,10 @@ export function parseObjectTrack(content: Uint8Array): ObjectTrack {
     translations.push(c.f64s(3));
   }
   const track: ObjectTrack = { objectId, interpolation, times, rotations, translations };
-  checkObjectTrack(track);
+  // §5.15.7: a zero-sample track "has no pose and is read as absent", so reading one
+  // refuses nothing. checkObjectTrack stays strict for the writer, which must not emit a
+  // record whose interpolation byte is outside the registry.
+  if (times.length > 0) checkObjectTrack(track);
   return track;
 }
 

@@ -378,7 +378,13 @@ export async function decodeScene(
           objects.table = parseObjectTable(content);
           break;
         case Opcode.ObjectTrack:
-          objects.tracks.push(parseObjectTrack(content));
+          // §5.15.7: a zero-sample track "has no pose and is read as absent". Kept, one
+          // empty track would make a non-empty object layer, and two empty tracks for an
+          // id would be a duplicate the layer refuses.
+          {
+            const track = parseObjectTrack(content);
+            if (track.times.length > 0) objects.tracks.push(track);
+          }
           break;
         case Opcode.Statistics:
           statistics = parseStatistics(content);
