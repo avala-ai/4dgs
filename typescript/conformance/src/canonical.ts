@@ -363,10 +363,10 @@ function probeTimes(trajectory: { readonly times: readonly number[] }): number[]
 function sensorProbeTime(prov: Provenance, rigName: string): number {
   const trajectory = rigName ? prov.trajectory(rigName) : null;
   if (trajectory === null || trajectory.times.length === 0) return 0;
-  return (
-    trajectory.times[0]! +
-    (trajectory.times[trajectory.times.length - 1]! - trajectory.times[0]!) * 0.5
-  );
+  // Halved separately, like the trajectory probes: `first + (last - first) * 0.5`
+  // overflows when the two times straddle zero, and `0.5 * (first + last)` overflows
+  // when they are large and same-signed. Neither form survives both.
+  return trajectory.times[0]! / 2 + trajectory.times[trajectory.times.length - 1]! / 2;
 }
 
 function poseRow(t: number, pose: Pose | null, sensor?: string): unknown {

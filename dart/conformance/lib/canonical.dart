@@ -379,8 +379,10 @@ double _sensorProbeTime(
   if (sensor.rigName.isEmpty) return 0.0;
   final trajectory = prov.trajectory(sensor.rigName);
   if (trajectory == null || trajectory.sampleCount == 0) return 0.0;
-  return trajectory.times.first +
-      (trajectory.times.last - trajectory.times.first) * 0.5;
+  // Halved separately, like the trajectory probes: `first + (last - first) * 0.5`
+  // overflows when the two times straddle zero, and `0.5 * (first + last)`
+  // overflows when they are large and same-signed. Neither form survives both.
+  return trajectory.times.first / 2 + trajectory.times.last / 2;
 }
 
 Map<String, Object?> _poseRow(double t, FourdgsPose? pose, {String? sensor}) {
