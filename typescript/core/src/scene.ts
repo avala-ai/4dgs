@@ -342,7 +342,13 @@ export async function decodeScene(
           provenance.sensors.push(parseSensorCalibration(content));
           break;
         case Opcode.RigTrajectory:
-          provenance.trajectories.push(parseRigTrajectory(content));
+          {
+            // Section 5.15.4: a trajectory with no samples "MUST be read as though the
+            // record were absent". Reporting it would put a rig in the summary that
+            // carries no pose and that no sensor may reference.
+            const trajectory = parseRigTrajectory(content);
+            if (trajectory.times.length > 0) provenance.trajectories.push(trajectory);
+          }
           break;
         case Opcode.GeodeticAnchor:
           provenance.anchors.push(parseGeodeticAnchor(content));

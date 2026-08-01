@@ -407,7 +407,12 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
             elif record.opcode == op.SENSOR_CALIBRATION:
                 scene.provenance.sensors.append(rec.SensorCalibration.parse(record.content))
             elif record.opcode == op.RIG_TRAJECTORY:
-                scene.provenance.trajectories.append(rec.RigTrajectory.parse(record.content))
+                # Section 5.15.4: a trajectory with no samples "MUST be read as though
+                # the record were absent". Reporting it would put a rig in the summary
+                # that carries no pose and that no sensor may reference.
+                _trajectory = rec.RigTrajectory.parse(record.content)
+                if _trajectory.sample_count > 0:
+                    scene.provenance.trajectories.append(_trajectory)
             elif record.opcode == op.GEODETIC_ANCHOR:
                 scene.provenance.anchors.append(rec.GeodeticAnchor.parse(record.content))
             elif record.opcode == op.OBJECT_TABLE:

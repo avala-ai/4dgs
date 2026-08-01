@@ -261,9 +261,13 @@ FourdgsScene readFourdgsBytes(
             FourdgsSensorCalibration.parse(record.content),
           );
         case opRigTrajectory:
-          provenance.trajectories.add(
-            FourdgsRigTrajectory.parse(record.content),
-          );
+          // Section 5.15.4: a trajectory with no samples "MUST be read as though
+          // the record were absent". Reporting it would put a rig in the summary
+          // that carries no pose and that no sensor may reference.
+          final trajectory = FourdgsRigTrajectory.parse(record.content);
+          if (trajectory.sampleCount > 0) {
+            provenance.trajectories.add(trajectory);
+          }
         case opGeodeticAnchor:
           provenance.anchors.add(FourdgsGeodeticAnchor.parse(record.content));
         case opStatistics:

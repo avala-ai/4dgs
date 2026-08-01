@@ -422,7 +422,11 @@ def read_provenance(source: Readable, scene: IndexedScene) -> Provenance:
         elif opcode == op.SENSOR_CALIBRATION:
             out.sensors.append(rec.SensorCalibration.parse(content))
         elif opcode == op.RIG_TRAJECTORY:
-            out.trajectories.append(rec.RigTrajectory.parse(content))
+            # Section 5.15.4: a trajectory with no samples "MUST be read as though the
+            # record were absent".
+            trajectory = rec.RigTrajectory.parse(content)
+            if trajectory.sample_count > 0:
+                out.trajectories.append(trajectory)
         elif opcode == op.GEODETIC_ANCHOR:
             out.anchors.append(rec.GeodeticAnchor.parse(content))
     out.check()

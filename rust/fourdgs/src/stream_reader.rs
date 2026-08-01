@@ -313,10 +313,15 @@ pub fn read_from<R: Read>(source: R, options: &ReadOptions) -> Result<Scene> {
                 .provenance
                 .sensors
                 .push(rec::SensorCalibration::parse(&content)?),
-            op::RIG_TRAJECTORY => scene
-                .provenance
-                .trajectories
-                .push(rec::RigTrajectory::parse(&content)?),
+            op::RIG_TRAJECTORY => {
+                // Section 5.15.4: a trajectory with no samples "MUST be read as though
+                // the record were absent". Reporting it would put a rig in the summary
+                // that carries no pose and that no sensor may reference.
+                let trajectory = rec::RigTrajectory::parse(&content)?;
+                if trajectory.sample_count() > 0 {
+                    scene.provenance.trajectories.push(trajectory);
+                }
+            }
             op::GEODETIC_ANCHOR => scene
                 .provenance
                 .anchors

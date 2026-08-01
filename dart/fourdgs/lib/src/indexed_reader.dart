@@ -659,7 +659,9 @@ Future<FourdgsProvenance> readFourdgsProvenance(
       case opSensorCalibration:
         out.sensors.add(FourdgsSensorCalibration.parse(content));
       case opRigTrajectory:
-        out.trajectories.add(FourdgsRigTrajectory.parse(content));
+        // Section 5.15.4: a trajectory with no samples is read as though absent.
+        final trajectory = FourdgsRigTrajectory.parse(content);
+        if (trajectory.sampleCount > 0) out.trajectories.add(trajectory);
       case opGeodeticAnchor:
         out.anchors.add(FourdgsGeodeticAnchor.parse(content));
     }

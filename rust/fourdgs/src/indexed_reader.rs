@@ -694,7 +694,13 @@ pub fn read_provenance<R: Readable + ?Sized>(
         match *opcode {
             op::COORDINATE_FRAME => out.frames.push(rec::CoordinateFrame::parse(content)?),
             op::SENSOR_CALIBRATION => out.sensors.push(rec::SensorCalibration::parse(content)?),
-            op::RIG_TRAJECTORY => out.trajectories.push(rec::RigTrajectory::parse(content)?),
+            op::RIG_TRAJECTORY => {
+                // Section 5.15.4: a trajectory with no samples is read as though absent.
+                let trajectory = rec::RigTrajectory::parse(content)?;
+                if trajectory.sample_count() > 0 {
+                    out.trajectories.push(trajectory);
+                }
+            }
             op::GEODETIC_ANCHOR => out.anchors.push(rec::GeodeticAnchor::parse(content)?),
             _ => {}
         }

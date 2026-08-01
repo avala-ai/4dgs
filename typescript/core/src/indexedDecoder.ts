@@ -369,7 +369,11 @@ export class IndexedDecoder {
       else if (opcode === Opcode.SensorCalibration) {
         out.sensors.push(parseSensorCalibration(content));
       } else if (opcode === Opcode.RigTrajectory) {
-        out.trajectories.push(parseRigTrajectory(content));
+        {
+          // Section 5.15.4: a trajectory with no samples is read as though absent.
+          const trajectory = parseRigTrajectory(content);
+          if (trajectory.times.length > 0) out.trajectories.push(trajectory);
+        }
       } else {
         out.anchors.push(parseGeodeticAnchor(content));
       }
