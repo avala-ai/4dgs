@@ -1095,9 +1095,36 @@ export function parseObjectTable(content: Uint8Array): ObjectTable {
  * Two entries for one id make every lookup a coin toss, which is the duplicate-name
  * failure section 5.15.2 refuses for frames and sensors, spelled with integers.
  */
+/**
+ * Refuse a value that the record's field cannot hold.
+ *
+ * These ids and dimensions are `u32` and `u16` on the wire, so the parser can only ever
+ * produce values inside them. A caller constructing a record can produce `-1`, `1.5` or
+ * `2 ** 32`, and nothing downstream would notice: membership is compared as an unsigned
+ * integer, so a track keyed by `1.5` composes onto nothing and one keyed by `-1` matches
+ * no gaussian while still looking valid. Rust gets this from its types and Python checks
+ * it by hand; TypeScript carries `number`, so it checks too.
+ */
+function checkUnsignedField(value: number, max: number, message: string): void {
+  if (!Number.isInteger(value) || value < 0 || value > max) {
+    throw new MalformedFile(message);
+  }
+}
+
 export function checkObjectTable(table: ObjectTable): void {
+  checkUnsignedField(
+    table.embeddingDim,
+    0xffff,
+    `ObjectTable embedding_dim is ${table.embeddingDim}; expected an integer in [0, 65535]`,
+  );
   const seen = new Set<number>();
   for (const entry of table.entries) {
+    checkUnsignedField(
+      entry.objectId,
+      0xffffffff,
+      `ObjectTable entry has object_id ${entry.objectId}; expected an integer in ` +
+        "[0, 4294967295]",
+    );
     if (seen.has(entry.objectId)) {
       throw new MalformedFile(
         `two ObjectTable entries describe object ${entry.objectId}; entries are referred to ` +
@@ -1213,6 +1240,11 @@ export function parseObjectTrack(content: Uint8Array): ObjectTrack {
  * the rule is a second thing to get wrong.
  */
 export function checkObjectTrack(track: ObjectTrack): void {
+  checkUnsignedField(
+    track.objectId,
+    0xffffffff,
+    `ObjectTrack has object_id ${track.objectId}; expected an integer in [0, 4294967295]`,
+  );
   if (track.objectId === BACKGROUND_OBJECT) {
     throw new MalformedFile(
       "an ObjectTrack names object 0, which means background / unassigned; a track must move " +

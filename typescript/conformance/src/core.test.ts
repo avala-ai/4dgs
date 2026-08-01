@@ -624,3 +624,33 @@ test("an object table embedding must match the space the table declares", () => 
     MalformedFile,
   );
 });
+
+test("object ids and embedding_dim must fit the fields that carry them", () => {
+  // u32 and u16 on the wire, so the parser cannot produce anything else — but a caller
+  // constructing a record can, and nothing downstream notices: a track keyed by 1.5
+  // composes onto nothing, one keyed by -1 matches no gaussian, and both look valid.
+  // Rust gets this from its types; Python checks it by hand.
+  for (const bad of [-1, 1.5, 2 ** 32]) {
+    assert.throws(
+      () =>
+        checkObjectTrack({
+          objectId: bad,
+          interpolation: 0,
+          times: [],
+          rotations: [],
+          translations: [],
+        }),
+      MalformedFile,
+      `object_id ${bad} should be refused`,
+    );
+  }
+  assert.throws(() => checkObjectTable({ embeddingDim: 0x10000, entries: [] }), MalformedFile);
+  assert.throws(
+    () =>
+      checkObjectTable({
+        embeddingDim: 0,
+        entries: [{ objectId: -1, label: "", anchor: [0, 0, 0], dynamics: null, embedding: null }],
+      }),
+    MalformedFile,
+  );
+});
