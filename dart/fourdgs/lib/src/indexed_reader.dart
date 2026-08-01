@@ -511,7 +511,13 @@ Future<FourdgsAudioSourceDescriptor> _readAudioSourceDescriptor(
     );
   }
 
-  _checkRange(scene, range.offset, range.length, 'Audio Source descriptor');
+  _checkRange(
+    scene,
+    range.offset,
+    range.length,
+    'Audio Source descriptor',
+    frontMatter: true,
+  );
   final blob = await source.read(range.offset, range.length);
   final parsed = FourdgsAudioSourceRecord.parse(
     _recordContent(blob, opAudioSource, 'Audio Source descriptor'),
@@ -579,7 +585,7 @@ Future<FourdgsCameraTrajectory?> readFourdgsCamera(
 ) async {
   final range = scene.cameraRange;
   if (range == null) return null;
-  _checkRange(scene, range.offset, range.length, 'camera');
+  _checkRange(scene, range.offset, range.length, 'camera', frontMatter: true);
   final blob = await source.read(range.offset, range.length);
   final camera = FourdgsCamera.parse(_recordContent(blob, opCamera, 'camera'));
   return FourdgsCameraTrajectory(
@@ -601,7 +607,13 @@ Future<List<FourdgsMetadata>> readFourdgsMetadata(
 ) async {
   final out = <FourdgsMetadata>[];
   for (final range in scene.metadataRanges) {
-    _checkRange(scene, range.offset, range.length, 'metadata');
+    _checkRange(
+      scene,
+      range.offset,
+      range.length,
+      'metadata',
+      frontMatter: true,
+    );
     final blob = await source.read(range.offset, range.length);
     out.add(
       FourdgsMetadata.parse(_recordContent(blob, opMetadata, 'metadata')),
@@ -618,7 +630,13 @@ Future<List<FourdgsAttachment>> readFourdgsAttachments(
 ) async {
   final out = <FourdgsAttachment>[];
   for (final range in scene.attachmentRanges) {
-    _checkRange(scene, range.offset, range.length, 'attachment');
+    _checkRange(
+      scene,
+      range.offset,
+      range.length,
+      'attachment',
+      frontMatter: true,
+    );
     final blob = await source.read(range.offset, range.length);
     out.add(
       FourdgsAttachment.parse(_recordContent(blob, opAttachment, 'attachment')),
@@ -652,7 +670,13 @@ Future<FourdgsProvenance> readFourdgsProvenance(
         opcode != opGeodeticAnchor) {
       continue;
     }
-    _checkRange(scene, range.offset, range.length, 'provenance');
+    _checkRange(
+      scene,
+      range.offset,
+      range.length,
+      'provenance',
+      frontMatter: true,
+    );
     final blob = await source.read(range.offset, range.length);
     final content = _recordContent(blob, opcode, 'provenance');
     switch (opcode) {
@@ -694,7 +718,13 @@ Future<FourdgsObjectLayer> readFourdgsObjects(
         '(section 5.15.6)',
       );
     }
-    _checkRange(scene, range.offset, range.length, 'object layer');
+    _checkRange(
+      scene,
+      range.offset,
+      range.length,
+      'object layer',
+      frontMatter: true,
+    );
     final blob = await source.read(range.offset, range.length);
     final content = _recordContent(blob, opcode, 'object layer');
     if (opcode == opObjectTable) {
@@ -723,15 +753,20 @@ void _checkRange(
   FourdgsIndexedScene scene,
   int offset,
   int length,
-  String what,
-) {
+  String what, {
+  bool frontMatter = false,
+}) {
   if (offset < 0 || length < 0 || offset + length > scene.resourceBytes) {
     throw FourdgsMalformedFile(
       'the $what range is [$offset, ${offset + length}) of a '
       '${scene.resourceBytes} byte file',
     );
   }
-  if (length > maxFrontMatterBytes) {
+  // Front matter only. Chunk and SH band payloads are gaussian data, bounded by
+  // the per-stream decoded-size caps rather than by this ceiling, and a
+  // legitimate scene can carry a chunk far larger than it — capping them here
+  // refuses on the indexed path a file the streamed path decodes happily.
+  if (frontMatter && length > maxFrontMatterBytes) {
     throw FourdgsMalformedFile(
       'the $what range is $length bytes, past the $maxFrontMatterBytes ceiling',
     );
