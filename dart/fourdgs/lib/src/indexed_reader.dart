@@ -734,7 +734,11 @@ Future<FourdgsObjectLayer> readFourdgsObjects(
       }
       out.table = FourdgsObjectTable.parse(content);
     } else {
-      out.tracks.add(FourdgsObjectTrack.parse(content));
+      // Section 5.15.7: a zero-sample track "has no pose and is read as absent".
+      final track = FourdgsObjectTrack.parse(content);
+      if (track.sampleCount > 0) {
+        out.tracks.add(track);
+      }
     }
   }
   out.check();

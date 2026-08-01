@@ -1490,7 +1490,12 @@ class FourdgsObjectTrack {
       rotations: rotations,
       translations: translations,
     );
-    track.check();
+    // Section 5.15.7: a zero-sample track "has no pose and is read as absent",
+    // so reading one refuses nothing. `check` stays strict for the writer,
+    // which must not emit a record whose interpolation is outside the registry.
+    if (track.times.isNotEmpty) {
+      track.check();
+    }
     return track;
   }
 

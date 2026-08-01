@@ -294,7 +294,13 @@ FourdgsScene readFourdgsBytes(
           objects.table = FourdgsObjectTable.parse(record.content);
           break;
         case opObjectTrack:
-          objects.tracks.add(FourdgsObjectTrack.parse(record.content));
+          // Section 5.15.7: a zero-sample track "has no pose and is read as
+          // absent". Kept, one empty track would make a non-empty object layer,
+          // and two empty tracks for an id a duplicate the layer refuses.
+          final track = FourdgsObjectTrack.parse(record.content);
+          if (track.sampleCount > 0) {
+            objects.tracks.add(track);
+          }
           break;
         case opGeodeticAnchor:
           provenance.anchors.add(FourdgsGeodeticAnchor.parse(record.content));

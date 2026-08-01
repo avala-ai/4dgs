@@ -462,4 +462,27 @@ void main() {
     final layer = FourdgsObjectLayer(tracks: <FourdgsObjectTrack>[empty]);
     expect(layer.poseAt(7, 0), isNull);
   });
+
+  test('a zero-sample object track is read as absent rather than refused', () {
+    // The same sentence as section 5.15.4, in section 5.15.7, for the object
+    // layer. Kept, one empty track would make a non-empty object layer and two
+    // empty tracks for an id would be a duplicate check() refuses.
+    final body = Uint8List.fromList(<int>[7, 0, 0, 0, 7, 0, 0, 0, 0]);
+    expect(FourdgsObjectTrack.parse(body).sampleCount, 0);
+    expect(
+      () =>
+          FourdgsObjectTrack(
+            objectId: 7,
+            interpolation: 7,
+            times: <double>[0.0],
+            rotations: <List<double>>[
+              <double>[0.0, 0.0, 0.0, 1.0],
+            ],
+            translations: <List<double>>[
+              <double>[0.0, 0.0, 0.0],
+            ],
+          ).check(),
+      throwsA(isA<FourdgsMalformedFile>()),
+    );
+  });
 }
