@@ -734,6 +734,14 @@ fn decode_group(bytes: &[u8]) -> Result<(Vec<i64>, BTreeMap<u8, BinArray>)> {
     let mut cursor = Cursor::new(bytes);
     while cursor.remaining() > 0 {
         let (attribute_id, values) = decode_stream(&mut cursor, None)?;
+        // One stream per attribute here too: the regular chunk path refuses a second,
+        // and this path had its own loop that was still resolving it silently.
+        if got.contains_key(&attribute_id) {
+            return Err(Error::Malformed(format!(
+                "a keyframe-delta group carries attribute {attribute_id} twice; the \
+                 format defines one stream per attribute"
+            )));
+        }
         got.insert(attribute_id, values);
     }
     let Some(id_stream) = got.remove(&op::A_GAUSSIAN_ID) else {
@@ -752,6 +760,14 @@ fn keyframe_from_chunk(content: &[u8]) -> Result<(Vec<i64>, BTreeMap<u8, BinArra
     let mut cursor = Cursor::new(streams);
     while cursor.remaining() > 0 {
         let (attribute_id, values) = decode_stream(&mut cursor, None)?;
+        // One stream per attribute here too: the regular chunk path refuses a second,
+        // and this path had its own loop that was still resolving it silently.
+        if got.contains_key(&attribute_id) {
+            return Err(Error::Malformed(format!(
+                "a keyframe-delta group carries attribute {attribute_id} twice; the \
+                 format defines one stream per attribute"
+            )));
+        }
         got.insert(attribute_id, values);
     }
     let Some(id_stream) = got.remove(&op::A_GAUSSIAN_ID) else {
