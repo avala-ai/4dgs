@@ -127,6 +127,47 @@ banner and the cascading rebase appear only once the pull requests are linked, w
 or by confirming GitHub's recommendation banner. Until then it is a branch chain that reviews well,
 not a stack.
 
+**Rebasing the stack after the layer below merges.** This is the part that bites. GitHub
+squash-merges, so when the bottom PR lands, its commits do not exist on `main` — one new commit
+does, carrying the same content under a different hash. GitHub then retargets the next PR onto
+`main`, and that PR immediately shows **conflicts**, because its branch still contains the originals
+of everything the squash flattened.
+
+With the extension, this is what `rebase` is for — check the stack out, replay it, push:
+
+```sh
+gh stack checkout 74        # the stack containing the PR you were told is conflicting
+gh stack rebase             # replay every layer on the new base
+# fix conflicts, `git add`, then `gh stack rebase --continue` — not plain
+# `git rebase --continue`, which resumes only the rebase in front of you and
+# leaves the extension without the bookkeeping it needs to carry on up the stack
+gh stack push               # force-push each branch with lease
+```
+
+Without the extension, do not run a bare `git rebase main`: it tries to replay the merged layer's
+commits on top of a `main` that already has their content, and every one of them conflicts. Replay
+only the commits this layer owns, by naming the **old base tip** as the fork point:
+
+```sh
+# `d5199b6` is what the layer below pointed at before it merged — its final head, which
+# `git reflog <branch>` or the merged PR's last commit will tell you. Everything after it
+# is this layer's own work.
+git rebase --onto origin/main d5199b6 feat/parity-objects-ts
+git push --force-with-lease origin feat/parity-objects-ts
+```
+
+Then restack each layer above onto the one below, the same way, passing that layer's previous base
+tip. **Count the commits before you push.** A wrong fork point silently produces a branch with zero
+commits of its own, and force-pushing that empties the PR — GitHub closes it as an empty diff:
+
+```sh
+# Against the branch you rebased ONTO, never the branch you are on: `A..B` is what B has
+# and A does not, so naming the current branch on both sides always answers zero — for a
+# healthy branch and an emptied one alike.
+git log --oneline origin/main..HEAD | wc -l              # bottom layer, now based on main
+git log --oneline feat/parity-objects-ts..HEAD | wc -l   # a layer above, from its parent
+```
+
 **What does not belong in a stack.** A stack is for changes that genuinely depend on each other. Two
 unrelated fixes stacked together inherit each other's review latency and each other's red CI for no
 reason — open those side by side off `main`.
