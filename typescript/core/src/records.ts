@@ -1170,6 +1170,16 @@ export function checkObjectTable(table: ObjectTable): void {
     width("anchor", entry.anchor);
     finite("anchor", entry.anchor);
     if (entry.dynamics !== null) {
+      // The tuple is three vectors when the dynamics flag is set. The type says so, but
+      // this is the validator a JavaScript caller reaches, and indexing a short tuple
+      // hands `undefined` to the width check — a TypeError from a library, rather than
+      // this library naming the object and the field.
+      if (entry.dynamics.length !== 3) {
+        throw new MalformedFile(
+          `ObjectTable entry ${entry.objectId}: dynamics has ${entry.dynamics.length} vectors, ` +
+            "expected 3 (velocity, angular_velocity, acceleration)",
+        );
+      }
       width("velocity", entry.dynamics[0]);
       width("angular_velocity", entry.dynamics[1]);
       width("acceleration", entry.dynamics[2]);

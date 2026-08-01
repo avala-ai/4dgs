@@ -714,3 +714,25 @@ test("a table-only object layer composes without scanning every gaussian", () =>
     MalformedFile,
   );
 });
+
+test("a dynamics tuple of the wrong length is a malformed file, not a TypeError", () => {
+  // The type says three vectors, but this is the validator a JavaScript caller reaches,
+  // and indexing a short tuple hands `undefined` to the width check.
+  const entry = { objectId: 1, label: "", anchor: [0, 0, 0], embedding: null };
+  assert.throws(
+    () =>
+      checkObjectTable({
+        embeddingDim: 0,
+        entries: [
+          {
+            ...entry,
+            dynamics: [
+              [0, 0, 0],
+              [0, 0, 0],
+            ],
+          } as never,
+        ],
+      }),
+    MalformedFile,
+  );
+});
