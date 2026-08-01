@@ -16,59 +16,58 @@ expectations. C++ and Swift read 4DGS through the Rust C ABI: the additive state
 computes keyframe-delta summaries in the core, and the additive provenance-JSON accessor does the
 same for the provenance family, so every binding emits identical bytes with no per-language slerp.
 
-| Feature                                           | Python | TypeScript | Rust    | C++     | Swift   | Dart    |
-| ------------------------------------------------- | ------ | ---------- | ------- | ------- | ------- | ------- |
-| Streaming decode                                  | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Indexed / seeking decode                          | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Range-request decode                              | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Truncated-file recovery                           | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Chunk index                                       | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Summary offsets                                   | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| CRC validation                                    | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Quantized attributes                              | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Spherical harmonics, degree 1                     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Spherical harmonics, degree 2                     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Spherical harmonics, degree 3                     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| SH band range-skipping                            | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| SH per-band bit depth, decode                     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| SH per-band bit depth, encode                     | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
-| Spatial audio sources (optional)                  | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Multiple independent audio sources                | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Moving audio source reconstruction                | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Per-source audio payload range reads              | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Camera trajectory                                 | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Metadata                                          | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Attachments                                       | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Statistics                                        | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Provenance: coordinate frame + georeference       | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Provenance: sensor calibration                    | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Provenance: rig trajectory + pose interpolation   | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Object membership (`object_id`)                   | Yes    | Yes        | Yes     | No      | No      | No      |
-| Object Table: labels, anchors, embeddings         | Yes    | Yes        | Yes     | No      | No      | No      |
-| Object Track: rigid state composition¹            | Yes    | Yes        | Yes     | No      | No      | No      |
-| Temporal model `keyframe-delta`, decode           | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Delta composition, chained                        | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Delta composition, keyframe-referenced            | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Births and deaths in deltas                       | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Reconstruction at an instant                      | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Encode `keyframe-delta`                           | Yes    | Planned    | Yes     | Planned | Planned | Planned |
-| Unknown-record skipping                           | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Refusal diagnosis (named, not merely refused)     | Yes    | No         | No      | No      | No      | No      |
-| Private-range records                             | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Encode                                            | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
-| Chunked encode                                    | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
-| Summary writing                                   | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
-| Convert from PLY frame sequences                  | Yes    | No         | No      | No      | No      | No      |
-| glTF interop (import, snapshot export)            | Yes    | No         | No      | No      | No      | No      |
-| USD interop (import, snapshot export)             | Yes    | No         | No      | No      | No      | No      |
+| Feature                                         | Python | TypeScript | Rust | C++     | Swift   | Dart    |
+| ----------------------------------------------- | ------ | ---------- | ---- | ------- | ------- | ------- |
+| Streaming decode                                | Yes    | Yes        | Yes  | Yes     | Yes     | Yes     |
+| Indexed / seeking decode                        | Yes    | Yes        | Yes  | Yes     | Yes     | Yes     |
+| Range-request decode                            | Yes    | Yes        | Yes  | Yes     | Yes     | Yes     |
+| Truncated-file recovery                         | Yes    | Yes        | Yes  | Yes     | Yes     | Yes     |
+| Chunk index                                     | Yes    | Yes        | Yes  | Yes     | Yes     | Yes     |
+| Summary offsets                                 | Yes    | Yes        | Yes  | Yes     | Yes     | Yes     |
+| CRC validation                                  | Yes    | Yes        | Yes  | Yes     | Yes     | Yes     |
+| Quantized attributes                            | Yes    | Yes        | Yes  | Yes     | Yes     | Yes     |
+| Spherical harmonics, degree 1                   | Yes    | Yes        | Yes  | Yes     | Yes     | Yes     |
+| Spherical harmonics, degree 2                   | Yes    | Yes        | Yes  | Yes     | Yes     | Yes     |
+| Spherical harmonics, degree 3                   | Yes    | Yes        | Yes  | Yes     | Yes     | Yes     |
+| SH band range-skipping                          | Yes    | Yes        | Yes  | Yes     | Yes     | Yes     |
+| SH per-band bit depth, decode                   | Yes    | Yes        | Yes  | Yes     | Yes     | Yes     |
+| SH per-band bit depth, encode                   | Yes    | Yes        | Yes  | Yes     | Yes     | Planned |
+| Spatial audio sources (optional)                | Yes    | Yes        | Yes  | Yes     | Yes     | Yes     |
+| Multiple independent audio sources              | Yes    | Yes        | Yes  | Yes     | Yes     | Yes     |
+| Moving audio source reconstruction              | Yes    | Yes        | Yes  | Yes     | Yes     | Yes     |
+| Per-source audio payload range reads            | Yes    | Yes        | Yes  | Yes     | Yes     | Yes     |
+| Camera trajectory                               | Yes    | Yes        | Yes  | Yes     | Yes     | Yes     |
+| Metadata                                        | Yes    | Yes        | Yes  | Yes     | Yes     | Yes     |
+| Attachments                                     | Yes    | Yes        | Yes  | Yes     | Yes     | Yes     |
+| Statistics                                      | Yes    | Yes        | Yes  | Yes     | Yes     | Yes     |
+| Provenance: coordinate frame + georeference     | Yes    | Yes        | Yes  | Yes     | Yes     | Yes     |
+| Provenance: sensor calibration                  | Yes    | Yes        | Yes  | Yes     | Yes     | Yes     |
+| Provenance: rig trajectory + pose interpolation | Yes    | Yes        | Yes  | Yes     | Yes     | Yes     |
+| Object membership (`object_id`)                 | Yes    | Yes        | Yes  | No      | No      | No      |
+| Object Table: labels, anchors, embeddings       | Yes    | Yes        | Yes  | No      | No      | No      |
+| Object Track: rigid state composition¹          | Yes    | Yes        | Yes  | No      | No      | No      |
+| Temporal model `keyframe-delta`, decode         | Yes    | Yes        | Yes  | Yes     | Yes     | Yes     |
+| Delta composition, chained                      | Yes    | Yes        | Yes  | Yes     | Yes     | Yes     |
+| Delta composition, keyframe-referenced          | Yes    | Yes        | Yes  | Yes     | Yes     | Yes     |
+| Births and deaths in deltas                     | Yes    | Yes        | Yes  | Yes     | Yes     | Yes     |
+| Reconstruction at an instant                    | Yes    | Yes        | Yes  | Yes     | Yes     | Yes     |
+| Encode `keyframe-delta`                         | Yes    | Planned    | Yes  | Planned | Planned | Planned |
+| Unknown-record skipping                         | Yes    | Yes        | Yes  | Yes     | Yes     | Yes     |
+| Refusal diagnosis (named, not merely refused)   | Yes    | No         | No   | No      | No      | No      |
+| Private-range records                           | Yes    | Yes        | Yes  | Yes     | Yes     | Yes     |
+| Encode                                          | Yes    | Yes        | Yes  | Yes     | Yes     | Planned |
+| Chunked encode                                  | Yes    | Yes        | Yes  | Yes     | Yes     | Planned |
+| Summary writing                                 | Yes    | Yes        | Yes  | Yes     | Yes     | Planned |
+| Convert from PLY frame sequences                | Yes    | No         | No   | No      | No      | No      |
+| glTF interop (import, snapshot export)          | Yes    | No         | No   | No      | No      | No      |
+| USD interop (import, snapshot export)           | Yes    | No         | No   | No      | No      | No      |
 
-¹ On the `gaussian-birth` path. No implementation composes object tracks during
-`keyframe-delta` reconstruction: that path rebuilds base centres and scales from bins and
-never reads the object layer, so a scene carrying both decodes to its uncomposed state in
-every SDK. The object-layer variants the suite runs are `gaussian-birth`, so no row here
-is evidence either way about the combination — see issue #79.
-| USD animated export (keyframe-delta time samples) | Yes    | No         | No      | No      | No      | No      |
-| Inspect and validate                              | Yes    | Planned    | Planned | Planned | Planned | Planned |
+¹ On the `gaussian-birth` path. No implementation composes object tracks during `keyframe-delta`
+reconstruction: that path rebuilds base centres and scales from bins and never reads the object
+layer, so a scene carrying both decodes to its uncomposed state in every SDK. The object-layer
+variants the suite runs are `gaussian-birth`, so no row here is evidence either way about the
+combination — see issue #79. | USD animated export (keyframe-delta time samples) | Yes | No | No |
+No | No | No | | Inspect and validate | Yes | Planned | Planned | Planned | Planned | Planned |
 
 ## Reading this table
 
