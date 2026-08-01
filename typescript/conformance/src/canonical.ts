@@ -361,7 +361,10 @@ function probeTimes(trajectory: { readonly times: readonly number[] }): number[]
 
 /** When to evaluate a sensor's scene pose: the midpoint of the rig it rides. */
 function sensorProbeTime(prov: Provenance, rigName: string): number {
-  const trajectory = rigName ? prov.trajectory(rigName) : null;
+  // The empty string is a legal trajectory name — the default capture rig — and
+  // `sensorPoseAt` resolves it, so skipping the lookup summarized a moving unnamed rig
+  // at t=0 and never exercised its composed pose.
+  const trajectory = prov.trajectory(rigName);
   if (trajectory === null || trajectory.times.length === 0) return 0;
   // Halved separately, like the trajectory probes: `first + (last - first) * 0.5`
   // overflows when the two times straddle zero, and `0.5 * (first + last)` overflows

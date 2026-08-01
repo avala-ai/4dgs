@@ -376,7 +376,9 @@ double _sensorProbeTime(
   FourdgsProvenance prov,
   FourdgsSensorCalibration sensor,
 ) {
-  if (sensor.rigName.isEmpty) return 0.0;
+  // The empty string is a legal trajectory name — the default capture rig — and
+  // `sensorPoseAt` resolves it, so skipping the lookup summarized a moving
+  // unnamed rig at t=0 and never exercised its composed pose.
   final trajectory = prov.trajectory(sensor.rigName);
   if (trajectory == null || trajectory.sampleCount == 0) return 0.0;
   // Halved separately, like the trajectory probes: `first + (last - first) * 0.5`

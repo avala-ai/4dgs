@@ -772,9 +772,9 @@ fn probe_times<T: PoseSampled + ?Sized>(trajectory: &T) -> Vec<f64> {
 
 /// When to evaluate a sensor's scene pose: the midpoint of the rig it rides.
 fn sensor_probe_time(prov: &Provenance, rig_name: &str) -> f64 {
-    if rig_name.is_empty() {
-        return 0.0;
-    }
+    // The empty string is a legal trajectory name — the default capture rig — and
+    // `sensor_pose_at` resolves it, so skipping the lookup summarized a moving unnamed
+    // rig at t=0 and never exercised its composed pose.
     match prov.trajectory(rig_name) {
         Some(t) if t.sample_count() > 0 => {
             let (first, last) = (t.times[0], t.times[t.sample_count() - 1]);
