@@ -451,7 +451,9 @@ export class IndexedDecoder {
   }
 
   private async readRecordAt(range: ByteRange, expected: number): Promise<Uint8Array> {
-    const blob = await this.readRange(range.offset, range.length, `the record at ${range.offset}`);
+    const blob = await this.readRange(range.offset, range.length, `the record at ${range.offset}`, {
+      frontMatter: true,
+    });
     const record = readRecord(new Cursor(blob, 0, range.offset));
     if (record.opcode !== expected) {
       throw new MalformedFile(
@@ -470,13 +472,22 @@ export class IndexedDecoder {
    * transport happens to throw — a caller decoding a hostile file should not have to
    * catch the error type of somebody's HTTP client.
    */
-  private async readRange(offset: number, length: number, what: string): Promise<Uint8Array> {
-    // A ceiling as well as a bound. Staying inside the file is not enough on its own: a
-    // front-matter record may declare hundreds of megabytes and still sit inside a large
-    // file, and this path allocates the whole range before a parser can ignore an appended
-    // tail or refuse an oversized count. The Dart reader caps the same reads at the same
-    // number.
-    if (length > MAX_FRONT_MATTER_BYTES) {
+  private async readRange(
+    offset: number,
+    length: number,
+    what: string,
+    { frontMatter = false }: { frontMatter?: boolean } = {},
+  ): Promise<Uint8Array> {
+    // A ceiling as well as a bound, but only for front matter. Staying inside the file is
+    // not enough on its own: a Camera, Metadata or trajectory record may declare hundreds
+    // of megabytes and still sit inside a large file, and this path allocates the whole
+    // range before a parser can ignore an appended tail or refuse an oversized count.
+    //
+    // Chunk and SH band payloads are deliberately exempt: they are gaussian data, bounded
+    // by the per-stream decoded-size caps rather than by a front-matter ceiling, and a
+    // legitimate scene can carry a chunk far larger than this. Capping them here would
+    // refuse on the indexed path a file the streamed path decodes.
+    if (frontMatter && length > MAX_FRONT_MATTER_BYTES) {
       throw new MalformedFile(
         `${what} is ${length} bytes, past the ${MAX_FRONT_MATTER_BYTES} byte ceiling ` +
           "for a single front-matter record",
