@@ -38,6 +38,7 @@ library;
 import 'exceptions.dart';
 import 'provenance.dart';
 import 'records.dart';
+import 'model.dart';
 
 /// Adapter so [FourdgsObjectTrack] satisfies [FourdgsPoseSampled], and the
 /// clamp-and-slerp of section 5.15.4 is reused rather than restated.
@@ -203,4 +204,30 @@ class FourdgsObjectLayer {
       orientations[i * 4 + 3] = qw * rw - qx * rx - qy * ry - qz * rz;
     }
   }
+}
+
+/// Reconstructed gaussian state at [t] with the object layer composed onto it.
+///
+/// [FourdgsGaussianSet.stateAt] returns the base temporal state, which is the
+/// right answer for a scene with no object layer and the wrong one for a scene
+/// that has tracks: the gaussians of a moving object come back at their rest
+/// centres and orientations. Composition is a separate step because the layer
+/// is additive and a consumer that only wants geometry should not pay for it —
+/// but the composed reading is the one most callers want, and leaving it to
+/// each of them to remember `objects.apply(...)` makes the default answer the
+/// wrong one.
+///
+/// A scene with no layer, or one whose gaussians carry no membership, returns
+/// the base state unchanged.
+FourdgsState fourdgsStateAtWithObjects(
+  FourdgsGaussianSet gaussians,
+  FourdgsObjectLayer? objects,
+  double t, {
+  double cutoff = 0.05,
+}) {
+  final state = gaussians.stateAt(t, cutoff: cutoff);
+  final ids = state.objectId;
+  if (objects == null || objects.isEmpty || ids == null) return state;
+  objects.apply(state.centers, state.orientations, ids, t);
+  return state;
 }

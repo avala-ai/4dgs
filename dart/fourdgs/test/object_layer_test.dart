@@ -603,4 +603,42 @@ void main() {
       throwsA(isA<FourdgsMalformedFile>()),
     );
   });
+
+  test('the composed state path applies tracks the base path leaves alone', () {
+    // `stateAt` is the base temporal state and is the right answer for a scene
+    // with no layer. For one with tracks it returns the gaussians of a moving
+    // object at their rest centres, which is why the composed entry point
+    // exists — a caller should not have to remember `apply` to get the scene
+    // the file describes.
+    final gaussians = FourdgsGaussianSet(
+      positions: Float32List.fromList(<double>[1, 0, 0]),
+      scales: Float32List.fromList(<double>[1, 1, 1]),
+      rotations: Float32List.fromList(<double>[0, 0, 0, 1]),
+      colors: Float32List.fromList(<double>[1, 1, 1, 1]),
+      motions: Float32List.fromList(<double>[0, 0, 0]),
+      muT: Float32List.fromList(<double>[2]),
+      sigmaT: Float32List.fromList(<double>[double.infinity]),
+      winLo: Float32List.fromList(<double>[0]),
+      winHi: Float32List.fromList(<double>[10]),
+      objectId: Uint32List.fromList(<int>[7]),
+    );
+    final layer = FourdgsObjectLayer(
+      tracks: <FourdgsObjectTrack>[
+        FourdgsObjectTrack.parse(_quarterTurnTrack()),
+      ],
+    );
+
+    final base = gaussians.stateAt(2);
+    expect(base.centers[0], closeTo(1, 1e-9));
+
+    final composed = fourdgsStateAtWithObjects(gaussians, layer, 2);
+    expect(composed.centers[0], closeTo(5, 1e-9));
+    expect(composed.centers[1], closeTo(3, 1e-9));
+
+    // No layer, or an empty one, is the base state unchanged.
+    final none = fourdgsStateAtWithObjects(gaussians, null, 2);
+    expect(none.centers[0], closeTo(1, 1e-9));
+    final empty = fourdgsStateAtWithObjects(gaussians, FourdgsObjectLayer(), 2);
+    expect(empty.centers[0], closeTo(1, 1e-9));
+  });
 }

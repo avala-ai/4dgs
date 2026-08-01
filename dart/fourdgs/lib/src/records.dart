@@ -1312,6 +1312,9 @@ void _checkUnsignedField(int value, int max, String message) {
   }
 }
 
+/// The largest finite f32, the range every object-table lane is stored in.
+const double _f32Max = 3.4028234663852886e38;
+
 class FourdgsObjectEntry {
   FourdgsObjectEntry({
     required this.objectId,
@@ -1435,8 +1438,18 @@ class FourdgsObjectTable {
           'are referred to by id and nothing else (section 5.15.6)',
         );
       }
+      // These lanes are stored as f32, so the range is the field's rather than
+      // the double's: a finite 1e100 fits no conforming record — written as f32
+      // it rounds to infinity — and Python refuses it as
+      // `object-value-out-of-f32-range`.
       void finite(String label, List<double> values) {
         for (int k = 0; k < values.length; k++) {
+          if (values[k].isFinite && values[k].abs() > _f32Max) {
+            throw FourdgsMalformedFile(
+              'ObjectTable entry ${entry.objectId}: $label[$k] is '
+              '${values[k]}, outside the finite f32 range',
+            );
+          }
           if (!values[k].isFinite) {
             throw FourdgsMalformedFile(
               'ObjectTable entry ${entry.objectId}: $label[$k] is '
