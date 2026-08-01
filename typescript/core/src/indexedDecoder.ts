@@ -445,14 +445,24 @@ export class IndexedDecoder {
   async readAttachments(): Promise<Attachment[]> {
     const out: Attachment[] = [];
     for (const range of this.deferred.attachments) {
-      out.push(parseAttachment(await this.readRecordAt(range, Opcode.Attachment)));
+      // Exempt from the front-matter ceiling: section 5 says attachments "carry
+      // payload, and payload of unbounded size — a thumbnail sheet, a provenance
+      // blob". Capping them refuses on the indexed path a file the streamed path
+      // reads, which is the same mistake as capping chunk data.
+      out.push(
+        parseAttachment(await this.readRecordAt(range, Opcode.Attachment, { bounded: false })),
+      );
     }
     return out;
   }
 
-  private async readRecordAt(range: ByteRange, expected: number): Promise<Uint8Array> {
+  private async readRecordAt(
+    range: ByteRange,
+    expected: number,
+    { bounded = true }: { bounded?: boolean } = {},
+  ): Promise<Uint8Array> {
     const blob = await this.readRange(range.offset, range.length, `the record at ${range.offset}`, {
-      frontMatter: true,
+      frontMatter: bounded,
     });
     const record = readRecord(new Cursor(blob, 0, range.offset));
     if (record.opcode !== expected) {
