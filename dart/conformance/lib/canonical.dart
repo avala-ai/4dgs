@@ -358,12 +358,8 @@ Map<String, Object?> _objectsAndStates(
 
 /// Times a summary evaluates an object track at, derived from the track
 /// itself, the way a rig trajectory's probes are.
-List<double> _trackProbeTimes(FourdgsObjectTrack track) {
-  if (track.sampleCount == 0) return const <double>[];
-  final first = track.times.first;
-  final last = track.times.last;
-  return <double>[first - 0.5, first, 0.5 * (first + last), last, last + 0.5];
-}
+List<double> _trackProbeTimes(FourdgsObjectTrack track) =>
+    _probesOver(track.times);
 
 Map<String, Object?> _audioSource(
   FourdgsAudioSource source,
@@ -528,10 +524,20 @@ Map<String, Object?> _sensorPoseRow(
 /// Two of the five are outside the sample range on purpose: clamping is a rule,
 /// and a rule no expectation exercises is a rule an implementation can decline
 /// to have.
-List<double> _probeTimes(FourdgsRigTrajectory trajectory) {
-  if (trajectory.sampleCount == 0) return const <double>[];
-  final first = trajectory.times.first;
-  final last = trajectory.times.last;
+List<double> _probeTimes(FourdgsRigTrajectory trajectory) =>
+    _probesOver(trajectory.times);
+
+/// The probe times for a list of samples, shared by rigs and object tracks.
+///
+/// Halving each operand rather than halving their sum: two large same-signed
+/// times overflow `0.5 * (first + last)` to infinity, and `poseAt` refuses a
+/// non-finite query, so the summary fails on a track the format allows. The
+/// object-track copy of this list is how that bug came back after the rig one
+/// was fixed — hence one helper.
+List<double> _probesOver(List<double> times) {
+  if (times.isEmpty) return const <double>[];
+  final first = times.first;
+  final last = times.last;
   return <double>[first - 0.5, first, first / 2 + last / 2, last, last + 0.5];
 }
 

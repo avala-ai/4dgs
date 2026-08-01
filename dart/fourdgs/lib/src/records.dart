@@ -1491,10 +1491,16 @@ class FourdgsObjectTrack {
       translations: translations,
     );
     // Section 5.15.7: a zero-sample track "has no pose and is read as absent",
-    // so reading one refuses nothing. `check` stays strict for the writer,
-    // which must not emit a record whose interpolation is outside the registry.
+    // so reading one refuses nothing about its pose. The id is not part of the
+    // pose — the same section requires every track to refuse object 0 — so that
+    // rule holds for an absent track too, and the rest waits for the writer.
     if (track.times.isNotEmpty) {
       track.check();
+    } else if (track.objectId == backgroundObject) {
+      throw FourdgsMalformedFile(
+        'an ObjectTrack names object 0, which means background / unassigned; a '
+        'track must move an object that exists (section 5.15.7)',
+      );
     }
     return track;
   }
