@@ -2306,6 +2306,53 @@ pub unsafe extern "C" fn fourdgs_scene_provenance_json(
     })
 }
 
+/// Canonical object-layer JSON for an opened scene (spec §5.15.6-§5.15.7).
+///
+/// The Object Table, the SE(3) tracks with their sampled poses, and the composed state at
+/// three scene-clock probes — the summary that proves base-then-track composition rather
+/// than merely that the records were read. Computed in the core so that C++ and Swift
+/// cannot drift from each other, or from Rust, on the slerp or the composition order.
+///
+/// An empty string means the file carries neither object records nor per-gaussian
+/// membership: the binding should omit the keys, not emit null. Works on both open paths;
+/// on the indexed path the records are fetched if not already resident. On success `out`
+/// owns a string freed with `fourdgs_string_free`. Sequence the two out parameters as
+/// every other call here does — read them only after this returns OK.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_scene_objects_json(
+    scene: *mut fourdgs_scene,
+    out: *mut *const c_char,
+    out_len: *mut usize,
+) -> c_int {
+    guarded(|| {
+        if out.is_null() || out_len.is_null() {
+            set_last_error("a string out parameter is null".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        }
+        let Some(scene) = (unsafe { scene.as_mut() }) else {
+            set_last_error("the scene is null".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        };
+        let header = scene.inner.header().clone();
+        let layer = match scene.inner.objects() {
+            Ok(layer) => layer,
+            Err(e) => return report(e),
+        };
+        // The whole population, not whatever an earlier seek left resident: the summary
+        // reports every gaussian's composed state, and a partial load would silently
+        // report a partial scene. Spherical harmonics are irrelevant to it, so no band
+        // is fetched for their sake.
+        if let Err(e) = scene.inner.load_all(0) {
+            return report(e);
+        }
+        let gaussians = scene.inner.loaded().clone();
+        match crate::object_layer::canonical_json(&header, &gaussians, &layer) {
+            Ok(json) => put_owned_string(json, out, out_len),
+            Err(e) => report(e),
+        }
+    })
+}
+
 /// Release a string owned by the caller — the result of `fourdgs_peek_temporal_model`,
 /// `fourdgs_keyframe_delta_states_json` or `fourdgs_scene_provenance_json`. Null is
 /// accepted and ignored. The length must be the one the producing call returned; the pair
