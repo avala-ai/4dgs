@@ -630,13 +630,11 @@ Future<List<FourdgsAttachment>> readFourdgsAttachments(
 ) async {
   final out = <FourdgsAttachment>[];
   for (final range in scene.attachmentRanges) {
-    _checkRange(
-      scene,
-      range.offset,
-      range.length,
-      'attachment',
-      frontMatter: true,
-    );
+    // Exempt from the front-matter ceiling: section 5 says attachments "carry
+    // payload, and payload of unbounded size — a thumbnail sheet, a provenance
+    // blob". Capping them refuses on the indexed path a file the streamed path
+    // reads, which is the same mistake as capping chunk data.
+    _checkRange(scene, range.offset, range.length, 'attachment');
     final blob = await source.read(range.offset, range.length);
     out.add(
       FourdgsAttachment.parse(_recordContent(blob, opAttachment, 'attachment')),
