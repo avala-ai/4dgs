@@ -593,3 +593,18 @@ test("an object track with mismatched sample arrays is a malformed file, not a T
     MalformedFile,
   );
 });
+
+test("an object track sample of the wrong width is refused, not composed into NaN", () => {
+  // A translation of two numbers passes the trajectory rules, which iterate whatever
+  // coordinates are there, and then reads as undefined in composition — NaN centres
+  // rather than a refusal. Python names this; Rust cannot express it.
+  const base = { objectId: 7, interpolation: 0, times: [0] };
+  assert.throws(
+    () => checkObjectTrack({ ...base, rotations: [[0, 0, 0, 1]], translations: [[1, 2]] }),
+    MalformedFile,
+  );
+  assert.throws(
+    () => checkObjectTrack({ ...base, rotations: [[0, 0, 1]], translations: [[1, 2, 3]] }),
+    MalformedFile,
+  );
+});

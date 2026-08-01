@@ -1215,6 +1215,25 @@ export function checkObjectTrack(track: ObjectTrack): void {
         "every sample needs all three",
     );
   }
+  // And each sample has to be the right width. The trajectory rules iterate whatever
+  // coordinates are present, so a translation of two numbers passes them and then reads
+  // as `undefined` in composition, which writes NaN into the centres rather than
+  // refusing. Rust cannot express this — its samples are [f64; 4] and [f64; 3] — and
+  // Python names it; here it has to be checked.
+  for (let i = 0; i < track.times.length; i++) {
+    if (track.rotations[i]!.length !== 4) {
+      throw new MalformedFile(
+        `track for object ${track.objectId}: sample ${i} rotation has ` +
+          `${track.rotations[i]!.length} values, expected 4`,
+      );
+    }
+    if (track.translations[i]!.length !== 3) {
+      throw new MalformedFile(
+        `track for object ${track.objectId}: sample ${i} translation has ` +
+          `${track.translations[i]!.length} values, expected 3`,
+      );
+    }
+  }
   checkRigTrajectory({
     name: `object ${track.objectId}`,
     interpolation: track.interpolation,
