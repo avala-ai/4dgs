@@ -141,6 +141,17 @@ def decode_streams(
     got: dict[int, np.ndarray] = {}
     while cursor.remaining() > 0:
         attribute_id, values = decode_stream(cursor)
+        # The format defines one stream per attribute, so a second is a chunk that cannot
+        # say which stream defines its gaussians. Overwriting resolved it silently — and
+        # differently per SDK: this reader, Rust and TypeScript kept the last stream while
+        # Dart kept the first, so one malformed chunk decoded to two memberships. It is
+        # the duplicate-name failure section 5.15.2 refuses for records, spelled with
+        # attribute ids.
+        if attribute_id in got:
+            raise MalformedFile(
+                f"a chunk carries attribute {attribute_id} twice; the format defines one stream per attribute",
+                code="duplicate-attribute-stream",
+            )
         got[attribute_id] = values
 
     missing = [a for a in op.REQUIRED_ATTRIBUTES if a not in got]

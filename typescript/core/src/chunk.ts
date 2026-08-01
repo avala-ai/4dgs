@@ -138,6 +138,16 @@ export async function decodeChunkStreams(
           `the chunk declares ${count} gaussians`,
       );
     }
+    // The format defines one stream per attribute, so a second is a chunk that cannot
+    // say which stream defines its gaussians. Overwriting resolved that silently — and
+    // differently per SDK: this reader, Python and Rust kept the last stream while Dart
+    // kept the first, so one malformed chunk decoded to two memberships.
+    if (byId.has(stream.attributeId)) {
+      throw new MalformedFile(
+        `a chunk carries attribute ${stream.attributeId} twice; the format defines one ` +
+          "stream per attribute",
+      );
+    }
     byId.set(stream.attributeId, stream);
   }
 

@@ -21,6 +21,7 @@ import fourdgs
 import numpy as np
 import pytest
 from fourdgs import indexed_reader
+from fourdgs import opcode as op
 from fourdgs import records as rec
 from fourdgs.indexed_reader import open_indexed, read_chunk
 from fourdgs.readable import BytesReadable
@@ -289,3 +290,38 @@ def test_a_bad_utf8_string_names_the_byte_that_failed():
     message = str(caught.value)
     assert "offset 4" in message, message
     assert "byte 6" in message, message
+
+
+def test_a_chunk_that_carries_one_attribute_twice_is_refused():
+    """One stream per attribute — and the readers disagreed about a second.
+
+    Python, Rust and TypeScript kept the last stream; Dart kept the first, so a
+    malformed chunk decoded to two different sets of gaussians depending on which SDK
+    read it. All four refuse it now, which is the duplicate-name failure section 5.15.2
+    refuses for records, spelled with attribute ids.
+    """
+    from fourdgs.quantization import Steps
+    from fourdgs.serialization import encode_stream
+    from fourdgs.stream_reader import decode_streams
+
+    positions = np.zeros((3, 3), dtype=np.int64)
+    doubled = encode_stream(op.A_POSITION, positions, channels=3) + encode_stream(op.A_POSITION, positions, channels=3)
+    with pytest.raises(fourdgs.MalformedFile) as caught:
+        decode_streams(
+            doubled,
+            3,
+            Steps(
+                pos=1e-3,
+                scale_log=1e-3,
+                rot=1e-3,
+                rgb=1e-3,
+                alpha=1e-3,
+                motion=1e-3,
+                time=1e-3,
+                sigma_log=1e-3,
+                sh=1,
+            ),
+            np.zeros(3),
+            [],
+        )
+    assert caught.value.code == "duplicate-attribute-stream"

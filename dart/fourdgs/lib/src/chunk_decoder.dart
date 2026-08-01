@@ -128,11 +128,21 @@ FourdgsDecodedChunk decodeChunkStreams(
   while (cursor.remaining > 0) {
     final header = readStreamHeader(cursor);
     final wanted = _channelsFor(header.attributeId);
-    if (wanted == null || got.containsKey(header.attributeId)) {
-      // Unknown, private, or a duplicate. The registry reserves ids 64-127 for
-      // applications and requires readers to skip them; a duplicate is a file
-      // that cannot decide what it means, and taking the first is as defensible
-      // as taking the last without being silently order-dependent.
+    // The format defines one stream per attribute, so a second is a chunk that
+    // cannot say which stream defines its gaussians. Skipping it kept the first
+    // where Python, Rust and TypeScript kept the last, so one malformed chunk
+    // decoded to two memberships depending on which SDK read it. All four refuse
+    // it now: it is the duplicate-name failure section 5.15.2 refuses for
+    // records, spelled with attribute ids.
+    if (got.containsKey(header.attributeId)) {
+      throw FourdgsMalformedFile(
+        'a chunk carries attribute ${header.attributeId} twice; the format '
+        'defines one stream per attribute',
+      );
+    }
+    if (wanted == null) {
+      // Unknown or private. The registry reserves ids 64-127 for applications
+      // and requires readers to skip them.
       skipStreamPayload(cursor, header);
       continue;
     }

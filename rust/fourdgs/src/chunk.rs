@@ -115,6 +115,17 @@ pub fn decode_streams(
     let mut cursor = Cursor::new(streams);
     while cursor.remaining() > 0 {
         let (attribute_id, values) = decode_stream(&mut cursor, Some(count))?;
+        // The format defines one stream per attribute, so a second is a chunk that
+        // cannot say which stream defines its gaussians. Overwriting resolved it
+        // silently — and differently per SDK: this reader, Python and TypeScript kept
+        // the last stream while Dart kept the first, so one malformed chunk decoded to
+        // two memberships.
+        if got.contains_key(&attribute_id) {
+            return Err(Error::Malformed(format!(
+                "a chunk carries attribute {attribute_id} twice; the format defines one \
+                 stream per attribute"
+            )));
+        }
         got.insert(attribute_id, values);
     }
 
