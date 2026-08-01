@@ -333,7 +333,11 @@ export class Provenance {
       }
     }
 
-    const rigs = new Set(this.trajectories.map((t) => t.name));
+    // A zero-sample trajectory is "read as though the record were absent" (section
+    // 5.15.4), so a rig-relative sensor naming one names a rig this file does not carry
+    // — the same refusal, one step later. Composing it as identity would place every
+    // sensor on that rig at the rig origin: plausible, wrong, and silent.
+    const rigs = new Set(this.trajectories.filter((t) => t.times.length > 0).map((t) => t.name));
     for (const sensor of this.sensors) {
       if (sensor.poseReference === POSE_TO_RIG && !rigs.has(sensor.rigName)) {
         throw new MalformedFile(

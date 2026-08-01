@@ -311,7 +311,12 @@ class Provenance:
                     )
                 seen.add(name)
 
-        rigs = {t.name for t in self.trajectories}
+        # A zero-sample trajectory "MUST be read as though the record were absent"
+        # (section 5.15.4), so a rig-relative sensor naming one names a rig this file
+        # does not carry — the same refusal, reached one step later. Composing it as
+        # identity instead would place every sensor on that rig at the rig origin:
+        # plausible, wrong, and silent.
+        rigs = {t.name for t in self.trajectories if t.sample_count > 0}
         for sensor in self.sensors:
             if sensor.pose_reference == POSE_TO_RIG and sensor.rig_name not in rigs:
                 raise MalformedFile(

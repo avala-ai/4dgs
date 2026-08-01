@@ -394,8 +394,16 @@ impl Provenance {
         }
 
         for sensor in &self.sensors {
+            // A zero-sample trajectory "MUST be read as though the record were absent"
+            // (section 5.15.4), so a rig-relative sensor naming one names a rig this
+            // file does not carry — the same refusal, reached one step later. Composing
+            // it as identity would place every sensor on that rig at the rig origin:
+            // plausible, wrong, and silent.
             if sensor.pose_reference == POSE_TO_RIG
-                && !self.trajectories.iter().any(|t| t.name == sensor.rig_name)
+                && !self
+                    .trajectories
+                    .iter()
+                    .any(|t| t.name == sensor.rig_name && t.sample_count() > 0)
             {
                 return Err(Error::Malformed(format!(
                     "sensor {:?} is posed against rig {:?}, which this file does not carry \

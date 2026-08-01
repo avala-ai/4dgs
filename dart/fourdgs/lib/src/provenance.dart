@@ -397,7 +397,15 @@ class FourdgsProvenance {
       }
     }
 
-    final rigs = <String>{for (final t in trajectories) t.name};
+    // A zero-sample trajectory is "read as though the record were absent"
+    // (section 5.15.4), so a rig-relative sensor naming one names a rig this
+    // file does not carry — the same refusal, one step later. Composing it as
+    // identity would place every sensor on that rig at the rig origin:
+    // plausible, wrong, and silent.
+    final rigs = <String>{
+      for (final t in trajectories)
+        if (t.sampleCount > 0) t.name,
+    };
     for (final s in sensors) {
       if (s.poseReference == poseToRig && !rigs.contains(s.rigName)) {
         throw FourdgsMalformedFile(
