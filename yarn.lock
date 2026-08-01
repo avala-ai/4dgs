@@ -9,7 +9,7 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "4dgs-workspace@workspace:."
   dependencies:
-    "@types/node": "npm:22.10.2"
+    "@types/node": "npm:26.1.2"
     typescript: "npm:5.6.3"
   languageName: unknown
   linkType: soft
@@ -3864,21 +3864,12 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@types/node@npm:*":
+"@types/node@npm:*, @types/node@npm:26.1.2":
   version: 26.1.2
   resolution: "@types/node@npm:26.1.2"
   dependencies:
     undici-types: "npm:~8.3.0"
   checksum: 10c0/a45503222c7db8f374afd5c9381db63dd95b6b1f703abea0890dd3d4a09eeb41da489e08a1a45baf18fe89fb77fbf310ff2789f680c490b04dafc41a60800a86
-  languageName: node
-  linkType: hard
-
-"@types/node@npm:22.10.2":
-  version: 22.10.2
-  resolution: "@types/node@npm:22.10.2"
-  dependencies:
-    undici-types: "npm:~6.20.0"
-  checksum: 10c0/2c7b71a040f1ef5320938eca8ebc946e6905caa9bbf3d5665d9b3774a8d15ea9fab1582b849a6d28c7fc80756a62c5666bc66b69f42f4d5dafd1ccb193cdb4ac
   languageName: node
   linkType: hard
 
@@ -11945,13 +11936,6 @@ __metadata:
     tsc: bin/tsc
     tsserver: bin/tsserver
   checksum: 10c0/7c9d2e07c81226d60435939618c91ec2ff0b75fbfa106eec3430f0fcf93a584bc6c73176676f532d78c3594fe28a54b36eb40b3d75593071a7ec91301533ace7
-  languageName: node
-  linkType: hard
-
-"undici-types@npm:~6.20.0":
-  version: 6.20.0
-  resolution: "undici-types@npm:6.20.0"
-  checksum: 10c0/68e659a98898d6a836a9a59e6adf14a5d799707f5ea629433e025ac90d239f75e408e2e5ff086afc3cace26f8b26ee52155293564593fbb4a2f666af57fc59bf
   languageName: node
   linkType: hard
 
