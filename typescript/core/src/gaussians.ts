@@ -39,6 +39,14 @@ export class GaussianSet {
   readonly winHi: Float32Array;
   readonly sh: ShCoefficients | null;
   readonly shDegree: number;
+  /**
+   * `count` object ids (spec §6.6), or `null` when no chunk carried the stream. `0` is
+   * background: a gaussian that belongs to no object and no track may transform.
+   *
+   * Unsigned: the ids span the whole `u32` range and are compared for equality
+   * against a track's `object_id`, which is parsed as `u32`.
+   */
+  readonly objectId: Uint32Array | null;
 
   constructor(fields: {
     count: number;
@@ -53,6 +61,7 @@ export class GaussianSet {
     winHi: Float32Array;
     sh?: ShCoefficients | null;
     shDegree?: number;
+    objectId?: Uint32Array | null;
   }) {
     this.count = fields.count;
     this.positions = fields.positions;
@@ -66,6 +75,7 @@ export class GaussianSet {
     this.winHi = fields.winHi;
     this.sh = fields.sh ?? null;
     this.shDegree = fields.shDegree ?? 0;
+    this.objectId = fields.objectId ?? null;
   }
 
   static empty(shDegree = 0): GaussianSet {
@@ -99,16 +109,24 @@ export class GaussianSet {
     }
     const indices = Uint32Array.from(visible);
     const centers = new Float32Array(indices.length * 3);
+    const orientations = new Float32Array(indices.length * 4);
     const opacity = new Float32Array(indices.length);
+    const objectId = this.objectId === null ? null : new Uint32Array(indices.length);
     for (let k = 0; k < indices.length; k++) {
       const i = indices[k]!;
       const dt = t - this.muT[i]!;
       centers[k * 3] = this.positions[i * 3]! + this.motions[i * 3]! * dt;
       centers[k * 3 + 1] = this.positions[i * 3 + 1]! + this.motions[i * 3 + 1]! * dt;
       centers[k * 3 + 2] = this.positions[i * 3 + 2]! + this.motions[i * 3 + 2]! * dt;
+      // The rest orientation, which is the base state a track composes onto. The
+      // temporal model does not turn a gaussian; only the object layer does.
+      for (let axis = 0; axis < 4; axis++) {
+        orientations[k * 4 + axis] = this.rotations[i * 4 + axis]!;
+      }
+      if (objectId !== null) objectId[k] = this.objectId![i]!;
       opacity[k] = this.colors[i * 4 + 3]! * marginalAt(this.muT[i]!, this.sigmaT[i]!, t);
     }
-    return { t, indices, centers, opacity };
+    return { t, indices, centers, orientations, opacity, objectId };
   }
 
   /** Per-gaussian visible interval, clipped to the validity window. */
@@ -126,7 +144,11 @@ export interface GaussianState {
   readonly indices: Uint32Array;
   /** `indices.length × 3`. */
   readonly centers: Float32Array;
+  /** `indices.length × 4`, xyzw. The rest orientation until a track composes onto it. */
+  readonly orientations: Float32Array;
   readonly opacity: Float32Array;
+  /** `indices.length` object ids, or `null` when the scene carries no membership. */
+  readonly objectId: Uint32Array | null;
 }
 
 /** The soft temporal weight of a gaussian at a time. 1 for a gaussian that never fades. */
@@ -163,6 +185,14 @@ export function assembleGaussians(
   const winLo = new Float32Array(count);
   const winHi = new Float32Array(count);
 
+  // Membership is per chunk and optional, so a file may carry it on some chunks and not
+  // others. A chunk without the stream contributes background rather than a hole: the
+  // merged array exists when any chunk had one, which is what makes `null` mean "this
+  // scene has no object membership" rather than "the last chunk did not".
+  let sawObjectId = false;
+  for (const chunk of chunks) sawObjectId ||= chunk.objectId !== null;
+  const objectId = sawObjectId ? new Uint32Array(count) : null;
+
   const table = windowTableOrDefault(windows);
   const windowCount = table.length >>> 1;
   let at = 0;
@@ -174,6 +204,7 @@ export function assembleGaussians(
     motions.set(chunk.motions, at * 3);
     muT.set(chunk.muT, at);
     sigmaT.set(chunk.sigmaT, at);
+    if (objectId !== null && chunk.objectId !== null) objectId.set(chunk.objectId, at);
     for (let i = 0; i < chunk.count; i++) {
       const w = checkWindowIndex(chunk.windowIndex[i]!, windowCount);
       winLo[at + i] = table[w * 2]!;
@@ -195,5 +226,6 @@ export function assembleGaussians(
     winHi,
     sh,
     shDegree,
+    objectId,
   });
 }

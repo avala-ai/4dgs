@@ -92,6 +92,16 @@ export interface ChunkGaussians {
   readonly windowIndex: Int32Array;
   readonly sourceGroup: Int32Array | null;
   readonly sourceIndex: Int32Array | null;
+  /**
+   * Object membership (spec §6.6), or `null` when the chunk carries none. `0` is
+   * background: a gaussian that belongs to no object and is never transformed.
+   *
+   * Unsigned, unlike every other decoded lane: an `object_id` is an exact label
+   * over the whole `u32` range (spec §6.6), and the signed bins a stream decodes
+   * into would report an id above `2^31` as a negative number — one that no
+   * Object Track, parsed as `u32`, could ever match.
+   */
+  readonly objectId: Uint32Array | null;
 }
 
 export interface DecodeChunkOptions {
@@ -116,6 +126,7 @@ const EMPTY_CHUNK: ChunkGaussians = {
   windowIndex: new Int32Array(0),
   sourceGroup: null,
   sourceIndex: null,
+  objectId: null,
 };
 
 /**
@@ -151,6 +162,28 @@ export async function decodeChunkStreams(
     byId.set(stream.attributeId, stream);
   }
 
+  // One channel, as section 6.6 defines it. Without this a two-channel stream would
+  // decode to twice as many labels as there are gaussians, and the merge downstream
+  // would either shift every following gaussian's membership or fail on an array
+  // bound — a wrong object, or a raw RangeError, where the file is simply malformed.
+  const ids = byId.get(Attribute.ObjectId);
+  if (ids !== undefined) {
+    if (ids.channels !== 1) {
+      throw new MalformedFile(
+        `the object_id stream declares ${ids.channels} channels, the format defines 1`,
+      );
+    }
+    // The zero-element exemption above does not extend to membership. An empty
+    // `object_id` stream on a populated chunk would decode to no labels at all, and the
+    // merge downstream would read every gaussian as background — a silently different
+    // scene, where the Dart reader refuses the count outright.
+    if (ids.elementCount !== count) {
+      throw new MalformedFile(
+        `the object_id stream declares ${ids.elementCount} elements, the chunk declares ${count}`,
+      );
+    }
+  }
+
   if (count === 0) return EMPTY_CHUNK;
 
   const missing = REQUIRED_ATTRIBUTES.filter((id) => !byId.has(id));
@@ -158,9 +191,12 @@ export async function decodeChunkStreams(
     throw new MalformedFile(`chunk is missing required attributes ${missing.join(", ")}`);
   }
 
-  const wanted = [...REQUIRED_ATTRIBUTES, Attribute.SourceGroup, Attribute.SourceIndex].filter(
-    (id) => byId.has(id),
-  );
+  const wanted = [
+    ...REQUIRED_ATTRIBUTES,
+    Attribute.SourceGroup,
+    Attribute.SourceIndex,
+    Attribute.ObjectId,
+  ].filter((id) => byId.has(id));
   const decoded = new Map<number, Int32Array>();
   await Promise.all(
     wanted.map(async (id) => {
@@ -262,7 +298,19 @@ function assemble(
     windowIndex,
     sourceGroup: decoded.get(Attribute.SourceGroup) ?? null,
     sourceIndex: decoded.get(Attribute.SourceIndex) ?? null,
+    objectId: asObjectIds(decoded.get(Attribute.ObjectId)),
   };
+}
+
+/**
+ * Reinterpret a decoded lane's bits as unsigned object ids.
+ *
+ * A view rather than a copy: the bytes are already right, only their signedness
+ * was wrong.
+ */
+function asObjectIds(bins: Int32Array | undefined): Uint32Array | null {
+  if (bins === undefined) return null;
+  return new Uint32Array(bins.buffer, bins.byteOffset, bins.length);
 }
 
 /** Registry codec names, as the Chunk record's `compression` field spells them. */

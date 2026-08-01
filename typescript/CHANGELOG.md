@@ -8,6 +8,19 @@ The four packages version together.
 
 ## [Unreleased]
 
+### Added
+
+- Native object-layer decode in `@4dgs/core` (spec §5.15.6–§5.15.7, §6.6): `parseObjectTable` and
+  `parseObjectTrack` read the two records, the `object_id` attribute stream (id 14) is decoded onto
+  `GaussianSet.objectId`, and `ObjectLayer` composes an object's SE(3) track onto reconstructed
+  state — `center = R * c0 + T`, `orientation = R ⊗ r0`, base first. Available on both read paths:
+  `Scene.objects` on the streamed path, `readObjects()` on the indexed one, where the records are
+  framed at open and fetched only when asked for, as provenance is. A gaussian with `object_id = 0`,
+  or whose object has no track, keeps its base state; a scene that carries no layer produces an
+  empty `ObjectLayer`, which is a value and not an error.
+- `GaussianSet.stateAt` now returns `orientations` and `objectId` alongside centres and opacity, so
+  a caller can compose the layer onto a reconstructed instant without re-deriving either.
+
 ## [0.3.0] - 2026-07-31
 
 This release adds native `keyframe-delta` decode on both read paths in `@4dgs/core`. Decode still

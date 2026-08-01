@@ -21,6 +21,10 @@ import {
   MAX_TRAJECTORY_SAMPLES,
   TruncatedFile,
   parseRigTrajectory,
+  parseObjectTrack,
+  checkObjectTrack,
+  checkObjectTable,
+  ObjectLayer,
   quaternionNorm,
   checkRigTrajectory,
   poseAt,
@@ -547,6 +551,187 @@ test("a zero-sample trajectory is read as absent rather than refused", () => {
         times: [0],
         rotations: [[0, 0, 0, 1]],
         translations: [[0, 0, 0]],
+      }),
+    MalformedFile,
+  );
+});
+
+test("a zero-sample object track is read as absent rather than refused", () => {
+  // The same sentence as §5.15.4, in §5.15.7, for the object layer. Kept, one empty track
+  // would make a non-empty object layer and two empty tracks for an id would be a
+  // duplicate ObjectLayer.check() refuses.
+  const body = Uint8Array.from([7, 0, 0, 0, 7, 0, 0, 0, 0]);
+  const track = parseObjectTrack(body);
+  assert.equal(track.times.length, 0);
+  assert.throws(
+    () =>
+      checkObjectTrack({
+        ...track,
+        interpolation: 7,
+        times: [0],
+        rotations: [[0, 0, 0, 1]],
+        translations: [[0, 0, 0]],
+      }),
+    MalformedFile,
+  );
+});
+
+test("an object track with mismatched sample arrays is a malformed file, not a TypeError", () => {
+  // The trajectory rules iterate each array independently, so a track with two times and
+  // one rotation used to pass and fail later inside poseAt with a raw TypeError. Python
+  // and Rust refuse it at check time; this pins the same answer here.
+  assert.throws(
+    () =>
+      checkObjectTrack({
+        objectId: 7,
+        interpolation: 0,
+        times: [0, 1],
+        rotations: [[0, 0, 0, 1]],
+        translations: [
+          [0, 0, 0],
+          [1, 1, 1],
+        ],
+      }),
+    MalformedFile,
+  );
+});
+
+test("an object track sample of the wrong width is refused, not composed into NaN", () => {
+  // A translation of two numbers passes the trajectory rules, which iterate whatever
+  // coordinates are there, and then reads as undefined in composition — NaN centres
+  // rather than a refusal. Python names this; Rust cannot express it.
+  const base = { objectId: 7, interpolation: 0, times: [0] };
+  assert.throws(
+    () => checkObjectTrack({ ...base, rotations: [[0, 0, 0, 1]], translations: [[1, 2]] }),
+    MalformedFile,
+  );
+  assert.throws(
+    () => checkObjectTrack({ ...base, rotations: [[0, 0, 1]], translations: [[1, 2, 3]] }),
+    MalformedFile,
+  );
+});
+
+test("an object table embedding must match the space the table declares", () => {
+  // embedding_dim is declared once for the whole file, so a vector of another width —
+  // or any vector when the table declares no embedding space — describes a coordinate
+  // system nothing else in the file shares. Python refuses both.
+  const entry = { objectId: 1, label: "", anchor: [0, 0, 0], dynamics: null };
+  assert.throws(
+    () => checkObjectTable({ embeddingDim: 4, entries: [{ ...entry, embedding: [1, 2, 3] }] }),
+    MalformedFile,
+  );
+  assert.throws(
+    () => checkObjectTable({ embeddingDim: 0, entries: [{ ...entry, embedding: [1, 2, 3] }] }),
+    MalformedFile,
+  );
+});
+
+test("object ids and embedding_dim must fit the fields that carry them", () => {
+  // u32 and u16 on the wire, so the parser cannot produce anything else — but a caller
+  // constructing a record can, and nothing downstream notices: a track keyed by 1.5
+  // composes onto nothing, one keyed by -1 matches no gaussian, and both look valid.
+  // Rust gets this from its types; Python checks it by hand.
+  for (const bad of [-1, 1.5, 2 ** 32]) {
+    assert.throws(
+      () =>
+        checkObjectTrack({
+          objectId: bad,
+          interpolation: 0,
+          times: [],
+          rotations: [],
+          translations: [],
+        }),
+      MalformedFile,
+      `object_id ${bad} should be refused`,
+    );
+  }
+  assert.throws(() => checkObjectTable({ embeddingDim: 0x10000, entries: [] }), MalformedFile);
+  assert.throws(
+    () =>
+      checkObjectTable({
+        embeddingDim: 0,
+        entries: [{ objectId: -1, label: "", anchor: [0, 0, 0], dynamics: null, embedding: null }],
+      }),
+    MalformedFile,
+  );
+});
+
+test("object table lanes are refused outside the f32 range they are stored in", () => {
+  // 1e100 is a finite double and fits no conforming record: written as f32 it rounds
+  // to Infinity. Python refuses it as `object-value-out-of-f32-range`, so accepting it
+  // here would bless a table no other reader can hold.
+  const entry = { objectId: 1, label: "", dynamics: null, embedding: null };
+  assert.throws(
+    () => checkObjectTable({ embeddingDim: 0, entries: [{ ...entry, anchor: [1e100, 0, 0] }] }),
+    MalformedFile,
+  );
+  // The largest finite f32 is still a legal value.
+  checkObjectTable({
+    embeddingDim: 0,
+    entries: [{ ...entry, anchor: [3.4028234663852886e38, 0, 0] }],
+  });
+});
+
+test("an object table vector of the wrong width is refused", () => {
+  // The wire record carries f32[3] for the anchor and each dynamics vector, so a
+  // shorter one is a shape no conforming file can hold. Rust cannot express it.
+  const entry = { objectId: 1, label: "", dynamics: null, embedding: null };
+  assert.throws(
+    () => checkObjectTable({ embeddingDim: 0, entries: [{ ...entry, anchor: [1, 2] }] }),
+    MalformedFile,
+  );
+  assert.throws(
+    () =>
+      checkObjectTable({
+        embeddingDim: 0,
+        entries: [
+          {
+            ...entry,
+            anchor: [0, 0, 0],
+            dynamics: [
+              [0, 0],
+              [0, 0, 0],
+              [0, 0, 0],
+            ],
+          },
+        ],
+      }),
+    MalformedFile,
+  );
+});
+
+test("a table-only object layer composes without scanning every gaussian", () => {
+  // Labels and anchors with nothing moving is a valid, common layer. It has no pose to
+  // apply, so composition must not build a scene-sized set for nothing — but the shape
+  // checks still run, because mismatched arrays are wrong either way.
+  const layer = new ObjectLayer();
+  const centers = new Float32Array([1, 0, 0]);
+  const orientations = new Float32Array([0, 0, 0, 1]);
+  layer.apply(centers, orientations, new Uint32Array([7]), 2);
+  assert.deepEqual(Array.from(centers), [1, 0, 0]);
+  assert.throws(
+    () => layer.apply(new Float32Array([1, 0]), orientations, new Uint32Array([7]), 2),
+    MalformedFile,
+  );
+});
+
+test("a dynamics tuple of the wrong length is a malformed file, not a TypeError", () => {
+  // The type says three vectors, but this is the validator a JavaScript caller reaches,
+  // and indexing a short tuple hands `undefined` to the width check.
+  const entry = { objectId: 1, label: "", anchor: [0, 0, 0], embedding: null };
+  assert.throws(
+    () =>
+      checkObjectTable({
+        embeddingDim: 0,
+        entries: [
+          {
+            ...entry,
+            dynamics: [
+              [0, 0, 0],
+              [0, 0, 0],
+            ],
+          } as never,
+        ],
       }),
     MalformedFile,
   );

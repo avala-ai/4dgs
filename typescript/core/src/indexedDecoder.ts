@@ -26,6 +26,7 @@ import { crc32, DEFAULT_CODECS, type CodecRegistry } from "./codec.js";
 import { MalformedFile } from "./errors.js";
 import { FrontMatterScanner } from "./frontMatter.js";
 import { isProvenanceOpcode, Opcode } from "./opcodes.js";
+import { ObjectLayer } from "./objects.js";
 import { Provenance } from "./provenance.js";
 import { DEFAULT_CUTOFF, supportK } from "./quantization.js";
 import { checkQuantizationScheme, checkTemporalModel } from "./registry.js";
@@ -62,6 +63,8 @@ import {
   parseGeodeticAnchor,
   parseMetadata,
   parseHeader,
+  parseObjectTable,
+  parseObjectTrack,
   parseQuantization,
   parseRigTrajectory,
   parseSensorCalibration,
@@ -94,6 +97,15 @@ interface ByteRange {
   readonly offset: number;
   readonly length: number;
 }
+
+/**
+ * The most bytes one front-matter record may occupy before this reader refuses it.
+ *
+ * Not a format limit; a bound on what a single declared length can cost. 64 MiB is far
+ * past any real Camera, Metadata or trajectory record, and it is the number the Dart
+ * reader uses for the same reads.
+ */
+export const MAX_FRONT_MATTER_BYTES = 64 * 1024 * 1024;
 
 /** A provenance-family record framed during the front-matter walk (opcode + range). */
 interface ProvenanceRange {
@@ -347,7 +359,8 @@ export class IndexedDecoder {
    *
    * Opening a file frames these and stops, so a scene with a long rig trajectory costs
    * the same to open as one with none. Object-layer and still-reserved opcodes in the
-   * same family are framed and skipped here — they belong to a different layer.
+   * same family are framed and skipped here — they belong to a different layer, and
+   * {@link readObjects} reads them from the same ranges.
    */
   async readProvenance(): Promise<Provenance> {
     const out = new Provenance();
@@ -382,6 +395,40 @@ export class IndexedDecoder {
     return out;
   }
 
+  /**
+   * Every object-layer record, from the same framed ranges as the provenance family.
+   *
+   * Deferred for the same reason: a scene with a thousand-sample track costs nothing to
+   * open, and a consumer that only wants geometry never pays for the layer at all.
+   */
+  async readObjects(): Promise<ObjectLayer> {
+    const out = new ObjectLayer();
+    for (const range of this.provenanceRanges) {
+      const { opcode } = range;
+      if (opcode !== Opcode.ObjectTable && opcode !== Opcode.ObjectTrack) continue;
+      const content = await this.readRecordAt(
+        { offset: range.offset, length: range.length },
+        opcode,
+      );
+      if (opcode === Opcode.ObjectTable) {
+        if (out.table !== null) {
+          throw new MalformedFile(
+            "the file carries a second Object Table; a scene has one (section 5.15.6)",
+          );
+        }
+        out.table = parseObjectTable(content);
+      } else {
+        // §5.15.7: a zero-sample track "has no pose and is read as absent".
+        {
+          const track = parseObjectTrack(content);
+          if (track.times.length > 0) out.tracks.push(track);
+        }
+      }
+    }
+    out.check();
+    return out;
+  }
+
   /** The suggested camera trajectory, fetched only when a caller wants it. */
   async readCamera(): Promise<Camera | null> {
     const range = this.deferred.camera;
@@ -402,13 +449,25 @@ export class IndexedDecoder {
   async readAttachments(): Promise<Attachment[]> {
     const out: Attachment[] = [];
     for (const range of this.deferred.attachments) {
-      out.push(parseAttachment(await this.readRecordAt(range, Opcode.Attachment)));
+      // Exempt from the front-matter ceiling: section 5 says attachments "carry
+      // payload, and payload of unbounded size — a thumbnail sheet, a provenance
+      // blob". Capping them refuses on the indexed path a file the streamed path
+      // reads, which is the same mistake as capping chunk data.
+      out.push(
+        parseAttachment(await this.readRecordAt(range, Opcode.Attachment, { bounded: false })),
+      );
     }
     return out;
   }
 
-  private async readRecordAt(range: ByteRange, expected: number): Promise<Uint8Array> {
-    const blob = await this.readRange(range.offset, range.length, `the record at ${range.offset}`);
+  private async readRecordAt(
+    range: ByteRange,
+    expected: number,
+    { bounded = true }: { bounded?: boolean } = {},
+  ): Promise<Uint8Array> {
+    const blob = await this.readRange(range.offset, range.length, `the record at ${range.offset}`, {
+      frontMatter: bounded,
+    });
     const record = readRecord(new Cursor(blob, 0, range.offset));
     if (record.opcode !== expected) {
       throw new MalformedFile(
@@ -427,7 +486,27 @@ export class IndexedDecoder {
    * transport happens to throw — a caller decoding a hostile file should not have to
    * catch the error type of somebody's HTTP client.
    */
-  private async readRange(offset: number, length: number, what: string): Promise<Uint8Array> {
+  private async readRange(
+    offset: number,
+    length: number,
+    what: string,
+    { frontMatter = false }: { frontMatter?: boolean } = {},
+  ): Promise<Uint8Array> {
+    // A ceiling as well as a bound, but only for front matter. Staying inside the file is
+    // not enough on its own: a Camera, Metadata or trajectory record may declare hundreds
+    // of megabytes and still sit inside a large file, and this path allocates the whole
+    // range before a parser can ignore an appended tail or refuse an oversized count.
+    //
+    // Chunk and SH band payloads are deliberately exempt: they are gaussian data, bounded
+    // by the per-stream decoded-size caps rather than by a front-matter ceiling, and a
+    // legitimate scene can carry a chunk far larger than this. Capping them here would
+    // refuse on the indexed path a file the streamed path decodes.
+    if (frontMatter && length > MAX_FRONT_MATTER_BYTES) {
+      throw new MalformedFile(
+        `${what} is ${length} bytes, past the ${MAX_FRONT_MATTER_BYTES} byte ceiling ` +
+          "for a single front-matter record",
+      );
+    }
     if (offset < 0 || length < 0 || offset + length > this.size) {
       throw new MalformedFile(
         `${what} spans [${offset}, ${offset + length}), outside the ${this.size}-byte file`,

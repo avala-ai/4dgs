@@ -186,7 +186,7 @@ export function parseQuantization(content: Uint8Array): Quantization {
   const scheme = c.string();
   const posOrigin = c.f64s(3);
   const steps = c.f64s(8);
-  return {
+  const quantization: Quantization = {
     scheme,
     posOrigin,
     stepPos: steps[0]!,
@@ -200,6 +200,17 @@ export function parseQuantization(content: Uint8Array): Quantization {
     stepSh: c.u8(),
     bounds: c.stringMap(),
   };
+  // `object_id` is an exact label (spec section 6.6), not a metric value, so there is no
+  // meaningful error bound between two different labels — section 6.5 makes a bound for it
+  // a refusal rather than something to ignore.
+  const objectBound = quantization.bounds.get("object_id");
+  if (objectBound !== undefined) {
+    throw new MalformedFile(
+      `Quantization.bounds contains object_id=${JSON.stringify(objectBound)}; ` +
+        "object_id is an exact label and MUST NOT carry a bound",
+    );
+  }
+  return quantization;
 }
 
 /** Validity windows, as `[lo, hi]` pairs flattened into one array. */
@@ -995,6 +1006,331 @@ export function checkSensorCalibration(sensor: SensorCalibration): void {
         "has a zero focal length or image size",
     );
   }
+}
+
+/** Background / unassigned. A gaussian carrying this id belongs to no object. */
+export const BACKGROUND_OBJECT = 0;
+
+/** One object's advisory description. Nothing here transforms a gaussian. */
+export interface ObjectTableEntry {
+  readonly objectId: number;
+  readonly label: string;
+  readonly anchor: readonly number[];
+  /** `[velocity, angularVelocity, acceleration]`, or `null` when the entry carries none. */
+  readonly dynamics: readonly [readonly number[], readonly number[], readonly number[]] | null;
+  readonly embedding: readonly number[] | null;
+}
+
+/**
+ * The scene's one Object Table. Opcode `0x24`.
+ *
+ * Everything in it is advisory: membership comes from the `object_id` attribute (§6.6)
+ * and geometry changes only through an Object Track (§5.15.7). A reader that skips this
+ * record still decodes every gaussian correctly; what it loses is the names.
+ */
+export interface ObjectTable {
+  readonly embeddingDim: number;
+  readonly entries: readonly ObjectTableEntry[];
+}
+
+export function parseObjectTable(content: Uint8Array): ObjectTable {
+  const c = new Cursor(content);
+  const objectCount = c.u32();
+  const embeddingDim = c.u16();
+  // Bounded before anything is sized from it, like every other count-prefixed record.
+  // The smallest an entry can be is 4 (id) + 4 (empty label) + 12 (anchor) + 1 (dynamics
+  // flag), plus one more byte for the embedding flag once a space is declared.
+  const minimumEntryBytes = 4 + 4 + 12 + 1 + (embeddingDim > 0 ? 1 : 0);
+  if (objectCount * minimumEntryBytes > c.remaining) {
+    throw new TruncatedFile(
+      `ObjectTable declares ${objectCount} objects (at least ` +
+        `${objectCount * minimumEntryBytes} bytes), ${c.remaining} remain`,
+    );
+  }
+  const entries: ObjectTableEntry[] = [];
+  for (let i = 0; i < objectCount; i++) {
+    const objectId = c.u32();
+    const label = c.string();
+    const anchor = c.f32s(3);
+    const dynamicsPresent = c.u8();
+    if (dynamicsPresent > 1) {
+      throw new MalformedFile(
+        `ObjectTable entry ${i} has dynamics_present ${dynamicsPresent}; it must be 0 or 1 ` +
+          "(section 5.15.6)",
+      );
+    }
+    const dynamics =
+      dynamicsPresent === 1
+        ? ([c.f32s(3), c.f32s(3), c.f32s(3)] as [number[], number[], number[]])
+        : null;
+    let embedding: number[] | null = null;
+    if (embeddingDim > 0) {
+      const hasEmbedding = c.u8();
+      if (hasEmbedding > 1) {
+        throw new MalformedFile(
+          `ObjectTable entry ${i} has has_embedding ${hasEmbedding}; it must be 0 or 1 ` +
+            "(section 5.15.6)",
+        );
+      }
+      if (hasEmbedding === 1) {
+        if (embeddingDim * 4 > c.remaining) {
+          throw new TruncatedFile(
+            `ObjectTable entry ${i} declares a ${embeddingDim}-dimensional embedding ` +
+              `(${embeddingDim * 4} bytes), ${c.remaining} remain`,
+          );
+        }
+        embedding = c.f32s(embeddingDim);
+      }
+    }
+    entries.push({ objectId, label, anchor, dynamics, embedding });
+  }
+  const table: ObjectTable = { embeddingDim, entries };
+  checkObjectTable(table);
+  return table;
+}
+
+/**
+ * Refuse a table that cannot be indexed by id, and values that are not numbers.
+ *
+ * Two entries for one id make every lookup a coin toss, which is the duplicate-name
+ * failure section 5.15.2 refuses for frames and sensors, spelled with integers.
+ */
+/**
+ * Refuse a value that the record's field cannot hold.
+ *
+ * These ids and dimensions are `u32` and `u16` on the wire, so the parser can only ever
+ * produce values inside them. A caller constructing a record can produce `-1`, `1.5` or
+ * `2 ** 32`, and nothing downstream would notice: membership is compared as an unsigned
+ * integer, so a track keyed by `1.5` composes onto nothing and one keyed by `-1` matches
+ * no gaussian while still looking valid. Rust gets this from its types and Python checks
+ * it by hand; TypeScript carries `number`, so it checks too.
+ */
+function checkUnsignedField(value: number, max: number, message: string): void {
+  if (!Number.isInteger(value) || value < 0 || value > max) {
+    throw new MalformedFile(message);
+  }
+}
+
+/** The largest finite f32, the range every object-table lane is stored in. */
+const F32_MAX = 3.4028234663852886e38;
+
+export function checkObjectTable(table: ObjectTable): void {
+  checkUnsignedField(
+    table.embeddingDim,
+    0xffff,
+    `ObjectTable embedding_dim is ${table.embeddingDim}; expected an integer in [0, 65535]`,
+  );
+  const seen = new Set<number>();
+  for (const entry of table.entries) {
+    checkUnsignedField(
+      entry.objectId,
+      0xffffffff,
+      `ObjectTable entry has object_id ${entry.objectId}; expected an integer in ` +
+        "[0, 4294967295]",
+    );
+    if (seen.has(entry.objectId)) {
+      throw new MalformedFile(
+        `two ObjectTable entries describe object ${entry.objectId}; entries are referred to ` +
+          "by id and nothing else (section 5.15.6)",
+      );
+    }
+    seen.add(entry.objectId);
+    // These lanes are stored as f32, so the range is the field's, not the double's.
+    // A finite double such as 1e100 fits no conforming record — writing it would
+    // round to Infinity — and Python refuses it as `object-value-out-of-f32-range`,
+    // so accepting it here would bless a table no other reader can hold.
+    const finite = (label: string, values: readonly number[]): void => {
+      for (let k = 0; k < values.length; k++) {
+        const value = values[k]!;
+        if (!Number.isFinite(value)) {
+          throw new MalformedFile(
+            `ObjectTable entry ${entry.objectId}: ${label}[${k}] is ${value}; every stored ` +
+              "value must be finite (section 5.15.6)",
+          );
+        }
+        if (Math.abs(value) > F32_MAX) {
+          throw new MalformedFile(
+            `ObjectTable entry ${entry.objectId}: ${label}[${k}] is ${value}, outside the ` +
+              `finite f32 range [-${F32_MAX}, ${F32_MAX}]`,
+          );
+        }
+      }
+    };
+    // The wire record carries f32[3] for each of these, so a shorter vector is a shape
+    // no conforming file can hold — Rust cannot express it, its fields are [f32; 3].
+    // The parser always builds three; a caller constructing a table can hand over two,
+    // and every value in it would be checked and accepted.
+    const width = (label: string, values: readonly number[]): void => {
+      if (values.length !== 3) {
+        throw new MalformedFile(
+          `ObjectTable entry ${entry.objectId}: ${label} has ${values.length} values, expected 3`,
+        );
+      }
+    };
+    width("anchor", entry.anchor);
+    finite("anchor", entry.anchor);
+    if (entry.dynamics !== null) {
+      // The tuple is three vectors when the dynamics flag is set. The type says so, but
+      // this is the validator a JavaScript caller reaches, and indexing a short tuple
+      // hands `undefined` to the width check — a TypeError from a library, rather than
+      // this library naming the object and the field.
+      if (entry.dynamics.length !== 3) {
+        throw new MalformedFile(
+          `ObjectTable entry ${entry.objectId}: dynamics has ${entry.dynamics.length} vectors, ` +
+            "expected 3 (velocity, angular_velocity, acceleration)",
+        );
+      }
+      width("velocity", entry.dynamics[0]);
+      width("angular_velocity", entry.dynamics[1]);
+      width("acceleration", entry.dynamics[2]);
+      finite("velocity", entry.dynamics[0]);
+      finite("angular_velocity", entry.dynamics[1]);
+      finite("acceleration", entry.dynamics[2]);
+    }
+    // An embedding has to match the space the table declares. `embedding_dim` is
+    // declared once for the whole file, so a vector of a different width — or any
+    // vector at all when the table declares no embedding space — describes a
+    // coordinate system nothing else in the file shares. Python refuses both
+    // (`records.py`, "invalid-object-embedding-shape"); the parser cannot build
+    // either shape, but a caller constructing a table can.
+    if (entry.embedding !== null) {
+      if (table.embeddingDim === 0) {
+        throw new MalformedFile(
+          `object ${entry.objectId}: an embedding is present but embedding_dim is 0`,
+        );
+      }
+      if (entry.embedding.length !== table.embeddingDim) {
+        throw new MalformedFile(
+          `object ${entry.objectId}: embedding has ${entry.embedding.length} values, ` +
+            `embedding_dim declares ${table.embeddingDim}`,
+        );
+      }
+      finite("embedding", entry.embedding);
+    }
+  }
+}
+
+/**
+ * One object's rigid pose over the scene clock. Opcode `0x25`, one record per object.
+ *
+ * Structurally a {@link RigTrajectory} keyed by object id rather than by name, and
+ * deliberately so: it satisfies `PoseSampled`, so the clamp-and-slerp of section 5.15.4
+ * is the same code for both and cannot drift between them.
+ */
+export interface ObjectTrack {
+  readonly objectId: number;
+  readonly interpolation: number;
+  readonly times: readonly number[];
+  readonly rotations: readonly (readonly number[])[];
+  readonly translations: readonly (readonly number[])[];
+}
+
+export function parseObjectTrack(content: Uint8Array): ObjectTrack {
+  const c = new Cursor(content);
+  const objectId = c.u32();
+  const interpolation = c.u8();
+  const count = c.u32();
+  // Each sample is 8 + 32 + 24 = 64 bytes, as for a rig trajectory.
+  if (count * 64 > c.remaining) {
+    throw new TruncatedFile(
+      `ObjectTrack for object ${objectId} declares ${count} samples (${count * 64} bytes), ` +
+        `${c.remaining} remain`,
+    );
+  }
+  // The same ceiling a rig trajectory gets, and for the same reason: the streamed decoder
+  // buffers a whole non-streamed record before yielding it, so a track is bounded by what
+  // one record may ask a reader to allocate rather than by how it arrives. The Dart
+  // decoder already refuses past this count.
+  if (count > MAX_TRAJECTORY_SAMPLES) {
+    throw new MalformedFile(
+      `ObjectTrack for object ${objectId} declares ${count} samples, past the ` +
+        `${MAX_TRAJECTORY_SAMPLES} ceiling`,
+    );
+  }
+  const times: number[] = [];
+  const rotations: number[][] = [];
+  const translations: number[][] = [];
+  for (let i = 0; i < count; i++) {
+    times.push(c.f64());
+    rotations.push(c.f64s(4));
+    translations.push(c.f64s(3));
+  }
+  const track: ObjectTrack = { objectId, interpolation, times, rotations, translations };
+  // §5.15.7: a zero-sample track "has no pose and is read as absent", so reading one
+  // refuses nothing about its pose. The id is not part of the pose — the same section
+  // requires every track to refuse object 0 — so that rule holds for an absent track
+  // too, and the rest waits for the writer's own checkObjectTrack.
+  if (times.length > 0) {
+    checkObjectTrack(track);
+  } else if (objectId === BACKGROUND_OBJECT) {
+    throw new MalformedFile(
+      "an ObjectTrack names object 0, which means background / unassigned; a track must " +
+        "move an object that exists (section 5.15.7)",
+    );
+  }
+  return track;
+}
+
+/**
+ * A track's own rules: it moves a real object, and its samples are a function of time.
+ *
+ * The pose rules are the trajectory's, so they are checked by the trajectory's checker
+ * rather than restated — the two records interpolate identically and a second copy of
+ * the rule is a second thing to get wrong.
+ */
+export function checkObjectTrack(track: ObjectTrack): void {
+  checkUnsignedField(
+    track.objectId,
+    0xffffffff,
+    `ObjectTrack has object_id ${track.objectId}; expected an integer in [0, 4294967295]`,
+  );
+  if (track.objectId === BACKGROUND_OBJECT) {
+    throw new MalformedFile(
+      "an ObjectTrack names object 0, which means background / unassigned; a track must move " +
+        "an object that exists (section 5.15.7)",
+    );
+  }
+  // The trajectory rules iterate each array on its own, so they cannot see a track whose
+  // arrays disagree in length — a shape the parser cannot produce but a caller building a
+  // record can. Left to them, `poseAt` reads past the short array and the file comes back
+  // as a TypeError rather than a MalformedFile. Python and Rust check this before
+  // delegating; so does this.
+  if (
+    track.rotations.length !== track.times.length ||
+    track.translations.length !== track.times.length
+  ) {
+    throw new MalformedFile(
+      `track for object ${track.objectId}: ${track.times.length} times, ` +
+        `${track.rotations.length} rotations, and ${track.translations.length} translations; ` +
+        "every sample needs all three",
+    );
+  }
+  // And each sample has to be the right width. The trajectory rules iterate whatever
+  // coordinates are present, so a translation of two numbers passes them and then reads
+  // as `undefined` in composition, which writes NaN into the centres rather than
+  // refusing. Rust cannot express this — its samples are [f64; 4] and [f64; 3] — and
+  // Python names it; here it has to be checked.
+  for (let i = 0; i < track.times.length; i++) {
+    if (track.rotations[i]!.length !== 4) {
+      throw new MalformedFile(
+        `track for object ${track.objectId}: sample ${i} rotation has ` +
+          `${track.rotations[i]!.length} values, expected 4`,
+      );
+    }
+    if (track.translations[i]!.length !== 3) {
+      throw new MalformedFile(
+        `track for object ${track.objectId}: sample ${i} translation has ` +
+          `${track.translations[i]!.length} values, expected 3`,
+      );
+    }
+  }
+  checkRigTrajectory({
+    name: `object ${track.objectId}`,
+    interpolation: track.interpolation,
+    times: track.times,
+    rotations: track.rotations,
+    translations: track.translations,
+  });
 }
 
 /**

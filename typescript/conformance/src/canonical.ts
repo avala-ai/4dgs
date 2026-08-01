@@ -30,13 +30,17 @@ import {
   Crc32,
   audioSourceStateAt,
   crc32,
+  ObjectLayer as ObjectLayerClass,
+  poseApply,
   poseAt,
+  quaternionMultiply,
   type Attachment,
   type AudioSource,
   type AudioSourceDescriptor,
   type Camera,
   type GaussianSet,
   type Header,
+  type ObjectLayer,
   type Metadata,
   type Pose,
   type Provenance,
@@ -183,6 +187,11 @@ export interface SceneSummaryInput {
    * the note in {@link summarize}.
    */
   readonly provenance?: Provenance | null;
+  /**
+   * Object-layer records. Like provenance, absent from the summary entirely when the
+   * file carries neither them nor per-gaussian membership.
+   */
+  readonly objects?: ObjectLayer | null;
 }
 
 /** The statement every implementation must agree on for a variant. */
@@ -261,6 +270,13 @@ export function summarize(input: SceneSummaryInput): unknown {
     ...(input.provenance != null && !input.provenance.isEmpty
       ? { provenance: summarizeProvenance(input.provenance) }
       : {}),
+    // Same omission rule, and for the same reason: an object record is additive to the
+    // gaussian-birth model, so a file without one must summarize exactly as it did
+    // before the layer existed. Membership alone is enough to report — a scene can
+    // carry ids and no table.
+    ...((input.objects != null && !input.objects.isEmpty) || gaussians.objectId !== null
+      ? objectsAndStates(header, gaussians, input.objects ?? null, order)
+      : {}),
     sh: summarizeSh(gaussians, order),
     sample: {
       positions: rows(gaussians.positions, 3),
@@ -272,6 +288,9 @@ export function summarize(input: SceneSummaryInput): unknown {
       sigmaT: sample.map((i) => num(gaussians.sigmaT[i])),
       winLo: sample.map((i) => num(gaussians.winLo[i])),
       winHi: sample.map((i) => num(gaussians.winHi[i])),
+      ...(gaussians.objectId === null
+        ? {}
+        : { objectIds: sample.map((i) => String(gaussians.objectId![i])) }),
     },
     aggregate: {
       positionSum: positionSum.map((v) => num(v)),
@@ -349,6 +368,180 @@ function summarizeProvenance(prov: Provenance): unknown {
       return poseRow(probe, prov.sensorPoseAt(s.name, probe), s.name);
     }),
   };
+}
+
+/**
+ * Object records plus post-track gaussian states at three scene-clock probes.
+ *
+ * Stored fields alone do not prove reconstruction: two implementations can agree on
+ * every entry in the table and every sample in a track and still disagree about where a
+ * gaussian ends up, because the layer's one rule is an order — base first, track second.
+ * The states make that order visible, including orientation, and the canonical gaussian
+ * order keeps the result independent of chunk and decoder order.
+ */
+function objectsAndStates(
+  header: SceneSummaryInput["header"],
+  gaussians: GaussianSet,
+  objects: ObjectLayer | null,
+  order: readonly number[],
+): Record<string, unknown> {
+  const layer = objects ?? new ObjectLayerClass();
+
+  const tracks = layer.tracks.map((track) => ({
+    objectId: String(track.objectId),
+    interpolation: track.interpolation,
+    sampleCount: String(track.times.length),
+    posesAt: probeTimes(track).map((probe) => poseRow(probe, layer.poseAt(track.objectId, probe))),
+  }));
+
+  const entries = (layer.table?.entries ?? []).map((entry) => {
+    let embeddingCrc: string | null = null;
+    if (entry.embedding !== null) {
+      const bytes = new Uint8Array(entry.embedding.length * 4);
+      const view = new DataView(bytes.buffer);
+      for (let i = 0; i < entry.embedding.length; i++) {
+        view.setFloat32(i * 4, entry.embedding[i]!, true);
+      }
+      embeddingCrc = crc(bytes);
+    }
+    return {
+      objectId: String(entry.objectId),
+      label: entry.label,
+      anchor: entry.anchor.map((v) => num(v)),
+      // The decoded dynamics values, not merely their presence: a summary that said only
+      // whether the record was there would pass a decoder that read the nine floats and
+      // exposed zeros. Null when the entry carries none.
+      dynamics:
+        entry.dynamics === null
+          ? null
+          : {
+              velocity: entry.dynamics[0].map((v) => num(v)),
+              angularVelocity: entry.dynamics[1].map((v) => num(v)),
+              acceleration: entry.dynamics[2].map((v) => num(v)),
+            },
+      hasEmbedding: entry.embedding !== null,
+      embeddingCrc,
+    };
+  });
+
+  const duration = Math.max(0, header.durationSec);
+  const states = [0, 0.5 * duration, Math.max(0, duration - 1e-6)].map((t) => {
+    const base = canonicalObjectStateAt(gaussians, layer, t, header.cutoff);
+
+    const rowForIndex = new Map<number, number>();
+    base.indices.forEach((index, row) => rowForIndex.set(index, row));
+    const sampleRows: number[] = [];
+    for (const index of order) {
+      const row = rowForIndex.get(index);
+      if (row !== undefined) sampleRows.push(row);
+      if (sampleRows.length === SAMPLE) break;
+    }
+
+    const rows = (values: readonly number[], width: number): (number | null)[][] =>
+      sampleRows.map((row) => {
+        const out: (number | null)[] = [];
+        for (let axis = 0; axis < width; axis++) out.push(num(values[row * width + axis]));
+        return out;
+      });
+
+    const positionSum = [0, 1, 2].map((axis) => {
+      let total = 0;
+      for (let row = 0; row < base.indices.length; row++) total += base.centers[row * 3 + axis]!;
+      return num(total);
+    });
+    let opacitySum = 0;
+    for (const value of base.opacity) opacitySum += value;
+
+    return {
+      t: num(t),
+      liveCount: String(base.indices.length),
+      sample: {
+        positions: rows(base.centers, 3),
+        orientations: rows(base.orientations, 4),
+        objectIds: sampleRows.map((row) => String(base.objectIds[row])),
+      },
+      aggregate: { positionSum, opacitySum: num(opacitySum) },
+    };
+  });
+
+  return {
+    objects: {
+      embeddingDim: layer.table === null ? 0 : layer.table.embeddingDim,
+      table: entries,
+      tracks,
+    },
+    states,
+  };
+}
+
+interface CanonicalObjectState {
+  readonly indices: number[];
+  readonly centers: number[];
+  readonly orientations: number[];
+  readonly opacity: number[];
+  readonly objectIds: number[];
+}
+
+/**
+ * Reconstruct in double precision for the six-decimal comparison.
+ *
+ * Production state arrays are float32 — {@link GaussianSet.stateAt} returns those, and
+ * that is the right storage for a decoder. Widening the decoded fields first is what
+ * keeps the canonical summary a statement about the format rather than about an SDK's
+ * output storage type, and it is what the Python and Rust references do.
+ */
+function canonicalObjectStateAt(
+  gaussians: GaussianSet,
+  layer: ObjectLayer,
+  t: number,
+  cutoff: number,
+): CanonicalObjectState {
+  const state: CanonicalObjectState = {
+    indices: [],
+    centers: [],
+    orientations: [],
+    opacity: [],
+    objectIds: [],
+  };
+  for (let i = 0; i < gaussians.count; i++) {
+    if (!(gaussians.winLo[i]! <= t && t < gaussians.winHi[i]!)) continue;
+    const mu = gaussians.muT[i]!;
+    const sigma = gaussians.sigmaT[i]!;
+    const marginal = Number.isFinite(sigma)
+      ? Math.exp(-0.5 * ((t - mu) / Math.max(sigma, 1e-30)) ** 2)
+      : 1;
+    if (marginal < cutoff) continue;
+    state.indices.push(i);
+    for (let axis = 0; axis < 3; axis++) {
+      state.centers.push(
+        gaussians.positions[i * 3 + axis]! + gaussians.motions[i * 3 + axis]! * (t - mu),
+      );
+    }
+    for (let axis = 0; axis < 4; axis++)
+      state.orientations.push(gaussians.rotations[i * 4 + axis]!);
+    state.opacity.push(gaussians.colors[i * 4 + 3]! * marginal);
+    state.objectIds.push(gaussians.objectId === null ? 0 : gaussians.objectId[i]!);
+  }
+
+  const referenced = new Set(state.objectIds.filter((id) => id !== 0));
+  const poses = new Map<number, Pose>();
+  for (const track of layer.tracks) {
+    if (!referenced.has(track.objectId)) continue;
+    const pose = layer.poseAt(track.objectId, t);
+    if (pose !== null) poses.set(track.objectId, pose);
+  }
+  for (let row = 0; row < state.objectIds.length; row++) {
+    const pose = poses.get(state.objectIds[row]!);
+    if (pose === undefined) continue;
+    const moved = poseApply(pose, state.centers.slice(row * 3, row * 3 + 3));
+    for (let axis = 0; axis < 3; axis++) state.centers[row * 3 + axis] = moved[axis]!;
+    const turned = quaternionMultiply(
+      pose.rotation,
+      state.orientations.slice(row * 4, row * 4 + 4),
+    );
+    for (let axis = 0; axis < 4; axis++) state.orientations[row * 4 + axis] = turned[axis]!;
+  }
+  return state;
 }
 
 /** Times a summary evaluates a trajectory at, derived from the trajectory itself. */
@@ -495,6 +688,12 @@ function stableOrder(gaussians: GaussianSet): number[] {
       sortable(gaussians.winHi[i]!),
     );
     for (let k = 0; k < shWidth; k++) row.push(gaussians.sh!.values[i * shWidth + k]!);
+    // Membership joins the key, after the harmonics and before the index tiebreak, exactly
+    // where the Python and Rust references put it. Two gaussians can tie on every rounded
+    // field and still belong to different objects — and then the `objectIds` sample, and the
+    // states composed from it, would be ordered by decode order, which differs between two
+    // correct readers that chunked the scene differently.
+    if (gaussians.objectId !== null) row.push(gaussians.objectId[i]!);
     row.push(i);
     keys[i] = row;
   }
