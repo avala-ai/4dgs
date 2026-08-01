@@ -142,6 +142,12 @@ export class ObjectLayer {
       );
     }
 
+    // A table-only layer is valid and common — labels and anchors with nothing moving —
+    // and it has no pose to apply, so the id scan below would build a set the size of the
+    // scene for nothing. The shape checks above still run, because a caller passing
+    // mismatched arrays is wrong whether or not there is a track to apply.
+    if (this.tracks.length === 0) return;
+
     const referenced = new Set<number>();
     for (let i = 0; i < count; i++) {
       const id = objectIds[i]!;

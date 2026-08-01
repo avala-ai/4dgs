@@ -1156,8 +1156,23 @@ export function checkObjectTable(table: ObjectTable): void {
         }
       }
     };
+    // The wire record carries f32[3] for each of these, so a shorter vector is a shape
+    // no conforming file can hold — Rust cannot express it, its fields are [f32; 3].
+    // The parser always builds three; a caller constructing a table can hand over two,
+    // and every value in it would be checked and accepted.
+    const width = (label: string, values: readonly number[]): void => {
+      if (values.length !== 3) {
+        throw new MalformedFile(
+          `ObjectTable entry ${entry.objectId}: ${label} has ${values.length} values, expected 3`,
+        );
+      }
+    };
+    width("anchor", entry.anchor);
     finite("anchor", entry.anchor);
     if (entry.dynamics !== null) {
+      width("velocity", entry.dynamics[0]);
+      width("angular_velocity", entry.dynamics[1]);
+      width("acceleration", entry.dynamics[2]);
       finite("velocity", entry.dynamics[0]);
       finite("angular_velocity", entry.dynamics[1]);
       finite("acceleration", entry.dynamics[2]);

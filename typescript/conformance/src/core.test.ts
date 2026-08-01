@@ -24,6 +24,7 @@ import {
   parseObjectTrack,
   checkObjectTrack,
   checkObjectTable,
+  ObjectLayer,
   quaternionNorm,
   checkRigTrajectory,
   poseAt,
@@ -669,4 +670,47 @@ test("object table lanes are refused outside the f32 range they are stored in", 
     embeddingDim: 0,
     entries: [{ ...entry, anchor: [3.4028234663852886e38, 0, 0] }],
   });
+});
+
+test("an object table vector of the wrong width is refused", () => {
+  // The wire record carries f32[3] for the anchor and each dynamics vector, so a
+  // shorter one is a shape no conforming file can hold. Rust cannot express it.
+  const entry = { objectId: 1, label: "", dynamics: null, embedding: null };
+  assert.throws(
+    () => checkObjectTable({ embeddingDim: 0, entries: [{ ...entry, anchor: [1, 2] }] }),
+    MalformedFile,
+  );
+  assert.throws(
+    () =>
+      checkObjectTable({
+        embeddingDim: 0,
+        entries: [
+          {
+            ...entry,
+            anchor: [0, 0, 0],
+            dynamics: [
+              [0, 0],
+              [0, 0, 0],
+              [0, 0, 0],
+            ],
+          },
+        ],
+      }),
+    MalformedFile,
+  );
+});
+
+test("a table-only object layer composes without scanning every gaussian", () => {
+  // Labels and anchors with nothing moving is a valid, common layer. It has no pose to
+  // apply, so composition must not build a scene-sized set for nothing — but the shape
+  // checks still run, because mismatched arrays are wrong either way.
+  const layer = new ObjectLayer();
+  const centers = new Float32Array([1, 0, 0]);
+  const orientations = new Float32Array([0, 0, 0, 1]);
+  layer.apply(centers, orientations, new Uint32Array([7]), 2);
+  assert.deepEqual(Array.from(centers), [1, 0, 0]);
+  assert.throws(
+    () => layer.apply(new Float32Array([1, 0]), orientations, new Uint32Array([7]), 2),
+    MalformedFile,
+  );
 });
