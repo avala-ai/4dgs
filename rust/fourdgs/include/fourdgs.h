@@ -909,8 +909,24 @@ int fourdgs_keyframe_delta_states_json(const uint8_t *data, size_t length, int i
 int fourdgs_scene_provenance_json(fourdgs_scene *scene, const char **out, size_t *out_len);
 
 /**
+ * Canonical object-layer JSON for an opened scene (spec 5.15.6-5.15.7).
+ *
+ * The object shape matches the shared conformance summary: `objects` (the Object Table's
+ * entries and the SE(3) tracks with their `posesAt` probes) and `states` (the composed
+ * centres, orientations and membership at three scene-clock probes). The composition is
+ * performed here so that every binding shares one base-then-track order and one slerp.
+ * The whole population is loaded first, so the summary never describes only what an
+ * earlier seek left resident. An empty result is not an error — the binding should omit
+ * the `objects` and `states` keys rather than emit null. On success `out` owns a string
+ * freed with fourdgs_string_free. The two-out-parameter sequencing rule at the top of
+ * this header applies.
+ */
+int fourdgs_scene_objects_json(fourdgs_scene *scene, const char **out, size_t *out_len);
+
+/**
  * Release a string owned by the caller — the result of fourdgs_peek_temporal_model,
- * fourdgs_keyframe_delta_states_json or fourdgs_scene_provenance_json. Null is ignored.
+ * fourdgs_keyframe_delta_states_json, fourdgs_scene_provenance_json or
+ * fourdgs_scene_objects_json. Null is ignored.
  * The length must be the one the producing call returned; the pair identifies the same
  * allocation.
  */
