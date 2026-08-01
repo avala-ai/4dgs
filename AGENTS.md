@@ -138,7 +138,9 @@ With the extension, this is what `rebase` is for — check the stack out, replay
 ```sh
 gh stack checkout 74        # the stack containing the PR you were told is conflicting
 gh stack rebase             # replay every layer on the new base
-# fix conflicts, `git add`, `git rebase --continue`
+# fix conflicts, `git add`, then `gh stack rebase --continue` — not plain
+# `git rebase --continue`, which resumes only the rebase in front of you and
+# leaves the extension without the bookkeeping it needs to carry on up the stack
 gh stack push               # force-push each branch with lease
 ```
 
@@ -159,7 +161,11 @@ tip. **Count the commits before you push.** A wrong fork point silently produces
 commits of its own, and force-pushing that empties the PR — GitHub closes it as an empty diff:
 
 ```sh
-git log --oneline feat/parity-objects-ts..HEAD | wc -l   # must equal the layer's own commits
+# Against the branch you rebased ONTO, never the branch you are on: `A..B` is what B has
+# and A does not, so naming the current branch on both sides always answers zero — for a
+# healthy branch and an emptied one alike.
+git log --oneline origin/main..HEAD | wc -l              # bottom layer, now based on main
+git log --oneline feat/parity-objects-ts..HEAD | wc -l   # a layer above, from its parent
 ```
 
 **What does not belong in a stack.** A stack is for changes that genuinely depend on each other. Two
