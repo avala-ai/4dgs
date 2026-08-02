@@ -2388,13 +2388,21 @@ unsafe fn object_canonical_member(
         if let Err(e) = scene.inner.load_all(full) {
             return report(e);
         }
-        let gaussians = scene.inner.loaded().clone();
+        // Summarized against the borrow rather than a copy. The obvious way to satisfy the
+        // borrow checker here is to clone the resident set so the restore below can take
+        // `&mut` — which would hold two whole decoded populations at once, on the one call
+        // that has just decoded the largest one it ever will. The scope ends the borrow
+        // instead, and `CanonicalParts` is owned strings, so nothing outlives it.
+        let parts = {
+            let gaussians = scene.inner.loaded();
+            crate::object_layer::canonical_parts(&header, gaussians, &layer)
+        };
         if band < full {
             if let Err(e) = scene.inner.load_all(band) {
                 return report(e);
             }
         }
-        match crate::object_layer::canonical_parts(&header, &gaussians, &layer) {
+        match parts {
             Ok(parts) => put_owned_string(
                 if want_states {
                     parts.states
