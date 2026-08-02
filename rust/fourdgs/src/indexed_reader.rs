@@ -733,7 +733,15 @@ pub fn read_objects<R: Readable + ?Sized>(
             op::OBJECT_TABLE,
         )?)?);
     }
-    for range in scene.object_track_ranges.values() {
+    // File order, not id order. The ranges are keyed by object id so a duplicate track can
+    // be refused by lookup, but iterating that map would emit the layer sorted by id while
+    // the streamed reader and `canonical.py` emit it in the order the records appear. A
+    // file is free to write track 7 before track 3, and then the two paths would summarize
+    // the same layer differently — a canonical form that disagrees with itself depending on
+    // which reader produced it.
+    let mut ranges: Vec<&ObjectTrackRange> = scene.object_track_ranges.values().collect();
+    ranges.sort_by_key(|r| r.record_offset);
+    for range in ranges {
         // The same ceiling the table branch above applies. A track is front matter, so a
         // crafted record_length must not size an allocation before anything has looked at
         // the bytes — and the parse that would reject it only runs after the read.

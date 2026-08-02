@@ -893,6 +893,21 @@ array_accessor!(
     "Validity window end in seconds, 1 float per resident gaussian. Borrowed until the next load."
 );
 
+/// Object membership, 1 unsigned integer per resident gaussian, or null when the scene
+/// carries no `object_id` stream (spec §6.6).
+///
+/// Null and all-zero are different claims and both are legal: a file with no membership at
+/// all, and a file where every gaussian is background. A binding that substituted zeros for
+/// null would report the second when it read the first. Borrowed until the next load.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_scene_object_ids(scene: *const fourdgs_scene) -> *const u32 {
+    let scene = scene_or!(scene, std::ptr::null());
+    match scene.inner.loaded().object_id.as_ref() {
+        Some(ids) if !ids.is_empty() => ids.as_ptr(),
+        _ => std::ptr::null(),
+    }
+}
+
 /// Spherical harmonic coefficients, `3 * fourdgs_scene_sh_coefficients()` bytes per
 /// resident gaussian, component-major: every coefficient of red, then green, then blue.
 ///
@@ -2304,6 +2319,119 @@ pub unsafe extern "C" fn fourdgs_scene_provenance_json(
             Err(e) => report(e),
         }
     })
+}
+
+/// Canonical object-layer JSON for an opened scene (spec §5.15.6-§5.15.7).
+///
+/// The Object Table, the SE(3) tracks with their sampled poses, and the composed state at
+/// three scene-clock probes — the summary that proves base-then-track composition rather
+/// than merely that the records were read. Computed in the core so that C++ and Swift
+/// cannot drift from each other, or from Rust, on the slerp or the composition order.
+///
+/// An empty string means the file carries neither object records nor per-gaussian
+/// membership: the binding should omit the keys, not emit null. Works on both open paths;
+/// on the indexed path the records are fetched if not already resident. On success `out`
+/// owns a string freed with `fourdgs_string_free`. Sequence the two out parameters as
+/// every other call here does — read them only after this returns OK.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_scene_objects_json(
+    scene: *mut fourdgs_scene,
+    out: *mut *const c_char,
+    out_len: *mut usize,
+) -> c_int {
+    unsafe { object_canonical_member(scene, out, out_len, false) }
+}
+
+/// Shared body: both accessors compose the layer the same way and differ only in which
+/// rendered member they hand back.
+unsafe fn object_canonical_member(
+    scene: *mut fourdgs_scene,
+    out: *mut *const c_char,
+    out_len: *mut usize,
+    want_states: bool,
+) -> c_int {
+    guarded(|| {
+        if out.is_null() || out_len.is_null() {
+            set_last_error("a string out parameter is null".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        }
+        let Some(scene) = (unsafe { scene.as_mut() }) else {
+            set_last_error("the scene is null".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        };
+        let header = scene.inner.header().clone();
+        let layer = match scene.inner.objects() {
+            Ok(layer) => layer,
+            Err(e) => return report(e),
+        };
+        // The whole population at the file's full SH degree, whatever the caller left
+        // resident. Two reasons, and the second is the one that is easy to argue away:
+        //
+        // 1. The summary reports every gaussian's composed state, so a partial load would
+        //    silently report a partial scene.
+        // 2. `stable_order` places the SH coefficients *before* `object_id`. Two gaussians
+        //    tied on every base attribute but differing in both their harmonics and their
+        //    membership sort by the harmonics when those are resident and by the id when
+        //    they are not — and membership is a value these members emit, so the flip is
+        //    visible. Summarizing at the caller's cap would make canonical output depend
+        //    on call history, which is the one thing a canonical form may not do.
+        //
+        // It is tempting to stop at "rows that tie up to the harmonics are identical in
+        // everything emitted". That is false exactly when the ids differ, because the ids
+        // are keyed after the harmonics rather than before them.
+        //
+        // The caller's cap is restored afterwards: a consumer that capped bands to save
+        // memory should not find the full set resident because it asked for a summary.
+        // That costs a second decode, and only for a caller who capped.
+        let band = scene.inner.loaded_band();
+        let full = header.sh_degree;
+        if let Err(e) = scene.inner.load_all(full) {
+            return report(e);
+        }
+        // Summarized against the borrow rather than a copy. The obvious way to satisfy the
+        // borrow checker here is to clone the resident set so the restore below can take
+        // `&mut` — which would hold two whole decoded populations at once, on the one call
+        // that has just decoded the largest one it ever will. The scope ends the borrow
+        // instead, and `CanonicalParts` is owned strings, so nothing outlives it.
+        let parts = {
+            let gaussians = scene.inner.loaded();
+            crate::object_layer::canonical_parts(&header, gaussians, &layer)
+        };
+        if band < full {
+            if let Err(e) = scene.inner.load_all(band) {
+                return report(e);
+            }
+        }
+        match parts {
+            Ok(parts) => put_owned_string(
+                if want_states {
+                    parts.states
+                } else {
+                    parts.objects
+                },
+                out,
+                out_len,
+            ),
+            Err(e) => report(e),
+        }
+    })
+}
+
+/// The `states` member an object-layer file adds to a scene summary: post-composition
+/// gaussian state at each probe time.
+///
+/// Separate from `fourdgs_scene_objects_json` because the two sit side by side at the root
+/// of the summary, so a binding places each under its own key rather than cutting one
+/// document apart. Same contract as that call in every other respect: an empty string
+/// means the file carries neither object records nor membership, both open paths work, and
+/// the string is freed with `fourdgs_string_free`.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_scene_object_states_json(
+    scene: *mut fourdgs_scene,
+    out: *mut *const c_char,
+    out_len: *mut usize,
+) -> c_int {
+    unsafe { object_canonical_member(scene, out, out_len, true) }
 }
 
 /// Release a string owned by the caller — the result of `fourdgs_peek_temporal_model`,

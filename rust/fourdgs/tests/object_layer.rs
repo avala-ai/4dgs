@@ -18,7 +18,7 @@ use fourdgs::records::{
     ChunkIndexEntry, Footer, Header, ObjectTable, ObjectTableEntry, ObjectTrack, Quantization,
     WindowTable, TRAJECTORY_LINEAR,
 };
-use fourdgs::serialization::MAGIC;
+use fourdgs::serialization::{put_record, MAGIC};
 use fourdgs::stream::encode_stream;
 use fourdgs::SceneReader;
 
@@ -92,6 +92,220 @@ fn streams_with_object_id(values: &[i64], channels: usize) -> Vec<u8> {
         encode_stream(op::A_OBJECT_ID, values, channels, codec::DEFLATE, 1, false).unwrap(),
     );
     streams
+}
+
+/// Two gaussians identical in every attribute except their spherical harmonics, both
+/// members of the tracked object, with the harmonics ordered against the decode order.
+///
+/// The point is the tie: `object_layer::stable_order` ends its key with the SH
+/// coefficients, so this file sorts one way when the harmonics are resident and the other
+/// way when a band cap has dropped them. A canonical form that changed with the caller's
+/// band cap would be no canonical form at all, which is what
+/// `objects_json_does_not_depend_on_the_resident_band` pins down.
+fn object_file_with_harmonics() -> Vec<u8> {
+    const COUNT: usize = 2;
+    // Degree 1: 3 coefficients per colour component, so a row is 9 bytes wide.
+    const ROW: usize = 9;
+
+    let mut out = MAGIC.to_vec();
+    out.extend(
+        Header {
+            duration_sec: 1.0,
+            gaussian_count: COUNT as u64,
+            aabb: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            cutoff: 0.05,
+            temporal_model: "gaussian-birth".into(),
+            sh_degree: 1,
+            ..Default::default()
+        }
+        .encode(&[]),
+    );
+    out.extend(quantization().encode(&[]));
+    out.extend(
+        WindowTable {
+            windows: vec![(0.0, 1.0)],
+        }
+        .encode(),
+    );
+    out.extend(
+        ObjectTable {
+            embedding_dim: 0,
+            entries: vec![
+                ObjectTableEntry {
+                    object_id: 3,
+                    label: "untracked".into(),
+                    ..Default::default()
+                },
+                ObjectTableEntry {
+                    object_id: 7,
+                    label: "tracked".into(),
+                    ..Default::default()
+                },
+            ],
+        }
+        .encode(b"")
+        .unwrap(),
+    );
+    out.extend(
+        ObjectTrack {
+            object_id: 7,
+            interpolation: TRAJECTORY_LINEAR,
+            times: vec![0.0, 1.0],
+            rotations: vec![Q_Z90, Q_Z90],
+            translations: vec![[10.0, 0.0, 0.0], [10.0, 0.0, 0.0]],
+        }
+        .encode(b"")
+        .unwrap(),
+    );
+
+    let chunk_at = out.len() as u64;
+    let chunk = fourdgs::records::encode_chunk(
+        0.0,
+        1.0,
+        0,
+        COUNT as u32,
+        &streams_with_object_id(&[7, 3], 1),
+    );
+    out.extend(&chunk);
+
+    // The harmonics and the membership disagree about the order, which is the whole point.
+    // Row 0 is object 7 with the smaller coefficients; row 1 is object 3 with the larger.
+    // The key puts the harmonics before `object_id`, so with them resident row 0 sorts
+    // first and without them row 1 does — and the two rows differ in a value the summary
+    // emits, so the flip is visible.
+    let values: Vec<i64> = (0..COUNT)
+        .flat_map(|i| (0..ROW).map(move |_| if i == 0 { 100 } else { 200 }))
+        .collect();
+    let mut payload = vec![1u8];
+    payload
+        .extend(encode_stream(op::SH_BAND_STREAM, &values, ROW, codec::DEFLATE, 1, true).unwrap());
+    let band_at = out.len() as u64;
+    let before = out.len();
+    put_record(&mut out, op::SH_BAND_STREAM, &payload);
+    let band_length = (out.len() - before) as u64;
+
+    // Indexed, because that is the only path where a band cap is a real decision: the
+    // streamed reader decodes every band at open, so capping afterwards changes nothing
+    // and the defect this file exists to catch cannot occur there.
+    let summary_start = out.len() as u64;
+    out.extend(
+        ChunkIndexEntry {
+            t0: 0.0,
+            t1: 1.0,
+            chunk_offset: chunk_at,
+            chunk_length: chunk.len() as u64,
+            gaussian_count: COUNT as u32,
+            bands: vec![(1, band_at, band_length)],
+            ..Default::default()
+        }
+        .encode(),
+    );
+
+    out.extend(
+        Footer {
+            summary_start,
+            summary_offset_start: 0,
+            summary_crc: 0,
+        }
+        .encode(),
+    );
+    out.extend(MAGIC);
+    out
+}
+
+/// A file whose two Object Tracks are written highest id first, on either read path.
+///
+/// Legal and deliberately awkward: nothing in §5.15.7 orders the records, so a writer may
+/// emit track 7 before track 3. The indexed reader keys its ranges by id to refuse
+/// duplicates, and iterating that map would hand the layer back sorted — a different
+/// `objects.tracks` array than the streamed reader and `canonical.py` produce from the
+/// same bytes.
+fn object_file_with_tracks_out_of_id_order(indexed: bool) -> Vec<u8> {
+    let mut out = MAGIC.to_vec();
+    out.extend(
+        Header {
+            duration_sec: 1.0,
+            gaussian_count: 2,
+            aabb: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            cutoff: 0.05,
+            temporal_model: "gaussian-birth".into(),
+            ..Default::default()
+        }
+        .encode(&[]),
+    );
+    out.extend(quantization().encode(&[]));
+    out.extend(
+        WindowTable {
+            windows: vec![(0.0, 1.0)],
+        }
+        .encode(),
+    );
+    out.extend(
+        ObjectTable {
+            embedding_dim: 0,
+            entries: vec![
+                ObjectTableEntry {
+                    object_id: 3,
+                    label: "second".into(),
+                    ..Default::default()
+                },
+                ObjectTableEntry {
+                    object_id: 7,
+                    label: "first".into(),
+                    ..Default::default()
+                },
+            ],
+        }
+        .encode(b"")
+        .unwrap(),
+    );
+    // 7 before 3: the order under test.
+    for (object_id, x) in [(7u32, 10.0f64), (3, 5.0)] {
+        out.extend(
+            ObjectTrack {
+                object_id,
+                interpolation: TRAJECTORY_LINEAR,
+                times: vec![0.0, 1.0],
+                rotations: vec![Q_ID, Q_ID],
+                translations: vec![[x, 0.0, 0.0], [x, 0.0, 0.0]],
+            }
+            .encode(b"")
+            .unwrap(),
+        );
+    }
+
+    let chunk_at = out.len() as u64;
+    let chunk = fourdgs::records::encode_chunk(0.0, 1.0, 0, 2, &streams_with_object_id(&[7, 3], 1));
+    out.extend(&chunk);
+
+    let summary_start = if indexed {
+        let start = out.len() as u64;
+        out.extend(
+            ChunkIndexEntry {
+                t0: 0.0,
+                t1: 1.0,
+                chunk_offset: chunk_at,
+                chunk_length: chunk.len() as u64,
+                gaussian_count: 2,
+                bands: Vec::new(),
+                ..Default::default()
+            }
+            .encode(),
+        );
+        start
+    } else {
+        0
+    };
+    out.extend(
+        Footer {
+            summary_start,
+            summary_offset_start: 0,
+            summary_crc: 0,
+        }
+        .encode(),
+    );
+    out.extend(MAGIC);
+    out
 }
 
 fn object_file(indexed: bool, duplicate_table: bool) -> Vec<u8> {
@@ -1114,4 +1328,113 @@ fn the_composed_state_path_applies_tracks_the_base_path_leaves_alone() {
     // No layer is the base state unchanged.
     let none = state_at_with_objects(&gaussians, None, 2.0, 0.05).expect("no layer is fine");
     assert!((none.centers[0] - 1.0).abs() < 1e-6);
+}
+
+/// The canonical object JSON is the same whatever the caller left resident, and the
+/// caller's band cap survives the call.
+///
+/// `stable_order` places the SH coefficients *before* `object_id`, and this file is built
+/// to make that matter: two gaussians tied on every base attribute, differing in both
+/// their harmonics and their membership, arranged so the two keys disagree. With the
+/// harmonics resident row 0 sorts first; without them the ids decide and row 1 does. The
+/// ids are emitted, so the flip is visible — `objectIds` reads ["7", "3"] one way and
+/// ["3", "7"] the other, with the composed positions and orientations following.
+///
+/// The near-miss worth recording: it is tempting to argue that rows tying up to the
+/// harmonics are identical in everything these members emit, so the order cannot matter.
+/// That holds only while the ids are equal, because the ids are keyed *after* the
+/// harmonics. Summarizing at the caller's cap would therefore make canonical output depend
+/// on call history, and C++ and Swift would fail conformance on a file they decoded
+/// perfectly.
+///
+/// The second assertion is the accessor's other half: it summarizes at the file's full
+/// degree and puts the caller's cap back, so asking for a summary does not silently spend
+/// the memory a band cap was bought with.
+#[test]
+fn objects_json_does_not_depend_on_the_resident_band() {
+    unsafe fn canonical(bytes: &[u8], cap: u8, want_states: bool) -> (String, u8) {
+        let mut scene: *mut fourdgs::capi::fourdgs_scene = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { fourdgs::capi::fourdgs_open_memory(bytes.as_ptr(), bytes.len(), &mut scene) },
+            0
+        );
+        assert_eq!(
+            unsafe { fourdgs::capi::fourdgs_scene_load_all(scene, cap) },
+            0
+        );
+
+        let mut out: *const std::os::raw::c_char = std::ptr::null();
+        let mut length = 0usize;
+        let status = if want_states {
+            unsafe { fourdgs::capi::fourdgs_scene_object_states_json(scene, &mut out, &mut length) }
+        } else {
+            unsafe { fourdgs::capi::fourdgs_scene_objects_json(scene, &mut out, &mut length) }
+        };
+        assert_eq!(status, 0);
+        // Length-delimited, never NUL-terminated: the core hands back a pointer and a
+        // count, and the format's own `string` type may legally contain a NUL. Reading to
+        // the first zero byte runs off the end of the allocation — which is not a
+        // hypothetical, it is what Windows CI caught by returning this document with a
+        // stray 0x1B glued to it.
+        let json = String::from_utf8(
+            unsafe { std::slice::from_raw_parts(out as *const u8, length) }.to_vec(),
+        )
+        .expect("the core emits UTF-8");
+        unsafe { fourdgs::capi::fourdgs_string_free(out, length) };
+
+        // What the caller can still see: the resident coefficient width, which is what a
+        // band cap buys and what an accessor must not quietly spend.
+        let coefficients = unsafe { fourdgs::capi::fourdgs_scene_sh_coefficients(scene) } as u8;
+        unsafe { fourdgs::capi::fourdgs_scene_free(scene) };
+        (json, coefficients)
+    }
+
+    let bytes = object_file_with_harmonics();
+    for want_states in [false, true] {
+        let (capped, capped_coefficients) = unsafe { canonical(&bytes, 0, want_states) };
+        let (full, full_coefficients) = unsafe { canonical(&bytes, 1, want_states) };
+        assert_eq!(
+            capped, full,
+            "canonical object JSON changed with the caller's band cap (states = {want_states})"
+        );
+        // The cap survives the call, and the two caps are genuinely different loads —
+        // otherwise the equality above would prove nothing.
+        assert_eq!(capped_coefficients, 0);
+        assert_eq!(full_coefficients, 3);
+    }
+}
+
+/// Both read paths report the tracks in the order the file wrote them.
+///
+/// The indexed reader keys its ranges by object id, which is right for refusing a
+/// duplicate and wrong for rendering: iterating that map emits the layer sorted by id
+/// while the streamed reader and `canonical.py` emit it in record order. For a file that
+/// writes track 7 before track 3 the two paths would summarize the same bytes differently,
+/// and a canonical form that depends on which reader produced it is not canonical.
+#[test]
+fn tracks_are_summarized_in_file_order_on_both_paths() {
+    let mut summaries = Vec::new();
+    for mode in [OpenMode::Sequential, OpenMode::Indexed] {
+        let bytes = object_file_with_tracks_out_of_id_order(mode == OpenMode::Indexed);
+        let mut reader =
+            SceneReader::open_with(BytesReadable::new(&bytes), mode).expect("open object file");
+        let layer = reader.objects().expect("object layer");
+        assert_eq!(
+            layer.tracks.iter().map(|t| t.object_id).collect::<Vec<_>>(),
+            vec![7, 3],
+            "tracks came back in id order rather than file order ({mode:?})"
+        );
+
+        let header = reader.header().clone();
+        let gaussians = reader.load_all(0).expect("load").clone();
+        summaries.push(
+            fourdgs::object_layer::canonical_parts(&header, &gaussians, &layer)
+                .expect("canonical parts")
+                .objects,
+        );
+    }
+    assert_eq!(
+        summaries[0], summaries[1],
+        "the two read paths summarized the same layer differently"
+    );
 }

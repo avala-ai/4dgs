@@ -13,6 +13,15 @@ All notable changes to the Rust crate are documented here, following
   opened scene, or an empty string when the file carries none. Computed by
   `provenance::canonical_json` in the core so C++ and Swift emit the same slerp and clamp as the
   reference; freed with the existing `fourdgs_string_free`. Additive — no existing signature moved.
+- **The object layer on the C ABI.** `fourdgs_scene_objects_json` and
+  `fourdgs_scene_object_states_json` return the canonical `objects` and `states` members (spec
+  §5.15.6-§5.15.7) for an opened scene — the Object Table's entries, the tracks with their sampled
+  poses, and the post-composition gaussian state at each probe — or an empty string when the file
+  carries neither object records nor membership. Both are views of one
+  `object_layer::canonical_parts` computation, so composition order (`center = R*c0 + T`,
+  `orientation = R ⊗ r0`) is stated once in the core. `fourdgs_scene_object_ids` borrows the
+  resident `object_id` array, or returns NULL when the scene carries no such stream — NULL and
+  all-zero are different claims. Additive — no existing signature moved.
 
 ## [0.3.0] - 2026-07-31
 

@@ -909,8 +909,54 @@ int fourdgs_keyframe_delta_states_json(const uint8_t *data, size_t length, int i
 int fourdgs_scene_provenance_json(fourdgs_scene *scene, const char **out, size_t *out_len);
 
 /**
+ * The `objects` member of the canonical scene summary (spec 5.15.6-5.15.7): the Object
+ * Table's entries and the SE(3) tracks with their `posesAt` probes.
+ *
+ * The composition is performed here so every binding shares one base-then-track order and
+ * one slerp. An empty result is not an error — the binding should omit the key rather than
+ * emit null. On success `out` owns a string freed with fourdgs_string_free. The
+ * two-out-parameter sequencing rule at the top of this header applies.
+ *
+ * THIS CALL LOADS. The summary describes every gaussian, so it decodes the whole
+ * population, and at the file's full SH degree rather than the caller's cap — the
+ * canonical order keys the harmonics before `object_id`, so summarizing at a lower degree
+ * would sort a legal file differently from the reference. The cap is restored before this
+ * returns, so a caller that capped for memory keeps it, at the cost of a second decode.
+ *
+ * The working set is not restored. Treat this exactly like fourdgs_scene_load_all: every
+ * pointer previously handed out by fourdgs_scene_positions and its siblings, including
+ * fourdgs_scene_object_ids, is invalidated by it, and a caller that had seeked to an
+ * instant holds the whole scene afterwards. Call it before taking the pointers, not
+ * between taking them and reading them — the mistake this paragraph exists to prevent, and
+ * a silent one on a scene already loaded whole, because then the load is a no-op.
+ *
+ * The companion `states` member comes from fourdgs_scene_object_states_json. They are two
+ * calls because they are two root keys of the summary, sitting beside `sample` and
+ * `aggregate` — returning one document would make every binding cut it apart.
+ */
+/**
+ * Object membership, 1 unsigned integer per resident gaussian, or NULL when the scene
+ * carries no `object_id` stream (spec 6.6).
+ *
+ * NULL and all-zero are different claims and both are legal: a file with no membership at
+ * all, and a file where every gaussian is background. Borrowed until the next load.
+ */
+const uint32_t *fourdgs_scene_object_ids(const fourdgs_scene *scene);
+
+int fourdgs_scene_objects_json(fourdgs_scene *scene, const char **out, size_t *out_len);
+
+/**
+ * The `states` member of the canonical scene summary: the composed centres, orientations
+ * and membership at each scene-clock probe.
+ *
+ * Same contract as fourdgs_scene_objects_json in every other respect.
+ */
+int fourdgs_scene_object_states_json(fourdgs_scene *scene, const char **out, size_t *out_len);
+
+/**
  * Release a string owned by the caller — the result of fourdgs_peek_temporal_model,
- * fourdgs_keyframe_delta_states_json or fourdgs_scene_provenance_json. Null is ignored.
+ * fourdgs_keyframe_delta_states_json, fourdgs_scene_provenance_json or
+ * fourdgs_scene_objects_json. Null is ignored.
  * The length must be the one the producing call returned; the pair identifies the same
  * allocation.
  */

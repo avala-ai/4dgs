@@ -30,6 +30,7 @@
 //! Nothing here is required to decode gaussians. A file with no object layer produces an
 //! empty [`ObjectLayer`], which is a value and never an error.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use crate::error::{Error, Result};
@@ -237,4 +238,513 @@ pub fn state_at_with_objects(
         .collect();
     layer.apply(&mut state.centers, &mut state.orientations, &visible, t)?;
     Ok(state)
+}
+
+// ---------------------------------------------------------------------------
+// Canonical JSON — the object summary every SDK is diffed on
+// ---------------------------------------------------------------------------
+//
+// This lives in the core, beside the composition it reports, for the same reason
+// `provenance::canonical_json` and `keyframe_delta_states_json` do: C++ and Swift reach the
+// format through the C ABI, and a summary computed twice is a summary two bindings can
+// disagree about. The arithmetic that matters here — base-then-track composition, the
+// clamp-and-slerp behind each pose — happens once, in one language.
+
+use crate::model::GaussianSet;
+use crate::provenance::{int, num, Json};
+use crate::records::Header;
+use crate::serialization::crc32;
+
+/// How many gaussians appear in full in a state's sample. The aggregates cover the rest.
+const SAMPLE: usize = 16;
+
+/// How many decimals the canonical form keeps. Matches `FLOAT_DECIMALS` in `canonical.py`.
+const CANONICAL_DECIMALS: usize = 6;
+
+/// A comparison key: rounded like the summary, with infinity kept as infinity so every
+/// language orders never-fading gaussians identically.
+///
+/// Rendered and parsed back rather than scaled and rounded, because the two disagree on
+/// exact halves and a sort key may not. `f64::round` goes half away from zero, so the f32
+/// `0.5078125` — a dyadic value that lands exactly on the boundary — becomes `0.507813`
+/// here while `canonical.py`, C++ and Swift all render `0.507812`. Two gaussians straddling
+/// such a value would then sort one way in the core and the other way in the reference, and
+/// the sampled `states` they produce would disagree even though both decoded correctly.
+fn sortable(value: f32) -> f64 {
+    let v = value as f64;
+    if v.is_nan() {
+        return f64::INFINITY;
+    }
+    if v.is_infinite() {
+        return v;
+    }
+    // Scaled and rounded half to even rather than rendered and parsed. The rendering is
+    // the canonical definition, and this agrees with it for every f32 — the input is f32,
+    // so the value times a million needs at most thirteen significant digits and stays
+    // inside what f64 represents exactly, which is what would otherwise make double
+    // rounding disagree. `sortable_matches_the_rendered_form` checks that across the whole
+    // f32 bit space. Cheap matters because the comparison below calls this per field per
+    // comparison rather than materializing a key.
+    let scale = 10f64.powi(CANONICAL_DECIMALS as i32);
+    (v * scale).round_ties_even() / scale
+}
+
+/// Content order: derived from decoded values alone, never from decode order.
+///
+/// Gaussians may be reordered freely by an encoder and readers must not rely on their
+/// order, so a summary that did would ask two correct decoders to disagree. Membership
+/// joins the key after the harmonics — two gaussians can tie on every rounded field and
+/// still belong to different objects.
+pub fn stable_order(gaussians: &GaussianSet) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..gaussians.count()).collect();
+    // Stable, so two gaussians equal on every field of the key keep the order they arrived
+    // in — which cannot change any value the summary emits, and makes the sort reproducible.
+    order.sort_by(|&a, &b| compare_rows(gaussians, a, b));
+    order
+}
+
+/// The key, compared field by field instead of built.
+///
+/// Materializing it is the obvious shape and the expensive one: a row is twenty-one
+/// rounded scalars plus the harmonics, so a million gaussians at degree 3 is around five
+/// hundred megabytes of keys — allocated *after* the whole population is already resident,
+/// on a call whose entire job is to summarize it. Comparing on demand allocates the index
+/// vector and nothing else. It costs repeated rounding, which is why `sortable` is
+/// arithmetic rather than formatting.
+fn compare_rows(gaussians: &GaussianSet, a: usize, b: usize) -> Ordering {
+    fn cmp(x: f64, y: f64) -> Ordering {
+        x.partial_cmp(&y)
+            .expect("no key value is NaN; see `sortable`")
+    }
+
+    for (arr, width) in [
+        (&gaussians.positions, 3usize),
+        (&gaussians.scales, 3),
+        (&gaussians.rotations, 4),
+        (&gaussians.colors, 4),
+        (&gaussians.motions, 3),
+    ] {
+        for k in 0..width {
+            let ord = cmp(sortable(arr[a * width + k]), sortable(arr[b * width + k]));
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+    }
+    for arr in [
+        &gaussians.mu_t,
+        &gaussians.sigma_t,
+        &gaussians.win_lo,
+        &gaussians.win_hi,
+    ] {
+        let ord = cmp(sortable(arr[a]), sortable(arr[b]));
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    // Compared as the bytes they are. They were widened to f64 when the key was built, and
+    // widening is order-preserving, so this is the same comparison without the conversion.
+    if let Some(sh) = &gaussians.sh {
+        let sh_width = gaussians.sh_coefficients * 3;
+        for k in 0..sh_width {
+            let ord = sh[a * sh_width + k].cmp(&sh[b * sh_width + k]);
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+    }
+    // Membership last, after the harmonics: two gaussians can tie on every rounded field
+    // and still belong to different objects.
+    if let Some(object_ids) = &gaussians.object_id {
+        return object_ids[a].cmp(&object_ids[b]);
+    }
+    Ordering::Equal
+}
+
+/// Times a summary evaluates an object track at, derived from the track itself.
+///
+/// Two of the five are outside the sample range on purpose: clamping is a rule, and a rule
+/// no expectation exercises is a rule an implementation can decline to have.
+fn probe_times(track: &ObjectTrack) -> Vec<f64> {
+    if track.sample_count() == 0 {
+        return Vec::new();
+    }
+    let first = track.times[0];
+    let last = track.times[track.sample_count() - 1];
+    vec![
+        first - 0.5,
+        first,
+        first / 2.0 + last / 2.0,
+        last,
+        last + 0.5,
+    ]
+}
+
+fn pose_row(t: f64, pose: Option<&Pose>) -> Json {
+    match pose {
+        None => Json::obj(vec![
+            ("time", num(t)),
+            ("rotation", Json::Null),
+            ("translation", Json::Null),
+        ]),
+        Some(p) => Json::obj(vec![
+            ("time", num(t)),
+            (
+                "rotation",
+                Json::Arr(p.rotation.iter().map(|v| num(*v)).collect()),
+            ),
+            (
+                "translation",
+                Json::Arr(p.translation.iter().map(|v| num(*v)).collect()),
+            ),
+        ]),
+    }
+}
+
+/// One instant, reconstructed in f64 and composed.
+struct CanonicalState {
+    indices: Vec<usize>,
+    centers: Vec<f64>,
+    orientations: Vec<f64>,
+    opacity: Vec<f64>,
+    object_ids: Vec<u32>,
+}
+
+/// Reconstruct in double precision for the six-decimal comparison.
+///
+/// Production state arrays are f32 and that is the right storage for a decoder; widening
+/// the decoded fields first is what keeps the summary a statement about the format rather
+/// than about an SDK's output storage type.
+fn canonical_state_at(
+    gaussians: &GaussianSet,
+    layer: &ObjectLayer,
+    t: f64,
+    cutoff: f64,
+) -> Result<CanonicalState> {
+    let mut state = CanonicalState {
+        indices: Vec::new(),
+        centers: Vec::new(),
+        orientations: Vec::new(),
+        opacity: Vec::new(),
+        object_ids: Vec::new(),
+    };
+    for i in 0..gaussians.count() {
+        if !(gaussians.win_lo[i] as f64 <= t && t < gaussians.win_hi[i] as f64) {
+            continue;
+        }
+        let mu = gaussians.mu_t[i] as f64;
+        let sigma = gaussians.sigma_t[i] as f64;
+        let marginal = if sigma.is_finite() {
+            let z = (t - mu) / sigma.max(1e-30);
+            (-0.5 * z * z).exp()
+        } else {
+            1.0
+        };
+        if marginal < cutoff {
+            continue;
+        }
+        state.indices.push(i);
+        for axis in 0..3 {
+            state.centers.push(
+                gaussians.positions[i * 3 + axis] as f64
+                    + gaussians.motions[i * 3 + axis] as f64 * (t - mu),
+            );
+        }
+        state.orientations.extend(
+            gaussians.rotations[i * 4..i * 4 + 4]
+                .iter()
+                .map(|v| *v as f64),
+        );
+        state
+            .opacity
+            .push(gaussians.colors[i * 4 + 3] as f64 * marginal);
+        state
+            .object_ids
+            .push(gaussians.object_id.as_ref().map_or(0, |ids| ids[i]));
+    }
+
+    let referenced: HashSet<u32> = state
+        .object_ids
+        .iter()
+        .copied()
+        .filter(|id| *id != BACKGROUND)
+        .collect();
+    let mut poses: HashMap<u32, Pose> = HashMap::new();
+    for track in &layer.tracks {
+        if !referenced.contains(&track.object_id) {
+            continue;
+        }
+        if let Some(pose) = pose_at(track, t)? {
+            poses.insert(track.object_id, pose);
+        }
+    }
+    for (row, object_id) in state.object_ids.iter().enumerate() {
+        let Some(pose) = poses.get(object_id) else {
+            continue;
+        };
+        let c0 = [
+            state.centers[row * 3],
+            state.centers[row * 3 + 1],
+            state.centers[row * 3 + 2],
+        ];
+        let moved = pose.apply(c0);
+        state.centers[row * 3..row * 3 + 3].copy_from_slice(&moved);
+        let r0 = [
+            state.orientations[row * 4],
+            state.orientations[row * 4 + 1],
+            state.orientations[row * 4 + 2],
+            state.orientations[row * 4 + 3],
+        ];
+        let turned = quaternion_multiply(pose.rotation, r0);
+        state.orientations[row * 4..row * 4 + 4].copy_from_slice(&turned);
+    }
+    Ok(state)
+}
+
+/// The canonical object summary: the records, and the composed state at three probes.
+///
+/// Empty string when the file carries neither object records nor per-gaussian membership,
+/// which is deliberate and mirrors provenance: an object record is additive to the
+/// gaussian-birth model, so a file without one must summarize exactly as it did before the
+/// layer existed. A binding omits the keys rather than emitting nulls.
+///
+/// Stored fields alone would not prove reconstruction. Two implementations can agree on
+/// every table entry and every track sample and still disagree about where a gaussian ends
+/// up, because the layer's one rule is an order — base first, track second. The `states`
+/// make that order visible, including orientation.
+/// The two canonical members an object-layer file adds to a scene summary, rendered.
+///
+/// Returned separately rather than as one document because they sit at the *root* of the
+/// summary beside `sample`, `aggregate` and the rest — a binding places each under its own
+/// key. Handing back `{"objects":…,"states":…}` would make every binding cut the braces off
+/// and splice the text, which is the kind of string surgery a canonical output should never
+/// ask for. Both are empty when the file carries neither object records nor membership.
+pub struct CanonicalParts {
+    /// The `objects` value: embedding dimension, table entries, tracks with sampled poses.
+    pub objects: String,
+    /// The `states` value: post-composition gaussian state at each probe time.
+    pub states: String,
+}
+
+pub fn canonical_parts(
+    header: &Header,
+    gaussians: &GaussianSet,
+    layer: &ObjectLayer,
+) -> Result<CanonicalParts> {
+    if layer.is_empty() && gaussians.object_id.is_none() {
+        return Ok(CanonicalParts {
+            objects: String::new(),
+            states: String::new(),
+        });
+    }
+    layer.check()?;
+
+    let mut tracks = Vec::with_capacity(layer.tracks.len());
+    for track in &layer.tracks {
+        let mut poses = Vec::new();
+        for probe in probe_times(track) {
+            poses.push(pose_row(probe, pose_at(track, probe)?.as_ref()));
+        }
+        tracks.push(Json::obj(vec![
+            ("objectId", int(track.object_id as u64)),
+            ("interpolation", Json::Num(track.interpolation as f64)),
+            ("sampleCount", int(track.sample_count() as u64)),
+            ("posesAt", Json::Arr(poses)),
+        ]));
+    }
+
+    let mut entries = Vec::new();
+    let embedding_dim = match &layer.table {
+        None => 0,
+        Some(table) => {
+            entries.reserve(table.entries.len());
+            for entry in &table.entries {
+                let embedding_crc = match &entry.embedding {
+                    None => Json::Null,
+                    Some(embedding) => {
+                        let mut bytes = Vec::with_capacity(embedding.len() * 4);
+                        for value in embedding {
+                            bytes.extend_from_slice(&value.to_le_bytes());
+                        }
+                        Json::Str(crc32(&bytes).to_string())
+                    }
+                };
+                entries.push(Json::obj(vec![
+                    ("objectId", int(entry.object_id as u64)),
+                    ("label", Json::Str(entry.label.clone())),
+                    (
+                        "anchor",
+                        Json::Arr(entry.anchor.iter().map(|v| num(*v as f64)).collect()),
+                    ),
+                    // The decoded dynamics values, not merely their presence: a summary
+                    // that said only whether the record was there would pass a decoder
+                    // that read the nine floats and exposed zeros.
+                    (
+                        "dynamics",
+                        match &entry.dynamics {
+                            None => Json::Null,
+                            Some((velocity, angular, acceleration)) => Json::obj(vec![
+                                (
+                                    "velocity",
+                                    Json::Arr(velocity.iter().map(|v| num(*v as f64)).collect()),
+                                ),
+                                (
+                                    "angularVelocity",
+                                    Json::Arr(angular.iter().map(|v| num(*v as f64)).collect()),
+                                ),
+                                (
+                                    "acceleration",
+                                    Json::Arr(
+                                        acceleration.iter().map(|v| num(*v as f64)).collect(),
+                                    ),
+                                ),
+                            ]),
+                        },
+                    ),
+                    ("hasEmbedding", Json::Bool(entry.embedding.is_some())),
+                    ("embeddingCrc", embedding_crc),
+                ]));
+            }
+            table.embedding_dim
+        }
+    };
+
+    let order = stable_order(gaussians);
+    let duration = header.duration_sec.max(0.0);
+    let mut states = Vec::with_capacity(3);
+    for t in [0.0, 0.5 * duration, (duration - 1e-6).max(0.0)] {
+        let state = canonical_state_at(gaussians, layer, t, header.cutoff)?;
+
+        let mut row_for_index = vec![None; gaussians.count()];
+        for (row, index) in state.indices.iter().enumerate() {
+            row_for_index[*index] = Some(row);
+        }
+        let sample_rows: Vec<usize> = order
+            .iter()
+            .filter_map(|index| row_for_index[*index])
+            .take(SAMPLE)
+            .collect();
+        let rows = |values: &[f64], width: usize| {
+            Json::Arr(
+                sample_rows
+                    .iter()
+                    .map(|row| {
+                        Json::Arr(
+                            (0..width)
+                                .map(|axis| num(values[row * width + axis]))
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        let position_sum: Vec<Json> = (0..3)
+            .map(|axis| {
+                num((0..state.indices.len())
+                    .map(|row| state.centers[row * 3 + axis])
+                    .sum())
+            })
+            .collect();
+        let opacity_sum: f64 = state.opacity.iter().sum();
+        states.push(Json::obj(vec![
+            ("t", num(t)),
+            ("liveCount", int(state.indices.len() as u64)),
+            (
+                "sample",
+                Json::obj(vec![
+                    ("positions", rows(&state.centers, 3)),
+                    ("orientations", rows(&state.orientations, 4)),
+                    (
+                        "objectIds",
+                        Json::Arr(
+                            sample_rows
+                                .iter()
+                                .map(|row| int(state.object_ids[*row] as u64))
+                                .collect(),
+                        ),
+                    ),
+                ]),
+            ),
+            (
+                "aggregate",
+                Json::obj(vec![
+                    ("positionSum", Json::Arr(position_sum)),
+                    ("opacitySum", num(opacity_sum)),
+                ]),
+            ),
+        ]));
+    }
+
+    Ok(CanonicalParts {
+        objects: Json::obj(vec![
+            ("embeddingDim", Json::Num(embedding_dim as f64)),
+            ("table", Json::Arr(entries)),
+            ("tracks", Json::Arr(tracks)),
+        ])
+        .to_json(),
+        states: Json::Arr(states).to_json(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sortable;
+
+    /// The canonical rounding rule is render-then-parse, and exact halves are where the
+    /// alternatives part company.
+    ///
+    /// Each value here is dyadic, so `v * 1e6` is exactly representable and lands on `.5`:
+    /// scaling and calling `f64::round` rounds it away from zero, while every reference
+    /// implementation — Python's `round`, C++'s `strtod` of a rendered string, Swift's
+    /// `%.6f` — renders half to even. A sort key that disagreed with them would reorder
+    /// the sampled states for a file no decoder got wrong.
+    #[test]
+    fn exact_halves_round_the_way_the_reference_does() {
+        assert_eq!(sortable(0.5078125), 0.507812);
+        assert_eq!(sortable(0.0078125), 0.007812);
+        assert_eq!(sortable(-0.5078125), -0.507812);
+        // Not a tie: nothing to decide, and both rules agree.
+        assert_eq!(sortable(1.015625), 1.015625);
+    }
+
+    /// The arithmetic shortcut agrees with the canonical rendered form, everywhere.
+    ///
+    /// `sortable` scales and rounds half to even instead of rendering to six decimals and
+    /// parsing back, because the comparison calls it per field per comparison rather than
+    /// building a key once. The rendered form is still the definition, so the shortcut has
+    /// to match it — not approximately, and not only on the values a corpus happens to
+    /// hold. This sweeps the f32 bit space with a prime stride, so the samples are not
+    /// aligned to exponent boundaries, and covers both sides of the magnitude where
+    /// scaling by a million could start losing digits.
+    #[test]
+    fn sortable_matches_the_rendered_form() {
+        fn rendered(v: f64) -> f64 {
+            format!("{v:.*}", super::CANONICAL_DECIMALS)
+                .parse()
+                .unwrap_or(v)
+        }
+
+        let mut checked = 0u64;
+        let mut bits: u32 = 0;
+        while bits < u32::MAX - 4099 {
+            let v = f32::from_bits(bits);
+            if v.is_finite() {
+                assert_eq!(
+                    sortable(v),
+                    rendered(v as f64),
+                    "the shortcut and the canonical rendering disagree at {v:e}"
+                );
+                checked += 1;
+            }
+            bits += 4099;
+        }
+        assert!(checked > 500_000, "the sweep covered only {checked} values");
+    }
+
+    #[test]
+    fn undecodable_values_still_order_identically() {
+        assert_eq!(sortable(f32::NAN), f64::INFINITY);
+        assert_eq!(sortable(f32::INFINITY), f64::INFINITY);
+        assert_eq!(sortable(f32::NEG_INFINITY), f64::NEG_INFINITY);
+    }
 }
