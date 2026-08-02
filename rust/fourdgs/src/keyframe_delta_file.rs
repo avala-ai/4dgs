@@ -861,6 +861,7 @@ pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
                 let (ids, bins) = keyframe_from_chunk(record.content)?;
                 let (head, _) = rec::parse_chunk(record.content)?;
                 let state = keyframe_state(ids, bins)?;
+                check_window_indices(&state, &windows)?;
                 by_offset.insert(record.offset as u64, state.clone());
                 chunks.push(ChunkInfo {
                     t0: head.t0,
@@ -934,11 +935,27 @@ fn record_content(data: &[u8], offset: u64, length: u64) -> Result<&[u8]> {
     c.blob()
 }
 
+/// Refuse a `window_index` the table cannot answer, on either read path.
+///
+/// The table defaults to a single `(0, 0)` entry when a file declares none
+/// (`chunk::window_table_or_default`), so index 0 stays legal for a file with no Window
+/// Table — validating against the raw count would refuse those files on one path while
+/// the other decoded them.
+fn check_window_indices(state: &State, windows: &[(f64, f64)]) -> Result<()> {
+    let table_len = crate::chunk::window_table_or_default(windows).len();
+    if let Some(window_index) = state.bins.get(&op::A_WINDOW_INDEX) {
+        for &index in &window_index.values {
+            crate::chunk::check_window_index(index, table_len)?;
+        }
+    }
+    Ok(())
+}
+
 fn compose_chain(
     data: &[u8],
     index: &[rec::ChunkIndexEntry],
     entry: &rec::ChunkIndexEntry,
-    windows_len: usize,
+    windows: &[(f64, f64)],
 ) -> Result<State> {
     let chain = chain_for(index, (entry.t0 + entry.t1) / 2.0)?;
     let mut state: Option<State> = None;
@@ -955,13 +972,7 @@ fn compose_chain(
         }
     }
     let state = state.ok_or_else(|| Error::Malformed("an empty chain".into()))?;
-    // Refuse an index the table cannot answer, here rather than at reconstruction: the
-    // same rule the chunk path applies, and the reason `Grids::window_len` can be total.
-    if let Some(window_index) = state.bins.get(&op::A_WINDOW_INDEX) {
-        for &index in &window_index.values {
-            crate::chunk::check_window_index(index, windows_len)?;
-        }
-    }
+    check_window_indices(&state, windows)?;
     Ok(state)
 }
 
@@ -1007,7 +1018,7 @@ pub fn decode_indexed(data: &[u8]) -> Result<(DecodedSequence, Vec<rec::ChunkInd
 
     let mut chunks: Vec<ChunkInfo> = Vec::with_capacity(index.len());
     for entry in &index {
-        let state = compose_chain(data, &index, entry, windows.len())?;
+        let state = compose_chain(data, &index, entry, &windows)?;
         let (update_count, birth_count, death_count) = if entry.kind != 0 {
             let content = record_content(data, entry.chunk_offset, entry.chunk_length)?;
             let (head, ..) = rec::parse_delta_chunk(content)?;
