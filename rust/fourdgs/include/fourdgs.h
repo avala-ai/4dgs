@@ -913,11 +913,18 @@ int fourdgs_scene_provenance_json(fourdgs_scene *scene, const char **out, size_t
  * Table's entries and the SE(3) tracks with their `posesAt` probes.
  *
  * The composition is performed here so every binding shares one base-then-track order and
- * one slerp. The whole population is loaded first, so the summary never describes only
- * what an earlier seek left resident. An empty result is not an error — the binding should
- * omit the key rather than emit null. On success `out` owns a string freed with
- * fourdgs_string_free. The two-out-parameter sequencing rule at the top of this header
- * applies.
+ * one slerp. An empty result is not an error — the binding should omit the key rather than
+ * emit null. On success `out` owns a string freed with fourdgs_string_free. The
+ * two-out-parameter sequencing rule at the top of this header applies.
+ *
+ * THIS CALL LOADS. The summary describes every gaussian, so it decodes the whole
+ * population — at whatever SH band the caller already had resident, and it leaves that
+ * band alone, but not the working set. Treat it exactly like fourdgs_scene_load_all: every
+ * pointer previously handed out by fourdgs_scene_positions and its siblings, including
+ * fourdgs_scene_object_ids, is invalidated by it. A caller that had seeked to an instant
+ * holds the whole scene afterwards. Call it before taking the pointers, not between taking
+ * them and reading them — which is the mistake this paragraph exists to prevent, and it is
+ * silent on a scene already loaded whole, because then the load is a no-op.
  *
  * The companion `states` member comes from fourdgs_scene_object_states_json. They are two
  * calls because they are two root keys of the summary, sitting beside `sample` and

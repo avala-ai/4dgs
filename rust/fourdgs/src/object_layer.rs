@@ -257,8 +257,18 @@ use crate::serialization::crc32;
 /// How many gaussians appear in full in a state's sample. The aggregates cover the rest.
 const SAMPLE: usize = 16;
 
+/// How many decimals the canonical form keeps. Matches `FLOAT_DECIMALS` in `canonical.py`.
+const CANONICAL_DECIMALS: usize = 6;
+
 /// A comparison key: rounded like the summary, with infinity kept as infinity so every
 /// language orders never-fading gaussians identically.
+///
+/// Rendered and parsed back rather than scaled and rounded, because the two disagree on
+/// exact halves and a sort key may not. `f64::round` goes half away from zero, so the f32
+/// `0.5078125` — a dyadic value that lands exactly on the boundary — becomes `0.507813`
+/// here while `canonical.py`, C++ and Swift all render `0.507812`. Two gaussians straddling
+/// such a value would then sort one way in the core and the other way in the reference, and
+/// the sampled `states` they produce would disagree even though both decoded correctly.
 fn sortable(value: f32) -> f64 {
     let v = value as f64;
     if v.is_nan() {
@@ -267,8 +277,7 @@ fn sortable(value: f32) -> f64 {
     if v.is_infinite() {
         return v;
     }
-    let scale = 10f64.powi(6);
-    (v * scale).round() / scale
+    format!("{v:.*}", CANONICAL_DECIMALS).parse().unwrap_or(v)
 }
 
 /// Content order: derived from decoded values alone, never from decode order.
@@ -641,4 +650,33 @@ pub fn canonical_parts(
         .to_json(),
         states: Json::Arr(states).to_json(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sortable;
+
+    /// The canonical rounding rule is render-then-parse, and exact halves are where the
+    /// alternatives part company.
+    ///
+    /// Each value here is dyadic, so `v * 1e6` is exactly representable and lands on `.5`:
+    /// scaling and calling `f64::round` rounds it away from zero, while every reference
+    /// implementation — Python's `round`, C++'s `strtod` of a rendered string, Swift's
+    /// `%.6f` — renders half to even. A sort key that disagreed with them would reorder
+    /// the sampled states for a file no decoder got wrong.
+    #[test]
+    fn exact_halves_round_the_way_the_reference_does() {
+        assert_eq!(sortable(0.5078125), 0.507812);
+        assert_eq!(sortable(0.0078125), 0.007812);
+        assert_eq!(sortable(-0.5078125), -0.507812);
+        // Not a tie: nothing to decide, and both rules agree.
+        assert_eq!(sortable(1.015625), 1.015625);
+    }
+
+    #[test]
+    fn undecodable_values_still_order_identically() {
+        assert_eq!(sortable(f32::NAN), f64::INFINITY);
+        assert_eq!(sortable(f32::INFINITY), f64::INFINITY);
+        assert_eq!(sortable(f32::NEG_INFINITY), f64::NEG_INFINITY);
+    }
 }
