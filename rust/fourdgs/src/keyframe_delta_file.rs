@@ -1197,7 +1197,18 @@ pub fn reconstruct_at(seq: &DecodedSequence, state: &State, t: f64) -> Reconstru
             let z = (t - mu_f) / sigma_f;
             (-0.5 * z * z).exp()
         };
-        out.opacity.push(alpha * marginal);
+        // A gaussian is absent outside its own validity window, exactly as the
+        // gaussian-birth path decides it (`win_lo <= t < win_hi`). Unobservable while
+        // every keyframe-delta file carried one full-duration window; reachable the
+        // moment a file declares more than one.
+        let (lo, hi) = grids
+            .windows
+            .get(usize::try_from(window.values[i]).unwrap_or(0))
+            .copied()
+            .unwrap_or_else(|| grids.window());
+        let in_window = lo <= t && t < hi;
+        out.opacity
+            .push(if in_window { alpha * marginal } else { 0.0 });
     }
     out
 }

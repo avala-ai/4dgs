@@ -190,6 +190,14 @@ def test_a_multi_window_sequence_round_trips_each_gaussians_own_window():
         "both windows must survive the round trip, in table order"
     )
 
+    # A gaussian is absent outside its own window: the short-window rows carry no
+    # opacity once t passes 0.5s, while the full-duration rows still do. Before this,
+    # a closed window bled its gaussians through at full opacity for the whole clip.
+    late = kdf.render_at(seq, 2.0)
+    opacity = list(late["opacity"])
+    assert opacity[0] > 0.0 and opacity[1] > 0.0, "the full-duration rows stay visible"
+    assert opacity[2] == 0.0 and opacity[3] == 0.0, "a row whose window closed at 0.5s must not be reported at t=2"
+
     # And the decoder must give the two populations different velocity grids.
     grids = seq.grids
     sigma_bins = np.zeros(2, dtype=np.int64)

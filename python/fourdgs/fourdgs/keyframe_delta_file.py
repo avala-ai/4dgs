@@ -772,6 +772,8 @@ def _dequantize(state: State, grids: Grids):
         motions=b[op.A_MOTION].astype(np.float64) * m_step,
         mu_t=b[op.A_MU_T][:, 0].astype(np.float64) * t_step,
         sigma_t=sigma,
+        # Carried through so reconstruction can apply each row's own validity window.
+        window_index=b[op.A_WINDOW_INDEX][:, 0].astype(np.int64),
     )
 
 
@@ -802,6 +804,16 @@ def reconstruct_at(state: State, grids: Grids, t: float) -> dict:
     color = values["colors"][order]
     with np.errstate(over="ignore"):
         marginal = np.where(np.isinf(sigma), 1.0, np.exp(-0.5 * ((t - mu) / sigma) ** 2))
+    # A gaussian is absent outside its own validity window, exactly as the gaussian-birth
+    # path decides it (`model.py`: `win_lo <= t < win_hi`). This was unobservable while
+    # every keyframe-delta file carried one full-duration window — every row was always
+    # in-window — and becomes reachable the moment a file declares more than one, which
+    # is what the rest of this change enables. Without it a gaussian whose window closed
+    # at 0.5s is still reported, at full opacity, at t = 4.
+    table = np.asarray(grids.windows or [(0.0, 0.0)], dtype=np.float64)
+    idx = np.asarray(values["window_index"], dtype=np.int64)[order]
+    in_window = (table[idx, 0] <= t) & (t < table[idx, 1])
+    marginal = np.where(in_window, marginal, 0.0)
     centers = position + motion * (t - mu)[:, None]
     return dict(
         ids=ids,

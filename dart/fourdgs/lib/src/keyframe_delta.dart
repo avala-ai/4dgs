@@ -899,7 +899,16 @@ _Reconstruction _reconstructAt(
     final alpha = (opacityBins[i] * steps.alpha).clamp(0.0, 1.0);
     final marginal =
         sigma.isInfinite ? 1.0 : math.exp(-0.5 * (dt / sigma) * (dt / sigma));
-    opacity[outRow] = alpha * marginal;
+    // A gaussian is absent outside its own validity window, exactly as the
+    // gaussian-birth path decides it (`winLo <= t < winHi`). Unobservable while
+    // every keyframe-delta file carried one full-duration window; reachable the
+    // moment a file declares more than one.
+    final w =
+        grids.windows.isEmpty
+            ? const FourdgsWindow(0.0, 0.0)
+            : grids.windows[windowIndex[i].clamp(0, grids.windows.length - 1)];
+    final inWindow = w.lo <= t && t < w.hi;
+    opacity[outRow] = inWindow ? alpha * marginal : 0.0;
   }
   return _Reconstruction(ids, centers, scales, opacity);
 }
