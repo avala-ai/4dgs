@@ -67,6 +67,7 @@ from .serialization import (
     encode_stream,
     iter_records,
 )
+from .stream_reader import check_window_indices
 
 #: Matches `tests/conformance/canonical.py`: integers are strings so a 64-bit value
 #: survives a double-backed JSON parser, floats are rounded before comparison, and a
@@ -105,11 +106,30 @@ class Grids:
     steps: Steps
     bounds: Bounds
     origin: np.ndarray
-    window: tuple[float, float]
+    #: Every validity window the sequence declares, in Window Table order. A gaussian's
+    #: own window is the one its `window_index` names — the velocity grid is derived from
+    #: that window's length (spec section 6.3), so collapsing the table to its first entry
+    #: gives every gaussian outside window 0 the wrong motion precision and its positions
+    #: drift from the bins the encoder wrote.
+    windows: list[tuple[float, float]]
     cutoff: float
 
-    def motion_step(self, sigma_bins: np.ndarray, never_fades: np.ndarray) -> np.ndarray:
-        win_len = np.full(sigma_bins.shape, self.window[1] - self.window[0], dtype=np.float64)
+    @property
+    def window(self) -> tuple[float, float]:
+        """The first window. Only the writer uses this: it emits a single-window table."""
+        return self.windows[0] if self.windows else (0.0, 0.0)
+
+    def window_lengths(self, window_index: np.ndarray) -> np.ndarray:
+        """Per-gaussian window length, resolved the way the gaussian-birth path resolves it."""
+        if not self.windows:
+            return np.zeros(np.shape(window_index), dtype=np.float64)
+        table = np.asarray(self.windows, dtype=np.float64)
+        idx = np.asarray(window_index, dtype=np.int64).reshape(-1)
+        check_window_indices(idx, len(self.windows))
+        return table[idx, 1] - table[idx, 0]
+
+    def motion_step(self, sigma_bins: np.ndarray, never_fades: np.ndarray, window_index: np.ndarray) -> np.ndarray:
+        win_len = self.window_lengths(window_index)
         classes = life_class(sigma_bins, self.steps.sigma_log, never_fades, win_len, support_k(self.cutoff))
         return motion_steps(classes, self.steps.motion)
 
@@ -124,7 +144,13 @@ def _grids_for(samples: list[Sample], duration_sec: float, profile: str, cutoff:
     bounds = Bounds.for_profile(profile, median_scale=median_scale)
     steps = Steps.of(bounds)
     origin = positions.min(axis=0) if positions.size else np.zeros(3)
-    return Grids(steps=steps, bounds=bounds, origin=origin, window=(0.0, float(duration_sec)), cutoff=cutoff)
+    return Grids(
+        steps=steps,
+        bounds=bounds,
+        origin=origin,
+        windows=[(0.0, float(duration_sec))],
+        cutoff=cutoff,
+    )
 
 
 def _quantize_sample(sample: Sample, grids: Grids) -> tuple[np.ndarray, dict[int, np.ndarray]]:
@@ -151,7 +177,7 @@ def _quantize_sample(sample: Sample, grids: Grids) -> tuple[np.ndarray, dict[int
     rot_idx, q_rot = (
         quantize_rotation(g.rotations, grids.steps.rot) if n else (np.zeros(0, np.int64), np.zeros((0, 3), np.int64))
     )
-    m_step = grids.motion_step(q_sigma, never_fades) if n else np.zeros(0)
+    m_step = grids.motion_step(q_sigma, never_fades, window_index) if n else np.zeros(0)
     t_step = grids.mu_step(q_sigma, never_fades) if n else np.zeros(0)
     q_motion = (
         np.rint(g.motions.astype(np.float64) / m_step[:, None]).astype(np.int64) if n else np.zeros((0, 3), np.int64)
@@ -427,12 +453,11 @@ class DecodedSequence:
             sigma_log=q.step_sigma_log,
             sh=q.step_sh,
         )
-        window = self.windows[0] if self.windows else (0.0, 0.0)
         return Grids(
             steps=steps,
             bounds=None,
             origin=np.asarray(q.pos_origin, dtype=np.float64),
-            window=window,
+            windows=list(self.windows),
             cutoff=self.header.cutoff,
         )
 
@@ -689,7 +714,7 @@ def _dequantize(state: State, grids: Grids):
     sigma_bins = b[op.A_SIGMA_T][:, 0]
     never_fades = b[op.A_FLAGS][:, 0] != 0
     sigma = np.where(never_fades, np.inf, np.exp(sigma_bins * grids.steps.sigma_log))
-    m_step = grids.motion_step(sigma_bins, never_fades)[:, None]
+    m_step = grids.motion_step(sigma_bins, never_fades, b[op.A_WINDOW_INDEX][:, 0])[:, None]
     t_step = grids.mu_step(sigma_bins, never_fades)
     return dict(
         positions=dequantize(b[op.A_POSITION], grids.steps.pos, grids.origin),

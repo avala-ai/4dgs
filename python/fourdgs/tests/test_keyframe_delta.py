@@ -15,6 +15,7 @@ import pytest
 from fourdgs import keyframe_delta as kd
 from fourdgs import opcode as op
 from fourdgs import records as rec
+from fourdgs.exceptions import MalformedFile
 
 RNG = np.random.default_rng(20260729)
 
@@ -292,3 +293,40 @@ def test_a_depth_that_disagrees_with_the_chain_is_refused():
         kd.chain_for(index, 2.5)
     assert caught.value.code == "depth-mismatch"
     assert "cost of this seek" in str(caught.value)
+
+
+def test_each_gaussian_gets_the_window_its_index_names():
+    """The velocity grid comes from the gaussian's own window, not the table's first entry.
+
+    `window_index` is a required keyframe attribute and GOP-invariant (spec §11.5), so a
+    keyframe-delta sequence may legitimately carry several windows. Deriving every
+    gaussian's motion precision from `windows[0]` gave everyone outside window 0 the
+    wrong grid, and their reconstructed positions drifted from the bins the encoder
+    wrote — silently, in three SDKs at once.
+    """
+    from fourdgs.keyframe_delta_file import Grids
+    from fourdgs.quantization import Bounds, Steps
+
+    steps = Steps.of(Bounds.for_profile("default", median_scale=1e-2))
+    grids = Grids(
+        steps=steps,
+        bounds=None,
+        origin=np.zeros(3),
+        windows=[(0.0, 10.0), (0.0, 0.5)],
+        cutoff=0.05,
+    )
+
+    # Two never-fading gaussians: for those, window length alone sets the velocity class.
+    sigma_bins = np.zeros(2, dtype=np.int64)
+    never_fades = np.ones(2, dtype=bool)
+
+    both_in_window_0 = grids.motion_step(sigma_bins, never_fades, np.array([0, 0]))
+    assert both_in_window_0[0] == both_in_window_0[1]
+
+    one_each = grids.motion_step(sigma_bins, never_fades, np.array([0, 1]))
+    assert one_each[0] != one_each[1], "a 10s window and a 0.5s window cannot share a grid"
+    assert one_each[0] == both_in_window_0[0], "window 0 is unchanged"
+
+    # An index the table cannot answer is a malformed file, not a silent clamp.
+    with pytest.raises(MalformedFile):
+        grids.motion_step(sigma_bins, never_fades, np.array([0, 7]))
