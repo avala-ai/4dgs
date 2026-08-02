@@ -563,6 +563,15 @@ impl<R: Readable> SceneReader<R> {
     }
 
     /// The gaussians currently resident.
+    /// The spherical-harmonic band the resident set was loaded with.
+    ///
+    /// Exposed so a caller that must load for its own purposes can put the reader back
+    /// the way it found it — the object summary needs every gaussian, and taking them at
+    /// band 0 would otherwise silently drop the harmonics a caller had already paid for.
+    pub fn loaded_band(&self) -> u8 {
+        self.loaded_band
+    }
+
     pub fn loaded(&self) -> &GaussianSet {
         &self.loaded
     }

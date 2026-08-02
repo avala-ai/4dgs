@@ -893,6 +893,21 @@ array_accessor!(
     "Validity window end in seconds, 1 float per resident gaussian. Borrowed until the next load."
 );
 
+/// Object membership, 1 unsigned integer per resident gaussian, or null when the scene
+/// carries no `object_id` stream (spec §6.6).
+///
+/// Null and all-zero are different claims and both are legal: a file with no membership at
+/// all, and a file where every gaussian is background. A binding that substituted zeros for
+/// null would report the second when it read the first. Borrowed until the next load.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_scene_object_ids(scene: *const fourdgs_scene) -> *const u32 {
+    let scene = scene_or!(scene, std::ptr::null());
+    match scene.inner.loaded().object_id.as_ref() {
+        Some(ids) if !ids.is_empty() => ids.as_ptr(),
+        _ => std::ptr::null(),
+    }
+}
+
 /// Spherical harmonic coefficients, `3 * fourdgs_scene_sh_coefficients()` bytes per
 /// resident gaussian, component-major: every coefficient of red, then green, then blue.
 ///
@@ -2304,6 +2319,91 @@ pub unsafe extern "C" fn fourdgs_scene_provenance_json(
             Err(e) => report(e),
         }
     })
+}
+
+/// Canonical object-layer JSON for an opened scene (spec §5.15.6-§5.15.7).
+///
+/// The Object Table, the SE(3) tracks with their sampled poses, and the composed state at
+/// three scene-clock probes — the summary that proves base-then-track composition rather
+/// than merely that the records were read. Computed in the core so that C++ and Swift
+/// cannot drift from each other, or from Rust, on the slerp or the composition order.
+///
+/// An empty string means the file carries neither object records nor per-gaussian
+/// membership: the binding should omit the keys, not emit null. Works on both open paths;
+/// on the indexed path the records are fetched if not already resident. On success `out`
+/// owns a string freed with `fourdgs_string_free`. Sequence the two out parameters as
+/// every other call here does — read them only after this returns OK.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_scene_objects_json(
+    scene: *mut fourdgs_scene,
+    out: *mut *const c_char,
+    out_len: *mut usize,
+) -> c_int {
+    unsafe { object_canonical_member(scene, out, out_len, false) }
+}
+
+/// Shared body: both accessors compose the layer the same way and differ only in which
+/// rendered member they hand back.
+unsafe fn object_canonical_member(
+    scene: *mut fourdgs_scene,
+    out: *mut *const c_char,
+    out_len: *mut usize,
+    want_states: bool,
+) -> c_int {
+    guarded(|| {
+        if out.is_null() || out_len.is_null() {
+            set_last_error("a string out parameter is null".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        }
+        let Some(scene) = (unsafe { scene.as_mut() }) else {
+            set_last_error("the scene is null".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        };
+        let header = scene.inner.header().clone();
+        let layer = match scene.inner.objects() {
+            Ok(layer) => layer,
+            Err(e) => return report(e),
+        };
+        // The whole population, not whatever an earlier seek left resident: the summary
+        // reports every gaussian's composed state, and a partial load would silently
+        // report a partial scene. The caller's band is preserved — loading at band 0
+        // would drop harmonics it had already paid for, and this accessor must not be
+        // observable in what the caller reads next.
+        let band = scene.inner.loaded_band();
+        if let Err(e) = scene.inner.load_all(band) {
+            return report(e);
+        }
+        let gaussians = scene.inner.loaded().clone();
+        match crate::object_layer::canonical_parts(&header, &gaussians, &layer) {
+            Ok(parts) => put_owned_string(
+                if want_states {
+                    parts.states
+                } else {
+                    parts.objects
+                },
+                out,
+                out_len,
+            ),
+            Err(e) => report(e),
+        }
+    })
+}
+
+/// The `states` member an object-layer file adds to a scene summary: post-composition
+/// gaussian state at each probe time.
+///
+/// Separate from `fourdgs_scene_objects_json` because the two sit side by side at the root
+/// of the summary, so a binding places each under its own key rather than cutting one
+/// document apart. Same contract as that call in every other respect: an empty string
+/// means the file carries neither object records nor membership, both open paths work, and
+/// the string is freed with `fourdgs_string_free`.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_scene_object_states_json(
+    scene: *mut fourdgs_scene,
+    out: *mut *const c_char,
+    out_len: *mut usize,
+) -> c_int {
+    unsafe { object_canonical_member(scene, out, out_len, true) }
 }
 
 /// Release a string owned by the caller — the result of `fourdgs_peek_temporal_model`,

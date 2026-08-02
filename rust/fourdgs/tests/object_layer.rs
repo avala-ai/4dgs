@@ -18,7 +18,7 @@ use fourdgs::records::{
     ChunkIndexEntry, Footer, Header, ObjectTable, ObjectTableEntry, ObjectTrack, Quantization,
     WindowTable, TRAJECTORY_LINEAR,
 };
-use fourdgs::serialization::MAGIC;
+use fourdgs::serialization::{put_record, MAGIC};
 use fourdgs::stream::encode_stream;
 use fourdgs::SceneReader;
 
@@ -92,6 +92,115 @@ fn streams_with_object_id(values: &[i64], channels: usize) -> Vec<u8> {
         encode_stream(op::A_OBJECT_ID, values, channels, codec::DEFLATE, 1, false).unwrap(),
     );
     streams
+}
+
+/// Two gaussians identical in every attribute except their spherical harmonics, both
+/// members of the tracked object, with the harmonics ordered against the decode order.
+///
+/// The point is the tie: `object_layer::stable_order` ends its key with the SH
+/// coefficients, so this file sorts one way when the harmonics are resident and the other
+/// way when a band cap has dropped them. A canonical form that changed with the caller's
+/// band cap would be no canonical form at all, which is what
+/// `objects_json_does_not_depend_on_the_resident_band` pins down.
+fn object_file_with_harmonics() -> Vec<u8> {
+    const COUNT: usize = 2;
+    // Degree 1: 3 coefficients per colour component, so a row is 9 bytes wide.
+    const ROW: usize = 9;
+
+    let mut out = MAGIC.to_vec();
+    out.extend(
+        Header {
+            duration_sec: 1.0,
+            gaussian_count: COUNT as u64,
+            aabb: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            cutoff: 0.05,
+            temporal_model: "gaussian-birth".into(),
+            sh_degree: 1,
+            ..Default::default()
+        }
+        .encode(&[]),
+    );
+    out.extend(quantization().encode(&[]));
+    out.extend(
+        WindowTable {
+            windows: vec![(0.0, 1.0)],
+        }
+        .encode(),
+    );
+    out.extend(
+        ObjectTable {
+            embedding_dim: 0,
+            entries: vec![ObjectTableEntry {
+                object_id: 7,
+                label: "tracked".into(),
+                ..Default::default()
+            }],
+        }
+        .encode(b"")
+        .unwrap(),
+    );
+    out.extend(
+        ObjectTrack {
+            object_id: 7,
+            interpolation: TRAJECTORY_LINEAR,
+            times: vec![0.0, 1.0],
+            rotations: vec![Q_Z90, Q_Z90],
+            translations: vec![[10.0, 0.0, 0.0], [10.0, 0.0, 0.0]],
+        }
+        .encode(b"")
+        .unwrap(),
+    );
+
+    let chunk_at = out.len() as u64;
+    let chunk = fourdgs::records::encode_chunk(
+        0.0,
+        1.0,
+        0,
+        COUNT as u32,
+        &streams_with_object_id(&[7, 7], 1),
+    );
+    out.extend(&chunk);
+
+    // Row 0 gets the larger coefficients, so sorting with the harmonics in the key puts
+    // row 1 first and sorting without them leaves row 0 first.
+    let values: Vec<i64> = (0..COUNT)
+        .flat_map(|i| (0..ROW).map(move |_| if i == 0 { 200 } else { 100 }))
+        .collect();
+    let mut payload = vec![1u8];
+    payload
+        .extend(encode_stream(op::SH_BAND_STREAM, &values, ROW, codec::DEFLATE, 1, true).unwrap());
+    let band_at = out.len() as u64;
+    let before = out.len();
+    put_record(&mut out, op::SH_BAND_STREAM, &payload);
+    let band_length = (out.len() - before) as u64;
+
+    // Indexed, because that is the only path where a band cap is a real decision: the
+    // streamed reader decodes every band at open, so capping afterwards changes nothing
+    // and the defect this file exists to catch cannot occur there.
+    let summary_start = out.len() as u64;
+    out.extend(
+        ChunkIndexEntry {
+            t0: 0.0,
+            t1: 1.0,
+            chunk_offset: chunk_at,
+            chunk_length: chunk.len() as u64,
+            gaussian_count: COUNT as u32,
+            bands: vec![(1, band_at, band_length)],
+            ..Default::default()
+        }
+        .encode(),
+    );
+
+    out.extend(
+        Footer {
+            summary_start,
+            summary_offset_start: 0,
+            summary_crc: 0,
+        }
+        .encode(),
+    );
+    out.extend(MAGIC);
+    out
 }
 
 fn object_file(indexed: bool, duplicate_table: bool) -> Vec<u8> {
@@ -1114,4 +1223,69 @@ fn the_composed_state_path_applies_tracks_the_base_path_leaves_alone() {
     // No layer is the base state unchanged.
     let none = state_at_with_objects(&gaussians, None, 2.0, 0.05).expect("no layer is fine");
     assert!((none.centers[0] - 1.0).abs() < 1e-6);
+}
+
+/// The canonical object JSON is the same whatever the caller left resident, and the
+/// caller's band cap survives the call.
+///
+/// Worth pinning because the first half is not obvious. `canonical_parts` samples in
+/// `stable_order`, whose key ends with the SH coefficients — so a band-capped scene sorts
+/// on a shorter key and really does break ties differently. This file is built to make
+/// that happen: two gaussians identical in every attribute, differing only in their
+/// harmonics. The output is nevertheless identical, because rows that tie on the key up to
+/// the harmonics are by construction identical in everything `objects` and `states` emit.
+/// That is the invariant `canonical.py` states about its own ordering, and this is where a
+/// change that broke it — a new per-gaussian field emitted but not keyed — would show up
+/// as a Rust failure rather than as cross-language conformance drift.
+///
+/// The second half is the accessor's promise not to be observable: it loads every gaussian
+/// to summarize them, at whatever band the caller already had, and leaves that band alone.
+#[test]
+fn objects_json_does_not_depend_on_the_resident_band() {
+    use std::ffi::CStr;
+
+    unsafe fn canonical(bytes: &[u8], cap: u8, want_states: bool) -> (String, u8) {
+        let mut scene: *mut fourdgs::capi::fourdgs_scene = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { fourdgs::capi::fourdgs_open_memory(bytes.as_ptr(), bytes.len(), &mut scene) },
+            0
+        );
+        assert_eq!(
+            unsafe { fourdgs::capi::fourdgs_scene_load_all(scene, cap) },
+            0
+        );
+
+        let mut out: *const std::os::raw::c_char = std::ptr::null();
+        let mut length = 0usize;
+        let status = if want_states {
+            unsafe { fourdgs::capi::fourdgs_scene_object_states_json(scene, &mut out, &mut length) }
+        } else {
+            unsafe { fourdgs::capi::fourdgs_scene_objects_json(scene, &mut out, &mut length) }
+        };
+        assert_eq!(status, 0);
+        let json = unsafe { CStr::from_ptr(out) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { fourdgs::capi::fourdgs_string_free(out, length) };
+
+        // What the caller can still see: the resident coefficient width, which is what a
+        // band cap buys and what an accessor must not quietly spend.
+        let coefficients = unsafe { fourdgs::capi::fourdgs_scene_sh_coefficients(scene) } as u8;
+        unsafe { fourdgs::capi::fourdgs_scene_free(scene) };
+        (json, coefficients)
+    }
+
+    let bytes = object_file_with_harmonics();
+    for want_states in [false, true] {
+        let (capped, capped_coefficients) = unsafe { canonical(&bytes, 0, want_states) };
+        let (full, full_coefficients) = unsafe { canonical(&bytes, 1, want_states) };
+        assert_eq!(
+            capped, full,
+            "canonical object JSON changed with the caller's band cap (states = {want_states})"
+        );
+        // The cap survives the call, and the two caps are genuinely different loads —
+        // otherwise the equality above would prove nothing.
+        assert_eq!(capped_coefficients, 0);
+        assert_eq!(full_coefficients, 3);
+    }
 }

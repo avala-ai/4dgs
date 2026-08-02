@@ -496,8 +496,13 @@ const RIG_SAMPLES: usize = 4;
 
 /// A JSON value whose objects are sorted by key. Private mirror of the conformance
 /// emitter — the core does not depend on its own test crate.
-enum Json {
+///
+/// Shared with [`crate::object_layer`], which emits the same canonical shapes for the
+/// object layer: one writer, one rounding rule, so two families cannot disagree about how
+/// a number is spelled.
+pub(crate) enum Json {
     Null,
+    Bool(bool),
     Num(f64),
     Str(String),
     Arr(Vec<Json>),
@@ -505,13 +510,14 @@ enum Json {
 }
 
 impl Json {
-    fn obj(pairs: Vec<(&str, Json)>) -> Json {
+    pub(crate) fn obj(pairs: Vec<(&str, Json)>) -> Json {
         Json::Obj(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
     }
 
     fn write(&self, out: &mut String) {
         match self {
             Json::Null => out.push_str("null"),
+            Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
             Json::Num(v) => {
                 let _ = write!(out, "{v:.*}", PROVENANCE_JSON_DECIMALS);
             }
@@ -541,7 +547,7 @@ impl Json {
         }
     }
 
-    fn to_json(&self) -> String {
+    pub(crate) fn to_json(&self) -> String {
         let mut out = String::new();
         self.write(&mut out);
         out
@@ -567,7 +573,7 @@ fn write_json_string(out: &mut String, s: &str) {
 }
 
 /// Round for comparison; a non-finite value becomes `null`.
-fn num(v: f64) -> Json {
+pub(crate) fn num(v: f64) -> Json {
     if v.is_finite() {
         Json::Num(v)
     } else {
@@ -576,7 +582,7 @@ fn num(v: f64) -> Json {
 }
 
 /// An integer as a string, so a 64-bit value survives a JSON parser backed by doubles.
-fn int(v: u64) -> Json {
+pub(crate) fn int(v: u64) -> Json {
     Json::Str(v.to_string())
 }
 
