@@ -892,6 +892,11 @@ pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
                     )));
                 };
                 let (state, head) = compose_delta(reference, record.content)?;
+                // Births in a delta group carry their own `window_index`, so the check
+                // belongs on this branch too — not only where a keyframe is read. The
+                // indexed path validates the composed state for every chunk, so leaving
+                // it off here would accept a birth the other path refuses.
+                check_window_indices(&state, &windows)?;
                 by_offset.insert(record.offset as u64, state.clone());
                 chunks.push(ChunkInfo {
                     t0: head.t0,
