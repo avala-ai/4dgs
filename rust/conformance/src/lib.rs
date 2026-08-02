@@ -35,6 +35,45 @@ pub const RIG_SAMPLES: usize = 4;
 pub const AUDIO_KEYFRAMES: usize = 4;
 
 /// A JSON value, with objects sorted by key.
+/// What a runner has to say about a file: the summary, or the name of the refusal.
+///
+/// A refusal is a result, not a crash. The runner prints `{"refused": "<id>"}` on stdout
+/// and exits 0, and the harness diffs that against the expectation like any other answer.
+/// Exiting non-zero instead would collapse "refused for the right reason" and "fell over"
+/// into one outcome — and the invalid corpus exists precisely to tell those apart.
+pub enum Failure {
+    /// A refusal this reader can name. The identifier is compared across every SDK.
+    Refused(&'static str),
+    /// Anything else. Goes to stderr with a non-zero exit, as before.
+    Message(String),
+}
+
+impl Failure {
+    /// Classify a decode error: named refusals become an answer, everything else a failure.
+    ///
+    /// An error the refusal table does not name — a truncated transport, an encoder bound
+    /// violation — is still a failure here. Reporting it as a refusal would let a decoder
+    /// pass the invalid corpus by falling over in the right place.
+    pub fn from_error(path: &str, error: &fourdgs::Error) -> Failure {
+        match error.refusal_code() {
+            Some(code) => Failure::Refused(code),
+            None => Failure::Message(format!("{path}: {error}")),
+        }
+    }
+}
+
+impl From<String> for Failure {
+    /// The extra checks report their own prose; none of them is a refusal.
+    fn from(message: String) -> Failure {
+        Failure::Message(message)
+    }
+}
+
+/// The canonical answer for a refused file.
+pub fn refusal_json(code: &str) -> String {
+    format!("{{\n  \"refused\": \"{code}\"\n}}")
+}
+
 pub enum J {
     Null,
     Bool(bool),

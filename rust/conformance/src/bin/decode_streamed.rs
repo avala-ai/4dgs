@@ -12,7 +12,7 @@ use fourdgs::keyframe_delta_file::decode_streamed as decode_keyframe_delta_strea
 use fourdgs::opcode;
 use fourdgs::records::Header;
 use fourdgs::serialization::{check_magic, Records, MAGIC};
-use fourdgs_conformance::{keyframe_delta_states_json, summarize, Extras};
+use fourdgs_conformance::{keyframe_delta_states_json, refusal_json, summarize, Extras, Failure};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -25,7 +25,13 @@ fn main() -> ExitCode {
             println!("{json}");
             ExitCode::SUCCESS
         }
-        Err(message) => {
+        // A refusal is an answer, not a crash: stdout and exit 0, so the harness can
+        // diff it against the expectation instead of only seeing that we fell over.
+        Err(Failure::Refused(code)) => {
+            println!("{}", refusal_json(code));
+            ExitCode::SUCCESS
+        }
+        Err(Failure::Message(message)) => {
             eprintln!("{message}");
             ExitCode::FAILURE
         }
@@ -35,14 +41,14 @@ fn main() -> ExitCode {
 /// The Header's temporal model, read without decoding the gaussians. A `keyframe-delta`
 /// file composes and summarizes differently from a `gaussian-birth` one, so the runner
 /// branches on this before doing either.
-fn temporal_model(data: &[u8]) -> Result<Option<String>, String> {
-    check_magic(data).map_err(|e| e.to_string())?;
+fn temporal_model(path: &str, data: &[u8]) -> Result<Option<String>, Failure> {
+    check_magic(data).map_err(|e| Failure::from_error(path, &e))?;
     for record in Records::new(data, MAGIC.len()) {
-        let record = record.map_err(|e| e.to_string())?;
+        let record = record.map_err(|e| Failure::from_error(path, &e))?;
         if record.opcode == opcode::HEADER {
             return Ok(Some(
                 Header::parse(record.content)
-                    .map_err(|e| e.to_string())?
+                    .map_err(|e| Failure::from_error(path, &e))?
                     .temporal_model,
             ));
         }
@@ -50,19 +56,20 @@ fn temporal_model(data: &[u8]) -> Result<Option<String>, String> {
     Ok(None)
 }
 
-fn run(path: &str) -> Result<String, String> {
-    let data = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+fn run(path: &str) -> Result<String, Failure> {
+    let data = std::fs::read(path).map_err(|e| Failure::Message(format!("{path}: {e}")))?;
 
-    if temporal_model(&data)?.as_deref() == Some("keyframe-delta") {
+    if temporal_model(path, &data)?.as_deref() == Some("keyframe-delta") {
         // The whole model exists to make reconstruction-at-an-instant cheap, and that
         // reconstruction — not a whole-population summary — is what the SDKs are diffed on.
         // Truncation recovery is a gaussian-birth check: the states canonical is a
         // different statement and a cut file is a different file.
-        let seq = decode_keyframe_delta_streamed(&data).map_err(|e| format!("{path}: {e}"))?;
+        let seq =
+            decode_keyframe_delta_streamed(&data).map_err(|e| Failure::from_error(path, &e))?;
         return Ok(keyframe_delta_states_json(&seq));
     }
 
-    let scene = fourdgs::read_bytes(&data).map_err(|e| format!("{path}: {e}"))?;
+    let scene = fourdgs::read_bytes(&data).map_err(|e| Failure::from_error(path, &e))?;
     check_truncation_recovery(&data, &scene)?;
 
     let intervals: Vec<(f64, f64)> = scene.chunk_index.iter().map(|e| (e.t0, e.t1)).collect();
@@ -82,7 +89,7 @@ fn run(path: &str) -> Result<String, String> {
             objects: Some(&scene.objects),
         },
     )
-    .map_err(|e| format!("{path}: {e}"))
+    .map_err(|e| Failure::from_error(path, &e))
 }
 
 /// Decode the same file cut short, and insist on what survives.

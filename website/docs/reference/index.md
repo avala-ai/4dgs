@@ -10,12 +10,13 @@ declarations. Nothing is marked `Yes` on the strength of code existing.
 Every row is filled in from a suite that runs: 46 valid variants and 7 invalid ones, plus 4
 keyframe-delta and 3 object-layer variants in their own subdirectories, over two read paths
 (streamed and indexed). A language takes the variants it declares support for, and what it declines
-is what this table records — 119 checks passing for Python and 105 each for Rust, TypeScript, Dart,
-C++ and Swift. Rust declines the refusal expectations; the five non-Python SDKs decline the same
-Python-only variants and nothing else. C++ and Swift read 4DGS through the Rust C ABI: the additive
-states-JSON accessor computes keyframe-delta summaries in the core, the provenance-JSON accessor
-does the same for the provenance family, and the objects-JSON pair does it for the object layer, so
-every binding emits identical bytes with no per-language slerp or composition order of its own.
+is what this table records — 119 checks passing for Python and Rust, and 105 each for TypeScript,
+Dart, C++ and Swift. The four still at 105 decline the same thing and nothing else: the invalid
+corpus, which asks a decoder to _name_ the refusal rather than merely refuse. C++ and Swift read
+4DGS through the Rust C ABI: the additive states-JSON accessor computes keyframe-delta summaries in
+the core, the provenance-JSON accessor does the same for the provenance family, and the objects-JSON
+pair does it for the object layer, so every binding emits identical bytes with no per-language slerp
+or composition order of its own.
 
 | Feature                                           | Python | TypeScript | Rust    | C++     | Swift   | Dart    |
 | ------------------------------------------------- | ------ | ---------- | ------- | ------- | ------- | ------- |
@@ -54,7 +55,7 @@ every binding emits identical bytes with no per-language slerp or composition or
 | Reconstruction at an instant                      | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Encode `keyframe-delta`                           | Yes    | Planned    | Yes     | Planned | Planned | Planned |
 | Unknown-record skipping                           | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Refusal diagnosis (named, not merely refused)     | Yes    | No         | No      | No      | No      | No      |
+| Refusal diagnosis (named, not merely refused)     | Yes    | No         | Yes     | No      | No      | No      |
 | Private-range records                             | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Encode                                            | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
 | Chunked encode                                    | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
@@ -239,8 +240,10 @@ evaluate is the whole feature, and that is what is measured.
 that it refused one. The invalid corpus pairs each deliberately broken file with a refusal
 identifier, and a runner prints that identifier as its answer. The distinction is the whole row: a
 decoder that refuses every invalid file for the wrong reason is indistinguishable, to a suite that
-only checks that something was raised, from one that refuses correctly. The four `No` cells are the
-honest state — those SDKs refuse these files today, and nothing here proves they refuse them for the
+only checks that something was raised, from one that refuses correctly. Rust carries the identifier
+on the error itself — `Error::refusal_code`, from the constants in `fourdgs::error::refusal` — so a
+consumer can branch on the refusal without reading its prose. The four remaining `No` cells are the
+honest state: those SDKs refuse these files today, and nothing here proves they refuse them for the
 right reason.
 
 The row was also the first thing to find a gap in the reference: neither an unknown `temporal_model`

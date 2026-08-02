@@ -83,6 +83,14 @@ fn status_of(error: &Error) -> c_int {
         // rather than left to a catch-all so that it stays correct when one is added.
         Error::InvalidInput(_) => FOURDGS_STATUS_INVALID_ARGUMENT,
         Error::Io(_) => FOURDGS_STATUS_IO,
+        // Deferred to the kind, so naming a refusal did not renumber any status a
+        // consumer already switches on.
+        Error::Refused { kind, .. } => match kind {
+            crate::error::RefusalKind::UnsupportedVersion => FOURDGS_STATUS_UNSUPPORTED_VERSION,
+            crate::error::RefusalKind::UnsupportedModel => FOURDGS_STATUS_UNSUPPORTED_CODEC,
+            crate::error::RefusalKind::UnsupportedCodec => FOURDGS_STATUS_UNSUPPORTED_CODEC,
+            crate::error::RefusalKind::Malformed => FOURDGS_STATUS_MALFORMED,
+        },
     }
 }
 

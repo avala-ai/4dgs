@@ -247,12 +247,18 @@ pub fn check_magic(head: &[u8]) -> Result<()> {
     let elsewhere = head[..VERSION_AT] != MAGIC[..VERSION_AT]
         || head[VERSION_AT + 1..MAGIC.len()] != MAGIC[VERSION_AT + 1..];
     if !elsewhere {
-        return Err(Error::UnsupportedVersion(format!(
-            "4dgs major version {:?} is not supported by this reader",
-            head[VERSION_AT] as char
-        )));
+        return Err(Error::refused(
+            crate::error::refusal::UNSUPPORTED_MAJOR_VERSION,
+            crate::error::RefusalKind::UnsupportedVersion,
+            format!(
+                "4dgs major version {:?} is not supported by this reader",
+                head[VERSION_AT] as char
+            ),
+        ));
     }
-    Err(Error::UnsupportedVersion(
+    Err(Error::refused(
+        crate::error::refusal::MAGIC_MISMATCH,
+        crate::error::RefusalKind::UnsupportedVersion,
         "not a 4dgs file (bad magic)".into(),
     ))
 }

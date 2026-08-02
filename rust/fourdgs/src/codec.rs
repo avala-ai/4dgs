@@ -39,9 +39,15 @@ pub fn decompress(body: &[u8], codec: u8, expected: usize) -> Result<Vec<u8>> {
     match codec {
         DEFLATE => exact(flate2::read::ZlibDecoder::new(body), expected, "deflate"),
         ZSTD => decompress_zstd(body, expected),
-        other => Err(Error::UnsupportedCodec(format!(
-            "stream codec {other} is not a codec this build implements"
-        ))),
+        // Named, because this is the one a file can trigger: an unknown codec id on a
+        // stream is a conforming file this build cannot read. Its twin below is the
+        // *encoder* refusing its own argument, which no file can cause and the refusal
+        // table therefore does not name.
+        other => Err(Error::refused(
+            crate::error::refusal::UNKNOWN_STREAM_CODEC,
+            crate::error::RefusalKind::UnsupportedCodec,
+            format!("stream codec {other} is not a codec this build implements"),
+        )),
     }
 }
 

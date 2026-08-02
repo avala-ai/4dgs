@@ -52,20 +52,28 @@ pub fn check_temporal_model(model: &str) -> Result<()> {
     if KNOWN_TEMPORAL_MODELS.contains(&model) {
         return Ok(());
     }
-    Err(Error::UnsupportedModel(format!(
-        "the Header declares temporal model '{model}', which this reader does not implement \
-         (it implements {})",
-        listed(KNOWN_TEMPORAL_MODELS)
-    )))
+    Err(Error::refused(
+        crate::error::refusal::UNKNOWN_TEMPORAL_MODEL,
+        crate::error::RefusalKind::UnsupportedModel,
+        format!(
+            "the Header declares temporal model '{model}', which this reader does not implement \
+             (it implements {})",
+            listed(KNOWN_TEMPORAL_MODELS)
+        ),
+    ))
 }
 
 pub fn check_quantization_scheme(scheme: &str) -> Result<()> {
     if KNOWN_QUANTIZATION_SCHEMES.contains(&scheme) {
         return Ok(());
     }
-    Err(Error::UnsupportedModel(format!(
-        "the Quantization record declares scheme '{scheme}', which this reader does not implement \
-         (it implements {})",
-        listed(KNOWN_QUANTIZATION_SCHEMES)
-    )))
+    Err(Error::refused(
+        crate::error::refusal::UNKNOWN_QUANTIZATION_SCHEME,
+        crate::error::RefusalKind::UnsupportedModel,
+        format!(
+            "the Quantization record declares scheme '{scheme}', which this reader does not \
+             implement (it implements {})",
+            listed(KNOWN_QUANTIZATION_SCHEMES)
+        ),
+    ))
 }

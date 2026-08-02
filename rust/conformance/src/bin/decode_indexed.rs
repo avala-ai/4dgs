@@ -20,7 +20,7 @@ use fourdgs::opcode;
 use fourdgs::readable::{FileReadable, Readable};
 use fourdgs::records::{ChunkIndexEntry, Header};
 use fourdgs::serialization::{check_magic, Records, MAGIC};
-use fourdgs_conformance::{keyframe_delta_states_json, summarize, Extras};
+use fourdgs_conformance::{keyframe_delta_states_json, refusal_json, summarize, Extras, Failure};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -33,7 +33,13 @@ fn main() -> ExitCode {
             println!("{json}");
             ExitCode::SUCCESS
         }
-        Err(message) => {
+        // A refusal is an answer, not a crash: stdout and exit 0, so the harness can
+        // diff it against the expectation instead of only seeing that we fell over.
+        Err(Failure::Refused(code)) => {
+            println!("{}", refusal_json(code));
+            ExitCode::SUCCESS
+        }
+        Err(Failure::Message(message)) => {
             eprintln!("{message}");
             ExitCode::FAILURE
         }
@@ -59,14 +65,14 @@ impl<R: Readable> Readable for Counting<R> {
 }
 
 /// The Header's temporal model, read without decoding the gaussians.
-fn temporal_model(data: &[u8]) -> Result<Option<String>, String> {
-    check_magic(data).map_err(|e| e.to_string())?;
+fn temporal_model(path: &str, data: &[u8]) -> Result<Option<String>, Failure> {
+    check_magic(data).map_err(|e| Failure::from_error(path, &e))?;
     for record in Records::new(data, MAGIC.len()) {
-        let record = record.map_err(|e| e.to_string())?;
+        let record = record.map_err(|e| Failure::from_error(path, &e))?;
         if record.opcode == opcode::HEADER {
             return Ok(Some(
                 Header::parse(record.content)
-                    .map_err(|e| e.to_string())?
+                    .map_err(|e| Failure::from_error(path, &e))?
                     .temporal_model,
             ));
         }
@@ -74,43 +80,48 @@ fn temporal_model(data: &[u8]) -> Result<Option<String>, String> {
     Ok(None)
 }
 
-fn run(path: &str) -> Result<String, String> {
-    let data = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
-    if temporal_model(&data)?.as_deref() == Some("keyframe-delta") {
+fn run(path: &str) -> Result<String, Failure> {
+    let data = std::fs::read(path).map_err(|e| Failure::Message(format!("{path}: {e}")))?;
+    if temporal_model(path, &data)?.as_deref() == Some("keyframe-delta") {
         // The indexed path composes each instant by walking its chain (spec §11.8); its
         // canonical states must match the streamed path's, and the harness diffs it
         // against the same committed expectation the streamed runner is held to.
-        let (seq, _) = decode_keyframe_delta_indexed(&data).map_err(|e| format!("{path}: {e}"))?;
+        let (seq, _) =
+            decode_keyframe_delta_indexed(&data).map_err(|e| Failure::from_error(path, &e))?;
         return Ok(keyframe_delta_states_json(&seq));
     }
 
     let mut source = Counting {
-        inner: FileReadable::open(path).map_err(|e| format!("{path}: {e}"))?,
+        inner: FileReadable::open(path).map_err(|e| Failure::from_error(path, &e))?,
         bytes_read: 0,
     };
-    let scene = open_indexed(&mut source).map_err(|e| format!("{path}: {e}"))?;
+    let scene = open_indexed(&mut source).map_err(|e| Failure::from_error(path, &e))?;
 
     let mut chunks = Vec::with_capacity(scene.index.len());
     for entry in &scene.index {
-        chunks.push(read_chunk(&mut source, &scene, entry, 3).map_err(|e| e.to_string())?);
+        chunks.push(
+            read_chunk(&mut source, &scene, entry, 3).map_err(|e| Failure::from_error(path, &e))?,
+        );
     }
-    let audio_sources = read_audio_sources(&mut source, &scene).map_err(|e| e.to_string())?;
-    let camera = read_camera(&mut source, &scene).map_err(|e| e.to_string())?;
-    let metadata =
-        fourdgs::indexed_reader::read_metadata(&mut source, &scene).map_err(|e| e.to_string())?;
-    let attachments = read_attachments(&mut source, &scene).map_err(|e| e.to_string())?;
+    let audio_sources =
+        read_audio_sources(&mut source, &scene).map_err(|e| Failure::from_error(path, &e))?;
+    let camera = read_camera(&mut source, &scene).map_err(|e| Failure::from_error(path, &e))?;
+    let metadata = fourdgs::indexed_reader::read_metadata(&mut source, &scene)
+        .map_err(|e| Failure::from_error(path, &e))?;
+    let attachments =
+        read_attachments(&mut source, &scene).map_err(|e| Failure::from_error(path, &e))?;
     // Framed at open, fetched here — the same contract the camera and the attachments
     // have, and the reason no Header flag announces the family.
-    let provenance =
-        fourdgs::indexed_reader::read_provenance(&mut source, &scene).map_err(|e| e.to_string())?;
-    let objects = read_objects(&mut source, &scene).map_err(|e| e.to_string())?;
+    let provenance = fourdgs::indexed_reader::read_provenance(&mut source, &scene)
+        .map_err(|e| Failure::from_error(path, &e))?;
+    let objects = read_objects(&mut source, &scene).map_err(|e| Failure::from_error(path, &e))?;
     check_band_skipping(&mut source, &scene)?;
 
     let bands: Vec<BTreeMap<u8, fourdgs::stream::DecodedStream>> =
         chunks.iter().map(|c| c.bands.clone()).collect();
     let gaussians =
         fourdgs::stream_reader::assemble(&chunks, &bands, &scene.windows, &scene.header)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| Failure::from_error(path, &e))?;
 
     let intervals: Vec<(f64, f64)> = scene.index.iter().map(|e| (e.t0, e.t1)).collect();
     summarize(
@@ -129,7 +140,7 @@ fn run(path: &str) -> Result<String, String> {
             objects: Some(&objects),
         },
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| Failure::from_error(path, &e))
 }
 
 /// A reader that has capped its SH degree never transfers the bands above it.
