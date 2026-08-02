@@ -1242,8 +1242,6 @@ fn the_composed_state_path_applies_tracks_the_base_path_leaves_alone() {
 /// to summarize them, at whatever band the caller already had, and leaves that band alone.
 #[test]
 fn objects_json_does_not_depend_on_the_resident_band() {
-    use std::ffi::CStr;
-
     unsafe fn canonical(bytes: &[u8], cap: u8, want_states: bool) -> (String, u8) {
         let mut scene: *mut fourdgs::capi::fourdgs_scene = std::ptr::null_mut();
         assert_eq!(
@@ -1263,9 +1261,15 @@ fn objects_json_does_not_depend_on_the_resident_band() {
             unsafe { fourdgs::capi::fourdgs_scene_objects_json(scene, &mut out, &mut length) }
         };
         assert_eq!(status, 0);
-        let json = unsafe { CStr::from_ptr(out) }
-            .to_string_lossy()
-            .into_owned();
+        // Length-delimited, never NUL-terminated: the core hands back a pointer and a
+        // count, and the format's own `string` type may legally contain a NUL. Reading to
+        // the first zero byte runs off the end of the allocation — which is not a
+        // hypothetical, it is what Windows CI caught by returning this document with a
+        // stray 0x1B glued to it.
+        let json = String::from_utf8(
+            unsafe { std::slice::from_raw_parts(out as *const u8, length) }.to_vec(),
+        )
+        .expect("the core emits UTF-8");
         unsafe { fourdgs::capi::fourdgs_string_free(out, length) };
 
         // What the caller can still see: the resident coefficient width, which is what a
