@@ -434,3 +434,71 @@ impl Reencode for fourdgs::serialization::RawRecord<'_> {
         out
     }
 }
+
+#[test]
+fn a_rust_written_multi_window_sequence_round_trips() {
+    // The writer assigns `window_index` from each gaussian's own validity window, so it
+    // has to serialize the whole table. Writing nonzero indices against a one-entry table
+    // produces a file that the reader's own validation refuses — the encoder rejecting
+    // its own output. Nothing exercised `write_sequence` from a Rust test before this, so
+    // that shape reached review rather than a red build.
+    use fourdgs::keyframe_delta_file::{
+        decode_streamed, write_sequence, KeyframeDeltaOptions, Sample,
+    };
+    use fourdgs::model::GaussianSet;
+
+    let duration = 4.0;
+    let samples: Vec<Sample> = (0..4)
+        .map(|i| {
+            let n = 4usize;
+            let mut g = GaussianSet {
+                positions: Vec::with_capacity(n * 3),
+                scales: Vec::with_capacity(n * 3),
+                rotations: Vec::with_capacity(n * 4),
+                colors: Vec::with_capacity(n * 4),
+                // Non-zero motion on every gaussian, so a wrong window's motion step
+                // shows up as a wrong velocity rather than cancelling to zero.
+                motions: vec![0.25; n * 3],
+                mu_t: vec![0.0; n],
+                sigma_t: vec![100.0; n],
+                win_lo: vec![0.0; n],
+                // Two gaussians live the whole clip, two only the first half second.
+                win_hi: vec![duration as f32, duration as f32, 0.5, 0.5],
+                ..Default::default()
+            };
+            for k in 0..n {
+                g.positions
+                    .extend_from_slice(&[k as f32 * 0.1 + i as f32 * 0.01, 0.0, 0.0]);
+                g.scales.extend_from_slice(&[0.05, 0.05, 0.05]);
+                g.rotations.extend_from_slice(&[0.0, 0.0, 0.0, 1.0]);
+                g.colors.extend_from_slice(&[0.6, 0.4, 0.2, 0.9]);
+            }
+            Sample {
+                t0: i as f64,
+                ids: (0..n as i64).collect(),
+                gaussians: g,
+            }
+        })
+        .collect();
+
+    let kd = KeyframeDeltaOptions {
+        keyframe_every: 2,
+        ..Default::default()
+    };
+    let blob = write_sequence(&samples, duration, &kd).expect("the sequence encodes");
+
+    // The decoder refuses an index outside the table, so a successful decode is itself
+    // the assertion that the writer serialized every window it indexed into.
+    let seq = decode_streamed(&blob).expect("a multi-window file its own reader accepts");
+    assert_eq!(
+        seq.windows.len(),
+        2,
+        "both declared windows must reach the Window Table, not just the first"
+    );
+
+    // Deliberately not asserting on reconstructed motion here. `life_half` uses the
+    // window length only for never-fading gaussians, and this writer emits none, so a
+    // motion assertion through `write_sequence` passes whichever window the encoder
+    // quantized against — it would be a test that cannot fail. The grid's dependence on
+    // the window is covered directly in `keyframe_delta_file`'s own unit test.
+}

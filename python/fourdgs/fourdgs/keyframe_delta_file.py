@@ -67,6 +67,7 @@ from .serialization import (
     encode_stream,
     iter_records,
 )
+from .stream_reader import check_window_indices
 
 #: Matches `tests/conformance/canonical.py`: integers are strings so a 64-bit value
 #: survives a double-backed JSON parser, floats are rounded before comparison, and a
@@ -105,16 +106,68 @@ class Grids:
     steps: Steps
     bounds: Bounds
     origin: np.ndarray
-    window: tuple[float, float]
+    #: Every validity window the sequence declares, in Window Table order. A gaussian's
+    #: own window is the one its `window_index` names — the velocity grid is derived from
+    #: that window's length (spec section 6.3), so collapsing the table to its first entry
+    #: gives every gaussian outside window 0 the wrong motion precision and its positions
+    #: drift from the bins the encoder wrote.
+    windows: list[tuple[float, float]]
     cutoff: float
 
-    def motion_step(self, sigma_bins: np.ndarray, never_fades: np.ndarray) -> np.ndarray:
-        win_len = np.full(sigma_bins.shape, self.window[1] - self.window[0], dtype=np.float64)
+    @property
+    def window(self) -> tuple[float, float]:
+        """The first window. Only the writer uses this: it emits a single-window table."""
+        return self.windows[0] if self.windows else (0.0, 0.0)
+
+    def window_lengths(self, window_index: np.ndarray) -> np.ndarray:
+        """Per-gaussian window length, resolved the way the gaussian-birth path resolves it."""
+        # An absent or empty Window Table is one default `(0, 0)` window, not an
+        # unbounded fallback — the same defaulting the chunk decoder applies. Skipping
+        # the check here would let `window_index = 7` reconstruct against a zero-length
+        # window instead of being refused, and would answer differently from the regular
+        # chunk path on the same bytes.
+        windows = self.windows or [(0.0, 0.0)]
+        table = np.asarray(windows, dtype=np.float64)
+        idx = np.asarray(window_index, dtype=np.int64).reshape(-1)
+        check_window_indices(idx, len(windows))
+        return table[idx, 1] - table[idx, 0]
+
+    def motion_step(self, sigma_bins: np.ndarray, never_fades: np.ndarray, window_index: np.ndarray) -> np.ndarray:
+        win_len = self.window_lengths(window_index)
         classes = life_class(sigma_bins, self.steps.sigma_log, never_fades, win_len, support_k(self.cutoff))
         return motion_steps(classes, self.steps.motion)
 
     def mu_step(self, sigma_bins: np.ndarray, never_fades: np.ndarray) -> np.ndarray:
         return mu_steps(sigma_bins, self.steps.sigma_log, never_fades, self.steps.time)
+
+
+def _windows_of(samples: list[Sample], duration_sec: float) -> list[tuple[float, float]]:
+    """The distinct validity windows the population declares, in first-seen order.
+
+    A `GaussianSet` carries `win_lo`/`win_hi` per gaussian and the format lets a sequence
+    declare several windows, so the writer reads them rather than forcing one. It used to
+    emit a single full-duration entry, which meant no producer here could write the
+    multi-window file the readers are supposed to handle — and so nothing tested that they
+    did (issue #87).
+
+    Order is first-seen rather than sorted: `window_index` is written against this list, so
+    a stable order is what makes the indices mean the same thing on both sides.
+    """
+    seen: dict[tuple[float, float], None] = {}
+    for sample in samples:
+        lo = np.asarray(sample.gaussians.win_lo, dtype=np.float64).reshape(-1)
+        hi = np.asarray(sample.gaussians.win_hi, dtype=np.float64).reshape(-1)
+        for a, b in zip(lo, hi, strict=True):
+            seen.setdefault((float(a), float(b)), None)
+    return list(seen) or [(0.0, float(duration_sec))]
+
+
+def _window_indices(gaussians, windows: list[tuple[float, float]]) -> np.ndarray:
+    """Each gaussian's row in the window table."""
+    lookup = {w: i for i, w in enumerate(windows)}
+    lo = np.asarray(gaussians.win_lo, dtype=np.float64).reshape(-1)
+    hi = np.asarray(gaussians.win_hi, dtype=np.float64).reshape(-1)
+    return np.asarray([lookup[(float(a), float(b))] for a, b in zip(lo, hi, strict=True)], dtype=np.int64)
 
 
 def _grids_for(samples: list[Sample], duration_sec: float, profile: str, cutoff: float) -> Grids:
@@ -124,7 +177,13 @@ def _grids_for(samples: list[Sample], duration_sec: float, profile: str, cutoff:
     bounds = Bounds.for_profile(profile, median_scale=median_scale)
     steps = Steps.of(bounds)
     origin = positions.min(axis=0) if positions.size else np.zeros(3)
-    return Grids(steps=steps, bounds=bounds, origin=origin, window=(0.0, float(duration_sec)), cutoff=cutoff)
+    return Grids(
+        steps=steps,
+        bounds=bounds,
+        origin=origin,
+        windows=_windows_of(samples, duration_sec),
+        cutoff=cutoff,
+    )
 
 
 def _quantize_sample(sample: Sample, grids: Grids) -> tuple[np.ndarray, dict[int, np.ndarray]]:
@@ -146,12 +205,12 @@ def _quantize_sample(sample: Sample, grids: Grids) -> tuple[np.ndarray, dict[int
     q_sigma = quantize(np.log(np.maximum(sigma, 1e-30)), grids.steps.sigma_log) if n else np.zeros(0, np.int64)
     never_fades = np.zeros(n, dtype=bool)
     flags = never_fades.astype(np.int64)
-    window_index = np.zeros(n, dtype=np.int64)
+    window_index = _window_indices(g, grids.windows) if n else np.zeros(0, dtype=np.int64)
 
     rot_idx, q_rot = (
         quantize_rotation(g.rotations, grids.steps.rot) if n else (np.zeros(0, np.int64), np.zeros((0, 3), np.int64))
     )
-    m_step = grids.motion_step(q_sigma, never_fades) if n else np.zeros(0)
+    m_step = grids.motion_step(q_sigma, never_fades, window_index) if n else np.zeros(0)
     t_step = grids.mu_step(q_sigma, never_fades) if n else np.zeros(0)
     q_motion = (
         np.rint(g.motions.astype(np.float64) / m_step[:, None]).astype(np.int64) if n else np.zeros((0, 3), np.int64)
@@ -262,7 +321,7 @@ def write_sequence(
             bounds=grids.bounds.as_strings(),
         ).encode()
     )
-    emit(rec.WindowTable(windows=[grids.window]).encode())
+    emit(rec.WindowTable(windows=list(grids.windows)).encode())
 
     index: list[rec.ChunkIndexEntry] = []
     offsets: list[int] = []  # chunk record offset per sample
@@ -427,12 +486,11 @@ class DecodedSequence:
             sigma_log=q.step_sigma_log,
             sh=q.step_sh,
         )
-        window = self.windows[0] if self.windows else (0.0, 0.0)
         return Grids(
             steps=steps,
             bounds=None,
             origin=np.asarray(q.pos_origin, dtype=np.float64),
-            window=window,
+            windows=list(self.windows),
             cutoff=self.header.cutoff,
         )
 
@@ -686,10 +744,19 @@ def _dequantize(state: State, grids: Grids):
             sigma_t=np.zeros(0),
         )
     b = state.bins
+    if op.A_WINDOW_INDEX not in b:
+        # A zero-count keyframe can omit every stream, and `apply_delta` carries forward
+        # only attributes the reference already had — so a later birth can compose a
+        # non-empty state with no window_index. Reconstruction reads it below, so this is
+        # a refusal rather than a KeyError from inside the renderer.
+        raise MalformedFile(
+            "a non-empty state carries no window_index column; it is a required keyframe attribute (section 11.5)",
+            code="missing-window-index",
+        )
     sigma_bins = b[op.A_SIGMA_T][:, 0]
     never_fades = b[op.A_FLAGS][:, 0] != 0
     sigma = np.where(never_fades, np.inf, np.exp(sigma_bins * grids.steps.sigma_log))
-    m_step = grids.motion_step(sigma_bins, never_fades)[:, None]
+    m_step = grids.motion_step(sigma_bins, never_fades, b[op.A_WINDOW_INDEX][:, 0])[:, None]
     t_step = grids.mu_step(sigma_bins, never_fades)
     return dict(
         positions=dequantize(b[op.A_POSITION], grids.steps.pos, grids.origin),
@@ -705,6 +772,8 @@ def _dequantize(state: State, grids: Grids):
         motions=b[op.A_MOTION].astype(np.float64) * m_step,
         mu_t=b[op.A_MU_T][:, 0].astype(np.float64) * t_step,
         sigma_t=sigma,
+        # Carried through so reconstruction can apply each row's own validity window.
+        window_index=b[op.A_WINDOW_INDEX][:, 0].astype(np.int64),
     )
 
 
@@ -735,14 +804,27 @@ def reconstruct_at(state: State, grids: Grids, t: float) -> dict:
     color = values["colors"][order]
     with np.errstate(over="ignore"):
         marginal = np.where(np.isinf(sigma), 1.0, np.exp(-0.5 * ((t - mu) / sigma) ** 2))
+    # A gaussian is absent outside its own validity window, exactly as the gaussian-birth
+    # path decides it (`model.py`: `win_lo <= t < win_hi`). This was unobservable while
+    # every keyframe-delta file carried one full-duration window — every row was always
+    # in-window — and becomes reachable the moment a file declares more than one, which
+    # is what the rest of this change enables. Without it a gaussian whose window closed
+    # at 0.5s is still reported, at full opacity, at t = 4.
+    table = np.asarray(grids.windows or [(0.0, 0.0)], dtype=np.float64)
+    widx = np.asarray(values["window_index"], dtype=np.int64)[order]
+    # Absent means absent: the gaussian-birth path drops these rows outright
+    # (`model.py`: `idx = flatnonzero(visible)`), so id, centre, scale and liveCount all
+    # exclude them. Zeroing only the opacity would still report a gaussian section 3 says
+    # does not exist at this instant.
+    keep = np.flatnonzero((table[widx, 0] <= t) & (t < table[widx, 1]))
     centers = position + motion * (t - mu)[:, None]
     return dict(
-        ids=ids,
-        centers=centers,
-        scales=values["scales"][order],
-        rotations=values["rotations"][order],
-        rgb=color[:, :3],
-        opacity=color[:, 3] * marginal,
+        ids=ids[keep],
+        centers=centers[keep],
+        scales=values["scales"][order][keep],
+        rotations=values["rotations"][order][keep],
+        rgb=color[keep, :3],
+        opacity=color[keep, 3] * marginal[keep],
     )
 
 
@@ -816,7 +898,11 @@ def states_json(decoded: DecodedSequence) -> dict:
         states.append(
             {
                 "t": _num(t),
-                "liveCount": str(info.state.count),
+                # The count at this instant, from the rows reconstruction actually
+                # returned. `info.state.count` is the chunk's population, which now
+                # differs once a validity window has closed — reporting it here would
+                # claim gaussians are live that the same summary omits from `sample`.
+                "liveCount": str(len(r["ids"])),
                 "sample": {
                     "gaussianIds": [str(int(v)) for v in r["ids"][:sample_n]],
                     "positions": [[_num(v) for v in centers[i]] for i in range(sample_n)],

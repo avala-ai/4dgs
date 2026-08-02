@@ -767,27 +767,62 @@ List<FourdgsChunkIndexEntry> chainFor(
 /// The grids composition dequantizes against, drawn from the Quantization record
 /// and the single shared validity window.
 class _Grids {
-  _Grids(this.steps, this.origin, this.winLo, this.winHi, this.cutoff);
+  _Grids(this.steps, this.origin, this.windows, this.cutoff);
 
   final FourdgsSteps steps;
   final List<double> origin;
-  final double winLo;
-  final double winHi;
+
+  /// Every validity window the sequence declares, in Window Table order. A
+  /// gaussian's own window is the one its `window_index` names — the velocity
+  /// grid comes from that window's length (section 6.3), so collapsing the
+  /// table to its first entry gives every gaussian outside window 0 the wrong
+  /// motion precision and its positions drift from the bins the encoder wrote.
+  final List<FourdgsWindow> windows;
   final double cutoff;
 
-  double get windowLength => winHi - winLo;
+  /// The length of the window [index] names, refusing one the table cannot
+  /// answer rather than clamping: clamping substitutes one gaussian's lifetime
+  /// for another's in a file that is already wrong.
+  /// The window [index] names, refusing one the table cannot answer.
+  FourdgsWindow windowAt(int index) {
+    // An absent or empty table is one default (0, 0) window, matching the chunk
+    // decoder. Clamping instead would substitute one gaussian's lifetime for
+    // another's in a file that is already wrong.
+    final table =
+        windows.isEmpty
+            ? const <FourdgsWindow>[FourdgsWindow(0.0, 0.0)]
+            : windows;
+    if (index < 0 || index >= table.length) {
+      throw FourdgsMalformedFile(
+        'window index $index is outside the ${table.length}-entry window table',
+      );
+    }
+    return table[index];
+  }
+
+  double windowLengthAt(int index) {
+    // An absent or empty Window Table is one default (0, 0) window, not an
+    // unbounded fallback — the same defaulting the chunk decoder applies. A
+    // bare `return 0.0` for an empty table would let any index decode against
+    // it, so `window_index = 7` would reconstruct instead of being refused.
+    final table =
+        windows.isEmpty
+            ? const <FourdgsWindow>[FourdgsWindow(0.0, 0.0)]
+            : windows;
+    if (index < 0 || index >= table.length) {
+      throw FourdgsMalformedFile(
+        'window index $index is outside the ${table.length}-entry window table',
+      );
+    }
+    return table[index].hi - table[index].lo;
+  }
 }
 
 _Grids _gridsFor(KeyframeDeltaSequence sequence) {
-  final window =
-      sequence.windows.isNotEmpty
-          ? sequence.windows.first
-          : const FourdgsWindow(0.0, 0.0);
   return _Grids(
     FourdgsSteps.of(sequence.quantization),
     sequence.quantization.posOrigin,
-    window.lo,
-    window.hi,
+    sequence.windows,
     sequence.header.cutoff,
   );
 }
@@ -817,12 +852,13 @@ _Reconstruction _reconstructAt(
   final order = List<int>.generate(n, (int i) => i)
     ..sort((a, b) => state.ids[a].compareTo(state.ids[b]));
 
-  final ids = Int32List(n);
-  final centers = Float64List(n * 3);
-  final scales = Float64List(n * 3);
-  final opacity = Float64List(n);
   if (n == 0) {
-    return _Reconstruction(ids, centers, scales, opacity);
+    return _Reconstruction(
+      Int32List(0),
+      Float64List(0),
+      Float64List(0),
+      Float64List(0),
+    );
   }
 
   final position = state._bins[attrPosition]!.values;
@@ -835,10 +871,39 @@ _Reconstruction _reconstructAt(
 
   final steps = grids.steps;
   final k = supportK(grids.cutoff);
-  final winLen = grids.windowLength;
+  // A zero-count keyframe can omit every stream, and `_applyDelta` carries forward
+  // only attributes the reference already had — so a later birth can compose a
+  // non-empty state with no window_index. Reconstruction reads it below, so this is
+  // a refusal rather than a null-assertion failure inside the renderer.
+  final windowColumn = state._bins[attrWindowIndex];
+  if (windowColumn == null) {
+    throw const FourdgsMalformedFile(
+      'a non-empty state carries no window_index column; it is a required '
+      'keyframe attribute (section 11.5)',
+    );
+  }
+  final windowIndex = windowColumn.values;
 
-  for (int outRow = 0; outRow < n; outRow++) {
-    final i = order[outRow];
+  // A gaussian is absent outside its own validity window, exactly as the
+  // gaussian-birth path decides it (`winLo <= t < winHi`) — dropped, not merely
+  // made transparent, so id, centre, scale and the live count all exclude it.
+  // Unobservable while every keyframe-delta file carried one full-duration
+  // window; reachable the moment a file declares more than one.
+  final kept = <int>[];
+  for (final i in order) {
+    // Validated, not clamped: a row dropped for being outside a window it never
+    // named would make a malformed file look like a valid, emptier one.
+    final w = grids.windowAt(windowIndex[i]);
+    if (w.lo <= t && t < w.hi) kept.add(i);
+  }
+
+  final ids = Int32List(kept.length);
+  final centers = Float64List(kept.length * 3);
+  final scales = Float64List(kept.length * 3);
+  final opacity = Float64List(kept.length);
+
+  for (int outRow = 0; outRow < kept.length; outRow++) {
+    final i = kept[outRow];
     ids[outRow] = state.ids[i];
 
     final sigmaBin = sigmaBinsCol[i];
@@ -846,7 +911,13 @@ _Reconstruction _reconstructAt(
     final sigma =
         neverFades ? double.infinity : math.exp(sigmaBin * steps.sigmaLog);
     final mStep = motionStep(
-      lifeClass(sigmaBin, steps.sigmaLog, neverFades, winLen, k: k),
+      lifeClass(
+        sigmaBin,
+        steps.sigmaLog,
+        neverFades,
+        grids.windowLengthAt(windowIndex[i]),
+        k: k,
+      ),
       steps.motion,
     );
     final tStep = muStep(sigmaBin, steps.sigmaLog, neverFades, steps.time);
@@ -864,6 +935,10 @@ _Reconstruction _reconstructAt(
     final alpha = (opacityBins[i] * steps.alpha).clamp(0.0, 1.0);
     final marginal =
         sigma.isInfinite ? 1.0 : math.exp(-0.5 * (dt / sigma) * (dt / sigma));
+    // A gaussian is absent outside its own validity window, exactly as the
+    // gaussian-birth path decides it (`winLo <= t < winHi`). Unobservable while
+    // every keyframe-delta file carried one full-duration window; reachable the
+    // moment a file declares more than one.
     opacity[outRow] = alpha * marginal;
   }
   return _Reconstruction(ids, centers, scales, opacity);
@@ -967,7 +1042,10 @@ Map<String, Object?> _stateRow(
   }
   return <String, Object?>{
     't': _num(t),
-    'liveCount': info.state.count.toString(),
+    // The count at this instant, from the rows reconstruction returned:
+    // `info.state.count` is the chunk's population, which differs once a
+    // validity window has closed.
+    'liveCount': r.ids.length.toString(),
     'sample': <String, Object?>{
       'gaussianIds': <Object?>[
         for (int i = 0; i < sampleN; i++) r.ids[i].toString(),

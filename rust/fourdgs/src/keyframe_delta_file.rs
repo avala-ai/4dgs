@@ -101,13 +101,47 @@ fn is_keyframe(index: usize, kd: &KeyframeDeltaOptions) -> bool {
 pub struct Grids {
     pub steps: Steps,
     pub origin: [f64; 3],
-    pub window: (f64, f64),
+    /// Every validity window the sequence declares, in Window Table order. A gaussian's
+    /// own window is the one its `window_index` names — the velocity grid comes from that
+    /// window's length (spec §6.3), so collapsing the table to its first entry gives every
+    /// gaussian outside window 0 the wrong motion precision, and its reconstructed
+    /// positions drift from the bins the encoder wrote.
+    pub windows: Vec<(f64, f64)>,
     pub cutoff: f64,
 }
 
 impl Grids {
-    fn motion_step_for(&self, sigma_bin: i64, never_fades: bool) -> f64 {
-        let win_len = self.window.1 - self.window.0;
+    /// The first window. Only the writer uses this: it emits a single-window table.
+    pub fn window(&self) -> (f64, f64) {
+        self.windows.first().copied().unwrap_or((0.0, 0.0))
+    }
+
+    /// The length of the window `index` names.
+    ///
+    /// Every index is checked against the table when the state is built
+    /// (`check_window_index`, the same refusal the chunk path uses), so by the time
+    /// reconstruction asks, an out-of-range index cannot have survived. Falling back to
+    /// the first window keeps this total rather than panicking on a bound already proved.
+    fn window_len(&self, index: i64) -> f64 {
+        let w = self.window_at(index);
+        w.1 - w.0
+    }
+
+    /// The window `index` names, defaulting an absent table to one `(0, 0)` entry.
+    ///
+    /// Total on purpose: every index is checked against the table when the state is
+    /// built — `check_window_indices`, on both read paths — so an out-of-range index
+    /// cannot reach reconstruction, and this cannot panic on a bound already proved.
+    fn window_at(&self, index: i64) -> (f64, f64) {
+        usize::try_from(index)
+            .ok()
+            .and_then(|i| self.windows.get(i))
+            .copied()
+            .unwrap_or_else(|| self.window())
+    }
+
+    fn motion_step_for(&self, sigma_bin: i64, never_fades: bool, window_index: i64) -> f64 {
+        let win_len = self.window_len(window_index);
         let class = life_class(
             sigma_bin,
             self.steps.sigma_log,
@@ -172,7 +206,12 @@ fn quantize_sample(sample: &Sample, grids: &Grids) -> Result<(Vec<i64>, BTreeMap
         let never_fades = false;
         sigma.push(q_sigma);
         flags.push(0);
-        window_index.push(0);
+        let row_window = window_index_of(
+            &grids.windows,
+            g.win_lo.get(i).copied().unwrap_or(0.0),
+            g.win_hi.get(i).copied().unwrap_or(0.0),
+        );
+        window_index.push(row_window);
 
         for axis in 0..3 {
             position.push(quantize_scalar(
@@ -209,7 +248,10 @@ fn quantize_sample(sample: &Sample, grids: &Grids) -> Result<(Vec<i64>, BTreeMap
             0.0,
         ));
 
-        let m_step = grids.motion_step_for(q_sigma, never_fades);
+        // The row's own window, matching the index written beside it: quantizing against
+        // window 0 while recording a different index scales the velocity by one grid and
+        // reconstructs it with another.
+        let m_step = grids.motion_step_for(q_sigma, never_fades, row_window);
         for axis in 0..3 {
             motion.push(rint(g.motions[i * 3 + axis] as f64 / m_step));
         }
@@ -254,9 +296,47 @@ fn grids_for(samples: &[Sample], duration_sec: f64, profile: Profile, cutoff: f6
     Grids {
         steps,
         origin,
-        window: (0.0, duration_sec),
+        windows: windows_of(samples, duration_sec),
         cutoff,
     }
+}
+
+/// The distinct validity windows the population declares, in first-seen order.
+///
+/// A `GaussianSet` carries `win_lo`/`win_hi` per gaussian and the format lets a sequence
+/// declare several windows, so the writer reads them rather than forcing one. Emitting a
+/// single full-duration entry meant a Rust-written keyframe-delta file could not express
+/// the multi-window scene the readers now honour (issue #87).
+///
+/// Order is first-seen rather than sorted: `window_index` is written against this list, so
+/// a stable order is what makes the indices mean the same thing on both sides.
+fn windows_of(samples: &[Sample], duration_sec: f64) -> Vec<(f64, f64)> {
+    let mut out: Vec<(f64, f64)> = Vec::new();
+    for s in samples {
+        let g = &s.gaussians;
+        for i in 0..g.win_lo.len().min(g.win_hi.len()) {
+            let w = (g.win_lo[i] as f64, g.win_hi[i] as f64);
+            if !out
+                .iter()
+                .any(|e| e.0.to_bits() == w.0.to_bits() && e.1.to_bits() == w.1.to_bits())
+            {
+                out.push(w);
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push((0.0, duration_sec));
+    }
+    out
+}
+
+/// The row in the window table a gaussian's own window occupies.
+fn window_index_of(windows: &[(f64, f64)], lo: f32, hi: f32) -> i64 {
+    let w = (lo as f64, hi as f64);
+    windows
+        .iter()
+        .position(|e| e.0.to_bits() == w.0.to_bits() && e.1.to_bits() == w.1.to_bits())
+        .unwrap_or(0) as i64
 }
 
 fn median(values: &mut [f64]) -> Option<f64> {
@@ -545,7 +625,7 @@ pub fn write_sequence(
     );
     out.extend_from_slice(
         &rec::WindowTable {
-            windows: vec![grids.window],
+            windows: grids.windows.clone(),
         }
         .encode(),
     );
@@ -709,7 +789,7 @@ impl DecodedSequence {
         Grids {
             steps: q.steps(),
             origin,
-            window: self.windows.first().copied().unwrap_or((0.0, 0.0)),
+            windows: self.windows.clone(),
             cutoff: self.header.cutoff,
         }
     }
@@ -836,6 +916,7 @@ pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
                 let (ids, bins) = keyframe_from_chunk(record.content)?;
                 let (head, _) = rec::parse_chunk(record.content)?;
                 let state = keyframe_state(ids, bins)?;
+                check_window_indices(&state, &windows)?;
                 by_offset.insert(record.offset as u64, state.clone());
                 chunks.push(ChunkInfo {
                     t0: head.t0,
@@ -866,6 +947,11 @@ pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
                     )));
                 };
                 let (state, head) = compose_delta(reference, record.content)?;
+                // Births in a delta group carry their own `window_index`, so the check
+                // belongs on this branch too — not only where a keyframe is read. The
+                // indexed path validates the composed state for every chunk, so leaving
+                // it off here would accept a birth the other path refuses.
+                check_window_indices(&state, &windows)?;
                 by_offset.insert(record.offset as u64, state.clone());
                 chunks.push(ChunkInfo {
                     t0: head.t0,
@@ -909,10 +995,39 @@ fn record_content(data: &[u8], offset: u64, length: u64) -> Result<&[u8]> {
     c.blob()
 }
 
+/// Refuse a `window_index` the table cannot answer, on either read path.
+///
+/// The table defaults to a single `(0, 0)` entry when a file declares none
+/// (`chunk::window_table_or_default`), so index 0 stays legal for a file with no Window
+/// Table — validating against the raw count would refuse those files on one path while
+/// the other decoded them.
+fn check_window_indices(state: &State, windows: &[(f64, f64)]) -> Result<()> {
+    let table_len = crate::chunk::window_table_or_default(windows).len();
+    let Some(window_index) = state.bins.get(&op::A_WINDOW_INDEX) else {
+        // A zero-count keyframe can omit every stream, and `apply_delta` only carries
+        // forward attributes the reference already had — so a later birth can compose a
+        // non-empty state with no window_index at all. Reconstruction indexes it, so
+        // this has to be a refusal here rather than a panic there.
+        if state.count() > 0 {
+            return Err(Error::Malformed(
+                "a non-empty state carries no window_index column; it is a required \
+                 keyframe attribute (section 11.5)"
+                    .into(),
+            ));
+        }
+        return Ok(());
+    };
+    for &index in &window_index.values {
+        crate::chunk::check_window_index(index, table_len)?;
+    }
+    Ok(())
+}
+
 fn compose_chain(
     data: &[u8],
     index: &[rec::ChunkIndexEntry],
     entry: &rec::ChunkIndexEntry,
+    windows: &[(f64, f64)],
 ) -> Result<State> {
     let chain = chain_for(index, (entry.t0 + entry.t1) / 2.0)?;
     let mut state: Option<State> = None;
@@ -928,7 +1043,9 @@ fn compose_chain(
             state = Some(compose_delta(&reference, content)?.0);
         }
     }
-    state.ok_or_else(|| Error::Malformed("an empty chain".into()))
+    let state = state.ok_or_else(|| Error::Malformed("an empty chain".into()))?;
+    check_window_indices(&state, windows)?;
+    Ok(state)
 }
 
 /// Read the Footer, then the index, then compose each chunk by walking its chain.
@@ -973,7 +1090,7 @@ pub fn decode_indexed(data: &[u8]) -> Result<(DecodedSequence, Vec<rec::ChunkInd
 
     let mut chunks: Vec<ChunkInfo> = Vec::with_capacity(index.len());
     for entry in &index {
-        let state = compose_chain(data, &index, entry)?;
+        let state = compose_chain(data, &index, entry, &windows)?;
         let (update_count, birth_count, death_count) = if entry.kind != 0 {
             let content = record_content(data, entry.chunk_offset, entry.chunk_length)?;
             let (head, ..) = rec::parse_delta_chunk(content)?;
@@ -1059,8 +1176,18 @@ pub fn reconstruct_at(seq: &DecodedSequence, state: &State, t: f64) -> Reconstru
     let mu = &state.bins[&op::A_MU_T];
     let sigma = &state.bins[&op::A_SIGMA_T];
     let flags = &state.bins[&op::A_FLAGS];
+    let window = &state.bins[&op::A_WINDOW_INDEX];
 
     for &i in &order {
+        // A gaussian is absent outside its own validity window, exactly as the
+        // gaussian-birth path decides it (`win_lo <= t < win_hi`) — dropped, not merely
+        // made transparent, so id, centre, scale and the live count all exclude it.
+        // Unobservable while every keyframe-delta file carried one full-duration window;
+        // reachable the moment a file declares more than one.
+        let (lo, hi) = grids.window_at(window.values[i]);
+        if !(lo <= t && t < hi) {
+            continue;
+        }
         out.ids.push(state.ids[i]);
         let sigma_bin = sigma.values[i];
         let never_fades = flags.values[i] != 0;
@@ -1069,7 +1196,7 @@ pub fn reconstruct_at(seq: &DecodedSequence, state: &State, t: f64) -> Reconstru
         } else {
             (sigma_bin as f64 * grids.steps.sigma_log).exp()
         };
-        let m_step = grids.motion_step_for(sigma_bin, never_fades);
+        let m_step = grids.motion_step_for(sigma_bin, never_fades, window.values[i]);
         let t_step = grids.mu_step_for(sigma_bin, never_fades);
         let mu_f = mu.values[i] as f64 * t_step;
 
@@ -1306,7 +1433,10 @@ pub fn keyframe_delta_states_json(seq: &DecodedSequence) -> String {
 
         states.push(Json::obj(vec![
             ("t", num(t)),
-            ("liveCount", int(info.state.count() as u64)),
+            // The count at this instant, from the rows reconstruction returned:
+            // `info.state.count()` is the chunk's population, which differs once a
+            // validity window has closed.
+            ("liveCount", int(r.ids.len() as u64)),
             (
                 "sample",
                 Json::obj(vec![
@@ -1356,4 +1486,42 @@ pub fn peek_temporal_model(data: &[u8]) -> Result<String> {
     Err(Error::Malformed(
         "file has no Header record to read a temporal model from".into(),
     ))
+}
+
+#[cfg(test)]
+mod window_grid_tests {
+    use super::*;
+
+    fn grids(windows: Vec<(f64, f64)>) -> Grids {
+        Grids {
+            steps: Steps::of(&Bounds::for_profile(Profile::Default, 1e-2)),
+            origin: [0.0; 3],
+            windows,
+            cutoff: 0.05,
+        }
+    }
+
+    #[test]
+    fn a_never_fading_gaussian_takes_the_grid_of_the_window_it_names() {
+        // `life_half` reads the window length only when `never_fades` is set, so this is
+        // the shape where the index actually changes the answer — and the reason a test
+        // driven through `write_sequence` cannot see it: that writer emits no
+        // never-fading gaussians.
+        let g = grids(vec![(0.0, 10.0), (0.0, 0.5)]);
+        let long = g.motion_step_for(0, true, 0);
+        let short = g.motion_step_for(0, true, 1);
+        assert_ne!(
+            long, short,
+            "a 10s window and a 0.5s window cannot share a velocity grid"
+        );
+    }
+
+    #[test]
+    fn an_absent_window_table_is_one_default_window() {
+        // Not an unbounded fallback: index 0 is legal, and the length is the default
+        // window's, which is what the chunk path's `window_table_or_default` means.
+        let g = grids(Vec::new());
+        assert_eq!(g.window_len(0), 0.0);
+        assert_eq!(g.window_len(7), 0.0, "the fallback is total, not a panic");
+    }
 }
