@@ -228,11 +228,18 @@ public final class SceneReader {
     ///
     /// Computed by the core, like `provenanceJson`, so this binding and the C++ one cannot
     /// drift from Rust on composition order or pose interpolation.
+    ///
+    /// **This call loads.** The summary describes every gaussian, so the core decodes the
+    /// whole population — at whatever SH band was already resident, which it leaves alone.
+    /// A scene that had seeked to an instant holds the whole thing afterwards. Nothing
+    /// dangles the way it can in C: ``GaussianState`` owns Swift storage copied out of the
+    /// core, so a value taken earlier stays valid and stays what it was.
     public func objectsJson() throws -> String {
         try Core.objectsJson(handle)
     }
 
     /// The `states` member: composed centres, orientations and membership at each probe.
+    /// Loads on the same terms as ``objectsJson()``.
     public func objectStatesJson() throws -> String {
         try Core.objectStatesJson(handle)
     }
