@@ -20,7 +20,7 @@ from fourdgs import records as rec
 from fourdgs.keyframe_delta_writer import KeyframeDeltaOptions, Sample
 
 
-def _gaussians(positions, motions=None, colors=None):
+def _gaussians(positions, motions=None, colors=None, win_hi=8.0):
     n = len(positions)
     positions = np.asarray(positions, dtype=np.float32).reshape(n, 3)
     return fourdgs.GaussianSet(
@@ -40,7 +40,7 @@ def _gaussians(positions, motions=None, colors=None):
         mu_t=np.zeros(n, dtype=np.float32),
         sigma_t=np.full(n, 100.0, dtype=np.float32),  # finite, effectively non-fading over the clip
         win_lo=np.zeros(n, dtype=np.float32),
-        win_hi=np.full(n, 8.0, dtype=np.float32),
+        win_hi=np.full(n, win_hi, dtype=np.float32),
     )
 
 
@@ -122,7 +122,13 @@ def test_error_does_not_grow_with_depth():
     samples = []
     for i in range(steps):
         # A single gaussian creeping along x by one position-step's worth each frame.
-        samples.append(Sample(t0=float(i), ids=np.array([0]), gaussians=_gaussians([[0.001 * i, 0.0, 0.0]])))
+        samples.append(
+            Sample(
+                t0=float(i),
+                ids=np.array([0]),
+                gaussians=_gaussians([[0.001 * i, 0.0, 0.0]], win_hi=duration),
+            )
+        )
     data = write_ok(samples, duration, rec.DELTA_MODE_CHAINED, keyframe_every=steps)  # one keyframe, then deltas
     decoded = kdf.decode_streamed(data)
     assert decoded.chunks[-1].depth == steps - 1  # a genuinely deep chain
@@ -194,9 +200,11 @@ def test_a_multi_window_sequence_round_trips_each_gaussians_own_window():
     # opacity once t passes 0.5s, while the full-duration rows still do. Before this,
     # a closed window bled its gaussians through at full opacity for the whole clip.
     late = kdf.render_at(seq, 2.0)
-    opacity = list(late["opacity"])
-    assert opacity[0] > 0.0 and opacity[1] > 0.0, "the full-duration rows stay visible"
-    assert opacity[2] == 0.0 and opacity[3] == 0.0, "a row whose window closed at 0.5s must not be reported at t=2"
+    # Absent, not merely transparent: the rows whose window closed at 0.5s are gone from
+    # ids and centres too, which is how the gaussian-birth path reports them.
+    assert sorted(int(i) for i in late["ids"]) == [0, 1], "only the full-duration rows exist at t=2"
+    assert len(late["centers"]) == 2
+    assert all(o > 0.0 for o in late["opacity"]), "and the ones that remain are visible"
 
     # And the decoder must give the two populations different velocity grids.
     grids = seq.grids

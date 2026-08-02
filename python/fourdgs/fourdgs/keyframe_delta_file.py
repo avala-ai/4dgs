@@ -811,17 +811,20 @@ def reconstruct_at(state: State, grids: Grids, t: float) -> dict:
     # is what the rest of this change enables. Without it a gaussian whose window closed
     # at 0.5s is still reported, at full opacity, at t = 4.
     table = np.asarray(grids.windows or [(0.0, 0.0)], dtype=np.float64)
-    idx = np.asarray(values["window_index"], dtype=np.int64)[order]
-    in_window = (table[idx, 0] <= t) & (t < table[idx, 1])
-    marginal = np.where(in_window, marginal, 0.0)
+    widx = np.asarray(values["window_index"], dtype=np.int64)[order]
+    # Absent means absent: the gaussian-birth path drops these rows outright
+    # (`model.py`: `idx = flatnonzero(visible)`), so id, centre, scale and liveCount all
+    # exclude them. Zeroing only the opacity would still report a gaussian section 3 says
+    # does not exist at this instant.
+    keep = np.flatnonzero((table[widx, 0] <= t) & (t < table[widx, 1]))
     centers = position + motion * (t - mu)[:, None]
     return dict(
-        ids=ids,
-        centers=centers,
-        scales=values["scales"][order],
-        rotations=values["rotations"][order],
-        rgb=color[:, :3],
-        opacity=color[:, 3] * marginal,
+        ids=ids[keep],
+        centers=centers[keep],
+        scales=values["scales"][order][keep],
+        rotations=values["rotations"][order][keep],
+        rgb=color[keep, :3],
+        opacity=color[keep, 3] * marginal[keep],
     )
 
 

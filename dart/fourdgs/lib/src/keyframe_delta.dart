@@ -835,12 +835,13 @@ _Reconstruction _reconstructAt(
   final order = List<int>.generate(n, (int i) => i)
     ..sort((a, b) => state.ids[a].compareTo(state.ids[b]));
 
-  final ids = Int32List(n);
-  final centers = Float64List(n * 3);
-  final scales = Float64List(n * 3);
-  final opacity = Float64List(n);
   if (n == 0) {
-    return _Reconstruction(ids, centers, scales, opacity);
+    return _Reconstruction(
+      Int32List(0),
+      Float64List(0),
+      Float64List(0),
+      Float64List(0),
+    );
   }
 
   final position = state._bins[attrPosition]!.values;
@@ -866,8 +867,27 @@ _Reconstruction _reconstructAt(
   }
   final windowIndex = windowColumn.values;
 
-  for (int outRow = 0; outRow < n; outRow++) {
-    final i = order[outRow];
+  // A gaussian is absent outside its own validity window, exactly as the
+  // gaussian-birth path decides it (`winLo <= t < winHi`) — dropped, not merely
+  // made transparent, so id, centre, scale and the live count all exclude it.
+  // Unobservable while every keyframe-delta file carried one full-duration
+  // window; reachable the moment a file declares more than one.
+  final kept = <int>[];
+  for (final i in order) {
+    final w =
+        grids.windows.isEmpty
+            ? const FourdgsWindow(0.0, 0.0)
+            : grids.windows[windowIndex[i].clamp(0, grids.windows.length - 1)];
+    if (w.lo <= t && t < w.hi) kept.add(i);
+  }
+
+  final ids = Int32List(kept.length);
+  final centers = Float64List(kept.length * 3);
+  final scales = Float64List(kept.length * 3);
+  final opacity = Float64List(kept.length);
+
+  for (int outRow = 0; outRow < kept.length; outRow++) {
+    final i = kept[outRow];
     ids[outRow] = state.ids[i];
 
     final sigmaBin = sigmaBinsCol[i];
@@ -903,12 +923,7 @@ _Reconstruction _reconstructAt(
     // gaussian-birth path decides it (`winLo <= t < winHi`). Unobservable while
     // every keyframe-delta file carried one full-duration window; reachable the
     // moment a file declares more than one.
-    final w =
-        grids.windows.isEmpty
-            ? const FourdgsWindow(0.0, 0.0)
-            : grids.windows[windowIndex[i].clamp(0, grids.windows.length - 1)];
-    final inWindow = w.lo <= t && t < w.hi;
-    opacity[outRow] = inWindow ? alpha * marginal : 0.0;
+    opacity[outRow] = alpha * marginal;
   }
   return _Reconstruction(ids, centers, scales, opacity);
 }
