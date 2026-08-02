@@ -314,7 +314,13 @@ std::vector<std::size_t> stableOrder(const GaussianView& gaussians) {
   const std::size_t n = gaussians.count;
   const std::size_t shWidth =
       (gaussians.shDegree == 0 || gaussians.sh.empty()) ? 0 : gaussians.shCoefficients * 3;
-  const std::size_t width = 3 + 3 + 4 + 4 + 3 + 4 + shWidth;
+  // Membership is part of the key, after the harmonics, exactly as `canonical.py` orders
+  // it. It matters where the harmonics do not: two gaussians alike in every attribute but
+  // belonging to different objects tie on everything above, and `sample.objectIds` is a
+  // value this summary emits — so leaving membership out would let decode order pick which
+  // of `["0", "7"]` and `["7", "0"]` this file reports.
+  const std::size_t idWidth = gaussians.objectIds.empty() ? 0 : 1;
+  const std::size_t width = 3 + 3 + 4 + 4 + 3 + 4 + shWidth + idWidth;
 
   std::vector<double> keys(n * width);
   for (std::size_t i = 0; i < n; ++i) {
@@ -332,6 +338,7 @@ std::vector<std::size_t> stableOrder(const GaussianView& gaussians) {
     for (std::size_t k = 0; k < shWidth; ++k) {
       row[at++] = static_cast<double>(gaussians.sh[i * shWidth + k]);
     }
+    if (idWidth != 0) row[at++] = static_cast<double>(gaussians.objectIds[i]);
   }
 
   std::vector<std::size_t> order(n);
@@ -426,6 +433,30 @@ std::string canonical(const SceneSummary& summary) {
     });
   }
 
+  std::map<std::string, Json> sampleFields{
+      {"colors", floatRows(gaussians.colors, sample, 4)},
+      {"motions", floatRows(gaussians.motions, sample, 3)},
+      {"muT", scalarRow(gaussians.muT, sample)},
+      {"positions", floatRows(gaussians.positions, sample, 3)},
+      {"rotations", floatRows(gaussians.rotations, sample, 4)},
+      {"scales", floatRows(gaussians.scales, sample, 3)},
+      {"sigmaT", scalarRow(gaussians.sigmaT, sample)},
+      {"winHi", scalarRow(gaussians.winHi, sample)},
+      {"winLo", scalarRow(gaussians.winLo, sample)},
+  };
+  // Membership is an exact label, so it is rendered as an integer string like the counts
+  // are — never as a float. The key is omitted when the scene carries no `object_id`
+  // stream at all, which is a different file from one where every gaussian is background.
+  if (!gaussians.objectIds.empty()) {
+    std::vector<Json> ids;
+    ids.reserve(sample.size());
+    for (const std::size_t row : sample) {
+      ids.push_back(Json::string(std::to_string(gaussians.objectIds[row])));
+    }
+    sampleFields.emplace("objectIds", Json::array(std::move(ids)));
+  }
+  Json sampleMembers = Json::object(std::move(sampleFields));
+
   std::map<std::string, Json> rootMembers = {
       {"aggregate", Json::object({
                         {"neverFadesCount", integer(neverFades)},
@@ -447,17 +478,7 @@ std::string canonical(const SceneSummary& summary) {
       {"library", Json::string(header.library)},
       {"metadataRecords", Json::array(std::move(metadata))},
       {"profile", Json::string(header.profile)},
-      {"sample", Json::object({
-                     {"colors", floatRows(gaussians.colors, sample, 4)},
-                     {"motions", floatRows(gaussians.motions, sample, 3)},
-                     {"muT", scalarRow(gaussians.muT, sample)},
-                     {"positions", floatRows(gaussians.positions, sample, 3)},
-                     {"rotations", floatRows(gaussians.rotations, sample, 4)},
-                     {"scales", floatRows(gaussians.scales, sample, 3)},
-                     {"sigmaT", scalarRow(gaussians.sigmaT, sample)},
-                     {"winHi", scalarRow(gaussians.winHi, sample)},
-                     {"winLo", scalarRow(gaussians.winLo, sample)},
-                 })},
+      {"sample", std::move(sampleMembers)},
       {"sh", sphericalHarmonics(gaussians, order)},
       {"shDegree", Json::number(std::to_string(header.shDegree))},
       {"statistics", std::move(statistics)},
@@ -471,6 +492,16 @@ std::string canonical(const SceneSummary& summary) {
   // convention. A file without provenance is a file the record family does not apply to.
   if (!summary.provenanceJson.empty()) {
     rootMembers.emplace("provenance", Json::raw(summary.provenanceJson));
+  }
+
+  // The object layer adds two root keys beside the rest, on the same omit-when-absent
+  // rule: a file with neither object records nor membership reads exactly as it did
+  // before the layer existed.
+  if (!summary.objectsJson.empty()) {
+    rootMembers.emplace("objects", Json::raw(summary.objectsJson));
+  }
+  if (!summary.objectStatesJson.empty()) {
+    rootMembers.emplace("states", Json::raw(summary.objectStatesJson));
   }
 
   return Json::object(std::move(rootMembers)).render();

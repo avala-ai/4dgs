@@ -143,11 +143,15 @@ int main(int argc, char** argv) {
 
   Result<void> loaded = scene.loadAll(3);
   if (!loaded) return fail(loaded.error().toString());
-  const GaussianView gaussians = scene.gaussians();
-
   fourdgs::conformance::SceneRecords records;
   Result<void> collected = fourdgs::conformance::collectRecords(scene, &records);
   if (!collected) return fail(collected.error().toString());
+
+  // After the records, not before: `objectsJson` decodes the whole population and
+  // invalidates any view taken earlier. It happens to be a no-op here — the scene is
+  // already loaded whole — and depending on that is exactly how this becomes a dangling
+  // read the day the order above changes.
+  const GaussianView gaussians = scene.gaussians();
 
   Result<std::vector<std::uint8_t>> bytes = readWhole(path);
   if (!bytes) return fail(bytes.error().toString());

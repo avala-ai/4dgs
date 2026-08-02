@@ -176,6 +176,31 @@ class Scene {
   /// emit null. On the indexed path the records are fetched here if not already resident.
   Result<std::string> provenanceJson();
 
+  /// The `objects` member of the canonical summary (spec §5.15.6-§5.15.7): the Object
+  /// Table's entries and the SE(3) tracks with their sampled poses. Empty when the file
+  /// carries neither object records nor per-gaussian membership.
+  ///
+  /// Computed by the core, like `provenanceJson`, so that this binding and the Swift one
+  /// cannot drift from Rust on the composition order or the pose interpolation behind it.
+  ///
+  /// **This call loads.** The summary describes every gaussian, so it decodes the whole
+  /// population — at the file's full SH degree, because the canonical order keys the
+  /// harmonics before `object_id` and a lower degree would sort a legal file differently
+  /// from the reference. Any band cap is put back before this returns; the working set is
+  /// not, so any `GaussianView` taken earlier — including its `objectIds` span — is
+  /// invalidated exactly as `loadAll` invalidates it. Unlike `provenanceJson`, which reads
+  /// records and leaves the working set alone. Take the view after calling this, not
+  /// before: on a scene already loaded whole the load is a no-op and the mistake is
+  /// invisible, which is the only reason it would reach a caller who seeks.
+  Result<std::string> objectsJson();
+
+  /// The `states` member: composed centres, orientations and membership at each probe.
+  ///
+  /// Two calls rather than one document because these are two root keys of the summary,
+  /// sitting beside `sample` and `aggregate` — one document would have to be cut apart.
+  /// Loads and invalidates on the same terms as `objectsJson`.
+  Result<std::string> objectStatesJson();
+
   /// Three states, not two: "not checked" and "did not match" are different claims about a
   /// file, and collapsing them reports corruption nobody observed.
   enum class CrcState { kNotChecked = -1, kFailed = 0, kVerified = 1 };

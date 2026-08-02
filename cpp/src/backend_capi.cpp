@@ -295,6 +295,9 @@ GaussianView loadedGaussians(const Handle& handle) {
   view.sigmaT = spanOf(fourdgs_scene_sigma_t(scene), n);
   view.winLo = spanOf(fourdgs_scene_win_lo(scene), n);
   view.winHi = spanOf(fourdgs_scene_win_hi(scene), n);
+  // Null stays empty rather than becoming zeros: a scene with no membership and one where
+  // everything is background are different files.
+  view.objectIds = spanOf(fourdgs_scene_object_ids(scene), n);
   // Coefficients per colour component, so a row is three times this wide. Reported for the
   // working set rather than for the file, because capping the band cap lowers it.
   view.shCoefficients = fourdgs_scene_sh_coefficients(scene);
@@ -643,6 +646,30 @@ Result<std::string> provenanceJson(Handle& handle) {
   // Sequenced deliberately: read the out parameters only after the status is OK. Empty
   // string means the file carries no provenance — not a failure.
   const int status = fourdgs_scene_provenance_json(asScene(handle), &data, &length);
+  if (status != FOURDGS_STATUS_OK) return failure(status).error();
+  std::string out = (data != nullptr && length != 0) ? std::string(data, length) : std::string();
+  fourdgs_string_free(data, length);
+  return out;
+}
+
+Result<std::string> objectsJson(Handle& handle) {
+  const char* data = nullptr;
+  std::size_t length = 0;
+  // Same shape as provenance, and empty means the same thing: a file with no object
+  // records and no membership, whose summary must read exactly as it did before the
+  // layer existed.
+  const int status = fourdgs_scene_objects_json(asScene(handle), &data, &length);
+  if (status != FOURDGS_STATUS_OK) return failure(status).error();
+  std::string out = (data != nullptr && length != 0) ? std::string(data, length) : std::string();
+  fourdgs_string_free(data, length);
+  return out;
+}
+
+Result<std::string> objectStatesJson(Handle& handle) {
+  const char* data = nullptr;
+  std::size_t length = 0;
+  // The companion member to objectsJson: two root keys, so two calls.
+  const int status = fourdgs_scene_object_states_json(asScene(handle), &data, &length);
   if (status != FOURDGS_STATUS_OK) return failure(status).error();
   std::string out = (data != nullptr && length != 0) ? std::string(data, length) : std::string();
   fourdgs_string_free(data, length);
