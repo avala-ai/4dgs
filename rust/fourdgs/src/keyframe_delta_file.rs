@@ -994,10 +994,22 @@ fn record_content(data: &[u8], offset: u64, length: u64) -> Result<&[u8]> {
 /// the other decoded them.
 fn check_window_indices(state: &State, windows: &[(f64, f64)]) -> Result<()> {
     let table_len = crate::chunk::window_table_or_default(windows).len();
-    if let Some(window_index) = state.bins.get(&op::A_WINDOW_INDEX) {
-        for &index in &window_index.values {
-            crate::chunk::check_window_index(index, table_len)?;
+    let Some(window_index) = state.bins.get(&op::A_WINDOW_INDEX) else {
+        // A zero-count keyframe can omit every stream, and `apply_delta` only carries
+        // forward attributes the reference already had — so a later birth can compose a
+        // non-empty state with no window_index at all. Reconstruction indexes it, so
+        // this has to be a refusal here rather than a panic there.
+        if state.count() > 0 {
+            return Err(Error::Malformed(
+                "a non-empty state carries no window_index column; it is a required \
+                 keyframe attribute (section 11.5)"
+                    .into(),
+            ));
         }
+        return Ok(());
+    };
+    for &index in &window_index.values {
+        crate::chunk::check_window_index(index, table_len)?;
     }
     Ok(())
 }

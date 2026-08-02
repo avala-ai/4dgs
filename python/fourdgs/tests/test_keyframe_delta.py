@@ -337,3 +337,38 @@ def test_each_gaussian_gets_the_window_its_index_names():
     empty.motion_step(sigma_bins, never_fades, np.zeros(2, dtype=np.int64))
     with pytest.raises(MalformedFile):
         empty.motion_step(sigma_bins, never_fades, np.array([0, 7]))
+
+
+def test_a_state_without_window_index_is_refused_not_a_keyerror():
+    """`window_index` is a required keyframe attribute (§11.5), so a state missing it is
+    a malformed file — not a KeyError raised from inside the renderer.
+
+    It is reachable: a zero-count keyframe may omit every stream, and `apply_delta`
+    carries forward only attributes the reference already had, so a later birth can
+    compose a non-empty state with no window_index column at all.
+    """
+    from fourdgs.keyframe_delta_file import Grids, _dequantize
+    from fourdgs.quantization import Bounds, Steps
+
+    grids = Grids(
+        steps=Steps.of(Bounds.for_profile("default", median_scale=1e-2)),
+        bounds=None,
+        origin=np.zeros(3),
+        windows=[(0.0, 8.0)],
+        cutoff=0.05,
+    )
+
+    class _State:
+        ids = np.array([0])
+        bins = {
+            op.A_POSITION: np.zeros((1, 3), dtype=np.int64),
+            op.A_SIGMA_T: np.zeros((1, 1), dtype=np.int64),
+            op.A_FLAGS: np.zeros((1, 1), dtype=np.int64),
+        }
+
+        def count(self):
+            return 1
+
+    with pytest.raises(MalformedFile) as caught:
+        _dequantize(_State(), grids)
+    assert caught.value.code == "missing-window-index"

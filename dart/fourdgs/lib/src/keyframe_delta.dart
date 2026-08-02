@@ -853,7 +853,18 @@ _Reconstruction _reconstructAt(
 
   final steps = grids.steps;
   final k = supportK(grids.cutoff);
-  final windowIndex = state._bins[attrWindowIndex]!.values;
+  // A zero-count keyframe can omit every stream, and `_applyDelta` carries forward
+  // only attributes the reference already had — so a later birth can compose a
+  // non-empty state with no window_index. Reconstruction reads it below, so this is
+  // a refusal rather than a null-assertion failure inside the renderer.
+  final windowColumn = state._bins[attrWindowIndex];
+  if (windowColumn == null) {
+    throw const FourdgsMalformedFile(
+      'a non-empty state carries no window_index column; it is a required '
+      'keyframe attribute (section 11.5)',
+    );
+  }
+  final windowIndex = windowColumn.values;
 
   for (int outRow = 0; outRow < n; outRow++) {
     final i = order[outRow];

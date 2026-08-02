@@ -744,6 +744,15 @@ def _dequantize(state: State, grids: Grids):
             sigma_t=np.zeros(0),
         )
     b = state.bins
+    if op.A_WINDOW_INDEX not in b:
+        # A zero-count keyframe can omit every stream, and `apply_delta` carries forward
+        # only attributes the reference already had — so a later birth can compose a
+        # non-empty state with no window_index. Reconstruction reads it below, so this is
+        # a refusal rather than a KeyError from inside the renderer.
+        raise MalformedFile(
+            "a non-empty state carries no window_index column; it is a required keyframe attribute (section 11.5)",
+            code="missing-window-index",
+        )
     sigma_bins = b[op.A_SIGMA_T][:, 0]
     never_fades = b[op.A_FLAGS][:, 0] != 0
     sigma = np.where(never_fades, np.inf, np.exp(sigma_bins * grids.steps.sigma_log))
