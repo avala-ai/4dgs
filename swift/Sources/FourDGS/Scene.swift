@@ -208,6 +208,22 @@ public final class SceneReader {
         try loadedGaussians(at: t, options: options).live(at: t, cutoff: scene.header.cutoff)
     }
 
+    /// The scene reconstructed at `t`: what is visible, where it is, and how opaque.
+    ///
+    /// Prefer this over reconstructing from ``gaussians(at:options:)`` by hand when the file
+    /// carries an object layer. ``Gaussian/state(at:)`` is §3 and nothing more — it moves a
+    /// gaussian along its own velocity and fades it — while this composes any Object Track
+    /// (spec §5.15.7) onto the base centre and orientation, in the core, so every binding
+    /// shares one base-then-track order. For a scene with tracks the two disagree, and this
+    /// is the one that matches what the file describes.
+    public func stateAt(
+        _ t: Double, options: DecodeOptions = DecodeOptions()
+    ) throws
+        -> InstantState
+    {
+        try Core.stateAt(handle, t, bandCap: options.bandCap)
+    }
+
     /// A conservative upper bound on a cold seek to `t`, so a consumer can budget before
     /// asking for it. It includes every Object Track the
     /// decoded memberships could reference; actual transfer may be lower after validation
@@ -221,6 +237,29 @@ public final class SceneReader {
     /// emit null. On the indexed path the records are fetched here if not already resident.
     public func provenanceJson() throws -> String {
         try Core.provenanceJson(handle)
+    }
+
+    /// The `objects` member of the canonical summary (spec §5.15.6-§5.15.7), or empty when
+    /// the file carries neither object records nor per-gaussian membership.
+    ///
+    /// Computed by the core, like `provenanceJson`, so this binding and the C++ one cannot
+    /// drift from Rust on composition order or pose interpolation.
+    ///
+    /// **This call loads.** The summary describes every gaussian, so the core decodes the
+    /// whole population — at the file's full SH degree, because the canonical order keys
+    /// the harmonics before `object_id` and a lower degree would sort a legal file
+    /// differently from the reference. Any band cap is put back before this returns. A
+    /// scene that had seeked to an instant holds the whole thing afterwards. Nothing
+    /// dangles the way it can in C: ``GaussianState`` owns Swift storage copied out of the
+    /// core, so a value taken earlier stays valid and stays what it was.
+    public func objectsJson() throws -> String {
+        try Core.objectsJson(handle)
+    }
+
+    /// The `states` member: composed centres, orientations and membership at each probe.
+    /// Loads on the same terms as ``objectsJson()``.
+    public func objectStatesJson() throws -> String {
+        try Core.objectStatesJson(handle)
     }
 
     /// Read a bounded range of one source's encoded payload.

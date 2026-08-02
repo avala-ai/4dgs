@@ -94,12 +94,30 @@ public enum Runner {
         // Provenance is computed in the Rust core (posesAt / sensorPosesAt included) so
         // this binding cannot drift from the reference on slerp. Empty means omit the key.
         let provenanceJson = try reader.provenanceJson()
+        // The object layer likewise: the core composes base-then-track and samples each
+        // pose, so C++, Swift and Rust cannot disagree about composition order.
+        let objectsJson = try reader.objectsJson()
+        let objectStatesJson = try reader.objectStatesJson()
+
+        // The row the canonical JSON cannot carry for this family: that *this binding's*
+        // reconstruction surfaces the composition, not merely that the core computed it for
+        // the summary. Runs after the JSON calls because those load the whole scene, which
+        // would otherwise disturb the band-range check above.
+        let duration = scene.header.durationSec
+        // Read off the summary the core just produced rather than re-reading the records:
+        // an empty `tracks` array means membership without motion, which composes to the
+        // identity and can prove nothing either way.
+        let layerHasTrack = !objectsJson.isEmpty && !objectsJson.contains("\"tracks\":[]")
+        try ExtraChecks.objectTracksAreComposed(
+            reader, at: [0.0, duration * 0.5, duration * 0.75], layerHasTrack: layerHasTrack)
 
         return Summary.build(
             scene: scene,
             gaussians: gaussians,
             chunkIntervals: scene.chunkIntervals.map { ($0.lowerBound, $0.upperBound) },
             summaryChecksumVerified: scene.summaryChecksumVerified,
-            provenanceJson: provenanceJson)
+            provenanceJson: provenanceJson,
+            objectsJson: objectsJson,
+            objectStatesJson: objectStatesJson)
     }
 }
