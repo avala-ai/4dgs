@@ -30,6 +30,7 @@
 //! Nothing here is required to decode gaussians. A file with no object layer produces an
 //! empty [`ObjectLayer`], which is a value and never an error.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use crate::error::{Error, Result};
@@ -277,7 +278,15 @@ fn sortable(value: f32) -> f64 {
     if v.is_infinite() {
         return v;
     }
-    format!("{v:.*}", CANONICAL_DECIMALS).parse().unwrap_or(v)
+    // Scaled and rounded half to even rather than rendered and parsed. The rendering is
+    // the canonical definition, and this agrees with it for every f32 — the input is f32,
+    // so the value times a million needs at most thirteen significant digits and stays
+    // inside what f64 represents exactly, which is what would otherwise make double
+    // rounding disagree. `sortable_matches_the_rendered_form` checks that across the whole
+    // f32 bit space. Cheap matters because the comparison below calls this per field per
+    // comparison rather than materializing a key.
+    let scale = 10f64.powi(CANONICAL_DECIMALS as i32);
+    (v * scale).round_ties_even() / scale
 }
 
 /// Content order: derived from decoded values alone, never from decode order.
@@ -287,44 +296,69 @@ fn sortable(value: f32) -> f64 {
 /// joins the key after the harmonics — two gaussians can tie on every rounded field and
 /// still belong to different objects.
 pub fn stable_order(gaussians: &GaussianSet) -> Vec<usize> {
-    let n = gaussians.count();
-    let sh_width = gaussians
-        .sh
-        .as_ref()
-        .map_or(0, |_| gaussians.sh_coefficients * 3);
-    let mut keys: Vec<(Vec<f64>, usize)> = Vec::with_capacity(n);
-    for i in 0..n {
-        let mut row = Vec::with_capacity(17 + sh_width);
-        for (arr, width) in [
-            (&gaussians.positions, 3usize),
-            (&gaussians.scales, 3),
-            (&gaussians.rotations, 4),
-            (&gaussians.colors, 4),
-            (&gaussians.motions, 3),
-        ] {
-            for k in 0..width {
-                row.push(sortable(arr[i * width + k]));
-            }
-        }
-        row.push(sortable(gaussians.mu_t[i]));
-        row.push(sortable(gaussians.sigma_t[i]));
-        row.push(sortable(gaussians.win_lo[i]));
-        row.push(sortable(gaussians.win_hi[i]));
-        if let Some(sh) = &gaussians.sh {
-            for k in 0..sh_width {
-                row.push(sh[i * sh_width + k] as f64);
-            }
-        }
-        if let Some(object_ids) = &gaussians.object_id {
-            row.push(object_ids[i] as f64);
-        }
-        keys.push((row, i));
-    }
-    keys.sort_by(|a, b| {
-        a.0.partial_cmp(&b.0)
+    let mut order: Vec<usize> = (0..gaussians.count()).collect();
+    // Stable, so two gaussians equal on every field of the key keep the order they arrived
+    // in — which cannot change any value the summary emits, and makes the sort reproducible.
+    order.sort_by(|&a, &b| compare_rows(gaussians, a, b));
+    order
+}
+
+/// The key, compared field by field instead of built.
+///
+/// Materializing it is the obvious shape and the expensive one: a row is twenty-one
+/// rounded scalars plus the harmonics, so a million gaussians at degree 3 is around five
+/// hundred megabytes of keys — allocated *after* the whole population is already resident,
+/// on a call whose entire job is to summarize it. Comparing on demand allocates the index
+/// vector and nothing else. It costs repeated rounding, which is why `sortable` is
+/// arithmetic rather than formatting.
+fn compare_rows(gaussians: &GaussianSet, a: usize, b: usize) -> Ordering {
+    fn cmp(x: f64, y: f64) -> Ordering {
+        x.partial_cmp(&y)
             .expect("no key value is NaN; see `sortable`")
-    });
-    keys.into_iter().map(|(_, i)| i).collect()
+    }
+
+    for (arr, width) in [
+        (&gaussians.positions, 3usize),
+        (&gaussians.scales, 3),
+        (&gaussians.rotations, 4),
+        (&gaussians.colors, 4),
+        (&gaussians.motions, 3),
+    ] {
+        for k in 0..width {
+            let ord = cmp(sortable(arr[a * width + k]), sortable(arr[b * width + k]));
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+    }
+    for arr in [
+        &gaussians.mu_t,
+        &gaussians.sigma_t,
+        &gaussians.win_lo,
+        &gaussians.win_hi,
+    ] {
+        let ord = cmp(sortable(arr[a]), sortable(arr[b]));
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    // Compared as the bytes they are. They were widened to f64 when the key was built, and
+    // widening is order-preserving, so this is the same comparison without the conversion.
+    if let Some(sh) = &gaussians.sh {
+        let sh_width = gaussians.sh_coefficients * 3;
+        for k in 0..sh_width {
+            let ord = sh[a * sh_width + k].cmp(&sh[b * sh_width + k]);
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+    }
+    // Membership last, after the harmonics: two gaussians can tie on every rounded field
+    // and still belong to different objects.
+    if let Some(object_ids) = &gaussians.object_id {
+        return object_ids[a].cmp(&object_ids[b]);
+    }
+    Ordering::Equal
 }
 
 /// Times a summary evaluates an object track at, derived from the track itself.
@@ -671,6 +705,40 @@ mod tests {
         assert_eq!(sortable(-0.5078125), -0.507812);
         // Not a tie: nothing to decide, and both rules agree.
         assert_eq!(sortable(1.015625), 1.015625);
+    }
+
+    /// The arithmetic shortcut agrees with the canonical rendered form, everywhere.
+    ///
+    /// `sortable` scales and rounds half to even instead of rendering to six decimals and
+    /// parsing back, because the comparison calls it per field per comparison rather than
+    /// building a key once. The rendered form is still the definition, so the shortcut has
+    /// to match it — not approximately, and not only on the values a corpus happens to
+    /// hold. This sweeps the f32 bit space with a prime stride, so the samples are not
+    /// aligned to exponent boundaries, and covers both sides of the magnitude where
+    /// scaling by a million could start losing digits.
+    #[test]
+    fn sortable_matches_the_rendered_form() {
+        fn rendered(v: f64) -> f64 {
+            format!("{v:.*}", super::CANONICAL_DECIMALS)
+                .parse()
+                .unwrap_or(v)
+        }
+
+        let mut checked = 0u64;
+        let mut bits: u32 = 0;
+        while bits < u32::MAX - 4099 {
+            let v = f32::from_bits(bits);
+            if v.is_finite() {
+                assert_eq!(
+                    sortable(v),
+                    rendered(v as f64),
+                    "the shortcut and the canonical rendering disagree at {v:e}"
+                );
+                checked += 1;
+            }
+            bits += 4099;
+        }
+        assert!(checked > 500_000, "the sweep covered only {checked} values");
     }
 
     #[test]
