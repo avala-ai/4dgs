@@ -612,7 +612,7 @@ pub fn write_sequence(
     );
     out.extend_from_slice(
         &rec::WindowTable {
-            windows: vec![grids.window()],
+            windows: grids.windows.clone(),
         }
         .encode(),
     );
