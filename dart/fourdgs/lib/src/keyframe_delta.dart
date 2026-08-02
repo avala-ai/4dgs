@@ -1026,7 +1026,10 @@ Map<String, Object?> _stateRow(
   }
   return <String, Object?>{
     't': _num(t),
-    'liveCount': info.state.count.toString(),
+    // The count at this instant, from the rows reconstruction returned:
+    // `info.state.count` is the chunk's population, which differs once a
+    // validity window has closed.
+    'liveCount': r.ids.length.toString(),
     'sample': <String, Object?>{
       'gaussianIds': <Object?>[
         for (int i = 0; i < sampleN; i++) r.ids[i].toString(),

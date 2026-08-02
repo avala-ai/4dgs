@@ -898,7 +898,11 @@ def states_json(decoded: DecodedSequence) -> dict:
         states.append(
             {
                 "t": _num(t),
-                "liveCount": str(info.state.count),
+                # The count at this instant, from the rows reconstruction actually
+                # returned. `info.state.count` is the chunk's population, which now
+                # differs once a validity window has closed — reporting it here would
+                # claim gaussians are live that the same summary omits from `sample`.
+                "liveCount": str(len(r["ids"])),
                 "sample": {
                     "gaussianIds": [str(int(v)) for v in r["ids"][:sample_n]],
                     "positions": [[_num(v) for v in centers[i]] for i in range(sample_n)],

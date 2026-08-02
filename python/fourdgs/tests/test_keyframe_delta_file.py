@@ -206,6 +206,12 @@ def test_a_multi_window_sequence_round_trips_each_gaussians_own_window():
     assert len(late["centers"]) == 2
     assert all(o > 0.0 for o in late["opacity"]), "and the ones that remain are visible"
 
+    # The canonical summary has to agree with what reconstruction returned: reporting the
+    # chunk's population here would claim gaussians are live that the same summary omits.
+    summary = kdf.states_json(seq)
+    at_two = next(st for st in summary["states"] if abs(float(st["t"]) - 2.0) < 1e-9)
+    assert at_two["liveCount"] == "2", "liveCount counts the rows that exist at t, not the chunk's"
+
     # And the decoder must give the two populations different velocity grids.
     grids = seq.grids
     sigma_bins = np.zeros(2, dtype=np.int64)

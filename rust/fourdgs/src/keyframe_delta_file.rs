@@ -1428,7 +1428,10 @@ pub fn keyframe_delta_states_json(seq: &DecodedSequence) -> String {
 
         states.push(Json::obj(vec![
             ("t", num(t)),
-            ("liveCount", int(info.state.count() as u64)),
+            // The count at this instant, from the rows reconstruction returned:
+            // `info.state.count()` is the chunk's population, which differs once a
+            // validity window has closed.
+            ("liveCount", int(r.ids.len() as u64)),
             (
                 "sample",
                 Json::obj(vec![
