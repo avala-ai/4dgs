@@ -197,7 +197,11 @@ fn quantize_sample(sample: &Sample, grids: &Grids) -> Result<(Vec<i64>, BTreeMap
         let never_fades = false;
         sigma.push(q_sigma);
         flags.push(0);
-        window_index.push(0);
+        window_index.push(window_index_of(
+            &grids.windows,
+            g.win_lo.get(i).copied().unwrap_or(0.0),
+            g.win_hi.get(i).copied().unwrap_or(0.0),
+        ));
 
         for axis in 0..3 {
             position.push(quantize_scalar(
@@ -279,9 +283,47 @@ fn grids_for(samples: &[Sample], duration_sec: f64, profile: Profile, cutoff: f6
     Grids {
         steps,
         origin,
-        windows: vec![(0.0, duration_sec)],
+        windows: windows_of(samples, duration_sec),
         cutoff,
     }
+}
+
+/// The distinct validity windows the population declares, in first-seen order.
+///
+/// A `GaussianSet` carries `win_lo`/`win_hi` per gaussian and the format lets a sequence
+/// declare several windows, so the writer reads them rather than forcing one. Emitting a
+/// single full-duration entry meant a Rust-written keyframe-delta file could not express
+/// the multi-window scene the readers now honour (issue #87).
+///
+/// Order is first-seen rather than sorted: `window_index` is written against this list, so
+/// a stable order is what makes the indices mean the same thing on both sides.
+fn windows_of(samples: &[Sample], duration_sec: f64) -> Vec<(f64, f64)> {
+    let mut out: Vec<(f64, f64)> = Vec::new();
+    for s in samples {
+        let g = &s.gaussians;
+        for i in 0..g.win_lo.len().min(g.win_hi.len()) {
+            let w = (g.win_lo[i] as f64, g.win_hi[i] as f64);
+            if !out
+                .iter()
+                .any(|e| e.0.to_bits() == w.0.to_bits() && e.1.to_bits() == w.1.to_bits())
+            {
+                out.push(w);
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push((0.0, duration_sec));
+    }
+    out
+}
+
+/// The row in the window table a gaussian's own window occupies.
+fn window_index_of(windows: &[(f64, f64)], lo: f32, hi: f32) -> i64 {
+    let w = (lo as f64, hi as f64);
+    windows
+        .iter()
+        .position(|e| e.0.to_bits() == w.0.to_bits() && e.1.to_bits() == w.1.to_bits())
+        .unwrap_or(0) as i64
 }
 
 fn median(values: &mut [f64]) -> Option<f64> {
