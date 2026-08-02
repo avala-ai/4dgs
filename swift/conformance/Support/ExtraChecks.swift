@@ -72,20 +72,25 @@ enum ExtraChecks {
         _ scene: SceneReader, at times: [Double], layerHasTrack: Bool
     ) throws {
         guard layerHasTrack else { return }
-        let resident = try scene.gaussians(at: times[0])
-        guard resident.objectIds.contains(where: { $0 != 0 }) else { return }
+        guard try scene.loadedGaussians(at: times[0]).objectIds.contains(where: { $0 != 0 })
+        else { return }
 
         var firstMember: Int?
         for t in times {
             let composed = try scene.stateAt(t)
-            let rest = try scene.gaussians(at: t)
-            guard composed.count > 0, rest.objectIds.count == rest.count else { continue }
+            // The resident working set, not the live-filtered one. `composed.indices` are
+            // indices into the arrays the core has resident, and `gaussians(at:)` returns
+            // those rows minus the ones §3 hides — so indexing it by a resident index
+            // reads a different gaussian as soon as anything earlier is not live, and the
+            // membership guard below would silently skip or mismatch the tracked row.
+            let resident = try scene.loadedGaussians(at: t)
+            guard composed.count > 0, resident.objectIds.count == resident.count else { continue }
 
             for i in 0..<composed.count {
                 let g = Int(composed.indices[i])
-                guard g < rest.count, rest.objectIds[g] != 0 else { continue }
+                guard g < resident.count, resident.objectIds[g] != 0 else { continue }
                 firstMember = firstMember ?? g
-                let byHand = rest[g].state(at: t).position
+                let byHand = resident[g].state(at: t).position
                 let dx = Double(composed.centers[i * 3] - byHand.x)
                 let dy = Double(composed.centers[i * 3 + 1] - byHand.y)
                 let dz = Double(composed.centers[i * 3 + 2] - byHand.z)
