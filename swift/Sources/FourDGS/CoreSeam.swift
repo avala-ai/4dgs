@@ -336,7 +336,8 @@ enum Core {
             winLo: floats(fourdgs_scene_win_lo(scene.raw), 1),
             winHi: floats(fourdgs_scene_win_hi(scene.raw), 1),
             shDegree: Int(fourdgs_scene_sh_degree(scene.raw)),
-            sh: sh)
+            sh: sh,
+            objectIds: objectIds(scene, count: count))
     }
 
     // MARK: - The records that are not gaussians
@@ -645,6 +646,51 @@ enum Core {
         var out: UnsafePointer<CChar>?
         var length = 0
         let status = fourdgs_scene_provenance_json(scene.raw, &out, &length)
+        guard status == ok else { throw error(status) }
+        let result = string(out, length)
+        fourdgs_string_free(out, length)
+        return result
+    }
+
+    // MARK: - Object layer
+
+    /// The `objects` member of the canonical summary (spec §5.15.6-§5.15.7): the Object
+    /// Table's entries and the SE(3) tracks with their sampled poses. Empty when the file
+    /// carries neither object records nor per-gaussian membership — omit the key rather
+    /// than emit null. The core composes base-then-track and samples each pose, so this
+    /// binding reports the arithmetic instead of repeating it.
+    static func objectsJson(_ scene: SceneHandle) throws -> String {
+        try ownedString { out, length in
+            fourdgs_scene_objects_json(scene.raw, &out, &length)
+        }
+    }
+
+    /// The `states` member: composed centres, orientations and membership at each probe.
+    ///
+    /// Two calls rather than one document because these are two root keys of the summary.
+    static func objectStatesJson(_ scene: SceneHandle) throws -> String {
+        try ownedString { out, length in
+            fourdgs_scene_object_states_json(scene.raw, &out, &length)
+        }
+    }
+
+    /// Object membership per resident gaussian (spec §6.6), or empty when the scene
+    /// carries no `object_id` stream.
+    ///
+    /// Empty and all-zero are different claims and both are legal: a file with no
+    /// membership at all, and a file where every gaussian is background.
+    static func objectIds(_ scene: SceneHandle, count: Int) -> [UInt32] {
+        guard count > 0, let base = fourdgs_scene_object_ids(scene.raw) else { return [] }
+        return Array(UnsafeBufferPointer(start: base, count: count))
+    }
+
+    /// Shared shape for the core's owned-string accessors.
+    private static func ownedString(
+        _ call: (inout UnsafePointer<CChar>?, inout Int) -> Int32
+    ) throws -> String {
+        var out: UnsafePointer<CChar>?
+        var length = 0
+        let status = call(&out, &length)
         guard status == ok else { throw error(status) }
         let result = string(out, length)
         fourdgs_string_free(out, length)

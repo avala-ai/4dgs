@@ -23,7 +23,9 @@ public enum Summary {
         gaussians: GaussianState,
         chunkIntervals: [(Double, Double)],
         summaryChecksumVerified: Bool?,
-        provenanceJson: String = ""
+        provenanceJson: String = "",
+        objectsJson: String = "",
+        objectStatesJson: String = ""
     ) -> JSON {
         let order = stableOrder(gaussians)
         let sampled = Array(order.prefix(sample))
@@ -48,6 +50,25 @@ public enum Summary {
         }
         func column(_ array: [Float]) -> JSON {
             .array(sampled.map { JSON.number(array[$0]) })
+        }
+
+        var sampleFields: [String: JSON] = [
+            "positions": rows(gaussians.positions, 3),
+            "scales": rows(gaussians.scales, 3),
+            "rotations": rows(gaussians.rotations, 4),
+            "colors": rows(gaussians.colors, 4),
+            "motions": rows(gaussians.motions, 3),
+            "muT": column(gaussians.muT),
+            "sigmaT": column(gaussians.sigmaT),
+            "winLo": column(gaussians.winLo),
+            "winHi": column(gaussians.winHi),
+        ]
+        // Membership is an exact label, so it is rendered as an integer string like the
+        // counts are, never as a float. The key is absent when the scene carries no
+        // `object_id` stream — a different file from one where every gaussian is
+        // background, which would carry the key with every entry "0".
+        if !gaussians.objectIds.isEmpty {
+            sampleFields["objectIds"] = .array(sampled.map { .string(String(gaussians.objectIds[$0])) })
         }
 
         var fields: [String: JSON] = [
@@ -89,17 +110,7 @@ public enum Summary {
                 }),
             "summaryCrcOk": summaryChecksumVerified.map { JSON.bool($0) } ?? .null,
             "sh": sphericalHarmonics(gaussians, order),
-            "sample": .object([
-                "positions": rows(gaussians.positions, 3),
-                "scales": rows(gaussians.scales, 3),
-                "rotations": rows(gaussians.rotations, 4),
-                "colors": rows(gaussians.colors, 4),
-                "motions": rows(gaussians.motions, 3),
-                "muT": column(gaussians.muT),
-                "sigmaT": column(gaussians.sigmaT),
-                "winLo": column(gaussians.winLo),
-                "winHi": column(gaussians.winHi),
-            ]),
+            "sample": .object(sampleFields),
             "aggregate": .object([
                 "positionSum": .array(positionSum.map { JSON.number($0) }),
                 "opacitySum": .number(opacitySum),
@@ -112,6 +123,14 @@ public enum Summary {
         // convention. A file without provenance is a file the record family does not apply to.
         if !provenanceJson.isEmpty {
             fields["provenance"] = .raw(provenanceJson)
+        }
+        // Same rule for the object layer, and the two members are independent: a file can
+        // carry membership with no Object Table, or a table whose objects hold no gaussians.
+        if !objectsJson.isEmpty {
+            fields["objects"] = .raw(objectsJson)
+        }
+        if !objectStatesJson.isEmpty {
+            fields["states"] = .raw(objectStatesJson)
         }
 
         return .object(fields)
@@ -237,6 +256,14 @@ public enum Summary {
             row.append(sortable(g.winHi[i]))
             if shWidth > 0 {
                 for k in 0..<shWidth { row.append(Double(g.sh[i * shWidth + k])) }
+            }
+            // Membership last, exactly as canonical.py orders it. It matters where the
+            // harmonics do not: two gaussians alike in every attribute but belonging to
+            // different objects tie on everything above, and `sample.objectIds` is a value
+            // this summary emits — so leaving membership out would let decode order pick
+            // which of ["0", "7"] and ["7", "0"] this file reports.
+            if !g.objectIds.isEmpty {
+                row.append(Double(g.objectIds[i]))
             }
             keys.append((row, i))
         }

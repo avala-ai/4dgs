@@ -10,12 +10,12 @@ declarations. Nothing is marked `Yes` on the strength of code existing.
 Every row is filled in from a suite that runs: 46 valid variants and 7 invalid ones, plus 4
 keyframe-delta and 3 object-layer variants in their own subdirectories, over two read paths
 (streamed and indexed). A language takes the variants it declares support for, and what it declines
-is what this table records — 119 checks passing for Python, 105 each for Rust, TypeScript, Dart and
-C++, and 97 for Swift (provenance reported, object layer declined). Rust declines the refusal
-expectations. C++ and Swift read 4DGS through the Rust C ABI: the additive states-JSON accessor
-computes keyframe-delta summaries in the core, the provenance-JSON accessor does the same for the
-provenance family, and the objects-JSON pair does it for the object layer, so every binding emits
-identical bytes with no per-language slerp or composition order of its own.
+is what this table records — 119 checks passing for Python and 105 each for Rust, TypeScript, Dart,
+C++ and Swift. Rust declines the refusal expectations; the five non-Python SDKs decline the same
+Python-only variants and nothing else. C++ and Swift read 4DGS through the Rust C ABI: the additive
+states-JSON accessor computes keyframe-delta summaries in the core, the provenance-JSON accessor
+does the same for the provenance family, and the objects-JSON pair does it for the object layer, so
+every binding emits identical bytes with no per-language slerp or composition order of its own.
 
 | Feature                                           | Python | TypeScript | Rust    | C++     | Swift   | Dart    |
 | ------------------------------------------------- | ------ | ---------- | ------- | ------- | ------- | ------- |
@@ -44,9 +44,9 @@ identical bytes with no per-language slerp or composition order of its own.
 | Provenance: coordinate frame + georeference       | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Provenance: sensor calibration                    | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Provenance: rig trajectory + pose interpolation   | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Object membership (`object_id`)                   | Yes    | Yes        | Yes     | Yes     | No      | Yes     |
-| Object Table: labels, anchors, embeddings         | Yes    | Yes        | Yes     | Yes     | No      | Yes     |
-| Object Track: rigid state composition¹            | Yes    | Yes        | Yes     | Yes     | No      | Yes     |
+| Object membership (`object_id`)                   | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Object Table: labels, anchors, embeddings         | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Object Track: rigid state composition¹            | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Temporal model `keyframe-delta`, decode           | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Delta composition, chained                        | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Delta composition, keyframe-referenced            | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
@@ -126,12 +126,12 @@ rotations must compose as a quaternion product rather than one replacing the oth
 is not a workaround the way the keyframe-delta one is — an object record is additive to the
 gaussian-birth model, and the one `WithObjects` variant at the top level is read by the Kaitai
 grammar and the fuzzer, which is where the records' framing and length-skipping are proved — it just
-keeps the decode-and-compose family gathered where the harness reaches for it. Python, Rust,
-TypeScript and Dart emit those states from both read paths, and C++ does too — through the C ABI,
-which returns the `objects` and `states` members as two accessors over one computation and the
-per-gaussian memberships as a borrowed `uint32` array. A null array and an all-zero one are
-different claims and both are legal: a file that never assigns membership, and a file where every
-gaussian belongs to object 0. Swift still skips the optional records and reports `No`.
+keeps the decode-and-compose family gathered where the harness reaches for it. Every SDK now emits
+those states from both read paths — Python, Rust, TypeScript and Dart natively; C++ and Swift
+through the C ABI, which returns the `objects` and `states` members as two accessors over one
+computation and the per-gaussian memberships as a borrowed `uint32` array. A null array and an
+all-zero one are different claims and both are legal: a file that never assigns membership, and a
+file where every gaussian belongs to object 0.
 
 **The `keyframe-delta` temporal model** (spec §11) is proved by four corpus variants that live in
 their own `data/keyframe/` subdirectory, the way the invalid corpus does — every whole-corpus

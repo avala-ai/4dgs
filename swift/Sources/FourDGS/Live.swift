@@ -43,6 +43,7 @@ extension GaussianState {
         var winLo = [Float]()
         var winHi = [Float]()
         var sh = [UInt8]()
+        var objectIds = [UInt32]()
         positions.reserveCapacity(n * 3)
         scales.reserveCapacity(n * 3)
         rotations.reserveCapacity(n * 4)
@@ -53,6 +54,7 @@ extension GaussianState {
         winLo.reserveCapacity(n)
         winHi.reserveCapacity(n)
         sh.reserveCapacity(n * shWidth)
+        objectIds.reserveCapacity(self.objectIds.isEmpty ? 0 : n)
 
         for i in indices {
             positions.append(contentsOf: self.positions[i * 3..<(i * 3 + 3)])
@@ -67,11 +69,41 @@ extension GaussianState {
             if shWidth > 0 {
                 sh.append(contentsOf: self.sh[i * shWidth..<(i * shWidth + shWidth)])
             }
+            // Subset rather than carry the full array: membership is per gaussian, so a
+            // filtered state whose ids still index the unfiltered rows would mislabel
+            // every gaussian after the first one dropped.
+            if !self.objectIds.isEmpty {
+                objectIds.append(self.objectIds[i])
+            }
         }
         return GaussianState(
             count: n, positions: positions, scales: scales, rotations: rotations, colors: colors,
-            motions: motions, muT: muT, sigmaT: sigmaT, winLo: winLo, winHi: winHi, shDegree: shDegree, sh: sh
+            motions: motions, muT: muT, sigmaT: sigmaT, winLo: winLo, winHi: winHi, shDegree: shDegree,
+            sh: sh,
+            objectIds: objectIds
         )
+    }
+
+    /// Membership across parts, padded so it stays as long as the gaussians it labels.
+    ///
+    /// A chunk may omit the `object_id` stream while another carries it — §6.6 makes the
+    /// stream optional per chunk, and the core reads an omitted one as background for that
+    /// chunk alone. Concatenating with a plain `flatMap` would drop those rows instead of
+    /// standing in for them, leaving a non-empty array shorter than `count`: every row
+    /// after the gap mislabelled, and an index past the end for the last of them. `0` is
+    /// background, so padding says exactly what the absent stream meant.
+    private static func joinedMembership(_ parts: [GaussianState]) -> [UInt32] {
+        guard parts.contains(where: { !$0.objectIds.isEmpty }) else { return [] }
+        var joined = [UInt32]()
+        joined.reserveCapacity(parts.reduce(0) { $0 + $1.count })
+        for part in parts {
+            if part.objectIds.isEmpty {
+                joined.append(contentsOf: repeatElement(0, count: part.count))
+            } else {
+                joined.append(contentsOf: part.objectIds)
+            }
+        }
+        return joined
     }
 
     /// Concatenate states that agree on spherical-harmonic degree — which every state from
@@ -90,6 +122,7 @@ extension GaussianState {
             winLo: parts.flatMap(\.winLo),
             winHi: parts.flatMap(\.winHi),
             shDegree: first.shDegree,
-            sh: parts.flatMap(\.sh))
+            sh: parts.flatMap(\.sh),
+            objectIds: joinedMembership(parts))
     }
 }

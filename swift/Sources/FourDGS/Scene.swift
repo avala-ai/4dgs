@@ -223,6 +223,20 @@ public final class SceneReader {
         try Core.provenanceJson(handle)
     }
 
+    /// The `objects` member of the canonical summary (spec §5.15.6-§5.15.7), or empty when
+    /// the file carries neither object records nor per-gaussian membership.
+    ///
+    /// Computed by the core, like `provenanceJson`, so this binding and the C++ one cannot
+    /// drift from Rust on composition order or pose interpolation.
+    public func objectsJson() throws -> String {
+        try Core.objectsJson(handle)
+    }
+
+    /// The `states` member: composed centres, orientations and membership at each probe.
+    public func objectStatesJson() throws -> String {
+        try Core.objectStatesJson(handle)
+    }
+
     /// Read a bounded range of one source's encoded payload.
     public func audioSourceData(
         _ index: Int, offset: UInt64 = 0, length: UInt64
