@@ -359,12 +359,13 @@ def test_a_state_without_window_index_is_refused_not_a_keyerror():
     )
 
     class _State:
-        ids = np.array([0])
-        bins = {
-            op.A_POSITION: np.zeros((1, 3), dtype=np.int64),
-            op.A_SIGMA_T: np.zeros((1, 1), dtype=np.int64),
-            op.A_FLAGS: np.zeros((1, 1), dtype=np.int64),
-        }
+        def __init__(self):
+            self.ids = np.array([0])
+            self.bins = {
+                op.A_POSITION: np.zeros((1, 3), dtype=np.int64),
+                op.A_SIGMA_T: np.zeros((1, 1), dtype=np.int64),
+                op.A_FLAGS: np.zeros((1, 1), dtype=np.int64),
+            }
 
         def count(self):
             return 1
