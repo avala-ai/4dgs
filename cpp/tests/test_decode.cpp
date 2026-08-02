@@ -180,15 +180,19 @@ void reconstructionAgreesWithTheCore(Scene& scene) {
         CHECK(mine.visible);
         break;
       }
+      // An Object Track moves and turns a gaussian; it does not fade one. So membership
+      // excuses the position comparison and nothing else — skipping the opacity check too
+      // would quietly stop proving §3's fade on exactly the rows this variant added.
       const bool composed = !resident.objectIds.empty() && resident.objectIds[g] != 0;
-      if (composed) continue;
-      // Float32 inputs widened to double on both sides, so the tolerance covers the
-      // arithmetic and not a difference of opinion about the formula.
-      for (std::size_t k = 0; k < 3; ++k) {
-        const double theirs = static_cast<double>(state->centers()[i * 3 + k]);
-        if (std::fabs(theirs - mine.center[k]) > 1e-4) {
-          CHECK(std::fabs(theirs - mine.center[k]) <= 1e-4);
-          break;
+      if (!composed) {
+        // Float32 inputs widened to double on both sides, so the tolerance covers the
+        // arithmetic and not a difference of opinion about the formula.
+        for (std::size_t k = 0; k < 3; ++k) {
+          const double theirs = static_cast<double>(state->centers()[i * 3 + k]);
+          if (std::fabs(theirs - mine.center[k]) > 1e-4) {
+            CHECK(std::fabs(theirs - mine.center[k]) <= 1e-4);
+            break;
+          }
         }
       }
       const double theirOpacity = static_cast<double>(state->opacity()[i]);

@@ -184,8 +184,11 @@ class Scene {
   /// cannot drift from Rust on the composition order or the pose interpolation behind it.
   ///
   /// **This call loads.** The summary describes every gaussian, so it decodes the whole
-  /// population and invalidates any `GaussianView` taken earlier — including its
-  /// `objectIds` span — exactly as `loadAll` does. Unlike `provenanceJson`, which reads
+  /// population — at the file's full SH degree, because the canonical order keys the
+  /// harmonics before `object_id` and a lower degree would sort a legal file differently
+  /// from the reference. Any band cap is put back before this returns; the working set is
+  /// not, so any `GaussianView` taken earlier — including its `objectIds` span — is
+  /// invalidated exactly as `loadAll` invalidates it. Unlike `provenanceJson`, which reads
   /// records and leaves the working set alone. Take the view after calling this, not
   /// before: on a scene already loaded whole the load is a no-op and the mistake is
   /// invisible, which is the only reason it would reach a caller who seeks.
