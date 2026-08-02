@@ -213,6 +213,101 @@ fn object_file_with_harmonics() -> Vec<u8> {
     out
 }
 
+/// A file whose two Object Tracks are written highest id first, on either read path.
+///
+/// Legal and deliberately awkward: nothing in §5.15.7 orders the records, so a writer may
+/// emit track 7 before track 3. The indexed reader keys its ranges by id to refuse
+/// duplicates, and iterating that map would hand the layer back sorted — a different
+/// `objects.tracks` array than the streamed reader and `canonical.py` produce from the
+/// same bytes.
+fn object_file_with_tracks_out_of_id_order(indexed: bool) -> Vec<u8> {
+    let mut out = MAGIC.to_vec();
+    out.extend(
+        Header {
+            duration_sec: 1.0,
+            gaussian_count: 2,
+            aabb: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            cutoff: 0.05,
+            temporal_model: "gaussian-birth".into(),
+            ..Default::default()
+        }
+        .encode(&[]),
+    );
+    out.extend(quantization().encode(&[]));
+    out.extend(
+        WindowTable {
+            windows: vec![(0.0, 1.0)],
+        }
+        .encode(),
+    );
+    out.extend(
+        ObjectTable {
+            embedding_dim: 0,
+            entries: vec![
+                ObjectTableEntry {
+                    object_id: 3,
+                    label: "second".into(),
+                    ..Default::default()
+                },
+                ObjectTableEntry {
+                    object_id: 7,
+                    label: "first".into(),
+                    ..Default::default()
+                },
+            ],
+        }
+        .encode(b"")
+        .unwrap(),
+    );
+    // 7 before 3: the order under test.
+    for (object_id, x) in [(7u32, 10.0f64), (3, 5.0)] {
+        out.extend(
+            ObjectTrack {
+                object_id,
+                interpolation: TRAJECTORY_LINEAR,
+                times: vec![0.0, 1.0],
+                rotations: vec![Q_ID, Q_ID],
+                translations: vec![[x, 0.0, 0.0], [x, 0.0, 0.0]],
+            }
+            .encode(b"")
+            .unwrap(),
+        );
+    }
+
+    let chunk_at = out.len() as u64;
+    let chunk = fourdgs::records::encode_chunk(0.0, 1.0, 0, 2, &streams_with_object_id(&[7, 3], 1));
+    out.extend(&chunk);
+
+    let summary_start = if indexed {
+        let start = out.len() as u64;
+        out.extend(
+            ChunkIndexEntry {
+                t0: 0.0,
+                t1: 1.0,
+                chunk_offset: chunk_at,
+                chunk_length: chunk.len() as u64,
+                gaussian_count: 2,
+                bands: Vec::new(),
+                ..Default::default()
+            }
+            .encode(),
+        );
+        start
+    } else {
+        0
+    };
+    out.extend(
+        Footer {
+            summary_start,
+            summary_offset_start: 0,
+            summary_crc: 0,
+        }
+        .encode(),
+    );
+    out.extend(MAGIC);
+    out
+}
+
 fn object_file(indexed: bool, duplicate_table: bool) -> Vec<u8> {
     object_file_with_track(
         indexed,
@@ -1307,4 +1402,39 @@ fn objects_json_does_not_depend_on_the_resident_band() {
         assert_eq!(capped_coefficients, 0);
         assert_eq!(full_coefficients, 3);
     }
+}
+
+/// Both read paths report the tracks in the order the file wrote them.
+///
+/// The indexed reader keys its ranges by object id, which is right for refusing a
+/// duplicate and wrong for rendering: iterating that map emits the layer sorted by id
+/// while the streamed reader and `canonical.py` emit it in record order. For a file that
+/// writes track 7 before track 3 the two paths would summarize the same bytes differently,
+/// and a canonical form that depends on which reader produced it is not canonical.
+#[test]
+fn tracks_are_summarized_in_file_order_on_both_paths() {
+    let mut summaries = Vec::new();
+    for mode in [OpenMode::Sequential, OpenMode::Indexed] {
+        let bytes = object_file_with_tracks_out_of_id_order(mode == OpenMode::Indexed);
+        let mut reader =
+            SceneReader::open_with(BytesReadable::new(&bytes), mode).expect("open object file");
+        let layer = reader.objects().expect("object layer");
+        assert_eq!(
+            layer.tracks.iter().map(|t| t.object_id).collect::<Vec<_>>(),
+            vec![7, 3],
+            "tracks came back in id order rather than file order ({mode:?})"
+        );
+
+        let header = reader.header().clone();
+        let gaussians = reader.load_all(0).expect("load").clone();
+        summaries.push(
+            fourdgs::object_layer::canonical_parts(&header, &gaussians, &layer)
+                .expect("canonical parts")
+                .objects,
+        );
+    }
+    assert_eq!(
+        summaries[0], summaries[1],
+        "the two read paths summarized the same layer differently"
+    );
 }
