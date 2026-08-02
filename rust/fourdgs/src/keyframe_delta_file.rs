@@ -123,12 +123,21 @@ impl Grids {
     /// reconstruction asks, an out-of-range index cannot have survived. Falling back to
     /// the first window keeps this total rather than panicking on a bound already proved.
     fn window_len(&self, index: i64) -> f64 {
-        let w = usize::try_from(index)
+        let w = self.window_at(index);
+        w.1 - w.0
+    }
+
+    /// The window `index` names, defaulting an absent table to one `(0, 0)` entry.
+    ///
+    /// Total on purpose: every index is checked against the table when the state is
+    /// built — `check_window_indices`, on both read paths — so an out-of-range index
+    /// cannot reach reconstruction, and this cannot panic on a bound already proved.
+    fn window_at(&self, index: i64) -> (f64, f64) {
+        usize::try_from(index)
             .ok()
             .and_then(|i| self.windows.get(i))
             .copied()
-            .unwrap_or_else(|| self.window());
-        w.1 - w.0
+            .unwrap_or_else(|| self.window())
     }
 
     fn motion_step_for(&self, sigma_bin: i64, never_fades: bool, window_index: i64) -> f64 {
@@ -1175,11 +1184,7 @@ pub fn reconstruct_at(seq: &DecodedSequence, state: &State, t: f64) -> Reconstru
         // made transparent, so id, centre, scale and the live count all exclude it.
         // Unobservable while every keyframe-delta file carried one full-duration window;
         // reachable the moment a file declares more than one.
-        let (lo, hi) = grids
-            .windows
-            .get(usize::try_from(window.values[i]).unwrap_or(0))
-            .copied()
-            .unwrap_or_else(|| grids.window());
+        let (lo, hi) = grids.window_at(window.values[i]);
         if !(lo <= t && t < hi) {
             continue;
         }

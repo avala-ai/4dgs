@@ -783,6 +783,23 @@ class _Grids {
   /// The length of the window [index] names, refusing one the table cannot
   /// answer rather than clamping: clamping substitutes one gaussian's lifetime
   /// for another's in a file that is already wrong.
+  /// The window [index] names, refusing one the table cannot answer.
+  FourdgsWindow windowAt(int index) {
+    // An absent or empty table is one default (0, 0) window, matching the chunk
+    // decoder. Clamping instead would substitute one gaussian's lifetime for
+    // another's in a file that is already wrong.
+    final table =
+        windows.isEmpty
+            ? const <FourdgsWindow>[FourdgsWindow(0.0, 0.0)]
+            : windows;
+    if (index < 0 || index >= table.length) {
+      throw FourdgsMalformedFile(
+        'window index $index is outside the ${table.length}-entry window table',
+      );
+    }
+    return table[index];
+  }
+
   double windowLengthAt(int index) {
     // An absent or empty Window Table is one default (0, 0) window, not an
     // unbounded fallback — the same defaulting the chunk decoder applies. A
@@ -874,10 +891,9 @@ _Reconstruction _reconstructAt(
   // window; reachable the moment a file declares more than one.
   final kept = <int>[];
   for (final i in order) {
-    final w =
-        grids.windows.isEmpty
-            ? const FourdgsWindow(0.0, 0.0)
-            : grids.windows[windowIndex[i].clamp(0, grids.windows.length - 1)];
+    // Validated, not clamped: a row dropped for being outside a window it never
+    // named would make a malformed file look like a valid, emptier one.
+    final w = grids.windowAt(windowIndex[i]);
     if (w.lo <= t && t < w.hi) kept.add(i);
   }
 
