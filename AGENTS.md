@@ -85,8 +85,10 @@ The mechanics that matter here:
 - **Merge order is bottom-up.** GitHub enforces it, and it is also the order the work depends in:
   the corpus and the harness change once, at the bottom, and each language above it proves itself
   against that same corpus.
-- **Retargeting is automatic.** When the bottom PR merges, the ones above it re-target the base
-  branch on their own. Do not hand-edit base branches to chase a merge.
+- **Retargeting is _not_ reliably automatic**, and you cannot fix it from the CLI. When the bottom
+  PR merges, the one above it is supposed to re-target onto `main` by itself. It may not — see "When
+  the retarget does not happen" below, which is a recovery procedure written from a real incident
+  rather than from the documentation.
 - **Branch protection and CI apply to every PR in the stack**, so a red check on layer three is not
   excused by a green one on layer one.
 - **All branches must live in this repository.** Cross-fork stacks are not supported, which means a
@@ -167,6 +169,60 @@ commits of its own, and force-pushing that empties the PR — GitHub closes it a
 git log --oneline origin/main..HEAD | wc -l              # bottom layer, now based on main
 git log --oneline feat/parity-objects-ts..HEAD | wc -l   # a layer above, from its parent
 ```
+
+**When the retarget does not happen.** Observed on 2026-08-02, with #92/#93/#94: the bottom PR
+merged and the next one kept pointing at the merged branch. Everything you would reach for first
+makes it worse, so the order below matters.
+
+The symptom is a diff that suddenly grows. The child PR's base branch still points at the layer's
+pre-squash commits while its head has been rebased onto `main`, so GitHub diffs across the squash
+and shows the layer below as part of this PR — #93 jumped from 14 files to 22 without a single
+source change.
+
+What does **not** work, both confirmed the hard way:
+
+```sh
+# 1. Retargeting through the API or the CLI. Refused for any PR that is part of a stack —
+#    top or bottom, and still refused after the layer below has merged.
+gh pr edit 93 --base main
+gh api -X PATCH repos/OWNER/REPO/pulls/93 -f base=main
+#    422 Validation Failed — "Cannot change the base branch because the pull request is
+#    part of a stack."
+
+# 2. Deleting the merged base branch to force a retarget. GitHub CLOSES the child PR.
+gh api -X DELETE repos/OWNER/REPO/git/refs/heads/feat/objects-rust-abi
+#    #93 went to CLOSED, base unchanged, diff still wrong.
+```
+
+Recovery, in order:
+
+```sh
+# Keep a rescue ref BEFORE touching any branch — deleting a ref you cannot name again is
+# the one mistake here with no cheap undo.
+git branch -f rescue/objects-rust-abi 9d3756477a
+
+# If a PR was closed by a branch deletion: recreate the ref, then reopen. Both survive.
+gh api -X POST repos/OWNER/REPO/git/refs -f ref=refs/heads/feat/objects-rust-abi -f sha=9d37564...
+gh pr reopen 93
+
+# Point the stale base branch at main so the diff is readable again while you decide.
+gh api -X PATCH repos/OWNER/REPO/git/refs/heads/feat/objects-rust-abi \
+  -f sha=$(git rev-parse origin/main) -F force=true
+```
+
+Then pick one, because the base ref must end up as `main` before the PR can merge there:
+
+- **In the web UI: unstack the PR, then change its base.** The UI permits what the API refuses. This
+  is the cheapest route and it keeps the PR number and its whole review history.
+- **Or replace the PR**: close it, and open a new one from the same (already rebased) head branch
+  with `--base main`. Guaranteed to work, and what to do when nobody can reach the UI — at the cost
+  of a new number, with the review thread left behind on the closed PR. Link the two in both
+  directions so the history is followable.
+
+Note that `gh` has no built-in `stack` command — 2.63 does not, at least. The `gh stack …` lines
+GitHub shows in the "resolve conflicts" box come from the extension above, and if it is not
+installed those instructions are dead ends. Check with `gh stack --help` before quoting them to
+anyone.
 
 **What does not belong in a stack.** A stack is for changes that genuinely depend on each other. Two
 unrelated fixes stacked together inherit each other's review latency and each other's red CI for no
