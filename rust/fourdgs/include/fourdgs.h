@@ -918,13 +918,17 @@ int fourdgs_scene_provenance_json(fourdgs_scene *scene, const char **out, size_t
  * two-out-parameter sequencing rule at the top of this header applies.
  *
  * THIS CALL LOADS. The summary describes every gaussian, so it decodes the whole
- * population — at whatever SH band the caller already had resident, and it leaves that
- * band alone, but not the working set. Treat it exactly like fourdgs_scene_load_all: every
+ * population, and at the file's full SH degree rather than the caller's cap — the
+ * canonical order keys the harmonics before `object_id`, so summarizing at a lower degree
+ * would sort a legal file differently from the reference. The cap is restored before this
+ * returns, so a caller that capped for memory keeps it, at the cost of a second decode.
+ *
+ * The working set is not restored. Treat this exactly like fourdgs_scene_load_all: every
  * pointer previously handed out by fourdgs_scene_positions and its siblings, including
- * fourdgs_scene_object_ids, is invalidated by it. A caller that had seeked to an instant
- * holds the whole scene afterwards. Call it before taking the pointers, not between taking
- * them and reading them — which is the mistake this paragraph exists to prevent, and it is
- * silent on a scene already loaded whole, because then the load is a no-op.
+ * fourdgs_scene_object_ids, is invalidated by it, and a caller that had seeked to an
+ * instant holds the whole scene afterwards. Call it before taking the pointers, not
+ * between taking them and reading them — the mistake this paragraph exists to prevent, and
+ * a silent one on a scene already loaded whole, because then the load is a no-op.
  *
  * The companion `states` member comes from fourdgs_scene_object_states_json. They are two
  * calls because they are two root keys of the summary, sitting beside `sample` and

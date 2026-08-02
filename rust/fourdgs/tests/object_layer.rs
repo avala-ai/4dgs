@@ -130,11 +130,18 @@ fn object_file_with_harmonics() -> Vec<u8> {
     out.extend(
         ObjectTable {
             embedding_dim: 0,
-            entries: vec![ObjectTableEntry {
-                object_id: 7,
-                label: "tracked".into(),
-                ..Default::default()
-            }],
+            entries: vec![
+                ObjectTableEntry {
+                    object_id: 3,
+                    label: "untracked".into(),
+                    ..Default::default()
+                },
+                ObjectTableEntry {
+                    object_id: 7,
+                    label: "tracked".into(),
+                    ..Default::default()
+                },
+            ],
         }
         .encode(b"")
         .unwrap(),
@@ -157,14 +164,17 @@ fn object_file_with_harmonics() -> Vec<u8> {
         1.0,
         0,
         COUNT as u32,
-        &streams_with_object_id(&[7, 7], 1),
+        &streams_with_object_id(&[7, 3], 1),
     );
     out.extend(&chunk);
 
-    // Row 0 gets the larger coefficients, so sorting with the harmonics in the key puts
-    // row 1 first and sorting without them leaves row 0 first.
+    // The harmonics and the membership disagree about the order, which is the whole point.
+    // Row 0 is object 7 with the smaller coefficients; row 1 is object 3 with the larger.
+    // The key puts the harmonics before `object_id`, so with them resident row 0 sorts
+    // first and without them row 1 does — and the two rows differ in a value the summary
+    // emits, so the flip is visible.
     let values: Vec<i64> = (0..COUNT)
-        .flat_map(|i| (0..ROW).map(move |_| if i == 0 { 200 } else { 100 }))
+        .flat_map(|i| (0..ROW).map(move |_| if i == 0 { 100 } else { 200 }))
         .collect();
     let mut payload = vec![1u8];
     payload
@@ -1228,18 +1238,23 @@ fn the_composed_state_path_applies_tracks_the_base_path_leaves_alone() {
 /// The canonical object JSON is the same whatever the caller left resident, and the
 /// caller's band cap survives the call.
 ///
-/// Worth pinning because the first half is not obvious. `canonical_parts` samples in
-/// `stable_order`, whose key ends with the SH coefficients — so a band-capped scene sorts
-/// on a shorter key and really does break ties differently. This file is built to make
-/// that happen: two gaussians identical in every attribute, differing only in their
-/// harmonics. The output is nevertheless identical, because rows that tie on the key up to
-/// the harmonics are by construction identical in everything `objects` and `states` emit.
-/// That is the invariant `canonical.py` states about its own ordering, and this is where a
-/// change that broke it — a new per-gaussian field emitted but not keyed — would show up
-/// as a Rust failure rather than as cross-language conformance drift.
+/// `stable_order` places the SH coefficients *before* `object_id`, and this file is built
+/// to make that matter: two gaussians tied on every base attribute, differing in both
+/// their harmonics and their membership, arranged so the two keys disagree. With the
+/// harmonics resident row 0 sorts first; without them the ids decide and row 1 does. The
+/// ids are emitted, so the flip is visible — `objectIds` reads ["7", "3"] one way and
+/// ["3", "7"] the other, with the composed positions and orientations following.
 ///
-/// The second half is the accessor's promise not to be observable: it loads every gaussian
-/// to summarize them, at whatever band the caller already had, and leaves that band alone.
+/// The near-miss worth recording: it is tempting to argue that rows tying up to the
+/// harmonics are identical in everything these members emit, so the order cannot matter.
+/// That holds only while the ids are equal, because the ids are keyed *after* the
+/// harmonics. Summarizing at the caller's cap would therefore make canonical output depend
+/// on call history, and C++ and Swift would fail conformance on a file they decoded
+/// perfectly.
+///
+/// The second assertion is the accessor's other half: it summarizes at the file's full
+/// degree and puts the caller's cap back, so asking for a summary does not silently spend
+/// the memory a band cap was bought with.
 #[test]
 fn objects_json_does_not_depend_on_the_resident_band() {
     unsafe fn canonical(bytes: &[u8], cap: u8, want_states: bool) -> (String, u8) {

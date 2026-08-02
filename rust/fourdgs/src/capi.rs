@@ -2364,16 +2364,36 @@ unsafe fn object_canonical_member(
             Ok(layer) => layer,
             Err(e) => return report(e),
         };
-        // The whole population, not whatever an earlier seek left resident: the summary
-        // reports every gaussian's composed state, and a partial load would silently
-        // report a partial scene. The caller's band is preserved — loading at band 0
-        // would drop harmonics it had already paid for, and this accessor must not be
-        // observable in what the caller reads next.
+        // The whole population at the file's full SH degree, whatever the caller left
+        // resident. Two reasons, and the second is the one that is easy to argue away:
+        //
+        // 1. The summary reports every gaussian's composed state, so a partial load would
+        //    silently report a partial scene.
+        // 2. `stable_order` places the SH coefficients *before* `object_id`. Two gaussians
+        //    tied on every base attribute but differing in both their harmonics and their
+        //    membership sort by the harmonics when those are resident and by the id when
+        //    they are not — and membership is a value these members emit, so the flip is
+        //    visible. Summarizing at the caller's cap would make canonical output depend
+        //    on call history, which is the one thing a canonical form may not do.
+        //
+        // It is tempting to stop at "rows that tie up to the harmonics are identical in
+        // everything emitted". That is false exactly when the ids differ, because the ids
+        // are keyed after the harmonics rather than before them.
+        //
+        // The caller's cap is restored afterwards: a consumer that capped bands to save
+        // memory should not find the full set resident because it asked for a summary.
+        // That costs a second decode, and only for a caller who capped.
         let band = scene.inner.loaded_band();
-        if let Err(e) = scene.inner.load_all(band) {
+        let full = header.sh_degree;
+        if let Err(e) = scene.inner.load_all(full) {
             return report(e);
         }
         let gaussians = scene.inner.loaded().clone();
+        if band < full {
+            if let Err(e) = scene.inner.load_all(band) {
+                return report(e);
+            }
+        }
         match crate::object_layer::canonical_parts(&header, &gaussians, &layer) {
             Ok(parts) => put_owned_string(
                 if want_states {
