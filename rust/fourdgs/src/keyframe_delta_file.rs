@@ -101,13 +101,38 @@ fn is_keyframe(index: usize, kd: &KeyframeDeltaOptions) -> bool {
 pub struct Grids {
     pub steps: Steps,
     pub origin: [f64; 3],
-    pub window: (f64, f64),
+    /// Every validity window the sequence declares, in Window Table order. A gaussian's
+    /// own window is the one its `window_index` names — the velocity grid comes from that
+    /// window's length (spec §6.3), so collapsing the table to its first entry gives every
+    /// gaussian outside window 0 the wrong motion precision, and its reconstructed
+    /// positions drift from the bins the encoder wrote.
+    pub windows: Vec<(f64, f64)>,
     pub cutoff: f64,
 }
 
 impl Grids {
-    fn motion_step_for(&self, sigma_bin: i64, never_fades: bool) -> f64 {
-        let win_len = self.window.1 - self.window.0;
+    /// The first window. Only the writer uses this: it emits a single-window table.
+    pub fn window(&self) -> (f64, f64) {
+        self.windows.first().copied().unwrap_or((0.0, 0.0))
+    }
+
+    /// The length of the window `index` names.
+    ///
+    /// Every index is checked against the table when the state is built
+    /// (`check_window_index`, the same refusal the chunk path uses), so by the time
+    /// reconstruction asks, an out-of-range index cannot have survived. Falling back to
+    /// the first window keeps this total rather than panicking on a bound already proved.
+    fn window_len(&self, index: i64) -> f64 {
+        let w = usize::try_from(index)
+            .ok()
+            .and_then(|i| self.windows.get(i))
+            .copied()
+            .unwrap_or_else(|| self.window());
+        w.1 - w.0
+    }
+
+    fn motion_step_for(&self, sigma_bin: i64, never_fades: bool, window_index: i64) -> f64 {
+        let win_len = self.window_len(window_index);
         let class = life_class(
             sigma_bin,
             self.steps.sigma_log,
@@ -209,7 +234,7 @@ fn quantize_sample(sample: &Sample, grids: &Grids) -> Result<(Vec<i64>, BTreeMap
             0.0,
         ));
 
-        let m_step = grids.motion_step_for(q_sigma, never_fades);
+        let m_step = grids.motion_step_for(q_sigma, never_fades, 0);
         for axis in 0..3 {
             motion.push(rint(g.motions[i * 3 + axis] as f64 / m_step));
         }
@@ -254,7 +279,7 @@ fn grids_for(samples: &[Sample], duration_sec: f64, profile: Profile, cutoff: f6
     Grids {
         steps,
         origin,
-        window: (0.0, duration_sec),
+        windows: vec![(0.0, duration_sec)],
         cutoff,
     }
 }
@@ -545,7 +570,7 @@ pub fn write_sequence(
     );
     out.extend_from_slice(
         &rec::WindowTable {
-            windows: vec![grids.window],
+            windows: vec![grids.window()],
         }
         .encode(),
     );
@@ -709,7 +734,7 @@ impl DecodedSequence {
         Grids {
             steps: q.steps(),
             origin,
-            window: self.windows.first().copied().unwrap_or((0.0, 0.0)),
+            windows: self.windows.clone(),
             cutoff: self.header.cutoff,
         }
     }
@@ -913,6 +938,7 @@ fn compose_chain(
     data: &[u8],
     index: &[rec::ChunkIndexEntry],
     entry: &rec::ChunkIndexEntry,
+    windows_len: usize,
 ) -> Result<State> {
     let chain = chain_for(index, (entry.t0 + entry.t1) / 2.0)?;
     let mut state: Option<State> = None;
@@ -928,7 +954,15 @@ fn compose_chain(
             state = Some(compose_delta(&reference, content)?.0);
         }
     }
-    state.ok_or_else(|| Error::Malformed("an empty chain".into()))
+    let state = state.ok_or_else(|| Error::Malformed("an empty chain".into()))?;
+    // Refuse an index the table cannot answer, here rather than at reconstruction: the
+    // same rule the chunk path applies, and the reason `Grids::window_len` can be total.
+    if let Some(window_index) = state.bins.get(&op::A_WINDOW_INDEX) {
+        for &index in &window_index.values {
+            crate::chunk::check_window_index(index, windows_len)?;
+        }
+    }
+    Ok(state)
 }
 
 /// Read the Footer, then the index, then compose each chunk by walking its chain.
@@ -973,7 +1007,7 @@ pub fn decode_indexed(data: &[u8]) -> Result<(DecodedSequence, Vec<rec::ChunkInd
 
     let mut chunks: Vec<ChunkInfo> = Vec::with_capacity(index.len());
     for entry in &index {
-        let state = compose_chain(data, &index, entry)?;
+        let state = compose_chain(data, &index, entry, windows.len())?;
         let (update_count, birth_count, death_count) = if entry.kind != 0 {
             let content = record_content(data, entry.chunk_offset, entry.chunk_length)?;
             let (head, ..) = rec::parse_delta_chunk(content)?;
@@ -1059,6 +1093,7 @@ pub fn reconstruct_at(seq: &DecodedSequence, state: &State, t: f64) -> Reconstru
     let mu = &state.bins[&op::A_MU_T];
     let sigma = &state.bins[&op::A_SIGMA_T];
     let flags = &state.bins[&op::A_FLAGS];
+    let window = &state.bins[&op::A_WINDOW_INDEX];
 
     for &i in &order {
         out.ids.push(state.ids[i]);
@@ -1069,7 +1104,7 @@ pub fn reconstruct_at(seq: &DecodedSequence, state: &State, t: f64) -> Reconstru
         } else {
             (sigma_bin as f64 * grids.steps.sigma_log).exp()
         };
-        let m_step = grids.motion_step_for(sigma_bin, never_fades);
+        let m_step = grids.motion_step_for(sigma_bin, never_fades, window.values[i]);
         let t_step = grids.mu_step_for(sigma_bin, never_fades);
         let mu_f = mu.values[i] as f64 * t_step;
 
