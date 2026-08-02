@@ -230,8 +230,10 @@ public final class SceneReader {
     /// drift from Rust on composition order or pose interpolation.
     ///
     /// **This call loads.** The summary describes every gaussian, so the core decodes the
-    /// whole population — at whatever SH band was already resident, which it leaves alone.
-    /// A scene that had seeked to an instant holds the whole thing afterwards. Nothing
+    /// whole population — at the file's full SH degree, because the canonical order keys
+    /// the harmonics before `object_id` and a lower degree would sort a legal file
+    /// differently from the reference. Any band cap is put back before this returns. A
+    /// scene that had seeked to an instant holds the whole thing afterwards. Nothing
     /// dangles the way it can in C: ``GaussianState`` owns Swift storage copied out of the
     /// core, so a value taken earlier stays valid and stays what it was.
     public func objectsJson() throws -> String {
