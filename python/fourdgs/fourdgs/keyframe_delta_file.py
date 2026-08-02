@@ -137,6 +137,35 @@ class Grids:
         return mu_steps(sigma_bins, self.steps.sigma_log, never_fades, self.steps.time)
 
 
+def _windows_of(samples: list[Sample], duration_sec: float) -> list[tuple[float, float]]:
+    """The distinct validity windows the population declares, in first-seen order.
+
+    A `GaussianSet` carries `win_lo`/`win_hi` per gaussian and the format lets a sequence
+    declare several windows, so the writer reads them rather than forcing one. It used to
+    emit a single full-duration entry, which meant no producer here could write the
+    multi-window file the readers are supposed to handle — and so nothing tested that they
+    did (issue #87).
+
+    Order is first-seen rather than sorted: `window_index` is written against this list, so
+    a stable order is what makes the indices mean the same thing on both sides.
+    """
+    seen: dict[tuple[float, float], None] = {}
+    for sample in samples:
+        lo = np.asarray(sample.gaussians.win_lo, dtype=np.float64).reshape(-1)
+        hi = np.asarray(sample.gaussians.win_hi, dtype=np.float64).reshape(-1)
+        for a, b in zip(lo, hi, strict=True):
+            seen.setdefault((float(a), float(b)), None)
+    return list(seen) or [(0.0, float(duration_sec))]
+
+
+def _window_indices(gaussians, windows: list[tuple[float, float]]) -> np.ndarray:
+    """Each gaussian's row in the window table."""
+    lookup = {w: i for i, w in enumerate(windows)}
+    lo = np.asarray(gaussians.win_lo, dtype=np.float64).reshape(-1)
+    hi = np.asarray(gaussians.win_hi, dtype=np.float64).reshape(-1)
+    return np.asarray([lookup[(float(a), float(b))] for a, b in zip(lo, hi, strict=True)], dtype=np.int64)
+
+
 def _grids_for(samples: list[Sample], duration_sec: float, profile: str, cutoff: float) -> Grids:
     positions = np.concatenate([np.asarray(s.gaussians.positions, dtype=np.float64) for s in samples])
     scales = np.concatenate([np.asarray(s.gaussians.scales, dtype=np.float64) for s in samples])
@@ -148,7 +177,7 @@ def _grids_for(samples: list[Sample], duration_sec: float, profile: str, cutoff:
         steps=steps,
         bounds=bounds,
         origin=origin,
-        windows=[(0.0, float(duration_sec))],
+        windows=_windows_of(samples, duration_sec),
         cutoff=cutoff,
     )
 
@@ -172,7 +201,7 @@ def _quantize_sample(sample: Sample, grids: Grids) -> tuple[np.ndarray, dict[int
     q_sigma = quantize(np.log(np.maximum(sigma, 1e-30)), grids.steps.sigma_log) if n else np.zeros(0, np.int64)
     never_fades = np.zeros(n, dtype=bool)
     flags = never_fades.astype(np.int64)
-    window_index = np.zeros(n, dtype=np.int64)
+    window_index = _window_indices(g, grids.windows) if n else np.zeros(0, dtype=np.int64)
 
     rot_idx, q_rot = (
         quantize_rotation(g.rotations, grids.steps.rot) if n else (np.zeros(0, np.int64), np.zeros((0, 3), np.int64))
@@ -288,7 +317,7 @@ def write_sequence(
             bounds=grids.bounds.as_strings(),
         ).encode()
     )
-    emit(rec.WindowTable(windows=[grids.window]).encode())
+    emit(rec.WindowTable(windows=list(grids.windows)).encode())
 
     index: list[rec.ChunkIndexEntry] = []
     offsets: list[int] = []  # chunk record offset per sample

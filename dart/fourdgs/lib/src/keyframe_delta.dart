@@ -767,27 +767,39 @@ List<FourdgsChunkIndexEntry> chainFor(
 /// The grids composition dequantizes against, drawn from the Quantization record
 /// and the single shared validity window.
 class _Grids {
-  _Grids(this.steps, this.origin, this.winLo, this.winHi, this.cutoff);
+  _Grids(this.steps, this.origin, this.windows, this.cutoff);
 
   final FourdgsSteps steps;
   final List<double> origin;
-  final double winLo;
-  final double winHi;
+
+  /// Every validity window the sequence declares, in Window Table order. A
+  /// gaussian's own window is the one its `window_index` names — the velocity
+  /// grid comes from that window's length (section 6.3), so collapsing the
+  /// table to its first entry gives every gaussian outside window 0 the wrong
+  /// motion precision and its positions drift from the bins the encoder wrote.
+  final List<FourdgsWindow> windows;
   final double cutoff;
 
-  double get windowLength => winHi - winLo;
+  /// The length of the window [index] names, refusing one the table cannot
+  /// answer rather than clamping: clamping substitutes one gaussian's lifetime
+  /// for another's in a file that is already wrong.
+  double windowLengthAt(int index) {
+    if (windows.isEmpty) return 0.0;
+    if (index < 0 || index >= windows.length) {
+      throw FourdgsMalformedFile(
+        'window index $index is outside the ${windows.length}-entry window '
+        'table',
+      );
+    }
+    return windows[index].hi - windows[index].lo;
+  }
 }
 
 _Grids _gridsFor(KeyframeDeltaSequence sequence) {
-  final window =
-      sequence.windows.isNotEmpty
-          ? sequence.windows.first
-          : const FourdgsWindow(0.0, 0.0);
   return _Grids(
     FourdgsSteps.of(sequence.quantization),
     sequence.quantization.posOrigin,
-    window.lo,
-    window.hi,
+    sequence.windows,
     sequence.header.cutoff,
   );
 }
@@ -835,7 +847,7 @@ _Reconstruction _reconstructAt(
 
   final steps = grids.steps;
   final k = supportK(grids.cutoff);
-  final winLen = grids.windowLength;
+  final windowIndex = state._bins[attrWindowIndex]!.values;
 
   for (int outRow = 0; outRow < n; outRow++) {
     final i = order[outRow];
@@ -846,7 +858,13 @@ _Reconstruction _reconstructAt(
     final sigma =
         neverFades ? double.infinity : math.exp(sigmaBin * steps.sigmaLog);
     final mStep = motionStep(
-      lifeClass(sigmaBin, steps.sigmaLog, neverFades, winLen, k: k),
+      lifeClass(
+        sigmaBin,
+        steps.sigmaLog,
+        neverFades,
+        grids.windowLengthAt(windowIndex[i]),
+        k: k,
+      ),
       steps.motion,
     );
     final tStep = muStep(sigmaBin, steps.sigmaLog, neverFades, steps.time);

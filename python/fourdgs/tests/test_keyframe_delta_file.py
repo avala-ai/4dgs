@@ -137,3 +137,62 @@ def write_ok(samples, duration, mode, keyframe_every=4):
     return kdf.write_sequence(
         samples, duration, kd=KeyframeDeltaOptions(keyframe_every=keyframe_every, delta_mode=mode)
     )
+
+
+def _two_window_gaussians(positions, window_of):
+    """A population whose gaussians sit in different validity windows."""
+    n = len(positions)
+    lo = np.asarray([window_of(i)[0] for i in range(n)], dtype=np.float32)
+    hi = np.asarray([window_of(i)[1] for i in range(n)], dtype=np.float32)
+    g = _gaussians(positions)
+    return fourdgs.GaussianSet(
+        positions=g.positions,
+        scales=g.scales,
+        rotations=g.rotations,
+        colors=g.colors,
+        motions=g.motions,
+        mu_t=g.mu_t,
+        sigma_t=g.sigma_t,
+        win_lo=lo,
+        win_hi=hi,
+    )
+
+
+def test_a_multi_window_sequence_round_trips_each_gaussians_own_window():
+    """The writer emits every window the population declares, and the reader honours them.
+
+    Before issue #87 neither half of this was true: the writer forced one full-duration
+    window and wrote `window_index = 0` for everyone, so no producer here could even
+    express the file the readers were supposed to handle — which is why the readers'
+    collapse to `windows[0]` went unnoticed in three SDKs at once.
+    """
+    duration = 8.0
+
+    # Two gaussians in a long window, two in a short one.
+    def window_of(i):
+        return (0.0, duration) if i < 2 else (0.0, 0.5)
+
+    samples = [
+        Sample(
+            t0=float(i),
+            ids=np.array([0, 1, 2, 3]),
+            gaussians=_two_window_gaussians(
+                [[float(i) * 0.1, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]],
+                window_of,
+            ),
+        )
+        for i in range(4)
+    ]
+    blob = write_ok(samples, duration, rec.DELTA_MODE_CHAINED, keyframe_every=2)
+
+    seq = kdf.decode_streamed(blob)
+    assert [(w[0], w[1]) for w in seq.windows] == [(0.0, duration), (0.0, 0.5)], (
+        "both windows must survive the round trip, in table order"
+    )
+
+    # And the decoder must give the two populations different velocity grids.
+    grids = seq.grids
+    sigma_bins = np.zeros(2, dtype=np.int64)
+    never_fades = np.ones(2, dtype=bool)
+    steps = grids.motion_step(sigma_bins, never_fades, np.array([0, 1]))
+    assert steps[0] != steps[1], "a full-duration window and a 0.5s window cannot share a grid"
