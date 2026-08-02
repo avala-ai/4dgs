@@ -215,6 +215,10 @@ Result<State> Scene::stateAt(double t, int maxShBand) {
 
 Result<std::string> Scene::provenanceJson() { return detail::provenanceJson(*handle_); }
 
+Result<std::string> Scene::objectsJson() { return detail::objectsJson(*handle_); }
+
+Result<std::string> Scene::objectStatesJson() { return detail::objectStatesJson(*handle_); }
+
 Result<std::string> peekTemporalModel(Span<const std::uint8_t> bytes) {
   return detail::peekTemporalModel(bytes);
 }

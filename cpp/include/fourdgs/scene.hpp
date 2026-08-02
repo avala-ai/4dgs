@@ -176,6 +176,20 @@ class Scene {
   /// emit null. On the indexed path the records are fetched here if not already resident.
   Result<std::string> provenanceJson();
 
+  /// The `objects` member of the canonical summary (spec §5.15.6-§5.15.7): the Object
+  /// Table's entries and the SE(3) tracks with their sampled poses. Empty when the file
+  /// carries neither object records nor per-gaussian membership.
+  ///
+  /// Computed by the core, like `provenanceJson`, so that this binding and the Swift one
+  /// cannot drift from Rust on the composition order or the pose interpolation behind it.
+  Result<std::string> objectsJson();
+
+  /// The `states` member: composed centres, orientations and membership at each probe.
+  ///
+  /// Two calls rather than one document because these are two root keys of the summary,
+  /// sitting beside `sample` and `aggregate` — one document would have to be cut apart.
+  Result<std::string> objectStatesJson();
+
   /// Three states, not two: "not checked" and "did not match" are different claims about a
   /// file, and collapsing them reports corruption nobody observed.
   enum class CrcState { kNotChecked = -1, kFailed = 0, kVerified = 1 };

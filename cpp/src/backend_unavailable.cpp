@@ -95,6 +95,8 @@ Result<std::string> keyframeDeltaStatesJson(Span<const std::uint8_t>, bool) {
   return notImplemented();
 }
 Result<std::string> provenanceJson(Handle&) { return notImplemented(); }
+Result<std::string> objectsJson(Handle&) { return notImplemented(); }
+Result<std::string> objectStatesJson(Handle&) { return notImplemented(); }
 
 void closeScene(Handle& handle) noexcept { handle.scene = nullptr; }
 void closeState(StateHandle& state) noexcept { state.state = nullptr; }
