@@ -43,6 +43,7 @@ extension GaussianState {
         var winLo = [Float]()
         var winHi = [Float]()
         var sh = [UInt8]()
+        var objectIds = [UInt32]()
         positions.reserveCapacity(n * 3)
         scales.reserveCapacity(n * 3)
         rotations.reserveCapacity(n * 4)
@@ -53,6 +54,7 @@ extension GaussianState {
         winLo.reserveCapacity(n)
         winHi.reserveCapacity(n)
         sh.reserveCapacity(n * shWidth)
+        objectIds.reserveCapacity(self.objectIds.isEmpty ? 0 : n)
 
         for i in indices {
             positions.append(contentsOf: self.positions[i * 3..<(i * 3 + 3)])
@@ -67,10 +69,18 @@ extension GaussianState {
             if shWidth > 0 {
                 sh.append(contentsOf: self.sh[i * shWidth..<(i * shWidth + shWidth)])
             }
+            // Subset rather than carry the full array: membership is per gaussian, so a
+            // filtered state whose ids still index the unfiltered rows would mislabel
+            // every gaussian after the first one dropped.
+            if !self.objectIds.isEmpty {
+                objectIds.append(self.objectIds[i])
+            }
         }
         return GaussianState(
             count: n, positions: positions, scales: scales, rotations: rotations, colors: colors,
-            motions: motions, muT: muT, sigmaT: sigmaT, winLo: winLo, winHi: winHi, shDegree: shDegree, sh: sh
+            motions: motions, muT: muT, sigmaT: sigmaT, winLo: winLo, winHi: winHi, shDegree: shDegree,
+            sh: sh,
+            objectIds: objectIds
         )
     }
 
@@ -90,6 +100,7 @@ extension GaussianState {
             winLo: parts.flatMap(\.winLo),
             winHi: parts.flatMap(\.winHi),
             shDegree: first.shDegree,
-            sh: parts.flatMap(\.sh))
+            sh: parts.flatMap(\.sh),
+            objectIds: parts.flatMap(\.objectIds))
     }
 }

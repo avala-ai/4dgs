@@ -384,6 +384,12 @@ public struct GaussianState: Sendable, Equatable {
     public let winHi: [Float]
     /// 0...3. `0` means ``sh`` is empty.
     public let shDegree: Int
+    /// Object membership per gaussian (spec §6.6), or empty when the scene carries no
+    /// `object_id` stream.
+    ///
+    /// Empty and all-zero are different claims and both are legal: a file that never
+    /// assigns membership, and a file where every gaussian belongs to object 0.
+    public let objectIds: [UInt32]
     /// Spherical-harmonic coefficients as stored: unsigned bytes, consumed as read.
     ///
     /// `(shDegree + 1)² − 1` coefficients per colour component per gaussian, laid out
@@ -396,8 +402,10 @@ public struct GaussianState: Sendable, Equatable {
     public init(
         count: Int, positions: [Float], scales: [Float], rotations: [Float], colors: [Float],
         motions: [Float],
-        muT: [Float], sigmaT: [Float], winLo: [Float], winHi: [Float], shDegree: Int, sh: [UInt8]
+        muT: [Float], sigmaT: [Float], winLo: [Float], winHi: [Float], shDegree: Int, sh: [UInt8],
+        objectIds: [UInt32] = []
     ) {
+        self.objectIds = objectIds
         self.count = count
         self.positions = positions
         self.scales = scales

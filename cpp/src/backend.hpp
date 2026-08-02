@@ -129,6 +129,7 @@ Result<std::string> provenanceJson(Handle& handle);
 /// Table, the SE(3) tracks with their sampled poses, and the composed state at three
 /// probes. Empty when the file carries neither object records nor membership.
 Result<std::string> objectsJson(Handle& handle);
+Result<std::string> objectStatesJson(Handle& handle);
 
 /// Release. Both are safe on a handle that never opened, and on a null one.
 void closeScene(Handle& handle) noexcept;

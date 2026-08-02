@@ -469,13 +469,30 @@ fn canonical_state_at(
 /// every table entry and every track sample and still disagree about where a gaussian ends
 /// up, because the layer's one rule is an order — base first, track second. The `states`
 /// make that order visible, including orientation.
-pub fn canonical_json(
+/// The two canonical members an object-layer file adds to a scene summary, rendered.
+///
+/// Returned separately rather than as one document because they sit at the *root* of the
+/// summary beside `sample`, `aggregate` and the rest — a binding places each under its own
+/// key. Handing back `{"objects":…,"states":…}` would make every binding cut the braces off
+/// and splice the text, which is the kind of string surgery a canonical output should never
+/// ask for. Both are empty when the file carries neither object records nor membership.
+pub struct CanonicalParts {
+    /// The `objects` value: embedding dimension, table entries, tracks with sampled poses.
+    pub objects: String,
+    /// The `states` value: post-composition gaussian state at each probe time.
+    pub states: String,
+}
+
+pub fn canonical_parts(
     header: &Header,
     gaussians: &GaussianSet,
     layer: &ObjectLayer,
-) -> Result<String> {
+) -> Result<CanonicalParts> {
     if layer.is_empty() && gaussians.object_id.is_none() {
-        return Ok(String::new());
+        return Ok(CanonicalParts {
+            objects: String::new(),
+            states: String::new(),
+        });
     }
     layer.check()?;
 
@@ -615,16 +632,13 @@ pub fn canonical_json(
         ]));
     }
 
-    Ok(Json::obj(vec![
-        (
-            "objects",
-            Json::obj(vec![
-                ("embeddingDim", Json::Num(embedding_dim as f64)),
-                ("table", Json::Arr(entries)),
-                ("tracks", Json::Arr(tracks)),
-            ]),
-        ),
-        ("states", Json::Arr(states)),
-    ])
-    .to_json())
+    Ok(CanonicalParts {
+        objects: Json::obj(vec![
+            ("embeddingDim", Json::Num(embedding_dim as f64)),
+            ("table", Json::Arr(entries)),
+            ("tracks", Json::Arr(tracks)),
+        ])
+        .to_json(),
+        states: Json::Arr(states).to_json(),
+    })
 }

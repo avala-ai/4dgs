@@ -181,6 +181,39 @@ final class LiveTests: XCTestCase {
         let s = state().live(at: 1.0, cutoff: 0.05)
         XCTAssertEqual(GaussianState.concatenated([s, s]).count, 2 * s.count)
     }
+
+    /// Membership is per gaussian, so filtering has to carry it along the same rows.
+    ///
+    /// The failure this guards is silent: a filter that keeps the ids unsubsetted still
+    /// returns the right *number* of gaussians when the drop happens at the end, and
+    /// mislabels every gaussian after the first drop anywhere else.
+    func testLiveSubsetsMembershipAlongsideTheAttributes() {
+        // `state()` births three gaussians; the middle one's window is [5, 7), so at t=1
+        // rows 0 and 2 survive and row 1 does not.
+        let ids: [UInt32] = [7, 8, 9]
+        let s = GaussianState(
+            count: state().count, positions: state().positions, scales: state().scales,
+            rotations: state().rotations, colors: state().colors, motions: state().motions,
+            muT: state().muT, sigmaT: state().sigmaT, winLo: state().winLo, winHi: state().winHi,
+            shDegree: 0, sh: [], objectIds: ids)
+        let live = s.live(at: 1.0, cutoff: 0.05)
+        XCTAssertEqual(live.count, 2)
+        XCTAssertEqual(live.objectIds, [7, 9])
+    }
+
+    /// A scene with no `object_id` stream keeps an empty array rather than growing zeros,
+    /// because "no membership" and "everything is object 0" are different files.
+    func testLiveLeavesMembershipEmptyWhenTheSceneHasNone() {
+        XCTAssertTrue(state().live(at: 1.0, cutoff: 0.05).objectIds.isEmpty)
+    }
+
+    func testConcatenationJoinsMembership() {
+        let s = GaussianState(
+            count: 1, positions: [0, 0, 0], scales: [1, 1, 1], rotations: [0, 0, 0, 1],
+            colors: [1, 1, 1, 1], motions: [0, 0, 0], muT: [0], sigmaT: [.infinity], winLo: [0],
+            winHi: [1], shDegree: 0, sh: [], objectIds: [4])
+        XCTAssertEqual(GaussianState.concatenated([s, s]).objectIds, [4, 4])
+    }
 }
 
 final class MagicTests: XCTestCase {

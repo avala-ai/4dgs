@@ -135,11 +135,10 @@ REFUSAL_FAMILIES = frozenset({"python"})
 OBJECT_TOKENS = ("Object",)
 
 FAMILY_DECLINES: dict[str, tuple[str, ...]] = {
-    # TypeScript, Dart, C++ and Swift report provenance (spec §5.15) — C++ and Swift via
-    # the Rust C ABI's additive provenance-JSON accessor. TypeScript and Dart also decode
-    # the object layer and compose its tracks natively; C++ and Swift still decline it.
-    "cpp": OBJECT_TOKENS,
-    "swift": OBJECT_TOKENS,
+    # Every family now reports provenance (spec §5.15) and decodes the object layer.
+    # TypeScript and Dart compose its tracks natively; C++ and Swift do it through the
+    # Rust C ABI's additive objects/states accessors, so no binding restates the
+    # base-then-track order or the slerp underneath it.
 }
 
 

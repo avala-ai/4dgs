@@ -893,6 +893,21 @@ array_accessor!(
     "Validity window end in seconds, 1 float per resident gaussian. Borrowed until the next load."
 );
 
+/// Object membership, 1 unsigned integer per resident gaussian, or null when the scene
+/// carries no `object_id` stream (spec §6.6).
+///
+/// Null and all-zero are different claims and both are legal: a file with no membership at
+/// all, and a file where every gaussian is background. A binding that substituted zeros for
+/// null would report the second when it read the first. Borrowed until the next load.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_scene_object_ids(scene: *const fourdgs_scene) -> *const u32 {
+    let scene = scene_or!(scene, std::ptr::null());
+    match scene.inner.loaded().object_id.as_ref() {
+        Some(ids) if !ids.is_empty() => ids.as_ptr(),
+        _ => std::ptr::null(),
+    }
+}
+
 /// Spherical harmonic coefficients, `3 * fourdgs_scene_sh_coefficients()` bytes per
 /// resident gaussian, component-major: every coefficient of red, then green, then blue.
 ///
@@ -2324,6 +2339,17 @@ pub unsafe extern "C" fn fourdgs_scene_objects_json(
     out: *mut *const c_char,
     out_len: *mut usize,
 ) -> c_int {
+    unsafe { object_canonical_member(scene, out, out_len, false) }
+}
+
+/// Shared body: both accessors compose the layer the same way and differ only in which
+/// rendered member they hand back.
+unsafe fn object_canonical_member(
+    scene: *mut fourdgs_scene,
+    out: *mut *const c_char,
+    out_len: *mut usize,
+    want_states: bool,
+) -> c_int {
     guarded(|| {
         if out.is_null() || out_len.is_null() {
             set_last_error("a string out parameter is null".into());
@@ -2348,11 +2374,36 @@ pub unsafe extern "C" fn fourdgs_scene_objects_json(
             return report(e);
         }
         let gaussians = scene.inner.loaded().clone();
-        match crate::object_layer::canonical_json(&header, &gaussians, &layer) {
-            Ok(json) => put_owned_string(json, out, out_len),
+        match crate::object_layer::canonical_parts(&header, &gaussians, &layer) {
+            Ok(parts) => put_owned_string(
+                if want_states {
+                    parts.states
+                } else {
+                    parts.objects
+                },
+                out,
+                out_len,
+            ),
             Err(e) => report(e),
         }
     })
+}
+
+/// The `states` member an object-layer file adds to a scene summary: post-composition
+/// gaussian state at each probe time.
+///
+/// Separate from `fourdgs_scene_objects_json` because the two sit side by side at the root
+/// of the summary, so a binding places each under its own key rather than cutting one
+/// document apart. Same contract as that call in every other respect: an empty string
+/// means the file carries neither object records nor membership, both open paths work, and
+/// the string is freed with `fourdgs_string_free`.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_scene_object_states_json(
+    scene: *mut fourdgs_scene,
+    out: *mut *const c_char,
+    out_len: *mut usize,
+) -> c_int {
+    unsafe { object_canonical_member(scene, out, out_len, true) }
 }
 
 /// Release a string owned by the caller — the result of `fourdgs_peek_temporal_model`,

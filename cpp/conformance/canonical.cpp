@@ -426,6 +426,30 @@ std::string canonical(const SceneSummary& summary) {
     });
   }
 
+  std::map<std::string, Json> sampleFields{
+      {"colors", floatRows(gaussians.colors, sample, 4)},
+      {"motions", floatRows(gaussians.motions, sample, 3)},
+      {"muT", scalarRow(gaussians.muT, sample)},
+      {"positions", floatRows(gaussians.positions, sample, 3)},
+      {"rotations", floatRows(gaussians.rotations, sample, 4)},
+      {"scales", floatRows(gaussians.scales, sample, 3)},
+      {"sigmaT", scalarRow(gaussians.sigmaT, sample)},
+      {"winHi", scalarRow(gaussians.winHi, sample)},
+      {"winLo", scalarRow(gaussians.winLo, sample)},
+  };
+  // Membership is an exact label, so it is rendered as an integer string like the counts
+  // are — never as a float. The key is omitted when the scene carries no `object_id`
+  // stream at all, which is a different file from one where every gaussian is background.
+  if (!gaussians.objectIds.empty()) {
+    std::vector<Json> ids;
+    ids.reserve(sample.size());
+    for (const std::size_t row : sample) {
+      ids.push_back(Json::string(std::to_string(gaussians.objectIds[row])));
+    }
+    sampleFields.emplace("objectIds", Json::array(std::move(ids)));
+  }
+  Json sampleMembers = Json::object(std::move(sampleFields));
+
   std::map<std::string, Json> rootMembers = {
       {"aggregate", Json::object({
                         {"neverFadesCount", integer(neverFades)},
@@ -447,17 +471,7 @@ std::string canonical(const SceneSummary& summary) {
       {"library", Json::string(header.library)},
       {"metadataRecords", Json::array(std::move(metadata))},
       {"profile", Json::string(header.profile)},
-      {"sample", Json::object({
-                     {"colors", floatRows(gaussians.colors, sample, 4)},
-                     {"motions", floatRows(gaussians.motions, sample, 3)},
-                     {"muT", scalarRow(gaussians.muT, sample)},
-                     {"positions", floatRows(gaussians.positions, sample, 3)},
-                     {"rotations", floatRows(gaussians.rotations, sample, 4)},
-                     {"scales", floatRows(gaussians.scales, sample, 3)},
-                     {"sigmaT", scalarRow(gaussians.sigmaT, sample)},
-                     {"winHi", scalarRow(gaussians.winHi, sample)},
-                     {"winLo", scalarRow(gaussians.winLo, sample)},
-                 })},
+      {"sample", std::move(sampleMembers)},
       {"sh", sphericalHarmonics(gaussians, order)},
       {"shDegree", Json::number(std::to_string(header.shDegree))},
       {"statistics", std::move(statistics)},
@@ -471,6 +485,16 @@ std::string canonical(const SceneSummary& summary) {
   // convention. A file without provenance is a file the record family does not apply to.
   if (!summary.provenanceJson.empty()) {
     rootMembers.emplace("provenance", Json::raw(summary.provenanceJson));
+  }
+
+  // The object layer adds two root keys beside the rest, on the same omit-when-absent
+  // rule: a file with neither object records nor membership reads exactly as it did
+  // before the layer existed.
+  if (!summary.objectsJson.empty()) {
+    rootMembers.emplace("objects", Json::raw(summary.objectsJson));
+  }
+  if (!summary.objectStatesJson.empty()) {
+    rootMembers.emplace("states", Json::raw(summary.objectStatesJson));
   }
 
   return Json::object(std::move(rootMembers)).render();

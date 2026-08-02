@@ -187,6 +187,10 @@ struct GaussianView {
   Span<const float> sigmaT;
   Span<const float> winLo;
   Span<const float> winHi;
+  /// Object membership (spec §6.6), or empty when the scene carries no `object_id`
+  /// stream. Empty and all-zero are different claims: no membership at all, versus every
+  /// gaussian assigned to background.
+  Span<const std::uint32_t> objectIds;
   Span<const std::uint8_t> sh;
   int shDegree = 0;
   std::size_t shCoefficients = 0;

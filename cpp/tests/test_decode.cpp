@@ -54,7 +54,14 @@ const char* kVariants[] = {
     "TinySigmas-UseChunkIndex-UseCrc",
     "LongLived-Quantized-UseChunkIndex-UseCrc",
     "NoData-UseChunkIndex-UseCrc",
+    // Carries per-gaussian `object_id` (spec §6.6), which is the only variant here whose
+    // membership span is expected to be populated.
+    "LongLived-UseChunkIndex-UseCrc-WithObjects",
 };
+
+/// The variant above that carries membership, so the check below can tell an absent stream
+/// from a stream this package failed to surface.
+const char* kMembershipVariant = "LongLived-UseChunkIndex-UseCrc-WithObjects";
 
 std::vector<std::uint8_t> readWhole(const std::string& path, bool* found) {
   std::vector<std::uint8_t> bytes;
@@ -143,6 +150,14 @@ void theWorkingSetMatchesTheHeader(Scene& scene) {
 /// they are compared here, with the file's own cutoff — the value §6.3 makes load-bearing
 /// and the one a decoder substituting the 0.05 default would get wrong on exactly the
 /// variants that declare something else.
+///
+/// Gaussians belonging to an object are compared for visibility but not for position. §3
+/// is the whole of what `fourdgs::stateAt` claims; the core additionally applies the
+/// Object Track (§5.15.7) to any gaussian whose `object_id` is non-zero, so on those rows
+/// the two are answering different questions rather than disagreeing. `0` is background
+/// (§6.6), which is why the id itself is the predicate. The composed answer is not
+/// untested — it is the conformance suite's `states` member, checked against
+/// `canonical.py` on every object variant.
 void reconstructionAgreesWithTheCore(Scene& scene) {
   const double duration = scene.durationSec();
   const double cutoff = scene.cutoff();
@@ -165,6 +180,8 @@ void reconstructionAgreesWithTheCore(Scene& scene) {
         CHECK(mine.visible);
         break;
       }
+      const bool composed = !resident.objectIds.empty() && resident.objectIds[g] != 0;
+      if (composed) continue;
       // Float32 inputs widened to double on both sides, so the tolerance covers the
       // arithmetic and not a difference of opinion about the formula.
       for (std::size_t k = 0; k < 3; ++k) {
@@ -191,6 +208,26 @@ void reconstructionAgreesWithTheCore(Scene& scene) {
     }
     CHECK_EQ(missing, static_cast<std::size_t>(0));
   }
+}
+
+/// Membership spans the working set exactly, and absence stays absence.
+///
+/// The span is borrowed from the core, so the failure a wrong length produces is a read
+/// past the end of the core's allocation rather than a wrong answer — which is why the
+/// size is asserted rather than inferred, and why this runs under the sanitizers with the
+/// rest of the file. Empty is a legitimate answer for a scene with no `object_id` stream;
+/// what would not be legitimate is empty for a scene that has one.
+void membershipSpansTheWorkingSet(Scene& scene, bool expected) {
+  CHECK(scene.loadAll(3).ok());
+  const GaussianView view = scene.gaussians();
+  CHECK_EQ(view.objectIds.empty(), !expected);
+  if (view.objectIds.empty()) return;
+  CHECK_EQ(view.objectIds.size(), view.count);
+  // Touch every element: under ASan this is what turns a too-long span into a report
+  // instead of a value nobody reads.
+  std::uint64_t total = 0;
+  for (std::size_t i = 0; i < view.objectIds.size(); ++i) total += view.objectIds[i];
+  CHECK(total >= 0u);
 }
 
 /// Every source is independently readable at its declared length. Absence stays absence.
@@ -286,6 +323,7 @@ void runTests() {
     Scene& scene = **opened;
 
     theWorkingSetMatchesTheHeader(scene);
+    membershipSpansTheWorkingSet(scene, std::string(variant) == kMembershipVariant);
     reconstructionAgreesWithTheCore(scene);
     audioReadsBackAtItsDeclaredLength(scene);
     malformedInputIsRefusedAndNamed(bytes);

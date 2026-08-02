@@ -37,6 +37,7 @@ struct SceneRecords {
   /// Canonical object-layer JSON from the core. Empty when the file carries neither
   /// object records nor per-gaussian membership.
   std::string objectsJson;
+  std::string objectStatesJson;
 };
 
 /// Read everything the summary reports beyond the gaussians.
@@ -103,6 +104,10 @@ inline Result<void> collectRecords(Scene& scene, SceneRecords* out) {
   if (!objects) return objects.error();
   out->objectsJson = std::move(*objects);
 
+  Result<std::string> objectStates = scene.objectStatesJson();
+  if (!objectStates) return objectStates.error();
+  out->objectStatesJson = std::move(*objectStates);
+
   return Result<void>();
 }
 
@@ -121,6 +126,7 @@ inline SceneSummary summaryOf(const SceneRecords& records, const GaussianView& g
   summary.summaryCrcOk = records.crcKnown ? &records.crcOk : nullptr;
   summary.provenanceJson = records.provenanceJson;
   summary.objectsJson = records.objectsJson;
+  summary.objectStatesJson = records.objectStatesJson;
   return summary;
 }
 

@@ -84,6 +84,7 @@ struct SceneSummary {
   /// Canonical object-layer JSON from the core: `objects` and `states`. Empty when the
   /// file carries neither object records nor per-gaussian membership.
   std::string objectsJson;
+  std::string objectStatesJson;
 };
 
 /// The statement every implementation must agree on for a variant.

@@ -94,12 +94,18 @@ public enum Runner {
         // Provenance is computed in the Rust core (posesAt / sensorPosesAt included) so
         // this binding cannot drift from the reference on slerp. Empty means omit the key.
         let provenanceJson = try reader.provenanceJson()
+        // The object layer likewise: the core composes base-then-track and samples each
+        // pose, so C++, Swift and Rust cannot disagree about composition order.
+        let objectsJson = try reader.objectsJson()
+        let objectStatesJson = try reader.objectStatesJson()
 
         return Summary.build(
             scene: scene,
             gaussians: gaussians,
             chunkIntervals: scene.chunkIntervals.map { ($0.lowerBound, $0.upperBound) },
             summaryChecksumVerified: scene.summaryChecksumVerified,
-            provenanceJson: provenanceJson)
+            provenanceJson: provenanceJson,
+            objectsJson: objectsJson,
+            objectStatesJson: objectStatesJson)
     }
 }
