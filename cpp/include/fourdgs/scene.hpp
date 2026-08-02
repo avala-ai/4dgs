@@ -182,12 +182,20 @@ class Scene {
   ///
   /// Computed by the core, like `provenanceJson`, so that this binding and the Swift one
   /// cannot drift from Rust on the composition order or the pose interpolation behind it.
+  ///
+  /// **This call loads.** The summary describes every gaussian, so it decodes the whole
+  /// population and invalidates any `GaussianView` taken earlier — including its
+  /// `objectIds` span — exactly as `loadAll` does. Unlike `provenanceJson`, which reads
+  /// records and leaves the working set alone. Take the view after calling this, not
+  /// before: on a scene already loaded whole the load is a no-op and the mistake is
+  /// invisible, which is the only reason it would reach a caller who seeks.
   Result<std::string> objectsJson();
 
   /// The `states` member: composed centres, orientations and membership at each probe.
   ///
   /// Two calls rather than one document because these are two root keys of the summary,
   /// sitting beside `sample` and `aggregate` — one document would have to be cut apart.
+  /// Loads and invalidates on the same terms as `objectsJson`.
   Result<std::string> objectStatesJson();
 
   /// Three states, not two: "not checked" and "did not match" are different claims about a
