@@ -482,3 +482,35 @@ public struct Gaussian: Sendable, Equatable {
         sigmaT.isInfinite
     }
 }
+
+/// The scene reconstructed at one instant: which gaussians exist then, and where.
+///
+/// Distinct from ``GaussianState``, which is the resident population as decoded. This is
+/// the answer to "what is visible at `t`", with §3's window and cutoff applied and any
+/// Object Track (spec §5.15.7) composed onto the base centre and orientation — the reason
+/// to prefer it over reconstructing from a ``Gaussian`` by hand, which applies §3 alone and
+/// leaves a tracked object sitting at its rest pose.
+public struct InstantState: Sendable, Equatable {
+    /// Indices into the resident arrays, one per visible gaussian.
+    public let indices: [UInt32]
+    /// Composed centres, 3 per visible gaussian, packed by visible index.
+    public let centers: [Float]
+    /// Composed orientations, 4 xyzw per visible gaussian, packed by visible index.
+    public let orientations: [Float]
+    /// `color.a * marginal`, 1 per visible gaussian, packed by visible index.
+    public let opacity: [Float]
+
+    public init(indices: [UInt32], centers: [Float], orientations: [Float], opacity: [Float]) {
+        self.indices = indices
+        self.centers = centers
+        self.orientations = orientations
+        self.opacity = opacity
+    }
+
+    /// How many gaussians exist at that instant.
+    public var count: Int { indices.count }
+
+    /// What an instant with nothing live reconstructs to.
+    public static let empty = InstantState(
+        indices: [], centers: [], orientations: [], opacity: [])
+}

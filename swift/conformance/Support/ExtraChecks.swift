@@ -20,9 +20,14 @@ enum ExtraChecks {
         case noBytesMoved(chunk: Int, cap: Int)
         case capMovedMoreThanWider(chunk: Int, narrow: Int, narrowBytes: UInt64, wide: Int, wideBytes: UInt64)
         case capMovedNothingLess(chunk: Int, bytes: UInt64, degree: Int)
+        case trackNotComposed(t: Double, gaussian: Int)
 
         var description: String {
             switch self {
+            case .trackNotComposed(let t, let gaussian):
+                return
+                    "at t=\(t) gaussian \(gaussian) belongs to a tracked object but stateAt left it "
+                    + "at the pose §3 alone would give — the Object Track was not composed"
             case .notReportedTruncated(let what):
                 return "\(what) was not reported truncated"
             case .lostGaussians(let what, let got, let expected):
@@ -50,6 +55,48 @@ enum ExtraChecks {
     /// cut rather than pass a short scene off as a complete one. Silence is the failure mode
     /// that matters — a decoder that returns fewer gaussians without comment is one a consumer
     /// cannot distinguish from a small file.
+    /// `stateAt` composes Object Tracks; reconstructing by hand does not.
+    ///
+    /// The canonical JSON proves the *core* composes, because the `states` member comes
+    /// from the core. What it cannot prove is that this binding's reconstruction surfaces
+    /// that composition — a Swift caller could be handed §3-only poses while the summary
+    /// looked perfect, and the feature matrix would claim something no check covers.
+    ///
+    /// So: somewhere among these probes, at least one gaussian belonging to a tracked
+    /// object must come back from ``SceneReader/stateAt(_:options:)`` at a different place
+    /// than ``Gaussian/state(at:)`` puts it. Aggregated across the probes rather than
+    /// demanded at each, because a track is free to sit at the identity pose for part of
+    /// its life — every corpus track does, early on — and a scene whose layer carries no
+    /// track at all is excused entirely, since for it the composition *is* the identity.
+    static func objectTracksAreComposed(
+        _ scene: SceneReader, at times: [Double], layerHasTrack: Bool
+    ) throws {
+        guard layerHasTrack else { return }
+        let resident = try scene.gaussians(at: times[0])
+        guard resident.objectIds.contains(where: { $0 != 0 }) else { return }
+
+        var firstMember: Int?
+        for t in times {
+            let composed = try scene.stateAt(t)
+            let rest = try scene.gaussians(at: t)
+            guard composed.count > 0, rest.objectIds.count == rest.count else { continue }
+
+            for i in 0..<composed.count {
+                let g = Int(composed.indices[i])
+                guard g < rest.count, rest.objectIds[g] != 0 else { continue }
+                firstMember = firstMember ?? g
+                let byHand = rest[g].state(at: t).position
+                let dx = Double(composed.centers[i * 3] - byHand.x)
+                let dy = Double(composed.centers[i * 3 + 1] - byHand.y)
+                let dz = Double(composed.centers[i * 3 + 2] - byHand.z)
+                if (dx * dx + dy * dy + dz * dz).squareRoot() > 1e-4 { return }
+            }
+        }
+        if let g = firstMember {
+            throw Failure.trackNotComposed(t: times[times.count - 1], gaussian: g)
+        }
+    }
+
     static func truncationRecovery(path: String, wholeCount: Int) throws {
         let bytes = [UInt8](try Data(contentsOf: URL(fileURLWithPath: path)))
         guard bytes.count >= 16 else { return }

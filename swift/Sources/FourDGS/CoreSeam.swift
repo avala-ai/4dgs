@@ -652,6 +652,42 @@ enum Core {
         return result
     }
 
+    // MARK: - State at an instant
+
+    /// The scene reconstructed at `t`, with Object Tracks composed.
+    ///
+    /// The core does the reconstruction, which is the point: §3's visibility rule and the
+    /// base-then-track composition of §5.15.7 are stated once, in Rust, and this binding
+    /// reports them. `Gaussian/state(at:)` is the local §3 arithmetic and knows nothing
+    /// about objects — for a scene that carries tracks the two answer different questions.
+    static func stateAt(_ scene: SceneHandle, _ t: Double, bandCap: Int?) throws -> InstantState {
+        var raw: OpaquePointer?
+        let status = fourdgs_scene_state_at(scene.raw, t, bandCapByte(bandCap), &raw)
+        guard status == ok else { throw error(status) }
+        guard let raw else { return InstantState.empty }
+        defer { fourdgs_state_free(raw) }
+
+        let count = Int(fourdgs_state_count(raw))
+        guard count > 0 else { return InstantState.empty }
+
+        // Copied, like everything else that crosses this seam: the header states these
+        // pointers live until the state is freed, and that is at the end of this call.
+        func floats(_ pointer: UnsafePointer<Float>?, _ width: Int) -> [Float] {
+            guard let pointer else { return [] }
+            return Array(UnsafeBufferPointer(start: pointer, count: count * width))
+        }
+        let indices: [UInt32] =
+            fourdgs_state_indices(raw).map {
+                Array(UnsafeBufferPointer(start: $0, count: count))
+            } ?? []
+
+        return InstantState(
+            indices: indices,
+            centers: floats(fourdgs_state_centers(raw), 3),
+            orientations: floats(fourdgs_state_orientations(raw), 4),
+            opacity: floats(fourdgs_state_opacity(raw), 1))
+    }
+
     // MARK: - Object layer
 
     /// The `objects` member of the canonical summary (spec §5.15.6-§5.15.7): the Object
