@@ -456,7 +456,9 @@ fn a_rust_written_multi_window_sequence_round_trips() {
                 scales: Vec::with_capacity(n * 3),
                 rotations: Vec::with_capacity(n * 4),
                 colors: Vec::with_capacity(n * 4),
-                motions: vec![0.0; n * 3],
+                // Non-zero motion on every gaussian, so a wrong window's motion step
+                // shows up as a wrong velocity rather than cancelling to zero.
+                motions: vec![0.25; n * 3],
                 mu_t: vec![0.0; n],
                 sigma_t: vec![100.0; n],
                 win_lo: vec![0.0; n],
@@ -493,4 +495,10 @@ fn a_rust_written_multi_window_sequence_round_trips() {
         2,
         "both declared windows must reach the Window Table, not just the first"
     );
+
+    // Deliberately not asserting on reconstructed motion here. `life_half` uses the
+    // window length only for never-fading gaussians, and this writer emits none, so a
+    // motion assertion through `write_sequence` passes whichever window the encoder
+    // quantized against — it would be a test that cannot fail. The grid's dependence on
+    // the window is covered directly in `keyframe_delta_file`'s own unit test.
 }

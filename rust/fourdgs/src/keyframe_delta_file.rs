@@ -197,11 +197,12 @@ fn quantize_sample(sample: &Sample, grids: &Grids) -> Result<(Vec<i64>, BTreeMap
         let never_fades = false;
         sigma.push(q_sigma);
         flags.push(0);
-        window_index.push(window_index_of(
+        let row_window = window_index_of(
             &grids.windows,
             g.win_lo.get(i).copied().unwrap_or(0.0),
             g.win_hi.get(i).copied().unwrap_or(0.0),
-        ));
+        );
+        window_index.push(row_window);
 
         for axis in 0..3 {
             position.push(quantize_scalar(
@@ -238,7 +239,10 @@ fn quantize_sample(sample: &Sample, grids: &Grids) -> Result<(Vec<i64>, BTreeMap
             0.0,
         ));
 
-        let m_step = grids.motion_step_for(q_sigma, never_fades, 0);
+        // The row's own window, matching the index written beside it: quantizing against
+        // window 0 while recording a different index scales the velocity by one grid and
+        // reconstructs it with another.
+        let m_step = grids.motion_step_for(q_sigma, never_fades, row_window);
         for axis in 0..3 {
             motion.push(rint(g.motions[i * 3 + axis] as f64 / m_step));
         }
@@ -1449,4 +1453,42 @@ pub fn peek_temporal_model(data: &[u8]) -> Result<String> {
     Err(Error::Malformed(
         "file has no Header record to read a temporal model from".into(),
     ))
+}
+
+#[cfg(test)]
+mod window_grid_tests {
+    use super::*;
+
+    fn grids(windows: Vec<(f64, f64)>) -> Grids {
+        Grids {
+            steps: Steps::of(&Bounds::for_profile(Profile::Default, 1e-2)),
+            origin: [0.0; 3],
+            windows,
+            cutoff: 0.05,
+        }
+    }
+
+    #[test]
+    fn a_never_fading_gaussian_takes_the_grid_of_the_window_it_names() {
+        // `life_half` reads the window length only when `never_fades` is set, so this is
+        // the shape where the index actually changes the answer — and the reason a test
+        // driven through `write_sequence` cannot see it: that writer emits no
+        // never-fading gaussians.
+        let g = grids(vec![(0.0, 10.0), (0.0, 0.5)]);
+        let long = g.motion_step_for(0, true, 0);
+        let short = g.motion_step_for(0, true, 1);
+        assert_ne!(
+            long, short,
+            "a 10s window and a 0.5s window cannot share a velocity grid"
+        );
+    }
+
+    #[test]
+    fn an_absent_window_table_is_one_default_window() {
+        // Not an unbounded fallback: index 0 is legal, and the length is the default
+        // window's, which is what the chunk path's `window_table_or_default` means.
+        let g = grids(Vec::new());
+        assert_eq!(g.window_len(0), 0.0);
+        assert_eq!(g.window_len(7), 0.0, "the fallback is total, not a panic");
+    }
 }
