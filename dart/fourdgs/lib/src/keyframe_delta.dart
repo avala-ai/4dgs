@@ -784,14 +784,20 @@ class _Grids {
   /// answer rather than clamping: clamping substitutes one gaussian's lifetime
   /// for another's in a file that is already wrong.
   double windowLengthAt(int index) {
-    if (windows.isEmpty) return 0.0;
-    if (index < 0 || index >= windows.length) {
+    // An absent or empty Window Table is one default (0, 0) window, not an
+    // unbounded fallback — the same defaulting the chunk decoder applies. A
+    // bare `return 0.0` for an empty table would let any index decode against
+    // it, so `window_index = 7` would reconstruct instead of being refused.
+    final table =
+        windows.isEmpty
+            ? const <FourdgsWindow>[FourdgsWindow(0.0, 0.0)]
+            : windows;
+    if (index < 0 || index >= table.length) {
       throw FourdgsMalformedFile(
-        'window index $index is outside the ${windows.length}-entry window '
-        'table',
+        'window index $index is outside the ${table.length}-entry window table',
       );
     }
-    return windows[index].hi - windows[index].lo;
+    return table[index].hi - table[index].lo;
   }
 }
 

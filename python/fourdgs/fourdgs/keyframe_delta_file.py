@@ -121,11 +121,15 @@ class Grids:
 
     def window_lengths(self, window_index: np.ndarray) -> np.ndarray:
         """Per-gaussian window length, resolved the way the gaussian-birth path resolves it."""
-        if not self.windows:
-            return np.zeros(np.shape(window_index), dtype=np.float64)
-        table = np.asarray(self.windows, dtype=np.float64)
+        # An absent or empty Window Table is one default `(0, 0)` window, not an
+        # unbounded fallback — the same defaulting the chunk decoder applies. Skipping
+        # the check here would let `window_index = 7` reconstruct against a zero-length
+        # window instead of being refused, and would answer differently from the regular
+        # chunk path on the same bytes.
+        windows = self.windows or [(0.0, 0.0)]
+        table = np.asarray(windows, dtype=np.float64)
         idx = np.asarray(window_index, dtype=np.int64).reshape(-1)
-        check_window_indices(idx, len(self.windows))
+        check_window_indices(idx, len(windows))
         return table[idx, 1] - table[idx, 0]
 
     def motion_step(self, sigma_bins: np.ndarray, never_fades: np.ndarray, window_index: np.ndarray) -> np.ndarray:

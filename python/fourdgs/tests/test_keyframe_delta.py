@@ -330,3 +330,10 @@ def test_each_gaussian_gets_the_window_its_index_names():
     # An index the table cannot answer is a malformed file, not a silent clamp.
     with pytest.raises(MalformedFile):
         grids.motion_step(sigma_bins, never_fades, np.array([0, 7]))
+
+    # And an absent table is one default (0, 0) window, not an unbounded fallback:
+    # index 0 is legal there, anything else is not.
+    empty = Grids(steps=steps, bounds=None, origin=np.zeros(3), windows=[], cutoff=0.05)
+    empty.motion_step(sigma_bins, never_fades, np.zeros(2, dtype=np.int64))
+    with pytest.raises(MalformedFile):
+        empty.motion_step(sigma_bins, never_fades, np.array([0, 7]))
