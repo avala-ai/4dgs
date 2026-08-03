@@ -384,10 +384,6 @@ FourdgsScene readFourdgsBytes(
   // no duration to compare against yet, and an early check would let exactly
   // that file through.
   for (final entry in chunkIndex) {
-    // `durationSec <= 0` is tested first and unconditionally: `t1 <= 0 ||
-    // t0 >= duration` is the complement of an overlap test that only holds for
-    // a non-degenerate window, and at duration 0 an entry straddling zero,
-    // `[-1, 1)`, satisfies neither half.
     // `liveCount` is the population only for a DELTA entry; a keyframe leaves it
     // zero and counts its gaussians the ordinary way, so keying on `extended`
     // alone would read every keyframe in an extended index as empty.
@@ -395,10 +391,13 @@ FourdgsScene readFourdgsBytes(
         (entry.extended && entry.kind == 1)
             ? entry.liveCount
             : entry.gaussianCount;
+    // A zero-duration scene is not a scene with no clock: a static asset is
+    // written as `duration_sec = 0` with one nonempty entry just past zero, and
+    // every SDK's glTF/USD import produces exactly that. So the end of the clock
+    // only bounds an entry when there IS an end.
     if (population > 0 &&
-        (header.durationSec <= 0.0 ||
-            entry.t1 <= 0.0 ||
-            entry.t0 >= header.durationSec)) {
+        (entry.t1 <= 0.0 ||
+            (header.durationSec > 0.0 && entry.t0 >= header.durationSec))) {
       throw FourdgsMalformedFile(
         'a chunk index entry covers [${entry.t0}, ${entry.t1}), outside the '
         'scene clock [0, ${header.durationSec})',
@@ -640,12 +639,13 @@ bool _endsWithFooterAndMagic(Uint8List data) {
   final int at = data.length - fourdgsMagic.length - footerRecordBytes;
   if (at < fourdgsMagic.length) return false;
   if (data[at] != opFooter) return false;
-  final int declared = ByteData.sublistView(
-    data,
-    at + 1,
-    at + 9,
-  ).getUint64(0, Endian.little);
-  return declared == footerContentBytes;
+  // Two u32 reads, not `getUint64`: that method is unsupported under dart2js, so
+  // reaching for it here would turn a browser's diagnosis of a corrupt file into
+  // a platform `UnsupportedError`. `FourdgsCursor.u64` splits it the same way.
+  final ByteData length = ByteData.sublistView(data, at + 1, at + 9);
+  final int low = length.getUint32(0, Endian.little);
+  final int high = length.getUint32(4, Endian.little);
+  return high == 0 && low == footerContentBytes;
 }
 
 bool _endsWithMagic(Uint8List data) {

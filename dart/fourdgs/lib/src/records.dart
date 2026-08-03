@@ -281,9 +281,14 @@ class FourdgsWindowTable {
       // Visibility is gated on `lo <= t < hi`, so a NaN bound is false at every
       // instant and those gaussians silently never appear; an inverted window
       // reads as one covering nothing. Both decode to a scene quietly missing
-      // content, which is worse than a refusal. `lo == hi` stays legal — the
-      // NoData fixture is exactly that.
-      if (!lo.isFinite || !hi.isFinite || hi < lo) {
+      // content, which is worse than a refusal.
+      //
+      // `hi == +infinity` is NOT one of those. It is how this format says a
+      // gaussian never expires, and it is what every SDK writes for a static
+      // glTF or USD import — `duration_sec = 0` with `[0, +inf)` — so refusing
+      // it would make the reference writers' own output undecodable. `lo == hi`
+      // stays legal too: the NoData fixture is exactly that.
+      if (lo.isNaN || hi.isNaN || !lo.isFinite || hi < lo) {
         throw FourdgsMalformedFile(
           'window $i spans [$lo, $hi); a validity window must be finite and '
           'must not end before it starts',

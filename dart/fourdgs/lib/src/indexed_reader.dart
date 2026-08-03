@@ -306,10 +306,9 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
   // against yet.
   final double duration = front.header!.durationSec;
   for (final entry in index) {
-    // `duration <= 0` is tested first and unconditionally: `t1 <= 0 ||
-    // t0 >= duration` is the complement of an overlap test that only holds for
-    // a non-degenerate window, and at duration 0 an entry straddling zero,
-    // `[-1, 1)`, satisfies neither half.
+    // A zero-duration scene is not a scene with no clock — a static asset is
+    // written that way, with one nonempty entry just past zero — so the end of
+    // the clock only bounds an entry when there IS an end.
     // `liveCount` is the population only for a DELTA entry. A keyframe in an
     // extended index leaves it zero and counts its gaussians the ordinary way,
     // so keying on `extended` alone reads every keyframe as empty.
@@ -318,7 +317,7 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
             ? entry.liveCount
             : entry.gaussianCount;
     if (population > 0 &&
-        (duration <= 0.0 || entry.t1 <= 0.0 || entry.t0 >= duration)) {
+        (entry.t1 <= 0.0 || (duration > 0.0 && entry.t0 >= duration))) {
       throw FourdgsMalformedFile(
         'a chunk index entry covers [${entry.t0}, ${entry.t1}), outside the '
         'scene clock [0, $duration)',

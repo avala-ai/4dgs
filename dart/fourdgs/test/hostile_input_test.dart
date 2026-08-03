@@ -275,6 +275,77 @@ void main() {
     });
   });
 
+  group('the static-asset shape stays decodable', () {
+    // A glTF or USD import has no timeline: every SDK writes it as
+    // `duration_sec = 0` with `win_hi = +infinity`, and the reference writer
+    // emits one chunk-index entry just past zero. Hardening that refuses NaN
+    // and inverted intervals must not sweep this up with them — doing so makes
+    // the reference writers' own output undecodable, and no corpus variant
+    // covers it, so nothing else here would notice.
+
+    test('an infinite win_hi is accepted', () {
+      final FourdgsWindowTable table = FourdgsWindowTable.parse(
+        _windowTableContent(lo: 0.0, hi: double.infinity),
+      );
+      expect(table.windows.single.hi, double.infinity);
+    });
+
+    test('a NaN or inverted window is still refused', () {
+      expect(
+        () => FourdgsWindowTable.parse(
+          _windowTableContent(lo: 0.0, hi: double.nan),
+        ),
+        throwsA(isA<FourdgsMalformedFile>()),
+      );
+      expect(
+        () => FourdgsWindowTable.parse(_windowTableContent(lo: 5.0, hi: 1.0)),
+        throwsA(isA<FourdgsMalformedFile>()),
+      );
+      // -infinity as a START is not the static idiom and stays refused.
+      expect(
+        () => FourdgsWindowTable.parse(
+          _windowTableContent(lo: double.negativeInfinity, hi: 1.0),
+        ),
+        throwsA(isA<FourdgsMalformedFile>()),
+      );
+    });
+
+    test(
+      'a nonempty index entry at duration zero is accepted by both openers',
+      () async {
+        // The exact shape `fourdgs.write(g, 0.0)` produces: t1 just past zero, a
+        // nonempty entry, and no scene clock to bound its end.
+        final BytesBuilder out =
+            BytesBuilder()
+              ..add(fourdgsMagic)
+              ..add(_record(opHeader, _headerContent(durationSec: 0.0)))
+              ..add(_record(opQuantization, _quantizationContent()));
+        final int summaryStart = out.length;
+        out.add(
+          _record(opChunkIndex, _chunkIndexEntryContent(t0: 0.0, t1: 1e-9)),
+        );
+        final BytesBuilder footer =
+            BytesBuilder()
+              ..add(_u64(summaryStart))
+              ..add(_u64(0))
+              ..add(_u32(0));
+        out
+          ..add(_record(opFooter, footer.toBytes()))
+          ..add(fourdgsMagic);
+        final Uint8List bytes = out.toBytes();
+
+        expect(
+          readFourdgsBytes(bytes, recoverTruncated: false).header.durationSec,
+          0.0,
+        );
+        final FourdgsIndexedScene indexed = await openFourdgsIndexed(
+          FourdgsBytes(bytes),
+        );
+        expect(indexed.index.single.t1, 1e-9);
+      },
+    );
+  });
+
   group('both openers agree about what is out of clock', () {
     test('an out-of-clock index entry is refused by the indexed opener too', () async {
       // Built rather than patched. Editing a real file's index invalidates the
