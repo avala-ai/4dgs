@@ -295,6 +295,37 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
     }
   }
 
+  // The same clock bound the streamed reader applies, so a container is not
+  // accepted or refused according to which opener was used. An entry that
+  // cannot overlap the scene clock names gaussians `chunksForTime` will never
+  // select: the file opens cleanly, its CRC verifies, and part of the scene is
+  // quietly unreachable.
+  //
+  // After the walk rather than inside it, because nothing orders a Chunk Index
+  // after the Header — an index arriving first has no duration to compare
+  // against yet.
+  final double duration = front.header!.durationSec;
+  for (final entry in index) {
+    // `duration <= 0` is tested first and unconditionally: `t1 <= 0 ||
+    // t0 >= duration` is the complement of an overlap test that only holds for
+    // a non-degenerate window, and at duration 0 an entry straddling zero,
+    // `[-1, 1)`, satisfies neither half.
+    // `liveCount` is the population only for a DELTA entry. A keyframe in an
+    // extended index leaves it zero and counts its gaussians the ordinary way,
+    // so keying on `extended` alone reads every keyframe as empty.
+    final int population =
+        (entry.extended && entry.kind == 1)
+            ? entry.liveCount
+            : entry.gaussianCount;
+    if (population > 0 &&
+        (duration <= 0.0 || entry.t1 <= 0.0 || entry.t0 >= duration)) {
+      throw FourdgsMalformedFile(
+        'a chunk index entry covers [${entry.t0}, ${entry.t1}), outside the '
+        'scene clock [0, $duration)',
+      );
+    }
+  }
+
   return FourdgsIndexedScene(
     header: front.header!,
     quantization: front.quantization!,

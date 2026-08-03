@@ -275,6 +275,61 @@ void main() {
     });
   });
 
+  group('both openers agree about what is out of clock', () {
+    test('an out-of-clock index entry is refused by the indexed opener too', () async {
+      // Built rather than patched. Editing a real file's index invalidates the
+      // summary CRC, and the indexed opener refuses on that FIRST — so a patched
+      // fixture never reaches the clock bound and the test proves nothing. This
+      // file declares `summaryCrc = 0`, which turns that check off, leaving the
+      // clock bound as the only thing that can refuse it.
+      final Uint8List indexRecord = _record(
+        opChunkIndex,
+        _chunkIndexEntryContent(
+          t0: 500.0,
+          t1: 501.0,
+        ), // the scene clock is [0, 1)
+      );
+      final BytesBuilder out =
+          BytesBuilder()
+            ..add(fourdgsMagic)
+            ..add(_record(opHeader, _headerContent()))
+            ..add(_record(opQuantization, _quantizationContent()));
+      final int summaryStart = out.length;
+      out.add(indexRecord);
+      final BytesBuilder footer =
+          BytesBuilder()
+            ..add(_u64(summaryStart))
+            ..add(_u64(0))
+            ..add(_u32(0)); // summaryCrc 0: not checked
+      out
+        ..add(_record(opFooter, footer.toBytes()))
+        ..add(fourdgsMagic);
+      final Uint8List bytes = out.toBytes();
+
+      // Matched on the message, not merely the type: several other refusals are
+      // also `FourdgsMalformedFile`, and a type-only assertion would pass
+      // whether or not the clock bound exists — which is how the first version
+      // of this test failed to notice the indexed opener had none.
+      final Matcher outOfClock = throwsA(
+        isA<FourdgsMalformedFile>().having(
+          (FourdgsMalformedFile e) => e.message,
+          'message',
+          contains('scene clock'),
+        ),
+      );
+      expect(
+        () => readFourdgsBytes(bytes, recoverTruncated: false),
+        outOfClock,
+        reason: 'streamed reader',
+      );
+      await expectLater(
+        openFourdgsIndexed(FourdgsBytes(bytes)),
+        outOfClock,
+        reason: 'indexed opener must agree',
+      );
+    });
+  });
+
   group('a short scene cannot hide behind a missing closing magic', () {
     test(
       'dropping only the trailing magic does not excuse a header/chunk mismatch',
@@ -371,6 +426,32 @@ void main() {
       },
     );
   });
+}
+
+/// `u8 opcode`, `u64 length`, content — the framing every record shares.
+Uint8List _record(int opcode, Uint8List content) {
+  final BytesBuilder out =
+      BytesBuilder()
+        ..addByte(opcode)
+        ..add(_u64(content.length))
+        ..add(content);
+  return out.toBytes();
+}
+
+/// The smallest Quantization record the readers accept: the scheme they
+/// implement, a finite origin, and unit steps.
+Uint8List _quantizationContent() {
+  final BytesBuilder body = BytesBuilder()..add(_string('uniform-v1'));
+  for (int i = 0; i < 3; i++) {
+    body.add(_f64(0.0)); // pos origin
+  }
+  for (int i = 0; i < 8; i++) {
+    body.add(_f64(1.0)); // step_pos .. step_sigma_log
+  }
+  body
+    ..addByte(1) // step_sh
+    ..add(_u32(0)); // empty bounds map
+  return body.toBytes();
 }
 
 /// Byte offset of the Header's `gaussian_count`, found by walking the record

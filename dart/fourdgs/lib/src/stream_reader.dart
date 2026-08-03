@@ -337,15 +337,19 @@ FourdgsScene readFourdgsBytes(
     }
   } on FourdgsTruncatedFile {
     if (!recoverTruncated) rethrow;
-    // Recovery is for a file that stopped early, and the closing magic says
-    // whether it did. With that magic present every byte is here and the walk
-    // still ran off the end, which means a record's own length field lied —
-    // internal corruption, not a short download. Recovering would silently
-    // discard the real records that follow the corrupt one, a far larger loss
-    // than the tail-end truncation this exists to tolerate. The two arrive as
-    // the same exception because, from inside the framing scan, they look
-    // identical.
-    if (_endsWithMagic(data)) rethrow;
+    // Recovery is for a file that stopped early. A walk that ran off the end of
+    // a file which nevertheless carries a complete tail means a record's own
+    // length field lied — internal corruption, not a short download — and
+    // recovering would silently discard the real records after the corrupt one.
+    // The two arrive as the same exception because, from inside the framing
+    // scan, they look identical.
+    //
+    // The trailing magic ALONE does not establish that tail. Those eight bytes
+    // can occur inside any payload, so a prefix cut mid-record can end with them
+    // by coincidence — or by construction, which is the case a hostile-input
+    // suite is for. A Footer record sitting immediately before them is the
+    // structure a complete file actually ends with, and is what this asks for.
+    if (_endsWithFooterAndMagic(data)) rethrow;
     truncated = true;
   }
 
@@ -384,7 +388,14 @@ FourdgsScene readFourdgsBytes(
     // t0 >= duration` is the complement of an overlap test that only holds for
     // a non-degenerate window, and at duration 0 an entry straddling zero,
     // `[-1, 1)`, satisfies neither half.
-    if (entry.gaussianCount > 0 &&
+    // `liveCount` is the population only for a DELTA entry; a keyframe leaves it
+    // zero and counts its gaussians the ordinary way, so keying on `extended`
+    // alone would read every keyframe in an extended index as empty.
+    final int population =
+        (entry.extended && entry.kind == 1)
+            ? entry.liveCount
+            : entry.gaussianCount;
+    if (population > 0 &&
         (header.durationSec <= 0.0 ||
             entry.t1 <= 0.0 ||
             entry.t0 >= header.durationSec)) {
@@ -614,6 +625,28 @@ FourdgsAudioSource _audioSource(
   interpolation: source.interpolation,
   data: data,
 );
+
+/// True when the resource ends the way a complete file does: a Footer record,
+/// then the closing magic.
+///
+/// Deliberately stricter than a suffix comparison. The magic is eight bytes with
+/// no framing of its own, so any payload may contain them; only a Footer in
+/// front of them says the record stream really reached its end.
+bool _endsWithFooterAndMagic(Uint8List data) {
+  if (!_endsWithMagic(data)) return false;
+  // opcode + u64 length + the Footer's three fields.
+  const int footerContentBytes = 8 + 8 + 4;
+  const int footerRecordBytes = 1 + 8 + footerContentBytes;
+  final int at = data.length - fourdgsMagic.length - footerRecordBytes;
+  if (at < fourdgsMagic.length) return false;
+  if (data[at] != opFooter) return false;
+  final int declared = ByteData.sublistView(
+    data,
+    at + 1,
+    at + 9,
+  ).getUint64(0, Endian.little);
+  return declared == footerContentBytes;
+}
 
 bool _endsWithMagic(Uint8List data) {
   if (data.length < fourdgsMagic.length) return false;
