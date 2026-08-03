@@ -132,6 +132,10 @@ FourdgsScene readFourdgsBytes(
   FourdgsQuantization? quantization;
   List<FourdgsWindow> windows = const <FourdgsWindow>[];
   final chunks = <FourdgsDecodedChunk>[];
+  // True only when the record walk itself hit the end of the buffer. Distinct
+  // from `truncated`, which is also set for a file whose records are all intact
+  // but whose closing magic is missing.
+  bool recordsRanOut = false;
   final chunkCounts = <int>[];
   final chunkBands = <Map<int, Uint8List>>[];
   final chunkIndex = <FourdgsChunkIndexEntry>[];
@@ -347,6 +351,7 @@ FourdgsScene readFourdgsBytes(
     // identical.
     if (_endsWithMagic(data)) rethrow;
     truncated = true;
+    recordsRanOut = true;
   }
 
   // The magic is written at both ends so that a file can be recognized from its
@@ -395,19 +400,6 @@ FourdgsScene readFourdgsBytes(
     }
   }
 
-  // A complete file whose chunks do not add up to the total its own Header
-  // declares. Only for a file that arrived whole: a truncated one is expected
-  // to hold fewer, and that is what `truncated` reports rather than an error.
-  if (!truncated) {
-    final assembled = chunkCounts.fold<int>(0, (int sum, int n) => sum + n);
-    if (assembled != header.gaussianCount) {
-      throw FourdgsMalformedFile(
-        'the header declares ${header.gaussianCount} gaussians but the chunks '
-        'assemble to $assembled',
-      );
-    }
-  }
-
   final audioSources = _assembleAudioSources(
     header,
     audioDescriptors,
@@ -416,6 +408,30 @@ FourdgsScene readFourdgsBytes(
     firstAudioRecord,
     truncated,
   );
+
+  // Placed after the record-level diagnostics above on purpose. This is a tally
+  // over the whole file, so it can only say "something is missing"; a record
+  // that names its own fault says more, and a reader should hear that first.
+  // A complete file whose chunks do not add up to the total its own Header
+  // declares.
+  //
+  // Gated on the RECORD WALK completing, not on `truncated`. Those differ in
+  // exactly the case worth catching: a file whose records all parsed but whose
+  // closing magic was dropped is marked truncated, yet no later chunk can
+  // explain a mismatch — every chunk the file has was decoded. Skipping the
+  // check for it would let nine missing bytes wave a quietly short scene
+  // through. A walk that really ran out is a different matter: fewer gaussians
+  // than the header promises is the expected outcome there, and `truncated` is
+  // what reports it.
+  if (!recordsRanOut) {
+    final assembled = chunkCounts.fold<int>(0, (int sum, int n) => sum + n);
+    if (assembled != header.gaussianCount) {
+      throw FourdgsMalformedFile(
+        'the header declares ${header.gaussianCount} gaussians but the chunks '
+        'assemble to $assembled',
+      );
+    }
+  }
 
   // The cross-record rules — unique sensor names, a rig reference that
   // resolves — can only run once the whole front matter has gone past. A

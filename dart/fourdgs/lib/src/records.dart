@@ -439,15 +439,6 @@ class FourdgsChunkIndexEntry {
         'must not end before it starts',
       );
     }
-    // Zero width is legal only when the chunk is empty. The seek rule is
-    // half-open, so a nonempty chunk over `t0 == t1` can never be selected —
-    // its gaussians are unreachable while still counting toward the file total.
-    if (t0 == t1 && gaussianCount != 0) {
-      throw FourdgsMalformedFile(
-        'a chunk index entry declares $gaussianCount gaussians over the '
-        'zero-width interval [$t0, $t1); no seek can ever select them',
-      );
-    }
     final bandCount = c.u32();
     if (bandCount > c.remaining ~/ bandRangeBytes) {
       throw FourdgsMalformedFile(
@@ -482,6 +473,19 @@ class FourdgsChunkIndexEntry {
     // record's length from its header, so an entry with at least this many bytes
     // left carries the block and a `gaussian-birth` entry — which has none —
     // reads to the same values it always did.
+    // Zero width is legal only when the entry is empty, and which field says
+    // "empty" depends on the entry. The seek rule is half-open, so nothing can
+    // ever select a nonempty chunk over `t0 == t1` — its gaussians are
+    // unreachable while still counting toward the file.
+    void refuseNonemptyZeroWidth(int population, String what) {
+      if (t0 == t1 && population != 0) {
+        throw FourdgsMalformedFile(
+          'a chunk index entry declares $population $what over the zero-width '
+          'interval [$t0, $t1); no seek can ever select them',
+        );
+      }
+    }
+
     if (c.remaining >= indexDeltaBlockBytes) {
       final kind = c.u8();
       final deltaMode = c.u8();
@@ -489,6 +493,13 @@ class FourdgsChunkIndexEntry {
       final keyframeOffset = c.u64();
       final depth = c.u16();
       final liveCount = c.u64();
+      // A delta entry's `gaussianCount` counts the operations it carries —
+      // births, deaths, updates — not the population they compose to. A delta
+      // that changes nothing has zero operations over a live scene, so testing
+      // it here would wave through exactly the unreachable state chunk this
+      // refuses. `liveCount` is the population over [t0, t1), so that is the
+      // number the rule is about.
+      refuseNonemptyZeroWidth(liveCount, 'live gaussians');
       return FourdgsChunkIndexEntry(
         t0: t0,
         t1: t1,
@@ -505,6 +516,8 @@ class FourdgsChunkIndexEntry {
         liveCount: liveCount,
       );
     }
+    // No extended block: `gaussianCount` IS the population.
+    refuseNonemptyZeroWidth(gaussianCount, 'gaussians');
     return FourdgsChunkIndexEntry(
       t0: t0,
       t1: t1,

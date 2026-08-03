@@ -16,6 +16,7 @@
 library;
 
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:fourdgs/fourdgs.dart';
@@ -239,6 +240,33 @@ void main() {
       );
     });
 
+    test('a zero-change DELTA over a zero-width interval is refused', () {
+      // A delta entry's `gaussianCount` counts operations — births, deaths,
+      // updates — not the population they compose to. A delta that changes
+      // nothing carries zero operations over a live scene, so a rule written
+      // against `gaussianCount` waves through exactly the unreachable state
+      // chunk it is supposed to refuse. `liveCount` is the population.
+      final BytesBuilder body =
+          BytesBuilder()
+            ..add(_f64(1.0)) // t0
+            ..add(_f64(1.0)) // t1 — zero width
+            ..add(_u64(0)) // chunkOffset
+            ..add(_u64(0)) // chunkLength
+            ..add(_u32(0)) // gaussianCount: no operations
+            ..add(_u32(0)) // bandCount
+            // keyframe-delta block
+            ..addByte(1) // kind: delta
+            ..addByte(0) // deltaMode
+            ..add(_u64(0)) // referenceOffset
+            ..add(_u64(0)) // keyframeOffset
+            ..add(_u32(0).sublist(0, 2)) // depth (u16)
+            ..add(_u64(7)); // liveCount: seven gaussians nothing can reach
+      expect(
+        () => FourdgsChunkIndexEntry.parse(body.toBytes()),
+        throwsA(isA<FourdgsMalformedFile>()),
+      );
+    });
+
     test('an EMPTY chunk over a zero-width interval is still accepted', () {
       final FourdgsChunkIndexEntry entry = FourdgsChunkIndexEntry.parse(
         _chunkIndexEntryContent(t0: 1.0, t1: 1.0, gaussianCount: 0),
@@ -246,4 +274,79 @@ void main() {
       expect(entry.gaussianCount, 0);
     });
   });
+
+  group('a short scene cannot hide behind a missing closing magic', () {
+    test(
+      'dropping only the trailing magic does not excuse a header/chunk mismatch',
+      () {
+        // The records all parse; only the closing magic is gone. That marks the
+        // file truncated, but no later chunk could explain a mismatch — every
+        // chunk the file has was decoded. Gating the cross-check on `truncated`
+        // would let nine missing bytes wave a quietly short scene through.
+        final Uint8List real =
+            File(
+              '../../tests/conformance/data/TenWindows-UseChunkIndex-UseCrc.4dgs',
+            ).readAsBytesSync();
+
+        // Inflate the header's gaussian count by one, so the file now claims one
+        // more gaussian than its chunks assemble to.
+        final Uint8List bytes = Uint8List.fromList(real);
+        final int countOffset = _headerGaussianCountOffset(bytes);
+        final ByteData view = ByteData.sublistView(
+          bytes,
+          countOffset,
+          countOffset + 8,
+        );
+        final int declared = view.getUint32(0, Endian.little);
+        view.setUint32(0, declared + 1, Endian.little);
+
+        // Whole file: refused, as the check intends.
+        expect(
+          () => readFourdgsBytes(bytes, recoverTruncated: true),
+          throwsA(isA<FourdgsMalformedFile>()),
+        );
+
+        // Same file with the closing magic dropped: still refused.
+        final Uint8List clipped = Uint8List.sublistView(
+          bytes,
+          0,
+          bytes.length - fourdgsMagic.length,
+        );
+        expect(
+          () => readFourdgsBytes(clipped, recoverTruncated: true),
+          throwsA(isA<FourdgsMalformedFile>()),
+        );
+      },
+    );
+  });
+}
+
+/// Byte offset of the Header's `gaussian_count`, found by walking the record
+/// framing rather than assuming a layout.
+int _headerGaussianCountOffset(Uint8List bytes) {
+  int offset = fourdgsMagic.length;
+  while (offset + 9 <= bytes.length) {
+    final int opcode = bytes[offset];
+    final ByteData lengthView = ByteData.sublistView(
+      bytes,
+      offset + 1,
+      offset + 9,
+    );
+    final int length = lengthView.getUint32(0, Endian.little);
+    if (opcode == 0x01) {
+      // profile, library: each a u32 length followed by its bytes.
+      int at = offset + 9;
+      for (int i = 0; i < 2; i++) {
+        final int n = ByteData.sublistView(
+          bytes,
+          at,
+          at + 4,
+        ).getUint32(0, Endian.little);
+        at += 4 + n;
+      }
+      return at + 8; // past durationSec
+    }
+    offset += 9 + length;
+  }
+  throw StateError('no Header record found');
 }
