@@ -50,6 +50,42 @@ pub enum Error {
     InvalidInput(String),
     /// The transport failed.
     Io(std::io::Error),
+    /// A refusal the specification names, carrying the identifier that names it.
+    ///
+    /// The other variants say what *kind* of thing went wrong. This one additionally says
+    /// *which* refusal it is, with a stable string the conformance suite compares against
+    /// the same identifier every other SDK prints — so "refused for the right reason" and
+    /// "refused for some reason" stop being the same observation.
+    ///
+    /// It does not change how a refusal reads. `kind` carries the variant this would
+    /// otherwise have been, and both `Display` and the C ABI's status mapping defer to it,
+    /// so the sentence on the wire is byte-for-byte what it was before the identifier
+    /// existed. That matters because the specification writes those sentences and the CLI
+    /// cross-validator compares them against the Python reader's, line for line.
+    Refused {
+        /// Stable across releases and across languages. Changing one is a wire-visible
+        /// change to the conformance corpus, not an implementation detail.
+        code: &'static str,
+        kind: RefusalKind,
+        message: String,
+    },
+}
+
+/// The variant a [`Error::Refused`] would have been without its identifier.
+///
+/// Exists so that adding the identifier changed no sentence and no status code. Each arm
+/// maps to exactly the `Display` prefix and the `FOURDGS_STATUS_*` its counterpart had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalKind {
+    /// Not a 4dgs file, or a major version this reader does not implement.
+    UnsupportedVersion,
+    /// A well-known name this build does not implement — a temporal model, a quantization
+    /// scheme. Prints the message alone, as its counterpart does.
+    UnsupportedModel,
+    /// A legal but unimplemented codec.
+    UnsupportedCodec,
+    /// Structurally invalid: a value outside its legal domain.
+    Malformed,
 }
 
 impl fmt::Display for Error {
@@ -64,6 +100,13 @@ impl fmt::Display for Error {
             Error::UnsupportedOperation(m) => write!(f, "unsupported operation: {m}"),
             Error::InvalidInput(m) => write!(f, "invalid input: {m}"),
             Error::Io(e) => write!(f, "io: {e}"),
+            // Deferred to the kind so that naming a refusal did not reword it.
+            Error::Refused { kind, message, .. } => match kind {
+                RefusalKind::UnsupportedVersion => write!(f, "unsupported version: {message}"),
+                RefusalKind::UnsupportedModel => write!(f, "{message}"),
+                RefusalKind::UnsupportedCodec => write!(f, "unsupported codec: {message}"),
+                RefusalKind::Malformed => write!(f, "malformed: {message}"),
+            },
         }
     }
 }
@@ -83,11 +126,96 @@ impl From<std::io::Error> for Error {
     }
 }
 
+/// Every refusal this reader can name (spec: the refusal table).
+///
+/// Constants rather than string literals at the raise sites, because these are compared
+/// across six implementations: a typo in one is a conformance failure that reads like a
+/// decoder bug.
+pub mod refusal {
+    /// The file does not begin with the 4dgs magic.
+    pub const MAGIC_MISMATCH: &str = "magic-mismatch";
+    /// The magic is ours; the major version is not one this reader implements.
+    pub const UNSUPPORTED_MAJOR_VERSION: &str = "unsupported-major-version";
+    /// The Header names a temporal model this build does not implement — including the
+    /// empty name, which is a declaration of nothing rather than a default.
+    pub const UNKNOWN_TEMPORAL_MODEL: &str = "unknown-temporal-model";
+    /// The Quantization record names a scheme this build does not implement.
+    pub const UNKNOWN_QUANTIZATION_SCHEME: &str = "unknown-quantization-scheme";
+    /// A stream declares a codec this build does not implement.
+    pub const UNKNOWN_STREAM_CODEC: &str = "unknown-stream-codec";
+    /// A gaussian's `window_index` names a row the Window Table does not have.
+    pub const WINDOW_INDEX_OUT_OF_RANGE: &str = "window-index-out-of-range";
+}
+
 impl Error {
     /// True for the one error a streamed reader recovers from by keeping what it already
     /// decoded.
     pub fn is_truncation(&self) -> bool {
         matches!(self, Error::Truncated(_))
+    }
+
+    /// Build a named refusal. See [`refusal`] for the identifiers.
+    pub fn refused(code: &'static str, kind: RefusalKind, message: String) -> Error {
+        Error::Refused {
+            code,
+            kind,
+            message,
+        }
+    }
+
+    /// True when this is "not our file, or a version we do not implement", however it was
+    /// raised.
+    ///
+    /// Predicates rather than `matches!` on the variant, because a named refusal lives in
+    /// [`Error::Refused`] and carries its taxonomy in `kind`. Asking the question this way
+    /// keeps working when a refusal gains a name; matching the variant directly does not.
+    pub fn is_unsupported_version(&self) -> bool {
+        matches!(
+            self,
+            Error::UnsupportedVersion(_)
+                | Error::Refused {
+                    kind: RefusalKind::UnsupportedVersion,
+                    ..
+                }
+        )
+    }
+
+    /// True for a legal file this build cannot read — an unimplemented codec, temporal
+    /// model or quantization scheme.
+    pub fn is_unsupported_feature(&self) -> bool {
+        matches!(
+            self,
+            Error::UnsupportedCodec(_)
+                | Error::UnsupportedModel(_)
+                | Error::Refused {
+                    kind: RefusalKind::UnsupportedCodec | RefusalKind::UnsupportedModel,
+                    ..
+                }
+        )
+    }
+
+    /// True for a structurally invalid file.
+    pub fn is_malformed(&self) -> bool {
+        matches!(
+            self,
+            Error::Malformed(_)
+                | Error::Refused {
+                    kind: RefusalKind::Malformed,
+                    ..
+                }
+        )
+    }
+
+    /// The identifier for a refusal this reader can name, or `None` for everything else.
+    ///
+    /// `None` is not a failure — a truncated transport and an encoder bound violation are
+    /// real errors that the refusal table does not name. It means "this is not one of the
+    /// refusals the corpus compares".
+    pub fn refusal_code(&self) -> Option<&'static str> {
+        match self {
+            Error::Refused { code, .. } => Some(code),
+            _ => None,
+        }
     }
 }
 

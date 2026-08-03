@@ -68,8 +68,14 @@ fn minimal_file() -> Vec<u8> {
 fn a_file_that_is_not_ours_is_refused_as_a_version_problem() {
     let err = fourdgs::read_bytes(&[0u8; 64]).unwrap_err();
     assert!(
-        matches!(err, Error::UnsupportedVersion(_)),
+        err.is_unsupported_version(),
         "expected an unsupported version, got {err}"
+    );
+    // The stronger statement: not merely refused, refused for a reason it can name — the
+    // same identifier every other SDK prints for this file.
+    assert_eq!(
+        err.refusal_code(),
+        Some(fourdgs::error::refusal::MAGIC_MISMATCH)
     );
 }
 
@@ -80,7 +86,11 @@ fn a_future_major_version_names_itself() {
     let err = fourdgs::read_bytes(&data).unwrap_err();
     // The fix for this is a newer reader, not a new file, so it must not be reported as
     // corruption.
-    assert!(matches!(err, Error::UnsupportedVersion(_)));
+    assert!(err.is_unsupported_version());
+    assert_eq!(
+        err.refusal_code(),
+        Some(fourdgs::error::refusal::UNSUPPORTED_MAJOR_VERSION)
+    );
     assert!(
         err.to_string().contains('9'),
         "the message names the version: {err}"
@@ -270,8 +280,31 @@ fn an_unimplemented_codec_is_refused_by_name() {
     // A different failure from a corrupt file: the file is fine, this build cannot read
     // it, and the message has to say which codec so the fix is obvious.
     let err = fourdgs::codec::decompress(b"anything", 200, 16).unwrap_err();
-    assert!(matches!(err, Error::UnsupportedCodec(_)), "got {err}");
+    assert!(err.is_unsupported_feature(), "got {err}");
+    assert_eq!(
+        err.refusal_code(),
+        Some(fourdgs::error::refusal::UNKNOWN_STREAM_CODEC)
+    );
     assert!(err.to_string().contains("200"));
+}
+
+/// A build without the `zstd` feature still *names* what it is refusing.
+///
+/// This is the default build's answer to a legal zstd file, so it is the refusal a stock
+/// Rust reader hands back most often. Leaving it unnamed would mean the one stream codec
+/// people actually hit is the one the reader cannot identify — and the conformance runner
+/// would report it as having fallen over rather than as having refused.
+#[test]
+#[cfg(not(feature = "zstd"))]
+fn a_zstd_stream_without_the_feature_is_refused_by_name() {
+    let err = fourdgs::codec::decompress(b"anything", 1, 16).unwrap_err();
+    assert!(err.is_unsupported_feature(), "got {err}");
+    assert_eq!(
+        err.refusal_code(),
+        Some(fourdgs::error::refusal::UNKNOWN_STREAM_CODEC)
+    );
+    // The identifier says which rule; the message says which of the two cases it is.
+    assert!(err.to_string().contains("zstd"), "{err}");
 }
 
 #[test]

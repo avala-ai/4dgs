@@ -67,10 +67,14 @@ pub fn chunk_stream_bytes<'a>(
         return Ok(std::borrow::Cow::Borrowed(streams));
     }
     let numeric = codec::codec_from_name(&head.compression).ok_or_else(|| {
-        Error::UnsupportedCodec(format!(
-            "the chunk at t0={} is compressed with {:?}, which this build does not know",
-            head.t0, head.compression
-        ))
+        Error::refused(
+            crate::error::refusal::UNKNOWN_STREAM_CODEC,
+            crate::error::RefusalKind::UnsupportedCodec,
+            format!(
+                "the chunk at t0={} is compressed with {:?}, which this build does not know",
+                head.t0, head.compression
+            ),
+        )
     })?;
     let expected = usize::try_from(head.uncompressed_size).map_err(|_| {
         Error::Malformed(format!(
@@ -90,9 +94,11 @@ pub fn chunk_stream_bytes<'a>(
 /// wrong output. Refusing names the index and the table.
 pub fn check_window_index(index: i64, table_len: usize) -> Result<u32> {
     if index < 0 || index as usize >= table_len {
-        return Err(Error::Malformed(format!(
-            "window index {index} is outside the {table_len}-entry window table"
-        )));
+        return Err(Error::refused(
+            crate::error::refusal::WINDOW_INDEX_OUT_OF_RANGE,
+            crate::error::RefusalKind::Malformed,
+            format!("window index {index} is outside the {table_len}-entry window table"),
+        ));
     }
     Ok(index as u32)
 }

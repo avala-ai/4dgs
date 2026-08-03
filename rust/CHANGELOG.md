@@ -6,7 +6,29 @@ All notable changes to the Rust crate are documented here, following
 
 ## [Unreleased]
 
+### Changed
+
+- **Named refusals are a new `Error` variant.** The six refusals the specification's table names —
+  `magic-mismatch`, `unsupported-major-version`, `unknown-temporal-model`,
+  `unknown-quantization-scheme`, `unknown-stream-codec`, `window-index-out-of-range` — now arrive as
+  `Error::Refused { code, kind, message }` rather than as `UnsupportedVersion`, `UnsupportedCodec`,
+  `UnsupportedModel` or `Malformed`. Nothing on the wire changed: `kind` carries the variant it
+  would have been, and both `Display` and the C ABI's status mapping defer to it, so every sentence
+  and every `FOURDGS_STATUS_*` is what it was.
+
+  **This is a breaking change for code that matched those variants directly** —
+  `matches!(err, Error::UnsupportedVersion(_))` no longer catches a bad magic. Use the new
+  predicates, which account for both spellings and keep working when a refusal gains a name:
+  `Error::is_unsupported_version`, `is_unsupported_feature`, `is_malformed`.
+
 ### Added
+
+- **Refusal identifiers.** `Error::refusal_code` returns a stable string for a refusal this reader
+  can name, or `None` for errors the refusal table does not cover — a truncated transport, an
+  encoder bound violation. The identifiers are constants in `fourdgs::error::refusal`, compared
+  across every SDK by the conformance suite, so a typo in one is a conformance failure rather than a
+  private detail. Rust now answers the invalid corpus and passes **119** checks, the same as the
+  Python reference.
 
 - **Provenance on the C ABI.** `fourdgs_scene_provenance_json` returns the canonical provenance
   object (frames, anchors, sensors, trajectories with `posesAt` probes, and `sensorPosesAt`) for an
