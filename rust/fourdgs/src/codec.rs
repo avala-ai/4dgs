@@ -60,7 +60,14 @@ fn decompress_zstd(body: &[u8], expected: usize) -> Result<Vec<u8>> {
 
 #[cfg(not(feature = "zstd"))]
 fn decompress_zstd(_body: &[u8], _expected: usize) -> Result<Vec<u8>> {
-    Err(Error::UnsupportedCodec(
+    // Named, like the unknown-id arm above. This is the *default* build's answer to a
+    // legal zstd file, so leaving it unnamed would mean the codec a stock Rust build
+    // refuses most often is the one it cannot name. The identifier is the same one:
+    // from the file's side both are "this reader does not implement my stream codec",
+    // and which of the two it is belongs in the message, not in the identifier.
+    Err(Error::refused(
+        crate::error::refusal::UNKNOWN_STREAM_CODEC,
+        crate::error::RefusalKind::UnsupportedCodec,
         "this file uses zstd streams; rebuild the crate with the 'zstd' feature".into(),
     ))
 }

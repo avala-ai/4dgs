@@ -288,6 +288,25 @@ fn an_unimplemented_codec_is_refused_by_name() {
     assert!(err.to_string().contains("200"));
 }
 
+/// A build without the `zstd` feature still *names* what it is refusing.
+///
+/// This is the default build's answer to a legal zstd file, so it is the refusal a stock
+/// Rust reader hands back most often. Leaving it unnamed would mean the one stream codec
+/// people actually hit is the one the reader cannot identify — and the conformance runner
+/// would report it as having fallen over rather than as having refused.
+#[test]
+#[cfg(not(feature = "zstd"))]
+fn a_zstd_stream_without_the_feature_is_refused_by_name() {
+    let err = fourdgs::codec::decompress(b"anything", 1, 16).unwrap_err();
+    assert!(err.is_unsupported_feature(), "got {err}");
+    assert_eq!(
+        err.refusal_code(),
+        Some(fourdgs::error::refusal::UNKNOWN_STREAM_CODEC)
+    );
+    // The identifier says which rule; the message says which of the two cases it is.
+    assert!(err.to_string().contains("zstd"), "{err}");
+}
+
 #[test]
 fn a_deflate_stream_that_lies_about_its_size_is_refused() {
     let raw = b"the quick brown fox";
