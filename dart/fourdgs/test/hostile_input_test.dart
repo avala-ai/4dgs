@@ -45,13 +45,14 @@ Uint8List _headerContent({
   int shDegree = 0,
   double durationSec = 1.0,
   double cutoff = 0.05,
+  int gaussianCount = 0,
 }) {
   final body =
       BytesBuilder()
         ..add(_string('')) // profile
         ..add(_string('')) // library
         ..add(_f64(durationSec))
-        ..add(_u64(0)) // gaussian count
+        ..add(_u64(gaussianCount))
         ..add(_f64(cutoff))
         ..add(_string(temporalModel));
   for (int i = 0; i < 6; i++) {
@@ -310,19 +311,90 @@ void main() {
       );
     });
 
+    test('a nonempty index entry at duration zero opens', () async {
+      // The exact shape `fourdgs.write(g, 0.0)` produces: t1 just past zero, a
+      // nonempty entry, and no scene clock to bound its end.
+      final BytesBuilder out =
+          BytesBuilder()
+            ..add(fourdgsMagic)
+            // The header's total must agree with the index, or the cross-check
+            // refuses the file before the clock rule is reached — which is correct,
+            // and would make this test about the wrong thing.
+            ..add(
+              _record(
+                opHeader,
+                _headerContent(durationSec: 0.0, gaussianCount: 1),
+              ),
+            )
+            ..add(_record(opQuantization, _quantizationContent()))
+            // The static window itself: [0, +infinity). A file that
+            // declares gaussians must carry a Window Table, and this is
+            // the one such a scene has.
+            ..add(
+              _record(
+                opWindowTable,
+                _windowTableContent(lo: 0.0, hi: double.infinity),
+              ),
+            );
+      final int summaryStart = out.length;
+      out.add(
+        _record(opChunkIndex, _chunkIndexEntryContent(t0: 0.0, t1: 1e-9)),
+      );
+      final BytesBuilder footer =
+          BytesBuilder()
+            ..add(_u64(summaryStart))
+            ..add(_u64(0))
+            ..add(_u32(0));
+      out
+        ..add(_record(opFooter, footer.toBytes()))
+        ..add(fourdgsMagic);
+      final Uint8List bytes = out.toBytes();
+
+      // Indexed only: this file carries front matter and an index but no
+      // Chunk record, which the indexed opener never needs and the streamed
+      // reader rightly refuses. The streamed path's clock rule reads the same
+      // entry fields, covered by the entry-level test below.
+      final FourdgsIndexedScene indexed = await openFourdgsIndexed(
+        FourdgsBytes(bytes),
+      );
+      expect(indexed.header.durationSec, 0.0);
+      expect(indexed.index.single.t1, 1e-9);
+    });
+  });
+
+  group('an entry just past zero is not out of clock', () {
+    test('a nonempty entry at duration zero parses', () {
+      // The shape `fourdgs.write(g, 0.0)` emits for a static asset; both
+      // readers apply their clock rule to exactly these fields.
+      final FourdgsChunkIndexEntry entry = FourdgsChunkIndexEntry.parse(
+        _chunkIndexEntryContent(t0: 0.0, t1: 1e-9),
+      );
+      expect(entry.t1, 1e-9);
+      expect(entry.gaussianCount, 1);
+    });
+  });
+
+  group('both openers agree about the header total', () {
     test(
-      'a nonempty index entry at duration zero is accepted by both openers',
+      'an inflated header count is refused by the indexed opener too',
       () async {
-        // The exact shape `fourdgs.write(g, 0.0)` produces: t1 just past zero, a
-        // nonempty entry, and no scene clock to bound its end.
+        // The streamed reader compares the header against the chunks it
+        // assembled. The indexed opener never touches a chunk, so its only
+        // evidence is the index — and without this it returned a scene whose
+        // header count was simply false, with every chunk readable and the CRC
+        // verifying. One opener refusing and the other agreeing is the divergence
+        // this whole area exists to remove.
         final BytesBuilder out =
             BytesBuilder()
               ..add(fourdgsMagic)
-              ..add(_record(opHeader, _headerContent(durationSec: 0.0)))
-              ..add(_record(opQuantization, _quantizationContent()));
+              ..add(_record(opHeader, _headerContent(gaussianCount: 9)))
+              ..add(_record(opQuantization, _quantizationContent()))
+              ..add(
+                _record(opWindowTable, _windowTableContent(lo: 0.0, hi: 1.0)),
+              );
         final int summaryStart = out.length;
         out.add(
-          _record(opChunkIndex, _chunkIndexEntryContent(t0: 0.0, t1: 1e-9)),
+          _record(opChunkIndex, _chunkIndexEntryContent(t0: 0.0, t1: 1.0)),
         );
         final BytesBuilder footer =
             BytesBuilder()
@@ -332,16 +404,17 @@ void main() {
         out
           ..add(_record(opFooter, footer.toBytes()))
           ..add(fourdgsMagic);
-        final Uint8List bytes = out.toBytes();
 
-        expect(
-          readFourdgsBytes(bytes, recoverTruncated: false).header.durationSec,
-          0.0,
+        await expectLater(
+          openFourdgsIndexed(FourdgsBytes(out.toBytes())),
+          throwsA(
+            isA<FourdgsMalformedFile>().having(
+              (FourdgsMalformedFile e) => e.message,
+              'message',
+              contains('accounts for'),
+            ),
+          ),
         );
-        final FourdgsIndexedScene indexed = await openFourdgsIndexed(
-          FourdgsBytes(bytes),
-        );
-        expect(indexed.index.single.t1, 1e-9);
       },
     );
   });

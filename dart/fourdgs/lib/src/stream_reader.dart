@@ -337,19 +337,20 @@ FourdgsScene readFourdgsBytes(
     }
   } on FourdgsTruncatedFile {
     if (!recoverTruncated) rethrow;
-    // Recovery is for a file that stopped early. A walk that ran off the end of
-    // a file which nevertheless carries a complete tail means a record's own
-    // length field lied — internal corruption, not a short download — and
-    // recovering would silently discard the real records after the corrupt one.
-    // The two arrive as the same exception because, from inside the framing
-    // scan, they look identical.
+    // Recovery, unconditionally. A corrupt record length and a file cut short
+    // raise the same exception, and from the framing alone they cannot be told
+    // apart: in BOTH cases the walk is unable to reach the tail, so nothing at
+    // the tail is evidence of anything. Two attempts at a discriminator were
+    // tried and both were unsound — first the closing magic, then a Footer
+    // record in front of it. Each is a fixed byte pattern with no framing of
+    // its own, so a payload can contain it, which makes a crafted file able to
+    // turn a legitimate partial read into a refusal. Breaking recovery for
+    // hostile input is a worse trade than accepting a prefix of a corrupt file,
+    // which is what `truncated` already reports.
     //
-    // The trailing magic ALONE does not establish that tail. Those eight bytes
-    // can occur inside any payload, so a prefix cut mid-record can end with them
-    // by coincidence — or by construction, which is the case a hostile-input
-    // suite is for. A Footer record sitting immediately before them is the
-    // structure a complete file actually ends with, and is what this asks for.
-    if (_endsWithFooterAndMagic(data)) rethrow;
+    // The case that motivated the discriminator is still caught, and soundly:
+    // when the walk DOES reach the Footer, the header/chunk cross-check below
+    // refuses a file whose totals disagree.
     truncated = true;
   }
 
@@ -624,29 +625,6 @@ FourdgsAudioSource _audioSource(
   interpolation: source.interpolation,
   data: data,
 );
-
-/// True when the resource ends the way a complete file does: a Footer record,
-/// then the closing magic.
-///
-/// Deliberately stricter than a suffix comparison. The magic is eight bytes with
-/// no framing of its own, so any payload may contain them; only a Footer in
-/// front of them says the record stream really reached its end.
-bool _endsWithFooterAndMagic(Uint8List data) {
-  if (!_endsWithMagic(data)) return false;
-  // opcode + u64 length + the Footer's three fields.
-  const int footerContentBytes = 8 + 8 + 4;
-  const int footerRecordBytes = 1 + 8 + footerContentBytes;
-  final int at = data.length - fourdgsMagic.length - footerRecordBytes;
-  if (at < fourdgsMagic.length) return false;
-  if (data[at] != opFooter) return false;
-  // Two u32 reads, not `getUint64`: that method is unsupported under dart2js, so
-  // reaching for it here would turn a browser's diagnosis of a corrupt file into
-  // a platform `UnsupportedError`. `FourdgsCursor.u64` splits it the same way.
-  final ByteData length = ByteData.sublistView(data, at + 1, at + 9);
-  final int low = length.getUint32(0, Endian.little);
-  final int high = length.getUint32(4, Endian.little);
-  return high == 0 && low == footerContentBytes;
-}
 
 bool _endsWithMagic(Uint8List data) {
   if (data.length < fourdgsMagic.length) return false;

@@ -325,6 +325,28 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
     }
   }
 
+  // The same total the streamed reader cross-checks, from the only evidence this
+  // path has: the index itself. Without it an inflated header count is refused
+  // by one opener and returned as fact by the other — every chunk readable, the
+  // CRC verifying, and the scene claiming gaussians it does not have.
+  //
+  // `gaussian-birth` only. A keyframe-delta index describes operations composing
+  // onto a keyframe, so its entries do not sum to the population and the header
+  // total is not their sum. An empty index says nothing either way.
+  if (index.isNotEmpty && front.header!.temporalModel == 'gaussian-birth') {
+    final int declared = front.header!.gaussianCount;
+    final int indexed = index.fold<int>(
+      0,
+      (int sum, e) => sum + e.gaussianCount,
+    );
+    if (indexed != declared) {
+      throw FourdgsMalformedFile(
+        'the header declares $declared gaussians but the chunk index accounts '
+        'for $indexed',
+      );
+    }
+  }
+
   return FourdgsIndexedScene(
     header: front.header!,
     quantization: front.quantization!,
