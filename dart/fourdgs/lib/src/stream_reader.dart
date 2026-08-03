@@ -337,6 +337,15 @@ FourdgsScene readFourdgsBytes(
     }
   } on FourdgsTruncatedFile {
     if (!recoverTruncated) rethrow;
+    // Recovery is for a file that stopped early, and the closing magic says
+    // whether it did. With that magic present every byte is here and the walk
+    // still ran off the end, which means a record's own length field lied —
+    // internal corruption, not a short download. Recovering would silently
+    // discard the real records that follow the corrupt one, a far larger loss
+    // than the tail-end truncation this exists to tolerate. The two arrive as
+    // the same exception because, from inside the framing scan, they look
+    // identical.
+    if (_endsWithMagic(data)) rethrow;
     truncated = true;
   }
 
@@ -358,6 +367,45 @@ FourdgsScene readFourdgsBytes(
     throw const FourdgsMalformedFile(
       'file has no Header or no Quantization record',
     );
+  }
+
+  // The same clock bound `openFourdgsIndexed` applies, so a container is not
+  // accepted or refused according to which public decoder opened it. An entry
+  // that cannot overlap the scene clock names gaussians no seek will ever
+  // select: the file opens cleanly, its CRC verifies, and part of the scene is
+  // simply unreachable.
+  //
+  // Deferred to here rather than checked as each entry is parsed, because
+  // nothing orders a Chunk Index after the Header — an index arriving first has
+  // no duration to compare against yet, and an early check would let exactly
+  // that file through.
+  for (final entry in chunkIndex) {
+    // `durationSec <= 0` is tested first and unconditionally: `t1 <= 0 ||
+    // t0 >= duration` is the complement of an overlap test that only holds for
+    // a non-degenerate window, and at duration 0 an entry straddling zero,
+    // `[-1, 1)`, satisfies neither half.
+    if (entry.gaussianCount > 0 &&
+        (header.durationSec <= 0.0 ||
+            entry.t1 <= 0.0 ||
+            entry.t0 >= header.durationSec)) {
+      throw FourdgsMalformedFile(
+        'a chunk index entry covers [${entry.t0}, ${entry.t1}), outside the '
+        'scene clock [0, ${header.durationSec})',
+      );
+    }
+  }
+
+  // A complete file whose chunks do not add up to the total its own Header
+  // declares. Only for a file that arrived whole: a truncated one is expected
+  // to hold fewer, and that is what `truncated` reports rather than an error.
+  if (!truncated) {
+    final assembled = chunkCounts.fold<int>(0, (int sum, int n) => sum + n);
+    if (assembled != header.gaussianCount) {
+      throw FourdgsMalformedFile(
+        'the header declares ${header.gaussianCount} gaussians but the chunks '
+        'assemble to $assembled',
+      );
+    }
   }
 
   final audioSources = _assembleAudioSources(

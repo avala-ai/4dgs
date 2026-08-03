@@ -68,20 +68,75 @@ class FourdgsHeader {
 
   static FourdgsHeader parse(Uint8List content) {
     final c = FourdgsCursor(content);
+    final profile = c.string();
+    final library = c.string();
+    final durationSec = c.f64();
+    // Every check here is on a value that decodes into plausible-looking output
+    // when it is trusted, rather than into an obvious error. A NaN duration
+    // reaches timeline arithmetic and breaks playback; a negative one is not a
+    // duration. Zero stays legal — the NoData conformance fixture is exactly a
+    // zero-duration scene.
+    if (!durationSec.isFinite || durationSec < 0) {
+      throw FourdgsMalformedFile(
+        'the header declares an invalid duration ($durationSec seconds)',
+      );
+    }
+    final gaussianCount = c.u64();
+    final cutoff = c.f64();
+    // Otherwise only validated where a chunk's motion is decoded against it,
+    // which a zero-gaussian file or a metadata-only indexed open never reaches
+    // — the bad value would sit in the returned header indefinitely.
+    if (cutoff.isNaN || !(cutoff > 0.0 && cutoff <= 1.0)) {
+      throw FourdgsMalformedFile(
+        "the header's cutoff is $cutoff; a marginal threshold must be in (0, 1]",
+      );
+    }
+    final temporalModel = c.string();
+    // Named, not assumed. A model this build cannot decode is a conforming file
+    // it cannot read, which is a different answer from "corrupt". Both known
+    // models are accepted: `keyframe-delta` files are legal and read by their
+    // own path, which refusing here would make unreachable.
+    if (!_knownTemporalModels.contains(temporalModel)) {
+      throw FourdgsUnsupportedCodec(
+        'the header declares temporal model "$temporalModel", which this build '
+        'does not implement (it implements ${_knownTemporalModels.join(", ")})',
+      );
+    }
+    final aabb = c.f64s(6);
+    final shDegree = c.u8();
+    // 0-3 is the whole registry. Out of range is not merely unknown: a decoded
+    // byte budget prices an unknown band at zero while the coefficient count
+    // keeps growing with the degree, so a buffer sized from the first is not
+    // the scene the second decodes.
+    if (shDegree > 3) {
+      throw FourdgsMalformedFile(
+        'the header declares spherical-harmonic degree $shDegree; the registry '
+        'defines 0 through 3',
+      );
+    }
     return FourdgsHeader(
-      profile: c.string(),
-      library: c.string(),
-      durationSec: c.f64(),
-      gaussianCount: c.u64(),
-      cutoff: c.f64(),
-      temporalModel: c.string(),
-      aabb: c.f64s(6),
-      shDegree: c.u8(),
+      profile: profile,
+      library: library,
+      durationSec: durationSec,
+      gaussianCount: gaussianCount,
+      cutoff: cutoff,
+      temporalModel: temporalModel,
+      aabb: aabb,
+      shDegree: shDegree,
       flags: c.u8(),
       attributes: c.strMap(),
     );
   }
 }
+
+/// Temporal models this build implements.
+///
+/// Accepting a name is a promise to read the file, so a name the specification
+/// reserves belongs here only once this decoder can decode it.
+const Set<String> _knownTemporalModels = <String>{
+  'gaussian-birth',
+  'keyframe-delta',
+};
 
 /// Opcode `0x02`. The tail pointer that makes the file seekable.
 class FourdgsFooter {
@@ -221,7 +276,20 @@ class FourdgsWindowTable {
     }
     final out = <FourdgsWindow>[];
     for (int i = 0; i < n; i++) {
-      out.add(FourdgsWindow(c.f64(), c.f64()));
+      final lo = c.f64();
+      final hi = c.f64();
+      // Visibility is gated on `lo <= t < hi`, so a NaN bound is false at every
+      // instant and those gaussians silently never appear; an inverted window
+      // reads as one covering nothing. Both decode to a scene quietly missing
+      // content, which is worse than a refusal. `lo == hi` stays legal — the
+      // NoData fixture is exactly that.
+      if (!lo.isFinite || !hi.isFinite || hi < lo) {
+        throw FourdgsMalformedFile(
+          'window $i spans [$lo, $hi); a validity window must be finite and '
+          'must not end before it starts',
+        );
+      }
+      out.add(FourdgsWindow(lo, hi));
     }
     return FourdgsWindowTable(out);
   }
@@ -362,6 +430,24 @@ class FourdgsChunkIndexEntry {
     final chunkOffset = c.u64();
     final chunkLength = c.u64();
     final gaussianCount = c.u32();
+    // The interval is what every seek compares against, so a bound that cannot
+    // be compared is worse than a wrong one: NaN makes `t0 <= t < t1` false at
+    // every instant and the chunk never resolves for any seek.
+    if (!t0.isFinite || !t1.isFinite || t1 < t0) {
+      throw FourdgsMalformedFile(
+        'a chunk index entry spans [$t0, $t1); an interval must be finite and '
+        'must not end before it starts',
+      );
+    }
+    // Zero width is legal only when the chunk is empty. The seek rule is
+    // half-open, so a nonempty chunk over `t0 == t1` can never be selected —
+    // its gaussians are unreachable while still counting toward the file total.
+    if (t0 == t1 && gaussianCount != 0) {
+      throw FourdgsMalformedFile(
+        'a chunk index entry declares $gaussianCount gaussians over the '
+        'zero-width interval [$t0, $t1); no seek can ever select them',
+      );
+    }
     final bandCount = c.u32();
     if (bandCount > c.remaining ~/ bandRangeBytes) {
       throw FourdgsMalformedFile(
