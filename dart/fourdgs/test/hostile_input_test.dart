@@ -318,6 +318,58 @@ void main() {
         );
       },
     );
+
+    test(
+      'a prefix that stops before the Footer still recovers rather than being refused',
+      () {
+        // The other half of the same rule, and the reason the gate is the Footer
+        // rather than a clean walk. A file cut exactly at a record boundary walks
+        // to its end without throwing, so "the walk did not run out" is true of it
+        // — but no Footer was read, so more chunks were coming, and holding fewer
+        // gaussians than the header promises is exactly what recovery means.
+        // Refusing here would break the streaming contract for every partial read.
+        final Uint8List real =
+            File(
+              '../../tests/conformance/data/TenWindows-UseChunkIndex-UseCrc.4dgs',
+            ).readAsBytesSync();
+
+        // Cut at the record boundary immediately BEFORE the first Chunk, so the
+        // prefix is a clean walk that is genuinely missing gaussians. Cutting
+        // anywhere after the chunks would leave the count already satisfied and
+        // the case untested — which is exactly what a first attempt at this test
+        // did, and it passed against the wrong gate.
+        int offset = fourdgsMagic.length;
+        while (offset + 9 <= real.length && real[offset] != 0x04) {
+          final int length = ByteData.sublistView(
+            real,
+            offset + 1,
+            offset + 9,
+          ).getUint32(0, Endian.little);
+          offset += 9 + length;
+        }
+        expect(
+          offset,
+          lessThan(real.length),
+          reason: 'the fixture must contain a Chunk record',
+        );
+        final Uint8List prefix = Uint8List.sublistView(real, 0, offset);
+
+        final FourdgsScene scene = readFourdgsBytes(
+          prefix,
+          recoverTruncated: true,
+        );
+        expect(
+          scene.truncated,
+          isTrue,
+          reason: 'a prefix must come back reported as truncated',
+        );
+        expect(
+          scene.gaussians.count,
+          lessThan(scene.header.gaussianCount),
+          reason: 'the prefix must really be short, or this pins nothing',
+        );
+      },
+    );
   });
 }
 

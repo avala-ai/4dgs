@@ -132,10 +132,6 @@ FourdgsScene readFourdgsBytes(
   FourdgsQuantization? quantization;
   List<FourdgsWindow> windows = const <FourdgsWindow>[];
   final chunks = <FourdgsDecodedChunk>[];
-  // True only when the record walk itself hit the end of the buffer. Distinct
-  // from `truncated`, which is also set for a file whose records are all intact
-  // but whose closing magic is missing.
-  bool recordsRanOut = false;
   final chunkCounts = <int>[];
   final chunkBands = <Map<int, Uint8List>>[];
   final chunkIndex = <FourdgsChunkIndexEntry>[];
@@ -351,7 +347,6 @@ FourdgsScene readFourdgsBytes(
     // identical.
     if (_endsWithMagic(data)) rethrow;
     truncated = true;
-    recordsRanOut = true;
   }
 
   // The magic is written at both ends so that a file can be recognized from its
@@ -415,15 +410,22 @@ FourdgsScene readFourdgsBytes(
   // A complete file whose chunks do not add up to the total its own Header
   // declares.
   //
-  // Gated on the RECORD WALK completing, not on `truncated`. Those differ in
-  // exactly the case worth catching: a file whose records all parsed but whose
-  // closing magic was dropped is marked truncated, yet no later chunk can
-  // explain a mismatch — every chunk the file has was decoded. Skipping the
-  // check for it would let nine missing bytes wave a quietly short scene
-  // through. A walk that really ran out is a different matter: fewer gaussians
-  // than the header promises is the expected outcome there, and `truncated` is
-  // what reports it.
-  if (!recordsRanOut) {
+  // Gated on having SEEN THE FOOTER, which is the only thing that says no
+  // further chunk was coming. Two weaker gates were tried and both were wrong:
+  //
+  // * `!truncated` skips the check for a file whose records all parsed but
+  //   whose closing magic was dropped — nine missing bytes waving a quietly
+  //   short scene through.
+  // * `!recordsRanOut` catches that, but a file cut exactly at a record
+  //   boundary before the Footer walks cleanly to its end without throwing, so
+  //   the flag stays false and the check refuses a prefix that recovery is
+  //   supposed to return with `truncated == true`.
+  //
+  // The Footer is the file's own end marker. With it read, every chunk the file
+  // has was decoded and a shortfall is a real disagreement; without it, the file
+  // stopped early and holding fewer gaussians than the header promises is the
+  // expected outcome — which `truncated` reports.
+  if (sawFooter) {
     final assembled = chunkCounts.fold<int>(0, (int sum, int n) => sum + n);
     if (assembled != header.gaussianCount) {
       throw FourdgsMalformedFile(
