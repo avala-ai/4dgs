@@ -575,6 +575,58 @@ void main() {
     );
   });
 
+  group('a zero-duration scene still has a start', () {
+    test(
+      'a nonempty entry beginning after zero is refused at duration zero',
+      () async {
+        // The static exception exists for `[0, >0)`, the shape the writers emit.
+        // It is not a licence for any interval at all: with no clock length the
+        // only instant a seek can ask for is 0, so `[500, 501)` holds gaussians
+        // nothing can ever reach — the same unreachable content the bound exists
+        // to refuse, hiding behind the exception.
+        final BytesBuilder out =
+            BytesBuilder()
+              ..add(fourdgsMagic)
+              ..add(
+                _record(
+                  opHeader,
+                  _headerContent(durationSec: 0.0, gaussianCount: 1),
+                ),
+              )
+              ..add(_record(opQuantization, _quantizationContent()))
+              ..add(
+                _record(
+                  opWindowTable,
+                  _windowTableContent(lo: 0.0, hi: double.infinity),
+                ),
+              );
+        final int summaryStart = out.length;
+        out.add(
+          _record(opChunkIndex, _chunkIndexEntryContent(t0: 500.0, t1: 501.0)),
+        );
+        final BytesBuilder footer =
+            BytesBuilder()
+              ..add(_u64(summaryStart))
+              ..add(_u64(0))
+              ..add(_u32(0));
+        out
+          ..add(_record(opFooter, footer.toBytes()))
+          ..add(fourdgsMagic);
+
+        await expectLater(
+          openFourdgsIndexed(FourdgsBytes(out.toBytes())),
+          throwsA(
+            isA<FourdgsMalformedFile>().having(
+              (FourdgsMalformedFile e) => e.message,
+              'message',
+              contains('scene clock'),
+            ),
+          ),
+        );
+      },
+    );
+  });
+
   group('both openers agree about what is out of clock', () {
     test('an out-of-clock index entry is refused by the indexed opener too', () async {
       // Built rather than patched. Editing a real file's index invalidates the

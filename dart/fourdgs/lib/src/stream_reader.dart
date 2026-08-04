@@ -395,10 +395,14 @@ FourdgsScene readFourdgsBytes(
     // A zero-duration scene is not a scene with no clock: a static asset is
     // written as `duration_sec = 0` with one nonempty entry just past zero, and
     // every SDK's glTF/USD import produces exactly that. So the end of the clock
-    // only bounds an entry when there IS an end.
+    // only bounds an entry when there IS an end — but the start still does. At
+    // duration zero the only instant a seek can ask for is 0, so an entry that
+    // begins after it, `[500, 501)`, is as unreachable as one that ended before.
     if (population > 0 &&
         (entry.t1 <= 0.0 ||
-            (header.durationSec > 0.0 && entry.t0 >= header.durationSec))) {
+            (header.durationSec > 0.0
+                ? entry.t0 >= header.durationSec
+                : entry.t0 > 0.0))) {
       throw FourdgsMalformedFile(
         'a Chunk Index entry covers [${entry.t0}, ${entry.t1}), outside the '
         'scene clock [0, ${header.durationSec}); expected an interval that '
