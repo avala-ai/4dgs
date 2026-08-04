@@ -30,10 +30,11 @@ plausible-looking output rather than an error, so nothing downstream notices:
   container is not accepted or refused according to which reader opened it; and a cross-check that
   the chunks assemble to the total the header declares, for complete files only — a truncated file
   is expected to hold fewer.
-- **Truncation recovery no longer hides corruption.** A record length running past the buffer and a
-  download cut short raise the same error; the closing magic distinguishes them. With it present
-  every byte is there and a length field lied, so recovering would discard the real records after
-  the corrupt one.
+- **Truncation recovery is unchanged, deliberately.** A record length running past the buffer and a
+  download cut short raise the same error, and they cannot be told apart: in both cases the walk
+  never reaches the tail, so nothing at the tail is evidence. `recoverTruncated` therefore still
+  returns the decoded prefix with `truncated == true` for both. What a complete file cannot do is
+  disagree with itself — once the walk reaches the Footer, the totals above are checked.
 
 These already existed in the Mission Control copy of this decoder, pinned by its own hostile-input
 suite. They are here now so that consuming this package directly is not a step down in robustness.

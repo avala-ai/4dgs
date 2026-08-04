@@ -293,7 +293,7 @@ class FourdgsWindowTable {
       // exactly that.
       if (lo.isNaN || hi.isNaN || hi < lo) {
         throw FourdgsMalformedFile(
-          'window $i spans [$lo, $hi); a validity window must be finite and '
+          'window $i spans [$lo, $hi); a validity window must not carry NaN and '
           'must not end before it starts',
         );
       }
