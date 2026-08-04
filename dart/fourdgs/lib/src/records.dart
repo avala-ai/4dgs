@@ -283,12 +283,15 @@ class FourdgsWindowTable {
       // reads as one covering nothing. Both decode to a scene quietly missing
       // content, which is worse than a refusal.
       //
-      // `hi == +infinity` is NOT one of those. It is how this format says a
-      // gaussian never expires, and it is what every SDK writes for a static
-      // glTF or USD import — `duration_sec = 0` with `[0, +inf)` — so refusing
-      // it would make the reference writers' own output undecodable. `lo == hi`
-      // stays legal too: the NoData fixture is exactly that.
-      if (lo.isNaN || hi.isNaN || !lo.isFinite || hi < lo) {
+      // An INFINITY is not one of those, at either end. The reference encoders
+      // exclude `win_lo` and `win_hi` from their finite-input check on purpose —
+      // "an infinity in them is meaningful rather than broken" — so `[0, +inf)`
+      // is how a static glTF or USD import says a gaussian never expires, and
+      // `[-inf, t)` is a gaussian that has always existed. Requiring either
+      // bound to be finite makes conforming output from the other SDKs
+      // undecodable here. `lo == hi` stays legal too: the NoData fixture is
+      // exactly that.
+      if (lo.isNaN || hi.isNaN || hi < lo) {
         throw FourdgsMalformedFile(
           'window $i spans [$lo, $hi); a validity window must be finite and '
           'must not end before it starts',
@@ -498,13 +501,19 @@ class FourdgsChunkIndexEntry {
       final keyframeOffset = c.u64();
       final depth = c.u16();
       final liveCount = c.u64();
-      // A delta entry's `gaussianCount` counts the operations it carries —
-      // births, deaths, updates — not the population they compose to. A delta
-      // that changes nothing has zero operations over a live scene, so testing
-      // it here would wave through exactly the unreachable state chunk this
-      // refuses. `liveCount` is the population over [t0, t1), so that is the
-      // number the rule is about.
-      refuseNonemptyZeroWidth(liveCount, 'live gaussians');
+      // Which field is the population depends on the KIND, not merely on the
+      // block being present. A delta's `gaussianCount` counts the operations it
+      // carries — births, deaths, updates — so a delta that changes nothing has
+      // zero of them over a live scene, and `liveCount` is what the rule is
+      // about. An extended KEYFRAME counts its gaussians the ordinary way and
+      // may leave `liveCount` at zero, so reading that would wave through a
+      // zero-width keyframe holding real content. Both clock checks make the
+      // same distinction.
+      final bool isDelta = kind == 1;
+      refuseNonemptyZeroWidth(
+        isDelta ? liveCount : gaussianCount,
+        isDelta ? 'live gaussians' : 'gaussians',
+      );
       return FourdgsChunkIndexEntry(
         t0: t0,
         t1: t1,

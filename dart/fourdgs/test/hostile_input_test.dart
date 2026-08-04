@@ -241,6 +241,31 @@ void main() {
       );
     });
 
+    test('a zero-width extended KEYFRAME with gaussians is refused', () {
+      // An extended index carries both kinds. A keyframe counts its gaussians
+      // the ordinary way and may leave `liveCount` at zero, so a rule that reads
+      // `liveCount` whenever the block is present waves this one through — a
+      // zero-width entry holding real content that no seek can ever select.
+      final BytesBuilder body =
+          BytesBuilder()
+            ..add(_f64(1.0)) // t0
+            ..add(_f64(1.0)) // t1 — zero width
+            ..add(_u64(0)) // chunkOffset
+            ..add(_u64(0)) // chunkLength
+            ..add(_u32(4)) // gaussianCount: real content
+            ..add(_u32(0)) // bandCount
+            ..addByte(0) // kind: keyframe
+            ..addByte(0) // deltaMode
+            ..add(_u64(0)) // referenceOffset
+            ..add(_u64(0)) // keyframeOffset
+            ..add(_u32(0).sublist(0, 2)) // depth (u16)
+            ..add(_u64(0)); // liveCount: zero, which is not the population here
+      expect(
+        () => FourdgsChunkIndexEntry.parse(body.toBytes()),
+        throwsA(isA<FourdgsMalformedFile>()),
+      );
+    });
+
     test('a zero-change DELTA over a zero-width interval is refused', () {
       // A delta entry's `gaussianCount` counts operations — births, deaths,
       // updates — not the population they compose to. A delta that changes
@@ -302,12 +327,15 @@ void main() {
         () => FourdgsWindowTable.parse(_windowTableContent(lo: 5.0, hi: 1.0)),
         throwsA(isA<FourdgsMalformedFile>()),
       );
-      // -infinity as a START is not the static idiom and stays refused.
+      // A -infinity START is legal, not the mirror of an inverted window. The
+      // reference encoders exclude both bounds from their finite-input check on
+      // purpose, so `[-inf, 1)` — a gaussian that has always existed — is
+      // conforming output this decoder has to read.
       expect(
-        () => FourdgsWindowTable.parse(
+        FourdgsWindowTable.parse(
           _windowTableContent(lo: double.negativeInfinity, hi: 1.0),
-        ),
-        throwsA(isA<FourdgsMalformedFile>()),
+        ).windows.single.lo,
+        double.negativeInfinity,
       );
     });
 
