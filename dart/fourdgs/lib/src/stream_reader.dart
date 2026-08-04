@@ -436,7 +436,14 @@ FourdgsScene readFourdgsBytes(
   // has was decoded and a shortfall is a real disagreement; without it, the file
   // stopped early and holding fewer gaussians than the header promises is the
   // expected outcome — which `truncated` reports.
-  if (sawFooter) {
+  //
+  // `gaussian-birth` only, like the indexed opener's version. Under
+  // `keyframe-delta` the Header's `gaussian_count` is the number of distinct
+  // ids in the sequence, not a sum over chunks (spec section 11), and this
+  // reader steps over delta chunks entirely — so a valid sequence whose second
+  // keyframe restates ids already seen would be refused for adding up
+  // differently to a total that was never a sum.
+  if (sawFooter && header.temporalModel == 'gaussian-birth') {
     final assembled = chunkCounts.fold<int>(0, (int sum, int n) => sum + n);
     if (assembled != header.gaussianCount) {
       throw FourdgsMalformedFile(

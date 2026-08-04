@@ -375,6 +375,44 @@ void main() {
   });
 
   group('both openers agree about the header total', () {
+    test('a keyframe-delta file is not measured with gaussian-birth arithmetic', () {
+      // Under `keyframe-delta` the Header's `gaussian_count` is the number of
+      // distinct ids in the sequence, not a sum over chunks — and this reader
+      // steps over delta chunks entirely. Applying the gaussian-birth tally to
+      // one would refuse a valid sequence whose second keyframe restates ids it
+      // has already seen, for adding up differently to a total that was never a
+      // sum. The gate is the temporal model, so a file declaring it is exempt.
+      final BytesBuilder out =
+          BytesBuilder()
+            ..add(fourdgsMagic)
+            ..add(
+              _record(
+                opHeader,
+                _headerContent(
+                  temporalModel: 'keyframe-delta',
+                  gaussianCount: 9,
+                ),
+              ),
+            )
+            ..add(_record(opQuantization, _quantizationContent()));
+      final BytesBuilder footer =
+          BytesBuilder()
+            ..add(_u64(0))
+            ..add(_u64(0))
+            ..add(_u32(0));
+      out
+        ..add(_record(opFooter, footer.toBytes()))
+        ..add(fourdgsMagic);
+
+      // No chunks at all, so a gaussian-birth tally would make this 0 against 9.
+      final FourdgsScene scene = readFourdgsBytes(
+        out.toBytes(),
+        recoverTruncated: false,
+      );
+      expect(scene.header.gaussianCount, 9);
+      expect(scene.header.temporalModel, 'keyframe-delta');
+    });
+
     test(
       'an inflated header count is refused by the indexed opener too',
       () async {
