@@ -300,6 +300,25 @@ void main() {
       );
     });
 
+    test('an open-ended index interval is accepted', () {
+      // Infinity compares fine under `t0 <= t < t1`, and the format does not
+      // require these bounds to be finite — the Python and Rust parsers accept
+      // both of these, so refusing them would make an open-ended index readable
+      // everywhere except Dart. Verified against the Python parser directly.
+      expect(
+        FourdgsChunkIndexEntry.parse(
+          _chunkIndexEntryContent(t0: 0.0, t1: double.infinity),
+        ).t1,
+        double.infinity,
+      );
+      expect(
+        FourdgsChunkIndexEntry.parse(
+          _chunkIndexEntryContent(t0: double.negativeInfinity, t1: 1.0),
+        ).t0,
+        double.negativeInfinity,
+      );
+    });
+
     test('a nonempty chunk over a zero-width interval is refused', () {
       // The seek rule is half-open, so nothing can ever select this chunk — yet
       // its gaussians still count toward the file's total, which is how a scene

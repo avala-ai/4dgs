@@ -450,10 +450,16 @@ class FourdgsChunkIndexEntry {
     // The interval is what every seek compares against, so a bound that cannot
     // be compared is worse than a wrong one: NaN makes `t0 <= t < t1` false at
     // every instant and the chunk never resolves for any seek.
-    if (!t0.isFinite || !t1.isFinite || t1 < t0) {
+    //
+    // An infinity compares perfectly well, though, and the format does not
+    // require these bounds to be finite — the Python and Rust parsers accept
+    // `[0, +inf)` and `[-inf, t)`, so refusing them here would make an
+    // open-ended index unreadable in Dart alone. Same rule the Window Table
+    // uses: NaN and inversion, nothing more.
+    if (t0.isNaN || t1.isNaN || t1 < t0) {
       throw FourdgsMalformedFile(
         'the Chunk Index entry at byte $intervalAt spans [$t0, $t1); expected '
-        'finite bounds with t0 <= t1',
+        't0 <= t1 and neither bound NaN (an infinity is legal)',
       );
     }
     final bandCount = c.u32();
