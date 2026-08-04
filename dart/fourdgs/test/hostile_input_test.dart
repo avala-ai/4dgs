@@ -185,6 +185,77 @@ void main() {
     });
   });
 
+  group('a refusal names the byte, the value and the expectation', () {
+    // AGENTS.md section 6: "A decoder that refuses a file says which byte, which
+    // record, which value, and what was expected." A bare type is not a
+    // diagnosis, and neither is a message that only says a value is invalid —
+    // whoever is holding the hostile file has to be able to find it.
+
+    void expectDiagnostic(
+      void Function() parse, {
+      required List<String> mentions,
+    }) {
+      try {
+        parse();
+        fail('expected a refusal');
+      } on FourdgsException catch (e) {
+        for (final String fragment in mentions) {
+          expect(
+            e.message,
+            contains(fragment),
+            reason: 'the diagnosis must mention "$fragment": ${e.message}',
+          );
+        }
+      }
+    }
+
+    test('the header names the record, the byte, the value and the range', () {
+      expectDiagnostic(
+        () => FourdgsHeader.parse(_headerContent(durationSec: double.nan)),
+        mentions: <String>['Header', 'byte', 'duration_sec', 'expected'],
+      );
+      expectDiagnostic(
+        () => FourdgsHeader.parse(_headerContent(cutoff: 0.0)),
+        mentions: <String>['Header', 'byte', 'cutoff', '(0, 1]'],
+      );
+      expectDiagnostic(
+        () => FourdgsHeader.parse(_headerContent(shDegree: 9)),
+        mentions: <String>['Header', 'byte', 'sh_degree', '0 through 3'],
+      );
+      expectDiagnostic(
+        () => FourdgsHeader.parse(_headerContent(temporalModel: 'nope')),
+        mentions: <String>[
+          'Header',
+          'byte',
+          'temporal_model',
+          'expected one of',
+        ],
+      );
+    });
+
+    test('the window table names the entry, the byte and the rule', () {
+      expectDiagnostic(
+        () => FourdgsWindowTable.parse(_windowTableContent(lo: 5.0, hi: 1.0)),
+        mentions: <String>['Window Table', 'byte', 'expected'],
+      );
+    });
+
+    test('the chunk index names the byte and what was expected', () {
+      expectDiagnostic(
+        () => FourdgsChunkIndexEntry.parse(
+          _chunkIndexEntryContent(t0: double.nan, t1: 1.0),
+        ),
+        mentions: <String>['Chunk Index', 'byte', 'expected'],
+      );
+      expectDiagnostic(
+        () => FourdgsChunkIndexEntry.parse(
+          _chunkIndexEntryContent(t0: 1.0, t1: 1.0),
+        ),
+        mentions: <String>['Chunk Index', 'byte', 'zero-width', 'expected'],
+      );
+    });
+  });
+
   group('intervals that no instant can satisfy are refused', () {
     test('a NaN or inverted validity window is refused', () {
       expect(

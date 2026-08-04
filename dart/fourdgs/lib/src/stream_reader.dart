@@ -400,8 +400,9 @@ FourdgsScene readFourdgsBytes(
         (entry.t1 <= 0.0 ||
             (header.durationSec > 0.0 && entry.t0 >= header.durationSec))) {
       throw FourdgsMalformedFile(
-        'a chunk index entry covers [${entry.t0}, ${entry.t1}), outside the '
-        'scene clock [0, ${header.durationSec})',
+        'a Chunk Index entry covers [${entry.t0}, ${entry.t1}), outside the '
+        'scene clock [0, ${header.durationSec}); expected an interval that '
+        'overlaps it, or an empty entry',
       );
     }
   }
@@ -447,8 +448,9 @@ FourdgsScene readFourdgsBytes(
     final assembled = chunkCounts.fold<int>(0, (int sum, int n) => sum + n);
     if (assembled != header.gaussianCount) {
       throw FourdgsMalformedFile(
-        'the header declares ${header.gaussianCount} gaussians but the chunks '
-        'assemble to $assembled',
+        'the Header declares ${header.gaussianCount} gaussians but the '
+        "file's chunks assemble to $assembled; expected the two to agree in a "
+        'file whose records reached the Footer',
       );
     }
   }

@@ -319,8 +319,9 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
     if (population > 0 &&
         (entry.t1 <= 0.0 || (duration > 0.0 && entry.t0 >= duration))) {
       throw FourdgsMalformedFile(
-        'a chunk index entry covers [${entry.t0}, ${entry.t1}), outside the '
-        'scene clock [0, $duration)',
+        'a Chunk Index entry covers [${entry.t0}, ${entry.t1}), outside the '
+        'scene clock [0, $duration); expected an interval that overlaps it, or '
+        'an empty entry',
       );
     }
   }
@@ -341,8 +342,8 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
     );
     if (indexed != declared) {
       throw FourdgsMalformedFile(
-        'the header declares $declared gaussians but the chunk index accounts '
-        'for $indexed',
+        'the Header declares $declared gaussians but the Chunk Index accounts '
+        'for $indexed; expected the two to agree under gaussian-birth',
       );
     }
   }

@@ -70,6 +70,7 @@ class FourdgsHeader {
     final c = FourdgsCursor(content);
     final profile = c.string();
     final library = c.string();
+    final durationAt = c.pos;
     final durationSec = c.f64();
     // Every check here is on a value that decodes into plausible-looking output
     // when it is trusted, rather than into an obvious error. A NaN duration
@@ -78,19 +79,23 @@ class FourdgsHeader {
     // zero-duration scene.
     if (!durationSec.isFinite || durationSec < 0) {
       throw FourdgsMalformedFile(
-        'the header declares an invalid duration ($durationSec seconds)',
+        'the Header at byte $durationAt declares duration_sec = $durationSec; '
+        'expected a finite value >= 0',
       );
     }
     final gaussianCount = c.u64();
+    final cutoffAt = c.pos;
     final cutoff = c.f64();
     // Otherwise only validated where a chunk's motion is decoded against it,
     // which a zero-gaussian file or a metadata-only indexed open never reaches
     // — the bad value would sit in the returned header indefinitely.
     if (cutoff.isNaN || !(cutoff > 0.0 && cutoff <= 1.0)) {
       throw FourdgsMalformedFile(
-        "the header's cutoff is $cutoff; a marginal threshold must be in (0, 1]",
+        'the Header at byte $cutoffAt declares cutoff = $cutoff; expected a '
+        'marginal threshold in (0, 1]',
       );
     }
+    final temporalModelAt = c.pos;
     final temporalModel = c.string();
     // Named, not assumed. A model this build cannot decode is a conforming file
     // it cannot read, which is a different answer from "corrupt". Both known
@@ -98,11 +103,13 @@ class FourdgsHeader {
     // own path, which refusing here would make unreachable.
     if (!_knownTemporalModels.contains(temporalModel)) {
       throw FourdgsUnsupportedCodec(
-        'the header declares temporal model "$temporalModel", which this build '
-        'does not implement (it implements ${_knownTemporalModels.join(", ")})',
+        'the Header at byte $temporalModelAt declares temporal_model '
+        '"$temporalModel", which this build does not implement; expected one of '
+        '${_knownTemporalModels.join(", ")}',
       );
     }
     final aabb = c.f64s(6);
+    final shDegreeAt = c.pos;
     final shDegree = c.u8();
     // 0-3 is the whole registry. Out of range is not merely unknown: a decoded
     // byte budget prices an unknown band at zero while the coefficient count
@@ -110,8 +117,8 @@ class FourdgsHeader {
     // the scene the second decodes.
     if (shDegree > 3) {
       throw FourdgsMalformedFile(
-        'the header declares spherical-harmonic degree $shDegree; the registry '
-        'defines 0 through 3',
+        'the Header at byte $shDegreeAt declares sh_degree = $shDegree; the '
+        'registry defines 0 through 3',
       );
     }
     return FourdgsHeader(
@@ -276,6 +283,7 @@ class FourdgsWindowTable {
     }
     final out = <FourdgsWindow>[];
     for (int i = 0; i < n; i++) {
+      final windowAt = c.pos;
       final lo = c.f64();
       final hi = c.f64();
       // Visibility is gated on `lo <= t < hi`, so a NaN bound is false at every
@@ -293,8 +301,8 @@ class FourdgsWindowTable {
       // exactly that.
       if (lo.isNaN || hi.isNaN || hi < lo) {
         throw FourdgsMalformedFile(
-          'window $i spans [$lo, $hi); a validity window must not carry NaN and '
-          'must not end before it starts',
+          'window $i of the Window Table, at byte $windowAt, spans [$lo, $hi); '
+          'expected lo <= hi and neither bound NaN (an infinity is legal)',
         );
       }
       out.add(FourdgsWindow(lo, hi));
@@ -433,6 +441,7 @@ class FourdgsChunkIndexEntry {
 
   static FourdgsChunkIndexEntry parse(Uint8List content) {
     final c = FourdgsCursor(content);
+    final intervalAt = c.pos;
     final t0 = c.f64();
     final t1 = c.f64();
     final chunkOffset = c.u64();
@@ -443,8 +452,8 @@ class FourdgsChunkIndexEntry {
     // every instant and the chunk never resolves for any seek.
     if (!t0.isFinite || !t1.isFinite || t1 < t0) {
       throw FourdgsMalformedFile(
-        'a chunk index entry spans [$t0, $t1); an interval must be finite and '
-        'must not end before it starts',
+        'the Chunk Index entry at byte $intervalAt spans [$t0, $t1); expected '
+        'finite bounds with t0 <= t1',
       );
     }
     final bandCount = c.u32();
@@ -488,8 +497,9 @@ class FourdgsChunkIndexEntry {
     void refuseNonemptyZeroWidth(int population, String what) {
       if (t0 == t1 && population != 0) {
         throw FourdgsMalformedFile(
-          'a chunk index entry declares $population $what over the zero-width '
-          'interval [$t0, $t1); no seek can ever select them',
+          'the Chunk Index entry at byte $intervalAt declares $population $what '
+          'over the zero-width interval [$t0, $t1); expected 0 there, because '
+          'the half-open seek rule can never select a zero-width interval',
         );
       }
     }
