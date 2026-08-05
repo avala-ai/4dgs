@@ -242,6 +242,10 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
   final footer = FourdgsFooter.parse(footerRecord.content);
 
   final index = <FourdgsChunkIndexEntry>[];
+  // Where each entry above came from. A refusal that can only say which interval
+  // was wrong leaves the reader of a file with a thousand index records nothing
+  // to open a hex editor at; the offset is known here and nowhere later.
+  final indexRecordOffsets = <int>[];
   final summaryOffsets = <FourdgsSummaryOffset>[];
   FourdgsStatistics? statistics;
   bool? crcOk;
@@ -285,6 +289,7 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
             );
           }
           index.add(FourdgsChunkIndexEntry.parse(record.content));
+          indexRecordOffsets.add(record.offset);
         case opStatistics:
           statistics = FourdgsStatistics.parse(record.content);
         case opSummaryOffset:
@@ -305,7 +310,8 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
   // after the Header — an index arriving first has no duration to compare
   // against yet.
   final double duration = front.header!.durationSec;
-  for (final entry in index) {
+  for (int i = 0; i < index.length; i++) {
+    final entry = index[i];
     // A zero-duration scene is not a scene with no clock — a static asset is
     // written that way, with one nonempty entry just past zero — so the end of
     // the clock only bounds an entry when there IS an end. The start still
@@ -322,9 +328,10 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
         (entry.t1 <= 0.0 ||
             (duration > 0.0 ? entry.t0 >= duration : entry.t0 > 0.0))) {
       throw FourdgsMalformedFile(
-        'a Chunk Index entry covers [${entry.t0}, ${entry.t1}), outside the '
-        'scene clock [0, $duration); expected an interval that overlaps it, or '
-        'an empty entry',
+        'the Chunk Index record at byte ${indexRecordOffsets[i]} (entry $i of '
+        '${index.length}) covers [${entry.t0}, ${entry.t1}), outside the scene '
+        'clock [0, $duration); expected an interval that overlaps it, or an '
+        'empty entry',
       );
     }
   }

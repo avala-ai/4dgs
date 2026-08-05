@@ -135,6 +135,10 @@ FourdgsScene readFourdgsBytes(
   final chunkCounts = <int>[];
   final chunkBands = <Map<int, Uint8List>>[];
   final chunkIndex = <FourdgsChunkIndexEntry>[];
+  // Where each entry above came from, kept for the same reason the indexed
+  // opener keeps it: the clock check runs after the walk, by which time the
+  // record offset is gone and a refusal could only name the interval.
+  final chunkIndexRecordOffsets = <int>[];
   final metadata = <FourdgsMetadata>[];
   final attachments = <FourdgsAttachment>[];
   final summaryOffsets = <FourdgsSummaryOffset>[];
@@ -308,6 +312,7 @@ FourdgsScene readFourdgsBytes(
           statistics = FourdgsStatistics.parse(record.content);
         case opChunkIndex:
           chunkIndex.add(FourdgsChunkIndexEntry.parse(record.content));
+          chunkIndexRecordOffsets.add(record.offset);
         case opSummaryOffset:
           summaryOffsets.add(FourdgsSummaryOffset.parse(record.content));
         case opFooter:
@@ -384,7 +389,8 @@ FourdgsScene readFourdgsBytes(
   // nothing orders a Chunk Index after the Header — an index arriving first has
   // no duration to compare against yet, and an early check would let exactly
   // that file through.
-  for (final entry in chunkIndex) {
+  for (int i = 0; i < chunkIndex.length; i++) {
+    final entry = chunkIndex[i];
     // `liveCount` is the population only for a DELTA entry; a keyframe leaves it
     // zero and counts its gaussians the ordinary way, so keying on `extended`
     // alone would read every keyframe in an extended index as empty.
@@ -404,7 +410,8 @@ FourdgsScene readFourdgsBytes(
                 ? entry.t0 >= header.durationSec
                 : entry.t0 > 0.0))) {
       throw FourdgsMalformedFile(
-        'a Chunk Index entry covers [${entry.t0}, ${entry.t1}), outside the '
+        'the Chunk Index record at byte ${chunkIndexRecordOffsets[i]} (entry $i '
+        'of ${chunkIndex.length}) covers [${entry.t0}, ${entry.t1}), outside the '
         'scene clock [0, ${header.durationSec}); expected an interval that '
         'overlaps it, or an empty entry',
       );

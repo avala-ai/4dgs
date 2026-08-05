@@ -662,12 +662,25 @@ void main() {
       // also `FourdgsMalformedFile`, and a type-only assertion would pass
       // whether or not the clock bound exists — which is how the first version
       // of this test failed to notice the indexed opener had none.
+      // The refusal has to be locatable, not merely correct: in a file with a
+      // thousand index records, "an entry covers [500, 501)" tells whoever is
+      // holding it nothing about where to look. Both readers know the record's
+      // byte offset while parsing and must carry it this far.
       final Matcher outOfClock = throwsA(
-        isA<FourdgsMalformedFile>().having(
-          (FourdgsMalformedFile e) => e.message,
-          'message',
-          contains('scene clock'),
-        ),
+        isA<FourdgsMalformedFile>()
+            .having(
+              (FourdgsMalformedFile e) => e.message,
+              'message',
+              contains('scene clock'),
+            )
+            .having(
+              (FourdgsMalformedFile e) => e.message,
+              'names the record',
+              allOf(
+                contains('Chunk Index record at byte'),
+                contains('entry 0 of'),
+              ),
+            ),
       );
       expect(
         () => readFourdgsBytes(bytes, recoverTruncated: false),
