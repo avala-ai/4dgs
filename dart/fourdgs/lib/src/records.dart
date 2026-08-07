@@ -68,20 +68,82 @@ class FourdgsHeader {
 
   static FourdgsHeader parse(Uint8List content) {
     final c = FourdgsCursor(content);
+    final profile = c.string();
+    final library = c.string();
+    final durationAt = c.pos;
+    final durationSec = c.f64();
+    // Every check here is on a value that decodes into plausible-looking output
+    // when it is trusted, rather than into an obvious error. A NaN duration
+    // reaches timeline arithmetic and breaks playback; a negative one is not a
+    // duration. Zero stays legal — the NoData conformance fixture is exactly a
+    // zero-duration scene.
+    if (!durationSec.isFinite || durationSec < 0) {
+      throw FourdgsMalformedFile(
+        'the Header at byte $durationAt declares duration_sec = $durationSec; '
+        'expected a finite value >= 0',
+      );
+    }
+    final gaussianCount = c.u64();
+    final cutoffAt = c.pos;
+    final cutoff = c.f64();
+    // Otherwise only validated where a chunk's motion is decoded against it,
+    // which a zero-gaussian file or a metadata-only indexed open never reaches
+    // — the bad value would sit in the returned header indefinitely.
+    if (cutoff.isNaN || !(cutoff > 0.0 && cutoff <= 1.0)) {
+      throw FourdgsMalformedFile(
+        'the Header at byte $cutoffAt declares cutoff = $cutoff; expected a '
+        'marginal threshold in (0, 1]',
+      );
+    }
+    final temporalModelAt = c.pos;
+    final temporalModel = c.string();
+    // Named, not assumed. A model this build cannot decode is a conforming file
+    // it cannot read, which is a different answer from "corrupt". Both known
+    // models are accepted: `keyframe-delta` files are legal and read by their
+    // own path, which refusing here would make unreachable.
+    if (!_knownTemporalModels.contains(temporalModel)) {
+      throw FourdgsUnsupportedCodec(
+        'the Header at byte $temporalModelAt declares temporal_model '
+        '"$temporalModel", which this build does not implement; expected one of '
+        '${_knownTemporalModels.join(", ")}',
+      );
+    }
+    final aabb = c.f64s(6);
+    final shDegreeAt = c.pos;
+    final shDegree = c.u8();
+    // 0-3 is the whole registry. Out of range is not merely unknown: a decoded
+    // byte budget prices an unknown band at zero while the coefficient count
+    // keeps growing with the degree, so a buffer sized from the first is not
+    // the scene the second decodes.
+    if (shDegree > 3) {
+      throw FourdgsMalformedFile(
+        'the Header at byte $shDegreeAt declares sh_degree = $shDegree; the '
+        'registry defines 0 through 3',
+      );
+    }
     return FourdgsHeader(
-      profile: c.string(),
-      library: c.string(),
-      durationSec: c.f64(),
-      gaussianCount: c.u64(),
-      cutoff: c.f64(),
-      temporalModel: c.string(),
-      aabb: c.f64s(6),
-      shDegree: c.u8(),
+      profile: profile,
+      library: library,
+      durationSec: durationSec,
+      gaussianCount: gaussianCount,
+      cutoff: cutoff,
+      temporalModel: temporalModel,
+      aabb: aabb,
+      shDegree: shDegree,
       flags: c.u8(),
       attributes: c.strMap(),
     );
   }
 }
+
+/// Temporal models this build implements.
+///
+/// Accepting a name is a promise to read the file, so a name the specification
+/// reserves belongs here only once this decoder can decode it.
+const Set<String> _knownTemporalModels = <String>{
+  'gaussian-birth',
+  'keyframe-delta',
+};
 
 /// Opcode `0x02`. The tail pointer that makes the file seekable.
 class FourdgsFooter {
@@ -221,7 +283,29 @@ class FourdgsWindowTable {
     }
     final out = <FourdgsWindow>[];
     for (int i = 0; i < n; i++) {
-      out.add(FourdgsWindow(c.f64(), c.f64()));
+      final windowAt = c.pos;
+      final lo = c.f64();
+      final hi = c.f64();
+      // Visibility is gated on `lo <= t < hi`, so a NaN bound is false at every
+      // instant and those gaussians silently never appear; an inverted window
+      // reads as one covering nothing. Both decode to a scene quietly missing
+      // content, which is worse than a refusal.
+      //
+      // An INFINITY is not one of those, at either end. The reference encoders
+      // exclude `win_lo` and `win_hi` from their finite-input check on purpose —
+      // "an infinity in them is meaningful rather than broken" — so `[0, +inf)`
+      // is how a static glTF or USD import says a gaussian never expires, and
+      // `[-inf, t)` is a gaussian that has always existed. Requiring either
+      // bound to be finite makes conforming output from the other SDKs
+      // undecodable here. `lo == hi` stays legal too: the NoData fixture is
+      // exactly that.
+      if (lo.isNaN || hi.isNaN || hi < lo) {
+        throw FourdgsMalformedFile(
+          'window $i of the Window Table, at byte $windowAt, spans [$lo, $hi); '
+          'expected lo <= hi and neither bound NaN (an infinity is legal)',
+        );
+      }
+      out.add(FourdgsWindow(lo, hi));
     }
     return FourdgsWindowTable(out);
   }
@@ -357,11 +441,27 @@ class FourdgsChunkIndexEntry {
 
   static FourdgsChunkIndexEntry parse(Uint8List content) {
     final c = FourdgsCursor(content);
+    final intervalAt = c.pos;
     final t0 = c.f64();
     final t1 = c.f64();
     final chunkOffset = c.u64();
     final chunkLength = c.u64();
     final gaussianCount = c.u32();
+    // The interval is what every seek compares against, so a bound that cannot
+    // be compared is worse than a wrong one: NaN makes `t0 <= t < t1` false at
+    // every instant and the chunk never resolves for any seek.
+    //
+    // An infinity compares perfectly well, though, and the format does not
+    // require these bounds to be finite — the Python and Rust parsers accept
+    // `[0, +inf)` and `[-inf, t)`, so refusing them here would make an
+    // open-ended index unreadable in Dart alone. Same rule the Window Table
+    // uses: NaN and inversion, nothing more.
+    if (t0.isNaN || t1.isNaN || t1 < t0) {
+      throw FourdgsMalformedFile(
+        'the Chunk Index entry at byte $intervalAt spans [$t0, $t1); expected '
+        't0 <= t1 and neither bound NaN (an infinity is legal)',
+      );
+    }
     final bandCount = c.u32();
     if (bandCount > c.remaining ~/ bandRangeBytes) {
       throw FourdgsMalformedFile(
@@ -396,6 +496,20 @@ class FourdgsChunkIndexEntry {
     // record's length from its header, so an entry with at least this many bytes
     // left carries the block and a `gaussian-birth` entry — which has none —
     // reads to the same values it always did.
+    // Zero width is legal only when the entry is empty, and which field says
+    // "empty" depends on the entry. The seek rule is half-open, so nothing can
+    // ever select a nonempty chunk over `t0 == t1` — its gaussians are
+    // unreachable while still counting toward the file.
+    void refuseNonemptyZeroWidth(int population, String what) {
+      if (t0 == t1 && population != 0) {
+        throw FourdgsMalformedFile(
+          'the Chunk Index entry at byte $intervalAt declares $population $what '
+          'over the zero-width interval [$t0, $t1); expected 0 there, because '
+          'the half-open seek rule can never select a zero-width interval',
+        );
+      }
+    }
+
     if (c.remaining >= indexDeltaBlockBytes) {
       final kind = c.u8();
       final deltaMode = c.u8();
@@ -403,6 +517,19 @@ class FourdgsChunkIndexEntry {
       final keyframeOffset = c.u64();
       final depth = c.u16();
       final liveCount = c.u64();
+      // Which field is the population depends on the KIND, not merely on the
+      // block being present. A delta's `gaussianCount` counts the operations it
+      // carries — births, deaths, updates — so a delta that changes nothing has
+      // zero of them over a live scene, and `liveCount` is what the rule is
+      // about. An extended KEYFRAME counts its gaussians the ordinary way and
+      // may leave `liveCount` at zero, so reading that would wave through a
+      // zero-width keyframe holding real content. Both clock checks make the
+      // same distinction.
+      final bool isDelta = kind == 1;
+      refuseNonemptyZeroWidth(
+        isDelta ? liveCount : gaussianCount,
+        isDelta ? 'live gaussians' : 'gaussians',
+      );
       return FourdgsChunkIndexEntry(
         t0: t0,
         t1: t1,
@@ -419,6 +546,8 @@ class FourdgsChunkIndexEntry {
         liveCount: liveCount,
       );
     }
+    // No extended block: `gaussianCount` IS the population.
+    refuseNonemptyZeroWidth(gaussianCount, 'gaussians');
     return FourdgsChunkIndexEntry(
       t0: t0,
       t1: t1,

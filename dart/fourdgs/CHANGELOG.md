@@ -12,6 +12,33 @@ mention its own version — and because the release gate extracts this section a
 so it has to exist before the tag rather than after it. There is no date: the release has not
 happened.
 
+### Hostile-input hardening
+
+The decoder refuses a class of file it previously accepted — values that decode into
+plausible-looking output rather than an error, so nothing downstream notices:
+
+- **Header.** A spherical-harmonic degree outside the 0-3 registry, a temporal model this build does
+  not implement (`gaussian-birth` and `keyframe-delta` are accepted; anything else is named rather
+  than assumed), a non-finite or negative duration, and a cutoff outside `(0, 1]`. Zero duration
+  stays legal — a zero-duration scene is a real fixture.
+- **Validity windows and chunk-index intervals.** NaN or inverted bounds on both. Visibility is
+  gated on `lo <= t < hi`, so a NaN bound is false at every instant and the content behind it
+  silently never appears. `lo == hi` stays legal.
+- **Chunk index.** A nonempty chunk over a zero-width interval. The seek rule is half-open, so
+  nothing can ever select it, yet its gaussians still count toward the file's total.
+- **Streamed reader.** The chunk-index clock bound the indexed reader already applied, so a
+  container is not accepted or refused according to which reader opened it; and a cross-check that
+  the chunks assemble to the total the header declares, for complete files only — a truncated file
+  is expected to hold fewer.
+- **Truncation recovery is unchanged, deliberately.** A record length running past the buffer and a
+  download cut short raise the same error, and they cannot be told apart: in both cases the walk
+  never reaches the tail, so nothing at the tail is evidence. `recoverTruncated` therefore still
+  returns the decoded prefix with `truncated == true` for both. What a complete file cannot do is
+  disagree with itself — once the walk reaches the Footer, the totals above are checked.
+
+These already existed in the Mission Control copy of this decoder, pinned by its own hostile-input
+suite. They are here now so that consuming this package directly is not a step down in robustness.
+
 ### Added
 
 - `fourdgs`, a pure-Dart decoder for the `.4dgs` container. No Flutter dependency and no `dart:io`

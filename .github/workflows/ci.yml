@@ -76,7 +76,7 @@ jobs:
           size_kb=$(du -s typescript | cut -f1)
           echo "typescript: ${size_kb} KiB"
           [ "$size_kb" -le 704 ] || { echo "::error::typescript is ${size_kb} KiB, over the 704 KiB budget"; exit 1; }
-      - name: Dart sources under 544 KB
+      - name: Dart sources under 608 KB
         # Sources only, same as TypeScript's and Swift's: this job builds nothing, so
         # .dart_tool and the compiled runners are not here to measure, and a vendored
         # dependency would show up as a budget failure.
@@ -92,10 +92,15 @@ jobs:
         # objects.dart, the two record parsers, the membership attribute, the canonical
         # states and their unit tests. 468 KiB against 480 left three files of headroom,
         # which is a budget about to trip on whatever landed next.
+        # Raised from 544 to 608 KiB for the hostile-input hardening: the refusals in
+        # records.dart and both readers, and the suite that pins them — about 40 KiB,
+        # three quarters of it the tests. The headroom is deliberate and will be spent:
+        # the rest of the Mission Control hostile-input suite is still to be ported here,
+        # which is what lets Mission Control drop its vendored copy of this decoder.
         run: |
           size_kb=$(du -s dart | cut -f1)
           echo "dart: ${size_kb} KiB"
-          [ "$size_kb" -le 544 ] || { echo "::error::dart is ${size_kb} KiB, over the 544 KiB budget"; exit 1; }
+          [ "$size_kb" -le 608 ] || { echo "::error::dart is ${size_kb} KiB, over the 608 KiB budget"; exit 1; }
       - name: Swift sources under 300 KB
         # Sources only, same as TypeScript's: this job builds nothing, so .build is not
         # here to measure and a vendored dependency would show up as a budget failure.

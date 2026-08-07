@@ -135,6 +135,10 @@ FourdgsScene readFourdgsBytes(
   final chunkCounts = <int>[];
   final chunkBands = <Map<int, Uint8List>>[];
   final chunkIndex = <FourdgsChunkIndexEntry>[];
+  // Where each entry above came from, kept for the same reason the indexed
+  // opener keeps it: the clock check runs after the walk, by which time the
+  // record offset is gone and a refusal could only name the interval.
+  final chunkIndexRecordOffsets = <int>[];
   final metadata = <FourdgsMetadata>[];
   final attachments = <FourdgsAttachment>[];
   final summaryOffsets = <FourdgsSummaryOffset>[];
@@ -308,6 +312,7 @@ FourdgsScene readFourdgsBytes(
           statistics = FourdgsStatistics.parse(record.content);
         case opChunkIndex:
           chunkIndex.add(FourdgsChunkIndexEntry.parse(record.content));
+          chunkIndexRecordOffsets.add(record.offset);
         case opSummaryOffset:
           summaryOffsets.add(FourdgsSummaryOffset.parse(record.content));
         case opFooter:
@@ -337,6 +342,20 @@ FourdgsScene readFourdgsBytes(
     }
   } on FourdgsTruncatedFile {
     if (!recoverTruncated) rethrow;
+    // Recovery, unconditionally. A corrupt record length and a file cut short
+    // raise the same exception, and from the framing alone they cannot be told
+    // apart: in BOTH cases the walk is unable to reach the tail, so nothing at
+    // the tail is evidence of anything. Two attempts at a discriminator were
+    // tried and both were unsound — first the closing magic, then a Footer
+    // record in front of it. Each is a fixed byte pattern with no framing of
+    // its own, so a payload can contain it, which makes a crafted file able to
+    // turn a legitimate partial read into a refusal. Breaking recovery for
+    // hostile input is a worse trade than accepting a prefix of a corrupt file,
+    // which is what `truncated` already reports.
+    //
+    // The case that motivated the discriminator is still caught, and soundly:
+    // when the walk DOES reach the Footer, the header/chunk cross-check below
+    // refuses a file whose totals disagree.
     truncated = true;
   }
 
@@ -360,6 +379,45 @@ FourdgsScene readFourdgsBytes(
     );
   }
 
+  // The same clock bound `openFourdgsIndexed` applies, so a container is not
+  // accepted or refused according to which public decoder opened it. An entry
+  // that cannot overlap the scene clock names gaussians no seek will ever
+  // select: the file opens cleanly, its CRC verifies, and part of the scene is
+  // simply unreachable.
+  //
+  // Deferred to here rather than checked as each entry is parsed, because
+  // nothing orders a Chunk Index after the Header — an index arriving first has
+  // no duration to compare against yet, and an early check would let exactly
+  // that file through.
+  for (int i = 0; i < chunkIndex.length; i++) {
+    final entry = chunkIndex[i];
+    // `liveCount` is the population only for a DELTA entry; a keyframe leaves it
+    // zero and counts its gaussians the ordinary way, so keying on `extended`
+    // alone would read every keyframe in an extended index as empty.
+    final int population =
+        (entry.extended && entry.kind == 1)
+            ? entry.liveCount
+            : entry.gaussianCount;
+    // A zero-duration scene is not a scene with no clock: a static asset is
+    // written as `duration_sec = 0` with one nonempty entry just past zero, and
+    // every SDK's glTF/USD import produces exactly that. So the end of the clock
+    // only bounds an entry when there IS an end — but the start still does. At
+    // duration zero the only instant a seek can ask for is 0, so an entry that
+    // begins after it, `[500, 501)`, is as unreachable as one that ended before.
+    if (population > 0 &&
+        (entry.t1 <= 0.0 ||
+            (header.durationSec > 0.0
+                ? entry.t0 >= header.durationSec
+                : entry.t0 > 0.0))) {
+      throw FourdgsMalformedFile(
+        'the Chunk Index record at byte ${chunkIndexRecordOffsets[i]} (entry $i '
+        'of ${chunkIndex.length}) covers [${entry.t0}, ${entry.t1}), outside the '
+        'scene clock [0, ${header.durationSec}); expected an interval that '
+        'overlaps it, or an empty entry',
+      );
+    }
+  }
+
   final audioSources = _assembleAudioSources(
     header,
     audioDescriptors,
@@ -368,6 +426,45 @@ FourdgsScene readFourdgsBytes(
     firstAudioRecord,
     truncated,
   );
+
+  // Placed after the record-level diagnostics above on purpose. This is a tally
+  // over the whole file, so it can only say "something is missing"; a record
+  // that names its own fault says more, and a reader should hear that first.
+  // A complete file whose chunks do not add up to the total its own Header
+  // declares.
+  //
+  // Gated on having SEEN THE FOOTER, which is the only thing that says no
+  // further chunk was coming. Two weaker gates were tried and both were wrong:
+  //
+  // * `!truncated` skips the check for a file whose records all parsed but
+  //   whose closing magic was dropped — nine missing bytes waving a quietly
+  //   short scene through.
+  // * `!recordsRanOut` catches that, but a file cut exactly at a record
+  //   boundary before the Footer walks cleanly to its end without throwing, so
+  //   the flag stays false and the check refuses a prefix that recovery is
+  //   supposed to return with `truncated == true`.
+  //
+  // The Footer is the file's own end marker. With it read, every chunk the file
+  // has was decoded and a shortfall is a real disagreement; without it, the file
+  // stopped early and holding fewer gaussians than the header promises is the
+  // expected outcome — which `truncated` reports.
+  //
+  // `gaussian-birth` only, like the indexed opener's version. Under
+  // `keyframe-delta` the Header's `gaussian_count` is the number of distinct
+  // ids in the sequence, not a sum over chunks (spec section 11), and this
+  // reader steps over delta chunks entirely — so a valid sequence whose second
+  // keyframe restates ids already seen would be refused for adding up
+  // differently to a total that was never a sum.
+  if (sawFooter && header.temporalModel == 'gaussian-birth') {
+    final assembled = chunkCounts.fold<int>(0, (int sum, int n) => sum + n);
+    if (assembled != header.gaussianCount) {
+      throw FourdgsMalformedFile(
+        'the Header declares ${header.gaussianCount} gaussians but the '
+        "file's chunks assemble to $assembled; expected the two to agree in a "
+        'file whose records reached the Footer',
+      );
+    }
+  }
 
   // The cross-record rules — unique sensor names, a rig reference that
   // resolves — can only run once the whole front matter has gone past. A
