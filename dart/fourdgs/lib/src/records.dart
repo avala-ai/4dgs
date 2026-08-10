@@ -106,17 +106,6 @@ class FourdgsHeader {
     }
     final temporalModelAt = c.pos;
     final temporalModel = c.string();
-    // Named, not assumed. A model this build cannot decode is a conforming file
-    // it cannot read, which is a different answer from "corrupt". Both known
-    // models are accepted: `keyframe-delta` files are legal and read by their
-    // own path, which refusing here would make unreachable.
-    if (!_knownTemporalModels.contains(temporalModel)) {
-      throw FourdgsUnsupportedCodec(
-        'the Header at byte $temporalModelAt declares temporal_model '
-        '"$temporalModel", which this build does not implement; expected one of '
-        '${_knownTemporalModels.join(", ")}',
-      );
-    }
     final aabb = c.f64s(6);
     final shDegreeAt = c.pos;
     final shDegree = c.u8();
@@ -130,6 +119,24 @@ class FourdgsHeader {
         'registry defines 0 through 3',
       );
     }
+    final flags = c.u8();
+    final attributes = c.strMap();
+    // Last, and after every mandatory field has been read. "A model this build
+    // does not implement" is a statement about a whole Header, and a Header that
+    // ends after the model string is not one — it is truncated, and saying the
+    // model is unsupported would send the reader off to add codec support for a
+    // file that is simply missing its second half. Named, not assumed: an
+    // unknown model is a conforming file this build cannot read, which is a
+    // different answer from "corrupt". Both known models are accepted;
+    // `keyframe-delta` files are legal and read by their own path, which
+    // refusing here would make unreachable.
+    if (!_knownTemporalModels.contains(temporalModel)) {
+      throw FourdgsUnsupportedCodec(
+        'the Header at byte $temporalModelAt declares temporal_model '
+        '"$temporalModel", which this build does not implement; expected one of '
+        '${_knownTemporalModels.join(", ")}',
+      );
+    }
     return FourdgsHeader(
       profile: profile,
       library: library,
@@ -139,8 +146,8 @@ class FourdgsHeader {
       temporalModel: temporalModel,
       aabb: aabb,
       shDegree: shDegree,
-      flags: c.u8(),
-      attributes: c.strMap(),
+      flags: flags,
+      attributes: attributes,
     );
   }
 }
@@ -355,11 +362,31 @@ class FourdgsChunkBody {
   final Uint8List streams;
 }
 
+/// The interval rule, applied wherever a record states one.
+///
+/// A NaN bound is false against every instant, so content behind it is
+/// unreachable while still counting toward the file; an inverted one describes
+/// nothing at all. The Chunk Index is checked at parse, and so are the chunks it
+/// summarises — otherwise the streamed path, which never reads the index,
+/// accepts a file the indexed path refuses.
+void refuseUnusableInterval(double t0, double t1, int at, String what) {
+  if (t0.isNaN || t1.isNaN || t1 < t0) {
+    throw FourdgsMalformedFile(
+      'the $what at byte $at spans [$t0, $t1); expected an interval with '
+      't1 >= t0 and neither bound NaN',
+    );
+  }
+}
+
 FourdgsChunkBody parseChunk(Uint8List content) {
   final c = FourdgsCursor(content);
+  final intervalAt = c.pos;
+  final t0 = c.f64();
+  final t1 = c.f64();
+  refuseUnusableInterval(t0, t1, intervalAt, 'Chunk');
   final head = FourdgsChunkHeader(
-    t0: c.f64(),
-    t1: c.f64(),
+    t0: t0,
+    t1: t1,
     level: c.u32(),
     count: c.u32(),
     compression: c.string(),
@@ -713,9 +740,13 @@ const int deltaModeChained = 1;
 
 FourdgsDeltaChunkBody parseDeltaChunk(Uint8List content) {
   final c = FourdgsCursor(content);
+  final intervalAt = c.pos;
+  final t0 = c.f64();
+  final t1 = c.f64();
+  refuseUnusableInterval(t0, t1, intervalAt, 'Delta Chunk');
   final head = FourdgsDeltaChunkHeader(
-    t0: c.f64(),
-    t1: c.f64(),
+    t0: t0,
+    t1: t1,
     level: c.u32(),
     deltaMode: c.u8(),
     referenceOffset: c.u64(),

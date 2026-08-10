@@ -396,6 +396,54 @@ void main() {
       );
     });
 
+    test('a Header that ends after the model is truncated, not unsupported', () {
+      // "A model this build does not implement" is a statement about a whole
+      // Header. One that stops after the model string is not one — it is
+      // missing its second half, and answering "unsupported" sends whoever is
+      // holding it off to add codec support for a file that needs none.
+      final Uint8List whole = _headerContent(temporalModel: 'made-up-model');
+      // Cut immediately after the model string, before the AABB.
+      final int cut = whole.length - (6 * 8 + 1 + 1 + 4);
+      final Uint8List truncated = Uint8List.sublistView(whole, 0, cut);
+
+      expect(
+        () => FourdgsHeader.parse(truncated),
+        throwsA(isA<FourdgsTruncatedFile>()),
+        reason: 'the Header is incomplete, whatever its model says',
+      );
+      // And the whole one still names the model, which is the other half of the
+      // distinction: complete but unimplemented is not corrupt.
+      expect(
+        () => FourdgsHeader.parse(whole),
+        throwsA(isA<FourdgsUnsupportedCodec>()),
+      );
+    });
+
+    test('a state chunk states an interval, and it is held to the rule', () {
+      // The streamed keyframe-delta path never reads the Chunk Index, so a rule
+      // applied only there let the two first-class paths disagree about the
+      // same file.
+      final BytesBuilder chunk =
+          BytesBuilder()
+            ..add(_f64(1.0)) // t0
+            ..add(_f64(double.nan)) // t1 — NaN
+            ..add(_u32(0)) // level
+            ..add(_u32(0)) // count
+            ..add(_string('')) // compression
+            ..add(_u64(0)) // uncompressedSize
+            ..add(_u64(0)); // payload length
+      expect(
+        () => parseChunk(chunk.toBytes()),
+        throwsA(
+          isA<FourdgsMalformedFile>().having(
+            (FourdgsMalformedFile e) => e.message,
+            'message',
+            contains('Chunk at byte 0 spans'),
+          ),
+        ),
+      );
+    });
+
     test('an interval refusal names a byte in the file, not in the record', () {
       // The parser reads a cursor over the record's content, so its own idea of
       // "byte 0" is the start of that content and every refusal named byte 0.

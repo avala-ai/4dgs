@@ -22,6 +22,9 @@ plausible-looking output rather than an error, so nothing downstream notices:
   than assumed), a NaN or negative duration, and a cutoff outside `(0, 1]`. Zero duration stays
   legal — a zero-duration scene is a real fixture — and so does `+Infinity`, which is how an
   open-ended scene declares itself.
+- **Chunk and Delta Chunk intervals.** The same rule the Chunk Index gets, applied where a chunk
+  states its own interval. Without it the streamed keyframe-delta path, which never reads the index,
+  accepted a file the indexed path refused.
 - **Validity windows and chunk-index intervals.** NaN or inverted bounds on both. Visibility is
   gated on `lo <= t < hi`, so a NaN bound is false at every instant and the content behind it
   silently never appears. `lo == hi` stays legal.
@@ -54,6 +57,10 @@ plausible-looking output rather than an error, so nothing downstream notices:
 
 ### Fixed
 
+- **A truncated Header is not an unsupported one.** A Header that ended after its `temporal_model`
+  string was refused for naming a model this build does not implement, when what it actually is, is
+  incomplete — sending whoever holds it to add codec support for a file that needs none. Every
+  mandatory field is read before the model is classified.
 - **An interval refusal names a byte in the file.** The Chunk Index parser reads a cursor over the
   record's content, so its own byte 0 is the start of that content, and a NaN or inverted interval
   was reported at byte 0 whatever its position. Callers pass the record's file origin now, so the
