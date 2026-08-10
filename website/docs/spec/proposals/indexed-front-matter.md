@@ -270,8 +270,13 @@ One variant, in `data/invalid/`, because after this proposal the file is not a l
   `Chunk Index`, with `summary_start` adjusted. Every other byte is a conforming file: the index is
   correct, the summary CRC is correct, and both read paths currently open it without complaint.
 - **What it asserts:** a streamed decode MUST refuse, naming opcode `0x25` and the record's byte
-  offset. This is the same shape as the existing invalid variants for an Audio Source after a chunk,
-  and it belongs beside them.
+  offset. It joins the seven files already in `data/invalid/`, which are all single-value refusals —
+  a bad magic, an unknown scheme, a window index out of range — so a record-position refusal is a
+  new shape for that directory rather than a variation on one already there. Worth noticing while
+  writing it: **§5.17's audio rule has no variant either.** The refusal exists in the reference
+  (`stream_reader.py:383-385`) and in the validator (`validate.py:246`), and nothing in the corpus
+  proves any other SDK implements it. A second file, `LateAudioSource`, would close that gap at the
+  same time and for the same reason, and this proposal recommends adding it alongside.
 - **Why an invalid variant and not a valid one:** a valid variant can only assert that the two paths
   agree, and under this proposal they agree because the file cannot exist. The thing worth pinning
   is the refusal — without it, an implementation that keeps today's silent behaviour passes.
