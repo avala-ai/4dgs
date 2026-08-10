@@ -32,13 +32,23 @@ The LOD proposal is documentation only and is not advertised here.
   temporal model over time. Births and deaths are exact per frame; USD time samples do not carry
   `gaussian_id` correspondence across samples.
 
+- **`state_at_with_objects`**, exported at the top level, is the supported way to compose an object
+  layer onto reconstructed gaussian state. Earlier notes described this composition without naming
+  an entry point for it.
 - **A ceiling on trajectory and object-track samples.** `MAX_TRAJECTORY_SAMPLES` bounds what one
   count-prefixed record may ask a reader to allocate before the bytes behind it are shown to exist.
   Shared by value with the other SDKs, because a ceiling only one implementation has is a file that
   decodes here and is refused there.
-- **An empty trajectory is read as though the record were absent** (spec §5.15.4), so reading one
-  refuses nothing — not even an interpolation byte outside the registry, which describes how to read
-  samples it does not carry. The writer stays strict and must not emit such a record.
+- **A ceiling on indexed front-matter records.** `MAX_FRONT_MATTER_BYTES` (64 MiB) bounds a Camera,
+  Metadata, provenance, object-layer or Audio Source descriptor record before `open_indexed` fetches
+  it, so a declared length cannot size a transfer the file has not justified. Chunks and audio
+  payloads are not front matter and are unaffected. **A file with a genuinely larger front-matter
+  record is refused where 0.2.0 attempted to read it.**
+- **An empty trajectory or object track is read as though the record were absent** (spec §5.15.4 and
+  §5.15.7), so reading one refuses nothing — not even an interpolation byte outside the registry,
+  which describes how to read samples it does not carry. Note that the writer does not currently
+  refuse a zero-sample record: `check()` validates sample times, and a trajectory with no samples
+  encodes with a zero count.
 
 ### Fixed
 
@@ -48,7 +58,19 @@ The LOD proposal is documentation only and is not advertised here.
   motion precision — no refusal, just positions that drift from the bins the encoder wrote. The
   writer could not produce such a file either: it forced a single full-duration window and wrote
   `window_index = 0` for everyone, ignoring the `win_lo` and `win_hi` each gaussian already carried.
-  Both sides are fixed, so a multi-window population round-trips at the precision it declares.
+
+  **This changes reconstructed state, not only its precision.** `reconstruct_at` now drops gaussians
+  outside their own half-open window, and `states_json`'s `liveCount` follows, so a multi-window
+  file that previously returned expired or not-yet-born gaussians produces a different live set.
+  Compare 0.3.0 results against 0.2.0 with that in mind.
+
+- **A duplicate attribute stream is refused rather than resolved.** A malformed chunk or
+  keyframe-delta group carrying the same attribute twice decoded last-stream-wins, so the same bytes
+  could yield different memberships or values depending on order. It now refuses with
+  `duplicate-attribute-stream`.
+- **Quaternions near the top of the `f64` range normalize instead of being refused.** Trajectory,
+  object-track and sensor-extrinsic rotations use `math.hypot` rather than a sum of squares, so an
+  input like `[1e308, 0, 0, 0]` no longer overflows on the way to its own norm.
 
 - **Chunk-compressed PLY segment fidelity.** Segmented imports now retain every source gaussian and
   use the `.4dgs` validity window—not temporal-center filtering—to reproduce which segment is
