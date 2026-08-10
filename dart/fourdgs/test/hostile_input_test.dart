@@ -331,6 +331,33 @@ void main() {
       );
     });
 
+    test('a gaussian-birth entry cannot pose as a delta to dodge the guard', () {
+      // The delta block is recognised by length and a leading byte, both of
+      // which a hostile gaussian-birth file can supply. If the guard trusted
+      // `kind` it would then check `liveCount` — zero here — and wave through
+      // four gaussians no seek can reach. Only a keyframe-delta Header gives
+      // `liveCount` that meaning, and this parser cannot see the Header, so it
+      // checks whichever count is nonzero.
+      final BytesBuilder body =
+          BytesBuilder()
+            ..add(_f64(1.0)) // t0
+            ..add(_f64(1.0)) // t1 — zero width
+            ..add(_u64(0)) // chunkOffset
+            ..add(_u64(0)) // chunkLength
+            ..add(_u32(4)) // gaussianCount: real content
+            ..add(_u32(0)) // bandCount
+            ..addByte(1) // kind: claims delta
+            ..addByte(0) // deltaMode
+            ..add(_u64(0)) // referenceOffset
+            ..add(_u64(0)) // keyframeOffset
+            ..add(_u32(0).sublist(0, 2)) // depth (u16)
+            ..add(_u64(0)); // liveCount: zero, the field it wants checked
+      expect(
+        () => FourdgsChunkIndexEntry.parse(body.toBytes()),
+        throwsA(isA<FourdgsMalformedFile>()),
+      );
+    });
+
     test('a zero-width extended KEYFRAME with gaussians is refused', () {
       // An extended index carries both kinds. A keyframe counts its gaussians
       // the ordinary way and may leave `liveCount` at zero, so a rule that reads

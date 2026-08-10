@@ -389,13 +389,18 @@ FourdgsScene readFourdgsBytes(
   // nothing orders a Chunk Index after the Header — an index arriving first has
   // no duration to compare against yet, and an early check would let exactly
   // that file through.
+  // Only a keyframe-delta Header gives `liveCount` its meaning. Without this
+  // the appended block alone decides, and a gaussian-birth entry carrying 28
+  // trailing bytes that happen to begin with 1 would be read as a delta —
+  // letting a hostile file choose which count gets checked.
+  final bool isKeyframeDelta = header.temporalModel == 'keyframe-delta';
   for (int i = 0; i < chunkIndex.length; i++) {
     final entry = chunkIndex[i];
     // `liveCount` is the population only for a DELTA entry; a keyframe leaves it
     // zero and counts its gaussians the ordinary way, so keying on `extended`
     // alone would read every keyframe in an extended index as empty.
     final int population =
-        (entry.extended && entry.kind == 1)
+        (isKeyframeDelta && entry.extended && entry.kind == 1)
             ? entry.liveCount
             : entry.gaussianCount;
     // A zero-duration scene is not a scene with no clock: a static asset is

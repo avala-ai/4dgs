@@ -517,18 +517,20 @@ class FourdgsChunkIndexEntry {
       final keyframeOffset = c.u64();
       final depth = c.u16();
       final liveCount = c.u64();
-      // Which field is the population depends on the KIND, not merely on the
-      // block being present. A delta's `gaussianCount` counts the operations it
-      // carries — births, deaths, updates — so a delta that changes nothing has
-      // zero of them over a live scene, and `liveCount` is what the rule is
-      // about. An extended KEYFRAME counts its gaussians the ordinary way and
-      // may leave `liveCount` at zero, so reading that would wave through a
-      // zero-width keyframe holding real content. Both clock checks make the
-      // same distinction.
-      final bool isDelta = kind == 1;
+      // Either count, because this parser cannot know which one means
+      // "population". `liveCount` carries that meaning only under a
+      // `keyframe-delta` Header, and the Header is not in scope here — a
+      // gaussian-birth entry with 28 trailing bytes whose first is 1 parses as
+      // a delta regardless, so keying on `kind` alone lets a hostile file
+      // choose which field is checked.
+      //
+      // Over a zero-width interval the distinction does not matter: operations
+      // and live gaussians are both content the half-open seek rule can never
+      // select, so a nonzero anything is unreachable. Testing both is stricter
+      // than testing the right one, and needs no context to be correct.
       refuseNonemptyZeroWidth(
-        isDelta ? liveCount : gaussianCount,
-        isDelta ? 'live gaussians' : 'gaussians',
+        gaussianCount != 0 ? gaussianCount : liveCount,
+        gaussianCount != 0 ? 'gaussians' : 'live gaussians',
       );
       return FourdgsChunkIndexEntry(
         t0: t0,

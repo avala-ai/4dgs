@@ -289,7 +289,12 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
             );
           }
           index.add(FourdgsChunkIndexEntry.parse(record.content));
-          indexRecordOffsets.add(record.offset);
+          // File-relative, not summary-relative. `iterRecords` walks the buffer
+          // fetched at `footer.summaryStart`, so its offsets start from zero
+          // there — storing one raw would send whoever reads the diagnostic to
+          // the wrong byte, and to a different byte than the streamed reader
+          // names for the same record.
+          indexRecordOffsets.add(footer.summaryStart + record.offset);
         case opStatistics:
           statistics = FourdgsStatistics.parse(record.content);
         case opSummaryOffset:
@@ -310,6 +315,11 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
   // after the Header — an index arriving first has no duration to compare
   // against yet.
   final double duration = front.header!.durationSec;
+  // Only a keyframe-delta Header gives `liveCount` its meaning. Without this
+  // the appended block alone decides, and a gaussian-birth entry carrying 28
+  // trailing bytes that happen to begin with 1 would be read as a delta —
+  // letting a hostile file choose which count gets checked.
+  final bool isKeyframeDelta = front.header!.temporalModel == 'keyframe-delta';
   for (int i = 0; i < index.length; i++) {
     final entry = index[i];
     // A zero-duration scene is not a scene with no clock — a static asset is
@@ -321,7 +331,7 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
     // extended index leaves it zero and counts its gaussians the ordinary way,
     // so keying on `extended` alone reads every keyframe as empty.
     final int population =
-        (entry.extended && entry.kind == 1)
+        (isKeyframeDelta && entry.extended && entry.kind == 1)
             ? entry.liveCount
             : entry.gaussianCount;
     if (population > 0 &&
