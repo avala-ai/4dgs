@@ -16,6 +16,14 @@ All notable changes to the Swift package are documented here, following
   sources did not move; every target names its own path under `swift/`.
 - `fourdgsPackageVersion`, the one place this package's version is written, asserted against the
   release tag before anything is built.
+- Named refusals: `RefusalCode` gives the six identifiers the specification's refusal table defines,
+  and `FourDGSError.refusalCode` answers which rule a file broke — `nil` when the table does not
+  name the failure, which truncation and I/O errors legitimately are. The identifier comes from the
+  core through `fourdgs_last_refusal_code`, read as the pointer-and-length pair the ABI returns
+  rather than as a C string, and rides on three existing cases as a defaulted associated value, so
+  no pattern match and no call site changed. The `decode_streamed` and `decode_indexed` runners
+  print `{"refused": "<id>"}` and exit 0 for a file they refuse, which adds the invalid corpus to
+  Swift's conformance run: 105 comparisons become 119.
 - keyframe-delta decode: `peekTemporalModel` and `keyframeDeltaStatesJson`, binding the core's
   additive states-JSON C ABI through `CoreSeam`. The summary is computed in the Rust core, so the
   binding does no arithmetic of its own; the `decode_streamed` and `decode_indexed` runners peek the

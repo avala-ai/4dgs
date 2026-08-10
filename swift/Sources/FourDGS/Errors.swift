@@ -1,6 +1,39 @@
 // Copyright 2026 Avala AI
 // SPDX-License-Identifier: Apache-2.0
 
+/// The specification's name for **which** rule a file broke.
+///
+/// ``FourDGSError`` says what *kind* of thing went wrong; this says which rule, in the same
+/// six words Python, Rust, TypeScript, C++ and Dart print for the same file. That is the
+/// difference between "both decoders refused it" and "both decoders refused it for the same
+/// reason" — a reader that rejects a bad-magic file because it mis-parsed the version passes
+/// a bare-refusal test and is still wrong.
+///
+/// The vocabulary is closed and is defined once, in `rust/fourdgs/src/error.rs`. Seven
+/// invalid corpus variants map onto these six: an empty temporal model and an unrecognized
+/// one share ``unknownTemporalModel``, because a declaration of nothing is not a default.
+public enum RefusalCode: String, Sendable, Equatable, CaseIterable {
+
+    /// The file does not begin with the 4dgs magic.
+    case magicMismatch = "magic-mismatch"
+
+    /// The magic is ours; the major version is not one this reader implements.
+    case unsupportedMajorVersion = "unsupported-major-version"
+
+    /// The Header names a temporal model this build does not implement — including the
+    /// empty name.
+    case unknownTemporalModel = "unknown-temporal-model"
+
+    /// The Quantization record names a scheme this build does not implement.
+    case unknownQuantizationScheme = "unknown-quantization-scheme"
+
+    /// A stream declares a codec this build does not implement.
+    case unknownStreamCodec = "unknown-stream-codec"
+
+    /// A gaussian's `window_index` names a row the Window Table does not have.
+    case windowIndexOutOfRange = "window-index-out-of-range"
+}
+
 /// Why a file was refused.
 ///
 /// This package parses untrusted bytes, so a bare error type is not a diagnosis: every
@@ -9,6 +42,13 @@
 /// The split that matters is between **malformed** and **unsupported**. A malformed file
 /// is broken and the fix is to re-encode it; an unsupported one is legal and the fix is a
 /// newer reader. Collapsing the two sends people to debug the wrong thing.
+///
+/// Three cases carry a ``RefusalCode`` as a trailing associated value, defaulted to `nil`
+/// so every existing call site still compiles. They are the three the C ABI seam builds,
+/// and each is many-to-one: ``unsupportedCodec`` alone stands for three different
+/// identifiers. That ambiguity is exactly why the core grew
+/// `fourdgs_last_refusal_code` instead of three more status codes, and the value is
+/// carried rather than recomputed because only the core knows which rule it applied.
 public enum FourDGSError: Error, Equatable, Sendable {
 
     // MARK: Malformed — the file is wrong
@@ -24,7 +64,7 @@ public enum FourDGSError: Error, Equatable, Sendable {
     case truncated(offset: Int64, record: String, needed: Int64, available: Int64)
 
     /// A field held a value the specification does not allow.
-    case malformed(offset: Int64, record: String, field: String, reason: String)
+    case malformed(offset: Int64, record: String, field: String, reason: String, refusal: RefusalCode? = nil)
 
     /// A gaussian referenced a window the Window Table does not contain. Not clamped:
     /// clamping substitutes one gaussian's lifetime for another's in a file that is
@@ -39,7 +79,7 @@ public enum FourDGSError: Error, Equatable, Sendable {
     /// A chunk named a compression codec this reader does not implement. Distinct from a
     /// corrupt chunk: ignoring the codec would decode compressed bytes as attribute
     /// streams, which produces wrong gaussians rather than an error.
-    case unsupportedCodec(offset: Int64, record: String, name: String)
+    case unsupportedCodec(offset: Int64, record: String, name: String, refusal: RefusalCode? = nil)
 
     /// A well-known string — profile, quantization scheme, temporal model, interpolation
     /// — that is in the registry's space but not in this reader's.
@@ -60,10 +100,46 @@ public enum FourDGSError: Error, Equatable, Sendable {
     /// The Rust core reported an error this version of the binding has no case for. The
     /// code and message are passed through verbatim rather than flattened, so a core that
     /// grows a new failure mode is still diagnosable from Swift.
-    case core(code: Int32, message: String)
+    case core(code: Int32, message: String, refusal: RefusalCode? = nil)
 
     /// Reached a path whose implementation is still the C ABI seam.
     case notImplemented(String)
+}
+
+extension FourDGSError {
+
+    /// Which rule this file broke, or `nil` when no rule in the refusal table names it.
+    ///
+    /// `nil` is an answer, not a gap in the plumbing. A truncated transport, an I/O failure
+    /// and a caller's bad range are real errors that the table does not name, and reporting
+    /// one of them under a borrowed identifier would be worse than reporting none. The
+    /// distinction a caller needs — "no error at all" — is the absence of a thrown error,
+    /// not `nil` here.
+    ///
+    /// Three cases answer from the case alone, because each is one rule and nothing else:
+    /// a file whose magic is wrong broke exactly the magic rule. The other three answer
+    /// with what they were built carrying, because the same case stands for several rules.
+    public var refusalCode: RefusalCode? {
+        switch self {
+        case .notFourDGS:
+            return .magicMismatch
+        case .unsupportedMajorVersion:
+            return .unsupportedMajorVersion
+        case .windowIndexOutOfRange:
+            return .windowIndexOutOfRange
+        case .malformed(_, _, _, _, let refusal):
+            return refusal
+        case .unsupportedCodec(_, _, _, let refusal):
+            return refusal
+        case .core(_, _, let refusal):
+            return refusal
+        // Listed rather than left to a `default`, so that a case added later has to decide
+        // whether it names a refusal instead of silently answering `nil`.
+        case .truncated, .summaryChecksumMismatch, .unsupportedValue, .noChunkIndex,
+            .invalidRange, .unreadableSource, .notImplemented:
+            return nil
+        }
+    }
 }
 
 extension FourDGSError: CustomStringConvertible {
@@ -77,7 +153,7 @@ extension FourDGSError: CustomStringConvertible {
                 "unsupported major version: the magic's version byte is \(found) ('\(Character(UnicodeScalar(found)))'), this reader implements \(supported)"
         case .truncated(let offset, let record, let needed, let available):
             return "truncated \(record) at byte \(offset): needs \(needed) bytes, \(available) remain"
-        case .malformed(let offset, let record, let field, let reason):
+        case .malformed(let offset, let record, let field, let reason, _):
             return "malformed \(record).\(field) at byte \(offset): \(reason)"
         case .windowIndexOutOfRange(let offset, let index, let tableSize):
             return
@@ -85,7 +161,7 @@ extension FourDGSError: CustomStringConvertible {
         case .summaryChecksumMismatch(let offset, let declared, let computed):
             return
                 "summary CRC mismatch at byte \(offset): the Footer declares \(declared), the bytes compute \(computed)"
-        case .unsupportedCodec(let offset, let record, let name):
+        case .unsupportedCodec(let offset, let record, let name, _):
             return
                 "unsupported codec \"\(name)\" named by \(record) at byte \(offset); the file is legal, this reader is not new enough"
         case .unsupportedValue(let offset, let record, let field, let value):
@@ -98,7 +174,7 @@ extension FourDGSError: CustomStringConvertible {
             return "invalid range: offset \(offset), count \(count)"
         case .unreadableSource(let description):
             return "unreadable source: \(description)"
-        case .core(let code, let message):
+        case .core(let code, let message, _):
             return "4dgs core error \(code): \(message)"
         case .notImplemented(let what):
             return "\(what) is not implemented yet in the Swift SDK"

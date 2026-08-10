@@ -290,6 +290,81 @@ final class MagicTests: XCTestCase {
     }
 }
 
+/// A refusal names **which** rule the file broke, not merely that one broke. "Both readers
+/// refused it" and "both readers refused it for the same reason" are different claims, and
+/// only the second one is worth anything: a reader that rejects a bad-magic file because it
+/// mis-parsed the version passes a bare-refusal test and is still wrong.
+final class RefusalTests: XCTestCase {
+
+    /// The identifiers are a shared vocabulary, spelled the same in six languages. A typo
+    /// here would not fail to compile and would not fail a decode — it would quietly make
+    /// Swift disagree with everyone else about what it just refused, which is exactly the
+    /// class of drift the conformance suite's refusal expectations exist to catch. Pinned
+    /// here too so the mistake is found in a unit test rather than in a corpus diff.
+    func testTheVocabularyIsTheSpecification() {
+        XCTAssertEqual(
+            RefusalCode.allCases.map(\.rawValue),
+            [
+                "magic-mismatch", "unsupported-major-version", "unknown-temporal-model",
+                "unknown-quantization-scheme", "unknown-stream-codec", "window-index-out-of-range",
+            ])
+    }
+
+    /// Refused on the Swift side of the seam, before any byte crosses: the case *is* the
+    /// diagnosis, so the identifier comes from the case and needs nothing carried.
+    func testTheBindingsOwnRefusalsNameThemselves() {
+        var garbage = InMemoryReader(Array("not a splat at all".utf8))
+        XCTAssertThrowsError(try Core.validateMagic(&garbage)) { error in
+            XCTAssertEqual((error as? FourDGSError)?.refusalCode, .magicMismatch)
+        }
+
+        var future = InMemoryReader(Core.magic.enumerated().map { $0.offset == 5 ? 0x32 : $0.element })
+        XCTAssertThrowsError(try Core.validateMagic(&future)) { error in
+            XCTAssertEqual((error as? FourDGSError)?.refusalCode, .unsupportedMajorVersion)
+        }
+    }
+
+    /// The seam itself: `peekTemporalModel` goes straight to the core, so a refusal here
+    /// came back over the C ABI. The status alone cannot say which rule was broken — one
+    /// status covers both of these — and the identifier is what tells them apart.
+    func testTheCoresRefusalsCrossTheABIByName() throws {
+        XCTAssertThrowsError(try peekTemporalModel(Array("not a splat at all".utf8))) { error in
+            XCTAssertEqual((error as? FourDGSError)?.refusalCode, .magicMismatch)
+        }
+
+        let future = Core.magic.enumerated().map { $0.offset == 5 ? 0x32 : $0.element }
+        XCTAssertThrowsError(try peekTemporalModel(future + Array(repeating: 0, count: 32))) { error in
+            XCTAssertEqual((error as? FourDGSError)?.refusalCode, .unsupportedMajorVersion)
+        }
+    }
+
+    /// No identifier is an answer, not a hole in the plumbing. The magic and nothing after
+    /// it is a real error the refusal table does not name, and the ABI says so by returning
+    /// `FOURDGS_STATUS_OK` with a null pointer. Reporting it under a borrowed identifier
+    /// would be worse than reporting none — the whole row would stop meaning anything.
+    func testAnUnnamedFailureIsNotGivenSomebodyElsesName() {
+        XCTAssertThrowsError(try peekTemporalModel(Core.magic)) { error in
+            let error = error as? FourDGSError
+            XCTAssertNotNil(error, "expected a FourDGSError, got \(error as Any)")
+            XCTAssertNil(error?.refusalCode)
+            // Still a diagnosis in words, which is where an unnamed refusal is read.
+            XCTAssertFalse("\(error!)".isEmpty)
+        }
+    }
+
+    /// The identifier rides along without displacing anything: the message, the status and
+    /// every pattern that matched these cases before still say what they said.
+    func testCarryingAnIdentifierChangesNothingElse() {
+        let error = FourDGSError.unsupportedCodec(
+            offset: 12, record: "Chunk", name: "brotli", refusal: .unknownStreamCodec)
+        XCTAssertEqual(error.refusalCode, .unknownStreamCodec)
+        XCTAssertTrue("\(error)".contains("unsupported codec \"brotli\" named by Chunk at byte 12"))
+        // Defaulted, so a call site written before the identifier existed still compiles and
+        // still means what it meant: this refusal has no name in the table.
+        XCTAssertNil(FourDGSError.unsupportedCodec(offset: 12, record: "Chunk", name: "brotli").refusalCode)
+    }
+}
+
 final class SeamTests: XCTestCase {
 
     /// Garbage is diagnosed as garbage on the Swift side, before anything crosses into
