@@ -208,9 +208,10 @@ python3 tests/conformance/run.py \
   --runner-cmd 'go run ./cmd/decode_indexed'
 ```
 
-The command is split with shell quoting rules, and the variant's file path is appended to it — so a
-runner sees whatever arguments you wrote, then one path, which is the same invocation the built-in
-runners get.
+The command is split with the quoting rules of the platform the suite is running on — POSIX rules
+elsewhere, Windows rules on Windows, where a backslash is a path separator and not an escape — and
+the variant's file path is appended to it. So a runner sees whatever arguments you wrote, then one
+path, which is the same invocation the built-in runners get.
 
 ### The capabilities handshake
 
@@ -234,14 +235,34 @@ and no path. The runner answers with one JSON object on stdout and exits 0:
 | `name`     | yes      | `<family>/<read path>`, printed on every line about this runner                                         |
 | `family`   | no       | defaults to `name` up to the first `/`                                                                  |
 | `readPath` | yes      | `streamed` or `indexed`. An indexed runner is not asked about a variant written without `UseChunkIndex` |
-| `refusals` | no       | `true` to be scored on the seven invalid variants. Absent means no, and the seven are skipped           |
-| `declines` | no       | variant-name fragments this runner has not implemented; a variant containing one is skipped, not failed |
+| `refusals` | no       | `true` to be scored on all seven invalid variants. Absent means no, and the seven are skipped           |
+| `declines` | no       | fragments of a **valid** variant's name this runner has not implemented; a match is skipped, not failed |
 
 Two consequences worth stating, because they are what the built-in tables get wrong for an outsider.
 The runner opts into the invalid corpus itself, so it does not need its family added to
 `REFUSAL_FAMILIES` — a file it does not own. And declining is something the runner says about itself
 rather than something the harness records about it, so a partial implementation can be scored
 honestly on its first day.
+
+**`refusals` is all seven or none, and `declines` cannot quietly reduce it.** The two keys describe
+different corpora, so a fragment is matched against the valid variants only. Otherwise a runner
+declining `Unknown` — because it has not implemented unknown record types, a feature of the valid
+corpus — would also stop being asked `invalid/UnknownStreamCodec`,
+`invalid/UnknownQuantizationScheme` and `invalid/UnknownTemporalModel`, while the handshake line
+above it still read `refusals answered`. Nobody would have lied; a feature name would simply have
+collided with a filename, and the score would have overstated what was proved. `REFUSAL_FAMILIES`
+works the same way for the families in this repository, so an outside runner is held to neither more
+nor less than a built-in one.
+
+**A runner that answers nothing fails.** If every valid variant matches a `declines` fragment and
+`refusals` is absent, the run ends `0 passed, 120 skipped, 0 failed` — and exits non-zero, naming
+the runner:
+
+```
+error: go/decode_streamed declined every variant, so nothing was compared
+```
+
+An empty implementation is a legitimate starting point; a green suite in front of one is not.
 
 The handshake doubles as the liveness check. A command that cannot be started, hangs, exits non-zero
 or prints something other than one JSON object fails the run with a message naming the command and
@@ -261,13 +282,30 @@ go wrong costs exactly one red variant rather than the run:
 ```
 FAIL go/decode_streamed invalid/BadMagic: runner did not answer within 120s
 FAIL go/decode_streamed invalid/BadMagic: runner exited 1
+FAIL go/decode_streamed invalid/BadMagic: runner could not be started: No such file or directory
+FAIL go/decode_streamed invalid/BadMagic: runner printed more than 8388608 bytes on stdout
 FAIL go/decode_streamed invalid/BadMagic: stdout is not one JSON document (Expecting value: line 1 column 1 (char 0))
   stdout: 'reading /…/BadMagic.4dgs\n{"refused": "magic-mismatch"}'
 ```
 
-The third is the one every runner author meets: **stdout is the answer and nothing else**, and a
+The last is the one every runner author meets: **stdout is the answer and nothing else**, and a
 progress line printed beside the JSON leaves the whole document impossible to parse. Diagnostics go
 on stderr, which the harness captures and prints when the runner exits non-zero.
+
+Three details of that bounding, each there because the failure it prevents costs the run rather than
+a variant:
+
+- **The timeout ends the process group, not the process.** `go run ./cmd/runner` and
+  `dotnet run --project X` are wrappers: they launch the decoder and are not it. Killing the wrapper
+  alone leaves the decoder running, and a corpus of 120 variants against a hanging implementation
+  leaves 120 of them behind. Each invocation gets its own session, and the timeout ends all of it.
+- **Captured output is bounded** at 8 MiB per stream, drained continuously so the runner never
+  blocks on a full pipe. An answer is one JSON document — the largest expectation in the corpus is
+  under 25 KB — so a runner that passes this bound is not going to pass the comparison either, and
+  it should not be able to exhaust the machine on its way to being told so.
+- **Output that is not UTF-8 is reported, not raised.** The bytes are decoded with replacement, so a
+  runner whose stdout is not text fails one variant with its output quoted, rather than ending the
+  run in a `UnicodeDecodeError` that names neither the runner nor the variant.
 
 ## Platforms
 
