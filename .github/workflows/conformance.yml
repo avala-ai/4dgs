@@ -272,8 +272,12 @@ jobs:
       # produced nothing is a red suite rather than a green one. LD_LIBRARY_PATH is needed
       # because cargo emits the staticlib and the cdylib side by side and the linker
       # prefers the shared one.
+      #
+      # The manifest is at the repository root (SwiftPM only finds it there), so there is
+      # no --package-path; --scratch-path is what keeps the runners at the path run.py
+      # looks them up by, swift/.build/release.
       - run: |
-          swift build --package-path swift --configuration release -Xlinker -L$PWD/target/release
+          swift build --scratch-path swift/.build --configuration release -Xlinker -L$PWD/target/release
           python3 -m pip install --break-system-packages -e ./python/fourdgs >/dev/null
           python3 tests/conformance/generate.py
           LD_LIBRARY_PATH=$PWD/target/release python3 tests/conformance/run.py --runner swift

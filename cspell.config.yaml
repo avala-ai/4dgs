@@ -130,6 +130,8 @@ words:
   - cdylib
   - staticlib
   - lpthread
+  # `-lfourdgs`, the flag in the link error a consumer without the core sees
+  - lfourdgs
   - clippy
   - MSVC
   - fprintf

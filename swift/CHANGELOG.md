@@ -6,8 +6,16 @@ All notable changes to the Swift package are documented here, following
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-08-10
+
 ### Added
 
+- The package can be depended on. `Package.swift` moved to the repository root, because SwiftPM
+  clones the URL it is given and looks for a manifest at the top of that clone — a manifest under
+  `swift/` is invisible to `.package(url:)`, so nothing could depend on this package at all. The
+  sources did not move; every target names its own path under `swift/`.
+- `fourdgsPackageVersion`, the one place this package's version is written, asserted against the
+  release tag before anything is built.
 - keyframe-delta decode: `peekTemporalModel` and `keyframeDeltaStatesJson`, binding the core's
   additive states-JSON C ABI through `CoreSeam`. The summary is computed in the Rust core, so the
   binding does no arithmetic of its own; the `decode_streamed` and `decode_indexed` runners peek the
@@ -50,8 +58,14 @@ All notable changes to the Swift package are documented here, following
 
 ### Notes
 
-The shared suite proves 79 comparisons across the 45 valid variants Swift supports, including fixed,
+The shared suite proves 105 comparisons across the valid variants Swift supports, including fixed,
 moving and multiple audio-source scenes. Swift's runners materialize payloads only for canonical
 comparison; the public `SceneReader` leaves them deferred.
 
-Nothing is released. There is no Swift package registry entry and nothing should depend on this yet.
+**This version resolves and does not link out of tree.** There is no Swift registry; the package is
+consumed from this repository's URL, at plain `vX.Y.Z` tags, which are the only tags SwiftPM reads.
+`FourDGS` binds the Rust core through its C ABI and ships no prebuilt copy of it, so a consumer with
+no checkout of this repository has no `libfourdgs` for the linker to find. The manifest emits a
+warning saying so, naming what is missing and how to supply it, instead of leaving
+`cannot find -lfourdgs` as the whole diagnosis. A `binaryTarget` pointing at a checksummed
+`.xcframework` built for visionOS, iOS and macOS is the fix, and is not in this version.
