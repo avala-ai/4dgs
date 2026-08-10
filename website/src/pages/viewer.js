@@ -110,6 +110,12 @@ export default function ViewerPage() {
               Spherical harmonics on a <code>keyframe-delta</code> scene: SH bands live in their own
               records, which that model&rsquo;s read path does not visit.
             </li>
+            <li>
+              More gaussians at one instant than this device&rsquo;s WebGL texture limit holds —
+              every gaussian is drawn from a single texture, so past that limit the page says so by
+              name rather than showing you an empty canvas. A renderer that tiles its data across
+              several textures has no such ceiling.
+            </li>
           </ul>
           <p>
             The format does not impose a handedness or an up axis, so the viewer picks Y-up and lets

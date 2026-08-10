@@ -54,12 +54,22 @@ function clamp(value, lo, hi) {
  * `chunk` is the one whose half-open `[t0, t1)` contains `t`; picking it is the seek, and
  * this is what that seek was for.
  *
+ * The gaussians that come back are the ones §3 calls visible at `t` —
+ * `win_lo <= t < win_hi` and `marginal >= cutoff` — and no others. The window test is the
+ * format's only hard temporal gate (§3.1) and it is not a property of the temporal model:
+ * a composed `keyframe-delta` state carries a `window_index` per gaussian exactly as a
+ * `gaussian-birth` chunk does, so the same two comparisons decide existence on both paths.
+ * `@4dgs/core`'s canonical statement for this model reports every composed row rather than
+ * the visible ones, because it is describing the population a chunk carries and not what a
+ * consumer draws; those are different questions and this one is the renderer's.
+ *
  * @param {object} sequence the decoded `KeyframeDeltaSequence`
  * @param {object} chunk one `KeyframeDeltaChunkInfo` from it
  * @param {number} t scene time, in seconds
+ * @param {number} cutoff the marginal below which a gaussian is not drawn
  * @returns {import("./openScene").Frame}
  */
-export function reconstructKeyframeDelta(sequence, chunk, t) {
+export function reconstructKeyframeDelta(sequence, chunk, t, cutoff) {
   const state = chunk.state;
   const count = state.count;
   const steps = stepsFrom(sequence.quantization);
@@ -72,7 +82,7 @@ export function reconstructKeyframeDelta(sequence, chunk, t) {
   const scales = new Float32Array(count * 3);
   const rotations = new Float32Array(count * 4);
   const colors = new Float32Array(count * 4);
-  if (count === 0) return emptyFrame(t, centers, scales, rotations, colors);
+  if (count === 0) return frameOf(t, 0, centers, scales, rotations, colors);
 
   const position = columnOf(state, Attribute.Position, chunk);
   const scaleBins = columnOf(state, Attribute.Scale, chunk);
@@ -86,6 +96,10 @@ export function reconstructKeyframeDelta(sequence, chunk, t) {
   const flags = columnOf(state, Attribute.Flags, chunk);
   const windowBins = columnOf(state, Attribute.WindowIndex, chunk);
 
+  // Rows are written at `live`, not at `i`: a gaussian the two visibility tests reject is
+  // not a transparent gaussian, it is one that does not exist at this instant, and the
+  // frame the renderer is handed says so by not containing it.
+  let live = 0;
   for (let i = 0; i < count; i++) {
     const i3 = i * 3;
     const sigmaBin = sigmaBins[i];
@@ -100,18 +114,27 @@ export function reconstructKeyframeDelta(sequence, chunk, t) {
       windowCount,
       `keyframe-delta chunk at byte ${chunk.offset}, gaussian id ${state.ids[i]}`,
     );
-    const windowLength = windows[windowIndex * 2 + 1] - windows[windowIndex * 2];
+    const windowLo = windows[windowIndex * 2];
+    const windowHi = windows[windowIndex * 2 + 1];
+    // §3.1: the validity window is the format's only hard temporal gate, and a gaussian
+    // outside it does not exist at `t` whatever its marginal says.
+    if (!(windowLo <= t && t < windowHi)) continue;
+
     const step = motionStep(
-      lifeClass(sigmaBin, steps.sigmaLog, neverFades, windowLength, k),
+      lifeClass(sigmaBin, steps.sigmaLog, neverFades, windowHi - windowLo, k),
       steps.motion,
     );
     const mu = muBins[i] * muStep(sigmaBin, steps.sigmaLog, neverFades, steps.time);
     const dt = t - mu;
+    const marginal = sigma === Infinity ? 1 : Math.exp(-0.5 * (dt / sigma) * (dt / sigma));
+    // The other half of §3's visibility test, and the file's own threshold for it.
+    if (!(marginal >= cutoff)) continue;
 
+    const o3 = live * 3;
     for (let c = 0; c < 3; c++) {
       const rest = position[i3 + c] * steps.pos + origin[c];
-      centers[i3 + c] = rest + motion[i3 + c] * step * dt;
-      scales[i3 + c] = Math.exp(scaleBins[i3 + c] * steps.scaleLog);
+      centers[o3 + c] = rest + motion[i3 + c] * step * dt;
+      scales[o3 + c] = Math.exp(scaleBins[i3 + c] * steps.scaleLog);
     }
 
     dequantizeRotation(
@@ -121,28 +144,28 @@ export function reconstructKeyframeDelta(sequence, chunk, t) {
       rotationBins[i3 + 2],
       steps.rot,
       rotations,
-      i * 4,
+      live * 4,
     );
 
     const [r, g, b] = rctInverse(colorBins[i3], colorBins[i3 + 1], colorBins[i3 + 2]);
-    colors[i * 4] = clamp(r * steps.rgb, 0, 1);
-    colors[i * 4 + 1] = clamp(g * steps.rgb, 0, 1);
-    colors[i * 4 + 2] = clamp(b * steps.rgb, 0, 1);
-    const marginal = sigma === Infinity ? 1 : Math.exp(-0.5 * (dt / sigma) * (dt / sigma));
-    colors[i * 4 + 3] = clamp(opacityBins[i] * steps.alpha, 0, 1) * marginal;
+    colors[live * 4] = clamp(r * steps.rgb, 0, 1);
+    colors[live * 4 + 1] = clamp(g * steps.rgb, 0, 1);
+    colors[live * 4 + 2] = clamp(b * steps.rgb, 0, 1);
+    colors[live * 4 + 3] = clamp(opacityBins[i] * steps.alpha, 0, 1) * marginal;
+    live += 1;
   }
 
-  return emptyFrame(t, centers, scales, rotations, colors);
+  return frameOf(t, live, centers, scales, rotations, colors);
 }
 
-function emptyFrame(t, centers, scales, rotations, colors) {
+function frameOf(t, count, centers, scales, rotations, colors) {
   return {
     time: t,
-    count: colors.length / 4,
-    centers,
-    scales,
-    rotations,
-    colors,
+    count,
+    centers: centers.subarray(0, count * 3),
+    scales: scales.subarray(0, count * 3),
+    rotations: rotations.subarray(0, count * 4),
+    colors: colors.subarray(0, count * 4),
     sh: null,
     shCoefficients: 0,
     shDegree: 0,

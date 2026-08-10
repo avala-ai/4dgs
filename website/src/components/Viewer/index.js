@@ -34,6 +34,8 @@ export default function Viewer() {
   /** Everything the animation loop reads and writes without re-rendering React. */
   const playbackRef = useRef({ playable: null, time: 0, playing: false, loop: true, serial: 0 });
   const dragRef = useRef(null);
+  /** True only between pointer-down and pointer-up on the scrubber. */
+  const draggingScrubRef = useRef(false);
 
   const [source, setSource] = useState(null);
   const [scene, setScene] = useState(null);
@@ -44,6 +46,14 @@ export default function Viewer() {
   const [upAxis, setUpAxis] = useState("y");
   const [playing, setPlaying] = useState(false);
   const [loop, setLoop] = useState(true);
+  /**
+   * Set when an instant refuses to decode, which retires the file.
+   *
+   * The scene's facts stay on the page — they are still true of the file, and they are half
+   * of the diagnosis next to the refusal — but nothing is left to play, so the transport
+   * says so by being disabled rather than by accepting clicks and ignoring them.
+   */
+  const [decodeFailed, setDecodeFailed] = useState(false);
   /** Non-null while the visitor is dragging the scrubber, so the readout cannot fight it. */
   const [scrub, setScrub] = useState(null);
   const [readout, setReadout] = useState({ time: 0, count: 0, intervals: [], transfer: null });
@@ -106,6 +116,7 @@ export default function Viewer() {
               if (!running || playbackRef.current.serial !== serial) return;
               playbackRef.current.playable = null;
               setPlaying(false);
+              setDecodeFailed(true);
               setError(failure);
             });
         }
@@ -144,7 +155,14 @@ export default function Viewer() {
 
   const open = useCallback(async (readable, label) => {
     const playback = playbackRef.current;
+    // A URL over a slow link and a large local file both take long enough that a visitor
+    // can start a second open before the first returns. Every effect below is guarded by
+    // the serial this call started under, so the file that finishes last does not win: the
+    // one the page says it is showing does, and an older refusal never replaces a newer
+    // one.
     playback.serial += 1;
+    const serial = playback.serial;
+    const current = () => playbackRef.current.serial === serial;
     playback.playable = null;
     playback.playing = false;
     playback.time = 0;
@@ -152,21 +170,26 @@ export default function Viewer() {
     setPlaying(false);
     setScene(null);
     setError(null);
+    setDecodeFailed(false);
     setSource(label);
     setBusy(true);
     try {
       const playable = await openScene(readable);
+      if (!current()) return;
       // Framing also probes a handful of instants. One that will not decode is worth
       // saying now rather than three seconds into playback, so its refusal joins the notes.
-      playable.notes.push(...(await frameCamera(playable, rendererRef.current, cameraRef.current)));
+      playable.notes.push(
+        ...(await frameCamera(playable, rendererRef.current, cameraRef.current, current)),
+      );
+      if (!current()) return;
       playback.playable = playable;
       playback.time = 0;
       playback.rendered = 0;
       setScene(playable);
     } catch (failure) {
-      setError(failure);
+      if (current()) setError(failure);
     } finally {
-      setBusy(false);
+      if (current()) setBusy(false);
     }
   }, []);
 
@@ -229,6 +252,12 @@ export default function Viewer() {
   const togglePlay = useCallback(() => {
     const playback = playbackRef.current;
     if (playback.playable === null) return;
+    // A run that ended without looping left the clock on the last instant the timeline
+    // contains. Starting from there would reach the duration on the first tick and stop
+    // again, so Play from the end means play it again rather than nothing at all.
+    if (!playback.playing && playback.time >= lastInstant(playback.playable.duration)) {
+      playback.time = 0;
+    }
     playback.playing = !playback.playing;
     setPlaying(playback.playing);
   }, []);
@@ -240,6 +269,7 @@ export default function Viewer() {
   // --- markup --------------------------------------------------------------
 
   const duration = scene === null ? 0 : scene.duration;
+  const playableNow = scene !== null && duration > 0 && !decodeFailed;
 
   return (
     <div className={styles.viewer}>
@@ -283,7 +313,7 @@ export default function Viewer() {
           type="button"
           className="button button--secondary button--sm"
           onClick={togglePlay}
-          disabled={scene === null || duration <= 0}
+          disabled={!playableNow}
         >
           {playing ? "Pause" : "Play"}
         </button>
@@ -294,14 +324,31 @@ export default function Viewer() {
           max={duration > 0 ? duration : 1}
           step={duration > 0 ? duration / 2000 : 0.001}
           value={scrub ?? readout.time}
-          disabled={scene === null || duration <= 0}
+          disabled={!playableNow}
+          // The override exists so a dragging thumb is not yanked back by the readout, and
+          // it lasts exactly as long as the drag. An arrow key is not a drag: it seeks, and
+          // the slider goes straight back to following playback, so the next key press
+          // starts from where the scene actually is rather than from a frozen value.
+          onPointerDown={() => {
+            draggingScrubRef.current = true;
+          }}
           onChange={(event) => {
             const value = Number(event.target.value);
-            setScrub(value);
+            setScrub(draggingScrubRef.current ? value : null);
             seek(value);
           }}
-          onPointerUp={() => setScrub(null)}
-          onBlur={() => setScrub(null)}
+          onPointerUp={() => {
+            draggingScrubRef.current = false;
+            setScrub(null);
+          }}
+          onPointerCancel={() => {
+            draggingScrubRef.current = false;
+            setScrub(null);
+          }}
+          onBlur={() => {
+            draggingScrubRef.current = false;
+            setScrub(null);
+          }}
           aria-label="Scene time"
         />
         <span className={styles.clock}>
@@ -466,10 +513,13 @@ const READ_MODES = {
  * A scene whose gaussians are all born late has nothing at `t = 0`, and framing an empty
  * frame would leave the camera at the origin looking at nothing.
  */
-async function frameCamera(playable, renderer, camera) {
+async function frameCamera(playable, renderer, camera, isCurrent) {
   // The instant the visitor lands on. A refusal here is the file's answer to "can you open
   // this", and is allowed to propagate.
   const first = await playable.frameAt(0);
+  // A file the visitor has already moved on from does not get to put a frame on the canvas
+  // or move the camera; its caller will discard the rest of this open too.
+  if (!isCurrent()) return [];
   if (renderer !== null) renderer.setFrame(first);
   if (camera === null) return [];
 
@@ -487,6 +537,7 @@ async function frameCamera(playable, renderer, camera) {
       warnings.push(`t = ${t} does not decode — ${refusalName(failure)}: ${failure.message}`);
     }
   }
+  if (!isCurrent()) return [];
   camera.frame(bounds === null ? [0, 0, 0] : bounds.center, bounds === null ? 1 : bounds.radius);
   return warnings;
 }

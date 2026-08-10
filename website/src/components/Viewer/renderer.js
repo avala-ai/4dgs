@@ -26,7 +26,15 @@
  *   carries spherical harmonics.
  */
 
-/** Texels per row in both data textures. Any power of two well under `MAX_TEXTURE_SIZE`. */
+/**
+ * Texels per row in both data textures, when the device allows it.
+ *
+ * A row this narrow keeps the staging arrays small for an ordinary scene, but a texture is
+ * also no taller than `MAX_TEXTURE_SIZE` — 2048 rows on a device at WebGL2's floor, which
+ * at three texels a gaussian is only about 699k of them. Past that the rows are widened to
+ * the device's limit instead, which is why the shaders read `textureSize()` rather than
+ * this constant.
+ */
 const TEXTURE_WIDTH = 1024;
 
 /** How many standard deviations of the 2D gaussian the drawn quad covers. */
@@ -196,6 +204,12 @@ export class SplatRenderer {
     this.geometryTexture = createTexture(gl);
     this.colourTexture = createTexture(gl);
 
+    // `texImage2D` past this limit fails with INVALID_VALUE and throws nothing: the draw
+    // then samples a texture that was never allocated, which is a blank canvas and no
+    // message. It is asked for once, here, and respected in `ensureCapacity`.
+    this.maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+    this.geometryLayout = { width: TEXTURE_WIDTH, rows: 0, texels: 0 };
+    this.colourLayout = { width: TEXTURE_WIDTH, rows: 0, texels: 0 };
     this.capacity = 0;
     this.frame = null;
     this.frameSerial = 0;
@@ -231,18 +245,18 @@ export class SplatRenderer {
     }
 
     const gl = this.gl;
-    const rows = Math.ceil((frame.count * 3) / TEXTURE_WIDTH);
+    const { width, rows } = rowsFor(this.geometryLayout, frame.count * 3);
     gl.bindTexture(gl.TEXTURE_2D, this.geometryTexture);
     gl.texSubImage2D(
       gl.TEXTURE_2D,
       0,
       0,
       0,
-      TEXTURE_WIDTH,
+      width,
       rows,
       gl.RGBA,
       gl.FLOAT,
-      geometry.subarray(0, rows * TEXTURE_WIDTH * 4),
+      geometry.subarray(0, rows * width * 4),
     );
   }
 
@@ -364,31 +378,42 @@ export class SplatRenderer {
     }
 
     const gl = this.gl;
-    const rows = Math.ceil(frame.count / TEXTURE_WIDTH);
+    const { width, rows } = rowsFor(this.colourLayout, frame.count);
     gl.bindTexture(gl.TEXTURE_2D, this.colourTexture);
     gl.texSubImage2D(
       gl.TEXTURE_2D,
       0,
       0,
       0,
-      TEXTURE_WIDTH,
+      width,
       rows,
       gl.RGBA,
       gl.UNSIGNED_BYTE,
-      colours.subarray(0, rows * TEXTURE_WIDTH * 4),
+      colours.subarray(0, rows * width * 4),
     );
   }
 
   /** Grow the staging arrays and the textures. They never shrink. */
   ensureCapacity(count) {
     if (count <= this.capacity) return;
-    const capacity = Math.max(count, TEXTURE_WIDTH, this.capacity * 2);
-    const geometryRows = Math.ceil((capacity * 3) / TEXTURE_WIDTH);
-    const colourRows = Math.ceil(capacity / TEXTURE_WIDTH);
+    const limit = this.maxTextureSize;
+    // Three texels a gaussian, in a texture that is at most `limit` texels each way.
+    const supported = Math.floor((limit * limit) / 3);
+    if (count > supported) {
+      throw new Error(
+        `this scene has ${count} gaussians alive at one instant, and this device's WebGL2 ` +
+          `MAX_TEXTURE_SIZE of ${limit} holds at most ${supported} of them (three texels ` +
+          `each) in the one texture this viewer draws from. The file is fine; the page will ` +
+          `not draw it. A renderer that tiles its data across several textures would.`,
+      );
+    }
+    const capacity = Math.min(supported, Math.max(count, TEXTURE_WIDTH, this.capacity * 2));
+    this.geometryLayout = layoutFor(capacity * 3, limit);
+    this.colourLayout = layoutFor(capacity, limit);
     this.capacity = capacity;
     // Whole rows, so a partial `texSubImage2D` always has the bytes it says it has.
-    this.geometryData = new Float32Array(geometryRows * TEXTURE_WIDTH * 4);
-    this.colourData = new Uint8Array(colourRows * TEXTURE_WIDTH * 4);
+    this.geometryData = new Float32Array(this.geometryLayout.texels * 4);
+    this.colourData = new Uint8Array(this.colourLayout.texels * 4);
     this.depths = new Float32Array(this.capacity);
     this.order = new Uint32Array(this.capacity);
 
@@ -398,8 +423,8 @@ export class SplatRenderer {
       gl.TEXTURE_2D,
       0,
       gl.RGBA32F,
-      TEXTURE_WIDTH,
-      geometryRows,
+      this.geometryLayout.width,
+      this.geometryLayout.rows,
       0,
       gl.RGBA,
       gl.FLOAT,
@@ -410,8 +435,8 @@ export class SplatRenderer {
       gl.TEXTURE_2D,
       0,
       gl.RGBA8,
-      TEXTURE_WIDTH,
-      colourRows,
+      this.colourLayout.width,
+      this.colourLayout.rows,
       0,
       gl.RGBA,
       gl.UNSIGNED_BYTE,
@@ -419,6 +444,25 @@ export class SplatRenderer {
     );
     this.colouredForFrame = -1;
   }
+}
+
+/**
+ * A texture wide enough to hold `texels` in no more than `limit` rows.
+ *
+ * The narrow default row is kept while it fits, because it is what makes the staging array
+ * for a small scene small. Once the row count would pass `MAX_TEXTURE_SIZE` the widest row
+ * the device allows is the only shape left, and it raises the ceiling to `limit²` texels.
+ */
+function layoutFor(texels, limit) {
+  const narrow = Math.min(TEXTURE_WIDTH, limit);
+  const width = Math.ceil(texels / narrow) > limit ? limit : narrow;
+  const rows = Math.max(1, Math.ceil(texels / width));
+  return { width, rows, texels: width * rows };
+}
+
+/** The whole rows of `layout` that `texels` occupies, which is what an upload covers. */
+function rowsFor(layout, texels) {
+  return { width: layout.width, rows: Math.max(1, Math.ceil(texels / layout.width)) };
 }
 
 /**
