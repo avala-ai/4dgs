@@ -12,6 +12,20 @@ The four packages version together.
 
 ### Added
 
+- Provenance decode in `@4dgs/core` (spec §5.15): `CoordinateFrame`, `GeodeticAnchor`,
+  `SensorCalibration` and `RigTrajectory` records are parsed and reported, with `poseAt` and `slerp`
+  interpolating a rig pose at an instant and `poseCompose` / `poseApply` placing a sensor in the
+  scene. Available on both read paths — the streamed decoder reports it with the scene, while
+  `IndexedDecoder.readProvenance()` frames the records at open and fetches them only when asked, so
+  a metadata-only open still costs one range request.
+- `stateAtWithObjects` is exported as the entry point for composing an object layer onto
+  reconstructed gaussian state.
+- Ceilings that stop a declared length from sizing an allocation: `MAX_TRAJECTORY_SAMPLES` bounds
+  what one count-prefixed record may ask for, and `MAX_FRONT_MATTER_BYTES` (64 MiB) bounds a Camera,
+  Metadata, provenance, object-layer or Audio Source descriptor record before the indexed decoder
+  fetches it. Chunks and audio payloads are not front matter and are unaffected. Both are shared by
+  value with the other SDKs, because a ceiling only one implementation has is a file that decodes
+  there and is refused here.
 - Native object-layer decode in `@4dgs/core` (spec §5.15.6–§5.15.7, §6.6): `parseObjectTable` and
   `parseObjectTrack` read the two records, the `object_id` attribute stream (id 14) is decoded onto
   `GaussianSet.objectId`, and `ObjectLayer` composes an object's SE(3) track onto reconstructed
