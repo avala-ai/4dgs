@@ -32,25 +32,29 @@ The LOD proposal is documentation only and is not advertised here.
   temporal model over time. Births and deaths are exact per frame; USD time samples do not carry
   `gaussian_id` correspondence across samples.
 
-- **`state_at_with_objects`**, exported at the top level, is the supported way to compose an object
-  layer onto reconstructed gaussian state. Earlier notes described this composition without naming
-  an entry point for it.
+- **`state_at_with_objects`**, exported at the top level, composes an object layer onto gaussian
+  state a caller already holds. `Scene.state_at` remains the path for a decoded streamed scene,
+  which composes its own layer; this is the same rule applied where the two arrive separately.
 - **A ceiling on trajectory and object-track samples.** `MAX_TRAJECTORY_SAMPLES` bounds what one
   count-prefixed record may ask a reader to allocate before the bytes behind it are shown to exist.
   Shared by value with the other SDKs, because a ceiling only one implementation has is a file that
   decodes here and is refused there.
 - **A ceiling on indexed front-matter records.** `MAX_FRONT_MATTER_BYTES` (64 MiB) bounds a Camera,
-  Metadata, provenance, object-layer or Audio Source descriptor record before `open_indexed` fetches
-  it, so a declared length cannot size a transfer the file has not justified. Chunks and audio
-  payloads are not front matter and are unaffected. **A file with a genuinely larger front-matter
-  record is refused where 0.2.0 attempted to read it.**
+  Metadata, provenance, object-layer or Audio Source descriptor record, so a declared length cannot
+  size a transfer the file has not justified. Chunks and audio payloads are not front matter and are
+  unaffected. The check runs when the record is fetched rather than at open: `open_indexed` frames
+  these ranges without reading them, so a file carrying an oversized one still opens and still
+  decodes its chunks — it is the accessor for that record that refuses, where 0.2.0 transferred it.
 - **An empty trajectory or object track is read as though the record were absent** (spec §5.15.4 and
-  §5.15.7), so reading one refuses nothing — not even an interpolation byte outside the registry,
-  which describes how to read samples it does not carry. Note that the writer does not currently
-  refuse a zero-sample record: `check()` validates sample times, and a trajectory with no samples
-  encodes with a zero count.
+  §5.15.7), so its pose rules are not applied — not even an interpolation byte outside the registry,
+  which describes how to read samples it does not carry. Rules that are not about the pose still
+  hold: a track naming object 0 is refused whether or not it carries samples, because the same
+  section requires every track to name something to move.
 
-### Fixed
+  Two consequences worth stating. A rig-relative sensor naming a zero-sample trajectory is now
+  refused, because the trajectory it references is absent — 0.2.0 kept the empty record and returned
+  the bare extrinsic. And the writer does not refuse a zero-sample record: `check()` validates
+  sample times and not the count, so one encodes with a count of zero.
 
 - **Each gaussian gets the validity window its `window_index` names.** The keyframe-delta reader
   derived every gaussian's velocity grid from the first validity window (spec §6.3), so on a file
@@ -64,6 +68,23 @@ The LOD proposal is documentation only and is not advertised here.
   file that previously returned expired or not-yet-born gaussians produces a different live set.
   Compare 0.3.0 results against 0.2.0 with that in mind.
 
+- **Cross-record rules run on a truncated file too, where they can.** `read` now applies the
+  provenance and object-layer checks whatever `recover_truncated` returned, because a duplicate
+  sensor name among records that arrived complete is a fault no later byte could repair. Rules that
+  resolve one record against another are still deferred for a cut file — the record it names may
+  simply not have arrived — unless a Footer went past, which means the record stream was complete
+  and a missing rig or frame is missing for good. **0.2.0 skipped all of these for any truncated
+  file and returned the partial scene.**
+- **A `pose_reference` outside the registry is refused.** The registry defines 0 (scene) and 1
+  (rig); 0.2.0 treated every other value as scene-relative, which puts a sensor somewhere plausible
+  and wrong rather than saying it cannot place it.
+- **Object Table shapes are validated before they are written.** An anchor that is not three values,
+  a dynamics tuple that is not three vectors, or a dynamics vector that is not three values is
+  refused with an identifier naming the object and the field. 0.2.0 wrote short anchors into a
+  structurally shifted record, and a wrong dynamics count surfaced as a bare `ValueError`.
+- **An invalid UTF-8 string names the byte that failed.** The diagnostic pointed at the length
+  prefix, which had decoded fine, sending whoever held the file four bytes short of the problem. It
+  now names the offending byte and its value.
 - **A duplicate attribute stream is refused rather than resolved.** A malformed chunk or
   keyframe-delta group carrying the same attribute twice decoded last-stream-wins, so the same bytes
   could yield different memberships or values depending on order. It now refuses with
