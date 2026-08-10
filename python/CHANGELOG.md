@@ -6,7 +6,7 @@ All notable changes to the Python package are documented here, following
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-07-31
+## [0.3.0] - 2026-08-10
 
 This release ships the normative `keyframe-delta` temporal model as a whole-file reference path and
 animated OpenUSD export for those sequences. Rendering and player policy remain outside the package.
@@ -32,7 +32,23 @@ The LOD proposal is documentation only and is not advertised here.
   temporal model over time. Births and deaths are exact per frame; USD time samples do not carry
   `gaussian_id` correspondence across samples.
 
+- **A ceiling on trajectory and object-track samples.** `MAX_TRAJECTORY_SAMPLES` bounds what one
+  count-prefixed record may ask a reader to allocate before the bytes behind it are shown to exist.
+  Shared by value with the other SDKs, because a ceiling only one implementation has is a file that
+  decodes here and is refused there.
+- **An empty trajectory is read as though the record were absent** (spec §5.15.4), so reading one
+  refuses nothing — not even an interpolation byte outside the registry, which describes how to read
+  samples it does not carry. The writer stays strict and must not emit such a record.
+
 ### Fixed
+
+- **Each gaussian gets the validity window its `window_index` names.** The keyframe-delta reader
+  derived every gaussian's velocity grid from the first validity window (spec §6.3), so on a file
+  whose Window Table has more than one entry, everything outside window 0 reconstructed at the wrong
+  motion precision — no refusal, just positions that drift from the bins the encoder wrote. The
+  writer could not produce such a file either: it forced a single full-duration window and wrote
+  `window_index = 0` for everyone, ignoring the `win_lo` and `win_hi` each gaussian already carried.
+  Both sides are fixed, so a multi-window population round-trips at the precision it declares.
 
 - **Chunk-compressed PLY segment fidelity.** Segmented imports now retain every source gaussian and
   use the `.4dgs` validity window—not temporal-center filtering—to reproduce which segment is
