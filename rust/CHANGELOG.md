@@ -6,6 +6,23 @@ All notable changes to the Rust crate are documented here, following
 
 ## [Unreleased]
 
+### Added
+
+- **The refusal identifier on the C ABI.**
+  `fourdgs_last_refusal_code(const char **out, size_t *out_len)` returns the identifier the
+  specification's refusal table gives the last error on this thread — `magic-mismatch`,
+  `unsupported-major-version`, `unknown-temporal-model`, `unknown-quantization-scheme`,
+  `unknown-stream-codec`, `window-index-out-of-range` — or NULL with length 0 when the error is not
+  one of them, which is an answer rather than a gap: a truncated transport and an I/O failure are
+  real errors the table does not name. The nine `FOURDGS_STATUS_*` codes say what _kind_ of thing
+  went wrong and `FOURDGS_STATUS_UNSUPPORTED_CODEC` alone covers three of the six, so this is the
+  only way a binding can say _which_ refusal it met. Additive — no existing signature moved —
+  because two bindings and a downstream application consume this ABI. Length-delimited like every
+  other string here, never NUL-terminated. Thread-local and written beside the message, so the
+  identifier and `fourdgs_last_error()` always describe one failure and a later error never inherits
+  an earlier identifier. `tests/capi_refusal.rs` reads it the way C does and `capi_smoke.c` proves
+  it links and compiles as C.
+
 ## [0.4.0] - 2026-08-10
 
 ### Added
