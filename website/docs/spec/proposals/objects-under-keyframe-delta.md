@@ -121,8 +121,8 @@ The chain machinery is attribute-generic, so `object_id` would survive it — `S
 restates one:
 
 ```python
-GOP_INVARIANT     = frozenset({op.A_SIGMA_T, op.A_FLAGS, op.A_WINDOW_INDEX})   # keyframe_delta.py:57
-ABSOLUTE_IN_UPDATE = frozenset({op.A_ROTATION_INDEX, op.A_ROTATION})           # keyframe_delta.py:60
+GOP_INVARIANT = frozenset({op.A_SIGMA_T, op.A_FLAGS, op.A_WINDOW_INDEX})  # keyframe_delta.py:57
+ABSOLUTE_IN_UPDATE = frozenset({op.A_ROTATION_INDEX, op.A_ROTATION})  # keyframe_delta.py:60
 ```
 
 `op.A_OBJECT_ID` is `14` (`opcode.py:135`) and is in neither set, so the update branch at

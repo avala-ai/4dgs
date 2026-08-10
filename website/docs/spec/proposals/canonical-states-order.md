@@ -63,7 +63,7 @@ key never sees:
 
 ```python
 row_for_index = {int(index): row for row, index in enumerate(base["indices"])}
-sample_indices = [index for index in order if index in row_for_index][:SAMPLE]   # canonical.py:250
+sample_indices = [index for index in order if index in row_for_index][:SAMPLE]  # canonical.py:250
 ```
 
 and the values are the composed centre and orientation at probe time `t`:
