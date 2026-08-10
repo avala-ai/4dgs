@@ -62,8 +62,8 @@ Two smaller questions have no reading at all, and the composition rule is unusab
    [§5.18](../index.md) says of the update group: "Every other stream present carries **bin
    differences** against the reference state." By the letter of that sentence a restated `object_id`
    is a difference of labels — object `12` minus object `7` is `5`, which is not an object. §11.5
-   makes `rotation_index` and `rotation` absolute by exception, and lists three attributes that a
-   delta MUST NOT carry at all. `object_id` is in neither list.
+   makes `rotation_index` and `rotation` absolute by exception, and forbids `sigma_t`, `flags` and
+   `window_index` in an update group outright. `object_id` is in neither list.
 
 2. **May `object_id` change within a GOP at all?** §11.5's invariant set is `sigma_t`, `flags`,
    `window_index`, `rotation_index`, each for a stated reason about derived grids. None of those
@@ -392,6 +392,17 @@ to write the combination, then add a variant".
 - **"§5.15.7 composes a track onto the reference state (`center = R*c0 + T`)."** §5.15.7 states the
   composition in prose and refers to §3; the formula is written out in §3 and in §6.6, not in
   §5.15.7. A reader looking for the arithmetic at the cited section will not find it there.
+
+**One thing found while writing §5.2 that #79 does not mention, and that whoever edits §11.5 should
+fix in the same pass.** §11.5 opens "Four attributes are **GOP-invariant per gaussian**: a delta
+MUST NOT carry them in its update group, and a reader MUST refuse a file where one appears there",
+and its table's fourth row is `rotation_index` — but the paragraph four lines below says "The update
+carries `rotation_index` and the three `rotation` bins as written". The section contradicts itself
+about `rotation_index`. §5.18 resolves it correctly ("`sigma_t`, `flags` and `window_index` MUST be
+absent; `rotation_index` and `rotation`, when present, are absolute") and so does the reference
+(`GOP_INVARIANT` holds three ids, not four), so the wire is unambiguous and only §11.5's opening
+sentence is wrong. It matters here because this proposal adds a sentence to that section, and a
+reader arriving at it to learn `object_id`'s treatment reads the contradiction first.
 
 ---
 
