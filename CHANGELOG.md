@@ -40,5 +40,5 @@ The TypeScript packages are at 0.3.0 in this repository and have written 0.1.0, 
 changelog sections, and are absent from the log above because nothing beyond the 0.0.1 name
 reservation has been published: the release job's OIDC exchange has no trusted publisher to exchange
 with on npm. The tag will be pushed when it can publish, which is the only thing that puts a line
-here. Python and Rust 0.3.0 follow the same rule — version constants and changelog sections land on
-`main` first; tags and registry lines come after.
+here. Python 0.3.0 and Rust 0.4.0 follow the same rule — version constants and changelog sections
+land on `main` first; tags and registry lines come after.
