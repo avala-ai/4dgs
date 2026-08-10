@@ -57,7 +57,7 @@ jobs:
           echo "rust: ${size_kb} KiB"
           [ "$size_kb" -le 1100 ] || { echo "::error::rust is ${size_kb} KiB, over the 1100 KiB budget"; exit 1; }
 
-      - name: TypeScript sources under 704 KB
+      - name: TypeScript sources under 768 KB
         # Sources only: this job installs nothing and builds nothing, so node_modules
         # and dist are not here to measure. A vendored dependency would show up as a
         # budget failure, which is the point.
@@ -74,6 +74,12 @@ jobs:
         # left — the next file would have tripped it whatever it contained.
         # Raised from 704 to 768 KiB for full keyframe-delta reconstruction: SH composition,
         # streamed-prefix recovery, indexed-chain checks and the hostile-input tests that pin them.
+        # Raised from 704 to 768 KiB for the `4dgs` command-line tool: the record walk,
+        # the structural validator and the tests that drive both. Measured 740 KiB, so
+        # this is not headroom being taken speculatively — 680 against 704 left six
+        # filesystem blocks, and a tool is four files before it does anything. The Rust
+        # budget went 500 -> 600 for exactly this, when its `4dgs` tool became a third
+        # crate; that raise is the precedent this one follows.
         run: |
           size_kb=$(du -s typescript | cut -f1)
           echo "typescript: ${size_kb} KiB"

@@ -111,6 +111,7 @@ export {
   type Statistics,
   type SummaryOffset,
   BACKGROUND_OBJECT,
+  bytesEqual,
   checkCoordinateFrame,
   checkGeodeticAnchor,
   checkMagic,

@@ -22,6 +22,32 @@ The four packages version together.
 - `KeyframeDeltaIndexedDecoder`, a range-backed `IReadable` seek for `keyframe-delta` files. Opening
   reads bounded front-matter and summary windows; `reconstructAt(t)` fetches and composes only the
   index chain and spherical-harmonic ranges needed for that instant.
+- **A `4dgs` command-line tool, in `@4dgs/nodejs`.** `4dgs inspect <file>` walks the file record by
+  record and prints opcode, byte offset, content and total length, and whether the file's own
+  summary checksum covers that record — framing only, so it costs the same on a scene carrying a
+  six-megabyte audio payload as on one carrying none. `4dgs validate <file>` runs the structural
+  checks, and every check, severity and sentence it composes is
+  `python/fourdgs/fourdgs/validate.py`'s: over the whole 60-file conformance corpus the two tools
+  print identical findings, and the two remaining differences are sentences the libraries raise
+  rather than the validators write. `--json` gives `inspect` a machine-readable form; `--decode`
+  gives `validate` the two refusals that live inside a chunk's attribute streams, where no amount of
+  framing reaches them. The tool lives in `@4dgs/nodejs` because it opens files and I/O lives at the
+  edges; `inspectFile` and `validateFile` are exported, so anything the tool can do a caller can do
+  in process. Also exported: `bytesEqual` from `@4dgs/core`, which the walk needs to recognize a
+  trailing magic.
+- **A refused file is named by rule and by byte.** Both commands print
+  `refused: <identifier> at byte <n> (<what sits there>)` —
+  `unknown-quantization-scheme at byte 154 (the Quantization record)` — using the `Refusal`
+  identifiers below. All seven files in the invalid conformance corpus are answered this way, each
+  with the identifier the corpus expects.
+- **Exit codes a pipeline can act on.** `0` fine, `1` refused or invalid, `2` valid with warnings,
+  `3` the tool itself failed. The third is the one that is not the Rust tool's: exiting `1` both for
+  "I read this file and it does not conform" and for "I fell over" makes a verdict about a file
+  indistinguishable from a broken validator, and those need opposite reactions from whoever is
+  holding the file.
+- **A truncated file is reported, not thrown.** `inspect` names every record that was complete
+  before the cut, with the offsets and lengths it has in the whole file, and then says where the cut
+  is; `validate` prints what the Python validator prints for the same file, byte for byte.
 - **Refusals say which rule was broken.** Every error in `@4dgs/core` now carries an optional
   `refusalCode`, and the six identifiers the specification's refusal table names — `magic-mismatch`,
   `unsupported-major-version`, `unknown-temporal-model`, `unknown-quantization-scheme`,

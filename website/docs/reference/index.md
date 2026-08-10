@@ -63,7 +63,7 @@ identical bytes with no per-language slerp or composition order of its own.
 | glTF interop (import, snapshot export)            | Yes    | No         | No      | No      | No      | No      |
 | USD interop (import, snapshot export)             | Yes    | No         | No      | No      | No      | No      |
 | USD animated export (keyframe-delta time samples) | Yes    | No         | No      | No      | No      | No      |
-| Inspect and validate                              | Yes    | Planned    | Planned | Planned | Planned | Planned |
+| Inspect and validate                              | Yes    | Yes        | Planned | Planned | Planned | Planned |
 
 ¹ On the `gaussian-birth` path. No implementation composes object tracks during `keyframe-delta`
 reconstruction: that path rebuilds base centres and scales from bins and never reads the object
