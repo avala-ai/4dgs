@@ -92,8 +92,40 @@ Each ceiling names the byte, the record, the value and the expectation, so
 as `FourdgsChunkIndexEntry` already did, and the chunk parsers report where their stream blocks
 start.
 
+### Refusal diagnosis
+
+- **Refusals say which rule was broken.** Every exception in this package now carries an optional
+  `refusalCode`, and the six identifiers the specification's refusal table names — `magic-mismatch`,
+  `unsupported-major-version`, `unknown-temporal-model`, `unknown-quantization-scheme`,
+  `unknown-stream-codec`, `window-index-out-of-range` — are exported as named constants rather than
+  written as literals at the raise sites, because six implementations are compared on those strings
+  and a typo in one reads in CI like a decoder bug. The exception class alone was too coarse to
+  compare on: `FourdgsUnsupportedCodec` covers an unknown temporal model, an unknown quantization
+  scheme and an unknown stream codec alike, so "it threw `FourdgsUnsupportedCodec`" cannot tell a
+  decoder that refused for the right reason from one that refused for the wrong one. `null` means "a
+  real error the refusal table does not name", not "no error" — which is why `FourdgsTruncatedFile`,
+  the one refusal that is recoverable rather than refusable, offers nowhere to put an identifier.
+  This is additive: `refusalCode` is a property on the existing `FourdgsException` rather than a new
+  class, so every `catch` and every `is` check keeps working, and `FourdgsException` still extends
+  `FormatException`.
+
 ### Fixed
 
+- **A file whose magic is corrupted anywhere but the version byte is no longer reported as an
+  unsupported version.** `checkMagic` tested only that bytes 1-4 read `4DGS`, so flipping the
+  leading `0x89` sentinel — the byte that stops byte-oriented tooling treating a 4dgs file as text —
+  produced "4dgs major version 1 is not supported by this reader". That sends the file's holder
+  looking for a newer reader, which would not have helped. The version byte must now be the only
+  difference, which also catches the mangled `CR LF` the sentinel exists alongside. Nothing inside
+  Dart could see this, because both answers are a `FourdgsUnsupportedVersion` carrying a plausible
+  sentence; it took giving the two answers different names.
+- **A window index outside the Window Table is refused rather than clamped.** The `gaussian-birth`
+  chunk decoder clamped an out-of-range index to the nearest window, which substitutes one
+  gaussian's lifetime for another's in a file that is already wrong in some way nobody has diagnosed
+  — the scene renders and the fault is gone. Python and Rust have always refused it, and this
+  package's own `keyframe-delta` path already did, so one file decoded two ways depending on its
+  temporal model. An absent or empty Window Table is still one default `(0, 0)` window (spec §5.4),
+  so index 0 resolves and everything past it does not.
 - **A truncated Header is not an unsupported one.** A Header that ended after its `temporal_model`
   string was refused for naming a model this build does not implement, when what it actually is, is
   incomplete — sending whoever holds it to add codec support for a file that needs none. Every
