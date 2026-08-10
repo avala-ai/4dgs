@@ -334,6 +334,17 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
         (isKeyframeDelta && entry.extended && entry.kind == 1)
             ? entry.liveCount
             : entry.gaussianCount;
+    // Zero width is the same fault said differently: an interval no seek can
+    // select. The record parser applies this to `gaussianCount`, which it can
+    // read without context; `liveCount` needs the Header, so it lands here.
+    if (population > 0 && entry.t0 == entry.t1) {
+      throw FourdgsMalformedFile(
+        'the Chunk Index record at byte ${indexRecordOffsets[i]} (entry $i of '
+        '${index.length}) declares $population live gaussians over the zero-width '
+        'interval [${entry.t0}, ${entry.t1}); expected 0 there, because the '
+        'half-open seek rule can never select a zero-width interval',
+      );
+    }
     if (population > 0 &&
         (entry.t1 <= 0.0 ||
             (duration > 0.0 ? entry.t0 >= duration : entry.t0 > 0.0))) {

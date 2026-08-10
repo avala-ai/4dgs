@@ -19,13 +19,17 @@ plausible-looking output rather than an error, so nothing downstream notices:
 
 - **Header.** A spherical-harmonic degree outside the 0-3 registry, a temporal model this build does
   not implement (`gaussian-birth` and `keyframe-delta` are accepted; anything else is named rather
-  than assumed), a non-finite or negative duration, and a cutoff outside `(0, 1]`. Zero duration
-  stays legal — a zero-duration scene is a real fixture.
+  than assumed), a NaN or negative duration, and a cutoff outside `(0, 1]`. Zero duration stays
+  legal — a zero-duration scene is a real fixture — and so does `+Infinity`, which is how an
+  open-ended scene declares itself.
 - **Validity windows and chunk-index intervals.** NaN or inverted bounds on both. Visibility is
   gated on `lo <= t < hi`, so a NaN bound is false at every instant and the content behind it
   silently never appears. `lo == hi` stays legal.
 - **Chunk index.** A nonempty chunk over a zero-width interval. The seek rule is half-open, so
-  nothing can ever select it, yet its gaussians still count toward the file's total.
+  nothing can ever select it, yet its gaussians still count toward the file's total. For a
+  `keyframe-delta` entry the population is `liveCount` rather than the operation count, so that
+  rule is applied by the readers, which know the temporal model — the record parser sees the
+  appended block by length alone and cannot tell a delta entry from fields a later revision adds.
 - **Streamed reader.** The chunk-index clock bound the indexed reader already applied, so a
   container is not accepted or refused according to which reader opened it; and a cross-check that
   the chunks assemble to the total the header declares, for complete files only — a truncated file

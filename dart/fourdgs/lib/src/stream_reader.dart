@@ -409,6 +409,17 @@ FourdgsScene readFourdgsBytes(
     // only bounds an entry when there IS an end — but the start still does. At
     // duration zero the only instant a seek can ask for is 0, so an entry that
     // begins after it, `[500, 501)`, is as unreachable as one that ended before.
+    // Zero width is the same fault said differently: an interval no seek can
+    // select. The record parser applies this to `gaussianCount`, which it can
+    // read without context; `liveCount` needs the Header, so it lands here.
+    if (population > 0 && entry.t0 == entry.t1) {
+      throw FourdgsMalformedFile(
+        'the Chunk Index record at byte ${chunkIndexRecordOffsets[i]} (entry $i of '
+        '${chunkIndex.length}) declares $population live gaussians over the zero-width '
+        'interval [${entry.t0}, ${entry.t1}); expected 0 there, because the '
+        'half-open seek rule can never select a zero-width interval',
+      );
+    }
     if (population > 0 &&
         (entry.t1 <= 0.0 ||
             (header.durationSec > 0.0

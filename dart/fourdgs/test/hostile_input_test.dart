@@ -143,10 +143,25 @@ void main() {
       );
     });
 
-    test('a NaN, infinite, or negative duration is refused', () {
+    test('an open-ended scene declares +Infinity, and that is legal', () {
+      // The finiteness rule the spec writes is about an audio source's duration
+      // (§5.11), not the scene's. Neither reference writer rejects an infinite
+      // scene duration, `[0, +Infinity)` seeks like any other half-open
+      // interval, and §5.8 makes the last index `t1` the Header's duration — an
+      // endpoint this reader already accepts as infinite. Refusing it here would
+      // buy no safety and cost interoperability: a file the other five SDKs read
+      // would be undecodable in Dart alone.
+      expect(
+        FourdgsHeader.parse(
+          _headerContent(durationSec: double.infinity),
+        ).durationSec,
+        double.infinity,
+      );
+    });
+
+    test('a NaN or negative duration is refused', () {
       for (final double bad in <double>[
         double.nan,
-        double.infinity,
         double.negativeInfinity,
         -1.0,
         -0.0001,
@@ -383,13 +398,19 @@ void main() {
       );
     });
 
-    test('a zero-change DELTA over a zero-width interval is refused', () {
+    test('a zero-change DELTA over a zero-width interval is refused', () async {
       // A delta entry's `gaussianCount` counts operations — births, deaths,
       // updates — not the population they compose to. A delta that changes
       // nothing carries zero operations over a live scene, so a rule written
       // against `gaussianCount` waves through exactly the unreachable state
       // chunk it is supposed to refuse. `liveCount` is the population.
-      final BytesBuilder body =
+      //
+      // Which is why this is a READER test and not a record test. `liveCount`
+      // means "population" only under a keyframe-delta Header; the record parser
+      // recognises the appended block by length alone and cannot tell a delta
+      // entry from a future revision's extra fields, so reading the field there
+      // would refuse forward-compatible files. Both readers have the Header.
+      final BytesBuilder entry =
           BytesBuilder()
             ..add(_f64(1.0)) // t0
             ..add(_f64(1.0)) // t1 — zero width
@@ -397,17 +418,84 @@ void main() {
             ..add(_u64(0)) // chunkLength
             ..add(_u32(0)) // gaussianCount: no operations
             ..add(_u32(0)) // bandCount
-            // keyframe-delta block
             ..addByte(1) // kind: delta
             ..addByte(0) // deltaMode
             ..add(_u64(0)) // referenceOffset
             ..add(_u64(0)) // keyframeOffset
             ..add(_u32(0).sublist(0, 2)) // depth (u16)
             ..add(_u64(7)); // liveCount: seven gaussians nothing can reach
-      expect(
-        () => FourdgsChunkIndexEntry.parse(body.toBytes()),
-        throwsA(isA<FourdgsMalformedFile>()),
+
+      // The record parser accepts it, and that is the point above.
+      expect(FourdgsChunkIndexEntry.parse(entry.toBytes()).liveCount, 7);
+
+      final BytesBuilder out =
+          BytesBuilder()
+            ..add(fourdgsMagic)
+            ..add(
+              _record(
+                opHeader,
+                _headerContent(temporalModel: 'keyframe-delta'),
+              ),
+            )
+            ..add(_record(opQuantization, _quantizationContent()));
+      final int summaryStart = out.length;
+      out.add(_record(opChunkIndex, entry.toBytes()));
+      final BytesBuilder footer =
+          BytesBuilder()
+            ..add(_u64(summaryStart))
+            ..add(_u64(0))
+            ..add(_u32(0)); // summaryCrc 0: not checked
+      out
+        ..add(_record(opFooter, footer.toBytes()))
+        ..add(fourdgsMagic);
+      final Uint8List bytes = out.toBytes();
+
+      final Matcher zeroWidth = throwsA(
+        isA<FourdgsMalformedFile>()
+            .having(
+              (FourdgsMalformedFile e) => e.message,
+              'message',
+              contains('zero-width interval'),
+            )
+            .having(
+              (FourdgsMalformedFile e) => e.message,
+              'names the record',
+              allOf(
+                contains('Chunk Index record at byte'),
+                contains('entry 0 of'),
+              ),
+            ),
       );
+      expect(
+        () => readFourdgsBytes(bytes, recoverTruncated: false),
+        zeroWidth,
+        reason: 'streamed reader',
+      );
+      await expectLater(openFourdgsIndexed(FourdgsBytes(bytes)), zeroWidth);
+    });
+
+    test('appended fields a future revision adds do not make an entry hostile', () {
+      // The mirror of the test above. This is an EMPTY `gaussian-birth` entry
+      // over a zero-width interval — legal, and skipped by every reader — that
+      // carries 28 bytes of fields this revision does not define. Their content
+      // is arbitrary, including at the offset where a keyframe-delta entry would
+      // put `liveCount`. A parser that read that field without knowing the
+      // Header would refuse a file written to a later revision of this format.
+      final BytesBuilder entry =
+          BytesBuilder()
+            ..add(_f64(1.0)) // t0
+            ..add(_f64(1.0)) // t1 — zero width, and empty, so legal
+            ..add(_u64(0)) // chunkOffset
+            ..add(_u64(0)) // chunkLength
+            ..add(_u32(0)) // gaussianCount: empty
+            ..add(_u32(0)) // bandCount
+            ..addByte(9) // not a `kind` this revision defines
+            ..addByte(9)
+            ..add(_u64(0xDEADBEEF))
+            ..add(_u64(0xFEEDFACE))
+            ..add(_u32(0).sublist(0, 2))
+            ..add(_u64(12345)); // whatever a later revision keeps here
+      expect(FourdgsChunkIndexEntry.parse(entry.toBytes()).gaussianCount, 0);
     });
 
     test('an EMPTY chunk over a zero-width interval is still accepted', () {

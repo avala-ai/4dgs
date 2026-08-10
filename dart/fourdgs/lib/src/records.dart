@@ -77,10 +77,19 @@ class FourdgsHeader {
     // reaches timeline arithmetic and breaks playback; a negative one is not a
     // duration. Zero stays legal — the NoData conformance fixture is exactly a
     // zero-duration scene.
-    if (!durationSec.isFinite || durationSec < 0) {
+    //
+    // `+Infinity` stays legal too, and this is deliberate. The spec requires
+    // finiteness of an *audio source's* duration (§5.11) and says nothing of the
+    // kind about the scene's; neither reference writer rejects it; `[0, +oo)` has
+    // a well-defined seek; and §5.8 makes the last index `t1` the Header's
+    // duration, an endpoint this file already accepts as infinite. Refusing it
+    // here would not make anything safer — it would make a file the other five
+    // SDKs read undecodable in Dart alone, which is the one outcome a format
+    // cannot afford.
+    if (durationSec.isNaN || durationSec < 0) {
       throw FourdgsMalformedFile(
         'the Header at byte $durationAt declares duration_sec = $durationSec; '
-        'expected a finite value >= 0',
+        'expected a value >= 0, or +Infinity for an open-ended scene',
       );
     }
     final gaussianCount = c.u64();
@@ -517,21 +526,15 @@ class FourdgsChunkIndexEntry {
       final keyframeOffset = c.u64();
       final depth = c.u16();
       final liveCount = c.u64();
-      // Either count, because this parser cannot know which one means
-      // "population". `liveCount` carries that meaning only under a
-      // `keyframe-delta` Header, and the Header is not in scope here — a
-      // gaussian-birth entry with 28 trailing bytes whose first is 1 parses as
-      // a delta regardless, so keying on `kind` alone lets a hostile file
-      // choose which field is checked.
-      //
-      // Over a zero-width interval the distinction does not matter: operations
-      // and live gaussians are both content the half-open seek rule can never
-      // select, so a nonzero anything is unreachable. Testing both is stricter
-      // than testing the right one, and needs no context to be correct.
-      refuseNonemptyZeroWidth(
-        gaussianCount != 0 ? gaussianCount : liveCount,
-        gaussianCount != 0 ? 'gaussians' : 'live gaussians',
-      );
+      // `gaussianCount` only. `liveCount` means "population" under a
+      // `keyframe-delta` Header and nothing at all otherwise, and the Header is
+      // not in scope here: this parser recognises the appended block by length
+      // and cannot tell a delta entry from a future revision's extra fields.
+      // Checking it here would refuse an empty entry whose appended bytes merely
+      // happen to be nonzero at that position — a forward-compatible file every
+      // other reader skips past. The reader-level check does have the Header,
+      // and applies the same rule to `liveCount` where it means something.
+      refuseNonemptyZeroWidth(gaussianCount, 'gaussians');
       return FourdgsChunkIndexEntry(
         t0: t0,
         t1: t1,
