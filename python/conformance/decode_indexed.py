@@ -39,6 +39,14 @@ from fourdgs.readable import FileReadable
 from fourdgs.records import Header
 from fourdgs.serialization import MAGIC, check_magic, iter_records
 
+UNSUPPORTED: frozenset[str] = frozenset()
+
+
+def supports_variant(name: str) -> bool:
+    # A file written without an index cannot be read this way. Declining is the correct
+    # answer, not a failure — that is what supportsVariant is for.
+    return "UseChunkIndex" in name
+
 
 def _temporal_model(data: bytes) -> str | None:
     """The Header's temporal model, read without decoding the gaussians."""
