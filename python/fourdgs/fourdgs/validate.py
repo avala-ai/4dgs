@@ -6,6 +6,23 @@
 This is what makes a third-party encoder possible: a way to find out *why* a file is
 wrong that does not involve reading someone else's decoder. Every finding names the
 record, the field and what was expected.
+
+Two things beyond the framing walk, because a validator that only walks the framing
+answers a narrower question than the one its holder asked:
+
+* **It decodes the chunks.** Walking the framing steps *over* a chunk by its declared
+  length, which is exactly not looking inside it — so an unimplemented stream codec and an
+  out-of-range window index were both invisible here, and both are in the invalid corpus.
+  One chunk is resident at a time (AGENTS.md §1), so validating a file larger than memory
+  still works.
+* **It knows `keyframe-delta`.** Every structural check below assumed the gaussian-birth
+  chunk shape, so a conforming keyframe-delta file came back with seven errors. The
+  Header's declared model now selects the reader, because refusing a file for declaring a
+  model this library implements was never a statement about the file.
+
+Findings that came from a refusal carry the refusal's identifier and the byte it fired at;
+see `refusal`. The finding line itself is unchanged, so it still reads word for word as
+the Rust validator's, which is what lets the two tools be diffed.
 """
 
 from __future__ import annotations
@@ -15,18 +32,25 @@ from dataclasses import dataclass, field
 
 from . import opcode as op
 from . import records as rec
+from . import refusal
 from .exceptions import FourdgsError
 from .object_layer import ObjectLayer
 from .provenance import LENGTH_UNIT_METRES, Provenance
 from .quantization import sh_bound, sh_step
 from .readable import BytesReadable
-from .serialization import MAGIC, check_magic, crc32, iter_records
+from .refusal import Named, Site, Walk
+from .serialization import MAGIC, crc32, iter_records
 
 
 @dataclass
 class Finding:
     severity: str  # "error" | "warning" | "note"
     message: str
+    #: The refusal identifier and the byte it fired at, for the findings that have one.
+    #: Most do not: "Header declares 640 gaussians; chunks contain 256" is a rule this
+    #: validator checks itself, not a refusal a reader raised, and the refusal table does
+    #: not name it.
+    refusal: Named | None = None
 
     def __str__(self) -> str:
         return f"{self.severity}: {self.message}"
@@ -48,6 +72,21 @@ class Report:
 
     def note(self, msg: str) -> None:
         self.findings.append(Finding("note", msg))
+
+    def refused(
+        self,
+        prefix: str,
+        exc: FourdgsError,
+        where: Walk | None = None,
+        site: Site | None = None,
+    ) -> None:
+        """An error a reader raised, carrying its identifier and the byte if it has one.
+
+        `prefix` is what the message is introduced with, so the sentence stays the one the
+        other validators print; the identifier arrives separately and changes nothing
+        about it.
+        """
+        self.findings.append(Finding("error", f"{prefix}{exc}", refusal.describe(exc, where, site)))
 
 
 def _check_quantization_finite(quant: rec.Quantization, report: Report, ordinal: int = 0) -> None:
@@ -196,10 +235,13 @@ def _check_sh_bit_depths(quant: rec.Quantization, sh_degree: int, report: Report
 
 def validate(data: bytes) -> Report:
     report = Report()
+    # Framing first, and for two reasons: it refuses a file that is not ours before
+    # anything reads a byte as an opcode, and it is what gives every later refusal a byte
+    # to point at.
     try:
-        check_magic(data)
+        walk = refusal.walk(data)
     except FourdgsError as exc:
-        report.error(str(exc))
+        report.refused("", exc)
         return report
 
     if not data.endswith(MAGIC):
@@ -313,9 +355,15 @@ def validate(data: bytes) -> Report:
             elif record.opcode == op.OBJECT_TRACK:
                 objects.tracks.append(rec.ObjectTrack.parse(record.content))
             elif op.is_provenance(record.opcode):
+                # The reserved tail of the family, and only the tail: every branch above
+                # parses one of `0x20`-`0x25`, so a capture carrying frames, sensors, a rig
+                # and a georeference collects no notes here. The range named is the one
+                # that is actually still reserved — `0x24` and `0x25` were assigned to the
+                # object layer, and a note calling them reserved tells its reader that two
+                # records this library parses were skipped.
                 report.note(
                     f"reserved provenance record 0x{record.opcode:02X} — skipped, as required "
-                    f"(0x24-0x2F, section 5.15.6)"
+                    f"(0x26-0x2F, section 5.15.6)"
                 )
             elif op.is_private(record.opcode):
                 report.note(
@@ -348,7 +396,18 @@ def validate(data: bytes) -> Report:
     except FourdgsError as exc:
         report.error(str(exc))
 
-    if header is not None and counted != header.gaussian_count:
+    # Which chunk shape the rest of this validator is entitled to assume. A
+    # `keyframe-delta` file's Chunks are keyframes and its Delta Chunks are differences
+    # against them, so several checks below are about the gaussian-birth shape and about
+    # nothing else. Read from the Header rather than guessed from the records, because a
+    # file that carries Delta Chunks and does not say so is itself a fault.
+    keyframe_delta = header is not None and header.temporal_model == "keyframe-delta"
+
+    # `gaussian_count` counts distinct gaussians over the whole sequence under
+    # `keyframe-delta`, and every keyframe carries a full population — so the sum across
+    # chunks is a larger number by design, not a disagreement. Summing it anyway is what
+    # made this validator call a conforming keyframe-delta file invalid.
+    if header is not None and not keyframe_delta and counted != header.gaussian_count:
         report.error(f"Header declares {header.gaussian_count} gaussians; chunks contain {counted}")
     if header is not None:
         for source in audio_sources.values():
@@ -380,7 +439,12 @@ def validate(data: bytes) -> Report:
     for i, entry in enumerate(index):
         if entry.chunk_offset + entry.chunk_length > len(data):
             report.error(f"chunk index entry {i} points past the end of the file")
-        elif data[entry.chunk_offset] != op.CHUNK:
+            continue
+        # A `keyframe-delta` file indexes both kinds: a Chunk is a keyframe and a Delta
+        # Chunk is a difference against one, and an index that could only name the former
+        # could not seek the model at all.
+        at = data[entry.chunk_offset]
+        if at != op.CHUNK and not (keyframe_delta and at == op.DELTA_CHUNK):
             report.error(f"chunk index entry {i} does not point at a Chunk record")
 
     if footer is not None and footer.summary_crc and footer.summary_start:
@@ -392,12 +456,63 @@ def validate(data: bytes) -> Report:
     if header is not None and not index:
         report.warn("no chunk index: this file can only be read front to back, not seeked")
 
-    # Opening the file the way a seeking client would is itself a check.
+    # What survived the cut, which is the question the errors above do not answer.
+    #
+    # A cut file is invalid and every finding about it stands — but records are
+    # length-prefixed, so everything complete before the cut is intact and the streamed
+    # reader keeps it. Saying only that the file stopped reading leaves its holder to
+    # guess whether anything is salvageable; this says how much.
+    if walk.cut is not None:
+        report.note(
+            f"the file is cut at byte {walk.cut.at:,}: {walk.cut.reason}. "
+            f"The {walk.intact()} complete records before it are intact, "
+            f"and a streamed reader recovers them"
+        )
+
+    if keyframe_delta:
+        _check_keyframe_delta(data, walk, report)
+    else:
+        _check_gaussian_birth(data, walk, report)
+
+    return report
+
+
+def _check_gaussian_birth(data: bytes, walk: Walk, report: Report) -> None:
+    """The two checks that only a reader can perform: open the file, then decode it.
+
+    Opening it the way a seeking client would is where the front-matter refusals fire — an
+    unimplemented temporal model, an unimplemented quantization scheme. Decoding the chunks
+    is where the rest do, and there is no substitute for it: the framing walk steps over a
+    chunk by its declared length, so an unimplemented stream codec and an out-of-range
+    window index are both invisible to everything above. Both are in the invalid corpus,
+    and both used to validate clean.
+    """
     try:
         from .indexed_reader import open_indexed
 
         open_indexed(BytesReadable(data))
     except FourdgsError as exc:
-        report.error(f"a seeking reader cannot open this file: {exc}")
+        report.refused("a seeking reader cannot open this file: ", exc, walk)
+        # A file that will not open will not decode either, and the second error would say
+        # the same thing about the same byte.
+        return
+    refused = refusal.scan_chunks(data)
+    if refused is not None:
+        report.refused("a chunk does not decode: ", refused.error, walk, refused.site)
 
-    return report
+
+def _check_keyframe_delta(data: bytes, walk: Walk, report: Report) -> None:
+    """The same, for the temporal model whose chunks are keyframes and differences.
+
+    `decode_indexed` is the model's own reader, so this is the same statement as the
+    branch above — open the file the way a client would, and decode what it carries —
+    expressed in the reader the file's declared model actually needs. The alternative,
+    which is what this validator did until now, is to run the gaussian-birth reader over
+    it and report its refusal as a fault in the file.
+    """
+    try:
+        from .keyframe_delta_file import decode_indexed
+
+        decode_indexed(data)
+    except FourdgsError as exc:
+        report.refused("a seeking reader cannot open this file: ", exc, walk)

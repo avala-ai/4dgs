@@ -114,6 +114,12 @@ def cmd_validate(args) -> int:
         report = validate(fh.read())
     for finding in report.findings:
         print(finding)
+        # Indented, and with a prefix of its own, so that a caller filtering the findings
+        # on `error:`/`warning:`/`note:` — which is how this tool and the Rust one are
+        # compared — sees exactly what it saw before. Naming which rule fired is a
+        # validator's whole job, and the vocabulary was already on the exception.
+        if finding.refusal is not None:
+            print(f"  {finding.refusal}")
     if report.ok:
         print("valid" if not report.findings else "valid (with notes)")
         return 0

@@ -6,6 +6,51 @@ All notable changes to the Python package are documented here, following
 
 ## [Unreleased]
 
+### Fixed
+
+- **`4dgs validate` no longer calls two malformed files valid.** `UnknownStreamCodec` and
+  `WindowIndexOutOfRange` — two of the conformance corpus's seven invalid variants — were reported
+  `valid`, exit 0. Both break a rule inside a chunk's attribute streams, and the validator only
+  walked the framing, which steps *over* a chunk by its declared length rather than into it. It now
+  decodes the chunks after the framing checks, one resident at a time on the indexed path (AGENTS.md
+  §1), so validating a file larger than memory still works. All seven variants are now refused, each
+  by the identifier its own corpus entry declares.
+
+- **`keyframe-delta` files are validated against the model they declare.** They were validated
+  against the `gaussian-birth` reading and came back with seven errors and an `INVALID`, for a
+  temporal model this package has implemented since 0.3.0. `gaussian_count` counts distinct
+  gaussians over the sequence while every keyframe carries a full population, so summing chunks is a
+  larger number by design; the chunk index addresses Delta Chunks as well as Chunks; and the
+  gaussian-birth reader is not the reader that opens the file. The Header's `temporal_model` now
+  selects the path.
+
+- **The reserved-provenance note names the range that is actually reserved.** `0x24` and `0x25` were
+  assigned to the object layer, so `(0x24-0x2F, section 5.15.6)` told its reader that two records
+  this package parses had been skipped. It reads `(0x26-0x2F, …)` now. The note still fires only for
+  the still-reserved tail: a capture carrying frames, sensors, a rig and a georeference collects none.
+
+### Added
+
+- **`4dgs validate` names the refusal, and the byte it fired at.** The exceptions have always
+  carried `code`, the language-independent identifier the conformance suite compares across SDKs;
+  the CLI dropped it. It is printed on an indented line of its own beneath the finding it belongs
+  to, so a caller filtering output on `error:`/`warning:`/`note:` — which is how this tool and the
+  Rust one are diffed — sees exactly what it saw before:
+
+  ```
+  error: a chunk does not decode: window index 1 is outside the 1-entry window table
+    refusal window-index-out-of-range at byte 2506 (the Chunk record at index entry 1)
+  ```
+
+  The byte is the tool's own contribution: an exception is raised where a value is parsed, not where
+  its bytes sit, so the new `fourdgs.refusal` module walks the framing and asks which record a given
+  identifier is about. It is a table, not a guess, and a code it has not been taught is left
+  unplaced rather than placed wrongly.
+
+- **A cut file says how much of it survived.** Alongside the errors it already produced, `validate`
+  now notes the byte the file was cut at, the record it was cut inside, and how many complete
+  records before it a streamed reader recovers.
+
 ## [0.3.0] - 2026-08-10
 
 This release ships the normative `keyframe-delta` temporal model as a whole-file reference path and
