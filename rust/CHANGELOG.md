@@ -8,22 +8,24 @@ All notable changes to the Rust crate are documented here, following
 
 ## [0.4.0] - 2026-08-10
 
-### Changed
-
-- **Named refusals are a new `Error` variant.** The six refusals the specification's table names —
-  `magic-mismatch`, `unsupported-major-version`, `unknown-temporal-model`,
-  `unknown-quantization-scheme`, `unknown-stream-codec`, `window-index-out-of-range` — now arrive as
-  `Error::Refused { code, kind, message }` rather than as `UnsupportedVersion`, `UnsupportedCodec`,
-  `UnsupportedModel` or `Malformed`. Nothing on the wire changed: `kind` carries the variant it
-  would have been, and both `Display` and the C ABI's status mapping defer to it, so every sentence
-  and every `FOURDGS_STATUS_*` is what it was.
-
-  **This is a breaking change for code that matched those variants directly** —
-  `matches!(err, Error::UnsupportedVersion(_))` no longer catches a bad magic. Use the new
-  predicates, which account for both spellings and keep working when a refusal gains a name:
-  `Error::is_unsupported_version`, `is_unsupported_feature`, `is_malformed`.
-
 ### Added
+
+- **The `keyframe-delta` temporal model.** Composition, write and both read paths mirror the Python
+  reference and the normative spec (§11). Deltas are integer bin subtractions on shared grids so
+  composition telescopes; the declared error bound holds at any chain depth. Streamed decode
+  composes front to back; indexed decode walks only the chain an instant needs. The canonical
+  `states` JSON is emitted by `keyframe_delta_file::keyframe_delta_states_json` and is the
+  cross-implementation gate. Refusal codes match the reference (`bin-overflow`,
+  `invariant-changed-in-update`, `forward-reference`, `depth-mismatch`, and the rest) without
+  changing the frozen `Error` enum shape.
+
+- **keyframe-delta on the C ABI.** `fourdgs_keyframe_delta_states_json` decodes a whole
+  keyframe-delta file (either read path) to its canonical `states` JSON,
+  `fourdgs_peek_temporal_model` reads the Header's model without opening a scene, and
+  `fourdgs_string_free` releases the owned strings both return. Additive — no existing signature
+  moved. The C++ and Swift packages decode keyframe-delta through these entry points rather than a
+  second encoder; `capi_smoke.c` exercises the peek, the decode refusal on a gaussian-birth file,
+  and the free.
 
 - **Refusal identifiers.** `Error::refusal_code` returns a stable string for a refusal this reader
   can name, or `None` for errors the refusal table does not cover — a truncated transport, an
@@ -47,31 +49,36 @@ All notable changes to the Rust crate are documented here, following
   resident `object_id` array, or returns NULL when the scene carries no such stream — NULL and
   all-zero are different claims. Additive — no existing signature moved.
 
-## [0.3.0] - 2026-07-31
+### Changed
 
-This release adds the normative `keyframe-delta` temporal model in the crate and exposes whole-file
-decode through an additive C ABI for the C++ and Swift bindings. Reconstruction still ends at
-composed gaussian state; rendering remains a consumer responsibility. The LOD proposal is
-documentation only and is not advertised here.
+- **Named refusals are a new `Error` variant.** The six refusals the specification's table names —
+  `magic-mismatch`, `unsupported-major-version`, `unknown-temporal-model`,
+  `unknown-quantization-scheme`, `unknown-stream-codec`, `window-index-out-of-range` — now arrive as
+  `Error::Refused { code, kind, message }` rather than as `UnsupportedVersion`, `UnsupportedCodec`,
+  `UnsupportedModel` or `Malformed`. Nothing on the wire changed: `kind` carries the variant it
+  would have been, and both `Display` and the C ABI's status mapping defer to it, so every sentence
+  and every `FOURDGS_STATUS_*` is what it was.
 
-### Added
+  **This is a breaking change for code that matched those variants directly** —
+  `matches!(err, Error::UnsupportedVersion(_))` no longer catches a bad magic. Use the new
+  predicates, which account for both spellings and keep working when a refusal gains a name:
+  `Error::is_unsupported_version`, `is_unsupported_feature`, `is_malformed`.
 
-- **The `keyframe-delta` temporal model.** Composition, write and both read paths mirror the Python
-  reference and the normative spec (§11). Deltas are integer bin subtractions on shared grids so
-  composition telescopes; the declared error bound holds at any chain depth. Streamed decode
-  composes front to back; indexed decode walks only the chain an instant needs. The canonical
-  `states` JSON is emitted by `keyframe_delta_file::keyframe_delta_states_json` and is the
-  cross-implementation gate. Refusal codes match the reference (`bin-overflow`,
-  `invariant-changed-in-update`, `forward-reference`, `depth-mismatch`, and the rest) without
-  changing the frozen `Error` enum shape.
+### Fixed
 
-- **keyframe-delta on the C ABI.** `fourdgs_keyframe_delta_states_json` decodes a whole
-  keyframe-delta file (either read path) to its canonical `states` JSON,
-  `fourdgs_peek_temporal_model` reads the Header's model without opening a scene, and
-  `fourdgs_string_free` releases the owned strings both return. Additive — no existing signature
-  moved. The C++ and Swift packages decode keyframe-delta through these entry points rather than a
-  second encoder; `capi_smoke.c` exercises the peek, the decode refusal on a gaussian-birth file,
-  and the free.
+- **Each gaussian gets the validity window its `window_index` names.** The keyframe-delta reader
+  carried one window for the whole sequence and derived every gaussian's velocity grid from
+  `windows[0]` (spec §6.3), so on a file whose Window Table has more than one entry, every gaussian
+  outside window 0 reconstructed at the wrong motion precision — no refusal, just positions that
+  drift from the bins the encoder wrote. The writer could not produce such a file either: it forced
+  a single full-duration window and wrote `window_index = 0` for everyone, ignoring the `win_lo` and
+  `win_hi` each gaussian already carried. Both sides are fixed, so a multi-window population now
+  round-trips at the precision it declares.
+
+## [0.3.0] - unreleased
+
+Prepared on 2026-07-31 and never tagged. Its notes are part of 0.4.0, which is the release that
+ships them.
 
 ## [0.2.0] - 2026-07-29
 
