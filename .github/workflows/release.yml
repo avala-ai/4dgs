@@ -9,10 +9,13 @@ name: Release
 #   releases/rust/vX.Y.Z
 #   releases/dart/vX.Y.Z
 #   releases/typescript/<package>/vX.Y.Z
+#   releases/corpus/vX.Y.Z         <- the conformance corpus, not a package
 #
 # Every job authenticates with OIDC trusted publishing. There are no stored
 # registry tokens in this repository and there should never be one: a token in
-# a secret is a credential that outlives the job it was created for.
+# a secret is a credential that outlives the job it was created for. The corpus
+# job is the exception that proves it: it publishes to no registry, so it has
+# nothing to authenticate to and asks for no id-token at all.
 #
 # Every job also leaves a GitHub Release behind, with that version's changelog
 # section as its body. A tag that publishes a package and leaves no release is a
@@ -414,3 +417,106 @@ jobs:
           gh release create "${GITHUB_REF#refs/tags/}" $prerelease \
             --title "@4dgs/$package $version" \
             --notes-file "$RUNNER_TEMP/notes.md"
+
+  corpus:
+    name: Publish the conformance corpus
+    if: startsWith(github.ref, 'refs/tags/releases/corpus/')
+    # The corpus is not a package and has no registry, so this job is the simplest
+    # one here: there is no OIDC exchange, no token, and nothing to authenticate
+    # to. The release IS the publication, and the assets on it are the artifact of
+    # record rather than a second copy of one — the opposite of every job above,
+    # which deliberately attaches nothing.
+    #
+    # It is versioned on its own tag because the corpus changes when variants are
+    # added, which has nothing to do with any SDK's version. `scripts/pack_corpus.py`
+    # holds the version constant, exactly as a package holds its own.
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      # For the release step alone. No id-token: nothing here publishes anywhere.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Version matches the tag
+        # Before anything is built, as in every job above. A tarball whose name and
+        # tag disagree is a download nobody can cite.
+        run: |
+          tag="${GITHUB_REF#refs/tags/releases/corpus/v}"
+          source=$(python3 scripts/pack_corpus.py --version)
+          echo "tag=$tag source=$source"
+          if [ "$tag" != "$source" ]; then
+            echo "::error::version mismatch — tag $tag, CORPUS_VERSION $source"
+            exit 1
+          fi
+
+      - name: Release notes from the changelog
+        run: |
+          version="${GITHUB_REF#refs/tags/releases/corpus/v}"
+          python scripts/changelog_section.py tests/conformance/CHANGELOG.md "$version" > "$RUNNER_TEMP/section.md"
+          tag_url="releases%2Fcorpus%2Fv$version"
+          {
+            echo "## What's changed"
+            echo
+            cat "$RUNNER_TEMP/section.md"
+            echo
+            echo "---"
+            echo
+            echo "\`curl -LO https://github.com/avala-ai/4dgs/releases/download/$tag_url/4dgs-conformance-corpus-$version.tar.gz\` | [how to use it](https://4dgs.dev/docs/reference/conformance#download-the-corpus) | [full changelog](https://github.com/avala-ai/4dgs/blob/main/tests/conformance/CHANGELOG.md)"
+            echo
+            echo "Verify it with \`cd 4dgs-conformance-corpus-$version/corpus && sha256sum -c CHECKSUMS.txt\`. That file is committed at [\`tests/conformance/data/CHECKSUMS.txt\`](https://github.com/avala-ai/4dgs/blob/main/tests/conformance/data/CHECKSUMS.txt), byte for byte the copy in the archive, so the digests can be checked against git without trusting this download."
+            echo
+            echo "Apache-2.0, and nothing else to clear: every scene is synthetic from a fixed seed, every audio payload is a generated sine sweep, and there is no captured data of any kind."
+          } > "$RUNNER_TEMP/notes.md"
+
+      - name: Generate the corpus, and assert nothing moved
+        # The same gate CI runs on every pull request, run again here against the
+        # exact checkout the tag names: regenerate, match every committed SHA-256,
+        # and prove two generator runs are byte-identical. Publishing a corpus that
+        # had not passed this would publish an encoder's nondeterminism as a
+        # contract.
+        run: |
+          pip install -e ./python/fourdgs
+          python3 tests/conformance/generate.py --verify
+
+      - name: Build the artifact
+        # `--check` unpacks the tarball somewhere else entirely and verifies every
+        # SHA-256 in its manifest, so what is checked is the archive rather than the
+        # directory it was built from.
+        run: python3 scripts/pack_corpus.py --out dist --check "$RUNNER_TEMP/unpacked"
+
+      - name: A decoder reads the unpacked copy
+        # The step this whole job exists to be able to claim. An archive whose
+        # checksums verify proves only that the bytes survived the tar; it says
+        # nothing about whether they are still a corpus. So the harness is pointed
+        # at the unpacked download instead of at the generated directory — the
+        # unpacked `corpus/` is byte-for-byte `tests/conformance/data`, which is why
+        # a symlink is all it takes — and the reference implementation is scored
+        # against it. A failure here stops the release before the tag has a
+        # download attached to it.
+        run: |
+          version="${GITHUB_REF#refs/tags/releases/corpus/v}"
+          unpacked="$RUNNER_TEMP/unpacked/4dgs-conformance-corpus-$version/corpus"
+          mv tests/conformance/data tests/conformance/data.generated
+          ln -s "$unpacked" tests/conformance/data
+          python3 tests/conformance/run.py --runner python
+          rm tests/conformance/data
+          mv tests/conformance/data.generated tests/conformance/data
+
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF#refs/tags/releases/corpus/v}"
+          # 0.x while the wire format is a draft, exactly as for the packages: the
+          # corpus is a rendering of that format and cannot be more stable than it.
+          case "$version" in 0.*) prerelease=--prerelease ;; *) prerelease= ;; esac
+          gh release create "${GITHUB_REF#refs/tags/}" $prerelease \
+            --title "Conformance corpus $version" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            "dist/4dgs-conformance-corpus-$version.tar.gz" \
+            "dist/4dgs-conformance-corpus-$version.tar.gz.sha256"
