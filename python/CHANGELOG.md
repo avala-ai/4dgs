@@ -32,10 +32,14 @@ The LOD proposal is documentation only and is not advertised here.
   temporal model over time. Births and deaths are exact per frame; USD time samples do not carry
   `gaussian_id` correspondence across samples.
 
-- **`state_at_with_objects(gaussians, objects, t)`**, exported at the top level, reconstructs state
-  at `t` and composes an object layer onto it in one call. `Scene.state_at` already did this for a
-  decoded streamed scene; this is the same rule where the gaussians and the layer arrive separately,
-  as they do on the indexed path, and it saves every caller from remembering `ObjectLayer.apply`.
+- **`state_at_with_objects(gaussians, objects, t, cutoff)`**, exported at the top level, takes a
+  `GaussianSet`, reconstructs its state at `t` itself, and composes an object layer onto the result
+  in one call. `Scene.state_at` already did this for a decoded streamed scene; this is the same rule
+  where the gaussians and the layer arrive separately, as they do on the indexed path, and it saves
+  every caller from remembering `ObjectLayer.apply`. It has no Header to read, so `cutoff` defaults
+  to `0.05` where `Scene.state_at` passes its own file's `header.cutoff`: an indexed caller whose
+  file declares a different threshold has to pass `scene.header.cutoff`, or the visibility test runs
+  against `0.05` and a different set of gaussians can reach composition.
 - **A ceiling on trajectory and object-track samples.** `MAX_TRAJECTORY_SAMPLES` bounds what one
   count-prefixed record may ask a reader to allocate before the bytes behind it are shown to exist.
   Shared by value with the other SDKs, because a ceiling only one implementation has is a file that
@@ -61,16 +65,33 @@ The LOD proposal is documentation only and is not advertised here.
   sample times and not the count, so one encodes with a count of zero.
 
 - **Each gaussian gets the validity window its `window_index` names.** The keyframe-delta reader
-  derived every gaussian's velocity grid from the first validity window (spec §6.3), so on a file
-  whose Window Table has more than one entry, everything outside window 0 reconstructed at the wrong
-  motion precision — no refusal, just positions that drift from the bins the encoder wrote. The
-  writer could not produce such a file either: it forced a single full-duration window and wrote
+  derived every gaussian's velocity grid from the first validity window (spec §6.3), and the writer
+  could not produce a file that showed it up: it forced a single full-duration window and wrote
   `window_index = 0` for everyone, ignoring the `win_lo` and `win_hi` each gaussian already carried.
+  Both sides are fixed — the writer emits the distinct windows its population declares, and the
+  reader resolves each row against the one its own index names.
 
-  **This changes reconstructed state, not only its precision.** `reconstruct_at` now drops gaussians
-  outside their own half-open window, and `states_json`'s `liveCount` follows, so a multi-window
-  file that previously returned expired or not-yet-born gaussians produces a different live set.
-  Compare 0.3.0 results against 0.2.0 with that in mind.
+  The precision half of this is narrower than it sounds. §6.3 takes the velocity grid from the
+  window length only for gaussians flagged as never fading; for every other gaussian the grid comes
+  from its own `sigma_t` and the window never entered it. So the positions that drifted from the
+  bins the encoder wrote were those of never-fading gaussians whose window is a different length
+  from window 0's, and different by enough to land in another precision class. No refusal, just
+  numbers nobody wrote.
+
+  **The liveness half reaches any file with more than one window.** `reconstruct_at` now drops
+  gaussians outside their own half-open window and `states_json`'s `liveCount` follows, so any probe
+  instant that falls outside some gaussian's window now returns a different population — where
+  before an expired or not-yet-born gaussian was still reported at an instant it does not exist, at
+  full opacity if it is one that never fades. Both halves correct code drafted for this release and
+  never tagged: 0.2.0 shipped no whole-file keyframe-delta reader, so there is no 0.2.0 output to
+  compare against — this is for whoever ran the path off `main` before 2026-08-02.
+
+- **A keyframe-delta state carrying no `window_index` is refused by name.** A zero-count keyframe
+  may legally omit every stream, and a delta carries forward only the attributes its reference
+  already had, so a later birth group can compose a non-empty state with no `window_index` column.
+  Reconstruction needs one per row now that each row resolves its own window, so a state without it
+  is refused as `missing-window-index`, naming the §11.5 rule that makes the attribute required,
+  rather than failing as a `KeyError` raised inside reconstruction.
 
 - **Cross-record rules run on a truncated file too, where they can.** `read` now applies the
   provenance and object-layer checks whatever `recover_truncated` returned, because a duplicate
