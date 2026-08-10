@@ -32,9 +32,10 @@ The LOD proposal is documentation only and is not advertised here.
   temporal model over time. Births and deaths are exact per frame; USD time samples do not carry
   `gaussian_id` correspondence across samples.
 
-- **`state_at_with_objects`**, exported at the top level, composes an object layer onto gaussian
-  state a caller already holds. `Scene.state_at` remains the path for a decoded streamed scene,
-  which composes its own layer; this is the same rule applied where the two arrive separately.
+- **`state_at_with_objects(gaussians, objects, t)`**, exported at the top level, reconstructs state
+  at `t` and composes an object layer onto it in one call. `Scene.state_at` already did this for a
+  decoded streamed scene; this is the same rule where the gaussians and the layer arrive separately,
+  as they do on the indexed path, and it saves every caller from remembering `ObjectLayer.apply`.
 - **A ceiling on trajectory and object-track samples.** `MAX_TRAJECTORY_SAMPLES` bounds what one
   count-prefixed record may ask a reader to allocate before the bytes behind it are shown to exist.
   Shared by value with the other SDKs, because a ceiling only one implementation has is a file that
@@ -45,6 +46,9 @@ The LOD proposal is documentation only and is not advertised here.
   unaffected. The check runs when the record is fetched rather than at open: `open_indexed` frames
   these ranges without reading them, so a file carrying an oversized one still opens and still
   decodes its chunks — it is the accessor for that record that refuses, where 0.2.0 transferred it.
+
+### Fixed
+
 - **An empty trajectory or object track is read as though the record were absent** (spec §5.15.4 and
   §5.15.7), so its pose rules are not applied — not even an interpolation byte outside the registry,
   which describes how to read samples it does not carry. Rules that are not about the pose still
