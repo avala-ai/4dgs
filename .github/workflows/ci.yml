@@ -95,8 +95,8 @@ jobs:
         # Raised from 544 to 608 KiB for the hostile-input hardening: the refusals in
         # records.dart and both readers, and the suite that pins them — about 40 KiB,
         # three quarters of it the tests. The headroom is deliberate and will be spent:
-        # the rest of the Mission Control hostile-input suite is still to be ported here,
-        # which is what lets Mission Control drop its vendored copy of this decoder.
+        # the rest of the hostile-input suite is still to be ported here, which is what
+        # lets a consumer drop a vendored copy of this decoder for the package.
         run: |
           size_kb=$(du -s dart | cut -f1)
           echo "dart: ${size_kb} KiB"

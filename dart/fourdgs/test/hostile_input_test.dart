@@ -9,10 +9,10 @@
 /// out-of-registry enum is still a well-formed integer. A header total that
 /// disagrees with the chunks is a scene that opens cleanly and is quietly short.
 ///
-/// The Mission Control copy of this decoder grew these checks first, against its
+/// A vendored copy of this decoder grew these checks first, against its
 /// own 1,663-line hostile-input suite. This file is the subset that pins them
-/// here, in the published package — the one Mission Control is meant to switch
-/// to, which cannot happen while switching would lose the hardening.
+/// here, in the published package — the one a vendoring consumer is meant to
+/// switch to, which is not worth doing while switching loses the hardening.
 library;
 
 import 'dart:convert';

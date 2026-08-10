@@ -49,8 +49,9 @@ plausible-looking output rather than an error, so nothing downstream notices:
   The chain is now built from the entry the caller already holds, so the indexed path no longer
   refuses a file the streamed path reads.
 
-These already existed in the Mission Control copy of this decoder, pinned by its own hostile-input
-suite. They are here now so that consuming this package directly is not a step down in robustness.
+These checks were pinned by a hostile-input suite kept alongside a first-party viewer that
+vendors this decoder. They are here now so that depending on the published package directly is not
+a step down in robustness for anyone doing the same.
 
 ### Added
 
