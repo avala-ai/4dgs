@@ -10,12 +10,14 @@
 `--verify` is the gate that keeps the corpus honest. It asserts three things:
 
 1. every generated file matches its committed SHA-256;
-2. every committed expectation matches a fresh decode;
+2. every committed expectation matches, character for character, a fresh decode;
 3. two consecutive generator runs are byte-identical.
 
-The third is the one that earns its keep: accidental nondeterminism in an encoder —
-iteration order, a hash seed, a timestamp — is invisible locally and shows up as somebody
-else's failing CI.
+The second and third are the ones that earn their keep, and they catch different things.
+Accidental nondeterminism in an encoder — iteration order, a hash seed, a timestamp — is
+invisible locally and shows up as somebody else's failing CI. A canonical form that varies
+by machine is quieter still: the bytes are identical, so every checksum passes, and only
+the expectations move (issue #153).
 """
 
 from __future__ import annotations
@@ -776,6 +778,24 @@ def write_checksums(checksums: dict[str, str]) -> None:
         fh.write("\n".join(lines) + "\n")
 
 
+def read_expectations() -> dict[str, str]:
+    """Every committed `.json` expectation as text, keyed the way the checksums are.
+
+    Read *before* the generator overwrites them, which is what lets `--verify` say whether
+    a fresh decode still produces the corpus that is committed.
+    """
+    out: dict[str, str] = {}
+    for root, prefix in ((DATA, ""), (INVALID, "invalid/"), (KEYFRAME, "keyframe/"), (OBJECT, "object/")):
+        if not os.path.isdir(root):
+            continue
+        for name in sorted(os.listdir(root)):
+            if not name.endswith(".json"):
+                continue
+            with open(os.path.join(root, name), encoding="utf-8") as fh:
+                out[prefix + name[: -len(".json")]] = fh.read()
+    return out
+
+
 def read_checksums() -> dict[str, str]:
     out: dict[str, str] = {}
     if not os.path.exists(CHECKSUMS):
@@ -794,6 +814,7 @@ def main(argv=None) -> int:
     parser.add_argument("--verify", action="store_true", help="regenerate and assert nothing moved")
     args = parser.parse_args(argv)
 
+    committed_expectations = read_expectations() if args.verify else {}
     checksums = write_corpus(DATA)
     total = sum(
         os.path.getsize(os.path.join(root, f))
@@ -812,10 +833,10 @@ def main(argv=None) -> int:
         print(f"wrote {CHECKSUMS}")
         return 0
 
-    return 0 if _verify(checksums) else 1
+    return 0 if _verify(checksums, committed_expectations) else 1
 
 
-def _verify(checksums: dict[str, str]) -> bool:
+def _verify(checksums: dict[str, str], committed_expectations: dict[str, str]) -> bool:
     """Assert the corpus matches what is committed and that the encoder is stable."""
     committed = read_checksums()
     failures = []
@@ -829,6 +850,22 @@ def _verify(checksums: dict[str, str]) -> bool:
     for name in committed:
         if name not in checksums:
             failures.append(f"{name}: committed checksum has no variant")
+
+    # The expectations, which the checksums cannot speak for. `canonical.py` runs after the
+    # bytes are decoded, so a summary that varies by platform — a signed zero at the noise
+    # floor, issue #153 — leaves every `.4dgs` byte-identical, keeps every checksum green,
+    # and still leaves a corpus nobody else can regenerate. Compared as text and not as
+    # parsed JSON on purpose: a parser erases exactly the differences this is here to
+    # catch, `-0.0` and `0.0` being equal numbers and different corpora.
+    fresh_expectations = read_expectations()
+    for name, text in sorted(fresh_expectations.items()):
+        if name not in committed_expectations:
+            failures.append(f"{name}.json: no committed expectation")
+        elif committed_expectations[name] != text:
+            failures.append(f"{name}.json: {_first_difference(committed_expectations[name], text)}")
+    for name in committed_expectations:
+        if name not in fresh_expectations:
+            failures.append(f"{name}.json: committed expectation has no variant")
 
     # Determinism: a second run must produce the same bytes.
     second = {}
@@ -852,8 +889,17 @@ def _verify(checksums: dict[str, str]) -> bool:
         print("\nif the change was intended, rerun without --verify and commit the result", file=sys.stderr)
         return False
 
-    print(f"verified {len(checksums)} variants: checksums match and the encoder is deterministic")
+    print(f"verified {len(checksums)} variants: checksums and expectations match, and the encoder is deterministic")
     return True
+
+
+def _first_difference(committed: str, fresh: str) -> str:
+    """Where two expectations first differ, so a failure names a value and not just a file."""
+    old, new = committed.splitlines(), fresh.splitlines()
+    for i, (a, b) in enumerate(zip(old, new, strict=False), start=1):
+        if a != b:
+            return f"line {i}: committed {a.strip()}, fresh decode {b.strip()}"
+    return f"{len(old)} committed lines, {len(new)} from a fresh decode"
 
 
 if __name__ == "__main__":
