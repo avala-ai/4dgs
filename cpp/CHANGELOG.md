@@ -6,8 +6,21 @@ All notable changes to the C++ package are documented here, following
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-08-10
+
 ### Added
 
+- A CMake package another project can consume. The install already exported its targets under the
+  `fourdgs::` namespace but generated no config file, so `find_package(fourdgs-cpp)` could not
+  succeed against it — the install rules produced something nothing could find. It now installs
+  `fourdgs-cpp-config.cmake` and `fourdgs-cpp-config-version.cmake` beside the targets file, so a
+  version request is answerable (`SameMinorVersion`, which is what a 0.x compatibility promise
+  means). `fourdgs::cpp` names the library whether it arrived through `find_package` or
+  `add_subdirectory`, and the tests, conformance runners and examples build by default only when
+  this is the top-level project, so consuming the package no longer adds them to somebody else's
+  build. `cpp/README.md` documents the three consumption paths, including the `SOURCE_SUBDIR cpp`
+  argument that a `CPMAddPackage` needs and nobody would guess: this repository has no CMakeLists at
+  its root, and without that argument the fetch silently adds nothing.
 - keyframe-delta decode: `fourdgs::keyframeDeltaStatesJson` and `fourdgs::peekTemporalModel`,
   binding the core's additive states-JSON C ABI. The summary is computed in the Rust core, so the
   binding does no arithmetic of its own; the `decode_streamed` and `decode_indexed` conformance
@@ -37,8 +50,19 @@ All notable changes to the C++ package are documented here, following
   comparison rests on, that reordering a scene's gaussians cannot change one character of its
   summary.
 
+### Known limitations
+
+An out-of-tree build supplies the Rust core itself: this is a binding over that core's C ABI, and
+the core's library is a build artifact, so `FOURDGS_CORE_LIBRARY` (and, for a copy of `cpp/` on its
+own, `FOURDGS_CORE_HEADER_DIR`) point at what `cargo build -p fourdgs --release` produced.
+Configuring without them outside this repository is now a fatal error naming both, rather than a
+STATUS line and a library that refuses every call. Building the core from CMake with Corrosion, or
+fetching a prebuilt one, would remove the step; neither is implemented, and the choice between them
+is deliberately not being made here.
+
 ### Notes
 
 Conformance-verified: 79 checks across the 45 valid variants this binding supports, and the feature
-matrix records exactly what that proves. Nothing is released yet — the package has no version to
-release from.
+matrix records exactly what that proves. This is the first release: 0.1.0 rather than a number
+matched to another SDK's, because the packages version independently and this one has shipped
+nothing before.
