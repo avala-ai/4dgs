@@ -26,7 +26,10 @@ happened.
   gaussian goes in the deepest node whose interval fully contains its support, so it is stored
   exactly once however long it lives, and a reader that wants one instant fetches the nodes covering
   it instead of the scene. `maxDepth` and `minChunkGaussians` control the shape; a node too small to
-  be worth its own chunk hands its gaussians back to its parent.
+  be worth its own chunk hands its gaussians back to its parent. Planning costs `O(n log n)` in the
+  gaussian count and not `O(n²)`: a scene that gives every gaussian its own validity window has as
+  many top-level intervals as gaussians, and each gaussian finds its interval by binary search over
+  the split points rather than by every interval being offered every gaussian.
 - Summary writing, in the shape spec §4.5 requires: the Chunk Index, then Statistics, then the
   Summary Offset, one contiguous run immediately before the Footer with nothing else inside it. That
   contiguity is what lets a streamed reader verify `summary_crc` by retaining the trailing records
@@ -43,6 +46,14 @@ happened.
   An inverted window is refused rather than written because visibility is gated on `lo <= t < hi`:
   it would cover no instant, and this package's own reader refuses the record carrying it, so
   writing one produces a file neither read path can reopen.
+- Every option has a range and is checked against it before anything acts on it: `level` is `-1` or
+  `0`–`9`, `maxDepth` is `0`–`32`, `minChunkGaussians` is at least `1`, `shBands` is not negative.
+  Each is a `FourdgsInvalidInput` naming the option, the value and the range, because the
+  alternative is what these did before — an out-of-range deflate level surfacing as a `RangeError`
+  from inside a compression package, and an unbounded `maxDepth` surfacing as a `StackOverflowError`
+  from inside the chunk planner, where a gaussian that lives for a single instant never straddles a
+  midpoint and so never stops descending. Neither names the option or the caller who set it, and
+  neither is catchable as one of this library's own exceptions.
 - Three lanes that a domain repair would otherwise change silently are refused instead: an rgb or
 - Three lanes that a domain repair would otherwise change silently are refused instead: an rgb or
   opacity component outside `[0, 1]`, which `decodeChunk` clamps back into the range, so a channel

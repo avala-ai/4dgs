@@ -192,7 +192,7 @@ void main() {
     });
 
     test('invalid deflate levels are authoring errors', () {
-      for (final level in const <int>[-1, 10]) {
+      for (final level in const <int>[-2, 10]) {
         expect(
           () => writeFourdgsBytes(
             buildScene(),
@@ -203,7 +203,7 @@ void main() {
             isA<FourdgsInvalidInput>().having(
               (FourdgsInvalidInput e) => e.message,
               'message',
-              allOf(contains('deflate level'), contains('0 through 9')),
+              allOf(contains('deflate level'), contains('0 to 9')),
             ),
           ),
         );
@@ -1036,6 +1036,40 @@ void main() {
       expect(deep.gaussians.count, scene.count);
     });
 
+    test('a window per gaussian still puts each one in its own window', () {
+      // The shape the interval search exists for. Every distinct window puts its
+      // endpoints in the top-level split points, so a scene that gives each
+      // gaussian its own window has as many intervals as gaussians — and the
+      // scan this replaced asked every interval about every gaussian, which is
+      // the quadratic this module promises it does not contain.
+      //
+      // 256 windows over 8 seconds so that every boundary is a multiple of
+      // 2^-5 and survives the trip through `float32` exactly: a test that has
+      // to reason about which side of a boundary a value landed on is testing
+      // the rounding, not the partition.
+      const count = 256;
+      final scene = buildScene(count: count, windows: count);
+      final decoded = readFourdgsBytes(
+        writeFourdgsBytes(
+          scene,
+          8.0,
+          options: const FourdgsWriteOptions(maxDepth: 0, minChunkGaussians: 1),
+        ),
+      );
+      // One chunk per window and no root chunk. A gaussian whose interval was
+      // found wrongly lands either in a chunk that does not contain its support
+      // or, if no interval was found at all, in the root — one extra chunk
+      // spanning the whole timeline, which is what this count would catch.
+      expect(decoded.chunkIndex.length, count);
+      int total = 0;
+      for (final entry in decoded.chunkIndex) {
+        expect(entry.gaussianCount, 1);
+        total += entry.gaussianCount;
+      }
+      expect(total, count);
+      expect(decoded.gaussians.count, count);
+    });
+
     test('every chunk in a multi-chunk file is framed by its index entry', () {
       final bytes = writeFourdgsBytes(
         buildScene(count: 512, windows: 8, shDegree: 2),
@@ -1760,6 +1794,83 @@ void main() {
       final actual = decoded.gaussians.scales[3 * 3 + 2];
       final bound = declared(decoded.quantization, 'scale_rel');
       expect((actual / source - 1.0).abs(), lessThanOrEqualTo(bound));
+    });
+
+    test('a partition depth the stack cannot hold is refused by name', () {
+      // A gaussian whose support is a single instant never straddles a midpoint,
+      // so it is offered every level there is and takes all of them. The descent
+      // is recursive, so before the ceiling this was a `StackOverflowError` from
+      // inside the planner: an error that names neither the option nor the
+      // caller who set it, and one no `catch` on this library's own exceptions
+      // would see.
+      final instant = flatScene(4, winHi: 10.0);
+      instant.sigmaT.fillRange(0, 4, 0.0);
+      instant.muT.fillRange(0, 4, 5.0);
+      expect(
+        () => writeFourdgsBytes(
+          instant,
+          10.0,
+          options: const FourdgsWriteOptions(
+            maxDepth: 10000,
+            minChunkGaussians: 1,
+          ),
+        ),
+        throwsA(
+          isA<FourdgsInvalidInput>().having(
+            (FourdgsInvalidInput e) => e.message,
+            'message',
+            allOf(contains('max_depth'), contains('10000'), contains('32')),
+          ),
+        ),
+      );
+      // The ceiling itself is a depth, not a refusal: the same scene at the
+      // deepest legal partition still writes.
+      expect(
+        () => writeFourdgsBytes(
+          instant,
+          10.0,
+          options: const FourdgsWriteOptions(
+            maxDepth: 32,
+            minChunkGaussians: 1,
+          ),
+        ),
+        returnsNormally,
+      );
+    });
+
+    test('an option outside its range is named here, not by a library', () {
+      // Each of these used to leave the encoder as somebody else's error or as
+      // no error at all — an out-of-range deflate level as a `RangeError` from
+      // inside the compression package, a nonsensical chunk population as a
+      // silently different partition.
+      const cases = <FourdgsWriteOptions>[
+        FourdgsWriteOptions(level: 42),
+        FourdgsWriteOptions(level: -2),
+        FourdgsWriteOptions(maxDepth: -1),
+        FourdgsWriteOptions(maxDepth: 33),
+        FourdgsWriteOptions(minChunkGaussians: 0),
+        FourdgsWriteOptions(minChunkGaussians: -5),
+        FourdgsWriteOptions(shBands: -1),
+      ];
+      for (final options in cases) {
+        expect(
+          () => writeFourdgsBytes(buildScene(count: 8), 8.0, options: options),
+          throwsA(isA<FourdgsInvalidInput>()),
+          reason:
+              'level=${options.level} max_depth=${options.maxDepth} '
+              'min_chunk_gaussians=${options.minChunkGaussians} '
+              'sh_bands=${options.shBands}',
+        );
+      }
+      // `-1` is the deflate codec's own default. It is a level, not a mistake.
+      expect(
+        () => writeFourdgsBytes(
+          buildScene(count: 8),
+          8.0,
+          options: const FourdgsWriteOptions(level: -1),
+        ),
+        returnsNormally,
+      );
     });
 
     test('an unknown profile lists the ones that exist', () {

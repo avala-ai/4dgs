@@ -101,16 +101,19 @@ class FourdgsWriteOptions {
   /// which is why it is the default everywhere.
   final int codec;
 
-  /// Deflate compression level, 0–9.
+  /// Deflate compression level: `-1` for the codec's own default, or `0`–`9`
+  /// from fastest to smallest. Anything else is refused by name.
   final int level;
 
-  /// Depth of the temporal partition below each window. `0` writes one chunk per
-  /// window interval, which is the coarsest partition that is still a partition.
+  /// Depth of the temporal partition below each window, `0` to `32`. `0` writes
+  /// one chunk per window interval, which is the coarsest partition that is
+  /// still a partition. The ceiling is there because the descent is recursive
+  /// and a gaussian that lives for one instant never stops descending.
   final int maxDepth;
 
-  /// The population a subdivision has to reach to be worth its own chunk. Below
-  /// it a node hands its gaussians back to its parent, so a deep tree over a
-  /// small scene does not turn into hundreds of chunks of four.
+  /// The population a subdivision has to reach to be worth its own chunk, at
+  /// least `1`. Below it a node hands its gaussians back to its parent, so a
+  /// deep tree over a small scene does not turn into hundreds of chunks of four.
   final int minChunkGaussians;
 
   final bool writeIndex;
@@ -180,11 +183,7 @@ void writeFourdgsToSink(
       'write deflate, which every reader implements',
     );
   }
-  if (options.level < 0 || options.level > 9) {
-    throw FourdgsInvalidInput(
-      'deflate level is ${options.level}; expected an integer from 0 through 9',
-    );
-  }
+  _checkOptions(options);
   // A profile is a promise about what the file contains, made so a consumer can
   // reject an unsuitable file up front rather than discovering the absence
   // mid-decode. `objects` promises an `object_id` stream in every non-empty
@@ -364,6 +363,56 @@ void writeFourdgsToSink(
 // --------------------------------------------------------------------------
 // Input validation
 // --------------------------------------------------------------------------
+
+/// The deepest temporal partition this encoder will build below a window.
+///
+/// Not a taste limit. A window split this far is intervals of nanoseconds even
+/// on a scene measured in days — orders of magnitude below the finest time grid
+/// any quantization profile declares — and a chunk index with `2^32` entries per
+/// window is not a file anybody can read. Past here the depth buys nothing and
+/// costs a stack frame per level.
+const int _maxChunkTreeDepth = 32;
+
+/// The values a caller chose, before any of them is acted on.
+///
+/// Every one of these is a caller's mistake rather than a file's, which is what
+/// [FourdgsInvalidInput] is for, and each message names the value it got and the
+/// range it wanted (AGENTS.md §6). The alternative is what these used to do: an
+/// out-of-range deflate level surfaced as `RangeError` from inside a compression
+/// library, and an out-of-range depth surfaced as `StackOverflowError` from
+/// inside the chunk planner — two diagnoses that name neither the option nor the
+/// caller who set it.
+void _checkOptions(FourdgsWriteOptions options) {
+  if (options.level < -1 || options.level > 9) {
+    throw FourdgsInvalidInput(
+      'deflate level is ${options.level}; the levels are -1 for the codec\'s '
+      'own default and 0 to 9 from fastest to smallest',
+    );
+  }
+  // The descent below a window is one stack frame per level, and a gaussian
+  // whose support is a single instant never straddles a midpoint, so it never
+  // stops descending: with `minChunkGaussians: 1` a large depth is a
+  // `StackOverflowError` rather than a file or a diagnosis.
+  if (options.maxDepth < 0 || options.maxDepth > _maxChunkTreeDepth) {
+    throw FourdgsInvalidInput(
+      'max_depth is ${options.maxDepth}; the temporal partition runs from 0 '
+      'levels below each window interval to $_maxChunkTreeDepth',
+    );
+  }
+  if (options.minChunkGaussians < 1) {
+    throw FourdgsInvalidInput(
+      'min_chunk_gaussians is ${options.minChunkGaussians}; a chunk holds at '
+      'least one gaussian, so the population that earns a subdivision its own '
+      'chunk is at least 1',
+    );
+  }
+  if (options.shBands < 0) {
+    throw FourdgsInvalidInput(
+      'sh_bands is ${options.shBands}; the highest band to write is 0 for none '
+      'or a positive band number, capped further by the scene\'s own degree',
+    );
+  }
+}
 
 /// Per-gaussian lanes that land on a grid, so a non-finite value in one either
 /// sets a non-finite grid parameter or rounds to a meaningless bin.
@@ -1178,14 +1227,33 @@ List<_Plan> _planChunks(
     return stay;
   }
 
+  // Which window interval each gaussian belongs to, decided in one pass over
+  // the scene rather than by asking every interval about every gaussian.
+  //
+  // The scan this replaces was quadratic the moment a scene gives its gaussians
+  // their own validity windows: every distinct window puts its endpoints in
+  // `tops`, so the interval count and the gaussian count grow together and this
+  // module's promise that "nothing here is quadratic in the gaussian count"
+  // stopped being true — 128k gaussians took half a minute to plan.
+  //
+  // The answer is the same one. A gaussian went to the first interval that
+  // contained its whole support, because the intervals were visited in order
+  // and an assigned gaussian was skipped by every later one; `tops` ascends, so
+  // that interval can be found by two binary searches instead of a scan. Members
+  // are appended in ascending `i`, which is the order the comprehension built
+  // them in.
+  final byInterval = <List<int>>[
+    for (int w = 0; w + 1 < tops.length; w++) <int>[],
+  ];
+  for (int i = 0; i < n; i++) {
+    final w = _firstContainingInterval(tops, lo[i], hi[i]);
+    if (w >= 0) byInterval[w].add(i);
+  }
+
   for (int w = 0; w + 1 < tops.length; w++) {
     final a = tops[w];
     final b = tops[w + 1];
-    final pool = <int>[
-      for (int i = 0; i < n; i++)
-        if (assigned[i] < 0 && lo[i] >= a - 1e-9 && hi[i] <= b + 1e-9) i,
-    ];
-    final kept = descend(a, b, 0, pool);
+    final kept = descend(a, b, 0, byInterval[w]);
     if (kept.isNotEmpty) {
       nodes.add(_Node(a, b, 0));
       for (final i in kept) {
@@ -1208,12 +1276,22 @@ List<_Plan> _planChunks(
     }
   }
 
+  // The second scan that was quadratic: `nodes` grows with the window count,
+  // which grows with the gaussian count, so one pass per node over the whole
+  // scene multiplied the two together. One pass over the scene fills every
+  // node's list, and appending in ascending `i` leaves each list in the order
+  // the comprehension produced.
+  final membersByNode = <List<int>>[
+    for (int node = 0; node < nodes.length; node++) <int>[],
+  ];
+  for (int i = 0; i < n; i++) {
+    final node = assigned[i];
+    if (node >= 0) membersByNode[node].add(i);
+  }
+
   final plans = <_Plan>[];
   for (int node = 0; node < nodes.length; node++) {
-    final members = <int>[
-      for (int i = 0; i < n; i++)
-        if (assigned[i] == node) i,
-    ];
+    final members = membersByNode[node];
     if (members.isEmpty) continue;
     plans.add(
       _Plan(
@@ -1240,6 +1318,52 @@ List<_Plan> _planChunks(
     for (final plan in plans)
       _Plan(plan.t0, plan.t1, plan.level, _mortonOrder(g, plan.members)),
   ];
+}
+
+/// The first interval of [tops] whose span contains the whole support
+/// `[lo, hi]`, or `-1` when no interval does.
+///
+/// [tops] ascends, which is what makes two binary searches equivalent to the
+/// scan: the intervals whose start clears `lo` are a prefix of it, and those
+/// whose end covers `hi` are a suffix, so the first interval that does both is
+/// where the suffix begins — if it begins inside the prefix at all.
+///
+/// The comparisons are the scan's own, `lo >= a - 1e-9` and `hi <= b + 1e-9`,
+/// written that way round rather than rearranged into `a <= lo + 1e-9`. The two
+/// are the same statement in arithmetic and not always the same answer in
+/// doubles, and this has to reproduce the partition the scan produced exactly:
+/// one gaussian landing in a different chunk is a different file.
+int _firstContainingInterval(List<double> tops, double lo, double hi) {
+  // The last interval whose start clears `lo`.
+  int last = -1;
+  int low = 0;
+  int high = tops.length - 2;
+  while (low <= high) {
+    final mid = (low + high) >> 1;
+    if (lo >= tops[mid] - 1e-9) {
+      last = mid;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  if (last < 0) return -1;
+
+  // The first interval whose end covers `hi`, looked for only among those, so
+  // that "the suffix starts past the prefix" comes back as no interval at all.
+  int first = -1;
+  low = 0;
+  high = last;
+  while (low <= high) {
+    final mid = (low + high) >> 1;
+    if (hi <= tops[mid + 1] + 1e-9) {
+      first = mid;
+      high = mid - 1;
+    } else {
+      low = mid + 1;
+    }
+  }
+  return first;
 }
 
 /// One node of the interval tree: its span and its depth below the window level.
