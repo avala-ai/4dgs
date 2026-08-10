@@ -768,6 +768,49 @@ void main() {
       },
     );
 
+    test('a bin at the edge of the symbol domain never becomes a wrong one', () {
+      // A delta between two bins at opposite ends of the signed 32-bit range
+      // needs 33 bits, and an attribute stream's symbols are 32. The interesting
+      // failure is not the refusal — it is the silent one: truncating that delta
+      // produces a stream that decodes to a different number.
+      //
+      // Velocity is where it is reachable, because its bins are signed and its
+      // pitch is the finest in the format. The shape matters as much as the
+      // magnitude: a scene whose velocities sit near one extreme and then jump to
+      // the other delta-codes to a run of near-zeros and a single 33-bit step,
+      // which is exactly the input that makes delta the smaller of the two
+      // candidates and therefore the one written.
+      //
+      // The sweep is deliberately blind about where the boundary falls. Whatever
+      // the encoder does with a magnitude, the result must be a file this decoder
+      // reads back to the velocities that went in, or a refusal naming the
+      // attribute and the gaussian. Never a third thing.
+      for (final magnitude in <double>[1e3, 1e4, 1e5, 1e6, 1e9]) {
+        const count = 64;
+        final scene = flatScene(count);
+        for (int i = 0; i < count; i++) {
+          final sign = i < count ~/ 2 ? 1.0 : -1.0;
+          scene.motions[i * 3] = sign * (magnitude - i);
+        }
+        Uint8List bytes;
+        try {
+          bytes = writeFourdgsBytes(scene, 2.0);
+        } on FourdgsInvalidInput catch (error) {
+          expect(error.message, contains('motion'));
+          continue;
+        }
+        final decoded = readFourdgsBytes(bytes);
+        expect(decoded.gaussians.count, count, reason: 'magnitude $magnitude');
+        for (int i = 0; i < count; i++) {
+          expect(
+            decoded.gaussians.motions[i * 3].abs(),
+            closeTo(magnitude - i, magnitude * 1e-3),
+            reason: 'magnitude $magnitude, gaussian $i',
+          );
+        }
+      }
+    });
+
     test('a codec this build cannot write is named rather than attempted', () {
       expect(
         () => writeFourdgsBytes(

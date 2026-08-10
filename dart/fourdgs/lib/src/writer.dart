@@ -1134,14 +1134,8 @@ Uint8List _encodeStream(
 
   var best = _codeSymbols(values, options, attributeId);
   var bestMode = modeRaw;
-  if (count > 1) {
-    final deltas = Int32List(values.length);
-    for (int c = 0; c < channels; c++) {
-      deltas[c] = values[c];
-    }
-    for (int i = channels; i < values.length; i++) {
-      deltas[i] = values[i] - values[i - channels];
-    }
+  final deltas = count > 1 ? _deltaCandidate(values, channels) : null;
+  if (deltas != null) {
     final candidate = _codeSymbols(deltas, options, attributeId);
     if (candidate.payload.length < best.payload.length) {
       best = candidate;
@@ -1160,6 +1154,28 @@ Uint8List _encodeStream(
     ),
     best.payload,
   );
+}
+
+/// The delta-coded view of [values], or null when it cannot be represented.
+///
+/// A delta between two bins at opposite ends of the signed 32-bit range needs 33
+/// bits, and an attribute stream's symbols are 32. Dart stores that silently
+/// truncated, and truncated is the dangerous word: the stream then decodes to a
+/// different number, and whether anything notices depends on where the running
+/// sum lands. Returning null drops the candidate instead — raw mode is always
+/// representable, so a stream that cannot be delta-coded is still written, and
+/// written correctly.
+Int32List? _deltaCandidate(Int32List values, int channels) {
+  final deltas = Int32List(values.length);
+  for (int c = 0; c < channels; c++) {
+    deltas[c] = values[c];
+  }
+  for (int i = channels; i < values.length; i++) {
+    final delta = values[i] - values[i - channels];
+    if (delta < -2147483648 || delta > 2147483647) return null;
+    deltas[i] = delta;
+  }
+  return deltas;
 }
 
 bool _allRowsEqual(Int32List values, int channels, int count) {
