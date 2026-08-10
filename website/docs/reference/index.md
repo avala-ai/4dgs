@@ -3,9 +3,11 @@
 Support in this project is **per feature, not per language**. A partial SDK is a deliberate,
 documented state — not a defect — and this table is the public contract that says so.
 
-**A `Yes` means the conformance suite proves it.** Each SDK declares the variants it supports via
-`supportsVariant()`, the harness runs exactly those, and this table is kept in lockstep with those
-declarations. Nothing is marked `Yes` on the strength of code existing.
+**A `Yes` means the conformance suite proves it.** Each SDK answers the variants it supports, the
+harness skips the rest —
+[which variants those are, and who decides, is the runner protocol](./conformance.md#declining-a-variant)
+— and this table is kept in lockstep with what runs. Nothing is marked `Yes` on the strength of code
+existing.
 
 Every row is filled in from a suite that runs: 46 valid variants and 7 invalid ones, plus 4
 keyframe-delta and 3 object-layer variants in their own subdirectories, over two read paths
