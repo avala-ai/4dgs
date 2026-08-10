@@ -12,6 +12,33 @@ mention its own version — and because the release gate extracts this section a
 so it has to exist before the tag rather than after it. There is no date: the release has not
 happened.
 
+### The writer
+
+- `writeFourdgsBytes` encodes a `FourdgsGaussianSet` into a complete `.4dgs` buffer: the magic at
+  both ends, opcode-tagged length-prefixed records, Header, Quantization, Window Table, a Chunk with
+  its attribute streams, the spherical-harmonic band records, and a Footer. A second encoder rather
+  than a binding — it shares no code with the other five SDKs and lands on the same integer bins, so
+  a decoder cannot tell its output from theirs once decoded.
+- Summary writing, in the shape spec §4.5 requires: the Chunk Index, then Statistics, then the
+  Summary Offset, one contiguous run immediately before the Footer with nothing else inside it. That
+  contiguity is what lets a streamed reader verify `summary_crc` by retaining the trailing records
+  rather than the whole file, so it is asserted on the written bytes rather than assumed. Every
+  offset and length in the index frames a whole record, opcode byte included (§5.8).
+- `FourdgsWriteOptions` carries the quantization profile, the Header's `cutoff`, the deflate level,
+  which summary records to write, and the Header's `profile`, `library` and attributes. The defaults
+  are the reference encoders'.
+- Refusals name the field and the gaussian, not just the failure: a non-finite value in a lane that
+  lands on a grid, a NaN validity window, a NaN or `-inf` sigma, a bin outside the signed 32-bit
+  symbols a stream carries, an unknown profile, a cutoff outside `(0, 1]`. `+inf` is a value in
+  three places and is written as one — a never-fading `sigma_t`, and a `win_lo`/`win_hi` that says a
+  gaussian is present at every instant.
+- Deterministic: two encodes of one scene are byte-identical, including the Header's attribute map,
+  whose keys are sorted rather than emitted in whatever order the caller's map iterates.
+- Proved by `dart/encode-roundtrip.sh`, which re-encodes all 46 corpus variants and requires the
+  Dart and Python decoders to produce identical canonical JSON from every result, on both read paths
+  in each language. It runs in the conformance workflow. An encoder checked only by its own decoder
+  proves that two halves of one implementation share an opinion.
+
 ### Hostile-input hardening
 
 The decoder refuses a class of file it previously accepted — values that decode into

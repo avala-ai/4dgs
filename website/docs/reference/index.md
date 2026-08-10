@@ -56,9 +56,9 @@ identical bytes with no per-language slerp or composition order of its own.
 | Unknown-record skipping                           | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Refusal diagnosis (named, not merely refused)     | Yes    | Yes        | Yes     | Yes     | Yes     | No      |
 | Private-range records                             | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Encode                                            | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
+| Encode                                            | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Chunked encode                                    | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
-| Summary writing                                   | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
+| Summary writing                                   | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Convert from PLY frame sequences                  | Yes    | No         | No      | No      | No      | No      |
 | glTF interop (import, snapshot export)            | Yes    | No         | No      | No      | No      | No      |
 | USD interop (import, snapshot export)             | Yes    | No         | No      | No      | No      | No      |
@@ -295,6 +295,15 @@ is about to declare — so the Quantization record's numbers are checked on ever
 scene rather than sampled. The chunk tree is exercised by the same run: the corpus scenes partition
 into up to 42 chunks each.
 
+Dart's is proved the way Rust's is, and for the same reason: it is a second encoder rather than a
+binding, sharing no code with the other five. `dart/encode-roundtrip.sh` re-encodes every variant
+with the Dart writer and then requires the **Dart and Python decoders to produce identical canonical
+JSON** from the result, on both read paths in each language, asserting byte-identical output across
+two encodes on the way. Both paths, because they fail differently: the streamed one never looks at
+the index, so a file with a wrong summary offset or a wrong chunk range still decodes there and only
+the indexed one notices. That is what carries **Encode** and **Summary writing**; **Chunked encode**
+is a separate claim and stays `Planned` until the Dart writer partitions a timeline.
+
 TypeScript, C++ and Swift are proved by the cross-language encode gate,
 `tests/conformance/encode_roundtrip.py`. It re-encodes every variant's decoded gaussians twice —
 once with the language under test, once with a shared Rust reference that writes gaussians alone
@@ -352,11 +361,13 @@ something a decode suite can see.
 `SceneWriter.encode` binding the core's `fourdgs_writer_*` functions rather than reimplementing the
 quantizer. Swift targets visionOS and iOS.
 
-**Dart** is an independent decoder rather than a binding: pure Dart, no Flutter dependency, sharing
-no code with the other five. That is what makes its agreement with them worth something — the row it
-fills in is a sixth derivation from the specification, not a sixth caller of the same one. It runs
-on the Dart VM, inside Flutter, and compiled to JavaScript or Wasm, and its `dart:io` transport is a
-separate import so the decoder itself stays platform-free.
+**Dart** is an independent implementation rather than a binding: pure Dart, no Flutter dependency,
+sharing no code with the other five. That is what makes its agreement with them worth something —
+the row it fills in is a sixth derivation from the specification, not a sixth caller of the same
+one. It runs on the Dart VM, inside Flutter, and compiled to JavaScript or Wasm, and its `dart:io`
+transport is a separate import so the decoder itself stays platform-free. It now writes as well as
+reads, and the writer is the same kind of thing: a second encoder that lands on the same integer
+bins, not a wrapper over one that already existed.
 
 Its arrival moved no other cell, but it did find one: the velocity precision class is derived from
 the Header's `cutoff`, and a decoder that assumes the default 0.05 decodes a minority of gaussians'
