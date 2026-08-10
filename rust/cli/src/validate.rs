@@ -10,6 +10,21 @@
 //! The checks, their severities and their wording are `python/fourdgs/fourdgs/validate.py`'s.
 //! Two validators that disagree about whether a file conforms are worse than one, so where
 //! the two differ the Python module is the reference and this is the bug.
+//!
+//! Three things this validator does that the Python one does not yet, each recorded here
+//! because a divergence nobody wrote down is indistinguishable from a bug:
+//!
+//! * **It prints the refusal identifier and the byte.** The finding lines themselves are
+//!   unchanged and still match Python's word for word; the identifier goes on a line of
+//!   its own beneath the finding it belongs to. Python's exceptions carry the same `code`
+//!   — its CLI simply does not print it.
+//! * **It decodes the chunks.** A framing walk steps over a chunk by its declared length,
+//!   so a fault inside a chunk's streams is invisible to it; two of the invalid corpus's
+//!   seven files are exactly that, and both validators called them clean.
+//! * **It knows `keyframe-delta`.** Both validators used to report a conforming
+//!   keyframe-delta file as invalid, because every structural check assumed the
+//!   gaussian-birth chunk shape. The Rust core implements the model, so its validator now
+//!   validates against the model the file declares.
 
 use std::collections::BTreeMap;
 
@@ -18,7 +33,8 @@ use fourdgs::serialization::{crc32, Records, MAGIC, RECORD_HEADER_SIZE};
 use fourdgs::{opcode as op, records as rec, BytesReadable, Result};
 
 use crate::args::Args;
-use crate::{EXIT_FAILED, EXIT_OK, EXIT_WARNINGS};
+use crate::refusal::{self, Named, Walk};
+use crate::{EXIT_FAILED, EXIT_OK, EXIT_TOOL, EXIT_WARNINGS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
@@ -37,38 +53,92 @@ impl Severity {
     }
 }
 
+/// One thing wrong with a file, and — when the library named it — which refusal it is.
+#[derive(Debug)]
+pub struct Finding {
+    pub severity: Severity,
+    /// Word for word what the Python validator prints for the same bytes.
+    pub message: String,
+    /// The refusal identifier and the byte it fired at, for the findings that have one.
+    /// Most do not: "the Header declares 640 gaussians; chunks contain 256" is a rule this
+    /// validator checks itself, not a refusal the reader raised, and the refusal table
+    /// does not name it.
+    pub refusal: Option<Named>,
+}
+
 #[derive(Debug, Default)]
 pub struct Report {
-    pub findings: Vec<(Severity, String)>,
+    pub findings: Vec<Finding>,
 }
 
 impl Report {
     pub fn ok(&self) -> bool {
-        !self.findings.iter().any(|(s, _)| *s == Severity::Error)
+        !self.findings.iter().any(|f| f.severity == Severity::Error)
     }
 
     fn worst(&self) -> Option<Severity> {
-        self.findings.iter().map(|(s, _)| *s).max()
+        self.findings.iter().map(|f| f.severity).max()
+    }
+
+    fn push(&mut self, severity: Severity, message: String, refusal: Option<Named>) {
+        self.findings.push(Finding {
+            severity,
+            message,
+            refusal,
+        });
     }
 
     fn error(&mut self, message: String) {
-        self.findings.push((Severity::Error, message));
+        self.push(Severity::Error, message, None);
     }
 
     fn warn(&mut self, message: String) {
-        self.findings.push((Severity::Warning, message));
+        self.push(Severity::Warning, message, None);
     }
 
     fn note(&mut self, message: String) {
-        self.findings.push((Severity::Note, message));
+        self.push(Severity::Note, message, None);
+    }
+
+    /// An error the library raised, carrying its identifier and the byte if it has one.
+    ///
+    /// `prefix` is what the message is introduced with, so the sentence stays the one the
+    /// other validator prints; the identifier arrives on its own line and changes nothing
+    /// about it.
+    fn refused(
+        &mut self,
+        prefix: &str,
+        error: &fourdgs::Error,
+        walk: Option<&Walk>,
+        site: Option<refusal::Site>,
+    ) {
+        let named = refusal::describe(error, walk, site);
+        self.push(Severity::Error, format!("{prefix}{error}"), named);
     }
 }
 
 pub fn run(args: &Args) -> Result<u8> {
-    let data = std::fs::read(&args.file)?;
+    // Whole-file, as the Python validator is: a validator's job is to answer for the file
+    // it was handed rather than for the part of it that happened to be cheap, and the
+    // summary CRC has to cover a contiguous region to mean anything. The bounded-memory
+    // rule is about decode paths, and the decode this performs is chunk by chunk.
+    let data = match std::fs::read(&args.file) {
+        Ok(data) => data,
+        // Not the file's fault, and not a refusal. See `EXIT_TOOL`.
+        Err(error) => {
+            eprintln!("4dgs: {}: {error}", args.file);
+            return Ok(EXIT_TOOL);
+        }
+    };
     let report = validate(&data);
-    for (severity, message) in &report.findings {
-        out!("{}: {message}", severity.as_str());
+    for finding in &report.findings {
+        out!("{}: {}", finding.severity.as_str(), finding.message);
+        // Indented, and with a prefix of its own, so that a caller filtering the findings
+        // on `error:`/`warning:`/`note:` — which is how the two validators are compared —
+        // sees exactly what it saw before.
+        if let Some(named) = &finding.refusal {
+            out!("  {named}");
+        }
     }
     if !report.ok() {
         eprintln!("INVALID");
@@ -94,10 +164,16 @@ pub fn run(args: &Args) -> Result<u8> {
 /// Every check, in the Python validator's order.
 pub fn validate(data: &[u8]) -> Report {
     let mut report = Report::default();
-    if let Err(error) = fourdgs::serialization::check_magic(data) {
-        report.error(error.to_string());
-        return report;
-    }
+    // Framing first, and for two reasons: it refuses a file that is not ours before
+    // anything reads a byte as an opcode, and it is what gives every later refusal a byte
+    // to point at.
+    let walk = match refusal::walk(&mut BytesReadable::new(data)) {
+        Ok(walk) => walk,
+        Err(error) => {
+            report.refused("", &error, None, None);
+            return report;
+        }
+    };
     if !data.ends_with(&MAGIC) {
         report.error(
             "file does not end with the magic; it is truncated or was written by a broken encoder"
@@ -206,6 +282,15 @@ pub fn validate(data: &[u8]) -> Report {
                 "private record 0x{opcode:02X} ({} bytes) — skipped, as required",
                 record.content.len()
             )),
+            // The reserved tail of the provenance family, which is a different thing from
+            // an unknown record: the range is spoken for, so a reader that meets one knows
+            // it is looking at a record from a later revision rather than at a byte it
+            // cannot account for. Python's wording, because a note the two tools spell
+            // differently is a diff nobody can read.
+            opcode if op::is_provenance(opcode) && !is_specified(opcode) => report.note(format!(
+                "reserved provenance record 0x{opcode:02X} — skipped, as required \
+                 (0x24-0x2F, section 5.15.6)"
+            )),
             opcode if !is_specified(opcode) => report.note(format!(
                 "unknown record 0x{opcode:02X} — skipped, as required"
             )),
@@ -233,8 +318,22 @@ pub fn validate(data: &[u8]) -> Report {
         report.error("no Footer record".into());
     }
 
+    // Which chunk shape the rest of this validator is entitled to assume. A
+    // `keyframe-delta` file's Chunks are keyframes and its Delta Chunks are differences
+    // against them, so several checks below are about the gaussian-birth shape and about
+    // nothing else. Read from the Header rather than guessed from the records, because a
+    // file that carries Delta Chunks and does not say so is itself a fault.
+    let keyframe_delta = header
+        .as_ref()
+        .is_some_and(|h| h.temporal_model == "keyframe-delta");
+
     if let Some(header) = &header {
-        if counted != header.gaussian_count {
+        // `gaussian_count` counts distinct gaussians over the whole sequence under
+        // `keyframe-delta`, and every keyframe carries a full population — so the sum
+        // across chunks is a larger number by design, not a disagreement. Summing them
+        // anyway is what made both validators call a conforming keyframe-delta file
+        // invalid.
+        if !keyframe_delta && counted != header.gaussian_count {
             report.error(format!(
                 "Header declares {} gaussians; chunks contain {counted}",
                 header.gaussian_count
@@ -283,11 +382,16 @@ pub fn validate(data: &[u8]) -> Report {
 
     for (i, entry) in index.iter().enumerate() {
         let end = entry.chunk_offset.saturating_add(entry.chunk_length);
+        let at = data.get(entry.chunk_offset as usize).copied();
+        // A `keyframe-delta` file indexes both kinds: a Chunk is a keyframe and a Delta
+        // Chunk is a difference against one, and an index that could only name the former
+        // could not seek the model at all.
+        let addressable = at == Some(op::CHUNK) || (keyframe_delta && at == Some(op::DELTA_CHUNK));
         if end > data.len() as u64 {
             report.error(format!(
                 "chunk index entry {i} points past the end of the file"
             ));
-        } else if data.get(entry.chunk_offset as usize) != Some(&op::CHUNK) {
+        } else if !addressable {
             report.error(format!(
                 "chunk index entry {i} does not point at a Chunk record"
             ));
@@ -317,12 +421,72 @@ pub fn validate(data: &[u8]) -> Report {
         report.warn("no chunk index: this file can only be read front to back, not seeked".into());
     }
 
-    // Opening the file the way a seeking client would is itself a check.
-    if let Err(error) = fourdgs::indexed_reader::open_indexed(&mut BytesReadable::new(data)) {
-        report.error(format!("a seeking reader cannot open this file: {error}"));
+    // What survived the cut, which is the question the errors above do not answer.
+    //
+    // A cut file is invalid and every finding about it stands — but records are
+    // length-prefixed, so everything complete before the cut is intact and the library's
+    // streamed reader keeps it. Saying only that the file stopped reading leaves its
+    // holder to guess whether anything is salvageable; this says how much.
+    if let Some(cut) = &walk.cut {
+        report.note(format!(
+            "the file is cut at byte {}: {}. The {} complete records before it are intact, \
+             and a streamed reader recovers them",
+            crate::commas(cut.at),
+            cut.reason,
+            walk.intact()
+        ));
+    }
+
+    if keyframe_delta {
+        check_keyframe_delta(data, &walk, &mut report);
+    } else {
+        check_gaussian_birth(data, &walk, &mut report);
     }
 
     report
+}
+
+/// The two checks that only a reader can perform: open the file, then decode it.
+///
+/// Opening it the way a seeking client would is where the front-matter refusals fire — an
+/// unimplemented temporal model, an unimplemented quantization scheme. Decoding the chunks
+/// is where the rest do, and there is no substitute for it: the framing walk above steps
+/// over a chunk by its declared length, so an unimplemented stream codec and an
+/// out-of-range window index are both invisible to everything before this point. Both are
+/// in the invalid corpus, and both used to validate clean.
+fn check_gaussian_birth(data: &[u8], walk: &Walk, report: &mut Report) {
+    if let Err(error) = fourdgs::indexed_reader::open_indexed(&mut BytesReadable::new(data)) {
+        report.refused(
+            "a seeking reader cannot open this file: ",
+            &error,
+            Some(walk),
+            None,
+        );
+        // A file that will not open will not decode either, and the second error would say
+        // the same thing about the same byte.
+        return;
+    }
+    if let Err((error, site)) = refusal::scan_chunks(BytesReadable::new(data)) {
+        report.refused("a chunk does not decode: ", &error, Some(walk), site);
+    }
+}
+
+/// The same, for the temporal model whose chunks are keyframes and differences.
+///
+/// `decode_indexed` is the model's own reader, so this is the same statement as the branch
+/// above — open the file the way a client would, and decode what it carries — expressed in
+/// the reader the file's declared model actually needs. The alternative, which is what
+/// both validators did until now, is to run the gaussian-birth reader over it and report
+/// its refusal as a fault in the file.
+fn check_keyframe_delta(data: &[u8], walk: &Walk, report: &mut Report) {
+    if let Err(error) = fourdgs::keyframe_delta_file::decode_indexed(data) {
+        report.refused(
+            "a seeking reader cannot open this file: ",
+            &error,
+            Some(walk),
+            None,
+        );
+    }
 }
 
 /// Every step and origin must be finite (spec §5.3).
@@ -427,8 +591,23 @@ fn spell(v: f64) -> String {
 /// True for the opcodes the specification defines. Everything else is either the
 /// application range or a record from a version this build does not implement, and both
 /// are skipped rather than refused.
+///
+/// The provenance family is listed by name rather than by range: `0x20`-`0x2F` is reserved
+/// as a whole, and only six of those numbers are defined. Calling the other ten
+/// "specified" would silence the note that tells a reader a record came from a later
+/// revision; calling the six of them "unknown" — which is what this did before — reported
+/// four notes about a conforming file that the Python validator says nothing about.
 fn is_specified(opcode: u8) -> bool {
     (op::HEADER..=op::AUDIO_DATA).contains(&opcode)
+        || matches!(
+            opcode,
+            op::COORDINATE_FRAME
+                | op::SENSOR_CALIBRATION
+                | op::RIG_TRAJECTORY
+                | op::GEODETIC_ANCHOR
+                | op::OBJECT_TABLE
+                | op::OBJECT_TRACK
+        )
 }
 
 fn validate_audio_source(source: &rec::AudioSource, scene_duration: f64, report: &mut Report) {
@@ -518,7 +697,7 @@ fn validate_audio_source(source: &rec::AudioSource, scene_duration: f64, report:
 /// shifts every offset the index holds, which produces a corrupt file rather than the
 /// file from a newer writer the caller was asking for.
 #[cfg(test)]
-fn fixture(extra: Vec<Vec<u8>>) -> Vec<u8> {
+pub fn sample_file(extra: Vec<Vec<u8>>) -> Vec<u8> {
     use fourdgs::{GaussianSet, WriteOptions};
     let mut g = GaussianSet::default();
     // Spread over the unit cube, and irregularly: an encoder derives its quantization grid
@@ -554,7 +733,7 @@ fn fixture(extra: Vec<Vec<u8>>) -> Vec<u8> {
 
 #[cfg(test)]
 fn minimal() -> Vec<u8> {
-    fixture(Vec::new())
+    sample_file(Vec::new())
 }
 
 #[cfg(test)]
@@ -615,8 +794,8 @@ mod tests {
         report
             .findings
             .iter()
-            .filter(|(s, _)| *s == Severity::Error)
-            .map(|(_, m)| m.clone())
+            .filter(|f| f.severity == Severity::Error)
+            .map(|f| f.message.clone())
             .collect()
     }
 
@@ -752,6 +931,30 @@ mod tests {
         let report = validate(b"not a 4dgs file at all");
         assert!(!report.ok());
         assert_eq!(report.findings.len(), 1);
+        // And named. "Both readers raised an error" is not agreement — one of them may
+        // have refused for the wrong reason, which is the failure a negative test is
+        // supposed to catch and cannot without the identifier.
+        let named = report.findings[0]
+            .refusal
+            .as_ref()
+            .expect("a refusal the specification names");
+        assert_eq!(named.code, fourdgs::error::refusal::MAGIC_MISMATCH);
+        assert_eq!(named.site.as_ref().unwrap().offset, 0);
+    }
+
+    #[test]
+    fn a_version_this_reader_does_not_implement_is_a_different_refusal_from_a_bad_magic() {
+        // The fix differs — a newer reader, or a different file — so the identifiers do
+        // too, and a tool that collapsed them would send its reader looking for the wrong
+        // one.
+        let mut data = minimal();
+        data[5] = b'9';
+        let report = validate(&data);
+        let named = report.findings[0].refusal.as_ref().expect("a refusal");
+        assert_eq!(
+            named.code,
+            fourdgs::error::refusal::UNSUPPORTED_MAJOR_VERSION
+        );
     }
 
     #[test]
@@ -763,7 +966,7 @@ mod tests {
         assert!(report
             .findings
             .iter()
-            .any(|(_, m)| m.contains("does not end with the magic")));
+            .any(|f| f.message.contains("does not end with the magic")));
     }
 
     #[test]
@@ -781,7 +984,7 @@ mod tests {
             report
                 .findings
                 .iter()
-                .any(|(_, m)| m.contains("summary CRC mismatch")),
+                .any(|f| f.message.contains("summary CRC mismatch")),
             "{:?}",
             report.findings
         );
@@ -798,13 +1001,47 @@ mod tests {
         let mut private = vec![0x81];
         private.extend_from_slice(&2u64.to_le_bytes());
         private.extend_from_slice(b"hi");
-        let data = fixture(vec![record, private]);
+        let data = sample_file(vec![record, private]);
         let report = validate(&data);
         assert!(report.ok(), "{:?}", report.findings);
         assert!(report
             .findings
             .iter()
-            .any(|(s, m)| *s == Severity::Note && m.contains("unknown record 0x7F")));
+            .any(|f| f.severity == Severity::Note && f.message.contains("unknown record 0x7F")));
+    }
+
+    #[test]
+    fn a_provenance_record_is_not_an_unknown_one() {
+        // Both are skipped, and a reader that met either still decodes the file — but the
+        // two say different things about where the record came from, and the Python
+        // validator has always said the first. Four notes about a conforming capture is
+        // what this reported before, against Python's silence.
+        let frame = rec::CoordinateFrame {
+            handedness: 1,
+            up_axis: 2,
+            forward_axis: 1,
+            length_unit: 1,
+            metres_per_unit: 1.0,
+            ..Default::default()
+        }
+        .encode(&[]);
+        // The reserved tail of the same family, which is the case the note does apply to.
+        let mut reserved = vec![0x2Fu8];
+        reserved.extend_from_slice(&0u64.to_le_bytes());
+
+        let report = validate(&sample_file(vec![frame, reserved]));
+        assert!(report.ok(), "{:?}", report.findings);
+        let notes: Vec<&str> = report.findings.iter().map(|f| f.message.as_str()).collect();
+        assert!(
+            !notes.iter().any(|m| m.contains("unknown record 0x20")),
+            "{notes:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|m| m.contains("reserved provenance record 0x2F")),
+            "{notes:?}"
+        );
     }
 
     #[test]

@@ -22,6 +22,47 @@ All notable changes to the Rust crate are documented here, following
   identifier and `fourdgs_last_error()` always describe one failure and a later error never inherits
   an earlier identifier. `tests/capi_refusal.rs` reads it the way C does and `capi_smoke.c` proves
   it links and compiles as C.
+- **Inspect and validate, to the diagnostic bar the format asks for.** The `4dgs` tool already
+  walked records and checked files; what it could not do is the thing its holder actually wants,
+  which is to be told _which_ rule a file broke and _where_. It now is.
+
+  - **`4dgs validate` names the refusal and the byte.** Findings still read word for word as the
+    Python validator's — the identifier arrives on a line of its own beneath the finding it belongs
+    to, so anything filtering on `error:`/`warning:`/`note:` sees exactly what it saw before. The
+    identifier is `Error::refusal_code`'s, the same string the conformance corpus is written
+    against; the byte comes from the tool's own framing walk, since an error is raised where a value
+    was parsed rather than where its bytes sit.
+  - **It decodes the chunks, one at a time.** A framing walk steps over a chunk by its declared
+    length, so a fault inside a chunk's streams is invisible to it — two of the invalid corpus's
+    seven variants are exactly that, and both used to validate clean. All seven are now refused, by
+    the identifier the corpus names, with the byte. On the indexed path exactly one chunk is
+    resident at a time.
+  - **It knows `keyframe-delta`.** Every structural check assumed the gaussian-birth chunk shape, so
+    a conforming keyframe-delta file came back with seven errors and an `INVALID`. The Header's
+    declared model now selects the reader, and the model's own `decode_indexed` is what opens it.
+  - **A provenance record is no longer reported as an unknown one.** `0x20`-`0x25` are defined, so
+    they are skipped in silence; `0x26`-`0x2F` is reserved and keeps the note, in the Python
+    validator's wording. Four spurious notes about a conforming capture are gone.
+
+- **`4dgs inspect` reports CRC status per record.** The only checksum the format defines is the
+  Footer's `summary_crc`, so the new column says whether the checksum covers a given record and
+  whether it agrees — `ok`, `MISMATCH`, or `-` for a record nothing covers — with the covered byte
+  range named beneath the table. `--json` carries the same as a per-record `"crc"` and a
+  `"summary_crc"` object.
+
+- **A truncated file is reported rather than refused at the first byte that failed.** `inspect`
+  lists every record it could frame, then names the cut, the byte, and how many complete records
+  before it a streamed reader keeps; `validate` adds the same as a note. Records are
+  length-prefixed, so that prefix is genuinely intact — saying only that the file stopped reading
+  left its holder to guess whether anything was salvageable.
+
+### Changed
+
+- **Exit code 3: the tool could not run.** A missing file, an unreadable one, or an argument the
+  tool does not understand now exits 3 rather than 1. `1` is an answer about a file — it was read,
+  and it is bad; `3` is the absence of an answer. A pipeline that saw 1 for both could not tell a
+  corrupt asset from a typo in a path, which makes the tool indistinguishable from a broken one on
+  the day it matters. `0`, `1` and `2` are unchanged.
 
 ## [0.4.0] - 2026-08-10
 

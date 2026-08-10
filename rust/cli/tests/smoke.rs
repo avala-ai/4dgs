@@ -224,7 +224,213 @@ fn the_usage_message_is_served_rather_than_run() {
     assert_eq!(out.status.code(), Some(0));
     assert!(stdout(&out).contains("4dgs info"));
     assert_eq!(run(&["--version"]).status.code(), Some(0));
-    assert_eq!(run(&["frobnicate", "x"]).status.code(), Some(1));
+    // 3, not 1: a command nobody can parse is the absence of an answer about a file, and
+    // exit 1 is an answer about a file. See `EXIT_TOOL`.
+    assert_eq!(run(&["frobnicate", "x"]).status.code(), Some(3));
+}
+
+#[test]
+fn a_file_the_tool_cannot_read_is_told_apart_from_a_file_it_refuses() {
+    // The distinction the exit codes exist for. A pipeline that saw 1 for both could not
+    // tell a corrupt asset from a typo in a path, which makes the tool indistinguishable
+    // from a broken one on the day it matters.
+    let missing = std::env::temp_dir().join("fourdgs-cli-no-such-file.4dgs");
+    std::fs::remove_file(&missing).ok();
+    for command in ["info", "validate", "inspect", "decode"] {
+        let out = run(&[command, missing.to_str().unwrap()]);
+        assert_eq!(
+            out.status.code(),
+            Some(3),
+            "`{command}` reported a missing file as a verdict on its contents"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// The refusal corpus knows the right answer; this is the tool checked against it.
+
+/// The refusal identifier the corpus says a reader must produce for this variant.
+///
+/// The expectation is read from the corpus rather than written here, so a test that
+/// asserted the wrong identifier would have to be wrong in the same way the generator is.
+/// The file is `{"refused": "<id>"}` and nothing else, which is under the bar for a JSON
+/// dependency in a tool whose whole point is a small dependency tree.
+fn expected_refusal(json_path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(json_path).ok()?;
+    let rest = text.split("\"refused\"").nth(1)?;
+    let rest = rest.split(':').nth(1)?;
+    let start = rest.find('"')? + 1;
+    let end = rest[start..].find('"')? + start;
+    Some(rest[start..end].to_string())
+}
+
+/// Every file in the invalid corpus, with the identifier it must be refused for.
+fn invalid_corpus() -> Vec<(String, PathBuf, String)> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/conformance/data/invalid");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, PathBuf, String)> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "4dgs"))
+        .filter_map(|p| {
+            let code = expected_refusal(&p.with_extension("json"))?;
+            let name = p.file_stem()?.to_string_lossy().into_owned();
+            Some((name, p, code))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn every_invalid_variant_is_refused_by_its_own_identifier() {
+    // The strongest evidence there is that this tool is right, because the corpus already
+    // knows the answer and the tool had no hand in writing it. "Refused" alone is not the
+    // property: a reader that refuses every one of these for the wrong reason passes a
+    // test that only checks the exit code, and that is precisely the failure the invalid
+    // corpus was built to catch.
+    let corpus = invalid_corpus();
+    if corpus.is_empty() {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI generates the corpus before this suite, so an empty one is a test that \
+             silently did not run"
+        );
+        return;
+    }
+    for (name, path, code) in &corpus {
+        let out = run(&["validate", path.to_str().unwrap()]);
+        let text = stdout(&out);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{name} must be refused, and non-zero is how a pipeline learns it: {text}"
+        );
+        assert!(
+            text.contains(&format!("refusal {code}")),
+            "{name} must be refused as `{code}`, and the tool said: {text}"
+        );
+        // And the byte, which is the question its holder actually has. Every one of these
+        // is placeable: four in the front matter, two inside a chunk the tool decodes.
+        assert!(
+            text.contains(&format!("refusal {code} at byte ")),
+            "{name} named the refusal but not where it fired: {text}"
+        );
+    }
+    assert_eq!(
+        corpus.len(),
+        7,
+        "the invalid corpus is seven variants; a run that saw a different number is \
+         checking a corpus this test has not been read against"
+    );
+}
+
+#[test]
+fn a_conforming_keyframe_delta_file_is_valid() {
+    // It was not, in either validator: every structural check assumed the gaussian-birth
+    // chunk shape, so a file whose Chunks are keyframes and whose Delta Chunks are
+    // differences came back with seven errors and an INVALID. The Rust core implements the
+    // model — the conformance suite proves it — so refusing a file for declaring it was
+    // never a statement about the file.
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/conformance/data/keyframe");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        assert!(std::env::var_os("CI").is_none(), "CI generates the corpus");
+        return;
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "4dgs"))
+        .collect();
+    paths.sort();
+    assert!(!paths.is_empty(), "no keyframe-delta variants to check");
+    for path in &paths {
+        let out = run(&["validate", path.to_str().unwrap()]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{} is a conforming file: {}",
+            path.display(),
+            stdout(&out)
+        );
+        assert_eq!(stdout(&out).trim(), "valid");
+    }
+}
+
+#[test]
+fn inspect_reports_the_crc_status_of_every_record() {
+    let Some(path) = file(INDEXED) else {
+        return;
+    };
+    let text = stdout(&run(&["inspect", path.to_str().unwrap()]));
+    // The only checksum the format defines covers the summary, so the index rows are
+    // covered and the Header is not — and saying so per record is what tells a reader
+    // whether the checksum has anything to say about the row they are looking at.
+    let cell = |record: &str| -> String {
+        text.lines()
+            .find(|l| l.contains(&format!(" {record} ")))
+            .and_then(|l| l.split_whitespace().last())
+            .unwrap_or_else(|| panic!("no {record} row in {text}"))
+            .to_string()
+    };
+    assert_eq!(cell("ChunkIndex"), "ok", "{text}");
+    assert_eq!(cell("Header"), "-", "{text}");
+    assert!(
+        text.contains("crc: the Footer's summary checksum covers"),
+        "{text}"
+    );
+
+    let json = stdout(&run(&["inspect", "--json", path.to_str().unwrap()]));
+    assert!(json.contains("\"crc\": \"ok\""), "{json}");
+    assert!(json.contains("\"crc\": null"), "{json}");
+    assert!(json.contains("\"ok\": true"), "{json}");
+}
+
+#[test]
+fn a_corrupted_summary_is_reported_against_the_records_it_covers() {
+    let Some(path) = file(INDEXED) else {
+        return;
+    };
+    let mut data = std::fs::read(&path).unwrap();
+    // Inside the first summary record's content rather than its framing: the walk still
+    // ends where it should, and the checksum is the only thing that can notice.
+    let tail = data.len() - (9 + 20 + 8);
+    let summary_start = u64::from_le_bytes(data[tail + 9..tail + 17].try_into().unwrap()) as usize;
+    assert!(summary_start > 0, "the variant was selected for its index");
+    data[summary_start + 9 + 4] ^= 0xFF;
+    let broken = std::env::temp_dir().join("fourdgs-cli-bad-summary.4dgs");
+    std::fs::write(&broken, &data).unwrap();
+
+    let text = stdout(&run(&["inspect", broken.to_str().unwrap()]));
+    assert!(text.contains("MISMATCH"), "{text}");
+    // And the framing is still whole, which is the distinction: a checksum that disagrees
+    // says the index is untrustworthy, not that the file stopped being a 4dgs file.
+    assert!(!text.contains("truncated at byte"), "{text}");
+    std::fs::remove_file(&broken).ok();
+}
+
+#[test]
+fn a_cut_file_reports_what_was_decodable_rather_than_only_that_it_stopped() {
+    let Some(path) = file(INDEXED) else {
+        return;
+    };
+    let data = std::fs::read(&path).unwrap();
+    let cut = std::env::temp_dir().join("fourdgs-cli-cut.4dgs");
+    std::fs::write(&cut, &data[..data.len() / 2]).unwrap();
+
+    let out = run(&["inspect", cut.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert!(text.contains("truncated at byte"), "{text}");
+    assert!(text.contains("intact prefix"), "{text}");
+    // Records, not one error line. Reporting only that the file stopped leaves its holder
+    // to guess whether anything is salvageable, which is the question they had.
+    assert!(text.contains("Header"), "{text}");
+    assert!(text.contains("Quantization"), "{text}");
+    assert_eq!(out.status.code(), Some(1), "a cut file is not a whole one");
+
+    let notes = stdout(&run(&["validate", cut.to_str().unwrap()]));
+    assert!(notes.contains("a streamed reader recovers them"), "{notes}");
+    std::fs::remove_file(&cut).ok();
 }
 
 #[test]
@@ -494,10 +700,13 @@ fn both_validators_refuse_the_invalid_corpus_the_same_way() {
         //   prefixes its error kind and Python does not. Closing that means changing
         //   messages in both languages.
         // * files whose only fault is inside a chunk's streams, such as an unimplemented
-        //   stream codec. NEITHER validator reports those, because `validate` walks the
-        //   framing and opens the file the way a seeking client would; it never decodes a
-        //   stream. The decoders do refuse them — the conformance runners prove that —
-        //   so this is a thinness in the validators, not a hole in the readers.
+        //   stream codec. This validator now decodes the chunks and reports them, named
+        //   and placed; the Python one still walks the framing and opens the file the way
+        //   a seeking client would, so it never sees inside a stream and calls those files
+        //   clean. That is the direction a divergence is allowed to run — this reader says
+        //   more, and nothing it says contradicts the other — and #125's Python-side
+        //   counterpart is what closes it. `every_invalid_variant_is_refused_by_its_own_-
+        //   identifier` is where the added reporting is held to the corpus.
         let wording_is_contract =
             name.contains("TemporalModel") || name.contains("QuantizationScheme");
         if wording_is_contract {
