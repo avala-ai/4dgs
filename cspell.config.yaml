@@ -134,6 +134,8 @@ words:
   - MSVC
   - fprintf
   - DFOURDGS
+  # Python standard-library names that appear in release notes
+  - hypot
   # Git and workflow vocabulary
   - reflog
   - oneline
