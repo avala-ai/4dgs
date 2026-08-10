@@ -106,6 +106,12 @@ Future<void> main(List<String> args) async {
   }
   try {
     stdout.writeln(await run(args.single));
+  } on FourdgsException catch (error) {
+    // Both read paths answer the invalid corpus, and they reach the Header by
+    // different routes — one front to back, one through the Footer. A check
+    // placed on only one of them refuses half the files it should, and only
+    // running both can show that.
+    stdout.writeln(refusalJson(error));
   } catch (error) {
     stderr.writeln(error);
     exit(1);
