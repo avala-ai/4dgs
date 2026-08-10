@@ -1023,7 +1023,14 @@ fn check_window_indices(state: &State, windows: &[(f64, f64)]) -> Result<()> {
     Ok(())
 }
 
-fn compose_chain(
+/// Compose the chain ending at `entry`, and check the state it produces.
+///
+/// Public because composing one entry is the whole of what a validator needs: it asks
+/// whether each chunk decodes, not what any of them decoded to, and holding every state to
+/// answer that costs many times the file. A caller that wants the states wants
+/// [`decode_indexed`]; a caller that wants the verdict calls this per entry and drops what
+/// it returns.
+pub fn compose_chain(
     data: &[u8],
     index: &[rec::ChunkIndexEntry],
     entry: &rec::ChunkIndexEntry,
@@ -1048,8 +1055,21 @@ fn compose_chain(
     Ok(state)
 }
 
-/// Read the Footer, then the index, then compose each chunk by walking its chain.
-pub fn decode_indexed(data: &[u8]) -> Result<(DecodedSequence, Vec<rec::ChunkIndexEntry>)> {
+/// A `keyframe-delta` file's front matter and its index, with nothing composed.
+///
+/// What [`decode_indexed`] reads before it decodes anything, split out because two callers
+/// want only this much: one that means to compose a single instant, and one that means to
+/// check each chunk in turn and keep none of them.
+#[derive(Debug, Clone)]
+pub struct IndexedSequence {
+    pub header: rec::Header,
+    pub quantization: rec::Quantization,
+    pub windows: Vec<(f64, f64)>,
+    pub index: Vec<rec::ChunkIndexEntry>,
+}
+
+/// Read the Footer and the index, and check that the index tiles the timeline.
+pub fn open_indexed(data: &[u8]) -> Result<IndexedSequence> {
     check_magic(data)?;
     let mut header: Option<rec::Header> = None;
     let mut quant: Option<rec::Quantization> = None;
@@ -1087,6 +1107,23 @@ pub fn decode_indexed(data: &[u8]) -> Result<(DecodedSequence, Vec<rec::ChunkInd
         }
     }
     check_tiling(&index)?;
+
+    Ok(IndexedSequence {
+        header,
+        quantization,
+        windows,
+        index,
+    })
+}
+
+/// Read the Footer, then the index, then compose each chunk by walking its chain.
+pub fn decode_indexed(data: &[u8]) -> Result<(DecodedSequence, Vec<rec::ChunkIndexEntry>)> {
+    let IndexedSequence {
+        header,
+        quantization,
+        windows,
+        index,
+    } = open_indexed(data)?;
 
     let mut chunks: Vec<ChunkInfo> = Vec::with_capacity(index.len());
     for entry in &index {

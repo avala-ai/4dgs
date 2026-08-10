@@ -109,10 +109,24 @@ fn main() -> ExitCode {
 /// would place the refusal may itself refuse. That costs the byte, not the identifier.
 fn locate(path: &str, error: &fourdgs::Error) -> Option<refusal::Named> {
     error.refusal_code()?;
-    let walk = fourdgs::readable::FileReadable::open(path)
-        .and_then(|mut source| refusal::walk(&mut source))
-        .ok();
-    refusal::describe(error, walk.as_ref(), None)
+    let Ok(mut source) = fourdgs::readable::FileReadable::open(path) else {
+        return refusal::describe(error, None, None);
+    };
+    let walk = refusal::walk(&mut source).ok();
+    // A cell because the fetch is called once per candidate record and a shared closure
+    // cannot hold the reader mutably. Only Header and Quantization records are ever
+    // fetched, and only their content — nothing here reads a payload.
+    let source = std::cell::RefCell::new(source);
+    let fetch = |frame: &refusal::Frame| {
+        use fourdgs::readable::Readable;
+        let at = frame.offset + fourdgs::serialization::RECORD_HEADER_SIZE as u64;
+        source.borrow_mut().read(at, frame.length).ok()
+    };
+    let framing = walk.as_ref().map(|walk| refusal::Framing {
+        walk,
+        fetch: &fetch,
+    });
+    refusal::describe(error, framing, None)
 }
 
 /// A count with thousands separators, matching the Python tool's `{:,}`.

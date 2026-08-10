@@ -32,17 +32,32 @@ All notable changes to the Rust crate are documented here, following
     identifier is `Error::refusal_code`'s, the same string the conformance corpus is written
     against; the byte comes from the tool's own framing walk, since an error is raised where a value
     was parsed rather than where its bytes sit.
-  - **It decodes the chunks, one at a time.** A framing walk steps over a chunk by its declared
-    length, so a fault inside a chunk's streams is invisible to it — two of the invalid corpus's
-    seven variants are exactly that, and both used to validate clean. All seven are now refused, by
-    the identifier the corpus names, with the byte. On the indexed path exactly one chunk is
-    resident at a time.
+  - **It decodes the chunks, one at a time — every chunk, and every band each one declares.** A
+    framing walk steps over a chunk by its declared length, so a fault inside a chunk's streams is
+    invisible to it — two of the invalid corpus's seven variants are exactly that, and both used to
+    validate clean. All seven are now refused, by the identifier the corpus names, with the byte.
+    Exactly one chunk is resident at a time on **both** paths: the indexed one reads chunk by chunk
+    through the index, and a file with no index is walked record by record rather than decoded in
+    one call, which is what used to make the resident set the whole scene. Spherical-harmonic bands
+    are decoded rather than capped at band 0 — capping is a rendering choice, and an SH Band Stream
+    carrying a codec this build does not implement is a file that does not decode — and the byte
+    names the band record itself, not the Chunk it belongs to.
   - **It knows `keyframe-delta`.** Every structural check assumed the gaussian-birth chunk shape, so
     a conforming keyframe-delta file came back with seven errors and an `INVALID`. The Header's
-    declared model now selects the reader, and the model's own `decode_indexed` is what opens it.
+    declared model now selects the reader, and the model's own reader is what opens it — one chain
+    composed at a time, so a refusal names the index entry it came from and a long sequence is never
+    resident all at once.
+  - **A refusal is placed at the record that carries the refused value.** Nothing in the framing
+    forbids a second Header or a second Quantization record, and both read paths check every copy
+    they meet — so a file whose first Header is fine and whose second declares a model this build
+    does not implement is refused at the second. The byte now says so; it used to name the first
+    record of that kind, which is an offset pointing at a record with nothing wrong with it.
   - **A provenance record is no longer reported as an unknown one.** `0x20`-`0x25` are defined, so
-    they are skipped in silence; `0x26`-`0x2F` is reserved and keeps the note, in the Python
-    validator's wording. Four spurious notes about a conforming capture are gone.
+    they are skipped in silence; `0x26`-`0x2F` is reserved and keeps the note. The note names that
+    range and §5.15.8, where both validators said `0x24-0x2F, section 5.15.6` — true before the
+    object layer was assigned `0x24` and `0x25` out of it, and since then a citation pointing at two
+    records that exist. Both tools still note the same opcodes. Four spurious notes about a
+    conforming capture are gone.
 
 - **`4dgs inspect` reports CRC status per record.** The only checksum the format defines is the
   Footer's `summary_crc`, so the new column says whether the checksum covers a given record and
@@ -55,6 +70,24 @@ All notable changes to the Rust crate are documented here, following
   before it a streamed reader keeps; `validate` adds the same as a note. Records are
   length-prefixed, so that prefix is genuinely intact — saying only that the file stopped reading
   left its holder to guess whether anything was salvageable.
+
+  This holds for a file cut inside its own **Footer** too. The Footer is where the summary checksum
+  is declared, so `inspect` reads it to say which records that checksum covers; asking for a record
+  the file was cut inside returned `Truncated` and ended the command before a single row was
+  printed. Coverage is now read only from a whole Footer, and a file cut inside one reports its
+  records and declares no checksum rather than nothing at all.
+
+- **The summary checksum is computed over bounded reads.** `summary_start` is eight bytes off an
+  untrusted file and may name byte 8, which made verifying the checksum a single allocation of
+  essentially the whole file. `serialization::Crc32` is the same CRC-32 fed in pieces, and `inspect`
+  feeds it a megabyte at a time.
+
+- **Three additive library items, each of which exists because a caller wants the verdict rather
+  than the data.** `serialization::Crc32`, above. `keyframe_delta_file::open_indexed` returns an
+  `IndexedSequence` — a file's front matter and index with nothing composed — and
+  `keyframe_delta_file::compose_chain` composes the chain ending at one index entry.
+  `decode_indexed` is those two in a loop and is unchanged; what it cannot do is answer "does every
+  chunk decode?" without keeping every state it decoded.
 
 ### Changed
 

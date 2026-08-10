@@ -27,7 +27,7 @@ jobs:
             echo "conformance data: ${size_kb} KiB"
             [ "$size_kb" -le 2560 ] || { echo "::error::conformance data over budget"; exit 1; }
           fi
-      - name: Rust sources under 1100 KB
+      - name: Rust sources under 1200 KB
         # Sources only: this job builds nothing, so target/ is not here to measure. A
         # vendored dependency would show up as a budget failure, which is the point —
         # everything these crates need comes from crates.io via Cargo.toml.
@@ -41,8 +41,12 @@ jobs:
         # layer's records, composition module, indexed sampling, and conformance coverage
         # landed together; 1000 after the keyframe-delta model (composition, whole-file
         # write/decode, both read paths, and its encode-roundtrip runners) landed; 1100 after
-        # the object layer's composed-state entry point and its test. A budget
-        # that tight stops being a budget and starts being a tax
+        # the object layer's composed-state entry point and its test; 1200 after the `4dgs`
+        # validator learned to place a refusal — the refusal-placement walk and the
+        # chunk-decode scan are new files beside the tool's own, and the CLI tests that read
+        # their expectations out of the invalid corpus are another. 1116 against 1100 is not
+        # headroom, it is the next source file failing a gate about vendored dependencies.
+        # A budget that tight stops being a budget and starts being a tax
         # on the next feature, so each raise leaves a little headroom. The number moves
         # when the tree grows deliberately, which is the one thing it is not meant to
         # catch — it exists so that a vendored dependency, which arrives in hundreds of
@@ -55,7 +59,7 @@ jobs:
         run: |
           size_kb=$(du -s rust | cut -f1)
           echo "rust: ${size_kb} KiB"
-          [ "$size_kb" -le 1100 ] || { echo "::error::rust is ${size_kb} KiB, over the 1100 KiB budget"; exit 1; }
+          [ "$size_kb" -le 1200 ] || { echo "::error::rust is ${size_kb} KiB, over the 1200 KiB budget"; exit 1; }
 
       - name: TypeScript sources under 896 KB
         # Sources only: this job installs nothing and builds nothing, so node_modules

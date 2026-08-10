@@ -329,13 +329,24 @@ impl Coverage {
     }
 }
 
+/// How much of the summary is read at once while its checksum is computed.
+///
+/// The region is `[summary_start, footer_start)`, and `summary_start` is eight bytes off an
+/// untrusted file: a Footer may name byte 8, which makes the region the whole file. Sizing
+/// one allocation from it is how a tool asked to look at a bad file runs out of memory
+/// reporting on it, so the checksum is fed in blocks of this size instead (principle 1).
+const CRC_BLOCK: u64 = 1024 * 1024;
+
 /// Read the Footer and check the summary it declares.
 ///
 /// `None` when the file declares no summary checksum, which is a property of the file
 /// rather than a failure: `write_crc` is an encoder option and a file written without it
-/// has nothing here to verify.
+/// has nothing here to verify. `None` too when the file was cut inside its own Footer —
+/// the walk lists that record because its declared length is the fault, but its content is
+/// not in the file, and a read of it would end `inspect` through the error path with the
+/// intact-prefix report unprinted. Which is exactly the file this command exists for.
 fn coverage(source: &mut FileReadable, walk: &crate::refusal::Walk) -> Result<Option<Coverage>> {
-    let Some(frame) = walk.first(op::FOOTER) else {
+    let Some(frame) = walk.first_intact(op::FOOTER) else {
         return Ok(None);
     };
     let content = source.read(
@@ -349,11 +360,17 @@ fn coverage(source: &mut FileReadable, walk: &crate::refusal::Walk) -> Result<Op
     // The summary ends where the Footer begins — taken from the walk rather than computed
     // from a footer's expected size, so a Footer that a later revision extends does not
     // move the region out from under the check.
-    let summary = source.read(footer.summary_start, frame.offset - footer.summary_start)?;
+    let mut crc = fourdgs::serialization::Crc32::new();
+    let mut at = footer.summary_start;
+    while at < frame.offset {
+        let take = (frame.offset - at).min(CRC_BLOCK);
+        crc.update(&source.read(at, take)?);
+        at += take;
+    }
     Ok(Some(Coverage {
         start: footer.summary_start,
         end: frame.offset,
-        ok: fourdgs::serialization::crc32(&summary) == footer.summary_crc,
+        ok: crc.finish() == footer.summary_crc,
     }))
 }
 

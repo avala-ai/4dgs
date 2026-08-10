@@ -326,6 +326,173 @@ fn every_invalid_variant_is_refused_by_its_own_identifier() {
     );
 }
 
+// ---------------------------------------------------------------------------------------
+// A fault inside a stream, in each of the places a stream can be.
+//
+// The framing walk steps over a record by its declared length, so nothing above this line
+// can see inside one. These take a conforming corpus file, make exactly one stream
+// undecodable, and require the tool to say so — with the identifier the corpus uses for
+// that fault and the byte of the record the fault is actually in.
+
+/// Every top-level record: its opcode, where it starts, and how long its content is.
+///
+/// The framing, done by hand, because the point of these tests is to reach a byte inside a
+/// record and the tool's own walk is one of the things under test.
+fn framing(data: &[u8]) -> Vec<(u8, usize, usize)> {
+    let mut out = Vec::new();
+    let mut at = 8usize;
+    while at + 9 <= data.len().saturating_sub(8) {
+        let opcode = data[at];
+        let length = u64::from_le_bytes(data[at + 1..at + 9].try_into().unwrap()) as usize;
+        out.push((opcode, at, length));
+        let Some(next) = at.checked_add(9 + length).filter(|n| *n <= data.len()) else {
+            break;
+        };
+        at = next;
+    }
+    out
+}
+
+/// Make the first record with this opcode declare a stream codec no build implements.
+///
+/// Returns the record's offset. A stream header is `attribute_id, width, mode,
+/// stream_codec, channels`, so this is one byte — the same fault the corpus's
+/// `UnknownStreamCodec` variant carries, moved into whichever record the caller names.
+fn break_the_codec_in(data: &mut [u8], opcode: u8) -> Option<u64> {
+    let (_, at, length) = framing(data).into_iter().find(|(o, ..)| *o == opcode)?;
+    let content = &data[at + 9..at + 9 + length];
+    let stream_at = match opcode {
+        // A Chunk's streams follow its header, whose length varies with the compression
+        // name it carries — so the library is what says where they start.
+        0x05 => {
+            let (_, streams) = fourdgs::records::parse_chunk(content).ok()?;
+            content.len() - streams.len()
+        }
+        // An SH Band Stream record is the band index, then the stream (spec §5.7).
+        0x07 => 1,
+        _ => return None,
+    };
+    data[at + 9 + stream_at + 3] = 9;
+    Some(at as u64)
+}
+
+/// A corpus file with one byte changed, written where a test can hand it to the tool.
+fn broken_copy(source: &Path, name: &str, opcode: u8) -> Option<(PathBuf, u64)> {
+    let mut data = std::fs::read(source).ok()?;
+    let at = break_the_codec_in(&mut data, opcode)?;
+    let path = std::env::temp_dir().join(name);
+    std::fs::write(&path, &data).ok()?;
+    Some((path, at))
+}
+
+#[test]
+fn a_fault_inside_a_spherical_harmonic_band_is_not_reported_valid() {
+    // Bands were fetched at a cap of 0 — a rendering choice, applied to a question that is
+    // not about rendering. An SH Band Stream is a stream like any other, so a band record
+    // carrying a codec this build does not implement is a file that does not decode; with
+    // the cap in place the tool decoded the base chunk, found it healthy, and printed
+    // `valid`. And the byte names the band record, not the Chunk it belongs to: the two
+    // are thousands of bytes apart, and the Chunk's own streams are fine.
+    let Some(source) = file(SH_DEGREE_2) else {
+        return;
+    };
+    let Some((path, at)) = broken_copy(&source, "fourdgs-cli-bad-band.4dgs", 0x07) else {
+        panic!("the SHDegree2 variant carries SH Band Stream records");
+    };
+    let out = run(&["validate", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains(&format!("refusal unknown-stream-codec at byte {at} ")),
+        "{text}"
+    );
+    assert!(text.contains("SH Band Stream for band"), "{text}");
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_file_with_no_index_names_the_chunk_it_could_not_decode() {
+    // Without an index there is nothing to seek with, so this file used to be decoded in
+    // one call that either succeeded or failed — which meant the whole scene resident, and
+    // a refusal with no byte at all to report. It is walked record by record now, so the
+    // Chunk that refused is the Chunk the report names, and nothing is held past it.
+    let Some(source) = file(NO_INDEX) else {
+        return;
+    };
+    let Some((path, at)) = broken_copy(&source, "fourdgs-cli-bad-unindexed.4dgs", 0x05) else {
+        panic!("every corpus variant carries Chunk records");
+    };
+    let out = run(&["validate", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains(&format!("refusal unknown-stream-codec at byte {at} ")),
+        "{text}"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_keyframe_delta_chunk_that_does_not_decode_is_named_and_placed() {
+    // The keyframe-delta branch composed the whole sequence in one call, so a refusal
+    // inside one chunk's streams arrived with no entry to attribute it to and printed the
+    // identifier with no byte — below the contract the rest of this tool now holds. It
+    // composes one chain at a time, which is what the report needs and what keeps a long
+    // sequence from being resident all at once.
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/conformance/data/keyframe");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        assert!(std::env::var_os("CI").is_none(), "CI generates the corpus");
+        return;
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "4dgs"))
+        .collect();
+    paths.sort();
+    let source = paths.first().expect("a keyframe-delta variant");
+    let Some((path, at)) = broken_copy(source, "fourdgs-cli-bad-keyframe.4dgs", 0x05) else {
+        panic!("a keyframe-delta file carries Chunk records; they are its keyframes");
+    };
+    let out = run(&["validate", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains(&format!("refusal unknown-stream-codec at byte {at} ")),
+        "{text}"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_file_cut_inside_its_own_footer_is_still_reported_record_by_record() {
+    // The one truncation point that used to take `inspect` out through the error path
+    // before it printed a row. The Footer is where the summary checksum is declared, so
+    // the tool reads it to say which records that checksum covers — and asking for a
+    // record the file was cut inside returns `Truncated`, losing the intact-prefix report
+    // for precisely the file the report exists for.
+    let Some(source) = file(INDEXED) else {
+        return;
+    };
+    let data = std::fs::read(&source).unwrap();
+    // The Footer's content is 20 bytes and the trailing magic is 8; cutting four bytes
+    // into that content leaves the record framed and its content missing.
+    let footer_at = data.len() - (9 + 20 + 8);
+    assert_eq!(data[footer_at], 0x02, "the last record is the Footer");
+    let path = std::env::temp_dir().join("fourdgs-cli-cut-footer.4dgs");
+    std::fs::write(&path, &data[..footer_at + 9 + 4]).unwrap();
+
+    let out = run(&["inspect", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "a cut file is not a whole one");
+    assert!(text.contains("Header"), "{text}");
+    assert!(text.contains("Footer"), "{text}");
+    assert!(text.contains("truncated at byte"), "{text}");
+    assert!(text.contains("intact prefix"), "{text}");
+    // And no checksum verdict is invented for a Footer nobody could read.
+    assert!(text.contains("declares no summary checksum"), "{text}");
+    std::fs::remove_file(&path).ok();
+}
+
 #[test]
 fn a_conforming_keyframe_delta_file_is_valid() {
     // It was not, in either validator: every structural check assumed the gaussian-birth

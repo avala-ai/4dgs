@@ -11,7 +11,7 @@
 //! Two validators that disagree about whether a file conforms are worse than one, so where
 //! the two differ the Python module is the reference and this is the bug.
 //!
-//! Three things this validator does that the Python one does not yet, each recorded here
+//! Four things this validator does that the Python one does not yet, each recorded here
 //! because a divergence nobody wrote down is indistinguishable from a bug:
 //!
 //! * **It prints the refusal identifier and the byte.** The finding lines themselves are
@@ -25,6 +25,12 @@
 //!   keyframe-delta file as invalid, because every structural check assumed the
 //!   gaussian-birth chunk shape. The Rust core implements the model, so its validator now
 //!   validates against the model the file declares.
+//! * **Its reserved-provenance note names the range that is actually reserved.** Both
+//!   tools said `0x24-0x2F, section 5.15.6`, which was true until the object layer was
+//!   assigned `0x24` and `0x25` out of that range. The note fires on the same opcodes in
+//!   both — `0x26`-`0x2F`, the ones neither handles by name — so the two agree about every
+//!   file; only the citation differed from what §5.15 says today. See the arm that emits
+//!   it.
 
 use std::collections::BTreeMap;
 
@@ -33,7 +39,7 @@ use fourdgs::serialization::{crc32, Records, MAGIC, RECORD_HEADER_SIZE};
 use fourdgs::{opcode as op, records as rec, BytesReadable, Result};
 
 use crate::args::Args;
-use crate::refusal::{self, Named, Walk};
+use crate::refusal::{self, Framing, Named};
 use crate::{EXIT_FAILED, EXIT_OK, EXIT_TOOL, EXIT_WARNINGS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -109,10 +115,10 @@ impl Report {
         &mut self,
         prefix: &str,
         error: &fourdgs::Error,
-        walk: Option<&Walk>,
+        framing: Option<Framing>,
         site: Option<refusal::Site>,
     ) {
-        let named = refusal::describe(error, walk, site);
+        let named = refusal::describe(error, framing, site);
         self.push(Severity::Error, format!("{prefix}{error}"), named);
     }
 }
@@ -285,11 +291,22 @@ pub fn validate(data: &[u8]) -> Report {
             // The reserved tail of the provenance family, which is a different thing from
             // an unknown record: the range is spoken for, so a reader that meets one knows
             // it is looking at a record from a later revision rather than at a byte it
-            // cannot account for. Python's wording, because a note the two tools spell
-            // differently is a diff nobody can read.
+            // cannot account for.
+            //
+            // The range and the section are the ones spec §5.15 names today: `0x24` and
+            // `0x25` are the Object Table and the Object Track, defined in §5.15.6 and
+            // §5.15.7, and what is reserved is `0x26`-`0x2F` in §5.15.8. Both validators
+            // still said `0x24-0x2F, section 5.15.6`, which was true before the object
+            // layer was assigned out of that range and points a reader at two records
+            // that exist. This is the one place the wording deliberately leads Python's:
+            // the note fires on exactly the same opcodes in both tools — Python handles
+            // `0x20`-`0x25` by name and falls through only for `0x26`-`0x2F`, as this
+            // does — so the two agree about every file and disagree only about a citation
+            // that had gone stale. The Python-side correction belongs with #125's
+            // validator work.
             opcode if op::is_provenance(opcode) && !is_specified(opcode) => report.note(format!(
                 "reserved provenance record 0x{opcode:02X} — skipped, as required \
-                 (0x24-0x2F, section 5.15.6)"
+                 (0x26-0x2F, section 5.15.8)"
             )),
             opcode if !is_specified(opcode) => report.note(format!(
                 "unknown record 0x{opcode:02X} — skipped, as required"
@@ -437,10 +454,15 @@ pub fn validate(data: &[u8]) -> Report {
         ));
     }
 
+    let fetch = |frame: &refusal::Frame| frame.content(data).map(<[u8]>::to_vec);
+    let framing = Framing {
+        walk: &walk,
+        fetch: &fetch,
+    };
     if keyframe_delta {
-        check_keyframe_delta(data, &walk, &mut report);
+        check_keyframe_delta(data, framing, &mut report);
     } else {
-        check_gaussian_birth(data, &walk, &mut report);
+        check_gaussian_birth(data, framing, &mut report);
     }
 
     report
@@ -454,38 +476,78 @@ pub fn validate(data: &[u8]) -> Report {
 /// over a chunk by its declared length, so an unimplemented stream codec and an
 /// out-of-range window index are both invisible to everything before this point. Both are
 /// in the invalid corpus, and both used to validate clean.
-fn check_gaussian_birth(data: &[u8], walk: &Walk, report: &mut Report) {
-    if let Err(error) = fourdgs::indexed_reader::open_indexed(&mut BytesReadable::new(data)) {
-        report.refused(
-            "a seeking reader cannot open this file: ",
-            &error,
-            Some(walk),
-            None,
-        );
-        // A file that will not open will not decode either, and the second error would say
-        // the same thing about the same byte.
-        return;
-    }
-    if let Err((error, site)) = refusal::scan_chunks(BytesReadable::new(data)) {
-        report.refused("a chunk does not decode: ", &error, Some(walk), site);
+fn check_gaussian_birth(data: &[u8], framing: Framing, report: &mut Report) {
+    let scene = match fourdgs::indexed_reader::open_indexed(&mut BytesReadable::new(data)) {
+        Ok(scene) => scene,
+        Err(error) => {
+            report.refused(
+                "a seeking reader cannot open this file: ",
+                &error,
+                Some(framing),
+                None,
+            );
+            // A file that will not open will not decode either, and the second error would
+            // say the same thing about the same byte.
+            return;
+        }
+    };
+    if let Err((error, site)) = refusal::scan_chunks(data, framing.walk, &scene) {
+        report.refused("a chunk does not decode: ", &error, Some(framing), site);
     }
 }
 
 /// The same, for the temporal model whose chunks are keyframes and differences.
 ///
-/// `decode_indexed` is the model's own reader, so this is the same statement as the branch
-/// above — open the file the way a client would, and decode what it carries — expressed in
-/// the reader the file's declared model actually needs. The alternative, which is what
-/// both validators did until now, is to run the gaussian-birth reader over it and report
-/// its refusal as a fault in the file.
-fn check_keyframe_delta(data: &[u8], walk: &Walk, report: &mut Report) {
-    if let Err(error) = fourdgs::keyframe_delta_file::decode_indexed(data) {
-        report.refused(
-            "a seeking reader cannot open this file: ",
-            &error,
-            Some(walk),
-            None,
+/// This is the same statement as the branch above — open the file the way a client would,
+/// then decode what it carries — expressed in the reader the file's declared model actually
+/// needs. The alternative, which is what both validators did until now, is to run the
+/// gaussian-birth reader over it and report its refusal as a fault in the file.
+///
+/// Entry by entry, for the two reasons the branch above is: a composed state is a whole
+/// population and holding one per index entry costs many times the file, and an entry that
+/// refuses is an entry whose **offset** the report can name. `decode_indexed` keeps every
+/// state — which is right for a caller that wants the states and wrong for one that wants
+/// the verdict — so this drives `compose_chain` itself and drops each state as it goes.
+fn check_keyframe_delta(data: &[u8], framing: Framing, report: &mut Report) {
+    let sequence = match fourdgs::keyframe_delta_file::open_indexed(data) {
+        Ok(sequence) => sequence,
+        Err(error) => {
+            report.refused(
+                "a seeking reader cannot open this file: ",
+                &error,
+                Some(framing),
+                None,
+            );
+            return;
+        }
+    };
+    for (i, entry) in sequence.index.iter().enumerate() {
+        // The composed state is dropped here, at the end of the iteration.
+        let composed = fourdgs::keyframe_delta_file::compose_chain(
+            data,
+            &sequence.index,
+            entry,
+            &sequence.windows,
         );
+        if let Err(error) = composed {
+            let what = if entry.kind == 0 {
+                "Chunk"
+            } else {
+                "DeltaChunk"
+            };
+            report.refused(
+                "a chunk does not decode: ",
+                &error,
+                Some(framing),
+                Some(refusal::Site {
+                    offset: entry.chunk_offset,
+                    what: format!("the {what} record at index entry {i}"),
+                }),
+            );
+            // One chain's failure is every later chain's failure — they share links — so
+            // the first is the finding and the rest would be the same fault restated.
+            return;
+        }
     }
 }
 
@@ -768,14 +830,27 @@ mod tests {
     /// The same, with however many Quantization records the caller wants. More than one is
     /// legal framing, and the case the per-record check exists for.
     fn minimal_file_with(quants: &[rec::Quantization]) -> Vec<u8> {
-        let header = rec::Header {
-            duration_sec: 1.0,
-            gaussian_count: 0,
-            aabb: vec![0.0; 6],
-            ..Default::default()
-        };
+        minimal_file_headed(&["gaussian-birth"], quants)
+    }
+
+    /// The same again, with however many Header records the caller wants too, each
+    /// declaring the temporal model named. Duplicate front matter is legal framing, and a
+    /// reader checks every copy it meets — so which copy a refusal is about is a question
+    /// with a wrong answer available.
+    fn minimal_file_headed(models: &[&str], quants: &[rec::Quantization]) -> Vec<u8> {
         let mut out = MAGIC.to_vec();
-        out.extend_from_slice(&header.encode(&[]));
+        for model in models {
+            out.extend_from_slice(
+                &rec::Header {
+                    duration_sec: 1.0,
+                    gaussian_count: 0,
+                    aabb: vec![0.0; 6],
+                    temporal_model: (*model).into(),
+                    ..Default::default()
+                }
+                .encode(&[]),
+            );
+        }
         for quant in quants {
             out.extend_from_slice(&quant.encode(&[]));
         }
@@ -1041,6 +1116,88 @@ mod tests {
                 .iter()
                 .any(|m| m.contains("reserved provenance record 0x2F")),
             "{notes:?}"
+        );
+        // And the range it names is the one that is actually reserved. `0x24` and `0x25`
+        // are the Object Table and the Object Track — defined records, handled by name a
+        // few arms above — so a note saying the reserved range starts at `0x24` sends its
+        // reader looking for two records that exist. Spec §5.15 reserves `0x26`-`0x2F` in
+        // §5.15.8.
+        assert!(
+            notes
+                .iter()
+                .any(|m| m.contains("(0x26-0x2F, section 5.15.8)")),
+            "{notes:?}"
+        );
+    }
+
+    /// The byte a named refusal was placed at, for the tests below.
+    fn refused_at(report: &Report, code: &str) -> u64 {
+        report
+            .findings
+            .iter()
+            .find_map(|f| f.refusal.as_ref().filter(|n| n.code == code))
+            .unwrap_or_else(|| panic!("no `{code}` refusal in {:?}", report.findings))
+            .site
+            .as_ref()
+            .unwrap_or_else(|| panic!("`{code}` was named but not placed"))
+            .offset
+    }
+
+    /// Where the `n`th record with this opcode starts, counting from zero.
+    fn nth_record(data: &[u8], opcode: u8, n: usize) -> u64 {
+        let walk = refusal::walk(&mut BytesReadable::new(data)).expect("a walk");
+        walk.records
+            .iter()
+            .filter(|frame| frame.opcode == opcode)
+            .nth(n)
+            .expect("that many records")
+            .offset
+    }
+
+    #[test]
+    fn the_refused_header_is_the_one_that_declares_the_model_not_the_first_one() {
+        // Nothing in the framing forbids a second Header, and a reader checks each one as
+        // it meets it — so a file whose first Header is fine and whose second declares a
+        // model this build does not implement is refused *at the second*. Naming the first
+        // gives a byte that points at a record with nothing wrong with it, which is worse
+        // than no byte: an offset is believed.
+        let data = minimal_file_headed(&["gaussian-birth", "frame-sequence"], &[grids()]);
+        let report = validate(&data);
+        assert!(!report.ok(), "{:?}", errors(&report));
+        assert_eq!(
+            refused_at(&report, fourdgs::error::refusal::UNKNOWN_TEMPORAL_MODEL),
+            nth_record(&data, op::HEADER, 1),
+            "the second Header is the one that declares the model nobody implements"
+        );
+    }
+
+    #[test]
+    fn the_refused_quantization_record_is_the_one_that_declares_the_scheme() {
+        // The same rule, one record along. `check_quantization_scheme` runs per record on
+        // both read paths, so the refusal fires at whichever copy declares the scheme.
+        let mut unknown = grids();
+        unknown.scheme = "uniform-v9".into();
+        let data = minimal_file_with(&[grids(), unknown]);
+        let report = validate(&data);
+        assert!(!report.ok());
+        assert_eq!(
+            refused_at(
+                &report,
+                fourdgs::error::refusal::UNKNOWN_QUANTIZATION_SCHEME
+            ),
+            nth_record(&data, op::QUANTIZATION, 1)
+        );
+    }
+
+    #[test]
+    fn a_refusal_in_the_only_record_of_its_kind_is_still_placed() {
+        // The ordinary case, which the search above must not have cost: one Header, and
+        // it is the one refused.
+        let data = minimal_file_headed(&["frame-sequence"], &[grids()]);
+        let report = validate(&data);
+        assert_eq!(
+            refused_at(&report, fourdgs::error::refusal::UNKNOWN_TEMPORAL_MODEL),
+            MAGIC.len() as u64
         );
     }
 
