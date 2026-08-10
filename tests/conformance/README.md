@@ -68,7 +68,9 @@ like a gap rather than a pass.
 
 `REFUSAL_FAMILIES` in `run.py` lists the families whose runners answer these. A family absent from
 it skips the invalid corpus exactly as it would skip any variant it declines, and the feature matrix
-is where that shows up publicly.
+is where that shows up publicly. A runner from outside this repository does not appear in that set
+and does not need to: it says `"refusals": true` in its own declaration (see
+[below](#running-a-runner-that-lives-outside-this-repository)) and is scored on all seven.
 
 ### Every rule here already existed
 
@@ -114,11 +116,12 @@ corpus must be redistributable without a licence question and reproducible witho
 ## Declining a feature is how a partial SDK stays honest
 
 `run.py` lets a whole language family decline the variants carrying a feature it has not
-implemented, alongside the per-runner `supportsVariant`. The object-layer variants are the current
-users of it: C++ and Swift decline them, and the feature matrix records the `No`. TypeScript and
-Dart used to sit in that list and no longer do — they decode the object layer and compose its tracks
-natively, which is what removing a family from `FAMILY_DECLINES` is supposed to look like. Every
-family reports provenance (spec §5.15); C++ and Swift do so through the Rust C ABI's additive
+implemented, through `FAMILY_DECLINES`; a runner from outside this repository declines by listing
+the same name fragments in its own declaration. The object-layer variants are the current users of
+it: C++ and Swift decline them, and the feature matrix records the `No`. TypeScript and Dart used to
+sit in that list and no longer do — they decode the object layer and compose its tracks natively,
+which is what removing a family from `FAMILY_DECLINES` is supposed to look like. Every family
+reports provenance (spec §5.15); C++ and Swift do so through the Rust C ABI's additive
 provenance-JSON accessor.
 
 The alternative to optional keys was worse in a way worth writing down. The canonical summary emits
@@ -170,9 +173,10 @@ A runner is three abstractions:
 | `IndexedDecode`  | the index, then only the chunks it needs | the same JSON, derived from the same expectation |
 | `Encode`         | the expectation JSON                     | a `.4dgs` the decoders must agree on             |
 
-Each declares `name` and `supportsVariant(variant)`. **A partial implementation is expected**: a
-runner that returns `False` for a variant is skipped, not failed, and the feature matrix is where
-that shows up publicly.
+**A partial implementation is expected**: a variant a runner declines is skipped, not failed, and
+the feature matrix is where that shows up publicly. For the runners in this repository the decision
+is the harness's — `FAMILY_DECLINES`, `REFUSAL_FAMILIES` and the `decode_indexed` rule, all in
+`run.py`. For a runner outside it, the runner declares it; see the next section.
 
 Every runner is invoked the same way: as a subprocess, with a path, printing canonical JSON to
 stdout. A new language needs one stdout CLI and one line in `RUNNERS`. A language with a build step
@@ -185,6 +189,85 @@ and never ran.
 compiled family without the suffix is reported "not built" on Windows and silently contributes
 nothing. It does not stay silent for long, because a family asked for by name and never executed is
 a failure, but the error names the runner rather than the platform and reads like a build problem.
+
+**Every entry in `RUNNERS` ends in a path**, because that last element existing is how the harness
+decides the family is built. That is a property of this table, not of runners in general:
+`go run ./cmd/runner` and `dotnet run --project X` end in neither a script nor a binary, which is
+why a runner driven with `--runner-cmd` is asked a different question entirely.
+
+## Running a runner that lives outside this repository
+
+An implementation this repository has never heard of is scored with `--runner-cmd`, once per read
+path, and is compared exactly as a built-in family is — same corpus, same expectations, same
+`json.loads(actual) == json.loads(expected)`. Nothing about it is special-cased, and 119/119 is
+reachable from outside without editing this harness at all:
+
+```sh
+python3 tests/conformance/run.py \
+  --runner-cmd 'go run ./cmd/decode_streamed' \
+  --runner-cmd 'go run ./cmd/decode_indexed'
+```
+
+The command is split with shell quoting rules, and the variant's file path is appended to it — so a
+runner sees whatever arguments you wrote, then one path, which is the same invocation the built-in
+runners get.
+
+### The capabilities handshake
+
+Before any variant runs, the harness spawns the command once with a single `--capabilities` argument
+and no path. The runner answers with one JSON object on stdout and exits 0:
+
+```json
+{
+  "protocol": 1,
+  "name": "go/decode_indexed",
+  "family": "go",
+  "readPath": "indexed",
+  "refusals": true,
+  "declines": ["Object", "SHDegree3"]
+}
+```
+
+| Key        | Required | Meaning                                                                                                 |
+| ---------- | -------- | ------------------------------------------------------------------------------------------------------- |
+| `protocol` | yes      | the protocol version, `1`. A mismatch is an error naming both numbers                                   |
+| `name`     | yes      | `<family>/<read path>`, printed on every line about this runner                                         |
+| `family`   | no       | defaults to `name` up to the first `/`                                                                  |
+| `readPath` | yes      | `streamed` or `indexed`. An indexed runner is not asked about a variant written without `UseChunkIndex` |
+| `refusals` | no       | `true` to be scored on the seven invalid variants. Absent means no, and the seven are skipped           |
+| `declines` | no       | variant-name fragments this runner has not implemented; a variant containing one is skipped, not failed |
+
+Two consequences worth stating, because they are what the built-in tables get wrong for an outsider.
+The runner opts into the invalid corpus itself, so it does not need its family added to
+`REFUSAL_FAMILIES` — a file it does not own. And declining is something the runner says about itself
+rather than something the harness records about it, so a partial implementation can be scored
+honestly on its first day.
+
+The handshake doubles as the liveness check. A command that cannot be started, hangs, exits non-zero
+or prints something other than one JSON object fails the run with a message naming the command and
+the reason — not a skip, because a runner named on the command line is one somebody is actively
+trying to score, and scoring nothing silently is the green-suite-that-proved-nothing failure this
+harness refuses everywhere else.
+
+`--update` is refused with `--runner-cmd`. The expectations are the contract every implementation is
+scored against; a runner this repository does not own may be compared to them and may not become
+them.
+
+### When a runner misbehaves
+
+Each invocation is bounded by `--timeout` (120 seconds by default), and every way an invocation can
+go wrong costs exactly one red variant rather than the run:
+
+```
+FAIL go/decode_streamed invalid/BadMagic: runner did not answer within 120s
+FAIL go/decode_streamed invalid/BadMagic: runner exited 1
+FAIL go/decode_streamed invalid/BadMagic: stdout is not one JSON document (Expecting value: line 1 column 1 (char 0))
+  stdout: 'reading /…/BadMagic.4dgs\n{"refused": "magic-mismatch"}'
+```
+
+The third is the one every runner author meets: **stdout is the answer and nothing else**, and a
+progress line printed beside the JSON leaves the whole document impossible to parse. Diagnostics go
+on stderr, which the harness captures and prints when the runner exits non-zero.
 
 ## Platforms
 
