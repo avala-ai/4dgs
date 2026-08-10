@@ -25,6 +25,28 @@ All notable changes to the C++ package are documented here, following
   `PROJECT_VERSION` rather than written out a second time. It returned `"0.0.0"` while the package
   answered `find_package(fourdgs-cpp 0.1)`, so an application reporting the linked SDK version and
   the build that resolved it disagreed.
+- A `4dgs` command-line tool (`cpp/tools/`, built as `cpp/build/tools/4dgs`) with two commands.
+  `inspect` walks the file record by record — offset, opcode name, content and total length, and the
+  CRC status of the region each record sits in — reading nine bytes per record, so it costs the same
+  on a file carrying an hour of audio as on one carrying none. `validate` checks the file and, when
+  it is refused, prints the refusal identifier **and the byte it fired at** beneath the finding it
+  belongs to: `refusal unknown-stream-codec at byte 659 (the Chunk record at index entry 0)`. All
+  seven variants of the invalid corpus are refused by the identifier their expectation file
+  declares, at the same bytes the Rust tool reports.
+- `validate` decodes the chunks, one resident at a time on the indexed path. A framing walk steps
+  _over_ a chunk by its declared length, which is exactly not looking inside it — so
+  `unknown-stream-codec` and `window-index-out-of-range` are reachable at all only by decoding, and
+  a framing-only validator calls those two files valid.
+- `validate` branches on the Header's declared `temporal_model`, so a conforming `keyframe-delta`
+  file is validated by the reader its model needs instead of producing errors from the
+  gaussian-birth chunk shape it does not have.
+- A truncated file is walked as far as it goes and then reports the cut: the byte, the record's
+  declared length against the file's size, and how many complete records before it a streamed reader
+  keeps. `inspect` prints it beneath the table and `validate` adds it as a note beside its errors.
+- Exit codes a pipeline can act on: `0` fine, `1` refused or invalid, `2` valid with warnings, `3`
+  the tool could not run. The last is the one that matters — a missing file, an unrecognized
+  argument, or a build with no decoder behind it is the absence of an answer, not a verdict on a
+  file, and a tool that exits `1` for both is indistinguishable from a broken one.
 - Refusal diagnosis: `fourdgs::Error::refusal` names _which_ rule refused a file — `magic-mismatch`,
   `unsupported-major-version`, `unknown-temporal-model`, `unknown-quantization-scheme`,
   `unknown-stream-codec`, `window-index-out-of-range` — in the same words every other SDK prints.
