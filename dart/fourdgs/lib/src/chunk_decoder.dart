@@ -86,8 +86,16 @@ FourdgsDecodedChunk decodeChunkStreams(
     // reference encoder never does — streams carry their own codec. Reading one
     // that did would interpret compressed bytes as stream headers and decode
     // convincing rubbish, so it is named and refused instead.
+    //
+    // The same refusal as an unknown codec id on a stream, reached by the other
+    // route a file has to it: a chunk names its codec, a stream numbers it. The
+    // invalid corpus only takes the numbered route, so nothing in the suite
+    // holds this line down — it is here because one broken rule should not be
+    // diagnosed by name or anonymously depending on which of its two spellings
+    // the file used.
     throw FourdgsUnsupportedCodec(
       'chunk-level "$compression" compression is not supported by this decoder',
+      refusalCode: refusalUnknownStreamCodec,
     );
   }
 
@@ -223,7 +231,12 @@ FourdgsDecodedChunk decodeChunkStreams(
   final oy = posOrigin[1];
   final oz = posOrigin[2];
   final rgbOut = List<int>.filled(3, 0);
-  final lastWindow = windows.length - 1;
+  // An absent or empty Window Table is one default `(0, 0)` window (spec
+  // section 5.4) — degenerate, well defined, and not an error. It is a real row
+  // for the purpose of the bound below, so that index 0 resolves against it and
+  // every other index is still out of range; a table of length zero would make
+  // every index out of range, including the only legal one.
+  final windowCount = windows.isEmpty ? 1 : windows.length;
   // Derived once per chunk from the Header's own threshold. A file that declares
   // something other than the default was encoded against that number, so a
   // decoder that assumed 0.05 would put a minority of gaussians in the wrong
@@ -243,9 +256,8 @@ FourdgsDecodedChunk decodeChunkStreams(
     scales[i3 + 2] = math.exp(scale.values[i3 + 2] * steps.scaleLog);
 
     // Which quaternion component was dropped, and therefore which three the
-    // stream carries. Unlike the window index below — advisory geometry, so a
-    // bad one is clamped to the nearest window — this is structural: it says
-    // how to read the other three values. Outside 0..3 no component is ever
+    // stream carries. Structural, like the window index below: it says how to
+    // read the other three values. Outside 0..3 no component is ever
     // restored from `big`, and dequantizeRotation reads the third residual
     // twice, producing a quaternion that normalizes cleanly and is simply
     // wrong. Silently wrong orientations are worse than a refused file.
@@ -281,14 +293,22 @@ FourdgsDecodedChunk decodeChunkStreams(
     sigmaT[i] =
         neverFades ? double.infinity : math.exp(sigmaBin * steps.sigmaLog);
 
-    // A window index out of range is clamped rather than fatal, matching the
-    // reference: the window table is advisory geometry, and refusing a whole
-    // scene over one bad index would be a worse answer than the nearest window.
+    // Refused rather than clamped, which is what this used to do and what the
+    // keyframe-delta path has always refused to do. Clamping substitutes one
+    // gaussian's lifetime for another's, in a file that is already wrong in
+    // some way nobody has diagnosed — it turns a detectable fault into
+    // plausible wrong output, and the scene renders. The specification makes
+    // this a refusal for that reason; Python and Rust have always made it one.
     final wi = window.values[i];
+    if (wi < 0 || wi >= windowCount) {
+      throw FourdgsMalformedFile(
+        'window index $wi is outside the $windowCount-entry window table',
+        refusalCode: refusalWindowIndexOutOfRange,
+      );
+    }
     windowIndex[i] = wi;
-    final safe = lastWindow < 0 ? -1 : wi.clamp(0, lastWindow);
-    final lo = safe < 0 ? 0.0 : windows[safe].lo;
-    final hi = safe < 0 ? 0.0 : windows[safe].hi;
+    final lo = windows.isEmpty ? 0.0 : windows[wi].lo;
+    final hi = windows.isEmpty ? 0.0 : windows[wi].hi;
     winLo[i] = lo;
     winHi[i] = hi;
 

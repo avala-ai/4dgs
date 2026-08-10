@@ -323,32 +323,47 @@ Iterable<FourdgsRecordSpan> scanRecordSpans(
   }
 }
 
+/// Where the major version sits in the magic. Every other byte is a fixed
+/// sentinel.
+const int _magicVersionAt = 5;
+
 /// Refuses a file this reader must not try to interpret.
 ///
 /// A wrong major version is refused rather than guessed at: the version byte
 /// gates the whole file, so pressing on would mean reading unknown bytes as
 /// known ones.
+///
+/// The two refusals are told apart by whether the version byte is the **only**
+/// byte that differs. Every other byte of the magic is a fixed sentinel, so a
+/// file that differs elsewhere is not a 4dgs file whatever its version byte
+/// happens to say. Testing only that bytes 1-4 read `4DGS` — as this did —
+/// reported a file whose leading `0x89` had been corrupted as "4dgs major
+/// version 1 is not supported by this reader", which sends its holder looking
+/// for a newer reader that would not have helped. Nothing in the valid corpus
+/// can reach either branch, which is why it survived until the invalid corpus
+/// asked the two branches to say different names.
 void checkMagic(Uint8List head) {
   if (head.length < fourdgsMagic.length) {
     throw const FourdgsTruncatedFile('file is shorter than the magic');
   }
   for (int i = 0; i < fourdgsMagic.length; i++) {
+    if (i == _magicVersionAt) continue;
     if (head[i] != fourdgsMagic[i]) {
-      if (head.length >= 5 &&
-          head[1] == 0x34 &&
-          head[2] == 0x44 &&
-          head[3] == 0x47 &&
-          head[4] == 0x53) {
-        // The version is the ASCII digit in the magic, so it is reported as the
-        // character a reader would see in a hex dump. Printing its ordinal
-        // instead turns "version 9" into "version 57", which sends whoever is
-        // holding the file looking for a version that does not exist.
-        throw FourdgsUnsupportedVersion(
-          '4dgs major version ${_versionLabel(head)} is not supported by this reader',
-        );
-      }
-      throw const FourdgsUnsupportedVersion('not a 4dgs file (bad magic)');
+      throw const FourdgsUnsupportedVersion(
+        'not a 4dgs file (bad magic)',
+        refusalCode: refusalMagicMismatch,
+      );
     }
+  }
+  if (head[_magicVersionAt] != fourdgsMagic[_magicVersionAt]) {
+    // The version is the ASCII digit in the magic, so it is reported as the
+    // character a reader would see in a hex dump. Printing its ordinal
+    // instead turns "version 9" into "version 57", which sends whoever is
+    // holding the file looking for a version that does not exist.
+    throw FourdgsUnsupportedVersion(
+      '4dgs major version ${_versionLabel(head)} is not supported by this reader',
+      refusalCode: refusalUnsupportedMajorVersion,
+    );
   }
 }
 
@@ -568,12 +583,22 @@ Uint8List _decompress(Uint8List body, int codec, int expected) {
     // Legal per the specification and appropriate for archival encodes, but it
     // needs a binding this decoder deliberately does not have. Writers default
     // to deflate precisely so that no platform needs one.
+    // Named with the same identifier the unknown-id arm below carries. This is
+    // the default build's answer to a legal zstd file, so leaving it unnamed
+    // would mean the codec this reader refuses most often is the one it cannot
+    // name; and from the file's side both are "this reader does not implement
+    // my stream codec". Which of the two it is belongs in the message, not in
+    // the identifier.
     throw const FourdgsUnsupportedCodec(
       'this stream is zstd-coded; re-encode with the default deflate codec',
+      refusalCode: refusalUnknownStreamCodec,
     );
   }
   if (codec != codecDeflate) {
-    throw FourdgsUnsupportedCodec('unknown stream codec $codec');
+    throw FourdgsUnsupportedCodec(
+      'unknown stream codec $codec',
+      refusalCode: refusalUnknownStreamCodec,
+    );
   }
   if (body.length < 2) {
     throw const FourdgsTruncatedFile(

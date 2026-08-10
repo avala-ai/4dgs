@@ -350,6 +350,7 @@ void _checkGroupsDisjoint(Int32List a, Int32List b, Int32List d) {
   if (body.header.compression.isNotEmpty) {
     throw FourdgsUnsupportedCodec(
       'chunk-level "${body.header.compression}" compression is not supported',
+      refusalCode: refusalUnknownStreamCodec,
     );
   }
   final streams = _decodeStreams(
@@ -893,6 +894,7 @@ class _Grids {
     if (index < 0 || index >= table.length) {
       throw FourdgsMalformedFile(
         'window index $index is outside the ${table.length}-entry window table',
+        refusalCode: refusalWindowIndexOutOfRange,
       );
     }
     return table[index];
@@ -910,6 +912,7 @@ class _Grids {
     if (index < 0 || index >= table.length) {
       throw FourdgsMalformedFile(
         'window index $index is outside the ${table.length}-entry window table',
+        refusalCode: refusalWindowIndexOutOfRange,
       );
     }
     return table[index].hi - table[index].lo;

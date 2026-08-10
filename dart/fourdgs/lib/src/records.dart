@@ -129,12 +129,16 @@ class FourdgsHeader {
     // unknown model is a conforming file this build cannot read, which is a
     // different answer from "corrupt". Both known models are accepted;
     // `keyframe-delta` files are legal and read by their own path, which
-    // refusing here would make unreachable.
+    // refusing here would make unreachable. The empty name arrives here too and
+    // is refused under the same identifier: a declaration of nothing is not a
+    // default, and the difference between it and a future model's name is a
+    // sentence for a human, not a rule a caller branches on.
     if (!_knownTemporalModels.contains(temporalModel)) {
       throw FourdgsUnsupportedCodec(
         'the Header at byte $temporalModelAt declares temporal_model '
         '"$temporalModel", which this build does not implement; expected one of '
         '${_knownTemporalModels.join(", ")}',
+        refusalCode: refusalUnknownTemporalModel,
       );
     }
     return FourdgsHeader(
@@ -262,6 +266,7 @@ class FourdgsQuantization {
         'the Quantization record at byte $schemeAt declares scheme "$scheme", '
         'which this build does not implement; expected one of '
         '${_knownQuantizationSchemes.join(", ")}',
+        refusalCode: refusalUnknownQuantizationScheme,
       );
     }
     return FourdgsQuantization(
