@@ -396,6 +396,58 @@ void main() {
       );
     });
 
+    test('an interval refusal names a byte in the file, not in the record', () {
+      // The parser reads a cursor over the record's content, so its own idea of
+      // "byte 0" is the start of that content and every refusal named byte 0.
+      // A file with a thousand index records earns nothing from that. The reader
+      // knows where the record sits and now says so.
+      final BytesBuilder entry =
+          BytesBuilder()
+            ..add(_f64(0.0)) // t0
+            ..add(_f64(double.nan)) // t1 — NaN, refused
+            ..add(_u64(0))
+            ..add(_u64(0))
+            ..add(_u32(0))
+            ..add(_u32(0));
+
+      final BytesBuilder out =
+          BytesBuilder()
+            ..add(fourdgsMagic)
+            ..add(_record(opHeader, _headerContent()))
+            ..add(_record(opQuantization, _quantizationContent()));
+      final int summaryStart = out.length;
+      out.add(_record(opChunkIndex, entry.toBytes()));
+      final BytesBuilder footer =
+          BytesBuilder()
+            ..add(_u64(summaryStart))
+            ..add(_u64(0))
+            ..add(_u32(0));
+      out
+        ..add(_record(opFooter, footer.toBytes()))
+        ..add(fourdgsMagic);
+      final Uint8List bytes = out.toBytes();
+
+      // The interval is the first field of the content, and the content starts
+      // one record header past the record.
+      final int intervalAt = summaryStart + 9;
+      expect(
+        () => readFourdgsBytes(bytes, recoverTruncated: false),
+        throwsA(
+          isA<FourdgsMalformedFile>().having(
+            (FourdgsMalformedFile e) => e.message,
+            'names the interval byte',
+            contains('at byte $intervalAt'),
+          ),
+        ),
+        reason: 'streamed reader',
+      );
+      // And it is a byte someone can seek to: the f64 there is the NaN.
+      expect(
+        ByteData.sublistView(bytes).getFloat64(intervalAt + 8, Endian.little),
+        isNaN,
+      );
+    });
+
     test('a delta that only kills gaussians is empty, whatever it counts', () {
       // A delta entry's `gaussianCount` counts operations. A chunk that removes
       // three gaussians and adds none declares three operations and a

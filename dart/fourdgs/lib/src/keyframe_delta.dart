@@ -607,7 +607,12 @@ decodeKeyframeDeltaIndexed(Uint8List data) {
   final indexRecordOffsets = <int>[];
   for (final record in iterRecords(data, footer.summaryStart)) {
     if (record.opcode == opChunkIndex) {
-      index.add(FourdgsChunkIndexEntry.parse(record.content));
+      index.add(
+        FourdgsChunkIndexEntry.parse(
+          record.content,
+          fileOffset: record.offset + recordHeaderBytes,
+        ),
+      );
       indexRecordOffsets.add(record.offset);
     } else {
       break;
@@ -638,6 +643,18 @@ decodeKeyframeDeltaIndexed(Uint8List data) {
     // corruption check. It is also the only thing standing between a zero-width
     // entry declaring nothing and a payload composing to something: the index
     // rule above reads the entry, and the entry is not the file.
+    // Both counts, for a keyframe. §5.8 defines `live_count` for every extended
+    // entry as the population after composition, and the reference writers set
+    // it on keyframes as well — so checking only the field the population rule
+    // happens to select would let a corrupt `liveCount` through on exactly the
+    // entries where the other field agrees.
+    if (entry.kind == 0 && entry.liveCount != state.count) {
+      throw FourdgsMalformedFile(
+        'the Chunk Index record at byte ${indexRecordOffsets[i]} (entry $i of '
+        '${index.length}) declares live_count ${entry.liveCount} for a keyframe '
+        'whose chunk holds ${state.count} gaussians; expected the two to agree',
+      );
+    }
     final int declared = indexEntryPopulation(entry, isKeyframeDelta: true);
     if (state.count != declared) {
       throw FourdgsMalformedFile(
@@ -1017,7 +1034,13 @@ List<double> _probeTimes(List<KeyframeDeltaChunk> chunks, double durationSec) {
     final double mid = (c.t0 + c.t1) / 2.0;
     if (mid.isFinite) times.add(round9(mid));
   }
-  times.add(round9(math.max(0.0, durationSec - 1e-6)));
+  // The instant just below the end, when there is an end. `durationSec - 1e-6`
+  // is still `+Infinity` for an open-ended scene — an instant no half-open
+  // interval contains, which reconstructs to an empty state at a null time and
+  // reports a nonempty scene as holding nothing.
+  if (durationSec.isFinite) {
+    times.add(round9(math.max(0.0, durationSec - 1e-6)));
+  }
   final sorted = times.toList()..sort();
   return sorted;
 }

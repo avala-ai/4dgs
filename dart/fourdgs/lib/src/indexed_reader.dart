@@ -288,7 +288,15 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
               'the chunk index holds more than $maxChunkIndexEntries entries',
             );
           }
-          index.add(FourdgsChunkIndexEntry.parse(record.content));
+          index.add(
+            FourdgsChunkIndexEntry.parse(
+              record.content,
+              // Where the content starts, not the record: `iterRecords` is over a
+              // detached summary buffer here, so the file origin is the summary's.
+              fileOffset:
+                  footer.summaryStart + record.offset + recordHeaderBytes,
+            ),
+          );
           // File-relative, not summary-relative. `iterRecords` walks the buffer
           // fetched at `footer.summaryStart`, so its offsets start from zero
           // there — storing one raw would send whoever reads the diagnostic to

@@ -448,9 +448,13 @@ class FourdgsChunkIndexEntry {
   /// True when this chunk can hold a gaussian visible anywhere in `[a, b)`.
   bool overlaps(double a, double b) => t0 < b && a < t1;
 
-  static FourdgsChunkIndexEntry parse(Uint8List content) {
+  /// [fileOffset] is where `content` begins in the file, so that a refusal can
+  /// name a byte someone can seek to. Defaulted rather than required because a
+  /// caller holding a bare record — a test, a fuzzer — has no file to be
+  /// relative to, and 0 is then the truth rather than a placeholder.
+  static FourdgsChunkIndexEntry parse(Uint8List content, {int fileOffset = 0}) {
     final c = FourdgsCursor(content);
-    final intervalAt = c.pos;
+    final intervalAt = fileOffset + c.pos;
     final t0 = c.f64();
     final t1 = c.f64();
     final chunkOffset = c.u64();

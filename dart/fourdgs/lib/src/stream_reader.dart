@@ -311,7 +311,12 @@ FourdgsScene readFourdgsBytes(
         case opStatistics:
           statistics = FourdgsStatistics.parse(record.content);
         case opChunkIndex:
-          chunkIndex.add(FourdgsChunkIndexEntry.parse(record.content));
+          chunkIndex.add(
+            FourdgsChunkIndexEntry.parse(
+              record.content,
+              fileOffset: record.offset + recordHeaderBytes,
+            ),
+          );
           chunkIndexRecordOffsets.add(record.offset);
         case opSummaryOffset:
           summaryOffsets.add(FourdgsSummaryOffset.parse(record.content));

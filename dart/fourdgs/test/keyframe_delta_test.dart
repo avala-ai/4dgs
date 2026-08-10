@@ -220,6 +220,79 @@ void main() {
     );
   });
 
+  test('a keyframe states its live_count too, and it has to be true', () {
+    // §5.8 defines `live_count` for every extended entry as the population after
+    // composition, and the reference writers set it on keyframes as well as on
+    // deltas. Checking only the field the population rule selects would let a
+    // corrupt one through on exactly the entries where the other field agrees.
+    final Uint8List original = _bytes(_keyframeOnly);
+    final result = decodeKeyframeDeltaIndexed(original);
+    final last = result.index.last;
+    expect(last.kind, 0, reason: 'this fixture is keyframes only');
+    expect(
+      last.liveCount,
+      result.sequence.chunks.last.state.count,
+      reason: 'the writer states it for keyframes',
+    );
+
+    final int at = lastIndexEntry(original, last);
+    final Uint8List patched = Uint8List.fromList(original);
+    ByteData.sublistView(
+      patched,
+    ).setUint64(at + 60, last.liveCount + 1, Endian.little);
+    expect(
+      () => decodeKeyframeDeltaIndexed(patched),
+      throwsA(
+        isA<FourdgsMalformedFile>().having(
+          (FourdgsMalformedFile e) => e.message,
+          'message',
+          contains('live_count ${last.liveCount + 1} for a keyframe'),
+        ),
+      ),
+    );
+  });
+
+  test('an open-ended scene is probed only at instants that exist', () {
+    // `durationSec - 1e-6` is still `+Infinity` for an open-ended scene. No
+    // half-open interval contains that instant, so reconstruction found nothing
+    // and the summary reported a nonempty scene as an empty state at a null
+    // time — a wrong answer rather than a refusal, which is the worse kind.
+    final Uint8List original = _bytes(_movingChained);
+    final result = decodeKeyframeDeltaIndexed(original);
+
+    final Uint8List patched = Uint8List.fromList(original);
+    final ByteData view = ByteData.sublistView(patched);
+    // The Header's duration_sec, checked against the parsed value before it is
+    // overwritten so that a layout change fails here rather than patching some
+    // unrelated byte into infinity.
+    const int durationAt = 61;
+    expect(
+      view.getFloat64(durationAt, Endian.little),
+      result.sequence.header.durationSec,
+    );
+    view.setFloat64(durationAt, double.infinity, Endian.little);
+    // And the last chunk runs to that end. The index entry is what the probe
+    // list is derived from, so it is the one that has to say `+Infinity`.
+    view.setFloat64(
+      lastIndexEntry(original, result.index.last) + 8,
+      double.infinity,
+      Endian.little,
+    );
+
+    final reopened = decodeKeyframeDeltaIndexed(patched);
+    expect(reopened.sequence.header.durationSec, double.infinity);
+
+    final Map<String, Object?> summary = keyframeDeltaStatesJson(
+      reopened.sequence,
+    );
+    final List<Object?> states = summary['states']! as List<Object?>;
+    expect(states, isNotEmpty);
+    for (final Object? state in states) {
+      final Map<Object?, Object?> row = state! as Map<Object?, Object?>;
+      expect((row['t']! as num).toDouble().isFinite, isTrue);
+    }
+  });
+
   test('a chunk kind this build cannot place is refused', () {
     // Two kinds are defined: 0 keyframe, 1 delta. A third is not a
     // forward-compatible extension — it is a chunk that cannot be put in a

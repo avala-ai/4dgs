@@ -39,6 +39,9 @@ plausible-looking output rather than an error, so nothing downstream notices:
   differently. And a chain whose composed population disagrees with the `live_count` the index
   declares: §5.8 states that duplication is there to be checked, and checking it is what stops an
   entry declaring nothing from summarising a payload that decodes to something.
+- **Keyframe-delta index, continued.** A keyframe's `live_count` is checked against the population
+  its chunk composes to, not only the count the population rule happens to select — §5.8 defines the
+  field for every extended entry and the reference writers set it on keyframes too.
 - **Streamed reader.** The chunk-index clock bound the indexed reader already applied, so a
   container is not accepted or refused according to which reader opened it; and a cross-check that
   the chunks assemble to the total the header declares, for complete files only — a truncated file
@@ -51,6 +54,15 @@ plausible-looking output rather than an error, so nothing downstream notices:
 
 ### Fixed
 
+- **An interval refusal names a byte in the file.** The Chunk Index parser reads a cursor over the
+  record's content, so its own byte 0 is the start of that content, and a NaN or inverted interval
+  was reported at byte 0 whatever its position. Callers pass the record's file origin now, so the
+  byte named is one a reader can seek to.
+- **An open-ended scene is probed at instants that exist.** The canonical summary derives probe
+  times from each chunk's interval and from `duration - 1e-6`, both of which are `+Infinity` for an
+  open-ended scene — an instant no half-open interval contains, which reported a nonempty scene as
+  an empty state at a null time. Both are omitted when they are not finite; a chunk is still probed
+  at its start.
 - **An open-ended state chunk is composable on the indexed path.** `[t, +Infinity)` is a legal
   interval, and composing each chunk used to probe it at its own midpoint — which for an open-ended
   interval is `+Infinity`, an instant no half-open interval contains, its own included. The chain is
