@@ -27,6 +27,8 @@ import hashlib
 import io
 import os
 import sys
+from itertools import zip_longest
+from typing import NamedTuple
 
 import numpy as np
 
@@ -714,9 +716,25 @@ def _objects(duration_sec: float) -> ObjectLayer:
     )
 
 
-def write_corpus(target: str) -> dict[str, str]:
+class Corpus(NamedTuple):
+    """What one generator run produced, both halves keyed by variant name.
+
+    The expectations are carried out of here rather than read back off disk afterwards,
+    and that is the difference between a gate and a formality: a `.json` left behind by a
+    renamed or deleted variant is still on disk and still reads back identically, so a
+    directory listing cannot tell a fresh decode from an orphan. This map contains exactly
+    what this run wrote, which makes the leftover file visible as a committed expectation
+    no variant accounts for.
+    """
+
+    checksums: dict[str, str]
+    expectations: dict[str, str]
+
+
+def write_corpus(target: str) -> Corpus:
     os.makedirs(target, exist_ok=True)
     checksums: dict[str, str] = {}
+    expectations: dict[str, str] = {}
     for scenario, flags in scenarios.variants():
         name = scenarios.variant_name(scenario, flags)
         data, expectation = build(scenario, flags)
@@ -725,6 +743,7 @@ def write_corpus(target: str) -> dict[str, str]:
         with open(os.path.join(target, f"{name}.json"), "w", encoding="utf-8") as fh:
             fh.write(expectation + "\n")
         checksums[name] = hashlib.sha256(data).hexdigest()
+        expectations[name] = expectation + "\n"
 
     # keyframe-delta variants live in their own subdirectory, exactly as the invalid
     # corpus does, and for the same structural reason: every whole-corpus consumer that
@@ -741,6 +760,7 @@ def write_corpus(target: str) -> dict[str, str]:
         with open(os.path.join(keyframe_dir, f"{name}.json"), "w", encoding="utf-8") as fh:
             fh.write(expectation + "\n")
         checksums[f"keyframe/{name}"] = hashlib.sha256(data).hexdigest()
+        expectations[f"keyframe/{name}"] = expectation + "\n"
 
     # Object-layer variants live in their own subdirectory too, for the same gathering
     # reason as keyframe/: run.py is the one consumer that reaches into it. Unlike a
@@ -756,6 +776,7 @@ def write_corpus(target: str) -> dict[str, str]:
         with open(os.path.join(object_dir, f"{name}.json"), "w", encoding="utf-8") as fh:
             fh.write(expectation + "\n")
         checksums[f"object/{name}"] = hashlib.sha256(data).hexdigest()
+        expectations[f"object/{name}"] = expectation + "\n"
 
     invalid_dir = os.path.join(target, "invalid")
     os.makedirs(invalid_dir, exist_ok=True)
@@ -765,7 +786,8 @@ def write_corpus(target: str) -> dict[str, str]:
         with open(os.path.join(invalid_dir, f"{name}.json"), "w", encoding="utf-8") as fh:
             fh.write(expectation + "\n")
         checksums[f"invalid/{name}"] = hashlib.sha256(data).hexdigest()
-    return checksums
+        expectations[f"invalid/{name}"] = expectation + "\n"
+    return Corpus(checksums, expectations)
 
 
 def write_checksums(checksums: dict[str, str]) -> None:
@@ -781,8 +803,10 @@ def write_checksums(checksums: dict[str, str]) -> None:
 def read_expectations() -> dict[str, str]:
     """Every committed `.json` expectation as text, keyed the way the checksums are.
 
-    Read *before* the generator overwrites them, which is what lets `--verify` say whether
-    a fresh decode still produces the corpus that is committed.
+    Called *before* the generator overwrites them, which is what lets `--verify` say
+    whether a fresh decode still produces the corpus that is committed. This is the
+    committed side only; the fresh side comes back from `write_corpus`, which knows which
+    files it wrote and can therefore tell an expectation from an orphan.
     """
     out: dict[str, str] = {}
     for root, prefix in ((DATA, ""), (INVALID, "invalid/"), (KEYFRAME, "keyframe/"), (OBJECT, "object/")):
@@ -815,7 +839,8 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     committed_expectations = read_expectations() if args.verify else {}
-    checksums = write_corpus(DATA)
+    corpus = write_corpus(DATA)
+    checksums = corpus.checksums
     total = sum(
         os.path.getsize(os.path.join(root, f))
         for root in (DATA, INVALID, KEYFRAME, OBJECT)
@@ -833,11 +858,12 @@ def main(argv=None) -> int:
         print(f"wrote {CHECKSUMS}")
         return 0
 
-    return 0 if _verify(checksums, committed_expectations) else 1
+    return 0 if _verify(corpus, committed_expectations) else 1
 
 
-def _verify(checksums: dict[str, str], committed_expectations: dict[str, str]) -> bool:
+def _verify(corpus: Corpus, committed_expectations: dict[str, str]) -> bool:
     """Assert the corpus matches what is committed and that the encoder is stable."""
+    checksums = corpus.checksums
     committed = read_checksums()
     failures = []
     if not committed:
@@ -857,7 +883,13 @@ def _verify(checksums: dict[str, str], committed_expectations: dict[str, str]) -
     # and still leaves a corpus nobody else can regenerate. Compared as text and not as
     # parsed JSON on purpose: a parser erases exactly the differences this is here to
     # catch, `-0.0` and `0.0` being equal numbers and different corpora.
-    fresh_expectations = read_expectations()
+    #
+    # The fresh side is what `write_corpus` returned, not what is on disk now. Reading the
+    # directory back would compare a renamed or deleted variant's leftover `.json` against
+    # itself and call that a match, which is how a gate ends up asserting nothing about
+    # exactly the file nobody generates any more. `run.py` does list the directory, so an
+    # orphan is a variant it tries to run and cannot.
+    fresh_expectations = corpus.expectations
     for name, text in sorted(fresh_expectations.items()):
         if name not in committed_expectations:
             failures.append(f"{name}.json: no committed expectation")
@@ -894,12 +926,26 @@ def _verify(checksums: dict[str, str], committed_expectations: dict[str, str]) -
 
 
 def _first_difference(committed: str, fresh: str) -> str:
-    """Where two expectations first differ, so a failure names a value and not just a file."""
-    old, new = committed.splitlines(), fresh.splitlines()
+    """Where two expectations first differ, so a failure names a value and not just a file.
+
+    Line endings are kept and both sides are printed with `repr`, because the differences
+    this gate exists to catch are character-level ones. `strip()` would render a line that
+    gained an indent identically to the line it differs from, and `splitlines()` without
+    `keepends` makes `"{}"` and `"{}\\n"` the same list — so the check would fail with a
+    message saying the two files agree, which is worse than no message at all.
+    """
+    old, new = committed.splitlines(keepends=True), fresh.splitlines(keepends=True)
     for i, (a, b) in enumerate(zip(old, new, strict=False), start=1):
         if a != b:
-            return f"line {i}: committed {a.strip()}, fresh decode {b.strip()}"
-    return f"{len(old)} committed lines, {len(new)} from a fresh decode"
+            column = next(j for j, (x, y) in enumerate(zip_longest(a, b), start=1) if x != y)
+            return f"line {i}, column {column}: committed {a!r}, fresh decode {b!r}"
+    # Same lines as far as the shorter one goes, so the difference is what comes after it.
+    shared = min(len(old), len(new))
+    extra, side = (new, "a fresh decode") if len(new) > len(old) else (old, "the committed file")
+    return (
+        f"{len(old)} committed lines against {len(new)} from a fresh decode; "
+        f"line {shared + 1} is in {side} only: {extra[shared]!r}"
+    )
 
 
 if __name__ == "__main__":

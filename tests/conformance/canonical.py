@@ -9,7 +9,7 @@ about how a language spells a number:
 * integers are strings, so a 64-bit value survives a JSON parser backed by doubles;
 * floats are rounded to a fixed number of decimals before comparison;
 * a zero is `0.0` and never `-0.0`, because the sign of a zero says nothing about the
-  scene — see `num`;
+  scene — see `num` and `canonical`;
 * a never-fading gaussian's sigma is `null`, never a sentinel a decoder could produce by
   accident;
 * `audioSources` is an array, empty when absent, so multiplicity and absence are both
@@ -88,7 +88,35 @@ def crc(data) -> str:
 
 
 def canonical(scene_summary: dict) -> str:
-    return json.dumps(scene_summary, sort_keys=True, indent=2, allow_nan=False)
+    """Serialize a summary, unsigning every zero on the way out.
+
+    `num` is the front door and most values arrive through it, but not every summary is
+    built by `summarize`: the keyframe-delta corpus comes from
+    `fourdgs.keyframe_delta_file.states_json`, which rounds with its own helper, and the
+    next model to arrive will very likely bring a third. Normalizing here makes the
+    unsigned zero a property of the canonical form itself rather than of whichever helper
+    happened to produce a number, so a path added later gets the guarantee instead of
+    reintroducing #153 somewhere new.
+    """
+    return json.dumps(_unsigned_zeros(scene_summary), sort_keys=True, indent=2, allow_nan=False)
+
+
+def _unsigned_zeros(value):
+    """A summary with `-0.0` replaced by `0.0` and every other value left alone.
+
+    Walks the structure rather than the serialized text: `-0.0` is spelled several ways in
+    JSON output depending on magnitude, and a string substitution would also reach inside
+    the string-encoded integers this format uses.
+    """
+    if isinstance(value, dict):
+        return {k: _unsigned_zeros(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_unsigned_zeros(v) for v in value]
+    # `bool` is a subclass of `int` and not of `float`, so it falls through untouched, and
+    # so do the string-encoded integers. See `num` for why `+ 0.0` is not a no-op.
+    if isinstance(value, float):
+        return value + 0.0
+    return value
 
 
 def summarize(
