@@ -389,37 +389,25 @@ FourdgsScene readFourdgsBytes(
   // nothing orders a Chunk Index after the Header — an index arriving first has
   // no duration to compare against yet, and an early check would let exactly
   // that file through.
-  // Only a keyframe-delta Header gives `liveCount` its meaning. Without this
-  // the appended block alone decides, and a gaussian-birth entry carrying 28
-  // trailing bytes that happen to begin with 1 would be read as a delta —
-  // letting a hostile file choose which count gets checked.
+  // What makes `liveCount` mean anything. See [indexEntryPopulation].
   final bool isKeyframeDelta = header.temporalModel == 'keyframe-delta';
   for (int i = 0; i < chunkIndex.length; i++) {
     final entry = chunkIndex[i];
-    // `liveCount` is the population only for a DELTA entry; a keyframe leaves it
-    // zero and counts its gaussians the ordinary way, so keying on `extended`
-    // alone would read every keyframe in an extended index as empty.
-    final int population =
-        (isKeyframeDelta && entry.extended && entry.kind == 1)
-            ? entry.liveCount
-            : entry.gaussianCount;
+    final int population = indexEntryPopulation(
+      entry,
+      isKeyframeDelta: isKeyframeDelta,
+    );
+    refuseZeroWidthPopulation(
+      entry,
+      population,
+      'the Chunk Index record at byte ${chunkIndexRecordOffsets[i]} (entry $i of ${chunkIndex.length})',
+    );
     // A zero-duration scene is not a scene with no clock: a static asset is
     // written as `duration_sec = 0` with one nonempty entry just past zero, and
     // every SDK's glTF/USD import produces exactly that. So the end of the clock
     // only bounds an entry when there IS an end — but the start still does. At
     // duration zero the only instant a seek can ask for is 0, so an entry that
     // begins after it, `[500, 501)`, is as unreachable as one that ended before.
-    // Zero width is the same fault said differently: an interval no seek can
-    // select. The record parser applies this to `gaussianCount`, which it can
-    // read without context; `liveCount` needs the Header, so it lands here.
-    if (population > 0 && entry.t0 == entry.t1) {
-      throw FourdgsMalformedFile(
-        'the Chunk Index record at byte ${chunkIndexRecordOffsets[i]} (entry $i of '
-        '${chunkIndex.length}) declares $population live gaussians over the zero-width '
-        'interval [${entry.t0}, ${entry.t1}); expected 0 there, because the '
-        'half-open seek rule can never select a zero-width interval',
-      );
-    }
     if (population > 0 &&
         (entry.t1 <= 0.0 ||
             (header.durationSec > 0.0

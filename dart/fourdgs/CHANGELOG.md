@@ -30,6 +30,7 @@ plausible-looking output rather than an error, so nothing downstream notices:
   `keyframe-delta` entry the population is `liveCount` rather than the operation count, so that
   rule is applied by the readers, which know the temporal model — the record parser sees the
   appended block by length alone and cannot tell a delta entry from fields a later revision adds.
+  All three read paths apply it, including the dedicated keyframe-delta opener.
 - **Streamed reader.** The chunk-index clock bound the indexed reader already applied, so a
   container is not accepted or refused according to which reader opened it; and a cross-check that
   the chunks assemble to the total the header declares, for complete files only — a truncated file
@@ -39,6 +40,14 @@ plausible-looking output rather than an error, so nothing downstream notices:
   never reaches the tail, so nothing at the tail is evidence. `recoverTruncated` therefore still
   returns the decoded prefix with `truncated == true` for both. What a complete file cannot do is
   disagree with itself — once the walk reaches the Footer, the totals above are checked.
+
+### Fixed
+
+- **An open-ended state chunk is composable on the indexed path.** `[t, +Infinity)` is a legal
+  interval, and composing each chunk used to probe it at its own midpoint — which for an
+  open-ended interval is `+Infinity`, an instant no half-open interval contains, its own included.
+  The chain is now built from the entry the caller already holds, so the indexed path no longer
+  refuses a file the streamed path reads.
 
 These already existed in the Mission Control copy of this decoder, pinned by its own hostile-input
 suite. They are here now so that consuming this package directly is not a step down in robustness.

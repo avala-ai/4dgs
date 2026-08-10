@@ -564,6 +564,47 @@ class FourdgsChunkIndexEntry {
   }
 }
 
+/// The number of gaussians an index entry says are *there*, which is not always
+/// the number it stores in `gaussianCount`.
+///
+/// A delta entry's `gaussianCount` counts operations — births, deaths, updates
+/// — and its `liveCount` counts the population those operations compose to. A
+/// keyframe entry counts the ordinary way and leaves `liveCount` zero. And
+/// `liveCount` means any of this only under a `keyframe-delta` Header: the
+/// record parser recognises the appended block by length alone and cannot tell
+/// a delta entry from fields a later revision adds, so the caller has to say.
+int indexEntryPopulation(
+  FourdgsChunkIndexEntry entry, {
+  required bool isKeyframeDelta,
+}) =>
+    (isKeyframeDelta && entry.extended && entry.kind == 1)
+        ? entry.liveCount
+        : entry.gaussianCount;
+
+/// Refuses gaussians nothing can ever reach, over an interval of no width.
+///
+/// The seek rule is half-open, so `t0 == t1` selects nothing at any instant,
+/// while the gaussians behind it still count toward the file's total. The
+/// record parser applies this to `gaussianCount`, which it can read without
+/// context; every path that knows the temporal model applies it to the
+/// population, and calls this so that all of them say it the same way.
+///
+/// [where] locates the record — "the Chunk Index record at byte N (entry i of
+/// n)". A refusal that cannot be seeked to is a refusal nobody can act on.
+void refuseZeroWidthPopulation(
+  FourdgsChunkIndexEntry entry,
+  int population,
+  String where,
+) {
+  if (population > 0 && entry.t0 == entry.t1) {
+    throw FourdgsMalformedFile(
+      '$where declares $population live gaussians over the zero-width interval '
+      '[${entry.t0}, ${entry.t1}); expected 0 there, because the half-open '
+      'seek rule can never select a zero-width interval',
+    );
+  }
+}
+
 /// Bytes the `keyframe-delta` block appends to a Chunk Index entry:
 /// `u8 kind`, `u8 delta_mode`, `u64 reference_offset`, `u64 keyframe_offset`,
 /// `u16 depth`, `u64 live_count`.

@@ -315,10 +315,7 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
   // after the Header — an index arriving first has no duration to compare
   // against yet.
   final double duration = front.header!.durationSec;
-  // Only a keyframe-delta Header gives `liveCount` its meaning. Without this
-  // the appended block alone decides, and a gaussian-birth entry carrying 28
-  // trailing bytes that happen to begin with 1 would be read as a delta —
-  // letting a hostile file choose which count gets checked.
+  // What makes `liveCount` mean anything. See [indexEntryPopulation].
   final bool isKeyframeDelta = front.header!.temporalModel == 'keyframe-delta';
   for (int i = 0; i < index.length; i++) {
     final entry = index[i];
@@ -327,24 +324,15 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
     // the clock only bounds an entry when there IS an end. The start still
     // does: at duration zero the only instant a seek can ask for is 0, so an
     // entry beginning after it is unreachable.
-    // `liveCount` is the population only for a DELTA entry. A keyframe in an
-    // extended index leaves it zero and counts its gaussians the ordinary way,
-    // so keying on `extended` alone reads every keyframe as empty.
-    final int population =
-        (isKeyframeDelta && entry.extended && entry.kind == 1)
-            ? entry.liveCount
-            : entry.gaussianCount;
-    // Zero width is the same fault said differently: an interval no seek can
-    // select. The record parser applies this to `gaussianCount`, which it can
-    // read without context; `liveCount` needs the Header, so it lands here.
-    if (population > 0 && entry.t0 == entry.t1) {
-      throw FourdgsMalformedFile(
-        'the Chunk Index record at byte ${indexRecordOffsets[i]} (entry $i of '
-        '${index.length}) declares $population live gaussians over the zero-width '
-        'interval [${entry.t0}, ${entry.t1}); expected 0 there, because the '
-        'half-open seek rule can never select a zero-width interval',
-      );
-    }
+    final int population = indexEntryPopulation(
+      entry,
+      isKeyframeDelta: isKeyframeDelta,
+    );
+    refuseZeroWidthPopulation(
+      entry,
+      population,
+      'the Chunk Index record at byte ${indexRecordOffsets[i]} (entry $i of ${index.length})',
+    );
     if (population > 0 &&
         (entry.t1 <= 0.0 ||
             (duration > 0.0 ? entry.t0 >= duration : entry.t0 > 0.0))) {

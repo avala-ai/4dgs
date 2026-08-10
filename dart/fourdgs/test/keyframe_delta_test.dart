@@ -152,6 +152,57 @@ void main() {
     expect(t, greaterThan((steps - 2).toDouble()));
   });
 
+  test('an open-ended final state chunk composes on the indexed path', () {
+    // `[t, +Infinity)` is a legal interval — the format puts no finiteness
+    // requirement on a scene's end — and its midpoint is `+Infinity`, an instant
+    // no half-open interval contains, its own included. Composing each chunk by
+    // probing at its midpoint therefore failed to find the chunk it was already
+    // holding, and the indexed path refused a file the streamed path reads. The
+    // chain is built from the entry now; nothing here invents an instant.
+    final Uint8List original = _bytes(_movingChained);
+    final result = decodeKeyframeDeltaIndexed(original);
+    final last = result.index.last;
+
+    // Located by its interval rather than by a hardcoded offset: the pair is
+    // the first sixteen bytes of the last Chunk Index entry, and asserting it
+    // occurs exactly once is what makes the patch below unambiguous.
+    final ByteData pair =
+        ByteData(16)
+          ..setFloat64(0, last.t0, Endian.little)
+          ..setFloat64(8, last.t1, Endian.little);
+    final Uint8List needle = pair.buffer.asUint8List();
+    final List<int> hits = <int>[];
+    for (int i = 0; i + needle.length <= original.length; i++) {
+      bool same = true;
+      for (int j = 0; j < needle.length; j++) {
+        if (original[i + j] != needle[j]) {
+          same = false;
+          break;
+        }
+      }
+      if (same) hits.add(i);
+    }
+    // Twice: a chunk states its own interval and the index restates it. A real
+    // open-ended file has `+Infinity` in both, so both are patched — leaving one
+    // finite would be testing a file no writer produces.
+    expect(hits, hasLength(2), reason: 'the chunk and the index entry');
+
+    final Uint8List patched = Uint8List.fromList(original);
+    for (final int at in hits) {
+      ByteData.sublistView(
+        patched,
+      ).setFloat64(at + 8, double.infinity, Endian.little);
+    }
+
+    final reopened = decodeKeyframeDeltaIndexed(patched);
+    expect(reopened.index.last.t1, double.infinity);
+    // Composed, not merely parsed: the same population the finite file reaches.
+    expect(
+      reopened.sequence.chunks.last.state.count,
+      result.sequence.chunks.last.state.count,
+    );
+  });
+
   test('the indexed path walks a chain to every chunk', () {
     final result = decodeKeyframeDeltaIndexed(_bytes(_movingChained));
     // The index tiles the timeline and every entry composed to a live

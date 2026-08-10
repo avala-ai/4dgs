@@ -474,6 +474,85 @@ void main() {
       await expectLater(openFourdgsIndexed(FourdgsBytes(bytes)), zeroWidth);
     });
 
+    test('the dedicated keyframe-delta opener applies the rule too', () {
+      // Three reader paths reach a Chunk Index, and this one — the seeking
+      // client's path — had no population check at all. A zero-change delta over
+      // a zero-width interval reached composition, where the entry itself is
+      // unreachable but the chunk metadata around it is not, so a midpoint
+      // lookup could return a neighbouring state under this entry's heading.
+      final BytesBuilder entry =
+          BytesBuilder()
+            ..add(_f64(2.0)) // t0
+            ..add(_f64(2.0)) // t1 — zero width
+            ..add(_u64(0)) // chunkOffset
+            ..add(_u64(0)) // chunkLength
+            ..add(_u32(0)) // gaussianCount: no operations
+            ..add(_u32(0)) // bandCount
+            ..addByte(1) // kind: delta
+            ..addByte(0) // deltaMode
+            ..add(_u64(0)) // referenceOffset
+            ..add(_u64(0)) // keyframeOffset
+            ..add(_u32(0).sublist(0, 2)) // depth (u16)
+            ..add(_u64(7)); // liveCount: seven gaussians nothing can reach
+
+      final BytesBuilder out =
+          BytesBuilder()
+            ..add(fourdgsMagic)
+            ..add(
+              _record(
+                opHeader,
+                _headerContent(temporalModel: 'keyframe-delta'),
+              ),
+            )
+            ..add(_record(opQuantization, _quantizationContent()));
+      final int summaryStart = out.length;
+      out.add(_record(opChunkIndex, entry.toBytes()));
+      final BytesBuilder footer =
+          BytesBuilder()
+            ..add(_u64(summaryStart))
+            ..add(_u64(0))
+            ..add(_u32(0));
+      out
+        ..add(_record(opFooter, footer.toBytes()))
+        ..add(fourdgsMagic);
+
+      expect(
+        () => decodeKeyframeDeltaIndexed(out.toBytes()),
+        throwsA(
+          isA<FourdgsMalformedFile>()
+              .having(
+                (FourdgsMalformedFile e) => e.message,
+                'message',
+                contains('zero-width interval'),
+              )
+              .having(
+                (FourdgsMalformedFile e) => e.message,
+                'names the record',
+                contains('Chunk Index record at byte'),
+              ),
+        ),
+      );
+    });
+
+    test('an open-ended state chunk is composable without an instant', () {
+      // `[0, +Infinity)` is a legal interval, and its midpoint is `+Infinity` —
+      // an instant no half-open interval contains, including its own. Composing
+      // by probing at the midpoint therefore could not find the very entry it
+      // was asked about, so the indexed path refused a file the streamed path
+      // reads. The chain is now built from the entry, with no instant involved.
+      final FourdgsChunkIndexEntry open = FourdgsChunkIndexEntry.parse(
+        _chunkIndexEntryContent(t0: 0.0, t1: double.infinity),
+      );
+      final List<FourdgsChunkIndexEntry> index = <FourdgsChunkIndexEntry>[open];
+      expect(chainFrom(index, open), <FourdgsChunkIndexEntry>[open]);
+      expect(
+        () => chainFor(index, (open.t0 + open.t1) / 2.0),
+        throwsA(isA<FourdgsMalformedFile>()),
+        reason: 'the midpoint of an open-ended interval is not in it',
+      );
+      expect(chainFor(index, 0.0), <FourdgsChunkIndexEntry>[open]);
+    });
+
     test('appended fields a future revision adds do not make an entry hostile', () {
       // The mirror of the test above. This is an EMPTY `gaussian-birth` entry
       // over a zero-width interval — legal, and skipped by every reader — that

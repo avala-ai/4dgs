@@ -599,12 +599,30 @@ decodeKeyframeDeltaIndexed(Uint8List data) {
   }
 
   final index = <FourdgsChunkIndexEntry>[];
+  // File-relative, not summary-relative: `iterRecords` counts from the buffer it
+  // was handed, and a diagnostic naming a byte nobody can seek to is worse than
+  // one naming none.
+  final indexRecordOffsets = <int>[];
   for (final record in iterRecords(data, footer.summaryStart)) {
     if (record.opcode == opChunkIndex) {
       index.add(FourdgsChunkIndexEntry.parse(record.content));
+      indexRecordOffsets.add(footer.summaryStart + record.offset);
     } else {
       break;
     }
+  }
+  // This function IS the keyframe-delta path, so `liveCount` means what it says
+  // — and this is the third reader that has to apply the rule, which is why the
+  // rule lives in one place now. Without it a zero-change delta over `[t, t)`
+  // reaches composition, where the entry it describes is unreachable but the
+  // chunk metadata around it is not.
+  for (int i = 0; i < index.length; i++) {
+    refuseZeroWidthPopulation(
+      index[i],
+      indexEntryPopulation(index[i], isKeyframeDelta: true),
+      'the Chunk Index record at byte ${indexRecordOffsets[i]} (entry $i of '
+      '${index.length})',
+    );
   }
   checkTiling(index);
 
@@ -666,7 +684,7 @@ KeyframeDeltaState _composeChain(
   List<FourdgsChunkIndexEntry> index,
   FourdgsChunkIndexEntry entry,
 ) {
-  final chain = chainFor(index, (entry.t0 + entry.t1) / 2.0);
+  final chain = chainFrom(index, entry);
   KeyframeDeltaState? state;
   for (final link in chain) {
     final content = _recordContent(data, link.chunkOffset, link.chunkLength);
@@ -714,20 +732,29 @@ List<FourdgsChunkIndexEntry> chainFor(
   List<FourdgsChunkIndexEntry> index,
   double t,
 ) {
+  for (final entry in index) {
+    if (entry.t0 <= t && t < entry.t1) {
+      return chainFrom(index, entry);
+    }
+  }
+  throw FourdgsMalformedFile('no state chunk covers t=$t');
+}
+
+/// The keyframe and deltas that reconstruct [current] itself.
+///
+/// Split from [chainFor] because a caller that already holds the entry has no
+/// instant to offer and should not have to invent one. Composing every chunk in
+/// turn used to probe each at its own midpoint, which is a fine instant for a
+/// finite interval and no instant at all for `[0, +Infinity)`: the midpoint is
+/// `+Infinity`, `t < t1` is false there, and a file the streamed path decodes
+/// became one the indexed path could not find its way into.
+List<FourdgsChunkIndexEntry> chainFrom(
+  List<FourdgsChunkIndexEntry> index,
+  FourdgsChunkIndexEntry current,
+) {
   final byOffset = <int, FourdgsChunkIndexEntry>{
     for (final entry in index) entry.chunkOffset: entry,
   };
-  FourdgsChunkIndexEntry? current;
-  for (final entry in index) {
-    if (entry.t0 <= t && t < entry.t1) {
-      current = entry;
-      break;
-    }
-  }
-  if (current == null) {
-    throw FourdgsMalformedFile('no state chunk covers t=$t');
-  }
-
   final chain = <FourdgsChunkIndexEntry>[current];
   while (chain.first.kind != 0) {
     final head = chain.first;
