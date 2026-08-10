@@ -6,6 +6,8 @@ All notable changes to the Rust crate are documented here, following
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-10
+
 ### Changed
 
 - **Named refusals are a new `Error` variant.** The six refusals the specification's table names —
