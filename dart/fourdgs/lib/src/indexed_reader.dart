@@ -242,6 +242,10 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
   final footer = FourdgsFooter.parse(footerRecord.content);
 
   final index = <FourdgsChunkIndexEntry>[];
+  // Where each entry above came from. A refusal that can only say which interval
+  // was wrong leaves the reader of a file with a thousand index records nothing
+  // to open a hex editor at; the offset is known here and nowhere later.
+  final indexRecordOffsets = <int>[];
   final summaryOffsets = <FourdgsSummaryOffset>[];
   FourdgsStatistics? statistics;
   bool? crcOk;
@@ -284,7 +288,21 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
               'the chunk index holds more than $maxChunkIndexEntries entries',
             );
           }
-          index.add(FourdgsChunkIndexEntry.parse(record.content));
+          index.add(
+            FourdgsChunkIndexEntry.parse(
+              record.content,
+              // Where the content starts, not the record: `iterRecords` is over a
+              // detached summary buffer here, so the file origin is the summary's.
+              fileOffset:
+                  footer.summaryStart + record.offset + recordHeaderBytes,
+            ),
+          );
+          // File-relative, not summary-relative. `iterRecords` walks the buffer
+          // fetched at `footer.summaryStart`, so its offsets start from zero
+          // there — storing one raw would send whoever reads the diagnostic to
+          // the wrong byte, and to a different byte than the streamed reader
+          // names for the same record.
+          indexRecordOffsets.add(footer.summaryStart + record.offset);
         case opStatistics:
           statistics = FourdgsStatistics.parse(record.content);
         case opSummaryOffset:
@@ -292,6 +310,66 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
         default:
           break;
       }
+    }
+  }
+
+  // The same clock bound the streamed reader applies, so a container is not
+  // accepted or refused according to which opener was used. An entry that
+  // cannot overlap the scene clock names gaussians `chunksForTime` will never
+  // select: the file opens cleanly, its CRC verifies, and part of the scene is
+  // quietly unreachable.
+  //
+  // After the walk rather than inside it, because nothing orders a Chunk Index
+  // after the Header — an index arriving first has no duration to compare
+  // against yet.
+  final double duration = front.header!.durationSec;
+  // What makes `liveCount` mean anything. See [indexEntryPopulation].
+  final bool isKeyframeDelta = front.header!.temporalModel == 'keyframe-delta';
+  for (int i = 0; i < index.length; i++) {
+    final entry = index[i];
+    // A zero-duration scene is not a scene with no clock — a static asset is
+    // written that way, with one nonempty entry just past zero — so the end of
+    // the clock only bounds an entry when there IS an end. The start still
+    // does: at duration zero the only instant a seek can ask for is 0, so an
+    // entry beginning after it is unreachable.
+    final String where =
+        'the Chunk Index record at byte ${indexRecordOffsets[i]} (entry $i of ${index.length})';
+    checkIndexEntry(entry, isKeyframeDelta: isKeyframeDelta, where: where);
+    final int population = indexEntryPopulation(
+      entry,
+      isKeyframeDelta: isKeyframeDelta,
+    );
+    if (population > 0 &&
+        (entry.t1 <= 0.0 ||
+            (duration > 0.0 ? entry.t0 >= duration : entry.t0 > 0.0))) {
+      throw FourdgsMalformedFile(
+        'the Chunk Index record at byte ${indexRecordOffsets[i]} (entry $i of '
+        '${index.length}) covers [${entry.t0}, ${entry.t1}), outside the scene '
+        'clock [0, $duration); expected an interval that overlaps it, or an '
+        'empty entry',
+      );
+    }
+  }
+
+  // The same total the streamed reader cross-checks, from the only evidence this
+  // path has: the index itself. Without it an inflated header count is refused
+  // by one opener and returned as fact by the other — every chunk readable, the
+  // CRC verifying, and the scene claiming gaussians it does not have.
+  //
+  // `gaussian-birth` only. A keyframe-delta index describes operations composing
+  // onto a keyframe, so its entries do not sum to the population and the header
+  // total is not their sum. An empty index says nothing either way.
+  if (index.isNotEmpty && front.header!.temporalModel == 'gaussian-birth') {
+    final int declared = front.header!.gaussianCount;
+    final int indexed = index.fold<int>(
+      0,
+      (int sum, e) => sum + e.gaussianCount,
+    );
+    if (indexed != declared) {
+      throw FourdgsMalformedFile(
+        'the Header declares $declared gaussians but the Chunk Index accounts '
+        'for $indexed; expected the two to agree under gaussian-birth',
+      );
     }
   }
 

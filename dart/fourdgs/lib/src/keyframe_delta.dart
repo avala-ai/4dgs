@@ -599,18 +599,71 @@ decodeKeyframeDeltaIndexed(Uint8List data) {
   }
 
   final index = <FourdgsChunkIndexEntry>[];
+  // Already file-relative: `iterRecords(data, footer.summaryStart)` walks the
+  // whole file from that position, so the offsets it yields count from the start
+  // of the file. The indexed opener adds `summaryStart` because it iterates a
+  // detached summary buffer; doing the same here would name a byte at twice the
+  // offset, which is worse than naming none.
+  final indexRecordOffsets = <int>[];
   for (final record in iterRecords(data, footer.summaryStart)) {
     if (record.opcode == opChunkIndex) {
-      index.add(FourdgsChunkIndexEntry.parse(record.content));
+      index.add(
+        FourdgsChunkIndexEntry.parse(
+          record.content,
+          fileOffset: record.offset + recordHeaderBytes,
+        ),
+      );
+      indexRecordOffsets.add(record.offset);
     } else {
       break;
     }
   }
+  // This function IS the keyframe-delta path, so `liveCount` means what it says
+  // — and this is the third reader that has to apply the rule, which is why the
+  // rule lives in one place now. Without it a zero-change delta over `[t, t)`
+  // reaches composition, where the entry it describes is unreachable but the
+  // chunk metadata around it is not.
+  for (int i = 0; i < index.length; i++) {
+    checkIndexEntry(
+      index[i],
+      isKeyframeDelta: true,
+      where:
+          'the Chunk Index record at byte ${indexRecordOffsets[i]} (entry $i of '
+          '${index.length})',
+    );
+  }
   checkTiling(index);
 
   final chunks = <KeyframeDeltaChunk>[];
-  for (final entry in index) {
+  for (int i = 0; i < index.length; i++) {
+    final entry = index[i];
     final state = _composeChain(data, index, entry);
+    // The index says how many gaussians are live over this interval and the
+    // chunks say what they are, and §5.8 calls that duplication a cheap
+    // corruption check. It is also the only thing standing between a zero-width
+    // entry declaring nothing and a payload composing to something: the index
+    // rule above reads the entry, and the entry is not the file.
+    // Both counts, for a keyframe. §5.8 defines `live_count` for every extended
+    // entry as the population after composition, and the reference writers set
+    // it on keyframes as well — so checking only the field the population rule
+    // happens to select would let a corrupt `liveCount` through on exactly the
+    // entries where the other field agrees.
+    if (entry.kind == 0 && entry.liveCount != state.count) {
+      throw FourdgsMalformedFile(
+        'the Chunk Index record at byte ${indexRecordOffsets[i]} (entry $i of '
+        '${index.length}) declares live_count ${entry.liveCount} for a keyframe '
+        'whose chunk holds ${state.count} gaussians; expected the two to agree',
+      );
+    }
+    final int declared = indexEntryPopulation(entry, isKeyframeDelta: true);
+    if (state.count != declared) {
+      throw FourdgsMalformedFile(
+        'the Chunk Index record at byte ${indexRecordOffsets[i]} (entry $i of '
+        '${index.length}) declares $declared live gaussians over '
+        '[${entry.t0}, ${entry.t1}), but its chain composes to ${state.count}; '
+        'expected the index and the chunks to agree',
+      );
+    }
     int? updateCount;
     int? birthCount;
     int? deathCount;
@@ -666,7 +719,7 @@ KeyframeDeltaState _composeChain(
   List<FourdgsChunkIndexEntry> index,
   FourdgsChunkIndexEntry entry,
 ) {
-  final chain = chainFor(index, (entry.t0 + entry.t1) / 2.0);
+  final chain = chainFrom(index, entry);
   KeyframeDeltaState? state;
   for (final link in chain) {
     final content = _recordContent(data, link.chunkOffset, link.chunkLength);
@@ -714,20 +767,29 @@ List<FourdgsChunkIndexEntry> chainFor(
   List<FourdgsChunkIndexEntry> index,
   double t,
 ) {
+  for (final entry in index) {
+    if (entry.t0 <= t && t < entry.t1) {
+      return chainFrom(index, entry);
+    }
+  }
+  throw FourdgsMalformedFile('no state chunk covers t=$t');
+}
+
+/// The keyframe and deltas that reconstruct [current] itself.
+///
+/// Split from [chainFor] because a caller that already holds the entry has no
+/// instant to offer and should not have to invent one. Composing every chunk in
+/// turn used to probe each at its own midpoint, which is a fine instant for a
+/// finite interval and no instant at all for `[0, +Infinity)`: the midpoint is
+/// `+Infinity`, `t < t1` is false there, and a file the streamed path decodes
+/// became one the indexed path could not find its way into.
+List<FourdgsChunkIndexEntry> chainFrom(
+  List<FourdgsChunkIndexEntry> index,
+  FourdgsChunkIndexEntry current,
+) {
   final byOffset = <int, FourdgsChunkIndexEntry>{
     for (final entry in index) entry.chunkOffset: entry,
   };
-  FourdgsChunkIndexEntry? current;
-  for (final entry in index) {
-    if (entry.t0 <= t && t < entry.t1) {
-      current = entry;
-      break;
-    }
-  }
-  if (current == null) {
-    throw FourdgsMalformedFile('no state chunk covers t=$t');
-  }
-
   final chain = <FourdgsChunkIndexEntry>[current];
   while (chain.first.kind != 0) {
     final head = chain.first;
@@ -966,9 +1028,19 @@ List<double> _probeTimes(List<KeyframeDeltaChunk> chunks, double durationSec) {
   double round9(double v) => double.parse(v.toStringAsFixed(9));
   for (final c in chunks) {
     times.add(round9(c.t0));
-    times.add(round9((c.t0 + c.t1) / 2.0));
+    // An open-ended chunk has no midpoint: `(t0 + Infinity) / 2` is `Infinity`,
+    // which is not an instant inside `[t0, Infinity)` or inside anything else.
+    // Its `t0` is already in the list, so the interval is still probed.
+    final double mid = (c.t0 + c.t1) / 2.0;
+    if (mid.isFinite) times.add(round9(mid));
   }
-  times.add(round9(math.max(0.0, durationSec - 1e-6)));
+  // The instant just below the end, when there is an end. `durationSec - 1e-6`
+  // is still `+Infinity` for an open-ended scene — an instant no half-open
+  // interval contains, which reconstructs to an empty state at a null time and
+  // reports a nonempty scene as holding nothing.
+  if (durationSec.isFinite) {
+    times.add(round9(math.max(0.0, durationSec - 1e-6)));
+  }
   final sorted = times.toList()..sort();
   return sorted;
 }

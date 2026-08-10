@@ -152,6 +152,234 @@ void main() {
     expect(t, greaterThan((steps - 2).toDouble()));
   });
 
+  /// The byte offset of the last Chunk Index entry in [file], located by the
+  /// interval it declares. The chunk states the same pair, so the later of the
+  /// two occurrences is the index copy — the summary sits at the end of a file.
+  int lastIndexEntry(Uint8List file, FourdgsChunkIndexEntry last) {
+    final ByteData pair =
+        ByteData(16)
+          ..setFloat64(0, last.t0, Endian.little)
+          ..setFloat64(8, last.t1, Endian.little);
+    final Uint8List needle = pair.buffer.asUint8List();
+    final List<int> hits = <int>[];
+    for (int i = 0; i + needle.length <= file.length; i++) {
+      bool same = true;
+      for (int j = 0; j < needle.length; j++) {
+        if (file[i + j] != needle[j]) {
+          same = false;
+          break;
+        }
+      }
+      if (same) hits.add(i);
+    }
+    expect(hits, isNotEmpty);
+    return hits.last;
+  }
+
+  test('the index and the chunks must agree about the population', () {
+    // `live_count` is "gaussians live over [t0, t1), after composition" (§5.8),
+    // stated in the index and again by the chunks it summarises. The spec calls
+    // that duplication a cheap corruption check, and it is the only thing
+    // between an entry declaring nothing and a payload composing to something —
+    // the entry is not the file.
+    final Uint8List original = _bytes(_movingChained);
+    final result = decodeKeyframeDeltaIndexed(original);
+    final last = result.index.last;
+    expect(last.kind, 1, reason: 'the fixture ends on a delta');
+
+    // liveCount is the last field of the appended block: t0, t1, chunkOffset,
+    // chunkLength (8 each), gaussianCount, bandCount (4 each), kind, deltaMode
+    // (1 each), referenceOffset, keyframeOffset (8 each), depth (2).
+    final int at = lastIndexEntry(original, last);
+    final int wrong = last.liveCount + 1;
+    final Uint8List patched = Uint8List.fromList(original);
+    ByteData.sublistView(patched).setUint64(at + 60, wrong, Endian.little);
+    expect(
+      FourdgsChunkIndexEntry.parse(
+        Uint8List.sublistView(patched, at, at + 68),
+      ).liveCount,
+      wrong,
+      reason: 'the patch landed on liveCount',
+    );
+
+    expect(
+      () => decodeKeyframeDeltaIndexed(patched),
+      throwsA(
+        isA<FourdgsMalformedFile>()
+            .having(
+              (FourdgsMalformedFile e) => e.message,
+              'message',
+              contains('composes to ${last.liveCount}'),
+            )
+            .having(
+              (FourdgsMalformedFile e) => e.message,
+              'names what was declared',
+              contains('declares $wrong live gaussians'),
+            ),
+      ),
+    );
+  });
+
+  test('a keyframe states its live_count too, and it has to be true', () {
+    // §5.8 defines `live_count` for every extended entry as the population after
+    // composition, and the reference writers set it on keyframes as well as on
+    // deltas. Checking only the field the population rule selects would let a
+    // corrupt one through on exactly the entries where the other field agrees.
+    final Uint8List original = _bytes(_keyframeOnly);
+    final result = decodeKeyframeDeltaIndexed(original);
+    final last = result.index.last;
+    expect(last.kind, 0, reason: 'this fixture is keyframes only');
+    expect(
+      last.liveCount,
+      result.sequence.chunks.last.state.count,
+      reason: 'the writer states it for keyframes',
+    );
+
+    final int at = lastIndexEntry(original, last);
+    final Uint8List patched = Uint8List.fromList(original);
+    ByteData.sublistView(
+      patched,
+    ).setUint64(at + 60, last.liveCount + 1, Endian.little);
+    expect(
+      () => decodeKeyframeDeltaIndexed(patched),
+      throwsA(
+        isA<FourdgsMalformedFile>().having(
+          (FourdgsMalformedFile e) => e.message,
+          'message',
+          contains('live_count ${last.liveCount + 1} for a keyframe'),
+        ),
+      ),
+    );
+  });
+
+  test('an open-ended scene is probed only at instants that exist', () {
+    // `durationSec - 1e-6` is still `+Infinity` for an open-ended scene. No
+    // half-open interval contains that instant, so reconstruction found nothing
+    // and the summary reported a nonempty scene as an empty state at a null
+    // time — a wrong answer rather than a refusal, which is the worse kind.
+    final Uint8List original = _bytes(_movingChained);
+    final result = decodeKeyframeDeltaIndexed(original);
+
+    final Uint8List patched = Uint8List.fromList(original);
+    final ByteData view = ByteData.sublistView(patched);
+    // The Header's duration_sec, checked against the parsed value before it is
+    // overwritten so that a layout change fails here rather than patching some
+    // unrelated byte into infinity.
+    const int durationAt = 61;
+    expect(
+      view.getFloat64(durationAt, Endian.little),
+      result.sequence.header.durationSec,
+    );
+    view.setFloat64(durationAt, double.infinity, Endian.little);
+    // And the last chunk runs to that end. The index entry is what the probe
+    // list is derived from, so it is the one that has to say `+Infinity`.
+    view.setFloat64(
+      lastIndexEntry(original, result.index.last) + 8,
+      double.infinity,
+      Endian.little,
+    );
+
+    final reopened = decodeKeyframeDeltaIndexed(patched);
+    expect(reopened.sequence.header.durationSec, double.infinity);
+
+    final Map<String, Object?> summary = keyframeDeltaStatesJson(
+      reopened.sequence,
+    );
+    final List<Object?> states = summary['states']! as List<Object?>;
+    expect(states, isNotEmpty);
+    for (final Object? state in states) {
+      final Map<Object?, Object?> row = state! as Map<Object?, Object?>;
+      expect((row['t']! as num).toDouble().isFinite, isTrue);
+    }
+  });
+
+  test('a chunk kind this build cannot place is refused', () {
+    // Two kinds are defined: 0 keyframe, 1 delta. A third is not a
+    // forward-compatible extension — it is a chunk that cannot be put in a
+    // chain, and the population rule and the composer used to disagree about
+    // which of the two it resembled.
+    final Uint8List original = _bytes(_movingChained);
+    final result = decodeKeyframeDeltaIndexed(original);
+    final int at = lastIndexEntry(original, result.index.last);
+    final Uint8List patched = Uint8List.fromList(original);
+    patched[at + 40] = 2; // kind
+    expect(
+      () => decodeKeyframeDeltaIndexed(patched),
+      throwsA(
+        isA<FourdgsMalformedFile>().having(
+          (FourdgsMalformedFile e) => e.message,
+          'message',
+          contains('chunk_kind 2'),
+        ),
+      ),
+    );
+  });
+
+  test('an open-ended final state chunk composes on the indexed path', () {
+    // `[t, +Infinity)` is a legal interval — the format puts no finiteness
+    // requirement on a scene's end — and its midpoint is `+Infinity`, an instant
+    // no half-open interval contains, its own included. Composing each chunk by
+    // probing at its midpoint therefore failed to find the chunk it was already
+    // holding, and the indexed path refused a file the streamed path reads. The
+    // chain is built from the entry now; nothing here invents an instant.
+    final Uint8List original = _bytes(_movingChained);
+    final result = decodeKeyframeDeltaIndexed(original);
+    final last = result.index.last;
+
+    // Located by its interval rather than by a hardcoded offset: the pair is
+    // the first sixteen bytes of the last Chunk Index entry, and asserting it
+    // occurs exactly once is what makes the patch below unambiguous.
+    final ByteData pair =
+        ByteData(16)
+          ..setFloat64(0, last.t0, Endian.little)
+          ..setFloat64(8, last.t1, Endian.little);
+    final Uint8List needle = pair.buffer.asUint8List();
+    final List<int> hits = <int>[];
+    for (int i = 0; i + needle.length <= original.length; i++) {
+      bool same = true;
+      for (int j = 0; j < needle.length; j++) {
+        if (original[i + j] != needle[j]) {
+          same = false;
+          break;
+        }
+      }
+      if (same) hits.add(i);
+    }
+    // Twice: a chunk states its own interval and the index restates it. A real
+    // open-ended file has `+Infinity` in both, so both are patched — leaving one
+    // finite would be testing a file no writer produces.
+    expect(hits, hasLength(2), reason: 'the chunk and the index entry');
+
+    final Uint8List patched = Uint8List.fromList(original);
+    for (final int at in hits) {
+      ByteData.sublistView(
+        patched,
+      ).setFloat64(at + 8, double.infinity, Endian.little);
+    }
+
+    final reopened = decodeKeyframeDeltaIndexed(patched);
+    expect(reopened.index.last.t1, double.infinity);
+    // Composed, not merely parsed: the same population the finite file reaches.
+    expect(
+      reopened.sequence.chunks.last.state.count,
+      result.sequence.chunks.last.state.count,
+    );
+
+    // And the summary asks about instants that exist. Probe times are derived
+    // from each chunk's interval, so an open-ended chunk contributed a midpoint
+    // of `+Infinity` — a time no chunk covers, answered by falling back to the
+    // last one. The interval is still probed at its `t0`.
+    final Map<String, Object?> summary = keyframeDeltaStatesJson(
+      reopened.sequence,
+    );
+    final List<Object?> states = summary['states']! as List<Object?>;
+    for (final Object? state in states) {
+      final double t =
+          ((state! as Map<Object?, Object?>)['t']! as num).toDouble();
+      expect(t.isFinite, isTrue, reason: 'probed at $t');
+    }
+  });
+
   test('the indexed path walks a chain to every chunk', () {
     final result = decodeKeyframeDeltaIndexed(_bytes(_movingChained));
     // The index tiles the timeline and every entry composed to a live

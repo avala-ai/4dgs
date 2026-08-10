@@ -12,6 +12,74 @@ mention its own version — and because the release gate extracts this section a
 so it has to exist before the tag rather than after it. There is no date: the release has not
 happened.
 
+### Hostile-input hardening
+
+The decoder refuses a class of file it previously accepted — values that decode into
+plausible-looking output rather than an error, so nothing downstream notices:
+
+- **Header.** A spherical-harmonic degree outside the 0-3 registry, a temporal model this build does
+  not implement (`gaussian-birth` and `keyframe-delta` are accepted; anything else is named rather
+  than assumed), a NaN or negative duration, and a cutoff outside `(0, 1]`. Zero duration stays
+  legal — a zero-duration scene is a real fixture — and so does `+Infinity`, which is how an
+  open-ended scene declares itself.
+- **Chunk and Delta Chunk intervals.** The same rule the Chunk Index gets, applied where a chunk
+  states its own interval. Without it the streamed keyframe-delta path, which never reads the index,
+  accepted a file the indexed path refused.
+- **Validity windows and chunk-index intervals.** NaN or inverted bounds on both. Visibility is
+  gated on `lo <= t < hi`, so a NaN bound is false at every instant and the content behind it
+  silently never appears. `lo == hi` stays legal.
+- **Chunk index.** A nonempty chunk over a zero-width interval. The seek rule is half-open, so
+  nothing can ever select it, yet its gaussians still count toward the file's total. For a
+  `keyframe-delta` entry the population is `liveCount` rather than the operation count, so that rule
+  is applied by the readers, which know the temporal model — the record parser sees the appended
+  block by length alone and cannot tell a delta entry from fields a later revision adds. All three
+  read paths apply it, including the dedicated keyframe-delta opener. The record parser applies it
+  only to an entry with no appended block, where `gaussianCount` is unambiguously a population: a
+  delta that only removes gaussians declares its removals there and a `liveCount` of zero, and is
+  empty despite the count.
+- **Keyframe-delta index.** A `chunk_kind` other than 0 or 1 — not a forward-compatible extension
+  but a chunk that cannot be placed in a chain, and one the population rule and the composer read
+  differently. And a chain whose composed population disagrees with the `live_count` the index
+  declares: §5.8 states that duplication is there to be checked, and checking it is what stops an
+  entry declaring nothing from summarising a payload that decodes to something.
+- **Keyframe-delta index, continued.** A keyframe's `live_count` is checked against the population
+  its chunk composes to, not only the count the population rule happens to select — §5.8 defines the
+  field for every extended entry and the reference writers set it on keyframes too.
+- **Streamed reader.** The chunk-index clock bound the indexed reader already applied, so a
+  container is not accepted or refused according to which reader opened it; and a cross-check that
+  the chunks assemble to the total the header declares, for complete files only — a truncated file
+  is expected to hold fewer.
+- **Truncation recovery is unchanged, deliberately.** A record length running past the buffer and a
+  download cut short raise the same error, and they cannot be told apart: in both cases the walk
+  never reaches the tail, so nothing at the tail is evidence. `recoverTruncated` therefore still
+  returns the decoded prefix with `truncated == true` for both. What a complete file cannot do is
+  disagree with itself — once the walk reaches the Footer, the totals above are checked.
+
+### Fixed
+
+- **A truncated Header is not an unsupported one.** A Header that ended after its `temporal_model`
+  string was refused for naming a model this build does not implement, when what it actually is, is
+  incomplete — sending whoever holds it to add codec support for a file that needs none. Every
+  mandatory field is read before the model is classified.
+- **An interval refusal names a byte in the file.** The Chunk Index parser reads a cursor over the
+  record's content, so its own byte 0 is the start of that content, and a NaN or inverted interval
+  was reported at byte 0 whatever its position. Callers pass the record's file origin now, so the
+  byte named is one a reader can seek to.
+- **An open-ended scene is probed at instants that exist.** The canonical summary derives probe
+  times from each chunk's interval and from `duration - 1e-6`, both of which are `+Infinity` for an
+  open-ended scene — an instant no half-open interval contains, which reported a nonempty scene as
+  an empty state at a null time. Both are omitted when they are not finite; a chunk is still probed
+  at its start.
+- **An open-ended state chunk is composable on the indexed path.** `[t, +Infinity)` is a legal
+  interval, and composing each chunk used to probe it at its own midpoint — which for an open-ended
+  interval is `+Infinity`, an instant no half-open interval contains, its own included. The chain is
+  now built from the entry the caller already holds, so the indexed path no longer refuses a file
+  the streamed path reads.
+
+These checks were pinned by a hostile-input suite kept alongside a first-party viewer that vendors
+this decoder. They are here now so that depending on the published package directly is not a step
+down in robustness for anyone doing the same.
+
 ### Added
 
 - `fourdgs`, a pure-Dart decoder for the `.4dgs` container. No Flutter dependency and no `dart:io`

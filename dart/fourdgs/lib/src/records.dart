@@ -68,20 +68,98 @@ class FourdgsHeader {
 
   static FourdgsHeader parse(Uint8List content) {
     final c = FourdgsCursor(content);
+    final profile = c.string();
+    final library = c.string();
+    final durationAt = c.pos;
+    final durationSec = c.f64();
+    // Every check here is on a value that decodes into plausible-looking output
+    // when it is trusted, rather than into an obvious error. A NaN duration
+    // reaches timeline arithmetic and breaks playback; a negative one is not a
+    // duration. Zero stays legal — the NoData conformance fixture is exactly a
+    // zero-duration scene.
+    //
+    // `+Infinity` stays legal too, and this is deliberate. The spec requires
+    // finiteness of an *audio source's* duration (§5.11) and says nothing of the
+    // kind about the scene's; neither reference writer rejects it; `[0, +oo)` has
+    // a well-defined seek; and §5.8 makes the last index `t1` the Header's
+    // duration, an endpoint this file already accepts as infinite. Refusing it
+    // here would not make anything safer — it would make a file the other five
+    // SDKs read undecodable in Dart alone, which is the one outcome a format
+    // cannot afford.
+    if (durationSec.isNaN || durationSec < 0) {
+      throw FourdgsMalformedFile(
+        'the Header at byte $durationAt declares duration_sec = $durationSec; '
+        'expected a value >= 0, or +Infinity for an open-ended scene',
+      );
+    }
+    final gaussianCount = c.u64();
+    final cutoffAt = c.pos;
+    final cutoff = c.f64();
+    // Otherwise only validated where a chunk's motion is decoded against it,
+    // which a zero-gaussian file or a metadata-only indexed open never reaches
+    // — the bad value would sit in the returned header indefinitely.
+    if (cutoff.isNaN || !(cutoff > 0.0 && cutoff <= 1.0)) {
+      throw FourdgsMalformedFile(
+        'the Header at byte $cutoffAt declares cutoff = $cutoff; expected a '
+        'marginal threshold in (0, 1]',
+      );
+    }
+    final temporalModelAt = c.pos;
+    final temporalModel = c.string();
+    final aabb = c.f64s(6);
+    final shDegreeAt = c.pos;
+    final shDegree = c.u8();
+    // 0-3 is the whole registry. Out of range is not merely unknown: a decoded
+    // byte budget prices an unknown band at zero while the coefficient count
+    // keeps growing with the degree, so a buffer sized from the first is not
+    // the scene the second decodes.
+    if (shDegree > 3) {
+      throw FourdgsMalformedFile(
+        'the Header at byte $shDegreeAt declares sh_degree = $shDegree; the '
+        'registry defines 0 through 3',
+      );
+    }
+    final flags = c.u8();
+    final attributes = c.strMap();
+    // Last, and after every mandatory field has been read. "A model this build
+    // does not implement" is a statement about a whole Header, and a Header that
+    // ends after the model string is not one — it is truncated, and saying the
+    // model is unsupported would send the reader off to add codec support for a
+    // file that is simply missing its second half. Named, not assumed: an
+    // unknown model is a conforming file this build cannot read, which is a
+    // different answer from "corrupt". Both known models are accepted;
+    // `keyframe-delta` files are legal and read by their own path, which
+    // refusing here would make unreachable.
+    if (!_knownTemporalModels.contains(temporalModel)) {
+      throw FourdgsUnsupportedCodec(
+        'the Header at byte $temporalModelAt declares temporal_model '
+        '"$temporalModel", which this build does not implement; expected one of '
+        '${_knownTemporalModels.join(", ")}',
+      );
+    }
     return FourdgsHeader(
-      profile: c.string(),
-      library: c.string(),
-      durationSec: c.f64(),
-      gaussianCount: c.u64(),
-      cutoff: c.f64(),
-      temporalModel: c.string(),
-      aabb: c.f64s(6),
-      shDegree: c.u8(),
-      flags: c.u8(),
-      attributes: c.strMap(),
+      profile: profile,
+      library: library,
+      durationSec: durationSec,
+      gaussianCount: gaussianCount,
+      cutoff: cutoff,
+      temporalModel: temporalModel,
+      aabb: aabb,
+      shDegree: shDegree,
+      flags: flags,
+      attributes: attributes,
     );
   }
 }
+
+/// Temporal models this build implements.
+///
+/// Accepting a name is a promise to read the file, so a name the specification
+/// reserves belongs here only once this decoder can decode it.
+const Set<String> _knownTemporalModels = <String>{
+  'gaussian-birth',
+  'keyframe-delta',
+};
 
 /// Opcode `0x02`. The tail pointer that makes the file seekable.
 class FourdgsFooter {
@@ -221,7 +299,29 @@ class FourdgsWindowTable {
     }
     final out = <FourdgsWindow>[];
     for (int i = 0; i < n; i++) {
-      out.add(FourdgsWindow(c.f64(), c.f64()));
+      final windowAt = c.pos;
+      final lo = c.f64();
+      final hi = c.f64();
+      // Visibility is gated on `lo <= t < hi`, so a NaN bound is false at every
+      // instant and those gaussians silently never appear; an inverted window
+      // reads as one covering nothing. Both decode to a scene quietly missing
+      // content, which is worse than a refusal.
+      //
+      // An INFINITY is not one of those, at either end. The reference encoders
+      // exclude `win_lo` and `win_hi` from their finite-input check on purpose —
+      // "an infinity in them is meaningful rather than broken" — so `[0, +inf)`
+      // is how a static glTF or USD import says a gaussian never expires, and
+      // `[-inf, t)` is a gaussian that has always existed. Requiring either
+      // bound to be finite makes conforming output from the other SDKs
+      // undecodable here. `lo == hi` stays legal too: the NoData fixture is
+      // exactly that.
+      if (lo.isNaN || hi.isNaN || hi < lo) {
+        throw FourdgsMalformedFile(
+          'window $i of the Window Table, at byte $windowAt, spans [$lo, $hi); '
+          'expected lo <= hi and neither bound NaN (an infinity is legal)',
+        );
+      }
+      out.add(FourdgsWindow(lo, hi));
     }
     return FourdgsWindowTable(out);
   }
@@ -262,11 +362,31 @@ class FourdgsChunkBody {
   final Uint8List streams;
 }
 
+/// The interval rule, applied wherever a record states one.
+///
+/// A NaN bound is false against every instant, so content behind it is
+/// unreachable while still counting toward the file; an inverted one describes
+/// nothing at all. The Chunk Index is checked at parse, and so are the chunks it
+/// summarises — otherwise the streamed path, which never reads the index,
+/// accepts a file the indexed path refuses.
+void refuseUnusableInterval(double t0, double t1, int at, String what) {
+  if (t0.isNaN || t1.isNaN || t1 < t0) {
+    throw FourdgsMalformedFile(
+      'the $what at byte $at spans [$t0, $t1); expected an interval with '
+      't1 >= t0 and neither bound NaN',
+    );
+  }
+}
+
 FourdgsChunkBody parseChunk(Uint8List content) {
   final c = FourdgsCursor(content);
+  final intervalAt = c.pos;
+  final t0 = c.f64();
+  final t1 = c.f64();
+  refuseUnusableInterval(t0, t1, intervalAt, 'Chunk');
   final head = FourdgsChunkHeader(
-    t0: c.f64(),
-    t1: c.f64(),
+    t0: t0,
+    t1: t1,
     level: c.u32(),
     count: c.u32(),
     compression: c.string(),
@@ -355,13 +475,33 @@ class FourdgsChunkIndexEntry {
   /// True when this chunk can hold a gaussian visible anywhere in `[a, b)`.
   bool overlaps(double a, double b) => t0 < b && a < t1;
 
-  static FourdgsChunkIndexEntry parse(Uint8List content) {
+  /// [fileOffset] is where `content` begins in the file, so that a refusal can
+  /// name a byte someone can seek to. Defaulted rather than required because a
+  /// caller holding a bare record — a test, a fuzzer — has no file to be
+  /// relative to, and 0 is then the truth rather than a placeholder.
+  static FourdgsChunkIndexEntry parse(Uint8List content, {int fileOffset = 0}) {
     final c = FourdgsCursor(content);
+    final intervalAt = fileOffset + c.pos;
     final t0 = c.f64();
     final t1 = c.f64();
     final chunkOffset = c.u64();
     final chunkLength = c.u64();
     final gaussianCount = c.u32();
+    // The interval is what every seek compares against, so a bound that cannot
+    // be compared is worse than a wrong one: NaN makes `t0 <= t < t1` false at
+    // every instant and the chunk never resolves for any seek.
+    //
+    // An infinity compares perfectly well, though, and the format does not
+    // require these bounds to be finite — the Python and Rust parsers accept
+    // `[0, +inf)` and `[-inf, t)`, so refusing them here would make an
+    // open-ended index unreadable in Dart alone. Same rule the Window Table
+    // uses: NaN and inversion, nothing more.
+    if (t0.isNaN || t1.isNaN || t1 < t0) {
+      throw FourdgsMalformedFile(
+        'the Chunk Index entry at byte $intervalAt spans [$t0, $t1); expected '
+        't0 <= t1 and neither bound NaN (an infinity is legal)',
+      );
+    }
     final bandCount = c.u32();
     if (bandCount > c.remaining ~/ bandRangeBytes) {
       throw FourdgsMalformedFile(
@@ -396,6 +536,20 @@ class FourdgsChunkIndexEntry {
     // record's length from its header, so an entry with at least this many bytes
     // left carries the block and a `gaussian-birth` entry — which has none —
     // reads to the same values it always did.
+    // Zero width is legal only when the entry is empty, and which field says
+    // "empty" depends on the entry. The seek rule is half-open, so nothing can
+    // ever select a nonempty chunk over `t0 == t1` — its gaussians are
+    // unreachable while still counting toward the file.
+    void refuseNonemptyZeroWidth(int population, String what) {
+      if (t0 == t1 && population != 0) {
+        throw FourdgsMalformedFile(
+          'the Chunk Index entry at byte $intervalAt declares $population $what '
+          'over the zero-width interval [$t0, $t1); expected 0 there, because '
+          'the half-open seek rule can never select a zero-width interval',
+        );
+      }
+    }
+
     if (c.remaining >= indexDeltaBlockBytes) {
       final kind = c.u8();
       final deltaMode = c.u8();
@@ -403,6 +557,20 @@ class FourdgsChunkIndexEntry {
       final keyframeOffset = c.u64();
       final depth = c.u16();
       final liveCount = c.u64();
+      // No zero-width check here at all, on either count. An appended block
+      // means neither field is unambiguously a population: under a
+      // `keyframe-delta` Header a delta entry's `gaussianCount` counts
+      // operations, so a chunk that only kills gaussians declares three of them
+      // and a `liveCount` of zero — empty, and refused by a rule reading
+      // `gaussianCount`. And `liveCount` is only a population under that same
+      // Header, which this parser cannot see: it recognises the block by length
+      // and cannot tell a delta entry from fields a later revision adds.
+      //
+      // So the rule moves to whoever knows the temporal model. Both openers and
+      // the keyframe-delta reader compute the population with
+      // [indexEntryPopulation] and apply [refuseZeroWidthPopulation] to it,
+      // which catches everything this would have caught and nothing it should
+      // not have.
       return FourdgsChunkIndexEntry(
         t0: t0,
         t1: t1,
@@ -419,6 +587,8 @@ class FourdgsChunkIndexEntry {
         liveCount: liveCount,
       );
     }
+    // No extended block: `gaussianCount` IS the population.
+    refuseNonemptyZeroWidth(gaussianCount, 'gaussians');
     return FourdgsChunkIndexEntry(
       t0: t0,
       t1: t1,
@@ -426,6 +596,80 @@ class FourdgsChunkIndexEntry {
       chunkLength: chunkLength,
       gaussianCount: gaussianCount,
       bands: bands,
+    );
+  }
+}
+
+/// The number of gaussians an index entry says are *there*, which is not always
+/// the number it stores in `gaussianCount`.
+///
+/// A delta entry's `gaussianCount` counts operations — births, deaths, updates
+/// — and its `liveCount` counts the population those operations compose to. A
+/// keyframe entry counts the ordinary way and leaves `liveCount` zero. And
+/// `liveCount` means any of this only under a `keyframe-delta` Header: the
+/// record parser recognises the appended block by length alone and cannot tell
+/// a delta entry from fields a later revision adds, so the caller has to say.
+int indexEntryPopulation(
+  FourdgsChunkIndexEntry entry, {
+  required bool isKeyframeDelta,
+}) =>
+    // `kind != 0`, not `kind == 1`, because that is what the keyframe-delta
+    // reader does when it composes: every nonzero kind is a delta there. Reading
+    // `kind == 1` here made an entry declaring kind 2 a keyframe to this rule and
+    // a delta to the decoder, and a file only has to disagree with itself once.
+    // Unknown kinds are refused outright by [checkIndexEntry]; this stays
+    // consistent with the decoder for the window where both are reachable.
+    (isKeyframeDelta && entry.extended && entry.kind != 0)
+        ? entry.liveCount
+        : entry.gaussianCount;
+
+/// Everything an index entry can be refused for that needs the Header to see it.
+///
+/// Three read paths reach a Chunk Index and all three need these, which is why
+/// they are one call. [where] locates the record — "the Chunk Index record at
+/// byte N (entry i of n)".
+void checkIndexEntry(
+  FourdgsChunkIndexEntry entry, {
+  required bool isKeyframeDelta,
+  required String where,
+}) {
+  // Two kinds are defined (spec §5.8): 0 keyframe, 1 delta. A third is not a
+  // forward-compatible extension — it is a chunk this build cannot place in a
+  // chain, and guessing which of the two it resembles is how one reader
+  // composes a scene the next one refuses.
+  if (isKeyframeDelta && entry.extended && entry.kind > 1) {
+    throw FourdgsMalformedFile(
+      '$where declares chunk_kind ${entry.kind}; expected 0 for a keyframe or '
+      '1 for a delta',
+    );
+  }
+  refuseZeroWidthPopulation(
+    entry,
+    indexEntryPopulation(entry, isKeyframeDelta: isKeyframeDelta),
+    where,
+  );
+}
+
+/// Refuses gaussians nothing can ever reach, over an interval of no width.
+///
+/// The seek rule is half-open, so `t0 == t1` selects nothing at any instant,
+/// while the gaussians behind it still count toward the file's total. The
+/// record parser applies this to `gaussianCount`, which it can read without
+/// context; every path that knows the temporal model applies it to the
+/// population, and calls this so that all of them say it the same way.
+///
+/// [where] locates the record — "the Chunk Index record at byte N (entry i of
+/// n)". A refusal that cannot be seeked to is a refusal nobody can act on.
+void refuseZeroWidthPopulation(
+  FourdgsChunkIndexEntry entry,
+  int population,
+  String where,
+) {
+  if (population > 0 && entry.t0 == entry.t1) {
+    throw FourdgsMalformedFile(
+      '$where declares $population live gaussians over the zero-width interval '
+      '[${entry.t0}, ${entry.t1}); expected 0 there, because the half-open '
+      'seek rule can never select a zero-width interval',
     );
   }
 }
@@ -496,9 +740,13 @@ const int deltaModeChained = 1;
 
 FourdgsDeltaChunkBody parseDeltaChunk(Uint8List content) {
   final c = FourdgsCursor(content);
+  final intervalAt = c.pos;
+  final t0 = c.f64();
+  final t1 = c.f64();
+  refuseUnusableInterval(t0, t1, intervalAt, 'Delta Chunk');
   final head = FourdgsDeltaChunkHeader(
-    t0: c.f64(),
-    t1: c.f64(),
+    t0: t0,
+    t1: t1,
     level: c.u32(),
     deltaMode: c.u8(),
     referenceOffset: c.u64(),
