@@ -23,7 +23,9 @@ import {
   decodeKeyframeDeltaIndexed,
   decodeKeyframeDeltaStreamed,
   decompressChunkBlock,
+  keyframeDeltaChunkAt,
   keyframeDeltaStatesJson,
+  reconstructKeyframeDelta,
   DEFAULT_CODECS,
   lifeClass,
   motionStep,
@@ -122,11 +124,17 @@ function windowTableBody(windows: readonly (readonly [number, number])[]): Uint8
 }
 
 /** One never-fading gaussian at `windowIndex`, drifting on x by `motionBinX` bins. */
-async function oneGaussianStreams(windowIndex: number, motionBinX: number): Promise<Uint8Array> {
+async function oneGaussianStreams(
+  windowIndex: number,
+  motionBinX: number,
+  objectId?: number,
+): Promise<Uint8Array> {
   const s = (attributeId: number, values: number[], channels: number) =>
     encodeTestStream({ attributeId, values, channels });
+  const membership = objectId === undefined ? [] : [s(Attribute.ObjectId, [objectId], 1)];
   return concat(
     await Promise.all([
+      ...membership,
       s(Attribute.GaussianId, [0], 1),
       s(Attribute.Position, [0, 0, 0], 3),
       s(Attribute.Scale, [0, 0, 0], 3),
@@ -175,8 +183,13 @@ async function oneKeyframeFile(options: {
   motionBinX: number;
   duration: number;
   compress?: boolean;
+  objectId?: number;
 }): Promise<Uint8Array> {
-  const rawStreams = await oneGaussianStreams(options.windowIndex, options.motionBinX);
+  const rawStreams = await oneGaussianStreams(
+    options.windowIndex,
+    options.motionBinX,
+    options.objectId,
+  );
   const blob = options.compress ? await deflate(rawStreams) : rawStreams;
   const chunk = chunkRecord(
     0,
@@ -198,14 +211,15 @@ async function oneKeyframeFile(options: {
 
 test("motion precision follows each gaussian's own validity window, not window 0", async () => {
   const motionBinX = 10;
-  const duration = 1;
   // Window 0 is long (4 s), window 1 short (0.02 s). The gaussian references window 1, so
   // its velocity pitch must come from window 1 — a decoder using window 0 reconstructs a
-  // very different, wrong centre.
+  // very different, wrong centre. The timeline is the short window's, so the probe lands
+  // inside it: a probe outside would test the §3 gate below instead of the pitch.
+  const duration = 0.02;
   const file = await oneKeyframeFile({
     windows: [
       [0, 4],
-      [0, 0.02],
+      [0, duration],
     ],
     windowIndex: 1,
     motionBinX,
@@ -216,11 +230,67 @@ test("motion precision follows each gaussian's own validity window, not window 0
   const k = supportK(0.05);
   const pitch = (winLen: number) =>
     motionStep(lifeClass(0, STEPS.sigmaLog, true, winLen, k), STEPS.motion);
-  const probe = states.find((row) => row.t === 0.5)!;
+  const probe = states.find((row) => row.t === 0.01)!;
   const centerX = probe.sample.positions[0]![0]!;
-  assert.equal(centerX, num(motionBinX * pitch(0.02) * 0.5));
-  assert.notEqual(pitch(0.02), pitch(4));
-  assert.notEqual(centerX, num(motionBinX * pitch(4) * 0.5));
+  assert.equal(centerX, num(motionBinX * pitch(duration) * 0.01));
+  assert.notEqual(pitch(duration), pitch(4));
+  assert.notEqual(centerX, num(motionBinX * pitch(4) * 0.01));
+});
+
+test("a gaussian whose validity window has closed is absent, not transparent", async () => {
+  // The window shuts at 0.02 s and the timeline runs to 1 s. Section 3 makes the window a
+  // hard gate: past it the gaussian does not exist, so it leaves the population rather than
+  // fading — id, centre, scale and liveCount all drop it, exactly as the gaussian-birth
+  // path decides it. Reporting it at full opacity at t = 0.5 is what this pins against.
+  const file = await oneKeyframeFile({
+    windows: [[0, 0.02]],
+    windowIndex: 0,
+    motionBinX: 10,
+    duration: 1,
+  });
+  const sequence = await decodeKeyframeDeltaStreamed(file);
+  const summary = keyframeDeltaStatesJson(sequence);
+  const states = summary.states as { t: number; liveCount: string }[];
+  assert.equal(states.find((row) => row.t === 0)!.liveCount, "1");
+  assert.equal(states.find((row) => row.t === 0.5)!.liveCount, "0");
+  // The chunk's composed population is unchanged — one gaussian, all the way across. It is
+  // the instant that has no gaussian in it, not the chunk.
+  assert.equal(sequence.chunks[0]!.state.count, 1);
+  const chunk = keyframeDeltaChunkAt(sequence, 0.5);
+  assert.equal(reconstructKeyframeDelta(sequence, chunk, 0.01).count, 1);
+  assert.equal(reconstructKeyframeDelta(sequence, chunk, 0.5).count, 0);
+});
+
+test("object membership is carried through the reconstruction where a chunk has it", async () => {
+  // `object_id` is optional on a keyframe-delta chunk (spec §6.6), so the reconstruction
+  // reports `null` for a file without it and the ids themselves for a file with it — not a
+  // column of zeroes, which would read as "every gaussian is background". The id is read
+  // unsigned, because the ids span the whole u32 range and a track compares them for
+  // equality against a `u32`.
+  const objectId = 0xfffffff0;
+  const withMembership = await oneKeyframeFile({
+    windows: [[0, 1]],
+    windowIndex: 0,
+    motionBinX: 0,
+    duration: 1,
+    objectId,
+  });
+  const sequence = await decodeKeyframeDeltaStreamed(withMembership);
+  const g = reconstructKeyframeDelta(sequence, keyframeDeltaChunkAt(sequence, 0.5), 0.5);
+  assert.equal(g.count, 1);
+  assert.deepEqual([...g.objectId!], [objectId]);
+
+  const without = await oneKeyframeFile({
+    windows: [[0, 1]],
+    windowIndex: 0,
+    motionBinX: 0,
+    duration: 1,
+  });
+  const plain = await decodeKeyframeDeltaStreamed(without);
+  assert.equal(
+    reconstructKeyframeDelta(plain, keyframeDeltaChunkAt(plain, 0.5), 0.5).objectId,
+    null,
+  );
 });
 
 test("an out-of-range window index is refused, not clamped", async () => {

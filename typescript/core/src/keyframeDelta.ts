@@ -24,9 +24,13 @@
  * - {@link decodeKeyframeDeltaIndexed} reads the index and, for an instant, walks only that
  *   instant's chain.
  *
- * {@link keyframeDeltaStatesJson} is the statement other SDKs are diffed against: the
- * composed population reconstructed at an instant, in `gaussian_id` order, with integers as
- * strings so a 64-bit value survives a double-backed JSON parser.
+ * Either way the answer is a composed population per chunk, still in bins. Turning one into
+ * gaussians at an instant is {@link reconstructKeyframeDelta}, which is where decoding ends
+ * (design §5), and {@link keyframeDeltaChunkAt} is the seek in front of it.
+ *
+ * {@link keyframeDeltaStatesJson} is the statement other SDKs are diffed against, and it is
+ * a sample of that same reconstruction — not a second one — with integers as strings so a
+ * 64-bit value survives a double-backed JSON parser.
  */
 
 import {
@@ -40,7 +44,15 @@ import { DEFAULT_CODECS, type CodecRegistry } from "./codec.js";
 import { Cursor } from "./cursor.js";
 import { MalformedFile } from "./errors.js";
 import { Attribute, GAUSSIAN_FLAG_NEVER_FADES } from "./opcodes.js";
-import { clamp, lifeClass, motionStep, muStep, supportK, type Steps } from "./quantization.js";
+import {
+  clamp,
+  dequantizeRotation,
+  lifeClass,
+  motionStep,
+  muStep,
+  rctInverse,
+  supportK,
+} from "./quantization.js";
 import {
   DELTA_MODE_CHAINED,
   MAGIC,
@@ -111,31 +123,41 @@ function columnRows(column: Column): number {
 }
 
 /**
+ * Read a composed state's bin columns. Assigned by {@link KeyframeDeltaState}'s static
+ * block, which is the only way past a `#` field.
+ *
+ * Composed bins are not public API. A consumer reads reconstructed values through
+ * {@link reconstructKeyframeDelta}, and this file — the one place that composes bins and
+ * the one place that turns them into values — is the only holder of this reader. The
+ * class used to publish a `column()` method marked `@internal`, which is a comment where
+ * a language feature will do.
+ */
+let binsOf!: (state: KeyframeDeltaState) => Map<number, Column>;
+
+/**
  * A composed population: identities, and one bin column per attribute.
  *
  * `ids` and every column are aligned, and the order is an implementation detail — nothing
  * in the format depends on it and no reader may rely on it. The bins stay private: a
- * consumer reads reconstructed gaussians through {@link keyframeDeltaStatesJson}, not raw
+ * consumer reads reconstructed gaussians through {@link reconstructKeyframeDelta}, not raw
  * composed bins.
  */
 export class KeyframeDeltaState {
+  readonly #bins: Map<number, Column>;
+
+  static {
+    binsOf = (state) => state.#bins;
+  }
+
   constructor(
     readonly ids: Int32Array,
-    private readonly bins: Map<number, Column>,
-  ) {}
+    bins: Map<number, Column>,
+  ) {
+    this.#bins = bins;
+  }
 
   get count(): number {
     return this.ids.length;
-  }
-
-  /** @internal a bin column, for reconstruction. */
-  column(attribute: number): Column | undefined {
-    return this.bins.get(attribute);
-  }
-
-  /** @internal every attribute the state carries. */
-  attributes(): IterableIterator<number> {
-    return this.bins.keys();
   }
 }
 
@@ -187,8 +209,7 @@ function applyDelta(
 
   // --- deaths -----------------------------------------------------------
   let ids = state.ids;
-  let bins = new Map<number, Column>();
-  for (const attribute of state.attributes()) bins.set(attribute, state.column(attribute)!);
+  let bins = new Map<number, Column>(binsOf(state));
 
   if (deathIds.length > 0) {
     const live = new Set<number>(ids);
@@ -935,105 +956,207 @@ export function chainFor(index: readonly ChunkIndexEntry[], t: number): ChunkInd
 // Reconstruction and the canonical summary
 // --------------------------------------------------------------------------
 
-interface Grids {
-  readonly steps: Steps;
-  readonly origin: readonly number[];
-  /**
-   * The whole Window Table as flattened `[lo, hi]` pairs. A never-fading gaussian's
-   * velocity precision is derived from its own `window_index`'s length (spec §6.3), so the
-   * full table is kept and indexed per gaussian rather than collapsed to one window.
-   */
-  readonly windows: Float64Array;
-  readonly cutoff: number;
-}
-
-function gridsFor(sequence: KeyframeDeltaSequence): Grids {
-  return {
-    steps: stepsFrom(sequence.quantization),
-    origin: sequence.quantization.posOrigin,
-    windows: windowTableOrDefault(sequence.windows),
-    cutoff: sequence.header.cutoff,
-  };
-}
-
-interface Reconstruction {
-  readonly ids: Int32Array; // sorted ascending
-  readonly centers: Float64Array; // count * 3
-  readonly scales: Float64Array; // count * 3
-  readonly opacity: Float64Array; // count
+/**
+ * A composed population reconstructed at an instant: values, not bins.
+ *
+ * Rows are in ascending `gaussian_id` order. That is decoded-value order — not stream
+ * order, which is an encoder's choice no reader may rely on — and it is unique within a
+ * state (spec §11.2), so two implementations that compose the same population agree row
+ * for row. Every array is parallel to `ids` and holds `count` rows.
+ *
+ * Gaussians outside their own validity window are absent rather than transparent: outside
+ * it a gaussian does not exist at that time (spec §3), which is how the `gaussian-birth`
+ * path decides it too, so `count`, `ids` and every array exclude them.
+ *
+ * The arrays are `Float64Array` because this is also what the cross-SDK statement is
+ * computed from, and that statement is diffed at six decimal places on sums over the whole
+ * population — an accumulation in `float32` disagrees there. A renderer narrows to
+ * `float32` when it packs a vertex buffer, which is a layout decision belonging to
+ * whatever draws the splats (design §5).
+ */
+export interface KeyframeDeltaGaussians {
+  /** The instant this was reconstructed at, in seconds. */
+  readonly t: number;
+  /** Gaussians alive at `t`; the row count of every array below. */
   readonly count: number;
+  /** `count` gaussian ids, ascending. */
+  readonly ids: Int32Array;
+  /** `count × 3` centres: rest position carried along the linear velocity to `t`. */
+  readonly centers: Float64Array;
+  /** `count × 3` linear scale. */
+  readonly scales: Float64Array;
+  /** `count × 4` unit quaternion, xyzw. */
+  readonly rotations: Float64Array;
+  /** `count × 3` linear RGB, each in [0, 1]. */
+  readonly rgb: Float64Array;
+  /** `count` opacity in [0, 1], already folded with the temporal marginal at `t`. */
+  readonly opacity: Float64Array;
+  /**
+   * `count` object ids (spec §6.6), or `null` when the composed state carries no
+   * membership stream. `0` is background.
+   */
+  readonly objectId: Uint32Array | null;
 }
 
 /**
- * The composed population reconstructed at instant `t`, in `gaussian_id` order.
+ * The state chunk covering scene time `t` — the seek, answered from the decoded timeline.
  *
- * Everything downstream orders by `gaussian_id`, which is unique within a state (spec
- * §11.2). That is decoded-value order — not stream order, which a reader may not rely on —
- * so two implementations that compose the same population agree on every row.
+ * The chunks tile `[0, duration_sec)` with half-open intervals, so exactly one covers any
+ * `t` inside the timeline and finding it is a lookup rather than a search. A `t` at or past
+ * the end resolves to the last chunk: a reader asking for the final instant of a file gets
+ * its final state rather than a refusal for landing on the boundary.
  */
-function reconstructAt(info: KeyframeDeltaChunkInfo, grids: Grids, t: number): Reconstruction {
-  const state = info.state;
+export function keyframeDeltaChunkAt(
+  sequence: KeyframeDeltaSequence,
+  t: number,
+): KeyframeDeltaChunkInfo {
+  const chunks = sequence.chunks;
+  if (chunks.length === 0) {
+    throw new MalformedFile(`no state chunk covers t=${t}; the file carries none`);
+  }
+  for (const c of chunks) if (c.t0 <= t && t < c.t1) return c;
+  return chunks[chunks.length - 1]!;
+}
+
+/**
+ * The population `chunk` carries, reconstructed at scene time `t`.
+ *
+ * This is where decoding ends (design §5): composition is over quantization bins, and a
+ * composed bin *is* the bin an absolute statement of that instant would carry, so
+ * dequantizing here is the same arithmetic a keyframe chunk uses (spec §11.7). `chunk` is
+ * the one whose half-open `[t0, t1)` contains `t` — {@link keyframeDeltaChunkAt} finds it,
+ * and a player that has already seeked passes the chunk it seeked to rather than looking it
+ * up again on every frame.
+ */
+export function reconstructKeyframeDelta(
+  sequence: KeyframeDeltaSequence,
+  chunk: KeyframeDeltaChunkInfo,
+  t: number,
+): KeyframeDeltaGaussians {
+  const state = chunk.state;
   const n = state.count;
-  const order = Array.from({ length: n }, (_, i) => i).sort(
-    (a, b) => state.ids[a]! - state.ids[b]!,
-  );
   const ids = new Int32Array(n);
   const centers = new Float64Array(n * 3);
   const scales = new Float64Array(n * 3);
+  const rotations = new Float64Array(n * 4);
+  const rgb = new Float64Array(n * 3);
   const opacity = new Float64Array(n);
-  if (n === 0) return { ids, centers, scales, opacity, count: 0 };
+  const bins = binsOf(state);
+  const objectIdColumn = bins.get(Attribute.ObjectId);
+  if (objectIdColumn !== undefined && objectIdColumn.channels !== 1) {
+    throw new MalformedFile(
+      `the object_id column of the keyframe-delta chunk at byte ${chunk.offset} declares ` +
+        `${objectIdColumn.channels} channels, the format defines 1`,
+    );
+  }
+  const objectId = objectIdColumn === undefined ? null : new Uint32Array(n);
+  if (n === 0) {
+    return { t, count: 0, ids, centers, scales, rotations, rgb, opacity, objectId };
+  }
 
-  const position = state.column(Attribute.Position)!.values;
-  const scaleBins = state.column(Attribute.Scale)!.values;
-  const motion = state.column(Attribute.Motion)!.values;
-  const muBins = state.column(Attribute.MuT)!.values;
-  const sigmaBinsCol = state.column(Attribute.SigmaT)!.values;
-  const flags = state.column(Attribute.Flags)!.values;
-  const opacityBins = state.column(Attribute.Opacity)!.values;
-  const windowBins = state.column(Attribute.WindowIndex)!.values;
+  // A composed state that has lost a required column is refused by name rather than read
+  // as zeroes: a gaussian with no colour column is not a black gaussian, it is a file this
+  // reader cannot turn into gaussians. Reported before the loop so the answer is every
+  // attribute that is missing, not the first one reached.
+  const absent = REQUIRED_KEYFRAME_ATTRIBUTES.filter((id) => !bins.has(id));
+  if (absent.length > 0) {
+    throw new MalformedFile(
+      `the population composed at the keyframe-delta chunk at byte ${chunk.offset} carries no ` +
+        `attribute ${absent.join(", ")} column, which every keyframe-delta state must have`,
+    );
+  }
+  const position = bins.get(Attribute.Position)!.values;
+  const scaleBins = bins.get(Attribute.Scale)!.values;
+  const rotationIndex = bins.get(Attribute.RotationIndex)!.values;
+  const rotationBins = bins.get(Attribute.Rotation)!.values;
+  const colorBins = bins.get(Attribute.Color)!.values;
+  const opacityBins = bins.get(Attribute.Opacity)!.values;
+  const motion = bins.get(Attribute.Motion)!.values;
+  const muBins = bins.get(Attribute.MuT)!.values;
+  const sigmaBinsCol = bins.get(Attribute.SigmaT)!.values;
+  const flags = bins.get(Attribute.Flags)!.values;
+  const windowBins = bins.get(Attribute.WindowIndex)!.values;
+  const objectIdBins = objectIdColumn?.values;
 
-  const steps = grids.steps;
-  const k = supportK(grids.cutoff);
-  const windowCount = grids.windows.length >>> 1;
+  const steps = stepsFrom(sequence.quantization);
+  const origin = sequence.quantization.posOrigin;
+  const windows = windowTableOrDefault(sequence.windows);
+  const windowCount = windows.length >>> 1;
+  const k = supportK(sequence.header.cutoff);
 
-  for (let outRow = 0; outRow < n; outRow++) {
-    const i = order[outRow]!;
-    ids[outRow] = state.ids[i]!;
+  const order = Array.from({ length: n }, (_, i) => i).sort(
+    (a, b) => state.ids[a]! - state.ids[b]!,
+  );
+
+  let out = 0;
+  for (const i of order) {
+    // A never-fading gaussian's velocity grid is derived from the length of its own
+    // validity window (spec §6.3), so the pitch is selected per gaussian from its
+    // window_index rather than from a single shared window; an out-of-range index is
+    // refused, not clamped, and refused for every row whether or not this instant keeps it.
+    const windowIndex = checkWindowIndex(
+      windowBins[i]!,
+      windowCount,
+      `keyframe-delta chunk at byte ${chunk.offset}, gaussian id ${state.ids[i]!}`,
+    );
+    const winLo = windows[windowIndex * 2]!;
+    const winHi = windows[windowIndex * 2 + 1]!;
+    if (!(winLo <= t && t < winHi)) continue;
 
     const sigmaBin = sigmaBinsCol[i]!;
     const neverFades = (flags[i]! & GAUSSIAN_FLAG_NEVER_FADES) !== 0;
     const sigma = neverFades ? Infinity : Math.exp(sigmaBin * steps.sigmaLog);
-    // A never-fading gaussian's velocity grid is derived from the length of its own
-    // validity window (spec §6.3), so the pitch is selected per gaussian from its
-    // window_index rather than from a single shared window; an out-of-range index is
-    // refused, not clamped.
-    const windowIndex = checkWindowIndex(
-      windowBins[i]!,
-      windowCount,
-      `keyframe-delta chunk at byte ${info.offset}, gaussian id ${state.ids[i]!}`,
-    );
-    const winLen = grids.windows[windowIndex * 2 + 1]! - grids.windows[windowIndex * 2]!;
     const mStep = motionStep(
-      lifeClass(sigmaBin, steps.sigmaLog, neverFades, winLen, k),
+      lifeClass(sigmaBin, steps.sigmaLog, neverFades, winHi - winLo, k),
       steps.motion,
     );
-    const tStep = muStep(sigmaBin, steps.sigmaLog, neverFades, steps.time);
-    const mu = muBins[i]! * tStep;
+    const mu = muBins[i]! * muStep(sigmaBin, steps.sigmaLog, neverFades, steps.time);
     const dt = t - mu;
 
-    const o3 = outRow * 3;
+    ids[out] = state.ids[i]!;
+    const o3 = out * 3;
     const i3 = i * 3;
     for (let c = 0; c < 3; c++) {
-      const pos = position[i3 + c]! * steps.pos + grids.origin[c]!;
+      const pos = position[i3 + c]! * steps.pos + origin[c]!;
       centers[o3 + c] = pos + motion[i3 + c]! * mStep * dt;
       scales[o3 + c] = Math.exp(scaleBins[i3 + c]! * steps.scaleLog);
     }
 
+    dequantizeRotation(
+      rotationIndex[i]!,
+      rotationBins[i3]!,
+      rotationBins[i3 + 1]!,
+      rotationBins[i3 + 2]!,
+      steps.rot,
+      rotations,
+      out * 4,
+    );
+
+    const [r, g, b] = rctInverse(colorBins[i3]!, colorBins[i3 + 1]!, colorBins[i3 + 2]!);
+    rgb[o3] = clamp(r * steps.rgb, 0, 1);
+    rgb[o3 + 1] = clamp(g * steps.rgb, 0, 1);
+    rgb[o3 + 2] = clamp(b * steps.rgb, 0, 1);
+
     const alpha = clamp(opacityBins[i]! * steps.alpha, 0, 1);
     const marginal = sigma === Infinity ? 1 : Math.exp(-0.5 * (dt / sigma) * (dt / sigma));
-    opacity[outRow] = alpha * marginal;
+    opacity[out] = alpha * marginal;
+    if (objectId !== null) objectId[out] = objectIdBins![i]!;
+    out++;
   }
-  return { ids, centers, scales, opacity, count: n };
+
+  // Views, not copies: nothing was dropped in the ordinary case, and where a window has
+  // closed the tail is simply not part of the answer.
+  return {
+    t,
+    count: out,
+    ids: ids.subarray(0, out),
+    centers: centers.subarray(0, out * 3),
+    scales: scales.subarray(0, out * 3),
+    rotations: rotations.subarray(0, out * 4),
+    rgb: rgb.subarray(0, out * 3),
+    opacity: opacity.subarray(0, out),
+    objectId: objectId === null ? null : objectId.subarray(0, out),
+  };
 }
 
 /** Decimals a float is rounded to before comparison, matching `tests/conformance/canonical.py`. */
@@ -1097,14 +1220,6 @@ function probeTimes(chunks: readonly KeyframeDeltaChunkInfo[], durationSec: numb
   return [...times].sort((a, b) => a - b);
 }
 
-function stateCovering(
-  chunks: readonly KeyframeDeltaChunkInfo[],
-  t: number,
-): KeyframeDeltaChunkInfo {
-  for (const c of chunks) if (c.t0 <= t && t < c.t1) return c;
-  return chunks[chunks.length - 1]!;
-}
-
 /**
  * The statement two implementations are diffed on for a `keyframe-delta` file.
  *
@@ -1115,7 +1230,6 @@ function stateCovering(
  * so a 64-bit value survives a double-backed JSON parser.
  */
 export function keyframeDeltaStatesJson(sequence: KeyframeDeltaSequence): Record<string, unknown> {
-  const grids = gridsFor(sequence);
   const duration = sequence.header.durationSec;
 
   const chunkRows = sequence.chunks.map((c) => ({
@@ -1141,9 +1255,7 @@ export function keyframeDeltaStatesJson(sequence: KeyframeDeltaSequence): Record
       probeEnd = Math.max(probeEnd, sequence.chunks[i]!.t1);
     }
   }
-  const states = probeTimes(sequence.chunks, probeEnd).map((t) =>
-    stateRow(stateCovering(sequence.chunks, t), grids, t),
-  );
+  const states = probeTimes(sequence.chunks, probeEnd).map((t) => stateRow(sequence, t));
 
   return {
     temporalModel: "keyframe-delta",
@@ -1155,8 +1267,8 @@ export function keyframeDeltaStatesJson(sequence: KeyframeDeltaSequence): Record
   };
 }
 
-function stateRow(info: KeyframeDeltaChunkInfo, grids: Grids, t: number): Record<string, unknown> {
-  const r = reconstructAt(info, grids, t);
+function stateRow(sequence: KeyframeDeltaSequence, t: number): Record<string, unknown> {
+  const r = reconstructKeyframeDelta(sequence, keyframeDeltaChunkAt(sequence, t), t);
   const sampleN = Math.min(SAMPLE, r.count);
   const positionSum = [0, 0, 0];
   let opacitySum = 0;
@@ -1180,7 +1292,10 @@ function stateRow(info: KeyframeDeltaChunkInfo, grids: Grids, t: number): Record
   }
   return {
     t: num(t),
-    liveCount: String(info.state.count),
+    // The count at this instant, from the rows reconstruction actually returned — not the
+    // chunk's population, which differs once a validity window has closed. Reporting the
+    // population here would claim gaussians are live that the same row omits from `sample`.
+    liveCount: String(r.count),
     sample: {
       gaussianIds,
       positions,

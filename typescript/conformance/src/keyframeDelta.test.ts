@@ -21,9 +21,13 @@ import {
   MalformedFile,
   decodeKeyframeDeltaIndexed,
   decodeKeyframeDeltaStreamed,
+  keyframeDeltaChunkAt,
   keyframeDeltaStatesJson,
+  reconstructKeyframeDelta,
   type KeyframeDeltaSequence,
 } from "@4dgs/core";
+
+import { num } from "./canonical.js";
 
 import {
   DEEP_CHAIN,
@@ -162,4 +166,93 @@ test("both read paths report the same header", async () => {
   const indexed = (await decodeKeyframeDeltaIndexed(bytes(MOVING_KEYFRAME))).sequence;
   assert.equal(streamed.header.gaussianCount, indexed.header.gaussianCount);
   assert.equal(streamed.header.durationSec, indexed.header.durationSec);
+});
+
+// --- the full reconstruction (spec §11.7, §3) -----------------------------
+
+/** Every probe instant the canonical summary reports, in order. */
+function probes(summary: Record<string, unknown>): number[] {
+  return (summary.states as Row[]).map((s) => s.t as number);
+}
+
+test("the reconstruction at an instant carries every attribute, not a sample of two", async () => {
+  const sequence = await decodeKeyframeDeltaStreamed(bytes(MOVING_CHAINED));
+  let seen = 0;
+  for (const t of probes(keyframeDeltaStatesJson(sequence))) {
+    const g = reconstructKeyframeDelta(sequence, keyframeDeltaChunkAt(sequence, t), t);
+    assert.equal(g.t, t);
+    assert.equal(g.ids.length, g.count);
+    assert.equal(g.centers.length, g.count * 3);
+    assert.equal(g.scales.length, g.count * 3);
+    assert.equal(g.rotations.length, g.count * 4);
+    assert.equal(g.rgb.length, g.count * 3);
+    assert.equal(g.opacity.length, g.count);
+    // Ascending gaussian_id is the only order two implementations can agree on: stream
+    // order is an encoder's choice (spec §11.2).
+    for (let i = 1; i < g.count; i++) assert.ok(g.ids[i]! > g.ids[i - 1]!);
+    for (let i = 0; i < g.count; i++) {
+      const norm = Math.hypot(
+        g.rotations[i * 4]!,
+        g.rotations[i * 4 + 1]!,
+        g.rotations[i * 4 + 2]!,
+        g.rotations[i * 4 + 3]!,
+      );
+      assert.ok(Math.abs(norm - 1) < 1e-9, `rotation ${i} at t=${t} has norm ${norm}`);
+      assert.ok(g.scales[i * 3]! > 0);
+      for (let c = 0; c < 3; c++) assert.ok(g.rgb[i * 3 + c]! >= 0 && g.rgb[i * 3 + c]! <= 1);
+      assert.ok(g.opacity[i]! >= 0 && g.opacity[i]! <= 1);
+    }
+    // No fixture here carries object membership on a keyframe-delta chunk, so `null` is the
+    // honest answer rather than a column of zeroes reading as "everything is background".
+    assert.equal(g.objectId, null);
+    seen += g.count;
+  }
+  assert.ok(seen > 0);
+});
+
+test("the canonical summary is that reconstruction, not a second one", async () => {
+  // The summary two SDKs are diffed on reads the rows a consumer gets. If these two ever
+  // came apart, the conformance suite would be proving something no caller can see.
+  const sequence = await decodeKeyframeDeltaStreamed(bytes(MOVING_CHAINED));
+  for (const row of keyframeDeltaStatesJson(sequence).states as Row[]) {
+    const t = row.t as number;
+    const g = reconstructKeyframeDelta(sequence, keyframeDeltaChunkAt(sequence, t), t);
+    assert.equal(String(g.count), row.liveCount);
+    const sample = row.sample as Record<string, unknown>;
+    const ids = sample.gaussianIds as string[];
+    const positions = sample.positions as number[][];
+    for (let i = 0; i < ids.length; i++) {
+      assert.equal(String(g.ids[i]), ids[i]);
+      for (let c = 0; c < 3; c++) assert.equal(num(g.centers[i * 3 + c]!), positions[i]![c]);
+    }
+  }
+});
+
+test("both read paths reconstruct the same values, rotations and colour included", async () => {
+  // The canonical statement samples centres and scales; agreeing on those says nothing
+  // about the attributes it never prints. Composing a chain by byte range and composing
+  // front to back must reach the same gaussians in every attribute, or one of the two read
+  // paths is decoding a different scene.
+  const streamed = await decodeKeyframeDeltaStreamed(bytes(MOVING_KEYFRAME));
+  const indexed = (await decodeKeyframeDeltaIndexed(bytes(MOVING_KEYFRAME))).sequence;
+  for (const t of probes(keyframeDeltaStatesJson(streamed))) {
+    const a = reconstructKeyframeDelta(streamed, keyframeDeltaChunkAt(streamed, t), t);
+    const b = reconstructKeyframeDelta(indexed, keyframeDeltaChunkAt(indexed, t), t);
+    assert.deepEqual([...a.ids], [...b.ids]);
+    assert.deepEqual([...a.centers], [...b.centers]);
+    assert.deepEqual([...a.scales], [...b.scales]);
+    assert.deepEqual([...a.rotations], [...b.rotations]);
+    assert.deepEqual([...a.rgb], [...b.rgb]);
+    assert.deepEqual([...a.opacity], [...b.opacity]);
+  }
+});
+
+test("the covering chunk is the seek, and the end of the timeline is not a refusal", async () => {
+  const sequence = await decodeKeyframeDeltaStreamed(bytes(MOVING_CHAINED));
+  for (const chunk of sequence.chunks) {
+    assert.equal(keyframeDeltaChunkAt(sequence, chunk.t0), chunk);
+    assert.equal(keyframeDeltaChunkAt(sequence, (chunk.t0 + chunk.t1) / 2), chunk);
+  }
+  const last = sequence.chunks[sequence.chunks.length - 1]!;
+  assert.equal(keyframeDeltaChunkAt(sequence, last.t1), last);
 });

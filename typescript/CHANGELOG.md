@@ -8,6 +8,35 @@ The four packages version together.
 
 ## [Unreleased]
 
+### Added
+
+- `reconstructKeyframeDelta` in `@4dgs/core`: the full population at an instant of a
+  `keyframe-delta` sequence — gaussian ids, centres, scales, rotations, linear RGB, marginal-folded
+  opacity, and object membership where a chunk carries it — in ascending `gaussian_id` order (spec
+  §11.7). `keyframeDeltaChunkAt` answers the seek that precedes it: the chunk whose half-open
+  `[t0, t1)` contains `t`. Until now the package published only `keyframeDeltaStatesJson`, which
+  samples positions and scales for the cross-SDK statement, so the first renderer written against
+  this package had to reimplement §11.7 to get every attribute of every gaussian.
+- `dequantizeRotation` accepts a `Float64Array` output as well as a `Float32Array`.
+
+### Changed
+
+- `keyframeDeltaStatesJson` is now computed from `reconstructKeyframeDelta` rather than from a
+  second private reconstruction, so the statement the SDKs are diffed on is exactly the rows a
+  consumer gets. Its `states[].liveCount` is the count of gaussians the reconstruction returns
+  rather than the chunk's composed population, which matches the Python reference.
+- A gaussian outside its own validity window is absent from a reconstructed instant rather than
+  present at full opacity: outside the window a gaussian does not exist at that time (spec §3),
+  which is how the `gaussian-birth` path has always decided it. Unobservable on files that carry one
+  full-duration window, which is every keyframe-delta file in the corpus today.
+
+### Removed
+
+- `KeyframeDeltaState.column()` and `KeyframeDeltaState.attributes()`, which were exported and
+  marked `@internal`. Composed bins are not public API; `reconstructKeyframeDelta` is the supported
+  way to values, and the bins are now a JavaScript private field so the boundary is enforced rather
+  than documented.
+
 ## [0.4.0] - 2026-08-10
 
 ### Added

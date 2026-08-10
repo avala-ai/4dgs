@@ -128,7 +128,9 @@ export function dequantizeRotation(
   bin1: number,
   bin2: number,
   step: number,
-  out: Float32Array,
+  // Either width: the `gaussian-birth` path stores float32 gaussians, the keyframe-delta
+  // reconstruction keeps float64 so that sums over a population agree across SDKs.
+  out: Float32Array | Float64Array,
   outOffset: number,
 ): void {
   const rest = REST_COMPONENTS[largest];
