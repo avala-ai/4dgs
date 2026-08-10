@@ -599,14 +599,16 @@ decodeKeyframeDeltaIndexed(Uint8List data) {
   }
 
   final index = <FourdgsChunkIndexEntry>[];
-  // File-relative, not summary-relative: `iterRecords` counts from the buffer it
-  // was handed, and a diagnostic naming a byte nobody can seek to is worse than
-  // one naming none.
+  // Already file-relative: `iterRecords(data, footer.summaryStart)` walks the
+  // whole file from that position, so the offsets it yields count from the start
+  // of the file. The indexed opener adds `summaryStart` because it iterates a
+  // detached summary buffer; doing the same here would name a byte at twice the
+  // offset, which is worse than naming none.
   final indexRecordOffsets = <int>[];
   for (final record in iterRecords(data, footer.summaryStart)) {
     if (record.opcode == opChunkIndex) {
       index.add(FourdgsChunkIndexEntry.parse(record.content));
-      indexRecordOffsets.add(footer.summaryStart + record.offset);
+      indexRecordOffsets.add(record.offset);
     } else {
       break;
     }

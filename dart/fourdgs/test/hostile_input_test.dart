@@ -348,12 +348,12 @@ void main() {
 
     test('a gaussian-birth entry cannot pose as a delta to dodge the guard', () {
       // The delta block is recognised by length and a leading byte, both of
-      // which a hostile gaussian-birth file can supply. If the guard trusted
-      // `kind` it would then check `liveCount` — zero here — and wave through
-      // four gaussians no seek can reach. Only a keyframe-delta Header gives
-      // `liveCount` that meaning, and this parser cannot see the Header, so it
-      // checks whichever count is nonzero.
-      final BytesBuilder body =
+      // which a hostile gaussian-birth file can supply. If the population rule
+      // trusted `kind` it would then read `liveCount` — zero here — and wave
+      // through four gaussians no seek can reach. Under a gaussian-birth Header
+      // `liveCount` means nothing, so the reader counts `gaussianCount` whatever
+      // the appended bytes claim.
+      final BytesBuilder entry =
           BytesBuilder()
             ..add(_f64(1.0)) // t0
             ..add(_f64(1.0)) // t1 — zero width
@@ -366,10 +366,66 @@ void main() {
             ..add(_u64(0)) // referenceOffset
             ..add(_u64(0)) // keyframeOffset
             ..add(_u32(0).sublist(0, 2)) // depth (u16)
-            ..add(_u64(0)); // liveCount: zero, the field it wants checked
+            ..add(_u64(0)); // liveCount: zero, the field it wants read
+
+      final BytesBuilder out =
+          BytesBuilder()
+            ..add(fourdgsMagic)
+            ..add(_record(opHeader, _headerContent(gaussianCount: 4)))
+            ..add(_record(opQuantization, _quantizationContent()));
+      final int summaryStart = out.length;
+      out.add(_record(opChunkIndex, entry.toBytes()));
+      final BytesBuilder footer =
+          BytesBuilder()
+            ..add(_u64(summaryStart))
+            ..add(_u64(0))
+            ..add(_u32(0));
+      out
+        ..add(_record(opFooter, footer.toBytes()))
+        ..add(fourdgsMagic);
+
       expect(
-        () => FourdgsChunkIndexEntry.parse(body.toBytes()),
-        throwsA(isA<FourdgsMalformedFile>()),
+        () => readFourdgsBytes(out.toBytes(), recoverTruncated: false),
+        throwsA(
+          isA<FourdgsMalformedFile>().having(
+            (FourdgsMalformedFile e) => e.message,
+            'message',
+            contains('zero-width interval'),
+          ),
+        ),
+      );
+    });
+
+    test('a delta that only kills gaussians is empty, whatever it counts', () {
+      // A delta entry's `gaussianCount` counts operations. A chunk that removes
+      // three gaussians and adds none declares three operations and a
+      // `liveCount` of zero — it IS empty, and a zero-width rule reading
+      // `gaussianCount` would refuse a file the reference writers can produce.
+      // This is why the parser checks neither count once the appended block is
+      // present, and the readers check the population instead.
+      final BytesBuilder entry =
+          BytesBuilder()
+            ..add(_f64(1.0)) // t0
+            ..add(_f64(1.0)) // t1 — zero width
+            ..add(_u64(0)) // chunkOffset
+            ..add(_u64(0)) // chunkLength
+            ..add(_u32(3)) // gaussianCount: three deaths
+            ..add(_u32(0)) // bandCount
+            ..addByte(1) // kind: delta
+            ..addByte(0) // deltaMode
+            ..add(_u64(0)) // referenceOffset
+            ..add(_u64(0)) // keyframeOffset
+            ..add(_u32(0).sublist(0, 2)) // depth (u16)
+            ..add(_u64(0)); // liveCount: nothing survives
+      final FourdgsChunkIndexEntry parsed = FourdgsChunkIndexEntry.parse(
+        entry.toBytes(),
+      );
+      expect(parsed.gaussianCount, 3);
+      expect(parsed.liveCount, 0);
+      expect(
+        indexEntryPopulation(parsed, isKeyframeDelta: true),
+        0,
+        reason: 'operations are not a population',
       );
     });
 
@@ -392,9 +448,37 @@ void main() {
             ..add(_u64(0)) // keyframeOffset
             ..add(_u32(0).sublist(0, 2)) // depth (u16)
             ..add(_u64(0)); // liveCount: zero, which is not the population here
+
+      final BytesBuilder out =
+          BytesBuilder()
+            ..add(fourdgsMagic)
+            ..add(
+              _record(
+                opHeader,
+                _headerContent(temporalModel: 'keyframe-delta'),
+              ),
+            )
+            ..add(_record(opQuantization, _quantizationContent()));
+      final int summaryStart = out.length;
+      out.add(_record(opChunkIndex, body.toBytes()));
+      final BytesBuilder footer =
+          BytesBuilder()
+            ..add(_u64(summaryStart))
+            ..add(_u64(0))
+            ..add(_u32(0));
+      out
+        ..add(_record(opFooter, footer.toBytes()))
+        ..add(fourdgsMagic);
+
       expect(
-        () => FourdgsChunkIndexEntry.parse(body.toBytes()),
-        throwsA(isA<FourdgsMalformedFile>()),
+        () => decodeKeyframeDeltaIndexed(out.toBytes()),
+        throwsA(
+          isA<FourdgsMalformedFile>().having(
+            (FourdgsMalformedFile e) => e.message,
+            'message',
+            contains('zero-width interval'),
+          ),
+        ),
       );
     });
 
@@ -516,21 +600,31 @@ void main() {
         ..add(_record(opFooter, footer.toBytes()))
         ..add(fourdgsMagic);
 
+      final Uint8List bytes = out.toBytes();
+      Object? thrown;
+      try {
+        decodeKeyframeDeltaIndexed(bytes);
+      } catch (e) {
+        thrown = e;
+      }
+      expect(thrown, isA<FourdgsMalformedFile>());
+      final String message = (thrown! as FourdgsMalformedFile).message;
+      expect(message, contains('zero-width interval'));
+
+      // The byte is checked, not merely present. A diagnostic that names an
+      // offset nobody can seek to is worse than one that names none, and an
+      // off-by-a-summary is exactly the mistake that reads as correct: the
+      // sentence is well-formed and the number is wrong. This walk over three
+      // read paths has produced that error twice.
+      final RegExp at = RegExp(r'record at byte (\d+)');
+      final Match? m = at.firstMatch(message);
+      expect(m, isNotNull, reason: message);
+      final int offset = int.parse(m!.group(1)!);
+      expect(offset, summaryStart, reason: 'the index record starts here');
       expect(
-        () => decodeKeyframeDeltaIndexed(out.toBytes()),
-        throwsA(
-          isA<FourdgsMalformedFile>()
-              .having(
-                (FourdgsMalformedFile e) => e.message,
-                'message',
-                contains('zero-width interval'),
-              )
-              .having(
-                (FourdgsMalformedFile e) => e.message,
-                'names the record',
-                contains('Chunk Index record at byte'),
-              ),
-        ),
+        bytes[offset],
+        opChunkIndex,
+        reason: 'and that byte is its opcode',
       );
     });
 

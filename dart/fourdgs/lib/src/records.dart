@@ -526,15 +526,20 @@ class FourdgsChunkIndexEntry {
       final keyframeOffset = c.u64();
       final depth = c.u16();
       final liveCount = c.u64();
-      // `gaussianCount` only. `liveCount` means "population" under a
-      // `keyframe-delta` Header and nothing at all otherwise, and the Header is
-      // not in scope here: this parser recognises the appended block by length
-      // and cannot tell a delta entry from a future revision's extra fields.
-      // Checking it here would refuse an empty entry whose appended bytes merely
-      // happen to be nonzero at that position — a forward-compatible file every
-      // other reader skips past. The reader-level check does have the Header,
-      // and applies the same rule to `liveCount` where it means something.
-      refuseNonemptyZeroWidth(gaussianCount, 'gaussians');
+      // No zero-width check here at all, on either count. An appended block
+      // means neither field is unambiguously a population: under a
+      // `keyframe-delta` Header a delta entry's `gaussianCount` counts
+      // operations, so a chunk that only kills gaussians declares three of them
+      // and a `liveCount` of zero — empty, and refused by a rule reading
+      // `gaussianCount`. And `liveCount` is only a population under that same
+      // Header, which this parser cannot see: it recognises the block by length
+      // and cannot tell a delta entry from fields a later revision adds.
+      //
+      // So the rule moves to whoever knows the temporal model. Both openers and
+      // the keyframe-delta reader compute the population with
+      // [indexEntryPopulation] and apply [refuseZeroWidthPopulation] to it,
+      // which catches everything this would have caught and nothing it should
+      // not have.
       return FourdgsChunkIndexEntry(
         t0: t0,
         t1: t1,

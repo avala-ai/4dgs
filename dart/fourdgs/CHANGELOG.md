@@ -30,7 +30,10 @@ plausible-looking output rather than an error, so nothing downstream notices:
   `keyframe-delta` entry the population is `liveCount` rather than the operation count, so that
   rule is applied by the readers, which know the temporal model — the record parser sees the
   appended block by length alone and cannot tell a delta entry from fields a later revision adds.
-  All three read paths apply it, including the dedicated keyframe-delta opener.
+  All three read paths apply it, including the dedicated keyframe-delta opener. The record parser
+  applies it only to an entry with no appended block, where `gaussianCount` is unambiguously a
+  population: a delta that only removes gaussians declares its removals there and a `liveCount` of
+  zero, and is empty despite the count.
 - **Streamed reader.** The chunk-index clock bound the indexed reader already applied, so a
   container is not accepted or refused according to which reader opened it; and a cross-check that
   the chunks assemble to the total the header declares, for complete files only — a truncated file
