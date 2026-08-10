@@ -74,9 +74,10 @@ _TEMPORAL_CHUNK_FLOATS = 28
 _STATIC_VERTEX_UINTS = 4
 _TEMPORAL_VERTEX_UINTS = 6
 
-# 4DV's temporal shader treats these as semantic sentinels, not ordinary
-# negative timestamps. The container has explicit representations for both
-# behaviours, so normalize them while importing:
+# Two values of `mu` are semantic sentinels rather than ordinary negative
+# timestamps: below either threshold the field selects a behaviour instead of
+# naming a time. The container has explicit representations for both, so
+# normalize them while importing:
 #   mu <= -5  — fixed position (no advection), but still temporally faded
 #   mu <= -10 — fixed position and always visible inside the segment window
 _STATIC_MU_SENTINEL = -5.0
