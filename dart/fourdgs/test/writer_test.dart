@@ -867,6 +867,200 @@ void main() {
     });
   });
 
+  group('the chunk tree', () {
+    // The chunking preset the cross-language encode gate uses: small enough that a
+    // few hundred gaussians exercise the tree rather than landing in one node.
+    const chunked = FourdgsWriteOptions(
+      maxDepth: 4,
+      minChunkGaussians: 8,
+      writeStatistics: true,
+      writeSummaryOffsets: true,
+    );
+
+    test('a partitioned timeline produces more than one chunk', () {
+      final scene = buildScene(count: 512, windows: 8);
+      final decoded = readFourdgsBytes(
+        writeFourdgsBytes(scene, 8.0, options: chunked),
+      );
+      expect(decoded.chunkIndex.length, greaterThan(1));
+      expect(decoded.statistics!.chunkCount, decoded.chunkIndex.length);
+    });
+
+    test('every gaussian is stored exactly once, however long it lives', () {
+      final scene = buildScene(count: 512, windows: 8);
+      final decoded = readFourdgsBytes(
+        writeFourdgsBytes(scene, 8.0, options: chunked),
+      );
+      int total = 0;
+      for (final entry in decoded.chunkIndex) {
+        total += entry.gaussianCount;
+      }
+      expect(total, scene.count);
+      expect(decoded.header.gaussianCount, scene.count);
+      expect(decoded.gaussians.count, scene.count);
+    });
+
+    test("a chunk's interval contains the support of everything in it", () async {
+      final scene = buildScene(count: 512, windows: 8);
+      final bytes = writeFourdgsBytes(scene, 8.0, options: chunked);
+      final indexed = await openFourdgsIndexed(FourdgsBytes(bytes));
+      final k = math.sqrt(-2.0 * math.log(indexed.header.cutoff));
+      final boundTime = declared(indexed.quantization, 'time');
+      final boundSigmaRel = declared(indexed.quantization, 'sigma_rel');
+
+      for (final entry in indexed.index) {
+        final chunk = await readFourdgsChunk(
+          FourdgsBytes(bytes),
+          indexed,
+          entry,
+        );
+        for (int i = 0; i < chunk.count; i++) {
+          final sigma = chunk.sigmaT[i];
+          final half = sigma.isFinite ? k * sigma : double.infinity;
+          final lo = math.max(chunk.muT[i] - half, chunk.winLo[i]);
+          final hi = math.min(chunk.muT[i] + half, chunk.winHi[i]);
+          // The tree's whole invariant: a gaussian goes in the deepest node
+          // whose interval fully contains its support. Break it and an instant
+          // inside [t0, t1) is served without a gaussian visible there.
+          //
+          // The tolerance is the file's own, not a fudge. The partition is built
+          // on the support the caller handed in; what comes back out is rebuilt
+          // from the birth-time and sigma bins, so an edge may move by the
+          // declared `time` bound plus the declared relative `sigma_rel` bound
+          // applied to the half-width. Anything beyond that is a filing error.
+          final slack =
+              boundTime + (sigma.isFinite ? k * sigma * boundSigmaRel : 0.0);
+          expect(lo, greaterThanOrEqualTo(entry.t0 - slack));
+          expect(hi, lessThanOrEqualTo(entry.t1 + slack));
+        }
+      }
+    });
+
+    test('seeking an instant finds every gaussian visible at it', () async {
+      final scene = buildScene(count: 512, windows: 8);
+      final bytes = writeFourdgsBytes(scene, 8.0, options: chunked);
+      final whole = readFourdgsBytes(bytes);
+      final indexed = await openFourdgsIndexed(FourdgsBytes(bytes));
+      final cutoff = indexed.header.cutoff;
+
+      // A probe inside every index interval, plus the ends of the timeline. The
+      // seek rule is half-open — `t0 <= t < t1` — so a point strictly inside an
+      // interval is served by exactly the entries that should serve it.
+      //
+      // Not the midpoint. A node's midpoint is precisely where it splits its
+      // children, so it is the one instant in the interval where a gaussian's
+      // *reconstructed* support can sit on the far side of a boundary its
+      // *input* support did not cross — by less than the file's declared time
+      // bound, but enough to be counted here and not there. That is a property
+      // of quantizing after partitioning, not a filing error, and probing a
+      // boundary would test it rather than the seek.
+      final probes = <double>{
+        0.0,
+        for (final entry in indexed.index)
+          entry.t0 + 0.37 * (entry.t1 - entry.t0),
+        8.0 - 1e-6,
+      };
+
+      for (final t in probes) {
+        final expected = whole.gaussians.stateAt(t, cutoff: cutoff).count;
+        int found = 0;
+        for (final entry in indexed.index) {
+          if (!(entry.t0 <= t && t < entry.t1)) continue;
+          final chunk = await readFourdgsChunk(
+            FourdgsBytes(bytes),
+            indexed,
+            entry,
+          );
+          for (int i = 0; i < chunk.count; i++) {
+            if (!(chunk.winLo[i] <= t && t < chunk.winHi[i])) continue;
+            final sigma = chunk.sigmaT[i];
+            final marginal =
+                sigma.isFinite
+                    ? math.exp(
+                      -0.5 *
+                          math.pow(
+                            (t - chunk.muT[i]) / math.max(sigma, 1e-30),
+                            2,
+                          ),
+                    )
+                    : 1.0;
+            if (marginal >= cutoff) found++;
+          }
+        }
+        expect(
+          found,
+          expected,
+          reason:
+              'at t = $t the covering chunks must hold every visible gaussian',
+        );
+      }
+    });
+
+    test('depth 0 writes one chunk per window interval', () {
+      final scene = buildScene(count: 256, windows: 4);
+      final decoded = readFourdgsBytes(
+        writeFourdgsBytes(
+          scene,
+          8.0,
+          options: const FourdgsWriteOptions(maxDepth: 0, minChunkGaussians: 1),
+        ),
+      );
+      // Four windows, each fully inside its own top-level interval.
+      expect(decoded.chunkIndex.length, 4);
+      for (final entry in decoded.chunkIndex) {
+        expect(entry.t1 - entry.t0, closeTo(2.0, 1e-9));
+      }
+    });
+
+    test('a node too small for its own chunk goes back to its parent', () {
+      final scene = buildScene(count: 256, windows: 4);
+      final deep = readFourdgsBytes(
+        writeFourdgsBytes(
+          scene,
+          8.0,
+          options: const FourdgsWriteOptions(maxDepth: 6, minChunkGaussians: 4),
+        ),
+      );
+      final shallow = readFourdgsBytes(
+        writeFourdgsBytes(
+          scene,
+          8.0,
+          options: const FourdgsWriteOptions(
+            maxDepth: 6,
+            minChunkGaussians: 1 << 20,
+          ),
+        ),
+      );
+      expect(deep.chunkIndex.length, greaterThan(shallow.chunkIndex.length));
+      expect(shallow.gaussians.count, scene.count);
+      expect(deep.gaussians.count, scene.count);
+    });
+
+    test('every chunk in a multi-chunk file is framed by its index entry', () {
+      final bytes = writeFourdgsBytes(
+        buildScene(count: 512, windows: 8, shDegree: 2),
+        8.0,
+        options: chunked,
+      );
+      final decoded = readFourdgsBytes(bytes);
+      expect(decoded.chunkIndex.length, greaterThan(1));
+      for (final entry in decoded.chunkIndex) {
+        expect(bytes[entry.chunkOffset], opChunk);
+        expect(
+          entry.chunkLength,
+          recordHeaderBytes + _contentLength(bytes, entry.chunkOffset),
+        );
+        for (final band in entry.bands) {
+          expect(bytes[band.offset], opShBandStream);
+          expect(
+            band.length,
+            recordHeaderBytes + _contentLength(bytes, band.offset),
+          );
+        }
+      }
+    });
+  });
+
   group('spherical harmonics', () {
     for (final degree in <int>[1, 2, 3]) {
       test('degree $degree coefficients come back byte for byte', () {

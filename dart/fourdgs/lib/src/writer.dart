@@ -76,6 +76,8 @@ class FourdgsWriteOptions {
     this.cutoff = fourdgsDefaultCutoff,
     this.codec = codecDeflate,
     this.level = 6,
+    this.maxDepth = 6,
+    this.minChunkGaussians = 2048,
     this.writeIndex = true,
     this.writeStatistics = false,
     this.writeSummaryOffsets = false,
@@ -101,6 +103,15 @@ class FourdgsWriteOptions {
 
   /// Deflate compression level, 0–9.
   final int level;
+
+  /// Depth of the temporal partition below each window. `0` writes one chunk per
+  /// window interval, which is the coarsest partition that is still a partition.
+  final int maxDepth;
+
+  /// The population a subdivision has to reach to be worth its own chunk. Below
+  /// it a node hands its gaussians back to its parent, so a deep tree over a
+  /// small scene does not turn into hundreds of chunks of four.
+  final int minChunkGaussians;
 
   final bool writeIndex;
   final bool writeStatistics;
@@ -1103,22 +1114,151 @@ class _Plan {
   final List<int> members;
 }
 
-/// Bounded spatial chunks spanning the whole partitioned timeline.
+/// Assign gaussians to the nodes of a temporal interval tree.
 ///
-/// Temporal splitting is issue #117, so a seek still reads every one of these
-/// overlapping entries. The fixed population cap exists for the sink contract:
-/// one record's streams and framing copy are bounded independently of scene
-/// size, and each member list is released before the next one is made.
-Iterable<_Plan> _planChunks(
+/// A gaussian goes in the deepest node whose interval fully contains its
+/// support, so it is stored exactly once however long it lives, and a reader
+/// that wants one instant fetches the nodes covering it instead of the scene.
+///
+/// The top level is the window table rather than a power-of-two split of the
+/// whole timeline, and that is the part worth stating: gaussians fitted over one
+/// window straddle the boundaries of an even split, so every one of them would
+/// be pushed up to the root and the tree would have one node in it.
+List<_Plan> _planChunks(
   FourdgsGaussianSet g,
   List<double> tops,
   FourdgsWriteOptions options,
-) sync* {
-  for (int start = 0; start < g.count; start += _maxGaussiansPerChunk) {
-    final end = math.min(start + _maxGaussiansPerChunk, g.count);
-    final members = <int>[for (int i = start; i < end; i++) i];
-    yield _Plan(tops.first, tops.last, 0, _mortonOrder(g, members));
+) {
+  final n = g.count;
+  if (n == 0) return const <_Plan>[];
+
+  // Support, clipped to each gaussian's own validity window and computed with
+  // the file's own cutoff — the same threshold the Header declares, so the
+  // partition a reader would derive is the partition the encoder built.
+  final support = g.support(cutoff: options.cutoff);
+  final lo = support.lo;
+  final hi = support.hi;
+
+  final assigned = Int32List(n)..fillRange(0, n, -1);
+  final nodes = <_Node>[];
+
+  /// Push [pool] down the tree, returning the gaussians that could not descend
+  /// because their support straddles a boundary. Those belong to the caller.
+  List<int> descend(double a, double b, int level, List<int> pool) {
+    if (pool.isEmpty || level >= options.maxDepth) return pool;
+    final mid = 0.5 * (a + b);
+    final stay = <int>[];
+    final left = <int>[];
+    final right = <int>[];
+    for (final i in pool) {
+      if (hi[i] <= mid) {
+        left.add(i);
+      } else if (lo[i] >= mid) {
+        right.add(i);
+      } else {
+        stay.add(i);
+      }
+    }
+    for (final child in <_Child>[_Child(a, mid, left), _Child(mid, b, right)]) {
+      // A node too small to be worth its own chunk hands its gaussians back to
+      // the parent rather than producing a chunk of four.
+      if (child.members.length < options.minChunkGaussians) {
+        stay.addAll(child.members);
+        continue;
+      }
+      final kept = descend(child.t0, child.t1, level + 1, child.members);
+      if (kept.isNotEmpty) {
+        nodes.add(_Node(child.t0, child.t1, level + 1));
+        for (final i in kept) {
+          assigned[i] = nodes.length - 1;
+        }
+      }
+    }
+    stay.sort();
+    return stay;
   }
+
+  for (int w = 0; w + 1 < tops.length; w++) {
+    final a = tops[w];
+    final b = tops[w + 1];
+    final pool = <int>[
+      for (int i = 0; i < n; i++)
+        if (assigned[i] < 0 && lo[i] >= a - 1e-9 && hi[i] <= b + 1e-9) i,
+    ];
+    final kept = descend(a, b, 0, pool);
+    if (kept.isNotEmpty) {
+      nodes.add(_Node(a, b, 0));
+      for (final i in kept) {
+        assigned[i] = nodes.length - 1;
+      }
+    }
+  }
+
+  // Whatever no window interval contained — a gaussian whose support crosses a
+  // window boundary, or one clipped by nothing at all. It belongs to the root,
+  // which spans the whole partitioned timeline.
+  final rest = <int>[
+    for (int i = 0; i < n; i++)
+      if (assigned[i] < 0) i,
+  ];
+  if (rest.isNotEmpty) {
+    nodes.add(_Node(tops.first, tops.last, -1));
+    for (final i in rest) {
+      assigned[i] = nodes.length - 1;
+    }
+  }
+
+  final plans = <_Plan>[];
+  for (int node = 0; node < nodes.length; node++) {
+    final members = <int>[
+      for (int i = 0; i < n; i++)
+        if (assigned[i] == node) i,
+    ];
+    if (members.isEmpty) continue;
+    plans.add(
+      _Plan(
+        nodes[node].t0,
+        nodes[node].t1,
+        math.max(nodes[node].level, 0),
+        members,
+      ),
+    );
+  }
+  // Shallow nodes first, then by start time: a fixed order, so two runs of this
+  // encoder lay the same chunks out at the same offsets — and so do two
+  // implementations of it.
+  plans.sort(
+    (a, b) => a.level != b.level ? a.level - b.level : a.t0.compareTo(b.t0),
+  );
+
+  if (plans.isEmpty) {
+    plans.add(
+      _Plan(tops.first, tops.last, 0, <int>[for (int i = 0; i < n; i++) i]),
+    );
+  }
+  return <_Plan>[
+    for (final plan in plans)
+      _Plan(plan.t0, plan.t1, plan.level, _mortonOrder(g, plan.members)),
+  ];
+}
+
+/// One node of the interval tree: its span and its depth below the window level.
+class _Node {
+  const _Node(this.t0, this.t1, this.level);
+
+  final double t0;
+  final double t1;
+  final int level;
+}
+
+/// A candidate child during the descent: half of a parent's interval, and the
+/// gaussians whose support fits inside it.
+class _Child {
+  const _Child(this.t0, this.t1, this.members);
+
+  final double t0;
+  final double t1;
+  final List<int> members;
 }
 
 /// Reorder a chunk's members for spatial locality, by Morton code over their own

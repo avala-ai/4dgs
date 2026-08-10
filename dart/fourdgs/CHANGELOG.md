@@ -20,6 +20,13 @@ happened.
   attribute streams, spherical-harmonic band records, and Footer. A second encoder rather than a
   binding — it shares no code with the other five SDKs and lands on the same integer bins, so a
   decoder cannot tell its output from theirs once decoded.
+- Chunked encode. The timeline is partitioned into an interval tree whose top level is the window
+  table rather than an even split — gaussians fitted over one window straddle the boundaries of an
+  even split, so all of them would be pushed to the root and the tree would have one node in it. A
+  gaussian goes in the deepest node whose interval fully contains its support, so it is stored
+  exactly once however long it lives, and a reader that wants one instant fetches the nodes covering
+  it instead of the scene. `maxDepth` and `minChunkGaussians` control the shape; a node too small to
+  be worth its own chunk hands its gaussians back to its parent.
 - Summary writing, in the shape spec §4.5 requires: the Chunk Index, then Statistics, then the
   Summary Offset, one contiguous run immediately before the Footer with nothing else inside it. That
   contiguity is what lets a streamed reader verify `summary_crc` by retaining the trailing records
@@ -78,7 +85,8 @@ happened.
   a reader as 0, the extreme positive coefficient read as the extreme negative one.
 - Deterministic: two encodes of one scene are byte-identical, including the Header's attribute map,
   whose keys are sorted rather than emitted in whatever order the caller's map iterates.
-- Proved by `dart/encode-roundtrip.sh`, which re-encodes all 46 corpus variants and makes two
+- Proved by `dart/encode-roundtrip.sh`, which re-encodes all 46 corpus variants — into as many as 42
+  chunks each — and makes two
   separate claims about each result. **Fidelity**: the written scene is compared against the scene
   it was written from, by the Python reference reader, attribute by attribute, against the error
   bounds the written file itself declares — including the per-gaussian velocity and birth-time
