@@ -24,14 +24,6 @@ from fourdgs.opcode import HEADER
 from fourdgs.records import Header
 from fourdgs.serialization import MAGIC, check_magic, iter_records
 
-#: Variants this runner declines. Empty: the reference implementation supports the whole
-#: matrix, which is the only reason it is allowed to be the reference.
-UNSUPPORTED: frozenset[str] = frozenset()
-
-
-def supports_variant(name: str) -> bool:
-    return name not in UNSUPPORTED
-
 
 def _temporal_model(data: bytes) -> str | None:
     """The Header's temporal model, read without decoding the gaussians.
@@ -125,8 +117,6 @@ def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print("usage: decode_streamed.py <file.4dgs>", file=sys.stderr)
         return 2
-    if "--supports" in argv:
-        return 0
     try:
         print(run(argv[1]))
     except fourdgs.FourdgsError as exc:

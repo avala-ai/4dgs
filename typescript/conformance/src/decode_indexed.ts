@@ -33,11 +33,6 @@ import { checkIndexedInvariants, CountingReadable } from "./checks.js";
 /** How much of the front is read to learn the temporal model without decoding gaussians. */
 const HEADER_PROBE_BYTES = 64 * 1024;
 
-/** A file written without an index cannot be read this way; the harness skips those. */
-export function supportsVariant(name: string): boolean {
-  return name.includes("UseChunkIndex");
-}
-
 /** The Header's temporal model, read from a bounded prefix. */
 async function temporalModel(source: IReadable, size: number): Promise<string | null> {
   const probe = await source.read(0n, BigInt(Math.min(size, HEADER_PROBE_BYTES)));
