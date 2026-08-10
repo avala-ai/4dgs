@@ -11,7 +11,7 @@ All notable changes to the Python package are documented here, following
 - **`4dgs validate` no longer calls two malformed files valid.** `UnknownStreamCodec` and
   `WindowIndexOutOfRange` — two of the conformance corpus's seven invalid variants — were reported
   `valid`, exit 0. Both break a rule inside a chunk's attribute streams, and the validator only
-  walked the framing, which steps *over* a chunk by its declared length rather than into it. It now
+  walked the framing, which steps _over_ a chunk by its declared length rather than into it. It now
   decodes the chunks after the framing checks, one resident at a time on the indexed path (AGENTS.md
   §1), so validating a file larger than memory still works. All seven variants are now refused, each
   by the identifier its own corpus entry declares.
@@ -27,7 +27,8 @@ All notable changes to the Python package are documented here, following
 - **The reserved-provenance note names the range that is actually reserved.** `0x24` and `0x25` were
   assigned to the object layer, so `(0x24-0x2F, section 5.15.6)` told its reader that two records
   this package parses had been skipped. It reads `(0x26-0x2F, …)` now. The note still fires only for
-  the still-reserved tail: a capture carrying frames, sensors, a rig and a georeference collects none.
+  the still-reserved tail: a capture carrying frames, sensors, a rig and a georeference collects
+  none.
 
 ### Added
 
