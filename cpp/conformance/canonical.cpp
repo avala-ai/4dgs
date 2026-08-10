@@ -507,5 +507,11 @@ std::string canonical(const SceneSummary& summary) {
   return Json::object(std::move(rootMembers)).render();
 }
 
+std::string refusalJson(const std::string& identifier) {
+  std::map<std::string, Json> members;
+  members.emplace("refused", Json::string(identifier));
+  return Json::object(std::move(members)).render();
+}
+
 }  // namespace conformance
 }  // namespace fourdgs

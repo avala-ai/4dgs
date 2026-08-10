@@ -55,7 +55,7 @@ or composition order of its own.
 | Reconstruction at an instant                      | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Encode `keyframe-delta`                           | Yes    | Planned    | Yes     | Planned | Planned | Planned |
 | Unknown-record skipping                           | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Refusal diagnosis (named, not merely refused)     | Yes    | Yes        | Yes     | No      | No      | No      |
+| Refusal diagnosis (named, not merely refused)     | Yes    | Yes        | Yes     | Yes     | No      | No      |
 | Private-range records                             | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Encode                                            | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
 | Chunked encode                                    | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
@@ -243,9 +243,11 @@ decoder that refuses every invalid file for the wrong reason is indistinguishabl
 only checks that something was raised, from one that refuses correctly. Rust carries the identifier
 on the error itself — `Error::refusal_code`, from the constants in `fourdgs::error::refusal` — and
 TypeScript does the same, as an optional `refusalCode` on `FourdgsError` from the constants in
-`Refusal`, so a consumer can branch on the refusal without reading its prose. The three remaining
-`No` cells are the honest state: those SDKs refuse these files today, and nothing here proves they
-refuse them for the right reason.
+`Refusal`. C++ carries the same identifier on `fourdgs::Error::refusal`, read across the C ABI
+through `fourdgs_last_refusal_code`; it is a `std::optional`, because a truncated file and a
+transport that failed are real errors the refusal table does not name. A consumer can branch on any
+of these refusals without reading its prose. The two remaining `No` cells are the honest state:
+those SDKs refuse these files today, and nothing here proves they refuse them for the right reason.
 
 The row was also the first thing to find a gap in the reference: neither an unknown `temporal_model`
 nor an unknown quantization `scheme` was refused at all before it existed, despite the registry

@@ -25,6 +25,20 @@ All notable changes to the C++ package are documented here, following
   `PROJECT_VERSION` rather than written out a second time. It returned `"0.0.0"` while the package
   answered `find_package(fourdgs-cpp 0.1)`, so an application reporting the linked SDK version and
   the build that resolved it disagreed.
+- Refusal diagnosis: `fourdgs::Error::refusal` names _which_ rule refused a file — `magic-mismatch`,
+  `unsupported-major-version`, `unknown-temporal-model`, `unknown-quantization-scheme`,
+  `unknown-stream-codec`, `window-index-out-of-range` — in the same words every other SDK prints.
+  `ErrorCode` says what kind of thing went wrong and `kUnsupported` alone covers three of those six,
+  so the code could not answer the question. A `std::optional`, and empty for every failure the
+  specification's table does not name: a truncated file and a transport that gave up are real errors
+  with no rule behind them. Additive, so existing catch sites are unchanged. Read across the C ABI
+  from `fourdgs_last_refusal_code` as a (pointer, length) pair and copied by length — the string is
+  not NUL-terminated, and reading it as though it were is the ABI bug that shape exists to prevent.
+- The `decode_streamed` and `decode_indexed` conformance runners answer a refused file with
+  `{"refused": "<identifier>"}` on stdout and exit 0, so the suite can tell "refused the file" from
+  "refused it for the right reason" — a decoder that rejects a bad-magic file because it mis-parsed
+  the version passes the first and fails the second. `cpp` joins `REFUSAL_FAMILIES`, and the
+  seven-variant invalid corpus is read on both paths: the suite goes from 105 checks to 119.
 - keyframe-delta decode: `fourdgs::keyframeDeltaStatesJson` and `fourdgs::peekTemporalModel`,
   binding the core's additive states-JSON C ABI. The summary is computed in the Rust core, so the
   binding does no arithmetic of its own; the `decode_streamed` and `decode_indexed` conformance
