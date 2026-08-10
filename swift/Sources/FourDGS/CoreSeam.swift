@@ -766,7 +766,7 @@ enum Core {
     /// Translate a status into a Swift error, carrying the core's own message.
     ///
     /// The mapping is deliberately partial. A code this binding has no case for becomes
-    /// ``FourDGSError/core(code:message:)`` with the message passed through verbatim, so a
+    /// ``FourDGSError/core(code:message:refusal:)`` with the message passed through verbatim, so a
     /// core that grows a failure mode stays diagnosable from Swift rather than being
     /// flattened into "decode failed".
     ///

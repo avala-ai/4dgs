@@ -43,12 +43,21 @@ public enum RefusalCode: String, Sendable, Equatable, CaseIterable {
 /// is broken and the fix is to re-encode it; an unsupported one is legal and the fix is a
 /// newer reader. Collapsing the two sends people to debug the wrong thing.
 ///
-/// Three cases carry a ``RefusalCode`` as a trailing associated value, defaulted to `nil`
-/// so every existing call site still compiles. They are the three the C ABI seam builds,
-/// and each is many-to-one: ``unsupportedCodec`` alone stands for three different
-/// identifiers. That ambiguity is exactly why the core grew
+/// Three cases carry a ``RefusalCode`` as a trailing associated value. They are the three
+/// the C ABI seam builds, and each is many-to-one: ``unsupportedCodec`` alone stands for
+/// three different identifiers. That ambiguity is exactly why the core grew
 /// `fourdgs_last_refusal_code` instead of three more status codes, and the value is
 /// carried rather than recomputed because only the core knows which rule it applied.
+///
+/// The `= nil` default is a **construction** convenience and nothing more: `.malformed(…)`
+/// spelled with the previous four arguments still builds. It does not make the addition
+/// source-compatible for consumers, because a default has no effect on a pattern — code
+/// that destructures `case .malformed(let offset, let record, let field, let reason)` now
+/// fails to compile with "tuple pattern has the wrong length". Adding an associated value
+/// to a public case is a breaking change to the API, and this one is taken deliberately:
+/// nothing is released, no package registry entry exists, and the alternative — a seventh
+/// case, or a parallel error type — would break every exhaustive `switch` instead, which
+/// is worse. Anyone destructuring these three cases adds a `_` for the new element.
 public enum FourDGSError: Error, Equatable, Sendable {
 
     // MARK: Malformed — the file is wrong

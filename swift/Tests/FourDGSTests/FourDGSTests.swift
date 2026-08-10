@@ -352,16 +352,32 @@ final class RefusalTests: XCTestCase {
         }
     }
 
-    /// The identifier rides along without displacing anything: the message, the status and
-    /// every pattern that matched these cases before still say what they said.
-    func testCarryingAnIdentifierChangesNothingElse() {
+    /// The identifier rides along without displacing anything the case already carried: the
+    /// message still reads the same and the values in front of it are still in front of it.
+    ///
+    /// What it *does* displace is the arity of a pattern. Destructuring now needs a slot for
+    /// the new element, which is a source-breaking change to a public case and is recorded as
+    /// one in `swift/CHANGELOG.md`. This test spells the new shape out so the break is pinned
+    /// by a compile rather than left as a claim in prose.
+    func testCarryingAnIdentifierDisplacesOnlyThePatternsArity() {
         let error = FourDGSError.unsupportedCodec(
             offset: 12, record: "Chunk", name: "brotli", refusal: .unknownStreamCodec)
         XCTAssertEqual(error.refusalCode, .unknownStreamCodec)
         XCTAssertTrue("\(error)".contains("unsupported codec \"brotli\" named by Chunk at byte 12"))
-        // Defaulted, so a call site written before the identifier existed still compiles and
-        // still means what it meant: this refusal has no name in the table.
-        XCTAssertNil(FourDGSError.unsupportedCodec(offset: 12, record: "Chunk", name: "brotli").refusalCode)
+
+        guard case .unsupportedCodec(let offset, let record, let name, let refusal) = error else {
+            return XCTFail("expected unsupportedCodec, got \(error)")
+        }
+        XCTAssertEqual(offset, 12)
+        XCTAssertEqual(record, "Chunk")
+        XCTAssertEqual(name, "brotli")
+        XCTAssertEqual(refusal, .unknownStreamCodec)
+
+        // The default is a construction convenience only: a call site written before the
+        // identifier existed still compiles and still means what it meant — this refusal has
+        // no name in the table. A *pattern* written before it does not; that is the break.
+        XCTAssertNil(
+            FourDGSError.unsupportedCodec(offset: 12, record: "Chunk", name: "brotli").refusalCode)
     }
 }
 
