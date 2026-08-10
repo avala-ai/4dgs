@@ -582,9 +582,42 @@ int indexEntryPopulation(
   FourdgsChunkIndexEntry entry, {
   required bool isKeyframeDelta,
 }) =>
-    (isKeyframeDelta && entry.extended && entry.kind == 1)
+    // `kind != 0`, not `kind == 1`, because that is what the keyframe-delta
+    // reader does when it composes: every nonzero kind is a delta there. Reading
+    // `kind == 1` here made an entry declaring kind 2 a keyframe to this rule and
+    // a delta to the decoder, and a file only has to disagree with itself once.
+    // Unknown kinds are refused outright by [checkIndexEntry]; this stays
+    // consistent with the decoder for the window where both are reachable.
+    (isKeyframeDelta && entry.extended && entry.kind != 0)
         ? entry.liveCount
         : entry.gaussianCount;
+
+/// Everything an index entry can be refused for that needs the Header to see it.
+///
+/// Three read paths reach a Chunk Index and all three need these, which is why
+/// they are one call. [where] locates the record — "the Chunk Index record at
+/// byte N (entry i of n)".
+void checkIndexEntry(
+  FourdgsChunkIndexEntry entry, {
+  required bool isKeyframeDelta,
+  required String where,
+}) {
+  // Two kinds are defined (spec §5.8): 0 keyframe, 1 delta. A third is not a
+  // forward-compatible extension — it is a chunk this build cannot place in a
+  // chain, and guessing which of the two it resembles is how one reader
+  // composes a scene the next one refuses.
+  if (isKeyframeDelta && entry.extended && entry.kind > 1) {
+    throw FourdgsMalformedFile(
+      '$where declares chunk_kind ${entry.kind}; expected 0 for a keyframe or '
+      '1 for a delta',
+    );
+  }
+  refuseZeroWidthPopulation(
+    entry,
+    indexEntryPopulation(entry, isKeyframeDelta: isKeyframeDelta),
+    where,
+  );
+}
 
 /// Refuses gaussians nothing can ever reach, over an interval of no width.
 ///

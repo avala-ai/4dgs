@@ -34,6 +34,11 @@ plausible-looking output rather than an error, so nothing downstream notices:
   applies it only to an entry with no appended block, where `gaussianCount` is unambiguously a
   population: a delta that only removes gaussians declares its removals there and a `liveCount` of
   zero, and is empty despite the count.
+- **Keyframe-delta index.** A `chunk_kind` other than 0 or 1 — not a forward-compatible
+  extension but a chunk that cannot be placed in a chain, and one the population rule and the
+  composer read differently. And a chain whose composed population disagrees with the `live_count`
+  the index declares: §5.8 states that duplication is there to be checked, and checking it is what
+  stops an entry declaring nothing from summarising a payload that decodes to something.
 - **Streamed reader.** The chunk-index clock bound the indexed reader already applied, so a
   container is not accepted or refused according to which reader opened it; and a cross-check that
   the chunks assemble to the total the header declares, for complete files only — a truncated file

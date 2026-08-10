@@ -324,14 +324,12 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
     // the clock only bounds an entry when there IS an end. The start still
     // does: at duration zero the only instant a seek can ask for is 0, so an
     // entry beginning after it is unreachable.
+    final String where =
+        'the Chunk Index record at byte ${indexRecordOffsets[i]} (entry $i of ${index.length})';
+    checkIndexEntry(entry, isKeyframeDelta: isKeyframeDelta, where: where);
     final int population = indexEntryPopulation(
       entry,
       isKeyframeDelta: isKeyframeDelta,
-    );
-    refuseZeroWidthPopulation(
-      entry,
-      population,
-      'the Chunk Index record at byte ${indexRecordOffsets[i]} (entry $i of ${index.length})',
     );
     if (population > 0 &&
         (entry.t1 <= 0.0 ||

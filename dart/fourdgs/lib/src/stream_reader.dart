@@ -393,14 +393,12 @@ FourdgsScene readFourdgsBytes(
   final bool isKeyframeDelta = header.temporalModel == 'keyframe-delta';
   for (int i = 0; i < chunkIndex.length; i++) {
     final entry = chunkIndex[i];
+    final String where =
+        'the Chunk Index record at byte ${chunkIndexRecordOffsets[i]} (entry $i of ${chunkIndex.length})';
+    checkIndexEntry(entry, isKeyframeDelta: isKeyframeDelta, where: where);
     final int population = indexEntryPopulation(
       entry,
       isKeyframeDelta: isKeyframeDelta,
-    );
-    refuseZeroWidthPopulation(
-      entry,
-      population,
-      'the Chunk Index record at byte ${chunkIndexRecordOffsets[i]} (entry $i of ${chunkIndex.length})',
     );
     // A zero-duration scene is not a scene with no clock: a static asset is
     // written as `duration_sec = 0` with one nonempty entry just past zero, and

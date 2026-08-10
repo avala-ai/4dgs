@@ -619,18 +619,34 @@ decodeKeyframeDeltaIndexed(Uint8List data) {
   // reaches composition, where the entry it describes is unreachable but the
   // chunk metadata around it is not.
   for (int i = 0; i < index.length; i++) {
-    refuseZeroWidthPopulation(
+    checkIndexEntry(
       index[i],
-      indexEntryPopulation(index[i], isKeyframeDelta: true),
-      'the Chunk Index record at byte ${indexRecordOffsets[i]} (entry $i of '
-      '${index.length})',
+      isKeyframeDelta: true,
+      where:
+          'the Chunk Index record at byte ${indexRecordOffsets[i]} (entry $i of '
+          '${index.length})',
     );
   }
   checkTiling(index);
 
   final chunks = <KeyframeDeltaChunk>[];
-  for (final entry in index) {
+  for (int i = 0; i < index.length; i++) {
+    final entry = index[i];
     final state = _composeChain(data, index, entry);
+    // The index says how many gaussians are live over this interval and the
+    // chunks say what they are, and §5.8 calls that duplication a cheap
+    // corruption check. It is also the only thing standing between a zero-width
+    // entry declaring nothing and a payload composing to something: the index
+    // rule above reads the entry, and the entry is not the file.
+    final int declared = indexEntryPopulation(entry, isKeyframeDelta: true);
+    if (state.count != declared) {
+      throw FourdgsMalformedFile(
+        'the Chunk Index record at byte ${indexRecordOffsets[i]} (entry $i of '
+        '${index.length}) declares $declared live gaussians over '
+        '[${entry.t0}, ${entry.t1}), but its chain composes to ${state.count}; '
+        'expected the index and the chunks to agree',
+      );
+    }
     int? updateCount;
     int? birthCount;
     int? deathCount;
@@ -995,7 +1011,11 @@ List<double> _probeTimes(List<KeyframeDeltaChunk> chunks, double durationSec) {
   double round9(double v) => double.parse(v.toStringAsFixed(9));
   for (final c in chunks) {
     times.add(round9(c.t0));
-    times.add(round9((c.t0 + c.t1) / 2.0));
+    // An open-ended chunk has no midpoint: `(t0 + Infinity) / 2` is `Infinity`,
+    // which is not an instant inside `[t0, Infinity)` or inside anything else.
+    // Its `t0` is already in the list, so the interval is still probed.
+    final double mid = (c.t0 + c.t1) / 2.0;
+    if (mid.isFinite) times.add(round9(mid));
   }
   times.add(round9(math.max(0.0, durationSec - 1e-6)));
   final sorted = times.toList()..sort();
