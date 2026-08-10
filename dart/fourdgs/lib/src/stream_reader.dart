@@ -161,7 +161,10 @@ FourdgsScene readFourdgsBytes(
         case opHeader:
           header = FourdgsHeader.parse(record.content);
         case opQuantization:
-          quantization = FourdgsQuantization.parse(record.content);
+          quantization = FourdgsQuantization.parse(
+            record.content,
+            fileOffset: record.offset + recordHeaderBytes,
+          );
         case opWindowTable:
           windows = FourdgsWindowTable.parse(record.content).windows;
         case opChunk:
@@ -252,7 +255,10 @@ FourdgsScene readFourdgsBytes(
           }
           audioPayloads[payload.sourceId] = payload.data;
         case opCamera:
-          final c = FourdgsCamera.parse(record.content);
+          final c = FourdgsCamera.parse(
+            record.content,
+            fileOffset: record.offset + recordHeaderBytes,
+          );
           camera = FourdgsCameraTrajectory(
             fovYDeg: c.fovYDeg,
             position: c.position,

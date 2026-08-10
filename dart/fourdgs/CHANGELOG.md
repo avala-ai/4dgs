@@ -55,6 +55,46 @@ plausible-looking output rather than an error, so nothing downstream notices:
   returns the decoded prefix with `truncated == true` for both. What a complete file cannot do is
   disagree with itself — once the walk reaches the Footer, the totals above are checked.
 
+### Resource ceilings
+
+The hardening above is about what is _legal_ — which files conform. This is about what is
+_affordable_. A malformed length field could still size an allocation before anything noticed it was
+malformed, which is the difference between refusing a bad file and being taken down by one. Every
+ceiling here is shared **by value** with the other SDKs, because a ceiling only one implementation
+has means a file that decodes in three of them and is refused in the fourth:
+
+- **Total decoded bytes for a streamed read.** A keyframe-delta chunk's attribute streams are now
+  framed first, priced as a block, and only then decoded. Each stream was already capped on its own,
+  but nothing capped what a block of them added up to: attribute ids are a byte wide, so one group
+  may carry 256 of them and a delta chunk carries three groups — and a constant-mode stream declares
+  an array of any size from a payload of nine bytes. A one-kilobyte group could ask this decoder for
+  tens of gigabytes and pass every check on the way. The ceiling is `maxChunkDecodedBytes`, 512 MiB,
+  the number this package already applied to a `gaussian-birth` chunk and the same
+  `MAX_STREAM_BYTES` Python, Rust and TypeScript apply.
+- **Camera keyframe count.** `maxTrajectorySamples`, 1,000,000, which is `MAX_TRAJECTORY_SAMPLES` in
+  Python, Rust and TypeScript. A camera path is a pose trajectory, so it is held to the ceiling
+  every other one in this format already had; the constant was named `maxRigTrajectorySamples` and
+  now covers the Rig Trajectory, the Object Track and the Camera record alike.
+- **Quantization scheme.** `uniform-v1` is what this build implements, and a record naming anything
+  else is refused as an unsupported codec rather than decoded through a grid it was not given — the
+  steps are the only description of what a bin means, so reading `uniform-v9` bins through
+  `uniform-v1` arithmetic produces a scene that is wrong everywhere and complains nowhere.
+- **Quantization parameter magnitude.** Every step and `pos_origin` component must be finite (spec
+  §5.3), and the refusal names the field. This decoder acts on the rule rather than reporting it for
+  a reason specific to Dart: the per-gaussian pitches are derived with `log2` and rounded with
+  `floor`, and `double.floor()` on a NaN or an infinity throws `UnsupportedError`, which names no
+  byte, no record and no field.
+- **A default cutoff, from one constant.** `fourdgsDefaultCutoff` (0.05, `DEFAULT_CUTOFF` elsewhere)
+  now supplies every default in the package rather than a repeated literal, and `stateAt` and
+  `support` refuse a threshold outside `(0, 1]` instead of turning it into an infinite support
+  radius or a comparison that keeps the whole scene. `support` derives its half-width through
+  `supportK`, so there is one implementation of the rule.
+
+Each ceiling names the byte, the record, the value and the expectation, so
+`FourdgsQuantization.parse` and `FourdgsCamera.parse` take the `fileOffset` their record begins at,
+as `FourdgsChunkIndexEntry` already did, and the chunk parsers report where their stream blocks
+start.
+
 ### Fixed
 
 - **A truncated Header is not an unsupported one.** A Header that ended after its `temporal_model`

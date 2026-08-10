@@ -37,6 +37,7 @@ library;
 
 import 'exceptions.dart';
 import 'provenance.dart';
+import 'quantization.dart';
 import 'records.dart';
 import 'model.dart';
 
@@ -229,7 +230,7 @@ FourdgsState fourdgsStateAtWithObjects(
   FourdgsGaussianSet gaussians,
   FourdgsObjectLayer? objects,
   double t, {
-  double cutoff = 0.05,
+  double cutoff = fourdgsDefaultCutoff,
 }) {
   final state = gaussians.stateAt(t, cutoff: cutoff);
   final ids = state.objectId;

@@ -226,10 +226,18 @@ class FourdgsQuantization {
   /// Declared maximum deviation per attribute, as decimal strings.
   final Map<String, String> bounds;
 
-  static FourdgsQuantization parse(Uint8List content) {
+  /// [fileOffset] is where `content` begins in the file, for the same reason
+  /// [FourdgsChunkIndexEntry.parse] takes one: a refusal that names byte 0
+  /// names the start of a record's content, which is not a byte anybody can
+  /// seek to. Defaulted rather than required, because a caller holding a bare
+  /// record has no file to be relative to.
+  static FourdgsQuantization parse(Uint8List content, {int fileOffset = 0}) {
     final c = FourdgsCursor(content);
+    final schemeAt = fileOffset + c.pos;
     final scheme = c.string();
+    final originAt = fileOffset + c.pos;
     final origin = c.f64s(3);
+    final stepsAt = fileOffset + c.pos;
     final steps = c.f64s(8);
     final stepSh = c.u8();
     final bounds = c.strMap();
@@ -240,6 +248,20 @@ class FourdgsQuantization {
       throw FourdgsMalformedFile(
         "Quantization.bounds contains object_id='${bounds['object_id']}'; "
         'object_id is an exact label and MUST NOT carry a bound',
+      );
+    }
+    _checkQuantizationMagnitudes(origin, originAt, steps, stepsAt);
+    // Last, after every mandatory field has been read, for the reason the
+    // Header checks its temporal model last: "a scheme this build does not
+    // implement" is a statement about a whole record, and a record that ends
+    // inside its bounds map is not one — it is truncated, and answering
+    // "unsupported" would send its holder off to add a codec for a file that
+    // needs none.
+    if (!_knownQuantizationSchemes.contains(scheme)) {
+      throw FourdgsUnsupportedCodec(
+        'the Quantization record at byte $schemeAt declares scheme "$scheme", '
+        'which this build does not implement; expected one of '
+        '${_knownQuantizationSchemes.join(", ")}',
       );
     }
     return FourdgsQuantization(
@@ -258,6 +280,76 @@ class FourdgsQuantization {
     );
   }
 }
+
+/// Quantization schemes this build implements.
+///
+/// `KNOWN_QUANTIZATION_SCHEMES` in Python and TypeScript, with the same single
+/// member. The registry's standing rule is that a value it does not list is
+/// legal but unrecognized and that a reader which does not know one must fail
+/// cleanly naming it, rather than decode through a grid it was not given: the
+/// steps below are the *only* description of what the bins mean, so reading
+/// `uniform-v9` bins through `uniform-v1` arithmetic produces a scene that is
+/// wrong everywhere and complains nowhere.
+const Set<String> _knownQuantizationSchemes = <String>{'uniform-v1'};
+
+/// Every step and origin component must be finite (spec section 5.3).
+///
+/// This is the ceiling on a quantization parameter's magnitude, and the
+/// specification puts it exactly at the end of the finite range: "Neither an
+/// infinity nor a NaN is a legal value for any of them."  Python's and Rust's
+/// validators report the same fault, field by field, in the same words.
+///
+/// This decoder acts on it rather than reporting it, and the reason is
+/// specific to Dart. The per-gaussian pitches in `quantization.dart` are
+/// derived with `log2(...)` and rounded with `floor`, and `double.floor()` on a
+/// NaN or an infinity throws `UnsupportedError: Infinity or NaN toInt` — an
+/// exception that names no byte, no record and no field, raised from inside
+/// arithmetic three call levels below the reader. Section 6 of AGENTS.md asks
+/// for a diagnosis, and this is the last point at which the file still has one
+/// to give.
+///
+/// Reported per field, because "the Quantization record is broken" is what the
+/// caller already knows.
+void _checkQuantizationMagnitudes(
+  List<double> origin,
+  int originAt,
+  List<double> steps,
+  int stepsAt,
+) {
+  for (int i = 0; i < origin.length; i++) {
+    if (!origin[i].isFinite) {
+      throw FourdgsMalformedFile(
+        'the Quantization record at byte ${originAt + i * 8} declares '
+        'pos_origin[$i] = ${origin[i]}; expected a finite value, since a '
+        'non-finite origin is not a coarser grid but no grid at all '
+        '(section 5.3)',
+      );
+    }
+  }
+  for (int i = 0; i < steps.length; i++) {
+    if (!steps[i].isFinite) {
+      throw FourdgsMalformedFile(
+        'the Quantization record at byte ${stepsAt + i * 8} declares '
+        '${_stepNames[i]} = ${steps[i]}; expected a finite value, since a '
+        'non-finite step is not a coarser grid but no grid at all '
+        '(section 5.3)',
+      );
+    }
+  }
+}
+
+/// The eight steps in the order the record writes them, so a refusal names the
+/// field a producer has to fix rather than an index into a tuple.
+const List<String> _stepNames = <String>[
+  'step_pos',
+  'step_scale_log',
+  'step_rot',
+  'step_rgb',
+  'step_alpha',
+  'step_motion',
+  'step_time',
+  'step_sigma_log',
+];
 
 /// One validity window: the span outside which a gaussian does not exist.
 class FourdgsWindow {
@@ -356,10 +448,15 @@ class FourdgsChunkHeader {
 
 /// A chunk's header and the raw bytes of its concatenated attribute streams.
 class FourdgsChunkBody {
-  const FourdgsChunkBody(this.header, this.streams);
+  const FourdgsChunkBody(this.header, this.streams, {this.streamsOffset = 0});
 
   final FourdgsChunkHeader header;
   final Uint8List streams;
+
+  /// Where [streams] begins within the record's content, so a refusal raised
+  /// while walking the block can name a byte in the file rather than an offset
+  /// into a buffer only the parser can see.
+  final int streamsOffset;
 }
 
 /// The interval rule, applied wherever a record states one.
@@ -392,7 +489,8 @@ FourdgsChunkBody parseChunk(Uint8List content) {
     compression: c.string(),
     uncompressedSize: c.u64(),
   );
-  return FourdgsChunkBody(head, c.take(c.u64()));
+  final length = c.u64();
+  return FourdgsChunkBody(head, c.take(length), streamsOffset: c.pos - length);
 }
 
 /// A spherical-harmonic band's own byte range within the file.
@@ -718,8 +816,11 @@ class FourdgsDeltaChunkBody {
     this.header,
     this.updates,
     this.births,
-    this.deaths,
-  );
+    this.deaths, {
+    this.updatesOffset = 0,
+    this.birthsOffset = 0,
+    this.deathsOffset = 0,
+  });
 
   final FourdgsDeltaChunkHeader header;
 
@@ -732,6 +833,12 @@ class FourdgsDeltaChunkBody {
 
   /// A single `gaussian_id` stream naming gaussians that die here.
   final Uint8List deaths;
+
+  /// Where each group begins within the record's content, for the reason
+  /// [FourdgsChunkBody.streamsOffset] carries one.
+  final int updatesOffset;
+  final int birthsOffset;
+  final int deathsOffset;
 }
 
 /// `delta_mode` values (spec §5.18). Per chunk, not per file.
@@ -761,11 +868,24 @@ FourdgsDeltaChunkBody parseDeltaChunk(Uint8List content) {
   // The three groups are framed by length inside one blob rather than tagged
   // with a group byte on every stream, so the death list — small and often
   // wanted alone — is reachable by stepping over two lengths.
-  final records = FourdgsCursor(c.take(c.u64()));
+  final blockLength = c.u64();
+  final blockAt = c.pos;
+  final records = FourdgsCursor(c.take(blockLength));
   final updates = records.take(records.u64());
+  final updatesAt = records.pos - updates.length;
   final births = records.take(records.u64());
+  final birthsAt = records.pos - births.length;
   final deaths = records.take(records.u64());
-  return FourdgsDeltaChunkBody(head, updates, births, deaths);
+  final deathsAt = records.pos - deaths.length;
+  return FourdgsDeltaChunkBody(
+    head,
+    updates,
+    births,
+    deaths,
+    updatesOffset: blockAt + updatesAt,
+    birthsOffset: blockAt + birthsAt,
+    deathsOffset: blockAt + deathsAt,
+  );
 }
 
 /// Opcode `0x09`. Present only when the scene has audio; its absence is the
@@ -997,12 +1117,29 @@ class FourdgsCamera {
   final String interpolation;
   final bool loop;
 
-  static FourdgsCamera parse(Uint8List content) {
+  /// [fileOffset] is where `content` begins in the file, so a refusal names a
+  /// byte someone can seek to rather than an offset into a record.
+  static FourdgsCamera parse(Uint8List content, {int fileOffset = 0}) {
     final c = FourdgsCursor(content);
     final fov = c.f64();
     final position = c.f64s(3);
     final target = c.f64s(3);
+    final countAt = fileOffset + c.pos;
     final n = c.u32();
+    // A camera path is a pose trajectory, sampled the way every other one in
+    // this format is, so it is held to the same ceiling — see
+    // [maxTrajectorySamples]. Checked before the loop, which is the last point
+    // at which nothing has been allocated: each keyframe below becomes three
+    // Dart lists whose headers cost several times the 56 bytes it occupies on
+    // the wire, so a record the front-matter ceiling admits at 64 MiB expands
+    // to several hundred megabytes of objects on the way to finding out the
+    // count was a lie.
+    if (n > maxTrajectorySamples) {
+      throw FourdgsMalformedFile(
+        'the Camera record at byte $countAt declares $n keyframes, past the '
+        '$maxTrajectorySamples ceiling',
+      );
+    }
     final times = <double>[];
     final positions = <List<double>>[];
     final targets = <List<double>>[];
@@ -1465,10 +1602,10 @@ class FourdgsRigTrajectory {
         '${c.remaining ~/ rigTrajectorySampleBytes}',
       );
     }
-    if (count > maxRigTrajectorySamples) {
+    if (count > maxTrajectorySamples) {
       throw FourdgsMalformedFile(
         "trajectory '$name' declares $count samples, past the "
-        '$maxRigTrajectorySamples ceiling',
+        '$maxTrajectorySamples ceiling',
       );
     }
     final times = <double>[];
@@ -1805,10 +1942,10 @@ class FourdgsObjectTrack {
         'room for ${c.remaining ~/ rigTrajectorySampleBytes}',
       );
     }
-    if (count > maxRigTrajectorySamples) {
+    if (count > maxTrajectorySamples) {
       throw FourdgsMalformedFile(
         'ObjectTrack for object $objectId declares $count samples, past the '
-        '$maxRigTrajectorySamples ceiling',
+        '$maxTrajectorySamples ceiling',
       );
     }
     final times = <double>[];
@@ -1929,7 +2066,14 @@ const int maxWindowsPerScene = 65536;
 /// version's bands instead of pinning it at three.
 const int maxBandsPerChunk = 16;
 
-/// The most pose samples one rig trajectory may declare.
+/// The most samples one count-prefixed trajectory may declare — a Rig
+/// Trajectory, an Object Track, or the Camera record's suggested path.
+///
+/// `MAX_TRAJECTORY_SAMPLES` in Python, Rust and TypeScript, and 1,000,000 here
+/// because it is 1,000,000 there. A ceiling only one implementation has means a
+/// file that decodes in three SDKs and is refused in the fourth, which is a
+/// conformance split rather than hardening; the number is shared by value for
+/// that reason, and not because a Dart list costs what a Rust `Vec` does.
 ///
 /// A ten-minute capture at 100 Hz is sixty thousand samples; this ceiling is an
 /// order of magnitude above that and still a refusal rather than an allocation
@@ -1941,4 +2085,4 @@ const int maxBandsPerChunk = 16;
 /// MiB of samples *exactly*, so a trajectory at the ceiling parsed on the
 /// streamed path and was refused on the indexed one — the same file, two
 /// answers from one SDK.
-const int maxRigTrajectorySamples = 1000000;
+const int maxTrajectorySamples = 1000000;
