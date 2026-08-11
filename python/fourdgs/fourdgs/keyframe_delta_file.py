@@ -244,6 +244,36 @@ def _quantize_sample(sample: Sample, grids: Grids) -> tuple[np.ndarray, dict[int
     return ids, bins
 
 
+def _reanchor_bins(bins: dict[int, np.ndarray], grids: Grids, t0: float) -> dict[int, np.ndarray]:
+    """Restate quantized trajectories at ``t0`` without moving their centres.
+
+    Position and ``mu_t`` are one coupled trajectory anchor.  Changing only the
+    latter changes the reconstructed centre, so keyframes, updates, and births
+    all pass through this operation before they are serialized.
+    """
+    if not bins[op.A_MU_T].size:
+        return dict(bins)
+
+    sigma = bins[op.A_SIGMA_T].reshape(-1)
+    flags = bins[op.A_FLAGS].reshape(-1)
+    never_fades = (flags & op.FLAG_NEVER_FADES) != 0
+    window_index = bins[op.A_WINDOW_INDEX].reshape(-1)
+    motion_step = grids.motion_step(sigma, never_fades, window_index)
+    time_step = grids.mu_step(sigma, never_fades)
+
+    position = dequantize(bins[op.A_POSITION], grids.steps.pos, grids.origin)
+    motion = bins[op.A_MOTION].astype(np.float64) * motion_step[:, None]
+    authored_mu = bins[op.A_MU_T].reshape(-1).astype(np.float64) * time_step
+    anchor_bins = np.rint(float(t0) / time_step).astype(np.int64)
+    serialized_mu = anchor_bins.astype(np.float64) * time_step
+    centre = position + motion * (serialized_mu - authored_mu)[:, None]
+
+    anchored = dict(bins)
+    anchored[op.A_POSITION] = quantize(centre, grids.steps.pos, grids.origin)
+    anchored[op.A_MU_T] = anchor_bins.reshape(-1, 1)
+    return anchored
+
+
 # --------------------------------------------------------------------------
 # Writing
 # --------------------------------------------------------------------------
@@ -284,7 +314,11 @@ def write_sequence(
         raise ValueError("a keyframe-delta file needs at least one sample")
 
     grids = _grids_for(samples, duration_sec, profile, cutoff)
-    quantized = [_quantize_sample(s, grids) for s in samples]
+    quantized = [
+        (ids, _reanchor_bins(bins, grids, sample.t0))
+        for sample in samples
+        for ids, bins in [_quantize_sample(sample, grids)]
+    ]
     t0s = [float(s.t0) for s in samples]
     t1s = [*t0s[1:], float(duration_sec)]
 
@@ -302,7 +336,11 @@ def write_sequence(
         cursor += len(blob)
         return at
 
-    aabb = _aabb(samples)
+    # Header and Statistics describe the rest positions the file actually
+    # serializes. Reanchoring can move those far from the source samples'
+    # original position arrays, especially for a fast trajectory whose authored
+    # mu_t differs from the interval start.
+    aabb = _aabb(quantized, grids)
     emit(
         rec.Header(
             duration_sec=float(duration_sec),
@@ -341,7 +379,17 @@ def write_sequence(
     for i, (ids, bins) in enumerate(quantized):
         t0, t1 = t0s[i], t1s[i]
         if is_keyframe(i, kd):
-            blob = rec.encode_chunk(t0, t1, 0, int(ids.shape[0]), _keyframe_streams(ids, bins, codec, level))
+            # The sample was already restated at this physical interval start.  Position
+            # and mu_t were rebased together, so serializing the new anchor preserves the
+            # trajectory's centre rather than moving it to the old position at a new time.
+            keyframe_bins = bins
+            blob = rec.encode_chunk(
+                t0,
+                t1,
+                0,
+                int(ids.shape[0]),
+                _keyframe_streams(ids, keyframe_bins, codec, level),
+            )
             at = emit(blob)
             offsets.append(at)
             kinds.append(0)
@@ -370,7 +418,42 @@ def write_sequence(
             ref_sample = i - 1
             depth = depths[i - 1] + 1
         ref_ids, ref_bins = quantized[ref_sample]
-        update_ids, update_bins, birth_ids, birth_bins, death_ids = delta_groups(ref_ids, ref_bins, ids, bins)
+
+        # Compare both populations at this delta's t0. Position and mu_t are a coupled
+        # anchor: reanchoring the reference makes an inherited moving trajectory compare
+        # equal when it already reaches the sample's centre at t0. Births and the target
+        # population were normalized to t0 before this loop.
+        live = np.isin(ids, ref_ids)
+        order = np.argsort(ref_ids, kind="stable")
+        ref_rows = order[np.searchsorted(ref_ids[order], ids[live])]
+        comparison_ref_bins = _reanchor_bins(ref_bins, grids, t0)
+
+        update_ids, update_bins, birth_ids, birth_bins, death_ids = delta_groups(
+            ref_ids, comparison_ref_bins, ids, bins
+        )
+
+        # delta_groups subtracted from the comparison-only t0 anchor. The wire delta must
+        # instead subtract position and mu_t from the state actually serialized by its
+        # reference so composition telescopes to the normalized target exactly.
+        updated = np.isin(ids, update_ids)
+        if update_ids.size:
+            update_ref_rows = order[np.searchsorted(ref_ids[order], update_ids)]
+            update_bins[op.A_POSITION] = bins[op.A_POSITION][updated] - ref_bins[op.A_POSITION][update_ref_rows]
+            update_bins[op.A_MU_T] = bins[op.A_MU_T][updated] - ref_bins[op.A_MU_T][update_ref_rows]
+
+        # Retain the composed anchors the decoder will see for later chained deltas.
+        # Untouched common rows keep their earlier position/mu_t pair; updated rows and
+        # births use this delta's normalized pair.
+        composed_bins = dict(bins)
+        composed_position = bins[op.A_POSITION].copy()
+        composed_position[live] = ref_bins[op.A_POSITION][ref_rows]
+        composed_position[updated] = bins[op.A_POSITION][updated]
+        composed_bins[op.A_POSITION] = composed_position
+        composed_mu = bins[op.A_MU_T].copy()
+        composed_mu[live] = ref_bins[op.A_MU_T][ref_rows]
+        composed_mu[updated] = bins[op.A_MU_T][updated]
+        composed_bins[op.A_MU_T] = composed_mu
+        quantized[i] = (ids, composed_bins)
         updates = encode_delta_streams(update_ids, update_bins, codec=codec, level=level)
         births = encode_delta_streams(birth_ids, birth_bins, codec=codec, level=level)
         deaths = death_streams(death_ids, codec=codec, level=level)
@@ -443,12 +526,13 @@ def _keyframe_index(i: int, kd: KeyframeDeltaOptions) -> int:
     return j
 
 
-def _aabb(samples: list[Sample]) -> list[float]:
-    positions = np.concatenate(
-        [np.asarray(s.gaussians.positions, dtype=np.float64) for s in samples if s.gaussians.count]
-    )
-    if not positions.size:
+def _aabb(quantized: list[tuple[np.ndarray, dict[int, np.ndarray]]], grids: Grids) -> list[float]:
+    populations = [
+        dequantize(bins[op.A_POSITION], grids.steps.pos, grids.origin) for ids, bins in quantized if ids.size
+    ]
+    if not populations:
         return [0.0] * 6
+    positions = np.concatenate(populations)
     return [*positions.min(axis=0).tolist(), *positions.max(axis=0).tolist()]
 
 
