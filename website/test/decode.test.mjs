@@ -18,6 +18,7 @@ import {
   Attribute,
   FourdgsError,
   GAUSSIAN_FLAG_NEVER_FADES,
+  MAGIC,
   MalformedFile,
   UnsupportedCodec,
   UnsupportedVersion,
@@ -29,7 +30,7 @@ import {
   muStep,
 } from "@4dgs/core";
 
-import { openScene } from "../src/components/Viewer/openScene.js";
+import { ViewerLimitError, openScene } from "../src/components/Viewer/openScene.js";
 import { reconstructKeyframeDelta } from "../src/components/Viewer/keyframeDelta.js";
 import {
   BytesReadable,
@@ -47,6 +48,7 @@ import {
   withBadSummaryCrc,
   withDuplicateIndexOffset,
   withHeaderDuration,
+  withHeaderShDegree,
   withPaddedHeader,
   withRedistributedIndexCounts,
   withStateChunksReversed,
@@ -463,5 +465,53 @@ describe("the temporal model is read from the Header, whatever size it is", () =
     for (const t of instantsFor(plain.duration)) {
       assert.deepEqual(digest(await padded.frameAt(t)), digest(await plain.frameAt(t)), `t = ${t}`);
     }
+  });
+
+  it("refuses an oversized declared Header before a decoder requests its range", async () => {
+    const declared = 64 * 1024 * 1024 + 1;
+    const prefix = new Uint8Array(MAGIC.length + 9);
+    prefix.set(MAGIC);
+    prefix[MAGIC.length] = 0x01;
+    new DataView(prefix.buffer).setBigUint64(MAGIC.length + 1, BigInt(declared), true);
+    const source = {
+      largestRead: 0,
+      async size() {
+        return BigInt(prefix.length + declared);
+      },
+      async read(offset, length) {
+        const at = Number(offset);
+        const count = Number(length);
+        this.largestRead = Math.max(this.largestRead, count);
+        const out = new Uint8Array(count);
+        if (at < prefix.length) {
+          out.set(prefix.subarray(at, Math.min(prefix.length, at + count)));
+        }
+        return out;
+      },
+    };
+
+    await assert.rejects(
+      () => openScene(source),
+      (error) =>
+        error instanceof ViewerLimitError &&
+        error.message.includes(`declares ${declared} content bytes`),
+    );
+    assert.ok(source.largestRead <= 64 * 1024, `largest range read was ${source.largestRead}`);
+  });
+});
+
+describe("indexed SH bands agree with the Header", () => {
+  it("refuses a non-empty Chunk whose physical bands stop below Header.sh_degree", async () => {
+    const whole = variant("MixedLifetimes-SHDegree2-UseChunkIndex-UseCrc.4dgs");
+    const bytes = withHeaderShDegree(whole.bytes, 3);
+    const playable = await openScene(new BytesReadable(bytes));
+    assert.equal(playable.readMode, "indexed");
+    await assert.rejects(
+      () => playable.frameAt(0),
+      (error) =>
+        error instanceof MalformedFile &&
+        error.message.includes("decodes SH degree 2") &&
+        error.message.includes("Header declares SH degree 3"),
+    );
   });
 });

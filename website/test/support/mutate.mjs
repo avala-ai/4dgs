@@ -8,6 +8,7 @@
  */
 
 import {
+  Cursor,
   MAGIC,
   Opcode,
   RECORD_HEADER_BYTES,
@@ -114,6 +115,23 @@ export function withHeaderDuration(bytes, duration) {
     duration,
     true,
   );
+  return out;
+}
+
+/** Change only Header.sh_degree; it is outside the Footer's summary CRC region. */
+export function withHeaderShDegree(bytes, degree) {
+  const header = records(bytes).find((record) => record.opcode === Opcode.Header);
+  if (header === undefined) throw new Error("no Header record in this variant");
+  const cursor = new Cursor(header.content);
+  cursor.string();
+  cursor.string();
+  cursor.f64();
+  cursor.u64();
+  cursor.f64();
+  cursor.string();
+  cursor.f64s(6);
+  const out = bytes.slice();
+  out[header.offset + RECORD_HEADER_BYTES + cursor.pos] = degree;
   return out;
 }
 

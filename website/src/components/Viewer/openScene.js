@@ -137,14 +137,16 @@ class CountingReadable {
 export async function openScene(source) {
   const counting = new CountingReadable(source);
   const size = Number(await counting.size());
+  // Learn the temporal model before either decoder opens the file. In particular, this
+  // frames the Header and enforces the viewer's per-record ceiling before
+  // `IndexedDecoder.open` is allowed to fetch its content from an untrusted u64 length.
+  const temporalModel = await temporalModelOf(counting, size);
   try {
     return await openGaussianBirth(counting, size);
   } catch (refusal) {
     // `decodeScene` and `IndexedDecoder` implement `gaussian-birth`, and they refuse
-    // anything else by name. A `keyframe-delta` file lands here, so the Header is read
-    // only once that refusal has happened — which keeps the common case to a single pass
-    // over the front matter rather than a probe and then a pass.
-    if ((await temporalModelOf(counting, size)) !== "keyframe-delta") throw refusal;
+    // anything else by name. A `keyframe-delta` file lands here.
+    if (temporalModel !== "keyframe-delta") throw refusal;
     return await openKeyframeDelta(counting, size);
   }
 }
@@ -160,7 +162,9 @@ export async function openScene(source) {
  * happens not to contain it would answer "not keyframe-delta" about a file that is one.
  *
  * `null` when the walk did not reach a Header, or when it could not be read at all — a
- * short or malformed file, whose real refusal the caller is already holding.
+ * short or malformed file, whose real refusal the decoder will supply. A framed Header
+ * beyond the viewer's ceiling is different: refuse it here before any decoder can turn
+ * its declared length into a range read.
  */
 async function temporalModelOf(source, size) {
   try {
@@ -168,10 +172,16 @@ async function temporalModelOf(source, size) {
     checkMagic(await scanner.head(MAGIC.length));
     for await (const record of scanner.records(MAGIC.length)) {
       if (record.opcode !== Opcode.Header) continue;
-      if (record.contentLength > MAX_HEADER_RECORD_BYTES) return null;
+      if (record.contentLength > MAX_HEADER_RECORD_BYTES) {
+        throw new ViewerLimitError(
+          `Header record at byte ${record.offset} declares ${record.contentLength} content bytes; ` +
+            `this viewer limits a Header to ${MAX_HEADER_RECORD_BYTES} bytes before decoding it`,
+        );
+      }
       return parseHeader(await scanner.content(record)).temporalModel;
     }
-  } catch {
+  } catch (error) {
+    if (error instanceof ViewerLimitError) throw error;
     return null;
   }
   return null;
@@ -228,6 +238,13 @@ function indexedPlayable(decoder, source, notes) {
       let chunk = chunks.get(entry.chunkOffset);
       if (chunk === undefined) {
         chunk = await decoder.readChunk(entry, { maxShBand: header.shDegree });
+        const decodedDegree = chunk.sh?.degree ?? 0;
+        if (chunk.gaussians.count > 0 && decodedDegree !== header.shDegree) {
+          throw new MalformedFile(
+            `Chunk at byte ${entry.chunkOffset} decodes SH degree ${decodedDegree}, ` +
+              `but the Header declares SH degree ${header.shDegree}`,
+          );
+        }
         chunks.set(entry.chunkOffset, chunk);
         if (chunks.size > CHUNK_CACHE_LIMIT) chunks.delete(chunks.keys().next().value);
       }
