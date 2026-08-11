@@ -324,6 +324,27 @@ impl<'a> Streamed<'a> {
             .read(frame.offset + RECORD_HEADER_SIZE as u64, frame.length)
             .ok()
     }
+
+    /// A bounded slice of one record's content.
+    ///
+    /// Refusal placement needs only the declaration string in Header or Quantization.
+    /// Reading through this method means an extensible record's appended trailer is never
+    /// transferred merely to say which byte carried an unsupported value.
+    fn range(&mut self, frame: &Frame, at: u64, length: u64) -> Option<Vec<u8>> {
+        let end = at.checked_add(length)?;
+        if end > frame.length || length > fourdgs::indexed_reader::MAX_FRONT_MATTER_BYTES {
+            return None;
+        }
+        self.source
+            .read(
+                frame
+                    .offset
+                    .checked_add(RECORD_HEADER_SIZE as u64)?
+                    .checked_add(at)?,
+                length,
+            )
+            .ok()
+    }
 }
 
 /// The byte a refusal fired at, found without holding the file or a walk of it.
@@ -355,15 +376,10 @@ pub fn locate_streaming(source: &mut dyn Readable, code: &str) -> Option<Site> {
             offset: 0,
             what: "the magic".into(),
         }),
-        id::UNKNOWN_TEMPORAL_MODEL => {
-            first_declaring(source, op::HEADER, "the Header record", header_refuses)
+        id::UNKNOWN_TEMPORAL_MODEL => first_declaring(source, op::HEADER, "the Header record"),
+        id::UNKNOWN_QUANTIZATION_SCHEME => {
+            first_declaring(source, op::QUANTIZATION, "the Quantization record")
         }
-        id::UNKNOWN_QUANTIZATION_SCHEME => first_declaring(
-            source,
-            op::QUANTIZATION,
-            "the Quantization record",
-            quantization_refuses,
-        ),
         id::UNKNOWN_STREAM_CODEC | id::WINDOW_INDEX_OUT_OF_RANGE => match scan_streamed(source) {
             Err((error, site)) if error.refusal_code() == Some(code) => site,
             _ => None,
@@ -373,18 +389,18 @@ pub fn locate_streaming(source: &mut dyn Readable, code: &str) -> Option<Site> {
 }
 
 /// The first whole record of this kind whose own declared value is the one being refused.
-fn first_declaring(
-    source: &mut dyn Readable,
-    opcode: u8,
-    what: &str,
-    refuses: fn(&[u8]) -> bool,
-) -> Option<Site> {
+fn first_declaring(source: &mut dyn Readable, opcode: u8, what: &str) -> Option<Site> {
     let mut records = Streamed::open(source).ok()?;
     while let Some(frame) = records.next_frame() {
         if frame.opcode != opcode {
             continue;
         }
-        if records.content(&frame).is_some_and(|c| refuses(&c)) {
+        let refuses = match opcode {
+            op::HEADER => header_declaration_refuses(&mut records, &frame),
+            op::QUANTIZATION => quantization_declaration_refuses(&mut records, &frame),
+            _ => false,
+        };
+        if refuses {
             return Some(Site {
                 offset: frame.offset,
                 what: what.into(),
@@ -392,6 +408,43 @@ fn first_declaring(
         }
     }
     None
+}
+
+/// The byte immediately after a length-prefixed string, without fetching its contents.
+fn skip_string(records: &mut Streamed<'_>, frame: &Frame, at: u64) -> Option<u64> {
+    let length = records.range(frame, at, 4)?;
+    let length = u32::from_le_bytes(length.try_into().ok()?) as u64;
+    at.checked_add(4)?
+        .checked_add(length)
+        .filter(|end| *end <= frame.length)
+}
+
+/// One declaration string, bounded independently of the record's extensible trailer.
+fn string_at(records: &mut Streamed<'_>, frame: &Frame, at: u64) -> Option<String> {
+    let prefix = records.range(frame, at, 4)?;
+    let length = u32::from_le_bytes(prefix.try_into().ok()?) as u64;
+    let bytes = records.range(frame, at.checked_add(4)?, length)?;
+    String::from_utf8(bytes).ok()
+}
+
+fn header_declaration_refuses(records: &mut Streamed<'_>, frame: &Frame) -> bool {
+    let Some(after_profile) = skip_string(records, frame, 0) else {
+        return false;
+    };
+    let Some(after_library) = skip_string(records, frame, after_profile) else {
+        return false;
+    };
+    // duration_sec, gaussian_count, cutoff
+    let Some(temporal_model_at) = after_library.checked_add(8 + 8 + 8) else {
+        return false;
+    };
+    string_at(records, frame, temporal_model_at)
+        .is_some_and(|model| fourdgs::registry::check_temporal_model(&model).is_err())
+}
+
+fn quantization_declaration_refuses(records: &mut Streamed<'_>, frame: &Frame) -> bool {
+    string_at(records, frame, 0)
+        .is_some_and(|scheme| fourdgs::registry::check_quantization_scheme(&scheme).is_err())
 }
 
 /// The byte a refusal fired at, and what sits there.
@@ -513,9 +566,32 @@ pub fn scan_chunks(
     let mut source = BytesReadable::new(data);
     for (i, entry) in scene.index.iter().enumerate() {
         // The returned chunk is dropped here, at the end of the iteration.
-        if let Err(error) = read_chunk(&mut source, scene, entry, u8::MAX) {
-            let site = refusing_record(&mut source, scene, entry, i);
-            return Err((error, Some(site)));
+        match read_chunk(&mut source, scene, entry, u8::MAX) {
+            Err(error) => {
+                let site = refusing_record(&mut source, scene, entry, i);
+                return Err((error, Some(site)));
+            }
+            Ok(chunk) if chunk.count > 0 => {
+                // Decode first, then compare the complete declaration. That order keeps a
+                // bad band stream localized to its own physical record instead of hiding
+                // it behind a second index-shape finding on the Chunk.
+                let mut declared: Vec<u8> = entry.bands.iter().map(|(band, _, _)| *band).collect();
+                declared.sort_unstable();
+                let expected: Vec<u8> = (1..=scene.header.sh_degree).collect();
+                if declared != expected {
+                    return Err((
+                        Error::Malformed(format!(
+                            "the Chunk at byte {} carries SH bands {declared:?}; the Header declares degree {} and requires {expected:?}",
+                            entry.chunk_offset, scene.header.sh_degree
+                        )),
+                        Some(Site {
+                            offset: entry.chunk_offset,
+                            what: format!("the Chunk record at index entry {i}"),
+                        }),
+                    ));
+                }
+            }
+            Ok(_) => {}
         }
     }
     Ok(())
@@ -660,6 +736,16 @@ pub fn scan_streamed(source: &mut dyn Readable) -> std::result::Result<(), (Erro
                 .map_err(|error| (error, here()))?;
                 count = decoded.count;
             }
+            op::DELTA_CHUNK => {
+                let Some(content) = records.content(&frame) else {
+                    continue;
+                };
+                fourdgs::keyframe_delta_file::check_delta_chunk(&content, &windows)
+                    .map_err(|error| (error, here()))?;
+                if let Ok((head, _)) = rec::parse_delta_chunk_records(&content) {
+                    count = head.birth_count as usize;
+                }
+            }
             op::SH_BAND_STREAM => {
                 let Some(content) = records.content(&frame) else {
                     continue;
@@ -667,8 +753,28 @@ pub fn scan_streamed(source: &mut dyn Readable) -> std::result::Result<(), (Erro
                 let mut cursor = Cursor::new(&content);
                 // The band index, which the record carries and the stream header does not:
                 // a band stream's `attribute_id` is 0x07 and collides with `mu_t` (§5.7).
-                cursor.u8().map_err(|error| (error, here()))?;
-                decode_stream(&mut cursor, Some(count)).map_err(|error| (error, here()))?;
+                let band = cursor.u8().map_err(|error| (error, here()))?;
+                if !(1..=3).contains(&band) {
+                    return Err((
+                        Error::Malformed(format!(
+                            "the SH Band Stream at byte {} declares band {band}; only bands 1 through 3 are defined",
+                            frame.offset
+                        )),
+                        here(),
+                    ));
+                }
+                let (_, stream) =
+                    decode_stream(&mut cursor, Some(count)).map_err(|error| (error, here()))?;
+                let expected_channels = 3 * (2 * band as usize + 1);
+                if stream.channels != expected_channels {
+                    return Err((
+                        Error::Malformed(format!(
+                            "the SH Band Stream at byte {} for band {band} declares {} channels; band {band} requires {expected_channels}",
+                            frame.offset, stream.channels
+                        )),
+                        here(),
+                    ));
+                }
             }
             _ => {}
         }
@@ -929,6 +1035,37 @@ mod tests {
              which ends at {header_end}",
             source.furthest,
             data.len()
+        );
+    }
+
+    #[test]
+    fn placing_a_front_matter_refusal_does_not_read_an_appended_trailer() {
+        let mut data = crate::validate::sample_file(Vec::new());
+        let header_at = MAGIC.len();
+        let old_length = u64::from_le_bytes(
+            data[header_at + 1..header_at + RECORD_HEADER_SIZE]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let old_end = header_at + RECORD_HEADER_SIZE + old_length;
+        let trailer = vec![0xA5; 1024 * 1024];
+        data.splice(old_end..old_end, trailer.iter().copied());
+        let new_length = old_length + trailer.len();
+        data[header_at + 1..header_at + RECORD_HEADER_SIZE]
+            .copy_from_slice(&(new_length as u64).to_le_bytes());
+        let model = data
+            .windows(14)
+            .position(|w| w == b"gaussian-birth")
+            .unwrap();
+        data[model..model + 14].copy_from_slice(b"frame-sequence");
+
+        let mut source = Watched::new(&data);
+        let site = locate_streaming(&mut source, id::UNKNOWN_TEMPORAL_MODEL).unwrap();
+        assert_eq!(site.offset, header_at as u64);
+        assert!(
+            source.furthest < old_end as u64,
+            "the locator read through byte {}, into an appended trailer that starts at {old_end}",
+            source.furthest
         );
     }
 

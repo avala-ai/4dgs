@@ -940,19 +940,6 @@ fn delta_record_bytes<'a>(
     head: &rec::DeltaChunkHeader,
     records: &'a [u8],
 ) -> Result<Cow<'a, [u8]>> {
-    if head.compression.is_empty() {
-        return Ok(Cow::Borrowed(records));
-    }
-    let numeric = crate::codec::codec_from_name(&head.compression).ok_or_else(|| {
-        Error::refused(
-            crate::error::refusal::UNKNOWN_STREAM_CODEC,
-            crate::error::RefusalKind::UnsupportedCodec,
-            format!(
-                "the Delta Chunk at t0={} is compressed with {:?}, which this build does not know",
-                head.t0, head.compression
-            ),
-        )
-    })?;
     let expected = usize::try_from(head.uncompressed_size).map_err(|_| {
         Error::Malformed(format!(
             "the Delta Chunk at t0={} declares {} uncompressed bytes, more than this platform can address",
@@ -965,6 +952,26 @@ fn delta_record_bytes<'a>(
             head.t0, head.uncompressed_size
         )));
     }
+    if head.compression.is_empty() {
+        if records.len() != expected {
+            return Err(Error::Malformed(format!(
+                "the uncompressed Delta Chunk at t0={} declares {expected} record bytes but carries {}",
+                head.t0,
+                records.len()
+            )));
+        }
+        return Ok(Cow::Borrowed(records));
+    }
+    let numeric = crate::codec::codec_from_name(&head.compression).ok_or_else(|| {
+        Error::refused(
+            crate::error::refusal::UNKNOWN_STREAM_CODEC,
+            crate::error::RefusalKind::UnsupportedCodec,
+            format!(
+                "the Delta Chunk at t0={} is compressed with {:?}, which this build does not know",
+                head.t0, head.compression
+            ),
+        )
+    })?;
     Ok(Cow::Owned(crate::codec::decompress(
         records, numeric, expected,
     )?))
@@ -1472,14 +1479,16 @@ pub fn open_indexed<R: crate::Readable + ?Sized>(source: &mut R) -> Result<Index
                 check_keyframe_temporal_model(&parsed.temporal_model)?;
                 header = Some(parsed);
             }
-            op::QUANTIZATION if !state_seen => {
+            op::QUANTIZATION => {
                 let content = source.read(
                     at + crate::serialization::RECORD_HEADER_SIZE as u64,
                     content_length,
                 )?;
                 let parsed = rec::Quantization::parse(&content)?;
                 crate::registry::check_quantization_scheme(&parsed.scheme)?;
-                quant = Some(parsed);
+                if !state_seen {
+                    quant = Some(parsed);
+                }
             }
             op::WINDOW_TABLE if !state_seen => {
                 let content = source.read(
@@ -2069,6 +2078,15 @@ mod hostile_record_tests {
     }
 
     #[test]
+    fn an_uncompressed_delta_records_block_must_match_its_declared_size() {
+        let records = empty_delta_records();
+        let content = delta_content_with_compression("", &records, records.len() as u64 + 1);
+        let error = check_delta_chunk(&content, &[]).unwrap_err();
+        assert!(error.to_string().contains("declares"), "{error}");
+        assert!(error.to_string().contains("but carries"), "{error}");
+    }
+
+    #[test]
     fn defined_attributes_must_use_their_defined_channel_count() {
         let bytes = encode_stream(op::A_POSITION, &[1, 2], 2, codec::DEFLATE, 6, true).unwrap();
         let error = decode_group(&bytes, 1).unwrap_err();
@@ -2245,6 +2263,39 @@ mod hostile_record_tests {
         assert_eq!(
             error.refusal_code(),
             Some(crate::error::refusal::UNKNOWN_TEMPORAL_MODEL)
+        );
+    }
+
+    #[test]
+    fn indexed_open_checks_a_quantization_after_the_first_state_record() {
+        let mut data = empty_indexed_file();
+        let old_footer_at =
+            data.len() - MAGIC.len() - crate::serialization::RECORD_HEADER_SIZE - 20;
+        let old_summary_start = u64::from_le_bytes(
+            data[old_footer_at + crate::serialization::RECORD_HEADER_SIZE
+                ..old_footer_at + crate::serialization::RECORD_HEADER_SIZE + 8]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let mut late_grid = Records::new(&data, MAGIC.len())
+            .filter_map(|record| record.ok())
+            .find(|record| record.opcode == op::QUANTIZATION)
+            .map(|record| rec::Quantization::parse(record.content).unwrap())
+            .unwrap();
+        late_grid.scheme = "future-grid".into();
+        let late = late_grid.encode(&[]);
+        data.splice(old_summary_start..old_summary_start, late.iter().copied());
+
+        let footer_at = old_footer_at + late.len();
+        let shifted_summary = (old_summary_start + late.len()) as u64;
+        data[footer_at + crate::serialization::RECORD_HEADER_SIZE
+            ..footer_at + crate::serialization::RECORD_HEADER_SIZE + 8]
+            .copy_from_slice(&shifted_summary.to_le_bytes());
+
+        let error = open_indexed(&mut BytesReadable::new(&data)).unwrap_err();
+        assert_eq!(
+            error.refusal_code(),
+            Some(crate::error::refusal::UNKNOWN_QUANTIZATION_SCHEME)
         );
     }
 }

@@ -509,6 +509,13 @@ fn validate_checked(data: &[u8]) -> Result<Report> {
     }
     if footer.is_none() {
         report.error("no Footer record".into());
+    } else if seen.last() != Some(&op::FOOTER) {
+        let final_record = seen
+            .last()
+            .map_or_else(|| "nothing".into(), |opcode| op::name(*opcode));
+        report.error(format!(
+            "the final record is {final_record}; the Footer must be final"
+        ));
     }
 
     // Which chunk shape the rest of this validator is entitled to assume. A
@@ -1164,7 +1171,15 @@ fn check_keyframe_delta_streamed(data: &[u8], framing: Framing, report: &mut Rep
                         frame.offset
                     )));
                 }
-                fourdgs::stream::decode_stream(&mut cursor, Some(count)).map(|_| ())
+                let (_, stream) = fourdgs::stream::decode_stream(&mut cursor, Some(count))?;
+                let expected_channels = 3 * (2 * band as usize + 1);
+                if stream.channels != expected_channels {
+                    return Err(fourdgs::Error::Malformed(format!(
+                        "the SH Band Stream at {} for band {band} declares {} channels; band {band} requires {expected_channels}",
+                        frame.offset, stream.channels
+                    )));
+                }
+                Ok(())
             })(),
             _ => continue,
         };
@@ -1726,6 +1741,23 @@ mod tests {
             .findings
             .iter()
             .any(|f| f.message.contains("does not end with the magic")));
+    }
+
+    #[test]
+    fn the_footer_must_be_the_final_record() {
+        let mut data = minimal();
+        data.truncate(data.len() - MAGIC.len());
+        fourdgs::serialization::put_record(&mut data, 0xFE, &[]);
+        data.extend_from_slice(&MAGIC);
+        let report = validate(&data);
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.message.contains("Footer must be final")),
+            "{:?}",
+            report.findings
+        );
     }
 
     #[test]

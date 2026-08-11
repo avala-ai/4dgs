@@ -602,6 +602,13 @@ pub fn read_chunk<R: Readable + ?Sized>(
             )));
         }
         let (_, values) = decode_stream(&mut cursor, Some(head.count as usize))?;
+        let expected_channels = 3 * (2 * physical_band as usize + 1);
+        if values.channels != expected_channels {
+            return Err(Error::Malformed(format!(
+                "the SH Band Stream at byte {offset} for band {physical_band} declares {} channels; band {physical_band} requires {expected_channels}",
+                values.channels
+            )));
+        }
         bands.insert(*band, values);
     }
     decoded.bands = bands;
