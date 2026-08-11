@@ -47,6 +47,20 @@ void main() {
     expect(probes.every(adjacent.covers), isTrue);
   });
 
+  test('a narrow support protrusion needs its own quantization guard', () {
+    final interval = entry(t0: 0.0, t1: 1.0);
+    expect(
+      residentSupportWithinEntry(interval, 0.25, 1.000001, 0.0),
+      isFalse,
+      reason: 'a successful peak probe at 0.5 cannot prove the exposed edge',
+    );
+    expect(
+      residentSupportWithinEntry(interval, 0.25, 1.000001, 0.000002),
+      isTrue,
+      reason: 'the row-specific quantization guard excuses only its own slack',
+    );
+  });
+
   test('visible probes hit point support that fixed fractions miss', () {
     final rotations = Float32List(4)..[3] = 1.0;
     final gaussian = FourdgsGaussianSet(
@@ -210,7 +224,7 @@ void main() {
     );
   });
 
-  test('point support confined to guarded boundaries needs no probe', () async {
+  test('point support inside its guarded entry needs no probe', () async {
     final rotations = Float32List(8);
     rotations[3] = 1.0;
     rotations[7] = 1.0;
@@ -240,7 +254,11 @@ void main() {
       readFourdgsBytes(bytes).gaussians,
     );
     expect(result.probes, 0);
-    expect(result.guardedVisibleCandidates, greaterThan(0));
+    expect(
+      result.guardedVisibleCandidates,
+      0,
+      reason: 'complete support containment replaces a peak candidate',
+    );
   });
 
   test(

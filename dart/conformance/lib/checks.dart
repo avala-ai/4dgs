@@ -241,6 +241,19 @@ double seekGuardMuHalfWidth(
   double timePitch,
 ) => 0.5 * muStep(sigmaBin, sigmaLogPitch, neverFades, timePitch).abs();
 
+/// Whether one decoded resident's complete visible support belongs to [entry].
+///
+/// [guard] is that row's own worst-case movement from `mu_t` and `sigma_t`
+/// quantization, not a scene-wide tolerance. Proving containment directly is
+/// both stronger and cheaper than hoping a finite set of probe instants lands
+/// in every protruding sliver.
+bool residentSupportWithinEntry(
+  FourdgsChunkIndexEntry entry,
+  double supportLo,
+  double supportHi,
+  double guard,
+) => supportLo >= entry.t0 - guard && supportHi <= entry.t1 + guard;
+
 /// A [FourdgsReadable] that records what it transferred, so a claim about byte
 /// ranges can be checked against the bytes that actually moved.
 class CountingReadable implements FourdgsReadable {
@@ -412,6 +425,7 @@ checkSeekReadsOnlyWhatItNeeds(
   final sigmaLog = quantization.stepSigmaLog;
   final sigmaHalfRelative = seekGuardSigmaHalfRelative(sigmaLog);
   final guardEdges = <({double at, double guard})>[];
+  final residentGuards = Float64List(whole.count);
   for (int i = 0; i < whole.count; i++) {
     final storedSigma = whole.sigmaT[i];
     if (!storedSigma.isFinite) continue;
@@ -425,6 +439,7 @@ checkSeekReadsOnlyWhatItNeeds(
     );
     final slack = muHalfWidth + k * sigma * sigmaHalfRelative;
     if (!slack.isFinite) continue;
+    residentGuards[i] = slack;
 
     final rawLo = whole.muT[i] - k * sigma;
     final rawHi = whole.muT[i] + k * sigma;
@@ -465,15 +480,12 @@ checkSeekReadsOnlyWhatItNeeds(
     rowStart += entry.gaussianCount;
   }
 
-  // One compact candidate table is enough to cover every resident support.
-  // Sorting it once lets both the interval selection and expected visible rows
-  // advance as sweeps; neither asks every chunk or every gaussian about every
-  // probe. Multiple chunks proposing the same instant share one decode.
+  // Prove every resident's complete decoded support against its owning entry.
+  // Candidate probes then remain a fixed small set per distinct interval;
+  // broad populations with distinct peaks cannot turn this into a quadratic
+  // sequence of full-scene reconstructions.
   final support = whole.support(cutoff: scene.header.cutoff);
   final candidates = <double>{};
-  final supportRows = <double, Set<int>>{};
-  final requiredResidentRows = <int>{};
-  final rowOwner = <int, int>{};
   for (final entry in probeEntries) {
     final residentCount = entry.gaussianCount;
     final residentStart = rowStartByChunkOffset[entry.chunkOffset]!;
@@ -481,20 +493,20 @@ checkSeekReadsOnlyWhatItNeeds(
     for (int row = residentStart; row < residentEnd; row++) {
       if (support.lo[row] <= support.hi[row] &&
           support.lo[row] < whole.winHi[row]) {
-        requiredResidentRows.add(row);
-        rowOwner[row] = entry.chunkOffset;
+        final guard = residentGuards[row];
+        if (!residentSupportWithinEntry(
+          entry,
+          support.lo[row],
+          support.hi[row],
+          guard,
+        )) {
+          throw ConformanceFailure(
+            'resident gaussian row $row in the chunk at ${entry.chunkOffset} '
+            'has decoded support [${support.lo[row]}, ${support.hi[row]}], '
+            'outside [${entry.t0}, ${entry.t1}] beyond its $guard quantization guard',
+          );
+        }
       }
-    }
-    final visible = _seekVisibleProbeRows(
-      entry,
-      whole,
-      scene.header.cutoff,
-      residentStart: residentStart,
-      residentCount: residentCount,
-    );
-    for (final candidate in visible) {
-      candidates.add(candidate.time);
-      supportRows.putIfAbsent(candidate.time, () => <int>{}).add(candidate.row);
     }
     candidates.addAll(seekProbeInstants(entry, guardAt));
   }
@@ -528,8 +540,6 @@ checkSeekReadsOnlyWhatItNeeds(
 
   int probed = 0;
   int guardedVisibleCandidates = 0;
-  final provedRows = <int>{};
-  final guardedRows = <int>{};
   for (final t in orderedCandidates) {
     while (nextEntryStart < entryStarts.length &&
         entryStarts[nextEntryStart].at <= t) {
@@ -556,7 +566,6 @@ checkSeekReadsOnlyWhatItNeeds(
     if (_probeInGuardZones(t, guardZones)) {
       if (fromWhole.isNotEmpty) {
         guardedVisibleCandidates++;
-        guardedRows.addAll(supportRows[t] ?? const <int>{});
       }
       continue;
     }
@@ -585,18 +594,6 @@ checkSeekReadsOnlyWhatItNeeds(
       );
     }
     probed++;
-    provedRows.addAll(supportRows[t] ?? const <int>{});
-  }
-  final unproved = requiredResidentRows.difference(<int>{
-    ...provedRows,
-    ...guardedRows,
-  });
-  if (unproved.isNotEmpty) {
-    final row = unproved.first;
-    throw ConformanceFailure(
-      'resident gaussian row $row in the chunk at ${rowOwner[row]} yielded no '
-      'successful or guarded probe from its support',
-    );
   }
   return (probes: probed, guardedVisibleCandidates: guardedVisibleCandidates);
 }
