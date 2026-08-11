@@ -114,10 +114,47 @@ def test_a_delta_subtracts_from_the_serialized_keyframe_birth_time(mode):
     assert following_delta.reference_offset == later_keyframe.offset
 
     # The input authors mu_t=0 for every sample.  The keyframe correctly writes
-    # t0=4, and the following delta must calculate against that serialized bin so
-    # composition returns to the authored zero rather than inheriting the anchor.
+    # t0=4, and the following delta must calculate against that serialized bin while
+    # stating every updated gaussian at the delta's own t0=6.
     assert np.all(later_keyframe.state.bins[op.A_MU_T] != 0)
-    assert following_delta.state.bins[op.A_MU_T].reshape(-1).tolist() == [0] * following_delta.state.count
+    sigma = following_delta.state.bins[op.A_SIGMA_T].reshape(-1)
+    never_fades = (following_delta.state.bins[op.A_FLAGS].reshape(-1) & op.FLAG_NEVER_FADES) != 0
+    expected = np.rint(following_delta.t0 / decoded.grids.mu_step(sigma, never_fades)).astype(np.int64)
+    actual_by_id = dict(
+        zip(
+            following_delta.state.ids.tolist(),
+            following_delta.state.bins[op.A_MU_T].reshape(-1).tolist(),
+            strict=True,
+        )
+    )
+    expected_by_id = dict(zip(following_delta.state.ids.tolist(), expected.tolist(), strict=True))
+    assert all(actual_by_id[gaussian_id] == expected_by_id[gaussian_id] for gaussian_id in [0, 1, 4])
+    keyframe_by_id = dict(
+        zip(
+            later_keyframe.state.ids.tolist(),
+            later_keyframe.state.bins[op.A_MU_T].reshape(-1).tolist(),
+            strict=True,
+        )
+    )
+    assert all(actual_by_id[gaussian_id] == keyframe_by_id[gaussian_id] for gaussian_id in [2, 3])
+
+
+@pytest.mark.parametrize("mode", [rec.DELTA_MODE_CHAINED, rec.DELTA_MODE_KEYFRAME])
+def test_a_delta_reanchors_only_the_gaussians_it_updates(mode):
+    samples, duration = _moving_sequence(steps=2, duration=2.0)
+    samples[1].gaussians.positions[:] = samples[0].gaussians.positions
+    samples[1].gaussians.positions[0, 0] += 0.25
+
+    decoded = kdf.decode_streamed(write_ok(samples, duration, mode, keyframe_every=2))
+    keyframe, delta = decoded.chunks
+    assert delta.update_count == 1
+
+    keyframe_mu = dict(
+        zip(keyframe.state.ids.tolist(), keyframe.state.bins[op.A_MU_T].reshape(-1).tolist(), strict=True)
+    )
+    delta_mu = dict(zip(delta.state.ids.tolist(), delta.state.bins[op.A_MU_T].reshape(-1).tolist(), strict=True))
+    assert delta_mu[0] != keyframe_mu[0]
+    assert all(delta_mu[gaussian_id] == keyframe_mu[gaussian_id] for gaussian_id in [1, 2, 3])
 
 
 def test_composition_reconstructs_each_source_sample():

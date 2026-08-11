@@ -390,7 +390,45 @@ def write_sequence(
             ref_sample = i - 1
             depth = depths[i - 1] + 1
         ref_ids, ref_bins = quantized[ref_sample]
-        update_ids, update_bins, birth_ids, birth_bins, death_ids = delta_groups(ref_ids, ref_bins, ids, bins)
+
+        # mu_t says when a gaussian's state was last stated, not when the caller happened
+        # to anchor its equivalent trajectory.  Ignore that authored anchor while deciding
+        # whether a common gaussian changed: otherwise a sample that keeps mu_t=0 would
+        # spend bytes "updating" every gaussian after a nonzero-time keyframe.  Births are
+        # stated by this delta, so they carry this delta's t0 immediately.
+        live = np.isin(ids, ref_ids)
+        order = np.argsort(ref_ids, kind="stable")
+        ref_rows = order[np.searchsorted(ref_ids[order], ids[live])]
+        sigma = bins[op.A_SIGMA_T].reshape(-1)
+        never_fades = (bins[op.A_FLAGS].reshape(-1) & op.FLAG_NEVER_FADES) != 0
+        stated_mu = np.rint(t0 / grids.mu_step(sigma, never_fades)).astype(np.int64)
+        comparison_bins = dict(bins)
+        comparison_mu = bins[op.A_MU_T].copy().reshape(-1)
+        comparison_mu[live] = ref_bins[op.A_MU_T].reshape(-1)[ref_rows]
+        comparison_mu[~live] = stated_mu[~live]
+        comparison_bins[op.A_MU_T] = comparison_mu.reshape(-1, 1)
+
+        update_ids, update_bins, birth_ids, birth_bins, death_ids = delta_groups(
+            ref_ids, ref_bins, ids, comparison_bins
+        )
+
+        # Every updated gaussian is stated at this delta's t0.  delta_groups deliberately
+        # compared common mu_t values as equal above, so replace its zero difference with
+        # the difference from the state actually serialized by the reference.  Retain that
+        # composed anchor in quantized[i] so the next chained delta subtracts from the same
+        # state its decoder will see; untouched gaussians keep the reference anchor.
+        updated = np.isin(ids, update_ids)
+        if update_ids.size:
+            update_ref_rows = order[np.searchsorted(ref_ids[order], update_ids)]
+            update_bins[op.A_MU_T] = (stated_mu[updated] - ref_bins[op.A_MU_T].reshape(-1)[update_ref_rows]).reshape(
+                -1, 1
+            )
+        composed_bins = dict(bins)
+        composed_mu = stated_mu.copy()
+        composed_mu[live] = ref_bins[op.A_MU_T].reshape(-1)[ref_rows]
+        composed_mu[updated] = stated_mu[updated]
+        composed_bins[op.A_MU_T] = composed_mu.reshape(-1, 1)
+        quantized[i] = (ids, composed_bins)
         updates = encode_delta_streams(update_ids, update_bins, codec=codec, level=level)
         births = encode_delta_streams(birth_ids, birth_bins, codec=codec, level=level)
         deaths = death_streams(death_ids, codec=codec, level=level)
