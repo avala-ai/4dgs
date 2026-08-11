@@ -19,8 +19,9 @@ import {
   FourdgsError,
   GAUSSIAN_FLAG_NEVER_FADES,
   MalformedFile,
+  UnsupportedCodec,
+  UnsupportedVersion,
   decodeKeyframeDeltaStreamed,
-  keyframeDeltaStatesJson,
   stepsFrom,
   supportK,
   lifeClass,
@@ -43,6 +44,9 @@ import {
 } from "./support/corpus.mjs";
 import {
   cutAfterChunk,
+  withBadSummaryCrc,
+  withDuplicateIndexOffset,
+  withHeaderDuration,
   withPaddedHeader,
   withRedistributedIndexCounts,
   withStateChunksReversed,
@@ -126,16 +130,16 @@ describe("the corpus decodes to the same scene on both read paths", () => {
 describe("keyframe-delta reconstruction matches the canonical statement", () => {
   for (const { name, file, expected } of KEYFRAME_DELTA) {
     it(name, async () => {
-      const bytes = new Uint8Array(await (await import("node:fs/promises")).readFile(file));
-      const sequence = await decodeKeyframeDeltaStreamed(bytes);
-      const canonical = keyframeDeltaStatesJson(sequence);
       const playable = await openScene(new FileReadable(file));
       assert.equal(playable.readMode, "keyframe-delta");
       assert.equal(playable.header.temporalModel, expected.temporalModel);
       assert.equal(playable.duration, expected.durationSec);
-      assert.ok(canonical.states.length > 0, "the canonical statement probes at least one instant");
+      assert.ok(
+        expected.states.length > 0,
+        "the committed expectation probes at least one instant",
+      );
 
-      for (const row of canonical.states) {
+      for (const row of expected.states) {
         const frame = await playable.frameAt(row.t);
         // Every window in this corpus covers the whole timeline and no probe falls under
         // the cutoff, so the visible population is the composed one. Where that stops being
@@ -158,6 +162,16 @@ describe("keyframe-delta reconstruction matches the canonical statement", () => 
           `positionSum at t = ${row.t}`,
         );
         assert.equal(round(opacity), round(row.aggregate.opacitySum), `opacitySum at t = ${row.t}`);
+        assert.deepEqual(
+          Array.from(frame.centers, round),
+          row.sample.positions.flat().map(round),
+          `sample positions at t = ${row.t}`,
+        );
+        assert.deepEqual(
+          Array.from(frame.scales, round),
+          row.sample.scales.flat().map(round),
+          `sample scales at t = ${row.t}`,
+        );
       }
     });
   }
@@ -181,6 +195,7 @@ describe("an invalid file is refused in the decoder's own words", () => {
         refusal instanceof FourdgsError,
         `refused with ${refusal?.constructor?.name}, not a 4dgs refusal`,
       );
+      assert.equal(refusalTag(refusal), expected.refused, refusal.message);
       // §6: a refusal names the value, not just the fact. The page prints this sentence as
       // it came, so a message that stopped saying anything would be invisible here
       // otherwise.
@@ -191,6 +206,22 @@ describe("an invalid file is refused in the decoder's own words", () => {
     });
   }
 });
+
+function refusalTag(error) {
+  const message = error.message;
+  if (error instanceof UnsupportedVersion) {
+    return /major version 1\b/.test(message) ? "magic-mismatch" : "unsupported-major-version";
+  }
+  if (error instanceof UnsupportedCodec) {
+    if (/temporal model/.test(message)) return "unknown-temporal-model";
+    if (/Quantization.*scheme/.test(message)) return "unknown-quantization-scheme";
+    if (/stream codec/.test(message)) return "unknown-stream-codec";
+  }
+  if (error instanceof MalformedFile && /window index/.test(message)) {
+    return "window-index-out-of-range";
+  }
+  return `unmapped:${error.constructor.name}`;
+}
 
 describe("§5.5: a chunk's gaussians are invisible outside its interval", () => {
   // The file this PR was opened over: a gaussian whose validity window is [14, 16) stored
@@ -244,6 +275,29 @@ describe("§5.5: a chunk's gaussians are invisible outside its interval", () => 
     assert.ok(
       !playable.notes.some((line) => line.includes("Every other visibility rule is applied")),
       `a conforming file lost its gate:\n${playable.notes.join("\n")}`,
+    );
+  });
+
+  it("a CRC-rejected index falls back to the streamed path", async () => {
+    const bytes = withBadSummaryCrc(
+      variant("TenWindows-UseChunkIndex-UseChunks-UseCrc.4dgs").bytes,
+    );
+    const playable = await openScene(new BytesReadable(bytes));
+    assert.equal(playable.readMode, "streamed");
+    assert.ok(playable.notes.some((line) => line.includes("summary CRC")));
+  });
+
+  it("duplicate Chunk offsets cannot build a streamed interval gate", async () => {
+    const { bytes, duplicateOffset } = withDuplicateIndexOffset(
+      variant("TenWindows-UseChunkIndex-UseChunks-UseCrc.4dgs").bytes,
+    );
+    const playable = await openScene(new BytesReadable(bytes, { hideFooter: true }));
+    assert.equal(playable.readMode, "streamed");
+    assert.ok(
+      playable.notes.some(
+        (line) =>
+          line.includes(`offset ${duplicateOffset} more than once`) && line.includes("one to one"),
+      ),
     );
   });
 });
@@ -380,6 +434,19 @@ describe("§11.10: a keyframe-delta timeline ends where its chunks do", () => {
         `t = ${t}: reordering storage must not change what the file means`,
       );
     }
+  });
+
+  it("a complete file whose chunks stop early is malformed, not truncated", async () => {
+    const whole = variant(source);
+    const duration = whole.expected.durationSec + 1;
+    const bytes = withHeaderDuration(whole.bytes, duration);
+    await assert.rejects(
+      () => openScene(new BytesReadable(bytes)),
+      (error) =>
+        error instanceof MalformedFile &&
+        error.message.includes(`duration_sec ${duration}`) &&
+        error.message.includes("complete"),
+    );
   });
 });
 

@@ -5,6 +5,10 @@ on:
     branches: [main]
     paths:
       - "website/**"
+      - "typescript/core/**"
+      - "typescript/browser/**"
+      - "python/fourdgs/**"
+      - "tests/conformance/**"
       - "package.json"
       - "yarn.lock"
       - ".github/workflows/website.yml"
@@ -13,6 +17,10 @@ on:
   pull_request:
     paths:
       - "website/**"
+      - "typescript/core/**"
+      - "typescript/browser/**"
+      - "python/fourdgs/**"
+      - "tests/conformance/**"
       - "package.json"
       - "yarn.lock"
       - ".github/workflows/website.yml"

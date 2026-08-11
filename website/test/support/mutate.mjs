@@ -17,6 +17,7 @@ import {
 
 /** Offset within a Chunk Index entry's content of its `u32` gaussian_count (spec §5.9). */
 const INDEX_ENTRY_COUNT_AT = 8 + 8 + 8 + 8;
+const INDEX_ENTRY_OFFSET_AT = 8 + 8;
 
 function records(bytes) {
   return [...iterateRecords(bytes, MAGIC.length)];
@@ -66,6 +67,54 @@ export function withRedistributedIndexCounts(bytes) {
     firstEntry: entries[0].parsed,
     claimed: entries[0].parsed.gaussianCount - 1,
   };
+}
+
+/** Two index entries point at the same Chunk, leaving another Chunk unrepresented. */
+export function withDuplicateIndexOffset(bytes) {
+  const entries = records(bytes).filter((record) => record.opcode === Opcode.ChunkIndex);
+  if (entries.length < 2) throw new Error("this variant has fewer than two Chunk Index entries");
+  const first = parseChunkIndexEntry(entries[0].content);
+  const out = bytes.slice();
+  new DataView(out.buffer, out.byteOffset, out.byteLength).setBigUint64(
+    entries[1].offset + RECORD_HEADER_BYTES + INDEX_ENTRY_OFFSET_AT,
+    BigInt(first.chunkOffset),
+    true,
+  );
+  return { bytes: out, duplicateOffset: first.chunkOffset };
+}
+
+/** Corrupt only the Footer's summary CRC, leaving every index entry byte intact. */
+export function withBadSummaryCrc(bytes) {
+  const footer = records(bytes).find((record) => record.opcode === Opcode.Footer);
+  if (footer === undefined) throw new Error("no Footer record in this variant");
+  const out = bytes.slice();
+  const at = footer.offset + RECORD_HEADER_BYTES + 16;
+  const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
+  view.setUint32(at, view.getUint32(at, true) ^ 0x01000000, true);
+  return out;
+}
+
+/** Change only Header.duration_sec; it is outside the Footer's summary CRC region. */
+export function withHeaderDuration(bytes, duration) {
+  const header = records(bytes).find((record) => record.opcode === Opcode.Header);
+  if (header === undefined) throw new Error("no Header record in this variant");
+  const view = new DataView(
+    header.content.buffer,
+    header.content.byteOffset,
+    header.content.byteLength,
+  );
+  let at = 0;
+  for (let i = 0; i < 2; i++) {
+    const length = view.getUint32(at, true);
+    at += 4 + length;
+  }
+  const out = bytes.slice();
+  new DataView(out.buffer, out.byteOffset, out.byteLength).setFloat64(
+    header.offset + RECORD_HEADER_BYTES + at,
+    duration,
+    true,
+  );
+  return out;
 }
 
 /**

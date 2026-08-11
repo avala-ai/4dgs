@@ -171,6 +171,10 @@ export class SplatRenderer {
     }
     this.gl = gl;
     this.canvas = canvas;
+    // Kept before a loss: querying extensions after the context is gone is not reliable.
+    // The viewer asks the platform to restore after surfacing the failure, then rebuilds
+    // every GPU object in `webglcontextrestored`.
+    this.contextLossExtension = gl.getExtension("WEBGL_lose_context");
     this.program = linkProgram(gl, VERTEX_SHADER, FRAGMENT_SHADER);
     this.uniforms = {
       geometry: gl.getUniformLocation(this.program, "u_geometry"),
@@ -234,6 +238,10 @@ export class SplatRenderer {
     this.frameSerial += 1;
   }
 
+  requestContextRestore() {
+    this.contextLossExtension?.restoreContext();
+  }
+
   /**
    * Take the gaussians alive at an instant.
    *
@@ -241,10 +249,16 @@ export class SplatRenderer {
    * on the scene's scale and rotation and not at all on where the camera is.
    */
   setFrame(frame) {
-    this.frame = frame;
-    this.frameSerial += 1;
-    if (frame.count === 0) return;
-    this.ensureCapacity(frame.count);
+    // Capacity is a precondition for publishing the frame. If allocation refuses an
+    // oversized scene, `draw` must continue to see the previous valid frame (or none), not
+    // a count whose staging arrays and textures were never created.
+    if (frame.count > 0) this.ensureCapacity(frame.count);
+
+    if (frame.count === 0) {
+      this.frame = frame;
+      this.frameSerial += 1;
+      return;
+    }
 
     const geometry = this.geometryData;
     for (let i = 0; i < frame.count; i++) {
@@ -270,6 +284,8 @@ export class SplatRenderer {
       gl.FLOAT,
       geometry.subarray(0, rows * width * 4),
     );
+    this.frame = frame;
+    this.frameSerial += 1;
   }
 
   /** Draw the current frame from the current camera. */

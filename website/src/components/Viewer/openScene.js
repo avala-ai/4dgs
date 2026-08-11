@@ -90,6 +90,14 @@ const CHUNK_CACHE_LIMIT = 64;
  */
 const KEYFRAME_DELTA_BYTE_LIMIT = 512 * 1024 * 1024;
 
+/** A conforming resource this particular page cannot safely hold. */
+export class ViewerLimitError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "ViewerLimitError";
+  }
+}
+
 /**
  * Counts what the transport actually moved.
  *
@@ -177,8 +185,17 @@ async function openGaussianBirth(source, size) {
   const notes = [];
   try {
     const decoder = await IndexedDecoder.open(source);
-    if (decoder.index.length > 0) return indexedPlayable(decoder, source, notes);
-    notes.push("The file carries no Chunk Index, so it is read front to back instead of seeked.");
+    if (decoder.index.length > 0 && decoder.summaryCrcOk !== false) {
+      return indexedPlayable(decoder, source, notes);
+    }
+    if (decoder.summaryCrcOk === false) {
+      notes.push(
+        "The Footer's summary CRC does not match the index it covers, so the index is not " +
+          "trusted for seeking and the file is read front to back instead.",
+      );
+    } else {
+      notes.push("The file carries no Chunk Index, so it is read front to back instead of seeked.");
+    }
   } catch (error) {
     // An index that cannot be read is a reason to read the file the other way, not a
     // reason to refuse it: a file cut before its Footer has no index and still decodes.
@@ -226,9 +243,6 @@ function indexedPlayable(decoder, source, notes) {
     return set;
   }
 
-  if (decoder.summaryCrcOk === false) {
-    notes.push("The Footer's summary CRC does not match the index it covers.");
-  }
   return {
     readMode: "indexed",
     header,
@@ -349,8 +363,9 @@ function frameFromSet(set, t, cutoff, gate) {
  * scene. So every entry is checked against the Chunk record it names, exactly as
  * `IndexedDecoder.readChunk` checks it before decoding: the record at `chunk_offset` must
  * be a Chunk, and its header's `count`, `t0` and `t1` must be the ones the entry claims.
- * That costs one bounded read of each chunk record, on a path already reading the file
- * front to back, and it is the difference between a gate and a guess.
+ * That costs one fixed-size framing read and then the record's own validated range, on a
+ * path already reading the file front to back, and it is the difference between a gate and
+ * a guess.
  *
  * A gate is not built unless every one of those checks passes. Nothing here refuses the
  * file: the gaussians decoded, and the indexed reader — the one whose contract an index
@@ -382,6 +397,19 @@ async function chunkGateOf(scene, source, size) {
     };
   }
 
+  const offsets = new Set();
+  for (const entry of entries) {
+    if (offsets.has(entry.chunkOffset)) {
+      return {
+        gate: null,
+        why:
+          `This file's Chunk Index names offset ${entry.chunkOffset} more than once, so it ` +
+          "does not cover the decoded Chunk records one to one.",
+      };
+    }
+    offsets.add(entry.chunkOffset);
+  }
+
   for (const entry of entries) {
     const mismatch = await chunkDisagreement(entry, source, size);
     if (mismatch !== null) return { gate: null, why: `This file's ${mismatch}` };
@@ -407,7 +435,7 @@ async function chunkGateOf(scene, source, size) {
  */
 async function chunkDisagreement(entry, source, size) {
   const { chunkOffset, chunkLength } = entry;
-  if (chunkOffset < 0 || chunkLength < RECORD_HEADER_BYTES || chunkOffset + chunkLength > size) {
+  if (chunkOffset < 0 || chunkOffset + RECORD_HEADER_BYTES > size) {
     return (
       `Chunk Index entry for [${entry.t0}, ${entry.t1}) spans ` +
       `[${chunkOffset}, ${chunkOffset + chunkLength}), outside the ${size}-byte resource.`
@@ -415,14 +443,31 @@ async function chunkDisagreement(entry, source, size) {
   }
   let parsed;
   try {
-    const blob = await source.read(BigInt(chunkOffset), BigInt(chunkLength));
-    const record = readRecord(new Cursor(blob, 0, chunkOffset));
-    if (record.opcode !== Opcode.Chunk) {
+    // `chunkLength` belongs to the untrusted index. Read only the fixed framing first,
+    // then use the Chunk record's own length after proving it is representable and inside
+    // the resource. A damaged index cannot turn this optional check into a multi-gigabyte
+    // allocation by exaggerating the range while keeping a valid Chunk offset.
+    const framed = await source.read(BigInt(chunkOffset), BigInt(RECORD_HEADER_BYTES));
+    const head = new Cursor(framed, 0, chunkOffset);
+    const opcode = head.u8();
+    const actualLength = RECORD_HEADER_BYTES + head.u64();
+    if (opcode !== Opcode.Chunk) {
       return (
         `Chunk Index points at offset ${chunkOffset}, which holds opcode ` +
-        `0x${record.opcode.toString(16)} rather than a Chunk.`
+        `0x${opcode.toString(16)} rather than a Chunk.`
       );
     }
+    if (actualLength !== chunkLength) {
+      return (
+        `chunk at ${chunkOffset} occupies ${actualLength} bytes and its index entry says ` +
+        `${chunkLength}.`
+      );
+    }
+    if (chunkOffset + actualLength > size) {
+      return `chunk at ${chunkOffset} declares ${actualLength} bytes, past the ${size}-byte resource.`;
+    }
+    const blob = await source.read(BigInt(chunkOffset), BigInt(actualLength));
+    const record = readRecord(new Cursor(blob, 0, chunkOffset));
     parsed = parseChunk(record.content);
   } catch (error) {
     return `Chunk Index entry at offset ${chunkOffset} could not be read back: ${error.message}`;
@@ -484,7 +529,7 @@ function concatSh(chunks) {
  */
 async function openKeyframeDelta(source, size) {
   if (size > KEYFRAME_DELTA_BYTE_LIMIT) {
-    throw new MalformedFile(
+    throw new ViewerLimitError(
       `this keyframe-delta resource is ${size} bytes, and this page composes a keyframe-delta ` +
         `file whole — @4dgs/core's keyframe-delta read paths take a byte array rather than a ` +
         `byte-range reader — so it declines anything over ${KEYFRAME_DELTA_BYTE_LIMIT} bytes ` +
@@ -493,6 +538,7 @@ async function openKeyframeDelta(source, size) {
     );
   }
   const data = await source.read(0n, BigInt(size));
+  const complete = endsWithMagic(data);
   const sequence = await decodeKeyframeDeltaStreamed(data);
   const cutoff = cutoffOf(sequence.header);
   const notes = [
@@ -522,6 +568,13 @@ async function openKeyframeDelta(source, size) {
   }
   const duration = Math.min(sequence.header.durationSec, covered);
   if (duration < sequence.header.durationSec) {
+    if (complete) {
+      throw new MalformedFile(
+        `this complete keyframe-delta file's state chunks cover [${earliest}, ${covered}), ` +
+          `short of the Header's duration_sec ${sequence.header.durationSec}; a complete ` +
+          "timeline must tile the whole declared duration",
+      );
+    }
     notes.push(
       `The chunks that decoded cover [${earliest}, ${covered}), short of the Header's ` +
         `duration_sec ${sequence.header.durationSec}: the file was cut after a complete ` +
@@ -557,6 +610,13 @@ async function openKeyframeDelta(source, size) {
     transfer: () => transferOf(source),
     notes,
   };
+}
+
+function endsWithMagic(data) {
+  if (data.length < MAGIC.length) return false;
+  const at = data.length - MAGIC.length;
+  for (let i = 0; i < MAGIC.length; i++) if (data[at + i] !== MAGIC[i]) return false;
+  return true;
 }
 
 function transferOf(source) {

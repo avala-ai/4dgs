@@ -137,13 +137,27 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
     return page;
   }
 
-  const opened = () =>
-    document.querySelectorAll("dt").length > 0 &&
-    [...document.querySelectorAll("button")].some((b) => b.textContent === "Play" && !b.disabled);
+  const opened = () => {
+    const live = [...document.querySelectorAll("dt")].find(
+      (entry) => entry.textContent === "Live at this instant",
+    );
+    return (
+      live !== undefined &&
+      Number(live.nextElementSibling?.textContent.replace(/,/g, "")) > 0 &&
+      [...document.querySelectorAll("button")].some((b) => b.textContent === "Play" && !b.disabled)
+    );
+  };
   const refused = () => document.querySelector("h3") !== null;
 
   it("opens a corpus file and shows the file's own facts", async () => {
     const page = await viewer();
+    await page.waitFor(
+      () => {
+        const input = document.querySelector('input[type="file"]');
+        return input !== null && !input.disabled;
+      },
+      { what: "the renderer to survive browser startup" },
+    );
     await page.evaluate(pickFile, `${site.base}/corpus/${VALID}`);
     await page.waitFor(opened, { what: "a scene with an enabled transport" });
     const state = await page.evaluate(readState);
@@ -212,6 +226,9 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
 
   it("does not freeze a new file behind a read left in flight on the old one", async () => {
     const page = await viewer();
+    await page.waitFor(() => document.querySelector('input[type="url"]') !== null, {
+      what: "the URL control to mount",
+    });
     await page.evaluate((href) => {
       const input = document.querySelector('input[type="url"]');
       const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
@@ -320,6 +337,33 @@ describe("the viewer in a browser", { skip: available ? false : "no Chrome found
     assert.match(state.refusalBody, /MAX_TEXTURE_SIZE of 2/);
     assert.match(state.refusalBody, /gaussians alive at one instant/);
     assert.match(state.refusalBody, /The file is fine/);
+    await page.close();
+  });
+
+  it("surfaces WebGL context loss and rebuilds after restoration", async () => {
+    const page = await viewer();
+    await page.evaluate(pickFile, `${site.base}/corpus/${VALID}`);
+    await page.waitFor(opened);
+    const canRestore = await page.evaluate(() => {
+      const gl = document.querySelector("canvas").getContext("webgl2");
+      const extension = gl.getExtension("WEBGL_lose_context");
+      if (extension === null) throw new Error("WEBGL_lose_context is unavailable");
+      window.__restoreWebglForTest = () => extension.restoreContext();
+      extension.loseContext();
+      return true;
+    });
+    assert.equal(canRestore, true);
+    await page.waitFor(refused, { what: "the WebGL context-loss refusal" });
+    const lost = await page.evaluate(readState);
+    assert.equal(lost.refusalTitle, "ViewerCapabilityError");
+    assert.match(lost.refusalBody, /WebGL2 context was lost/);
+    assert.equal(lost.fileDisabled, true);
+
+    await page.evaluate(() => window.__restoreWebglForTest());
+    await page.waitFor(opened, { what: "the rebuilt renderer" });
+    const after = await page.evaluate(readState);
+    assert.equal(after.refusalTitle, null);
+    assert.equal(after.playDisabled, false);
     await page.close();
   });
 });

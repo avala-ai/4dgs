@@ -17,7 +17,7 @@ import {
 import React, { useCallback, useEffect, useRef, useState } from "react";
 
 import { OrbitCamera, boundsOf } from "./camera.js";
-import { openScene } from "./openScene.js";
+import { ViewerLimitError, openScene } from "./openScene.js";
 import { SplatRenderer } from "./renderer.js";
 import styles from "./styles.module.css";
 
@@ -26,6 +26,13 @@ const FRAMING_PROBES = [0, 0.25, 0.5, 0.75, 0.999];
 
 /** How often the readouts under the canvas are allowed to re-render, in milliseconds. */
 const READOUT_INTERVAL = 100;
+
+class ViewerCapabilityError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "ViewerCapabilityError";
+  }
+}
 
 export default function Viewer() {
   const canvasRef = useRef(null);
@@ -39,11 +46,13 @@ export default function Viewer() {
   /**
    * Why this browser cannot draw anything, if it cannot.
    *
-   * WebGL2 either exists or it does not, and no file changes that. It is held apart from
-   * the per-file refusal so that opening a file cannot clear it, and read through a ref as
-   * well as through state because `open` is created once and must see it.
+   * Covers both a browser with no WebGL2 and a context temporarily lost after setup. It is
+   * held apart from the per-file refusal so that opening a file cannot clear it, and read
+   * through a ref as well as through state because `open` is created once and must see it.
    */
   const setupFailureRef = useRef(null);
+  /** The last open attempted during a recoverable context loss. */
+  const pendingOpenRef = useRef(null);
 
   const [source, setSource] = useState(null);
   const [scene, setScene] = useState(null);
@@ -62,7 +71,7 @@ export default function Viewer() {
    * says so by being disabled rather than by accepting clicks and ignoring them.
    */
   const [decodeFailed, setDecodeFailed] = useState(false);
-  /** Set once, when WebGL2 is not available at all. Nothing about a file clears it. */
+  /** True while WebGL2 is unavailable, including while a lost context is rebuilding. */
   const [setupFailed, setSetupFailed] = useState(false);
   /** Non-null while the visitor is dragging the scrubber, so the readout cannot fight it. */
   const [scrub, setScrub] = useState(null);
@@ -89,6 +98,7 @@ export default function Viewer() {
     cameraRef.current = new OrbitCamera();
 
     let running = true;
+    let contextIsLost = false;
     let previous = performance.now();
     let lastReadout = 0;
     /**
@@ -100,8 +110,80 @@ export default function Viewer() {
      */
     let pendingSerial = null;
 
+    const contextLost = (event) => {
+      // Prevent the default so the platform is allowed to restore the context. Until then,
+      // stop the transport and say why the canvas is blank instead of advancing beside it.
+      event.preventDefault();
+      contextIsLost = true;
+      const failure = new ViewerCapabilityError(
+        "the WebGL2 context was lost; rendering is paused while the browser restores it",
+      );
+      setupFailureRef.current = failure;
+      const playback = playbackRef.current;
+      playback.playing = false;
+      renderer.clear();
+      setPlaying(false);
+      setSetupFailed(true);
+      setError(failure);
+      // Some headless and resource-constrained browsers do not initiate restoration on
+      // their own. Leave the diagnosis visible first, then ask the WebGL extension to
+      // restore; the restored handler recreates every resource rather than reusing any.
+      const lostRenderer = renderer;
+      setTimeout(() => {
+        if (running && contextIsLost && renderer === lostRenderer) {
+          lostRenderer.requestContextRestore();
+        }
+      }, 500);
+    };
+    const contextRestored = async () => {
+      if (!running) return;
+      try {
+        renderer.dispose();
+        renderer = new SplatRenderer(canvas);
+        rendererRef.current = renderer;
+        contextIsLost = false;
+        setupFailureRef.current = null;
+        setSetupFailed(false);
+        setError(null);
+
+        const pendingOpen = pendingOpenRef.current;
+        pendingOpenRef.current = null;
+        if (pendingOpen !== null) {
+          open(pendingOpen.readable, pendingOpen.label);
+          return;
+        }
+
+        // GPU resources do not survive a restored context. Recreate the frame at the
+        // current instant from decoded state; the transport stays paused so restoration
+        // cannot make scene time jump.
+        const playback = playbackRef.current;
+        const playable = playback.playable;
+        const serial = playback.serial;
+        if (playable !== null) {
+          const frame = await playable.frameAt(playback.time);
+          if (running && playbackRef.current.serial === serial && !contextIsLost) {
+            renderer.setFrame(frame);
+            playbackRef.current.rendered = playback.time;
+          }
+        }
+      } catch (failure) {
+        const wrapped = new ViewerCapabilityError(
+          `the WebGL2 context was restored but the renderer could not be rebuilt: ${failure.message}`,
+        );
+        setupFailureRef.current = wrapped;
+        setSetupFailed(true);
+        setError(wrapped);
+      }
+    };
+    canvas.addEventListener("webglcontextlost", contextLost);
+    canvas.addEventListener("webglcontextrestored", contextRestored);
+
     const tick = (now) => {
       if (!running) return;
+      if (contextIsLost) {
+        requestAnimationFrame(tick);
+        return;
+      }
       const dt = Math.min((now - previous) / 1000, 0.25);
       previous = now;
       const playback = playbackRef.current;
@@ -137,6 +219,7 @@ export default function Viewer() {
               if (pendingSerial === serial) pendingSerial = null;
               if (!running || playbackRef.current.serial !== serial) return;
               playbackRef.current.playable = null;
+              renderer.clear();
               setPlaying(false);
               setDecodeFailed(true);
               setError(failure);
@@ -161,6 +244,8 @@ export default function Viewer() {
 
     return () => {
       running = false;
+      canvas.removeEventListener("webglcontextlost", contextLost);
+      canvas.removeEventListener("webglcontextrestored", contextRestored);
       renderer.dispose();
       rendererRef.current = null;
     };
@@ -179,9 +264,16 @@ export default function Viewer() {
     // Nothing to open a file into. Restate why rather than replacing it with a refusal
     // about the file, which is not the thing that is wrong.
     if (setupFailureRef.current !== null) {
+      if (setupFailureRef.current instanceof ViewerCapabilityError) {
+        // A context restoration is already in flight. Keep only the most recent choice;
+        // once GPU resources have been rebuilt it is opened through the ordinary serial
+        // path, so a startup loss cannot silently eat the visitor's first file.
+        pendingOpenRef.current = { readable, label };
+      }
       setError(setupFailureRef.current);
       return;
     }
+    pendingOpenRef.current = null;
     const playback = playbackRef.current;
     // A URL over a slow link and a large local file both take long enough that a visitor
     // can start a second open before the first returns. Every effect below is guarded by
@@ -460,6 +552,8 @@ export default function Viewer() {
  * worth more than that, so it is recovered from the prototype chain, which survives.
  */
 const REFUSAL_NAMES = [
+  [ViewerLimitError, "ViewerLimitError"],
+  [ViewerCapabilityError, "ViewerCapabilityError"],
   [MalformedFile, "MalformedFile"],
   [TruncatedFile, "TruncatedFile"],
   [UnsupportedCodec, "UnsupportedCodec"],
@@ -478,10 +572,11 @@ function Refusal({ error }) {
       <h3 className={styles.refusalTitle}>{refusalName(error)}</h3>
       <pre className={styles.refusalBody}>{error.message}</pre>
       <p className={styles.refusalNote}>
-        Printed exactly as <code>@4dgs/core</code> raised it. <code>UnsupportedCodec</code> and{" "}
+        Printed exactly as the reader raised it. <code>UnsupportedCodec</code> and{" "}
         <code>UnsupportedVersion</code> mean the file may be perfectly conforming and this build
         cannot read part of it; <code>MalformedFile</code> means the bytes are wrong;{" "}
-        <code>TruncatedFile</code> means they ran out.
+        <code>TruncatedFile</code> means they ran out; viewer capability and limit errors mean the
+        file may be valid but this page cannot draw it safely.
       </p>
     </div>
   );
@@ -560,6 +655,7 @@ async function frameCamera(playable, renderer, camera, isCurrent) {
   const warnings = [];
   let bounds = boundsOf(first.centers, first.count);
   for (const fraction of FRAMING_PROBES) {
+    if (bounds !== null) break;
     if (fraction === 0 || !(playable.duration > 0)) continue;
     const t = Math.min(playable.duration * fraction, lastInstant(playable.duration));
     try {
