@@ -240,9 +240,18 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
       '4dgs: framedFooterOffset and framedFooterLength must be supplied together',
     );
   }
-  final int footerAt =
-      framedFooterOffset ?? size - fourdgsMagic.length - minimumTail;
-  final int footerLength = framedFooterLength ?? footerFixedContentBytes;
+  final ({int offset, int length}) locatedFooter;
+  if (framedFooterOffset != null) {
+    locatedFooter = (offset: framedFooterOffset, length: framedFooterLength!);
+  } else {
+    locatedFooter = await _locateFooter(
+      source,
+      size - fourdgsMagic.length,
+      footerFixedContentBytes,
+    );
+  }
+  final int footerAt = locatedFooter.offset;
+  final int footerLength = locatedFooter.length;
   if (footerAt < 0 ||
       footerLength < footerFixedContentBytes ||
       footerAt + recordHeaderBytes + footerLength !=
@@ -422,6 +431,61 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
     provenanceRanges: front.provenanceRanges,
     statistics: statistics,
     summaryOffsets: summaryOffsets,
+  );
+}
+
+/// Locate the variable-width final Footer from bounded tail ranges.
+///
+/// Version-1 fields occupy the first 20 content bytes, while later minor
+/// revisions may append more. The content length therefore cannot be inferred
+/// from a fixed distance to the closing magic. Search backwards for the framed
+/// header whose declared range ends exactly at [magicAt], holding at most one
+/// scan block plus the eight length bytes.
+Future<({int offset, int length})> _locateFooter(
+  FourdgsReadable source,
+  int magicAt,
+  int fixedContentBytes,
+) async {
+  const int blockBytes = 64 * 1024;
+  final int fixedAt = magicAt - recordHeaderBytes - fixedContentBytes;
+  final Uint8List fixedHead = await source.read(fixedAt, recordHeaderBytes);
+  if (fixedHead[0] == opFooter &&
+      ByteData.sublistView(
+            fixedHead,
+            1,
+            recordHeaderBytes,
+          ).getUint64(0, Endian.little) ==
+          fixedContentBytes) {
+    return (offset: fixedAt, length: fixedContentBytes);
+  }
+
+  int scanEnd = fixedAt - 1;
+  while (scanEnd >= fourdgsMagic.length) {
+    final int scanStart = math.max(
+      fourdgsMagic.length,
+      scanEnd - blockBytes + 1,
+    );
+    final Uint8List bytes = await source.read(
+      scanStart,
+      scanEnd - scanStart + 1 + 8,
+    );
+    for (int candidate = scanEnd; candidate >= scanStart; candidate--) {
+      final int local = candidate - scanStart;
+      if (bytes[local] != opFooter) continue;
+      final int length = ByteData.sublistView(
+        bytes,
+        local + 1,
+        local + recordHeaderBytes,
+      ).getUint64(0, Endian.little);
+      if (length >= fixedContentBytes &&
+          candidate + recordHeaderBytes + length == magicAt) {
+        return (offset: candidate, length: length);
+      }
+    }
+    scanEnd = scanStart - 1;
+  }
+  throw const FourdgsMalformedFile(
+    'the final record before the closing magic is not a framed Footer',
   );
 }
 

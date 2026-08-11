@@ -1736,9 +1736,7 @@ class FourdgsRigTrajectory {
     // record were absent", so reading one refuses nothing — not even an
     // interpolation byte outside the registry, which describes how to read
     // samples it does not carry. `check` stays strict for the writer.
-    if (trajectory.times.isNotEmpty) {
-      trajectory.check();
-    }
+    if (trajectory.times.isNotEmpty) trajectory._checkSamples();
     return trajectory;
   }
 
@@ -1751,6 +1749,10 @@ class FourdgsRigTrajectory {
         '(step)',
       );
     }
+    _checkSamples();
+  }
+
+  void _checkSamples() {
     for (int i = 0; i < times.length; i++) {
       final t = times[i];
       if (!t.isFinite) {

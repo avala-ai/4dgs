@@ -199,12 +199,13 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
   final List<int> indexFrameOffsets = <int>[];
   final List<int> summaryFrameOffsets = <int>[];
   final List<int> summaryOffsetFrameOffsets = <int>[];
-  final List<_StateInterval> framedStateIntervals = <_StateInterval>[];
   // Where each entry's own Chunk Index record sits, so a finding about entry `i`
   // names the byte the reader would name for the same fault.
   final List<int> indexRecordOffsets = <int>[];
-  final Map<int, FourdgsAudioSourceRecord> audioSources =
-      <int, FourdgsAudioSourceRecord>{};
+  // Pairing needs only the source id and its declared payload length. Parsed
+  // descriptors (especially their keyframe arrays and strings) are released
+  // before the next record is read.
+  final Map<int, int> audioSources = <int, int>{};
   final Map<int, int> audioData = <int, int>{};
   bool firstChunkSeen = false;
   bool legacyAudioSeen = false;
@@ -304,11 +305,6 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
                 fileOffset: frame.offset + recordHeaderBytes,
               );
               counted += parsed.count;
-              framedStateIntervals.add((
-                t0: parsed.t0,
-                t1: parsed.t1,
-                offset: frame.offset,
-              ));
             } else {
               final FourdgsCursor cursor = FourdgsCursor(
                 await _bytesOf(source, frame, most: 16),
@@ -321,7 +317,6 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
                 frame.offset + recordHeaderBytes,
                 'Delta Chunk',
               );
-              framedStateIntervals.add((t0: t0, t1: t1, offset: frame.offset));
             }
           } on FourdgsException catch (error) {
             report.error('chunk $chunkCount does not parse: ${_say(error)}');
@@ -375,7 +370,19 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
                 'Audio Source id ${parsed.sourceId} appears more than once',
               );
             }
-            audioSources[parsed.sourceId] = parsed;
+            final FourdgsHeader? parsedHeader = header;
+            if (parsedHeader != null) {
+              for (int i = 0; i < parsed.keyframes.length; i++) {
+                final double t = parsed.keyframes[i].time;
+                if (t < 0 || t > parsedHeader.durationSec) {
+                  report.error(
+                    'Audio Source id ${parsed.sourceId} keyframe $i time $t is '
+                    'outside [0, ${parsedHeader.durationSec}]',
+                  );
+                }
+              }
+            }
+            audioSources[parsed.sourceId] = parsed.dataLength;
           } on FourdgsException catch (error) {
             report.error('Audio Source does not parse: ${_say(error)}');
           }
@@ -478,7 +485,7 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
     );
   }
   if (header != null && keyframeDelta) {
-    _checkFramedTiling(framedStateIntervals, header.durationSec, report);
+    await _checkFramedTiling(source, walk, header.durationSec, report);
   }
 
   if (header != null) {
@@ -517,19 +524,6 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
         'there is an Audio Source or legacy Audio record, but the Header\'s '
         'audio flag is clear',
       );
-    }
-    // The parser already refuses a keyframe list that is not finite and strictly
-    // increasing; what it cannot know is the scene clock those times sit on.
-    for (final FourdgsAudioSourceRecord audioSource in audioSources.values) {
-      for (int i = 0; i < audioSource.keyframes.length; i++) {
-        final double t = audioSource.keyframes[i].time;
-        if (t < 0 || t > header.durationSec) {
-          report.error(
-            'Audio Source id ${audioSource.sourceId} keyframe $i time $t is '
-            'outside [0, ${header.durationSec}]',
-          );
-        }
-      }
     }
     switch (header.profile) {
       case 'capture':
@@ -581,16 +575,15 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
   if (seen.contains(opAudio) && audioSources.isNotEmpty) {
     report.error('legacy Audio and Audio Source records must not be mixed');
   }
-  for (final MapEntry<int, FourdgsAudioSourceRecord> entry
-      in audioSources.entries) {
+  for (final MapEntry<int, int> entry in audioSources.entries) {
     final int? length = audioData[entry.key];
     if (length == null) {
       report.error(
         'Audio Source id ${entry.key} has no matching Audio Data record',
       );
-    } else if (entry.value.dataLength != length) {
+    } else if (entry.value != length) {
       report.error(
-        'Audio Source id ${entry.key} declares ${entry.value.dataLength} bytes; '
+        'Audio Source id ${entry.key} declares ${entry.value} bytes; '
         'Audio Data contains $length',
       );
     }
@@ -959,6 +952,14 @@ Future<void> _checkProvenanceRecords(
           if (value.sampleCount > 0 && !trajectoryNames.add(value.name)) {
             duplicate('RigTrajectory', value.name, '5.15.4');
           }
+          if (value.sampleCount > 0 &&
+              value.interpolation != trajectoryLinear &&
+              value.interpolation != trajectoryStep) {
+            report.warn(
+              "trajectory '${value.name}' names interpolation "
+              '${value.interpolation}, which is not in the registry',
+            );
+          }
         case opGeodeticAnchor:
           final value = FourdgsGeodeticAnchor.parse(
             await _bytesOf(source, frame),
@@ -1097,27 +1098,55 @@ void _noteUnread(_Report report, FourdgsFrame frame) {
   }
 }
 
-void _checkFramedTiling(
-  List<_StateInterval> intervals,
+Future<void> _checkFramedTiling(
+  FourdgsReadable source,
+  FourdgsWalk walk,
   double durationSec,
   _Report report,
-) {
-  if (intervals.isEmpty) {
-    report.error('a keyframe-delta file contains no state chunks');
-    return;
-  }
-  intervals.sort((_StateInterval a, _StateInterval b) => a.t0.compareTo(b.t0));
-  final _StateInterval first = intervals.first;
-  if (first.t0 != 0.0) {
-    report.error(
-      'the state chunks start at ${first.t0} in the record at byte '
-      '${first.offset}; the timeline must start at 0',
-    );
-  }
-  for (int i = 1; i < intervals.length; i++) {
-    final _StateInterval previous = intervals[i - 1];
-    final _StateInterval current = intervals[i];
-    if (previous.t1 != current.t0) {
+) async {
+  // Physical records need not be in t0 order (§11.1), so a one-pass adjacent
+  // comparison is insufficient. Select the next interval in sorted order with
+  // bounded replay: each pass retains two fixed-size interval heads, never a
+  // list proportional to the number of chunks.
+  _StateInterval? previous;
+  while (true) {
+    _StateInterval? next;
+    await for (final FourdgsFrame frame in walkFourdgsFrames(source, walk)) {
+      if ((frame.opcode != opChunk && frame.opcode != opDeltaChunk) ||
+          frame.offset + frame.total > walk.size) {
+        continue;
+      }
+      final _StateInterval interval;
+      try {
+        interval = await _framedStateInterval(source, frame);
+      } on FourdgsException {
+        // The framing pass already reported this record's parse error.
+        continue;
+      }
+      final _StateInterval? selected = previous;
+      if (selected != null &&
+          (interval.t0 < selected.t0 ||
+              (interval.t0 == selected.t0 &&
+                  interval.offset <= selected.offset))) {
+        continue;
+      }
+      final _StateInterval? candidate = next;
+      if (candidate == null ||
+          interval.t0 < candidate.t0 ||
+          (interval.t0 == candidate.t0 && interval.offset < candidate.offset)) {
+        next = interval;
+      }
+    }
+    if (next == null) break;
+    final _StateInterval current = next;
+    if (previous == null) {
+      if (current.t0 != 0.0) {
+        report.error(
+          'the state chunks start at ${current.t0} in the record at byte '
+          '${current.offset}; the timeline must start at 0',
+        );
+      }
+    } else if (previous.t1 != current.t0) {
       final String what = current.t0 < previous.t1 ? 'overlap' : 'leave a gap';
       report.error(
         'state chunks $what: [${previous.t0}, ${previous.t1}) at byte '
@@ -1125,14 +1154,44 @@ void _checkFramedTiling(
         'byte ${current.offset}',
       );
     }
+    previous = current;
   }
-  final _StateInterval last = intervals.last;
-  if (last.t1 != durationSec) {
+  if (previous == null) {
+    report.error('a keyframe-delta file contains no state chunks');
+    return;
+  }
+  if (previous.t1 != durationSec) {
     report.error(
-      'the state chunks end at ${last.t1} in the record at byte ${last.offset}; '
+      'the state chunks end at ${previous.t1} in the record at byte '
+      '${previous.offset}; '
       'the Header duration_sec is $durationSec',
     );
   }
+}
+
+Future<_StateInterval> _framedStateInterval(
+  FourdgsReadable source,
+  FourdgsFrame frame,
+) async {
+  if (frame.opcode == opChunk) {
+    final parsed = parseChunkInterval(
+      await _bytesOf(source, frame, most: chunkFixedHeadBytes),
+      fileOffset: frame.offset + recordHeaderBytes,
+    );
+    return (t0: parsed.t0, t1: parsed.t1, offset: frame.offset);
+  }
+  final FourdgsCursor cursor = FourdgsCursor(
+    await _bytesOf(source, frame, most: 16),
+  );
+  final double t0 = cursor.f64();
+  final double t1 = cursor.f64();
+  refuseUnusableInterval(
+    t0,
+    t1,
+    frame.offset + recordHeaderBytes,
+    'Delta Chunk',
+  );
+  return (t0: t0, t1: t1, offset: frame.offset);
 }
 
 /// Validate a legacy Audio descriptor without fetching its payload.

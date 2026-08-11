@@ -720,6 +720,36 @@ void main() {
       );
     });
 
+    test('unregistered trajectory interpolation is a warning', () async {
+      final Uint8List trajectory =
+          (BytesBuilder()
+                ..add(_string('rig'))
+                ..addByte(7)
+                ..add(_u32(1))
+                ..add(_f64(0.0))
+                ..add(_f64(0.0))
+                ..add(_f64(0.0))
+                ..add(_f64(0.0))
+                ..add(_f64(1.0))
+                ..add(_f64(0.0))
+                ..add(_f64(0.0))
+                ..add(_f64(0.0)))
+              .toBytes();
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(_minimal(extra: _record(opRigTrajectory, trajectory))),
+      );
+      expect(
+        _messages(report, FourdgsSeverity.warning),
+        contains(
+          "trajectory 'rig' names interpolation 7, which is not in the registry",
+        ),
+      );
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        isNot(contains(contains("trajectory 'rig'"))),
+      );
+    });
+
     test(
       'every legacy Audio record is parsed and duplicates are rejected',
       () async {
@@ -1247,15 +1277,16 @@ void main() {
 
   group('a checksum over a range is not a copy of the range', () {
     test('an appended Footer still ends the summary at its opcode', () async {
-      final FourdgsValidation report = await validateFourdgs(
-        FourdgsBytes(_minimalWithExtendedFooterCrc()),
-      );
+      final FourdgsBytes source = FourdgsBytes(_minimalWithExtendedFooterCrc());
+      final FourdgsValidation report = await validateFourdgs(source);
       final List<String> errors = _messages(report, FourdgsSeverity.error);
       expect(errors, isNot(contains(contains('summary CRC mismatch'))));
       expect(
         errors,
         isNot(contains(startsWith('a seeking reader cannot open this file:'))),
       );
+      // The public indexed path has no validator-supplied framing hints.
+      expect((await openFourdgsIndexed(source)).durationSec, 1.0);
     });
 
     test('block by block gives what the whole buffer gives', () async {
