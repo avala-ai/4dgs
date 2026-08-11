@@ -757,6 +757,18 @@ class TestTheIndexIsData:
 
 
 class TestSHBandStreams:
+    def test_duplicate_physical_bands_are_refused_as_they_arrive(self):
+        owner = len(MAGIC)
+        data = (
+            MAGIC
+            + put_record(op.CHUNK, b"")
+            + put_record(op.SH_BAND_STREAM, b"\x01")
+            + put_record(op.SH_BAND_STREAM, b"\x01")
+        )
+        indexed = _with(_index_entries(_keyframe_file())[0], chunk_offset=owner)
+        with pytest.raises(MalformedFile, match="band 1 more than once"):
+            kdf.check_index_bands(data, [indexed], sh_degree=1)
+
     def test_keyframe_delta_physical_bands_need_not_be_in_band_number_order(self):
         paths = [p for p in _variants(CORPUS) if "SHDegree2" in p.stem and "UseChunkIndex" in p.stem]
         _require_corpus(paths, "indexed SH-degree-2 variants")

@@ -314,7 +314,21 @@ def test_an_inverted_index_interval_is_refused_before_adjacency():
     with pytest.raises(MalformedFile) as caught:
         kd.check_tiling([_entry(0.0, 2.0, 100), _entry(2.0, 1.0, 200)])
     assert caught.value.code == "non-tiling-chunks"
-    assert "expected finite t0 and t1 >= t0" in str(caught.value)
+    assert "expected finite t0" in str(caught.value)
+
+
+def test_an_open_ended_timeline_accepts_infinity_only_on_its_final_interval():
+    kd.check_tiling(
+        [_entry(0.0, 1.0, 100), _entry(1.0, np.inf, 200)],
+        duration_sec=np.inf,
+    )
+    for index, duration in (
+        ([_entry(0.0, np.inf, 100), _entry(np.inf, np.inf, 200)], np.inf),
+        ([_entry(0.0, np.inf, 100)], 1.0),
+        ([_entry(0.0, np.inf, 100)], None),
+    ):
+        with pytest.raises(MalformedFile, match="unusable interval"):
+            kd.check_tiling(index, duration_sec=duration)
 
 
 def test_absolute_bins_stay_in_the_signed_i32_domain():

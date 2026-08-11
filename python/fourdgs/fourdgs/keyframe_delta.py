@@ -320,10 +320,12 @@ def check_tiling(index, duration_sec: float | None = None) -> None:
     this package passes it.
     """
     ordered = sorted(index, key=lambda e: e.t0)
-    for entry in ordered:
-        if not np.isfinite(entry.t0) or not np.isfinite(entry.t1) or entry.t1 < entry.t0:
+    for ordinal, entry in enumerate(ordered):
+        open_ended_final = ordinal == len(ordered) - 1 and duration_sec == np.inf and entry.t1 == np.inf
+        if not np.isfinite(entry.t0) or (not np.isfinite(entry.t1) and not open_ended_final) or entry.t1 < entry.t0:
             raise _refuse(
-                f"state chunk has unusable interval [{entry.t0}, {entry.t1}); expected finite t0 and t1 >= t0",
+                f"state chunk has unusable interval [{entry.t0}, {entry.t1}); expected finite t0 and "
+                "t1 >= t0 (except +Infinity for the final interval of an open-ended timeline)",
                 "non-tiling-chunks",
             )
     for previous, entry in pairwise(ordered):

@@ -1208,9 +1208,10 @@ def check_index_bands(data: bytes, index: list[rec.ChunkIndexEntry], sh_degree: 
     owner: int | None = None
     indexed: rec.ChunkIndexEntry | None = None
     following: list[tuple[int, int, int]] = []
+    following_bands: set[int] = set()
 
     def finish_owner() -> None:
-        nonlocal owner, indexed, following
+        nonlocal owner, indexed, following, following_bands
         if owner is None:
             return
         if indexed is None:
@@ -1221,11 +1222,6 @@ def check_index_bands(data: bytes, index: list[rec.ChunkIndexEntry], sh_degree: 
         if len({band for band, _offset, _length in indexed.bands}) != len(indexed.bands):
             raise MalformedFile(
                 f"the chunk index entry at {owner} names a band more than once",
-                code="index-record-mismatch",
-            )
-        if len({band for band, _offset, _length in following}) != len(following):
-            raise MalformedFile(
-                f"the state chunk at {owner} is followed by duplicate SH band numbers",
                 code="index-record-mismatch",
             )
         if set(indexed.bands) != set(following):
@@ -1245,6 +1241,7 @@ def check_index_bands(data: bytes, index: list[rec.ChunkIndexEntry], sh_degree: 
         owner = None
         indexed = None
         following = []
+        following_bands = set()
 
     for record in iter_records(data, len(MAGIC)):
         if record.opcode in (op.CHUNK, op.DELTA_CHUNK):
@@ -1252,6 +1249,7 @@ def check_index_bands(data: bytes, index: list[rec.ChunkIndexEntry], sh_degree: 
             owner = record.offset
             indexed = by_offset.get(owner)
             following = []
+            following_bands = set()
             continue
         if record.opcode == op.SH_BAND_STREAM:
             if owner is None:
@@ -1260,6 +1258,18 @@ def check_index_bands(data: bytes, index: list[rec.ChunkIndexEntry], sh_degree: 
                     code="index-record-mismatch",
                 )
             band = Cursor(record.content).u8()
+            if band not in wanted:
+                raise MalformedFile(
+                    f"the state chunk at {owner} is followed by SH band {band}; "
+                    f"the Header declares degree {sh_degree}, requiring bands {wanted}",
+                    code="index-record-mismatch",
+                )
+            if band in following_bands:
+                raise MalformedFile(
+                    f"the state chunk at {owner} is followed by SH band {band} more than once",
+                    code="index-record-mismatch",
+                )
+            following_bands.add(band)
             following.append((band, record.offset, 9 + len(record.content)))
             continue
         finish_owner()

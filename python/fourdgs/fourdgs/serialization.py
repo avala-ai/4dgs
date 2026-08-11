@@ -370,13 +370,15 @@ def decode_stream(cursor: Cursor) -> tuple[int, np.ndarray]:
     """Read one attribute stream, returning `(attribute_id, (n, channels) int64)`."""
     head = cursor.take(_STREAM_HEADER.size)
     attribute_id, width, mode, codec, channels, count, payload_len = _STREAM_HEADER.unpack_from(head)
-    if count == 0:
-        cursor.take(payload_len)
-        return attribute_id, np.zeros((0, channels), dtype=np.int64)
     if width not in (1, 2, 4):
         raise MalformedFile(f"attribute {attribute_id}: bad symbol width {width}")
     if channels == 0:
         raise MalformedFile(f"attribute {attribute_id}: zero channels")
+    if mode not in (MODE_RAW, MODE_DELTA, MODE_CONST):
+        raise TruncatedFile(f"attribute {attribute_id}: unknown stream mode {mode}")
+    if count == 0:
+        cursor.take(payload_len)
+        return attribute_id, np.zeros((0, channels), dtype=np.int64)
 
     symbols = channels if mode == MODE_CONST else count * channels
     expected = symbols * width
@@ -403,8 +405,6 @@ def decode_stream(cursor: Cursor) -> tuple[int, np.ndarray]:
     vals = unzigzag(sym).reshape(count, channels)
     if mode == MODE_DELTA:
         vals = np.cumsum(vals, axis=0, dtype=np.int64)
-    elif mode != MODE_RAW:
-        raise TruncatedFile(f"attribute {attribute_id}: unknown stream mode {mode}")
     return attribute_id, vals
 
 
