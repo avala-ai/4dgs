@@ -161,8 +161,17 @@ func validate(_ source: ToolReader) -> Report {
             "file does not end with the magic; it is truncated or was written by a broken encoder")
     }
 
+    // Report the cut before any early return. In particular, a file cut inside its first record
+    // has no intact first opcode, but the walk still knows that record's byte, kind, declared
+    // length and the resource size — the useful diagnosis must not be hidden by "no records".
+    if let cut = walked.cut {
+        report.note(
+            "the file is cut at byte \(commas(cut.at)): \(cut.reason). The \(walked.intact) "
+                + "complete records before it are intact, and a streamed reader recovers them")
+    }
+
     // Only whole records set these values: a record the file was cut inside is reported by the
-    // note below, and counting it as present would say a Footer exists before its bytes do.
+    // note above, and counting it as present would say a Footer exists before its bytes do.
     guard let firstOpcode else {
         report.error("no records at all")
         return report
@@ -253,18 +262,6 @@ func validate(_ source: ToolReader) -> Report {
 
     if hasHeader && index.isEmpty {
         report.warn("no chunk index: this file can only be read front to back, not seeked")
-    }
-
-    // What survived the cut, which is the question the errors above do not answer.
-    //
-    // A cut file is invalid and every finding about it stands — but records are length-prefixed,
-    // so everything complete before the cut is intact and the SDK's streamed reader keeps it.
-    // Saying only that the file stopped reading leaves its holder to guess whether anything is
-    // salvageable; this says how much.
-    if let cut = walked.cut {
-        report.note(
-            "the file is cut at byte \(commas(cut.at)): \(cut.reason). The \(walked.intact) "
-                + "complete records before it are intact, and a streamed reader recovers them")
     }
 
     if !keyframeDelta {

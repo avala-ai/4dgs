@@ -252,6 +252,20 @@ final class ValidateTests: XCTestCase {
             }, "\(report.findings.map(\.message))")
     }
 
+    /// Even with no intact first record, the length-prefixed frame identifies the exact fault.
+    func testACutInsideTheFirstRecordReportsItsFrame() {
+        let bytes = magic + [Opcode.header] + littleU64(32) + [0xAA] + magic
+        let report = validate(bytes)
+
+        XCTAssertFalse(report.ok)
+        XCTAssertTrue(
+            report.findings.contains {
+                $0.severity == .note
+                    && $0.message.contains("the Header record declares 32 bytes")
+                    && $0.message.contains("past the end of a \(bytes.count)-byte file")
+            }, "\(report.findings.map(\.message))")
+    }
+
     /// An index is untrusted bytes. `offset == size, length == 0` passes an end-only bound but
     /// names the byte after the file; that must be a finding, never an array trap.
     func testAnIndexOffsetAtEndOfFileIsDiagnosed() throws {
