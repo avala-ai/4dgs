@@ -5,14 +5,15 @@
  * Encoding a `keyframe-delta` file (spec §11).
  *
  * The caller supplies a **sequence of samples**: a population, with identities, stated at a
- * sequence of times. This encoder picks keyframes by cadence, quantizes every sample on one
- * set of grids, and writes each non-keyframe sample as the *difference of bins* against the
- * chunk it references.
+ * sequence of times. This encoder picks keyframes by cadence, derives one set of grids from
+ * bounded passes over the samples, and writes each non-keyframe sample as the *difference of
+ * bins* against the chunk it references.
  *
- * Quantizing every sample up front, on grids derived from the whole sequence, is the part
- * that makes the model's error claim true. A delta is then an integer subtraction between
- * two bins on the same grid, the composition telescopes, and the reconstructed bin at any
- * depth is exactly the bin an absolute statement of that instant would have carried. An
+ * Quantizing every sample on grids derived from the whole sequence is the part that makes
+ * the model's error claim true. A delta is then an integer subtraction between two bins on
+ * the same grid, the composition telescopes, and the reconstructed bin at any depth is
+ * exactly the bin an absolute statement of that instant would have carried. Samples are
+ * quantized one at a time: only the current population and its reference are retained. An
  * encoder that instead quantized `x_j - x_{j-1}` would produce a file whose declared bounds
  * mean nothing after the second delta.
  *
@@ -32,7 +33,6 @@ import { DELTA_MODE_CHAINED, DELTA_MODE_KEYFRAME, MAGIC } from "./records.js";
 import {
   ByteWriter,
   encodeStream,
-  median,
   putStrMap,
   quantizeRotation,
   rctForward,
@@ -105,6 +105,11 @@ const GOP_INVARIANT: readonly number[] = [Attribute.SigmaT, Attribute.Flags, Att
 const ABSOLUTE_IN_UPDATE: readonly number[] = [Attribute.RotationIndex, Attribute.Rotation];
 
 const PROFILES = ["fine", "default", "coarse"] as const;
+const U32_MAX = 0xffff_ffff;
+const I32_MIN = -0x8000_0000;
+const I32_MAX = 0x7fff_ffff;
+const U32_MODULUS = 0x1_0000_0000;
+const U16_MAX = 0xffff;
 
 /** The maximum deviation a decoder may observe, per attribute (spec §6.2). */
 interface Bounds {
@@ -209,13 +214,106 @@ function windowsOf(
   return out.length > 0 ? out : [[0, durationSec]];
 }
 
+/**
+ * Exact median scale with constant auxiliary memory.
+ *
+ * Positive finite IEEE-754 bit patterns have the same unsigned order as their numeric
+ * values. Selecting one bit at a time therefore finds the kth value in 64 bounded passes,
+ * without retaining one scale lane for every gaussian in every sample.
+ */
+function medianScaleOf(samples: readonly KeyframeDeltaSample[]): number {
+  let count = 0;
+  for (let sampleAt = 0; sampleAt < samples.length; sampleAt++) {
+    const g = samples[sampleAt]!.gaussians;
+    for (let i = 0; i < g.count * 3; i++) {
+      const value = g.scales[i]!;
+      if (!Number.isFinite(value) || value <= 0) {
+        throw new Error(
+          `sample ${sampleAt}, scale lane ${i} is ${value}; scales must be finite and positive`,
+        );
+      }
+      count++;
+    }
+  }
+  if (count === 0) return 1e-3;
+
+  const kth = (rank: number): number => {
+    let prefix = 0n;
+    let mask = 0n;
+    const storage = new ArrayBuffer(8);
+    const view = new DataView(storage);
+    for (let shift = 63; shift >= 0; shift--) {
+      const bit = 1n << BigInt(shift);
+      let zeroes = 0;
+      for (const sample of samples) {
+        const g = sample.gaussians;
+        for (let i = 0; i < g.count * 3; i++) {
+          view.setFloat64(0, g.scales[i]!, false);
+          const bits = view.getBigUint64(0, false);
+          if ((bits & mask) === prefix && (bits & bit) === 0n) zeroes++;
+        }
+      }
+      mask |= bit;
+      if (rank >= zeroes) {
+        rank -= zeroes;
+        prefix |= bit;
+      }
+    }
+    view.setBigUint64(0, prefix, false);
+    return view.getFloat64(0, false);
+  };
+
+  const high = kth(count >> 1);
+  return count % 2 === 1 ? high : 0.5 * (kth((count >> 1) - 1) + high);
+}
+
+/** Validate identity once, count distinct ids, and forbid reuse after a death. */
+function validateSequenceIds(samples: readonly KeyframeDeltaSample[]): number {
+  const distinct = new Set<number>();
+  const retired = new Set<number>();
+  let previous = new Set<number>();
+
+  for (let at = 0; at < samples.length; at++) {
+    const sample = samples[at]!;
+    if (sample.ids.length !== sample.gaussians.count) {
+      throw new Error(
+        `sample ${at} carries ${sample.gaussians.count} gaussians but ${sample.ids.length} ids`,
+      );
+    }
+    const current = new Set<number>();
+    for (let i = 0; i < sample.ids.length; i++) {
+      const id = sample.ids[i]!;
+      if (!Number.isInteger(id) || id < 0 || id > U32_MAX) {
+        throw new Error(
+          `sample ${at} carries gaussian id ${id}; gaussian_id is an unsigned 32-bit value`,
+        );
+      }
+      if (current.has(id)) {
+        throw new Error(
+          `sample ${at} names gaussian id ${id} twice; ids are unique within a state`,
+        );
+      }
+      if (retired.has(id)) {
+        throw new Error(
+          `sample ${at} reuses gaussian id ${id} after it died; gaussian_id is never reused ` +
+            `within a sequence`,
+        );
+      }
+      current.add(id);
+      distinct.add(id);
+    }
+    for (const id of previous) if (!current.has(id)) retired.add(id);
+    previous = current;
+  }
+  return distinct.size;
+}
+
 function gridsFor(
   samples: readonly KeyframeDeltaSample[],
   durationSec: number,
   profile: string,
   cutoff: number,
 ): Grids {
-  const scales: number[] = [];
   const origin: [number, number, number] = [Infinity, Infinity, Infinity];
   let any = false;
   for (const sample of samples) {
@@ -224,14 +322,13 @@ function gridsFor(
       any = true;
       for (let a = 0; a < 3; a++) {
         origin[a] = Math.min(origin[a]!, g.positions[i * 3 + a]!);
-        scales.push(g.scales[i * 3 + a]!);
       }
     }
   }
   if (!any) {
     origin[0] = origin[1] = origin[2] = 0;
   }
-  const bounds = boundsForProfile(profile, scales.length === 0 ? 1e-3 : median(scales));
+  const bounds = boundsForProfile(profile, medianScaleOf(samples));
   return {
     steps: stepsOf(bounds),
     bounds,
@@ -252,7 +349,7 @@ function quantizeSample(
   if (sample.ids.length !== n) {
     throw new Error(`sample ${at} carries ${n} gaussians but ${sample.ids.length} ids`);
   }
-  if (g.sh != null && (g.shDegree ?? 0) > 0) {
+  if (g.sh != null && g.sh.length > 0) {
     throw new Error(
       `sample ${at} carries spherical harmonics, which a keyframe-delta file has no place to ` +
         `put: SH Band Stream records hang off a gaussian-birth Chunk and are not composed by ` +
@@ -263,8 +360,11 @@ function quantizeSample(
   const seen = new Set<number>();
   for (let i = 0; i < n; i++) {
     const id = sample.ids[i]!;
-    if (!Number.isInteger(id))
-      throw new Error(`sample ${at} carries a non-integer gaussian id ${id}`);
+    if (!Number.isInteger(id) || id < 0 || id > U32_MAX) {
+      throw new Error(
+        `sample ${at} carries gaussian id ${id}; gaussian_id is an unsigned 32-bit value`,
+      );
+    }
     if (seen.has(id)) {
       throw new Error(`sample ${at} names gaussian id ${id} twice; ids are unique within a state`);
     }
@@ -288,14 +388,13 @@ function quantizeSample(
 
   for (let i = 0; i < n; i++) {
     const sigmaValue = g.sigmaT[i]!;
-    if (!Number.isFinite(sigmaValue)) {
+    if (!Number.isFinite(sigmaValue) || sigmaValue <= 0) {
       throw new Error(
-        `sample ${at}, gaussian ${i}: sigma_t is ${sigmaValue}. A never-fading gaussian takes its ` +
-          `velocity grid from its validity window, which this writer does not vary across a ` +
-          `sequence; give it a finite sigma_t.`,
+        `sample ${at}, gaussian ${i}: sigma_t is ${sigmaValue}; this writer requires a finite ` +
+          `positive temporal width`,
       );
     }
-    const sigmaBin = rint(Math.log(Math.max(sigmaValue, 1e-30)) / steps.sigmaLog);
+    const sigmaBin = rint(Math.log(sigmaValue) / steps.sigmaLog);
     sigma.push(sigmaBin);
     flags.push(0);
     const row = windowRow(grids.windows, g.winLo[i]!, g.winHi[i]!);
@@ -333,7 +432,9 @@ function quantizeSample(
       steps.motion,
     );
     for (let a = 0; a < 3; a++) motion.push(rint(g.motions[i * 3 + a]! / mStep));
-    mu.push(rint(g.muT[i]! / muStep(sigmaBin, steps.sigmaLog, false, steps.time)));
+    // A state is stated at the sample timestamp (§11.3). Anchoring mu_t anywhere else
+    // moves a nonzero-velocity gaussian away from the position the caller supplied at t0.
+    mu.push(rint(sample.t0 / muStep(sigmaBin, steps.sigmaLog, false, steps.time)));
   }
 
   const bins: Bins = new Map();
@@ -348,6 +449,18 @@ function quantizeSample(
   bins.set(Attribute.SigmaT, { channels: 1, values: sigma });
   bins.set(Attribute.Flags, { channels: 1, values: flags });
   bins.set(Attribute.WindowIndex, { channels: 1, values: windowIndex });
+  for (const [attribute, column] of bins) {
+    for (let i = 0; i < column.values.length; i++) {
+      const value = column.values[i]!;
+      if (!Number.isInteger(value) || value < I32_MIN || value > I32_MAX) {
+        const row = Math.floor(i / column.channels);
+        throw new Error(
+          `sample ${at}, gaussian id ${ids[row]}: attribute ${attribute} bin ${value} is outside ` +
+            `the signed 32-bit range composed bins must stay inside`,
+        );
+      }
+    }
+  }
   return { ids, bins };
 }
 
@@ -442,7 +555,9 @@ function deltaGroups(
 
   const changed = new Array<boolean>(commonRows.length).fill(false);
   for (const [attribute, after] of bins) {
-    if (GOP_INVARIANT.includes(attribute)) continue;
+    // mu_t is restated when another lane causes this gaussian to be stated by the delta;
+    // its timestamp alone must not turn an otherwise untouched gaussian into an update.
+    if (GOP_INVARIANT.includes(attribute) || attribute === Attribute.MuT) continue;
     const before = referenceBins.get(attribute);
     if (before === undefined) continue;
     for (let k = 0; k < commonRows.length; k++) {
@@ -494,10 +609,15 @@ async function concatStreams(parts: readonly Uint8Array[]): Promise<Uint8Array> 
   return out;
 }
 
+/** u32 identities travel through the signed stream codec with the same 32 bits. */
+function gaussianIdCodes(ids: readonly number[]): number[] {
+  return ids.map((id) => (id > I32_MAX ? id - U32_MODULUS : id));
+}
+
 /** One group's streams: the ids it names, then the attributes it carries, ascending. */
 async function groupStreams(ids: readonly number[], bins: Bins): Promise<Uint8Array> {
   if (ids.length === 0) return new Uint8Array(0);
-  const parts = [await encodeStream(Attribute.GaussianId, [...ids], 1)];
+  const parts = [await encodeStream(Attribute.GaussianId, gaussianIdCodes(ids), 1)];
   for (const attribute of [...bins.keys()].sort((a, b) => a - b)) {
     const column = bins.get(attribute)!;
     parts.push(await encodeStream(attribute, column.values, column.channels));
@@ -507,7 +627,7 @@ async function groupStreams(ids: readonly number[], bins: Bins): Promise<Uint8Ar
 
 /** A keyframe chunk's streams: identity, then all eleven required attributes in order. */
 async function keyframeStreams(ids: readonly number[], bins: Bins): Promise<Uint8Array> {
-  const parts = [await encodeStream(Attribute.GaussianId, [...ids], 1)];
+  const parts = [await encodeStream(Attribute.GaussianId, gaussianIdCodes(ids), 1)];
   for (const attribute of REQUIRED_ATTRIBUTES) {
     const column = bins.get(attribute)!;
     parts.push(await encodeStream(attribute, column.values, column.channels));
@@ -614,14 +734,26 @@ function isKeyframe(index: number, keyframeEvery: number, keyframeAt: readonly n
   );
 }
 
-function keyframeIndexBefore(
-  i: number,
+function checkDepthPlan(
+  count: number,
   keyframeEvery: number,
   keyframeAt: readonly number[],
-): number {
-  let j = i;
-  while (j > 0 && !isKeyframe(j, keyframeEvery, keyframeAt)) j -= 1;
-  return j;
+  deltaMode: number,
+): void {
+  if (!Number.isInteger(keyframeEvery) || keyframeEvery < 0) {
+    throw new Error(`keyframeEvery must be a non-negative integer, got ${keyframeEvery}`);
+  }
+  if (deltaMode !== DELTA_MODE_CHAINED) return;
+  let depth = 0;
+  for (let i = 0; i < count; i++) {
+    depth = isKeyframe(i, keyframeEvery, keyframeAt) ? 0 : depth + 1;
+    if (depth > U16_MAX) {
+      throw new Error(
+        `sample ${i} would have chained depth ${depth}, past the ${U16_MAX} maximum the ` +
+          `Delta Chunk u16 depth field can store; add a keyframe or shorten the cadence`,
+      );
+    }
+  }
 }
 
 function aabbOf(samples: readonly KeyframeDeltaSample[]): number[] {
@@ -675,37 +807,35 @@ export async function encodeKeyframeDeltaSequence(
   if (samples.length === 0) {
     throw new Error("a keyframe-delta file needs at least one sample");
   }
+  if (!Number.isFinite(durationSec)) {
+    throw new Error(`duration_sec must be finite, got ${durationSec}`);
+  }
   if (deltaMode !== DELTA_MODE_CHAINED && deltaMode !== DELTA_MODE_KEYFRAME) {
     throw new Error(
       `delta_mode is ${deltaMode}; the format defines ${DELTA_MODE_KEYFRAME} (keyframe-referenced) ` +
         `and ${DELTA_MODE_CHAINED} (chained), and nothing else`,
     );
   }
-  const t0s = samples.map((s) => s.t0);
-  const t1s = [...t0s.slice(1), durationSec];
-  if (t0s[0] !== 0) {
+  checkDepthPlan(samples.length, keyframeEvery, keyframeAt, deltaMode);
+  const distinctCount = validateSequenceIds(samples);
+  if (samples[0]!.t0 !== 0) {
     throw new Error(
-      `the first sample starts at ${t0s[0]}, not 0; a keyframe-delta timeline covers ` +
+      `the first sample starts at ${samples[0]!.t0}, not 0; a keyframe-delta timeline covers ` +
         `[0, duration_sec) with no gap (spec §11.1)`,
     );
   }
-  for (let i = 0; i < t0s.length; i++) {
-    if (!(t1s[i]! > t0s[i]!)) {
+  for (let i = 0; i < samples.length; i++) {
+    const t0 = samples[i]!.t0;
+    const t1 = samples[i + 1]?.t0 ?? durationSec;
+    if (!(t1 > t0)) {
       throw new Error(
-        `sample ${i} covers [${t0s[i]}, ${t1s[i]}), which is empty or inverted; samples tile the ` +
+        `sample ${i} covers [${t0}, ${t1}), which is empty or inverted; samples tile the ` +
           `timeline in order and the last one ends at duration_sec ${durationSec} (spec §11.1)`,
       );
     }
   }
 
   const grids = gridsFor(samples, durationSec, profile, cutoff);
-  const quantized = samples.map((s, i) => quantizeSample(s, grids, i));
-
-  // The Header's gaussian_count under `keyframe-delta` is the count of DISTINCT ids over
-  // the sequence, not a sum over chunks: a gaussian restated in eight samples is one
-  // gaussian, and the chunk counts already say what each record carries.
-  const distinct = new Set<number>();
-  for (const { ids } of quantized) for (const id of ids) distinct.add(id);
 
   const out = new ByteWriter(8192);
   out.bytes(MAGIC);
@@ -715,7 +845,7 @@ export async function encodeKeyframeDeltaSequence(
   header.string(profile);
   header.string(library);
   header.f64(durationSec);
-  header.u64(distinct.size);
+  header.u64(distinctCount);
   header.f64(cutoff);
   header.string("keyframe-delta");
   for (const v of aabb) header.f64(v);
@@ -748,22 +878,27 @@ export async function encodeKeyframeDeltaSequence(
   out.bytes(record(Opcode.WindowTable, wt.finish()));
 
   const index: IndexEntry[] = [];
-  const offsets: number[] = [];
-  const depths: number[] = [];
   let keyframeOffset = 0;
+  let previousOffset = 0;
+  let previousDepth = 0;
+  let previous: { ids: number[]; bins: Bins } | null = null;
+  let gopReference: { ids: number[]; bins: Bins } | null = null;
 
-  for (let i = 0; i < quantized.length; i++) {
-    const { ids, bins } = quantized[i]!;
-    const t0 = t0s[i]!;
-    const t1 = t1s[i]!;
+  for (let i = 0; i < samples.length; i++) {
+    const current = quantizeSample(samples[i]!, grids, i);
+    const { ids, bins } = current;
+    const t0 = samples[i]!.t0;
+    const t1 = samples[i + 1]?.t0 ?? durationSec;
 
     if (isKeyframe(i, keyframeEvery, keyframeAt)) {
       const blob = encodeChunk(t0, t1, ids.length, await keyframeStreams(ids, bins));
       const at = out.length;
       out.bytes(blob);
-      offsets.push(at);
-      depths.push(0);
       keyframeOffset = at;
+      previousOffset = at;
+      previousDepth = 0;
+      previous = deltaMode === DELTA_MODE_CHAINED ? current : null;
+      gopReference = deltaMode === DELTA_MODE_KEYFRAME ? current : null;
       index.push({
         t0,
         t1,
@@ -781,16 +916,19 @@ export async function encodeKeyframeDeltaSequence(
     }
 
     // A delta: reference the group's keyframe (mode 0) or the previous chunk (mode 1).
-    const referenceSample =
-      deltaMode === DELTA_MODE_KEYFRAME ? keyframeIndexBefore(i, keyframeEvery, keyframeAt) : i - 1;
-    const depth = deltaMode === DELTA_MODE_KEYFRAME ? 1 : depths[i - 1]! + 1;
-    const reference = quantized[referenceSample]!;
+    const reference = deltaMode === DELTA_MODE_KEYFRAME ? gopReference : previous;
+    if (reference === null) throw new Error(`sample ${i} has no preceding keyframe reference`);
+    const referenceOffset = deltaMode === DELTA_MODE_KEYFRAME ? keyframeOffset : previousOffset;
+    const depth = deltaMode === DELTA_MODE_KEYFRAME ? 1 : previousDepth + 1;
+    if (depth > U16_MAX) {
+      throw new Error(`sample ${i} has depth ${depth}, past the u16 maximum ${U16_MAX}`);
+    }
     const groups = deltaGroups(reference.ids, reference.bins, ids, bins, i);
     const blob = encodeDeltaChunk(
       t0,
       t1,
       deltaMode,
-      offsets[referenceSample]!,
+      referenceOffset,
       keyframeOffset,
       depth,
       await groupStreams(groups.updateIds, groups.updateBins),
@@ -800,8 +938,9 @@ export async function encodeKeyframeDeltaSequence(
     );
     const at = out.length;
     out.bytes(blob);
-    offsets.push(at);
-    depths.push(depth);
+    previousOffset = at;
+    previousDepth = depth;
+    if (deltaMode === DELTA_MODE_CHAINED) previous = current;
     index.push({
       t0,
       t1,
@@ -812,7 +951,7 @@ export async function encodeKeyframeDeltaSequence(
       gaussianCount: groups.updateIds.length + groups.birthIds.length + groups.deathIds.length,
       kind: 1,
       deltaMode,
-      referenceOffset: offsets[referenceSample]!,
+      referenceOffset,
       keyframeOffset,
       depth,
       liveCount: ids.length,
@@ -826,7 +965,7 @@ export async function encodeKeyframeDeltaSequence(
     for (const entry of index) out.bytes(encodeIndexEntry(entry));
     if (writeStatistics) {
       const s = new ByteWriter(96);
-      s.u64(distinct.size);
+      s.u64(distinctCount);
       s.u32(index.length);
       s.f64(durationSec);
       for (const v of aabb) s.f64(v);

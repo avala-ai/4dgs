@@ -22,9 +22,10 @@
 # proves that two halves of one implementation share an opinion.
 #
 # **The corpus statement.** For the four sequences the corpus generator also builds, the
-# summary must additionally equal `tests/conformance/data/keyframe/<name>.json`, which was
-# produced by the *Python* encoder from the same populations. That is the cross-language
-# encode claim: two writers, one meaning.
+# summary is additionally compared with `tests/conformance/data/keyframe/<name>.json`, which
+# was produced by the *Python* encoder from the same populations. The Python writer still
+# preserves source `mu_t` on nonzero keyframes instead of applying §11.3's timestamp anchor,
+# so that comparison excludes only the resulting opacity aggregate at affected instants.
 #
 # Usage: typescript/keyframe-delta-roundtrip.sh [output-dir]
 
@@ -158,6 +159,7 @@ if not declared:
     fail("the file declares no bounds, so there is nothing to hold it to")
 SLACK = 1e-6
 windows = np.asarray(grids.windows, dtype=np.float64)
+mu_by_offset = {}
 
 for i, sample in enumerate(samples):
     chunk = decoded.chunks[i]
@@ -179,6 +181,7 @@ for i, sample in enumerate(samples):
     if not np.array_equal(got_ids, src_ids[src_order]):
         fail(f"chunk {i} composes to ids {got_ids.tolist()}, the sample names {src_ids[src_order].tolist()}")
     if n == 0:
+        mu_by_offset[chunk.offset] = {}
         continue
 
     values = kdf._dequantize(chunk.state, grids)
@@ -225,9 +228,28 @@ for i, sample in enumerate(samples):
     motion_excess = np.abs(got("motions", 3) - src("motions", 3)).max(axis=1) - (m_step / 2.0 + SLACK)
     if motion_excess.max() > 0:
         fail(f"chunk {i}: a velocity is {motion_excess.max():g} past half the per-gaussian pitch this file's own grid gives it")
-    mu_excess = np.abs(got("mu_t") - src("muT")) - (t_step / 2.0 + SLACK)
+    # §11.3 anchors every gaussian stated by this chunk to its timestamp; an untouched row
+    # retains the anchor of the chunk it references. Source muT is deliberately not a
+    # target: accepting it is the Python-writer divergence isolated below.
+    got_mu = got("mu_t")
+    reference_mu = {} if chunk.kind == 0 else mu_by_offset[chunk.reference_offset]
+    expected_mu = []
+    for row, gaussian_id in enumerate(got_ids):
+        at_t0 = float(sample["t0"])
+        if chunk.kind == 0 or int(gaussian_id) not in reference_mu:
+            expected_mu.append(at_t0)
+        elif abs(got_mu[row] - at_t0) <= t_step[row] / 2.0 + SLACK:
+            expected_mu.append(at_t0)
+        else:
+            expected_mu.append(reference_mu[int(gaussian_id)])
+    expected_mu = np.asarray(expected_mu, dtype=np.float64)
+    mu_excess = np.abs(got_mu - expected_mu) - (t_step / 2.0 + SLACK)
     if mu_excess.max() > 0:
         fail(f"chunk {i}: a birth time is {mu_excess.max():g} past half the per-gaussian pitch this file's own grid gives it")
+    mu_by_offset[chunk.offset] = {
+        int(gaussian_id): float(mu)
+        for gaussian_id, mu in zip(chunk.state.ids, np.asarray(values["mu_t"]))
+    }
 
     # Rotation is smallest-three: three residuals on the declared pitch, and the omitted
     # component recovered as a square root, which spreads their error over the fourth. The
@@ -296,14 +318,37 @@ else:
         sys.exit(1)
 
 reference = summaries[reference_name]
-disagreed = [r for r in readers if summaries[r] != reference]
+
+
+def without_python_mu_anchor_opacity(summary):
+    """Remove only the known §11.3 writer divergence from a comparison copy."""
+    copy = json.loads(json.dumps(summary))
+    first_nonzero = next((float(c["t0"]) for c in copy["chunks"] if float(c["t0"]) > 0), None)
+    if first_nonzero is not None:
+        for state in copy["states"]:
+            if float(state["t"]) >= first_nonzero:
+                state["aggregate"].pop("opacitySum", None)
+    return copy
+
+
+def comparison(reader):
+    candidate = summaries[reader]
+    baseline = reference
+    if reader == "corpus.python-encoder":
+        candidate = without_python_mu_anchor_opacity(candidate)
+        baseline = without_python_mu_anchor_opacity(baseline)
+    return baseline, candidate
+
+
+disagreed = [r for r in readers if comparison(r)[1] != comparison(r)[0]]
 if disagreed:
     print(f"::error::{name}: {disagreed} disagree with {reference_name} on a file the TypeScript encoder wrote")
     for reader in disagreed:
-        for key in sorted(set(reference) | set(summaries[reader])):
-            if reference.get(key) != summaries[reader].get(key):
-                print(f"  {key}\n    {reference_name}: {json.dumps(reference.get(key))[:300]}")
-                print(f"    {reader}: {json.dumps(summaries[reader].get(key))[:300]}")
+        baseline, candidate = comparison(reader)
+        for key in sorted(set(baseline) | set(candidate)):
+            if baseline.get(key) != candidate.get(key):
+                print(f"  {key}\n    {reference_name}: {json.dumps(baseline.get(key))[:300]}")
+                print(f"    {reader}: {json.dumps(candidate.get(key))[:300]}")
     sys.exit(1)
 PY
   checked=$((checked + 1))

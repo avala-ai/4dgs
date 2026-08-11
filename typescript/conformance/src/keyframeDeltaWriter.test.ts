@@ -98,6 +98,25 @@ function records(data: Uint8Array): { opcode: number; content: Uint8Array }[] {
   }));
 }
 
+/**
+ * The Python reference writer still preserves source mu_t on nonzero keyframes; §11.3
+ * requires the state timestamp. Until that writer is corrected, its corpus summary differs
+ * only in the temporal marginal folded into this aggregate.
+ */
+function withoutPythonMuAnchorOpacity(summary: Record<string, unknown>): Record<string, unknown> {
+  const copy = structuredClone(summary) as {
+    chunks: { t0: number }[];
+    states: { t: number; aggregate: { opacitySum?: number } }[];
+  };
+  const firstNonzero = copy.chunks.find((chunk) => chunk.t0 > 0)?.t0;
+  if (firstNonzero !== undefined) {
+    for (const state of copy.states) {
+      if (state.t >= firstNonzero) delete state.aggregate.opacitySum;
+    }
+  }
+  return copy as unknown as Record<string, unknown>;
+}
+
 // --------------------------------------------------------------------------
 // The cross-encoder statement
 // --------------------------------------------------------------------------
@@ -117,7 +136,10 @@ for (const variant of KEYFRAME_DELTA_VARIANTS.filter((v) => v.inCorpus)) {
     const indexed = canonical(
       keyframeDeltaStatesJson((await decodeKeyframeDeltaIndexed(data)).sequence),
     );
-    assert.equal(streamed, canonical(JSON.parse(expectation)));
+    assert.equal(
+      canonical(withoutPythonMuAnchorOpacity(JSON.parse(streamed) as Record<string, unknown>)),
+      canonical(withoutPythonMuAnchorOpacity(JSON.parse(expectation) as Record<string, unknown>)),
+    );
     assert.equal(indexed, streamed);
   });
 }
@@ -305,6 +327,22 @@ test("an unchanged gaussian costs no bytes", async () => {
   assert.equal(same.chunks[1]!.updateCount, 0);
 });
 
+test("mu_t is anchored to each sample timestamp", async () => {
+  const samples = pair(0, 1);
+  samples[1]!.gaussians.motions = Float32Array.from([2, 0, 0]);
+  samples[1]!.gaussians.muT = Float32Array.from([0]); // deliberately not sample t0
+  const sequence = await decodeKeyframeDeltaStreamed(
+    await encodeKeyframeDeltaSequence(samples, DURATION, { keyframeEvery: 8 }),
+  );
+  const t = samples[1]!.t0;
+  const states = keyframeDeltaStatesJson(sequence).states as {
+    t: number;
+    sample: { positions: number[][] };
+  }[];
+  const center = states.find((state) => state.t === t)!.sample.positions[0]![0]!;
+  assert.ok(Math.abs(center - 1) < 0.01, `centre at sample time: ${center}`);
+});
+
 test("the file is framed by magic at both ends, and the summary is the index then statistics", async () => {
   const data = await encode(KEYFRAME_DELTA_VARIANTS[1]!);
   assert.deepEqual([...data.subarray(0, MAGIC.length)], [...MAGIC]);
@@ -354,6 +392,10 @@ test("a promise the writer cannot keep is refused rather than written", async ()
   const ok = pair(0, 1);
 
   await assert.rejects(() => encodeKeyframeDeltaSequence([], DURATION), /at least one sample/);
+  await assert.rejects(
+    () => encodeKeyframeDeltaSequence(ok, Number.POSITIVE_INFINITY),
+    /duration_sec must be finite/,
+  );
 
   // A timeline that does not tile is refused here, rather than written into a file both of
   // this package's own read paths would then reject (spec §11.1).
@@ -394,6 +436,10 @@ test("a promise the writer cannot keep is refused rather than written", async ()
       ),
     /names gaussian id 7 twice/,
   );
+  await assert.rejects(
+    () => encodeKeyframeDeltaSequence([{ t0: 0, ids: [-1], gaussians: one(0) }], DURATION),
+    /unsigned 32-bit/,
+  );
 
   // delta_mode is a two-value field, and a third value is not a future extension of it.
   await assert.rejects(
@@ -404,6 +450,47 @@ test("a promise the writer cannot keep is refused rather than written", async ()
   await assert.rejects(
     () => encodeKeyframeDeltaSequence(ok, DURATION, { profile: "ultra" }),
     /profile must be one of/,
+  );
+});
+
+test("gaussian ids span u32 and are never reused after death", async () => {
+  const high = 0xffff_fff0;
+  const data = await encodeKeyframeDeltaSequence(
+    [{ t0: 0, ids: [high], gaussians: one(0) }],
+    DURATION,
+  );
+  const decoded = await decodeKeyframeDeltaStreamed(data);
+  assert.equal(decoded.chunks[0]!.state.ids[0]! >>> 0, high);
+
+  const empty = { ...one(0), count: 0 };
+  await assert.rejects(
+    () =>
+      encodeKeyframeDeltaSequence(
+        [
+          { t0: 0, ids: [7], gaussians: one(0) },
+          { t0: 1, ids: [], gaussians: empty },
+          { t0: 2, ids: [7], gaussians: one(0) },
+        ],
+        3,
+      ),
+    /reuses gaussian id 7 after it died/,
+  );
+});
+
+test("a chained depth that cannot fit u16 is refused before encoding", async () => {
+  const empty = { ...one(0), count: 0 };
+  const samples = Array.from({ length: 0x1_0001 }, (_, i) => ({
+    t0: i,
+    ids: [] as number[],
+    gaussians: empty,
+  }));
+  await assert.rejects(
+    () =>
+      encodeKeyframeDeltaSequence(samples, samples.length, {
+        keyframeEvery: 0,
+        deltaMode: DELTA_MODE_CHAINED,
+      }),
+    /depth 65536, past the 65535 maximum/,
   );
 });
 
@@ -421,6 +508,39 @@ test("spherical harmonics are refused, not silently dropped", async () => {
   await assert.rejects(
     () => encodeKeyframeDeltaSequence(samples, DURATION),
     /carries spherical harmonics/,
+  );
+
+  const undeclared = pair(0, 1);
+  undeclared[0]!.gaussians.sh = Uint8Array.from([1]);
+  await assert.rejects(
+    () => encodeKeyframeDeltaSequence(undeclared, DURATION),
+    /carries spherical harmonics/,
+  );
+});
+
+test("absolute bins must fit i32 even when their delta would fit", async () => {
+  const samples = pair(0, 20_000_000);
+  await assert.rejects(
+    () => encodeKeyframeDeltaSequence(samples, DURATION, { keyframeEvery: 8 }),
+    /attribute 0 bin .*outside the signed 32-bit range/,
+  );
+});
+
+test("small positive temporal widths are quantized without a floor", async () => {
+  const tiny = pair(0, 1);
+  const floored = pair(0, 1);
+  for (const sample of tiny) sample.gaussians.sigmaT = Float32Array.from([1e-35]);
+  for (const sample of floored) sample.gaussians.sigmaT = Float32Array.from([1e-30]);
+  const tinyFile = await encodeKeyframeDeltaSequence(tiny, DURATION);
+  const floorFile = await encodeKeyframeDeltaSequence(floored, DURATION);
+  assert.notDeepEqual([...tinyFile], [...floorFile]);
+  await decodeKeyframeDeltaIndexed(tinyFile);
+
+  const invalid = pair(0, 1);
+  for (const sample of invalid) sample.gaussians.sigmaT = Float32Array.from([0]);
+  await assert.rejects(
+    () => encodeKeyframeDeltaSequence(invalid, DURATION),
+    /requires a finite positive temporal width/,
   );
 });
 
