@@ -152,10 +152,10 @@ class Findings {
     this.items.push({ severity: "note", message });
   }
 
-  /** The first refusal in file order wins; a later one is a consequence of it. */
+  /** The earliest refusal in file order wins, independent of validation-pass order. */
   refuse(error: unknown, at: number, where: string): void {
-    if (this.refused !== null) return;
     if (!(error instanceof FourdgsError) || error.refusalCode === undefined) return;
+    if (this.refused !== null && this.refused.at <= at) return;
     this.refused = { code: error.refusalCode, message: error.message, at, where };
   }
 }
@@ -543,17 +543,17 @@ export async function validateFile(
         // reports the second without turning unknown-but-legal registry values into
         // malformed bytes.
         case Opcode.CoordinateFrame:
-          await parseInto(found, "CoordinateFrame", async () => {
+          await parseInto(found, "CoordinateFrame", offset, async () => {
             provenance.frames.push(parseCoordinateFrame(await content()));
           });
           break;
         case Opcode.SensorCalibration:
-          await parseInto(found, "SensorCalibration", async () => {
+          await parseInto(found, "SensorCalibration", offset, async () => {
             provenance.sensors.push(parseSensorCalibration(await content()));
           });
           break;
         case Opcode.RigTrajectory:
-          await parseInto(found, "RigTrajectory", async () => {
+          await parseInto(found, "RigTrajectory", offset, async () => {
             const trajectory = parseRigTrajectory(await content());
             // §5.15.4 reads a zero-sample trajectory as absent. In
             // particular, it neither collides with another absent record nor
@@ -563,7 +563,7 @@ export async function validateFile(
           });
           break;
         case Opcode.GeodeticAnchor:
-          await parseInto(found, "GeodeticAnchor", async () => {
+          await parseInto(found, "GeodeticAnchor", offset, async () => {
             provenance.anchors.push(parseGeodeticAnchor(await content()));
           });
           break;
@@ -575,12 +575,12 @@ export async function validateFile(
             );
             break;
           }
-          await parseInto(found, "ObjectTable", async () => {
+          await parseInto(found, "ObjectTable", offset, async () => {
             objects.table = parseObjectTable(await content());
           });
           break;
         case Opcode.ObjectTrack:
-          await parseInto(found, "ObjectTrack", async () => {
+          await parseInto(found, "ObjectTrack", offset, async () => {
             const track = parseObjectTrack(await content());
             // §5.15.7 reads a zero-sample track as absent. In particular, two
             // absent records for one id are not two active tracks.
@@ -588,34 +588,34 @@ export async function validateFile(
           });
           break;
         case Opcode.Camera:
-          await parseInto(found, "Camera", async () => {
+          await parseInto(found, "Camera", offset, async () => {
             parseCamera(await content());
           });
           break;
         case Opcode.Metadata:
-          await parseInto(found, "Metadata", async () => {
+          await parseInto(found, "Metadata", offset, async () => {
             parseMetadata(await content());
           });
           break;
         case Opcode.Attachment:
-          await parseInto(found, "Attachment", async () => {
+          await parseInto(found, "Attachment", offset, async () => {
             await validatePayloadRecord(source, framed, 2, 0);
           });
           break;
         case Opcode.Statistics:
-          await parseInto(found, "Statistics", async () => {
+          await parseInto(found, "Statistics", offset, async () => {
             parseStatistics(await content());
           });
           break;
         case Opcode.SummaryOffset:
           firstSummaryOffset ??= offset;
-          await parseInto(found, "SummaryOffset", async () => {
+          await parseInto(found, "SummaryOffset", offset, async () => {
             parseSummaryOffset(await content());
           });
           break;
         case Opcode.Audio:
           hasLegacyAudio = true;
-          await parseInto(found, "Audio", async () => {
+          await parseInto(found, "Audio", offset, async () => {
             await validatePayloadRecord(source, framed, 1, 8);
           });
           break;
@@ -806,6 +806,13 @@ export async function validateFile(
           }
         } else {
           const deltaHead = head as DeltaChunkHeader;
+          const deltaCount = deltaHead.updateCount + deltaHead.birthCount + deltaHead.deathCount;
+          if (entry.gaussianCount !== deltaCount) {
+            found.error(
+              `chunk index entry ${i} declares ${entry.gaussianCount} affected gaussians; ` +
+                `the Delta Chunk at ${entry.chunkOffset} declares ${deltaCount} across its groups`,
+            );
+          }
           const fields: readonly (readonly [string, number, number])[] = [
             ["delta_mode", entry.deltaMode, deltaHead.deltaMode],
             ["reference_offset", entry.referenceOffset, deltaHead.referenceOffset],
@@ -859,7 +866,7 @@ export async function validateFile(
     });
   });
 
-  checkKeyframeDeltaIndexChains(index, found);
+  checkKeyframeDeltaIndexChains(index, found, header?.temporalModel === "keyframe-delta");
 
   // An index is a one-for-one description of the physical Chunk records, not merely a
   // collection of individually valid pointers. Missing and duplicate entries both make
@@ -995,12 +1002,22 @@ interface PhysicalBandRange {
  * Delta Chunk headers. Comparing index fields with record fields catches disagreement; this
  * catches the equally corrupt case where both copies agree on a false seek cost.
  */
-function checkKeyframeDeltaIndexChains(index: readonly ChunkIndexEntry[], found: Findings): void {
+function checkKeyframeDeltaIndexChains(
+  index: readonly ChunkIndexEntry[],
+  found: Findings,
+  keyframeDelta: boolean,
+): void {
   const ordered = [...index].sort((a, b) => a.chunkOffset - b.chunkOffset);
   const derived = new Map<number, { depth: number; keyframeOffset: number; kind: number }>();
   let previousOffset: number | null = null;
   for (const entry of ordered) {
     if (!entry.extended) {
+      if (keyframeDelta) {
+        found.error(
+          `the keyframe-delta chunk index entry at ${entry.chunkOffset} omits ` +
+            "chunk_kind, delta reference, depth and live_count fields",
+        );
+      }
       previousOffset = entry.chunkOffset;
       continue;
     }
@@ -1350,12 +1367,13 @@ async function recordAt(
 async function parseInto(
   found: Findings,
   record: string,
+  offset: number,
   parse: () => void | Promise<void>,
 ): Promise<void> {
   try {
     await parse();
   } catch (error) {
-    found.error(`${record} does not parse: ${message(error)}`);
+    found.error(`${record} record at byte ${offset} does not parse: ${message(error)}`);
   }
 }
 

@@ -1218,6 +1218,12 @@ export async function validateKeyframeDeltaStreamed(
         }
         const decoded = await keyframeFromChunk(content, codecs);
         const state = keyframeState(decoded.ids, decoded.bins);
+        if (state.count !== parsed.header.count) {
+          throw new MalformedFile(
+            `keyframe chunk at ${record.offset} declares ${parsed.header.count} gaussians; ` +
+              `its decoded attribute streams carry ${state.count}`,
+          );
+        }
         // A keyframe begins a new GOP. A conforming later delta can address this keyframe or
         // the immediately previous state, never an obsolete state from the current GOP.
         const retained = {

@@ -1127,7 +1127,7 @@ test("regression: illegal top-level structures and malformed known records are r
       framedRecord(Opcode.AttributeStream, new Uint8Array(0)),
       "not a legal top-level record",
     ],
-    ["MalformedCamera", framedRecord(Opcode.Camera, new Uint8Array(0)), "Camera does not parse"],
+    ["MalformedCamera", framedRecord(Opcode.Camera, new Uint8Array(0)), "Camera record at byte"],
   ] as const) {
     const changed = splice(original.slice(), summary, record);
     const verdict = validated(file(`${name}.4dgs`, resealSummary(changed, record.length)));

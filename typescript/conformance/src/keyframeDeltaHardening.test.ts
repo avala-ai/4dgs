@@ -18,6 +18,8 @@ import { test } from "node:test";
 import {
   Attribute,
   MalformedFile,
+  Opcode,
+  RECORD_HEADER_BYTES,
   UnsupportedCodec,
   checkTiling,
   decodeChunkStreams,
@@ -29,6 +31,8 @@ import {
   keyframeDeltaStatesJson,
   reconstructKeyframeDelta,
   keyframeDeltaValidationRecordOffset,
+  iterateRecords,
+  parseChunkIndexEntry,
   DEFAULT_CODECS,
   lifeClass,
   motionStep,
@@ -706,6 +710,104 @@ test("decoded validation checks window indices and locates the refusing state re
   const report = await validateFile(file, { decode: true });
   assert.equal(report.refused?.code, "window-index-out-of-range");
   assert.equal(report.refused?.at, chunkOffset);
+});
+
+test("decoded validation keeps the earliest refusal across validation passes", async () => {
+  const file = await oneKeyframeFile({
+    windows: [[0, 1]],
+    windowIndex: 3,
+    motionBinX: 1,
+    duration: 1,
+  });
+  const chunk = [...iterateRecords(file, MAGIC.length)].find(
+    (item) => item.opcode === Opcode.Chunk,
+  )!;
+  const badBandStream = await encodeTestStream({
+    attributeId: Opcode.ShBandStream,
+    values: Array(9).fill(0),
+    channels: 9,
+    codec: 9,
+  });
+  const withLaterRefusal = concat([
+    file,
+    record(Opcode.ShBandStream, concat([new Uint8Array([1]), badBandStream])),
+  ]);
+  const report = await validateFile(withLaterRefusal, { decode: true });
+  assert.equal(report.refused?.code, "window-index-out-of-range");
+  assert.equal(report.refused?.at, chunk.offset);
+});
+
+test("a keyframe's decoded row count must match its Chunk header", async () => {
+  const file = await oneKeyframeFile({
+    windows: [[0, 1]],
+    windowIndex: 0,
+    motionBinX: 0,
+    duration: 1,
+  });
+  const chunk = [...iterateRecords(file, MAGIC.length)].find(
+    (item) => item.opcode === Opcode.Chunk,
+  )!;
+  new DataView(file.buffer, file.byteOffset, file.byteLength).setUint32(
+    chunk.offset + RECORD_HEADER_BYTES + 20,
+    0,
+    true,
+  );
+  await assert.rejects(
+    () => validateKeyframeDeltaStreamed(file),
+    (error: unknown) =>
+      error instanceof MalformedFile &&
+      error.message.includes("declares 0 gaussians") &&
+      error.message.includes("attribute streams carry 1"),
+  );
+});
+
+test("keyframe-delta requires extended Chunk Index entries", async () => {
+  const file = await oneKeyframeFile({
+    windows: [[0, 1]],
+    windowIndex: 0,
+    motionBinX: 0,
+    duration: 1,
+  });
+  const chunk = [...iterateRecords(file, MAGIC.length)].find(
+    (item) => item.opcode === Opcode.Chunk,
+  )!;
+  const legacyIndex = record(
+    Opcode.ChunkIndex,
+    concat([f64(0), f64(1), u64(chunk.offset), u64(chunk.raw.length), u32(1), u32(0)]),
+  );
+  const report = await validateFile(concat([file, legacyIndex]));
+  assert.ok(
+    report.findings.some((finding) =>
+      finding.message.includes("omits chunk_kind, delta reference, depth and live_count"),
+    ),
+  );
+});
+
+test("a delta index count must equal the Delta Chunk's three group counts", async () => {
+  const file = bytes(MOVING_CHAINED);
+  const entry = [...iterateRecords(file, MAGIC.length)].find(
+    (item) => item.opcode === Opcode.ChunkIndex && parseChunkIndexEntry(item.content).kind === 1,
+  )!;
+  const view = new DataView(file.buffer, file.byteOffset, file.byteLength);
+  const countAt = entry.offset + RECORD_HEADER_BYTES + 32;
+  view.setUint32(countAt, view.getUint32(countAt, true) + 1, true);
+  const report = await validateFile(file);
+  assert.ok(
+    report.findings.some(
+      (finding) =>
+        finding.message.includes("affected gaussians") &&
+        finding.message.includes("across its groups"),
+    ),
+  );
+});
+
+test("known-record parse findings include the enclosing record byte", async () => {
+  const report = await validateFile(concat([MAGIC, record(Opcode.Camera, new Uint8Array())]));
+  assert.ok(
+    report.findings.some((finding) =>
+      finding.message.includes(`Camera record at byte ${MAGIC.length} does not parse`),
+    ),
+  );
 });
 
 // --- chunk-level compression (codex P1 §5.5/§5.18) ------------------------
