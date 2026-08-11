@@ -444,9 +444,10 @@ def declared_capabilities(command: list[str], timeout: float) -> Capabilities:
     try:
         doc = json.loads(outcome.stdout)
     # `json.loads` also raises plain ValueError for implementation limits such as
-    # Python's maximum integer-string length. Every unparseable handshake is a
-    # protocol error, including syntactically JSON input with a 5,000-digit version.
-    except ValueError as exc:
+    # Python's maximum integer-string length, and RecursionError when a syntactically
+    # valid document nests beyond the parser's stack. Every unparseable handshake is a
+    # protocol error, including those two inputs rather than a harness traceback.
+    except (ValueError, RecursionError) as exc:
         raise ProtocolError(f"{CAPABILITIES_ARG} did not print one JSON object: {exc}") from exc
     if not isinstance(doc, dict):
         raise ProtocolError(f"{CAPABILITIES_ARG} printed {type(doc).__name__}, not a JSON object")
@@ -724,10 +725,10 @@ def main(argv=None) -> int:
             try:
                 actual_json = json.loads(actual)
             # As in the capabilities handshake, parser limits can raise plain
-            # ValueError rather than JSONDecodeError (for example an oversized
-            # integer). Keep that failure on this runner/variant instead of
-            # letting it escape the harness as a traceback.
-            except ValueError as exc:
+            # ValueError (an oversized integer) or RecursionError (excessive nesting).
+            # Keep that failure on this runner/variant instead of letting it escape the
+            # harness as a traceback.
+            except (ValueError, RecursionError) as exc:
                 failed += 1
                 print(f"FAIL {caps.name} {variant}: stdout is not one JSON document ({exc})")
                 print(f"  stdout: {actual[:200]!r}")
