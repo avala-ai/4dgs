@@ -140,6 +140,14 @@ function privateRecord(length: number): Uint8Array {
   return out;
 }
 
+function framedRecord(opcode: number, content: Uint8Array): Uint8Array {
+  const out = new Uint8Array(RECORD_HEADER_BYTES + content.length);
+  out[0] = opcode;
+  new DataView(out.buffer).setBigUint64(1, BigInt(content.length), true);
+  out.set(content, RECORD_HEADER_BYTES);
+  return out;
+}
+
 function splice(data: Uint8Array, at: number, insert: Uint8Array): Uint8Array {
   const out = new Uint8Array(data.length + insert.length);
   out.set(data.subarray(0, at));
@@ -561,6 +569,47 @@ test("regression: the object layer's cross-record rules are checked, not stepped
   );
 });
 
+test("regression: zero-sample Object Tracks are absent during cross-record checks", (t) => {
+  if (corpus("LongLived-UseChunkIndex-UseCrc-WithObjects") === null || !existsSync(EXECUTABLE)) {
+    return t.skip("corpus not generated");
+  }
+  const data = bytesOf("LongLived-UseChunkIndex-UseCrc-WithObjects");
+  const summary = parseFooter(
+    data.subarray(data.length - FOOTER_TAIL_BYTES + RECORD_HEADER_BYTES),
+  ).summaryStart;
+  const content = new Uint8Array(9);
+  const view = new DataView(content.buffer);
+  view.setUint32(0, 7, true);
+  content[4] = 0;
+  view.setUint32(5, 0, true);
+  const empty = framedRecord(Opcode.ObjectTrack, content);
+  const withTwoEmpty = splice(splice(data, summary, empty), summary + empty.length, empty);
+  const report = validated(
+    file("TwoAbsentTracks.4dgs", resealSummary(withTwoEmpty, 2 * empty.length)),
+  );
+  assert.equal(report.code, EXIT_OK, report.out.join("\n"));
+});
+
+test("regression: Header SH degree is restricted to the attribute registry", (t) => {
+  if (corpus("TenWindows-UseChunkIndex-UseCrc") === null || !existsSync(EXECUTABLE)) {
+    return t.skip("corpus not generated");
+  }
+  const data = bytesOf("TenWindows-UseChunkIndex-UseCrc");
+  const header = recordsOf(data)[0]!;
+  const cursor = new Cursor(data.subarray(header.offset + RECORD_HEADER_BYTES));
+  cursor.string();
+  cursor.string();
+  cursor.f64();
+  cursor.u64();
+  cursor.f64();
+  cursor.string();
+  cursor.f64s(6);
+  data[header.offset + RECORD_HEADER_BYTES + cursor.pos] = 4;
+  const report = validated(file("ShDegree4.4dgs", data));
+  assert.equal(report.code, EXIT_FAILED);
+  assert.ok(report.out.some((line) => line.includes("Header sh_degree is 4")));
+});
+
 test("regression: a record after the Footer, a reserved Header flag, a foreign summary record", (t) => {
   // Three normative MUSTs the structural pass could not see: §4 (the Footer is the last
   // record), §4.2 (Header flag bits 2-7 are zero) and §4.5 (the summary is exactly the
@@ -601,6 +650,16 @@ test("regression: a record after the Footer, a reserved Header flag, a foreign s
   const start = parseFooter(
     original.subarray(original.length - FOOTER_TAIL_BYTES + RECORD_HEADER_BYTES),
   ).summaryStart;
+
+  const firstIndex = recordsOf(original).find((record) => record.opcode === Opcode.ChunkIndex)!;
+  const shortened = resealSummary(original.slice(), firstIndex.length);
+  const lateStart = validated(file("LateSummaryStart.4dgs", shortened));
+  assert.equal(lateStart.code, EXIT_FAILED);
+  assert.ok(
+    lateStart.out.some((line) => line.includes("the first Chunk Index record starts at")),
+    lateStart.out.join("\n"),
+  );
+
   // Inside the summary, with the checksum recomputed over it — which is exactly why the
   // CRC cannot answer this question and something else has to.
   const inside = resealSummary(splice(original.slice(), start, privateRecord(16)));

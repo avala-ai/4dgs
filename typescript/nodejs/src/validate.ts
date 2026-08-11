@@ -177,6 +177,7 @@ export async function validateFile(
   let chunkCount = 0;
   let counted = 0;
   const index: ChunkIndexEntry[] = [];
+  let firstIndexOffset: number | null = null;
   const audioSources = new Map<number, AudioSourceDescriptor>();
   const audioData = new Map<number, number>();
   const provenance = new Provenance();
@@ -221,6 +222,12 @@ export async function validateFile(
             checkTemporalModel(header.temporalModel);
           } catch (error) {
             found.refuse(error, offset, "the Header record");
+          }
+          if (header.shDegree > MAX_SH_DEGREE) {
+            found.error(
+              `Header sh_degree is ${header.shDegree}; the attribute registry defines only ` +
+                `degrees 0-${MAX_SH_DEGREE} (§5.1)`,
+            );
           }
           break;
         case Opcode.Quantization:
@@ -317,6 +324,7 @@ export async function validateFile(
           break;
         }
         case Opcode.ChunkIndex:
+          firstIndexOffset ??= offset;
           try {
             index.push(parseChunkIndexEntry(content));
           } catch (error) {
@@ -405,7 +413,10 @@ export async function validateFile(
           break;
         case Opcode.ObjectTrack:
           parseInto(found, "ObjectTrack", () => {
-            objects.tracks.push(parseObjectTrack(content));
+            const track = parseObjectTrack(content);
+            // §5.15.7 reads a zero-sample track as absent. In particular, two
+            // absent records for one id are not two active tracks.
+            if (track.times.length > 0) objects.tracks.push(track);
           });
           break;
         default:
@@ -645,6 +656,12 @@ export async function validateFile(
       new Crc32().update(data.subarray(footer.summaryStart, tail)).digest() !== footer.summaryCrc
     ) {
       found.error("summary CRC mismatch: the index is untrustworthy (a streamed read still works)");
+    }
+    if (firstIndexOffset !== null && footer.summaryStart !== firstIndexOffset) {
+      found.error(
+        `the Footer's summary starts at ${footer.summaryStart}; the first Chunk Index ` +
+          `record starts at ${firstIndexOffset} (§5.2)`,
+      );
     }
     checkSummaryComposition(data, footer.summaryStart, tail, found);
   }
