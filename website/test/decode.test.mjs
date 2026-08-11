@@ -212,7 +212,9 @@ describe("an invalid file is refused in the decoder's own words", () => {
 function refusalTag(error) {
   const message = error.message;
   if (error instanceof UnsupportedVersion) {
-    return /major version 1\b/.test(message) ? "magic-mismatch" : "unsupported-major-version";
+    return message.startsWith("not a 4dgs file:") || /major version 1\b/.test(message)
+      ? "magic-mismatch"
+      : "unsupported-major-version";
   }
   if (error instanceof UnsupportedCodec) {
     if (/temporal model/.test(message)) return "unknown-temporal-model";

@@ -145,27 +145,6 @@ export default function Viewer() {
         setupFailureRef.current = null;
         setSetupFailed(false);
         setError(null);
-
-        const pendingOpen = pendingOpenRef.current;
-        pendingOpenRef.current = null;
-        if (pendingOpen !== null) {
-          open(pendingOpen.readable, pendingOpen.label);
-          return;
-        }
-
-        // GPU resources do not survive a restored context. Recreate the frame at the
-        // current instant from decoded state; the transport stays paused so restoration
-        // cannot make scene time jump.
-        const playback = playbackRef.current;
-        const playable = playback.playable;
-        const serial = playback.serial;
-        if (playable !== null) {
-          const frame = await playable.frameAt(playback.time);
-          if (running && playbackRef.current.serial === serial && !contextIsLost) {
-            renderer.setFrame(frame);
-            playbackRef.current.rendered = playback.time;
-          }
-        }
       } catch (failure) {
         const wrapped = new ViewerCapabilityError(
           `the WebGL2 context was restored but the renderer could not be rebuilt: ${failure.message}`,
@@ -173,6 +152,37 @@ export default function Viewer() {
         setupFailureRef.current = wrapped;
         setSetupFailed(true);
         setError(wrapped);
+        return;
+      }
+
+      const pendingOpen = pendingOpenRef.current;
+      pendingOpenRef.current = null;
+      if (pendingOpen !== null) {
+        open(pendingOpen.readable, pendingOpen.label);
+        return;
+      }
+
+      // GPU resources do not survive a restored context. Recreate the frame at the
+      // current instant from decoded state; a decode/range failure is a file or transport
+      // diagnosis, not evidence that rebuilding WebGL failed.
+      const playback = playbackRef.current;
+      const playable = playback.playable;
+      const serial = playback.serial;
+      if (playable !== null) {
+        try {
+          const frame = await playable.frameAt(playback.time);
+          if (running && playbackRef.current.serial === serial && !contextIsLost) {
+            rendererRef.current?.setFrame(frame);
+            playbackRef.current.rendered = playback.time;
+          }
+        } catch (failure) {
+          if (!running || playbackRef.current.serial !== serial) return;
+          playbackRef.current.playable = null;
+          rendererRef.current?.clear();
+          setPlaying(false);
+          setDecodeFailed(true);
+          setError(failure);
+        }
       }
     };
     canvas.addEventListener("webglcontextlost", contextLost);
@@ -303,7 +313,7 @@ export default function Viewer() {
       // Framing also probes a handful of instants. One that will not decode is worth
       // saying now rather than three seconds into playback, so its refusal joins the notes.
       playable.notes.push(
-        ...(await frameCamera(playable, rendererRef.current, cameraRef.current, current)),
+        ...(await frameCamera(playable, () => rendererRef.current, cameraRef.current, current)),
       );
       if (!current()) return;
       playback.playable = playable;
@@ -642,14 +652,14 @@ const READ_MODES = {
  * A scene whose gaussians are all born late has nothing at `t = 0`, and framing an empty
  * frame would leave the camera at the origin looking at nothing.
  */
-async function frameCamera(playable, renderer, camera, isCurrent) {
+async function frameCamera(playable, currentRenderer, camera, isCurrent) {
   // The instant the visitor lands on. A refusal here is the file's answer to "can you open
   // this", and is allowed to propagate.
   const first = await playable.frameAt(0);
   // A file the visitor has already moved on from does not get to put a frame on the canvas
   // or move the camera; its caller will discard the rest of this open too.
   if (!isCurrent()) return [];
-  if (renderer !== null) renderer.setFrame(first);
+  currentRenderer()?.setFrame(first);
   if (camera === null) return [];
 
   const warnings = [];
@@ -668,8 +678,22 @@ async function frameCamera(playable, renderer, camera, isCurrent) {
     }
   }
   if (!isCurrent()) return [];
-  camera.frame(bounds === null ? [0, 0, 0] : bounds.center, bounds === null ? 1 : bounds.radius);
+  const framing = bounds ?? boundsFromAabb(playable.header?.aabb);
+  camera.frame(framing === null ? [0, 0, 0] : framing.center, framing === null ? 1 : framing.radius);
   return warnings;
+}
+
+/** A scene-wide framing fallback for sparse visibility that fixed time probes can miss. */
+function boundsFromAabb(aabb) {
+  if (!Array.isArray(aabb) || aabb.length !== 6 || !aabb.every(Number.isFinite)) return null;
+  const center = [
+    (aabb[0] + aabb[3]) / 2,
+    (aabb[1] + aabb[4]) / 2,
+    (aabb[2] + aabb[5]) / 2,
+  ];
+  const radius = Math.hypot(aabb[3] - aabb[0], aabb[4] - aabb[1], aabb[5] - aabb[2]) / 2;
+  if (!center.every(Number.isFinite) || !Number.isFinite(radius) || radius <= 0) return null;
+  return { center, radius };
 }
 
 /** The largest instant the half-open timeline `[0, duration)` actually contains. */

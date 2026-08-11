@@ -31,9 +31,7 @@ import {
   checkMagic,
   decodeKeyframeDeltaStreamed,
   decodeScene,
-  parseChunk,
   parseHeader,
-  readRecord,
 } from "@4dgs/core";
 
 import { reconstructKeyframeDelta } from "./keyframeDelta.js";
@@ -446,9 +444,9 @@ async function chunkGateOf(scene, source, size) {
 /**
  * How one Chunk Index entry disagrees with the Chunk record it points at, or `null`.
  *
- * The record is read and framed by `@4dgs/core` — `readRecord` then `parseChunk` — so this
- * is the indexed reader's own check on the streamed reader's data, not a second opinion
- * about what a Chunk record contains.
+ * Only the record header and fixed Chunk fields are fetched. The streamed decode already
+ * consumed the payload; fetching it again merely to compare three fixed fields would make
+ * this optional fallback check another whole-chunk allocation.
  */
 async function chunkDisagreement(entry, source, size) {
   const { chunkOffset, chunkLength } = entry;
@@ -458,13 +456,19 @@ async function chunkDisagreement(entry, source, size) {
       `[${chunkOffset}, ${chunkOffset + chunkLength}), outside the ${size}-byte resource.`
     );
   }
-  let parsed;
+  let count;
+  let t0;
+  let t1;
   try {
     // `chunkLength` belongs to the untrusted index. Read only the fixed framing first,
     // then use the Chunk record's own length after proving it is representable and inside
     // the resource. A damaged index cannot turn this optional check into a multi-gigabyte
     // allocation by exaggerating the range while keeping a valid Chunk offset.
-    const framed = await source.read(BigInt(chunkOffset), BigInt(RECORD_HEADER_BYTES));
+    const fixedChunkBytes = RECORD_HEADER_BYTES + 24;
+    if (chunkOffset + fixedChunkBytes > size) {
+      return `Chunk Index entry at offset ${chunkOffset} does not contain the fixed Chunk fields.`;
+    }
+    const framed = await source.read(BigInt(chunkOffset), BigInt(fixedChunkBytes));
     const head = new Cursor(framed, 0, chunkOffset);
     const opcode = head.u8();
     const actualLength = RECORD_HEADER_BYTES + head.u64();
@@ -483,13 +487,13 @@ async function chunkDisagreement(entry, source, size) {
     if (chunkOffset + actualLength > size) {
       return `chunk at ${chunkOffset} declares ${actualLength} bytes, past the ${size}-byte resource.`;
     }
-    const blob = await source.read(BigInt(chunkOffset), BigInt(actualLength));
-    const record = readRecord(new Cursor(blob, 0, chunkOffset));
-    parsed = parseChunk(record.content);
+    t0 = head.f64();
+    t1 = head.f64();
+    head.u32(); // level
+    count = head.u32();
   } catch (error) {
     return `Chunk Index entry at offset ${chunkOffset} could not be read back: ${error.message}`;
   }
-  const { count, t0, t1 } = parsed.header;
   if (count !== entry.gaussianCount) {
     return (
       `chunk at ${chunkOffset} holds ${count} gaussians and its index entry says ` +
