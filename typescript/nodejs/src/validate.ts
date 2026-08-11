@@ -169,6 +169,7 @@ export async function validateFile(
   }
 
   const seen: number[] = [];
+  const topLevelOffsets = new Set<number>();
   let header: Header | null = null;
   let quantization: Quantization | null = null;
   let quantizationCount = 0;
@@ -193,6 +194,7 @@ export async function validateFile(
     for (const record of iterateRecords(data, MAGIC.length)) {
       seen.push(record.opcode);
       const { content, offset } = record;
+      topLevelOffsets.add(offset);
       // A record whose own body will not parse is a finding rather than an abort: the point
       // of a validator is to say everything that is wrong with a file, not the first thing.
       switch (record.opcode) {
@@ -456,7 +458,8 @@ export async function validateFile(
     decodedShChunks.forEach((chunk, i) => {
       if (!chunk.decoded) return;
       try {
-        degrees.push(mergeBands(chunk.count, chunk.bands, MAX_SH_DEGREE).degree);
+        const degree = mergeBands(chunk.count, chunk.bands, MAX_SH_DEGREE).degree;
+        if (chunk.count > 0) degrees.push(degree);
       } catch (error) {
         found.error(`chunk ${i + 1} SH bands do not assemble: ${message(error)}`);
       }
@@ -466,6 +469,12 @@ export async function validateFile(
       new Set(degrees).size > 1
     ) {
       found.error(`chunks disagree on SH degree: ${[...new Set(degrees)].join(", ")}`);
+    }
+    if (header !== null && degrees.some((degree) => degree !== header!.shDegree)) {
+      found.error(
+        `nonempty chunks assemble SH degree ${[...new Set(degrees)].join(", ")}; the Header ` +
+          `declares degree ${header.shDegree} (§6.5)`,
+      );
     }
   }
 
@@ -571,6 +580,11 @@ export async function validateFile(
     const chunkEnd = entry.chunkOffset + entry.chunkLength;
     if (!Number.isSafeInteger(chunkEnd) || chunkEnd > data.length) {
       found.error(`chunk index entry ${i} points past the end of the file`);
+    } else if (!topLevelOffsets.has(entry.chunkOffset)) {
+      found.error(
+        `chunk index entry ${i} points at byte ${entry.chunkOffset}, which is not the start ` +
+          `of a top-level record`,
+      );
     } else if (data[entry.chunkOffset] !== Opcode.Chunk) {
       found.error(`chunk index entry ${i} does not point at a Chunk record`);
     } else {
@@ -600,6 +614,12 @@ export async function validateFile(
                 `at ${entry.chunkOffset} contains ${parsed.header.count}`,
             );
           }
+          if (!Object.is(parsed.header.t0, entry.t0) || !Object.is(parsed.header.t1, entry.t1)) {
+            found.error(
+              `chunk index entry ${i} declares interval [${entry.t0}, ${entry.t1}); the Chunk ` +
+                `at ${entry.chunkOffset} declares [${parsed.header.t0}, ${parsed.header.t1})`,
+            );
+          }
         } catch (error) {
           found.error(
             `chunk index entry ${i} references a Chunk that does not parse: ${message(error)}`,
@@ -613,6 +633,10 @@ export async function validateFile(
       const where = `chunk index entry ${i} SH band range ${j}`;
       if (!Number.isSafeInteger(bandEnd) || bandEnd > data.length) {
         found.error(`${where} points past the end of the file`);
+        return;
+      }
+      if (!topLevelOffsets.has(band.offset)) {
+        found.error(`${where} does not point at the start of a top-level record`);
         return;
       }
       if (data[band.offset] !== Opcode.ShBandStream) {
@@ -661,7 +685,12 @@ export async function validateFile(
     ) {
       found.error("summary CRC mismatch: the index is untrustworthy (a streamed read still works)");
     }
-    if (firstIndexOffset !== null && footer.summaryStart !== firstIndexOffset) {
+    if (firstIndexOffset === null) {
+      found.error(
+        `the Footer's nonzero summary_start ${footer.summaryStart} names no Chunk Index ` +
+          `record (§5.2)`,
+      );
+    } else if (footer.summaryStart !== firstIndexOffset) {
       found.error(
         `the Footer's summary starts at ${footer.summaryStart}; the first Chunk Index ` +
           `record starts at ${firstIndexOffset} (§5.2)`,

@@ -633,6 +633,30 @@ test("regression: Header SH degree is restricted to the attribute registry", (t)
   assert.ok(report.out.some((line) => line.includes("Header sh_degree is 4")));
 });
 
+test("regression: decoded SH degree must equal the Header declaration", (t) => {
+  if (corpus("MixedLifetimes-SHDegree1-UseChunkIndex-UseCrc") === null || !existsSync(EXECUTABLE)) {
+    return t.skip("corpus not generated");
+  }
+  const data = bytesOf("MixedLifetimes-SHDegree1-UseChunkIndex-UseCrc");
+  const header = recordsOf(data)[0]!;
+  const cursor = new Cursor(data.subarray(header.offset + RECORD_HEADER_BYTES));
+  cursor.string();
+  cursor.string();
+  cursor.f64();
+  cursor.u64();
+  cursor.f64();
+  cursor.string();
+  cursor.f64s(6);
+  data[header.offset + RECORD_HEADER_BYTES + cursor.pos] = 2;
+
+  const report = validated(file("WrongShDegree.4dgs", data), "--decode");
+  assert.equal(report.code, EXIT_FAILED);
+  assert.ok(
+    report.out.some((line) => line.includes("nonempty chunks assemble SH degree 1")),
+    report.out.join("\n"),
+  );
+});
+
 test("regression: a record after the Footer, a reserved Header flag, a foreign summary record", (t) => {
   // Three normative MUSTs the structural pass could not see: §4 (the Footer is the last
   // record), §4.2 (Header flag bits 2-7 are zero) and §4.5 (the summary is exactly the
@@ -769,6 +793,69 @@ test("regression: indexed counts and SH ranges duplicate their referenced record
     ),
     bandReport.out.join("\n"),
   );
+
+  const wrongInterval = bytesOf("MixedLifetimes-SHDegree2-UseChunkIndex-UseCrc");
+  const intervalIndex = recordsOf(wrongInterval).find(
+    (record) => record.opcode === Opcode.ChunkIndex,
+  )!;
+  const intervalAt = intervalIndex.offset + RECORD_HEADER_BYTES;
+  const intervalView = new DataView(
+    wrongInterval.buffer,
+    wrongInterval.byteOffset,
+    wrongInterval.byteLength,
+  );
+  intervalView.setFloat64(intervalAt, intervalView.getFloat64(intervalAt, true) + 0.125, true);
+  const intervalReport = validated(file("WrongIndexedInterval.4dgs", resealSummary(wrongInterval)));
+  assert.equal(intervalReport.code, EXIT_FAILED);
+  assert.ok(
+    intervalReport.out.some((line) => line.includes("declares interval")),
+    intervalReport.out.join("\n"),
+  );
+});
+
+test("regression: indexed targets are physical records and a summary starts with its index", (t) => {
+  const path = corpus("TenWindows-UseChunkIndex-UseCrc");
+  if (path === null || !existsSync(EXECUTABLE)) return t.skip("corpus not generated");
+
+  const original = bytesOf("TenWindows-UseChunkIndex-UseCrc");
+  const records = recordsOf(original);
+  const chunk = records.find((record) => record.opcode === Opcode.Chunk)!;
+  const summary = parseFooter(
+    original.subarray(original.length - FOOTER_TAIL_BYTES + RECORD_HEADER_BYTES),
+  ).summaryStart;
+  const embedded = framedRecord(0x80, original.slice(chunk.offset, chunk.offset + chunk.length));
+  const insidePrivate = splice(original, summary, embedded);
+  const shiftedIndex = recordsOf(insidePrivate).find(
+    (record) => record.opcode === Opcode.ChunkIndex,
+  )!;
+  new DataView(
+    insidePrivate.buffer,
+    insidePrivate.byteOffset,
+    insidePrivate.byteLength,
+  ).setBigUint64(
+    shiftedIndex.offset + RECORD_HEADER_BYTES + 16,
+    BigInt(summary + RECORD_HEADER_BYTES),
+    true,
+  );
+  const embeddedReport = validated(
+    file("EmbeddedChunk.4dgs", resealSummary(insidePrivate, embedded.length)),
+  );
+  assert.equal(embeddedReport.code, EXIT_FAILED);
+  assert.ok(
+    embeddedReport.out.some((line) => line.includes("not the start of a top-level record")),
+    embeddedReport.out.join("\n"),
+  );
+
+  const noIndex = original.slice();
+  for (const record of recordsOf(noIndex)) {
+    if (record.opcode === Opcode.ChunkIndex) noIndex[record.offset] = Opcode.Statistics;
+  }
+  const noIndexReport = validated(file("SummaryWithoutIndex.4dgs", resealSummary(noIndex)));
+  assert.equal(noIndexReport.code, EXIT_FAILED);
+  assert.ok(
+    noIndexReport.out.some((line) => line.includes("names no Chunk Index record")),
+    noIndexReport.out.join("\n"),
+  );
 });
 
 test("unit: inspect refuses a resource size that cannot be represented exactly", async () => {
@@ -777,18 +864,15 @@ test("unit: inspect refuses a resource size that cannot be represented exactly",
     size: () => Promise.resolve(size),
     read: () => Promise.reject(new Error("inspect must reject the size before reading")),
   };
-  await assert.rejects(
-    inspectFile(unreadable),
-    (error: unknown) => {
-      assert.ok(error instanceof RangeError);
-      assert.ok(!(error instanceof FourdgsError));
-      assert.match(
-        error.message,
-        new RegExp(`resource size ${size} exceeds the largest exactly addressable size`),
-      );
-      return true;
-    },
-  );
+  await assert.rejects(inspectFile(unreadable), (error: unknown) => {
+    assert.ok(error instanceof RangeError);
+    assert.ok(!(error instanceof FourdgsError));
+    assert.match(
+      error.message,
+      new RegExp(`resource size ${size} exceeds the largest exactly addressable size`),
+    );
+    return true;
+  });
 });
 
 test("unit: the appended SH bit depths are parsed, tolerantly", (t) => {
