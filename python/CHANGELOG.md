@@ -6,22 +6,6 @@ All notable changes to the Python package are documented here, following
 
 ## [Unreleased]
 
-### Fixed
-
-- **The Header declares the SH degree the file actually carries.** `sh_bands` caps how many bands
-  the writer emits, but the Header went on declaring the degree the input `GaussianSet` held. A
-  degree-3 scene written with `sh_bands=1` carries three coefficients per component and declared
-  fifteen, so a reader sizing its buffers from the Header read a different number of coefficients
-  than the file contained. The declared degree is now the highest band written (issue #190).
-
-- **The top spherical-harmonic coefficient survives a pitch that does not divide 256.** The `coarse`
-  profile's `step_sh = 3` centred the coefficient 255 on **256**, which no `u8` holds: the reference
-  reader refused the file the reference writer had just produced, and a reader whose stream codec
-  narrows to a byte instead reported the extreme positive coefficient as the extreme negative one.
-  Coefficient rounding now lives in one place, `quantization.coarsen_sh`, and clamps back into the
-  byte range — a move that can only be towards the original, so the declared half-pitch bound is
-  kept (issues #181, #190).
-
 ## [0.3.0] - 2026-08-10
 
 This release ships the normative `keyframe-delta` temporal model as a whole-file reference path and
@@ -84,11 +68,12 @@ The LOD proposal is documentation only and is not advertised here.
   sample times and not the count, so one encodes with a count of zero.
 
 - **Each gaussian gets the validity window its `window_index` names.** The keyframe-delta reader
-  derived every gaussian's velocity grid from the first validity window (spec §6.3), and the writer
-  could not produce a file that showed it up: it forced a single full-duration window and wrote
-  `window_index = 0` for everyone, ignoring the `win_lo` and `win_hi` each gaussian already carried.
-  Both sides are fixed — the writer emits the distinct windows its population declares, and the
-  reader resolves each row against the one its own index names.
+  derived every gaussian's velocity grid from the first validity window (spec §6.3), while the
+  writer forced a single full-duration window and wrote `window_index = 0` for everyone, ignoring
+  the `win_lo` and `win_hi` each gaussian already carried. Both sides are fixed — the writer now
+  round-trips distinct windows and exercises their liveness, and the reader resolves each row
+  against the one its own index names. The reference writer still cannot demonstrate the precision
+  defect because it emits no never-fading gaussian, the case whose velocity grid uses window length.
 
   The precision half of this is narrower than it sounds. §6.3 takes the velocity grid from the
   window length only for gaussians flagged as never fading; for every other gaussian the grid comes
@@ -97,13 +82,14 @@ The LOD proposal is documentation only and is not advertised here.
   from window 0's, and different by enough to land in another precision class. No refusal, just
   numbers nobody wrote.
 
-  **The liveness half reaches any file with more than one window.** `reconstruct_at` now drops
-  gaussians outside their own half-open window and `states_json`'s `liveCount` follows, so any probe
-  instant that falls outside some gaussian's window now returns a different population — where
+  **The liveness half reaches a gaussian that references a window excluding the requested instant.**
+  `reconstruct_at` now drops gaussians outside their own half-open window and `states_json`'s
+  `liveCount` follows, so a probe in that excluded interval returns a different population — where
   before an expired or not-yet-born gaussian was still reported at an instant it does not exist, at
-  full opacity if it is one that never fades. Both halves correct code drafted for this release and
-  never tagged: 0.2.0 shipped no whole-file keyframe-delta reader, so there is no 0.2.0 output to
-  compare against — this is for whoever ran the path off `main` before 2026-08-02.
+  full opacity if it is one that never fades. Merely declaring extra, unreferenced windows changes
+  nothing. Both halves correct code drafted for this release and never tagged: 0.2.0 shipped no
+  whole-file keyframe-delta reader, so there is no 0.2.0 output to compare against — this is for
+  whoever ran the path off `main` before 2026-08-02.
 
 - **A keyframe-delta state carrying no `window_index` is refused by name.** A zero-count keyframe
   may legally omit every stream, and a delta carries forward only the attributes its reference
@@ -141,6 +127,23 @@ The LOD proposal is documentation only and is not advertised here.
 - **Quaternions near the top of the `f64` range normalize instead of being refused.** Trajectory,
   object-track and sensor-extrinsic rotations use `math.hypot` rather than a sum of squares, so an
   input like `[1e308, 0, 0, 0]` no longer overflows on the way to its own norm.
+- **Canonical keyframe-delta JSON writes zero without a negative sign.** A value that rounds from
+  `-0.0` to zero is emitted as `0.0`, so textual `states_json` comparisons no longer differ on a
+  sign that carries no numeric distinction.
+
+- **The Header declares the SH degree the file actually carries.** `sh_bands` caps how many bands
+  the writer emits, but the Header went on declaring the degree the input `GaussianSet` held. A
+  degree-3 scene written with `sh_bands=1` carries three coefficients per component and declared
+  fifteen, so a reader sizing its buffers from the Header read a different number of coefficients
+  than the file contained. The declared degree is now the highest band written (issue #190).
+
+- **The top spherical-harmonic coefficient survives a pitch that does not divide 256.** The `coarse`
+  profile's `step_sh = 3` centred the coefficient 255 on **256**, which no `u8` holds: the reference
+  reader refused the file the reference writer had just produced, and a reader whose stream codec
+  narrows to a byte instead reported the extreme positive coefficient as the extreme negative one.
+  Coefficient rounding now lives in one place, `quantization.coarsen_sh`, and clamps back into the
+  byte range — a move that can only be towards the original, so the declared half-pitch bound is
+  kept (issues #181, #190).
 
 - **Chunk-compressed PLY segment fidelity.** Segmented imports now retain every source gaussian and
   use the `.4dgs` validity window—not temporal-center filtering—to reproduce which segment is
