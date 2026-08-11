@@ -720,7 +720,7 @@ def write_corpus(target: str) -> dict[str, str]:
         data, expectation = build(scenario, flags)
         with open(os.path.join(target, f"{name}.4dgs"), "wb") as fh:
             fh.write(data)
-        with open(os.path.join(target, f"{name}.json"), "w", encoding="utf-8") as fh:
+        with open(os.path.join(target, f"{name}.json"), "w", encoding="utf-8", newline="\n") as fh:
             fh.write(expectation + "\n")
         checksums[name] = hashlib.sha256(data).hexdigest()
 
@@ -736,7 +736,7 @@ def write_corpus(target: str) -> dict[str, str]:
     for name, data, expectation in build_keyframe_delta_corpus():
         with open(os.path.join(keyframe_dir, f"{name}.4dgs"), "wb") as fh:
             fh.write(data)
-        with open(os.path.join(keyframe_dir, f"{name}.json"), "w", encoding="utf-8") as fh:
+        with open(os.path.join(keyframe_dir, f"{name}.json"), "w", encoding="utf-8", newline="\n") as fh:
             fh.write(expectation + "\n")
         checksums[f"keyframe/{name}"] = hashlib.sha256(data).hexdigest()
 
@@ -751,7 +751,7 @@ def write_corpus(target: str) -> dict[str, str]:
     for name, data, expectation in build_object_corpus():
         with open(os.path.join(object_dir, f"{name}.4dgs"), "wb") as fh:
             fh.write(data)
-        with open(os.path.join(object_dir, f"{name}.json"), "w", encoding="utf-8") as fh:
+        with open(os.path.join(object_dir, f"{name}.json"), "w", encoding="utf-8", newline="\n") as fh:
             fh.write(expectation + "\n")
         checksums[f"object/{name}"] = hashlib.sha256(data).hexdigest()
 
@@ -760,7 +760,7 @@ def write_corpus(target: str) -> dict[str, str]:
     for name, data, expectation in build_invalid():
         with open(os.path.join(invalid_dir, f"{name}.4dgs"), "wb") as fh:
             fh.write(data)
-        with open(os.path.join(invalid_dir, f"{name}.json"), "w", encoding="utf-8") as fh:
+        with open(os.path.join(invalid_dir, f"{name}.json"), "w", encoding="utf-8", newline="\n") as fh:
             fh.write(expectation + "\n")
         checksums[f"invalid/{name}"] = hashlib.sha256(data).hexdigest()
     return checksums
@@ -772,7 +772,7 @@ def write_checksums(checksums: dict[str, str]) -> None:
         "# Written by the generator; do not edit by hand.",
     ]
     lines += [f"{digest}  {name}.4dgs" for name, digest in sorted(checksums.items())]
-    with open(CHECKSUMS, "w", encoding="utf-8") as fh:
+    with open(CHECKSUMS, "w", encoding="utf-8", newline="\n") as fh:
         fh.write("\n".join(lines) + "\n")
 
 

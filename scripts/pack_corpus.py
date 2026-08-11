@@ -35,7 +35,6 @@ import hashlib
 import io
 import json
 import os
-import shutil
 import sys
 import tarfile
 
@@ -363,8 +362,12 @@ def unpack_and_check(tarball: str, into: str) -> None:
     artifact rather than the directory it was built from. An archive nobody has unpacked is
     an archive whose contents are a hope.
     """
-    if os.path.isdir(into):
-        shutil.rmtree(into)
+    # `into` is caller-owned. Removing it would both destroy unrelated files and,
+    # when it is the output directory or an ancestor, delete the tarball we are
+    # about to check. A release check always gets a fresh RUNNER_TEMP path; a
+    # local caller gets a controlled refusal instead of a recursive deletion.
+    if os.path.lexists(into):
+        raise SystemExit(f"::error::the check directory already exists: {into}")
     os.makedirs(into)
     with tarfile.open(tarball) as archive:
         for member in archive.getmembers():

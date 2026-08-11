@@ -468,7 +468,7 @@ jobs:
             echo
             echo "\`curl -LO https://github.com/avala-ai/4dgs/releases/download/$tag_url/4dgs-conformance-corpus-$version.tar.gz\` | [how to use it](https://4dgs.dev/docs/reference/conformance#download-the-corpus) | [full changelog](https://github.com/avala-ai/4dgs/blob/main/tests/conformance/CHANGELOG.md)"
             echo
-            echo "Verify it with \`cd 4dgs-conformance-corpus-$version/corpus && sha256sum -c CHECKSUMS.txt\`. That file is committed at [\`tests/conformance/data/CHECKSUMS.txt\`](https://github.com/avala-ai/4dgs/blob/main/tests/conformance/data/CHECKSUMS.txt), byte for byte the copy in the archive, so the digests can be checked against git without trusting this download."
+            echo "Verify it with \`cd 4dgs-conformance-corpus-$version/corpus && sha256sum -c CHECKSUMS.txt\`. That file is committed at [\`tests/conformance/data/CHECKSUMS.txt\`](https://github.com/avala-ai/4dgs/blob/$tag_url/tests/conformance/data/CHECKSUMS.txt), byte for byte the copy in the archive, so the digests can be checked against the immutable release tag without trusting this download."
             echo
             echo "Apache-2.0, and nothing else to clear: every scene is synthetic from a fixed seed, every audio payload is a generated sine sweep, and there is no captured data of any kind."
           } > "$RUNNER_TEMP/notes.md"
@@ -482,6 +482,10 @@ jobs:
         run: |
           pip install -e ./python/fourdgs
           python3 tests/conformance/generate.py --verify
+          if ! git diff --exit-code -- tests/conformance/data; then
+            echo "::error::the generated expectations differ from the release tag"
+            exit 1
+          fi
 
       - name: Build the artifact
         # `--check` unpacks the tarball somewhere else entirely and verifies every
