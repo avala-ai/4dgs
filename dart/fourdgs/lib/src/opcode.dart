@@ -61,6 +61,52 @@ const int opPrivateStart = 0x80;
 
 bool isPrivateOpcode(int opcode) => opcode >= opPrivateStart;
 
+/// The names in [_opcodeNames], plus the two ranges a reader steps over.
+///
+/// Character for character what `rust/fourdgs/src/opcode.rs` answers, because
+/// these names are what the inspect tables in six SDKs print for the same
+/// record. A row that reads `WindowTable` in one tool and `Window Table` in
+/// another is a diff a reader has to squint at before deciding it means nothing.
+String opcodeName(int opcode) {
+  final String? known = _opcodeNames[opcode];
+  if (known != null) return known;
+  final String hex = opcode.toRadixString(16).padLeft(2, '0').toUpperCase();
+  return isPrivateOpcode(opcode) ? 'Private(0x$hex)' : 'Unknown(0x$hex)';
+}
+
+const Map<int, String> _opcodeNames = <int, String>{
+  opHeader: 'Header',
+  opFooter: 'Footer',
+  opQuantization: 'Quantization',
+  opWindowTable: 'WindowTable',
+  opChunk: 'Chunk',
+  opAttributeStream: 'AttributeStream',
+  opShBandStream: 'ShBandStream',
+  opChunkIndex: 'ChunkIndex',
+  opAudio: 'Audio',
+  opCamera: 'Camera',
+  opMetadata: 'Metadata',
+  opStatistics: 'Statistics',
+  opAttachment: 'Attachment',
+  opAttachmentIndex: 'AttachmentIndex',
+  opSummaryOffset: 'SummaryOffset',
+  opDeltaChunk: 'DeltaChunk',
+  opAudioSource: 'Audio Source',
+  opAudioData: 'Audio Data',
+  opCoordinateFrame: 'CoordinateFrame',
+  opSensorCalibration: 'SensorCalibration',
+  opRigTrajectory: 'RigTrajectory',
+  opGeodeticAnchor: 'GeodeticAnchor',
+  opObjectTable: 'ObjectTable',
+  opObjectTrack: 'ObjectTrack',
+};
+
+/// True for the opcodes this version of the specification defines.
+///
+/// Everything else is either the application range or a record from a revision
+/// this build does not implement, and both are skipped rather than refused.
+bool isSpecifiedOpcode(int opcode) => _opcodeNames.containsKey(opcode);
+
 // Attribute ids carried by Attribute Stream records.
 const int attrPosition = 0;
 const int attrScale = 1;
