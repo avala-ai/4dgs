@@ -7,7 +7,7 @@ Nothing here is in force until it is folded into [the specification](../index.md
 
 The question in #78 is short and the answer decides geometry: **may a provenance-family record
 (`0x20`–`0x2F`) appear after the first `Chunk`?** Auditing the two read paths exposes the same
-unstated position rule for the legacy Audio (`0x04`), Camera (`0x0A`), Metadata (`0x0B`) and
+unstated position rule for the legacy Audio (`0x09`), Camera (`0x0A`), Metadata (`0x0B`) and
 Attachment (`0x0D`) records. The answer therefore has to cover every record the indexed front-matter
 walk collects, rather than fixing one family while leaving four identical divergences.
 
@@ -292,11 +292,20 @@ One variant, in `data/invalid/`, because after this proposal the file is not a l
   a bad magic, an unknown scheme, a window index out of range — so a record-position refusal is a
   new shape for that directory rather than a variation on one already there.
 - **The rest of the positional family is independently pinned.** Add `LateLegacyAudio`,
-  `LateCamera`, `LateMetadata`, `LateAttachment`, `LateWindowTable` and `LateAudioSource` using the
-  same splice. One provenance example cannot prove the branches for unrelated legacy opcodes, and
-  §5.17's existing Audio Source rule currently has no variant either. Each expectation names its
-  opcode and offset; `LateAudioSource` closes the pre-existing §5.17 gap while the other five
-  prevent this proposal from documenting a broader rule than the suite proves.
+  `LateCamera`, `LateMetadata`, `LateAttachment`, `LateWindowTable`, `LateAudioSource` and
+  `LateAudioData` using the same splice. One provenance example cannot prove the branches for
+  unrelated legacy opcodes, and Audio Source and Audio Data are separate opcodes with separate
+  refusal branches. Each expectation names its opcode and offset; the last two close both halves of
+  the pre-existing §5.17 gap while the other five prevent this proposal from documenting a broader
+  rule than the suite proves.
+- **Opcode and offset are machine-checked, not prose around a generic refusal.** Before adding the
+  variants, the invalid-runner result grows optional `opcode` and `at` fields sourced from the
+  structured exception, and these expectations contain all three values, for example
+  `{"refused":"late-front-matter-record","opcode":37,"at":1234}` for an Object Track at byte 1234.
+  Every SDK's late-record refusal must retain those fields, and each conformance runner must
+  serialize them; comparing only today's `refused` string would not prove the diagnostic rule this
+  proposal adds. Existing invalid cases whose rule names no opcode keep their current one-field
+  expectations.
 - **Why an invalid variant and not a valid one:** a valid variant can only assert that the two paths
   agree, and under this proposal they agree because the file cannot exist. The thing worth pinning
   is the refusal — without it, an implementation that keeps today's silent behaviour passes.

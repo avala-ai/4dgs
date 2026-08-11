@@ -291,7 +291,7 @@ rely on it." Everything in this proposal is the conformance reference being held
 
 ## 6. The conformance variants that pin it
 
-Four cases, represented by five files; the tied-state case is deliberately a paired encoding.
+Four cases, represented by six files; both tie-sensitive cases are deliberately paired encodings.
 
 - **`ObjectTiedGaussians` and `ObjectTiedGaussiansReordered`** — two encodings of the same
   object-layer gaussian multiset, containing at least one pair of gaussians that tie on every field
@@ -321,12 +321,18 @@ Four cases, represented by five files; the tied-state case is deliberately a pai
   unless their rounded `opacitySum` differs, while all centres are zero. This independently catches
   a port that fixes `positionSum` and leaves opacity in resident order.
 
-- **`ObjectResidualTieSum`** — rows that tie both on `_stable_order` and on the rounded secondary
-  row emitted by (1a), while their unrounded composed centres differ. Their resident and stable
-  orders are chosen so the unrounded sums cross a six-decimal boundary. Its generator precondition
-  is explicit: secondary emitted-row keys compare equal and the two rounded sums do not. This is the
-  first variant that actually reaches (2a)'s residual and therefore the trigger for considering
-  (2b); `ObjectTiedGaussians` cannot serve that role because its emitted centres differ.
+- **`ObjectResidualTieSum` and `ObjectResidualTieSumReordered`** — two encodings of the same rows,
+  which tie both on `_stable_order` and on the rounded secondary row emitted by (1a), while their
+  unrounded composed centres differ. The second encoding reverses the surviving tied run's physical
+  order and changes no decoded value. Their generator preconditions are explicit: secondary
+  emitted-row keys compare equal, resident-order addition in the two encodings lands on opposite
+  sides of a six-decimal boundary, and sorting the addends produces one identical total for both.
+  The pair shares one expectation, so an implementation that preserves stable resident order cannot
+  pass merely because it is deterministic for either input alone. This is the first pair that
+  actually reaches (2a)'s residual and therefore the trigger for implementing (2b);
+  `ObjectTiedGaussians` cannot serve that role because its emitted centres differ. It belongs in the
+  follow-up stack that adopts (2b), not in the initial (1a)/(2a) stack whose limitation it is
+  designed to expose.
 
 All four belong beside the existing `object/` variants. None needs a spec change, a new opcode or a
 new writer capability — they are ordinary scenes with adversarially chosen numbers. The generator's

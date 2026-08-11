@@ -359,21 +359,23 @@ decide.
 - **Shape:** at least four state chunks so that a delta references a delta (depth ≥ 2), an Object
   Table naming two objects, and one Object Track for one of them with samples that put a
   non-identity pose at every probe. The keyframe deliberately omits `object_id`, so its population
-  begins with implicit zero ids. The first delta's **birth group** introduces the stream with a
-  non-zero id while the surviving reference rows remain implicit zeros; the next delta's update
-  group assigns one survivor to the tracked object. A later birth omits the stream and must receive
-  zero even though the composed state now carries non-zero ids. At least one gaussian carries
-  per-gaussian `motion` so that `R * (position + motion * dt) + T` is distinguishable from
-  `R * position + T`.
+  begins with implicit zero ids. The first delta's **birth group** introduces the stream with object
+  id `7` while the surviving reference rows remain implicit zeros; that delta also assigns one
+  implicit-zero survivor to id `7`. The next delta relabels the born gaussian from `7` to the
+  separately tracked id `12`. A later birth omits the stream and must receive zero even though the
+  composed state now carries non-zero ids. At least one gaussian carries per-gaussian `motion` so
+  that `R * (position + motion * dt) + T` is distinguishable from `R * position + T`.
 - **The first birth introduces `object_id`.** Its absolute birth row is appended to a materialized
   zero column for all survivors. This is the inverse transition to an omitted birth after the column
   exists, and catches a generic composer that appends an attribute array containing only the birth
   rows.
-- **One delta introduces and restates an `object_id`**, moving a gaussian from implicit zero to the
-  tracked object. This separates rule (i) from both current failures: refusing an update attribute
-  absent from the keyframe, and adding the absolute label if a zero column was materialized by hand.
-  Under (i) the gaussian's centre at the following probe is the tracked pose applied to its base
-  state; the untouched gaussian and the birth that omits the stream remain untracked.
+- **The deltas exercise introduction and true absolute replacement independently.** Moving the
+  keyframe survivor from implicit zero to `7` proves that an omitted keyframe column is materialized
+  instead of refused. Relabelling the born gaussian from non-zero id `7` to non-zero id `12` is what
+  proves absolute replacement: the erroneous additive path produces `19`, whereas a zero-to-`12`
+  transition would produce `12` under either algorithm. Under rule (i), id `12`'s track moves that
+  gaussian at the following probe; the untouched gaussian and the later birth that omits the stream
+  remain untracked.
 - **What the canonical must report.** The `keyframe-delta` canonical
   (`keyframe_delta_file.states_json`) has no `objects` member and no `objectIds` today, so it must
   gain both, in the shape `canonical.summarize` already uses for `gaussian-birth`: an `objects`
@@ -388,10 +390,16 @@ decide.
   gaussian that is not live (already covered by the existing unknown-id refusal, so possibly
   redundant), and — if (ii) is chosen instead of (i) — a delta carrying `object_id` at all.
 
-**Cost of the variant is a writer change first.** `write_sequence` must grow an `objects` parameter
-and `_keyframe_streams` must emit id `14`, or the file cannot be generated. That is the honest
-sequencing note for #134: for #79, step 2 is not "add a variant", it is "teach the reference encoder
-to write the combination, then add a variant".
+**Cost of the variant is a writer change first.** `write_sequence` must grow an `objects` parameter,
+and sample quantization must carry an optional exact `object_id` column (attribute `14`) rather than
+stopping at attributes `0`–`10`. `_keyframe_streams` then emits that column only when the keyframe
+physically carries it. Delta generation must do more than index `reference_bins[14]`: when the
+reference omits the column it materializes zeros for its live ids before classifying updates, and
+when a birth first introduces the column it extends those survivor zeros with the births' absolute
+values. Conversely, births that omit the column append zeros when the reference already carries it.
+Only after those rules exist can the writer deliberately produce the omitted-keyframe transition
+this variant requires. That is the honest sequencing note for #134: for #79, step 2 is not "add a
+variant", it is "teach the reference encoder to write the combination, then add a variant".
 
 ---
 
