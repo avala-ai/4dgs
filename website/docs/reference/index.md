@@ -64,7 +64,7 @@ identical bytes with no per-language slerp or composition order of its own.
 | glTF interop (import, snapshot export)            | Yes    | No         | No      | No      | No      | No      |
 | USD interop (import, snapshot export)             | Yes    | No         | No      | No      | No      | No      |
 | USD animated export (keyframe-delta time samples) | Yes    | No         | No      | No      | No      | No      |
-| Inspect and validate                              | Yes    | Planned    | Planned | Planned | Planned | Planned |
+| Inspect and validate                              | Yes    | Planned    | Planned | Planned | Yes     | Planned |
 
 ¹ On the `gaussian-birth` path. No implementation composes object tracks during `keyframe-delta`
 reconstruction: that path rebuilds base centres and scales from bins and never reads the object
@@ -332,10 +332,9 @@ costs strictly fewer bytes than carrying them, and that no cap ever moves more t
 **Convert from PLY frame sequences** and **Inspect and validate** are tools rather than wire-format
 features, so the conformance suite does not cover them. The converter's fixtures are PLY frames
 generated into a temporary directory from a fixed seed — the corpus rule applied to a different file
-format — and validators are tested against hostile files built byte by byte. Swift remains
-`Planned`: its bounded structural validator checks both temporal models, but the ranged ABI cannot
-yet compose keyframe-delta identity state, so it reports that model as incomplete rather than
-calling a structurally clean file valid.
+format — and validators are tested against hostile files built byte by byte. Swift's validator is
+implemented: it checks both temporal models with bounded range reads, composes keyframe-delta
+identity history, and reports a structurally clean file as valid.
 
 **Rust** decodes and encodes. Its decode rows are filled in from the same suite on the same terms as
 the other two; its encode rows come from the cross-implementation gate described above. Python

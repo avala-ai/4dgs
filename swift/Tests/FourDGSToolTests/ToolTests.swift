@@ -812,6 +812,27 @@ final class ValidateTests: XCTestCase {
             })
     }
 
+    func testEverySummaryRecordMustBeInsideTheDeclaredRun() throws {
+        try requireCorpus()
+        let variant =
+            "TenWindows-UseChunkIndex-UseChunks-UseCrc-UseStatistics-UseSummaryOffset.4dgs"
+        var bytes = try readFixture(corpusDirectory().appendingPathComponent(variant))
+        let walked = try walk(bytes)
+        let statistics = try XCTUnwrap(walked.firstIntact(Opcode.statistics))
+        let footer = try XCTUnwrap(walked.firstIntact(Opcode.footer))
+        writeU64(
+            statistics.offset + statistics.total,
+            into: &bytes,
+            at: footer.offset + recordHeaderSize)
+        writeU32(0, into: &bytes, at: footer.offset + recordHeaderSize + 16)
+        let findings = validate(bytes).findings
+        XCTAssertTrue(
+            findings.contains {
+                $0.message
+                    == "Statistics at byte \(statistics.offset) lies outside the Footer-declared summary"
+            }, findings.map(\.message).joined(separator: "\n"))
+    }
+
     func testAttributeStreamCannotFrameATopLevelRecord() throws {
         try requireCorpus()
         var bytes = try readFixture(corpusDirectory().appendingPathComponent(provenanceVariant))
@@ -1290,6 +1311,15 @@ final class ValidateTests: XCTestCase {
         ) { error in
             XCTAssertTrue(sentence(asFourDGS(error)).contains("declares 1 bytes; 0 remain"))
         }
+    }
+
+    func testAuxiliaryValidationHasAnAggregateByteCeiling() {
+        XCTAssertEqual(
+            nextAuxiliaryValidationBytes(0, adding: maximumAuxiliaryValidationBytes),
+            maximumAuxiliaryValidationBytes)
+        XCTAssertNil(
+            nextAuxiliaryValidationBytes(0, adding: maximumAuxiliaryValidationBytes + 1))
+        XCTAssertNil(nextAuxiliaryValidationBytes(UInt64.max, adding: 1))
     }
 
     func testConstantValidationColumnsStayCompressed() throws {

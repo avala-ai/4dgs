@@ -808,6 +808,16 @@ private func diagnosticOffset(_ error: FourDGSError) -> UInt64? {
 }
 
 private let maximumRetainedValidationRecords = 262_144
+/// The Rust-backed auxiliary parser retains decoded values for cross-record checks.
+/// Price the complete family before invoking it so validation never allocates in
+/// proportion to an untrusted Metadata, trajectory, or object payload.
+let maximumAuxiliaryValidationBytes: UInt64 = 64 * 1024 * 1024
+
+func nextAuxiliaryValidationBytes(_ current: UInt64, adding length: UInt64) -> UInt64? {
+    let (next, overflow) = current.addingReportingOverflow(length)
+    guard !overflow, next <= maximumAuxiliaryValidationBytes else { return nil }
+    return next
+}
 
 private func validatePhysicalRecords(
     _ source: ToolReader, _ walked: Walk, index: [IndexEntry], keyframeDelta: Bool,
@@ -849,6 +859,7 @@ private func validatePhysicalRecords(
     var firstAuxiliaryError: (FourDGSError, Site)?
     var firstFrontMatterError: (FourDGSError, Site)?
     var auxiliaryRecords: [Frame] = []
+    var auxiliaryBytes: UInt64 = 0
     var auxiliaryLimitReported = false
     var headerRecords: [Frame] = []
     var quantizationRecords: [Frame] = []
@@ -1188,8 +1199,18 @@ private func validatePhysicalRecords(
                 }
 
                 if isAuxiliaryRecord(frame.opcode) {
-                    if auxiliaryRecords.count < maximumRetainedValidationRecords {
+                    if auxiliaryLimitReported {
+                        return
+                    } else if nextAuxiliaryValidationBytes(auxiliaryBytes, adding: frame.total) == nil {
+                        scanReport.error(
+                            "the auxiliary record family exceeds the "
+                                + "\(maximumAuxiliaryValidationBytes)-byte validation limit; "
+                                + "refusing to materialize untrusted aggregate payloads")
+                        auxiliaryLimitReported = true
+                    } else if auxiliaryRecords.count < maximumRetainedValidationRecords {
                         auxiliaryRecords.append(frame)
+                        auxiliaryBytes = nextAuxiliaryValidationBytes(
+                            auxiliaryBytes, adding: frame.total)!
                     } else if !auxiliaryLimitReported {
                         scanReport.error(
                             "the file contains more than \(maximumRetainedValidationRecords) "
@@ -2882,8 +2903,8 @@ func validate(_ source: ToolReader) -> Report {
     var retainedHeaders = 0
     var retainedQuantizations = 0
     var retainedFooters = 0
-    var retainedChunkIndexes = 0
-    var chunkIndexLimitReported = false
+    var retainedSummaryRecords = 0
+    var summaryRecordLimitReported = false
     var privateCount: UInt64 = 0
     var firstPrivate: (opcode: UInt8, length: UInt64)?
     var provenanceCount: UInt64 = 0
@@ -2913,9 +2934,9 @@ func validate(_ source: ToolReader) -> Report {
                 case Opcode.footer:
                     defer { retainedFooters += 1 }
                     return retainedFooters == 0
-                case Opcode.chunkIndex:
-                    defer { retainedChunkIndexes += 1 }
-                    return retainedChunkIndexes < maximumRetainedValidationRecords
+                case Opcode.chunkIndex, Opcode.statistics, Opcode.summaryOffset:
+                    defer { retainedSummaryRecords += 1 }
+                    return retainedSummaryRecords < maximumRetainedValidationRecords
                 default:
                     return false
                 }
@@ -3013,14 +3034,16 @@ func validate(_ source: ToolReader) -> Report {
                     if firstUnknown == nil { firstUnknown = opcode }
                     if unknownCount < UInt64.max { unknownCount += 1 }
                 }
-                if opcode == Opcode.chunkIndex
-                    && retainedChunkIndexes > maximumRetainedValidationRecords
-                    && !chunkIndexLimitReported
+                if (opcode == Opcode.chunkIndex || opcode == Opcode.statistics
+                    || opcode == Opcode.summaryOffset)
+                    && retainedSummaryRecords > maximumRetainedValidationRecords
+                    && !summaryRecordLimitReported
                 {
                     report.error(
                         "the file contains more than \(maximumRetainedValidationRecords) "
-                            + "ChunkIndex records; refusing to retain an unbounded index")
-                    chunkIndexLimitReported = true
+                            + "ChunkIndex, Statistics, or SummaryOffset records; refusing to "
+                            + "retain an unbounded summary family")
+                    summaryRecordLimitReported = true
                 }
             })
     } catch {
@@ -3151,11 +3174,15 @@ func validate(_ source: ToolReader) -> Report {
     } else {
         indexRange = 0..<0
     }
-    for frame in walked.intactRecords where frame.opcode == Opcode.chunkIndex {
+    let summaryOpcodes: Set<UInt8> = [
+        Opcode.chunkIndex, Opcode.statistics, Opcode.summaryOffset,
+    ]
+    for frame in walked.intactRecords where summaryOpcodes.contains(frame.opcode) {
         let (end, overflow) = frame.offset.addingReportingOverflow(frame.total)
         if overflow || !indexRange.contains(frame.offset) || end > indexRange.upperBound {
             report.error(
-                "ChunkIndex at byte \(frame.offset) lies outside the Footer-declared summary")
+                "\(opcodeName(frame.opcode)) at byte \(frame.offset) lies outside the "
+                    + "Footer-declared summary")
         }
     }
 
