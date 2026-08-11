@@ -167,6 +167,20 @@ The identifier matters more than it looks. "Both decoders raised an error" is no
 them may have refused for the wrong reason, which is precisely the failure a negative test exists to
 catch. The identifier names the rule, and it is the same string in every language.
 
+The two **indexed** refusal-answering runners inspect the version prefix before Header dispatch. If
+it is the exact version-1 magic, they read through the Header's length-prefixed `profile` and
+`library` fields to choose the gaussian-birth or keyframe-delta indexed decoder. If the prefix
+differs — including `BadMagic` and `FutureMajorVersion` — they bypass that Header read and route to
+the gaussian-birth indexed opener. The selected opener owns the magic rule, so it produces the
+refusal without asking dispatch code to parse an unrecognized layout.
+
+For a recognized version-1 file, the Header pre-read is still dispatch rather than the validation
+this suite credits. Mutation pins that distinction: deleting `check_magic` from either indexed
+opener turns exactly the two prefix variants red; deleting its temporal-model or quantization-scheme
+check turns their variants red; and deleting the shared window-index or stream-codec check turns the
+corresponding variant red on both paths. The streamed runners still validate magic while selecting
+the streamed decoder; this claim is about the indexed path.
+
 Every rule in this corpus already existed in version 1 — nothing here is new specification, so the
 contract is proved against rules that predate it. It found three real faults on its first run:
 neither an unknown `temporal_model` nor an unknown quantization `scheme` was refused at all, both
