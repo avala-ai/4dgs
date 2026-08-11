@@ -199,6 +199,13 @@ without guarding it, so the exception escapes and the whole run stops with a tra
 one variant going red. A stray debug print does not cost a runner author one variant; it costs them
 the run.
 
+**Except under `--update`, where it costs them the corpus.** That mode writes the runner's stdout to
+the expectation file and counts the variant as passed without parsing it at all — the write happens
+before either `json.loads` call, so nothing is validated on the way in. A runner that emits a banner
+under `--update` does not stop the run; it commits the banner as the expectation every other
+implementation is then diffed against. Treat `--update` as what it is: a deliberate rewrite of the
+contract, to be read in the diff before it is committed, and never a way to make a red suite green.
+
 **Stderr is free.** The harness captures it, parses none of it, and prints its first 2000 characters
 only when the runner exits non-zero. So stderr is where diagnostics belong — with the caveat that on
 a passing run nobody will ever see them.
@@ -217,10 +224,14 @@ indistinguishable from a broken one. Telling those apart is the entire reason th
 exists, and it cannot be done if the runner throws the distinction away in its exit status.
 
 The harness tells no non-zero code from another: `if result.returncode != 0` is the whole test, so
-1, 2 and a segfault's 139 are the same failure with a different number printed beside it. The
-runners here nonetheless use 2 for a usage error — the wrong number of arguments — and 1 for a
-decode that genuinely failed. Nothing checks that, and an outside runner that follows the convention
-buys only a log that reads more clearly.
+1, 2 and a crash are the same failure with a different number printed beside it. The number printed
+for a crash is worth knowing before you go looking for it in a log: the harness spawns the runner
+directly rather than through a shell, so on POSIX a process killed by a signal reports the negated
+signal number — a segfault is `-11`, not the `139` a shell would have translated it into — while
+Windows reports the exception code the process died with. The runners here nonetheless use 2 for a
+usage error — the wrong number of arguments — and 1 for a decode that genuinely failed. Nothing
+checks that, and an outside runner that follows the convention buys only a log that reads more
+clearly.
 
 Non-zero must also not be used to mean "I do not support this variant". Declining happens before the
 process starts; see [below](#declining-a-variant).
@@ -247,8 +258,19 @@ runner whose name ends in `decode_indexed`. Exactly one valid variant, `TenWindo
 that position, and it is skipped for the indexed path in every language.
 
 The invalid corpus is the exception, deliberately. It is cut from a base file that carries an index
-precisely so that both paths can be asked to refuse all seven, and both are. A refusal check written
-into only one read path refuses half the files it should, and there is no other way to notice.
+precisely so that both paths can be asked to refuse all seven, and both are asked. A refusal check
+written into only one read path refuses half the files it should, and there is no other way to
+notice.
+
+Two of the seven do not currently prove that for the indexed path, and an outside author should know
+which. Both refusal-answering runners here read the Header before choosing a path — they have to,
+because a `keyframe-delta` file is summarized by a different function — and that pre-read validates
+the magic. So `BadMagic` and `FutureMajorVersion` are refused by the runner's own front-matter read,
+with the right identifier, before the indexed opener is called at all: deleting `check_magic` from
+the indexed path leaves the suite at 119 passed, 0 failed. The other five are genuinely reached
+through it — deleting the indexed path's `check_temporal_model` turns `UnknownTemporalModel` and
+`EmptyTemporalModel` red immediately. This is a property of how the runners are written rather than
+of the corpus, which is why it is recorded here rather than treated as coverage.
 
 Encoding is proved by a different program — `tests/conformance/encode_roundtrip.py`, which drives an
 `<encoder> <in.4dgs> <out.4dgs>` CLI and diffs its output against the Rust reference encoder through
@@ -375,9 +397,18 @@ decoding silently as the known value, and a corrupt first byte was reported as a
 version 1.
 
 Truncation is deliberately not here. A cut file is recoverable rather than refusable, so no
-expectation can express it. The runners in this repository make their own truncated copy of each
-valid variant, assert what survives, and exit non-zero if it does not — a check the harness cannot
-see except as a failure. An outside runner is welcome to do the same and is not required to.
+expectation can express it. The **streamed** runners in this repository make their own truncated
+copy of each **`gaussian-birth`** variant, assert what survives, and exit non-zero if it does not —
+a check the harness cannot see except as a failure. An outside runner is welcome to do the same and
+is not required to.
+
+Both qualifiers are load-bearing, and neither is an oversight. The indexed runners make no cut copy:
+the indexed path needs the Footer and the summary block at the tail, which is exactly what a cut
+removes, so there is nothing for it to recover and nothing to assert. And a `keyframe-delta` variant
+returns its states summary before the truncation hook is reached — recovery is a `gaussian-birth`
+statement, and a cut keyframe-delta file is a different file whose chains no longer terminate. So of
+the sixty variants, the truncation check runs over the forty-nine valid `gaussian-birth` ones — the
+top-level cross-product and the object-layer family — on one of the two read paths.
 
 ### The canonical JSON contract
 
@@ -436,10 +467,32 @@ for exactly this reason, and `null` there means "never fades" rather than "missi
 not rely on their order, so a summary that did would be asking two correct decoders to disagree.
 Everything per-gaussian — the sample, the aggregates, the spherical-harmonic digest — is taken in
 the content order `_stable_order` defines: sort by the gaussian's whole decoded state, rounded
-exactly as the summary rounds it, with its spherical-harmonic coefficients and object id last. Two
-gaussians that tie on all of that are identical in every value the summary emits, so their relative
-order cannot change the output. A runner therefore materializes every gaussian and sorts them, which
-is precisely what the SDK underneath it must never do. The runner is not the SDK.
+exactly as the summary rounds it, with its spherical-harmonic coefficients and object id last.
+
+That order is not quite total, and the gap is worth stating rather than glossing. The key is the
+_rounded_ state, so two gaussians can tie on every field of it and still hold different exact
+values; the sort is stable, so the tie is then broken by decode order, which is the one thing this
+rule says must not matter. For the `sample` rows it is harmless — their values are the keyed fields,
+so tied rows are interchangeable by construction. The aggregates are where it bites: `positionSum`
+and `opacitySum` accumulate the _unrounded_ values in that order, and floating-point addition is not
+associative, so a legal reordering that produces a different tie-break can in principle move the
+sixth decimal of a total. It is latent rather than live: across the forty-nine valid
+`gaussian-birth` variants no two gaussians tie on that key at all, so nothing today has a tie to
+break. [Issue #95](https://github.com/avala-ai/4dgs/issues/95) tracks it and its sibling in the
+states summary; fixing either means changing the reference all six SDKs are diffed against and
+regenerating every expectation at once, which is why it has not been done as a side effect of
+anything. A runner reproducing `_stable_order` should reproduce it exactly — including the stable
+sort — rather than substitute a total order of its own, because a divergence here would show up as
+an unexplainable diff in the sixth decimal rather than as a clean failure.
+
+A runner therefore materializes every gaussian and sorts them, which is precisely what the SDK
+underneath it must never do. The runner is not the SDK: bounded memory is a property the decoder has
+to hold for arbitrary input, and the canonical summary is by definition a whole-population statement
+— aggregates over every gaussian, in an order derived from every gaussian's decoded values. What
+keeps that honest is the corpus rather than the runner: sixty files under a 2.5 MB total budget, the
+largest of them under 100 KiB, generated rather than supplied. A runner is allowed to be slow and
+fat over that. The library it calls is not, and nothing here exercises the library's memory
+behaviour — that is what each SDK's own tests are for.
 
 **Bulk payloads become digests.** Spherical-harmonic coefficients, attachment contents and audio
 payloads are summarized as a CRC-32 over the bytes in content order, rendered as a decimal string.
