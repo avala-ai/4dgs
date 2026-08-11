@@ -239,6 +239,8 @@ export {
 export {
   KEYFRAME_DELTA_BIN_MAX,
   KEYFRAME_DELTA_BIN_MIN,
+  MAX_KEYFRAME_DELTA_INDEX_ENTRIES,
+  MAX_KEYFRAME_DELTA_SUMMARY_BYTES,
   KeyframeDeltaIndexedDecoder,
   KeyframeDeltaState,
   type Interval,

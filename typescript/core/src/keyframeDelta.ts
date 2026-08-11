@@ -1001,6 +1001,24 @@ export interface OpenKeyframeDeltaIndexedOptions {
 const KEYFRAME_DELTA_HEAD_PROBE_BYTES = 64 * 1024;
 const MAX_KEYFRAME_DELTA_RECORD_BYTES = 64 * 1024 * 1024;
 
+/** Maximum retained keyframe-delta summary and Chunk Index sizes for one open. */
+export const MAX_KEYFRAME_DELTA_SUMMARY_BYTES = 64 * 1024 * 1024;
+export const MAX_KEYFRAME_DELTA_INDEX_ENTRIES = 262_144;
+
+function appendKeyframeDeltaIndexEntry(
+  index: ChunkIndexEntry[],
+  entry: ChunkIndexEntry,
+  recordOffset: number,
+): void {
+  if (index.length === MAX_KEYFRAME_DELTA_INDEX_ENTRIES) {
+    throw new MalformedFile(
+      `the Chunk Index contains more than ${MAX_KEYFRAME_DELTA_INDEX_ENTRIES} entries; ` +
+        `refusing record at byte ${recordOffset} before retaining an unbounded index`,
+    );
+  }
+  index.push(entry);
+}
+
 function checkFetchedFrontMatterSize(record: FrontMatterRecord): void {
   if (record.contentLength <= MAX_KEYFRAME_DELTA_RECORD_BYTES) return;
   throw new MalformedFile(
@@ -1108,6 +1126,13 @@ export class KeyframeDeltaIndexedDecoder {
     if (footer.summaryStart === footerOffset) {
       throw new MalformedFile("keyframe-delta file carries no Chunk Index summary");
     }
+    const summaryLength = footerOffset - footer.summaryStart;
+    if (summaryLength > MAX_KEYFRAME_DELTA_SUMMARY_BYTES) {
+      throw new MalformedFile(
+        `keyframe-delta summary is ${summaryLength} bytes, past the ` +
+          `${MAX_KEYFRAME_DELTA_SUMMARY_BYTES}-byte total summary limit`,
+      );
+    }
 
     if (footer.summaryCrc !== 0) {
       const crc = new Crc32();
@@ -1135,7 +1160,11 @@ export class KeyframeDeltaIndexedDecoder {
             `past the ${MAX_KEYFRAME_DELTA_RECORD_BYTES}-byte per-record reader limit`,
         );
       }
-      index.push(parseChunkIndexEntry(await summary.content(record)));
+      appendKeyframeDeltaIndexEntry(
+        index,
+        parseChunkIndexEntry(await summary.content(record)),
+        record.offset,
+      );
     }
     if (summaryEnd !== footerOffset) {
       throw new MalformedFile(
@@ -1263,8 +1292,9 @@ export async function decodeKeyframeDeltaIndexed(
 
   const index: ChunkIndexEntry[] = [];
   for (const record of iterateRecords(data, summaryStart)) {
-    if (record.opcode === Opcode.ChunkIndex) index.push(parseChunkIndexEntry(record.content));
-    else break;
+    if (record.opcode === Opcode.ChunkIndex) {
+      appendKeyframeDeltaIndexEntry(index, parseChunkIndexEntry(record.content), record.offset);
+    } else break;
   }
   // The indexed path has read the Footer, so it is a complete file: require full timeline
   // coverage, not just adjacency (spec §11.1). The streamed path stays adjacency-only.

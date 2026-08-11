@@ -19,7 +19,9 @@ import { test } from "node:test";
 
 import {
   BytesReadable,
+  FOOTER_TAIL_BYTES,
   KeyframeDeltaIndexedDecoder,
+  MAX_KEYFRAME_DELTA_SUMMARY_BYTES,
   MalformedFile,
   chainFor,
   decodeKeyframeDeltaIndexed,
@@ -27,6 +29,7 @@ import {
   keyframeDeltaChunkAt,
   keyframeDeltaStatesJson,
   reconstructKeyframeDelta,
+  type IReadable,
   type KeyframeDeltaSequence,
 } from "@4dgs/core";
 
@@ -198,6 +201,32 @@ test("the range-backed indexed decoder reads only the requested chain", async ()
   assert.deepEqual([...ranged.ids], [...expected.ids]);
   assert.deepEqual([...ranged.centers], [...expected.centers]);
   assert.deepEqual([...ranged.rotations], [...expected.rotations]);
+});
+
+test("the range-backed decoder refuses an oversized total summary before scanning it", async () => {
+  const data = bytes(MOVING_CHAINED);
+  const prefixEnd = data.byteLength - FOOTER_TAIL_BYTES;
+  const tail = data.slice(prefixEnd);
+  const footerOffset = data.byteLength + MAX_KEYFRAME_DELTA_SUMMARY_BYTES;
+  const source: IReadable = {
+    async size(): Promise<bigint> {
+      return BigInt(footerOffset + FOOTER_TAIL_BYTES);
+    },
+    async read(offset: bigint, length: bigint): Promise<Uint8Array> {
+      const at = Number(offset);
+      const count = Number(length);
+      if (at === footerOffset && count === FOOTER_TAIL_BYTES) return tail;
+      if (at >= 0 && at + count <= prefixEnd) return data.slice(at, at + count);
+      throw new Error(`unexpected sparse-file read [${at}, ${at + count})`);
+    },
+  };
+
+  await assert.rejects(
+    () => KeyframeDeltaIndexedDecoder.open(source, { headProbeBytes: 64 }),
+    (error: unknown) =>
+      error instanceof MalformedFile &&
+      error.message.includes(`${MAX_KEYFRAME_DELTA_SUMMARY_BYTES}-byte total summary limit`),
+  );
 });
 
 test("keyframe-delta readers refuse an unknown quantization scheme before reconstruction", async () => {
