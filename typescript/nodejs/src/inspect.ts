@@ -92,7 +92,14 @@ const CRC_BLOCK_BYTES = 64 * 1024;
  * reported rather than raised.
  */
 export async function inspectFile(source: IReadable): Promise<InspectReport> {
-  const size = Number(await source.size());
+  const sizeBig = await source.size();
+  if (sizeBig > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new FourdgsError(
+      `resource size ${sizeBig} exceeds the largest exactly addressable size ` +
+        `${Number.MAX_SAFE_INTEGER} in this implementation`,
+    );
+  }
+  const size = Number(sizeBig);
   checkMagic(await source.read(0n, BigInt(Math.min(MAGIC.length, size))));
 
   const summary = await readSummaryCrc(source, size);

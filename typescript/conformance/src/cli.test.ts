@@ -38,7 +38,9 @@ import {
   parseQuantization,
   shBound,
   shStep,
+  type IReadable,
 } from "@4dgs/core";
+import { inspectFile } from "@4dgs/nodejs";
 import {
   EXIT_FAILED,
   EXIT_OK,
@@ -515,6 +517,27 @@ test("regression: --decode reaches inside SH band streams, not only chunk stream
   assert.equal(decoded.err.at(-1), "INVALID");
 });
 
+test("regression: --decode assembles SH bands before accepting them", (t) => {
+  const path = corpus("MixedLifetimes-SHDegree2-UseChunkIndex-UseCrc");
+  if (path === null || !existsSync(EXECUTABLE)) return t.skip("corpus not generated");
+  const data = bytesOf("MixedLifetimes-SHDegree2-UseChunkIndex-UseCrc");
+  const firstBand = recordsOf(data).find((record) => record.opcode === Opcode.ShBandStream)!;
+  const firstIndex = recordsOf(data).find((record) => record.opcode === Opcode.ChunkIndex)!;
+  // Make the first chunk carry bands 2 and 3 rather than 1 and 2. Both streams remain
+  // individually decodable, and the index agrees with the record, so only semantic
+  // assembly can notice that these do not form a whole degree starting at band 1.
+  data[firstBand.offset + RECORD_HEADER_BYTES] = 3;
+  data[firstIndex.offset + RECORD_HEADER_BYTES + 40] = 3;
+  const report = validated(file("MissingLowerShBand.4dgs", resealSummary(data)), "--decode");
+  assert.equal(report.code, EXIT_FAILED);
+  assert.ok(
+    report.out.some((line) =>
+      line.includes("chunk 1 SH bands do not assemble: SH bands 2, 3 do not form whole degrees"),
+    ),
+    report.out.join("\n"),
+  );
+});
+
 test("regression: the object layer's cross-record rules are checked, not stepped over", (t) => {
   // `scene.ts` refuses two tracks for one object, and so does the Python validator. A
   // structural pass that skipped the record declared a file valid that neither can read.
@@ -591,6 +614,22 @@ test("regression: a record after the Footer, a reserved Header flag, a foreign s
     !smuggled.out.some((line) => line.includes("summary CRC mismatch")),
     "the checksum passes; that is the point",
   );
+
+  // A zero CRC legally means "not computed"; summary_start still defines the range and
+  // its composition remains normative.
+  const unchecked = inside.slice();
+  const footerContent = unchecked.length - FOOTER_TAIL_BYTES + RECORD_HEADER_BYTES;
+  new DataView(unchecked.buffer, unchecked.byteOffset, unchecked.byteLength).setUint32(
+    footerContent + 16,
+    0,
+    true,
+  );
+  const withoutCrc = validated(file("SummaryPayloadNoCrc.4dgs", unchecked));
+  assert.equal(withoutCrc.code, EXIT_FAILED);
+  assert.ok(
+    withoutCrc.out.some((line) => /the summary carries a \S+ record at \d+/.test(line)),
+    withoutCrc.out.join("\n"),
+  );
 });
 
 test("regression: an index entry whose length does not frame its record is refused", (t) => {
@@ -609,6 +648,56 @@ test("regression: an index entry whose length does not frame its record is refus
   assert.ok(
     report.out.some((line) => /chunk index entry 0 declares 1 bytes at \d+/.test(line)),
     report.out.join("\n"),
+  );
+});
+
+test("regression: indexed counts and SH ranges duplicate their referenced records exactly", (t) => {
+  const path = corpus("MixedLifetimes-SHDegree2-UseChunkIndex-UseCrc");
+  if (path === null || !existsSync(EXECUTABLE)) return t.skip("corpus not generated");
+
+  const wrongCount = bytesOf("MixedLifetimes-SHDegree2-UseChunkIndex-UseCrc");
+  const countIndex = recordsOf(wrongCount).find((record) => record.opcode === Opcode.ChunkIndex)!;
+  const countAt = countIndex.offset + RECORD_HEADER_BYTES + 32;
+  const countView = new DataView(wrongCount.buffer, wrongCount.byteOffset, wrongCount.byteLength);
+  countView.setUint32(countAt, countView.getUint32(countAt, true) + 1, true);
+  const countReport = validated(file("WrongIndexedCount.4dgs", resealSummary(wrongCount)));
+  assert.equal(countReport.code, EXIT_FAILED);
+  assert.ok(
+    countReport.out.some((line) =>
+      /chunk index entry 0 declares \d+ gaussians; the Chunk at \d+ contains \d+/.test(line),
+    ),
+    countReport.out.join("\n"),
+  );
+
+  const shortBand = bytesOf("MixedLifetimes-SHDegree2-UseChunkIndex-UseCrc");
+  const bandIndex = recordsOf(shortBand).find((record) => record.opcode === Opcode.ChunkIndex)!;
+  // f64 t0, f64 t1, u64 chunk offset/length, u32 count/band count, u8 band, u64 offset,
+  // then the first indexed SH range's length.
+  const lengthAt = bandIndex.offset + RECORD_HEADER_BYTES + 49;
+  new DataView(shortBand.buffer, shortBand.byteOffset, shortBand.byteLength).setBigUint64(
+    lengthAt,
+    1n,
+    true,
+  );
+  const bandReport = validated(file("ShortIndexedBand.4dgs", resealSummary(shortBand)));
+  assert.equal(bandReport.code, EXIT_FAILED);
+  assert.ok(
+    bandReport.out.some((line) =>
+      /chunk index entry 0 SH band range 0 declares 1 bytes/.test(line),
+    ),
+    bandReport.out.join("\n"),
+  );
+});
+
+test("unit: inspect refuses a resource size that cannot be represented exactly", async () => {
+  const size = BigInt(Number.MAX_SAFE_INTEGER) + 1n;
+  const unreadable: IReadable = {
+    size: () => Promise.resolve(size),
+    read: () => Promise.reject(new Error("inspect must reject the size before reading")),
+  };
+  await assert.rejects(
+    inspectFile(unreadable),
+    new RegExp(`resource size ${size} exceeds the largest exactly addressable size`),
   );
 });
 

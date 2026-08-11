@@ -49,6 +49,7 @@ import {
   isPrivateOpcode,
   isProvenanceOpcode,
   iterateRecords,
+  mergeBands,
   opcodeName,
   parseAudioData,
   parseAudioSource,
@@ -181,6 +182,11 @@ export async function validateFile(
   const provenance = new Provenance();
   const objects = new ObjectLayer();
   let firstChunkSeen = false;
+  const decodedShChunks: {
+    readonly count: number;
+    readonly bands: Map<number, Int32Array>;
+    decoded: boolean;
+  }[] = [];
 
   try {
     for (const record of iterateRecords(data, MAGIC.length)) {
@@ -258,6 +264,12 @@ export async function validateFile(
             break;
           }
           counted += parsed.header.count;
+          const decodedShChunk = {
+            count: parsed.header.count,
+            bands: new Map<number, Int32Array>(),
+            decoded: false,
+          };
+          if (options.decode === true) decodedShChunks.push(decodedShChunk);
           if (parsed.header.t1 < parsed.header.t0) {
             found.error(
               `chunk ${chunkCount} has t1 (${parsed.header.t1}) before t0 (${parsed.header.t0})`,
@@ -273,6 +285,7 @@ export async function validateFile(
                 supportK: supportK(header.cutoff || DEFAULT_CUTOFF),
                 codecs: DEFAULT_CODECS,
               });
+              decodedShChunk.decoded = true;
             } catch (error) {
               found.error(`chunk ${chunkCount} does not decode: ${message(error)}`);
               found.refuse(error, offset, "the Chunk record");
@@ -287,7 +300,7 @@ export async function validateFile(
           // is refused there — and a `--decode` pass that skipped them would report that
           // same file valid. The two refusals a chunk's own streams can raise are exactly
           // the two a band's stream can raise, for the same reason.
-          if (options.decode !== true) break;
+          if (options.decode !== true || decodedShChunks.length === 0) break;
           let band = 0;
           try {
             const parsedBand = parseShBandRecord(content);
@@ -295,7 +308,8 @@ export async function validateFile(
             // A reader caps its degree and never fetches the bands above it, so a band
             // this build would not evaluate is not one it refuses either.
             if (band > MAX_SH_DEGREE) break;
-            await decodeStream(frameOneStream(parsedBand.cursor), DEFAULT_CODECS);
+            const values = await decodeStream(frameOneStream(parsedBand.cursor), DEFAULT_CODECS);
+            decodedShChunks[decodedShChunks.length - 1]!.bands.set(band, values);
           } catch (error) {
             found.error(`chunk ${chunkCount} SH band ${band} does not decode: ${message(error)}`);
             found.refuse(error, offset, "the SH Band Stream record");
@@ -417,6 +431,29 @@ export async function validateFile(
     found.error(`stopped reading: ${message(error)}`);
   }
 
+  // Decoding each SH stream proves only its framing and codec. The decoded values become
+  // gaussian state only after the bands are assembled, and that step enforces the semantic
+  // invariants a normal streamed read enforces: whole degrees starting at band 1, the
+  // coefficient count for this chunk, values in the stored u8 range, and one scene-wide
+  // degree shared by every chunk.
+  if (options.decode === true) {
+    const degrees: number[] = [];
+    decodedShChunks.forEach((chunk, i) => {
+      if (!chunk.decoded) return;
+      try {
+        degrees.push(mergeBands(chunk.count, chunk.bands, MAX_SH_DEGREE).degree);
+      } catch (error) {
+        found.error(`chunk ${i + 1} SH bands do not assemble: ${message(error)}`);
+      }
+    });
+    if (
+      degrees.length === decodedShChunks.filter((chunk) => chunk.decoded).length &&
+      new Set(degrees).size > 1
+    ) {
+      found.error(`chunks disagree on SH degree: ${[...new Set(degrees)].join(", ")}`);
+    }
+  }
+
   if (seen.length === 0) {
     found.error("no records at all");
     return report(found);
@@ -516,7 +553,8 @@ export async function validateFile(
   }
 
   index.forEach((entry, i) => {
-    if (entry.chunkOffset + entry.chunkLength > data.length) {
+    const chunkEnd = entry.chunkOffset + entry.chunkLength;
+    if (!Number.isSafeInteger(chunkEnd) || chunkEnd > data.length) {
       found.error(`chunk index entry ${i} points past the end of the file`);
     } else if (data[entry.chunkOffset] !== Opcode.Chunk) {
       found.error(`chunk index entry ${i} does not point at a Chunk record`);
@@ -529,16 +567,72 @@ export async function validateFile(
       // them, so the seek path — a first-class read path, not an optimization (AGENTS.md
       // §2) — fails on a file the checks above call conforming.
       const framed = recordLengthAt(data, entry.chunkOffset);
-      if (framed !== null && framed !== entry.chunkLength) {
+      if (framed === null) {
+        found.error(`chunk index entry ${i} does not frame a complete Chunk record`);
+      } else if (framed !== entry.chunkLength) {
         found.error(
           `chunk index entry ${i} declares ${entry.chunkLength} bytes at ` +
             `${entry.chunkOffset}; the record there is ${framed} bytes (§5.8)`,
         );
+      } else {
+        try {
+          const parsed = parseChunk(
+            data.subarray(entry.chunkOffset + RECORD_HEADER_BYTES, entry.chunkOffset + framed),
+          );
+          if (parsed.header.count !== entry.gaussianCount) {
+            found.error(
+              `chunk index entry ${i} declares ${entry.gaussianCount} gaussians; the Chunk ` +
+                `at ${entry.chunkOffset} contains ${parsed.header.count}`,
+            );
+          }
+        } catch (error) {
+          found.error(
+            `chunk index entry ${i} references a Chunk that does not parse: ${message(error)}`,
+          );
+        }
       }
     }
+
+    entry.bands.forEach((band, j) => {
+      const bandEnd = band.offset + band.length;
+      const where = `chunk index entry ${i} SH band range ${j}`;
+      if (!Number.isSafeInteger(bandEnd) || bandEnd > data.length) {
+        found.error(`${where} points past the end of the file`);
+        return;
+      }
+      if (data[band.offset] !== Opcode.ShBandStream) {
+        found.error(`${where} does not point at an SH Band Stream record`);
+        return;
+      }
+      const framed = recordLengthAt(data, band.offset);
+      if (framed === null) {
+        found.error(`${where} does not frame a complete SH Band Stream record`);
+        return;
+      }
+      if (framed !== band.length) {
+        found.error(
+          `${where} declares ${band.length} bytes at ${band.offset}; the record there is ` +
+            `${framed} bytes (§5.8)`,
+        );
+        return;
+      }
+      try {
+        const parsed = parseShBandRecord(
+          data.subarray(band.offset + RECORD_HEADER_BYTES, band.offset + framed),
+        );
+        if (parsed.band !== band.band) {
+          found.error(
+            `${where} says band ${band.band}; the record at ${band.offset} says band ` +
+              `${parsed.band}`,
+          );
+        }
+      } catch (error) {
+        found.error(`${where} references a record that does not parse: ${message(error)}`);
+      }
+    });
   });
 
-  if (footer !== null && footer.summaryCrc !== 0 && footer.summaryStart !== 0) {
+  if (footer !== null && footer.summaryStart !== 0) {
     // The Footer record itself is not covered: nine bytes of framing plus its twenty bytes
     // of content plus the trailing magic.
     const tail = data.length - FOOTER_TAIL_BYTES;
@@ -547,6 +641,7 @@ export async function validateFile(
         `the Footer's summary starts at ${footer.summaryStart}, after the summary ends at ${tail}`,
       );
     } else if (
+      footer.summaryCrc !== 0 &&
       new Crc32().update(data.subarray(footer.summaryStart, tail)).digest() !== footer.summaryCrc
     ) {
       found.error("summary CRC mismatch: the index is untrustworthy (a streamed read still works)");
