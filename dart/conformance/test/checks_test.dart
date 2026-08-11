@@ -47,6 +47,29 @@ void main() {
     expect(probes.every(adjacent.covers), isTrue);
   });
 
+  test('visible probes hit point support that fixed fractions miss', () {
+    final rotations = Float32List(4)..[3] = 1.0;
+    final gaussian = FourdgsGaussianSet(
+      positions: Float32List(3),
+      scales: Float32List(3)..fillRange(0, 3, 1e-3),
+      rotations: rotations,
+      colors: Float32List(4),
+      motions: Float32List(3),
+      muT: Float32List.fromList(const <double>[0.5]),
+      sigmaT: Float32List(1),
+      winLo: Float32List(1),
+      winHi: Float32List.fromList(const <double>[1.0]),
+    );
+    final interval = entry(t0: 0.0, t1: 1.0);
+
+    expect(seekProbeInstants(interval, (_) => 0.0), isNot(contains(0.5)));
+    expect(
+      seekVisibleProbeInstants(interval, gaussian, 0.05),
+      equals(const <double>[0.5]),
+    );
+    expect(gaussian.stateAt(0.5).count, 1);
+  });
+
   test('sigma-log guard distance uses pitch magnitude', () {
     final positive = seekGuardSigmaHalfRelative(0.1);
     expect(positive, greaterThan(0));

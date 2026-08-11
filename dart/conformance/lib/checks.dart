@@ -99,6 +99,55 @@ List<double> seekProbeInstants(
   return inside(const <double>[-3.5, -0.5, 0.5, 3.5]);
 }
 
+/// Up to [limit] instants drawn from actual reconstructed supports in [entry].
+///
+/// Fractional entry probes can all miss a point-supported or very narrow
+/// gaussian. These candidates start at each gaussian's marginal peak and fall
+/// back to the interior of its support/window intersection, so an empty/empty
+/// comparison is never the only evidence collected for a populated entry.
+List<double> seekVisibleProbeInstants(
+  FourdgsChunkIndexEntry entry,
+  FourdgsGaussianSet gaussians,
+  double cutoff, {
+  int limit = 4,
+}) {
+  final result = <double>[];
+  final seen = <double>{};
+  final k = supportK(cutoff);
+  for (int i = 0; i < gaussians.count && result.length < limit; i++) {
+    final sigma = gaussians.sigmaT[i];
+    final mu = gaussians.muT[i];
+    final half = sigma.isFinite ? k * sigma : double.infinity;
+    final lo = math.max(entry.t0, math.max(gaussians.winLo[i], mu - half));
+    final hi = math.min(entry.t1, math.min(gaussians.winHi[i], mu + half));
+    if (lo > hi) continue;
+
+    double? candidate;
+    if (mu.isFinite && lo <= mu && mu <= hi && entry.covers(mu)) {
+      candidate = mu;
+    } else if (lo.isFinite && hi.isFinite && lo < hi) {
+      candidate = lo + (hi - lo) * 0.5;
+    } else if (lo.isFinite) {
+      candidate = lo + math.max(1.0, lo.abs() * 1e-6);
+    } else if (hi.isFinite) {
+      candidate = hi - math.max(1.0, hi.abs() * 1e-6);
+    } else {
+      candidate = 0.0;
+    }
+
+    final t = candidate;
+    if (!t.isFinite || !entry.covers(t)) continue;
+    if (!(gaussians.winLo[i] <= t && t < gaussians.winHi[i])) continue;
+    final marginal =
+        sigma.isFinite
+            ? math.exp(-0.5 * math.pow((t - mu) / math.max(sigma, 1e-30), 2))
+            : 1.0;
+    if (marginal < cutoff || !seen.add(t)) continue;
+    result.add(t);
+  }
+  return result;
+}
+
 /// Largest relative sigma movement caused by half a log-space quantization bin.
 double seekGuardSigmaHalfRelative(double pitch) =>
     math.exp(0.5 * pitch.abs()) - 1.0;
@@ -317,7 +366,10 @@ Future<int> checkSeekReadsOnlyWhatItNeeds(
   for (final entry in probeEntries) {
     final span = entry.t1 - entry.t0;
     if (span <= 0.0) continue;
-    final candidates = seekProbeInstants(entry, guardAt);
+    final candidates = <double>{
+      ...seekVisibleProbeInstants(entry, whole, scene.header.cutoff),
+      ...seekProbeInstants(entry, guardAt),
+    };
     for (final t in candidates) {
       if (!t.isFinite) continue;
       if (seekProbeNearAnyBoundary(t, boundaries, guardEdges)) continue;
@@ -342,6 +394,9 @@ Future<int> checkSeekReadsOnlyWhatItNeeds(
         scene.header.cutoff,
       );
       final fromWhole = _visibleKeys(whole, t, scene.header.cutoff);
+      // Empty on both sides proves only that this instant missed the content,
+      // not that the index filed that content in the right interval.
+      if (fromWhole.isEmpty && fromSeek.isEmpty) continue;
       if (fromSeek.length != fromWhole.length ||
           !_sameKeys(fromSeek, fromWhole)) {
         throw ConformanceFailure(
