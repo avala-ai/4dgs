@@ -95,3 +95,32 @@ class FourdgsUnsupportedCodec extends FourdgsException {
 class FourdgsMalformedFile extends FourdgsException {
   const FourdgsMalformedFile(super.message, {super.refusalCode});
 }
+
+/// The refusal a `window_index` outside the Window Table gets, wherever it is
+/// reached from.
+///
+/// One sentence in one place because there are three reach sites: the
+/// `gaussian-birth` chunk decoder, and both grid lookups on the keyframe-delta
+/// path. Six SDKs are compared on the identifier, but the person holding the
+/// file is looking for a record — and three separately written spellings of one
+/// refusal is three chances for one of them to leave the location out, which is
+/// how the chunk decoder's came to say only the value and the table size.
+///
+/// [gaussian] locates the offending record: `"gaussian 5 of the chunk at byte
+/// 4096"` on the chunk path, `"gaussian 77"` on the keyframe-delta path, where
+/// the stable id is what the file carries and the row is an artefact of
+/// composition order. Empty for a caller with no record to blame, which drops
+/// the clause rather than printing a dangling `gaussian -1`.
+FourdgsMalformedFile windowIndexOutOfRange(
+  int index,
+  int tableLength, {
+  String gaussian = '',
+}) {
+  return FourdgsMalformedFile(
+    gaussian.isEmpty
+        ? 'window index $index is outside the $tableLength-entry window table'
+        : '$gaussian names window index $index, which is outside the '
+            '$tableLength-entry window table',
+    refusalCode: refusalWindowIndexOutOfRange,
+  );
+}

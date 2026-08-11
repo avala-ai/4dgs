@@ -441,6 +441,7 @@ Future<FourdgsDecodedChunk> readFourdgsChunk(
     cutoff: scene.header.cutoff,
     compression: body.header.compression,
     shBandRecords: bandRecords,
+    chunkOffset: entry.chunkOffset,
   );
 }
 

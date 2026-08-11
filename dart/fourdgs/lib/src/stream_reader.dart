@@ -183,6 +183,7 @@ FourdgsScene readFourdgsBytes(
               windows,
               cutoff: header?.cutoff ?? fourdgsDefaultCutoff,
               compression: body.header.compression,
+              chunkOffset: record.offset,
             ),
           );
           chunkCounts.add(body.header.count);

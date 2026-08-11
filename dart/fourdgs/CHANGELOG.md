@@ -125,7 +125,19 @@ start.
   — the scene renders and the fault is gone. Python and Rust have always refused it, and this
   package's own `keyframe-delta` path already did, so one file decoded two ways depending on its
   temporal model. An absent or empty Window Table is still one default `(0, 0)` window (spec §5.4),
-  so index 0 resolves and everything past it does not.
+  so index 0 resolves and everything past it does not. The refusal names the offending record and
+  not only the offending value: the identifier says which rule broke, but a file has many chunks and
+  all of them decode through one function, so "window index 7 is outside the 1-entry window table"
+  left its holder a whole file to search. It is built in one place now — three sites reach it, the
+  chunk decoder and both keyframe-delta grid lookups — and reads
+  `gaussian 5 of the chunk at byte 4096 names window index 7, …` on the chunk path and
+  `gaussian 77 names …` on the keyframe-delta path, where the stable id is what the file carries and
+  the row is an artefact of composition order.
+- **Every refusal a chunk raises says which chunk.** `decodeChunkStreams` takes the chunk record's
+  file offset and names it in all of them — the duplicate attribute stream, the element and channel
+  count mismatches, the missing required attributes, the decoded-size ceiling, the chunk-level codec
+  and the two per-gaussian refusals. None of them could be placed in a multi-chunk file, and fixing
+  one of them would have left the rest to be found the same way a second time.
 - **A truncated Header is not an unsupported one.** A Header that ended after its `temporal_model`
   string was refused for naming a model this build does not implement, when what it actually is, is
   incomplete — sending whoever holds it to add codec support for a file that needs none. Every

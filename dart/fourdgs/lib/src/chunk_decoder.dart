@@ -71,6 +71,14 @@ class FourdgsDecodedChunk {
 /// marginal threshold, so a decoder that guessed either would decode velocities
 /// the encoder never wrote — on a minority of gaussians, silently. Making them
 /// impossible to omit is the fix; remembering to pass them is not.
+///
+/// [chunkOffset] is where this chunk's record begins in the file. Every refusal
+/// below names it, because a file has many chunks and they all decode through
+/// here: "gaussian 5 names window index 7" is a sentence about some gaussian 5
+/// somewhere, and the person holding the file has no way to narrow it down
+/// (AGENTS.md §6). Defaulted rather than required, for the same reason
+/// [FourdgsQuantization.parse] defaults its `fileOffset` — a caller holding a
+/// bare chunk buffer has no file to be relative to, and says so with `0`.
 FourdgsDecodedChunk decodeChunkStreams(
   Uint8List streams,
   int count,
@@ -80,7 +88,9 @@ FourdgsDecodedChunk decodeChunkStreams(
   required double cutoff,
   String compression = '',
   Map<int, Uint8List> shBandRecords = const <int, Uint8List>{},
+  int chunkOffset = 0,
 }) {
+  final chunkAt = 'the chunk at byte $chunkOffset';
   if (compression.isNotEmpty) {
     // The registry allows a chunk to compress its whole records block, and the
     // reference encoder never does — streams carry their own codec. Reading one
@@ -94,7 +104,8 @@ FourdgsDecodedChunk decodeChunkStreams(
     // diagnosed by name or anonymously depending on which of its two spellings
     // the file used.
     throw FourdgsUnsupportedCodec(
-      'chunk-level "$compression" compression is not supported by this decoder',
+      '$chunkAt uses chunk-level "$compression" compression, which is not '
+      'supported by this decoder',
       refusalCode: refusalUnknownStreamCodec,
     );
   }
@@ -121,7 +132,8 @@ FourdgsDecodedChunk decodeChunkStreams(
   // performed — `count` is attacker-chosen and 64-bit.
   if (count < 0 || count > maxChunkDecodedBytes ~/ perGaussian) {
     throw FourdgsMalformedFile(
-      'a chunk declares $count gaussians, which would decode to more than $maxChunkDecodedBytes bytes ($perGaussian per gaussian at this SH degree)',
+      '$chunkAt declares $count gaussians, which would decode to more than '
+      '$maxChunkDecodedBytes bytes ($perGaussian per gaussian at this SH degree)',
     );
   }
 
@@ -154,7 +166,7 @@ FourdgsDecodedChunk decodeChunkStreams(
     // records, spelled with attribute ids.
     if (got.containsKey(header.attributeId)) {
       throw FourdgsMalformedFile(
-        'a chunk carries attribute ${header.attributeId} twice; the format '
+        '$chunkAt carries attribute ${header.attributeId} twice; the format '
         'defines one stream per attribute',
       );
     }
@@ -166,12 +178,14 @@ FourdgsDecodedChunk decodeChunkStreams(
     }
     if (header.count != count) {
       throw FourdgsMalformedFile(
-        'attribute ${header.attributeId} declares ${header.count} elements, the chunk declares $count',
+        'attribute ${header.attributeId} of $chunkAt declares ${header.count} '
+        'elements, the chunk declares $count',
       );
     }
     if (header.channels != wanted) {
       throw FourdgsMalformedFile(
-        'attribute ${header.attributeId} declares ${header.channels} channels, the registry says $wanted',
+        'attribute ${header.attributeId} of $chunkAt declares '
+        '${header.channels} channels, the registry says $wanted',
       );
     }
     got[header.attributeId] = decodeAttributeStreamBody(cursor, header);
@@ -196,7 +210,9 @@ FourdgsDecodedChunk decodeChunkStreams(
   final missing =
       requiredAttributes.where((int a) => !got.containsKey(a)).toList();
   if (missing.isNotEmpty) {
-    throw FourdgsMalformedFile('chunk is missing required attributes $missing');
+    throw FourdgsMalformedFile(
+      '$chunkAt is missing required attributes $missing',
+    );
   }
 
   // Shapes were checked as the streams were read, so by here every entry has
@@ -264,7 +280,8 @@ FourdgsDecodedChunk decodeChunkStreams(
     final largest = rotIndex.values[i];
     if (largest < 0 || largest > 3) {
       throw FourdgsMalformedFile(
-        'gaussian $i names quaternion component $largest as its largest; only 0-3 exist',
+        'gaussian $i of $chunkAt names quaternion component $largest as its '
+        'largest; only 0-3 exist',
       );
     }
     dequantizeRotation(
@@ -301,9 +318,10 @@ FourdgsDecodedChunk decodeChunkStreams(
     // this a refusal for that reason; Python and Rust have always made it one.
     final wi = window.values[i];
     if (wi < 0 || wi >= windowCount) {
-      throw FourdgsMalformedFile(
-        'window index $wi is outside the $windowCount-entry window table',
-        refusalCode: refusalWindowIndexOutOfRange,
+      throw windowIndexOutOfRange(
+        wi,
+        windowCount,
+        gaussian: 'gaussian $i of $chunkAt',
       );
     }
     windowIndex[i] = wi;

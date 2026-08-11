@@ -159,6 +159,7 @@ const FourdgsSteps _unitSteps = FourdgsSteps(
 FourdgsDecodedChunk _decodeOneGaussian({
   required int windowIndex,
   required List<FourdgsWindow> windows,
+  int chunkOffset = 0,
 }) {
   return decodeChunkStreams(
     _oneGaussianStreams(windowIndex: windowIndex),
@@ -167,7 +168,18 @@ FourdgsDecodedChunk _decodeOneGaussian({
     const <double>[0.0, 0.0, 0.0],
     windows,
     cutoff: 0.05,
+    chunkOffset: chunkOffset,
   );
+}
+
+/// The message [body] refused with, or `null` when it refused with nothing.
+String? _messageOf(void Function() body) {
+  try {
+    body();
+  } on FourdgsException catch (e) {
+    return e.message;
+  }
+  return null;
 }
 
 void main() {
@@ -287,6 +299,54 @@ void main() {
         ),
         refusalWindowIndexOutOfRange,
       );
+    });
+
+    test('the window-index refusal says which gaussian and which chunk', () {
+      // The identifier says which rule broke; it cannot say where. A file has
+      // many chunks and every one of them decodes through the same function, so
+      // "window index 3 is outside the 1-entry window table" is a true sentence
+      // that leaves its holder with a whole file to search (AGENTS.md §6).
+      final message = _messageOf(
+        () => _decodeOneGaussian(
+          windowIndex: 3,
+          windows: const <FourdgsWindow>[FourdgsWindow(0.0, 1.0)],
+          chunkOffset: 4096,
+        ),
+      );
+      expect(message, isNotNull);
+      expect(
+        message,
+        allOf(
+          contains('gaussian 0'),
+          contains('byte 4096'),
+          contains('window index 3'),
+          contains('1-entry window table'),
+        ),
+      );
+    });
+
+    test('one refusal, one sentence, wherever it is reached from', () {
+      // Three sites reach this refusal — the gaussian-birth chunk decoder and
+      // both keyframe-delta grid lookups — and they build the sentence in one
+      // place for that reason. Three separately written spellings is three
+      // chances for one of them to leave the location out, which is exactly how
+      // the chunk decoder's came to name only the value and the table size.
+      final located = windowIndexOutOfRange(4, 1, gaussian: 'gaussian 77');
+      expect(located.refusalCode, refusalWindowIndexOutOfRange);
+      expect(
+        located.message,
+        allOf(
+          contains('gaussian 77'),
+          contains('window index 4'),
+          contains('1-entry window table'),
+        ),
+      );
+      // A caller with no record to blame drops the clause rather than printing
+      // a dangling "gaussian -1".
+      final bare = windowIndexOutOfRange(4, 1);
+      expect(bare.refusalCode, refusalWindowIndexOutOfRange);
+      expect(bare.message, isNot(contains('gaussian')));
+      expect(bare.message, contains('window index 4'));
     });
 
     test('an error the refusal table does not name carries no identifier', () {

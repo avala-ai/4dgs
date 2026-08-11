@@ -879,11 +879,18 @@ class _Grids {
   final List<FourdgsWindow> windows;
   final double cutoff;
 
-  /// The length of the window [index] names, refusing one the table cannot
-  /// answer rather than clamping: clamping substitutes one gaussian's lifetime
-  /// for another's in a file that is already wrong.
-  /// The window [index] names, refusing one the table cannot answer.
-  FourdgsWindow windowAt(int index) {
+  /// The window [index] names, refusing one the table cannot answer rather than
+  /// clamping: clamping substitutes one gaussian's lifetime for another's in a
+  /// file that is already wrong.
+  ///
+  /// [gaussian] is the stable id of the gaussian that named the index, so the
+  /// refusal says which one. A keyframe-delta state restates many gaussians and
+  /// this is reached once per row, so "window index 7 is outside the table" on
+  /// its own is a fact about the file with no way to find it again. The id
+  /// rather than the row, because rows are an artefact of composition order and
+  /// the id is what the file carries (spec §11.5). Defaulted, for a caller that
+  /// has no gaussian to blame.
+  FourdgsWindow windowAt(int index, {int gaussian = -1}) {
     // An absent or empty table is one default (0, 0) window, matching the chunk
     // decoder. Clamping instead would substitute one gaussian's lifetime for
     // another's in a file that is already wrong.
@@ -892,15 +899,16 @@ class _Grids {
             ? const <FourdgsWindow>[FourdgsWindow(0.0, 0.0)]
             : windows;
     if (index < 0 || index >= table.length) {
-      throw FourdgsMalformedFile(
-        'window index $index is outside the ${table.length}-entry window table',
-        refusalCode: refusalWindowIndexOutOfRange,
+      throw windowIndexOutOfRange(
+        index,
+        table.length,
+        gaussian: _named(gaussian),
       );
     }
     return table[index];
   }
 
-  double windowLengthAt(int index) {
+  double windowLengthAt(int index, {int gaussian = -1}) {
     // An absent or empty Window Table is one default (0, 0) window, not an
     // unbounded fallback — the same defaulting the chunk decoder applies. A
     // bare `return 0.0` for an empty table would let any index decode against
@@ -910,13 +918,18 @@ class _Grids {
             ? const <FourdgsWindow>[FourdgsWindow(0.0, 0.0)]
             : windows;
     if (index < 0 || index >= table.length) {
-      throw FourdgsMalformedFile(
-        'window index $index is outside the ${table.length}-entry window table',
-        refusalCode: refusalWindowIndexOutOfRange,
+      throw windowIndexOutOfRange(
+        index,
+        table.length,
+        gaussian: _named(gaussian),
       );
     }
     return table[index].hi - table[index].lo;
   }
+
+  /// `"gaussian 12"`, or nothing when the caller had no id to give.
+  static String _named(int gaussian) =>
+      gaussian < 0 ? '' : 'gaussian $gaussian';
 }
 
 _Grids _gridsFor(KeyframeDeltaSequence sequence) {
@@ -994,7 +1007,7 @@ _Reconstruction _reconstructAt(
   for (final i in order) {
     // Validated, not clamped: a row dropped for being outside a window it never
     // named would make a malformed file look like a valid, emptier one.
-    final w = grids.windowAt(windowIndex[i]);
+    final w = grids.windowAt(windowIndex[i], gaussian: state.ids[i]);
     if (w.lo <= t && t < w.hi) kept.add(i);
   }
 
@@ -1016,7 +1029,7 @@ _Reconstruction _reconstructAt(
         sigmaBin,
         steps.sigmaLog,
         neverFades,
-        grids.windowLengthAt(windowIndex[i]),
+        grids.windowLengthAt(windowIndex[i], gaussian: state.ids[i]),
         k: k,
       ),
       steps.motion,
