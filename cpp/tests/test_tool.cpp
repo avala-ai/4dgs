@@ -116,6 +116,12 @@ std::uint64_t readU64(const std::vector<std::uint8_t>& bytes, std::size_t at) {
   return value;
 }
 
+std::uint32_t readU32(const std::vector<std::uint8_t>& bytes, std::size_t at) {
+  std::uint32_t value = 0;
+  for (int i = 3; i >= 0; --i) value = (value << 8) | bytes[at + static_cast<std::size_t>(i)];
+  return value;
+}
+
 void writeU64(std::vector<std::uint8_t>* bytes, std::size_t at, std::uint64_t value) {
   for (int i = 0; i < 8; ++i)
     (*bytes)[at + static_cast<std::size_t>(i)] = static_cast<std::uint8_t>(value >> (8 * i));
@@ -563,6 +569,85 @@ void anUnindexedKeyframeDeltaUsesTheStreamedDecoder() {
     }
   }
   CHECK(warnedOnly);
+}
+
+void anUnindexedFileStillReceivesAFrontMatterVerdict() {
+  if (corpusMissing()) return;
+  if (noDecoder()) return;
+  std::vector<std::uint8_t> bytes = readBytes(corpusDirectory() / kProvenanceVariant);
+  CHECK(!bytes.empty());
+  if (bytes.empty()) return;
+  fourdgs::Result<Walk> walked =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  CHECK(walked.ok());
+  if (!walked) return;
+  const fourdgs::tool::Frame* header = walked->firstIntact(fourdgs::tool::op::kHeader);
+  const fourdgs::tool::Frame* firstIndex = walked->firstIntact(fourdgs::tool::op::kChunkIndex);
+  const fourdgs::tool::Frame* footer = walked->firstIntact(fourdgs::tool::op::kFooter);
+  CHECK(header != nullptr);
+  CHECK(firstIndex != nullptr);
+  CHECK(footer != nullptr);
+  if (header == nullptr || firstIndex == nullptr || footer == nullptr) return;
+
+  std::size_t model = static_cast<std::size_t>(header->offset + fourdgs::tool::kRecordHeaderSize);
+  for (int field = 0; field < 2; ++field) model += 4 + readU32(bytes, model);
+  model += 8 + 8 + 8;
+  const std::uint32_t modelLength = readU32(bytes, model);
+  model += 4;
+  const std::string unknown = "unknown-model!";
+  CHECK_EQ(modelLength, unknown.size());
+  if (modelLength != unknown.size()) return;
+  std::copy(unknown.begin(), unknown.end(), bytes.begin() + static_cast<std::ptrdiff_t>(model));
+
+  std::vector<std::uint8_t> unindexed(bytes.begin(), bytes.begin() + firstIndex->offset);
+  const std::size_t newFooter = unindexed.size();
+  unindexed.insert(unindexed.end(), bytes.begin() + footer->offset,
+                   bytes.begin() + footer->offset + footer->total());
+  unindexed.insert(unindexed.end(), bytes.end() - fourdgs::tool::kMagicSize, bytes.end());
+  for (std::size_t i = 0; i < 20; ++i) {
+    unindexed[newFooter + fourdgs::tool::kRecordHeaderSize + i] = 0;
+  }
+
+  const Report report =
+      fourdgs::tool::validate(Span<const std::uint8_t>(unindexed.data(), unindexed.size()));
+  bool refusedModel = false;
+  for (const fourdgs::tool::Finding& finding : report.findings) {
+    if (finding.refusal.has_value() && finding.refusal->code == "unknown-temporal-model") {
+      refusedModel = true;
+    }
+  }
+  CHECK(refusedModel);
+}
+
+void duplicateHeadersAreRejectedBeforeModelDispatch() {
+  if (corpusMissing()) return;
+  std::vector<std::uint8_t> bytes = readBytes(corpusDirectory() / kProvenanceVariant);
+  CHECK(!bytes.empty());
+  if (bytes.empty()) return;
+  fourdgs::Result<Walk> walked =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  CHECK(walked.ok());
+  if (!walked) return;
+  const fourdgs::tool::Frame* header = walked->firstIntact(fourdgs::tool::op::kHeader);
+  const fourdgs::tool::Frame* chunk = walked->firstIntact(fourdgs::tool::op::kChunk);
+  CHECK(header != nullptr);
+  CHECK(chunk != nullptr);
+  if (header == nullptr || chunk == nullptr) return;
+  const std::vector<std::uint8_t> duplicate(
+      bytes.begin() + static_cast<std::ptrdiff_t>(header->offset),
+      bytes.begin() + static_cast<std::ptrdiff_t>(header->offset + header->total()));
+  bytes.insert(bytes.begin() + static_cast<std::ptrdiff_t>(chunk->offset), duplicate.begin(),
+               duplicate.end());
+
+  const Report report =
+      fourdgs::tool::validate(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  bool unique = false;
+  for (const fourdgs::tool::Finding& finding : report.findings) {
+    if (finding.message.find("Header records; the Header must be unique") != std::string::npos) {
+      unique = true;
+    }
+  }
+  CHECK(unique);
 }
 
 void anEmbeddedChunkOpcodeIsNotARecordBoundary() {
@@ -1146,18 +1231,68 @@ void checksumReadFailuresAreNotReportedAsNoChecksum() {
   fourdgs::Result<Walk> walked = fourdgs::tool::walk(ordinary);
   CHECK(walked.ok());
   if (!walked) return;
-  const std::optional<fourdgs::tool::SummaryDeclaration> summary =
+  const fourdgs::Result<std::optional<fourdgs::tool::SummaryDeclaration>> summary =
       fourdgs::tool::summaryDeclaration(ordinary, *walked);
-  CHECK(summary.has_value());
-  if (!summary.has_value()) return;
+  CHECK(summary.ok());
+  CHECK(summary.ok() && summary->has_value());
+  if (!summary || !summary->has_value()) return;
 
-  FailingSummaryReadable failing(std::move(bytes), summary->start);
+  FailingSummaryReadable failing(std::move(bytes), summary->value().start);
   fourdgs::Result<std::optional<fourdgs::tool::Coverage>> covered =
       fourdgs::tool::coverage(failing, *walked);
   CHECK(!covered.ok());
   if (!covered) {
     CHECK(covered.error().message.find("injected summary transport failure") != std::string::npos);
   }
+}
+
+void footerDeclarationsNameShortRecordsAndTransportFailures() {
+  if (corpusMissing()) return;
+  std::vector<std::uint8_t> original = readBytes(corpusDirectory() / kProvenanceVariant);
+  CHECK(!original.empty());
+  if (original.empty()) return;
+  fourdgs::Result<Walk> walked =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(original.data(), original.size()));
+  CHECK(walked.ok());
+  if (!walked) return;
+  const fourdgs::tool::Frame* footer = walked->firstIntact(fourdgs::tool::op::kFooter);
+  CHECK(footer != nullptr);
+  if (footer == nullptr || footer->length < 20) return;
+
+  std::vector<std::uint8_t> shortFooter = original;
+  writeU64(&shortFooter, static_cast<std::size_t>(footer->offset + 1), 19);
+  const std::size_t eraseBegin =
+      static_cast<std::size_t>(footer->offset + fourdgs::tool::kRecordHeaderSize + 19);
+  const std::size_t eraseEnd =
+      static_cast<std::size_t>(footer->offset + fourdgs::tool::kRecordHeaderSize + footer->length);
+  shortFooter.erase(shortFooter.begin() + static_cast<std::ptrdiff_t>(eraseBegin),
+                    shortFooter.begin() + static_cast<std::ptrdiff_t>(eraseEnd));
+  const Report shortReport =
+      fourdgs::tool::validate(Span<const std::uint8_t>(shortFooter.data(), shortFooter.size()));
+  bool namedMinimum = false;
+  for (const fourdgs::tool::Finding& finding : shortReport.findings) {
+    if (finding.message.find("Footer record at byte") != std::string::npos &&
+        finding.message.find("declares 19 content bytes") != std::string::npos &&
+        finding.message.find("requires at least 20") != std::string::npos) {
+      namedMinimum = true;
+    }
+  }
+  CHECK(namedMinimum);
+
+  FailingRangeReadable failing(std::move(original),
+                               footer->offset + fourdgs::tool::kRecordHeaderSize);
+  const Report failedRead = fourdgs::tool::validate(failing);
+  CHECK(!failedRead.ok());
+  CHECK(!failedRead.hasErrors());
+  CHECK(!failedRead.complete);
+  bool preserved = false;
+  for (const fourdgs::tool::Finding& finding : failedRead.findings) {
+    if (finding.message.find("Footer declaration could not be read") != std::string::npos &&
+        finding.message.find("injected Header transport failure") != std::string::npos) {
+      preserved = true;
+    }
+  }
+  CHECK(preserved);
 }
 
 void aFileMissingOnlyItsTrailingMagicIsNotInspectedCleanly() {
@@ -1323,6 +1458,26 @@ void aFramingTransportFailureIsNotReportedAsAFileCut() {
     CHECK_EQ(static_cast<int>(walked.error().code), static_cast<int>(ErrorCode::kIo));
     CHECK(walked.error().message.find("injected framing transport failure") != std::string::npos);
   }
+
+  std::vector<std::uint8_t> validationBytes(fourdgs::tool::kMagic,
+                                            fourdgs::tool::kMagic + fourdgs::tool::kMagicSize);
+  validationBytes.push_back(0x80);
+  validationBytes.insert(validationBytes.end(), 8, 0);
+  validationBytes.insert(validationBytes.end(), fourdgs::tool::kMagic,
+                         fourdgs::tool::kMagic + fourdgs::tool::kMagicSize);
+  FailingFramingReadable validationSource(std::move(validationBytes));
+  const Report report = fourdgs::tool::validate(validationSource);
+  CHECK(!report.ok());
+  CHECK(!report.hasErrors());
+  CHECK(!report.complete);
+  bool toolFailure = false;
+  for (const fourdgs::tool::Finding& finding : report.findings) {
+    if (finding.message.find("cannot walk the input resource framing") != std::string::npos &&
+        finding.message.find("injected framing transport failure") != std::string::npos) {
+      toolFailure = true;
+    }
+  }
+  CHECK(toolFailure);
 }
 
 void aDuplicateFrontMatterRecordLeavesTheRefusalUnplaced() {
@@ -1482,6 +1637,8 @@ void runTests() {
   aLongHeaderIsRangeParsedThroughItsTemporalModel();
   aTemporalModelTransportFailureMakesValidationIncomplete();
   anUnindexedKeyframeDeltaUsesTheStreamedDecoder();
+  anUnindexedFileStillReceivesAFrontMatterVerdict();
+  duplicateHeadersAreRejectedBeforeModelDispatch();
   anEmbeddedChunkOpcodeIsNotARecordBoundary();
   anOrphanChunkIsDecodedByTheStreamedValidationPass();
   anUnindexedPhysicalBandIsRejected();
@@ -1495,6 +1652,7 @@ void runTests() {
   summaryPlacementIsCheckedWithoutAChecksum();
   modelSpecificAndBareStructureOpcodesAreRejected();
   checksumReadFailuresAreNotReportedAsNoChecksum();
+  footerDeclarationsNameShortRecordsAndTransportFailures();
   aFileMissingOnlyItsTrailingMagicIsNotInspectedCleanly();
   anIndexEntryAtTheEndOfTheFileIsRefusedRatherThanDereferenced();
   aFileCutInsideItsFirstRecordStillSaysWhereItWasCut();

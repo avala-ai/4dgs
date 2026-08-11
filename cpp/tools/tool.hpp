@@ -283,9 +283,11 @@ struct SummaryDeclaration {
   std::uint64_t end = 0;
 };
 
-/// Empty only when a complete Footer cannot be read. A zero checksum remains in the declaration,
-/// because summary placement is normative independently of checksum presence.
-std::optional<SummaryDeclaration> summaryDeclaration(Readable& source, const Walk& walk);
+/// A successful empty value means there is no unique trailing Footer to inspect. A transport
+/// error reading its fixed prefix is preserved so callers cannot describe failed I/O as absence.
+/// A zero checksum remains in the declaration, because summary placement is normative
+/// independently of checksum presence.
+Result<std::optional<SummaryDeclaration>> summaryDeclaration(Readable& source, const Walk& walk);
 
 /// The region the Footer's summary checksum covers, and whether it agrees.
 ///

@@ -147,22 +147,25 @@ std::string hex2(std::uint8_t value) {
 /// both invisible to everything before this point. Both are in the invalid corpus.
 void checkGaussianBirth(Readable& source, const Walk& walk, const std::vector<IndexEntry>& index,
                         Report* report) {
-  if (index.empty()) {
-    incomplete(report,
-               "chunk payload validation is incomplete: the file has no Chunk Index, and the "
-               "C++ core has no bounded per-record sequential validation surface");
-    return;
-  }
-  Result<std::unique_ptr<Scene>> opened = Scene::open(source, ReadMode::kIndexed);
+  const ReadMode mode = index.empty() ? ReadMode::kSequential : ReadMode::kIndexed;
+  Result<std::unique_ptr<Scene>> opened = Scene::open(source, mode);
   if (!opened) {
-    refused(report, "a seeking reader cannot open this file: ", opened.error(), &walk,
-            std::nullopt);
+    refused(report,
+            index.empty() ? "a streamed reader cannot open this file: "
+                          : "a seeking reader cannot open this file: ",
+            opened.error(), &walk, std::nullopt);
     // A file that will not open will not decode either, and the second error would say the same
     // thing about the same byte.
     return;
   }
   // Closed before the scan, so only one reader — and one chunk — is resident at a time.
   opened->reset();
+  if (index.empty()) {
+    incomplete(report,
+               "chunk payload validation is incomplete: the file has no Chunk Index, and the "
+               "C++ core has no bounded per-record sequential validation surface");
+    return;
+  }
   std::optional<ChunkRefusal> refusal = scanChunks(source, index);
   if (refusal.has_value()) {
     refused(report, "a chunk does not decode: ", refusal->error, &walk, refusal->site);
@@ -266,7 +269,11 @@ Report validate(Readable& source) {
 
   Result<std::uint64_t> sized = source.size();
   if (!sized) {
-    refused(&report, "", sized.error(), nullptr, std::nullopt);
+    if (sized.error().code == ErrorCode::kIo) {
+      incomplete(&report, "cannot size the input resource: " + sized.error().message);
+    } else {
+      refused(&report, "", sized.error(), nullptr, std::nullopt);
+    }
     return report;
   }
   const std::uint64_t size = *sized;
@@ -274,14 +281,23 @@ Report validate(Readable& source) {
   // Framing first, and for two reasons: it refuses a file that is not ours before anything reads
   // a byte as an opcode, and it is what gives every later refusal a byte to point at.
   std::optional<Frame> undersizedIndex;
+  std::optional<Frame> undersizedFooter;
   Result<Walk> walked = walk(source, [&](const Frame& frame, bool complete) {
     if (complete && frame.opcode == op::kChunkIndex && frame.length < 40 &&
         !undersizedIndex.has_value()) {
       undersizedIndex = frame;
     }
+    if (complete && frame.opcode == op::kFooter && frame.length < 20 &&
+        !undersizedFooter.has_value()) {
+      undersizedFooter = frame;
+    }
   });
   if (!walked) {
-    refused(&report, "", walked.error(), nullptr, std::nullopt);
+    if (walked.error().code == ErrorCode::kIo) {
+      incomplete(&report, "cannot walk the input resource framing: " + walked.error().message);
+    } else {
+      refused(&report, "", walked.error(), nullptr, std::nullopt);
+    }
     return report;
   }
   const Walk& walk = *walked;
@@ -361,6 +377,16 @@ Report validate(Readable& source) {
   if (walk.intactOpcodeCounts[op::kFooter] > 1) {
     error(&report, "the file carries " + std::to_string(walk.intactOpcodeCounts[op::kFooter]) +
                        " Footer records; the Footer must be unique and final");
+  }
+  if (undersizedFooter.has_value()) {
+    error(&report, "the Footer record at byte " + std::to_string(undersizedFooter->offset) +
+                       " declares " + std::to_string(undersizedFooter->length) +
+                       " content bytes; the fixed version-1 prefix requires at least 20");
+  }
+  if (walk.intactOpcodeCounts[op::kHeader] > 1) {
+    error(&report, "the file carries " + std::to_string(walk.intactOpcodeCounts[op::kHeader]) +
+                       " Header records; the Header must be unique and first");
+    return report;
   }
   // The other half of the same normative sentence (spec §4: "the Header MUST be the first record,
   // the Footer MUST be the last"), and a note rather than an error on purpose.
@@ -602,7 +628,13 @@ Report validate(Readable& source) {
               " is invalid; Attribute Stream is a bare structure inside Chunk, not a record");
   }
 
-  std::optional<SummaryDeclaration> summary = summaryDeclaration(source, walk);
+  Result<std::optional<SummaryDeclaration>> declaredSummary = summaryDeclaration(source, walk);
+  if (!declaredSummary) {
+    incomplete(&report,
+               "the Footer declaration could not be read: " + declaredSummary.error().message);
+    return report;
+  }
+  std::optional<SummaryDeclaration> summary = *declaredSummary;
   if (summary.has_value()) {
     if (summary->start > summary->end) {
       error(&report, "the Footer's summary starts at " + std::to_string(summary->start) +

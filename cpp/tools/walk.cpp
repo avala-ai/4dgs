@@ -555,13 +555,13 @@ std::optional<ChunkRefusal> scanChunks(Readable& source, const std::vector<Index
   return std::nullopt;
 }
 
-std::optional<SummaryDeclaration> summaryDeclaration(Readable& source, const Walk& walk) {
+Result<std::optional<SummaryDeclaration>> summaryDeclaration(Readable& source, const Walk& walk) {
   // A summary declaration belongs to the unique trailing Footer. Reading the
   // first Footer lets an earlier counterfeit suppress or redirect the checksum
   // while a second Footer satisfies the last-record shape.
   if (walk.intactOpcodeCounts[op::kFooter] != 1 || !walk.lastIntactRecord.has_value() ||
       walk.lastIntactRecord->opcode != op::kFooter) {
-    return std::nullopt;
+    return std::optional<SummaryDeclaration>();
   }
   const Frame* frame = &*walk.lastIntactRecord;
   // `summary_start`, `summary_offset_start`, `summary_crc` — twenty bytes, and the only record
@@ -569,9 +569,19 @@ std::optional<SummaryDeclaration> summaryDeclaration(Readable& source, const Wal
   // this needs are the first three and they do not move.
   constexpr std::size_t kFooterFields = 20;
   const std::uint64_t content = frame->offset + kRecordHeaderSize;
-  if (frame->length < kFooterFields) return std::nullopt;
+  if (frame->length < kFooterFields) return std::optional<SummaryDeclaration>();
   std::uint8_t at[kFooterFields];
-  if (!readExactly(source, content, at, kFooterFields)) return std::nullopt;
+  Result<std::size_t> got =
+      source.read(content, Span<std::uint8_t>(at, static_cast<std::size_t>(kFooterFields)));
+  if (!got) {
+    return Error(got.error().code, "Footer fixed fields at byte " + std::to_string(content) +
+                                       " could not be read: " + got.error().message);
+  }
+  if (*got != kFooterFields) {
+    return Error(ErrorCode::kIo, "Footer fixed fields at byte " + std::to_string(content) +
+                                     " returned " + std::to_string(*got) + " bytes; expected " +
+                                     std::to_string(kFooterFields));
+  }
   SummaryDeclaration out;
   out.start = readU64(at);
   out.offsetStart = readU64(at + 8);
@@ -580,21 +590,23 @@ std::optional<SummaryDeclaration> summaryDeclaration(Readable& source, const Wal
   // footer's expected size, so a Footer that a later revision extends does not move the region
   // out from under the check.
   out.end = frame->offset;
-  return out;
+  return std::optional<SummaryDeclaration>(out);
 }
 
 Result<std::optional<Coverage>> coverage(Readable& source, const Walk& walk) {
-  std::optional<SummaryDeclaration> declared = summaryDeclaration(source, walk);
-  if (!declared.has_value() || declared->crc == 0 || declared->start == 0 ||
-      declared->start > declared->end) {
+  Result<std::optional<SummaryDeclaration>> declaration = summaryDeclaration(source, walk);
+  if (!declaration) return declaration.error();
+  if (!declaration->has_value() || declaration->value().crc == 0 ||
+      declaration->value().start == 0 || declaration->value().start > declaration->value().end) {
     return std::optional<Coverage>();
   }
-  Result<std::uint32_t> actual = crc32Range(source, declared->start, declared->end);
+  const SummaryDeclaration& declared = declaration->value();
+  Result<std::uint32_t> actual = crc32Range(source, declared.start, declared.end);
   if (!actual) return actual.error();
   Coverage out;
-  out.start = declared->start;
-  out.end = declared->end;
-  out.ok = *actual == declared->crc;
+  out.start = declared.start;
+  out.end = declared.end;
+  out.ok = *actual == declared.crc;
   return std::optional<Coverage>(out);
 }
 
