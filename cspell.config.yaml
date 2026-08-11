@@ -142,6 +142,7 @@ words:
   - oneline
   - worktree
   - worktrees
+  - toplevel
 ignorePaths:
   - "**/node_modules/**"
   - "**/dist/**"
