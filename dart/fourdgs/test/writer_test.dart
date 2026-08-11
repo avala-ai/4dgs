@@ -236,6 +236,30 @@ void main() {
       expect(decoded.header.aabb[3], greaterThan(scene.positions[3]));
     });
 
+    test(
+      'a finite authored position cannot reconstruct to float32 infinity',
+      () {
+        const f32Max = 3.4028234663852886e38;
+        final scene = flatScene(2);
+        scene.positions[3] = f32Max;
+        scene.scales.fillRange(0, scene.scales.length, 0.95 * f32Max);
+        expect(
+          () => writeFourdgsBytes(scene, 1.0),
+          throwsA(
+            isA<FourdgsInvalidInput>().having(
+              (FourdgsInvalidInput e) => e.message,
+              'message',
+              allOf(
+                contains('position'),
+                contains('gaussian 1'),
+                contains('float32'),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+
     test('two encodes of one scene are the same bytes', () {
       final scene = buildScene();
       // The attribute maps hold the same pairs in different insertion orders. A
@@ -1229,6 +1253,11 @@ void main() {
         () => writeFourdgsBytes(flatScene(4, winHi: double.infinity), 2.0),
         returnsNormally,
       );
+
+      // Equal infinite endpoints are a legal empty window. `+inf - +inf` is
+      // NaN, but its lifetime is zero and must select the same motion grid in
+      // the writer and every decoder rather than relying on NaN clamp ordering.
+      expect(lifeClass(0, 0.1, true, double.nan), lifeClass(0, 0.1, true, 0.0));
     });
 
     test(

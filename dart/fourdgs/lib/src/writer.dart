@@ -1329,6 +1329,13 @@ List<double> _encodedAabb(Int32List positionBins, int count, _Grid grid) {
       decoded[0] =
           positionBins[i * 3 + axis] * grid.stepPos + grid.origin[axis];
       final v = decoded[0];
+      if (!v.isFinite) {
+        throw FourdgsInvalidInput(
+          'position bin ${positionBins[i * 3 + axis]} at gaussian $i axis '
+          '$axis reconstructs outside the finite float32 range; the decoded '
+          'position would be $v',
+        );
+      }
       if (v < lo) lo = v;
       if (v > hi) hi = v;
     }
