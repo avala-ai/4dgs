@@ -235,6 +235,7 @@ export { type AudioPayloadChunk, type DecodeOptions, type Scene, decodeScene } f
 
 export {
   HEAD_PROBE_BYTES,
+  MAX_FRONT_MATTER_BYTES,
   IndexedDecoder,
   type IndexedChunk,
   type OpenIndexedOptions,

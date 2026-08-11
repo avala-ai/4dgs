@@ -31,7 +31,9 @@ import {
   Cursor,
   FourdgsError,
   FOOTER_TAIL_BYTES,
+  HEADER_FLAG_HAS_AUDIO,
   MAGIC,
+  MAX_FRONT_MATTER_BYTES,
   Opcode,
   RECORD_HEADER_BYTES,
   iterateRecords,
@@ -638,6 +640,48 @@ test("regression: keyframe-delta index metadata is checked without and with deco
   );
 });
 
+test("regression: Header cutoff and keyframe population are structural checks", async () => {
+  const original = new Uint8Array(Buffer.from(MOVING_CHAINED, "base64"));
+  const headerRecord = [...iterateRecords(original, MAGIC.length)].find(
+    (record) => record.opcode === Opcode.Header,
+  )!;
+  const headerCursor = new Cursor(headerRecord.content);
+  headerCursor.string();
+  headerCursor.string();
+  headerCursor.f64();
+  headerCursor.u64();
+  const cutoffAt = headerRecord.offset + RECORD_HEADER_BYTES + headerCursor.pos;
+  const badCutoff = original.slice();
+  new DataView(badCutoff.buffer, badCutoff.byteOffset, badCutoff.byteLength).setFloat64(
+    cutoffAt,
+    2,
+    true,
+  );
+  const cutoffReport = await validateFile(badCutoff);
+  assert.ok(
+    cutoffReport.findings.some((finding) =>
+      finding.message.includes("Header cutoff is 2; expected a finite value in (0, 1]"),
+    ),
+  );
+
+  const oversizedKeyframe = original.slice();
+  const keyframe = recordsOf(oversizedKeyframe).find((record) => record.opcode === Opcode.Chunk)!;
+  new DataView(
+    oversizedKeyframe.buffer,
+    oversizedKeyframe.byteOffset,
+    oversizedKeyframe.byteLength,
+  ).setUint32(keyframe.offset + RECORD_HEADER_BYTES + 20, 0xffff_ffff, true);
+  const countReport = await validateFile(oversizedKeyframe);
+  assert.ok(
+    countReport.findings.some(
+      (finding) =>
+        finding.message.includes(`keyframe Chunk at byte ${keyframe.offset} declares 4294967295`) &&
+        finding.message.includes("the Header declares only"),
+    ),
+    countReport.findings.map((finding) => finding.message).join("\n"),
+  );
+});
+
 test("regression: gaussian-birth rejects a physical Delta Chunk", async () => {
   const data = new Uint8Array(Buffer.from(MOVING_CHAINED, "base64"));
   const model = new TextEncoder().encode("keyframe-delta");
@@ -1181,6 +1225,44 @@ test("unit: inspect and validate range-read instead of retaining the resource", 
   assert.ok(largestRead < data.length, `one range read buffered all ${data.length} bytes`);
 });
 
+test("unit: validation bounds a known record before fetching its body", async () => {
+  const contentLength = MAX_FRONT_MATTER_BYTES + 1;
+  const metadataAt = MAGIC.length;
+  const tailAt = metadataAt + RECORD_HEADER_BYTES + contentLength;
+  const size = tailAt + MAGIC.length;
+  const prefix = new Uint8Array(MAGIC.length + RECORD_HEADER_BYTES);
+  prefix.set(MAGIC);
+  prefix[metadataAt] = Opcode.Metadata;
+  new DataView(prefix.buffer).setBigUint64(metadataAt + 1, BigInt(contentLength), true);
+  let largestRead = 0;
+  const source: IReadable = {
+    size: () => Promise.resolve(BigInt(size)),
+    read: (offset, length) => {
+      const at = Number(offset);
+      const count = Number(length);
+      largestRead = Math.max(largestRead, count);
+      const out = new Uint8Array(count);
+      for (let i = 0; i < count; i++) {
+        const absolute = at + i;
+        if (absolute < prefix.length) out[i] = prefix[absolute]!;
+        else if (absolute >= tailAt && absolute < size) out[i] = MAGIC[absolute - tailAt]!;
+      }
+      return Promise.resolve(out);
+    },
+  };
+
+  const report = await validateFile(source);
+  assert.ok(
+    report.findings.some(
+      (finding) =>
+        finding.message.includes(`Metadata record at byte ${metadataAt}`) &&
+        finding.message.includes("ceiling for a single parsed record"),
+    ),
+    report.findings.map((finding) => finding.message).join("\n"),
+  );
+  assert.ok(largestRead <= 64 * 1024, `validation requested ${largestRead} bytes at once`);
+});
+
 test("regression: illegal top-level structures and malformed known records are refused", (t) => {
   const path = corpus("TenWindows-UseChunkIndex-UseCrc");
   if (path === null || !existsSync(EXECUTABLE)) return t.skip("corpus not generated");
@@ -1195,6 +1277,7 @@ test("regression: illegal top-level structures and malformed known records are r
       framedRecord(Opcode.AttributeStream, new Uint8Array(0)),
       "not a legal top-level record",
     ],
+    ["ReservedZeroOpcode", framedRecord(0, new Uint8Array(0)), "not a legal top-level record"],
     ["MalformedCamera", framedRecord(Opcode.Camera, new Uint8Array(0)), "Camera record at byte"],
   ] as const) {
     const changed = splice(original.slice(), summary, record);
@@ -1230,6 +1313,63 @@ test("regression: illegal top-level structures and malformed known records are r
   assert.ok(
     footerVerdict.out.some((line) => line.includes("summary_offset_start is 1")),
     footerVerdict.out.join("\n"),
+  );
+});
+
+test("regression: indexed opening discovers legal legacy Audio after a Chunk", async (t) => {
+  const path = corpus("TenWindows-UseChunkIndex-UseCrc");
+  if (path === null) return t.skip("corpus not generated");
+  const original = bytesOf("TenWindows-UseChunkIndex-UseCrc");
+  const kept: Uint8Array[] = [];
+  for (const record of iterateRecords(original, MAGIC.length)) {
+    if (
+      record.opcode === Opcode.ChunkIndex ||
+      record.opcode === Opcode.Statistics ||
+      record.opcode === Opcode.SummaryOffset ||
+      record.opcode === Opcode.Footer
+    ) {
+      continue;
+    }
+    const raw = record.raw.slice();
+    if (record.opcode === Opcode.Header) {
+      const cursor = new Cursor(record.content);
+      cursor.string();
+      cursor.string();
+      cursor.f64();
+      cursor.u64();
+      cursor.f64();
+      cursor.string();
+      cursor.f64s(6);
+      cursor.u8();
+      raw[RECORD_HEADER_BYTES + cursor.pos] |= HEADER_FLAG_HAS_AUDIO;
+    }
+    kept.push(raw);
+  }
+  const audio = new Uint8Array(23);
+  const audioView = new DataView(audio.buffer);
+  audioView.setUint32(0, 3, true);
+  audio.set(new TextEncoder().encode("wav"), 4);
+  audioView.setFloat64(7, 0, true);
+  audioView.setBigUint64(15, 0n, true);
+  const records = [
+    MAGIC,
+    ...kept,
+    framedRecord(Opcode.Audio, audio),
+    framedRecord(Opcode.Footer, new Uint8Array(20)),
+    MAGIC,
+  ];
+  const total = records.reduce((sum, record) => sum + record.length, 0);
+  const indexless = new Uint8Array(total);
+  let at = 0;
+  for (const record of records) {
+    indexless.set(record, at);
+    at += record.length;
+  }
+
+  const report = await validateFile(indexless);
+  assert.equal(report.ok, true, report.findings.map((finding) => finding.message).join("\n"));
+  assert.ok(
+    report.findings.every((finding) => !finding.message.includes("a seeking reader cannot open")),
   );
 });
 
@@ -1329,6 +1469,26 @@ test("regression: Summary Offset records belong to the declared summary", async 
     report.findings.some(
       (finding) =>
         finding.message.includes(`Summary Offset record at byte ${firstChunk.offset}`) &&
+        finding.message.includes("outside the declared summary"),
+    ),
+    report.findings.map((finding) => finding.message).join("\n"),
+  );
+});
+
+test("regression: every Statistics record belongs to the declared summary", async (t) => {
+  const variant = "TenWindows-UseChunkIndex-UseChunks-UseCrc-UseStatistics-UseSummaryOffset";
+  if (corpus(variant) === null) return t.skip("corpus not generated");
+  const original = bytesOf(variant);
+  const statistics = recordsOf(original).find((record) => record.opcode === Opcode.Statistics)!;
+  const copy = original.slice(statistics.offset, statistics.offset + statistics.length);
+  const firstChunk = recordsOf(original).find((record) => record.opcode === Opcode.Chunk)!;
+  const moved = resealSummary(splice(original, firstChunk.offset, copy), copy.length);
+
+  const report = await validateFile(moved);
+  assert.ok(
+    report.findings.some(
+      (finding) =>
+        finding.message.includes(`Statistics record at byte ${firstChunk.offset}`) &&
         finding.message.includes("outside the declared summary"),
     ),
     report.findings.map((finding) => finding.message).join("\n"),

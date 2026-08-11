@@ -207,7 +207,9 @@ export class IndexedDecoder {
       };
     const provenanceRanges: ProvenanceRange[] = [];
     for await (const record of scanner.records(MAGIC.length)) {
-      if (record.opcode === Opcode.Chunk) break;
+      // Record order is non-normative outside Header, Footer, and the contiguous summary.
+      // Keep framing after the first Chunk so a legal late legacy Audio record remains
+      // discoverable by an indexed open; state bodies are still skipped arithmetically.
       if (record.opcode === Opcode.Header) {
         header = parseHeader(await scanner.content(record));
         checkTemporalModel(header.temporalModel);

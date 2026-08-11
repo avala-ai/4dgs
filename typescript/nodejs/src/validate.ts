@@ -36,7 +36,9 @@ import {
   IndexedDecoder,
   LENGTH_UNIT_METRES,
   MAGIC,
+  MAX_FRONT_MATTER_BYTES,
   MAX_SH_DEGREE,
+  MalformedFile,
   ObjectLayer,
   Opcode,
   Provenance,
@@ -211,6 +213,7 @@ export async function validateFile(
   let counted = 0;
   const index: ChunkIndexEntry[] = [];
   let firstIndexOffset: number | null = null;
+  const statisticsOffsets: number[] = [];
   const summaryOffsetOffsets: number[] = [];
   const physicalChunkOffsets: number[] = [];
   const physicalChunks = new Map<
@@ -260,6 +263,13 @@ export async function validateFile(
       const { offset } = record;
       let contentValue: Uint8Array | null = null;
       const content = async (): Promise<Uint8Array> => {
+        if (framed.contentLength > MAX_FRONT_MATTER_BYTES) {
+          throw new MalformedFile(
+            `${opcodeName(framed.opcode)} record at byte ${framed.offset} is ` +
+              `${framed.contentLength} bytes, past the ${MAX_FRONT_MATTER_BYTES} byte ` +
+              "ceiling for a single parsed record",
+          );
+        }
         contentValue ??= await scanner.content(framed);
         return contentValue;
       };
@@ -321,6 +331,11 @@ export async function validateFile(
                 `degrees 0-${MAX_SH_DEGREE} (§5.1)`,
             );
           }
+          if (!Number.isFinite(header.cutoff) || header.cutoff <= 0 || header.cutoff > 1) {
+            found.error(
+              `Header cutoff is ${header.cutoff}; expected a finite value in (0, 1] (§4.2)`,
+            );
+          }
           break;
         case Opcode.Quantization:
           try {
@@ -356,6 +371,7 @@ export async function validateFile(
           }
           break;
         case Opcode.Chunk: {
+          const activeHeader = header as Header | null;
           physicalChunkOffsets.push(offset);
           physicalBands.set(offset, []);
           currentChunkOffset = offset;
@@ -370,12 +386,27 @@ export async function validateFile(
           chunkCount += 1;
           let parsed;
           try {
-            parsed = parseChunk(await content());
+            parsed =
+              options.decode === true
+                ? parseChunk(await scanner.content(framed))
+                : {
+                    header: await parseChunkRecordHeader(source, framed),
+                    streams: new Uint8Array(),
+                  };
           } catch (error) {
             found.error(`chunk ${chunkCount} does not parse: ${message(error)}`);
             break;
           }
           counted += parsed.header.count;
+          if (
+            activeHeader?.temporalModel === "keyframe-delta" &&
+            parsed.header.count > activeHeader.gaussianCount
+          ) {
+            found.error(
+              `keyframe Chunk at byte ${offset} declares ${parsed.header.count} gaussians; ` +
+                `the Header declares only ${activeHeader.gaussianCount} distinct gaussian ids`,
+            );
+          }
           physicalChunks.set(offset, {
             opcode: Opcode.Chunk,
             length: record.length,
@@ -385,7 +416,7 @@ export async function validateFile(
             ordinal: physicalChunkOffsets.length,
             count: parsed.header.count,
             bands: new Map<number, Int32Array>(),
-            decoded: options.decode === true && header?.temporalModel === "keyframe-delta",
+            decoded: options.decode === true && activeHeader?.temporalModel === "keyframe-delta",
           };
           if (parsed.header.t1 < parsed.header.t0) {
             found.error(
@@ -421,7 +452,13 @@ export async function validateFile(
           firstChunkSeen = true;
           let parsed;
           try {
-            parsed = parseDeltaChunk(await content());
+            parsed =
+              options.decode === true
+                ? parseDeltaChunk(await scanner.content(framed))
+                : {
+                    header: await parseDeltaChunkRecordHeader(source, framed),
+                    records: new Uint8Array(),
+                  };
           } catch (error) {
             found.error(`Delta Chunk at byte ${offset} does not parse: ${message(error)}`);
             break;
@@ -460,7 +497,11 @@ export async function validateFile(
           // the two a band's stream can raise, for the same reason.
           let band = 0;
           try {
-            const parsedBand = parseShBandRecord(await content());
+            const parsedBand = parseShBandRecord(
+              options.decode === true
+                ? await scanner.content(framed)
+                : await scanner.content(framed, 1),
+            );
             band = parsedBand.band;
             if (band < 1 || band > MAX_SH_DEGREE) {
               found.error(
@@ -617,6 +658,7 @@ export async function validateFile(
           });
           break;
         case Opcode.Statistics:
+          statisticsOffsets.push(offset);
           await parseInto(found, "Statistics", offset, async () => {
             parseStatistics(await content());
           });
@@ -1008,6 +1050,14 @@ export async function validateFile(
 
   if (footer !== null) {
     const tail = size - FOOTER_TAIL_BYTES;
+    for (const offset of statisticsOffsets) {
+      if (footer.summaryStart === 0 || offset < footer.summaryStart || offset >= tail) {
+        found.error(
+          `Statistics record at byte ${offset} lies outside the declared summary ` +
+            `[${footer.summaryStart}, ${tail}) (§4.5)`,
+        );
+      }
+    }
     const summaryOffsetsInSummary = summaryOffsetOffsets.filter(
       (offset) => footer!.summaryStart !== 0 && offset >= footer!.summaryStart && offset < tail,
     );
@@ -1480,6 +1530,118 @@ async function parseAudioDataRecord(
   return { sourceId, dataLength };
 }
 
+/** Parse a Chunk's fixed fields and blob framing without fetching its stream payload. */
+async function parseChunkRecordHeader(
+  source: IReadable,
+  record: FrontMatterRecord,
+): Promise<ChunkHeader> {
+  let at = record.offset + RECORD_HEADER_BYTES;
+  const end = at + record.contentLength;
+  const fixed = new Cursor(
+    await fixedRecordBytes(source, at, 24, end, "Chunk fixed fields"),
+    0,
+    at,
+  );
+  const t0 = fixed.f64();
+  const t1 = fixed.f64();
+  const level = fixed.u32();
+  const count = fixed.u32();
+  at += 24;
+  const named = await boundedStringAt(source, at, end, "Chunk compression");
+  at = named.after;
+  const uncompressed = new Cursor(
+    await fixedRecordBytes(source, at, 8, end, "Chunk uncompressed_size"),
+    0,
+    at,
+  ).u64();
+  at += 8;
+  await validateBlobAt(source, at, end, "Chunk streams");
+  return { t0, t1, level, count, compression: named.value, uncompressedSize: uncompressed };
+}
+
+/** Parse a Delta Chunk's fixed fields and blob framing without fetching its records payload. */
+async function parseDeltaChunkRecordHeader(
+  source: IReadable,
+  record: FrontMatterRecord,
+): Promise<DeltaChunkHeader> {
+  let at = record.offset + RECORD_HEADER_BYTES;
+  const end = at + record.contentLength;
+  const fixed = new Cursor(
+    await fixedRecordBytes(source, at, 51, end, "Delta Chunk fixed fields"),
+    0,
+    at,
+  );
+  const header = {
+    t0: fixed.f64(),
+    t1: fixed.f64(),
+    level: fixed.u32(),
+    deltaMode: fixed.u8(),
+    referenceOffset: fixed.u64(),
+    keyframeOffset: fixed.u64(),
+    depth: fixed.u16(),
+    updateCount: fixed.u32(),
+    birthCount: fixed.u32(),
+    deathCount: fixed.u32(),
+  };
+  at += 51;
+  const named = await boundedStringAt(source, at, end, "Delta Chunk compression");
+  at = named.after;
+  const uncompressed = new Cursor(
+    await fixedRecordBytes(source, at, 8, end, "Delta Chunk uncompressed_size"),
+    0,
+    at,
+  ).u64();
+  at += 8;
+  await validateBlobAt(source, at, end, "Delta Chunk records");
+  return { ...header, compression: named.value, uncompressedSize: uncompressed };
+}
+
+async function boundedStringAt(
+  source: IReadable,
+  at: number,
+  end: number,
+  field: string,
+): Promise<{ readonly value: string; readonly after: number }> {
+  const length = new Cursor(
+    await fixedRecordBytes(source, at, 4, end, `${field} length`),
+    0,
+    at,
+  ).u32();
+  at += 4;
+  if (length > VALIDATION_STRING_BYTES) {
+    throw new MalformedFile(
+      `${field} declares ${length} bytes, past the ${VALIDATION_STRING_BYTES}-byte string ceiling`,
+    );
+  }
+  const bytes = await fixedRecordBytes(source, at, length, end, field);
+  let value: string;
+  try {
+    value = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new MalformedFile(`${field} at byte ${at} is not valid UTF-8`);
+  }
+  return { value, after: at + length };
+}
+
+async function validateBlobAt(
+  source: IReadable,
+  at: number,
+  end: number,
+  field: string,
+): Promise<void> {
+  const length = new Cursor(
+    await fixedRecordBytes(source, at, 8, end, `${field} length`),
+    0,
+    at,
+  ).u64();
+  at += 8;
+  if (!Number.isSafeInteger(at + length) || at + length > end) {
+    throw new MalformedFile(
+      `${field} at byte ${at} declares ${length} bytes, only ${end - at} remain in the record`,
+    );
+  }
+}
+
 /** Validate string/string/blob payload framing without ever reading the payload itself. */
 async function validatePayloadRecord(
   source: IReadable,
@@ -1586,11 +1748,13 @@ const TOP_LEVEL_OPCODES: ReadonlySet<number> = new Set<number>([
 ]);
 
 const ILLEGAL_TOP_LEVEL_OPCODES: ReadonlySet<number> = new Set<number>([
+  0,
   Opcode.AttributeStream,
   Opcode.AttachmentIndex,
 ]);
 
 const VALIDATION_PROBE_BYTES = 64 * 1024;
+const VALIDATION_STRING_BYTES = 4096;
 
 function hex(opcode: number): string {
   return `0x${opcode.toString(16).padStart(2, "0").toUpperCase()}`;
