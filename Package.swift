@@ -75,12 +75,13 @@ let package = Package(
         // the tests drive the whole tool — arguments in, output and exit code out — without
         // spawning a process.
         .target(
-            name: "FourDGSTool", dependencies: ["FourDGS"], path: "swift/Sources/FourDGSTool"),
+            name: "FourDGSTool", dependencies: ["FourDGS", "CFourDGS"],
+            path: "swift/Sources/FourDGSTool"),
         .executableTarget(
             name: "FourDGSCommand", dependencies: ["FourDGSTool"],
             path: "swift/Sources/FourDGSCommand"),
         .testTarget(
-            name: "FourDGSToolTests", dependencies: ["FourDGSTool", "FourDGS"],
+            name: "FourDGSToolTests", dependencies: ["FourDGSTool", "FourDGS", "CFourDGS"],
             path: "swift/Tests/FourDGSToolTests"),
 
         // The conformance runners. Two executables, because the suite tests two read paths

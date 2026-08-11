@@ -7,6 +7,7 @@
 /// metadata, summary structure, and every physical state stream without buffering whole records.
 
 import FourDGS
+import CFourDGS
 
 public enum Severity: Int, Comparable {
     case note
@@ -189,18 +190,20 @@ private func frontMatterSlices(
 
 private func singleChunkReader(
     _ source: ToolReader, header: Frame, quantization: Frame, windowTable: Frame?, chunk: Frame,
-    temporalModelOffset: UInt64? = nil
+    temporalModelOffset: UInt64? = nil, bands: [Frame] = []
 ) -> SlicedReader {
     var slices = frontMatterSlices(
         header: header, quantization: quantization, windowTable: windowTable,
         temporalModelOffset: temporalModelOffset)
     slices.append(SourceSlice(offset: chunk.offset, length: chunk.total))
+    for band in bands { slices.append(SourceSlice(offset: band.offset, length: band.total)) }
     return SlicedReader(source: source, slices: slices)
 }
 
-private struct DeltaGroup {
+struct DeltaGroup {
     let name: String
     let count: UInt32
+    let source: ToolReader
     let offset: UInt64
     let length: UInt64
 }
@@ -211,7 +214,62 @@ private func malformedDelta(_ frame: Frame, _ reason: String) -> FourDGSError {
         reason: reason)
 }
 
-private func deltaGroups(_ source: ToolReader, _ frame: Frame) throws -> [DeltaGroup] {
+private func inflated(_ bytes: [UInt8], expected: UInt64, frame: Frame) throws -> [UInt8] {
+    guard let count = Int(exactly: expected) else {
+        throw malformedDelta(frame, "uncompressed_size is larger than this platform can address")
+    }
+    guard let inputCount = uInt(exactly: bytes.count) else {
+        throw malformedDelta(frame, "compressed records exceed zlib's per-stream input limit")
+    }
+    var stream = z_stream()
+    let initialized = inflateInit_(&stream, zlibVersion(), Int32(MemoryLayout<z_stream>.size))
+    guard initialized == Z_OK else {
+        throw malformedDelta(frame, "deflate could not initialize (zlib status \(initialized))")
+    }
+    defer { inflateEnd(&stream) }
+
+    // Grow only from bytes the codec actually produces. A forged large declaration must not
+    // reserve that much memory before the compressed input has substantiated it.
+    var output: [UInt8] = []
+    var block = [UInt8](repeating: 0, count: min(64 * 1024, max(count, 1)))
+    var status = Int32(Z_OK)
+    try bytes.withUnsafeBytes { input in
+        stream.next_in = UnsafeMutablePointer(
+            mutating: input.bindMemory(to: Bytef.self).baseAddress)
+        stream.avail_in = inputCount
+        repeat {
+            let remaining = count - output.count
+            let wanted = min(block.count, max(remaining, 1))
+            let produced = block.withUnsafeMutableBytes { destination in
+                stream.next_out = destination.bindMemory(to: Bytef.self).baseAddress
+                stream.avail_out = uInt(wanted)
+                status = CFourDGS.inflate(&stream, Z_NO_FLUSH)
+                return wanted - Int(stream.avail_out)
+            }
+            if remaining == 0, produced > 0 {
+                throw malformedDelta(
+                    frame, "deflate expands past the declared \(count) bytes")
+            }
+            output.append(contentsOf: block[..<produced])
+            guard status == Z_OK || status == Z_STREAM_END else {
+                throw malformedDelta(frame, "deflate could not be decoded (zlib status \(status))")
+            }
+            if status == Z_OK, produced == 0, stream.avail_in == 0 {
+                throw malformedDelta(frame, "deflate ended after \(output.count) of \(count) bytes")
+            }
+        } while status != Z_STREAM_END
+    }
+    guard output.count == count else {
+        throw malformedDelta(
+            frame, "deflate produced \(output.count) of the declared \(count) bytes")
+    }
+    guard stream.avail_in == 0 else {
+        throw malformedDelta(frame, "bytes remain after the deflate stream")
+    }
+    return output
+}
+
+func deltaGroups(_ source: ToolReader, _ frame: Frame) throws -> [DeltaGroup] {
     let content = frame.offset + recordHeaderSize
     let countsAt: UInt64 = 39
     let compressionLengthAt: UInt64 = 51
@@ -232,6 +290,14 @@ private func deltaGroups(_ source: ToolReader, _ frame: Frame) throws -> [DeltaG
     guard compressionLength <= frame.length - relative else {
         throw malformedDelta(frame, "compression string runs past the record")
     }
+    guard let compressionCount = Int(exactly: compressionLength) else {
+        throw malformedDelta(frame, "compression string is larger than this platform can address")
+    }
+    let compressionBytes = try source.exactly(
+        offset: content + relative, count: compressionCount, record: "DeltaChunk compression")
+    guard let compression = String(bytes: compressionBytes, encoding: .utf8) else {
+        throw malformedDelta(frame, "compression is not UTF-8")
+    }
     relative += compressionLength
     guard relative <= frame.length, frame.length - relative >= 16 else {
         throw malformedDelta(frame, "records length does not fit after the compression string")
@@ -244,36 +310,59 @@ private func deltaGroups(_ source: ToolReader, _ frame: Frame) throws -> [DeltaG
     guard recordsLength <= frame.length - relative else {
         throw malformedDelta(frame, "records blob runs past the record")
     }
-    guard uncompressed == recordsLength else {
-        throw malformedDelta(
-            frame,
-            "uncompressed_size is \(uncompressed), but the records blob is \(recordsLength) bytes")
-    }
     guard relative + recordsLength == frame.length else {
         throw malformedDelta(frame, "bytes remain after the records blob")
     }
 
-    let recordsEnd = relative + recordsLength
+    let recordsSource: ToolReader
+    let recordsStart: UInt64
+    let recordsEnd: UInt64
+    if compression.isEmpty {
+        guard uncompressed == recordsLength else {
+            throw malformedDelta(
+                frame,
+                "uncompressed_size is \(uncompressed), but the records blob is \(recordsLength) bytes")
+        }
+        recordsSource = source
+        recordsStart = content + relative
+        recordsEnd = recordsStart + recordsLength
+    } else {
+        guard compression == "deflate" else {
+            throw FourDGSError.unsupportedCodec(
+                offset: Int64(clamping: content + compressionLengthAt + 4), record: "DeltaChunk",
+                name: compression, refusal: .unknownStreamCodec)
+        }
+        guard let compressedCount = Int(exactly: recordsLength) else {
+            throw malformedDelta(frame, "records length is larger than this platform can address")
+        }
+        let compressed = try source.exactly(
+            offset: content + relative, count: compressedCount, record: "DeltaChunk records")
+        recordsSource = ToolReader(
+            InMemoryReader(try inflated(compressed, expected: uncompressed, frame: frame)))
+        recordsStart = 0
+        recordsEnd = uncompressed
+    }
+    var at = recordsStart
     let names = ["update", "birth", "death"]
     var groups: [DeltaGroup] = []
     for i in 0..<3 {
-        guard relative <= recordsEnd, recordsEnd - relative >= 8 else {
+        guard at <= recordsEnd, recordsEnd - at >= 8 else {
             throw malformedDelta(frame, "the \(names[i]) group length is missing")
         }
-        let field = try source.exactly(
-            offset: content + relative, count: 8, record: "DeltaChunk \(names[i]) length")
+        let field = try recordsSource.exactly(
+            offset: at, count: 8, record: "DeltaChunk \(names[i]) length")
         let length = readU64(field, at: 0) ?? 0
-        relative += 8
-        guard length <= recordsEnd - relative else {
+        at += 8
+        guard length <= recordsEnd - at else {
             throw malformedDelta(frame, "the \(names[i]) group runs past the records blob")
         }
         groups.append(
             DeltaGroup(
-                name: names[i], count: declaredCounts[i], offset: content + relative,
+                name: names[i], count: declaredCounts[i], source: recordsSource, offset: at,
                 length: length))
-        relative += length
+        at += length
     }
-    guard relative == recordsEnd else {
+    guard at == recordsEnd else {
         throw malformedDelta(frame, "bytes remain after the death group")
     }
     return groups
@@ -282,9 +371,7 @@ private func deltaGroups(_ source: ToolReader, _ frame: Frame) throws -> [DeltaG
 private let requiredGroupAttributes: Set<UInt8> = Set(0...10)
 private let invariantUpdateAttributes: Set<UInt8> = [8, 9, 10]
 
-private func validateGroupHeaders(
-    _ source: ToolReader, _ frame: Frame, _ group: DeltaGroup
-) throws {
+private func validateGroupHeaders(_ frame: Frame, _ group: DeltaGroup) throws {
     if group.length == 0 {
         guard group.count == 0 else {
             throw malformedDelta(
@@ -298,7 +385,7 @@ private func validateGroupHeaders(
         guard group.length - relative >= 17 else {
             throw malformedDelta(frame, "the \(group.name) group ends inside a stream header")
         }
-        let header = try source.exactly(
+        let header = try group.source.exactly(
             offset: group.offset + relative, count: 17,
             record: "DeltaChunk \(group.name) stream")
         let attribute = header[0]
@@ -367,8 +454,8 @@ private func syntheticChunkPrefix(
 
 private func deltaGroupReader(
     _ source: ToolReader, header: Frame, quantization: Frame, windowTable: Frame?,
-    temporalModelOffset: UInt64, fields: ChunkFields, group: DeltaGroup
-) -> SlicedReader {
+    temporalModelOffset: UInt64, fields: ChunkFields, group: DeltaGroup, band: Frame? = nil
+) throws -> SlicedReader {
     var slices = frontMatterSlices(
         header: header, quantization: quantization, windowTable: windowTable,
         temporalModelOffset: temporalModelOffset)
@@ -377,7 +464,20 @@ private func deltaGroupReader(
             literal: syntheticChunkPrefix(
                 t0: fields.t0, t1: fields.t1, level: fields.level, count: group.count,
                 streams: group.length)))
-    slices.append(SourceSlice(offset: group.offset, length: group.length))
+    if group.source === source {
+        slices.append(SourceSlice(offset: group.offset, length: group.length))
+    } else {
+        guard let length = Int(exactly: group.length) else {
+            throw malformedDelta(
+                Frame(opcode: Opcode.deltaChunk, offset: 0, length: group.length),
+                "group is larger than this platform can address")
+        }
+        slices.append(
+            SourceSlice(
+                literal: try group.source.exactly(
+                    offset: group.offset, count: length, record: "DeltaChunk \(group.name) group")))
+    }
+    if let band { slices.append(SourceSlice(offset: band.offset, length: band.total)) }
     return SlicedReader(source: source, slices: slices)
 }
 
@@ -408,6 +508,7 @@ private func validatePhysicalRecords(
         }
     }
     var seenBands: Set<Int> = []
+    var stateFrames: [UInt64: Frame] = [:]
 
     var header: Frame?
     var quantization: Frame?
@@ -423,9 +524,9 @@ private func validatePhysicalRecords(
                 guard intact else { return }
 
                 switch frame.opcode {
-                case Opcode.header: header = frame
-                case Opcode.quantization: quantization = frame
-                case Opcode.windowTable: windowTable = frame
+                case Opcode.header: if header == nil { header = frame }
+                case Opcode.quantization: if quantization == nil { quantization = frame }
+                case Opcode.windowTable: if windowTable == nil { windowTable = frame }
                 default: break
                 }
 
@@ -487,6 +588,39 @@ private func validatePhysicalRecords(
                                 result.indexSafe = false
                             }
                         }
+                        guard keyframeDelta, firstStateError == nil,
+                            address.length == frame.total, let header, let quantization,
+                            let temporalModelOffset, let state = stateFrames[index[address.entry].offset],
+                            let fields = result.fields[state.offset]
+                        else { continue }
+                        do {
+                            if state.opcode == Opcode.chunk {
+                                _ = try SceneReader(
+                                    singleChunkReader(
+                                        source, header: header, quantization: quantization,
+                                        windowTable: windowTable, chunk: state,
+                                        temporalModelOffset: temporalModelOffset, bands: [frame]),
+                                    path: .streamed)
+                            } else if let birth = try deltaGroups(source, state).first(where: {
+                                $0.name == "birth"
+                            }) {
+                                try validateGroupHeaders(state, birth)
+                                _ = try SceneReader(
+                                    deltaGroupReader(
+                                        source, header: header, quantization: quantization,
+                                        windowTable: windowTable,
+                                        temporalModelOffset: temporalModelOffset, fields: fields,
+                                        group: birth, band: frame),
+                                    path: .streamed)
+                            }
+                        } catch {
+                            firstStateError = (
+                                asFourDGS(error),
+                                Site(
+                                    offset: frame.offset,
+                                    what: "the physical SH Band Stream at byte \(frame.offset)")
+                            )
+                        }
                     }
                     return
                 }
@@ -502,6 +636,7 @@ private func validatePhysicalRecords(
                 }
 
                 let entries = byOffset[frame.offset] ?? []
+                if !entries.isEmpty { stateFrames[frame.offset] = frame }
                 if !index.isEmpty && entries.isEmpty {
                     scanReport.error(
                         "the \(opcodeName(frame.opcode)) record at byte \(frame.offset) is absent "
@@ -519,7 +654,7 @@ private func validatePhysicalRecords(
                 if keyframeDelta {
                     do {
                         if let fields = try chunkFields(source, frame) {
-                            result.fields[frame.offset] = fields
+                            if !entries.isEmpty { result.fields[frame.offset] = fields }
                             physicalFields = fields
                         } else {
                             scanReport.error(
@@ -547,7 +682,7 @@ private func validatePhysicalRecords(
                                 path: .streamed)
                         } else if let physicalFields {
                             for group in try deltaGroups(source, frame) {
-                                try validateGroupHeaders(source, frame, group)
+                                try validateGroupHeaders(frame, group)
                                 do {
                                     _ = try SceneReader(
                                         deltaGroupReader(
@@ -845,7 +980,11 @@ func validate(_ source: ToolReader) -> Report {
                 if opcode == Opcode.header { hasHeader = true }
                 if opcode == Opcode.quantization { hasQuantization = true }
                 if opcode == Opcode.footer { hasFooter = true }
-                if isPrivate(opcode) {
+                if opcode == Opcode.attributeStream {
+                    report.error(
+                        "AttributeStream at byte \(frame.offset) is a bare Chunk structure, not a "
+                            + "top-level record")
+                } else if isPrivate(opcode) {
                     report.note(
                         "private record 0x\(hex2(opcode)) (\(frame.length) bytes) — skipped, as required")
                 } else if isProvenance(opcode) && !isSpecified(opcode) {
@@ -956,7 +1095,10 @@ func validate(_ source: ToolReader) -> Report {
         return report
     }
     if let summary {
-        if summary.start > summary.end {
+        if summary.start == summary.end {
+            report.error(
+                "the Footer's nonzero summary_start \(summary.start) names no ChunkIndex record")
+        } else if summary.start > summary.end {
             report.error(
                 "the Footer's summary starts at \(summary.start), after the summary ends at "
                     + "\(summary.end)")

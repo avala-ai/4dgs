@@ -6,6 +6,8 @@
 // anywhere.
 module CFourDGS {
     header "../../../rust/fourdgs/include/fourdgs.h"
+    header "zlib_shim.h"
     link "fourdgs"
+    link "z"
     export *
 }
