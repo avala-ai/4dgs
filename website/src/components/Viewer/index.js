@@ -36,6 +36,14 @@ export default function Viewer() {
   const dragRef = useRef(null);
   /** True only between pointer-down and pointer-up on the scrubber. */
   const draggingScrubRef = useRef(false);
+  /**
+   * Why this browser cannot draw anything, if it cannot.
+   *
+   * WebGL2 either exists or it does not, and no file changes that. It is held apart from
+   * the per-file refusal so that opening a file cannot clear it, and read through a ref as
+   * well as through state because `open` is created once and must see it.
+   */
+  const setupFailureRef = useRef(null);
 
   const [source, setSource] = useState(null);
   const [scene, setScene] = useState(null);
@@ -54,6 +62,8 @@ export default function Viewer() {
    * says so by being disabled rather than by accepting clicks and ignoring them.
    */
   const [decodeFailed, setDecodeFailed] = useState(false);
+  /** Set once, when WebGL2 is not available at all. Nothing about a file clears it. */
+  const [setupFailed, setSetupFailed] = useState(false);
   /** Non-null while the visitor is dragging the scrubber, so the readout cannot fight it. */
   const [scrub, setScrub] = useState(null);
   const [readout, setReadout] = useState({ time: 0, count: 0, intervals: [], transfer: null });
@@ -67,6 +77,11 @@ export default function Viewer() {
     try {
       renderer = new SplatRenderer(canvas);
     } catch (failure) {
+      // No context, so no loop, no renderer and no camera. Nothing below this line will
+      // ever run for this page, which is why the failure has to outlive any file the
+      // visitor opens next rather than being cleared by the attempt.
+      setupFailureRef.current = failure;
+      setSetupFailed(true);
       setError(failure);
       return undefined;
     }
@@ -76,7 +91,14 @@ export default function Viewer() {
     let running = true;
     let previous = performance.now();
     let lastReadout = 0;
-    let pending = false;
+    /**
+     * The open serial an in-flight `frameAt` belongs to, or null when nothing is in flight.
+     *
+     * Not a bare boolean: a range request against the file the visitor has moved on from
+     * may never settle, and a flag it shares would keep the replacement scene from ever
+     * asking for a frame. An obsolete request stops counting the moment the serial moves.
+     */
+    let pendingSerial = null;
 
     const tick = (now) => {
       if (!running) return;
@@ -97,22 +119,22 @@ export default function Viewer() {
             }
           }
         }
-        // One instant in flight at a time. A seek that has not come back yet simply keeps
-        // the previous frame on screen for another animation frame.
-        if (!pending && playback.rendered !== playback.time) {
-          pending = true;
+        // One instant in flight at a time, per open. A seek that has not come back yet
+        // simply keeps the previous frame on screen for another animation frame.
+        if (pendingSerial !== playback.serial && playback.rendered !== playback.time) {
           const wanted = playback.time;
           const serial = playback.serial;
+          pendingSerial = serial;
           playable
             .frameAt(wanted)
             .then((frame) => {
-              pending = false;
+              if (pendingSerial === serial) pendingSerial = null;
               if (!running || playbackRef.current.serial !== serial) return;
               playbackRef.current.rendered = wanted;
               renderer.setFrame(frame);
             })
             .catch((failure) => {
-              pending = false;
+              if (pendingSerial === serial) pendingSerial = null;
               if (!running || playbackRef.current.serial !== serial) return;
               playbackRef.current.playable = null;
               setPlaying(false);
@@ -154,6 +176,12 @@ export default function Viewer() {
   // --- opening a file ------------------------------------------------------
 
   const open = useCallback(async (readable, label) => {
+    // Nothing to open a file into. Restate why rather than replacing it with a refusal
+    // about the file, which is not the thing that is wrong.
+    if (setupFailureRef.current !== null) {
+      setError(setupFailureRef.current);
+      return;
+    }
     const playback = playbackRef.current;
     // A URL over a slow link and a large local file both take long enough that a visitor
     // can start a second open before the first returns. Every effect below is guarded by
@@ -173,6 +201,10 @@ export default function Viewer() {
     setDecodeFailed(false);
     setSource(label);
     setBusy(true);
+    // The canvas belongs to the file the page says it is showing. Leaving the previous
+    // scene drawn under a new source label — or under the new file's refusal — invites the
+    // reading that some of the new file came through, which is exactly false.
+    rendererRef.current?.clear();
     try {
       const playable = await openScene(readable);
       if (!current()) return;
@@ -376,6 +408,7 @@ export default function Viewer() {
           <input
             type="file"
             accept=".4dgs,application/octet-stream"
+            disabled={setupFailed}
             onChange={(event) => openFile(event.target.files[0])}
           />
         </label>
@@ -385,6 +418,7 @@ export default function Viewer() {
             type="url"
             placeholder="…or a URL to a .4dgs, read by byte range"
             value={url}
+            disabled={setupFailed}
             onChange={(event) => setUrl(event.target.value)}
             onKeyDown={(event) => {
               if (event.key === "Enter") openUrl();
@@ -394,7 +428,7 @@ export default function Viewer() {
             type="button"
             className="button button--secondary button--sm"
             onClick={openUrl}
-            disabled={url.trim() === ""}
+            disabled={setupFailed || url.trim() === ""}
           >
             Open URL
           </button>

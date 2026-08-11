@@ -223,6 +223,18 @@ export class SplatRenderer {
   }
 
   /**
+   * Forget whatever was on the canvas.
+   *
+   * Opening a second file must not leave the first one drawn: a refusal printed over the
+   * previous scene's geometry reads as "some of your file came through", which is the one
+   * thing a decoder's refusal must never be mistaken for.
+   */
+  clear() {
+    this.frame = null;
+    this.frameSerial += 1;
+  }
+
+  /**
    * Take the gaussians alive at an instant.
    *
    * The covariances are built here, once per instant, rather than per frame: they depend
