@@ -435,20 +435,17 @@ impl Reencode for fourdgs::serialization::RawRecord<'_> {
     }
 }
 
-#[test]
-fn a_rust_written_multi_window_sequence_round_trips() {
-    // The writer assigns `window_index` from each gaussian's own validity window, so it
-    // has to serialize the whole table. Writing nonzero indices against a one-entry table
-    // produces a file that the reader's own validation refuses — the encoder rejecting
-    // its own output. Nothing exercised `write_sequence` from a Rust test before this, so
-    // that shape reached review rather than a red build.
-    use fourdgs::keyframe_delta_file::{
-        decode_streamed, write_sequence, KeyframeDeltaOptions, Sample,
-    };
+/// Four gaussians over `duration` seconds, two of which stop existing at 0.5s.
+///
+/// Every sample carries all four ids, so the composed population at every chunk holds the
+/// short-lived pair long after their window has closed. That is the shape the validity
+/// window has to be read on: the rows are present in the state and absent from the
+/// instant, and only the gate tells the two apart.
+fn two_window_samples(duration: f64) -> Vec<fourdgs::keyframe_delta_file::Sample> {
+    use fourdgs::keyframe_delta_file::Sample;
     use fourdgs::model::GaussianSet;
 
-    let duration = 4.0;
-    let samples: Vec<Sample> = (0..4)
+    (0..4)
         .map(|i| {
             let n = 4usize;
             let mut g = GaussianSet {
@@ -479,7 +476,20 @@ fn a_rust_written_multi_window_sequence_round_trips() {
                 gaussians: g,
             }
         })
-        .collect();
+        .collect()
+}
+
+#[test]
+fn a_rust_written_multi_window_sequence_round_trips() {
+    // The writer assigns `window_index` from each gaussian's own validity window, so it
+    // has to serialize the whole table. Writing nonzero indices against a one-entry table
+    // produces a file that the reader's own validation refuses — the encoder rejecting
+    // its own output. Nothing exercised `write_sequence` from a Rust test before this, so
+    // that shape reached review rather than a red build.
+    use fourdgs::keyframe_delta_file::{decode_streamed, write_sequence, KeyframeDeltaOptions};
+
+    let duration = 4.0;
+    let samples = two_window_samples(duration);
 
     let kd = KeyframeDeltaOptions {
         keyframe_every: 2,
@@ -501,4 +511,69 @@ fn a_rust_written_multi_window_sequence_round_trips() {
     // motion assertion through `write_sequence` passes whichever window the encoder
     // quantized against — it would be a test that cannot fail. The grid's dependence on
     // the window is covered directly in `keyframe_delta_file`'s own unit test.
+}
+
+#[test]
+fn a_gaussian_whose_window_has_closed_is_absent_from_the_reconstruction() {
+    // Section 3's visibility rule, on the keyframe-delta path: a gaussian exists at `t`
+    // only while `win_lo <= t < win_hi`, and outside that it is dropped rather than
+    // merely faded — so its id, centre, scale and the live count all exclude it, exactly
+    // as the gaussian-birth path decides it in `model.rs`.
+    //
+    // No corpus variant can reach this today: every keyframe-delta fixture carries one
+    // window `[0, 8)`, so no gaussian's window ever closes before the scene does and the
+    // gate has nothing to drop. That is why this is a unit test rather than an
+    // expectation — and why the rule went unpinned here while it was pinned in the
+    // reference (`keyframe_delta_file.py`) and, later, in TypeScript.
+    use fourdgs::keyframe_delta_file::{
+        decode_indexed, decode_streamed, reconstruct_at, write_sequence, KeyframeDeltaOptions,
+    };
+
+    let duration = 4.0;
+    let samples = two_window_samples(duration);
+    let kd = KeyframeDeltaOptions {
+        keyframe_every: 2,
+        ..Default::default()
+    };
+    let blob = write_sequence(&samples, duration, &kd).expect("the sequence encodes");
+
+    // Both read paths, because the whole argument for reconstructing on each is that they
+    // can disagree, and a gate applied on one only would be exactly that disagreement.
+    for (path, seq) in [
+        ("streamed", decode_streamed(&blob).expect("streamed decode")),
+        ("indexed", decode_indexed(&blob).expect("indexed decode").0),
+    ] {
+        let last = seq.chunks.last().expect("the sequence has chunks");
+        assert_eq!(
+            last.state.count(),
+            4,
+            "{path}: the composed state still carries every gaussian; \
+             it is reconstruction, not composition, that applies the window"
+        );
+
+        // t = 3.0 is inside the long window `[0, 4)` and past the end of the short one
+        // `[0, 0.5)`.
+        let closed = reconstruct_at(&seq, &last.state, 3.0);
+        assert_eq!(
+            closed.ids,
+            vec![0, 1],
+            "{path}: ids 2 and 3 stopped existing at 0.5s and must not be reported at 3.0s"
+        );
+        assert_eq!(
+            closed.centers.len(),
+            2 * 3,
+            "{path}: centres follow the ids"
+        );
+        assert_eq!(closed.scales.len(), 2 * 3, "{path}: scales follow the ids");
+        assert_eq!(closed.opacity.len(), 2, "{path}: opacity follows the ids");
+
+        // ... and before 0.5s all four are present, so the assertion above is the window
+        // closing rather than the pair never having been decoded at all.
+        let open = reconstruct_at(&seq, &seq.chunks[0].state, 0.25);
+        assert_eq!(
+            open.ids,
+            vec![0, 1, 2, 3],
+            "{path}: every gaussian is alive at 0.25s, inside both windows"
+        );
+    }
 }
