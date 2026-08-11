@@ -36,7 +36,6 @@ import io
 import json
 import os
 import shutil
-import subprocess
 import sys
 import tarfile
 
@@ -108,27 +107,6 @@ def sha256(path: str) -> str:
     return digest.hexdigest()
 
 
-def commit() -> str | None:
-    """The commit the corpus was generated from, if this is a checkout.
-
-    `GITHUB_SHA` first, because in the release job the checkout is detached at the tag and
-    `git rev-parse HEAD` answers the same thing more slowly. None when neither is available
-    — the manifest says so rather than inventing a value.
-    """
-    if os.environ.get("GITHUB_SHA"):
-        return os.environ["GITHUB_SHA"]
-    try:
-        out = subprocess.run(
-            ["git", "-C", ROOT, "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError:
-        return None
-    return out.stdout.strip() or None
-
-
 def describe(name: str, directory: str, path: str, expectation_path: str) -> dict:
     """One entry in `MANIFEST.json`.
 
@@ -175,7 +153,6 @@ def manifest(entries: list[dict]) -> dict:
         "manifestSchema": MANIFEST_SCHEMA,
         "repository": "https://github.com/avala-ai/4dgs",
         "tag": f"releases/corpus/v{CORPUS_VERSION}",
-        "commit": commit(),
         "license": "Apache-2.0",
         "counts": {"variants": len(entries), **{k: families[k] for k in sorted(families)}},
         "variants": entries,
@@ -281,7 +258,9 @@ def build(out_dir: str) -> str:
     found = variants()
     committed = committed_checksums()
     entries: list[dict] = []
-    members: list[tuple[str, bytes]] = []
+    # Paths are the small archive index; file contents are never retained here.
+    # `tarfile.addfile` consumes each handle before the next one is opened.
+    path_members: list[tuple[str, str]] = []
     failures: list[str] = []
 
     for name, directory in found:
@@ -303,10 +282,8 @@ def build(out_dir: str) -> str:
         elif expected != entry["sha256"]:
             failures.append(f"{qualified}: {entry['sha256'][:16]}… != committed {expected[:16]}…")
         entries.append(entry)
-        with open(path, "rb") as handle:
-            members.append((entry["file"], handle.read()))
-        with open(expectation_path, "rb") as handle:
-            members.append((entry["expectation"], handle.read()))
+        path_members.append((entry["file"], path))
+        path_members.append((entry["expectation"], expectation_path))
 
     for name in committed:
         if name not in {entry["file"][len("corpus/") :] for entry in entries}:
@@ -319,52 +296,63 @@ def build(out_dir: str) -> str:
         print("\nregenerate with `python3 tests/conformance/generate.py` and try again", file=sys.stderr)
         raise SystemExit(1)
 
-    with open(CHECKSUMS, "rb") as handle:
-        members.append(("corpus/CHECKSUMS.txt", handle.read()))
+    path_members.append(("corpus/CHECKSUMS.txt", CHECKSUMS))
     for source, target in (("LICENSE", "LICENSE"), ("NOTICE", "NOTICE")):
-        with open(os.path.join(ROOT, source), "rb") as handle:
-            members.append((target, handle.read()))
-    members.append(("MANIFEST.json", (json.dumps(manifest(entries), indent=2, sort_keys=False) + "\n").encode()))
-    members.append(("README.md", readme(entries).encode()))
+        path_members.append((target, os.path.join(ROOT, source)))
+    # These two members are bounded by the small corpus index, not by scene
+    # contents. Keeping them in memory lets their exact byte length be declared
+    # before the streaming tar writer consumes them.
+    generated_members = [
+        ("MANIFEST.json", (json.dumps(manifest(entries), indent=2, sort_keys=False) + "\n").encode()),
+        ("README.md", readme(entries).encode()),
+    ]
 
     os.makedirs(out_dir, exist_ok=True)
     stem = f"{NAME}-{CORPUS_VERSION}"
     tarball = os.path.join(out_dir, f"{stem}.tar.gz")
 
-    raw = io.BytesIO()
-    with tarfile.open(fileobj=raw, mode="w") as archive:
-        directories: set[str] = set()
-        for member_name, _ in sorted(members):
-            parts = member_name.split("/")[:-1]
-            for depth in range(len(parts)):
-                directories.add("/".join(parts[: depth + 1]))
-        for directory in sorted(directories):
-            info = tarfile.TarInfo(f"{stem}/{directory}")
-            info.type = tarfile.DIRTYPE
-            info.mode = 0o755
-            info.mtime = EPOCH
-            archive.addfile(info)
-        for member_name, payload in sorted(members):
-            info = tarfile.TarInfo(f"{stem}/{member_name}")
-            info.size = len(payload)
-            info.mode = 0o644
-            info.mtime = EPOCH
-            # uid/gid/uname/gname default to 0 and the empty string on a TarInfo built by
-            # hand, which is what we want: the archive must not record who built it.
-            archive.addfile(info, io.BytesIO(payload))
+    member_names = [name for name, _ in path_members] + [name for name, _ in generated_members]
+    directories: set[str] = set()
+    for member_name in sorted(member_names):
+        parts = member_name.split("/")[:-1]
+        for depth in range(len(parts)):
+            directories.add("/".join(parts[: depth + 1]))
 
-    # `mtime=0` on the gzip header for the same reason as `EPOCH` above; gzip writes the
-    # current time by default, which alone would make two identical corpora differ.
+    # Write gzip, tar framing and each member in one forward-only pipeline.
+    # `w|` never seeks and `addfile` reads one source handle at a time, so peak
+    # memory is independent of both an individual scene's size and the total
+    # corpus size. `filename=""` also keeps the output path out of gzip's header.
     with open(tarball, "wb") as handle:
-        with gzip.GzipFile(fileobj=handle, mode="wb", compresslevel=9, mtime=0) as gz:
-            gz.write(raw.getvalue())
+        with gzip.GzipFile(filename="", fileobj=handle, mode="wb", compresslevel=9, mtime=0) as gz:
+            with tarfile.open(fileobj=gz, mode="w|") as archive:
+                for directory in sorted(directories):
+                    info = tarfile.TarInfo(f"{stem}/{directory}")
+                    info.type = tarfile.DIRTYPE
+                    info.mode = 0o755
+                    info.mtime = EPOCH
+                    archive.addfile(info)
+                for member_name, source_path in sorted(path_members):
+                    info = tarfile.TarInfo(f"{stem}/{member_name}")
+                    info.size = os.path.getsize(source_path)
+                    info.mode = 0o644
+                    info.mtime = EPOCH
+                    # uid/gid/uname/gname default to 0 and the empty string on a TarInfo
+                    # built by hand, so the archive does not record who built it.
+                    with open(source_path, "rb") as payload:
+                        archive.addfile(info, payload)
+                for member_name, payload in sorted(generated_members):
+                    info = tarfile.TarInfo(f"{stem}/{member_name}")
+                    info.size = len(payload)
+                    info.mode = 0o644
+                    info.mtime = EPOCH
+                    archive.addfile(info, io.BytesIO(payload))
 
     digest = sha256(tarball)
     with open(tarball + ".sha256", "w", encoding="utf-8") as handle:
         handle.write(f"{digest}  {stem}.tar.gz\n")
 
     print(f"{tarball}  {os.path.getsize(tarball) / 1024:.0f} KiB")
-    print(f"{len(entries)} variants, {len(members)} files, sha256 {digest}")
+    print(f"{len(entries)} variants, {len(path_members) + len(generated_members)} files, sha256 {digest}")
     return tarball
 
 

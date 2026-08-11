@@ -48,11 +48,11 @@ release here is. The corpus becomes 1.0.0 when version 1 of the specification is
   `sha256sum`'s, so `sha256sum -c CHECKSUMS.txt` verifies the download, and the digests can be
   checked against the repository at the tag without trusting the archive.
 
-- **`MANIFEST.json`**, a machine-readable index: the corpus version, the commit it was generated
-  from, and per variant its paths, both SHA-256s, its byte length, its temporal model, whether a
-  runner reading through the chunk index may be asked it, and — for an invalid variant — the refusal
-  identifier a conforming reader must produce. Enough for a harness that is not `run.py` to score a
-  runner without reading any Python.
+- **`MANIFEST.json`**, a machine-readable index: the corpus version and release tag, and per variant
+  its paths, both SHA-256s, its byte length, its temporal model, whether a runner reading through
+  the chunk index may be asked it, and — for an invalid variant — the refusal identifier a
+  conforming reader must produce. Enough for a harness that is not `run.py` to score a runner
+  without reading any Python.
 
 - **The archive is reproducible.** Fixed mtime, uid, gid and mode on every member, sorted order, and
   a gzip header with no timestamp, so two builds of the same corpus produce the same bytes and the
