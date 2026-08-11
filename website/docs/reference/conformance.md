@@ -151,7 +151,7 @@ API, no shared build system, nothing that assumes the implementation was written
 already in this repository.
 
 What follows is that interface written as a contract, rather than as a description of how the six
-runners here happen to be built. Everything in it is what
+SDKs here happen to be built. Everything in it is what
 [`run.py`](https://github.com/avala-ai/4dgs/blob/main/tests/conformance/run.py) actually does. Where
 the harness is stricter or looser than it means to be, that is said plainly instead of smoothed
 over, because a runner author will meet the behaviour and not the intention.
@@ -181,7 +181,9 @@ is inside the file.
 
 There is no stdin. The harness neither writes to it nor closes it, so the runner inherits whatever
 the harness inherited; a runner that reads stdin will block or read something unrelated to its job.
-No environment variable carries part of the request and no configuration file is consulted.
+There is no process timeout either: a blocked runner hangs the whole conformance run indefinitely,
+and no later exit-code diagnostic is produced. No environment variable carries part of the request
+and no configuration file is consulted.
 
 Each invocation is a fresh process handling one file. Nothing may be carried between variants, and
 nothing needs to be — the corpus is sixty files, so a runner is allowed to be slow to start and is
@@ -241,10 +243,18 @@ process starts; see [below](#declining-a-variant).
 Each implementation ships **two** runners, and when both entry points are built the harness runs
 both over the same corpus, diffing both against the same committed expectation:
 
-| Runner            | Reads                                    | Produces                                     |
+| Runner            | Decoder path                             | Produces                                     |
 | ----------------- | ---------------------------------------- | -------------------------------------------- |
 | `decode_streamed` | the file front to back, no seeking       | the canonical summary of everything it found |
 | `decode_indexed`  | the index, then only the chunks it needs | the same summary, reached a different way    |
+
+The middle column describes the decoder being exercised, not every byte the runner process itself
+touches. Five indexed runners currently materialize the file once to inspect `temporal_model` before
+they construct the ranged reader; the TypeScript runner uses a bounded probe. The byte counters
+inside the indexed runners begin at the ranged reader, so a passing corpus proves that the indexed
+decoder agrees semantically and that its counted reads skip unrequested SH bands. It does **not**
+prove that the command's model-dispatch pre-read was itself ranged. An outside runner should keep
+dispatch bounded; the current harness does not observe or enforce that property.
 
 They are driven separately rather than left to whichever path a core would pick, because **they have
 to be able to disagree**. A streamed reader arrives at the Header front to back; an indexed one
