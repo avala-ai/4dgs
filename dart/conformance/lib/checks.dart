@@ -172,30 +172,48 @@ Future<int> checkSeekReadsOnlyWhatItNeeds(
   final index = scene.index;
   if (index.length < 2 || whole.count == 0) return 0;
 
-  // How far from a boundary a gaussian may legitimately sit on the far side of
-  // it. Per gaussian, out of the record's own pitches.
+  // How far from a boundary a gaussian whose support ends there may legitimately
+  // sit on the far side of it. Per gaussian, out of the record's own pitches.
+  //
+  // This must be scoped to the boundary: a broad gaussian stored in an ancestor
+  // chunk can have a large finite sigma while its support spans a child boundary
+  // exactly. Its sigma error cannot move either support endpoint across that child
+  // boundary, so using its slack globally would suppress every unrelated probe.
   final quantization = scene.quantization;
   final k = supportK(scene.header.cutoff);
   final sigmaLog = quantization.stepSigmaLog;
   final sigmaHalfRelative = math.exp(0.5 * sigmaLog) - 1.0;
-  double guard = 0.0;
-  for (int i = 0; i < whole.count; i++) {
-    final sigma = whole.sigmaT[i];
-    final neverFades = !sigma.isFinite;
-    // A never-fading gaussian's support is its validity window, and the Window
-    // Table stores that verbatim: nothing about it was rounded.
-    final sigmaBin =
-        neverFades ? 0 : (math.log(math.max(sigma, 1e-30)) / sigmaLog).round();
-    final mu = muStep(sigmaBin, sigmaLog, neverFades, quantization.stepTime);
-    final slack = neverFades ? 0.0 : 0.5 * mu + k * sigma * sigmaHalfRelative;
-    if (slack.isFinite && slack > guard) guard = slack;
-  }
+  final guardByBoundary = <double, double>{};
 
-  final boundaries =
-      <double>{
-          for (final entry in index) ...<double>[entry.t0, entry.t1],
-        }.toList()
-        ..sort();
+  double guardAt(double boundary) => guardByBoundary.putIfAbsent(boundary, () {
+    double guard = 0.0;
+    for (int i = 0; i < whole.count; i++) {
+      final sigma = whole.sigmaT[i];
+      if (!sigma.isFinite) continue;
+      final sigmaBin = (math.log(math.max(sigma, 1e-30)) / sigmaLog).round();
+      final muPitch = muStep(sigmaBin, sigmaLog, false, quantization.stepTime);
+      final slack = 0.5 * muPitch + k * sigma * sigmaHalfRelative;
+      if (!slack.isFinite) continue;
+
+      final rawLo = whole.muT[i] - k * sigma;
+      final rawHi = whole.muT[i] + k * sigma;
+      final lo = math.max(rawLo, whole.winLo[i]);
+      final hi = math.min(rawHi, whole.winHi[i]);
+      // A support clipped by a validity-window edge cannot move through that edge
+      // when sigma is rounded: the Window Table stores the edge exactly.
+      final loSlack = rawLo > whole.winLo[i] ? slack : 0.0;
+      final hiSlack = rawHi < whole.winHi[i] ? slack : 0.0;
+      if ((loSlack > 0.0 && (lo - boundary).abs() <= loSlack) ||
+          (hiSlack > 0.0 && (hi - boundary).abs() <= hiSlack)) {
+        guard = math.max(guard, slack);
+      }
+    }
+    return guard;
+  });
+
+  final boundaries = <double>{
+    for (final entry in index) ...<double>[entry.t0, entry.t1],
+  }.toList()..sort();
 
   // This is an optimization/fidelity probe, not another full decode. Bound the
   // number of global comparisons independently of the accepted index size: a
@@ -224,10 +242,12 @@ Future<int> checkSeekReadsOnlyWhatItNeeds(
         high = middle;
       }
     }
-    if (low < boundaries.length && (boundaries[low] - t).abs() <= guard) {
+    if (low < boundaries.length &&
+        (boundaries[low] - t).abs() <= guardAt(boundaries[low])) {
       return true;
     }
-    return low > 0 && (boundaries[low - 1] - t).abs() <= guard;
+    return low > 0 &&
+        (boundaries[low - 1] - t).abs() <= guardAt(boundaries[low - 1]);
   }
 
   int probed = 0;
@@ -243,7 +263,10 @@ Future<int> checkSeekReadsOnlyWhatItNeeds(
       // An open-ended entry has no fractional midpoint. Probe finite instants
       // relative to its start, spaced beyond the support-rounding guard; the
       // half-offsets also avoid the common integer window boundaries.
-      final step = math.max(1.0, math.max(4.0 * guard, entry.t0.abs() * 1e-6));
+      final step = math.max(
+        1.0,
+        math.max(4.0 * guardAt(entry.t0), entry.t0.abs() * 1e-6),
+      );
       for (final factor in const <double>[0.5, 1.5, 3.5, 7.5]) {
         candidates.add(entry.t0 + factor * step);
       }

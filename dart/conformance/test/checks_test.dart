@@ -41,4 +41,61 @@ void main() {
       greaterThan(0),
     );
   });
+
+  test(
+    'one broad gaussian does not suppress unrelated boundary probes',
+    () async {
+      const count = 9;
+      final rotations = Float32List(count * 4);
+      for (int i = 0; i < count; i++) rotations[i * 4 + 3] = 1.0;
+      final scene = FourdgsGaussianSet(
+        positions: Float32List(count * 3),
+        scales: Float32List(count * 3)..fillRange(0, count * 3, 1e-3),
+        rotations: rotations,
+        colors: Float32List(count * 4),
+        motions: Float32List(count * 3),
+        muT: Float32List.fromList(<double>[
+          4.0,
+          0.5,
+          1.5,
+          2.5,
+          3.5,
+          4.5,
+          5.5,
+          6.5,
+          7.5,
+        ]),
+        sigmaT: Float32List.fromList(<double>[
+          1000.0,
+          0.02,
+          0.02,
+          0.02,
+          0.02,
+          0.02,
+          0.02,
+          0.02,
+          0.02,
+        ]),
+        winLo: Float32List(count),
+        winHi: Float32List(count)..fillRange(0, count, 8.0),
+      );
+      final bytes = writeFourdgsBytes(
+        scene,
+        8.0,
+        options: const FourdgsWriteOptions(maxDepth: 4, minChunkGaussians: 1),
+      );
+      final source = CountingReadable(FourdgsBytes(bytes));
+      final indexed = await openFourdgsIndexed(source);
+      expect(indexed.index.length, greaterThan(1));
+
+      expect(
+        await checkSeekReadsOnlyWhatItNeeds(
+          source,
+          indexed,
+          readFourdgsBytes(bytes).gaussians,
+        ),
+        greaterThan(0),
+      );
+    },
+  );
 }
