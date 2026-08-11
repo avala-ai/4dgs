@@ -26,12 +26,13 @@ import 'package:fourdgs/fourdgs.dart';
 /// The source's profile, unless it is one this preset cannot keep.
 ///
 /// A profile is a promise about the file's contents, and this runner writes the
-/// gaussians alone — so `objects`, which promises an `object_id` stream and an
-/// Object Table, is a promise the output would break. Dropping it is the same
-/// choice the preset already makes about audio, cameras and attachments: what
-/// cannot be reproduced is not claimed, and the writer refuses the profile
-/// rather than writing a Header that says otherwise.
-String _writableProfile(String profile) => profile == 'objects' ? '' : profile;
+/// gaussians alone — so `objects`, which promises an Object Table, and
+/// `capture`, which promises a finite multi-chunk timeline with Statistics, are
+/// promises this generic preset cannot keep for every source. Dropping them is
+/// the same choice the preset already makes about audio, cameras and
+/// attachments: what cannot be reproduced is not claimed.
+String _writableProfile(String profile) =>
+    profile == 'objects' || profile == 'capture' ? '' : profile;
 
 void _checkSourceGroups(FourdgsGaussianSet source, FourdgsGaussianSet encoded) {
   if ((source.sourceGroup == null) != (encoded.sourceGroup == null)) {

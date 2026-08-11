@@ -113,7 +113,9 @@ source_scene = fourdgs.read(source)
 src = source_scene.gaussians
 scene = fourdgs.read(encoded)
 enc = scene.gaussians
-expected_profile = "" if source_scene.header.profile == "objects" else source_scene.header.profile
+expected_profile = (
+    "" if source_scene.header.profile in {"objects", "capture"} else source_scene.header.profile
+)
 if scene.header.duration_sec != source_scene.header.duration_sec:
     fail(
         f"duration_sec changed from {source_scene.header.duration_sec} "
