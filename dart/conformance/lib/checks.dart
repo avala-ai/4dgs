@@ -250,29 +250,33 @@ Future<int> checkSeekReadsOnlyWhatItNeeds(
   final k = supportK(scene.header.cutoff);
   final sigmaLog = quantization.stepSigmaLog;
   final sigmaHalfRelative = math.exp(0.5 * sigmaLog) - 1.0;
+  final guardEdges = <({double at, double guard})>[];
+  for (int i = 0; i < whole.count; i++) {
+    final sigma = whole.sigmaT[i];
+    if (!sigma.isFinite) continue;
+    final sigmaBin = seekGuardSigmaBin(sigma, sigmaLog);
+    final muPitch = muStep(sigmaBin, sigmaLog, false, quantization.stepTime);
+    final slack = 0.5 * muPitch + k * sigma * sigmaHalfRelative;
+    if (!slack.isFinite) continue;
+
+    final rawLo = whole.muT[i] - k * sigma;
+    final rawHi = whole.muT[i] + k * sigma;
+    final lo = math.max(rawLo, whole.winLo[i]);
+    final hi = math.min(rawHi, whole.winHi[i]);
+    if (rawLo > whole.winLo[i] && slack > 0.0) {
+      guardEdges.add((at: lo, guard: slack));
+    }
+    if (rawHi < whole.winHi[i] && slack > 0.0) {
+      guardEdges.add((at: hi, guard: slack));
+    }
+  }
   final guardByBoundary = <double, double>{};
 
   double guardAt(double boundary) => guardByBoundary.putIfAbsent(boundary, () {
     double guard = 0.0;
-    for (int i = 0; i < whole.count; i++) {
-      final sigma = whole.sigmaT[i];
-      if (!sigma.isFinite) continue;
-      final sigmaBin = seekGuardSigmaBin(sigma, sigmaLog);
-      final muPitch = muStep(sigmaBin, sigmaLog, false, quantization.stepTime);
-      final slack = 0.5 * muPitch + k * sigma * sigmaHalfRelative;
-      if (!slack.isFinite) continue;
-
-      final rawLo = whole.muT[i] - k * sigma;
-      final rawHi = whole.muT[i] + k * sigma;
-      final lo = math.max(rawLo, whole.winLo[i]);
-      final hi = math.min(rawHi, whole.winHi[i]);
-      // A support clipped by a validity-window edge cannot move through that edge
-      // when sigma is rounded: the Window Table stores the edge exactly.
-      final loSlack = rawLo > whole.winLo[i] ? slack : 0.0;
-      final hiSlack = rawHi < whole.winHi[i] ? slack : 0.0;
-      if ((loSlack > 0.0 && (lo - boundary).abs() <= loSlack) ||
-          (hiSlack > 0.0 && (hi - boundary).abs() <= hiSlack)) {
-        guard = math.max(guard, slack);
+    for (final edge in guardEdges) {
+      if ((edge.at - boundary).abs() <= edge.guard) {
+        guard = math.max(guard, edge.guard);
       }
     }
     return guard;
@@ -294,25 +298,6 @@ Future<int> checkSeekReadsOnlyWhatItNeeds(
     isKeyframeDelta: scene.header.temporalModel == 'keyframe-delta',
   );
 
-  bool nearBoundary(double t) {
-    int low = 0;
-    int high = boundaries.length;
-    while (low < high) {
-      final middle = low + ((high - low) >> 1);
-      if (boundaries[middle] < t) {
-        low = middle + 1;
-      } else {
-        high = middle;
-      }
-    }
-    if (low < boundaries.length &&
-        (boundaries[low] - t).abs() <= guardAt(boundaries[low])) {
-      return true;
-    }
-    return low > 0 &&
-        (boundaries[low - 1] - t).abs() <= guardAt(boundaries[low - 1]);
-  }
-
   int probed = 0;
   for (final entry in probeEntries) {
     final span = entry.t1 - entry.t0;
@@ -320,7 +305,7 @@ Future<int> checkSeekReadsOnlyWhatItNeeds(
     final candidates = seekProbeInstants(entry, guardAt);
     for (final t in candidates) {
       if (!t.isFinite) continue;
-      if (nearBoundary(t)) continue;
+      if (seekProbeNearAnyBoundary(t, boundaries, guardEdges)) continue;
 
       final selected = <FourdgsChunkIndexEntry>[
         for (final candidate in index)
@@ -354,6 +339,40 @@ Future<int> checkSeekReadsOnlyWhatItNeeds(
     }
   }
   return probed;
+}
+
+/// Whether [t] lies inside any quantization guard around any chunk boundary.
+///
+/// A wide guard attached to an earlier boundary can reach past several narrow
+/// boundaries, so checking only [t]'s immediate neighbours is not sufficient.
+/// For each reconstructed support edge, this asks by binary search whether a
+/// boundary lies within both the edge's guard and [t]'s guard from that same
+/// boundary. Work is bounded by the decoded gaussian population and the small,
+/// fixed probe count rather than by every boundary/gaussian pair.
+bool seekProbeNearAnyBoundary(
+  double t,
+  List<double> sortedBoundaries,
+  List<({double at, double guard})> guardEdges,
+) {
+  for (final edge in guardEdges) {
+    final double lo = math.max(edge.at, t) - edge.guard;
+    final double hi = math.min(edge.at, t) + edge.guard;
+    if (lo > hi) continue;
+    int low = 0;
+    int high = sortedBoundaries.length;
+    while (low < high) {
+      final int middle = low + ((high - low) >> 1);
+      if (sortedBoundaries[middle] < lo) {
+        low = middle + 1;
+      } else {
+        high = middle;
+      }
+    }
+    if (low < sortedBoundaries.length && sortedBoundaries[low] <= hi) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /// Reconstructed state at [t] as sorted keys, so two orderings of one answer

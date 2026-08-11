@@ -611,7 +611,9 @@ jobs:
           cd ../conformance && dart analyze --fatal-infos
 
       - name: Tests
-        run: cd dart/fourdgs && dart test
+        run: |
+          cd dart/fourdgs && dart test
+          cd ../conformance && dart test
 
       # The one gate that would otherwise be discovered on release day. It is cheap, it
       # needs no credentials, and a package that cannot be packed is a package whose first

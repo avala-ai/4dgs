@@ -52,6 +52,21 @@ void main() {
     );
   });
 
+  test('a wide earlier guard reaches across narrower boundaries', () {
+    expect(
+      seekProbeNearAnyBoundary(
+        2.9,
+        const <double>[0.0, 2.0, 3.0],
+        const <({double at, double guard})>[
+          (at: 0.0, guard: 3.0),
+          (at: 2.0, guard: 0.0),
+          (at: 3.0, guard: 0.0),
+        ],
+      ),
+      isTrue,
+    );
+  });
+
   test('seek proof samples indexes made only of open-ended entries', () async {
     final rotations = Float32List(8);
     rotations[3] = 1.0;
