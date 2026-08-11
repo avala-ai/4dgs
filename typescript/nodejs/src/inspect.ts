@@ -110,6 +110,14 @@ export async function inspectFile(source: IReadable): Promise<InspectReport> {
     // never framed as one.
     if (remaining <= MAGIC.length) {
       trailingMagic = bytesEqual(await source.read(BigInt(at), BigInt(remaining)), MAGIC);
+      // Anything else in that space is a file that was cut inside its own closing magic:
+      // the records all framed, so nothing above reported a stop, and the tail is short by
+      // a byte or seven. Saying so here is what keeps `inspect` from exiting 0 on a file
+      // the validator refuses one line later for the same reason — "file does not end with
+      // the magic" is a finding there, and it was a note here.
+      if (!trailingMagic) {
+        stopped = `${remaining} bytes at ${at} are not the closing magic; the file is truncated`;
+      }
       break;
     }
     if (remaining < RECORD_HEADER_BYTES) {

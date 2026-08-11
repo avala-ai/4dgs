@@ -24,19 +24,28 @@
 import {
   BytesReadable,
   Crc32,
+  Cursor,
   DEFAULT_CODECS,
   DEFAULT_CUTOFF,
   FOOTER_TAIL_BYTES,
   FourdgsError,
+  HEADER_FLAG_CHUNKS_COMPRESSED,
+  HEADER_FLAG_HAS_AUDIO,
   IndexedDecoder,
   MAGIC,
+  MAX_SH_DEGREE,
+  ObjectLayer,
   Opcode,
+  Provenance,
+  RECORD_HEADER_BYTES,
   bytesEqual,
   checkMagic,
   checkQuantizationScheme,
   checkTemporalModel,
   chunkStreamBytes,
   decodeChunkStreams,
+  decodeStream,
+  frameOneStream,
   isPrivateOpcode,
   isProvenanceOpcode,
   iterateRecords,
@@ -45,10 +54,19 @@ import {
   parseAudioSource,
   parseChunk,
   parseChunkIndexEntry,
+  parseCoordinateFrame,
   parseFooter,
+  parseGeodeticAnchor,
   parseHeader,
+  parseObjectTable,
+  parseObjectTrack,
   parseQuantization,
+  parseRigTrajectory,
+  parseSensorCalibration,
+  parseShBandRecord,
   parseWindowTable,
+  shBound,
+  shStep,
   stepsFrom,
   supportK,
   windowTableOrDefault,
@@ -160,6 +178,8 @@ export async function validateFile(
   const index: ChunkIndexEntry[] = [];
   const audioSources = new Map<number, AudioSourceDescriptor>();
   const audioData = new Map<number, number>();
+  const provenance = new Provenance();
+  const objects = new ObjectLayer();
   let firstChunkSeen = false;
 
   try {
@@ -175,6 +195,21 @@ export async function validateFile(
           } catch (error) {
             found.error(`Header does not parse: ${message(error)}`);
             break;
+          }
+          // §4.2's Header definition spells the flags byte out: bit 0 is audio, bit 1 is
+          // compressed chunks, "bits 2-7: reserved, MUST be 0". Nothing downstream can
+          // notice a set reserved bit — `hasAudio` reads bit 0 and the rest is dropped —
+          // so a writer that put meaning in one of them ships a file every reader
+          // silently disagrees with it about. The parser makes this check for the Audio
+          // Source record's flags already; the Header's had nobody making it.
+          {
+            const reserved =
+              header.flags & ~(HEADER_FLAG_HAS_AUDIO | HEADER_FLAG_CHUNKS_COMPRESSED);
+            if (reserved !== 0) {
+              found.error(
+                `Header flags is ${hex(header.flags)}; bits 2-7 are reserved and MUST be 0 (§4.2)`,
+              );
+            }
           }
           try {
             checkTemporalModel(header.temporalModel);
@@ -195,6 +230,7 @@ export async function validateFile(
           // the last would pass a file whose first grid is non-finite while the whole scene
           // decodes through it.
           checkQuantizationFinite(quantization, found, quantizationCount);
+          checkShBitDepths(quantization, header === null ? 0 : header.shDegree, found);
           quantizationCount += 1;
           try {
             checkQuantizationScheme(quantization.scheme);
@@ -241,6 +277,28 @@ export async function validateFile(
               found.error(`chunk ${chunkCount} does not decode: ${message(error)}`);
               found.refuse(error, offset, "the Chunk record");
             }
+          }
+          break;
+        }
+        case Opcode.ShBandStream: {
+          // Framing steps over these; only a decoder reaches inside one. The streamed
+          // decoder parses and decodes every band record it meets (`scene.ts`), so a file
+          // whose band declares a codec this build does not have, or whose payload is cut,
+          // is refused there — and a `--decode` pass that skipped them would report that
+          // same file valid. The two refusals a chunk's own streams can raise are exactly
+          // the two a band's stream can raise, for the same reason.
+          if (options.decode !== true) break;
+          let band = 0;
+          try {
+            const parsedBand = parseShBandRecord(content);
+            band = parsedBand.band;
+            // A reader caps its degree and never fetches the bands above it, so a band
+            // this build would not evaluate is not one it refuses either.
+            if (band > MAX_SH_DEGREE) break;
+            await decodeStream(frameOneStream(parsedBand.cursor), DEFAULT_CODECS);
+          } catch (error) {
+            found.error(`chunk ${chunkCount} SH band ${band} does not decode: ${message(error)}`);
+            found.refuse(error, offset, "the SH Band Stream record");
           }
           break;
         }
@@ -292,6 +350,50 @@ export async function validateFile(
           audioData.set(payload.sourceId, payload.data.length);
           break;
         }
+        // The provenance and object-layer records, parsed for the rules that span more
+        // than one of them. A validator that skipped these declared a file valid that
+        // this package's own streamed decoder refuses — `scene.ts` calls the same two
+        // `check()` methods — and that the Python validator refuses too. Neither their
+        // per-record fields nor the rest of Python's `_check_provenance` is re-checked
+        // here; the parsers make the first, and the second is a follow-up the Rust
+        // validator has not taken either.
+        case Opcode.CoordinateFrame:
+          parseInto(found, "CoordinateFrame", () => {
+            provenance.frames.push(parseCoordinateFrame(content));
+          });
+          break;
+        case Opcode.SensorCalibration:
+          parseInto(found, "SensorCalibration", () => {
+            provenance.sensors.push(parseSensorCalibration(content));
+          });
+          break;
+        case Opcode.RigTrajectory:
+          parseInto(found, "RigTrajectory", () => {
+            provenance.trajectories.push(parseRigTrajectory(content));
+          });
+          break;
+        case Opcode.GeodeticAnchor:
+          parseInto(found, "GeodeticAnchor", () => {
+            provenance.anchors.push(parseGeodeticAnchor(content));
+          });
+          break;
+        case Opcode.ObjectTable:
+          if (objects.table !== null) {
+            found.error(
+              `a second ObjectTable record appears at byte ${offset}; ` +
+                "a file may carry exactly one scene-wide object table",
+            );
+            break;
+          }
+          parseInto(found, "ObjectTable", () => {
+            objects.table = parseObjectTable(content);
+          });
+          break;
+        case Opcode.ObjectTrack:
+          parseInto(found, "ObjectTrack", () => {
+            objects.tracks.push(parseObjectTrack(content));
+          });
+          break;
         default:
           if (isPrivateOpcode(record.opcode)) {
             found.note(
@@ -325,6 +427,29 @@ export async function validateFile(
   if (header === null) found.error("no Header record");
   if (quantization === null) found.error("no Quantization record");
   if (footer === null) found.error("no Footer record");
+  // §4: "the Footer MUST be the last [record]". Presence is not position, and the
+  // difference is reachable: a record wedged between a real Footer and the trailing magic
+  // leaves every check above satisfied, while `IndexedDecoder.open` reads the tail record
+  // and parses its content as Footer fields whatever its opcode. The walk in `inspect.ts`
+  // refuses to read a tail that is not a Footer record; this is the same rule, on the same
+  // file, from the other tool.
+  if (footer !== null && seen.at(-1) !== Opcode.Footer) {
+    found.error(
+      `the last record is ${opcodeName(seen.at(-1)!)}; the Footer must be the last record (§4)`,
+    );
+  }
+
+  // The rules no single provenance or object record can enforce on its own — a duplicate
+  // name, a sensor posed against a rig the file does not carry, two tracks moving one
+  // object. `scene.ts` refuses these, so without them a file this package cannot decode
+  // was being reported as conforming.
+  for (const layer of [provenance, objects]) {
+    try {
+      layer.check();
+    } catch (error) {
+      found.error(message(error));
+    }
+  }
 
   if (header !== null) {
     if (counted !== header.gaussianCount) {
@@ -395,6 +520,21 @@ export async function validateFile(
       found.error(`chunk index entry ${i} points past the end of the file`);
     } else if (data[entry.chunkOffset] !== Opcode.Chunk) {
       found.error(`chunk index entry ${i} does not point at a Chunk record`);
+    } else {
+      // §5.8: "Every offset and length here frames a whole record, opcode byte and
+      // content length included, so a reader fetches `[offset, offset + length)` and
+      // parses it exactly as it would parse that record mid-stream." An entry whose first
+      // byte is right and whose length is not describes a range no reader can parse:
+      // `IndexedDecoder.readChunk` range-reads exactly this many bytes before framing
+      // them, so the seek path — a first-class read path, not an optimization (AGENTS.md
+      // §2) — fails on a file the checks above call conforming.
+      const framed = recordLengthAt(data, entry.chunkOffset);
+      if (framed !== null && framed !== entry.chunkLength) {
+        found.error(
+          `chunk index entry ${i} declares ${entry.chunkLength} bytes at ` +
+            `${entry.chunkOffset}; the record there is ${framed} bytes (§5.8)`,
+        );
+      }
     }
   });
 
@@ -411,6 +551,7 @@ export async function validateFile(
     ) {
       found.error("summary CRC mismatch: the index is untrustworthy (a streamed read still works)");
     }
+    checkSummaryComposition(data, footer.summaryStart, tail, found);
   }
 
   if (header !== null && index.length === 0) {
@@ -459,6 +600,119 @@ function checkQuantizationFinite(quant: Quantization, found: Findings, ordinal: 
         `${where} ${name} is ${spell(value)}; every step and origin must be finite (§5.3)`,
       );
     }
+  }
+}
+
+/**
+ * The per-band SH bit depths, against the degree the Header declares (spec §6.5).
+ *
+ * The Python and Rust validators both make this check; until `parseQuantization` read the
+ * appended field, this one could not, which is the whole of why it was missing. Only
+ * checked when the file actually carries bands: appended fields are positional, so a
+ * record that ends in bytes some other writer appended can parse as a depth list by
+ * coincidence, and on a file with no coefficients that is a false alarm waiting to happen.
+ */
+function checkShBitDepths(quant: Quantization, shDegree: number, found: Findings): void {
+  if (quant.shBitDepths.length === 0 || shDegree <= 0) return;
+  if (quant.shBitDepths.length !== shDegree) {
+    found.error(
+      `Quantization declares ${quant.shBitDepths.length} SH bit depths; the Header declares ` +
+        `degree ${shDegree}, and there is one band per degree (§6.5)`,
+    );
+  }
+  const declared = quant.shBitDepths.slice(0, shDegree);
+  declared.forEach((bits, i) => {
+    const key = `sh_band${i + 1}`;
+    const expected = String(shBound(bits));
+    const value = quant.bounds.get(key);
+    if (value === undefined) {
+      found.warn(
+        `Quantization declares ${bits} bits for SH band ${i + 1} but no \`${key}\` bound (§5.3)`,
+      );
+    } else if (value !== expected) {
+      found.warn(
+        `Quantization declares \`${key}\` as ${value}; ${bits} bits gives a bound of ` +
+          `${expected} (§6.5)`,
+      );
+    }
+  });
+  const coarsest = Math.max(...declared.map(shStep));
+  if (quant.stepSh !== coarsest) {
+    found.warn(
+      `Quantization step_sh is ${quant.stepSh}; the coarsest declared band has a pitch of ` +
+        `${coarsest}, which is what a consumer that reads only step_sh has to be given (§6.5)`,
+    );
+  }
+}
+
+/**
+ * The summary is exactly the Chunk Index, Statistics and Summary Offset records, as one
+ * contiguous run (spec §4.5).
+ *
+ * The checksum above proves the bytes in the range are the bytes the writer checksummed;
+ * it says nothing about what they are. A Chunk or an Attachment inside the run passes it
+ * with a recomputed CRC — and then a streamed reader, which retains the trailing run of
+ * summary records precisely because §4.5 promises it is one, has retained the wrong bytes,
+ * while `IndexedDecoder.open` reads the whole declared range in one allocation to find an
+ * index inside it.
+ */
+function checkSummaryComposition(
+  data: Uint8Array,
+  start: number,
+  end: number,
+  found: Findings,
+): void {
+  let at = start;
+  while (at < end) {
+    const length = recordLengthAt(data, at);
+    if (length === null || at + length > end) {
+      found.error(
+        `the summary at ${start} is not a whole run of records; the one at ${at} does not ` +
+          `frame inside it (§4.5)`,
+      );
+      return;
+    }
+    if (!SUMMARY_OPCODES.has(data[at]!)) {
+      found.error(
+        `the summary carries a ${opcodeName(data[at]!)} record at ${at}; the summary is ` +
+          `exactly the Chunk Index, Statistics and Summary Offset records (§4.5)`,
+      );
+      return;
+    }
+    at += length;
+  }
+}
+
+/** The three records §4.5 admits into the summary. */
+const SUMMARY_OPCODES: ReadonlySet<number> = new Set<number>([
+  Opcode.ChunkIndex,
+  Opcode.Statistics,
+  Opcode.SummaryOffset,
+]);
+
+/**
+ * The whole length of the record framed at `offset` — header included — or `null` when
+ * the bytes there do not frame one inside the file.
+ */
+function recordLengthAt(data: Uint8Array, offset: number): number | null {
+  if (offset + RECORD_HEADER_BYTES > data.length) return null;
+  let contentLength: number;
+  try {
+    contentLength = new Cursor(data, offset + 1).u64();
+  } catch {
+    return null;
+  }
+  const total = contentLength + RECORD_HEADER_BYTES;
+  if (!Number.isSafeInteger(offset + total) || offset + total > data.length) return null;
+  return total;
+}
+
+/** Run a record parser, turning a refusal into a finding rather than an abort. */
+function parseInto(found: Findings, record: string, parse: () => void): void {
+  try {
+    parse();
+  } catch (error) {
+    found.error(`${record} does not parse: ${message(error)}`);
   }
 }
 

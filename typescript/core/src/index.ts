@@ -201,11 +201,15 @@ export {
 
 export {
   MAX_SH_DEGREE,
+  SH_MAX_BITS,
+  SH_MIN_BITS,
   type ShCoefficients,
   bandCoefficientRange,
   coefficientsForDegree,
   coefficientsInBand,
   mergeBands,
+  shBound,
+  shStep,
 } from "./sh.js";
 
 export {

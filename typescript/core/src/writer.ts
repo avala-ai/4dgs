@@ -21,7 +21,7 @@
  */
 
 import { crc32 } from "./codec.js";
-import { bandCoefficientRange } from "./sh.js";
+import { SH_MAX_BITS, SH_MIN_BITS, bandCoefficientRange, shBound, shStep } from "./sh.js";
 
 /** The gaussians to encode, structure-of-arrays — the shape a decoder hands back. */
 export interface GaussianInput {
@@ -94,8 +94,6 @@ const LIFE_HALF_MIN = 0.02;
 const LIFE_HALF_MAX = 2.0;
 const MU_REL = 0.05;
 const MU_MIN_CLASS = -10;
-const SH_MIN_BITS = 3;
-const SH_MAX_BITS = 8;
 
 /** The default profile's error bounds and the grid pitches they imply. */
 interface Grid {
@@ -210,14 +208,6 @@ function quantizeRotation(
 /** The forward reversible colour transform: store `(g, r - g, b - g)`. */
 function rctForward(r: number, g: number, b: number): [number, number, number] {
   return [g, r - g, b - g];
-}
-
-function shStep(bits: number): number {
-  return 1 << (SH_MAX_BITS - Math.min(Math.max(bits, SH_MIN_BITS), SH_MAX_BITS));
-}
-
-function shBound(bits: number): number {
-  return shStep(bits) >> 1;
 }
 
 /** Round one coefficient byte onto the grid `bits` names, at bin centres. */

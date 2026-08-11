@@ -21,8 +21,9 @@
  * abstraction with no filesystem in it.
  */
 
+import { realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { FourdgsError } from "@4dgs/core";
 import { FileHandleReadable } from "./index.js";
 import { inspectFile, type InspectReport } from "./inspect.js";
@@ -167,6 +168,10 @@ async function inspect(args: Args, sink: Sink): Promise<number> {
     sink.err(`4dgs: stopped: ${report.stopped}`);
     return EXIT_FAILED;
   }
+  // A file that does not end with the magic is truncated or was written by a broken
+  // encoder — `validate` calls that an error, and a walk that printed the same observation
+  // as a note and exited 0 would let a pipeline accept what the validator refuses.
+  if (!report.trailingMagic) return EXIT_FAILED;
   return report.summaryCrc !== null && !report.summaryCrc.ok ? EXIT_FAILED : EXIT_OK;
 }
 
@@ -290,8 +295,32 @@ function printInspectJson(report: InspectReport, sink: Sink): void {
   );
 }
 
+/**
+ * True when this module is what was invoked, rather than imported.
+ *
+ * Compared after `realpath`, because the installed `4dgs` is a **symlink**: npm links
+ * `node_modules/.bin/4dgs` at this file, and Node resolves the entry point it reports in
+ * `import.meta.url` through that link while leaving `process.argv[1]` as the path the
+ * shell used. Comparing the two directly is false for every installed invocation, so the
+ * advertised executable would exit 0 having printed nothing — the one failure mode a
+ * command-line tool must not have. Resolving both ends makes the comparison about the
+ * file rather than about the route taken to it.
+ */
+function invokedDirectly(argv1: string | undefined): boolean {
+  if (argv1 === undefined) return false;
+  const here = fileURLToPath(import.meta.url);
+  try {
+    return realpathSync(argv1) === realpathSync(here);
+  } catch {
+    // An `argv[1]` that no longer resolves is not this file; a `realpath` that fails on
+    // this file itself means the module was loaded from something the filesystem cannot
+    // name, and neither is a reason to fall over before parsing an argument.
+    return argv1 === here;
+  }
+}
+
 // Run only when this module is what was invoked, so the tests can import `main` and drive
 // it without the process exiting underneath them.
-if (process.argv[1] !== undefined && pathToFileURL(process.argv[1]).href === import.meta.url) {
+if (invokedDirectly(process.argv[1])) {
   process.exitCode = await main(process.argv.slice(2));
 }
