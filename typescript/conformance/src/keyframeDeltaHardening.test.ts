@@ -145,7 +145,7 @@ async function oneGaussianStreams(
   windowIndex: number,
   motionBinX: number,
   objectId?: number,
-  options: { id?: number; rotationChannels?: number } = {},
+  options: { id?: number; idChannels?: number; rotationChannels?: number } = {},
 ): Promise<Uint8Array> {
   const s = (attributeId: number, values: number[], channels: number) =>
     encodeTestStream({ attributeId, values, channels });
@@ -157,7 +157,11 @@ async function oneGaussianStreams(
   return concat(
     await Promise.all([
       ...membership,
-      s(Attribute.GaussianId, [options.id ?? 0], 1),
+      s(
+        Attribute.GaussianId,
+        options.idChannels === 2 ? [options.id ?? 0, 123] : [options.id ?? 0],
+        options.idChannels ?? 1,
+      ),
       s(Attribute.Position, [0, 0, 0], 3),
       s(Attribute.Scale, [0, 0, 0], 3),
       s(Attribute.RotationIndex, [3], 1),
@@ -222,6 +226,7 @@ function deltaChunkRecord(options: {
 async function keyframeThenBirthFile(options: {
   born: number;
   objectId: number;
+  birthIdChannels?: number;
 }): Promise<Uint8Array> {
   const keyframeStreams = await oneGaussianStreams(0, 0);
   const keyframe = chunkRecord(0, 0.5, keyframeStreams, "", keyframeStreams.length);
@@ -231,7 +236,10 @@ async function keyframeThenBirthFile(options: {
     record(0x03, quantizationBody()),
     record(0x04, windowTableBody([[0, 1]])),
   ]);
-  const births = await oneGaussianStreams(0, 0, options.objectId, { id: options.born });
+  const births = await oneGaussianStreams(0, 0, options.objectId, {
+    id: options.born,
+    ...(options.birthIdChannels === undefined ? {} : { idChannels: options.birthIdChannels }),
+  });
   return concat([
     front,
     keyframe,
@@ -301,13 +309,19 @@ async function oneKeyframeFile(options: {
   duration: number;
   compress?: boolean;
   objectId?: number;
+  idChannels?: number;
   rotationChannels?: number;
 }): Promise<Uint8Array> {
   const rawStreams = await oneGaussianStreams(
     options.windowIndex,
     options.motionBinX,
     options.objectId,
-    options.rotationChannels === undefined ? {} : { rotationChannels: options.rotationChannels },
+    {
+      ...(options.idChannels === undefined ? {} : { idChannels: options.idChannels }),
+      ...(options.rotationChannels === undefined
+        ? {}
+        : { rotationChannels: options.rotationChannels }),
+    },
   );
   const blob = options.compress ? await deflate(rawStreams) : rawStreams;
   const chunk = chunkRecord(
@@ -690,6 +704,50 @@ test("an attribute stream whose channel width is not the registry's is refused",
       error instanceof MalformedFile &&
       /attribute 3 declares 1 channels, the format defines 3/.test(error.message),
   );
+});
+
+test("gaussian_id is one channel in keyframes and delta groups", async () => {
+  const keyframe = await oneKeyframeFile({
+    windows: [[0, 1]],
+    windowIndex: 0,
+    motionBinX: 0,
+    duration: 1,
+    idChannels: 2,
+  });
+  await assert.rejects(
+    () => decodeKeyframeDeltaStreamed(keyframe),
+    (error: unknown) =>
+      error instanceof MalformedFile &&
+      /attribute 13 .*declares 2 channels, the format defines 1/.test(error.message),
+  );
+
+  const birth = await keyframeThenBirthFile({
+    born: 7,
+    objectId: 9,
+    birthIdChannels: 2,
+  });
+  await assert.rejects(
+    () => decodeKeyframeDeltaStreamed(birth),
+    (error: unknown) =>
+      error instanceof MalformedFile &&
+      /attribute 13 .*declares 2 channels, the format defines 1/.test(error.message),
+  );
+});
+
+test("SH dimensions are checked before a constant stream can expand", async () => {
+  const data = await oneKeyframeShFile();
+  const band = [...iterateRecords(data, MAGIC.length)].find((record) => record.opcode === 0x07)!;
+  const mutated = data.slice();
+  const streamAt = band.offset + 9 + 1;
+  mutated[streamAt + 2] = 2; // constant mode: nine payload symbols can claim many rows
+  new DataView(mutated.buffer, mutated.byteOffset, mutated.byteLength).setUint32(
+    streamAt + 5,
+    7_000_000,
+    true,
+  );
+  const expected = /SH band 1 carries 7000000 rows, expected 1/;
+  await assert.rejects(() => decodeKeyframeDeltaStreamed(mutated), expected);
+  await assert.rejects(() => decodeKeyframeDeltaIndexed(mutated), expected);
 });
 
 test("canonical summaries handle more chunks than V8's argument limit", async () => {

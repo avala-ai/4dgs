@@ -18,7 +18,10 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  BytesReadable,
+  KeyframeDeltaIndexedDecoder,
   MalformedFile,
+  chainFor,
   decodeKeyframeDeltaIndexed,
   decodeKeyframeDeltaStreamed,
   keyframeDeltaChunkAt,
@@ -158,6 +161,43 @@ test("the indexed path walks a chain to every chunk", async () => {
   // asserts, so reaching here is the check.
   assert.equal(result.index.length, result.sequence.chunks.length);
   assert.ok(result.sequence.chunks.every((c) => c.state.count >= 4));
+});
+
+test("the range-backed indexed decoder reads only the requested chain", async () => {
+  const data = bytes(MOVING_CHAINED);
+  const source = new (class extends BytesReadable {
+    readonly ranges: { offset: number; length: number }[] = [];
+
+    override read(offset: bigint, length: bigint): Promise<Uint8Array> {
+      this.ranges.push({ offset: Number(offset), length: Number(length) });
+      return super.read(offset, length);
+    }
+  })(data);
+  const decoder = await KeyframeDeltaIndexedDecoder.open(source, { headProbeBytes: 64 });
+  source.ranges.length = 0;
+
+  const target = decoder.index[decoder.index.length - 1]!;
+  const t = (target.t0 + target.t1) / 2;
+  const chain = chainFor(decoder.index, t);
+  const allowed = new Set<string>();
+  for (const entry of chain) {
+    allowed.add(`${entry.chunkOffset}:${entry.chunkLength}`);
+    for (const band of entry.bands) allowed.add(`${band.offset}:${band.length}`);
+  }
+
+  const ranged = await decoder.reconstructAt(t);
+  assert.ok(source.ranges.length > 0);
+  assert.ok(
+    source.ranges.every(({ offset, length }) => allowed.has(`${offset}:${length}`)),
+    `seek read an unrelated range: ${JSON.stringify(source.ranges)}`,
+  );
+  assert.ok(source.ranges.every(({ length }) => length < data.byteLength));
+
+  const whole = (await decodeKeyframeDeltaIndexed(data)).sequence;
+  const expected = reconstructKeyframeDelta(whole, keyframeDeltaChunkAt(whole, t), t);
+  assert.deepEqual([...ranged.ids], [...expected.ids]);
+  assert.deepEqual([...ranged.centers], [...expected.centers]);
+  assert.deepEqual([...ranged.rotations], [...expected.rotations]);
 });
 
 // The streamed and indexed sequences expose the same header, a small sanity tie.

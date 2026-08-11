@@ -19,6 +19,9 @@ The four packages version together.
   consumers had to reimplement §11.7 to get every attribute of every gaussian.
 - `dequantizeRotation` accepts a `Float64Array` output as well as a `Float32Array`.
 - `ATTRIBUTE_CHANNELS`, the interleaving width the registry gives each attribute id it defines.
+- `KeyframeDeltaIndexedDecoder`, a range-backed `IReadable` seek for `keyframe-delta` files. Opening
+  reads bounded front-matter and summary windows; `reconstructAt(t)` fetches and composes only the
+  index chain and spherical-harmonic ranges needed for that instant.
 - **Refusals say which rule was broken.** Every error in `@4dgs/core` now carries an optional
   `refusalCode`, and the six identifiers the specification's refusal table names — `magic-mismatch`,
   `unsupported-major-version`, `unknown-temporal-model`, `unknown-quantization-scheme`,
@@ -41,6 +44,8 @@ The four packages version together.
   present at full opacity: outside the window a gaussian does not exist at that time (spec §3),
   which is how the `gaussian-birth` path has always decided it. Unobservable on files that carry one
   full-duration window, which is every keyframe-delta file in the corpus today.
+- `ObjectLayer.apply` accepts either `Float32Array` or `Float64Array` centres and orientations, so
+  object tracks compose directly onto `keyframe-delta` reconstruction without a narrowing copy.
 
 ### Fixed
 
@@ -51,6 +56,9 @@ The four packages version together.
   end, which arithmetic turns into a `NaN` quaternion rather than into a refusal. The rule was
   enforced for `object_id` alone, where a wrong width would have shifted every gaussian's
   membership; `ATTRIBUTE_CHANNELS` now states it once for every attribute the registry names.
+- **SH Band Stream dimensions are checked before payload decode.** A constant stream can expand a
+  handful of symbols into its declared row count, so band, width, and chunk row count are now
+  compared before an untrusted declaration can allocate hundreds of megabytes.
 - **A birth that introduces `object_id` no longer misaligns the column it introduces.** Membership
   is optional per chunk and its omission means `0` (§6.6), so a background keyframe without the
   stream followed by a delta birth that has one is a legal file. Composed without a default for the

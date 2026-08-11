@@ -40,9 +40,10 @@ import {
   stepsFrom,
   windowTableOrDefault,
 } from "./chunk.js";
-import { DEFAULT_CODECS, type CodecRegistry } from "./codec.js";
+import { Crc32, DEFAULT_CODECS, type CodecRegistry } from "./codec.js";
 import { Cursor } from "./cursor.js";
 import { MalformedFile, TruncatedFile } from "./errors.js";
+import { FrontMatterScanner } from "./frontMatter.js";
 import { ATTRIBUTE_CHANNELS, Attribute, GAUSSIAN_FLAG_NEVER_FADES } from "./opcodes.js";
 import {
   clamp,
@@ -55,12 +56,15 @@ import {
 } from "./quantization.js";
 import {
   DELTA_MODE_CHAINED,
+  FOOTER_TAIL_BYTES,
   MAGIC,
+  RECORD_HEADER_BYTES,
   type ChunkIndexEntry,
   type DeltaChunkHeader,
   type Header,
   type ParsedDeltaChunk,
   type Quantization,
+  bytesEqual,
   checkMagic,
   frameDeltaGroups,
   iterateRecords,
@@ -74,6 +78,7 @@ import {
   parseWindowTable,
   readRecord,
 } from "./records.js";
+import type { IReadable } from "./readable.js";
 import { Opcode } from "./opcodes.js";
 import { coefficientsInBand, mergeBands, type ShCoefficients } from "./sh.js";
 import { decodeStream, frameOneStream, frameStreams, type RawStream } from "./streams.js";
@@ -485,6 +490,7 @@ async function decodeGroup(
   if (gaussianId === undefined) {
     throw new MalformedFile("a keyframe-delta group carries no gaussian_id stream");
   }
+  checkChannels(Attribute.GaussianId, gaussianId, "a keyframe-delta group");
   streams.delete(Attribute.GaussianId);
   return { ids: idsOf(gaussianId), bins: streams };
 }
@@ -493,6 +499,9 @@ async function decodeGroup(
 async function decodeShBand(
   content: Uint8Array,
   codecs: CodecRegistry,
+  degree: number,
+  expectedRows: number,
+  where: string,
 ): Promise<{ band: number; stream: RawStream; values: Int32Array }> {
   const parsed = parseShBandRecord(content);
   const stream = frameOneStream(parsed.cursor);
@@ -505,6 +514,24 @@ async function decodeShBand(
     throw new MalformedFile(
       `SH band ${parsed.band} stream declares attribute id ${stream.attributeId}, the format ` +
         `defines ${Opcode.ShBandStream}`,
+    );
+  }
+  if (parsed.band < 1 || parsed.band > degree) {
+    throw new MalformedFile(
+      `${where} carries SH band ${parsed.band}, outside the Header's declared degree ${degree}`,
+    );
+  }
+  const channels = coefficientsInBand(parsed.band) * 3;
+  if (stream.channels !== channels) {
+    throw new MalformedFile(
+      `${where} SH band ${parsed.band} declares ${stream.channels} channels, degree ` +
+        `${parsed.band} defines ${channels}`,
+    );
+  }
+  if (stream.elementCount !== expectedRows) {
+    throw new MalformedFile(
+      `${where} SH band ${parsed.band} carries ${stream.elementCount} rows, expected ` +
+        `${expectedRows}`,
     );
   }
   return { band: parsed.band, stream, values: await decodeStream(stream, codecs) };
@@ -625,6 +652,7 @@ async function keyframeFromChunk(
     if (parsed.header.count === 0) return { ids: new Int32Array(0), bins: streams };
     throw new MalformedFile("a keyframe-delta chunk carries no gaussian_id stream");
   }
+  checkChannels(Attribute.GaussianId, gaussianId, "a keyframe");
   streams.delete(Attribute.GaussianId);
   if (parsed.header.count !== 0) {
     const missing = REQUIRED_KEYFRAME_ATTRIBUTES.filter((id) => !streams.has(id));
@@ -759,6 +787,13 @@ function checkIndexAgreesWithHeader(entry: ChunkIndexEntry, head: DeltaChunkHead
           `Delta Chunk it points at says ${name}=${headerValue}; the index and the record disagree`,
       );
     }
+  }
+  const changed = head.updateCount + head.birthCount + head.deathCount;
+  if (entry.gaussianCount !== changed) {
+    throw new MalformedFile(
+      `the Chunk Index entry at offset ${entry.chunkOffset} says gaussian_count=` +
+        `${entry.gaussianCount}, but the Delta Chunk declares ${changed} rows across its groups`,
+    );
   }
 }
 
@@ -910,8 +945,9 @@ export async function decodeKeyframeDeltaStreamed(
           `an SH Band Stream appears at byte ${record.offset} before a state chunk or Header`,
         );
       }
-      const decoded = await decodeShBand(record.content, codecs);
       const rows = currentChunk.kind === 0 ? currentChunk.state.count : currentChunk.birthCount!;
+      const where = `state chunk at byte ${currentChunk.offset}`;
+      const decoded = await decodeShBand(record.content, codecs, header.shDegree, rows, where);
       attachShBand(
         currentChunk.state,
         header.shDegree,
@@ -919,7 +955,7 @@ export async function decodeKeyframeDeltaStreamed(
         decoded.stream,
         decoded.values,
         rows,
-        `state chunk at byte ${currentChunk.offset}`,
+        where,
         currentBands,
       );
     } else if (record.opcode === Opcode.Footer) {
@@ -951,6 +987,236 @@ export async function decodeKeyframeDeltaStreamed(
 export interface KeyframeDeltaIndexedResult {
   readonly sequence: KeyframeDeltaSequence;
   readonly index: readonly ChunkIndexEntry[];
+}
+
+/** Options for opening the range-backed keyframe-delta reader. */
+export interface OpenKeyframeDeltaIndexedOptions {
+  readonly codecs?: CodecRegistry;
+  /** Bounded sliding-window size used while framing front matter and the summary. */
+  readonly headProbeBytes?: number;
+}
+
+const KEYFRAME_DELTA_HEAD_PROBE_BYTES = 64 * 1024;
+const MAX_KEYFRAME_DELTA_RECORD_BYTES = 64 * 1024 * 1024;
+
+/** Read exactly one transport range, naming a short read as a malformed resource. */
+async function readExact(source: IReadable, offset: number, length: number): Promise<Uint8Array> {
+  const bytes = await source.read(BigInt(offset), BigInt(length));
+  if (bytes.byteLength !== length) {
+    throw new MalformedFile(
+      `range [${offset}, ${offset + length}) returned ${bytes.byteLength} bytes, expected ${length}`,
+    );
+  }
+  return bytes;
+}
+
+/**
+ * A keyframe-delta file opened for indexed seeks over an {@link IReadable}.
+ *
+ * Opening reads bounded front-matter windows, the fixed Footer tail, and the small index.
+ * {@link chunkAt} and {@link reconstructAt} then fetch only `chainFor(index, t)` and that
+ * chain's SH ranges. No operation buffers the resource or composes unrelated chunks.
+ */
+export class KeyframeDeltaIndexedDecoder {
+  private constructor(
+    private readonly source: IReadable,
+    private readonly size: number,
+    private readonly codecs: CodecRegistry,
+    readonly header: Header,
+    readonly quantization: Quantization,
+    readonly windows: Float64Array,
+    readonly index: readonly ChunkIndexEntry[],
+  ) {}
+
+  static async open(
+    source: IReadable,
+    options: OpenKeyframeDeltaIndexedOptions = {},
+  ): Promise<KeyframeDeltaIndexedDecoder> {
+    const size64 = await source.size();
+    if (size64 > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new MalformedFile(`file size ${size64} exceeds JavaScript's exact integer range`);
+    }
+    const size = Number(size64);
+    if (size < MAGIC.length + FOOTER_TAIL_BYTES) {
+      throw new MalformedFile(`file is ${size} bytes, too short to hold a Header and Footer`);
+    }
+    const codecs = options.codecs ?? DEFAULT_CODECS;
+    const probeBytes = options.headProbeBytes ?? KEYFRAME_DELTA_HEAD_PROBE_BYTES;
+    if (!Number.isSafeInteger(probeBytes) || probeBytes < RECORD_HEADER_BYTES) {
+      throw new RangeError(`headProbeBytes must be an integer at least ${RECORD_HEADER_BYTES}`);
+    }
+
+    const front = new FrontMatterScanner(source, size, probeBytes);
+    checkMagic(await front.head(MAGIC.length));
+    let header: Header | null = null;
+    let quantization: Quantization | null = null;
+    let windows = new Float64Array(0);
+    for await (const record of front.records(MAGIC.length)) {
+      if (record.opcode === Opcode.Chunk || record.opcode === Opcode.DeltaChunk) break;
+      if (record.contentLength > MAX_KEYFRAME_DELTA_RECORD_BYTES) {
+        throw new MalformedFile(
+          `front-matter record opcode ${record.opcode} at byte ${record.offset} declares ` +
+            `${record.contentLength} bytes, past the ${MAX_KEYFRAME_DELTA_RECORD_BYTES}-byte ` +
+            `per-record reader limit`,
+        );
+      }
+      if (record.opcode === Opcode.Header) {
+        header = parseHeader(await front.content(record));
+        if (header.temporalModel !== "keyframe-delta") {
+          throw new MalformedFile(
+            `KeyframeDeltaIndexedDecoder is the keyframe-delta path; this file is ` +
+              `"${header.temporalModel}"`,
+          );
+        }
+      } else if (record.opcode === Opcode.Quantization) {
+        quantization = parseQuantization(await front.content(record));
+      } else if (record.opcode === Opcode.WindowTable) {
+        windows = parseWindowTable(await front.content(record));
+      }
+    }
+    if (header === null || quantization === null) {
+      throw new MalformedFile("keyframe-delta file has no Header or Quantization record");
+    }
+
+    const footerOffset = size - FOOTER_TAIL_BYTES;
+    const tail = await readExact(source, footerOffset, FOOTER_TAIL_BYTES);
+    if (!bytesEqual(tail.subarray(tail.byteLength - MAGIC.length), MAGIC)) {
+      throw new MalformedFile("file does not end with the magic; it may be truncated");
+    }
+    const footerRecord = readRecord(new Cursor(tail, 0, footerOffset));
+    if (
+      footerRecord.opcode !== Opcode.Footer ||
+      footerRecord.raw.byteLength !== FOOTER_TAIL_BYTES - MAGIC.length
+    ) {
+      throw new MalformedFile(`the fixed tail at byte ${footerOffset} is not one complete Footer`);
+    }
+    const footer = parseFooter(footerRecord.content);
+    if (footer.summaryStart < MAGIC.length || footer.summaryStart > footerOffset) {
+      throw new MalformedFile(
+        `Footer says the summary starts at ${footer.summaryStart}, outside ` +
+          `[${MAGIC.length}, ${footerOffset}]`,
+      );
+    }
+    if (footer.summaryStart === footerOffset) {
+      throw new MalformedFile("keyframe-delta file carries no Chunk Index summary");
+    }
+
+    if (footer.summaryCrc !== 0) {
+      const crc = new Crc32();
+      for (let at = footer.summaryStart; at < footerOffset;) {
+        const length = Math.min(KEYFRAME_DELTA_HEAD_PROBE_BYTES, footerOffset - at);
+        crc.update(await readExact(source, at, length));
+        at += length;
+      }
+      if (crc.digest() !== footer.summaryCrc) {
+        throw new MalformedFile(
+          `Footer summary CRC 0x${footer.summaryCrc.toString(16)} does not match the index bytes`,
+        );
+      }
+    }
+
+    const index: ChunkIndexEntry[] = [];
+    const summary = new FrontMatterScanner(source, footerOffset, probeBytes);
+    let summaryEnd = footer.summaryStart;
+    for await (const record of summary.records(footer.summaryStart)) {
+      summaryEnd = record.offset + record.totalLength;
+      if (record.opcode !== Opcode.ChunkIndex) continue;
+      if (record.contentLength > MAX_KEYFRAME_DELTA_RECORD_BYTES) {
+        throw new MalformedFile(
+          `Chunk Index record at byte ${record.offset} declares ${record.contentLength} bytes, ` +
+            `past the ${MAX_KEYFRAME_DELTA_RECORD_BYTES}-byte per-record reader limit`,
+        );
+      }
+      index.push(parseChunkIndexEntry(await summary.content(record)));
+    }
+    if (summaryEnd !== footerOffset) {
+      throw new MalformedFile(
+        `summary records end at byte ${summaryEnd}, the Footer starts at ${footerOffset}`,
+      );
+    }
+    checkTiling(index, header.durationSec, true);
+    return new KeyframeDeltaIndexedDecoder(
+      source,
+      size,
+      codecs,
+      header,
+      quantization,
+      windows,
+      index,
+    );
+  }
+
+  /** Compose only the indexed chain covering `t`. */
+  async chunkAt(t: number): Promise<KeyframeDeltaChunkInfo> {
+    const chain = chainFor(this.index, t);
+    const entry = chain[chain.length - 1]!;
+    const cached = new Map<string, Promise<IndexedRecord>>();
+    const read: IndexedRecordReader = (offset, length) => {
+      const key = `${offset}:${length}`;
+      let pending = cached.get(key);
+      if (pending === undefined) {
+        pending = (async () => {
+          if (offset < 0 || length < RECORD_HEADER_BYTES || offset + length > this.size) {
+            throw new MalformedFile(
+              `indexed range [${offset}, ${offset + length}) is outside the ${this.size}-byte file`,
+            );
+          }
+          return indexedRecordFromBytes(
+            await readExact(this.source, offset, length),
+            offset,
+            length,
+          );
+        })();
+        cached.set(key, pending);
+      }
+      return pending;
+    };
+    const state = await composeChainFromReader(
+      read,
+      this.index,
+      entry,
+      this.codecs,
+      this.header.shDegree,
+    );
+    let updateCount: number | null = null;
+    let birthCount: number | null = null;
+    let deathCount: number | null = null;
+    if (entry.kind !== 0) {
+      const parsed = parseDeltaChunk((await read(entry.chunkOffset, entry.chunkLength)).content);
+      checkIndexAgreesWithHeader(entry, parsed.header);
+      updateCount = parsed.header.updateCount;
+      birthCount = parsed.header.birthCount;
+      deathCount = parsed.header.deathCount;
+    }
+    return {
+      t0: entry.t0,
+      t1: entry.t1,
+      kind: entry.kind,
+      deltaMode: entry.kind === 0 ? null : entry.deltaMode,
+      depth: entry.depth,
+      offset: entry.chunkOffset,
+      referenceOffset: entry.referenceOffset,
+      updateCount,
+      birthCount,
+      deathCount,
+      state,
+    };
+  }
+
+  /** Compose and reconstruct the gaussian state at `t`, touching only its indexed chain. */
+  async reconstructAt(t: number): Promise<KeyframeDeltaGaussians> {
+    const chunk = await this.chunkAt(t);
+    return reconstructKeyframeDelta(
+      {
+        header: this.header,
+        quantization: this.quantization,
+        windows: this.windows,
+        chunks: [chunk],
+      },
+      chunk,
+      t,
+    );
+  }
 }
 
 /**
@@ -996,6 +1262,7 @@ export async function decodeKeyframeDeltaIndexed(
   checkTiling(index, header.durationSec, true);
 
   const chunks: KeyframeDeltaChunkInfo[] = [];
+  const read = wholeFileRecordReader(data);
   for (const entry of index) {
     const state = await composeChain(data, index, entry, codecs, header.shDegree);
     let updateCount: number | null = null;
@@ -1006,7 +1273,7 @@ export async function decodeKeyframeDeltaIndexed(
       // that wants the split reads the delta chunk's own header. The chain walk already
       // fetched this record; parsing its header again is cheap.
       const head = parseDeltaChunk(
-        recordContentAt(data, entry.chunkOffset, entry.chunkLength),
+        (await read(entry.chunkOffset, entry.chunkLength)).content,
       ).header;
       // The index duplicates six of the header's fields (§5.8); refuse a disagreement,
       // because the chain was selected from the index while the composed record is the
@@ -1034,14 +1301,56 @@ export async function decodeKeyframeDeltaIndexed(
   return { sequence: { header, quantization, windows, chunks }, index };
 }
 
-function recordContentAt(data: Uint8Array, offset: number, length: number): Uint8Array {
-  const c = new Cursor(data.subarray(offset, offset + length));
-  c.u8();
-  return c.take(c.u64());
+interface IndexedRecord {
+  readonly opcode: number;
+  readonly content: Uint8Array;
+}
+
+type IndexedRecordReader = (offset: number, length: number) => Promise<IndexedRecord>;
+
+function indexedRecordFromBytes(
+  bytes: Uint8Array,
+  offset: number,
+  expectedLength: number,
+): IndexedRecord {
+  if (bytes.byteLength !== expectedLength) {
+    throw new MalformedFile(
+      `indexed range at byte ${offset} returned ${bytes.byteLength} bytes, expected ${expectedLength}`,
+    );
+  }
+  const record = readRecord(new Cursor(bytes, 0, offset));
+  if (record.raw.byteLength !== expectedLength) {
+    throw new MalformedFile(
+      `indexed range at byte ${offset} declares one ${record.raw.byteLength}-byte record, ` +
+        `the index range is ${expectedLength} bytes`,
+    );
+  }
+  return { opcode: record.opcode, content: record.content };
+}
+
+function wholeFileRecordReader(data: Uint8Array): IndexedRecordReader {
+  return async (offset, length) => {
+    if (offset < 0 || length < 9 || offset + length > data.byteLength) {
+      throw new MalformedFile(
+        `indexed range [${offset}, ${offset + length}) is outside the ${data.byteLength}-byte file`,
+      );
+    }
+    return indexedRecordFromBytes(data.subarray(offset, offset + length), offset, length);
+  };
 }
 
 async function composeChain(
   data: Uint8Array,
+  index: readonly ChunkIndexEntry[],
+  entry: ChunkIndexEntry,
+  codecs: CodecRegistry,
+  shDegree: number,
+): Promise<KeyframeDeltaState> {
+  return composeChainFromReader(wholeFileRecordReader(data), index, entry, codecs, shDegree);
+}
+
+async function composeChainFromReader(
+  read: IndexedRecordReader,
   index: readonly ChunkIndexEntry[],
   entry: ChunkIndexEntry,
   codecs: CodecRegistry,
@@ -1054,17 +1363,34 @@ async function composeChain(
   // does not hold `level` — it is a chunk field — so the rule is enforced here.
   let keyframeLevel = 0;
   for (const link of chain) {
-    const content = recordContentAt(data, link.chunkOffset, link.chunkLength);
+    const record = await read(link.chunkOffset, link.chunkLength);
+    const wanted = link.kind === 0 ? Opcode.Chunk : Opcode.DeltaChunk;
+    if (record.opcode !== wanted) {
+      throw new MalformedFile(
+        `the Chunk Index entry at ${link.chunkOffset} declares chunk_kind ${link.kind}, but ` +
+          `the record there has opcode ${record.opcode} instead of ${wanted}`,
+      );
+    }
+    const content = record.content;
     if (link.kind === 0) {
       const decoded = await keyframeFromChunk(content, codecs);
       state = keyframeState(decoded.ids, decoded.bins);
-      keyframeLevel = parseChunk(content).header.level;
-      await attachIndexedShBands(data, link, state, shDegree, state.count, codecs);
+      const head = parseChunk(content).header;
+      keyframeLevel = head.level;
+      if (link.t0 !== head.t0 || link.t1 !== head.t1 || link.gaussianCount !== state.count) {
+        throw new MalformedFile(
+          `the Chunk Index entry at ${link.chunkOffset} declares interval ` +
+            `[${link.t0}, ${link.t1}) and gaussian_count ${link.gaussianCount}; the keyframe ` +
+            `Chunk there declares [${head.t0}, ${head.t1}) and ${state.count}`,
+        );
+      }
+      await attachIndexedShBands(read, link, state, shDegree, state.count, codecs);
     } else {
       if (state === null) {
         throw new MalformedFile("a keyframe-delta chain begins with a delta chunk");
       }
       const parsed = parseDeltaChunk(content);
+      checkIndexAgreesWithHeader(link, parsed.header);
       // The reference this delta composes onto is its own `reference_offset` (the previous
       // link for a chained delta, the keyframe for a keyframe-referenced one); name that in
       // the diagnostic, not the GOP keyframe (§11.6).
@@ -1075,7 +1401,7 @@ async function composeChain(
         parsed.header.referenceOffset,
       );
       state = await composeDelta(state, parsed, codecs);
-      await attachIndexedShBands(data, link, state, shDegree, parsed.header.birthCount, codecs);
+      await attachIndexedShBands(read, link, state, shDegree, parsed.header.birthCount, codecs);
     }
     checkCompleteSh(state, shDegree, `state chunk at byte ${link.chunkOffset}`);
   }
@@ -1084,7 +1410,7 @@ async function composeChain(
 }
 
 async function attachIndexedShBands(
-  data: Uint8Array,
+  read: IndexedRecordReader,
   entry: ChunkIndexEntry,
   state: KeyframeDeltaState,
   shDegree: number,
@@ -1093,28 +1419,15 @@ async function attachIndexedShBands(
 ): Promise<void> {
   const attached = new Set<number>();
   for (const range of entry.bands) {
-    if (range.offset < 0 || range.length < 0 || range.offset + range.length > data.length) {
-      throw new MalformedFile(
-        `state chunk at byte ${entry.chunkOffset} indexes SH band ${range.band} at byte ` +
-          `${range.offset} for ${range.length} bytes, outside the ${data.length}-byte file`,
-      );
-    }
-    const record = readRecord(
-      new Cursor(data.subarray(range.offset, range.offset + range.length), 0, range.offset),
-    );
+    const record = await read(range.offset, range.length);
     if (record.opcode !== Opcode.ShBandStream) {
       throw new MalformedFile(
         `state chunk at byte ${entry.chunkOffset} indexes SH band ${range.band} at byte ` +
           `${range.offset}, which holds opcode ${record.opcode} rather than an SH Band Stream`,
       );
     }
-    if (record.raw.length !== range.length) {
-      throw new MalformedFile(
-        `state chunk at byte ${entry.chunkOffset} indexes SH band ${range.band} with length ` +
-          `${range.length}, its record occupies ${record.raw.length}`,
-      );
-    }
-    const decoded = await decodeShBand(record.content, codecs);
+    const where = `state chunk at byte ${entry.chunkOffset}`;
+    const decoded = await decodeShBand(record.content, codecs, shDegree, addedRows, where);
     if (decoded.band !== range.band) {
       throw new MalformedFile(
         `state chunk at byte ${entry.chunkOffset} indexes SH band ${range.band}, the record ` +
@@ -1128,7 +1441,7 @@ async function attachIndexedShBands(
       decoded.stream,
       decoded.values,
       addedRows,
-      `state chunk at byte ${entry.chunkOffset}`,
+      where,
       attached,
     );
   }
@@ -1204,7 +1517,15 @@ export function checkTiling(
  */
 export function chainFor(index: readonly ChunkIndexEntry[], t: number): ChunkIndexEntry[] {
   const byOffset = new Map<number, ChunkIndexEntry>();
-  for (const entry of index) byOffset.set(entry.chunkOffset, entry);
+  for (const entry of index) {
+    if (entry.kind !== 0 && entry.kind !== 1) {
+      throw new MalformedFile(
+        `the Chunk Index entry at ${entry.chunkOffset} declares unknown chunk_kind ${entry.kind}; ` +
+          "expected 0 (keyframe) or 1 (delta)",
+      );
+    }
+    byOffset.set(entry.chunkOffset, entry);
+  }
   let current: ChunkIndexEntry | undefined;
   for (const entry of index) {
     if (entry.t0 <= t && t < entry.t1) {
