@@ -10,6 +10,48 @@ import 'package:fourdgs_conformance/checks.dart';
 import 'package:test/test.dart';
 
 void main() {
+  FourdgsChunkIndexEntry entry({
+    required double t0,
+    required double t1,
+    int gaussianCount = 1,
+  }) => FourdgsChunkIndexEntry(
+    t0: t0,
+    t1: t1,
+    chunkOffset: 0,
+    chunkLength: 0,
+    gaussianCount: gaussianCount,
+    bands: const <FourdgsBandRange>[],
+  );
+
+  test('seek probes cover degenerate pitches and unbounded starts', () {
+    expect(seekGuardSigmaBin(1.0, 0.0), 0);
+
+    for (final interval in <FourdgsChunkIndexEntry>[
+      entry(t0: double.negativeInfinity, t1: 4.0),
+      entry(t0: double.negativeInfinity, t1: double.infinity),
+    ]) {
+      final probes = seekProbeInstants(interval, (_) => 0.0);
+      expect(probes, isNotEmpty);
+      expect(probes.every((t) => t.isFinite), isTrue);
+      expect(probes.every(interval.covers), isTrue);
+    }
+  });
+
+  test('seek entry cap is applied after unusable entries are removed', () {
+    final populated = entry(t0: 100.0, t1: 101.0);
+    final index = <FourdgsChunkIndexEntry>[
+      for (int i = 0; i < 40; i++)
+        if (i == 23)
+          populated
+        else
+          entry(t0: i.toDouble(), t1: i.toDouble(), gaussianCount: 0),
+    ];
+    expect(
+      boundedSeekProbeEntries(index, isKeyframeDelta: false),
+      equals(<FourdgsChunkIndexEntry>[populated]),
+    );
+  });
+
   test('seek proof samples indexes made only of open-ended entries', () async {
     final rotations = Float32List(8);
     rotations[3] = 1.0;

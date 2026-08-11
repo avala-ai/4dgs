@@ -29,6 +29,73 @@ class ConformanceFailure implements Exception {
   String toString() => 'conformance: $message';
 }
 
+/// The stable inverse representative for a reconstructed sigma grid.
+///
+/// A zero pitch is legal and maps every finite bin to sigma 1. There is no
+/// unique inverse in that case, so bin zero is the representative used by the
+/// seek-rounding guard.
+int seekGuardSigmaBin(double sigma, double sigmaLogStep) =>
+    sigmaLogStep == 0.0
+        ? 0
+        : (math.log(math.max(sigma, 1e-30)) / sigmaLogStep).round();
+
+/// At most [limit] evenly spaced entries that can exercise a selective seek.
+///
+/// Filtering precedes sampling so an index full of legal empty entries cannot
+/// hide its one populated interval between sample positions.
+List<FourdgsChunkIndexEntry> boundedSeekProbeEntries(
+  List<FourdgsChunkIndexEntry> index, {
+  required bool isKeyframeDelta,
+  int limit = 16,
+}) {
+  final usable = <FourdgsChunkIndexEntry>[
+    for (final entry in index)
+      if (entry.t1 > entry.t0 &&
+          indexEntryPopulation(entry, isKeyframeDelta: isKeyframeDelta) > 0)
+        entry,
+  ];
+  if (usable.length <= limit) return usable;
+  return <FourdgsChunkIndexEntry>[
+    for (int slot = 0; slot < limit; slot++)
+      usable[slot * (usable.length - 1) ~/ (limit - 1)],
+  ];
+}
+
+/// Finite instants strictly inside an index entry, including unbounded ones.
+List<double> seekProbeInstants(
+  FourdgsChunkIndexEntry entry,
+  double Function(double boundary) guardAt,
+) {
+  final span = entry.t1 - entry.t0;
+  if (span.isFinite) {
+    return <double>[
+      for (final fraction in const <double>[0.13, 0.37, 0.61, 0.89])
+        entry.t0 + fraction * span,
+    ];
+  }
+  if (entry.t0.isFinite) {
+    final step = math.max(
+      1.0,
+      math.max(4.0 * guardAt(entry.t0), entry.t0.abs() * 1e-6),
+    );
+    return <double>[
+      for (final factor in const <double>[0.5, 1.5, 3.5, 7.5])
+        entry.t0 + factor * step,
+    ];
+  }
+  if (entry.t1.isFinite) {
+    final step = math.max(
+      1.0,
+      math.max(4.0 * guardAt(entry.t1), entry.t1.abs() * 1e-6),
+    );
+    return <double>[
+      for (final factor in const <double>[0.5, 1.5, 3.5, 7.5])
+        entry.t1 - factor * step,
+    ];
+  }
+  return const <double>[-3.5, -0.5, 0.5, 3.5];
+}
+
 /// A [FourdgsReadable] that records what it transferred, so a claim about byte
 /// ranges can be checked against the bytes that actually moved.
 class CountingReadable implements FourdgsReadable {
@@ -190,7 +257,7 @@ Future<int> checkSeekReadsOnlyWhatItNeeds(
     for (int i = 0; i < whole.count; i++) {
       final sigma = whole.sigmaT[i];
       if (!sigma.isFinite) continue;
-      final sigmaBin = (math.log(math.max(sigma, 1e-30)) / sigmaLog).round();
+      final sigmaBin = seekGuardSigmaBin(sigma, sigmaLog);
       final muPitch = muStep(sigmaBin, sigmaLog, false, quantization.stepTime);
       final slack = 0.5 * muPitch + k * sigma * sigmaHalfRelative;
       if (!slack.isFinite) continue;
@@ -211,25 +278,21 @@ Future<int> checkSeekReadsOnlyWhatItNeeds(
     return guard;
   });
 
-  final boundaries = <double>{
-    for (final entry in index) ...<double>[entry.t0, entry.t1],
-  }.toList()..sort();
+  final boundaries =
+      <double>{
+          for (final entry in index) ...<double>[entry.t0, entry.t1],
+        }.toList()
+        ..sort();
 
   // This is an optimization/fidelity probe, not another full decode. Bound the
   // number of global comparisons independently of the accepted index size: a
   // 262k-entry legal file must not turn this into hundreds of billions of
-  // checks. Sixteen evenly spaced entries still cover the timeline and tree
-  // depths, while the work below stays O(m + n) with a fixed factor.
-  const maxProbeEntries = 16;
-  final probeEntries = <FourdgsChunkIndexEntry>[];
-  if (index.length <= maxProbeEntries) {
-    probeEntries.addAll(index);
-  } else {
-    for (int slot = 0; slot < maxProbeEntries; slot++) {
-      final at = slot * (index.length - 1) ~/ (maxProbeEntries - 1);
-      probeEntries.add(index[at]);
-    }
-  }
+  // checks. Filter first: otherwise sixteen evenly spaced empty, zero-width
+  // entries can hide the one populated interval this check must exercise.
+  final probeEntries = boundedSeekProbeEntries(
+    index,
+    isKeyframeDelta: scene.header.temporalModel == 'keyframe-delta',
+  );
 
   bool nearBoundary(double t) {
     int low = 0;
@@ -254,23 +317,7 @@ Future<int> checkSeekReadsOnlyWhatItNeeds(
   for (final entry in probeEntries) {
     final span = entry.t1 - entry.t0;
     if (span <= 0.0) continue;
-    final candidates = <double>[];
-    if (span.isFinite) {
-      for (final fraction in const <double>[0.13, 0.37, 0.61, 0.89]) {
-        candidates.add(entry.t0 + fraction * span);
-      }
-    } else {
-      // An open-ended entry has no fractional midpoint. Probe finite instants
-      // relative to its start, spaced beyond the support-rounding guard; the
-      // half-offsets also avoid the common integer window boundaries.
-      final step = math.max(
-        1.0,
-        math.max(4.0 * guardAt(entry.t0), entry.t0.abs() * 1e-6),
-      );
-      for (final factor in const <double>[0.5, 1.5, 3.5, 7.5]) {
-        candidates.add(entry.t0 + factor * step);
-      }
-    }
+    final candidates = seekProbeInstants(entry, guardAt);
     for (final t in candidates) {
       if (!t.isFinite) continue;
       if (nearBoundary(t)) continue;
