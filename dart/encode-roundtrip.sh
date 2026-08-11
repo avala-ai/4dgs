@@ -14,12 +14,12 @@
 # in. An encoder that displaced every position, greyed every colour or dropped every
 # velocity produces a file all four read the same way, and it is wrong.
 #
-# **Agreement.** The result is decoded with BOTH the Dart decoder and the Python reference
-# decoder — on both read paths — and all four canonical summaries must be identical. An
-# encoder checked only by its own decoder proves that two halves of one implementation share
-# an opinion, which is exactly the failure mode a conformance suite exists to catch.
-# Agreement with a decoder written in another language, against the same specification, is a
-# real claim.
+# **Agreement.** The result is decoded by three independent implementations — Dart's own, the
+# Python reference and the Rust reference — on both read paths each, and all six canonical
+# summaries must be identical. An encoder checked only by its own decoder proves that two
+# halves of one implementation share an opinion, which is exactly the failure mode a
+# conformance suite exists to catch; two implementations can still share a misreading of one
+# sentence of the specification. Three, written independently, is a real claim.
 #
 # Neither claim implies the other, which is why both are made.
 #
@@ -51,10 +51,25 @@ decode_dart_streamed="$root/dart/conformance/build/decode_streamed$exe"
 decode_dart_indexed="$root/dart/conformance/build/decode_indexed$exe"
 decode_python_streamed="$root/python/conformance/decode_streamed.py"
 decode_python_indexed="$root/python/conformance/decode_indexed.py"
+decode_rust_streamed="$root/target/release/decode_streamed$exe"
+decode_rust_indexed="$root/target/release/decode_indexed$exe"
 
-for binary in "$encode" "$decode_dart_streamed" "$decode_dart_indexed"; do
+# Every reader is required, and a missing one is an error rather than a reader quietly
+# dropped from the comparison. A gate that skips itself when a binary is absent reports
+# green for a run that proved less than it says it did, and the shape of this script — a
+# count printed at the end — is exactly the shape that hides it.
+for binary in \
+  "$encode" "$decode_dart_streamed" "$decode_dart_indexed" \
+  "$decode_rust_streamed" "$decode_rust_indexed"; do
   [ -x "$binary" ] || {
-    echo "::error::$binary is not built; run dart compile exe in dart/conformance"
+    echo "::error::$binary is not built; run dart compile exe in dart/conformance and" \
+      "cargo build -p fourdgs-conformance --release"
+    exit 1
+  }
+done
+for script in "$decode_python_streamed" "$decode_python_indexed"; do
+  [ -f "$script" ] || {
+    echo "::error::$script is missing"
     exit 1
   }
 done
@@ -94,7 +109,8 @@ def fail(detail):
     sys.exit(1)
 
 
-src = fourdgs.read(source).gaussians
+source_scene = fourdgs.read(source)
+src = source_scene.gaussians
 scene = fourdgs.read(encoded)
 enc = scene.gaussians
 if enc.count != src.count:
@@ -217,13 +233,33 @@ if mu_excess.max() > 0:
 if not np.array_equal(enc.win_lo, src.win_lo[pair]) or not np.array_equal(enc.win_hi, src.win_hi[pair]):
     fail("a validity window came back changed, and the Window Table stores them verbatim")
 
-# Spherical harmonics are bytes on a declared pitch. `step_sh` is what the
-# encoder did, so the deviation it allows is half of it — and the identity when
-# the pitch is 1, where a coefficient must survive byte for byte.
-if src.sh is not None and enc.sh is not None and scene.header.sh_degree > 0:
-    columns = min(src.sh.shape[1], enc.sh.shape[1])
+# Spherical harmonics. Presence, degree and shape are checked BEFORE any
+# coefficient is compared, and they are checked because the comparison cannot
+# make them: an encoder that emitted no SH at all leaves `enc.sh` at None and
+# skips a conditional, and one that emitted only a lower-degree prefix survives a
+# comparison taken over the columns that happen to be in both. Either loses
+# view-dependent appearance outright, and every decoder reads the degraded file
+# the same way, so the agreement checks below cannot see it. This runner asks for
+# every band (`shBands: 3`), so what went in is what must come out.
+if (src.sh is None) != (enc.sh is None):
+    fail(
+        "the source carries spherical harmonics and the encoded file does not"
+        if enc.sh is None
+        else "the encoded file carries spherical harmonics the source does not"
+    )
+if src.sh is not None:
+    if int(scene.header.sh_degree) != int(source_scene.header.sh_degree):
+        fail(
+            f"the encoded file declares SH degree {int(scene.header.sh_degree)}, "
+            f"the source {int(source_scene.header.sh_degree)}"
+        )
+    if enc.sh.shape != src.sh.shape:
+        fail(f"the SH block is {enc.sh.shape}, the source's {src.sh.shape}")
+    # Bytes on a declared pitch: `step_sh` is what the encoder did, so the
+    # deviation it allows is half of it — and the identity when the pitch is 1,
+    # where a coefficient must survive byte for byte.
     step = max(1, int(scene.quantization.step_sh))
-    deviation = np.abs(enc.sh[:, :columns].astype(np.int64) - src.sh[pair][:, :columns].astype(np.int64)).max()
+    deviation = np.abs(enc.sh.astype(np.int64) - src.sh[pair].astype(np.int64)).max()
     if deviation > step // 2:
         fail(f"an SH coefficient moved {deviation} codes, past the {step // 2} a pitch of {step} allows")
 PY
@@ -231,12 +267,21 @@ PY
   "$decode_dart_indexed" "$out/$name.4dgs" >"$out/$name.dart.indexed.json"
   "$python" "$decode_python_streamed" "$out/$name.4dgs" >"$out/$name.python.streamed.json"
   "$python" "$decode_python_indexed" "$out/$name.4dgs" >"$out/$name.python.indexed.json"
+  "$decode_rust_streamed" "$out/$name.4dgs" >"$out/$name.rust.streamed.json"
+  "$decode_rust_indexed" "$out/$name.4dgs" >"$out/$name.rust.indexed.json"
   "$python" - "$out/$name" "$name" <<'PY'
 import json
 import sys
 
 prefix, name = sys.argv[1], sys.argv[2]
-readers = ("dart.streamed", "dart.indexed", "python.streamed", "python.indexed")
+readers = (
+    "dart.streamed",
+    "dart.indexed",
+    "python.streamed",
+    "python.indexed",
+    "rust.streamed",
+    "rust.indexed",
+)
 summaries = {}
 for reader in readers:
     with open(f"{prefix}.{reader}.json", encoding="utf-8") as fh:
@@ -257,4 +302,4 @@ PY
   echo "  $name: $(cat "$out/$name.note")"
 done
 
-echo "$agreed variants re-encoded by Dart; every one inside the bounds it declares against its source, and both decoders agree on it, both read paths"
+echo "$agreed variants re-encoded by Dart; every one inside the bounds it declares against its source, and the Dart, Python and Rust decoders agree on it, both read paths each"

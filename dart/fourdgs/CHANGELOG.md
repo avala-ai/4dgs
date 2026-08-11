@@ -35,6 +35,27 @@ happened.
   An inverted window is refused rather than written because visibility is gated on `lo <= t < hi`:
   it would cover no instant, and this package's own reader refuses the record carrying it, so
   writing one produces a file neither read path can reopen.
+- Three lanes that a clamp would otherwise change silently are refused instead: an rgb or opacity
+  component outside `[0, 1]`, which `decodeChunk` clamps back into the range, so a channel of 1.2
+  returns as 1.0 in a file declaring an `rgb` bound near 0.004; a scale at or below zero, and a
+  finite negative `sigma_t`, both of which go through `log(max(v, 1e-30))` and come back as a value
+  no caller wrote, missing a *relative* bound by every order of magnitude there is. A `sigma_t` of
+  exactly zero stays legal: it is a gaussian whose support is a single instant.
+- A spherical-harmonic row must be whole degrees — 3, 8 or 15 coefficients per colour component —
+  and its buffer must be the size that row implies. Bands are whole and a reader takes them whole
+  (§6.5), so a row of four coefficients cannot be written as a degree-2 band, and building one out
+  of the columns that happen to be there produced a band record declaring three channels where the
+  band defines fifteen: a file neither of this package's read paths could reopen.
+- The optional identity streams `source_index` and `object_id` are written when the set carries
+  them, rather than dropped. §6.6: "The Object Table, Object Tracks and `object_id` stream are
+  independently optional … None is a reason to invent or discard another." `object_id` crosses to
+  the stream's signed symbols by the same-bits two's-complement view §6.6 defines, so the whole
+  unsigned 32-bit domain survives; delta coding stays available because a candidate that will not
+  fit a 32-bit symbol is dropped rather than truncated.
+- The Summary Offset's declared range ends where the Chunk Index ends. Measured after Statistics had
+  been appended, it advertised `chunk-index` over a run whose tail was a Statistics record — which
+  defeats the one thing the record exists for, letting a consumer range-read a single class of
+  summary record.
 - The scene profile `objects` is refused. A profile is a promise about what the file contains, and
   that one promises an `object_id` stream in every non-empty chunk and an Object Table (registry,
   Profiles); this writer emits neither, so accepting it would put a claim in the Header that the
@@ -53,11 +74,15 @@ happened.
   separate claims about each result. **Fidelity**: the written scene is compared against the scene
   it was written from, by the Python reference reader, attribute by attribute, against the error
   bounds the written file itself declares — including the per-gaussian velocity and birth-time
-  pitches, derived the way a decoder derives them. **Agreement**: the Dart and Python decoders must
-  produce identical canonical JSON from the result, on both read paths in each language. Neither
-  implies the other. Four decoders reading one file the same way say nothing about whether that file
-  is the scene that went in, and an encoder checked only by its own decoder proves that two halves
-  of one implementation share an opinion. It runs in the conformance workflow.
+  pitches, derived the way a decoder derives them, and the presence, degree and shape of the
+  spherical harmonics, which are checked before any coefficient is compared because an encoder that
+  emitted none at all would otherwise skip the comparison entirely. **Agreement**: the Dart, Python
+  and Rust decoders must produce identical canonical JSON from the result, on both read paths each —
+  six readers, three implementations. Neither claim implies the other. Decoders reading one file the
+  same way say nothing about whether that file is the scene that went in, and an encoder checked
+  only by its own decoder proves that two halves of one implementation share an opinion. Every
+  reader is required: a missing one is an error rather than a reader quietly dropped from the
+  comparison. It runs in the conformance workflow.
 
 ### Hostile-input hardening
 

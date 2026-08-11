@@ -234,12 +234,16 @@ jobs:
           python tests/conformance/generate.py
           python tests/conformance/run.py --runner dart
 
-      # The other direction: Dart re-encodes each variant's gaussians and both decoders —
-      # its own and the Python reference — have to read the result as the same scene, on
-      # both read paths. An encoder checked only by its own decoder proves that two halves
-      # of one implementation share an opinion.
-      - name: Dart encodes files the Python reference agrees with
-        run: dart/encode-roundtrip.sh
+      # The other direction: Dart re-encodes each variant's gaussians, and three decoders —
+      # its own, the Python reference and the Rust reference — have to read the result as
+      # the same scene, on both read paths each. An encoder checked only by its own decoder
+      # proves that two halves of one implementation share an opinion; two implementations
+      # can still share a misreading. The script requires every one of those readers and
+      # fails if one is missing, so this build step is not optional.
+      - name: Dart encodes files the Python and Rust references agree with
+        run: |
+          cargo build -p fourdgs-conformance --release
+          dart/encode-roundtrip.sh
 
   swift:
     runs-on: ubuntu-latest

@@ -258,6 +258,12 @@ Uint8List writeFourdgsBytes(
     for (final entry in index) {
       out.bytes(entry.encode());
     }
+    // Taken here, before anything else is appended. A Summary Offset frames one
+    // *class* of summary record, so that a consumer can range-read the index
+    // without the rest of the summary; measuring the group after Statistics has
+    // been written declares a range whose tail is a different record class,
+    // which is the one thing the record exists to prevent.
+    final groupEnd = out.length;
     if (options.writeStatistics) {
       out.bytes(
         _statisticsRecord(n, index.length, durationSec, _aabb(gaussians)),
@@ -266,7 +272,7 @@ Uint8List writeFourdgsBytes(
     if (options.writeSummaryOffsets) {
       summaryOffsetStart = out.length;
       out.bytes(
-        _summaryOffsetRecord(opChunkIndex, groupStart, out.length - groupStart),
+        _summaryOffsetRecord(opChunkIndex, groupStart, groupEnd - groupStart),
       );
     }
     summaryLength = out.length - summaryStart;
@@ -309,6 +315,11 @@ void _checkInput(FourdgsGaussianSet g, double cutoff) {
   _checkLength('sigma_t', g.sigmaT.length, n);
   _checkLength('win_lo', g.winLo.length, n);
   _checkLength('win_hi', g.winHi.length, n);
+  final sourceIndex = g.sourceIndex;
+  if (sourceIndex != null) _checkLength('source_index', sourceIndex.length, n);
+  final objectId = g.objectId;
+  if (objectId != null) _checkLength('object_id', objectId.length, n);
+  _checkSh(g, n);
   if (n == 0) return;
 
   _checkFinite('positions', g.positions, 3);
@@ -318,16 +329,61 @@ void _checkInput(FourdgsGaussianSet g, double cutoff) {
   _checkFinite('motions', g.motions, 3);
   _checkFinite('mu_t', g.muT, 1);
 
-  // `sigma_t` is not on that list: `+inf` is its documented spelling for a
+  // Three lanes are quantized through a clamp, and a clamp is the quiet way to
+  // store a value nobody authored. Colour is written as a bin of `step_rgb` and
+  // read back through `.clamp(0.0, 1.0)` in `decodeChunk`, so an input of 1.2
+  // returns as 1.0 while the file declares an `rgb` bound near 0.004; a scale
+  // and a `sigma_t` go through `log(max(v, 1e-30))`, so zero or negative becomes
+  // e^-69 and the declared *relative* bound is missed by every order of
+  // magnitude there is. All three are the same defect: the file keeps its
+  // promise about the number it stored and not about the number it was given.
+  // Refusing here names the lane and the gaussian, which is the diagnosis the
+  // caller can act on (AGENTS.md §6).
+  for (int i = 0; i < n; i++) {
+    for (int c = 0; c < 4; c++) {
+      final v = g.colors[i * 4 + c];
+      if (v < 0.0 || v > 1.0) {
+        throw FourdgsInvalidInput(
+          '${c == 3 ? "opacity" : "color"} is $v at gaussian $i; linear rgb and '
+          'opacity are stored in [0, 1] and a decoder clamps to it, so a value '
+          'outside it comes back changed by far more than this file declares',
+        );
+      }
+    }
+    for (int axis = 0; axis < 3; axis++) {
+      final scale = g.scales[i * 3 + axis];
+      if (scale <= 0.0) {
+        throw FourdgsInvalidInput(
+          'scale is $scale at gaussian $i; a gaussian extent is quantized in the '
+          'log domain against a relative bound, which a value at or below zero '
+          'has no meaning in',
+        );
+      }
+    }
+  }
+
+  // `sigma_t` is not on the finite list: `+inf` is its documented spelling for a
   // gaussian that never fades (spec §3), and it survives encode and decode as
   // infinity. NaN and `-inf` are refused, because a decoder reads every
   // non-finite sigma as never-fading and a NaN there becomes a
-  // deliberate-looking value.
+  // deliberate-looking value. A finite negative one is refused for the reason
+  // above: it is a standard deviation, it goes through the same
+  // `max(sigma, 1e-30)`, and it would be stored as a lifetime nobody wrote.
+  // Zero stays legal — it is a gaussian whose support is a single instant, which
+  // is a shape the chunk planner has to handle, and `1e-30` is as near it as a
+  // logarithmic grid reaches.
   for (int i = 0; i < n; i++) {
     final sigma = g.sigmaT[i];
     if (sigma.isNaN || sigma == double.negativeInfinity) {
       throw FourdgsInvalidInput(
         'sigma_t is $sigma at gaussian $i; use +inf for a gaussian that never fades',
+      );
+    }
+    if (sigma < 0.0) {
+      throw FourdgsInvalidInput(
+        'sigma_t is $sigma at gaussian $i; it is a temporal standard deviation, '
+        'so a negative one has no lifetime to encode and would be stored as a '
+        'positive one nobody wrote',
       );
     }
   }
@@ -369,6 +425,35 @@ void _checkInput(FourdgsGaussianSet g, double cutoff) {
       );
     }
   }
+}
+
+/// The coefficient counts a whole degree has: 3 at degree 1, 8 at 2, 15 at 3.
+const List<int> _wholeDegrees = <int>[3, 8, 15];
+
+/// The spherical-harmonic row is whole degrees, and the buffer is the size that
+/// row implies.
+///
+/// Bands are whole and a reader takes them whole (spec §6.5), which cuts both
+/// ways: `decodeShBandRecord` refuses a band record that does not carry all of
+/// its band's channels, so a row of four coefficients — a whole degree-1 band
+/// and two fifths of a degree-2 one — cannot be written as one. Before this
+/// check the writer built band 2 out of the single column it had and declared
+/// three channels where the band defines fifteen, and the file it returned could
+/// not be reopened by either of this package's read paths. A buffer of the wrong
+/// size is refused here for the same reason `positions` is: the alternative is a
+/// `RangeError` from the gather loop, which names neither the lane nor the
+/// gaussian.
+void _checkSh(FourdgsGaussianSet g, int n) {
+  final sh = g.sh;
+  if (sh == null) return;
+  if (!_wholeDegrees.contains(g.shCoefficients)) {
+    throw FourdgsInvalidInput(
+      'sh_coefficients is ${g.shCoefficients}; a spherical-harmonic row is '
+      'whole degrees, so it holds $_wholeDegrees coefficients per colour '
+      'component and nothing between them',
+    );
+  }
+  _checkLength('sh', sh.length, n * 3 * g.shCoefficients);
 }
 
 void _checkLength(String name, int got, int want) {
@@ -720,7 +805,27 @@ _Quantized _quantize(
     );
   }
 
-  return _Quantized(<_Lane>[
+  // The two optional identity lanes, written when — and only when — the set
+  // carries them. Neither is quantized: they are labels, and §6.6 says so in as
+  // many words about `object_id` ("the id is exact and is never dequantized").
+  //
+  // They are here because dropping them is a decision, not a default. §6.6:
+  // "The Object Table, Object Tracks and `object_id` stream are independently
+  // optional. A file with ids and no table still groups gaussians … None is a
+  // reason to invent or discard another." Before this, decoding a file that
+  // carried producer-side stable ids and writing it straight back out returned a
+  // file with none, and the identity those fields exist to preserve was gone
+  // with nothing said anywhere.
+  //
+  // `object_id` owns the whole unsigned 32-bit domain while an attribute
+  // stream's symbols are signed, so the bridge is the same-bits two's-complement
+  // view §6.6 defines: `0xFFFF_FFFF` is written as `-1` and read back as
+  // `0xFFFF_FFFF`. Bijective, and not a grid. Delta coding stays available
+  // because `_deltaCandidate` computes in 64 bits and drops any candidate that
+  // does not fit a 32-bit symbol, which is exactly the condition §6.6 attaches
+  // to it; the Python reference disables delta here instead, because in NumPy
+  // the same subtraction wraps silently.
+  final lanes = <_Lane>[
     _Lane(attrPosition, 3, pos),
     _Lane(attrScale, 3, scale),
     _Lane(attrRotationIndex, 1, rotationIndex),
@@ -732,7 +837,20 @@ _Quantized _quantize(
     _Lane(attrSigmaT, 1, sigma),
     _Lane(attrFlags, 1, flags),
     _Lane(attrWindowIndex, 1, windowIndex),
-  ]);
+  ];
+  final sourceIndex = g.sourceIndex;
+  if (sourceIndex != null) {
+    lanes.add(_Lane(attrSourceIndex, 1, Int32List.fromList(sourceIndex)));
+  }
+  final objectId = g.objectId;
+  if (objectId != null) {
+    final codes = Int32List(n);
+    for (int i = 0; i < n; i++) {
+      codes[i] = objectId[i].toSigned(32);
+    }
+    lanes.add(_Lane(attrObjectId, 1, codes));
+  }
+  return _Quantized(lanes);
 }
 
 /// Smallest-three: drop the largest-magnitude component and canonicalize the
@@ -898,12 +1016,17 @@ List<_BandColumns> _bandColumns(FourdgsGaussianSet g, int maxBands) {
   for (int band = 1; band <= math.min(g.shDegree, maxBands); band++) {
     final range = shBandRange[band];
     if (range == null) continue;
-    final last = math.min(range.last, g.shCoefficients);
-    if (range.first >= last) continue;
+    // Whole bands only. A row that stops inside a band carries none of it: the
+    // record would declare fewer channels than the band defines and every reader
+    // here refuses that. A Header naming a degree its bands do not reach is a
+    // legal thing to have decoded — the merge takes bands 1..k and reports the
+    // coefficients they hold — so this stops rather than refuses, and the Header
+    // below then declares the last band that fit.
+    if (range.last > g.shCoefficients) break;
     out.add(
       _BandColumns(band, <int>[
         for (int component = 0; component < 3; component++)
-          for (int k = range.first; k < last; k++)
+          for (int k = range.first; k < range.last; k++)
             component * g.shCoefficients + k,
       ]),
     );

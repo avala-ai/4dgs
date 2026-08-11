@@ -397,6 +397,99 @@ void main() {
     });
   });
 
+  group('the optional identity streams', () {
+    // Neither is quantized and neither has a bound: they are labels. What has to
+    // hold is that a decode-then-encode returns them, because §6.6 says a writer
+    // has no business dropping them — "the Object Table, Object Tracks and
+    // `object_id` stream are independently optional … None is a reason to invent
+    // or discard another" — and because a producer's stable ids are the one
+    // thing in a file that nothing else can reconstruct.
+    FourdgsGaussianSet withIds(FourdgsGaussianSet g) => FourdgsGaussianSet(
+      positions: g.positions,
+      scales: g.scales,
+      rotations: g.rotations,
+      colors: g.colors,
+      motions: g.motions,
+      muT: g.muT,
+      sigmaT: g.sigmaT,
+      winLo: g.winLo,
+      winHi: g.winHi,
+      sourceIndex: Int32List.fromList(<int>[
+        for (int i = 0; i < g.count; i++) 1000 - i,
+      ]),
+      // The full unsigned domain, including the two values that only survive a
+      // same-bits signed view: `0x80000000` is `-2147483648` as a stream symbol
+      // and `0xFFFFFFFF` is `-1`.
+      objectId: Uint32List.fromList(<int>[
+        for (int i = 0; i < g.count; i++)
+          switch (i % 4) {
+            0 => 0,
+            1 => 7,
+            2 => 0x80000000,
+            _ => 0xFFFFFFFF,
+          },
+      ]),
+    );
+
+    test('source_index and object_id survive a decode and re-encode', () {
+      final scene = withIds(buildScene(count: 48));
+      final once = readFourdgsBytes(writeFourdgsBytes(scene, 8.0));
+      expect(once.gaussians.sourceIndex, isNotNull);
+      expect(once.gaussians.objectId, isNotNull);
+
+      final pairing = _pairByPosition(scene, once.gaussians);
+      for (int j = 0; j < pairing.length; j++) {
+        final i = pairing[j];
+        expect(once.gaussians.sourceIndex![j], scene.sourceIndex![i]);
+        expect(once.gaussians.objectId![j], scene.objectId![i]);
+      }
+
+      // And through a second pass, which is the case the finding was about: a
+      // tool that reads a file and writes it back must not be where the ids go
+      // missing.
+      final twice =
+          readFourdgsBytes(writeFourdgsBytes(once.gaussians, 8.0)).gaussians;
+      expect(twice.sourceIndex, isNotNull);
+      expect(
+        <int>[...twice.objectId!]..sort(),
+        <int>[...once.gaussians.objectId!]..sort(),
+      );
+    });
+
+    test('a scene without them writes neither stream', () {
+      final bytes = writeFourdgsBytes(buildScene(count: 16), 8.0);
+      final decoded = readFourdgsBytes(bytes).gaussians;
+      expect(decoded.sourceIndex, isNull);
+      expect(decoded.objectId, isNull);
+    });
+
+    test('an id lane of the wrong length is named rather than truncated', () {
+      final base = buildScene(count: 8);
+      final wrong = FourdgsGaussianSet(
+        positions: base.positions,
+        scales: base.scales,
+        rotations: base.rotations,
+        colors: base.colors,
+        motions: base.motions,
+        muT: base.muT,
+        sigmaT: base.sigmaT,
+        winLo: base.winLo,
+        winHi: base.winHi,
+        objectId: Uint32List(7),
+      );
+      expect(
+        () => writeFourdgsBytes(wrong, 8.0),
+        throwsA(
+          isA<FourdgsInvalidInput>().having(
+            (FourdgsInvalidInput e) => e.message,
+            'message',
+            allOf(contains('object_id'), contains('7')),
+          ),
+        ),
+      );
+    });
+  });
+
   group('the summary', () {
     test('is exactly Chunk Index, Statistics and Summary Offset, contiguous', () {
       final bytes = writeFourdgsBytes(
@@ -444,6 +537,54 @@ void main() {
       expect(decoded.statistics!.gaussianCount, decoded.header.gaussianCount);
       expect(decoded.summaryOffsets.single.groupOpcode, opChunkIndex);
       expect(decoded.summaryOffsets.single.groupStart, start);
+    });
+
+    test('the Summary Offset frames the index and stops before Statistics', () {
+      // A Summary Offset exists so a consumer can range-read one *class* of
+      // summary record without the rest of the summary. The range it declares
+      // therefore has to end where the Chunk Index ends: measured after the
+      // Statistics record was appended, it advertises `opChunkIndex` over a run
+      // whose tail is a Statistics record, and a reader that fetched exactly
+      // that range and parsed it as index entries would find one.
+      final bytes = writeFourdgsBytes(
+        buildScene(),
+        8.0,
+        options: const FourdgsWriteOptions(
+          writeStatistics: true,
+          writeSummaryOffsets: true,
+        ),
+      );
+      final decoded = readFourdgsBytes(bytes);
+      final offset = decoded.summaryOffsets.single;
+      expect(offset.groupOpcode, opChunkIndex);
+
+      // Parse the advertised range on its own, the way a consumer that fetched
+      // only those bytes would have to.
+      final group =
+          iterRecords(
+            Uint8List.sublistView(
+              bytes,
+              offset.groupStart,
+              offset.groupStart + offset.groupLength,
+            ),
+          ).toList();
+      expect(
+        <int>{for (final r in group) r.opcode},
+        <int>{opChunkIndex},
+        reason: 'the range must hold index records and nothing else',
+      );
+      expect(group.length, decoded.chunkIndex.length);
+      // Whole records: the last one ends exactly where the range does.
+      expect(
+        group.last.offset + group.last.framedLength,
+        offset.groupLength,
+        reason: 'the range must end on a record boundary',
+      );
+      // And it must stop short of the Statistics record that follows it.
+      final statistics = recordsOf(
+        bytes,
+      ).firstWhere((FourdgsRecord r) => r.opcode == opStatistics);
+      expect(offset.groupStart + offset.groupLength, statistics.offset);
     });
 
     test('the Footer points at the first byte of the summary', () {
@@ -678,6 +819,103 @@ void main() {
       }
     });
 
+    test('a coefficient row that stops inside a band is refused', () {
+      // Bands are whole and a reader takes them whole (spec §6.5).
+      // `decodeShBandRecord` refuses a band record whose stream declares fewer
+      // channels than the band defines, so a row of four coefficients — a whole
+      // degree-1 band and two fifths of a degree-2 one — cannot be written as
+      // band 2. Before this check the writer built that band out of its one
+      // available column and declared three channels where fifteen were
+      // required, and the file it returned could not be reopened by either of
+      // this package's read paths.
+      final base = buildScene(count: 8, shDegree: 2);
+      final partial = FourdgsGaussianSet(
+        positions: base.positions,
+        scales: base.scales,
+        rotations: base.rotations,
+        colors: base.colors,
+        motions: base.motions,
+        muT: base.muT,
+        sigmaT: base.sigmaT,
+        winLo: base.winLo,
+        winHi: base.winHi,
+        shDegree: 2,
+        shCoefficients: 4,
+        sh: Uint8List(8 * 3 * 4),
+      );
+      expect(
+        () => writeFourdgsBytes(partial, 8.0),
+        throwsA(
+          isA<FourdgsInvalidInput>().having(
+            (FourdgsInvalidInput e) => e.message,
+            'message',
+            allOf(contains('sh_coefficients'), contains('4')),
+          ),
+        ),
+      );
+
+      // A buffer that does not hold `count * 3 * sh_coefficients` bytes is
+      // refused by name too, rather than indexing off its end in the gather
+      // loop.
+      final short = FourdgsGaussianSet(
+        positions: base.positions,
+        scales: base.scales,
+        rotations: base.rotations,
+        colors: base.colors,
+        motions: base.motions,
+        muT: base.muT,
+        sigmaT: base.sigmaT,
+        winLo: base.winLo,
+        winHi: base.winHi,
+        shDegree: 2,
+        shCoefficients: 8,
+        sh: Uint8List(8 * 3 * 8 - 1),
+      );
+      expect(
+        () => writeFourdgsBytes(short, 8.0),
+        throwsA(
+          isA<FourdgsInvalidInput>().having(
+            (FourdgsInvalidInput e) => e.message,
+            'message',
+            allOf(contains('sh'), contains('${8 * 3 * 8}')),
+          ),
+        ),
+      );
+    });
+
+    test('a degree the bands do not reach is written as the bands that do', () {
+      // This shape is not malformed input, it is what decoding a file whose
+      // Header names degree 3 while its chunks carry bands 1 and 2 produces:
+      // `shDegree` comes from the Header and `shCoefficients` from the bands
+      // that were actually merged. Re-encoding it has to write the two whole
+      // bands and declare degree 2, not refuse and not invent a third.
+      final base = buildScene(count: 8, shDegree: 2);
+      final overDeclared = FourdgsGaussianSet(
+        positions: base.positions,
+        scales: base.scales,
+        rotations: base.rotations,
+        colors: base.colors,
+        motions: base.motions,
+        muT: base.muT,
+        sigmaT: base.sigmaT,
+        winLo: base.winLo,
+        winHi: base.winHi,
+        shDegree: 3,
+        shCoefficients: 8,
+        sh: base.sh,
+      );
+      final bytes = writeFourdgsBytes(overDeclared, 8.0);
+      final decoded = readFourdgsBytes(bytes);
+      expect(decoded.header.shDegree, 2);
+      expect(decoded.gaussians.shCoefficients, 8);
+      expect(
+        recordsOf(
+          bytes,
+        ).where((FourdgsRecord r) => r.opcode == opShBandStream).length,
+        2,
+      );
+    });
+
     test('a scene with no harmonics declares degree 0 and writes no bands', () {
       final bytes = writeFourdgsBytes(buildScene(), 8.0);
       expect(readFourdgsBytes(bytes).header.shDegree, 0);
@@ -908,8 +1146,86 @@ void main() {
             ),
           ),
         );
+
+        // And a *finite* negative one, which the -inf check does not cover. It
+        // reaches `log(max(sigma, 1e-30))` and is stored as a lifetime of
+        // 1e-30 s: the file then declares a `sigma_rel` bound of 0.02 and the
+        // scene it decodes to misses the authored value by thirty orders of
+        // magnitude.
+        final finite = buildScene(count: 8);
+        finite.sigmaT[5] = -0.1;
+        expect(
+          () => writeFourdgsBytes(finite, 8.0),
+          throwsA(
+            isA<FourdgsInvalidInput>().having(
+              (FourdgsInvalidInput e) => e.message,
+              'message',
+              allOf(contains('sigma_t'), contains('gaussian 5')),
+            ),
+          ),
+        );
+
+        // Zero stays legal. It is a gaussian whose support is a single instant,
+        // which is a shape the chunk planner has to handle, and `1e-30` is as
+        // near it as a logarithmic grid reaches.
+        final instant = buildScene(count: 8);
+        instant.sigmaT[1] = 0.0;
+        expect(() => writeFourdgsBytes(instant, 8.0), returnsNormally);
       },
     );
+
+    test('a colour outside [0, 1] is refused rather than clamped', () {
+      // `decodeChunk` clamps reconstructed colours into [0, 1], so a channel of
+      // 1.2 comes back as 1.0 while the file declares an `rgb` bound near
+      // 0.004. Writing it would be the encoder changing the authored scene by
+      // two hundred times its own stated tolerance, silently.
+      for (final channel in <int>[0, 3]) {
+        for (final value in <double>[-0.1, 1.2]) {
+          final scene = buildScene(count: 8);
+          scene.colors[4 * 4 + channel] = value;
+          expect(
+            () => writeFourdgsBytes(scene, 8.0),
+            throwsA(
+              isA<FourdgsInvalidInput>().having(
+                (FourdgsInvalidInput e) => e.message,
+                'message',
+                allOf(
+                  contains(channel == 3 ? 'opacity' : 'color'),
+                  contains('gaussian 4'),
+                ),
+              ),
+            ),
+            reason: 'channel $channel = $value',
+          );
+        }
+      }
+      // The endpoints are inside the range and stay writable.
+      final edges = buildScene(count: 8);
+      edges.colors[0] = 0.0;
+      edges.colors[1] = 1.0;
+      expect(() => writeFourdgsBytes(edges, 8.0), returnsNormally);
+    });
+
+    test('a scale at or below zero is refused rather than floored', () {
+      // Same defect as the colour clamp, one lane over: scales are quantized as
+      // `log(max(scale, 1e-30))` against a *relative* bound, and zero has no
+      // relative distance from anything.
+      for (final value in <double>[0.0, -1e-3]) {
+        final scene = buildScene(count: 8);
+        scene.scales[3 * 3 + 2] = value;
+        expect(
+          () => writeFourdgsBytes(scene, 8.0),
+          throwsA(
+            isA<FourdgsInvalidInput>().having(
+              (FourdgsInvalidInput e) => e.message,
+              'message',
+              allOf(contains('scale'), contains('gaussian 3')),
+            ),
+          ),
+          reason: 'scale = $value',
+        );
+      }
+    });
 
     test('an unknown profile lists the ones that exist', () {
       expect(
