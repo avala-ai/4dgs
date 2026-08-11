@@ -286,11 +286,22 @@ def decompress(body: bytes, codec: int, expected: int) -> bytes:
     untrusted file should not have to catch `zlib.error` to find out that the file was
     corrupt. Every failure in here comes back as a `MalformedFile`.
     """
+    if expected > MAX_STREAM_BYTES:
+        raise MalformedFile(f"compressed block declares {expected} bytes, past the {MAX_STREAM_BYTES} cap")
     if codec == CODEC_DEFLATE:
         try:
-            out = zlib.decompress(body, bufsize=min(expected, 1 << 20))
+            decoder = zlib.decompressobj()
+            # `zlib.decompress(..., bufsize=...)` treats bufsize only as a growth hint. A
+            # small payload can therefore expand without limit before the length check
+            # below runs. Asking for one byte beyond the declaration both caps allocation
+            # and distinguishes an over-producing stream from one of exactly that size.
+            out = decoder.decompress(body, expected + 1)
         except zlib.error as exc:
             raise MalformedFile(f"deflate stream is corrupt: {exc}") from exc
+        if len(out) > expected or decoder.unconsumed_tail:
+            raise TruncatedFile(f"stream decompresses past the {expected} bytes declared by its header")
+        if not decoder.eof:
+            raise TruncatedFile("deflate stream ends before its end marker")
     elif codec == CODEC_ZSTD:
         try:
             import zstandard

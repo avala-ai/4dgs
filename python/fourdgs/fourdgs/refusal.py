@@ -415,21 +415,48 @@ def scan_front_to_back(data: bytes, where: Walk) -> ChunkRefusal | None:
     quant: rec.Quantization | None = None
     windows: list[tuple[float, float]] = []
     cutoff = DEFAULT_CUTOFF
+    declared_degree: int | None = None
     band_owner_count: int | None = None
+    band_owner_at: int | None = None
+    bands: list[int] = []
+
+    def finish_bands() -> ChunkRefusal | None:
+        nonlocal band_owner_count, band_owner_at, bands
+        if band_owner_at is None:
+            return None
+        if declared_degree is not None:
+            wanted = list(range(1, declared_degree + 1))
+            if bands != wanted:
+                return ChunkRefusal(
+                    MalformedFile(
+                        f"the Chunk at {band_owner_at} is followed by SH bands {bands}; "
+                        f"the Header declares degree {declared_degree}, requiring bands {wanted}",
+                        code="index-record-mismatch",
+                    ),
+                    Site(band_owner_at, f"the Chunk record at byte {band_owner_at}"),
+                )
+        band_owner_count = None
+        band_owner_at = None
+        bands = []
+        return None
 
     for frame in where.intact_records():
         content = frame.content(where.data)
         if content is None:
             continue
-        if frame.opcode not in (op.CHUNK, op.SH_BAND_STREAM):
-            band_owner_count = None
+        if frame.opcode != op.SH_BAND_STREAM:
+            unfinished = finish_bands()
+            if unfinished is not None:
+                return unfinished
         here = Site(frame.offset, f"the {op.name(frame.opcode)} record")
         try:
             if frame.opcode == op.HEADER:
                 # Taken as met, and not required to parse: a record whose body is broken
                 # is a finding the validator has already made, and stopping here would
                 # replace it with a worse one.
-                cutoff = rec.Header.parse(content).cutoff
+                header = rec.Header.parse(content)
+                cutoff = header.cutoff
+                declared_degree = int(header.sh_degree)
             elif frame.opcode == op.QUANTIZATION:
                 quant = rec.Quantization.parse(content)
             elif frame.opcode == op.WINDOW_TABLE:
@@ -437,12 +464,13 @@ def scan_front_to_back(data: bytes, where: Walk) -> ChunkRefusal | None:
         except FourdgsError:
             continue
         if frame.opcode == op.CHUNK:
-            band_owner_count = None
             # A Chunk before the grid it is quantized against is a fault the validator
             # reports itself; there is nothing to decode it with here.
             try:
                 head, streams = rec.parse_chunk(content)
                 band_owner_count = int(head.count)
+                band_owner_at = frame.offset
+                bands = []
                 if quant is None:
                     continue
                 # The decoded chunk is dropped when this iteration ends.
@@ -481,6 +509,7 @@ def scan_front_to_back(data: bytes, where: Walk) -> ChunkRefusal | None:
                         f"shape {values.shape}; its owning Chunk requires {expected_shape}",
                         code="stream-element-count-mismatch",
                     )
+                bands.append(band)
             except FourdgsError as exc:
                 return ChunkRefusal(exc, here)
-    return None
+    return finish_bands()

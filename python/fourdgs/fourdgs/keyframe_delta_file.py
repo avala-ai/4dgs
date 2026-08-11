@@ -1410,9 +1410,11 @@ def scan_streamed(
     check_magic(data)
     keyframe_at: int | None = None
     keyframe_state_: State | None = None
+    keyframe_level: int | None = None
     previous_at: int | None = None
     previous_state: State | None = None
     previous_depth: int | None = None
+    previous_level: int | None = None
     declared_degree = sh_degree
     band_owner: int | None = None
     band_rows = 0
@@ -1447,7 +1449,9 @@ def scan_streamed(
             ids, bins = _keyframe_from_chunk(record.content)
             state = keyframe_state(ids, bins)
             keyframe_at, keyframe_state_ = record.offset, state
+            keyframe_level = int(head.level)
             depth = 0
+            level = keyframe_level
             t0, t1 = head.t0, head.t1
             band_owner = record.offset
             band_rows = int(head.count)
@@ -1463,16 +1467,18 @@ def scan_streamed(
             if head_peek.delta_mode == rec.DELTA_MODE_KEYFRAME:
                 reference = keyframe_state_ if head_peek.reference_offset == keyframe_at else None
                 reference_depth = 0 if reference is not None else None
+                reference_level = keyframe_level if reference is not None else None
             elif head_peek.delta_mode == rec.DELTA_MODE_CHAINED:
                 reference = previous_state if head_peek.reference_offset == previous_at else None
                 reference_depth = previous_depth if reference is not None else None
+                reference_level = previous_level if reference is not None else None
             else:
                 raise MalformedFile(
                     f"delta chunk at {record.offset} declares delta_mode {head_peek.delta_mode}; "
                     "expected 0 (keyframe) or 1 (chained)",
                     code="index-record-mismatch",
                 )
-            if reference is None or reference_depth is None:
+            if reference is None or reference_depth is None or reference_level is None:
                 expected = keyframe_at if head_peek.delta_mode == rec.DELTA_MODE_KEYFRAME else previous_at
                 raise MalformedFile(
                     f"delta chunk at {record.offset} uses mode {head_peek.delta_mode} and references "
@@ -1487,7 +1493,14 @@ def scan_streamed(
                     code="depth-mismatch",
                 )
             state, head = _compose_delta(reference, record.content)
+            if int(head.level) != reference_level:
+                raise MalformedFile(
+                    f"delta at {record.offset} declares level {head.level}; "
+                    f"its reference at {head.reference_offset} declares level {reference_level}",
+                    code="index-record-mismatch",
+                )
             depth = int(head.depth)
+            level = int(head.level)
             t0, t1 = head.t0, head.t1
             band_owner = record.offset
             band_rows = int(head.birth_count)
@@ -1524,7 +1537,12 @@ def scan_streamed(
             continue
         else:
             continue
-        previous_at, previous_state, previous_depth = record.offset, state, depth
+        previous_at, previous_state, previous_depth, previous_level = (
+            record.offset,
+            state,
+            depth,
+            level,
+        )
         if on_state is not None:
             on_state(record.offset, t0, t1)
         yield record.offset, (0 if record.opcode == op.CHUNK else 1), state

@@ -35,11 +35,12 @@ from fourdgs import opcode as op
 from fourdgs import records as rec
 from fourdgs import refusal
 from fourdgs.cli import main
-from fourdgs.exceptions import MalformedFile, UnsupportedCodec
+from fourdgs.exceptions import FourdgsError, MalformedFile, UnsupportedCodec
 from fourdgs.keyframe_delta_writer import KeyframeDeltaOptions, Sample
 from fourdgs.serialization import (
     CODEC_DEFLATE,
     MAGIC,
+    MAX_STREAM_BYTES,
     Cursor,
     compress,
     crc32,
@@ -457,6 +458,35 @@ class TestKeyframeDelta:
         assert parsed.t0 == head.t0 and parsed.t1 == head.t1
         assert parsed.compression == "deflate" and parsed.uncompressed_size == len(raw)
 
+    @pytest.mark.parametrize(
+        ("declared", "raw", "message"),
+        [
+            (MAX_STREAM_BYTES + 1, b"", "past the"),
+            (8, b"x" * (1 << 20), "decompresses past"),
+        ],
+        ids=("declared-cap", "expansion-cap"),
+    )
+    def test_delta_chunk_decompression_is_bounded(self, declared, raw, message):
+        delta = _first_record(_keyframe_file(), op.DELTA_CHUNK)
+        head, _original = rec.parse_delta_chunk_block(delta.content)
+        content = (
+            put_f64(head.t0)
+            + put_f64(head.t1)
+            + put_u32(head.level)
+            + bytes([head.delta_mode])
+            + put_u64(head.reference_offset)
+            + put_u64(head.keyframe_offset)
+            + struct.pack("<H", head.depth)
+            + put_u32(head.update_count)
+            + put_u32(head.birth_count)
+            + put_u32(head.death_count)
+            + put_string("deflate")
+            + put_u64(declared)
+            + put_blob(compress(raw, CODEC_DEFLATE, 9))
+        )
+        with pytest.raises(FourdgsError, match=message):
+            kdf._delta_chunk_groups(content)
+
     def test_births_are_complete_and_deaths_carry_only_identity(self):
         empty = kdf.State(ids=np.zeros(0, dtype=np.int64), bins={})
         birth = encode_stream(op.A_GAUSSIAN_ID, np.array([[7]], dtype=np.int64), channels=1)
@@ -713,6 +743,26 @@ class TestTheIndexIsData:
 
 
 class TestSHBandStreams:
+    def test_an_indexless_gaussian_birth_chunk_requires_each_declared_band_once(self):
+        paths = [p for p in _variants(CORPUS) if "SHDegree2" in p.stem and "UseChunkIndex" in p.stem]
+        _require_corpus(paths, "indexed SH-degree-2 variants")
+        data = paths[0].read_bytes()
+        footer_record = _first_record(data, op.FOOTER)
+        footer = rec.Footer.parse(footer_record.content)
+        data = bytearray(data[: footer.summary_start] + rec.Footer().encode() + MAGIC)
+        bands = [
+            (record.offset, 9 + len(record.content))
+            for record in iter_records(data, len(MAGIC))
+            if record.opcode == op.SH_BAND_STREAM
+        ]
+        assert len(bands) >= 2
+        missing_at, missing_length = bands[1]
+        del data[missing_at : missing_at + missing_length]
+        walked = refusal.walk(bytes(data), retain_records=False)
+        refused = refusal.scan_front_to_back(bytes(data), walked)
+        assert refused is not None
+        assert "followed by SH bands [1]" in str(refused.error)
+
     def test_a_gaussian_birth_index_cannot_omit_a_physical_band(self):
         paths = [p for p in _variants(CORPUS) if "SHDegree2" in p.stem and "UseChunkIndex" in p.stem]
         _require_corpus(paths, "indexed gaussian-birth variants carrying SH bands")
@@ -1078,6 +1128,17 @@ class TestBoundedDecoding:
         report = validate(bytes(patched))
         assert not report.ok
         assert any("selected reference requires depth" in finding.message for finding in report.findings)
+
+    def test_an_unindexed_delta_level_must_match_its_selected_reference(self):
+        data = bytearray(_keyframe_file(write_index=False))
+        delta = _first_record(bytes(data), op.DELTA_CHUNK)
+        # t0, t1, then u32 level.
+        struct.pack_into("<I", data, delta.offset + 9 + 16, 7)
+        report = validate(bytes(data))
+        assert not report.ok
+        assert any(
+            "its reference at" in finding.message and "declares level" in finding.message for finding in report.findings
+        )
 
     def test_an_unindexed_keyframe_refusal_keeps_its_record_site(self):
         data = bytearray(_keyframe_file(write_index=False))
