@@ -172,6 +172,24 @@ exactly. Convert the final integer back only when serializing the aggregate. The
 only on the multiset of values the canonical form actually emits, not on row order or a language's
 floating-point addition.
 
+The float-to-unit conversion is textual, not `integer(num(value) * 10**FLOAT_DECIMALS)`: that
+expression multiplies a binary approximation and makes truncation or a second rounding observable.
+Render the finite result of `num(value)` in fixed-point form with exactly `FLOAT_DECIMALS`
+fractional digits using the same round-to-nearest, ties-to-even rule as `num`; parse the sign, whole
+digits and fractional digits as decimal integers. With `scale = 10**FLOAT_DECIMALS`, compute
+`sign * (whole * scale + fraction)`. Thus `num(1.000001)` renders as `1.000001` and becomes
+`1000001` units even though the binary product `round(1.000001, 6) * 10**6` can be
+`1000000.9999999999`. No port converts the fixed-point text through a binary float again.
+
+Serialization is the inverse decimal operation and likewise performs no floating-point conversion.
+For an integer sum `s`, emit its sign, `abs(s) // 10**FLOAT_DECIMALS` as the whole digits, a decimal
+point, and the zero-padded fractional remainder with trailing zeroes removed (leaving one `0` after
+the point for an integral result). This is a JSON number token, even when it is outside binary64's
+finite range. Such a final sum does **not** become `null`; `null` is reserved for the non-finite
+addend rule below. JSON places no magnitude limit on its number grammar, so a port whose JSON value
+type cannot hold the token must write this aggregate token directly rather than narrow the exact sum
+through that type.
+
 - Cost: one rounding and integer conversion per addend. Each port must use the same already-shared
   canonical rounding rule and an arbitrary-precision integer representation for both the scaled
   addend and every partial sum. A declared population is not an overflow proof: one finite decoded
@@ -271,6 +289,13 @@ same fix regenerate its new expectation.
 > composed value is non-finite, the aggregate for that field is `null` and no integer conversion or
 > partial sum is attempted. This preserves the canonical form's existing non-finite rule and gives
 > every port one defined result instead of asking it to convert `null` to integer units.
+>
+> Convert a finite rounded addend to units by rendering it with exactly `FLOAT_DECIMALS` fixed-point
+> fractional digits under the canonical ties-to-even rule and parsing those decimal digits into an
+> arbitrary-precision signed integer. Do not multiply its binary float by the scale. Serialize the
+> exact total by inserting the decimal point `FLOAT_DECIMALS` digits from the right, trimming
+> trailing fractional zeroes but retaining `.0`; never convert the total to a binary float. A
+> finite-addend total outside binary64's range is therefore still an exact JSON number, not `null`.
 
 ### 5.3 `tests/conformance/README.md`, replacing the "nothing depends on decoded order" bullet
 
