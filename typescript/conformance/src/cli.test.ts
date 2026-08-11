@@ -29,6 +29,7 @@ import { test } from "node:test";
 import {
   Crc32,
   Cursor,
+  FourdgsError,
   FOOTER_TAIL_BYTES,
   MAGIC,
   Opcode,
@@ -590,6 +591,28 @@ test("regression: zero-sample Object Tracks are absent during cross-record check
   assert.equal(report.code, EXIT_OK, report.out.join("\n"));
 });
 
+test("regression: zero-sample Rig Trajectories are absent during duplicate checks", (t) => {
+  if (corpus("LongLived-UseChunkIndex-UseCrc-WithObjects") === null || !existsSync(EXECUTABLE)) {
+    return t.skip("corpus not generated");
+  }
+  const data = bytesOf("LongLived-UseChunkIndex-UseCrc-WithObjects");
+  const summary = parseFooter(
+    data.subarray(data.length - FOOTER_TAIL_BYTES + RECORD_HEADER_BYTES),
+  ).summaryStart;
+  const content = new Uint8Array(10);
+  const view = new DataView(content.buffer);
+  view.setUint32(0, 1, true);
+  content[4] = "x".charCodeAt(0);
+  content[5] = 0;
+  view.setUint32(6, 0, true);
+  const empty = framedRecord(Opcode.RigTrajectory, content);
+  const withTwoEmpty = splice(splice(data, summary, empty), summary + empty.length, empty);
+  const report = validated(
+    file("TwoAbsentTrajectories.4dgs", resealSummary(withTwoEmpty, 2 * empty.length)),
+  );
+  assert.equal(report.code, EXIT_OK, report.out.join("\n"));
+});
+
 test("regression: Header SH degree is restricted to the attribute registry", (t) => {
   if (corpus("TenWindows-UseChunkIndex-UseCrc") === null || !existsSync(EXECUTABLE)) {
     return t.skip("corpus not generated");
@@ -756,7 +779,15 @@ test("unit: inspect refuses a resource size that cannot be represented exactly",
   };
   await assert.rejects(
     inspectFile(unreadable),
-    new RegExp(`resource size ${size} exceeds the largest exactly addressable size`),
+    (error: unknown) => {
+      assert.ok(error instanceof RangeError);
+      assert.ok(!(error instanceof FourdgsError));
+      assert.match(
+        error.message,
+        new RegExp(`resource size ${size} exceeds the largest exactly addressable size`),
+      );
+      return true;
+    },
   );
 });
 

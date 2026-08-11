@@ -391,7 +391,11 @@ export async function validateFile(
           break;
         case Opcode.RigTrajectory:
           parseInto(found, "RigTrajectory", () => {
-            provenance.trajectories.push(parseRigTrajectory(content));
+            const trajectory = parseRigTrajectory(content);
+            // §5.15.4 reads a zero-sample trajectory as absent. In
+            // particular, it neither collides with another absent record nor
+            // shadows a later, real trajectory with the same name.
+            if (trajectory.times.length > 0) provenance.trajectories.push(trajectory);
           });
           break;
         case Opcode.GeodeticAnchor:

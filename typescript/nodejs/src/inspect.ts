@@ -94,7 +94,11 @@ const CRC_BLOCK_BYTES = 64 * 1024;
 export async function inspectFile(source: IReadable): Promise<InspectReport> {
   const sizeBig = await source.size();
   if (sizeBig > BigInt(Number.MAX_SAFE_INTEGER)) {
-    throw new FourdgsError(
+    // This is an implementation/address-space limit, not a verdict that the
+    // file is malformed. The CLI classifies non-Fourdgs errors as tool failure
+    // (exit 3), so a pipeline does not quarantine a valid resource merely
+    // because JavaScript cannot address it exactly.
+    throw new RangeError(
       `resource size ${sizeBig} exceeds the largest exactly addressable size ` +
         `${Number.MAX_SAFE_INTEGER} in this implementation`,
     );
