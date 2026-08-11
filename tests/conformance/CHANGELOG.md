@@ -46,7 +46,9 @@ release here is. The corpus becomes 1.0.0 when version 1 of the specification is
 
 - **`corpus/CHECKSUMS.txt`**, the manifest committed in git, packed verbatim. Its format is already
   `sha256sum`'s, so `sha256sum -c CHECKSUMS.txt` verifies the download, and the digests can be
-  checked against the repository at the tag without trusting the archive.
+  checked against the repository at the tag without trusting the archive. It covers both each
+  `.4dgs` and its `.json` expectation, so a source-archive rebuild cannot bless expectations that
+  changed during generation.
 
 - **`MANIFEST.json`**, a machine-readable index: the corpus version and release tag, and per variant
   its paths, both SHA-256s, its byte length, its temporal model, whether a runner reading through

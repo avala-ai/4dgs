@@ -35,7 +35,6 @@ import hashlib
 import io
 import json
 import os
-import subprocess
 import sys
 import tarfile
 
@@ -104,37 +103,6 @@ def sha256(path: str) -> str:
     with open(path, "rb") as handle:
         for block in iter(lambda: handle.read(1 << 20), b""):
             digest.update(block)
-    return digest.hexdigest()
-
-
-def committed_sha256(path: str) -> str:
-    """SHA-256 of *path* in the tagged source, without buffering the blob.
-
-    A git checkout reads the blob from ``HEAD`` so a dirty or line-ending-filtered
-    worktree cannot silently bless itself. GitHub's tag source archives deliberately
-    contain no ``.git`` directory; there the extracted file *is* the tagged blob, so it
-    is hashed directly. Generated ``.4dgs`` bytes remain pinned by ``CHECKSUMS.txt``.
-    """
-    if not os.path.lexists(os.path.join(ROOT, ".git")):
-        return sha256(path)
-
-    relative = os.path.relpath(path, ROOT).replace(os.sep, "/")
-    process = subprocess.Popen(
-        ["git", "show", f"HEAD:{relative}"],
-        cwd=ROOT,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    assert process.stdout is not None
-    assert process.stderr is not None
-    digest = hashlib.sha256()
-    for block in iter(lambda: process.stdout.read(1 << 20), b""):
-        digest.update(block)
-    error = process.stderr.read().decode("utf-8", errors="replace").strip()
-    status = process.wait()
-    if status != 0:
-        detail = f": {error}" if error else ""
-        raise RuntimeError(f"cannot read {relative} at HEAD{detail}")
     return digest.hexdigest()
 
 
@@ -225,7 +193,7 @@ them usable by somebody who has not cloned it.
   NOTICE
   MANIFEST.json      machine-readable index of every variant
   corpus/            byte-for-byte `tests/conformance/data` in the repository
-    CHECKSUMS.txt    SHA-256 per .4dgs, `sha256sum -c` compatible
+    CHECKSUMS.txt    SHA-256 per generated file, `sha256sum -c` compatible
     <variant>.4dgs   the file
     <variant>.json   exactly what a correct decoder must produce from it
     keyframe/        the keyframe-delta temporal model
@@ -245,8 +213,7 @@ cd {name}-{version}/corpus && sha256sum -c CHECKSUMS.txt
 byte the file in this archive. So the digests can be checked against git at the tag without trusting
 this download, and a corpus that verifies here is the same corpus CI verifies there.
 
-`MANIFEST.json` carries the same digests plus one for every expectation, which `CHECKSUMS.txt` does
-not cover.
+`MANIFEST.json` carries the same per-variant digests together with the metadata a harness needs.
 
 ## Run a decoder against it
 
@@ -377,6 +344,18 @@ def readme(entries: list[dict]) -> str:
     return README.format(version=CORPUS_VERSION, name=NAME, counts=line)
 
 
+def reject_inside_data(path: str, description: str) -> None:
+    """Refuse an output that would become an input to this pack or a later one."""
+    data_root = os.path.realpath(DATA)
+    candidate = os.path.realpath(os.path.abspath(path))
+    try:
+        inside = os.path.commonpath([data_root, candidate]) == data_root
+    except ValueError:
+        inside = False  # Different Windows drives cannot contain one another.
+    if inside:
+        raise SystemExit(f"::error::the {description} is inside the corpus tree: {path}")
+
+
 def build(out_dir: str) -> str:
     """Write the tarball and its `.sha256`, and return the tarball's path."""
     if not os.path.isdir(DATA) or not os.path.exists(CHECKSUMS):
@@ -391,15 +370,7 @@ def build(out_dir: str) -> str:
     # resolves an existing symlinked parent even when the final directory has not
     # been created yet, and commonpath is component-aware (`data-old` is not inside
     # `data`). This check precedes both corpus_members() and os.makedirs().
-    data_root = os.path.realpath(DATA)
-    output_root = os.path.realpath(os.path.abspath(out_dir))
-    try:
-        inside_data = os.path.commonpath([data_root, output_root]) == data_root
-    except ValueError:
-        # Different Windows drives cannot contain one another.
-        inside_data = False
-    if inside_data:
-        raise SystemExit(f"::error::the output directory is inside the corpus tree: {out_dir}")
+    reject_inside_data(out_dir, "output directory")
 
     found = variants()
     committed = committed_checksums()
@@ -424,20 +395,20 @@ def build(out_dir: str) -> str:
             failures.append(f"{qualified}: no committed checksum")
         elif expected != entry["sha256"]:
             failures.append(f"{qualified}: {entry['sha256'][:16]}… != committed {expected[:16]}…")
-        try:
-            expected_expectation = committed_sha256(expectation_path)
-        except RuntimeError as error:
-            failures.append(str(error))
-        else:
-            if expected_expectation != entry["expectationSha256"]:
-                failures.append(
-                    f"{qualified}.json: {entry['expectationSha256'][:16]}… "
-                    f"!= committed HEAD {expected_expectation[:16]}…"
-                )
+        expected_expectation = committed.get(f"{qualified}.json")
+        if expected_expectation is None:
+            failures.append(f"{qualified}.json: no committed checksum")
+        elif expected_expectation != entry["expectationSha256"]:
+            failures.append(
+                f"{qualified}.json: {entry['expectationSha256'][:16]}… != committed {expected_expectation[:16]}…"
+            )
         entries.append(entry)
 
+    archived = {
+        path for entry in entries for path in (entry["file"][len("corpus/") :], entry["expectation"][len("corpus/") :])
+    }
     for name in committed:
-        if name not in {entry["file"][len("corpus/") :] for entry in entries}:
+        if name not in archived:
             failures.append(f"{name}: committed checksum has no file")
 
     if failures:
@@ -528,6 +499,7 @@ def unpack_and_check(tarball: str, into: str) -> None:
     # when it is the output directory or an ancestor, delete the tarball we are
     # about to check. A release check always gets a fresh RUNNER_TEMP path; a
     # local caller gets a controlled refusal instead of a recursive deletion.
+    reject_inside_data(into, "check directory")
     if os.path.lexists(into):
         raise SystemExit(f"::error::the check directory already exists: {into}")
     os.makedirs(into)

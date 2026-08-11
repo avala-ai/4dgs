@@ -64,7 +64,7 @@ and it says what a major, minor and patch bump each mean for a score taken again
   LICENSE  NOTICE    Apache-2.0
   MANIFEST.json      machine-readable index of every variant
   corpus/            byte-for-byte `tests/conformance/data` in the repository
-    CHECKSUMS.txt    SHA-256 per .4dgs, `sha256sum -c` compatible
+    CHECKSUMS.txt    SHA-256 per generated file, `sha256sum -c` compatible
     <variant>.4dgs   the file
     <variant>.json   exactly what a correct decoder must produce from it
     keyframe/        the keyframe-delta temporal model
@@ -99,8 +99,7 @@ member is written with a fixed mtime, uid, gid and mode in sorted order, and gzi
 timestamp, so rebuilding the same corpus at the same version produces the same digest rather than
 one you have to take on faith.
 
-`MANIFEST.json` carries the same digests plus one for every expectation, which `CHECKSUMS.txt` does
-not cover.
+`MANIFEST.json` carries the same per-variant digests together with the metadata a harness needs.
 
 ### Point a runner at an unpacked corpus
 
