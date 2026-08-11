@@ -331,24 +331,31 @@ encodings.
   which tie both on `_stable_order` and on the rounded secondary row emitted by (1a), while their
   unrounded composed centres differ. The second encoding reverses the surviving tied run's physical
   order and changes no decoded value. Their generator preconditions are explicit: secondary
-  emitted-row keys compare equal, resident-order addition in the two encodings lands on opposite
-  sides of a six-decimal boundary, and sorting then adding the raw floats produces a rounded total
-  that **differs** from the exact sum of the individually rounded integer-unit addends. The pair
-  shares one integer-unit expectation for both root `aggregate.positionSum` and every applicable
-  `states[*].aggregate.positionSum`, so neither stable resident order nor the explicitly rejected
-  raw-float sort can pass. This is the first pair that actually reaches (2a)'s residual and
-  therefore the trigger for implementing (2b); `ObjectTiedGaussians` cannot serve that role because
-  its emitted centres differ. It belongs in the follow-up stack that adopts (2b), not in the initial
-  (1a)/(2a) stack whose limitation it is designed to expose.
+  emitted-row keys compare equal, and resident-order addition in the two encodings lands on opposite
+  sides of a six-decimal boundary. The generator evaluates the two summary levels independently,
+  because they do not sum the same values: root `aggregate.positionSum` sums stored positions, while
+  each `states[*].aggregate.positionSum` sums centres composed at that probe. For the root and for
+  **every** probe whose aggregate is asserted, it MUST separately prove that sorting and adding the
+  applicable raw floats produces a rounded total that differs from the exact sum of the individually
+  rounded integer-unit addends. A state-level witness is not evidence for the root, and one probe is
+  not evidence for another; an aggregate that does not meet the precondition is omitted rather than
+  claimed. The pair shares the resulting integer-unit expectations, so neither stable resident order
+  nor the explicitly rejected raw-float sort can pass at either summary level. This is the first
+  pair that actually reaches (2a)'s residual and therefore the trigger for implementing (2b);
+  `ObjectTiedGaussians` cannot serve that role because its emitted centres differ. It belongs in the
+  follow-up stack that adopts (2b), not in the initial (1a)/(2a) stack whose limitation it is
+  designed to expose.
 
 - **`ObjectResidualTieOpacity` and `ObjectResidualTieOpacityReordered`** — the opacity counterpart
   to the preceding pair. The rows tie on the six-decimal opacity component of the primary key and on
   the complete rounded emitted-state secondary key, but carry distinct unrounded decoded opacities.
   The second encoding reverses only that surviving tied run. The generator must prove that
-  resident-order addition crosses a six-decimal `opacitySum` boundary between the two files, while
-  sorting then adding the raw opacity floats produces a rounded total that **differs** from the
-  exact sum of individually rounded integer-unit addends. The pair shares that integer-unit
-  expectation for both root `aggregate.opacitySum` and every applicable
+  resident-order addition crosses a six-decimal `opacitySum` boundary between the two files. Here
+  too the root and state preconditions are separate: the root sums stored alpha, while each state
+  sums the time-weighted opacity at its probe. For the root and for every asserted probe, the
+  generator MUST independently show that raw-float sorted addition rounds differently from exact
+  integer-unit addition; it cannot use a state witness to claim root coverage or vice versa. The
+  pair shares those integer-unit expectations for root `aggregate.opacitySum` and every qualifying
   `states[*].aggregate.opacitySum`. `ObjectOpacityOrder` proves that (2a) must use content order,
   but cannot catch a port that applies (2b)'s exact-unit rule to centres alone; this pair makes both
   aggregates and both summary levels part of the deferred (2b) contract.

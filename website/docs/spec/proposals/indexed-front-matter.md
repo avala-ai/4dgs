@@ -322,14 +322,20 @@ One variant, in `data/invalid/`, because after this proposal the file is not a l
   is the refusal — without it, an implementation that keeps today's silent behaviour passes.
 - **No indexed verdict is asserted.** An indexed reader MAY stop at the first Chunk, so it may never
   observe the late record; an implementation that scans farther may instead issue the specified
-  refusal. Both behaviours conform. The suite therefore pins the streamed refusal only rather than
-  turning the indexed reader's permission to stop early into a requirement to skip the record.
-- **Both temporal-model stream loops are exercised.** At least one late Window Table case is built
-  once with a `gaussian-birth` Header and once with a `keyframe-delta` Header. The latter is decoded
-  through the keyframe-delta front-to-back entry point, whose record loop is independent of the
-  ordinary streamed decoder. Both expectations name the late opcode and offset. This prevents a
-  shared corpus rule from being "implemented" only in the path reached by the other late-record
-  files while keyframe-delta silently skips the same misplaced front matter.
+  refusal. Both behaviours conform. Before these files are added, the harness gains a
+  `STREAMED_ONLY_INVALID` set containing every `Late*` variant, and `supports()` returns false for
+  indexed runners when the variant is in that set; its existing per-runner execution audit still
+  requires every streamed runner to run each case. This is a variant-specific exclusion, not a
+  shared refusal expectation that silently asks indexed implementations to detect what they are
+  allowed not to scan.
+- **Both temporal-model stream loops are exercised, including skipped opcodes.** Build both
+  `LateKeyframeDeltaWindowTable` and `LateKeyframeDeltaObjectTrack`. The first reaches a branch the
+  keyframe-delta loop already dispatches; the second reaches a defined opcode that loop currently
+  skips entirely. Both are decoded through the keyframe-delta front-to-back entry point and both
+  expectations name the late opcode and offset. Together with the ordinary `gaussian-birth` `Late*`
+  files, they require a shared opcode-level positional guard (or equivalent checks in every loop),
+  rather than permitting a port to patch only the Window Table branch while late Metadata or
+  provenance records remain silently accepted.
 
 Neither variant regenerates anything. The corpus gains files; nothing existing moves.
 
@@ -340,13 +346,15 @@ Neither variant regenerates anything. The corpus gains files; nothing existing m
 The proposal's instruction is to say plainly which files this breaks, so:
 
 **Files that become illegal:** any file carrying a Window Table, legacy Audio, Camera, Metadata,
-Attachment, Audio Source/Data, or a record with an opcode in `0x20`–`0x2F` at a byte offset after
-the first `Chunk` record.
+Attachment, Audio Source/Data, or a **defined** provenance-family record with an opcode in
+`0x20`–`0x25` at a byte offset after the first `Chunk` record. Opcodes `0x26`–`0x2F` are already
+reserved and forbidden in version-1 writer output (§5.15.8), so this proposal does not newly make
+files containing them illegal.
 
 **Files known to be in that set:** none.
 
 - No conformance variant. All 60 `.4dgs` files the generator produces — top-level, `object/`,
-  `keyframe/` and `invalid/` alike — were framed record by record and none carries a `0x20`–`0x2F`
+  `keyframe/` and `invalid/` alike — were framed record by record and none carries a `0x20`–`0x25`
   opcode after the first `Chunk` or `Delta Chunk`. (Two files in the invalid set cannot be framed at
   all, by design; neither is a counter-example.)
 - No output of `fourdgs.write`: `writer.py:516-541` emits provenance and the object layer before the

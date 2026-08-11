@@ -417,11 +417,11 @@ carries every corner the rules above decide.
   so the present `object_id` stream has two rows: A repeats its absolute reference id (zero in the
   introduction case) and B states its new id. The expectation catches both a writer that emits a
   one-row object lane and a reader that applies B's value to A by treating the lane as sparse.
-- **Omitted complete-state lanes normalize to zero.** After the same gaussian reaches id `12`, the
-  next complete source sample omits `object_id`. The writer must detect the nonzero-to-zero change
-  and physically emit an absolute zero update; the canonical state becomes untracked. This is the
-  opposite direction from materializing an omitted reference and catches a writer that only
-  normalizes the reference side before classifying changes.
+- **Omitted complete-state lanes normalize to zero.** After the same gaussian reaches id
+  `0x8000000C`, the next complete source sample omits `object_id`. The writer must detect the
+  nonzero-to-zero change and physically emit an absolute zero update; the canonical state becomes
+  untracked. This is the opposite direction from materializing an omitted reference and catches a
+  writer that only normalizes the reference side before classifying changes.
 - **What the canonical must report.** The `keyframe-delta` canonical
   (`keyframe_delta_file.states_json`) has no `objects` member and no `objectIds` today, so it must
   gain both, in the shape `canonical.summarize` already uses for `gaussian-birth`: an `objects`
