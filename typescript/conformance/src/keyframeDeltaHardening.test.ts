@@ -24,6 +24,7 @@ import {
   decodeKeyframeDeltaIndexed,
   decodeKeyframeDeltaStreamed,
   decompressChunkBlock,
+  iterateRecords,
   keyframeDeltaChunkAt,
   keyframeDeltaStatesJson,
   reconstructKeyframeDelta,
@@ -598,6 +599,37 @@ test("a streamed decode reads a complete prefix and bounds probes to the last ch
   for (const invalid of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
     assert.throws(() => keyframeDeltaChunkAt(sequence, invalid), MalformedFile);
   }
+});
+
+test("a cut inside a trailing SH record drops only its incomplete state", async () => {
+  const data = await keyframeThenBirthShFile();
+  const framed = [...iterateRecords(data, MAGIC.length)];
+  const trailingBand = framed[framed.length - 1]!;
+  assert.equal(trailingBand.opcode, 0x07);
+
+  // The band frame has arrived, but only one byte of its declared content has.
+  const cut = data.slice(0, trailingBand.offset + 9 + 1);
+  const decoded = await decodeKeyframeDeltaStreamed(cut);
+  assert.equal(decoded.chunks.length, 1);
+  const state = reconstructKeyframeDelta(decoded, decoded.chunks[0]!, 0.25);
+  assert.equal(state.sh?.degree, 1);
+  assert.deepEqual(
+    [...state.sh!.values],
+    Array.from({ length: 9 }, (_, i) => i + 1),
+  );
+});
+
+test("the end boundary selects the temporally last chunk, not the physical last", async () => {
+  const sequence = (await decodeKeyframeDeltaIndexed(bytes(MOVING_CHAINED))).sequence;
+  const temporalLast = sequence.chunks.reduce((latest, chunk) =>
+    chunk.t1 > latest.t1 ? chunk : latest,
+  );
+  const physicallyReordered = { ...sequence, chunks: [...sequence.chunks].reverse() };
+  assert.notEqual(physicallyReordered.chunks.at(-1)!.offset, temporalLast.offset);
+  assert.equal(
+    keyframeDeltaChunkAt(physicallyReordered, sequence.header.durationSec).offset,
+    temporalLast.offset,
+  );
 });
 
 test("a birth that introduces object_id defaults the rows that came before it", async () => {

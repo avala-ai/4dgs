@@ -42,7 +42,7 @@ import {
 } from "./chunk.js";
 import { DEFAULT_CODECS, type CodecRegistry } from "./codec.js";
 import { Cursor } from "./cursor.js";
-import { MalformedFile } from "./errors.js";
+import { MalformedFile, TruncatedFile } from "./errors.js";
 import { ATTRIBUTE_CHANNELS, Attribute, GAUSSIAN_FLAG_NEVER_FADES } from "./opcodes.js";
 import {
   clamp,
@@ -269,7 +269,9 @@ function applyDelta(
       copied.set(attribute, { channels: column.channels, values: Int32Array.from(column.values) });
     }
     bins = copied;
-    for (const [band, values] of bandsOf(state)) bands.set(band, Int32Array.from(values));
+    // Coefficients are immutable under updates. A shallow map copy keeps sibling
+    // composition isolated while sharing the large arrays until births append rows.
+    bands = new Map(bandsOf(state));
   }
 
   // --- updates ----------------------------------------------------------
@@ -816,7 +818,20 @@ export async function decodeKeyframeDeltaStreamed(
     );
   };
 
-  for (const record of iterateRecords(data, MAGIC.length)) {
+  const iterator = iterateRecords(data, MAGIC.length)[Symbol.iterator]();
+  while (true) {
+    let next: ReturnType<(typeof iterator)["next"]>;
+    try {
+      next = iterator.next();
+    } catch (error) {
+      // A cut may land inside a record after its nine-byte frame has arrived. The
+      // longest preceding complete prefix is still decodable; band completeness below
+      // decides whether the current state belongs to that prefix.
+      if (!(error instanceof TruncatedFile) || sawFooter) throw error;
+      break;
+    }
+    if (next.done) break;
+    const record = next.value;
     if (record.opcode === Opcode.Header) {
       header = parseHeader(record.content);
       if (header.temporalModel !== "keyframe-delta") {
@@ -1303,7 +1318,10 @@ export function keyframeDeltaChunkAt(
     throw new MalformedFile(`no state chunk covers t=${t}; the file carries none`);
   }
   for (const c of chunks) if (c.t0 <= t && t < c.t1) return c;
-  const last = chunks[chunks.length - 1]!;
+  let last = chunks[0]!;
+  for (let i = 1; i < chunks.length; i++) {
+    if (chunks[i]!.t1 > last.t1) last = chunks[i]!;
+  }
   if (!Number.isFinite(t) || t < last.t1) {
     throw new MalformedFile(`no state chunk covers t=${t}`);
   }
