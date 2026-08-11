@@ -10,11 +10,64 @@
  * broken, and the file is fine but this build cannot read one of its codecs.
  */
 
-/** Base class for every error this package raises. */
+/**
+ * Every refusal this reader can name (spec: the refusal table).
+ *
+ * Constants rather than string literals at the raise sites, because these are compared
+ * across six implementations: a typo in one is a conformance failure that reads like a
+ * decoder bug.
+ */
+export const Refusal = {
+  /** The file does not begin with the 4dgs magic. */
+  MagicMismatch: "magic-mismatch",
+  /** The magic is ours; the major version is not one this reader implements. */
+  UnsupportedMajorVersion: "unsupported-major-version",
+  /**
+   * The Header names a temporal model this build does not implement — including the
+   * empty name, which is a declaration of nothing rather than a default.
+   */
+  UnknownTemporalModel: "unknown-temporal-model",
+  /** The Quantization record names a scheme this build does not implement. */
+  UnknownQuantizationScheme: "unknown-quantization-scheme",
+  /** A stream declares a codec this build does not implement. */
+  UnknownStreamCodec: "unknown-stream-codec",
+  /** A gaussian's window index names a row the Window Table does not have. */
+  WindowIndexOutOfRange: "window-index-out-of-range",
+} as const;
+
+/** One of the identifiers in {@link Refusal}. */
+export type RefusalCode = (typeof Refusal)[keyof typeof Refusal];
+
+/** Options every error in this package accepts. */
+export interface FourdgsErrorOptions {
+  /** The identifier for a refusal the specification names. See {@link Refusal}. */
+  readonly refusalCode?: RefusalCode | undefined;
+}
+
+/**
+ * Base class for every error this package raises.
+ *
+ * `refusalCode` is an optional **refusal identifier**: a short, stable,
+ * language-independent name for the rule the file broke. The message is what a human
+ * reads; the identifier is what two implementations in two languages can be compared on,
+ * because the error *class* is far too coarse for that — `MalformedFile` covers a dozen
+ * distinct faults, and "both decoders threw MalformedFile" is not agreement.
+ *
+ * It is a property on this class rather than a subclass of it on purpose: an existing
+ * `instanceof FourdgsError` — or `instanceof UnsupportedCodec` — keeps meaning exactly
+ * what it meant before, so naming a refusal breaks nobody.
+ *
+ * `undefined` means "a real error the refusal table does not name" — a truncated
+ * transport, an encoder bound violation — not "no error".
+ */
 export class FourdgsError extends Error {
-  constructor(message: string) {
+  /** The refusal this is, when the specification names it. */
+  readonly refusalCode?: RefusalCode | undefined;
+
+  constructor(message: string, options?: FourdgsErrorOptions) {
     super(message);
     this.name = new.target.name;
+    this.refusalCode = options?.refusalCode;
   }
 }
 

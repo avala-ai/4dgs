@@ -55,7 +55,7 @@ or composition order of its own.
 | Reconstruction at an instant                      | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Encode `keyframe-delta`                           | Yes    | Planned    | Yes     | Planned | Planned | Planned |
 | Unknown-record skipping                           | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Refusal diagnosis (named, not merely refused)     | Yes    | No         | Yes     | No      | No      | No      |
+| Refusal diagnosis (named, not merely refused)     | Yes    | Yes        | Yes     | No      | No      | No      |
 | Private-range records                             | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Encode                                            | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
 | Chunked encode                                    | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
@@ -241,14 +241,18 @@ that it refused one. The invalid corpus pairs each deliberately broken file with
 identifier, and a runner prints that identifier as its answer. The distinction is the whole row: a
 decoder that refuses every invalid file for the wrong reason is indistinguishable, to a suite that
 only checks that something was raised, from one that refuses correctly. Rust carries the identifier
-on the error itself — `Error::refusal_code`, from the constants in `fourdgs::error::refusal` — so a
-consumer can branch on the refusal without reading its prose. The four remaining `No` cells are the
-honest state: those SDKs refuse these files today, and nothing here proves they refuse them for the
-right reason.
+on the error itself — `Error::refusal_code`, from the constants in `fourdgs::error::refusal` — and
+TypeScript does the same, as an optional `refusalCode` on `FourdgsError` from the constants in
+`Refusal`, so a consumer can branch on the refusal without reading its prose. The three remaining
+`No` cells are the honest state: those SDKs refuse these files today, and nothing here proves they
+refuse them for the right reason.
 
 The row was also the first thing to find a gap in the reference: neither an unknown `temporal_model`
 nor an unknown quantization `scheme` was refused at all before it existed, despite the registry
-requiring both. Each decoded as though it carried the known value.
+requiring both. Each decoded as though it carried the known value. It found one more on the way into
+TypeScript, where a file with a corrupted first magic byte was reported as an unsupported major
+version — the reader tested only that bytes 1-4 read `4DGS`. Both refusals are the same class and
+carry the same sentence's worth of prose, so nothing short of comparing identifiers could see it.
 
 **Truncated-file recovery** is the one row no expectation can carry, because a cut file is a
 different file. Each runner decodes its variant twice more — once cut before the trailing magic,
