@@ -87,7 +87,12 @@ Future<String> run(String path) async {
     //
     // On a multi-chunk file it must actually run: a check whose every probe was
     // skipped is a check that reported success without executing.
-    final seekCheck = await checkSeekReadsOnlyWhatItNeeds(source, scene, whole);
+    final seekCheck = await checkSeekReadsOnlyWhatItNeeds(
+      source,
+      scene,
+      whole,
+      decodedChunks: chunks,
+    );
     if (scene.index.length >= 2 &&
         hasAnyVisibleSupport(whole, scene.header.cutoff) &&
         seekCheck.probes == 0 &&

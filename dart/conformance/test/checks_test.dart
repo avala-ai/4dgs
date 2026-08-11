@@ -189,9 +189,24 @@ void main() {
     expect(indexed.index.every((entry) => entry.t1.isInfinite), isTrue);
 
     final whole = readFourdgsBytes(bytes).gaussians;
+    final chunks = <FourdgsDecodedChunk>[
+      for (final entry in indexed.index)
+        await readFourdgsChunk(source, indexed, entry, maxShBand: 0),
+    ];
+    final beforeSeekProof = source.bytesRead;
     expect(
-      (await checkSeekReadsOnlyWhatItNeeds(source, indexed, whole)).probes,
+      (await checkSeekReadsOnlyWhatItNeeds(
+        source,
+        indexed,
+        whole,
+        decodedChunks: chunks,
+      )).probes,
       greaterThan(0),
+    );
+    expect(
+      source.bytesRead,
+      beforeSeekProof,
+      reason: 'seek probes reuse the chunks the indexed runner already decoded',
     );
   });
 

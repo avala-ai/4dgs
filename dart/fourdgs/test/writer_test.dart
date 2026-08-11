@@ -1008,6 +1008,41 @@ void main() {
       );
     });
 
+    test(
+      'planning uses the same minimum sigma as state reconstruction',
+      () async {
+        final scene = flatScene(2, winHi: 1.0);
+        scene.sigmaT[0] = 1e-35;
+        scene.muT[0] = 0.0;
+        // This second validity window introduces a split between the authored
+        // sigma edge and stateAt's 1e-30 effective-sigma edge.
+        scene.sigmaT[1] = double.infinity;
+        scene.winHi[1] = 1e-31;
+        final bytes = writeFourdgsBytes(
+          scene,
+          1.0,
+          options: const FourdgsWriteOptions(maxDepth: 0, minChunkGaussians: 1),
+        );
+        final indexed = await openFourdgsIndexed(FourdgsBytes(bytes));
+        const probe = 5e-31;
+        final chunks = <FourdgsDecodedChunk>[];
+        for (final entry in indexed.index) {
+          if (entry.covers(probe)) {
+            chunks.add(
+              await readFourdgsChunk(FourdgsBytes(bytes), indexed, entry),
+            );
+          }
+        }
+        expect(
+          assembleGaussians(
+            chunks,
+            0,
+          ).stateAt(probe, cutoff: indexed.header.cutoff).count,
+          1,
+        );
+      },
+    );
+
     test('finite support still partitions an open-ended scene', () {
       final scene = buildScene(count: 512, windows: 1, duration: 512.0);
       scene.winLo.fillRange(0, scene.count, 0.0);

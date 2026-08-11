@@ -313,24 +313,27 @@ void writeFourdgsToSink(
     );
     out.bytes(chunk);
 
-    final entryBands = <_IndexBand>[];
+    final List<_IndexBand>? entryBands =
+        options.writeIndex ? <_IndexBand>[] : null;
     for (final band in bands) {
       final blob = _bandRecord(gaussians, band, members, options, grid.stepSh);
       final at = out.length;
       out.bytes(blob);
-      entryBands.add(_IndexBand(band.band, at, blob.length));
+      entryBands?.add(_IndexBand(band.band, at, blob.length));
     }
 
-    index.add(
-      _IndexEntry(
-        t0: plan.t0,
-        t1: plan.t1,
-        chunkOffset: chunkOffset,
-        chunkLength: chunk.length,
-        gaussianCount: members.length,
-        bands: entryBands,
-      ),
-    );
+    if (options.writeIndex) {
+      index.add(
+        _IndexEntry(
+          t0: plan.t0,
+          t1: plan.t1,
+          chunkOffset: chunkOffset,
+          chunkLength: chunk.length,
+          gaussianCount: members.length,
+          bands: entryBands!,
+        ),
+      );
+    }
   }
 
   // The summary (spec §4.5): the Chunk Index, then Statistics, then the Summary

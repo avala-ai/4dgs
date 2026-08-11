@@ -113,6 +113,34 @@ List<double> seekVisibleProbeInstants(
   int residentCount = 0,
 }) {
   if (limit <= 0) return const <double>[];
+  final rows = _seekVisibleProbeRows(
+    entry,
+    gaussians,
+    cutoff,
+    residentStart: residentStart,
+    residentCount: residentCount,
+  );
+  final times = <double>{};
+  for (final row in rows) {
+    times.add(row.time);
+    if (times.length == limit) break;
+  }
+  return times.toList(growable: false);
+}
+
+/// Candidate instants together with the resident row each one proves.
+///
+/// The public helper caps distinct instants for callers that need only a
+/// representative sample. The conformance proof consumes every row here, so
+/// success for four equal-width residents cannot silently stand in for a fifth
+/// resident that has no support inside its owning entry.
+List<({double time, int row})> _seekVisibleProbeRows(
+  FourdgsChunkIndexEntry entry,
+  FourdgsGaussianSet gaussians,
+  double cutoff, {
+  required int residentStart,
+  required int residentCount,
+}) {
   final selected = <({double time, bool resident, double width, int row})>[];
   final k = supportK(cutoff);
   final residentEnd = residentStart + residentCount;
@@ -130,8 +158,9 @@ List<double> seekVisibleProbeInstants(
   final end = residentCount > 0 ? residentEnd : gaussians.count;
   for (int i = first; i < end; i++) {
     final sigma = gaussians.sigmaT[i];
+    final effectiveSigma = sigma.isFinite ? math.max(sigma, 1e-30) : sigma;
     final mu = gaussians.muT[i];
-    final half = sigma.isFinite ? k * sigma : double.infinity;
+    final half = effectiveSigma.isFinite ? k * effectiveSigma : double.infinity;
     final lo = math.max(entry.t0, math.max(gaussians.winLo[i], mu - half));
     final hi = math.min(entry.t1, math.min(gaussians.winHi[i], mu + half));
     if (lo > hi) continue;
@@ -153,8 +182,8 @@ List<double> seekVisibleProbeInstants(
     if (!t.isFinite || !entry.covers(t)) continue;
     if (!(gaussians.winLo[i] <= t && t < gaussians.winHi[i])) continue;
     final marginal =
-        sigma.isFinite
-            ? math.exp(-0.5 * math.pow((t - mu) / math.max(sigma, 1e-30), 2))
+        effectiveSigma.isFinite
+            ? math.exp(-0.5 * math.pow((t - mu) / effectiveSigma, 2))
             : 1.0;
     if (marginal < cutoff) continue;
     final row = (
@@ -163,16 +192,12 @@ List<double> seekVisibleProbeInstants(
       width: hi - lo,
       row: i,
     );
-    final duplicate = selected.indexWhere((value) => value.time == t);
-    if (duplicate >= 0) {
-      if (compare(row, selected[duplicate]) < 0) selected[duplicate] = row;
-    } else {
-      selected.add(row);
-    }
+    selected.add(row);
   }
   selected.sort(compare);
-  if (selected.length > limit) selected.removeRange(limit, selected.length);
-  return <double>[for (final row in selected) row.time];
+  return <({double time, int row})>[
+    for (final row in selected) (time: row.time, row: row.row),
+  ];
 }
 
 /// Whether the reconstructed population is visible at any scene-clock instant.
@@ -185,8 +210,9 @@ bool hasAnyVisibleSupport(FourdgsGaussianSet gaussians, double cutoff) {
     final windowLo = gaussians.winLo[i];
     final windowHi = gaussians.winHi[i];
     if (!(windowLo < windowHi)) continue;
-    final sigma = gaussians.sigmaT[i];
-    if (!sigma.isFinite) return true;
+    final storedSigma = gaussians.sigmaT[i];
+    if (!storedSigma.isFinite) return true;
+    final sigma = math.max(storedSigma, 1e-30);
     final mu = gaussians.muT[i];
     final supportLo = mu - k * sigma;
     final supportHi = mu + k * sigma;
@@ -354,11 +380,24 @@ Future<({int probes, int guardedVisibleCandidates})>
 checkSeekReadsOnlyWhatItNeeds(
   CountingReadable source,
   FourdgsIndexedScene scene,
-  FourdgsGaussianSet whole,
-) async {
+  FourdgsGaussianSet whole, {
+  List<FourdgsDecodedChunk>? decodedChunks,
+}) async {
   final index = scene.index;
   if (index.length < 2 || whole.count == 0) {
     return (probes: 0, guardedVisibleCandidates: 0);
+  }
+  final chunks =
+      decodedChunks ??
+      <FourdgsDecodedChunk>[
+        for (final entry in index)
+          await readFourdgsChunk(source, scene, entry, maxShBand: 0),
+      ];
+  if (chunks.length != index.length) {
+    throw ConformanceFailure(
+      'the seek proof received ${chunks.length} decoded chunks for '
+      '${index.length} index entries',
+    );
   }
 
   // How far from a boundary a gaussian whose support ends there may legitimately
@@ -374,8 +413,9 @@ checkSeekReadsOnlyWhatItNeeds(
   final sigmaHalfRelative = seekGuardSigmaHalfRelative(sigmaLog);
   final guardEdges = <({double at, double guard})>[];
   for (int i = 0; i < whole.count; i++) {
-    final sigma = whole.sigmaT[i];
-    if (!sigma.isFinite) continue;
+    final storedSigma = whole.sigmaT[i];
+    if (!storedSigma.isFinite) continue;
+    final sigma = math.max(storedSigma, 1e-30);
     final sigmaBin = seekGuardSigmaBin(sigma, sigmaLog);
     final muHalfWidth = seekGuardMuHalfWidth(
       sigmaBin,
@@ -431,8 +471,9 @@ checkSeekReadsOnlyWhatItNeeds(
   // probe. Multiple chunks proposing the same instant share one decode.
   final support = whole.support(cutoff: scene.header.cutoff);
   final candidates = <double>{};
-  final supportOwners = <double, Set<int>>{};
-  final ownersWithVisibleResidents = <int>{};
+  final supportRows = <double, Set<int>>{};
+  final requiredResidentRows = <int>{};
+  final rowOwner = <int, int>{};
   for (final entry in probeEntries) {
     final residentCount = entry.gaussianCount;
     final residentStart = rowStartByChunkOffset[entry.chunkOffset]!;
@@ -440,20 +481,20 @@ checkSeekReadsOnlyWhatItNeeds(
     for (int row = residentStart; row < residentEnd; row++) {
       if (support.lo[row] <= support.hi[row] &&
           support.lo[row] < whole.winHi[row]) {
-        ownersWithVisibleResidents.add(entry.chunkOffset);
-        break;
+        requiredResidentRows.add(row);
+        rowOwner[row] = entry.chunkOffset;
       }
     }
-    final visible = seekVisibleProbeInstants(
+    final visible = _seekVisibleProbeRows(
       entry,
       whole,
       scene.header.cutoff,
       residentStart: residentStart,
       residentCount: residentCount,
     );
-    for (final t in visible) {
-      candidates.add(t);
-      supportOwners.putIfAbsent(t, () => <int>{}).add(entry.chunkOffset);
+    for (final candidate in visible) {
+      candidates.add(candidate.time);
+      supportRows.putIfAbsent(candidate.time, () => <int>{}).add(candidate.row);
     }
     candidates.addAll(seekProbeInstants(entry, guardAt));
   }
@@ -487,8 +528,8 @@ checkSeekReadsOnlyWhatItNeeds(
 
   int probed = 0;
   int guardedVisibleCandidates = 0;
-  final provedOwners = <int>{};
-  final guardedOwners = <int>{};
+  final provedRows = <int>{};
+  final guardedRows = <int>{};
   for (final t in orderedCandidates) {
     while (nextEntryStart < entryStarts.length &&
         entryStarts[nextEntryStart].at <= t) {
@@ -515,7 +556,7 @@ checkSeekReadsOnlyWhatItNeeds(
     if (_probeInGuardZones(t, guardZones)) {
       if (fromWhole.isNotEmpty) {
         guardedVisibleCandidates++;
-        guardedOwners.addAll(supportOwners[t] ?? const <int>{});
+        guardedRows.addAll(supportRows[t] ?? const <int>{});
       }
       continue;
     }
@@ -524,12 +565,11 @@ checkSeekReadsOnlyWhatItNeeds(
     if (selectedIndices.isEmpty) {
       throw ConformanceFailure('no chunk index entry covers probe t=$t');
     }
-    final chunks = <FourdgsDecodedChunk>[
-      for (final i in selectedIndices)
-        await readFourdgsChunk(source, scene, index[i], maxShBand: 0),
+    final selectedChunks = <FourdgsDecodedChunk>[
+      for (final i in selectedIndices) chunks[i],
     ];
     final fromSeek = _visibleKeys(
-      assembleGaussians(chunks, 0),
+      assembleGaussians(selectedChunks, 0),
       t,
       scene.header.cutoff,
     );
@@ -545,19 +585,18 @@ checkSeekReadsOnlyWhatItNeeds(
       );
     }
     probed++;
-    provedOwners.addAll(supportOwners[t] ?? const <int>{});
+    provedRows.addAll(supportRows[t] ?? const <int>{});
   }
-  for (final entry in probeEntries) {
-    if ((provedOwners.contains(entry.chunkOffset) ||
-        guardedOwners.contains(entry.chunkOffset))) {
-      continue;
-    }
-    if (ownersWithVisibleResidents.contains(entry.chunkOffset)) {
-      throw ConformanceFailure(
-        'populated chunk at ${entry.chunkOffset} yielded no successful or guarded '
-        'probe from its resident supports',
-      );
-    }
+  final unproved = requiredResidentRows.difference(<int>{
+    ...provedRows,
+    ...guardedRows,
+  });
+  if (unproved.isNotEmpty) {
+    final row = unproved.first;
+    throw ConformanceFailure(
+      'resident gaussian row $row in the chunk at ${rowOwner[row]} yielded no '
+      'successful or guarded probe from its support',
+    );
   }
   return (probes: probed, guardedVisibleCandidates: guardedVisibleCandidates);
 }

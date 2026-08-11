@@ -512,7 +512,12 @@ class FourdgsGaussianSet {
     final hi = Float64List(count);
     for (int i = 0; i < count; i++) {
       final sigma = sigmaT[i];
-      final half = sigma.isFinite ? k * sigma : double.infinity;
+      // State reconstruction floors finite sigma at 1e-30 before evaluating
+      // the marginal. Support is the inverse of that same calculation: using
+      // the authored sub-floor value here would let a chunker file a gaussian
+      // into an interval where stateAt can still see it outside the interval.
+      final half =
+          sigma.isFinite ? k * math.max(sigma, 1e-30) : double.infinity;
       lo[i] = math.max(muT[i] - half, winLo[i]);
       hi[i] = math.min(muT[i] + half, winHi[i]);
     }
