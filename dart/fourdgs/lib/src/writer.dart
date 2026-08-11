@@ -206,8 +206,7 @@ void writeFourdgsToSink(
   final n = gaussians.count;
   final grid = _Grid.forScene(gaussians, options.profile);
   final windows = _WindowTable.of(gaussians);
-  final quantized = _quantize(gaussians, grid, windows, options.cutoff);
-  final encodedAabb = _encodedAabb(quantized.lanes.first.values, n, grid);
+  final encodedAabb = _encodedAabb(gaussians, grid);
 
   // Window boundaries are the top level of the temporal partition. Anything
   // strictly inside the clip is a split point; the ends are always present.
@@ -238,15 +237,20 @@ void writeFourdgsToSink(
 
   final index = <_IndexEntry>[];
   for (final plan in plans) {
+    // Quantized columns are bounded by one Chunk. Keeping the whole scene's
+    // eleven lanes here would make the sink API retain memory in proportion to
+    // output size even though every framed record is released immediately.
+    final quantized = _quantize(
+      gaussians,
+      plan.members,
+      grid,
+      windows,
+      options.cutoff,
+    );
     final streams = _ByteWriter(4096);
     for (final lane in quantized.lanes) {
       streams.bytes(
-        _encodeStream(
-          lane.attributeId,
-          _gather(lane.values, plan.members, lane.channels),
-          lane.channels,
-          options,
-        ),
+        _encodeStream(lane.attributeId, lane.values, lane.channels, options),
       );
     }
     final chunkOffset = out.length;
@@ -807,11 +811,12 @@ const List<List<int>> _rest = <List<int>>[
 
 _Quantized _quantize(
   FourdgsGaussianSet g,
+  List<int> members,
   _Grid grid,
   _WindowTable table,
   double cutoff,
 ) {
-  final n = g.count;
+  final n = members.length;
   final pos = Int32List(n * 3);
   final scale = Int32List(n * 3);
   final rotationIndex = Int32List(n);
@@ -829,9 +834,10 @@ _Quantized _quantize(
   final stepSigmaLog = grid.stepSigmaLog;
   final narrowedMotion = Float32List(1);
 
-  for (int i = 0; i < n; i++) {
+  for (int row = 0; row < n; row++) {
+    final i = members[row];
     for (int axis = 0; axis < 3; axis++) {
-      pos[i * 3 + axis] = _bin(
+      pos[row * 3 + axis] = _bin(
         (g.positions[i * 3 + axis] - grid.origin[axis]) / grid.stepPos,
         'position',
         i,
@@ -839,24 +845,24 @@ _Quantized _quantize(
       // Input validation already proved this Float32 value is finite and
       // strictly positive. Preserve its actual logarithm: flooring a legal
       // sub-1e-30 scale would violate the Header's relative error promise.
-      scale[i * 3 + axis] = _bin(
+      scale[row * 3 + axis] = _bin(
         math.log(g.scales[i * 3 + axis]) / stepScaleLog,
         'scale',
         i,
       );
     }
 
-    _quantizeRotation(g, i, grid.stepRot, rotationIndex, rotation);
+    _quantizeRotation(g, i, row, grid.stepRot, rotationIndex, rotation);
 
     // The colour transform stores `(g, r - g, b - g)`. Exact in the integer
     // domain, so it changes the compressed size and never the error bound.
     final r = _bin(g.colors[i * 4] / grid.stepRgb, 'color', i);
     final green = _bin(g.colors[i * 4 + 1] / grid.stepRgb, 'color', i);
     final b = _bin(g.colors[i * 4 + 2] / grid.stepRgb, 'color', i);
-    rgb[i * 3] = green;
-    rgb[i * 3 + 1] = r - green;
-    rgb[i * 3 + 2] = b - green;
-    alpha[i] = _bin(g.colors[i * 4 + 3] / grid.stepAlpha, 'opacity', i);
+    rgb[row * 3] = green;
+    rgb[row * 3 + 1] = r - green;
+    rgb[row * 3 + 2] = b - green;
+    alpha[row] = _bin(g.colors[i * 4 + 3] / grid.stepAlpha, 'opacity', i);
 
     final neverFades = !g.sigmaT[i].isFinite;
     final sigmaBin =
@@ -867,11 +873,11 @@ _Quantized _quantize(
               'sigma_t',
               i,
             );
-    sigma[i] = sigmaBin;
-    flags[i] = neverFades ? flagNeverFades : 0;
+    sigma[row] = sigmaBin;
+    flags[row] = neverFades ? flagNeverFades : 0;
 
     final w = table.index[i];
-    windowIndex[i] = w;
+    windowIndex[row] = w;
     final window = table.windows[w];
 
     // Both per-gaussian pitches are recomputed at decode from the sigma bin, so
@@ -890,7 +896,7 @@ _Quantized _quantize(
     );
     for (int axis = 0; axis < 3; axis++) {
       final bin = _bin(g.motions[i * 3 + axis] / mStep, 'motion', i);
-      motion[i * 3 + axis] = bin;
+      motion[row * 3 + axis] = bin;
       // `decodeChunk` writes the product into a Float32List. A finite authored
       // velocity can therefore quantize to a perfectly legal i32 bin and still
       // reconstruct as infinity; test the value in the representation the
@@ -904,7 +910,7 @@ _Quantized _quantize(
         );
       }
     }
-    mu[i] = _bin(
+    mu[row] = _bin(
       g.muT[i] / muStep(sigmaBin, stepSigmaLog, neverFades, grid.stepTime),
       'mu_t',
       i,
@@ -946,17 +952,29 @@ _Quantized _quantize(
   ];
   final sourceGroup = g.sourceGroup;
   if (sourceGroup != null) {
-    lanes.add(_Lane(attrSourceGroup, 1, Int32List.fromList(sourceGroup)));
+    lanes.add(
+      _Lane(
+        attrSourceGroup,
+        1,
+        Int32List.fromList(<int>[for (final i in members) sourceGroup[i]]),
+      ),
+    );
   }
   final sourceIndex = g.sourceIndex;
   if (sourceIndex != null) {
-    lanes.add(_Lane(attrSourceIndex, 1, Int32List.fromList(sourceIndex)));
+    lanes.add(
+      _Lane(
+        attrSourceIndex,
+        1,
+        Int32List.fromList(<int>[for (final i in members) sourceIndex[i]]),
+      ),
+    );
   }
   final objectId = g.objectId;
   if (objectId != null) {
     final codes = Int32List(n);
-    for (int i = 0; i < n; i++) {
-      codes[i] = objectId[i].toSigned(32);
+    for (int row = 0; row < n; row++) {
+      codes[row] = objectId[members[row]].toSigned(32);
     }
     lanes.add(_Lane(attrObjectId, 1, codes));
   }
@@ -973,16 +991,17 @@ _Quantized _quantize(
 /// the other one would land a hair off theirs on exact ties.
 void _quantizeRotation(
   FourdgsGaussianSet g,
-  int i,
+  int gaussian,
+  int row,
   double step,
   Int32List largestOut,
   Int32List binsOut,
 ) {
   final q = <double>[
-    g.rotations[i * 4],
-    g.rotations[i * 4 + 1],
-    g.rotations[i * 4 + 2],
-    g.rotations[i * 4 + 3],
+    g.rotations[gaussian * 4],
+    g.rotations[gaussian * 4 + 1],
+    g.rotations[gaussian * 4 + 2],
+    g.rotations[gaussian * 4 + 3],
   ];
   double scale = 0.0;
   for (final v in q) {
@@ -1002,10 +1021,10 @@ void _quantizeRotation(
     if (q[c].abs() > q[largest].abs()) largest = c;
   }
   final sign = q[largest] < 0.0 ? -1.0 : 1.0;
-  largestOut[i] = largest;
+  largestOut[row] = largest;
   final rest = _rest[largest];
   for (int c = 0; c < 3; c++) {
-    binsOut[i * 3 + c] = _binRotation(q[rest[c]] * sign / step, i);
+    binsOut[row * 3 + c] = _binRotation(q[rest[c]] * sign / step, gaussian);
   }
 }
 
@@ -1374,24 +1393,28 @@ class _IndexEntry {
   }
 }
 
-List<double> _encodedAabb(Int32List positionBins, int count, _Grid grid) {
-  if (count == 0) return List<double>.filled(6, 0.0);
+List<double> _encodedAabb(FourdgsGaussianSet g, _Grid grid) {
+  if (g.count == 0) return List<double>.filled(6, 0.0);
   final out = List<double>.filled(6, 0.0);
   final decoded = Float32List(1);
   for (int axis = 0; axis < 3; axis++) {
     double lo = double.infinity;
     double hi = double.negativeInfinity;
-    for (int i = 0; i < count; i++) {
+    for (int i = 0; i < g.count; i++) {
       // `decodeChunk` lands positions in a Float32List. The bin arithmetic is
       // double, and a negative maximum can round upward when narrowed; recording
       // its pre-narrowing value would then advertise a maximum below the value
       // the decoder actually returns.
-      decoded[0] =
-          positionBins[i * 3 + axis] * grid.stepPos + grid.origin[axis];
+      final bin = _bin(
+        (g.positions[i * 3 + axis] - grid.origin[axis]) / grid.stepPos,
+        'position',
+        i,
+      );
+      decoded[0] = bin * grid.stepPos + grid.origin[axis];
       final v = decoded[0];
       if (!v.isFinite) {
         throw FourdgsInvalidInput(
-          'position bin ${positionBins[i * 3 + axis]} at gaussian $i axis '
+          'position bin $bin at gaussian $i axis '
           '$axis reconstructs outside the finite float32 range; the decoded '
           'position would be $v',
         );
@@ -1416,17 +1439,6 @@ Uint8List _record(int opcode, Uint8List content) {
 // --------------------------------------------------------------------------
 // Attribute streams
 // --------------------------------------------------------------------------
-
-Int32List _gather(Int32List values, List<int> members, int channels) {
-  final out = Int32List(members.length * channels);
-  int at = 0;
-  for (final i in members) {
-    for (int c = 0; c < channels; c++) {
-      out[at++] = values[i * channels + c];
-    }
-  }
-  return out;
-}
 
 /// Serialize signed integer bins as one Attribute Stream.
 ///
