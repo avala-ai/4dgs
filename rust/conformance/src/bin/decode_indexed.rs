@@ -70,6 +70,12 @@ impl<R: Readable> Readable for Counting<R> {
 /// selected indexed decoder owns that rule, so the invalid corpus can prove that the
 /// indexed path enforces it independently of the streamed path.
 fn temporal_model(path: &str, data: &[u8]) -> Result<Option<String>, Failure> {
+    // Only a known version-1 file is safe to parse with the version-1 record and Header
+    // layouts. Every other prefix goes straight to the indexed opener, which diagnoses a
+    // foreign magic separately from a future major version before it touches any record.
+    if data.get(..MAGIC.len()) != Some(MAGIC.as_slice()) {
+        return Ok(None);
+    }
     for record in Records::new(data, MAGIC.len()) {
         let record = record.map_err(|e| Failure::from_error(path, &e))?;
         if record.opcode == opcode::HEADER {
