@@ -134,6 +134,7 @@ words:
   - MSVC
   - fprintf
   - DFOURDGS
+  - DCMAKE
   # Git and workflow vocabulary
   - reflog
   - oneline
