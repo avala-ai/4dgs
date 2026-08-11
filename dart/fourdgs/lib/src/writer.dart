@@ -127,10 +127,10 @@ Uint8List writeFourdgsBytes(
   double durationSec, {
   FourdgsWriteOptions options = const FourdgsWriteOptions(),
 }) {
-  if (durationSec.isNaN || !durationSec.isFinite || durationSec < 0.0) {
+  if (durationSec.isNaN || durationSec < 0.0) {
     throw FourdgsInvalidInput(
-      'duration_sec is $durationSec; a scene length must be finite and '
-      'non-negative, and a static asset says so with 0',
+      'duration_sec is $durationSec; expected a value >= 0, or +Infinity for '
+      'an open-ended scene (a static asset says so with 0)',
     );
   }
   if (!_profiles.containsKey(options.profile)) {
@@ -161,12 +161,19 @@ Uint8List writeFourdgsBytes(
       'write the object layer first or leave the profile empty',
     );
   }
+  if (options.sceneProfile == 'relightable') {
+    throw FourdgsInvalidInput(
+      'the scene profile "relightable" is reserved for a future relighting '
+      'extension, and a version-1 writer MUST NOT emit it',
+    );
+  }
   _checkInput(gaussians, options.cutoff);
 
   final n = gaussians.count;
   final grid = _Grid.forScene(gaussians, options.profile);
   final windows = _WindowTable.of(gaussians);
   final quantized = _quantize(gaussians, grid, windows, options.cutoff);
+  final encodedAabb = _encodedAabb(quantized.lanes.first.values, n, grid);
 
   // Window boundaries are the top level of the temporal partition. Anything
   // strictly inside the clip is a split point; the ends are always present.
@@ -189,6 +196,7 @@ Uint8List writeFourdgsBytes(
       durationSec,
       options,
       bands.isEmpty ? 0 : bands.last.band,
+      encodedAabb,
     ),
   );
   out.bytes(_quantizationRecord(grid, windows));
@@ -265,9 +273,7 @@ Uint8List writeFourdgsBytes(
     // which is the one thing the record exists to prevent.
     final groupEnd = out.length;
     if (options.writeStatistics) {
-      out.bytes(
-        _statisticsRecord(n, index.length, durationSec, _aabb(gaussians)),
-      );
+      out.bytes(_statisticsRecord(n, index.length, durationSec, encodedAabb));
     }
     if (options.writeSummaryOffsets) {
       summaryOffsetStart = out.length;
@@ -328,6 +334,19 @@ void _checkInput(FourdgsGaussianSet g, double cutoff) {
   _checkFinite('colors', g.colors, 4);
   _checkFinite('motions', g.motions, 3);
   _checkFinite('mu_t', g.muT, 1);
+
+  for (int i = 0; i < n; i++) {
+    double largest = 0.0;
+    for (int c = 0; c < 4; c++) {
+      largest = math.max(largest, g.rotations[i * 4 + c].abs());
+    }
+    if (largest == 0.0) {
+      throw FourdgsInvalidInput(
+        'rotation has zero length at gaussian $i; a zero quaternion has no '
+        'orientation to encode',
+      );
+    }
+  }
 
   // Three lanes are quantized through a clamp, and a clamp is the quiet way to
   // store a value nobody authored. Colour is written as a bin of `step_rgb` and
@@ -874,11 +893,16 @@ void _quantizeRotation(
     g.rotations[i * 4 + 2],
     g.rotations[i * 4 + 3],
   ];
-  double norm = 0.0;
+  double scale = 0.0;
   for (final v in q) {
-    norm += v * v;
+    scale = math.max(scale, v.abs());
   }
-  norm = math.max(math.sqrt(norm), 1e-30);
+  double scaledSquareSum = 0.0;
+  for (final v in q) {
+    final scaled = v / scale;
+    scaledSquareSum += scaled * scaled;
+  }
+  final norm = scale * math.sqrt(scaledSquareSum);
   for (int c = 0; c < 4; c++) {
     q[c] = q[c] / norm;
   }
@@ -1103,6 +1127,7 @@ Uint8List _header(
   double durationSec,
   FourdgsWriteOptions options,
   int shDegree,
+  List<double> aabb,
 ) {
   final w = _ByteWriter(256);
   w.string(options.sceneProfile);
@@ -1116,7 +1141,7 @@ Uint8List _header(
   w.u64(g.count);
   w.f64(options.cutoff);
   w.string('gaussian-birth');
-  for (final v in _aabb(g)) {
+  for (final v in aabb) {
     w.f64(v);
   }
   w.u8(shDegree);
@@ -1258,14 +1283,14 @@ class _IndexEntry {
   }
 }
 
-List<double> _aabb(FourdgsGaussianSet g) {
-  if (g.count == 0) return List<double>.filled(6, 0.0);
+List<double> _encodedAabb(Int32List positionBins, int count, _Grid grid) {
+  if (count == 0) return List<double>.filled(6, 0.0);
   final out = List<double>.filled(6, 0.0);
   for (int axis = 0; axis < 3; axis++) {
     double lo = double.infinity;
     double hi = double.negativeInfinity;
-    for (int i = 0; i < g.count; i++) {
-      final v = g.positions[i * 3 + axis];
+    for (int i = 0; i < count; i++) {
+      final v = positionBins[i * 3 + axis] * grid.stepPos + grid.origin[axis];
       if (v < lo) lo = v;
       if (v > hi) hi = v;
     }

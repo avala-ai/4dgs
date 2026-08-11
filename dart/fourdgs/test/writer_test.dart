@@ -196,6 +196,41 @@ void main() {
       }
     });
 
+    test('Header and Statistics bound the positions the file reconstructs', () {
+      final scene = flatScene(2);
+      // With a 1e-3 median scale the default position pitch is 1e-4. This
+      // authored maximum rounds outward to the 1e-4 bin, so an AABB taken from
+      // the input would exclude the point the file actually reconstructs.
+      scene.positions[3] = 0.000075;
+      final decoded = readFourdgsBytes(
+        writeFourdgsBytes(
+          scene,
+          1.0,
+          options: const FourdgsWriteOptions(writeStatistics: true),
+        ),
+      );
+      final reconstructed = <double>[
+        double.infinity,
+        double.infinity,
+        double.infinity,
+        double.negativeInfinity,
+        double.negativeInfinity,
+        double.negativeInfinity,
+      ];
+      for (int i = 0; i < decoded.gaussians.count; i++) {
+        for (int axis = 0; axis < 3; axis++) {
+          final value = decoded.gaussians.positions[i * 3 + axis];
+          reconstructed[axis] = math.min(reconstructed[axis], value);
+          reconstructed[3 + axis] = math.max(reconstructed[3 + axis], value);
+        }
+      }
+      for (int i = 0; i < 6; i++) {
+        expect(decoded.header.aabb[i], closeTo(reconstructed[i], 1e-12));
+        expect(decoded.statistics!.aabb[i], decoded.header.aabb[i]);
+      }
+      expect(decoded.header.aabb[3], greaterThan(scene.positions[3]));
+    });
+
     test('two encodes of one scene are the same bytes', () {
       final scene = buildScene();
       // The attribute maps hold the same pairs in different insertion orders. A
@@ -1079,7 +1114,7 @@ void main() {
       }
     });
 
-    test('the objects profile is refused until its records are written', () {
+    test('promissory and reserved scene profiles are refused', () {
       // A profile is a promise about what the file contains. `objects` promises
       // an object_id stream in every non-empty chunk and one Object Table, and
       // this writer emits neither — so the Header would carry a promise the
@@ -1095,6 +1130,20 @@ void main() {
             (FourdgsInvalidInput e) => e.message,
             'message',
             allOf(contains('objects'), contains('Object Table')),
+          ),
+        ),
+      );
+      expect(
+        () => writeFourdgsBytes(
+          buildScene(count: 8),
+          8.0,
+          options: const FourdgsWriteOptions(sceneProfile: 'relightable'),
+        ),
+        throwsA(
+          isA<FourdgsInvalidInput>().having(
+            (FourdgsInvalidInput e) => e.message,
+            'message',
+            allOf(contains('relightable'), contains('MUST NOT')),
           ),
         ),
       );
@@ -1245,13 +1294,40 @@ void main() {
     });
 
     test('a duration that is not a scene length is refused', () {
-      for (final duration in <double>[double.nan, double.infinity, -1.0]) {
+      for (final duration in <double>[double.nan, -1.0]) {
         expect(
           () => writeFourdgsBytes(buildScene(), duration),
           throwsA(isA<FourdgsInvalidInput>()),
           reason: 'duration_sec = $duration',
         );
       }
+    });
+
+    test('+Infinity writes an open-ended scene', () {
+      final scene = flatScene(8, winHi: double.infinity);
+      final decoded = readFourdgsBytes(
+        writeFourdgsBytes(scene, double.infinity),
+      );
+      expect(decoded.header.durationSec, double.infinity);
+      expect(decoded.chunkIndex, isNotEmpty);
+      expect(decoded.chunkIndex.last.t1, double.infinity);
+    });
+
+    test('a zero-length quaternion is refused by gaussian', () {
+      final scene = buildScene(count: 8);
+      for (int c = 0; c < 4; c++) {
+        scene.rotations[5 * 4 + c] = 0.0;
+      }
+      expect(
+        () => writeFourdgsBytes(scene, 8.0),
+        throwsA(
+          isA<FourdgsInvalidInput>().having(
+            (FourdgsInvalidInput e) => e.message,
+            'message',
+            allOf(contains('rotation'), contains('gaussian 5')),
+          ),
+        ),
+      );
     });
 
     test(

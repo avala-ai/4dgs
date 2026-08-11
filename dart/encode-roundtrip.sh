@@ -200,6 +200,25 @@ for key, limit in limits.items():
     if not (worst[key] <= limit):
         fail(f"{key} deviates by {worst[key]:g}, past the {limit:g} this file declares")
 
+# Quaternion sign is not an orientation: q and -q are the same rotation. The
+# stored three residuals each carry the declared `rot` bound, while restoring
+# and renormalizing the omitted component can amplify their error by a small
+# factor (the writer's unit test covers the same worst-case envelope).
+enc_q = enc.rotations.astype(np.float64)
+src_q = src.rotations[pair].astype(np.float64)
+enc_norm = np.linalg.norm(enc_q, axis=1)
+src_norm = np.linalg.norm(src_q, axis=1)
+if np.any(enc_norm == 0.0) or np.any(src_norm == 0.0):
+    fail("a rotation has zero quaternion length")
+enc_q /= enc_norm[:, None]
+src_q /= src_norm[:, None]
+same = np.max(np.abs(enc_q - src_q), axis=1)
+flipped = np.max(np.abs(enc_q + src_q), axis=1)
+rotation_error = np.minimum(same, flipped).max()
+rotation_limit = 8.0 * declared["rot"] + SLACK
+if rotation_error > rotation_limit:
+    fail(f"a rotation deviates by {rotation_error:g}, past the {rotation_limit:g} reconstructed-quaternion envelope")
+
 # Velocity and birth time are the two lanes whose grid is per gaussian, not per
 # file: a short-lived gaussian is on screen briefly, so it tolerates a coarser
 # velocity than a long-lived one, and `step_motion` in the record is the pitch
@@ -232,6 +251,14 @@ if mu_excess.max() > 0:
 # The validity windows are written verbatim, so they are not a tolerance at all.
 if not np.array_equal(enc.win_lo, src.win_lo[pair]) or not np.array_equal(enc.win_hi, src.win_hi[pair]):
     fail("a validity window came back changed, and the Window Table stores them verbatim")
+
+# Object membership is also verbatim and exact. Absence is distinct from a
+# present all-zero stream: the latter explicitly assigns every gaussian to the
+# background object and must survive a decode-then-encode round trip as a lane.
+if (src.object_id is None) != (enc.object_id is None):
+    fail("the object_id stream changed between present and absent")
+if src.object_id is not None and not np.array_equal(enc.object_id, src.object_id[pair]):
+    fail("an object_id changed, and object membership is an exact label")
 
 # Spherical harmonics. Presence, degree and shape are checked BEFORE any
 # coefficient is compared, and they are checked because the comparison cannot
