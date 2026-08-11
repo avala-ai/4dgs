@@ -171,12 +171,20 @@ jobs:
           python tests/conformance/generate.py
           python tests/conformance/run.py --runner rust
 
-      # The corpus proves decoders against files the reference encoder wrote; this proves
-      # the Rust encoder, by requiring the Rust and Python decoders to agree on files it
-      # wrote. An encoder checked only by its own decoder proves that two halves of one
-      # implementation share an opinion, which is the failure mode this suite exists to
-      # catch. Every encode inside it also runs the encoder's own bound verification.
+      # One Ubuntu leg runs the shared source-fidelity gate over both reference encoders.
+      # Agreement alone cannot expose a defect they share, which is the motivating failure
+      # mode for this gate; its self-test runs beside them so a dead assertion is red too.
+      - name: The two reference encoders preserve their source scenes
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          python tests/conformance/encode_roundtrip.py --self-test
+          python tests/conformance/encode_roundtrip.py --encoder rust
+          python tests/conformance/encode_roundtrip.py --encoder python
+
+      # Keep the existing cross-platform Rust/Python agreement pass on the other legs. Its
+      # independent script exercises both read paths and remains useful platform coverage.
       - name: The encoder writes files another implementation agrees with
+        if: matrix.os != 'ubuntu-latest'
         run: rust/encode-roundtrip.sh
 
   cpp:

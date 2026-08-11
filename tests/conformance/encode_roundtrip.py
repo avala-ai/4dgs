@@ -67,11 +67,13 @@ are open specification questions rather than defects; see `KNOWN_REFERENCE_DIVER
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 
 import numpy as np
 
@@ -85,7 +87,7 @@ sys.path.insert(0, HERE)
 import fourdgs
 from canonical import canonical, summarize
 from fourdgs import records as rec
-from fourdgs.opcode import CHUNK, CHUNK_INDEX, HEADER
+from fourdgs.opcode import CHUNK, CHUNK_INDEX, DELTA_CHUNK, HEADER, QUANTIZATION, SH_BAND_STREAM
 from fourdgs.quantization import life_class, motion_steps, mu_steps, support_k
 from fourdgs.serialization import MAGIC, iter_records
 
@@ -144,7 +146,7 @@ SLACK = 1e-6
 #: there too and are deliberately absent: their grid is per gaussian, so the declared number
 #: is the bound for one reference lifetime rather than for any particular gaussian, and
 #: `check_fidelity` derives each gaussian's own pitch instead.
-DECLARED_LANES = ("pos", "scale_rel", "rgb", "alpha", "sigma_rel")
+DECLARED_LANES = ("pos", "scale_rel", "rot", "rgb", "alpha", "sigma_rel")
 
 #: The relative lanes, quantized in the log domain: `log(1 + bound)` is the promise there.
 LOG_DOMAIN_LANES = frozenset({"scale_rel", "sigma_rel"})
@@ -269,8 +271,14 @@ def _pair_with_source(enc, src) -> np.ndarray:
 
     lanes = [
         (enc.positions, src.positions),
+        (np.log(enc.scales.astype(np.float64)), np.log(src.scales.astype(np.float64))),
         (enc.colors, src.colors),
+        (enc.motions, src.motions),
         (enc.mu_t[:, None], src.mu_t[:, None]),
+        (
+            np.where(np.isfinite(enc.sigma_t), np.log(enc.sigma_t), np.inf)[:, None],
+            np.where(np.isfinite(src.sigma_t), np.log(src.sigma_t), np.inf)[:, None],
+        ),
         (enc.win_lo[:, None], src.win_lo[:, None]),
         (enc.win_hi[:, None], src.win_hi[:, None]),
     ]
@@ -278,6 +286,28 @@ def _pair_with_source(enc, src) -> np.ndarray:
     for raw_a, raw_b in lanes:
         a, b = centred(raw_a), centred(raw_b)
         cost += np.abs(a[:, None, :] - b[None, :, :]).sum(axis=2) / spread(b)
+
+    # q and -q are the same rotation. Normalize first, then use the cheaper sign for each
+    # possible pair; a sign flip must cost zero while a genuinely different orientation
+    # must break a tie between otherwise identical gaussians.
+    a_rot = enc.rotations.astype(np.float64)
+    b_rot = src.rotations.astype(np.float64)
+    a_rot /= np.maximum(np.linalg.norm(a_rot, axis=1, keepdims=True), 1e-30)
+    b_rot /= np.maximum(np.linalg.norm(b_rot, axis=1, keepdims=True), 1e-30)
+    rot_minus = np.abs(a_rot[:, None, :] - b_rot[None, :, :]).sum(axis=2)
+    rot_plus = np.abs(a_rot[:, None, :] + b_rot[None, :, :]).sum(axis=2)
+    cost += np.minimum(rot_minus, rot_plus) / spread(b_rot)
+
+    # SH and the two exact identity lanes are often the only distinction between rows
+    # sharing every geometric value. Identity mismatches dominate a lossy metric: an
+    # encoder may quantize a float, but it may never substitute another exact label.
+    if enc.sh is not None and src.sh is not None and enc.sh.shape[1] == src.sh.shape[1]:
+        cost += np.abs(enc.sh[:, None, :].astype(np.int16) - src.sh[None, :, :].astype(np.int16)).sum(axis=2) / 255.0
+    for name in ("source_index", "object_id"):
+        a_label = getattr(enc, name)
+        b_label = getattr(src, name)
+        if a_label is not None and b_label is not None:
+            cost += (np.asarray(a_label)[:, None] != np.asarray(b_label)[None, :]) * 1e6
 
     # Greedy over the whole matrix, cheapest pair first. Two gaussians that really are
     # interchangeable cost nothing to swap, which is why an exact assignment is not needed
@@ -301,9 +331,23 @@ def _pair_with_source(enc, src) -> np.ndarray:
 
 def check_fidelity(source: str, written: str) -> None:
     """Hold a written file against the scene it was written from. Raises on any deviation."""
-    src = fourdgs.read(source).gaussians
+    source_scene = fourdgs.read(source)
+    src = source_scene.gaussians
     scene = fourdgs.read(written)
     enc = scene.gaussians
+
+    # These are authoring inputs to the fixed preset, not values the writer is free to
+    # replace with defaults. Check them against the source even for an empty scene, where
+    # there are no gaussian lanes below to expose a shared encoder mistake.
+    header_fields = {
+        "duration_sec": (source_scene.header.duration_sec, scene.header.duration_sec),
+        "cutoff": (source_scene.header.cutoff, scene.header.cutoff),
+        "profile": (source_scene.header.profile, scene.header.profile),
+        "attributes": (dict(source_scene.header.attributes), dict(scene.header.attributes)),
+    }
+    changed_header = {name: values for name, values in header_fields.items() if values[0] != values[1]}
+    if changed_header:
+        raise AssertionError(f"the encoder changed source Header fields: {changed_header}")
     if enc.count != src.count:
         raise AssertionError(f"the encoder wrote {enc.count} gaussians for {src.count}")
     if enc.count == 0:
@@ -315,6 +359,11 @@ def check_fidelity(source: str, written: str) -> None:
     worst = {}
     worst["pos"] = np.abs(enc.positions - src.positions[pair]).max()
     worst["scale_rel"] = np.abs(np.log(enc.scales.astype(np.float64) / src.scales[pair].astype(np.float64))).max()
+    a_rot = enc.rotations.astype(np.float64)
+    b_rot = src.rotations[pair].astype(np.float64)
+    a_rot /= np.maximum(np.linalg.norm(a_rot, axis=1, keepdims=True), 1e-30)
+    b_rot /= np.maximum(np.linalg.norm(b_rot, axis=1, keepdims=True), 1e-30)
+    worst["rot"] = np.minimum(np.abs(a_rot - b_rot).max(axis=1), np.abs(a_rot + b_rot).max(axis=1)).max()
     worst["rgb"] = np.abs(enc.colors[:, :3] - src.colors[pair][:, :3]).max()
     worst["alpha"] = np.abs(enc.colors[:, 3] - src.colors[pair][:, 3]).max()
     finite = np.isfinite(src.sigma_t[pair]) & np.isfinite(enc.sigma_t)
@@ -357,27 +406,62 @@ def check_fidelity(source: str, written: str) -> None:
         raise AssertionError(
             f"a velocity is {motion_excess.max():g} past half the per-gaussian pitch this file's own grid gives it"
         )
+    bounds = scene.quantization.bounds
+    for declared in ("pos", "time"):
+        if declared not in bounds:
+            raise AssertionError(f"the file declares no {declared} bound needed for temporal fidelity")
+    # The grid calculation alone would bless an inflated `step_motion`. The actual promise
+    # is displacement over the visible half-span (capped at two seconds), and it is bounded
+    # by bounds.pos independently of whatever pitch the encoder wrote.
+    sigma = enc.sigma_t.astype(np.float64)
+    visible_half = np.where(never_fades, win_len, support_k(float(scene.header.cutoff)) * sigma)
+    visible_half = np.minimum(np.maximum(visible_half, 0.0), 2.0)
+    motion_error = np.abs(enc.motions.astype(np.float64) - src.motions[pair].astype(np.float64))
+    displacement = motion_error * visible_half[:, None]
+    if displacement.max() > float(bounds["pos"]) + SLACK:
+        raise AssertionError(
+            f"a velocity error displaces its gaussian by {displacement.max():g}, past the "
+            f"{bounds['pos']} position bound this file declares"
+        )
     mu_excess = np.abs(enc.mu_t.astype(np.float64) - src.mu_t[pair].astype(np.float64)) - (mu_step / 2.0 + SLACK)
     if mu_excess.max() > 0:
         raise AssertionError(
             f"a birth time is {mu_excess.max():g} past half the per-gaussian pitch this file's own grid gives it"
+        )
+    mu_deviation = np.abs(enc.mu_t.astype(np.float64) - src.mu_t[pair].astype(np.float64)).max()
+    if mu_deviation > float(bounds["time"]) + SLACK:
+        raise AssertionError(
+            f"a birth time deviates by {mu_deviation:g}, past the {bounds['time']} temporal bound this file declares"
         )
 
     # The validity windows are written verbatim, so they are not a tolerance at all.
     if not np.array_equal(enc.win_lo, src.win_lo[pair]) or not np.array_equal(enc.win_hi, src.win_hi[pair]):
         raise AssertionError("a validity window came back changed, and the Window Table stores them verbatim")
 
-    # Spherical harmonics are bytes on a declared pitch. `step_sh` is what the encoder did, so
-    # the deviation it allows is half of it — and the identity when the pitch is 1, where a
-    # coefficient must survive byte for byte.
-    if src.sh is not None and enc.sh is not None and scene.header.sh_degree > 0:
-        columns = min(src.sh.shape[1], enc.sh.shape[1])
-        step = max(1, int(scene.quantization.step_sh))
-        deviation = np.abs(enc.sh[:, :columns].astype(np.int64) - src.sh[pair][:, :columns].astype(np.int64)).max()
-        if deviation > step // 2:
-            raise AssertionError(
-                f"an SH coefficient moved {deviation} codes, past the {step // 2} a pitch of {step} allows"
+    # No missing band can hide behind agreement between two writers. Presence, degree and
+    # shape are exact; coefficient values are checked band by band against that band's own
+    # declaration (falling back to the legal global bound on files without per-band depths).
+    if (src.sh is None) != (enc.sh is None):
+        raise AssertionError("spherical-harmonic data changed presence")
+    if src.sh_degree != enc.sh_degree or int(scene.header.sh_degree) != src.sh_degree:
+        raise AssertionError(f"spherical-harmonic degree changed from {src.sh_degree} to {scene.header.sh_degree}")
+    if src.sh is not None:
+        if enc.sh.shape != src.sh.shape:
+            raise AssertionError(f"spherical-harmonic shape changed from {src.sh.shape} to {enc.sh.shape}")
+        coeffs = src.sh.shape[1] // 3
+        for band, (first, last) in {1: (0, 3), 2: (3, 8), 3: (8, 15)}.items():
+            if band > src.sh_degree:
+                break
+            columns = [c * coeffs + k for c in range(3) for k in range(first, min(last, coeffs))]
+            key = f"sh_band{band}"
+            if key not in bounds and "sh" not in bounds:
+                raise AssertionError(f"the file declares no bound for SH band {band}")
+            limit = float(bounds.get(key, bounds.get("sh")))
+            deviation = np.abs(enc.sh[:, columns].astype(np.int64) - src.sh[pair][:, columns].astype(np.int64)).max(
+                initial=0
             )
+            if deviation > limit + SLACK:
+                raise AssertionError(f"SH band {band} moved {deviation} codes, past the {limit:g} this file declares")
 
 
 # --------------------------------------------------------------------------
@@ -399,7 +483,9 @@ def check_index_counts(path: str) -> None:
     header = None
     entries: list[rec.ChunkIndexEntry] = []
     chunk_counts: dict[int, int] = {}
-    for record in iter_records(data, len(MAGIC)):
+    records = list(iter_records(data, len(MAGIC)))
+    records_by_offset = {record.offset: record for record in records}
+    for record in records:
         if record.opcode == HEADER:
             header = rec.Header.parse(record.content)
         elif record.opcode == CHUNK_INDEX:
@@ -411,12 +497,64 @@ def check_index_counts(path: str) -> None:
     if not entries:
         return
 
+    state_opcodes = {CHUNK} if header.temporal_model == "gaussian-birth" else {CHUNK, DELTA_CHUNK}
+    physical_chunks = Counter(record.offset for record in records if record.opcode in state_opcodes)
+    indexed_chunks = Counter(entry.chunk_offset for entry in entries)
+    if indexed_chunks != physical_chunks:
+        missing = list((physical_chunks - indexed_chunks).elements())
+        duplicated = list((indexed_chunks - physical_chunks).elements())
+        raise AssertionError(
+            "the Chunk Index is not one-to-one with physical state chunks: "
+            f"missing offsets {missing}, duplicated or unknown offsets {duplicated}"
+        )
+
+    physical_bands = Counter(record.offset for record in records if record.opcode == SH_BAND_STREAM)
+    indexed_bands = Counter(offset for entry in entries for _, offset, _ in entry.bands)
+    if indexed_bands != physical_bands:
+        missing = list((physical_bands - indexed_bands).elements())
+        duplicated = list((indexed_bands - physical_bands).elements())
+        raise AssertionError(
+            "the Chunk Index is not one-to-one with physical SH bands: "
+            f"missing offsets {missing}, duplicated or unknown offsets {duplicated}"
+        )
+
     for i, entry in enumerate(entries):
         # Two kinds are defined, 0 and 1. An entry that declares anything else describes a
         # record the format has no reading of, and it is the index — not the chunk — that
         # says so, so no decoder is obliged to notice.
         if entry.kind not in (0, 1):
             raise AssertionError(f"chunk index entry {i} declares kind {entry.kind}; the format defines 0 and 1")
+        chunk_record = records_by_offset[entry.chunk_offset]
+        actual_length = RECORD_HEADER_BYTES + len(chunk_record.content)
+        if entry.chunk_length != actual_length:
+            raise AssertionError(
+                f"chunk index entry {i} declares chunk_length {entry.chunk_length} at {entry.chunk_offset}; "
+                f"the physical record is {actual_length} bytes"
+            )
+        expected_opcode = CHUNK if entry.kind == 0 else DELTA_CHUNK
+        if chunk_record.opcode != expected_opcode:
+            raise AssertionError(
+                f"chunk index entry {i} declares kind {entry.kind} at {entry.chunk_offset}, where opcode "
+                f"0x{chunk_record.opcode:02x} appears"
+            )
+        for band, offset, length in entry.bands:
+            band_record = records_by_offset[offset]
+            actual_band_length = RECORD_HEADER_BYTES + len(band_record.content)
+            if band_record.opcode != SH_BAND_STREAM:
+                raise AssertionError(
+                    f"chunk index entry {i} band {band} points at {offset}, where opcode "
+                    f"0x{band_record.opcode:02x} appears"
+                )
+            physical_band = int(band_record.content[0]) if band_record.content else -1
+            if physical_band != band:
+                raise AssertionError(
+                    f"chunk index entry {i} names SH band {band} at {offset}; the record names band {physical_band}"
+                )
+            if length != actual_band_length:
+                raise AssertionError(
+                    f"chunk index entry {i} band {band} declares length {length} at {offset}; "
+                    f"the physical record is {actual_band_length} bytes"
+                )
 
     if header.temporal_model == "keyframe-delta":
         _check_keyframe_delta_index(data, header, entries)
@@ -542,7 +680,7 @@ def compare(
     tmp: str,
     ladder: str | None,
     second_encoder: bool,
-    known: dict[str, str],
+    allow_known_reference_divergences: bool,
 ) -> list[str]:
     """Prove one variant. Returns the known divergences it tolerated; raises on the rest."""
     ref_out = os.path.join(tmp, "reference.4dgs")
@@ -551,7 +689,8 @@ def compare(
     try:
         encode(candidate, source, cand_out, ladder)
     except RuntimeError as exc:
-        note = known_refusal(str(exc)) if known else None
+        variant = os.path.basename(source).removesuffix(".4dgs")
+        note = known_refusal(variant, ladder, str(exc)) if allow_known_reference_divergences else None
         if note is None:
             raise
         return [f"the candidate refused a file the reference wrote — {note}"]
@@ -568,12 +707,18 @@ def compare(
             ref.pop(key, None)
             cand.pop(key, None)
     differing = [key for key in sorted(set(ref) | set(cand)) if ref.get(key) != cand.get(key)]
-    unaccounted = {key: (ref.get(key), cand.get(key)) for key in differing if key not in known}
+    variant = os.path.basename(source).removesuffix(".4dgs")
+    notes = {
+        key: known_reference_divergence(variant, ladder, key, cand.get(key), ref.get(key))
+        for key in differing
+        if allow_known_reference_divergences
+    }
+    unaccounted = {key: (ref.get(key), cand.get(key)) for key in differing if not notes.get(key)}
     if unaccounted:
         raise AssertionError(_diff(unaccounted))
     if ladder is not None:
         _check_declared_depths(cand_out)
-    return [f"{key}: {known[key]}" for key in differing]
+    return [f"{key}: {notes[key]}" for key in differing if notes.get(key)]
 
 
 def _check_declared_depths(path: str) -> None:
@@ -606,24 +751,54 @@ def _diff(unaccounted: dict[str, tuple], left: str = "reference", right: str = "
 # --------------------------------------------------------------------------
 
 #: Divergences between the Python and Rust reference encoders that are known and not yet
-#: decided. Keyed by the field the comparison names, so an entry covers every variant it
-#: shows up on and disappears the day the question is answered — the list shrinks as #182
-#: and #187 are resolved, and `--references` goes red on anything not in it.
+#: decided. Each exemption names the exact variant, pass, field, and fingerprints of both
+#: values. A second bug in a field that already has an issue therefore stays red.
 #:
 #: This is not a list of things that are fine. It is a list of things that have an issue
 #: number, which is the difference between a known divergence and an unnoticed one.
 KNOWN_REFERENCE_DIVERGENCES = {
-    "chunkIntervals": "#182(1): Python's _encode drops opts.cutoff and supports at 0.05; Rust passes it through",
-    "statistics.chunkCount": "#182(1): the same dropped cutoff, counted — a different tree has a different size",
-    "index.chunkCount": "#182(1): the same dropped cutoff, as the index itself counts it",
-    "quantization.bounds": "#182(2): one number, two spellings — Python's repr() against Rust's formatter",
+    (
+        "MixedLifetimes-CustomCutoff-UseChunkIndex-UseCrc",
+        None,
+        "chunkIntervals",
+    ): (
+        "30834166acd73413c9ec7ddacc6659f5064664426dff349fee7ae706ce3e320b",
+        "ad2cf5ba91d371a5fb735bb5807685763cda67efd890f916d98fb36fd4721c58",
+        "#182(1): Python's _encode drops opts.cutoff and supports at 0.05; Rust passes it through",
+    ),
+    (
+        "MixedLifetimes-CustomCutoff-UseChunkIndex-UseCrc",
+        None,
+        "statistics.chunkCount",
+    ): (
+        "9df59c3d4c39c130062ef9655dac0f0c4179a19c69f40b8db0c0d0ff2c0cc11b",
+        "a04908f573e7a1c9b9f62563bb9a5188334fd250d76875e845de3f24c895eb4b",
+        "#182(1): the same dropped cutoff, counted — Python writes 24 chunks and Rust writes 27",
+    ),
+    (
+        "MixedLifetimes-CustomCutoff-UseChunkIndex-UseCrc",
+        None,
+        "index.chunkCount",
+    ): (
+        "c2356069e9d1e79ca924378153cfbbfb4d4416b1f99d41a2940bfdb66c5319db",
+        "670671cd97404156226e507973f2ab8330d3022ca96e0c93bdbdb320c41adcaf",
+        "#182(1): the same dropped cutoff, as the index counts 24 chunks against 27",
+    ),
+    **{
+        (variant, None, "quantization.bounds"): (
+            "0b070f1689d4859b268a8439ccc9440caa2b4e327cb822c29151541539994ba1",
+            "d2bf7f31abb65bae4fe22d5db06dbe3d88735cd595687b0e2c03db358ba00bc3",
+            "#182(2): Python spells pos as 5e-05 and Rust as 5e-5",
+        )
+        for variant in ("NoData-Quantized-UseChunkIndex-UseCrc", "NoData-UseChunkIndex-UseCrc")
+    },
 }
 
 #: Refusals that are the divergence: one reference declines to write what the other writes.
 #: Matched on the message rather than on the fact of failing, so that a genuine crash in an
 #: encoder is still a failure and not an exemption.
 KNOWN_ENCODE_REFUSALS = {
-    "the objects profile requires one ObjectTable record": (
+    ("LongLived-UseChunkIndex-UseCrc-WithObjects", None, "the objects profile requires one ObjectTable record"): (
         "#182(3): the objects profile without an Object Table — Python refuses, Rust writes"
     ),
 }
@@ -633,9 +808,22 @@ KNOWN_ENCODE_REFUSALS = {
 REFERENCE_IDENTITY_KEYS = LAYOUT_DEPENDENT_KEYS
 
 
-def known_refusal(message: str) -> str | None:
-    for pattern, note in KNOWN_ENCODE_REFUSALS.items():
-        if pattern in message:
+def _fingerprint(value) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def known_reference_divergence(variant: str, ladder: str | None, field: str, python, rust) -> str | None:
+    expected = KNOWN_REFERENCE_DIVERGENCES.get((variant, ladder, field))
+    if expected is None:
+        return None
+    python_hash, rust_hash, note = expected
+    return note if (_fingerprint(python), _fingerprint(rust)) == (python_hash, rust_hash) else None
+
+
+def known_refusal(variant: str, ladder: str | None, message: str) -> str | None:
+    for (expected_variant, expected_ladder, pattern), note in KNOWN_ENCODE_REFUSALS.items():
+        if variant == expected_variant and ladder == expected_ladder and pattern in message:
             return note
     return None
 
@@ -675,7 +863,7 @@ def _declared_shape(path: str) -> dict:
     }
 
 
-def reference_divergences(source: str, tmp: str, ladder: str | None) -> list[tuple[str, str, str]]:
+def reference_divergences(source: str, tmp: str, ladder: str | None) -> list[tuple[str, object, object]]:
     """(field, python, rust) for every place the two references disagree on one variant."""
     py_out = os.path.join(tmp, "python.4dgs")
     rs_out = os.path.join(tmp, "rust.4dgs")
@@ -698,13 +886,13 @@ def reference_divergences(source: str, tmp: str, ladder: str | None) -> list[tup
         rs_json.pop(key, None)
     for key in sorted(set(py_json) | set(rs_json)):
         if py_json.get(key) != rs_json.get(key):
-            found.append((key, json.dumps(py_json.get(key))[:200], json.dumps(rs_json.get(key))[:200]))
+            found.append((key, py_json.get(key), rs_json.get(key)))
 
     py_shape = _declared_shape(py_out)
     rs_shape = _declared_shape(rs_out)
     for key in sorted(py_shape):
         if py_shape[key] != rs_shape[key]:
-            found.append((key, json.dumps(py_shape[key])[:200], json.dumps(rs_shape[key])[:200]))
+            found.append((key, py_shape[key], rs_shape[key]))
     return found
 
 
@@ -721,13 +909,23 @@ def run_references() -> int:
             for ladder in passes:
                 label = variant if ladder is None else f"{variant} @ {ladder}"
                 for field, py, rs in reference_divergences(source, tmp, ladder):
-                    note = known_refusal(py + rs) if field == "encode" else KNOWN_REFERENCE_DIVERGENCES.get(field)
+                    note = (
+                        known_refusal(variant, ladder, str(py) + str(rs))
+                        if field == "encode"
+                        else known_reference_divergence(variant, ladder, field, py, rs)
+                    )
                     if note:
                         known += 1
-                        print(f"KNOWN {label}\n  {field}: {note}\n    python: {py}\n    rust:   {rs}")
+                        print(
+                            f"KNOWN {label}\n  {field}: {note}\n"
+                            f"    python: {json.dumps(py)[:300]}\n    rust:   {json.dumps(rs)[:300]}"
+                        )
                     else:
                         unknown += 1
-                        print(f"DIVERGES {label}\n  {field}\n    python: {py}\n    rust:   {rs}")
+                        print(
+                            f"DIVERGES {label}\n  {field}\n"
+                            f"    python: {json.dumps(py)[:300]}\n    rust:   {json.dumps(rs)[:300]}"
+                        )
     print(f"\n{len(names)} variants; {known} known divergences (#182), {unknown} not accounted for")
     return 1 if unknown else 0
 
@@ -832,10 +1030,28 @@ def _test_fidelity_catches_a_changed_scene(tmp: str) -> list[str]:
     """
     source = _self_test_source()
     said = []
+
+    def change_alpha(g):
+        g.colors = g.colors.copy()
+        g.colors[:, 3] = np.float32(0.25)
+
+    def change_rotation(g):
+        g.rotations = np.tile(np.asarray([0.5, 0.5, 0.5, 0.5], dtype=np.float32), (g.count, 1))
+
+    def change_sigma(g):
+        g.sigma_t = g.sigma_t.copy()
+        finite = np.isfinite(g.sigma_t)
+        g.sigma_t[finite] *= np.float32(2.0)
+
     for lane, mutate, expected in (
         ("pos", lambda g: setattr(g, "positions", g.positions + np.float32(1.0)), "pos deviates by"),
+        ("scale", lambda g: setattr(g, "scales", g.scales * np.float32(2.0)), "scale_rel deviates by"),
+        ("rot", change_rotation, "rot deviates by"),
         ("rgb", lambda g: setattr(g, "colors", np.full_like(g.colors, 0.5)), "rgb deviates by"),
+        ("alpha", change_alpha, "alpha deviates by"),
         ("motion", lambda g: setattr(g, "motions", g.motions * np.float32(2.0)), "past half the per-gaussian pitch"),
+        ("mu_t", lambda g: setattr(g, "mu_t", g.mu_t + np.float32(0.25)), "birth time"),
+        ("sigma_t", change_sigma, "sigma_rel deviates by"),
         ("win", lambda g: setattr(g, "win_lo", g.win_lo + np.float32(1e-3)), "validity window"),
     ):
         scene = fourdgs.read(source)
@@ -843,6 +1059,22 @@ def _test_fidelity_catches_a_changed_scene(tmp: str) -> list[str]:
         out = os.path.join(tmp, f"changed-{lane}.4dgs")
         _write(scene, out)
         said.append(_expect_failure(f"fidelity/{lane}", lambda out=out: check_fidelity(source, out), expected))
+
+    sh_source = os.path.join(DATA, "MixedLifetimes-SHDegree3-UseChunkIndex-UseCrc.4dgs")
+    if not os.path.exists(sh_source):
+        raise AssertionError(f"{sh_source} is missing; run tests/conformance/generate.py first")
+    sh_scene = fourdgs.read(sh_source)
+    sh_scene.gaussians.sh = sh_scene.gaussians.sh.copy()
+    sh_scene.gaussians.sh[0, 0] ^= np.uint8(0x80)
+    sh_out = os.path.join(tmp, "changed-sh.4dgs")
+    _write(sh_scene, sh_out)
+    said.append(_expect_failure("fidelity/sh", lambda: check_fidelity(sh_source, sh_out), "SH band"))
+
+    header_scene = fourdgs.read(source)
+    header_scene.header.cutoff = header_scene.header.cutoff / 2.0
+    header_out = os.path.join(tmp, "changed-header.4dgs")
+    _write(header_scene, header_out)
+    said.append(_expect_failure("fidelity/header", lambda: check_fidelity(source, header_out), "Header fields"))
     return said
 
 
@@ -872,17 +1104,74 @@ def _test_agreement_still_catches_divergence(tmp: str) -> list[str]:
     message = _diff(differing)
     if "chunkIntervals" not in message:
         raise AssertionError(f"the diff should name chunkIntervals; it said:\n{message}")
-    # And the allow-list is what decides: the same divergence, tolerated, is not a failure.
-    if [key for key in differing if key not in KNOWN_REFERENCE_DIVERGENCES]:
-        raise AssertionError(
-            "a different chunk tree should be entirely accounted for by #182's entries; it is not: "
-            f"{sorted(key for key in differing if key not in KNOWN_REFERENCE_DIVERGENCES)}"
-        )
+    # A field name alone must not turn this deliberately different tree into a known #182
+    # result. Its variant and exact values differ from the one documented exemption.
+    variant = os.path.basename(source).removesuffix(".4dgs")
+    accidentally_known = [
+        key for key, (left, right) in differing.items() if known_reference_divergence(variant, None, key, left, right)
+    ]
+    if accidentally_known:
+        raise AssertionError(f"the #182 allow-list swallowed unrelated differences in {accidentally_known}")
     return [f"agreement still bites: {len(a['chunkIntervals'])} intervals against {len(b['chunkIntervals'])}"]
 
 
 #: An opcode and a u64 length precede every record's content.
 RECORD_HEADER_BYTES = 9
+
+
+def _rewrite_quantization(path: str, out: str, mutate) -> None:
+    """Copy a file while changing fixed-width Quantization fields, not its bounds map."""
+    with open(path, "rb") as fh:
+        data = bytearray(fh.read())
+    for record in iter_records(bytes(data), len(MAGIC)):
+        if record.opcode != QUANTIZATION:
+            continue
+        quantization = rec.Quantization.parse(record.content)
+        mutate(quantization)
+        replacement = quantization.encode()
+        span = slice(record.offset, record.offset + RECORD_HEADER_BYTES + len(record.content))
+        if len(replacement) != span.stop - span.start:
+            raise AssertionError("rewriting Quantization changed its length; the file's offsets would move")
+        data[span] = replacement
+        break
+    else:
+        raise AssertionError(f"{path} carries no Quantization record to rewrite")
+    with open(out, "wb") as fh:
+        fh.write(bytes(data))
+
+
+def _test_declared_temporal_bounds_bite(tmp: str) -> list[str]:
+    """Inflated grid pitches do not inflate the independent bounds declaration."""
+    scene = fourdgs.read(_self_test_source())
+    scene.gaussians.sigma_t = np.full_like(scene.gaussians.sigma_t, np.inf)
+    scene.gaussians.win_lo = np.zeros_like(scene.gaussians.win_lo)
+    scene.gaussians.win_hi = np.full_like(scene.gaussians.win_hi, scene.header.duration_sec)
+    scene.gaussians.motions = np.zeros_like(scene.gaussians.motions)
+    scene.gaussians.mu_t = np.zeros_like(scene.gaussians.mu_t)
+    seed = os.path.join(tmp, "temporal-seed.4dgs")
+    _write(scene, seed, write_crc=False)
+    seeded = fourdgs.read(seed)
+    # always-visible over an eight-second window is life class 2, so its own motion
+    # pitch is one quarter of the record's base pitch. Put every value on bin one;
+    # doubling the base pitch then moves it by exactly half the new pitch (legal by
+    # the grid alone) but by twice bounds.pos over the two-second displacement cap.
+    seeded.gaussians.motions[:, 0] = np.float32(seeded.quantization.step_motion / 4.0)
+    seeded.gaussians.mu_t[:] = np.float32(seeded.quantization.step_time)
+    source = os.path.join(tmp, "temporal-source.4dgs")
+    _write(seeded, source, write_crc=False)
+
+    scene = fourdgs.read(source)
+    written = os.path.join(tmp, "temporal-bounds.4dgs")
+    _write(scene, written, write_crc=False)
+
+    motion = os.path.join(tmp, "inflated-motion-grid.4dgs")
+    _rewrite_quantization(written, motion, lambda q: setattr(q, "step_motion", q.step_motion * 2.0))
+    time = os.path.join(tmp, "inflated-time-grid.4dgs")
+    _rewrite_quantization(written, time, lambda q: setattr(q, "step_time", q.step_time * 2.0))
+    return [
+        _expect_failure("bounds/motion", lambda: check_fidelity(source, motion), "displaces its gaussian"),
+        _expect_failure("bounds/time", lambda: check_fidelity(source, time), "temporal bound"),
+    ]
 
 
 def _rewrite_index_entry(path: str, out: str, mutate, select=lambda entry: True) -> None:
@@ -932,6 +1221,50 @@ def _test_index_counts_bite(tmp: str) -> list[str]:
     _rewrite_index_entry(written, lying, lambda e: setattr(e, "gaussian_count", e.gaussian_count + 1))
     said.append(_expect_failure("index/gaussian-birth", lambda: check_index_counts(lying), "which holds"))
 
+    bad_length = os.path.join(tmp, "index-chunk-length.4dgs")
+    _rewrite_index_entry(written, bad_length, lambda e: setattr(e, "chunk_length", e.chunk_length + 1))
+    said.append(_expect_failure("index/chunk-length", lambda: check_index_counts(bad_length), "chunk_length"))
+
+    with open(written, "rb") as fh:
+        indexed_data = fh.read()
+    entries = [
+        rec.ChunkIndexEntry.parse(record.content)
+        for record in iter_records(indexed_data, len(MAGIC))
+        if record.opcode == CHUNK_INDEX
+    ]
+    same_count = next(
+        ((a, b) for i, a in enumerate(entries) for b in entries[i + 1 :] if a.gaussian_count == b.gaussian_count),
+        None,
+    )
+    if same_count is None:
+        raise AssertionError("the index fixture has no two equally sized chunks for the one-to-one mutation")
+    omitted, duplicated = same_count
+    duplicate = os.path.join(tmp, "index-duplicate.4dgs")
+
+    def duplicate_offset(entry):
+        entry.chunk_offset = duplicated.chunk_offset
+        entry.chunk_length = duplicated.chunk_length
+
+    _rewrite_index_entry(
+        written,
+        duplicate,
+        duplicate_offset,
+        select=lambda entry: entry.chunk_offset == omitted.chunk_offset,
+    )
+    said.append(_expect_failure("index/one-to-one", lambda: check_index_counts(duplicate), "not one-to-one"))
+
+    sh_source = fourdgs.read(os.path.join(DATA, "MixedLifetimes-SHDegree2-UseChunkIndex-UseCrc.4dgs"))
+    sh_written = os.path.join(tmp, "indexed-sh.4dgs")
+    _write(sh_source, sh_written, write_crc=False)
+    bad_band_length = os.path.join(tmp, "index-band-length.4dgs")
+
+    def lengthen_band(entry):
+        band, offset, length = entry.bands[0]
+        entry.bands[0] = (band, offset, length + 1)
+
+    _rewrite_index_entry(sh_written, bad_band_length, lengthen_band, select=lambda entry: bool(entry.bands))
+    said.append(_expect_failure("index/band-length", lambda: check_index_counts(bad_band_length), "physical record"))
+
     keyframe = os.path.join(DATA, "keyframe", "KeyframeDelta-UseChunkIndex-UseCrc-UseStatistics.4dgs")
     if not os.path.exists(keyframe):
         raise AssertionError(f"{keyframe} is missing; run tests/conformance/generate.py first")
@@ -958,6 +1291,7 @@ def run_self_test() -> int:
     tests = (
         _test_tolerance_is_read_from_the_file,
         _test_fidelity_catches_a_changed_scene,
+        _test_declared_temporal_bounds_bite,
         _test_agreement_still_catches_divergence,
         _test_index_counts_bite,
     )
@@ -1005,7 +1339,7 @@ def run_encoder(encoder: str) -> int:
     # questions rather than defects in an encoder. They are named on every run, and counted,
     # so tolerating them stays visible — but they do not turn the gate red while the
     # question is undecided. The list shrinks to nothing as #182 is answered.
-    known = KNOWN_REFERENCE_DIVERGENCES if encoder == "python" else {}
+    allow_known = encoder == "python"
 
     agreed = graded = failed = tolerated = 0
     with tempfile.TemporaryDirectory() as tmp:
@@ -1014,7 +1348,7 @@ def run_encoder(encoder: str) -> int:
             for ladder in [None] + ([SH_LADDER] if "SHDegree" in variant else []):
                 label = variant if ladder is None else f"{variant} @ {ladder}"
                 try:
-                    notes = compare(REFERENCE, command, source, tmp, ladder, second_encoder, known)
+                    notes = compare(REFERENCE, command, source, tmp, ladder, second_encoder, allow_known)
                 except (AssertionError, RuntimeError) as exc:
                     failed += 1
                     print(f"FAIL {encoder} {label}\n  {exc}")
