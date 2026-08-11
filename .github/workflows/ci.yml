@@ -72,10 +72,12 @@ jobs:
         # the two record parsers, the membership attribute, the canonical states and their
         # unit tests. 640 was the exact measured size, which is a budget with no headroom
         # left — the next file would have tripped it whatever it contained.
+        # Raised from 704 to 768 KiB for full keyframe-delta reconstruction: SH composition,
+        # streamed-prefix recovery, indexed-chain checks and the hostile-input tests that pin them.
         run: |
           size_kb=$(du -s typescript | cut -f1)
           echo "typescript: ${size_kb} KiB"
-          [ "$size_kb" -le 704 ] || { echo "::error::typescript is ${size_kb} KiB, over the 704 KiB budget"; exit 1; }
+          [ "$size_kb" -le 768 ] || { echo "::error::typescript is ${size_kb} KiB, over the 768 KiB budget"; exit 1; }
       - name: Dart sources under 768 KB
         # Sources only, same as TypeScript's and Swift's: this job builds nothing, so
         # .dart_tool and the compiled runners are not here to measure, and a vendored

@@ -34,6 +34,7 @@ export {
 
 export {
   Attribute,
+  ATTRIBUTE_CHANNELS,
   FROZEN_OPCODES,
   GAUSSIAN_FLAG_NEVER_FADES,
   HEADER_FLAG_CHUNKS_COMPRESSED,
@@ -238,14 +239,21 @@ export {
 export {
   KEYFRAME_DELTA_BIN_MAX,
   KEYFRAME_DELTA_BIN_MIN,
+  MAX_KEYFRAME_DELTA_INDEX_ENTRIES,
+  MAX_KEYFRAME_DELTA_SUMMARY_BYTES,
+  KeyframeDeltaIndexedDecoder,
   KeyframeDeltaState,
   type Interval,
   type KeyframeDeltaChunkInfo,
+  type KeyframeDeltaGaussians,
   type KeyframeDeltaIndexedResult,
   type KeyframeDeltaSequence,
+  type OpenKeyframeDeltaIndexedOptions,
   chainFor,
   checkTiling,
   decodeKeyframeDeltaIndexed,
   decodeKeyframeDeltaStreamed,
+  keyframeDeltaChunkAt,
   keyframeDeltaStatesJson,
+  reconstructKeyframeDelta,
 } from "./keyframeDelta.js";

@@ -10,6 +10,18 @@ The four packages version together.
 
 ### Added
 
+- `reconstructKeyframeDelta` in `@4dgs/core`: the full population at an instant of a
+  `keyframe-delta` sequence — gaussian ids, centres, scales, rotations, linear RGB, marginal-folded
+  opacity, spherical harmonics, and object membership where a chunk carries it — in ascending
+  `gaussian_id` order (spec §11.7). `keyframeDeltaChunkAt` answers the seek that precedes it: the
+  chunk whose half-open `[t0, t1)` contains `t`. Until now the package published only
+  `keyframeDeltaStatesJson`, which samples positions and scales for the cross-SDK statement, so
+  consumers had to reimplement §11.7 to get every attribute of every gaussian.
+- `dequantizeRotation` accepts a `Float64Array` output as well as a `Float32Array`.
+- `ATTRIBUTE_CHANNELS`, the interleaving width the registry gives each attribute id it defines.
+- `KeyframeDeltaIndexedDecoder`, a range-backed `IReadable` seek for `keyframe-delta` files. Opening
+  reads bounded front-matter and summary windows; `reconstructAt(t)` fetches and composes only the
+  index chain and spherical-harmonic ranges needed for that instant.
 - **Refusals say which rule was broken.** Every error in `@4dgs/core` now carries an optional
   `refusalCode`, and the six identifiers the specification's refusal table names — `magic-mismatch`,
   `unsupported-major-version`, `unknown-temporal-model`, `unknown-quantization-scheme`,
@@ -22,8 +34,44 @@ The four packages version together.
   error". This is additive: `refusalCode` is a property on the existing `FourdgsError` rather than a
   new subclass, so every `instanceof` check keeps working.
 
+### Changed
+
+- `keyframeDeltaStatesJson` is now computed from `reconstructKeyframeDelta` rather than from a
+  second private reconstruction, so the statement the SDKs are diffed on is exactly the rows a
+  consumer gets. Its `states[].liveCount` is the count of gaussians the reconstruction returns
+  rather than the chunk's composed population, which matches the Python reference.
+- A gaussian outside its own validity window is absent from a reconstructed instant rather than
+  present at full opacity: outside the window a gaussian does not exist at that time (spec §3),
+  which is how the `gaussian-birth` path has always decided it. Unobservable on files that carry one
+  full-duration window, which is every keyframe-delta file in the corpus today.
+- `ObjectLayer.apply` accepts either `Float32Array` or `Float64Array` centres and orientations, so
+  object tracks compose directly onto `keyframe-delta` reconstruction without a narrowing copy.
+
 ### Fixed
 
+- **An attribute stream whose `channels` is not the width the registry gives it is refused**, on
+  both the `gaussian-birth` chunk path and the `keyframe-delta` composition path. Every reader of
+  these bins indexes with a fixed stride, so a `rotation` column declaring one channel and the right
+  element count read the next row's bin as this row's second component — and `undefined` past the
+  end, which arithmetic turns into a `NaN` quaternion rather than into a refusal. The rule was
+  enforced for `object_id` alone, where a wrong width would have shifted every gaussian's
+  membership; `ATTRIBUTE_CHANNELS` now states it once for every attribute the registry names.
+- **SH Band Stream dimensions are checked before payload decode.** A constant stream can expand a
+  handful of symbols into its declared row count, so band, width, and chunk row count are now
+  compared before an untrusted declaration can allocate hundreds of megabytes.
+- **A birth that introduces `object_id` no longer misaligns the column it introduces.** Membership
+  is optional per chunk and its omission means `0` (§6.6), so a background keyframe without the
+  stream followed by a delta birth that has one is a legal file. Composed without a default for the
+  rows already in the state, the merged column was `birth_count` rows long against the whole
+  population: the birth's membership landed on a gaussian that was already there, and the birth
+  itself read past the end as `0`. The rows that came before an introduced column now carry the
+  omission default.
+- **A seek past the end of a truncated prefix is refused rather than answered with the last state
+  before the cut.** `keyframeDeltaChunkAt` resolves a `t` at or past the end of a _complete_
+  timeline to the last chunk, which is the boundary convenience a player wants; on a streamed prefix
+  of a truncated file (§11.10) the last decodable instant is the last complete chunk's `t1`, and
+  reporting the state before the cut as the state after it is a decoder inventing content. The
+  indexed path already refused it.
 - **A file whose magic is corrupted anywhere but the version byte is no longer reported as an
   unsupported version.** `checkMagic` tested only that bytes 1-4 read `4DGS`, so flipping the
   leading `0x89` sentinel — the byte that stops byte-oriented tooling treating a 4dgs file as text —
@@ -31,6 +79,13 @@ The four packages version together.
   looking for a newer reader, which would not have helped. The version byte must now be the only
   difference. Python's reader carries a comment about making exactly this mistake; nothing inside
   TypeScript could see it, because both answers are an `UnsupportedVersion` with a sentence.
+
+### Removed
+
+- `KeyframeDeltaState.column()` and `KeyframeDeltaState.attributes()`, which were exported and
+  marked `@internal`. Composed bins are not public API; `reconstructKeyframeDelta` is the supported
+  way to values, and the bins are now a JavaScript private field so the boundary is enforced rather
+  than documented.
 
 ## [0.4.0] - 2026-08-10
 

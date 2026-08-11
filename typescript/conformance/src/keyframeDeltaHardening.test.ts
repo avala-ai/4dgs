@@ -20,10 +20,14 @@ import {
   MalformedFile,
   UnsupportedCodec,
   checkTiling,
+  decodeChunkStreams,
   decodeKeyframeDeltaIndexed,
   decodeKeyframeDeltaStreamed,
   decompressChunkBlock,
+  iterateRecords,
+  keyframeDeltaChunkAt,
   keyframeDeltaStatesJson,
+  reconstructKeyframeDelta,
   DEFAULT_CODECS,
   lifeClass,
   motionStep,
@@ -53,6 +57,11 @@ function u32(v: number): Uint8Array {
   new DataView(b.buffer).setUint32(0, v, true);
   return b;
 }
+function u16(v: number): Uint8Array {
+  const b = new Uint8Array(2);
+  new DataView(b.buffer).setUint16(0, v, true);
+  return b;
+}
 function u64(v: number): Uint8Array {
   const b = new Uint8Array(8);
   new DataView(b.buffer).setBigUint64(0, BigInt(v), true);
@@ -76,12 +85,12 @@ const STEPS = {
   sigmaLog: 0.01,
 };
 
-function headerBody(durationSec: number): Uint8Array {
+function headerBody(durationSec: number, shDegree = 0, gaussianCount = 1): Uint8Array {
   return concat([
     str(""), // profile
     str(""), // library
     f64(durationSec),
-    u64(1), // gaussian_count
+    u64(gaussianCount),
     f64(0.05), // cutoff
     str("keyframe-delta"),
     f64(0),
@@ -90,10 +99,20 @@ function headerBody(durationSec: number): Uint8Array {
     f64(0),
     f64(0),
     f64(0), // aabb
-    new Uint8Array([0]), // sh_degree
+    new Uint8Array([shDegree]), // sh_degree
     new Uint8Array([0]), // flags
     EMPTY_MAP,
   ]);
+}
+
+async function shBandRecord(band: number, values: number[], channels: number): Promise<Uint8Array> {
+  const stream = await encodeTestStream({
+    attributeId: 0x07,
+    values,
+    channels,
+    symbolWidth: 2,
+  });
+  return record(0x07, concat([new Uint8Array([band]), stream]));
 }
 
 function quantizationBody(): Uint8Array {
@@ -122,25 +141,221 @@ function windowTableBody(windows: readonly (readonly [number, number])[]): Uint8
 }
 
 /** One never-fading gaussian at `windowIndex`, drifting on x by `motionBinX` bins. */
-async function oneGaussianStreams(windowIndex: number, motionBinX: number): Promise<Uint8Array> {
+async function oneGaussianStreams(
+  windowIndex: number,
+  motionBinX: number,
+  objectId?: number,
+  options: {
+    id?: number;
+    idChannels?: number;
+    rotationChannels?: number;
+    muTBin?: number;
+    sigmaTBin?: number;
+    flags?: number;
+  } = {},
+): Promise<Uint8Array> {
   const s = (attributeId: number, values: number[], channels: number) =>
     encodeTestStream({ attributeId, values, channels });
+  const membership = objectId === undefined ? [] : [s(Attribute.ObjectId, [objectId], 1)];
+  // One row either way: three channels is what the registry defines, and a one-channel
+  // rotation is the malformed shape whose element count still matches the chunk's.
+  const rotationChannels = options.rotationChannels ?? 3;
+  const rotation = rotationChannels === 3 ? [0, 0, 0] : [0];
   return concat(
     await Promise.all([
-      s(Attribute.GaussianId, [0], 1),
+      ...membership,
+      s(
+        Attribute.GaussianId,
+        options.idChannels === 2 ? [options.id ?? 0, 123] : [options.id ?? 0],
+        options.idChannels ?? 1,
+      ),
       s(Attribute.Position, [0, 0, 0], 3),
       s(Attribute.Scale, [0, 0, 0], 3),
       s(Attribute.RotationIndex, [3], 1),
-      s(Attribute.Rotation, [0, 0, 0], 3),
+      s(Attribute.Rotation, rotation, rotationChannels),
       s(Attribute.Color, [0, 0, 0], 3),
       s(Attribute.Opacity, [0], 1),
       s(Attribute.Motion, [motionBinX, 0, 0], 3),
-      s(Attribute.MuT, [0], 1),
-      s(Attribute.SigmaT, [0], 1),
-      s(Attribute.Flags, [1], 1), // never fades
+      s(Attribute.MuT, [options.muTBin ?? 0], 1),
+      s(Attribute.SigmaT, [options.sigmaTBin ?? 0], 1),
+      s(Attribute.Flags, [options.flags ?? 1], 1), // never fades by default
       s(Attribute.WindowIndex, [windowIndex], 1),
     ]),
   );
+}
+
+/** The same streams a `gaussian-birth` chunk carries: everything but the identity. */
+async function threeChannelStreams(options: { rotationChannels: number }): Promise<Uint8Array> {
+  return oneGaussianStreams(0, 0, undefined, options);
+}
+
+/**
+ * A Delta Chunk record (spec §5.18) over `[t0, t1)` referencing `referenceOffset`, with
+ * one birth and nothing else.
+ *
+ * Written by hand rather than by an encoder, because the file this pins — a keyframe with
+ * no `object_id` and a birth that has one — is legal, unrepresentable in the corpus today,
+ * and exactly the shape the composition bug lived in.
+ */
+function deltaChunkRecord(options: {
+  t0: number;
+  t1: number;
+  referenceOffset: number;
+  births: Uint8Array;
+  deltaMode?: number;
+  keyframeOffset?: number;
+  depth?: number;
+}): Uint8Array {
+  const blob = concat([u64(0), u64(options.births.length), options.births, u64(0)]);
+  const body = concat([
+    f64(options.t0),
+    f64(options.t1),
+    u32(0), // level
+    new Uint8Array([options.deltaMode ?? 0]),
+    u64(options.referenceOffset),
+    u64(options.keyframeOffset ?? options.referenceOffset),
+    u16(options.depth ?? 1),
+    u32(0), // update_count
+    u32(1), // birth_count
+    u32(0), // death_count
+    str(""), // compression
+    u64(blob.length),
+    u64(blob.length),
+    blob,
+  ]);
+  return record(0x10, body);
+}
+
+function updateDeltaChunkRecord(options: {
+  t0: number;
+  t1: number;
+  referenceOffset: number;
+  updates: Uint8Array;
+}): Uint8Array {
+  const blob = concat([u64(options.updates.length), options.updates, u64(0), u64(0)]);
+  return record(
+    0x10,
+    concat([
+      f64(options.t0),
+      f64(options.t1),
+      u32(0),
+      new Uint8Array([0]),
+      u64(options.referenceOffset),
+      u64(options.referenceOffset),
+      new Uint8Array([1, 0]),
+      u32(1),
+      u32(0),
+      u32(0),
+      str(""),
+      u64(blob.length),
+      u64(blob.length),
+      blob,
+    ]),
+  );
+}
+
+/**
+ * A keyframe with one gaussian and no `object_id`, then a delta that births one with it.
+ *
+ * §6.6 makes membership optional per chunk and defines the omission as `0`, so this file
+ * conforms; what it asks of a decoder is that the column the birth introduces be as long
+ * as the population it lands in.
+ */
+async function keyframeThenBirthFile(options: {
+  born: number;
+  objectId?: number;
+  keyframeObjectId?: number;
+  birthIdChannels?: number;
+}): Promise<Uint8Array> {
+  const keyframeStreams = await oneGaussianStreams(0, 0, options.keyframeObjectId);
+  const keyframe = chunkRecord(0, 0.5, keyframeStreams, "", keyframeStreams.length);
+  const front = concat([
+    MAGIC,
+    record(0x01, headerBody(1)),
+    record(0x03, quantizationBody()),
+    record(0x04, windowTableBody([[0, 1]])),
+  ]);
+  const births = await oneGaussianStreams(0, 0, options.objectId, {
+    id: options.born,
+    ...(options.birthIdChannels === undefined ? {} : { idChannels: options.birthIdChannels }),
+  });
+  return concat([
+    front,
+    keyframe,
+    deltaChunkRecord({ t0: 0.5, t1: 1, referenceOffset: front.length, births }),
+  ]);
+}
+
+async function keyframeThenBirthShFile(): Promise<Uint8Array> {
+  const keyframeStreams = await oneGaussianStreams(0, 0);
+  const keyframe = chunkRecord(0, 0.5, keyframeStreams, "", keyframeStreams.length);
+  const front = concat([
+    MAGIC,
+    record(0x01, headerBody(1, 1)),
+    record(0x03, quantizationBody()),
+    record(0x04, windowTableBody([[0, 1]])),
+  ]);
+  const births = await oneGaussianStreams(0, 0, undefined, { id: 7 });
+  const keyframeBand = await shBandRecord(
+    1,
+    Array.from({ length: 9 }, (_, i) => i + 1),
+    9,
+  );
+  const birthBand = await shBandRecord(
+    1,
+    Array.from({ length: 9 }, (_, i) => 101 + i),
+    9,
+  );
+  return concat([
+    front,
+    keyframe,
+    keyframeBand,
+    deltaChunkRecord({ t0: 0.5, t1: 1, referenceOffset: front.length, births }),
+    birthBand,
+  ]);
+}
+
+async function keyframeThenManyBirthsShFile(birthCount: number): Promise<Uint8Array> {
+  const intervals = birthCount + 1;
+  const keyframeStreams = await oneGaussianStreams(0, 0);
+  const front = concat([
+    MAGIC,
+    record(0x01, headerBody(1, 1, birthCount + 1)),
+    record(0x03, quantizationBody()),
+    record(0x04, windowTableBody([[0, 1]])),
+  ]);
+  const keyframeOffset = front.length;
+  const keyframe = chunkRecord(0, 1 / intervals, keyframeStreams, "", keyframeStreams.length);
+  const firstBand = await shBandRecord(
+    1,
+    Array.from({ length: 9 }, (_, i) => i + 1),
+    9,
+  );
+  const parts: Uint8Array[] = [front, keyframe, firstBand];
+  let length = front.length + keyframe.length + firstBand.length;
+  let referenceOffset = keyframeOffset;
+  for (let birth = 1; birth <= birthCount; birth++) {
+    const births = await oneGaussianStreams(0, 0, undefined, { id: birth });
+    const deltaOffset = length;
+    const delta = deltaChunkRecord({
+      t0: birth / intervals,
+      t1: (birth + 1) / intervals,
+      referenceOffset,
+      keyframeOffset,
+      deltaMode: 1,
+      depth: birth,
+      births,
+    });
+    const band = await shBandRecord(
+      1,
+      Array.from({ length: 9 }, (_, i) => birth * 10 + i + 1),
+      9,
+    );
+    parts.push(delta, band);
+    length += delta.length + band.length;
+    referenceOffset = deltaOffset;
+  }
+  return concat(parts);
 }
 
 /**
@@ -154,12 +369,13 @@ function chunkRecord(
   blob: Uint8Array,
   compression: string,
   uncompressedSize: number,
+  count = 1,
 ): Uint8Array {
   const body = concat([
     f64(t0),
     f64(t1),
     u32(0), // level
-    u32(1), // count
+    u32(count),
     str(compression),
     u64(uncompressedSize),
     u64(blob.length),
@@ -175,8 +391,27 @@ async function oneKeyframeFile(options: {
   motionBinX: number;
   duration: number;
   compress?: boolean;
+  objectId?: number;
+  idChannels?: number;
+  rotationChannels?: number;
+  muTBin?: number;
+  sigmaTBin?: number;
+  flags?: number;
 }): Promise<Uint8Array> {
-  const rawStreams = await oneGaussianStreams(options.windowIndex, options.motionBinX);
+  const rawStreams = await oneGaussianStreams(
+    options.windowIndex,
+    options.motionBinX,
+    options.objectId,
+    {
+      ...(options.idChannels === undefined ? {} : { idChannels: options.idChannels }),
+      ...(options.rotationChannels === undefined
+        ? {}
+        : { rotationChannels: options.rotationChannels }),
+      ...(options.muTBin === undefined ? {} : { muTBin: options.muTBin }),
+      ...(options.sigmaTBin === undefined ? {} : { sigmaTBin: options.sigmaTBin }),
+      ...(options.flags === undefined ? {} : { flags: options.flags }),
+    },
+  );
   const blob = options.compress ? await deflate(rawStreams) : rawStreams;
   const chunk = chunkRecord(
     0,
@@ -194,18 +429,67 @@ async function oneKeyframeFile(options: {
   ]);
 }
 
+/** One SH-bearing keyframe with a complete index, Footer and trailing magic. */
+async function oneKeyframeShFile(
+  options: { indexASecondBand?: boolean } = {},
+): Promise<Uint8Array> {
+  const streams = await oneGaussianStreams(0, 0);
+  const front = concat([
+    MAGIC,
+    record(0x01, headerBody(1, 1)),
+    record(0x03, quantizationBody()),
+    record(0x04, windowTableBody([[0, 1]])),
+  ]);
+  const chunk = chunkRecord(0, 1, streams, "", streams.length);
+  const chunkOffset = front.length;
+  const bandValues = Array.from({ length: 9 }, (_, i) => 240 - i);
+  const band = await shBandRecord(1, bandValues, 9);
+  const bandOffset = chunkOffset + chunk.length;
+  const secondBand = options.indexASecondBand
+    ? await shBandRecord(
+        1,
+        Array.from({ length: 9 }, (_, i) => 120 - i),
+        9,
+      )
+    : new Uint8Array(0);
+  const indexedBandOffset = bandOffset + (options.indexASecondBand ? band.length : 0);
+  const summaryStart = bandOffset + band.length + secondBand.length;
+  const index = record(
+    0x08,
+    concat([
+      f64(0),
+      f64(1),
+      u64(chunkOffset),
+      u64(chunk.length),
+      u32(1),
+      u32(1),
+      new Uint8Array([1]),
+      u64(indexedBandOffset),
+      u64(options.indexASecondBand ? secondBand.length : band.length),
+      new Uint8Array([0, 0]), // keyframe, no delta mode
+      u64(0),
+      u64(chunkOffset),
+      u16(0),
+      u64(1),
+    ]),
+  );
+  const footer = record(0x02, concat([u64(summaryStart), u64(0), u32(0)]));
+  return concat([front, chunk, band, secondBand, index, footer, MAGIC]);
+}
+
 // --- per-gaussian validity window (codex P1 §6.3) -------------------------
 
 test("motion precision follows each gaussian's own validity window, not window 0", async () => {
   const motionBinX = 10;
-  const duration = 1;
   // Window 0 is long (4 s), window 1 short (0.02 s). The gaussian references window 1, so
   // its velocity pitch must come from window 1 — a decoder using window 0 reconstructs a
-  // very different, wrong centre.
+  // very different, wrong centre. The timeline is the short window's, so the probe lands
+  // inside it: a probe outside would test the §3 gate below instead of the pitch.
+  const duration = 0.02;
   const file = await oneKeyframeFile({
     windows: [
       [0, 4],
-      [0, 0.02],
+      [0, duration],
     ],
     windowIndex: 1,
     motionBinX,
@@ -216,11 +500,164 @@ test("motion precision follows each gaussian's own validity window, not window 0
   const k = supportK(0.05);
   const pitch = (winLen: number) =>
     motionStep(lifeClass(0, STEPS.sigmaLog, true, winLen, k), STEPS.motion);
-  const probe = states.find((row) => row.t === 0.5)!;
+  const probe = states.find((row) => row.t === 0.01)!;
   const centerX = probe.sample.positions[0]![0]!;
-  assert.equal(centerX, num(motionBinX * pitch(0.02) * 0.5));
-  assert.notEqual(pitch(0.02), pitch(4));
-  assert.notEqual(centerX, num(motionBinX * pitch(4) * 0.5));
+  assert.equal(centerX, num(motionBinX * pitch(duration) * 0.01));
+  assert.notEqual(pitch(duration), pitch(4));
+  assert.notEqual(centerX, num(motionBinX * pitch(4) * 0.01));
+});
+
+test("a gaussian whose validity window has closed is absent, not transparent", async () => {
+  // The window shuts at 0.02 s and the timeline runs to 1 s. Section 3 makes the window a
+  // hard gate: past it the gaussian does not exist, so it leaves the population rather than
+  // fading — id, centre, scale and liveCount all drop it, exactly as the gaussian-birth
+  // path decides it. Reporting it at full opacity at t = 0.5 is what this pins against.
+  const file = await oneKeyframeFile({
+    windows: [[0, 0.02]],
+    windowIndex: 0,
+    motionBinX: 10,
+    duration: 1,
+  });
+  const sequence = await decodeKeyframeDeltaStreamed(file);
+  const summary = keyframeDeltaStatesJson(sequence);
+  const states = summary.states as { t: number; liveCount: string }[];
+  assert.equal(states.find((row) => row.t === 0)!.liveCount, "1");
+  assert.equal(states.find((row) => row.t === 0.5)!.liveCount, "0");
+  // The chunk's composed population is unchanged — one gaussian, all the way across. It is
+  // the instant that has no gaussian in it, not the chunk.
+  assert.equal(sequence.chunks[0]!.state.count, 1);
+  const chunk = keyframeDeltaChunkAt(sequence, 0.5);
+  assert.equal(reconstructKeyframeDelta(sequence, chunk, 0.01).count, 1);
+  const absent = reconstructKeyframeDelta(sequence, chunk, 0.5);
+  assert.equal(absent.count, 0);
+  assert.equal(absent.ids.buffer.byteLength, 0);
+  assert.equal(absent.centers.buffer.byteLength, 0);
+  assert.equal(absent.rotations.buffer.byteLength, 0);
+});
+
+test("a gaussian below the temporal marginal cutoff is absent inside its window", async () => {
+  // The hard validity window admits this row for the whole second. Its finite temporal
+  // Gaussian is centred at zero and narrow, so near the end the marginal is below
+  // the Header cutoff and the reconstructed state must omit it rather than retain a
+  // practically transparent row.
+  const file = await oneKeyframeFile({
+    windows: [[0, 1]],
+    windowIndex: 0,
+    motionBinX: 0,
+    duration: 1,
+    muTBin: 0,
+    sigmaTBin: -100,
+    flags: 0,
+  });
+  const sequence = await decodeKeyframeDeltaStreamed(file);
+  const chunk = keyframeDeltaChunkAt(sequence, 0.95);
+  assert.equal(reconstructKeyframeDelta(sequence, chunk, 0).count, 1);
+  assert.equal(reconstructKeyframeDelta(sequence, chunk, 0.95).count, 0);
+});
+
+test("object membership is carried through the reconstruction where a chunk has it", async () => {
+  // `object_id` is optional on a keyframe-delta chunk (spec §6.6), so the reconstruction
+  // reports `null` for a file without it and the ids themselves for a file with it — not a
+  // column of zeroes, which would read as "every gaussian is background". The id is read
+  // unsigned, because the ids span the whole u32 range and a track compares them for
+  // equality against a `u32`.
+  const objectId = 0xfffffff0;
+  const withMembership = await oneKeyframeFile({
+    windows: [[0, 1]],
+    windowIndex: 0,
+    motionBinX: 0,
+    duration: 1,
+    objectId,
+  });
+  const sequence = await decodeKeyframeDeltaStreamed(withMembership);
+  const g = reconstructKeyframeDelta(sequence, keyframeDeltaChunkAt(sequence, 0.5), 0.5);
+  assert.equal(g.count, 1);
+  assert.deepEqual([...g.objectId!], [objectId]);
+
+  const without = await oneKeyframeFile({
+    windows: [[0, 1]],
+    windowIndex: 0,
+    motionBinX: 0,
+    duration: 1,
+  });
+  const plain = await decodeKeyframeDeltaStreamed(without);
+  assert.equal(
+    reconstructKeyframeDelta(plain, keyframeDeltaChunkAt(plain, 0.5), 0.5).objectId,
+    null,
+  );
+});
+
+test("keyframe-delta reconstruction preserves SH on both paths and across a birth", async () => {
+  const indexedFile = await oneKeyframeShFile();
+  const streamed = await decodeKeyframeDeltaStreamed(indexedFile);
+  const indexed = (await decodeKeyframeDeltaIndexed(indexedFile)).sequence;
+  const expected = Array.from({ length: 9 }, (_, i) => 240 - i);
+  for (const sequence of [streamed, indexed]) {
+    const state = reconstructKeyframeDelta(sequence, keyframeDeltaChunkAt(sequence, 0.5), 0.5);
+    assert.equal(state.sh?.degree, 1);
+    assert.equal(state.sh?.coefficients, 3);
+    assert.equal(state.sh?.count, 1);
+    assert.deepEqual([...(state.sh?.values ?? [])], expected);
+  }
+
+  // A Delta Chunk's band rows belong to its births. Existing rows inherit the keyframe's
+  // coefficients; the newly born row is appended, and the public state follows the same
+  // gaussian-id order as every other reconstructed attribute.
+  const withBirth = await decodeKeyframeDeltaStreamed(await keyframeThenBirthShFile());
+  const after = reconstructKeyframeDelta(withBirth, keyframeDeltaChunkAt(withBirth, 0.75), 0.75);
+  assert.deepEqual([...after.ids], [0, 7]);
+  assert.deepEqual(
+    [...after.sh!.values],
+    [
+      ...Array.from({ length: 9 }, (_, i) => i + 1),
+      ...Array.from({ length: 9 }, (_, i) => 101 + i),
+    ],
+  );
+});
+
+test("a streamed SH band must immediately follow the state record it extends", async () => {
+  const data = await oneKeyframeShFile();
+  const band = [...iterateRecords(data, MAGIC.length)].find((item) => item.opcode === 0x07)!;
+  const unrelated = record(0x80, new Uint8Array([1]));
+  const interleaved = concat([
+    data.subarray(0, band.offset),
+    unrelated,
+    data.subarray(band.offset),
+  ]);
+
+  await assert.rejects(
+    () => decodeKeyframeDeltaStreamed(interleaved),
+    (error: unknown) =>
+      error instanceof MalformedFile && error.message.includes("carries SH bands none"),
+  );
+});
+
+test("an indexed SH range must trail the state chunk that owns it", async () => {
+  // Both records are individually valid band-1 streams with the right row shape. Only the first
+  // physically trails the Chunk; pointing the index at the second used to let the indexed path
+  // reconstruct different coefficients from the streamed path.
+  const misplaced = await oneKeyframeShFile({ indexASecondBand: true });
+  await assert.rejects(
+    () => decodeKeyframeDeltaIndexed(misplaced),
+    (error: unknown) =>
+      error instanceof MalformedFile &&
+      error.message.includes("its trailing SH records place that band at byte"),
+  );
+});
+
+test("an append-only SH birth chain reconstructs every persistent segment", async () => {
+  const births = 12;
+  const sequence = await decodeKeyframeDeltaStreamed(await keyframeThenManyBirthsShFile(births));
+  assert.equal(sequence.chunks.length, births + 1);
+  const state = reconstructKeyframeDelta(sequence, sequence.chunks.at(-1)!, 0.99);
+  assert.deepEqual(
+    [...state.ids],
+    Array.from({ length: births + 1 }, (_, id) => id),
+  );
+  const expected = Array.from({ length: births + 1 }, (_, row) =>
+    Array.from({ length: 9 }, (_, i) => (row === 0 ? i + 1 : row * 10 + i + 1)),
+  ).flat();
+  assert.deepEqual([...state.sh!.values], expected);
 });
 
 test("an out-of-range window index is refused, not clamped", async () => {
@@ -319,6 +756,226 @@ test("a streamed decode reads a complete prefix and bounds probes to the last ch
   const states = keyframeDeltaStatesJson(decoded).states as { t: number }[];
   assert.ok(states.length > 0);
   assert.ok(states.every((s) => s.t < lastT1));
+
+  // And a seek into the tail the cut removed is refused rather than answered with the last
+  // state before it. The end-of-timeline convenience — `t` at or past the end resolves to
+  // the last chunk — is for a complete file; here the missing bytes are what said what
+  // happens at that instant, so handing back the state before the cut would be the decoder
+  // inventing content. The indexed path already refuses it; both do now.
+  assert.equal(keyframeDeltaChunkAt(decoded, lastT1 - 1e-9).t1, lastT1);
+  assert.throws(
+    () => keyframeDeltaChunkAt(decoded, lastT1),
+    (error: unknown) =>
+      error instanceof MalformedFile && /this timeline ends at/.test(error.message),
+  );
+  assert.throws(
+    () => keyframeDeltaChunkAt(decoded, sequence.header.durationSec - 1e-9),
+    MalformedFile,
+  );
+  // The complete file keeps the convenience: its last chunk reaches duration_sec, so the
+  // final instant and the boundary itself both resolve.
+  assert.equal(
+    keyframeDeltaChunkAt(sequence, sequence.header.durationSec).t1,
+    sequence.header.durationSec,
+  );
+  for (const invalid of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.throws(() => keyframeDeltaChunkAt(sequence, invalid), MalformedFile);
+  }
+});
+
+test("a cut inside a trailing SH record drops only its incomplete state", async () => {
+  const data = await keyframeThenBirthShFile();
+  const framed = [...iterateRecords(data, MAGIC.length)];
+  const trailingBand = framed[framed.length - 1]!;
+  assert.equal(trailingBand.opcode, 0x07);
+
+  // The band frame has arrived, but only one byte of its declared content has.
+  const cut = data.slice(0, trailingBand.offset + 9 + 1);
+  const decoded = await decodeKeyframeDeltaStreamed(cut);
+  assert.equal(decoded.chunks.length, 1);
+  const state = reconstructKeyframeDelta(decoded, decoded.chunks[0]!, 0.25);
+  assert.equal(state.sh?.degree, 1);
+  assert.deepEqual(
+    [...state.sh!.values],
+    Array.from({ length: 9 }, (_, i) => i + 1),
+  );
+});
+
+test("the end boundary selects the temporally last chunk, not the physical last", async () => {
+  const sequence = (await decodeKeyframeDeltaIndexed(bytes(MOVING_CHAINED))).sequence;
+  const temporalLast = sequence.chunks.reduce((latest, chunk) =>
+    chunk.t1 > latest.t1 ? chunk : latest,
+  );
+  const physicallyReordered = { ...sequence, chunks: [...sequence.chunks].reverse() };
+  assert.notEqual(physicallyReordered.chunks.at(-1)!.offset, temporalLast.offset);
+  assert.equal(
+    keyframeDeltaChunkAt(physicallyReordered, sequence.header.durationSec).offset,
+    temporalLast.offset,
+  );
+});
+
+test("a birth that introduces object_id defaults the rows that came before it", async () => {
+  // §6.6 makes membership optional per chunk and gives the omission a value: a state that
+  // omits the stream is read as though every gaussian in it carried 0. So a background
+  // keyframe with no `object_id` followed by a delta birth that has one is a legal file,
+  // and the column it composes to must be as long as the population. Composed without the
+  // default it was `birth_count` rows long against two ids, so the birth's membership
+  // landed on the gaussian that was already there and the birth itself read past the end:
+  // two gaussians in the wrong object, and no error anywhere.
+  const born = 7;
+  const objectId = 0xfffffff0;
+  const file = await keyframeThenBirthFile({ born, objectId });
+  const sequence = await decodeKeyframeDeltaStreamed(file);
+  assert.equal(sequence.chunks.length, 2);
+
+  const before = reconstructKeyframeDelta(sequence, sequence.chunks[0]!, 0.25);
+  assert.equal(before.objectId, null, "the keyframe carries no membership at all");
+
+  const after = reconstructKeyframeDelta(sequence, sequence.chunks[1]!, 0.75);
+  assert.deepEqual([...after.ids], [0, born], "ascending gaussian_id");
+  assert.deepEqual([...after.objectId!], [0, objectId]);
+});
+
+test("a birth that omits object_id defaults its new row to background", async () => {
+  const existingObject = 42;
+  const born = 7;
+  const file = await keyframeThenBirthFile({ born, keyframeObjectId: existingObject });
+  const sequence = await decodeKeyframeDeltaStreamed(file);
+  const after = reconstructKeyframeDelta(sequence, sequence.chunks[1]!, 0.75);
+  assert.deepEqual([...after.ids], [0, born]);
+  assert.deepEqual([...after.objectId!], [existingObject, 0]);
+});
+
+test("a streamless empty keyframe reconstructs as empty state", async () => {
+  const empty = new Uint8Array(0);
+  const file = concat([
+    MAGIC,
+    record(0x01, headerBody(1, 0, 0)),
+    record(0x03, quantizationBody()),
+    record(0x04, windowTableBody([[0, 1]])),
+    chunkRecord(0, 1, empty, "", 0, 0),
+  ]);
+  const sequence = await decodeKeyframeDeltaStreamed(file);
+  const reconstructed = reconstructKeyframeDelta(sequence, sequence.chunks[0]!, 0.5);
+  assert.equal(reconstructed.count, 0);
+  assert.equal(reconstructed.ids.byteLength, 0);
+  assert.equal(reconstructed.centers.byteLength, 0);
+  assert.equal(reconstructed.sh, null);
+});
+
+test("an update restates rotation_index and rotation together", async () => {
+  const keyframeStreams = await oneGaussianStreams(0, 0);
+  const keyframe = chunkRecord(0, 0.5, keyframeStreams, "", keyframeStreams.length);
+  const front = concat([
+    MAGIC,
+    record(0x01, headerBody(1)),
+    record(0x03, quantizationBody()),
+    record(0x04, windowTableBody([[0, 1]])),
+  ]);
+  const updates = concat(
+    await Promise.all([
+      encodeTestStream({ attributeId: Attribute.GaussianId, values: [0], channels: 1 }),
+      encodeTestStream({ attributeId: Attribute.RotationIndex, values: [2], channels: 1 }),
+    ]),
+  );
+  const file = concat([
+    front,
+    keyframe,
+    updateDeltaChunkRecord({
+      t0: 0.5,
+      t1: 1,
+      referenceOffset: front.length,
+      updates,
+    }),
+  ]);
+  await assert.rejects(
+    () => decodeKeyframeDeltaStreamed(file),
+    (error: unknown) =>
+      error instanceof MalformedFile &&
+      /restate rotation_index and all three rotation bins together/.test(error.message),
+  );
+});
+
+test("an attribute stream whose channel width is not the registry's is refused", async () => {
+  // The row count does not pin the shape. A `rotation` column declaring one channel and
+  // the right element count passed every check and then met a reader that indexes
+  // `values[i * 3 + c]`: it read the next row's bin as this row's second component, and
+  // `undefined` past the end, which arithmetic turns into a NaN quaternion. The rule was
+  // enforced for `object_id` alone; it is the registry's rule for every attribute it names.
+  const wrong = await oneKeyframeFile({
+    windows: [[0, 1]],
+    windowIndex: 0,
+    motionBinX: 0,
+    duration: 1,
+    rotationChannels: 1,
+  });
+  await assert.rejects(
+    () => decodeKeyframeDeltaStreamed(wrong),
+    (error: unknown) =>
+      error instanceof MalformedFile &&
+      /attribute 3 .*declares 1 channels, the format defines 3/.test(error.message),
+  );
+
+  // The same streams read as a `gaussian-birth` chunk: the check belongs to both paths,
+  // because a delta group's columns never pass through the chunk decoder.
+  const streams = await threeChannelStreams({ rotationChannels: 1 });
+  await assert.rejects(
+    () =>
+      decodeChunkStreams(streams, 1, {
+        steps: { ...STEPS, sh: 1 },
+        posOrigin: [0, 0, 0],
+        windows: new Float64Array([0, 1]),
+        supportK: supportK(0.05),
+        codecs: DEFAULT_CODECS,
+      }),
+    (error: unknown) =>
+      error instanceof MalformedFile &&
+      /attribute 3 declares 1 channels, the format defines 3/.test(error.message),
+  );
+});
+
+test("gaussian_id is one channel in keyframes and delta groups", async () => {
+  const keyframe = await oneKeyframeFile({
+    windows: [[0, 1]],
+    windowIndex: 0,
+    motionBinX: 0,
+    duration: 1,
+    idChannels: 2,
+  });
+  await assert.rejects(
+    () => decodeKeyframeDeltaStreamed(keyframe),
+    (error: unknown) =>
+      error instanceof MalformedFile &&
+      /attribute 13 .*declares 2 channels, the format defines 1/.test(error.message),
+  );
+
+  const birth = await keyframeThenBirthFile({
+    born: 7,
+    objectId: 9,
+    birthIdChannels: 2,
+  });
+  await assert.rejects(
+    () => decodeKeyframeDeltaStreamed(birth),
+    (error: unknown) =>
+      error instanceof MalformedFile &&
+      /attribute 13 .*declares 2 channels, the format defines 1/.test(error.message),
+  );
+});
+
+test("SH dimensions are checked before a constant stream can expand", async () => {
+  const data = await oneKeyframeShFile();
+  const band = [...iterateRecords(data, MAGIC.length)].find((record) => record.opcode === 0x07)!;
+  const mutated = data.slice();
+  const streamAt = band.offset + 9 + 1;
+  mutated[streamAt + 2] = 2; // constant mode: nine payload symbols can claim many rows
+  new DataView(mutated.buffer, mutated.byteOffset, mutated.byteLength).setUint32(
+    streamAt + 5,
+    7_000_000,
+    true,
+  );
+  const expected = /SH band 1 carries 7000000 rows, expected 1/;
+  await assert.rejects(() => decodeKeyframeDeltaStreamed(mutated), expected);
+  await assert.rejects(() => decodeKeyframeDeltaIndexed(mutated), expected);
 });
 
 test("canonical summaries handle more chunks than V8's argument limit", async () => {
