@@ -1,47 +1,10 @@
 // Copyright 2026 Avala AI
 // SPDX-License-Identifier: Apache-2.0
 
-/// Structural validation.
+/// Bounded structural validation aligned with the Python reference validator.
 ///
-/// This is what makes a third-party encoder possible: a way to find out *why* a file is wrong
-/// that does not involve reading someone else's decoder. Every finding names the record, the
-/// field and what was expected.
-///
-/// The findings, their severities and their wording are `python/fourdgs/fourdgs/validate.py`'s.
-/// Two validators that disagree about whether a file conforms are worse than one, so where the
-/// two differ the Python module is the reference and this is the bug.
-///
-/// **What this validator does not check, and why.** The Python and Rust validators parse every
-/// record's body and check its fields — the Header's gaussian count against the chunks, each
-/// Audio Source's pose and timing, every quantization step for finiteness. This one does not,
-/// because the Swift package is a binding: full record parsing and gaussian reconstruction go
-/// through `CoreSeam.swift`, and writing those parsers here would make the tool a second decoder
-/// that could disagree with the one it ships beside. The checks below therefore read only bounded
-/// structural fields — framing, fixed index and state-record headers, the summary checksum — plus
-/// everything the reader itself decides, which is where the six named refusals live.
-///
-/// The consequence is worth stating plainly: on a file this tool calls valid, Python may still
-/// have something to say. It reports a subset of Python's findings and never a finding Python
-/// contradicts, which is the property that matters — a validator that is quieter is a gap, and
-/// one that disagrees is a bug.
-///
-/// Three things it does that the Python tool does not:
-///
-/// * **It prints the refusal identifier and the byte.** The finding lines themselves match
-///   Python's word for word; the identifier goes on a line of its own beneath the finding it
-///   belongs to. Python's exceptions carry the same `code` — its CLI simply does not print it.
-/// * **It decodes every physical Chunk.** A framing walk steps over a chunk by its declared length,
-///   so a fault inside its streams is invisible to it; two of the invalid corpus's seven files are
-///   exactly that, and Python calls them clean. Indexed chunks use their ordinary ranges. A chunk
-///   absent from the index is exposed to the streamed core in a one-chunk virtual file, so the
-///   working set stays bounded by that chunk.
-/// * **It recognizes `keyframe-delta`.** Python reports a conforming keyframe-delta file as
-///   invalid, because its structural checks assume the gaussian-birth chunk shape. This tool
-///   validates its timeline tiling, backward reference chains, exact depth, keyframe ancestry and
-///   every field duplicated between the index and a Delta Chunk. Each keyframe and delta group is
-///   also sent through the ordinary core stream decoder in a bounded, range-backed virtual file.
-///   Its current ABI has no ranged composition entry point, so the conformance runner remains the
-///   place that proves full identity composition at an instant.
+/// Swift leaves full record parsing to the core binding. This layer checks framing, indexed
+/// metadata, summary structure, and every physical state stream without buffering whole records.
 
 import FourDGS
 
@@ -50,7 +13,6 @@ public enum Severity: Int, Comparable {
     case warning
     case error
 
-    /// `note`, `warning`, `error` — the prefix a finding is printed under.
     public var name: String {
         switch self {
         case .note: return "note"
@@ -62,14 +24,10 @@ public enum Severity: Int, Comparable {
     public static func < (lhs: Severity, rhs: Severity) -> Bool { lhs.rawValue < rhs.rawValue }
 }
 
-/// One thing wrong with a file, and — when the SDK named it — which refusal it is.
+/// A diagnostic and, when the SDK named it, its refusal identifier and byte.
 public struct Finding {
     public let severity: Severity
-    /// Word for word what the Python validator prints for the same bytes.
     public let message: String
-    /// The refusal identifier and the byte it fired at, for the findings that have one. Most do
-    /// not: "first record is Footer; the Header must come first" is a rule this validator checks
-    /// itself, not a refusal the reader raised, and the refusal table does not name it.
     public let refusal: Named?
 }
 
@@ -87,20 +45,15 @@ public struct Report {
     mutating func warn(_ message: String) { push(.warning, message, nil) }
     mutating func note(_ message: String) { push(.note, message, nil) }
 
-    /// An error the reader raised, carrying its identifier and the byte if it has one.
-    ///
-    /// `prefix` is what the message is introduced with, so the sentence stays the one the other
-    /// validators print; the identifier arrives on its own line and changes nothing about it.
+    /// Preserve the shared diagnostic sentence while attaching Swift's placed refusal.
     mutating func refused(_ prefix: String, _ error: FourDGSError, _ walk: Walk?, _ site: Site?) {
         push(.error, prefix + sentence(error), describe(error, walk: walk, site: site))
     }
 }
 
-/// One original byte range in the small virtual file used to decode one physical Chunk.
 private struct SourceSlice {
     let offset: UInt64
     let length: UInt64
-    /// Fixed framing generated by the validator; source-backed slices leave this nil.
     let literal: [UInt8]?
 
     init(offset: UInt64, length: UInt64) {
@@ -116,11 +69,7 @@ private struct SourceSlice {
     }
 }
 
-/// A concatenation of original byte ranges, without copying them.
-///
-/// Validation gives the streamed core the magic, the active Header/Quantization/Window Table and
-/// one Chunk. The virtual file deliberately ends there, so truncation recovery returns that one
-/// decoded chunk. Memory is therefore bounded by one chunk even when the original has no index.
+/// A source-backed concatenation; validation never materializes a physical state record.
 private struct SlicedReader: ByteRangeReader {
     let source: ToolReader
     let slices: [SourceSlice]
@@ -177,31 +126,6 @@ private struct SlicedReader: ByteRangeReader {
     }
 }
 
-/// Replace one equal-length field in a virtual range reader without materializing that reader.
-private struct ReplacingReader<Base: ByteRangeReader>: ByteRangeReader {
-    var base: Base
-    let offset: UInt64
-    let replacement: [UInt8]
-
-    func byteCount() throws -> Int64 { try base.byteCount() }
-
-    mutating func read(offset requested: Int64, count: Int) throws -> [UInt8] {
-        var bytes = try base.read(offset: requested, count: count)
-        guard requested >= 0, !bytes.isEmpty else { return bytes }
-        let start = UInt64(requested)
-        let end = start + UInt64(bytes.count)
-        let replacementEnd = offset + UInt64(replacement.count)
-        let overlapStart = max(start, offset)
-        let overlapEnd = min(end, replacementEnd)
-        guard overlapStart < overlapEnd else { return bytes }
-        for absolute in overlapStart..<overlapEnd {
-            bytes[Int(absolute - start)] = replacement[Int(absolute - offset)]
-        }
-        return bytes
-    }
-}
-
-/// The fields duplicated between a physical state record and its Chunk Index entry.
 struct ChunkFields {
     let opcode: UInt8
     let t0: Double
@@ -240,28 +164,38 @@ private func chunkFields(_ source: ToolReader, _ frame: Frame) throws -> ChunkFi
         referenceOffset: referenceOffset, keyframeOffset: keyframeOffset, depth: depth)
 }
 
-private func singleChunkReader(
-    _ source: ToolReader, header: Frame, quantization: Frame, windowTable: Frame?, chunk: Frame
-) -> SlicedReader {
+private func frontMatterSlices(
+    header: Frame, quantization: Frame, windowTable: Frame?, temporalModelOffset: UInt64? = nil
+) -> [SourceSlice] {
     var slices = [
-        SourceSlice(offset: 0, length: UInt64(magic.count)),
-        SourceSlice(offset: header.offset, length: header.total),
-        SourceSlice(offset: quantization.offset, length: quantization.total),
+        SourceSlice(offset: 0, length: UInt64(magic.count))
     ]
+    if let model = temporalModelOffset {
+        let after = model + UInt64("gaussian-birth".utf8.count)
+        slices += [
+            SourceSlice(offset: header.offset, length: model - header.offset),
+            SourceSlice(literal: Array("gaussian-birth".utf8)),
+            SourceSlice(offset: after, length: header.offset + header.total - after),
+        ]
+    } else {
+        slices.append(SourceSlice(offset: header.offset, length: header.total))
+    }
+    slices.append(SourceSlice(offset: quantization.offset, length: quantization.total))
     if let windowTable {
         slices.append(SourceSlice(offset: windowTable.offset, length: windowTable.total))
     }
-    slices.append(SourceSlice(offset: chunk.offset, length: chunk.total))
-    return SlicedReader(source: source, slices: slices)
+    return slices
 }
 
-private func gaussianBirthView(
-    _ reader: SlicedReader, header: Frame, temporalModelOffset: UInt64
-) -> ReplacingReader<SlicedReader> {
-    ReplacingReader(
-        base: reader,
-        offset: UInt64(magic.count) + temporalModelOffset - header.offset,
-        replacement: Array("gaussian-birth".utf8))
+private func singleChunkReader(
+    _ source: ToolReader, header: Frame, quantization: Frame, windowTable: Frame?, chunk: Frame,
+    temporalModelOffset: UInt64? = nil
+) -> SlicedReader {
+    var slices = frontMatterSlices(
+        header: header, quantization: quantization, windowTable: windowTable,
+        temporalModelOffset: temporalModelOffset)
+    slices.append(SourceSlice(offset: chunk.offset, length: chunk.total))
+    return SlicedReader(source: source, slices: slices)
 }
 
 private struct DeltaGroup {
@@ -277,7 +211,6 @@ private func malformedDelta(_ frame: Frame, _ reason: String) -> FourDGSError {
         reason: reason)
 }
 
-/// Locate the three length-framed groups with fixed-size reads only.
 private func deltaGroups(_ source: ToolReader, _ frame: Frame) throws -> [DeltaGroup] {
     let content = frame.offset + recordHeaderSize
     let countsAt: UInt64 = 39
@@ -349,7 +282,6 @@ private func deltaGroups(_ source: ToolReader, _ frame: Frame) throws -> [DeltaG
 private let requiredGroupAttributes: Set<UInt8> = Set(0...10)
 private let invariantUpdateAttributes: Set<UInt8> = [8, 9, 10]
 
-/// Check stream framing and the group rules before any declared payload reaches the core.
 private func validateGroupHeaders(
     _ source: ToolReader, _ frame: Frame, _ group: DeltaGroup
 ) throws {
@@ -419,7 +351,6 @@ private func littleU64Bytes(_ value: UInt64) -> [UInt8] {
     (0..<8).map { UInt8(truncatingIfNeeded: value >> (8 * $0)) }
 }
 
-/// A gaussian-birth Chunk header around one delta group. The group's bytes stay source-backed.
 private func syntheticChunkPrefix(
     t0: Double, t1: Double, level: UInt32, count: UInt32, streams: UInt64
 ) -> [UInt8] {
@@ -437,24 +368,17 @@ private func syntheticChunkPrefix(
 private func deltaGroupReader(
     _ source: ToolReader, header: Frame, quantization: Frame, windowTable: Frame?,
     temporalModelOffset: UInt64, fields: ChunkFields, group: DeltaGroup
-) -> ReplacingReader<SlicedReader> {
-    var slices = [
-        SourceSlice(offset: 0, length: UInt64(magic.count)),
-        SourceSlice(offset: header.offset, length: header.total),
-        SourceSlice(offset: quantization.offset, length: quantization.total),
-    ]
-    if let windowTable {
-        slices.append(SourceSlice(offset: windowTable.offset, length: windowTable.total))
-    }
+) -> SlicedReader {
+    var slices = frontMatterSlices(
+        header: header, quantization: quantization, windowTable: windowTable,
+        temporalModelOffset: temporalModelOffset)
     slices.append(
         SourceSlice(
             literal: syntheticChunkPrefix(
                 t0: fields.t0, t1: fields.t1, level: fields.level, count: group.count,
                 streams: group.length)))
     slices.append(SourceSlice(offset: group.offset, length: group.length))
-    return gaussianBirthView(
-        SlicedReader(source: source, slices: slices), header: header,
-        temporalModelOffset: temporalModelOffset)
+    return SlicedReader(source: source, slices: slices)
 }
 
 private func isExpectedPartialGroupError(_ error: FourDGSError, group: DeltaGroup) -> Bool {
@@ -465,9 +389,6 @@ private func isChunkRefusal(_ error: FourDGSError) -> Bool {
     error.refusalCode == .unknownStreamCodec || error.refusalCode == .windowIndexOutOfRange
 }
 
-/// Match the index against the physical framing, validate the summary's members, and decode every
-/// gaussian-birth Chunk even when the index omits it. The second walk retains no frames; its only
-/// growing structures are keyed by the already-small index.
 private func validatePhysicalRecords(
     _ source: ToolReader, _ walked: Walk, index: [IndexEntry], keyframeDelta: Bool,
     temporalModelOffset: UInt64?, summary: SummaryDeclaration?, indexBoundsSafe: Bool,
@@ -619,11 +540,10 @@ private func validatePhysicalRecords(
                         guard let temporalModelOffset else { return }
                         if frame.opcode == Opcode.chunk {
                             _ = try SceneReader(
-                                gaussianBirthView(
-                                    singleChunkReader(
-                                        source, header: header, quantization: quantization,
-                                        windowTable: windowTable, chunk: frame),
-                                    header: header, temporalModelOffset: temporalModelOffset),
+                                singleChunkReader(
+                                    source, header: header, quantization: quantization,
+                                    windowTable: windowTable, chunk: frame,
+                                    temporalModelOffset: temporalModelOffset),
                                 path: .streamed)
                         } else if let physicalFields {
                             for group in try deltaGroups(source, frame) {
@@ -812,8 +732,7 @@ func validateKeyframeDeltaIndex(
 
     }
 
-    // Backward references make this a DAG in physical-offset order. Resolve each node once and
-    // cache its keyframe/depth instead of re-walking every prefix of a long chained GOP.
+    // Resolve the backward-reference DAG once in physical order.
     struct Resolution {
         let keyframe: UInt64
         let depth: Int
@@ -885,20 +804,15 @@ func validateKeyframeDeltaIndex(
     }
 }
 
-/// Every check, over one size-and-range transport.
+/// Run every check over one size-and-range transport.
 func validate(_ source: ToolReader) -> Report {
     var report = Report()
 
-    // Framing first, and for two reasons: it refuses a file that is not ours before anything
-    // reads a byte as an opcode, and it is what gives every later refusal a byte to point at.
     var firstOpcode: UInt8?
     var lastOpcode: UInt8?
     var hasHeader = false
     var hasQuantization = false
     var hasFooter = false
-    // Two are enough to preserve the refusal-placement rule: one can be placed, more than one is
-    // ambiguous. Footer content is read only from the first. Chunk Index frames are the format's
-    // small seek index; every unrelated top-level frame is consumed and immediately discarded.
     var retainedHeaders = 0
     var retainedQuantizations = 0
     var retainedFooters = 0
@@ -935,8 +849,6 @@ func validate(_ source: ToolReader) -> Report {
                     report.note(
                         "private record 0x\(hex2(opcode)) (\(frame.length) bytes) — skipped, as required")
                 } else if isProvenance(opcode) && !isSpecified(opcode) {
-                    // The reserved tail of the provenance family is spoken for, so this is a
-                    // future-revision record rather than a byte the reader cannot account for.
                     report.note(
                         "reserved provenance record 0x\(hex2(opcode)) — skipped, as required "
                             + "(0x26-0x2F, section 5.15.8)")
@@ -954,17 +866,12 @@ func validate(_ source: ToolReader) -> Report {
             "file does not end with the magic; it is truncated or was written by a broken encoder")
     }
 
-    // Report the cut before any early return. In particular, a file cut inside its first record
-    // has no intact first opcode, but the walk still knows that record's byte, kind, declared
-    // length and the resource size — the useful diagnosis must not be hidden by "no records".
     if let cut = walked.cut {
         report.note(
             "the file is cut at byte \(commas(cut.at)): \(cut.reason). The \(walked.intact) "
                 + "complete records before it are intact, and a streamed reader recovers them")
     }
 
-    // Only whole records set these values: a record the file was cut inside is reported by the
-    // note above, and counting it as present would say a Footer exists before its bytes do.
     guard let firstOpcode else {
         report.error("no records at all")
         return report
@@ -980,16 +887,6 @@ func validate(_ source: ToolReader) -> Report {
             "last record is \(opcodeName(lastOpcode ?? 0)); the Footer must be the final record")
     }
 
-    // Which chunk shape the rest of this validator is entitled to assume. A `keyframe-delta`
-    // file's Chunks are keyframes and its Delta Chunks are differences against them, so the index
-    // check below is about the gaussian-birth shape and about nothing else. Read from the Header
-    // rather than guessed from the records, because a file that carries Delta Chunks and does not
-    // say so is itself a fault.
-    //
-    // The two length-prefixed strings before this field are skipped by their declared lengths;
-    // only four-byte lengths and the fourteen-byte dispatch value are read. A fixed prefix is not
-    // sufficient because a conforming profile or library name can put this field arbitrarily far
-    // into the Header.
     let dispatch: HeaderDispatch?
     do {
         dispatch = try headerDispatch(source, walked)
@@ -1014,9 +911,6 @@ func validate(_ source: ToolReader) -> Report {
             indexBoundsSafe = false
             continue
         }
-        // A `keyframe-delta` file indexes both kinds: a Chunk is a keyframe and a Delta Chunk is
-        // a difference against one, and an index that could only name the former could not seek
-        // the model at all.
         let at: UInt8
         do {
             at = try source.exactly(offset: entry.offset, count: 1, record: "Chunk Index target")[0]
@@ -1101,18 +995,11 @@ func validate(_ source: ToolReader) -> Report {
     return report
 }
 
-/// The in-memory convenience used by parser tests and callers that already own their bytes.
 public func validate(_ bytes: [UInt8]) -> Report {
     validate(ToolReader(InMemoryReader(bytes)))
 }
 
-/// The two checks only a reader can perform: open the file, then decode it.
-///
-/// Opening it the way a seeking client would is where the front-matter refusals fire — an
-/// unimplemented temporal model, an unimplemented quantization scheme. Decoding the chunks is
-/// where the rest do, and there is no substitute for it: the framing walk steps over a chunk by
-/// its declared length, so an unimplemented stream codec and an out-of-range window index are
-/// both invisible to everything before this point. Both are in the invalid corpus.
+/// Open the indexed reader and decode chunks only after physical ranges have been proved.
 private func checkGaussianBirth(
     _ source: ToolReader, _ walked: Walk, _ index: [IndexEntry], indexSafe: Bool,
     chunkAlreadyRefused: Bool, _ report: inout Report
@@ -1127,8 +1014,6 @@ private func checkGaussianBirth(
     } catch {
         report.refused(
             "a seeking reader cannot open this file: ", asFourDGS(error), walked, nil)
-        // A file that will not open will not decode either, and the second error would say the
-        // same thing about the same byte.
         return
     }
     if !chunkAlreadyRefused, let refusal = scanChunks(reader, index: index) {
@@ -1142,16 +1027,12 @@ public func runValidate(_ path: String, _ out: TextOutput, _ err: TextOutput) ->
     do {
         source = try ToolReader(FileReader(path: path))
     } catch {
-        // Not the file's fault, and not a refusal. See ``exitTool``.
         err.line("4dgs: \(path): \(sentence(asFourDGS(error)))")
         return exitTool
     }
     let report = validate(source)
     for finding in report.findings {
         out.line("\(finding.severity.name): \(finding.message)")
-        // Indented, and with a prefix of its own, so that a caller filtering the findings on
-        // `error:`/`warning:`/`note:` — which is how the validators are compared — sees exactly
-        // what it saw before.
         if let refusal = finding.refusal { out.line("  \(refusal)") }
     }
     if !report.ok {
@@ -1159,8 +1040,5 @@ public func runValidate(_ path: String, _ out: TextOutput, _ err: TextOutput) ->
         return exitFailed
     }
     out.line(report.findings.isEmpty ? "valid" : "valid (with notes)")
-    // The one deliberate divergence from the Python tool, which exits 0 here, and the Rust and
-    // C++ tools' too. A warning a script cannot see is a warning nobody acts on, so it gets its
-    // own code.
     return report.worst == .warning ? exitWarnings : exitOk
 }

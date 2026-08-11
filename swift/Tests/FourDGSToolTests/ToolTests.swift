@@ -1,24 +1,13 @@
 // Copyright 2026 Avala AI
 // SPDX-License-Identifier: Apache-2.0
 
-/// The `4dgs` tool, over the corpus that already knows the answers.
-///
-/// The invalid corpus is seven files, each with a `.json` beside it naming the rule it breaks.
-/// That mapping is not restated here: it is read out of the corpus, so this suite cannot drift
-/// into agreeing with a stale copy of itself, and a corpus that grows an eighth variant fails this
-/// suite until the tool has an answer for it.
-///
-/// The tool is driven through `run(_:out:err:)` with argument strings and a pair of sinks, which
-/// is the whole tool including its exit codes — no subprocess, so this behaves the same wherever
-/// the package builds.
-
+/// Corpus-driven tests for the in-process `4dgs` command.
 import Foundation
 import FourDGS
 import XCTest
 
 @testable import FourDGSTool
 
-/// One run of the tool: what it printed, and what it exited with.
 private struct Runs {
     let code: Int32
     let out: String
@@ -32,13 +21,8 @@ private func runTool(_ arguments: [String]) -> Runs {
     return Runs(code: code, out: out.text, err: err.text)
 }
 
-/// A conforming capture carrying provenance records — a coordinate frame, a rig trajectory and
-/// sensor calibrations — which is the variant that would produce spurious "unknown record" notes
-/// if the provenance family were not recognized.
 private let provenanceVariant = "TenWindows-UseChunkIndex-UseCrc-WithFrame-WithRig-WithSensors.4dgs"
 
-/// Where the generated corpus lives. Located from this file rather than from the working
-/// directory, because `swift test` does not promise one.
 private func corpusDirectory() -> URL {
     if let fromEnvironment = ProcessInfo.processInfo.environment["FOURDGS_CORPUS"] {
         return URL(fileURLWithPath: fromEnvironment)
@@ -48,11 +32,7 @@ private func corpusDirectory() -> URL {
     return root.appendingPathComponent("tests/conformance/data")
 }
 
-/// Skip when the corpus is not on disk.
-///
-/// The corpus is generated rather than committed, so a developer who has not run the generator
-/// gets skipped tests instead of failures — but CI generates it before this suite runs, and there
-/// a missing corpus is a suite that silently did not run.
+/// Skip locally when the generated corpus is absent, but never silently skip it in CI.
 private func requireCorpus() throws {
     let invalid = corpusDirectory().appendingPathComponent("invalid")
     if FileManager.default.fileExists(atPath: invalid.path) { return }
@@ -63,7 +43,6 @@ private func requireCorpus() throws {
     throw XCTSkip("no corpus; run tests/conformance/generate.py first")
 }
 
-/// Every `.4dgs` in a corpus directory, sorted so a failure names the same file twice running.
 private func variants(_ directory: URL) -> [URL] {
     let found = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
     return
@@ -73,7 +52,6 @@ private func variants(_ directory: URL) -> [URL] {
         .map { directory.appendingPathComponent($0) }
 }
 
-/// Tests deliberately mutate tiny corpus fixtures in memory. Production commands never use this.
 private func readFixture(_ url: URL) throws -> [UInt8] {
     [UInt8](try Data(contentsOf: url))
 }
@@ -117,8 +95,7 @@ private final class RecordingReader: ByteRangeReader {
     }
 }
 
-/// The `"refused"` member of an expectation file: the identifier the corpus says a reader must
-/// produce for these bytes.
+/// Read the refusal identifier declared beside an invalid corpus variant.
 private func expectedRefusal(_ variant: URL) -> String? {
     let json = variant.deletingPathExtension().appendingPathExtension("json")
     guard let data = FileManager.default.contents(atPath: json.path),
@@ -308,8 +285,6 @@ final class ValidateTests: XCTestCase {
             }, "\(report.findings.map(\.message))")
     }
 
-    /// Band addresses are independent ranges in the Chunk Index. Accepting a prefix of a framed
-    /// SH Band Stream would let an indexed reader see different bytes than the physical scan.
     func testAnIndexedBandLengthMustEqualThePhysicalFrame() throws {
         try requireCorpus()
         let variant = "MixedLifetimes-SHDegree3-UseChunkIndex-UseCrc.4dgs"
@@ -387,8 +362,6 @@ final class ValidateTests: XCTestCase {
             }, "\(report.findings.map(\.message))")
     }
 
-    /// A zero checksum disables integrity checking, not the Footer's declaration that the byte
-    /// range is a summary. Its record-family and boundary rules still apply.
     func testSummaryStructureIsCheckedWhenItsCRCIsZero() throws {
         try requireCorpus()
         let variant =
@@ -511,8 +484,6 @@ final class ValidateTests: XCTestCase {
             }, "\(endReport.findings.map(\.message))")
     }
 
-    /// Both state-record kinds reach the ordinary stream decoder through bounded virtual files.
-    /// An unimplemented codec in either one must therefore be a refusal, not skipped bytes.
     func testKeyframeAndDeltaStreamsAreDecoded() throws {
         try requireCorpus()
         let file = corpusDirectory().appendingPathComponent(
@@ -553,8 +524,6 @@ final class ValidateTests: XCTestCase {
             }, "\(deltaReport.findings.map(\.message))")
     }
 
-    /// A long chained GOP is resolved once per entry. This is large enough to make the former
-    /// repeated prefix walk quadratic while remaining a small, deterministic unit test.
     func testKeyframeDeltaChainResolutionIsLinearAfterSorting() {
         let count = 20_000
         let firstOffset: UInt64 = 1_000
