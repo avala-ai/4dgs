@@ -405,6 +405,38 @@ class TestKeyframeDelta:
         assert not report.ok
         assert any("keyframe Chunk record there declares" in f.message for f in report.findings), report.findings
 
+    @pytest.mark.parametrize("write_index", [False, True], ids=("streamed", "indexed"))
+    def test_every_keyframe_mu_t_decodes_to_its_chunk_timestamp(self, write_index):
+        data = _single_keyframe_file(write_index=write_index, codec=0)
+        chunk = _first_record(data, op.CHUNK)
+        head, streams = rec.parse_chunk(chunk.content)
+        cursor = Cursor(bytes(streams))
+        rewritten: list[bytes] = []
+        while cursor.remaining():
+            start = cursor.pos
+            attribute, values = decode_stream(cursor)
+            if attribute == op.A_MU_T:
+                replacement = encode_stream(
+                    attribute,
+                    values + 1,
+                    channels=values.shape[1],
+                    codec=0,
+                )
+                assert len(replacement) == cursor.pos - start
+                rewritten.append(replacement)
+            else:
+                rewritten.append(bytes(cursor.buf[start : cursor.pos]))
+        replacement = rec.encode_chunk(head.t0, head.t1, head.level, head.count, b"".join(rewritten))
+        original_length = 9 + len(chunk.content)
+        assert len(replacement) == original_length
+        malformed = data[: chunk.offset] + replacement + data[chunk.offset + original_length :]
+
+        report = validate(malformed)
+        assert not report.ok
+        assert any(
+            "decodes mu_t=" in f.message and "expected the Chunk timestamp" in f.message for f in report.findings
+        )
+
     def test_a_delta_must_name_the_keyframe_its_chain_reaches(self):
         data = _keyframe_file()
         entry = next(e for e in _index_entries(data) if e.kind == 1)
@@ -437,6 +469,29 @@ class TestKeyframeDelta:
         )
         ids, _bins = kdf._keyframe_from_chunk(content)
         assert len(ids) == head.count
+
+    @pytest.mark.parametrize("write_index", [False, True], ids=("streamed", "indexed"))
+    def test_an_uncompressed_keyframe_block_matches_its_declared_size(self, write_index):
+        data = _single_keyframe_file(write_index=write_index)
+        chunk = _first_record(data, op.CHUNK)
+        head, streams = rec.parse_chunk(chunk.content)
+        content = (
+            put_f64(head.t0)
+            + put_f64(head.t1)
+            + put_u32(head.level)
+            + put_u32(head.count)
+            + put_string("")
+            + put_u64(head.uncompressed_size + 1)
+            + put_blob(bytes(streams))
+        )
+        replacement = put_record(op.CHUNK, content)
+        original_length = 9 + len(chunk.content)
+        assert len(replacement) == original_length
+        malformed = data[: chunk.offset] + replacement + data[chunk.offset + original_length :]
+
+        report = validate(malformed)
+        assert not report.ok
+        assert any("declares uncompressed_size" in f.message for f in report.findings), report.findings
 
     def test_delta_chunk_level_compression_is_honored(self):
         delta = _first_record(_keyframe_file(), op.DELTA_CHUNK)
@@ -744,6 +799,34 @@ class TestTheIndexIsData:
         report = validate(_repack_summary(data, lambda i, e: first if i == 1 else e))
         assert any("both name the chunk at byte" in f.message for f in report.findings), report.findings
 
+    def test_a_gaussian_birth_indexed_range_frames_exactly_one_chunk_record(self):
+        data = _real_file()
+        report = validate(
+            _repack_summary(
+                data,
+                lambda i, entry: _with(entry, chunk_length=entry.chunk_length + 1) if i == 0 else entry,
+            )
+        )
+        assert not report.ok
+        assert any("record there frames exactly" in finding.message for finding in report.findings), report.findings
+
+    @pytest.mark.parametrize("field", ["t0", "t1", "gaussian_count"])
+    def test_gaussian_birth_index_metadata_matches_its_chunk(self, field):
+        data = _real_file()
+
+        def change(i, entry):
+            if i:
+                return entry
+            value = getattr(entry, field)
+            return _with(entry, **{field: value + 1})
+
+        report = validate(_repack_summary(data, change))
+        assert not report.ok
+        assert any(
+            f"declares {field}" in finding.message and "Chunk record there declares" in finding.message
+            for finding in report.findings
+        ), report.findings
+
     def test_a_zero_length_range_at_eof_is_a_finding_not_an_index_error(self):
         data = _keyframe_file()
         report = validate(
@@ -1016,6 +1099,29 @@ class TestWholeFileCompatibilityGates:
         report = validate(malformed)
         assert not report.ok
         assert any("attribute 0 declares 1 channels; the registry says 3" in f.message for f in report.findings)
+
+    def test_a_gaussian_birth_chunk_rejects_gaussian_id(self):
+        data = _real_file(write_index=False)
+        chunk = _first_record(data, op.CHUNK)
+        head, streams = rec.parse_chunk(chunk.content)
+        identities = encode_stream(
+            op.A_GAUSSIAN_ID,
+            np.arange(head.count, dtype=np.int64).reshape(-1, 1),
+            channels=1,
+            codec=0,
+        )
+        replacement = rec.encode_chunk(
+            head.t0,
+            head.t1,
+            head.level,
+            head.count,
+            bytes(streams) + identities,
+        )
+        malformed = data[: chunk.offset] + replacement + data[chunk.offset + 9 + len(chunk.content) :]
+
+        report = validate(malformed)
+        assert not report.ok
+        assert any("gaussian-birth chunk carries gaussian_id" in f.message for f in report.findings)
 
 
 class TestProvenanceRecords:
@@ -1394,7 +1500,7 @@ def _patch_sh_degree(data: bytes, degree: int) -> bytes:
     return data[: record.offset] + after + data[record.offset + len(before) :]
 
 
-def _single_keyframe_file(*, write_index: bool) -> bytes:
+def _single_keyframe_file(*, write_index: bool, codec: int = CODEC_DEFLATE) -> bytes:
     duration = 1.0
     sample = Sample(
         t0=0.0,
@@ -1406,6 +1512,7 @@ def _single_keyframe_file(*, write_index: bool) -> bytes:
         duration,
         kd=KeyframeDeltaOptions(keyframe_every=1),
         write_index=write_index,
+        codec=codec,
     )
 
 

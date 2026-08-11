@@ -278,6 +278,35 @@ def _reanchor_bins(bins: dict[int, np.ndarray], grids: Grids, t0: float) -> dict
     return anchored
 
 
+def _keyframe_mu_bins(t0: float, bins: dict[int, np.ndarray], grids: Grids) -> np.ndarray:
+    """The one `mu_t` bin each keyframe row must use for its own timestamp."""
+    sigma_bins = bins[op.A_SIGMA_T][:, 0]
+    never_fades = bins[op.A_FLAGS][:, 0] != 0
+    step = grids.mu_step(sigma_bins, never_fades)
+    if np.any(~np.isfinite(step)) or np.any(step <= 0):
+        raise MalformedFile("the keyframe mu_t grid has a non-finite or non-positive step")
+    return np.rint(float(t0) / step).astype(np.int64).reshape(-1, 1)
+
+
+def _check_keyframe_mu_t(t0: float, bins: dict[int, np.ndarray], grids: Grids) -> None:
+    """Refuse a keyframe whose decoded temporal origin is not its Chunk timestamp."""
+    if not bins or bins[op.A_MU_T].shape[0] == 0:
+        return
+    actual = bins[op.A_MU_T][:, 0]
+    expected = _keyframe_mu_bins(t0, bins, grids)[:, 0]
+    mismatch = np.flatnonzero(actual != expected)
+    if mismatch.size:
+        row = int(mismatch[0])
+        sigma_bins = bins[op.A_SIGMA_T][:, 0]
+        never_fades = bins[op.A_FLAGS][:, 0] != 0
+        step = grids.mu_step(sigma_bins, never_fades)
+        decoded = float(actual[row]) * float(step[row])
+        raise MalformedFile(
+            f"keyframe Chunk at t0={t0} row {row} decodes mu_t={decoded}; expected the Chunk timestamp {t0}",
+            code="keyframe-mu-t-mismatch",
+        )
+
+
 # --------------------------------------------------------------------------
 # Writing
 # --------------------------------------------------------------------------
@@ -325,6 +354,12 @@ def write_sequence(
     ]
     t0s = [float(s.t0) for s in samples]
     t1s = [*t0s[1:], float(duration_sec)]
+    # A keyframe states every gaussian anew at its own t0 (§11.3). Keep the quantized
+    # reference state and the bytes emitted from it identical, even when a caller's input
+    # GaussianSet retained a temporal origin from an earlier sample.
+    for i, (ids, bins) in enumerate(quantized):
+        if is_keyframe(i, kd) and ids.size:
+            bins[op.A_MU_T] = _keyframe_mu_bins(t0s[i], bins, grids)
 
     distinct_ids: set[int] = set()
     for ids, _ in quantized:
@@ -571,8 +606,18 @@ class DecodedSequence:
 
     @property
     def grids(self) -> Grids:
-        q = self.quantization
-        steps = Steps(
+        return _decoded_grids(self.quantization, self.windows, self.header.cutoff)
+
+
+def _decoded_grids(
+    quantization: rec.Quantization,
+    windows: list[tuple[float, float]],
+    cutoff: float,
+) -> Grids:
+    """Rebuild the shared grids from the records a decoder has already parsed."""
+    q = quantization
+    return Grids(
+        steps=Steps(
             pos=q.step_pos,
             scale_log=q.step_scale_log,
             rot=q.step_rot,
@@ -582,14 +627,12 @@ class DecodedSequence:
             time=q.step_time,
             sigma_log=q.step_sigma_log,
             sh=q.step_sh,
-        )
-        return Grids(
-            steps=steps,
-            bounds=None,
-            origin=np.asarray(q.pos_origin, dtype=np.float64),
-            windows=list(self.windows),
-            cutoff=self.header.cutoff,
-        )
+        ),
+        bounds=None,
+        origin=np.asarray(q.pos_origin, dtype=np.float64),
+        windows=list(windows),
+        cutoff=cutoff,
+    )
 
 
 def _decode_group(stream_bytes) -> tuple[np.ndarray, dict[int, np.ndarray]]:
@@ -621,7 +664,7 @@ def _decode_group(stream_bytes) -> tuple[np.ndarray, dict[int, np.ndarray]]:
     return ids, got
 
 
-def _keyframe_from_chunk(content) -> tuple[np.ndarray, dict[int, np.ndarray]]:
+def _keyframe_from_chunk(content, grids: Grids | None = None) -> tuple[np.ndarray, dict[int, np.ndarray]]:
     head, streams = rec.parse_chunk(content)
     cursor = Cursor(chunk_stream_bytes(head, streams))
     got: dict[int, np.ndarray] = {}
@@ -653,6 +696,8 @@ def _keyframe_from_chunk(content) -> tuple[np.ndarray, dict[int, np.ndarray]]:
     missing = [a for a in _REQUIRED if a not in got]
     if missing and head.count:
         raise MalformedFile(f"keyframe chunk is missing required attributes {missing}")
+    if grids is not None:
+        _check_keyframe_mu_t(head.t0, got, grids)
     return ids, got
 
 
@@ -796,7 +841,12 @@ def decode_streamed(data: bytes) -> DecodedSequence:
         elif record.opcode == op.WINDOW_TABLE:
             windows = rec.WindowTable.parse(record.content).windows
         elif record.opcode == op.CHUNK:
-            ids, bins = _keyframe_from_chunk(record.content)
+            if header is None or quant is None:
+                raise MalformedFile("a keyframe Chunk appears before the Header or Quantization record")
+            ids, bins = _keyframe_from_chunk(
+                record.content,
+                _decoded_grids(quant, windows, header.cutoff),
+            )
             state = keyframe_state(ids, bins)
             by_offset[record.offset] = state
             chunks.append(
@@ -865,6 +915,10 @@ class IndexedSequence:
     windows: list[tuple[float, float]]
     index: list[rec.ChunkIndexEntry]
 
+    @property
+    def grids(self) -> Grids:
+        return _decoded_grids(self.quantization, self.windows, self.header.cutoff)
+
 
 def open_indexed(data: bytes) -> IndexedSequence:
     """Read the Footer and the index, and check that the index tiles the timeline."""
@@ -924,7 +978,7 @@ def decode_indexed(data: bytes) -> tuple[DecodedSequence, list[rec.ChunkIndexEnt
     # Compose each entry by walking its chain, so both read paths are exercised.
     chunks: list[ChunkInfo] = []
     for entry in index:
-        state = compose_chain(data, index, entry, opened.windows)
+        state = compose_chain(data, index, entry, opened.windows, opened.grids)
         update_count = birth_count = death_count = None
         if entry.kind:
             # The counts are not in the index — there `gaussian_count` is their sum — so a
@@ -1042,6 +1096,7 @@ def compose_chain(
     index: list[rec.ChunkIndexEntry],
     entry: rec.ChunkIndexEntry,
     windows: list[tuple[float, float]] | None = None,
+    grids: Grids | None = None,
 ) -> State:
     """Compose the chain ending at `entry`, and check the state it produces.
 
@@ -1051,6 +1106,9 @@ def compose_chain(
     `decode_indexed`; a caller that wants the verdict calls this per entry and drops what
     it returns.
     """
+    if grids is None:
+        grids = open_indexed(data).grids
+
     for indexed in index:
         if not indexed.extended:
             raise MalformedFile(
@@ -1108,6 +1166,7 @@ def compose_chain(
                     f"{link.gaussian_count}; the keyframe chunk there carries {state.count}",
                     code="index-record-mismatch",
                 )
+            _check_keyframe_mu_t(head.t0, bins, grids)
         else:
             if state is None:
                 raise MalformedFile("a chain begins with a delta chunk", code="chain-without-keyframe")
@@ -1289,6 +1348,7 @@ def scan_indexed(
     windows: list[tuple[float, float]],
     on_entry: Callable[[int, rec.ChunkIndexEntry], None] | None = None,
     on_band: Callable[[int, int], None] | None = None,
+    grids: Grids | None = None,
 ):
     """Compose an indexed timeline once, retaining only current and GOP-keyframe state.
 
@@ -1297,6 +1357,19 @@ def scan_indexed(
     chained prefix.  Timeline order lets the validator prove the same references in one
     front-to-back pass.
     """
+    if grids is None:
+        header = quantization = None
+        for record in iter_records(data, len(MAGIC)):
+            if record.opcode == op.HEADER:
+                header = rec.Header.parse(record.content)
+            elif record.opcode == op.QUANTIZATION:
+                quantization = rec.Quantization.parse(record.content)
+            elif record.opcode in (op.CHUNK, op.DELTA_CHUNK):
+                break
+        if header is None or quantization is None:
+            raise MalformedFile("keyframe-delta file has no Header or Quantization record")
+        grids = _decoded_grids(quantization, windows, header.cutoff)
+
     for entry in index:
         if not entry.extended:
             raise MalformedFile(
@@ -1343,6 +1416,7 @@ def scan_indexed(
                     f"{entry.gaussian_count}; the keyframe chunk there carries {state.count}",
                     code="index-record-mismatch",
                 )
+            _check_keyframe_mu_t(head.t0, bins, grids)
             if entry.extended and (
                 entry.keyframe_offset != entry.chunk_offset
                 or entry.depth != 0
@@ -1465,6 +1539,9 @@ def scan_streamed(
     band_owner: int | None = None
     band_rows = 0
     bands: list[int] = []
+    quantization: rec.Quantization | None = None
+    windows: list[tuple[float, float]] = []
+    cutoff = 0.05
 
     def finish_bands() -> None:
         nonlocal band_owner, band_rows, bands
@@ -1485,14 +1562,28 @@ def scan_streamed(
     for record in iter_records(data, len(MAGIC)):
         if record.opcode != op.SH_BAND_STREAM:
             finish_bands()
-        if record.opcode == op.HEADER and sh_degree is None:
-            declared_degree = rec.Header.parse(record.content).sh_degree
+        if record.opcode == op.HEADER:
+            parsed_header = rec.Header.parse(record.content)
+            cutoff = parsed_header.cutoff
+            if sh_degree is None:
+                declared_degree = parsed_header.sh_degree
+            continue
+        if record.opcode == op.QUANTIZATION:
+            quantization = rec.Quantization.parse(record.content)
+            continue
+        if record.opcode == op.WINDOW_TABLE:
+            windows = rec.WindowTable.parse(record.content).windows
             continue
         if record.opcode == op.CHUNK:
             if on_record is not None:
                 on_record(record.offset, record.opcode)
+            if quantization is None:
+                raise MalformedFile("a keyframe Chunk appears before the Quantization record")
             head = rec.parse_chunk(record.content)[0]
-            ids, bins = _keyframe_from_chunk(record.content)
+            ids, bins = _keyframe_from_chunk(
+                record.content,
+                _decoded_grids(quantization, windows, cutoff),
+            )
             state = keyframe_state(ids, bins)
             keyframe_at, keyframe_state_ = record.offset, state
             keyframe_level = int(head.level)

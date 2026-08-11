@@ -678,6 +678,7 @@ def _check_keyframe_delta(data: bytes, walk: Walk, report: Report, header: rec.H
                 opened.windows,
                 visiting,
                 visiting_band,
+                opened.grids,
             ):
                 state_ready()
                 identity_audit.observe(_entry.chunk_offset, state)

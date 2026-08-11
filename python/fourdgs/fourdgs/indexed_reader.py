@@ -344,7 +344,27 @@ def open_indexed(source: Readable) -> IndexedScene:
 def read_chunk(source: Readable, scene: IndexedScene, entry: rec.ChunkIndexEntry, *, max_sh_band: int = 0) -> dict:
     """Fetch and decode one chunk, plus only the SH bands asked for."""
     blob = _read_range(source, entry.chunk_offset, entry.chunk_length, "a chunk index entry")
-    head, streams = rec.parse_chunk(Cursor(blob, 9).take(len(blob) - 9))
+    framed = Cursor(blob)
+    opcode = framed.u8()
+    content_length = framed.u64()
+    if opcode != op.CHUNK or content_length + 9 != len(blob):
+        raise MalformedFile(
+            f"the chunk index entry at {entry.chunk_offset} declares {entry.chunk_length} "
+            f"bytes; the record there frames exactly {content_length + 9}",
+            code="index-record-mismatch",
+        )
+    head, streams = rec.parse_chunk(framed.take(content_length))
+    for field_name, indexed, actual in (
+        ("t0", entry.t0, head.t0),
+        ("t1", entry.t1, head.t1),
+        ("gaussian_count", entry.gaussian_count, head.count),
+    ):
+        if indexed != actual:
+            raise MalformedFile(
+                f"the chunk index entry at {entry.chunk_offset} declares {field_name} "
+                f"{indexed}; the Chunk record there declares {actual}",
+                code="index-record-mismatch",
+            )
     decoded = decode_streams(
         chunk_stream_bytes(head, streams),
         head.count,

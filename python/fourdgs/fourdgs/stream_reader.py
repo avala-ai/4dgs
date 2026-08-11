@@ -159,6 +159,13 @@ def decode_streams(
         if values is not None:
             got[attribute_id] = values
 
+    if op.A_GAUSSIAN_ID in seen:
+        raise MalformedFile(
+            "a gaussian-birth chunk carries gaussian_id; that attribute exists only "
+            "under the keyframe-delta temporal model",
+            code="unexpected-gaussian-id",
+        )
+
     missing = [a for a in op.REQUIRED_ATTRIBUTES if a not in got]
     if missing and count:
         raise MalformedFile(f"chunk is missing required attributes {missing}")
@@ -327,6 +334,12 @@ def chunk_stream_bytes(head: rec.ChunkHeader, streams) -> bytes:
     they were attribute streams, which produces wrong gaussians instead of an error.
     """
     if head.compression == "":
+        if len(streams) != head.uncompressed_size:
+            raise MalformedFile(
+                f"chunk at t0={head.t0} declares uncompressed_size "
+                f"{head.uncompressed_size}; its records block contains {len(streams)} bytes",
+                code="decompressed-size-mismatch",
+            )
         return streams
     codec = {"deflate": CODEC_DEFLATE, "zstd": CODEC_ZSTD}.get(head.compression)
     if codec is None:
