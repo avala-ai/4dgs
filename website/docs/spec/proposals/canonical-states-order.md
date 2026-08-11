@@ -209,6 +209,15 @@ remain semantically equal, while two different 400-digit totals do not both coll
 This is part of (2b), not optional harness hygiene: writing an exact token and then comparing a
 narrowed value would leave the conformance claim untested.
 
+Mismatch diagnostics remain part of that contract. `encode_roundtrip.py` MUST NOT pass the parsed
+objects directly to `json.dumps`, whose standard encoder rejects `Decimal`. Its shared diagnostic
+renderer recursively replaces each `Decimal` with its exact decimal spelling before producing the
+human-readable diff (quoting that spelling is harmless in a diagnostic). A focused harness test
+feeds two unequal Decimal-bearing summaries through the real mismatch path and requires a field diff
+rather than `TypeError`. Retaining the original JSON text is not sufficient here because the gate
+removes layout-dependent fields before comparison; the diagnostic must render the normalized objects
+it actually compared.
+
 - Cost: one rounding and integer conversion per addend. Each port must use the same already-shared
   canonical rounding rule and an arbitrary-precision integer representation for both the scaled
   addend and every partial sum. A declared population is not an overflow proof: one finite decoded
@@ -272,6 +281,11 @@ targeting the branch below. Merge and rebase them bottom-up. The affected ports 
 `cpp/conformance/canonical.cpp` and `swift/conformance/Support/Summary.swift`. This is an unusually
 good moment to make the change, and it will not stay true — the first adversarial scene makes the
 same fix regenerate its new expectation.
+
+There is no initial (1a)/(2a) release in this rollout. The bottom conformance layer lands (1a),
+(2b), the lossless comparator and every discriminating variant in §6 together; only then do the
+language layers claim the guarantee. A weaker (2a) experiment may exist on a development branch, but
+it is not a mergeable layer and does not update the feature matrix.
 
 ---
 
@@ -410,9 +424,9 @@ encodings.
   claimed. The pair shares the resulting integer-unit expectations, so neither stable resident order
   nor the explicitly rejected raw-float sort can pass at either summary level. This is the first
   pair that actually reaches (2a)'s residual and therefore the trigger for implementing (2b);
-  `ObjectTiedGaussians` cannot serve that role because its emitted centres differ. It belongs in the
-  follow-up stack that adopts (2b), not in the initial (1a)/(2a) stack whose limitation it is
-  designed to expose.
+  `ObjectTiedGaussians` cannot serve that role because its emitted centres differ. It therefore
+  lands in the bottom conformance layer of the same recommended (1a)/(2b) stack, before any language
+  layer can claim order-independent aggregates.
 
 - **`ObjectResidualTieOpacity` and `ObjectResidualTieOpacityReordered`** — the opacity counterpart
   to the preceding pair. The rows tie on the six-decimal opacity component of the primary key and on
@@ -426,7 +440,7 @@ encodings.
   pair shares those integer-unit expectations for root `aggregate.opacitySum` and every qualifying
   `states[*].aggregate.opacitySum`. `ObjectOpacityOrder` proves that (2a) must use content order,
   but cannot catch a port that applies (2b)'s exact-unit rule to centres alone; this pair makes both
-  aggregates and both summary levels part of the deferred (2b) contract.
+  aggregates and both summary levels part of the immediate (2b) contract in that same bottom layer.
 
 - **`ObjectExactAggregateBeyondBinary64`** — finite, individually canonical centre addends whose
   exact integer-unit sum has more than 309 decimal digits and differs from a nearby deliberately

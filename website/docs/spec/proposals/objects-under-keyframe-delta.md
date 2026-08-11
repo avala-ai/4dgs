@@ -484,18 +484,24 @@ carries every corner the rules above decide.
 `scene_profile` parameters. Its existing `profile` parameter selects quantization bounds
 (`fine`/`default`/`coarse`) and currently also leaks that selector into `Header.profile`; the new
 parameter separates the scene-profile registry value exactly as the `gaussian-birth` writer's
-`WriteOptions.scene_profile` already does. Existing callers default to the empty scene profile; the
-profile-specific case passes `objects`. Sample quantization must carry an optional exact `object_id`
-column (attribute `14`) rather than stopping at attributes `0`–`10`. `_keyframe_streams` then emits
-that column only when the keyframe physically carries it. Delta generation must do more than index
-`reference_bins[14]`: when the either the reference or current complete state omits the column it
-materializes zeros for every row on that side before classifying updates. When a birth first
-introduces the column it extends the survivor zeros with the births' absolute values. Conversely,
-births that omit the column append zeros when the reference already carries it, and a current
-complete state that omits the column after a nonzero reference emits explicit zero updates. Only
-after those rules exist can the writer deliberately produce the omitted-keyframe transition this
-variant requires. That is the honest sequencing note for #134: for #79, step 2 is not "add a
-variant", it is "teach the reference encoder to write the combination, then add a variant".
+`WriteOptions.scene_profile` already does. Compatibility requires an omitted value to be distinct
+from an explicit empty profile: define `scene_profile: str | None = None`, and when it is `None`
+write the existing `profile` value into `Header.profile` exactly as the writer does today. Thus all
+existing keyframe-delta generator calls remain byte-identical and their committed files and
+checksums do not change. New callers pass `scene_profile=""` for an explicitly empty scene profile;
+the profile-specific case passes `scene_profile="objects"`. Removing the legacy fallback later would
+be a separate compatibility change with an explicit corpus regeneration, not part of this rollout.
+Sample quantization must carry an optional exact `object_id` column (attribute `14`) rather than
+stopping at attributes `0`–`10`. `_keyframe_streams` then emits that column only when the keyframe
+physically carries it. Delta generation must do more than index `reference_bins[14]`: when either
+the reference or current complete state omits the column it materializes zeros for every row on that
+side before classifying updates. When a birth first introduces the column it extends the survivor
+zeros with the births' absolute values. Conversely, births that omit the column append zeros when
+the reference already carries it, and a current complete state that omits the column after a nonzero
+reference emits explicit zero updates. Only after those rules exist can the writer deliberately
+produce the omitted-keyframe transition this variant requires. That is the honest sequencing note
+for #134: for #79, step 2 is not "add a variant", it is "teach the reference encoder to write the
+combination, then add a variant".
 
 ---
 
