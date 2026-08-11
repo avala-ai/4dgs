@@ -137,6 +137,8 @@ words:
   # Git and workflow vocabulary
   - reflog
   - oneline
+  - worktree
+  - worktrees
 ignorePaths:
   - "**/node_modules/**"
   - "**/dist/**"
