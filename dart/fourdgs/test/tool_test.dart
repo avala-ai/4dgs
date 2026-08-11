@@ -447,6 +447,88 @@ void main() {
       );
     });
 
+    test(
+      'post-chunk Attachment headers are parsed without their payload',
+      () async {
+        final FourdgsValidation report = await validateFourdgs(
+          FourdgsBytes(
+            _keyframeDelta(afterChunk: _record(opAttachment, Uint8List(3))),
+          ),
+        );
+        expect(report.ok, isFalse);
+        expect(
+          _messages(report, FourdgsSeverity.error),
+          contains(startsWith('the Attachment record at byte')),
+        );
+      },
+    );
+
+    test('the Footer cannot omit framed Chunk Index records', () async {
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(_minimal(extra: _record(opChunkIndex, _entryAt(0)))),
+      );
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(contains('summary_start 0 (no index)')),
+      );
+    });
+
+    test(
+      'every legacy Audio record is parsed and duplicates are rejected',
+      () async {
+        final Uint8List audio = _record(
+          opAudio,
+          (BytesBuilder()
+                ..add(_string('wav'))
+                ..add(_f64(0.0))
+                ..add(_u64(0)))
+              .toBytes(),
+        );
+        final FourdgsValidation report = await validateFourdgs(
+          FourdgsBytes(_keyframeDelta(beforeChunk: audio, afterChunk: audio)),
+        );
+        expect(
+          _messages(report, FourdgsSeverity.error),
+          contains('the file carries more than one legacy Audio record'),
+        );
+      },
+    );
+
+    test(
+      'embedded and reserved opcodes are not legal top-level records',
+      () async {
+        for (final int opcode in const <int>[
+          opAttributeStream,
+          opAttachmentIndex,
+        ]) {
+          final FourdgsValidation report = await validateFourdgs(
+            FourdgsBytes(_minimal(extra: _record(opcode, Uint8List(0)))),
+          );
+          expect(
+            _messages(report, FourdgsSeverity.error),
+            contains(contains('is not legal as a top-level record')),
+          );
+        }
+      },
+    );
+
+    test('gaussian-birth refuses a Delta Chunk record', () async {
+      final Uint8List interval =
+          (BytesBuilder()
+                ..add(_f64(0.0))
+                ..add(_f64(1.0)))
+              .toBytes();
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(_minimal(extra: _record(opDeltaChunk, interval))),
+      );
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(
+          contains('only legal under the keyframe-delta temporal model'),
+        ),
+      );
+    });
+
     test('the SH-depth append is checked against Header degree', () async {
       final FourdgsValidation report = await validateFourdgs(
         FourdgsBytes(_minimal(shDegree: 2, shBitDepths: const <int>[8])),
@@ -574,6 +656,27 @@ void main() {
       final FourdgsValidation report = await validateFourdgs(source);
       expect(report.ok, isTrue);
       expect(source.largestRead, lessThan(data.length));
+    });
+
+    test('an indexless timeline still covers both Header endpoints', () async {
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(
+          _keyframeDelta(
+            writeIndex: false,
+            chunkT0: 0.25,
+            chunkT1: 0.75,
+            headerDuration: 1.0,
+          ),
+        ),
+      );
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(contains('timeline must start at 0')),
+      );
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(contains('Header duration_sec is 1.0')),
+      );
     });
 
     test('a no-index file still validates its framed SH bands', () async {
@@ -783,6 +886,14 @@ void main() {
       expect(inspection.coverage, isNotNull);
       expect(inspection.coverage!.ok, isFalse);
       expect(source.largestRead, lessThanOrEqualTo(fourdgsCrcBlockBytes));
+    });
+
+    test('inspect reads only the fixed prefix of an extended Footer', () async {
+      final Uint8List data = _minimalWithHugeFooterAppend();
+      final _CountingReadable source = _CountingReadable(data);
+      final FourdgsInspection inspection = await inspectFourdgs(source);
+      expect(inspection.coverageError, isNull);
+      expect(source.largestRead, lessThan(fourdgsCrcBlockBytes));
     });
   });
 
@@ -1180,6 +1291,28 @@ Uint8List _minimalWithExtendedFooterCrc() {
       .toBytes();
 }
 
+Uint8List _minimalWithHugeFooterAppend() {
+  final Uint8List prefix =
+      (BytesBuilder()
+            ..add(fourdgsMagic)
+            ..add(_record(opHeader, _headerContent()))
+            ..add(_record(opQuantization, _quantizationContent()))
+            ..add(_record(opWindowTable, _windowTableContent())))
+          .toBytes();
+  final Uint8List footer =
+      (BytesBuilder()
+            ..add(_u64(0))
+            ..add(_u64(0))
+            ..add(_u32(0))
+            ..add(Uint8List(fourdgsCrcBlockBytes + 4096)))
+          .toBytes();
+  return (BytesBuilder()
+        ..add(prefix)
+        ..add(_record(opFooter, footer))
+        ..add(fourdgsMagic))
+      .toBytes();
+}
+
 /// One indexed gaussian-birth chunk followed by an omitted, malformed chunk.
 /// The omitted chunk has zero declared gaussians so the Header and index totals
 /// still agree; only a pass over every framed Chunk can find its broken body.
@@ -1563,26 +1696,32 @@ Uint8List _keyframeDelta({
   bool writeIndex = true,
   int? indexBandOffset,
   int? indexChunkOffset,
+  Uint8List? beforeChunk,
   Uint8List? afterChunk,
   bool extraUnindexedKeyframe = false,
   int headerGaussianCount = 1,
   int positionChannels = 3,
+  double headerDuration = 1.0,
+  double chunkT0 = 0.0,
+  double chunkT1 = 1.0,
 }) {
-  final Uint8List head =
-      (BytesBuilder()
-            ..add(fourdgsMagic)
-            ..add(
-              _record(
-                opHeader,
-                _headerContent(
-                  temporalModel: 'keyframe-delta',
-                  gaussianCount: headerGaussianCount,
-                ),
-              ),
-            )
-            ..add(_record(opQuantization, _quantizationContent()))
-            ..add(_record(opWindowTable, _windowTableContent())))
-          .toBytes();
+  final BytesBuilder headBuilder =
+      BytesBuilder()
+        ..add(fourdgsMagic)
+        ..add(
+          _record(
+            opHeader,
+            _headerContent(
+              temporalModel: 'keyframe-delta',
+              durationSec: headerDuration,
+              gaussianCount: headerGaussianCount,
+            ),
+          ),
+        )
+        ..add(_record(opQuantization, _quantizationContent()))
+        ..add(_record(opWindowTable, _windowTableContent()));
+  if (beforeChunk != null) headBuilder.add(beforeChunk);
+  final Uint8List head = headBuilder.toBytes();
 
   final Uint8List streams = _keyframeStreams(
     windowIndex: windowIndex,
@@ -1590,8 +1729,8 @@ Uint8List _keyframeDelta({
   );
   final BytesBuilder chunk =
       BytesBuilder()
-        ..add(_f64(0.0)) // t0
-        ..add(_f64(1.0)) // t1
+        ..add(_f64(chunkT0))
+        ..add(_f64(chunkT1))
         ..add(_u32(0)) // level
         ..add(_u32(1)) // count
         ..add(_string('')) // compression
@@ -1630,8 +1769,8 @@ Uint8List _keyframeDelta({
       chunkOffset + chunkRecord.length + betweenRecords.length;
   final BytesBuilder entry =
       BytesBuilder()
-        ..add(_f64(0.0))
-        ..add(_f64(1.0))
+        ..add(_f64(chunkT0))
+        ..add(_f64(chunkT1))
         ..add(_u64(indexChunkOffset ?? chunkOffset))
         ..add(_u64(chunkRecord.length))
         ..add(_u32(1)) // gaussian_count

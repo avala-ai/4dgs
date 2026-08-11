@@ -170,6 +170,8 @@ const Set<String> _knownTemporalModels = <String>{
 };
 
 /// Opcode `0x02`. The tail pointer that makes the file seekable.
+const int footerFixedBytes = 20;
+
 class FourdgsFooter {
   const FourdgsFooter({
     required this.summaryStart,

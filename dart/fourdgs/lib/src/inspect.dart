@@ -100,7 +100,10 @@ Future<FourdgsSummaryCoverage?> _coverage(
   final FourdgsFrame? frame = walk.first(opFooter);
   if (frame == null || frame.offset + frame.total > walk.size) return null;
   final FourdgsFooter footer = FourdgsFooter.parse(
-    await source.read(frame.offset + recordHeaderBytes, frame.length),
+    await source.read(
+      frame.offset + recordHeaderBytes,
+      frame.length < footerFixedBytes ? frame.length : footerFixedBytes,
+    ),
   );
   if (footer.summaryCrc == 0 ||
       footer.summaryStart == 0 ||

@@ -34,6 +34,7 @@
 ///   implements.
 library;
 
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'chunk_decoder.dart';
@@ -128,6 +129,8 @@ class _Report {
 String _say(Object error) =>
     error is FourdgsException ? error.message : error.toString();
 
+typedef _StateInterval = ({double t0, double t1, int offset});
+
 /// Every check, in the Python validator's order.
 ///
 /// Nothing here holds the file. The Python, Rust, TypeScript and C++ validators
@@ -169,6 +172,8 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
   int chunkCount = 0;
   int counted = 0;
   final List<FourdgsChunkIndexEntry> index = <FourdgsChunkIndexEntry>[];
+  final List<int> indexFrameOffsets = <int>[];
+  final List<_StateInterval> framedStateIntervals = <_StateInterval>[];
   // Where each entry's own Chunk Index record sits, so a finding about entry `i`
   // names the byte the reader would name for the same fault.
   final List<int> indexRecordOffsets = <int>[];
@@ -176,6 +181,7 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
       <int, FourdgsAudioSourceRecord>{};
   final Map<int, int> audioData = <int, int>{};
   bool firstChunkSeen = false;
+  bool legacyAudioSeen = false;
   // A front-matter refusal makes the reader passes below pointless: the reader
   // would refuse the same record for the same reason at the same byte, and a
   // report that says it twice is a report a reader has to read twice.
@@ -197,6 +203,13 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
       }
       if (firstOpcode < 0) firstOpcode = frame.opcode;
       seen.add(frame.opcode);
+      if (isSpecifiedOpcode(frame.opcode) &&
+          !isLegalTopLevelOpcode(frame.opcode)) {
+        report.error(
+          '${opcodeName(frame.opcode)} (0x${frame.opcode.toRadixString(16).padLeft(2, "0")}) '
+          'is not legal as a top-level record',
+        );
+      }
       // A record whose own body will not parse is a finding rather than an
       // abort: the point of a validator is to say everything that is wrong with
       // a file, not the first thing.
@@ -246,22 +259,41 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
         case opDeltaChunk:
           firstChunkSeen = true;
           chunkCount += 1;
-          if (frame.opcode == opChunk) {
-            try {
+          try {
+            if (frame.opcode == opChunk) {
               // The first twenty-four bytes, not the record: a chunk is where a
               // file keeps its weight, and all this pass wants from one is the
               // count it declares. What is *in* it is checked by decoding it,
               // one chunk at a time, further down.
-              counted +=
-                  parseChunkInterval(
-                    await _bytesOf(source, frame, most: chunkFixedHeadBytes),
-                    fileOffset: frame.offset + recordHeaderBytes,
-                  ).count;
-            } on FourdgsException catch (error) {
-              report.error('chunk $chunkCount does not parse: ${_say(error)}');
+              final parsed = parseChunkInterval(
+                await _bytesOf(source, frame, most: chunkFixedHeadBytes),
+                fileOffset: frame.offset + recordHeaderBytes,
+              );
+              counted += parsed.count;
+              framedStateIntervals.add((
+                t0: parsed.t0,
+                t1: parsed.t1,
+                offset: frame.offset,
+              ));
+            } else {
+              final FourdgsCursor cursor = FourdgsCursor(
+                await _bytesOf(source, frame, most: 16),
+              );
+              final double t0 = cursor.f64();
+              final double t1 = cursor.f64();
+              refuseUnusableInterval(
+                t0,
+                t1,
+                frame.offset + recordHeaderBytes,
+                'Delta Chunk',
+              );
+              framedStateIntervals.add((t0: t0, t1: t1, offset: frame.offset));
             }
+          } on FourdgsException catch (error) {
+            report.error('chunk $chunkCount does not parse: ${_say(error)}');
           }
         case opChunkIndex:
+          indexFrameOffsets.add(frame.offset);
           try {
             index.add(
               FourdgsChunkIndexEntry.parse(
@@ -275,10 +307,27 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
           }
         case opFooter:
           try {
-            footer = FourdgsFooter.parse(await _bytesOf(source, frame));
+            footer = FourdgsFooter.parse(
+              await _bytesOf(source, frame, most: footerFixedBytes),
+            );
             footerOffset = frame.offset;
           } on FourdgsException catch (error) {
             report.error('Footer does not parse: ${_say(error)}');
+          }
+        case opAudio:
+          try {
+            _legacyAudioHead(
+              await _bytesOf(source, frame, most: legacyAudioPrefixBytes),
+              frame,
+            );
+            if (legacyAudioSeen) {
+              report.error(
+                'the file carries more than one legacy Audio record',
+              );
+            }
+            legacyAudioSeen = true;
+          } on FourdgsException catch (error) {
+            report.error('legacy Audio does not parse: ${_say(error)}');
           }
         case opAudioSource:
           try {
@@ -320,6 +369,15 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
             audioData[parsed.sourceId] = parsed.length;
           } on FourdgsException catch (error) {
             report.error('Audio Data does not parse: ${_say(error)}');
+          }
+        case opAttachment:
+          try {
+            await _checkAttachmentHead(source, frame);
+          } on FourdgsException catch (error) {
+            report.error(
+              'the Attachment record at byte ${frame.offset} does not parse: '
+              '${_say(error)}',
+            );
           }
         default:
           _noteUnread(report, frame);
@@ -363,6 +421,16 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
   // than guessed from the records, because a file that carries Delta Chunks and
   // does not say so is itself a fault.
   final bool keyframeDelta = header?.temporalModel == 'keyframe-delta';
+
+  if (header != null && !keyframeDelta && seen.contains(opDeltaChunk)) {
+    report.error(
+      'a Delta Chunk is only legal under the keyframe-delta temporal model; '
+      'the Header declares ${header.temporalModel}',
+    );
+  }
+  if (header != null && keyframeDelta) {
+    _checkFramedTiling(framedStateIntervals, header.durationSec, report);
+  }
 
   if (header != null) {
     if (quantization != null) {
@@ -481,7 +549,30 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
     }
   }
 
-  if (header != null && index.isEmpty) {
+  if (footer != null && footerOffset >= 0) {
+    if (footer.summaryStart == 0 && indexFrameOffsets.isNotEmpty) {
+      report.error(
+        'the Footer declares summary_start 0 (no index), but the framing walk '
+        'found ${indexFrameOffsets.length} Chunk Index record(s)',
+      );
+    } else if (footer.summaryStart != 0) {
+      final List<int> orphaned = <int>[
+        for (final int offset in indexFrameOffsets)
+          if (offset < footer.summaryStart || offset >= footerOffset) offset,
+      ];
+      if (indexFrameOffsets.isEmpty ||
+          indexFrameOffsets.first != footer.summaryStart ||
+          orphaned.isNotEmpty) {
+        report.error(
+          'the Footer declares the Chunk Index at ${footer.summaryStart}, but '
+          'the complete framing walk found Chunk Index records at '
+          '${indexFrameOffsets.isEmpty ? "no offsets" : indexFrameOffsets.join(", ")}',
+        );
+      }
+    }
+  }
+
+  if (header != null && footer?.summaryStart == 0) {
     report.warn(
       'no chunk index: this file can only be read front to back, not seeked',
     );
@@ -522,6 +613,12 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
       // A file that will not open will not decode either, and the second error
       // would say the same thing about the same byte.
       return FourdgsValidation(report.findings);
+    }
+    if (scene.index.length != index.length) {
+      report.error(
+        'the complete framing walk found ${index.length} parsed Chunk Index '
+        'records, but the Footer-addressed summary exposes ${scene.index.length}',
+      );
     }
     // The record families the framing walk steps over and a public decoder
     // refuses: a truncated ObjectTrack or a malformed CoordinateFrame is a file
@@ -715,6 +812,165 @@ void _noteUnread(_Report report, FourdgsFrame frame) {
   } else {
     report.note('unknown record $hex — skipped, as required');
   }
+}
+
+void _checkFramedTiling(
+  List<_StateInterval> intervals,
+  double durationSec,
+  _Report report,
+) {
+  if (intervals.isEmpty) {
+    report.error('a keyframe-delta file contains no state chunks');
+    return;
+  }
+  intervals.sort((_StateInterval a, _StateInterval b) => a.t0.compareTo(b.t0));
+  final _StateInterval first = intervals.first;
+  if (first.t0 != 0.0) {
+    report.error(
+      'the state chunks start at ${first.t0} in the record at byte '
+      '${first.offset}; the timeline must start at 0',
+    );
+  }
+  for (int i = 1; i < intervals.length; i++) {
+    final _StateInterval previous = intervals[i - 1];
+    final _StateInterval current = intervals[i];
+    if (previous.t1 != current.t0) {
+      final String what = current.t0 < previous.t1 ? 'overlap' : 'leave a gap';
+      report.error(
+        'state chunks $what: [${previous.t0}, ${previous.t1}) at byte '
+        '${previous.offset} is followed by [${current.t0}, ${current.t1}) at '
+        'byte ${current.offset}',
+      );
+    }
+  }
+  final _StateInterval last = intervals.last;
+  if (last.t1 != durationSec) {
+    report.error(
+      'the state chunks end at ${last.t1} in the record at byte ${last.offset}; '
+      'the Header duration_sec is $durationSec',
+    );
+  }
+}
+
+/// Enough of a legacy Audio record to contain its variable descriptor but not
+/// its payload. This is the same fixed prefix the indexed opener uses.
+const int legacyAudioPrefixBytes = 512;
+
+void _legacyAudioHead(Uint8List prefix, FourdgsFrame frame) {
+  final FourdgsCursor cursor = FourdgsCursor(prefix);
+  cursor.string();
+  cursor.f64();
+  final int dataLength = cursor.u64();
+  if (dataLength > frame.length - cursor.pos) {
+    throw FourdgsTruncatedFile(
+      'the legacy Audio record declares $dataLength data bytes, but its '
+      'content is only ${frame.length} bytes',
+    );
+  }
+}
+
+/// Validate an Attachment's two strings and payload length without fetching
+/// the payload. The two strings are streamed through the UTF-8 decoder, so a
+/// large but bounded name does not become a second whole-record allocation.
+Future<void> _checkAttachmentHead(
+  FourdgsReadable source,
+  FourdgsFrame frame,
+) async {
+  int at = 0;
+  at = await _attachmentString(source, frame, at, 'name');
+  at = await _attachmentString(source, frame, at, 'media type');
+  if (at + 8 > maxFrontMatterBytes) {
+    throw FourdgsMalformedFile(
+      'the Attachment header reaches ${fourdgsCommas(at + 8)} bytes, past the '
+      '${fourdgsCommas(maxFrontMatterBytes)}-byte front-matter ceiling',
+    );
+  }
+  if (at + 8 > frame.length) {
+    throw FourdgsTruncatedFile(
+      'the Attachment payload length needs 8 bytes at content offset $at, '
+      '${frame.length - at} remain',
+    );
+  }
+  final int dataLength =
+      FourdgsCursor(
+        await source.read(frame.offset + recordHeaderBytes + at, 8),
+      ).u64();
+  at += 8;
+  if (dataLength > frame.length - at) {
+    throw FourdgsTruncatedFile(
+      'the Attachment declares $dataLength payload bytes at content offset '
+      '$at, ${frame.length - at} remain',
+    );
+  }
+}
+
+Future<int> _attachmentString(
+  FourdgsReadable source,
+  FourdgsFrame frame,
+  int at,
+  String field,
+) async {
+  if (at + 4 > frame.length) {
+    throw FourdgsTruncatedFile(
+      'the Attachment $field length needs 4 bytes at content offset $at, '
+      '${frame.length - at} remain',
+    );
+  }
+  final Uint8List lengthBytes = await source.read(
+    frame.offset + recordHeaderBytes + at,
+    4,
+  );
+  final int length = ByteData.sublistView(
+    lengthBytes,
+  ).getUint32(0, Endian.little);
+  final int bytesAt = at + 4;
+  if (length > frame.length - bytesAt) {
+    throw FourdgsTruncatedFile(
+      'the Attachment $field declares $length bytes at content offset '
+      '$bytesAt, ${frame.length - bytesAt} remain',
+    );
+  }
+  if (bytesAt + length > maxFrontMatterBytes) {
+    throw FourdgsMalformedFile(
+      'the Attachment header reaches ${fourdgsCommas(bytesAt + length)} bytes, '
+      'past the ${fourdgsCommas(maxFrontMatterBytes)}-byte front-matter ceiling',
+    );
+  }
+  final ByteConversionSink decoder = const Utf8Decoder().startChunkedConversion(
+    const _DiscardStrings(),
+  );
+  int consumed = 0;
+  try {
+    while (consumed < length) {
+      final int remaining = length - consumed;
+      final int take =
+          remaining < fourdgsCrcBlockBytes ? remaining : fourdgsCrcBlockBytes;
+      decoder.add(
+        await source.read(
+          frame.offset + recordHeaderBytes + bytesAt + consumed,
+          take,
+        ),
+      );
+      consumed += take;
+    }
+    decoder.close();
+  } on FormatException catch (error) {
+    throw FourdgsMalformedFile(
+      'the Attachment $field at content offset $bytesAt is not valid UTF-8: '
+      '${error.message}',
+    );
+  }
+  return bytesAt + length;
+}
+
+class _DiscardStrings implements Sink<String> {
+  const _DiscardStrings();
+
+  @override
+  void add(String data) {}
+
+  @override
+  void close() {}
 }
 
 /// How much of an Audio Data record's content [_audioDataHead] needs: the `u32`
@@ -955,7 +1211,7 @@ Future<void> _checkKeyframeDelta(
   final List<FourdgsChunkIndexEntry> index = scene.index;
   if (index.isNotEmpty) {
     try {
-      checkTiling(index);
+      checkTiling(index, durationSec: scene.header.durationSec);
     } on FourdgsException catch (error) {
       report.error('the state chunks do not tile the timeline: ${_say(error)}');
       return;
@@ -984,12 +1240,13 @@ Future<void> _checkKeyframeDelta(
   final Map<int, int> bandPopulationAt = <int, int>{};
   final Map<int, List<FourdgsBandRange>> framedBandsAt =
       <int, List<FourdgsBandRange>>{};
-  // The Header is the file's declared upper bound on identities. Keeping one
-  // entry per identity is therefore bounded by a value parsed and validated
-  // before any chunk is decoded; refuse before growing past it. The same set
-  // proves both the scene-wide distinct count and the no-reuse-after-death
-  // rule, without accumulating a second whole-file set.
-  final Set<int> seenIds = <int>{};
+  // A Header count is an untrusted u64, not an allocation bound. The fixed
+  // filter makes definitely-new identities constant-space; a hash collision is
+  // resolved by replaying the earlier state records with the same two-state
+  // working set as this pass. That can cost time on an adversarial file, but it
+  // never retains every historical identity.
+  final _IdentityFilter identityFilter = _IdentityFilter();
+  int distinctIds = 0;
   KeyframeDeltaState? keyframeState;
   KeyframeDeltaState? previousState;
   int keyframeOffset = -1;
@@ -1052,26 +1309,17 @@ Future<void> _checkKeyframeDelta(
       if (frame.opcode == opChunk) {
         final FourdgsChunkBody body = parseChunk(content);
         state = keyframeDeltaStateFromChunk(content, chunkOffset: frame.offset);
-        final Set<int> liveBefore = <int>{
-          if (previousState != null) ...previousState.ids,
-        };
-        for (final int id in state.ids) {
-          if (liveBefore.contains(id)) continue;
-          if (seenIds.contains(id)) {
-            throw FourdgsMalformedFile(
-              'the keyframe at byte ${frame.offset} reuses retired gaussian id '
-              '$id; an id is never reused after a death',
-            );
-          }
-          if (seenIds.length >= scene.header.gaussianCount) {
-            throw FourdgsMalformedFile(
-              'Header declares ${scene.header.gaussianCount} distinct gaussian '
-              'ids, but the keyframe at byte ${frame.offset} introduces id $id '
-              'after that many identities were already seen',
-            );
-          }
-          seenIds.add(id);
-        }
+        distinctIds = await _recordIdentityIntroductions(
+          source,
+          walk,
+          state,
+          previousState,
+          frame.offset,
+          identityFilter,
+          distinctIds,
+          scene.header.gaussianCount,
+          'the keyframe',
+        );
         keyframeState = state;
         keyframeOffset = frame.offset;
         keyframeLevel = body.header.level;
@@ -1137,24 +1385,17 @@ Future<void> _checkKeyframeDelta(
           body,
           chunkOffset: frame.offset,
         );
-        final Set<int> before = <int>{for (final int id in reference.ids) id};
-        final Set<int> after = <int>{for (final int id in state.ids) id};
-        for (final int id in after.difference(before)) {
-          if (seenIds.contains(id)) {
-            throw FourdgsMalformedFile(
-              'the delta chunk at byte ${frame.offset} births retired gaussian '
-              'id $id; an id is never reused after a death',
-            );
-          }
-          if (seenIds.length >= scene.header.gaussianCount) {
-            throw FourdgsMalformedFile(
-              'Header declares ${scene.header.gaussianCount} distinct gaussian '
-              'ids, but the delta chunk at byte ${frame.offset} births id $id '
-              'after that many identities were already seen',
-            );
-          }
-          seenIds.add(id);
-        }
+        distinctIds = await _recordIdentityIntroductions(
+          source,
+          walk,
+          state,
+          previousState,
+          frame.offset,
+          identityFilter,
+          distinctIds,
+          scene.header.gaussianCount,
+          'the delta chunk',
+        );
         previousDepth = head.depth;
         previousLevel = head.level;
         bandPopulation = head.birthCount;
@@ -1247,11 +1488,130 @@ Future<void> _checkKeyframeDelta(
       return;
     }
   }
-  if (seenIds.length != scene.header.gaussianCount) {
+  if (distinctIds != scene.header.gaussianCount) {
     report.error(
       'Header declares ${scene.header.gaussianCount} distinct gaussian ids; '
-      'keyframes and births contain ${seenIds.length}',
+      'keyframes and births contain $distinctIds',
     );
+  }
+}
+
+Future<int> _recordIdentityIntroductions(
+  FourdgsReadable source,
+  FourdgsWalk walk,
+  KeyframeDeltaState state,
+  KeyframeDeltaState? previous,
+  int offset,
+  _IdentityFilter filter,
+  int distinct,
+  int declared,
+  String what,
+) async {
+  for (final int id in state.ids) {
+    if (_stateContains(previous, id)) continue;
+    if (filter.mightContain(id) &&
+        await _identityAppearedBefore(source, walk, offset, id)) {
+      final String action = what == 'the delta chunk' ? 'births' : 'reuses';
+      throw FourdgsMalformedFile(
+        '$what at byte $offset $action retired gaussian id $id; an id is '
+        'never reused after a death',
+      );
+    }
+    if (distinct >= declared) {
+      throw FourdgsMalformedFile(
+        'Header declares $declared distinct gaussian ids, but $what at byte '
+        '$offset introduces id $id after that many identities were already seen',
+      );
+    }
+    filter.add(id);
+    distinct += 1;
+  }
+  return distinct;
+}
+
+bool _stateContains(KeyframeDeltaState? state, int id) {
+  if (state == null) return false;
+  for (final int candidate in state.ids) {
+    if (candidate == id) return true;
+  }
+  return false;
+}
+
+/// Exact fallback for a fixed-filter collision.
+///
+/// Replays only records before [beforeOffset], retaining the GOP keyframe and
+/// previous temporal state. A collision can therefore cost another bounded
+/// pass, never a scene-wide identity table.
+Future<bool> _identityAppearedBefore(
+  FourdgsReadable source,
+  FourdgsWalk walk,
+  int beforeOffset,
+  int id,
+) async {
+  KeyframeDeltaState? keyframe;
+  KeyframeDeltaState? previous;
+  for (final FourdgsFrame frame in walk.records) {
+    if (frame.offset >= beforeOffset) break;
+    if (frame.opcode != opChunk && frame.opcode != opDeltaChunk) continue;
+    if (frame.offset + frame.total > walk.size) break;
+    final Uint8List content = _content(
+      await source.read(frame.offset, frame.total),
+      frame.opcode,
+    );
+    final KeyframeDeltaState state;
+    if (frame.opcode == opChunk) {
+      state = keyframeDeltaStateFromChunk(content, chunkOffset: frame.offset);
+      keyframe = state;
+    } else {
+      final FourdgsDeltaChunkBody body = parseDeltaChunk(content);
+      final KeyframeDeltaState? reference =
+          body.header.deltaMode == deltaModeKeyframe ? keyframe : previous;
+      if (reference == null) {
+        throw FourdgsMalformedFile(
+          'the delta chunk at byte ${frame.offset} has no earlier state to reference',
+        );
+      }
+      state = applyKeyframeDeltaBody(
+        reference,
+        body,
+        chunkOffset: frame.offset,
+      );
+    }
+    if (_stateContains(state, id) && !_stateContains(previous, id)) {
+      return true;
+    }
+    previous = state;
+  }
+  return false;
+}
+
+/// A fixed one-mebibit identity filter. False positives take the exact replay
+/// above; false negatives are impossible because add and lookup set/test the
+/// same three bits.
+class _IdentityFilter {
+  static const int _byteCount = 1 << 17;
+  static const int _bitMask = _byteCount * 8 - 1;
+
+  final Uint8List _bits = Uint8List(_byteCount);
+
+  bool mightContain(int id) {
+    for (final int bit in _positions(id)) {
+      if ((_bits[bit >> 3] & (1 << (bit & 7))) == 0) return false;
+    }
+    return true;
+  }
+
+  void add(int id) {
+    for (final int bit in _positions(id)) {
+      _bits[bit >> 3] |= 1 << (bit & 7);
+    }
+  }
+
+  Iterable<int> _positions(int id) sync* {
+    final int value = id & 0xFFFFFFFF;
+    yield (value ^ (value >>> 16)) & _bitMask;
+    yield ((value << 7) ^ (value >>> 9) ^ 0x5BD1E995) & _bitMask;
+    yield ((value << 13) ^ (value >>> 11) ^ 0x27D4EB2D) & _bitMask;
   }
 }
 

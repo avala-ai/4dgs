@@ -379,11 +379,15 @@ void _checkGroupsDisjoint(Int32List a, Int32List b, Int32List d) {
 /// rather than gating on the `gaussian-birth` registry the chunk decoder uses:
 /// an update group carries a subset of the required attributes, a death group
 /// carries only the identity, and both must decode.
-({Int32List ids, Map<int, _Column> bins}) _decodeGroup(Uint8List blob, int at) {
+({Int32List ids, Map<int, _Column> bins}) _decodeGroup(
+  Uint8List blob,
+  int at,
+  String what,
+) {
   if (blob.isEmpty) {
     return (ids: Int32List(0), bins: <int, _Column>{});
   }
-  final streams = _decodeStreams(FourdgsCursor(blob), at);
+  final streams = _decodeStreams(FourdgsCursor(blob), at, what);
   final gaussianId = streams.remove(attrGaussianId);
   if (gaussianId == null) {
     throw const FourdgsMalformedFile(
@@ -410,6 +414,7 @@ void _checkGroupsDisjoint(Int32List a, Int32List b, Int32List d) {
   final streams = _decodeStreams(
     FourdgsCursor(body.streams),
     at + recordHeaderBytes + body.streamsOffset,
+    'the keyframe chunk at byte $at',
   );
   final gaussianId = streams.remove(attrGaussianId);
   if (gaussianId == null) {
@@ -439,7 +444,7 @@ void _checkGroupsDisjoint(Int32List a, Int32List b, Int32List d) {
 /// The framing pass proves every declared payload is present before the first
 /// decoded allocation. Per-stream decoded-size limits remain the cross-SDK
 /// contract; this SDK must not add a differently scoped aggregate refusal.
-Map<int, _Column> _decodeStreams(FourdgsCursor cursor, int at) {
+Map<int, _Column> _decodeStreams(FourdgsCursor cursor, int at, String what) {
   final framed =
       <({FourdgsStreamHeader header, Uint8List payload, int offset})>[];
   final seen = <int>{};
@@ -463,9 +468,9 @@ Map<int, _Column> _decodeStreams(FourdgsCursor cursor, int at) {
     final int? expectedChannels = _keyframeDeltaChannels(header.attributeId);
     if (expectedChannels != null && header.channels != expectedChannels) {
       throw FourdgsMalformedFile(
-        'attribute ${header.attributeId} of the keyframe-delta stream at byte '
-        '$offset declares ${header.channels} channels, the registry says '
-        '$expectedChannels',
+        'attribute ${header.attributeId} of $what declares ${header.channels} '
+        'channels, the registry says $expectedChannels; its stream header is '
+        'at byte $offset',
       );
     }
     framed.add((header: header, payload: payload, offset: offset));
@@ -507,6 +512,7 @@ int? _keyframeDeltaChannels(int attributeId) {
       return null;
   }
 }
+
 Int32List _idsOf(_Column gaussianId) {
   final n = gaussianId.rows;
   final out = Int32List(n);
@@ -674,9 +680,13 @@ KeyframeDeltaState _composeDelta(
 }) {
   final content = at + recordHeaderBytes;
   final what = 'the delta chunk at byte $at';
-  final updates = _decodeGroup(body.updates, content + body.updatesOffset);
-  final births = _decodeGroup(body.births, content + body.birthsOffset);
-  final deaths = _decodeGroup(body.deaths, content + body.deathsOffset);
+  final updates = _decodeGroup(
+    body.updates,
+    content + body.updatesOffset,
+    what,
+  );
+  final births = _decodeGroup(body.births, content + body.birthsOffset, what);
+  final deaths = _decodeGroup(body.deaths, content + body.deathsOffset, what);
   void checkCount(String group, int actual, int declared) {
     if (actual != declared) {
       throw FourdgsMalformedFile(
@@ -1040,8 +1050,19 @@ Map<int, FourdgsChunkIndexEntry> keyframeDeltaChainIndex(
 
 /// State chunks tile the timeline: no overlap, no gap (spec §11.1). This is what
 /// makes the seek predicate a lookup rather than a search.
-void checkTiling(List<FourdgsChunkIndexEntry> index) {
+void checkTiling(List<FourdgsChunkIndexEntry> index, {double? durationSec}) {
   final ordered = index.toList()..sort((a, b) => a.t0.compareTo(b.t0));
+  if (ordered.isEmpty) {
+    throw const FourdgsMalformedFile(
+      'a keyframe-delta file contains no indexed state chunks',
+    );
+  }
+  if (ordered.first.t0 != 0.0) {
+    throw FourdgsMalformedFile(
+      'state chunks start at ${ordered.first.t0}; expected the first interval '
+      'to start at 0',
+    );
+  }
   for (int i = 1; i < ordered.length; i++) {
     final previous = ordered[i - 1];
     final entry = ordered[i];
@@ -1052,6 +1073,12 @@ void checkTiling(List<FourdgsChunkIndexEntry> index) {
         '[${entry.t0}, ${entry.t1})',
       );
     }
+  }
+  if (durationSec != null && ordered.last.t1 != durationSec) {
+    throw FourdgsMalformedFile(
+      'state chunks end at ${ordered.last.t1}; the Header duration_sec is '
+      '$durationSec',
+    );
   }
 }
 

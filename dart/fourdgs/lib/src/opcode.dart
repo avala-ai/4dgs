@@ -107,6 +107,17 @@ const Map<int, String> _opcodeNames = <int, String>{
 /// this build does not implement, and both are skipped rather than refused.
 bool isSpecifiedOpcode(int opcode) => _opcodeNames.containsKey(opcode);
 
+/// True when a specified opcode is itself a top-level record.
+///
+/// Attribute Stream is an embedded structure inside a Chunk or delta group,
+/// and Attachment Index remains reserved with an explicit writer prohibition.
+/// Keeping their registry names is useful to inspection output; it does not
+/// make either legal in the outer record sequence.
+bool isLegalTopLevelOpcode(int opcode) =>
+    isSpecifiedOpcode(opcode) &&
+    opcode != opAttributeStream &&
+    opcode != opAttachmentIndex;
+
 // Attribute ids carried by Attribute Stream records.
 const int attrPosition = 0;
 const int attrScale = 1;
