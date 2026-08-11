@@ -1222,7 +1222,11 @@ void main() {
           isA<FourdgsInvalidInput>().having(
             (FourdgsInvalidInput e) => e.message,
             'message',
-            allOf(contains('objects'), contains('Object Table')),
+            allOf(
+              contains('objects'),
+              contains('Object Table'),
+              isNot(contains('object_id')),
+            ),
           ),
         ),
       );

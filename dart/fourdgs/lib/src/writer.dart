@@ -148,17 +148,16 @@ Uint8List writeFourdgsBytes(
   // A profile is a promise about what the file contains, made so a consumer can
   // reject an unsuitable file up front rather than discovering the absence
   // mid-decode. `objects` promises an `object_id` stream in every non-empty
-  // chunk and one Object Table (registry, Profiles), and this writer emits
-  // neither record — it has no code to. Writing the string anyway would put a
-  // promise in the Header that the bytes below it do not keep, and no reader
-  // today enforces it, so the file would circulate as an objects file and fail
-  // whenever something finally checked. Refusing names what is missing;
+  // chunk and one Object Table (registry, Profiles). This writer can emit the
+  // stream when the gaussian set supplies it, but its API has no Object Table
+  // input at all. Writing the string anyway would put a promise in the Header
+  // that the bytes below it do not keep. Refusing names the unsupported record;
   // silently downgrading to "" would throw away what the caller asked for.
   if (options.sceneProfile == 'objects') {
     throw FourdgsInvalidInput(
-      'the scene profile "objects" promises an object_id stream in every '
-      'non-empty chunk and one Object Table, and this writer emits neither; '
-      'write the object layer first or leave the profile empty',
+      'the scene profile "objects" promises one Object Table, but this writer '
+      'has no Object Table input; write the object layer first or leave the '
+      'profile empty',
     );
   }
   if (options.sceneProfile == 'relightable') {
