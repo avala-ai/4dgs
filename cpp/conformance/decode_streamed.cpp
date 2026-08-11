@@ -8,6 +8,11 @@
 /// The whole interface between an implementation and the harness is this: take a path, print
 /// the canonical JSON. Anything wrong exits non-zero with a sentence on stderr, and the
 /// harness reports it like a diff.
+///
+/// A refused file is the exception, and it is not "anything wrong": the invalid corpus is
+/// files this reader is *supposed* to reject, so a refusal whose rule the specification names
+/// prints `{"refused": "<id>"}` and exits 0. Exiting non-zero instead would make "refused for
+/// the right reason" and "fell over in the right place" one outcome.
 
 #include <cstdio>
 #include <memory>
@@ -31,6 +36,18 @@ using fourdgs::Scene;
 int fail(const std::string& message) {
   std::fprintf(stderr, "%s\n", message.c_str());
   return 1;
+}
+
+/// The answer for a file the reader would not decode.
+///
+/// An error carrying an identifier is a refusal the specification names, and it is printed as
+/// the run's result. An error without one — an unreadable path, a file cut short, an internal
+/// mistake — is a failure and stays on stderr: there is no rule for the suite to check, and
+/// dressing it up as a refusal would let a broken runner answer every invalid variant.
+int refusedOrFailed(const Error& error) {
+  if (!error.refusal.has_value()) return fail(error.toString());
+  std::printf("%s\n", fourdgs::conformance::refusalJson(*error.refusal).c_str());
+  return 0;
 }
 
 Result<std::vector<std::uint8_t>> readWhole(const std::string& path) {
@@ -121,11 +138,13 @@ int main(int argc, char** argv) {
   if (!whole) return fail(whole.error().toString());
   Result<std::string> model =
       fourdgs::peekTemporalModel(fourdgs::Span<const std::uint8_t>(whole->data(), whole->size()));
-  if (!model) return fail(model.error().toString());
+  // A file refused this early — bad magic, a major version from the future — never reaches a
+  // Scene, so the refusal is answered here as well as below.
+  if (!model) return refusedOrFailed(model.error());
   if (*model == "keyframe-delta") {
     Result<std::string> json = fourdgs::keyframeDeltaStatesJson(
         fourdgs::Span<const std::uint8_t>(whole->data(), whole->size()), /*indexed=*/false);
-    if (!json) return fail(json.error().toString());
+    if (!json) return refusedOrFailed(json.error());
     std::printf("%s\n", json->c_str());
     return 0;
   }
@@ -135,17 +154,19 @@ int main(int argc, char** argv) {
   std::unique_ptr<fourdgs::FileReadable> source(*file);
 
   Result<std::unique_ptr<Scene>> opened = Scene::open(*source, ReadMode::kSequential);
-  if (!opened) return fail(opened.error().toString());
+  if (!opened) return refusedOrFailed(opened.error());
   Scene& scene = **opened;
   if (scene.isIndexed()) {
     return fail("asked for the sequential path and got the indexed one");
   }
 
+  // Not every rule fires at open: a window index past the end of its table is a record read
+  // during the load, and a refusal the suite would miss if only the open were answered.
   Result<void> loaded = scene.loadAll(3);
-  if (!loaded) return fail(loaded.error().toString());
+  if (!loaded) return refusedOrFailed(loaded.error());
   fourdgs::conformance::SceneRecords records;
   Result<void> collected = fourdgs::conformance::collectRecords(scene, &records);
-  if (!collected) return fail(collected.error().toString());
+  if (!collected) return refusedOrFailed(collected.error());
 
   // After the records, not before: `objectsJson` decodes the whole population and
   // invalidates any view taken earlier. It happens to be a no-op here — the scene is
