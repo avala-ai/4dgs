@@ -333,6 +333,8 @@ void _checkInput(FourdgsGaussianSet g, double cutoff) {
   _checkLength('sigma_t', g.sigmaT.length, n);
   _checkLength('win_lo', g.winLo.length, n);
   _checkLength('win_hi', g.winHi.length, n);
+  final sourceGroup = g.sourceGroup;
+  if (sourceGroup != null) _checkLength('source_group', sourceGroup.length, n);
   final sourceIndex = g.sourceIndex;
   if (sourceIndex != null) _checkLength('source_index', sourceIndex.length, n);
   final objectId = g.objectId;
@@ -445,7 +447,9 @@ void _checkInput(FourdgsGaussianSet g, double cutoff) {
   // back a file neither of its own read paths will reopen — the one output a
   // writer must never produce. `lo == hi` stays legal: the empty window is how
   // a static asset's index spells "no extent", and the NoData fixture is
-  // exactly that.
+  // exactly that. Equal *infinite* endpoints are refused below: their
+  // subtraction is NaN, and the other version-1 SDKs do not yet share Dart's
+  // normalization of that empty span when deriving a motion grid.
   for (int i = 0; i < n; i++) {
     if (g.winHi[i] < g.winLo[i]) {
       throw FourdgsInvalidInput(
@@ -453,6 +457,13 @@ void _checkInput(FourdgsGaussianSet g, double cutoff) {
         'whose lower bound is above its upper; visibility is gated on '
         'lo <= t < hi, so it would cover no instant and this reader refuses '
         'the Window Table record it would be written into',
+      );
+    }
+    if (g.winHi[i] == g.winLo[i] && !g.winLo[i].isFinite) {
+      throw FourdgsInvalidInput(
+        'gaussian $i has the infinite empty validity window '
+        '[${g.winLo[i]}, ${g.winHi[i]}); its length is NaN and the version-1 '
+        'decoders do not share one motion-grid interpretation for it',
       );
     }
   }
@@ -788,6 +799,7 @@ _Quantized _quantize(
   final k = supportK(cutoff);
   final stepScaleLog = grid.stepScaleLog;
   final stepSigmaLog = grid.stepSigmaLog;
+  final narrowedMotion = Float32List(1);
 
   for (int i = 0; i < n; i++) {
     for (int axis = 0; axis < 3; axis++) {
@@ -846,7 +858,20 @@ _Quantized _quantize(
       grid.stepMotion,
     );
     for (int axis = 0; axis < 3; axis++) {
-      motion[i * 3 + axis] = _bin(g.motions[i * 3 + axis] / mStep, 'motion', i);
+      final bin = _bin(g.motions[i * 3 + axis] / mStep, 'motion', i);
+      motion[i * 3 + axis] = bin;
+      // `decodeChunk` writes the product into a Float32List. A finite authored
+      // velocity can therefore quantize to a perfectly legal i32 bin and still
+      // reconstruct as infinity; test the value in the representation the
+      // public decoder actually returns.
+      narrowedMotion[0] = bin * mStep;
+      if (!narrowedMotion[0].isFinite) {
+        throw FourdgsInvalidInput(
+          'motion bin $bin at gaussian $i axis $axis reconstructs outside the '
+          'finite float32 range; the decoded velocity would be '
+          '${narrowedMotion[0]}',
+        );
+      }
     }
     mu[i] = _bin(
       g.muT[i] / muStep(sigmaBin, stepSigmaLog, neverFades, grid.stepTime),
@@ -855,7 +880,7 @@ _Quantized _quantize(
     );
   }
 
-  // The two optional identity lanes, written when — and only when — the set
+  // The optional identity lanes, written when — and only when — the set
   // carries them. Neither is quantized: they are labels, and §6.6 says so in as
   // many words about `object_id` ("the id is exact and is never dequantized").
   //
@@ -888,6 +913,10 @@ _Quantized _quantize(
     _Lane(attrFlags, 1, flags),
     _Lane(attrWindowIndex, 1, windowIndex),
   ];
+  final sourceGroup = g.sourceGroup;
+  if (sourceGroup != null) {
+    lanes.add(_Lane(attrSourceGroup, 1, Int32List.fromList(sourceGroup)));
+  }
   final sourceIndex = g.sourceIndex;
   if (sourceIndex != null) {
     lanes.add(_Lane(attrSourceIndex, 1, Int32List.fromList(sourceIndex)));

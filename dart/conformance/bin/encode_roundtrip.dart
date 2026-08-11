@@ -33,6 +33,42 @@ import 'package:fourdgs/fourdgs.dart';
 /// rather than writing a Header that says otherwise.
 String _writableProfile(String profile) => profile == 'objects' ? '' : profile;
 
+void _checkSourceGroups(FourdgsGaussianSet source, FourdgsGaussianSet encoded) {
+  if ((source.sourceGroup == null) != (encoded.sourceGroup == null)) {
+    throw StateError(
+      'the source_group stream changed between present and absent',
+    );
+  }
+  if (source.sourceGroup == null) return;
+  if (source.sourceIndex == null || encoded.sourceIndex == null) {
+    throw StateError(
+      'source_group fidelity needs the source_index pairing lane in this encode gate',
+    );
+  }
+  final expected = <int, int>{};
+  for (int i = 0; i < source.count; i++) {
+    final key = source.sourceIndex![i];
+    if (expected.containsKey(key)) {
+      throw StateError(
+        'source_index $key is not unique enough to pair source_group',
+      );
+    }
+    expected[key] = source.sourceGroup![i];
+  }
+  for (int i = 0; i < encoded.count; i++) {
+    final key = encoded.sourceIndex![i];
+    if (!expected.containsKey(key) ||
+        expected.remove(key) != encoded.sourceGroup![i]) {
+      throw StateError('source_group changed for source_index $key');
+    }
+  }
+  if (expected.isNotEmpty) {
+    throw StateError(
+      'the encoded source_group stream omitted ${expected.length} rows',
+    );
+  }
+}
+
 /// The gaussians alone: no audio, no camera, no metadata records, no
 /// attachments, no provenance. That is the whole point of this baseline — these
 /// authoring surfaces write gaussians, and a gate that compared whole scenes
@@ -88,6 +124,7 @@ String run(String input, String output) {
       '${scene.gaussians.count}',
     );
   }
+  _checkSourceGroups(scene.gaussians, reread.gaussians);
 
   File(output).writeAsBytesSync(bytes);
   return '${reread.gaussians.count} gaussians, '

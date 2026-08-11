@@ -260,6 +260,31 @@ void main() {
       },
     );
 
+    test(
+      'a finite authored velocity cannot reconstruct to float32 infinity',
+      () {
+        const f32Max = 3.4028234663852886e38;
+        final scene = flatScene(2, winHi: 0.5);
+        scene.scales.fillRange(0, scene.scales.length, 0.9 * f32Max);
+        scene.sigmaT.fillRange(0, scene.sigmaT.length, double.infinity);
+        scene.motions[3] = f32Max;
+        expect(
+          () => writeFourdgsBytes(scene, 0.5),
+          throwsA(
+            isA<FourdgsInvalidInput>().having(
+              (FourdgsInvalidInput e) => e.message,
+              'message',
+              allOf(
+                contains('motion'),
+                contains('gaussian 1'),
+                contains('float32'),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+
     test('two encodes of one scene are the same bytes', () {
       final scene = buildScene();
       // The attribute maps hold the same pairs in different insertion orders. A
@@ -478,6 +503,9 @@ void main() {
       sigmaT: g.sigmaT,
       winLo: g.winLo,
       winHi: g.winHi,
+      sourceGroup: Int32List.fromList(<int>[
+        for (int i = 0; i < g.count; i++) (i * 13) - 71,
+      ]),
       sourceIndex: Int32List.fromList(<int>[
         for (int i = 0; i < g.count; i++) 1000 - i,
       ]),
@@ -495,15 +523,17 @@ void main() {
       ]),
     );
 
-    test('source_index and object_id survive a decode and re-encode', () {
+    test('source_group, source_index and object_id survive re-encoding', () {
       final scene = withIds(buildScene(count: 48));
       final once = readFourdgsBytes(writeFourdgsBytes(scene, 8.0));
+      expect(once.gaussians.sourceGroup, isNotNull);
       expect(once.gaussians.sourceIndex, isNotNull);
       expect(once.gaussians.objectId, isNotNull);
 
       final pairing = _pairByPosition(scene, once.gaussians);
       for (int j = 0; j < pairing.length; j++) {
         final i = pairing[j];
+        expect(once.gaussians.sourceGroup![j], scene.sourceGroup![i]);
         expect(once.gaussians.sourceIndex![j], scene.sourceIndex![i]);
         expect(once.gaussians.objectId![j], scene.objectId![i]);
       }
@@ -513,6 +543,7 @@ void main() {
       // missing.
       final twice =
           readFourdgsBytes(writeFourdgsBytes(once.gaussians, 8.0)).gaussians;
+      expect(twice.sourceGroup, isNotNull);
       expect(twice.sourceIndex, isNotNull);
       expect(
         <int>[...twice.objectId!]..sort(),
@@ -523,6 +554,7 @@ void main() {
     test('a scene without them writes neither stream', () {
       final bytes = writeFourdgsBytes(buildScene(count: 16), 8.0);
       final decoded = readFourdgsBytes(bytes).gaussians;
+      expect(decoded.sourceGroup, isNull);
       expect(decoded.sourceIndex, isNull);
       expect(decoded.objectId, isNull);
     });
@@ -1236,7 +1268,7 @@ void main() {
       }
     });
 
-    test('a NaN window is refused, an infinite one is not', () {
+    test('NaN and cross-SDK-ambiguous infinite empty windows are refused', () {
       final withNan = buildScene(count: 8);
       withNan.winHi[3] = double.nan;
       expect(
@@ -1254,9 +1286,28 @@ void main() {
         returnsNormally,
       );
 
-      // Equal infinite endpoints are a legal empty window. `+inf - +inf` is
-      // NaN, but its lifetime is zero and must select the same motion grid in
-      // the writer and every decoder rather than relying on NaN clamp ordering.
+      for (final endpoint in <double>[
+        double.infinity,
+        double.negativeInfinity,
+      ]) {
+        final empty = flatScene(4);
+        empty.winLo[2] = endpoint;
+        empty.winHi[2] = endpoint;
+        expect(
+          () => writeFourdgsBytes(empty, 2.0),
+          throwsA(
+            isA<FourdgsInvalidInput>().having(
+              (FourdgsInvalidInput e) => e.message,
+              'message',
+              allOf(contains('gaussian 2'), contains('infinite empty')),
+            ),
+          ),
+          reason: 'endpoint $endpoint',
+        );
+      }
+
+      // The shared Dart decoder still treats the legal wire value as an empty
+      // lifetime. The writer refuses it until the other SDKs share that rule.
       expect(lifeClass(0, 0.1, true, double.nan), lifeClass(0, 0.1, true, 0.0));
     });
 

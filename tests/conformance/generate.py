@@ -106,10 +106,11 @@ def build(scenario, flags, *, read_back: bool = True, **overrides) -> tuple[byte
         win_hi=np.asarray(raw["win_hi"], dtype=np.float32),
         sh=(np.arange(n * coeffs, dtype=np.int64) % 251).astype(np.uint8).reshape(n, coeffs) if coeffs else None,
         sh_degree=sh_degree,
-        # The one object-bearing top-level variant also carries all exact
+        # The one object-bearing top-level variant also carries both exact
         # producer-side identity lanes. Distinct nontrivial values make a
-        # decode/re-encode loss observable instead of merely proving that all
-        # readers agree on the degraded file.
+        # decode/re-encode loss or substitution observable in the Dart encode
+        # gate rather than merely proving that all readers agree on the
+        # degraded file.
         source_group=(
             (np.arange(n, dtype=np.int64) * np.int64(31) - np.int64(1009)) if "WithObjects" in flags else None
         ),
