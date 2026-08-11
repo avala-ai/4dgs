@@ -35,6 +35,7 @@ import hashlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tarfile
 
@@ -104,6 +105,49 @@ def sha256(path: str) -> str:
         for block in iter(lambda: handle.read(1 << 20), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def committed_sha256(path: str) -> str:
+    """SHA-256 of *path* at the checked-out commit, without buffering the blob.
+
+    A release build runs from the corpus tag, so ``HEAD`` is the immutable source a
+    local rebuild is supposed to reproduce. Generated ``.4dgs`` bytes are pinned by
+    ``CHECKSUMS.txt``; expectations are tracked files and are pinned directly here.
+    Hashing the worktree copy into a fresh manifest would only bless an
+    environment-dependent textual difference.
+    """
+    relative = os.path.relpath(path, ROOT).replace(os.sep, "/")
+    process = subprocess.Popen(
+        ["git", "show", f"HEAD:{relative}"],
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdout is not None
+    assert process.stderr is not None
+    digest = hashlib.sha256()
+    for block in iter(lambda: process.stdout.read(1 << 20), b""):
+        digest.update(block)
+    error = process.stderr.read().decode("utf-8", errors="replace").strip()
+    status = process.wait()
+    if status != 0:
+        detail = f": {error}" if error else ""
+        raise RuntimeError(f"cannot read {relative} at HEAD{detail}")
+    return digest.hexdigest()
+
+
+def corpus_members() -> list[tuple[str, str]]:
+    """Every regular file under ``data/``, preserving its relative path."""
+    members: list[tuple[str, str]] = []
+    for dirpath, dirnames, filenames in os.walk(DATA):
+        dirnames.sort()
+        relative_dir = os.path.relpath(dirpath, DATA)
+        relative_dir = "" if relative_dir == "." else relative_dir.replace(os.sep, "/")
+        for filename in sorted(filenames):
+            source = os.path.join(dirpath, filename)
+            relative = f"{relative_dir}/{filename}" if relative_dir else filename
+            members.append((f"corpus/{relative}", source))
+    return members
 
 
 def describe(name: str, directory: str, path: str, expectation_path: str) -> dict:
@@ -267,8 +311,26 @@ while IFS= read -r f; do
     continue
   fi
   expected=$(cat "${{f%.4dgs}}.json")
-  if ! python3 -c 'import json,sys; sys.exit(json.loads(sys.argv[1]) != json.loads(sys.argv[2]))' \\
-    "$actual" "$expected"; then
+  if ! python3 - "$actual" "$expected" <<'PY'
+import json
+import sys
+
+def same_json(left, right):
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(
+            same_json(left[key], right[key]) for key in left
+        )
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            same_json(a, b) for a, b in zip(left, right)
+        )
+    return left == right
+
+sys.exit(not same_json(json.loads(sys.argv[1]), json.loads(sys.argv[2])))
+PY
+  then
     echo "FAIL $f"
     failed=1
   fi
@@ -320,9 +382,6 @@ def build(out_dir: str) -> str:
     found = variants()
     committed = committed_checksums()
     entries: list[dict] = []
-    # Paths are the small archive index; file contents are never retained here.
-    # `tarfile.addfile` consumes each handle before the next one is opened.
-    path_members: list[tuple[str, str]] = []
     failures: list[str] = []
 
     for name, directory in found:
@@ -343,22 +402,40 @@ def build(out_dir: str) -> str:
             failures.append(f"{qualified}: no committed checksum")
         elif expected != entry["sha256"]:
             failures.append(f"{qualified}: {entry['sha256'][:16]}… != committed {expected[:16]}…")
+        try:
+            expected_expectation = committed_sha256(expectation_path)
+        except RuntimeError as error:
+            failures.append(str(error))
+        else:
+            if expected_expectation != entry["expectationSha256"]:
+                failures.append(
+                    f"{qualified}.json: {entry['expectationSha256'][:16]}… "
+                    f"!= committed HEAD {expected_expectation[:16]}…"
+                )
         entries.append(entry)
-        path_members.append((entry["file"], path))
-        path_members.append((entry["expectation"], expectation_path))
 
     for name in committed:
         if name not in {entry["file"][len("corpus/") :] for entry in entries}:
             failures.append(f"{name}: committed checksum has no file")
 
     if failures:
-        print("::error::the corpus does not match CHECKSUMS.txt, so it will not be packed", file=sys.stderr)
+        print(
+            "::error::the corpus does not match CHECKSUMS.txt and committed expectations, so it will not be packed",
+            file=sys.stderr,
+        )
         for failure in failures:
             print(f"  {failure}", file=sys.stderr)
-        print("\nregenerate with `python3 tests/conformance/generate.py` and try again", file=sys.stderr)
+        print(
+            "\nregenerate with `python3 tests/conformance/generate.py` and try again",
+            file=sys.stderr,
+        )
         raise SystemExit(1)
 
-    path_members.append(("corpus/CHECKSUMS.txt", CHECKSUMS))
+    # Archive the directory, not a reconstruction of the files the packer happens
+    # to understand. This preserves .gitignore and any future auxiliary file, so
+    # the promised drop-in replacement really has the exact source-tree shape.
+    # Paths are a small index; `tarfile.addfile` streams one file at a time.
+    path_members = corpus_members()
     for source, target in (("LICENSE", "LICENSE"), ("NOTICE", "NOTICE")):
         path_members.append((target, os.path.join(ROOT, source)))
     # These two members are bounded by the small corpus index, not by scene
@@ -457,6 +534,28 @@ def unpack_and_check(tarball: str, into: str) -> None:
             actual = sha256(path)
             if actual != entry[digest_key]:
                 failures.append(f"{entry[key]}: {actual[:16]}… != manifest {entry[digest_key][:16]}…")
+
+    # The manifest indexes variants, not repository housekeeping. Compare the
+    # complete trees too so an omitted .gitignore (or future auxiliary file)
+    # cannot pass the release check unnoticed.
+    source_members = {archive_name[len("corpus/") :]: source for archive_name, source in corpus_members()}
+    unpacked_corpus = os.path.join(root, "corpus")
+    unpacked_members: dict[str, str] = {}
+    for dirpath, dirnames, filenames in os.walk(unpacked_corpus):
+        dirnames.sort()
+        for filename in sorted(filenames):
+            path = os.path.join(dirpath, filename)
+            relative = os.path.relpath(path, unpacked_corpus).replace(os.sep, "/")
+            unpacked_members[relative] = path
+    for relative in sorted(source_members.keys() - unpacked_members.keys()):
+        failures.append(f"corpus/{relative}: missing from the archive")
+    for relative in sorted(unpacked_members.keys() - source_members.keys()):
+        failures.append(f"corpus/{relative}: not present in tests/conformance/data")
+    for relative in sorted(source_members.keys() & unpacked_members.keys()):
+        source_digest = sha256(source_members[relative])
+        unpacked_digest = sha256(unpacked_members[relative])
+        if source_digest != unpacked_digest:
+            failures.append(f"corpus/{relative}: {unpacked_digest[:16]}… != source {source_digest[:16]}…")
     if failures:
         print("::error::the unpacked corpus does not match its manifest", file=sys.stderr)
         for failure in failures:
