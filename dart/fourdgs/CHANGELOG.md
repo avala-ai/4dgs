@@ -138,6 +138,14 @@ start.
   count mismatches, the missing required attributes, the decoded-size ceiling, the chunk-level codec
   and the two per-gaussian refusals. None of them could be placed in a multi-chunk file, and fixing
   one of them would have left the rest to be found the same way a second time.
+- **The keyframe-delta window refusal names the gaussian even when its id is in the top half of the
+  `u32` range.** `gaussian_id` is a `u32` (spec §11.2) and bins decode as signed 32-bit in every
+  SDK, so `0xFFFFFFFF` arrives as `-1` — and "no gaussian supplied" was spelled `-1` too. The one
+  gaussian whose id was the largest the format allows was therefore the one gaussian whose refusal
+  silently lost its location. The absent case is a `null` now, which no id can collide with. The id
+  is still printed as the signed value the decoder holds, because that is the value this package's
+  `states` JSON carries and the value Python and Rust print for the same file; a message naming an
+  id that appears nowhere else would be a worse diagnosis than a negative one.
 - **A truncated Header is not an unsupported one.** A Header that ended after its `temporal_model`
   string was refused for naming a model this build does not implement, when what it actually is, is
   incomplete — sending whoever holds it to add codec support for a file that needs none. Every

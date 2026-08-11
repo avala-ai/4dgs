@@ -888,9 +888,9 @@ class _Grids {
   /// this is reached once per row, so "window index 7 is outside the table" on
   /// its own is a fact about the file with no way to find it again. The id
   /// rather than the row, because rows are an artefact of composition order and
-  /// the id is what the file carries (spec §11.5). Defaulted, for a caller that
-  /// has no gaussian to blame.
-  FourdgsWindow windowAt(int index, {int gaussian = -1}) {
+  /// the id is what the file carries (spec §11.5). Null, not a negative number,
+  /// for a caller that has no gaussian to blame — see [_named].
+  FourdgsWindow windowAt(int index, {int? gaussian}) {
     // An absent or empty table is one default (0, 0) window, matching the chunk
     // decoder. Clamping instead would substitute one gaussian's lifetime for
     // another's in a file that is already wrong.
@@ -908,7 +908,7 @@ class _Grids {
     return table[index];
   }
 
-  double windowLengthAt(int index, {int gaussian = -1}) {
+  double windowLengthAt(int index, {int? gaussian}) {
     // An absent or empty Window Table is one default (0, 0) window, not an
     // unbounded fallback — the same defaulting the chunk decoder applies. A
     // bare `return 0.0` for an empty table would let any index decode against
@@ -928,8 +928,15 @@ class _Grids {
   }
 
   /// `"gaussian 12"`, or nothing when the caller had no id to give.
-  static String _named(int gaussian) =>
-      gaussian < 0 ? '' : 'gaussian $gaussian';
+  ///
+  /// The absent case is `null` rather than a negative number because a negative
+  /// number is a legal id here. `gaussian_id` is a `u32` (spec §11.2) and bins
+  /// are decoded as signed 32-bit in every SDK, so an id at or above `2^31`
+  /// arrives as a negative value — `0xFFFFFFFF` reads as `-1`. A `-1` sentinel
+  /// would therefore silently drop the location from the one refusal that named
+  /// the highest legal id, which is the opposite of what §6 asks for.
+  static String _named(int? gaussian) =>
+      gaussian == null ? '' : 'gaussian $gaussian';
 }
 
 _Grids _gridsFor(KeyframeDeltaSequence sequence) {

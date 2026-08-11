@@ -172,6 +172,54 @@ FourdgsDecodedChunk _decodeOneGaussian({
   );
 }
 
+/// One record: `u8 opcode`, `u64 content_length`, content.
+Uint8List _record(int opcode, List<int> content) =>
+    Uint8List.fromList(<int>[opcode, ..._u64(content.length), ...content]);
+
+/// A whole one-chunk `keyframe-delta` file whose single gaussian carries
+/// [gaussianId] and names [windowIndex] against a one-entry Window Table.
+///
+/// Hand-written rather than taken from a fixture because the reference encoder
+/// will not write an out-of-range `window_index`, and because the case that
+/// matters here — an id whose `u32` value is at or above `2^31` — is one the
+/// encoder has no reason to emit either.
+Uint8List _keyframeDeltaFile({
+  required int gaussianId,
+  required int windowIndex,
+}) {
+  final streams =
+      BytesBuilder()
+        ..add(_oneGaussianStreams(windowIndex: windowIndex))
+        ..add(_constStream(attrGaussianId, 1, 1, gaussianId));
+  final block = streams.toBytes();
+  final chunk =
+      BytesBuilder()
+        ..add(_f64(0.0)) // t0
+        ..add(_f64(1.0)) // t1
+        ..add(_u32(0)) // level
+        ..add(_u32(1)) // count
+        ..add(_string('')) // compression
+        ..add(_u64(0)) // uncompressed_size
+        ..add(_u64(block.length))
+        ..add(block);
+  final windowTable =
+      BytesBuilder()
+        ..add(_u32(1))
+        ..add(_f64(0.0))
+        ..add(_f64(1.0));
+  final file =
+      BytesBuilder()
+        ..add(fourdgsMagic)
+        ..add(
+          _record(opHeader, _headerContent(temporalModel: 'keyframe-delta')),
+        )
+        ..add(_record(opQuantization, _quantizationContent()))
+        ..add(_record(opWindowTable, windowTable.toBytes()))
+        ..add(_record(opChunk, chunk.toBytes()))
+        ..add(fourdgsMagic);
+  return file.toBytes();
+}
+
 /// The message [body] refused with, or `null` when it refused with nothing.
 String? _messageOf(void Function() body) {
   try {
@@ -347,6 +395,31 @@ void main() {
       expect(bare.refusalCode, refusalWindowIndexOutOfRange);
       expect(bare.message, isNot(contains('gaussian')));
       expect(bare.message, contains('window index 4'));
+    });
+
+    test('the highest legal gaussian id still gets named', () {
+      // `gaussian_id` is a `u32` (spec §11.2) and bins decode as signed 32-bit
+      // in every SDK, so the top half of the id space arrives negative:
+      // `0xFFFFFFFF` reads as `-1`. "No id supplied" was spelled `-1` too, so
+      // the one gaussian whose id is the largest the format allows was the one
+      // gaussian whose refusal lost its location — the failure this rule exists
+      // to prevent, aimed at the id most likely to be a sentinel elsewhere.
+      final message = _messageOf(
+        () => keyframeDeltaStatesJson(
+          decodeKeyframeDeltaStreamed(
+            _keyframeDeltaFile(gaussianId: -1, windowIndex: 3),
+          ),
+        ),
+      );
+      expect(message, isNotNull);
+      expect(
+        message,
+        allOf(
+          contains('gaussian -1'),
+          contains('window index 3'),
+          contains('1-entry window table'),
+        ),
+      );
     });
 
     test('an error the refusal table does not name carries no identifier', () {
