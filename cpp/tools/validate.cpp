@@ -38,10 +38,10 @@
 ///   the model — the conformance suite proves it — so refusing a file for declaring it was never
 ///   a statement about the file.
 
-#include <limits>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "tool.hpp"
@@ -69,6 +69,11 @@ void warn(Report* report, std::string message) {
 
 void note(Report* report, std::string message) {
   push(report, Severity::kNote, std::move(message), std::nullopt);
+}
+
+void incomplete(Report* report, std::string message) {
+  report->complete = false;
+  warn(report, std::move(message));
 }
 
 /// An error the reader raised, carrying its identifier and the byte if it has one.
@@ -120,6 +125,12 @@ std::string hex2(std::uint8_t value) {
 /// both invisible to everything before this point. Both are in the invalid corpus.
 void checkGaussianBirth(Readable& source, const Walk& walk, const std::vector<IndexEntry>& index,
                         Report* report) {
+  if (index.empty()) {
+    incomplete(report,
+               "chunk payload validation is incomplete: the file has no Chunk Index, and the "
+               "C++ core has no bounded per-record sequential validation surface");
+    return;
+  }
   Result<std::unique_ptr<Scene>> opened = Scene::open(source, ReadMode::kIndexed);
   if (!opened) {
     refused(report, "a seeking reader cannot open this file: ", opened.error(), &walk,
@@ -136,43 +147,14 @@ void checkGaussianBirth(Readable& source, const Walk& walk, const std::vector<In
   }
 }
 
-/// The same, for the temporal model whose chunks are keyframes and differences.
-///
-/// This is the same statement as the branch above — open the file the way a client would, and
-/// decode what it carries — expressed in the reader the file's declared model actually needs.
-/// The alternative, which is what the Python validator still does, is to run the gaussian-birth
-/// reader over it and report its refusal as a fault in the file.
-/// The one path that holds the file, and the ABI is why.
-///
-/// `fourdgs_keyframe_delta_states_json` takes `(const uint8_t*, size_t)`: it composes every chain
-/// in the core and hands back the canonical states, and there is no range-reading counterpart and
-/// no per-entry surface to drive one chain at a time. So this branch reads the file — and it is
-/// reached only for a Header that declares `keyframe-delta`, so the gaussian-birth branch, which
-/// is every other file in the corpus, never pays for it.
-void checkKeyframeDelta(Readable& source, std::uint64_t size, bool indexed, const Walk& walk,
-                        Report* report) {
-  if (size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
-    error(report, "the keyframe-delta file is too large for this ABI's contiguous input");
-    return;
-  }
-  std::vector<std::uint8_t> data(static_cast<std::size_t>(size));
-  if (!data.empty()) {
-    Result<std::size_t> got = source.read(0, Span<std::uint8_t>(data.data(), data.size()));
-    if (!got || *got != data.size()) {
-      error(report,
-            "the file could not be read whole, which this temporal model needs: " +
-                (got ? std::string("the resource returned a short read") : got.error().message));
-      return;
-    }
-  }
-  Result<std::string> states =
-      keyframeDeltaStatesJson(Span<const std::uint8_t>(data.data(), data.size()), indexed);
-  if (!states) {
-    refused(report,
-            indexed ? "a seeking reader cannot open this file: "
-                    : "a streamed reader cannot decode this file: ",
-            states.error(), &walk, std::nullopt);
-  }
+/// The keyframe-delta C ABI accepts one contiguous byte span. Calling it here would necessarily
+/// buffer the whole resource, and a validator may not turn a large valid capture into an
+/// allocation attempt. Until the core exposes range-based streamed and indexed composition, say
+/// that the verdict is incomplete instead of certifying bytes this binding could not inspect.
+void checkKeyframeDelta(Report* report) {
+  incomplete(report,
+             "keyframe-delta payload validation is unavailable through the bounded C++ core "
+             "surface; structural checks completed, but neither read mode was certified");
 }
 
 /// The Header's temporal model, range-parsed through its two variable-length prefixes.
@@ -225,12 +207,14 @@ std::string temporalModel(Readable& source, const Walk& walk) {
   return rangeParsedModel(source, walk);
 }
 
-bool Report::ok() const {
+bool Report::hasErrors() const {
   for (const Finding& finding : findings) {
-    if (finding.severity == Severity::kError) return false;
+    if (finding.severity == Severity::kError) return true;
   }
-  return true;
+  return false;
 }
+
+bool Report::ok() const { return complete && !hasErrors(); }
 
 std::optional<Severity> Report::worst() const {
   std::optional<Severity> out;
@@ -290,7 +274,10 @@ Report validate(Readable& source) {
     if (count == 0) continue;
     const std::uint8_t opcode = static_cast<std::uint8_t>(value);
     const Frame* first = walk.firstIntact(opcode);
-    if (isPrivate(opcode)) {
+    if (opcode == op::kAttributeStream) {
+      // Its registry number is used inside Chunk; the structural error is emitted below.
+      continue;
+    } else if (isPrivate(opcode)) {
       if (count == 1 && first != nullptr) {
         note(&report, "private record " + hex2(opcode) + " (" + std::to_string(first->length) +
                           " bytes) — skipped, as required");
@@ -352,21 +339,56 @@ Report validate(Readable& source) {
   const bool keyframeDelta = model == "keyframe-delta";
 
   const std::vector<IndexEntry> index = chunkIndexEntries(source, walk);
-  if (walk.intactOpcodeCounts[op::kChunkIndex] > kMaxChunkIndexEntries) {
-    error(&report, "the file carries more than " + std::to_string(kMaxChunkIndexEntries) +
-                       " Chunk Index records; this validator's bounded index cannot retain them");
+  const std::uint64_t physicalIndexCount = walk.intactOpcodeCounts[op::kChunkIndex];
+  const bool completeIndex = physicalIndexCount <= kMaxChunkIndexEntries;
+  if (!completeIndex) {
+    incomplete(&report, "index validation is incomplete: the file carries more than " +
+                            std::to_string(kMaxChunkIndexEntries) +
+                            " Chunk Index records, beyond this validator's bounded retained index");
   }
   // Resolve every indexed offset against the top-level framing walk. Looking only at the byte at
   // an offset accepts a counterfeit Chunk header embedded in another record's payload; a valid
   // range has to equal one complete frame, opcode and declared total alike.
   std::vector<std::optional<Frame>> physical(index.size());
   std::unordered_map<std::uint64_t, std::vector<std::size_t>> wanted;
-  for (std::size_t i = 0; i < index.size(); ++i) wanted[index[i].offset].push_back(i);
+  std::unordered_set<std::uint64_t> indexedChunkOffsets;
+  struct IndexedBand {
+    std::size_t entry = 0;
+    BandRange range;
+    std::optional<Frame> physical;
+  };
+  std::vector<IndexedBand> indexedBands;
+  std::unordered_map<std::uint64_t, std::vector<std::size_t>> wantedBands;
+  for (std::size_t i = 0; i < index.size(); ++i) {
+    wanted[index[i].offset].push_back(i);
+    indexedChunkOffsets.insert(index[i].offset);
+    for (const BandRange& range : index[i].bands) {
+      const std::size_t at = indexedBands.size();
+      indexedBands.push_back(IndexedBand{i, range, std::nullopt});
+      wantedBands[range.offset].push_back(at);
+    }
+  }
+  std::optional<Frame> firstUnindexedState;
+  std::optional<Frame> firstGaussianBirthDelta;
   (void)fourdgs::tool::walk(source, [&](const Frame& frame, bool complete) {
     if (!complete) return;
     const auto found = wanted.find(frame.offset);
-    if (found == wanted.end()) return;
-    for (std::size_t i : found->second) physical[i] = frame;
+    if (found != wanted.end()) {
+      for (std::size_t i : found->second) physical[i] = frame;
+    }
+    const auto foundBands = wantedBands.find(frame.offset);
+    if (foundBands != wantedBands.end()) {
+      for (std::size_t i : foundBands->second) indexedBands[i].physical = frame;
+    }
+    const bool state = frame.opcode == op::kChunk || frame.opcode == op::kDeltaChunk;
+    if (!keyframeDelta && frame.opcode == op::kDeltaChunk && !firstGaussianBirthDelta.has_value()) {
+      firstGaussianBirthDelta = frame;
+    }
+    if (state && physicalIndexCount > 0 && completeIndex &&
+        indexedChunkOffsets.find(frame.offset) == indexedChunkOffsets.end() &&
+        !firstUnindexedState.has_value()) {
+      firstUnindexedState = frame;
+    }
   });
   for (std::size_t i = 0; i < index.size(); ++i) {
     const IndexEntry& entry = index[i];
@@ -396,22 +418,107 @@ Report validate(Readable& source) {
                          std::to_string(physical[i]->total()) + " bytes");
     }
   }
+  for (const IndexedBand& band : indexedBands) {
+    const std::uint64_t end = band.range.offset + band.range.length;
+    const bool overflows = end < band.range.offset || end > size || band.range.offset >= size;
+    if (overflows) {
+      error(&report, "SH band " + std::to_string(band.range.band) + " at index entry " +
+                         std::to_string(band.entry) + " points past the end of the file");
+    } else if (!band.physical.has_value() || band.physical->opcode != op::kShBandStream) {
+      error(&report, "SH band " + std::to_string(band.range.band) + " at index entry " +
+                         std::to_string(band.entry) +
+                         " does not point at the start of a top-level SH Band Stream record");
+    } else if (band.physical->total() != band.range.length) {
+      error(&report, "SH band " + std::to_string(band.range.band) + " at index entry " +
+                         std::to_string(band.entry) + " declares " +
+                         std::to_string(band.range.length) + " bytes at " +
+                         std::to_string(band.range.offset) + "; the record there is " +
+                         std::to_string(band.physical->total()) + " bytes");
+    }
+  }
+  if (firstUnindexedState.has_value()) {
+    error(&report, "the physical " + opcodeName(firstUnindexedState->opcode) + " record at byte " +
+                       std::to_string(firstUnindexedState->offset) +
+                       " is absent from the Chunk Index");
+  }
+  if (firstGaussianBirthDelta.has_value()) {
+    error(&report, "the gaussian-birth file carries a Delta Chunk record at byte " +
+                       std::to_string(firstGaussianBirthDelta->offset) +
+                       "; Delta Chunk is legal only under keyframe-delta");
+  }
+  if (walk.intactOpcodeCounts[op::kAttributeStream] > 0) {
+    const Frame* attribute = walk.firstIntact(op::kAttributeStream);
+    error(&report,
+          "the top-level Attribute Stream at byte " +
+              std::to_string(attribute == nullptr ? 0 : attribute->offset) +
+              " is invalid; Attribute Stream is a bare structure inside Chunk, not a record");
+  }
 
   std::optional<SummaryDeclaration> summary = summaryDeclaration(source, walk);
   if (summary.has_value()) {
     if (summary->start > summary->end) {
       error(&report, "the Footer's summary starts at " + std::to_string(summary->start) +
                          ", after the summary ends at " + std::to_string(summary->end));
+    } else if (summary->start == 0) {
+      if (physicalIndexCount > 0) {
+        error(&report, "the Footer's summary_start is 0, but the file carries Chunk Index records");
+      }
+      if (summary->offsetStart != 0) {
+        error(&report, "the Footer's summary_offset_start is nonzero while summary_start is 0");
+      }
     } else {
-      std::optional<Coverage> covered = coverage(source, walk);
-      if (covered.has_value() && !covered->ok) {
+      const Frame* firstIndex = walk.firstIntact(op::kChunkIndex);
+      if (firstIndex == nullptr || firstIndex->offset != summary->start) {
+        error(&report, "the Footer's summary_start " + std::to_string(summary->start) +
+                           " does not name the first Chunk Index record");
+      }
+      std::optional<Frame> firstOffset;
+      std::optional<Frame> foreignSummaryRecord;
+      std::optional<Frame> earlySummaryRecord;
+      (void)fourdgs::tool::walk(source, [&](const Frame& frame, bool complete) {
+        if (!complete || frame.offset >= summary->end) return;
+        const bool summaryKind = frame.opcode == op::kChunkIndex ||
+                                 frame.opcode == op::kStatistics ||
+                                 frame.opcode == op::kSummaryOffset;
+        if (frame.opcode == op::kSummaryOffset && !firstOffset.has_value()) firstOffset = frame;
+        if (frame.offset < summary->start) {
+          if (summaryKind && !earlySummaryRecord.has_value()) earlySummaryRecord = frame;
+          return;
+        }
+        if (!summaryKind && !foreignSummaryRecord.has_value()) foreignSummaryRecord = frame;
+      });
+      if (earlySummaryRecord.has_value()) {
+        error(&report, "the " + opcodeName(earlySummaryRecord->opcode) + " record at byte " +
+                           std::to_string(earlySummaryRecord->offset) +
+                           " lies before the Footer's contiguous summary");
+      }
+      if (foreignSummaryRecord.has_value()) {
+        error(&report, "the Footer's summary contains " + opcodeName(foreignSummaryRecord->opcode) +
+                           " at byte " + std::to_string(foreignSummaryRecord->offset) +
+                           "; expected only Chunk Index, Statistics, or Summary Offset records");
+      }
+      const std::uint64_t actualOffsetStart =
+          firstOffset.has_value() ? firstOffset->offset : static_cast<std::uint64_t>(0);
+      if (summary->offsetStart != actualOffsetStart) {
+        error(&report, "the Footer's summary_offset_start is " +
+                           std::to_string(summary->offsetStart) + "; expected " +
+                           std::to_string(actualOffsetStart));
+      }
+    }
+
+    if (summary->crc != 0 && summary->start != 0 && summary->start <= summary->end) {
+      Result<std::optional<Coverage>> covered = coverage(source, walk);
+      if (!covered) {
+        incomplete(&report,
+                   "the summary checksum could not be verified: " + covered.error().message);
+      } else if (covered->has_value() && !covered->value().ok) {
         error(&report,
               "summary CRC mismatch: the index is untrustworthy (a streamed read still works)");
       }
     }
   }
 
-  if (header && index.empty()) {
+  if (header && physicalIndexCount == 0) {
     warn(&report, "no chunk index: this file can only be read front to back, not seeked");
   }
 
@@ -419,7 +526,7 @@ Report validate(Readable& source) {
   if (walk.cut.has_value()) noteTheCut(&report, walk);
 
   if (keyframeDelta) {
-    checkKeyframeDelta(source, size, !index.empty(), walk, &report);
+    checkKeyframeDelta(&report);
   } else {
     checkGaussianBirth(source, walk, index, &report);
   }
@@ -464,9 +571,13 @@ int runValidate(const std::string& path, std::ostream& out, std::ostream& err) {
     // it saw before.
     if (finding.refusal.has_value()) out << "  " << finding.refusal->toString() << "\n";
   }
-  if (!report.ok()) {
+  if (report.hasErrors()) {
     err << "INVALID\n";
     return kExitFailed;
+  }
+  if (!report.complete) {
+    err << "INCOMPLETE\n";
+    return kExitTool;
   }
   out << (report.findings.empty() ? "valid" : "valid (with notes)") << "\n";
   // The one deliberate divergence from the Python tool, which exits 0 here, and the Rust tool's

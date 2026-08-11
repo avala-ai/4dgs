@@ -132,7 +132,7 @@ bool isProvenance(std::uint8_t opcode) {
 }
 
 bool isSpecified(std::uint8_t opcode) {
-  return (opcode >= op::kHeader && opcode <= op::kAudioData) ||
+  return ((opcode >= op::kHeader && opcode <= op::kAudioData) && opcode != op::kAttributeStream) ||
          (opcode >= op::kCoordinateFrame && opcode <= op::kObjectTrack);
 }
 
@@ -252,8 +252,12 @@ std::uint32_t crc32(const std::uint8_t* data, std::size_t length) {
   return crc32Update(0xFFFFFFFFu, data, length) ^ 0xFFFFFFFFu;
 }
 
-std::optional<std::uint32_t> crc32Range(Readable& source, std::uint64_t start, std::uint64_t end) {
-  if (end < start) return std::nullopt;
+Result<std::uint32_t> crc32Range(Readable& source, std::uint64_t start, std::uint64_t end) {
+  if (end < start) {
+    return Error(ErrorCode::kInvalidArgument, "summary checksum range starts after it ends (" +
+                                                  std::to_string(start) + ".." +
+                                                  std::to_string(end) + ")");
+  }
   std::vector<std::uint8_t> buffer(kCrcBuffer);
   std::uint32_t crc = 0xFFFFFFFFu;
   for (std::uint64_t at = start; at < end;) {
@@ -261,7 +265,17 @@ std::optional<std::uint32_t> crc32Range(Readable& source, std::uint64_t start, s
     const std::size_t take = remaining < static_cast<std::uint64_t>(buffer.size())
                                  ? static_cast<std::size_t>(remaining)
                                  : buffer.size();
-    if (!readExactly(source, at, buffer.data(), take)) return std::nullopt;
+    Result<std::size_t> got = source.read(at, Span<std::uint8_t>(buffer.data(), take));
+    if (!got) {
+      return Error(got.error().code, "summary checksum bytes " + std::to_string(at) + ".." +
+                                         std::to_string(at + take) +
+                                         " could not be read: " + got.error().message);
+    }
+    if (*got != take) {
+      return Error(ErrorCode::kTruncated, "summary checksum bytes " + std::to_string(at) + ".." +
+                                              std::to_string(at + take) + " returned only " +
+                                              std::to_string(*got) + " bytes");
+    }
     crc = crc32Update(crc, buffer.data(), take);
     at += take;
   }
@@ -475,55 +489,42 @@ std::vector<IndexEntry> chunkIndexEntries(Readable& source, const Walk& framing)
 }
 
 std::optional<ChunkRefusal> scanChunks(Readable& source, const std::vector<IndexEntry>& index) {
-  int degree = 0;
-  if (!index.empty()) {
-    Result<std::unique_ptr<Scene>> opened = Scene::open(source, ReadMode::kIndexed);
-    if (!opened) return ChunkRefusal{opened.error(), std::nullopt};
-    Scene& scene = **opened;
+  if (index.empty()) return std::nullopt;
+  Result<std::unique_ptr<Scene>> opened = Scene::open(source, ReadMode::kIndexed);
+  if (!opened) return ChunkRefusal{opened.error(), std::nullopt};
+  Scene& scene = **opened;
 
-    // The degree the file declares, so the scan fetches what the file says it carries. A cap of 0
-    // transfers no band record at all, which is why a band that will not decode used to come back
-    // as a file with nothing wrong with it.
-    degree = scene.shDegree();
-    const std::uint32_t chunks = scene.chunkCount();
-    if (scene.isIndexed()) {
-      for (std::uint32_t i = 0; i < chunks; ++i) {
-        Result<void> loaded = scene.loadChunk(i, degree);
-        if (loaded) continue;
+  // The degree the file declares, so the scan fetches what the file says it carries. A cap of 0
+  // transfers no band record at all, which is why a band that will not decode used to come back
+  // as a file with nothing wrong with it.
+  const int degree = scene.shDegree();
+  const std::uint32_t chunks = scene.chunkCount();
+  if (scene.isIndexed()) {
+    for (std::uint32_t i = 0; i < chunks; ++i) {
+      Result<void> loaded = scene.loadChunk(i, degree);
+      if (loaded) continue;
 
-        std::optional<Site> site;
-        if (i < index.size()) {
-          site = Site{index[i].offset, "the Chunk record at index entry " + std::to_string(i)};
-          // Which band, if it was a band. The cap is raised from nothing until the fetch starts
-          // failing: the first cap that fails is the first band the reader could not decode, and
-          // failing at 0 means the fault is in the chunk's own attribute streams rather than in
-          // any band. This runs only here, on the failure path, so a healthy file pays nothing.
-          for (int cap = 0; cap <= degree; ++cap) {
-            if (scene.loadChunk(i, cap)) continue;
-            if (cap == 0) break;
-            const BandRange* range = index[i].bandRange(cap);
-            if (range != nullptr) {
-              site =
-                  Site{range->offset, "the SH Band Stream record for band " + std::to_string(cap) +
-                                          " at index entry " + std::to_string(i)};
-            }
-            break;
+      std::optional<Site> site;
+      if (i < index.size()) {
+        site = Site{index[i].offset, "the Chunk record at index entry " + std::to_string(i)};
+        // Which band, if it was a band. The cap is raised from nothing until the fetch starts
+        // failing: the first cap that fails is the first band the reader could not decode, and
+        // failing at 0 means the fault is in the chunk's own attribute streams rather than in
+        // any band. This runs only here, on the failure path, so a healthy file pays nothing.
+        for (int cap = 0; cap <= degree; ++cap) {
+          if (scene.loadChunk(i, cap)) continue;
+          if (cap == 0) break;
+          const BandRange* range = index[i].bandRange(cap);
+          if (range != nullptr) {
+            site = Site{range->offset, "the SH Band Stream record for band " + std::to_string(cap) +
+                                           " at index entry " + std::to_string(i)};
           }
+          break;
         }
-        return ChunkRefusal{loaded.error(), site};
       }
+      return ChunkRefusal{loaded.error(), site};
     }
   }
-
-  // And the front-to-back path, independently. An index can omit a physical Chunk; decoding only
-  // what it names never fetches that orphan and can call a file valid even though a pipe reader
-  // refuses it. The indexed pass runs first only so a refusal both paths share keeps its precise
-  // index or SH-band byte instead of becoming unplaced.
-  Result<std::unique_ptr<Scene>> streamed = Scene::open(source, ReadMode::kSequential);
-  if (!streamed) return ChunkRefusal{streamed.error(), std::nullopt};
-  if (index.empty()) degree = (*streamed)->shDegree();
-  Result<void> streamedLoaded = (*streamed)->loadAll(degree);
-  if (!streamedLoaded) return ChunkRefusal{streamedLoaded.error(), std::nullopt};
   return std::nullopt;
 }
 
@@ -540,25 +541,28 @@ std::optional<SummaryDeclaration> summaryDeclaration(Readable& source, const Wal
   if (!readExactly(source, content, at, kFooterFields)) return std::nullopt;
   SummaryDeclaration out;
   out.start = readU64(at);
+  out.offsetStart = readU64(at + 8);
   for (int i = 3; i >= 0; --i) out.crc = (out.crc << 8) | at[16 + i];
   // The summary ends where the Footer begins — taken from the walk rather than computed from a
   // footer's expected size, so a Footer that a later revision extends does not move the region
   // out from under the check.
   out.end = frame->offset;
-  if (out.crc == 0 || out.start == 0) return std::nullopt;
   return out;
 }
 
-std::optional<Coverage> coverage(Readable& source, const Walk& walk) {
+Result<std::optional<Coverage>> coverage(Readable& source, const Walk& walk) {
   std::optional<SummaryDeclaration> declared = summaryDeclaration(source, walk);
-  if (!declared.has_value() || declared->start > declared->end) return std::nullopt;
-  std::optional<std::uint32_t> actual = crc32Range(source, declared->start, declared->end);
-  if (!actual.has_value()) return std::nullopt;
+  if (!declared.has_value() || declared->crc == 0 || declared->start == 0 ||
+      declared->start > declared->end) {
+    return std::optional<Coverage>();
+  }
+  Result<std::uint32_t> actual = crc32Range(source, declared->start, declared->end);
+  if (!actual) return actual.error();
   Coverage out;
   out.start = declared->start;
   out.end = declared->end;
   out.ok = *actual == declared->crc;
-  return out;
+  return std::optional<Coverage>(out);
 }
 
 const char* coverageCell(const std::optional<Coverage>& coverage, std::uint64_t at,

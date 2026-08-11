@@ -219,19 +219,19 @@ void aConformingCaptureIsValid() {
   CHECK(!result.outContains("error:"));
 }
 
-void aConformingKeyframeDeltaFileIsValid() {
-  // It is not, in the Python validator: every structural check there assumes the
-  // gaussian-birth chunk shape, so a file whose Chunks are keyframes and whose Delta Chunks are
-  // differences comes back invalid. The core implements the model — the conformance suite
-  // proves it — so refusing a file for declaring it was never a statement about the file.
+void aConformingKeyframeDeltaFileIsNotMisclassified() {
+  // The C ABI's keyframe-delta entry point accepts a whole byte span. The tool must not buffer a
+  // capture to reach it, so it reports the bounded structural result as incomplete rather than
+  // calling a conforming file invalid or certifying payloads it did not decode.
   if (corpusMissing()) return;
   if (noDecoder()) return;
   const std::vector<std::filesystem::path> files = variants(corpusDirectory() / "keyframe");
   CHECK(!files.empty());
   for (const std::filesystem::path& file : files) {
     const Run result = run({"validate", file.string()});
-    CHECK_EQ(result.code, fourdgs::tool::kExitOk);
+    CHECK_EQ(result.code, fourdgs::tool::kExitTool);
     CHECK(!result.outContains("error:"));
+    CHECK(result.outContains("neither read mode was certified"));
     if (result.outContains("error:")) {
       std::fprintf(stderr, "  %s said: %s", file.filename().string().c_str(), result.out.c_str());
     }
@@ -252,8 +252,10 @@ void everyValidVariantIsValid() {
   CHECK(files.size() >= 40);
   for (const std::filesystem::path& file : files) {
     const Run result = run({"validate", file.string()});
-    // 0, or 2 for the three variants that carry no chunk index and warn about it. Never 1.
-    CHECK(result.code == fourdgs::tool::kExitOk || result.code == fourdgs::tool::kExitWarnings);
+    // Indexed files are complete. An indexless file is structurally accepted but returns 3:
+    // the bounded C++ core cannot decode one physical chunk at a time on that path. Never 1.
+    CHECK(result.code == fourdgs::tool::kExitOk || result.code == fourdgs::tool::kExitWarnings ||
+          result.code == fourdgs::tool::kExitTool);
     if (result.code == fourdgs::tool::kExitFailed) {
       std::fprintf(stderr, "  %s said: %s", file.filename().string().c_str(), result.out.c_str());
     }
@@ -500,7 +502,9 @@ void anUnindexedKeyframeDeltaUsesTheStreamedDecoder() {
 
   const Report report =
       fourdgs::tool::validate(Span<const std::uint8_t>(unindexed.data(), unindexed.size()));
-  CHECK(report.ok());
+  CHECK(!report.ok());
+  CHECK(!report.hasErrors());
+  CHECK(!report.complete);
   bool warnedOnly = false;
   for (const fourdgs::tool::Finding& finding : report.findings) {
     if (finding.message.find("can only be read front to back") != std::string::npos) {
@@ -591,13 +595,13 @@ void anOrphanChunkIsDecodedByTheStreamedValidationPass() {
   const Report report =
       fourdgs::tool::validate(Span<const std::uint8_t>(withOrphan.data(), withOrphan.size()));
   CHECK(!report.ok());
-  bool decodedOrphan = false;
+  bool foundOrphan = false;
   for (const fourdgs::tool::Finding& finding : report.findings) {
-    if (finding.refusal.has_value() && finding.refusal->code == "unknown-stream-codec") {
-      decodedOrphan = true;
+    if (finding.message.find("absent from the Chunk Index") != std::string::npos) {
+      foundOrphan = true;
     }
   }
-  CHECK(decodedOrphan);
+  CHECK(foundOrphan);
 }
 
 void inspectReadsRangesRatherThanTheWholeFile() {
@@ -617,8 +621,10 @@ void inspectReadsRangesRatherThanTheWholeFile() {
   fourdgs::Result<Walk> walked = fourdgs::tool::walk(counting);
   CHECK(walked.ok());
   if (!walked) return;
-  const std::optional<fourdgs::tool::Coverage> covered = fourdgs::tool::coverage(counting, *walked);
-  CHECK(covered.has_value());
+  const fourdgs::Result<std::optional<fourdgs::tool::Coverage>> covered =
+      fourdgs::tool::coverage(counting, *walked);
+  CHECK(covered.ok());
+  CHECK(covered.ok() && covered->has_value());
   // Framing (nine bytes a record, plus both magics) and the covered range, and nothing else. The
   // Audio Data record alone is over four kilobytes, so a whole-file read could not fit under this.
   CHECK(counting.bytesRead() < bytes.size() / 2);
@@ -626,6 +632,180 @@ void inspectReadsRangesRatherThanTheWholeFile() {
     std::fprintf(stderr, "  transferred %llu of %llu bytes\n",
                  static_cast<unsigned long long>(counting.bytesRead()),
                  static_cast<unsigned long long>(bytes.size()));
+  }
+}
+
+void keyframeDeltaValidationDoesNotReadTheWholeResource() {
+  if (corpusMissing()) return;
+  if (noDecoder()) return;
+  const std::vector<std::uint8_t> bytes = readBytes(
+      corpusDirectory() / "keyframe" / "KeyframeDelta-UseChunkIndex-UseCrc-UseStatistics.4dgs");
+  CHECK(!bytes.empty());
+  if (bytes.empty()) return;
+
+  fourdgs::MemoryReadable inner(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  fourdgs::CountingReadable counting(&inner);
+  const Report report = fourdgs::tool::validate(counting);
+  CHECK(!report.ok());
+  CHECK(!report.hasErrors());
+  CHECK(!report.complete);
+  CHECK(counting.bytesRead() < bytes.size());
+}
+
+void indexedBandRangesMustNameWholeTopLevelRecords() {
+  if (corpusMissing()) return;
+  if (noDecoder()) return;
+  std::vector<std::uint8_t> bytes =
+      readBytes(corpusDirectory() / "MixedLifetimes-SHDegree3-UseChunkIndex-UseCrc.4dgs");
+  CHECK(!bytes.empty());
+  if (bytes.empty()) return;
+  fourdgs::Result<Walk> walked =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  CHECK(walked.ok());
+  if (!walked) return;
+  const fourdgs::tool::Frame* index = walked->firstIntact(fourdgs::tool::op::kChunkIndex);
+  CHECK(index != nullptr);
+  if (index == nullptr) return;
+
+  // Fixed index fields, then band 1's number and offset; its length begins nine bytes in.
+  const std::size_t lengthField =
+      static_cast<std::size_t>(index->offset + fourdgs::tool::kRecordHeaderSize + 40 + 9);
+  const std::uint64_t original = readU64(bytes, lengthField);
+  writeU64(&bytes, lengthField, original + 1);
+  resealSummary(&bytes);
+  const Report report =
+      fourdgs::tool::validate(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  bool namedWholeRecord = false;
+  for (const fourdgs::tool::Finding& finding : report.findings) {
+    if (finding.message.find("SH band 1 at index entry 0 declares") != std::string::npos &&
+        finding.message.find("the record there is") != std::string::npos) {
+      namedWholeRecord = true;
+    }
+  }
+  CHECK(namedWholeRecord);
+}
+
+void summaryPlacementIsCheckedWithoutAChecksum() {
+  if (corpusMissing()) return;
+  if (noDecoder()) return;
+  std::vector<std::uint8_t> bytes = readBytes(corpusDirectory() / kProvenanceVariant);
+  CHECK(!bytes.empty());
+  if (bytes.empty()) return;
+  std::vector<fourdgs::tool::Frame> indexes;
+  fourdgs::Result<Walk> walked =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(bytes.data(), bytes.size()),
+                               [&](const fourdgs::tool::Frame& frame, bool complete) {
+                                 if (complete && frame.opcode == fourdgs::tool::op::kChunkIndex)
+                                   indexes.push_back(frame);
+                               });
+  CHECK(walked.ok());
+  CHECK(indexes.size() >= 2);
+  if (!walked || indexes.size() < 2) return;
+  const fourdgs::tool::Frame* footer = walked->firstIntact(fourdgs::tool::op::kFooter);
+  CHECK(footer != nullptr);
+  if (footer == nullptr) return;
+  const std::size_t content =
+      static_cast<std::size_t>(footer->offset + fourdgs::tool::kRecordHeaderSize);
+  writeU64(&bytes, content, indexes[1].offset);
+  writeU32(&bytes, content + 16, 0);
+
+  const Report report =
+      fourdgs::tool::validate(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  bool found = false;
+  for (const fourdgs::tool::Finding& finding : report.findings) {
+    if (finding.message.find("does not name the first Chunk Index record") != std::string::npos) {
+      found = true;
+    }
+  }
+  CHECK(found);
+}
+
+void modelSpecificAndBareStructureOpcodesAreRejected() {
+  if (corpusMissing()) return;
+  if (noDecoder()) return;
+  const std::vector<std::uint8_t> original = readBytes(corpusDirectory() / kProvenanceVariant);
+  CHECK(!original.empty());
+  if (original.empty()) return;
+  fourdgs::Result<Walk> walked =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(original.data(), original.size()));
+  CHECK(walked.ok());
+  if (!walked) return;
+  const fourdgs::tool::Frame* chunk = walked->firstIntact(fourdgs::tool::op::kChunk);
+  CHECK(chunk != nullptr);
+  if (chunk == nullptr) return;
+
+  std::vector<std::uint8_t> delta = original;
+  delta[static_cast<std::size_t>(chunk->offset)] = fourdgs::tool::op::kDeltaChunk;
+  const Report deltaReport =
+      fourdgs::tool::validate(Span<const std::uint8_t>(delta.data(), delta.size()));
+  bool rejectedDelta = false;
+  for (const fourdgs::tool::Finding& finding : deltaReport.findings) {
+    if (finding.message.find("Delta Chunk is legal only under keyframe-delta") !=
+        std::string::npos) {
+      rejectedDelta = true;
+    }
+  }
+  CHECK(rejectedDelta);
+
+  std::vector<std::uint8_t> attribute = original;
+  attribute[static_cast<std::size_t>(chunk->offset)] = fourdgs::tool::op::kAttributeStream;
+  const Report attributeReport =
+      fourdgs::tool::validate(Span<const std::uint8_t>(attribute.data(), attribute.size()));
+  bool rejectedAttribute = false;
+  for (const fourdgs::tool::Finding& finding : attributeReport.findings) {
+    if (finding.message.find("Attribute Stream is a bare structure inside Chunk") !=
+        std::string::npos) {
+      rejectedAttribute = true;
+    }
+  }
+  CHECK(rejectedAttribute);
+}
+
+class FailingSummaryReadable : public fourdgs::Readable {
+ public:
+  FailingSummaryReadable(std::vector<std::uint8_t> bytes, std::uint64_t failAt)
+      : bytes_(std::move(bytes)), failAt_(failAt) {}
+
+  fourdgs::Result<std::uint64_t> size() override { return bytes_.size(); }
+
+  fourdgs::Result<std::size_t> read(std::uint64_t offset, Span<std::uint8_t> into) override {
+    if (offset == failAt_ && into.size() > fourdgs::tool::kRecordHeaderSize) {
+      return Error(ErrorCode::kIo, "injected summary transport failure");
+    }
+    if (offset >= bytes_.size()) return static_cast<std::size_t>(0);
+    const std::size_t available = bytes_.size() - static_cast<std::size_t>(offset);
+    const std::size_t take = std::min(available, into.size());
+    for (std::size_t i = 0; i < take; ++i) {
+      into[i] = bytes_[static_cast<std::size_t>(offset) + i];
+    }
+    return take;
+  }
+
+ private:
+  std::vector<std::uint8_t> bytes_;
+  std::uint64_t failAt_;
+};
+
+void checksumReadFailuresAreNotReportedAsNoChecksum() {
+  if (corpusMissing()) return;
+  std::vector<std::uint8_t> bytes = readBytes(corpusDirectory() / kProvenanceVariant);
+  CHECK(!bytes.empty());
+  if (bytes.empty()) return;
+  fourdgs::tool::BorrowedReadable ordinary(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  fourdgs::Result<Walk> walked = fourdgs::tool::walk(ordinary);
+  CHECK(walked.ok());
+  if (!walked) return;
+  const std::optional<fourdgs::tool::SummaryDeclaration> summary =
+      fourdgs::tool::summaryDeclaration(ordinary, *walked);
+  CHECK(summary.has_value());
+  if (!summary.has_value()) return;
+
+  FailingSummaryReadable failing(std::move(bytes), summary->start);
+  fourdgs::Result<std::optional<fourdgs::tool::Coverage>> covered =
+      fourdgs::tool::coverage(failing, *walked);
+  CHECK(!covered.ok());
+  if (!covered) {
+    CHECK(covered.error().message.find("injected summary transport failure") != std::string::npos);
   }
 }
 
@@ -901,7 +1081,7 @@ void commasMatchThePythonToolsThousandsSeparator() {
 void runTests() {
   everyInvalidVariantIsRefusedByItsOwnIdentifier();
   aConformingCaptureIsValid();
-  aConformingKeyframeDeltaFileIsValid();
+  aConformingKeyframeDeltaFileIsNotMisclassified();
   everyValidVariantIsValid();
   aWalkFramesEveryRecordAndEndsOnTheMagic();
   aCutFileReportsTheIntactPrefixAndTheByte();
@@ -916,6 +1096,11 @@ void runTests() {
   anEmbeddedChunkOpcodeIsNotARecordBoundary();
   anOrphanChunkIsDecodedByTheStreamedValidationPass();
   inspectReadsRangesRatherThanTheWholeFile();
+  keyframeDeltaValidationDoesNotReadTheWholeResource();
+  indexedBandRangesMustNameWholeTopLevelRecords();
+  summaryPlacementIsCheckedWithoutAChecksum();
+  modelSpecificAndBareStructureOpcodesAreRejected();
+  checksumReadFailuresAreNotReportedAsNoChecksum();
   aFileMissingOnlyItsTrailingMagicIsNotInspectedCleanly();
   anIndexEntryAtTheEndOfTheFileIsRefusedRatherThanDereferenced();
   aFileCutInsideItsFirstRecordStillSaysWhereItWasCut();

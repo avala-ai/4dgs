@@ -69,14 +69,16 @@ std::string jsonString(const std::string& value) {
   return out;
 }
 
-void printText(std::ostream& out, Readable& source, const Walk& walk,
-               const std::optional<Coverage>& covered) {
+Result<Walk> printText(std::ostream& out, Readable& source,
+                       const std::optional<Coverage>& covered) {
   row(out, "offset", "record", "content", "total", "crc");
   row(out, "0", "(magic)", "", "8", "-");
-  (void)fourdgs::tool::walk(source, [&](const Frame& frame, bool) {
+  Result<Walk> walked = fourdgs::tool::walk(source, [&](const Frame& frame, bool) {
     row(out, commas(frame.offset), opcodeName(frame.opcode), commas(frame.length),
         commas(frame.total()), coverageCell(covered, frame.offset, frame.total()));
   });
+  if (!walked) return walked.error();
+  const Walk& walk = *walked;
   if (walk.trailingMagic) {
     row(out, commas(walk.size - kMagicSize), "(magic)", "", "8", "-");
   }
@@ -96,20 +98,13 @@ void printText(std::ostream& out, Readable& source, const Walk& walk,
   } else {
     out << "crc: this file declares no summary checksum, so nothing here is covered\n";
   }
+  return walked;
 }
 
-void printJson(std::ostream& out, Readable& source, const Walk& walk,
-               const std::optional<Coverage>& covered) {
+Result<Walk> printJson(std::ostream& out, Readable& source, std::uint64_t initialSize,
+                       const std::optional<Coverage>& covered) {
   out << "{\n";
-  out << "  \"size\": " << walk.size << ",\n";
-  out << "  \"trailing_magic\": " << (walk.trailingMagic ? "true" : "false") << ",\n";
-  if (walk.cut.has_value()) {
-    out << "  \"stopped\": " << jsonString(walk.cut->reason) << ",\n";
-    out << "  \"truncated_at\": " << walk.cut->at << ",\n";
-  } else {
-    out << "  \"stopped\": null,\n";
-    out << "  \"truncated_at\": null,\n";
-  }
+  out << "  \"size\": " << initialSize << ",\n";
   if (covered.has_value()) {
     out << "  \"summary_crc\": {\"start\": " << covered->start << ", \"end\": " << covered->end
         << ", \"ok\": " << (covered->ok ? "true" : "false") << "},\n";
@@ -118,7 +113,7 @@ void printJson(std::ostream& out, Readable& source, const Walk& walk,
   }
   out << "  \"records\": [\n";
   std::uint64_t i = 0;
-  (void)fourdgs::tool::walk(source, [&](const Frame& frame, bool) {
+  Result<Walk> walked = fourdgs::tool::walk(source, [&](const Frame& frame, bool) {
     const std::string cell = coverageCell(covered, frame.offset, frame.total());
     std::string crc = "null";
     if (cell != "-") {
@@ -126,15 +121,31 @@ void printJson(std::ostream& out, Readable& source, const Walk& walk,
       for (char& c : lowered) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
       crc = jsonString(lowered);
     }
-    out << "    {\"offset\": " << frame.offset
+    out << (i == 0 ? "" : ",\n") << "    {\"offset\": " << frame.offset
         << ", \"opcode\": " << static_cast<unsigned>(frame.opcode)
         << ", \"name\": " << jsonString(opcodeName(frame.opcode))
         << ", \"content_length\": " << frame.length << ", \"total_length\": " << frame.total()
-        << ", \"crc\": " << crc << "}" << (i + 1 == walk.recordCount ? "" : ",") << "\n";
+        << ", \"crc\": " << crc << "}";
     i += 1;
   });
-  out << "  ]\n";
+  out << (i == 0 ? "" : "\n") << "  ],\n";
+  if (!walked) {
+    out << "  \"trailing_magic\": false,\n";
+    out << "  \"stopped\": " << jsonString(walked.error().message) << ",\n";
+    out << "  \"truncated_at\": null\n";
+    out << "}\n";
+    return walked.error();
+  }
+  out << "  \"trailing_magic\": " << (walked->trailingMagic ? "true" : "false") << ",\n";
+  if (walked->cut.has_value()) {
+    out << "  \"stopped\": " << jsonString(walked->cut->reason) << ",\n";
+    out << "  \"truncated_at\": " << walked->cut->at << "\n";
+  } else {
+    out << "  \"stopped\": null,\n";
+    out << "  \"truncated_at\": null\n";
+  }
   out << "}\n";
+  return walked;
 }
 
 }  // namespace
@@ -161,11 +172,16 @@ int runInspect(const std::string& path, bool json, std::ostream& out, std::ostre
     return kExitFailed;
   }
 
-  const std::optional<Coverage> covered = coverage(*source, *walked);
-  if (json) {
-    printJson(out, *source, *walked, covered);
-  } else {
-    printText(out, *source, *walked, covered);
+  Result<std::optional<Coverage>> covered = coverage(*source, *walked);
+  if (!covered) {
+    err << "4dgs: " << path << ": " << covered.error().message << "\n";
+    return kExitTool;
+  }
+  Result<Walk> outputWalk =
+      json ? printJson(out, *source, walked->size, *covered) : printText(out, *source, *covered);
+  if (!outputWalk) {
+    err << "4dgs: " << path << ": " << outputWalk.error().message << "\n";
+    return kExitTool;
   }
   // The prefix was recovered and reported; the file is still not a whole one, and a pipeline that
   // goes on to read it should not be told otherwise.
@@ -175,7 +191,7 @@ int runInspect(const std::string& path, bool json, std::ostream& out, std::ostre
   // luck to land there — leaves the walk with no cut to report and only the closing magic absent.
   // That file used to print "the file does not end with the magic" and exit 0, so a script
   // reading the exit code was told the incomplete file inspected cleanly.
-  const bool whole = !walked->cut.has_value() && walked->trailingMagic;
+  const bool whole = !outputWalk->cut.has_value() && outputWalk->trailingMagic;
   return whole ? kExitOk : kExitFailed;
 }
 

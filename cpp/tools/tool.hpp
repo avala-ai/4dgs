@@ -54,7 +54,12 @@ constexpr std::uint8_t kHeader = 0x01;
 constexpr std::uint8_t kFooter = 0x02;
 constexpr std::uint8_t kQuantization = 0x03;
 constexpr std::uint8_t kChunk = 0x05;
+/// Attribute Stream has a registry number for use inside Chunk, but is never a wire record.
+constexpr std::uint8_t kAttributeStream = 0x06;
+constexpr std::uint8_t kShBandStream = 0x07;
 constexpr std::uint8_t kChunkIndex = 0x08;
+constexpr std::uint8_t kStatistics = 0x0C;
+constexpr std::uint8_t kSummaryOffset = 0x0F;
 /// A keyframe-delta file's delta chunks. Deliberately not a flag on Chunk: a Chunk is
 /// independently decodable and a Delta Chunk is exactly the record that is not.
 constexpr std::uint8_t kDeltaChunk = 0x10;
@@ -169,17 +174,8 @@ class BorrowedReadable : public Readable {
   Span<const std::uint8_t> bytes_;
 };
 
-/// A whole file, for the one check that cannot be performed any other way.
-///
-/// Cross-SDK principle 1 is not a guideline this tool gets to interpret: `inspect` and the
-/// gaussian-birth half of `validate` read ranges, and never hold more than one chunk and one
-/// 64 KiB buffer, whatever the file's size.
-///
-/// The exception is `keyframe-delta`, and it is the C ABI's rather than this tool's:
-/// `fourdgs_keyframe_delta_states_json` takes `(const uint8_t*, size_t)`, with no range-reading
-/// counterpart and no per-entry surface to drive one chain at a time, so composing those chains
-/// at all means handing the core the whole file. That surface belongs to the Rust crate; until it
-/// grows a reader overload, this is the one path that buffers.
+/// Convenience for small test fixtures and callers that explicitly request owned bytes.
+/// Validation and inspection never use it; both operate on `Readable` ranges.
 Result<std::vector<std::uint8_t>> readWhole(const std::string& path);
 
 /// The byte a refusal fired at, and what sits there.
@@ -247,9 +243,8 @@ struct IndexEntry {
 /// declared degree so that what gets decoded is what the file claims to carry.
 ///
 /// One chunk resident at a time on the indexed path (cross-SDK principle 1), which is what
-/// keeps this bounded on a file too large to hold. A file with no index has no per-chunk
-/// addressing to use, so it is decoded front to back and the refusal comes back without an
-/// offset rather than with a guessed one.
+/// keeps this bounded on a file too large to hold. A file with no index has no bounded
+/// per-chunk surface in the C++ core, so validation reports that check as incomplete.
 ///
 /// The scene is opened over `source` rather than over a buffer: `fourdgs_open_memory` copies the
 /// bytes it is given, so handing it a whole file would cost a second copy of that file before the
@@ -274,13 +269,15 @@ std::string temporalModel(Readable& source, const Walk& walk);
 struct SummaryDeclaration {
   /// First byte the checksum covers.
   std::uint64_t start = 0;
+  /// First Summary Offset record, or zero when that group is absent.
+  std::uint64_t offsetStart = 0;
   std::uint32_t crc = 0;
   /// One past the last covered byte: where the Footer record's opcode sits.
   std::uint64_t end = 0;
 };
 
-/// Empty when the file has no Footer, or declares no summary checksum — which is a property of
-/// the file rather than a failure, because writing one is an encoder option.
+/// Empty only when a complete Footer cannot be read. A zero checksum remains in the declaration,
+/// because summary placement is normative independently of checksum presence.
 std::optional<SummaryDeclaration> summaryDeclaration(Readable& source, const Walk& walk);
 
 /// The region the Footer's summary checksum covers, and whether it agrees.
@@ -296,12 +293,12 @@ struct Coverage {
   bool ok = false;
 };
 
-/// Empty when the file declares no summary checksum, which is a property of the file rather
-/// than a failure: writing one is an encoder option.
+/// A successful empty value means the file declares no checksum. An error means the declared
+/// range could not be read, which callers must not describe as checksum absence.
 ///
 /// The checksum is accumulated over the covered range through a fixed buffer, so a summary that
 /// spans most of a large file costs that buffer and not the range.
-std::optional<Coverage> coverage(Readable& source, const Walk& walk);
+Result<std::optional<Coverage>> coverage(Readable& source, const Walk& walk);
 
 /// The cell for one record: `ok`, `MISMATCH`, or `-` for a record the checksum does not cover.
 const char* coverageCell(const std::optional<Coverage>& coverage, std::uint64_t at,
@@ -312,10 +309,9 @@ std::uint32_t crc32(const std::uint8_t* data, std::size_t length);
 
 /// The same, over a byte range of `source`, a buffer at a time.
 ///
-/// Empty when the range could not be read whole — a file that shrank under the walk, or a
-/// declared range that runs past the end — which is a different answer from a checksum that
-/// disagreed, and the caller tells them apart.
-std::optional<std::uint32_t> crc32Range(Readable& source, std::uint64_t start, std::uint64_t end);
+/// A file that shrank under the walk or a transport failure is returned as an error carrying the
+/// failed byte range; it is never collapsed into checksum absence.
+Result<std::uint32_t> crc32Range(Readable& source, std::uint64_t start, std::uint64_t end);
 
 /// A count with thousands separators, matching the Python tool's `{:,}`.
 std::string commas(std::uint64_t value);
@@ -338,7 +334,12 @@ struct Finding {
 
 struct Report {
   std::vector<Finding> findings;
+  /// False when a bounded implementation cannot finish a check with the available core API.
+  /// This is not a verdict against the file, and the CLI reports it as a tool failure rather
+  /// than printing `valid` or `INVALID`.
+  bool complete = true;
 
+  bool hasErrors() const;
   bool ok() const;
   std::optional<Severity> worst() const;
 };
