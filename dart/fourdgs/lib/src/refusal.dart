@@ -73,12 +73,15 @@ class FourdgsCut {
   final bool insideARecord;
 }
 
-/// The result of walking a file's framing: every record, and the cut if there
-/// was one.
+/// The result of walking a file's framing, and the cut if there was one.
 class FourdgsWalk {
   FourdgsWalk({required this.size});
 
   final List<FourdgsFrame> records = <FourdgsFrame>[];
+  final Map<int, FourdgsFrame> _first = <int, FourdgsFrame>{};
+  final Map<int, int> _counts = <int, int>{};
+  int recordCount = 0;
+  FourdgsFrame? last;
   FourdgsCut? cut;
 
   /// True when the last eight bytes are the magic, as a whole file's are.
@@ -88,11 +91,12 @@ class FourdgsWalk {
 
   /// The first record with this opcode, if the file carries one.
   FourdgsFrame? first(int opcode) {
-    for (final FourdgsFrame frame in records) {
-      if (frame.opcode == opcode) return frame;
-    }
-    return null;
+    return _first[opcode];
   }
+
+  int count(int opcode) => _counts[opcode] ?? 0;
+
+  int get recordsOmitted => recordCount - records.length;
 
   /// How many of the reported records are whole.
   ///
@@ -101,7 +105,7 @@ class FourdgsWalk {
   /// — but it is not something a streamed reader keeps.
   int get intact {
     final int incomplete = cut != null && cut!.insideARecord ? 1 : 0;
-    final int whole = records.length - incomplete;
+    final int whole = recordCount - incomplete;
     return whole < 0 ? 0 : whole;
   }
 }
@@ -110,9 +114,9 @@ class FourdgsWalk {
 ///
 /// Records are at least nine bytes, but each retained frame is a heap object.
 /// A ceiling keeps a hostile file made entirely of empty records from turning
-/// a bounded nine-byte scan into unbounded object accumulation. One million is
-/// far beyond a practical scene's record count while remaining a fixed cost.
-const int maxFramedRecords = 1000000;
+/// a bounded nine-byte scan into unbounded object accumulation. Records beyond
+/// it are still framed and counted; they are omitted only from the report table.
+const int maxFramedRecords = 65536;
 
 /// Every top-level record, from framing alone.
 ///
@@ -164,13 +168,13 @@ Future<FourdgsWalk> walkFourdgsFraming(FourdgsReadable source) async {
     // A record is listed either way: a declared length that runs off the end is
     // a fact about that record, and hiding the record hides the field that
     // carries the fault.
-    if (out.records.length >= maxFramedRecords) {
-      throw FourdgsMalformedFile(
-        'the file carries more than ${fourdgsCommas(maxFramedRecords)} records; '
-        'the framing table is capped before another record is retained',
-      );
+    out.recordCount += 1;
+    out.last = frame;
+    out._first.putIfAbsent(opcode, () => frame);
+    out._counts[opcode] = (out._counts[opcode] ?? 0) + 1;
+    if (out.records.length < maxFramedRecords) {
+      out.records.add(frame);
     }
-    out.records.add(frame);
     final int end = at + frame.total;
     if (end > size) {
       out.cut = FourdgsCut(

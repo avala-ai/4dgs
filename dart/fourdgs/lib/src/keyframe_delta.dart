@@ -303,23 +303,25 @@ KeyframeDeltaState _applyDelta(
     final grown = <int, _Column>{};
     for (final attribute in attributes) {
       final existing = bins[attribute];
-      final added = birthBins[attribute]!;
-      if (existing != null && existing.channels != added.channels) {
+      final added = birthBins[attribute];
+      if (existing != null &&
+          added != null &&
+          existing.channels != added.channels) {
         throw FourdgsMalformedFile(
           'a birth carries ${added.channels} channels for attribute $attribute, '
           'but the live population carries ${existing.channels}',
         );
       }
-      final ch = added.channels;
-      final before = existing?.values ?? Int32List(0);
+      final ch = existing?.channels ?? added!.channels;
+      // Optional attributes omitted by one side carry their registry default
+      // (zero). Keep every column aligned whether it first appears in this
+      // birth or disappears from it; required attributes were checked above.
+      final before = existing?.values ?? Int32List(ids.length * ch);
+      final after = added?.values ?? Int32List(birthIds.length * ch);
       final merged =
-          Int32List(before.length + added.values.length)
+          Int32List(before.length + after.length)
             ..setRange(0, before.length, before)
-            ..setRange(
-              before.length,
-              before.length + added.values.length,
-              added.values,
-            );
+            ..setRange(before.length, before.length + after.length, after);
       grown[attribute] = _Column(ch, merged);
     }
     ids = grownIds;

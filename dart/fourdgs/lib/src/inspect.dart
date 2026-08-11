@@ -159,9 +159,13 @@ String formatFourdgsInspection(FourdgsInspection inspection) {
   }
 
   out.writeln();
-  out.writeln(
-    '${walk.records.length} records, ${fourdgsCommas(walk.size)} bytes',
-  );
+  out.writeln('${walk.recordCount} records, ${fourdgsCommas(walk.size)} bytes');
+  if (walk.recordsOmitted > 0) {
+    out.writeln(
+      '${walk.recordsOmitted} records omitted from the bounded table after '
+      'the first $maxFramedRecords; framing still covered the complete file',
+    );
+  }
   final FourdgsCut? cut = walk.cut;
   if (cut != null) {
     out.writeln('truncated at byte ${fourdgsCommas(cut.at)}: ${cut.reason}');
@@ -209,6 +213,8 @@ String formatFourdgsInspectionJson(FourdgsInspection inspection) {
   out.writeln('{');
   out.writeln('  "size": ${walk.size},');
   out.writeln('  "trailing_magic": ${walk.trailingMagic},');
+  out.writeln('  "record_count": ${walk.recordCount},');
+  out.writeln('  "records_omitted": ${walk.recordsOmitted},');
   if (cut == null) {
     out.writeln('  "stopped": null,');
     out.writeln('  "truncated_at": null,');

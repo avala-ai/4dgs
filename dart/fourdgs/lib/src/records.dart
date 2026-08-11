@@ -558,7 +558,14 @@ FourdgsChunkBody parseChunk(Uint8List content) {
     uncompressedSize: c.u64(),
   );
   final length = c.u64();
-  return FourdgsChunkBody(head, c.take(length), streamsOffset: c.pos - length);
+  final records = c.take(length);
+  if (head.compression.isEmpty && head.uncompressedSize != records.length) {
+    throw FourdgsMalformedFile(
+      'the uncompressed Chunk declares ${head.uncompressedSize} record bytes '
+      'but carries ${records.length}',
+    );
+  }
+  return FourdgsChunkBody(head, records, streamsOffset: c.pos - length);
 }
 
 /// A spherical-harmonic band's own byte range within the file.

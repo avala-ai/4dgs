@@ -70,6 +70,49 @@ void main() {
         );
       },
     );
+
+    test(
+      'extension-heavy files are counted without an arbitrary refusal',
+      () async {
+        final builder = BytesBuilder()..add(fourdgsMagic);
+        final emptyPrivate = _record(0x80, Uint8List(0));
+        for (int i = 0; i <= maxFramedRecords; i++) {
+          builder.add(emptyPrivate);
+        }
+        builder.add(fourdgsMagic);
+
+        final walk = await walkFourdgsFraming(FourdgsBytes(builder.toBytes()));
+        expect(walk.recordCount, maxFramedRecords + 1);
+        expect(walk.records, hasLength(maxFramedRecords));
+        expect(walk.recordsOmitted, 1);
+        expect(walk.trailingMagic, isTrue);
+      },
+    );
+  });
+
+  test('an uncompressed Chunk must declare its carried block size', () {
+    final streams = _keyframeStreams(windowIndex: 0);
+    final content =
+        (BytesBuilder()
+              ..add(_f64(0.0))
+              ..add(_f64(1.0))
+              ..add(_u32(0))
+              ..add(_u32(1))
+              ..add(_string(''))
+              ..add(_u64(streams.length + 1))
+              ..add(_u64(streams.length))
+              ..add(streams))
+            .toBytes();
+    expect(
+      () => parseChunk(content),
+      throwsA(
+        isA<FourdgsMalformedFile>().having(
+          (error) => error.message,
+          'message',
+          allOf(contains('uncompressed Chunk'), contains('but carries')),
+        ),
+      ),
+    );
   });
 
   group('placing a refusal', () {
@@ -1441,7 +1484,7 @@ Uint8List _gaussianBirthWithMalformedUnindexedChunk() {
           ..add(_u32(0))
           ..add(_u32(count))
           ..add(_string(''))
-          ..add(_u64(0))
+          ..add(_u64(streams.length))
           ..add(_u64(streams.length))
           ..add(streams))
         .toBytes(),
@@ -1509,7 +1552,7 @@ Uint8List _keyframesWithSwappedBands() {
           ..add(_u32(0))
           ..add(_u32(1))
           ..add(_string(''))
-          ..add(_u64(0))
+          ..add(_u64(_keyframeStreams(windowIndex: 0, muTBin: muTBin).length))
           ..add(_u64(_keyframeStreams(windowIndex: 0, muTBin: muTBin).length))
           ..add(_keyframeStreams(windowIndex: 0, muTBin: muTBin)))
         .toBytes(),
@@ -1642,7 +1685,7 @@ Uint8List _keyframeDeltaWithRetiredIdReuse() {
           ..add(_u32(0))
           ..add(_u32(1))
           ..add(_string(''))
-          ..add(_u64(0))
+          ..add(_u64(streams.length))
           ..add(_u64(streams.length))
           ..add(streams))
         .toBytes(),
@@ -1846,7 +1889,7 @@ Uint8List _keyframeDelta({
         ..add(_u32(0)) // level
         ..add(_u32(1)) // count
         ..add(_string('')) // compression
-        ..add(_u64(0)) // uncompressed_size
+        ..add(_u64(streams.length)) // uncompressed_size
         ..add(_u64(streams.length))
         ..add(streams);
   final Uint8List chunkRecord = _record(opChunk, chunk.toBytes());
@@ -1955,7 +1998,7 @@ Uint8List _keyframeDeltaWithEmptyDelta({
           ..add(_u32(0))
           ..add(_u32(1))
           ..add(_string(''))
-          ..add(_u64(0))
+          ..add(_u64(streams.length))
           ..add(_u64(streams.length))
           ..add(streams))
         .toBytes(),

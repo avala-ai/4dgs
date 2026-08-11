@@ -42,7 +42,7 @@ import 'exceptions.dart';
 import 'indexed_reader.dart';
 import 'keyframe_delta.dart';
 import 'opcode.dart';
-import 'provenance.dart' show FourdgsProvenance, lengthUnitMetres;
+import 'provenance.dart' show lengthUnitMetres;
 import 'quantization.dart';
 import 'readable.dart';
 import 'records.dart';
@@ -170,7 +170,6 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
   FourdgsFooter? footer;
   int footerOffset = -1;
   int footerLength = -1;
-  final List<int> footerOffsets = <int>[];
   int firstOpcode = -1;
   int chunkCount = 0;
   int counted = 0;
@@ -315,7 +314,6 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
             report.error('a chunk index entry does not parse: ${_say(error)}');
           }
         case opFooter:
-          footerOffsets.add(frame.offset);
           try {
             footer = FourdgsFooter.parse(
               await _bytesOf(source, frame, most: footerFixedBytes),
@@ -418,22 +416,22 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
   // Header that is present but unreadable has already been reported as one, and
   // saying "no Header record" about a file that plainly has one sends its holder
   // looking for the wrong fault.
-  if (!seen.contains(opHeader)) report.error('no Header record');
-  if (!seen.contains(opQuantization)) report.error('no Quantization record');
-  if (!seen.contains(opFooter)) report.error('no Footer record');
-  if (footerOffsets.length > 1) {
+  if (walk.count(opHeader) == 0) report.error('no Header record');
+  if (walk.count(opQuantization) == 0) report.error('no Quantization record');
+  if (walk.count(opFooter) == 0) report.error('no Footer record');
+  if (walk.count(opFooter) > 1) {
     report.error(
-      'the file carries ${footerOffsets.length} Footer records at '
-      '${footerOffsets.join(", ")}; the Footer must appear exactly once as '
-      'the final record',
+      'the file carries ${walk.count(opFooter)} Footer records (the first is at '
+      'byte ${walk.first(opFooter)!.offset}); the Footer must appear exactly '
+      'once as the final record',
     );
   }
-  if (footerOffsets.isNotEmpty &&
-      walk.records.isNotEmpty &&
-      walk.records.last.opcode != opFooter) {
-    final FourdgsFrame last = walk.records.last;
+  if (walk.count(opFooter) > 0 &&
+      walk.last != null &&
+      walk.last!.opcode != opFooter) {
+    final FourdgsFrame last = walk.last!;
     report.error(
-      'the Footer at byte ${footerOffsets.last} is followed by '
+      'the Footer at byte ${walk.first(opFooter)!.offset} is followed by '
       '${opcodeName(last.opcode)} at byte ${last.offset}; the Footer must be '
       'the final record',
     );
@@ -747,26 +745,7 @@ Future<void> _checkAuxiliaryRecords(
     statistics: scene.statistics,
     summaryOffsets: scene.summaryOffsets,
   );
-  try {
-    final FourdgsProvenance provenance = await readFourdgsProvenance(
-      source,
-      complete,
-    );
-    for (final frame in provenance.frames) {
-      final double? registered = lengthUnitMetres[frame.lengthUnit];
-      if (registered != null &&
-          frame.metresPerUnit > 0.0 &&
-          frame.metresPerUnit != registered) {
-        report.error(
-          'Coordinate Frame "${frame.name}" declares length_unit '
-          '${frame.lengthUnit}, which means $registered metres per unit, but '
-          'metres_per_unit is ${frame.metresPerUnit}; both fields must agree',
-        );
-      }
-    }
-  } on FourdgsException catch (error) {
-    report.error('the provenance records do not decode: ${_say(error)}');
-  }
+  await _checkProvenanceRecords(source, walk, report);
   try {
     await readFourdgsObjects(source, complete);
   } on FourdgsException catch (error) {
@@ -803,6 +782,119 @@ Future<void> _checkAuxiliaryRecords(
         'the Metadata record at byte ${frame.offset} does not decode: ${_say(error)}',
       );
     }
+  }
+}
+
+/// Parse provenance a record at a time instead of materializing the family.
+///
+/// Trajectories are the important case: each record has a bounded decoded
+/// allocation, but retaining every sample array until the final cross-record
+/// checks makes peak memory the size of the capture. Only names survive the
+/// first pass; a second pass checks references after all targets are known.
+Future<void> _checkProvenanceRecords(
+  FourdgsReadable source,
+  FourdgsWalk walk,
+  _Report report,
+) async {
+  final frameNames = <String>{};
+  final sensorNames = <String>{};
+  final trajectoryNames = <String>{};
+  final anchorNames = <String>{};
+
+  Never duplicate(String kind, String name, String section) =>
+      throw FourdgsMalformedFile(
+        "two $kind records are named '$name'; these records are referred to "
+        'by name and nothing else (section $section)',
+      );
+
+  try {
+    for (final FourdgsFrame frame in walk.records) {
+      if (frame.offset + frame.total > walk.size) continue;
+      switch (frame.opcode) {
+        case opCoordinateFrame:
+          final value = FourdgsCoordinateFrame.parse(
+            await _bytesOf(source, frame),
+          );
+          if (!frameNames.add(value.name)) {
+            duplicate('CoordinateFrame', value.name, '5.15.2');
+          }
+          final double? registered = lengthUnitMetres[value.lengthUnit];
+          if (registered != null &&
+              value.metresPerUnit > 0.0 &&
+              value.metresPerUnit != registered) {
+            report.error(
+              'Coordinate Frame "${value.name}" declares length_unit '
+              '${value.lengthUnit}, which means $registered metres per unit, '
+              'but metres_per_unit is ${value.metresPerUnit}; both fields must '
+              'agree',
+            );
+          }
+        case opSensorCalibration:
+          final value = FourdgsSensorCalibration.parse(
+            await _bytesOf(source, frame),
+          );
+          if (!sensorNames.add(value.name)) {
+            duplicate('SensorCalibration', value.name, '5.15.3');
+          }
+          if (value.poseReference != poseToScene &&
+              value.poseReference != poseToRig) {
+            throw FourdgsMalformedFile(
+              "sensor '${value.name}' declares pose_reference "
+              '${value.poseReference}; the registry defines 0 (scene) and 1 '
+              '(rig)',
+            );
+          }
+        case opRigTrajectory:
+          final value = FourdgsRigTrajectory.parse(
+            await _bytesOf(source, frame),
+          );
+          // Zero-sample trajectories are read as absent, including for name
+          // uniqueness and later rig references.
+          if (value.sampleCount > 0 && !trajectoryNames.add(value.name)) {
+            duplicate('RigTrajectory', value.name, '5.15.4');
+          }
+        case opGeodeticAnchor:
+          final value = FourdgsGeodeticAnchor.parse(
+            await _bytesOf(source, frame),
+          );
+          if (!anchorNames.add(value.frameName)) {
+            duplicate('GeodeticAnchor', value.frameName, '5.15.5');
+          }
+      }
+    }
+
+    // Resolve references only after later records had a chance to declare the
+    // target. Reparse and release each small record instead of retaining every
+    // sensor and anchor object from the first pass.
+    for (final FourdgsFrame frame in walk.records) {
+      if (frame.offset + frame.total > walk.size) continue;
+      if (frame.opcode == opSensorCalibration) {
+        final sensor = FourdgsSensorCalibration.parse(
+          await _bytesOf(source, frame),
+        );
+        if (sensor.poseReference == poseToRig &&
+            !trajectoryNames.contains(sensor.rigName)) {
+          throw FourdgsMalformedFile(
+            "sensor '${sensor.name}' is posed against rig "
+            "'${sensor.rigName}', which this file does not carry (section "
+            '5.15.3)',
+          );
+        }
+      } else if (frame.opcode == opGeodeticAnchor) {
+        final anchor = FourdgsGeodeticAnchor.parse(
+          await _bytesOf(source, frame),
+        );
+        if (!frameNames.contains(anchor.frameName)) {
+          throw FourdgsMalformedFile(
+            "a GeodeticAnchor anchors frame '${anchor.frameName}', which this "
+            'file does not define; an anchor for a frame nobody declared is a '
+            'latitude attached to nothing (section 5.15.5)',
+          );
+        }
+      }
+    }
+  } on FourdgsException catch (error) {
+    report.error('the provenance records do not decode: ${_say(error)}');
   }
 }
 
