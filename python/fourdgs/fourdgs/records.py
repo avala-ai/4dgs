@@ -81,7 +81,7 @@ class Header:
     @staticmethod
     def parse(content) -> Header:
         c = Cursor(content)
-        return Header(
+        header = Header(
             profile=c.string(),
             library=c.string(),
             duration_sec=c.f64(),
@@ -93,6 +93,9 @@ class Header:
             flags=c.u8(),
             attributes=c.str_map(),
         )
+        if not 0 <= header.sh_degree <= 3:
+            raise MalformedFile(f"the Header declares sh_degree {header.sh_degree}; version 1 defines 0 through 3")
+        return header
 
 
 @dataclass

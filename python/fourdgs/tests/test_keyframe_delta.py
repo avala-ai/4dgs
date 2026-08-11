@@ -331,6 +331,14 @@ def test_an_open_ended_timeline_accepts_infinity_only_on_its_final_interval():
             kd.check_tiling(index, duration_sec=duration)
 
 
+def test_an_open_ended_entry_builds_its_chain_without_an_infinite_probe():
+    index = [
+        _entry(0.0, 1.0, 100),
+        _entry(1.0, np.inf, 200, kind=1, reference=100, keyframe=100, depth=1),
+    ]
+    assert [entry.chunk_offset for entry in kd.chain_from(index, index[-1])] == [100, 200]
+
+
 def test_absolute_bins_stay_in_the_signed_i32_domain():
     too_large = np.iinfo(np.int32).max + 1
     with pytest.raises(MalformedFile) as caught:

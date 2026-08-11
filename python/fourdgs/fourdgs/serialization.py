@@ -376,6 +376,12 @@ def decode_stream(cursor: Cursor) -> tuple[int, np.ndarray]:
         raise MalformedFile(f"attribute {attribute_id}: zero channels")
     if mode not in (MODE_RAW, MODE_DELTA, MODE_CONST):
         raise TruncatedFile(f"attribute {attribute_id}: unknown stream mode {mode}")
+    # Codec is a property of the known stream header, even when there are no
+    # symbols to decompress. Keep this before the empty fast path so a reserved
+    # codec does not become conditionally legal at element_count zero. Unknown
+    # attributes still bypass this function through decode_stream_or_skip.
+    if codec not in CODEC_NAMES:
+        raise UnsupportedCodec(f"unknown stream codec {codec}", code="unknown-stream-codec")
     if count == 0:
         cursor.take(payload_len)
         return attribute_id, np.zeros((0, channels), dtype=np.int64)

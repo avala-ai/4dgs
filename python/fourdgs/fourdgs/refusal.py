@@ -493,6 +493,19 @@ def scan_front_to_back(data: bytes, where: Walk) -> ChunkRefusal | None:
                 # The band index, which the record carries and the stream header does not:
                 # a band stream's `attribute_id` is 0x07 and collides with `mu_t` (§5.7).
                 band = cursor.u8()
+                maximum = declared_degree if declared_degree is not None else 3
+                if band < 1 or band > maximum:
+                    raise MalformedFile(
+                        f"the Chunk at {band_owner_at} is followed by SH band {band}; "
+                        f"the Header declares degree {declared_degree}, requiring bands "
+                        f"{list(range(1, maximum + 1))}",
+                        code="index-record-mismatch",
+                    )
+                if band in bands:
+                    raise MalformedFile(
+                        f"the Chunk at {band_owner_at} is followed by SH band {band} more than once",
+                        code="index-record-mismatch",
+                    )
                 attribute, values = decode_stream(cursor)
                 if attribute != op.SH_BAND_STREAM:
                     raise MalformedFile(

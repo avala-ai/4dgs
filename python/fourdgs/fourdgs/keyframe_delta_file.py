@@ -35,7 +35,7 @@ import numpy as np
 from . import opcode as op
 from . import records as rec
 from .exceptions import MalformedFile, UnsupportedCodec
-from .keyframe_delta import State, apply_delta, chain_for, check_tiling, keyframe_state
+from .keyframe_delta import State, apply_delta, chain_from, check_tiling, keyframe_state
 from .keyframe_delta_writer import (
     KeyframeDeltaOptions,
     Sample,
@@ -1122,7 +1122,7 @@ def compose_chain(
                 f"{indexed.kind}; expected 0 (keyframe) or 1 (delta)",
                 code="unknown-chunk-kind",
             )
-    chain = chain_for(index, (entry.t0 + entry.t1) / 2.0)
+    chain = chain_from(index, entry)
     keyframe_at = chain[0].chunk_offset
     for link in chain:
         if link.extended and link.keyframe_offset != keyframe_at:
@@ -1662,6 +1662,19 @@ def scan_streamed(
                 )
             band = Cursor(record.content)
             band_number = band.u8()
+            maximum = declared_degree if declared_degree is not None else 3
+            if band_number < 1 or band_number > maximum:
+                raise MalformedFile(
+                    f"the state chunk at {band_owner} is followed by SH band {band_number}; "
+                    f"the Header declares degree {declared_degree}, requiring bands "
+                    f"{list(range(1, maximum + 1))}",
+                    code="index-record-mismatch",
+                )
+            if band_number in bands:
+                raise MalformedFile(
+                    f"the state chunk at {band_owner} is followed by SH band {band_number} more than once",
+                    code="index-record-mismatch",
+                )
             attribute, values = decode_stream(band)
             if attribute != op.SH_BAND_STREAM:
                 raise MalformedFile(

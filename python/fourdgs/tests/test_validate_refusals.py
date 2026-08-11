@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import os
 import struct
 import subprocess
@@ -295,6 +296,33 @@ class TestKeyframeDelta:
         report = validate(_keyframe_file(write_index=False))
         assert report.ok, [str(f) for f in report.findings]
         assert [f.severity for f in report.findings] == ["warning"], "only the no-index warning"
+
+    def test_an_open_ended_indexed_sequence_composes_its_selected_entry(self):
+        data = _single_keyframe_file(write_index=True)
+        header_record = _first_record(data, op.HEADER)
+        header = rec.Header.parse(header_record.content)
+        header.duration_sec = math.inf
+        data = (
+            data[: header_record.offset]
+            + header.encode()
+            + data[header_record.offset + 9 + len(header_record.content) :]
+        )
+        chunk = _first_record(data, op.CHUNK)
+        patched = bytearray(data)
+        struct.pack_into("<d", patched, chunk.offset + 9 + 8, math.inf)
+        data = _repack_summary(
+            bytes(patched),
+            lambda _i, entry: _with(entry, t1=math.inf),
+        )
+        opened = kdf.open_indexed(data)
+        state = kdf.compose_chain(
+            data,
+            opened.index,
+            opened.index[-1],
+            opened.windows,
+            opened.grids,
+        )
+        assert state.count == 1
 
     def test_the_header_gaussian_count_is_checked_against_the_distinct_ids(self):
         """`gaussian_count` counts distinct gaussians over the sequence under this model.
@@ -772,6 +800,29 @@ class TestKeyframeDelta:
 
 
 class TestTheIndexIsData:
+    def test_only_the_footer_selected_index_proves_physical_chunk_coverage(self):
+        data = _real_file()
+        entries = _index_entries(data)
+        assert len(entries) >= 2
+        omitted = entries[-1]
+        without = _repack_summary(
+            data,
+            lambda i, entry: None if i == len(entries) - 1 else entry,
+        )
+        footer = _first_record(without, op.FOOTER)
+        # A Statistics separator ends the consecutive index run consumed by
+        # open_indexed. The stray entry after it still names the omitted Chunk,
+        # but a seeking reader never sees it.
+        stray = put_record(op.STATISTICS, b"") + omitted.encode()
+        malformed = without[: footer.offset] + stray + without[footer.offset :]
+        report = validate(malformed)
+        assert not report.ok
+        assert any("lies outside the Footer-selected summary index" in f.message for f in report.findings)
+        assert any(
+            f"Chunk record at byte {omitted.chunk_offset} is not named by any chunk index entry" in f.message
+            for f in report.findings
+        ), report.findings
+
     """An index entry is data, and data in an untrusted file can say anything.
 
     Every check that decodes a chunk is driven by the index, so a chunk no entry names is
@@ -851,6 +902,41 @@ class TestSHBandStreams:
         indexed = _with(_index_entries(_keyframe_file())[0], chunk_offset=owner)
         with pytest.raises(MalformedFile, match="band 1 more than once"):
             kdf.check_index_bands(data, [indexed], sh_degree=1)
+
+    def test_indexless_scanners_reject_duplicate_bands_before_retaining_a_run(self):
+        band = put_record(
+            op.SH_BAND_STREAM,
+            bytes([1])
+            + encode_stream(
+                op.SH_BAND_STREAM,
+                np.zeros((1, 9), dtype=np.int64),
+                channels=9,
+            ),
+        )
+        keyframe = _patch_sh_degree(_single_keyframe_file(write_index=False), 1)
+        chunk = _first_record(keyframe, op.CHUNK)
+        after = chunk.offset + 9 + len(chunk.content)
+        duplicate = keyframe[:after] + band + band + keyframe[after:]
+        with pytest.raises(MalformedFile, match="band 1 more than once"):
+            list(kdf.scan_streamed(duplicate))
+
+        birth = _patch_sh_degree(_real_file(write_index=False), 1)
+        owner = _first_record(birth, op.CHUNK)
+        head, _streams = rec.parse_chunk(owner.content)
+        birth_band = put_record(
+            op.SH_BAND_STREAM,
+            bytes([1])
+            + encode_stream(
+                op.SH_BAND_STREAM,
+                np.zeros((head.count, 9), dtype=np.int64),
+                channels=9,
+            ),
+        )
+        after = owner.offset + 9 + len(owner.content)
+        duplicate = birth[:after] + birth_band + birth_band + birth[after:]
+        refused = refusal.scan_front_to_back(duplicate, refusal.walk(duplicate, retain_records=False))
+        assert refused is not None
+        assert "band 1 more than once" in str(refused.error)
 
     def test_keyframe_delta_physical_bands_need_not_be_in_band_number_order(self):
         paths = [p for p in _variants(CORPUS) if "SHDegree2" in p.stem and "UseChunkIndex" in p.stem]
@@ -1045,6 +1131,31 @@ class TestWholeFileCompatibilityGates:
         assert attribute == 0x7F
         assert values is None
         assert cursor.remaining() == 0
+
+    def test_a_known_empty_stream_still_rejects_an_unknown_codec(self):
+        stream = bytearray(
+            encode_stream(
+                op.A_POSITION,
+                np.zeros((0, 3), dtype=np.int64),
+                channels=3,
+                codec=CODEC_DEFLATE,
+            )
+        )
+        stream[3] = 9
+        with pytest.raises(UnsupportedCodec, match="unknown stream codec 9") as caught:
+            decode_stream(Cursor(bytes(stream)))
+        assert caught.value.code == "unknown-stream-codec"
+
+    def test_header_sh_degree_is_limited_to_the_version_one_registry(self):
+        header = _first_record(_single_keyframe_file(write_index=False), op.HEADER)
+        content = bytearray(header.content)
+        # Re-encode to locate the fixed one-byte field without depending on the
+        # lengths of the profile, library, or temporal-model strings.
+        parsed = rec.Header.parse(content)
+        parsed.sh_degree = 4
+        malformed = next(iter_records(parsed.encode()))
+        with pytest.raises(MalformedFile, match=r"sh_degree 4.*0 through 3"):
+            rec.Header.parse(malformed.content)
 
     @pytest.mark.parametrize(
         ("opcode", "mutate", "code"),

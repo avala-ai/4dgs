@@ -360,11 +360,23 @@ def chain_for(index, t: float) -> list:
     byte cost is the sum of the entries' `chunk_length`, so a consumer can budget a seek
     before it issues a request.
     """
-    by_offset = {entry.chunk_offset: entry for entry in index}
     current = next((entry for entry in index if entry.t0 <= t < entry.t1), None)
     if current is None:
         raise _refuse(f"no state chunk covers t={t}", "non-tiling-chunks")
 
+    return chain_from(index, current)
+
+
+def chain_from(index, current) -> list:
+    """The keyframe and deltas that reconstruct an already-selected entry.
+
+    Indexed callers already hold the entry they intend to compose. Building its
+    chain directly avoids inventing a midpoint, which is not finite for the legal
+    final interval ``[t0, +Infinity)`` and can also re-select the wrong entry in an
+    index that has not yet had its tiling diagnosed.
+    """
+
+    by_offset = {entry.chunk_offset: entry for entry in index}
     chain = [current]
     while chain[0].kind != 0:
         head = chain[0]

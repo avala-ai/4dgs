@@ -255,11 +255,13 @@ def validate(data: bytes) -> Report:
     chunk_count = 0
     counted = 0
     index: list[rec.ChunkIndexEntry] = []
+    index_record_offsets: list[int] = []
     #: Where every Chunk and Delta Chunk record sits, in file order — what the index is
     #: checked against, and what says a Delta Chunk turned up in a file that declares a
     #: model with no such record.
     first_delta_offset: int | None = None
     footer = None
+    footer_offset: int | None = None
     provenance = Provenance()
     objects = ObjectLayer()
     audio_sources: dict[int, rec.AudioSource] = {}
@@ -293,6 +295,7 @@ def validate(data: bytes) -> Report:
                     first_delta_offset = record.offset
             elif record.opcode == op.CHUNK_INDEX:
                 index.append(rec.ChunkIndexEntry.parse(record.content))
+                index_record_offsets.append(record.offset)
             elif record.opcode == op.AUDIO_SOURCE:
                 source = rec.AudioSource.parse(record.content)
                 if first_chunk_seen:
@@ -347,6 +350,7 @@ def validate(data: bytes) -> Report:
                 audio_data[payload.source_id] = len(payload.data)
             elif record.opcode == op.FOOTER:
                 footer = rec.Footer.parse(record.content)
+                footer_offset = record.offset
             elif record.opcode == op.COORDINATE_FRAME:
                 provenance.frames.append(rec.CoordinateFrame.parse(record.content))
             elif record.opcode == op.SENSOR_CALIBRATION:
@@ -396,6 +400,31 @@ def validate(data: bytes) -> Report:
         report.error("no Quantization record")
     if footer is None:
         report.error("no Footer record")
+
+    # The indexed reader consumes only the consecutive Chunk Index records at
+    # the Footer-selected start of the contiguous summary. A stray index in
+    # front matter, after Statistics, or beside a zero summary is not coverage:
+    # treating it as such lets a physical Chunk evade both the omission check
+    # and the payload scan even though a seeking reader never sees that entry.
+    selected_index_offsets: set[int] = set()
+    if footer is not None and footer_offset is not None and footer.summary_start:
+        frames = list(walk.intact_records())
+        start = next((i for i, frame in enumerate(frames) if frame.offset == footer.summary_start), None)
+        if start is None or frames[start].opcode != op.CHUNK_INDEX:
+            report.error(
+                f"the Footer's summary_start {footer.summary_start} does not name the first Chunk Index record"
+            )
+        else:
+            for frame in frames[start:]:
+                if frame.offset >= footer_offset or frame.opcode != op.CHUNK_INDEX:
+                    break
+                selected_index_offsets.add(frame.offset)
+    for offset in index_record_offsets:
+        if offset not in selected_index_offsets:
+            report.error(f"the Chunk Index record at byte {offset} lies outside the Footer-selected summary index")
+    index = [
+        entry for offset, entry in zip(index_record_offsets, index, strict=True) if offset in selected_index_offsets
+    ]
 
     try:
         provenance.check()
