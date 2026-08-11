@@ -283,12 +283,16 @@ void writeFourdgsToSink(
 
   final index = <_IndexEntry>[];
   for (final plan in plans) {
+    // Spatial order is materialized for this one bounded chunk and released
+    // after it is written. The plan retains only a view into one packed i32
+    // assignment table shared by the whole partition.
+    final members = plan.members(gaussians);
     // Quantized columns are bounded by one Chunk. Keeping the whole scene's
     // eleven lanes here would make the sink API retain memory in proportion to
     // output size even though every framed record is released immediately.
     final quantized = _quantize(
       gaussians,
-      plan.members,
+      members,
       grid,
       windows,
       options.cutoff,
@@ -304,20 +308,14 @@ void writeFourdgsToSink(
       plan.t0,
       plan.t1,
       plan.level,
-      plan.members.length,
+      members.length,
       streams.finish(),
     );
     out.bytes(chunk);
 
     final entryBands = <_IndexBand>[];
     for (final band in bands) {
-      final blob = _bandRecord(
-        gaussians,
-        band,
-        plan.members,
-        options,
-        grid.stepSh,
-      );
+      final blob = _bandRecord(gaussians, band, members, options, grid.stepSh);
       final at = out.length;
       out.bytes(blob);
       entryBands.add(_IndexBand(band.band, at, blob.length));
@@ -329,7 +327,7 @@ void writeFourdgsToSink(
         t1: plan.t1,
         chunkOffset: chunkOffset,
         chunkLength: chunk.length,
-        gaussianCount: plan.members.length,
+        gaussianCount: members.length,
         bands: entryBands,
       ),
     );
@@ -1174,14 +1172,19 @@ int _binRotation(double v, int gaussian) {
 // Chunk planning
 // --------------------------------------------------------------------------
 
-/// One chunk: its interval, its depth in the temporal tree, and its members.
+/// One chunk: interval metadata plus a view into one packed assignment table.
 class _Plan {
-  _Plan(this.t0, this.t1, this.level, this.members);
+  _Plan(this.t0, this.t1, this.level, this._packed, this.start, this.end);
 
   final double t0;
   final double t1;
   final int level;
-  final List<int> members;
+  final Int32List _packed;
+  final int start;
+  final int end;
+
+  List<int> members(FourdgsGaussianSet g) =>
+      _mortonOrder(g, Int32List.sublistView(_packed, start, end));
 }
 
 /// Assign gaussians to the nodes of a temporal interval tree.
@@ -1278,18 +1281,37 @@ List<_Plan> _planChunks(
   // that interval can be found by two binary searches instead of a scan. Members
   // are appended in ascending `i`, which is the order the comprehension built
   // them in.
-  final byInterval = <List<int>>[
-    for (int w = 0; w + 1 < tops.length; w++) <int>[],
-  ];
+  final intervalCounts = Int32List(tops.length - 1);
   for (int i = 0; i < n; i++) {
     final w = _firstContainingInterval(tops, lo[i], hi[i], g.winHi[i]);
-    if (w >= 0) byInterval[w].add(i);
+    assigned[i] = w;
+    if (w >= 0) intervalCounts[w]++;
   }
+  final intervalOffsets = Int32List(intervalCounts.length + 1);
+  for (int w = 0; w < intervalCounts.length; w++) {
+    intervalOffsets[w + 1] = intervalOffsets[w] + intervalCounts[w];
+  }
+  Int32List? intervalMembers = Int32List(intervalOffsets.last);
+  final intervalCursor = Int32List.fromList(intervalOffsets);
+  for (int i = 0; i < n; i++) {
+    final w = assigned[i];
+    if (w >= 0) intervalMembers[intervalCursor[w]++] = i;
+  }
+  assigned.fillRange(0, n, -1);
 
   for (int w = 0; w + 1 < tops.length; w++) {
     final a = tops[w];
     final b = tops[w + 1];
-    final kept = descend(a, b, 0, byInterval[w]);
+    final kept = descend(
+      a,
+      b,
+      0,
+      Int32List.sublistView(
+        intervalMembers,
+        intervalOffsets[w],
+        intervalOffsets[w + 1],
+      ),
+    );
     if (kept.isNotEmpty) {
       nodes.add(_Node(a, b, 0));
       for (final i in kept) {
@@ -1297,78 +1319,64 @@ List<_Plan> _planChunks(
       }
     }
   }
+  intervalMembers = null;
 
   // Whatever no window interval contained — a gaussian whose support crosses a
   // window boundary, or one clipped by nothing at all. It belongs to the root,
   // which spans the whole partitioned timeline.
-  final rest = <int>[
-    for (int i = 0; i < n; i++)
-      if (assigned[i] < 0) i,
-  ];
-  if (rest.isNotEmpty) {
+  if (assigned.any((node) => node < 0)) {
     nodes.add(_Node(tops.first, tops.last, -1));
-    for (final i in rest) {
-      assigned[i] = nodes.length - 1;
+    final root = nodes.length - 1;
+    for (int i = 0; i < n; i++) {
+      if (assigned[i] < 0) assigned[i] = root;
     }
   }
 
-  // The second scan that was quadratic: `nodes` grows with the window count,
-  // which grows with the gaussian count, so one pass per node over the whole
-  // scene multiplied the two together. One pass over the scene fills every
-  // node's list, and appending in ascending `i` leaves each list in the order
-  // the comprehension produced.
-  final membersByNode = <List<int>>[
-    for (int node = 0; node < nodes.length; node++) <int>[],
-  ];
+  // Pack the assignment once. Plans below retain only offsets into this i32
+  // table, not one growable object list per node and then a second Morton-
+  // ordered copy per bounded chunk.
+  final nodeCounts = Int32List(nodes.length);
+  for (int i = 0; i < n; i++) {
+    nodeCounts[assigned[i]]++;
+  }
+  final nodeOffsets = Int32List(nodes.length + 1);
+  for (int node = 0; node < nodes.length; node++) {
+    nodeOffsets[node + 1] = nodeOffsets[node] + nodeCounts[node];
+  }
+  final packed = Int32List(n);
+  final nodeCursor = Int32List.fromList(nodeOffsets);
   for (int i = 0; i < n; i++) {
     final node = assigned[i];
-    if (node >= 0) membersByNode[node].add(i);
+    packed[nodeCursor[node]++] = i;
   }
 
+  final nodeOrder = <int>[for (int node = 0; node < nodes.length; node++) node]
+    ..sort((a, b) {
+      final left = nodes[a];
+      final right = nodes[b];
+      return left.level != right.level
+          ? left.level - right.level
+          : left.t0.compareTo(right.t0);
+    });
   final plans = <_Plan>[];
-  for (int node = 0; node < nodes.length; node++) {
-    final members = membersByNode[node];
-    if (members.isEmpty) continue;
-    plans.add(
-      _Plan(
-        nodes[node].t0,
-        nodes[node].t1,
-        math.max(nodes[node].level, 0),
-        members,
-      ),
-    );
-  }
-  // Shallow nodes first, then by start time: a fixed order, so two runs of this
-  // encoder lay the same chunks out at the same offsets — and so do two
-  // implementations of it.
-  plans.sort(
-    (a, b) => a.level != b.level ? a.level - b.level : a.t0.compareTo(b.t0),
-  );
-
-  if (plans.isEmpty) {
-    plans.add(
-      _Plan(tops.first, tops.last, 0, <int>[for (int i = 0; i < n; i++) i]),
-    );
-  }
-  final bounded = <_Plan>[];
-  for (final plan in plans) {
-    for (
-      int start = 0;
-      start < plan.members.length;
-      start += _maxGaussiansPerChunk
-    ) {
-      final end = math.min(start + _maxGaussiansPerChunk, plan.members.length);
-      bounded.add(
+  for (final node in nodeOrder) {
+    final first = nodeOffsets[node];
+    final stop = nodeOffsets[node + 1];
+    for (int start = first; start < stop; start += _maxGaussiansPerChunk) {
+      final end = math.min(start + _maxGaussiansPerChunk, stop);
+      plans.add(
         _Plan(
-          plan.t0,
-          plan.t1,
-          plan.level,
-          _mortonOrder(g, plan.members.sublist(start, end)),
+          nodes[node].t0,
+          nodes[node].t1,
+          math.max(nodes[node].level, 0),
+          packed,
+          start,
+          end,
         ),
       );
     }
   }
-  return bounded;
+  return plans;
 }
 
 /// Give an open-ended final window a finite prefix the tree can bisect.

@@ -13,6 +13,7 @@
 /// reports it like a diff.
 library;
 
+import 'dart:collection';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
@@ -39,25 +40,19 @@ int seekGuardSigmaBin(double sigma, double sigmaLogStep) =>
         ? 0
         : (math.log(math.max(sigma, 1e-30)) / sigmaLogStep).round();
 
-/// At most [limit] evenly spaced entries that can exercise a selective seek.
+/// Every populated, non-empty entry that must exercise a selective seek.
 ///
-/// Filtering precedes sampling so an index full of legal empty entries cannot
-/// hide its one populated interval between sample positions.
-List<FourdgsChunkIndexEntry> boundedSeekProbeEntries(
+/// Correctness is per interval: success elsewhere cannot prove that this
+/// chunk's resident content was filed where a seek can reach it.
+List<FourdgsChunkIndexEntry> seekProbeEntries(
   List<FourdgsChunkIndexEntry> index, {
   required bool isKeyframeDelta,
-  int limit = 16,
 }) {
-  final usable = <FourdgsChunkIndexEntry>[
+  return <FourdgsChunkIndexEntry>[
     for (final entry in index)
       if (entry.t1 > entry.t0 &&
           indexEntryPopulation(entry, isKeyframeDelta: isKeyframeDelta) > 0)
         entry,
-  ];
-  if (usable.length <= limit) return usable;
-  return <FourdgsChunkIndexEntry>[
-    for (int slot = 0; slot < limit; slot++)
-      usable[slot * (usable.length - 1) ~/ (limit - 1)],
   ];
 }
 
@@ -131,7 +126,9 @@ List<double> seekVisibleProbeInstants(
     return byWidth != 0 ? byWidth : a.row.compareTo(b.row);
   }
 
-  for (int i = 0; i < gaussians.count; i++) {
+  final first = residentCount > 0 ? residentStart : 0;
+  final end = residentCount > 0 ? residentEnd : gaussians.count;
+  for (int i = first; i < end; i++) {
     final sigma = gaussians.sigmaT[i];
     final mu = gaussians.muT[i];
     final half = sigma.isFinite ? k * sigma : double.infinity;
@@ -172,9 +169,9 @@ List<double> seekVisibleProbeInstants(
     } else {
       selected.add(row);
     }
-    selected.sort(compare);
-    if (selected.length > limit) selected.removeLast();
   }
+  selected.sort(compare);
+  if (selected.length > limit) selected.removeRange(limit, selected.length);
   return <double>[for (final row in selected) row.time];
 }
 
@@ -408,30 +405,16 @@ checkSeekReadsOnlyWhatItNeeds(
       }
     }
   }
-  final guardByBoundary = <double, double>{};
-
-  double guardAt(double boundary) => guardByBoundary.putIfAbsent(boundary, () {
-    double guard = 0.0;
-    for (final edge in guardEdges) {
-      if ((edge.at - boundary).abs() <= edge.guard) {
-        guard = math.max(guard, edge.guard);
-      }
-    }
-    return guard;
-  });
-
   final boundaries =
       <double>{
           for (final entry in index) ...<double>[entry.t0, entry.t1],
         }.toList()
         ..sort();
+  final boundaryGuards = _seekBoundaryGuards(boundaries, guardEdges);
+  final guardZones = _seekGuardZones(boundaries, guardEdges);
+  double guardAt(double boundary) => boundaryGuards[boundary] ?? 0.0;
 
-  // This is an optimization/fidelity probe, not another full decode. Bound the
-  // number of global comparisons independently of the accepted index size: a
-  // 262k-entry legal file must not turn this into hundreds of billions of
-  // checks. Filter first: otherwise sixteen evenly spaced empty, zero-width
-  // entries can hide the one populated interval this check must exercise.
-  final probeEntries = boundedSeekProbeEntries(
+  final probeEntries = seekProbeEntries(
     index,
     isKeyframeDelta: scene.header.temporalModel == 'keyframe-delta',
   );
@@ -442,66 +425,251 @@ checkSeekReadsOnlyWhatItNeeds(
     rowStart += entry.gaussianCount;
   }
 
+  // One compact candidate table is enough to cover every resident support.
+  // Sorting it once lets both the interval selection and expected visible rows
+  // advance as sweeps; neither asks every chunk or every gaussian about every
+  // probe. Multiple chunks proposing the same instant share one decode.
+  final support = whole.support(cutoff: scene.header.cutoff);
+  final candidates = <double>{};
+  final supportOwners = <double, Set<int>>{};
+  final ownersWithVisibleResidents = <int>{};
+  for (final entry in probeEntries) {
+    final residentCount = entry.gaussianCount;
+    final residentStart = rowStartByChunkOffset[entry.chunkOffset]!;
+    final residentEnd = residentStart + residentCount;
+    for (int row = residentStart; row < residentEnd; row++) {
+      if (support.lo[row] <= support.hi[row] &&
+          support.lo[row] < whole.winHi[row]) {
+        ownersWithVisibleResidents.add(entry.chunkOffset);
+        break;
+      }
+    }
+    final visible = seekVisibleProbeInstants(
+      entry,
+      whole,
+      scene.header.cutoff,
+      residentStart: residentStart,
+      residentCount: residentCount,
+    );
+    for (final t in visible) {
+      candidates.add(t);
+      supportOwners.putIfAbsent(t, () => <int>{}).add(entry.chunkOffset);
+    }
+    candidates.addAll(seekProbeInstants(entry, guardAt));
+  }
+  final orderedCandidates =
+      candidates.where((t) => t.isFinite).toList()..sort();
+
+  final entryStarts = <({double at, int index})>[
+    for (int i = 0; i < index.length; i++) (at: index[i].t0, index: i),
+  ]..sort((a, b) => a.at.compareTo(b.at));
+  final entryEnds = <({double at, int index})>[
+    for (int i = 0; i < index.length; i++) (at: index[i].t1, index: i),
+  ]..sort((a, b) => a.at.compareTo(b.at));
+  final activeEntries = <int>{};
+  int nextEntryStart = 0;
+  int nextEntryEnd = 0;
+
+  final rowStarts = <({double at, int row})>[];
+  final rowEnds = <({double at, bool inclusive, int row})>[];
+  for (int row = 0; row < whole.count; row++) {
+    final lo = support.lo[row];
+    final hi = support.hi[row];
+    if (lo > hi || !(lo < whole.winHi[row])) continue;
+    rowStarts.add((at: lo, row: row));
+    rowEnds.add((at: hi, inclusive: hi < whole.winHi[row], row: row));
+  }
+  rowStarts.sort((a, b) => a.at.compareTo(b.at));
+  rowEnds.sort((a, b) => a.at.compareTo(b.at));
+  final activeRows = <int>{};
+  int nextRowStart = 0;
+  int nextRowEnd = 0;
+
   int probed = 0;
   int guardedVisibleCandidates = 0;
-  for (final entry in probeEntries) {
-    final span = entry.t1 - entry.t0;
-    if (span <= 0.0) continue;
-    final candidates = <double>{
-      ...seekVisibleProbeInstants(
-        entry,
-        whole,
-        scene.header.cutoff,
-        residentStart: rowStartByChunkOffset[entry.chunkOffset]!,
-        residentCount: entry.gaussianCount,
-      ),
-      ...seekProbeInstants(entry, guardAt),
-    };
-    for (final t in candidates) {
-      if (!t.isFinite) continue;
-      if (seekProbeNearAnyBoundary(t, boundaries, guardEdges)) {
-        if (_visibleKeys(whole, t, scene.header.cutoff).isNotEmpty) {
-          guardedVisibleCandidates++;
-        }
-        continue;
-      }
+  final provedOwners = <int>{};
+  final guardedOwners = <int>{};
+  for (final t in orderedCandidates) {
+    while (nextEntryStart < entryStarts.length &&
+        entryStarts[nextEntryStart].at <= t) {
+      activeEntries.add(entryStarts[nextEntryStart++].index);
+    }
+    while (nextEntryEnd < entryEnds.length && entryEnds[nextEntryEnd].at <= t) {
+      activeEntries.remove(entryEnds[nextEntryEnd++].index);
+    }
+    while (nextRowStart < rowStarts.length && rowStarts[nextRowStart].at <= t) {
+      activeRows.add(rowStarts[nextRowStart++].row);
+    }
+    while (nextRowEnd < rowEnds.length &&
+        (rowEnds[nextRowEnd].at < t ||
+            (rowEnds[nextRowEnd].at == t && !rowEnds[nextRowEnd].inclusive))) {
+      activeRows.remove(rowEnds[nextRowEnd++].row);
+    }
 
-      final selected = <FourdgsChunkIndexEntry>[
-        for (final candidate in index)
-          if (candidate.t0 <= t && t < candidate.t1) candidate,
-      ];
-      if (selected.isEmpty) {
-        throw ConformanceFailure(
-          'no chunk index entry covers t=$t, which lies inside '
-          '[${entry.t0}, ${entry.t1})',
-        );
+    final fromWhole = _visibleKeysForRows(
+      whole,
+      activeRows,
+      t,
+      scene.header.cutoff,
+    );
+    if (_probeInGuardZones(t, guardZones)) {
+      if (fromWhole.isNotEmpty) {
+        guardedVisibleCandidates++;
+        guardedOwners.addAll(supportOwners[t] ?? const <int>{});
       }
-      final chunks = <FourdgsDecodedChunk>[
-        for (final e in selected)
-          await readFourdgsChunk(source, scene, e, maxShBand: 0),
-      ];
-      final fromSeek = _visibleKeys(
-        assembleGaussians(chunks, 0),
-        t,
-        scene.header.cutoff,
+      continue;
+    }
+
+    final selectedIndices = activeEntries;
+    if (selectedIndices.isEmpty) {
+      throw ConformanceFailure('no chunk index entry covers probe t=$t');
+    }
+    final chunks = <FourdgsDecodedChunk>[
+      for (final i in selectedIndices)
+        await readFourdgsChunk(source, scene, index[i], maxShBand: 0),
+    ];
+    final fromSeek = _visibleKeys(
+      assembleGaussians(chunks, 0),
+      t,
+      scene.header.cutoff,
+    );
+    // Empty on both sides proves only that this instant missed the content,
+    // not that the index filed that content in the right interval.
+    if (fromWhole.isEmpty && fromSeek.isEmpty) continue;
+    if (fromSeek.length != fromWhole.length ||
+        !_sameKeys(fromSeek, fromWhole)) {
+      throw ConformanceFailure(
+        'a seek at t=$t read ${selectedIndices.length} of ${index.length} chunks and '
+        'found ${fromSeek.length} visible gaussians; the whole scene has '
+        '${fromWhole.length} visible there',
       );
-      final fromWhole = _visibleKeys(whole, t, scene.header.cutoff);
-      // Empty on both sides proves only that this instant missed the content,
-      // not that the index filed that content in the right interval.
-      if (fromWhole.isEmpty && fromSeek.isEmpty) continue;
-      if (fromSeek.length != fromWhole.length ||
-          !_sameKeys(fromSeek, fromWhole)) {
-        throw ConformanceFailure(
-          'a seek at t=$t read ${selected.length} of ${index.length} chunks and '
-          'found ${fromSeek.length} visible gaussians; the whole scene has '
-          '${fromWhole.length} visible there',
-        );
-      }
-      probed++;
+    }
+    probed++;
+    provedOwners.addAll(supportOwners[t] ?? const <int>{});
+  }
+  for (final entry in probeEntries) {
+    if ((provedOwners.contains(entry.chunkOffset) ||
+        guardedOwners.contains(entry.chunkOffset))) {
+      continue;
+    }
+    if (ownersWithVisibleResidents.contains(entry.chunkOffset)) {
+      throw ConformanceFailure(
+        'populated chunk at ${entry.chunkOffset} yielded no successful or guarded '
+        'probe from its resident supports',
+      );
     }
   }
   return (probes: probed, guardedVisibleCandidates: guardedVisibleCandidates);
 }
+
+Map<double, double> _seekBoundaryGuards(
+  List<double> sortedBoundaries,
+  List<({double at, double guard})> guardEdges,
+) {
+  final starts = <({double at, double guard})>[
+    for (final edge in guardEdges)
+      if (edge.at.isFinite && edge.guard.isFinite && edge.guard >= 0.0)
+        (at: edge.at - edge.guard, guard: edge.guard),
+  ]..sort((a, b) => a.at.compareTo(b.at));
+  final ends = <({double at, double guard})>[
+    for (final edge in guardEdges)
+      if (edge.at.isFinite && edge.guard.isFinite && edge.guard >= 0.0)
+        (at: edge.at + edge.guard, guard: edge.guard),
+  ]..sort((a, b) => a.at.compareTo(b.at));
+  final active = SplayTreeMap<double, int>();
+  final result = <double, double>{};
+  int nextStart = 0;
+  int nextEnd = 0;
+  for (final boundary in sortedBoundaries) {
+    while (nextStart < starts.length && starts[nextStart].at <= boundary) {
+      final guard = starts[nextStart++].guard;
+      active[guard] = (active[guard] ?? 0) + 1;
+    }
+    while (nextEnd < ends.length && ends[nextEnd].at < boundary) {
+      final guard = ends[nextEnd++].guard;
+      final count = active[guard]!;
+      if (count == 1) {
+        active.remove(guard);
+      } else {
+        active[guard] = count - 1;
+      }
+    }
+    result[boundary] = active.lastKey() ?? 0.0;
+  }
+  return result;
+}
+
+List<({double lo, double hi})> _seekGuardZones(
+  List<double> sortedBoundaries,
+  List<({double at, double guard})> guardEdges,
+) {
+  final zones = <({double lo, double hi})>[];
+  for (final edge in guardEdges) {
+    if (!edge.at.isFinite || !edge.guard.isFinite || edge.guard < 0.0) continue;
+    final wantedLo = edge.at - edge.guard;
+    final wantedHi = edge.at + edge.guard;
+    int low = 0;
+    int high = sortedBoundaries.length;
+    while (low < high) {
+      final middle = low + ((high - low) >> 1);
+      if (sortedBoundaries[middle] < wantedLo) {
+        low = middle + 1;
+      } else {
+        high = middle;
+      }
+    }
+    final first = low;
+    low = first;
+    high = sortedBoundaries.length;
+    while (low < high) {
+      final middle = low + ((high - low) >> 1);
+      if (sortedBoundaries[middle] <= wantedHi) {
+        low = middle + 1;
+      } else {
+        high = middle;
+      }
+    }
+    final last = low - 1;
+    if (first <= last && first < sortedBoundaries.length) {
+      zones.add((
+        lo: sortedBoundaries[first] - edge.guard,
+        hi: sortedBoundaries[last] + edge.guard,
+      ));
+    }
+  }
+  zones.sort((a, b) => a.lo.compareTo(b.lo));
+  final merged = <({double lo, double hi})>[];
+  for (final zone in zones) {
+    if (merged.isEmpty || zone.lo > merged.last.hi) {
+      merged.add(zone);
+    } else if (zone.hi > merged.last.hi) {
+      merged[merged.length - 1] = (lo: merged.last.lo, hi: zone.hi);
+    }
+  }
+  return merged;
+}
+
+({double lo, double hi})? _guardZoneContaining(
+  double t,
+  List<({double lo, double hi})> zones,
+) {
+  int low = 0;
+  int high = zones.length;
+  while (low < high) {
+    final middle = low + ((high - low) >> 1);
+    if (zones[middle].lo <= t) {
+      low = middle + 1;
+    } else {
+      high = middle;
+    }
+  }
+  if (low == 0) return null;
+  final zone = zones[low - 1];
+  return t <= zone.hi ? zone : null;
+}
+
+bool _probeInGuardZones(double t, List<({double lo, double hi})> zones) =>
+    _guardZoneContaining(t, zones) != null;
 
 /// Whether [t] lies inside any quantization guard around any chunk boundary.
 ///
@@ -535,6 +703,35 @@ bool seekProbeNearAnyBoundary(
     }
   }
   return false;
+}
+
+List<String> _visibleKeysForRows(
+  FourdgsGaussianSet g,
+  Iterable<int> rows,
+  double t,
+  double cutoff,
+) {
+  final keys = <String>[];
+  for (final i in rows) {
+    if (!(g.winLo[i] <= t && t < g.winHi[i])) continue;
+    final sigma = g.sigmaT[i];
+    final marginal =
+        sigma.isFinite
+            ? math.exp(
+              -0.5 * math.pow((t - g.muT[i]) / math.max(sigma, 1e-30), 2),
+            )
+            : 1.0;
+    if (marginal < cutoff) continue;
+    final dt = t - g.muT[i];
+    keys.add(
+      '${g.positions[i * 3] + g.motions[i * 3] * dt},'
+      '${g.positions[i * 3 + 1] + g.motions[i * 3 + 1] * dt},'
+      '${g.positions[i * 3 + 2] + g.motions[i * 3 + 2] * dt},'
+      '${g.colors[i * 4 + 3] * marginal}',
+    );
+  }
+  keys.sort();
+  return keys;
 }
 
 /// Reconstructed state at [t] as sorted keys, so two orderings of one answer

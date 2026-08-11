@@ -135,19 +135,17 @@ void main() {
     expect(seekGuardMuHalfWidth(0, 0.0, false, -0.25), 0.125);
   });
 
-  test('seek entry cap is applied after unusable entries are removed', () {
-    final populated = entry(t0: 100.0, t1: 101.0);
-    final index = <FourdgsChunkIndexEntry>[
-      for (int i = 0; i < 40; i++)
-        if (i == 23)
-          populated
-        else
-          entry(t0: i.toDouble(), t1: i.toDouble(), gaussianCount: 0),
+  test('seek probes retain every populated entry', () {
+    final populated = <FourdgsChunkIndexEntry>[
+      for (int i = 0; i < 24; i++) entry(t0: 100.0 + i, t1: 101.0 + i),
     ];
-    expect(
-      boundedSeekProbeEntries(index, isKeyframeDelta: false),
-      equals(<FourdgsChunkIndexEntry>[populated]),
-    );
+    final index = <FourdgsChunkIndexEntry>[
+      for (int i = 0; i < populated.length; i++) ...<FourdgsChunkIndexEntry>[
+        entry(t0: i.toDouble(), t1: i.toDouble(), gaussianCount: 0),
+        populated[i],
+      ],
+    ];
+    expect(seekProbeEntries(index, isKeyframeDelta: false), equals(populated));
   });
 
   test('a wide earlier guard reaches across narrower boundaries', () {
