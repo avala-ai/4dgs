@@ -43,7 +43,7 @@ import {
 import { Crc32, DEFAULT_CODECS, type CodecRegistry } from "./codec.js";
 import { Cursor } from "./cursor.js";
 import { MalformedFile, TruncatedFile } from "./errors.js";
-import { FrontMatterScanner } from "./frontMatter.js";
+import { FrontMatterScanner, type FrontMatterRecord } from "./frontMatter.js";
 import { ATTRIBUTE_CHANNELS, Attribute, GAUSSIAN_FLAG_NEVER_FADES } from "./opcodes.js";
 import {
   clamp,
@@ -999,6 +999,15 @@ export interface OpenKeyframeDeltaIndexedOptions {
 const KEYFRAME_DELTA_HEAD_PROBE_BYTES = 64 * 1024;
 const MAX_KEYFRAME_DELTA_RECORD_BYTES = 64 * 1024 * 1024;
 
+function checkFetchedFrontMatterSize(record: FrontMatterRecord): void {
+  if (record.contentLength <= MAX_KEYFRAME_DELTA_RECORD_BYTES) return;
+  throw new MalformedFile(
+    `front-matter record opcode ${record.opcode} at byte ${record.offset} declares ` +
+      `${record.contentLength} bytes, past the ${MAX_KEYFRAME_DELTA_RECORD_BYTES}-byte ` +
+      `per-record reader limit`,
+  );
+}
+
 /** Read exactly one transport range, naming a short read as a malformed resource. */
 async function readExact(source: IReadable, offset: number, length: number): Promise<Uint8Array> {
   const bytes = await source.read(BigInt(offset), BigInt(length));
@@ -1053,14 +1062,8 @@ export class KeyframeDeltaIndexedDecoder {
     let windows = new Float64Array(0);
     for await (const record of front.records(MAGIC.length)) {
       if (record.opcode === Opcode.Chunk || record.opcode === Opcode.DeltaChunk) break;
-      if (record.contentLength > MAX_KEYFRAME_DELTA_RECORD_BYTES) {
-        throw new MalformedFile(
-          `front-matter record opcode ${record.opcode} at byte ${record.offset} declares ` +
-            `${record.contentLength} bytes, past the ${MAX_KEYFRAME_DELTA_RECORD_BYTES}-byte ` +
-            `per-record reader limit`,
-        );
-      }
       if (record.opcode === Opcode.Header) {
+        checkFetchedFrontMatterSize(record);
         header = parseHeader(await front.content(record));
         if (header.temporalModel !== "keyframe-delta") {
           throw new MalformedFile(
@@ -1069,8 +1072,10 @@ export class KeyframeDeltaIndexedDecoder {
           );
         }
       } else if (record.opcode === Opcode.Quantization) {
+        checkFetchedFrontMatterSize(record);
         quantization = parseQuantization(await front.content(record));
       } else if (record.opcode === Opcode.WindowTable) {
+        checkFetchedFrontMatterSize(record);
         windows = parseWindowTable(await front.content(record));
       }
     }
@@ -1356,7 +1361,7 @@ async function composeChainFromReader(
   codecs: CodecRegistry,
   shDegree: number,
 ): Promise<KeyframeDeltaState> {
-  const chain = chainFor(index, (entry.t0 + entry.t1) / 2.0);
+  const chain = chainEndingAt(index, entry);
   let state: KeyframeDeltaState | null = null;
   // A GOP shares one `level`: the keyframe sets it and every delta's reference must match
   // it (spec §11.6), so along a chain every link carries the keyframe's level. The index
@@ -1516,6 +1521,22 @@ export function checkTiling(
  * and returned oldest first, the order {@link applyDelta} composes in (spec §11.8).
  */
 export function chainFor(index: readonly ChunkIndexEntry[], t: number): ChunkIndexEntry[] {
+  let current: ChunkIndexEntry | undefined;
+  for (const entry of index) {
+    if (entry.t0 <= t && t < entry.t1) {
+      current = entry;
+      break;
+    }
+  }
+  if (current === undefined) throw new MalformedFile(`no state chunk covers t=${t}`);
+  return chainEndingAt(index, current);
+}
+
+/** Walk the references from an entry already selected by its half-open interval. */
+function chainEndingAt(
+  index: readonly ChunkIndexEntry[],
+  current: ChunkIndexEntry,
+): ChunkIndexEntry[] {
   const byOffset = new Map<number, ChunkIndexEntry>();
   for (const entry of index) {
     if (entry.kind !== 0 && entry.kind !== 1) {
@@ -1526,14 +1547,6 @@ export function chainFor(index: readonly ChunkIndexEntry[], t: number): ChunkInd
     }
     byOffset.set(entry.chunkOffset, entry);
   }
-  let current: ChunkIndexEntry | undefined;
-  for (const entry of index) {
-    if (entry.t0 <= t && t < entry.t1) {
-      current = entry;
-      break;
-    }
-  }
-  if (current === undefined) throw new MalformedFile(`no state chunk covers t=${t}`);
 
   const chain: ChunkIndexEntry[] = [current];
   while (chain[0]!.kind !== 0) {
