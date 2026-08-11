@@ -1032,6 +1032,45 @@ void aShortReadIsTruncationRatherThanAnInventedRecord() {
   }
 }
 
+class FailingFramingReadable : public fourdgs::Readable {
+ public:
+  explicit FailingFramingReadable(std::vector<std::uint8_t> bytes)
+      : bytes_(std::move(bytes)) {}
+
+  fourdgs::Result<std::uint64_t> size() override { return bytes_.size(); }
+
+  fourdgs::Result<std::size_t> read(std::uint64_t offset, Span<std::uint8_t> into) override {
+    if (offset == fourdgs::tool::kMagicSize) {
+      return Error(ErrorCode::kIo, "injected framing transport failure");
+    }
+    if (offset >= bytes_.size()) return static_cast<std::size_t>(0);
+    const std::size_t take =
+        std::min(into.size(), bytes_.size() - static_cast<std::size_t>(offset));
+    std::copy_n(bytes_.begin() + static_cast<std::size_t>(offset), take, into.data());
+    return take;
+  }
+
+ private:
+  std::vector<std::uint8_t> bytes_;
+};
+
+void aFramingTransportFailureIsNotReportedAsAFileCut() {
+  std::vector<std::uint8_t> bytes(fourdgs::tool::kMagic,
+                                  fourdgs::tool::kMagic + fourdgs::tool::kMagicSize);
+  bytes.push_back(0x80);
+  bytes.insert(bytes.end(), 8, 0);
+  bytes.insert(bytes.end(), fourdgs::tool::kMagic,
+               fourdgs::tool::kMagic + fourdgs::tool::kMagicSize);
+  FailingFramingReadable source(std::move(bytes));
+  fourdgs::Result<Walk> walked = fourdgs::tool::walk(source);
+  CHECK(!walked.ok());
+  if (!walked) {
+    CHECK_EQ(static_cast<int>(walked.error().code), static_cast<int>(ErrorCode::kIo));
+    CHECK(walked.error().message.find("injected framing transport failure") !=
+          std::string::npos);
+  }
+}
+
 void aDuplicateFrontMatterRecordLeavesTheRefusalUnplaced() {
   // Two Headers, and a refusal named for one of them. Which copy the reader refused at is not
   // something a framing walk can know, and an offset pointing at a record with nothing wrong with
@@ -1202,6 +1241,7 @@ void runTests() {
   anIndexEntryAtTheEndOfTheFileIsRefusedRatherThanDereferenced();
   aFileCutInsideItsFirstRecordStillSaysWhereItWasCut();
   aShortReadIsTruncationRatherThanAnInventedRecord();
+  aFramingTransportFailureIsNotReportedAsAFileCut();
   aDuplicateFrontMatterRecordLeavesTheRefusalUnplaced();
   aRecordAfterTheFooterIsReportedWithoutMovingTheVerdict();
   aBandThatWillNotDecodeIsRefusedAndPlacedAtItsOwnRecord();

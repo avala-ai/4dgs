@@ -434,8 +434,9 @@ Report validate(Readable& source) {
                (physical[i]->opcode != op::kChunk &&
                 !(keyframeDelta && physical[i]->opcode == op::kDeltaChunk))) {
       error(&report, "chunk index entry " + std::to_string(i) +
-                         " does not point at the start of a "
-                         "top-level Chunk record");
+                         " does not point at the start of a " +
+                         (keyframeDelta ? "top-level Chunk or Delta Chunk record"
+                                        : "top-level Chunk record"));
     } else if (physical[i]->total() != entry.length) {
       error(&report, "chunk index entry " + std::to_string(i) + " declares " +
                          std::to_string(entry.length) + " bytes at " +

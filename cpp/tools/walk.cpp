@@ -312,10 +312,14 @@ Result<Walk> walk(Readable& source, const FrameVisitor& visitor) {
     // A whole file ends with the magic, so its last eight bytes are not a record.
     if (remaining <= kMagicSize) {
       std::uint8_t tail[kMagicSize] = {0};
-      if (!readExactly(source, at, tail, static_cast<std::size_t>(remaining))) {
+      Result<std::size_t> tailRead =
+          source.read(at, Span<std::uint8_t>(tail, static_cast<std::size_t>(remaining)));
+      if (!tailRead) return tailRead.error();
+      if (*tailRead != remaining) {
         Cut cut;
         cut.at = at;
-        cut.reason = "the last " + commas(remaining) + " bytes could not be read";
+        cut.reason = "the last " + commas(remaining) + " bytes returned only " +
+                     commas(*tailRead) + " bytes";
         out.cut = cut;
         break;
       }
@@ -342,10 +346,14 @@ Result<Walk> walk(Readable& source, const FrameVisitor& visitor) {
     // Nine bytes or none. A short read here would otherwise be parsed as a record: whatever byte
     // arrived becomes an opcode and the unread remainder becomes a declared length, so the walk
     // would report an invented record instead of naming the byte the file stops at.
-    if (!readExactly(source, at, framing, static_cast<std::size_t>(kRecordHeaderSize))) {
+    Result<std::size_t> framingRead = source.read(
+        at, Span<std::uint8_t>(framing, static_cast<std::size_t>(kRecordHeaderSize)));
+    if (!framingRead) return framingRead.error();
+    if (*framingRead != kRecordHeaderSize) {
       Cut cut;
       cut.at = at;
-      cut.reason = "a record header could not be read at this byte";
+      cut.reason = "the record header at this byte returned only " +
+                   commas(*framingRead) + " of " + commas(kRecordHeaderSize) + " bytes";
       out.cut = cut;
       break;
     }

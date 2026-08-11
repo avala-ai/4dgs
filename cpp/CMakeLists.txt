@@ -328,6 +328,10 @@ include(CMakePackageConfigHelpers)
 
 set(FOURDGS_INSTALL_CMAKEDIR ${CMAKE_INSTALL_LIBDIR}/cmake/fourdgs-cpp)
 
+if(FOURDGS_BUILD_TOOL)
+  install(TARGETS fourdgs-cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+
 install(
   TARGETS fourdgs-cpp
   EXPORT fourdgs-cpp-targets
