@@ -69,17 +69,18 @@ std::string jsonString(const std::string& value) {
   return out;
 }
 
-void printText(std::ostream& out, const Walk& walk, const std::optional<Coverage>& covered) {
+void printText(std::ostream& out, Readable& source, const Walk& walk,
+               const std::optional<Coverage>& covered) {
   row(out, "offset", "record", "content", "total", "crc");
   row(out, "0", "(magic)", "", "8", "-");
-  for (const Frame& frame : walk.records) {
+  (void)fourdgs::tool::walk(source, [&](const Frame& frame, bool) {
     row(out, commas(frame.offset), opcodeName(frame.opcode), commas(frame.length),
         commas(frame.total()), coverageCell(covered, frame.offset, frame.total()));
-  }
+  });
   if (walk.trailingMagic) {
     row(out, commas(walk.size - kMagicSize), "(magic)", "", "8", "-");
   }
-  out << "\n" << walk.records.size() << " records, " << commas(walk.size) << " bytes\n";
+  out << "\n" << walk.recordCount << " records, " << commas(walk.size) << " bytes\n";
   if (walk.cut.has_value()) {
     out << "truncated at byte " << commas(walk.cut->at) << ": " << walk.cut->reason << "\n";
     out << "the " << walk.intact()
@@ -97,7 +98,8 @@ void printText(std::ostream& out, const Walk& walk, const std::optional<Coverage
   }
 }
 
-void printJson(std::ostream& out, const Walk& walk, const std::optional<Coverage>& covered) {
+void printJson(std::ostream& out, Readable& source, const Walk& walk,
+               const std::optional<Coverage>& covered) {
   out << "{\n";
   out << "  \"size\": " << walk.size << ",\n";
   out << "  \"trailing_magic\": " << (walk.trailingMagic ? "true" : "false") << ",\n";
@@ -115,8 +117,8 @@ void printJson(std::ostream& out, const Walk& walk, const std::optional<Coverage
     out << "  \"summary_crc\": null,\n";
   }
   out << "  \"records\": [\n";
-  for (std::size_t i = 0; i < walk.records.size(); ++i) {
-    const Frame& frame = walk.records[i];
+  std::uint64_t i = 0;
+  (void)fourdgs::tool::walk(source, [&](const Frame& frame, bool) {
     const std::string cell = coverageCell(covered, frame.offset, frame.total());
     std::string crc = "null";
     if (cell != "-") {
@@ -128,8 +130,9 @@ void printJson(std::ostream& out, const Walk& walk, const std::optional<Coverage
         << ", \"opcode\": " << static_cast<unsigned>(frame.opcode)
         << ", \"name\": " << jsonString(opcodeName(frame.opcode))
         << ", \"content_length\": " << frame.length << ", \"total_length\": " << frame.total()
-        << ", \"crc\": " << crc << "}" << (i + 1 == walk.records.size() ? "" : ",") << "\n";
-  }
+        << ", \"crc\": " << crc << "}" << (i + 1 == walk.recordCount ? "" : ",") << "\n";
+    i += 1;
+  });
   out << "  ]\n";
   out << "}\n";
 }
@@ -160,9 +163,9 @@ int runInspect(const std::string& path, bool json, std::ostream& out, std::ostre
 
   const std::optional<Coverage> covered = coverage(*source, *walked);
   if (json) {
-    printJson(out, *walked, covered);
+    printJson(out, *source, *walked, covered);
   } else {
-    printText(out, *walked, covered);
+    printText(out, *source, *walked, covered);
   }
   // The prefix was recovered and reported; the file is still not a whole one, and a pipeline that
   // goes on to read it should not be told otherwise.

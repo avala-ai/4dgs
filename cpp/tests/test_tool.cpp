@@ -102,6 +102,48 @@ std::vector<std::uint8_t> readBytes(const std::filesystem::path& path) {
   return *data;
 }
 
+void appendU32(std::vector<std::uint8_t>* out, std::uint32_t value) {
+  for (int i = 0; i < 4; ++i) out->push_back(static_cast<std::uint8_t>(value >> (8 * i)));
+}
+
+void appendU64(std::vector<std::uint8_t>* out, std::uint64_t value) {
+  for (int i = 0; i < 8; ++i) out->push_back(static_cast<std::uint8_t>(value >> (8 * i)));
+}
+
+std::uint64_t readU64(const std::vector<std::uint8_t>& bytes, std::size_t at) {
+  std::uint64_t value = 0;
+  for (int i = 7; i >= 0; --i) value = (value << 8) | bytes[at + static_cast<std::size_t>(i)];
+  return value;
+}
+
+void writeU64(std::vector<std::uint8_t>* bytes, std::size_t at, std::uint64_t value) {
+  for (int i = 0; i < 8; ++i)
+    (*bytes)[at + static_cast<std::size_t>(i)] = static_cast<std::uint8_t>(value >> (8 * i));
+}
+
+void writeU32(std::vector<std::uint8_t>* bytes, std::size_t at, std::uint32_t value) {
+  for (int i = 0; i < 4; ++i)
+    (*bytes)[at + static_cast<std::size_t>(i)] = static_cast<std::uint8_t>(value >> (8 * i));
+}
+
+void resealSummary(std::vector<std::uint8_t>* bytes) {
+  fourdgs::Result<Walk> walked =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(bytes->data(), bytes->size()));
+  CHECK(walked.ok());
+  if (!walked) return;
+  const fourdgs::tool::Frame* footer = walked->firstIntact(fourdgs::tool::op::kFooter);
+  CHECK(footer != nullptr);
+  if (footer == nullptr) return;
+  const std::size_t content =
+      static_cast<std::size_t>(footer->offset + fourdgs::tool::kRecordHeaderSize);
+  const std::uint64_t start = readU64(*bytes, content);
+  CHECK(start <= footer->offset);
+  if (start > footer->offset) return;
+  const std::uint32_t crc = fourdgs::tool::crc32(bytes->data() + static_cast<std::size_t>(start),
+                                                 static_cast<std::size_t>(footer->offset - start));
+  writeU32(bytes, content + 16, crc);
+}
+
 /// The `"refused"` member of an expectation file.
 ///
 /// Enough JSON for one string member, which is all the corpus is asked for here. A JSON parser
@@ -222,8 +264,14 @@ void aWalkFramesEveryRecordAndEndsOnTheMagic() {
   if (corpusMissing()) return;
   const std::vector<std::uint8_t> data = readBytes(corpusDirectory() / kProvenanceVariant);
   CHECK(!data.empty());
+  std::uint64_t at = fourdgs::tool::kMagicSize;
   fourdgs::Result<Walk> walked =
-      fourdgs::tool::walkBytes(Span<const std::uint8_t>(data.data(), data.size()));
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(data.data(), data.size()),
+                               [&](const fourdgs::tool::Frame& frame, bool complete) {
+                                 CHECK(complete);
+                                 CHECK_EQ(frame.offset, at);
+                                 at += frame.total();
+                               });
   CHECK(walked.ok());
   if (!walked) return;
   CHECK(walked->trailingMagic);
@@ -231,11 +279,6 @@ void aWalkFramesEveryRecordAndEndsOnTheMagic() {
   CHECK(walked->first(fourdgs::tool::op::kHeader) != nullptr);
   CHECK(walked->first(fourdgs::tool::op::kFooter) != nullptr);
   // Every record accounted for, back to back: the offsets have to tile the file.
-  std::uint64_t at = fourdgs::tool::kMagicSize;
-  for (const fourdgs::tool::Frame& frame : walked->records) {
-    CHECK_EQ(frame.offset, at);
-    at += frame.total();
-  }
   CHECK_EQ(at, walked->size - fourdgs::tool::kMagicSize);
 }
 
@@ -259,9 +302,9 @@ void aCutFileReportsTheIntactPrefixAndTheByte() {
   CHECK(!cut->trailingMagic);
   // The intact prefix is still framed, and the record the file was cut inside is reported but
   // is not part of it: hiding that record would hide the declared length that is the fault.
-  CHECK(!cut->records.empty());
-  CHECK(cut->records.size() < whole->records.size());
-  CHECK_EQ(cut->intact(), cut->records.size() - 1);
+  CHECK(cut->recordCount > 0);
+  CHECK(cut->recordCount < whole->recordCount);
+  CHECK_EQ(cut->intact(), cut->recordCount - 1);
 
   const Report report = fourdgs::tool::validate(Span<const std::uint8_t>(data.data(), data.size()));
   CHECK(!report.ok());
@@ -377,6 +420,185 @@ class ShortReadable : public fourdgs::Readable {
   std::uint64_t claimed_;
   std::size_t cap_;
 };
+
+void aWalkRetainsBoundedFactsForUnboundedPrivateRecords() {
+  constexpr std::size_t kRecords = 50000;
+  std::vector<std::uint8_t> bytes;
+  bytes.reserve(fourdgs::tool::kMagicSize + kRecords * fourdgs::tool::kRecordHeaderSize +
+                fourdgs::tool::kMagicSize);
+  bytes.insert(bytes.end(), fourdgs::tool::kMagic,
+               fourdgs::tool::kMagic + fourdgs::tool::kMagicSize);
+  for (std::size_t i = 0; i < kRecords; ++i) {
+    bytes.push_back(0x80);
+    for (int j = 0; j < 8; ++j) bytes.push_back(0);
+  }
+  bytes.insert(bytes.end(), fourdgs::tool::kMagic,
+               fourdgs::tool::kMagic + fourdgs::tool::kMagicSize);
+
+  fourdgs::Result<Walk> walked =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  CHECK(walked.ok());
+  if (!walked) return;
+  CHECK_EQ(walked->recordCount, static_cast<std::uint64_t>(kRecords));
+  CHECK_EQ(walked->intact(), static_cast<std::uint64_t>(kRecords));
+  CHECK_EQ(walked->representatives.size(), static_cast<std::size_t>(2));
+  CHECK_EQ(walked->opcodeCounts[0x80], static_cast<std::uint64_t>(kRecords));
+}
+
+void aLongHeaderIsRangeParsedThroughItsTemporalModel() {
+  constexpr std::size_t kProfileBytes = 6000;
+  std::vector<std::uint8_t> content;
+  appendU32(&content, static_cast<std::uint32_t>(kProfileBytes));
+  content.insert(content.end(), kProfileBytes, static_cast<std::uint8_t>('p'));
+  appendU32(&content, 0);                       // library
+  content.insert(content.end(), 8 + 8 + 8, 0);  // duration, gaussian_count, cutoff
+  const std::string model = "keyframe-delta";
+  appendU32(&content, static_cast<std::uint32_t>(model.size()));
+  content.insert(content.end(), model.begin(), model.end());
+
+  std::vector<std::uint8_t> bytes(fourdgs::tool::kMagic,
+                                  fourdgs::tool::kMagic + fourdgs::tool::kMagicSize);
+  bytes.push_back(fourdgs::tool::op::kHeader);
+  appendU64(&bytes, content.size());
+  bytes.insert(bytes.end(), content.begin(), content.end());
+  bytes.insert(bytes.end(), fourdgs::tool::kMagic,
+               fourdgs::tool::kMagic + fourdgs::tool::kMagicSize);
+
+  fourdgs::tool::BorrowedReadable source(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  fourdgs::Result<Walk> walked = fourdgs::tool::walk(source);
+  CHECK(walked.ok());
+  if (!walked) return;
+  CHECK_EQ(fourdgs::tool::temporalModel(source, *walked), model);
+}
+
+void anUnindexedKeyframeDeltaUsesTheStreamedDecoder() {
+  if (corpusMissing()) return;
+  if (noDecoder()) return;
+  std::vector<std::uint8_t> bytes = readBytes(
+      corpusDirectory() / "keyframe" / "KeyframeDelta-UseChunkIndex-UseCrc-UseStatistics.4dgs");
+  CHECK(!bytes.empty());
+  if (bytes.empty()) return;
+  fourdgs::Result<Walk> walked =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  CHECK(walked.ok());
+  if (!walked) return;
+  const fourdgs::tool::Frame* firstIndex = walked->firstIntact(fourdgs::tool::op::kChunkIndex);
+  const fourdgs::tool::Frame* footer = walked->firstIntact(fourdgs::tool::op::kFooter);
+  CHECK(firstIndex != nullptr);
+  CHECK(footer != nullptr);
+  if (firstIndex == nullptr || footer == nullptr) return;
+
+  std::vector<std::uint8_t> unindexed(bytes.begin(), bytes.begin() + firstIndex->offset);
+  const std::size_t newFooter = unindexed.size();
+  unindexed.insert(unindexed.end(), bytes.begin() + footer->offset,
+                   bytes.begin() + footer->offset + footer->total());
+  unindexed.insert(unindexed.end(), bytes.end() - fourdgs::tool::kMagicSize, bytes.end());
+  // summary_start, summary_offset_start and summary_crc all declare no summary.
+  for (std::size_t i = 0; i < 20; ++i) {
+    unindexed[newFooter + fourdgs::tool::kRecordHeaderSize + i] = 0;
+  }
+
+  const Report report =
+      fourdgs::tool::validate(Span<const std::uint8_t>(unindexed.data(), unindexed.size()));
+  CHECK(report.ok());
+  bool warnedOnly = false;
+  for (const fourdgs::tool::Finding& finding : report.findings) {
+    if (finding.message.find("can only be read front to back") != std::string::npos) {
+      warnedOnly = finding.severity == Severity::kWarning;
+    }
+  }
+  CHECK(warnedOnly);
+}
+
+void anEmbeddedChunkOpcodeIsNotARecordBoundary() {
+  if (corpusMissing()) return;
+  if (noDecoder()) return;
+  std::vector<std::uint8_t> bytes = readBytes(corpusDirectory() / kProvenanceVariant);
+  CHECK(!bytes.empty());
+  if (bytes.empty()) return;
+  fourdgs::Result<Walk> walked =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  CHECK(walked.ok());
+  if (!walked) return;
+  const fourdgs::tool::Frame* header = walked->firstIntact(fourdgs::tool::op::kHeader);
+  const fourdgs::tool::Frame* entry = walked->firstIntact(fourdgs::tool::op::kChunkIndex);
+  CHECK(header != nullptr);
+  CHECK(entry != nullptr);
+  if (header == nullptr || entry == nullptr) return;
+  const std::size_t embedded =
+      static_cast<std::size_t>(header->offset + fourdgs::tool::kRecordHeaderSize + 4);
+  bytes[embedded] = fourdgs::tool::op::kChunk;
+  const std::size_t indexFields =
+      static_cast<std::size_t>(entry->offset + fourdgs::tool::kRecordHeaderSize + 16);
+  writeU64(&bytes, indexFields, embedded);
+  writeU64(&bytes, indexFields + 8, 1);
+  resealSummary(&bytes);
+
+  const Report report =
+      fourdgs::tool::validate(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  CHECK(!report.ok());
+  bool namedBoundary = false;
+  for (const fourdgs::tool::Finding& finding : report.findings) {
+    if (finding.message.find("does not point at the start of a top-level Chunk record") !=
+        std::string::npos) {
+      namedBoundary = true;
+    }
+  }
+  CHECK(namedBoundary);
+}
+
+void anOrphanChunkIsDecodedByTheStreamedValidationPass() {
+  if (corpusMissing()) return;
+  if (noDecoder()) return;
+  std::vector<std::uint8_t> bytes = readBytes(corpusDirectory() / kProvenanceVariant);
+  const std::vector<std::uint8_t> invalid =
+      readBytes(corpusDirectory() / "invalid" / "UnknownStreamCodec.4dgs");
+  CHECK(!bytes.empty());
+  CHECK(!invalid.empty());
+  if (bytes.empty() || invalid.empty()) return;
+  fourdgs::Result<Walk> validWalk =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  fourdgs::Result<Walk> invalidWalk =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(invalid.data(), invalid.size()));
+  CHECK(validWalk.ok());
+  CHECK(invalidWalk.ok());
+  if (!validWalk || !invalidWalk) return;
+  const fourdgs::tool::Frame* summary = validWalk->firstIntact(fourdgs::tool::op::kChunkIndex);
+  const fourdgs::tool::Frame* badChunk = invalidWalk->firstIntact(fourdgs::tool::op::kChunk);
+  const fourdgs::tool::Frame* oldFooter = validWalk->firstIntact(fourdgs::tool::op::kFooter);
+  CHECK(summary != nullptr);
+  CHECK(badChunk != nullptr);
+  CHECK(oldFooter != nullptr);
+  if (summary == nullptr || badChunk == nullptr || oldFooter == nullptr) return;
+
+  const std::size_t insertAt = static_cast<std::size_t>(summary->offset);
+  const std::size_t badStart = static_cast<std::size_t>(badChunk->offset);
+  const std::size_t badEnd = badStart + static_cast<std::size_t>(badChunk->total());
+  std::vector<std::uint8_t> withOrphan(bytes.begin(), bytes.begin() + insertAt);
+  withOrphan.insert(withOrphan.end(), invalid.begin() + badStart, invalid.begin() + badEnd);
+  withOrphan.insert(withOrphan.end(), bytes.begin() + insertAt, bytes.end());
+  const std::uint64_t shift = badChunk->total();
+  const std::size_t footerContent =
+      static_cast<std::size_t>(oldFooter->offset + shift + fourdgs::tool::kRecordHeaderSize);
+  const std::uint64_t oldSummaryStart = readU64(
+      bytes, static_cast<std::size_t>(oldFooter->offset + fourdgs::tool::kRecordHeaderSize));
+  writeU64(&withOrphan, footerContent, oldSummaryStart + shift);
+  const std::uint64_t oldSummaryOffset = readU64(
+      bytes, static_cast<std::size_t>(oldFooter->offset + fourdgs::tool::kRecordHeaderSize + 8));
+  if (oldSummaryOffset != 0) writeU64(&withOrphan, footerContent + 8, oldSummaryOffset + shift);
+  resealSummary(&withOrphan);
+
+  const Report report =
+      fourdgs::tool::validate(Span<const std::uint8_t>(withOrphan.data(), withOrphan.size()));
+  CHECK(!report.ok());
+  bool decodedOrphan = false;
+  for (const fourdgs::tool::Finding& finding : report.findings) {
+    if (finding.refusal.has_value() && finding.refusal->code == "unknown-stream-codec") {
+      decodedOrphan = true;
+    }
+  }
+  CHECK(decodedOrphan);
+}
 
 void inspectReadsRangesRatherThanTheWholeFile() {
   // Cross-SDK principle 1, checked at the transport rather than argued in a comment: `inspect` is
@@ -530,7 +752,7 @@ void aShortReadIsTruncationRatherThanAnInventedRecord() {
   fourdgs::Result<Walk> framed = fourdgs::tool::walk(partial);
   CHECK(framed.ok());
   if (framed) {
-    CHECK(framed->records.empty());
+    CHECK_EQ(framed->recordCount, static_cast<std::uint64_t>(0));
     CHECK(framed->cut.has_value());
   }
 }
@@ -540,7 +762,9 @@ void aDuplicateFrontMatterRecordLeavesTheRefusalUnplaced() {
   // something a framing walk can know, and an offset pointing at a record with nothing wrong with
   // it is worse than no offset because a reader believes it.
   Walk one;
-  one.records.push_back(fourdgs::tool::Frame{fourdgs::tool::op::kHeader, 8, 100});
+  one.representatives.push_back(fourdgs::tool::Frame{fourdgs::tool::op::kHeader, 8, 100});
+  one.opcodeCounts[fourdgs::tool::op::kHeader] = 1;
+  one.intactOpcodeCounts[fourdgs::tool::op::kHeader] = 1;
   const Error refusal(ErrorCode::kUnsupported, "the Header declares temporal model 'x'",
                       std::string("unknown-temporal-model"));
   const std::optional<Named> placed = fourdgs::tool::describe(refusal, &one, std::nullopt);
@@ -551,7 +775,9 @@ void aDuplicateFrontMatterRecordLeavesTheRefusalUnplaced() {
   }
 
   Walk two = one;
-  two.records.push_back(fourdgs::tool::Frame{fourdgs::tool::op::kHeader, 117, 100});
+  two.representatives.push_back(fourdgs::tool::Frame{fourdgs::tool::op::kHeader, 117, 100});
+  two.opcodeCounts[fourdgs::tool::op::kHeader] = 2;
+  two.intactOpcodeCounts[fourdgs::tool::op::kHeader] = 2;
   const std::optional<Named> ambiguous = fourdgs::tool::describe(refusal, &two, std::nullopt);
   // Still named — the identifier is the reader's and is not in doubt — and no longer placed.
   CHECK(ambiguous.has_value());
@@ -684,6 +910,11 @@ void runTests() {
   anErrorTheRefusalTableDoesNotNameIsNotGivenAnIdentifier();
   theDisplayFormCarriesTheCodeAndTheByte();
   opcodeNamesCoverTheOpenRanges();
+  aWalkRetainsBoundedFactsForUnboundedPrivateRecords();
+  aLongHeaderIsRangeParsedThroughItsTemporalModel();
+  anUnindexedKeyframeDeltaUsesTheStreamedDecoder();
+  anEmbeddedChunkOpcodeIsNotARecordBoundary();
+  anOrphanChunkIsDecodedByTheStreamedValidationPass();
   inspectReadsRangesRatherThanTheWholeFile();
   aFileMissingOnlyItsTrailingMagicIsNotInspectedCleanly();
   anIndexEntryAtTheEndOfTheFileIsRefusedRatherThanDereferenced();

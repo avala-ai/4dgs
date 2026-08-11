@@ -38,8 +38,10 @@
 ///   the model — the conformance suite proves it — so refusing a file for declaring it was never
 ///   a statement about the file.
 
+#include <limits>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "tool.hpp"
@@ -90,10 +92,15 @@ void noteTheCut(Report* report, const Walk& walk) {
                    " complete records before it are intact, and a streamed reader recovers them");
 }
 
-/// One byte at `offset`, or false. The offset comes off the file's own index, so it is untrusted.
-bool readByte(Readable& source, std::uint64_t offset, std::uint8_t* into) {
-  Result<std::size_t> got = source.read(offset, Span<std::uint8_t>(into, 1));
-  return got.ok() && *got == 1;
+bool readExactly(Readable& source, std::uint64_t offset, std::uint8_t* into, std::size_t length) {
+  Result<std::size_t> got = source.read(offset, Span<std::uint8_t>(into, length));
+  return got.ok() && *got == length;
+}
+
+std::uint32_t readU32(const std::uint8_t* at) {
+  std::uint32_t value = 0;
+  for (int i = 3; i >= 0; --i) value = (value << 8) | at[i];
+  return value;
 }
 
 std::string hex2(std::uint8_t value) {
@@ -142,44 +149,81 @@ void checkGaussianBirth(Readable& source, const Walk& walk, const std::vector<In
 /// no per-entry surface to drive one chain at a time. So this branch reads the file — and it is
 /// reached only for a Header that declares `keyframe-delta`, so the gaussian-birth branch, which
 /// is every other file in the corpus, never pays for it.
-void checkKeyframeDelta(Readable& source, std::uint64_t size, const Walk& walk, Report* report) {
+void checkKeyframeDelta(Readable& source, std::uint64_t size, bool indexed, const Walk& walk,
+                        Report* report) {
+  if (size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+    error(report, "the keyframe-delta file is too large for this ABI's contiguous input");
+    return;
+  }
   std::vector<std::uint8_t> data(static_cast<std::size_t>(size));
   if (!data.empty()) {
     Result<std::size_t> got = source.read(0, Span<std::uint8_t>(data.data(), data.size()));
-    if (!got) {
-      error(report, "the file could not be read whole, which this temporal model needs: " +
-                        got.error().message);
+    if (!got || *got != data.size()) {
+      error(report,
+            "the file could not be read whole, which this temporal model needs: " +
+                (got ? std::string("the resource returned a short read") : got.error().message));
       return;
     }
-    data.resize(*got);
   }
   Result<std::string> states =
-      keyframeDeltaStatesJson(Span<const std::uint8_t>(data.data(), data.size()), /*indexed=*/true);
+      keyframeDeltaStatesJson(Span<const std::uint8_t>(data.data(), data.size()), indexed);
   if (!states) {
-    refused(report, "a seeking reader cannot open this file: ", states.error(), &walk,
-            std::nullopt);
+    refused(report,
+            indexed ? "a seeking reader cannot open this file: "
+                    : "a streamed reader cannot decode this file: ",
+            states.error(), &walk, std::nullopt);
   }
 }
 
-/// The Header's declared temporal model, from a bounded prefix.
+/// The Header's temporal model, range-parsed through its two variable-length prefixes.
 ///
-/// `peekTemporalModel` reads the magic and the Header and stops, so it never needs more than the
-/// front of a file — the same prefix `refuseMagic` hands it. Passing the whole file would be a
-/// whole-file read for one string.
-std::string peekModel(Readable& source, std::uint64_t size) {
-  constexpr std::uint64_t kPrefix = 4096;
-  const std::uint64_t take = size < kPrefix ? size : kPrefix;
-  std::vector<std::uint8_t> head(static_cast<std::size_t>(take));
-  Result<std::size_t> got = source.read(0, Span<std::uint8_t>(head.data(), head.size()));
-  if (!got) return std::string();
-  head.resize(*got);
-  Result<std::string> peeked =
-      peekTemporalModel(Span<const std::uint8_t>(head.data(), head.size()));
-  if (!peeked) return std::string();
-  return *peeked;
+/// A fixed head probe is unrelated to the wire format: `profile` and `library` are legal strings
+/// of any framed length, so either can move `temporal_model` past such a probe. Only the model's
+/// own bytes are read here; large preceding strings are skipped by their validated lengths.
+std::string rangeParsedModel(Readable& source, const Walk& walk) {
+  const Frame* header = walk.firstIntact(op::kHeader);
+  if (header == nullptr) return std::string();
+  const std::uint64_t start = header->offset + kRecordHeaderSize;
+  const std::uint64_t limit = start + header->length;
+  if (limit < start) return std::string();
+  std::uint64_t at = start;
+  auto skipString = [&]() -> bool {
+    if (at > limit || limit - at < 4) return false;
+    std::uint8_t lengthBytes[4];
+    if (!readExactly(source, at, lengthBytes, sizeof(lengthBytes))) return false;
+    const std::uint64_t length = readU32(lengthBytes);
+    at += 4;
+    if (at > limit || length > limit - at) return false;
+    at += length;
+    return true;
+  };
+  if (!skipString() || !skipString()) return std::string();
+  // duration_sec, gaussian_count, cutoff.
+  constexpr std::uint64_t kFixedBeforeModel = 8 + 8 + 8;
+  if (at > limit || kFixedBeforeModel > limit - at) return std::string();
+  at += kFixedBeforeModel;
+  if (at > limit || limit - at < 4) return std::string();
+  std::uint8_t lengthBytes[4];
+  if (!readExactly(source, at, lengthBytes, sizeof(lengthBytes))) return std::string();
+  const std::uint64_t length = readU32(lengthBytes);
+  at += 4;
+  if (at > limit || length > limit - at) return std::string();
+  constexpr char kKeyframeDelta[] = "keyframe-delta";
+  constexpr std::size_t kKeyframeDeltaLength = sizeof(kKeyframeDelta) - 1;
+  if (length != kKeyframeDeltaLength) return std::string("other");
+  std::uint8_t model[kKeyframeDeltaLength];
+  if (!readExactly(source, at, model, sizeof(model))) return std::string();
+  for (std::size_t i = 0; i < kKeyframeDeltaLength; ++i) {
+    if (model[i] != static_cast<std::uint8_t>(kKeyframeDelta[i])) return std::string("other");
+  }
+  return std::string(kKeyframeDelta);
 }
 
 }  // namespace
+
+std::string temporalModel(Readable& source, const Walk& walk) {
+  return rangeParsedModel(source, walk);
+}
 
 bool Report::ok() const {
   for (const Finding& finding : findings) {
@@ -238,20 +282,22 @@ Report validate(Readable& source) {
 
   // Only the whole records: a record the file was cut inside is reported by the note below, and
   // counting it as present would say a Footer exists in a file that stops before one.
-  const std::size_t intact = walk.intact();
-  std::vector<std::uint8_t> seen;
-  bool header = false;
-  bool quantization = false;
-  bool footer = false;
-  for (std::size_t i = 0; i < intact; ++i) {
-    const std::uint8_t opcode = walk.records[i].opcode;
-    seen.push_back(opcode);
-    if (opcode == op::kHeader) header = true;
-    if (opcode == op::kQuantization) quantization = true;
-    if (opcode == op::kFooter) footer = true;
+  const bool header = walk.intactOpcodeCounts[op::kHeader] > 0;
+  const bool quantization = walk.intactOpcodeCounts[op::kQuantization] > 0;
+  const bool footer = walk.intactOpcodeCounts[op::kFooter] > 0;
+  for (std::size_t value = 0; value < walk.intactOpcodeCounts.size(); ++value) {
+    const std::uint64_t count = walk.intactOpcodeCounts[value];
+    if (count == 0) continue;
+    const std::uint8_t opcode = static_cast<std::uint8_t>(value);
+    const Frame* first = walk.firstIntact(opcode);
     if (isPrivate(opcode)) {
-      note(&report, "private record " + hex2(opcode) + " (" +
-                        std::to_string(walk.records[i].length) + " bytes) — skipped, as required");
+      if (count == 1 && first != nullptr) {
+        note(&report, "private record " + hex2(opcode) + " (" + std::to_string(first->length) +
+                          " bytes) — skipped, as required");
+      } else {
+        note(&report, std::to_string(count) + " private records " + hex2(opcode) +
+                          " — skipped, as required");
+      }
     } else if (isProvenance(opcode) && !isSpecified(opcode)) {
       // The reserved tail of the provenance family, which is a different thing from an unknown
       // record: the range is spoken for, so a reader that meets one knows it is looking at a
@@ -263,7 +309,7 @@ Report validate(Readable& source) {
     }
   }
 
-  if (seen.empty()) {
+  if (walk.intact() == 0) {
     error(&report, "no records at all");
     // And where it stopped, which on this path is everything else the file has to say. A magic
     // followed by an incomplete first record has nothing intact, so `seen` is empty and this
@@ -273,8 +319,9 @@ Report validate(Readable& source) {
     if (walk.cut.has_value()) noteTheCut(&report, walk);
     return report;
   }
-  if (seen[0] != op::kHeader) {
-    error(&report, "first record is " + opcodeName(seen[0]) + "; the Header must come first");
+  if (walk.firstIntactRecord->opcode != op::kHeader) {
+    error(&report, "first record is " + opcodeName(walk.firstIntactRecord->opcode) +
+                       "; the Header must come first");
   }
   if (!header) error(&report, "no Header record");
   if (!quantization) error(&report, "no Quantization record");
@@ -287,8 +334,8 @@ Report validate(Readable& source) {
   // validator that calls a file invalid while the reference calls it valid, and a verdict this
   // tool reaches alone is the exact failure this epic exists to prevent. A note carries the fact
   // without moving the verdict, and the check belongs in the reference first.
-  if (footer && seen.back() != op::kFooter) {
-    note(&report, "the last record is " + opcodeName(seen.back()) +
+  if (footer && walk.lastIntactRecord->opcode != op::kFooter) {
+    note(&report, "the last record is " + opcodeName(walk.lastIntactRecord->opcode) +
                       "; the Footer must be the last record (section 4)");
   }
 
@@ -301,10 +348,26 @@ Report validate(Readable& source) {
   // Asked of the reader rather than parsed here: this is the one field the whole branch turns
   // on, and a tool that read it out of the Header itself could disagree with the reader about
   // which model a file declares — which is the one disagreement that would matter.
-  const std::string model = peekModel(source, size);
+  const std::string model = temporalModel(source, walk);
   const bool keyframeDelta = model == "keyframe-delta";
 
   const std::vector<IndexEntry> index = chunkIndexEntries(source, walk);
+  if (walk.intactOpcodeCounts[op::kChunkIndex] > kMaxChunkIndexEntries) {
+    error(&report, "the file carries more than " + std::to_string(kMaxChunkIndexEntries) +
+                       " Chunk Index records; this validator's bounded index cannot retain them");
+  }
+  // Resolve every indexed offset against the top-level framing walk. Looking only at the byte at
+  // an offset accepts a counterfeit Chunk header embedded in another record's payload; a valid
+  // range has to equal one complete frame, opcode and declared total alike.
+  std::vector<std::optional<Frame>> physical(index.size());
+  std::unordered_map<std::uint64_t, std::vector<std::size_t>> wanted;
+  for (std::size_t i = 0; i < index.size(); ++i) wanted[index[i].offset].push_back(i);
+  (void)fourdgs::tool::walk(source, [&](const Frame& frame, bool complete) {
+    if (!complete) return;
+    const auto found = wanted.find(frame.offset);
+    if (found == wanted.end()) return;
+    for (std::size_t i : found->second) physical[i] = frame;
+  });
   for (std::size_t i = 0; i < index.size(); ++i) {
     const IndexEntry& entry = index[i];
     const std::uint64_t end = entry.offset + entry.length;
@@ -318,15 +381,19 @@ Report validate(Readable& source) {
     // A `keyframe-delta` file indexes both kinds: a Chunk is a keyframe and a Delta Chunk is a
     // difference against one, and an index that could only name the former could not seek the
     // model at all.
-    std::uint8_t at = 0;
-    const bool readable = !overflows && readByte(source, entry.offset, &at);
-    const bool addressable =
-        readable && (at == op::kChunk || (keyframeDelta && at == op::kDeltaChunk));
     if (overflows) {
       error(&report, "chunk index entry " + std::to_string(i) + " points past the end of the file");
-    } else if (!addressable) {
-      error(&report,
-            "chunk index entry " + std::to_string(i) + " does not point at a Chunk record");
+    } else if (!physical[i].has_value() ||
+               (physical[i]->opcode != op::kChunk &&
+                !(keyframeDelta && physical[i]->opcode == op::kDeltaChunk))) {
+      error(&report, "chunk index entry " + std::to_string(i) +
+                         " does not point at the start of a "
+                         "top-level Chunk record");
+    } else if (physical[i]->total() != entry.length) {
+      error(&report, "chunk index entry " + std::to_string(i) + " declares " +
+                         std::to_string(entry.length) + " bytes at " +
+                         std::to_string(entry.offset) + "; the record there is " +
+                         std::to_string(physical[i]->total()) + " bytes");
     }
   }
 
@@ -352,7 +419,7 @@ Report validate(Readable& source) {
   if (walk.cut.has_value()) noteTheCut(&report, walk);
 
   if (keyframeDelta) {
-    checkKeyframeDelta(source, size, walk, &report);
+    checkKeyframeDelta(source, size, !index.empty(), walk, &report);
   } else {
     checkGaussianBirth(source, walk, index, &report);
   }

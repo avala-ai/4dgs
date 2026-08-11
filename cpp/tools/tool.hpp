@@ -4,7 +4,9 @@
 #ifndef FOURDGS_TOOL_HPP
 #define FOURDGS_TOOL_HPP
 
+#include <array>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <ostream>
 #include <string>
@@ -39,6 +41,8 @@ extern const std::uint8_t kMagic[8];
 constexpr std::uint64_t kMagicSize = 8;
 /// `u8` opcode plus `u64` content length.
 constexpr std::uint64_t kRecordHeaderSize = 9;
+/// A fixed ceiling for the small summary index retained by validation.
+constexpr std::size_t kMaxChunkIndexEntries = 262144;
 
 /// The record opcodes this tool names by hand, spec §5.2.
 ///
@@ -101,23 +105,40 @@ struct Cut {
   bool insideARecord = false;
 };
 
-/// The result of walking a file's framing: every record, and the cut if there was one.
+/// Called as each record frame is found. `complete` is false only for the final frame when its
+/// declared content runs past the resource.
+using FrameVisitor = std::function<void(const Frame&, bool complete)>;
+
+/// The result of walking a file's framing: bounded facts about the records, and any cut.
 struct Walk {
-  std::vector<Frame> records;
+  /// At most the first two records of each opcode. Two are enough to place a unique
+  /// front-matter refusal or prove that placement ambiguous; retaining every private record
+  /// would make a framing walk use memory proportional to an untrusted record count.
+  std::vector<Frame> representatives;
+  std::array<std::uint64_t, 256> opcodeCounts{};
+  std::array<std::uint64_t, 256> intactOpcodeCounts{};
+  std::uint64_t recordCount = 0;
+  std::uint64_t intactRecordCount = 0;
+  std::optional<Frame> firstRecord;
+  std::optional<Frame> lastRecord;
+  std::optional<Frame> firstIntactRecord;
+  std::optional<Frame> lastIntactRecord;
   std::optional<Cut> cut;
   /// True when the last eight bytes are the magic, as a whole file's are.
   bool trailingMagic = false;
   std::uint64_t size = 0;
 
-  /// The first record with this opcode, or `nullptr`. Valid until `records` changes.
+  /// The first record with this opcode, or `nullptr`.
   const Frame* first(std::uint8_t opcode) const;
+  /// The first complete record with this opcode, or `nullptr`.
+  const Frame* firstIntact(std::uint8_t opcode) const;
 
   /// How many of the reported records are whole.
   ///
   /// All of them, except when the file was cut inside one: that record is reported — hiding
   /// it would hide the declared length that is the whole fault — but it is not something a
   /// streamed reader keeps.
-  std::size_t intact() const;
+  std::uint64_t intact() const;
 };
 
 /// Every top-level record, from framing alone.
@@ -127,10 +148,10 @@ struct Walk {
 /// walk over bytes that are not ours would report whatever the first byte happened to mean as
 /// an opcode — and when it fails, the core is asked to name the refusal so that the wording
 /// and the identifier are the reader's rather than this tool's.
-Result<Walk> walk(Readable& source);
+Result<Walk> walk(Readable& source, const FrameVisitor& visitor = FrameVisitor());
 
 /// The same, over bytes already in hand and without copying them.
-Result<Walk> walkBytes(Span<const std::uint8_t> data);
+Result<Walk> walkBytes(Span<const std::uint8_t> data, const FrameVisitor& visitor = FrameVisitor());
 
 /// A `Readable` over bytes the caller already holds, without copying them.
 ///
@@ -244,6 +265,10 @@ std::optional<ChunkRefusal> scanChunks(Readable& source, const std::vector<Index
 /// Forty bytes per index record plus seventeen per band it declares, read where the walk says
 /// that record is, and bounded by the record's own declared length rather than by its band count.
 std::vector<IndexEntry> chunkIndexEntries(Readable& source, const Walk& walk);
+
+/// The Header's temporal model, range-parsed through its length-framed profile and library.
+/// Empty when the Header is absent or malformed.
+std::string temporalModel(Readable& source, const Walk& walk);
 
 /// What the Footer declares about the summary checksum, and where the summary ends.
 struct SummaryDeclaration {

@@ -99,8 +99,19 @@ std::uint64_t Frame::total() const {
 }
 
 const Frame* Walk::first(std::uint8_t opcode) const {
-  for (const Frame& frame : records) {
+  for (const Frame& frame : representatives) {
     if (frame.opcode == opcode) return &frame;
+  }
+  return nullptr;
+}
+
+const Frame* Walk::firstIntact(std::uint8_t opcode) const {
+  if (intactOpcodeCounts[opcode] == 0) return nullptr;
+  for (const Frame& frame : representatives) {
+    if (frame.opcode == opcode && frame.offset + frame.total() >= frame.offset &&
+        frame.offset + frame.total() <= size) {
+      return &frame;
+    }
   }
   return nullptr;
 }
@@ -112,10 +123,7 @@ const BandRange* IndexEntry::bandRange(int band) const {
   return nullptr;
 }
 
-std::size_t Walk::intact() const {
-  const std::size_t incomplete = (cut.has_value() && cut->insideARecord) ? 1 : 0;
-  return records.size() < incomplete ? 0 : records.size() - incomplete;
-}
+std::uint64_t Walk::intact() const { return intactRecordCount; }
 
 bool isPrivate(std::uint8_t opcode) { return opcode >= op::kPrivateStart; }
 
@@ -260,7 +268,7 @@ std::optional<std::uint32_t> crc32Range(Readable& source, std::uint64_t start, s
   return crc ^ 0xFFFFFFFFu;
 }
 
-Result<Walk> walk(Readable& source) {
+Result<Walk> walk(Readable& source, const FrameVisitor& visitor) {
   Result<std::uint64_t> sized = source.size();
   if (!sized) return sized.error();
   const std::uint64_t size = *sized;
@@ -331,12 +339,18 @@ Result<Walk> walk(Readable& source) {
     frame.opcode = framing[0];
     frame.offset = at;
     frame.length = readU64(framing + 1);
-    // A record is listed either way: a declared length that runs off the end is a fact about
-    // that record, and hiding the record hides the field that carries the fault.
-    out.records.push_back(frame);
+    out.recordCount += 1;
+    out.opcodeCounts[frame.opcode] += 1;
+    out.firstRecord = out.firstRecord.has_value() ? out.firstRecord : std::optional<Frame>(frame);
+    out.lastRecord = frame;
+    // Two representatives per opcode are sufficient for every later use: the first places a
+    // unique refusal, and the second proves it is not unique. Memory therefore stays fixed even
+    // for a valid file containing millions of empty private records.
+    if (out.opcodeCounts[frame.opcode] <= 2) out.representatives.push_back(frame);
 
     const std::uint64_t end = at + frame.total();
     if (frame.total() == UINT64_MAX || end < at || end > size) {
+      if (visitor) visitor(frame, false);
       Cut cut;
       cut.at = at;
       cut.reason = "the " + opcodeName(frame.opcode) + " record declares " + commas(frame.length) +
@@ -345,6 +359,12 @@ Result<Walk> walk(Readable& source) {
       out.cut = cut;
       break;
     }
+    out.intactRecordCount += 1;
+    out.intactOpcodeCounts[frame.opcode] += 1;
+    out.firstIntactRecord =
+        out.firstIntactRecord.has_value() ? out.firstIntactRecord : std::optional<Frame>(frame);
+    out.lastIntactRecord = frame;
+    if (visitor) visitor(frame, true);
     at = end;
   }
   return out;
@@ -392,10 +412,9 @@ std::optional<Site> frontMatterSite(const Walk* walk, const std::string& code) {
   // nothing wrong with it, which the paragraph above rules out for the reason it gives. Every
   // corpus variant carries one of each, so this costs none of the seven placements.
   const Frame* found = nullptr;
-  for (const Frame& frame : walk->records) {
-    if (frame.opcode != opcode) continue;
-    if (found != nullptr) return std::nullopt;
-    found = &frame;
+  if (walk->intactOpcodeCounts[opcode] != 1) return std::nullopt;
+  for (const Frame& frame : walk->representatives) {
+    if (frame.opcode == opcode) found = &frame;
   }
   if (found == nullptr) return std::nullopt;
   return Site{found->offset, what};
@@ -412,7 +431,7 @@ std::optional<Named> describe(const Error& error, const Walk* walk,
   return named;
 }
 
-std::vector<IndexEntry> chunkIndexEntries(Readable& source, const Walk& walk) {
+std::vector<IndexEntry> chunkIndexEntries(Readable& source, const Walk& framing) {
   // `t0`, `t1`, `chunk_offset`, `chunk_length`: two doubles in, and the only fields this needs.
   // Everything after them is what a seek costs rather than where the chunk is, and a later
   // revision may append to it — which is why this reads a prefix and not a record.
@@ -421,20 +440,25 @@ std::vector<IndexEntry> chunkIndexEntries(Readable& source, const Walk& walk) {
   // Band 1 upwards, appended after the fixed prefix: `u8 band`, `u64 offset`, `u64 length`.
   constexpr std::size_t kBandEntry = 17;
   std::vector<IndexEntry> out;
+  if (framing.intactOpcodeCounts[op::kChunkIndex] == 0) return out;
   std::uint8_t prefix[kPrefix];
   std::uint8_t band[kBandEntry];
-  for (const Frame& frame : walk.records) {
-    if (frame.opcode != op::kChunkIndex) continue;
+  (void)walk(source, [&](const Frame& frame, bool complete) {
+    if (!complete || out.size() >= kMaxChunkIndexEntries) return;
+    if (frame.opcode != op::kChunkIndex) return;
     const std::uint64_t content = frame.offset + kRecordHeaderSize;
-    if (frame.length < kPrefix) continue;
-    if (!readExactly(source, content, prefix, kPrefix)) continue;
+    if (frame.length < kPrefix) return;
+    if (!readExactly(source, content, prefix, kPrefix)) return;
     IndexEntry entry;
     entry.offset = readU64(prefix + kOffsetField);
     entry.length = readU64(prefix + kOffsetField + 8);
     // `gaussian_count` then `band_count`, two `u32`s closing the prefix.
     std::uint32_t bands = 0;
     for (int i = 3; i >= 0; --i) bands = (bands << 8) | prefix[36 + i];
-    for (std::uint32_t b = 0; b < bands; ++b) {
+    // The format defines at most three SH bands. Reading more would only retain an untrusted
+    // count's worth of ranges for a record the decoder will refuse independently.
+    const std::uint32_t keptBands = bands < 3 ? bands : 3;
+    for (std::uint32_t b = 0; b < keptBands; ++b) {
       const std::uint64_t at = content + kPrefix + static_cast<std::uint64_t>(b) * kBandEntry;
       // The declared count is off an untrusted file; the record's own length is the bound.
       if (kPrefix + static_cast<std::uint64_t>(b + 1) * kBandEntry > frame.length) break;
@@ -446,56 +470,65 @@ std::vector<IndexEntry> chunkIndexEntries(Readable& source, const Walk& walk) {
       entry.bands.push_back(range);
     }
     out.push_back(entry);
-  }
+  });
   return out;
 }
 
 std::optional<ChunkRefusal> scanChunks(Readable& source, const std::vector<IndexEntry>& index) {
-  Result<std::unique_ptr<Scene>> opened = Scene::open(source, ReadMode::kAuto);
-  if (!opened) return ChunkRefusal{opened.error(), std::nullopt};
-  Scene& scene = **opened;
+  int degree = 0;
+  if (!index.empty()) {
+    Result<std::unique_ptr<Scene>> opened = Scene::open(source, ReadMode::kIndexed);
+    if (!opened) return ChunkRefusal{opened.error(), std::nullopt};
+    Scene& scene = **opened;
 
-  // The degree the file declares, so the scan fetches what the file says it carries. A cap of 0
-  // transfers no band record at all, which is why a band that will not decode used to come back
-  // as a file with nothing wrong with it.
-  const int degree = scene.shDegree();
+    // The degree the file declares, so the scan fetches what the file says it carries. A cap of 0
+    // transfers no band record at all, which is why a band that will not decode used to come back
+    // as a file with nothing wrong with it.
+    degree = scene.shDegree();
+    const std::uint32_t chunks = scene.chunkCount();
+    if (scene.isIndexed()) {
+      for (std::uint32_t i = 0; i < chunks; ++i) {
+        Result<void> loaded = scene.loadChunk(i, degree);
+        if (loaded) continue;
 
-  const std::uint32_t chunks = scene.chunkCount();
-  if (chunks == 0 || !scene.isIndexed()) {
-    // Front to back: every chunk or none, and no per-chunk offset to attribute to.
-    Result<void> loaded = scene.loadAll(degree);
-    if (!loaded) return ChunkRefusal{loaded.error(), std::nullopt};
-    return std::nullopt;
-  }
-  for (std::uint32_t i = 0; i < chunks; ++i) {
-    Result<void> loaded = scene.loadChunk(i, degree);
-    if (loaded) continue;
-
-    std::optional<Site> site;
-    if (i < index.size()) {
-      site = Site{index[i].offset, "the Chunk record at index entry " + std::to_string(i)};
-      // Which band, if it was a band. The cap is raised from nothing until the fetch starts
-      // failing: the first cap that fails is the first band the reader could not decode, and
-      // failing at 0 means the fault is in the chunk's own attribute streams rather than in any
-      // band. This runs only here, on the failure path, so a healthy file pays nothing for it.
-      for (int cap = 0; cap <= degree; ++cap) {
-        if (scene.loadChunk(i, cap)) continue;
-        if (cap == 0) break;
-        const BandRange* range = index[i].bandRange(cap);
-        if (range != nullptr) {
-          site = Site{range->offset, "the SH Band Stream record for band " + std::to_string(cap) +
-                                         " at index entry " + std::to_string(i)};
+        std::optional<Site> site;
+        if (i < index.size()) {
+          site = Site{index[i].offset, "the Chunk record at index entry " + std::to_string(i)};
+          // Which band, if it was a band. The cap is raised from nothing until the fetch starts
+          // failing: the first cap that fails is the first band the reader could not decode, and
+          // failing at 0 means the fault is in the chunk's own attribute streams rather than in
+          // any band. This runs only here, on the failure path, so a healthy file pays nothing.
+          for (int cap = 0; cap <= degree; ++cap) {
+            if (scene.loadChunk(i, cap)) continue;
+            if (cap == 0) break;
+            const BandRange* range = index[i].bandRange(cap);
+            if (range != nullptr) {
+              site =
+                  Site{range->offset, "the SH Band Stream record for band " + std::to_string(cap) +
+                                          " at index entry " + std::to_string(i)};
+            }
+            break;
+          }
         }
-        break;
+        return ChunkRefusal{loaded.error(), site};
       }
     }
-    return ChunkRefusal{loaded.error(), site};
   }
+
+  // And the front-to-back path, independently. An index can omit a physical Chunk; decoding only
+  // what it names never fetches that orphan and can call a file valid even though a pipe reader
+  // refuses it. The indexed pass runs first only so a refusal both paths share keeps its precise
+  // index or SH-band byte instead of becoming unplaced.
+  Result<std::unique_ptr<Scene>> streamed = Scene::open(source, ReadMode::kSequential);
+  if (!streamed) return ChunkRefusal{streamed.error(), std::nullopt};
+  if (index.empty()) degree = (*streamed)->shDegree();
+  Result<void> streamedLoaded = (*streamed)->loadAll(degree);
+  if (!streamedLoaded) return ChunkRefusal{streamedLoaded.error(), std::nullopt};
   return std::nullopt;
 }
 
 std::optional<SummaryDeclaration> summaryDeclaration(Readable& source, const Walk& walk) {
-  const Frame* frame = walk.first(op::kFooter);
+  const Frame* frame = walk.firstIntact(op::kFooter);
   if (frame == nullptr) return std::nullopt;
   // `summary_start`, `summary_offset_start`, `summary_crc` — twenty bytes, and the only record
   // this tool reads the content of. A Footer a later revision extends still parses: the fields
@@ -550,9 +583,9 @@ Result<std::vector<std::uint8_t>> readWhole(const std::string& path) {
   return bytes;
 }
 
-Result<Walk> walkBytes(Span<const std::uint8_t> data) {
+Result<Walk> walkBytes(Span<const std::uint8_t> data, const FrameVisitor& visitor) {
   BorrowedReadable source(data);
-  return walk(source);
+  return walk(source, visitor);
 }
 
 }  // namespace tool
