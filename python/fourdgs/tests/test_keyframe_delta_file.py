@@ -16,6 +16,7 @@ import fourdgs
 import numpy as np
 import pytest
 from fourdgs import keyframe_delta_file as kdf
+from fourdgs import opcode as op
 from fourdgs import records as rec
 from fourdgs.keyframe_delta_writer import KeyframeDeltaOptions, Sample
 
@@ -86,6 +87,37 @@ def test_a_keyframe_only_file_is_the_frame_sequence_shape():
     assert all(c.kind == 0 for c in decoded.chunks)  # every chunk a keyframe, no deltas
     summary = kdf.states_json(decoded)
     assert all(row["kind"] == "keyframe" for row in summary["chunks"])
+
+
+def test_each_keyframe_states_mu_t_at_its_chunk_start():
+    samples, duration = _moving_sequence(steps=4)
+    decoded = kdf.decode_streamed(write_ok(samples, duration, rec.DELTA_MODE_CHAINED, keyframe_every=2))
+    keyframes = [chunk for chunk in decoded.chunks if chunk.kind == 0]
+    assert [chunk.t0 for chunk in keyframes] == [0.0, 4.0]
+    for chunk in keyframes:
+        sigma = chunk.state.bins[op.A_SIGMA_T].reshape(-1)
+        never_fades = (chunk.state.bins[op.A_FLAGS].reshape(-1) & op.FLAG_NEVER_FADES) != 0
+        expected = np.rint(chunk.t0 / decoded.grids.mu_step(sigma, never_fades)).astype(np.int64)
+        assert chunk.state.bins[op.A_MU_T].reshape(-1).tolist() == expected.tolist()
+
+
+@pytest.mark.parametrize("mode", [rec.DELTA_MODE_CHAINED, rec.DELTA_MODE_KEYFRAME])
+def test_a_delta_subtracts_from_the_serialized_keyframe_birth_time(mode):
+    samples, duration = _moving_sequence(steps=4)
+    for sample in samples:
+        sample.gaussians.motions[:, 0] = 0.25
+
+    decoded = kdf.decode_streamed(write_ok(samples, duration, mode, keyframe_every=2))
+    later_keyframe = decoded.chunks[2]
+    following_delta = decoded.chunks[3]
+    assert later_keyframe.t0 == 4.0
+    assert following_delta.reference_offset == later_keyframe.offset
+
+    # The input authors mu_t=0 for every sample.  The keyframe correctly writes
+    # t0=4, and the following delta must calculate against that serialized bin so
+    # composition returns to the authored zero rather than inheriting the anchor.
+    assert np.all(later_keyframe.state.bins[op.A_MU_T] != 0)
+    assert following_delta.state.bins[op.A_MU_T].reshape(-1).tolist() == [0] * following_delta.state.count
 
 
 def test_composition_reconstructs_each_source_sample():

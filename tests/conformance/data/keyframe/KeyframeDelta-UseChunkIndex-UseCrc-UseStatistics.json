@@ -64,7 +64,7 @@
       "liveCount": "4",
       "t0": 5.0,
       "t1": 6.0,
-      "updateCount": "3"
+      "updateCount": "4"
     },
     {
       "birthCount": "0",
@@ -607,7 +607,7 @@
     },
     {
       "aggregate": {
-        "opacitySum": 3.604894,
+        "opacitySum": 3.607843,
         "positionSum": [
           2.4,
           2.2,
@@ -671,7 +671,7 @@
     },
     {
       "aggregate": {
-        "opacitySum": 3.604111,
+        "opacitySum": 3.607797,
         "positionSum": [
           2.4,
           2.2,

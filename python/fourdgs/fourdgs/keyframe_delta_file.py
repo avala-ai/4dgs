@@ -341,7 +341,27 @@ def write_sequence(
     for i, (ids, bins) in enumerate(quantized):
         t0, t1 = t0s[i], t1s[i]
         if is_keyframe(i, kd):
-            blob = rec.encode_chunk(t0, t1, 0, int(ids.shape[0]), _keyframe_streams(ids, bins, codec, level))
+            # A keyframe states every live gaussian afresh at its physical interval
+            # start. Keep the shared sample bins unchanged for later delta arithmetic,
+            # but serialize mu_t at Chunk.t0 as spec section 11.3 requires.
+            keyframe_bins = dict(bins)
+            sigma = bins[op.A_SIGMA_T].reshape(-1)
+            never_fades = (bins[op.A_FLAGS].reshape(-1) & op.FLAG_NEVER_FADES) != 0
+            step = grids.mu_step(sigma, never_fades)
+            keyframe_bins[op.A_MU_T] = np.rint(t0 / step).astype(np.int64).reshape(-1, 1)
+            # Deltas must subtract from the state that was actually serialized.  In
+            # particular, a delta following a later keyframe has to undo this t0
+            # anchor when its authored mu_t differs; subtracting from the unmodified
+            # input bins would make the encoded difference telescope to the wrong
+            # absolute value during composition.
+            quantized[i] = (ids, keyframe_bins)
+            blob = rec.encode_chunk(
+                t0,
+                t1,
+                0,
+                int(ids.shape[0]),
+                _keyframe_streams(ids, keyframe_bins, codec, level),
+            )
             at = emit(blob)
             offsets.append(at)
             kinds.append(0)
