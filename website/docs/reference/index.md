@@ -33,7 +33,7 @@ identical bytes with no per-language slerp or composition order of its own.
 | Spherical harmonics, degree 1                     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Spherical harmonics, degree 2                     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Spherical harmonics, degree 3                     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| SH band range-skipping                            | Yes    | Yes        | Yes     | Yes     | Untested | Yes     |
+| SH band range-skipping                            | Yes    | Yes        | Yes     | Untested | Untested | Yes     |
 | SH per-band bit depth, decode                     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | SH per-band bit depth, encode                     | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
 | Spatial audio sources (optional)                  | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
@@ -233,11 +233,12 @@ Swift are proved by the cross-language encode gate below, which runs the same pe
 coefficients each encoder coarsened must come back out of the Python decoder as the same bytes, and
 the appended depths must read as the ones written.
 
-**SH band range-skipping** is proved for five SDKs by a byte count taken at the transport rather
+**SH band range-skipping** is proved for four SDKs by a byte count taken at the transport rather
 than by a decoded value: each of those runners reads a chunk at every band cap and asserts the bytes
 transferred equal exactly what the chunk index declares for the bands at or below it. Never
-transferring a band you will not evaluate is the whole feature, and that is what is measured. Swift
-compares the core's estimates without measuring a capped transport read, so its cell remains
+transferring a band you will not evaluate is the whole feature, and that is what is measured. The
+C++ and Swift bindings compare byte-count expectations derived from the same Rust binding that
+performs the read, rather than independently measuring capped transport reads, so both cells remain
 `Untested`.
 
 **Refusal diagnosis** is a `Yes` only where a runner names _which_ rule a file broke, not merely
@@ -328,10 +329,11 @@ their own bindings. See
 [the fuzzing notes](https://github.com/avala-ai/4dgs/blob/main/tests/fuzz/README.md) and
 `rust/fourdgs/tests/fuzz.rs`.
 
-**Swift**'s current band-skipping check compares `bytesForChunk` estimates computed from the index.
-It proves that the estimates shrink monotonically as bands are capped, but it neither loads a chunk
-nor observes the cache or transport. That is why the matrix records the binding as `Untested` for
-range-skipping even though the core implements it.
+**C++** and **Swift** currently check band-skipping against byte-count expectations computed from
+the same Rust binding that performs the capped read. Those checks show that the estimates shrink as
+bands are capped, but they do not independently observe the binding's cache or transport. That is
+why the matrix records both bindings as `Untested` for range-skipping even though the core
+implements it.
 
 **Convert from PLY frame sequences** and **Inspect and validate** are tools rather than wire-format
 features, so the conformance suite does not cover them; they are marked from their own tests, which
