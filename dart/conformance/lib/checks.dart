@@ -543,8 +543,17 @@ checkSeekReadsOnlyWhatItNeeds(
     }
     candidates.addAll(seekProbeInstants(entry, guardAt));
   }
+  final duration = scene.header.durationSec;
   final orderedCandidates =
-      candidates.where((t) => t.isFinite).toList()..sort();
+      candidates
+          .where(
+            (t) =>
+                t.isFinite &&
+                t >= 0.0 &&
+                (t < duration || (duration == 0.0 && t == 0.0)),
+          )
+          .toList()
+        ..sort();
 
   final entryStarts = <({double at, int index})>[
     for (int i = 0; i < index.length; i++) (at: index[i].t0, index: i),

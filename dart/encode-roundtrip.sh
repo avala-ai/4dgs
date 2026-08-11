@@ -82,6 +82,7 @@ if [ ${#variants[@]} -eq 0 ]; then
 fi
 
 agreed=0
+multi_entry=0
 for source in "${variants[@]}"; do
   name="$(basename "$source" .4dgs)"
   "$encode" "$source" "$out/$name.4dgs" >"$out/$name.note"
@@ -354,7 +355,17 @@ if disagreed:
     sys.exit(1)
 PY
   agreed=$((agreed + 1))
-  echo "  $name: $(cat "$out/$name.note")"
+  note="$(cat "$out/$name.note")"
+  if [[ "$note" =~ ,[[:space:]]([0-9]+)[[:space:]]chunks, ]] &&
+    [ "${BASH_REMATCH[1]}" -gt 1 ]; then
+    multi_entry=1
+  fi
+  echo "  $name: $note"
 done
+
+if [ "$multi_entry" -ne 1 ]; then
+  echo "::error::no Dart-written variant produced more than one Chunk Index entry; chunked encode was not exercised"
+  exit 1
+fi
 
 echo "$agreed variants re-encoded by Dart; every one inside the bounds it declares against its source, and the Dart, Python and Rust decoders agree on it, both read paths each"
