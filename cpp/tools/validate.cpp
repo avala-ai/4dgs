@@ -78,6 +78,24 @@ void refused(Report* report, const char* prefix, const Error& err, const Walk* w
   push(report, Severity::kError, std::string(prefix) + err.message, describe(err, walk, site));
 }
 
+/// What survived the cut, in one sentence, from the two places that need it.
+///
+/// A cut file is invalid and every finding about it stands — but records are length-prefixed, so
+/// everything complete before the cut is intact and the library's streamed reader keeps it.
+/// Saying only that the file stopped reading leaves its holder to guess whether anything is
+/// salvageable; this says how much.
+void noteTheCut(Report* report, const Walk& walk) {
+  note(report, "the file is cut at byte " + commas(walk.cut->at) + ": " + walk.cut->reason +
+                   ". The " + std::to_string(walk.intact()) +
+                   " complete records before it are intact, and a streamed reader recovers them");
+}
+
+/// One byte at `offset`, or false. The offset comes off the file's own index, so it is untrusted.
+bool readByte(Readable& source, std::uint64_t offset, std::uint8_t* into) {
+  Result<std::size_t> got = source.read(offset, Span<std::uint8_t>(into, 1));
+  return got.ok() && *got == 1;
+}
+
 std::string hex2(std::uint8_t value) {
   static const char* digits = "0123456789ABCDEF";
   std::string out = "0x";
@@ -93,9 +111,9 @@ std::string hex2(std::uint8_t value) {
 /// where the rest do, and there is no substitute for it: the framing walk steps over a chunk by
 /// its declared length, so an unimplemented stream codec and an out-of-range window index are
 /// both invisible to everything before this point. Both are in the invalid corpus.
-void checkGaussianBirth(Span<const std::uint8_t> data, const Walk& walk,
-                        const std::vector<std::uint64_t>& chunkOffsets, Report* report) {
-  Result<std::unique_ptr<Scene>> opened = Scene::openMemory(data, ReadMode::kIndexed);
+void checkGaussianBirth(Readable& source, const Walk& walk, const std::vector<IndexEntry>& index,
+                        Report* report) {
+  Result<std::unique_ptr<Scene>> opened = Scene::open(source, ReadMode::kIndexed);
   if (!opened) {
     refused(report, "a seeking reader cannot open this file: ", opened.error(), &walk,
             std::nullopt);
@@ -105,7 +123,7 @@ void checkGaussianBirth(Span<const std::uint8_t> data, const Walk& walk,
   }
   // Closed before the scan, so only one reader — and one chunk — is resident at a time.
   opened->reset();
-  std::optional<ChunkRefusal> refusal = scanChunks(data, chunkOffsets);
+  std::optional<ChunkRefusal> refusal = scanChunks(source, index);
   if (refusal.has_value()) {
     refused(report, "a chunk does not decode: ", refusal->error, &walk, refusal->site);
   }
@@ -117,12 +135,48 @@ void checkGaussianBirth(Span<const std::uint8_t> data, const Walk& walk,
 /// decode what it carries — expressed in the reader the file's declared model actually needs.
 /// The alternative, which is what the Python validator still does, is to run the gaussian-birth
 /// reader over it and report its refusal as a fault in the file.
-void checkKeyframeDelta(Span<const std::uint8_t> data, const Walk& walk, Report* report) {
-  Result<std::string> states = keyframeDeltaStatesJson(data, /*indexed=*/true);
+/// The one path that holds the file, and the ABI is why.
+///
+/// `fourdgs_keyframe_delta_states_json` takes `(const uint8_t*, size_t)`: it composes every chain
+/// in the core and hands back the canonical states, and there is no range-reading counterpart and
+/// no per-entry surface to drive one chain at a time. So this branch reads the file — and it is
+/// reached only for a Header that declares `keyframe-delta`, so the gaussian-birth branch, which
+/// is every other file in the corpus, never pays for it.
+void checkKeyframeDelta(Readable& source, std::uint64_t size, const Walk& walk, Report* report) {
+  std::vector<std::uint8_t> data(static_cast<std::size_t>(size));
+  if (!data.empty()) {
+    Result<std::size_t> got = source.read(0, Span<std::uint8_t>(data.data(), data.size()));
+    if (!got) {
+      error(report, "the file could not be read whole, which this temporal model needs: " +
+                        got.error().message);
+      return;
+    }
+    data.resize(*got);
+  }
+  Result<std::string> states =
+      keyframeDeltaStatesJson(Span<const std::uint8_t>(data.data(), data.size()), /*indexed=*/true);
   if (!states) {
     refused(report, "a seeking reader cannot open this file: ", states.error(), &walk,
             std::nullopt);
   }
+}
+
+/// The Header's declared temporal model, from a bounded prefix.
+///
+/// `peekTemporalModel` reads the magic and the Header and stops, so it never needs more than the
+/// front of a file — the same prefix `refuseMagic` hands it. Passing the whole file would be a
+/// whole-file read for one string.
+std::string peekModel(Readable& source, std::uint64_t size) {
+  constexpr std::uint64_t kPrefix = 4096;
+  const std::uint64_t take = size < kPrefix ? size : kPrefix;
+  std::vector<std::uint8_t> head(static_cast<std::size_t>(take));
+  Result<std::size_t> got = source.read(0, Span<std::uint8_t>(head.data(), head.size()));
+  if (!got) return std::string();
+  head.resize(*got);
+  Result<std::string> peeked =
+      peekTemporalModel(Span<const std::uint8_t>(head.data(), head.size()));
+  if (!peeked) return std::string();
+  return *peeked;
 }
 
 }  // namespace
@@ -145,20 +199,37 @@ std::optional<Severity> Report::worst() const {
 }
 
 Report validate(Span<const std::uint8_t> data) {
+  BorrowedReadable source(data);
+  return validate(source);
+}
+
+Report validate(Readable& source) {
   Report report;
+
+  Result<std::uint64_t> sized = source.size();
+  if (!sized) {
+    refused(&report, "", sized.error(), nullptr, std::nullopt);
+    return report;
+  }
+  const std::uint64_t size = *sized;
 
   // Framing first, and for two reasons: it refuses a file that is not ours before anything reads
   // a byte as an opcode, and it is what gives every later refusal a byte to point at.
-  Result<Walk> walked = walkBytes(data);
+  Result<Walk> walked = walk(source);
   if (!walked) {
     refused(&report, "", walked.error(), nullptr, std::nullopt);
     return report;
   }
   const Walk& walk = *walked;
 
-  bool endsWithMagic = data.size() >= kMagicSize;
-  for (std::size_t i = 0; i < kMagicSize && endsWithMagic; ++i) {
-    if (data[data.size() - kMagicSize + i] != kMagic[i]) endsWithMagic = false;
+  bool endsWithMagic = size >= kMagicSize;
+  if (endsWithMagic) {
+    std::uint8_t tail[kMagicSize] = {0};
+    Result<std::size_t> got = source.read(size - kMagicSize, Span<std::uint8_t>(tail, kMagicSize));
+    endsWithMagic = got.ok() && *got == kMagicSize;
+    for (std::size_t i = 0; i < kMagicSize && endsWithMagic; ++i) {
+      if (tail[i] != kMagic[i]) endsWithMagic = false;
+    }
   }
   if (!endsWithMagic) {
     error(&report,
@@ -194,6 +265,12 @@ Report validate(Span<const std::uint8_t> data) {
 
   if (seen.empty()) {
     error(&report, "no records at all");
+    // And where it stopped, which on this path is everything else the file has to say. A magic
+    // followed by an incomplete first record has nothing intact, so `seen` is empty and this
+    // return fires before the cut note below — leaving the byte, the record and the declared
+    // length the walk had already recovered unreported, in exactly the case carrying the least
+    // other information. "No records at all" was the whole answer.
+    if (walk.cut.has_value()) noteTheCut(&report, walk);
     return report;
   }
   if (seen[0] != op::kHeader) {
@@ -202,6 +279,18 @@ Report validate(Span<const std::uint8_t> data) {
   if (!header) error(&report, "no Header record");
   if (!quantization) error(&report, "no Quantization record");
   if (!footer) error(&report, "no Footer record");
+  // The other half of the same normative sentence (spec §4: "the Header MUST be the first record,
+  // the Footer MUST be the last"), and a note rather than an error on purpose.
+  //
+  // Neither the Python reference validator nor the Rust one checks this — both check only the
+  // Header half, in the wording copied above. Raising it to `error` here would make this the one
+  // validator that calls a file invalid while the reference calls it valid, and a verdict this
+  // tool reaches alone is the exact failure this epic exists to prevent. A note carries the fact
+  // without moving the verdict, and the check belongs in the reference first.
+  if (footer && seen.back() != op::kFooter) {
+    note(&report, "the last record is " + opcodeName(seen.back()) +
+                      "; the Footer must be the last record (section 4)");
+  }
 
   // Which chunk shape the rest of this validator is entitled to assume. A `keyframe-delta`
   // file's Chunks are keyframes and its Delta Chunks are differences against them, so the index
@@ -212,21 +301,27 @@ Report validate(Span<const std::uint8_t> data) {
   // Asked of the reader rather than parsed here: this is the one field the whole branch turns
   // on, and a tool that read it out of the Header itself could disagree with the reader about
   // which model a file declares — which is the one disagreement that would matter.
-  std::string model;
-  Result<std::string> peeked = peekTemporalModel(data);
-  if (peeked) model = *peeked;
+  const std::string model = peekModel(source, size);
   const bool keyframeDelta = model == "keyframe-delta";
 
-  const std::vector<IndexEntry> index = chunkIndexEntries(data, walk);
+  const std::vector<IndexEntry> index = chunkIndexEntries(source, walk);
   for (std::size_t i = 0; i < index.size(); ++i) {
     const IndexEntry& entry = index[i];
     const std::uint64_t end = entry.offset + entry.length;
-    const bool overflows = end < entry.offset || end > data.size();
+    // `offset >= size` and not just `end > size`. An entry declaring `chunk_offset == size` with
+    // `chunk_length == 0` has an end exactly at the end of the file, so the arithmetic check
+    // passes — and the opcode read below then reaches one byte past the last, which over a
+    // borrowed buffer is a read outside it. These are untrusted bytes off the file being
+    // validated, so an entry naming the byte after the file is a diagnosis to print, not an
+    // address to dereference.
+    const bool overflows = end < entry.offset || end > size || entry.offset >= size;
     // A `keyframe-delta` file indexes both kinds: a Chunk is a keyframe and a Delta Chunk is a
     // difference against one, and an index that could only name the former could not seek the
     // model at all.
-    const std::uint8_t at = overflows ? 0 : data[static_cast<std::size_t>(entry.offset)];
-    const bool addressable = at == op::kChunk || (keyframeDelta && at == op::kDeltaChunk);
+    std::uint8_t at = 0;
+    const bool readable = !overflows && readByte(source, entry.offset, &at);
+    const bool addressable =
+        readable && (at == op::kChunk || (keyframeDelta && at == op::kDeltaChunk));
     if (overflows) {
       error(&report, "chunk index entry " + std::to_string(i) + " points past the end of the file");
     } else if (!addressable) {
@@ -235,13 +330,13 @@ Report validate(Span<const std::uint8_t> data) {
     }
   }
 
-  std::optional<SummaryDeclaration> summary = summaryDeclaration(data, walk);
+  std::optional<SummaryDeclaration> summary = summaryDeclaration(source, walk);
   if (summary.has_value()) {
     if (summary->start > summary->end) {
       error(&report, "the Footer's summary starts at " + std::to_string(summary->start) +
                          ", after the summary ends at " + std::to_string(summary->end));
     } else {
-      std::optional<Coverage> covered = coverage(data, walk);
+      std::optional<Coverage> covered = coverage(source, walk);
       if (covered.has_value() && !covered->ok) {
         error(&report,
               "summary CRC mismatch: the index is untrustworthy (a streamed read still works)");
@@ -254,25 +349,12 @@ Report validate(Span<const std::uint8_t> data) {
   }
 
   // What survived the cut, which is the question the errors above do not answer.
-  //
-  // A cut file is invalid and every finding about it stands — but records are length-prefixed,
-  // so everything complete before the cut is intact and the library's streamed reader keeps it.
-  // Saying only that the file stopped reading leaves its holder to guess whether anything is
-  // salvageable; this says how much.
-  if (walk.cut.has_value()) {
-    note(&report, "the file is cut at byte " + commas(walk.cut->at) + ": " + walk.cut->reason +
-                      ". The " + std::to_string(walk.intact()) +
-                      " complete records before it are intact, and a streamed reader recovers "
-                      "them");
-  }
+  if (walk.cut.has_value()) noteTheCut(&report, walk);
 
   if (keyframeDelta) {
-    checkKeyframeDelta(data, walk, &report);
+    checkKeyframeDelta(source, size, walk, &report);
   } else {
-    std::vector<std::uint64_t> chunkOffsets;
-    chunkOffsets.reserve(index.size());
-    for (const IndexEntry& entry : index) chunkOffsets.push_back(entry.offset);
-    checkGaussianBirth(data, walk, chunkOffsets, &report);
+    checkGaussianBirth(source, walk, index, &report);
   }
 
   return report;
@@ -300,13 +382,14 @@ int runValidate(const std::string& path, std::ostream& out, std::ostream& err) {
            "C++ package README for how to link the core (`inspect` still walks the framing)\n";
     return kExitTool;
   }
-  Result<std::vector<std::uint8_t>> data = readWhole(path);
-  if (!data) {
+  Result<FileReadable*> file = FileReadable::open(path);
+  if (!file) {
     // Not the file's fault, and not a refusal. See `kExitTool`.
-    err << "4dgs: " << path << ": " << data.error().message << "\n";
+    err << "4dgs: " << path << ": " << file.error().message << "\n";
     return kExitTool;
   }
-  const Report report = validate(Span<const std::uint8_t>(data->data(), data->size()));
+  std::unique_ptr<FileReadable> source(*file);
+  const Report report = validate(*source);
   for (const Finding& finding : report.findings) {
     out << severityName(finding.severity) << ": " << finding.message << "\n";
     // Indented, and with a prefix of its own, so that a caller filtering the findings on

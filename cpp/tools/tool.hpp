@@ -132,12 +132,33 @@ Result<Walk> walk(Readable& source);
 /// The same, over bytes already in hand and without copying them.
 Result<Walk> walkBytes(Span<const std::uint8_t> data);
 
-/// A whole file, for the commands that need one.
+/// A `Readable` over bytes the caller already holds, without copying them.
 ///
-/// `validate` does: the summary checksum has to cover a contiguous region to mean anything, and
-/// the reader is handed the same bytes rather than a second transport that could disagree with
-/// this walk. Cross-SDK principle 1 is about decode paths, and the decode this performs is
-/// chunk by chunk.
+/// `MemoryReadable` takes ownership of a copy, which is the right shape for a test fixture and
+/// the wrong one for bytes that are already in hand. Everything in this tool that used to take a
+/// `Span` takes a `Readable&`, so this is how a caller with bytes reaches it.
+class BorrowedReadable : public Readable {
+ public:
+  explicit BorrowedReadable(Span<const std::uint8_t> bytes) : bytes_(bytes) {}
+
+  Result<std::uint64_t> size() override;
+  Result<std::size_t> read(std::uint64_t offset, Span<std::uint8_t> into) override;
+
+ private:
+  Span<const std::uint8_t> bytes_;
+};
+
+/// A whole file, for the one check that cannot be performed any other way.
+///
+/// Cross-SDK principle 1 is not a guideline this tool gets to interpret: `inspect` and the
+/// gaussian-birth half of `validate` read ranges, and never hold more than one chunk and one
+/// 64 KiB buffer, whatever the file's size.
+///
+/// The exception is `keyframe-delta`, and it is the C ABI's rather than this tool's:
+/// `fourdgs_keyframe_delta_states_json` takes `(const uint8_t*, size_t)`, with no range-reading
+/// counterpart and no per-entry surface to drive one chain at a time, so composing those chains
+/// at all means handing the core the whole file. That surface belongs to the Rust crate; until it
+/// grows a reader overload, this is the one path that buffers.
 Result<std::vector<std::uint8_t>> readWhole(const std::string& path);
 
 /// The byte a refusal fired at, and what sits there.
@@ -172,31 +193,57 @@ struct ChunkRefusal {
   std::optional<Site> site;
 };
 
+/// Where one band's stream record sits, as the chunk index entry declares it.
+struct BandRange {
+  int band = 0;
+  std::uint64_t offset = 0;
+  std::uint64_t length = 0;
+};
+
+/// One chunk index entry: where its chunk sits, and where each of its bands does.
+struct IndexEntry {
+  std::uint64_t offset = 0;
+  std::uint64_t length = 0;
+  /// Band 1 upwards, in the order the entry lists them. Empty for a file with no spherical
+  /// harmonics, and for one whose encoder wrote none — both of which are ordinary.
+  std::vector<BandRange> bands;
+
+  /// The record for `band`, or `nullptr`.
+  const BandRange* bandRange(int band) const;
+};
+
 /// The first chunk that refuses, decoded one chunk at a time.
 ///
 /// Empty means every chunk decoded, which is the only evidence there is that a file's streams
 /// are readable — the framing walk cannot produce it, because stepping over a chunk by its
 /// declared length is exactly not looking inside it.
 ///
+/// **Every band the file declares, not band 0.** Each spherical-harmonic band is its own record
+/// with its own stream header, addressed by byte range so that a reader which has capped its
+/// degree never transfers the higher ones. That is exactly what makes them invisible to a
+/// validator: a scan at band 0 fetches none of them, and a file whose band 2 will not decode
+/// comes back `valid`, exit 0. This is #168's finding, and the cap here is the file's own
+/// declared degree so that what gets decoded is what the file claims to carry.
+///
 /// One chunk resident at a time on the indexed path (cross-SDK principle 1), which is what
 /// keeps this bounded on a file too large to hold. A file with no index has no per-chunk
 /// addressing to use, so it is decoded front to back and the refusal comes back without an
 /// offset rather than with a guessed one.
-std::optional<ChunkRefusal> scanChunks(Span<const std::uint8_t> data,
-                                       const std::vector<std::uint64_t>& chunkOffsets);
-
-/// One chunk index entry, in the two fields that are about where its chunk sits.
-struct IndexEntry {
-  std::uint64_t offset = 0;
-  std::uint64_t length = 0;
-};
+///
+/// The scene is opened over `source` rather than over a buffer: `fourdgs_open_memory` copies the
+/// bytes it is given, so handing it a whole file would cost a second copy of that file before the
+/// first chunk was decoded.
+std::optional<ChunkRefusal> scanChunks(Readable& source, const std::vector<IndexEntry>& index);
 
 /// What the file's own index says about where its chunks are, in index order.
 ///
 /// Read from the Chunk Index records rather than from the Chunk records the walk found, because
 /// "index entry 3" is what the reader was asked for and what it will name back — and because an
 /// entry pointing somewhere there is no Chunk is one of the things a validator is for.
-std::vector<IndexEntry> chunkIndexEntries(Span<const std::uint8_t> data, const Walk& walk);
+///
+/// Forty bytes per index record plus seventeen per band it declares, read where the walk says
+/// that record is, and bounded by the record's own declared length rather than by its band count.
+std::vector<IndexEntry> chunkIndexEntries(Readable& source, const Walk& walk);
 
 /// What the Footer declares about the summary checksum, and where the summary ends.
 struct SummaryDeclaration {
@@ -209,8 +256,7 @@ struct SummaryDeclaration {
 
 /// Empty when the file has no Footer, or declares no summary checksum — which is a property of
 /// the file rather than a failure, because writing one is an encoder option.
-std::optional<SummaryDeclaration> summaryDeclaration(Span<const std::uint8_t> data,
-                                                     const Walk& walk);
+std::optional<SummaryDeclaration> summaryDeclaration(Readable& source, const Walk& walk);
 
 /// The region the Footer's summary checksum covers, and whether it agrees.
 ///
@@ -227,7 +273,10 @@ struct Coverage {
 
 /// Empty when the file declares no summary checksum, which is a property of the file rather
 /// than a failure: writing one is an encoder option.
-std::optional<Coverage> coverage(Span<const std::uint8_t> data, const Walk& walk);
+///
+/// The checksum is accumulated over the covered range through a fixed buffer, so a summary that
+/// spans most of a large file costs that buffer and not the range.
+std::optional<Coverage> coverage(Readable& source, const Walk& walk);
 
 /// The cell for one record: `ok`, `MISMATCH`, or `-` for a record the checksum does not cover.
 const char* coverageCell(const std::optional<Coverage>& coverage, std::uint64_t at,
@@ -235,6 +284,13 @@ const char* coverageCell(const std::optional<Coverage>& coverage, std::uint64_t 
 
 /// CRC-32 (IEEE), the polynomial the Footer declares its summary under.
 std::uint32_t crc32(const std::uint8_t* data, std::size_t length);
+
+/// The same, over a byte range of `source`, a buffer at a time.
+///
+/// Empty when the range could not be read whole — a file that shrank under the walk, or a
+/// declared range that runs past the end — which is a different answer from a checksum that
+/// disagreed, and the caller tells them apart.
+std::optional<std::uint32_t> crc32Range(Readable& source, std::uint64_t start, std::uint64_t end);
 
 /// A count with thousands separators, matching the Python tool's `{:,}`.
 std::string commas(std::uint64_t value);
@@ -262,7 +318,10 @@ struct Report {
   std::optional<Severity> worst() const;
 };
 
-/// Every check, over bytes already in hand.
+/// Every check, reading ranges of `source`.
+Report validate(Readable& source);
+
+/// The same, over bytes already in hand.
 Report validate(Span<const std::uint8_t> data);
 
 /// `4dgs validate <file>` — check a file against the specification.

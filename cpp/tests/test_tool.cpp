@@ -39,6 +39,9 @@ using fourdgs::tool::Walk;
 #define FOURDGS_CORPUS_DIR "tests/conformance/data"
 #endif
 
+/// Every `.4dgs` in a corpus directory, sorted so a failure names the same file twice running.
+std::vector<std::filesystem::path> variants(const std::filesystem::path& directory);
+
 std::filesystem::path corpusDirectory() {
   const char* fromEnvironment = std::getenv("FOURDGS_CORPUS");
   if (fromEnvironment != nullptr) return std::filesystem::path(fromEnvironment);
@@ -51,7 +54,15 @@ std::filesystem::path corpusDirectory() {
 /// gets skipped checks instead of failures — but CI generates it before this suite runs, and
 /// there a missing corpus is a suite that silently did not run.
 bool corpusMissing() {
-  if (std::filesystem::is_directory(corpusDirectory() / "invalid")) return false;
+  // The generated files, not the directory that holds them. `tests/conformance/data/invalid/` is
+  // tracked — the seven `.json` expectations are committed and only the `.4dgs` beside each one
+  // is generated — so a check for the directory answers "present" in a checkout where the
+  // generator has never run. This suite then ran against files that were not there and failed,
+  // which is the opposite of the local skip the paragraph above promises; it also made the skip
+  // untestable, because nothing could make it fire.
+  const bool generated =
+      !variants(corpusDirectory()).empty() && !variants(corpusDirectory() / "invalid").empty();
+  if (generated) return false;
   CHECK(std::getenv("CI") == nullptr);
   return true;
 }
@@ -110,7 +121,6 @@ std::string expectedRefusal(const std::filesystem::path& json) {
   return text.substr(open + 1, close - open - 1);
 }
 
-/// Every `.4dgs` in a corpus directory, sorted so a failure names the same file twice running.
 std::vector<std::filesystem::path> variants(const std::filesystem::path& directory) {
   std::vector<std::filesystem::path> out;
   if (!std::filesystem::is_directory(directory)) return out;
@@ -341,6 +351,317 @@ void opcodeNamesCoverTheOpenRanges() {
   CHECK(fourdgs::tool::isPrivate(0x80));
 }
 
+/// A transport that stops early, which `Readable` explicitly permits.
+///
+/// A file can shrink between the `size()` a walk asks for and the read that follows, and the
+/// abstraction surfaces that as a short read rather than an error. A walk that parsed the buffer
+/// regardless would be parsing bytes that never arrived.
+class ShortReadable : public fourdgs::Readable {
+ public:
+  ShortReadable(std::vector<std::uint8_t> bytes, std::uint64_t claimed, std::size_t cap)
+      : bytes_(std::move(bytes)), claimed_(claimed), cap_(cap) {}
+
+  fourdgs::Result<std::uint64_t> size() override { return claimed_; }
+
+  fourdgs::Result<std::size_t> read(std::uint64_t offset, Span<std::uint8_t> into) override {
+    if (offset >= bytes_.size()) return static_cast<std::size_t>(0);
+    std::size_t take = bytes_.size() - static_cast<std::size_t>(offset);
+    if (take > into.size()) take = into.size();
+    if (take > cap_) take = cap_;
+    for (std::size_t i = 0; i < take; ++i) into[i] = bytes_[static_cast<std::size_t>(offset) + i];
+    return take;
+  }
+
+ private:
+  std::vector<std::uint8_t> bytes_;
+  std::uint64_t claimed_;
+  std::size_t cap_;
+};
+
+void inspectReadsRangesRatherThanTheWholeFile() {
+  // Cross-SDK principle 1, checked at the transport rather than argued in a comment: `inspect` is
+  // framing plus the summary checksum, so what it transfers is nine bytes per record and the
+  // covered range — never the payload it steps over. The audio variant is the one that makes the
+  // difference visible, because most of it is an Audio Data record nothing here looks inside.
+  if (corpusMissing()) return;
+  const std::filesystem::path file =
+      corpusDirectory() / "OneWindow-UseChunkIndex-UseCrc-WithSpatialAudio.4dgs";
+  const std::vector<std::uint8_t> bytes = readBytes(file);
+  CHECK(!bytes.empty());
+  if (bytes.empty()) return;
+
+  fourdgs::MemoryReadable inner(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  fourdgs::CountingReadable counting(&inner);
+  fourdgs::Result<Walk> walked = fourdgs::tool::walk(counting);
+  CHECK(walked.ok());
+  if (!walked) return;
+  const std::optional<fourdgs::tool::Coverage> covered = fourdgs::tool::coverage(counting, *walked);
+  CHECK(covered.has_value());
+  // Framing (nine bytes a record, plus both magics) and the covered range, and nothing else. The
+  // Audio Data record alone is over four kilobytes, so a whole-file read could not fit under this.
+  CHECK(counting.bytesRead() < bytes.size() / 2);
+  if (counting.bytesRead() >= bytes.size() / 2) {
+    std::fprintf(stderr, "  transferred %llu of %llu bytes\n",
+                 static_cast<unsigned long long>(counting.bytesRead()),
+                 static_cast<unsigned long long>(bytes.size()));
+  }
+}
+
+void aFileMissingOnlyItsTrailingMagicIsNotInspectedCleanly() {
+  // Cut exactly on a record boundary, which is the shape `head -c` produces without needing to
+  // land anywhere lucky: every record is whole, so the walk has no cut to report and only the
+  // closing magic is gone. This used to print the note and exit 0, telling a script the
+  // incomplete file was fine.
+  if (corpusMissing()) return;
+  std::vector<std::uint8_t> bytes = readBytes(corpusDirectory() / kProvenanceVariant);
+  CHECK(bytes.size() > fourdgs::tool::kMagicSize);
+  if (bytes.size() <= fourdgs::tool::kMagicSize) return;
+  bytes.resize(bytes.size() - fourdgs::tool::kMagicSize);
+
+  const std::filesystem::path cut =
+      std::filesystem::temp_directory_path() / "fourdgs-test-no-trailing-magic.4dgs";
+  {
+    std::ofstream stream(cut, std::ios::binary);
+    stream.write(reinterpret_cast<const char*>(bytes.data()),
+                 static_cast<std::streamsize>(bytes.size()));
+  }
+  fourdgs::Result<Walk> walked =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  CHECK(walked.ok());
+  if (walked) {
+    // The precondition the check is about: no cut, and no trailing magic.
+    CHECK(!walked->cut.has_value());
+    CHECK(!walked->trailingMagic);
+  }
+  const Run result = run({"inspect", cut.string()});
+  CHECK_EQ(result.code, fourdgs::tool::kExitFailed);
+  CHECK(result.outContains("the file does not end with the magic"));
+  std::filesystem::remove(cut);
+}
+
+void anIndexEntryAtTheEndOfTheFileIsRefusedRatherThanDereferenced() {
+  // `chunk_offset == size`, `chunk_length == 0`: the end is exactly the end of the file, so an
+  // arithmetic bounds check passes and the opcode read that follows is one byte past the last.
+  // These are untrusted bytes off the file being validated.
+  if (corpusMissing()) return;
+  if (noDecoder()) return;
+  std::vector<std::uint8_t> bytes = readBytes(corpusDirectory() / kProvenanceVariant);
+  CHECK(!bytes.empty());
+  if (bytes.empty()) return;
+  fourdgs::Result<Walk> walked =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  CHECK(walked.ok());
+  if (!walked) return;
+
+  // Point the first index entry's `chunk_offset` at the byte after the file, and its length at 0.
+  const fourdgs::tool::Frame* entry = walked->first(fourdgs::tool::op::kChunkIndex);
+  CHECK(entry != nullptr);
+  if (entry == nullptr) return;
+  const std::size_t field =
+      static_cast<std::size_t>(entry->offset + fourdgs::tool::kRecordHeaderSize + 16);
+  CHECK(field + 16 <= bytes.size());
+  if (field + 16 > bytes.size()) return;
+  const std::uint64_t size = bytes.size();
+  for (int i = 0; i < 8; ++i) {
+    bytes[field + i] = static_cast<std::uint8_t>((size >> (8 * i)) & 0xFF);
+  }
+  for (int i = 0; i < 8; ++i) bytes[field + 8 + i] = 0;
+
+  const Report report =
+      fourdgs::tool::validate(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  CHECK(!report.ok());
+  bool pointsPastTheEnd = false;
+  for (const fourdgs::tool::Finding& finding : report.findings) {
+    if (finding.message.find("points past the end of the file") != std::string::npos) {
+      pointsPastTheEnd = true;
+    }
+  }
+  CHECK(pointsPastTheEnd);
+}
+
+void aFileCutInsideItsFirstRecordStillSaysWhereItWasCut() {
+  // Nothing intact, so the "no records at all" error fires — and used to be the whole answer,
+  // returning before the note that carries the byte, the record and the declared length.
+  if (corpusMissing()) return;
+  if (noDecoder()) return;
+  std::vector<std::uint8_t> bytes = readBytes(corpusDirectory() / kProvenanceVariant);
+  CHECK(bytes.size() > 32);
+  if (bytes.size() <= 32) return;
+  // The magic, then the Header's nine framing bytes and four of its content: a first record whose
+  // declared length runs past the end of what is here.
+  bytes.resize(fourdgs::tool::kMagicSize + fourdgs::tool::kRecordHeaderSize + 4);
+
+  const Report report =
+      fourdgs::tool::validate(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  CHECK(!report.ok());
+  bool noRecords = false;
+  bool saidWhereItWasCut = false;
+  for (const fourdgs::tool::Finding& finding : report.findings) {
+    if (finding.message == "no records at all") noRecords = true;
+    if (finding.message.find("the file is cut at byte ") != std::string::npos) {
+      saidWhereItWasCut = true;
+      // Not just that it stopped: the record and the length that is the fault.
+      CHECK(finding.message.find("the Header record declares ") != std::string::npos);
+    }
+  }
+  CHECK(noRecords);
+  CHECK(saidWhereItWasCut);
+}
+
+void aShortReadIsTruncationRatherThanAnInventedRecord() {
+  // A resource that reports one size and then reads short. The magic never arrives whole, so a
+  // walk that trusted the requested length would compare partly-unwritten bytes and report "not a
+  // 4dgs file" — sending its reader after the wrong problem entirely.
+  std::vector<std::uint8_t> bytes(64, 0x11);
+  for (std::size_t i = 0; i < fourdgs::tool::kMagicSize; ++i) {
+    bytes[i] = fourdgs::tool::kMagic[i];
+  }
+  ShortReadable stingy(bytes, /*claimed=*/64, /*cap=*/4);
+  fourdgs::Result<Walk> walked = fourdgs::tool::walk(stingy);
+  CHECK(!walked.ok());
+  if (!walked) {
+    CHECK_EQ(static_cast<int>(walked.error().code), static_cast<int>(ErrorCode::kTruncated));
+    CHECK(walked.error().message.find("shorter than the magic") != std::string::npos);
+  }
+
+  // And past the magic: a record header is nine bytes, and a transport that hands over eight of
+  // them must not become an opcode plus a declared length.
+  ShortReadable partial(bytes, /*claimed=*/64, /*cap=*/8);
+  fourdgs::Result<Walk> framed = fourdgs::tool::walk(partial);
+  CHECK(framed.ok());
+  if (framed) {
+    CHECK(framed->records.empty());
+    CHECK(framed->cut.has_value());
+  }
+}
+
+void aDuplicateFrontMatterRecordLeavesTheRefusalUnplaced() {
+  // Two Headers, and a refusal named for one of them. Which copy the reader refused at is not
+  // something a framing walk can know, and an offset pointing at a record with nothing wrong with
+  // it is worse than no offset because a reader believes it.
+  Walk one;
+  one.records.push_back(fourdgs::tool::Frame{fourdgs::tool::op::kHeader, 8, 100});
+  const Error refusal(ErrorCode::kUnsupported, "the Header declares temporal model 'x'",
+                      std::string("unknown-temporal-model"));
+  const std::optional<Named> placed = fourdgs::tool::describe(refusal, &one, std::nullopt);
+  CHECK(placed.has_value());
+  if (placed.has_value()) {
+    CHECK(placed->site.has_value());
+    if (placed->site.has_value()) CHECK_EQ(placed->site->offset, static_cast<std::uint64_t>(8));
+  }
+
+  Walk two = one;
+  two.records.push_back(fourdgs::tool::Frame{fourdgs::tool::op::kHeader, 117, 100});
+  const std::optional<Named> ambiguous = fourdgs::tool::describe(refusal, &two, std::nullopt);
+  // Still named — the identifier is the reader's and is not in doubt — and no longer placed.
+  CHECK(ambiguous.has_value());
+  if (ambiguous.has_value()) {
+    CHECK_EQ(ambiguous->code, std::string("unknown-temporal-model"));
+    CHECK(!ambiguous->site.has_value());
+  }
+}
+
+void aRecordAfterTheFooterIsReportedWithoutMovingTheVerdict() {
+  // Spec section 4: the Footer MUST be the last record. Neither the Python reference validator
+  // nor the Rust one checks it, so this is a note — the fact is reported and the verdict stays
+  // the reference's, because a validator that alone calls a file invalid is the disagreement the
+  // whole epic is about.
+  if (corpusMissing()) return;
+  std::vector<std::uint8_t> bytes = readBytes(corpusDirectory() / kProvenanceVariant);
+  CHECK(bytes.size() > fourdgs::tool::kMagicSize);
+  if (bytes.size() <= fourdgs::tool::kMagicSize) return;
+
+  // A private record, empty, wedged between the Footer and the closing magic. The summary
+  // checksum covers only up to where the Footer begins, so it is untouched by this.
+  std::vector<std::uint8_t> spliced(bytes.begin(), bytes.end() - fourdgs::tool::kMagicSize);
+  spliced.push_back(0x80);
+  for (int i = 0; i < 8; ++i) spliced.push_back(0);
+  for (std::size_t i = 0; i < fourdgs::tool::kMagicSize; ++i) {
+    spliced.push_back(fourdgs::tool::kMagic[i]);
+  }
+
+  const Report report =
+      fourdgs::tool::validate(Span<const std::uint8_t>(spliced.data(), spliced.size()));
+  bool saidFooterIsNotLast = false;
+  for (const fourdgs::tool::Finding& finding : report.findings) {
+    if (finding.message.find("the Footer must be the last record") != std::string::npos) {
+      saidFooterIsNotLast = true;
+      CHECK(finding.severity == Severity::kNote);
+    }
+  }
+  CHECK(saidFooterIsNotLast);
+}
+
+void aBandThatWillNotDecodeIsRefusedAndPlacedAtItsOwnRecord() {
+  // #168's finding, in the language it was found in. Every SH band is its own record with its own
+  // stream header, addressed by byte range so a reader that has capped its degree never transfers
+  // the higher ones — which is exactly what hid them from this validator. A scan at band 0 fetches
+  // no band record at all, so a file whose band 2 will not decode came back `valid`, exit 0.
+  //
+  // The mutation is `invalid.py`'s own: the codec byte of a stream header set to 9, which the
+  // registry reserves, so it is legal-but-unimplemented rather than nonsense — an
+  // `unknown-stream-codec` refusal and not a corrupt-payload one.
+  if (corpusMissing()) return;
+  if (noDecoder()) return;
+  const std::filesystem::path source =
+      corpusDirectory() / "MixedLifetimes-SHDegree3-UseChunkIndex-UseCrc.4dgs";
+  std::vector<std::uint8_t> bytes = readBytes(source);
+  CHECK(!bytes.empty());
+  if (bytes.empty()) return;
+
+  fourdgs::Result<Walk> walked =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  CHECK(walked.ok());
+  if (!walked) return;
+
+  // The band ranges come out of the file's own index, which is where the tool reads them too.
+  fourdgs::tool::BorrowedReadable reader(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  const std::vector<fourdgs::tool::IndexEntry> index =
+      fourdgs::tool::chunkIndexEntries(reader, *walked);
+  CHECK(!index.empty());
+  if (index.empty()) return;
+  const fourdgs::tool::BandRange* band = index[0].bandRange(2);
+  CHECK(band != nullptr);
+  if (band == nullptr) return;
+
+  // Inside the band's record: nine framing bytes, the band number, then the stream header whose
+  // fourth byte is the codec — `attribute_id, symbol_width, mode, [codec]`.
+  const std::size_t codecByte =
+      static_cast<std::size_t>(band->offset + fourdgs::tool::kRecordHeaderSize + 1 + 3);
+  CHECK(codecByte < bytes.size());
+  if (codecByte >= bytes.size()) return;
+
+  // The file is valid before the patch: without this the check below could pass on a file that
+  // was already being refused for some other reason.
+  const Report before =
+      fourdgs::tool::validate(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  CHECK(before.ok());
+
+  bytes[codecByte] = 0x09;
+  const std::filesystem::path patched =
+      std::filesystem::temp_directory_path() / "fourdgs-test-bad-band.4dgs";
+  {
+    std::ofstream stream(patched, std::ios::binary);
+    stream.write(reinterpret_cast<const char*>(bytes.data()),
+                 static_cast<std::streamsize>(bytes.size()));
+  }
+
+  // End to end, through the tool: the identifier, the byte, the band, and the exit code.
+  const Run result = run({"validate", patched.string()});
+  CHECK_EQ(result.code, fourdgs::tool::kExitFailed);
+  // Exact equality on the identifier, read from the corpus rather than restated here — this is
+  // the same string the seven invalid variants are compared by.
+  const std::string expected =
+      expectedRefusal(corpusDirectory() / "invalid" / "UnknownStreamCodec.json");
+  CHECK_EQ(expected, std::string("unknown-stream-codec"));
+  CHECK(result.outContains("refusal " + expected + " at byte " + std::to_string(band->offset) +
+                           " (the SH Band Stream record for band 2"));
+  if (!result.outContains("refusal " + expected + " at byte ")) {
+    std::fprintf(stderr, "  patched band said: %s", result.out.c_str());
+  }
+  std::filesystem::remove(patched);
+}
+
 void commasMatchThePythonToolsThousandsSeparator() {
   CHECK_EQ(fourdgs::tool::commas(0), std::string("0"));
   CHECK_EQ(fourdgs::tool::commas(999), std::string("999"));
@@ -363,6 +684,14 @@ void runTests() {
   anErrorTheRefusalTableDoesNotNameIsNotGivenAnIdentifier();
   theDisplayFormCarriesTheCodeAndTheByte();
   opcodeNamesCoverTheOpenRanges();
+  inspectReadsRangesRatherThanTheWholeFile();
+  aFileMissingOnlyItsTrailingMagicIsNotInspectedCleanly();
+  anIndexEntryAtTheEndOfTheFileIsRefusedRatherThanDereferenced();
+  aFileCutInsideItsFirstRecordStillSaysWhereItWasCut();
+  aShortReadIsTruncationRatherThanAnInventedRecord();
+  aDuplicateFrontMatterRecordLeavesTheRefusalUnplaced();
+  aRecordAfterTheFooterIsReportedWithoutMovingTheVerdict();
+  aBandThatWillNotDecodeIsRefusedAndPlacedAtItsOwnRecord();
   commasMatchThePythonToolsThousandsSeparator();
 }
 

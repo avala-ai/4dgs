@@ -37,6 +37,18 @@ All notable changes to the C++ package are documented here, following
   _over_ a chunk by its declared length, which is exactly not looking inside it — so
   `unknown-stream-codec` and `window-index-out-of-range` are reachable at all only by decoding, and
   a framing-only validator calls those two files valid.
+- **Every spherical-harmonic band the file declares is decoded, not just band 0.** Each band is its
+  own record with its own stream header, addressed by byte range so a reader that has capped its
+  degree never transfers the higher ones — which is what hid them from a validator scanning at band
+  0, and what let a file whose band 2 will not decode come back `valid`, exit 0. When a band
+  refuses, the byte names _that band's own record_, narrowed by raising the cap until the fetch
+  starts failing, on the failure path only.
+- Both commands read byte ranges rather than the file. `inspect` transfers nine bytes per record
+  plus the checksummed region, and `validate` opens the scene over the same transport instead of
+  handing the core a buffer it would copy — so neither holds a capture whose size it does not
+  control. The one exception is a `keyframe-delta` file, because
+  `fourdgs_keyframe_delta_states_json` takes `(const uint8_t*, size_t)` and the C ABI offers no
+  range-reading counterpart.
 - `validate` branches on the Header's declared `temporal_model`, so a conforming `keyframe-delta`
   file is validated by the reader its model needs instead of producing errors from the
   gaussian-birth chunk shape it does not have.

@@ -156,8 +156,16 @@ INVALID
 The `refusal` line is the identifier from `Error::refusal` and the byte the tool's own framing walk
 places it at. `validate` decodes the chunks — one resident at a time on the indexed path — because a
 framing walk steps _over_ a chunk rather than into it, and two of the refusals the specification
-names fire inside a chunk's streams. A `keyframe-delta` file is validated against the model its
-Header declares rather than against the gaussian-birth chunk shape.
+names fire inside a chunk's streams. Every spherical-harmonic band the file declares is decoded too,
+for the same reason one step further in: a band is its own record fetched by byte range, so a scan
+capped at band 0 never transfers one, and a refusing band names its own record. A `keyframe-delta`
+file is validated against the model its Header declares rather than against the gaussian-birth chunk
+shape.
+
+Both commands read ranges rather than files. `inspect` transfers nine bytes per record and the
+checksummed region; `validate` opens the scene over the same transport. A `keyframe-delta` file is
+the exception, and the C ABI is why — `fourdgs_keyframe_delta_states_json` takes a pointer and a
+length with no range-reading counterpart.
 
 Exit codes: **0** fine, **1** refused or invalid, **2** valid with warnings, **3** the tool could
 not run — a missing file, an argument it does not understand, or a build with no decoder behind it.

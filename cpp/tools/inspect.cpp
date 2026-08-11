@@ -13,7 +13,9 @@
 /// and the question its holder has is how much of it survived rather than whether the file is
 /// broken, which they already know.
 
+#include <cctype>
 #include <iomanip>
+#include <memory>
 #include <ostream>
 #include <string>
 
@@ -135,16 +137,17 @@ void printJson(std::ostream& out, const Walk& walk, const std::optional<Coverage
 }  // namespace
 
 int runInspect(const std::string& path, bool json, std::ostream& out, std::ostream& err) {
-  // The whole file, for the checksum: the summary CRC has to cover a contiguous region to mean
-  // anything, and a record's CRC cell is a claim about the region it sits in. The walk itself
-  // still reads nine bytes per record, over the bytes already in hand.
-  Result<std::vector<std::uint8_t>> data = readWhole(path);
-  if (!data) {
-    err << "4dgs: " << path << ": " << data.error().message << "\n";
+  // Ranges, not a file. The walk reads nine bytes per record and steps over the content, and the
+  // summary checksum is accumulated through one 64 KiB buffer — so the sentence at the top of
+  // this file, that inspecting a capture with an hour of embedded audio costs what inspecting one
+  // without it costs, is a property of the code rather than a description of it.
+  Result<FileReadable*> file = FileReadable::open(path);
+  if (!file) {
+    err << "4dgs: " << path << ": " << file.error().message << "\n";
     return kExitTool;
   }
-  const Span<const std::uint8_t> bytes(data->data(), data->size());
-  Result<Walk> walked = walkBytes(bytes);
+  std::unique_ptr<FileReadable> source(*file);
+  Result<Walk> walked = walk(*source);
   if (!walked) {
     err << "4dgs: " << path << ": " << walked.error().message << "\n";
     // And the identifier, plus the byte, for the refusals the specification names. There is no
@@ -155,15 +158,22 @@ int runInspect(const std::string& path, bool json, std::ostream& out, std::ostre
     return kExitFailed;
   }
 
-  const std::optional<Coverage> covered = coverage(bytes, *walked);
+  const std::optional<Coverage> covered = coverage(*source, *walked);
   if (json) {
     printJson(out, *walked, covered);
   } else {
     printText(out, *walked, covered);
   }
-  // The prefix was recovered and reported; the file is still not a whole one, and a pipeline
-  // that goes on to read it should not be told otherwise.
-  return walked->cut.has_value() ? kExitFailed : kExitOk;
+  // The prefix was recovered and reported; the file is still not a whole one, and a pipeline that
+  // goes on to read it should not be told otherwise.
+  //
+  // A missing trailing magic counts, and it is not the same condition as a cut. A file cut
+  // exactly on a record boundary — the shape `head -c` produces most often, because it needs no
+  // luck to land there — leaves the walk with no cut to report and only the closing magic absent.
+  // That file used to print "the file does not end with the magic" and exit 0, so a script
+  // reading the exit code was told the incomplete file inspected cleanly.
+  const bool whole = !walked->cut.has_value() && walked->trailingMagic;
+  return whole ? kExitOk : kExitFailed;
 }
 
 }  // namespace tool

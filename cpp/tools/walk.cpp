@@ -45,27 +45,17 @@ std::uint64_t readU64(const std::uint8_t* at) {
   return value;
 }
 
-/// A `Readable` over bytes the caller already holds, without copying them.
+/// Exactly `length` bytes at `offset`, or nothing.
 ///
-/// `MemoryReadable` takes ownership of a copy, which is the right shape for a test fixture and
-/// the wrong one for a file this tool has just read whole.
-class BorrowedReadable : public Readable {
- public:
-  explicit BorrowedReadable(Span<const std::uint8_t> bytes) : bytes_(bytes) {}
-
-  Result<std::uint64_t> size() override { return static_cast<std::uint64_t>(bytes_.size()); }
-
-  Result<std::size_t> read(std::uint64_t offset, Span<std::uint8_t> into) override {
-    if (offset > bytes_.size()) return static_cast<std::size_t>(0);
-    const std::size_t available = bytes_.size() - static_cast<std::size_t>(offset);
-    const std::size_t take = available < into.size() ? available : into.size();
-    for (std::size_t i = 0; i < take; ++i) into[i] = bytes_[static_cast<std::size_t>(offset) + i];
-    return take;
-  }
-
- private:
-  Span<const std::uint8_t> bytes_;
-};
+/// `Readable::read` is allowed to come back short — the abstraction says so, because a resource
+/// can shrink between the `size()` that was asked for and the read that follows. A caller that
+/// parses the buffer regardless is parsing whatever was there before, which is how a truncated
+/// file turns into an invented opcode or a magic that does not match. Every fixed-size read in
+/// this file goes through here so that a short one is reported as a short one.
+bool readExactly(Readable& source, std::uint64_t offset, std::uint8_t* into, std::size_t length) {
+  Result<std::size_t> got = source.read(offset, Span<std::uint8_t>(into, length));
+  return got.ok() && *got == length;
+}
 
 /// Ask the core to name a bad magic, so the wording and the identifier are the reader's.
 ///
@@ -93,6 +83,16 @@ Error refuseMagic(Readable& source, std::uint64_t size) {
 
 }  // namespace
 
+Result<std::uint64_t> BorrowedReadable::size() { return static_cast<std::uint64_t>(bytes_.size()); }
+
+Result<std::size_t> BorrowedReadable::read(std::uint64_t offset, Span<std::uint8_t> into) {
+  if (offset > bytes_.size()) return static_cast<std::size_t>(0);
+  const std::size_t available = bytes_.size() - static_cast<std::size_t>(offset);
+  const std::size_t take = available < into.size() ? available : into.size();
+  for (std::size_t i = 0; i < take; ++i) into[i] = bytes_[static_cast<std::size_t>(offset) + i];
+  return take;
+}
+
 std::uint64_t Frame::total() const {
   const std::uint64_t sum = length + kRecordHeaderSize;
   return sum < length ? UINT64_MAX : sum;
@@ -101,6 +101,13 @@ std::uint64_t Frame::total() const {
 const Frame* Walk::first(std::uint8_t opcode) const {
   for (const Frame& frame : records) {
     if (frame.opcode == opcode) return &frame;
+  }
+  return nullptr;
+}
+
+const BandRange* IndexEntry::bandRange(int band) const {
+  for (const BandRange& range : bands) {
+    if (range.band == band) return &range;
   }
   return nullptr;
 }
@@ -191,22 +198,64 @@ std::string commas(std::uint64_t value) {
   return out;
 }
 
-std::uint32_t crc32(const std::uint8_t* data, std::size_t length) {
-  // CRC-32 (IEEE). Written out rather than linked, exactly as the conformance helper writes it
-  // out: a checksum is fifteen lines and a dependency is forever.
-  static std::uint32_t table[256];
-  static bool ready = false;
-  if (!ready) {
+namespace {
+
+/// CRC-32 (IEEE). Written out rather than linked, exactly as the conformance helper writes it
+/// out: a checksum is fifteen lines and a dependency is forever.
+///
+/// Built once, in the initializer of a function-local `static`, which C++11 makes thread-safe:
+/// the first caller through builds it and every other caller blocks until it is whole. The
+/// obvious spelling — a file-scope table beside a `bool ready` — is a data race the moment two
+/// threads validate two files, and its symptom is a checksum computed from a half-built table,
+/// which reads as a corrupt file rather than as a bug in this function.
+struct Crc32Table {
+  std::uint32_t entry[256];
+
+  Crc32Table() {
     for (std::uint32_t i = 0; i < 256; ++i) {
       std::uint32_t c = i;
       for (int k = 0; k < 8; ++k) c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-      table[i] = c;
+      entry[i] = c;
     }
-    ready = true;
   }
-  std::uint32_t crc = 0xFFFFFFFFu;
+};
+
+const Crc32Table& crc32Table() {
+  static const Crc32Table table;
+  return table;
+}
+
+/// The running value, so a checksum can be accumulated across reads without holding the range.
+std::uint32_t crc32Update(std::uint32_t crc, const std::uint8_t* data, std::size_t length) {
+  const Crc32Table& table = crc32Table();
   for (std::size_t i = 0; i < length; ++i) {
-    crc = table[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8);
+    crc = table.entry[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8);
+  }
+  return crc;
+}
+
+/// One buffer, whatever the range. 64 KiB is a read size a filesystem is happy with and a number
+/// this tool never multiplies by anything.
+constexpr std::size_t kCrcBuffer = 64 * 1024;
+
+}  // namespace
+
+std::uint32_t crc32(const std::uint8_t* data, std::size_t length) {
+  return crc32Update(0xFFFFFFFFu, data, length) ^ 0xFFFFFFFFu;
+}
+
+std::optional<std::uint32_t> crc32Range(Readable& source, std::uint64_t start, std::uint64_t end) {
+  if (end < start) return std::nullopt;
+  std::vector<std::uint8_t> buffer(kCrcBuffer);
+  std::uint32_t crc = 0xFFFFFFFFu;
+  for (std::uint64_t at = start; at < end;) {
+    const std::uint64_t remaining = end - at;
+    const std::size_t take = remaining < static_cast<std::uint64_t>(buffer.size())
+                                 ? static_cast<std::size_t>(remaining)
+                                 : buffer.size();
+    if (!readExactly(source, at, buffer.data(), take)) return std::nullopt;
+    crc = crc32Update(crc, buffer.data(), take);
+    at += take;
   }
   return crc ^ 0xFFFFFFFFu;
 }
@@ -221,7 +270,10 @@ Result<Walk> walk(Readable& source) {
   Result<std::size_t> got =
       source.read(0, Span<std::uint8_t>(head, static_cast<std::size_t>(headBytes)));
   if (!got) return got.error();
-  if (headBytes < kMagicSize) {
+  // The bytes that arrived, not the bytes that were asked for. A resource is allowed to come back
+  // short, and eight zero bytes read as "this is not a 4dgs file" rather than as the truncation
+  // they are — a diagnosis that sends its reader after the wrong problem entirely.
+  if (headBytes < kMagicSize || *got < kMagicSize) {
     return Error(ErrorCode::kTruncated, "truncated: file is shorter than the magic");
   }
   for (std::size_t i = 0; i < kMagicSize; ++i) {
@@ -237,9 +289,13 @@ Result<Walk> walk(Readable& source) {
     // A whole file ends with the magic, so its last eight bytes are not a record.
     if (remaining <= kMagicSize) {
       std::uint8_t tail[kMagicSize] = {0};
-      Result<std::size_t> read =
-          source.read(at, Span<std::uint8_t>(tail, static_cast<std::size_t>(remaining)));
-      if (!read) return read.error();
+      if (!readExactly(source, at, tail, static_cast<std::size_t>(remaining))) {
+        Cut cut;
+        cut.at = at;
+        cut.reason = "the last " + commas(remaining) + " bytes could not be read";
+        out.cut = cut;
+        break;
+      }
       out.trailingMagic = remaining == kMagicSize;
       for (std::size_t i = 0; i < static_cast<std::size_t>(remaining) && out.trailingMagic; ++i) {
         if (tail[i] != kMagic[i]) out.trailingMagic = false;
@@ -260,9 +316,16 @@ Result<Walk> walk(Readable& source) {
       break;
     }
     std::uint8_t framing[kRecordHeaderSize] = {0};
-    Result<std::size_t> read =
-        source.read(at, Span<std::uint8_t>(framing, static_cast<std::size_t>(kRecordHeaderSize)));
-    if (!read) return read.error();
+    // Nine bytes or none. A short read here would otherwise be parsed as a record: whatever byte
+    // arrived becomes an opcode and the unread remainder becomes a declared length, so the walk
+    // would report an invented record instead of naming the byte the file stops at.
+    if (!readExactly(source, at, framing, static_cast<std::size_t>(kRecordHeaderSize))) {
+      Cut cut;
+      cut.at = at;
+      cut.reason = "a record header could not be read at this byte";
+      out.cut = cut;
+      break;
+    }
 
     Frame frame;
     frame.opcode = framing[0];
@@ -321,9 +384,21 @@ std::optional<Site> frontMatterSite(const Walk* walk, const std::string& code) {
     return std::nullopt;
   }
   if (walk == nullptr) return std::nullopt;
-  const Frame* frame = walk->first(opcode);
-  if (frame == nullptr) return std::nullopt;
-  return Site{frame->offset, what};
+  // Exactly one record of that kind, or no offset. Nothing in the format forbids a second Header
+  // or a second Quantization record, and a reader refuses at whichever copy carries the value it
+  // does not implement — which need not be the first. Telling them apart means parsing each
+  // candidate and asking a registry about the value it declares, and this package has neither a
+  // parser nor a registry; the alternative on offer is an offset pointing at a record with
+  // nothing wrong with it, which the paragraph above rules out for the reason it gives. Every
+  // corpus variant carries one of each, so this costs none of the seven placements.
+  const Frame* found = nullptr;
+  for (const Frame& frame : walk->records) {
+    if (frame.opcode != opcode) continue;
+    if (found != nullptr) return std::nullopt;
+    found = &frame;
+  }
+  if (found == nullptr) return std::nullopt;
+  return Site{found->offset, what};
 }
 
 }  // namespace
@@ -337,63 +412,99 @@ std::optional<Named> describe(const Error& error, const Walk* walk,
   return named;
 }
 
-std::vector<IndexEntry> chunkIndexEntries(Span<const std::uint8_t> data, const Walk& walk) {
+std::vector<IndexEntry> chunkIndexEntries(Readable& source, const Walk& walk) {
   // `t0`, `t1`, `chunk_offset`, `chunk_length`: two doubles in, and the only fields this needs.
   // Everything after them is what a seek costs rather than where the chunk is, and a later
   // revision may append to it — which is why this reads a prefix and not a record.
   constexpr std::uint64_t kOffsetField = 16;
-  constexpr std::uint64_t kPrefix = 32;
+  constexpr std::size_t kPrefix = 40;
+  // Band 1 upwards, appended after the fixed prefix: `u8 band`, `u64 offset`, `u64 length`.
+  constexpr std::size_t kBandEntry = 17;
   std::vector<IndexEntry> out;
+  std::uint8_t prefix[kPrefix];
+  std::uint8_t band[kBandEntry];
   for (const Frame& frame : walk.records) {
     if (frame.opcode != op::kChunkIndex) continue;
     const std::uint64_t content = frame.offset + kRecordHeaderSize;
-    if (frame.length < kPrefix || content + kPrefix > data.size()) continue;
+    if (frame.length < kPrefix) continue;
+    if (!readExactly(source, content, prefix, kPrefix)) continue;
     IndexEntry entry;
-    entry.offset = readU64(data.data() + content + kOffsetField);
-    entry.length = readU64(data.data() + content + kOffsetField + 8);
+    entry.offset = readU64(prefix + kOffsetField);
+    entry.length = readU64(prefix + kOffsetField + 8);
+    // `gaussian_count` then `band_count`, two `u32`s closing the prefix.
+    std::uint32_t bands = 0;
+    for (int i = 3; i >= 0; --i) bands = (bands << 8) | prefix[36 + i];
+    for (std::uint32_t b = 0; b < bands; ++b) {
+      const std::uint64_t at = content + kPrefix + static_cast<std::uint64_t>(b) * kBandEntry;
+      // The declared count is off an untrusted file; the record's own length is the bound.
+      if (kPrefix + static_cast<std::uint64_t>(b + 1) * kBandEntry > frame.length) break;
+      if (!readExactly(source, at, band, kBandEntry)) break;
+      BandRange range;
+      range.band = band[0];
+      range.offset = readU64(band + 1);
+      range.length = readU64(band + 9);
+      entry.bands.push_back(range);
+    }
     out.push_back(entry);
   }
   return out;
 }
 
-std::optional<ChunkRefusal> scanChunks(Span<const std::uint8_t> data,
-                                       const std::vector<std::uint64_t>& chunkOffsets) {
-  Result<std::unique_ptr<Scene>> opened = Scene::openMemory(data, ReadMode::kAuto);
+std::optional<ChunkRefusal> scanChunks(Readable& source, const std::vector<IndexEntry>& index) {
+  Result<std::unique_ptr<Scene>> opened = Scene::open(source, ReadMode::kAuto);
   if (!opened) return ChunkRefusal{opened.error(), std::nullopt};
   Scene& scene = **opened;
 
+  // The degree the file declares, so the scan fetches what the file says it carries. A cap of 0
+  // transfers no band record at all, which is why a band that will not decode used to come back
+  // as a file with nothing wrong with it.
+  const int degree = scene.shDegree();
+
   const std::uint32_t chunks = scene.chunkCount();
   if (chunks == 0 || !scene.isIndexed()) {
-    // Front to back: every chunk or none, and no per-chunk offset to attribute to. Band 0
-    // throughout — spherical harmonics do not enter reconstructed state, so fetching them would
-    // only move bytes nobody is checking.
-    Result<void> loaded = scene.loadAll(0);
+    // Front to back: every chunk or none, and no per-chunk offset to attribute to.
+    Result<void> loaded = scene.loadAll(degree);
     if (!loaded) return ChunkRefusal{loaded.error(), std::nullopt};
     return std::nullopt;
   }
   for (std::uint32_t i = 0; i < chunks; ++i) {
-    Result<void> loaded = scene.loadChunk(i, 0);
+    Result<void> loaded = scene.loadChunk(i, degree);
     if (loaded) continue;
+
     std::optional<Site> site;
-    if (i < chunkOffsets.size()) {
-      site = Site{chunkOffsets[i], "the Chunk record at index entry " + std::to_string(i)};
+    if (i < index.size()) {
+      site = Site{index[i].offset, "the Chunk record at index entry " + std::to_string(i)};
+      // Which band, if it was a band. The cap is raised from nothing until the fetch starts
+      // failing: the first cap that fails is the first band the reader could not decode, and
+      // failing at 0 means the fault is in the chunk's own attribute streams rather than in any
+      // band. This runs only here, on the failure path, so a healthy file pays nothing for it.
+      for (int cap = 0; cap <= degree; ++cap) {
+        if (scene.loadChunk(i, cap)) continue;
+        if (cap == 0) break;
+        const BandRange* range = index[i].bandRange(cap);
+        if (range != nullptr) {
+          site = Site{range->offset, "the SH Band Stream record for band " + std::to_string(cap) +
+                                         " at index entry " + std::to_string(i)};
+        }
+        break;
+      }
     }
     return ChunkRefusal{loaded.error(), site};
   }
   return std::nullopt;
 }
 
-std::optional<SummaryDeclaration> summaryDeclaration(Span<const std::uint8_t> data,
-                                                     const Walk& walk) {
+std::optional<SummaryDeclaration> summaryDeclaration(Readable& source, const Walk& walk) {
   const Frame* frame = walk.first(op::kFooter);
   if (frame == nullptr) return std::nullopt;
   // `summary_start`, `summary_offset_start`, `summary_crc` — twenty bytes, and the only record
   // this tool reads the content of. A Footer a later revision extends still parses: the fields
   // this needs are the first three and they do not move.
-  constexpr std::uint64_t kFooterFields = 20;
+  constexpr std::size_t kFooterFields = 20;
   const std::uint64_t content = frame->offset + kRecordHeaderSize;
-  if (frame->length < kFooterFields || content + kFooterFields > data.size()) return std::nullopt;
-  const std::uint8_t* at = data.data() + content;
+  if (frame->length < kFooterFields) return std::nullopt;
+  std::uint8_t at[kFooterFields];
+  if (!readExactly(source, content, at, kFooterFields)) return std::nullopt;
   SummaryDeclaration out;
   out.start = readU64(at);
   for (int i = 3; i >= 0; --i) out.crc = (out.crc << 8) | at[16 + i];
@@ -405,14 +516,15 @@ std::optional<SummaryDeclaration> summaryDeclaration(Span<const std::uint8_t> da
   return out;
 }
 
-std::optional<Coverage> coverage(Span<const std::uint8_t> data, const Walk& walk) {
-  std::optional<SummaryDeclaration> declared = summaryDeclaration(data, walk);
+std::optional<Coverage> coverage(Readable& source, const Walk& walk) {
+  std::optional<SummaryDeclaration> declared = summaryDeclaration(source, walk);
   if (!declared.has_value() || declared->start > declared->end) return std::nullopt;
+  std::optional<std::uint32_t> actual = crc32Range(source, declared->start, declared->end);
+  if (!actual.has_value()) return std::nullopt;
   Coverage out;
   out.start = declared->start;
   out.end = declared->end;
-  out.ok = crc32(data.data() + out.start, static_cast<std::size_t>(out.end - out.start)) ==
-           declared->crc;
+  out.ok = *actual == declared->crc;
   return out;
 }
 
