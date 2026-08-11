@@ -266,7 +266,7 @@ std::optional<ChunkRefusal> scanChunks(Readable& source, const std::vector<Index
 ///
 /// Forty bytes per index record plus seventeen per band it declares, read where the walk says
 /// that record is, and bounded by the record's own declared length rather than by its band count.
-std::vector<IndexEntry> chunkIndexEntries(Readable& source, const Walk& walk);
+Result<std::vector<IndexEntry>> chunkIndexEntries(Readable& source, const Walk& walk);
 
 /// The Header's temporal model, range-parsed through its length-framed profile and library.
 /// Empty when the Header is absent or malformed.
@@ -361,6 +361,10 @@ Report validate(Span<const std::uint8_t> data);
 
 /// `4dgs validate <file>` — check a file against the specification.
 int runValidate(const std::string& path, std::ostream& out, std::ostream& err);
+
+/// The CLI status for a framing failure found after the resource was opened. Transport I/O means
+/// the tool obtained no verdict; malformed bytes are a verdict about the file.
+int inspectFailureExit(const Error& error);
 
 /// `4dgs inspect <file> [--json]` — walk the records: offset, opcode, length, CRC status.
 int runInspect(const std::string& path, bool json, std::ostream& out, std::ostream& err);

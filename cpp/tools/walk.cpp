@@ -67,9 +67,16 @@ double readF64(const std::uint8_t* at) {
 /// parses the buffer regardless is parsing whatever was there before, which is how a truncated
 /// file turns into an invented opcode or a magic that does not match. Every fixed-size read in
 /// this file goes through here so that a short one is reported as a short one.
-bool readExactly(Readable& source, std::uint64_t offset, std::uint8_t* into, std::size_t length) {
+Result<void> readExactly(Readable& source, std::uint64_t offset, std::uint8_t* into,
+                         std::size_t length) {
   Result<std::size_t> got = source.read(offset, Span<std::uint8_t>(into, length));
-  return got.ok() && *got == length;
+  if (!got) return got.error();
+  if (*got != length) {
+    return Error(ErrorCode::kIo, "short range read at byte " + std::to_string(offset) +
+                                     ": wanted " + std::to_string(length) + " bytes, got " +
+                                     std::to_string(*got));
+  }
+  return Result<void>();
 }
 
 /// Ask the core to name a bad magic, so the wording and the identifier are the reader's.
@@ -469,7 +476,7 @@ std::optional<Named> describe(const Error& error, const Walk* walk,
   return named;
 }
 
-std::vector<IndexEntry> chunkIndexEntries(Readable& source, const Walk& framing) {
+Result<std::vector<IndexEntry>> chunkIndexEntries(Readable& source, const Walk& framing) {
   // `t0`, `t1`, `chunk_offset`, `chunk_length`: two doubles in, and the only fields this needs.
   // Everything after them is what a seek costs rather than where the chunk is, and a later
   // revision may append to it — which is why this reads a prefix and not a record.
@@ -481,12 +488,20 @@ std::vector<IndexEntry> chunkIndexEntries(Readable& source, const Walk& framing)
   if (framing.intactOpcodeCounts[op::kChunkIndex] == 0) return out;
   std::uint8_t prefix[kPrefix];
   std::uint8_t band[kBandEntry];
-  (void)walk(source, [&](const Frame& frame, bool complete) {
+  std::optional<Error> failed;
+  Result<Walk> scanned = walk(source, [&](const Frame& frame, bool complete) {
+    if (failed.has_value()) return;
     if (!complete || out.size() >= kMaxChunkIndexEntries) return;
     if (frame.opcode != op::kChunkIndex) return;
     const std::uint64_t content = frame.offset + kRecordHeaderSize;
     if (frame.length < kPrefix) return;
-    if (!readExactly(source, content, prefix, kPrefix)) return;
+    Result<void> readPrefix = readExactly(source, content, prefix, kPrefix);
+    if (!readPrefix) {
+      failed = Error(readPrefix.error().code,
+                     "Chunk Index fixed prefix at byte " + std::to_string(content) +
+                         " could not be read: " + readPrefix.error().message);
+      return;
+    }
     IndexEntry entry;
     entry.t0 = readF64(prefix);
     entry.t1 = readF64(prefix + 8);
@@ -503,7 +518,13 @@ std::vector<IndexEntry> chunkIndexEntries(Readable& source, const Walk& framing)
       const std::uint64_t at = content + kPrefix + static_cast<std::uint64_t>(b) * kBandEntry;
       // The declared count is off an untrusted file; the record's own length is the bound.
       if (kPrefix + static_cast<std::uint64_t>(b + 1) * kBandEntry > frame.length) break;
-      if (!readExactly(source, at, band, kBandEntry)) break;
+      Result<void> readBand = readExactly(source, at, band, kBandEntry);
+      if (!readBand) {
+        failed =
+            Error(readBand.error().code, "Chunk Index band range at byte " + std::to_string(at) +
+                                             " could not be read: " + readBand.error().message);
+        return;
+      }
       BandRange range;
       range.band = band[0];
       range.offset = readU64(band + 1);
@@ -512,6 +533,8 @@ std::vector<IndexEntry> chunkIndexEntries(Readable& source, const Walk& framing)
     }
     out.push_back(entry);
   });
+  if (!scanned) return scanned.error();
+  if (failed.has_value()) return *failed;
   return out;
 }
 

@@ -376,6 +376,14 @@ void anErrorTheRefusalTableDoesNotNameIsNotGivenAnIdentifier() {
   }
 }
 
+void inspectTransportFailuresUseTheToolFailureExit() {
+  CHECK_EQ(fourdgs::tool::inspectFailureExit(
+               Error(ErrorCode::kIo, "injected inspect transport failure")),
+           fourdgs::tool::kExitTool);
+  CHECK_EQ(fourdgs::tool::inspectFailureExit(Error(ErrorCode::kBadMagic, "not a 4dgs file")),
+           fourdgs::tool::kExitFailed);
+}
+
 void theDisplayFormCarriesTheCodeAndTheByte() {
   Named named;
   named.code = "unknown-temporal-model";
@@ -523,6 +531,35 @@ void aTemporalModelTransportFailureMakesValidationIncomplete() {
   bool propagated = false;
   for (const fourdgs::tool::Finding& finding : report.findings) {
     if (finding.message.find("cannot range-read the Header temporal_model") != std::string::npos &&
+        finding.message.find("injected Header transport failure") != std::string::npos) {
+      propagated = true;
+    }
+  }
+  CHECK(propagated);
+}
+
+void aChunkIndexTransportFailureMakesValidationIncomplete() {
+  if (corpusMissing()) return;
+  if (noDecoder()) return;
+  std::vector<std::uint8_t> bytes = readBytes(corpusDirectory() / kProvenanceVariant);
+  CHECK(!bytes.empty());
+  if (bytes.empty()) return;
+  fourdgs::Result<Walk> walked =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  CHECK(walked.ok());
+  if (!walked) return;
+  const fourdgs::tool::Frame* index = walked->firstIntact(fourdgs::tool::op::kChunkIndex);
+  CHECK(index != nullptr);
+  if (index == nullptr) return;
+
+  FailingRangeReadable failing(std::move(bytes), index->offset + fourdgs::tool::kRecordHeaderSize);
+  const Report report = fourdgs::tool::validate(failing);
+  CHECK(!report.ok());
+  CHECK(!report.hasErrors());
+  CHECK(!report.complete);
+  bool propagated = false;
+  for (const fourdgs::tool::Finding& finding : report.findings) {
+    if (finding.message.find("cannot range-read the Chunk Index") != std::string::npos &&
         finding.message.find("injected Header transport failure") != std::string::npos) {
       propagated = true;
     }
@@ -921,8 +958,11 @@ void indexMetadataMustMatchThePointedRecords() {
   if (!walked) return;
   fourdgs::tool::BorrowedReadable source(
       Span<const std::uint8_t>(original.data(), original.size()));
-  const std::vector<fourdgs::tool::IndexEntry> entries =
+  fourdgs::Result<std::vector<fourdgs::tool::IndexEntry>> parsedEntries =
       fourdgs::tool::chunkIndexEntries(source, *walked);
+  CHECK(parsedEntries.ok());
+  if (!parsedEntries) return;
+  const std::vector<fourdgs::tool::IndexEntry>& entries = *parsedEntries;
   CHECK_EQ(indexFrames.size(), entries.size());
   if (indexFrames.size() != entries.size()) return;
 
@@ -982,8 +1022,11 @@ void indexedBandsMustMatchTheirRecordsAndOwners() {
   if (!walked) return;
   fourdgs::tool::BorrowedReadable source(
       Span<const std::uint8_t>(original.data(), original.size()));
-  const std::vector<fourdgs::tool::IndexEntry> entries =
+  fourdgs::Result<std::vector<fourdgs::tool::IndexEntry>> parsedEntries =
       fourdgs::tool::chunkIndexEntries(source, *walked);
+  CHECK(parsedEntries.ok());
+  if (!parsedEntries) return;
+  const std::vector<fourdgs::tool::IndexEntry>& entries = *parsedEntries;
   CHECK_EQ(indexFrames.size(), entries.size());
   if (indexFrames.size() != entries.size() || entries.empty() || entries[0].bands.empty()) return;
 
@@ -1001,6 +1044,29 @@ void indexedBandsMustMatchTheirRecordsAndOwners() {
     }
   }
   CHECK(checkedLabel);
+
+  CHECK(entries[0].bands.size() >= 2);
+  if (entries[0].bands.size() >= 2) {
+    std::vector<std::uint8_t> duplicate = original;
+    const std::uint8_t repeated = entries[0].bands[0].band;
+    const std::size_t secondIndexBand = static_cast<std::size_t>(
+        indexFrames[0].offset + fourdgs::tool::kRecordHeaderSize + 40 + 17);
+    const std::size_t secondRecordBand =
+        static_cast<std::size_t>(entries[0].bands[1].offset + fourdgs::tool::kRecordHeaderSize);
+    duplicate[secondIndexBand] = repeated;
+    duplicate[secondRecordBand] = repeated;
+    resealSummary(&duplicate);
+    const Report duplicateReport =
+        fourdgs::tool::validate(Span<const std::uint8_t>(duplicate.data(), duplicate.size()));
+    bool checkedDuplicate = false;
+    for (const fourdgs::tool::Finding& finding : duplicateReport.findings) {
+      if (finding.message.find("declares SH band " + std::to_string(repeated) +
+                               " more than once") != std::string::npos) {
+        checkedDuplicate = true;
+      }
+    }
+    CHECK(checkedDuplicate);
+  }
 
   std::size_t leftEntry = entries.size();
   std::size_t rightEntry = entries.size();
@@ -1295,6 +1361,39 @@ void footerDeclarationsNameShortRecordsAndTransportFailures() {
   CHECK(preserved);
 }
 
+void anAppendedFooterFieldIsIncompleteRatherThanInvalid() {
+  if (corpusMissing()) return;
+  if (noDecoder()) return;
+  std::vector<std::uint8_t> bytes = readBytes(corpusDirectory() / kProvenanceVariant);
+  CHECK(!bytes.empty());
+  if (bytes.empty()) return;
+  fourdgs::Result<Walk> walked =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  CHECK(walked.ok());
+  if (!walked) return;
+  const fourdgs::tool::Frame* footer = walked->firstIntact(fourdgs::tool::op::kFooter);
+  CHECK(footer != nullptr);
+  if (footer == nullptr || footer->length != 20) return;
+
+  const std::size_t extensionAt = static_cast<std::size_t>(footer->offset + footer->total());
+  bytes.insert(bytes.begin() + static_cast<std::ptrdiff_t>(extensionAt), 0xA5);
+  writeU64(&bytes, static_cast<std::size_t>(footer->offset + 1), footer->length + 1);
+
+  const Report report =
+      fourdgs::tool::validate(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  CHECK(!report.ok());
+  CHECK(!report.hasErrors());
+  CHECK(!report.complete);
+  bool explained = false;
+  for (const fourdgs::tool::Finding& finding : report.findings) {
+    if (finding.message.find("extends the Footer beyond its version-1 prefix") !=
+        std::string::npos) {
+      explained = true;
+    }
+  }
+  CHECK(explained);
+}
+
 void aFileMissingOnlyItsTrailingMagicIsNotInspectedCleanly() {
   // Cut exactly on a record boundary, which is the shape `head -c` produces without needing to
   // land anywhere lucky: every record is whole, so the walk has no cut to report and only the
@@ -1565,8 +1664,11 @@ void aBandThatWillNotDecodeIsRefusedAndPlacedAtItsOwnRecord() {
 
   // The band ranges come out of the file's own index, which is where the tool reads them too.
   fourdgs::tool::BorrowedReadable reader(Span<const std::uint8_t>(bytes.data(), bytes.size()));
-  const std::vector<fourdgs::tool::IndexEntry> index =
+  fourdgs::Result<std::vector<fourdgs::tool::IndexEntry>> parsedIndex =
       fourdgs::tool::chunkIndexEntries(reader, *walked);
+  CHECK(parsedIndex.ok());
+  if (!parsedIndex) return;
+  const std::vector<fourdgs::tool::IndexEntry>& index = *parsedIndex;
   CHECK(!index.empty());
   if (index.empty()) return;
   const fourdgs::tool::BandRange* band = index[0].bandRange(2);
@@ -1631,11 +1733,13 @@ void runTests() {
   inspectPrintsOneRowPerRecordAndReportsACut();
   theToolCouldNotRunHasItsOwnExitCode();
   anErrorTheRefusalTableDoesNotNameIsNotGivenAnIdentifier();
+  inspectTransportFailuresUseTheToolFailureExit();
   theDisplayFormCarriesTheCodeAndTheByte();
   opcodeNamesCoverTheOpenRanges();
   aWalkRetainsBoundedFactsForUnboundedPrivateRecords();
   aLongHeaderIsRangeParsedThroughItsTemporalModel();
   aTemporalModelTransportFailureMakesValidationIncomplete();
+  aChunkIndexTransportFailureMakesValidationIncomplete();
   anUnindexedKeyframeDeltaUsesTheStreamedDecoder();
   anUnindexedFileStillReceivesAFrontMatterVerdict();
   duplicateHeadersAreRejectedBeforeModelDispatch();
@@ -1653,6 +1757,7 @@ void runTests() {
   modelSpecificAndBareStructureOpcodesAreRejected();
   checksumReadFailuresAreNotReportedAsNoChecksum();
   footerDeclarationsNameShortRecordsAndTransportFailures();
+  anAppendedFooterFieldIsIncompleteRatherThanInvalid();
   aFileMissingOnlyItsTrailingMagicIsNotInspectedCleanly();
   anIndexEntryAtTheEndOfTheFileIsRefusedRatherThanDereferenced();
   aFileCutInsideItsFirstRecordStillSaysWhereItWasCut();

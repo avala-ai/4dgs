@@ -146,8 +146,14 @@ std::string hex2(std::uint8_t value) {
 /// its declared length, so an unimplemented stream codec and an out-of-range window index are
 /// both invisible to everything before this point. Both are in the invalid corpus.
 void checkGaussianBirth(Readable& source, const Walk& walk, const std::vector<IndexEntry>& index,
-                        Report* report) {
+                        bool indexedCoreSupportsFooter, Report* report) {
   const ReadMode mode = index.empty() ? ReadMode::kSequential : ReadMode::kIndexed;
+  if (!index.empty() && !indexedCoreSupportsFooter) {
+    incomplete(report,
+               "chunk payload validation is incomplete: the file extends the Footer beyond "
+               "its version-1 prefix, which this indexed core cannot locate from a fixed tail");
+    return;
+  }
   Result<std::unique_ptr<Scene>> opened = Scene::open(source, mode);
   if (!opened) {
     refused(report,
@@ -302,15 +308,7 @@ Report validate(Readable& source) {
   }
   const Walk& walk = *walked;
 
-  bool endsWithMagic = size >= kMagicSize;
-  if (endsWithMagic) {
-    std::uint8_t tail[kMagicSize] = {0};
-    Result<std::size_t> got = source.read(size - kMagicSize, Span<std::uint8_t>(tail, kMagicSize));
-    endsWithMagic = got.ok() && *got == kMagicSize;
-    for (std::size_t i = 0; i < kMagicSize && endsWithMagic; ++i) {
-      if (tail[i] != kMagic[i]) endsWithMagic = false;
-    }
-  }
+  const bool endsWithMagic = walk.trailingMagic;
   if (!endsWithMagic) {
     error(&report,
           "file does not end with the magic; it is truncated or was written by a broken encoder");
@@ -417,7 +415,12 @@ Report validate(Readable& source) {
   }
   const bool keyframeDelta = *model == "keyframe-delta";
 
-  const std::vector<IndexEntry> index = chunkIndexEntries(source, walk);
+  Result<std::vector<IndexEntry>> parsedIndex = chunkIndexEntries(source, walk);
+  if (!parsedIndex) {
+    incomplete(&report, "cannot range-read the Chunk Index: " + parsedIndex.error().message);
+    return report;
+  }
+  const std::vector<IndexEntry> index = *parsedIndex;
   const std::uint64_t physicalIndexCount = walk.intactOpcodeCounts[op::kChunkIndex];
   if (undersizedIndex.has_value()) {
     error(&report, "the Chunk Index record at byte " + std::to_string(undersizedIndex->offset) +
@@ -452,7 +455,13 @@ Report validate(Readable& source) {
                          std::to_string(index[i].offset) +
                          "; each state record must have exactly one index entry");
     }
+    std::unordered_set<std::uint8_t> entryBands;
     for (const BandRange& range : index[i].bands) {
+      if (!entryBands.insert(range.band).second) {
+        error(&report, "chunk index entry " + std::to_string(i) + " declares SH band " +
+                           std::to_string(range.band) +
+                           " more than once; each band has exactly one range per state record");
+      }
       const std::size_t at = indexedBands.size();
       indexedBands.push_back(IndexedBand{i, range, std::nullopt, std::nullopt});
       wantedBands[range.offset].push_back(at);
@@ -708,7 +717,10 @@ Report validate(Readable& source) {
   if (keyframeDelta) {
     checkKeyframeDelta(&report);
   } else {
-    checkGaussianBirth(source, walk, index, &report);
+    const bool indexedCoreSupportsFooter = !walk.lastIntactRecord.has_value() ||
+                                           walk.lastIntactRecord->opcode != op::kFooter ||
+                                           walk.lastIntactRecord->length == 20;
+    checkGaussianBirth(source, walk, index, indexedCoreSupportsFooter, &report);
   }
 
   return report;

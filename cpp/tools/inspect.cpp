@@ -150,6 +150,10 @@ Result<Walk> printJson(std::ostream& out, Readable& source, std::uint64_t initia
 
 }  // namespace
 
+int inspectFailureExit(const Error& error) {
+  return error.code == ErrorCode::kIo ? kExitTool : kExitFailed;
+}
+
 int runInspect(const std::string& path, bool json, std::ostream& out, std::ostream& err) {
   // Ranges, not a file. The walk reads nine bytes per record and steps over the content, and the
   // summary checksum is accumulated through one 64 KiB buffer — so the sentence at the top of
@@ -169,7 +173,7 @@ int runInspect(const std::string& path, bool json, std::ostream& out, std::ostre
     // the magic itself are placeable here, and those need no walk.
     std::optional<Named> named = describe(walked.error(), nullptr, std::nullopt);
     if (named.has_value()) err << "4dgs: " << named->toString() << "\n";
-    return kExitFailed;
+    return inspectFailureExit(walked.error());
   }
 
   Result<std::optional<Coverage>> covered = coverage(*source, *walked);
