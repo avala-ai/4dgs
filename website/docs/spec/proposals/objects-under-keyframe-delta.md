@@ -366,8 +366,10 @@ with the accompanying note:
 
 ## 6. The conformance variant that pins it
 
-**`KeyframeDeltaObjects`**, in `data/keyframe/`. One variant, carrying every corner the rules above
-decide.
+**`KeyframeDeltaObjects-UseChunkIndex`**, in `data/keyframe/`. The `UseChunkIndex` flag is part of
+the name so the current harness selects both streamed and indexed runners; this proposal is not
+proved if only the front-to-back path sees the object records and membership lanes. One variant
+carries every corner the rules above decide.
 
 - **Shape:** at least seven state chunks in two groups of pictures, with a chained delta in each, an
   Object Table naming two objects, and distinguishable Object Tracks for ids `7` and `12`, both with
