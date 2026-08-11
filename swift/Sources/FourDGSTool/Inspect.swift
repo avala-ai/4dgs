@@ -34,20 +34,23 @@ private func pad(_ value: String, _ width: Int, left: Bool) -> String {
 }
 
 private func printText(
-    _ out: TextOutput, _ walked: Walk, _ declared: SummaryDeclaration?, _ covered: Coverage?
-) {
+    _ out: TextOutput, _ source: ToolReader, _ walked: Walk, _ declared: SummaryDeclaration?,
+    _ covered: Coverage?
+) throws {
     row(out, "offset", "record", "content", "total", "crc")
     row(out, "0", "(magic)", "", "8", "-")
-    for frame in walked.records {
-        row(
-            out, commas(frame.offset), opcodeName(frame.opcode), commas(frame.length),
-            commas(frame.total), Coverage.cell(covered, at: frame.offset, total: frame.total))
-    }
+    _ = try walk(
+        source, retaining: { _ in false },
+        visit: { frame, _ in
+            row(
+                out, commas(frame.offset), opcodeName(frame.opcode), commas(frame.length),
+                commas(frame.total), Coverage.cell(covered, at: frame.offset, total: frame.total))
+        })
     if walked.trailingMagic {
         row(out, commas(walked.size - UInt64(magic.count)), "(magic)", "", "8", "-")
     }
     out.line("")
-    out.line("\(walked.records.count) records, \(commas(walked.size)) bytes")
+    out.line("\(walked.recordCount) records, \(commas(walked.size)) bytes")
     if let cut = walked.cut {
         out.line("truncated at byte \(commas(cut.at)): \(cut.reason)")
         out.line(
@@ -71,8 +74,9 @@ private func printText(
 }
 
 private func printJson(
-    _ out: TextOutput, _ walked: Walk, _ declared: SummaryDeclaration?, _ covered: Coverage?
-) {
+    _ out: TextOutput, _ source: ToolReader, _ walked: Walk, _ declared: SummaryDeclaration?,
+    _ covered: Coverage?
+) throws {
     out.line("{")
     out.line("  \"size\": \(walked.size),")
     out.line("  \"trailing_magic\": \(walked.trailingMagic),")
@@ -95,16 +99,20 @@ private func printJson(
         out.line("  \"summary_crc\": null,")
     }
     out.line("  \"records\": [")
-    for (i, frame) in walked.records.enumerated() {
-        let cell = Coverage.cell(covered, at: frame.offset, total: frame.total)
-        let crc = cell == "-" ? "null" : jsonString(cell.lowercased())
-        let comma = i + 1 == walked.records.count ? "" : ","
-        out.line(
-            "    {\"offset\": \(frame.offset), \"opcode\": \(frame.opcode), "
-                + "\"name\": \(jsonString(opcodeName(frame.opcode))), "
-                + "\"content_length\": \(frame.length), \"total_length\": \(frame.total), "
-                + "\"crc\": \(crc)}\(comma)")
-    }
+    var index = 0
+    _ = try walk(
+        source, retaining: { _ in false },
+        visit: { frame, _ in
+            let cell = Coverage.cell(covered, at: frame.offset, total: frame.total)
+            let crc = cell == "-" ? "null" : jsonString(cell.lowercased())
+            index += 1
+            let comma = index == walked.recordCount ? "" : ","
+            out.line(
+                "    {\"offset\": \(frame.offset), \"opcode\": \(frame.opcode), "
+                    + "\"name\": \(jsonString(opcodeName(frame.opcode))), "
+                    + "\"content_length\": \(frame.length), \"total_length\": \(frame.total), "
+                    + "\"crc\": \(crc)}\(comma)")
+        })
     out.line("  ]")
     out.line("}")
 }
@@ -137,9 +145,16 @@ public func runInspect(_ path: String, json: Bool, _ out: TextOutput, _ err: Tex
         err.line("4dgs: \(path): \(sentence(asFourDGS(error)))")
         return exitTool
     }
+    var retainedFooter = false
     let walked: Walk
     do {
-        walked = try walk(source)
+        walked = try walk(
+            source,
+            retaining: { frame in
+                guard frame.opcode == Opcode.footer, !retainedFooter else { return false }
+                retainedFooter = true
+                return true
+            })
     } catch {
         let refusal = asFourDGS(error)
         err.line("4dgs: \(path): \(sentence(refusal))")
@@ -159,10 +174,15 @@ public func runInspect(_ path: String, json: Bool, _ out: TextOutput, _ err: Tex
         err.line("4dgs: \(path): \(sentence(asFourDGS(error)))")
         return exitTool
     }
-    if json {
-        printJson(out, walked, declared, covered)
-    } else {
-        printText(out, walked, declared, covered)
+    do {
+        if json {
+            try printJson(out, source, walked, declared, covered)
+        } else {
+            try printText(out, source, walked, declared, covered)
+        }
+    } catch {
+        err.line("4dgs: \(path): \(sentence(asFourDGS(error)))")
+        return exitTool
     }
     // The prefix was recovered and reported; the file is still not a whole one, and a pipeline
     // that goes on to read it should not be told otherwise.

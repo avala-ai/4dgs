@@ -82,6 +82,14 @@ private func writeU64(_ value: UInt64, into bytes: inout [UInt8], at offset: UIn
     for i in 0..<8 { bytes[Int(offset) + i] = UInt8(truncatingIfNeeded: value >> (8 * i)) }
 }
 
+private func littleU32(_ value: UInt32) -> [UInt8] {
+    (0..<4).map { UInt8(truncatingIfNeeded: value >> (8 * $0)) }
+}
+
+private func littleU64(_ value: UInt64) -> [UInt8] {
+    (0..<8).map { UInt8(truncatingIfNeeded: value >> (8 * $0)) }
+}
+
 private func withTemporaryFile<T>(_ bytes: [UInt8], _ body: (String) throws -> T) throws -> T {
     let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".4dgs")
     try Data(bytes).write(to: url)
@@ -279,6 +287,40 @@ final class ValidateTests: XCTestCase {
             }, "\(report.findings.map(\.message))")
     }
 
+    /// A Header string has a u32 length, not a 4 KiB limit. Dispatch follows those lengths with
+    /// small range reads, so a producer's long free-form name cannot hide `temporal_model`.
+    func testKeyframeDeltaDispatchReadsPastALongHeaderPrefix() throws {
+        let longLibrary = [UInt8](repeating: 0x61, count: 5000)
+        var content = littleU32(0)  // profile
+        content += littleU32(UInt32(longLibrary.count)) + longLibrary
+        content += [UInt8](repeating: 0, count: 24)  // duration, gaussian count, cutoff
+        let model = Array("keyframe-delta".utf8)
+        content += littleU32(UInt32(model.count)) + model
+        let bytes = magic + [Opcode.header] + littleU64(UInt64(content.count)) + content + magic
+        let recording = RecordingReader(bytes)
+        let source = ToolReader(recording)
+        let walked = try walk(source, retaining: { $0.opcode == Opcode.header })
+
+        XCTAssertTrue(try isKeyframeDelta(source, walked))
+        XCTAssertEqual(recording.largestRead, model.count)
+    }
+
+    func testFooterMustBeTheFinalRecordForKeyframeDelta() throws {
+        try requireCorpus()
+        let file = try XCTUnwrap(
+            variants(corpusDirectory().appendingPathComponent("keyframe")).first)
+        var bytes = try readFixture(file)
+        bytes.insert(
+            contentsOf: [Opcode.privateStart] + littleU64(0), at: bytes.count - magic.count)
+
+        let report = validate(bytes)
+        XCTAssertFalse(report.ok)
+        XCTAssertTrue(
+            report.findings.contains {
+                $0.message == "last record is Private(0x80); the Footer must be the final record"
+            }, "\(report.findings.map(\.message))")
+    }
+
     /// The CLI's structural work stays on ranges for both temporal models. These fixtures are
     /// larger than the bounded Header prefix, so a file-sized request would be visible here.
     func testValidationDoesNotRequestTheWholeFile() throws {
@@ -299,6 +341,29 @@ final class ValidateTests: XCTestCase {
 }
 
 final class InspectTests: XCTestCase {
+
+    /// The production walk can visit an arbitrary record stream without retaining its frames.
+    /// The fixture is intentionally dominated by zero-length private records: retaining a Frame
+    /// per record is exactly the old file-size-multiplier failure mode.
+    func testASelectiveWalkDoesNotRetainEveryFrame() throws {
+        let count = 20_000
+        var bytes = magic
+        for _ in 0..<count { bytes += [Opcode.privateStart] + littleU64(0) }
+        bytes += magic
+        let recording = RecordingReader(bytes)
+        var visited = 0
+        let walked = try walk(
+            ToolReader(recording), retaining: { _ in false },
+            visit: { _, intact in
+                if intact { visited += 1 }
+            })
+
+        XCTAssertEqual(visited, count)
+        XCTAssertEqual(walked.recordCount, count)
+        XCTAssertEqual(walked.intact, count)
+        XCTAssertTrue(walked.records.isEmpty)
+        XCTAssertEqual(recording.largestRead, Int(recordHeaderSize))
+    }
 
     func testAWalkFramesEveryRecordAndEndsOnTheMagic() throws {
         try requireCorpus()
@@ -379,6 +444,40 @@ final class InspectTests: XCTestCase {
         XCTAssertEqual(runTool(["--help"]).code, exitOk)
         XCTAssertEqual(runTool([]).code, exitOk)
         XCTAssertEqual(runTool(["--version"]).code, exitOk)
+    }
+
+    func testAClosedOutputPipeIsSuccessful() {
+        let pipe = Pipe()
+        pipe.fileHandleForReading.closeFile()
+        let out = StandardStream(pipe.fileHandleForWriting)
+        out.write("the reader has already left\n")
+        XCTAssertTrue(
+            out.brokenPipe,
+            "failure: \(String(describing: out.failure.map { $0 as NSError }))")
+
+        let diagnostics = Pipe()
+        let err = StandardStream(diagnostics.fileHandleForWriting)
+        XCTAssertEqual(processExit(exitFailed, out: out, err: err), exitOk)
+        diagnostics.fileHandleForWriting.closeFile()
+        diagnostics.fileHandleForReading.closeFile()
+    }
+
+    func testAnotherOutputFailureRemainsAToolFailure() {
+        let closed = Pipe()
+        closed.fileHandleForWriting.closeFile()
+        let out = StandardStream(closed.fileHandleForWriting)
+        out.write("cannot be written")
+        XCTAssertNotNil(out.failure)
+        XCTAssertFalse(out.brokenPipe)
+
+        let diagnostics = Pipe()
+        let err = StandardStream(diagnostics.fileHandleForWriting)
+        XCTAssertEqual(processExit(exitOk, out: out, err: err), exitTool)
+        diagnostics.fileHandleForWriting.closeFile()
+        let message = String(
+            data: diagnostics.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+        XCTAssertTrue(message?.contains("4dgs: cannot write output:") == true)
+        diagnostics.fileHandleForReading.closeFile()
     }
 }
 

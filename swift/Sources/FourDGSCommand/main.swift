@@ -10,4 +10,7 @@
 import FourDGSTool
 import Foundation
 
-exit(run(Array(CommandLine.arguments.dropFirst()), out: StandardStream.out, err: StandardStream.err))
+let out = StandardStream.out
+let err = StandardStream.err
+let code = run(Array(CommandLine.arguments.dropFirst()), out: out, err: err)
+exit(processExit(code, out: out, err: err))

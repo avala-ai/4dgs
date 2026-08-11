@@ -98,9 +98,59 @@ func validate(_ source: ToolReader) -> Report {
 
     // Framing first, and for two reasons: it refuses a file that is not ours before anything
     // reads a byte as an opcode, and it is what gives every later refusal a byte to point at.
+    var firstOpcode: UInt8?
+    var lastOpcode: UInt8?
+    var hasHeader = false
+    var hasQuantization = false
+    var hasFooter = false
+    // Two are enough to preserve the refusal-placement rule: one can be placed, more than one is
+    // ambiguous. Footer content is read only from the first. Chunk Index frames are the format's
+    // small seek index; every unrelated top-level frame is consumed and immediately discarded.
+    var retainedHeaders = 0
+    var retainedQuantizations = 0
+    var retainedFooters = 0
     let walked: Walk
     do {
-        walked = try walk(source)
+        walked = try walk(
+            source,
+            retaining: { frame in
+                switch frame.opcode {
+                case Opcode.header:
+                    defer { retainedHeaders += 1 }
+                    return retainedHeaders < 2
+                case Opcode.quantization:
+                    defer { retainedQuantizations += 1 }
+                    return retainedQuantizations < 2
+                case Opcode.footer:
+                    defer { retainedFooters += 1 }
+                    return retainedFooters == 0
+                case Opcode.chunkIndex:
+                    return true
+                default:
+                    return false
+                }
+            },
+            visit: { frame, intact in
+                guard intact else { return }
+                let opcode = frame.opcode
+                if firstOpcode == nil { firstOpcode = opcode }
+                lastOpcode = opcode
+                if opcode == Opcode.header { hasHeader = true }
+                if opcode == Opcode.quantization { hasQuantization = true }
+                if opcode == Opcode.footer { hasFooter = true }
+                if isPrivate(opcode) {
+                    report.note(
+                        "private record 0x\(hex2(opcode)) (\(frame.length) bytes) — skipped, as required")
+                } else if isProvenance(opcode) && !isSpecified(opcode) {
+                    // The reserved tail of the provenance family is spoken for, so this is a
+                    // future-revision record rather than a byte the reader cannot account for.
+                    report.note(
+                        "reserved provenance record 0x\(hex2(opcode)) — skipped, as required "
+                            + "(0x26-0x2F, section 5.15.8)")
+                } else if !isSpecified(opcode) {
+                    report.note("unknown record 0x\(hex2(opcode)) — skipped, as required")
+                }
+            })
     } catch {
         report.refused("", asFourDGS(error), nil, nil)
         return report
@@ -111,35 +161,9 @@ func validate(_ source: ToolReader) -> Report {
             "file does not end with the magic; it is truncated or was written by a broken encoder")
     }
 
-    // Only the whole records: a record the file was cut inside is reported by the note below, and
-    // counting it as present would say a Footer exists in a file that stops before one.
-    var seen: [UInt8] = []
-    var hasHeader = false
-    var hasQuantization = false
-    var hasFooter = false
-    for frame in walked.intactRecords {
-        let opcode = frame.opcode
-        seen.append(opcode)
-        if opcode == Opcode.header { hasHeader = true }
-        if opcode == Opcode.quantization { hasQuantization = true }
-        if opcode == Opcode.footer { hasFooter = true }
-        if isPrivate(opcode) {
-            report.note(
-                "private record 0x\(hex2(opcode)) (\(frame.length) bytes) — skipped, as required")
-        } else if isProvenance(opcode) && !isSpecified(opcode) {
-            // The reserved tail of the provenance family, which is a different thing from an
-            // unknown record: the range is spoken for, so a reader that meets one knows it is
-            // looking at a record from a later revision rather than at a byte it cannot account
-            // for.
-            report.note(
-                "reserved provenance record 0x\(hex2(opcode)) — skipped, as required "
-                    + "(0x26-0x2F, section 5.15.8)")
-        } else if !isSpecified(opcode) {
-            report.note("unknown record 0x\(hex2(opcode)) — skipped, as required")
-        }
-    }
-
-    guard let firstOpcode = seen.first else {
+    // Only whole records set these values: a record the file was cut inside is reported by the
+    // note below, and counting it as present would say a Footer exists before its bytes do.
+    guard let firstOpcode else {
         report.error("no records at all")
         return report
     }
@@ -149,6 +173,10 @@ func validate(_ source: ToolReader) -> Report {
     if !hasHeader { report.error("no Header record") }
     if !hasQuantization { report.error("no Quantization record") }
     if !hasFooter { report.error("no Footer record") }
+    if hasFooter && lastOpcode != Opcode.footer {
+        report.error(
+            "last record is \(opcodeName(lastOpcode ?? 0)); the Footer must be the final record")
+    }
 
     // Which chunk shape the rest of this validator is entitled to assume. A `keyframe-delta`
     // file's Chunks are keyframes and its Delta Chunks are differences against them, so the index
@@ -156,21 +184,17 @@ func validate(_ source: ToolReader) -> Report {
     // rather than guessed from the records, because a file that carries Delta Chunks and does not
     // say so is itself a fault.
     //
-    // Asked of the reader rather than parsed here: this is the one field the whole branch turns
-    // on, and a tool that read it out of the Header itself could disagree with the reader about
-    // which model a file declares — which is the one disagreement that would matter.
-    // The public model peek is byte-in, so give it only the bounded prefix it consumes. This is
-    // also the only part of a keyframe-delta file the current ABI can inspect without a whole-file
-    // allocation; structural, index and checksum validation below remain fully ranged.
-    let prefixCount = Int(min(walked.size, 4096))
-    let prefix: [UInt8]
+    // The two length-prefixed strings before this field are skipped by their declared lengths;
+    // only four-byte lengths and the fourteen-byte dispatch value are read. A fixed prefix is not
+    // sufficient because a conforming profile or library name can put this field arbitrarily far
+    // into the Header.
+    let keyframeDelta: Bool
     do {
-        prefix = try source.exactly(offset: 0, count: prefixCount, record: "Header prefix")
+        keyframeDelta = try isKeyframeDelta(source, walked)
     } catch {
         report.refused("", asFourDGS(error), walked, nil)
         return report
     }
-    let keyframeDelta = (try? peekTemporalModel(prefix)) == "keyframe-delta"
 
     let index: [IndexEntry]
     do {

@@ -16,6 +16,11 @@
 
 import Foundation
 import FourDGS
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 
 /// Exit codes, which are the only part of a command-line tool another program reads.
 ///
@@ -52,13 +57,63 @@ public final class TextBuffer: TextOutput {
 /// Output the process writes.
 public final class StandardStream: TextOutput {
     private let handle: FileHandle
+    public private(set) var brokenPipe = false
+    public private(set) var failure: Error?
 
     public static let out = StandardStream(FileHandle.standardOutput)
     public static let err = StandardStream(FileHandle.standardError)
 
-    private init(_ handle: FileHandle) { self.handle = handle }
+    /// Ignore the signal so the throwing write API can distinguish EPIPE from other failures.
+    /// Without this, Linux kills `4dgs inspect file | head` before Swift can see the error.
+    private static let ignoresBrokenPipeSignal: Void = {
+        #if canImport(Darwin) || canImport(Glibc)
+            _ = signal(SIGPIPE, SIG_IGN)
+        #endif
+    }()
 
-    public func write(_ text: String) { handle.write(Data(text.utf8)) }
+    init(_ handle: FileHandle) {
+        _ = Self.ignoresBrokenPipeSignal
+        self.handle = handle
+    }
+
+    private static func isBrokenPipe(_ error: Error) -> Bool {
+        var system = error as NSError
+        // swift-corelibs-foundation wraps POSIX write failures in NSCocoaErrorDomain; Darwin may
+        // hand the POSIX error through directly. Follow the bounded Foundation error chain so the
+        // same executable recognizes both shapes without treating another write error as EPIPE.
+        for _ in 0..<4 {
+            #if canImport(Darwin) || canImport(Glibc)
+                if system.domain == NSPOSIXErrorDomain && system.code == Int(EPIPE) { return true }
+            #endif
+            guard let underlying = system.userInfo[NSUnderlyingErrorKey] as? NSError else {
+                return false
+            }
+            system = underlying
+        }
+        return false
+    }
+
+    public func write(_ text: String) {
+        guard failure == nil, !brokenPipe else { return }
+        do {
+            try handle.write(contentsOf: Data(text.utf8))
+        } catch {
+            if Self.isBrokenPipe(error) {
+                brokenPipe = true
+                return
+            }
+            failure = error
+        }
+    }
+}
+
+/// Turn buffered stream state into the process result. A downstream reader closing a pipe is a
+/// successful pipeline; every other output failure is diagnosed and remains a tool failure.
+public func processExit(_ code: Int32, out: StandardStream, err: StandardStream) -> Int32 {
+    if out.brokenPipe || err.brokenPipe { return exitOk }
+    guard let failure = out.failure ?? err.failure else { return code }
+    err.line("4dgs: cannot write output: \(failure)")
+    return exitTool
 }
 
 /// The usage text, which is also where the exit codes are documented.

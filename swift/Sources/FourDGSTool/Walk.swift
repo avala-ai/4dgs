@@ -202,17 +202,34 @@ public struct Cut {
     public let insideARecord: Bool
 }
 
-/// The result of walking a file's framing: every record, and the cut if there was one.
+/// The result of walking a file's framing: counts, retained metadata, and the cut if there was one.
+///
+/// `records` is deliberately not necessarily the whole walk. Production callers retain only the
+/// few record kinds they need after the scan; a visitor sees every frame while it is current. The
+/// in-memory convenience below retains everything for focused parser tests.
 public struct Walk {
     public var records: [Frame] = []
     public var cut: Cut?
     /// True when the last eight bytes are the magic, as a whole file's are.
     public var trailingMagic = false
     public var size: UInt64 = 0
+    /// Every framed record, whether retained in ``records`` or not.
+    public var recordCount = 0
+    fileprivate var intactRecordCount = 0
+    fileprivate var retainedIntactCount = 0
 
-    /// The records a streamed reader keeps: every one the walk framed, less the one the file was
-    /// cut inside.
-    public var intactRecords: ArraySlice<Frame> { records.prefix(intact) }
+    /// The retained records a streamed reader keeps. A record cut inside can be retained so its
+    /// declared length remains reportable, but it is never in this slice.
+    public var intactRecords: ArraySlice<Frame> {
+        // The fallback preserves the useful value semantics of a hand-built `Walk` in focused
+        // tests and callers: scanner-produced walks always have a nonzero `recordCount` when they
+        // carry records, while a literal can only express the old all-retained shape.
+        let count =
+            recordCount == 0 && !records.isEmpty
+            ? records.count - ((cut?.insideARecord ?? false) ? 1 : 0)
+            : retainedIntactCount
+        return records.prefix(count)
+    }
 
     /// The first *whole* record with this opcode, or `nil`.
     ///
@@ -224,13 +241,15 @@ public struct Walk {
         intactRecords.first { $0.opcode == opcode }
     }
 
-    /// How many of the reported records are whole.
+    /// How many of all framed records are whole, including frames the caller did not retain.
     ///
     /// All of them, except when the file was cut inside one: that record is reported — hiding it
     /// would hide the declared length that is the whole fault — but it is not something a
     /// streamed reader keeps.
     public var intact: Int {
-        records.count - ((cut?.insideARecord ?? false) ? 1 : 0)
+        recordCount == 0 && !records.isEmpty
+            ? records.count - ((cut?.insideARecord ?? false) ? 1 : 0)
+            : intactRecordCount
     }
 }
 
@@ -259,7 +278,14 @@ func readU32(_ bytes: [UInt8], at: UInt64) -> UInt32? {
 /// bytes that are not ours would report whatever the first byte happened to mean as an opcode —
 /// and when it fails, the SDK is asked to name the refusal so that the wording and the identifier
 /// are the reader's rather than this tool's.
-func walk(_ source: ToolReader) throws -> Walk {
+///
+/// `retaining` chooses the bounded metadata needed after the scan. `visit` receives every frame
+/// while it is current, including the final incomplete one; its Boolean says whether the record
+/// is whole. This is what lets `inspect` emit an arbitrarily long record list without storing it.
+func walk(
+    _ source: ToolReader, retaining: (Frame) -> Bool,
+    visit: ((Frame, Bool) -> Void)? = nil
+) throws -> Walk {
     let size = try source.size()
     guard size >= UInt64(magic.count) else {
         throw FourDGSError.truncated(
@@ -296,12 +322,14 @@ func walk(_ source: ToolReader) throws -> Walk {
         let header = try source.exactly(
             offset: at, count: Int(recordHeaderSize), record: "record header")
         let frame = Frame(opcode: header[0], offset: at, length: readU64(header, at: 1) ?? 0)
-        // A record is listed either way: a declared length that runs off the end is a fact about
-        // that record, and hiding the record hides the field that carries the fault.
-        out.records.append(frame)
+        out.recordCount += 1
 
         let (end, overflow) = at.addingReportingOverflow(frame.total)
         if frame.overflows || overflow || end > size {
+            // An incomplete record is still visited and may be retained: its declared length is
+            // the fault, and hiding the record would hide the field that carries it.
+            if retaining(frame) { out.records.append(frame) }
+            visit?(frame, false)
             out.cut = Cut(
                 at: at,
                 reason:
@@ -310,9 +338,21 @@ func walk(_ source: ToolReader) throws -> Walk {
                 insideARecord: true)
             break
         }
+        if retaining(frame) {
+            out.records.append(frame)
+            out.retainedIntactCount += 1
+        }
+        out.intactRecordCount += 1
+        visit?(frame, true)
         at = end
     }
     return out
+}
+
+/// Retain every frame. This exists for callers that explicitly want an in-memory walk; the CLI
+/// uses the selective overload above so file size cannot turn into frame-array size.
+func walk(_ source: ToolReader) throws -> Walk {
+    try walk(source, retaining: { _ in true })
 }
 
 /// The in-memory convenience used by unit tests and callers that already own their bytes.
@@ -472,6 +512,45 @@ func chunkIndexEntries(_ source: ToolReader, _ walk: Walk) throws -> [IndexEntry
 /// The in-memory convenience used by focused parser tests.
 public func chunkIndexEntries(_ bytes: [UInt8], _ walk: Walk) -> [IndexEntry] {
     (try? chunkIndexEntries(ToolReader(InMemoryReader(bytes)), walk)) ?? []
+}
+
+/// Whether the first whole Header declares `keyframe-delta`, using only bounded ranges.
+///
+/// The two strings before `temporal_model` have no small length cap, so a fixed prefix cannot
+/// reach the model in every conforming Header. Their four-byte lengths are enough to skip them;
+/// only the model itself is read, and only when it has exactly the fourteen bytes needed to equal
+/// the one value this validator dispatches specially. A malformed Header returns `false` here and
+/// is diagnosed by the ordinary gaussian-birth reader rather than by a second Header parser.
+func isKeyframeDelta(_ source: ToolReader, _ walk: Walk) throws -> Bool {
+    guard let frame = walk.firstIntact(Opcode.header) else { return false }
+    let content = frame.offset + recordHeaderSize
+    var relative: UInt64 = 0
+
+    func stringLength() throws -> UInt64? {
+        guard relative <= frame.length, frame.length - relative >= 4 else { return nil }
+        let field = try source.exactly(
+            offset: content + relative, count: 4, record: "Header string length")
+        let length = UInt64(readU32(field, at: 0) ?? 0)
+        relative += 4
+        guard length <= frame.length - relative else { return nil }
+        return length
+    }
+
+    guard let profileLength = try stringLength() else { return false }
+    relative += profileLength
+    guard let libraryLength = try stringLength() else { return false }
+    relative += libraryLength
+
+    // duration_sec, gaussian_count, cutoff.
+    let fixed: UInt64 = 24
+    guard relative <= frame.length, frame.length - relative >= fixed else { return false }
+    relative += fixed
+    guard let modelLength = try stringLength() else { return false }
+    let expected = Array("keyframe-delta".utf8)
+    guard modelLength == UInt64(expected.count) else { return false }
+    let model = try source.exactly(
+        offset: content + relative, count: expected.count, record: "Header temporal_model")
+    return model == expected
 }
 
 /// What the Footer declares about the summary checksum, and where the summary ends.
