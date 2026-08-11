@@ -155,6 +155,7 @@ struct ChunkFields {
     let t1: Double
     let level: UInt32
     let count: UInt32
+    let birthCount: UInt32
     let deltaMode: UInt8
     let referenceOffset: UInt64
     let keyframeOffset: UInt64
@@ -163,6 +164,7 @@ struct ChunkFields {
 
 private struct PhysicalValidation {
     var fields: [UInt64: ChunkFields] = [:]
+    var frames: [UInt64: Frame] = [:]
     var gaussianCount: UInt64 = 0
     var indexSafe = true
     var chunkRefused = false
@@ -179,8 +181,9 @@ private func chunkFields(_ source: ToolReader, _ frame: Frame) throws -> ChunkFi
     if frame.opcode == Opcode.chunk {
         guard let count = readU32(bytes, at: 20) else { return nil }
         return ChunkFields(
-            opcode: frame.opcode, t0: t0, t1: t1, level: level, count: count, deltaMode: 0,
-            referenceOffset: 0, keyframeOffset: frame.offset, depth: 0)
+            opcode: frame.opcode, t0: t0, t1: t1, level: level, count: count,
+            birthCount: count, deltaMode: 0, referenceOffset: 0,
+            keyframeOffset: frame.offset, depth: 0)
     }
     guard let referenceOffset = readU64(bytes, at: 21),
         let keyframeOffset = readU64(bytes, at: 29), let depth = readU16(bytes, at: 37),
@@ -194,7 +197,7 @@ private func chunkFields(_ source: ToolReader, _ frame: Frame) throws -> ChunkFi
     }
     return ChunkFields(
         opcode: frame.opcode, t0: t0, t1: t1, level: level, count: affected,
-        deltaMode: bytes[20],
+        birthCount: births, deltaMode: bytes[20],
         referenceOffset: referenceOffset, keyframeOffset: keyframeOffset, depth: depth)
 }
 
@@ -642,6 +645,8 @@ private func isAuxiliaryRecord(_ opcode: UInt8) -> Bool {
     (0x0A...0x0F).contains(opcode) || (0x20...0x25).contains(opcode)
 }
 
+private let maximumRetainedValidationRecords = 262_144
+
 private func validatePhysicalRecords(
     _ source: ToolReader, _ walked: Walk, index: [IndexEntry], keyframeDelta: Bool,
     temporalModelOffset: UInt64?, durationSec: Double?, shDegree: UInt8?,
@@ -677,27 +682,34 @@ private func validatePhysicalRecords(
     var summaryOffsetStartsOnBoundary = summary?.offsetStart == 0
     var summaryOffsetStructureReported = false
     var firstSummaryOffset: UInt64?
-    var previousPhysicalInterval: ChunkFields?
-    var physicalIntervalCount = 0
+    var physicalIntervals: [ChunkFields] = []
 
     var firstAuxiliaryError: (FourDGSError, Site)?
+    var firstFrontMatterError: (FourDGSError, Site)?
+    var auxiliaryRecords: [Frame] = []
+    var auxiliaryLimitReported = false
+    var headerRecords: [Frame] = []
+    var quantizationRecords: [Frame] = []
+    var frontMatterLimitReported = false
+    var stateLimitReported = false
     var stateBeforeQuantizationReported = false
 
     func finishChunkBands() {
         guard let state = currentState,
-            let fields = currentStateFields, fields.opcode == Opcode.chunk,
-            let shDegree
+            let fields = currentStateFields, let shDegree
         else { return }
+        let count = fields.opcode == Opcode.deltaChunk ? fields.birthCount : fields.count
         let expected: Set<UInt8> =
-            fields.count == 0 || shDegree == 0 ? [] : Set(1...shDegree)
+            count == 0 || shDegree == 0 ? [] : Set(1...shDegree)
         guard currentBandNumbers != expected else { return }
         let missing = expected.subtracting(currentBandNumbers).sorted()
         let extra = currentBandNumbers.subtracting(expected).sorted()
         var details: [String] = []
         if !missing.isEmpty { details.append("missing bands \(missing)") }
         if !extra.isEmpty { details.append("unexpected bands \(extra)") }
+        let rows = fields.opcode == Opcode.deltaChunk ? "births" : "gaussians"
         scanReport.error(
-            "the Chunk at byte \(state.offset) declares \(fields.count) gaussians and Header "
+            "the \(opcodeName(fields.opcode)) at byte \(state.offset) declares \(count) \(rows) and Header "
                 + "sh_degree \(shDegree), but its physical SH Band Streams have "
                 + details.joined(separator: " and "))
     }
@@ -721,8 +733,32 @@ private func validatePhysicalRecords(
                 guard intact else { return }
 
                 switch frame.opcode {
-                case Opcode.header: if header == nil { header = frame }
-                case Opcode.quantization: if quantization == nil { quantization = frame }
+                case Opcode.header:
+                    if header == nil { header = frame }
+                    if headerRecords.count + quantizationRecords.count
+                        < maximumRetainedValidationRecords
+                    {
+                        headerRecords.append(frame)
+                    } else if !frontMatterLimitReported {
+                        scanReport.error(
+                            "the file contains more than \(maximumRetainedValidationRecords) "
+                                + "Header or Quantization records; refusing to retain an "
+                                + "unbounded front matter list")
+                        frontMatterLimitReported = true
+                    }
+                case Opcode.quantization:
+                    if quantization == nil { quantization = frame }
+                    if headerRecords.count + quantizationRecords.count
+                        < maximumRetainedValidationRecords
+                    {
+                        quantizationRecords.append(frame)
+                    } else if !frontMatterLimitReported {
+                        scanReport.error(
+                            "the file contains more than \(maximumRetainedValidationRecords) "
+                                + "Header or Quantization records; refusing to retain an "
+                                + "unbounded front matter list")
+                        frontMatterLimitReported = true
+                    }
                 case Opcode.windowTable: if windowTable == nil { windowTable = frame }
                 default: break
                 }
@@ -918,24 +954,13 @@ private func validatePhysicalRecords(
                 }
 
                 if keyframeDelta && isAuxiliaryRecord(frame.opcode) {
-                    guard let header, let quantization, let temporalModelOffset else { return }
-                    do {
-                        var slices = frontMatterSlices(
-                            header: header, quantization: quantization,
-                            windowTable: windowTable, temporalModelOffset: temporalModelOffset)
-                        slices.append(SourceSlice(offset: frame.offset, length: frame.total))
-                        _ = try SceneReader(
-                            SlicedReader(source: source, slices: slices), path: .streamed)
-                    } catch {
-                        if firstAuxiliaryError == nil {
-                            firstAuxiliaryError = (
-                                asFourDGS(error),
-                                Site(
-                                    offset: frame.offset,
-                                    what:
-                                        "the physical \(opcodeName(frame.opcode)) record at byte "
-                                        + "\(frame.offset)"))
-                        }
+                    if auxiliaryRecords.count < maximumRetainedValidationRecords {
+                        auxiliaryRecords.append(frame)
+                    } else if !auxiliaryLimitReported {
+                        scanReport.error(
+                            "the file contains more than \(maximumRetainedValidationRecords) "
+                                + "auxiliary records; refusing to retain an unbounded list")
+                        auxiliaryLimitReported = true
                     }
                     return
                 }
@@ -980,8 +1005,15 @@ private func validatePhysicalRecords(
                     if let fields = try chunkFields(source, frame) {
                         physicalFields = fields
                         currentStateFields = fields
+                        let retainState = result.fields.count < maximumRetainedValidationRecords
+                        if !retainState && !stateLimitReported {
+                            scanReport.error(
+                                "the file contains more than "
+                                    + "\(maximumRetainedValidationRecords) physical state records; "
+                                    + "refusing to retain unbounded state metadata")
+                            stateLimitReported = true
+                        }
                         if keyframeDelta {
-                            physicalIntervalCount += 1
                             if !fields.t0.isFinite || !fields.t1.isFinite
                                 || fields.t0 >= fields.t1
                             {
@@ -990,25 +1022,17 @@ private func validatePhysicalRecords(
                                         + "[\(fields.t0), \(fields.t1)) must contain two finite "
                                         + "values with t0 < t1")
                             } else {
-                                if let previous = previousPhysicalInterval,
-                                    previous.t1 != fields.t0
-                                {
-                                    let what =
-                                        fields.t0 < previous.t1 ? "overlap" : "leave a gap"
-                                    scanReport.error(
-                                        "physical state chunks \(what): [\(previous.t0), "
-                                            + "\(previous.t1)) is followed by [\(fields.t0), "
-                                            + "\(fields.t1))")
-                                } else if previousPhysicalInterval == nil, fields.t0 != 0 {
-                                    scanReport.error(
-                                        "physical state chunks start at \(fields.t0); expected the "
-                                            + "keyframe-delta timeline to start at 0")
-                                }
-                                previousPhysicalInterval = fields
+                                if retainState { physicalIntervals.append(fields) }
                             }
-                            result.fields[frame.offset] = fields
+                            if retainState {
+                                result.fields[frame.offset] = fields
+                                result.frames[frame.offset] = frame
+                            }
                         } else {
-                            result.fields[frame.offset] = fields
+                            if retainState {
+                                result.fields[frame.offset] = fields
+                                result.frames[frame.offset] = frame
+                            }
                         }
                         for i in entries where index[i].gaussianCount != fields.count {
                             scanReport.error(
@@ -1096,15 +1120,116 @@ private func validatePhysicalRecords(
         result.indexSafe = false
     }
     finishChunkBands()
+
+    if keyframeDelta, let firstHeader = headerRecords.first,
+        let firstQuantization = quantizationRecords.first
+    {
+        for candidate in headerRecords where firstFrontMatterError == nil {
+            do {
+                var one = Walk()
+                one.records = [candidate]
+                let candidateDispatch = try headerDispatch(source, one)
+                _ = try SceneReader(
+                    SlicedReader(
+                        source: source,
+                        slices: frontMatterSlices(
+                            header: candidate, quantization: firstQuantization,
+                            windowTable: nil,
+                            temporalModelOffset: candidateDispatch?.keyframeDelta == true
+                                ? candidateDispatch?.temporalModelOffset : nil)),
+                    path: .streamed)
+            } catch {
+                firstFrontMatterError = (
+                    asFourDGS(error),
+                    Site(
+                        offset: candidate.offset,
+                        what: "the physical Header record at byte \(candidate.offset)")
+                )
+            }
+        }
+        for candidate in quantizationRecords where firstFrontMatterError == nil {
+            do {
+                _ = try SceneReader(
+                    SlicedReader(
+                        source: source,
+                        slices: frontMatterSlices(
+                            header: firstHeader, quantization: candidate, windowTable: nil,
+                            temporalModelOffset: temporalModelOffset)),
+                    path: .streamed)
+            } catch {
+                firstFrontMatterError = (
+                    asFourDGS(error),
+                    Site(
+                        offset: candidate.offset,
+                        what: "the physical Quantization record at byte \(candidate.offset)")
+                )
+            }
+        }
+    }
+
+    if keyframeDelta, !auxiliaryRecords.isEmpty, let header, let quantization,
+        let temporalModelOffset
+    {
+        func parseAuxiliaryPrefix(_ count: Int) throws {
+            var slices = frontMatterSlices(
+                header: header, quantization: quantization, windowTable: windowTable,
+                temporalModelOffset: temporalModelOffset)
+            for frame in auxiliaryRecords.prefix(count) {
+                slices.append(SourceSlice(offset: frame.offset, length: frame.total))
+            }
+            _ = try SceneReader(SlicedReader(source: source, slices: slices), path: .streamed)
+        }
+        do {
+            try parseAuxiliaryPrefix(auxiliaryRecords.count)
+        } catch {
+            var failure = asFourDGS(error)
+            var low = 1
+            var high = auxiliaryRecords.count
+            while low < high {
+                let middle = low + (high - low) / 2
+                do {
+                    try parseAuxiliaryPrefix(middle)
+                    low = middle + 1
+                } catch {
+                    failure = asFourDGS(error)
+                    high = middle
+                }
+            }
+            let frame = auxiliaryRecords[low - 1]
+            firstAuxiliaryError = (
+                failure,
+                Site(
+                    offset: frame.offset,
+                    what: "the physical \(opcodeName(frame.opcode)) record at byte \(frame.offset)")
+            )
+        }
+    }
+
     if keyframeDelta {
-        if physicalIntervalCount == 0 {
+        let ordered = physicalIntervals.sorted {
+            if $0.t0 == $1.t0 { return $0.t1 < $1.t1 }
+            return $0.t0 < $1.t0
+        }
+        if ordered.isEmpty {
             scanReport.error("the keyframe-delta file contains no physical state chunks")
-        } else if let durationSec, let last = previousPhysicalInterval,
-            last.t1 != durationSec
-        {
-            scanReport.error(
-                "physical state chunks end at \(last.t1); expected Header duration_sec "
-                    + "\(durationSec)")
+        } else {
+            if let first = ordered.first, first.t0 != 0 {
+                scanReport.error(
+                    "physical state chunks start at \(first.t0); expected the keyframe-delta "
+                        + "timeline to start at 0")
+            }
+            for pair in zip(ordered, ordered.dropFirst()) where pair.0.t1 != pair.1.t0 {
+                let what = pair.1.t0 < pair.0.t1 ? "overlap" : "leave a gap"
+                scanReport.error(
+                    "physical state chunks \(what): [\(pair.0.t0), \(pair.0.t1)) is followed by "
+                        + "[\(pair.1.t0), \(pair.1.t1))")
+                break
+            }
+            if let durationSec, let last = ordered.last, last.t1 != durationSec {
+                scanReport.error(
+                    "physical state chunks end at \(last.t1); expected Header duration_sec "
+                        + "\(durationSec)")
+            }
         }
         if index.isEmpty {
             validatePhysicalKeyframeDeltaReferences(result.fields, report: &scanReport)
@@ -1153,10 +1278,229 @@ private func validatePhysicalRecords(
     }
     if let firstAuxiliaryError {
         report.refused(
-            "an auxiliary record does not decode: ", firstAuxiliaryError.0, walked,
+            "\(firstAuxiliaryError.1.what) does not decode: ", firstAuxiliaryError.0, walked,
             firstAuxiliaryError.1)
     }
+    if let firstFrontMatterError {
+        report.refused(
+            "a front matter record does not decode: ", firstFrontMatterError.0, walked,
+            firstFrontMatterError.1)
+    }
     return result
+}
+
+private let maximumIdentityStreamBytes: UInt64 = 1 << 30
+
+private func malformedIdentity(_ frame: Frame, _ reason: String) -> FourDGSError {
+    .malformed(
+        offset: Int64(clamping: frame.offset), record: opcodeName(frame.opcode),
+        field: "gaussian_id", reason: reason)
+}
+
+/// Decode only a group's identity column. The payload is inflated to bounded temporary storage;
+/// byte-plane blocks are then read back without retaining any other attribute or the whole record.
+private func gaussianIDs(_ frame: Frame, _ group: DeltaGroup) throws -> Set<UInt32> {
+    if group.length == 0 {
+        guard group.count == 0 else {
+            throw malformedIdentity(
+                frame, "the \(group.name) group declares \(group.count) rows but has no streams")
+        }
+        return []
+    }
+
+    var relative: UInt64 = 0
+    var identityHeader: [UInt8]?
+    var identityPayloadOffset: UInt64 = 0
+    var identityPayloadLength: UInt64 = 0
+    while relative < group.length {
+        guard group.length - relative >= 17 else {
+            throw malformedIdentity(frame, "the \(group.name) group ends inside a stream header")
+        }
+        let header = try group.source.exactly(
+            offset: group.offset + relative, count: 17,
+            record: "\(opcodeName(frame.opcode)) \(group.name) stream")
+        let payloadLength = readU64(header, at: 9) ?? 0
+        relative += 17
+        guard payloadLength <= group.length - relative else {
+            throw malformedIdentity(
+                frame, "attribute \(header[0]) runs past the \(group.name) group")
+        }
+        if header[0] == 13 {
+            guard identityHeader == nil else {
+                throw malformedIdentity(frame, "the \(group.name) group carries gaussian_id twice")
+            }
+            identityHeader = header
+            identityPayloadOffset = group.offset + relative
+            identityPayloadLength = payloadLength
+        }
+        relative += payloadLength
+    }
+    guard let header = identityHeader else {
+        throw malformedIdentity(frame, "the \(group.name) group carries no gaussian_id stream")
+    }
+
+    let width = UInt64(header[1])
+    let mode = header[2]
+    let codec = header[3]
+    let channels = UInt64(header[4])
+    let count = UInt64(readU32(header, at: 5) ?? 0)
+    guard count == UInt64(group.count) else {
+        throw malformedIdentity(
+            frame,
+            "the \(group.name) group declares \(group.count) rows, but gaussian_id carries \(count)")
+    }
+    if count == 0 { return [] }
+    guard width == 1 || width == 2 || width == 4 else {
+        throw malformedIdentity(
+            frame, "the stream declares symbol width \(width); expected 1, 2, or 4")
+    }
+    guard channels == 1 else {
+        throw malformedIdentity(frame, "the stream declares \(channels) channels; expected 1")
+    }
+    guard mode <= 2 else {
+        throw malformedIdentity(frame, "the stream declares unknown mode \(mode)")
+    }
+    guard codec == 0 else {
+        throw FourDGSError.unsupportedCodec(
+            offset: Int64(clamping: identityPayloadOffset), record: "gaussian_id stream",
+            name: "stream codec \(codec)", refusal: .unknownStreamCodec)
+    }
+
+    let symbols = mode == 2 ? UInt64(1) : count
+    let (bytesPerChannel, firstOverflow) = symbols.multipliedReportingOverflow(by: width)
+    let (expectedBytes, secondOverflow) = bytesPerChannel.multipliedReportingOverflow(by: channels)
+    guard !firstOverflow, !secondOverflow, expectedBytes <= maximumIdentityStreamBytes else {
+        throw malformedIdentity(
+            frame, "the decoded stream exceeds the \(maximumIdentityStreamBytes)-byte limit")
+    }
+    let decoded = try inflatedReader(
+        group.source, offset: identityPayloadOffset, length: identityPayloadLength,
+        expected: expectedBytes, frame: frame)
+
+    var ids: Set<UInt32> = []
+    ids.reserveCapacity(Int(group.count))
+    var previous: Int64 = 0
+    let blockSymbols: UInt64 = 16 * 1024
+    var start: UInt64 = 0
+    while start < symbols {
+        let blockCount = min(blockSymbols, symbols - start)
+        var planes: [[UInt8]] = []
+        planes.reserveCapacity(Int(width))
+        for plane in 0..<width {
+            planes.append(
+                try decoded.exactly(
+                    offset: plane * symbols + start, count: Int(blockCount),
+                    record: "gaussian_id decoded symbols"))
+        }
+        for i in 0..<Int(blockCount) {
+            var encoded: UInt64 = 0
+            for plane in 0..<Int(width) {
+                encoded |= UInt64(planes[plane][i]) << UInt64(8 * plane)
+            }
+            var value = Int64(bitPattern: (encoded >> 1) ^ (0 &- (encoded & 1)))
+            if mode == 1 {
+                value = previous &+ value
+                previous = value
+            }
+            guard value >= 0, value <= Int64(UInt32.max) else {
+                throw malformedIdentity(
+                    frame, "the stream decodes gaussian_id \(value); expected a u32 value")
+            }
+            let id = UInt32(value)
+            let repeats = mode == 2 ? count : 1
+            for _ in 0..<repeats {
+                guard ids.insert(id).inserted else {
+                    throw malformedIdentity(
+                        frame, "the \(group.name) group names gaussian_id \(id) more than once")
+                }
+            }
+        }
+        start += blockCount
+    }
+    return ids
+}
+
+private func applyIdentityDelta(
+    _ reference: Set<UInt32>, frame: Frame, groups: [DeltaGroup]
+) throws -> Set<UInt32> {
+    guard groups.count == 3 else {
+        throw malformedIdentity(frame, "expected update, birth, and death groups")
+    }
+    let updates = try gaussianIDs(frame, groups[0])
+    let births = try gaussianIDs(frame, groups[1])
+    let deaths = try gaussianIDs(frame, groups[2])
+    if let id = updates.intersection(births).first {
+        throw malformedIdentity(frame, "gaussian_id \(id) is updated and born by the same delta")
+    }
+    if let id = updates.intersection(deaths).first {
+        throw malformedIdentity(frame, "gaussian_id \(id) is updated and killed by the same delta")
+    }
+    if let id = births.intersection(deaths).first {
+        throw malformedIdentity(frame, "gaussian_id \(id) is born and killed by the same delta")
+    }
+    if let id = updates.subtracting(reference).first {
+        throw malformedIdentity(
+            frame, "the delta updates gaussian_id \(id), which is not live at its reference")
+    }
+    if let id = deaths.subtracting(reference).first {
+        throw malformedIdentity(
+            frame, "the delta kills gaussian_id \(id), which is not live at its reference")
+    }
+    if let id = births.intersection(reference).first {
+        throw malformedIdentity(
+            frame, "the delta creates gaussian_id \(id), which is already live at its reference")
+    }
+    return reference.subtracting(deaths).union(births)
+}
+
+/// Rebuild each target from its own backwards chain. This deliberately trades repeated reads for
+/// bounded memory: at most one composed identity set is resident, regardless of file length.
+private func validateKeyframeDeltaIdentity(
+    _ source: ToolReader, physical: PhysicalValidation, index: [IndexEntry],
+    report: inout Report
+) {
+    let indexed = Dictionary(grouping: index.enumerated(), by: { $0.element.offset })
+    for target in physical.frames.keys.sorted() {
+        var chain: [Frame] = []
+        var at = target
+        var visited: Set<UInt64> = []
+        while let frame = physical.frames[at], let fields = physical.fields[at] {
+            guard visited.insert(at).inserted else {
+                report.error("the identity reference chain at byte \(target) contains a cycle")
+                return
+            }
+            chain.append(frame)
+            if fields.opcode == Opcode.chunk { break }
+            at = fields.referenceOffset
+        }
+        guard chain.last?.opcode == Opcode.chunk else { continue }
+
+        do {
+            var state: Set<UInt32> = []
+            for frame in chain.reversed() {
+                if frame.opcode == Opcode.chunk {
+                    state = try gaussianIDs(frame, keyframeGroup(source, frame))
+                } else {
+                    state = try applyIdentityDelta(
+                        state, frame: frame, groups: deltaGroups(source, frame))
+                }
+            }
+            for (i, entry) in indexed[target] ?? [] where entry.extended {
+                if entry.liveCount != UInt64(state.count) {
+                    report.error(
+                        "chunk index entry \(i) has live_count \(entry.liveCount), but composing "
+                            + "the state at byte \(target) produces \(state.count) live gaussians")
+                }
+            }
+        } catch {
+            report.refused(
+                "keyframe-delta identity composition failed: ", asFourDGS(error), nil,
+                Site(
+                    offset: target,
+                    what: "the identity chain ending at the state record at byte \(target)"))
+            return
+        }
+    }
 }
 
 private func validatePhysicalKeyframeDeltaReferences(
@@ -1244,6 +1588,13 @@ private func validateGaussianBirthIndexIntervals(
         report.error(
             "chunk index entries \(entries.map(String.init).joined(separator: ", ")) all name "
                 + "byte \(offset); each state record must have one index entry")
+    }
+    for (offset, physical) in fields where physical.opcode == Opcode.chunk {
+        if !physical.t0.isFinite || !physical.t1.isFinite || physical.t1 < physical.t0 {
+            report.error(
+                "the physical Chunk at byte \(offset) has interval [\(physical.t0), "
+                    + "\(physical.t1)); expected finite values with t0 <= t1")
+        }
     }
     for (i, entry) in index.enumerated() {
         guard let physical = fields[entry.offset], physical.opcode == Opcode.chunk else { continue }
@@ -1337,6 +1688,13 @@ func validateKeyframeDeltaIndex(
             if entry.depth != 0 {
                 report.error(
                     "chunk index entry \(i) is a keyframe but depth is \(entry.depth); expected 0")
+            }
+            if let physical = fields[entry.offset], physical.opcode == Opcode.chunk,
+                entry.liveCount != UInt64(physical.count)
+            {
+                report.error(
+                    "chunk index entry \(i) has live_count \(entry.liveCount), but the keyframe "
+                        + "Chunk at byte \(entry.offset) declares \(physical.count) gaussians")
             }
         } else if entry.deltaMode > 1 {
             report.error(
@@ -1689,6 +2047,41 @@ private func audioDataSummary(_ source: ToolReader, _ frame: Frame) throws -> Au
     return AudioDataSummary(id: id, dataLength: length)
 }
 
+private func validateLegacyAudio(_ source: ToolReader, _ frame: Frame) throws {
+    let content = frame.offset + recordHeaderSize
+    guard frame.length >= 4 else {
+        throw malformedAudio(frame, field: "codec", reason: "the string length is missing")
+    }
+    let lengthBytes = try source.exactly(offset: content, count: 4, record: "Audio codec length")
+    let codecLength = UInt64(readU32(lengthBytes, at: 0) ?? 0)
+    guard codecLength <= frame.length - 4 else {
+        throw malformedAudio(frame, field: "codec", reason: "the string runs past the record")
+    }
+    guard codecLength != 0 else {
+        throw malformedAudio(frame, field: "codec", reason: "the string is empty")
+    }
+    try validateAudioUTF8(
+        source, frame, offset: content + 4, length: codecLength, field: "codec")
+    let relative = 4 + codecLength
+    guard relative <= frame.length, frame.length - relative >= 16 else {
+        throw malformedAudio(
+            frame, field: "payload",
+            reason: "start_sec and the data length need 16 bytes after the codec")
+    }
+    let fields = try source.exactly(
+        offset: content + relative, count: 16, record: "Audio timing and data length")
+    let startSec = readF64(fields, at: 0) ?? .nan
+    let dataLength = readU64(fields, at: 8) ?? 0
+    guard startSec.isFinite else {
+        throw malformedAudio(frame, field: "start_sec", reason: "the value is not finite")
+    }
+    guard dataLength == frame.length - relative - 16 else {
+        throw malformedAudio(
+            frame, field: "data",
+            reason: "the record declares \(dataLength) bytes; \(frame.length - relative - 16) remain")
+    }
+}
+
 /// Run every check over one size-and-range transport.
 func validate(_ source: ToolReader) -> Report {
     var report = Report()
@@ -1701,6 +2094,8 @@ func validate(_ source: ToolReader) -> Report {
     var retainedHeaders = 0
     var retainedQuantizations = 0
     var retainedFooters = 0
+    var retainedChunkIndexes = 0
+    var chunkIndexLimitReported = false
     var privateCount: UInt64 = 0
     var firstPrivate: (opcode: UInt8, length: UInt64)?
     var provenanceCount: UInt64 = 0
@@ -1730,7 +2125,8 @@ func validate(_ source: ToolReader) -> Report {
                     defer { retainedFooters += 1 }
                     return retainedFooters == 0
                 case Opcode.chunkIndex:
-                    return true
+                    defer { retainedChunkIndexes += 1 }
+                    return retainedChunkIndexes < maximumRetainedValidationRecords
                 default:
                     return false
                 }
@@ -1760,6 +2156,13 @@ func validate(_ source: ToolReader) -> Report {
                 }
                 if opcode == Opcode.audio {
                     if legacyAudioCount < UInt64.max { legacyAudioCount += 1 }
+                    do {
+                        try validateLegacyAudio(source, frame)
+                    } catch {
+                        report.error(
+                            "Audio at byte \(frame.offset) does not parse: "
+                                + sentence(asFourDGS(error)))
+                    }
                 } else if opcode == Opcode.audioSource {
                     do {
                         let parsed = try audioSourceSummary(source, frame)
@@ -1796,6 +2199,15 @@ func validate(_ source: ToolReader) -> Report {
                 } else if !isSpecified(opcode) {
                     if firstUnknown == nil { firstUnknown = opcode }
                     if unknownCount < UInt64.max { unknownCount += 1 }
+                }
+                if opcode == Opcode.chunkIndex
+                    && retainedChunkIndexes > maximumRetainedValidationRecords
+                    && !chunkIndexLimitReported
+                {
+                    report.error(
+                        "the file contains more than \(maximumRetainedValidationRecords) "
+                            + "ChunkIndex records; refusing to retain an unbounded index")
+                    chunkIndexLimitReported = true
                 }
             })
     } catch {
@@ -2021,19 +2433,22 @@ func validate(_ source: ToolReader) -> Report {
     if keyframeDelta {
         validateKeyframeDeltaIndex(
             index, fields: physical.fields, durationSec: dispatch?.durationSec, report: &report)
-        report.incomplete(
-            "keyframe-delta identity composition was not checked: the current ranged Swift ABI "
-                + "exposes groups and references, but not composed identity state")
+        validateKeyframeDeltaIdentity(source, physical: physical, index: index, report: &report)
     } else {
         validateGaussianBirthIndexIntervals(
             index, fields: physical.fields, report: &report)
+        let physicalIntervalsSafe = physical.fields.values.allSatisfy {
+            $0.opcode != Opcode.chunk
+                || ($0.t0.isFinite && $0.t1.isFinite && $0.t0 <= $0.t1)
+        }
         if let expected = dispatch?.gaussianCount, physical.gaussianCount != expected {
             report.error(
                 "Header gaussian_count is \(expected), but physical Chunks contain "
                     + "\(physical.gaussianCount) gaussians")
         }
         checkGaussianBirth(
-            source, walked, index, indexSafe: physical.indexSafe,
+            source, walked, index,
+            indexSafe: physical.indexSafe && physicalIntervalsSafe,
             chunkAlreadyRefused: physical.chunkRefused, &report)
     }
 

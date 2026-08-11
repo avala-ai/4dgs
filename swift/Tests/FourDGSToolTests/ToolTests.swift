@@ -158,18 +158,17 @@ final class ValidateTests: XCTestCase {
         XCTAssertFalse(result.out.contains("error:"))
     }
 
-    func testAConformingKeyframeDeltaFileIsReportedIncomplete() throws {
+    func testAConformingKeyframeDeltaFileIsValid() throws {
         try requireCorpus()
         let files = variants(corpusDirectory().appendingPathComponent("keyframe"))
         XCTAssertFalse(files.isEmpty)
         for file in files {
             let result = runTool(["validate", file.path])
-            XCTAssertEqual(result.code, exitWarnings, "\(file.lastPathComponent) said: \(result.out)")
+            XCTAssertEqual(result.code, exitOk, "\(file.lastPathComponent) said: \(result.out)")
             XCTAssertFalse(result.out.contains("error:"), result.out)
-            XCTAssertTrue(result.out.contains("identity composition was not checked"), result.out)
-            XCTAssertEqual(result.err, "INCOMPLETE\n")
+            XCTAssertTrue(result.out.contains("valid"), result.out)
+            XCTAssertEqual(result.err, "")
         }
-        XCTAssertTrue(usage.contains("incomplete (not proof of validity)"))
     }
 
     func testEveryValidVariantIsValid() throws {
@@ -600,6 +599,36 @@ final class ValidateTests: XCTestCase {
         let copy = bytes[Int(header.offset)..<Int(header.offset + header.total)]
         bytes.insert(contentsOf: copy, at: Int(state.offset))
         XCTAssertFalse(validate(bytes).ok)
+
+        let source = ToolReader(InMemoryReader(try readFixture(file)))
+        let dispatch = try XCTUnwrap(try headerDispatch(source, walked))
+        var malformedHeader = Array(copy)
+        let model = Int(dispatch.temporalModelOffset - header.offset)
+        malformedHeader.replaceSubrange(model..<(model + 14), with: "unknown-model!".utf8)
+        var secondMalformedHeader = try readFixture(file)
+        secondMalformedHeader.insert(contentsOf: malformedHeader, at: Int(state.offset))
+        XCTAssertTrue(
+            validate(secondMalformedHeader).findings.contains {
+                $0.refusal?.code == .unknownTemporalModel
+                    && $0.refusal?.site?.offset == state.offset
+            })
+
+        let quantization = try XCTUnwrap(walked.firstIntact(Opcode.quantization))
+        var malformedQuantization = Array(
+            try readFixture(file)[
+                Int(quantization.offset)..<Int(quantization.offset + quantization.total)])
+        let schemeLength = Int(try XCTUnwrap(readU32(malformedQuantization, at: recordHeaderSize)))
+        malformedQuantization.replaceSubrange(
+            Int(recordHeaderSize + 4)..<Int(recordHeaderSize + 4 + UInt64(schemeLength)),
+            with: [UInt8](repeating: 0x78, count: schemeLength))
+        var secondMalformedQuantization = try readFixture(file)
+        secondMalformedQuantization.insert(
+            contentsOf: malformedQuantization, at: Int(state.offset))
+        XCTAssertTrue(
+            validate(secondMalformedQuantization).findings.contains {
+                $0.refusal?.code == .unknownQuantizationScheme
+                    && $0.refusal?.site?.offset == state.offset
+            })
     }
 
     func testAnEmptyNonzeroSummaryRangeIsInvalid() throws {
@@ -946,6 +975,23 @@ final class ValidateTests: XCTestCase {
                 $0.message.contains("has t0") && $0.message.contains("the Chunk at byte")
             })
 
+        let chunk = try XCTUnwrap(walked.firstIntact(Opcode.chunk))
+        let t0 = try XCTUnwrap(readF64(original, at: chunk.offset + recordHeaderSize))
+        let reversedEnd = t0 - 1
+        var reversedInterval = original
+        writeU64(
+            reversedEnd.bitPattern, into: &reversedInterval,
+            at: chunk.offset + recordHeaderSize + 8)
+        writeU64(
+            reversedEnd.bitPattern, into: &reversedInterval,
+            at: index.offset + recordHeaderSize + 8)
+        writeU32(0, into: &reversedInterval, at: footer.offset + recordHeaderSize + 16)
+        XCTAssertTrue(
+            validate(reversedInterval).findings.contains {
+                $0.message.contains("physical Chunk at byte \(chunk.offset)")
+                    && $0.message.contains("expected finite values with t0 <= t1")
+            })
+
         var wrongIndexCount = original
         writeU32(
             entry.gaussianCount + 1, into: &wrongIndexCount,
@@ -1000,11 +1046,13 @@ final class ValidateTests: XCTestCase {
         var malformedAuxiliary = original
         malformedAuxiliary.insert(
             contentsOf: [Opcode.coordinateFrame] + littleU64(0), at: Int(firstState.offset))
+        let auxiliaryFindings = validate(malformedAuxiliary).findings
         XCTAssertTrue(
-            validate(malformedAuxiliary).findings.contains {
-                $0.refusal?.site?.offset == firstState.offset
-                    && $0.refusal?.site?.what.contains("CoordinateFrame") == true
-            })
+            auxiliaryFindings.contains {
+                $0.message.contains("physical CoordinateFrame record at byte \(firstState.offset)")
+            },
+            auxiliaryFindings.map { "\($0.message) [\($0.refusal.map(String.init(describing:)) ?? "-")]" }
+                .joined(separator: "\n"))
     }
 
     func testEveryPhysicalBandMustAppearInItsOwningIndexEntry() throws {
@@ -1131,6 +1179,100 @@ final class ValidateTests: XCTestCase {
         XCTAssertTrue(
             validate(mixed).findings.contains {
                 $0.message == "legacy Audio and Audio Source records must not be mixed"
+            })
+
+        var malformedLegacy = keyframeDelta
+        malformedLegacy.insert(
+            contentsOf: [Opcode.audio] + littleU64(4) + littleU32(100),
+            at: Int(firstState.offset))
+        XCTAssertTrue(
+            validate(malformedLegacy).findings.contains {
+                $0.message.contains("Audio at byte \(firstState.offset) does not parse")
+                    && $0.message.contains("codec")
+            })
+    }
+
+    func testKeyframeDeltaBirthBandsLiveCountsAndPhysicalOrdering() throws {
+        try requireCorpus()
+        let churnFile = corpusDirectory().appendingPathComponent(
+            "keyframe/KeyframeDeltaChurn-UseChunkIndex-UseCrc-UseStatistics.4dgs")
+        let churn = try readFixture(churnFile)
+        let churnWalk = try walk(churn)
+        let churnDispatch = try XCTUnwrap(
+            try headerDispatch(ToolReader(InMemoryReader(churn)), churnWalk))
+
+        var missingBirthBands = churn
+        missingBirthBands[Int(churnDispatch.temporalModelOffset + 14 + 48)] = 1
+        XCTAssertTrue(
+            validate(missingBirthBands).findings.contains {
+                $0.message.contains("DeltaChunk at byte") && $0.message.contains("births")
+                    && $0.message.contains("missing bands [1]")
+            })
+
+        let indexFrame = try XCTUnwrap(
+            churnWalk.intactRecords.first { frame in
+                guard frame.opcode == Opcode.chunkIndex else { return false }
+                return chunkIndexEntries(churn, churnWalk).first?.kind == 0
+            })
+        let entry = try XCTUnwrap(chunkIndexEntries(churn, churnWalk).first)
+        let bandCount = UInt64(
+            try XCTUnwrap(readU32(churn, at: indexFrame.offset + recordHeaderSize + 36)))
+        let extensionOffset = indexFrame.offset + recordHeaderSize + 40 + bandCount * 17
+        var wrongLiveCount = churn
+        writeU64(entry.liveCount + 1, into: &wrongLiveCount, at: extensionOffset + 20)
+        let footer = try XCTUnwrap(churnWalk.firstIntact(Opcode.footer))
+        writeU32(0, into: &wrongLiveCount, at: footer.offset + recordHeaderSize + 16)
+        XCTAssertTrue(
+            validate(wrongLiveCount).findings.contains {
+                $0.message.contains("live_count \(entry.liveCount + 1)")
+                    && $0.message.contains("keyframe Chunk")
+            })
+
+        let keyframesFile = corpusDirectory().appendingPathComponent(
+            "keyframe/KeyframeOnly-UseChunkIndex-UseCrc-UseStatistics.4dgs")
+        var reordered = try readFixture(keyframesFile)
+        let reorderedWalk = try walk(reordered)
+        let states = reorderedWalk.intactRecords.filter { $0.opcode == Opcode.chunk }
+        XCTAssertGreaterThanOrEqual(states.count, 2)
+        let first = states[0]
+        let second = states[1]
+        let firstBytes = reordered[Int(first.offset)..<Int(first.offset + first.total)]
+        let secondBytes = reordered[Int(second.offset)..<Int(second.offset + second.total)]
+        reordered.replaceSubrange(
+            Int(first.offset)..<Int(second.offset + second.total), with: secondBytes + firstBytes)
+        for frame in reorderedWalk.intactRecords where frame.opcode == Opcode.chunkIndex {
+            reordered[Int(frame.offset)] = Opcode.privateStart
+        }
+        let reorderedFooter = try XCTUnwrap(reorderedWalk.firstIntact(Opcode.footer))
+        writeU64(0, into: &reordered, at: reorderedFooter.offset + recordHeaderSize)
+        writeU32(0, into: &reordered, at: reorderedFooter.offset + recordHeaderSize + 16)
+        let reorderedReport = validate(reordered)
+        XCTAssertFalse(
+            reorderedReport.findings.contains {
+                $0.message.hasPrefix("physical state chunks")
+            }, "\(reorderedReport.findings.map(\.message))")
+    }
+
+    func testKeyframeDeltaAuxiliaryRecordsAreValidatedTogether() throws {
+        try requireCorpus()
+        let file = corpusDirectory().appendingPathComponent(
+            "object/MultiObject-UseChunkIndex-UseCrc.4dgs")
+        var bytes = try readFixture(file)
+        let walked = try walk(bytes)
+        let dispatch = try XCTUnwrap(
+            try headerDispatch(ToolReader(InMemoryReader(bytes)), walked))
+        bytes.replaceSubrange(
+            Int(dispatch.temporalModelOffset)..<Int(dispatch.temporalModelOffset + 14),
+            with: "keyframe-delta".utf8)
+        let table = try XCTUnwrap(walked.firstIntact(0x24))
+        let state = try XCTUnwrap(walked.firstIntact(Opcode.chunk))
+        let tableBytes = bytes[Int(table.offset)..<Int(table.offset + table.total)]
+        bytes.insert(contentsOf: tableBytes, at: Int(state.offset))
+
+        XCTAssertTrue(
+            validate(bytes).findings.contains {
+                $0.message.contains("physical ObjectTable record at byte \(state.offset)")
+                    && $0.message.contains("does not decode")
             })
     }
 
