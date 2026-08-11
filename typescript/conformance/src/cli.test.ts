@@ -658,8 +658,45 @@ test("regression: decoded SH degree must equal the Header declaration", (t) => {
   const report = validated(file("WrongShDegree.4dgs", data), "--decode");
   assert.equal(report.code, EXIT_FAILED);
   assert.ok(
-    report.out.some((line) => line.includes("nonempty chunks assemble SH degree 1")),
+    report.out.some((line) => line.includes("chunks assemble SH degree 1")),
     report.out.join("\n"),
+  );
+});
+
+test("regression: decoded validation reports late malformed windows and every early Footer", (t) => {
+  const path = corpus("TenWindows-UseChunkIndex-UseCrc");
+  if (path === null || !existsSync(EXECUTABLE)) return t.skip("corpus not generated");
+  const original = bytesOf("TenWindows-UseChunkIndex-UseCrc");
+  const summary = parseFooter(
+    original.subarray(original.length - FOOTER_TAIL_BYTES + RECORD_HEADER_BYTES),
+  ).summaryStart;
+
+  const malformedWindow = framedRecord(Opcode.WindowTable, Uint8Array.of(1));
+  const withWindow = splice(original.slice(), summary, malformedWindow);
+  const windowReport = validated(
+    file("LateMalformedWindow.4dgs", resealSummary(withWindow, malformedWindow.length)),
+    "--decode",
+  );
+  assert.equal(windowReport.code, EXIT_FAILED);
+  assert.ok(
+    windowReport.out.some((line) => line.includes("Window Table does not parse")),
+    windowReport.out.join("\n"),
+  );
+
+  const footerRecord = recordsOf(original).find((record) => record.opcode === Opcode.Footer)!;
+  const duplicate = original.slice(footerRecord.offset, footerRecord.offset + footerRecord.length);
+  const twoFooters = splice(original.slice(), footerRecord.offset, duplicate);
+  const finalFooterContent = twoFooters.length - FOOTER_TAIL_BYTES + RECORD_HEADER_BYTES;
+  new DataView(twoFooters.buffer, twoFooters.byteOffset, twoFooters.byteLength).setUint32(
+    finalFooterContent + 16,
+    0,
+    true,
+  );
+  const footerReport = validated(file("TwoFooters.4dgs", twoFooters));
+  assert.equal(footerReport.code, EXIT_FAILED);
+  assert.ok(
+    footerReport.out.some((line) => line.includes("every Footer must be the last record")),
+    footerReport.out.join("\n"),
   );
 });
 

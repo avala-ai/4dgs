@@ -272,8 +272,11 @@ export async function validateFile(
           // this record, and a finding it does not have is a disagreement about a file.
           try {
             windows = parseWindowTable(content);
-          } catch {
+          } catch (error) {
             windows = null;
+            if (options.decode === true) {
+              found.error(`Window Table does not parse: ${message(error)}`);
+            }
           }
           break;
         case Opcode.Chunk: {
@@ -494,7 +497,7 @@ export async function validateFile(
       if (!chunk.decoded) return;
       try {
         const degree = mergeBands(chunk.count, chunk.bands, MAX_SH_DEGREE).degree;
-        if (chunk.count > 0) degrees.push(degree);
+        degrees.push(degree);
       } catch (error) {
         found.error(`chunk ${i + 1} SH bands do not assemble: ${message(error)}`);
       }
@@ -507,7 +510,7 @@ export async function validateFile(
     }
     if (header !== null && degrees.some((degree) => degree !== header!.shDegree)) {
       found.error(
-        `nonempty chunks assemble SH degree ${[...new Set(degrees)].join(", ")}; the Header ` +
+        `chunks assemble SH degree ${[...new Set(degrees)].join(", ")}; the Header ` +
           `declares degree ${header.shDegree} (§6.5)`,
       );
     }
@@ -532,6 +535,13 @@ export async function validateFile(
   if (footer !== null && seen.at(-1) !== Opcode.Footer) {
     found.error(
       `the last record is ${opcodeName(seen.at(-1)!)}; the Footer must be the last record (§4)`,
+    );
+  }
+  const earlyFooter = seen.slice(0, -1).indexOf(Opcode.Footer);
+  if (earlyFooter >= 0) {
+    found.error(
+      `Footer record ${earlyFooter + 1} is followed by another record; every Footer must be ` +
+        "the last record (§4)",
     );
   }
 
