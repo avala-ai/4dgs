@@ -568,6 +568,74 @@ test("regression: an SH band immediately after a Delta Chunk belongs to that sta
     report.findings.every((finding) => !finding.message.includes("does not immediately follow")),
     report.findings.map((finding) => finding.message).join("\n"),
   );
+
+  const badCodec = bandRecord.slice();
+  badCodec[RECORD_HEADER_BYTES + 1 + 3] = 9;
+  const badCodecAt = delta.offset + delta.length;
+  const decoded = await validateFile(splice(deltaFile, badCodecAt, badCodec), { decode: true });
+  assert.equal(decoded.refused?.code, "unknown-stream-codec");
+  assert.equal(decoded.refused?.at, badCodecAt);
+
+  const badAttribute = bandRecord.slice();
+  badAttribute[RECORD_HEADER_BYTES + 1] = 0;
+  const nested = await validateFile(splice(deltaFile, badCodecAt, badAttribute), { decode: true });
+  assert.ok(
+    nested.findings.some((finding) => finding.message.includes("declares nested attribute_id 0")),
+    nested.findings.map((finding) => finding.message).join("\n"),
+  );
+});
+
+test("regression: keyframe-delta index metadata is checked without and with decoding", async () => {
+  const original = new Uint8Array(Buffer.from(MOVING_CHAINED, "base64"));
+  const records = [...iterateRecords(original, MAGIC.length)];
+  const keyframeRecord = records.find(
+    (record) =>
+      record.opcode === Opcode.ChunkIndex && parseChunkIndexEntry(record.content).kind === 0,
+  )!;
+  const entry = parseChunkIndexEntry(keyframeRecord.content);
+  const bandCount = entry.bands.length;
+  const extensionAt = keyframeRecord.offset + RECORD_HEADER_BYTES + 40 + bandCount * (1 + 8 + 8);
+
+  const constants = original.slice();
+  constants[extensionAt + 1] = 1;
+  new DataView(constants.buffer, constants.byteOffset, constants.byteLength).setBigUint64(
+    extensionAt + 2,
+    1n,
+    true,
+  );
+  const constantsReport = await validateFile(resealSummary(constants));
+  assert.ok(constantsReport.findings.some((finding) => finding.message.includes("delta_mode 1")));
+  assert.ok(
+    constantsReport.findings.some((finding) => finding.message.includes("reference_offset 1")),
+  );
+
+  const live = original.slice();
+  const liveAt = extensionAt + 20;
+  const liveView = new DataView(live.buffer, live.byteOffset, live.byteLength);
+  liveView.setBigUint64(liveAt, liveView.getBigUint64(liveAt, true) + 1n, true);
+  const liveReport = await validateFile(resealSummary(live), { decode: true });
+  assert.ok(
+    liveReport.findings.some(
+      (finding) =>
+        finding.message.includes(`declares live_count ${entry.liveCount + 1}`) &&
+        finding.message.includes("composing the state"),
+    ),
+    liveReport.findings.map((finding) => finding.message).join("\n"),
+  );
+
+  const timeline = original.slice();
+  new DataView(timeline.buffer, timeline.byteOffset, timeline.byteLength).setFloat64(
+    keyframeRecord.offset + RECORD_HEADER_BYTES,
+    0.25,
+    true,
+  );
+  const timelineReport = await validateFile(resealSummary(timeline));
+  assert.ok(
+    timelineReport.findings.some((finding) =>
+      finding.message.includes("keyframe-delta timeline does not tile the scene clock"),
+    ),
+    timelineReport.findings.map((finding) => finding.message).join("\n"),
+  );
 });
 
 test("regression: gaussian-birth rejects a physical Delta Chunk", async () => {
@@ -1191,6 +1259,7 @@ test("unit: the appended SH bit depths are parsed, tolerantly", (t) => {
   const content = data.subarray(record.offset + RECORD_HEADER_BYTES, record.offset + record.length);
   const quantization = parseQuantization(content);
   assert.deepEqual([...quantization.shBitDepths], [5, 4]);
+  assert.equal(quantization.shBitDepthsMalformed, false);
   // Five bits is a pitch of 8 and a bound of 4, which is what the record's own bounds map
   // declares — the relationship the validator's check is about.
   assert.equal(shStep(5), 8);
@@ -1203,7 +1272,10 @@ test("unit: the appended SH bit depths are parsed, tolerantly", (t) => {
   const outOfRange = content.slice();
   outOfRange[outOfRange.length - 1] = 9;
   assert.deepEqual([...parseQuantization(outOfRange).shBitDepths], []);
-  assert.deepEqual([...parseQuantization(content.slice(0, -1)).shBitDepths], []);
+  assert.equal(parseQuantization(outOfRange).shBitDepthsMalformed, true);
+  const truncated = parseQuantization(content.slice(0, -1));
+  assert.deepEqual([...truncated.shBitDepths], []);
+  assert.equal(truncated.shBitDepthsMalformed, true);
 });
 
 test("regression: the SH bit depths are checked against the Header's degree", (t) => {
@@ -1223,6 +1295,44 @@ test("regression: the SH bit depths are checked against the Header's degree", (t
     report.out.join("\n"),
   );
   assert.equal(report.out.at(-1), "valid (with notes)");
+
+  const malformed = bytesOf("MixedLifetimes-SHBitsLow-SHDegree2-UseChunkIndex-UseCrc");
+  const malformedQuantization = recordsOf(malformed)[1]!;
+  malformed[malformedQuantization.offset + malformedQuantization.length - 1] = 2;
+  const malformedReport = validated(file("MalformedDepth.4dgs", malformed));
+  assert.equal(malformedReport.code, EXIT_FAILED, malformedReport.out.join("\n"));
+  assert.ok(
+    malformedReport.out.some((line) => line.includes("malformed SH bit-depth declaration")),
+    malformedReport.out.join("\n"),
+  );
+});
+
+test("regression: Summary Offset records belong to the declared summary", async (t) => {
+  const variant = "TenWindows-UseChunkIndex-UseChunks-UseCrc-UseStatistics-UseSummaryOffset";
+  if (corpus(variant) === null) return t.skip("corpus not generated");
+  const original = bytesOf(variant);
+  const summaryOffset = recordsOf(original).find(
+    (record) => record.opcode === Opcode.SummaryOffset,
+  )!;
+  const copy = original.slice(summaryOffset.offset, summaryOffset.offset + summaryOffset.length);
+  const firstChunk = recordsOf(original).find((record) => record.opcode === Opcode.Chunk)!;
+  const moved = resealSummary(splice(original, firstChunk.offset, copy), copy.length);
+  const footerContent = moved.length - FOOTER_TAIL_BYTES + RECORD_HEADER_BYTES;
+  new DataView(moved.buffer, moved.byteOffset, moved.byteLength).setBigUint64(
+    footerContent + 8,
+    BigInt(firstChunk.offset),
+    true,
+  );
+
+  const report = await validateFile(moved);
+  assert.ok(
+    report.findings.some(
+      (finding) =>
+        finding.message.includes(`Summary Offset record at byte ${firstChunk.offset}`) &&
+        finding.message.includes("outside the declared summary"),
+    ),
+    report.findings.map((finding) => finding.message).join("\n"),
+  );
 });
 
 interface JsonRecord {

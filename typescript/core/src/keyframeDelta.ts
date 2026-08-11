@@ -1118,6 +1118,7 @@ export async function decodeKeyframeDeltaStreamed(
 export async function validateKeyframeDeltaStreamed(
   input: IReadable | Uint8Array,
   codecs: CodecRegistry = DEFAULT_CODECS,
+  onState?: ((offset: number, liveCount: number) => void) | undefined,
 ): Promise<number> {
   const source = input instanceof Uint8Array ? new BytesReadable(input) : input;
   const sizeBig = await source.size();
@@ -1173,7 +1174,7 @@ export async function validateKeyframeDeltaStreamed(
   };
   const rememberInterval = (next: Interval, offset: number): void => {
     if (intervals.length >= MAX_VALIDATION_INTERVALS) {
-      throw new MalformedFile(
+      throw new RangeError(
         `keyframe-delta validation exceeds the ${MAX_VALIDATION_INTERVALS}-state-chunk limit`,
       );
     }
@@ -1234,6 +1235,7 @@ export async function validateKeyframeDeltaStreamed(
         };
         gopKeyframe = retained;
         previousState = retained;
+        onState?.(record.offset, state.count);
         remember(state, parsed.header, record.offset);
         rememberWindowIndices(state, record.offset);
         rememberInterval(parsed.header, record.offset);
@@ -1304,6 +1306,7 @@ export async function validateKeyframeDeltaStreamed(
           level: parsed.header.level,
           depth: expectedDepth,
         };
+        onState?.(record.offset, state.count);
         remember(state, parsed.header, record.offset);
         rememberWindowIndices(state, record.offset);
         rememberInterval(parsed.header, record.offset);
@@ -2006,6 +2009,14 @@ export function checkTiling(
   requireFullCoverage = false,
 ): void {
   const ordered = [...intervals].sort((a, b) => a.t0 - b.t0);
+  for (const entry of ordered) {
+    if (!Number.isFinite(entry.t0) || !Number.isFinite(entry.t1) || entry.t1 < entry.t0) {
+      throw new MalformedFile(
+        `state chunk has unusable interval [${entry.t0}, ${entry.t1}); expected finite t0 ` +
+          "and t1 >= t0",
+      );
+    }
+  }
   for (let i = 1; i < ordered.length; i++) {
     const previous = ordered[i - 1]!;
     const entry = ordered[i]!;

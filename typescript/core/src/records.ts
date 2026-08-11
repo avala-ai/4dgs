@@ -200,6 +200,8 @@ export interface Quantization {
    * no bytes at all, not as a zero count.
    */
   readonly shBitDepths: readonly number[];
+  /** True when appended bytes look like an SH depth list but do not frame a legal one. */
+  readonly shBitDepthsMalformed: boolean;
 }
 
 export function parseQuantization(content: Uint8Array): Quantization {
@@ -207,6 +209,9 @@ export function parseQuantization(content: Uint8Array): Quantization {
   const scheme = c.string();
   const posOrigin = c.f64s(3);
   const steps = c.f64s(8);
+  const stepSh = c.u8();
+  const bounds = c.stringMap();
+  const parsedDepths = shBitDepths(c);
   const quantization: Quantization = {
     scheme,
     posOrigin,
@@ -218,9 +223,10 @@ export function parseQuantization(content: Uint8Array): Quantization {
     stepMotion: steps[5]!,
     stepTime: steps[6]!,
     stepSigmaLog: steps[7]!,
-    stepSh: c.u8(),
-    bounds: c.stringMap(),
-    shBitDepths: shBitDepths(c),
+    stepSh,
+    bounds,
+    shBitDepths: parsedDepths.values,
+    shBitDepthsMalformed: parsedDepths.malformed,
   };
   // `object_id` is an exact label (spec section 6.6), not a metric value, so there is no
   // meaningful error bound between two different labels — section 6.5 makes a bound for it
@@ -246,21 +252,28 @@ export function parseQuantization(content: Uint8Array): Quantization {
  * for, or a depth outside the legal range, is read as "this file declares none" rather
  * than as a corrupt file (spec §5.3).
  */
-function shBitDepths(c: Cursor): readonly number[] {
-  if (c.remaining < 1) return [];
+function shBitDepths(c: Cursor): {
+  readonly values: readonly number[];
+  readonly malformed: boolean;
+} {
+  if (c.remaining < 1) return { values: [], malformed: false };
   const at = c.pos;
   const count = c.u8();
-  if (count === 0 || c.remaining < count) {
+  if (count === 0) {
     c.pos = at;
-    return [];
+    return { values: [], malformed: false };
+  }
+  if (c.remaining < count) {
+    c.pos = at;
+    return { values: [], malformed: true };
   }
   const depths: number[] = [];
   for (let i = 0; i < count; i++) depths.push(c.u8());
   if (depths.some((bits) => bits < SH_MIN_BITS || bits > SH_MAX_BITS)) {
     c.pos = at;
-    return [];
+    return { values: [], malformed: true };
   }
-  return depths;
+  return { values: depths, malformed: false };
 }
 
 /** Validity windows, as `[lo, hi]` pairs flattened into one array. */

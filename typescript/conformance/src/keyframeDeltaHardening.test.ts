@@ -857,6 +857,7 @@ test("checkTiling: adjacency always, coverage only when required", () => {
   const at = (t0: number, t1: number) => ({ t0, t1 });
   assert.throws(() => checkTiling([at(0, 1), at(2, 3)]), MalformedFile); // gap
   assert.throws(() => checkTiling([at(0, 2), at(1, 3)]), MalformedFile); // overlap
+  assert.throws(() => checkTiling([at(0, 2), at(2, 1)], 1, true), MalformedFile); // inverted
   assert.throws(() => checkTiling([], 1), MalformedFile); // duration but no chunks
   checkTiling([at(0, 1), at(1, 2)], 2); // complete: no throw
 
@@ -868,6 +869,19 @@ test("checkTiling: adjacency always, coverage only when required", () => {
   assert.throws(() => checkTiling([at(0, 1)], 2, true), MalformedFile); // ends before duration
   assert.throws(() => checkTiling([at(0.5, 1)], 1, true), MalformedFile); // starts after 0
   checkTiling([at(0, 1), at(1, 2)], 2, true); // full coverage: no throw
+});
+
+test("streamed validation reports each composed live population without retaining states", async () => {
+  const data = bytes(MOVING_CHAINED);
+  const expected = (await decodeKeyframeDeltaStreamed(data)).chunks.map((chunk) => [
+    chunk.offset,
+    chunk.state.count,
+  ]);
+  const observed: [number, number][] = [];
+  await validateKeyframeDeltaStreamed(data, DEFAULT_CODECS, (offset, liveCount) => {
+    observed.push([offset, liveCount]);
+  });
+  assert.deepEqual(observed, expected);
 });
 
 test("streamed validation checks timeline adjacency after sorting state intervals", async () => {

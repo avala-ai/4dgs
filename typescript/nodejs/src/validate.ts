@@ -43,6 +43,7 @@ import {
   RECORD_HEADER_BYTES,
   bytesEqual,
   checkMagic,
+  checkTiling,
   checkQuantizationScheme,
   checkTemporalModel,
   chunkStreamBytes,
@@ -210,7 +211,7 @@ export async function validateFile(
   let counted = 0;
   const index: ChunkIndexEntry[] = [];
   let firstIndexOffset: number | null = null;
-  let firstSummaryOffset: number | null = null;
+  const summaryOffsetOffsets: number[] = [];
   const physicalChunkOffsets: number[] = [];
   const physicalChunks = new Map<
     number,
@@ -381,10 +382,10 @@ export async function validateFile(
             header: parsed.header,
           });
           decodedShChunk = {
-            ordinal: chunkCount,
+            ordinal: physicalChunkOffsets.length,
             count: parsed.header.count,
             bands: new Map<number, Int32Array>(),
-            decoded: false,
+            decoded: options.decode === true && header?.temporalModel === "keyframe-delta",
           };
           if (parsed.header.t1 < parsed.header.t0) {
             found.error(
@@ -430,6 +431,12 @@ export async function validateFile(
             length: record.length,
             header: parsed.header,
           });
+          decodedShChunk = {
+            ordinal: physicalChunkOffsets.length,
+            count: parsed.header.birthCount,
+            bands: new Map<number, Int32Array>(),
+            decoded: options.decode === true,
+          };
           if (header !== null && header.temporalModel !== "keyframe-delta") {
             found.error(
               `Delta Chunk at byte ${offset} is not legal under temporal_model ` +
@@ -476,7 +483,14 @@ export async function validateFile(
             }
             if (options.decode !== true || decodedShChunk === null) break;
             if (band < 1 || band > MAX_SH_DEGREE) break;
-            const values = await decodeStream(frameOneStream(parsedBand.cursor), DEFAULT_CODECS);
+            const framedBand = frameOneStream(parsedBand.cursor);
+            if (framedBand.attributeId !== Opcode.ShBandStream) {
+              found.error(
+                `SH Band Stream at byte ${offset} declares nested attribute_id ` +
+                  `${framedBand.attributeId}; version 1 fixes it at ${Opcode.ShBandStream}`,
+              );
+            }
+            const values = await decodeStream(framedBand, DEFAULT_CODECS);
             decodedShChunk.bands.set(band, values);
           } catch (error) {
             found.error(`chunk ${chunkCount} SH band ${band} does not decode: ${message(error)}`);
@@ -608,7 +622,7 @@ export async function validateFile(
           });
           break;
         case Opcode.SummaryOffset:
-          firstSummaryOffset ??= offset;
+          summaryOffsetOffsets.push(offset);
           await parseInto(found, "SummaryOffset", offset, async () => {
             parseSummaryOffset(await content());
           });
@@ -737,10 +751,39 @@ export async function validateFile(
     }
   }
 
-  if (options.decode === true && header?.temporalModel === "keyframe-delta") {
+  if (header?.temporalModel === "keyframe-delta") {
+    const intervals =
+      index.length > 0
+        ? index
+        : [...physicalChunks.values()].map(({ header: stateHeader }) => ({
+            t0: stateHeader.t0,
+            t1: stateHeader.t1,
+          }));
     try {
-      await validateKeyframeDeltaStreamed(source, DEFAULT_CODECS);
+      checkTiling(intervals, header.durationSec, true);
     } catch (error) {
+      found.error(`keyframe-delta timeline does not tile the scene clock: ${message(error)}`);
+    }
+  }
+
+  if (options.decode === true && header?.temporalModel === "keyframe-delta") {
+    const liveCounts = new Map<number, number>();
+    try {
+      await validateKeyframeDeltaStreamed(source, DEFAULT_CODECS, (offset, liveCount) => {
+        liveCounts.set(offset, liveCount);
+      });
+      index.forEach((entry, i) => {
+        if (!entry.extended) return;
+        const composed = liveCounts.get(entry.chunkOffset);
+        if (composed !== undefined && entry.liveCount !== composed) {
+          found.error(
+            `chunk index entry ${i} declares live_count ${entry.liveCount}; composing the ` +
+              `state at ${entry.chunkOffset} produces ${composed} gaussians`,
+          );
+        }
+      });
+    } catch (error) {
+      if (error instanceof RangeError) throw error;
       found.error(`keyframe-delta timeline does not decode: ${message(error)}`);
       const at =
         keyframeDeltaValidationRecordOffset(error) ?? physicalChunkOffsets[0] ?? MAGIC.length;
@@ -964,7 +1007,20 @@ export async function validateFile(
   }
 
   if (footer !== null) {
-    const expectedSummaryOffset = firstSummaryOffset ?? 0;
+    const tail = size - FOOTER_TAIL_BYTES;
+    const summaryOffsetsInSummary = summaryOffsetOffsets.filter(
+      (offset) => footer!.summaryStart !== 0 && offset >= footer!.summaryStart && offset < tail,
+    );
+    const summaryOffsetSet = new Set(summaryOffsetsInSummary);
+    for (const offset of summaryOffsetOffsets) {
+      if (!summaryOffsetSet.has(offset)) {
+        found.error(
+          `Summary Offset record at byte ${offset} lies outside the declared summary ` +
+            `[${footer.summaryStart}, ${tail}) (§5.2)`,
+        );
+      }
+    }
+    const expectedSummaryOffset = summaryOffsetsInSummary[0] ?? 0;
     if (footer.summaryOffsetStart !== expectedSummaryOffset) {
       found.error(
         `the Footer's summary_offset_start is ${footer.summaryOffsetStart}; the first Summary ` +
@@ -1022,6 +1078,18 @@ function checkKeyframeDeltaIndexChains(
       continue;
     }
     if (entry.kind === 0) {
+      if (entry.deltaMode !== 0) {
+        found.error(
+          `the keyframe index entry at ${entry.chunkOffset} declares delta_mode ` +
+            `${entry.deltaMode}; a keyframe must declare 0`,
+        );
+      }
+      if (entry.referenceOffset !== 0) {
+        found.error(
+          `the keyframe index entry at ${entry.chunkOffset} declares reference_offset ` +
+            `${entry.referenceOffset}; a keyframe must declare 0`,
+        );
+      }
       if (entry.depth !== 0) {
         found.error(
           `the keyframe index entry at ${entry.chunkOffset} declares depth ${entry.depth}; ` +
@@ -1256,6 +1324,12 @@ function checkQuantizationFinite(quant: Quantization, found: Findings, ordinal: 
  * coincidence, and on a file with no coefficients that is a false alarm waiting to happen.
  */
 function checkShBitDepths(quant: Quantization, shDegree: number, found: Findings): void {
+  if (quant.shBitDepthsMalformed) {
+    found.error(
+      "Quantization carries a malformed SH bit-depth declaration; the count must fit the " +
+        "record and every depth must be in 3..8 (§5.3)",
+    );
+  }
   if (quant.shBitDepths.length === 0 || shDegree <= 0) return;
   if (quant.shBitDepths.length !== shDegree) {
     found.error(
