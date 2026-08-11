@@ -41,7 +41,7 @@ import {
   shStep,
   type IReadable,
 } from "@4dgs/core";
-import { inspectFile } from "@4dgs/nodejs";
+import { inspectFile, validateFile } from "@4dgs/nodejs";
 import {
   EXIT_FAILED,
   EXIT_OK,
@@ -297,13 +297,13 @@ test("the summary checksum is reported per record and as a verdict", async (t) =
  * Not this tool's opinion: the Rust (#168), Python (#178), C++ (#183), Swift (#188) and
  * Dart (#191) validators answer these same seven numbers, which is what makes the byte
  * part of the refusal rather than a per-language detail. `FutureMajorVersion` is `0` and
- * not `5` on purpose — the refusal is about the magic, and the magic starts at 0. The
+ * version byte is named at byte 5; the fixed sentinel as a whole is named at byte 0. The
  * identifiers are not written here at all; they are read out of the corpus.
  */
 const REFUSED_AT: Readonly<Record<string, number>> = {
   BadMagic: 0,
   EmptyTemporalModel: 8,
-  FutureMajorVersion: 0,
+  FutureMajorVersion: 5,
   UnknownQuantizationScheme: 154,
   UnknownStreamCodec: 659,
   UnknownTemporalModel: 8,
@@ -419,7 +419,7 @@ test("a truncated file reports what was decodable and that it was cut", async (t
       "error: file does not end with the magic; it is truncated or was written by a broken encoder",
     ),
   );
-  assert.ok(validated.out.some((line) => line.startsWith("error: stopped reading: need ")));
+  assert.ok(validated.out.some((line) => line.startsWith("error: stopped reading: ")));
   // A cut file is not a refusal: nothing in the refusal table names "the bytes ran out".
   assert.ok(!validated.out.some((line) => line.startsWith("refused: ")));
 });
@@ -433,7 +433,7 @@ test("a conforming file validates clean, and a warning gets its own exit code", 
     return t.skip("corpus not generated");
   }
 
-  for (const path of [clean, audio]) {
+  for (const path of [clean, audio, delta]) {
     const validated = await run("validate", "--decode", path);
     assert.equal(validated.code, EXIT_OK, path);
     assert.equal(validated.out.at(-1), "valid", path);
@@ -1010,6 +1010,96 @@ test("unit: inspect refuses a resource size that cannot be represented exactly",
     );
     return true;
   });
+});
+
+test("unit: inspect and validate range-read instead of retaining the resource", async (t) => {
+  const path = corpus("OneWindow-UseChunkIndex-UseCrc-WithLargeAudio");
+  if (path === null) return t.skip("corpus not generated");
+  const data = new Uint8Array(readFileSync(path));
+  let largestRead = 0;
+  const source: IReadable = {
+    size: () => Promise.resolve(BigInt(data.length)),
+    read: (offset, length) => {
+      largestRead = Math.max(largestRead, Number(length));
+      const at = Number(offset);
+      return Promise.resolve(data.subarray(at, at + Number(length)));
+    },
+  };
+  let rows = 0;
+  const inspected = await inspectFile(source, () => {
+    rows += 1;
+  });
+  assert.equal(rows, inspected.recordCount);
+  const validated = await validateFile(source);
+  assert.equal(validated.ok, true);
+  assert.ok(largestRead < data.length, `one range read buffered all ${data.length} bytes`);
+});
+
+test("regression: illegal top-level structures and malformed known records are refused", (t) => {
+  const path = corpus("TenWindows-UseChunkIndex-UseCrc");
+  if (path === null || !existsSync(EXECUTABLE)) return t.skip("corpus not generated");
+  const original = bytesOf("TenWindows-UseChunkIndex-UseCrc");
+  const summary = parseFooter(
+    original.subarray(original.length - FOOTER_TAIL_BYTES + RECORD_HEADER_BYTES),
+  ).summaryStart;
+
+  for (const [name, record, expected] of [
+    [
+      "TopLevelAttributeStream",
+      framedRecord(Opcode.AttributeStream, new Uint8Array(0)),
+      "not a legal top-level record",
+    ],
+    ["MalformedCamera", framedRecord(Opcode.Camera, new Uint8Array(0)), "Camera does not parse"],
+  ] as const) {
+    const changed = splice(original.slice(), summary, record);
+    const verdict = validated(file(`${name}.4dgs`, resealSummary(changed, record.length)));
+    assert.equal(verdict.code, EXIT_FAILED);
+    assert.ok(
+      verdict.out.some((line) => line.includes(expected)),
+      verdict.out.join("\n"),
+    );
+  }
+
+  const header = recordsOf(original)[0]!;
+  const duplicateHeader = original.slice(header.offset, header.offset + header.length);
+  const doubled = splice(original.slice(), header.offset + header.length, duplicateHeader);
+  const duplicateVerdict = validated(
+    file("DuplicateHeader.4dgs", resealSummary(doubled, duplicateHeader.length)),
+  );
+  assert.equal(duplicateVerdict.code, EXIT_FAILED);
+  assert.ok(
+    duplicateVerdict.out.some((line) => line.includes("the first and only Header")),
+    duplicateVerdict.out.join("\n"),
+  );
+
+  const badSummaryOffset = original.slice();
+  const footerContent = badSummaryOffset.length - FOOTER_TAIL_BYTES + RECORD_HEADER_BYTES;
+  new DataView(
+    badSummaryOffset.buffer,
+    badSummaryOffset.byteOffset,
+    badSummaryOffset.byteLength,
+  ).setBigUint64(footerContent + 8, 1n, true);
+  const footerVerdict = validated(file("BadSummaryOffsetStart.4dgs", badSummaryOffset));
+  assert.equal(footerVerdict.code, EXIT_FAILED);
+  assert.ok(
+    footerVerdict.out.some((line) => line.includes("summary_offset_start is 1")),
+    footerVerdict.out.join("\n"),
+  );
+});
+
+test("unit: inspect reports an inexact record length at that record's byte", async () => {
+  const bytes = new Uint8Array(MAGIC.length + RECORD_HEADER_BYTES);
+  bytes.set(MAGIC);
+  bytes[MAGIC.length] = Opcode.Chunk;
+  new DataView(bytes.buffer).setBigUint64(MAGIC.length + 1, 1n << 60n, true);
+  const report = await inspectFile({
+    size: () => Promise.resolve(BigInt(bytes.length)),
+    read: (offset, length) => {
+      const at = Number(offset);
+      return Promise.resolve(bytes.subarray(at, at + Number(length)));
+    },
+  });
+  assert.match(report.stopped!, /offset 9 exceeds 2\^53/);
 });
 
 test("unit: the appended SH bit depths are parsed, tolerantly", (t) => {

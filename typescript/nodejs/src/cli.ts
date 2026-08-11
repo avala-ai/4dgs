@@ -22,11 +22,10 @@
  */
 
 import { realpathSync } from "node:fs";
-import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { FourdgsError } from "@4dgs/core";
 import { FileHandleReadable } from "./index.js";
-import { inspectFile, type InspectReport } from "./inspect.js";
+import { inspectFile, type InspectedRecord, type InspectReport } from "./inspect.js";
 import { validateFile, type Report } from "./validate.js";
 
 /**
@@ -145,7 +144,9 @@ export async function main(argv: readonly string[], sink: Sink = CONSOLE): Promi
     if (error instanceof FourdgsError) {
       sink.err(`4dgs: ${args.file}: ${error.message}`);
       if (error.refusalCode !== undefined) {
-        sink.err(`4dgs: refused: ${error.refusalCode} at byte 0 (the file magic)`);
+        const at = error.refusalCode === "unsupported-major-version" ? 5 : 0;
+        const where = at === 5 ? "the major-version byte" : "the file magic";
+        sink.err(`4dgs: refused: ${error.refusalCode} at byte ${at} (${where})`);
       }
       return EXIT_FAILED;
     }
@@ -158,12 +159,10 @@ async function inspect(args: Args, sink: Sink): Promise<number> {
   const source = await FileHandleReadable.open(args.file);
   let report: InspectReport;
   try {
-    report = await inspectFile(source);
+    report = args.json ? await inspectJson(source, sink) : await inspectText(source, sink);
   } finally {
     await source.close();
   }
-  if (args.json) printInspectJson(report, sink);
-  else printInspectText(report, sink);
   if (report.stopped !== null) {
     sink.err(`4dgs: stopped: ${report.stopped}`);
     return EXIT_FAILED;
@@ -176,8 +175,13 @@ async function inspect(args: Args, sink: Sink): Promise<number> {
 }
 
 async function validate(args: Args, sink: Sink): Promise<number> {
-  const data = await readFile(args.file);
-  const report = await validateFile(data, { decode: args.decode });
+  const source = await FileHandleReadable.open(args.file);
+  let report: Report;
+  try {
+    report = await validateFile(source, { decode: args.decode });
+  } finally {
+    await source.close();
+  }
   print(report, sink);
   if (!report.ok) {
     sink.err("INVALID");
@@ -226,28 +230,31 @@ function pad(text: string, width: number, right = true): string {
  * this record under the file's checksum" and framing alone cannot. It is appended rather
  * than inserted, so a script reading the first four columns reads the same four.
  */
-function printInspectText(report: InspectReport, sink: Sink): void {
-  const summary = report.summaryCrc;
-  const crcOf = (covered: boolean): string =>
-    !covered ? "" : summary !== null && summary.ok ? "ok" : "MISMATCH";
+async function inspectText(source: FileHandleReadable, sink: Sink): Promise<InspectReport> {
+  const crcOf = (record: InspectedRecord): string =>
+    !record.covered ? "" : record.summaryOk === true ? "ok" : "MISMATCH";
   const line = (a: string, b: string, c: string, d: string, e: string): void =>
     sink.out(`${pad(a, 12)}  ${pad(b, 18, false)} ${pad(c, 14)}  ${pad(d, 14)}  ${e}`.trimEnd());
 
   line("offset", "record", "content", "total", "crc");
   line("0", "(magic)", "", "8", "");
-  for (const record of report.records) {
+  const report = await inspectFile(source, (record) => {
+    // `covered` was computed from the checksum report before the record walk, so the row
+    // can be emitted and forgotten immediately. This keeps one short record from becoming
+    // one retained object for the lifetime of an arbitrarily large file.
     line(
       commas(record.offset),
       record.name,
       commas(record.contentLength),
       commas(record.totalLength),
-      crcOf(record.covered),
+      crcOf(record),
     );
-  }
+  });
+  const summary = report.summaryCrc;
   if (report.trailingMagic) line(commas(report.size - 8), "(magic)", "", "8", "");
 
   const cut = report.stopped !== null ? " (the last record is incomplete)" : "";
-  sink.out(`\n${report.records.length} records, ${commas(report.size)} bytes${cut}`);
+  sink.out(`\n${report.recordCount} records, ${commas(report.size)} bytes${cut}`);
   if (summary === null) {
     sink.out(`summary crc    none — ${report.summaryCrcAbsent ?? "unavailable"}`);
   } else {
@@ -259,40 +266,45 @@ function printInspectText(report: InspectReport, sink: Sink): void {
   if (!report.trailingMagic && report.stopped === null) {
     sink.out("note: the file does not end with the magic");
   }
+  return report;
 }
 
-function printInspectJson(report: InspectReport, sink: Sink): void {
+async function inspectJson(source: FileHandleReadable, sink: Sink): Promise<InspectReport> {
+  sink.out('{"records":[');
+  let first = true;
+  const report = await inspectFile(source, (record) => {
+    sink.out(`${first ? "" : ","}${JSON.stringify(jsonRecord(record))}`);
+    first = false;
+  });
   const summary = report.summaryCrc;
   sink.out(
-    JSON.stringify(
-      {
-        size: report.size,
-        trailing_magic: report.trailingMagic,
-        stopped: report.stopped,
-        summary_crc_absent: report.summaryCrcAbsent,
-        summary_crc:
-          summary === null
-            ? null
-            : {
-                start: summary.start,
-                end: summary.end,
-                declared: summary.declared,
-                actual: summary.actual,
-                ok: summary.ok,
-              },
-        records: report.records.map((record) => ({
-          offset: record.offset,
-          opcode: record.opcode,
-          name: record.name,
-          content_length: record.contentLength,
-          total_length: record.totalLength,
-          crc_covered: record.covered,
-        })),
-      },
-      null,
-      2,
-    ),
+    `],"size":${report.size},"trailing_magic":${report.trailingMagic},` +
+      `"stopped":${JSON.stringify(report.stopped)},` +
+      `"summary_crc_absent":${JSON.stringify(report.summaryCrcAbsent)},` +
+      `"summary_crc":${JSON.stringify(
+        summary === null
+          ? null
+          : {
+              start: summary.start,
+              end: summary.end,
+              declared: summary.declared,
+              actual: summary.actual,
+              ok: summary.ok,
+            },
+      )}}`,
   );
+  return report;
+}
+
+function jsonRecord(record: InspectedRecord): Record<string, unknown> {
+  return {
+    offset: record.offset,
+    opcode: record.opcode,
+    name: record.name,
+    content_length: record.contentLength,
+    total_length: record.totalLength,
+    crc_covered: record.covered,
+  };
 }
 
 /**

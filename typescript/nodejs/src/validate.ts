@@ -15,10 +15,8 @@
  * the byte it fired at: the messages a library raises are each language's own, so the
  * identifier is the only part of a refusal two implementations can be compared on.
  *
- * The whole file is held in memory here, which no decode path in this package does. A
- * validator is not a decode path: the summary checksum covers a byte range, the index
- * points into one, and "is this file self-consistent" is a question about all of it at
- * once. The Python and Rust validators read the file the same way, for the same reason.
+ * The walk is range-backed. It retains the small cross-record tables needed for semantic
+ * checks, but record bodies and checksum blocks are fetched one at a time and released.
  */
 
 import {
@@ -30,6 +28,7 @@ import {
   DEFAULT_CUTOFF,
   FOOTER_TAIL_BYTES,
   FourdgsError,
+  FrontMatterScanner,
   HEADER_FLAG_CHUNKS_COMPRESSED,
   HEADER_FLAG_HAS_AUDIO,
   IndexedDecoder,
@@ -50,33 +49,41 @@ import {
   frameOneStream,
   isPrivateOpcode,
   isProvenanceOpcode,
-  iterateRecords,
   mergeBands,
   opcodeName,
-  parseAudioData,
   parseAudioSource,
+  parseCamera,
   parseChunk,
   parseChunkIndexEntry,
   parseCoordinateFrame,
+  parseDeltaChunk,
   parseFooter,
   parseGeodeticAnchor,
   parseHeader,
+  parseMetadata,
   parseObjectTable,
   parseObjectTrack,
   parseQuantization,
   parseRigTrajectory,
   parseSensorCalibration,
   parseShBandRecord,
+  parseStatistics,
+  parseSummaryOffset,
   parseWindowTable,
   shBound,
   shStep,
   stepsFrom,
   supportK,
+  validateKeyframeDeltaStreamed,
   windowTableOrDefault,
   type AudioSourceDescriptor,
   type ChunkIndexEntry,
+  type ChunkHeader,
+  type DeltaChunkHeader,
   type Footer,
+  type FrontMatterRecord,
   type Header,
+  type IReadable,
   type Quantization,
   type RefusalCode,
 } from "@4dgs/core";
@@ -152,26 +159,45 @@ class Findings {
 
 /** Every check, in the Python validator's order. */
 export async function validateFile(
-  data: Uint8Array,
+  input: IReadable | Uint8Array,
   options: ValidateOptions = {},
 ): Promise<Report> {
+  const source = input instanceof Uint8Array ? new BytesReadable(input) : input;
   const found = new Findings();
+  const sizeBig = await source.size();
+  if (sizeBig > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new RangeError(
+      `resource size ${sizeBig} exceeds the largest exactly addressable size ` +
+        `${Number.MAX_SAFE_INTEGER} in this implementation`,
+    );
+  }
+  const size = Number(sizeBig);
+  const scanner = new FrontMatterScanner(source, size, VALIDATION_PROBE_BYTES);
   try {
-    checkMagic(data);
+    checkMagic(await scanner.head(MAGIC.length));
   } catch (error) {
     found.error(message(error));
-    found.refuse(error, 0, "the file magic");
+    const at =
+      error instanceof FourdgsError && error.refusalCode === "unsupported-major-version" ? 5 : 0;
+    found.refuse(error, at, at === 5 ? "the major-version byte" : "the file magic");
     return report(found);
   }
 
-  if (!bytesEqual(data.subarray(data.length - MAGIC.length), MAGIC)) {
+  if (
+    size < MAGIC.length ||
+    !bytesEqual(await source.read(BigInt(size - MAGIC.length), BigInt(MAGIC.length)), MAGIC)
+  ) {
     found.error(
       "file does not end with the magic; it is truncated or was written by a broken encoder",
     );
   }
 
-  const seen: number[] = [];
-  const topLevelOffsets = new Set<number>();
+  let recordCount = 0;
+  let firstOpcode: number | null = null;
+  let lastOpcode: number | null = null;
+  let headerCount = 0;
+  let footerCount = 0;
+  let hasLegacyAudio = false;
   let header: Header | null = null;
   let quantization: Quantization | null = null;
   let quantizationCount = 0;
@@ -181,11 +207,21 @@ export async function validateFile(
   let counted = 0;
   const index: ChunkIndexEntry[] = [];
   let firstIndexOffset: number | null = null;
+  let firstSummaryOffset: number | null = null;
   const physicalChunkOffsets: number[] = [];
+  const physicalChunks = new Map<
+    number,
+    {
+      readonly opcode: number;
+      readonly length: number;
+      readonly header: ChunkHeader | DeltaChunkHeader;
+    }
+  >();
   const physicalBands = new Map<
     number,
     { readonly band: number; readonly offset: number; readonly length: number }[]
   >();
+  const physicalBandRecords = new Map<number, { readonly band: number; readonly length: number }>();
   let currentChunkOffset: number | null = null;
   const audioSources = new Map<number, AudioSourceDescriptor>();
   const audioData = new Map<number, number>();
@@ -193,17 +229,40 @@ export async function validateFile(
   const emptyTrajectories: string[] = [];
   const objects = new ObjectLayer();
   let firstChunkSeen = false;
-  const decodedShChunks: {
+  let decodedShChunk: {
+    readonly ordinal: number;
     readonly count: number;
     readonly bands: Map<number, Int32Array>;
     decoded: boolean;
-  }[] = [];
+  } | null = null;
+  const decodedShDegrees = new Set<number>();
+  let frozenDecodeOptions: {
+    readonly header: Header;
+    readonly quantization: Quantization;
+    readonly windows: Float64Array;
+  } | null = null;
+  let decodeOptionsFrozen = false;
 
   try {
-    for (const record of iterateRecords(data, MAGIC.length)) {
-      seen.push(record.opcode);
-      const { content, offset } = record;
-      topLevelOffsets.add(offset);
+    for await (const framed of scanner.records(MAGIC.length)) {
+      recordCount += 1;
+      firstOpcode ??= framed.opcode;
+      lastOpcode = framed.opcode;
+      const record = {
+        opcode: framed.opcode,
+        offset: framed.offset,
+        length: framed.totalLength,
+      };
+      const { offset } = record;
+      let contentValue: Uint8Array | null = null;
+      const content = async (): Promise<Uint8Array> => {
+        contentValue ??= await scanner.content(framed);
+        return contentValue;
+      };
+      if (record.opcode !== Opcode.ShBandStream && decodedShChunk !== null) {
+        finalizeDecodedShChunk(decodedShChunk, decodedShDegrees, found);
+        decodedShChunk = null;
+      }
       // An SH Band Stream belongs only to the Chunk immediately before the run of band
       // records. Any other top-level record ends that run.
       if (record.opcode !== Opcode.Chunk && record.opcode !== Opcode.ShBandStream) {
@@ -213,8 +272,15 @@ export async function validateFile(
       // of a validator is to say everything that is wrong with a file, not the first thing.
       switch (record.opcode) {
         case Opcode.Header:
+          headerCount += 1;
+          if (headerCount > 1) {
+            found.error(
+              `Header record ${headerCount} appears at byte ${offset}; the Header must be ` +
+                "the first and only Header (§4)",
+            );
+          }
           try {
-            header = parseHeader(content);
+            header = parseHeader(await content());
           } catch (error) {
             found.error(`Header does not parse: ${message(error)}`);
             break;
@@ -235,7 +301,9 @@ export async function validateFile(
             }
           }
           try {
-            checkTemporalModel(header.temporalModel);
+            if (header.temporalModel !== "keyframe-delta") {
+              checkTemporalModel(header.temporalModel);
+            }
           } catch (error) {
             found.refuse(error, offset, "the Header record");
           }
@@ -248,7 +316,7 @@ export async function validateFile(
           break;
         case Opcode.Quantization:
           try {
-            quantization = parseQuantization(content);
+            quantization = parseQuantization(await content());
           } catch (error) {
             found.error(`Quantization does not parse: ${message(error)}`);
             break;
@@ -271,7 +339,7 @@ export async function validateFile(
           // Read for the decode pass below, quietly: the Python validator does not parse
           // this record, and a finding it does not have is a disagreement about a file.
           try {
-            windows = parseWindowTable(content);
+            windows = parseWindowTable(await content());
           } catch (error) {
             windows = null;
             if (options.decode === true) {
@@ -284,34 +352,50 @@ export async function validateFile(
           physicalBands.set(offset, []);
           currentChunkOffset = offset;
           firstChunkSeen = true;
+          if (!decodeOptionsFrozen) {
+            frozenDecodeOptions =
+              header === null || quantization === null
+                ? null
+                : { header, quantization, windows: windows ?? new Float64Array(0) };
+            decodeOptionsFrozen = true;
+          }
           chunkCount += 1;
           let parsed;
           try {
-            parsed = parseChunk(content);
+            parsed = parseChunk(await content());
           } catch (error) {
             found.error(`chunk ${chunkCount} does not parse: ${message(error)}`);
             break;
           }
           counted += parsed.header.count;
-          const decodedShChunk = {
+          physicalChunks.set(offset, {
+            opcode: Opcode.Chunk,
+            length: record.length,
+            header: parsed.header,
+          });
+          decodedShChunk = {
+            ordinal: chunkCount,
             count: parsed.header.count,
             bands: new Map<number, Int32Array>(),
             decoded: false,
           };
-          if (options.decode === true) decodedShChunks.push(decodedShChunk);
           if (parsed.header.t1 < parsed.header.t0) {
             found.error(
               `chunk ${chunkCount} has t1 (${parsed.header.t1}) before t0 (${parsed.header.t0})`,
             );
           }
-          if (options.decode === true && header !== null && quantization !== null) {
+          if (
+            options.decode === true &&
+            frozenDecodeOptions !== null &&
+            frozenDecodeOptions.header.temporalModel !== "keyframe-delta"
+          ) {
             try {
               const bytes = await chunkStreamBytes(parsed, DEFAULT_CODECS);
               await decodeChunkStreams(bytes, parsed.header.count, {
-                steps: stepsFrom(quantization),
-                posOrigin: quantization.posOrigin,
-                windows: windowTableOrDefault(windows ?? new Float64Array(0)),
-                supportK: supportK(header.cutoff || DEFAULT_CUTOFF),
+                steps: stepsFrom(frozenDecodeOptions.quantization),
+                posOrigin: frozenDecodeOptions.quantization.posOrigin,
+                windows: windowTableOrDefault(frozenDecodeOptions.windows),
+                supportK: supportK(frozenDecodeOptions.header.cutoff || DEFAULT_CUTOFF),
                 codecs: DEFAULT_CODECS,
               });
               decodedShChunk.decoded = true;
@@ -319,6 +403,31 @@ export async function validateFile(
               found.error(`chunk ${chunkCount} does not decode: ${message(error)}`);
               found.refuse(error, offset, "the Chunk record");
             }
+          }
+          break;
+        }
+        case Opcode.DeltaChunk: {
+          physicalChunkOffsets.push(offset);
+          physicalBands.set(offset, []);
+          currentChunkOffset = null;
+          firstChunkSeen = true;
+          let parsed;
+          try {
+            parsed = parseDeltaChunk(await content());
+          } catch (error) {
+            found.error(`Delta Chunk at byte ${offset} does not parse: ${message(error)}`);
+            break;
+          }
+          physicalChunks.set(offset, {
+            opcode: Opcode.DeltaChunk,
+            length: record.length,
+            header: parsed.header,
+          });
+          if (parsed.header.t1 < parsed.header.t0) {
+            found.error(
+              `Delta Chunk at byte ${offset} has t1 (${parsed.header.t1}) before t0 ` +
+                `(${parsed.header.t0})`,
+            );
           }
           break;
         }
@@ -331,7 +440,7 @@ export async function validateFile(
           // the two a band's stream can raise, for the same reason.
           let band = 0;
           try {
-            const parsedBand = parseShBandRecord(content);
+            const parsedBand = parseShBandRecord(await content());
             band = parsedBand.band;
             if (band < 1 || band > MAX_SH_DEGREE) {
               found.error(
@@ -350,11 +459,12 @@ export async function validateFile(
                 offset,
                 length: record.length,
               });
+              physicalBandRecords.set(offset, { band, length: record.length });
             }
-            if (options.decode !== true || decodedShChunks.length === 0) break;
+            if (options.decode !== true || decodedShChunk === null) break;
             if (band < 1 || band > MAX_SH_DEGREE) break;
             const values = await decodeStream(frameOneStream(parsedBand.cursor), DEFAULT_CODECS);
-            decodedShChunks[decodedShChunks.length - 1]!.bands.set(band, values);
+            decodedShChunk.bands.set(band, values);
           } catch (error) {
             found.error(`chunk ${chunkCount} SH band ${band} does not decode: ${message(error)}`);
             found.refuse(error, offset, "the SH Band Stream record");
@@ -364,14 +474,15 @@ export async function validateFile(
         case Opcode.ChunkIndex:
           firstIndexOffset ??= offset;
           try {
-            index.push(parseChunkIndexEntry(content));
+            index.push(parseChunkIndexEntry(await content()));
           } catch (error) {
             found.error(`a chunk index entry does not parse: ${message(error)}`);
           }
           break;
         case Opcode.Footer:
+          footerCount += 1;
           try {
-            footer = parseFooter(content);
+            footer = parseFooter(await content());
           } catch (error) {
             found.error(`Footer does not parse: ${message(error)}`);
           }
@@ -379,7 +490,7 @@ export async function validateFile(
         case Opcode.AudioSource: {
           let source;
           try {
-            source = parseAudioSource(content);
+            source = parseAudioSource(await content());
           } catch (error) {
             found.error(`Audio Source does not parse: ${message(error)}`);
             break;
@@ -396,7 +507,7 @@ export async function validateFile(
         case Opcode.AudioData: {
           let payload;
           try {
-            payload = parseAudioData(content);
+            payload = await parseAudioDataRecord(source, framed);
           } catch (error) {
             found.error(`Audio Data does not parse: ${message(error)}`);
             break;
@@ -407,7 +518,7 @@ export async function validateFile(
           if (audioData.has(payload.sourceId)) {
             found.error(`Audio Data id ${payload.sourceId} appears more than once`);
           }
-          audioData.set(payload.sourceId, payload.data.length);
+          audioData.set(payload.sourceId, payload.dataLength);
           break;
         }
         // The provenance and object-layer records, parsed for the rules that span more
@@ -419,18 +530,18 @@ export async function validateFile(
         // reports the second without turning unknown-but-legal registry values into
         // malformed bytes.
         case Opcode.CoordinateFrame:
-          parseInto(found, "CoordinateFrame", () => {
-            provenance.frames.push(parseCoordinateFrame(content));
+          await parseInto(found, "CoordinateFrame", async () => {
+            provenance.frames.push(parseCoordinateFrame(await content()));
           });
           break;
         case Opcode.SensorCalibration:
-          parseInto(found, "SensorCalibration", () => {
-            provenance.sensors.push(parseSensorCalibration(content));
+          await parseInto(found, "SensorCalibration", async () => {
+            provenance.sensors.push(parseSensorCalibration(await content()));
           });
           break;
         case Opcode.RigTrajectory:
-          parseInto(found, "RigTrajectory", () => {
-            const trajectory = parseRigTrajectory(content);
+          await parseInto(found, "RigTrajectory", async () => {
+            const trajectory = parseRigTrajectory(await content());
             // §5.15.4 reads a zero-sample trajectory as absent. In
             // particular, it neither collides with another absent record nor
             // shadows a later, real trajectory with the same name.
@@ -439,8 +550,8 @@ export async function validateFile(
           });
           break;
         case Opcode.GeodeticAnchor:
-          parseInto(found, "GeodeticAnchor", () => {
-            provenance.anchors.push(parseGeodeticAnchor(content));
+          await parseInto(found, "GeodeticAnchor", async () => {
+            provenance.anchors.push(parseGeodeticAnchor(await content()));
           });
           break;
         case Opcode.ObjectTable:
@@ -451,24 +562,61 @@ export async function validateFile(
             );
             break;
           }
-          parseInto(found, "ObjectTable", () => {
-            objects.table = parseObjectTable(content);
+          await parseInto(found, "ObjectTable", async () => {
+            objects.table = parseObjectTable(await content());
           });
           break;
         case Opcode.ObjectTrack:
-          parseInto(found, "ObjectTrack", () => {
-            const track = parseObjectTrack(content);
+          await parseInto(found, "ObjectTrack", async () => {
+            const track = parseObjectTrack(await content());
             // §5.15.7 reads a zero-sample track as absent. In particular, two
             // absent records for one id are not two active tracks.
             if (track.times.length > 0) objects.tracks.push(track);
           });
           break;
+        case Opcode.Camera:
+          await parseInto(found, "Camera", async () => {
+            parseCamera(await content());
+          });
+          break;
+        case Opcode.Metadata:
+          await parseInto(found, "Metadata", async () => {
+            parseMetadata(await content());
+          });
+          break;
+        case Opcode.Attachment:
+          await parseInto(found, "Attachment", async () => {
+            await validatePayloadRecord(source, framed, 2, 0);
+          });
+          break;
+        case Opcode.Statistics:
+          await parseInto(found, "Statistics", async () => {
+            parseStatistics(await content());
+          });
+          break;
+        case Opcode.SummaryOffset:
+          firstSummaryOffset ??= offset;
+          await parseInto(found, "SummaryOffset", async () => {
+            parseSummaryOffset(await content());
+          });
+          break;
+        case Opcode.Audio:
+          hasLegacyAudio = true;
+          await parseInto(found, "Audio", async () => {
+            await validatePayloadRecord(source, framed, 1, 8);
+          });
+          break;
         default:
           if (isPrivateOpcode(record.opcode)) {
             found.note(
-              `private record ${hex(record.opcode)} (${content.length} bytes) — skipped, as required`,
+              `private record ${hex(record.opcode)} (${framed.contentLength} bytes) — skipped, as required`,
             );
-          } else if (SPECIFIED.has(record.opcode)) {
+          } else if (ILLEGAL_TOP_LEVEL_OPCODES.has(record.opcode)) {
+            found.error(
+              `${opcodeName(record.opcode)} (${hex(record.opcode)}) is not a legal top-level ` +
+                "record (§5)",
+            );
+          } else if (TOP_LEVEL_OPCODES.has(record.opcode)) {
             // A record this validator has nothing to say about — provenance, the object
             // layer, a camera. Framed, stepped over, not remarked on.
           } else if (isProvenanceOpcode(record.opcode)) {
@@ -485,6 +633,10 @@ export async function validateFile(
   } catch (error) {
     found.error(`stopped reading: ${message(error)}`);
   }
+  if (decodedShChunk !== null) {
+    finalizeDecodedShChunk(decodedShChunk, decodedShDegrees, found);
+    decodedShChunk = null;
+  }
 
   // Decoding each SH stream proves only its framing and codec. The decoded values become
   // gaussian state only after the bands are assembled, and that step enforces the semantic
@@ -492,36 +644,23 @@ export async function validateFile(
   // coefficient count for this chunk, values in the stored u8 range, and one scene-wide
   // degree shared by every chunk.
   if (options.decode === true) {
-    const degrees: number[] = [];
-    decodedShChunks.forEach((chunk, i) => {
-      if (!chunk.decoded) return;
-      try {
-        const degree = mergeBands(chunk.count, chunk.bands, MAX_SH_DEGREE).degree;
-        degrees.push(degree);
-      } catch (error) {
-        found.error(`chunk ${i + 1} SH bands do not assemble: ${message(error)}`);
-      }
-    });
-    if (
-      degrees.length === decodedShChunks.filter((chunk) => chunk.decoded).length &&
-      new Set(degrees).size > 1
-    ) {
-      found.error(`chunks disagree on SH degree: ${[...new Set(degrees)].join(", ")}`);
+    if (decodedShDegrees.size > 1) {
+      found.error(`chunks disagree on SH degree: ${[...decodedShDegrees].join(", ")}`);
     }
-    if (header !== null && degrees.some((degree) => degree !== header!.shDegree)) {
+    if (header !== null && [...decodedShDegrees].some((degree) => degree !== header!.shDegree)) {
       found.error(
-        `chunks assemble SH degree ${[...new Set(degrees)].join(", ")}; the Header ` +
+        `chunks assemble SH degree ${[...decodedShDegrees].join(", ")}; the Header ` +
           `declares degree ${header.shDegree} (§6.5)`,
       );
     }
   }
 
-  if (seen.length === 0) {
+  if (recordCount === 0) {
     found.error("no records at all");
     return report(found);
   }
-  if (seen[0] !== Opcode.Header) {
-    found.error(`first record is ${opcodeName(seen[0]!)}; the Header must come first`);
+  if (firstOpcode !== Opcode.Header) {
+    found.error(`first record is ${opcodeName(firstOpcode!)}; the Header must come first`);
   }
   if (header === null) found.error("no Header record");
   if (quantization === null) found.error("no Quantization record");
@@ -532,16 +671,14 @@ export async function validateFile(
   // and parses its content as Footer fields whatever its opcode. The walk in `inspect.ts`
   // refuses to read a tail that is not a Footer record; this is the same rule, on the same
   // file, from the other tool.
-  if (footer !== null && seen.at(-1) !== Opcode.Footer) {
+  if (footer !== null && lastOpcode !== Opcode.Footer) {
     found.error(
-      `the last record is ${opcodeName(seen.at(-1)!)}; the Footer must be the last record (§4)`,
+      `the last record is ${opcodeName(lastOpcode!)}; the Footer must be the last record (§4)`,
     );
   }
-  const earlyFooter = seen.slice(0, -1).indexOf(Opcode.Footer);
-  if (earlyFooter >= 0) {
+  if (footerCount > 1) {
     found.error(
-      `Footer record ${earlyFooter + 1} is followed by another record; every Footer must be ` +
-        "the last record (§4)",
+      `the file carries ${footerCount} Footer records; every Footer must be the last record (§4)`,
     );
   }
 
@@ -559,11 +696,10 @@ export async function validateFile(
   checkProvenance(provenance, emptyTrajectories, found);
 
   if (header !== null) {
-    if (counted !== header.gaussianCount) {
+    if (header.temporalModel !== "keyframe-delta" && counted !== header.gaussianCount) {
       found.error(`Header declares ${header.gaussianCount} gaussians; chunks contain ${counted}`);
     }
-    const hasAudioRecords =
-      seen.includes(Opcode.Audio) || audioSources.size > 0 || audioData.size > 0;
+    const hasAudioRecords = hasLegacyAudio || audioSources.size > 0 || audioData.size > 0;
     if (header.hasAudio && !hasAudioRecords) {
       found.error(
         "Header says the file has audio, but there is no Audio Source or legacy Audio record",
@@ -587,7 +723,16 @@ export async function validateFile(
       });
     }
   }
-  if (seen.includes(Opcode.Audio) && audioSources.size > 0) {
+
+  if (options.decode === true && header?.temporalModel === "keyframe-delta") {
+    try {
+      await validateKeyframeDeltaStreamed(source, DEFAULT_CODECS);
+    } catch (error) {
+      found.error(`keyframe-delta timeline does not decode: ${message(error)}`);
+      found.refuse(error, physicalChunkOffsets[0] ?? MAGIC.length, "the keyframe-delta timeline");
+    }
+  }
+  if (hasLegacyAudio && audioSources.size > 0) {
     found.error("legacy Audio and Audio Source records must not be mixed");
   }
   for (const [sourceId, source] of audioSources) {
@@ -609,15 +754,14 @@ export async function validateFile(
 
   index.forEach((entry, i) => {
     const chunkEnd = entry.chunkOffset + entry.chunkLength;
-    if (!Number.isSafeInteger(chunkEnd) || chunkEnd > data.length) {
+    const physical = physicalChunks.get(entry.chunkOffset);
+    if (!Number.isSafeInteger(chunkEnd) || chunkEnd > size) {
       found.error(`chunk index entry ${i} points past the end of the file`);
-    } else if (!topLevelOffsets.has(entry.chunkOffset)) {
+    } else if (physical === undefined) {
       found.error(
         `chunk index entry ${i} points at byte ${entry.chunkOffset}, which is not the start ` +
-          `of a top-level record`,
+          `of a top-level record holding a Chunk or Delta Chunk`,
       );
-    } else if (data[entry.chunkOffset] !== Opcode.Chunk) {
-      found.error(`chunk index entry ${i} does not point at a Chunk record`);
     } else {
       // §5.8: "Every offset and length here frames a whole record, opcode byte and
       // content length included, so a reader fetches `[offset, offset + length)` and
@@ -626,34 +770,47 @@ export async function validateFile(
       // `IndexedDecoder.readChunk` range-reads exactly this many bytes before framing
       // them, so the seek path — a first-class read path, not an optimization (AGENTS.md
       // §2) — fails on a file the checks above call conforming.
-      const framed = recordLengthAt(data, entry.chunkOffset);
-      if (framed === null) {
-        found.error(`chunk index entry ${i} does not frame a complete Chunk record`);
-      } else if (framed !== entry.chunkLength) {
+      if (physical.length !== entry.chunkLength) {
         found.error(
           `chunk index entry ${i} declares ${entry.chunkLength} bytes at ` +
-            `${entry.chunkOffset}; the record there is ${framed} bytes (§5.8)`,
+            `${entry.chunkOffset}; the record there is ${physical.length} bytes (§5.8)`,
         );
+      } else if (entry.extended && entry.kind === 1 && physical.opcode !== Opcode.DeltaChunk) {
+        found.error(`chunk index entry ${i} declares a delta but points at a Chunk record`);
+      } else if ((!entry.extended || entry.kind === 0) && physical.opcode !== Opcode.Chunk) {
+        found.error(`chunk index entry ${i} declares a keyframe but points at a Delta Chunk`);
       } else {
-        try {
-          const parsed = parseChunk(
-            data.subarray(entry.chunkOffset + RECORD_HEADER_BYTES, entry.chunkOffset + framed),
-          );
-          if (parsed.header.count !== entry.gaussianCount) {
+        const head = physical.header;
+        if (physical.opcode === Opcode.Chunk) {
+          const chunkHead = head as ChunkHeader;
+          if (chunkHead.count !== entry.gaussianCount) {
             found.error(
               `chunk index entry ${i} declares ${entry.gaussianCount} gaussians; the Chunk ` +
-                `at ${entry.chunkOffset} contains ${parsed.header.count}`,
+                `at ${entry.chunkOffset} contains ${chunkHead.count}`,
             );
           }
-          if (!Object.is(parsed.header.t0, entry.t0) || !Object.is(parsed.header.t1, entry.t1)) {
-            found.error(
-              `chunk index entry ${i} declares interval [${entry.t0}, ${entry.t1}); the Chunk ` +
-                `at ${entry.chunkOffset} declares [${parsed.header.t0}, ${parsed.header.t1})`,
-            );
+        } else {
+          const deltaHead = head as DeltaChunkHeader;
+          const fields: readonly (readonly [string, number, number])[] = [
+            ["delta_mode", entry.deltaMode, deltaHead.deltaMode],
+            ["reference_offset", entry.referenceOffset, deltaHead.referenceOffset],
+            ["keyframe_offset", entry.keyframeOffset, deltaHead.keyframeOffset],
+            ["depth", entry.depth, deltaHead.depth],
+          ];
+          for (const [name, indexed, actual] of fields) {
+            if (indexed !== actual) {
+              found.error(
+                `chunk index entry ${i} declares ${name}=${indexed}; the Delta Chunk at ` +
+                  `${entry.chunkOffset} declares ${name}=${actual}`,
+              );
+            }
           }
-        } catch (error) {
+        }
+        if (!Object.is(head.t0, entry.t0) || !Object.is(head.t1, entry.t1)) {
           found.error(
-            `chunk index entry ${i} references a Chunk that does not parse: ${message(error)}`,
+            `chunk index entry ${i} declares interval [${entry.t0}, ${entry.t1}); the ` +
+              `${opcodeName(physical.opcode)} at ${entry.chunkOffset} declares ` +
+              `[${head.t0}, ${head.t1})`,
           );
         }
       }
@@ -662,42 +819,27 @@ export async function validateFile(
     entry.bands.forEach((band, j) => {
       const bandEnd = band.offset + band.length;
       const where = `chunk index entry ${i} SH band range ${j}`;
-      if (!Number.isSafeInteger(bandEnd) || bandEnd > data.length) {
+      if (!Number.isSafeInteger(bandEnd) || bandEnd > size) {
         found.error(`${where} points past the end of the file`);
         return;
       }
-      if (!topLevelOffsets.has(band.offset)) {
+      const physicalBand = physicalBandRecords.get(band.offset);
+      if (physicalBand === undefined) {
         found.error(`${where} does not point at the start of a top-level record`);
         return;
       }
-      if (data[band.offset] !== Opcode.ShBandStream) {
-        found.error(`${where} does not point at an SH Band Stream record`);
-        return;
-      }
-      const framed = recordLengthAt(data, band.offset);
-      if (framed === null) {
-        found.error(`${where} does not frame a complete SH Band Stream record`);
-        return;
-      }
-      if (framed !== band.length) {
+      if (physicalBand.length !== band.length) {
         found.error(
           `${where} declares ${band.length} bytes at ${band.offset}; the record there is ` +
-            `${framed} bytes (§5.8)`,
+            `${physicalBand.length} bytes (§5.8)`,
         );
         return;
       }
-      try {
-        const parsed = parseShBandRecord(
-          data.subarray(band.offset + RECORD_HEADER_BYTES, band.offset + framed),
+      if (physicalBand.band !== band.band) {
+        found.error(
+          `${where} says band ${band.band}; the record at ${band.offset} says band ` +
+            `${physicalBand.band}`,
         );
-        if (parsed.band !== band.band) {
-          found.error(
-            `${where} says band ${band.band}; the record at ${band.offset} says band ` +
-              `${parsed.band}`,
-          );
-        }
-      } catch (error) {
-        found.error(`${where} references a record that does not parse: ${message(error)}`);
       }
     });
   });
@@ -720,9 +862,9 @@ export async function validateFile(
         );
       }
     }
-    const physicalChunks = new Set(physicalChunkOffsets);
+    const physicalChunkSet = new Set(physicalChunkOffsets);
     for (const [chunkOffset, count] of indexedCounts) {
-      if (!physicalChunks.has(chunkOffset)) {
+      if (!physicalChunkSet.has(chunkOffset)) {
         found.error(
           `${count} Chunk Index ${count === 1 ? "entry points" : "entries point"} at byte ` +
             `${chunkOffset}, where there is no physical Chunk`,
@@ -772,14 +914,14 @@ export async function validateFile(
   if (footer !== null && footer.summaryStart !== 0) {
     // The Footer record itself is not covered: nine bytes of framing plus its twenty bytes
     // of content plus the trailing magic.
-    const tail = data.length - FOOTER_TAIL_BYTES;
+    const tail = size - FOOTER_TAIL_BYTES;
     if (footer.summaryStart > tail) {
       found.error(
         `the Footer's summary starts at ${footer.summaryStart}, after the summary ends at ${tail}`,
       );
     } else if (
       footer.summaryCrc !== 0 &&
-      new Crc32().update(data.subarray(footer.summaryStart, tail)).digest() !== footer.summaryCrc
+      (await crcRange(source, footer.summaryStart, tail)) !== footer.summaryCrc
     ) {
       found.error("summary CRC mismatch: the index is untrustworthy (a streamed read still works)");
     }
@@ -794,18 +936,32 @@ export async function validateFile(
           `record starts at ${firstIndexOffset} (§5.2)`,
       );
     }
-    checkSummaryComposition(data, footer.summaryStart, tail, found);
+    await checkSummaryComposition(source, size, footer.summaryStart, tail, found);
+  }
+
+  if (footer !== null) {
+    const expectedSummaryOffset = firstSummaryOffset ?? 0;
+    if (footer.summaryOffsetStart !== expectedSummaryOffset) {
+      found.error(
+        `the Footer's summary_offset_start is ${footer.summaryOffsetStart}; the first Summary ` +
+          `Offset record starts at ${expectedSummaryOffset} (§5.2)`,
+      );
+    }
   }
 
   if (header !== null && index.length === 0) {
     found.warn("no chunk index: this file can only be read front to back, not seeked");
   }
 
-  // Opening the file the way a seeking client would is itself a check.
-  try {
-    await IndexedDecoder.open(new BytesReadable(data));
-  } catch (error) {
-    found.error(`a seeking reader cannot open this file: ${message(error)}`);
+  // Opening the gaussian-birth file the way a seeking client would is itself a check. The
+  // keyframe-delta path above performs its own record/index parity checks; this decoder
+  // intentionally declines that temporal model.
+  if (header?.temporalModel !== "keyframe-delta") {
+    try {
+      await IndexedDecoder.open(source);
+    } catch (error) {
+      found.error(`a seeking reader cannot open this file: ${message(error)}`);
+    }
   }
 
   return report(found);
@@ -815,6 +971,26 @@ interface PhysicalBandRange {
   readonly band: number;
   readonly offset: number;
   readonly length: number;
+}
+
+function finalizeDecodedShChunk(
+  chunk: {
+    readonly ordinal: number;
+    readonly count: number;
+    readonly bands: Map<number, Int32Array>;
+    readonly decoded: boolean;
+  } | null,
+  degrees: Set<number>,
+  found: Findings,
+): void {
+  if (chunk === null || !chunk.decoded) return;
+  try {
+    // Keep only the scalar degree. The decoded coefficient arrays can be several times
+    // larger than their compressed streams and must die with this chunk.
+    degrees.add(mergeBands(chunk.count, chunk.bands, MAX_SH_DEGREE).degree);
+  } catch (error) {
+    found.error(`chunk ${chunk.ordinal} SH bands do not assemble: ${message(error)}`);
+  }
 }
 
 function bandRangeKey(range: PhysicalBandRange): string {
@@ -997,15 +1173,17 @@ function checkShBitDepths(quant: Quantization, shDegree: number, found: Findings
  * while `IndexedDecoder.open` reads the whole declared range in one allocation to find an
  * index inside it.
  */
-function checkSummaryComposition(
-  data: Uint8Array,
+async function checkSummaryComposition(
+  source: IReadable,
+  size: number,
   start: number,
   end: number,
   found: Findings,
-): void {
+): Promise<void> {
   let at = start;
   while (at < end) {
-    const length = recordLengthAt(data, at);
+    const framed = await recordAt(source, size, at);
+    const length = framed?.totalLength ?? null;
     if (length === null || at + length > end) {
       found.error(
         `the summary at ${start} is not a whole run of records; the one at ${at} does not ` +
@@ -1013,9 +1191,9 @@ function checkSummaryComposition(
       );
       return;
     }
-    if (!SUMMARY_OPCODES.has(data[at]!)) {
+    if (!SUMMARY_OPCODES.has(framed!.opcode)) {
       found.error(
-        `the summary carries a ${opcodeName(data[at]!)} record at ${at}; the summary is ` +
+        `the summary carries a ${opcodeName(framed!.opcode)} record at ${at}; the summary is ` +
           `exactly the Chunk Index, Statistics and Summary Offset records (§4.5)`,
       );
       return;
@@ -1035,26 +1213,131 @@ const SUMMARY_OPCODES: ReadonlySet<number> = new Set<number>([
  * The whole length of the record framed at `offset` — header included — or `null` when
  * the bytes there do not frame one inside the file.
  */
-function recordLengthAt(data: Uint8Array, offset: number): number | null {
-  if (offset + RECORD_HEADER_BYTES > data.length) return null;
+async function recordAt(
+  source: IReadable,
+  size: number,
+  offset: number,
+): Promise<FrontMatterRecord | null> {
+  if (offset + RECORD_HEADER_BYTES > size) return null;
   let contentLength: number;
+  let opcode: number;
   try {
-    contentLength = new Cursor(data, offset + 1).u64();
+    const cursor = new Cursor(
+      await source.read(BigInt(offset), BigInt(RECORD_HEADER_BYTES)),
+      0,
+      offset,
+    );
+    opcode = cursor.u8();
+    contentLength = cursor.u64();
   } catch {
     return null;
   }
   const total = contentLength + RECORD_HEADER_BYTES;
-  if (!Number.isSafeInteger(offset + total) || offset + total > data.length) return null;
-  return total;
+  if (!Number.isSafeInteger(offset + total) || offset + total > size) return null;
+  return { opcode, offset, contentLength, totalLength: total };
 }
 
 /** Run a record parser, turning a refusal into a finding rather than an abort. */
-function parseInto(found: Findings, record: string, parse: () => void): void {
+async function parseInto(
+  found: Findings,
+  record: string,
+  parse: () => void | Promise<void>,
+): Promise<void> {
   try {
-    parse();
+    await parse();
   } catch (error) {
     found.error(`${record} does not parse: ${message(error)}`);
   }
+}
+
+async function crcRange(source: IReadable, start: number, end: number): Promise<number> {
+  const crc = new Crc32();
+  for (let at = start; at < end; at += VALIDATION_PROBE_BYTES) {
+    crc.update(await source.read(BigInt(at), BigInt(Math.min(VALIDATION_PROBE_BYTES, end - at))));
+  }
+  return crc.digest();
+}
+
+async function parseAudioDataRecord(
+  source: IReadable,
+  record: FrontMatterRecord,
+): Promise<{ readonly sourceId: number; readonly dataLength: number }> {
+  let at = record.offset + RECORD_HEADER_BYTES;
+  const end = at + record.contentLength;
+  const idBytes = await fixedRecordBytes(source, at, 4, end, "Audio Data source_id");
+  const sourceId = new Cursor(idBytes, 0, at).u32();
+  at += 4;
+  const lengthBytes = await fixedRecordBytes(source, at, 8, end, "Audio Data payload length");
+  const dataLength = new Cursor(lengthBytes, 0, at).u64();
+  at += 8;
+  if (at + dataLength > end) {
+    throw new Error(
+      `Audio Data id ${sourceId} declares ${dataLength} payload bytes at ${at}, only ` +
+        `${end - at} remain in the record`,
+    );
+  }
+  return { sourceId, dataLength };
+}
+
+/** Validate string/string/blob payload framing without ever reading the payload itself. */
+async function validatePayloadRecord(
+  source: IReadable,
+  record: FrontMatterRecord,
+  stringCount: number,
+  fixedBytesAfterStrings: number,
+): Promise<void> {
+  let at = record.offset + RECORD_HEADER_BYTES;
+  const end = at + record.contentLength;
+  for (let i = 0; i < stringCount; i++) at = await validateStringAt(source, at, end);
+  await fixedRecordBytes(source, at, fixedBytesAfterStrings, end, "fixed payload fields");
+  at += fixedBytesAfterStrings;
+  const lengthBytes = await fixedRecordBytes(source, at, 8, end, "payload length");
+  const payloadLength = new Cursor(lengthBytes, 0, at).u64();
+  at += 8;
+  if (at + payloadLength > end) {
+    throw new Error(
+      `payload at byte ${at} declares ${payloadLength} bytes, only ${end - at} remain in ` +
+        `the ${opcodeName(record.opcode)} record`,
+    );
+  }
+}
+
+async function validateStringAt(source: IReadable, at: number, end: number): Promise<number> {
+  const lengthBytes = await fixedRecordBytes(source, at, 4, end, "string length");
+  const length = new Cursor(lengthBytes, 0, at).u32();
+  at += 4;
+  if (at + length > end) {
+    throw new Error(`string at byte ${at} declares ${length} bytes, only ${end - at} remain`);
+  }
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  try {
+    for (let readAt = at; readAt < at + length; readAt += VALIDATION_PROBE_BYTES) {
+      decoder.decode(
+        await source.read(
+          BigInt(readAt),
+          BigInt(Math.min(VALIDATION_PROBE_BYTES, at + length - readAt)),
+        ),
+        { stream: true },
+      );
+    }
+    decoder.decode();
+  } catch {
+    throw new Error(`string at byte ${at} is not valid UTF-8`);
+  }
+  return at + length;
+}
+
+async function fixedRecordBytes(
+  source: IReadable,
+  at: number,
+  length: number,
+  end: number,
+  field: string,
+): Promise<Uint8Array> {
+  if (at + length > end) {
+    throw new Error(`${field} needs ${length} bytes at ${at}, only ${end - at} remain`);
+  }
+  return source.read(BigInt(at), BigInt(length));
 }
 
 /**
@@ -1076,7 +1359,37 @@ function spell(value: number): string {
  * refused — with a note, because a reader silently dropping records is how a file loses
  * half its meaning without anybody noticing.
  */
-const SPECIFIED: ReadonlySet<number> = new Set<number>(Object.values(Opcode));
+const TOP_LEVEL_OPCODES: ReadonlySet<number> = new Set<number>([
+  Opcode.Header,
+  Opcode.Footer,
+  Opcode.Quantization,
+  Opcode.WindowTable,
+  Opcode.Chunk,
+  Opcode.ShBandStream,
+  Opcode.ChunkIndex,
+  Opcode.Camera,
+  Opcode.Audio,
+  Opcode.Metadata,
+  Opcode.Attachment,
+  Opcode.Statistics,
+  Opcode.SummaryOffset,
+  Opcode.AudioSource,
+  Opcode.AudioData,
+  Opcode.DeltaChunk,
+  Opcode.CoordinateFrame,
+  Opcode.SensorCalibration,
+  Opcode.RigTrajectory,
+  Opcode.GeodeticAnchor,
+  Opcode.ObjectTable,
+  Opcode.ObjectTrack,
+]);
+
+const ILLEGAL_TOP_LEVEL_OPCODES: ReadonlySet<number> = new Set<number>([
+  Opcode.AttributeStream,
+  Opcode.AttachmentIndex,
+]);
+
+const VALIDATION_PROBE_BYTES = 64 * 1024;
 
 function hex(opcode: number): string {
   return `0x${opcode.toString(16).padStart(2, "0").toUpperCase()}`;

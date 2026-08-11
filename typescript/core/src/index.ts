@@ -259,6 +259,7 @@ export {
   decodeKeyframeDeltaIndexed,
   decodeKeyframeDeltaStreamed,
   keyframeDeltaChunkAt,
+  validateKeyframeDeltaStreamed,
   keyframeDeltaStatesJson,
   reconstructKeyframeDelta,
 } from "./keyframeDelta.js";

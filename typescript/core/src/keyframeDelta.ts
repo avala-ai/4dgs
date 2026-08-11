@@ -54,6 +54,7 @@ import {
   muStep,
   rctInverse,
   supportK,
+  type Steps,
 } from "./quantization.js";
 import {
   DELTA_MODE_CHAINED,
@@ -79,7 +80,7 @@ import {
   parseWindowTable,
   readRecord,
 } from "./records.js";
-import type { IReadable } from "./readable.js";
+import { BytesReadable, type IReadable } from "./readable.js";
 import { Opcode } from "./opcodes.js";
 import { coefficientsInBand, mergeBands, type ShCoefficients } from "./sh.js";
 import { decodeStream, frameOneStream, frameStreams, type RawStream } from "./streams.js";
@@ -1080,6 +1081,128 @@ export async function decodeKeyframeDeltaStreamed(
   // as on the indexed path, so a hole is refused whichever way the file is read (§11.1).
   checkTiling(chunks, header.durationSec);
   return { header, quantization, windows, chunks };
+}
+
+/**
+ * Decode and check a keyframe-delta stream without retaining reconstructed timeline rows.
+ *
+ * Validation needs the same composition rules as the public decoder but not its sequence
+ * result. Keeping only the states addressable inside the current GOP bounds memory by one
+ * reference chain, while `allIds` is bounded by the Header's already-validated population.
+ */
+export async function validateKeyframeDeltaStreamed(
+  input: IReadable | Uint8Array,
+  codecs: CodecRegistry = DEFAULT_CODECS,
+): Promise<number> {
+  const source = input instanceof Uint8Array ? new BytesReadable(input) : input;
+  const sizeBig = await source.size();
+  if (sizeBig > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new RangeError(`keyframe-delta resource size ${sizeBig} exceeds 2^53`);
+  }
+  const size = Number(sizeBig);
+  const scanner = new FrontMatterScanner(source, size, 64 * 1024);
+  checkMagic(await scanner.head(MAGIC.length));
+
+  let header: Header | null = null;
+  let previous: Interval | null = null;
+  let first: Interval | null = null;
+  let last: Interval | null = null;
+  const allIds = new Set<number>();
+  const byOffset = new Map<number, { state: KeyframeDeltaState; level: number }>();
+
+  const remember = (state: KeyframeDeltaState): void => {
+    for (const id of state.ids) {
+      allIds.add(id);
+      if (header !== null && allIds.size > header.gaussianCount) {
+        throw new MalformedFile(
+          `keyframe-delta states introduce more than the Header's ` +
+            `${header.gaussianCount} distinct gaussian ids`,
+        );
+      }
+    }
+  };
+  const interval = (next: Interval): void => {
+    first ??= next;
+    if (previous !== null && previous.t1 !== next.t0) {
+      const what = next.t0 < previous.t1 ? "overlap" : "leave a gap";
+      throw new MalformedFile(
+        `state chunks ${what}: [${previous.t0}, ${previous.t1}) is followed by ` +
+          `[${next.t0}, ${next.t1})`,
+      );
+    }
+    previous = next;
+    last = next;
+  };
+
+  for await (const record of scanner.records(MAGIC.length)) {
+    if (record.opcode === Opcode.Header) {
+      header = parseHeader(await scanner.content(record));
+      if (header.temporalModel !== "keyframe-delta") {
+        throw new MalformedFile(
+          `validateKeyframeDeltaStreamed is the keyframe-delta path; this file is ` +
+            `"${header.temporalModel}"`,
+        );
+      }
+    } else if (record.opcode === Opcode.Chunk) {
+      const content = await scanner.content(record);
+      const parsed = parseChunk(content);
+      const decoded = await keyframeFromChunk(content, codecs);
+      const state = keyframeState(decoded.ids, decoded.bins);
+      // A keyframe begins a new GOP. A conforming later delta can address this keyframe or
+      // a delta after it, never a state from a completed GOP.
+      byOffset.clear();
+      byOffset.set(record.offset, { state, level: parsed.header.level });
+      remember(state);
+      interval(parsed.header);
+    } else if (record.opcode === Opcode.DeltaChunk) {
+      const parsed = parseDeltaChunk(await scanner.content(record));
+      if (parsed.header.referenceOffset >= record.offset) {
+        throw new MalformedFile(
+          `delta chunk at ${record.offset} references ${parsed.header.referenceOffset}, which ` +
+            `is not behind it`,
+        );
+      }
+      const reference = byOffset.get(parsed.header.referenceOffset);
+      if (reference === undefined) {
+        throw new MalformedFile(
+          `delta chunk at ${record.offset} references ${parsed.header.referenceOffset}, which ` +
+            `is not in its current GOP`,
+        );
+      }
+      checkLevelMatch(
+        reference.level,
+        parsed.header.level,
+        record.offset,
+        parsed.header.referenceOffset,
+      );
+      const state = await composeDelta(reference.state, parsed, codecs);
+      byOffset.set(record.offset, { state, level: parsed.header.level });
+      remember(state);
+      interval(parsed.header);
+    }
+  }
+
+  if (header === null) throw new MalformedFile("keyframe-delta file has no Header record");
+  const coveredFirst = first as Interval | null;
+  const coveredLast = last as Interval | null;
+  if (coveredFirst === null || coveredLast === null) {
+    throw new MalformedFile(
+      `a keyframe-delta file declares duration_sec ${header.durationSec} but carries no state chunks`,
+    );
+  }
+  if (coveredFirst.t0 !== 0 || coveredLast.t1 !== header.durationSec) {
+    throw new MalformedFile(
+      `keyframe-delta timeline covers [${coveredFirst.t0}, ${coveredLast.t1}), expected ` +
+        `[0, ${header.durationSec})`,
+    );
+  }
+  if (allIds.size !== header.gaussianCount) {
+    throw new MalformedFile(
+      `Header declares ${header.gaussianCount} distinct gaussian ids; keyframe-delta states ` +
+        `introduce ${allIds.size}`,
+    );
+  }
+  return allIds.size;
 }
 
 /** The result of the indexed read path: the sequence and the index it walked. */

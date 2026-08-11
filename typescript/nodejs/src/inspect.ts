@@ -44,6 +44,8 @@ export interface InspectedRecord {
   readonly totalLength: number;
   /** True when this record lies inside the range the Footer's `summary_crc` covers. */
   readonly covered: boolean;
+  /** The declared summary's verdict, repeated so a streamed row can be printed at once. */
+  readonly summaryOk: boolean | null;
 }
 
 /** The summary checksum, as the Footer declares it and as the bytes actually compute. */
@@ -59,7 +61,8 @@ export interface SummaryCrc {
 
 export interface InspectReport {
   readonly size: number;
-  readonly records: readonly InspectedRecord[];
+  /** Number of records delivered to the caller's sink. */
+  readonly recordCount: number;
   /** True when the last eight bytes are the magic, as a complete file's are. */
   readonly trailingMagic: boolean;
   /**
@@ -91,7 +94,10 @@ const CRC_BLOCK_BYTES = 64 * 1024;
  * version this reader does not implement, has no records to walk. Everything after that is
  * reported rather than raised.
  */
-export async function inspectFile(source: IReadable): Promise<InspectReport> {
+export async function inspectFile(
+  source: IReadable,
+  onRecord: (record: InspectedRecord) => void | Promise<void> = () => {},
+): Promise<InspectReport> {
   const sizeBig = await source.size();
   if (sizeBig > BigInt(Number.MAX_SAFE_INTEGER)) {
     // This is an implementation/address-space limit, not a verdict that the
@@ -109,7 +115,7 @@ export async function inspectFile(source: IReadable): Promise<InspectReport> {
   const summary = await readSummaryCrc(source, size);
   const summaryCrc = typeof summary === "string" ? null : summary;
   const summaryCrcAbsent = typeof summary === "string" ? summary : null;
-  const records: InspectedRecord[] = [];
+  let recordCount = 0;
   let at = MAGIC.length;
   let trailingMagic = false;
   let stopped: string | null = null;
@@ -135,7 +141,7 @@ export async function inspectFile(source: IReadable): Promise<InspectReport> {
       stopped = `${remaining} bytes at ${at} are not a record header`;
       break;
     }
-    const framing = new Cursor(await source.read(BigInt(at), BigInt(RECORD_HEADER_BYTES)));
+    const framing = new Cursor(await source.read(BigInt(at), BigInt(RECORD_HEADER_BYTES)), 0, at);
     const opcode = framing.u8();
     let contentLength: number;
     try {
@@ -152,14 +158,16 @@ export async function inspectFile(source: IReadable): Promise<InspectReport> {
       stopped =
         `the ${opcodeName(opcode)} record at ${at} declares ${contentLength} bytes, ` +
         `past the end of a ${size}-byte file`;
-      records.push(row(opcode, at, contentLength, totalLength, summaryCrc));
+      await onRecord(row(opcode, at, contentLength, totalLength, summaryCrc));
+      recordCount += 1;
       break;
     }
-    records.push(row(opcode, at, contentLength, totalLength, summaryCrc));
+    await onRecord(row(opcode, at, contentLength, totalLength, summaryCrc));
+    recordCount += 1;
     at = end;
   }
 
-  return { size, records, trailingMagic, stopped, summaryCrc, summaryCrcAbsent };
+  return { size, recordCount, trailingMagic, stopped, summaryCrc, summaryCrcAbsent };
 }
 
 function row(
@@ -176,6 +184,7 @@ function row(
     contentLength,
     totalLength,
     covered: summary !== null && offset >= summary.start && offset < summary.end,
+    summaryOk: summary?.ok ?? null,
   };
 }
 
