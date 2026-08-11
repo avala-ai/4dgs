@@ -67,7 +67,7 @@ from .serialization import (
     encode_stream,
     iter_records,
 )
-from .stream_reader import check_window_indices
+from .stream_reader import check_window_indices, chunk_stream_bytes
 
 #: Matches `tests/conformance/canonical.py`: integers are strings so a 64-bit value
 #: survives a double-backed JSON parser, floats are rounded before comparison, a
@@ -614,7 +614,7 @@ def _decode_group(stream_bytes) -> tuple[np.ndarray, dict[int, np.ndarray]]:
 
 def _keyframe_from_chunk(content) -> tuple[np.ndarray, dict[int, np.ndarray]]:
     head, streams = rec.parse_chunk(content)
-    cursor = Cursor(bytes(streams))
+    cursor = Cursor(chunk_stream_bytes(head, streams))
     got: dict[int, np.ndarray] = {}
     while cursor.remaining() > 0:
         attribute_id, values = decode_stream(cursor)
@@ -955,9 +955,30 @@ def compose_chain(
     `decode_indexed`; a caller that wants the verdict calls this per entry and drops what
     it returns.
     """
+    for indexed in index:
+        if indexed.kind not in (0, 1):
+            raise MalformedFile(
+                f"the chunk index entry at {indexed.chunk_offset} declares unknown chunk_kind "
+                f"{indexed.kind}; expected 0 (keyframe) or 1 (delta)",
+                code="unknown-chunk-kind",
+            )
     chain = chain_for(index, (entry.t0 + entry.t1) / 2.0)
+    keyframe_at = chain[0].chunk_offset
+    for link in chain:
+        if link.extended and link.keyframe_offset != keyframe_at:
+            raise MalformedFile(
+                f"the chunk index entry at {link.chunk_offset} declares keyframe_offset "
+                f"{link.keyframe_offset}; its chain reaches the keyframe at {keyframe_at}",
+                code="index-record-mismatch",
+            )
     state: State | None = None
     for link in chain:
+        if link.kind not in (0, 1):
+            raise MalformedFile(
+                f"the chunk index entry at {link.chunk_offset} declares unknown chunk_kind "
+                f"{link.kind}; expected 0 (keyframe) or 1 (delta)",
+                code="unknown-chunk-kind",
+            )
         content = _record_at(data, link.chunk_offset, link.chunk_length)
         opcode = data[link.chunk_offset] if link.chunk_offset < len(data) else None
         want = op.CHUNK if link.kind == 0 else op.DELTA_CHUNK
@@ -969,8 +990,16 @@ def compose_chain(
                 code="index-record-mismatch",
             )
         if link.kind == 0:
+            head = rec.parse_chunk(content)[0]
             ids, bins = _keyframe_from_chunk(content)
             state = keyframe_state(ids, bins)
+            if link.t0 != head.t0 or link.t1 != head.t1:
+                raise MalformedFile(
+                    f"the chunk index entry at {link.chunk_offset} declares interval "
+                    f"[{link.t0}, {link.t1}); the keyframe Chunk record there declares "
+                    f"[{head.t0}, {head.t1})",
+                    code="index-record-mismatch",
+                )
             if link.extended and link.gaussian_count != state.count:
                 raise MalformedFile(
                     f"the chunk index entry at {link.chunk_offset} declares gaussian_count "
@@ -994,7 +1023,37 @@ def compose_chain(
             code="index-record-mismatch",
         )
     check_window_indices_of(state, windows if windows is not None else [])
+    _decode_index_bands(data, entry)
     return state
+
+
+def _decode_index_bands(data: bytes, entry: rec.ChunkIndexEntry) -> None:
+    """Decode and discard every SH band the entry declares."""
+    for declared_band, offset, length in entry.bands:
+        if offset < 0 or length < 9 or offset + length > len(data):
+            raise MalformedFile(
+                f"the chunk index entry at {entry.chunk_offset} points SH band "
+                f"{declared_band} outside the file at [{offset}, {offset + length})",
+                code="index-record-mismatch",
+            )
+        framed = Cursor(data[offset : offset + length])
+        opcode = framed.u8()
+        content_length = framed.u64()
+        if opcode != op.SH_BAND_STREAM or content_length + 9 != length:
+            raise MalformedFile(
+                f"the chunk index entry at {entry.chunk_offset} points SH band "
+                f"{declared_band} at {offset}, which is not one complete SH Band Stream record",
+                code="index-record-mismatch",
+            )
+        band_content = Cursor(framed.take(content_length))
+        record_band = band_content.u8()
+        if record_band != declared_band:
+            raise MalformedFile(
+                f"the chunk index entry at {entry.chunk_offset} declares SH band "
+                f"{declared_band}; the record at {offset} declares band {record_band}",
+                code="index-record-mismatch",
+            )
+        decode_stream(band_content)
 
 
 def scan_streamed(data: bytes):
@@ -1048,6 +1107,11 @@ def scan_streamed(data: bytes):
             # still bound is a population still resident — and this one is the state
             # before last, which nothing else needs once the composition is done.
             reference = None
+        elif record.opcode == op.SH_BAND_STREAM:
+            band = Cursor(record.content)
+            band.u8()
+            decode_stream(band)
+            continue
         else:
             continue
         previous_at, previous_state = record.offset, state

@@ -35,8 +35,22 @@ from fourdgs import opcode as op
 from fourdgs import records as rec
 from fourdgs import refusal
 from fourdgs.cli import main
+from fourdgs.exceptions import UnsupportedCodec
 from fourdgs.keyframe_delta_writer import KeyframeDeltaOptions, Sample
-from fourdgs.serialization import MAGIC, crc32, iter_records, put_record
+from fourdgs.serialization import (
+    CODEC_DEFLATE,
+    MAGIC,
+    compress,
+    crc32,
+    encode_stream,
+    iter_records,
+    put_blob,
+    put_f64,
+    put_record,
+    put_string,
+    put_u32,
+    put_u64,
+)
 from fourdgs.validate import validate
 
 CORPUS = Path(__file__).resolve().parents[3] / "tests" / "conformance" / "data"
@@ -317,6 +331,69 @@ class TestKeyframeDelta:
         report = validate(bytes(patched))
         assert not report.ok
         assert any("declares delta_mode" in f.message for f in report.findings), report.findings
+
+    def test_unknown_chunk_kinds_are_refused_before_dispatch(self):
+        data = _keyframe_file()
+        report = validate(_repack_summary(data, lambda _i, e: _with(e, kind=2) if e.kind == 1 else e))
+        assert not report.ok
+        assert any("unknown chunk_kind 2" in f.message for f in report.findings), report.findings
+
+    def test_a_keyframe_chunk_interval_must_match_its_index_entry(self):
+        data = _keyframe_file()
+        chunk = _first_record(data, op.CHUNK)
+        patched = bytearray(data)
+        struct.pack_into("<d", patched, chunk.offset + 9, 0.25)
+        report = validate(bytes(patched))
+        assert not report.ok
+        assert any("keyframe Chunk record there declares" in f.message for f in report.findings), report.findings
+
+    def test_a_delta_must_name_the_keyframe_its_chain_reaches(self):
+        data = _keyframe_file()
+        entry = next(e for e in _index_entries(data) if e.kind == 1)
+        wrong = entry.keyframe_offset + 1
+        patched = bytearray(data)
+        # Delta Chunk content: t0, t1, level, delta_mode, reference_offset, keyframe_offset.
+        struct.pack_into("<Q", patched, entry.chunk_offset + 9 + 29, wrong)
+        both_wrong = _repack_summary(
+            bytes(patched),
+            lambda _i, e: _with(e, keyframe_offset=wrong) if e.chunk_offset == entry.chunk_offset else e,
+        )
+        report = validate(both_wrong)
+        assert not report.ok
+        assert any("its chain reaches the keyframe" in f.message for f in report.findings), report.findings
+
+    def test_keyframe_chunk_level_compression_is_honored(self):
+        data = _keyframe_file()
+        chunk = _first_record(data, op.CHUNK)
+        head, streams = rec.parse_chunk(chunk.content)
+        raw = bytes(streams)
+        compressed = compress(raw, CODEC_DEFLATE, 6)
+        content = (
+            put_f64(head.t0)
+            + put_f64(head.t1)
+            + put_u32(head.level)
+            + put_u32(head.count)
+            + put_string("deflate")
+            + put_u64(len(raw))
+            + put_blob(compressed)
+        )
+        ids, _bins = kdf._keyframe_from_chunk(content)
+        assert len(ids) == head.count
+
+    def test_indexed_keyframe_delta_bands_are_decoded(self):
+        data = _keyframe_file()
+        index = _index_entries(data)
+        first = index[0]
+        stream = bytearray(
+            encode_stream(op.SH_BAND_STREAM, np.zeros((first.live_count, 3), dtype=np.int64), channels=3, codec=0)
+        )
+        stream[3] = 9  # stream codec
+        band_blob = put_record(op.SH_BAND_STREAM, bytes([1]) + bytes(stream))
+        band_at = len(data)
+        indexed = _with(first, bands=[(1, band_at, len(band_blob))])
+        index[0] = indexed
+        with pytest.raises(UnsupportedCodec, match="unknown stream codec 9"):
+            kdf.compose_chain(data + band_blob, index, indexed)
 
     def test_the_index_and_the_composed_population_must_agree(self):
         """`live_count` is the one index field only a decode can settle: the population
