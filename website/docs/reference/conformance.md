@@ -19,11 +19,12 @@ combinations are **variants**, and for each variant the generator writes two thi
 - `data/<variant>.json`, exactly what a correct decoder must produce from it, committed
 
 A variant's name is its scenario followed by the flags it carries, hyphen-separated —
-`MixedLifetimes-Quantized-SHDegree2-UseChunkIndex-UseCrc`. The name is load-bearing in one place:
-the harness matches fragments of it to decide which runners are asked to answer the variant at all.
-Most variants sit at the top of `data/`; three families live in subdirectories — `data/keyframe/`,
-`data/object/` and `data/invalid/` — and a variant there is named with its directory as a prefix.
-Today that is 46 valid variants at the top level, 4 keyframe-delta, 3 object-layer and 7 invalid.
+`MixedLifetimes-Quantized-SHDegree2-UseChunkIndex-UseCrc`. The name is load-bearing in two places:
+the decode harness matches fragments to select runners, and the encode gate makes its second,
+per-band-depth pass only when the name contains `SHDegree`. Most variants sit at the top of `data/`;
+three families live in subdirectories — `data/keyframe/`, `data/object/` and `data/invalid/` — and a
+variant there is named with its directory as a prefix. Today that is 46 valid variants at the top
+level, 4 keyframe-delta, 3 object-layer and 7 invalid.
 
 ## The corpus is generated, not committed
 
@@ -253,11 +254,13 @@ both over the same corpus, diffing both against the same committed expectation:
 
 The middle column describes the decoder being exercised, not every byte the runner process itself
 touches. Five indexed runners currently materialize the file once to inspect `temporal_model` before
-they construct the ranged reader; the TypeScript runner uses a bounded probe. The byte counters
-inside the indexed runners begin at the ranged reader, so a passing corpus proves that the indexed
-decoder agrees semantically and that its counted reads skip unrequested SH bands. It does **not**
-prove that the command's model-dispatch pre-read was itself ranged. An outside runner should keep
-dispatch bounded; the current harness does not observe or enforce that property.
+they construct the ranged reader; the TypeScript runner uses a bounded probe. The byte counters in
+most indexed runners begin at the ranged reader, so a passing corpus proves that their counted reads
+skip unrequested SH bands. Swift is the exception: its extra check compares the core's
+`bytesForChunk` estimates and does not perform a capped load through a counting transport, so it
+does not prove that the binding honors `bandCap` when reading. None of these counters includes the
+command's model-dispatch pre-read. An outside runner should keep dispatch bounded; the current
+harness does not observe or enforce it.
 
 They are driven separately rather than left to whichever path a core would pick, because **they have
 to be able to disagree**. A streamed reader arrives at the Header front to back; an indexed one
@@ -333,8 +336,8 @@ One thing declining is _not_: **stepping a record over by its length is not decl
 that skips an unknown record correctly finishes the file, decodes every gaussian, and produces a
 summary missing the key that record contributes — and a diff cannot tell that apart from a decoder
 that read the record and got it wrong. Forward compatibility is the right behaviour for a reader in
-the field and the wrong answer for a runner. Decline the variant, take the skip, and let the feature
-matrix say `No`.
+the field and the wrong answer for a runner. Decline the variant, take the skip, and record
+`Planned` or `No` in the feature matrix according to whether that SDK intends to implement it.
 
 ### Refusing a file
 
@@ -361,11 +364,14 @@ and the runner exits 0, because a refusal is a result rather than a crash.
 
 The identifier matters more than it looks. "Both decoders raised an error" is not agreement: one of
 them may have refused for the wrong reason, which is precisely the failure a negative test exists to
-catch. The identifier names the rule, and it is the same string in every language. There are six,
-declared as constants in `mod refusal` in
+catch. The identifier names the rule, and it is the same string in every language. The current
+invalid corpus uses six, declared as constants in `mod refusal` in
 [`rust/fourdgs/src/error.rs`](https://github.com/avala-ai/4dgs/blob/main/rust/fourdgs/src/error.rs)
-and gathered as `CODES` in `invalid.py`. That set is closed: a runner may produce no identifier
-outside it, and a new refusal is added there rather than invented in one language.
+and gathered as `CODES` in `invalid.py`. That registry is closed for these seven expectations: a
+runner may not substitute another identifier for them, and a new invalid-corpus refusal is added
+there rather than invented in one language. Other features have their own named refusals —
+keyframe-delta includes `depth-mismatch`, for example — and future corpus families may exercise
+those without adding them to `invalid.CODES`.
 
 | Invalid variant             | Identifier                    | The rule it breaks                                                     | Where    |
 | --------------------------- | ----------------------------- | ---------------------------------------------------------------------- | -------- |
@@ -385,13 +391,14 @@ language could see it. The two files break the same rule from opposite direction
 refuse both under the same name. A useful side effect: the identifier cannot be derived from the
 variant name, which is as it should be, since it names the rule and not the file.
 
-Only an error carrying one of those six identifiers is a refusal answer. If decoding fails without
-one — a truncated transport, an I/O error, an ordinary parse failure — the runner prints no refusal
-document, writes its diagnosis to stderr and exits non-zero. In particular, `{"refused": ""}` is not
-the representation of an unnamed error: it exits zero and therefore claims the runner produced a
-valid answer, even though the empty string is not an identifier the format defines. The Rust runners
-preserve this split. The two Python runners currently do not: they catch every `FourdgsError`,
-substitute `""` for a missing code and exit zero. That is a runner defect
+For the current invalid corpus, only an error carrying the expected one of those six identifiers is
+a refusal answer. More generally, a named refusal is an answer only when the expectation names it.
+If decoding fails without one — a truncated transport, an I/O error, an ordinary parse failure — the
+runner prints no refusal document, writes its diagnosis to stderr and exits non-zero. In particular,
+`{"refused": ""}` is not the representation of an unnamed error: it exits zero and therefore claims
+the runner produced a valid answer, even though the empty string is not an identifier the format
+defines. The Rust runners preserve this split. The two Python runners currently do not: they catch
+every `FourdgsError`, substitute `""` for a missing code and exit zero. That is a runner defect
 ([#208](https://github.com/avala-ai/4dgs/issues/208)), not an alternative protocol. An outside
 implementation that cannot name a decoder error must fail the invocation rather than copy Python's
 empty refusal.
