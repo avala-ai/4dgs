@@ -88,7 +88,9 @@ Future<String> run(String path) async {
     // On a multi-chunk file it must actually run: a check whose every probe was
     // skipped is a check that reported success without executing.
     final probes = await checkSeekReadsOnlyWhatItNeeds(source, scene, whole);
-    if (scene.index.length >= 2 && whole.count > 0 && probes == 0) {
+    if (scene.index.length >= 2 &&
+        hasAnyVisibleSupport(whole, scene.header.cutoff) &&
+        probes == 0) {
       throw ConformanceFailure(
         'a ${scene.index.length}-chunk file yielded no usable seek probe; the '
         'check reported success without running',

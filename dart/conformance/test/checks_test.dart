@@ -70,6 +70,59 @@ void main() {
     expect(gaussian.stateAt(0.5).count, 1);
   });
 
+  test('resident point support is selected past four broad rows', () {
+    const count = 5;
+    final rotations = Float32List(count * 4);
+    for (int i = 0; i < count; i++) rotations[i * 4 + 3] = 1.0;
+    final gaussians = FourdgsGaussianSet(
+      positions: Float32List(count * 3),
+      scales: Float32List(count * 3)..fillRange(0, count * 3, 1e-3),
+      rotations: rotations,
+      colors: Float32List(count * 4),
+      motions: Float32List(count * 3),
+      muT: Float32List.fromList(const <double>[0.1, 0.2, 0.3, 0.4, 0.75]),
+      sigmaT: Float32List.fromList(const <double>[
+        double.infinity,
+        double.infinity,
+        double.infinity,
+        double.infinity,
+        0.0,
+      ]),
+      winLo: Float32List(count),
+      winHi: Float32List(count)..fillRange(0, count, 1.0),
+    );
+
+    expect(
+      seekVisibleProbeInstants(
+        entry(t0: 0.0, t1: 1.0, gaussianCount: 1),
+        gaussians,
+        0.05,
+        residentStart: 4,
+        residentCount: 1,
+      ),
+      contains(0.75),
+    );
+  });
+
+  test('stored gaussians in empty windows have no visible support', () {
+    final rotations = Float32List(8);
+    rotations[3] = 1.0;
+    rotations[7] = 1.0;
+    final gaussians = FourdgsGaussianSet(
+      positions: Float32List(6),
+      scales: Float32List(6)..fillRange(0, 6, 1e-3),
+      rotations: rotations,
+      colors: Float32List(8),
+      motions: Float32List(6),
+      muT: Float32List.fromList(const <double>[0.0, 1.0]),
+      sigmaT: Float32List.fromList(const <double>[1.0, double.infinity]),
+      winLo: Float32List.fromList(const <double>[0.0, 2.0]),
+      winHi: Float32List.fromList(const <double>[0.0, 2.0]),
+    );
+
+    expect(hasAnyVisibleSupport(gaussians, 0.05), isFalse);
+  });
+
   test('sigma-log guard distance uses pitch magnitude', () {
     final positive = seekGuardSigmaHalfRelative(0.1);
     expect(positive, greaterThan(0));

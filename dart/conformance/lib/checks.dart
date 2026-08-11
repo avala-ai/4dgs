@@ -105,16 +105,33 @@ List<double> seekProbeInstants(
 /// gaussian. These candidates start at each gaussian's marginal peak and fall
 /// back to the interior of its support/window intersection, so an empty/empty
 /// comparison is never the only evidence collected for a populated entry.
+/// Every row is considered before the cap is applied. Rows physically resident
+/// in this entry take priority, then narrower intersections, so broad ancestor
+/// content at the start of the assembled scene cannot crowd out a later point
+/// gaussian owned by the entry. The retained set is always at most [limit].
 List<double> seekVisibleProbeInstants(
   FourdgsChunkIndexEntry entry,
   FourdgsGaussianSet gaussians,
   double cutoff, {
   int limit = 4,
+  int residentStart = 0,
+  int residentCount = 0,
 }) {
-  final result = <double>[];
-  final seen = <double>{};
+  if (limit <= 0) return const <double>[];
+  final selected = <({double time, bool resident, double width, int row})>[];
   final k = supportK(cutoff);
-  for (int i = 0; i < gaussians.count && result.length < limit; i++) {
+  final residentEnd = residentStart + residentCount;
+
+  int compare(
+    ({double time, bool resident, double width, int row}) a,
+    ({double time, bool resident, double width, int row}) b,
+  ) {
+    if (a.resident != b.resident) return a.resident ? -1 : 1;
+    final byWidth = a.width.compareTo(b.width);
+    return byWidth != 0 ? byWidth : a.row.compareTo(b.row);
+  }
+
+  for (int i = 0; i < gaussians.count; i++) {
     final sigma = gaussians.sigmaT[i];
     final mu = gaussians.muT[i];
     final half = sigma.isFinite ? k * sigma : double.infinity;
@@ -142,10 +159,47 @@ List<double> seekVisibleProbeInstants(
         sigma.isFinite
             ? math.exp(-0.5 * math.pow((t - mu) / math.max(sigma, 1e-30), 2))
             : 1.0;
-    if (marginal < cutoff || !seen.add(t)) continue;
-    result.add(t);
+    if (marginal < cutoff) continue;
+    final row = (
+      time: t,
+      resident: residentStart <= i && i < residentEnd,
+      width: hi - lo,
+      row: i,
+    );
+    final duplicate = selected.indexWhere((value) => value.time == t);
+    if (duplicate >= 0) {
+      if (compare(row, selected[duplicate]) < 0) selected[duplicate] = row;
+    } else {
+      selected.add(row);
+    }
+    selected.sort(compare);
+    if (selected.length > limit) selected.removeLast();
   }
-  return result;
+  return <double>[for (final row in selected) row.time];
+}
+
+/// Whether the reconstructed population is visible at any scene-clock instant.
+///
+/// Empty validity windows carry stored gaussians but no state. This is an
+/// `O(count)` existence check with no allocation proportional to the scene.
+bool hasAnyVisibleSupport(FourdgsGaussianSet gaussians, double cutoff) {
+  final k = supportK(cutoff);
+  for (int i = 0; i < gaussians.count; i++) {
+    final windowLo = gaussians.winLo[i];
+    final windowHi = gaussians.winHi[i];
+    if (!(windowLo < windowHi)) continue;
+    final sigma = gaussians.sigmaT[i];
+    if (!sigma.isFinite) return true;
+    final mu = gaussians.muT[i];
+    final supportLo = mu - k * sigma;
+    final supportHi = mu + k * sigma;
+    final lo = math.max(windowLo, supportLo);
+    final hi = math.min(windowHi, supportHi);
+    // Marginal support is closed; the validity window is [lo, hi). A point at
+    // the window's lower edge is visible, while one at its upper edge is not.
+    if (lo <= hi && lo < windowHi) return true;
+  }
+  return false;
 }
 
 /// Largest relative sigma movement caused by half a log-space quantization bin.
@@ -361,13 +415,25 @@ Future<int> checkSeekReadsOnlyWhatItNeeds(
     index,
     isKeyframeDelta: scene.header.temporalModel == 'keyframe-delta',
   );
+  final rowStartByChunkOffset = <int, int>{};
+  int rowStart = 0;
+  for (final entry in index) {
+    rowStartByChunkOffset[entry.chunkOffset] = rowStart;
+    rowStart += entry.gaussianCount;
+  }
 
   int probed = 0;
   for (final entry in probeEntries) {
     final span = entry.t1 - entry.t0;
     if (span <= 0.0) continue;
     final candidates = <double>{
-      ...seekVisibleProbeInstants(entry, whole, scene.header.cutoff),
+      ...seekVisibleProbeInstants(
+        entry,
+        whole,
+        scene.header.cutoff,
+        residentStart: rowStartByChunkOffset[entry.chunkOffset]!,
+        residentCount: entry.gaussianCount,
+      ),
       ...seekProbeInstants(entry, guardAt),
     };
     for (final t in candidates) {
