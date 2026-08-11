@@ -239,7 +239,7 @@ def validate(data: bytes) -> Report:
     # anything reads a byte as an opcode, and it is what gives every later refusal a byte
     # to point at.
     try:
-        walk = refusal.walk(data)
+        walk = refusal.walk(data, retain_records=False)
     except FourdgsError as exc:
         report.refused("", exc)
         return report
@@ -247,7 +247,8 @@ def validate(data: bytes) -> Report:
     if not data.endswith(MAGIC):
         report.error("file does not end with the magic; it is truncated or was written by a broken encoder")
 
-    seen: list[int] = []
+    seen: set[int] = set()
+    first_opcode: int | None = None
     header = None
     quant = None
     quant_count = 0
@@ -257,8 +258,7 @@ def validate(data: bytes) -> Report:
     #: Where every Chunk and Delta Chunk record sits, in file order — what the index is
     #: checked against, and what says a Delta Chunk turned up in a file that declares a
     #: model with no such record.
-    chunk_offsets: list[int] = []
-    delta_offsets: list[int] = []
+    first_delta_offset: int | None = None
     footer = None
     provenance = Provenance()
     objects = ObjectLayer()
@@ -268,7 +268,9 @@ def validate(data: bytes) -> Report:
 
     try:
         for record in iter_records(data, len(MAGIC)):
-            seen.append(record.opcode)
+            if first_opcode is None:
+                first_opcode = record.opcode
+            seen.add(record.opcode)
             if record.opcode == op.HEADER:
                 header = rec.Header.parse(record.content)
             elif record.opcode == op.QUANTIZATION:
@@ -283,13 +285,12 @@ def validate(data: bytes) -> Report:
                 head, _ = rec.parse_chunk(record.content)
                 chunk_count += 1
                 counted += head.count
-                chunk_offsets.append(record.offset)
                 if head.t1 < head.t0:
                     report.error(f"chunk {chunk_count} has t1 ({head.t1}) before t0 ({head.t0})")
             elif record.opcode == op.DELTA_CHUNK:
                 first_chunk_seen = True
-                delta_offsets.append(record.offset)
-                chunk_offsets.append(record.offset)
+                if first_delta_offset is None:
+                    first_delta_offset = record.offset
             elif record.opcode == op.CHUNK_INDEX:
                 index.append(rec.ChunkIndexEntry.parse(record.content))
             elif record.opcode == op.AUDIO_SOURCE:
@@ -387,8 +388,8 @@ def validate(data: bytes) -> Report:
     if not seen:
         report.error("no records at all")
         return report
-    if seen[0] != op.HEADER:
-        report.error(f"first record is {op.name(seen[0])}; the Header must come first")
+    if first_opcode != op.HEADER:
+        report.error(f"first record is {op.name(first_opcode)}; the Header must come first")
     if header is None:
         report.error("no Header record")
     if quant is None:
@@ -451,10 +452,10 @@ def validate(data: bytes) -> Report:
     # streamed one skips the opcode as though it were unknown, and the indexed one stops
     # at the first Chunk — so a Delta Chunk in a gaussian-birth file was read by nobody
     # and reported by nobody, and the state it carries silently was not in the scene.
-    if delta_offsets and not keyframe_delta:
+    if first_delta_offset is not None and not keyframe_delta:
         model = "gaussian-birth" if header is None else header.temporal_model
         report.error(
-            f"a Delta Chunk record appears at byte {delta_offsets[0]}, but the Header declares "
+            f"a Delta Chunk record appears at byte {first_delta_offset}, but the Header declares "
             f"temporal model {model!r}; Delta Chunks exist only under 'keyframe-delta' (§5.18)"
         )
 
@@ -484,10 +485,13 @@ def validate(data: bytes) -> Report:
     # valid. The file layout is "one per chunk" (§4), so the omission is itself the fault
     # and naming it is better than quietly decoding around it.
     if index:
-        for at in chunk_offsets:
+        for record in iter_records(data, len(MAGIC)):
+            if record.opcode not in (op.CHUNK, op.DELTA_CHUNK):
+                continue
+            at = record.offset
             if at not in named_by_index:
                 report.error(
-                    f"the {op.name(data[at])} record at byte {at} is not named by any chunk index entry; "
+                    f"the {op.name(record.opcode)} record at byte {at} is not named by any chunk index entry; "
                     f"a seeking reader never reads it (§4)"
                 )
 
@@ -608,27 +612,26 @@ def _check_keyframe_delta(data: bytes, walk: Walk, report: Report, header: rec.H
         except FourdgsError as exc:
             report.refused("a seeking reader cannot open this file: ", exc, walk)
             return
-        for i, entry in enumerate(opened.index):
-            what = "Chunk" if entry.kind == 0 else "DeltaChunk"
-            try:
-                # The composed state is dropped when this iteration ends.
-                state = kdf.compose_chain(data, opened.index, entry, opened.windows)
-            except FourdgsError as exc:
-                report.refused(
-                    "a chunk does not decode: ",
-                    exc,
-                    walk,
-                    Site(entry.chunk_offset, f"the {what} record at index entry {i}"),
-                )
-                # One chain's failure is every later chain's failure — they share links —
-                # so the first is the finding and the rest would be the same fault
-                # restated.
-                return
-            live.update(int(v) for v in state.ids)
-            # Dropped before the next entry is composed, not merely rebound after it: a
-            # name still bound while the next call runs is a population still resident,
-            # and two at once on a large sequence is the cost this loop exists to avoid.
-            del state
+        i = 0
+        entry = opened.index[0] if opened.index else None
+
+        def visiting(ordinal: int, candidate: rec.ChunkIndexEntry) -> None:
+            nonlocal i, entry
+            i, entry = ordinal, candidate
+
+        try:
+            for _entry, state in kdf.scan_indexed(data, opened.index, opened.windows, visiting):
+                live.update(int(v) for v in state.ids)
+                # Dropped before the next entry is composed, not merely rebound after it:
+                # the generator retains only current and GOP-keyframe state.
+                del state
+        except FourdgsError as exc:
+            site = None
+            if entry is not None:
+                what = "Chunk" if entry.kind == 0 else "DeltaChunk"
+                site = Site(entry.chunk_offset, f"the {what} record at index entry {i}")
+            report.refused("a chunk does not decode: ", exc, walk, site)
+            return
 
     if len(live) != header.gaussian_count:
         report.error(
@@ -638,10 +641,10 @@ def _check_keyframe_delta(data: bytes, walk: Walk, report: Report, header: rec.H
 
 def _window_table(walk: Walk, data: bytes) -> list[tuple[float, float]]:
     """The effective Window Table, matching the streamed decoder's last-one-wins rule."""
-    frame = next(
-        (record for record in reversed(walk.intact_records()) if record.opcode == op.WINDOW_TABLE),
-        None,
-    )
+    frame = None
+    for record in walk.intact_records():
+        if record.opcode == op.WINDOW_TABLE:
+            frame = record
     if frame is None:
         return []
     content = frame.content(data)

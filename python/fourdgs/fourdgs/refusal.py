@@ -34,7 +34,7 @@ the one there are the same table.
 from __future__ import annotations
 
 import struct
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -97,6 +97,10 @@ class Walk:
     #: True when the last eight bytes are the magic, as a whole file's are.
     trailing_magic: bool = False
     size: int = 0
+    record_count: int = 0
+    #: False for validation: `intact_records()` then streams framing from `data` on each
+    #: pass instead of retaining one Python object per record.
+    retained: bool = True
     #: The bytes this walk framed. Placing a refusal takes both the framing and the bytes
     #: it frames — which record, and then which record of that kind — and the caller here
     #: is a validator that was handed the whole file to begin with, so this is the same
@@ -113,10 +117,12 @@ class Walk:
         """
         return next((r for r in self.intact_records() if r.opcode == opcode), None)
 
-    def intact_records(self) -> list[Frame]:
+    def intact_records(self) -> Iterable[Frame]:
         """The records a streamed reader keeps: every one framed, less the one it was cut
         inside."""
-        return self.records[: self.intact()]
+        if self.retained:
+            return self.records[: self.intact()]
+        return _intact_frames(self.data)
 
     def intact(self) -> int:
         """How many of the reported records are whole.
@@ -126,10 +132,26 @@ class Walk:
         something a streamed reader keeps.
         """
         incomplete = 1 if self.cut is not None and self.cut.inside_a_record else 0
-        return max(len(self.records) - incomplete, 0)
+        return max(self.record_count - incomplete, 0)
 
 
-def walk(data: bytes) -> Walk:
+def _intact_frames(data: bytes) -> Iterable[Frame]:
+    """Frame complete records lazily, stopping before a cut or trailing magic."""
+    at = len(MAGIC)
+    size = len(data)
+    while size - at > len(MAGIC):
+        if size - at < RECORD_HEADER_SIZE:
+            return
+        opcode, length = _RECORD_HEADER.unpack_from(data, at)
+        frame = Frame(opcode=opcode, offset=at, length=length)
+        end = at + frame.total
+        if end > size:
+            return
+        yield frame
+        at = end
+
+
+def walk(data: bytes, *, retain_records: bool = True) -> Walk:
     """Every top-level record, from framing alone.
 
     Reads nine bytes per record and steps over the content, so this is as cheap on a file
@@ -138,7 +160,7 @@ def walk(data: bytes) -> Walk:
     mean as an opcode.
     """
     check_magic(data)
-    out = Walk(size=len(data), data=data)
+    out = Walk(size=len(data), data=data, retained=retain_records)
     at = len(MAGIC)
     while True:
         remaining = out.size - at
@@ -165,7 +187,9 @@ def walk(data: bytes) -> Walk:
         frame = Frame(opcode=opcode, offset=at, length=length)
         # A record is listed either way: a declared length that runs off the end is a fact
         # about that record, and hiding the record hides the field that carries the fault.
-        out.records.append(frame)
+        out.record_count += 1
+        if retain_records:
+            out.records.append(frame)
         end = at + frame.total
         if end > out.size:
             out.cut = Cut(

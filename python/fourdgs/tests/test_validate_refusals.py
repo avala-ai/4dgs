@@ -395,6 +395,26 @@ class TestKeyframeDelta:
         with pytest.raises(UnsupportedCodec, match="unknown stream codec 9"):
             kdf.compose_chain(data + band_blob, index, indexed)
 
+    def test_indexed_keyframe_delta_bands_must_have_the_declared_shape(self):
+        data = _keyframe_file()
+        index = _index_entries(data)
+        first = index[0]
+        # Band one is nine coefficients per gaussian. Keep the rows correct so this
+        # mutation proves the channel-width check rather than the row-count check.
+        band_blob = put_record(
+            op.SH_BAND_STREAM,
+            bytes([1])
+            + encode_stream(
+                op.SH_BAND_STREAM,
+                np.zeros((first.live_count, 1), dtype=np.int64),
+                channels=1,
+            ),
+        )
+        band_at = len(data)
+        index[0] = _with(first, bands=[(1, band_at, len(band_blob))])
+        with pytest.raises(MalformedFile, match=r"requires \(4, 9\)"):
+            kdf.compose_chain(data + band_blob, index, index[0])
+
     def test_an_index_cannot_omit_a_physical_keyframe_delta_band(self):
         data = _keyframe_file()
         header_record = _first_record(data, op.HEADER)
@@ -751,27 +771,27 @@ class TestBoundedDecoding:
         assert refusal.scan_chunks(data) is None
         assert len(earlier) > 1, "the fixture must carry more than one chunk for this to prove anything"
 
-    def test_a_keyframe_delta_file_is_composed_one_state_at_a_time(self, monkeypatch):
-        """A composed state is a whole population, and `decode_indexed` keeps one per index
-        entry — memory proportional to population times chunk count, on a model whose whole
-        point is that a seek is cheap. The validator composes each chain and drops it."""
-        import weakref
-
+    def test_an_indexed_keyframe_delta_file_is_composed_in_one_linear_scan(self, monkeypatch):
+        """Validating every entry with `compose_chain` recomposes the whole prefix, making
+        a long chained GOP quadratic. The validator applies each physical delta exactly
+        once while retaining only the current and GOP-keyframe states."""
         from fourdgs import keyframe_delta_file
 
-        original = keyframe_delta_file.compose_chain
-        earlier: list[weakref.ref] = []
+        original = keyframe_delta_file._compose_delta
+        calls = 0
 
         def watched(*args, **kwargs):
-            assert all(ref() is None for ref in earlier), "a previously composed state is still resident"
-            state = original(*args, **kwargs)
-            earlier.append(weakref.ref(state.ids))
-            return state
+            nonlocal calls
+            calls += 1
+            return original(*args, **kwargs)
 
-        monkeypatch.setattr(keyframe_delta_file, "compose_chain", watched)
-        report = validate(_keyframe_file())
+        monkeypatch.setattr(keyframe_delta_file, "_compose_delta", watched)
+        data = _keyframe_file()
+        report = validate(data)
         assert report.ok, [str(f) for f in report.findings]
-        assert len(earlier) > 1, "the fixture must carry more than one chunk for this to prove anything"
+        expected = sum(entry.kind == 1 for entry in _index_entries(data))
+        assert expected > 1, "the fixture must carry more than one delta for this to prove anything"
+        assert calls == expected
 
     def test_an_unindexed_keyframe_delta_file_keeps_two_states_at_most(self):
         """`decode_streamed` keeps a state per chunk plus a map of every offset a delta
@@ -789,6 +809,23 @@ class TestBoundedDecoding:
             alive = [ref for ref in seen if ref() is not None]
             assert len(alive) <= 2, f"{len(alive)} states resident at once"
         assert len(seen) > 2, "the fixture must carry more than two chunks for this to prove anything"
+
+    def test_an_unindexed_delta_depth_must_match_its_selected_reference(self):
+        data = _keyframe_file(write_index=False)
+        delta = _first_record(data, op.DELTA_CHUNK)
+        patched = bytearray(data)
+        # t0, t1, level, mode, reference_offset, keyframe_offset, then u16 depth.
+        struct.pack_into("<H", patched, delta.offset + 9 + 37, 7)
+        report = validate(bytes(patched))
+        assert not report.ok
+        assert any("selected reference requires depth" in finding.message for finding in report.findings)
+
+    def test_validation_framing_does_not_retain_one_object_per_record(self):
+        data = _keyframe_file(write_index=False)
+        framed = refusal.walk(data, retain_records=False)
+        assert framed.record_count > 2
+        assert framed.records == []
+        assert sum(1 for _ in framed.intact_records()) == framed.intact()
 
 
 def _first_record(data: bytes, opcode: int):
