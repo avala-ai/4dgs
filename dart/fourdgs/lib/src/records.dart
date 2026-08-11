@@ -1126,18 +1126,16 @@ class FourdgsCamera {
     final target = c.f64s(3);
     final countAt = fileOffset + c.pos;
     final n = c.u32();
-    // A camera path is a pose trajectory, sampled the way every other one in
-    // this format is, so it is held to the same ceiling — see
-    // [maxTrajectorySamples]. Checked before the loop, which is the last point
-    // at which nothing has been allocated: each keyframe below becomes three
-    // Dart lists whose headers cost several times the 56 bytes it occupies on
-    // the wire, so a record the front-matter ceiling admits at 64 MiB expands
-    // to several hundred megabytes of objects on the way to finding out the
-    // count was a lie.
-    if (n > maxTrajectorySamples) {
+    // Prove the declared samples physically fit before building any of the
+    // three growable lists. Camera has no cross-SDK sample-count ceiling, so
+    // the bounded record bytes are the limit; applying the trajectory ceiling
+    // here would make Dart reject a Camera the other SDKs accept.
+    const int keyframeBytes = 8 + 3 * 8 + 3 * 8;
+    final capacity = c.remaining ~/ keyframeBytes;
+    if (n > capacity) {
       throw FourdgsMalformedFile(
-        'the Camera record at byte $countAt declares $n keyframes, past the '
-        '$maxTrajectorySamples ceiling',
+        'the Camera record at byte $countAt declares $n keyframes but holds '
+        'room for $capacity complete $keyframeBytes-byte keyframes',
       );
     }
     final times = <double>[];

@@ -60,21 +60,18 @@ plausible-looking output rather than an error, so nothing downstream notices:
 The hardening above is about what is _legal_ — which files conform. This is about what is
 _affordable_. A malformed length field could still size an allocation before anything noticed it was
 malformed, which is the difference between refusing a bad file and being taken down by one. Every
-ceiling here is shared **by value** with the other SDKs, because a ceiling only one implementation
-has means a file that decodes in three of them and is refused in the fourth:
+ceiling here is shared **by scope and value** with the other SDKs, because a ceiling only one
+implementation has means a file that decodes in three of them and is refused in the fourth:
 
-- **Total decoded bytes for a streamed read.** A keyframe-delta chunk's attribute streams are now
-  framed first, priced as a block, and only then decoded. Each stream was already capped on its own,
-  but nothing capped what a block of them added up to: attribute ids are a byte wide, so one group
-  may carry 256 of them and a delta chunk carries three groups — and a constant-mode stream declares
-  an array of any size from a payload of nine bytes. A one-kilobyte group could ask this decoder for
-  tens of gigabytes and pass every check on the way. The ceiling is `maxChunkDecodedBytes`, 512 MiB,
-  the number this package already applied to a `gaussian-birth` chunk and the same
-  `MAX_STREAM_BYTES` Python, Rust and TypeScript apply.
-- **Camera keyframe count.** `maxTrajectorySamples`, 1,000,000, which is `MAX_TRAJECTORY_SAMPLES` in
-  Python, Rust and TypeScript. A camera path is a pose trajectory, so it is held to the ceiling
-  every other one in this format already had; the constant was named `maxRigTrajectorySamples` and
-  now covers the Rig Trajectory, the Object Track and the Camera record alike.
+- **Bounded Camera framing without a Dart-only count ceiling.** Before building any keyframe list,
+  the parser proves that all declared 56-byte samples fit in the already bounded record. Camera has
+  no cross-SDK `MAX_TRAJECTORY_SAMPLES` rule, so valid large Camera records remain accepted while a
+  truncated declaration cannot allocate every available row before failing.
+- **Keyframe-delta groups are framed before decoding.** Every declared stream payload is
+  bounds-checked before the first decoded array is allocated. Decoded size remains subject to the
+  shared per-stream ceiling; no Dart-only aggregate chunk limit changes which conforming files are
+  accepted. A repeated stream whose payload is incomplete is consequently diagnosed as truncated
+  before the duplicate-attribute rule is considered.
 - **Quantization scheme.** `uniform-v1` is what this build implements, and a record naming anything
   else is refused as an unsupported codec rather than decoded through a grid it was not given — the
   steps are the only description of what a bin means, so reading `uniform-v9` bins through

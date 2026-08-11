@@ -32,7 +32,6 @@ library;
 import 'dart:math' as math;
 import 'dart:typed_data';
 
-import 'chunk_decoder.dart';
 import 'exceptions.dart';
 import 'opcode.dart';
 import 'quantization.dart';
@@ -328,16 +327,11 @@ void _checkGroupsDisjoint(Int32List a, Int32List b, Int32List d) {
 /// rather than gating on the `gaussian-birth` registry the chunk decoder uses:
 /// an update group carries a subset of the required attributes, a death group
 /// carries only the identity, and both must decode.
-({Int32List ids, Map<int, _Column> bins}) _decodeGroup(
-  Uint8List blob,
-  _DecodedBytes budget,
-  int at,
-  String what,
-) {
+({Int32List ids, Map<int, _Column> bins}) _decodeGroup(Uint8List blob, int at) {
   if (blob.isEmpty) {
     return (ids: Int32List(0), bins: <int, _Column>{});
   }
-  final streams = _decodeStreams(FourdgsCursor(blob), budget, at, what);
+  final streams = _decodeStreams(FourdgsCursor(blob), at);
   final gaussianId = streams.remove(attrGaussianId);
   if (gaussianId == null) {
     throw const FourdgsMalformedFile(
@@ -360,9 +354,7 @@ void _checkGroupsDisjoint(Int32List a, Int32List b, Int32List d) {
   }
   final streams = _decodeStreams(
     FourdgsCursor(body.streams),
-    _DecodedBytes(),
     at + recordHeaderBytes + body.streamsOffset,
-    'the keyframe chunk at byte $at',
   );
   final gaussianId = streams.remove(attrGaussianId);
   if (gaussianId == null) {
@@ -387,51 +379,32 @@ void _checkGroupsDisjoint(Int32List a, Int32List b, Int32List d) {
   return (ids: _idsOf(gaussianId), bins: streams);
 }
 
-/// Frames every stream in a group, prices the whole block, and only then
-/// decodes it.
+/// Frames every stream in a group and only then decodes it.
 ///
-/// Two passes rather than one, and the second pass is the point. A stream is
-/// individually capped at [maxStreamBytes] worth of bins, but nothing capped
-/// what a *block* of them adds up to: attribute ids are a byte wide, so one
-/// group may carry 256 of them, a delta chunk carries three groups, and every
-/// one of those streams may be constant-mode — a seventeen-byte header and a
-/// handful of payload bytes declaring a hundred million elements. A one-kilobyte
-/// group could therefore ask this decoder for tens of gigabytes and pass every
-/// check on the way, which is the failure the chunk path has been guarded
-/// against since it was written ([maxChunkDecodedBytes]) and this path never
-/// was.
-///
-/// Framing first is what makes the ceiling worth having: a header is 17 bytes
-/// and says how many bins its stream will produce, so the block's whole cost is
-/// known before a single `Int32List` exists. Charging as each stream was
-/// decoded would still allocate everything up to the last one.
-Map<int, _Column> _decodeStreams(
-  FourdgsCursor cursor,
-  _DecodedBytes budget,
-  int at,
-  String what,
-) {
-  final framed =
-      <({FourdgsStreamHeader header, Uint8List payload, int offset})>[];
+/// The framing pass proves every declared payload is present before the first
+/// decoded allocation. Per-stream decoded-size limits remain the cross-SDK
+/// contract; this SDK must not add a differently scoped aggregate refusal.
+Map<int, _Column> _decodeStreams(FourdgsCursor cursor, int at) {
+  final framed = <({FourdgsStreamHeader header, Uint8List payload})>[];
   final seen = <int>{};
   while (cursor.remaining > 0) {
     final offset = at + cursor.pos;
     final header = readStreamHeader(cursor);
+    // Bounds-check the payload before classifying a duplicate. A repeated
+    // complete stream is malformed; a repeated header whose payload runs past
+    // the group is truncated, and taking this view allocates no decoded bins.
+    final payload = cursor.take(header.payloadLength);
     // One stream per attribute here too: the regular chunk path refuses a
     // second, and this path had its own loop that was still resolving it
     // silently.
     if (!seen.add(header.attributeId)) {
       throw FourdgsMalformedFile(
         'a keyframe-delta group carries attribute ${header.attributeId} twice; '
-        'the format defines one stream per attribute',
+        'the second header is at byte $offset and the format defines one stream '
+        'per attribute',
       );
     }
-    budget.charge(header, offset, what);
-    framed.add((
-      header: header,
-      payload: cursor.take(header.payloadLength),
-      offset: offset,
-    ));
+    framed.add((header: header, payload: payload));
   }
 
   final got = <int, _Column>{};
@@ -443,39 +416,6 @@ Map<int, _Column> _decodeStreams(
     got[stream.attributeId] = _Column(stream.channels, stream.values);
   }
   return got;
-}
-
-/// The decoded bins one keyframe-delta chunk has already been charged for.
-///
-/// One of these spans a whole chunk, not a group: a delta chunk's updates,
-/// births and deaths are decoded together and held together, so three groups
-/// each just under the ceiling are one chunk three times over it.
-class _DecodedBytes {
-  int spent = 0;
-
-  /// Charges [header]'s declared bins against the ceiling, before its payload
-  /// is touched.
-  ///
-  /// The ceiling is [maxChunkDecodedBytes] — 512 MiB, the same number this
-  /// package already applies to a `gaussian-birth` chunk and the same
-  /// `MAX_STREAM_BYTES` Python, Rust and TypeScript apply to a single stream.
-  /// Shared by value on purpose: a ceiling only one implementation has means a
-  /// file that decodes in three SDKs and is refused in the fourth.
-  ///
-  /// Four bytes per bin because that is what a bin costs — the values land in
-  /// an `Int32List`, which is what TypeScript's `produced` cap counts too.
-  void charge(FourdgsStreamHeader header, int offset, String what) {
-    final bins = header.count * header.channels;
-    spent += bins * 4;
-    if (spent > maxChunkDecodedBytes) {
-      throw FourdgsMalformedFile(
-        '$what declares ${header.count} elements x ${header.channels} channels '
-        'for attribute ${header.attributeId} at byte $offset, bringing this '
-        'chunk to $spent decoded bytes, past the $maxChunkDecodedBytes-byte '
-        'ceiling',
-      );
-    }
-  }
 }
 
 Int32List _idsOf(_Column gaussianId) {
@@ -640,29 +580,10 @@ KeyframeDeltaState _composeDelta(
   FourdgsDeltaChunkBody body, {
   required int at,
 }) {
-  // One budget for the three groups: they are decoded together and held
-  // together, so what the chunk costs is their sum.
-  final budget = _DecodedBytes();
   final content = at + recordHeaderBytes;
-  final what = 'the delta chunk at byte $at';
-  final updates = _decodeGroup(
-    body.updates,
-    budget,
-    content + body.updatesOffset,
-    what,
-  );
-  final births = _decodeGroup(
-    body.births,
-    budget,
-    content + body.birthsOffset,
-    what,
-  );
-  final deaths = _decodeGroup(
-    body.deaths,
-    budget,
-    content + body.deathsOffset,
-    what,
-  );
+  final updates = _decodeGroup(body.updates, content + body.updatesOffset);
+  final births = _decodeGroup(body.births, content + body.birthsOffset);
+  final deaths = _decodeGroup(body.deaths, content + body.deathsOffset);
   return _applyDelta(
     reference,
     updateIds: updates.ids,

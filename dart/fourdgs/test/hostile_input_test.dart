@@ -1181,85 +1181,65 @@ void main() {
   });
 
   group('what a file declares is priced before it is allocated', () {
-    test(
-      'a Camera record cannot declare more keyframes than a trajectory may',
-      () {
-        // The count is a `u32` and each keyframe becomes three Dart lists, whose
-        // headers cost several times the 56 bytes a keyframe occupies on the
-        // wire. Refusing from the count alone is the only place the record is
-        // free; a page later the reader has already built whatever fitted.
-        const int at =
-            96; // an arbitrary record position, so byte 0 proves nothing
-        expect(
-          () => FourdgsCamera.parse(
-            _cameraContent(maxTrajectorySamples + 1),
-            fileOffset: at,
-          ),
-          throwsA(
-            isA<FourdgsMalformedFile>()
-                .having(
-                  (FourdgsMalformedFile e) => e.message,
-                  'names the byte the count sits at',
-                  contains('at byte ${at + _cameraCountOffset}'),
-                )
-                .having(
-                  (FourdgsMalformedFile e) => e.message,
-                  'names the value and the ceiling',
-                  contains(
-                    '${maxTrajectorySamples + 1} keyframes, past the '
-                    '$maxTrajectorySamples ceiling',
-                  ),
+    test('Camera sample bytes are proved before keyframe lists are built', () {
+      // Camera has no shared sample-count ceiling, but a declared count still
+      // must fit in the bounded record before any of its three lists grow.
+      const int at =
+          96; // an arbitrary record position, so byte 0 proves nothing
+      const int declared = 1000001;
+      expect(
+        () => FourdgsCamera.parse(_cameraContent(declared), fileOffset: at),
+        throwsA(
+          isA<FourdgsMalformedFile>()
+              .having(
+                (FourdgsMalformedFile e) => e.message,
+                'names the byte the count sits at',
+                contains('at byte ${at + _cameraCountOffset}'),
+              )
+              .having(
+                (FourdgsMalformedFile e) => e.message,
+                'names the value and physical capacity',
+                contains(
+                  '$declared keyframes but holds room for 0 complete '
+                  '56-byte keyframes',
                 ),
-          ),
-        );
-
-        // Not a truncation. Without the ceiling this record is refused too — for
-        // running out of bytes, three million allocations later — and that is a
-        // different diagnosis pointing at a different fix.
-        expect(
-          () => FourdgsCamera.parse(_cameraContent(maxTrajectorySamples + 1)),
-          isNot(throwsA(isA<FourdgsTruncatedFile>())),
-        );
-
-        // And an ordinary path still parses: the ceiling is four orders of
-        // magnitude above any suggested camera move.
-        final BytesBuilder ordinary = BytesBuilder()..add(_cameraContent(1));
-        ordinary
-          ..add(_f64(0.5)) // time
-          ..add(_f64(1.0))
-          ..add(_f64(2.0))
-          ..add(_f64(3.0)) // position
-          ..add(_f64(0.0))
-          ..add(_f64(0.0))
-          ..add(_f64(0.0)) // target
-          ..add(_string('linear'))
-          ..addByte(1);
-        expect(FourdgsCamera.parse(ordinary.toBytes()).times, <double>[0.5]);
-      },
-    );
-
-    test('a chunk of streams is priced as a block, not one stream at a time', () {
-      // Every stream here passes the per-stream cap on its own. The block is
-      // what a decoder actually has to hold, and until this ceiling existed the
-      // keyframe-delta path had none: attribute ids are a byte wide, so one
-      // group may carry 256 of them, and a constant-mode stream declares an
-      // array of any size from a payload of nine bytes.
-      const int elements = 100000000; // 400 MB of bins each, 800 MB together
-      expect(
-        elements,
-        lessThan(maxStreamBytes ~/ 4),
-        reason: 'each stream alone must clear the per-stream cap',
-      );
-      expect(
-        elements * 4 * 2,
-        greaterThan(maxChunkDecodedBytes),
-        reason: 'and the two together must not',
+              ),
+        ),
       );
 
+      // The framing mismatch is classified before the loop, rather than
+      // allocating every complete prefix and failing at the first absent row.
+      expect(
+        () => FourdgsCamera.parse(_cameraContent(declared)),
+        isNot(throwsA(isA<FourdgsTruncatedFile>())),
+      );
+
+      // An ordinary path still parses.
+      final BytesBuilder ordinary = BytesBuilder()..add(_cameraContent(1));
+      ordinary
+        ..add(_f64(0.5)) // time
+        ..add(_f64(1.0))
+        ..add(_f64(2.0))
+        ..add(_f64(3.0)) // position
+        ..add(_f64(0.0))
+        ..add(_f64(0.0))
+        ..add(_f64(0.0)) // target
+        ..add(_string('linear'))
+        ..addByte(1);
+      expect(FourdgsCamera.parse(ordinary.toBytes()).times, <double>[0.5]);
+    });
+
+    test('a truncated duplicate payload is classified before duplication', () {
+      final Uint8List complete = _constStream(attrGaussianId, 0);
+      final Uint8List cutDuplicate = Uint8List.sublistView(
+        complete,
+        0,
+        complete.length - 1,
+      );
       final BytesBuilder streams =
           BytesBuilder()
-            ..add(_constStream(attrGaussianId, elements))
-            ..add(_constStream(attrPosition, elements));
+            ..add(complete)
+            ..add(cutDuplicate);
       final Uint8List chunk = _keyframeChunkContent(streams.toBytes());
 
       final BytesBuilder out =
@@ -1272,38 +1252,16 @@ void main() {
               ),
             )
             ..add(_record(opQuantization, _quantizationContent()));
-      final int chunkAt = out.length;
       out
         ..add(_record(opChunk, chunk))
         ..add(fourdgsMagic);
 
-      // The second stream header sits one stream past the start of the block.
-      final int blockAt =
-          chunkAt + 9 + 8 + 8 + 4 + 4 + 4 + 8 + 8; // record, t0..streams length
-      final int secondAt = blockAt + _constStream(attrGaussianId, 0).length;
       expect(
         () => decodeKeyframeDeltaStreamed(out.toBytes()),
-        throwsA(
-          isA<FourdgsMalformedFile>()
-              .having(
-                (FourdgsMalformedFile e) => e.message,
-                'names the record and the stream header',
-                contains('the keyframe chunk at byte $chunkAt'),
-              )
-              .having(
-                (FourdgsMalformedFile e) => e.message,
-                'names the byte the offending header sits at',
-                contains('at byte $secondAt'),
-              )
-              .having(
-                (FourdgsMalformedFile e) => e.message,
-                'names the total and the ceiling',
-                contains(
-                  'bringing this chunk to ${elements * 4 * 2} decoded bytes, '
-                  'past the $maxChunkDecodedBytes-byte ceiling',
-                ),
-              ),
-        ),
+        throwsA(isA<FourdgsTruncatedFile>()),
+        reason:
+            'the incomplete payload is truncated even though its header '
+            'repeats an attribute',
       );
     });
 
