@@ -1,7 +1,7 @@
 // Copyright 2026 Avala AI
 // SPDX-License-Identifier: Apache-2.0
 
-/// The encoder: gaussians in, a complete `.4dgs` byte buffer out.
+/// The encoder: gaussians in, framed `.4dgs` records out.
 ///
 /// A second implementation rather than a binding. Dart authoring — a Flutter
 /// tool, a converter, a test fixture — is the point, so the arithmetic here
@@ -17,12 +17,10 @@
 /// `deflate` did, whether a stream came out smaller raw or delta-coded — is an
 /// encoder's own business and is not part of what the file means.
 ///
-/// Bounded like the decoders (AGENTS.md §1) in the one sense an encoder can be:
-/// nothing here is quadratic in the gaussian count and no chunk's streams are
-/// held after the chunk is framed. It does build the whole file in memory,
-/// which is what "the encoder is a reference" (§4) buys — a caller streaming a
-/// hundred-million-gaussian capture wants a writer that owns its own sink, and
-/// that is a different API, not a different format.
+/// Bounded like the decoders (AGENTS.md §1): nothing here is quadratic in the
+/// gaussian count, no chunk's streams are held after its record is emitted, and
+/// [writeFourdgsToSink] never retains the complete file. [writeFourdgsBytes] is
+/// the explicit in-memory convenience for callers that already need one buffer.
 library;
 
 import 'dart:convert';
@@ -116,13 +114,31 @@ class FourdgsWriteOptions {
   final Map<String, String> attributes;
 }
 
-/// Encode [gaussians] as a complete `.4dgs` file.
+/// Encode [gaussians] as one in-memory `.4dgs` file.
 ///
 /// [durationSec] is the scene length; playback covers `[0, durationSec)`. A
 /// static asset is `0`, and the index it produces is the single half-open
 /// interval `[0, 1e-9)` the reference encoders write for one — a seek at `t=0`
 /// has to land somewhere, and an empty interval covers no instant at all.
 Uint8List writeFourdgsBytes(
+  FourdgsGaussianSet gaussians,
+  double durationSec, {
+  FourdgsWriteOptions options = const FourdgsWriteOptions(),
+}) {
+  final collector = _ByteCollector();
+  writeFourdgsToSink(collector, gaussians, durationSec, options: options);
+  return collector.finish();
+}
+
+/// Encode [gaussians] to [sink], one complete framed record at a time.
+///
+/// The sink is borrowed and is not closed. The writer retains the quantized
+/// gaussian lanes and the small Chunk Index, but releases each Chunk and SH Band
+/// record after [Sink.add] returns; memory does not grow with the output file.
+/// A sink that performs I/O belongs in a transport package at the application
+/// edge, while tests and browsers can supply any other `Sink<List<int>>`.
+void writeFourdgsToSink(
+  Sink<List<int>> sink,
   FourdgsGaussianSet gaussians,
   double durationSec, {
   FourdgsWriteOptions options = const FourdgsWriteOptions(),
@@ -193,7 +209,7 @@ Uint8List writeFourdgsBytes(
 
   final bands = _bandColumns(gaussians, options.shBands);
 
-  final out = _ByteWriter(4096);
+  final out = _SinkWriter(sink);
   out.bytes(fourdgsMagic);
   // The degree the file actually carries, which is the highest band written and
   // not the degree the input happened to hold. `shBands` caps what is emitted,
@@ -271,11 +287,19 @@ Uint8List writeFourdgsBytes(
   int summaryStart = 0;
   int summaryOffsetStart = 0;
   int summaryLength = 0;
+  int summaryCrc = 0;
+  void emitSummary(Uint8List record) {
+    out.bytes(record);
+    if (options.writeCrc) {
+      summaryCrc = fourdgsCrc32(record, summaryCrc);
+    }
+  }
+
   if (options.writeIndex && index.isNotEmpty) {
     summaryStart = out.length;
     final groupStart = summaryStart;
     for (final entry in index) {
-      out.bytes(entry.encode());
+      emitSummary(entry.encode());
     }
     // Taken here, before anything else is appended. A Summary Offset frames one
     // *class* of summary record, so that a consumer can range-read the index
@@ -284,24 +308,20 @@ Uint8List writeFourdgsBytes(
     // which is the one thing the record exists to prevent.
     final groupEnd = out.length;
     if (options.writeStatistics) {
-      out.bytes(_statisticsRecord(n, index.length, durationSec, encodedAabb));
+      emitSummary(_statisticsRecord(n, index.length, durationSec, encodedAabb));
     }
     if (options.writeSummaryOffsets) {
       summaryOffsetStart = out.length;
-      out.bytes(
+      emitSummary(
         _summaryOffsetRecord(opChunkIndex, groupStart, groupEnd - groupStart),
       );
     }
     summaryLength = out.length - summaryStart;
   }
 
-  final crc =
-      options.writeCrc && summaryLength > 0
-          ? fourdgsCrc32(out.viewFrom(summaryStart))
-          : 0;
+  final crc = options.writeCrc && summaryLength > 0 ? summaryCrc : 0;
   out.bytes(_footerRecord(summaryStart, summaryOffsetStart, crc));
   out.bytes(fourdgsMagic);
-  return out.finish();
 }
 
 // --------------------------------------------------------------------------
@@ -366,16 +386,12 @@ void _checkInput(FourdgsGaussianSet g, double cutoff) {
     }
   }
 
-  // Three lanes are quantized through a clamp, and a clamp is the quiet way to
-  // store a value nobody authored. Colour is written as a bin of `step_rgb` and
-  // read back through `.clamp(0.0, 1.0)` in `decodeChunk`, so an input of 1.2
-  // returns as 1.0 while the file declares an `rgb` bound near 0.004; a scale
-  // and a `sigma_t` go through `log(max(v, 1e-30))`, so zero or negative becomes
-  // e^-69 and the declared *relative* bound is missed by every order of
-  // magnitude there is. All three are the same defect: the file keeps its
-  // promise about the number it stored and not about the number it was given.
-  // Refusing here names the lane and the gaussian, which is the diagnosis the
-  // caller can act on (AGENTS.md §6).
+  // These lanes have domains the quantizer cannot repair. Colour is read back
+  // through `.clamp(0.0, 1.0)`, so an input of 1.2 returns as 1.0 while the file
+  // declares an `rgb` bound near 0.004. Scale is quantized in the log domain,
+  // which is defined for every positive Float32 value and for nothing at or
+  // below zero. Refusing outside those domains names the lane and gaussian;
+  // flooring would quietly store a value nobody authored (AGENTS.md §6).
   for (int i = 0; i < n; i++) {
     for (int c = 0; c < 4; c++) {
       final v = g.colors[i * 4 + c];
@@ -404,8 +420,8 @@ void _checkInput(FourdgsGaussianSet g, double cutoff) {
   // infinity. NaN and `-inf` are refused, because a decoder reads every
   // non-finite sigma as never-fading and a NaN there becomes a
   // deliberate-looking value. A finite negative one is refused for the reason
-  // above: it is a standard deviation, it goes through the same
-  // `max(sigma, 1e-30)`, and it would be stored as a lifetime nobody wrote.
+  // above: it is a standard deviation and would be stored as a positive
+  // lifetime nobody wrote.
   // Zero stays legal — it is a gaussian whose support is a single instant, which
   // is a shape the chunk planner has to handle, and `1e-30` is as near it as a
   // logarithmic grid reaches.
@@ -812,8 +828,11 @@ _Quantized _quantize(
         'position',
         i,
       );
+      // Input validation already proved this Float32 value is finite and
+      // strictly positive. Preserve its actual logarithm: flooring a legal
+      // sub-1e-30 scale would violate the Header's relative error promise.
       scale[i * 3 + axis] = _bin(
-        math.log(math.max(g.scales[i * 3 + axis], 1e-30)) / stepScaleLog,
+        math.log(g.scales[i * 3 + axis]) / stepScaleLog,
         'scale',
         i,
       );
@@ -1600,6 +1619,47 @@ Uint8List _concat(Uint8List head, Uint8List tail) {
 // --------------------------------------------------------------------------
 // A little-endian byte sink
 // --------------------------------------------------------------------------
+
+/// Counts bytes while forwarding each completed record to the caller's sink.
+class _SinkWriter {
+  _SinkWriter(this._sink);
+
+  final Sink<List<int>> _sink;
+  int _length = 0;
+
+  int get length => _length;
+
+  void bytes(Uint8List bytes) {
+    _sink.add(bytes);
+    _length += bytes.length;
+  }
+}
+
+/// The deliberately whole-file adapter behind [writeFourdgsBytes].
+class _ByteCollector implements Sink<List<int>> {
+  final _parts = <Uint8List>[];
+  int _length = 0;
+
+  @override
+  void add(List<int> data) {
+    final bytes = data is Uint8List ? data : Uint8List.fromList(data);
+    _parts.add(bytes);
+    _length += bytes.length;
+  }
+
+  @override
+  void close() {}
+
+  Uint8List finish() {
+    final out = Uint8List(_length);
+    int at = 0;
+    for (final part in _parts) {
+      out.setRange(at, at + part.length, part);
+      at += part.length;
+    }
+    return out;
+  }
+}
 
 class _ByteWriter {
   _ByteWriter([int capacity = 256]) : _buf = Uint8List(math.max(capacity, 16)) {

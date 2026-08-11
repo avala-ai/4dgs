@@ -131,6 +131,17 @@ double declared(FourdgsQuantization quantization, String key) =>
 List<FourdgsRecord> recordsOf(Uint8List bytes) =>
     iterRecords(bytes, fourdgsMagic.length).toList();
 
+class _RecordingSink implements Sink<List<int>> {
+  final parts = <Uint8List>[];
+  bool closed = false;
+
+  @override
+  void add(List<int> data) => parts.add(Uint8List.fromList(data));
+
+  @override
+  void close() => closed = true;
+}
+
 void main() {
   group('the envelope', () {
     test('opens and closes with the magic, and frames every record', () {
@@ -155,6 +166,29 @@ void main() {
       expect(opcodes[2], opWindowTable);
       expect(opcodes.last, opFooter);
       expect(opcodes, contains(opChunk));
+    });
+
+    test('the sink writer emits complete records and borrows the sink', () {
+      final scene = buildScene(shDegree: 2);
+      final sink = _RecordingSink();
+      writeFourdgsToSink(sink, scene, 8.0);
+
+      expect(sink.closed, isFalse, reason: 'the caller owns the transport');
+      expect(sink.parts.first, orderedEquals(fourdgsMagic));
+      expect(sink.parts.last, orderedEquals(fourdgsMagic));
+      for (final record in sink.parts.skip(1).take(sink.parts.length - 2)) {
+        expect(
+          record.length,
+          recordHeaderBytes + _contentLength(record, 0),
+          reason: 'every add between the magic markers is one framed record',
+        );
+      }
+
+      final streamed = Uint8List.fromList(
+        sink.parts.expand((part) => part).toList(),
+      );
+      expect(streamed, orderedEquals(writeFourdgsBytes(scene, 8.0)));
+      expect(readFourdgsBytes(streamed).gaussians.count, scene.count);
     });
 
     test('invalid deflate levels are authoring errors', () {
@@ -1410,9 +1444,8 @@ void main() {
     });
 
     test('a scale at or below zero is refused rather than floored', () {
-      // Same defect as the colour clamp, one lane over: scales are quantized as
-      // `log(max(scale, 1e-30))` against a *relative* bound, and zero has no
-      // relative distance from anything.
+      // Scales are quantized in the log domain against a relative bound, and
+      // zero has neither a logarithm nor a relative distance from anything.
       for (final value in <double>[0.0, -1e-3]) {
         final scene = buildScene(count: 8);
         scene.scales[3 * 3 + 2] = value;
@@ -1428,6 +1461,17 @@ void main() {
           reason: 'scale = $value',
         );
       }
+    });
+
+    test('a positive scale below 1e-30 keeps the declared relative bound', () {
+      final scene = flatScene(8, winHi: 8.0);
+      final source = Float32List.fromList(<double>[1e-35]).single;
+      scene.scales[3 * 3 + 2] = source;
+
+      final decoded = readFourdgsBytes(writeFourdgsBytes(scene, 8.0));
+      final actual = decoded.gaussians.scales[3 * 3 + 2];
+      final bound = declared(decoded.quantization, 'scale_rel');
+      expect((actual / source - 1.0).abs(), lessThanOrEqualTo(bound));
     });
 
     test('an unknown profile lists the ones that exist', () {

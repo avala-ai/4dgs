@@ -22,10 +22,11 @@
 /// the edges, so the decoder can be tested without a network and shipped
 /// without a platform.
 ///
-/// Writing goes the other way through the same primitives: [writeFourdgsBytes]
-/// encodes a [FourdgsGaussianSet] into a complete file. It is an encoder in its
-/// own right rather than a wrapper over another SDK's, which is what makes its
-/// agreement with them worth something.
+/// Writing goes the other way through the same primitives:
+/// [writeFourdgsToSink] emits bounded records and [writeFourdgsBytes] is its
+/// in-memory convenience. They encode a [FourdgsGaussianSet] in their own right
+/// rather than wrapping another SDK, which is what makes their agreement with
+/// those SDKs worth something.
 ///
 /// Reading a file from disk needs one more import: `package:fourdgs/io.dart`
 /// carries the `dart:io` transport, kept out of this library so the decoder

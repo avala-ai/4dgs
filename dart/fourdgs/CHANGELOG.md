@@ -14,11 +14,12 @@ happened.
 
 ### The writer
 
-- `writeFourdgsBytes` encodes a `FourdgsGaussianSet` into a complete `.4dgs` buffer: the magic at
-  both ends, opcode-tagged length-prefixed records, Header, Quantization, Window Table, a Chunk with
-  its attribute streams, the spherical-harmonic band records, and a Footer. A second encoder rather
-  than a binding — it shares no code with the other five SDKs and lands on the same integer bins, so
-  a decoder cannot tell its output from theirs once decoded.
+- `writeFourdgsToSink` encodes a `FourdgsGaussianSet` one complete framed record at a time without
+  retaining the output file; `writeFourdgsBytes` is the explicit in-memory convenience over that
+  sink API. Both write the magic at both ends, Header, Quantization, Window Table, Chunks and their
+  attribute streams, spherical-harmonic band records, and Footer. A second encoder rather than a
+  binding — it shares no code with the other five SDKs and lands on the same integer bins, so a
+  decoder cannot tell its output from theirs once decoded.
 - Summary writing, in the shape spec §4.5 requires: the Chunk Index, then Statistics, then the
   Summary Offset, one contiguous run immediately before the Footer with nothing else inside it. That
   contiguity is what lets a streamed reader verify `summary_crc` by retaining the trailing records
@@ -35,11 +36,13 @@ happened.
   An inverted window is refused rather than written because visibility is gated on `lo <= t < hi`:
   it would cover no instant, and this package's own reader refuses the record carrying it, so
   writing one produces a file neither read path can reopen.
-- Three lanes that a clamp would otherwise change silently are refused instead: an rgb or opacity
-  component outside `[0, 1]`, which `decodeChunk` clamps back into the range, so a channel of 1.2
-  returns as 1.0 in a file declaring an `rgb` bound near 0.004; a scale at or below zero, and a
-  finite negative `sigma_t`, both of which go through `log(max(v, 1e-30))` and come back as a value
-  no caller wrote, missing a *relative* bound by every order of magnitude there is. A `sigma_t` of
+- Three lanes that a domain repair would otherwise change silently are refused instead: an rgb or
+ - Three lanes that a domain repair would otherwise change silently are refused instead: an rgb or
+   opacity component outside `[0, 1]`, which `decodeChunk` clamps back into the range, so a channel
+   of 1.2 returns as 1.0 in a file declaring an `rgb` bound near 0.004; a scale at or below zero,
+   whose logarithm is undefined; and a finite negative `sigma_t`, which would be floored to a
+   positive lifetime. Every strictly positive Float32 scale, including values below `1e-30`, is
+   quantized from its actual logarithm and stays inside the declared relative bound. A `sigma_t` of
   exactly zero stays legal: it is a gaussian whose support is a single instant.
 - Finite authoring input is also checked in the representation the decoder returns. A position or
   velocity whose legal integer bin reconstructs beyond finite `float32` is refused rather than
