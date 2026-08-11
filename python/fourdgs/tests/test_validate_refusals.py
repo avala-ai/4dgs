@@ -313,6 +313,16 @@ class TestKeyframeDelta:
         named = [f.refusal for f in report.findings if f.refusal is not None]
         assert any(n.code == "unknown-quantization-scheme" and n.site is not None for n in named), report.findings
 
+    def test_every_header_is_checked_on_the_selected_keyframe_delta_path(self):
+        data = _keyframe_file(write_index=False)
+        original = _first_record(data, op.HEADER)
+        wrong = rec.Header.parse(original.content)
+        wrong.temporal_model = "gaussian-birth"
+        wrong_first = data[: original.offset] + wrong.encode() + data[original.offset + 9 + len(original.content) :]
+        report = validate(_splice(wrong_first, original))
+        assert not report.ok
+        assert any("contains a Header declaring" in finding.message for finding in report.findings)
+
     def test_the_index_and_the_delta_chunk_must_agree_field_by_field(self):
         """§5.8: four index fields duplicate what the Delta Chunk states, and "a reader
         MUST refuse a file where the index and the record disagree, naming the field".
@@ -337,6 +347,25 @@ class TestKeyframeDelta:
         report = validate(_repack_summary(data, lambda _i, e: _with(e, kind=2) if e.kind == 1 else e))
         assert not report.ok
         assert any("unknown chunk_kind 2" in f.message for f in report.findings), report.findings
+
+    def test_every_keyframe_delta_index_entry_carries_the_extension(self):
+        data = _keyframe_file()
+        report = validate(
+            _repack_summary(data, lambda i, entry: _with(entry, extended=False) if i == 0 else entry)
+        )
+        assert not report.ok
+        assert any("omits chunk_kind" in finding.message for finding in report.findings)
+
+    def test_an_indexed_state_range_frames_exactly_one_record(self):
+        data = _keyframe_file()
+        report = validate(
+            _repack_summary(
+                data,
+                lambda i, entry: _with(entry, chunk_length=entry.chunk_length + 9) if i == 0 else entry,
+            )
+        )
+        assert not report.ok
+        assert any("frames exactly" in finding.message for finding in report.findings)
 
     def test_a_keyframe_chunk_interval_must_match_its_index_entry(self):
         data = _keyframe_file()
@@ -379,6 +408,44 @@ class TestKeyframeDelta:
         )
         ids, _bins = kdf._keyframe_from_chunk(content)
         assert len(ids) == head.count
+
+    def test_delta_chunk_level_compression_is_honored(self):
+        delta = _first_record(_keyframe_file(), op.DELTA_CHUNK)
+        head, raw = rec.parse_delta_chunk_block(delta.content)
+        compressed = compress(bytes(raw), CODEC_DEFLATE, 6)
+        content = (
+            put_f64(head.t0)
+            + put_f64(head.t1)
+            + put_u32(head.level)
+            + bytes([head.delta_mode])
+            + put_u64(head.reference_offset)
+            + put_u64(head.keyframe_offset)
+            + struct.pack("<H", head.depth)
+            + put_u32(head.update_count)
+            + put_u32(head.birth_count)
+            + put_u32(head.death_count)
+            + put_string("deflate")
+            + put_u64(len(raw))
+            + put_blob(compressed)
+        )
+        parsed, *_groups = kdf._delta_chunk_groups(content)
+        assert parsed.t0 == head.t0 and parsed.t1 == head.t1
+        assert parsed.compression == "deflate" and parsed.uncompressed_size == len(raw)
+
+    def test_births_are_complete_and_deaths_carry_only_identity(self):
+        empty = kdf.State(ids=np.zeros(0, dtype=np.int64), bins={})
+        birth = encode_stream(op.A_GAUSSIAN_ID, np.array([[7]], dtype=np.int64), channels=1)
+        birth += encode_stream(op.A_WINDOW_INDEX, np.array([[0]], dtype=np.int64), channels=1)
+        born = rec.encode_delta_chunk(0.0, 1.0, 0, 0, 0, 0, 1, b"", birth, b"", (0, 1, 0))
+        with pytest.raises(MalformedFile, match="missing required attributes"):
+            kdf._compose_delta(empty, born[9:])
+
+        live = kdf.State(ids=np.array([7], dtype=np.int64), bins={})
+        death = encode_stream(op.A_GAUSSIAN_ID, np.array([[7]], dtype=np.int64), channels=1)
+        death += encode_stream(op.A_POSITION, np.zeros((1, 3), dtype=np.int64), channels=3)
+        killed = rec.encode_delta_chunk(0.0, 1.0, 0, 0, 0, 0, 1, b"", b"", death, (0, 0, 1))
+        with pytest.raises(MalformedFile, match="deaths group carries attributes"):
+            kdf._compose_delta(live, killed[9:])
 
     def test_indexed_keyframe_delta_bands_are_decoded(self):
         data = _keyframe_file()
@@ -538,6 +605,14 @@ class TestKeyframeDelta:
             assert not report.ok, name
             assert any("state chunks" in f.message for f in report.findings), (name, report.findings)
 
+    def test_an_indexless_sequence_must_tile_the_timeline_too(self):
+        data = bytearray(_keyframe_file(write_index=False))
+        delta = _first_record(bytes(data), op.DELTA_CHUNK)
+        struct.pack_into("<d", data, delta.offset + 9, 1.25)
+        report = validate(bytes(data))
+        assert not report.ok
+        assert any("preceding interval ends" in finding.message for finding in report.findings)
+
 
 class TestTheIndexIsData:
     """An index entry is data, and data in an untrusted file can say anything.
@@ -569,6 +644,32 @@ class TestTheIndexIsData:
 
 
 class TestSHBandStreams:
+    def test_a_gaussian_birth_index_cannot_omit_a_physical_band(self):
+        paths = [p for p in _variants(CORPUS) if "SHDegree2" in p.stem and "UseChunkIndex" in p.stem]
+        _require_corpus(paths, "indexed gaussian-birth variants carrying SH bands")
+        data = paths[0].read_bytes()
+        first = _index_entries(data)[0]
+        assert first.bands
+        report = validate(
+            _repack_summary(
+                data,
+                lambda i, entry: _with(entry, bands=entry.bands[1:]) if i == 0 else entry,
+            )
+        )
+        assert not report.ok
+        assert any("physical records following that chunk" in f.message for f in report.findings), report.findings
+
+    def test_a_band_stream_has_the_fixed_inner_attribute_id(self):
+        paths = [p for p in _variants(CORPUS) if "SHDegree2" in p.stem]
+        _require_corpus(paths, "corpus variants carrying SH bands")
+        data = bytearray(paths[0].read_bytes())
+        band = _first_record(bytes(data), op.SH_BAND_STREAM)
+        assert band is not None
+        data[band.offset + 9 + 1] = op.A_POSITION
+        report = validate(bytes(data))
+        assert not report.ok
+        assert any("inner attribute_id" in f.message for f in report.findings), report.findings
+
     def test_a_band_that_does_not_decode_is_found_and_named(self):
         """A framing walk steps over an SH Band Stream exactly as it steps over a Chunk.
 
@@ -663,8 +764,17 @@ class TestTruncation:
         # The incomplete record is listed — hiding it would hide the length that is the
         # fault — and it is not counted as something a streamed reader keeps.
         assert walk.intact() == len(walk.records) - 1
-        assert walk.records[-1].offset == walk.cut.at
+        assert walk.cut.at == len(whole) // 2
+        assert walk.records[-1].offset == walk.cut.record_at
         assert not walk.trailing_magic
+
+    def test_a_cut_after_a_complete_index_stays_a_validation_report(self):
+        whole = _real_file()
+        footer = _first_record(whole, op.FOOTER)
+        cut = whole[: footer.offset + 10]
+        report = validate(cut)
+        assert not report.ok
+        assert any(f"cut at byte {len(cut):,}" in finding.message for finding in report.findings)
 
 
 class TestRefusalPlacement:
@@ -819,6 +929,18 @@ class TestBoundedDecoding:
         report = validate(bytes(patched))
         assert not report.ok
         assert any("selected reference requires depth" in finding.message for finding in report.findings)
+
+    def test_an_unindexed_keyframe_refusal_keeps_its_record_site(self):
+        data = bytearray(_keyframe_file(write_index=False))
+        chunk = _first_record(bytes(data), op.CHUNK)
+        _head, streams = rec.parse_chunk(chunk.content)
+        stream_at = chunk.offset + 9 + len(chunk.content) - len(streams)
+        data[stream_at + 3] = 9
+        report = validate(bytes(data))
+        named = [finding.refusal for finding in report.findings if finding.refusal is not None]
+        refusal_ = next(item for item in named if item.code == "unknown-stream-codec")
+        assert refusal_.site is not None
+        assert refusal_.site.offset == chunk.offset
 
     def test_validation_framing_does_not_retain_one_object_per_record(self):
         data = _keyframe_file(write_index=False)

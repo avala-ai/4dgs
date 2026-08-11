@@ -485,13 +485,13 @@ def validate(data: bytes) -> Report:
     # valid. The file layout is "one per chunk" (§4), so the omission is itself the fault
     # and naming it is better than quietly decoding around it.
     if index:
-        for record in iter_records(data, len(MAGIC)):
-            if record.opcode not in (op.CHUNK, op.DELTA_CHUNK):
+        for frame in walk.intact_records():
+            if frame.opcode not in (op.CHUNK, op.DELTA_CHUNK):
                 continue
-            at = record.offset
+            at = frame.offset
             if at not in named_by_index:
                 report.error(
-                    f"the {op.name(record.opcode)} record at byte {at} is not named by any chunk index entry; "
+                    f"the {op.name(frame.opcode)} record at byte {at} is not named by any chunk index entry; "
                     f"a seeking reader never reads it (§4)"
                 )
 
@@ -511,8 +511,14 @@ def validate(data: bytes) -> Report:
     # reader keeps it. Saying only that the file stopped reading leaves its holder to
     # guess whether anything is salvageable; this says how much.
     if walk.cut is not None:
+        record_start = (
+            f"The incomplete record starts at byte {walk.cut.record_at:,}. "
+            if walk.cut.record_at is not None
+            else ""
+        )
         report.note(
             f"the file is cut at byte {walk.cut.at:,}: {walk.cut.reason}. "
+            f"{record_start}"
             f"The {walk.intact()} complete records before it are intact, "
             f"and a streamed reader recovers them"
         )
@@ -539,7 +545,11 @@ def _check_gaussian_birth(data: bytes, walk: Walk, report: Report) -> None:
     try:
         from .indexed_reader import open_indexed
 
-        open_indexed(BytesReadable(data))
+        scene = open_indexed(BytesReadable(data))
+        if scene.index:
+            from .keyframe_delta_file import check_index_bands
+
+            check_index_bands(data, scene.index, scene.header.sh_degree)
     except FourdgsError as exc:
         report.refused("a seeking reader cannot open this file: ", exc, walk)
         # A file that will not open will not decode either, and the second error would say
@@ -564,31 +574,47 @@ def _check_keyframe_delta(data: bytes, walk: Walk, report: Report, header: rec.H
     report can name.
     """
     from . import keyframe_delta_file as kdf
-    from .registry import check_quantization_scheme
+    from .registry import check_quantization_scheme, check_temporal_model
 
     # The compatibility gate the gaussian-birth branch gets from `open_indexed`. The
     # keyframe-delta reader parses the front matter without consulting the registry, so a
     # file declaring a quantization scheme no build implements was reported valid on this
     # path and refused on the other — the same bytes, two answers, decided by a field that
-    # has nothing to do with quantization. (The temporal model is not rechecked here: it is
-    # what selected this branch, and `registry.check_temporal_model` names the models the
-    # *gaussian-birth* reader implements.)
+    # has nothing to do with quantization. Every Header is checked as encountered too:
+    # selecting this path from the last Header does not excuse an earlier Header that a
+    # streamed decoder would refuse.
+    gate_site: Site | None = None
     try:
         for frame in walk.intact_records():
-            if frame.opcode != op.QUANTIZATION:
+            if frame.opcode not in (op.HEADER, op.QUANTIZATION):
                 continue
             content = frame.content(data)
-            if content is not None:
+            if content is None:
+                continue
+            gate_site = Site(frame.offset, f"the {op.name(frame.opcode)} record")
+            if frame.opcode == op.HEADER:
+                model = rec.Header.parse(content).temporal_model
+                if model != "keyframe-delta":
+                    # Preserve the named registry refusal for an unknown model. A known
+                    # gaussian-birth value is simply wrong for this selected path.
+                    check_temporal_model(model)
+                    raise FourdgsError(
+                        f"a keyframe-delta sequence contains a Header declaring {model!r}",
+                        code="wrong-temporal-model",
+                    )
+            else:
                 check_quantization_scheme(rec.Quantization.parse(content).scheme)
     except FourdgsError as exc:
-        report.refused("a seeking reader cannot open this file: ", exc, walk)
+        report.refused("a seeking reader cannot open this file: ", exc, walk, gate_site)
         return
 
-    # Distinct identities over the whole sequence, which is what `gaussian_count` counts
-    # under this model (§11.4) — every keyframe carries a full population, so summing the
-    # chunks is a larger number by design and the check above skips this model entirely.
-    # Skipping it left the field unchecked by anything: a Header could declare any number.
-    live: set[int] = set()
+    current_site: Site | None = None
+
+    def visiting_record(offset: int, opcode: int) -> None:
+        nonlocal current_site
+        current_site = Site(offset, f"the {op.name(opcode)} record")
+
+    identity_audit = kdf.BoundedIdentityAudit()
 
     if not indexed:
         # No index is a legal file, not a broken one: §4 makes the summary optional and
@@ -597,13 +623,41 @@ def _check_keyframe_delta(data: bytes, walk: Walk, report: Report, header: rec.H
         # the magic as record framing — so every conforming indexless keyframe-delta file
         # was reported invalid, with a diagnosis about a record that does not exist.
         windows = _window_table(walk, data)
+        first_t0: float | None = None
+        previous_t1: float | None = None
+        last_t1: float | None = None
+
+        def interval(offset: int, t0: float, t1: float) -> None:
+            nonlocal first_t0, previous_t1, last_t1
+            if first_t0 is None:
+                first_t0 = t0
+                if t0 != 0.0:
+                    raise FourdgsError(
+                        f"the first keyframe-delta state starts at {t0}, not 0",
+                        code="timeline-gap",
+                    )
+            elif previous_t1 != t0:
+                raise FourdgsError(
+                    f"state chunk at {offset} starts at {t0}; the preceding interval ends at {previous_t1}",
+                    code="timeline-gap",
+                )
+            previous_t1 = last_t1 = t1
+
         try:
-            for _offset, _kind, state in kdf.scan_streamed(data):
+            for _offset, _kind, state in kdf.scan_streamed(
+                data, on_record=visiting_record, on_state=interval
+            ):
                 kdf.check_window_indices_of(state, windows)
-                live.update(int(v) for v in state.ids)
+                identity_audit.observe(_offset, state)
                 del state
+            if last_t1 != header.duration_sec:
+                raise FourdgsError(
+                    f"the last keyframe-delta state ends at {last_t1}; the Header duration is "
+                    f"{header.duration_sec}",
+                    code="timeline-gap",
+                )
         except FourdgsError as exc:
-            report.refused("a chunk does not decode: ", exc, walk)
+            report.refused("a chunk does not decode: ", exc, walk, current_site)
             return
     else:
         try:
@@ -621,7 +675,7 @@ def _check_keyframe_delta(data: bytes, walk: Walk, report: Report, header: rec.H
 
         try:
             for _entry, state in kdf.scan_indexed(data, opened.index, opened.windows, visiting):
-                live.update(int(v) for v in state.ids)
+                identity_audit.observe(_entry.chunk_offset, state)
                 # Dropped before the next entry is composed, not merely rebound after it:
                 # the generator retains only current and GOP-keyframe state.
                 del state
@@ -633,9 +687,18 @@ def _check_keyframe_delta(data: bytes, walk: Walk, report: Report, header: rec.H
             report.refused("a chunk does not decode: ", exc, walk, site)
             return
 
-    if len(live) != header.gaussian_count:
+    if identity_audit.overflowed:
+        try:
+            distinct = kdf.count_distinct_ids_bounded(data, on_record=visiting_record)
+        except FourdgsError as exc:
+            report.refused("a chunk does not decode: ", exc, walk, current_site)
+            return
+    else:
+        distinct = identity_audit.distinct
+    if distinct != header.gaussian_count:
         report.error(
-            f"Header declares {header.gaussian_count} gaussians; the sequence carries {len(live)} distinct gaussian ids"
+            f"Header declares {header.gaussian_count} gaussians; the sequence carries "
+            f"{distinct} distinct gaussian ids"
         )
 
 

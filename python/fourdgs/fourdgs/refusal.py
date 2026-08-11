@@ -86,6 +86,8 @@ class Cut:
     #: True when the cut is inside a record whose framing was read — so the last record
     #: the walk reports is the incomplete one, and everything before it is intact.
     inside_a_record: bool
+    #: Opcode byte of that incomplete record. ``None`` when framing itself was cut.
+    record_at: int | None = None
 
 
 @dataclass
@@ -193,11 +195,12 @@ def walk(data: bytes, *, retain_records: bool = True) -> Walk:
         end = at + frame.total
         if end > out.size:
             out.cut = Cut(
-                at=at,
+                at=out.size,
                 reason=(
                     f"the {op.name(opcode)} record declares {length:,} bytes, past the end of a {out.size:,}-byte file"
                 ),
                 inside_a_record=True,
+                record_at=at,
             )
             break
         at = end
@@ -454,7 +457,15 @@ def scan_front_to_back(data: bytes, where: Walk) -> ChunkRefusal | None:
                 # The band index, which the record carries and the stream header does not:
                 # a band stream's `attribute_id` is 0x07 and collides with `mu_t` (§5.7).
                 cursor.u8()
-                decode_stream(cursor)
+                attribute, _values = decode_stream(cursor)
+                if attribute != op.SH_BAND_STREAM:
+                    from .exceptions import MalformedFile
+
+                    raise MalformedFile(
+                        f"the SH Band Stream at {frame.offset} declares inner attribute_id "
+                        f"{attribute}; version 1 fixes it at {op.SH_BAND_STREAM}",
+                        code="index-record-mismatch",
+                    )
             except FourdgsError as exc:
                 return ChunkRefusal(exc, here)
     return None

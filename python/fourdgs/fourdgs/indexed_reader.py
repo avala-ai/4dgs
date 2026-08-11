@@ -362,7 +362,12 @@ def read_chunk(source: Readable, scene: IndexedScene, entry: rec.ChunkIndexEntry
         cur.u8()  # band index, already known from the index
         from .serialization import decode_stream
 
-        _, values = decode_stream(cur)
+        attribute, values = decode_stream(cur)
+        if attribute != op.SH_BAND_STREAM:
+            raise MalformedFile(
+                f"the SH Band Stream at {offset} declares inner attribute_id {attribute}; "
+                f"version 1 fixes it at {op.SH_BAND_STREAM}"
+            )
         decoded["sh"][band] = values
     return decoded
 

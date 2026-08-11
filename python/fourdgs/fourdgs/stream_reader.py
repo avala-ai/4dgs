@@ -374,7 +374,12 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
                     band_cursor = Cursor(record.content)
                     band = band_cursor.u8()
                     if band <= max_sh_band:
-                        _, values = decode_stream(band_cursor)
+                        attribute, values = decode_stream(band_cursor)
+                        if attribute != op.SH_BAND_STREAM:
+                            raise MalformedFile(
+                                f"the SH Band Stream at {record.offset} declares inner attribute_id "
+                                f"{attribute}; version 1 fixes it at {op.SH_BAND_STREAM}"
+                            )
                         chunk_bands[-1][band] = values
             elif record.opcode == op.AUDIO:
                 if first_audio_record is None:

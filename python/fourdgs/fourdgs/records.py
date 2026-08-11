@@ -336,7 +336,8 @@ def encode_delta_chunk(
     return put_record(op.DELTA_CHUNK, body)
 
 
-def parse_delta_chunk(content) -> tuple[DeltaChunkHeader, memoryview, memoryview, memoryview]:
+def parse_delta_chunk_block(content) -> tuple[DeltaChunkHeader, memoryview]:
+    """Parse a Delta Chunk header and return its still-compressed records block."""
     c = Cursor(content)
     head = DeltaChunkHeader(
         t0=c.f64(),
@@ -352,7 +353,19 @@ def parse_delta_chunk(content) -> tuple[DeltaChunkHeader, memoryview, memoryview
         compression=c.string(),
         uncompressed_size=c.u64(),
     )
-    records = Cursor(c.take(c.u64()))
+    return head, c.take(c.u64())
+
+
+def parse_delta_chunk(content) -> tuple[DeltaChunkHeader, memoryview, memoryview, memoryview]:
+    """Parse an uncompressed Delta Chunk into its three framed groups.
+
+    Readers that support the record-level ``compression`` field first call
+    :func:`parse_delta_chunk_block`, decompress the returned block, and frame the three
+    groups from those bytes. This convenience remains the reference encoder's empty-codec
+    path and keeps the record module independent of codec implementations.
+    """
+    head, block = parse_delta_chunk_block(content)
+    records = Cursor(block)
     return head, records.take(records.u64()), records.take(records.u64()), records.take(records.u64())
 
 
