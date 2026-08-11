@@ -305,6 +305,7 @@ fn seek_cost(scene: &IndexedScene) {
 /// the region it sits in rather than a field of its own — covered and agreeing, covered
 /// and not, or covered by nothing at all — and saying so per record is what tells a reader
 /// whether the checksum has anything to say about the record they are looking at.
+#[derive(Debug)]
 struct Coverage {
     start: u64,
     /// One past the last covered byte: where the Footer record's opcode sits.
@@ -363,8 +364,14 @@ fn coverage(source: &mut dyn Readable, walk: &crate::refusal::Walk) -> Result<Op
         frame.length.min(FOOTER_FIELDS),
     )?;
     let footer = fourdgs::records::Footer::parse(&content)?;
-    if footer.summary_crc == 0 || footer.summary_start == 0 || footer.summary_start > frame.offset {
+    if footer.summary_crc == 0 || footer.summary_start == 0 {
         return Ok(None);
+    }
+    if footer.summary_start > frame.offset {
+        return Err(fourdgs::Error::Malformed(format!(
+            "the Footer says its checksummed summary starts at {}, after the Footer itself at {}",
+            footer.summary_start, frame.offset
+        )));
     }
     // The summary ends where the Footer begins — taken from the walk rather than computed
     // from a footer's expected size, so a Footer that a later revision extends does not
@@ -792,5 +799,22 @@ mod tests {
         let mut source = BytesReadable::new(&data);
         let walk = crate::refusal::walk(&mut source).expect("a walk");
         assert!(coverage(&mut source, &walk).is_err());
+    }
+
+    #[test]
+    fn a_checksummed_summary_cannot_start_after_its_footer() {
+        let mut data = footer_declaring(0);
+        let footer_at = data.len() - (RECORD_HEADER_SIZE + 20 + MAGIC.len());
+        let impossible = (footer_at as u64 + 1).to_le_bytes();
+        let start = footer_at + RECORD_HEADER_SIZE;
+        data[start..start + 8].copy_from_slice(&impossible);
+
+        let mut source = BytesReadable::new(&data);
+        let walk = crate::refusal::walk(&mut source).expect("a framing walk");
+        let error = coverage(&mut source, &walk).expect_err("the checksum range is impossible");
+        assert!(
+            error.to_string().contains("after the Footer itself"),
+            "{error}"
+        );
     }
 }

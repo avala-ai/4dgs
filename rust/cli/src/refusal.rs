@@ -563,10 +563,6 @@ pub fn scan_streamed(source: &mut dyn Readable) -> std::result::Result<(), (Erro
     let mut count = 0usize;
 
     while let Some(frame) = records.next_frame() {
-        let Some(content) = records.content(&frame) else {
-            continue;
-        };
-        let content = content.as_slice();
         let here = || {
             Some(Site {
                 offset: frame.offset,
@@ -578,27 +574,40 @@ pub fn scan_streamed(source: &mut dyn Readable) -> std::result::Result<(), (Erro
             // finding the validator has already made, and stopping here would replace it
             // with a worse one.
             op::HEADER => {
-                if let Ok(header) = rec::Header::parse(content) {
+                let Some(content) = records.content(&frame) else {
+                    continue;
+                };
+                if let Ok(header) = rec::Header::parse(&content) {
                     cutoff = header.cutoff;
                 }
             }
             op::QUANTIZATION => {
-                if let Ok(parsed) = rec::Quantization::parse(content) {
+                let Some(content) = records.content(&frame) else {
+                    continue;
+                };
+                if let Ok(parsed) = rec::Quantization::parse(&content) {
                     quantization = Some(parsed);
                 }
             }
             op::WINDOW_TABLE => {
-                if let Ok(table) = rec::WindowTable::parse(content) {
+                let Some(content) = records.content(&frame) else {
+                    continue;
+                };
+                if let Ok(table) = rec::WindowTable::parse(&content) {
                     windows = table.windows;
                 }
             }
             op::CHUNK => {
+                let Some(content) = records.content(&frame) else {
+                    continue;
+                };
                 // A Chunk before the grid it is quantized against is a fault the validator
                 // reports itself; there is nothing to decode it with here.
                 let Some(quantization) = &quantization else {
                     continue;
                 };
-                let (head, streams) = rec::parse_chunk(content).map_err(|error| (error, here()))?;
+                let (head, streams) =
+                    rec::parse_chunk(&content).map_err(|error| (error, here()))?;
                 let blob = fourdgs::chunk::chunk_stream_bytes(&head, streams)
                     .map_err(|error| (error, here()))?;
                 let decoded = fourdgs::chunk::decode_streams(
@@ -613,7 +622,10 @@ pub fn scan_streamed(source: &mut dyn Readable) -> std::result::Result<(), (Erro
                 count = decoded.count;
             }
             op::SH_BAND_STREAM => {
-                let mut cursor = Cursor::new(content);
+                let Some(content) = records.content(&frame) else {
+                    continue;
+                };
+                let mut cursor = Cursor::new(&content);
                 // The band index, which the record carries and the stream header does not:
                 // a band stream's `attribute_id` is 0x07 and collides with `mu_t` (§5.7).
                 cursor.u8().map_err(|error| (error, here()))?;
@@ -633,7 +645,13 @@ pub fn scan_streamed(source: &mut dyn Readable) -> std::result::Result<(), (Erro
 /// else — so a band record there is reachable only by asking for it directly, which is what
 /// this is. `count` is the entry's own `gaussian_count`: a band stream is sized against the
 /// chunk it belongs to (spec §5.7), and a stream that disagrees is a fault of its own.
-pub fn decode_band_record(data: &[u8], at: u64, length: u64, count: usize) -> Result<()> {
+pub fn decode_band_record(
+    data: &[u8],
+    at: u64,
+    length: u64,
+    declared_band: u8,
+    count: usize,
+) -> Result<()> {
     let start = usize::try_from(at).map_err(|_| out_of_file(at))?;
     let end = usize::try_from(length)
         .ok()
@@ -651,7 +669,17 @@ pub fn decode_band_record(data: &[u8], at: u64, length: u64, count: usize) -> Re
     let mut content = Cursor::new(record.blob()?);
     // The band index, which the record carries and the stream header does not: a band
     // stream's `attribute_id` is 0x07 and collides with `mu_t` (§5.7).
-    content.u8()?;
+    let physical_band = content.u8()?;
+    if !(1..=3).contains(&physical_band) {
+        return Err(Error::Malformed(format!(
+            "the SH Band Stream at byte {at} declares band {physical_band}; only bands 1 through 3 are defined"
+        )));
+    }
+    if physical_band != declared_band {
+        return Err(Error::Malformed(format!(
+            "the chunk index labels the SH Band Stream at byte {at} as band {declared_band}; the record declares band {physical_band}"
+        )));
+    }
     decode_stream(&mut content, Some(count))?;
     Ok(())
 }

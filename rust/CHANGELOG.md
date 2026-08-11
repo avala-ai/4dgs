@@ -44,9 +44,9 @@ All notable changes to the Rust crate are documented here, following
     names the band record itself, not the Chunk it belongs to.
   - **It knows `keyframe-delta`.** Every structural check assumed the gaussian-birth chunk shape, so
     a conforming keyframe-delta file came back with seven errors and an `INVALID`. The Header's
-    declared model now selects the reader, and the model's own reader is what opens it — one chain
-    composed at a time, so a refusal names the index entry it came from and a long sequence is never
-    resident all at once.
+    declared model now selects the reader, and the model's own reader is what opens it. Validation
+    walks the timeline once, retaining only the current state and GOP keyframe, so a refusal names
+    its index entry without repeatedly decoding chained prefixes or retaining the sequence.
   - **A refusal is placed at the record that carries the refused value.** Nothing in the framing
     forbids a second Header or a second Quantization record, and both read paths check every copy
     they meet — so a file whose first Header is fine and whose second declares a model this build
@@ -82,16 +82,29 @@ All notable changes to the Rust crate are documented here, following
   essentially the whole file. `serialization::Crc32` is the same CRC-32 fed in pieces, and `inspect`
   feeds it a megabyte at a time.
 
-- **Five additive library items, each of which exists because a caller wants the verdict rather than
-  the data.** `serialization::Crc32`, above. `keyframe_delta_file::open_indexed` returns an
-  `IndexedSequence` — a file's front matter and index with nothing composed — and
-  `keyframe_delta_file::compose_chain` composes the chain ending at one index entry.
-  `decode_indexed` is those two in a loop and is unchanged; what it cannot do is answer "does every
-  chunk decode?" without keeping every state it decoded. `keyframe_delta_file::check_keyframe_chunk`
-  and `check_delta_chunk` answer the same question for one record of a file that has no index to
-  seek in, and keep nothing.
+- **Additive library items for callers that want the verdict rather than the whole sequence.**
+  `serialization::Crc32`, above. `keyframe_delta_file::open_indexed` returns an `IndexedSequence` —
+  a file's front matter and index with nothing composed — and `keyframe_delta_file::compose_chain`
+  composes the chain ending at one index entry. Both use the core `Readable` range abstraction.
+  `read_keyframe_entry` and `read_delta_entry` support a linear full-file walk without accumulating
+  states. `decode_indexed` is those two in a loop and is unchanged; what it cannot do is answer
+  "does every chunk decode?" without keeping every state it decoded.
+  `keyframe_delta_file::check_keyframe_chunk` and `check_delta_chunk` answer the same question for
+  one record of a file that has no index to seek in, and keep nothing.
 
 ### Fixed
+
+- **`keyframe-delta` validation now checks the model's complete structural contract.** Indexed
+  fields must agree with the Chunk or Delta Chunk they name; keyframe and delta-group stream counts
+  must agree with their record headers; keyframe-mode deltas reference the GOP keyframe and chained
+  deltas reference the immediately preceding state; SH band numbers must be in `1..3` and agree with
+  the index. Stream-only files compose deltas, check their timeline, and decode their SH bands too.
+  The Header's `gaussian_count` is checked against distinct identities using a fixed-memory,
+  disk-partitioned counter rather than a scene-sized identity map.
+
+- **`inspect` refuses an impossible checksum range.** A nonzero summary checksum whose start lies
+  after the Footer is malformed; it is no longer described as a file that intentionally omitted a
+  checksum.
 
 - **A `keyframe-delta` file declaring an unknown quantization scheme is refused.** The model's
   reader parsed its Quantization record and never asked the registry about it, so a scheme this

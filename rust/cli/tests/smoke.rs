@@ -789,6 +789,123 @@ fn fixture(name: &str, data: &[u8]) -> PathBuf {
     path
 }
 
+fn header_gaussian_count_offset(data: &[u8]) -> usize {
+    let record = fourdgs::serialization::Records::new(data, fourdgs::serialization::MAGIC.len())
+        .next()
+        .expect("a Header record")
+        .expect("the Header framing parses");
+    assert_eq!(record.opcode, 0x01);
+    let mut content = fourdgs::serialization::Cursor::new(record.content);
+    content.string().unwrap();
+    content.string().unwrap();
+    content.f64().unwrap();
+    record.offset + fourdgs::serialization::RECORD_HEADER_SIZE + content.position()
+}
+
+#[test]
+fn keyframe_delta_header_count_is_the_distinct_identity_count() {
+    let Some(source) = keyframe_file() else {
+        return;
+    };
+    let mut data = std::fs::read(&source).unwrap();
+    let at = header_gaussian_count_offset(&data);
+    let declared = u64::from_le_bytes(data[at..at + 8].try_into().unwrap());
+    data[at..at + 8].copy_from_slice(&(declared + 1).to_le_bytes());
+    let path = fixture("fourdgs-cli-kd-header-count.4dgs", &data);
+
+    let out = run(&["validate", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains("keyframes and birth groups introduce"),
+        "{text}"
+    );
+    std::fs::remove_file(path).ok();
+}
+
+#[test]
+fn delta_mode_must_name_the_reference_that_mode_defines() {
+    let Some(source) = keyframe_files().into_iter().find(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("KeyframeDelta-"))
+    }) else {
+        return;
+    };
+    let mut data = std::fs::read(&source).unwrap();
+    let (start, _) = summary_bounds(&data);
+    let (mut entries, rest) = summary_parts(&data);
+    assert!(entries.len() >= 3, "the fixture needs two deltas");
+    let target = 2usize;
+    assert_eq!(entries[target].kind, 1);
+    assert_eq!(entries[target - 1].kind, 1);
+
+    // Make both copies of the metadata self-consistent and make the generic chain walk
+    // succeed: only the mode-specific rule can reject this file.
+    entries[target].delta_mode = fourdgs::records::DELTA_MODE_KEYFRAME;
+    entries[target].reference_offset = entries[target - 1].chunk_offset;
+    entries[target].depth = entries[target - 1].depth + 1;
+    let content =
+        entries[target].chunk_offset as usize + fourdgs::serialization::RECORD_HEADER_SIZE;
+    data[content + 20] = fourdgs::records::DELTA_MODE_KEYFRAME;
+    data[content + 21..content + 29]
+        .copy_from_slice(&entries[target].reference_offset.to_le_bytes());
+    data[content + 37..content + 39].copy_from_slice(&entries[target].depth.to_le_bytes());
+
+    let summary: Vec<u8> = entries
+        .iter()
+        .flat_map(|entry| entry.encode())
+        .chain(rest)
+        .collect();
+    let path = fixture(
+        "fourdgs-cli-kd-mode-reference.4dgs",
+        &rebuilt(&data[..start], &summary),
+    );
+    let out = run(&["validate", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("uses keyframe mode but references"), "{text}");
+    std::fs::remove_file(path).ok();
+}
+
+#[test]
+fn indexed_band_number_must_match_the_physical_record() {
+    let Some(source) = keyframe_file() else {
+        return;
+    };
+    let data = std::fs::read(&source).unwrap();
+    let (start, _) = summary_bounds(&data);
+    let (mut entries, rest) = summary_parts(&data);
+    let count = entries[0].gaussian_count as usize;
+    entries[0].bands.push((1, 0, 0));
+    let entries_len: usize = entries.iter().map(|entry| entry.encode().len()).sum();
+    let band_at = (start + entries_len) as u64;
+    let mut content = vec![2u8];
+    content.extend_from_slice(
+        &fourdgs::stream::encode_stream(0x07, &vec![0; count], 1, 0, 0, false).unwrap(),
+    );
+    let mut band = vec![0x07u8];
+    band.extend_from_slice(&(content.len() as u64).to_le_bytes());
+    band.extend_from_slice(&content);
+    entries[0].bands = vec![(1, band_at, band.len() as u64)];
+    let summary: Vec<u8> = entries
+        .iter()
+        .flat_map(|entry| entry.encode())
+        .chain(band)
+        .chain(rest)
+        .collect();
+    let path = fixture(
+        "fourdgs-cli-kd-band-number.4dgs",
+        &rebuilt(&data[..start], &summary),
+    );
+
+    let out = run(&["validate", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("record declares band 2"), "{text}");
+    std::fs::remove_file(path).ok();
+}
+
 #[test]
 fn a_keyframe_delta_file_declaring_an_unknown_quantization_scheme_is_refused() {
     // The keyframe-delta reader parsed its Quantization record and never asked the registry

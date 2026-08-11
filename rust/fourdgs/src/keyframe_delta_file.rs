@@ -806,14 +806,19 @@ fn bin_array(stream: &DecodedStream) -> BinArray {
 }
 
 /// One length-framed sub-block: its ids, and a bin array per other attribute.
-fn decode_group(bytes: &[u8]) -> Result<(Vec<i64>, BTreeMap<u8, BinArray>)> {
+fn decode_group(bytes: &[u8], expected_count: usize) -> Result<(Vec<i64>, BTreeMap<u8, BinArray>)> {
     if bytes.is_empty() {
+        if expected_count != 0 {
+            return Err(Error::Malformed(format!(
+                "a keyframe-delta group declares {expected_count} gaussians but carries no streams"
+            )));
+        }
         return Ok((Vec::new(), BTreeMap::new()));
     }
     let mut got: BTreeMap<u8, DecodedStream> = BTreeMap::new();
     let mut cursor = Cursor::new(bytes);
     while cursor.remaining() > 0 {
-        let (attribute_id, values) = decode_stream(&mut cursor, None)?;
+        let (attribute_id, values) = decode_stream(&mut cursor, Some(expected_count))?;
         // One stream per attribute here too: the regular chunk path refuses a second,
         // and this path had its own loop that was still resolving it silently.
         if got.contains_key(&attribute_id) {
@@ -834,12 +839,14 @@ fn decode_group(bytes: &[u8]) -> Result<(Vec<i64>, BTreeMap<u8, BinArray>)> {
     Ok((ids, bins))
 }
 
-fn keyframe_from_chunk(content: &[u8]) -> Result<(Vec<i64>, BTreeMap<u8, BinArray>)> {
+fn keyframe_from_chunk(
+    content: &[u8],
+) -> Result<(rec::ChunkHeader, Vec<i64>, BTreeMap<u8, BinArray>)> {
     let (head, streams) = rec::parse_chunk(content)?;
     let mut got: BTreeMap<u8, DecodedStream> = BTreeMap::new();
     let mut cursor = Cursor::new(streams);
     while cursor.remaining() > 0 {
-        let (attribute_id, values) = decode_stream(&mut cursor, None)?;
+        let (attribute_id, values) = decode_stream(&mut cursor, Some(head.count as usize))?;
         // One stream per attribute here too: the regular chunk path refuses a second,
         // and this path had its own loop that was still resolving it silently.
         if got.contains_key(&attribute_id) {
@@ -869,14 +876,17 @@ fn keyframe_from_chunk(content: &[u8]) -> Result<(Vec<i64>, BTreeMap<u8, BinArra
         }
     }
     let bins = got.iter().map(|(a, s)| (*a, bin_array(s))).collect();
-    Ok((ids, bins))
+    Ok((head, ids, bins))
 }
 
-fn compose_delta(reference: &State, content: &[u8]) -> Result<(State, rec::DeltaChunkHeader)> {
+fn compose_delta(
+    reference: &State,
+    content: &[u8],
+) -> Result<(State, rec::DeltaChunkHeader, Vec<i64>)> {
     let (head, updates, births, deaths) = rec::parse_delta_chunk(content)?;
-    let (update_ids, update_bins) = decode_group(updates)?;
-    let (birth_ids, birth_bins) = decode_group(births)?;
-    let (death_ids, _) = decode_group(deaths)?;
+    let (update_ids, update_bins) = decode_group(updates, head.update_count as usize)?;
+    let (birth_ids, birth_bins) = decode_group(births, head.birth_count as usize)?;
+    let (death_ids, _) = decode_group(deaths, head.death_count as usize)?;
     let state = apply_delta(
         reference,
         &update_ids,
@@ -885,7 +895,7 @@ fn compose_delta(reference: &State, content: &[u8]) -> Result<(State, rec::Delta
         &birth_bins,
         &death_ids,
     )?;
-    Ok((state, head))
+    Ok((state, head, birth_ids))
 }
 
 /// Decode one keyframe chunk's streams, check the state they make, and keep neither.
@@ -895,9 +905,18 @@ fn compose_delta(reference: &State, content: &[u8]) -> Result<(State, rec::Delta
 /// question [`decode_streamed`] answers by building a `DecodedSequence` — every state
 /// resident at once — for a caller that only wanted a verdict.
 pub fn check_keyframe_chunk(content: &[u8], windows: &[(f64, f64)]) -> Result<()> {
-    let (ids, bins) = keyframe_from_chunk(content)?;
+    decode_keyframe_chunk(content, windows).map(|_| ())
+}
+
+/// Decode one keyframe record content into its state and parsed header.
+pub fn decode_keyframe_chunk(
+    content: &[u8],
+    windows: &[(f64, f64)],
+) -> Result<(State, rec::ChunkHeader)> {
+    let (head, ids, bins) = keyframe_from_chunk(content)?;
     let state = keyframe_state(ids, bins)?;
-    check_window_indices(&state, windows)
+    check_window_indices(&state, windows)?;
+    Ok((state, head))
 }
 
 /// The same for one delta chunk, without the reference state it would compose against.
@@ -908,10 +927,14 @@ pub fn check_keyframe_chunk(content: &[u8], windows: &[(f64, f64)]) -> Result<()
 /// group carries are checked here too: births bring their own, and a birth naming a window
 /// the table cannot answer is refused on the indexed path.
 pub fn check_delta_chunk(content: &[u8], windows: &[(f64, f64)]) -> Result<()> {
-    let (_, updates, births, deaths) = rec::parse_delta_chunk(content)?;
+    let (head, updates, births, deaths) = rec::parse_delta_chunk(content)?;
     let table_len = crate::chunk::window_table_or_default(windows).len();
-    for group in [updates, births, deaths] {
-        let (_, bins) = decode_group(group)?;
+    for (group, count) in [
+        (updates, head.update_count),
+        (births, head.birth_count),
+        (deaths, head.death_count),
+    ] {
+        let (_, bins) = decode_group(group, count as usize)?;
         let Some(window_index) = bins.get(&op::A_WINDOW_INDEX) else {
             continue;
         };
@@ -920,6 +943,17 @@ pub fn check_delta_chunk(content: &[u8], windows: &[(f64, f64)]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Compose one delta record content onto a previously decoded reference state.
+pub fn compose_delta_chunk(
+    reference: &State,
+    content: &[u8],
+    windows: &[(f64, f64)],
+) -> Result<(State, rec::DeltaChunkHeader, Vec<i64>)> {
+    let (state, head, births) = compose_delta(reference, content)?;
+    check_window_indices(&state, windows)?;
+    Ok((state, head, births))
 }
 
 /// Front to back: decode each chunk and compose it onto the state it references.
@@ -947,8 +981,7 @@ pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
             op::QUANTIZATION => quant = Some(rec::Quantization::parse(record.content)?),
             op::WINDOW_TABLE => windows = rec::WindowTable::parse(record.content)?.windows,
             op::CHUNK => {
-                let (ids, bins) = keyframe_from_chunk(record.content)?;
-                let (head, _) = rec::parse_chunk(record.content)?;
+                let (head, ids, bins) = keyframe_from_chunk(record.content)?;
                 let state = keyframe_state(ids, bins)?;
                 check_window_indices(&state, &windows)?;
                 by_offset.insert(record.offset as u64, state.clone());
@@ -980,7 +1013,7 @@ pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
                         record.offset, head.reference_offset
                     )));
                 };
-                let (state, head) = compose_delta(reference, record.content)?;
+                let (state, head, _) = compose_delta(reference, record.content)?;
                 // Births in a delta group carry their own `window_index`, so the check
                 // belongs on this branch too — not only where a keyframe is read. The
                 // indexed path validates the composed state for every chunk, so leaving
@@ -1018,15 +1051,71 @@ pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
     })
 }
 
-fn record_content(data: &[u8], offset: u64, length: u64) -> Result<&[u8]> {
-    let start = offset as usize;
-    let end = start
-        .checked_add(length as usize)
-        .filter(|e| *e <= data.len())
-        .ok_or_else(|| Error::Truncated(format!("record at {offset} runs past the file")))?;
-    let mut c = Cursor::new(&data[start..end]);
-    c.u8()?;
-    c.blob()
+fn ranged_framing<R: crate::Readable + ?Sized>(
+    source: &mut R,
+    offset: u64,
+    declared_length: Option<u64>,
+) -> Result<(u8, u64)> {
+    let size = source.size()?;
+    let header_end = offset
+        .checked_add(crate::serialization::RECORD_HEADER_SIZE as u64)
+        .filter(|end| *end <= size)
+        .ok_or_else(|| {
+            Error::Truncated(format!("record framing at {offset} runs past the file"))
+        })?;
+    let framing = source.read(offset, header_end - offset)?;
+    let opcode = framing[0];
+    let content_length = u64::from_le_bytes(framing[1..9].try_into().expect("nine-byte framing"));
+    let total = content_length
+        .checked_add(crate::serialization::RECORD_HEADER_SIZE as u64)
+        .ok_or_else(|| {
+            Error::Truncated(format!(
+                "the {} record at {offset} has a length that overflows",
+                op::name(opcode)
+            ))
+        })?;
+    if let Some(declared) = declared_length {
+        if declared != total {
+            return Err(Error::Malformed(format!(
+                "the index declares {declared} bytes for the {} record at {offset}; its framing declares {total}",
+                op::name(opcode)
+            )));
+        }
+    }
+    let content_at = offset + crate::serialization::RECORD_HEADER_SIZE as u64;
+    content_at.checked_add(content_length).filter(|end| *end <= size).ok_or_else(
+        || {
+            Error::Truncated(format!(
+                "the {} record at {offset} declares {content_length} bytes past the end of the {size}-byte file",
+                op::name(opcode)
+            ))
+        },
+    )?;
+    Ok((opcode, content_length))
+}
+
+fn ranged_record<R: crate::Readable + ?Sized>(
+    source: &mut R,
+    offset: u64,
+    declared_length: Option<u64>,
+) -> Result<(u8, Vec<u8>)> {
+    let (opcode, content_length) = ranged_framing(source, offset, declared_length)?;
+    let content_at = offset + crate::serialization::RECORD_HEADER_SIZE as u64;
+    Ok((opcode, source.read(content_at, content_length)?))
+}
+
+fn check_keyframe_temporal_model(model: &str) -> Result<()> {
+    if model == "keyframe-delta" {
+        return Ok(());
+    }
+    Err(Error::refused(
+        crate::error::refusal::UNKNOWN_TEMPORAL_MODEL,
+        crate::error::RefusalKind::UnsupportedModel,
+        format!(
+            "the Header declares temporal model '{model}', which this reader does not implement \
+             (it implements keyframe-delta)"
+        ),
+    ))
 }
 
 /// Refuse a `window_index` the table cannot answer, on either read path.
@@ -1057,15 +1146,56 @@ fn check_window_indices(state: &State, windows: &[(f64, f64)]) -> Result<()> {
     Ok(())
 }
 
+/// Fetch and decode one indexed keyframe through the caller's range source.
+///
+/// The returned state is one chunk's population. A sequential validator can retain it as
+/// its current/GOP reference, advance once, and never accumulate a state per index entry.
+pub fn read_keyframe_entry<R: crate::Readable + ?Sized>(
+    source: &mut R,
+    entry: &rec::ChunkIndexEntry,
+    windows: &[(f64, f64)],
+) -> Result<(State, rec::ChunkHeader)> {
+    let (opcode, content) = ranged_record(source, entry.chunk_offset, Some(entry.chunk_length))?;
+    if opcode != op::CHUNK {
+        return Err(Error::Malformed(format!(
+            "the keyframe index entry at {} points at {}",
+            entry.chunk_offset,
+            op::name(opcode)
+        )));
+    }
+    decode_keyframe_chunk(&content, windows)
+}
+
+/// Fetch and compose one indexed delta through the caller's range source.
+///
+/// `birth_ids` is returned with the state so a bounded full-file validator can stream
+/// identity-introduction events to its fixed-memory counter without decoding the record a
+/// second time.
+pub fn read_delta_entry<R: crate::Readable + ?Sized>(
+    source: &mut R,
+    entry: &rec::ChunkIndexEntry,
+    reference: &State,
+    windows: &[(f64, f64)],
+) -> Result<(State, rec::DeltaChunkHeader, Vec<i64>)> {
+    let (opcode, content) = ranged_record(source, entry.chunk_offset, Some(entry.chunk_length))?;
+    if opcode != op::DELTA_CHUNK {
+        return Err(Error::Malformed(format!(
+            "the delta index entry at {} points at {}",
+            entry.chunk_offset,
+            op::name(opcode)
+        )));
+    }
+    compose_delta_chunk(reference, &content, windows)
+}
+
 /// Compose the chain ending at `entry`, and check the state it produces.
 ///
-/// Public because composing one entry is the whole of what a validator needs: it asks
-/// whether each chunk decodes, not what any of them decoded to, and holding every state to
-/// answer that costs many times the file. A caller that wants the states wants
-/// [`decode_indexed`]; a caller that wants the verdict calls this per entry and drops what
-/// it returns.
-pub fn compose_chain(
-    data: &[u8],
+/// Public because a range-seeking caller may want one instant without materializing the
+/// asset. A full-file validator should instead walk entries once with
+/// [`read_keyframe_entry`] and [`read_delta_entry`], retaining only its current/GOP states;
+/// calling this for every chained entry would decode the same prefixes repeatedly.
+pub fn compose_chain<R: crate::Readable + ?Sized>(
+    source: &mut R,
     index: &[rec::ChunkIndexEntry],
     entry: &rec::ChunkIndexEntry,
     windows: &[(f64, f64)],
@@ -1073,15 +1203,13 @@ pub fn compose_chain(
     let chain = chain_for(index, (entry.t0 + entry.t1) / 2.0)?;
     let mut state: Option<State> = None;
     for link in &chain {
-        let content = record_content(data, link.chunk_offset, link.chunk_length)?;
         if link.kind == 0 {
-            let (ids, bins) = keyframe_from_chunk(content)?;
-            state = Some(keyframe_state(ids, bins)?);
+            state = Some(read_keyframe_entry(source, link, windows)?.0);
         } else {
             let reference = state
                 .take()
                 .ok_or_else(|| Error::Malformed("a chain begins with a delta chunk".into()))?;
-            state = Some(compose_delta(&reference, content)?.0);
+            state = Some(read_delta_entry(source, link, &reference, windows)?.0);
         }
     }
     let state = state.ok_or_else(|| Error::Malformed("an empty chain".into()))?;
@@ -1111,34 +1239,72 @@ pub struct IndexedSequence {
 /// path used to carry it all the way to a composed state — so `4dgs validate` printed
 /// `valid` for a file the other model's reader refuses by name.
 ///
-/// The *temporal* model is deliberately not checked here. `registry::KNOWN_TEMPORAL_MODELS`
-/// is the gaussian-birth reader's list and does not contain `keyframe-delta`, because a name
-/// belongs there only when the reader that consults it can decode it. This module is the
-/// reader that decodes this model, so the check would refuse every file it exists for.
-pub fn open_indexed(data: &[u8]) -> Result<IndexedSequence> {
-    check_magic(data)?;
+/// Every Header is checked here too. The shared temporal-model registry belongs to the
+/// gaussian-birth reader and therefore does not list `keyframe-delta`; this model-specific
+/// reader performs the equivalent named check against the one model it implements. Doing
+/// so per record matters when duplicate Headers disagree.
+pub fn open_indexed<R: crate::Readable + ?Sized>(source: &mut R) -> Result<IndexedSequence> {
+    let size = source.size()?;
+    let head = source.read(0, (MAGIC.len() as u64).min(size))?;
+    check_magic(&head)?;
+    let tail = source.read(
+        size.saturating_sub(MAGIC.len() as u64),
+        (MAGIC.len() as u64).min(size),
+    )?;
+    if tail != MAGIC {
+        return Err(Error::Malformed(
+            "file does not end with the magic; it may be truncated".into(),
+        ));
+    }
     let mut header: Option<rec::Header> = None;
     let mut quant: Option<rec::Quantization> = None;
     let mut windows: Vec<(f64, f64)> = Vec::new();
-    let mut footer: Option<rec::Footer> = None;
-    for record in Records::new(data, MAGIC.len()) {
-        let record = record?;
-        match record.opcode {
-            op::HEADER => header = Some(rec::Header::parse(record.content)?),
+    let mut footer: Option<(u64, rec::Footer)> = None;
+    let mut at = MAGIC.len() as u64;
+    while at < size.saturating_sub(MAGIC.len() as u64) {
+        let (opcode, content_length) = ranged_framing(source, at, None)?;
+        let total = crate::serialization::RECORD_HEADER_SIZE as u64 + content_length;
+        match opcode {
+            op::HEADER => {
+                let content = source.read(
+                    at + crate::serialization::RECORD_HEADER_SIZE as u64,
+                    content_length,
+                )?;
+                let parsed = rec::Header::parse(&content)?;
+                check_keyframe_temporal_model(&parsed.temporal_model)?;
+                header = Some(parsed);
+            }
             op::QUANTIZATION => {
-                let parsed = rec::Quantization::parse(record.content)?;
+                let content = source.read(
+                    at + crate::serialization::RECORD_HEADER_SIZE as u64,
+                    content_length,
+                )?;
+                let parsed = rec::Quantization::parse(&content)?;
                 crate::registry::check_quantization_scheme(&parsed.scheme)?;
                 quant = Some(parsed);
             }
-            op::WINDOW_TABLE => windows = rec::WindowTable::parse(record.content)?.windows,
+            op::WINDOW_TABLE => {
+                let content = source.read(
+                    at + crate::serialization::RECORD_HEADER_SIZE as u64,
+                    content_length,
+                )?;
+                windows = rec::WindowTable::parse(&content)?.windows;
+            }
             op::FOOTER => {
-                footer = Some(rec::Footer::parse(record.content)?);
+                let content = source.read(
+                    at + crate::serialization::RECORD_HEADER_SIZE as u64,
+                    content_length.min(20),
+                )?;
+                footer = Some((at, rec::Footer::parse(&content)?));
                 break;
             }
             _ => {}
         }
+        at = at
+            .checked_add(total)
+            .ok_or_else(|| Error::Truncated("record walk offset overflows".into()))?;
     }
-    let Some(footer) = footer else {
+    let Some((footer_at, footer)) = footer else {
         return Err(Error::Malformed("file has no Footer".into()));
     };
     let (Some(header), Some(quantization)) = (header, quant) else {
@@ -1148,7 +1314,14 @@ pub fn open_indexed(data: &[u8]) -> Result<IndexedSequence> {
     };
 
     let mut index: Vec<rec::ChunkIndexEntry> = Vec::new();
-    for record in Records::new(data, footer.summary_start as usize) {
+    if footer.summary_start > footer_at {
+        return Err(Error::Malformed(format!(
+            "the footer says the summary starts at {}, past the footer itself at {footer_at}",
+            footer.summary_start
+        )));
+    }
+    let summary = source.read(footer.summary_start, footer_at - footer.summary_start)?;
+    for record in Records::new(&summary, 0) {
         let record = record?;
         if record.opcode == op::CHUNK_INDEX {
             index.push(rec::ChunkIndexEntry::parse(record.content)?);
@@ -1169,19 +1342,21 @@ pub fn open_indexed(data: &[u8]) -> Result<IndexedSequence> {
 
 /// Read the Footer, then the index, then compose each chunk by walking its chain.
 pub fn decode_indexed(data: &[u8]) -> Result<(DecodedSequence, Vec<rec::ChunkIndexEntry>)> {
+    let mut source = crate::BytesReadable::new(data);
     let IndexedSequence {
         header,
         quantization,
         windows,
         index,
-    } = open_indexed(data)?;
+    } = open_indexed(&mut source)?;
 
     let mut chunks: Vec<ChunkInfo> = Vec::with_capacity(index.len());
     for entry in &index {
-        let state = compose_chain(data, &index, entry, &windows)?;
+        let state = compose_chain(&mut source, &index, entry, &windows)?;
         let (update_count, birth_count, death_count) = if entry.kind != 0 {
-            let content = record_content(data, entry.chunk_offset, entry.chunk_length)?;
-            let (head, ..) = rec::parse_delta_chunk(content)?;
+            let (_, content) =
+                ranged_record(&mut source, entry.chunk_offset, Some(entry.chunk_length))?;
+            let (head, ..) = rec::parse_delta_chunk(&content)?;
             (
                 Some(head.update_count),
                 Some(head.birth_count),
