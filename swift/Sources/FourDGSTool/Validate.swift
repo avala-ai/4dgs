@@ -663,6 +663,9 @@ private func validatePhysicalRecords(
     var firstStateError: (FourDGSError, Site)?
     var summaryStartsOnBoundary = summary?.start == summary?.end
     var summaryStructureReported = false
+    var summaryOffsetStartsOnBoundary = summary?.offsetStart == 0
+    var summaryOffsetStructureReported = false
+    var firstSummaryOffset: UInt64?
     var previousPhysicalInterval: ChunkFields?
     var physicalIntervalCount = 0
 
@@ -730,6 +733,9 @@ private func validatePhysicalRecords(
                         summaryStructureReported = true
                     }
                     if frame.offset >= summary.start && frame.offset < summary.end {
+                        if frame.opcode == Opcode.summaryOffset && firstSummaryOffset == nil {
+                            firstSummaryOffset = frame.offset
+                        }
                         let allowed =
                             frame.opcode == Opcode.chunkIndex || frame.opcode == Opcode.statistics
                             || frame.opcode == Opcode.summaryOffset
@@ -745,6 +751,36 @@ private func validatePhysicalRecords(
                                         + "extends past the Footer's summary range")
                             }
                             summaryStructureReported = true
+                        }
+                    }
+                    if summary.offsetStart != 0 {
+                        if frame.offset == summary.offsetStart {
+                            summaryOffsetStartsOnBoundary = true
+                            if !summaryOffsetStructureReported
+                                && (frame.offset < summary.start || frame.offset >= summary.end)
+                            {
+                                scanReport.error(
+                                    "the Footer's summary_offset_start \(summary.offsetStart) lies "
+                                        + "outside the declared summary [\(summary.start), "
+                                        + "\(summary.end))")
+                                summaryOffsetStructureReported = true
+                            } else if !summaryOffsetStructureReported
+                                && frame.opcode != Opcode.summaryOffset
+                            {
+                                scanReport.error(
+                                    "the Footer's summary_offset_start \(summary.offsetStart) names "
+                                        + "\(opcodeName(frame.opcode)); expected SummaryOffset")
+                                summaryOffsetStructureReported = true
+                            }
+                        } else if !summaryOffsetStructureReported
+                            && frame.offset < summary.offsetStart
+                            && frameEnd > summary.offsetStart
+                        {
+                            scanReport.error(
+                                "the Footer's summary_offset_start \(summary.offsetStart) lies "
+                                    + "inside the \(opcodeName(frame.opcode)) record at byte "
+                                    + "\(frame.offset); expected a SummaryOffset record boundary")
+                            summaryOffsetStructureReported = true
                         }
                     }
                 }
@@ -920,7 +956,9 @@ private func validatePhysicalRecords(
                                 }
                                 previousPhysicalInterval = fields
                             }
-                            if !entries.isEmpty { result.fields[frame.offset] = fields }
+                            result.fields[frame.offset] = fields
+                        } else {
+                            result.fields[frame.offset] = fields
                         }
                         if !keyframeDelta, fields.opcode == Opcode.chunk {
                             let (sum, overflow) = result.gaussianCount.addingReportingOverflow(
@@ -1010,6 +1048,9 @@ private func validatePhysicalRecords(
                 "physical state chunks end at \(last.t1); expected Header duration_sec "
                     + "\(durationSec)")
         }
+        if index.isEmpty {
+            validatePhysicalKeyframeDeltaReferences(result.fields, report: &scanReport)
+        }
     }
 
     if let summary, summary.start < summary.end, !summaryStartsOnBoundary,
@@ -1017,6 +1058,21 @@ private func validatePhysicalRecords(
     {
         scanReport.error(
             "the Footer's summary starts at byte \(summary.start), which is not a record boundary")
+    }
+    if let summary, summary.offsetStart != 0, !summaryOffsetStructureReported {
+        if summary.offsetStart < summary.start || summary.offsetStart >= summary.end {
+            scanReport.error(
+                "the Footer's summary_offset_start \(summary.offsetStart) lies outside the "
+                    + "declared summary [\(summary.start), \(summary.end))")
+        } else if !summaryOffsetStartsOnBoundary {
+            scanReport.error(
+                "the Footer's summary_offset_start \(summary.offsetStart) is not a record boundary; "
+                    + "expected the first SummaryOffset record")
+        } else if let firstSummaryOffset, summary.offsetStart != firstSummaryOffset {
+            scanReport.error(
+                "the Footer's summary_offset_start \(summary.offsetStart) does not name the first "
+                    + "SummaryOffset record at byte \(firstSummaryOffset)")
+        }
     }
     for address in bandsByOffset.values.flatMap({ $0 }) where !seenBands.contains(address.token) {
         scanReport.error(
@@ -1038,6 +1094,100 @@ private func validatePhysicalRecords(
         result.chunkRefused = true
     }
     return result
+}
+
+private func validatePhysicalKeyframeDeltaReferences(
+    _ fields: [UInt64: ChunkFields], report: inout Report
+) {
+    struct Resolution {
+        let keyframe: UInt64
+        let depth: Int
+    }
+
+    var resolved: [UInt64: Resolution] = [:]
+    for (offset, state) in fields.sorted(by: { $0.key < $1.key }) {
+        if state.opcode == Opcode.chunk {
+            resolved[offset] = Resolution(keyframe: offset, depth: 0)
+            continue
+        }
+        guard state.opcode == Opcode.deltaChunk else { continue }
+        guard state.deltaMode <= 1 else {
+            report.error(
+                "the physical DeltaChunk at byte \(offset) has delta_mode \(state.deltaMode); "
+                    + "expected 0 (keyframe-referenced) or 1 (chained)")
+            continue
+        }
+        guard state.referenceOffset < offset else {
+            report.error(
+                "the physical DeltaChunk at byte \(offset) references \(state.referenceOffset), "
+                    + "which is not behind it; references point backwards only")
+            continue
+        }
+        guard let reference = fields[state.referenceOffset] else {
+            report.error(
+                "the physical DeltaChunk at byte \(offset) references \(state.referenceOffset), "
+                    + "which is not a physical state record")
+            continue
+        }
+        if state.level != reference.level {
+            report.error(
+                "the physical DeltaChunk at byte \(offset) has level \(state.level), but its "
+                    + "reference at byte \(state.referenceOffset) has level \(reference.level); "
+                    + "expected equal levels")
+        }
+        if state.deltaMode == 0 && state.referenceOffset != state.keyframeOffset {
+            report.error(
+                "the physical DeltaChunk at byte \(offset) uses keyframe-referenced delta_mode 0 "
+                    + "but references \(state.referenceOffset); expected keyframe_offset "
+                    + "\(state.keyframeOffset)")
+            continue
+        }
+        if state.deltaMode == 1 && reference.t1 != state.t0 {
+            report.error(
+                "the physical DeltaChunk at byte \(offset) uses chained delta_mode 1 but "
+                    + "references interval [\(reference.t0), \(reference.t1)); expected the state "
+                    + "immediately preceding t0 \(state.t0)")
+            continue
+        }
+        guard let referenceResolution = resolved[state.referenceOffset] else {
+            report.error(
+                "the physical reference chain from DeltaChunk at byte \(offset) does not reach "
+                    + "an earlier keyframe")
+            continue
+        }
+        let resolution = Resolution(
+            keyframe: referenceResolution.keyframe, depth: referenceResolution.depth + 1)
+        resolved[offset] = resolution
+        if resolution.depth != Int(state.depth) {
+            report.error(
+                "the physical DeltaChunk at byte \(offset) declares depth \(state.depth), but its "
+                    + "chain walks \(resolution.depth) delta chunks")
+        }
+        if state.keyframeOffset != resolution.keyframe {
+            report.error(
+                "the physical DeltaChunk at byte \(offset) declares keyframe_offset "
+                    + "\(state.keyframeOffset), but its chain reaches keyframe "
+                    + "\(resolution.keyframe)")
+        }
+    }
+}
+
+private func validateGaussianBirthIndexIntervals(
+    _ index: [IndexEntry], fields: [UInt64: ChunkFields], report: inout Report
+) {
+    for (i, entry) in index.enumerated() {
+        guard let physical = fields[entry.offset], physical.opcode == Opcode.chunk else { continue }
+        if physical.t0.bitPattern != entry.t0.bitPattern {
+            report.error(
+                "chunk index entry \(i) has t0 \(entry.t0), but the Chunk at byte "
+                    + "\(entry.offset) has t0 \(physical.t0)")
+        }
+        if physical.t1.bitPattern != entry.t1.bitPattern {
+            report.error(
+                "chunk index entry \(i) has t1 \(entry.t1), but the Chunk at byte "
+                    + "\(entry.offset) has t1 \(physical.t1)")
+        }
+    }
 }
 
 func validateKeyframeDeltaIndex(
@@ -1235,6 +1385,8 @@ func validateKeyframeDeltaIndex(
 private struct AudioSourceSummary {
     let id: UInt32
     let dataLength: UInt64
+    let firstKeyframeTime: Double?
+    let lastKeyframeTime: Double?
 }
 
 private struct AudioDataSummary {
@@ -1248,6 +1400,58 @@ private func malformedAudio(_ frame: Frame, field: String, reason: String) -> Fo
         reason: reason)
 }
 
+private func validateAudioUTF8(
+    _ source: ToolReader, _ frame: Frame, offset: UInt64, length: UInt64, field: String
+) throws {
+    var at: UInt64 = 0
+    var continuation = 0
+    var nextMinimum: UInt8 = 0x80
+    var nextMaximum: UInt8 = 0xBF
+    while at < length {
+        let count = Int(min(UInt64(4096), length - at))
+        let bytes = try source.exactly(
+            offset: offset + at, count: count, record: "Audio Source \(field)")
+        for byte in bytes {
+            if continuation == 0 {
+                switch byte {
+                case 0x00...0x7F: continue
+                case 0xC2...0xDF:
+                    continuation = 1
+                case 0xE0:
+                    continuation = 2
+                    nextMinimum = 0xA0
+                case 0xE1...0xEC, 0xEE...0xEF:
+                    continuation = 2
+                case 0xED:
+                    continuation = 2
+                    nextMaximum = 0x9F
+                case 0xF0:
+                    continuation = 3
+                    nextMinimum = 0x90
+                case 0xF1...0xF3:
+                    continuation = 3
+                case 0xF4:
+                    continuation = 3
+                    nextMaximum = 0x8F
+                default:
+                    throw malformedAudio(frame, field: field, reason: "the string is not UTF-8")
+                }
+            } else {
+                guard byte >= nextMinimum && byte <= nextMaximum else {
+                    throw malformedAudio(frame, field: field, reason: "the string is not UTF-8")
+                }
+                continuation -= 1
+                nextMinimum = 0x80
+                nextMaximum = 0xBF
+            }
+        }
+        at += UInt64(bytes.count)
+    }
+    guard continuation == 0 else {
+        throw malformedAudio(frame, field: field, reason: "the string is not UTF-8")
+    }
+}
+
 private func audioSourceSummary(_ source: ToolReader, _ frame: Frame) throws -> AudioSourceSummary {
     let content = frame.offset + recordHeaderSize
     guard frame.length >= 4 else {
@@ -1256,7 +1460,8 @@ private func audioSourceSummary(_ source: ToolReader, _ frame: Frame) throws -> 
     let idBytes = try source.exactly(offset: content, count: 4, record: "Audio Source source_id")
     let id = readU32(idBytes, at: 0) ?? 0
     var relative: UInt64 = 4
-    for field in ["name", "codec", "channel_layout"] {
+
+    func stringLocation(_ field: String) throws -> (offset: UInt64, length: UInt64) {
         guard relative <= frame.length, frame.length - relative >= 4 else {
             throw malformedAudio(frame, field: field, reason: "the string length is missing")
         }
@@ -1267,14 +1472,134 @@ private func audioSourceSummary(_ source: ToolReader, _ frame: Frame) throws -> 
         guard length <= frame.length - relative else {
             throw malformedAudio(frame, field: field, reason: "the string runs past the record")
         }
+        let offset = content + relative
+        try validateAudioUTF8(source, frame, offset: offset, length: length, field: field)
         relative += length
+        return (offset, length)
     }
-    guard relative <= frame.length, frame.length - relative >= 8 else {
-        throw malformedAudio(frame, field: "data_length", reason: "the 8-byte field is missing")
+
+    _ = try stringLocation("name")
+    let codec = try stringLocation("codec")
+    let channelLayout = try stringLocation("channel_layout")
+    guard codec.length != 0 else {
+        throw malformedAudio(frame, field: "codec", reason: "the string is empty")
     }
-    let lengthBytes = try source.exactly(
-        offset: content + relative, count: 8, record: "Audio Source data_length")
-    return AudioSourceSummary(id: id, dataLength: readU64(lengthBytes, at: 0) ?? 0)
+
+    let fixedLength: UInt64 = 93
+    guard relative <= frame.length, frame.length - relative >= fixedLength else {
+        throw malformedAudio(
+            frame, field: "fixed fields",
+            reason:
+                "the data_length, timing, flags, pose, and keyframe_count need \(fixedLength) bytes")
+    }
+    let fixed = try source.exactly(
+        offset: content + relative, count: Int(fixedLength), record: "Audio Source fixed fields")
+    let dataLength = readU64(fixed, at: 0) ?? 0
+    let startSec = readF64(fixed, at: 8) ?? .nan
+    let durationSec = readF64(fixed, at: 16) ?? .nan
+    let gain = readF64(fixed, at: 24) ?? .nan
+    let flags = fixed[32]
+    let position = (0..<3).map { readF64(fixed, at: 33 + 8 * $0) ?? .nan }
+    let rotation = (0..<4).map { readF64(fixed, at: 57 + 8 * $0) ?? .nan }
+    let keyframeCount = UInt64(readU32(fixed, at: 89) ?? 0)
+    relative += fixedLength
+
+    guard startSec.isFinite else {
+        throw malformedAudio(frame, field: "start_sec", reason: "the value is not finite")
+    }
+    guard durationSec.isFinite && durationSec > 0 else {
+        throw malformedAudio(
+            frame, field: "duration_sec", reason: "the value must be finite and positive")
+    }
+    guard gain.isFinite && gain >= 0 else {
+        throw malformedAudio(
+            frame, field: "gain", reason: "the value must be finite and non-negative")
+    }
+    guard flags & ~UInt8(0x03) == 0 else {
+        throw malformedAudio(frame, field: "flags", reason: "reserved flag bits are set")
+    }
+    if flags & 1 != 0 {
+        guard channelLayout.length == 4 else {
+            throw malformedAudio(
+                frame, field: "channel_layout", reason: "a spatial source must use mono")
+        }
+        let bytes = try source.exactly(
+            offset: channelLayout.offset, count: 4, record: "Audio Source channel_layout")
+        guard bytes == Array("mono".utf8) else {
+            throw malformedAudio(
+                frame, field: "channel_layout", reason: "a spatial source must use mono")
+        }
+    }
+    guard position.allSatisfy(\.isFinite) else {
+        throw malformedAudio(
+            frame, field: "position", reason: "the three values must be finite")
+    }
+    guard rotation.allSatisfy(\.isFinite) && rotation.contains(where: { $0 != 0 }) else {
+        throw malformedAudio(
+            frame, field: "rotation", reason: "the quaternion must be finite and nonzero")
+    }
+
+    let (keyframeBytes, keyframeOverflow) = keyframeCount.multipliedReportingOverflow(by: 64)
+    guard !keyframeOverflow, keyframeBytes <= frame.length - relative,
+        frame.length - relative - keyframeBytes >= 4
+    else {
+        throw malformedAudio(
+            frame, field: "keyframes",
+            reason: "\(keyframeCount) keyframes do not fit before the interpolation string")
+    }
+    var firstKeyframeTime: Double?
+    var lastKeyframeTime: Double?
+    for i in 0..<keyframeCount {
+        let bytes = try source.exactly(
+            offset: content + relative, count: 64, record: "Audio Source keyframe \(i)")
+        let time = readF64(bytes, at: 0) ?? .nan
+        let keyframePosition = (0..<3).map { readF64(bytes, at: 8 + 8 * $0) ?? .nan }
+        let keyframeRotation = (0..<4).map { readF64(bytes, at: 32 + 8 * $0) ?? .nan }
+        guard time.isFinite, lastKeyframeTime.map({ time > $0 }) ?? true else {
+            throw malformedAudio(
+                frame, field: "keyframe \(i) time",
+                reason: "the value must be finite and strictly increasing")
+        }
+        guard keyframePosition.allSatisfy(\.isFinite) else {
+            throw malformedAudio(
+                frame, field: "keyframe \(i) position",
+                reason: "the three values must be finite")
+        }
+        guard
+            keyframeRotation.allSatisfy(\.isFinite)
+                && keyframeRotation.contains(where: { $0 != 0 })
+        else {
+            throw malformedAudio(
+                frame, field: "keyframe \(i) rotation",
+                reason: "the quaternion must be finite and nonzero")
+        }
+        if firstKeyframeTime == nil { firstKeyframeTime = time }
+        lastKeyframeTime = time
+        relative += 64
+    }
+
+    let interpolation = try stringLocation("interpolation")
+    guard relative == frame.length else {
+        throw malformedAudio(
+            frame, field: "trailing bytes", reason: "the descriptor has bytes after interpolation")
+    }
+    guard interpolation.length == 4 || interpolation.length == 6 else {
+        throw malformedAudio(
+            frame, field: "interpolation", reason: "expected step or linear")
+    }
+    let interpolationBytes = try source.exactly(
+        offset: interpolation.offset, count: Int(interpolation.length),
+        record: "Audio Source interpolation")
+    guard
+        interpolationBytes == Array("step".utf8)
+            || interpolationBytes == Array("linear".utf8)
+    else {
+        throw malformedAudio(
+            frame, field: "interpolation", reason: "expected step or linear")
+    }
+    return AudioSourceSummary(
+        id: id, dataLength: dataLength, firstKeyframeTime: firstKeyframeTime,
+        lastKeyframeTime: lastKeyframeTime)
 }
 
 private func audioDataSummary(_ source: ToolReader, _ frame: Frame) throws -> AudioDataSummary {
@@ -1314,6 +1639,7 @@ func validate(_ source: ToolReader) -> Report {
     var firstUnknown: UInt8?
     var stateSeen = false
     var pendingFooter: UInt64?
+    var legacyAudioCount: UInt64 = 0
     var audioSources: [UInt32: AudioSourceSummary] = [:]
     var audioData: [UInt32: AudioDataSummary] = [:]
     let walked: Walk
@@ -1353,12 +1679,17 @@ func validate(_ source: ToolReader) -> Report {
                 if opcode == Opcode.quantization { hasQuantization = true }
                 if opcode == Opcode.footer { hasFooter = true }
                 if opcode == Opcode.chunk || opcode == Opcode.deltaChunk { stateSeen = true }
-                if stateSeen && (opcode == Opcode.audioSource || opcode == Opcode.audioData) {
+                if stateSeen
+                    && (opcode == Opcode.audio || opcode == Opcode.audioSource
+                        || opcode == Opcode.audioData)
+                {
                     report.error(
                         "\(opcodeName(opcode)) at byte \(frame.offset) appears after the first "
                             + "Chunk or DeltaChunk; audio records must precede state records")
                 }
-                if opcode == Opcode.audioSource {
+                if opcode == Opcode.audio {
+                    if legacyAudioCount < UInt64.max { legacyAudioCount += 1 }
+                } else if opcode == Opcode.audioSource {
                     do {
                         let parsed = try audioSourceSummary(source, frame)
                         if audioSources.updateValue(parsed, forKey: parsed.id) != nil {
@@ -1461,6 +1792,13 @@ func validate(_ source: ToolReader) -> Report {
     let keyframeDelta = dispatch?.keyframeDelta ?? false
 
     for (id, descriptor) in audioSources {
+        if let dispatch,
+            descriptor.firstKeyframeTime.map({ $0 < 0 }) == true
+                || descriptor.lastKeyframeTime.map({ $0 > dispatch.durationSec }) == true
+        {
+            report.error(
+                "Audio Source id \(id) has a keyframe outside [0, \(dispatch.durationSec)]")
+        }
         guard let payload = audioData[id] else {
             report.error("Audio Source id \(id) has no matching Audio Data record")
             continue
@@ -1475,13 +1813,16 @@ func validate(_ source: ToolReader) -> Report {
         report.error("Audio Data id \(id) has no matching Audio Source record")
     }
     if let dispatch {
-        let hasAudioRecords = !audioSources.isEmpty || !audioData.isEmpty
+        let hasAudioRecords = legacyAudioCount != 0 || !audioSources.isEmpty || !audioData.isEmpty
         if dispatch.hasAudio != hasAudioRecords {
             let declaration = dispatch.hasAudio ? "set" : "clear"
             report.error(
                 "Header has-audio flag is \(declaration), but the file "
                     + (hasAudioRecords ? "contains audio records" : "contains no audio records"))
         }
+    }
+    if legacyAudioCount != 0 && !audioSources.isEmpty {
+        report.error("legacy Audio and Audio Source records must not be mixed")
     }
 
     let summary: SummaryDeclaration?
@@ -1601,6 +1942,8 @@ func validate(_ source: ToolReader) -> Report {
             "keyframe-delta identity composition was not checked: the current ranged Swift ABI "
                 + "exposes groups and references, but not composed identity state")
     } else {
+        validateGaussianBirthIndexIntervals(
+            index, fields: physical.fields, report: &report)
         if let expected = dispatch?.gaussianCount, physical.gaussianCount != expected {
             report.error(
                 "Header gaussian_count is \(expected), but physical Chunks contain "

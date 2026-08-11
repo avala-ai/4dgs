@@ -922,6 +922,18 @@ final class ValidateTests: XCTestCase {
             validate(extended).findings.contains {
                 $0.message.contains("keyframe-delta fields in a gaussian-birth file")
             })
+
+        let entry = try XCTUnwrap(chunkIndexEntries(original, walked).first)
+        var wrongInterval = original
+        writeU64(
+            (entry.t0 + 0.125).bitPattern, into: &wrongInterval,
+            at: index.offset + recordHeaderSize)
+        let footer = try XCTUnwrap(walked.firstIntact(Opcode.footer))
+        writeU32(0, into: &wrongInterval, at: footer.offset + recordHeaderSize + 16)
+        XCTAssertTrue(
+            validate(wrongInterval).findings.contains {
+                $0.message.contains("has t0") && $0.message.contains("the Chunk at byte")
+            })
     }
 
     func testKeyframeIdentityAndAudioPairingAreCheckedStructurally() throws {
@@ -974,6 +986,115 @@ final class ValidateTests: XCTestCase {
         XCTAssertTrue(
             validate(audio).findings.contains {
                 $0.message.contains("declares \(dataLength + 1) data bytes")
+            })
+    }
+
+    func testKeyframeDeltaValidatesCompleteAudioDescriptorsAndLegacyAudioAccounting() throws {
+        try requireCorpus()
+        let audioFile = corpusDirectory().appendingPathComponent(
+            "OneWindow-UseChunkIndex-UseCrc-WithSpatialAudio.4dgs")
+        let original = try readFixture(audioFile)
+        let originalWalk = try walk(original)
+        let dispatch = try XCTUnwrap(
+            try headerDispatch(ToolReader(InMemoryReader(original)), originalWalk))
+        let descriptor = try XCTUnwrap(originalWalk.firstIntact(Opcode.audioSource))
+        let payload = try XCTUnwrap(originalWalk.firstIntact(Opcode.audioData))
+
+        var keyframeDelta = original
+        keyframeDelta.replaceSubrange(
+            Int(dispatch.temporalModelOffset)..<Int(dispatch.temporalModelOffset + 14),
+            with: "keyframe-delta".utf8)
+        var relative: UInt64 = 4
+        for _ in 0..<3 {
+            let length = UInt64(
+                try XCTUnwrap(
+                    readU32(
+                        keyframeDelta,
+                        at: descriptor.offset + recordHeaderSize + relative)))
+            relative += 4 + length
+        }
+        let dataLengthAt = descriptor.offset + recordHeaderSize + relative
+
+        var reservedFlags = keyframeDelta
+        reservedFlags[Int(dataLengthAt + 32)] |= 0x80
+        XCTAssertTrue(
+            validate(reservedFlags).findings.contains {
+                $0.message.contains("Audio Source.flags")
+                    && $0.message.contains("reserved flag bits")
+            })
+
+        var legacyOnly = keyframeDelta
+        legacyOnly[Int(descriptor.offset)] = Opcode.audio
+        legacyOnly[Int(payload.offset)] = Opcode.privateStart
+        XCTAssertFalse(
+            validate(legacyOnly).findings.contains {
+                $0.message.contains("Header has-audio flag")
+            })
+
+        var mixed = keyframeDelta
+        let firstState = try XCTUnwrap(
+            originalWalk.records.first {
+                $0.opcode == Opcode.chunk || $0.opcode == Opcode.deltaChunk
+            })
+        mixed.insert(
+            contentsOf: [Opcode.audio] + littleU64(0), at: Int(firstState.offset))
+        XCTAssertTrue(
+            validate(mixed).findings.contains {
+                $0.message == "legacy Audio and Audio Source records must not be mixed"
+            })
+    }
+
+    func testPhysicalDeltaReferencesAreCheckedWithoutAnIndex() throws {
+        try requireCorpus()
+        let file = corpusDirectory().appendingPathComponent(
+            "keyframe/KeyframeDelta-UseChunkIndex-UseCrc-UseStatistics.4dgs")
+        var bytes = try readFixture(file)
+        let walked = try walk(bytes)
+        let delta = try XCTUnwrap(walked.firstIntact(Opcode.deltaChunk))
+        writeU64(
+            delta.offset, into: &bytes,
+            at: delta.offset + recordHeaderSize + 21)
+        for frame in walked.records where frame.opcode == Opcode.chunkIndex {
+            bytes[Int(frame.offset)] = Opcode.privateStart
+        }
+        let footer = try XCTUnwrap(walked.firstIntact(Opcode.footer))
+        writeU64(0, into: &bytes, at: footer.offset + recordHeaderSize)
+        writeU32(0, into: &bytes, at: footer.offset + recordHeaderSize + 16)
+
+        XCTAssertTrue(
+            validate(bytes).findings.contains {
+                $0.message.contains("the physical DeltaChunk at byte \(delta.offset)")
+                    && $0.message.contains("references point backwards only")
+            })
+    }
+
+    func testFooterSummaryOffsetStartNamesTheFirstSummaryOffsetRecord() throws {
+        try requireCorpus()
+        let variant =
+            "TenWindows-UseChunkIndex-UseChunks-UseCrc-UseStatistics-UseSummaryOffset.4dgs"
+        var bytes = try readFixture(corpusDirectory().appendingPathComponent(variant))
+        let walked = try walk(bytes)
+        let statistics = try XCTUnwrap(walked.firstIntact(Opcode.statistics))
+        let footer = try XCTUnwrap(walked.firstIntact(Opcode.footer))
+        writeU64(
+            statistics.offset, into: &bytes,
+            at: footer.offset + recordHeaderSize + 8)
+        writeU32(0, into: &bytes, at: footer.offset + recordHeaderSize + 16)
+
+        XCTAssertTrue(
+            validate(bytes).findings.contains {
+                $0.message
+                    == "the Footer's summary_offset_start \(statistics.offset) names Statistics; "
+                    + "expected SummaryOffset"
+            })
+
+        var laterOffset = try readFixture(corpusDirectory().appendingPathComponent(variant))
+        laterOffset[Int(statistics.offset)] = Opcode.summaryOffset
+        writeU32(0, into: &laterOffset, at: footer.offset + recordHeaderSize + 16)
+        XCTAssertTrue(
+            validate(laterOffset).findings.contains {
+                $0.message.contains("does not name the first SummaryOffset record")
+                    && $0.message.contains("byte \(statistics.offset)")
             })
     }
 

@@ -15,6 +15,7 @@ public enum Opcode {
     public static let attributeStream: UInt8 = 0x06
     public static let shBandStream: UInt8 = 0x07
     public static let chunkIndex: UInt8 = 0x08
+    public static let audio: UInt8 = 0x09
     public static let statistics: UInt8 = 0x0C
     public static let summaryOffset: UInt8 = 0x0F
     public static let deltaChunk: UInt8 = 0x10
@@ -465,6 +466,7 @@ func isKeyframeDelta(_ source: ToolReader, _ walk: Walk) throws -> Bool {
 
 public struct SummaryDeclaration {
     public let start: UInt64
+    public let offsetStart: UInt64
     public let crc: UInt32
     public let end: UInt64
 }
@@ -479,9 +481,12 @@ func summaryDeclaration(_ source: ToolReader, _ walk: Walk) throws -> SummaryDec
             reason: "the record has \(frame.length) bytes; expected at least \(fields)")
     }
     let bytes = try source.exactly(offset: content, count: Int(fields), record: "Footer")
-    guard let start = readU64(bytes, at: 0), let crc = readU32(bytes, at: 16) else { return nil }
-    guard start != 0 else { return nil }
-    return SummaryDeclaration(start: start, crc: crc, end: frame.offset)
+    guard let start = readU64(bytes, at: 0),
+        let offsetStart = readU64(bytes, at: 8), let crc = readU32(bytes, at: 16)
+    else { return nil }
+    guard start != 0 || offsetStart != 0 else { return nil }
+    return SummaryDeclaration(
+        start: start, offsetStart: offsetStart, crc: crc, end: frame.offset)
 }
 
 public func summaryDeclaration(_ bytes: [UInt8], _ walk: Walk) -> SummaryDeclaration? {
