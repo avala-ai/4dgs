@@ -457,6 +457,11 @@ func headerDispatch(_ source: ToolReader, _ walk: Walk) throws -> HeaderDispatch
     guard relative <= frame.length, frame.length - relative >= afterModel else { return nil }
     let degreeAndFlags = try source.exactly(
         offset: content + relative + 48, count: 2, record: "Header sh_degree and flags")
+    guard degreeAndFlags[0] <= 3 else {
+        throw FourDGSError.malformed(
+            offset: Int64(clamping: content + relative + 48), record: "Header",
+            field: "sh_degree", reason: "declares \(degreeAndFlags[0]); expected 0 through 3")
+    }
     let expected = Array("keyframe-delta".utf8)
     return HeaderDispatch(
         keyframeDelta: model == expected, durationSec: durationSec,

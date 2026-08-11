@@ -203,7 +203,9 @@ private func chunkFields(_ source: ToolReader, _ frame: Frame) throws -> ChunkFi
 
 /// Grid parameters are semantic numeric values, not opaque payload. The core parser preserves
 /// IEEE non-finite values, so the validator checks every physical Quantization record itself.
-private func validateQuantizationFiniteness(_ source: ToolReader, _ frame: Frame) throws {
+private func validateQuantizationFiniteness(
+    _ source: ToolReader, _ frame: Frame, shDegree: UInt8?
+) throws {
     let content = frame.offset + recordHeaderSize
     guard frame.length >= 4 else {
         throw FourDGSError.truncated(
@@ -233,6 +235,42 @@ private func validateQuantizationFiniteness(_ source: ToolReader, _ frame: Frame
                 offset: Int64(clamping: numericStart + UInt64(i * 8)), record: "Quantization",
                 field: name, reason: "expected a finite grid parameter")
         }
+    }
+
+    // `step_sh` follows the numeric prefix, then a length-prefixed bounds map. The
+    // optional per-band depths begin after that map; skip the map by its validated length
+    // so a large declaration is never materialized just to reach the appended bytes.
+    let suffix = numericStart + numericBytes
+    guard suffix <= content + frame.length, content + frame.length - suffix >= 5 else {
+        throw FourDGSError.truncated(
+            offset: Int64(clamping: suffix), record: "Quantization suffix",
+            needed: 5, available: Int64(clamping: content + frame.length - suffix))
+    }
+    let suffixHeader = try source.exactly(
+        offset: suffix, count: 5, record: "Quantization step_sh and bounds length")
+    let boundsLength = UInt64(readU32(suffixHeader, at: 1) ?? 0)
+    let depthsAt = suffix + 5 + boundsLength
+    guard boundsLength <= content + frame.length - suffix - 5 else {
+        throw FourDGSError.truncated(
+            offset: Int64(clamping: suffix + 5), record: "Quantization bounds",
+            needed: Int64(clamping: boundsLength),
+            available: Int64(clamping: content + frame.length - suffix - 5))
+    }
+    guard depthsAt < content + frame.length, let shDegree, shDegree > 0 else { return }
+    let countByte = try source.exactly(
+        offset: depthsAt, count: 1, record: "Quantization sh_depth_count")
+    let count = UInt64(countByte[0])
+    guard count > 0, count <= content + frame.length - depthsAt - 1 else { return }
+    let depths = try source.exactly(
+        offset: depthsAt + 1, count: Int(count), record: "Quantization SH bit depths")
+    // A malformed appended field is read as absent by decoders. Only a legal declaration
+    // makes the validator compare its one-depth-per-band promise with the Header.
+    guard depths.allSatisfy({ (3...8).contains($0) }) else { return }
+    guard count == UInt64(shDegree) else {
+        throw FourDGSError.malformed(
+            offset: Int64(clamping: depthsAt), record: "Quantization",
+            field: "sh_depth_count",
+            reason: "declares \(count) depths; Header sh_degree \(shDegree) requires one per band")
     }
 }
 
@@ -801,7 +839,7 @@ private func validatePhysicalRecords(
                 case Opcode.quantization:
                     if quantization == nil { quantization = frame }
                     do {
-                        try validateQuantizationFiniteness(source, frame)
+                        try validateQuantizationFiniteness(source, frame, shDegree: shDegree)
                     } catch {
                         scanReport.error(
                             "Quantization at byte \(frame.offset) is invalid: "
@@ -1039,7 +1077,7 @@ private func validatePhysicalRecords(
                     return
                 }
 
-                if keyframeDelta && isAuxiliaryRecord(frame.opcode) {
+                if isAuxiliaryRecord(frame.opcode) {
                     if auxiliaryRecords.count < maximumRetainedValidationRecords {
                         auxiliaryRecords.append(frame)
                     } else if !auxiliaryLimitReported {
@@ -1253,12 +1291,12 @@ private func validatePhysicalRecords(
         }
     }
 
-    if keyframeDelta, !auxiliaryRecords.isEmpty, let header, let quantization,
-        let temporalModelOffset
+    if !auxiliaryRecords.isEmpty, let header, let quantization,
+        !keyframeDelta || temporalModelOffset != nil
     {
         var slices = frontMatterSlices(
             header: header, quantization: quantization, windowTable: windowTable,
-            temporalModelOffset: temporalModelOffset)
+            temporalModelOffset: keyframeDelta ? temporalModelOffset : nil)
         let auxiliaryStart = slices.reduce(UInt64(0)) { $0 + $1.length }
         for frame in auxiliaryRecords {
             slices.append(SourceSlice(offset: frame.offset, length: frame.total))
@@ -1289,7 +1327,7 @@ private func validatePhysicalRecords(
                     var trial = frontMatterSlices(
                         header: header, quantization: quantization,
                         windowTable: windowTable,
-                        temporalModelOffset: temporalModelOffset)
+                        temporalModelOffset: keyframeDelta ? temporalModelOffset : nil)
                     for frame in auxiliaryRecords where frame.offset != candidate.offset {
                         trial.append(SourceSlice(offset: frame.offset, length: frame.total))
                     }
@@ -1465,6 +1503,12 @@ private func gaussianIDs(_ frame: Frame, _ group: DeltaGroup) throws -> Set<UInt
     }
     guard mode <= 2 else {
         throw malformedIdentity(frame, "the stream declares unknown mode \(mode)")
+    }
+    guard mode != 2 || count == 1 else {
+        throw malformedIdentity(
+            frame,
+            "the constant gaussian_id stream declares \(count) rows; one constant repeated more than once duplicates an identity"
+        )
     }
     guard codec == 0 else {
         throw FourDGSError.unsupportedCodec(

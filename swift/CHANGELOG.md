@@ -6,8 +6,6 @@ All notable changes to the Swift package are documented here, following
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-08-10
-
 ### Added
 
 - `4dgs`, the inspect-and-validate tool, completing the row across all six SDKs. `4dgs inspect`
@@ -31,6 +29,10 @@ All notable changes to the Swift package are documented here, following
   reader itself decides. It has no record parsers of its own and does not grow any; the consequence
   is that on a file it calls valid, Python may still have something to say. It never reports a
   finding Python contradicts.
+
+## [0.1.0] - 2026-08-10
+
+### Added
 
 - The package can be depended on. `Package.swift` moved to the repository root, because SwiftPM
   clones the URL it is given and looks for a manifest at the top of that clone — a manifest under

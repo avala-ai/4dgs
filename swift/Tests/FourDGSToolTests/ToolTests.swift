@@ -1077,6 +1077,55 @@ final class ValidateTests: XCTestCase {
                 .joined(separator: "\n"))
     }
 
+    func testHeaderDegreeAndQuantizationDepthsAreValidatedDirectly() throws {
+        try requireCorpus()
+        let file = corpusDirectory().appendingPathComponent(
+            "MixedLifetimes-SHDegree3-UseChunkIndex-UseCrc.4dgs")
+        let original = try readFixture(file)
+        let walked = try walk(original)
+        let dispatch = try XCTUnwrap(
+            try headerDispatch(ToolReader(InMemoryReader(original)), walked))
+
+        var impossibleDegree = original
+        impossibleDegree[Int(dispatch.temporalModelOffset + 14 + 48)] = 4
+        XCTAssertTrue(
+            validate(impossibleDegree).findings.contains {
+                $0.message.contains("Header") && $0.message.contains("sh_degree")
+                    && $0.message.contains("0 through 3")
+            })
+
+        let quantization = try XCTUnwrap(walked.firstIntact(Opcode.quantization))
+        let content = quantization.offset + recordHeaderSize
+        let schemeLength = UInt64(try XCTUnwrap(readU32(original, at: content)))
+        let suffix = content + 4 + schemeLength + 11 * 8
+        let boundsLength = UInt64(try XCTUnwrap(readU32(original, at: suffix + 1)))
+        let depthsAt = suffix + 5 + boundsLength
+        XCTAssertEqual(depthsAt, quantization.offset + quantization.total)
+        var wrongDepthCount = original
+        wrongDepthCount.insert(contentsOf: [1, 8], at: Int(depthsAt))
+        writeU64(
+            quantization.length + 2, into: &wrongDepthCount, at: quantization.offset + 1)
+        XCTAssertTrue(
+            validate(wrongDepthCount).findings.contains {
+                $0.message.contains("sh_depth_count")
+                    && $0.message.contains("Header sh_degree 3 requires one per band")
+            })
+    }
+
+    func testGaussianBirthAuxiliaryRecordsAreParsedToo() throws {
+        try requireCorpus()
+        let file = corpusDirectory().appendingPathComponent(provenanceVariant)
+        var bytes = try readFixture(file)
+        let state = try XCTUnwrap(try walk(bytes).firstIntact(Opcode.chunk))
+        bytes.insert(
+            contentsOf: [Opcode.coordinateFrame] + littleU64(0), at: Int(state.offset))
+        let findings = validate(bytes).findings
+        XCTAssertTrue(
+            findings.contains {
+                $0.message.contains("physical CoordinateFrame record at byte \(state.offset)")
+            }, findings.map(\.message).joined(separator: "\n"))
+    }
+
     func testEveryPhysicalBandMustAppearInItsOwningIndexEntry() throws {
         try requireCorpus()
         let file = corpusDirectory().appendingPathComponent(
@@ -1143,6 +1192,14 @@ final class ValidateTests: XCTestCase {
         XCTAssertTrue(
             validate(missingIdentity).findings.contains {
                 $0.message.contains("keyframe group carries no gaussian_id stream")
+            })
+
+        var constantIdentity = try readFixture(keyframeFile)
+        constantIdentity[Int(try XCTUnwrap(identityOffset)) + 2] = 2
+        XCTAssertTrue(
+            validate(constantIdentity).findings.contains {
+                $0.message.contains("constant gaussian_id stream")
+                    && $0.message.contains("duplicates an identity")
             })
 
         let audioFile = corpusDirectory().appendingPathComponent(
