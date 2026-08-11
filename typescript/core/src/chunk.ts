@@ -17,7 +17,7 @@
 import { CODEC_DEFLATE, CODEC_ZSTD, type CodecRegistry, decompressorFor } from "./codec.js";
 import { Cursor } from "./cursor.js";
 import { MalformedFile, UnsupportedCodec } from "./errors.js";
-import { Attribute, REQUIRED_ATTRIBUTES } from "./opcodes.js";
+import { ATTRIBUTE_CHANNELS, Attribute, REQUIRED_ATTRIBUTES } from "./opcodes.js";
 import {
   clamp,
   dequantizeRotation,
@@ -162,17 +162,25 @@ export async function decodeChunkStreams(
     byId.set(stream.attributeId, stream);
   }
 
-  // One channel, as section 6.6 defines it. Without this a two-channel stream would
-  // decode to twice as many labels as there are gaussians, and the merge downstream
-  // would either shift every following gaussian's membership or fail on an array
-  // bound — a wrong object, or a raw RangeError, where the file is simply malformed.
-  const ids = byId.get(Attribute.ObjectId);
-  if (ids !== undefined) {
-    if (ids.channels !== 1) {
+  // The width the registry gives each attribute it defines. Without this a stream that
+  // declares the wrong `channels` and the right `element_count` decodes to a differently
+  // shaped array that every reader below indexes with a fixed stride: a two-channel
+  // `object_id` shifts every following gaussian's membership, and a one-channel
+  // `position` reads its neighbour's x as its own y and `undefined` at the end, which
+  // arithmetic turns into a `NaN` centre rather than into a refusal. `object_id` was
+  // already checked here; the rest were not.
+  for (const [attribute, stream] of byId) {
+    const channels = ATTRIBUTE_CHANNELS.get(attribute);
+    if (channels !== undefined && stream.channels !== channels) {
       throw new MalformedFile(
-        `the object_id stream declares ${ids.channels} channels, the format defines 1`,
+        `attribute ${attribute} declares ${stream.channels} channels, the format defines ` +
+          `${channels}`,
       );
     }
+  }
+
+  const ids = byId.get(Attribute.ObjectId);
+  if (ids !== undefined) {
     // The zero-element exemption above does not extend to membership. An empty
     // `object_id` stream on a populated chunk would decode to no labels at all, and the
     // merge downstream would read every gaussian as background — a silently different

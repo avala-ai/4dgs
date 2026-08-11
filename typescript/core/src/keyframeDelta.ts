@@ -43,7 +43,7 @@ import {
 import { DEFAULT_CODECS, type CodecRegistry } from "./codec.js";
 import { Cursor } from "./cursor.js";
 import { MalformedFile } from "./errors.js";
-import { Attribute, GAUSSIAN_FLAG_NEVER_FADES } from "./opcodes.js";
+import { ATTRIBUTE_CHANNELS, Attribute, GAUSSIAN_FLAG_NEVER_FADES } from "./opcodes.js";
 import {
   clamp,
   dequantizeRotation,
@@ -171,8 +171,29 @@ function keyframeState(ids: Int32Array, bins: Map<number, Column>): KeyframeDelt
           `${ids.length} gaussians`,
       );
     }
+    checkChannels(attribute, column, "a keyframe");
   }
   return new KeyframeDeltaState(ids, bins);
+}
+
+/**
+ * An attribute's interleaving width, against the one the registry gives it.
+ *
+ * The row count alone does not pin the shape: a `rotation` column declaring one channel
+ * and `count` rows passes every count check and then feeds a reader that indexes
+ * `values[i * 3 + c]`, which reads the next row's bin as this row's second component and
+ * `undefined` past the end — a plausible-looking wrong quaternion, or a `NaN` one. The
+ * check exists in `decodeChunkStreams` for the same reason; a composed state has to make
+ * it too, because a delta group's columns never pass through that path.
+ */
+function checkChannels(attribute: number, column: Column, where: string): void {
+  const channels = ATTRIBUTE_CHANNELS.get(attribute);
+  if (channels !== undefined && column.channels !== channels) {
+    throw new MalformedFile(
+      `attribute ${attribute} in ${where} declares ${column.channels} channels, the format ` +
+        `defines ${channels}`,
+    );
+  }
 }
 
 /**
@@ -258,6 +279,7 @@ function applyDelta(
             `declares ${updateIds.length}`,
         );
       }
+      checkChannels(attribute, delta, "an update group");
       const target = bins.get(attribute);
       if (target === undefined) {
         throw new MalformedFile(
@@ -314,6 +336,7 @@ function applyDelta(
             `declares ${birthIds.length}`,
         );
       }
+      checkChannels(attribute, column, "a birth group");
     }
 
     const attributes = new Set<number>([...bins.keys(), ...birthBins.keys()]);
@@ -324,7 +347,15 @@ function applyDelta(
     for (const attribute of attributes) {
       const existing = bins.get(attribute);
       const added = birthBins.get(attribute)!;
-      const before = existing?.values ?? new Int32Array(0);
+      // A birth may introduce a column the referenced state does not carry: `object_id`
+      // is optional per gaussian and per chunk, so a background keyframe legitimately
+      // omits it and a later birth legitimately supplies membership. The rows already in
+      // the state still need a value, and §6.6 says which one — a state that omits the
+      // stream is read as though every gaussian in it carried `0`. Without the prefix the
+      // merged column is `birth_count` rows long against `count` ids, so the birth's
+      // membership lands on the first pre-existing gaussian and the birth itself reads
+      // past the end: two gaussians in the wrong object, silently.
+      const before = existing?.values ?? new Int32Array(ids.length * added.channels);
       const merged = new Int32Array(before.length + added.values.length);
       merged.set(before, 0);
       merged.set(added.values, before.length);
@@ -1003,8 +1034,17 @@ export interface KeyframeDeltaGaussians {
  *
  * The chunks tile `[0, duration_sec)` with half-open intervals, so exactly one covers any
  * `t` inside the timeline and finding it is a lookup rather than a search. A `t` at or past
- * the end resolves to the last chunk: a reader asking for the final instant of a file gets
- * its final state rather than a refusal for landing on the boundary.
+ * the end of a **complete** timeline resolves to the last chunk: a reader asking for the
+ * final instant of a file gets its final state rather than a refusal for landing on the
+ * boundary of a half-open interval.
+ *
+ * That convenience stops where the timeline does. A streamed reader may hold only a
+ * complete prefix of a truncated file (§11.10), and there the last decodable instant is the
+ * last complete chunk's `t1`, not the Header's `duration_sec` — the same rule the canonical
+ * probes are bounded by. Handing back the last chunk for a `t` in the missing tail would
+ * report the state before the cut as the state after it, which is a decoder inventing
+ * content: the bytes that said what happens at that instant are the bytes that are gone.
+ * The indexed path already refuses it (`chainFor`), and now both do.
  */
 export function keyframeDeltaChunkAt(
   sequence: KeyframeDeltaSequence,
@@ -1015,7 +1055,15 @@ export function keyframeDeltaChunkAt(
     throw new MalformedFile(`no state chunk covers t=${t}; the file carries none`);
   }
   for (const c of chunks) if (c.t0 <= t && t < c.t1) return c;
-  return chunks[chunks.length - 1]!;
+  const last = chunks[chunks.length - 1]!;
+  if (t >= last.t1 && last.t1 < sequence.header.durationSec) {
+    throw new MalformedFile(
+      `no decoded state chunk covers t=${t}: this timeline ends at ${last.t1}, short of the ` +
+        `Header's duration_sec ${sequence.header.durationSec}, so the file was cut before the ` +
+        `chunk that would have said`,
+    );
+  }
+  return last;
 }
 
 /**

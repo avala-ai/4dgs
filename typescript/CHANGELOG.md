@@ -18,6 +18,7 @@ The four packages version together.
   samples positions and scales for the cross-SDK statement, so the first renderer written against
   this package had to reimplement §11.7 to get every attribute of every gaussian.
 - `dequantizeRotation` accepts a `Float64Array` output as well as a `Float32Array`.
+- `ATTRIBUTE_CHANNELS`, the interleaving width the registry gives each attribute id it defines.
 
 ### Changed
 
@@ -29,6 +30,29 @@ The four packages version together.
   present at full opacity: outside the window a gaussian does not exist at that time (spec §3),
   which is how the `gaussian-birth` path has always decided it. Unobservable on files that carry one
   full-duration window, which is every keyframe-delta file in the corpus today.
+
+### Fixed
+
+- **An attribute stream whose `channels` is not the width the registry gives it is refused**, on
+  both the `gaussian-birth` chunk path and the `keyframe-delta` composition path. Every reader of
+  these bins indexes with a fixed stride, so a `rotation` column declaring one channel and the right
+  element count read the next row's bin as this row's second component — and `undefined` past the
+  end, which arithmetic turns into a `NaN` quaternion rather than into a refusal. The rule was
+  enforced for `object_id` alone, where a wrong width would have shifted every gaussian's
+  membership; `ATTRIBUTE_CHANNELS` now states it once for every attribute the registry names.
+- **A birth that introduces `object_id` no longer misaligns the column it introduces.** Membership
+  is optional per chunk and its omission means `0` (§6.6), so a background keyframe without the
+  stream followed by a delta birth that has one is a legal file. Composed without a default for the
+  rows already in the state, the merged column was `birth_count` rows long against the whole
+  population: the birth's membership landed on a gaussian that was already there, and the birth
+  itself read past the end as `0`. The rows that came before an introduced column now carry the
+  omission default.
+- **A seek past the end of a truncated prefix is refused rather than answered with the last state
+  before the cut.** `keyframeDeltaChunkAt` resolves a `t` at or past the end of a _complete_
+  timeline to the last chunk, which is the boundary convenience a player wants; on a streamed prefix
+  of a truncated file (§11.10) the last decodable instant is the last complete chunk's `t1`, and
+  reporting the state before the cut as the state after it is a decoder inventing content. The
+  indexed path already refused it.
 
 ### Removed
 

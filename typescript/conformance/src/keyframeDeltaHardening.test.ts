@@ -20,6 +20,7 @@ import {
   MalformedFile,
   UnsupportedCodec,
   checkTiling,
+  decodeChunkStreams,
   decodeKeyframeDeltaIndexed,
   decodeKeyframeDeltaStreamed,
   decompressChunkBlock,
@@ -128,18 +129,23 @@ async function oneGaussianStreams(
   windowIndex: number,
   motionBinX: number,
   objectId?: number,
+  options: { id?: number; rotationChannels?: number } = {},
 ): Promise<Uint8Array> {
   const s = (attributeId: number, values: number[], channels: number) =>
     encodeTestStream({ attributeId, values, channels });
   const membership = objectId === undefined ? [] : [s(Attribute.ObjectId, [objectId], 1)];
+  // One row either way: three channels is what the registry defines, and a one-channel
+  // rotation is the malformed shape whose element count still matches the chunk's.
+  const rotationChannels = options.rotationChannels ?? 3;
+  const rotation = rotationChannels === 3 ? [0, 0, 0] : [0];
   return concat(
     await Promise.all([
       ...membership,
-      s(Attribute.GaussianId, [0], 1),
+      s(Attribute.GaussianId, [options.id ?? 0], 1),
       s(Attribute.Position, [0, 0, 0], 3),
       s(Attribute.Scale, [0, 0, 0], 3),
       s(Attribute.RotationIndex, [3], 1),
-      s(Attribute.Rotation, [0, 0, 0], 3),
+      s(Attribute.Rotation, rotation, rotationChannels),
       s(Attribute.Color, [0, 0, 0], 3),
       s(Attribute.Opacity, [0], 1),
       s(Attribute.Motion, [motionBinX, 0, 0], 3),
@@ -149,6 +155,72 @@ async function oneGaussianStreams(
       s(Attribute.WindowIndex, [windowIndex], 1),
     ]),
   );
+}
+
+/** The same streams a `gaussian-birth` chunk carries: everything but the identity. */
+async function threeChannelStreams(options: { rotationChannels: number }): Promise<Uint8Array> {
+  return oneGaussianStreams(0, 0, undefined, options);
+}
+
+/**
+ * A Delta Chunk record (spec §5.18) over `[t0, t1)` referencing `referenceOffset`, with
+ * one birth and nothing else.
+ *
+ * Written by hand rather than by an encoder, because the file this pins — a keyframe with
+ * no `object_id` and a birth that has one — is legal, unrepresentable in the corpus today,
+ * and exactly the shape the composition bug lived in.
+ */
+function deltaChunkRecord(options: {
+  t0: number;
+  t1: number;
+  referenceOffset: number;
+  births: Uint8Array;
+}): Uint8Array {
+  const blob = concat([u64(0), u64(options.births.length), options.births, u64(0)]);
+  const body = concat([
+    f64(options.t0),
+    f64(options.t1),
+    u32(0), // level
+    new Uint8Array([0]), // delta_mode 0: references the keyframe at the head of the GOP
+    u64(options.referenceOffset),
+    u64(options.referenceOffset), // keyframe_offset
+    new Uint8Array([1, 0]), // depth
+    u32(0), // update_count
+    u32(1), // birth_count
+    u32(0), // death_count
+    str(""), // compression
+    u64(blob.length),
+    u64(blob.length),
+    blob,
+  ]);
+  return record(0x10, body);
+}
+
+/**
+ * A keyframe with one gaussian and no `object_id`, then a delta that births one with it.
+ *
+ * §6.6 makes membership optional per chunk and defines the omission as `0`, so this file
+ * conforms; what it asks of a decoder is that the column the birth introduces be as long
+ * as the population it lands in.
+ */
+async function keyframeThenBirthFile(options: {
+  born: number;
+  objectId: number;
+}): Promise<Uint8Array> {
+  const keyframeStreams = await oneGaussianStreams(0, 0);
+  const keyframe = chunkRecord(0, 0.5, keyframeStreams, "", keyframeStreams.length);
+  const front = concat([
+    MAGIC,
+    record(0x01, headerBody(1)),
+    record(0x03, quantizationBody()),
+    record(0x04, windowTableBody([[0, 1]])),
+  ]);
+  const births = await oneGaussianStreams(0, 0, options.objectId, { id: options.born });
+  return concat([
+    front,
+    keyframe,
+    deltaChunkRecord({ t0: 0.5, t1: 1, referenceOffset: front.length, births }),
+  ]);
 }
 
 /**
@@ -184,11 +256,13 @@ async function oneKeyframeFile(options: {
   duration: number;
   compress?: boolean;
   objectId?: number;
+  rotationChannels?: number;
 }): Promise<Uint8Array> {
   const rawStreams = await oneGaussianStreams(
     options.windowIndex,
     options.motionBinX,
     options.objectId,
+    options.rotationChannels === undefined ? {} : { rotationChannels: options.rotationChannels },
   );
   const blob = options.compress ? await deflate(rawStreams) : rawStreams;
   const chunk = chunkRecord(
@@ -389,6 +463,88 @@ test("a streamed decode reads a complete prefix and bounds probes to the last ch
   const states = keyframeDeltaStatesJson(decoded).states as { t: number }[];
   assert.ok(states.length > 0);
   assert.ok(states.every((s) => s.t < lastT1));
+
+  // And a seek into the tail the cut removed is refused rather than answered with the last
+  // state before it. The end-of-timeline convenience — `t` at or past the end resolves to
+  // the last chunk — is for a complete file; here the missing bytes are what said what
+  // happens at that instant, so handing back the state before the cut would be the decoder
+  // inventing content. The indexed path already refuses it; both do now.
+  assert.equal(keyframeDeltaChunkAt(decoded, lastT1 - 1e-9).t1, lastT1);
+  assert.throws(
+    () => keyframeDeltaChunkAt(decoded, lastT1),
+    (error: unknown) =>
+      error instanceof MalformedFile && /this timeline ends at/.test(error.message),
+  );
+  assert.throws(
+    () => keyframeDeltaChunkAt(decoded, sequence.header.durationSec - 1e-9),
+    MalformedFile,
+  );
+  // The complete file keeps the convenience: its last chunk reaches duration_sec, so the
+  // final instant and the boundary itself both resolve.
+  assert.equal(
+    keyframeDeltaChunkAt(sequence, sequence.header.durationSec).t1,
+    sequence.header.durationSec,
+  );
+});
+
+test("a birth that introduces object_id defaults the rows that came before it", async () => {
+  // §6.6 makes membership optional per chunk and gives the omission a value: a state that
+  // omits the stream is read as though every gaussian in it carried 0. So a background
+  // keyframe with no `object_id` followed by a delta birth that has one is a legal file,
+  // and the column it composes to must be as long as the population. Composed without the
+  // default it was `birth_count` rows long against two ids, so the birth's membership
+  // landed on the gaussian that was already there and the birth itself read past the end:
+  // two gaussians in the wrong object, and no error anywhere.
+  const born = 7;
+  const objectId = 0xfffffff0;
+  const file = await keyframeThenBirthFile({ born, objectId });
+  const sequence = await decodeKeyframeDeltaStreamed(file);
+  assert.equal(sequence.chunks.length, 2);
+
+  const before = reconstructKeyframeDelta(sequence, sequence.chunks[0]!, 0.25);
+  assert.equal(before.objectId, null, "the keyframe carries no membership at all");
+
+  const after = reconstructKeyframeDelta(sequence, sequence.chunks[1]!, 0.75);
+  assert.deepEqual([...after.ids], [0, born], "ascending gaussian_id");
+  assert.deepEqual([...after.objectId!], [0, objectId]);
+});
+
+test("an attribute stream whose channel width is not the registry's is refused", async () => {
+  // The row count does not pin the shape. A `rotation` column declaring one channel and
+  // the right element count passed every check and then met a reader that indexes
+  // `values[i * 3 + c]`: it read the next row's bin as this row's second component, and
+  // `undefined` past the end, which arithmetic turns into a NaN quaternion. The rule was
+  // enforced for `object_id` alone; it is the registry's rule for every attribute it names.
+  const wrong = await oneKeyframeFile({
+    windows: [[0, 1]],
+    windowIndex: 0,
+    motionBinX: 0,
+    duration: 1,
+    rotationChannels: 1,
+  });
+  await assert.rejects(
+    () => decodeKeyframeDeltaStreamed(wrong),
+    (error: unknown) =>
+      error instanceof MalformedFile &&
+      /attribute 3 .*declares 1 channels, the format defines 3/.test(error.message),
+  );
+
+  // The same streams read as a `gaussian-birth` chunk: the check belongs to both paths,
+  // because a delta group's columns never pass through the chunk decoder.
+  const streams = await threeChannelStreams({ rotationChannels: 1 });
+  await assert.rejects(
+    () =>
+      decodeChunkStreams(streams, 1, {
+        steps: { ...STEPS, sh: 1 },
+        posOrigin: [0, 0, 0],
+        windows: new Float64Array([0, 1]),
+        supportK: supportK(0.05),
+        codecs: DEFAULT_CODECS,
+      }),
+    (error: unknown) =>
+      error instanceof MalformedFile &&
+      /attribute 3 declares 1 channels, the format defines 3/.test(error.message),
+  );
 });
 
 test("canonical summaries handle more chunks than V8's argument limit", async () => {

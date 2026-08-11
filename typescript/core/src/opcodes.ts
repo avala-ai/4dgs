@@ -126,6 +126,37 @@ export const Attribute = {
   ObjectId: 14,
 } as const;
 
+/**
+ * The interleaving width the registry gives each attribute it defines.
+ *
+ * Every reader of these streams indexes with a fixed stride — `position[i * 3 + 2]`,
+ * `rotation[i * 3 + 1]` — so a stream that declares the wrong `channels` while declaring
+ * the right `element_count` does not fail: it reads a neighbour's value, or reads past the
+ * end and gets `undefined`, which arithmetic turns into `NaN` rather than into a refusal.
+ * The rule was already enforced for `object_id` alone, where a wrong width would have
+ * shifted every following gaussian's membership. It is the same rule for the rest.
+ *
+ * An id this map does not name is an attribute this reader does not interpret, and its
+ * width is the file's business.
+ */
+export const ATTRIBUTE_CHANNELS: ReadonlyMap<number, number> = new Map<number, number>([
+  [Attribute.Position, 3],
+  [Attribute.Scale, 3],
+  [Attribute.RotationIndex, 1],
+  [Attribute.Rotation, 3],
+  [Attribute.Color, 3],
+  [Attribute.Opacity, 1],
+  [Attribute.Motion, 3],
+  [Attribute.MuT, 1],
+  [Attribute.SigmaT, 1],
+  [Attribute.Flags, 1],
+  [Attribute.WindowIndex, 1],
+  [Attribute.SourceGroup, 1],
+  [Attribute.SourceIndex, 1],
+  [Attribute.GaussianId, 1],
+  [Attribute.ObjectId, 1],
+]);
+
 /** Attribute ids every chunk must carry. */
 export const REQUIRED_ATTRIBUTES: readonly number[] = [
   Attribute.Position,
