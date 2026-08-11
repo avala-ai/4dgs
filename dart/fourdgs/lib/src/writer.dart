@@ -605,7 +605,7 @@ class _Grid {
 
   factory _Grid.forScene(FourdgsGaussianSet g, String profile) {
     final constants = _profiles[profile]!;
-    final medianScale = g.count == 0 ? 1e-3 : _median(g.scales);
+    final medianScale = g.count == 0 ? 1e-3 : _medianFloat32(g.scales);
     final origin = Float64List(3);
     if (g.count > 0) {
       for (int axis = 0; axis < 3; axis++) {
@@ -674,14 +674,51 @@ class _Grid {
 
 String _decimal(double v) => v.toString();
 
-/// The median of a list, taken the way NumPy takes it: the mean of the two
-/// middle values on an even count, in double precision.
-double _median(List<double> values) {
+/// The median of positive float32 values without copying or sorting the lane.
+///
+/// Positive IEEE-754 bit patterns have the same order as their values. Four
+/// fixed 256-bin radix passes therefore select one order statistic with 1 KiB
+/// of scratch, however large the scene is. An even population selects its two
+/// middle values separately and averages them in double precision, matching
+/// NumPy without retaining another population-sized buffer.
+double _medianFloat32(Float32List values) {
   if (values.isEmpty) return 1e-3;
-  final sorted = Float64List.fromList(values)..sort();
-  final mid = sorted.length ~/ 2;
-  if (sorted.length.isOdd) return sorted[mid];
-  return 0.5 * (sorted[mid - 1] + sorted[mid]);
+  final bits = Uint32List.view(
+    values.buffer,
+    values.offsetInBytes,
+    values.length,
+  );
+
+  double select(int rank) {
+    final counts = Uint64List(256);
+    int prefix = 0;
+    int prefixMask = 0;
+    for (final shift in const <int>[24, 16, 8, 0]) {
+      counts.fillRange(0, counts.length, 0);
+      for (final value in bits) {
+        if ((value & prefixMask) == prefix) {
+          counts[(value >> shift) & 0xff]++;
+        }
+      }
+      int before = 0;
+      int bucket = 0;
+      for (; bucket < counts.length; bucket++) {
+        final through = before + counts[bucket];
+        if (rank < through) break;
+        before = through;
+      }
+      rank -= before;
+      prefix |= bucket << shift;
+      prefixMask |= 0xff << shift;
+    }
+    final word = Uint32List(1);
+    word[0] = prefix;
+    return Float32List.view(word.buffer).single;
+  }
+
+  final mid = values.length ~/ 2;
+  if (values.length.isOdd) return select(mid);
+  return 0.5 * (select(mid - 1) + select(mid));
 }
 
 /// `log(1 + x)`, which `dart:math` does not carry.

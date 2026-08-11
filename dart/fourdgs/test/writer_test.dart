@@ -1128,6 +1128,17 @@ void main() {
   });
 
   group('the grid', () {
+    test('the median scale is exact and leaves the source lane untouched', () {
+      final scene = flatScene(2, winHi: 2.0);
+      scene.scales.setAll(0, const <double>[1, 2, 3, 4, 5, 6]);
+      final before = Float32List.fromList(scene.scales);
+
+      final q = readFourdgsBytes(writeFourdgsBytes(scene, 2.0)).quantization;
+
+      expect(q.stepPos, 2 * 0.05 * 3.5);
+      expect(scene.scales, orderedEquals(before));
+    });
+
     test('declares pitches that are exactly twice the bounds it declares', () {
       final q =
           readFourdgsBytes(writeFourdgsBytes(buildScene(), 8.0)).quantization;
