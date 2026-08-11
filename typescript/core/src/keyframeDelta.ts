@@ -45,6 +45,7 @@ import { Cursor } from "./cursor.js";
 import { MalformedFile, TruncatedFile } from "./errors.js";
 import { FrontMatterScanner, type FrontMatterRecord } from "./frontMatter.js";
 import { ATTRIBUTE_CHANNELS, Attribute, GAUSSIAN_FLAG_NEVER_FADES } from "./opcodes.js";
+import { checkQuantizationScheme } from "./registry.js";
 import {
   clamp,
   dequantizeRotation,
@@ -877,6 +878,7 @@ export async function decodeKeyframeDeltaStreamed(
       }
     } else if (record.opcode === Opcode.Quantization) {
       quantization = parseQuantization(record.content);
+      checkQuantizationScheme(quantization.scheme);
     } else if (record.opcode === Opcode.WindowTable) {
       windows = parseWindowTable(record.content);
     } else if (record.opcode === Opcode.Chunk) {
@@ -1074,6 +1076,7 @@ export class KeyframeDeltaIndexedDecoder {
       } else if (record.opcode === Opcode.Quantization) {
         checkFetchedFrontMatterSize(record);
         quantization = parseQuantization(await front.content(record));
+        checkQuantizationScheme(quantization.scheme);
       } else if (record.opcode === Opcode.WindowTable) {
         checkFetchedFrontMatterSize(record);
         windows = parseWindowTable(await front.content(record));
@@ -1245,6 +1248,7 @@ export async function decodeKeyframeDeltaIndexed(
       header = parseHeader(record.content);
     } else if (record.opcode === Opcode.Quantization) {
       quantization = parseQuantization(record.content);
+      checkQuantizationScheme(quantization.scheme);
     } else if (record.opcode === Opcode.WindowTable) {
       windows = parseWindowTable(record.content);
     } else if (record.opcode === Opcode.Footer) {

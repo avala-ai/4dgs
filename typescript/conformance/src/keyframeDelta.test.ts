@@ -200,6 +200,20 @@ test("the range-backed indexed decoder reads only the requested chain", async ()
   assert.deepEqual([...ranged.rotations], [...expected.rotations]);
 });
 
+test("keyframe-delta readers refuse an unknown quantization scheme before reconstruction", async () => {
+  const data = bytes(MOVING_CHAINED);
+  const schemeAt = Buffer.from(data).indexOf("uniform-v1");
+  assert.ok(schemeAt >= 0);
+  data[schemeAt + "uniform-v".length] = "9".charCodeAt(0);
+
+  await assert.rejects(
+    () => KeyframeDeltaIndexedDecoder.open(new BytesReadable(data), { headProbeBytes: 64 }),
+    /uniform-v9/,
+  );
+  await assert.rejects(() => decodeKeyframeDeltaStreamed(data), /uniform-v9/);
+  await assert.rejects(() => decodeKeyframeDeltaIndexed(data), /uniform-v9/);
+});
+
 // The streamed and indexed sequences expose the same header, a small sanity tie.
 test("both read paths report the same header", async () => {
   const streamed: KeyframeDeltaSequence = await decodeKeyframeDeltaStreamed(bytes(MOVING_KEYFRAME));
