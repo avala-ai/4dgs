@@ -713,6 +713,89 @@ final class ValidateTests: XCTestCase {
                 $0.message.contains("composing attribute 0 for gaussian_id 0")
                     && $0.message.contains("signed 32-bit range")
             }, findings.map(\.message).joined(separator: "\n"))
+
+        func keyframeRecord(_ streams: [UInt8], t1: Double = 0.5) -> [UInt8] {
+            var body = littleU64(0) + littleU64(t1.bitPattern)
+            body += littleU32(0) + littleU32(1) + littleU32(0)
+            body += littleU64(UInt64(streams.count))
+            body += littleU64(UInt64(streams.count)) + streams
+            return [Opcode.chunk] + littleU64(UInt64(body.count)) + body
+        }
+
+        func deltaRecord(
+            t0: Double, t1: Double, reference: UInt64, keyframe: UInt64, depth: UInt16,
+            updates: [UInt8] = [], births: [UInt8] = [], deaths: [UInt8] = [],
+            updateCount: UInt32 = 0, birthCount: UInt32 = 0, deathCount: UInt32 = 0
+        ) -> [UInt8] {
+            let groups =
+                littleU64(UInt64(updates.count)) + updates
+                + littleU64(UInt64(births.count)) + births
+                + littleU64(UInt64(deaths.count)) + deaths
+            var body = littleU64(t0.bitPattern) + littleU64(t1.bitPattern) + littleU32(0)
+            body += [1] + littleU64(reference) + littleU64(keyframe) + littleU16(depth)
+            body += littleU32(updateCount) + littleU32(birthCount) + littleU32(deathCount)
+            body += littleU32(0) + littleU64(UInt64(groups.count))
+            body += littleU64(UInt64(groups.count)) + groups
+            return [Opcode.deltaChunk] + littleU64(UInt64(body.count)) + body
+        }
+
+        // A duplicate birth followed by an update used to reach
+        // Dictionary(uniqueKeysWithValues:) before the identity pass and trap the process.
+        let duplicateKeyframe = keyframeRecord(keyframeStreams)
+        let duplicateDeltaOffset = UInt64(front.count + duplicateKeyframe.count)
+        let duplicateBirth = deltaRecord(
+            t0: 0.5, t1: 0.75, reference: keyframeOffset, keyframe: keyframeOffset, depth: 1,
+            births: keyframeStreams, birthCount: 1)
+        let laterUpdate = stream(13, [0], channels: 1) + stream(1, [0, 0, 0], channels: 3)
+        let updateAfterDuplicate = deltaRecord(
+            t0: 0.75, t1: 1, reference: duplicateDeltaOffset, keyframe: keyframeOffset,
+            depth: 2, updates: laterUpdate, updateCount: 1)
+        let duplicateFindings = validate(
+            front + duplicateKeyframe + duplicateBirth + updateAfterDuplicate
+        ).findings
+        XCTAssertTrue(
+            duplicateFindings.contains {
+                $0.message.contains("creates gaussian_id 0, which is already live")
+            }, duplicateFindings.map(\.message).joined(separator: "\n"))
+
+        // object_id is an absolute restatement. Repeating Int32.max is legal; adding it to
+        // the prior value would overflow and falsely reject the file.
+        let objectStreams = keyframeStreams + stream(14, [Int32.max], channels: 1)
+        let objectKeyframe = keyframeRecord(objectStreams)
+        let objectUpdate =
+            stream(13, [0], channels: 1)
+            + stream(14, [Int32.max], channels: 1)
+        let objectDelta = deltaRecord(
+            t0: 0.5, t1: 1, reference: keyframeOffset, keyframe: keyframeOffset, depth: 1,
+            updates: objectUpdate, updateCount: 1)
+        let objectFindings = validate(front + objectKeyframe + objectDelta).findings
+        XCTAssertFalse(
+            objectFindings.contains {
+                $0.message.contains("composing attribute 14")
+                    && $0.message.contains("signed 32-bit range")
+            }, objectFindings.map(\.message).joined(separator: "\n"))
+
+        // gaussian_id is u32 even though its Attribute Stream code is held in Int32. -1 is
+        // the wire representation of UInt32.max and must survive both ordered and set decoders.
+        var highIDStreams: [UInt8] = []
+        for (attribute, channels) in channelWidths {
+            let values =
+                attribute == 13
+                ? [Int32(-1)] : [Int32](repeating: 0, count: Int(channels))
+            highIDStreams += stream(attribute, values, channels: channels)
+        }
+        let highIDKeyframe = keyframeRecord(highIDStreams)
+        let highIDUpdate =
+            stream(13, [-1], channels: 1)
+            + stream(1, [0, 0, 0], channels: 3)
+        let highIDDelta = deltaRecord(
+            t0: 0.5, t1: 1, reference: keyframeOffset, keyframe: keyframeOffset, depth: 1,
+            updates: highIDUpdate, updateCount: 1)
+        let highIDFindings = validate(front + highIDKeyframe + highIDDelta).findings
+        XCTAssertFalse(
+            highIDFindings.contains {
+                $0.message.contains("gaussian_id -1") && $0.message.contains("expected a u32")
+            }, highIDFindings.map(\.message).joined(separator: "\n"))
     }
 
     func testAnEmptyNonzeroSummaryRangeIsInvalid() throws {
@@ -1199,8 +1282,10 @@ final class ValidateTests: XCTestCase {
     func testGaussianBirthAuxiliaryRecordsAreParsedToo() throws {
         try requireCorpus()
         let file = corpusDirectory().appendingPathComponent(provenanceVariant)
-        var bytes = try readFixture(file)
-        let state = try XCTUnwrap(try walk(bytes).firstIntact(Opcode.chunk))
+        let original = try readFixture(file)
+        let walked = try walk(original)
+        let state = try XCTUnwrap(walked.firstIntact(Opcode.chunk))
+        var bytes = original
         bytes.insert(
             contentsOf: [Opcode.coordinateFrame] + littleU64(0), at: Int(state.offset))
         let findings = validate(bytes).findings
@@ -1208,6 +1293,18 @@ final class ValidateTests: XCTestCase {
             findings.contains {
                 $0.message.contains("physical CoordinateFrame record at byte \(state.offset)")
             }, findings.map(\.message).joined(separator: "\n"))
+
+        // The indexed core stops its front-matter scan at the first state, but physical
+        // validation still has to parse a replacement WindowTable after the last Chunk.
+        let footer = try XCTUnwrap(walked.firstIntact(Opcode.footer))
+        var lateWindow = original
+        lateWindow.insert(
+            contentsOf: [Opcode.windowTable] + littleU64(0), at: Int(footer.offset))
+        let lateFindings = validate(lateWindow).findings
+        XCTAssertTrue(
+            lateFindings.contains {
+                $0.message.contains("physical WindowTable record at byte \(footer.offset)")
+            }, lateFindings.map(\.message).joined(separator: "\n"))
     }
 
     func testEveryPhysicalBandMustAppearInItsOwningIndexEntry() throws {

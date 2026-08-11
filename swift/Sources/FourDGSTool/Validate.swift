@@ -861,7 +861,9 @@ private func validatePhysicalRecords(
                     // table governs the following state record. Keeping only the first both
                     // skipped malformed replacements and checked later chunks against stale rows.
                     windowTable = frame
-                    if keyframeDelta, let header, let quantization, let temporalModelOffset {
+                    if let header, let quantization,
+                        !keyframeDelta || temporalModelOffset != nil
+                    {
                         do {
                             _ = try SceneReader(
                                 SlicedReader(
@@ -869,7 +871,8 @@ private func validatePhysicalRecords(
                                     slices: frontMatterSlices(
                                         header: header, quantization: quantization,
                                         windowTable: frame,
-                                        temporalModelOffset: temporalModelOffset)),
+                                        temporalModelOffset: keyframeDelta
+                                            ? temporalModelOffset : nil)),
                                 path: .streamed)
                         } catch {
                             let tableError = asFourDGS(error)
@@ -1612,11 +1615,7 @@ private func orderedValidationIDs(_ frame: Frame, _ group: DeltaGroup) throws ->
     ids.reserveCapacity(column.values.count)
     var unique: Set<UInt32> = []
     for value in column.values {
-        guard value >= 0 else {
-            throw malformedIdentity(
-                frame, "the stream decodes gaussian_id \(value); expected a u32 value")
-        }
-        let id = UInt32(value)
+        let id = UInt32(bitPattern: value)
         guard unique.insert(id).inserted else {
             throw malformedIdentity(
                 frame, "the \(group.name) group names gaussian_id \(id) more than once")
@@ -1655,6 +1654,12 @@ private func applyValidationDelta(
     let birthIDs = try orderedValidationIDs(frame, groups[1])
     let deathIDs = try orderedValidationIDs(frame, groups[2])
     removeValidationRows(&state, deaths: Set(deathIDs))
+    let liveIDs = Set(state.ids)
+    if let duplicate = birthIDs.first(where: { liveIDs.contains($0) }) {
+        throw malformedIdentity(
+            frame,
+            "the delta creates gaussian_id \(duplicate), which is already live at its reference")
+    }
 
     if includeUpdates, let update = try validationColumn(frame, groups[0], attribute: attribute) {
         guard var base = state.column else {
@@ -1668,7 +1673,14 @@ private func applyValidationDelta(
                 "an update gives attribute \(attribute) \(update.channels) channels; the referenced state carries \(base.channels)"
             )
         }
-        let rows = Dictionary(uniqueKeysWithValues: state.ids.enumerated().map { ($0.element, $0.offset) })
+        var rows: [UInt32: Int] = [:]
+        rows.reserveCapacity(state.ids.count)
+        for (row, id) in state.ids.enumerated() {
+            guard rows.updateValue(row, forKey: id) == nil else {
+                throw malformedIdentity(
+                    frame, "the referenced state carries gaussian_id \(id) more than once")
+            }
+        }
         for (updateRow, id) in updateIDs.enumerated() {
             guard let row = rows[id] else {
                 throw malformedIdentity(
@@ -1677,7 +1689,7 @@ private func applyValidationDelta(
             for channel in 0..<base.channels {
                 let destination = row * base.channels + channel
                 let incoming = update.values[updateRow * base.channels + channel]
-                if attribute == 2 || attribute == 3 {
+                if attribute == 2 || attribute == 3 || attribute == 14 {
                     base.values[destination] = incoming
                 } else {
                     let sum = Int64(base.values[destination]) + Int64(incoming)
@@ -1907,11 +1919,13 @@ private func gaussianIDs(_ frame: Frame, _ group: DeltaGroup) throws -> Set<UInt
                 value = previous &+ value
                 previous = value
             }
-            guard value >= 0, value <= Int64(UInt32.max) else {
+            guard let signed = Int32(exactly: value) else {
                 throw malformedIdentity(
-                    frame, "the stream decodes gaussian_id \(value); expected a u32 value")
+                    frame,
+                    "the stream decodes gaussian_id storage value \(value), outside the signed 32-bit wire representation of u32"
+                )
             }
-            let id = UInt32(value)
+            let id = UInt32(bitPattern: signed)
             let repeats = mode == 2 ? count : 1
             for _ in 0..<repeats {
                 guard ids.insert(id).inserted else {
