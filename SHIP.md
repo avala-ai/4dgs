@@ -57,18 +57,19 @@ Throughput comes from **non-overlapping writers**, not from more tokens on the s
 
 ### Default lane map
 
-| Lane                       | Conflict scope (write exclusive)                                                                       | Notes                                                              |
-| -------------------------- | ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------ |
-| **python**                 | `python/`                                                                                              | Reference-friendly encoder/decoder                                 |
-| **rust**                   | `rust/`                                                                                                | Rust SDK + CLI                                                     |
-| **typescript**             | `typescript/`, root `package.json` / `yarn.lock` when deps change                                      | Core / node / browser packages; stage lock with the package change |
-| **dart**                   | `dart/`                                                                                                | Dart SDK                                                           |
-| **swift**                  | `swift/`                                                                                               | Swift SDK                                                          |
-| **cpp**                    | `cpp/`                                                                                                 | C++ SDK                                                            |
-| **spec / kaitai / corpus** | `kaitai/`, `spec-tools/`, **`tests/conformance/`** (shared generator, harness, expectations, fixtures) | Bottom of a feature stack                                          |
-| **website / docs**         | `website/`                                                                                             | Concepts vocabulary lives here                                     |
-| **scripts / ci**           | `scripts/`, `.github/`                                                                                 | Prefer dedicated PRs                                               |
-| **root prose**             | `AGENTS.md`, this file, CHANGELOG, RELEASING                                                           | lead when multi-agent                                              |
+| Lane                       | Conflict scope (write exclusive)                                                                 | Notes                                                              |
+| -------------------------- | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------ |
+| **python**                 | `python/`                                                                                        | Reference-friendly encoder/decoder                                 |
+| **rust**                   | `rust/`, root `Cargo.toml` / `Cargo.lock` when the workspace changes                             | Rust SDK + CLI                                                     |
+| **typescript**             | `typescript/`, root `package.json` / `yarn.lock` when deps change                                | Core / node / browser packages; stage lock with the package change |
+| **dart**                   | `dart/`                                                                                          | Dart SDK                                                           |
+| **swift**                  | `swift/`                                                                                         | Swift SDK                                                          |
+| **cpp**                    | `cpp/`                                                                                           | C++ SDK                                                            |
+| **spec / kaitai / corpus** | `kaitai/`, `spec-tools/`, `tests/conformance/`, **`website/docs/spec/`** (normative format docs) | Bottom of a feature stack — wire-format + corpus                   |
+| **fuzz (shared)**          | `tests/fuzz/`                                                                                    | Shared hostile-input seeds — **serialize**; one writer only        |
+| **website / docs**         | `website/` **except** `website/docs/spec/`                                                       | Guides/concepts only; normative spec is corpus lane                |
+| **scripts / ci**           | `scripts/`, `.github/`                                                                           | Prefer dedicated PRs                                               |
+| **root prose**             | `AGENTS.md`, this file, CHANGELOG, RELEASING                                                     | lead when multi-agent                                              |
 
 Hard rules:
 
@@ -81,9 +82,9 @@ Hard rules:
 5. **Lead owns integration.** When stacking languages, one person/agent manages retargets,
    conformance, and PR narrative.
 6. Propose durable learnings to the **lead** (root-prose lane); do not parallel-edit root
-   `AGENTS.md` from multiple language lanes. **fork** use ordinary **sequential** PRs (one language
-   after another merges to upstream), not a required in-repo stack. Do not prescribe an impossible
-   stacked workflow for forks.
+   `AGENTS.md` from multiple language lanes.
+7. **Fork exception (AGENTS.md §9):** contributors on a fork use ordinary **sequential** PRs (one
+   language after another merges to upstream), not an in-repo stack GitHub cannot create.
 
 ### `git worktree` — default for parallel / multi-agent work
 
@@ -101,9 +102,12 @@ git fetch "$UPSTREAM" main
 git worktree add --no-track -b fix/python-<slug> ../4dgs-wt-python "$UPSTREAM/main"
 git worktree add --no-track -b fix/rust-<slug>   ../4dgs-wt-rust   "$UPSTREAM/main"
 
-# First publish: git push -u origin HEAD
+# Publish — set PR_HEAD_REMOTE explicitly (writable remote for the PR head). Never `git remote | head -1`.
+#   : "${PR_HEAD_REMOTE:?}"; git push -u "$PR_HEAD_REMOTE" HEAD
+# Stacks on the canonical repo: git push -u "$UPSTREAM" HEAD
 
-# Cleanup only after MERGED or explicit abandon:
+# Cleanup — run from PRIMARY clone, not from inside the worktree:
+# cd "$(git rev-parse --show-toplevel)"
 state=$(gh pr view <n> --json state --jq .state)
 if [ "$state" = "MERGED" ] || [ "${ABANDON_CONFIRMED:-}" = "1" ]; then
   if [ -n "$(git -C ../4dgs-wt-python status --porcelain 2>/dev/null)" ]; then
@@ -180,13 +184,15 @@ Agents **should** commit as they go **inside their own worktree**.
 
 ## 5. Fast feedback loops (close the loop without full multi-SDK waits)
 
-| Loop                  | Prefer                                                                                                                                                                                                           |
-| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Python                | Package tests under `python/`; **format claim / conformance:** from repo root generate corpus if needed, then `python tests/conformance/run.py --runner python` (shared harness — not only the package Makefile) |
-| Rust                  | Package `cargo test` in `rust/`; **format claim / conformance:** build runners as CI does, generate corpus if needed, then `python tests/conformance/run.py --runner rust` from repo root                        |
-| TypeScript            | **Repo root:** `yarn test` and/or `yarn conformance` (packages under `typescript/` do not define test scripts). Generate corpus first when exercising corpus-backed tests.                                       |
-| Dart                  | package tests under `dart/`                                                                                                                                                                                      |
-| Vocabulary / concepts | `website/docs/guides/concepts.md` consistency                                                                                                                                                                    |
+| Loop                  | Prefer                                                                                                                                                                                                                        |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Python                | Package tests under `python/`. **Format claim:** generate corpus, then `python tests/conformance/run.py --runner python` from repo root (same as CI).                                                                         |
+| Rust                  | Package `cargo test` in `rust/`. **Format claim:** build runners as CI does, generate corpus, then `python tests/conformance/run.py --runner rust`.                                                                           |
+| TypeScript            | **Repo root:** `yarn test` for unit; **format claim:** `yarn build` (produces conformance runners) **then** `yarn conformance` / `python tests/conformance/run.py --runner typescript`. Do not run conformance without build. |
+| Dart                  | Package tests under `dart/`. **Format claim:** build dart runners as CI does, generate corpus, then `python tests/conformance/run.py --runner dart`.                                                                          |
+| C++                   | Package/build tests under `cpp/`. **Format claim:** build runners as CI does, generate corpus, then `python tests/conformance/run.py --runner cpp`.                                                                           |
+| Swift                 | Package tests under `swift/`. **Format claim:** build runners as CI does, generate corpus, then `python tests/conformance/run.py --runner swift`.                                                                             |
+| Vocabulary / concepts | `website/docs/guides/concepts.md` (not normative `website/docs/spec/`)                                                                                                                                                        |
 
 **Close the loop before expanding scope.**
 
@@ -228,7 +234,7 @@ not hide large refactors inside feature PRs.
 3. Commit **atomically** in-lane (own worktree).
 4. Verify with **that language’s** real test entry points; escalate before open PR.
 5. Self-check cross-SDK principles (bounded memory, streamable decode, I/O at edges, …).
-6. Encode learnings into AGENTS.md — not only chat.
+6. Propose learnings to the **lead** (root-prose lane); do not parallel-edit root `AGENTS.md`.
 
 ---
 
