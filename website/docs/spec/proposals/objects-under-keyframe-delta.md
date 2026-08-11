@@ -294,6 +294,14 @@ one.
 > `object_id` is **not** GOP-invariant: a gaussian MAY be relabelled within a group of pictures, and
 > a producer that relabels one restates the whole value. A birth carries it absolutely like every
 > other attribute the birth group states.
+>
+> The optional-stream rule in §6.6 applies to every composed state: when the reference state omits
+> `object_id`, it logically carries an all-zero column, one zero for every live gaussian. An update
+> MAY introduce the stream by restating non-zero ids for any subset; the composer materializes the
+> zero column before applying those absolute replacements, and unmentioned gaussians remain zero.
+> Likewise, a birth group that omits `object_id` gives each birth id zero even when the surviving
+> reference population already carries the column. Physical omission is therefore not an
+> update-attribute mismatch and MUST NOT be refused as one.
 
 ### 5.3 Into §5.18, in the `updates` bullet
 
@@ -318,6 +326,10 @@ and extend the bullet's final sentence:
 > attribute, and MAY be restated absolutely in a delta's update group (§11.5). The track that
 > applies to a gaussian at time `t` is the one naming the `object_id` the chain produced for it at
 > `t`, and composition happens once, after reconstruction, per §11.3.
+>
+> Omitting the stream means the logical value zero for every gaussian, including a keyframe whose
+> later delta introduces non-zero ids and a birth in a state where other gaussians already carry
+> ids. §11.5 defines how that implicit zero column participates in composition.
 
 ### 5.5 Into §13's changelog table
 
@@ -342,16 +354,19 @@ with the accompanying note:
 **`KeyframeDeltaObjects`**, in `data/keyframe/`. One variant, carrying every corner the rules above
 decide.
 
-- **Shape:** at least three state chunks so that a delta references a delta (depth ≥ 2), a
-  population carrying `object_id` in every chunk, an Object Table naming two objects, and one Object
-  Track for one of them with samples that put a non-identity pose at every probe. At least one
-  gaussian carries `object_id = 0` so the untracked branch is exercised, and at least one carries
-  per-gaussian `motion` so that `R * (position + motion * dt) + T` is distinguishable from
-  `R * position + T`.
-- **One delta restates an `object_id`**, moving a gaussian from the untracked object to the tracked
-  one. This is the row that separates rule (i) from the reference's current addition: under (i) the
-  gaussian's centre at the following probe is the tracked pose applied to its base state; under the
-  present code it lands on a third object entirely.
+- **Shape:** at least three state chunks so that a delta references a delta (depth ≥ 2), an Object
+  Table naming two objects, and one Object Track for one of them with samples that put a
+  non-identity pose at every probe. The keyframe deliberately omits `object_id`, so its population
+  begins with implicit zero ids; the first delta introduces the stream by assigning one surviving
+  gaussian to the tracked object while leaving another implicitly zero. A later birth omits the
+  stream and must also receive zero even though the composed state now carries non-zero ids. At
+  least one gaussian carries per-gaussian `motion` so that `R * (position + motion * dt) + T` is
+  distinguishable from `R * position + T`.
+- **One delta introduces and restates an `object_id`**, moving a gaussian from implicit zero to the
+  tracked object. This separates rule (i) from both current failures: refusing an update attribute
+  absent from the keyframe, and adding the absolute label if a zero column was materialized by hand.
+  Under (i) the gaussian's centre at the following probe is the tracked pose applied to its base
+  state; the untouched gaussian and the birth that omits the stream remain untracked.
 - **What the canonical must report.** The `keyframe-delta` canonical
   (`keyframe_delta_file.states_json`) has no `objects` member and no `objectIds` today, so it must
   gain both, in the shape `canonical.summarize` already uses for `gaussian-birth`: an `objects`

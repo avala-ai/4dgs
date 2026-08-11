@@ -5,9 +5,11 @@
 would carry it, and names the conformance variant that would stop the next implementation guessing.
 Nothing here is in force until it is folded into [the specification](../index.md).
 
-The question is short and the answer decides geometry: **may a provenance-family record (`0x20`–
-`0x2F`) appear after the first `Chunk`?** Today the specification does not say, and the two read
-paths answer it differently on the same bytes.
+The question in #78 is short and the answer decides geometry: **may a provenance-family record
+(`0x20`–`0x2F`) appear after the first `Chunk`?** Auditing the two read paths exposes the same
+unstated position rule for the legacy Audio (`0x04`), Camera (`0x0A`), Metadata (`0x0B`) and
+Attachment (`0x0D`) records. The answer therefore has to cover every record the indexed front-matter
+walk collects, rather than fixing one family while leaving four identical divergences.
 
 ---
 
@@ -66,16 +68,17 @@ so they inherit that loop rather than duplicate it. The issue's "all five implem
 stated as **four native indexed readers and two bindings over one of them** — the conclusion is the
 same and the count is not.
 
-The provenance and object-layer records are framed inside that loop and nowhere else — Python
-`indexed_reader.py:263-264`, Rust `indexed_reader.rs:449`, TypeScript `indexedDecoder.ts:257-261`,
-Dart `indexed_reader.dart:1203-1204` — and the deferred readers walk only what the loop collected
-(`read_provenance`, `indexed_reader.py:430`; `read_objects`, `indexed_reader.py:459`). A record past
-the break is therefore not merely unread: it is never framed, so no later call can reach it.
+Legacy Audio, Camera, Metadata, Attachment, provenance and object-layer records are framed inside
+that loop and nowhere else — Python `indexed_reader.py:263-264`, Rust `indexed_reader.rs:449`,
+TypeScript `indexedDecoder.ts:257-261`, Dart `indexed_reader.dart:1203-1204` — and the deferred
+readers walk only what the loop collected (`read_provenance`, `indexed_reader.py:430`;
+`read_objects`, `indexed_reader.py:459`). A record past the break is therefore not merely unread: it
+is never framed, so no later call can reach it.
 
 The streamed reader has no such boundary. `python/fourdgs/fourdgs/stream_reader.py:344` iterates
-every record in the file and dispatches `0x20`–`0x25` at lines 417–444 with no position test at all.
-The contrast inside that same function is the tell: `AUDIO_SOURCE` and `AUDIO_DATA` **do** carry one
-(`stream_reader.py:383-385` and `392-394`,
+every record in the file and dispatches the legacy records at lines 379–416 and `0x20`–`0x25` at
+lines 417–444 with no position test at all. The contrast inside that same function is the tell:
+`AUDIO_SOURCE` and `AUDIO_DATA` **do** carry one (`stream_reader.py:383-385` and `392-394`,
 `raise MalformedFile("an Audio Source record appears after the first Chunk")`), because §5.17 gave
 them a rule to enforce. The provenance family has no rule, so there is nothing to enforce and
 nothing is enforced.
@@ -120,10 +123,12 @@ needs a variant and not only a paragraph.
 
 ## 3. The options
 
-### (a) A producer rule — the family MUST precede the first Chunk
+### (a) A producer rule — indexed front matter MUST precede the first Chunk
 
-Indexed readers keep stopping at the first `Chunk`; writers are forbidden from putting anything the
-indexed path needs behind it.
+Indexed readers keep stopping at the first `Chunk`; writers are forbidden from putting anything that
+walk collects behind it. The rule covers legacy Audio, Camera, Metadata, Attachment, Audio
+Source/Data pairs and the provenance family. Header, Quantization and Window Table already have
+their own stronger placement requirements.
 
 - **Cost to producers:** none that can be measured. Every writer in this repository already
   complies, and the rule is what §5.15.1 already says these records do.
@@ -155,15 +160,17 @@ Give a reader an O(1) way to find them, so both properties survive.
   per-chunk records. Appending "and also, unrelated front matter lives at N" to a frozen per-chunk
   record (§4.4) spends the append budget of the index on something that has nothing to do with
   chunks.
-- **Summary Offset (`0x0F`) is closer and still wrong.** Its body is
-  `group_opcode, group_start, group_length` — it names one **contiguous run** of one opcode class.
-  Late records are by definition not contiguous with the early ones, so a file with a Coordinate
-  Frame in front matter and an Object Track after the chunks has two runs of `0x20`–`0x2F` and no
-  way to say so.
-- **So (c) means a new record.** A front-matter index — plausibly at `0x0E`, which §5.13 keeps
-  reserved with no defined body — plus a rule for what a reader does when the index and the records
-  disagree (the Chunk Index precedent, §5.8, is "refuse, naming the field"), plus six
-  implementations, plus a variant for the index itself and one for the disagreement.
+- **Summary Offset (`0x0F`) is closer, and could be extended.** Its body is
+  `group_opcode, group_start, group_length` — one **contiguous run** of one opcode class — but the
+  wire permits repeatable Summary Offset records and does not require `group_opcode` to be unique.
+  Option (c) could define one entry per run, including multiple entries for the same opcode, without
+  allocating a new opcode. That is a compatible extension of a provisional record, not something
+  current readers implement: they would still need to retain every entry, define overlap and
+  disagreement handling, and distinguish a complete list from an incomplete one.
+- A dedicated front-matter index at reserved `0x0E` remains another design, not a prerequisite.
+  Either representation needs six implementations, a variant for repeated runs, and a rule for an
+  index that disagrees with the records (the Chunk Index precedent, §5.8, is "refuse, naming the
+  field"). A new record is therefore avoidable; the cross-SDK discovery semantics are not.
 - And it does not finish the job: the index is optional, so a file may still carry a late record
   with no entry for it, and (c) still needs (a)'s rule for that case. The most expensive option ends
   by needing the cheapest one anyway.
@@ -172,7 +179,7 @@ Give a reader an O(1) way to find them, so both properties survive.
 
 ## 4. Recommendation
 
-**Adopt (a): the provenance family MUST appear before the first `Chunk`.**
+**Adopt (a): every record the indexed front walk collects MUST appear before the first `Chunk`.**
 
 Four reasons, in the order they should be weighed.
 
@@ -192,8 +199,9 @@ Four reasons, in the order they should be weighed.
    whole decision.
 
 4. **The alternatives trade a real property for a hypothetical one.** (b) spends the indexed path's
-   defining guarantee to preserve files nobody writes. (c) spends an opcode, a record, six
-   implementations and a disagreement rule, and still needs (a) underneath.
+   defining guarantee to preserve files nobody writes. (c) can reuse repeatable Summary Offset
+   records rather than spend an opcode, but still costs six implementations, completeness and
+   disagreement rules, and still needs (a) for a late record omitted from that optional index.
 
 The honest counter-argument is that (a) is a **tightening**, and §10's version rules do not list
 "forbid a shape that was previously legal" among the additive changes. That is right, and it is why
@@ -223,11 +231,15 @@ Written as spec prose, ready to lift.
 > changes where gaussians are (§3), so a track a reader cannot see is a scene in the wrong place
 > rather than a description it lacks.
 >
-> **A reader that encounters a record with an opcode in `0x20`–`0x2F` after the first `Chunk` MUST
-> refuse the file**, naming the opcode and its byte offset. A streamed reader detects this for free,
-> because it has already passed a chunk. **An indexed reader MAY stop framing front matter at the
-> first `Chunk` and is not required to detect the violation**: the two paths then agree on every
-> conforming file, and the path that can name the fault at no cost is the one required to.
+> **A reader that encounters a defined provenance-family record (`0x20`–`0x25`) after the first
+> `Chunk` MUST refuse the file**, naming the opcode and its byte offset. An opcode the reader does
+> not recognize is still skipped under §4.2; position cannot turn an unknown record into a known
+> refusal rule. A future definition in the reserved `0x26`–`0x2F` range inherits the producer rule
+> and states its corresponding reader check when it becomes known. A streamed reader detects a
+> violation for free, because it has already passed a chunk. **An indexed reader MAY stop framing
+> front matter at the first `Chunk` and is not required to detect the violation**: the two paths
+> then agree on every conforming file, and the path that can name the fault at no cost is the one
+> required to.
 >
 > This is a rule about a writer's output, not a new capability. A file that satisfies it is
 > byte-identical to the file it would otherwise have been.
@@ -249,15 +261,21 @@ Replace:
 with:
 
 > Order is normative only where stated: the Header MUST be the first record, the Footer MUST be the
-> last, the summary MUST be contiguous (§4.5), and every Audio Source, Audio Data (§5.17) and
-> provenance-family record (§5.15) MUST precede the first `Chunk`. Everything else in the diagram
-> above is a writer's convention, and a reader MUST NOT depend on it.
+> last, the summary MUST be contiguous (§4.5), and legacy Audio, Camera, Metadata, Attachment, every
+> Audio Source and Audio Data pair (§5.17), and every provenance-family record (§5.15) MUST precede
+> the first `Chunk`. Records not constrained here or in their own sections retain free placement,
+> and a reader MUST NOT depend on their position.
+>
+> A reader that encounters any of those defined records after the first `Chunk` MUST refuse it,
+> naming the opcode and byte offset. This does not override §4.2 for an opcode the reader does not
+> recognize: unknown records are skipped until a specification defines both their meaning and any
+> positional check.
 
 ### 5.4 Into §13's changelog table
 
-| Change                                                                                                     | Kind       |
-| ---------------------------------------------------------------------------------------------------------- | ---------- |
-| §5.15/§4 added: every provenance-family record MUST precede the first `Chunk`, matching §5.17's audio rule | rule added |
+| Change                                                                                                                                   | Kind       |
+| ---------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| §4/§5.15 added: every record collected by the indexed front walk MUST precede the first `Chunk`, matching §5.17's Audio Source/Data rule | rule added |
 
 ---
 
@@ -272,11 +290,13 @@ One variant, in `data/invalid/`, because after this proposal the file is not a l
 - **What it asserts:** a streamed decode MUST refuse, naming opcode `0x25` and the record's byte
   offset. It joins the seven files already in `data/invalid/`, which are all single-value refusals —
   a bad magic, an unknown scheme, a window index out of range — so a record-position refusal is a
-  new shape for that directory rather than a variation on one already there. Worth noticing while
-  writing it: **§5.17's audio rule has no variant either.** The refusal exists in the reference
-  (`stream_reader.py:383-385`) and in the validator (`validate.py:246`), and nothing in the corpus
-  proves any other SDK implements it. A second file, `LateAudioSource`, would close that gap at the
-  same time and for the same reason, and this proposal recommends adding it alongside.
+  new shape for that directory rather than a variation on one already there.
+- **The rest of the positional family is independently pinned.** Add `LateLegacyAudio`,
+  `LateCamera`, `LateMetadata`, `LateAttachment` and `LateAudioSource` using the same splice. One
+  provenance example cannot prove the branches for unrelated legacy opcodes, and §5.17's existing
+  Audio Source rule currently has no variant either. Each expectation names its opcode and offset;
+  `LateAudioSource` closes the pre-existing §5.17 gap while the other four prevent this proposal
+  from documenting a broader rule than the suite proves.
 - **Why an invalid variant and not a valid one:** a valid variant can only assert that the two paths
   agree, and under this proposal they agree because the file cannot exist. The thing worth pinning
   is the refusal — without it, an implementation that keeps today's silent behaviour passes.
@@ -294,8 +314,9 @@ Neither variant regenerates anything. The corpus gains files; nothing existing m
 
 The proposal's instruction is to say plainly which files this breaks, so:
 
-**Files that become illegal:** any file carrying a record with an opcode in `0x20`–`0x2F` at a byte
-offset after the first `Chunk` record.
+**Files that become illegal:** any file carrying legacy Audio, Camera, Metadata, Attachment, Audio
+Source/Data, or a record with an opcode in `0x20`–`0x2F` at a byte offset after the first `Chunk`
+record.
 
 **Files known to be in that set:** none.
 
@@ -342,12 +363,12 @@ Every claim was checked against the code; two need correcting and one needs shar
 
 ## 9. Deliberately not decided here
 
-- **Whether the still-reserved `0x26`–`0x2F` (§5.15.8) inherit the rule.** They do, as written — the
-  rule is stated over the opcode range, not over the six defined records — and that is deliberate: a
-  range reserved for "per-chunk or per-gaussian acquisition timestamps" is exactly the kind of
-  record a future author might want to interleave with chunks. If that turns out to be the right
-  design, it should be argued then, by a proposal that moves the record out of this family rather
-  than by an exception inside it.
+- **Whether the still-reserved `0x26`–`0x2F` (§5.15.8) inherit the producer rule.** They do: a
+  future writer using that family keeps them before chunks unless their defining proposal moves them
+  to a different family. An older reader still skips an unknown opcode wherever it appears under
+  §4.2; only once an opcode is defined can a reader recognize it and enforce its positional refusal.
+  This distinction keeps forward-compatible skipping and the producer layout rule from contradicting
+  one another.
 - **Whether a front-matter index is worth having anyway**, independently of this question, for files
   with very large front matter. Option (c)'s machinery has a use — an indexed open that wants one
   sensor out of two hundred still frames all two hundred today — and that is a legitimate proposal.

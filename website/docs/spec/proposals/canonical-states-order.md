@@ -8,8 +8,7 @@ goes instead, and §5.4 says why none of it belongs in [the specification](../in
 
 The canonical form promises that nothing it emits depends on decoded order. Its `states` member —
 the post-track reconstruction the object layer exists to prove — breaks that promise in two places,
-and this proposal recommends one fix for each, plus a third defect found while verifying the first
-two.
+and this proposal recommends one fix for each.
 
 ---
 
@@ -124,27 +123,6 @@ associativity, are not written down anywhere. The issue's diagnosis is right; it
 paraphrase presented as a quotation. Worth saying because "the reference is internally inconsistent"
 is a stronger charge when the rule is written next to the code that follows it, and here it is not.
 
-### 2.4 A third defect, found while verifying the first two: signed zero
-
-`num()` rounds and returns (`canonical.py:53-64`); `round(-4e-17, 6)` is `-0.0` and
-`round(4e-17, 6)` is `0.0`, and `json.dumps` spells them differently. A composed coordinate whose
-true value is zero and whose computed value is arithmetic noise of either sign therefore prints as
-`0.0` or `-0.0` depending on the arithmetic path.
-
-This is observable now.
-`tests/conformance/data/object/ObjectTrackComposed-UseChunkIndex-UseCrc.json` carries exactly two
-`-0.0` values in the whole corpus, at lines 505 and 602, both inside `states`. Regenerating the
-corpus on this machine (Python 3.12.3, numpy 2.5.1, x86-64 Linux) reproduces every other byte of
-every other expectation and turns the one at line 505 into `0.0`: the composed `z` there is
-`+4.44e-17` locally, and was a small negative on whatever machine wrote the committed file.
-
-**It is invisible to the harness and visible in git.** `run.py:207` compares
-`json.loads(actual) == json.loads(expected)`, and `-0.0 == 0.0` is `True` in Python, so no runner
-fails. What it does is make `tests/conformance/generate.py` produce a one-line diff on a corpus
-nobody changed — and `generate.py --verify` will not catch it either, because `_verify`
-(`generate.py:817-856`) asserts the `.4dgs` SHA-256s and generator determinism and never compares
-the `.json` expectations, which `write_corpus` has already overwritten in place by then.
-
 ---
 
 ## 3. The options
@@ -202,30 +180,21 @@ and the most expensive: only Python has it in the standard library, and hand-rol
 in six languages is the easiest of these three to get subtly different between ports. Rejected on
 cost.
 
-### For signed zero
-
-**(3a) Normalize in `num()`:** return `0.0` when the rounded value is zero, whatever its sign. One
-line per port.
-
-**(3b) Leave it.** The harness already treats the two as equal, so this is a diff-noise fix rather
-than a correctness fix.
-
 ---
 
 ## 4. Recommendation
 
-**Adopt (1a), (2a) and (3a). Name (2b) as the follow-up that the tie variant would justify.**
+**Adopt (1a) and (2a). Name (2b) as the follow-up that a residual-sum variant would justify.**
 
 - **(1a)** because it is the only fix that restores `_stable_order`'s argument at the level where
   the values are emitted, and it does so without touching the rounding that makes the key portable.
 - **(2a)** because it makes the reference internally consistent — the defect #95 actually names —
   and costs one expression per aggregate. It does not fully discharge the promise, and §5.2's text
   says that in the docstring rather than leaving a future reader to assume otherwise.
-- **(3a)** because it costs one line, removes a source of committed-file churn that no test can see,
-  and closes a hole in `generate.py --verify` without having to widen `--verify` itself.
-- **(2b) deferred**, with a named trigger: once a corpus variant exists that produces a rounded-key
-  tie, (2a)'s residual becomes detectable, and at that point sorting the addends is worth the six
-  ports. Doing it before then means shipping a rule nothing checks.
+- **(2b) deferred**, with a named trigger: once a corpus variant contains rows that still tie after
+  the secondary emitted-row key while their unrounded addends make the two summation orders cross a
+  six-decimal boundary, (2a)'s residual becomes detectable. At that point sorting the addends is
+  worth the separate language changes. Doing it before then means shipping a rule nothing checks.
 
 ### What regenerating expectations costs: nothing, and this was measured
 
@@ -249,17 +218,15 @@ the format says means nothing — and it is **currently harmless**, because thes
 well-conditioned enough that both orders round to the same six decimals. And there are no ties
 anywhere, so (1a) reorders nothing.
 
-So the cost of (1a) and (2a) is: **zero expectation bytes**, in any of the six languages. It is six
-code changes and one review, not a corpus regeneration — `tests/conformance/canonical.py`,
-`rust/conformance/src/lib.rs`, `typescript/conformance/src/canonical.ts`,
-`dart/conformance/lib/canonical.dart`, `cpp/conformance/canonical.cpp` and
-`swift/conformance/Support/Summary.swift`. That is an unusually good moment to make a change like
-this, and it will not stay true — the first variant that ties, or the first scene with large
-opposing coordinates, makes the same fix a corpus-wide regeneration.
-
-(3a) is the only one that moves a byte: two values in one file
-(`object/ObjectTrackComposed-UseChunkIndex-UseCrc.json:505` and `:602`), from `-0.0` to `0.0`. No
-runner's result changes, since the harness already compares them equal.
+So the cost of (1a) and (2a) is: **zero existing expectation bytes**, in any of the six languages.
+Delivery follows the repository's stacked-PR rule: the corpus, reference canonical and Python runner
+form the bottom layer; Rust, TypeScript, Dart, C++ and Swift each get their own language-only layer,
+targeting the branch below. Merge and rebase them bottom-up. The affected ports are
+`tests/conformance/canonical.py`, `rust/conformance/src/lib.rs`,
+`typescript/conformance/src/canonical.ts`, `dart/conformance/lib/canonical.dart`,
+`cpp/conformance/canonical.cpp` and `swift/conformance/Support/Summary.swift`. This is an unusually
+good moment to make the change, and it will not stay true — the first adversarial scene makes the
+same fix regenerate its new expectation.
 
 ---
 
@@ -322,9 +289,9 @@ rely on it." Everything in this proposal is the conformance reference being held
 
 ---
 
-## 6. The conformance variant that pins it
+## 6. The conformance variants that pin it
 
-Two variants, both new files, neither regenerating anything.
+Four variants, each with one job and each a new file.
 
 - **`ObjectTiedGaussians`** — an object-layer scene containing at least one pair of gaussians that
   tie on every field of the `_stable_order` key at six decimals while differing in exact `position`
@@ -336,25 +303,30 @@ Two variants, both new files, neither regenerating anything.
   decoders that chunk the scene differently produce different rows, so the variant fails today and
   passes after — which is the property that makes it worth adding rather than a restatement.
 
-  It also makes (2a)'s residual detectable for the first time, which is the trigger §4 names for
-  taking up (2b).
+- **`ObjectCancellingPositionSum`** — live centres of large opposing sign spread across at least two
+  chunks, with resident order grouping signs and content order interleaving them. The generator must
+  assert before writing the expectation that the two pre-fix orders produce different values after
+  six-decimal rounding. It asserts only `states[*].aggregate.positionSum`; opacity is deliberately
+  held constant so a position fix cannot borrow evidence from another field.
 
-- **`ObjectCancellingSum`** — the same scene shape with live centres of large opposing sign spread
-  across at least two chunks, so that the two summation orders produce different sixth decimals.
-  Asserts `states[*].aggregate.positionSum` and `opacitySum`. This is the variant that would have
-  failed on the day line 262 was written, and its absence is why the defect has been sitting in the
-  reference.
+- **`ObjectOpacityOrder`** — 64 live gaussians whose decoded opacities contain 32 high values, 31
+  low values and one boundary value tuned so resident-order and content-order addition land on
+  opposite sides of a six-decimal rounding boundary. Resident order groups high then low values; the
+  content key alternates them. The generator records both sums and refuses to emit the variant
+  unless their rounded `opacitySum` differs, while all centres are zero. This independently catches
+  a port that fixes `positionSum` and leaves opacity in resident order.
 
-Both belong beside the existing `object/` variants. Neither needs a spec change, a new opcode or a
-new writer capability — they are ordinary scenes with adversarially chosen numbers, which is the
-cheapest kind of variant this corpus can grow.
+- **`ObjectResidualTieSum`** — rows that tie both on `_stable_order` and on the rounded secondary
+  row emitted by (1a), while their unrounded composed centres differ. Their resident and stable
+  orders are chosen so the unrounded sums cross a six-decimal boundary. Its generator precondition
+  is explicit: secondary emitted-row keys compare equal and the two rounded sums do not. This is the
+  first variant that actually reaches (2a)'s residual and therefore the trigger for considering
+  (2b); `ObjectTiedGaussians` cannot serve that role because its emitted centres differ.
 
-**One harness note, separable from this proposal.** `generate.py --verify` (`generate.py:792-856`)
-asserts the `.4dgs` checksums and generator determinism, and `write_corpus` rewrites the `.json`
-expectations in place before it runs, so a drifted expectation is silently overwritten rather than
-reported. That is how the `-0.0` in §2.4 has stayed committed. Whether `--verify` should compare the
-expectations too, or whether CI should add a `git diff --exit-code` after it, is a harness question
-and not a canonical-form one — but it is the reason (3a) is worth doing rather than tolerating.
+All four belong beside the existing `object/` variants. None needs a spec change, a new opcode or a
+new writer capability — they are ordinary scenes with adversarially chosen numbers. The generator's
+precondition assertions are part of the design: an adversarial name is not evidence unless the
+constructed values demonstrably separate the two algorithms.
 
 ---
 
@@ -367,7 +339,7 @@ and not a canonical-form one — but it is the reason (3a) is worth doing rather
   two index different spaces. See §2.2.
 - **"The three object-layer conformance variants."** Four; see §4.
 - **What the issue does not say, and should:** `opacitySum` (`canonical.py:263`) has the same defect
-  as `positionSum`, and the signed-zero exposure in §2.4 is a third instance of the same class.
+  as `positionSum` and needs independent conformance evidence.
 
 ---
 
@@ -381,5 +353,3 @@ and not a canonical-form one — but it is the reason (3a) is worth doing rather
   (§11.2) and is a decoded value, so it has no ties to break. That remains true only while that
   canonical stays keyed on identity, which is worth remembering if it ever grows an object-layer
   block ([#79](https://github.com/avala-ai/4dgs/issues/79)).
-- **Whether `--verify` should compare expectations.** Named in §6 as the reason (3a) matters; left
-  to whoever owns the harness.
