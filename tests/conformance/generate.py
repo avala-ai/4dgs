@@ -370,6 +370,60 @@ def _kd_churn_sequence() -> list[Sample]:
     return samples
 
 
+_KD_ROW_LANES = (
+    "positions",
+    "scales",
+    "rotations",
+    "colors",
+    "motions",
+    "sigma_t",
+    "win_lo",
+    "win_hi",
+    "sh",
+    "source_group",
+    "source_index",
+    "object_id",
+)
+
+
+def _kd_state_temporal_origins(samples: list[Sample], keyframe_every: int, delta_mode: int) -> None:
+    """State `mu_t` at the Chunk that actually restates each row.
+
+    A keyframe states every live gaussian. A delta states births and rows whose
+    other authored lanes changed; an omitted row must retain the temporal origin
+    from its reference state. Keeping one such row is itself a conformance claim:
+    a decoder that drops untouched identities can no longer pass this corpus.
+    """
+    last_keyframe = 0
+    for index, sample in enumerate(samples):
+        keyframe = index == 0 or (keyframe_every > 0 and index % keyframe_every == 0)
+        if keyframe:
+            sample.gaussians.mu_t.fill(sample.t0)
+            last_keyframe = index
+            continue
+
+        reference = samples[index - 1 if delta_mode == DELTA_MODE_CHAINED else last_keyframe]
+        reference_rows = {int(identity): row for row, identity in enumerate(reference.ids)}
+        for row, identity_value in enumerate(sample.ids):
+            identity = int(identity_value)
+            reference_row = reference_rows.get(identity)
+            if reference_row is None:
+                sample.gaussians.mu_t[row] = sample.t0
+                continue
+
+            changed = False
+            for lane in _KD_ROW_LANES:
+                current_values = getattr(sample.gaussians, lane)
+                reference_values = getattr(reference.gaussians, lane)
+                if current_values is None or reference_values is None:
+                    changed = current_values is not reference_values
+                else:
+                    changed = not np.array_equal(current_values[row], reference_values[reference_row])
+                if changed:
+                    break
+            sample.gaussians.mu_t[row] = sample.t0 if changed else reference.gaussians.mu_t[reference_row]
+
+
 #: (name, sequence-builder, cadence, delta-mode). Four variants, each a distinct decode:
 #: every chunk a keyframe; chained pure-update deltas; chained deltas carrying births and
 #: deaths; and keyframe-referenced deltas.
@@ -392,12 +446,9 @@ def build_keyframe_delta_corpus() -> list[tuple[str, bytes, str]]:
     out: list[tuple[str, bytes, str]] = []
     for name, sequence_of, keyframe_every, delta_mode in KEYFRAME_DELTA_VARIANTS:
         samples = sequence_of()
-        # §11.3: every state statement uses that Chunk's t0 as its temporal origin.
-        # Keep the corpus input explicit about the invariant for both keyframes and
-        # delta-updated rows; otherwise the first delta after a cadence boundary writes
-        # a negative update that silently restores the old origin.
-        for sample in samples:
-            sample.gaussians.mu_t.fill(sample.t0)
+        # §11.3: a row that is stated uses that Chunk's t0 as its temporal origin;
+        # a row omitted from a delta retains the origin from its reference state.
+        _kd_state_temporal_origins(samples, keyframe_every, delta_mode)
         data = kdf.write_sequence(
             samples,
             _KD_DURATION,
