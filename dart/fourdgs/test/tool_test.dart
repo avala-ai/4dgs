@@ -473,6 +473,73 @@ void main() {
       );
     });
 
+    test('an earlier Footer cannot hide behind the final Footer', () async {
+      final Uint8List footer =
+          (BytesBuilder()
+                ..add(_u64(0))
+                ..add(_u64(0))
+                ..add(_u32(0)))
+              .toBytes();
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(_minimal(extra: _record(opFooter, footer))),
+      );
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(contains('2 Footer records')),
+      );
+    });
+
+    test('the summary range contains only summary record classes', () async {
+      final Uint8List index = _record(opChunkIndex, _entryAt(0));
+      final Uint8List unexpected = _record(0x81, Uint8List(1));
+      final Uint8List summary =
+          (BytesBuilder()
+                ..add(index)
+                ..add(unexpected))
+              .toBytes();
+      final int summaryStart =
+          fourdgsMagic.length +
+          _record(opHeader, _headerContent()).length +
+          _record(opQuantization, _quantizationContent()).length +
+          _record(opWindowTable, _windowTableContent()).length;
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(
+          _minimal(
+            extra: summary,
+            summaryStart: summaryStart,
+            summaryCrc: fourdgsCrc32(summary),
+          ),
+        ),
+      );
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(contains('only Chunk Index, Statistics, and Summary Offset')),
+      );
+    });
+
+    test('conflicting Coordinate Frame units are an error', () async {
+      final Uint8List coordinateFrame =
+          (BytesBuilder()
+                ..add(_string('scene'))
+                ..addByte(0) // handedness unspecified
+                ..addByte(1) // +X up
+                ..addByte(2) // +Y forward
+                ..addByte(1) // metre
+                ..add(_f64(0.01)))
+              .toBytes();
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(
+          _minimal(extra: _record(opCoordinateFrame, coordinateFrame)),
+        ),
+      );
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(
+          allOf(contains('length_unit 1'), contains('metres_per_unit is 0.01')),
+        ),
+      );
+    });
+
     test(
       'every legacy Audio record is parsed and duplicates are rejected',
       () async {

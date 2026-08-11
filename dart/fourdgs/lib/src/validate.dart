@@ -42,6 +42,7 @@ import 'exceptions.dart';
 import 'indexed_reader.dart';
 import 'keyframe_delta.dart';
 import 'opcode.dart';
+import 'provenance.dart' show FourdgsProvenance, lengthUnitMetres;
 import 'quantization.dart';
 import 'readable.dart';
 import 'records.dart';
@@ -168,6 +169,7 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
   List<FourdgsWindow> windows = const <FourdgsWindow>[];
   FourdgsFooter? footer;
   int footerOffset = -1;
+  final List<int> footerOffsets = <int>[];
   int firstOpcode = -1;
   int chunkCount = 0;
   int counted = 0;
@@ -306,6 +308,7 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
             report.error('a chunk index entry does not parse: ${_say(error)}');
           }
         case opFooter:
+          footerOffsets.add(frame.offset);
           try {
             footer = FourdgsFooter.parse(
               await _bytesOf(source, frame, most: footerFixedBytes),
@@ -413,6 +416,23 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
   if (!seen.contains(opHeader)) report.error('no Header record');
   if (!seen.contains(opQuantization)) report.error('no Quantization record');
   if (!seen.contains(opFooter)) report.error('no Footer record');
+  if (footerOffsets.length > 1) {
+    report.error(
+      'the file carries ${footerOffsets.length} Footer records at '
+      '${footerOffsets.join(", ")}; the Footer must appear exactly once as '
+      'the final record',
+    );
+  }
+  if (footerOffsets.isNotEmpty &&
+      walk.records.isNotEmpty &&
+      walk.records.last.opcode != opFooter) {
+    final FourdgsFrame last = walk.records.last;
+    report.error(
+      'the Footer at byte ${footerOffsets.last} is followed by '
+      '${opcodeName(last.opcode)} at byte ${last.offset}; the Footer must be '
+      'the final record',
+    );
+  }
 
   // Which chunk shape the rest of this validator is entitled to assume. A
   // `keyframe-delta` file's Chunks are keyframes and its Delta Chunks are
@@ -556,6 +576,26 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
         'found ${indexFrameOffsets.length} Chunk Index record(s)',
       );
     } else if (footer.summaryStart != 0) {
+      const Set<int> summaryOpcodes = <int>{
+        opChunkIndex,
+        opStatistics,
+        opSummaryOffset,
+      };
+      final List<FourdgsFrame> unexpected = <FourdgsFrame>[
+        for (final FourdgsFrame frame in walk.records)
+          if (footer.summaryStart <= frame.offset &&
+              frame.offset < footerOffset &&
+              !summaryOpcodes.contains(frame.opcode))
+            frame,
+      ];
+      for (final FourdgsFrame frame in unexpected) {
+        report.error(
+          'the Footer summary range [${footer.summaryStart}, $footerOffset) '
+          'contains ${opcodeName(frame.opcode)} at byte ${frame.offset}; only '
+          'Chunk Index, Statistics, and Summary Offset records are legal in '
+          'the complete summary run',
+        );
+      }
       final List<int> orphaned = <int>[
         for (final int offset in indexFrameOffsets)
           if (offset < footer.summaryStart || offset >= footerOffset) offset,
@@ -695,7 +735,22 @@ Future<void> _checkAuxiliaryRecords(
     summaryOffsets: scene.summaryOffsets,
   );
   try {
-    await readFourdgsProvenance(source, complete);
+    final FourdgsProvenance provenance = await readFourdgsProvenance(
+      source,
+      complete,
+    );
+    for (final frame in provenance.frames) {
+      final double? registered = lengthUnitMetres[frame.lengthUnit];
+      if (registered != null &&
+          frame.metresPerUnit > 0.0 &&
+          frame.metresPerUnit != registered) {
+        report.error(
+          'Coordinate Frame "${frame.name}" declares length_unit '
+          '${frame.lengthUnit}, which means $registered metres per unit, but '
+          'metres_per_unit is ${frame.metresPerUnit}; both fields must agree',
+        );
+      }
+    }
   } on FourdgsException catch (error) {
     report.error('the provenance records do not decode: ${_say(error)}');
   }
@@ -1507,8 +1562,10 @@ Future<int> _recordIdentityIntroductions(
   int declared,
   String what,
 ) async {
+  final _StateIdIndex? previousIds =
+      previous == null ? null : _StateIdIndex(previous.ids);
   for (final int id in state.ids) {
-    if (_stateContains(previous, id)) continue;
+    if (previousIds?.contains(id) ?? false) continue;
     if (filter.mightContain(id) &&
         await _identityAppearedBefore(source, walk, offset, id)) {
       final String action = what == 'the delta chunk' ? 'births' : 'reuses';
@@ -1527,6 +1584,20 @@ Future<int> _recordIdentityIntroductions(
     distinct += 1;
   }
   return distinct;
+}
+
+/// One per-state membership index for the identity-introduction pass.
+///
+/// A delta commonly retains almost every prior id. Building the hash set once
+/// makes the pass linear on ordinary input instead of scanning the prior state
+/// once for every retained id (`O(N²)`). The index is released with the call
+/// and never accumulates across chunks.
+class _StateIdIndex {
+  _StateIdIndex(Int32List ids) : _ids = <int>{for (final int id in ids) id};
+
+  final Set<int> _ids;
+
+  bool contains(int id) => _ids.contains(id);
 }
 
 bool _stateContains(KeyframeDeltaState? state, int id) {
