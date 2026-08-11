@@ -714,6 +714,28 @@ KeyframeDeltaState _composeDelta(
   checkCount('update', updates.ids.length, body.header.updateCount);
   checkCount('birth', births.ids.length, body.header.birthCount);
   checkCount('death', deaths.ids.length, body.header.deathCount);
+  void checkColumnCounts(
+    String group,
+    Map<int, _Column> columns,
+    int declared,
+  ) {
+    for (final MapEntry<int, _Column> column in columns.entries) {
+      if (column.value.rows != declared) {
+        throw FourdgsMalformedFile(
+          '$what declares $declared $group operations, but attribute '
+          '${column.key} in its $group group decodes to '
+          '${column.value.rows} rows',
+        );
+      }
+    }
+  }
+
+  // The composer has no ids to iterate when a group declares zero operations.
+  // Check every lane explicitly so a non-empty attribute stream cannot hide in
+  // an otherwise empty group and be silently discarded.
+  checkColumnCounts('update', updates.bins, body.header.updateCount);
+  checkColumnCounts('birth', births.bins, body.header.birthCount);
+  checkColumnCounts('death', deaths.bins, body.header.deathCount);
   final hasRotationIndex = updates.bins.containsKey(attrRotationIndex);
   final hasRotationBins = updates.bins.containsKey(attrRotation);
   if (hasRotationIndex != hasRotationBins) {

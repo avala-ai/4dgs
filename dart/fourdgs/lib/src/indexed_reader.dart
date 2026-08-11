@@ -205,6 +205,9 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
       'the file has no Header or no Quantization record before its first chunk',
     );
   }
+  // An absent or empty Window Table is the one default `(0, 0)` row from
+  // section 5.4. Chunk decoding applies that same default, so opening must not
+  // reject a resource the range reader can decode unambiguously.
   final audioSourceRanges = _pairIndexedAudioSources(front);
   if (front.header!.hasAudio != audioSourceRanges.isNotEmpty) {
     throw FourdgsMalformedFile(

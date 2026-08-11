@@ -333,6 +333,52 @@ void main() {
       );
     });
 
+    test('an absent Window Table supplies the default window', () async {
+      final Uint8List streams = _keyframeStreams(
+        windowIndex: 0,
+        includeGaussianId: false,
+      );
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(
+          _minimal(
+            writeWindowTable: false,
+            gaussianCount: 1,
+            extra: _stateChunk(streams, 1),
+          ),
+        ),
+      );
+      expect(_messages(report, FourdgsSeverity.error), isEmpty);
+    });
+
+    test('an SH band before every Chunk is rejected', () async {
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(
+          _minimal(
+            shDegree: 1,
+            extra:
+                (BytesBuilder()
+                      ..add(_shBandRecord(0, 0))
+                      ..add(_stateChunk(Uint8List(0), 0)))
+                    .toBytes(),
+          ),
+        ),
+      );
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(allOf(contains('ShBandStream'), contains('precedes every'))),
+      );
+    });
+
+    test('duplicate gaussian-birth index entries are rejected', () async {
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(_gaussianBirthWithDuplicateIndex()),
+      );
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(contains('both name the gaussian-birth Chunk')),
+      );
+    });
+
     test('an unknown record is a note rather than a failure', () async {
       final FourdgsValidation report = await validateFourdgs(
         FourdgsBytes(_minimal(extra: _record(0x7F, Uint8List(3)))),
@@ -1058,6 +1104,27 @@ void main() {
       );
     });
 
+    test('empty delta groups cannot carry nonempty attributes', () async {
+      final Uint8List updates =
+          (BytesBuilder()
+                ..add(_constStream(attrGaussianId, 1, 0, 0))
+                ..add(_constStream(attrPosition, 3, 1, 0)))
+              .toBytes();
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(_keyframeDeltaWithEmptyDelta(updateGroup: updates)),
+      );
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(
+          allOf(
+            contains('declares 0 update operations'),
+            contains('attribute 0'),
+            contains('decodes to 1 rows'),
+          ),
+        ),
+      );
+    });
+
     test('a delta must preserve its reference level', () async {
       final FourdgsValidation report = await validateFourdgs(
         FourdgsBytes(_keyframeDeltaWithEmptyDelta(deltaLevel: 1)),
@@ -1504,6 +1571,7 @@ Uint8List _minimal({
   int shDegree = 0,
   int headerFlags = 0,
   int gaussianCount = 0,
+  bool writeWindowTable = true,
   List<int> shBitDepths = const <int>[],
 }) {
   final BytesBuilder out =
@@ -1522,14 +1590,15 @@ Uint8List _minimal({
           ),
         );
   if (secondHeader != null) out.add(_record(opHeader, secondHeader));
-  out
-    ..add(
-      _record(
-        opQuantization,
-        _quantizationContent(scheme: scheme, shBitDepths: shBitDepths),
-      ),
-    )
-    ..add(_record(opWindowTable, _windowTableContent()));
+  out.add(
+    _record(
+      opQuantization,
+      _quantizationContent(scheme: scheme, shBitDepths: shBitDepths),
+    ),
+  );
+  if (writeWindowTable) {
+    out.add(_record(opWindowTable, _windowTableContent()));
+  }
   if (extra != null) out.add(extra);
   final BytesBuilder footer =
       BytesBuilder()
@@ -2106,6 +2175,7 @@ Uint8List _keyframeDeltaWithEmptyDelta({
   int birthCount = 0,
   int deathCount = 0,
   int deltaLevel = 0,
+  Uint8List? updateGroup,
 }) {
   final Uint8List head =
       (BytesBuilder()
@@ -2138,9 +2208,11 @@ Uint8List _keyframeDeltaWithEmptyDelta({
         .toBytes(),
   );
   final int keyframeOffset = head.length;
+  final Uint8List updates = updateGroup ?? Uint8List(0);
   final BytesBuilder groups =
       BytesBuilder()
-        ..add(_u64(0))
+        ..add(_u64(updates.length))
+        ..add(updates)
         ..add(_u64(0))
         ..add(_u64(0));
   final Uint8List groupBytes = groups.toBytes();
@@ -2231,6 +2303,47 @@ Uint8List _keyframeDeltaWithEmptyDelta({
         ..add(delta)
         ..add(firstIndex)
         ..add(secondIndex)
+        ..add(footer)
+        ..add(fourdgsMagic))
+      .toBytes();
+}
+
+/// One empty gaussian-birth Chunk named twice by the summary.
+Uint8List _gaussianBirthWithDuplicateIndex() {
+  final Uint8List head =
+      (BytesBuilder()
+            ..add(fourdgsMagic)
+            ..add(_record(opHeader, _headerContent()))
+            ..add(_record(opQuantization, _quantizationContent()))
+            ..add(_record(opWindowTable, _windowTableContent())))
+          .toBytes();
+  final Uint8List chunk = _stateChunk(Uint8List(0), 0);
+  final int chunkOffset = head.length;
+  final Uint8List entry =
+      (BytesBuilder()
+            ..add(_f64(0.0))
+            ..add(_f64(1.0))
+            ..add(_u64(chunkOffset))
+            ..add(_u64(chunk.length))
+            ..add(_u32(0))
+            ..add(_u32(0)))
+          .toBytes();
+  final Uint8List first = _record(opChunkIndex, entry);
+  final Uint8List second = _record(opChunkIndex, entry);
+  final int indexOffset = chunkOffset + chunk.length;
+  final Uint8List footer = _record(
+    opFooter,
+    (BytesBuilder()
+          ..add(_u64(indexOffset))
+          ..add(_u64(0))
+          ..add(_u32(0)))
+        .toBytes(),
+  );
+  return (BytesBuilder()
+        ..add(head)
+        ..add(chunk)
+        ..add(first)
+        ..add(second)
         ..add(footer)
         ..add(fourdgsMagic))
       .toBytes();

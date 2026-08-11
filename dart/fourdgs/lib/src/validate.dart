@@ -1323,6 +1323,20 @@ Future<void> _checkGaussianBirth(
   required double cutoff,
   required bool requireObjectId,
 }) async {
+  final Map<int, int> firstIndexAt = <int, int>{};
+  for (int i = 0; i < scene.index.length; i++) {
+    final int offset = scene.index[i].chunkOffset;
+    final int? previous = firstIndexAt[offset];
+    if (previous != null) {
+      report.error(
+        'chunk index entries $previous and $i both name the gaussian-birth '
+        'Chunk at byte $offset; the format defines one entry per chunk',
+      );
+    } else {
+      firstIndexAt[offset] = i;
+    }
+  }
+  final Set<int> indexedOffsets = firstIndexAt.keys.toSet();
   final Map<int, List<FourdgsBandRange>> framedBands =
       <int, List<FourdgsBandRange>>{};
   final Map<int, int> framedPopulations = <int, int>{};
@@ -1333,17 +1347,11 @@ Future<void> _checkGaussianBirth(
     quantization: quantization,
     windows: windows,
     cutoff: cutoff,
+    degree: scene.header.shDegree,
+    indexedOffsets: indexedOffsets,
     framedBands: framedBands,
     framedPopulations: framedPopulations,
     requireObjectId: requireObjectId,
-  )) {
-    return;
-  }
-  if (_checkFramedBandCoverage(
-    framedBands,
-    framedPopulations,
-    scene.header.shDegree,
-    report,
   )) {
     return;
   }
@@ -1351,19 +1359,10 @@ Future<void> _checkGaussianBirth(
 
   final Map<int, FourdgsFrame> framedChunks = <int, FourdgsFrame>{};
   await for (final FourdgsFrame frame in walkFourdgsFrames(source, walk)) {
-    if (frame.opcode == opChunk && frame.offset + frame.total <= walk.size) {
+    if (frame.opcode == opChunk &&
+        frame.offset + frame.total <= walk.size &&
+        indexedOffsets.contains(frame.offset)) {
       framedChunks[frame.offset] = frame;
-    }
-  }
-  final Set<int> indexedOffsets = <int>{
-    for (final FourdgsChunkIndexEntry entry in scene.index) entry.chunkOffset,
-  };
-  for (final int offset in framedBands.keys) {
-    if (!indexedOffsets.contains(offset)) {
-      report.error(
-        'the Chunk record at byte $offset is a complete gaussian-birth chunk '
-        'the Chunk Index does not name',
-      );
     }
   }
   for (int i = 0; i < scene.index.length; i++) {
@@ -1431,6 +1430,8 @@ Future<bool> _scanFramedChunks(
   required FourdgsQuantization? quantization,
   required List<FourdgsWindow> windows,
   required double cutoff,
+  required int degree,
+  required Set<int> indexedOffsets,
   required Map<int, List<FourdgsBandRange>> framedBands,
   required Map<int, int> framedPopulations,
   required bool requireObjectId,
@@ -1438,6 +1439,34 @@ Future<bool> _scanFramedChunks(
   if (quantization == null) return false; // already reported as missing
   int count = 0;
   int chunkOffset = -1;
+  List<FourdgsBandRange> chunkBands = <FourdgsBandRange>[];
+
+  bool finishChunk() {
+    if (chunkOffset < 0) return false;
+    final bool failed = _checkStateBandCoverage(
+      chunkOffset,
+      chunkBands,
+      count,
+      degree,
+      report,
+    );
+    // The index is bounded independently. Retain band ranges only for offsets
+    // it names; an indexless stream therefore drops every completed chunk's
+    // bookkeeping before the next chunk is decoded.
+    if (indexedOffsets.isNotEmpty) {
+      if (!indexedOffsets.contains(chunkOffset)) {
+        report.error(
+          'the Chunk record at byte $chunkOffset is a complete '
+          'gaussian-birth chunk the Chunk Index does not name',
+        );
+      } else {
+        framedBands[chunkOffset] = List<FourdgsBandRange>.of(chunkBands);
+        framedPopulations[chunkOffset] = count;
+      }
+    }
+    return failed;
+  }
+
   await for (final FourdgsFrame frame in walkFourdgsFrames(source, walk)) {
     if (frame.opcode != opChunk && frame.opcode != opShBandStream) continue;
     if (frame.offset + frame.total > walk.size) continue; // the cut record
@@ -1448,6 +1477,7 @@ Future<bool> _scanFramedChunks(
         frame.opcode,
       );
       if (frame.opcode == opChunk) {
+        if (finishChunk()) return true;
         final FourdgsChunkBody body = parseChunk(content);
         count = body.header.count;
         final FourdgsCursor streamCursor = FourdgsCursor(body.streams);
@@ -1472,8 +1502,7 @@ Future<bool> _scanFramedChunks(
           );
         }
         chunkOffset = frame.offset;
-        framedBands.putIfAbsent(chunkOffset, () => <FourdgsBandRange>[]);
-        framedPopulations[chunkOffset] = count;
+        chunkBands = <FourdgsBandRange>[];
         decodeChunkStreams(
           body.streams,
           count,
@@ -1487,26 +1516,33 @@ Future<bool> _scanFramedChunks(
           // at byte 0" about the fifth chunk of the file.
           chunkOffset: frame.offset,
         );
-      } else if (content.isNotEmpty) {
+      } else {
         // Bands belong to the chunk that precedes them; that adjacency is the
         // only thing that says which chunk's gaussians they colour.
+        if (chunkOffset < 0) {
+          throw FourdgsMalformedFile(
+            'the ShBandStream record at byte ${frame.offset} precedes every '
+            'Chunk and has no gaussian population to which it can belong',
+          );
+        }
+        if (content.isEmpty) {
+          throw const FourdgsTruncatedFile(
+            'a ShBandStream record has no band header',
+          );
+        }
         framedBand = content[0];
         decodeShBandRecord(
           content,
           expectedBand: framedBand,
           expectedCount: count,
         );
-        if (chunkOffset >= 0) {
-          framedBands
-              .putIfAbsent(chunkOffset, () => <FourdgsBandRange>[])
-              .add(
-                FourdgsBandRange(
-                  band: framedBand,
-                  offset: frame.offset,
-                  length: frame.total,
-                ),
-              );
-        }
+        chunkBands.add(
+          FourdgsBandRange(
+            band: framedBand,
+            offset: frame.offset,
+            length: frame.total,
+          ),
+        );
       }
     } on FourdgsException catch (error) {
       final String record =
@@ -1525,7 +1561,7 @@ Future<bool> _scanFramedChunks(
       return true;
     }
   }
-  return false;
+  return finishChunk();
 }
 
 /// Every nonempty state contribution carries exactly the degree the Header
@@ -1539,24 +1575,40 @@ bool _checkFramedBandCoverage(
   bool failed = false;
   for (final MapEntry<int, List<FourdgsBandRange>> entry in bandsAt.entries) {
     final int population = populations[entry.key] ?? 0;
-    final List<int> actual = <int>[
-      for (final FourdgsBandRange band in entry.value) band.band,
-    ]..sort();
-    final List<int> expected =
-        population == 0 ? <int>[] : <int>[for (int b = 1; b <= degree; b++) b];
-    if (actual.length != expected.length ||
-        !actual.asMap().entries.every(
-          (MapEntry<int, int> value) => value.value == expected[value.key],
-        )) {
-      report.error(
-        'the state chunk at byte ${entry.key} carries SH bands $actual for '
-        '$population gaussians; the Header declares degree $degree and '
-        'requires $expected',
-      );
-      failed = true;
-    }
+    failed =
+        _checkStateBandCoverage(
+          entry.key,
+          entry.value,
+          population,
+          degree,
+          report,
+        ) ||
+        failed;
   }
   return failed;
+}
+
+bool _checkStateBandCoverage(
+  int offset,
+  List<FourdgsBandRange> bands,
+  int population,
+  int degree,
+  _Report report,
+) {
+  final List<int> actual = <int>[for (final band in bands) band.band]..sort();
+  final List<int> expected =
+      population == 0 ? <int>[] : <int>[for (int b = 1; b <= degree; b++) b];
+  if (actual.length == expected.length &&
+      actual.asMap().entries.every(
+        (MapEntry<int, int> value) => value.value == expected[value.key],
+      )) {
+    return false;
+  }
+  report.error(
+    'the state chunk at byte $offset carries SH bands $actual for $population '
+    'gaussians; the Header declares degree $degree and requires $expected',
+  );
+  return true;
 }
 
 /// The same, for the temporal model whose chunks are keyframes and differences.
