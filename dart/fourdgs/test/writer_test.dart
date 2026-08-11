@@ -979,6 +979,35 @@ void main() {
       expect(visible, 1);
     });
 
+    test('sub-nanosecond support beyond an interval stays reachable', () async {
+      const boundary = 1e-6;
+      final scene = flatScene(2, winHi: 1.0);
+      scene.sigmaT.fillRange(0, scene.count, double.infinity);
+      scene.winHi[0] = boundary;
+      scene.winHi[1] = boundary + 5e-10;
+      final bytes = writeFourdgsBytes(
+        scene,
+        1.0,
+        options: const FourdgsWriteOptions(maxDepth: 0, minChunkGaussians: 1),
+      );
+      final indexed = await openFourdgsIndexed(FourdgsBytes(bytes));
+      final chunks = <FourdgsDecodedChunk>[];
+      for (final entry in indexed.index) {
+        if (entry.t0 <= boundary && boundary < entry.t1) {
+          chunks.add(
+            await readFourdgsChunk(FourdgsBytes(bytes), indexed, entry),
+          );
+        }
+      }
+      expect(
+        assembleGaussians(
+          chunks,
+          0,
+        ).stateAt(boundary, cutoff: indexed.header.cutoff).count,
+        1,
+      );
+    });
+
     test('finite support still partitions an open-ended scene', () {
       final scene = buildScene(count: 512, windows: 1, duration: 512.0);
       scene.winLo.fillRange(0, scene.count, 0.0);
@@ -992,6 +1021,20 @@ void main() {
         ),
       );
       expect(decoded.chunkIndex.length, greaterThan(1));
+      expect(decoded.chunkIndex.any((entry) => entry.t1.isFinite), isTrue);
+    });
+
+    test('point support at an open tail start still earns a finite chunk', () {
+      final scene = flatScene(128, winHi: double.infinity);
+      scene.sigmaT.fillRange(0, scene.count, 0.0);
+      scene.muT.fillRange(0, scene.count, 0.0);
+      final decoded = readFourdgsBytes(
+        writeFourdgsBytes(
+          scene,
+          double.infinity,
+          options: const FourdgsWriteOptions(maxDepth: 4, minChunkGaussians: 8),
+        ),
+      );
       expect(decoded.chunkIndex.any((entry) => entry.t1.isFinite), isTrue);
     });
 

@@ -1282,7 +1282,7 @@ List<_Plan> _planChunks(
     for (int w = 0; w + 1 < tops.length; w++) <int>[],
   ];
   for (int i = 0; i < n; i++) {
-    final w = _firstContainingInterval(tops, lo[i], hi[i]);
+    final w = _firstContainingInterval(tops, lo[i], hi[i], g.winHi[i]);
     if (w >= 0) byInterval[w].add(i);
   }
 
@@ -1370,11 +1370,13 @@ List<double> _finiteTailTops(
   if (tops.length < 2 || tops.last.isFinite) return tops;
   final start = tops[tops.length - 2];
   double lastFinite = start;
+  bool haveFinite = false;
   for (int i = 0; i < supportHi.length; i++) {
     if (supportLo[i] < start || !supportHi[i].isFinite) continue;
+    haveFinite = true;
     if (supportHi[i] > lastFinite) lastFinite = supportHi[i];
   }
-  if (!(lastFinite > start)) return tops;
+  if (!haveFinite) return tops;
   final padding = math.max(1e-9, lastFinite.abs() * 1e-12);
   final boundary = lastFinite + padding;
   if (!boundary.isFinite || !(boundary > lastFinite)) return tops;
@@ -1389,19 +1391,23 @@ List<double> _finiteTailTops(
 /// whose end covers `hi` are a suffix, so the first interval that does both is
 /// where the suffix begins — if it begins inside the prefix at all.
 ///
-/// The comparisons are the scan's own, `lo >= a - 1e-9` and `hi <= b + 1e-9`,
-/// written that way round rather than rearranged into `a <= lo + 1e-9`. The two
-/// are the same statement in arithmetic and not always the same answer in
-/// doubles, and this has to reproduce the partition the scan produced exactly:
-/// one gaussian landing in a different chunk is a different file.
-int _firstContainingInterval(List<double> tops, double lo, double hi) {
+/// Containment is exact. A tolerance here can file support ending just beyond
+/// `b` into `[a, b)`, after which a seek at `b` omits a gaussian the streamed
+/// path still sees. The support endpoint itself is inclusive unless the
+/// gaussian's validity window ends there, which [windowHi] distinguishes.
+int _firstContainingInterval(
+  List<double> tops,
+  double lo,
+  double hi,
+  double windowHi,
+) {
   // The last interval whose start clears `lo`.
   int last = -1;
   int low = 0;
   int high = tops.length - 2;
   while (low <= high) {
     final mid = (low + high) >> 1;
-    if (lo >= tops[mid] - 1e-9) {
+    if (lo >= tops[mid]) {
       last = mid;
       low = mid + 1;
     } else {
@@ -1417,7 +1423,11 @@ int _firstContainingInterval(List<double> tops, double lo, double hi) {
   high = last;
   while (low <= high) {
     final mid = (low + high) >> 1;
-    if (hi <= tops[mid + 1] + 1e-9) {
+    final end = tops[mid + 1];
+    // A marginal includes its support endpoint. Equality fits a half-open
+    // interval only when the verbatim validity window also ends there, making
+    // the gaussian absent at the interval's excluded endpoint.
+    if (hi < end || (hi == end && windowHi <= end)) {
       first = mid;
       high = mid - 1;
     } else {

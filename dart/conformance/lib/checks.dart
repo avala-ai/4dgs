@@ -233,9 +233,22 @@ Future<int> checkSeekReadsOnlyWhatItNeeds(
   int probed = 0;
   for (final entry in probeEntries) {
     final span = entry.t1 - entry.t0;
-    if (!span.isFinite || span <= 0.0) continue;
-    for (final fraction in const <double>[0.13, 0.37, 0.61, 0.89]) {
-      final t = entry.t0 + fraction * span;
+    if (span <= 0.0) continue;
+    final candidates = <double>[];
+    if (span.isFinite) {
+      for (final fraction in const <double>[0.13, 0.37, 0.61, 0.89]) {
+        candidates.add(entry.t0 + fraction * span);
+      }
+    } else {
+      // An open-ended entry has no fractional midpoint. Probe finite instants
+      // relative to its start, spaced beyond the support-rounding guard; the
+      // half-offsets also avoid the common integer window boundaries.
+      final step = math.max(1.0, math.max(4.0 * guard, entry.t0.abs() * 1e-6));
+      for (final factor in const <double>[0.5, 1.5, 3.5, 7.5]) {
+        candidates.add(entry.t0 + factor * step);
+      }
+    }
+    for (final t in candidates) {
       if (!t.isFinite) continue;
       if (nearBoundary(t)) continue;
 
