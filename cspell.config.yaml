@@ -142,6 +142,15 @@ words:
   # Git and workflow vocabulary
   - reflog
   - oneline
+  # Spec-decision proposals (#78, #79, #95): the reference implementation's own
+  # identifiers, the summation vocabulary, and the toolchain names they cite
+  - numpy
+  - ndarray
+  - frozenset
+  - fsum
+  - multiset
+  - modulemap
+  - uncomposed
   - worktree
   - worktrees
   - toplevel
