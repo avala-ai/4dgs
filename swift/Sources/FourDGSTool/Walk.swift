@@ -134,6 +134,43 @@ public func crc32(_ bytes: ArraySlice<UInt8>) -> UInt32 {
     return crc ^ 0xFFFF_FFFF
 }
 
+/// The tool's one transport edge.
+///
+/// `ByteRangeReader` has mutating requirements so value transports can keep cursor or cache state.
+/// Boxing it once lets framing, checksum validation and the decoder share that abstraction without
+/// ever turning a file into an array. Tests can still put an `InMemoryReader` behind the same box.
+final class ToolReader: ByteRangeReader {
+    private var base: any ByteRangeReader
+
+    init(_ base: any ByteRangeReader) { self.base = base }
+
+    func byteCount() throws -> Int64 { try base.byteCount() }
+
+    func read(offset: Int64, count: Int) throws -> [UInt8] {
+        try base.read(offset: offset, count: count)
+    }
+
+    /// A non-negative size. The protocol uses `Int64`, so every valid offset also fits its reads.
+    func size() throws -> UInt64 {
+        let count = try byteCount()
+        guard count >= 0 else { throw FourDGSError.invalidRange(offset: count, count: 0) }
+        return UInt64(count)
+    }
+
+    /// Exactly one already-bounded range, or the SDK's ordinary truncation diagnosis.
+    func exactly(offset: UInt64, count: Int, record: String) throws -> [UInt8] {
+        guard let signed = Int64(exactly: offset) else {
+            throw FourDGSError.invalidRange(offset: Int64.max, count: count)
+        }
+        let bytes = try read(offset: signed, count: count)
+        guard bytes.count == count else {
+            throw FourDGSError.truncated(
+                offset: signed, record: record, needed: Int64(count), available: Int64(bytes.count))
+        }
+        return bytes
+    }
+}
+
 /// One record's framing: what it is, where it starts, how long its content is.
 public struct Frame: Equatable {
     public let opcode: UInt8
@@ -147,7 +184,10 @@ public struct Frame: Equatable {
     /// Saturating: the length is eight bytes off an untrusted file, so a record can declare
     /// `UInt64.max` and this is where that would wrap. Saturating produces a total that runs
     /// past the end of any file, which is exactly what the walk then reports.
-    public var total: UInt64 { length.addingReportingOverflow(recordHeaderSize).partialValue }
+    public var total: UInt64 {
+        let (total, overflow) = length.addingReportingOverflow(recordHeaderSize)
+        return overflow ? UInt64.max : total
+    }
 
     var overflows: Bool { length.addingReportingOverflow(recordHeaderSize).overflow }
 }
@@ -219,13 +259,14 @@ func readU32(_ bytes: [UInt8], at: UInt64) -> UInt32? {
 /// bytes that are not ours would report whatever the first byte happened to mean as an opcode —
 /// and when it fails, the SDK is asked to name the refusal so that the wording and the identifier
 /// are the reader's rather than this tool's.
-public func walk(_ bytes: [UInt8]) throws -> Walk {
-    let size = UInt64(bytes.count)
+func walk(_ source: ToolReader) throws -> Walk {
+    let size = try source.size()
     guard size >= UInt64(magic.count) else {
         throw FourDGSError.truncated(
             offset: 0, record: "magic", needed: Int64(magic.count), available: Int64(size))
     }
-    if Array(bytes.prefix(magic.count)) != magic { throw refuseMagic(bytes) }
+    let head = try source.exactly(offset: 0, count: magic.count, record: "magic")
+    if head != magic { throw refuseMagic(head) }
 
     var out = Walk()
     out.size = size
@@ -235,7 +276,9 @@ public func walk(_ bytes: [UInt8]) throws -> Walk {
         if remaining == 0 { break }
         // A whole file ends with the magic, so its last eight bytes are not a record.
         if remaining <= UInt64(magic.count) {
-            out.trailingMagic = Array(bytes[Int(at)...]) == magic
+            let tail = try source.exactly(
+                offset: at, count: Int(remaining), record: "trailing magic")
+            out.trailingMagic = tail == magic
             if !out.trailingMagic {
                 out.cut = Cut(
                     at: at,
@@ -250,8 +293,9 @@ public func walk(_ bytes: [UInt8]) throws -> Walk {
                 insideARecord: false)
             break
         }
-        let frame = Frame(
-            opcode: bytes[Int(at)], offset: at, length: readU64(bytes, at: at + 1) ?? 0)
+        let header = try source.exactly(
+            offset: at, count: Int(recordHeaderSize), record: "record header")
+        let frame = Frame(opcode: header[0], offset: at, length: readU64(header, at: 1) ?? 0)
         // A record is listed either way: a declared length that runs off the end is a fact about
         // that record, and hiding the record hides the field that carries the fault.
         out.records.append(frame)
@@ -269,6 +313,11 @@ public func walk(_ bytes: [UInt8]) throws -> Walk {
         at = end
     }
     return out
+}
+
+/// The in-memory convenience used by unit tests and callers that already own their bytes.
+public func walk(_ bytes: [UInt8]) throws -> Walk {
+    try walk(ToolReader(InMemoryReader(bytes)))
 }
 
 /// Ask the SDK to name a bad magic, so the wording and the identifier are the reader's.
@@ -389,31 +438,40 @@ public struct IndexEntry {
 /// `gaussian_count`, then the band table (spec §5.9). Everything after those is what a seek costs
 /// or what `keyframe-delta` adds, and a later revision may append more — which is why this stops
 /// where the addresses stop.
-public func chunkIndexEntries(_ bytes: [UInt8], _ walk: Walk) -> [IndexEntry] {
+func chunkIndexEntries(_ source: ToolReader, _ walk: Walk) throws -> [IndexEntry] {
     let offsetField: UInt64 = 16
     let bandTable: UInt64 = 36
     let prefix: UInt64 = 40
     var out: [IndexEntry] = []
     for frame in walk.intactRecords where frame.opcode == Opcode.chunkIndex {
         let content = frame.offset + recordHeaderSize
-        guard frame.length >= prefix,
-            let offset = readU64(bytes, at: content + offsetField),
-            let length = readU64(bytes, at: content + offsetField + 8)
+        guard frame.length >= prefix else { continue }
+        let fields = try source.exactly(
+            offset: content, count: Int(prefix), record: "Chunk Index")
+        guard let offset = readU64(fields, at: offsetField),
+            let length = readU64(fields, at: offsetField + 8)
         else { continue }
         var bands: [(band: UInt8, offset: UInt64)] = []
-        let declared = readU32(bytes, at: content + bandTable) ?? 0
+        let declared = UInt64(readU32(fields, at: bandTable) ?? 0)
         // `(u8 band, u64 offset, u64 length)` each, and only as many as this record's own
-        // declared length has room for: the count is four bytes off an untrusted file.
+        // declared length has room for. Degree 3 is the format maximum, so at most three bands
+        // can be useful for refusal placement; the count is four bytes off an untrusted file.
         var at = content + prefix
-        for _ in 0..<declared {
-            guard at + 17 <= content + frame.length, let bandOffset = readU64(bytes, at: at + 1)
-            else { break }
-            bands.append((band: bytes[Int(at)], offset: bandOffset))
+        let available = (frame.length - prefix) / 17
+        for _ in 0..<min(min(declared, available), 3) {
+            let field = try source.exactly(offset: at, count: 17, record: "Chunk Index band range")
+            guard let bandOffset = readU64(field, at: 1) else { break }
+            bands.append((band: field[0], offset: bandOffset))
             at += 17
         }
         out.append(IndexEntry(offset: offset, length: length, bands: bands))
     }
     return out
+}
+
+/// The in-memory convenience used by focused parser tests.
+public func chunkIndexEntries(_ bytes: [UInt8], _ walk: Walk) -> [IndexEntry] {
+    (try? chunkIndexEntries(ToolReader(InMemoryReader(bytes)), walk)) ?? []
 }
 
 /// What the Footer declares about the summary checksum, and where the summary ends.
@@ -427,7 +485,7 @@ public struct SummaryDeclaration {
 
 /// Empty when the file has no Footer, or declares no summary checksum — which is a property of
 /// the file rather than a failure, because writing one is an encoder option.
-public func summaryDeclaration(_ bytes: [UInt8], _ walk: Walk) -> SummaryDeclaration? {
+func summaryDeclaration(_ source: ToolReader, _ walk: Walk) throws -> SummaryDeclaration? {
     // A whole Footer only. A file cut inside its own Footer has a record whose declared length is
     // the fault and whose content is not there, and reading a summary declaration out of it would
     // answer a question about the file with bytes the file does not have.
@@ -437,16 +495,19 @@ public func summaryDeclaration(_ bytes: [UInt8], _ walk: Walk) -> SummaryDeclara
     // this needs are the first three and they do not move.
     let fields: UInt64 = 20
     let content = frame.offset + recordHeaderSize
-    guard frame.length >= fields, content + fields <= UInt64(bytes.count),
-        let start = readU64(bytes, at: content)
-    else { return nil }
-    var crc: UInt32 = 0
-    for i in (0..<4).reversed() { crc = (crc << 8) | UInt32(bytes[Int(content) + 16 + i]) }
+    guard frame.length >= fields else { return nil }
+    let bytes = try source.exactly(offset: content, count: Int(fields), record: "Footer")
+    guard let start = readU64(bytes, at: 0), let crc = readU32(bytes, at: 16) else { return nil }
     guard crc != 0, start != 0 else { return nil }
     // The summary ends where the Footer begins — taken from the walk rather than computed from a
     // footer's expected size, so a Footer that a later revision extends does not move the region
     // out from under the check.
     return SummaryDeclaration(start: start, crc: crc, end: frame.offset)
+}
+
+/// The in-memory convenience used by focused parser tests.
+public func summaryDeclaration(_ bytes: [UInt8], _ walk: Walk) -> SummaryDeclaration? {
+    try? summaryDeclaration(ToolReader(InMemoryReader(bytes)), walk)
 }
 
 /// The region the Footer's summary checksum covers, and whether it agrees.
@@ -472,12 +533,35 @@ public struct Coverage {
 
 /// Empty when the file declares no summary checksum, which is a property of the file rather than
 /// a failure: writing one is an encoder option.
-public func coverage(_ bytes: [UInt8], _ walk: Walk) -> Coverage? {
-    guard let declared = summaryDeclaration(bytes, walk), declared.start <= declared.end,
-        declared.end <= UInt64(bytes.count)
+func coverage(_ source: ToolReader, _ walk: Walk) throws -> Coverage? {
+    guard let declared = try summaryDeclaration(source, walk), declared.start <= declared.end,
+        declared.end <= walk.size
     else { return nil }
-    let region = bytes[Int(declared.start)..<Int(declared.end)]
-    return Coverage(start: declared.start, end: declared.end, ok: crc32(region) == declared.crc)
+
+    // One fixed-size buffer at a time. `ByteRangeReader` returns owned bytes, so the storage is
+    // replaced on every iteration instead of accumulating the checksum region.
+    let block = 64 * 1024
+    var crc: UInt32 = 0xFFFF_FFFF
+    var at = declared.start
+    while at < declared.end {
+        let remaining = declared.end - at
+        let count = Int(min(UInt64(block), remaining))
+        let bytes = try source.exactly(offset: at, count: count, record: "summary checksum")
+        for byte in bytes {
+            crc ^= UInt32(byte)
+            for _ in 0..<8 {
+                crc = (crc & 1) != 0 ? (0xEDB8_8320 ^ (crc >> 1)) : (crc >> 1)
+            }
+        }
+        at += UInt64(count)
+    }
+    return Coverage(
+        start: declared.start, end: declared.end, ok: (crc ^ 0xFFFF_FFFF) == declared.crc)
+}
+
+/// The in-memory convenience used by focused checksum tests.
+public func coverage(_ bytes: [UInt8], _ walk: Walk) -> Coverage? {
+    try? coverage(ToolReader(InMemoryReader(bytes)), walk)
 }
 
 /// A refusal raised while decoding chunks, with the chunk it came from.
@@ -501,23 +585,12 @@ public struct ChunkRefusal {
 /// state, so a *renderer* is right to cap them — but an SH Band Stream is a stream like any
 /// other, and a band record carrying a codec this build does not implement is a file that does
 /// not decode. Capping the bands here would report it `valid`.
-public func scanChunks(_ bytes: [UInt8], index: [IndexEntry]) -> ChunkRefusal? {
-    let reader: SceneReader
-    do {
-        reader = try SceneReader(InMemoryReader(bytes))
-    } catch {
-        return ChunkRefusal(error: asFourDGS(error), site: nil)
-    }
+func scanChunks(_ reader: SceneReader, index: [IndexEntry]) -> ChunkRefusal? {
     let chunks = reader.scene.chunkIntervals.count
     guard chunks > 0, reader.scene.isIndexed else {
-        // Front to back: every chunk or none, and no per-chunk offset to attribute to. The core
-        // has no way to fetch one chunk of a file that has no index — a front-to-back reader
-        // decoded them all on the way to being opened — so this asks for what it already holds.
-        do {
-            _ = try reader.allGaussians()
-        } catch {
-            return ChunkRefusal(error: asFourDGS(error), site: nil)
-        }
+        // The ABI cannot ask a non-indexed scene for one chunk. Calling `allGaussians` here would
+        // turn validation into an unbounded accumulation, so opening the streamed scene is the
+        // strongest bounded check available; the missing-index warning states the limitation.
         return nil
     }
     for i in 0..<chunks {

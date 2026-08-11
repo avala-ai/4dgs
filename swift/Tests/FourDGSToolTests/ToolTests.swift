@@ -73,6 +73,38 @@ private func variants(_ directory: URL) -> [URL] {
         .map { directory.appendingPathComponent($0) }
 }
 
+/// Tests deliberately mutate tiny corpus fixtures in memory. Production commands never use this.
+private func readFixture(_ url: URL) throws -> [UInt8] {
+    [UInt8](try Data(contentsOf: url))
+}
+
+private func writeU64(_ value: UInt64, into bytes: inout [UInt8], at offset: UInt64) {
+    for i in 0..<8 { bytes[Int(offset) + i] = UInt8(truncatingIfNeeded: value >> (8 * i)) }
+}
+
+private func withTemporaryFile<T>(_ bytes: [UInt8], _ body: (String) throws -> T) throws -> T {
+    let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".4dgs")
+    try Data(bytes).write(to: url)
+    defer { try? FileManager.default.removeItem(at: url) }
+    return try body(url.path)
+}
+
+private final class RecordingReader: ByteRangeReader {
+    let bytes: [UInt8]
+    private(set) var largestRead = 0
+
+    init(_ bytes: [UInt8]) { self.bytes = bytes }
+
+    func byteCount() throws -> Int64 { Int64(bytes.count) }
+
+    func read(offset: Int64, count: Int) throws -> [UInt8] {
+        largestRead = max(largestRead, count)
+        let start = min(Int(clamping: offset), bytes.count)
+        let end = min(start + count, bytes.count)
+        return Array(bytes[start..<end])
+    }
+}
+
 /// The `"refused"` member of an expectation file: the identifier the corpus says a reader must
 /// produce for these bytes.
 private func expectedRefusal(_ variant: URL) -> String? {
@@ -120,8 +152,8 @@ final class ValidateTests: XCTestCase {
 
     /// It is not, in the Python validator: every structural check there assumes the
     /// gaussian-birth chunk shape, so a file whose Chunks are keyframes and whose Delta Chunks
-    /// are differences comes back invalid. The core implements the model — the conformance suite
-    /// proves it — so refusing a file for declaring it was never a statement about the file.
+    /// are differences comes back invalid. This tool recognizes that shape and applies its own
+    /// two-kind index rule instead of sending it through the wrong reader.
     func testAConformingKeyframeDeltaFileIsValid() throws {
         try requireCorpus()
         let files = variants(corpusDirectory().appendingPathComponent("keyframe"))
@@ -164,7 +196,7 @@ final class ValidateTests: XCTestCase {
     func testABandThatWillNotDecodeIsRefusedAndPlacedAtItsOwnRecord() throws {
         try requireCorpus()
         let variant = "MixedLifetimes-SHDegree3-UseChunkIndex-UseCrc.4dgs"
-        var bytes = try readWhole(corpusDirectory().appendingPathComponent(variant).path)
+        var bytes = try readFixture(corpusDirectory().appendingPathComponent(variant))
         XCTAssertTrue(validate(bytes).ok, "the unpatched variant is a conforming file")
 
         let walked = try walk(bytes)
@@ -190,7 +222,7 @@ final class ValidateTests: XCTestCase {
     /// holder actually has.
     func testACutFileReportsTheIntactPrefixAndTheByte() throws {
         try requireCorpus()
-        let bytes = try readWhole(corpusDirectory().appendingPathComponent(provenanceVariant).path)
+        let bytes = try readFixture(corpusDirectory().appendingPathComponent(provenanceVariant))
         let whole = try walk(bytes)
         let cutBytes = Array(bytes.prefix(bytes.count / 2))
         let cut = try walk(cutBytes)
@@ -211,13 +243,66 @@ final class ValidateTests: XCTestCase {
                 $0.severity == .note && $0.message.hasPrefix("the file is cut at byte ")
             }, "\(report.findings.map(\.message))")
     }
+
+    /// An index is untrusted bytes. `offset == size, length == 0` passes an end-only bound but
+    /// names the byte after the file; that must be a finding, never an array trap.
+    func testAnIndexOffsetAtEndOfFileIsDiagnosed() throws {
+        try requireCorpus()
+        var bytes = try readFixture(corpusDirectory().appendingPathComponent(provenanceVariant))
+        let walked = try walk(bytes)
+        let frame = try XCTUnwrap(walked.firstIntact(Opcode.chunkIndex))
+        let content = frame.offset + recordHeaderSize
+        writeU64(UInt64(bytes.count), into: &bytes, at: content + 16)
+        writeU64(0, into: &bytes, at: content + 24)
+
+        let report = validate(bytes)
+        XCTAssertTrue(
+            report.findings.contains {
+                $0.message == "chunk index entry 0 points past the end of the file"
+            }, "\(report.findings.map(\.message))")
+    }
+
+    func testKeyframeDeltaIndexDiagnosticNamesBothLegalTargets() throws {
+        try requireCorpus()
+        let file = try XCTUnwrap(
+            variants(corpusDirectory().appendingPathComponent("keyframe")).first)
+        var bytes = try readFixture(file)
+        let walked = try walk(bytes)
+        let frame = try XCTUnwrap(walked.firstIntact(Opcode.chunkIndex))
+        // Point the first entry at the Header: in bounds, but neither legal chunk kind.
+        writeU64(8, into: &bytes, at: frame.offset + recordHeaderSize + 16)
+
+        let report = validate(bytes)
+        XCTAssertTrue(
+            report.findings.contains {
+                $0.message == "chunk index entry 0 does not point at a Chunk or DeltaChunk record"
+            }, "\(report.findings.map(\.message))")
+    }
+
+    /// The CLI's structural work stays on ranges for both temporal models. These fixtures are
+    /// larger than the bounded Header prefix, so a file-sized request would be visible here.
+    func testValidationDoesNotRequestTheWholeFile() throws {
+        try requireCorpus()
+        let files = [
+            corpusDirectory().appendingPathComponent(provenanceVariant),
+            try XCTUnwrap(variants(corpusDirectory().appendingPathComponent("keyframe")).first),
+        ]
+        for file in files {
+            let bytes = try readFixture(file)
+            XCTAssertGreaterThan(bytes.count, 4096)
+            let recording = RecordingReader(bytes)
+            let report = validate(ToolReader(recording))
+            XCTAssertTrue(report.ok, "\(file.lastPathComponent): \(report.findings.map(\.message))")
+            XCTAssertLessThan(recording.largestRead, bytes.count, file.lastPathComponent)
+        }
+    }
 }
 
 final class InspectTests: XCTestCase {
 
     func testAWalkFramesEveryRecordAndEndsOnTheMagic() throws {
         try requireCorpus()
-        let bytes = try readWhole(corpusDirectory().appendingPathComponent(provenanceVariant).path)
+        let bytes = try readFixture(corpusDirectory().appendingPathComponent(provenanceVariant))
         let walked = try walk(bytes)
         XCTAssertTrue(walked.trailingMagic)
         XCTAssertNil(walked.cut)
@@ -248,6 +333,37 @@ final class InspectTests: XCTestCase {
         XCTAssertEqual(json.code, exitOk)
         XCTAssertTrue(json.out.contains("\"records\": ["))
         XCTAssertTrue(json.out.contains("\"truncated_at\": null"))
+    }
+
+    func testInspectFailsWhenOnlyTheClosingMagicIsMissing() throws {
+        try requireCorpus()
+        var bytes = try readFixture(corpusDirectory().appendingPathComponent(provenanceVariant))
+        bytes.removeLast(magic.count)
+        try withTemporaryFile(bytes) { path in
+            let result = runTool(["inspect", path])
+            XCTAssertEqual(result.code, exitFailed)
+            XCTAssertTrue(result.out.contains("note: the file does not end with the magic"))
+        }
+    }
+
+    func testInspectPreservesMalformedSummaryBounds() throws {
+        try requireCorpus()
+        var bytes = try readFixture(corpusDirectory().appendingPathComponent(provenanceVariant))
+        let walked = try walk(bytes)
+        let footer = try XCTUnwrap(walked.firstIntact(Opcode.footer))
+        writeU64(footer.offset + 1, into: &bytes, at: footer.offset + recordHeaderSize)
+
+        try withTemporaryFile(bytes) { path in
+            let text = runTool(["inspect", path])
+            XCTAssertEqual(text.code, exitOk)
+            XCTAssertTrue(text.out.contains("crc: INVALID: the Footer's summary starts at"))
+            XCTAssertFalse(text.out.contains("declares no summary checksum"))
+
+            let json = runTool(["inspect", "--json", path])
+            XCTAssertEqual(json.code, exitOk)
+            XCTAssertTrue(json.out.contains("\"summary_crc\": {"))
+            XCTAssertTrue(json.out.contains("\"ok\": null"))
+        }
     }
 
     /// `1` is an answer about a file: it was read, and it is bad. `3` is the absence of an answer,
@@ -346,5 +462,6 @@ final class RefusalPlacementTests: XCTestCase {
         XCTAssertTrue(cut.insideARecord)
         XCTAssertEqual(cut.at, 8)
         XCTAssertEqual(walked.intact, 0)
+        XCTAssertEqual(walked.records[0].total, UInt64.max)
     }
 }

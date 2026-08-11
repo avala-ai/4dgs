@@ -33,7 +33,9 @@ private func pad(_ value: String, _ width: Int, left: Bool) -> String {
     return left ? value + fill : fill + value
 }
 
-private func printText(_ out: TextOutput, _ walked: Walk, _ covered: Coverage?) {
+private func printText(
+    _ out: TextOutput, _ walked: Walk, _ declared: SummaryDeclaration?, _ covered: Coverage?
+) {
     row(out, "offset", "record", "content", "total", "crc")
     row(out, "0", "(magic)", "", "8", "-")
     for frame in walked.records {
@@ -59,12 +61,18 @@ private func printText(_ out: TextOutput, _ walked: Walk, _ covered: Coverage?) 
         out.line(
             "crc: the Footer's summary checksum covers bytes \(commas(covered.start)).."
                 + "\(commas(covered.end)); `-` is a record it does not cover")
+    } else if let declared {
+        out.line(
+            "crc: INVALID: the Footer's summary starts at \(commas(declared.start)), after "
+                + "the summary ends at \(commas(declared.end))")
     } else {
         out.line("crc: this file declares no summary checksum, so nothing here is covered")
     }
 }
 
-private func printJson(_ out: TextOutput, _ walked: Walk, _ covered: Coverage?) {
+private func printJson(
+    _ out: TextOutput, _ walked: Walk, _ declared: SummaryDeclaration?, _ covered: Coverage?
+) {
     out.line("{")
     out.line("  \"size\": \(walked.size),")
     out.line("  \"trailing_magic\": \(walked.trailingMagic),")
@@ -79,6 +87,10 @@ private func printJson(_ out: TextOutput, _ walked: Walk, _ covered: Coverage?) 
         out.line(
             "  \"summary_crc\": {\"start\": \(covered.start), \"end\": \(covered.end), "
                 + "\"ok\": \(covered.ok)},")
+    } else if let declared {
+        out.line(
+            "  \"summary_crc\": {\"start\": \(declared.start), \"end\": \(declared.end), "
+                + "\"ok\": null, \"error\": \"start is after end\"},")
     } else {
         out.line("  \"summary_crc\": null,")
     }
@@ -118,19 +130,16 @@ func jsonString(_ value: String) -> String {
 
 /// `4dgs inspect <file> [--json]` — walk the records: offset, opcode, length, CRC status.
 public func runInspect(_ path: String, json: Bool, _ out: TextOutput, _ err: TextOutput) -> Int32 {
-    // The whole file, for the checksum: the summary CRC has to cover a contiguous region to mean
-    // anything, and a record's CRC cell is a claim about the region it sits in. The walk itself
-    // still reads nine bytes per record, over the bytes already in hand.
-    let bytes: [UInt8]
+    let source: ToolReader
     do {
-        bytes = try readWhole(path)
+        source = try ToolReader(FileReader(path: path))
     } catch {
         err.line("4dgs: \(path): \(sentence(asFourDGS(error)))")
         return exitTool
     }
     let walked: Walk
     do {
-        walked = try walk(bytes)
+        walked = try walk(source)
     } catch {
         let refusal = asFourDGS(error)
         err.line("4dgs: \(path): \(sentence(refusal))")
@@ -141,13 +150,21 @@ public func runInspect(_ path: String, json: Bool, _ out: TextOutput, _ err: Tex
         return exitFailed
     }
 
-    let covered = coverage(bytes, walked)
+    let declared: SummaryDeclaration?
+    let covered: Coverage?
+    do {
+        declared = try summaryDeclaration(source, walked)
+        covered = try coverage(source, walked)
+    } catch {
+        err.line("4dgs: \(path): \(sentence(asFourDGS(error)))")
+        return exitTool
+    }
     if json {
-        printJson(out, walked, covered)
+        printJson(out, walked, declared, covered)
     } else {
-        printText(out, walked, covered)
+        printText(out, walked, declared, covered)
     }
     // The prefix was recovered and reported; the file is still not a whole one, and a pipeline
     // that goes on to read it should not be told otherwise.
-    return walked.cut != nil ? exitFailed : exitOk
+    return walked.cut != nil || !walked.trailingMagic ? exitFailed : exitOk
 }

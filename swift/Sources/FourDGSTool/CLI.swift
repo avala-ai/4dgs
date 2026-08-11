@@ -61,19 +61,6 @@ public final class StandardStream: TextOutput {
     public func write(_ text: String) { handle.write(Data(text.utf8)) }
 }
 
-/// A whole file, for the commands that need one.
-///
-/// `validate` does: the summary checksum has to cover a contiguous region to mean anything, and
-/// the reader is handed the same bytes rather than a second transport that could disagree with
-/// this walk. Cross-SDK principle 1 is about decode paths, and the decode this performs is chunk
-/// by chunk.
-public func readWhole(_ path: String) throws -> [UInt8] {
-    guard let data = FileManager.default.contents(atPath: path) else {
-        throw FourDGSError.unreadableSource(description: "cannot open \(path) for reading")
-    }
-    return [UInt8](data)
-}
-
 /// The usage text, which is also where the exit codes are documented.
 public let usage = """
     4dgs — inspect and validate .4dgs files

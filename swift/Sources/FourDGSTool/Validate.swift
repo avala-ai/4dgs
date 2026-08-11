@@ -34,10 +34,10 @@
 /// * **It decodes the chunks.** A framing walk steps over a chunk by its declared length, so a
 ///   fault inside a chunk's streams is invisible to it; two of the invalid corpus's seven files
 ///   are exactly that, and Python calls them clean.
-/// * **It knows `keyframe-delta`.** Python reports a conforming keyframe-delta file as invalid,
-///   because its structural checks assume the gaussian-birth chunk shape. The core implements the
-///   model — the conformance suite proves it — so refusing a file for declaring it was never a
-///   statement about the file.
+/// * **It recognizes `keyframe-delta`.** Python reports a conforming keyframe-delta file as
+///   invalid, because its structural checks assume the gaussian-birth chunk shape. This tool uses
+///   the model's own Chunk-or-DeltaChunk index rule. Its current ABI has no ranged composition
+///   entry point, so bounded validation stops at framing, index and checksum for that model.
 
 import FourDGS
 
@@ -92,21 +92,21 @@ public struct Report {
     }
 }
 
-/// Every check, over bytes already in hand.
-public func validate(_ bytes: [UInt8]) -> Report {
+/// Every check, over one size-and-range transport.
+func validate(_ source: ToolReader) -> Report {
     var report = Report()
 
     // Framing first, and for two reasons: it refuses a file that is not ours before anything
     // reads a byte as an opcode, and it is what gives every later refusal a byte to point at.
     let walked: Walk
     do {
-        walked = try walk(bytes)
+        walked = try walk(source)
     } catch {
         report.refused("", asFourDGS(error), nil, nil)
         return report
     }
 
-    if Array(bytes.suffix(magic.count)) != magic {
+    if !walked.trailingMagic {
         report.error(
             "file does not end with the magic; it is truncated or was written by a broken encoder")
     }
@@ -159,32 +159,71 @@ public func validate(_ bytes: [UInt8]) -> Report {
     // Asked of the reader rather than parsed here: this is the one field the whole branch turns
     // on, and a tool that read it out of the Header itself could disagree with the reader about
     // which model a file declares — which is the one disagreement that would matter.
-    let keyframeDelta = (try? peekTemporalModel(bytes)) == "keyframe-delta"
+    // The public model peek is byte-in, so give it only the bounded prefix it consumes. This is
+    // also the only part of a keyframe-delta file the current ABI can inspect without a whole-file
+    // allocation; structural, index and checksum validation below remain fully ranged.
+    let prefixCount = Int(min(walked.size, 4096))
+    let prefix: [UInt8]
+    do {
+        prefix = try source.exactly(offset: 0, count: prefixCount, record: "Header prefix")
+    } catch {
+        report.refused("", asFourDGS(error), walked, nil)
+        return report
+    }
+    let keyframeDelta = (try? peekTemporalModel(prefix)) == "keyframe-delta"
 
-    let index = chunkIndexEntries(bytes, walked)
+    let index: [IndexEntry]
+    do {
+        index = try chunkIndexEntries(source, walked)
+    } catch {
+        report.refused("", asFourDGS(error), walked, nil)
+        return report
+    }
     for (i, entry) in index.enumerated() {
         let (end, overflow) = entry.offset.addingReportingOverflow(entry.length)
-        if overflow || end > UInt64(bytes.count) {
+        if overflow || end > walked.size || entry.offset >= walked.size {
             report.error("chunk index entry \(i) points past the end of the file")
             continue
         }
         // A `keyframe-delta` file indexes both kinds: a Chunk is a keyframe and a Delta Chunk is
         // a difference against one, and an index that could only name the former could not seek
         // the model at all.
-        let at = bytes[Int(entry.offset)]
+        let at: UInt8
+        do {
+            at = try source.exactly(offset: entry.offset, count: 1, record: "Chunk Index target")[0]
+        } catch {
+            report.refused("", asFourDGS(error), walked, nil)
+            continue
+        }
         if at != Opcode.chunk && !(keyframeDelta && at == Opcode.deltaChunk) {
-            report.error("chunk index entry \(i) does not point at a Chunk record")
+            let expected = keyframeDelta ? "a Chunk or DeltaChunk record" : "a Chunk record"
+            report.error("chunk index entry \(i) does not point at \(expected)")
         }
     }
 
-    if let summary = summaryDeclaration(bytes, walked) {
+    let summary: SummaryDeclaration?
+    do {
+        summary = try summaryDeclaration(source, walked)
+    } catch {
+        report.refused("", asFourDGS(error), walked, nil)
+        return report
+    }
+    if let summary {
         if summary.start > summary.end {
             report.error(
                 "the Footer's summary starts at \(summary.start), after the summary ends at "
                     + "\(summary.end)")
-        } else if let covered = coverage(bytes, walked), !covered.ok {
-            report.error(
-                "summary CRC mismatch: the index is untrustworthy (a streamed read still works)")
+        } else {
+            do {
+                if let covered = try coverage(source, walked), !covered.ok {
+                    report.error(
+                        "summary CRC mismatch: the index is untrustworthy "
+                            + "(a streamed read still works)")
+                }
+            } catch {
+                report.refused("", asFourDGS(error), walked, nil)
+                return report
+            }
         }
     }
 
@@ -204,13 +243,16 @@ public func validate(_ bytes: [UInt8]) -> Report {
                 + "complete records before it are intact, and a streamed reader recovers them")
     }
 
-    if keyframeDelta {
-        checkKeyframeDelta(bytes, walked, &report)
-    } else {
-        checkGaussianBirth(bytes, walked, index, &report)
+    if !keyframeDelta {
+        checkGaussianBirth(source, walked, index, &report)
     }
 
     return report
+}
+
+/// The in-memory convenience used by parser tests and callers that already own their bytes.
+public func validate(_ bytes: [UInt8]) -> Report {
+    validate(ToolReader(InMemoryReader(bytes)))
 }
 
 /// The two checks only a reader can perform: open the file, then decode it.
@@ -221,10 +263,11 @@ public func validate(_ bytes: [UInt8]) -> Report {
 /// its declared length, so an unimplemented stream codec and an out-of-range window index are
 /// both invisible to everything before this point. Both are in the invalid corpus.
 private func checkGaussianBirth(
-    _ bytes: [UInt8], _ walked: Walk, _ index: [IndexEntry], _ report: inout Report
+    _ source: ToolReader, _ walked: Walk, _ index: [IndexEntry], _ report: inout Report
 ) {
+    let reader: SceneReader
     do {
-        _ = try SceneReader(InMemoryReader(bytes), path: .indexed)
+        reader = try SceneReader(source, path: .indexed)
     } catch {
         report.refused(
             "a seeking reader cannot open this file: ", asFourDGS(error), walked, nil)
@@ -232,42 +275,22 @@ private func checkGaussianBirth(
         // same thing about the same byte.
         return
     }
-    if let refusal = scanChunks(bytes, index: index) {
+    if let refusal = scanChunks(reader, index: index) {
         report.refused("a chunk does not decode: ", refusal.error, walked, refusal.site)
-    }
-}
-
-/// The same, for the temporal model whose chunks are keyframes and differences.
-///
-/// This is the same statement as the branch above — open the file the way a client would, and
-/// decode what it carries — expressed in the reader the file's declared model actually needs.
-/// The alternative, which is what the Python validator still does, is to run the gaussian-birth
-/// reader over it and report its refusal as a fault in the file.
-///
-/// One call, because one call is the whole surface the C ABI offers for this model: the core
-/// composes every chain and hands back the canonical states. So this branch cannot name the index
-/// entry that refused, and cannot compose one chain at a time — the memory the composition takes
-/// is the core's, and a binding that wanted per-entry control would have to reimplement the model
-/// on this side of the ABI, which is exactly the second decoder this package exists not to be.
-private func checkKeyframeDelta(_ bytes: [UInt8], _ walked: Walk, _ report: inout Report) {
-    do {
-        _ = try keyframeDeltaStatesJson(bytes, indexed: true)
-    } catch {
-        report.refused("a seeking reader cannot open this file: ", asFourDGS(error), walked, nil)
     }
 }
 
 /// `4dgs validate <file>` — check a file against the specification.
 public func runValidate(_ path: String, _ out: TextOutput, _ err: TextOutput) -> Int32 {
-    let bytes: [UInt8]
+    let source: ToolReader
     do {
-        bytes = try readWhole(path)
+        source = try ToolReader(FileReader(path: path))
     } catch {
         // Not the file's fault, and not a refusal. See ``exitTool``.
         err.line("4dgs: \(path): \(sentence(asFourDGS(error)))")
         return exitTool
     }
-    let report = validate(bytes)
+    let report = validate(source)
     for finding in report.findings {
         out.line("\(finding.severity.name): \(finding.message)")
         // Indented, and with a prefix of its own, so that a caller filtering the findings on
