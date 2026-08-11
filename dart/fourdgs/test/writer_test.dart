@@ -848,6 +848,23 @@ void main() {
       expect(decoded.chunkIndex.single.t0, 0.0);
       expect(decoded.chunkIndex.single.t1, 1e-9);
     });
+
+    test('a large scene is split before a Chunk buffer can grow with it', () {
+      final scene = flatScene(16385);
+      final decoded = readFourdgsBytes(writeFourdgsBytes(scene, 1.0));
+      expect(decoded.chunkIndex, hasLength(2));
+      expect(
+        decoded.chunkIndex.map((entry) => entry.gaussianCount),
+        everyElement(lessThanOrEqualTo(16384)),
+      );
+      expect(
+        decoded.chunkIndex.fold<int>(
+          0,
+          (sum, entry) => sum + entry.gaussianCount,
+        ),
+        scene.count,
+      );
+    });
   });
 
   group('spherical harmonics', () {
@@ -1410,6 +1427,19 @@ void main() {
         expect(() => writeFourdgsBytes(instant, 8.0), returnsNormally);
       },
     );
+
+    test('a positive sigma below 1e-30 keeps the relative bound', () {
+      final scene = buildScene(count: 8);
+      scene.sigmaT[3] = 1e-35;
+      final decoded = readFourdgsBytes(
+        writeFourdgsBytes(scene, 8.0),
+      ).gaussians.sigmaT.reduce(math.min);
+      expect(decoded, greaterThan(0.0));
+      expect(
+        (decoded - scene.sigmaT[3]).abs() / scene.sigmaT[3],
+        lessThan(0.02),
+      );
+    });
 
     test('a colour outside [0, 1] is refused rather than clamped', () {
       // `decodeChunk` clamps reconstructed colours into [0, 1], so a channel of

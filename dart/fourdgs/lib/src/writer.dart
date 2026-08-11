@@ -51,6 +51,13 @@ class FourdgsInvalidInput extends FourdgsException {
 /// The reference lifetime the velocity grid is expressed against (spec §6.3).
 const double _lifeRef = 0.5;
 
+/// Maximum population whose encoded attribute streams share one Chunk record.
+///
+/// A Chunk is framed by its total byte length, so its streams must be encoded
+/// before its header can be emitted. Keeping this fixed makes the record buffer
+/// bounded even when the caller supplies a much larger validated scene.
+const int _maxGaussiansPerChunk = 16384;
+
 /// Quantization profiles, as `(k, scaleRel, rot, rgb255, time, sigmaRel, sh)`.
 ///
 /// `k` scales the position tolerance by the scene's own median gaussian radius,
@@ -423,8 +430,9 @@ void _checkInput(FourdgsGaussianSet g, double cutoff) {
   // above: it is a standard deviation and would be stored as a positive
   // lifetime nobody wrote.
   // Zero stays legal — it is a gaussian whose support is a single instant, which
-  // is a shape the chunk planner has to handle, and `1e-30` is as near it as a
-  // logarithmic grid reaches.
+  // is a shape the chunk planner has to handle. The encoder uses `1e-30` only
+  // as zero's finite logarithmic spelling; every positive Float32 value has a
+  // defined logarithm of its own and must retain the declared relative bound.
   for (int i = 0; i < n; i++) {
     final sigma = g.sigmaT[i];
     if (sigma.isNaN || sigma == double.negativeInfinity) {
@@ -855,7 +863,7 @@ _Quantized _quantize(
         neverFades
             ? 0
             : _bin(
-              math.log(math.max(g.sigmaT[i], 1e-30)) / stepSigmaLog,
+              math.log(g.sigmaT[i] == 0.0 ? 1e-30 : g.sigmaT[i]) / stepSigmaLog,
               'sigma_t',
               i,
             );
@@ -1026,23 +1034,23 @@ class _Plan {
   final List<int> members;
 }
 
-/// One chunk holding every gaussian, spanning the whole partitioned timeline.
+/// Bounded spatial chunks spanning the whole partitioned timeline.
 ///
-/// Enough to write a conforming, readable, seekable file, and not enough to make
-/// seeking worth anything: one chunk means one index entry, so an instant costs
-/// the whole scene. Splitting the timeline is issue #117.
-List<_Plan> _planChunks(
+/// Temporal splitting is issue #117, so a seek still reads every one of these
+/// overlapping entries. The fixed population cap exists for the sink contract:
+/// one record's streams and framing copy are bounded independently of scene
+/// size, and each member list is released before the next one is made.
+Iterable<_Plan> _planChunks(
   FourdgsGaussianSet g,
   List<double> tops,
   FourdgsWriteOptions options,
-) {
-  if (g.count == 0) return const <_Plan>[];
-  return <_Plan>[
-    _Plan(tops.first, tops.last, 0, _mortonOrder(g, _all(g.count))),
-  ];
+) sync* {
+  for (int start = 0; start < g.count; start += _maxGaussiansPerChunk) {
+    final end = math.min(start + _maxGaussiansPerChunk, g.count);
+    final members = <int>[for (int i = start; i < end; i++) i];
+    yield _Plan(tops.first, tops.last, 0, _mortonOrder(g, members));
+  }
 }
-
-List<int> _all(int n) => <int>[for (int i = 0; i < n; i++) i];
 
 /// Reorder a chunk's members for spatial locality, by Morton code over their own
 /// bounding box.
