@@ -56,6 +56,11 @@ function u32(v: number): Uint8Array {
   new DataView(b.buffer).setUint32(0, v, true);
   return b;
 }
+function u16(v: number): Uint8Array {
+  const b = new Uint8Array(2);
+  new DataView(b.buffer).setUint16(0, v, true);
+  return b;
+}
 function u64(v: number): Uint8Array {
   const b = new Uint8Array(8);
   new DataView(b.buffer).setBigUint64(0, BigInt(v), true);
@@ -79,7 +84,7 @@ const STEPS = {
   sigmaLog: 0.01,
 };
 
-function headerBody(durationSec: number): Uint8Array {
+function headerBody(durationSec: number, shDegree = 0): Uint8Array {
   return concat([
     str(""), // profile
     str(""), // library
@@ -93,10 +98,20 @@ function headerBody(durationSec: number): Uint8Array {
     f64(0),
     f64(0),
     f64(0), // aabb
-    new Uint8Array([0]), // sh_degree
+    new Uint8Array([shDegree]), // sh_degree
     new Uint8Array([0]), // flags
     EMPTY_MAP,
   ]);
+}
+
+async function shBandRecord(band: number, values: number[], channels: number): Promise<Uint8Array> {
+  const stream = await encodeTestStream({
+    attributeId: 0x07,
+    values,
+    channels,
+    symbolWidth: 2,
+  });
+  return record(0x07, concat([new Uint8Array([band]), stream]));
 }
 
 function quantizationBody(): Uint8Array {
@@ -223,6 +238,35 @@ async function keyframeThenBirthFile(options: {
   ]);
 }
 
+async function keyframeThenBirthShFile(): Promise<Uint8Array> {
+  const keyframeStreams = await oneGaussianStreams(0, 0);
+  const keyframe = chunkRecord(0, 0.5, keyframeStreams, "", keyframeStreams.length);
+  const front = concat([
+    MAGIC,
+    record(0x01, headerBody(1, 1)),
+    record(0x03, quantizationBody()),
+    record(0x04, windowTableBody([[0, 1]])),
+  ]);
+  const births = await oneGaussianStreams(0, 0, undefined, { id: 7 });
+  const keyframeBand = await shBandRecord(
+    1,
+    Array.from({ length: 9 }, (_, i) => i + 1),
+    9,
+  );
+  const birthBand = await shBandRecord(
+    1,
+    Array.from({ length: 9 }, (_, i) => 101 + i),
+    9,
+  );
+  return concat([
+    front,
+    keyframe,
+    keyframeBand,
+    deltaChunkRecord({ t0: 0.5, t1: 1, referenceOffset: front.length, births }),
+    birthBand,
+  ]);
+}
+
 /**
  * A Chunk record (spec §5.5): `t0, t1, level, count, compression, uncompressed_size`, then
  * a length-framed records blob. `uncompressedSize` is the decompressed byte count — equal
@@ -279,6 +323,44 @@ async function oneKeyframeFile(options: {
     record(0x04, windowTableBody(options.windows)),
     chunk,
   ]);
+}
+
+/** One SH-bearing keyframe with a complete index, Footer and trailing magic. */
+async function oneKeyframeShFile(): Promise<Uint8Array> {
+  const streams = await oneGaussianStreams(0, 0);
+  const front = concat([
+    MAGIC,
+    record(0x01, headerBody(1, 1)),
+    record(0x03, quantizationBody()),
+    record(0x04, windowTableBody([[0, 1]])),
+  ]);
+  const chunk = chunkRecord(0, 1, streams, "", streams.length);
+  const chunkOffset = front.length;
+  const bandValues = Array.from({ length: 9 }, (_, i) => 240 - i);
+  const band = await shBandRecord(1, bandValues, 9);
+  const bandOffset = chunkOffset + chunk.length;
+  const summaryStart = bandOffset + band.length;
+  const index = record(
+    0x08,
+    concat([
+      f64(0),
+      f64(1),
+      u64(chunkOffset),
+      u64(chunk.length),
+      u32(1),
+      u32(1),
+      new Uint8Array([1]),
+      u64(bandOffset),
+      u64(band.length),
+      new Uint8Array([0, 0]), // keyframe, no delta mode
+      u64(0),
+      u64(chunkOffset),
+      u16(0),
+      u64(1),
+    ]),
+  );
+  const footer = record(0x02, concat([u64(summaryStart), u64(0), u32(0)]));
+  return concat([front, chunk, band, index, footer, MAGIC]);
 }
 
 // --- per-gaussian validity window (codex P1 §6.3) -------------------------
@@ -364,6 +446,34 @@ test("object membership is carried through the reconstruction where a chunk has 
   assert.equal(
     reconstructKeyframeDelta(plain, keyframeDeltaChunkAt(plain, 0.5), 0.5).objectId,
     null,
+  );
+});
+
+test("keyframe-delta reconstruction preserves SH on both paths and across a birth", async () => {
+  const indexedFile = await oneKeyframeShFile();
+  const streamed = await decodeKeyframeDeltaStreamed(indexedFile);
+  const indexed = (await decodeKeyframeDeltaIndexed(indexedFile)).sequence;
+  const expected = Array.from({ length: 9 }, (_, i) => 240 - i);
+  for (const sequence of [streamed, indexed]) {
+    const state = reconstructKeyframeDelta(sequence, keyframeDeltaChunkAt(sequence, 0.5), 0.5);
+    assert.equal(state.sh?.degree, 1);
+    assert.equal(state.sh?.coefficients, 3);
+    assert.equal(state.sh?.count, 1);
+    assert.deepEqual([...(state.sh?.values ?? [])], expected);
+  }
+
+  // A Delta Chunk's band rows belong to its births. Existing rows inherit the keyframe's
+  // coefficients; the newly born row is appended, and the public state follows the same
+  // gaussian-id order as every other reconstructed attribute.
+  const withBirth = await decodeKeyframeDeltaStreamed(await keyframeThenBirthShFile());
+  const after = reconstructKeyframeDelta(withBirth, keyframeDeltaChunkAt(withBirth, 0.75), 0.75);
+  assert.deepEqual([...after.ids], [0, 7]);
+  assert.deepEqual(
+    [...after.sh!.values],
+    [
+      ...Array.from({ length: 9 }, (_, i) => i + 1),
+      ...Array.from({ length: 9 }, (_, i) => 101 + i),
+    ],
   );
 });
 
@@ -485,6 +595,9 @@ test("a streamed decode reads a complete prefix and bounds probes to the last ch
     keyframeDeltaChunkAt(sequence, sequence.header.durationSec).t1,
     sequence.header.durationSec,
   );
+  for (const invalid of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.throws(() => keyframeDeltaChunkAt(sequence, invalid), MalformedFile);
+  }
 });
 
 test("a birth that introduces object_id defaults the rows that came before it", async () => {

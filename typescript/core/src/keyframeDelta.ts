@@ -70,10 +70,13 @@ import {
   parseFooter,
   parseHeader,
   parseQuantization,
+  parseShBandRecord,
   parseWindowTable,
+  readRecord,
 } from "./records.js";
 import { Opcode } from "./opcodes.js";
-import { decodeStream, frameStreams } from "./streams.js";
+import { coefficientsInBand, mergeBands, type ShCoefficients } from "./sh.js";
+import { decodeStream, frameOneStream, frameStreams, type RawStream } from "./streams.js";
 
 /**
  * Composed bins are signed 32-bit. Not a limit anyone meets — at a millimetre grid it
@@ -133,27 +136,33 @@ function columnRows(column: Column): number {
  * a language feature will do.
  */
 let binsOf!: (state: KeyframeDeltaState) => Map<number, Column>;
+let bandsOf!: (state: KeyframeDeltaState) => Map<number, Int32Array>;
 
 /**
- * A composed population: identities, and one bin column per attribute.
+ * A composed population: identities, one bin column per attribute, and stored SH bands.
  *
  * `ids` and every column are aligned, and the order is an implementation detail — nothing
  * in the format depends on it and no reader may rely on it. The bins stay private: a
  * consumer reads reconstructed gaussians through {@link reconstructKeyframeDelta}, not raw
- * composed bins.
+ * composed bins. SH stays private for the same reason and is exposed only with the fully
+ * reconstructed state.
  */
 export class KeyframeDeltaState {
   readonly #bins: Map<number, Column>;
+  readonly #bands: Map<number, Int32Array>;
 
   static {
     binsOf = (state) => state.#bins;
+    bandsOf = (state) => state.#bands;
   }
 
   constructor(
     readonly ids: Int32Array,
     bins: Map<number, Column>,
+    bands: Map<number, Int32Array> = new Map(),
   ) {
     this.#bins = bins;
+    this.#bands = bands;
   }
 
   get count(): number {
@@ -231,6 +240,7 @@ function applyDelta(
   // --- deaths -----------------------------------------------------------
   let ids = state.ids;
   let bins = new Map<number, Column>(binsOf(state));
+  let bands = new Map<number, Int32Array>();
 
   if (deathIds.length > 0) {
     const live = new Set<number>(ids);
@@ -248,6 +258,9 @@ function applyDelta(
     const kept = new Map<number, Column>();
     for (const [attribute, column] of bins) kept.set(attribute, selectRows(column, keep));
     bins = kept;
+    for (const [band, values] of bandsOf(state)) {
+      bands.set(band, selectBandRows(values, coefficientsInBand(band) * 3, keep));
+    }
   } else {
     // Copied because updates mutate columns in place, and the reference must not change
     // under a sibling chunk that also composes onto it.
@@ -256,6 +269,7 @@ function applyDelta(
       copied.set(attribute, { channels: column.channels, values: Int32Array.from(column.values) });
     }
     bins = copied;
+    for (const [band, values] of bandsOf(state)) bands.set(band, Int32Array.from(values));
   }
 
   // --- updates ----------------------------------------------------------
@@ -365,7 +379,7 @@ function applyDelta(
     bins = grown;
   }
 
-  return new KeyframeDeltaState(ids, bins);
+  return new KeyframeDeltaState(ids, bins, bands);
 }
 
 function gatherIds(ids: Int32Array, rows: readonly number[]): Int32Array {
@@ -383,6 +397,16 @@ function selectRows(column: Column, rows: readonly number[]): Column {
     for (let c = 0; c < ch; c++) out[dst + c] = column.values[src + c]!;
   }
   return { channels: ch, values: out };
+}
+
+function selectBandRows(values: Int32Array, channels: number, rows: readonly number[]): Int32Array {
+  const out = new Int32Array(rows.length * channels);
+  for (let r = 0; r < rows.length; r++) {
+    const src = rows[r]! * channels;
+    const dst = r * channels;
+    out.set(values.subarray(src, src + channels), dst);
+  }
+  return out;
 }
 
 function checkUnique(ids: Int32Array, what: string): void {
@@ -461,6 +485,126 @@ async function decodeGroup(
   }
   streams.delete(Attribute.GaussianId);
   return { ids: idsOf(gaussianId), bins: streams };
+}
+
+/** Decode and frame one top-level SH Band Stream without losing its declared shape. */
+async function decodeShBand(
+  content: Uint8Array,
+  codecs: CodecRegistry,
+): Promise<{ band: number; stream: RawStream; values: Int32Array }> {
+  const parsed = parseShBandRecord(content);
+  const stream = frameOneStream(parsed.cursor);
+  if (parsed.cursor.remaining !== 0) {
+    throw new MalformedFile(
+      `SH band ${parsed.band} has ${parsed.cursor.remaining} trailing bytes after its stream`,
+    );
+  }
+  if (stream.attributeId !== Opcode.ShBandStream) {
+    throw new MalformedFile(
+      `SH band ${parsed.band} stream declares attribute id ${stream.attributeId}, the format ` +
+        `defines ${Opcode.ShBandStream}`,
+    );
+  }
+  return { band: parsed.band, stream, values: await decodeStream(stream, codecs) };
+}
+
+/**
+ * Attach one chunk's band rows to the composed state.
+ *
+ * A keyframe band carries every keyframe row. A Delta Chunk band carries only its births;
+ * existing rows inherit their coefficients from the referenced state, updates leave them
+ * alone, and deaths have already selected the surviving rows in {@link applyDelta}.
+ */
+function attachShBand(
+  state: KeyframeDeltaState,
+  degree: number,
+  band: number,
+  stream: RawStream,
+  values: Int32Array,
+  addedRows: number,
+  where: string,
+  attachedBands: Set<number>,
+): void {
+  if (band < 1 || band > degree) {
+    throw new MalformedFile(
+      `${where} carries SH band ${band}, outside the Header's declared degree ${degree}`,
+    );
+  }
+  const channels = coefficientsInBand(band) * 3;
+  if (stream.channels !== channels) {
+    throw new MalformedFile(
+      `${where} SH band ${band} declares ${stream.channels} channels, degree ${band} defines ` +
+        `${channels}`,
+    );
+  }
+  if (stream.elementCount !== addedRows) {
+    throw new MalformedFile(
+      `${where} SH band ${band} carries ${stream.elementCount} rows, expected ${addedRows}`,
+    );
+  }
+  for (let i = 0; i < values.length; i++) {
+    const value = values[i]!;
+    if (value < 0 || value > 255) {
+      throw new MalformedFile(
+        `${where} SH band ${band} coefficient ${i} is ${value}, outside the u8 range 0..255`,
+      );
+    }
+  }
+
+  if (attachedBands.has(band)) {
+    throw new MalformedFile(`${where} carries SH band ${band} more than once`);
+  }
+  attachedBands.add(band);
+  const bands = bandsOf(state);
+  const priorRows = state.count - addedRows;
+  if (priorRows < 0) {
+    throw new MalformedFile(
+      `${where} declares ${addedRows} SH birth rows for a ${state.count}-gaussian state`,
+    );
+  }
+  const inherited = bands.get(band);
+  if (priorRows > 0 && inherited === undefined) {
+    throw new MalformedFile(
+      `${where} cannot append SH band ${band}: its referenced state carries no such band`,
+    );
+  }
+  if (inherited !== undefined && inherited.length !== priorRows * channels) {
+    throw new MalformedFile(
+      `${where} inherited SH band ${band} with ${inherited.length} values for ${priorRows} rows ` +
+        `of ${channels} channels`,
+    );
+  }
+  const merged = new Int32Array((priorRows + addedRows) * channels);
+  if (inherited !== undefined) merged.set(inherited, 0);
+  merged.set(values, priorRows * channels);
+  bands.set(band, merged);
+}
+
+/** Every state carries exactly the contiguous band set its Header declares. */
+function checkCompleteSh(state: KeyframeDeltaState, degree: number, where: string): void {
+  const bands = bandsOf(state);
+  if (degree === 0) {
+    if (bands.size > 0) throw new MalformedFile(`${where} carries SH bands but sh_degree is 0`);
+    return;
+  }
+  const present = [...bands.keys()].sort((a, b) => a - b);
+  const expected = Array.from({ length: degree }, (_, i) => i + 1);
+  if (present.length !== expected.length || present.some((band, i) => band !== expected[i])) {
+    throw new MalformedFile(
+      `${where} carries SH bands ${present.join(", ") || "none"}, the Header requires ` +
+        `${expected.join(", ")}`,
+    );
+  }
+  for (const band of expected) {
+    const channels = coefficientsInBand(band) * 3;
+    const length = bands.get(band)!.length;
+    if (length !== state.count * channels) {
+      throw new MalformedFile(
+        `${where} SH band ${band} carries ${length} values, expected ${state.count} rows x ` +
+          `${channels} channels`,
+      );
+    }
+  }
 }
 
 /** A keyframe Chunk's ids and its full set of required bins. */
@@ -659,6 +803,18 @@ export async function decodeKeyframeDeltaStreamed(
   // A chunk's composed state and its `level`; the level is kept so a delta can be refused
   // against a reference at a different level (spec §11.6).
   const byOffset = new Map<number, { state: KeyframeDeltaState; level: number }>();
+  let currentChunk: KeyframeDeltaChunkInfo | null = null;
+  let currentBands = new Set<number>();
+  let sawFooter = false;
+
+  const finishCurrentBands = (): void => {
+    if (currentChunk === null || header === null) return;
+    checkCompleteSh(
+      currentChunk.state,
+      header.shDegree,
+      `state chunk at byte ${currentChunk.offset}`,
+    );
+  };
 
   for (const record of iterateRecords(data, MAGIC.length)) {
     if (record.opcode === Opcode.Header) {
@@ -674,11 +830,12 @@ export async function decodeKeyframeDeltaStreamed(
     } else if (record.opcode === Opcode.WindowTable) {
       windows = parseWindowTable(record.content);
     } else if (record.opcode === Opcode.Chunk) {
+      finishCurrentBands();
       const parsed = parseChunk(record.content);
       const decoded = await keyframeFromChunk(record.content, codecs);
       const state = keyframeState(decoded.ids, decoded.bins);
       byOffset.set(record.offset, { state, level: parsed.header.level });
-      chunks.push({
+      currentChunk = {
         t0: parsed.header.t0,
         t1: parsed.header.t1,
         kind: 0,
@@ -690,8 +847,11 @@ export async function decodeKeyframeDeltaStreamed(
         birthCount: null,
         deathCount: null,
         state,
-      });
+      };
+      chunks.push(currentChunk);
+      currentBands = new Set();
     } else if (record.opcode === Opcode.DeltaChunk) {
+      finishCurrentBands();
       const parsed = parseDeltaChunk(record.content);
       const reference = byOffset.get(parsed.header.referenceOffset);
       if (reference === undefined) {
@@ -714,7 +874,7 @@ export async function decodeKeyframeDeltaStreamed(
       );
       const state = await composeDelta(reference.state, parsed, codecs);
       byOffset.set(record.offset, { state, level: parsed.header.level });
-      chunks.push({
+      currentChunk = {
         t0: parsed.header.t0,
         t1: parsed.header.t1,
         kind: 1,
@@ -726,12 +886,45 @@ export async function decodeKeyframeDeltaStreamed(
         birthCount: parsed.header.birthCount,
         deathCount: parsed.header.deathCount,
         state,
-      });
+      };
+      chunks.push(currentChunk);
+      currentBands = new Set();
+    } else if (record.opcode === Opcode.ShBandStream) {
+      if (currentChunk === null || header === null) {
+        throw new MalformedFile(
+          `an SH Band Stream appears at byte ${record.offset} before a state chunk or Header`,
+        );
+      }
+      const decoded = await decodeShBand(record.content, codecs);
+      const rows = currentChunk.kind === 0 ? currentChunk.state.count : currentChunk.birthCount!;
+      attachShBand(
+        currentChunk.state,
+        header.shDegree,
+        decoded.band,
+        decoded.stream,
+        decoded.values,
+        rows,
+        `state chunk at byte ${currentChunk.offset}`,
+        currentBands,
+      );
+    } else if (record.opcode === Opcode.Footer) {
+      sawFooter = true;
+      finishCurrentBands();
     }
   }
 
   if (header === null || quantization === null) {
     throw new MalformedFile("keyframe-delta file has no Header or Quantization record");
+  }
+  try {
+    finishCurrentBands();
+  } catch (error) {
+    // A stream may end between a state record and its declared band set. Those bytes do
+    // not describe a lower-degree state; retain the longest preceding complete prefix.
+    // Once a Footer was seen the file claimed completeness, so the same shape is malformed.
+    if (sawFooter || currentChunk === null || !(error instanceof MalformedFile)) throw error;
+    chunks.pop();
+    byOffset.delete(currentChunk.offset);
   }
   // The timeline must tile [0, duration_sec) with no overlap or gap — checked here as well
   // as on the indexed path, so a hole is refused whichever way the file is read (§11.1).
@@ -789,7 +982,7 @@ export async function decodeKeyframeDeltaIndexed(
 
   const chunks: KeyframeDeltaChunkInfo[] = [];
   for (const entry of index) {
-    const state = await composeChain(data, index, entry, codecs);
+    const state = await composeChain(data, index, entry, codecs, header.shDegree);
     let updateCount: number | null = null;
     let birthCount: number | null = null;
     let deathCount: number | null = null;
@@ -837,6 +1030,7 @@ async function composeChain(
   index: readonly ChunkIndexEntry[],
   entry: ChunkIndexEntry,
   codecs: CodecRegistry,
+  shDegree: number,
 ): Promise<KeyframeDeltaState> {
   const chain = chainFor(index, (entry.t0 + entry.t1) / 2.0);
   let state: KeyframeDeltaState | null = null;
@@ -850,6 +1044,7 @@ async function composeChain(
       const decoded = await keyframeFromChunk(content, codecs);
       state = keyframeState(decoded.ids, decoded.bins);
       keyframeLevel = parseChunk(content).header.level;
+      await attachIndexedShBands(data, link, state, shDegree, state.count, codecs);
     } else {
       if (state === null) {
         throw new MalformedFile("a keyframe-delta chain begins with a delta chunk");
@@ -865,10 +1060,63 @@ async function composeChain(
         parsed.header.referenceOffset,
       );
       state = await composeDelta(state, parsed, codecs);
+      await attachIndexedShBands(data, link, state, shDegree, parsed.header.birthCount, codecs);
     }
+    checkCompleteSh(state, shDegree, `state chunk at byte ${link.chunkOffset}`);
   }
   if (state === null) throw new MalformedFile("an empty keyframe-delta chain");
   return state;
+}
+
+async function attachIndexedShBands(
+  data: Uint8Array,
+  entry: ChunkIndexEntry,
+  state: KeyframeDeltaState,
+  shDegree: number,
+  addedRows: number,
+  codecs: CodecRegistry,
+): Promise<void> {
+  const attached = new Set<number>();
+  for (const range of entry.bands) {
+    if (range.offset < 0 || range.length < 0 || range.offset + range.length > data.length) {
+      throw new MalformedFile(
+        `state chunk at byte ${entry.chunkOffset} indexes SH band ${range.band} at byte ` +
+          `${range.offset} for ${range.length} bytes, outside the ${data.length}-byte file`,
+      );
+    }
+    const record = readRecord(
+      new Cursor(data.subarray(range.offset, range.offset + range.length), 0, range.offset),
+    );
+    if (record.opcode !== Opcode.ShBandStream) {
+      throw new MalformedFile(
+        `state chunk at byte ${entry.chunkOffset} indexes SH band ${range.band} at byte ` +
+          `${range.offset}, which holds opcode ${record.opcode} rather than an SH Band Stream`,
+      );
+    }
+    if (record.raw.length !== range.length) {
+      throw new MalformedFile(
+        `state chunk at byte ${entry.chunkOffset} indexes SH band ${range.band} with length ` +
+          `${range.length}, its record occupies ${record.raw.length}`,
+      );
+    }
+    const decoded = await decodeShBand(record.content, codecs);
+    if (decoded.band !== range.band) {
+      throw new MalformedFile(
+        `state chunk at byte ${entry.chunkOffset} indexes SH band ${range.band}, the record ` +
+          `at byte ${range.offset} says band ${decoded.band}`,
+      );
+    }
+    attachShBand(
+      state,
+      shDegree,
+      decoded.band,
+      decoded.stream,
+      decoded.values,
+      addedRows,
+      `state chunk at byte ${entry.chunkOffset}`,
+      attached,
+    );
+  }
 }
 
 /** The half-open interval a state chunk is valid over; enough to check tiling. */
@@ -999,11 +1247,9 @@ export function chainFor(index: readonly ChunkIndexEntry[], t: number): ChunkInd
  * it a gaussian does not exist at that time (spec §3), which is how the `gaussian-birth`
  * path decides it too, so `count`, `ids` and every array exclude them.
  *
- * The arrays are `Float64Array` because this is also what the cross-SDK statement is
+ * The value arrays are `Float64Array` because this is also what the cross-SDK statement is
  * computed from, and that statement is diffed at six decimal places on sums over the whole
- * population — an accumulation in `float32` disagrees there. A renderer narrows to
- * `float32` when it packs a vertex buffer, which is a layout decision belonging to
- * whatever draws the splats (design §5).
+ * population — an accumulation in `float32` disagrees there.
  */
 export interface KeyframeDeltaGaussians {
   /** The instant this was reconstructed at, in seconds. */
@@ -1022,6 +1268,8 @@ export interface KeyframeDeltaGaussians {
   readonly rgb: Float64Array;
   /** `count` opacity in [0, 1], already folded with the temporal marginal at `t`. */
   readonly opacity: Float64Array;
+  /** Stored spherical-harmonic coefficients in component-major order, or `null` at degree 0. */
+  readonly sh: ShCoefficients | null;
   /**
    * `count` object ids (spec §6.6), or `null` when the composed state carries no
    * membership stream. `0` is background.
@@ -1056,6 +1304,9 @@ export function keyframeDeltaChunkAt(
   }
   for (const c of chunks) if (c.t0 <= t && t < c.t1) return c;
   const last = chunks[chunks.length - 1]!;
+  if (!Number.isFinite(t) || t < last.t1) {
+    throw new MalformedFile(`no state chunk covers t=${t}`);
+  }
   if (t >= last.t1 && last.t1 < sequence.header.durationSec) {
     throw new MalformedFile(
       `no decoded state chunk covers t=${t}: this timeline ends at ${last.t1}, short of the ` +
@@ -1089,6 +1340,17 @@ export function reconstructKeyframeDelta(
   const rotations = new Float64Array(n * 4);
   const rgb = new Float64Array(n * 3);
   const opacity = new Float64Array(n);
+  checkCompleteSh(state, sequence.header.shDegree, `state chunk at byte ${chunk.offset}`);
+  const composedSh =
+    sequence.header.shDegree === 0 ? null : mergeBands(n, bandsOf(state), sequence.header.shDegree);
+  if (composedSh !== null && composedSh.degree !== sequence.header.shDegree) {
+    throw new MalformedFile(
+      `state chunk at byte ${chunk.offset} reconstructs SH degree ${composedSh.degree}, the ` +
+        `Header declares ${sequence.header.shDegree}`,
+    );
+  }
+  const shStride = composedSh === null ? 0 : composedSh.coefficients * 3;
+  const shValues = new Uint8Array(n * shStride);
   const bins = binsOf(state);
   const objectIdColumn = bins.get(Attribute.ObjectId);
   if (objectIdColumn !== undefined && objectIdColumn.channels !== 1) {
@@ -1099,7 +1361,11 @@ export function reconstructKeyframeDelta(
   }
   const objectId = objectIdColumn === undefined ? null : new Uint32Array(n);
   if (n === 0) {
-    return { t, count: 0, ids, centers, scales, rotations, rgb, opacity, objectId };
+    const sh =
+      composedSh === null
+        ? null
+        : { ...composedSh, count: 0, values: shValues, bands: composedSh.bands };
+    return { t, count: 0, ids, centers, scales, rotations, rgb, opacity, sh, objectId };
   }
 
   // A composed state that has lost a required column is refused by name rather than read
@@ -1188,6 +1454,9 @@ export function reconstructKeyframeDelta(
     const alpha = clamp(opacityBins[i]! * steps.alpha, 0, 1);
     const marginal = sigma === Infinity ? 1 : Math.exp(-0.5 * (dt / sigma) * (dt / sigma));
     opacity[out] = alpha * marginal;
+    if (composedSh !== null) {
+      shValues.set(composedSh.values.subarray(i * shStride, (i + 1) * shStride), out * shStride);
+    }
     if (objectId !== null) objectId[out] = objectIdBins![i]!;
     out++;
   }
@@ -1203,6 +1472,16 @@ export function reconstructKeyframeDelta(
     rotations: rotations.subarray(0, out * 4),
     rgb: rgb.subarray(0, out * 3),
     opacity: opacity.subarray(0, out),
+    sh:
+      composedSh === null
+        ? null
+        : {
+            degree: composedSh.degree,
+            coefficients: composedSh.coefficients,
+            count: out,
+            values: shValues.subarray(0, out * shStride),
+            bands: composedSh.bands,
+          },
     objectId: objectId === null ? null : objectId.subarray(0, out),
   };
 }

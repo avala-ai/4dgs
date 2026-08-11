@@ -12,11 +12,11 @@ The four packages version together.
 
 - `reconstructKeyframeDelta` in `@4dgs/core`: the full population at an instant of a
   `keyframe-delta` sequence — gaussian ids, centres, scales, rotations, linear RGB, marginal-folded
-  opacity, and object membership where a chunk carries it — in ascending `gaussian_id` order (spec
-  §11.7). `keyframeDeltaChunkAt` answers the seek that precedes it: the chunk whose half-open
-  `[t0, t1)` contains `t`. Until now the package published only `keyframeDeltaStatesJson`, which
-  samples positions and scales for the cross-SDK statement, so the first renderer written against
-  this package had to reimplement §11.7 to get every attribute of every gaussian.
+  opacity, spherical harmonics, and object membership where a chunk carries it — in ascending
+  `gaussian_id` order (spec §11.7). `keyframeDeltaChunkAt` answers the seek that precedes it: the
+  chunk whose half-open `[t0, t1)` contains `t`. Until now the package published only
+  `keyframeDeltaStatesJson`, which samples positions and scales for the cross-SDK statement, so
+  consumers had to reimplement §11.7 to get every attribute of every gaussian.
 - `dequantizeRotation` accepts a `Float64Array` output as well as a `Float32Array`.
 - `ATTRIBUTE_CHANNELS`, the interleaving width the registry gives each attribute id it defines.
 - **Refusals say which rule was broken.** Every error in `@4dgs/core` now carries an optional
