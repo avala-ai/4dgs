@@ -1,4 +1,4 @@
-# SPEED.md — Throughput without quality debt
+# SHIP.md — Throughput without quality debt
 
 **Audience:** humans and coding agents shipping in this repository.
 
@@ -9,7 +9,7 @@ loops — without weakening [`AGENTS.md`](AGENTS.md) (cross-SDK principles),
 **Not a goal:** commit count, token spend, or “vibe” volume. Those are lagging noise.
 Optimize for **green PRs merged per week** and **time from idea → first green CI**.
 
-Companion to the Avala monorepo’s `SPEED.md` (same discipline, this repo’s lanes).
+Companion to the Avala monorepo’s `SHIP.md` (same discipline, this repo’s lanes).
 
 ---
 
@@ -26,7 +26,7 @@ Read this when you are about to open a multi-file change, spawn parallel agents,
 the PR is growing into a review-hostile blob. Skip it for one-line fixes.
 
 **Already load-bearing here:** AGENTS.md §9 — *one language per pull request, stacked*.
-SPEED does not replace that; it adds blast radius, worktrees, and commit rhythm around it.
+SHIP does not replace that; it adds blast radius, worktrees, and commit rhythm around it.
 
 ---
 

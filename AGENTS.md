@@ -3,7 +3,7 @@
 Rules every implementation in this repository follows, whatever the language. They exist so that
 four SDKs behave like one format rather than four interpretations of it.
 
-**Throughput (parallel agents / multi-language work):** read **[SPEED.md](SPEED.md)** — blast
+**Throughput (parallel agents / multi-language work):** read **[SHIP.md](SHIP.md)** — blast
 radius, one language lane per writer, **one `git worktree` per concurrent writer**, atomic
 commits. Complements §9 (one language per PR, stacked); does not replace it.
 
