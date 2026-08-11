@@ -191,6 +191,38 @@ Future<FourdgsWalk> walkFourdgsFraming(FourdgsReadable source) async {
   return out;
 }
 
+/// Replays every frame from [walk] without retaining another frame table.
+///
+/// Inspection keeps only [maxFramedRecords] objects for display, but validation
+/// must still examine specified records after that reporting cap. Framing is
+/// cheap to replay: one fixed-size range read per omitted record and no
+/// accumulation proportional to the file.
+Stream<FourdgsFrame> walkFourdgsFrames(
+  FourdgsReadable source,
+  FourdgsWalk walk,
+) async* {
+  int at = fourdgsMagic.length;
+  for (int number = 0; number < walk.recordCount; number++) {
+    final FourdgsFrame frame;
+    if (number < walk.records.length) {
+      frame = walk.records[number];
+    } else {
+      final Uint8List framing = await source.read(at, recordHeaderBytes);
+      final ByteData view = ByteData.sublistView(framing);
+      frame = FourdgsFrame(
+        opcode: framing[0],
+        offset: at,
+        length:
+            view.getUint32(5, Endian.little) * 0x100000000 +
+            view.getUint32(1, Endian.little),
+      );
+    }
+    yield frame;
+    if (frame.offset + frame.total > walk.size) break;
+    at = frame.offset + frame.total;
+  }
+}
+
 bool _sameBytes(Uint8List candidate) {
   if (candidate.length != fourdgsMagic.length) return false;
   for (int i = 0; i < candidate.length; i++) {

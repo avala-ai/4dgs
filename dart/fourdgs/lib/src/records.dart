@@ -214,6 +214,7 @@ class FourdgsQuantization {
     required this.stepSh,
     required this.bounds,
     this.shBitDepths = const <int>[],
+    this.shBitDepthsMalformed = false,
   });
 
   final String scheme;
@@ -240,6 +241,10 @@ class FourdgsQuantization {
   /// therefore also represents a record written before the append existed.
   final List<int> shBitDepths;
 
+  /// True when trailing bytes looked like an SH-depth append but were invalid.
+  /// Decoders keep the legacy empty-depth fallback; validators report it.
+  final bool shBitDepthsMalformed;
+
   /// Declared maximum deviation per attribute, as decimal strings.
   final Map<String, String> bounds;
 
@@ -258,7 +263,7 @@ class FourdgsQuantization {
     final steps = c.f64s(8);
     final stepSh = c.u8();
     final bounds = c.strMap();
-    final shBitDepths = _readShBitDepths(c);
+    final shDepths = _readShBitDepths(c);
     // `object_id` is an exact label (section 6.6), not a metric value, so there
     // is no meaningful error bound between two different labels — section 6.5
     // makes a bound for it a refusal rather than something to ignore.
@@ -296,7 +301,8 @@ class FourdgsQuantization {
       stepSigmaLog: steps[7],
       stepSh: stepSh,
       bounds: bounds,
-      shBitDepths: shBitDepths,
+      shBitDepths: shDepths.depths,
+      shBitDepthsMalformed: shDepths.malformed,
     );
   }
 }
@@ -307,20 +313,24 @@ class FourdgsQuantization {
 /// the registry's 3..8 range can therefore be bytes belonging to a later
 /// append, and is treated as absent rather than making an older reader reject a
 /// forward-compatible Quantization record.
-List<int> _readShBitDepths(FourdgsCursor c) {
-  if (c.remaining < 1) return const <int>[];
+({List<int> depths, bool malformed}) _readShBitDepths(FourdgsCursor c) {
+  if (c.remaining < 1) return (depths: const <int>[], malformed: false);
   final int at = c.pos;
   final int count = c.u8();
-  if (count == 0 || c.remaining < count) {
+  if (count == 0) {
     c.pos = at;
-    return const <int>[];
+    return (depths: const <int>[], malformed: false);
+  }
+  if (c.remaining < count) {
+    c.pos = at;
+    return (depths: const <int>[], malformed: true);
   }
   final List<int> depths = <int>[for (int i = 0; i < count; i++) c.u8()];
   if (depths.any((int depth) => depth < 3 || depth > 8)) {
     c.pos = at;
-    return const <int>[];
+    return (depths: const <int>[], malformed: true);
   }
-  return depths;
+  return (depths: depths, malformed: false);
 }
 
 /// Quantization schemes this build implements.
@@ -1238,6 +1248,15 @@ class FourdgsCamera {
       positions.add(c.f64s(3));
       targets.add(c.f64s(3));
     }
+    final interpolation = c.string();
+    final loopAt = fileOffset + c.pos;
+    final loop = c.u8();
+    if (loop > 1) {
+      throw FourdgsMalformedFile(
+        'the Camera record at byte $fileOffset carries loop value $loop at '
+        'byte $loopAt; expected 0 or 1',
+      );
+    }
     return FourdgsCamera(
       fovYDeg: fov,
       position: position,
@@ -1245,8 +1264,8 @@ class FourdgsCamera {
       times: times,
       positions: positions,
       targets: targets,
-      interpolation: c.string(),
-      loop: c.u8() != 0,
+      interpolation: interpolation,
+      loop: loop == 1,
     );
   }
 }

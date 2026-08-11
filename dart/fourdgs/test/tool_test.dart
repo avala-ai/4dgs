@@ -311,8 +311,8 @@ void main() {
         );
         expect(report.ok, isFalse);
         expect(
-          _messages(report, FourdgsSeverity.error).single,
-          startsWith('the ShBandStream record for band 1 at byte'),
+          _messages(report, FourdgsSeverity.error),
+          contains(startsWith('the ShBandStream record for band 1 at byte')),
         );
       },
     );
@@ -380,7 +380,7 @@ void main() {
       // biggest record in the file, which is what "one chunk resident at a time"
       // means when it is true.
       final File file = File(
-        '$_corpus/MixedLifetimes-SHDegree2-UseChunkIndex-UseCrc.4dgs',
+        '$_corpus/TenWindows-UseChunkIndex-UseChunks-UseCrc-UseStatistics-UseSummaryOffset.4dgs',
       );
       if (!file.existsSync()) {
         fail(
@@ -477,6 +477,29 @@ void main() {
       );
     });
 
+    test('Camera loop is encoded as exactly zero or one', () async {
+      final Uint8List camera =
+          (BytesBuilder()
+                ..add(_f64(45.0))
+                ..add(_f64(0.0))
+                ..add(_f64(0.0))
+                ..add(_f64(0.0))
+                ..add(_f64(0.0))
+                ..add(_f64(0.0))
+                ..add(_f64(1.0))
+                ..add(_u32(0))
+                ..add(_string('linear'))
+                ..addByte(2))
+              .toBytes();
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(_minimal(extra: _record(opCamera, camera))),
+      );
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(allOf(contains('Camera record'), contains('expected 0 or 1'))),
+      );
+    });
+
     test('post-chunk Metadata records are parsed, not only framed', () async {
       final FourdgsValidation report = await validateFourdgs(
         FourdgsBytes(
@@ -513,6 +536,26 @@ void main() {
       expect(
         _messages(report, FourdgsSeverity.error),
         contains(contains('summary_start 0 (no index)')),
+      );
+    });
+
+    test('the Footer points at the first Summary Offset record', () async {
+      final Uint8List summaryOffset = _record(
+        opSummaryOffset,
+        (BytesBuilder()
+              ..addByte(opChunkIndex)
+              ..add(_u64(0))
+              ..add(_u64(0)))
+            .toBytes(),
+      );
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(
+          _minimal(extra: summaryOffset, summaryOffsetStart: 123456),
+        ),
+      );
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(contains('first Summary Offset')),
       );
     });
 
@@ -646,6 +689,87 @@ void main() {
       expect(
         _messages(report, FourdgsSeverity.error),
         contains(contains('declares 1 SH bit depths')),
+      );
+    });
+
+    test('a malformed SH-depth append remains visible to validation', () async {
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(_minimal(shDegree: 1, shBitDepths: const <int>[9])),
+      );
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(contains('malformed SH bit-depth declaration')),
+      );
+    });
+
+    test('reserved Header flag bits must be clear', () async {
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(_minimal(headerFlags: 0x04)),
+      );
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(contains('reserved bits 0x4')),
+      );
+    });
+
+    test('gaussian-birth Chunks cannot carry gaussian_id', () async {
+      final Uint8List streams = _keyframeStreams(windowIndex: 0);
+      final Uint8List chunk = _stateChunk(streams, 1);
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(_minimal(extra: chunk, gaussianCount: 1)),
+      );
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(contains('gaussian_id stream')),
+      );
+    });
+
+    test(
+      'the objects profile requires object_id in a non-empty Chunk',
+      () async {
+        final Uint8List objectTable = _record(
+          opObjectTable,
+          Uint8List.fromList(<int>[..._u32(0), ..._u16(0)]),
+        );
+        final Uint8List streams = _keyframeStreams(
+          windowIndex: 0,
+          includeGaussianId: false,
+        );
+        final FourdgsValidation report = await validateFourdgs(
+          FourdgsBytes(
+            _minimal(
+              profile: 'objects',
+              gaussianCount: 1,
+              extra:
+                  (BytesBuilder()
+                        ..add(objectTable)
+                        ..add(_stateChunk(streams, 1)))
+                      .toBytes(),
+            ),
+          ),
+        );
+        expect(
+          _messages(report, FourdgsSeverity.error),
+          contains(contains('objects profile requires object_id')),
+        );
+      },
+    );
+
+    test('specified records beyond the inspection cap are validated', () async {
+      final BytesBuilder extra = BytesBuilder();
+      final Uint8List private = _record(0x80, Uint8List(0));
+      // Header, Quantization, and Window Table consume the first three retained
+      // frame slots. Put the malformed Camera immediately after the table cap.
+      for (int i = 3; i < maxFramedRecords; i++) {
+        extra.add(private);
+      }
+      extra.add(_record(opCamera, Uint8List(3)));
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(_minimal(extra: extra.toBytes())),
+      );
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(startsWith('the Camera record at byte')),
       );
     });
 
@@ -1369,13 +1493,17 @@ Object _caught(void Function() body) {
 /// The smallest thing that is meant to validate: header, grids, windows, footer.
 Uint8List _minimal({
   String temporalModel = 'gaussian-birth',
+  String profile = '',
   String scheme = 'uniform-v1',
   Uint8List? extra,
   Uint8List? secondHeader,
   int summaryStart = 0,
   int summaryCrc = 0,
+  int summaryOffsetStart = 0,
   int footerContentBytes = 20,
   int shDegree = 0,
+  int headerFlags = 0,
+  int gaussianCount = 0,
   List<int> shBitDepths = const <int>[],
 }) {
   final BytesBuilder out =
@@ -1384,7 +1512,13 @@ Uint8List _minimal({
         ..add(
           _record(
             opHeader,
-            _headerContent(temporalModel: temporalModel, shDegree: shDegree),
+            _headerContent(
+              temporalModel: temporalModel,
+              profile: profile,
+              shDegree: shDegree,
+              flags: headerFlags,
+              gaussianCount: gaussianCount,
+            ),
           ),
         );
   if (secondHeader != null) out.add(_record(opHeader, secondHeader));
@@ -1400,7 +1534,7 @@ Uint8List _minimal({
   final BytesBuilder footer =
       BytesBuilder()
         ..add(_u64(summaryStart))
-        ..add(_u64(0))
+        ..add(_u64(summaryOffsetStart))
         ..add(_u32(summaryCrc));
   out
     ..add(
@@ -2127,6 +2261,7 @@ Uint8List _keyframeStreams({
   required int windowIndex,
   int positionChannels = 3,
   int muTBin = 0,
+  bool includeGaussianId = true,
 }) {
   const Map<int, int> channels = <int, int>{
     attrPosition: 3,
@@ -2156,9 +2291,23 @@ Uint8List _keyframeStreams({
       ),
     );
   }
-  out.add(_constStream(attrGaussianId, 1, 1, 0));
+  if (includeGaussianId) out.add(_constStream(attrGaussianId, 1, 1, 0));
   return out.toBytes();
 }
+
+Uint8List _stateChunk(Uint8List streams, int count) => _record(
+  opChunk,
+  (BytesBuilder()
+        ..add(_f64(0.0))
+        ..add(_f64(1.0))
+        ..add(_u32(0))
+        ..add(_u32(count))
+        ..add(_string(''))
+        ..add(_u64(streams.length))
+        ..add(_u64(streams.length))
+        ..add(streams))
+      .toBytes(),
+);
 
 /// A resource that remembers what was asked of it.
 ///
@@ -2222,13 +2371,15 @@ Uint8List _record(int opcode, Uint8List content) {
 
 Uint8List _headerContent({
   String temporalModel = 'gaussian-birth',
+  String profile = '',
   int shDegree = 0,
+  int flags = 0,
   double durationSec = 1.0,
   int gaussianCount = 0,
 }) {
   final BytesBuilder body =
       BytesBuilder()
-        ..add(_string('')) // profile
+        ..add(_string(profile))
         ..add(_string('')) // library
         ..add(_f64(durationSec)) // duration_sec
         ..add(_u64(gaussianCount))
@@ -2239,7 +2390,7 @@ Uint8List _headerContent({
   }
   body
     ..addByte(shDegree) // sh_degree
-    ..addByte(0) // flags
+    ..addByte(flags)
     ..add(_u32(0)); // empty attribute map
   return body.toBytes();
 }

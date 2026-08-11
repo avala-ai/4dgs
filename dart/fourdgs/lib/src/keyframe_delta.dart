@@ -92,6 +92,12 @@ class KeyframeDeltaState {
 
   int get count => ids.length;
 
+  /// Whether this composed population carries [attribute].
+  ///
+  /// Validators use this to enforce profile promises without exposing the
+  /// private bin storage or reconstructing the population to floating point.
+  bool hasAttribute(int attribute) => _bins.containsKey(attribute);
+
   /// Every `window_index` this state names, against the file's Window Table.
   ///
   /// Composition is arithmetic on bins and never looks a window up, so a state
@@ -708,6 +714,21 @@ KeyframeDeltaState _composeDelta(
   checkCount('update', updates.ids.length, body.header.updateCount);
   checkCount('birth', births.ids.length, body.header.birthCount);
   checkCount('death', deaths.ids.length, body.header.deathCount);
+  final hasRotationIndex = updates.bins.containsKey(attrRotationIndex);
+  final hasRotationBins = updates.bins.containsKey(attrRotation);
+  if (hasRotationIndex != hasRotationBins) {
+    throw FourdgsMalformedFile(
+      '$what must restate rotation_index and rotation together in an update; '
+      'one is present and the other is absent',
+    );
+  }
+  if (deaths.bins.isNotEmpty) {
+    final attributes = deaths.bins.keys.toList()..sort();
+    throw FourdgsMalformedFile(
+      '$what death group carries non-identity attributes $attributes; a death '
+      'group contains exactly one gaussian_id stream',
+    );
+  }
   return _applyDelta(
     reference,
     updateIds: updates.ids,
