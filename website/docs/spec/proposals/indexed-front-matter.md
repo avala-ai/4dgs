@@ -311,11 +311,10 @@ One variant, in `data/invalid/`, because after this proposal the file is not a l
 - **Why an invalid variant and not a valid one:** a valid variant can only assert that the two paths
   agree, and under this proposal they agree because the file cannot exist. The thing worth pinning
   is the refusal — without it, an implementation that keeps today's silent behaviour passes.
-- **Second variant, optional:** `LateProvenanceIndexed`, the same bytes asserted against the indexed
-  runner, expecting a **skip** rather than a refusal. It pins the asymmetry deliberately, so that a
-  later implementer who "fixes" the indexed reader by scanning the whole file fails a test that says
-  why. Whether the harness should encode "this runner is allowed to accept what that runner refuses"
-  is a question for whoever writes it; the rule stands either way.
+- **No indexed verdict is asserted.** An indexed reader MAY stop at the first Chunk, so it may never
+  observe the late record; an implementation that scans farther may instead issue the specified
+  refusal. Both behaviours conform. The suite therefore pins the streamed refusal only rather than
+  turning the indexed reader's permission to stop early into a requirement to skip the record.
 
 Neither variant regenerates anything. The corpus gains files; nothing existing moves.
 
