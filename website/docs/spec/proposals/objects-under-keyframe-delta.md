@@ -377,32 +377,38 @@ the name so the current harness selects both streamed and indexed runners; this 
 proved if only the front-to-back path sees the object records and membership lanes. One variant
 carries every corner the rules above decide.
 
-- **Shape:** at least seven state chunks in two groups of pictures, with a chained delta in each, an
-  Object Table naming two objects, and distinguishable Object Tracks for ids `7` and `12`, both with
-  samples that put a non-identity pose at every probe. Both keyframes deliberately omit `object_id`,
-  so each group begins with implicit zero ids. In the first group, a delta's **birth group alone**
-  introduces the stream with object id `7`; no survivor update in that delta carries `object_id`. In
-  the second group, a later delta assigns one implicit-zero survivor to id `7`, a position-only
+- **Shape:** at least eight state chunks in two groups of pictures, with a chained delta in each, an
+  Object Table naming two objects, and distinguishable Object Tracks for ids `7` and `0x8000000C`
+  (`2147483660`), both with samples that put a non-identity pose at every probe. The first keyframe
+  physically carries attribute `14`, with a mix of background and id `7`, so the keyframe decoder,
+  canonical membership and id `7` track are exercised before any delta. The second keyframe
+  deliberately omits `object_id`, so that group begins with implicit zero ids. Its first delta's
+  **birth group alone** introduces id `7` on a new gaussian; no survivor update in that delta
+  carries `object_id`. A later delta assigns one implicit-zero survivor to id `7`, a position-only
   delta updates it without an `object_id` lane, and the next delta relabels it to the separately
-  tracked id `12`. A final complete source sample omits its `object_id` column after that non-zero
-  state, requiring the writer to emit an absolute zero restatement; that delta also births a
-  gaussian with the lane omitted, which must receive zero. At least one gaussian carries
-  per-gaussian `motion` so that `R * (position + motion * dt) + T` is distinguishable from
+  tracked high-bit id `0x8000000C`. A final complete source sample omits its `object_id` column
+  after that non-zero state, requiring the writer to emit an absolute zero restatement; that delta
+  also births a gaussian with the lane omitted, which must receive zero. At least one gaussian
+  carries per-gaussian `motion` so that `R * (position + motion * dt) + T` is distinguishable from
   `R * position + T`.
-- **The first birth introduces `object_id`.** Its absolute birth row is appended to a materialized
-  zero column for all survivors. This is the inverse transition to an omitted birth after the column
-  exists, and catches a generic composer that appends an attribute array containing only the birth
-  rows.
-- **The deltas exercise introduction and true absolute replacement independently.** The first
+- **The second group's first birth introduces `object_id`.** Its absolute birth row is appended to a
+  materialized zero column for all survivors. This is the inverse transition to an omitted birth
+  after the column exists, and catches a generic composer that appends an attribute array containing
+  only the birth rows.
+- **The deltas exercise introduction and true absolute replacement independently.** The second
   group's birth-only introduction catches a composer that creates an attribute array containing only
-  birth rows. In the second group, moving a keyframe survivor from implicit zero to `7` proves that
-  an omitted reference column is materialized instead of refused. Relabelling that survivor from
-  non-zero id `7` to non-zero id `12` proves absolute replacement: the erroneous additive path
-  produces `19`, whereas a zero-to-`12` transition would produce `12` under either algorithm. The
-  survivor is therefore moved first by id `7` in an intermediate reconstructed state and by id `12`
-  in the later one. A decoder that composes tracks after each delta carries id `7`'s distinguishable
-  transform into the next delta and then applies id `12` as well, while the required post-chain
-  composition applies only id `12` to the final reconstructed base state.
+  birth rows. Moving a keyframe survivor from implicit zero to `7` then proves that an omitted
+  reference column is materialized instead of refused. Relabelling that survivor from non-zero id
+  `7` to non-zero id `0x8000000C` proves absolute replacement and the same-bits signed stream bridge
+  together: the wire symbol is negative, but canonical membership is the unsigned decimal
+  `2147483660`. The erroneous additive path produces a different high-bit id, while a decoder that
+  forgets the `i32`-to-`u32` bridge produces a negative label that matches no track. The survivor is
+  therefore moved first by id `7` in an intermediate reconstructed state and by id `2147483660` in
+  the later one. The shared expectation MUST contain both ids in `states[*].sample.objectIds` at
+  their respective probes and distinguish the two track transforms. A decoder that composes tracks
+  after each delta carries id `7`'s transform into the next delta and then applies the high-bit
+  track as well, while the required post-chain composition applies only the high-bit track to the
+  final reconstructed base state.
 - **Omitted update lanes carry forward.** Add a position-only update for a gaussian already on id
   `7`; its canonical `objectIds` value remains `7` and its track still applies. This distinguishes
   update omission from the implicit zero assigned by an omitted complete-keyframe or birth lane.

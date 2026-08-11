@@ -167,14 +167,15 @@ port.
 
 **(2b) Sum exact canonical integer units.** First apply the canonical form's existing
 `FLOAT_DECIMALS` rounding to each addend, convert the result to a signed integer count of
-`10^-FLOAT_DECIMALS` units, and add those integers exactly. Convert the final integer back only when
-serializing the aggregate. The sum then depends only on the multiset of values the canonical form
-actually emits, not on row order or a language's floating-point addition.
+`10^-FLOAT_DECIMALS` units in an **arbitrary-precision signed integer**, and add those integers
+exactly. Convert the final integer back only when serializing the aggregate. The sum then depends
+only on the multiset of values the canonical form actually emits, not on row order or a language's
+floating-point addition.
 
-- Cost: one rounding and integer conversion per addend, with an accumulator wide enough for the
-  corpus limit. Each port must use the same already-shared canonical rounding rule and reject an
-  aggregate whose declared population could overflow its accumulator. This is `O(n)` and needs no
-  sort.
+- Cost: one rounding and integer conversion per addend. Each port must use the same already-shared
+  canonical rounding rule and an arbitrary-precision integer representation for both the scaled
+  addend and every partial sum. A declared population is not an overflow proof: one finite decoded
+  value may already exceed a fixed-width scaled range. This is `O(n)` and needs no sort.
 - This is the only option here that discharges both parts of the promise. Sorting raw floats is not
   sufficient: equivalent cross-language computations may differ in their last bits, which can change
   both the sorted order of close addends and a non-associative result.
@@ -194,6 +195,8 @@ their last bits. Only Python has it in the standard library, too. Rejected on po
 - **(2b)** because summing exact canonical units makes the aggregate a function of the emitted
   multiset and gives all six languages the same arithmetic. The adversarial tied-row pair in §6
   makes the rule observable, so it does not ship as an untested convention.
+- The same exact-unit helper is used for the root `aggregate` and every `states[*].aggregate`;
+  repairing only the latter would leave the module-level order-independence promise false.
 
 ### What regeneration costs, and what was measured
 
@@ -240,8 +243,9 @@ same fix regenerate its new expectation.
 > **Nothing here may depend on decoded order.** Gaussians may be reordered freely by an encoder and
 > readers must not rely on their order, so a summary that did would be asking two correct decoders
 > to disagree. Per-gaussian rows and the spherical harmonic digest use the content order defined by
-> `_stable_order`; aggregates sum exact integer units after the same canonical rounding used for
-> emitted values, so their result is a function of the multiset rather than an iteration order.
+> `_stable_order`; the root aggregate and every per-state aggregate sum exact arbitrary-precision
+> integer units after the same canonical rounding used for emitted values, so their result is a
+> function of the multiset rather than an iteration order.
 >
 > That order rounds to `FLOAT_DECIMALS` before comparing, which is deliberate — two implementations
 > can compute a decoded value to different last bits, and an order keyed on exact values would
@@ -253,13 +257,15 @@ same fix regenerate its new expectation.
 > by the rounded values it emits**, and a tie that survives both ties on every number that block
 > prints.
 
-### 5.2 `canonical.py`, as a comment on the `states` aggregate
+### 5.2 `canonical.py`, as a comment on the root and `states` aggregates
 
 > Each addend is rounded by the canonical `num` rule and converted to an integer count of
-> `10^-FLOAT_DECIMALS` units before summation. The integer sum is exact and therefore depends only
-> on the multiset, never resident or decoded order. Sorting and then adding raw floats would still
-> be non-portable: equivalent computations in different languages may differ in their last bits and
-> therefore sort or sum differently.
+> `10^-FLOAT_DECIMALS` units before summation. Both the scaled addend and accumulator are
+> arbitrary-precision signed integers: a population limit alone cannot make a fixed-width addend
+> safe. The integer sum is exact and therefore depends only on the multiset, never resident or
+> decoded order. Sorting and then adding raw floats would still be non-portable: equivalent
+> computations in different languages may differ in their last bits and therefore sort or sum
+> differently.
 
 ### 5.3 `tests/conformance/README.md`, replacing the "nothing depends on decoded order" bullet
 
@@ -269,9 +275,9 @@ same fix regenerate its new expectation.
 >   on it and still hold different exact values — harmless wherever the emitted values are the keyed
 >   fields, and not harmless in `states`, whose rows are composed at a probe time from inputs the
 >   key sees only rounded. The `states` block therefore orders by the content key and then by the
->   rounded values it emits. Its aggregates round each addend to canonical integer units and sum
->   those units exactly, making them independent of both storage order and floating-point addition
->   order.
+>   rounded values it emits. The root aggregate and every state aggregate round each addend to
+>   canonical arbitrary-precision integer units and sum those units exactly, making them independent
+>   of both storage order and floating-point addition order.
 
 ### 5.4 Nothing in `website/docs/spec/index.md`
 
@@ -326,23 +332,26 @@ encodings.
   unrounded composed centres differ. The second encoding reverses the surviving tied run's physical
   order and changes no decoded value. Their generator preconditions are explicit: secondary
   emitted-row keys compare equal, resident-order addition in the two encodings lands on opposite
-  sides of a six-decimal boundary, and sorting the addends produces one identical total for both.
-  The pair shares one expectation, so an implementation that preserves stable resident order cannot
-  pass merely because it is deterministic for either input alone. This is the first pair that
-  actually reaches (2a)'s residual and therefore the trigger for implementing (2b);
-  `ObjectTiedGaussians` cannot serve that role because its emitted centres differ. It belongs in the
-  follow-up stack that adopts (2b), not in the initial (1a)/(2a) stack whose limitation it is
-  designed to expose.
+  sides of a six-decimal boundary, and sorting then adding the raw floats produces a rounded total
+  that **differs** from the exact sum of the individually rounded integer-unit addends. The pair
+  shares one integer-unit expectation for both root `aggregate.positionSum` and every applicable
+  `states[*].aggregate.positionSum`, so neither stable resident order nor the explicitly rejected
+  raw-float sort can pass. This is the first pair that actually reaches (2a)'s residual and
+  therefore the trigger for implementing (2b); `ObjectTiedGaussians` cannot serve that role because
+  its emitted centres differ. It belongs in the follow-up stack that adopts (2b), not in the initial
+  (1a)/(2a) stack whose limitation it is designed to expose.
 
 - **`ObjectResidualTieOpacity` and `ObjectResidualTieOpacityReordered`** — the opacity counterpart
   to the preceding pair. The rows tie on the six-decimal opacity component of the primary key and on
   the complete rounded emitted-state secondary key, but carry distinct unrounded decoded opacities.
   The second encoding reverses only that surviving tied run. The generator must prove that
   resident-order addition crosses a six-decimal `opacitySum` boundary between the two files, while
-  sorting the exact opacity addends produces one identical total. The pair shares one expectation.
-  `ObjectOpacityOrder` proves that (2a) must use content order, but cannot catch a port that applies
-  (2b)'s exact-addend sort to centres alone; this pair makes both aggregates part of the deferred
-  (2b) contract.
+  sorting then adding the raw opacity floats produces a rounded total that **differs** from the
+  exact sum of individually rounded integer-unit addends. The pair shares that integer-unit
+  expectation for both root `aggregate.opacitySum` and every applicable
+  `states[*].aggregate.opacitySum`. `ObjectOpacityOrder` proves that (2a) must use content order,
+  but cannot catch a port that applies (2b)'s exact-unit rule to centres alone; this pair makes both
+  aggregates and both summary levels part of the deferred (2b) contract.
 
 All five belong beside the existing `object/` variants. None needs a spec change, a new opcode or a
 new writer capability — they are ordinary scenes with adversarially chosen numbers. The generator's
