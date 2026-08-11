@@ -23,9 +23,12 @@ import {
   KeyframeDeltaIndexedDecoder,
   MAX_KEYFRAME_DELTA_SUMMARY_BYTES,
   MalformedFile,
+  Opcode,
+  RECORD_HEADER_BYTES,
   chainFor,
   decodeKeyframeDeltaIndexed,
   decodeKeyframeDeltaStreamed,
+  iterateRecords,
   keyframeDeltaChunkAt,
   keyframeDeltaStatesJson,
   reconstructKeyframeDelta,
@@ -45,6 +48,16 @@ import {
 
 function bytes(b64: string): Uint8Array {
   return new Uint8Array(Buffer.from(b64, "base64"));
+}
+
+function disableSummaryCrc(data: Uint8Array): void {
+  const footer = [...iterateRecords(data, 8)].find((record) => record.opcode === Opcode.Footer)!;
+  assert.ok(footer, "fixture has a Footer");
+  new DataView(data.buffer, data.byteOffset, data.byteLength).setUint32(
+    footer.offset + RECORD_HEADER_BYTES + 16,
+    0,
+    true,
+  );
 }
 
 async function statesStreamed(b64: string): Promise<Record<string, unknown>> {
@@ -184,8 +197,12 @@ test("the range-backed indexed decoder reads only the requested chain", async ()
   const chain = chainFor(decoder.index, t);
   const allowed = new Set<string>();
   for (const entry of chain) {
+    allowed.add(`${entry.chunkOffset}:${RECORD_HEADER_BYTES}`);
     allowed.add(`${entry.chunkOffset}:${entry.chunkLength}`);
-    for (const band of entry.bands) allowed.add(`${band.offset}:${band.length}`);
+    for (const band of entry.bands) {
+      allowed.add(`${band.offset}:${RECORD_HEADER_BYTES}`);
+      allowed.add(`${band.offset}:${band.length}`);
+    }
   }
 
   const ranged = await decoder.reconstructAt(t);
@@ -241,6 +258,100 @@ test("keyframe-delta readers refuse an unknown quantization scheme before recons
   );
   await assert.rejects(() => decodeKeyframeDeltaStreamed(data), /uniform-v9/);
   await assert.rejects(() => decodeKeyframeDeltaIndexed(data), /uniform-v9/);
+});
+
+test("keyframe-delta index band counts are bounded before range retention", async () => {
+  const data = bytes(MOVING_CHAINED);
+  const indexRecord = [...iterateRecords(data, 8)].find(
+    (record) => record.opcode === Opcode.ChunkIndex,
+  )!;
+  assert.ok(indexRecord, "fixture has a Chunk Index");
+  new DataView(data.buffer, data.byteOffset, data.byteLength).setUint32(
+    indexRecord.offset + RECORD_HEADER_BYTES + 36,
+    0xffffffff,
+    true,
+  );
+  disableSummaryCrc(data);
+
+  await assert.rejects(
+    () => KeyframeDeltaIndexedDecoder.open(new BytesReadable(data), { headProbeBytes: 64 }),
+    /declares 4294967295 SH band ranges/,
+  );
+  await assert.rejects(
+    () => decodeKeyframeDeltaIndexed(data),
+    /declares 4294967295 SH band ranges/,
+  );
+});
+
+test("every keyframe-delta index entry carries its extension", async () => {
+  let data = bytes(MOVING_CHAINED);
+  const indexRecord = [...iterateRecords(data, 8)].find(
+    (record) => record.opcode === Opcode.ChunkIndex,
+  )!;
+  assert.ok(indexRecord, "fixture has a Chunk Index");
+  disableSummaryCrc(data);
+  const contentLength = Number(
+    new DataView(data.buffer, data.byteOffset, data.byteLength).getBigUint64(
+      indexRecord.offset + 1,
+      true,
+    ),
+  );
+  const extensionAt = indexRecord.offset + RECORD_HEADER_BYTES + contentLength - 28;
+  const shortened = new Uint8Array(data.byteLength - 28);
+  shortened.set(data.subarray(0, extensionAt));
+  shortened.set(data.subarray(extensionAt + 28), extensionAt);
+  data = shortened;
+  new DataView(data.buffer, data.byteOffset, data.byteLength).setBigUint64(
+    indexRecord.offset + 1,
+    BigInt(contentLength - 28),
+    true,
+  );
+
+  await assert.rejects(
+    () => KeyframeDeltaIndexedDecoder.open(new BytesReadable(data), { headProbeBytes: 64 }),
+    /required keyframe-delta extension/,
+  );
+  await assert.rejects(() => decodeKeyframeDeltaIndexed(data), /required keyframe-delta extension/);
+});
+
+test("range-backed seeks probe record framing before fetching an indexed length", async () => {
+  const data = bytes(MOVING_CHAINED);
+  const indexRecord = [...iterateRecords(data, 8)].find(
+    (record) => record.opcode === Opcode.ChunkIndex,
+  )!;
+  assert.ok(indexRecord, "fixture has a Chunk Index");
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const lengthAt = indexRecord.offset + RECORD_HEADER_BYTES + 24;
+  const originalLength = Number(view.getBigUint64(lengthAt, true));
+  const falseLength = originalLength + 100;
+  view.setBigUint64(lengthAt, BigInt(falseLength), true);
+  disableSummaryCrc(data);
+
+  const source = new (class extends BytesReadable {
+    readonly ranges: { offset: number; length: number }[] = [];
+
+    override read(offset: bigint, length: bigint): Promise<Uint8Array> {
+      this.ranges.push({ offset: Number(offset), length: Number(length) });
+      return super.read(offset, length);
+    }
+  })(data);
+  const decoder = await KeyframeDeltaIndexedDecoder.open(source, { headProbeBytes: 64 });
+  source.ranges.length = 0;
+  const entry = decoder.index[0]!;
+  await assert.rejects(
+    () => decoder.reconstructAt((entry.t0 + entry.t1) / 2),
+    /record there frames/,
+  );
+  assert.ok(
+    source.ranges.some(
+      ({ offset, length }) => offset === entry.chunkOffset && length === RECORD_HEADER_BYTES,
+    ),
+  );
+  assert.ok(
+    !source.ranges.some(
+      ({ offset, length }) => offset === entry.chunkOffset && length === falseLength,
+    ),
+  );
 });
 
 // The streamed and indexed sequences expose the same header, a small sanity tie.

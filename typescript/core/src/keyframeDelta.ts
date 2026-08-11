@@ -1000,6 +1000,9 @@ export interface OpenKeyframeDeltaIndexedOptions {
 
 const KEYFRAME_DELTA_HEAD_PROBE_BYTES = 64 * 1024;
 const MAX_KEYFRAME_DELTA_RECORD_BYTES = 64 * 1024 * 1024;
+const CHUNK_INDEX_FIXED_BYTES = 40;
+const CHUNK_INDEX_BAND_BYTES = 17;
+const KEYFRAME_DELTA_INDEX_EXTENSION_BYTES = 28;
 
 /** Maximum retained keyframe-delta summary and Chunk Index sizes for one open. */
 export const MAX_KEYFRAME_DELTA_SUMMARY_BYTES = 64 * 1024 * 1024;
@@ -1017,6 +1020,62 @@ function appendKeyframeDeltaIndexEntry(
     );
   }
   index.push(entry);
+}
+
+/**
+ * Price a keyframe-delta index entry before `parseChunkIndexEntry` retains its band ranges.
+ *
+ * `band_count` is nested inside one otherwise bounded summary record. Checking only the outer
+ * entry count still lets a compact constant-mode payload induce millions of JavaScript objects,
+ * so the Header's degree and the record's own length are the allocation bounds here.
+ */
+function checkKeyframeDeltaIndexShape(
+  prefix: Uint8Array,
+  contentLength: number,
+  shDegree: number,
+  recordOffset: number,
+): void {
+  if (prefix.byteLength < CHUNK_INDEX_FIXED_BYTES) {
+    throw new MalformedFile(
+      `Chunk Index record at byte ${recordOffset} carries ${contentLength} content bytes; ` +
+        `keyframe-delta requires at least ${CHUNK_INDEX_FIXED_BYTES + KEYFRAME_DELTA_INDEX_EXTENSION_BYTES}`,
+    );
+  }
+  const bandCount = new DataView(prefix.buffer, prefix.byteOffset, prefix.byteLength).getUint32(
+    36,
+    true,
+  );
+  if (bandCount > shDegree) {
+    throw new MalformedFile(
+      `Chunk Index record at byte ${recordOffset} declares ${bandCount} SH band ranges, ` +
+        `the Header's degree permits at most ${shDegree}`,
+    );
+  }
+  const required =
+    CHUNK_INDEX_FIXED_BYTES +
+    bandCount * CHUNK_INDEX_BAND_BYTES +
+    KEYFRAME_DELTA_INDEX_EXTENSION_BYTES;
+  if (contentLength < required) {
+    throw new MalformedFile(
+      `Chunk Index record at byte ${recordOffset} carries ${contentLength} content bytes; ` +
+        `${bandCount} band ranges plus the required keyframe-delta extension need ${required}`,
+    );
+  }
+}
+
+function parseKeyframeDeltaIndexEntry(
+  content: Uint8Array,
+  shDegree: number,
+  recordOffset: number,
+): ChunkIndexEntry {
+  checkKeyframeDeltaIndexShape(content, content.byteLength, shDegree, recordOffset);
+  const entry = parseChunkIndexEntry(content);
+  if (!entry.extended) {
+    throw new MalformedFile(
+      `Chunk Index record at byte ${recordOffset} omits the required keyframe-delta extension`,
+    );
+  }
+  return entry;
 }
 
 function checkFetchedFrontMatterSize(record: FrontMatterRecord): void {
@@ -1160,9 +1219,15 @@ export class KeyframeDeltaIndexedDecoder {
             `past the ${MAX_KEYFRAME_DELTA_RECORD_BYTES}-byte per-record reader limit`,
         );
       }
+      checkKeyframeDeltaIndexShape(
+        await summary.content(record, CHUNK_INDEX_FIXED_BYTES),
+        record.contentLength,
+        header.shDegree,
+        record.offset,
+      );
       appendKeyframeDeltaIndexEntry(
         index,
-        parseChunkIndexEntry(await summary.content(record)),
+        parseKeyframeDeltaIndexEntry(await summary.content(record), header.shDegree, record.offset),
         record.offset,
       );
     }
@@ -1193,16 +1258,7 @@ export class KeyframeDeltaIndexedDecoder {
       let pending = cached.get(key);
       if (pending === undefined) {
         pending = (async () => {
-          if (offset < 0 || length < RECORD_HEADER_BYTES || offset + length > this.size) {
-            throw new MalformedFile(
-              `indexed range [${offset}, ${offset + length}) is outside the ${this.size}-byte file`,
-            );
-          }
-          return indexedRecordFromBytes(
-            await readExact(this.source, offset, length),
-            offset,
-            length,
-          );
+          return readRangeBackedIndexedRecord(this.source, this.size, offset, length);
         })();
         cached.set(key, pending);
       }
@@ -1293,7 +1349,11 @@ export async function decodeKeyframeDeltaIndexed(
   const index: ChunkIndexEntry[] = [];
   for (const record of iterateRecords(data, summaryStart)) {
     if (record.opcode === Opcode.ChunkIndex) {
-      appendKeyframeDeltaIndexEntry(index, parseChunkIndexEntry(record.content), record.offset);
+      appendKeyframeDeltaIndexEntry(
+        index,
+        parseKeyframeDeltaIndexEntry(record.content, header.shDegree, record.offset),
+        record.offset,
+      );
     } else break;
   }
   // The indexed path has read the Footer, so it is a complete file: require full timeline
@@ -1365,6 +1425,45 @@ function indexedRecordFromBytes(
     );
   }
   return { opcode: record.opcode, content: record.content };
+}
+
+/** Probe an indexed record's nine-byte frame before requesting its declared range. */
+async function readRangeBackedIndexedRecord(
+  source: IReadable,
+  size: number,
+  offset: number,
+  length: number,
+): Promise<IndexedRecord> {
+  const end = offset + length;
+  if (
+    !Number.isSafeInteger(offset) ||
+    !Number.isSafeInteger(length) ||
+    offset < 0 ||
+    length < RECORD_HEADER_BYTES ||
+    !Number.isSafeInteger(end) ||
+    end > size
+  ) {
+    throw new MalformedFile(`indexed range [${offset}, ${end}) is outside the ${size}-byte file`);
+  }
+  const framing = await readExact(source, offset, RECORD_HEADER_BYTES);
+  const cursor = new Cursor(framing, 0, offset);
+  const opcode = cursor.u8();
+  const contentLength = cursor.u64();
+  const framedLength = RECORD_HEADER_BYTES + contentLength;
+  if (framedLength !== length) {
+    throw new MalformedFile(
+      `indexed range at byte ${offset} declares ${length} bytes, but the ` +
+        `${opcode === Opcode.ShBandStream ? "SH Band Stream" : "state"} record there frames ` +
+        `${framedLength}`,
+    );
+  }
+  if (contentLength > MAX_KEYFRAME_DELTA_RECORD_BYTES) {
+    throw new MalformedFile(
+      `indexed record opcode ${opcode} at byte ${offset} declares ${contentLength} content ` +
+        `bytes, past the ${MAX_KEYFRAME_DELTA_RECORD_BYTES}-byte per-record reader limit`,
+    );
+  }
+  return indexedRecordFromBytes(await readExact(source, offset, length), offset, length);
 }
 
 function wholeFileRecordReader(data: Uint8Array): IndexedRecordReader {
