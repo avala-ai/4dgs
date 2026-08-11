@@ -283,6 +283,12 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
   final footer = FourdgsFooter.parse(
     footerCursor.take(footerFixedContentBytes),
   );
+  if (footer.summaryStart == 0 && footer.summaryCrc != 0) {
+    throw FourdgsMalformedFile(
+      'the Footer declares summary_crc ${footer.summaryCrc}, but '
+      'summary_start is 0 and there is no summary range to checksum',
+    );
+  }
 
   final index = <FourdgsChunkIndexEntry>[];
   // Where each entry above came from. A refusal that can only say which interval
@@ -434,55 +440,55 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
   );
 }
 
-/// Locate the variable-width final Footer from bounded tail ranges.
+/// Locate the variable-width final Footer from top-level record boundaries.
 ///
 /// Version-1 fields occupy the first 20 content bytes, while later minor
 /// revisions may append more. The content length therefore cannot be inferred
-/// from a fixed distance to the closing magic. Search backwards for the framed
-/// header whose declared range ends exactly at [magicAt], holding at most one
-/// scan block plus the eight length bytes.
+/// from a fixed distance to the closing magic, and an opcode-shaped sequence
+/// inside an append is not a record header. Walk only nine-byte framing headers
+/// from the opening magic, skipping payloads by their validated lengths. This
+/// touches no Chunk contents and retains one header however large the file is.
 Future<({int offset, int length})> _locateFooter(
   FourdgsReadable source,
   int magicAt,
   int fixedContentBytes,
 ) async {
-  const int blockBytes = 64 * 1024;
-  final int fixedAt = magicAt - recordHeaderBytes - fixedContentBytes;
-  final Uint8List fixedHead = await source.read(fixedAt, recordHeaderBytes);
-  if (fixedHead[0] == opFooter &&
-      ByteData.sublistView(
-            fixedHead,
-            1,
-            recordHeaderBytes,
-          ).getUint64(0, Endian.little) ==
-          fixedContentBytes) {
-    return (offset: fixedAt, length: fixedContentBytes);
-  }
-
-  int scanEnd = fixedAt - 1;
-  while (scanEnd >= fourdgsMagic.length) {
-    final int scanStart = math.max(
-      fourdgsMagic.length,
-      scanEnd - blockBytes + 1,
-    );
-    final Uint8List bytes = await source.read(
-      scanStart,
-      scanEnd - scanStart + 1 + 8,
-    );
-    for (int candidate = scanEnd; candidate >= scanStart; candidate--) {
-      final int local = candidate - scanStart;
-      if (bytes[local] != opFooter) continue;
-      final int length = ByteData.sublistView(
-        bytes,
-        local + 1,
-        local + recordHeaderBytes,
-      ).getUint64(0, Endian.little);
-      if (length >= fixedContentBytes &&
-          candidate + recordHeaderBytes + length == magicAt) {
-        return (offset: candidate, length: length);
-      }
+  int at = fourdgsMagic.length;
+  while (at < magicAt) {
+    if (at + recordHeaderBytes > magicAt) {
+      throw FourdgsMalformedFile(
+        'the record header at byte $at overlaps the closing magic at $magicAt',
+      );
     }
-    scanEnd = scanStart - 1;
+    final FourdgsCursor header = FourdgsCursor(
+      await source.read(at, recordHeaderBytes),
+    );
+    final int recordOpcode = header.u8();
+    final int length = header.u64();
+    final int end = at + recordHeaderBytes + length;
+    if (end > magicAt) {
+      throw FourdgsMalformedFile(
+        '${opcodeName(recordOpcode)} at byte $at ends at $end, past the '
+        'closing magic at $magicAt',
+      );
+    }
+    if (end == magicAt) {
+      if (recordOpcode != opFooter || length < fixedContentBytes) {
+        throw FourdgsMalformedFile(
+          'the final record before the closing magic is '
+          '${opcodeName(recordOpcode)} at byte $at with $length content bytes; '
+          'expected a Footer with at least $fixedContentBytes',
+        );
+      }
+      return (offset: at, length: length);
+    }
+    if (recordOpcode == opFooter) {
+      throw FourdgsMalformedFile(
+        'the Footer at byte $at is followed by another top-level record; the '
+        'Footer must be final',
+      );
+    }
+    at = end;
   }
   throw const FourdgsMalformedFile(
     'the final record before the closing magic is not a framed Footer',

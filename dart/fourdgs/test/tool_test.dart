@@ -720,6 +720,46 @@ void main() {
       );
     });
 
+    test('unregistered Coordinate Frame values are warnings', () async {
+      final Uint8List coordinateFrame =
+          (BytesBuilder()
+                ..add(_string('future'))
+                ..addByte(7) // unregistered handedness
+                ..addByte(1)
+                ..addByte(2)
+                ..addByte(9) // unregistered length unit
+                ..add(_f64(2.5)))
+              .toBytes();
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(
+          _minimal(extra: _record(opCoordinateFrame, coordinateFrame)),
+        ),
+      );
+      expect(report.ok, isTrue);
+      expect(
+        _messages(report, FourdgsSeverity.warning),
+        containsAll(<Matcher>[
+          contains('handedness 7 is not in the registry'),
+          contains('length_unit 9 is not in the registry'),
+        ]),
+      );
+    });
+
+    test('a malformed provenance record names its byte offset', () async {
+      final Uint8List data = _minimal(
+        extra: _record(opCoordinateFrame, Uint8List(2)),
+      );
+      final FourdgsWalk walk = await walkFourdgsFraming(FourdgsBytes(data));
+      final int offset = walk.first(opCoordinateFrame)!.offset;
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(data),
+      );
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(startsWith('the CoordinateFrame record at byte $offset')),
+      );
+    });
+
     test('unregistered trajectory interpolation is a warning', () async {
       final Uint8List trajectory =
           (BytesBuilder()
@@ -1273,6 +1313,16 @@ void main() {
         contains(contains('births retired gaussian id 0')),
       );
     });
+
+    test(
+      'identity introductions follow t0 rather than storage order',
+      () async {
+        final FourdgsValidation report = await validateFourdgs(
+          FourdgsBytes(_keyframeDeltasStoredOutOfTimelineOrder()),
+        );
+        expect(report.ok, isTrue, reason: report.findings.join('\n'));
+      },
+    );
   });
 
   group('a checksum over a range is not a copy of the range', () {
@@ -1287,6 +1337,30 @@ void main() {
       );
       // The public indexed path has no validator-supplied framing hints.
       expect((await openFourdgsIndexed(source)).durationSec, 1.0);
+    });
+
+    test('Footer-shaped append bytes are not top-level framing', () async {
+      final FourdgsBytes source = FourdgsBytes(_minimalWithFooterLikeAppend());
+      expect((await openFourdgsIndexed(source)).durationSec, 1.0);
+    });
+
+    test('a checksum without a summary range is malformed', () async {
+      final FourdgsBytes source = FourdgsBytes(_minimal(summaryCrc: 1));
+      final FourdgsValidation report = await validateFourdgs(source);
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(contains('there is no summary range to checksum')),
+      );
+      await expectLater(
+        openFourdgsIndexed(source),
+        throwsA(
+          isA<FourdgsMalformedFile>().having(
+            (error) => error.message,
+            'message',
+            contains('there is no summary range to checksum'),
+          ),
+        ),
+      );
     });
 
     test('block by block gives what the whole buffer gives', () async {
@@ -1741,6 +1815,33 @@ Uint8List _minimalWithExtendedFooterCrc() {
       .toBytes();
 }
 
+/// A real extended Footer whose append begins with a self-consistent fake
+/// Footer header. Only a top-level framing walk can distinguish the two.
+Uint8List _minimalWithFooterLikeAppend() {
+  final Uint8List prefix =
+      (BytesBuilder()
+            ..add(fourdgsMagic)
+            ..add(_record(opHeader, _headerContent()))
+            ..add(_record(opQuantization, _quantizationContent()))
+            ..add(_record(opWindowTable, _windowTableContent())))
+          .toBytes();
+  const int fakePayloadBytes = 55;
+  final Uint8List footer =
+      (BytesBuilder()
+            ..add(_u64(0))
+            ..add(_u64(0))
+            ..add(_u32(0))
+            ..addByte(opFooter)
+            ..add(_u64(fakePayloadBytes))
+            ..add(Uint8List(fakePayloadBytes)))
+          .toBytes();
+  return (BytesBuilder()
+        ..add(prefix)
+        ..add(_record(opFooter, footer))
+        ..add(fourdgsMagic))
+      .toBytes();
+}
+
 Uint8List _minimalWithHugeFooterAppend() {
   final Uint8List prefix =
       (BytesBuilder()
@@ -2120,6 +2221,161 @@ Uint8List _keyframeDeltaWithRetiredIdReuse() {
             referenceOffset: deathOffset,
             depth: 2,
             liveCount: 1,
+          ),
+        )
+        ..add(footer)
+        ..add(fourdgsMagic))
+      .toBytes();
+}
+
+/// Timeline keyframe({0}), retain({0}), death({0}), but the two independent
+/// keyframe-referenced deltas are stored death-first. Identity remains live in
+/// the earlier interval and is never reintroduced.
+Uint8List _keyframeDeltasStoredOutOfTimelineOrder() {
+  final Uint8List head =
+      (BytesBuilder()
+            ..add(fourdgsMagic)
+            ..add(
+              _record(
+                opHeader,
+                _headerContent(
+                  temporalModel: 'keyframe-delta',
+                  durationSec: 3.0,
+                  gaussianCount: 1,
+                ),
+              ),
+            )
+            ..add(_record(opQuantization, _quantizationContent()))
+            ..add(_record(opWindowTable, _windowTableContent())))
+          .toBytes();
+  final Uint8List streams = _keyframeStreams(windowIndex: 0);
+  final Uint8List keyframe = _record(
+    opChunk,
+    (BytesBuilder()
+          ..add(_f64(0.0))
+          ..add(_f64(1.0))
+          ..add(_u32(0))
+          ..add(_u32(1))
+          ..add(_string(''))
+          ..add(_u64(streams.length))
+          ..add(_u64(streams.length))
+          ..add(streams))
+        .toBytes(),
+  );
+  final int keyframeOffset = head.length;
+
+  Uint8List delta({
+    required double t0,
+    required double t1,
+    required Uint8List deaths,
+  }) {
+    final Uint8List groups =
+        (BytesBuilder()
+              ..add(_u64(0))
+              ..add(_u64(0))
+              ..add(_u64(deaths.length))
+              ..add(deaths))
+            .toBytes();
+    return _record(
+      opDeltaChunk,
+      (BytesBuilder()
+            ..add(_f64(t0))
+            ..add(_f64(t1))
+            ..add(_u32(0))
+            ..addByte(deltaModeKeyframe)
+            ..add(_u64(keyframeOffset))
+            ..add(_u64(keyframeOffset))
+            ..add(_u16(1))
+            ..add(_u32(0))
+            ..add(_u32(0))
+            ..add(_u32(deaths.isEmpty ? 0 : 1))
+            ..add(_string(''))
+            ..add(_u64(groups.length))
+            ..add(_u64(groups.length))
+            ..add(groups))
+          .toBytes(),
+    );
+  }
+
+  final Uint8List laterDeath = delta(
+    t0: 2.0,
+    t1: 3.0,
+    deaths: _constStream(attrGaussianId, 1, 1, 0),
+  );
+  final int deathOffset = keyframeOffset + keyframe.length;
+  final Uint8List earlierRetain = delta(t0: 1.0, t1: 2.0, deaths: Uint8List(0));
+  final int retainOffset = deathOffset + laterDeath.length;
+  final int indexOffset = retainOffset + earlierRetain.length;
+
+  Uint8List entry({
+    required double t0,
+    required double t1,
+    required int chunkOffset,
+    required int chunkLength,
+    required int operations,
+    required int kind,
+    required int liveCount,
+  }) => _record(
+    opChunkIndex,
+    (BytesBuilder()
+          ..add(_f64(t0))
+          ..add(_f64(t1))
+          ..add(_u64(chunkOffset))
+          ..add(_u64(chunkLength))
+          ..add(_u32(operations))
+          ..add(_u32(0))
+          ..addByte(kind)
+          ..addByte(kind == 0 ? 0 : deltaModeKeyframe)
+          ..add(_u64(kind == 0 ? 0 : keyframeOffset))
+          ..add(_u64(keyframeOffset))
+          ..add(_u16(kind == 0 ? 0 : 1))
+          ..add(_u64(liveCount)))
+        .toBytes(),
+  );
+  final Uint8List footer = _record(
+    opFooter,
+    (BytesBuilder()
+          ..add(_u64(indexOffset))
+          ..add(_u64(0))
+          ..add(_u32(0)))
+        .toBytes(),
+  );
+  return (BytesBuilder()
+        ..add(head)
+        ..add(keyframe)
+        ..add(laterDeath)
+        ..add(earlierRetain)
+        ..add(
+          entry(
+            t0: 0.0,
+            t1: 1.0,
+            chunkOffset: keyframeOffset,
+            chunkLength: keyframe.length,
+            operations: 1,
+            kind: 0,
+            liveCount: 1,
+          ),
+        )
+        ..add(
+          entry(
+            t0: 1.0,
+            t1: 2.0,
+            chunkOffset: retainOffset,
+            chunkLength: earlierRetain.length,
+            operations: 0,
+            kind: 1,
+            liveCount: 1,
+          ),
+        )
+        ..add(
+          entry(
+            t0: 2.0,
+            t1: 3.0,
+            chunkOffset: deathOffset,
+            chunkLength: laterDeath.length,
+            operations: 1,
+            kind: 1,
+            liveCount: 0,
           ),
         )
         ..add(footer)

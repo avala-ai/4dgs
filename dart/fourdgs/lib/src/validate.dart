@@ -623,7 +623,12 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
   if (footer != null &&
       footerOffset >= 0 &&
       footer.summaryCrc != 0 &&
-      footer.summaryStart != 0) {
+      footer.summaryStart == 0) {
+    report.error(
+      'the Footer declares summary_crc ${footer.summaryCrc}, but '
+      'summary_start is 0 and there is no summary range to checksum',
+    );
+  } else if (footer != null && footerOffset >= 0 && footer.summaryCrc != 0) {
     // The summary ends exactly where the framed Footer begins. Deriving this
     // from a fixed Footer size would include appended, forward-compatible
     // Footer fields in the CRC range (§4.2).
@@ -895,29 +900,44 @@ Future<void> _checkProvenanceRecords(
   FourdgsWalk walk,
   _Report report,
 ) async {
-  final frameNames = <String>{};
-  final sensorNames = <String>{};
-  final trajectoryNames = <String>{};
-  final anchorNames = <String>{};
-
   Never duplicate(String kind, String name, String section) =>
       throw FourdgsMalformedFile(
         "two $kind records are named '$name'; these records are referred to "
         'by name and nothing else (section $section)',
       );
 
-  try {
-    await for (final FourdgsFrame frame in walkFourdgsFrames(source, walk)) {
-      if (frame.offset + frame.total > walk.size) continue;
+  await for (final FourdgsFrame frame in walkFourdgsFrames(source, walk)) {
+    if (frame.offset + frame.total > walk.size) continue;
+    try {
       switch (frame.opcode) {
         case opCoordinateFrame:
           final value = FourdgsCoordinateFrame.parse(
             await _bytesOf(source, frame),
           );
-          if (!frameNames.add(value.name)) {
+          if (await _provenanceNameExists(
+            source,
+            walk,
+            opCoordinateFrame,
+            value.name,
+            beforeOffset: frame.offset,
+          )) {
             duplicate('CoordinateFrame', value.name, '5.15.2');
           }
           final double? registered = lengthUnitMetres[value.lengthUnit];
+          if (value.handedness != 0 &&
+              value.handedness != 1 &&
+              value.handedness != 2) {
+            report.warn(
+              'Coordinate Frame "${value.name}" handedness '
+              '${value.handedness} is not in the registry',
+            );
+          }
+          if (value.lengthUnit != 0 && registered == null) {
+            report.warn(
+              'Coordinate Frame "${value.name}" length_unit '
+              '${value.lengthUnit} is not in the registry',
+            );
+          }
           if (registered != null &&
               value.metresPerUnit > 0.0 &&
               value.metresPerUnit != registered) {
@@ -932,7 +952,13 @@ Future<void> _checkProvenanceRecords(
           final value = FourdgsSensorCalibration.parse(
             await _bytesOf(source, frame),
           );
-          if (!sensorNames.add(value.name)) {
+          if (await _provenanceNameExists(
+            source,
+            walk,
+            opSensorCalibration,
+            value.name,
+            beforeOffset: frame.offset,
+          )) {
             duplicate('SensorCalibration', value.name, '5.15.3');
           }
           if (value.poseReference != poseToScene &&
@@ -943,13 +969,33 @@ Future<void> _checkProvenanceRecords(
               '(rig)',
             );
           }
+          if (value.poseReference == poseToRig &&
+              !await _provenanceNameExists(
+                source,
+                walk,
+                opRigTrajectory,
+                value.rigName,
+              )) {
+            throw FourdgsMalformedFile(
+              "sensor '${value.name}' is posed against rig "
+              "'${value.rigName}', which this file does not carry (section "
+              '5.15.3)',
+            );
+          }
         case opRigTrajectory:
           final value = FourdgsRigTrajectory.parse(
             await _bytesOf(source, frame),
           );
           // Zero-sample trajectories are read as absent, including for name
           // uniqueness and later rig references.
-          if (value.sampleCount > 0 && !trajectoryNames.add(value.name)) {
+          if (value.sampleCount > 0 &&
+              await _provenanceNameExists(
+                source,
+                walk,
+                opRigTrajectory,
+                value.name,
+                beforeOffset: frame.offset,
+              )) {
             duplicate('RigTrajectory', value.name, '5.15.4');
           }
           if (value.sampleCount > 0 &&
@@ -964,45 +1010,74 @@ Future<void> _checkProvenanceRecords(
           final value = FourdgsGeodeticAnchor.parse(
             await _bytesOf(source, frame),
           );
-          if (!anchorNames.add(value.frameName)) {
+          if (await _provenanceNameExists(
+            source,
+            walk,
+            opGeodeticAnchor,
+            value.frameName,
+            beforeOffset: frame.offset,
+          )) {
             duplicate('GeodeticAnchor', value.frameName, '5.15.5');
           }
+          if (!await _provenanceNameExists(
+            source,
+            walk,
+            opCoordinateFrame,
+            value.frameName,
+          )) {
+            throw FourdgsMalformedFile(
+              "a GeodeticAnchor anchors frame '${value.frameName}', which this "
+              'file does not define; an anchor for a frame nobody declared is a '
+              'latitude attached to nothing (section 5.15.5)',
+            );
+          }
       }
+    } on FourdgsException catch (error) {
+      report.error(
+        'the ${opcodeName(frame.opcode)} record at byte ${frame.offset} does '
+        'not decode: ${_say(error)}',
+      );
     }
-
-    // Resolve references only after later records had a chance to declare the
-    // target. Reparse and release each small record instead of retaining every
-    // sensor and anchor object from the first pass.
-    await for (final FourdgsFrame frame in walkFourdgsFrames(source, walk)) {
-      if (frame.offset + frame.total > walk.size) continue;
-      if (frame.opcode == opSensorCalibration) {
-        final sensor = FourdgsSensorCalibration.parse(
-          await _bytesOf(source, frame),
-        );
-        if (sensor.poseReference == poseToRig &&
-            !trajectoryNames.contains(sensor.rigName)) {
-          throw FourdgsMalformedFile(
-            "sensor '${sensor.name}' is posed against rig "
-            "'${sensor.rigName}', which this file does not carry (section "
-            '5.15.3)',
-          );
-        }
-      } else if (frame.opcode == opGeodeticAnchor) {
-        final anchor = FourdgsGeodeticAnchor.parse(
-          await _bytesOf(source, frame),
-        );
-        if (!frameNames.contains(anchor.frameName)) {
-          throw FourdgsMalformedFile(
-            "a GeodeticAnchor anchors frame '${anchor.frameName}', which this "
-            'file does not define; an anchor for a frame nobody declared is a '
-            'latitude attached to nothing (section 5.15.5)',
-          );
-        }
-      }
-    }
-  } on FourdgsException catch (error) {
-    report.error('the provenance records do not decode: ${_say(error)}');
   }
+}
+
+/// Whether an earlier (or any) record of one provenance class carries [name].
+///
+/// Replaying ranges trades time for the invariant validators need most: memory
+/// is one independently bounded record, not the aggregate number or length of
+/// names in the file. Malformed replay records are ignored here and diagnosed
+/// once when the outer pass reaches their own byte offset.
+Future<bool> _provenanceNameExists(
+  FourdgsReadable source,
+  FourdgsWalk walk,
+  int wantedOpcode,
+  String name, {
+  int? beforeOffset,
+}) async {
+  await for (final FourdgsFrame frame in walkFourdgsFrames(source, walk)) {
+    if (beforeOffset != null && frame.offset >= beforeOffset) break;
+    if (frame.opcode != wantedOpcode ||
+        frame.offset + frame.total > walk.size) {
+      continue;
+    }
+    try {
+      final Uint8List bytes = await _bytesOf(source, frame);
+      switch (wantedOpcode) {
+        case opCoordinateFrame:
+          if (FourdgsCoordinateFrame.parse(bytes).name == name) return true;
+        case opSensorCalibration:
+          if (FourdgsSensorCalibration.parse(bytes).name == name) return true;
+        case opRigTrajectory:
+          final value = FourdgsRigTrajectory.parse(bytes);
+          if (value.sampleCount > 0 && value.name == name) return true;
+        case opGeodeticAnchor:
+          if (FourdgsGeodeticAnchor.parse(bytes).frameName == name) return true;
+      }
+    } on FourdgsException {
+      continue;
+    }
+  }
+  return false;
 }
 
 /// Validate the optional per-band SH-depth declaration against Header degree.
@@ -1844,17 +1919,19 @@ Future<void> _checkKeyframeDelta(
           );
         }
         checkKeyframeDeltaMuT(state, body.header.t0, scene.quantization);
-        distinctIds = await _recordIdentityIntroductions(
-          source,
-          walk,
-          state,
-          previousState,
-          frame.offset,
-          identityFilter,
-          distinctIds,
-          scene.header.gaussianCount,
-          'the keyframe',
-        );
+        if (index.isEmpty) {
+          distinctIds = await _recordIdentityIntroductions(
+            source,
+            walk,
+            state,
+            previousState,
+            frame.offset,
+            identityFilter,
+            distinctIds,
+            scene.header.gaussianCount,
+            'the keyframe',
+          );
+        }
         keyframeState = state;
         keyframeOffset = frame.offset;
         keyframeLevel = body.header.level;
@@ -1922,17 +1999,19 @@ Future<void> _checkKeyframeDelta(
           body,
           chunkOffset: frame.offset,
         );
-        distinctIds = await _recordIdentityIntroductions(
-          source,
-          walk,
-          state,
-          previousState,
-          frame.offset,
-          identityFilter,
-          distinctIds,
-          scene.header.gaussianCount,
-          'the delta chunk',
-        );
+        if (index.isEmpty) {
+          distinctIds = await _recordIdentityIntroductions(
+            source,
+            walk,
+            state,
+            previousState,
+            frame.offset,
+            identityFilter,
+            distinctIds,
+            scene.header.gaussianCount,
+            'the delta chunk',
+          );
+        }
         previousDepth = head.depth;
         previousLevel = head.level;
         bandPopulation = head.birthCount;
@@ -2028,12 +2107,124 @@ Future<void> _checkKeyframeDelta(
       return;
     }
   }
+  if (index.isNotEmpty) {
+    try {
+      distinctIds = await _indexedIdentityIntroductions(
+        source,
+        index,
+        scene.header.gaussianCount,
+      );
+    } on FourdgsException catch (error) {
+      report.refused('the indexed identity timeline does not compose: ', error);
+      return;
+    }
+  }
   if (distinctIds != scene.header.gaussianCount) {
     report.error(
       'Header declares ${scene.header.gaussianCount} distinct gaussian ids; '
       'keyframes and births contain $distinctIds',
     );
   }
+}
+
+/// Check births and retired-id reuse in timeline order, not record order.
+///
+/// Keyframe-referenced deltas in one GOP are independently composable and may
+/// be stored out of `t0` order. The already-bounded Chunk Index supplies the
+/// timeline; one composed state and one previous-state membership index are
+/// resident at a time.
+Future<int> _indexedIdentityIntroductions(
+  FourdgsReadable source,
+  List<FourdgsChunkIndexEntry> index,
+  int declared,
+) async {
+  final timeline = List<FourdgsChunkIndexEntry>.of(index)..sort((a, b) {
+    final int byStart = a.t0.compareTo(b.t0);
+    return byStart != 0 ? byStart : a.t1.compareTo(b.t1);
+  });
+  final byOffset = keyframeDeltaChainIndex(index);
+  final filter = _IdentityFilter();
+  KeyframeDeltaState? previous;
+  int distinct = 0;
+  for (int position = 0; position < timeline.length; position++) {
+    final entry = timeline[position];
+    final state = await readKeyframeDeltaChain(
+      source,
+      index,
+      entry,
+      byOffset: byOffset,
+    );
+    final _StateIdIndex? previousIds =
+        previous == null ? null : _StateIdIndex(previous.ids);
+    final List<int> introductions = <int>[];
+    final Set<int> collisionCandidates = <int>{};
+    for (final int id in state.ids) {
+      if (previousIds?.contains(id) ?? false) continue;
+      introductions.add(id);
+      if (filter.mightContain(id)) collisionCandidates.add(id);
+    }
+    final int? reused =
+        collisionCandidates.isEmpty
+            ? null
+            : await _identityAppearedEarlierInTimeline(
+              source,
+              index,
+              timeline,
+              position,
+              collisionCandidates,
+              byOffset,
+            );
+    if (reused != null) {
+      final String what = entry.kind == 1 ? 'the delta chunk' : 'the keyframe';
+      final String action = entry.kind == 1 ? 'births' : 'reuses';
+      throw FourdgsMalformedFile(
+        '$what at byte ${entry.chunkOffset} $action retired gaussian id '
+        '$reused; an id is never reused after a death',
+      );
+    }
+    for (final int id in introductions) {
+      if (distinct >= declared) {
+        throw FourdgsMalformedFile(
+          'Header declares $declared distinct gaussian ids, but the state '
+          'chunk at byte ${entry.chunkOffset} introduces id $id after that '
+          'many identities were already seen',
+        );
+      }
+      filter.add(id);
+      distinct += 1;
+    }
+    previous = state;
+  }
+  return distinct;
+}
+
+/// Exact fallback for a fixed-filter collision in an indexed timeline.
+Future<int?> _identityAppearedEarlierInTimeline(
+  FourdgsReadable source,
+  List<FourdgsChunkIndexEntry> index,
+  List<FourdgsChunkIndexEntry> timeline,
+  int beforePosition,
+  Set<int> candidates,
+  Map<int, FourdgsChunkIndexEntry> byOffset,
+) async {
+  KeyframeDeltaState? previous;
+  for (int position = 0; position < beforePosition; position++) {
+    final state = await readKeyframeDeltaChain(
+      source,
+      index,
+      timeline[position],
+      byOffset: byOffset,
+    );
+    final _StateIdIndex? previousIds =
+        previous == null ? null : _StateIdIndex(previous.ids);
+    for (final int id in state.ids) {
+      if (candidates.contains(id) && !(previousIds?.contains(id) ?? false)) {
+        return id;
+      }
+    }
+    previous = state;
+  }
+  return null;
 }
 
 Future<int> _recordIdentityIntroductions(
