@@ -1034,6 +1034,28 @@ final class ValidateTests: XCTestCase {
                     && $0.message.contains("missing bands [1]")
             })
 
+        let schemeLength = UInt64(
+            try XCTUnwrap(
+                readU32(original, at: quantization.offset + recordHeaderSize)))
+        var nonFiniteGrid = original
+        writeU64(
+            Double.nan.bitPattern, into: &nonFiniteGrid,
+            at: quantization.offset + recordHeaderSize + 4 + schemeLength)
+        XCTAssertTrue(
+            validate(nonFiniteGrid).findings.contains {
+                $0.message.contains("Quantization")
+                    && $0.message.contains("finite grid parameter")
+            })
+
+        var malformedSecondWindow = original
+        malformedSecondWindow.insert(
+            contentsOf: [Opcode.windowTable] + littleU64(0), at: Int(firstState.offset))
+        let malformedWindowFindings = validate(malformedSecondWindow).findings
+        XCTAssertTrue(
+            malformedWindowFindings.contains {
+                $0.message.contains("physical WindowTable record at byte \(firstState.offset)")
+            }, malformedWindowFindings.map(\.message).joined(separator: "\n"))
+
         var stateBeforeQuantization = original
         let stateBytes = original[
             Int(firstState.offset)..<Int(firstState.offset + firstState.total)]
@@ -1080,6 +1102,34 @@ final class ValidateTests: XCTestCase {
             "keyframe/KeyframeDelta-UseChunkIndex-UseCrc-UseStatistics.4dgs")
         var missingIdentity = try readFixture(keyframeFile)
         let keyframeWalk = try walk(missingIdentity)
+        let keyframeDispatch = try XCTUnwrap(
+            try headerDispatch(ToolReader(InMemoryReader(missingIdentity)), keyframeWalk))
+        let keyframeHeader = try XCTUnwrap(keyframeWalk.firstIntact(Opcode.header))
+        var headerRelative: UInt64 = 0
+        for _ in 0..<2 {
+            let length = UInt64(
+                try XCTUnwrap(
+                    readU32(
+                        missingIdentity,
+                        at: keyframeHeader.offset + recordHeaderSize + headerRelative)))
+            headerRelative += 4 + length
+        }
+        var wrongDistinctCount = missingIdentity
+        writeU64(
+            keyframeDispatch.gaussianCount + 1, into: &wrongDistinctCount,
+            at: keyframeHeader.offset + recordHeaderSize + headerRelative + 8)
+        XCTAssertTrue(
+            validate(wrongDistinctCount).findings.contains {
+                $0.message.contains("keyframe-delta sequence")
+                    && $0.message.contains("distinct gaussian_id values")
+            })
+
+        var reservedHeaderFlags = missingIdentity
+        reservedHeaderFlags[Int(keyframeDispatch.temporalModelOffset + 14 + 49)] |= 0x80
+        XCTAssertTrue(
+            validate(reservedHeaderFlags).findings.contains {
+                $0.message.contains("Header flags contain reserved bits")
+            })
         let keyframe = try XCTUnwrap(keyframeWalk.firstIntact(Opcode.chunk))
         var stream = keyframe.offset + recordHeaderSize + 44
         let streamEnd = keyframe.offset + keyframe.total
@@ -1269,11 +1319,12 @@ final class ValidateTests: XCTestCase {
         let tableBytes = bytes[Int(table.offset)..<Int(table.offset + table.total)]
         bytes.insert(contentsOf: tableBytes, at: Int(state.offset))
 
+        let report = validate(bytes)
         XCTAssertTrue(
-            validate(bytes).findings.contains {
+            report.findings.contains {
                 $0.message.contains("physical ObjectTable record at byte \(state.offset)")
                     && $0.message.contains("does not decode")
-            })
+            }, "\(report.findings.map(\.message))")
     }
 
     func testPhysicalDeltaReferencesAreCheckedWithoutAnIndex() throws {

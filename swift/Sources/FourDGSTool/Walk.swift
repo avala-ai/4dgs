@@ -414,6 +414,7 @@ struct HeaderDispatch {
     let durationSec: Double
     let gaussianCount: UInt64
     let shDegree: UInt8
+    let flags: UInt8
     let hasAudio: Bool
     let temporalModelOffset: UInt64
 }
@@ -460,7 +461,8 @@ func headerDispatch(_ source: ToolReader, _ walk: Walk) throws -> HeaderDispatch
     return HeaderDispatch(
         keyframeDelta: model == expected, durationSec: durationSec,
         gaussianCount: gaussianCount, shDegree: degreeAndFlags[0],
-        hasAudio: degreeAndFlags[1] & 1 != 0, temporalModelOffset: modelOffset)
+        flags: degreeAndFlags[1], hasAudio: degreeAndFlags[1] & 1 != 0,
+        temporalModelOffset: modelOffset)
 }
 
 func isKeyframeDelta(_ source: ToolReader, _ walk: Walk) throws -> Bool {

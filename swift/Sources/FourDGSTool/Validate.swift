@@ -201,6 +201,41 @@ private func chunkFields(_ source: ToolReader, _ frame: Frame) throws -> ChunkFi
         referenceOffset: referenceOffset, keyframeOffset: keyframeOffset, depth: depth)
 }
 
+/// Grid parameters are semantic numeric values, not opaque payload. The core parser preserves
+/// IEEE non-finite values, so the validator checks every physical Quantization record itself.
+private func validateQuantizationFiniteness(_ source: ToolReader, _ frame: Frame) throws {
+    let content = frame.offset + recordHeaderSize
+    guard frame.length >= 4 else {
+        throw FourDGSError.truncated(
+            offset: Int64(clamping: content), record: "Quantization.scheme",
+            needed: 4, available: Int64(clamping: frame.length))
+    }
+    let lengthBytes = try source.exactly(
+        offset: content, count: 4, record: "Quantization scheme length")
+    let schemeLength = UInt64(readU32(lengthBytes, at: 0) ?? 0)
+    let numericStart = content + 4 + schemeLength
+    let numericBytes: UInt64 = 11 * 8  // pos_origin[3], then eight scalar steps.
+    guard schemeLength <= frame.length - 4, numericBytes <= frame.length - 4 - schemeLength else {
+        throw FourDGSError.truncated(
+            offset: Int64(clamping: numericStart), record: "Quantization numeric fields",
+            needed: Int64(numericBytes),
+            available: Int64(clamping: frame.length - min(frame.length, 4 + schemeLength)))
+    }
+    let values = try source.exactly(
+        offset: numericStart, count: Int(numericBytes), record: "Quantization numeric fields")
+    let names = [
+        "pos_origin[0]", "pos_origin[1]", "pos_origin[2]", "step_pos", "step_scale_log",
+        "step_rot", "step_rgb", "step_alpha", "step_motion", "step_time", "step_sigma_log",
+    ]
+    for (i, name) in names.enumerated() {
+        guard let value = readF64(values, at: UInt64(i * 8)), value.isFinite else {
+            throw FourDGSError.malformed(
+                offset: Int64(clamping: numericStart + UInt64(i * 8)), record: "Quantization",
+                field: name, reason: "expected a finite grid parameter")
+        }
+    }
+}
+
 private func frontMatterSlices(
     header: Frame, quantization: Frame, windowTable: Frame?, temporalModelOffset: UInt64? = nil
 ) -> [SourceSlice] {
@@ -645,6 +680,23 @@ private func isAuxiliaryRecord(_ opcode: UInt8) -> Bool {
     (0x0A...0x0F).contains(opcode) || (0x20...0x25).contains(opcode)
 }
 
+private func diagnosticOffset(_ error: FourDGSError) -> UInt64? {
+    let offset: Int64?
+    switch error {
+    case .notFourDGS(let at, _), .truncated(let at, _, _, _),
+        .malformed(let at, _, _, _, _), .windowIndexOutOfRange(let at, _, _),
+        .summaryChecksumMismatch(let at, _, _), .unsupportedCodec(let at, _, _, _),
+        .unsupportedValue(let at, _, _, _), .invalidRange(let at, _):
+        offset = at
+    case .unsupportedMajorVersion:
+        offset = 5
+    case .noChunkIndex, .unreadableSource, .core, .notImplemented:
+        offset = nil
+    }
+    guard let offset, offset >= 0 else { return nil }
+    return UInt64(offset)
+}
+
 private let maximumRetainedValidationRecords = 262_144
 
 private func validatePhysicalRecords(
@@ -748,6 +800,13 @@ private func validatePhysicalRecords(
                     }
                 case Opcode.quantization:
                     if quantization == nil { quantization = frame }
+                    do {
+                        try validateQuantizationFiniteness(source, frame)
+                    } catch {
+                        scanReport.error(
+                            "Quantization at byte \(frame.offset) is invalid: "
+                                + sentence(asFourDGS(error)))
+                    }
                     if headerRecords.count + quantizationRecords.count
                         < maximumRetainedValidationRecords
                     {
@@ -759,7 +818,34 @@ private func validatePhysicalRecords(
                                 + "unbounded front matter list")
                         frontMatterLimitReported = true
                     }
-                case Opcode.windowTable: if windowTable == nil { windowTable = frame }
+                case Opcode.windowTable:
+                    // Window Tables are stateful front matter: the most recently encountered
+                    // table governs the following state record. Keeping only the first both
+                    // skipped malformed replacements and checked later chunks against stale rows.
+                    windowTable = frame
+                    if keyframeDelta, let header, let quantization, let temporalModelOffset {
+                        do {
+                            _ = try SceneReader(
+                                SlicedReader(
+                                    source: source,
+                                    slices: frontMatterSlices(
+                                        header: header, quantization: quantization,
+                                        windowTable: frame,
+                                        temporalModelOffset: temporalModelOffset)),
+                                path: .streamed)
+                        } catch {
+                            let tableError = asFourDGS(error)
+                            if firstFrontMatterError == nil {
+                                firstFrontMatterError = (
+                                    tableError,
+                                    Site(
+                                        offset: frame.offset,
+                                        what:
+                                            "the physical WindowTable record at byte \(frame.offset)")
+                                )
+                            }
+                        }
+                    }
                 default: break
                 }
 
@@ -1170,32 +1256,52 @@ private func validatePhysicalRecords(
     if keyframeDelta, !auxiliaryRecords.isEmpty, let header, let quantization,
         let temporalModelOffset
     {
-        func parseAuxiliaryPrefix(_ count: Int) throws {
-            var slices = frontMatterSlices(
-                header: header, quantization: quantization, windowTable: windowTable,
-                temporalModelOffset: temporalModelOffset)
-            for frame in auxiliaryRecords.prefix(count) {
-                slices.append(SourceSlice(offset: frame.offset, length: frame.total))
-            }
-            _ = try SceneReader(SlicedReader(source: source, slices: slices), path: .streamed)
+        var slices = frontMatterSlices(
+            header: header, quantization: quantization, windowTable: windowTable,
+            temporalModelOffset: temporalModelOffset)
+        let auxiliaryStart = slices.reduce(UInt64(0)) { $0 + $1.length }
+        for frame in auxiliaryRecords {
+            slices.append(SourceSlice(offset: frame.offset, length: frame.total))
         }
         do {
-            try parseAuxiliaryPrefix(auxiliaryRecords.count)
+            _ = try SceneReader(SlicedReader(source: source, slices: slices), path: .streamed)
         } catch {
-            var failure = asFourDGS(error)
-            var low = 1
-            var high = auxiliaryRecords.count
-            while low < high {
-                let middle = low + (high - low) / 2
-                do {
-                    try parseAuxiliaryPrefix(middle)
-                    low = middle + 1
-                } catch {
-                    failure = asFourDGS(error)
-                    high = middle
+            let failure = asFourDGS(error)
+            var located: Frame?
+            if let logical = diagnosticOffset(failure), logical >= auxiliaryStart {
+                var at = auxiliaryStart
+                for frame in auxiliaryRecords {
+                    if logical < at + frame.total {
+                        located = frame
+                        break
+                    }
+                    at += frame.total
                 }
             }
-            let frame = auxiliaryRecords[low - 1]
+            if located == nil {
+                // Some ABI errors do not carry a structured byte. Remove one candidate
+                // from the otherwise complete auxiliary set and retry: later definitions
+                // remain present, so a legal forward reference never makes an earlier
+                // record look like the fault. This is an invalid-file-only diagnostic path.
+                // Prefer the later of otherwise interchangeable duplicates: the first
+                // scene-wide definition is legal and the repeated record is the fault.
+                for candidate in auxiliaryRecords.reversed() {
+                    var trial = frontMatterSlices(
+                        header: header, quantization: quantization,
+                        windowTable: windowTable,
+                        temporalModelOffset: temporalModelOffset)
+                    for frame in auxiliaryRecords where frame.offset != candidate.offset {
+                        trial.append(SourceSlice(offset: frame.offset, length: frame.total))
+                    }
+                    do {
+                        _ = try SceneReader(
+                            SlicedReader(source: source, slices: trial), path: .streamed)
+                        located = candidate
+                        break
+                    } catch {}
+                }
+            }
+            let frame = located ?? auxiliaryRecords.last!
             firstAuxiliaryError = (
                 failure,
                 Site(
@@ -1283,7 +1389,7 @@ private func validatePhysicalRecords(
     }
     if let firstFrontMatterError {
         report.refused(
-            "a front matter record does not decode: ", firstFrontMatterError.0, walked,
+            "\(firstFrontMatterError.1.what) does not decode: ", firstFrontMatterError.0, walked,
             firstFrontMatterError.1)
     }
     return result
@@ -1455,36 +1561,49 @@ private func applyIdentityDelta(
 
 /// Rebuild each target from its own backwards chain. This deliberately trades repeated reads for
 /// bounded memory: at most one composed identity set is resident, regardless of file length.
+private enum IdentityPartitionFull: Error { case full }
+
 private func validateKeyframeDeltaIdentity(
     _ source: ToolReader, physical: PhysicalValidation, index: [IndexEntry],
-    report: inout Report
+    expectedDistinct: UInt64?, report: inout Report
 ) {
     let indexed = Dictionary(grouping: index.enumerated(), by: { $0.element.offset })
-    for target in physical.frames.keys.sorted() {
+    let targets = physical.fields.sorted {
+        if $0.value.t0 == $1.value.t0 { return $0.key < $1.key }
+        return $0.value.t0 < $1.value.t0
+    }.map(\.key)
+
+    func compose(_ target: UInt64) throws -> Set<UInt32>? {
         var chain: [Frame] = []
         var at = target
         var visited: Set<UInt64> = []
         while let frame = physical.frames[at], let fields = physical.fields[at] {
             guard visited.insert(at).inserted else {
-                report.error("the identity reference chain at byte \(target) contains a cycle")
-                return
+                throw FourDGSError.malformed(
+                    offset: Int64(clamping: target), record: "keyframe-delta identity chain",
+                    field: "reference_offset", reason: "the chain contains a cycle")
             }
             chain.append(frame)
             if fields.opcode == Opcode.chunk { break }
             at = fields.referenceOffset
         }
-        guard chain.last?.opcode == Opcode.chunk else { continue }
+        guard chain.last?.opcode == Opcode.chunk else { return nil }
 
-        do {
-            var state: Set<UInt32> = []
-            for frame in chain.reversed() {
-                if frame.opcode == Opcode.chunk {
-                    state = try gaussianIDs(frame, keyframeGroup(source, frame))
-                } else {
-                    state = try applyIdentityDelta(
-                        state, frame: frame, groups: deltaGroups(source, frame))
-                }
+        var state: Set<UInt32> = []
+        for frame in chain.reversed() {
+            if frame.opcode == Opcode.chunk {
+                state = try gaussianIDs(frame, keyframeGroup(source, frame))
+            } else {
+                state = try applyIdentityDelta(
+                    state, frame: frame, groups: deltaGroups(source, frame))
             }
+        }
+        return state
+    }
+
+    for target in targets {
+        do {
+            guard let state = try compose(target) else { continue }
             for (i, entry) in indexed[target] ?? [] where entry.extended {
                 if entry.liveCount != UInt64(state.count) {
                     report.error(
@@ -1500,6 +1619,60 @@ private func validateKeyframeDeltaIdentity(
                     what: "the identity chain ending at the state record at byte \(target)"))
             return
         }
+    }
+
+    // A global identity set would grow with cumulative births. Audit one fixed-capacity
+    // high-bit partition at a time instead; an overflowing partition is split and the
+    // timeline is replayed. Memory remains bounded while reuse after death and the Header's
+    // distinct-id declaration are checked over the whole sequence.
+    let capacity = 65_536
+    func countPartition(_ prefix: UInt32, _ bits: Int) throws -> UInt64 {
+        var seen: Set<UInt32> = []
+        var previousLive: Set<UInt32> = []
+        func belongs(_ id: UInt32) -> Bool {
+            bits == 0 || id >> (32 - bits) == prefix
+        }
+        for target in targets {
+            guard let state = try compose(target), let frame = physical.frames[target] else {
+                continue
+            }
+            var currentLive: Set<UInt32> = []
+            for id in state where belongs(id) {
+                currentLive.insert(id)
+                if previousLive.contains(id) { continue }
+                if seen.contains(id) {
+                    throw malformedIdentity(
+                        frame,
+                        "gaussian_id \(id) is reintroduced after it died; ids are never reused")
+                }
+                if seen.count >= capacity { throw IdentityPartitionFull.full }
+                seen.insert(id)
+            }
+            previousLive = currentLive
+        }
+        return UInt64(seen.count)
+    }
+
+    func countDistinct(_ prefix: UInt32, _ bits: Int) throws -> UInt64 {
+        do {
+            return try countPartition(prefix, bits)
+        } catch IdentityPartitionFull.full {
+            precondition(bits < 32, "a positive-capacity u32 partition cannot overflow at bit 32")
+            return try countDistinct(prefix << 1, bits + 1)
+                + countDistinct((prefix << 1) | 1, bits + 1)
+        }
+    }
+
+    do {
+        let distinct = try countDistinct(0, 0)
+        if let expectedDistinct, expectedDistinct != distinct {
+            report.error(
+                "Header gaussian_count is \(expectedDistinct), but the keyframe-delta sequence "
+                    + "contains \(distinct) distinct gaussian_id values")
+        }
+    } catch {
+        report.refused(
+            "keyframe-delta identity history failed: ", asFourDGS(error), nil, nil)
     }
 }
 
@@ -2109,6 +2282,7 @@ func validate(_ source: ToolReader) -> Report {
     var legacyAudioCount: UInt64 = 0
     var audioSources: [UInt32: AudioSourceSummary] = [:]
     var audioData: [UInt32: AudioDataSummary] = [:]
+    var audioLimitReported = false
     let walked: Walk
     do {
         walked = try walk(
@@ -2166,8 +2340,20 @@ func validate(_ source: ToolReader) -> Report {
                 } else if opcode == Opcode.audioSource {
                     do {
                         let parsed = try audioSourceSummary(source, frame)
-                        if audioSources.updateValue(parsed, forKey: parsed.id) != nil {
+                        if audioSources[parsed.id] != nil {
                             report.error("Audio Source id \(parsed.id) appears more than once")
+                        } else if audioSources.count + audioData.count
+                            >= maximumRetainedValidationRecords
+                        {
+                            if !audioLimitReported {
+                                report.error(
+                                    "the file contains more than "
+                                        + "\(maximumRetainedValidationRecords) Audio Source or "
+                                        + "Audio Data records; refusing to retain unbounded audio metadata")
+                                audioLimitReported = true
+                            }
+                        } else {
+                            audioSources[parsed.id] = parsed
                         }
                     } catch {
                         report.error(
@@ -2177,8 +2363,20 @@ func validate(_ source: ToolReader) -> Report {
                 } else if opcode == Opcode.audioData {
                     do {
                         let parsed = try audioDataSummary(source, frame)
-                        if audioData.updateValue(parsed, forKey: parsed.id) != nil {
+                        if audioData[parsed.id] != nil {
                             report.error("Audio Data id \(parsed.id) appears more than once")
+                        } else if audioSources.count + audioData.count
+                            >= maximumRetainedValidationRecords
+                        {
+                            if !audioLimitReported {
+                                report.error(
+                                    "the file contains more than "
+                                        + "\(maximumRetainedValidationRecords) Audio Source or "
+                                        + "Audio Data records; refusing to retain unbounded audio metadata")
+                                audioLimitReported = true
+                            }
+                        } else {
+                            audioData[parsed.id] = parsed
                         }
                     } catch {
                         report.error(
@@ -2285,6 +2483,11 @@ func validate(_ source: ToolReader) -> Report {
         return report
     }
     let keyframeDelta = dispatch?.keyframeDelta ?? false
+    if let dispatch, dispatch.flags & 0xFC != 0 {
+        report.error(
+            "Header flags contain reserved bits 0x\(hex2(dispatch.flags & 0xFC)); "
+                + "bits 2-7 must be zero")
+    }
 
     for (id, descriptor) in audioSources {
         if let dispatch,
@@ -2433,7 +2636,9 @@ func validate(_ source: ToolReader) -> Report {
     if keyframeDelta {
         validateKeyframeDeltaIndex(
             index, fields: physical.fields, durationSec: dispatch?.durationSec, report: &report)
-        validateKeyframeDeltaIdentity(source, physical: physical, index: index, report: &report)
+        validateKeyframeDeltaIdentity(
+            source, physical: physical, index: index,
+            expectedDistinct: dispatch?.gaussianCount, report: &report)
     } else {
         validateGaussianBirthIndexIntervals(
             index, fields: physical.fields, report: &report)
