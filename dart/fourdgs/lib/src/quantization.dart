@@ -52,8 +52,8 @@ final double kSupport = supportK(fourdgsDefaultCutoff);
 /// A threshold outside `(0, 1]` is not a threshold. It comes from a corrupt
 /// header, and it is refused here rather than allowed to become a domain error
 /// inside a logarithm.
-double supportK(double cutoff) {
-  checkCutoff(cutoff);
+double supportK(double cutoff, {String what = "the Header's cutoff"}) {
+  checkCutoff(cutoff, what: what);
   return math.sqrt(-2.0 * math.log(cutoff));
 }
 

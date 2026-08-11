@@ -1406,7 +1406,11 @@ void main() {
               isA<FourdgsMalformedFile>().having(
                 (FourdgsMalformedFile e) => e.message,
                 'names the value and the range',
-                allOf(contains('$bad'), contains('(0, 1]')),
+                allOf(
+                  contains('$bad'),
+                  contains('(0, 1]'),
+                  contains('passed to FourdgsGaussianSet.support'),
+                ),
               ),
             ),
             reason: 'support at cutoff $bad',

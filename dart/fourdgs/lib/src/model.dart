@@ -500,7 +500,10 @@ class FourdgsGaussianSet {
   ({Float64List lo, Float64List hi}) support({
     double cutoff = fourdgsDefaultCutoff,
   }) {
-    final k = supportK(cutoff);
+    final k = supportK(
+      cutoff,
+      what: 'the cutoff passed to FourdgsGaussianSet.support',
+    );
     final lo = Float64List(count);
     final hi = Float64List(count);
     for (int i = 0; i < count; i++) {

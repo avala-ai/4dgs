@@ -2084,3 +2084,10 @@ const int maxBandsPerChunk = 16;
 /// streamed path and was refused on the indexed one — the same file, two
 /// answers from one SDK.
 const int maxTrajectorySamples = 1000000;
+
+/// The former public name for [maxTrajectorySamples].
+///
+/// Kept because `records.dart` is exported from the package entry point and removing a
+/// top-level constant would make existing consumers fail to compile on upgrade.
+@Deprecated('Use maxTrajectorySamples')
+const int maxRigTrajectorySamples = maxTrajectorySamples;
