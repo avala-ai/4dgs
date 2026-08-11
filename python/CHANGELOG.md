@@ -35,11 +35,14 @@ The LOD proposal is documentation only and is not advertised here.
 - **`state_at_with_objects(gaussians, objects, t, cutoff)`**, exported at the top level, takes a
   `GaussianSet`, reconstructs its state at `t` itself, and composes an object layer onto the result
   in one call. `Scene.state_at` already did this for a decoded streamed scene; this is the same rule
-  where the gaussians and the layer arrive separately, as they do on the indexed path, and it saves
-  every caller from remembering `ObjectLayer.apply`. It has no Header to read, so `cutoff` defaults
-  to `0.05` where `Scene.state_at` passes its own file's `header.cutoff`: an indexed caller whose
-  file declares a different threshold has to pass `scene.header.cutoff`, or the visibility test runs
-  against `0.05` and a different set of gaussians can reach composition.
+  for a caller holding the two separately — a set from `scene.gaussians` or an import path, a layer
+  from `read_objects` — and it saves every caller from remembering `ObjectLayer.apply`. It is not a
+  drop-in for indexed output: `read_chunk` returns one chunk's decoded arrays and `IndexedScene`
+  carries no `GaussianSet`, so an indexed caller assembles one before composing. It has no Header to
+  read either, so `cutoff` defaults to `0.05` where `Scene.state_at` passes its own file's
+  `header.cutoff`: a caller whose file declares a different threshold has to pass
+  `scene.header.cutoff`, or the visibility test runs against `0.05` and a different set of gaussians
+  can reach composition.
 - **A ceiling on trajectory and object-track samples.** `MAX_TRAJECTORY_SAMPLES` bounds what one
   count-prefixed record may ask a reader to allocate before the bytes behind it are shown to exist.
   Shared by value with the other SDKs, because a ceiling only one implementation has is a file that
@@ -92,6 +95,11 @@ The LOD proposal is documentation only and is not advertised here.
   Reconstruction needs one per row now that each row resolves its own window, so a state without it
   is refused as `missing-window-index`, naming the §11.5 rule that makes the attribute required,
   rather than failing as a `KeyError` raised inside reconstruction.
+
+  The column is also range-checked now that it is read. An index outside the Window Table is refused
+  as `window-index-out-of-range` — the code the chunk decoder has raised since 0.2.0 for the same
+  fault — where the draft path never looked at the column and reconstructed everyone against window
+  0, so the same bytes were accepted here and refused on the regular chunk path.
 
 - **Cross-record rules run on a truncated file too, where they can.** `read` now applies the
   provenance and object-layer checks whatever `recover_truncated` returned, because a duplicate
