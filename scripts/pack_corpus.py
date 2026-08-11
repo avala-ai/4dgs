@@ -108,14 +108,16 @@ def sha256(path: str) -> str:
 
 
 def committed_sha256(path: str) -> str:
-    """SHA-256 of *path* at the checked-out commit, without buffering the blob.
+    """SHA-256 of *path* in the tagged source, without buffering the blob.
 
-    A release build runs from the corpus tag, so ``HEAD`` is the immutable source a
-    local rebuild is supposed to reproduce. Generated ``.4dgs`` bytes are pinned by
-    ``CHECKSUMS.txt``; expectations are tracked files and are pinned directly here.
-    Hashing the worktree copy into a fresh manifest would only bless an
-    environment-dependent textual difference.
+    A git checkout reads the blob from ``HEAD`` so a dirty or line-ending-filtered
+    worktree cannot silently bless itself. GitHub's tag source archives deliberately
+    contain no ``.git`` directory; there the extracted file *is* the tagged blob, so it
+    is hashed directly. Generated ``.4dgs`` bytes remain pinned by ``CHECKSUMS.txt``.
     """
+    if not os.path.lexists(os.path.join(ROOT, ".git")):
+        return sha256(path)
+
     relative = os.path.relpath(path, ROOT).replace(os.sep, "/")
     process = subprocess.Popen(
         ["git", "show", f"HEAD:{relative}"],
@@ -316,6 +318,12 @@ import json
 import sys
 
 def same_json(left, right):
+    # JSON has one number type. Python's bool is an int subclass, but JSON's
+    # boolean is distinct, so test it before accepting mixed int/float spellings.
+    if isinstance(left, bool) or isinstance(right, bool):
+        return type(left) is type(right) and left == right
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return left == right
     if type(left) is not type(right):
         return False
     if isinstance(left, dict):
@@ -378,6 +386,20 @@ def build(out_dir: str) -> str:
             file=sys.stderr,
         )
         raise SystemExit(1)
+
+    # Scan inputs only after proving that outputs cannot become inputs. realpath
+    # resolves an existing symlinked parent even when the final directory has not
+    # been created yet, and commonpath is component-aware (`data-old` is not inside
+    # `data`). This check precedes both corpus_members() and os.makedirs().
+    data_root = os.path.realpath(DATA)
+    output_root = os.path.realpath(os.path.abspath(out_dir))
+    try:
+        inside_data = os.path.commonpath([data_root, output_root]) == data_root
+    except ValueError:
+        # Different Windows drives cannot contain one another.
+        inside_data = False
+    if inside_data:
+        raise SystemExit(f"::error::the output directory is inside the corpus tree: {out_dir}")
 
     found = variants()
     committed = committed_checksums()
