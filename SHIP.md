@@ -111,7 +111,7 @@ git worktree add --no-track -b fix/rust-<slug>   ../4dgs-wt-rust   "$UPSTREAM/ma
 PRIMARY_GIT_DIR=$(git rev-parse --path-format=absolute --git-common-dir)
 PRIMARY=$(dirname "$PRIMARY_GIT_DIR")
 cd "$PRIMARY"
-PRIMARY=$(git worktree list --porcelain | awk '/^worktree /{print $2; exit}')
+PRIMARY=$(git worktree list --porcelain | sed -n 's/^worktree //p' | head -1)
 cd "$PRIMARY"
 state=$(gh pr view <n> --json state --jq .state)
 if [ "$state" = "MERGED" ] || [ "${ABANDON_CONFIRMED:-}" = "1" ]; then
