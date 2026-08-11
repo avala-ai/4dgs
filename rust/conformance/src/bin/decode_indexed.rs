@@ -19,7 +19,7 @@ use fourdgs::keyframe_delta_file::decode_indexed as decode_keyframe_delta_indexe
 use fourdgs::opcode;
 use fourdgs::readable::{FileReadable, Readable};
 use fourdgs::records::{ChunkIndexEntry, Header};
-use fourdgs::serialization::{check_magic, Records, MAGIC};
+use fourdgs::serialization::{Records, MAGIC};
 use fourdgs_conformance::{keyframe_delta_states_json, refusal_json, summarize, Extras, Failure};
 
 fn main() -> ExitCode {
@@ -64,9 +64,12 @@ impl<R: Readable> Readable for Counting<R> {
     }
 }
 
-/// The Header's temporal model, read without decoding the gaussians.
+/// The Header's temporal model, read only to choose the indexed decoder.
+///
+/// This is dispatch, not validation. In particular it must not check the magic: the
+/// selected indexed decoder owns that rule, so the invalid corpus can prove that the
+/// indexed path enforces it independently of the streamed path.
 fn temporal_model(path: &str, data: &[u8]) -> Result<Option<String>, Failure> {
-    check_magic(data).map_err(|e| Failure::from_error(path, &e))?;
     for record in Records::new(data, MAGIC.len()) {
         let record = record.map_err(|e| Failure::from_error(path, &e))?;
         if record.opcode == opcode::HEADER {
