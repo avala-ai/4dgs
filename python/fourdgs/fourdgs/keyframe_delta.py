@@ -127,8 +127,7 @@ def apply_delta(
     if has_rotation_index != has_rotation_bins:
         missing = op.A_ROTATION if has_rotation_index else op.A_ROTATION_INDEX
         raise _refuse(
-            f"an update carries only one half of the smallest-three rotation pair; "
-            f"attribute {missing} is missing",
+            f"an update carries only one half of the smallest-three rotation pair; attribute {missing} is missing",
             "incomplete-rotation-update",
         )
 

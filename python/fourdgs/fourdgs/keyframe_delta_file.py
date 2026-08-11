@@ -737,8 +737,7 @@ def _delta_chunk_groups(content) -> tuple[rec.DeltaChunkHeader, memoryview, memo
         codec = {"deflate": CODEC_DEFLATE, "zstd": CODEC_ZSTD}.get(head.compression)
         if codec is None:
             raise UnsupportedCodec(
-                f"delta chunk at t0={head.t0} is compressed with {head.compression!r}, "
-                "which this build does not know",
+                f"delta chunk at t0={head.t0} is compressed with {head.compression!r}, which this build does not know",
                 code="unknown-stream-codec",
             )
         records = decompress(bytes(stored), codec, head.uncompressed_size)
@@ -1108,7 +1107,11 @@ def compose_chain(
     return state
 
 
-def _decode_index_bands(data: bytes, entry: rec.ChunkIndexEntry) -> None:
+def _decode_index_bands(
+    data: bytes,
+    entry: rec.ChunkIndexEntry,
+    on_band: Callable[[int, int], None] | None = None,
+) -> None:
     """Decode and discard every SH band the entry declares."""
     state_content = _record_at(data, entry.chunk_offset, entry.chunk_length)
     expected_rows = (
@@ -1140,6 +1143,8 @@ def _decode_index_bands(data: bytes, entry: rec.ChunkIndexEntry) -> None:
                 f"{declared_band}; the record at {offset} declares band {record_band}",
                 code="index-record-mismatch",
             )
+        if on_band is not None:
+            on_band(declared_band, offset)
         attribute, values = decode_stream(band_content)
         if attribute != op.SH_BAND_STREAM:
             raise MalformedFile(
@@ -1166,12 +1171,54 @@ def check_index_bands(data: bytes, index: list[rec.ChunkIndexEntry], sh_degree: 
     before them, and compare the resulting byte ranges with the summary. The walk retains
     only offsets and lengths; no band payload is accumulated.
     """
-    physical: dict[int, list[tuple[int, int, int]]] = {}
+    by_offset: dict[int, rec.ChunkIndexEntry] = {}
+    for entry in index:
+        if entry.chunk_offset in by_offset:
+            raise MalformedFile(
+                f"two chunk index entries name the state chunk at {entry.chunk_offset}",
+                code="index-record-mismatch",
+            )
+        by_offset[entry.chunk_offset] = entry
+
+    wanted = list(range(1, sh_degree + 1))
+    seen: set[int] = set()
     owner: int | None = None
+    indexed: rec.ChunkIndexEntry | None = None
+    following: list[tuple[int, int, int]] = []
+
+    def finish_owner() -> None:
+        nonlocal owner, indexed, following
+        if owner is None:
+            return
+        if indexed is None:
+            raise MalformedFile(
+                f"the state chunk at {owner} is not named by the Chunk Index",
+                code="index-record-mismatch",
+            )
+        if indexed.bands != following:
+            raise MalformedFile(
+                f"the chunk index entry at {owner} declares SH band ranges "
+                f"{indexed.bands}; the physical records following that chunk are {following}",
+                code="index-record-mismatch",
+            )
+        bands = [band for band, _offset, _length in following]
+        if bands != wanted:
+            raise MalformedFile(
+                f"the state chunk at {owner} is followed by SH bands {bands}; "
+                f"the Header declares degree {sh_degree}, requiring bands {wanted}",
+                code="index-record-mismatch",
+            )
+        seen.add(owner)
+        owner = None
+        indexed = None
+        following = []
+
     for record in iter_records(data, len(MAGIC)):
         if record.opcode in (op.CHUNK, op.DELTA_CHUNK):
+            finish_owner()
             owner = record.offset
-            physical[owner] = []
+            indexed = by_offset.get(owner)
+            following = []
             continue
         if record.opcode == op.SH_BAND_STREAM:
             if owner is None:
@@ -1180,27 +1227,15 @@ def check_index_bands(data: bytes, index: list[rec.ChunkIndexEntry], sh_degree: 
                     code="index-record-mismatch",
                 )
             band = Cursor(record.content).u8()
-            physical[owner].append((band, record.offset, 9 + len(record.content)))
+            following.append((band, record.offset, 9 + len(record.content)))
             continue
-        owner = None
+        finish_owner()
 
+    finish_owner()
     for entry in index:
-        following = physical.get(entry.chunk_offset, [])
-        if entry.bands != following:
+        if entry.chunk_offset not in seen:
             raise MalformedFile(
-                f"the chunk index entry at {entry.chunk_offset} declares SH band ranges "
-                f"{entry.bands}; the physical records following that chunk are {following}",
-                code="index-record-mismatch",
-            )
-
-    for entry in index:
-        following = physical.get(entry.chunk_offset, [])
-        bands = [band for band, _offset, _length in following]
-        wanted = list(range(1, sh_degree + 1))
-        if bands != wanted:
-            raise MalformedFile(
-                f"the state chunk at {entry.chunk_offset} is followed by SH bands {bands}; "
-                f"the Header declares degree {sh_degree}, requiring bands {wanted}",
+                f"the chunk index entry at {entry.chunk_offset} does not name a physical state chunk",
                 code="index-record-mismatch",
             )
 
@@ -1210,6 +1245,7 @@ def scan_indexed(
     index: list[rec.ChunkIndexEntry],
     windows: list[tuple[float, float]],
     on_entry: Callable[[int, rec.ChunkIndexEntry], None] | None = None,
+    on_band: Callable[[int, int], None] | None = None,
 ):
     """Compose an indexed timeline once, retaining only current and GOP-keyframe state.
 
@@ -1346,7 +1382,7 @@ def scan_indexed(
                 code="index-record-mismatch",
             )
         check_window_indices_of(state, windows)
-        _decode_index_bands(data, entry)
+        _decode_index_bands(data, entry, on_band)
         yield entry, state
 
 
@@ -1354,6 +1390,8 @@ def scan_streamed(
     data: bytes,
     on_record: Callable[[int, int], None] | None = None,
     on_state: Callable[[int, float, float], None] | None = None,
+    *,
+    sh_degree: int | None = None,
 ):
     """Every state a front-to-back reader composes, one at a time, keeping none.
 
@@ -1375,18 +1413,47 @@ def scan_streamed(
     previous_at: int | None = None
     previous_state: State | None = None
     previous_depth: int | None = None
+    declared_degree = sh_degree
+    band_owner: int | None = None
+    band_rows = 0
+    bands: list[int] = []
+
+    def finish_bands() -> None:
+        nonlocal band_owner, band_rows, bands
+        if band_owner is None:
+            return
+        if declared_degree is not None:
+            wanted = list(range(1, declared_degree + 1))
+            if bands != wanted:
+                raise MalformedFile(
+                    f"the state chunk at {band_owner} is followed by SH bands {bands}; "
+                    f"the Header declares degree {declared_degree}, requiring bands {wanted}",
+                    code="index-record-mismatch",
+                )
+        band_owner = None
+        band_rows = 0
+        bands = []
 
     for record in iter_records(data, len(MAGIC)):
-        if on_record is not None and record.opcode in (op.CHUNK, op.DELTA_CHUNK, op.SH_BAND_STREAM):
-            on_record(record.offset, record.opcode)
+        if record.opcode != op.SH_BAND_STREAM:
+            finish_bands()
+        if record.opcode == op.HEADER and sh_degree is None:
+            declared_degree = rec.Header.parse(record.content).sh_degree
+            continue
         if record.opcode == op.CHUNK:
+            if on_record is not None:
+                on_record(record.offset, record.opcode)
             head = rec.parse_chunk(record.content)[0]
             ids, bins = _keyframe_from_chunk(record.content)
             state = keyframe_state(ids, bins)
             keyframe_at, keyframe_state_ = record.offset, state
             depth = 0
             t0, t1 = head.t0, head.t1
+            band_owner = record.offset
+            band_rows = int(head.count)
         elif record.opcode == op.DELTA_CHUNK:
+            if on_record is not None:
+                on_record(record.offset, record.opcode)
             head_peek = rec.parse_delta_chunk_block(record.content)[0]
             if head_peek.reference_offset >= record.offset:
                 raise MalformedFile(
@@ -1422,21 +1489,38 @@ def scan_streamed(
             state, head = _compose_delta(reference, record.content)
             depth = int(head.depth)
             t0, t1 = head.t0, head.t1
+            band_owner = record.offset
+            band_rows = int(head.birth_count)
             # Dropped here rather than left bound in this frame: a generator is suspended
             # at its yield for as long as the caller holds what it yielded, so a name
             # still bound is a population still resident — and this one is the state
             # before last, which nothing else needs once the composition is done.
             reference = None
         elif record.opcode == op.SH_BAND_STREAM:
+            if on_record is not None:
+                on_record(record.offset, record.opcode)
+            if band_owner is None:
+                raise MalformedFile(
+                    f"SH Band Stream at byte {record.offset} does not immediately follow a state chunk",
+                    code="index-record-mismatch",
+                )
             band = Cursor(record.content)
-            band.u8()
-            attribute, _values = decode_stream(band)
+            band_number = band.u8()
+            attribute, values = decode_stream(band)
             if attribute != op.SH_BAND_STREAM:
                 raise MalformedFile(
                     f"the SH Band Stream at {record.offset} declares inner attribute_id "
                     f"{attribute}; version 1 fixes it at {op.SH_BAND_STREAM}",
                     code="index-record-mismatch",
                 )
+            expected_shape = (band_rows, 3 * (2 * band_number + 1))
+            if values.shape != expected_shape:
+                raise MalformedFile(
+                    f"the SH Band Stream at {record.offset} for band {band_number} decodes to "
+                    f"shape {values.shape}; its owning state record requires {expected_shape}",
+                    code="stream-element-count-mismatch",
+                )
+            bands.append(band_number)
             continue
         else:
             continue
@@ -1444,6 +1528,8 @@ def scan_streamed(
         if on_state is not None:
             on_state(record.offset, t0, t1)
         yield record.offset, (0 if record.opcode == op.CHUNK else 1), state
+
+    finish_bands()
 
 
 class _IdentityPartitionFull(Exception):

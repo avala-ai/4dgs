@@ -40,8 +40,10 @@ from fourdgs.keyframe_delta_writer import KeyframeDeltaOptions, Sample
 from fourdgs.serialization import (
     CODEC_DEFLATE,
     MAGIC,
+    Cursor,
     compress,
     crc32,
+    decode_stream,
     encode_stream,
     iter_records,
     put_blob,
@@ -323,6 +325,31 @@ class TestKeyframeDelta:
         assert not report.ok
         assert any("contains a Header declaring" in finding.message for finding in report.findings)
 
+    def test_an_indexless_sequence_requires_every_declared_sh_band(self):
+        data = _patch_sh_degree(_single_keyframe_file(write_index=False), 1)
+        report = validate(data)
+        assert not report.ok
+        assert any("followed by SH bands []; the Header declares degree 1" in f.message for f in report.findings)
+
+    def test_an_indexless_keyframe_delta_band_must_match_its_owner_shape(self):
+        data = _patch_sh_degree(_single_keyframe_file(write_index=False), 1)
+        malformed = next(
+            iter_records(
+                put_record(
+                    op.SH_BAND_STREAM,
+                    bytes([1])
+                    + encode_stream(
+                        op.SH_BAND_STREAM,
+                        np.zeros((1, 3), dtype=np.int64),
+                        channels=3,
+                    ),
+                )
+            )
+        )
+        report = validate(_splice(data, malformed))
+        assert not report.ok
+        assert any("owning state record requires (1, 9)" in f.message for f in report.findings)
+
     def test_the_index_and_the_delta_chunk_must_agree_field_by_field(self):
         """§5.8: four index fields duplicate what the Delta Chunk states, and "a reader
         MUST refuse a file where the index and the record disagree, naming the field".
@@ -350,9 +377,7 @@ class TestKeyframeDelta:
 
     def test_every_keyframe_delta_index_entry_carries_the_extension(self):
         data = _keyframe_file()
-        report = validate(
-            _repack_summary(data, lambda i, entry: _with(entry, extended=False) if i == 0 else entry)
-        )
+        report = validate(_repack_summary(data, lambda i, entry: _with(entry, extended=False) if i == 0 else entry))
         assert not report.ok
         assert any("omits chunk_kind" in finding.message for finding in report.findings)
 
@@ -462,6 +487,19 @@ class TestKeyframeDelta:
         with pytest.raises(UnsupportedCodec, match="unknown stream codec 9"):
             kdf.compose_chain(data + band_blob, index, indexed)
 
+    def test_an_indexed_keyframe_delta_band_refusal_names_the_band_record(self):
+        data = _patch_sh_degree(_single_keyframe_file(write_index=True), 1)
+        stream = bytearray(encode_stream(op.SH_BAND_STREAM, np.zeros((1, 9), dtype=np.int64), channels=9, codec=0))
+        stream[3] = 9
+        data, band_at = _insert_single_indexed_band(data, put_record(op.SH_BAND_STREAM, bytes([1]) + stream))
+
+        report = validate(data)
+        named = [f.refusal for f in report.findings if f.refusal is not None]
+        refusal_ = next(item for item in named if item.code == "unknown-stream-codec")
+        assert refusal_.site is not None
+        assert refusal_.site.offset == band_at
+        assert "SH Band Stream for band 1" in refusal_.site.what
+
     def test_indexed_keyframe_delta_bands_must_have_the_declared_shape(self):
         data = _keyframe_file()
         index = _index_entries(data)
@@ -505,9 +543,11 @@ class TestKeyframeDelta:
 
         report = validate(data)
         assert not report.ok
-        assert any("physical records following that chunk" in finding.message for finding in report.findings), (
-            report.findings
-        )
+        assert any(
+            "physical records following that chunk" in finding.message
+            or "the Header declares degree 1, requiring bands [1]" in finding.message
+            for finding in report.findings
+        ), report.findings
 
     def test_the_index_and_the_composed_population_must_agree(self):
         """`live_count` is the one index field only a decode can settle: the population
@@ -613,6 +653,24 @@ class TestKeyframeDelta:
         assert not report.ok
         assert any("preceding interval ends" in finding.message for finding in report.findings)
 
+    def test_an_indexless_sequence_cannot_tile_file_order_with_a_reversed_interval(self):
+        data = bytearray(_keyframe_file(write_index=False))
+        states = [
+            record for record in iter_records(bytes(data), len(MAGIC)) if record.opcode in (op.CHUNK, op.DELTA_CHUNK)
+        ]
+        assert len(states) >= 3
+        # [0,2), [2,1), [1,3) is adjacent in physical order and reaches the same
+        # endpoint. Only the middle interval being inverted exposes the old check.
+        for record, t0, t1 in (
+            (states[0], 0.0, 2.0),
+            (states[1], 2.0, 1.0),
+            (states[2], 1.0, 3.0),
+        ):
+            struct.pack_into("<dd", data, record.offset + 9, t0, t1)
+        report = validate(bytes(data))
+        assert not report.ok
+        assert any("inverted interval [2.0, 1.0)" in finding.message for finding in report.findings)
+
 
 class TestTheIndexIsData:
     """An index entry is data, and data in an untrusted file can say anything.
@@ -647,15 +705,11 @@ class TestTheIndexIsData:
         report = validate(
             _repack_summary(
                 data,
-                lambda i, entry: (
-                    _with(entry, chunk_offset=len(data), chunk_length=0) if i == 0 else entry
-                ),
+                lambda i, entry: _with(entry, chunk_offset=len(data), chunk_length=0) if i == 0 else entry,
             )
         )
         assert not report.ok
-        assert any("does not contain a complete record header" in f.message for f in report.findings), (
-            report.findings
-        )
+        assert any("does not contain a complete record header" in f.message for f in report.findings), report.findings
 
 
 class TestSHBandStreams:
@@ -713,13 +767,17 @@ class TestSHBandStreams:
 
     @pytest.mark.parametrize("indexed", [False, True])
     def test_a_gaussian_birth_band_must_match_its_owning_chunk_shape(self, indexed):
-        paths = [
-            p
-            for p in _variants(CORPUS)
-            if "SHDegree2" in p.stem and ("UseChunkIndex" in p.stem) is indexed
-        ]
-        _require_corpus(paths, f"{'indexed' if indexed else 'unindexed'} SH-degree-2 variants")
-        data = bytearray(paths[0].read_bytes())
+        paths = [p for p in _variants(CORPUS) if "SHDegree2" in p.stem and "UseChunkIndex" in p.stem]
+        _require_corpus(paths, "indexed SH-degree-2 variants")
+        data = paths[0].read_bytes()
+        if not indexed:
+            # The generated matrix currently has no indexless SH fixture. Strip only the
+            # optional summary from a generated file; all physical Chunks and bands stay
+            # byte-for-byte identical, and the Footer declares that no index exists.
+            footer_record = _first_record(data, op.FOOTER)
+            footer = rec.Footer.parse(footer_record.content)
+            data = data[: footer.summary_start] + rec.Footer().encode() + MAGIC
+        data = bytearray(data)
         band = _first_record(bytes(data), op.SH_BAND_STREAM)
         assert band is not None
         # The stream remains completely framed and its payload length is unchanged. A
@@ -730,6 +788,62 @@ class TestSHBandStreams:
         report = validate(bytes(data))
         assert not report.ok
         assert any("owning Chunk requires" in f.message for f in report.findings), report.findings
+
+
+class TestWholeFileCompatibilityGates:
+    @pytest.mark.parametrize(
+        ("opcode", "mutate", "code"),
+        [
+            (
+                op.HEADER,
+                lambda value: setattr(value, "temporal_model", "future-model"),
+                "unknown-temporal-model",
+            ),
+            (
+                op.QUANTIZATION,
+                lambda value: setattr(value, "scheme", "uniform-v9"),
+                "unknown-quantization-scheme",
+            ),
+        ],
+    )
+    def test_a_later_gaussian_birth_compatibility_record_is_still_gated(self, opcode, mutate, code):
+        data = _real_file()
+        original = _first_record(data, opcode)
+        value = rec.Header.parse(original.content) if opcode == op.HEADER else rec.Quantization.parse(original.content)
+        mutate(value)
+        later = next(iter_records(value.encode()))
+        report = validate(_splice(data, later))
+        named = [f.refusal for f in report.findings if f.refusal is not None]
+        refusal_ = next(item for item in named if item.code == code)
+        assert refusal_.site is not None
+        assert refusal_.site.offset != original.offset
+
+    def test_a_gaussian_birth_stream_uses_the_registry_channel_count(self):
+        data = _real_file(write_index=False)
+        chunk = _first_record(data, op.CHUNK)
+        head, streams = rec.parse_chunk(chunk.content)
+        assert head.compression == ""
+        cursor = Cursor(bytes(streams))
+        rewritten: list[bytes] = []
+        while cursor.remaining():
+            start = cursor.pos
+            attribute, _values = decode_stream(cursor)
+            if attribute == op.A_POSITION:
+                rewritten.append(
+                    encode_stream(
+                        attribute,
+                        np.zeros((head.count, 1), dtype=np.int64),
+                        channels=1,
+                    )
+                )
+            else:
+                rewritten.append(bytes(cursor.buf[start : cursor.pos]))
+        replacement = rec.encode_chunk(head.t0, head.t1, head.level, head.count, b"".join(rewritten))
+        malformed = data[: chunk.offset] + replacement + data[chunk.offset + 9 + len(chunk.content) :]
+
+        report = validate(malformed)
+        assert not report.ok
+        assert any("attribute 0 declares 1 channels; the registry says 3" in f.message for f in report.findings)
 
 
 class TestProvenanceRecords:
@@ -1043,6 +1157,50 @@ def _patch_gaussian_count(data: bytes, count: int) -> bytes:
     now = header.encode()
     assert len(was) == len(now), "the count is fixed-width; the file must not move"
     return data.replace(was, now, 1)
+
+
+def _patch_sh_degree(data: bytes, degree: int) -> bytes:
+    record = _first_record(data, op.HEADER)
+    header = rec.Header.parse(record.content)
+    before = header.encode()
+    header.sh_degree = degree
+    after = header.encode()
+    assert len(before) == len(after)
+    return data[: record.offset] + after + data[record.offset + len(before) :]
+
+
+def _single_keyframe_file(*, write_index: bool) -> bytes:
+    duration = 1.0
+    sample = Sample(
+        t0=0.0,
+        ids=np.array([7]),
+        gaussians=_keyframe_gaussians([[0.0, 0.0, 0.0]], duration, None),
+    )
+    return kdf.write_sequence(
+        [sample],
+        duration,
+        kd=KeyframeDeltaOptions(keyframe_every=1),
+        write_index=write_index,
+    )
+
+
+def _insert_single_indexed_band(data: bytes, band: bytes) -> tuple[bytes, int]:
+    footer_record = _first_record(data, op.FOOTER)
+    footer = rec.Footer.parse(footer_record.content)
+    entries = _index_entries(data)
+    assert len(entries) == 1
+    band_at = footer.summary_start
+    entry = _with(entries[0], bands=[(1, band_at, len(band))])
+    summary_records = [
+        record
+        for record in iter_records(data, footer.summary_start)
+        if record.offset < footer_record.offset and record.opcode != op.CHUNK_INDEX
+    ]
+    summary = entry.encode() + b"".join(put_record(record.opcode, bytes(record.content)) for record in summary_records)
+    footer.summary_start += len(band)
+    if footer.summary_crc:
+        footer.summary_crc = crc32(summary)
+    return data[:band_at] + band + summary + footer.encode() + MAGIC, band_at
 
 
 def _keyframe_file(*, two_windows: bool = False, **options) -> bytes:

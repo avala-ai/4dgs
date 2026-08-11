@@ -164,6 +164,17 @@ def decode_streams(
                 f"the chunk declares {count} gaussians",
                 code="stream-element-count-mismatch",
             )
+        expected_channels = op.ATTRIBUTE_CHANNELS.get(attribute)
+        if expected_channels is not None and values.shape[1] != expected_channels:
+            if attribute == op.A_OBJECT_ID:
+                raise MalformedFile(
+                    f"the object_id stream declares {values.shape[1]} channels, the format defines 1",
+                    code="invalid-object-id-stream",
+                )
+            raise MalformedFile(
+                f"attribute {attribute} declares {values.shape[1]} channels; the registry says {expected_channels}",
+                code="stream-channel-count-mismatch",
+            )
     if not count:
         empty = np.zeros((0, 3), dtype=np.float64)
         return {
@@ -193,11 +204,6 @@ def decode_streams(
     object_id = None
     if op.A_OBJECT_ID in got:
         codes = got[op.A_OBJECT_ID]
-        if codes.shape[1] != 1:
-            raise MalformedFile(
-                f"the object_id stream declares {codes.shape[1]} channels, the format defines 1",
-                code="invalid-object-id-stream",
-            )
         codes = codes[:, 0]
         if np.any(codes < np.iinfo(np.int32).min) or np.any(codes > np.iinfo(np.int32).max):
             index = int(np.flatnonzero((codes < np.iinfo(np.int32).min) | (codes > np.iinfo(np.int32).max))[0])

@@ -520,9 +520,7 @@ def validate(data: bytes) -> Report:
     # guess whether anything is salvageable; this says how much.
     if walk.cut is not None:
         record_start = (
-            f"The incomplete record starts at byte {walk.cut.record_at:,}. "
-            if walk.cut.record_at is not None
-            else ""
+            f"The incomplete record starts at byte {walk.cut.record_at:,}. " if walk.cut.record_at is not None else ""
         )
         report.note(
             f"the file is cut at byte {walk.cut.at:,}: {walk.cut.reason}. "
@@ -550,6 +548,9 @@ def _check_gaussian_birth(data: bytes, walk: Walk, report: Report) -> None:
     window index are both invisible to everything above. Both are in the invalid corpus,
     and both used to validate clean.
     """
+    if not _check_compatibility_records(walk, data, report, "gaussian-birth"):
+        return
+
     try:
         from .indexed_reader import open_indexed
 
@@ -582,38 +583,8 @@ def _check_keyframe_delta(data: bytes, walk: Walk, report: Report, header: rec.H
     report can name.
     """
     from . import keyframe_delta_file as kdf
-    from .registry import check_quantization_scheme, check_temporal_model
 
-    # The compatibility gate the gaussian-birth branch gets from `open_indexed`. The
-    # keyframe-delta reader parses the front matter without consulting the registry, so a
-    # file declaring a quantization scheme no build implements was reported valid on this
-    # path and refused on the other — the same bytes, two answers, decided by a field that
-    # has nothing to do with quantization. Every Header is checked as encountered too:
-    # selecting this path from the last Header does not excuse an earlier Header that a
-    # streamed decoder would refuse.
-    gate_site: Site | None = None
-    try:
-        for frame in walk.intact_records():
-            if frame.opcode not in (op.HEADER, op.QUANTIZATION):
-                continue
-            content = frame.content(data)
-            if content is None:
-                continue
-            gate_site = Site(frame.offset, f"the {op.name(frame.opcode)} record")
-            if frame.opcode == op.HEADER:
-                model = rec.Header.parse(content).temporal_model
-                if model != "keyframe-delta":
-                    # Preserve the named registry refusal for an unknown model. A known
-                    # gaussian-birth value is simply wrong for this selected path.
-                    check_temporal_model(model)
-                    raise FourdgsError(
-                        f"a keyframe-delta sequence contains a Header declaring {model!r}",
-                        code="wrong-temporal-model",
-                    )
-            else:
-                check_quantization_scheme(rec.Quantization.parse(content).scheme)
-    except FourdgsError as exc:
-        report.refused("a seeking reader cannot open this file: ", exc, walk, gate_site)
+    if not _check_compatibility_records(walk, data, report, "keyframe-delta"):
         return
 
     current_site: Site | None = None
@@ -637,6 +608,11 @@ def _check_keyframe_delta(data: bytes, walk: Walk, report: Report, header: rec.H
 
         def interval(offset: int, t0: float, t1: float) -> None:
             nonlocal first_t0, previous_t1, last_t1
+            if t1 < t0:
+                raise FourdgsError(
+                    f"state chunk at {offset} has an inverted interval [{t0}, {t1})",
+                    code="non-tiling-chunks",
+                )
             if first_t0 is None:
                 first_t0 = t0
                 if t0 != 0.0:
@@ -653,15 +629,17 @@ def _check_keyframe_delta(data: bytes, walk: Walk, report: Report, header: rec.H
 
         try:
             for _offset, _kind, state in kdf.scan_streamed(
-                data, on_record=visiting_record, on_state=interval
+                data,
+                on_record=visiting_record,
+                on_state=interval,
+                sh_degree=header.sh_degree,
             ):
                 kdf.check_window_indices_of(state, windows)
                 identity_audit.observe(_offset, state)
                 del state
             if last_t1 != header.duration_sec:
                 raise FourdgsError(
-                    f"the last keyframe-delta state ends at {last_t1}; the Header duration is "
-                    f"{header.duration_sec}",
+                    f"the last keyframe-delta state ends at {last_t1}; the Header duration is {header.duration_sec}",
                     code="timeline-gap",
                 )
         except FourdgsError as exc:
@@ -676,20 +654,32 @@ def _check_keyframe_delta(data: bytes, walk: Walk, report: Report, header: rec.H
             return
         i = 0
         entry = opened.index[0] if opened.index else None
+        band_site: Site | None = None
 
         def visiting(ordinal: int, candidate: rec.ChunkIndexEntry) -> None:
-            nonlocal i, entry
+            nonlocal i, entry, band_site
             i, entry = ordinal, candidate
+            band_site = None
+
+        def visiting_band(band: int, offset: int) -> None:
+            nonlocal band_site
+            band_site = Site(offset, f"the SH Band Stream for band {band} at index entry {i}")
 
         try:
-            for _entry, state in kdf.scan_indexed(data, opened.index, opened.windows, visiting):
+            for _entry, state in kdf.scan_indexed(
+                data,
+                opened.index,
+                opened.windows,
+                visiting,
+                visiting_band,
+            ):
                 identity_audit.observe(_entry.chunk_offset, state)
                 # Dropped before the next entry is composed, not merely rebound after it:
                 # the generator retains only current and GOP-keyframe state.
                 del state
         except FourdgsError as exc:
-            site = None
-            if entry is not None:
+            site = band_site
+            if site is None and entry is not None:
                 what = "Chunk" if entry.kind == 0 else "DeltaChunk"
                 site = Site(entry.chunk_offset, f"the {what} record at index entry {i}")
             report.refused("a chunk does not decode: ", exc, walk, site)
@@ -705,9 +695,49 @@ def _check_keyframe_delta(data: bytes, walk: Walk, report: Report, header: rec.H
         distinct = identity_audit.distinct
     if distinct != header.gaussian_count:
         report.error(
-            f"Header declares {header.gaussian_count} gaussians; the sequence carries "
-            f"{distinct} distinct gaussian ids"
+            f"Header declares {header.gaussian_count} gaussians; the sequence carries {distinct} distinct gaussian ids"
         )
+
+
+def _check_compatibility_records(
+    walk: Walk,
+    data: bytes,
+    report: Report,
+    expected_model: str,
+) -> bool:
+    """Gate every Header and Quantization record, including copies after the first Chunk.
+
+    Indexed openers stop reading front matter at the first state record. Validation walks
+    the whole file, so a later record must not be allowed to smuggle in a model or scheme
+    that a front-to-back reader would refuse. The selected model is checked too: a known
+    value for the other decoder is malformed here, while an unknown value keeps its named
+    registry refusal.
+    """
+    from .registry import check_quantization_scheme, check_temporal_model
+
+    gate_site: Site | None = None
+    try:
+        for frame in walk.intact_records():
+            if frame.opcode not in (op.HEADER, op.QUANTIZATION):
+                continue
+            content = frame.content(data)
+            if content is None:
+                continue
+            gate_site = Site(frame.offset, f"the {op.name(frame.opcode)} record")
+            if frame.opcode == op.HEADER:
+                model = rec.Header.parse(content).temporal_model
+                if model != expected_model:
+                    check_temporal_model(model)
+                    raise FourdgsError(
+                        f"a {expected_model} sequence contains a Header declaring {model!r}",
+                        code="wrong-temporal-model",
+                    )
+            else:
+                check_quantization_scheme(rec.Quantization.parse(content).scheme)
+    except FourdgsError as exc:
+        report.refused("a seeking reader cannot open this file: ", exc, walk, gate_site)
+        return False
+    return True
 
 
 def _window_table(walk: Walk, data: bytes) -> list[tuple[float, float]]:
