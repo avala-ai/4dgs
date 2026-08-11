@@ -367,11 +367,29 @@ and extend the bullet's final sentence:
 > position-only update to object `7` remains on object `7`. §11.5 defines how the implicit zero
 > column and carry-forward rule participate in composition.
 
-### 5.5 Into §13's changelog table
+### 5.5 In `registry.md`, replacing the `objects` profile row
 
-| Change                                                                                                                    | Kind                      |
-| ------------------------------------------------------------------------------------------------------------------------- | ------------------------- |
-| §11.3/§11.5/§5.18/§6.6 added: object tracks compose after the delta chain, and `object_id` in an update group is absolute | clarification, rule added |
+| value     | promises                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `objects` | One Object Table is present, and every gaussian introduction states membership explicitly: every non-empty `gaussian-birth` Chunk, every non-empty `keyframe-delta` keyframe Chunk, and every non-empty Delta Chunk birth group carries `object_id`. Updates that do not relabel a gaussian MAY omit `object_id` and carry the reference value forward; death groups never carry it. Thus a position-only update or a non-empty death-only Delta Chunk satisfies the profile without an `object_id` stream. Tracks and embeddings remain optional. |
+
+The promise is about rows entering a reconstructed population, not about every physical record that
+happens to have a nonzero count. That is the only interpretation compatible with §5.18: a death
+group may carry only `gaussian_id`, while an update lane is intentionally sparse by attribute and
+omission means carry-forward. It also preserves what the existing `gaussian-birth` wording meant —
+every row a Chunk introduces has explicit membership — and extends that meaning to the two places a
+`keyframe-delta` chain introduces rows.
+
+Profiles constrain writers, not readers, as the registry already states. A decoder still accepts a
+conforming file whose `objects` profile makes a promise it does not meet; a profile validator or
+producer test is what reports the broken promise. This proposal therefore adds structural generator
+assertions rather than inventing a decode refusal.
+
+### 5.6 Into §13's changelog table
+
+| Change                                                                                                                                                                                   | Kind                      |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------- |
+| §11.3/§11.5/§5.18/§6.6 and registry added: object tracks compose after the delta chain, `object_id` in an update group is absolute, and the `objects` profile applies to introduced rows | clarification, rule added |
 
 with the accompanying note:
 
@@ -392,20 +410,21 @@ the name so the current harness selects both streamed and indexed runners; this 
 proved if only the front-to-back path sees the object records and membership lanes. One variant
 carries every corner the rules above decide.
 
-- **Shape:** at least eight state chunks in two groups of pictures, with a chained delta in each, an
-  Object Table naming two objects, and distinguishable Object Tracks for ids `7` and `0x8000000C`
-  (`2147483660`), both with samples that put a non-identity pose at every probe. The first keyframe
-  physically carries attribute `14`, with a mix of background and id `7`, so the keyframe decoder,
-  canonical membership and id `7` track are exercised before any delta. The second keyframe
-  deliberately omits `object_id`, so that group begins with implicit zero ids. Its first delta's
-  **birth group alone** introduces id `7` on a new gaussian; no survivor update in that delta
-  carries `object_id`. A later delta assigns one implicit-zero survivor to id `7`, a position-only
-  delta updates it without an `object_id` lane, and the next delta relabels it to the separately
-  tracked high-bit id `0x8000000C`. A final complete source sample omits its `object_id` column
-  after that non-zero state, requiring the writer to emit an absolute zero restatement; that delta
-  also births a gaussian with the lane omitted, which must receive zero. At least one gaussian
-  carries per-gaussian `motion` so that `R * (position + motion * dt) + T` is distinguishable from
-  `R * position + T`.
+- **Shape:** `Header.profile` is `""`, because this variant deliberately exercises legal implicit
+  membership rather than the stronger `objects` producer promise. It has at least eight state chunks
+  in two groups of pictures, with a chained delta in each, an Object Table naming two objects, and
+  distinguishable Object Tracks for ids `7` and `0x8000000C` (`2147483660`), both with samples that
+  put a non-identity pose at every probe. The first keyframe physically carries attribute `14`, with
+  a mix of background and id `7`, so the keyframe decoder, canonical membership and id `7` track are
+  exercised before any delta. The second keyframe deliberately omits `object_id`, so that group
+  begins with implicit zero ids. Its first delta's **birth group alone** introduces id `7` on a new
+  gaussian; no survivor update in that delta carries `object_id`. A later delta assigns one
+  implicit-zero survivor to id `7`, a position-only delta updates it without an `object_id` lane,
+  and the next delta relabels it to the separately tracked high-bit id `0x8000000C`. A final
+  complete source sample omits its `object_id` column after that non-zero state, requiring the
+  writer to emit an absolute zero restatement; that delta also births a gaussian with the lane
+  omitted, which must receive zero. At least one gaussian carries per-gaussian `motion` so that
+  `R * (position + motion * dt) + T` is distinguishable from `R * position + T`.
 - **The second group's first birth introduces `object_id`.** Its absolute birth row is appended to a
   materialized zero column for all survivors. This is the inverse transition to an omitted birth
   after the column exists, and catches a generic composer that appends an attribute array containing
@@ -447,22 +466,36 @@ carries every corner the rules above decide.
   (§11.2), so it does not inherit the tie hazard [#95](https://github.com/avala-ai/4dgs/issues/95)
   describes for `canonical.py`'s `states`. That is worth keeping — it means this variant can be
   added without waiting on #95.
+- **The `objects` profile has its own case.** Add `KeyframeDeltaObjectsProfile-UseChunkIndex` with
+  `Header.profile = "objects"`, one Object Table, two non-empty keyframes, a non-empty birth group,
+  a position-only update and a death-only Delta Chunk. Every keyframe and the birth group physically
+  carries `object_id`, including explicit zero rows; the position-only update omits the lane and
+  carries membership forward; the death group carries only `gaussian_id`. Before writing the
+  expectation, the generator frames the file and asserts those exact presences and absences. The
+  case therefore fails a writer that applies the old “every non-empty chunk” wording literally to
+  death-only deltas, one that incorrectly requires the lane on every update, or one that forgets to
+  put it on introduced rows. All runners still decode it normally, because profiles constrain
+  producers rather than changing decode semantics.
 - **Refusal variants, in `data/invalid/`:** a delta whose update group carries `object_id` for a
   gaussian that is not live (already covered by the existing unknown-id refusal, so possibly
   redundant), and — if (ii) is chosen instead of (i) — a delta carrying `object_id` at all.
 
-**Cost of the variant is a writer change first.** `write_sequence` must grow an `objects` parameter,
-and sample quantization must carry an optional exact `object_id` column (attribute `14`) rather than
-stopping at attributes `0`–`10`. `_keyframe_streams` then emits that column only when the keyframe
-physically carries it. Delta generation must do more than index `reference_bins[14]`: when the
-either the reference or current complete state omits the column it materializes zeros for every row
-on that side before classifying updates. When a birth first introduces the column it extends the
-survivor zeros with the births' absolute values. Conversely, births that omit the column append
-zeros when the reference already carries it, and a current complete state that omits the column
-after a nonzero reference emits explicit zero updates. Only after those rules exist can the writer
-deliberately produce the omitted-keyframe transition this variant requires. That is the honest
-sequencing note for #134: for #79, step 2 is not "add a variant", it is "teach the reference encoder
-to write the combination, then add a variant".
+**Cost of the variant is a writer change first.** `write_sequence` must grow `objects` and
+`scene_profile` parameters. Its existing `profile` parameter selects quantization bounds
+(`fine`/`default`/`coarse`) and currently also leaks that selector into `Header.profile`; the new
+parameter separates the scene-profile registry value exactly as the `gaussian-birth` writer's
+`WriteOptions.scene_profile` already does. Existing callers default to the empty scene profile; the
+profile-specific case passes `objects`. Sample quantization must carry an optional exact `object_id`
+column (attribute `14`) rather than stopping at attributes `0`–`10`. `_keyframe_streams` then emits
+that column only when the keyframe physically carries it. Delta generation must do more than index
+`reference_bins[14]`: when the either the reference or current complete state omits the column it
+materializes zeros for every row on that side before classifying updates. When a birth first
+introduces the column it extends the survivor zeros with the births' absolute values. Conversely,
+births that omit the column append zeros when the reference already carries it, and a current
+complete state that omits the column after a nonzero reference emits explicit zero updates. Only
+after those rules exist can the writer deliberately produce the omitted-keyframe transition this
+variant requires. That is the honest sequencing note for #134: for #79, step 2 is not "add a
+variant", it is "teach the reference encoder to write the combination, then add a variant".
 
 ---
 

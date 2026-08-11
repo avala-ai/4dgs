@@ -135,6 +135,16 @@ orientation and the `object_id` this block prints. Rows that tie after that emit
 and their relative order provably cannot change the output — which is `_stable_order`'s own
 argument, applied at the level where the values are actually produced.
 
+The secondary comparison is a portable lexicographic order over the emitted row, not the host
+language's comparison over decoded JSON values. For every emitted scalar, a finite canonical number
+sorts before `null`; finite numbers sort by numeric value after canonical six-decimal rounding;
+`-0.0` and `0.0` compare equal; and `null` compares equal to `null`. Equivalently, each numeric slot
+uses `(0, rounded_value)` when finite and `(1, 0)` when `num` emits `null`. The exact `object_id`
+slot compares as an unsigned integer, never as a decimal string. This covers every result of the
+canonical non-finite rule: `NaN`, positive infinity and negative infinity all emit `null` and are
+therefore deliberately indistinguishable in the key, just as they are in the row. No port asks its
+native sort to compare `None`/`null` with a number.
+
 - Cost: `_stable_order` must expose its keys (today it discards them, `canonical.py:538-540`), and
   the `states` block gains a sort over live rows per probe. Six ports, a few dozen lines each.
 - Keeps the correspondence with the root sample: where the content keys differ, the order is
@@ -190,6 +200,15 @@ addend rule below. JSON places no magnitude limit on its number grammar, so a po
 type cannot hold the token must write this aggregate token directly rather than narrow the exact sum
 through that type.
 
+The comparison harness must preserve that grammar-level precision too. `tests/conformance/run.py`
+loads actual and expected output with `json.loads(..., parse_float=Decimal, parse_int=int)`, through
+one shared helper, rather than the default binary64-backed float conversion. The same helper is used
+by `tests/conformance/encode_roundtrip.py` for its canonical comparisons. `Decimal` is constructed
+directly from the JSON token and is therefore exact; numeric spellings such as `1.0` and `1.00`
+remain semantically equal, while two different 400-digit totals do not both collapse to infinity.
+This is part of (2b), not optional harness hygiene: writing an exact token and then comparing a
+narrowed value would leave the conformance claim untested.
+
 - Cost: one rounding and integer conversion per addend. Each port must use the same already-shared
   canonical rounding rule and an arbitrary-precision integer representation for both the scaled
   addend and every partial sum. A declared population is not an overflow proof: one finite decoded
@@ -215,6 +234,8 @@ their last bits. Only Python has it in the standard library, too. Rejected on po
   makes the rule observable, so it does not ship as an untested convention.
 - The same exact-unit helper is used for the root `aggregate` and every `states[*].aggregate`;
   repairing only the latter would leave the module-level order-independence promise false.
+- The harness parses JSON number tokens losslessly before comparison; otherwise a wrong
+  out-of-binary64-range total can compare equal to the right one.
 
 ### What regeneration costs, and what was measured
 
@@ -274,6 +295,11 @@ same fix regenerate its new expectation.
 > multiplication by `t - mu_t`. So the `states` block orders its rows by the content key **and then
 > by the rounded values it emits**, and a tie that survives both ties on every number that block
 > prints.
+>
+> Compare that secondary row lexicographically with an explicit scalar order: finite canonical
+> numbers first in ascending numeric order (`-0.0` equal to `0.0`), then `null`, with `null` equal
+> to `null`; compare `object_id` as an exact unsigned integer. Do not delegate number-versus-null
+> ordering to the host language.
 
 ### 5.2 `canonical.py`, as a comment on the root and `states` aggregates
 
@@ -326,7 +352,7 @@ rely on it." Everything in this proposal is the conformance reference being held
 
 ## 6. The conformance variants that pin it
 
-Five cases, represented by eight files; all three tie-sensitive cases are deliberately paired
+Seven cases, represented by eleven files; all four tie-sensitive cases are deliberately paired
 encodings.
 
 - **`ObjectTiedGaussians` and `ObjectTiedGaussiansReordered`** — two encodings of the same
@@ -343,6 +369,18 @@ encodings.
   Without fix (1a), the stable sort retains the two different decoded resident orders when its key
   ties, so at least the reordered file disagrees with the shared expectation. No decoder is assumed
   to choose its own chunking or order; the two inputs supply both orders explicitly.
+
+- **`ObjectTiedNonFiniteRows` and `ObjectTiedNonFiniteRowsReordered`** — finite stored positions,
+  motions and probe times whose composed arithmetic overflows in one tied row, so its emitted centre
+  contains `null`, beside a tied row whose emitted centre remains finite. The second file reverses
+  only those rows. The generator proves the primary content keys tie and that the secondary rows
+  contain both scalar classes before it writes either file.
+
+  **What it asserts:** every port applies the explicit secondary scalar order — finite canonical
+  numbers before `null`, `null` equal to `null` — and both encodings emit the same sampled rows. A
+  host-language comparison between Python `None` and `float`, or a port-specific choice to put null
+  first, cannot pass. Every source value is finite; the `null` is the canonical representation of a
+  non-finite composed result, not a malformed-file shortcut.
 
 - **`ObjectCancellingPositionSum`** — live centres of large opposing sign spread across at least two
   chunks, with resident order grouping signs and content order interleaving them. The generator must
@@ -390,7 +428,20 @@ encodings.
   but cannot catch a port that applies (2b)'s exact-unit rule to centres alone; this pair makes both
   aggregates and both summary levels part of the deferred (2b) contract.
 
-All five belong beside the existing `object/` variants. None needs a spec change, a new opcode or a
+- **`ObjectExactAggregateBeyondBinary64`** — finite, individually canonical centre addends whose
+  exact integer-unit sum has more than 309 decimal digits and differs from a nearby deliberately
+  wrong total in a low-order digit. The generator asserts every addend is finite, the exact sum is
+  outside binary64's finite range, and the emitted aggregate token parses back to precisely the
+  integer-unit total without a float conversion.
+
+  **What it asserts:** every runner can emit the direct JSON number token required by (2b). The
+  harness lands with a focused regression too: its shared lossless loader parses two distinct
+  400-digit JSON number tokens and asserts they are unequal. That unit test is essential evidence
+  for the comparator itself — a corpus expectation alone cannot force an intentionally wrong runner
+  to be present — and would fail with today's default `json.loads` because both values become
+  infinity.
+
+All seven belong beside the existing `object/` variants. None needs a spec change, a new opcode or a
 new writer capability — they are ordinary scenes with adversarially chosen numbers. The generator's
 precondition assertions are part of the design: an adversarial name is not evidence unless the
 constructed values demonstrably separate the two algorithms.

@@ -8,8 +8,10 @@ Nothing here is in force until it is folded into [the specification](../index.md
 The question in #78 is short and the answer decides geometry: **may a provenance-family record
 (`0x20`–`0x2F`) appear after the first `Chunk`?** Auditing the two read paths exposes the same
 unstated position rule for the legacy Audio (`0x09`), Camera (`0x0A`), Metadata (`0x0B`) and
-Attachment (`0x0D`) records. The answer therefore has to cover every record the indexed front-matter
-walk collects, rather than fixing one family while leaving four identical divergences.
+Attachment (`0x0D`) records — and for Quantization (`0x03`), which a decoder needs before the first
+state even though §5.3 does not currently say it must precede one. The answer therefore has to cover
+every record the indexed front-matter walk collects, rather than fixing one family while leaving
+identical divergences.
 
 ---
 
@@ -126,9 +128,10 @@ needs a variant and not only a paragraph.
 ### (a) A producer rule — indexed front matter MUST precede the first Chunk
 
 Indexed readers keep stopping at the first `Chunk`; writers are forbidden from putting anything that
-walk collects behind it. The rule covers the Window Table, legacy Audio, Camera, Metadata,
-Attachment, Audio Source/Data pairs and the provenance family. Header and Quantization already have
-their own stronger placement requirements; §5.4 does not currently constrain the Window Table.
+walk collects behind it. The rule covers Quantization, the Window Table, legacy Audio, Camera,
+Metadata, Attachment, Audio Source/Data pairs and the provenance family. Header already has the
+stronger requirement to be the first record; neither §5.3 nor §5.4 currently constrains the other
+two records to precede state.
 
 - **Cost to producers:** none that can be measured. Every writer in this repository already
   complies, and the rule is what §5.15.1 already says these records do.
@@ -185,7 +188,8 @@ Give a reader an O(1) way to find them, so both properties survive.
 
 ## 4. Recommendation
 
-**Adopt (a): every record the indexed front walk collects MUST appear before the first `Chunk`.**
+**Adopt (a): every record the indexed front walk collects, including Quantization, MUST appear
+before the first `Chunk`.**
 
 Four reasons, in the order they should be weighed.
 
@@ -260,7 +264,16 @@ Written as spec prose, ready to lift.
 > records ahead of the chunks, for exactly the reason attachments do, and §5.15 makes that position
 > normative rather than customary.
 
-### 5.3 Into §4, under the layout diagram
+### 5.3 Into §5.3, after the Quantization record body
+
+> **Every Quantization record MUST appear before the first `Chunk`.** A state record cannot be
+> decoded without its grids, and an indexed reader discovers those grids in the bounded front-matter
+> walk before it seeks through the Chunk Index. A streamed reader that encounters Quantization after
+> the first `Chunk` MUST refuse the file, naming opcode `0x03` and the record's byte offset. An
+> indexed reader MAY stop framing at the first Chunk and is not required to discover the late
+> record, under the same asymmetric enforcement rule §5.15 states for the other front matter.
+
+### 5.4 Into §4, under the layout diagram
 
 Replace:
 
@@ -270,21 +283,21 @@ Replace:
 with:
 
 > Order is normative only where stated: the Header MUST be the first record, the Footer MUST be the
-> last, the summary MUST be contiguous (§4.5), and every Window Table, legacy Audio, Camera,
-> Metadata, Attachment, every Audio Source and Audio Data pair (§5.17), and every provenance-family
-> record (§5.15) MUST precede the first `Chunk`. Records not constrained here or in their own
-> sections retain free placement, and a reader MUST NOT depend on their position.
+> last, the summary MUST be contiguous (§4.5), and every Quantization, Window Table, legacy Audio,
+> Camera, Metadata, Attachment, every Audio Source and Audio Data pair (§5.17), and every
+> provenance-family record (§5.15) MUST precede the first `Chunk`. Records not constrained here or
+> in their own sections retain free placement, and a reader MUST NOT depend on their position.
 >
 > A reader that encounters any of those defined records after the first `Chunk` MUST refuse it,
 > naming the opcode and byte offset. This does not override §4.2 for an opcode the reader does not
 > recognize: unknown records are skipped until a specification defines both their meaning and any
 > positional check.
 
-### 5.4 Into §13's changelog table
+### 5.5 Into §13's changelog table
 
-| Change                                                                                                                                   | Kind       |
-| ---------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
-| §4/§5.15 added: every record collected by the indexed front walk MUST precede the first `Chunk`, matching §5.17's Audio Source/Data rule | rule added |
+| Change                                                                                                                                        | Kind       |
+| --------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| §4/§5.3/§5.15 added: every record collected by the indexed front walk MUST precede the first `Chunk`, matching §5.17's Audio Source/Data rule | rule added |
 
 ---
 
@@ -302,13 +315,13 @@ One variant, in `data/invalid/`, because after this proposal the file is not a l
   new shape for that directory rather than a variation on one already there.
 - **The rest of the positional family is independently pinned.** Add `LateCoordinateFrame`,
   `LateSensorCalibration`, `LateRigTrajectory`, `LateGeodeticAnchor`, `LateObjectTable` and
-  `LateObjectTrack`, plus `LateLegacyAudio`, `LateCamera`, `LateMetadata`, `LateAttachment`,
-  `LateWindowTable`, `LateAudioSource` and `LateAudioData`, using the same splice. The six
-  provenance opcodes dispatch through separate parser branches, so Object Track cannot stand in for
-  the other five; likewise, one provenance example cannot prove the branches for unrelated legacy
-  opcodes, and Audio Source and Audio Data have separate refusal branches. Each expectation names
-  its opcode and offset; the last two close both halves of the pre-existing §5.17 gap while the rest
-  prevent this proposal from documenting a broader rule than the suite proves.
+  `LateObjectTrack`, plus `LateQuantization`, `LateLegacyAudio`, `LateCamera`, `LateMetadata`,
+  `LateAttachment`, `LateWindowTable`, `LateAudioSource` and `LateAudioData`, using the same splice.
+  The six provenance opcodes dispatch through separate parser branches, so Object Track cannot stand
+  in for the other five; likewise, one provenance example cannot prove Quantization or the branches
+  for unrelated legacy opcodes, and Audio Source and Audio Data have separate refusal branches. Each
+  expectation names its opcode and offset; the last two close both halves of the pre-existing §5.17
+  gap while the rest prevent this proposal from documenting a broader rule than the suite proves.
 - **Opcode and offset are machine-checked, not prose around a generic refusal.** Before adding the
   variants, the invalid-runner result grows optional `opcode` and `at` fields sourced from the
   structured exception, and these expectations contain all three values, for example
@@ -339,16 +352,17 @@ One variant, in `data/invalid/`, because after this proposal the file is not a l
   structured late-record refusal first. This is a variant-specific indexed exclusion, not a shared
   refusal expectation that silently asks indexed implementations to detect what they are allowed not
   to scan.
-- **Both temporal-model stream loops are exercised, including skipped opcodes.** Build both
-  `LateKeyframeDeltaWindowTable` and `LateKeyframeDeltaObjectTrack`. The first reaches a branch the
-  keyframe-delta loop already dispatches; the second reaches a defined opcode that loop currently
-  skips entirely. Both are decoded through the keyframe-delta front-to-back entry point and both
-  expectations name the late opcode and offset. Together with the ordinary `gaussian-birth` `Late*`
-  files, they require a shared opcode-level positional guard (or equivalent checks in every loop),
-  rather than permitting a port to patch only the Window Table branch while late Metadata or
-  provenance records remain silently accepted.
+- **Both temporal-model stream loops are exercised, including skipped opcodes.** Build
+  `LateKeyframeDeltaQuantization`, `LateKeyframeDeltaWindowTable` and
+  `LateKeyframeDeltaObjectTrack`. The first two reach branches the keyframe-delta loop already
+  dispatches; the third reaches a defined opcode that loop currently skips entirely. All are decoded
+  through the keyframe-delta front-to-back entry point and every expectation names the late opcode
+  and offset. Together with the ordinary `gaussian-birth` `Late*` files, they require a shared
+  opcode-level positional guard (or equivalent checks in every loop), rather than permitting a port
+  to patch only the Window Table branch while late Quantization, Metadata or provenance records
+  remain silently accepted.
 
-Neither variant regenerates anything. The corpus gains files; nothing existing moves.
+These variants regenerate nothing already committed. The corpus gains files; nothing existing moves.
 
 ---
 
@@ -356,8 +370,8 @@ Neither variant regenerates anything. The corpus gains files; nothing existing m
 
 The proposal's instruction is to say plainly which files this breaks, so:
 
-**Files that become illegal:** any file carrying a Window Table, legacy Audio, Camera, Metadata,
-Attachment, Audio Source/Data, or a **defined** provenance-family record with an opcode in
+**Files that become illegal:** any file carrying Quantization, a Window Table, legacy Audio, Camera,
+Metadata, Attachment, Audio Source/Data, or a **defined** provenance-family record with an opcode in
 `0x20`–`0x25` at a byte offset after the first `Chunk` record. Opcodes `0x26`–`0x2F` are already
 reserved and forbidden in version-1 writer output (§5.15.8), so this proposal does not newly make
 files containing them illegal.
@@ -365,9 +379,9 @@ files containing them illegal.
 **Files known to be in that set:** none.
 
 - No conformance variant. All 60 `.4dgs` files the generator produces — top-level, `object/`,
-  `keyframe/` and `invalid/` alike — were framed record by record and none carries a `0x20`–`0x25`
-  opcode after the first `Chunk` or `Delta Chunk`. (Two files in the invalid set cannot be framed at
-  all, by design; neither is a counter-example.)
+  `keyframe/` and `invalid/` alike — were framed record by record and none carries Quantization or a
+  `0x20`–`0x25` opcode after the first `Chunk` or Delta Chunk. (Two files in the invalid set cannot
+  be framed at all, by design; neither is a counter-example.)
 - No output of `fourdgs.write`: `writer.py:516-541` emits provenance and the object layer before the
   chunk loop, and there is no option that reorders them.
 - No output of the Rust, TypeScript or Dart writers, which follow the same order.
