@@ -12,6 +12,8 @@ library;
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+import 'quantization.dart';
+
 /// A legacy, non-spatial track.
 ///
 /// Kept as an API compatibility view for version-1 files written before native
@@ -431,7 +433,13 @@ class FourdgsGaussianSet {
   /// it is what allows one file to hold gaussians fitted independently over
   /// different spans of the timeline without them bleeding into each other's
   /// intervals.
-  FourdgsState stateAt(double t, {double cutoff = 0.05}) {
+  /// [cutoff] defaults to [fourdgsDefaultCutoff], the threshold every SDK
+  /// applies when the Header does not usefully supply one. It is checked rather
+  /// than trusted: the comparison below is `marginal < cutoff`, and `NaN` loses
+  /// that comparison for every gaussian, so an unusable threshold would return
+  /// the whole scene as visible and say nothing.
+  FourdgsState stateAt(double t, {double cutoff = fourdgsDefaultCutoff}) {
+    checkCutoff(cutoff, what: 'the cutoff passed to stateAt');
     final n = count;
     final keep = Uint32List(n);
     int k = 0;
@@ -482,8 +490,20 @@ class FourdgsGaussianSet {
   /// This is what a chunker partitions on, and it is why content whose
   /// gaussians all live for the whole clip cannot be partitioned: every
   /// interval is the whole timeline, so every gaussian lands at the root.
-  ({Float64List lo, Float64List hi}) support({double cutoff = 0.05}) {
-    final k = math.sqrt(-2.0 * math.log(cutoff));
+  ///
+  /// [cutoff] defaults to [fourdgsDefaultCutoff] and goes through [supportK]
+  /// rather than through an inline square root, which is what makes an unusable
+  /// threshold a named refusal: `sqrt(-2 * log(0))` is `+Infinity`, and a
+  /// half-width of infinity clips to the validity window, so every gaussian
+  /// comes back alive for its whole window and the partition it feeds is
+  /// silently the trivial one.
+  ({Float64List lo, Float64List hi}) support({
+    double cutoff = fourdgsDefaultCutoff,
+  }) {
+    final k = supportK(
+      cutoff,
+      what: 'the cutoff passed to FourdgsGaussianSet.support',
+    );
     final lo = Float64List(count);
     final hi = Float64List(count);
     for (int i = 0; i < count; i++) {

@@ -55,6 +55,43 @@ plausible-looking output rather than an error, so nothing downstream notices:
   returns the decoded prefix with `truncated == true` for both. What a complete file cannot do is
   disagree with itself — once the walk reaches the Footer, the totals above are checked.
 
+### Resource ceilings
+
+The hardening above is about what is _legal_ — which files conform. This is about what is
+_affordable_. A malformed length field could still size an allocation before anything noticed it was
+malformed, which is the difference between refusing a bad file and being taken down by one. Every
+ceiling here is shared **by scope and value** with the other SDKs, because a ceiling only one
+implementation has means a file that decodes in three of them and is refused in the fourth:
+
+- **Bounded Camera framing without a Dart-only count ceiling.** Before building any keyframe list,
+  the parser proves that all declared 56-byte samples fit in the already bounded record. Camera has
+  no cross-SDK `MAX_TRAJECTORY_SAMPLES` rule, so valid large Camera records remain accepted while a
+  truncated declaration cannot allocate every available row before failing.
+- **Keyframe-delta groups are framed before decoding.** Every declared stream payload is
+  bounds-checked before the first decoded array is allocated. Decoded size remains subject to the
+  shared per-stream ceiling; no Dart-only aggregate chunk limit changes which conforming files are
+  accepted. A repeated stream whose payload is incomplete is consequently diagnosed as truncated
+  before the duplicate-attribute rule is considered.
+- **Quantization scheme.** `uniform-v1` is what this build implements, and a record naming anything
+  else is refused as an unsupported codec rather than decoded through a grid it was not given — the
+  steps are the only description of what a bin means, so reading `uniform-v9` bins through
+  `uniform-v1` arithmetic produces a scene that is wrong everywhere and complains nowhere.
+- **Quantization parameter magnitude.** Every step and `pos_origin` component must be finite (spec
+  §5.3), and the refusal names the field. This decoder acts on the rule rather than reporting it for
+  a reason specific to Dart: the per-gaussian pitches are derived with `log2` and rounded with
+  `floor`, and `double.floor()` on a NaN or an infinity throws `UnsupportedError`, which names no
+  byte, no record and no field.
+- **A default cutoff, from one constant.** `fourdgsDefaultCutoff` (0.05, `DEFAULT_CUTOFF` elsewhere)
+  now supplies every default in the package rather than a repeated literal, and `stateAt` and
+  `support` refuse a threshold outside `(0, 1]` instead of turning it into an infinite support
+  radius or a comparison that keeps the whole scene. `support` derives its half-width through
+  `supportK`, so there is one implementation of the rule.
+
+Each ceiling names the byte, the record, the value and the expectation, so
+`FourdgsQuantization.parse` and `FourdgsCamera.parse` take the `fileOffset` their record begins at,
+as `FourdgsChunkIndexEntry` already did, and the chunk parsers report where their stream blocks
+start.
+
 ### Fixed
 
 - **A truncated Header is not an unsupported one.** A Header that ended after its `temporal_model`

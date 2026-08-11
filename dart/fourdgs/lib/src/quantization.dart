@@ -27,6 +27,13 @@ import 'exceptions.dart';
 import 'records.dart';
 
 /// The Header's default marginal visibility threshold.
+///
+/// `DEFAULT_CUTOFF` in Python, Rust and TypeScript, and the same number here on
+/// purpose: it is the threshold a decoder applies when the Header does not
+/// usefully supply one, and a decoder that defaulted to something else would
+/// keep a different set of gaussians from the file than every other SDK reading
+/// it. Every default cutoff in this package comes from this constant rather
+/// than from a repeated literal, so there is one place to be wrong.
 const double fourdgsDefaultCutoff = 0.05;
 
 /// `marginal >= cutoff` <=> `|t - mu| <= K * sigma`, for the default cutoff.
@@ -45,13 +52,29 @@ final double kSupport = supportK(fourdgsDefaultCutoff);
 /// A threshold outside `(0, 1]` is not a threshold. It comes from a corrupt
 /// header, and it is refused here rather than allowed to become a domain error
 /// inside a logarithm.
-double supportK(double cutoff) {
+double supportK(double cutoff, {String what = "the Header's cutoff"}) {
+  checkCutoff(cutoff, what: what);
+  return math.sqrt(-2.0 * math.log(cutoff));
+}
+
+/// Refuses a marginal threshold outside `(0, 1]`, naming it.
+///
+/// Split out of [supportK] because two callers need the rule without needing
+/// the square root: [FourdgsGaussianSet.stateAt] compares against the threshold
+/// directly, and `NaN` loses that comparison for every gaussian — the whole
+/// scene comes back visible, with nothing raised anywhere. A threshold of zero
+/// is the other half: `sqrt(-2 * log(0))` is `+Infinity`, so a support interval
+/// derived from it covers the timeline and a chunker built on it cannot
+/// partition anything.
+///
+/// [what] names the source, because a threshold reaches this from two places
+/// with different fixes: the Header carries one, and a caller may pass its own.
+void checkCutoff(double cutoff, {String what = "the Header's cutoff"}) {
   if (cutoff.isNaN || !(cutoff > 0.0 && cutoff <= 1.0)) {
     throw FourdgsMalformedFile(
-      "the Header's cutoff is $cutoff; a marginal threshold must be in (0, 1]",
+      '$what is $cutoff; a marginal threshold must be in (0, 1]',
     );
   }
-  return math.sqrt(-2.0 * math.log(cutoff));
 }
 
 // Velocity precision classes.

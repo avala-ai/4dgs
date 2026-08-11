@@ -665,7 +665,10 @@ Future<FourdgsCameraTrajectory?> readFourdgsCamera(
   if (range == null) return null;
   _checkRange(scene, range.offset, range.length, 'camera', frontMatter: true);
   final blob = await source.read(range.offset, range.length);
-  final camera = FourdgsCamera.parse(_recordContent(blob, opCamera, 'camera'));
+  final camera = FourdgsCamera.parse(
+    _recordContent(blob, opCamera, 'camera'),
+    fileOffset: range.offset + recordHeaderBytes,
+  );
   return FourdgsCameraTrajectory(
     fovYDeg: camera.fovYDeg,
     position: camera.position,
@@ -1133,7 +1136,10 @@ void _applyFrontRecord(
     case opHeader:
       out.header = FourdgsHeader.parse(content);
     case opQuantization:
-      out.quantization = FourdgsQuantization.parse(content);
+      out.quantization = FourdgsQuantization.parse(
+        content,
+        fileOffset: span.contentOffset,
+      );
     case opWindowTable:
       out.windows = FourdgsWindowTable.parse(content).windows;
     case opAudio:

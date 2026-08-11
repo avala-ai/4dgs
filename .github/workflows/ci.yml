@@ -209,7 +209,8 @@ jobs:
       - run: npx --yes cspell@8 --config cspell.config.yaml "**/*.md"
 
   typescript:
-    name: ${{ matrix.os == 'ubuntu-latest' && 'typescript' || format('typescript ({0})', matrix.os) }}
+    name:
+      ${{ matrix.os == 'ubuntu-latest' && 'typescript' || format('typescript ({0})', matrix.os) }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -653,7 +654,9 @@ jobs:
             ~/.cargo/bin
             ~/.cargo/registry
             ~/.rustup
-          key: rust-toolchain-stable-${{ runner.os }}-${{ hashFiles('rust/**/Cargo.toml', 'Cargo.toml') }}
+          key:
+            rust-toolchain-stable-${{ runner.os }}-${{ hashFiles('rust/**/Cargo.toml', 'Cargo.toml')
+            }}
       - name: Cache the core's build
         uses: actions/cache@v6
         with:
@@ -694,7 +697,9 @@ jobs:
       - name: Build
         run: swift build --scratch-path swift/.build -Xlinker -L$PWD/target/release
       - name: Tests
-        run: LD_LIBRARY_PATH=$PWD/target/release swift test --scratch-path swift/.build -Xlinker -L$PWD/target/release
+        run:
+          LD_LIBRARY_PATH=$PWD/target/release swift test --scratch-path swift/.build -Xlinker
+          -L$PWD/target/release
 
       # The canonical JSON is a contract between languages, and this is where Swift's half
       # of it is checked — against canonical.py, on a synthetic scene, with no decoding in

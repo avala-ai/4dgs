@@ -327,11 +327,11 @@ void _checkGroupsDisjoint(Int32List a, Int32List b, Int32List d) {
 /// rather than gating on the `gaussian-birth` registry the chunk decoder uses:
 /// an update group carries a subset of the required attributes, a death group
 /// carries only the identity, and both must decode.
-({Int32List ids, Map<int, _Column> bins}) _decodeGroup(Uint8List blob) {
+({Int32List ids, Map<int, _Column> bins}) _decodeGroup(Uint8List blob, int at) {
   if (blob.isEmpty) {
     return (ids: Int32List(0), bins: <int, _Column>{});
   }
-  final streams = _decodeStreams(FourdgsCursor(blob));
+  final streams = _decodeStreams(FourdgsCursor(blob), at);
   final gaussianId = streams.remove(attrGaussianId);
   if (gaussianId == null) {
     throw const FourdgsMalformedFile(
@@ -343,15 +343,19 @@ void _checkGroupsDisjoint(Int32List a, Int32List b, Int32List d) {
 
 /// A keyframe Chunk's ids and its full set of required bins.
 ({Int32List ids, Map<int, _Column> bins}) _keyframeFromChunk(
-  Uint8List content,
-) {
+  Uint8List content, {
+  required int at,
+}) {
   final body = parseChunk(content);
   if (body.header.compression.isNotEmpty) {
     throw FourdgsUnsupportedCodec(
       'chunk-level "${body.header.compression}" compression is not supported',
     );
   }
-  final streams = _decodeStreams(FourdgsCursor(body.streams));
+  final streams = _decodeStreams(
+    FourdgsCursor(body.streams),
+    at + recordHeaderBytes + body.streamsOffset,
+  );
   final gaussianId = streams.remove(attrGaussianId);
   if (gaussianId == null) {
     if (body.header.count == 0) {
@@ -375,20 +379,40 @@ void _checkGroupsDisjoint(Int32List a, Int32List b, Int32List d) {
   return (ids: _idsOf(gaussianId), bins: streams);
 }
 
-Map<int, _Column> _decodeStreams(FourdgsCursor cursor) {
-  final got = <int, _Column>{};
+/// Frames every stream in a group and only then decodes it.
+///
+/// The framing pass proves every declared payload is present before the first
+/// decoded allocation. Per-stream decoded-size limits remain the cross-SDK
+/// contract; this SDK must not add a differently scoped aggregate refusal.
+Map<int, _Column> _decodeStreams(FourdgsCursor cursor, int at) {
+  final framed = <({FourdgsStreamHeader header, Uint8List payload})>[];
+  final seen = <int>{};
   while (cursor.remaining > 0) {
+    final offset = at + cursor.pos;
     final header = readStreamHeader(cursor);
-    final stream = decodeAttributeStreamBody(cursor, header);
+    // Bounds-check the payload before classifying a duplicate. A repeated
+    // complete stream is malformed; a repeated header whose payload runs past
+    // the group is truncated, and taking this view allocates no decoded bins.
+    final payload = cursor.take(header.payloadLength);
     // One stream per attribute here too: the regular chunk path refuses a
     // second, and this path had its own loop that was still resolving it
     // silently.
-    if (got.containsKey(stream.attributeId)) {
+    if (!seen.add(header.attributeId)) {
       throw FourdgsMalformedFile(
-        'a keyframe-delta group carries attribute ${stream.attributeId} twice; '
-        'the format defines one stream per attribute',
+        'a keyframe-delta group carries attribute ${header.attributeId} twice; '
+        'the second header is at byte $offset and the format defines one stream '
+        'per attribute',
       );
     }
+    framed.add((header: header, payload: payload));
+  }
+
+  final got = <int, _Column>{};
+  for (final entry in framed) {
+    final stream = decodeAttributeStreamBody(
+      FourdgsCursor(entry.payload),
+      entry.header,
+    );
     got[stream.attributeId] = _Column(stream.channels, stream.values);
   }
   return got;
@@ -476,12 +500,15 @@ KeyframeDeltaSequence decodeKeyframeDeltaStreamed(Uint8List data) {
           );
         }
       case opQuantization:
-        quantization = FourdgsQuantization.parse(record.content);
+        quantization = FourdgsQuantization.parse(
+          record.content,
+          fileOffset: record.offset + recordHeaderBytes,
+        );
       case opWindowTable:
         windows = FourdgsWindowTable.parse(record.content).windows;
       case opChunk:
         final chunk = parseChunk(record.content);
-        final decoded = _keyframeFromChunk(record.content);
+        final decoded = _keyframeFromChunk(record.content, at: record.offset);
         final state = _keyframeState(decoded.ids, decoded.bins);
         byOffset[record.offset] = state;
         chunks.add(
@@ -515,7 +542,7 @@ KeyframeDeltaSequence decodeKeyframeDeltaStreamed(Uint8List data) {
             '${body.header.referenceOffset}, which is not behind it',
           );
         }
-        final state = _composeDelta(reference, body);
+        final state = _composeDelta(reference, body, at: record.offset);
         byOffset[record.offset] = state;
         chunks.add(
           KeyframeDeltaChunk(
@@ -550,11 +577,13 @@ KeyframeDeltaSequence decodeKeyframeDeltaStreamed(Uint8List data) {
 
 KeyframeDeltaState _composeDelta(
   KeyframeDeltaState reference,
-  FourdgsDeltaChunkBody body,
-) {
-  final updates = _decodeGroup(body.updates);
-  final births = _decodeGroup(body.births);
-  final deaths = _decodeGroup(body.deaths);
+  FourdgsDeltaChunkBody body, {
+  required int at,
+}) {
+  final content = at + recordHeaderBytes;
+  final updates = _decodeGroup(body.updates, content + body.updatesOffset);
+  final births = _decodeGroup(body.births, content + body.birthsOffset);
+  final deaths = _decodeGroup(body.deaths, content + body.deathsOffset);
   return _applyDelta(
     reference,
     updateIds: updates.ids,
@@ -581,7 +610,10 @@ decodeKeyframeDeltaIndexed(Uint8List data) {
     if (record.opcode == opHeader) {
       header = FourdgsHeader.parse(record.content);
     } else if (record.opcode == opQuantization) {
-      quantization = FourdgsQuantization.parse(record.content);
+      quantization = FourdgsQuantization.parse(
+        record.content,
+        fileOffset: record.offset + recordHeaderBytes,
+      );
     } else if (record.opcode == opWindowTable) {
       windows = FourdgsWindowTable.parse(record.content).windows;
     } else if (record.opcode == opFooter) {
@@ -724,7 +756,7 @@ KeyframeDeltaState _composeChain(
   for (final link in chain) {
     final content = _recordContent(data, link.chunkOffset, link.chunkLength);
     if (link.kind == 0) {
-      final decoded = _keyframeFromChunk(content);
+      final decoded = _keyframeFromChunk(content, at: link.chunkOffset);
       state = _keyframeState(decoded.ids, decoded.bins);
     } else {
       if (state == null) {
@@ -732,7 +764,11 @@ KeyframeDeltaState _composeChain(
           'a keyframe-delta chain begins with a delta chunk',
         );
       }
-      state = _composeDelta(state, parseDeltaChunk(content));
+      state = _composeDelta(
+        state,
+        parseDeltaChunk(content),
+        at: link.chunkOffset,
+      );
     }
   }
   if (state == null) {
