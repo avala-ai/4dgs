@@ -610,7 +610,13 @@ test("regression: zero-sample Rig Trajectories are absent during duplicate check
   const report = validated(
     file("TwoAbsentTrajectories.4dgs", resealSummary(withTwoEmpty, 2 * empty.length)),
   );
-  assert.equal(report.code, EXIT_OK, report.out.join("\n"));
+  assert.equal(report.code, EXIT_WARNINGS, report.out.join("\n"));
+  assert.ok(
+    report.out.filter((line) => line.includes("carries no samples; it is read as though absent"))
+      .length === 2,
+    report.out.join("\n"),
+  );
+  assert.ok(!report.out.some((line) => line.includes("two RigTrajectory records")));
 });
 
 test("regression: Header SH degree is restricted to the attribute registry", (t) => {
@@ -855,6 +861,100 @@ test("regression: indexed targets are physical records and a summary starts with
   assert.ok(
     noIndexReport.out.some((line) => line.includes("names no Chunk Index record")),
     noIndexReport.out.join("\n"),
+  );
+});
+
+test("regression: the index is an exact map of physical chunks and their SH bands", (t) => {
+  const variant = "MixedLifetimes-SHDegree2-UseChunkIndex-UseCrc";
+  const path = corpus(variant);
+  if (path === null || !existsSync(EXECUTABLE)) return t.skip("corpus not generated");
+
+  const missingEntry = bytesOf(variant);
+  const missingIndexes = recordsOf(missingEntry).filter(
+    (record) => record.opcode === Opcode.ChunkIndex,
+  );
+  missingEntry[missingIndexes[1]!.offset] = Opcode.Statistics;
+  const missingReport = validated(file("MissingChunkIndexEntry.4dgs", resealSummary(missingEntry)));
+  assert.equal(missingReport.code, EXIT_FAILED);
+  assert.ok(
+    missingReport.out.some((line) => /the Chunk at byte \d+ has no Chunk Index entry/.test(line)),
+    missingReport.out.join("\n"),
+  );
+
+  // Both substituted ranges still point at complete SH Band Stream records, and both
+  // records still declare band 1. Only the owning-Chunk relationship exposes the lie.
+  const swappedBands = bytesOf(variant);
+  const swappedIndexes = recordsOf(swappedBands).filter(
+    (record) => record.opcode === Opcode.ChunkIndex,
+  );
+  const firstRange = swappedIndexes[0]!.offset + RECORD_HEADER_BYTES + 41;
+  const secondRange = swappedIndexes[1]!.offset + RECORD_HEADER_BYTES + 41;
+  const firstBytes = swappedBands.slice(firstRange, firstRange + 16);
+  swappedBands.copyWithin(firstRange, secondRange, secondRange + 16);
+  swappedBands.set(firstBytes, secondRange);
+  const swappedReport = validated(file("SwappedIndexedBands.4dgs", resealSummary(swappedBands)));
+  assert.equal(swappedReport.code, EXIT_FAILED);
+  assert.ok(
+    swappedReport.out.some((line) => line.includes("does not belong to its Chunk")),
+    swappedReport.out.join("\n"),
+  );
+});
+
+test("regression: physical indexes, SH registries and provenance semantics are validated", (t) => {
+  const indexedVariant = "MixedLifetimes-SHDegree2-UseChunkIndex-UseCrc";
+  const indexedPath = corpus(indexedVariant);
+  if (indexedPath === null || !existsSync(EXECUTABLE)) return t.skip("corpus not generated");
+
+  const zeroSummary = bytesOf(indexedVariant);
+  const footerContent = zeroSummary.length - FOOTER_TAIL_BYTES + RECORD_HEADER_BYTES;
+  const zeroSummaryView = new DataView(
+    zeroSummary.buffer,
+    zeroSummary.byteOffset,
+    zeroSummary.byteLength,
+  );
+  zeroSummaryView.setBigUint64(footerContent, 0n, true);
+  zeroSummaryView.setUint32(footerContent + 16, 0, true);
+  const zeroSummaryReport = validated(file("IndexWithZeroSummaryStart.4dgs", zeroSummary));
+  assert.equal(zeroSummaryReport.code, EXIT_FAILED);
+  assert.ok(
+    zeroSummaryReport.out.some((line) => line.includes("Footer's summary_start is 0")),
+    zeroSummaryReport.out.join("\n"),
+  );
+
+  const illegalBand = bytesOf(indexedVariant);
+  const records = recordsOf(illegalBand);
+  const band = records.find((record) => record.opcode === Opcode.ShBandStream)!;
+  const entry = records.find((record) => record.opcode === Opcode.ChunkIndex)!;
+  illegalBand[band.offset + RECORD_HEADER_BYTES] = 4;
+  illegalBand[entry.offset + RECORD_HEADER_BYTES + 40] = 4;
+  const illegalBandReport = validated(file("IllegalShBand.4dgs", resealSummary(illegalBand)));
+  assert.equal(illegalBandReport.code, EXIT_FAILED);
+  assert.ok(
+    illegalBandReport.out.some((line) => line.includes("the registry defines bands 1-3")),
+    illegalBandReport.out.join("\n"),
+  );
+
+  // Empty name, right-handed, +Y up, +Z forward, registry unit 1 (metres), but a
+  // contradictory numerical declaration of two metres per unit.
+  const wrongUnit = bytesOf(indexedVariant);
+  const wrongUnitRecords = recordsOf(wrongUnit);
+  const summary = parseFooter(
+    wrongUnit.subarray(wrongUnit.length - FOOTER_TAIL_BYTES + RECORD_HEADER_BYTES),
+  ).summaryStart;
+  const frame = new Uint8Array(16);
+  const frameView = new DataView(frame.buffer);
+  frameView.setUint32(0, 0, true);
+  frame.set([1, 1, 2, 1], 4);
+  frameView.setFloat64(8, 2, true);
+  assert.ok(wrongUnitRecords.some((record) => record.offset === summary));
+  const withWrongUnit = splice(wrongUnit, summary, framedRecord(Opcode.CoordinateFrame, frame));
+  const wrongUnitReport = validated(
+    file("ConflictingFrameUnits.4dgs", resealSummary(withWrongUnit, RECORD_HEADER_BYTES + 16)),
+  );
+  assert.equal(wrongUnitReport.code, EXIT_FAILED);
+  assert.ok(
+    wrongUnitReport.out.some((line) => line.includes("a writer must make them agree")),
+    wrongUnitReport.out.join("\n"),
   );
 });
 

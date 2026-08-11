@@ -23,6 +23,7 @@
 
 import {
   BytesReadable,
+  CAMERA_MODEL_COEFFICIENTS,
   Crc32,
   Cursor,
   DEFAULT_CODECS,
@@ -32,6 +33,7 @@ import {
   HEADER_FLAG_CHUNKS_COMPRESSED,
   HEADER_FLAG_HAS_AUDIO,
   IndexedDecoder,
+  LENGTH_UNIT_METRES,
   MAGIC,
   MAX_SH_DEGREE,
   ObjectLayer,
@@ -179,9 +181,16 @@ export async function validateFile(
   let counted = 0;
   const index: ChunkIndexEntry[] = [];
   let firstIndexOffset: number | null = null;
+  const physicalChunkOffsets: number[] = [];
+  const physicalBands = new Map<
+    number,
+    { readonly band: number; readonly offset: number; readonly length: number }[]
+  >();
+  let currentChunkOffset: number | null = null;
   const audioSources = new Map<number, AudioSourceDescriptor>();
   const audioData = new Map<number, number>();
   const provenance = new Provenance();
+  const emptyTrajectories: string[] = [];
   const objects = new ObjectLayer();
   let firstChunkSeen = false;
   const decodedShChunks: {
@@ -195,6 +204,11 @@ export async function validateFile(
       seen.push(record.opcode);
       const { content, offset } = record;
       topLevelOffsets.add(offset);
+      // An SH Band Stream belongs only to the Chunk immediately before the run of band
+      // records. Any other top-level record ends that run.
+      if (record.opcode !== Opcode.Chunk && record.opcode !== Opcode.ShBandStream) {
+        currentChunkOffset = null;
+      }
       // A record whose own body will not parse is a finding rather than an abort: the point
       // of a validator is to say everything that is wrong with a file, not the first thing.
       switch (record.opcode) {
@@ -263,6 +277,9 @@ export async function validateFile(
           }
           break;
         case Opcode.Chunk: {
+          physicalChunkOffsets.push(offset);
+          physicalBands.set(offset, []);
+          currentChunkOffset = offset;
           firstChunkSeen = true;
           chunkCount += 1;
           let parsed;
@@ -309,14 +326,30 @@ export async function validateFile(
           // is refused there — and a `--decode` pass that skipped them would report that
           // same file valid. The two refusals a chunk's own streams can raise are exactly
           // the two a band's stream can raise, for the same reason.
-          if (options.decode !== true || decodedShChunks.length === 0) break;
           let band = 0;
           try {
             const parsedBand = parseShBandRecord(content);
             band = parsedBand.band;
-            // A reader caps its degree and never fetches the bands above it, so a band
-            // this build would not evaluate is not one it refuses either.
-            if (band > MAX_SH_DEGREE) break;
+            if (band < 1 || band > MAX_SH_DEGREE) {
+              found.error(
+                `SH Band Stream at byte ${offset} declares band ${band}; the registry defines ` +
+                  `bands 1-${MAX_SH_DEGREE} (§5.7)`,
+              );
+            }
+            if (currentChunkOffset === null) {
+              found.error(
+                `SH Band Stream at byte ${offset} does not immediately follow a Chunk or one of ` +
+                  "that Chunk's SH Band Stream records",
+              );
+            } else {
+              physicalBands.get(currentChunkOffset)!.push({
+                band,
+                offset,
+                length: record.length,
+              });
+            }
+            if (options.decode !== true || decodedShChunks.length === 0) break;
+            if (band < 1 || band > MAX_SH_DEGREE) break;
             const values = await decodeStream(frameOneStream(parsedBand.cursor), DEFAULT_CODECS);
             decodedShChunks[decodedShChunks.length - 1]!.bands.set(band, values);
           } catch (error) {
@@ -378,9 +411,10 @@ export async function validateFile(
         // than one of them. A validator that skipped these declared a file valid that
         // this package's own streamed decoder refuses — `scene.ts` calls the same two
         // `check()` methods — and that the Python validator refuses too. Neither their
-        // per-record fields nor the rest of Python's `_check_provenance` is re-checked
-        // here; the parsers make the first, and the second is a follow-up the Rust
-        // validator has not taken either.
+        // per-record fields nor Python's semantic provenance findings belong in those
+        // cross-record checkers: the parsers make the first, and `checkProvenance` below
+        // reports the second without turning unknown-but-legal registry values into
+        // malformed bytes.
         case Opcode.CoordinateFrame:
           parseInto(found, "CoordinateFrame", () => {
             provenance.frames.push(parseCoordinateFrame(content));
@@ -398,6 +432,7 @@ export async function validateFile(
             // particular, it neither collides with another absent record nor
             // shadows a later, real trajectory with the same name.
             if (trajectory.times.length > 0) provenance.trajectories.push(trajectory);
+            else emptyTrajectories.push(trajectory.name);
           });
           break;
         case Opcode.GeodeticAnchor:
@@ -511,6 +546,7 @@ export async function validateFile(
       found.error(message(error));
     }
   }
+  checkProvenance(provenance, emptyTrajectories, found);
 
   if (header !== null) {
     if (counted !== header.gaussianCount) {
@@ -559,21 +595,6 @@ export async function validateFile(
     if (!audioSources.has(sourceId)) {
       found.error(`Audio Data id ${sourceId} has no matching Audio Source record`);
     }
-  }
-
-  // The one provenance finding a validator can reach without parsing a provenance record:
-  // poses expressed in a frame the file never names. The rest of the Python validator's
-  // provenance section — registry membership, a `metres_per_unit` that disagrees with its
-  // declared unit, a principal point outside its image — needs the parsed records and is
-  // not ported here, exactly as it is not ported to the Rust validator.
-  if (
-    !seen.includes(Opcode.CoordinateFrame) &&
-    (seen.includes(Opcode.SensorCalibration) || seen.includes(Opcode.RigTrajectory))
-  ) {
-    found.note(
-      "the file carries sensor or rig provenance but no CoordinateFrame record, so the frame " +
-        "those poses are expressed in is whatever the consumer assumes",
-    );
   }
 
   index.forEach((entry, i) => {
@@ -671,6 +692,73 @@ export async function validateFile(
     });
   });
 
+  // An index is a one-for-one description of the physical Chunk records, not merely a
+  // collection of individually valid pointers. Missing and duplicate entries both make
+  // indexed reads disagree with a front-to-back walk.
+  if (firstIndexOffset !== null) {
+    const indexedCounts = new Map<number, number>();
+    for (const entry of index) {
+      indexedCounts.set(entry.chunkOffset, (indexedCounts.get(entry.chunkOffset) ?? 0) + 1);
+    }
+    for (const chunkOffset of physicalChunkOffsets) {
+      const count = indexedCounts.get(chunkOffset) ?? 0;
+      if (count === 0) {
+        found.error(`the Chunk at byte ${chunkOffset} has no Chunk Index entry`);
+      } else if (count > 1) {
+        found.error(
+          `the Chunk at byte ${chunkOffset} has ${count} Chunk Index entries; expected 1`,
+        );
+      }
+    }
+    const physicalChunks = new Set(physicalChunkOffsets);
+    for (const [chunkOffset, count] of indexedCounts) {
+      if (!physicalChunks.has(chunkOffset)) {
+        found.error(
+          `${count} Chunk Index ${count === 1 ? "entry points" : "entries point"} at byte ` +
+            `${chunkOffset}, where there is no physical Chunk`,
+        );
+      }
+    }
+
+    index.forEach((entry, i) => {
+      const expected = physicalBands.get(entry.chunkOffset);
+      if (expected === undefined) return;
+      const expectedCounts = rangeCounts(expected);
+      const indexedCountsForChunk = rangeCounts(entry.bands);
+      for (const range of expected) {
+        const key = bandRangeKey(range);
+        const actual = indexedCountsForChunk.get(key) ?? 0;
+        const required = expectedCounts.get(key)!;
+        if (actual < required) {
+          found.error(
+            `chunk index entry ${i} omits physical SH band ${range.band} at byte ` +
+              `${range.offset} (${range.length} bytes) from its Chunk at ${entry.chunkOffset}`,
+          );
+          expectedCounts.set(key, actual);
+        }
+      }
+      for (const range of entry.bands) {
+        const key = bandRangeKey(range);
+        const actual = indexedCountsForChunk.get(key)!;
+        const required = rangeCounts(expected).get(key) ?? 0;
+        if (actual > required) {
+          found.error(
+            `chunk index entry ${i} includes SH band ${range.band} at byte ${range.offset} ` +
+              `(${range.length} bytes), which does not belong to its Chunk at ${entry.chunkOffset}`,
+          );
+          indexedCountsForChunk.set(key, required);
+        }
+      }
+    });
+  }
+
+  if (footer !== null && footer.summaryStart === 0 && firstIndexOffset !== null) {
+    found.error(
+      `the file carries Chunk Index records starting at byte ${firstIndexOffset}, but the ` +
+        "Footer's summary_start is 0 (§5.2)",
+    );
+  }
+
   if (footer !== null && footer.summaryStart !== 0) {
     // The Footer record itself is not covered: nine bytes of framing plus its twenty bytes
     // of content plus the trailing magic.
@@ -711,6 +799,104 @@ export async function validateFile(
   }
 
   return report(found);
+}
+
+interface PhysicalBandRange {
+  readonly band: number;
+  readonly offset: number;
+  readonly length: number;
+}
+
+function bandRangeKey(range: PhysicalBandRange): string {
+  return `${range.band}:${range.offset}:${range.length}`;
+}
+
+function rangeCounts(ranges: readonly PhysicalBandRange[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const range of ranges) {
+    const key = bandRangeKey(range);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return counts;
+}
+
+/** Semantic provenance findings that parsing deliberately leaves to validators. */
+function checkProvenance(
+  provenance: Provenance,
+  emptyTrajectories: readonly string[],
+  found: Findings,
+): void {
+  for (const frame of provenance.frames) {
+    const where = `CoordinateFrame ${JSON.stringify(frame.name)}`;
+    if (frame.handedness !== 0 && frame.handedness !== 1 && frame.handedness !== 2) {
+      found.warn(`${where} handedness ${frame.handedness} is not in the registry`);
+    }
+    if (frame.lengthUnit !== 0 && !LENGTH_UNIT_METRES.has(frame.lengthUnit)) {
+      found.warn(`${where} length_unit ${frame.lengthUnit} is not in the registry`);
+    }
+    const declared = LENGTH_UNIT_METRES.get(frame.lengthUnit);
+    if (
+      declared !== undefined &&
+      frame.metresPerUnit > 0 &&
+      Math.abs(frame.metresPerUnit - declared) > 1e-12 * Math.max(declared, 1)
+    ) {
+      found.error(
+        `${where} declares length_unit ${frame.lengthUnit} (${declared} m per unit) and ` +
+          `metres_per_unit ${frame.metresPerUnit}; a writer must make them agree. A consumer ` +
+          "handed this file takes metres_per_unit (section 5.15.2)",
+      );
+    }
+    if (frame.handedness === 0) {
+      found.note(`${where} does not state a handedness, so a consumer cannot mirror-correct it`);
+    }
+  }
+
+  for (const anchor of provenance.anchors) {
+    if (anchor.latitudeDeg === 0 && anchor.longitudeDeg === 0) {
+      found.warn(
+        `a GeodeticAnchor for frame ${JSON.stringify(anchor.frameName)} sits at exactly ` +
+          "(0, 0), which is far more often an unset field than a location in the Gulf of Guinea",
+      );
+    }
+  }
+
+  for (const sensor of provenance.sensors) {
+    if (!CAMERA_MODEL_COEFFICIENTS.has(sensor.cameraModel)) {
+      found.warn(
+        `sensor ${JSON.stringify(sensor.name)} names camera model ${sensor.cameraModel}, which ` +
+          "is not in the registry; a reader that cannot project with it must decline rather " +
+          "than apply part of it (section 5.15.3)",
+      );
+    }
+    if (
+      sensor.cameraModel !== 0 &&
+      (sensor.cx < 0 || sensor.cx > sensor.widthPx || sensor.cy < 0 || sensor.cy > sensor.heightPx)
+    ) {
+      found.warn(
+        `sensor ${JSON.stringify(sensor.name)} has a principal point (${sensor.cx}, ` +
+          `${sensor.cy}) outside its ${sensor.widthPx}x${sensor.heightPx} image`,
+      );
+    }
+  }
+
+  for (const name of emptyTrajectories) {
+    found.warn(
+      `trajectory ${JSON.stringify(name)} carries no samples; it is read as though absent ` +
+        "and should have been omitted (section 5.15.4)",
+    );
+  }
+
+  if (
+    provenance.frames.length === 0 &&
+    (provenance.sensors.length > 0 ||
+      provenance.trajectories.length > 0 ||
+      emptyTrajectories.length > 0)
+  ) {
+    found.note(
+      "the file carries sensor or rig provenance but no CoordinateFrame record, so the frame " +
+        "those poses are expressed in is whatever the consumer assumes",
+    );
+  }
 }
 
 /**
