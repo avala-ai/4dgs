@@ -55,6 +55,11 @@ def _temporal_model(data: bytes) -> str | None:
     selected indexed decoder owns that rule, so the invalid corpus can prove that the
     indexed path enforces it independently of the streamed path.
     """
+    # Only a known version-1 file is safe to parse with the version-1 record and Header
+    # layouts. Every other prefix goes straight to the indexed opener, which diagnoses a
+    # foreign magic separately from a future major version before it touches any record.
+    if data[: len(MAGIC)] != MAGIC:
+        return None
     for record in iter_records(data, len(MAGIC)):
         if record.opcode == HEADER:
             return Header.parse(record.content).temporal_model
