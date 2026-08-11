@@ -248,12 +248,12 @@ their last bits. Only Python has it in the standard library, too. Rejected on po
 
 ### What regeneration costs, and what was measured
 
-The corpus was regenerated into a scratch directory and every variant carrying a `states` member was
-examined. `states` is emitted only when a file carries the object layer (`canonical.py:183-187`),
-which is four files — `object/SingleObject`, `object/MultiObject`, `object/ObjectTrackComposed` and
-the top-level `LongLived-UseChunkIndex-UseCrc-WithObjects`. (#95 and #134 both say "three"; the
-top-level `WithObjects` variant is the fourth and it carries a table, a track and an `object_id`
-stream.) For each, at each of the three probe times:
+There are two regeneration scopes, and they must not be conflated. The row-order measurement was
+made against the four object-layer files that exercise composed `states` rows —
+`object/SingleObject`, `object/MultiObject`, `object/ObjectTrackComposed` and the top-level
+`LongLived-UseChunkIndex-UseCrc-WithObjects`. (#95 and #134 both say "three"; the top-level
+`WithObjects` variant is the fourth and it carries a table, a track and an `object_id` stream.) For
+each, at each of the three probe times:
 
 | variant                      | gaussians | ties in the key | content order == resident order | rounded `positionSum` changes | rounded `opacitySum` changes |
 | ---------------------------- | --------- | --------------- | ------------------------------- | ----------------------------- | ---------------------------- |
@@ -268,10 +268,16 @@ the format says means nothing — and it is **currently harmless**, because thes
 well-conditioned enough that both orders round to the same six decimals. And there are no ties
 anywhere, so (1a) reorders nothing.
 
-So the measured cost of (1a) and the weaker (2a) is zero existing expectation bytes. The recommended
-(2b) deliberately changes how each addend is rounded before aggregation; the bottom implementation
-PR must regenerate and review the four affected expectations rather than assuming that this
-measurement covers the stronger arithmetic.
+So the measured cost of (1a) and the weaker (2a) is zero existing expectation bytes. That
+measurement says nothing about the regeneration scope of (2b): `canonical.py` emits the root
+`aggregate` for every ordinary `gaussian-birth` variant, not only for object files, and the same
+helper also serves the keyframe-delta and per-state aggregates. At the time of this proposal, 53
+committed expectations contain a root `aggregate` (46 top-level, three under `object/`, and four
+under `keyframe/`), while eight contain `states`. The bottom implementation PR must regenerate and
+review every expectation containing either affected aggregate, deriving that set from the generated
+JSON rather than hard-coding these counts. Limiting review to the four rows above would permit an
+implementation accidentally scoped to object files and leave the repository's ordinary
+gaussian-birth expectations stale.
 
 Delivery follows the repository's stacked-PR rule: the corpus, reference canonical and Python runner
 form the bottom layer; Rust, TypeScript, Dart, C++ and Swift each get their own language-only layer,
