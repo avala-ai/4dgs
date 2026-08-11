@@ -379,6 +379,15 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+#: The tool could not run at all — the file was not there, or could not be read. Distinct
+#: from `1`, which is a verdict about a file this tool did read: a caller that gets the
+#: same code for "your file is invalid" and "I never opened your file" cannot tell a
+#: refusal from a typo in a path, and a pipeline gating on the exit status treats a broken
+#: mount as a fleet of malformed files. `2` is argparse's usage error, so this is `3`,
+#: which is also what the Rust tool returns for the same thing.
+EXIT_TOOL_FAILURE = 3
+
+
 def main(argv: list[str] | None = None) -> int:
     # The tool's output is UTF-8 wherever it goes. Unpiped, Python already does
     # this; piped on Windows it falls back to the locale encoding, so the same
@@ -388,7 +397,15 @@ def main(argv: list[str] | None = None) -> int:
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
     args = build_parser().parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except OSError as exc:
+        # Narrow on purpose: a transport that would not answer, and nothing else. A
+        # malformed file is a verdict and stays exit 1; a bug in this package should still
+        # come out as a traceback, because a tool that reports its own defects as though
+        # they were the file's is worse than one that crashes.
+        print(f"4dgs: {exc.filename or ''}: {exc.strerror or exc}".replace(": : ", ": "), file=sys.stderr)
+        return EXIT_TOOL_FAILURE
 
 
 if __name__ == "__main__":

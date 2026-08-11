@@ -30,6 +30,61 @@ All notable changes to the Python package are documented here, following
   the still-reserved tail: a capture carrying frames, sensors, a rig and a georeference collects
   none.
 
+- **Spherical-harmonic band streams are decoded during validation.** `read_chunk` caps the bands it
+  fetches, which is right for a renderer — coefficients do not enter reconstructed state — and wrong
+  for a validator: an SH Band Stream is a stream like any other, and a band carrying a codec no
+  build implements is a file that does not decode. Every band a chunk declares is now decoded, and a
+  refusal inside one names that band's own record rather than the Chunk it belongs to, which can be
+  thousands of bytes away.
+
+- **A chunk the index does not name is reported.** The file layout is one Chunk Index entry per
+  chunk (§4), and every check that decodes a chunk is driven by the index — so a file whose index
+  simply omitted the chunk carrying an unimplemented codec was reported valid. An omitted chunk and
+  two entries naming one chunk are both errors now.
+
+- **A Delta Chunk in a `gaussian-birth` file is refused.** §5.18: the record "exists only under
+  `temporal_model = "keyframe-delta"`". Neither reader said so — the streamed one skipped the opcode
+  as though it came from a later revision, the indexed one stopped at the first Chunk — so the
+  record was read by nobody and reported by nobody.
+
+- **A refusal is placed at the record the reader refused at, not the first of its kind.** Nothing in
+  the framing forbids a second Header or a second Quantization record, and a reader refuses at the
+  first one carrying a value it does not implement. The report named the first, sending its holder
+  to bytes that were perfectly good.
+
+- **The `keyframe-delta` read paths check what they parse.** Six fields were parsed and then used
+  for nothing, each of them a rule the specification states as a MUST:
+
+  - the four index fields that duplicate a Delta Chunk's own (§5.8: "a reader MUST refuse a file
+    where the index and the record disagree, naming the field"), plus `gaussian_count` and
+    `live_count`;
+  - a Delta Chunk's `update_count`, `birth_count` and `death_count` against the groups that arrived
+    (§5.18: "a stream whose `element_count` disagrees with its group's count is a refusal rather
+    than an allocation");
+  - a keyframe chunk's declared `count` against its streams, which `decode_streams` has always
+    checked on the `gaussian-birth` path;
+  - `window_index` against the Window Table, which composition never looked at — the bound was
+    proved during reconstruction, so a file whose keyframe named a window its table does not have
+    composed cleanly and refused when it was rendered;
+  - the ends of the timeline (§11.1: "the first `t0` is `0`; the last `t1` is the Header's
+    `duration_sec`"), which `check_tiling` never checked — it compared adjacent entries, and a
+    single-entry index has no adjacent pair at all;
+  - the Header's `gaussian_count` against the distinct ids the sequence carries, which was skipped
+    entirely for this model and so checked by nothing.
+
+- **A `keyframe-delta` file with no chunk index validates.** No index is a legal file (§4, AGENTS.md
+  §2). The indexed reader was run over it regardless, and a Footer whose `summary_start` is 0 sent
+  it to read records from byte 0 — where the magic sits — so every conforming one was reported
+  invalid with a diagnosis about a record that does not exist.
+
+- **Validation no longer assembles what it validates.** Three paths held the whole file: a
+  `gaussian-birth` file with no index went through the streamed reader, which concatenates every
+  chunk into one `GaussianSet`; an indexed `keyframe-delta` file went through `decode_indexed`,
+  which keeps a composed population per index entry; one with no index would have kept a state per
+  chunk plus a map of every offset a delta might reference. Each is now a scan that drops what it
+  decoded — one chunk on the indexed paths, and two composed states front to back, which is what
+  §5.18's two reference kinds require (AGENTS.md §1).
+
 ### Added
 
 - **`4dgs validate` names the refusal, and the byte it fired at.** The exceptions have always
@@ -51,6 +106,13 @@ All notable changes to the Python package are documented here, following
 - **A cut file says how much of it survived.** Alongside the errors it already produced, `validate`
   now notes the byte the file was cut at, the record it was cut inside, and how many complete
   records before it a streamed reader recovers.
+
+- **A file the tool could not open exits `3`, not `1`.** Exit `1` is a verdict about a file this
+  tool read; a missing path or an unreadable mount is not that, and a caller handed the same status
+  for both cannot tell a malformed corpus from a typo in a directory name. `0` (valid) and `1`
+  (refused) are unchanged, which is the contract five other SDKs are written against; `2` remains
+  argparse's usage error, and `3` is what the Rust tool already returns for the same thing. What was
+  there before was an uncaught traceback, which is exit `1` by accident.
 
 ## [0.3.0] - 2026-08-10
 

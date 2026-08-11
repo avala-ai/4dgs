@@ -630,6 +630,12 @@ def _keyframe_from_chunk(content) -> tuple[np.ndarray, dict[int, np.ndarray]]:
         got[attribute_id] = values
     if op.A_GAUSSIAN_ID not in got:
         raise MalformedFile("a keyframe-delta chunk carries no gaussian_id stream", code="missing-gaussian-id")
+    # Against the count the record declares, exactly as `decode_streams` does for a
+    # gaussian-birth chunk. A keyframe chunk is a Chunk record and `count` is the same
+    # field there — but this path never looked at it, so a chunk whose streams carry a
+    # different number of elements than its header declares was refused as a
+    # gaussian-birth chunk and composed as a keyframe.
+    _check_element_counts(got, int(head.count), "the keyframe chunk")
     ids = got.pop(op.A_GAUSSIAN_ID)[:, 0].astype(np.int64)
     missing = [a for a in _REQUIRED if a not in got]
     if missing and head.count:
@@ -637,11 +643,45 @@ def _keyframe_from_chunk(content) -> tuple[np.ndarray, dict[int, np.ndarray]]:
     return ids, got
 
 
+def _check_element_counts(bins: dict[int, np.ndarray], count: int, what: str) -> None:
+    """Every stream in a group carries exactly the elements its header declares.
+
+    §5.18: "a stream whose `element_count` disagrees with its group's count is a refusal
+    rather than an allocation". The counts are in the record header so a streamed reader
+    can size its working set before it decompresses anything; a reader that instead takes
+    the size from whatever arrived has given the header no meaning, and the alignment
+    between a group's id stream and its value streams — which is what a delta *is* — rests
+    on a number nobody checked.
+    """
+    for attribute, values in sorted(bins.items()):
+        if values.shape[0] != count:
+            raise MalformedFile(
+                f"attribute {attribute} carries {values.shape[0]} elements; {what} declares {count}",
+                code="stream-element-count-mismatch",
+            )
+
+
 def _compose_delta(reference: State, content) -> tuple[State, rec.DeltaChunkHeader]:
     head, updates, births, deaths = rec.parse_delta_chunk(content)
     update_ids, update_bins = _decode_group(updates)
     birth_ids, birth_bins = _decode_group(births)
     death_ids, _ = _decode_group(deaths)
+    # The three declared sizes, against the three groups that arrived. `apply_delta` sizes
+    # everything from the decoded id arrays, so without this the declared counts were
+    # parsed and then never used for anything — and a Delta Chunk that says it updates
+    # nine hundred gaussians and carries three composed silently.
+    for ids, bins, declared, group in (
+        (update_ids, update_bins, int(head.update_count), "updates"),
+        (birth_ids, birth_bins, int(head.birth_count), "births"),
+        (death_ids, {}, int(head.death_count), "deaths"),
+    ):
+        if int(ids.shape[0]) != declared:
+            raise MalformedFile(
+                f"the delta chunk's {group} group carries {int(ids.shape[0])} gaussians; "
+                f"its header declares {declared}",
+                code="stream-element-count-mismatch",
+            )
+        _check_element_counts(bins, declared, f"the delta chunk's {group} group")
     state = apply_delta(
         reference,
         update_ids=update_ids,
@@ -729,13 +769,23 @@ def _t1(content) -> float:
     return c.f64()
 
 
-def decode_indexed(data: bytes) -> tuple[DecodedSequence, list[rec.ChunkIndexEntry]]:
-    """Read the Footer, then the index, then compose each chunk by byte range.
+@dataclass
+class IndexedSequence:
+    """A file's front matter and its index, with nothing composed.
 
-    The composed state per chunk is produced by walking that chunk's chain (spec §11.8),
-    which is the seeking client's path and must reach the same population `decode_streamed`
-    reaches front to back.
+    What `decode_indexed` reads before it decodes anything, split out because two callers
+    want only this much: one that means to compose a single instant, and one — the
+    validator — that means to check each chunk in turn and keep none of them.
     """
+
+    header: rec.Header
+    quantization: rec.Quantization
+    windows: list[tuple[float, float]]
+    index: list[rec.ChunkIndexEntry]
+
+
+def open_indexed(data: bytes) -> IndexedSequence:
+    """Read the Footer and the index, and check that the index tiles the timeline."""
     check_magic(data)
     header = quant = None
     windows: list[tuple[float, float]] = []
@@ -753,6 +803,17 @@ def decode_indexed(data: bytes) -> tuple[DecodedSequence, list[rec.ChunkIndexEnt
         raise MalformedFile("file has no Footer")
     if header is None or quant is None:
         raise MalformedFile("keyframe-delta file has no Header or Quantization record")
+    # A Footer whose `summary_start` is 0 is a file with no summary at all (§5.2), which is
+    # the indexless file the streamed path exists for — not an index that happens to begin
+    # at byte 0. Reading records from there parses the magic as framing and reports
+    # whatever the eight magic bytes happen to mean as a record length, which is a
+    # diagnosis about nothing.
+    if not footer.summary_start:
+        raise MalformedFile(
+            "this file carries no chunk index, so it cannot be read by seeking; "
+            "a streamed reader decodes it front to back",
+            code="no-chunk-index",
+        )
 
     index: list[rec.ChunkIndexEntry] = []
     for record in iter_records(data, footer.summary_start):
@@ -760,12 +821,28 @@ def decode_indexed(data: bytes) -> tuple[DecodedSequence, list[rec.ChunkIndexEnt
             index.append(rec.ChunkIndexEntry.parse(record.content))
         else:
             break
-    check_tiling(index)
+    check_tiling(index, header.duration_sec)
+    return IndexedSequence(header=header, quantization=quant, windows=windows, index=index)
+
+
+def decode_indexed(data: bytes) -> tuple[DecodedSequence, list[rec.ChunkIndexEntry]]:
+    """Read the Footer, then the index, then compose each chunk by byte range.
+
+    The composed state per chunk is produced by walking that chunk's chain (spec §11.8),
+    which is the seeking client's path and must reach the same population `decode_streamed`
+    reaches front to back.
+
+    This returns every state at once, which is what a caller that wants the states wants
+    and what a caller that wants a verdict must not ask for — `compose_chain` is that
+    caller's entry point.
+    """
+    opened = open_indexed(data)
+    index = opened.index
 
     # Compose each entry by walking its chain, so both read paths are exercised.
     chunks: list[ChunkInfo] = []
     for entry in index:
-        state = _compose_chain(data, index, entry)
+        state = compose_chain(data, index, entry, opened.windows)
         update_count = birth_count = death_count = None
         if entry.kind:
             # The counts are not in the index — there `gaussian_count` is their sum — so a
@@ -788,7 +865,9 @@ def decode_indexed(data: bytes) -> tuple[DecodedSequence, list[rec.ChunkIndexEnt
                 state,
             )
         )
-    return DecodedSequence(header=header, quantization=quant, windows=windows, chunks=chunks), index
+    return DecodedSequence(
+        header=opened.header, quantization=opened.quantization, windows=opened.windows, chunks=chunks
+    ), index
 
 
 def _record_at(data: bytes, offset: int, length: int):
@@ -801,19 +880,178 @@ def rec_content(record_bytes: bytes):
     return c.take(c.u64())
 
 
-def _compose_chain(data: bytes, index: list[rec.ChunkIndexEntry], entry: rec.ChunkIndexEntry) -> State:
+def check_window_indices_of(state: State, windows: list[tuple[float, float]]) -> None:
+    """Refuse a `window_index` the table cannot answer, on either read path.
+
+    The table defaults to a single `(0, 0)` entry when a file declares none, so index 0
+    stays legal for a file with no Window Table — validating against the raw count would
+    refuse those files on one path while the other decoded them.
+
+    Composition produces bins and stops there, so nothing on this path used to look at
+    `window_index` at all: the bound was proved during reconstruction, several calls
+    later, on the one instant somebody asked for. A file whose keyframe carries an index
+    outside its table therefore composed cleanly and refused when it was rendered — the
+    same fault the gaussian-birth path refuses at decode.
+    """
+    table = len(windows) or 1
+    values = state.bins.get(op.A_WINDOW_INDEX)
+    if values is None:
+        # A zero-count keyframe may omit every stream, and `apply_delta` carries forward
+        # only the attributes the reference already had — so a later birth can compose a
+        # non-empty state with no window_index column at all. Reconstruction indexes it,
+        # so this is a refusal here rather than an IndexError there.
+        if state.count:
+            raise MalformedFile(
+                "a composed state carries no window_index column; it is a required keyframe attribute (section 11.5)",
+                code="missing-window-index",
+            )
+        return
+    check_window_indices(np.asarray(values, dtype=np.int64).reshape(-1), table)
+
+
+def _check_entry_against_record(entry: rec.ChunkIndexEntry, head: rec.DeltaChunkHeader) -> None:
+    """The four fields the index and the Delta Chunk both state (spec §5.8).
+
+    "A reader MUST refuse a file where the index and the record disagree, naming the
+    field" — the duplication is deliberate and it is only a corruption check if somebody
+    performs it. Nothing did: the chain is built from the index and the record was parsed
+    for its group counts, so a file whose index and records describe two different
+    sequences was read as whichever one the reader happened to consult.
+    """
+    for field_name, in_index, in_record in (
+        ("delta_mode", entry.delta_mode, head.delta_mode),
+        ("reference_offset", entry.reference_offset, head.reference_offset),
+        ("keyframe_offset", entry.keyframe_offset, head.keyframe_offset),
+        ("depth", entry.depth, head.depth),
+        ("t0", entry.t0, head.t0),
+        ("t1", entry.t1, head.t1),
+    ):
+        if in_index != in_record:
+            raise MalformedFile(
+                f"the chunk index entry at {entry.chunk_offset} declares {field_name} {in_index}; "
+                f"the Delta Chunk record there declares {in_record}",
+                code="index-record-mismatch",
+            )
+    declared = int(head.update_count) + int(head.birth_count) + int(head.death_count)
+    if entry.gaussian_count != declared:
+        raise MalformedFile(
+            f"the chunk index entry at {entry.chunk_offset} declares gaussian_count {entry.gaussian_count}; "
+            f"the Delta Chunk record there declares {declared} gaussians across its three groups",
+            code="index-record-mismatch",
+        )
+
+
+def compose_chain(
+    data: bytes,
+    index: list[rec.ChunkIndexEntry],
+    entry: rec.ChunkIndexEntry,
+    windows: list[tuple[float, float]] | None = None,
+) -> State:
+    """Compose the chain ending at `entry`, and check the state it produces.
+
+    Public because composing one entry is the whole of what a validator needs: it asks
+    whether each chunk decodes, not what any of them decoded to, and holding every state
+    to answer that costs many times the file. A caller that wants the states wants
+    `decode_indexed`; a caller that wants the verdict calls this per entry and drops what
+    it returns.
+    """
     chain = chain_for(index, (entry.t0 + entry.t1) / 2.0)
     state: State | None = None
     for link in chain:
         content = _record_at(data, link.chunk_offset, link.chunk_length)
+        opcode = data[link.chunk_offset] if link.chunk_offset < len(data) else None
+        want = op.CHUNK if link.kind == 0 else op.DELTA_CHUNK
+        if opcode != want:
+            raise MalformedFile(
+                f"the chunk index entry at {link.chunk_offset} declares chunk_kind {link.kind}, but the "
+                f"record there is {op.name(opcode) if opcode is not None else 'past the end of the file'} "
+                f"rather than {op.name(want)}",
+                code="index-record-mismatch",
+            )
         if link.kind == 0:
             ids, bins = _keyframe_from_chunk(content)
             state = keyframe_state(ids, bins)
+            if link.extended and link.gaussian_count != state.count:
+                raise MalformedFile(
+                    f"the chunk index entry at {link.chunk_offset} declares gaussian_count "
+                    f"{link.gaussian_count}; the keyframe chunk there carries {state.count}",
+                    code="index-record-mismatch",
+                )
         else:
-            assert state is not None
-            state, _ = _compose_delta(state, content)
-    assert state is not None
+            if state is None:
+                raise MalformedFile("a chain begins with a delta chunk", code="chain-without-keyframe")
+            state, head = _compose_delta(state, content)
+            if link.extended:
+                _check_entry_against_record(link, head)
+    if state is None:
+        raise MalformedFile("a chain with no chunks in it", code="chain-without-keyframe")
+    # `live_count` is the population after composition — the number a seeking consumer
+    # budgets against — and it is the one index field only a decode can check.
+    if entry.extended and entry.live_count != state.count:
+        raise MalformedFile(
+            f"the chunk index entry at {entry.chunk_offset} declares live_count {entry.live_count}; "
+            f"composing its chain produces {state.count} gaussians",
+            code="index-record-mismatch",
+        )
+    check_window_indices_of(state, windows if windows is not None else [])
     return state
+
+
+def scan_streamed(data: bytes):
+    """Every state a front-to-back reader composes, one at a time, keeping none.
+
+    `decode_streamed` keeps a state per chunk and a map of every offset a delta could
+    reference, which is right for a caller that wants the states and wrong for one that
+    only wants to know whether the file decodes: on a sequence with a thousand chunks it
+    holds a thousand populations. This yields each composed state and retains exactly two
+    — the head of the current group of pictures, which a keyframe-referenced delta points
+    at, and the previous chunk, which a chained delta points at. Those are the only two
+    references §5.18 defines, so a reference to anything else is a fault named here rather
+    than a third state kept in case.
+
+    Yields `(offset, kind, state)`. The caller is expected to drop each state before
+    asking for the next; nothing here holds on to it.
+    """
+    check_magic(data)
+    keyframe_at: int | None = None
+    keyframe_state_: State | None = None
+    previous_at: int | None = None
+    previous_state: State | None = None
+
+    for record in iter_records(data, len(MAGIC)):
+        if record.opcode == op.CHUNK:
+            ids, bins = _keyframe_from_chunk(record.content)
+            state = keyframe_state(ids, bins)
+            keyframe_at, keyframe_state_ = record.offset, state
+        elif record.opcode == op.DELTA_CHUNK:
+            head_peek = rec.parse_delta_chunk(record.content)[0]
+            if head_peek.reference_offset >= record.offset:
+                raise MalformedFile(
+                    f"delta chunk at {record.offset} references {head_peek.reference_offset}, which is not behind it",
+                    code="forward-reference",
+                )
+            if head_peek.reference_offset == previous_at:
+                reference = previous_state
+            elif head_peek.reference_offset == keyframe_at:
+                reference = keyframe_state_
+            else:
+                reference = None
+            if reference is None:
+                raise MalformedFile(
+                    f"delta chunk at {record.offset} references {head_peek.reference_offset}, which is "
+                    f"neither the keyframe at the head of its group nor the chunk before it",
+                    code="broken-reference",
+                )
+            state, _ = _compose_delta(reference, record.content)
+            # Dropped here rather than left bound in this frame: a generator is suspended
+            # at its yield for as long as the caller holds what it yielded, so a name
+            # still bound is a population still resident — and this one is the state
+            # before last, which nothing else needs once the composition is done.
+            reference = None
+        else:
+            continue
+        previous_at, previous_state = record.offset, state
+        yield record.offset, (0 if record.opcode == op.CHUNK else 1), state
 
 
 # --------------------------------------------------------------------------

@@ -258,11 +258,23 @@ def _check_groups_disjoint(update_ids: np.ndarray, birth_ids: np.ndarray, death_
 # --------------------------------------------------------------------------
 
 
-def check_tiling(index) -> None:
-    """State chunks tile the timeline: no overlap, no gap.
+def check_tiling(index, duration_sec: float | None = None) -> None:
+    """State chunks tile the timeline: no overlap, no gap, and no uncovered end.
 
     This is what makes the seek predicate a lookup rather than a search, and it is a real
     constraint — under `gaussian-birth` chunks may overlap freely, and here they may not.
+
+    §11.1 states the rule in three parts, and adjacency is only the middle one: "sorted by
+    `t0`, each chunk's `t1` equals the next chunk's `t0`; the first `t0` is `0`; the last
+    `t1` is the Header's `duration_sec`". Checking adjacency alone passes a file whose
+    chunks are perfectly adjacent over the middle of its timeline and cover neither end —
+    and a single-entry index, which has no adjacent pair at all, was checked by nothing.
+    A reader asked for an instant in the uncovered part then refuses a file the validator
+    called clean, which is the report being wrong rather than the file being unusual.
+
+    `duration_sec` is optional because a caller may hold an index before it holds the
+    Header — the ends cannot be checked against a duration nobody passed. Every caller in
+    this package passes it.
     """
     ordered = sorted(index, key=lambda e: e.t0)
     for previous, entry in pairwise(ordered):
@@ -272,6 +284,21 @@ def check_tiling(index) -> None:
                 f"state chunks {what}: [{previous.t0}, {previous.t1}) is followed by [{entry.t0}, {entry.t1})",
                 "non-tiling-chunks",
             )
+    if duration_sec is None or not ordered:
+        return
+    if ordered[0].t0 != 0.0:
+        raise _refuse(
+            f"state chunks leave a gap: the timeline starts at 0 and the first chunk covers "
+            f"[{ordered[0].t0}, {ordered[0].t1})",
+            "non-tiling-chunks",
+        )
+    if ordered[-1].t1 != duration_sec:
+        what = "overlap" if ordered[-1].t1 > duration_sec else "leave a gap"
+        raise _refuse(
+            f"state chunks {what}: the last chunk covers [{ordered[-1].t0}, {ordered[-1].t1}) and the "
+            f"Header declares a duration of {duration_sec}",
+            "non-tiling-chunks",
+        )
 
 
 def chain_for(index, t: float) -> list:

@@ -254,6 +254,11 @@ def validate(data: bytes) -> Report:
     chunk_count = 0
     counted = 0
     index: list[rec.ChunkIndexEntry] = []
+    #: Where every Chunk and Delta Chunk record sits, in file order — what the index is
+    #: checked against, and what says a Delta Chunk turned up in a file that declares a
+    #: model with no such record.
+    chunk_offsets: list[int] = []
+    delta_offsets: list[int] = []
     footer = None
     provenance = Provenance()
     objects = ObjectLayer()
@@ -278,8 +283,13 @@ def validate(data: bytes) -> Report:
                 head, _ = rec.parse_chunk(record.content)
                 chunk_count += 1
                 counted += head.count
+                chunk_offsets.append(record.offset)
                 if head.t1 < head.t0:
                     report.error(f"chunk {chunk_count} has t1 ({head.t1}) before t0 ({head.t0})")
+            elif record.opcode == op.DELTA_CHUNK:
+                first_chunk_seen = True
+                delta_offsets.append(record.offset)
+                chunk_offsets.append(record.offset)
             elif record.opcode == op.CHUNK_INDEX:
                 index.append(rec.ChunkIndexEntry.parse(record.content))
             elif record.opcode == op.AUDIO_SOURCE:
@@ -436,6 +446,19 @@ def validate(data: bytes) -> Report:
     for source_id in audio_data.keys() - audio_sources.keys():
         report.error(f"Audio Data id {source_id} has no matching Audio Source record")
 
+    # A Delta Chunk "exists only under `temporal_model = "keyframe-delta"`; a
+    # `gaussian-birth` file never contains one" (§5.18). Neither reader says so: the
+    # streamed one skips the opcode as though it were unknown, and the indexed one stops
+    # at the first Chunk — so a Delta Chunk in a gaussian-birth file was read by nobody
+    # and reported by nobody, and the state it carries silently was not in the scene.
+    if delta_offsets and not keyframe_delta:
+        model = "gaussian-birth" if header is None else header.temporal_model
+        report.error(
+            f"a Delta Chunk record appears at byte {delta_offsets[0]}, but the Header declares "
+            f"temporal model {model!r}; Delta Chunks exist only under 'keyframe-delta' (§5.18)"
+        )
+
+    named_by_index: dict[int, int] = {}
     for i, entry in enumerate(index):
         if entry.chunk_offset + entry.chunk_length > len(data):
             report.error(f"chunk index entry {i} points past the end of the file")
@@ -446,6 +469,27 @@ def validate(data: bytes) -> Report:
         at = data[entry.chunk_offset]
         if at != op.CHUNK and not (keyframe_delta and at == op.DELTA_CHUNK):
             report.error(f"chunk index entry {i} does not point at a Chunk record")
+            continue
+        if entry.chunk_offset in named_by_index:
+            report.error(
+                f"chunk index entries {named_by_index[entry.chunk_offset]} and {i} both name the "
+                f"chunk at byte {entry.chunk_offset}; the index carries one entry per chunk (§4)"
+            )
+        named_by_index[entry.chunk_offset] = i
+
+    # The index is data, and data in an untrusted file can say anything — including
+    # nothing at all about a chunk that is in the file. Every check that decodes a chunk
+    # below is driven by the index, so a chunk no entry names is a chunk nothing decodes:
+    # a file whose index omits the one chunk carrying an unimplemented codec was reported
+    # valid. The file layout is "one per chunk" (§4), so the omission is itself the fault
+    # and naming it is better than quietly decoding around it.
+    if index:
+        for at in chunk_offsets:
+            if at not in named_by_index:
+                report.error(
+                    f"the {op.name(data[at])} record at byte {at} is not named by any chunk index entry; "
+                    f"a seeking reader never reads it (§4)"
+                )
 
     if footer is not None and footer.summary_crc and footer.summary_start:
         tail = len(data) - (9 + 20 + len(MAGIC))
@@ -470,7 +514,8 @@ def validate(data: bytes) -> Report:
         )
 
     if keyframe_delta:
-        _check_keyframe_delta(data, walk, report)
+        assert header is not None  # `keyframe_delta` is read off it
+        _check_keyframe_delta(data, walk, report, header, bool(index))
     else:
         _check_gaussian_birth(data, walk, report)
 
@@ -496,23 +541,109 @@ def _check_gaussian_birth(data: bytes, walk: Walk, report: Report) -> None:
         # A file that will not open will not decode either, and the second error would say
         # the same thing about the same byte.
         return
-    refused = refusal.scan_chunks(data)
+    refused = refusal.scan_chunks(data, walk)
     if refused is not None:
         report.refused("a chunk does not decode: ", refused.error, walk, refused.site)
 
 
-def _check_keyframe_delta(data: bytes, walk: Walk, report: Report) -> None:
+def _check_keyframe_delta(data: bytes, walk: Walk, report: Report, header: rec.Header, indexed: bool) -> None:
     """The same, for the temporal model whose chunks are keyframes and differences.
 
-    `decode_indexed` is the model's own reader, so this is the same statement as the
-    branch above — open the file the way a client would, and decode what it carries —
-    expressed in the reader the file's declared model actually needs. The alternative,
-    which is what this validator did until now, is to run the gaussian-birth reader over
-    it and report its refusal as a fault in the file.
-    """
-    try:
-        from .keyframe_delta_file import decode_indexed
+    The same statement as the branch above — open the file the way a client would, then
+    decode what it carries — expressed in the reader the file's declared model actually
+    needs. The alternative, which is what this validator did until now, is to run the
+    gaussian-birth reader over it and report its refusal as a fault in the file.
 
-        decode_indexed(data)
+    Entry by entry, and never `decode_indexed`, for the two reasons the branch above is
+    per chunk: a composed state is a whole population and holding one per index entry
+    costs many times the file, and an entry that refuses is an entry whose **offset** the
+    report can name.
+    """
+    from . import keyframe_delta_file as kdf
+    from .registry import check_quantization_scheme
+
+    # The compatibility gate the gaussian-birth branch gets from `open_indexed`. The
+    # keyframe-delta reader parses the front matter without consulting the registry, so a
+    # file declaring a quantization scheme no build implements was reported valid on this
+    # path and refused on the other — the same bytes, two answers, decided by a field that
+    # has nothing to do with quantization. (The temporal model is not rechecked here: it is
+    # what selected this branch, and `registry.check_temporal_model` names the models the
+    # *gaussian-birth* reader implements.)
+    try:
+        for frame in walk.intact_records():
+            if frame.opcode != op.QUANTIZATION:
+                continue
+            content = frame.content(data)
+            if content is not None:
+                check_quantization_scheme(rec.Quantization.parse(content).scheme)
     except FourdgsError as exc:
         report.refused("a seeking reader cannot open this file: ", exc, walk)
+        return
+
+    # Distinct identities over the whole sequence, which is what `gaussian_count` counts
+    # under this model (§11.4) — every keyframe carries a full population, so summing the
+    # chunks is a larger number by design and the check above skips this model entirely.
+    # Skipping it left the field unchecked by anything: a Header could declare any number.
+    live: set[int] = set()
+
+    if not indexed:
+        # No index is a legal file, not a broken one: §4 makes the summary optional and
+        # AGENTS.md §2 makes streaming first-class. The indexed reader was being run over
+        # it anyway, which read the Footer's `summary_start` of 0 as an offset and parsed
+        # the magic as record framing — so every conforming indexless keyframe-delta file
+        # was reported invalid, with a diagnosis about a record that does not exist.
+        windows = _window_table(walk, data)
+        try:
+            for _offset, _kind, state in kdf.scan_streamed(data):
+                kdf.check_window_indices_of(state, windows)
+                live.update(int(v) for v in state.ids)
+                del state
+        except FourdgsError as exc:
+            report.refused("a chunk does not decode: ", exc, walk)
+            return
+    else:
+        try:
+            opened = kdf.open_indexed(data)
+        except FourdgsError as exc:
+            report.refused("a seeking reader cannot open this file: ", exc, walk)
+            return
+        for i, entry in enumerate(opened.index):
+            what = "Chunk" if entry.kind == 0 else "DeltaChunk"
+            try:
+                # The composed state is dropped when this iteration ends.
+                state = kdf.compose_chain(data, opened.index, entry, opened.windows)
+            except FourdgsError as exc:
+                report.refused(
+                    "a chunk does not decode: ",
+                    exc,
+                    walk,
+                    Site(entry.chunk_offset, f"the {what} record at index entry {i}"),
+                )
+                # One chain's failure is every later chain's failure — they share links —
+                # so the first is the finding and the rest would be the same fault
+                # restated.
+                return
+            live.update(int(v) for v in state.ids)
+            # Dropped before the next entry is composed, not merely rebound after it: a
+            # name still bound while the next call runs is a population still resident,
+            # and two at once on a large sequence is the cost this loop exists to avoid.
+            del state
+
+    if len(live) != header.gaussian_count:
+        report.error(
+            f"Header declares {header.gaussian_count} gaussians; the sequence carries {len(live)} distinct gaussian ids"
+        )
+
+
+def _window_table(walk: Walk, data: bytes) -> list[tuple[float, float]]:
+    """The Window Table a streamed reader would have when it meets a chunk."""
+    frame = walk.first_intact(op.WINDOW_TABLE)
+    if frame is None:
+        return []
+    content = frame.content(data)
+    if content is None:
+        return []
+    try:
+        return rec.WindowTable.parse(content).windows
+    except FourdgsError:
+        return []
