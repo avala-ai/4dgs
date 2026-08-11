@@ -484,6 +484,25 @@ void _checkSh(FourdgsGaussianSet g, int n) {
       'component and nothing between them',
     );
   }
+  final declaredCoefficients = switch (g.shDegree) {
+    0 => 0,
+    1 => 3,
+    2 => 8,
+    3 => 15,
+    _ => -1,
+  };
+  if (declaredCoefficients < 0) {
+    throw FourdgsInvalidInput(
+      'sh_degree is ${g.shDegree}; version 1 defines only degrees 0 through 3',
+    );
+  }
+  if (g.shCoefficients > declaredCoefficients) {
+    throw FourdgsInvalidInput(
+      'sh_coefficients is ${g.shCoefficients}, deeper than sh_degree '
+      '${g.shDegree} can declare ($declaredCoefficients); writing only the '
+      'declared bands would silently discard supplied coefficients',
+    );
+  }
   _checkLength('sh', sh.length, n * 3 * g.shCoefficients);
 }
 

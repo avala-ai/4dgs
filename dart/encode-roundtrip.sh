@@ -278,6 +278,14 @@ if (src.object_id is None) != (enc.object_id is None):
 if src.object_id is not None and not np.array_equal(enc.object_id, src.object_id[pair]):
     fail("an object_id changed, and object membership is an exact label")
 
+# Source provenance is another exact optional identity lane. The corpus's
+# object-bearing variant deliberately uses distinct nontrivial values, proving
+# presence and preservation through the writer's Morton order.
+if (src.source_index is None) != (enc.source_index is None):
+    fail("the source_index stream changed between present and absent")
+if src.source_index is not None and not np.array_equal(enc.source_index, src.source_index[pair]):
+    fail("a source_index changed, and source provenance is an exact label")
+
 # Spherical harmonics. Presence, degree and shape are checked BEFORE any
 # coefficient is compared, and they are checked because the comparison cannot
 # make them: an encoder that emitted no SH at all leaves `enc.sh` at None and

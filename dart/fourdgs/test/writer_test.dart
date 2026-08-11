@@ -916,6 +916,38 @@ void main() {
           ),
         ),
       );
+
+      // Whole rows can still be too deep for the degree the caller declared.
+      // Silently taking the degree-1 prefix of this degree-3 row would lose
+      // twelve supplied coefficients per colour component.
+      final deeperThanDeclared = FourdgsGaussianSet(
+        positions: base.positions,
+        scales: base.scales,
+        rotations: base.rotations,
+        colors: base.colors,
+        motions: base.motions,
+        muT: base.muT,
+        sigmaT: base.sigmaT,
+        winLo: base.winLo,
+        winHi: base.winHi,
+        shDegree: 1,
+        shCoefficients: 15,
+        sh: Uint8List(8 * 3 * 15),
+      );
+      expect(
+        () => writeFourdgsBytes(deeperThanDeclared, 8.0),
+        throwsA(
+          isA<FourdgsInvalidInput>().having(
+            (FourdgsInvalidInput e) => e.message,
+            'message',
+            allOf(
+              contains('sh_coefficients is 15'),
+              contains('sh_degree 1'),
+              contains('discard'),
+            ),
+          ),
+        ),
+      );
     });
 
     test('a degree the bands do not reach is written as the bands that do', () {
