@@ -39,8 +39,12 @@ public enum Opcode {
     public static let header: UInt8 = 0x01
     public static let footer: UInt8 = 0x02
     public static let quantization: UInt8 = 0x03
+    public static let windowTable: UInt8 = 0x04
     public static let chunk: UInt8 = 0x05
+    public static let shBandStream: UInt8 = 0x07
     public static let chunkIndex: UInt8 = 0x08
+    public static let statistics: UInt8 = 0x0C
+    public static let summaryOffset: UInt8 = 0x0F
     /// A keyframe-delta file's delta chunks. Deliberately not a flag on Chunk: a Chunk is
     /// independently decodable and a Delta Chunk is exactly the record that is not.
     public static let deltaChunk: UInt8 = 0x10
@@ -271,6 +275,18 @@ func readU32(_ bytes: [UInt8], at: UInt64) -> UInt32? {
     return value
 }
 
+/// A little-endian `u16` at `at`, or `nil` when the bytes are not there.
+func readU16(_ bytes: [UInt8], at: UInt64) -> UInt16? {
+    guard at <= UInt64(bytes.count), UInt64(bytes.count) - at >= 2 else { return nil }
+    let start = Int(at)
+    return UInt16(bytes[start]) | (UInt16(bytes[start + 1]) << 8)
+}
+
+/// A little-endian IEEE-754 `f64` at `at`, or `nil` when the bytes are not there.
+func readF64(_ bytes: [UInt8], at: UInt64) -> Double? {
+    readU64(bytes, at: at).map(Double.init(bitPattern:))
+}
+
 /// Every top-level record, from framing alone.
 ///
 /// Reads nine bytes per record and steps over the content, so this is as cheap on a file carrying
@@ -457,15 +473,26 @@ public func describe(_ error: FourDGSError, walk: Walk?, site: Site?) -> Named? 
     return Named(code: code, site: site ?? frontMatterSite(walk, code))
 }
 
-/// One chunk index entry, in the fields that are about where its records sit.
+/// One Chunk Index entry, including the keyframe-delta fields when the record carries them.
 public struct IndexEntry {
+    public let t0: Double
+    public let t1: Double
     public let offset: UInt64
     public let length: UInt64
-    /// `(band, offset)` for each SH Band Stream record this chunk's harmonics live in. A chunk is
-    /// not one record: the Chunk carries the attribute streams and each band sits in a record of
-    /// its own, elsewhere in the file, which is what lets a capped reader skip a band by byte
-    /// range rather than by decoding it.
-    public let bands: [(band: UInt8, offset: UInt64)]
+    /// `(band, offset, length)` for each SH Band Stream record this chunk's harmonics live in. A
+    /// chunk is not one record: the Chunk carries the attribute streams and each band sits in a
+    /// record of its own, elsewhere in the file, which is what lets a capped reader skip a band by
+    /// byte range rather than by decoding it.
+    public let bands: [(band: UInt8, offset: UInt64, length: UInt64)]
+    /// Whether the keyframe-delta block appended after the variable band table was present.
+    public let extended: Bool
+    /// 0 for a keyframe Chunk, 1 for a Delta Chunk.
+    public let kind: UInt8
+    public let deltaMode: UInt8
+    public let referenceOffset: UInt64
+    public let keyframeOffset: UInt64
+    public let depth: UInt16
+    public let liveCount: UInt64
 }
 
 /// What the file's own index says about where its chunks and their bands are, in index order.
@@ -474,37 +501,71 @@ public struct IndexEntry {
 /// "index entry 3" is what the reader was asked for and what it will name back — and because an
 /// entry pointing somewhere there is no Chunk is one of the things a validator is for.
 ///
-/// A fixed prefix rather than a record parse: `t0`, `t1`, `chunk_offset`, `chunk_length`,
-/// `gaussian_count`, then the band table (spec §5.9). Everything after those is what a seek costs
-/// or what `keyframe-delta` adds, and a later revision may append more — which is why this stops
-/// where the addresses stop.
+/// A bounded parse of the fixed prefix, the small band-address table, and the optional
+/// keyframe-delta block (spec §5.8). No record-sized allocation is made: the parser reads the
+/// forty-byte prefix, at most three useful band entries, and the fixed twenty-eight-byte extension.
 func chunkIndexEntries(_ source: ToolReader, _ walk: Walk) throws -> [IndexEntry] {
+    let t0Field: UInt64 = 0
+    let t1Field: UInt64 = 8
     let offsetField: UInt64 = 16
-    let bandTable: UInt64 = 36
+    let bandCountField: UInt64 = 36
     let prefix: UInt64 = 40
+    let bandEntrySize: UInt64 = 17
+    let deltaBlockSize: UInt64 = 28
     var out: [IndexEntry] = []
     for frame in walk.intactRecords where frame.opcode == Opcode.chunkIndex {
         let content = frame.offset + recordHeaderSize
         guard frame.length >= prefix else { continue }
         let fields = try source.exactly(
             offset: content, count: Int(prefix), record: "Chunk Index")
-        guard let offset = readU64(fields, at: offsetField),
+        guard let t0 = readF64(fields, at: t0Field), let t1 = readF64(fields, at: t1Field),
+            let offset = readU64(fields, at: offsetField),
             let length = readU64(fields, at: offsetField + 8)
         else { continue }
-        var bands: [(band: UInt8, offset: UInt64)] = []
-        let declared = UInt64(readU32(fields, at: bandTable) ?? 0)
+        var bands: [(band: UInt8, offset: UInt64, length: UInt64)] = []
+        let declared = UInt64(readU32(fields, at: bandCountField) ?? 0)
         // `(u8 band, u64 offset, u64 length)` each, and only as many as this record's own
         // declared length has room for. Degree 3 is the format maximum, so at most three bands
         // can be useful for refusal placement; the count is four bytes off an untrusted file.
         var at = content + prefix
-        let available = (frame.length - prefix) / 17
+        let available = (frame.length - prefix) / bandEntrySize
         for _ in 0..<min(min(declared, available), 3) {
-            let field = try source.exactly(offset: at, count: 17, record: "Chunk Index band range")
-            guard let bandOffset = readU64(field, at: 1) else { break }
-            bands.append((band: field[0], offset: bandOffset))
-            at += 17
+            let field = try source.exactly(
+                offset: at, count: Int(bandEntrySize), record: "Chunk Index band range")
+            guard let bandOffset = readU64(field, at: 1), let bandLength = readU64(field, at: 9)
+            else { break }
+            bands.append((band: field[0], offset: bandOffset, length: bandLength))
+            at += bandEntrySize
         }
-        out.append(IndexEntry(offset: offset, length: length, bands: bands))
+
+        let (bandBytes, bandOverflow) = declared.multipliedReportingOverflow(by: bandEntrySize)
+        let (extensionAt, extensionOverflow) = prefix.addingReportingOverflow(bandBytes)
+        let hasExtension =
+            !bandOverflow && !extensionOverflow && extensionAt <= frame.length
+            && frame.length - extensionAt >= deltaBlockSize
+        var kind: UInt8 = 0
+        var deltaMode: UInt8 = 0
+        var referenceOffset: UInt64 = 0
+        var keyframeOffset: UInt64 = 0
+        var depth: UInt16 = 0
+        var liveCount: UInt64 = 0
+        if hasExtension {
+            let extensionFields = try source.exactly(
+                offset: content + extensionAt, count: Int(deltaBlockSize),
+                record: "Chunk Index keyframe-delta fields")
+            kind = extensionFields[0]
+            deltaMode = extensionFields[1]
+            referenceOffset = readU64(extensionFields, at: 2) ?? 0
+            keyframeOffset = readU64(extensionFields, at: 10) ?? 0
+            depth = readU16(extensionFields, at: 18) ?? 0
+            liveCount = readU64(extensionFields, at: 20) ?? 0
+        }
+        out.append(
+            IndexEntry(
+                t0: t0, t1: t1, offset: offset, length: length, bands: bands,
+                extended: hasExtension, kind: kind, deltaMode: deltaMode,
+                referenceOffset: referenceOffset, keyframeOffset: keyframeOffset, depth: depth,
+                liveCount: liveCount))
     }
     return out
 }
@@ -667,9 +728,9 @@ public struct ChunkRefusal {
 func scanChunks(_ reader: SceneReader, index: [IndexEntry]) -> ChunkRefusal? {
     let chunks = reader.scene.chunkIntervals.count
     guard chunks > 0, reader.scene.isIndexed else {
-        // The ABI cannot ask a non-indexed scene for one chunk. Calling `allGaussians` here would
-        // turn validation into an unbounded accumulation, so opening the streamed scene is the
-        // strongest bounded check available; the missing-index warning states the limitation.
+        // The ABI cannot ask a non-indexed scene for one chunk. `validatePhysicalRecords` has
+        // already exposed each physical Chunk to a one-chunk streamed reader, so there is nothing
+        // to repeat here and no reason to call the unbounded whole-scene convenience.
         return nil
     }
     for i in 0..<chunks {

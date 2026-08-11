@@ -82,6 +82,10 @@ private func writeU64(_ value: UInt64, into bytes: inout [UInt8], at offset: UIn
     for i in 0..<8 { bytes[Int(offset) + i] = UInt8(truncatingIfNeeded: value >> (8 * i)) }
 }
 
+private func writeU32(_ value: UInt32, into bytes: inout [UInt8], at offset: UInt64) {
+    for i in 0..<4 { bytes[Int(offset) + i] = UInt8(truncatingIfNeeded: value >> (8 * i)) }
+}
+
 private func littleU32(_ value: UInt32) -> [UInt8] {
     (0..<4).map { UInt8(truncatingIfNeeded: value >> (8 * $0)) }
 }
@@ -284,6 +288,79 @@ final class ValidateTests: XCTestCase {
             }, "\(report.findings.map(\.message))")
     }
 
+    /// A range is not proved by fitting inside the resource. It must be exactly the whole framed
+    /// record, or an indexed decoder can materialize unrelated trailing bytes under an
+    /// attacker-sized `chunk_length`.
+    func testAnIndexedLengthMustEqualThePhysicalFrame() throws {
+        try requireCorpus()
+        var bytes = try readFixture(corpusDirectory().appendingPathComponent(provenanceVariant))
+        let walked = try walk(bytes)
+        let frame = try XCTUnwrap(walked.firstIntact(Opcode.chunkIndex))
+        let entry = try XCTUnwrap(chunkIndexEntries(bytes, walked).first)
+        writeU64(entry.length + 1, into: &bytes, at: frame.offset + recordHeaderSize + 24)
+
+        let report = validate(bytes)
+        XCTAssertFalse(report.ok)
+        XCTAssertTrue(
+            report.findings.contains {
+                $0.message.contains("chunk index entry 0 declares \(entry.length + 1) bytes")
+                    && $0.message.contains("its framed length is \(entry.length) bytes")
+            }, "\(report.findings.map(\.message))")
+    }
+
+    /// An index may not hide physical data by naming only a subset. The unknown codec lives in the
+    /// first Chunk; redirecting its entry to the second makes that Chunk absent from the index, so
+    /// only the bounded physical scan can still find the refusal.
+    func testAChunkAbsentFromTheIndexIsStillDecoded() throws {
+        try requireCorpus()
+        let file = corpusDirectory().appendingPathComponent("invalid/UnknownStreamCodec.4dgs")
+        var bytes = try readFixture(file)
+        let walked = try walk(bytes)
+        let frames = walked.records.filter { $0.opcode == Opcode.chunkIndex }
+        let entries = chunkIndexEntries(bytes, walked)
+        XCTAssertGreaterThanOrEqual(entries.count, 2)
+        writeU64(
+            entries[1].offset, into: &bytes,
+            at: frames[0].offset + recordHeaderSize + 16)
+
+        let report = validate(bytes)
+        XCTAssertFalse(report.ok)
+        XCTAssertTrue(
+            report.findings.contains {
+                $0.message
+                    == "the Chunk record at byte \(entries[0].offset) is absent from the Chunk Index"
+            }, "\(report.findings.map(\.message))")
+        XCTAssertTrue(
+            report.findings.compactMap(\.refusal).contains { $0.code == .unknownStreamCodec },
+            "\(report.findings.map(\.message))")
+    }
+
+    /// A matching checksum does not make arbitrary records into summary records. The three legal
+    /// kinds are a structural rule of §4.5, independently of CRC integrity.
+    func testSummaryRejectsANonSummaryRecordEvenWithAMatchingCRC() throws {
+        try requireCorpus()
+        let variant =
+            "TenWindows-UseChunkIndex-UseChunks-UseCrc-UseStatistics-UseSummaryOffset.4dgs"
+        var bytes = try readFixture(corpusDirectory().appendingPathComponent(variant))
+        let walked = try walk(bytes)
+        let statistics = try XCTUnwrap(walked.firstIntact(Opcode.statistics))
+        let footer = try XCTUnwrap(walked.firstIntact(Opcode.footer))
+        let summary = try XCTUnwrap(summaryDeclaration(bytes, walked))
+        bytes[Int(statistics.offset)] = Opcode.privateStart
+        let checksum = crc32(bytes[Int(summary.start)..<Int(summary.end)])
+        writeU32(checksum, into: &bytes, at: footer.offset + recordHeaderSize + 16)
+
+        let report = validate(bytes)
+        XCTAssertFalse(report.ok)
+        XCTAssertFalse(report.findings.contains { $0.message.hasPrefix("summary CRC mismatch") })
+        XCTAssertTrue(
+            report.findings.contains {
+                $0.message
+                    == "the Footer's summary contains Private(0x80) at byte \(statistics.offset); "
+                    + "expected only ChunkIndex, Statistics, or SummaryOffset records"
+            }, "\(report.findings.map(\.message))")
+    }
+
     func testKeyframeDeltaIndexDiagnosticNamesBothLegalTargets() throws {
         try requireCorpus()
         let file = try XCTUnwrap(
@@ -298,6 +375,56 @@ final class ValidateTests: XCTestCase {
         XCTAssertTrue(
             report.findings.contains {
                 $0.message == "chunk index entry 0 does not point at a Chunk or DeltaChunk record"
+            }, "\(report.findings.map(\.message))")
+    }
+
+    func testKeyframeDeltaIndexIntervalsMustTile() throws {
+        try requireCorpus()
+        let file = try XCTUnwrap(
+            variants(corpusDirectory().appendingPathComponent("keyframe")).first)
+        var bytes = try readFixture(file)
+        let walked = try walk(bytes)
+        let frames = walked.records.filter { $0.opcode == Opcode.chunkIndex }
+        let entries = chunkIndexEntries(bytes, walked)
+        XCTAssertGreaterThanOrEqual(entries.count, 2)
+        XCTAssertTrue(entries.allSatisfy(\.extended))
+        writeU64(
+            entries[0].t0.bitPattern, into: &bytes,
+            at: frames[1].offset + recordHeaderSize)
+
+        let report = validate(bytes)
+        XCTAssertTrue(
+            report.findings.contains { $0.message.hasPrefix("state chunks overlap:") },
+            "\(report.findings.map(\.message))")
+    }
+
+    func testKeyframeDeltaRejectsAForwardReferenceAndIndexRecordDisagreement() throws {
+        try requireCorpus()
+        let file = corpusDirectory().appendingPathComponent(
+            "keyframe/KeyframeDelta-UseChunkIndex-UseCrc-UseStatistics.4dgs")
+        var bytes = try readFixture(file)
+        let walked = try walk(bytes)
+        let frames = walked.records.filter { $0.opcode == Opcode.chunkIndex }
+        let entries = chunkIndexEntries(bytes, walked)
+        let delta = try XCTUnwrap(entries.firstIndex { $0.kind == 1 })
+        let frame = frames[delta]
+        let bandCount = UInt64(
+            try XCTUnwrap(readU32(bytes, at: frame.offset + recordHeaderSize + 36)))
+        let extensionOffset = frame.offset + recordHeaderSize + 40 + bandCount * 17
+        writeU64(entries[delta].offset, into: &bytes, at: extensionOffset + 2)
+
+        let report = validate(bytes)
+        XCTAssertFalse(report.ok)
+        XCTAssertTrue(
+            report.findings.contains {
+                $0.message
+                    == "the chunk at \(entries[delta].offset) references \(entries[delta].offset), "
+                    + "which is not behind it; references point backwards only"
+            }, "\(report.findings.map(\.message))")
+        XCTAssertTrue(
+            report.findings.contains {
+                $0.message.contains("chunk index entry \(delta) has reference_offset")
+                    && $0.message.contains("but the DeltaChunk at byte")
             }, "\(report.findings.map(\.message))")
     }
 
@@ -341,6 +468,7 @@ final class ValidateTests: XCTestCase {
         try requireCorpus()
         let files = [
             corpusDirectory().appendingPathComponent(provenanceVariant),
+            corpusDirectory().appendingPathComponent("TenWindows-UseCrc.4dgs"),
             try XCTUnwrap(variants(corpusDirectory().appendingPathComponent("keyframe")).first),
         ]
         for file in files {
