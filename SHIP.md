@@ -22,8 +22,9 @@ Companion to the Avala monorepo’s `SHIP.md` (same discipline, this repo’s la
 | [`RELEASING.md`](RELEASING.md) | Release process per language |
 | **This file** | How to *structure work* so many agents ship in parallel without thrashing |
 
-Read this when you are about to open a multi-file change, spawn parallel agents, or feel
-the PR is growing into a review-hostile blob. Skip it for one-line fixes.
+**When to read this file (opt-in):** multi-agent work, multi-language / cross-lane changes,
+stacked multi-SDK features, or a PR that is about to bloat. **Skip** for tiny single-language
+edits. Root [`AGENTS.md`](AGENTS.md) uses the same threshold.
 
 **Already load-bearing here:** AGENTS.md §9 — *one language per pull request, stacked*.
 SHIP does not replace that; it adds blast radius, worktrees, and commit rhythm around it.
@@ -56,15 +57,15 @@ Throughput comes from **non-overlapping writers**, not from more tokens on the s
 
 ### Default lane map
 
-| Lane | Owns (write) | Notes |
-|------|----------------|-------|
+| Lane | Conflict scope (write exclusive) | Notes |
+|------|----------------------------------|-------|
 | **python** | `python/` | Reference-friendly encoder/decoder |
 | **rust** | `rust/` | Rust SDK + CLI |
 | **typescript** | `typescript/` | Core / node / browser packages |
 | **dart** | `dart/` | Dart SDK |
 | **swift** | `swift/` | Swift SDK |
 | **cpp** | `cpp/` | C++ SDK |
-| **spec / kaitai / corpus** | `kaitai/`, `spec-tools/`, shared conformance fixtures under language trees as documented | Bottom of a feature stack |
+| **spec / kaitai / corpus** | `kaitai/`, `spec-tools/`, **`tests/conformance/`** (shared generator, harness, expectations, fixtures) | Bottom of a feature stack |
 | **website / docs** | `website/` | Concepts vocabulary lives here |
 | **scripts / ci** | `scripts/`, `.github/` | Prefer dedicated PRs |
 | **root prose** | `AGENTS.md`, this file, CHANGELOG, RELEASING | lead when multi-agent |
@@ -74,57 +75,70 @@ Hard rules:
 1. **Two writers never share a file.** Split by language directory first.
 2. **One language per PR** (AGENTS.md §9). A feature across SDKs is a **stack**, not one PR
    and not four parallel PRs against `main` that all edit shared corpus meaning without a base.
-3. **Contract / corpus first.** Spec or shared fixture changes land at the **bottom** of the
-   stack; each language PR above proves the same claim.
-4. **One `git worktree` per concurrent lane (required).** Do not run two writing agents in
-   the same working tree. Shared dirt causes silent overwrites, false “fixes,” and unreviewable
-   mixed diffs. **New** parallel work should use `git worktree` from a single primary clone
-   (see below).
+3. **Contract / corpus first.** Spec or shared fixture changes (`tests/conformance/`, kaitai,
+   spec-tools) land at the **bottom** of the stack; each language PR above proves the same claim.
+4. **One `git worktree` per concurrent lane (required)** for parallel writers.
 5. **Lead owns integration.** When stacking languages, one person/agent manages retargets,
    conformance, and PR narrative.
+6. **Fork exception (AGENTS.md §9):** cross-fork stacks are not supported. Contributors on a
+   **fork** use ordinary **sequential** PRs (one language after another merges to upstream),
+   not a required in-repo stack. Do not prescribe an impossible stacked workflow for forks.
 
 ### `git worktree` — default for parallel / multi-agent work
 
-From the primary clone (example paths; pick a sibling dir you control):
+Resolve the **upstream** remote (`avala-ai/4dgs`). On a fork that is often `upstream`.
 
 ```bash
-# One language = one branch = one worktree, branched from origin/main (or stack base)
-git fetch origin main
-git worktree add -b feat/python-<slug> ../4dgs-wt-python origin/main
-git worktree add -b feat/rust-<slug>   ../4dgs-wt-rust   origin/main
+UPSTREAM=$(git remote -v | awk '/avala-ai\/4dgs/ {print $1; exit}')
+UPSTREAM=${UPSTREAM:-origin}
+git fetch "$UPSTREAM" main
 
-# Agent A cwd: ../4dgs-wt-python   (writes python/ only)
-# Agent B cwd: ../4dgs-wt-rust     (writes rust/ only — only if independent of A;
-#                                   for one feature, stack instead of parallel)
+# Independent bugfixes in two languages (parallel PRs to main):
+git worktree add --no-track -b fix/python-<slug> ../4dgs-wt-python "$UPSTREAM/main"
+git worktree add --no-track -b fix/rust-<slug>   ../4dgs-wt-rust   "$UPSTREAM/main"
 
-# After PR merge or abandon:
+# First publish: git push -u origin HEAD
+
+# Squash-safe cleanup after merge/abandon:
 git worktree remove ../4dgs-wt-python
-git branch -d feat/python-<slug>   # if fully merged
+gh pr view <n> --json state --jq .state
+git branch -D fix/python-<slug>
 ```
 
-When languages **depend on the same corpus change**, do **not** parallelize against `main`:
-open the corpus PR first, then `git worktree add -b … <path> <corpus-branch>` for each
-language layer (or wait and branch from the next stack base). Parallel worktrees are for
-**independent** claims (e.g. two bugfixes in different SDKs).
+**Stacked multi-SDK feature** (corpus then languages) — each layer branches from the layer
+**below**, not all from the corpus tip as siblings:
+
+```bash
+# 1) corpus layer
+git worktree add --no-track -b feat/<slug>-corpus ../4dgs-wt-corpus "$UPSTREAM/main"
+# ... land corpus PR targeting main ...
+
+# 2) first language — base = corpus branch (PR targets corpus branch)
+git worktree add --no-track -b feat/<slug>-python ../4dgs-wt-python feat/<slug>-corpus
+
+# 3) next language — base = previous language branch (PR targets that branch)
+git worktree add --no-track -b feat/<slug>-rust ../4dgs-wt-rust feat/<slug>-python
+```
+
+Do **not** create every language worktree from the corpus branch alone; that yields sibling
+branches, not a stack (AGENTS.md §9).
 
 Rules of use:
 
-- **Branch from `origin/main`** (or the stack base), never from a dirty unrelated feature branch.
-- **Agent cwd is the worktree root** for that lane — not the primary tree.
+- **Branch from `$UPSTREAM/main`** or the **immediate stack base**, never a dirty unrelated branch.
+- **Agent cwd is the worktree root** for that lane.
 - **Do not** `git worktree add` into a path that already has uncommitted work.
-- List with `git worktree list`; prune stale entries with `git worktree prune` after deletes.
+- List with `git worktree list`; prune with `git worktree prune` after deletes.
 
 Single-lane, single-agent work may stay in the primary tree. The moment a second writer starts,
-**spin a worktree** — do not “just use another pane” on the same checkout.
+**spin a worktree**.
 
 ### Prompt shape for a parallel agent
-
-Keep prompts short; put judgment in the PR body later:
 
 ```text
 Lane: python only. Cwd: <worktree path>. Write only under python/.
 Goal: <one sentence>.
-Out of scope: rust/, typescript/, dart/, other SDKs.
+Out of scope: rust/, typescript/, dart/, tests/conformance/ (unless corpus lane), other SDKs.
 Done when: python conformance / package tests green for this claim.
 Commit atomically as you go (see §4). Do not open the PR unless asked.
 ```
@@ -133,112 +147,75 @@ Commit atomically as you go (see §4). Do not open the PR unless asked.
 
 ## 4. Commit rhythm inside a PR (atomic, not ceremonial)
 
-Agents **should** commit as they go. Humans should too. The PR is the review unit; commits
-are the undo/log unit.
+Agents **should** commit as they go **inside their own worktree**.
 
-1. **Atomic commits** — one concern per commit. Prefer Conventional Commit subjects when
-   natural: `fix(python): …`, `test(rust): …`, `docs: …`. Put the long reasoning in the
-   **commit body or PR body**, not a 40-line subject.
-2. **Only stage your lane’s files.** Other agents’ dirt is not yours to “helpfully” fix
-   unless you own that lane.
-3. **Do not amend** shared history or force-push unless the human asked (stacked-PR recovery
-   is the exception — follow AGENTS.md §9).
-4. **Batch review-bot findings** into one follow-up commit when possible
-   (`fix: address review — <theme>`), not five serial micro-pushes for five nits.
-5. **Conformance with the claim.** An SDK claims a feature by passing the suite for it
-   (AGENTS.md §8). A fix without a regression on decode semantics is unfinished unless the PR
-   explains why and what encodes the gap.
-
-PR description stays the place for narrative: which claim, which suite, risk. That quality
-bar does **not** require a single sprawling commit.
+1. **Atomic commits** — Prefer Conventional Commit subjects: `fix(python): …`, `test(rust): …`.
+2. **Only stage your lane’s files.**
+3. **History rewrites:** no casual amend/force-push.
+   - Allowed: stack recovery on **feature** branches per AGENTS.md §9.
+   - **Never** force-push `main`, even on a casual human request — protected branch rules win.
+4. **Batch review-bot findings** into one follow-up commit when possible.
+5. **Conformance with the claim** (AGENTS.md §8).
 
 ---
 
 ## 5. Fast feedback loops (close the loop without full multi-SDK waits)
 
-During the loop, run **that language’s** tests only. Cross-language full matrix is CI / stack
-integration, not every keystroke.
-
 | Loop | Prefer |
 |------|--------|
 | Python | package tests / conformance under `python/` (see package README/Makefile) |
 | Rust | `cargo test` in `rust/` (scoped packages) |
-| TypeScript | package scripts under `typescript/` |
+| TypeScript | **Repo root:** `yarn test` and/or `yarn conformance` (packages under `typescript/` do not define test scripts). Generate corpus first when exercising corpus-backed tests. |
 | Dart | package tests under `dart/` |
 | Vocabulary / concepts | `website/docs/guides/concepts.md` consistency |
 
-**Close the loop before expanding scope.** If verification is red, fix or shrink — do not
-open a second language layer on a red base.
+**Close the loop before expanding scope.**
 
 ---
 
 ## 6. What to parallelize vs serialize
 
-**Parallelize (high ROI):**
+**Parallelize:** independent bugs in different SDKs (separate worktrees → separate PRs to
+`main`); docs while an SDK change sits in review; isolated hypothesis worktrees; in-lane cleanup.
 
-- Independent bugs in different language SDKs (separate worktrees → separate PRs to `main`)
-- Docs / website wording while a finished SDK change sits in review
-- Hypothesis debugging on isolated worktrees
-- Cleanup that cannot conflict: dead code in one SDK, lint-only
+**Serialize:** format semantics / shared conformance meaning; hostile-input decode hardening that
+redefines errors; multi-language feature delivery (**stack**, bottom-up); release cuts.
 
-**Serialize (quality / correctness):**
-
-- Format semantics and shared conformance meaning
-- Hostile-input / untrusted-bytes decode hardening that redefines errors
-- Multi-language feature delivery (**stack**, bottom-up)
-- Release cuts (RELEASING.md)
-
-**Anti-patterns (slow and low quality):**
-
-- One PR touching Python + Rust + TypeScript + Dart “to finish the feature”
-- Parallel writers in the same language tree “to go faster”
-- Optimizing for commit count or merging before that language’s conformance is green
-- Renaming concepts away from `website/docs/guides/concepts.md` vocabulary
+**Anti-patterns:** one PR across four languages; two writers one tree; sibling branches where a
+stack is required; fork contributors forced into in-repo stacks; commit vanity.
 
 ---
 
 ## 7. Cleanup is a product (scheduled, small, separate)
 
-Debt paydown keeps agents fast later. Prefer **dedicated small PRs**:
-
-- dead code / unused exports in one language
-- duplicate tests
-- AGENTS.md / README command fixes
-
-Do **not** hide large refactors inside feature PRs. Opportunistic cleanup is OK only when it
-is high-confidence, in-lane, and does not obscure the feature diff.
+Prefer dedicated small PRs: dead code in one language, duplicate tests, AGENTS.md command fixes.
+Do not hide large refactors inside feature PRs.
 
 ---
 
 ## 8. Metrics (track these, not vanity)
 
-Per person or team, weekly:
-
-1. **PRs merged** with CI green (primary)
-2. **Median time** idea → first green CI on the PR
-3. **Median files changed** on non-merge commits (keep low; multi-language spikes mean stack)
-4. **Bot/review findings that are real** vs noise (encode the real ones in AGENTS.md)
-
-If (1) and (2) improve while conformance/regresses stay flat, the system is working.
-If commit count rises and decode incidents rise, stop and re-read §2 and AGENTS.md §1–§8.
+1. **PRs merged** with CI green  
+2. **Median time** idea → first green CI  
+3. **Median files changed** on non-merge commits  
+4. **Real** review findings encoded into AGENTS.md  
 
 ---
 
 ## 9. Standing rules for agents (checklist)
 
-1. Declare **language lane + out-of-scope paths** before writing.
-2. **One language per PR**; stack multi-SDK features (AGENTS.md §9).
-3. Commit **atomically** in-lane; leave other agents’ files alone.
-4. Verify with **that language’s** tests; escalate before open PR.
-5. Self-check cross-SDK principles (bounded memory, streamable decode, I/O at edges, …).
-6. When you learn something the next agent will need, write it into AGENTS.md — do not only
-   put it in chat.
+1. Declare **language lane + out-of-scope paths** before writing.  
+2. **One language per PR**; stack multi-SDK features (AGENTS.md §9); forks use sequential PRs.  
+3. Commit **atomically** in-lane (own worktree).  
+4. Verify with **that language’s** real test entry points; escalate before open PR.  
+5. Self-check cross-SDK principles (bounded memory, streamable decode, I/O at edges, …).  
+6. Encode learnings into AGENTS.md — not only chat.
 
 ---
 
 ## 10. See also
 
-- Root [`AGENTS.md`](AGENTS.md) — design principles + stacked multi-language PRs
-- [`CONTRIBUTING.md`](CONTRIBUTING.md) — contribution flow
-- [`RELEASING.md`](RELEASING.md) — per-language release
-- [`website/docs/guides/concepts.md`](website/docs/guides/concepts.md) — shared vocabulary
+- Root [`AGENTS.md`](AGENTS.md) — design principles + stacked multi-language PRs  
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — contribution flow (including forks)  
+- [`RELEASING.md`](RELEASING.md) — per-language release  
+- [`website/docs/guides/concepts.md`](website/docs/guides/concepts.md) — shared vocabulary  

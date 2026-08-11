@@ -5,7 +5,8 @@ four SDKs behave like one format rather than four interpretations of it.
 
 **Throughput (parallel agents / multi-language work):** read **[SHIP.md](SHIP.md)** — blast
 radius, one language lane per writer, **one `git worktree` per concurrent writer**, atomic
-commits. Complements §9 (one language per PR, stacked); does not replace it.
+commits. Opt-in for multi-agent, multi-language, or bloating PRs — **not** tiny single-language
+edits. Complements §9 (one language per PR, stacked; forks sequential); does not replace it.
 
 ## 1. Bounded memory, always
 
