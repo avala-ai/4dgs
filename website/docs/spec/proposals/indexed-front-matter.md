@@ -317,6 +317,13 @@ One variant, in `data/invalid/`, because after this proposal the file is not a l
   serialize them; comparing only today's `refused` string would not prove the diagnostic rule this
   proposal adds. Existing invalid cases whose rule names no opcode keep their current one-field
   expectations.
+- **The validator is exercised separately from the decode runners.** `tests/conformance/run.py`
+  currently invokes decoders only, so these files do not by themselves prove `fourdgs.validate`. The
+  corpus change therefore lands with a validator test that runs the Python validator over every
+  `Late*` file and asserts the same `refused`, `opcode` and `at` triple. Each SDK's inspect/validate
+  milestone adds the equivalent assertion to that language's validator suite before claiming this
+  rule in the feature matrix. Decoder coverage and validator coverage are two independent gates;
+  neither is cited as evidence for the other.
 - **Why an invalid variant and not a valid one:** a valid variant can only assert that the two paths
   agree, and under this proposal they agree because the file cannot exist. The thing worth pinning
   is the refusal — without it, an implementation that keeps today's silent behaviour passes.
@@ -324,10 +331,14 @@ One variant, in `data/invalid/`, because after this proposal the file is not a l
   observe the late record; an implementation that scans farther may instead issue the specified
   refusal. Both behaviours conform. Before these files are added, the harness gains a
   `STREAMED_ONLY_INVALID` set containing every `Late*` variant, and `supports()` returns false for
-  indexed runners when the variant is in that set; its existing per-runner execution audit still
-  requires every streamed runner to run each case. This is a variant-specific exclusion, not a
-  shared refusal expectation that silently asks indexed implementations to detect what they are
-  allowed not to scan.
+  indexed runners when the variant is in that set. The same harness change makes refusal execution
+  explicit for **every streamed runner family**, including Dart: it replaces the current
+  family-level "at least one runner ran" audit with a `(runner, variant)` audit and fails unless
+  every streamed runner executed every applicable `Late*` case. A streamed family may not skip the
+  invalid corpus merely because it is absent from today's `REFUSAL_FAMILIES`; it must serialize the
+  structured late-record refusal first. This is a variant-specific indexed exclusion, not a shared
+  refusal expectation that silently asks indexed implementations to detect what they are allowed not
+  to scan.
 - **Both temporal-model stream loops are exercised, including skipped opcodes.** Build both
   `LateKeyframeDeltaWindowTable` and `LateKeyframeDeltaObjectTrack`. The first reaches a branch the
   keyframe-delta loop already dispatches; the second reaches a defined opcode that loop currently

@@ -266,6 +266,11 @@ same fix regenerate its new expectation.
 > decoded order. Sorting and then adding raw floats would still be non-portable: equivalent
 > computations in different languages may differ in their last bits and therefore sort or sum
 > differently.
+>
+> Apply `num` before integer conversion. If any addend rounds to `null` because the decoded or
+> composed value is non-finite, the aggregate for that field is `null` and no integer conversion or
+> partial sum is attempted. This preserves the canonical form's existing non-finite rule and gives
+> every port one defined result instead of asking it to convert `null` to integer units.
 
 ### 5.3 `tests/conformance/README.md`, replacing the "nothing depends on decoded order" bullet
 

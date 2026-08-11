@@ -246,7 +246,11 @@ one.
 
 ## 5. The normative text
 
-### 5.1 Into §11.3, replacing its final paragraph
+### 5.1 Into §11.3, replacing the composed-state paragraph immediately before its final paragraph
+
+The existing final paragraph — the separate rule that a keyframe sets every gaussian's `mu_t` to the
+keyframe's `t0` — remains in place, unchanged. Replace only the preceding paragraph that begins "The
+composed state `S` is a set of gaussians" with the text below.
 
 > The composed state `S` is a set of gaussians in exactly the state §3 describes — the same fields,
 > the same types — and **§3's arithmetic then applies verbatim**. This model changes _where the
@@ -282,7 +286,18 @@ one.
 > depth would not survive the first delta. The transform is therefore applied to the reconstructed
 > state and nowhere else.
 
-### 5.2 Into §11.5, after the rotation paragraph
+### 5.2 Into §11.5, correcting the opening rule and then extending the rotation paragraph
+
+First replace §11.5's opening sentence and invariant table, which incorrectly include
+`rotation_index`, with:
+
+> Three attributes are **GOP-invariant per gaussian**: `sigma_t`, `flags` and `window_index`. A
+> delta MUST NOT carry them in its update group, and a reader MUST refuse a file where one appears
+> there. `rotation_index` is not GOP-invariant: like `rotation`, it is an absolute restatement when
+> present in an update, as the rotation paragraph below defines.
+
+This is a normative correction, not only an implementation note: it makes §11.5 agree with §5.18
+before the new `object_id` rule is inserted. Then add the following after the rotation paragraph:
 
 > **`object_id` in a delta's update group is an absolute restatement, not a bin difference.** The
 > update carries the `object_id` values as written and they replace the previous ones outright. This
