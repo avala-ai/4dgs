@@ -95,9 +95,9 @@ wants to know _where_ it stops being a 4dgs file.
 
 ```bash
 LD_LIBRARY_PATH="$PWD/target/release${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-  swift run --package-path swift -Xlinker -L"$PWD/target/release" 4dgs inspect scene.4dgs
+  swift run -Xlinker -L"$PWD/target/release" 4dgs inspect scene.4dgs
 LD_LIBRARY_PATH="$PWD/target/release${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-  swift run --package-path swift -Xlinker -L"$PWD/target/release" 4dgs validate scene.4dgs
+  swift run -Xlinker -L"$PWD/target/release" 4dgs validate scene.4dgs
 ```
 
 `inspect` walks the records — offset, opcode, content and total length, and whether the Footer's

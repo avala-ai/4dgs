@@ -637,7 +637,7 @@ final class ValidateTests: XCTestCase {
             entries.append(
                 IndexEntry(
                     t0: Double(i), t1: Double(i + 1), offset: offset, length: stride,
-                    bands: [], extended: true, kind: i == 0 ? 0 : 1,
+                    gaussianCount: 1, bands: [], extended: true, kind: i == 0 ? 0 : 1,
                     deltaMode: i == 0 ? 0 : 1,
                     referenceOffset: i == 0 ? 0 : offset - stride,
                     keyframeOffset: firstOffset, depth: UInt16(i), liveCount: 1))
@@ -882,6 +882,17 @@ final class ValidateTests: XCTestCase {
             validate(orphanIndex).findings.contains {
                 $0.message.contains("lies outside the Footer-declared summary")
             })
+
+        var manyFooters = original
+        let extraFooter = [Opcode.footer] + littleU64(20) + [UInt8](repeating: 0, count: 20)
+        for _ in 0..<20 {
+            manyFooters.insert(contentsOf: extraFooter, at: Int(footer.offset))
+        }
+        let repeated = validate(manyFooters).findings.filter {
+            $0.message.contains("Footer") && $0.message.contains("not final")
+        }
+        XCTAssertEqual(repeated.count, 1, "\(repeated.map(\.message))")
+        XCTAssertTrue(repeated[0].message.contains("20 Footer records"))
     }
 
     func testGaussianBirthHeaderAndIndexMetadataMatchPhysicalState() throws {
@@ -933,6 +944,85 @@ final class ValidateTests: XCTestCase {
         XCTAssertTrue(
             validate(wrongInterval).findings.contains {
                 $0.message.contains("has t0") && $0.message.contains("the Chunk at byte")
+            })
+
+        var wrongIndexCount = original
+        writeU32(
+            entry.gaussianCount + 1, into: &wrongIndexCount,
+            at: index.offset + recordHeaderSize + 32)
+        writeU32(0, into: &wrongIndexCount, at: footer.offset + recordHeaderSize + 16)
+        XCTAssertTrue(
+            validate(wrongIndexCount).findings.contains {
+                $0.message.contains("declares gaussian_count")
+                    && $0.message.contains("physical Chunk")
+            })
+
+        var duplicateIndex = original
+        let indexBytes = original[Int(index.offset)..<Int(index.offset + index.total)]
+        duplicateIndex.insert(contentsOf: indexBytes, at: Int(footer.offset))
+        let duplicateFooterOffset = footer.offset + index.total
+        writeU32(0, into: &duplicateIndex, at: duplicateFooterOffset + recordHeaderSize + 16)
+        XCTAssertTrue(
+            validate(duplicateIndex).findings.contains {
+                $0.message.contains("each state record must have one index entry")
+            })
+    }
+
+    func testPhysicalStateShapeAndOrderingDoNotDependOnTheIndex() throws {
+        try requireCorpus()
+        let file = corpusDirectory().appendingPathComponent(
+            "keyframe/KeyframeDelta-UseChunkIndex-UseCrc-UseStatistics.4dgs")
+        let original = try readFixture(file)
+        let walked = try walk(original)
+        let dispatch = try XCTUnwrap(
+            try headerDispatch(ToolReader(InMemoryReader(original)), walked))
+        let firstState = try XCTUnwrap(
+            walked.records.first { $0.opcode == Opcode.chunk || $0.opcode == Opcode.deltaChunk })
+        let quantization = try XCTUnwrap(walked.firstIntact(Opcode.quantization))
+
+        var missingKeyframeBands = original
+        missingKeyframeBands[Int(dispatch.temporalModelOffset + 14 + 48)] = 1
+        XCTAssertTrue(
+            validate(missingKeyframeBands).findings.contains {
+                $0.message.contains("physical SH Band Streams")
+                    && $0.message.contains("missing bands [1]")
+            })
+
+        var stateBeforeQuantization = original
+        let stateBytes = original[
+            Int(firstState.offset)..<Int(firstState.offset + firstState.total)]
+        stateBeforeQuantization.insert(contentsOf: stateBytes, at: Int(quantization.offset))
+        XCTAssertTrue(
+            validate(stateBeforeQuantization).findings.contains {
+                $0.message.contains("appears before Quantization")
+            })
+
+        var malformedAuxiliary = original
+        malformedAuxiliary.insert(
+            contentsOf: [Opcode.coordinateFrame] + littleU64(0), at: Int(firstState.offset))
+        XCTAssertTrue(
+            validate(malformedAuxiliary).findings.contains {
+                $0.refusal?.site?.offset == firstState.offset
+                    && $0.refusal?.site?.what.contains("CoordinateFrame") == true
+            })
+    }
+
+    func testEveryPhysicalBandMustAppearInItsOwningIndexEntry() throws {
+        try requireCorpus()
+        let file = corpusDirectory().appendingPathComponent(
+            "MixedLifetimes-SHDegree3-UseChunkIndex-UseCrc.4dgs")
+        var bytes = try readFixture(file)
+        let walked = try walk(bytes)
+        let footer = try XCTUnwrap(walked.firstIntact(Opcode.footer))
+        for frame in walked.records where frame.opcode == Opcode.chunkIndex {
+            writeU32(0, into: &bytes, at: frame.offset + recordHeaderSize + 36)
+        }
+        writeU32(0, into: &bytes, at: footer.offset + recordHeaderSize + 16)
+
+        XCTAssertTrue(
+            validate(bytes).findings.contains {
+                $0.message.contains("physical SH Band Stream")
+                    && $0.message.contains("absent from the Chunk Index entry")
             })
     }
 

@@ -169,7 +169,7 @@ private struct PhysicalValidation {
 }
 
 private func chunkFields(_ source: ToolReader, _ frame: Frame) throws -> ChunkFields? {
-    let fixed: UInt64 = frame.opcode == Opcode.deltaChunk ? 39 : 24
+    let fixed: UInt64 = frame.opcode == Opcode.deltaChunk ? 51 : 24
     guard frame.length >= fixed else { return nil }
     let bytes = try source.exactly(
         offset: frame.offset + recordHeaderSize, count: Int(fixed), record: opcodeName(frame.opcode))
@@ -183,10 +183,17 @@ private func chunkFields(_ source: ToolReader, _ frame: Frame) throws -> ChunkFi
             referenceOffset: 0, keyframeOffset: frame.offset, depth: 0)
     }
     guard let referenceOffset = readU64(bytes, at: 21),
-        let keyframeOffset = readU64(bytes, at: 29), let depth = readU16(bytes, at: 37)
+        let keyframeOffset = readU64(bytes, at: 29), let depth = readU16(bytes, at: 37),
+        let updates = readU32(bytes, at: 39), let births = readU32(bytes, at: 43),
+        let deaths = readU32(bytes, at: 47)
     else { return nil }
+    let (updatedAndBorn, firstOverflow) = updates.addingReportingOverflow(births)
+    let (affected, secondOverflow) = updatedAndBorn.addingReportingOverflow(deaths)
+    guard !firstOverflow, !secondOverflow else {
+        throw malformedStateStreams(frame, "the three delta group counts exceed UInt32")
+    }
     return ChunkFields(
-        opcode: frame.opcode, t0: t0, t1: t1, level: level, count: 0,
+        opcode: frame.opcode, t0: t0, t1: t1, level: level, count: affected,
         deltaMode: bytes[20],
         referenceOffset: referenceOffset, keyframeOffset: keyframeOffset, depth: depth)
 }
@@ -631,6 +638,10 @@ private func isExpectedPartialGroupError(_ error: FourDGSError, group: DeltaGrou
     group.name != "birth" && sentence(error).contains("chunk is missing required attributes")
 }
 
+private func isAuxiliaryRecord(_ opcode: UInt8) -> Bool {
+    (0x0A...0x0F).contains(opcode) || (0x20...0x25).contains(opcode)
+}
+
 private func validatePhysicalRecords(
     _ source: ToolReader, _ walked: Walk, index: [IndexEntry], keyframeDelta: Bool,
     temporalModelOffset: UInt64?, durationSec: Double?, shDegree: UInt8?,
@@ -669,8 +680,11 @@ private func validatePhysicalRecords(
     var previousPhysicalInterval: ChunkFields?
     var physicalIntervalCount = 0
 
-    func finishGaussianBirthBands() {
-        guard !keyframeDelta, let state = currentState,
+    var firstAuxiliaryError: (FourDGSError, Site)?
+    var stateBeforeQuantizationReported = false
+
+    func finishChunkBands() {
+        guard let state = currentState,
             let fields = currentStateFields, fields.opcode == Opcode.chunk,
             let shDegree
         else { return }
@@ -819,7 +833,15 @@ private func validatePhysicalRecords(
                             firstStateError = (stateError, physicalBandSite(frame))
                         }
                     }
-                    for address in bandsByOffset[frame.offset] ?? [] {
+                    let addresses = bandsByOffset[frame.offset] ?? []
+                    if !index.isEmpty && addresses.isEmpty {
+                        scanReport.error(
+                            "the physical SH Band Stream at byte \(frame.offset) is absent from "
+                                + "the Chunk Index entry for the state at byte "
+                                + "\(currentState?.offset ?? 0)")
+                        result.indexSafe = false
+                    }
+                    for address in addresses {
                         seenBands.insert(address.token)
                         if currentState?.offset != index[address.entry].offset {
                             let physical = currentState.map { String($0.offset) } ?? "no state"
@@ -895,14 +917,43 @@ private func validatePhysicalRecords(
                     return
                 }
 
+                if keyframeDelta && isAuxiliaryRecord(frame.opcode) {
+                    guard let header, let quantization, let temporalModelOffset else { return }
+                    do {
+                        var slices = frontMatterSlices(
+                            header: header, quantization: quantization,
+                            windowTable: windowTable, temporalModelOffset: temporalModelOffset)
+                        slices.append(SourceSlice(offset: frame.offset, length: frame.total))
+                        _ = try SceneReader(
+                            SlicedReader(source: source, slices: slices), path: .streamed)
+                    } catch {
+                        if firstAuxiliaryError == nil {
+                            firstAuxiliaryError = (
+                                asFourDGS(error),
+                                Site(
+                                    offset: frame.offset,
+                                    what:
+                                        "the physical \(opcodeName(frame.opcode)) record at byte "
+                                        + "\(frame.offset)"))
+                        }
+                    }
+                    return
+                }
+
                 guard frame.opcode == Opcode.chunk || frame.opcode == Opcode.deltaChunk else {
                     return
                 }
-                finishGaussianBirthBands()
+                finishChunkBands()
                 currentState = frame
                 currentStateFields = nil
                 currentBands.removeAll(keepingCapacity: true)
                 currentBandNumbers.removeAll(keepingCapacity: true)
+                if quantization == nil && !stateBeforeQuantizationReported {
+                    scanReport.error(
+                        "the \(opcodeName(frame.opcode)) record at byte \(frame.offset) appears "
+                            + "before Quantization; state records require their quantization grids")
+                    stateBeforeQuantizationReported = true
+                }
                 if frame.opcode == Opcode.deltaChunk && !keyframeDelta {
                     scanReport.error(
                         "the gaussian-birth file contains DeltaChunk at byte \(frame.offset); "
@@ -924,7 +975,6 @@ private func validatePhysicalRecords(
                             + "framed length is \(frame.total) bytes")
                     result.indexSafe = false
                 }
-
                 var physicalFields: ChunkFields?
                 do {
                     if let fields = try chunkFields(source, frame) {
@@ -959,6 +1009,14 @@ private func validatePhysicalRecords(
                             result.fields[frame.offset] = fields
                         } else {
                             result.fields[frame.offset] = fields
+                        }
+                        for i in entries where index[i].gaussianCount != fields.count {
+                            scanReport.error(
+                                "chunk index entry \(i) declares gaussian_count "
+                                    + "\(index[i].gaussianCount), but the physical "
+                                    + "\(opcodeName(frame.opcode)) at byte \(frame.offset) "
+                                    + "declares \(fields.count)")
+                            result.indexSafe = false
                         }
                         if !keyframeDelta, fields.opcode == Opcode.chunk {
                             let (sum, overflow) = result.gaussianCount.addingReportingOverflow(
@@ -1037,7 +1095,7 @@ private func validatePhysicalRecords(
         scanReport.refused("", asFourDGS(error), walked, nil)
         result.indexSafe = false
     }
-    finishGaussianBirthBands()
+    finishChunkBands()
     if keyframeDelta {
         if physicalIntervalCount == 0 {
             scanReport.error("the keyframe-delta file contains no physical state chunks")
@@ -1092,6 +1150,11 @@ private func validatePhysicalRecords(
             "a physical state record does not decode: ", firstStateError.0, walked,
             firstStateError.1)
         result.chunkRefused = true
+    }
+    if let firstAuxiliaryError {
+        report.refused(
+            "an auxiliary record does not decode: ", firstAuxiliaryError.0, walked,
+            firstAuxiliaryError.1)
     }
     return result
 }
@@ -1175,6 +1238,13 @@ private func validatePhysicalKeyframeDeltaReferences(
 private func validateGaussianBirthIndexIntervals(
     _ index: [IndexEntry], fields: [UInt64: ChunkFields], report: inout Report
 ) {
+    var byOffset: [UInt64: [Int]] = [:]
+    for (i, entry) in index.enumerated() { byOffset[entry.offset, default: []].append(i) }
+    for (offset, entries) in byOffset where entries.count > 1 {
+        report.error(
+            "chunk index entries \(entries.map(String.init).joined(separator: ", ")) all name "
+                + "byte \(offset); each state record must have one index entry")
+    }
     for (i, entry) in index.enumerated() {
         guard let physical = fields[entry.offset], physical.opcode == Opcode.chunk else { continue }
         if physical.t0.bitPattern != entry.t0.bitPattern {
@@ -1639,6 +1709,8 @@ func validate(_ source: ToolReader) -> Report {
     var firstUnknown: UInt8?
     var stateSeen = false
     var pendingFooter: UInt64?
+    var firstNonFinalFooter: UInt64?
+    var nonFinalFooterCount: UInt64 = 0
     var legacyAudioCount: UInt64 = 0
     var audioSources: [UInt32: AudioSourceSummary] = [:]
     var audioData: [UInt32: AudioDataSummary] = [:]
@@ -1667,9 +1739,8 @@ func validate(_ source: ToolReader) -> Report {
                 guard intact else { return }
                 let opcode = frame.opcode
                 if let footer = pendingFooter {
-                    report.error(
-                        "Footer at byte \(footer) is not final; exactly one Footer must be the "
-                            + "final record")
+                    if firstNonFinalFooter == nil { firstNonFinalFooter = footer }
+                    if nonFinalFooterCount < UInt64.max { nonFinalFooterCount += 1 }
                     pendingFooter = nil
                 }
                 if opcode == Opcode.footer { pendingFooter = frame.offset }
@@ -1730,6 +1801,18 @@ func validate(_ source: ToolReader) -> Report {
     } catch {
         report.refused("", asFourDGS(error), nil, nil)
         return report
+    }
+
+    if let firstNonFinalFooter {
+        if nonFinalFooterCount == 1 {
+            report.error(
+                "Footer at byte \(firstNonFinalFooter) is not final; exactly one Footer must be "
+                    + "the final record")
+        } else {
+            report.error(
+                "\(nonFinalFooterCount) Footer records are not final; the first is at byte "
+                    + "\(firstNonFinalFooter), and exactly one Footer must be the final record")
+        }
     }
 
     if let firstPrivate {

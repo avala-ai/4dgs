@@ -307,6 +307,7 @@ public struct IndexEntry {
     public let t1: Double
     public let offset: UInt64
     public let length: UInt64
+    public let gaussianCount: UInt32
     public let bands: [(band: UInt8, offset: UInt64, length: UInt64)]
     public let extended: Bool
     public let kind: UInt8
@@ -345,7 +346,8 @@ func chunkIndexEntries(
             offset: content, count: Int(prefix), record: "Chunk Index")
         guard let t0 = readF64(fields, at: t0Field), let t1 = readF64(fields, at: t1Field),
             let offset = readU64(fields, at: offsetField),
-            let length = readU64(fields, at: offsetField + 8)
+            let length = readU64(fields, at: offsetField + 8),
+            let gaussianCount = readU32(fields, at: 32)
         else { continue }
         var bands: [(band: UInt8, offset: UInt64, length: UInt64)] = []
         let declared = UInt64(readU32(fields, at: bandCountField) ?? 0)
@@ -394,7 +396,8 @@ func chunkIndexEntries(
         }
         out.append(
             IndexEntry(
-                t0: t0, t1: t1, offset: offset, length: length, bands: bands,
+                t0: t0, t1: t1, offset: offset, length: length,
+                gaussianCount: gaussianCount, bands: bands,
                 extended: hasExtension, kind: kind, deltaMode: deltaMode,
                 referenceOffset: referenceOffset, keyframeOffset: keyframeOffset, depth: depth,
                 liveCount: liveCount))
