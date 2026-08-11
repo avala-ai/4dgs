@@ -264,11 +264,13 @@ def _reanchor_bins(bins: dict[int, np.ndarray], grids: Grids, t0: float) -> dict
     position = dequantize(bins[op.A_POSITION], grids.steps.pos, grids.origin)
     motion = bins[op.A_MOTION].astype(np.float64) * motion_step[:, None]
     authored_mu = bins[op.A_MU_T].reshape(-1).astype(np.float64) * time_step
-    centre = position + motion * (float(t0) - authored_mu)[:, None]
+    anchor_bins = np.rint(float(t0) / time_step).astype(np.int64)
+    serialized_mu = anchor_bins.astype(np.float64) * time_step
+    centre = position + motion * (serialized_mu - authored_mu)[:, None]
 
     anchored = dict(bins)
     anchored[op.A_POSITION] = quantize(centre, grids.steps.pos, grids.origin)
-    anchored[op.A_MU_T] = np.rint(float(t0) / time_step).astype(np.int64).reshape(-1, 1)
+    anchored[op.A_MU_T] = anchor_bins.reshape(-1, 1)
     return anchored
 
 
@@ -334,7 +336,11 @@ def write_sequence(
         cursor += len(blob)
         return at
 
-    aabb = _aabb(samples)
+    # Header and Statistics describe the rest positions the file actually
+    # serializes. Reanchoring can move those far from the source samples'
+    # original position arrays, especially for a fast trajectory whose authored
+    # mu_t differs from the interval start.
+    aabb = _aabb(quantized, grids)
     emit(
         rec.Header(
             duration_sec=float(duration_sec),
@@ -432,12 +438,8 @@ def write_sequence(
         updated = np.isin(ids, update_ids)
         if update_ids.size:
             update_ref_rows = order[np.searchsorted(ref_ids[order], update_ids)]
-            update_bins[op.A_POSITION] = (
-                bins[op.A_POSITION][updated] - ref_bins[op.A_POSITION][update_ref_rows]
-            )
-            update_bins[op.A_MU_T] = (
-                bins[op.A_MU_T][updated] - ref_bins[op.A_MU_T][update_ref_rows]
-            )
+            update_bins[op.A_POSITION] = bins[op.A_POSITION][updated] - ref_bins[op.A_POSITION][update_ref_rows]
+            update_bins[op.A_MU_T] = bins[op.A_MU_T][updated] - ref_bins[op.A_MU_T][update_ref_rows]
 
         # Retain the composed anchors the decoder will see for later chained deltas.
         # Untouched common rows keep their earlier position/mu_t pair; updated rows and
@@ -524,12 +526,13 @@ def _keyframe_index(i: int, kd: KeyframeDeltaOptions) -> int:
     return j
 
 
-def _aabb(samples: list[Sample]) -> list[float]:
-    positions = np.concatenate(
-        [np.asarray(s.gaussians.positions, dtype=np.float64) for s in samples if s.gaussians.count]
-    )
-    if not positions.size:
+def _aabb(quantized: list[tuple[np.ndarray, dict[int, np.ndarray]]], grids: Grids) -> list[float]:
+    populations = [
+        dequantize(bins[op.A_POSITION], grids.steps.pos, grids.origin) for ids, bins in quantized if ids.size
+    ]
+    if not populations:
         return [0.0] * 6
+    positions = np.concatenate(populations)
     return [*positions.min(axis=0).tolist(), *positions.max(axis=0).tolist()]
 
 
