@@ -93,6 +93,15 @@ SH_LADDER = ",".join(str(depth) for depth in SH_LADDER_DEPTHS)
 #: geometry gate rather than compared with Rust's. TypeScript retains the pre-existing exact
 #: interval/count comparison until its own geometry gate proves that feature directly.
 SECOND_ENCODERS = frozenset({"typescript", "dart"})
+#: Encoders whose round-trip CLI accepts the optional per-band depth argument. Dart's
+#: first independent writer proves its fixed quantization preset here; its CLI does not
+#: yet expose graded SH depths, so passing a third argument would test argv parsing rather
+#: than an encoder feature it claims.
+SH_LADDER_ENCODERS = frozenset(set(ENCODERS) - {"dart"})
+#: Gaussian-only Dart output deliberately clears the source's capture profile. Keep that
+#: compatibility normalization local to Dart: TypeScript's profile is part of the state
+#: its independent encoder must preserve.
+CAPTURE_PROFILE_NORMALIZATION_ENCODERS = frozenset({"dart"})
 #: Encoders whose feature claim includes their own temporal partition. Add a family only
 #: in its language PR, once its writer proves reconstructed support is range-seekable.
 CHUNK_GEOMETRY_ENCODERS = frozenset({"dart"})
@@ -146,6 +155,7 @@ def compare(
     second_encoder: bool,
     check_chunk_geometry: bool,
     check_aabb_geometry: bool,
+    normalize_capture_profile: bool,
 ) -> None:
     ref_out = os.path.join(tmp, "reference.4dgs")
     cand_out = os.path.join(tmp, "candidate.4dgs")
@@ -176,7 +186,7 @@ def compare(
         # promise the source's original Statistics/multi-chunk capture shape. Rust
         # preserves the string even though the layout comparison is already removed.
         # Normalize the two legal spellings before comparing reconstructed state.
-        if {ref.get("profile"), cand.get("profile")} <= {"", "capture"}:
+        if normalize_capture_profile and {ref.get("profile"), cand.get("profile")} <= {"", "capture"}:
             ref.pop("profile", None)
             cand.pop("profile", None)
         # Gaussian-only authoring surfaces do not reproduce the Object Table. The Rust
@@ -204,12 +214,20 @@ def _check_chunk_geometry(path: str) -> None:
     """
     with FileReadable(path) as source:
         scene = open_indexed(source)
-        chunk_offsets = _chunk_record_offsets(source)
-        indexed_offsets = [entry.chunk_offset for entry in scene.index]
-        if sorted(indexed_offsets) != sorted(chunk_offsets):
+        chunks, physical_bands = _physical_geometry(source)
+        indexed_chunks = [(entry.chunk_offset, entry.chunk_length) for entry in scene.index]
+        physical_chunks = sorted((offset, length) for offset, (length, _, _) in chunks.items())
+        if sorted(indexed_chunks) != physical_chunks:
             raise AssertionError(
-                "the Chunk Index must name every Chunk exactly once; "
-                f"chunks are {chunk_offsets}, index names {indexed_offsets}"
+                "the Chunk Index must name every complete Chunk range exactly once; "
+                f"chunks are {physical_chunks}, index names {sorted(indexed_chunks)}"
+            )
+
+        indexed_bands = sorted(band_range for entry in scene.index for band_range in entry.bands)
+        if indexed_bands != sorted(physical_bands):
+            raise AssertionError(
+                "the Chunk Index must name every complete SH band range exactly once; "
+                f"bands are {sorted(physical_bands)}, index names {indexed_bands}"
             )
 
         table = window_table_or_default(scene.windows)
@@ -219,7 +237,26 @@ def _check_chunk_geometry(path: str) -> None:
         for number, entry in enumerate(scene.index):
             if not (entry.t0 < entry.t1):
                 raise AssertionError(f"chunk index entry {number} has invalid interval [{entry.t0}, {entry.t1})")
-            chunk = read_chunk(source, scene, entry)
+            _, physical_t0, physical_t1 = chunks[entry.chunk_offset]
+            if entry.t0 != physical_t0 or entry.t1 != physical_t1:
+                raise AssertionError(
+                    f"chunk index entry {number} declares interval [{entry.t0}, {entry.t1}), "
+                    f"its Chunk declares [{physical_t0}, {physical_t1})"
+                )
+
+            expected_bands = set(range(1, int(scene.header.sh_degree) + 1))
+            entry_bands = [band for band, _, _ in entry.bands]
+            if set(entry_bands) != expected_bands or len(entry_bands) != len(expected_bands):
+                raise AssertionError(
+                    f"chunk index entry {number} names SH bands {entry_bands}, "
+                    f"Header degree {scene.header.sh_degree} requires {sorted(expected_bands)}"
+                )
+            chunk = read_chunk(source, scene, entry, max_sh_band=int(scene.header.sh_degree))
+            if set(chunk["sh"]) != expected_bands:
+                raise AssertionError(
+                    f"indexed read of chunk {number} returned SH bands {sorted(chunk['sh'])}, "
+                    f"expected {sorted(expected_bands)}"
+                )
             count = len(chunk["mu_t"])
             if count != entry.gaussian_count:
                 raise AssertionError(
@@ -255,7 +292,7 @@ def _check_chunk_geometry(path: str) -> None:
 
 
 def _check_aabb_geometry(path: str) -> None:
-    """Header and Statistics bounds contain the candidate's public f32 positions."""
+    """Header and Statistics bounds equal the candidate's public f32 extrema."""
     scene = fourdgs.read(path)
     actual = scene.gaussians.aabb()
 
@@ -279,19 +316,27 @@ def _check_declared_aabb(record: str, bounds: list[float], actual: list[float]) 
     for axis in range(3):
         if bounds[axis] > bounds[3 + axis]:
             raise AssertionError(f"{record} AABB {bounds} is inverted on axis {axis}")
-        if bounds[axis] > actual[axis] or bounds[3 + axis] < actual[3 + axis]:
+        if bounds[axis] != actual[axis] or bounds[3 + axis] != actual[3 + axis]:
             raise AssertionError(
-                f"{record} AABB {bounds} excludes reconstructed axis {axis} range [{actual[axis]}, {actual[3 + axis]}]"
+                f"{record} AABB {bounds} does not equal reconstructed axis {axis} "
+                f"range [{actual[axis]}, {actual[3 + axis]}]"
             )
 
 
-def _chunk_record_offsets(source: FileReadable) -> list[int]:
-    """Scan framing headers without retaining record payloads or the whole file."""
+def _physical_geometry(
+    source: FileReadable,
+) -> tuple[dict[int, tuple[int, float, float]], list[tuple[int, int, int]]]:
+    """Return physical Chunk and SH ranges from a bounded framing scan.
+
+    Only the 16-byte Chunk interval and one-byte SH label are read from payloads. The
+    encoded streams themselves remain untouched, however large the candidate file is.
+    """
     payload_end = source.size() - len(MAGIC)
     if payload_end < len(MAGIC) or source.read(payload_end, len(MAGIC)) != MAGIC:
         raise AssertionError("candidate has no final magic")
 
-    offsets = []
+    chunks: dict[int, tuple[int, float, float]] = {}
+    bands: list[tuple[int, int, int]] = []
     offset = len(MAGIC)
     while offset < payload_end:
         if offset + RECORD_HEADER.size > payload_end:
@@ -301,9 +346,17 @@ def _chunk_record_offsets(source: FileReadable) -> list[int]:
         if record_end > payload_end:
             raise AssertionError(f"record at offset {offset} ends at {record_end}, beyond payload end {payload_end}")
         if record_opcode == opcode.CHUNK:
-            offsets.append(offset)
+            if length < 16:
+                raise AssertionError(f"Chunk at offset {offset} is {length} bytes, too short for its interval")
+            t0, t1 = struct.unpack("<dd", source.read(offset + RECORD_HEADER.size, 16))
+            chunks[offset] = (RECORD_HEADER.size + length, t0, t1)
+        elif record_opcode == opcode.SH_BAND_STREAM:
+            if length < 1:
+                raise AssertionError(f"SH band at offset {offset} has no band label")
+            band = source.read(offset + RECORD_HEADER.size, 1)[0]
+            bands.append((band, offset, RECORD_HEADER.size + length))
         offset = record_end
-    return offsets
+    return chunks, bands
 
 
 def _check_declared_depths(path: str) -> None:
@@ -381,6 +434,7 @@ def main(argv=None) -> int:
     second_encoder = args.encoder in SECOND_ENCODERS
     check_chunk_geometry = args.encoder in CHUNK_GEOMETRY_ENCODERS
     check_aabb_geometry = args.encoder in AABB_GEOMETRY_ENCODERS
+    normalize_capture_profile = args.encoder in CAPTURE_PROFILE_NORMALIZATION_ENCODERS
     agreed = graded = failed = 0
     with tempfile.TemporaryDirectory() as tmp:
         for variant in names:
@@ -395,13 +449,14 @@ def main(argv=None) -> int:
                     second_encoder,
                     check_chunk_geometry,
                     check_aabb_geometry,
+                    normalize_capture_profile,
                 )
                 agreed += 1
             except (AssertionError, RuntimeError) as exc:
                 failed += 1
                 print(f"FAIL {args.encoder} {variant}\n  {exc}")
                 continue
-            if "SHDegree" in variant:
+            if "SHDegree" in variant and args.encoder in SH_LADDER_ENCODERS:
                 try:
                     compare(
                         REFERENCE,
@@ -412,6 +467,7 @@ def main(argv=None) -> int:
                         second_encoder,
                         check_chunk_geometry,
                         check_aabb_geometry,
+                        normalize_capture_profile,
                     )
                     graded += 1
                 except (AssertionError, RuntimeError) as exc:

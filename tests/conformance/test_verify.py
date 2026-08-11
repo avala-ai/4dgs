@@ -191,3 +191,14 @@ class TestEncodeAabbGeometryGate:
                 [2.0, 0.0, 0.0, 1.0, 1.0, 1.0],
                 [2.0, 0.0, 0.0, 1.0, 1.0, 1.0],
             )
+
+    def test_a_loose_bound_does_not_count_as_reconstructed_geometry(self):
+        with pytest.raises(AssertionError, match="does not equal reconstructed axis 0"):
+            encode_roundtrip._check_declared_aabb(
+                "Header",
+                [-1.0, 0.0, 0.0, 2.0, 1.0, 1.0],
+                [0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            )
+
+    def test_the_empty_scene_aabb_is_the_zero_box(self):
+        encode_roundtrip._check_declared_aabb("Header", [0.0] * 6, [0.0] * 6)
