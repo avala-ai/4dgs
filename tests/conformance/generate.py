@@ -10,12 +10,14 @@
 `--verify` is the gate that keeps the corpus honest. It asserts three things:
 
 1. every generated file matches its committed SHA-256;
-2. every committed expectation matches a fresh decode;
+2. every committed expectation matches, character for character, a fresh decode;
 3. two consecutive generator runs are byte-identical.
 
-The third is the one that earns its keep: accidental nondeterminism in an encoder —
-iteration order, a hash seed, a timestamp — is invisible locally and shows up as somebody
-else's failing CI.
+The second and third are the ones that earn their keep, and they catch different things.
+Accidental nondeterminism in an encoder — iteration order, a hash seed, a timestamp — is
+invisible locally and shows up as somebody else's failing CI. A canonical form that varies
+by machine is quieter still: the bytes are identical, so every checksum passes, and only
+the expectations move (issue #153).
 """
 
 from __future__ import annotations
@@ -25,6 +27,8 @@ import hashlib
 import io
 import os
 import sys
+from itertools import zip_longest
+from typing import NamedTuple
 
 import numpy as np
 
@@ -712,17 +716,27 @@ def _objects(duration_sec: float) -> ObjectLayer:
     )
 
 
-def write_corpus(target: str) -> dict[str, str]:
+class Corpus(NamedTuple):
+    """One generator run, including fresh expectations that cannot include stale files."""
+
+    checksums: dict[str, str]
+    expectations: dict[str, str]
+
+
+def write_corpus(target: str) -> Corpus:
     os.makedirs(target, exist_ok=True)
     checksums: dict[str, str] = {}
+    expectations: dict[str, str] = {}
     for scenario, flags in scenarios.variants():
         name = scenarios.variant_name(scenario, flags)
         data, expectation = build(scenario, flags)
         with open(os.path.join(target, f"{name}.4dgs"), "wb") as fh:
             fh.write(data)
-        with open(os.path.join(target, f"{name}.json"), "w", encoding="utf-8") as fh:
+        with open(os.path.join(target, f"{name}.json"), "w", encoding="utf-8", newline="\n") as fh:
             fh.write(expectation + "\n")
-        checksums[name] = hashlib.sha256(data).hexdigest()
+        checksums[f"{name}.4dgs"] = hashlib.sha256(data).hexdigest()
+        checksums[f"{name}.json"] = hashlib.sha256((expectation + "\n").encode()).hexdigest()
+        expectations[name] = expectation + "\n"
 
     # keyframe-delta variants live in their own subdirectory, exactly as the invalid
     # corpus does, and for the same structural reason: every whole-corpus consumer that
@@ -736,9 +750,11 @@ def write_corpus(target: str) -> dict[str, str]:
     for name, data, expectation in build_keyframe_delta_corpus():
         with open(os.path.join(keyframe_dir, f"{name}.4dgs"), "wb") as fh:
             fh.write(data)
-        with open(os.path.join(keyframe_dir, f"{name}.json"), "w", encoding="utf-8") as fh:
+        with open(os.path.join(keyframe_dir, f"{name}.json"), "w", encoding="utf-8", newline="\n") as fh:
             fh.write(expectation + "\n")
-        checksums[f"keyframe/{name}"] = hashlib.sha256(data).hexdigest()
+        checksums[f"keyframe/{name}.4dgs"] = hashlib.sha256(data).hexdigest()
+        checksums[f"keyframe/{name}.json"] = hashlib.sha256((expectation + "\n").encode()).hexdigest()
+        expectations[f"keyframe/{name}"] = expectation + "\n"
 
     # Object-layer variants live in their own subdirectory too, for the same gathering
     # reason as keyframe/: run.py is the one consumer that reaches into it. Unlike a
@@ -751,29 +767,46 @@ def write_corpus(target: str) -> dict[str, str]:
     for name, data, expectation in build_object_corpus():
         with open(os.path.join(object_dir, f"{name}.4dgs"), "wb") as fh:
             fh.write(data)
-        with open(os.path.join(object_dir, f"{name}.json"), "w", encoding="utf-8") as fh:
+        with open(os.path.join(object_dir, f"{name}.json"), "w", encoding="utf-8", newline="\n") as fh:
             fh.write(expectation + "\n")
-        checksums[f"object/{name}"] = hashlib.sha256(data).hexdigest()
+        checksums[f"object/{name}.4dgs"] = hashlib.sha256(data).hexdigest()
+        checksums[f"object/{name}.json"] = hashlib.sha256((expectation + "\n").encode()).hexdigest()
+        expectations[f"object/{name}"] = expectation + "\n"
 
     invalid_dir = os.path.join(target, "invalid")
     os.makedirs(invalid_dir, exist_ok=True)
     for name, data, expectation in build_invalid():
         with open(os.path.join(invalid_dir, f"{name}.4dgs"), "wb") as fh:
             fh.write(data)
-        with open(os.path.join(invalid_dir, f"{name}.json"), "w", encoding="utf-8") as fh:
+        with open(os.path.join(invalid_dir, f"{name}.json"), "w", encoding="utf-8", newline="\n") as fh:
             fh.write(expectation + "\n")
-        checksums[f"invalid/{name}"] = hashlib.sha256(data).hexdigest()
-    return checksums
+        checksums[f"invalid/{name}.4dgs"] = hashlib.sha256(data).hexdigest()
+        checksums[f"invalid/{name}.json"] = hashlib.sha256((expectation + "\n").encode()).hexdigest()
+        expectations[f"invalid/{name}"] = expectation + "\n"
+    return Corpus(checksums, expectations)
 
 
 def write_checksums(checksums: dict[str, str]) -> None:
     lines = [
-        "# SHA-256 of each generated .4dgs variant, asserted by `generate.py --verify`.",
+        "# SHA-256 of each generated variant and expectation, asserted by `generate.py --verify`.",
         "# Written by the generator; do not edit by hand.",
     ]
-    lines += [f"{digest}  {name}.4dgs" for name, digest in sorted(checksums.items())]
-    with open(CHECKSUMS, "w", encoding="utf-8") as fh:
+    lines += [f"{digest}  {name}" for name, digest in sorted(checksums.items())]
+    with open(CHECKSUMS, "w", encoding="utf-8", newline="\n") as fh:
         fh.write("\n".join(lines) + "\n")
+
+
+def read_expectations() -> dict[str, str]:
+    """Read committed expectations before regeneration overwrites their files."""
+    out: dict[str, str] = {}
+    for root, prefix in ((DATA, ""), (INVALID, "invalid/"), (KEYFRAME, "keyframe/"), (OBJECT, "object/")):
+        if not os.path.isdir(root):
+            continue
+        for name in sorted(os.listdir(root)):
+            if name.endswith(".json"):
+                with open(os.path.join(root, name), encoding="utf-8") as fh:
+                    out[prefix + name[: -len(".json")]] = fh.read()
+    return out
 
 
 def read_checksums() -> dict[str, str]:
@@ -785,7 +818,7 @@ def read_checksums() -> dict[str, str]:
             if line.startswith("#") or not line.strip():
                 continue
             digest, name = line.split()
-            out[name[: -len(".4dgs")]] = digest
+            out[name] = digest
     return out
 
 
@@ -794,14 +827,17 @@ def main(argv=None) -> int:
     parser.add_argument("--verify", action="store_true", help="regenerate and assert nothing moved")
     args = parser.parse_args(argv)
 
-    checksums = write_corpus(DATA)
+    committed_expectations = read_expectations() if args.verify else {}
+    corpus = write_corpus(DATA)
+    checksums = corpus.checksums
     total = sum(
         os.path.getsize(os.path.join(root, f))
         for root in (DATA, INVALID, KEYFRAME, OBJECT)
         for f in os.listdir(root)
         if os.path.isfile(os.path.join(root, f))
     )
-    print(f"{len(checksums)} variants, {total / 1024:.0f} KiB in {DATA}")
+    variants = sum(name.endswith(".4dgs") for name in checksums)
+    print(f"{variants} variants, {total / 1024:.0f} KiB in {DATA}")
 
     if total > MAX_DATA_BYTES:
         print(f"error: corpus is {total} bytes, over the {MAX_DATA_BYTES} cap — prune variants", file=sys.stderr)
@@ -812,11 +848,12 @@ def main(argv=None) -> int:
         print(f"wrote {CHECKSUMS}")
         return 0
 
-    return 0 if _verify(checksums) else 1
+    return 0 if _verify(corpus, committed_expectations) else 1
 
 
-def _verify(checksums: dict[str, str]) -> bool:
+def _verify(corpus: Corpus, committed_expectations: dict[str, str]) -> bool:
     """Assert the corpus matches what is committed and that the encoder is stable."""
+    checksums = corpus.checksums
     committed = read_checksums()
     failures = []
     if not committed:
@@ -830,17 +867,32 @@ def _verify(checksums: dict[str, str]) -> bool:
         if name not in checksums:
             failures.append(f"{name}: committed checksum has no variant")
 
+    fresh_expectations = corpus.expectations
+    for name, text in sorted(fresh_expectations.items()):
+        if name not in committed_expectations:
+            failures.append(f"{name}.json: no committed expectation")
+        elif committed_expectations[name] != text:
+            failures.append(f"{name}.json: {_first_difference(committed_expectations[name], text)}")
+    for name in committed_expectations:
+        if name not in fresh_expectations:
+            failures.append(f"{name}.json: committed expectation has no variant")
+
     # Determinism: a second run must produce the same bytes.
-    second = {}
+    second: dict[str, str] = {}
+
+    def record(name: str, data: bytes, expectation: str) -> None:
+        second[f"{name}.4dgs"] = hashlib.sha256(data).hexdigest()
+        second[f"{name}.json"] = hashlib.sha256((expectation + "\n").encode()).hexdigest()
+
     for scenario, flags in scenarios.variants():
-        data, _ = build(scenario, flags)
-        second[scenarios.variant_name(scenario, flags)] = hashlib.sha256(data).hexdigest()
-    for name, data, _ in build_invalid():
-        second[f"invalid/{name}"] = hashlib.sha256(data).hexdigest()
-    for name, data, _ in build_keyframe_delta_corpus():
-        second[f"keyframe/{name}"] = hashlib.sha256(data).hexdigest()
-    for name, data, _ in build_object_corpus():
-        second[f"object/{name}"] = hashlib.sha256(data).hexdigest()
+        data, expectation = build(scenario, flags)
+        record(scenarios.variant_name(scenario, flags), data, expectation)
+    for name, data, expectation in build_invalid():
+        record(f"invalid/{name}", data, expectation)
+    for name, data, expectation in build_keyframe_delta_corpus():
+        record(f"keyframe/{name}", data, expectation)
+    for name, data, expectation in build_object_corpus():
+        record(f"object/{name}", data, expectation)
     for name, digest in checksums.items():
         if second.get(name) != digest:
             failures.append(f"{name}: encoder is not deterministic between runs")
@@ -852,8 +904,24 @@ def _verify(checksums: dict[str, str]) -> bool:
         print("\nif the change was intended, rerun without --verify and commit the result", file=sys.stderr)
         return False
 
-    print(f"verified {len(checksums)} variants: checksums match and the encoder is deterministic")
+    variants = sum(name.endswith(".4dgs") for name in checksums)
+    print(f"verified {variants} variants: checksums and expectations match, and the encoder is deterministic")
     return True
+
+
+def _first_difference(committed: str, fresh: str) -> str:
+    """Name the first character-level expectation difference."""
+    old, new = committed.splitlines(keepends=True), fresh.splitlines(keepends=True)
+    for i, (a, b) in enumerate(zip(old, new, strict=False), start=1):
+        if a != b:
+            column = next(j for j, (x, y) in enumerate(zip_longest(a, b), start=1) if x != y)
+            return f"line {i}, column {column}: committed {a!r}, fresh decode {b!r}"
+    shared = min(len(old), len(new))
+    extra, side = (new, "a fresh decode") if len(new) > len(old) else (old, "the committed file")
+    return (
+        f"{len(old)} committed lines against {len(new)} from a fresh decode; "
+        f"line {shared + 1} is in {side} only: {extra[shared]!r}"
+    )
 
 
 if __name__ == "__main__":

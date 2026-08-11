@@ -10,13 +10,12 @@ declarations. Nothing is marked `Yes` on the strength of code existing.
 Every row is filled in from a suite that runs: 46 valid variants and 7 invalid ones, plus 4
 keyframe-delta and 3 object-layer variants in their own subdirectories, over two read paths
 (streamed and indexed). A language takes the variants it declares support for, and what it declines
-is what this table records — 119 checks passing for Python and Rust, and 105 each for TypeScript,
-Dart, C++ and Swift. The four still at 105 decline the same thing and nothing else: the invalid
-corpus, which asks a decoder to _name_ the refusal rather than merely refuse. C++ and Swift read
-4DGS through the Rust C ABI: the additive states-JSON accessor computes keyframe-delta summaries in
-the core, the provenance-JSON accessor does the same for the provenance family, and the objects-JSON
-pair does it for the object layer, so every binding emits identical bytes with no per-language slerp
-or composition order of its own.
+is what this table records — 119 checks passing for Python, TypeScript, Rust, C++ and Swift, and 105
+for Dart. Dart declines the invalid corpus, which asks a decoder to _name_ the refusal rather than
+merely refuse. C++ and Swift read 4DGS through the Rust C ABI: the additive states-JSON accessor
+computes keyframe-delta summaries in the core, the provenance-JSON accessor does the same for the
+provenance family, and the objects-JSON pair does it for the object layer, so every binding emits
+identical bytes with no per-language slerp or composition order of its own.
 
 | Feature                                           | Python | TypeScript | Rust    | C++     | Swift   | Dart    |
 | ------------------------------------------------- | ------ | ---------- | ------- | ------- | ------- | ------- |
@@ -55,7 +54,7 @@ or composition order of its own.
 | Reconstruction at an instant                      | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Encode `keyframe-delta`                           | Yes    | Planned    | Yes     | Planned | Planned | Planned |
 | Unknown-record skipping                           | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Refusal diagnosis (named, not merely refused)     | Yes    | No         | Yes     | No      | No      | No      |
+| Refusal diagnosis (named, not merely refused)     | Yes    | Yes        | Yes     | Yes     | Yes     | No      |
 | Private-range records                             | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Encode                                            | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
 | Chunked encode                                    | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
@@ -241,14 +240,23 @@ that it refused one. The invalid corpus pairs each deliberately broken file with
 identifier, and a runner prints that identifier as its answer. The distinction is the whole row: a
 decoder that refuses every invalid file for the wrong reason is indistinguishable, to a suite that
 only checks that something was raised, from one that refuses correctly. Rust carries the identifier
-on the error itself — `Error::refusal_code`, from the constants in `fourdgs::error::refusal` — so a
-consumer can branch on the refusal without reading its prose. The four remaining `No` cells are the
-honest state: those SDKs refuse these files today, and nothing here proves they refuse them for the
-right reason.
+on the error itself — `Error::refusal_code`, from the constants in `fourdgs::error::refusal` — and
+TypeScript does the same, as an optional `refusalCode` on `FourdgsError` from the constants in
+`Refusal`. C++ carries the same identifier on `fourdgs::Error::refusal`, read across the C ABI
+through `fourdgs_last_refusal_code`; it is a `std::optional`, because a truncated file and a
+transport that failed are real errors the refusal table does not name. Swift carries the same
+identifier on `FourDGSError.refusalCode`, fetched from the core through `fourdgs_last_refusal_code`
+— a binding reports the rule the one decoder applied rather than inferring one from a status code,
+and `FOURDGS_STATUS_UNSUPPORTED_CODEC` alone stands for three of the six. A consumer can branch on
+any of these refusals without reading its prose. Dart's remaining `No` is the honest state: it
+refuses these files today, and nothing here proves it refuses them for the right reason.
 
 The row was also the first thing to find a gap in the reference: neither an unknown `temporal_model`
 nor an unknown quantization `scheme` was refused at all before it existed, despite the registry
-requiring both. Each decoded as though it carried the known value.
+requiring both. Each decoded as though it carried the known value. It found one more on the way into
+TypeScript, where a file with a corrupted first magic byte was reported as an unsupported major
+version — the reader tested only that bytes 1-4 read `4DGS`. Both refusals are the same class and
+carry the same sentence's worth of prose, so nothing short of comparing identifiers could see it.
 
 **Truncated-file recovery** is the one row no expectation can carry, because a cut file is a
 different file. Each runner decodes its variant twice more — once cut before the trailing magic,

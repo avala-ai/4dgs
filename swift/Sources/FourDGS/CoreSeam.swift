@@ -766,7 +766,7 @@ enum Core {
     /// Translate a status into a Swift error, carrying the core's own message.
     ///
     /// The mapping is deliberately partial. A code this binding has no case for becomes
-    /// ``FourDGSError/core(code:message:)`` with the message passed through verbatim, so a
+    /// ``FourDGSError/core(code:message:refusal:)`` with the message passed through verbatim, so a
     /// core that grows a failure mode stays diagnosable from Swift rather than being
     /// flattened into "decode failed".
     ///
@@ -774,6 +774,10 @@ enum Core {
     /// thread, so the message is copied into a Swift `String` here rather than held.
     static func error(_ status: Int32) -> FourDGSError {
         let message = String(cString: fourdgs_last_error())
+        // Read beside the message and never held: both are thread-local and both describe
+        // the same failure, so reading them together is what keeps a diagnosis from being
+        // paired with the identifier of an older one.
+        let refusal = lastRefusalCode()
         switch status {
         // The ABI conflates "not a 4dgs file" with "a version this build does not
         // implement" into one status, and from here there is no way to tell which. Rather
@@ -781,20 +785,43 @@ enum Core {
         // through. Swift's `validateMagic` distinguishes the two before the boundary, which
         // is where a caller normally meets them.
         case Int32(FOURDGS_STATUS_UNSUPPORTED_VERSION.rawValue):
-            return .core(code: status, message: message)
+            return .core(code: status, message: message, refusal: refusal)
         case Int32(FOURDGS_STATUS_TRUNCATED.rawValue):
             return .truncated(offset: 0, record: message, needed: 0, available: 0)
         case Int32(FOURDGS_STATUS_MALFORMED.rawValue):
-            return .malformed(offset: 0, record: "file", field: "", reason: message)
+            return .malformed(offset: 0, record: "file", field: "", reason: message, refusal: refusal)
         case Int32(FOURDGS_STATUS_UNSUPPORTED_CODEC.rawValue):
-            return .unsupportedCodec(offset: 0, record: "Chunk", name: message)
+            return .unsupportedCodec(offset: 0, record: "Chunk", name: message, refusal: refusal)
         case Int32(FOURDGS_STATUS_IO.rawValue):
             return .unreadableSource(description: message)
         case Int32(FOURDGS_STATUS_OUT_OF_RANGE.rawValue):
             return .invalidRange(offset: 0, count: 0)
         default:
-            return .core(code: status, message: message)
+            return .core(code: status, message: message, refusal: refusal)
         }
+    }
+
+    /// Which rule the core's last failure on this thread broke, or `nil` when the refusal
+    /// table does not name it.
+    ///
+    /// `nil` is an answer rather than a failure to ask, and the ABI says so twice: the call
+    /// returns `FOURDGS_STATUS_OK` while writing a null pointer and a zero length. A
+    /// truncated file, an I/O error and a null argument are real errors the table has no
+    /// name for, and the sentence for them is in `fourdgs_last_error`.
+    ///
+    /// The bytes are **not** NUL-terminated. They are read through ``string(_:_:)``, which
+    /// copies exactly the length the core reported — `String(cString:)` on this pointer
+    /// would run off the end of a `&'static str` that has no terminator, which is the bug
+    /// the length in this signature exists to prevent. They are static, so nothing frees
+    /// them, and copying is what keeps them from changing under the returned value.
+    private static func lastRefusalCode() -> RefusalCode? {
+        var pointer: UnsafePointer<CChar>?
+        var length = 0
+        guard fourdgs_last_refusal_code(&pointer, &length) == ok else { return nil }
+        guard pointer != nil, length > 0 else { return nil }
+        // An identifier this build has no case for is `nil` rather than a fabricated one: a
+        // core that grows a seventh refusal should look unnamed here, not misnamed.
+        return RefusalCode(rawValue: string(pointer, length))
     }
 
     /// `\x89 4 D G S 1 \r \n`. §4.1.
