@@ -90,6 +90,15 @@ struct SceneSummary {
 /// The statement every implementation must agree on for a variant.
 std::string canonical(const SceneSummary& summary);
 
+/// The canonical answer for a file this reader refused: `{"refused": "<identifier>"}`.
+///
+/// A refusal is a result, not a crash. The runner prints this on stdout and exits 0, and the
+/// harness diffs it against the committed expectation like any other answer — which is what
+/// separates "refused the file" from "refused it for the right reason". A decoder that
+/// rejects a bad-magic file because it mis-parsed the version would pass a bare-refusal test
+/// and fail this one.
+std::string refusalJson(const std::string& identifier);
+
 }  // namespace conformance
 }  // namespace fourdgs
 

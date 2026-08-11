@@ -111,7 +111,7 @@ def variants() -> list[str]:
 #: invalid corpus, exactly as it would skip any variant it declines, and the feature
 #: matrix is where that shows up publicly. Adding a language is one entry here plus the
 #: few lines in its runner that catch the refusal and print its identifier.
-REFUSAL_FAMILIES = frozenset({"python", "rust"})
+REFUSAL_FAMILIES = frozenset({"python", "rust", "typescript", "cpp"})
 
 
 #: Record families a language has not implemented, by the variant-name flags that carry

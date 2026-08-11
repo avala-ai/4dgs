@@ -6,8 +6,39 @@ All notable changes to the C++ package are documented here, following
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-08-10
+
 ### Added
 
+- A CMake package another project can consume. The install already exported its targets under the
+  `fourdgs::` namespace but generated no config file, so `find_package(fourdgs-cpp)` could not
+  succeed against it — the install rules produced something nothing could find. It now installs
+  `fourdgs-cpp-config.cmake` and `fourdgs-cpp-config-version.cmake` beside the targets file, so a
+  version request is answerable (`SameMinorVersion`, which is what a 0.x compatibility promise
+  means). `fourdgs::cpp` names the library whether it arrived through `find_package` or
+  `add_subdirectory`, and the tests, conformance runners and examples build by default only when
+  this is the top-level project, so consuming the package no longer adds them to somebody else's
+  build. `cpp/README.md` documents the three consumption paths, including the `SOURCE_SUBDIR cpp`
+  argument that a `CPMAddPackage` needs and nobody would guess: this repository has no CMakeLists at
+  its root, and without that argument the fetch silently adds nothing.
+- `fourdgs::version()` now reports the version the CMake project declares, compiled in from
+  `PROJECT_VERSION` rather than written out a second time. It returned `"0.0.0"` while the package
+  answered `find_package(fourdgs-cpp 0.1)`, so an application reporting the linked SDK version and
+  the build that resolved it disagreed.
+- Refusal diagnosis: `fourdgs::Error::refusal` names _which_ rule refused a file — `magic-mismatch`,
+  `unsupported-major-version`, `unknown-temporal-model`, `unknown-quantization-scheme`,
+  `unknown-stream-codec`, `window-index-out-of-range` — in the same words every other SDK prints.
+  `ErrorCode` says what kind of thing went wrong and `kUnsupported` alone covers three of those six,
+  so the code could not answer the question. A `std::optional`, and empty for every failure the
+  specification's table does not name: a truncated file and a transport that gave up are real errors
+  with no rule behind them. Additive, so existing catch sites are unchanged. Read across the C ABI
+  from `fourdgs_last_refusal_code` as a (pointer, length) pair and copied by length — the string is
+  not NUL-terminated, and reading it as though it were is the ABI bug that shape exists to prevent.
+- The `decode_streamed` and `decode_indexed` conformance runners answer a refused file with
+  `{"refused": "<identifier>"}` on stdout and exit 0, so the suite can tell "refused the file" from
+  "refused it for the right reason" — a decoder that rejects a bad-magic file because it mis-parsed
+  the version passes the first and fails the second. `cpp` joins `REFUSAL_FAMILIES`, and the
+  seven-variant invalid corpus is read on both paths: the suite goes from 105 checks to 119.
 - keyframe-delta decode: `fourdgs::keyframeDeltaStatesJson` and `fourdgs::peekTemporalModel`,
   binding the core's additive states-JSON C ABI. The summary is computed in the Rust core, so the
   binding does no arithmetic of its own; the `decode_streamed` and `decode_indexed` conformance
@@ -37,8 +68,29 @@ All notable changes to the C++ package are documented here, following
   comparison rests on, that reordering a scene's gaussians cannot change one character of its
   summary.
 
+### Fixed
+
+- Configuring without a core no longer depends on which half of the core is missing. The backend was
+  chosen from the header alone, and `rust/fourdgs/include/fourdgs.h` is committed while
+  `target/release/libfourdgs.a` is a build artifact — so in a fresh checkout, `cmake -S cpp` before
+  `cargo build` failed outright and `-DFOURDGS_ALLOW_NO_CORE=ON` could not rescue it, which is the
+  configuration that option exists for. The header and the library are resolved together now, and a
+  failed search is not cached, so configuring the same build directory again after
+  `cargo build -p fourdgs --release` links the core rather than keeping the build that has none.
+
+### Known limitations
+
+An out-of-tree build supplies the Rust core itself: this is a binding over that core's C ABI, and
+the core's library is a build artifact, so `FOURDGS_CORE_LIBRARY` (and, for a copy of `cpp/` on its
+own, `FOURDGS_CORE_HEADER_DIR`) point at what `cargo build -p fourdgs --release` produced.
+Configuring without them outside this repository is now a fatal error naming both, rather than a
+STATUS line and a library that refuses every call. Building the core from CMake with Corrosion, or
+fetching a prebuilt one, would remove the step; neither is implemented, and the choice between them
+is deliberately not being made here.
+
 ### Notes
 
 Conformance-verified: 79 checks across the 45 valid variants this binding supports, and the feature
-matrix records exactly what that proves. Nothing is released yet — the package has no version to
-release from.
+matrix records exactly what that proves. This is the first release: 0.1.0 rather than a number
+matched to another SDK's, because the packages version independently and this one has shipped
+nothing before.

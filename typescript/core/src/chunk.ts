@@ -16,7 +16,7 @@
 
 import { CODEC_DEFLATE, CODEC_ZSTD, type CodecRegistry, decompressorFor } from "./codec.js";
 import { Cursor } from "./cursor.js";
-import { MalformedFile, UnsupportedCodec } from "./errors.js";
+import { MalformedFile, Refusal, UnsupportedCodec } from "./errors.js";
 import { Attribute, REQUIRED_ATTRIBUTES } from "./opcodes.js";
 import {
   clamp,
@@ -53,6 +53,7 @@ export function checkWindowIndex(index: number, windowCount: number, location?: 
     throw new MalformedFile(
       `${location === undefined ? "" : `${location}: `}window index ${index} is outside the ` +
         `${windowCount}-entry window table`,
+      { refusalCode: Refusal.WindowIndexOutOfRange },
     );
   }
   return index;
@@ -348,8 +349,14 @@ export async function decompressChunkBlock(
   }
   const codec = CHUNK_COMPRESSION_IDS.get(compression);
   if (codec === undefined) {
+    // The same refusal as an unknown codec id on a stream, reached by the other route a
+    // file has to it: a chunk names its codec, a stream numbers it. The invalid corpus
+    // only takes the numbered route, so nothing in the suite holds this line down — it is
+    // here because one broken rule should not be diagnosed by name or anonymously
+    // depending on which of its two spellings the file used.
     throw new UnsupportedCodec(
       `${describe} is compressed with "${compression}", which this build does not know`,
+      { refusalCode: Refusal.UnknownStreamCodec },
     );
   }
   // The decompressor allocates its declared output in one call, so the declaration is

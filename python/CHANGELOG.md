@@ -6,6 +6,22 @@ All notable changes to the Python package are documented here, following
 
 ## [Unreleased]
 
+### Fixed
+
+- **The Header declares the SH degree the file actually carries.** `sh_bands` caps how many bands
+  the writer emits, but the Header went on declaring the degree the input `GaussianSet` held. A
+  degree-3 scene written with `sh_bands=1` carries three coefficients per component and declared
+  fifteen, so a reader sizing its buffers from the Header read a different number of coefficients
+  than the file contained. The declared degree is now the highest band written (issue #190).
+
+- **The top spherical-harmonic coefficient survives a pitch that does not divide 256.** The `coarse`
+  profile's `step_sh = 3` centred the coefficient 255 on **256**, which no `u8` holds: the reference
+  reader refused the file the reference writer had just produced, and a reader whose stream codec
+  narrows to a byte instead reported the extreme positive coefficient as the extreme negative one.
+  Coefficient rounding now lives in one place, `quantization.coarsen_sh`, and clamps back into the
+  byte range — a move that can only be towards the original, so the declared half-pitch bound is
+  kept (issues #181, #190).
+
 ## [0.3.0] - 2026-07-31
 
 This release ships the normative `keyframe-delta` temporal model as a whole-file reference path and

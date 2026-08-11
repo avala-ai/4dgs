@@ -10,12 +10,21 @@ name: Release
 #   releases/dart/vX.Y.Z
 #   releases/typescript/<package>/vX.Y.Z
 #   releases/corpus/vX.Y.Z         <- the conformance corpus, not a package
+#   vX.Y.Z                          <- Swift, and only Swift
 #
-# Every job authenticates with OIDC trusted publishing. There are no stored
-# registry tokens in this repository and there should never be one: a token in
-# a secret is a credential that outlives the job it was created for. The corpus
-# job is the exception that proves it: it publishes to no registry, so it has
-# nothing to authenticate to and asks for no id-token at all.
+# The bare tag is not a repository-wide version and there is no such thing. It
+# is the one tag shape SwiftPM reads: Swift has no registry, a package is
+# resolved straight from a Git URL, and versions come only from plain SemVer
+# tags on that repository. `releases/swift/v0.1.0` would offer a consumer no
+# versions at all. The Swift job below is guarded on the bare form and nothing
+# else may ever use it — two consumers of that namespace would make both
+# ambiguous, permanently.
+#
+# Every job that publishes to a registry authenticates with OIDC trusted
+# publishing. There are no stored registry tokens in this repository and there
+# should never be one: a token in a secret is a credential that outlives the job
+# it was created for. The corpus and Swift publish to no registry, so they have
+# nothing to authenticate to and ask for no id-token at all.
 #
 # Every job also leaves a GitHub Release behind, with that version's changelog
 # section as its body. A tag that publishes a package and leaves no release is a
@@ -27,6 +36,9 @@ on:
   push:
     tags:
       - "releases/**"
+      # Swift's. Spelled out digit by digit rather than as `v*` so that a stray
+      # `v2-experiment` branch tag cannot start a release.
+      - "v[0-9]+.[0-9]+.[0-9]+"
   workflow_dispatch:
 
 jobs:
@@ -165,6 +177,136 @@ jobs:
           case "$version" in 0.*) prerelease=--prerelease ;; *) prerelease= ;; esac
           gh release create "${GITHUB_REF#refs/tags/}" $prerelease \
             --title "fourdgs (Rust) $version" \
+            --notes-file "$RUNNER_TEMP/notes.md"
+
+  swift:
+    name: Release the Swift package
+    # Guarded on the bare `vX.Y.Z` tag, which belongs to Swift alone — see the header
+    # of this file and RELEASING.md. The `releases/**` jobs above cannot match it and
+    # this one cannot match theirs.
+    #
+    # There is no registry step because there is no Swift registry: consumers resolve
+    # the package from this repository's URL, so the tag *is* the publication. What is
+    # left is everything that makes the tag trustworthy — the version assertion, the
+    # notes, and a build of exactly what the tag will offer — plus the GitHub Release.
+    # No OIDC, no token, nothing to exchange.
+    #
+    # macOS rather than the Linux container the CI job uses: the runner already ships
+    # both toolchains, and visionOS, iOS and macOS are the platforms this package
+    # declares. A release verified only on Linux would be verified on the one platform
+    # the package is not for.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: macos-14
+    environment: release
+    permissions:
+      # For the release step alone. No id-token: nothing here authenticates to anything.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Not shallow: the resolution check below has SwiftPM clone this checkout as if
+          # it were the remote, and a clone of a depth-1 repository is a different and
+          # much less useful thing to be testing against.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: swift --version
+
+      - name: Version matches the tag
+        # SwiftPM has no version field in a manifest — a package's version is the tag it
+        # was resolved at. `fourdgsPackageVersion` is the one place the package states it,
+        # and this is where the two are held together.
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          source=$(grep -m1 '^public let fourdgsPackageVersion = ' swift/Sources/FourDGS/Version.swift | cut -d'"' -f2)
+          echo "tag=$tag source=$source"
+          if [ "$tag" != "$source" ]; then
+            echo "::error::version mismatch — tag $tag, Version.swift $source"
+            exit 1
+          fi
+
+      - name: The manifest is at the root
+        # The one thing a bare tag exists to make true. A manifest that moved back under
+        # swift/ would tag a version no `.package(url:)` can resolve, and the tag would be
+        # unretractable — so this is checked before the release is created, not after.
+        run: |
+          test -f Package.swift || {
+            echo "::error::there is no Package.swift at the repository root — SwiftPM looks for the manifest at the top of the clone, so this tag would resolve to nothing"
+            exit 1
+          }
+
+      - name: Release notes from the changelog
+        run: |
+          version="${GITHUB_REF#refs/tags/v}"
+          python scripts/changelog_section.py swift/CHANGELOG.md "$version" > "$RUNNER_TEMP/section.md"
+          {
+            echo "## What's changed"
+            echo
+            cat "$RUNNER_TEMP/section.md"
+            echo
+            echo "---"
+            echo
+            echo "\`.package(url: \"https://github.com/avala-ai/4dgs\", from: \"$version\")\` | [full changelog](https://github.com/avala-ai/4dgs/blob/main/swift/CHANGELOG.md)"
+            echo
+            echo "This tag is the version of the **Swift package** and of nothing else in this repository — Swift is the one language here whose package manager reads plain SemVer tags. See [RELEASING.md](https://github.com/avala-ai/4dgs/blob/main/RELEASING.md#swift-tags-look-repository-wide-and-are-not)."
+            echo
+            echo "The package resolves from that URL; it does not yet link outside a checkout of this repository, because it binds the Rust core and ships no prebuilt copy of it. See [swift/README.md](https://github.com/avala-ai/4dgs/blob/main/swift/README.md#the-core-is-not-in-the-box)."
+          } > "$RUNNER_TEMP/notes.md"
+
+      - name: Build and test what the tag will offer
+        # The core first, because the package links it. This is the same pair of commands
+        # the Swift CI job runs, on the same manifest, from the repository root.
+        run: |
+          cargo build -p fourdgs --release
+          swift build --scratch-path swift/.build -Xlinker -L$PWD/target/release
+          swift test --scratch-path swift/.build -Xlinker -L$PWD/target/release
+
+      - name: A consumer can resolve this tag
+        # The claim the whole ticket is about, checked against SwiftPM rather than against
+        # a reading of its documentation: a package that has never seen this repository
+        # resolves the tag from a URL. It is a `file://` URL to this checkout, so the test
+        # needs no network and no published release — the mechanism under test is the tag
+        # shape and the manifest's location, and neither cares which host serves it.
+        #
+        # `resolve` and not `build`: the core is not in the box, so a consumer's build is
+        # exactly what does not work yet. Do not "fix" this by adding a build here; fix it
+        # by shipping an XCFramework binary target.
+        run: |
+          version="${GITHUB_REF#refs/tags/v}"
+          consumer="$RUNNER_TEMP/consumer"
+          mkdir -p "$consumer/Sources/Consumer"
+          echo 'import FourDGS' > "$consumer/Sources/Consumer/Consumer.swift"
+          cat > "$consumer/Package.swift" <<EOF
+          // swift-tools-version:5.9
+          import PackageDescription
+          let package = Package(
+              name: "Consumer",
+              platforms: [.macOS(.v14)],
+              dependencies: [.package(url: "file://$PWD", exact: "$version")],
+              targets: [.target(name: "Consumer", dependencies: [.product(name: "FourDGS", package: "4dgs")])]
+          )
+          EOF
+          cd "$consumer" && swift package resolve
+          grep -q "\"version\" *: *\"$version\"" Package.resolved || {
+            echo "::error::the consumer resolved something other than $version"
+            cat Package.resolved
+            exit 1
+          }
+          echo "resolved $version from a URL"
+
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF#refs/tags/v}"
+          case "$version" in 0.*) prerelease=--prerelease ;; *) prerelease= ;; esac
+          # The title is what tells a reader on the releases page that a bare tag beside
+          # `releases/python/v0.3.0` is one package's version and not the repository's.
+          gh release create "${GITHUB_REF#refs/tags/}" $prerelease \
+            --title "fourdgs (Swift) $version" \
             --notes-file "$RUNNER_TEMP/notes.md"
 
   dart:

@@ -10,6 +10,7 @@ the release log.
 | TypeScript — `@4dgs/core`, `@4dgs/browser`, `@4dgs/nodejs`, `@4dgs/codecs` | [typescript/CHANGELOG.md](typescript/CHANGELOG.md)               | [npm](https://www.npmjs.com/package/@4dgs/core)       |
 | Rust — `fourdgs`                                                           | [rust/CHANGELOG.md](rust/CHANGELOG.md)                           | [crates.io](https://crates.io/crates/fourdgs)         |
 | Dart — `fourdgs`                                                           | [dart/fourdgs/CHANGELOG.md](dart/fourdgs/CHANGELOG.md)           | not yet published                                     |
+| Swift — `FourDGS`                                                          | [swift/CHANGELOG.md](swift/CHANGELOG.md)                         | no registry; resolved from this repository's URL      |
 | Conformance corpus                                                         | [tests/conformance/CHANGELOG.md](tests/conformance/CHANGELOG.md) | [releases](https://github.com/avala-ai/4dgs/releases) |
 
 The conformance corpus in that table is not a package. It is the corpus itself, published as a
@@ -47,3 +48,9 @@ reservation has been published: the release job's OIDC exchange has no trusted p
 with on npm. The tag will be pushed when it can publish, which is the only thing that puts a line
 here. Python 0.3.0 and Rust 0.4.0 follow the same rule — version constants and changelog sections
 land on `main` first; tags and registry lines come after.
+
+Swift 0.1.0 has a version constant and a changelog section on `main` and no tag yet. When it is cut
+it will be **`v0.1.0`, with no package name in it**, because SwiftPM reads versions only from plain
+SemVer tags and there is no registry between it and this repository. That bare tag is the Swift
+package's version and not this repository's — the reasoning, and the rule that nothing else may ever
+use that tag shape, are in [RELEASING.md](RELEASING.md#swift-tags-look-repository-wide-and-are-not).

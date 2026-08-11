@@ -56,12 +56,24 @@ thread_local! {
     /// The last error message, owned per thread so two threads decoding two files never
     /// overwrite each other's diagnosis.
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
+
+    /// The identifier of the last error, when it was one of the refusals the specification
+    /// names, and `None` for every other failure. Thread-local beside `LAST_ERROR` and
+    /// written only with it, so the message and the identifier a caller reads always
+    /// describe the same failure.
+    static LAST_REFUSAL: RefCell<Option<&'static str>> = const { RefCell::new(None) };
 }
 
 fn set_last_error(message: String) {
     let cleaned = message.replace('\0', " ");
     LAST_ERROR.with(|slot| {
         *slot.borrow_mut() = CString::new(cleaned).ok();
+    });
+    // Cleared here rather than at each call site: most failures — a null argument, an index
+    // past the end — are not named refusals, and a stale identifier left behind by an
+    // earlier one would name the wrong error. `report` sets it again for the refusals.
+    LAST_REFUSAL.with(|slot| {
+        *slot.borrow_mut() = None;
     });
 }
 
@@ -96,7 +108,13 @@ fn status_of(error: &Error) -> c_int {
 
 fn report(error: Error) -> c_int {
     let status = status_of(&error);
+    let code = error.refusal_code();
     set_last_error(error.to_string());
+    // After the message, not before: `set_last_error` clears whatever identifier the
+    // previous failure left behind, so writing this first would erase it again.
+    LAST_REFUSAL.with(|slot| {
+        *slot.borrow_mut() = code;
+    });
     status
 }
 
@@ -119,6 +137,50 @@ pub extern "C" fn fourdgs_last_error() -> *const c_char {
     LAST_ERROR.with(|slot| match &*slot.borrow() {
         Some(message) => message.as_ptr(),
         None => c"".as_ptr(),
+    })
+}
+
+/// The identifier of the last error on this thread, when the specification's refusal table
+/// names it, and null with length 0 for every other failure.
+///
+/// Additive: the nine `fourdgs_status` codes say what *kind* of thing went wrong, and
+/// `FOURDGS_STATUS_UNSUPPORTED_CODEC` alone covers three different named refusals. This is
+/// how a binding says *which* one, with the same string every other SDK prints, without any
+/// existing signature changing under the two bindings and the applications on them.
+///
+/// Length-delimited like every other string on this surface, and for the same reason:
+/// reading one of these with `CStr::from_ptr` is the bug this shape exists to prevent. The
+/// bytes are `'static` — the identifiers are compile-time constants, not file data — so the
+/// pointer never dangles; what it names changes with the next failing call on this thread.
+///
+/// A null out parameter is `FOURDGS_STATUS_INVALID_ARGUMENT` and, uniquely on this surface,
+/// does *not* record a message: this is the accessor for the last error, and overwriting it
+/// here would destroy the diagnosis the caller came for.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_last_refusal_code(
+    out: *mut *const c_char,
+    out_len: *mut usize,
+) -> c_int {
+    guarded(|| {
+        if out.is_null() || out_len.is_null() {
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        }
+        let code = LAST_REFUSAL.with(|slot| *slot.borrow());
+        // SAFETY: both pointers were checked non-null, and a refusal identifier is a
+        // `&'static str`, so the bytes outlive every caller.
+        unsafe {
+            match code {
+                Some(code) => {
+                    *out = code.as_ptr() as *const c_char;
+                    *out_len = code.len();
+                }
+                None => {
+                    *out = std::ptr::null();
+                    *out_len = 0;
+                }
+            }
+        }
+        FOURDGS_STATUS_OK
     })
 }
 

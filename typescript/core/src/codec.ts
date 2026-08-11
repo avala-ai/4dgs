@@ -10,7 +10,7 @@
  * which is how `zstd` stays out of a browser bundle that will never see it.
  */
 
-import { MalformedFile, TruncatedFile, UnsupportedCodec } from "./errors.js";
+import { MalformedFile, Refusal, TruncatedFile, UnsupportedCodec } from "./errors.js";
 
 export const CODEC_DEFLATE = 0;
 export const CODEC_ZSTD = 1;
@@ -107,6 +107,7 @@ export function decompressorFor(codec: number, registry: CodecRegistry): Decompr
   throw new UnsupportedCodec(
     `stream codec ${codec} (${codecName(codec)}) is not available in this build; ` +
       "register a decompressor for it through the decode options",
+    { refusalCode: Refusal.UnknownStreamCodec },
   );
 }
 

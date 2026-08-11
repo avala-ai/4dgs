@@ -48,8 +48,25 @@ struct Error {
   ErrorCode code = ErrorCode::kInternal;
   std::string message;
 
+  /// Which rule refused the file, in the specification's own vocabulary:
+  /// `"magic-mismatch"`, `"unsupported-major-version"`, `"unknown-temporal-model"`,
+  /// `"unknown-quantization-scheme"`, `"unknown-stream-codec"`,
+  /// `"window-index-out-of-range"` — the same six strings every other SDK prints.
+  ///
+  /// `code` says what *kind* of thing went wrong, and `kUnsupported` alone covers three of
+  /// those six; this says *which* one, so "refused the file" and "refused it for the right
+  /// reason" stop being the same observation.
+  ///
+  /// Absent for every failure the table does not name — a truncated file, a transport that
+  /// failed, a null argument — which are real errors with a real `message` and no
+  /// identifier. Absent is therefore not "no error": `Result::ok()` is what answers that,
+  /// and a successful call never reaches an `Error` at all.
+  std::optional<std::string> refusal;
+
   Error() = default;
   Error(ErrorCode c, std::string m) : code(c), message(std::move(m)) {}
+  Error(ErrorCode c, std::string m, std::optional<std::string> r)
+      : code(c), message(std::move(m)), refusal(std::move(r)) {}
 
   /// `"kMalformed: window index 7 is outside a table of 4"` — code and detail, for a log line
   /// or a `what()`.
