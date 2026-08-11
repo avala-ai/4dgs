@@ -238,8 +238,8 @@ process starts; see [below](#declining-a-variant).
 
 ### The two read paths
 
-Each implementation ships **two** runners, and the harness runs both over the same corpus, diffing
-both against the same committed expectation:
+Each implementation ships **two** runners, and when both entry points are built the harness runs
+both over the same corpus, diffing both against the same committed expectation:
 
 | Runner            | Reads                                    | Produces                                     |
 | ----------------- | ---------------------------------------- | -------------------------------------------- |
@@ -251,6 +251,12 @@ to be able to disagree**. A streamed reader arrives at the Header front to back;
 arrives through the Footer and the chunk index. A check placed on one route is invisible from the
 other, and a suite that ran whichever path an implementation preferred would run one of them twice
 and count it as two passes.
+
+The harness does not currently enforce that the pair is present. If one built-in entry point is
+missing, that runner is skipped, and `--runner <family>` is considered exercised once the other one
+runs. Such a run can therefore exit successfully after proving only one path. Build both entry
+points, confirm neither is reported as `skipping`, and check the combined pass count; a green exit
+by itself is not evidence that the pair ran.
 
 A file written without a chunk index cannot be read the indexed way at all, so the indexed runner is
 not asked about those variants: the harness skips any variant whose name lacks `UseChunkIndex` for a
@@ -273,9 +279,11 @@ through it — deleting the indexed path's `check_temporal_model` turns `Unknown
 of the corpus, which is why it is recorded here rather than treated as coverage.
 
 Encoding is proved by a different program — `tests/conformance/encode_roundtrip.py`, which drives an
-`<encoder> <in.4dgs> <out.4dgs>` CLI and diffs its output against the Rust reference encoder through
-the Python decoder. It is not part of this protocol, and as far as `run.py` is concerned a
-decoder-only implementation is a complete one.
+`<encoder> <in.4dgs> <out.4dgs> [sh-bit-depths]` CLI and diffs its output against the Rust reference
+encoder through the Python decoder. The input and output paths are required. For each variant whose
+name contains `SHDegree`, the gate makes a second call with the optional comma-separated depths
+`6,4,3`, band 1 first. Encoding is not part of this runner protocol, and as far as `run.py` is
+concerned a decoder-only implementation is a complete one.
 
 ### Declining a variant
 
@@ -322,11 +330,13 @@ is rules whose whole content is a refusal — an out-of-range window index, an u
 temporal model the reader does not know — and a decoder that ignores all of them passes every valid
 variant.
 
-`generator/invalid.py` declares the other half: mutations of one valid base file, each breaking
-exactly one rule, each paired with the **refusal identifier** a conforming reader must produce. The
-mutations are length-preserving wherever they can be, so nothing after the patch shifts and the file
-is wrong in exactly one way; a mutation that moved offsets would produce a file broken twice, and a
-reader could pass by noticing the wrong fault.
+`generator/invalid.py` declares the other half: six mutations of one valid base file, each breaking
+exactly one rule, plus one directly encoded case, each paired with the **refusal identifier** a
+conforming reader must produce. The mutations are length-preserving wherever they can be, so nothing
+after the patch shifts and the file is wrong in exactly one way; a mutation that moved offsets would
+produce a file broken twice, and a reader could pass by noticing the wrong fault. The exception is
+`EmptyTemporalModel`: shortening a length-prefixed string would move the Header fields after it, so
+the generator writes a fresh file with an empty `temporal_model` instead of byte-patching the base.
 
 The expectation — and so the document the runner prints — is a JSON object with one key:
 
@@ -445,6 +455,12 @@ emits those as JSON numbers **fails**, with digits that match exactly. It is not
 difference and no amount of re-reading the diff will make it into one: the failing key is a number
 where the expectation has a string.
 
+There is one Python equality loophole in that statement: `bool` is a subclass of `int`, so the
+current comparison accepts JSON `1` for `true` and `0` for `false`. That affects fields such as
+`hasAudio`, `spatial`, `loop` and `summaryCrcOk`. It is a harness gap, not a second schema: a runner
+should still emit booleans for boolean fields, because another implementation or a future
+type-strict comparison need not preserve the accident.
+
 **Rounding is the runner's job.** There is no tolerance anywhere in the comparison, so `0.3` and
 `0.30000000000000004` are simply different numbers here. Every float is rounded before it is
 printed, by `num()`: take the value as a double, map any non-finite value to `null`, otherwise round
@@ -526,7 +542,8 @@ delta mode and live/birth/death/update counts, plus reconstructed states at prob
 the reason that model exists is cheap reconstruction at an instant, and that is what two
 implementations should be diffed on. Its shape lives in `states_json`, in `keyframe_delta_file` in
 the Python and Rust cores rather than in `canonical.py`; the `data/keyframe/` expectations are
-those, and every other expectation is `summarize()`'s.
+those. The valid `gaussian-birth` expectations are `summarize()`'s. The seven `data/invalid/`
+expectations are the one-key refusal documents described above, not summaries of their files.
 
 Finally, an artifact worth naming so that nobody chases it: the committed `.json` files were written
 by the Python implementation, so they carry Python's spelling of every float. That is a fact about
