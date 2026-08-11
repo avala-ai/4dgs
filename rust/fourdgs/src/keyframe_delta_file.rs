@@ -31,7 +31,7 @@ use crate::quantization::{
     life_class, motion_step, mu_step, rct_forward, rint, support_k, Bounds, Profile, Steps,
 };
 use crate::records as rec;
-use crate::serialization::{check_magic, crc32, Cursor, Records, MAGIC};
+use crate::serialization::{check_magic, crc32, Cursor, Records, MAGIC, MAX_STREAM_BYTES};
 use crate::stream::{decode_stream, encode_stream, DecodedStream};
 
 /// How many gaussians appear in full in a probe's sample.
@@ -959,6 +959,12 @@ fn delta_record_bytes<'a>(
             head.t0, head.uncompressed_size
         ))
     })?;
+    if head.uncompressed_size > MAX_STREAM_BYTES {
+        return Err(Error::Malformed(format!(
+            "the Delta Chunk at t0={} declares {} uncompressed record bytes, past the {MAX_STREAM_BYTES} byte cap",
+            head.t0, head.uncompressed_size
+        )));
+    }
     Ok(Cow::Owned(crate::codec::decompress(
         records, numeric, expected,
     )?))
@@ -1445,14 +1451,16 @@ pub fn open_indexed<R: crate::Readable + ?Sized>(source: &mut R) -> Result<Index
     let mut quant: Option<rec::Quantization> = None;
     let mut windows: Vec<(f64, f64)> = Vec::new();
     let mut at = MAGIC.len() as u64;
-    // Front matter ends at the first state record. State and auxiliary payload records may
-    // fill the asset; an indexed open has no reason to frame every one before jumping to the
-    // Footer it already read from the fixed tail.
-    while at < footer.summary_start.min(footer_at) || footer.summary_start == 0 && at < footer_at {
+    let mut state_seen = false;
+    // Header declarations remain authoritative wherever they occur, so every copy is
+    // checked even after state begins.  Only nine-byte framing is read for intervening
+    // payload records; later non-Header front matter is deliberately not substituted for
+    // the grid and windows selected before the first state record.
+    while at < footer_at {
         let (opcode, content_length) = ranged_framing(source, at, None)?;
         let total = crate::serialization::RECORD_HEADER_SIZE as u64 + content_length;
         if opcode == op::CHUNK || opcode == op::DELTA_CHUNK {
-            break;
+            state_seen = true;
         }
         match opcode {
             op::HEADER => {
@@ -1464,7 +1472,7 @@ pub fn open_indexed<R: crate::Readable + ?Sized>(source: &mut R) -> Result<Index
                 check_keyframe_temporal_model(&parsed.temporal_model)?;
                 header = Some(parsed);
             }
-            op::QUANTIZATION => {
+            op::QUANTIZATION if !state_seen => {
                 let content = source.read(
                     at + crate::serialization::RECORD_HEADER_SIZE as u64,
                     content_length,
@@ -1473,7 +1481,7 @@ pub fn open_indexed<R: crate::Readable + ?Sized>(source: &mut R) -> Result<Index
                 crate::registry::check_quantization_scheme(&parsed.scheme)?;
                 quant = Some(parsed);
             }
-            op::WINDOW_TABLE => {
+            op::WINDOW_TABLE if !state_seen => {
                 let content = source.read(
                     at + crate::serialization::RECORD_HEADER_SIZE as u64,
                     content_length,
@@ -1485,6 +1493,12 @@ pub fn open_indexed<R: crate::Readable + ?Sized>(source: &mut R) -> Result<Index
         at = at
             .checked_add(total)
             .ok_or_else(|| Error::Truncated("record walk offset overflows".into()))?;
+        if at > footer_at {
+            return Err(Error::Truncated(format!(
+                "the {} record before the final Footer extends to byte {at}, past the Footer at {footer_at}",
+                op::name(opcode)
+            )));
+        }
     }
     let (Some(header), Some(quantization)) = (header, quant) else {
         return Err(Error::Malformed(
@@ -1990,6 +2004,7 @@ mod hostile_record_tests {
     use crate::codec;
     use crate::readable::Readable;
     use crate::serialization::{put_blob, put_f64, put_string, put_u16, put_u32, put_u64};
+    use crate::BytesReadable;
 
     fn record_content(record: &[u8]) -> &[u8] {
         &record[crate::serialization::RECORD_HEADER_SIZE..]
@@ -2039,6 +2054,18 @@ mod hostile_record_tests {
             error.refusal_code(),
             Some(crate::error::refusal::UNKNOWN_STREAM_CODEC)
         );
+    }
+
+    #[test]
+    fn a_delta_records_block_cannot_decompress_past_the_fixed_cap() {
+        let content = delta_content_with_compression(
+            "deflate",
+            &[0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01],
+            MAX_STREAM_BYTES + 1,
+        );
+        let error = check_delta_chunk(&content, &[]).unwrap_err();
+        assert!(error.to_string().contains("past the"), "{error}");
+        assert!(error.to_string().contains("byte cap"), "{error}");
     }
 
     #[test]
@@ -2185,6 +2212,39 @@ mod hostile_record_tests {
             source.reads.iter().all(|(_, length)| *length < 1024),
             "unexpected bulk read: {:?}",
             source.reads
+        );
+    }
+
+    #[test]
+    fn indexed_open_checks_a_header_after_the_first_state_record() {
+        let mut data = empty_indexed_file();
+        let old_footer_at =
+            data.len() - MAGIC.len() - crate::serialization::RECORD_HEADER_SIZE - 20;
+        let old_summary_start = u64::from_le_bytes(
+            data[old_footer_at + crate::serialization::RECORD_HEADER_SIZE
+                ..old_footer_at + crate::serialization::RECORD_HEADER_SIZE + 8]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let late = rec::Header {
+            duration_sec: 1.0,
+            aabb: vec![0.0; 6],
+            temporal_model: "frame-sequence".into(),
+            ..Default::default()
+        }
+        .encode(&[]);
+        data.splice(old_summary_start..old_summary_start, late.iter().copied());
+
+        let footer_at = old_footer_at + late.len();
+        let shifted_summary = (old_summary_start + late.len()) as u64;
+        data[footer_at + crate::serialization::RECORD_HEADER_SIZE
+            ..footer_at + crate::serialization::RECORD_HEADER_SIZE + 8]
+            .copy_from_slice(&shifted_summary.to_le_bytes());
+
+        let error = open_indexed(&mut BytesReadable::new(&data)).unwrap_err();
+        assert_eq!(
+            error.refusal_code(),
+            Some(crate::error::refusal::UNKNOWN_TEMPORAL_MODEL)
         );
     }
 }

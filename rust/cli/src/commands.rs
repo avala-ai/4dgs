@@ -407,12 +407,7 @@ fn coverage(
 /// throwing the rest away.
 pub fn inspect(args: &Args) -> Result<u8> {
     let mut source = FileReadable::open(&args.file)?;
-    let mut footer = None;
-    let summary = crate::refusal::walk_each(&mut source, |frame, intact| {
-        if intact && frame.opcode == op::FOOTER && footer.is_none() {
-            footer = Some(frame);
-        }
-    })?;
+    let (summary, footer) = inspection_walk(&mut source)?;
     let coverage = coverage(&mut source, footer)?;
 
     if args.json {
@@ -427,6 +422,18 @@ pub fn inspect(args: &Args) -> Result<u8> {
     } else {
         EXIT_OK
     })
+}
+
+fn inspection_walk(
+    source: &mut dyn Readable,
+) -> Result<(crate::refusal::WalkSummary, Option<crate::refusal::Frame>)> {
+    let mut footer = None;
+    let summary = crate::refusal::walk_each(source, |frame, intact| {
+        if intact && frame.opcode == op::FOOTER {
+            footer = Some(frame);
+        }
+    })?;
+    Ok((summary, footer))
 }
 
 fn print_inspect_text(
@@ -837,6 +844,21 @@ mod tests {
         assert!(
             error.to_string().contains("after the Footer itself"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn inspection_uses_the_final_intact_footer() {
+        let mut data = footer_declaring(0);
+        let final_at = data.len() - (RECORD_HEADER_SIZE + 20 + MAGIC.len());
+        let earlier = fourdgs::records::Footer::default().encode();
+        data.splice(final_at..final_at, earlier.iter().copied());
+
+        let (_, footer) = inspection_walk(&mut BytesReadable::new(&data)).unwrap();
+        assert_eq!(
+            footer.unwrap().offset,
+            (final_at + earlier.len()) as u64,
+            "the authoritative Footer is the last intact one"
         );
     }
 }

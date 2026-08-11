@@ -135,6 +135,7 @@ pub struct WalkSummary {
 /// carrying an hour of audio as on one carrying none. The magic is checked first, because
 /// a walk over bytes that are not ours would report whatever the first byte happened to
 /// mean as an opcode.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn walk(source: &mut dyn Readable) -> Result<Walk> {
     let mut records = Vec::new();
     let summary = walk_each(source, |frame, _| records.push(frame))?;
@@ -718,7 +719,14 @@ pub fn decode_band_record(
             "the chunk index labels the SH Band Stream at byte {at} as band {declared_band}; the record declares band {physical_band}"
         )));
     }
-    decode_stream(&mut content, Some(count))?;
+    let (_, stream) = decode_stream(&mut content, Some(count))?;
+    let expected_channels = 3 * (2 * physical_band as usize + 1);
+    if stream.channels != expected_channels {
+        return Err(Error::Malformed(format!(
+            "the SH Band Stream at byte {at} for band {physical_band} declares {} channels; band {physical_band} requires {expected_channels}",
+            stream.channels
+        )));
+    }
     Ok(())
 }
 
@@ -952,6 +960,21 @@ mod tests {
         // would be inventing conformance.
         let error = Error::Truncated("cut".into());
         assert!(describe(&error, None, None).is_none());
+    }
+
+    #[test]
+    fn an_sh_band_stream_must_declare_the_bands_channel_count() {
+        // SH Band Streams use attribute id 7 in their nested stream, which collides
+        // intentionally with mu_t and is disambiguated by the enclosing record.
+        let stream =
+            fourdgs::stream::encode_stream(op::A_MU_T, &[7], 1, fourdgs::codec::DEFLATE, 6, true)
+                .unwrap();
+        let mut content = vec![1];
+        content.extend_from_slice(&stream);
+        let mut record = Vec::new();
+        fourdgs::serialization::put_record(&mut record, op::SH_BAND_STREAM, &content);
+        let error = decode_band_record(&record, 0, record.len() as u64, 1, 1).unwrap_err();
+        assert!(error.to_string().contains("requires 9"), "{error}");
     }
 
     #[test]

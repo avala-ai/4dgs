@@ -269,7 +269,13 @@ pub fn run(args: &Args) -> Result<u8> {
             return Ok(EXIT_TOOL);
         }
     };
-    let report = validate(&data);
+    let report = match validate_checked(&data) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("4dgs: {}: validator tool failure: {error}", args.file);
+            return Ok(EXIT_TOOL);
+        }
+    };
     for finding in &report.findings {
         out!("{}: {}", finding.severity.as_str(), finding.message);
         // Indented, and with a prefix of its own, so that a caller filtering the findings
@@ -301,16 +307,53 @@ pub fn run(args: &Args) -> Result<u8> {
 }
 
 /// Every check, in the Python validator's order.
+#[cfg(test)]
 pub fn validate(data: &[u8]) -> Report {
+    validate_checked(data).unwrap_or_else(|error| {
+        let mut report = Report::default();
+        report.error(format!("the validator tool failed: {error}"));
+        report
+    })
+}
+
+fn validate_checked(data: &[u8]) -> Result<Report> {
     let mut report = Report::default();
     // Framing first, and for two reasons: it refuses a file that is not ours before
     // anything reads a byte as an opcode, and it is what gives every later refusal a byte
     // to point at.
-    let walk = match refusal::walk(&mut BytesReadable::new(data)) {
+    let mut refusing_header = None;
+    let mut refusing_quantization = None;
+    let walk = match refusal::walk_each(&mut BytesReadable::new(data), |frame, intact| {
+        if !intact {
+            return;
+        }
+        let Some(content) = frame.content(data) else {
+            return;
+        };
+        match frame.opcode {
+            op::HEADER
+                if refusing_header.is_none()
+                    && rec::Header::parse(content).is_ok_and(|header| {
+                        fourdgs::registry::check_temporal_model(&header.temporal_model).is_err()
+                    }) =>
+            {
+                refusing_header = Some(frame);
+            }
+            op::QUANTIZATION
+                if refusing_quantization.is_none()
+                    && rec::Quantization::parse(content).is_ok_and(|quantization| {
+                        fourdgs::registry::check_quantization_scheme(&quantization.scheme).is_err()
+                    }) =>
+            {
+                refusing_quantization = Some(frame);
+            }
+            _ => {}
+        }
+    }) {
         Ok(walk) => walk,
         Err(error) => {
             report.refused("", &error, None, None);
-            return report;
+            return Ok(report);
         }
     };
     if !data.ends_with(&MAGIC) {
@@ -450,7 +493,7 @@ pub fn validate(data: &[u8]) -> Report {
 
     if seen.is_empty() {
         report.error("no records at all".into());
-        return report;
+        return Ok(report);
     }
     if seen[0] != op::HEADER {
         report.error(format!(
@@ -583,22 +626,35 @@ pub fn validate(data: &[u8]) -> Report {
              and a streamed reader recovers them",
             crate::commas(cut.at),
             cut.reason,
-            walk.intact()
+            walk.intact
         ));
     }
 
+    // Refusal placement needs only the first front-matter record that actually refuses,
+    // never one Frame per record in the file.  The framing pass above retains these two
+    // candidates and aggregate cut facts only; chunk diagnostics already carry their
+    // exact site from the chunk-by-chunk decoder.
+    let location_walk = refusal::Walk {
+        records: [refusing_header, refusing_quantization]
+            .into_iter()
+            .flatten()
+            .collect(),
+        cut: None,
+        trailing_magic: walk.trailing_magic,
+        size: walk.size,
+    };
     let fetch = |frame: &refusal::Frame| frame.content(data).map(<[u8]>::to_vec);
     let framing = Framing {
-        walk: &walk,
+        walk: &location_walk,
         fetch: &fetch,
     };
     if keyframe_delta {
-        check_keyframe_delta(data, framing, index.is_empty(), &mut report);
+        check_keyframe_delta(data, framing, index.is_empty(), &mut report)?;
     } else {
         check_gaussian_birth(data, framing, &mut report);
     }
 
-    report
+    Ok(report)
 }
 
 /// The two checks that only a reader can perform: open the file, then decode it.
@@ -751,7 +807,12 @@ fn decode_indexed_delta<R: Readable + ?Sized>(
 /// returned an error — and every stream-only keyframe-delta file was reported invalid for a
 /// fault that belonged to the tool. The gaussian-birth branch has always had the other path;
 /// this one now has it too.
-fn check_keyframe_delta(data: &[u8], framing: Framing, unindexed: bool, report: &mut Report) {
+fn check_keyframe_delta(
+    data: &[u8],
+    framing: Framing,
+    unindexed: bool,
+    report: &mut Report,
+) -> Result<()> {
     if unindexed {
         return check_keyframe_delta_streamed(data, framing, report);
     }
@@ -765,7 +826,7 @@ fn check_keyframe_delta(data: &[u8], framing: Framing, unindexed: bool, report: 
                 Some(framing),
                 None,
             );
-            return;
+            return Ok(());
         }
     };
     let mut ordered: Vec<(usize, &rec::ChunkIndexEntry)> =
@@ -773,15 +834,7 @@ fn check_keyframe_delta(data: &[u8], framing: Framing, unindexed: bool, report: 
     ordered.sort_by(|(_, a), (_, b)| a.t0.partial_cmp(&b.t0).unwrap_or(std::cmp::Ordering::Equal));
     let mut current: Option<(u64, u16, u32, fourdgs::keyframe_delta::State)> = None;
     let mut keyframe: Option<(u64, u32, fourdgs::keyframe_delta::State)> = None;
-    let mut identities = match IdentityCounter::new() {
-        Ok(counter) => counter,
-        Err(error) => {
-            report.error(format!(
-                "the validator cannot create its bounded identity counter: {error}"
-            ));
-            return;
-        }
-    };
+    let mut identities = IdentityCounter::new()?;
 
     for (i, entry) in ordered {
         let what = if entry.kind == 0 {
@@ -859,6 +912,9 @@ fn check_keyframe_delta(data: &[u8], framing: Framing, unindexed: bool, report: 
         let band_count = match outcome {
             Ok(count) => count,
             Err(error) => {
+                if matches!(error, fourdgs::Error::Io(_)) {
+                    return Err(error);
+                }
                 report.refused(
                     "a chunk does not decode: ",
                     &error,
@@ -870,7 +926,7 @@ fn check_keyframe_delta(data: &[u8], framing: Framing, unindexed: bool, report: 
                 );
                 // One chain's failure is every later chain's failure — they share links — so
                 // the first is the finding and the rest would be the same fault restated.
-                return;
+                return Ok(());
             }
         };
         // Composing a chain reads Chunk and Delta Chunk records and nothing else, so an SH
@@ -894,7 +950,7 @@ fn check_keyframe_delta(data: &[u8], framing: Framing, unindexed: bool, report: 
                         ),
                     }),
                 );
-                return;
+                return Ok(());
             }
         }
     }
@@ -904,11 +960,11 @@ fn check_keyframe_delta(data: &[u8], framing: Framing, unindexed: bool, report: 
             "Header declares {} distinct gaussians; keyframes and birth groups introduce {count}",
             sequence.header.gaussian_count
         )),
-        Err(error) => report.error(format!(
-            "the validator's bounded identity counter failed: {error}"
-        )),
+        Err(error) if matches!(error, fourdgs::Error::Io(_)) => return Err(error),
+        Err(error) => report.error(format!("the file's identities are invalid: {error}")),
         _ => {}
     }
+    Ok(())
 }
 
 /// The same verdict for a `keyframe-delta` file with no index, which has to be read front to
@@ -917,7 +973,7 @@ fn check_keyframe_delta(data: &[u8], framing: Framing, unindexed: bool, report: 
 /// Record by record, retaining only the current state and its GOP keyframe. That is enough
 /// for both delta modes, makes every semantic composition refusal observable, and stays
 /// bounded independently of sequence length.
-fn check_keyframe_delta_streamed(data: &[u8], framing: Framing, report: &mut Report) {
+fn check_keyframe_delta_streamed(data: &[u8], framing: Framing, report: &mut Report) -> Result<()> {
     let mut windows: Vec<(f64, f64)> = Vec::new();
     let mut header: Option<rec::Header> = None;
     let mut quantization: Option<rec::Quantization> = None;
@@ -925,20 +981,21 @@ fn check_keyframe_delta_streamed(data: &[u8], framing: Framing, report: &mut Rep
     let mut keyframe: Option<(u64, u32, fourdgs::keyframe_delta::State)> = None;
     let mut previous_t1: Option<f64> = None;
     let mut band_count: Option<usize> = None;
-    let mut identities = match IdentityCounter::new() {
-        Ok(counter) => counter,
-        Err(error) => {
-            report.error(format!(
-                "the validator cannot create its bounded identity counter: {error}"
-            ));
-            return;
-        }
-    };
+    let mut identities = IdentityCounter::new()?;
 
-    for frame in framing.walk.intact_records() {
-        let Some(content) = frame.content(data) else {
-            continue;
+    for record in Records::new(data, MAGIC.len()) {
+        let record = match record {
+            Ok(record) => record,
+            // The structural pass already reports a cut or malformed framing.  Stop at
+            // the same byte without retaining the frames that led here.
+            Err(_) => break,
         };
+        let frame = refusal::Frame {
+            opcode: record.opcode,
+            offset: record.offset as u64,
+            length: record.content.len() as u64,
+        };
+        let content = record.content;
         let outcome: Result<()> = match frame.opcode {
             op::HEADER => rec::Header::parse(content).and_then(|parsed| {
                 if parsed.temporal_model != "keyframe-delta" {
@@ -1112,6 +1169,9 @@ fn check_keyframe_delta_streamed(data: &[u8], framing: Framing, report: &mut Rep
             _ => continue,
         };
         if let Err(error) = outcome {
+            if matches!(error, fourdgs::Error::Io(_)) {
+                return Err(error);
+            }
             let prefix = if matches!(frame.opcode, op::HEADER | op::QUANTIZATION) {
                 "a seeking reader cannot open this file: "
             } else {
@@ -1126,7 +1186,7 @@ fn check_keyframe_delta_streamed(data: &[u8], framing: Framing, report: &mut Rep
                     what: format!("the {} record", op::name(frame.opcode)),
                 }),
             );
-            return;
+            return Ok(());
         }
     }
 
@@ -1142,12 +1202,12 @@ fn check_keyframe_delta_streamed(data: &[u8], framing: Framing, report: &mut Rep
                 "Header declares {} distinct gaussians; keyframes and birth groups introduce {count}",
                 header.gaussian_count
             )),
-            Err(error) => report.error(format!(
-                "the validator's bounded identity counter failed: {error}"
-            )),
+            Err(error) if matches!(error, fourdgs::Error::Io(_)) => return Err(error),
+            Err(error) => report.error(format!("the file's identities are invalid: {error}")),
             _ => {}
         }
     }
+    Ok(())
 }
 
 /// Every step and origin must be finite (spec §5.3).
