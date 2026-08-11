@@ -575,15 +575,23 @@ public func chunkIndexEntries(_ bytes: [UInt8], _ walk: Walk) -> [IndexEntry] {
     (try? chunkIndexEntries(ToolReader(InMemoryReader(bytes)), walk)) ?? []
 }
 
-/// Whether the first whole Header declares `keyframe-delta`, using only bounded ranges.
+/// The bounded Header fields structural validation needs.
+struct HeaderDispatch {
+    let keyframeDelta: Bool
+    let durationSec: Double
+    /// Absolute byte of the fourteen-byte `temporal_model` value.
+    let temporalModelOffset: UInt64
+}
+
+/// The first whole Header's duration and temporal-model dispatch, using only bounded ranges.
 ///
 /// The two strings before `temporal_model` have no small length cap, so a fixed prefix cannot
 /// reach the model in every conforming Header. Their four-byte lengths are enough to skip them;
 /// only the model itself is read, and only when it has exactly the fourteen bytes needed to equal
-/// the one value this validator dispatches specially. A malformed Header returns `false` here and
-/// is diagnosed by the ordinary gaussian-birth reader rather than by a second Header parser.
-func isKeyframeDelta(_ source: ToolReader, _ walk: Walk) throws -> Bool {
-    guard let frame = walk.firstIntact(Opcode.header) else { return false }
+/// the one value this validator dispatches specially. A malformed Header returns `nil` here and is
+/// diagnosed by the ordinary gaussian-birth reader rather than by a second Header parser.
+func headerDispatch(_ source: ToolReader, _ walk: Walk) throws -> HeaderDispatch? {
+    guard let frame = walk.firstIntact(Opcode.header) else { return nil }
     let content = frame.offset + recordHeaderSize
     var relative: UInt64 = 0
 
@@ -597,21 +605,35 @@ func isKeyframeDelta(_ source: ToolReader, _ walk: Walk) throws -> Bool {
         return length
     }
 
-    guard let profileLength = try stringLength() else { return false }
+    guard let profileLength = try stringLength() else { return nil }
     relative += profileLength
-    guard let libraryLength = try stringLength() else { return false }
+    guard let libraryLength = try stringLength() else { return nil }
     relative += libraryLength
 
     // duration_sec, gaussian_count, cutoff.
     let fixed: UInt64 = 24
-    guard relative <= frame.length, frame.length - relative >= fixed else { return false }
+    guard relative <= frame.length, frame.length - relative >= fixed else { return nil }
+    let durationBytes = try source.exactly(
+        offset: content + relative, count: 8, record: "Header duration_sec")
+    guard let durationSec = readF64(durationBytes, at: 0) else { return nil }
     relative += fixed
-    guard let modelLength = try stringLength() else { return false }
+    guard let modelLength = try stringLength() else { return nil }
     let expected = Array("keyframe-delta".utf8)
-    guard modelLength == UInt64(expected.count) else { return false }
+    guard modelLength == UInt64(expected.count) else {
+        return HeaderDispatch(
+            keyframeDelta: false, durationSec: durationSec,
+            temporalModelOffset: content + relative)
+    }
     let model = try source.exactly(
         offset: content + relative, count: expected.count, record: "Header temporal_model")
-    return model == expected
+    return HeaderDispatch(
+        keyframeDelta: model == expected, durationSec: durationSec,
+        temporalModelOffset: content + relative)
+}
+
+/// Compatibility shape used by focused dispatch tests.
+func isKeyframeDelta(_ source: ToolReader, _ walk: Walk) throws -> Bool {
+    try headerDispatch(source, walk)?.keyframeDelta ?? false
 }
 
 /// What the Footer declares about the summary checksum, and where the summary ends.
@@ -623,8 +645,8 @@ public struct SummaryDeclaration {
     public let end: UInt64
 }
 
-/// Empty when the file has no Footer, or declares no summary checksum — which is a property of
-/// the file rather than a failure, because writing one is an encoder option.
+/// Empty when the file has no Footer or declares no summary range. The range remains present when
+/// `summary_crc == 0`: checksum is optional, summary structure is not.
 func summaryDeclaration(_ source: ToolReader, _ walk: Walk) throws -> SummaryDeclaration? {
     // A whole Footer only. A file cut inside its own Footer has a record whose declared length is
     // the fault and whose content is not there, and reading a summary declaration out of it would
@@ -638,7 +660,7 @@ func summaryDeclaration(_ source: ToolReader, _ walk: Walk) throws -> SummaryDec
     guard frame.length >= fields else { return nil }
     let bytes = try source.exactly(offset: content, count: Int(fields), record: "Footer")
     guard let start = readU64(bytes, at: 0), let crc = readU32(bytes, at: 16) else { return nil }
-    guard crc != 0, start != 0 else { return nil }
+    guard start != 0 else { return nil }
     // The summary ends where the Footer begins — taken from the walk rather than computed from a
     // footer's expected size, so a Footer that a later revision extends does not move the region
     // out from under the check.
@@ -674,8 +696,8 @@ public struct Coverage {
 /// Empty when the file declares no summary checksum, which is a property of the file rather than
 /// a failure: writing one is an encoder option.
 func coverage(_ source: ToolReader, _ walk: Walk) throws -> Coverage? {
-    guard let declared = try summaryDeclaration(source, walk), declared.start <= declared.end,
-        declared.end <= walk.size
+    guard let declared = try summaryDeclaration(source, walk), declared.crc != 0,
+        declared.start <= declared.end, declared.end <= walk.size
     else { return nil }
 
     // One fixed-size buffer at a time. `ByteRangeReader` returns owned bytes, so the storage is

@@ -308,6 +308,32 @@ final class ValidateTests: XCTestCase {
             }, "\(report.findings.map(\.message))")
     }
 
+    /// Band addresses are independent ranges in the Chunk Index. Accepting a prefix of a framed
+    /// SH Band Stream would let an indexed reader see different bytes than the physical scan.
+    func testAnIndexedBandLengthMustEqualThePhysicalFrame() throws {
+        try requireCorpus()
+        let variant = "MixedLifetimes-SHDegree3-UseChunkIndex-UseCrc.4dgs"
+        var bytes = try readFixture(corpusDirectory().appendingPathComponent(variant))
+        let walked = try walk(bytes)
+        let frames = walked.records.filter { $0.opcode == Opcode.chunkIndex }
+        let entries = chunkIndexEntries(bytes, walked)
+        let entryIndex = try XCTUnwrap(entries.firstIndex { !$0.bands.isEmpty })
+        let band = entries[entryIndex].bands[0]
+        XCTAssertEqual(frames.count, entries.count)
+        writeU64(
+            band.length + 1, into: &bytes,
+            at: frames[entryIndex].offset + recordHeaderSize + 40 + 9)
+
+        let report = validate(bytes)
+        XCTAssertFalse(report.ok)
+        XCTAssertTrue(
+            report.findings.contains {
+                $0.message.contains(
+                    "chunk index entry \(entryIndex) declares \(band.length + 1) bytes")
+                    && $0.message.contains("its framed length is \(band.length) bytes")
+            }, "\(report.findings.map(\.message))")
+    }
+
     /// An index may not hide physical data by naming only a subset. The unknown codec lives in the
     /// first Chunk; redirecting its entry to the second makes that Chunk absent from the index, so
     /// only the bounded physical scan can still find the refusal.
@@ -361,6 +387,48 @@ final class ValidateTests: XCTestCase {
             }, "\(report.findings.map(\.message))")
     }
 
+    /// A zero checksum disables integrity checking, not the Footer's declaration that the byte
+    /// range is a summary. Its record-family and boundary rules still apply.
+    func testSummaryStructureIsCheckedWhenItsCRCIsZero() throws {
+        try requireCorpus()
+        let variant =
+            "TenWindows-UseChunkIndex-UseChunks-UseCrc-UseStatistics-UseSummaryOffset.4dgs"
+        var bytes = try readFixture(corpusDirectory().appendingPathComponent(variant))
+        let walked = try walk(bytes)
+        let statistics = try XCTUnwrap(walked.firstIntact(Opcode.statistics))
+        let footer = try XCTUnwrap(walked.firstIntact(Opcode.footer))
+        bytes[Int(statistics.offset)] = Opcode.privateStart
+        writeU32(0, into: &bytes, at: footer.offset + recordHeaderSize + 16)
+
+        let report = validate(bytes)
+        XCTAssertFalse(report.ok)
+        XCTAssertFalse(report.findings.contains { $0.message.hasPrefix("summary CRC mismatch") })
+        XCTAssertTrue(
+            report.findings.contains {
+                $0.message
+                    == "the Footer's summary contains Private(0x80) at byte "
+                    + "\(statistics.offset); expected only ChunkIndex, Statistics, or "
+                    + "SummaryOffset records"
+            }, "\(report.findings.map(\.message))")
+    }
+
+    func testGaussianBirthRejectsAPhysicalDeltaChunk() throws {
+        try requireCorpus()
+        var bytes = try readFixture(corpusDirectory().appendingPathComponent(provenanceVariant))
+        let walked = try walk(bytes)
+        let chunk = try XCTUnwrap(walked.firstIntact(Opcode.chunk))
+        bytes[Int(chunk.offset)] = Opcode.deltaChunk
+
+        let report = validate(bytes)
+        XCTAssertFalse(report.ok)
+        XCTAssertTrue(
+            report.findings.contains {
+                $0.message
+                    == "the gaussian-birth file contains DeltaChunk at byte \(chunk.offset); "
+                    + "DeltaChunk belongs only to keyframe-delta"
+            }, "\(report.findings.map(\.message))")
+    }
+
     func testKeyframeDeltaIndexDiagnosticNamesBothLegalTargets() throws {
         try requireCorpus()
         let file = try XCTUnwrap(
@@ -396,6 +464,119 @@ final class ValidateTests: XCTestCase {
         XCTAssertTrue(
             report.findings.contains { $0.message.hasPrefix("state chunks overlap:") },
             "\(report.findings.map(\.message))")
+    }
+
+    func testKeyframeDeltaTimelineMustCoverTheHeaderDuration() throws {
+        try requireCorpus()
+        let file = try XCTUnwrap(
+            variants(corpusDirectory().appendingPathComponent("keyframe")).first)
+        let original = try readFixture(file)
+        let walked = try walk(original)
+        let frames = walked.records.filter { $0.opcode == Opcode.chunkIndex }
+        let entries = chunkIndexEntries(original, walked)
+        XCTAssertEqual(frames.count, entries.count)
+
+        let first = try XCTUnwrap(entries.indices.min { entries[$0].t0 < entries[$1].t0 })
+        let firstPhysical = try XCTUnwrap(
+            walked.records.first { $0.offset == entries[first].offset })
+        var lateStart = original
+        writeU64(0.25.bitPattern, into: &lateStart, at: frames[first].offset + recordHeaderSize)
+        writeU64(
+            0.25.bitPattern, into: &lateStart,
+            at: firstPhysical.offset + recordHeaderSize)
+        let startReport = validate(lateStart)
+        XCTAssertTrue(
+            startReport.findings.contains {
+                $0.message
+                    == "state chunks start at 0.25; expected the keyframe-delta timeline to start at 0"
+            }, "\(startReport.findings.map(\.message))")
+
+        let last = try XCTUnwrap(entries.indices.max { entries[$0].t1 < entries[$1].t1 })
+        let lastPhysical = try XCTUnwrap(
+            walked.records.first { $0.offset == entries[last].offset })
+        let earlyEnd = entries[last].t1 - 0.25
+        var shortEnd = original
+        writeU64(
+            earlyEnd.bitPattern, into: &shortEnd,
+            at: frames[last].offset + recordHeaderSize + 8)
+        writeU64(
+            earlyEnd.bitPattern, into: &shortEnd,
+            at: lastPhysical.offset + recordHeaderSize + 8)
+        let endReport = validate(shortEnd)
+        XCTAssertTrue(
+            endReport.findings.contains {
+                $0.message
+                    == "state chunks end at \(earlyEnd); expected Header duration_sec "
+                    + "\(entries[last].t1)"
+            }, "\(endReport.findings.map(\.message))")
+    }
+
+    /// Both state-record kinds reach the ordinary stream decoder through bounded virtual files.
+    /// An unimplemented codec in either one must therefore be a refusal, not skipped bytes.
+    func testKeyframeAndDeltaStreamsAreDecoded() throws {
+        try requireCorpus()
+        let file = corpusDirectory().appendingPathComponent(
+            "keyframe/KeyframeDelta-UseChunkIndex-UseCrc-UseStatistics.4dgs")
+        let original = try readFixture(file)
+        let walked = try walk(original)
+
+        var keyframeBytes = original
+        let keyframe = try XCTUnwrap(walked.firstIntact(Opcode.chunk))
+        keyframeBytes[Int(keyframe.offset + recordHeaderSize + 44 + 3)] = 9
+        let keyframeReport = validate(keyframeBytes)
+        XCTAssertFalse(keyframeReport.ok)
+        XCTAssertTrue(
+            keyframeReport.findings.compactMap(\.refusal).contains {
+                $0.code == .unknownStreamCodec
+            }, "\(keyframeReport.findings.map(\.message))")
+
+        var deltaBytes = original
+        let delta = try XCTUnwrap(walked.firstIntact(Opcode.deltaChunk))
+        var relative: UInt64 = 71
+        var streamOffset: UInt64?
+        for _ in 0..<3 {
+            let length = try XCTUnwrap(
+                readU64(deltaBytes, at: delta.offset + recordHeaderSize + relative))
+            relative += 8
+            if length >= 17 && streamOffset == nil {
+                streamOffset = delta.offset + recordHeaderSize + relative
+            }
+            relative += length
+        }
+        let deltaStream = try XCTUnwrap(streamOffset)
+        deltaBytes[Int(deltaStream + 3)] = 9
+        let deltaReport = validate(deltaBytes)
+        XCTAssertFalse(deltaReport.ok)
+        XCTAssertTrue(
+            deltaReport.findings.compactMap(\.refusal).contains {
+                $0.code == .unknownStreamCodec
+            }, "\(deltaReport.findings.map(\.message))")
+    }
+
+    /// A long chained GOP is resolved once per entry. This is large enough to make the former
+    /// repeated prefix walk quadratic while remaining a small, deterministic unit test.
+    func testKeyframeDeltaChainResolutionIsLinearAfterSorting() {
+        let count = 20_000
+        let firstOffset: UInt64 = 1_000
+        let stride: UInt64 = 100
+        var entries: [IndexEntry] = []
+        entries.reserveCapacity(count)
+        for i in 0..<count {
+            let offset = firstOffset + UInt64(i) * stride
+            entries.append(
+                IndexEntry(
+                    t0: Double(i), t1: Double(i + 1), offset: offset, length: stride,
+                    bands: [], extended: true, kind: i == 0 ? 0 : 1,
+                    deltaMode: i == 0 ? 0 : 1,
+                    referenceOffset: i == 0 ? 0 : offset - stride,
+                    keyframeOffset: firstOffset, depth: UInt16(i), liveCount: 1))
+        }
+        var report = Report()
+
+        validateKeyframeDeltaIndex(
+            entries, fields: [:], durationSec: Double(count), report: &report)
+
+        XCTAssertTrue(report.ok, "\(report.findings.map(\.message))")
     }
 
     func testKeyframeDeltaRejectsAForwardReferenceAndIndexRecordDisagreement() throws {

@@ -64,7 +64,7 @@ private func printText(
         out.line(
             "crc: the Footer's summary checksum covers bytes \(commas(covered.start)).."
                 + "\(commas(covered.end)); `-` is a record it does not cover")
-    } else if let declared {
+    } else if let declared, declared.start > declared.end {
         out.line(
             "crc: INVALID: the Footer's summary starts at \(commas(declared.start)), after "
                 + "the summary ends at \(commas(declared.end))")
@@ -91,7 +91,7 @@ private func printJson(
         out.line(
             "  \"summary_crc\": {\"start\": \(covered.start), \"end\": \(covered.end), "
                 + "\"ok\": \(covered.ok)},")
-    } else if let declared {
+    } else if let declared, declared.start > declared.end {
         out.line(
             "  \"summary_crc\": {\"start\": \(declared.start), \"end\": \(declared.end), "
                 + "\"ok\": null, \"error\": \"start is after end\"},")
