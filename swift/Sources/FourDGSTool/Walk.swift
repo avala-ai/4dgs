@@ -316,7 +316,9 @@ public struct IndexEntry {
     public let liveCount: UInt64
 }
 
-func chunkIndexEntries(_ source: ToolReader, _ walk: Walk) throws -> [IndexEntry] {
+func chunkIndexEntries(
+    _ source: ToolReader, _ walk: Walk, within summaryRange: Range<UInt64>? = nil
+) throws -> [IndexEntry] {
     let t0Field: UInt64 = 0
     let t1Field: UInt64 = 8
     let offsetField: UInt64 = 16
@@ -326,6 +328,12 @@ func chunkIndexEntries(_ source: ToolReader, _ walk: Walk) throws -> [IndexEntry
     let deltaBlockSize: UInt64 = 28
     var out: [IndexEntry] = []
     for frame in walk.intactRecords where frame.opcode == Opcode.chunkIndex {
+        if let summaryRange {
+            let (end, overflow) = frame.offset.addingReportingOverflow(frame.total)
+            guard !overflow, summaryRange.contains(frame.offset), end <= summaryRange.upperBound else {
+                continue
+            }
+        }
         let content = frame.offset + recordHeaderSize
         guard frame.length >= prefix else {
             throw FourDGSError.malformed(
@@ -400,6 +408,9 @@ public func chunkIndexEntries(_ bytes: [UInt8], _ walk: Walk) -> [IndexEntry] {
 struct HeaderDispatch {
     let keyframeDelta: Bool
     let durationSec: Double
+    let gaussianCount: UInt64
+    let shDegree: UInt8
+    let hasAudio: Bool
     let temporalModelOffset: UInt64
 }
 
@@ -425,22 +436,27 @@ func headerDispatch(_ source: ToolReader, _ walk: Walk) throws -> HeaderDispatch
 
     let fixed: UInt64 = 24
     guard relative <= frame.length, frame.length - relative >= fixed else { return nil }
-    let durationBytes = try source.exactly(
-        offset: content + relative, count: 8, record: "Header duration_sec")
-    guard let durationSec = readF64(durationBytes, at: 0) else { return nil }
+    let fixedBytes = try source.exactly(
+        offset: content + relative, count: Int(fixed), record: "Header fixed fields")
+    guard let durationSec = readF64(fixedBytes, at: 0),
+        let gaussianCount = readU64(fixedBytes, at: 8)
+    else { return nil }
     relative += fixed
     guard let modelLength = try stringLength() else { return nil }
-    let expected = Array("keyframe-delta".utf8)
-    guard modelLength == UInt64(expected.count) else {
-        return HeaderDispatch(
-            keyframeDelta: false, durationSec: durationSec,
-            temporalModelOffset: content + relative)
-    }
+    let modelOffset = content + relative
+    guard modelLength <= frame.length - relative else { return nil }
     let model = try source.exactly(
-        offset: content + relative, count: expected.count, record: "Header temporal_model")
+        offset: modelOffset, count: Int(modelLength), record: "Header temporal_model")
+    relative += modelLength
+    let afterModel: UInt64 = 48 + 2
+    guard relative <= frame.length, frame.length - relative >= afterModel else { return nil }
+    let degreeAndFlags = try source.exactly(
+        offset: content + relative + 48, count: 2, record: "Header sh_degree and flags")
+    let expected = Array("keyframe-delta".utf8)
     return HeaderDispatch(
         keyframeDelta: model == expected, durationSec: durationSec,
-        temporalModelOffset: content + relative)
+        gaussianCount: gaussianCount, shDegree: degreeAndFlags[0],
+        hasAudio: degreeAndFlags[1] & 1 != 0, temporalModelOffset: modelOffset)
 }
 
 func isKeyframeDelta(_ source: ToolReader, _ walk: Walk) throws -> Bool {

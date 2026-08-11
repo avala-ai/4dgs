@@ -108,7 +108,7 @@ before it a streamed reader keeps.
 `validate` checks the file and, when the reader refuses it, prints the refusal identifier and the
 byte it fired at beneath the finding it belongs to — the same identifiers the conformance corpus is
 written against, and the same bytes the Rust and C++ tools print. Exit codes: `0` valid, `1` refused
-or invalid, `2` valid with warnings, `3` the tool could not run.
+or invalid, `2` warnings or incomplete validation, `3` the tool could not run.
 
 The tool's own tests run it in-process, so `swift test` covers the commands and their exit codes;
 they read the generated corpus and skip themselves when it is not on disk.

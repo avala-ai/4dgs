@@ -8,6 +8,7 @@
 
 import FourDGS
 import CFourDGS
+import Foundation
 
 func readU16(_ bytes: [UInt8], at: UInt64) -> UInt16? {
     guard at <= UInt64(bytes.count), UInt64(bytes.count) - at >= 2 else { return nil }
@@ -67,17 +68,27 @@ private struct SourceSlice {
     let offset: UInt64
     let length: UInt64
     let literal: [UInt8]?
+    let reader: ToolReader?
 
     init(offset: UInt64, length: UInt64) {
         self.offset = offset
         self.length = length
         self.literal = nil
+        self.reader = nil
+    }
+
+    init(reader: ToolReader, offset: UInt64, length: UInt64) {
+        self.offset = offset
+        self.length = length
+        self.literal = nil
+        self.reader = reader
     }
 
     init(literal: [UInt8]) {
         self.offset = 0
         self.length = UInt64(literal.count)
         self.literal = literal
+        self.reader = nil
     }
 }
 
@@ -127,7 +138,7 @@ private struct SlicedReader: ByteRangeReader {
                 guard let readOffset = Int64(exactly: slice.offset + within) else {
                     throw FourDGSError.invalidRange(offset: Int64.max, count: Int(take))
                 }
-                bytes = try source.read(offset: readOffset, count: Int(take))
+                bytes = try (slice.reader ?? source).read(offset: readOffset, count: Int(take))
             }
             out.append(contentsOf: bytes)
             logical += UInt64(bytes.count)
@@ -143,6 +154,7 @@ struct ChunkFields {
     let t0: Double
     let t1: Double
     let level: UInt32
+    let count: UInt32
     let deltaMode: UInt8
     let referenceOffset: UInt64
     let keyframeOffset: UInt64
@@ -151,12 +163,13 @@ struct ChunkFields {
 
 private struct PhysicalValidation {
     var fields: [UInt64: ChunkFields] = [:]
+    var gaussianCount: UInt64 = 0
     var indexSafe = true
     var chunkRefused = false
 }
 
 private func chunkFields(_ source: ToolReader, _ frame: Frame) throws -> ChunkFields? {
-    let fixed: UInt64 = frame.opcode == Opcode.deltaChunk ? 39 : 20
+    let fixed: UInt64 = frame.opcode == Opcode.deltaChunk ? 39 : 24
     guard frame.length >= fixed else { return nil }
     let bytes = try source.exactly(
         offset: frame.offset + recordHeaderSize, count: Int(fixed), record: opcodeName(frame.opcode))
@@ -164,15 +177,17 @@ private func chunkFields(_ source: ToolReader, _ frame: Frame) throws -> ChunkFi
         let level = readU32(bytes, at: 16)
     else { return nil }
     if frame.opcode == Opcode.chunk {
+        guard let count = readU32(bytes, at: 20) else { return nil }
         return ChunkFields(
-            opcode: frame.opcode, t0: t0, t1: t1, level: level, deltaMode: 0,
+            opcode: frame.opcode, t0: t0, t1: t1, level: level, count: count, deltaMode: 0,
             referenceOffset: 0, keyframeOffset: frame.offset, depth: 0)
     }
     guard let referenceOffset = readU64(bytes, at: 21),
         let keyframeOffset = readU64(bytes, at: 29), let depth = readU16(bytes, at: 37)
     else { return nil }
     return ChunkFields(
-        opcode: frame.opcode, t0: t0, t1: t1, level: level, deltaMode: bytes[20],
+        opcode: frame.opcode, t0: t0, t1: t1, level: level, count: 0,
+        deltaMode: bytes[20],
         referenceOffset: referenceOffset, keyframeOffset: keyframeOffset, depth: depth)
 }
 
@@ -225,59 +240,128 @@ private func malformedDelta(_ frame: Frame, _ reason: String) -> FourDGSError {
         reason: reason)
 }
 
-private func inflated(_ bytes: [UInt8], expected: UInt64, frame: Frame) throws -> [UInt8] {
-    guard let count = Int(exactly: expected) else {
-        throw malformedDelta(frame, "uncompressed_size is larger than this platform can address")
+private func malformedStateStreams(_ frame: Frame, _ reason: String) -> FourDGSError {
+    if frame.opcode == Opcode.deltaChunk { return malformedDelta(frame, reason) }
+    return .malformed(
+        offset: Int64(clamping: frame.offset), record: opcodeName(frame.opcode), field: "streams",
+        reason: reason)
+}
+
+private final class TemporaryFileReader: ByteRangeReader {
+    private let url: URL
+    private let handle: FileHandle
+    private let count: Int64
+
+    init(url: URL, count: UInt64) throws {
+        guard let signedCount = Int64(exactly: count) else {
+            throw FourDGSError.invalidRange(offset: Int64.max, count: 0)
+        }
+        guard let handle = FileHandle(forReadingAtPath: url.path) else {
+            throw FourDGSError.unreadableSource(
+                description: "cannot reopen temporary inflated state")
+        }
+        self.url = url
+        self.handle = handle
+        self.count = signedCount
     }
-    guard let inputCount = uInt(exactly: bytes.count) else {
-        throw malformedDelta(frame, "compressed records exceed zlib's per-stream input limit")
+
+    deinit {
+        try? handle.close()
+        try? FileManager.default.removeItem(at: url)
     }
+
+    func byteCount() throws -> Int64 { count }
+
+    func read(offset: Int64, count: Int) throws -> [UInt8] {
+        guard offset >= 0, count >= 0 else {
+            throw FourDGSError.invalidRange(offset: offset, count: count)
+        }
+        try handle.seek(toOffset: UInt64(offset))
+        return [UInt8](handle.readData(ofLength: count))
+    }
+}
+
+private func inflatedReader(
+    _ source: ToolReader, offset: UInt64, length: UInt64, expected: UInt64, frame: Frame
+) throws -> ToolReader {
     var stream = z_stream()
     let initialized = inflateInit_(&stream, zlibVersion(), Int32(MemoryLayout<z_stream>.size))
     guard initialized == Z_OK else {
-        throw malformedDelta(frame, "deflate could not initialize (zlib status \(initialized))")
+        throw malformedStateStreams(
+            frame, "deflate could not initialize (zlib status \(initialized))")
     }
     defer { inflateEnd(&stream) }
 
-    // Grow only from bytes the codec actually produces. A forged large declaration must not
-    // reserve that much memory before the compressed input has substantiated it.
-    var output: [UInt8] = []
-    var block = [UInt8](repeating: 0, count: min(64 * 1024, max(count, 1)))
+    let url = FileManager.default.temporaryDirectory.appendingPathComponent(
+        "4dgs-validate-\(UUID().uuidString).inflate")
+    guard FileManager.default.createFile(atPath: url.path, contents: nil),
+        let outputHandle = FileHandle(forWritingAtPath: url.path)
+    else {
+        throw FourDGSError.unreadableSource(
+            description: "cannot create temporary storage for inflated state")
+    }
+    var keepFile = false
+    defer {
+        try? outputHandle.close()
+        if !keepFile { try? FileManager.default.removeItem(at: url) }
+    }
+
+    let blockSize = 64 * 1024
+    var output = [UInt8](repeating: 0, count: blockSize)
     var status = Int32(Z_OK)
-    try bytes.withUnsafeBytes { input in
-        stream.next_in = UnsafeMutablePointer(
-            mutating: input.bindMemory(to: Bytef.self).baseAddress)
-        stream.avail_in = inputCount
-        repeat {
-            let remaining = count - output.count
-            let wanted = min(block.count, max(remaining, 1))
-            let produced = block.withUnsafeMutableBytes { destination in
-                stream.next_out = destination.bindMemory(to: Bytef.self).baseAddress
-                stream.avail_out = uInt(wanted)
-                status = CFourDGS.inflate(&stream, Z_NO_FLUSH)
-                return wanted - Int(stream.avail_out)
+    var inputAt: UInt64 = 0
+    var producedTotal: UInt64 = 0
+    while inputAt < length, status != Z_STREAM_END {
+        let inputCount = Int(min(UInt64(blockSize), length - inputAt))
+        let input = try source.exactly(
+            offset: offset + inputAt, count: inputCount, record: "compressed state records")
+        try input.withUnsafeBytes { bytes in
+            stream.next_in = UnsafeMutablePointer(
+                mutating: bytes.bindMemory(to: Bytef.self).baseAddress)
+            stream.avail_in = uInt(inputCount)
+            repeat {
+                let produced = output.withUnsafeMutableBytes { destination in
+                    stream.next_out = destination.bindMemory(to: Bytef.self).baseAddress
+                    stream.avail_out = uInt(blockSize)
+                    status = CFourDGS.inflate(&stream, Z_NO_FLUSH)
+                    return blockSize - Int(stream.avail_out)
+                }
+                let (newTotal, overflow) = producedTotal.addingReportingOverflow(UInt64(produced))
+                guard !overflow, newTotal <= expected else {
+                    throw malformedStateStreams(
+                        frame, "deflate expands past the declared \(expected) bytes")
+                }
+                if produced > 0 {
+                    try outputHandle.write(contentsOf: Data(output[..<produced]))
+                    producedTotal = newTotal
+                }
+                guard status == Z_OK || status == Z_STREAM_END else {
+                    throw malformedStateStreams(
+                        frame, "deflate could not be decoded (zlib status \(status))")
+                }
+                if status == Z_OK, produced == 0, stream.avail_in == 0 { break }
+            } while stream.avail_in > 0 && status != Z_STREAM_END
+            if status == Z_STREAM_END, stream.avail_in != 0 {
+                throw malformedStateStreams(frame, "bytes remain after the deflate stream")
             }
-            if remaining == 0, produced > 0 {
-                throw malformedDelta(
-                    frame, "deflate expands past the declared \(count) bytes")
-            }
-            output.append(contentsOf: block[..<produced])
-            guard status == Z_OK || status == Z_STREAM_END else {
-                throw malformedDelta(frame, "deflate could not be decoded (zlib status \(status))")
-            }
-            if status == Z_OK, produced == 0, stream.avail_in == 0 {
-                throw malformedDelta(frame, "deflate ended after \(output.count) of \(count) bytes")
-            }
-        } while status != Z_STREAM_END
+        }
+        inputAt += UInt64(inputCount)
     }
-    guard output.count == count else {
-        throw malformedDelta(
-            frame, "deflate produced \(output.count) of the declared \(count) bytes")
+    guard status == Z_STREAM_END else {
+        throw malformedStateStreams(
+            frame, "deflate ended after \(producedTotal) of \(expected) bytes")
     }
-    guard stream.avail_in == 0 else {
-        throw malformedDelta(frame, "bytes remain after the deflate stream")
+    guard inputAt == length else {
+        throw malformedStateStreams(frame, "bytes remain after the deflate stream")
     }
-    return output
+    guard producedTotal == expected else {
+        throw malformedStateStreams(
+            frame, "deflate produced \(producedTotal) of the declared \(expected) bytes")
+    }
+    try outputHandle.close()
+    let reader = try ToolReader(TemporaryFileReader(url: url, count: producedTotal))
+    keepFile = true
+    return reader
 }
 
 func deltaGroups(_ source: ToolReader, _ frame: Frame) throws -> [DeltaGroup] {
@@ -330,7 +414,7 @@ func deltaGroups(_ source: ToolReader, _ frame: Frame) throws -> [DeltaGroup] {
     let recordsEnd: UInt64
     if compression.isEmpty {
         guard uncompressed == recordsLength else {
-            throw malformedDelta(
+            throw malformedStateStreams(
                 frame,
                 "uncompressed_size is \(uncompressed), but the records blob is \(recordsLength) bytes")
         }
@@ -343,13 +427,9 @@ func deltaGroups(_ source: ToolReader, _ frame: Frame) throws -> [DeltaGroup] {
                 offset: Int64(clamping: content + compressionLengthAt + 4), record: "DeltaChunk",
                 name: compression, refusal: .unknownStreamCodec)
         }
-        guard let compressedCount = Int(exactly: recordsLength) else {
-            throw malformedDelta(frame, "records length is larger than this platform can address")
-        }
-        let compressed = try source.exactly(
-            offset: content + relative, count: compressedCount, record: "DeltaChunk records")
-        recordsSource = ToolReader(
-            InMemoryReader(try inflated(compressed, expected: uncompressed, frame: frame)))
+        recordsSource = try inflatedReader(
+            source, offset: content + relative, length: recordsLength, expected: uncompressed,
+            frame: frame)
         recordsStart = 0
         recordsEnd = uncompressed
     }
@@ -379,13 +459,71 @@ func deltaGroups(_ source: ToolReader, _ frame: Frame) throws -> [DeltaGroup] {
     return groups
 }
 
+private func keyframeGroup(_ source: ToolReader, _ frame: Frame) throws -> DeltaGroup {
+    let content = frame.offset + recordHeaderSize
+    let compressionLengthAt: UInt64 = 24
+    guard frame.length >= compressionLengthAt + 4,
+        let fields = try chunkFields(source, frame)
+    else {
+        throw malformedStateStreams(frame, "the fixed fields and compression length do not fit")
+    }
+    let compressionField = try source.exactly(
+        offset: content + compressionLengthAt, count: 4, record: "Chunk compression length")
+    let compressionLength = UInt64(readU32(compressionField, at: 0) ?? 0)
+    var relative = compressionLengthAt + 4
+    guard compressionLength <= frame.length - relative,
+        let compressionCount = Int(exactly: compressionLength)
+    else {
+        throw malformedStateStreams(frame, "compression string runs past the record")
+    }
+    let compressionBytes = try source.exactly(
+        offset: content + relative, count: compressionCount, record: "Chunk compression")
+    guard let compression = String(bytes: compressionBytes, encoding: .utf8) else {
+        throw malformedStateStreams(frame, "compression is not UTF-8")
+    }
+    relative += compressionLength
+    guard relative <= frame.length, frame.length - relative >= 16 else {
+        throw malformedStateStreams(frame, "stream length does not fit after compression")
+    }
+    let lengths = try source.exactly(
+        offset: content + relative, count: 16, record: "Chunk stream length")
+    let uncompressed = readU64(lengths, at: 0) ?? 0
+    let streamLength = readU64(lengths, at: 8) ?? 0
+    relative += 16
+    guard streamLength <= frame.length - relative, relative + streamLength == frame.length else {
+        throw malformedStateStreams(frame, "stream blob does not occupy the rest of the record")
+    }
+
+    if compression.isEmpty {
+        guard uncompressed == streamLength else {
+            throw malformedStateStreams(
+                frame,
+                "uncompressed_size is \(uncompressed), but the stream blob is \(streamLength) bytes")
+        }
+        return DeltaGroup(
+            name: "keyframe", count: fields.count, source: source,
+            offset: content + relative, length: streamLength)
+    }
+    guard compression == "deflate" else {
+        throw FourDGSError.unsupportedCodec(
+            offset: Int64(clamping: content + compressionLengthAt + 4), record: "Chunk",
+            name: compression, refusal: .unknownStreamCodec)
+    }
+    let records = try inflatedReader(
+        source, offset: content + relative, length: streamLength, expected: uncompressed,
+        frame: frame)
+    return DeltaGroup(
+        name: "keyframe", count: fields.count, source: records, offset: 0,
+        length: uncompressed)
+}
+
 private let requiredGroupAttributes: Set<UInt8> = Set(0...10)
 private let invariantUpdateAttributes: Set<UInt8> = [8, 9, 10]
 
 private func validateGroupHeaders(_ frame: Frame, _ group: DeltaGroup) throws {
     if group.length == 0 {
         guard group.count == 0 else {
-            throw malformedDelta(
+            throw malformedStateStreams(
                 frame, "the \(group.name) group declares \(group.count) rows but has no streams")
         }
         return
@@ -394,19 +532,20 @@ private func validateGroupHeaders(_ frame: Frame, _ group: DeltaGroup) throws {
     var attributes: Set<UInt8> = []
     while relative < group.length {
         guard group.length - relative >= 17 else {
-            throw malformedDelta(frame, "the \(group.name) group ends inside a stream header")
+            throw malformedStateStreams(
+                frame, "the \(group.name) group ends inside a stream header")
         }
         let header = try group.source.exactly(
             offset: group.offset + relative, count: 17,
-            record: "DeltaChunk \(group.name) stream")
+            record: "\(opcodeName(frame.opcode)) \(group.name) stream")
         let attribute = header[0]
         guard attributes.insert(attribute).inserted else {
-            throw malformedDelta(
+            throw malformedStateStreams(
                 frame, "the \(group.name) group carries attribute \(attribute) twice")
         }
         let count = readU32(header, at: 5) ?? 0
         guard count == group.count else {
-            throw malformedDelta(
+            throw malformedStateStreams(
                 frame,
                 "the \(group.name) group declares \(group.count) rows, but attribute "
                     + "\(attribute) carries \(count)")
@@ -414,29 +553,32 @@ private func validateGroupHeaders(_ frame: Frame, _ group: DeltaGroup) throws {
         let payload = readU64(header, at: 9) ?? 0
         relative += 17
         guard payload <= group.length - relative else {
-            throw malformedDelta(
+            throw malformedStateStreams(
                 frame, "attribute \(attribute) in the \(group.name) group runs past the group")
         }
         relative += payload
     }
     guard attributes.contains(13) else {
-        throw malformedDelta(frame, "the \(group.name) group carries no gaussian_id stream")
+        throw malformedStateStreams(
+            frame, "the \(group.name) group carries no gaussian_id stream")
     }
-    if group.name == "birth" {
+    if group.name == "birth" || group.name == "keyframe" {
         let missing = requiredGroupAttributes.subtracting(attributes).sorted()
         guard missing.isEmpty else {
-            throw malformedDelta(frame, "the birth group is missing required attributes \(missing)")
+            throw malformedStateStreams(
+                frame, "the \(group.name) group is missing required attributes \(missing)")
         }
     } else if group.name == "update" {
         let forbidden = invariantUpdateAttributes.intersection(attributes).sorted()
         guard forbidden.isEmpty else {
-            throw malformedDelta(
+            throw malformedStateStreams(
                 frame, "the update group carries lifetime-invariant attributes \(forbidden)")
         }
     } else {
         let surplus = attributes.subtracting([13]).sorted()
         guard surplus.isEmpty else {
-            throw malformedDelta(frame, "the death group carries non-identity attributes \(surplus)")
+            throw malformedStateStreams(
+                frame, "the death group carries non-identity attributes \(surplus)")
         }
     }
 }
@@ -478,15 +620,8 @@ private func deltaGroupReader(
     if group.source === source {
         slices.append(SourceSlice(offset: group.offset, length: group.length))
     } else {
-        guard let length = Int(exactly: group.length) else {
-            throw malformedDelta(
-                Frame(opcode: Opcode.deltaChunk, offset: 0, length: group.length),
-                "group is larger than this platform can address")
-        }
         slices.append(
-            SourceSlice(
-                literal: try group.source.exactly(
-                    offset: group.offset, count: length, record: "DeltaChunk \(group.name) group")))
+            SourceSlice(reader: group.source, offset: group.offset, length: group.length))
     }
     for band in bands { slices.append(SourceSlice(offset: band.offset, length: band.total)) }
     return SlicedReader(source: source, slices: slices)
@@ -498,7 +633,8 @@ private func isExpectedPartialGroupError(_ error: FourDGSError, group: DeltaGrou
 
 private func validatePhysicalRecords(
     _ source: ToolReader, _ walked: Walk, index: [IndexEntry], keyframeDelta: Bool,
-    temporalModelOffset: UInt64?, summary: SummaryDeclaration?, indexBoundsSafe: Bool,
+    temporalModelOffset: UInt64?, durationSec: Double?, shDegree: UInt8?,
+    summary: SummaryDeclaration?, indexBoundsSafe: Bool,
     report: inout Report
 ) -> PhysicalValidation {
     var result = PhysicalValidation(indexSafe: indexBoundsSafe)
@@ -517,6 +653,7 @@ private func validatePhysicalRecords(
     }
     var seenBands: Set<Int> = []
     var currentState: Frame?
+    var currentStateFields: ChunkFields?
     var currentBands: [Frame] = []
     var currentBandNumbers: Set<UInt8> = []
 
@@ -526,6 +663,27 @@ private func validatePhysicalRecords(
     var firstStateError: (FourDGSError, Site)?
     var summaryStartsOnBoundary = summary?.start == summary?.end
     var summaryStructureReported = false
+    var previousPhysicalInterval: ChunkFields?
+    var physicalIntervalCount = 0
+
+    func finishGaussianBirthBands() {
+        guard !keyframeDelta, let state = currentState,
+            let fields = currentStateFields, fields.opcode == Opcode.chunk,
+            let shDegree
+        else { return }
+        let expected: Set<UInt8> =
+            fields.count == 0 || shDegree == 0 ? [] : Set(1...shDegree)
+        guard currentBandNumbers != expected else { return }
+        let missing = expected.subtracting(currentBandNumbers).sorted()
+        let extra = currentBandNumbers.subtracting(expected).sorted()
+        var details: [String] = []
+        if !missing.isEmpty { details.append("missing bands \(missing)") }
+        if !extra.isEmpty { details.append("unexpected bands \(extra)") }
+        scanReport.error(
+            "the Chunk at byte \(state.offset) declares \(fields.count) gaussians and Header "
+                + "sh_degree \(shDegree), but its physical SH Band Streams have "
+                + details.joined(separator: " and "))
+    }
 
     func physicalBandSite(_ frame: Frame) -> Site {
         guard let address = bandsByOffset[frame.offset]?.first else {
@@ -617,12 +775,25 @@ private func validatePhysicalRecords(
                         }
                         currentBands.append(frame)
                     } catch {
-                        if firstStateError == nil {
-                            firstStateError = (asFourDGS(error), physicalBandSite(frame))
+                        let stateError = asFourDGS(error)
+                        if firstStateError == nil
+                            || (firstStateError?.0.refusalCode == nil
+                                && stateError.refusalCode != nil)
+                        {
+                            firstStateError = (stateError, physicalBandSite(frame))
                         }
                     }
                     for address in bandsByOffset[frame.offset] ?? [] {
                         seenBands.insert(address.token)
+                        if currentState?.offset != index[address.entry].offset {
+                            let physical = currentState.map { String($0.offset) } ?? "no state"
+                            scanReport.error(
+                                "band \(address.band) of chunk index entry \(address.entry) points "
+                                    + "at the SH Band Stream at byte \(frame.offset), but that "
+                                    + "stream physically follows \(physical); expected Chunk or "
+                                    + "DeltaChunk at byte \(index[address.entry].offset)")
+                            result.indexSafe = false
+                        }
                         if address.length != frame.total {
                             scanReport.error(
                                 "chunk index entry \(address.entry) declares \(address.length) "
@@ -677,8 +848,12 @@ private func validatePhysicalRecords(
                                 path: .streamed)
                         }
                     } catch {
-                        if firstStateError == nil {
-                            firstStateError = (asFourDGS(error), physicalBandSite(frame))
+                        let stateError = asFourDGS(error)
+                        if firstStateError == nil
+                            || (firstStateError?.0.refusalCode == nil
+                                && stateError.refusalCode != nil)
+                        {
+                            firstStateError = (stateError, physicalBandSite(frame))
                         }
                     }
                     return
@@ -687,7 +862,9 @@ private func validatePhysicalRecords(
                 guard frame.opcode == Opcode.chunk || frame.opcode == Opcode.deltaChunk else {
                     return
                 }
+                finishGaussianBirthBands()
                 currentState = frame
+                currentStateFields = nil
                 currentBands.removeAll(keepingCapacity: true)
                 currentBandNumbers.removeAll(keepingCapacity: true)
                 if frame.opcode == Opcode.deltaChunk && !keyframeDelta {
@@ -713,21 +890,57 @@ private func validatePhysicalRecords(
                 }
 
                 var physicalFields: ChunkFields?
-                if keyframeDelta {
-                    do {
-                        if let fields = try chunkFields(source, frame) {
+                do {
+                    if let fields = try chunkFields(source, frame) {
+                        physicalFields = fields
+                        currentStateFields = fields
+                        if keyframeDelta {
+                            physicalIntervalCount += 1
+                            if !fields.t0.isFinite || !fields.t1.isFinite
+                                || fields.t0 >= fields.t1
+                            {
+                                scanReport.error(
+                                    "the physical \(opcodeName(fields.opcode)) interval "
+                                        + "[\(fields.t0), \(fields.t1)) must contain two finite "
+                                        + "values with t0 < t1")
+                            } else {
+                                if let previous = previousPhysicalInterval,
+                                    previous.t1 != fields.t0
+                                {
+                                    let what =
+                                        fields.t0 < previous.t1 ? "overlap" : "leave a gap"
+                                    scanReport.error(
+                                        "physical state chunks \(what): [\(previous.t0), "
+                                            + "\(previous.t1)) is followed by [\(fields.t0), "
+                                            + "\(fields.t1))")
+                                } else if previousPhysicalInterval == nil, fields.t0 != 0 {
+                                    scanReport.error(
+                                        "physical state chunks start at \(fields.t0); expected the "
+                                            + "keyframe-delta timeline to start at 0")
+                                }
+                                previousPhysicalInterval = fields
+                            }
                             if !entries.isEmpty { result.fields[frame.offset] = fields }
-                            physicalFields = fields
-                        } else {
-                            scanReport.error(
-                                "the \(opcodeName(frame.opcode)) record at byte \(frame.offset) is "
-                                    + "too short for its fixed fields")
-                            result.indexSafe = false
                         }
-                    } catch {
-                        scanReport.refused("", asFourDGS(error), walked, nil)
+                        if !keyframeDelta, fields.opcode == Opcode.chunk {
+                            let (sum, overflow) = result.gaussianCount.addingReportingOverflow(
+                                UInt64(fields.count))
+                            if overflow {
+                                scanReport.error(
+                                    "the sum of physical Chunk gaussian counts exceeds UInt64")
+                            } else {
+                                result.gaussianCount = sum
+                            }
+                        }
+                    } else {
+                        scanReport.error(
+                            "the \(opcodeName(frame.opcode)) record at byte \(frame.offset) is "
+                                + "too short for its fixed fields")
                         result.indexSafe = false
                     }
+                } catch {
+                    scanReport.refused("", asFourDGS(error), walked, nil)
+                    result.indexSafe = false
                 }
 
                 guard let header, let quantization else { return }
@@ -735,6 +948,7 @@ private func validatePhysicalRecords(
                     if keyframeDelta {
                         guard let temporalModelOffset else { return }
                         if frame.opcode == Opcode.chunk {
+                            try validateGroupHeaders(frame, try keyframeGroup(source, frame))
                             _ = try SceneReader(
                                 singleChunkReader(
                                     source, header: header, quantization: quantization,
@@ -784,6 +998,18 @@ private func validatePhysicalRecords(
     } catch {
         scanReport.refused("", asFourDGS(error), walked, nil)
         result.indexSafe = false
+    }
+    finishGaussianBirthBands()
+    if keyframeDelta {
+        if physicalIntervalCount == 0 {
+            scanReport.error("the keyframe-delta file contains no physical state chunks")
+        } else if let durationSec, let last = previousPhysicalInterval,
+            last.t1 != durationSec
+        {
+            scanReport.error(
+                "physical state chunks end at \(last.t1); expected Header duration_sec "
+                    + "\(durationSec)")
+        }
     }
 
     if let summary, summary.start < summary.end, !summaryStartsOnBoundary,
@@ -1006,6 +1232,68 @@ func validateKeyframeDeltaIndex(
     }
 }
 
+private struct AudioSourceSummary {
+    let id: UInt32
+    let dataLength: UInt64
+}
+
+private struct AudioDataSummary {
+    let id: UInt32
+    let dataLength: UInt64
+}
+
+private func malformedAudio(_ frame: Frame, field: String, reason: String) -> FourDGSError {
+    .malformed(
+        offset: Int64(clamping: frame.offset), record: opcodeName(frame.opcode), field: field,
+        reason: reason)
+}
+
+private func audioSourceSummary(_ source: ToolReader, _ frame: Frame) throws -> AudioSourceSummary {
+    let content = frame.offset + recordHeaderSize
+    guard frame.length >= 4 else {
+        throw malformedAudio(frame, field: "source_id", reason: "the record is shorter than 4 bytes")
+    }
+    let idBytes = try source.exactly(offset: content, count: 4, record: "Audio Source source_id")
+    let id = readU32(idBytes, at: 0) ?? 0
+    var relative: UInt64 = 4
+    for field in ["name", "codec", "channel_layout"] {
+        guard relative <= frame.length, frame.length - relative >= 4 else {
+            throw malformedAudio(frame, field: field, reason: "the string length is missing")
+        }
+        let lengthBytes = try source.exactly(
+            offset: content + relative, count: 4, record: "Audio Source \(field) length")
+        let length = UInt64(readU32(lengthBytes, at: 0) ?? 0)
+        relative += 4
+        guard length <= frame.length - relative else {
+            throw malformedAudio(frame, field: field, reason: "the string runs past the record")
+        }
+        relative += length
+    }
+    guard relative <= frame.length, frame.length - relative >= 8 else {
+        throw malformedAudio(frame, field: "data_length", reason: "the 8-byte field is missing")
+    }
+    let lengthBytes = try source.exactly(
+        offset: content + relative, count: 8, record: "Audio Source data_length")
+    return AudioSourceSummary(id: id, dataLength: readU64(lengthBytes, at: 0) ?? 0)
+}
+
+private func audioDataSummary(_ source: ToolReader, _ frame: Frame) throws -> AudioDataSummary {
+    let content = frame.offset + recordHeaderSize
+    guard frame.length >= 12 else {
+        throw malformedAudio(
+            frame, field: "payload", reason: "the source_id and data length need 12 bytes")
+    }
+    let fields = try source.exactly(offset: content, count: 12, record: "Audio Data fields")
+    let id = readU32(fields, at: 0) ?? 0
+    let length = readU64(fields, at: 4) ?? 0
+    guard length == frame.length - 12 else {
+        throw malformedAudio(
+            frame, field: "data",
+            reason: "source \(id) declares \(length) bytes; \(frame.length - 12) remain")
+    }
+    return AudioDataSummary(id: id, dataLength: length)
+}
+
 /// Run every check over one size-and-range transport.
 func validate(_ source: ToolReader) -> Report {
     var report = Report()
@@ -1025,6 +1313,9 @@ func validate(_ source: ToolReader) -> Report {
     var unknownCount: UInt64 = 0
     var firstUnknown: UInt8?
     var stateSeen = false
+    var pendingFooter: UInt64?
+    var audioSources: [UInt32: AudioSourceSummary] = [:]
+    var audioData: [UInt32: AudioDataSummary] = [:]
     let walked: Walk
     do {
         walked = try walk(
@@ -1049,6 +1340,13 @@ func validate(_ source: ToolReader) -> Report {
             visit: { frame, intact in
                 guard intact else { return }
                 let opcode = frame.opcode
+                if let footer = pendingFooter {
+                    report.error(
+                        "Footer at byte \(footer) is not final; exactly one Footer must be the "
+                            + "final record")
+                    pendingFooter = nil
+                }
+                if opcode == Opcode.footer { pendingFooter = frame.offset }
                 if firstOpcode == nil { firstOpcode = opcode }
                 lastOpcode = opcode
                 if opcode == Opcode.header { hasHeader = true }
@@ -1059,6 +1357,29 @@ func validate(_ source: ToolReader) -> Report {
                     report.error(
                         "\(opcodeName(opcode)) at byte \(frame.offset) appears after the first "
                             + "Chunk or DeltaChunk; audio records must precede state records")
+                }
+                if opcode == Opcode.audioSource {
+                    do {
+                        let parsed = try audioSourceSummary(source, frame)
+                        if audioSources.updateValue(parsed, forKey: parsed.id) != nil {
+                            report.error("Audio Source id \(parsed.id) appears more than once")
+                        }
+                    } catch {
+                        report.error(
+                            "Audio Source at byte \(frame.offset) does not parse: "
+                                + sentence(asFourDGS(error)))
+                    }
+                } else if opcode == Opcode.audioData {
+                    do {
+                        let parsed = try audioDataSummary(source, frame)
+                        if audioData.updateValue(parsed, forKey: parsed.id) != nil {
+                            report.error("Audio Data id \(parsed.id) appears more than once")
+                        }
+                    } catch {
+                        report.error(
+                            "Audio Data at byte \(frame.offset) does not parse: "
+                                + sentence(asFourDGS(error)))
+                    }
                 }
                 if opcode == Opcode.attributeStream {
                     report.error(
@@ -1139,9 +1460,54 @@ func validate(_ source: ToolReader) -> Report {
     }
     let keyframeDelta = dispatch?.keyframeDelta ?? false
 
+    for (id, descriptor) in audioSources {
+        guard let payload = audioData[id] else {
+            report.error("Audio Source id \(id) has no matching Audio Data record")
+            continue
+        }
+        if descriptor.dataLength != payload.dataLength {
+            report.error(
+                "Audio Source id \(id) declares \(descriptor.dataLength) data bytes, but its "
+                    + "Audio Data record carries \(payload.dataLength)")
+        }
+    }
+    for id in audioData.keys where audioSources[id] == nil {
+        report.error("Audio Data id \(id) has no matching Audio Source record")
+    }
+    if let dispatch {
+        let hasAudioRecords = !audioSources.isEmpty || !audioData.isEmpty
+        if dispatch.hasAudio != hasAudioRecords {
+            let declaration = dispatch.hasAudio ? "set" : "clear"
+            report.error(
+                "Header has-audio flag is \(declaration), but the file "
+                    + (hasAudioRecords ? "contains audio records" : "contains no audio records"))
+        }
+    }
+
+    let summary: SummaryDeclaration?
+    do {
+        summary = try summaryDeclaration(source, walked)
+    } catch {
+        report.refused("", asFourDGS(error), walked, nil)
+        return report
+    }
+    let indexRange: Range<UInt64>
+    if let summary, summary.start < summary.end {
+        indexRange = summary.start..<summary.end
+    } else {
+        indexRange = 0..<0
+    }
+    for frame in walked.intactRecords where frame.opcode == Opcode.chunkIndex {
+        let (end, overflow) = frame.offset.addingReportingOverflow(frame.total)
+        if overflow || !indexRange.contains(frame.offset) || end > indexRange.upperBound {
+            report.error(
+                "ChunkIndex at byte \(frame.offset) lies outside the Footer-declared summary")
+        }
+    }
+
     let index: [IndexEntry]
     do {
-        index = try chunkIndexEntries(source, walked)
+        index = try chunkIndexEntries(source, walked, within: indexRange)
     } catch {
         report.refused("", asFourDGS(error), walked, nil)
         return report
@@ -1165,6 +1531,11 @@ func validate(_ source: ToolReader) -> Report {
         if at != Opcode.chunk && !(keyframeDelta && at == Opcode.deltaChunk) {
             let expected = keyframeDelta ? "a Chunk or DeltaChunk record" : "a Chunk record"
             report.error("chunk index entry \(i) does not point at \(expected)")
+            indexBoundsSafe = false
+        }
+        if !keyframeDelta && entry.extended {
+            report.error(
+                "chunk index entry \(i) carries keyframe-delta fields in a gaussian-birth file")
             indexBoundsSafe = false
         }
         for band in entry.bands {
@@ -1191,13 +1562,6 @@ func validate(_ source: ToolReader) -> Report {
         }
     }
 
-    let summary: SummaryDeclaration?
-    do {
-        summary = try summaryDeclaration(source, walked)
-    } catch {
-        report.refused("", asFourDGS(error), walked, nil)
-        return report
-    }
     if let summary {
         if summary.start == summary.end {
             report.error(
@@ -1226,7 +1590,8 @@ func validate(_ source: ToolReader) -> Report {
 
     let physical = validatePhysicalRecords(
         source, walked, index: index, keyframeDelta: keyframeDelta,
-        temporalModelOffset: dispatch?.temporalModelOffset, summary: summary,
+        temporalModelOffset: dispatch?.temporalModelOffset, durationSec: dispatch?.durationSec,
+        shDegree: dispatch?.shDegree, summary: summary,
         indexBoundsSafe: indexBoundsSafe,
         report: &report)
     if keyframeDelta {
@@ -1236,6 +1601,11 @@ func validate(_ source: ToolReader) -> Report {
             "keyframe-delta identity composition was not checked: the current ranged Swift ABI "
                 + "exposes groups and references, but not composed identity state")
     } else {
+        if let expected = dispatch?.gaussianCount, physical.gaussianCount != expected {
+            report.error(
+                "Header gaussian_count is \(expected), but physical Chunks contain "
+                    + "\(physical.gaussianCount) gaussians")
+        }
         checkGaussianBirth(
             source, walked, index, indexSafe: physical.indexSafe,
             chunkAlreadyRefused: physical.chunkRefused, &report)

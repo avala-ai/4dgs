@@ -533,6 +533,34 @@ final class ValidateTests: XCTestCase {
         }
     }
 
+    func testCompressedDeltaInflationUsesBoundedRangeReads() throws {
+        let groupLength = 192 * 1024
+        var value: UInt32 = 0x1234_5678
+        var group: [UInt8] = []
+        group.reserveCapacity(groupLength)
+        for _ in 0..<groupLength {
+            value = value &* 1_664_525 &+ 1_013_904_223
+            group.append(UInt8(truncatingIfNeeded: value >> 24))
+        }
+        let records = littleU64(UInt64(group.count)) + group + littleU64(0) + littleU64(0)
+        let compressed = deflated(records)
+        XCTAssertGreaterThan(compressed.count, 64 * 1024)
+        var body = littleU64(0) + littleU64(1.0.bitPattern) + littleU32(0) + [UInt8(1)]
+        body += littleU64(0) + littleU64(0) + littleU16(1)
+        body += littleU32(0) + littleU32(0) + littleU32(0)
+        body += littleU32(7) + Array("deflate".utf8)
+        body += littleU64(UInt64(records.count)) + littleU64(UInt64(compressed.count)) + compressed
+        let bytes = [Opcode.deltaChunk] + littleU64(UInt64(body.count)) + body
+        let recording = RecordingReader(bytes)
+        let frame = Frame(opcode: Opcode.deltaChunk, offset: 0, length: UInt64(body.count))
+
+        let groups = try deltaGroups(ToolReader(recording), frame)
+
+        XCTAssertEqual(groups.first?.length, UInt64(groupLength))
+        XCTAssertLessThanOrEqual(recording.largestRead, 64 * 1024)
+        XCTAssertLessThan(recording.largestRead, compressed.count)
+    }
+
     func testKeyframeDeltaDecodesIndexedSHBandStreams() throws {
         try requireCorpus()
         let file = corpusDirectory().appendingPathComponent(
@@ -659,13 +687,14 @@ final class ValidateTests: XCTestCase {
         content += [UInt8](repeating: 0, count: 24)  // duration, gaussian count, cutoff
         let model = Array("keyframe-delta".utf8)
         content += littleU32(UInt32(model.count)) + model
+        content += [UInt8](repeating: 0, count: 50)  // aabb, sh_degree, flags
         let bytes = magic + [Opcode.header] + littleU64(UInt64(content.count)) + content + magic
         let recording = RecordingReader(bytes)
         let source = ToolReader(recording)
         let walked = try walk(source, retaining: { $0.opcode == Opcode.header })
 
         XCTAssertTrue(try isKeyframeDelta(source, walked))
-        XCTAssertEqual(recording.largestRead, model.count)
+        XCTAssertLessThanOrEqual(recording.largestRead, 24)
     }
 
     func testFooterMustBeTheFinalRecordForKeyframeDelta() throws {
@@ -767,6 +796,187 @@ final class ValidateTests: XCTestCase {
         writeU64(19, into: &shortFooter, at: keyframeFooter.offset + 1)
         says(shortFooter, "malformed Footer.fixed fields")
     }
+
+    func testIndexedBandsBelongToTheirPhysicalState() throws {
+        try requireCorpus()
+        var bytes = try readFixture(
+            corpusDirectory().appendingPathComponent(
+                "MixedLifetimes-SHDegree3-UseChunkIndex-UseCrc.4dgs"))
+        let walked = try walk(bytes)
+        let frames = walked.records.filter { $0.opcode == Opcode.chunkIndex }
+        let entries = chunkIndexEntries(bytes, walked)
+        let owners = entries.indices.filter { !entries[$0].bands.isEmpty }
+        XCTAssertGreaterThanOrEqual(owners.count, 2)
+        let first = owners[0]
+        let second = owners[1]
+        let firstBand = entries[first].bands[0]
+        let secondBand = entries[second].bands[0]
+        writeU64(
+            secondBand.offset, into: &bytes,
+            at: frames[first].offset + recordHeaderSize + 41)
+        writeU64(
+            secondBand.length, into: &bytes,
+            at: frames[first].offset + recordHeaderSize + 49)
+        writeU64(
+            firstBand.offset, into: &bytes,
+            at: frames[second].offset + recordHeaderSize + 41)
+        writeU64(
+            firstBand.length, into: &bytes,
+            at: frames[second].offset + recordHeaderSize + 49)
+
+        let report = validate(bytes)
+        XCTAssertTrue(
+            report.findings.contains { $0.message.contains("stream physically follows") },
+            "\(report.findings.map(\.message))")
+    }
+
+    func testKeyframeDeltaPhysicalTimelineIsCheckedWithoutAnIndex() throws {
+        try requireCorpus()
+        let file = corpusDirectory().appendingPathComponent(
+            "keyframe/KeyframeDelta-UseChunkIndex-UseCrc-UseStatistics.4dgs")
+        var bytes = try readFixture(file)
+        let walked = try walk(bytes)
+        let states = walked.records.filter {
+            $0.opcode == Opcode.chunk || $0.opcode == Opcode.deltaChunk
+        }
+        XCTAssertGreaterThanOrEqual(states.count, 2)
+        let firstEnd = try XCTUnwrap(
+            readU64(bytes, at: states[0].offset + recordHeaderSize + 8))
+        writeU64(
+            (Double(bitPattern: firstEnd) + 0.25).bitPattern, into: &bytes,
+            at: states[1].offset + recordHeaderSize)
+        for frame in walked.records where frame.opcode == Opcode.chunkIndex {
+            bytes[Int(frame.offset)] = Opcode.privateStart
+        }
+        let footer = try XCTUnwrap(walked.firstIntact(Opcode.footer))
+        writeU64(0, into: &bytes, at: footer.offset + recordHeaderSize)
+        writeU32(0, into: &bytes, at: footer.offset + recordHeaderSize + 16)
+
+        let report = validate(bytes)
+        XCTAssertTrue(
+            report.findings.contains { $0.message.hasPrefix("physical state chunks leave a gap") },
+            "\(report.findings.map(\.message))")
+    }
+
+    func testFooterAndChunkIndexPlacementArePhysicalRules() throws {
+        try requireCorpus()
+        let original = try readFixture(corpusDirectory().appendingPathComponent(provenanceVariant))
+        let walked = try walk(original)
+        let footer = try XCTUnwrap(walked.firstIntact(Opcode.footer))
+
+        var duplicateFooter = original
+        duplicateFooter.insert(
+            contentsOf: [Opcode.footer] + littleU64(20) + [UInt8](repeating: 0, count: 20),
+            at: Int(footer.offset))
+        XCTAssertTrue(
+            validate(duplicateFooter).findings.contains {
+                $0.message
+                    == "Footer at byte \(footer.offset) is not final; exactly one Footer must be "
+                    + "the final record"
+            })
+
+        var orphanIndex = original
+        writeU64(0, into: &orphanIndex, at: footer.offset + recordHeaderSize)
+        writeU32(0, into: &orphanIndex, at: footer.offset + recordHeaderSize + 16)
+        XCTAssertTrue(
+            validate(orphanIndex).findings.contains {
+                $0.message.contains("lies outside the Footer-declared summary")
+            })
+    }
+
+    func testGaussianBirthHeaderAndIndexMetadataMatchPhysicalState() throws {
+        try requireCorpus()
+        let original = try readFixture(corpusDirectory().appendingPathComponent(provenanceVariant))
+        let walked = try walk(original)
+        let source = ToolReader(InMemoryReader(original))
+        let dispatch = try XCTUnwrap(try headerDispatch(source, walked))
+        let header = try XCTUnwrap(walked.firstIntact(Opcode.header))
+        let content = header.offset + recordHeaderSize
+        var relative: UInt64 = 0
+        for _ in 0..<2 {
+            let length = UInt64(try XCTUnwrap(readU32(original, at: content + relative)))
+            relative += 4 + length
+        }
+
+        var wrongCount = original
+        writeU64(
+            dispatch.gaussianCount + 1, into: &wrongCount,
+            at: content + relative + 8)
+        XCTAssertTrue(
+            validate(wrongCount).findings.contains { $0.message.hasPrefix("Header gaussian_count") })
+
+        var wrongDegree = original
+        wrongDegree[Int(dispatch.temporalModelOffset + 14 + 48)] = 3
+        XCTAssertTrue(
+            validate(wrongDegree).findings.contains {
+                $0.message.contains("physical SH Band Streams")
+            })
+
+        let index = try XCTUnwrap(walked.firstIntact(Opcode.chunkIndex))
+        var extended = original
+        extended.insert(contentsOf: [UInt8](repeating: 0, count: 28), at: Int(index.offset + index.total))
+        writeU64(index.length + 28, into: &extended, at: index.offset + 1)
+        let shiftedFooter = try XCTUnwrap(try walk(extended).firstIntact(Opcode.footer)).offset
+        writeU32(0, into: &extended, at: shiftedFooter + recordHeaderSize + 16)
+        XCTAssertTrue(
+            validate(extended).findings.contains {
+                $0.message.contains("keyframe-delta fields in a gaussian-birth file")
+            })
+    }
+
+    func testKeyframeIdentityAndAudioPairingAreCheckedStructurally() throws {
+        try requireCorpus()
+        let keyframeFile = corpusDirectory().appendingPathComponent(
+            "keyframe/KeyframeDelta-UseChunkIndex-UseCrc-UseStatistics.4dgs")
+        var missingIdentity = try readFixture(keyframeFile)
+        let keyframeWalk = try walk(missingIdentity)
+        let keyframe = try XCTUnwrap(keyframeWalk.firstIntact(Opcode.chunk))
+        var stream = keyframe.offset + recordHeaderSize + 44
+        let streamEnd = keyframe.offset + keyframe.total
+        var identityOffset: UInt64?
+        while stream < streamEnd {
+            if missingIdentity[Int(stream)] == 13 { identityOffset = stream; break }
+            let payload = try XCTUnwrap(readU64(missingIdentity, at: stream + 9))
+            stream += 17 + payload
+        }
+        missingIdentity[Int(try XCTUnwrap(identityOffset))] = 14
+        XCTAssertTrue(
+            validate(missingIdentity).findings.contains {
+                $0.message.contains("keyframe group carries no gaussian_id stream")
+            })
+
+        let audioFile = corpusDirectory().appendingPathComponent(
+            "OneWindow-UseChunkIndex-UseCrc-WithSpatialAudio.4dgs")
+        var audio = try readFixture(audioFile)
+        let audioWalk = try walk(audio)
+        let audioDispatch = try XCTUnwrap(
+            try headerDispatch(ToolReader(InMemoryReader(audio)), audioWalk))
+        var wrongAudioFlag = audio
+        wrongAudioFlag[Int(audioDispatch.temporalModelOffset + 14 + 49)] &= ~UInt8(1)
+        XCTAssertTrue(
+            validate(wrongAudioFlag).findings.contains {
+                $0.message.contains("Header has-audio flag is clear")
+            })
+        audio.replaceSubrange(
+            Int(audioDispatch.temporalModelOffset)..<Int(audioDispatch.temporalModelOffset + 14),
+            with: "keyframe-delta".utf8)
+        let descriptor = try XCTUnwrap(audioWalk.firstIntact(Opcode.audioSource))
+        var relative: UInt64 = 4
+        for _ in 0..<3 {
+            let length = UInt64(
+                try XCTUnwrap(
+                    readU32(audio, at: descriptor.offset + recordHeaderSize + relative)))
+            relative += 4 + length
+        }
+        let dataLengthAt = descriptor.offset + recordHeaderSize + relative
+        let dataLength = try XCTUnwrap(readU64(audio, at: dataLengthAt))
+        writeU64(dataLength + 1, into: &audio, at: dataLengthAt)
+        XCTAssertTrue(
+            validate(audio).findings.contains {
+                $0.message.contains("declares \(dataLength + 1) data bytes")
+            })
+    }
+
 }
 
 final class InspectTests: XCTestCase {
@@ -854,6 +1064,19 @@ final class InspectTests: XCTestCase {
             XCTAssertEqual(json.code, exitOk)
             XCTAssertTrue(json.out.contains("\"summary_crc\": {"))
             XCTAssertTrue(json.out.contains("\"ok\": null"))
+        }
+    }
+
+    func testInspectClassifiesAMalformedFooterAsAFileFailure() throws {
+        try requireCorpus()
+        var bytes = try readFixture(corpusDirectory().appendingPathComponent(provenanceVariant))
+        let footer = try XCTUnwrap(try walk(bytes).firstIntact(Opcode.footer))
+        writeU64(19, into: &bytes, at: footer.offset + 1)
+
+        try withTemporaryFile(bytes) { path in
+            let result = runTool(["inspect", path])
+            XCTAssertEqual(result.code, exitFailed, result.err)
+            XCTAssertTrue(result.err.contains("malformed Footer.fixed fields"), result.err)
         }
     }
 

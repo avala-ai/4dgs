@@ -174,9 +174,14 @@ public func runInspect(_ path: String, json: Bool, _ out: TextOutput, _ err: Tex
     }
 
     let declared: SummaryDeclaration?
-    let covered: Coverage?
     do {
         declared = try summaryDeclaration(source, walked)
+    } catch {
+        err.line("4dgs: \(path): \(sentence(asFourDGS(error)))")
+        return exitFailed
+    }
+    let covered: Coverage?
+    do {
         covered = try coverage(source, walked)
     } catch {
         err.line("4dgs: \(path): \(sentence(asFourDGS(error)))")

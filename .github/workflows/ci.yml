@@ -113,17 +113,18 @@ jobs:
           size_kb=$(du -s dart | cut -f1)
           echo "dart: ${size_kb} KiB"
           [ "$size_kb" -le 768 ] || { echo "::error::dart is ${size_kb} KiB, over the 768 KiB budget"; exit 1; }
-      - name: Swift sources under 448 KB
+      - name: Swift sources under 512 KB
         # Sources only, same as TypeScript's: this job builds nothing, so .build is not
         # here to measure and a vendored dependency would show up as a budget failure.
         # Raised from 300 to 448 KiB for `4dgs`, the inspect-and-validate tool: the
         # framing walk and refusal placement, the two commands, the three-line executable
         # and the corpus-driven tests. `du` rounds every file to a 4 KiB block and these
         # are new files in new directories; 384 against 300 is not a rounding error.
+        # Raised to 512 KiB for its bounded physical-state validation and adversarial tests.
         run: |
           size_kb=$(du -s swift | cut -f1)
           echo "swift: ${size_kb} KiB"
-          [ "$size_kb" -le 448 ] || { echo "::error::swift is ${size_kb} KiB, over the 448 KiB budget"; exit 1; }
+          [ "$size_kb" -le 512 ] || { echo "::error::swift is ${size_kb} KiB, over the 512 KiB budget"; exit 1; }
 
   no-committed-binaries:
     # The corpus is generated. A committed .4dgs means someone bypassed the generator.
