@@ -24,9 +24,12 @@ export { BytesReadable, type IReadable } from "./readable.js";
 export {
   FourdgsError,
   MalformedFile,
+  Refusal,
   TruncatedFile,
   UnsupportedCodec,
   UnsupportedVersion,
+  type FourdgsErrorOptions,
+  type RefusalCode,
 } from "./errors.js";
 
 export {
@@ -57,6 +60,7 @@ export {
   type Decompressor,
   codecName,
   crc32,
+  decompressorFor,
   inflateZlib,
 } from "./codec.js";
 

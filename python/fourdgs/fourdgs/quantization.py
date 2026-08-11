@@ -113,18 +113,38 @@ def sh_bound(bits: int) -> int:
     return sh_step(bits) // 2
 
 
-def quantize_sh(values, bits: int) -> np.ndarray:
-    """Round coefficient bytes onto the grid `bits` names, reconstructing at bin centres.
+def coarsen_sh(values, step: int) -> np.ndarray:
+    """Round coefficient bytes onto a grid of `step` code units, at bin centres.
 
     Centring is what makes the bound half the pitch rather than the whole of it, and it
     keeps the operation idempotent: a coefficient already on the grid is left alone, so
-    re-encoding a file at the depth it already carries changes no byte.
+    re-encoding a file at the pitch it already carries changes no byte.
+
+    The result is clamped back into a byte, and that is not defensive. The top bin's
+    centre sits above the top of the range whenever the pitch does not divide 256, which
+    is exactly what the `coarse` profile's `step_sh = 3` does: the coefficient 255 centres
+    on **256**, a value a `u8` cannot hold. The reference reader then refuses the file its
+    own writer produced, and a reader whose stream codec narrows to a byte instead reports
+    the extreme positive coefficient as the extreme negative one — highest value in,
+    lowest out, in a file that decodes without complaint (issues #181, #190).
+
+    Clamping can only move a value towards the original, so the declared half-pitch bound
+    is kept a fortiori. This matches the Dart writer, which reached the same rule
+    independently in #166.
     """
-    step = sh_step(bits)
     v = np.asarray(values, dtype=np.int64)
-    if step == 1:
+    if step <= 1:
         return v
-    return (v // step) * step + step // 2
+    return np.clip((v // step) * step + step // 2, 0, 255)
+
+
+def quantize_sh(values, bits: int) -> np.ndarray:
+    """Round coefficient bytes onto the grid `bits` names, reconstructing at bin centres.
+
+    A bit depth's pitch is always a power of two, so the clamp in `coarsen_sh` never binds
+    here. It is the same arithmetic either way, in one place, so the two cannot drift.
+    """
+    return coarsen_sh(values, sh_step(bits))
 
 
 def sh_coefficient(bytes_) -> np.ndarray:

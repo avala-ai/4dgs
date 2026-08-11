@@ -19,6 +19,17 @@ The four packages version together.
   this package had to reimplement §11.7 to get every attribute of every gaussian.
 - `dequantizeRotation` accepts a `Float64Array` output as well as a `Float32Array`.
 - `ATTRIBUTE_CHANNELS`, the interleaving width the registry gives each attribute id it defines.
+- **Refusals say which rule was broken.** Every error in `@4dgs/core` now carries an optional
+  `refusalCode`, and the six identifiers the specification's refusal table names — `magic-mismatch`,
+  `unsupported-major-version`, `unknown-temporal-model`, `unknown-quantization-scheme`,
+  `unknown-stream-codec`, `window-index-out-of-range` — are exported as the `Refusal` constants
+  rather than written as literals at the raise sites, because six implementations are compared on
+  those strings. The class alone was too coarse to compare on: `UnsupportedCodec` covers an unknown
+  temporal model, an unknown quantization scheme and an unknown stream codec alike, so "it threw
+  `UnsupportedCodec`" cannot tell a decoder that refused for the right reason from one that refused
+  for the wrong one. `undefined` means "a real error the refusal table does not name", not "no
+  error". This is additive: `refusalCode` is a property on the existing `FourdgsError` rather than a
+  new subclass, so every `instanceof` check keeps working.
 
 ### Changed
 
@@ -53,6 +64,13 @@ The four packages version together.
   of a truncated file (§11.10) the last decodable instant is the last complete chunk's `t1`, and
   reporting the state before the cut as the state after it is a decoder inventing content. The
   indexed path already refused it.
+- **A file whose magic is corrupted anywhere but the version byte is no longer reported as an
+  unsupported version.** `checkMagic` tested only that bytes 1-4 read `4DGS`, so flipping the
+  leading `0x89` sentinel — the byte that stops byte-oriented tooling treating a 4dgs file as text —
+  produced "4dgs major version 1 is not supported by this reader". That sends the file's holder
+  looking for a newer reader, which would not have helped. The version byte must now be the only
+  difference. Python's reader carries a comment about making exactly this mistake; nothing inside
+  TypeScript could see it, because both answers are an `UnsupportedVersion` with a sentence.
 
 ### Removed
 

@@ -57,7 +57,7 @@ multiple fixed or moving sources in the same 3D scene.
 | TypeScript | [typescript/](typescript/) | `@4dgs/core` | Decoder and encoder, conformance-verified      | not yet — see below |
 | Rust       | [rust/](rust/)             | `fourdgs`    | Decoder and encoder, conformance-verified      | [crates.io][crates] |
 | C++        | [cpp/](cpp/)               | —            | Decode and encode over Rust's C ABI, verified  | build from source   |
-| Swift      | [swift/](swift/)           | —            | Binding over Rust; decode and encode, verified | build from source   |
+| Swift      | [swift/](swift/)           | `FourDGS`    | Binding over Rust; decode and encode, verified | SwiftPM URL, partly |
 | Dart       | [dart/](dart/)             | `fourdgs`    | Decoder, conformance-verified                  | not yet — see below |
 
 **The `@4dgs` packages are not on npm yet.** They are built, conformance-verified and versioned at
@@ -73,6 +73,13 @@ will not accept an automated publish for a package that does not exist. Automate
 setting _on a package_, so the name has to be claimed by a human running `dart pub publish` once
 before any workflow can take over. The release job is written and gated `if: false` until that
 happens; [RELEASING.md](RELEASING.md) has the three steps and their order.
+
+**Swift has no registry**, so `FourDGS` is consumed from this repository's URL — which is why
+`Package.swift` is at the root here and why Swift's releases are tagged `vX.Y.Z` with no package
+name in them: those are the only tags SwiftPM reads, and **a bare tag is the Swift package's version
+and not this repository's**. It resolves today and does not yet link outside a checkout, because the
+package binds the Rust core and ships no prebuilt copy of it; [swift/README.md](swift/README.md)
+says what that costs a consumer and what fixes it.
 
 Package names are `fourdgs` where a registry will not take `4dgs`; the format, the CLI and the file
 extension are always `4dgs`. [RELEASING.md](RELEASING.md) has the constraint per registry.

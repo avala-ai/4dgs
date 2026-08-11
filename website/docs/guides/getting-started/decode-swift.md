@@ -31,19 +31,37 @@ out of it is `Sendable`, because every array is copied out of the core's memory 
 Source descriptors are populated on open, but their `data` arrays remain empty; `dataSize` is known
 without transfer and `audioSourceData` performs the requested bounded payload read.
 
+## Depending on it
+
+`Package.swift` is at the root of the repository — SwiftPM looks for a manifest at the top of
+whatever it clones — and the versions it resolves come from plain `vX.Y.Z` tags there, not from the
+`releases/<lang>/vX.Y.Z` tags the other packages are cut from:
+
+```swift
+.package(url: "https://github.com/avala-ai/4dgs", from: "0.1.0")
+```
+
+**That resolves; it does not yet link.** The package binds the Rust core through its C ABI and ships
+no prebuilt copy of it, so a consumer outside a checkout of this repository has no `libfourdgs` for
+the linker to find. The manifest says as much while it is being evaluated, naming what is missing. A
+binary target shipping a prebuilt `.xcframework` is the fix and is not done yet; until then the
+package is buildable from a checkout, as below.
+
 ## Building
 
 Swift 5.9 or newer. The package links the core, so build that first and put it on the linker's
-search path:
+search path — both commands run from the repository root, where the manifest is:
 
 ```bash
 cargo build -p fourdgs --release
-swift build --package-path swift -Xlinker -L"$PWD/target/release"
-swift test  --package-path swift -Xlinker -L"$PWD/target/release"
+swift build --scratch-path swift/.build -Xlinker -L"$PWD/target/release"
+swift test  --scratch-path swift/.build -Xlinker -L"$PWD/target/release"
 ```
 
 The `-L` is passed on the command line rather than written into `Package.swift`, because an unsafe
-flag there would make the package undependable as a versioned dependency.
+flag there would make the package undependable as a versioned dependency. `--scratch-path` keeps
+SwiftPM's build directory under `swift/`, which is where the conformance harness looks for the
+runners it builds.
 
 ## Two things that will bite an integrator
 

@@ -8,7 +8,7 @@ Builds the same synthetic scene as `swift/conformance/Support/Synthetic.swift`, 
 same seed, and prints `canonical.py`'s summary of it. CI runs both and asserts the two
 documents parse equal:
 
-    swift run --package-path swift canonical_selftest > swift.json
+    swift run --scratch-path swift/.build canonical_selftest > swift.json
     python swift/conformance/selftest.py --compare swift.json
 
 The point is to separate two questions that would otherwise arrive together. When the Rust

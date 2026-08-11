@@ -63,6 +63,27 @@ const char* kVariants[] = {
 /// from a stream this package failed to surface.
 const char* kMembershipVariant = "LongLived-UseChunkIndex-UseCrc-WithObjects";
 
+/// The invalid corpus, and the identifier the specification's refusal table gives each
+/// variant. Seven files, six identifiers: an empty temporal model and an unrecognized one are
+/// the same refusal, because a declaration of nothing is not a default.
+///
+/// Named here rather than read from the expectation JSON, so this test states the mapping
+/// instead of agreeing with whatever the harness happens to hold.
+struct NamedRefusal {
+  const char* variant;
+  const char* identifier;
+};
+
+const NamedRefusal kNamedRefusals[] = {
+    {"BadMagic", "magic-mismatch"},
+    {"FutureMajorVersion", "unsupported-major-version"},
+    {"EmptyTemporalModel", "unknown-temporal-model"},
+    {"UnknownTemporalModel", "unknown-temporal-model"},
+    {"UnknownQuantizationScheme", "unknown-quantization-scheme"},
+    {"UnknownStreamCodec", "unknown-stream-codec"},
+    {"WindowIndexOutOfRange", "window-index-out-of-range"},
+};
+
 std::vector<std::uint8_t> readWhole(const std::string& path, bool* found) {
   std::vector<std::uint8_t> bytes;
   std::FILE* handle = std::fopen(path.c_str(), "rb");
@@ -299,6 +320,78 @@ void malformedInputIsRefusedAndNamed(const std::vector<std::uint8_t>& original) 
   }
 }
 
+/// A refused file says which rule refused it, not merely that something was wrong.
+///
+/// The identifier crosses the ABI as a (pointer, length) pair that is *not* NUL-terminated,
+/// so this also checks the length: an identifier read with `strlen` picks up whatever bytes
+/// follow it in the core's static data, and comparing against the exact expected string is
+/// what turns that into a failure instead of a value nobody looks at. Under the sanitizers
+/// the same read is where a copy past the end of the string is reported.
+///
+/// Both what fires at open and what fires during the load are covered, because the rules do
+/// not all fire in the same place: a temporal model is refused reading the Header, a window
+/// index past the end of its table only when the record is read.
+void refusalsAreNamed(const std::string& directory) {
+  for (const NamedRefusal& expected : kNamedRefusals) {
+    const std::string path = directory + "/invalid/" + expected.variant + ".4dgs";
+    bool found = false;
+    const std::vector<std::uint8_t> bytes = readWhole(path, &found);
+    if (!found) {
+      ::fourdgs::testing::report(__FILE__, __LINE__, path.c_str(),
+                                 "corpus file missing; run tests/conformance/generate.py");
+      continue;
+    }
+
+    fourdgs::Error refusal;
+    Result<std::unique_ptr<Scene>> opened =
+        Scene::openMemory(fourdgs::Span<const std::uint8_t>(bytes.data(), bytes.size()));
+    if (!opened.ok()) {
+      refusal = opened.error();
+    } else {
+      Result<void> loaded = (*opened)->loadAll(3);
+      CHECK(!loaded.ok());
+      if (loaded.ok()) continue;
+      refusal = loaded.error();
+    }
+
+    if (!refusal.refusal.has_value()) {
+      ::fourdgs::testing::report(__FILE__, __LINE__, expected.variant,
+                                 "refused without naming the rule: " + refusal.toString());
+      continue;
+    }
+    if (*refusal.refusal != expected.identifier) {
+      ::fourdgs::testing::report(__FILE__, __LINE__, expected.variant,
+                                 "refused as '" + *refusal.refusal + "', expected '" +
+                                     std::string(expected.identifier) + "'");
+    }
+  }
+}
+
+/// A failure the refusal table does not name reports no identifier — and reports it as
+/// absence rather than as an empty or stale one.
+///
+/// The distinction is the whole contract: a missing file and a file cut in half are real
+/// errors with real messages and no rule behind them, and an identifier left over from an
+/// earlier refusal would name the wrong failure. Run after `refusalsAreNamed`, so a stale
+/// value would have something to be stale from.
+void unnamedFailuresCarryNoIdentifier(const std::vector<std::uint8_t>& valid) {
+  Result<std::unique_ptr<Scene>> missing = Scene::openPath("/nonexistent/scene.4dgs");
+  CHECK(!missing.ok());
+  if (!missing.ok()) CHECK(!missing.error().refusal.has_value());
+
+  const std::vector<std::uint8_t> half(valid.begin(), valid.begin() + valid.size() / 2);
+  Result<std::unique_ptr<Scene>> cut =
+      Scene::openMemory(fourdgs::Span<const std::uint8_t>(half.data(), half.size()));
+  if (!cut.ok()) {
+    CHECK(!cut.error().refusal.has_value());
+    return;
+  }
+  // Opening a cut file legitimately succeeds when the Header survived the cut; the load is
+  // where it runs out of bytes, and truncation is not a rule the table names either.
+  Result<void> loaded = (*cut)->loadAll(3);
+  if (!loaded.ok()) CHECK(!loaded.error().refusal.has_value());
+}
+
 void runTests() {
   if (!fourdgs::backendAvailable()) {
     // Nothing to decode, and nothing claimed. The no-core build's contract is `test_seam`'s
@@ -307,6 +400,9 @@ void runTests() {
   }
 
   const std::string directory = corpusDirectory();
+
+  refusalsAreNamed(directory);
+
   for (const char* variant : kVariants) {
     const std::string path = directory + "/" + variant + ".4dgs";
     bool found = false;
@@ -331,6 +427,7 @@ void runTests() {
     reconstructionAgreesWithTheCore(scene);
     audioReadsBackAtItsDeclaredLength(scene);
     malformedInputIsRefusedAndNamed(bytes);
+    unnamedFailuresCarryNoIdentifier(bytes);
   }
 }
 

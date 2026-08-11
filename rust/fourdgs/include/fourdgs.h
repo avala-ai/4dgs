@@ -150,6 +150,29 @@ typedef enum fourdgs_status {
  */
 const char *fourdgs_last_error(void);
 
+/**
+ * The identifier the specification's refusal table gives the last error on this thread —
+ * "magic-mismatch", "unsupported-major-version", "unknown-temporal-model",
+ * "unknown-quantization-scheme", "unknown-stream-codec", "window-index-out-of-range" —
+ * or NULL with *out_len 0 when the last error is not one of them.
+ *
+ * The status codes say what KIND of thing went wrong, and FOURDGS_STATUS_UNSUPPORTED_CODEC
+ * alone covers three of those six. This is how a caller says WHICH one, in the same words
+ * every other implementation of this format uses.
+ *
+ * NULL is not a failure. A truncated transport, an I/O error and a null-argument mistake
+ * are real errors that the refusal table does not name; the call still returns
+ * FOURDGS_STATUS_OK and the sentence is in fourdgs_last_error().
+ *
+ * NOT NUL-terminated — read exactly *out_len bytes, and see CALL FIRST, THEN READ THE OUT
+ * PARAMETERS above. The bytes are static and outlive any scene, so nothing frees them;
+ * which identifier they spell changes with the next call on this thread that fails.
+ *
+ * A null out parameter returns FOURDGS_STATUS_INVALID_ARGUMENT and, alone on this surface,
+ * leaves fourdgs_last_error() untouched rather than overwriting the diagnosis being read.
+ */
+int fourdgs_last_refusal_code(const char **out, size_t *out_len);
+
 /** A short static name for a status code. Never null; valid forever. */
 const char *fourdgs_status_message(int status);
 

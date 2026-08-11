@@ -11,7 +11,7 @@
  */
 
 import { Cursor } from "./cursor.js";
-import { MalformedFile, TruncatedFile, UnsupportedVersion } from "./errors.js";
+import { MalformedFile, Refusal, TruncatedFile, UnsupportedVersion } from "./errors.js";
 import {
   AUDIO_SOURCE_FLAG_LOOP,
   AUDIO_SOURCE_FLAG_SPATIAL,
@@ -28,6 +28,9 @@ export const MAGIC = new Uint8Array([0x89, 0x34, 0x44, 0x47, 0x53, 0x31, 0x0d, 0
 
 /** The major version this reader implements. */
 export const VERSION = 1;
+
+/** Where the major version sits in the magic. Every other byte is a fixed sentinel. */
+const VERSION_AT = 5;
 
 /** `u8` opcode plus `u64` content length. */
 export const RECORD_HEADER_BYTES = 9;
@@ -65,15 +68,24 @@ export function checkMagic(head: Uint8Array): void {
   }
   const found = head.subarray(0, MAGIC.length);
   if (bytesEqual(found, MAGIC)) return;
+  // Told apart by whether the version byte is the ONLY difference: every other byte of
+  // the magic is a fixed sentinel, so a file that differs elsewhere is not a 4dgs file
+  // whatever its version byte happens to say. Testing only `found[1..5] === "4DGS"` — as
+  // this did — reported a corrupted first byte as an unsupported version 1, which sends
+  // its holder looking for a newer reader that would not have helped. Nothing in the
+  // valid corpus can reach this, which is why it survived until the invalid corpus asked.
   const isFourdgs =
-    found[1] === 0x34 && found[2] === 0x44 && found[3] === 0x47 && found[4] === 0x53;
+    bytesEqual(found.subarray(0, VERSION_AT), MAGIC.subarray(0, VERSION_AT)) &&
+    bytesEqual(found.subarray(VERSION_AT + 1), MAGIC.subarray(VERSION_AT + 1));
   if (isFourdgs) {
     throw new UnsupportedVersion(
-      `4dgs major version ${String.fromCharCode(found[5]!)} is not supported by this reader`,
+      `4dgs major version ${String.fromCharCode(found[VERSION_AT]!)} is not supported by this reader`,
+      { refusalCode: Refusal.UnsupportedMajorVersion },
     );
   }
   throw new UnsupportedVersion(
     `not a 4dgs file: magic is ${Array.from(found, (b) => b.toString(16).padStart(2, "0")).join(" ")}`,
+    { refusalCode: Refusal.MagicMismatch },
   );
 }
 
