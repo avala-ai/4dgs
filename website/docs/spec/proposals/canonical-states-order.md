@@ -336,14 +336,14 @@ encodings.
   designed to expose.
 
 - **`ObjectResidualTieOpacity` and `ObjectResidualTieOpacityReordered`** — the opacity counterpart
-  to the preceding pair. The rows tie on the six-decimal opacity component of the primary key and
-  on the complete rounded emitted-state secondary key, but carry distinct unrounded decoded
-  opacities. The second encoding reverses only that surviving tied run. The generator must prove
-  that resident-order addition crosses a six-decimal `opacitySum` boundary between the two files,
-  while sorting the exact opacity addends produces one identical total. The pair shares one
-  expectation. `ObjectOpacityOrder` proves that (2a) must use content order, but cannot catch a port
-  that applies (2b)'s exact-addend sort to centres alone; this pair makes both aggregates part of
-  the deferred (2b) contract.
+  to the preceding pair. The rows tie on the six-decimal opacity component of the primary key and on
+  the complete rounded emitted-state secondary key, but carry distinct unrounded decoded opacities.
+  The second encoding reverses only that surviving tied run. The generator must prove that
+  resident-order addition crosses a six-decimal `opacitySum` boundary between the two files, while
+  sorting the exact opacity addends produces one identical total. The pair shares one expectation.
+  `ObjectOpacityOrder` proves that (2a) must use content order, but cannot catch a port that applies
+  (2b)'s exact-addend sort to centres alone; this pair makes both aggregates part of the deferred
+  (2b) contract.
 
 All five belong beside the existing `object/` variants. None needs a spec change, a new opcode or a
 new writer capability — they are ordinary scenes with adversarially chosen numbers. The generator's
