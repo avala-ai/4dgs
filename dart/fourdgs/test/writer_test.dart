@@ -142,6 +142,25 @@ class _RecordingSink implements Sink<List<int>> {
   void close() => closed = true;
 }
 
+/// The per-band SH bit depths a file declares, read the way a reader that had
+/// never heard of the field would have to skip it: past the Quantization
+/// record's original fields, with the record's own length as the only bound.
+List<int> declaredShBitDepths(Uint8List bytes) {
+  final record = recordsOf(
+    bytes,
+  ).firstWhere((FourdgsRecord r) => r.opcode == opQuantization);
+  final cursor = FourdgsCursor(record.content);
+  cursor.string(); // scheme
+  cursor.f64s(3); // pos_origin
+  cursor.f64s(8); // the eight grid pitches
+  cursor.u8(); // step_sh
+  cursor.strMap(); // bounds
+  if (cursor.remaining < 1) return const <int>[];
+  final count = cursor.u8();
+  if (count == 0 || cursor.remaining < count) return const <int>[];
+  return <int>[for (int i = 0; i < count; i++) cursor.u8()];
+}
+
 void main() {
   group('the envelope', () {
     test('opens and closes with the magic, and frames every record', () {
@@ -1093,6 +1112,37 @@ void main() {
       expect(decoded.chunkIndex.any((entry) => entry.t1.isFinite), isTrue);
     });
 
+    test('many distinct windows are assigned to their own top pools', () {
+      const count = 1024;
+      final scene = flatScene(count, winHi: count.toDouble());
+      for (int i = 0; i < count; i++) {
+        scene.winLo[i] = i.toDouble();
+        scene.winHi[i] = (i + 1).toDouble();
+        scene.muT[i] = i + 0.5;
+        scene.sigmaT[i] = 0.01;
+      }
+
+      // One gaussian per top interval is the adversarial shape for a planner
+      // that rescans the whole population at every boundary. Each must still be
+      // assigned exactly once, without relying on deeper binary subdivision.
+      final decoded = readFourdgsBytes(
+        writeFourdgsBytes(
+          scene,
+          count.toDouble(),
+          options: const FourdgsWriteOptions(maxDepth: 0, minChunkGaussians: 1),
+        ),
+      );
+      expect(decoded.chunkIndex.length, count);
+      expect(
+        decoded.chunkIndex.fold<int>(
+          0,
+          (int total, FourdgsChunkIndexEntry entry) =>
+              total + entry.gaussianCount,
+        ),
+        count,
+      );
+    });
+
     test('every gaussian is stored exactly once, however long it lives', () {
       final scene = buildScene(count: 512, windows: 8);
       final decoded = readFourdgsBytes(
@@ -1107,35 +1157,35 @@ void main() {
       expect(decoded.gaussians.count, scene.count);
     });
 
-    test("a chunk's interval contains the support of everything in it", () async {
-      final scene = buildScene(count: 512, windows: 8);
-      final bytes = writeFourdgsBytes(scene, 8.0, options: chunked);
-      final indexed = await openFourdgsIndexed(FourdgsBytes(bytes));
-      final k = math.sqrt(-2.0 * math.log(indexed.header.cutoff));
+    test(
+      "a chunk's interval contains the support of everything in it",
+      () async {
+        final scene = buildScene(count: 512, windows: 8);
+        final bytes = writeFourdgsBytes(scene, 8.0, options: chunked);
+        final indexed = await openFourdgsIndexed(FourdgsBytes(bytes));
+        final k = math.sqrt(-2.0 * math.log(indexed.header.cutoff));
 
-      for (final entry in indexed.index) {
-        final chunk = await readFourdgsChunk(
-          FourdgsBytes(bytes),
-          indexed,
-          entry,
-        );
-        for (int i = 0; i < chunk.count; i++) {
-          final sigma = chunk.sigmaT[i];
-          final half = sigma.isFinite ? k * sigma : double.infinity;
-          final lo = math.max(chunk.muT[i] - half, chunk.winLo[i]);
-          final hi = math.min(chunk.muT[i] + half, chunk.winHi[i]);
-          // The tree's whole invariant: a gaussian goes in the deepest node
-          // whose interval fully contains its support. Break it and an instant
-          // inside [t0, t1) is served without a gaussian visible there.
-          //
-          // Assignment is built from these reconstructed values, so no
-          // quantization tolerance belongs here: an edge past the interval is
-          // an instant the streamed path can see and the indexed path can miss.
-          expect(lo, greaterThanOrEqualTo(entry.t0));
-          expect(hi, lessThanOrEqualTo(entry.t1));
+        for (final entry in indexed.index) {
+          final chunk = await readFourdgsChunk(
+            FourdgsBytes(bytes),
+            indexed,
+            entry,
+          );
+          for (int i = 0; i < chunk.count; i++) {
+            final sigma = chunk.sigmaT[i];
+            final half =
+                sigma.isFinite ? k * math.max(sigma, 1e-30) : double.infinity;
+            final lo = math.max(chunk.muT[i] - half, chunk.winLo[i]);
+            final hi = math.min(chunk.muT[i] + half, chunk.winHi[i]);
+            // The tree's whole invariant: a gaussian goes in the deepest node
+            // whose interval fully contains its support. Break it and an instant
+            // inside [t0, t1) is served without a gaussian visible there.
+            expect(lo, greaterThanOrEqualTo(entry.t0));
+            expect(hi, lessThanOrEqualTo(entry.t1));
+          }
         }
-      }
-    });
+      },
+    );
 
     test('seeking an instant finds every gaussian visible at it', () async {
       final scene = buildScene(count: 512, windows: 8);
@@ -1144,15 +1194,15 @@ void main() {
       final indexed = await openFourdgsIndexed(FourdgsBytes(bytes));
       final cutoff = indexed.header.cutoff;
 
-      // A probe inside every index interval, plus the ends of the timeline. The
-      // seek rule is half-open — `t0 <= t < t1` — so a point strictly inside an
-      // interval is served by exactly the entries that should serve it.
-      //
+      // Every entry start exercises a split boundary, and the interior probe
+      // exercises the ordinary case. Planning uses reconstructed support, so a
+      // boundary is no longer a case this agreement check has to avoid.
       final probes = <double>{
         0.0,
-        for (final entry in indexed.index) entry.t0,
-        for (final entry in indexed.index)
+        for (final entry in indexed.index) ...<double>[
+          entry.t0,
           entry.t0 + 0.37 * (entry.t1 - entry.t0),
+        ],
         8.0 - 1e-6,
       };
 
@@ -1189,6 +1239,73 @@ void main() {
               'at t = $t the covering chunks must hold every visible gaussian',
         );
       }
+    });
+
+    test('quantization cannot move support out of its indexed chunk', () async {
+      final scene = flatScene(1, winHi: 2.0);
+      // At the coarse profile the input support ends just below t=1, but the
+      // sigma grid reconstructs it just beyond t=1. Planning from the input
+      // used to put this gaussian in [0, 1), so an indexed seek at 1 omitted a
+      // gaussian the streamed decode considered visible.
+      scene.muT[0] = 0.768;
+      scene.sigmaT[0] = 0.094;
+      const options = FourdgsWriteOptions(
+        profile: 'coarse',
+        maxDepth: 1,
+        minChunkGaussians: 1,
+      );
+      final bytes = writeFourdgsBytes(scene, 2.0, options: options);
+      final whole = readFourdgsBytes(bytes);
+      final indexed = await openFourdgsIndexed(FourdgsBytes(bytes));
+
+      expect(scene.support().hi.single, lessThan(1.0));
+      expect(whole.gaussians.support().hi.single, greaterThan(1.0));
+      expect(whole.gaussians.stateAt(1.0).count, 1);
+
+      int found = 0;
+      for (final entry in indexed.chunksForTime(1.0)) {
+        final chunk = await readFourdgsChunk(
+          FourdgsBytes(bytes),
+          indexed,
+          entry,
+        );
+        for (int i = 0; i < chunk.count; i++) {
+          if (!(chunk.winLo[i] <= 1.0 && 1.0 < chunk.winHi[i])) continue;
+          final sigma = chunk.sigmaT[i];
+          final marginal =
+              sigma.isFinite
+                  ? math.exp(
+                    -0.5 *
+                        math.pow(
+                          (1.0 - chunk.muT[i]) / math.max(sigma, 1e-30),
+                          2,
+                        ),
+                  )
+                  : 1.0;
+          if (marginal >= indexed.header.cutoff) found++;
+        }
+      }
+      expect(found, 1);
+    });
+
+    test('the decoder sigma floor participates in chunk support', () async {
+      // Quantizing zero under the coarse profile reconstructs just below the
+      // stateAt floor. Without applying that floor here, its support ends left
+      // of the split even though the decoder still sees it just to the right.
+      final scene = flatScene(1, winHi: 4e-30)..sigmaT[0] = 0.0;
+      const options = FourdgsWriteOptions(
+        profile: 'coarse',
+        maxDepth: 1,
+        minChunkGaussians: 1,
+      );
+      final bytes = writeFourdgsBytes(scene, 4e-30, options: options);
+      final whole = readFourdgsBytes(bytes);
+      final indexed = await openFourdgsIndexed(FourdgsBytes(bytes));
+      const probe = 2.1e-30;
+
+      expect(whole.gaussians.sigmaT.single, lessThan(1e-30));
+      expect(whole.gaussians.stateAt(probe).count, 1);
+      expect(indexed.chunksForTime(probe), isNotEmpty);
     });
 
     test('depth 0 writes one chunk per window interval', () {
@@ -1356,11 +1473,10 @@ void main() {
       }
     });
 
-    test('the coarse profile puts coefficients on the pitch it declares', () {
-      // `step_sh` is an encode-side value (spec §6.5): a decoder does nothing
-      // with it, which is exactly why the encoder must. A file that declares a
-      // pitch of 3 and writes every byte through has said something about
-      // itself that is not true, and the profile's SH allowance buys nothing.
+    test('the coarse profile keeps undeclared depths at eight bits', () {
+      // §6.5 defines omitted per-band depths as eight-bit identity. The
+      // profile's older `step_sh` field remains a conservative error bound; it
+      // is not an implicit request to reduce the coefficient bytes.
       final scene = buildScene(count: 64, shDegree: 2);
       final coarse = readFourdgsBytes(
         writeFourdgsBytes(
@@ -1372,29 +1488,14 @@ void main() {
       expect(coarse.quantization.stepSh, 3);
       expect(coarse.quantization.bounds['sh'], '1');
       final sh = coarse.gaussians.sh!;
-      for (int i = 0; i < sh.length; i++) {
-        // A bin centre, or the top of the byte range — the last bin's centre is
-        // 256 at this pitch, and a coefficient that left the byte would arrive
-        // at a reader as zero: the extreme positive coefficient read as the
-        // extreme negative one.
-        expect(
-          sh[i] % 3 == 1 || sh[i] == 255,
-          isTrue,
-          reason: 'coefficient $i is ${sh[i]}, off the pitch of 3 declared',
-        );
-      }
-      // Half the pitch is the promise, and it is kept against the input.
       final pairing = _pairByPosition(scene, coarse.gaussians);
       final row = 3 * scene.shCoefficients;
-      int worst = 0;
       for (int j = 0; j < pairing.length; j++) {
         final i = pairing[j];
         for (int k = 0; k < row; k++) {
-          final d = (sh[j * row + k] - scene.sh![i * row + k]).abs();
-          if (d > worst) worst = d;
+          expect(sh[j * row + k], scene.sh![i * row + k]);
         }
       }
-      expect(worst, lessThanOrEqualTo(1));
 
       // And the identity where the pitch is 1, which is what the other two
       // profiles declare — the byte is stored as it arrived.
@@ -1558,6 +1659,254 @@ void main() {
       for (final entry in readFourdgsBytes(bytes).chunkIndex) {
         expect(entry.bands, isEmpty);
       }
+    });
+  });
+
+  group('per-band bit depths', () {
+    test('the named ladders map to their exact grids and bounds', () {
+      expect(fourdgsShLadders['flat'], <int>[8, 8, 8]);
+      expect(fourdgsShLadders['balanced'], <int>[8, 6, 5]);
+      expect(fourdgsShLadders['aggressive'], <int>[6, 4, 3]);
+      // Pitch and bound are the same relationship every other grid has: the
+      // bound is exactly half the pitch, and eight bits is pitch 1, bound 0.
+      for (int bits = 3; bits <= 8; bits++) {
+        expect(fourdgsShStep(bits), 1 << (8 - bits));
+        expect(fourdgsShBound(bits), fourdgsShStep(bits) ~/ 2);
+      }
+      expect(fourdgsShBound(8), 0);
+    });
+
+    for (final ladder in <String>['balanced', 'aggressive']) {
+      test('$ladder declares its depths and holds their bounds', () {
+        final depths = fourdgsShLadders[ladder]!;
+        final scene = buildScene(count: 128, shDegree: 3);
+        final bytes = writeFourdgsBytes(
+          scene,
+          8.0,
+          options: FourdgsWriteOptions(shBitDepths: depths),
+        );
+        final decoded = readFourdgsBytes(bytes);
+
+        // The appended field, read the way a reader that does not know it would
+        // step over it: past the record's original fields, by length.
+        expect(declaredShBitDepths(bytes), depths);
+
+        final q = decoded.quantization;
+        for (int band = 1; band <= 3; band++) {
+          expect(
+            q.bounds['sh_band$band'],
+            '${fourdgsShBound(depths[band - 1])}',
+            reason: 'band $band must declare the bound its depth guarantees',
+          );
+        }
+        // `step_sh` and the single `sh` bound predate per-band depths, so they
+        // carry the coarsest band's — an upper bound for a consumer that reads
+        // them and not the appended field, rather than a number that is true of
+        // one band and wrong for the others.
+        expect(q.stepSh, fourdgsShStep(depths.reduce(math.min)));
+        expect(q.bounds['sh'], '${fourdgsShBound(depths.reduce(math.min))}');
+
+        // And the coefficients themselves, every one of them.
+        final pairing = _pairByPosition(scene, decoded.gaussians);
+        final row = 3 * scene.shCoefficients;
+        final worst = <int, int>{1: 0, 2: 0, 3: 0};
+        for (int j = 0; j < pairing.length; j++) {
+          final i = pairing[j];
+          for (int component = 0; component < 3; component++) {
+            for (int k = 0; k < scene.shCoefficients; k++) {
+              final band = k < 3 ? 1 : (k < 8 ? 2 : 3);
+              final at = j * row + component * scene.shCoefficients + k;
+              final from = i * row + component * scene.shCoefficients + k;
+              final deviation =
+                  (decoded.gaussians.sh![at] - scene.sh![from]).abs();
+              worst[band] = math.max(worst[band]!, deviation);
+              expect(
+                decoded.gaussians.sh![at],
+                fourdgsQuantizeSh(scene.sh![from], depths[band - 1]),
+                reason: 'band $band coefficient $k of gaussian $i',
+              );
+            }
+          }
+        }
+        for (int band = 1; band <= 3; band++) {
+          expect(
+            worst[band],
+            lessThanOrEqualTo(fourdgsShBound(depths[band - 1])),
+          );
+        }
+      });
+    }
+
+    test('re-encoding at the depth a file already carries changes no byte', () {
+      // Centring at bin midpoints is what makes the rounding idempotent, and
+      // idempotence is what lets a pipeline re-encode without compounding loss.
+      final scene = buildScene(count: 64, shDegree: 3);
+      const options = FourdgsWriteOptions(shBitDepths: <int>[6, 4, 3]);
+      final once = readFourdgsBytes(
+        writeFourdgsBytes(scene, 8.0, options: options),
+      );
+      final twice = readFourdgsBytes(
+        writeFourdgsBytes(once.gaussians, 8.0, options: options),
+      );
+      expect(twice.gaussians.sh, orderedEquals(once.gaussians.sh!));
+    });
+
+    test('no depths append no bytes to the Quantization record', () {
+      // Not a zero count: the Quantization record retains its pre-field
+      // spelling when the option is absent.
+      final scene = buildScene(count: 32, shDegree: 2);
+      final plain = writeFourdgsBytes(scene, 8.0);
+      expect(declaredShBitDepths(plain), isEmpty);
+      expect(
+        readFourdgsBytes(plain).quantization.bounds.containsKey('sh_band1'),
+        isFalse,
+      );
+
+      final flat = writeFourdgsBytes(
+        scene,
+        8.0,
+        options: const FourdgsWriteOptions(shBitDepths: <int>[8, 8, 8]),
+      );
+      // `flat` is eight bits everywhere, so it changes no coefficient — but it
+      // is still a declaration, and the file says so.
+      expect(declaredShBitDepths(flat), <int>[8, 8]);
+      expect(
+        readFourdgsBytes(flat).gaussians.sh,
+        orderedEquals(readFourdgsBytes(plain).gaussians.sh!),
+      );
+    });
+
+    test('capping bands also caps the Header degree', () {
+      final bytes = writeFourdgsBytes(
+        buildScene(count: 32, shDegree: 3),
+        8.0,
+        options: const FourdgsWriteOptions(shBands: 1, shBitDepths: <int>[6]),
+      );
+      final decoded = readFourdgsBytes(bytes);
+      expect(decoded.header.shDegree, 1);
+      expect(declaredShBitDepths(bytes), <int>[6]);
+      expect(
+        decoded.chunkIndex.expand(
+          (FourdgsChunkIndexEntry e) =>
+              e.bands.map((FourdgsBandRange range) => range.band),
+        ),
+        everyElement(1),
+      );
+    });
+
+    test(
+      'a ladder shorter than the scene writes is refused, not filled in',
+      () {
+        expect(
+          () => writeFourdgsBytes(
+            buildScene(count: 32, shDegree: 3),
+            8.0,
+            options: const FourdgsWriteOptions(shBitDepths: <int>[8, 6]),
+          ),
+          throwsA(
+            isA<FourdgsInvalidInput>().having(
+              (FourdgsInvalidInput e) => e.message,
+              'message',
+              allOf(contains('declares 2 bands'), contains('writes 3')),
+            ),
+          ),
+        );
+      },
+    );
+
+    test('a depth outside 3..8 is refused', () {
+      for (final bits in <int>[2, 9]) {
+        expect(
+          () => writeFourdgsBytes(
+            buildScene(count: 32, shDegree: 1),
+            8.0,
+            options: FourdgsWriteOptions(shBitDepths: <int>[bits]),
+          ),
+          throwsA(isA<FourdgsInvalidInput>()),
+          reason: '$bits bits',
+        );
+      }
+    });
+
+    test('an invalid depth is refused before scene quantization', () {
+      final scene = buildScene(count: 1, shDegree: 1);
+      // This finite time would overflow its i32 bin if grid work ran first.
+      scene.muT[0] = 3e38;
+      expect(
+        () => writeFourdgsBytes(
+          scene,
+          8.0,
+          options: const FourdgsWriteOptions(shBitDepths: <int>[2]),
+        ),
+        throwsA(
+          isA<FourdgsInvalidInput>().having(
+            (FourdgsInvalidInput error) => error.message,
+            'message',
+            contains('SH bit depth'),
+          ),
+        ),
+      );
+    });
+
+    test('depths on a scene with no harmonics are simply unused', () {
+      final bytes = writeFourdgsBytes(
+        buildScene(count: 32),
+        8.0,
+        options: const FourdgsWriteOptions(shBitDepths: <int>[6, 4, 3]),
+      );
+      expect(declaredShBitDepths(bytes), isEmpty);
+      expect(readFourdgsBytes(bytes).header.shDegree, 0);
+    });
+
+    test('no per-band depths preserve eight-bit coefficients', () {
+      // §6.5 makes an omitted depth declaration eight-bit identity. `step_sh`
+      // predates per-band depths and remains a conservative profile bound; it
+      // does not request a second, implicit coefficient grid.
+      final scene = buildScene(count: 32, shDegree: 1);
+      final bytes = writeFourdgsBytes(
+        scene,
+        8.0,
+        options: const FourdgsWriteOptions(profile: 'coarse'),
+      );
+      final decoded = readFourdgsBytes(bytes);
+      expect(decoded.quantization.stepSh, 3);
+      expect(decoded.quantization.bounds['sh'], '1');
+
+      final pairing = _pairByPosition(scene, decoded.gaussians);
+      final row = 3 * scene.shCoefficients;
+      for (int j = 0; j < pairing.length; j++) {
+        final i = pairing[j];
+        for (int k = 0; k < row; k++) {
+          final raw = scene.sh![i * row + k];
+          expect(decoded.gaussians.sh![j * row + k], raw);
+        }
+      }
+
+      // The top of the range is the case that overflows, so it is written down
+      // explicitly rather than left to whether the fixture happened to hit it.
+      final top = flatScene(4);
+      final withTop = FourdgsGaussianSet(
+        positions: top.positions,
+        scales: top.scales,
+        rotations: top.rotations,
+        colors: top.colors,
+        motions: top.motions,
+        muT: top.muT,
+        sigmaT: top.sigmaT,
+        winLo: top.winLo,
+        winHi: top.winHi,
+        shDegree: 1,
+        shCoefficients: 3,
+        sh: Uint8List(4 * 9)..fillRange(0, 4 * 9, 255),
+      );
+      final saturated = readFourdgsBytes(
+        writeFourdgsBytes(
+          withTop,
+          2.0,
+          options: const FourdgsWriteOptions(profile: 'coarse'),
+        ),
+      );
+      expect(saturated.gaussians.sh, everyElement(255));
     });
   });
 

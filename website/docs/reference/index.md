@@ -32,7 +32,7 @@ identical bytes with no per-language slerp or composition order of its own.
 | Spherical harmonics, degree 3                     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | SH band range-skipping                            | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | SH per-band bit depth, decode                     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| SH per-band bit depth, encode                     | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
+| SH per-band bit depth, encode                     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Spatial audio sources (optional)                  | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Multiple independent audio sources                | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Moving audio source reconstruction                | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
@@ -225,10 +225,12 @@ The encode row is proved the way the other encode rows are: Python's by the corp
 re-encodes every variant and asserts its checksum, and Rust's by `encode-roundtrip.sh`, which now
 re-encodes every SH-bearing variant at per-band depths and requires the Python decoder to agree with
 the Rust one about the result — and, separately, to read back the depths that were declared. A file
-whose coefficients and whose declaration disagree fails one check or the other. TypeScript, C++ and
-Swift are proved by the cross-language encode gate below, which runs the same per-band pass: the
-coefficients each encoder coarsened must come back out of the Python decoder as the same bytes, and
-the appended depths must read as the ones written.
+whose coefficients and whose declaration disagree fails one check or the other. TypeScript, C++,
+Swift and Dart are proved by the cross-language encode gate below, which runs the same per-band
+pass: the coefficients each encoder coarsened must come back out of the Python decoder as the same
+bytes, and the appended depths must read as the ones written. Dart's unit suite additionally pins
+the named ladders and checks every emitted coefficient against the exact per-band grid and bound it
+declares.
 
 **SH band range-skipping** is proved by a byte count taken at the transport rather than by a decoded
 value: each runner reads a chunk at every band cap and asserts the bytes transferred equal exactly
@@ -299,26 +301,32 @@ Dart's is proved the way Rust's is, and for the same reason: it is a second enco
 binding, sharing no code with the other five. `dart/encode-roundtrip.sh` re-encodes every variant
 with the Dart writer and then requires the **Dart and Python decoders to produce identical canonical
 JSON** from the result, on both read paths in each language, asserting byte-identical output across
-two encodes on the way. Both paths, because they fail differently: the streamed one never looks at
-the index, so a file with a wrong summary offset or a wrong chunk range still decodes there and only
-the indexed one notices. **Chunked encode** rides the same gate: the writer partitions each scene
-into the same interval tree the reference builds — up to 42 chunks on the ten-window variants — so
-every one of those decodes is a seek across a multi-chunk file rather than a read of a single one.
+two encodes on the way. Both paths, because they reach the same state differently: the streamed one
+walks records from the front while the indexed one opens through the Footer and Chunk Index. That
+agreement alone does not prove instant-seek coverage, because the canonical indexed runner reads
+every entry; the cross-language gate below adds the missing geometry invariant. **Chunked encode**
+rides both gates: the writer emits up to 42 chunks on the ten-window variants, all four decodes
+agree, and the candidate's own index is checked against its reconstructed support. The
+Python-decoder gate stays because it is the one that survives a machine with no Rust toolchain.
 
-TypeScript, C++ and Swift are proved by the cross-language encode gate,
+TypeScript, C++, Swift and Dart are proved by the cross-language encode gate,
 `tests/conformance/encode_roundtrip.py`. It re-encodes every variant's decoded gaussians twice —
 once with the language under test, once with a shared Rust reference that writes gaussians alone
 (`encode_gaussians`) — and requires the Python decoder to read both files to the same summary. What
 "the same" means depends on the encoder. C++ and Swift reach the Rust writer through the C ABI
 (`fourdgs_writer_*`), so their files match the reference on every field; the gate therefore proves
 the binding wired the gaussians and options through correctly, which is the only thing a binding can
-get wrong. TypeScript is a genuine second encoder, so it makes its own byte-layout choices — how
-well `deflate` did, which order gaussians sit in a chunk — that a decoder cannot see and the
-specification does not fix; those fields are set aside and the diff rests on decoded content: the
-gaussian values, the chunk intervals, the statistics, the spherical-harmonic digest. The chunked and
-summary rows ride the same gate — the small chunk threshold the preset uses partitions the corpus
-scenes into a tree whose intervals both encoders must agree on, and the statistics record they both
-write carries the chunk count.
+get wrong. TypeScript and Dart are genuine second encoders, so they make their own byte-layout
+choices — how well `deflate` did, which order gaussians sit in a chunk — that a decoder cannot see
+and the specification does not fix; those fields are set aside and the diff rests on decoded
+content: the gaussian values, the non-layout statistics and the spherical-harmonic digest. Different
+correct partition heuristics do not have to produce the same intervals or chunk count.
+
+For Dart, the gate checks the candidate's geometry before setting those layout fields aside. A
+bounded framing scan requires every emitted Chunk to be indexed exactly once; each index population
+must match its decoded Chunk; every reconstructed support, clipped to its validity window, must fit
+the indexed half-open interval; and the indexed total must equal the Header population. The chunked
+row therefore claims a complete, range-seekable partition, not equality with the Rust writer's tree.
 
 **Fuzzed** is a property of an implementation, not a feature of the format, so it is not a row in
 this table — a row would imply the format has something called fuzzing that an SDK can support.

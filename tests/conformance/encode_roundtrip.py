@@ -94,11 +94,9 @@ SH_LADDER = ",".join(str(depth) for depth in SH_LADDER_DEPTHS)
 #: geometry gate rather than compared with Rust's. TypeScript retains the pre-existing exact
 #: interval/count comparison until its own geometry gate proves that feature directly.
 SECOND_ENCODERS = frozenset({"typescript", "dart"})
-#: Encoders whose round-trip CLI accepts the optional per-band depth argument. Dart's
-#: first independent writer proves its fixed quantization preset here; its CLI does not
-#: yet expose graded SH depths, so passing a third argument would test argv parsing rather
-#: than an encoder feature it claims.
-SH_LADDER_ENCODERS = frozenset(set(ENCODERS) - {"dart"})
+#: Encoders whose round-trip CLI accepts the optional per-band depth argument.
+#: The Dart SH layer adds that argument on top of its fixed-preset writer.
+SH_LADDER_ENCODERS = frozenset(ENCODERS)
 #: Gaussian-only Dart output deliberately clears the source's capture profile. Keep that
 #: compatibility normalization local to Dart: TypeScript's profile is part of the state
 #: its independent encoder must preserve.
