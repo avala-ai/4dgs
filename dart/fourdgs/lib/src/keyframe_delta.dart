@@ -940,7 +940,12 @@ decodeKeyframeDeltaIndexed(Uint8List data) {
       // cheap.
       final head =
           parseDeltaChunk(
-            _recordContent(data, entry.chunkOffset, entry.chunkLength),
+            _recordContent(
+              data,
+              entry.chunkOffset,
+              entry.chunkLength,
+              expectedOpcode: opDeltaChunk,
+            ),
           ).header;
       updateCount = head.updateCount;
       birthCount = head.birthCount;
@@ -974,10 +979,69 @@ decodeKeyframeDeltaIndexed(Uint8List data) {
   );
 }
 
-Uint8List _recordContent(Uint8List data, int offset, int length) {
-  final c = FourdgsCursor(Uint8List.sublistView(data, offset, offset + length));
-  c.u8();
-  return c.take(c.u64());
+Uint8List _recordContent(
+  Uint8List data,
+  int offset,
+  int length, {
+  required int expectedOpcode,
+  int? fileOffset,
+}) {
+  if (offset < 0 ||
+      length < recordHeaderBytes ||
+      offset + length > data.length) {
+    throw FourdgsMalformedFile(
+      'the indexed state record at byte ${fileOffset ?? offset} declares a '
+      '$length-byte '
+      'range outside the ${data.length}-byte buffer',
+    );
+  }
+  final int contentLength = _checkStateRecordHeader(
+    Uint8List.sublistView(data, offset, offset + recordHeaderBytes),
+    fileOffset: fileOffset ?? offset,
+    rangeLength: length,
+    expectedOpcode: expectedOpcode,
+  );
+  return Uint8List.sublistView(
+    data,
+    offset + recordHeaderBytes,
+    offset + recordHeaderBytes + contentLength,
+  );
+}
+
+int _checkStateRecordHeader(
+  Uint8List header, {
+  required int fileOffset,
+  required int rangeLength,
+  required int expectedOpcode,
+}) {
+  final c = FourdgsCursor(header);
+  final int opcode = c.u8();
+  final int contentLength = c.u64();
+  if (opcode != expectedOpcode) {
+    throw FourdgsMalformedFile(
+      'the indexed state record at byte $fileOffset is ${opcodeName(opcode)}; '
+      'expected ${opcodeName(expectedOpcode)}',
+    );
+  }
+  if (recordHeaderBytes + contentLength != rangeLength) {
+    throw FourdgsMalformedFile(
+      'the indexed state range at byte $fileOffset declares $rangeLength '
+      'bytes, but '
+      'its ${opcodeName(opcode)} framing declares '
+      '${recordHeaderBytes + contentLength}; the index must name exactly one '
+      'record',
+    );
+  }
+  return contentLength;
+}
+
+int _stateOpcode(FourdgsChunkIndexEntry entry) {
+  if (entry.kind == 0) return opChunk;
+  if (entry.kind == 1) return opDeltaChunk;
+  throw FourdgsMalformedFile(
+    'the index entry at byte ${entry.chunkOffset} declares chunk_kind '
+    '${entry.kind}; expected 0 (keyframe) or 1 (delta)',
+  );
 }
 
 /// The composed state of one index entry: its chain, walked and telescoped.
@@ -998,9 +1062,15 @@ KeyframeDeltaState composeKeyframeDeltaChain(
   final chain = chainFrom(index, entry, byOffset: byOffset);
   KeyframeDeltaState? state;
   for (final link in chain) {
+    final int expectedOpcode = _stateOpcode(link);
     state = _composeLink(
       state,
-      _recordContent(data, link.chunkOffset, link.chunkLength),
+      _recordContent(
+        data,
+        link.chunkOffset,
+        link.chunkLength,
+        expectedOpcode: expectedOpcode,
+      ),
       link,
     );
   }
@@ -1025,6 +1095,7 @@ Future<KeyframeDeltaState> readKeyframeDeltaChain(
   final int size = await source.size();
   KeyframeDeltaState? state;
   for (final link in chain) {
+    final int expectedOpcode = _stateOpcode(link);
     if (link.chunkOffset < 0 ||
         link.chunkLength < recordHeaderBytes ||
         link.chunkOffset + link.chunkLength > size) {
@@ -1033,6 +1104,25 @@ Future<KeyframeDeltaState> readKeyframeDeltaChain(
         'range outside the $size-byte resource',
       );
     }
+    final Uint8List header;
+    try {
+      header = await source.read(link.chunkOffset, recordHeaderBytes);
+    } on RangeError catch (error) {
+      throw FourdgsMalformedFile(
+        'the state record at ${link.chunkOffset} could not be read as a '
+        '$recordHeaderBytes-byte framing header: $error',
+      );
+    }
+    // Price the indexed range only after its fixed-size framing proves it is
+    // exactly one state record. Otherwise a forged chunk_length can make this
+    // public range API allocate nearly the whole file before noticing that the
+    // first record in it was small.
+    _checkStateRecordHeader(
+      header,
+      fileOffset: link.chunkOffset,
+      rangeLength: link.chunkLength,
+      expectedOpcode: expectedOpcode,
+    );
     final Uint8List blob;
     try {
       blob = await source.read(link.chunkOffset, link.chunkLength);
@@ -1044,7 +1134,13 @@ Future<KeyframeDeltaState> readKeyframeDeltaChain(
     }
     state = _composeLink(
       state,
-      _recordContent(blob, 0, link.chunkLength),
+      _recordContent(
+        blob,
+        0,
+        link.chunkLength,
+        expectedOpcode: expectedOpcode,
+        fileOffset: link.chunkOffset,
+      ),
       link,
     );
   }

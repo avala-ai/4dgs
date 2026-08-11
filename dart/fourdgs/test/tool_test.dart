@@ -164,6 +164,24 @@ void main() {
       expect(opcodeName(0x81), 'Private(0x81)');
     });
 
+    test('an impossible declared checksum range is diagnosed', () async {
+      final FourdgsInspection report = await inspectFourdgs(
+        FourdgsBytes(_minimal(summaryStart: 1 << 30, summaryCrc: 1)),
+      );
+      expect(report.coverage, isNull);
+      expect(
+        report.coverageError,
+        allOf(
+          contains('summary_start is 1073741824'),
+          contains('Footer at byte'),
+        ),
+      );
+      expect(
+        formatFourdgsInspection(report),
+        isNot(contains('declares no summary checksum')),
+      );
+    });
+
     test('the JSON form carries the same offsets the table prints', () async {
       final FourdgsInspection report = await inspectFourdgs(
         FourdgsBytes(_minimal()),
@@ -401,6 +419,36 @@ void main() {
       );
     });
 
+    test('extension notes have bounded retained detail', () async {
+      final BytesBuilder extras = BytesBuilder();
+      for (int i = 0; i < 70; i++) {
+        extras.add(_record(0x81, Uint8List(0)));
+      }
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(_minimal(extra: extras.toBytes())),
+      );
+      final List<String> notes = _messages(report, FourdgsSeverity.note);
+      expect(notes, hasLength(65));
+      expect(
+        notes.last,
+        '6 additional record notes omitted after the first 64; validation '
+        'still checked every record',
+      );
+    });
+
+    test('reserved provenance opcodes are invalid in version 1', () async {
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(_minimal(extra: _record(0x26, Uint8List(0)))),
+      );
+      expect(report.ok, isFalse);
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(
+          allOf(contains('reserved provenance opcode 0x26'), contains('byte')),
+        ),
+      );
+    });
+
     test('no read is ever the whole file', () async {
       // The claim this validator's API makes: it takes a resource rather than a
       // byte array because it never has to hold one. A file it read whole would
@@ -490,7 +538,7 @@ void main() {
       expect(report.ok, isFalse);
       expect(
         _messages(report, FourdgsSeverity.error),
-        contains(startsWith('the object layer does not decode:')),
+        contains(startsWith('the ObjectTable record at byte')),
       );
     });
 
@@ -505,7 +553,7 @@ void main() {
         expect(report.ok, isFalse);
         expect(
           _messages(report, FourdgsSeverity.error),
-          contains(startsWith('the object layer does not decode:')),
+          contains(startsWith('the ObjectTable record at byte')),
         );
       },
     );
@@ -984,6 +1032,22 @@ void main() {
       expect(
         _messages(report, FourdgsSeverity.error),
         contains(contains('ShBandStream range for band 1')),
+      );
+    });
+
+    test('the index cannot omit a physical SH band', () async {
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(_keyframeDelta(bandElementCount: 1, omitIndexBands: true)),
+      );
+      expect(report.ok, isFalse);
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(
+          allOf(
+            contains('declares SH band ranges []'),
+            contains('expected exact sets'),
+          ),
+        ),
       );
     });
 
@@ -2061,6 +2125,7 @@ Uint8List _keyframeDelta({
   double chunkT0 = 0.0,
   double chunkT1 = 1.0,
   int? headerShDegree,
+  bool omitIndexBands = false,
 }) {
   final BytesBuilder headBuilder =
       BytesBuilder()
@@ -2132,8 +2197,8 @@ Uint8List _keyframeDelta({
         ..add(_u64(indexChunkOffset ?? chunkOffset))
         ..add(_u64(chunkRecord.length + indexChunkLengthExtra))
         ..add(_u32(1)) // gaussian_count
-        ..add(_u32(bandElementCount == null ? 0 : 1));
-  if (bandElementCount != null) {
+        ..add(_u32(bandElementCount == null || omitIndexBands ? 0 : 1));
+  if (bandElementCount != null && !omitIndexBands) {
     entry
       ..addByte(1)
       ..add(_u64(indexBandOffset ?? bandOffset))

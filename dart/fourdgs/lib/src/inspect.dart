@@ -105,10 +105,14 @@ Future<FourdgsSummaryCoverage?> _coverage(
       frame.length < footerFixedBytes ? frame.length : footerFixedBytes,
     ),
   );
-  if (footer.summaryCrc == 0 ||
-      footer.summaryStart == 0 ||
+  if (footer.summaryCrc == 0) return null;
+  if (footer.summaryStart < fourdgsMagic.length ||
       footer.summaryStart > frame.offset) {
-    return null;
+    throw FourdgsMalformedFile(
+      'Footer summary_start is ${footer.summaryStart} for a nonzero '
+      'summary_crc; expected a checksum range beginning after the opening '
+      'magic and no later than the Footer at byte ${frame.offset}',
+    );
   }
   // The summary ends where the Footer begins — taken from the walk rather than
   // computed from a Footer's expected size, so a Footer that a later revision

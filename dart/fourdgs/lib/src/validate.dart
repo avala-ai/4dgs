@@ -93,7 +93,12 @@ class FourdgsValidation {
 }
 
 class _Report {
+  static const int _detailedNoteLimit = 64;
+
   final List<FourdgsFinding> findings = <FourdgsFinding>[];
+  int _detailedNotes = 0;
+  int _omittedNotes = 0;
+  int? _omittedNoteAt;
 
   void error(String message) =>
       findings.add(FourdgsFinding(FourdgsSeverity.error, message));
@@ -101,8 +106,25 @@ class _Report {
   void warn(String message) =>
       findings.add(FourdgsFinding(FourdgsSeverity.warning, message));
 
-  void note(String message) =>
+  void note(String message) {
+    if (_detailedNotes < _detailedNoteLimit) {
       findings.add(FourdgsFinding(FourdgsSeverity.note, message));
+      _detailedNotes += 1;
+      return;
+    }
+    _omittedNotes += 1;
+    final finding = FourdgsFinding(
+      FourdgsSeverity.note,
+      '$_omittedNotes additional record notes omitted after the first '
+      '$_detailedNoteLimit; validation still checked every record',
+    );
+    if (_omittedNoteAt == null) {
+      _omittedNoteAt = findings.length;
+      findings.add(finding);
+    } else {
+      findings[_omittedNoteAt!] = finding;
+    }
+  }
 
   /// An error a reader raised, carrying its identifier and the byte if it has
   /// one.
@@ -838,9 +860,9 @@ Future<void> _checkObjectRecords(
 ) async {
   bool hasTable = false;
   final trackedIds = <int>{};
-  try {
-    await for (final FourdgsFrame frame in walkFourdgsFrames(source, walk)) {
-      if (frame.offset + frame.total > walk.size) continue;
+  await for (final FourdgsFrame frame in walkFourdgsFrames(source, walk)) {
+    if (frame.offset + frame.total > walk.size) continue;
+    try {
       if (frame.opcode == opObjectTable) {
         if (hasTable) {
           throw const FourdgsMalformedFile(
@@ -860,9 +882,12 @@ Future<void> _checkObjectRecords(
           );
         }
       }
+    } on FourdgsException catch (error) {
+      report.error(
+        'the ${opcodeName(frame.opcode)} record at byte ${frame.offset} does '
+        'not decode: ${_say(error)}',
+      );
     }
-  } on FourdgsException catch (error) {
-    report.error('the object layer does not decode: ${_say(error)}');
   }
 }
 
@@ -1063,9 +1088,9 @@ void _noteUnread(_Report report, FourdgsFrame frame) {
     // provenance are parsed below, from the ranges the indexed opener framed;
     // a Camera, a Metadata record or an Attachment is framed and stepped over.
   } else if (isProvenanceOpcode(frame.opcode)) {
-    report.note(
-      'reserved provenance record $hex — skipped, as required '
-      '(0x26-0x2F, section 5.15.6)',
+    report.error(
+      'reserved provenance opcode $hex appears at byte ${frame.offset}; '
+      'version 1 writers MUST NOT emit 0x26-0x2F (section 5.15.6)',
     );
   } else {
     report.note('unknown record $hex — skipped, as required');
@@ -1564,30 +1589,6 @@ Future<bool> _scanFramedChunks(
   return finishChunk();
 }
 
-/// Every nonempty state contribution carries exactly the degree the Header
-/// promises; degree zero carries no band records at all.
-bool _checkFramedBandCoverage(
-  Map<int, List<FourdgsBandRange>> bandsAt,
-  Map<int, int> populations,
-  int degree,
-  _Report report,
-) {
-  bool failed = false;
-  for (final MapEntry<int, List<FourdgsBandRange>> entry in bandsAt.entries) {
-    final int population = populations[entry.key] ?? 0;
-    failed =
-        _checkStateBandCoverage(
-          entry.key,
-          entry.value,
-          population,
-          degree,
-          report,
-        ) ||
-        failed;
-  }
-  return failed;
-}
-
 bool _checkStateBandCoverage(
   int offset,
   List<FourdgsBandRange> bands,
@@ -1683,14 +1684,39 @@ Future<void> _checkKeyframeDelta(
   int previousDepth = 0;
   int previousLevel = -1;
   int bandPopulation = -1;
+  int bandOwnerOffset = -1;
+  List<FourdgsBandRange> bandRun = <FourdgsBandRange>[];
+  Set<int> bandNumbers = <int>{};
+
+  bool finishBandRun() {
+    if (bandOwnerOffset < 0) return false;
+    final bool failed = _checkStateBandCoverage(
+      bandOwnerOffset,
+      bandRun,
+      bandPopulation,
+      scene.header.shDegree,
+      report,
+    );
+    if (indexedAt.containsKey(bandOwnerOffset)) {
+      framedBandsAt[bandOwnerOffset] = List<FourdgsBandRange>.of(bandRun);
+      bandPopulationAt[bandOwnerOffset] = bandPopulation;
+    }
+    bandOwnerOffset = -1;
+    bandPopulation = -1;
+    bandRun = <FourdgsBandRange>[];
+    bandNumbers = <int>{};
+    return failed;
+  }
 
   await for (final FourdgsFrame frame in walkFourdgsFrames(source, walk)) {
     if (frame.offset + frame.total > walk.size) continue;
     if (frame.opcode != opChunk &&
         frame.opcode != opDeltaChunk &&
         frame.opcode != opShBandStream) {
+      if (finishBandRun()) return;
       continue;
     }
+    if (frame.opcode != opShBandStream && finishBandRun()) return;
     int? framedBand;
     try {
       final Uint8List content = _content(
@@ -1698,7 +1724,7 @@ Future<void> _checkKeyframeDelta(
         frame.opcode,
       );
       if (frame.opcode == opShBandStream) {
-        if (bandPopulation < 0 || content.isEmpty) {
+        if (bandOwnerOffset < 0 || bandPopulation < 0 || content.isEmpty) {
           throw FourdgsMalformedFile(
             'the ShBandStream record at byte ${frame.offset} does not follow '
             'a state chunk whose band population is known',
@@ -1710,23 +1736,29 @@ Future<void> _checkKeyframeDelta(
           expectedBand: framedBand,
           expectedCount: bandPopulation,
         );
-        if (previousOffset >= 0) {
-          framedBandsAt
-              .putIfAbsent(previousOffset, () => <FourdgsBandRange>[])
-              .add(
-                FourdgsBandRange(
-                  band: framedBand,
-                  offset: frame.offset,
-                  length: frame.total,
-                ),
-              );
+        if (bandPopulation == 0 ||
+            framedBand < 1 ||
+            framedBand > scene.header.shDegree ||
+            !bandNumbers.add(framedBand)) {
+          throw FourdgsMalformedFile(
+            'the state chunk at byte $bandOwnerOffset is followed by SH band '
+            '$framedBand more than its declared population and degree permit; '
+            'expected each band from 1 through ${scene.header.shDegree} once',
+          );
         }
+        bandRun.add(
+          FourdgsBandRange(
+            band: framedBand,
+            offset: frame.offset,
+            length: frame.total,
+          ),
+        );
         continue;
       }
 
-      framedStateOffsets.add(frame.offset);
       final indexed = indexedAt[frame.offset];
       final FourdgsChunkIndexEntry? entry = indexed?.entry;
+      if (entry != null) framedStateOffsets.add(frame.offset);
       final int entryIndex = indexed?.index ?? -1;
       final String where =
           entry == null
@@ -1890,8 +1922,9 @@ Future<void> _checkKeyframeDelta(
         }
       }
       state.checkWindows(windows);
-      bandPopulationAt[frame.offset] = bandPopulation;
-      framedBandsAt.putIfAbsent(frame.offset, () => <FourdgsBandRange>[]);
+      bandOwnerOffset = frame.offset;
+      bandRun = <FourdgsBandRange>[];
+      bandNumbers = <int>{};
       previousState = state;
       previousOffset = frame.offset;
     } on FourdgsException catch (error) {
@@ -1912,14 +1945,7 @@ Future<void> _checkKeyframeDelta(
     }
   }
 
-  if (_checkFramedBandCoverage(
-    framedBandsAt,
-    bandPopulationAt,
-    scene.header.shDegree,
-    report,
-  )) {
-    return;
-  }
+  if (finishBandRun()) return;
 
   for (int i = 0; i < index.length; i++) {
     final FourdgsChunkIndexEntry entry = index[i];
@@ -2124,22 +2150,6 @@ Future<bool> _checkBands(
   required int resourceSize,
   List<FourdgsBandRange>? framedBands,
 }) async {
-  if (entry.bands.isEmpty) return false;
-  final int expectedCount;
-  try {
-    expectedCount = count ?? await _bandPopulation(source, entry);
-  } on FourdgsException catch (error) {
-    report.refused(
-      'the chunk at byte ${fourdgsCommas(entry.chunkOffset)} does not say how '
-      'many gaussians its bands carry: ',
-      error,
-      site: FourdgsRefusalSite(
-        entry.chunkOffset,
-        'the Chunk record at index entry $i',
-      ),
-    );
-    return true;
-  }
   for (final FourdgsBandRange band in entry.bands) {
     if (band.offset < 0 ||
         band.length < recordHeaderBytes ||
@@ -2165,6 +2175,49 @@ Future<bool> _checkBands(
       );
       return true;
     }
+  }
+  if (framedBands != null) {
+    final List<FourdgsBandRange> declared = List<FourdgsBandRange>.of(
+      entry.bands,
+    )..sort(_compareBandRanges);
+    final List<FourdgsBandRange> physical = List<FourdgsBandRange>.of(
+      framedBands,
+    )..sort(_compareBandRanges);
+    final bool exact =
+        declared.length == physical.length &&
+        declared.asMap().entries.every((MapEntry<int, FourdgsBandRange> item) {
+          final FourdgsBandRange other = physical[item.key];
+          return item.value.band == other.band &&
+              item.value.offset == other.offset &&
+              item.value.length == other.length;
+        });
+    if (!exact) {
+      report.error(
+        'Chunk Index entry $i declares SH band ranges '
+        '${_bandRanges(declared)}, but the physical records following the '
+        'state chunk at byte ${entry.chunkOffset} are '
+        '${_bandRanges(physical)}; expected exact sets',
+      );
+      return true;
+    }
+  }
+  if (entry.bands.isEmpty) return false;
+  final int expectedCount;
+  try {
+    expectedCount = count ?? await _bandPopulation(source, entry);
+  } on FourdgsException catch (error) {
+    report.refused(
+      'the chunk at byte ${fourdgsCommas(entry.chunkOffset)} does not say how '
+      'many gaussians its bands carry: ',
+      error,
+      site: FourdgsRefusalSite(
+        entry.chunkOffset,
+        'the Chunk record at index entry $i',
+      ),
+    );
+    return true;
+  }
+  for (final FourdgsBandRange band in entry.bands) {
     try {
       decodeShBandRecord(
         _content(await source.read(band.offset, band.length), opShBandStream),
@@ -2191,6 +2244,19 @@ Future<bool> _checkBands(
   }
   return false;
 }
+
+int _compareBandRanges(FourdgsBandRange a, FourdgsBandRange b) {
+  final int band = a.band.compareTo(b.band);
+  if (band != 0) return band;
+  final int offset = a.offset.compareTo(b.offset);
+  return offset != 0 ? offset : a.length.compareTo(b.length);
+}
+
+String _bandRanges(List<FourdgsBandRange> ranges) =>
+    <String>[
+      for (final FourdgsBandRange range in ranges)
+        '${range.band}:[${range.offset},${range.offset + range.length})',
+    ].toString();
 
 /// How many gaussians the bands of [entry] carry harmonics for.
 Future<int> _bandPopulation(

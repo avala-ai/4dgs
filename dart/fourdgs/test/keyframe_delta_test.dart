@@ -54,6 +54,48 @@ void main() {
     expect(decoded.header.gaussianCount, 5);
   });
 
+  test(
+    'a ranged chain prices exact framing before fetching a chunk range',
+    () async {
+      final Uint8List data = _bytes(_movingChained);
+      final decoded = decodeKeyframeDeltaIndexed(data);
+      final FourdgsChunkIndexEntry chainHead =
+          chainFrom(decoded.index, decoded.index.last).first;
+      final FourdgsChunkIndexEntry widened = FourdgsChunkIndexEntry(
+        t0: chainHead.t0,
+        t1: chainHead.t1,
+        chunkOffset: chainHead.chunkOffset,
+        chunkLength: data.length - chainHead.chunkOffset,
+        gaussianCount: chainHead.gaussianCount,
+        bands: chainHead.bands,
+        extended: chainHead.extended,
+        kind: chainHead.kind,
+        deltaMode: chainHead.deltaMode,
+        referenceOffset: chainHead.referenceOffset,
+        keyframeOffset: chainHead.keyframeOffset,
+        depth: chainHead.depth,
+        liveCount: chainHead.liveCount,
+      );
+      final List<FourdgsChunkIndexEntry> index = <FourdgsChunkIndexEntry>[
+        for (final FourdgsChunkIndexEntry item in decoded.index)
+          if (item.chunkOffset == chainHead.chunkOffset) widened else item,
+      ];
+      final _ReadSizes source = _ReadSizes(data);
+
+      await expectLater(
+        readKeyframeDeltaChain(source, index, index.last),
+        throwsA(
+          isA<FourdgsMalformedFile>().having(
+            (FourdgsMalformedFile error) => error.message,
+            'message',
+            contains('the index must name exactly one record'),
+          ),
+        ),
+      );
+      expect(source.largestRead, recordHeaderBytes);
+    },
+  );
+
   test('a wrong temporal model is refused on the keyframe-delta path', () {
     // A gaussian-birth file names a different model in its Header. The
     // keyframe-delta path must refuse it rather than mis-compose keyframe Chunks
@@ -395,6 +437,22 @@ void main() {
     expect(result.index.length, result.sequence.chunks.length);
     expect(result.sequence.chunks.every((c) => c.state.count >= 4), isTrue);
   });
+}
+
+class _ReadSizes implements FourdgsReadable {
+  _ReadSizes(this.bytes);
+
+  final Uint8List bytes;
+  int largestRead = 0;
+
+  @override
+  Future<int> size() async => bytes.length;
+
+  @override
+  Future<Uint8List> read(int offset, int length) async {
+    if (length > largestRead) largestRead = length;
+    return Uint8List.sublistView(bytes, offset, offset + length);
+  }
 }
 
 const String _movingChained =
