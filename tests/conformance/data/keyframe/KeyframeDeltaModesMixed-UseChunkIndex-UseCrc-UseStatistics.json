@@ -64,7 +64,7 @@
       "liveCount": "4",
       "t0": 5.0,
       "t1": 6.0,
-      "updateCount": "4"
+      "updateCount": "3"
     },
     {
       "birthCount": "0",
@@ -75,7 +75,7 @@
       "liveCount": "4",
       "t0": 6.0,
       "t1": 7.0,
-      "updateCount": "4"
+      "updateCount": "3"
     },
     {
       "birthCount": "0",
@@ -86,7 +86,7 @@
       "liveCount": "4",
       "t0": 7.0,
       "t1": 8.0,
-      "updateCount": "4"
+      "updateCount": "3"
     }
   ],
   "cutoff": 0.05,

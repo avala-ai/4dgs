@@ -392,12 +392,12 @@ def build_keyframe_delta_corpus() -> list[tuple[str, bytes, str]]:
     out: list[tuple[str, bytes, str]] = []
     for name, sequence_of, keyframe_every, delta_mode in KEYFRAME_DELTA_VARIANTS:
         samples = sequence_of()
-        # §11.3: every keyframe states its gaussian state at the Chunk's own t0. Keep the
-        # corpus input explicit about that invariant so it proves readers reject a stale
-        # temporal origin rather than relying on one SDK's writer to repair the sample.
-        for i, sample in enumerate(samples):
-            if i % keyframe_every == 0:
-                sample.gaussians.mu_t.fill(sample.t0)
+        # §11.3: every state statement uses that Chunk's t0 as its temporal origin.
+        # Keep the corpus input explicit about the invariant for both keyframes and
+        # delta-updated rows; otherwise the first delta after a cadence boundary writes
+        # a negative update that silently restores the old origin.
+        for sample in samples:
+            sample.gaussians.mu_t.fill(sample.t0)
         data = kdf.write_sequence(
             samples,
             _KD_DURATION,
