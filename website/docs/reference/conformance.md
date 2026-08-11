@@ -257,12 +257,14 @@ The middle column describes the decoder being exercised, not every byte the runn
 touches. Five indexed runners currently materialize the file once to inspect `temporal_model` before
 they construct the ranged reader; their byte counters begin after that pre-read. The TypeScript
 runner uses a bounded probe through its counting transport, so its total includes dispatch, but each
-per-cap measurement snapshots the counter afterwards and isolates only the capped load. A passing
-corpus therefore proves that the measured chunk reads skip unrequested SH bands. Swift is the
-exception: its extra check compares the core's `bytesForChunk` estimates and does not perform a
-capped load through a counting transport, so it does not prove that the binding honors `bandCap`
-when reading. An outside runner should keep dispatch bounded; the current per-cap measurements do
-not enforce it.
+per-cap measurement snapshots the counter afterwards and isolates only the capped load. The Python,
+Rust, Dart and TypeScript checks independently prove that narrower caps transfer fewer indexed
+bytes. C++ measures a capped load, but obtains its expected byte count from `bytesForChunk` on the
+same binding and accepts equal counts at every cap; a binding that consistently ignores the cap can
+therefore pass both sides of that comparison. Swift only compares the core's `bytesForChunk`
+estimates and performs no capped load through a counting transport. Neither binding currently proves
+that its read skips an unrequested band. An outside runner should keep dispatch bounded too; the
+current per-cap measurements do not enforce it.
 
 They are driven separately rather than left to whichever path a core would pick, because **they have
 to be able to disagree**. A streamed reader arrives at the Header front to back; an indexed one
@@ -286,15 +288,14 @@ precisely so that both paths can be asked to refuse all seven, and both are aske
 written into only one read path refuses half the files it should, and there is no other way to
 notice.
 
-Two of the seven do not currently prove that for the indexed path, and an outside author should know
-which. Both refusal-answering runners here read the Header before choosing a path — they have to,
-because a `keyframe-delta` file is summarized by a different function — and that pre-read validates
-the magic. So `BadMagic` and `FutureMajorVersion` are refused by the runner's own front-matter read,
-with the right identifier, before the indexed opener is called at all: deleting `check_magic` from
-the indexed path leaves the suite at 119 passed, 0 failed. The other five are genuinely reached
-through it — deleting the indexed path's `check_temporal_model` turns `UnknownTemporalModel` and
-`EmptyTemporalModel` red immediately. This is a property of how the runners are written rather than
-of the corpus, which is why it is recorded here rather than treated as coverage.
+Two of the seven do not prove every indexed core. The Python and Rust runners route an unrecognized
+version prefix to their indexed opener, so their indexed magic/version checks own `BadMagic` and
+`FutureMajorVersion`. TypeScript instead calls `checkMagic` in its bounded temporal-model probe; C++
+and Swift call `peekTemporalModel` on a whole-file buffer. Those three therefore produce the right
+refusal before their indexed opener is called, and deleting the corresponding check from the indexed
+core can leave both prefix variants green. The other five invalid variants do reach those indexed
+paths. This is a property of how the runners are written rather than of the corpus, which is why it
+is recorded here instead of credited as two-path proof.
 
 Encoding is proved by a different program — `tests/conformance/encode_roundtrip.py`, which drives an
 `<encoder> <in.4dgs> <out.4dgs> [sh-bit-depths]` CLI and diffs its output against the Rust reference
@@ -404,27 +405,30 @@ If decoding fails without one — a truncated transport, an I/O error, an ordina
 runner prints no refusal document, writes its diagnosis to stderr and exits non-zero. In particular,
 `{"refused": ""}` is not the representation of an unnamed error: it exits zero and therefore claims
 the runner produced a valid answer, even though the empty string is not an identifier the format
-defines. The Rust runners preserve this split. The two Python runners currently do not: they catch
-every `FourdgsError`, substitute `""` for a missing code and exit zero. That is a runner defect
+defines. The Rust and C++ runners preserve this split. Python, TypeScript and Swift currently do
+not: their entry points catch their package error type, substitute `""` for a missing code and exit
+zero. An empty identifier matches none of today's invalid expectations, so it is red there, but the
+same handling misclassifies an unnamed decoder error as an answered refusal. That is a runner defect
 ([#208](https://github.com/avala-ai/4dgs/issues/208)), not an alternative protocol. An outside
-implementation that cannot name a decoder error must fail the invocation rather than copy Python's
-empty refusal.
+implementation that cannot name a decoder error must fail the invocation rather than copy those
+empty refusals.
 
 Whether any of this runs at all is gated at family granularity by `REFUSAL_FAMILIES`
 ([`run.py:114`](https://github.com/avala-ai/4dgs/blob/main/tests/conformance/run.py#L114)), which
-today holds `python` and `rust`. A family absent from it skips all seven invalid variants exactly as
+today holds `python`, `rust`, `typescript`, `cpp` and `swift`; Dart is the only built-in family that
+skips the invalid corpus. A family absent from the set skips all seven invalid variants exactly as
 it would skip any variant it declines — 105 checks rather than 119 — and the feature matrix is where
 that shows up publicly. The consequence for an outside implementation is sharp: a runner that
 answers every refusal perfectly proves nothing until its family is named in that set, which today
 means editing the harness. It is the hardest edge an out-of-tree runner meets, and the clearest
 thing #137 has to solve.
 
-The two **indexed** refusal-answering runners inspect the version prefix before Header dispatch. If
-it is the exact version-1 magic, they read through the Header's length-prefixed `profile` and
-`library` fields to choose the gaussian-birth or keyframe-delta indexed decoder. If the prefix
-differs — including `BadMagic` and `FutureMajorVersion` — they bypass that Header read and route to
-the gaussian-birth indexed opener. The selected opener owns the magic rule, so it produces the
-refusal without asking dispatch code to parse an unrecognized layout.
+The Python and Rust **indexed** runners inspect the version prefix before Header dispatch. If it is
+the exact version-1 magic, they read through the Header's length-prefixed `profile` and `library`
+fields to choose the gaussian-birth or keyframe-delta indexed decoder. If the prefix differs —
+including `BadMagic` and `FutureMajorVersion` — they bypass that Header read and route to the
+gaussian-birth indexed opener. The selected opener owns the magic rule, so it produces the refusal
+without asking dispatch code to parse an unrecognized layout.
 
 For a recognized version-1 file, the Header pre-read is still dispatch rather than the validation
 this suite credits. Mutation pins that distinction: deleting `check_magic` from either indexed
@@ -482,11 +486,13 @@ and indentation are free for the same reason — the expectations are pretty-pri
 because a human reads the diff, not because the comparison cares.
 
 **Type is not spelling.** `"50"` and `50` are not equal, and this is the rule that catches people.
-The summary emits 64-bit integers **as strings** — `gaussianCount`, `byteLength`, every count and
-every offset — so that a JSON parser backed by doubles cannot silently round one. A runner that
-emits those as JSON numbers **fails**, with digits that match exactly. It is not a formatting
-difference and no amount of re-reading the diff will make it into one: the failing key is a number
-where the expectation has a string.
+The summary emits potentially 64-bit counts, lengths and offsets **as strings** — for example
+`gaussianCount`, `sampleCount`, `byteLength`, `keyframeCount` and every summary offset — so that a
+JSON parser backed by doubles cannot silently round one. Dimensions and other small scalar fields
+retain their schema types: `objects.embeddingDim`, for example, is a JSON number. A runner that
+stringifies a numeric dimension or emits a string-count as a JSON number **fails**, with digits that
+match exactly. It is not a formatting difference and no amount of re-reading the diff will change
+the mismatched type.
 
 There is one Python equality loophole in that statement: `bool` is a subclass of `int`, so the
 current comparison accepts JSON `1` for `true` and `0` for `false`. That affects fields such as
