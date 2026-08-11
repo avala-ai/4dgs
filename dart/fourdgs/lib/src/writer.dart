@@ -34,6 +34,7 @@ import 'exceptions.dart';
 import 'model.dart';
 import 'opcode.dart';
 import 'quantization.dart';
+import 'records.dart' show maxWindowsPerScene;
 import 'serialization.dart';
 
 /// The caller handed the encoder something no conforming file can be written
@@ -199,6 +200,13 @@ void writeFourdgsToSink(
       'the scene profile "keyframed" promises a keyframe-delta temporal model '
       'with indexed state chunks and Statistics, while this writer emits the '
       'gaussian-birth model; use the sequence writer or leave the profile empty',
+    );
+  }
+  if (options.sceneProfile == 'capture') {
+    throw const FourdgsInvalidInput(
+      'the scene profile "capture" promises finite windows, multiple indexed '
+      'chunks, and Statistics; this reference writer does not yet enforce all '
+      'three promises, so leave the scene profile empty',
     );
   }
   _checkInput(gaussians, options.cutoff);
@@ -718,36 +726,34 @@ int _bin(double v, String attribute, int gaussian) {
 /// Windows repeat heavily — one per span the scene was fitted over — so the
 /// per-gaussian cost is an index rather than two floats.
 class _WindowTable {
-  _WindowTable(this.windows, this.index);
+  _WindowTable(this.windows);
 
   factory _WindowTable.of(FourdgsGaussianSet g) {
-    final pairs = <List<double>>[
-      for (int i = 0; i < g.count; i++) <double>[g.winLo[i], g.winHi[i]],
-    ];
-    pairs.sort(
-      (a, b) => a[0] != b[0] ? a[0].compareTo(b[0]) : a[1].compareTo(b[1]),
-    );
-    final distinct = <List<double>>[];
-    for (final pair in pairs) {
-      if (distinct.isEmpty ||
-          distinct.last[0] != pair[0] ||
-          distinct.last[1] != pair[1]) {
-        distinct.add(pair);
+    // Retain only distinct windows while scanning. A list pair per gaussian
+    // made even a scene with one shared window allocate and sort millions of
+    // temporary heap objects before the sink could emit its first record.
+    final pairs = <(double, double)>{};
+    for (int i = 0; i < g.count; i++) {
+      pairs.add((g.winLo[i], g.winHi[i]));
+      if (pairs.length > maxWindowsPerScene) {
+        throw FourdgsInvalidInput(
+          'the scene contains more than $maxWindowsPerScene distinct validity '
+          'windows; this SDK cannot read a larger Window Table',
+        );
       }
     }
-    if (distinct.isEmpty) distinct.add(<double>[0.0, 0.0]);
-
-    final index = Int32List(g.count);
-    for (int i = 0; i < g.count; i++) {
-      index[i] = _rank(distinct, g.winLo[i], g.winHi[i]);
-    }
-    return _WindowTable(distinct, index);
+    if (pairs.isEmpty) pairs.add((0.0, 0.0));
+    final distinct = <List<double>>[
+      for (final (lo, hi) in pairs) <double>[lo, hi],
+    ]..sort(
+      (a, b) => a[0] != b[0] ? a[0].compareTo(b[0]) : a[1].compareTo(b[1]),
+    );
+    return _WindowTable(distinct);
   }
 
   final List<List<double>> windows;
-  final Int32List index;
 
-  static int _rank(List<List<double>> windows, double lo, double hi) {
+  int rank(double lo, double hi) {
     int low = 0;
     int high = windows.length - 1;
     while (low < high) {
@@ -876,7 +882,7 @@ _Quantized _quantize(
     sigma[row] = sigmaBin;
     flags[row] = neverFades ? flagNeverFades : 0;
 
-    final w = table.index[i];
+    final w = table.rank(g.winLo[i], g.winHi[i]);
     windowIndex[row] = w;
     final window = table.windows[w];
 

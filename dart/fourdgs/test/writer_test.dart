@@ -216,7 +216,7 @@ void main() {
         scene,
         8.0,
         options: const FourdgsWriteOptions(
-          sceneProfile: 'capture',
+          sceneProfile: 'baked',
           library: 'a test',
           attributes: <String, String>{'zebra': '1', 'alpha': '2'},
         ),
@@ -231,7 +231,7 @@ void main() {
       expect(decoded.header.gaussianCount, scene.count);
       expect(decoded.header.durationSec, 8.0);
       expect(decoded.header.temporalModel, 'gaussian-birth');
-      expect(decoded.header.profile, 'capture');
+      expect(decoded.header.profile, 'baked');
       expect(decoded.header.library, 'a test');
       expect(decoded.header.cutoff, fourdgsDefaultCutoff);
       expect(decoded.header.attributes, <String, String>{
@@ -1328,8 +1328,22 @@ void main() {
           ),
         ),
       );
+      expect(
+        () => writeFourdgsBytes(
+          buildScene(count: 8),
+          8.0,
+          options: const FourdgsWriteOptions(sceneProfile: 'capture'),
+        ),
+        throwsA(
+          isA<FourdgsInvalidInput>().having(
+            (FourdgsInvalidInput e) => e.message,
+            'message',
+            allOf(contains('capture'), contains('Statistics')),
+          ),
+        ),
+      );
       // The profiles this writer can keep are unaffected.
-      for (final profile in <String>['', 'capture', 'baked']) {
+      for (final profile in <String>['', 'baked']) {
         expect(
           () => writeFourdgsBytes(
             buildScene(count: 8),
@@ -1340,6 +1354,27 @@ void main() {
           reason: profile,
         );
       }
+    });
+
+    test('the writer never emits a Window Table its reader refuses', () {
+      final scene = flatScene(maxWindowsPerScene + 1);
+      for (int i = 0; i < scene.count; i++) {
+        scene.winLo[i] = i.toDouble();
+        scene.winHi[i] = i + 0.5;
+      }
+      expect(
+        () => writeFourdgsBytes(scene, scene.count.toDouble()),
+        throwsA(
+          isA<FourdgsInvalidInput>().having(
+            (FourdgsInvalidInput e) => e.message,
+            'message',
+            allOf(
+              contains('$maxWindowsPerScene'),
+              contains('distinct validity windows'),
+            ),
+          ),
+        ),
+      );
     });
 
     test('NaN and cross-SDK-ambiguous infinite empty windows are refused', () {
