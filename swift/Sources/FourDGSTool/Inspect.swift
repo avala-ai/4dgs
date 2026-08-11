@@ -15,6 +15,14 @@
 
 import FourDGS
 
+func walk(_ source: ToolReader) throws -> Walk {
+    try walk(source, retaining: { _ in true })
+}
+
+public func walk(_ bytes: [UInt8]) throws -> Walk {
+    try walk(ToolReader(InMemoryReader(bytes)))
+}
+
 /// One table row, in the column widths the Rust and C++ tools print. The tools are expected to
 /// agree, and a report a reader diffs is a report where alignment is part of the agreement.
 private func row(

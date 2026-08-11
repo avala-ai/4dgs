@@ -9,6 +9,12 @@
 import FourDGS
 import CFourDGS
 
+func readU16(_ bytes: [UInt8], at: UInt64) -> UInt16? {
+    guard at <= UInt64(bytes.count), UInt64(bytes.count) - at >= 2 else { return nil }
+    let start = Int(at)
+    return UInt16(bytes[start]) | (UInt16(bytes[start + 1]) << 8)
+}
+
 public enum Severity: Int, Comparable {
     case note
     case warning
@@ -459,7 +465,7 @@ private func syntheticChunkPrefix(
 
 private func deltaGroupReader(
     _ source: ToolReader, header: Frame, quantization: Frame, windowTable: Frame?,
-    temporalModelOffset: UInt64, fields: ChunkFields, group: DeltaGroup, band: Frame? = nil
+    temporalModelOffset: UInt64, fields: ChunkFields, group: DeltaGroup, bands: [Frame] = []
 ) throws -> SlicedReader {
     var slices = frontMatterSlices(
         header: header, quantization: quantization, windowTable: windowTable,
@@ -482,7 +488,7 @@ private func deltaGroupReader(
                 literal: try group.source.exactly(
                     offset: group.offset, count: length, record: "DeltaChunk \(group.name) group")))
     }
-    if let band { slices.append(SourceSlice(offset: band.offset, length: band.total)) }
+    for band in bands { slices.append(SourceSlice(offset: band.offset, length: band.total)) }
     return SlicedReader(source: source, slices: slices)
 }
 
@@ -499,6 +505,7 @@ private func validatePhysicalRecords(
     var scanReport = Report()
     var byOffset: [UInt64: [Int]] = [:]
     for (i, entry) in index.enumerated() { byOffset[entry.offset, default: []].append(i) }
+    var seenEntries: Set<Int> = []
     var bandsByOffset: [UInt64: [(token: Int, entry: Int, band: UInt8, length: UInt64)]] = [:]
     var bandToken = 0
     for (i, entry) in index.enumerated() {
@@ -509,7 +516,9 @@ private func validatePhysicalRecords(
         }
     }
     var seenBands: Set<Int> = []
-    var stateFrames: [UInt64: Frame] = [:]
+    var currentState: Frame?
+    var currentBands: [Frame] = []
+    var currentBandNumbers: Set<UInt8> = []
 
     var header: Frame?
     var quantization: Frame?
@@ -517,6 +526,18 @@ private func validatePhysicalRecords(
     var firstStateError: (FourDGSError, Site)?
     var summaryStartsOnBoundary = summary?.start == summary?.end
     var summaryStructureReported = false
+
+    func physicalBandSite(_ frame: Frame) -> Site {
+        guard let address = bandsByOffset[frame.offset]?.first else {
+            return Site(
+                offset: frame.offset, what: "the physical SH Band Stream at byte \(frame.offset)")
+        }
+        return Site(
+            offset: frame.offset,
+            what:
+                "the SH Band Stream for band \(address.band) of the Chunk at index entry "
+                + "\(address.entry)")
+    }
 
     do {
         _ = try walk(
@@ -533,7 +554,15 @@ private func validatePhysicalRecords(
 
                 if let summary, summary.start <= summary.end {
                     let frameEnd = frame.offset + frame.total
-                    if frame.offset == summary.start { summaryStartsOnBoundary = true }
+                    if frame.offset == summary.start {
+                        summaryStartsOnBoundary = true
+                        if frame.opcode != Opcode.chunkIndex && !summaryStructureReported {
+                            scanReport.error(
+                                "the Footer's summary_start \(summary.start) names "
+                                    + "\(opcodeName(frame.opcode)); expected the first ChunkIndex")
+                            summaryStructureReported = true
+                        }
+                    }
                     if !summaryStructureReported && frame.offset < summary.start
                         && frameEnd > summary.start
                     {
@@ -563,6 +592,35 @@ private func validatePhysicalRecords(
                 }
 
                 if frame.opcode == Opcode.shBandStream {
+                    var physicalBand: UInt8?
+                    do {
+                        guard frame.length > 0 else {
+                            throw FourDGSError.malformed(
+                                offset: Int64(clamping: frame.offset), record: "SH Band Stream",
+                                field: "band", reason: "the record is empty; expected band 1, 2, or 3")
+                        }
+                        let band = try source.exactly(
+                            offset: frame.offset + recordHeaderSize, count: 1,
+                            record: "SH Band Stream band")[0]
+                        guard (1...3).contains(band) else {
+                            throw FourDGSError.malformed(
+                                offset: Int64(clamping: frame.offset + recordHeaderSize),
+                                record: "SH Band Stream", field: "band",
+                                reason: "the record names band \(band); expected 1, 2, or 3")
+                        }
+                        physicalBand = band
+                        guard currentBandNumbers.insert(band).inserted else {
+                            throw FourDGSError.malformed(
+                                offset: Int64(clamping: frame.offset + recordHeaderSize),
+                                record: "SH Band Stream", field: "band",
+                                reason: "band \(band) appears twice after the same state record")
+                        }
+                        currentBands.append(frame)
+                    } catch {
+                        if firstStateError == nil {
+                            firstStateError = (asFourDGS(error), physicalBandSite(frame))
+                        }
+                    }
                     for address in bandsByOffset[frame.offset] ?? [] {
                         seenBands.insert(address.token)
                         if address.length != frame.total {
@@ -572,55 +630,55 @@ private func validatePhysicalRecords(
                                     + "framed length is \(frame.total) bytes")
                             result.indexSafe = false
                         }
-                        if frame.length > 0 {
-                            do {
-                                let physicalBand = try source.exactly(
-                                    offset: frame.offset + recordHeaderSize, count: 1,
-                                    record: "SH Band Stream band")[0]
-                                if physicalBand != address.band {
-                                    scanReport.error(
-                                        "chunk index entry \(address.entry) names band "
-                                            + "\(address.band), but the SH Band Stream at byte "
-                                            + "\(frame.offset) names band \(physicalBand)")
-                                    result.indexSafe = false
-                                }
-                            } catch {
-                                scanReport.refused("", asFourDGS(error), walked, nil)
-                                result.indexSafe = false
-                            }
+                        if let physicalBand, physicalBand != address.band {
+                            scanReport.error(
+                                "chunk index entry \(address.entry) names band "
+                                    + "\(address.band), but the SH Band Stream at byte "
+                                    + "\(frame.offset) names band \(physicalBand)")
+                            result.indexSafe = false
                         }
-                        guard keyframeDelta, firstStateError == nil,
-                            address.length == frame.total, let header, let quantization,
-                            let temporalModelOffset, let state = stateFrames[index[address.entry].offset],
-                            let fields = result.fields[state.offset]
-                        else { continue }
-                        do {
+                    }
+                    do {
+                        guard let state = currentState else {
+                            throw FourDGSError.malformed(
+                                offset: Int64(clamping: frame.offset), record: "SH Band Stream",
+                                field: "placement", reason: "no Chunk or DeltaChunk precedes it")
+                        }
+                        guard let header, let quantization else { return }
+                        if keyframeDelta {
+                            guard let temporalModelOffset else { return }
                             if state.opcode == Opcode.chunk {
                                 _ = try SceneReader(
                                     singleChunkReader(
                                         source, header: header, quantization: quantization,
                                         windowTable: windowTable, chunk: state,
-                                        temporalModelOffset: temporalModelOffset, bands: [frame]),
+                                        temporalModelOffset: temporalModelOffset,
+                                        bands: currentBands),
                                     path: .streamed)
-                            } else if let birth = try deltaGroups(source, state).first(where: {
-                                $0.name == "birth"
-                            }) {
+                            } else if let fields = try chunkFields(source, state),
+                                let birth = try deltaGroups(source, state).first(where: {
+                                    $0.name == "birth"
+                                })
+                            {
                                 try validateGroupHeaders(state, birth)
                                 _ = try SceneReader(
                                     deltaGroupReader(
                                         source, header: header, quantization: quantization,
                                         windowTable: windowTable,
                                         temporalModelOffset: temporalModelOffset, fields: fields,
-                                        group: birth, band: frame),
+                                        group: birth, bands: currentBands),
                                     path: .streamed)
                             }
-                        } catch {
-                            firstStateError = (
-                                asFourDGS(error),
-                                Site(
-                                    offset: frame.offset,
-                                    what: "the physical SH Band Stream at byte \(frame.offset)")
-                            )
+                        } else if state.opcode == Opcode.chunk {
+                            _ = try SceneReader(
+                                singleChunkReader(
+                                    source, header: header, quantization: quantization,
+                                    windowTable: windowTable, chunk: state, bands: currentBands),
+                                path: .streamed)
+                        }
+                    } catch {
+                        if firstStateError == nil {
+                            firstStateError = (asFourDGS(error), physicalBandSite(frame))
                         }
                     }
                     return
@@ -629,6 +687,9 @@ private func validatePhysicalRecords(
                 guard frame.opcode == Opcode.chunk || frame.opcode == Opcode.deltaChunk else {
                     return
                 }
+                currentState = frame
+                currentBands.removeAll(keepingCapacity: true)
+                currentBandNumbers.removeAll(keepingCapacity: true)
                 if frame.opcode == Opcode.deltaChunk && !keyframeDelta {
                     scanReport.error(
                         "the gaussian-birth file contains DeltaChunk at byte \(frame.offset); "
@@ -637,7 +698,7 @@ private func validatePhysicalRecords(
                 }
 
                 let entries = byOffset[frame.offset] ?? []
-                if !entries.isEmpty { stateFrames[frame.offset] = frame }
+                seenEntries.formUnion(entries)
                 if !index.isEmpty && entries.isEmpty {
                     scanReport.error(
                         "the \(opcodeName(frame.opcode)) record at byte \(frame.offset) is absent "
@@ -669,8 +730,7 @@ private func validatePhysicalRecords(
                     }
                 }
 
-                guard firstStateError == nil, let header, let quantization
-                else { return }
+                guard let header, let quantization else { return }
                 do {
                     if keyframeDelta {
                         guard let temporalModelOffset else { return }
@@ -709,14 +769,16 @@ private func validatePhysicalRecords(
                     }
                 } catch {
                     let stateError = asFourDGS(error)
-                    firstStateError = (
-                        stateError,
-                        Site(
-                            offset: frame.offset,
-                            what:
-                                "the physical \(opcodeName(frame.opcode)) record at byte "
-                                + "\(frame.offset)")
-                    )
+                    if firstStateError == nil {
+                        firstStateError = (
+                            stateError,
+                            Site(
+                                offset: frame.offset,
+                                what:
+                                    "the physical \(opcodeName(frame.opcode)) record at byte "
+                                    + "\(frame.offset)")
+                        )
+                    }
                 }
             })
     } catch {
@@ -734,6 +796,12 @@ private func validatePhysicalRecords(
         scanReport.error(
             "chunk index entry \(address.entry) names band \(address.band) at a range that does "
                 + "not frame an intact SH Band Stream record")
+        result.indexSafe = false
+    }
+    for i in index.indices where !seenEntries.contains(i) {
+        scanReport.error(
+            "chunk index entry \(i) names byte \(index[i].offset), which is not the start of an "
+                + "intact physical Chunk or DeltaChunk record")
         result.indexSafe = false
     }
     report.findings.append(contentsOf: scanReport.findings)
@@ -950,6 +1018,13 @@ func validate(_ source: ToolReader) -> Report {
     var retainedHeaders = 0
     var retainedQuantizations = 0
     var retainedFooters = 0
+    var privateCount: UInt64 = 0
+    var firstPrivate: (opcode: UInt8, length: UInt64)?
+    var provenanceCount: UInt64 = 0
+    var firstProvenance: UInt8?
+    var unknownCount: UInt64 = 0
+    var firstUnknown: UInt8?
+    var stateSeen = false
     let walked: Walk
     do {
         walked = try walk(
@@ -979,24 +1054,54 @@ func validate(_ source: ToolReader) -> Report {
                 if opcode == Opcode.header { hasHeader = true }
                 if opcode == Opcode.quantization { hasQuantization = true }
                 if opcode == Opcode.footer { hasFooter = true }
+                if opcode == Opcode.chunk || opcode == Opcode.deltaChunk { stateSeen = true }
+                if stateSeen && (opcode == Opcode.audioSource || opcode == Opcode.audioData) {
+                    report.error(
+                        "\(opcodeName(opcode)) at byte \(frame.offset) appears after the first "
+                            + "Chunk or DeltaChunk; audio records must precede state records")
+                }
                 if opcode == Opcode.attributeStream {
                     report.error(
                         "AttributeStream at byte \(frame.offset) is a bare Chunk structure, not a "
                             + "top-level record")
                 } else if isPrivate(opcode) {
-                    report.note(
-                        "private record 0x\(hex2(opcode)) (\(frame.length) bytes) — skipped, as required")
+                    if firstPrivate == nil { firstPrivate = (opcode, frame.length) }
+                    if privateCount < UInt64.max { privateCount += 1 }
                 } else if isProvenance(opcode) && !isSpecified(opcode) {
-                    report.note(
-                        "reserved provenance record 0x\(hex2(opcode)) — skipped, as required "
-                            + "(0x26-0x2F, section 5.15.8)")
+                    if firstProvenance == nil { firstProvenance = opcode }
+                    if provenanceCount < UInt64.max { provenanceCount += 1 }
                 } else if !isSpecified(opcode) {
-                    report.note("unknown record 0x\(hex2(opcode)) — skipped, as required")
+                    if firstUnknown == nil { firstUnknown = opcode }
+                    if unknownCount < UInt64.max { unknownCount += 1 }
                 }
             })
     } catch {
         report.refused("", asFourDGS(error), nil, nil)
         return report
+    }
+
+    if let firstPrivate {
+        if privateCount == 1 {
+            report.note(
+                "private record 0x\(hex2(firstPrivate.opcode)) (\(firstPrivate.length) bytes) — "
+                    + "skipped, as required")
+        } else {
+            report.note(
+                "\(privateCount) private records — skipped, as required; first is "
+                    + "0x\(hex2(firstPrivate.opcode)) (\(firstPrivate.length) bytes)")
+        }
+    }
+    if let firstProvenance {
+        let prefix =
+            provenanceCount == 1
+            ? "reserved provenance record" : "\(provenanceCount) reserved provenance records; first is"
+        report.note(
+            "\(prefix) 0x\(hex2(firstProvenance)) — skipped, as required "
+                + "(0x26-0x2F, section 5.15.8)")
+    }
+    if let firstUnknown {
+        let prefix = unknownCount == 1 ? "unknown record" : "\(unknownCount) unknown records; first is"
+        report.note("\(prefix) 0x\(hex2(firstUnknown)) — skipped, as required")
     }
 
     if !walked.trailingMagic {

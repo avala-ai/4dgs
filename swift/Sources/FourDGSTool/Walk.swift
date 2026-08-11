@@ -18,6 +18,7 @@ public enum Opcode {
     public static let statistics: UInt8 = 0x0C
     public static let summaryOffset: UInt8 = 0x0F
     public static let deltaChunk: UInt8 = 0x10
+    public static let audioSource: UInt8 = 0x11
     public static let audioData: UInt8 = 0x12
     public static let coordinateFrame: UInt8 = 0x20
     public static let objectTrack: UInt8 = 0x25
@@ -186,12 +187,6 @@ func readU32(_ bytes: [UInt8], at: UInt64) -> UInt32? {
     return value
 }
 
-func readU16(_ bytes: [UInt8], at: UInt64) -> UInt16? {
-    guard at <= UInt64(bytes.count), UInt64(bytes.count) - at >= 2 else { return nil }
-    let start = Int(at)
-    return UInt16(bytes[start]) | (UInt16(bytes[start + 1]) << 8)
-}
-
 func readF64(_ bytes: [UInt8], at: UInt64) -> Double? {
     readU64(bytes, at: at).map(Double.init(bitPattern:))
 }
@@ -258,26 +253,6 @@ func walk(
         at = end
     }
     return out
-}
-
-func walk(_ source: ToolReader) throws -> Walk {
-    try walk(source, retaining: { _ in true })
-}
-
-public func walk(_ bytes: [UInt8]) throws -> Walk {
-    try walk(ToolReader(InMemoryReader(bytes)))
-}
-
-func refuseMagic(_ bytes: [UInt8]) -> FourDGSError {
-    let head = Array(bytes.prefix(magic.count))
-    do {
-        _ = try SceneReader(InMemoryReader(head))
-    } catch let error as FourDGSError {
-        return error
-    } catch {
-        return .unreadableSource(description: "\(error)")
-    }
-    return .notFourDGS(offset: 0, found: head)
 }
 
 public struct Site {
@@ -365,13 +340,23 @@ func chunkIndexEntries(_ source: ToolReader, _ walk: Walk) throws -> [IndexEntry
         else { continue }
         var bands: [(band: UInt8, offset: UInt64, length: UInt64)] = []
         let declared = UInt64(readU32(fields, at: bandCountField) ?? 0)
+        guard declared <= 3 else {
+            throw FourDGSError.malformed(
+                offset: Int64(clamping: content + bandCountField), record: "ChunkIndex",
+                field: "band_count", reason: "the record declares \(declared) bands; expected 0-3")
+        }
         var at = content + prefix
         let available = (frame.length - prefix) / bandEntrySize
-        for _ in 0..<min(min(declared, available), 3) {
+        for _ in 0..<min(declared, available) {
             let field = try source.exactly(
                 offset: at, count: Int(bandEntrySize), record: "Chunk Index band range")
             guard let bandOffset = readU64(field, at: 1), let bandLength = readU64(field, at: 9)
             else { break }
+            guard (1...3).contains(field[0]) else {
+                throw FourDGSError.malformed(
+                    offset: Int64(clamping: at), record: "ChunkIndex", field: "band",
+                    reason: "the entry names band \(field[0]); expected 1, 2, or 3")
+            }
             bands.append((band: field[0], offset: bandOffset, length: bandLength))
             at += bandEntrySize
         }
@@ -472,7 +457,11 @@ func summaryDeclaration(_ source: ToolReader, _ walk: Walk) throws -> SummaryDec
     guard let frame = walk.firstIntact(Opcode.footer) else { return nil }
     let fields: UInt64 = 20
     let content = frame.offset + recordHeaderSize
-    guard frame.length >= fields else { return nil }
+    guard frame.length >= fields else {
+        throw FourDGSError.malformed(
+            offset: Int64(clamping: frame.offset), record: "Footer", field: "fixed fields",
+            reason: "the record has \(frame.length) bytes; expected at least \(fields)")
+    }
     let bytes = try source.exactly(offset: content, count: Int(fields), record: "Footer")
     guard let start = readU64(bytes, at: 0), let crc = readU32(bytes, at: 16) else { return nil }
     guard start != 0 else { return nil }
@@ -558,18 +547,4 @@ private func refusingRecord(_ reader: SceneReader, _ i: Int, _ index: [IndexEntr
         }
     }
     return chunk
-}
-
-public func sentence(_ error: FourDGSError) -> String {
-    switch error {
-    case .unsupportedCodec(0, "Chunk", let message, _): return message
-    case .malformed(0, "file", "", let reason, _): return reason
-    case .truncated(0, let message, 0, 0): return message
-    case .core(_, let message, _): return message
-    default: return "\(error)"
-    }
-}
-
-public func asFourDGS(_ error: Error) -> FourDGSError {
-    (error as? FourDGSError) ?? .unreadableSource(description: "\(error)")
 }

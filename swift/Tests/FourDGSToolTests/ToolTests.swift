@@ -169,6 +169,7 @@ final class ValidateTests: XCTestCase {
             XCTAssertTrue(result.out.contains("identity composition was not checked"), result.out)
             XCTAssertEqual(result.err, "INCOMPLETE\n")
         }
+        XCTAssertTrue(usage.contains("incomplete (not proof of validity)"))
     }
 
     func testEveryValidVariantIsValid() throws {
@@ -701,6 +702,71 @@ final class ValidateTests: XCTestCase {
             XCTAssertLessThan(recording.largestRead, bytes.count, file.lastPathComponent)
         }
     }
+
+    func testHostilePhysicalAndSummaryShapesAreRejected() throws {
+        try requireCorpus()
+        let indexedURL = corpusDirectory().appendingPathComponent(
+            "MixedLifetimes-SHDegree3-UseChunkIndex-UseCrc.4dgs")
+        let original = try readFixture(indexedURL)
+        let walked = try walk(original)
+        let footer = try XCTUnwrap(walked.firstIntact(Opcode.footer))
+        let indexFrames = walked.records.filter { $0.opcode == Opcode.chunkIndex }
+
+        func says(_ bytes: [UInt8], _ fragment: String) {
+            XCTAssertTrue(
+                validate(bytes).findings.contains { $0.message.contains(fragment) }, fragment)
+        }
+
+        var noIndex = original
+        for frame in indexFrames { noIndex[Int(frame.offset)] = Opcode.privateStart }
+        writeU64(0, into: &noIndex, at: footer.offset + recordHeaderSize)
+        writeU32(0, into: &noIndex, at: footer.offset + recordHeaderSize + 16)
+        let band = try XCTUnwrap(walked.firstIntact(Opcode.shBandStream))
+        noIndex[Int(band.offset + recordHeaderSize + 4)] = 9
+        XCTAssertTrue(
+            validate(noIndex).findings.compactMap(\.refusal).contains {
+                $0.code == .unknownStreamCodec
+            })
+
+        var embedded = original
+        let entry = try XCTUnwrap(chunkIndexEntries(original, walked).first)
+        let inside = entry.offset + recordHeaderSize + 44
+        embedded[Int(inside)] = Opcode.chunk
+        writeU64(0, into: &embedded, at: inside + 1)
+        writeU64(inside, into: &embedded, at: indexFrames[0].offset + recordHeaderSize + 16)
+        writeU64(9, into: &embedded, at: indexFrames[0].offset + recordHeaderSize + 24)
+        says(embedded, "not the start of an intact physical Chunk or DeltaChunk record")
+
+        var tooManyBands = original
+        writeU32(
+            4, into: &tooManyBands,
+            at: indexFrames[0].offset + recordHeaderSize + 36)
+        says(tooManyBands, "band_count")
+
+        let keyframeURL = corpusDirectory().appendingPathComponent(
+            "keyframe/KeyframeDelta-UseChunkIndex-UseCrc-UseStatistics.4dgs")
+        let keyframe = try readFixture(keyframeURL)
+        let keyframeWalk = try walk(keyframe)
+        let statistics = try XCTUnwrap(keyframeWalk.firstIntact(Opcode.statistics))
+        let keyframeFooter = try XCTUnwrap(keyframeWalk.firstIntact(Opcode.footer))
+
+        var wrongSummaryStart = keyframe
+        writeU64(
+            statistics.offset, into: &wrongSummaryStart,
+            at: keyframeFooter.offset + recordHeaderSize)
+        writeU32(
+            0, into: &wrongSummaryStart,
+            at: keyframeFooter.offset + recordHeaderSize + 16)
+        says(wrongSummaryStart, "expected the first ChunkIndex")
+
+        var lateAudio = keyframe
+        lateAudio[Int(statistics.offset)] = Opcode.audioSource
+        says(lateAudio, "appears after the first Chunk or DeltaChunk")
+
+        var shortFooter = keyframe
+        writeU64(19, into: &shortFooter, at: keyframeFooter.offset + 1)
+        says(shortFooter, "malformed Footer.fixed fields")
+    }
 }
 
 final class InspectTests: XCTestCase {
@@ -723,6 +789,9 @@ final class InspectTests: XCTestCase {
         XCTAssertEqual(walked.intact, count)
         XCTAssertTrue(walked.records.isEmpty)
         XCTAssertEqual(recording.largestRead, Int(recordHeaderSize))
+        let report = validate(bytes)
+        XCTAssertEqual(report.findings.filter { $0.message.contains("private record") }.count, 1)
+        XCTAssertTrue(report.findings.contains { $0.message.contains("20000 private records") })
     }
 
     func testAWalkFramesEveryRecordAndEndsOnTheMagic() throws {

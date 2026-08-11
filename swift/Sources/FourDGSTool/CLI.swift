@@ -22,6 +22,32 @@ import FourDGS
     import Glibc
 #endif
 
+func refuseMagic(_ bytes: [UInt8]) -> FourDGSError {
+    let head = Array(bytes.prefix(magic.count))
+    do {
+        _ = try SceneReader(InMemoryReader(head))
+    } catch let error as FourDGSError {
+        return error
+    } catch {
+        return .unreadableSource(description: "\(error)")
+    }
+    return .notFourDGS(offset: 0, found: head)
+}
+
+public func sentence(_ error: FourDGSError) -> String {
+    switch error {
+    case .unsupportedCodec(0, "Chunk", let message, _): return message
+    case .malformed(0, "file", "", let reason, _): return reason
+    case .truncated(0, let message, 0, 0): return message
+    case .core(_, let message, _): return message
+    default: return "\(error)"
+    }
+}
+
+public func asFourDGS(_ error: Error) -> FourDGSError {
+    (error as? FourDGSError) ?? .unreadableSource(description: "\(error)")
+}
+
 /// Exit codes, which are the only part of a command-line tool another program reads.
 ///
 /// ``exitFailed`` and ``exitTool`` are the split that matters. `1` is an answer about the file:
@@ -130,7 +156,7 @@ public let usage = """
       --json          machine-readable output (inspect)
 
     exit codes:
-      0  fine                       2  valid, with warnings
+      0  validation complete       2  warnings, or incomplete (not proof of validity)
       1  refused, or invalid        3  the tool could not run (no such file, bad usage)
 
     """
