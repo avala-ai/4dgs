@@ -1341,7 +1341,7 @@ final class ValidateTests: XCTestCase {
         XCTAssertEqual(column.storedValueCount, Int(channels))
         XCTAssertEqual(column.rowValues(at: Int(rows) - 1), [Int32](repeating: 0, count: 255))
         column.setRow([Int32](repeating: 1, count: 255), at: Int(rows) - 1)
-        XCTAssertEqual(column.storedValueCount, Int(channels) * 2)
+        XCTAssertEqual(column.storedValueCount, Int(channels) * 2 + 4)
         XCTAssertEqual(column.rowValues(at: 0), [Int32](repeating: 0, count: 255))
         XCTAssertEqual(column.rowValues(at: Int(rows) - 1), [Int32](repeating: 1, count: 255))
     }
@@ -1580,6 +1580,29 @@ final class ValidateTests: XCTestCase {
                 $0.message.contains("Audio at byte \(firstState.offset) does not parse")
                     && $0.message.contains("codec")
             })
+
+        let validLegacy =
+            [Opcode.audio] + littleU64(23) + littleU32(3) + Array("wav".utf8)
+            + littleU64(0.0.bitPattern) + littleU64(0)
+        var lateLegacy = keyframeDelta
+        lateLegacy.insert(
+            contentsOf: validLegacy, at: Int(firstState.offset + firstState.total))
+        XCTAssertFalse(
+            validate(lateLegacy).findings.contains {
+                $0.message.contains("Audio at byte")
+                    && $0.message.contains("appears after the first Chunk")
+            })
+    }
+
+    func testConstantValidationUpdatesCoalesceDenseEqualRows() {
+        let channels = 255
+        let rows = 10_000
+        var column = ValidationColumn(
+            repeating: [Int32](repeating: 0, count: channels), rowCount: rows)
+        let replacement = [Int32](repeating: 7, count: channels)
+        for row in 0..<rows { column.setRow(replacement, at: row) }
+        XCTAssertEqual(column.rowValues(at: rows / 2), replacement)
+        XCTAssertEqual(column.storedValueCount, channels)
     }
 
     func testKeyframeDeltaBirthBandsLiveCountsAndPhysicalOrdering() throws {

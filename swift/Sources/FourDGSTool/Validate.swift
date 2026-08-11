@@ -1571,7 +1571,8 @@ private struct ValidationColumnPiece {
     var rowCount: Int
     let constant: Bool
     var values: [Int32]
-    var overrides: [Int: [Int32]] = [:]
+    var overrides: [Int: Int] = [:]
+    var overrideValues: [[Int32]] = []
 }
 
 struct ValidationColumn {
@@ -1581,7 +1582,8 @@ struct ValidationColumn {
     var rowCount: Int { pieces.reduce(0) { $0 + $1.rowCount } }
     var storedValueCount: Int {
         pieces.reduce(0) { total, piece in
-            total + piece.values.count + piece.overrides.values.reduce(0) { $0 + $1.count }
+            total + piece.values.count + piece.overrideValues.reduce(0) { $0 + $1.count }
+                + piece.overrides.count * 4
         }
     }
 
@@ -1604,7 +1606,7 @@ struct ValidationColumn {
                 relative -= piece.rowCount
                 continue
             }
-            if let override = piece.overrides[relative] { return override }
+            if let override = piece.overrides[relative] { return piece.overrideValues[override] }
             if piece.constant { return piece.values }
             let start = relative * channels
             return Array(piece.values[start..<(start + channels)])
@@ -1624,7 +1626,21 @@ struct ValidationColumn {
                 if rowValues == pieces[i].values {
                     pieces[i].overrides.removeValue(forKey: relative)
                 } else {
-                    pieces[i].overrides[relative] = rowValues
+                    let valueIndex: Int
+                    if let existing = pieces[i].overrideValues.firstIndex(of: rowValues) {
+                        valueIndex = existing
+                    } else {
+                        valueIndex = pieces[i].overrideValues.count
+                        pieces[i].overrideValues.append(rowValues)
+                    }
+                    pieces[i].overrides[relative] = valueIndex
+                    if pieces[i].overrides.count == pieces[i].rowCount,
+                        Set(pieces[i].overrides.values).count == 1
+                    {
+                        pieces[i].values = pieces[i].overrideValues[valueIndex]
+                        pieces[i].overrides.removeAll(keepingCapacity: false)
+                        pieces[i].overrideValues.removeAll(keepingCapacity: false)
+                    }
                 }
             } else {
                 let start = relative * channels
@@ -1652,7 +1668,17 @@ struct ValidationColumn {
                 var next = ValidationColumnPiece(
                     rowCount: keptRows.count, constant: true, values: piece.values)
                 for (newRow, oldRow) in keptRows.enumerated() {
-                    if let value = piece.overrides[oldRow] { next.overrides[newRow] = value }
+                    if let valueIndex = piece.overrides[oldRow] {
+                        let value = piece.overrideValues[valueIndex]
+                        let nextIndex: Int
+                        if let existing = next.overrideValues.firstIndex(of: value) {
+                            nextIndex = existing
+                        } else {
+                            nextIndex = next.overrideValues.count
+                            next.overrideValues.append(value)
+                        }
+                        next.overrides[newRow] = nextIndex
+                    }
                 }
                 retained.append(next)
             } else {
@@ -1922,6 +1948,12 @@ private func applyValidationDelta(
                 }
             }
             base.setRow(composed, at: row)
+            guard UInt64(base.storedValueCount) <= maximumValidationColumnBytes / 4 else {
+                throw malformedStateStreams(
+                    frame,
+                    "composed attribute \(attribute) exceeds the \(maximumValidationColumnBytes)-byte retained-column limit"
+                )
+            }
         }
         state.column = base
     }
@@ -2956,10 +2988,7 @@ func validate(_ source: ToolReader) -> Report {
                 if opcode == Opcode.quantization { hasQuantization = true }
                 if opcode == Opcode.footer { hasFooter = true }
                 if opcode == Opcode.chunk || opcode == Opcode.deltaChunk { stateSeen = true }
-                if stateSeen
-                    && (opcode == Opcode.audio || opcode == Opcode.audioSource
-                        || opcode == Opcode.audioData)
-                {
+                if stateSeen && (opcode == Opcode.audioSource || opcode == Opcode.audioData) {
                     report.error(
                         "\(opcodeName(opcode)) at byte \(frame.offset) appears after the first "
                             + "Chunk or DeltaChunk; audio records must precede state records")
