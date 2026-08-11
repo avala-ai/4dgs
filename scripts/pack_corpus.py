@@ -205,13 +205,57 @@ not cover.
 ## Run a decoder against it
 
 A runner is a command-line program that takes one `.4dgs` path and prints one JSON document on
-stdout. Choose its read mode and the corpus families it implements, then score the applicable
-manifest entries by comparing parsed JSON rather than text. This is a Bash recipe because process
-substitution keeps the loop — and its failure count — in the current shell:
+stdout. Choose its read mode and corpus families, optionally provide the exact variants a partial
+implementation supports, then compare parsed JSON rather than text:
+
+<!-- cspell:ignore mktemp startswith -->
 
 ```bash
 mode=streamed # or indexed
 families=valid,keyframe,object,invalid # remove families this runner does not implement
+allowlist= # optional file: one MANIFEST variant name per line
+selection=$(mktemp) || exit 1
+trap 'rm -f "$selection"' EXIT
+
+if ! python3 - "$mode" "$families" "$allowlist" >"$selection" <<'PY'
+import json
+import sys
+
+mode = sys.argv[1]
+families = set(sys.argv[2].split(","))
+allowlist = sys.argv[3]
+if mode not in {{"streamed", "indexed"}}:
+    raise SystemExit(f"mode must be streamed or indexed, not {{mode!r}}")
+with open("MANIFEST.json", encoding="utf-8") as handle:
+    variants = json.load(handle)["variants"]
+known_families = {{variant["family"] for variant in variants}}
+unknown_families = families - known_families
+if unknown_families:
+    raise SystemExit(f"unknown corpus families: {{sorted(unknown_families)}}")
+
+allowed = None
+if allowlist:
+    with open(allowlist, encoding="utf-8") as handle:
+        allowed = {{line.strip() for line in handle if line.strip() and not line.startswith("#")}}
+    unknown_names = allowed - {{variant["name"] for variant in variants}}
+    if unknown_names:
+        raise SystemExit(f"allowlist names no manifest variants: {{sorted(unknown_names)}}")
+
+for variant in variants:
+    if variant["family"] not in families or (mode == "indexed" and not variant["indexed"]):
+        continue
+    if allowed is None or variant["name"] in allowed:
+        print(variant["file"])
+PY
+then
+  echo "FAIL: could not select variants from MANIFEST.json"
+  exit 1
+fi
+if [ ! -s "$selection" ]; then
+  echo "FAIL: manifest selection produced no variants"
+  exit 1
+fi
+
 failed=0
 while IFS= read -r f; do
   if actual=$(your-runner "$f"); then
@@ -228,20 +272,7 @@ while IFS= read -r f; do
     echo "FAIL $f"
     failed=1
   fi
-done < <(
-  python3 - "$mode" "$families" <<'PY'
-import json
-import sys
-
-mode = sys.argv[1]
-families = set(sys.argv[2].split(","))
-with open("MANIFEST.json", encoding="utf-8") as handle:
-    variants = json.load(handle)["variants"]
-for variant in variants:
-    if variant["family"] in families and (mode != "indexed" or variant["indexed"]):
-        print(variant["file"])
-PY
-)
+done < "$selection"
 exit "$failed"
 ```
 
@@ -249,7 +280,10 @@ exit "$failed"
 keyframe-delta, object-layer and invalid corpora; `indexed` is false for a variant no index-reading
 runner can answer; and `refusal` is non-null for a file that must be refused. For those the document
 to print is `{{"refused": "<identifier>"}}` and the exit status is still 0, because a refusal is a
-result rather than a crash. Any non-zero runner status fails its variant before stdout is compared.
+result rather than a crash. A feature-level partial implementation sets `allowlist` to a text file
+containing the exact manifest `name` values it supports; unknown names, malformed manifest data and
+an empty selection all fail before the runner is invoked. Any non-zero runner status fails its
+variant before stdout is compared.
 
 The full contract — invocation, stdout, exit codes, the canonical JSON rules — is at
 <https://4dgs.dev/docs/reference/conformance>.
