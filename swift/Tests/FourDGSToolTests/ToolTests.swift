@@ -629,6 +629,90 @@ final class ValidateTests: XCTestCase {
                 $0.refusal?.code == .unknownQuantizationScheme
                     && $0.refusal?.site?.offset == state.offset
             })
+
+        let birthFile = corpusDirectory().appendingPathComponent(provenanceVariant)
+        let birthOriginal = try readFixture(birthFile)
+        let birthWalk = try walk(birthOriginal)
+        let birthSource = ToolReader(InMemoryReader(birthOriginal))
+        let birthDispatch = try XCTUnwrap(try headerDispatch(birthSource, birthWalk))
+        let birthHeader = try XCTUnwrap(birthWalk.firstIntact(Opcode.header))
+        let birthState = try XCTUnwrap(birthWalk.firstIntact(Opcode.chunk))
+        var lateBirthHeader = Array(
+            birthOriginal[
+                Int(birthHeader.offset)..<Int(birthHeader.offset + birthHeader.total)])
+        let birthModel = Int(birthDispatch.temporalModelOffset - birthHeader.offset)
+        lateBirthHeader.replaceSubrange(
+            birthModel..<(birthModel + 14), with: "unknown-model!".utf8)
+        var gaussianBirthWithLateHeader = birthOriginal
+        gaussianBirthWithLateHeader.insert(contentsOf: lateBirthHeader, at: Int(birthState.offset))
+        XCTAssertTrue(
+            validate(gaussianBirthWithLateHeader).findings.contains {
+                $0.refusal?.code == .unknownTemporalModel
+                    && $0.refusal?.site?.offset == birthState.offset
+            })
+    }
+
+    func testKeyframeDeltaValidationComposesBinsBeforeAccepting() throws {
+        try requireCorpus()
+        let fixture = corpusDirectory().appendingPathComponent(
+            "keyframe/KeyframeDelta-UseChunkIndex-UseCrc-UseStatistics.4dgs")
+        let original = try readFixture(fixture)
+        let firstState = try XCTUnwrap(try walk(original).firstIntact(Opcode.chunk))
+        let front = Array(original[..<Int(firstState.offset)])
+
+        func stream(_ attribute: UInt8, _ values: [Int32], channels: UInt8) -> [UInt8] {
+            let encoded = values.map { value -> UInt32 in
+                let wide = Int64(value)
+                return UInt32(wide >= 0 ? wide * 2 : -wide * 2 - 1)
+            }
+            let largest = encoded.max() ?? 0
+            let width: UInt8 = largest <= UInt8.max ? 1 : largest <= UInt16.max ? 2 : 4
+            var planes = [UInt8](repeating: 0, count: encoded.count * Int(width))
+            for plane in 0..<Int(width) {
+                for (i, value) in encoded.enumerated() {
+                    planes[plane * encoded.count + i] =
+                        UInt8(truncatingIfNeeded: value >> UInt32(8 * plane))
+                }
+            }
+            let payload = deflated(planes)
+            return [attribute, width, 0, 0, channels]
+                + littleU32(UInt32(values.count / Int(channels)))
+                + littleU64(UInt64(payload.count)) + payload
+        }
+
+        let channelWidths: [(UInt8, UInt8)] = [
+            (0, 3), (1, 3), (2, 1), (3, 3), (4, 3), (5, 1), (6, 3), (7, 1),
+            (8, 1), (9, 1), (10, 1), (13, 1),
+        ]
+        var keyframeStreams: [UInt8] = []
+        for (attribute, channels) in channelWidths {
+            let values =
+                attribute == 0
+                ? [Int32.max, 0, 0]
+                : [Int32](repeating: 0, count: Int(channels))
+            keyframeStreams += stream(attribute, values, channels: channels)
+        }
+        var keyframeBody = littleU64(0) + littleU64(0.5.bitPattern)
+        keyframeBody += littleU32(0) + littleU32(1) + littleU32(0)
+        keyframeBody += littleU64(UInt64(keyframeStreams.count))
+        keyframeBody += littleU64(UInt64(keyframeStreams.count)) + keyframeStreams
+        let keyframe = [Opcode.chunk] + littleU64(UInt64(keyframeBody.count)) + keyframeBody
+
+        let update = stream(13, [0], channels: 1) + stream(0, [1, 0, 0], channels: 3)
+        let records = littleU64(UInt64(update.count)) + update + littleU64(0) + littleU64(0)
+        let keyframeOffset = UInt64(front.count)
+        var deltaBody = littleU64(0.5.bitPattern) + littleU64(1.0.bitPattern) + littleU32(0)
+        deltaBody += [1] + littleU64(keyframeOffset) + littleU64(keyframeOffset) + littleU16(1)
+        deltaBody += littleU32(1) + littleU32(0) + littleU32(0) + littleU32(0)
+        deltaBody += littleU64(UInt64(records.count)) + littleU64(UInt64(records.count)) + records
+        let delta = [Opcode.deltaChunk] + littleU64(UInt64(deltaBody.count)) + deltaBody
+
+        let findings = validate(front + keyframe + delta).findings
+        XCTAssertTrue(
+            findings.contains {
+                $0.message.contains("composing attribute 0 for gaussian_id 0")
+                    && $0.message.contains("signed 32-bit range")
+            }, findings.map(\.message).joined(separator: "\n"))
     }
 
     func testAnEmptyNonzeroSummaryRangeIsInvalid() throws {

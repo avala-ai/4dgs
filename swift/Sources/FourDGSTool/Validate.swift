@@ -1245,7 +1245,7 @@ private func validatePhysicalRecords(
     }
     finishChunkBands()
 
-    if keyframeDelta, let firstHeader = headerRecords.first,
+    if let firstHeader = headerRecords.first,
         let firstQuantization = quantizationRecords.first
     {
         for candidate in headerRecords where firstFrontMatterError == nil {
@@ -1278,7 +1278,7 @@ private func validatePhysicalRecords(
                         source: source,
                         slices: frontMatterSlices(
                             header: firstHeader, quantization: candidate, windowTable: nil,
-                            temporalModelOffset: temporalModelOffset)),
+                            temporalModelOffset: keyframeDelta ? temporalModelOffset : nil)),
                     path: .streamed)
             } catch {
                 firstFrontMatterError = (
@@ -1434,6 +1434,361 @@ private func validatePhysicalRecords(
 }
 
 private let maximumIdentityStreamBytes: UInt64 = 1 << 30
+private let maximumValidationColumnBytes: UInt64 = 512 * 1024 * 1024
+
+private struct ValidationColumn {
+    let channels: Int
+    var values: [Int32]
+}
+
+private struct ValidationColumnState {
+    var ids: [UInt32]
+    var column: ValidationColumn?
+}
+
+private func validationGroupAttributes(_ frame: Frame, _ group: DeltaGroup) throws -> Set<UInt8> {
+    var attributes: Set<UInt8> = []
+    var relative: UInt64 = 0
+    while relative < group.length {
+        guard group.length - relative >= 17 else {
+            throw malformedStateStreams(
+                frame, "the \(group.name) group ends inside a stream header")
+        }
+        let header = try group.source.exactly(
+            offset: group.offset + relative, count: 17,
+            record: "\(opcodeName(frame.opcode)) \(group.name) stream")
+        guard attributes.insert(header[0]).inserted else {
+            throw malformedStateStreams(
+                frame, "the \(group.name) group carries attribute \(header[0]) twice")
+        }
+        let payload = readU64(header, at: 9) ?? 0
+        relative += 17
+        guard payload <= group.length - relative else {
+            throw malformedStateStreams(
+                frame, "attribute \(header[0]) runs past the \(group.name) group")
+        }
+        relative += payload
+    }
+    return attributes
+}
+
+/// Decode one requested column without retaining its siblings. The inflated byte planes and the
+/// resulting Int32 column are each capped before allocation, so replaying a chain remains bounded
+/// by one attribute rather than the product of every attribute and every state record.
+private func validationColumn(
+    _ frame: Frame, _ group: DeltaGroup, attribute wanted: UInt8
+) throws -> ValidationColumn? {
+    var relative: UInt64 = 0
+    var wantedHeader: [UInt8]?
+    var wantedPayloadOffset: UInt64 = 0
+    var wantedPayloadLength: UInt64 = 0
+    while relative < group.length {
+        guard group.length - relative >= 17 else {
+            throw malformedStateStreams(
+                frame, "the \(group.name) group ends inside a stream header")
+        }
+        let header = try group.source.exactly(
+            offset: group.offset + relative, count: 17,
+            record: "\(opcodeName(frame.opcode)) \(group.name) stream")
+        let payload = readU64(header, at: 9) ?? 0
+        relative += 17
+        guard payload <= group.length - relative else {
+            throw malformedStateStreams(
+                frame, "attribute \(header[0]) runs past the \(group.name) group")
+        }
+        if header[0] == wanted {
+            guard wantedHeader == nil else {
+                throw malformedStateStreams(
+                    frame, "the \(group.name) group carries attribute \(wanted) twice")
+            }
+            wantedHeader = header
+            wantedPayloadOffset = group.offset + relative
+            wantedPayloadLength = payload
+        }
+        relative += payload
+    }
+    guard let header = wantedHeader else { return nil }
+
+    let width = UInt64(header[1])
+    let mode = header[2]
+    let codec = header[3]
+    let channels64 = UInt64(header[4])
+    let count = UInt64(readU32(header, at: 5) ?? 0)
+    guard count == UInt64(group.count) else {
+        throw malformedStateStreams(
+            frame,
+            "the \(group.name) group declares \(group.count) rows, but attribute \(wanted) carries \(count)")
+    }
+    if count == 0 { return ValidationColumn(channels: Int(channels64), values: []) }
+    guard width == 1 || width == 2 || width == 4 else {
+        throw malformedStateStreams(
+            frame, "attribute \(wanted) declares symbol width \(width); expected 1, 2, or 4")
+    }
+    guard mode <= 2 else {
+        throw malformedStateStreams(
+            frame, "attribute \(wanted) declares unknown stream mode \(mode)")
+    }
+    guard channels64 > 0, let channels = Int(exactly: channels64) else {
+        throw malformedStateStreams(frame, "attribute \(wanted) declares zero channels")
+    }
+    guard codec == 0 else {
+        throw FourDGSError.unsupportedCodec(
+            offset: Int64(clamping: wantedPayloadOffset), record: "attribute \(wanted) stream",
+            name: "stream codec \(codec)", refusal: .unknownStreamCodec)
+    }
+
+    let storedElements = mode == 2 ? UInt64(1) : count
+    let (symbols, symbolOverflow) = storedElements.multipliedReportingOverflow(by: channels64)
+    let (decodedBytes, byteOverflow) = symbols.multipliedReportingOverflow(by: width)
+    let (producedSymbols, producedOverflow) = count.multipliedReportingOverflow(by: channels64)
+    let (producedBytes, producedByteOverflow) = producedSymbols.multipliedReportingOverflow(by: 4)
+    guard !symbolOverflow, !byteOverflow, !producedOverflow, !producedByteOverflow,
+        decodedBytes <= maximumValidationColumnBytes,
+        producedBytes <= maximumValidationColumnBytes,
+        let producedCount = Int(exactly: producedSymbols)
+    else {
+        throw malformedStateStreams(
+            frame,
+            "attribute \(wanted) exceeds the \(maximumValidationColumnBytes)-byte decoded-column limit")
+    }
+    let decoded = try inflatedReader(
+        group.source, offset: wantedPayloadOffset, length: wantedPayloadLength,
+        expected: decodedBytes, frame: frame)
+
+    var stored = [Int32](repeating: 0, count: Int(symbols))
+    var previous = [Int64](repeating: 0, count: channels)
+    let blockSymbols: UInt64 = 16 * 1024
+    var start: UInt64 = 0
+    while start < symbols {
+        let blockCount = min(blockSymbols, symbols - start)
+        var planes: [[UInt8]] = []
+        planes.reserveCapacity(Int(width))
+        for plane in 0..<width {
+            planes.append(
+                try decoded.exactly(
+                    offset: plane * symbols + start, count: Int(blockCount),
+                    record: "attribute \(wanted) decoded symbols"))
+        }
+        for i in 0..<Int(blockCount) {
+            var encoded: UInt64 = 0
+            for plane in 0..<Int(width) {
+                encoded |= UInt64(planes[plane][i]) << UInt64(8 * plane)
+            }
+            let half = Int64(encoded >> 1)
+            var value = encoded & 1 == 0 ? half : -half - 1
+            let symbol = Int(start) + i
+            if mode == 1 {
+                let channel = symbol % channels
+                let (sum, overflow) = previous[channel].addingReportingOverflow(value)
+                guard !overflow, sum >= Int64(Int32.min), sum <= Int64(Int32.max) else {
+                    throw malformedStateStreams(
+                        frame,
+                        "attribute \(wanted) delta stream leaves the signed 32-bit range at element \(symbol / channels)"
+                    )
+                }
+                previous[channel] = sum
+                value = sum
+            }
+            stored[symbol] = Int32(value)
+        }
+        start += blockCount
+    }
+
+    if mode != 2 { return ValidationColumn(channels: channels, values: stored) }
+    var repeated = [Int32](repeating: 0, count: producedCount)
+    for row in 0..<Int(count) {
+        repeated.replaceSubrange(
+            row * channels..<(row + 1) * channels, with: stored[0..<channels])
+    }
+    return ValidationColumn(channels: channels, values: repeated)
+}
+
+private func orderedValidationIDs(_ frame: Frame, _ group: DeltaGroup) throws -> [UInt32] {
+    if group.count == 0, group.length == 0 { return [] }
+    guard let column = try validationColumn(frame, group, attribute: 13), column.channels == 1 else {
+        throw malformedIdentity(frame, "the \(group.name) group carries no one-channel gaussian_id stream")
+    }
+    var ids: [UInt32] = []
+    ids.reserveCapacity(column.values.count)
+    var unique: Set<UInt32> = []
+    for value in column.values {
+        guard value >= 0 else {
+            throw malformedIdentity(
+                frame, "the stream decodes gaussian_id \(value); expected a u32 value")
+        }
+        let id = UInt32(value)
+        guard unique.insert(id).inserted else {
+            throw malformedIdentity(
+                frame, "the \(group.name) group names gaussian_id \(id) more than once")
+        }
+        ids.append(id)
+    }
+    return ids
+}
+
+private func removeValidationRows(
+    _ state: inout ValidationColumnState, deaths: Set<UInt32>
+) {
+    guard !deaths.isEmpty else { return }
+    var keptIDs: [UInt32] = []
+    keptIDs.reserveCapacity(state.ids.count)
+    var keptValues: [Int32] = []
+    if let column = state.column {
+        keptValues.reserveCapacity(column.values.count)
+        for (row, id) in state.ids.enumerated() where !deaths.contains(id) {
+            keptIDs.append(id)
+            keptValues += column.values[row * column.channels..<(row + 1) * column.channels]
+        }
+        state.column = ValidationColumn(channels: column.channels, values: keptValues)
+    } else {
+        keptIDs = state.ids.filter { !deaths.contains($0) }
+    }
+    state.ids = keptIDs
+}
+
+private func applyValidationDelta(
+    _ state: inout ValidationColumnState, source: ToolReader, frame: Frame, attribute: UInt8,
+    includeUpdates: Bool = true
+) throws {
+    let groups = try deltaGroups(source, frame)
+    let updateIDs = try orderedValidationIDs(frame, groups[0])
+    let birthIDs = try orderedValidationIDs(frame, groups[1])
+    let deathIDs = try orderedValidationIDs(frame, groups[2])
+    removeValidationRows(&state, deaths: Set(deathIDs))
+
+    if includeUpdates, let update = try validationColumn(frame, groups[0], attribute: attribute) {
+        guard var base = state.column else {
+            throw malformedStateStreams(
+                frame,
+                "an update touches attribute \(attribute), which the referenced state does not carry")
+        }
+        guard update.channels == base.channels else {
+            throw malformedStateStreams(
+                frame,
+                "an update gives attribute \(attribute) \(update.channels) channels; the referenced state carries \(base.channels)"
+            )
+        }
+        let rows = Dictionary(uniqueKeysWithValues: state.ids.enumerated().map { ($0.element, $0.offset) })
+        for (updateRow, id) in updateIDs.enumerated() {
+            guard let row = rows[id] else {
+                throw malformedIdentity(
+                    frame, "the delta updates gaussian_id \(id), which is not live at its reference")
+            }
+            for channel in 0..<base.channels {
+                let destination = row * base.channels + channel
+                let incoming = update.values[updateRow * base.channels + channel]
+                if attribute == 2 || attribute == 3 {
+                    base.values[destination] = incoming
+                } else {
+                    let sum = Int64(base.values[destination]) + Int64(incoming)
+                    guard sum >= Int64(Int32.min), sum <= Int64(Int32.max) else {
+                        throw malformedStateStreams(
+                            frame,
+                            "composing attribute \(attribute) for gaussian_id \(id) leaves the signed 32-bit range"
+                        )
+                    }
+                    base.values[destination] = Int32(sum)
+                }
+            }
+        }
+        state.column = base
+    }
+
+    guard !birthIDs.isEmpty else { return }
+    let birth = try validationColumn(frame, groups[1], attribute: attribute)
+    if var base = state.column {
+        if let birth {
+            guard birth.channels == base.channels else {
+                throw malformedStateStreams(
+                    frame,
+                    "a birth gives attribute \(attribute) \(birth.channels) channels; the referenced state carries \(base.channels)"
+                )
+            }
+            base.values += birth.values
+        } else if attribute == 14 {
+            base.values += [Int32](repeating: 0, count: birthIDs.count * base.channels)
+        } else {
+            throw malformedStateStreams(
+                frame, "the birth group carries no value for attribute \(attribute)")
+        }
+        state.column = base
+    } else if let birth {
+        guard state.ids.isEmpty || attribute == 14 else {
+            throw malformedStateStreams(
+                frame,
+                "a birth introduces attribute \(attribute) after the referenced state omitted it")
+        }
+        var values = [Int32](repeating: 0, count: state.ids.count * birth.channels)
+        values += birth.values
+        state.column = ValidationColumn(channels: birth.channels, values: values)
+    }
+    state.ids += birthIDs
+}
+
+private func validationState(
+    _ source: ToolReader, physical: PhysicalValidation, target: UInt64, attribute: UInt8
+) throws -> ValidationColumnState? {
+    var chain: [Frame] = []
+    var at = target
+    var visited: Set<UInt64> = []
+    while let frame = physical.frames[at], let fields = physical.fields[at] {
+        guard visited.insert(at).inserted else { return nil }
+        chain.append(frame)
+        if fields.opcode == Opcode.chunk { break }
+        at = fields.referenceOffset
+    }
+    guard let keyframe = chain.last, keyframe.opcode == Opcode.chunk else { return nil }
+    let keyframeGroup = try keyframeGroup(source, keyframe)
+    var state = ValidationColumnState(
+        ids: try orderedValidationIDs(keyframe, keyframeGroup),
+        column: try validationColumn(keyframe, keyframeGroup, attribute: attribute))
+    if state.column == nil, attribute == 14 {
+        state.column = ValidationColumn(
+            channels: 1, values: [Int32](repeating: 0, count: state.ids.count))
+    }
+    for frame in chain.dropLast().reversed() {
+        try applyValidationDelta(&state, source: source, frame: frame, attribute: attribute)
+    }
+    return state
+}
+
+/// Prove composition at the same signed-32-bit boundary as the decoders. Each target update is
+/// checked against a replay of its reference chain, one updated attribute at a time.
+private func validateKeyframeDeltaBins(
+    _ source: ToolReader, physical: PhysicalValidation, report: inout Report
+) {
+    let targets = physical.fields.sorted {
+        if $0.value.t0 == $1.value.t0 { return $0.key < $1.key }
+        return $0.value.t0 < $1.value.t0
+    }
+    for (offset, fields) in targets where fields.opcode == Opcode.deltaChunk {
+        guard let frame = physical.frames[offset] else { continue }
+        do {
+            let update = try deltaGroups(source, frame)[0]
+            let attributes = try validationGroupAttributes(frame, update)
+                .filter { $0 != 13 && $0 != 2 && $0 != 3 }
+            for attribute in attributes {
+                guard
+                    var state = try validationState(
+                        source, physical: physical, target: fields.referenceOffset,
+                        attribute: attribute)
+                else { continue }
+                // Deaths and births do not affect an update id because groups are disjoint; apply
+                // only the update to prove its arithmetic against the referenced bins.
+                try applyValidationDelta(
+                    &state, source: source, frame: frame, attribute: attribute,
+                    includeUpdates: true)
+            }
+        } catch {
+            report.refused(
+                "keyframe-delta bin composition failed: ", asFourDGS(error), nil,
+                Site(
+                    offset: offset,
+                    what: "the bin chain ending at the DeltaChunk at byte \(offset)"))
+            return
+        }
+    }
+}
 
 private func malformedIdentity(_ frame: Frame, _ reason: String) -> FourDGSError {
     .malformed(
@@ -2680,6 +3035,7 @@ func validate(_ source: ToolReader) -> Report {
     if keyframeDelta {
         validateKeyframeDeltaIndex(
             index, fields: physical.fields, durationSec: dispatch?.durationSec, report: &report)
+        validateKeyframeDeltaBins(source, physical: physical, report: &report)
         validateKeyframeDeltaIdentity(
             source, physical: physical, index: index,
             expectedDistinct: dispatch?.gaussianCount, report: &report)
