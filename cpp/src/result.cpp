@@ -47,7 +47,17 @@ std::string Error::toString() const {
   return out;
 }
 
-const char* version() noexcept { return "0.0.0"; }
+// One version per package, and for this one it lives in `project(fourdgs-cpp VERSION ...)`:
+// that number is what `write_basic_package_version_file` writes into the installed package
+// config, so it is what answers a consumer's `find_package(fourdgs-cpp 0.1)`. A second copy
+// here could only ever agree with it by accident, and did not — the package said 0.1.0
+// while this function said 0.0.0. The build passes it in; the fallback keeps this file
+// compiling in a tool that has not, and `test_seam` asserts the value the build produces.
+#ifndef FOURDGS_CPP_VERSION
+#define FOURDGS_CPP_VERSION "0.1.0"
+#endif
+
+const char* version() noexcept { return FOURDGS_CPP_VERSION; }
 
 const char* coreVersion() noexcept { return detail::coreVersionString(); }
 

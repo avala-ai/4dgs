@@ -128,6 +128,12 @@ package still compiles and every call returns `ErrorCode::kNotImplemented` with 
 the fix, while `fourdgs::backendAvailable()` returns `false`. CI builds and tests both, because both
 are what somebody gets.
 
+A core is a header and a library, and it can be absent either way: pointed somewhere with no
+`fourdgs.h`, or — the ordinary case in a fresh checkout, where the header is committed and the
+archive is a build artifact — with the header present and nothing under `target/`. Both are the same
+build with no decoder, and configuring again after `cargo build -p fourdgs --release` picks the core
+up in the same build directory.
+
 That is the default only in this repository, where the core is one `cargo build` away and building
 before it is a normal thing to do. Anywhere else, a library that refuses every call is not what
 whoever fetched it asked for, so the build stops instead — `-DFOURDGS_ALLOW_NO_CORE=ON` asks for it

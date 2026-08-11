@@ -21,6 +21,10 @@ All notable changes to the C++ package are documented here, following
   build. `cpp/README.md` documents the three consumption paths, including the `SOURCE_SUBDIR cpp`
   argument that a `CPMAddPackage` needs and nobody would guess: this repository has no CMakeLists at
   its root, and without that argument the fetch silently adds nothing.
+- `fourdgs::version()` now reports the version the CMake project declares, compiled in from
+  `PROJECT_VERSION` rather than written out a second time. It returned `"0.0.0"` while the package
+  answered `find_package(fourdgs-cpp 0.1)`, so an application reporting the linked SDK version and
+  the build that resolved it disagreed.
 - keyframe-delta decode: `fourdgs::keyframeDeltaStatesJson` and `fourdgs::peekTemporalModel`,
   binding the core's additive states-JSON C ABI. The summary is computed in the Rust core, so the
   binding does no arithmetic of its own; the `decode_streamed` and `decode_indexed` conformance
@@ -49,6 +53,16 @@ All notable changes to the C++ package are documented here, following
   at the ABI edge, and the canonical JSON — including the property the whole cross-language
   comparison rests on, that reordering a scene's gaussians cannot change one character of its
   summary.
+
+### Fixed
+
+- Configuring without a core no longer depends on which half of the core is missing. The backend was
+  chosen from the header alone, and `rust/fourdgs/include/fourdgs.h` is committed while
+  `target/release/libfourdgs.a` is a build artifact — so in a fresh checkout, `cmake -S cpp` before
+  `cargo build` failed outright and `-DFOURDGS_ALLOW_NO_CORE=ON` could not rescue it, which is the
+  configuration that option exists for. The header and the library are resolved together now, and a
+  failed search is not cached, so configuring the same build directory again after
+  `cargo build -p fourdgs --release` links the core rather than keeping the build that has none.
 
 ### Known limitations
 

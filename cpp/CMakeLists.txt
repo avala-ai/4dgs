@@ -86,21 +86,21 @@ option(FOURDGS_ALLOW_NO_CORE
        "Configure without a decoder rather than failing when the core cannot be found"
        ${FOURDGS_ALLOW_NO_CORE_DEFAULT})
 
-# The seam, resolved: with a core header the binding calls the ABI, without one it refuses
-# every call with kNotImplemented. Both configurations build, and both are honest — the
-# package never links against a decoder it does not have.
-if(EXISTS "${FOURDGS_CORE_HEADER_DIR}/fourdgs.h" AND EXISTS
-                                                    "${CMAKE_CURRENT_SOURCE_DIR}/src/backend_capi.cpp")
-  set(FOURDGS_HAVE_CORE ON)
-  set(FOURDGS_BACKEND_SOURCE src/backend_capi.cpp)
-elseif(EXISTS "${FOURDGS_CORE_HEADER_DIR}/fourdgs.h")
-  # The core landed and the binding has not been written against it yet. Refusing every call
-  # is the honest configuration; silently linking nothing is not.
-  set(FOURDGS_HAVE_CORE OFF)
-  set(FOURDGS_BACKEND_SOURCE src/backend_unavailable.cpp)
-  message(WARNING "fourdgs: a core header exists but src/backend_capi.cpp does not; "
-                  "building the binding without a decoder")
-else()
+# The seam, resolved: with a core the binding calls the ABI, without one it refuses every
+# call with kNotImplemented. Both configurations build, and both are honest — the package
+# never links against a decoder it does not have.
+#
+# A core is a header AND a library, and this asks for both before choosing a backend. It
+# used to choose on the header alone and look for the library afterwards, where a miss
+# could only be fatal — so in a fresh checkout, where `rust/fourdgs/include/fourdgs.h` is
+# committed and `target/release/libfourdgs.a` is not, `cmake -S cpp -B cpp/build` before
+# `cargo build` failed outright and `-DFOURDGS_ALLOW_NO_CORE=ON` could not rescue it. That
+# is exactly the configuration the option exists for, and exactly the order somebody
+# arriving at this repository does things in.
+set(FOURDGS_HAVE_CORE OFF)
+set(FOURDGS_BACKEND_SOURCE src/backend_unavailable.cpp)
+
+if(NOT EXISTS "${FOURDGS_CORE_HEADER_DIR}/fourdgs.h")
   if(NOT FOURDGS_ALLOW_NO_CORE)
     message(
       FATAL_ERROR
@@ -116,29 +116,14 @@ else()
         "To build the binding with no decoder on purpose — it compiles, and every call "
         "returns kNotImplemented — pass -DFOURDGS_ALLOW_NO_CORE=ON.")
   endif()
-  set(FOURDGS_HAVE_CORE OFF)
-  set(FOURDGS_BACKEND_SOURCE src/backend_unavailable.cpp)
   message(STATUS "fourdgs: no core header at ${FOURDGS_CORE_HEADER_DIR}/fourdgs.h; "
                  "building the binding without a decoder")
-endif()
-
-add_library(fourdgs-cpp STATIC src/scene.cpp src/model.cpp src/readable.cpp src/result.cpp
-                               src/writer.cpp ${FOURDGS_BACKEND_SOURCE})
-add_library(fourdgs::cpp ALIAS fourdgs-cpp)
-
-target_include_directories(
-  fourdgs-cpp
-  PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>
-  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-
-if(MSVC)
-  target_compile_options(fourdgs-cpp PRIVATE /W4)
+elseif(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/backend_capi.cpp")
+  # The core landed and the binding has not been written against it yet. Refusing every call
+  # is the honest configuration; silently linking nothing is not.
+  message(WARNING "fourdgs: a core header exists but src/backend_capi.cpp does not; "
+                  "building the binding without a decoder")
 else()
-  target_compile_options(fourdgs-cpp PRIVATE -Wall -Wextra -Wpedantic)
-endif()
-
-if(FOURDGS_HAVE_CORE)
-  target_include_directories(fourdgs-cpp PRIVATE ${FOURDGS_CORE_HEADER_DIR})
   if(FOURDGS_CORE_LIBRARY STREQUAL "")
     # The static library first. The crate builds a cdylib too, and linking that would make
     # every consumer's binary need it on their loader path at run time — a surprise for an
@@ -162,26 +147,70 @@ if(FOURDGS_HAVE_CORE)
       HINTS "${CMAKE_CURRENT_SOURCE_DIR}/../target/release"
             "${CMAKE_CURRENT_SOURCE_DIR}/../target/debug")
     set(CMAKE_FIND_LIBRARY_SUFFIXES ${FOURDGS_SAVED_FIND_SUFFIXES})
-    if(NOT FOURDGS_CORE_FOUND_LIBRARY)
-      # The header is committed and the library is not, so this is the message a consumer
-      # who fetched this package sees: everything the fetch brought is here except the one
-      # thing cargo has to produce. It names the directories that were searched, because
-      # "no library to link" against a source tree that visibly contains a Rust crate is a
-      # sentence somebody re-reads three times before checking `target/`.
-      message(
-        FATAL_ERROR
-          "fourdgs: found ${FOURDGS_CORE_HEADER_DIR}/fourdgs.h but no library to link.\n"
-          "Searched ${CMAKE_CURRENT_SOURCE_DIR}/../target/release and "
-          "${CMAKE_CURRENT_SOURCE_DIR}/../target/debug.\n"
-          "The core is a Rust crate, and its library is a build artifact rather than "
-          "something this directory carries: run `cargo build -p fourdgs --release` in the "
-          "checkout above, or point at an archive built elsewhere with "
-          "-DFOURDGS_CORE_LIBRARY=<path to libfourdgs.a or fourdgs.lib>.\n"
-          "A build outside this repository has to do one of those itself — see cpp/README.md, "
-          "'Consuming this package from another project'.")
+    if(FOURDGS_CORE_FOUND_LIBRARY)
+      set(FOURDGS_CORE_LIBRARY "${FOURDGS_CORE_FOUND_LIBRARY}")
+    else()
+      # `find_library` caches its answer, including NOTFOUND. Left cached, the very next
+      # thing a reader does — run `cargo build -p fourdgs --release` and reconfigure the
+      # same build directory — would find nothing and keep the build with no decoder, which
+      # is a much worse failure now that this branch is survivable rather than fatal.
+      unset(FOURDGS_CORE_FOUND_LIBRARY CACHE)
     endif()
-    set(FOURDGS_CORE_LIBRARY "${FOURDGS_CORE_FOUND_LIBRARY}")
   endif()
+
+  if(NOT FOURDGS_CORE_LIBRARY STREQUAL "")
+    set(FOURDGS_HAVE_CORE ON)
+    set(FOURDGS_BACKEND_SOURCE src/backend_capi.cpp)
+  elseif(NOT FOURDGS_ALLOW_NO_CORE)
+    # The header is committed and the library is not, so this is the message a consumer
+    # who fetched this package sees: everything the fetch brought is here except the one
+    # thing cargo has to produce. It names the directories that were searched, because
+    # "no library to link" against a source tree that visibly contains a Rust crate is a
+    # sentence somebody re-reads three times before checking `target/`.
+    message(
+      FATAL_ERROR
+        "fourdgs: found ${FOURDGS_CORE_HEADER_DIR}/fourdgs.h but no library to link.\n"
+        "Searched ${CMAKE_CURRENT_SOURCE_DIR}/../target/release and "
+        "${CMAKE_CURRENT_SOURCE_DIR}/../target/debug.\n"
+        "The core is a Rust crate, and its library is a build artifact rather than "
+        "something this directory carries: run `cargo build -p fourdgs --release` in the "
+        "checkout above, or point at an archive built elsewhere with "
+        "-DFOURDGS_CORE_LIBRARY=<path to libfourdgs.a or fourdgs.lib>.\n"
+        "A build outside this repository has to do one of those itself — see cpp/README.md, "
+        "'Consuming this package from another project'.\n"
+        "To build the binding with no decoder on purpose — it compiles, and every call "
+        "returns kNotImplemented — pass -DFOURDGS_ALLOW_NO_CORE=ON.")
+  else()
+    message(
+      STATUS
+        "fourdgs: found ${FOURDGS_CORE_HEADER_DIR}/fourdgs.h but no library to link; "
+        "building the binding without a decoder. Run `cargo build -p fourdgs --release` "
+        "and configure again to link it.")
+  endif()
+endif()
+
+add_library(fourdgs-cpp STATIC src/scene.cpp src/model.cpp src/readable.cpp src/result.cpp
+                               src/writer.cpp ${FOURDGS_BACKEND_SOURCE})
+add_library(fourdgs::cpp ALIAS fourdgs-cpp)
+
+# `fourdgs::version()` is compiled from this, so the number an application prints at run
+# time is the number its build resolved. A literal in `result.cpp` would be a second copy
+# of a version, which is the one thing this repository keeps exactly one of per package.
+target_compile_definitions(fourdgs-cpp PRIVATE FOURDGS_CPP_VERSION="${PROJECT_VERSION}")
+
+target_include_directories(
+  fourdgs-cpp
+  PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+if(MSVC)
+  target_compile_options(fourdgs-cpp PRIVATE /W4)
+else()
+  target_compile_options(fourdgs-cpp PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+if(FOURDGS_HAVE_CORE)
+  target_include_directories(fourdgs-cpp PRIVATE ${FOURDGS_CORE_HEADER_DIR})
   message(STATUS "fourdgs: linking the core from ${FOURDGS_CORE_LIBRARY}")
   target_link_libraries(fourdgs-cpp PUBLIC "${FOURDGS_CORE_LIBRARY}")
   # A Rust staticlib brings its own runtime requirements; these are what it needs on the
