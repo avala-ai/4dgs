@@ -80,9 +80,10 @@ Hard rules:
 4. **One `git worktree` per concurrent lane (required)** for parallel writers.
 5. **Lead owns integration.** When stacking languages, one person/agent manages retargets,
    conformance, and PR narrative.
-6. **Fork exception (AGENTS.md §9):** cross-fork stacks are not supported. Contributors on a
-   **fork** use ordinary **sequential** PRs (one language after another merges to upstream), not a
-   required in-repo stack. Do not prescribe an impossible stacked workflow for forks.
+6. Propose durable learnings to the **lead** (root-prose lane); do not parallel-edit root
+   `AGENTS.md` from multiple language lanes. **fork** use ordinary **sequential** PRs (one language
+   after another merges to upstream), not a required in-repo stack. Do not prescribe an impossible
+   stacked workflow for forks.
 
 ### `git worktree` — default for parallel / multi-agent work
 
@@ -162,8 +163,9 @@ Commit atomically as you go (see §4). Do not open the PR unless asked.
 Agents **should** commit as they go **inside their own worktree**.
 
 1. **Atomic commits** — Prefer Conventional Commit subjects: `fix(python): …`, `test(rust): …`.
-2. **Only stage your lane’s files.** TypeScript lane may also stage root `yarn.lock` / workspace
-   `package.json` when the change updates deps.
+2. **Only stage your lane’s files.** Rust may stage root `Cargo.toml` / `Cargo.lock` when the
+   workspace changes. TypeScript may stage root `yarn.lock` / workspace `package.json` when the
+   change updates deps.
 3. **History rewrites:** no casual amend/force-push.
    - Allowed: stack recovery on **feature** branches per AGENTS.md §9.
    - **Never** force-push `main`, even on a casual human request — protected branch rules win.
@@ -177,7 +179,7 @@ Agents **should** commit as they go **inside their own worktree**.
 | Loop                  | Prefer                                                                                                                                                                                                           |
 | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Python                | Package tests under `python/`; **format claim / conformance:** from repo root generate corpus if needed, then `python tests/conformance/run.py --runner python` (shared harness — not only the package Makefile) |
-| Rust                  | `cargo test` in `rust/` (scoped packages)                                                                                                                                                                        |
+| Rust                  | Package `cargo test` in `rust/`; **format claim / conformance:** build runners as CI does, generate corpus if needed, then `python tests/conformance/run.py --runner rust` from repo root                        |
 | TypeScript            | **Repo root:** `yarn test` and/or `yarn conformance` (packages under `typescript/` do not define test scripts). Generate corpus first when exercising corpus-backed tests.                                       |
 | Dart                  | package tests under `dart/`                                                                                                                                                                                      |
 | Vocabulary / concepts | `website/docs/guides/concepts.md` consistency                                                                                                                                                                    |
