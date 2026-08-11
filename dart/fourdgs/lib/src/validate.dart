@@ -624,6 +624,10 @@ Future<void> _scanFramedChunks(
           windows,
           cutoff: cutoff,
           compression: body.header.compression,
+          // The walk knows where this record is, and every refusal the decoder
+          // raises below names it. Leaving it defaulted would report "the chunk
+          // at byte 0" about the fifth chunk of the file.
+          chunkOffset: frame.offset,
         );
       } else if (content.isNotEmpty) {
         // Bands belong to the chunk that precedes them; that adjacency is the

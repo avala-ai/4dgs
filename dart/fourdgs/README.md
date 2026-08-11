@@ -155,7 +155,8 @@ $ fourdgs inspect scene.4dgs
 crc: the Footer's summary checksum covers bytes 2,374..2,423; `-` is a record it does not cover
 
 $ fourdgs validate broken.4dgs
-error: a chunk does not decode: window index 1 is outside the 1-entry window table
+error: a chunk does not decode: gaussian 0 of the chunk at byte 2506 names window index 1, which
+is outside the 1-entry window table
   refusal window-index-out-of-range at byte 2506 (the Chunk record at index entry 1)
 INVALID
 ```
