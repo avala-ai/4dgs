@@ -132,22 +132,28 @@ their own stronger placement requirements; §5.4 does not currently constrain th
 
 - **Cost to producers:** none that can be measured. Every writer in this repository already
   complies, and the rule is what §5.15.1 already says these records do.
-- **Cost to readers:** none. It removes an obligation rather than adding one.
+- **Cost to readers:** no extra I/O or allocation on a conforming file, but real implementation
+  work. Every streamed reader and validator must track whether the first state chunk has appeared,
+  reject each defined late opcode, and preserve the opcode and byte offset in a structured error;
+  every conformance runner must expose those fields for the invalid variants in §6.
 - **What it forbids:** a shape that is currently legal. See §7 for exactly which files that is.
 - **Enforcement is asymmetric, and that is the design.** A streamed reader can detect a violation
-  for free — it has already passed a chunk — so it refuses. An indexed reader cannot detect one
-  without the scan the rule exists to avoid, so it is explicitly not required to. Both paths then
-  agree on every conforming file, and the path that can name the fault does.
+  without another read — it has already passed a chunk — so it refuses. Adding and testing that
+  refusal is still reader and harness work. An indexed reader is explicitly not required to pay for
+  the gap scan described under (b). Both paths then agree on every conforming file, and the path
+  that already observes the fault names it.
 
 ### (b) A reader obligation — indexed opens must find them wherever they sit
 
-- **Cost:** an indexed open no longer costs a bounded read from the front plus the tail. To find a
-  record that may sit anywhere before `summary_start`, a reader must walk the record chain across
-  the chunks — and the chain is a linked list of lengths, so it cannot be jumped. Over a range
-  transport that is one round trip per record, on the path whose defining property (AGENTS.md §2,
-  §1) is that it "touch[es] only what an instant needs" in bounded memory.
-- It also makes `bytes_for_time` (`indexed_reader.py:180`) a lie, since opening now costs an
-  unpredictable amount that no caller can budget before asking.
+- **Cost:** an indexed open no longer costs a bounded read from the front plus the tail. The Footer
+  locates the summary and the Chunk Index gives the whole-record ranges of every state chunk and SH
+  band, so a reader can jump over those known ranges and scan only the intervening gaps; it is not
+  forced to follow one linked record at a time. That is nevertheless O(chunks) gaps and range
+  requests in the worst case, and every non-chunk record in those gaps must be framed before the
+  reader knows whether it is late front matter. It adds no bytes to `bytes_for_time`, which is an
+  estimate on an already-open scene and correctly excludes opening costs; the regression is in the
+  open itself, on the path whose defining property (AGENTS.md §2, §1) is that it "touch[es] only
+  what an instant needs" in bounded memory.
 - The one thing in its favour: it keeps every legal file legal. That is not enough. The property it
   preserves is the legality of files that do not exist, and the property it destroys is the reason
   the indexed path exists at all.
@@ -193,10 +199,11 @@ Four reasons, in the order they should be weighed.
    chunks." Adopting (a) turns an assertion about where they belong into a rule about where they may
    be. That is a clarification with teeth, not a new policy.
 
-3. **It costs nothing that exists.** No file in the corpus, no output of any writer here, and no
-   documented producer shape is affected. §7 states this precisely, because "makes currently-legal
-   files illegal" is true in the abstract and empty in the particular, and the difference is the
-   whole decision.
+3. **It adds no runtime cost to conforming files.** No file in the corpus, no output of any writer
+   here, and no documented producer shape is affected. Implementations still owe the streamed
+   refusal, structured opcode/offset diagnostics, validator check and conformance-runner plumbing
+   described in §6. §7 states the affected file set precisely, because "makes currently-legal files
+   illegal" is true in the abstract even though no known producer emits one.
 
 4. **The alternatives trade a real property for a hypothetical one.** (b) spends the indexed path's
    defining guarantee to preserve files nobody writes. (c) can reuse repeatable Summary Offset
@@ -225,21 +232,23 @@ Written as spec prose, ready to lift.
 >
 > The rule exists for the indexed path and is the same one §5.17 states for audio. An indexed reader
 > frames the front matter with a bounded read from the start of the file and then reads the index; a
-> record it must not miss cannot be somewhere that walk does not reach, because reaching it means
-> walking the record chain across every chunk, which is the cost the indexed path exists to avoid.
-> With the object layer the consequence is not confined to metadata: an Object Track (§5.15.7)
-> changes where gaussians are (§3), so a track a reader cannot see is a scene in the wrong place
-> rather than a description it lacks.
+> record it must not miss cannot be somewhere that walk does not reach. The Chunk Index lets an
+> implementation jump over the indexed state and SH records, but discovering arbitrary records in
+> every gap still costs O(chunks) range requests and a framing scan across those gaps — the cost the
+> indexed path exists to avoid. With the object layer the consequence is not confined to metadata:
+> an Object Track (§5.15.7) changes where gaussians are (§3), so a track a reader cannot see is a
+> scene in the wrong place rather than a description it lacks.
 >
 > **A reader that encounters a defined provenance-family record (`0x20`–`0x25`) after the first
 > `Chunk` MUST refuse the file**, naming the opcode and its byte offset. An opcode the reader does
 > not recognize is still skipped under §4.2; position cannot turn an unknown record into a known
 > refusal rule. A future definition in the reserved `0x26`–`0x2F` range inherits the producer rule
 > and states its corresponding reader check when it becomes known. A streamed reader detects a
-> violation for free, because it has already passed a chunk. **An indexed reader MAY stop framing
-> front matter at the first `Chunk` and is not required to detect the violation**: the two paths
-> then agree on every conforming file, and the path that can name the fault at no cost is the one
-> required to.
+> violation without extra I/O, because it has already passed a chunk. Implementing the refusal and
+> retaining its opcode and byte offset are still required reader work. **An indexed reader MAY stop
+> framing front matter at the first `Chunk` and is not required to detect the violation**: the two
+> paths then agree on every conforming file, and the path that can name the fault at no cost is the
+> one required to.
 >
 > This is a rule about a writer's output, not a new capability. A file that satisfies it is
 > byte-identical to the file it would otherwise have been.
@@ -364,11 +373,10 @@ Every claim was checked against the code; two need correcting and one needs shar
   matter, was returned by both paths; only the spliced track was missed. The defect is positional,
   not categorical, which matters when writing the variant: a file that puts the whole layer late and
   a file that puts one record late fail differently.
-- **"Costs a tail scan"** (of option (b)). Not a tail scan: `summary_start` bounds the region but
-  the records inside it can only be found by walking the chain forward from the front, because a
-  record's position is only known from the previous record's length. The cost is a full forward walk
-  over every chunk header, not a read of the tail. This makes (b) worse than the issue states, not
-  better.
+- **"Costs a tail scan"** (of option (b)). Not a tail scan: `summary_start` bounds the region and
+  the Chunk Index identifies the state and SH ranges that can be skipped, but arbitrary late records
+  can occupy any intervening gap. The cost is therefore a gap scan with O(chunks) ranges in the
+  worst case, not a read of the tail and not necessarily a one-record-at-a-time forward walk.
 
 ---
 
