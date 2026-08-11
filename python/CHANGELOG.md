@@ -6,23 +6,7 @@ All notable changes to the Python package are documented here, following
 
 ## [Unreleased]
 
-### Fixed
-
-- **The Header declares the SH degree the file actually carries.** `sh_bands` caps how many bands
-  the writer emits, but the Header went on declaring the degree the input `GaussianSet` held. A
-  degree-3 scene written with `sh_bands=1` carries three coefficients per component and declared
-  fifteen, so a reader sizing its buffers from the Header read a different number of coefficients
-  than the file contained. The declared degree is now the highest band written (issue #190).
-
-- **The top spherical-harmonic coefficient survives a pitch that does not divide 256.** The `coarse`
-  profile's `step_sh = 3` centred the coefficient 255 on **256**, which no `u8` holds: the reference
-  reader refused the file the reference writer had just produced, and a reader whose stream codec
-  narrows to a byte instead reported the extreme positive coefficient as the extreme negative one.
-  Coefficient rounding now lives in one place, `quantization.coarsen_sh`, and clamps back into the
-  byte range — a move that can only be towards the original, so the declared half-pitch bound is
-  kept (issues #181, #190).
-
-## [0.3.0] - 2026-07-31
+## [0.3.0] - 2026-08-10
 
 This release ships the normative `keyframe-delta` temporal model as a whole-file reference path and
 animated OpenUSD export for those sequences. Rendering and player policy remain outside the package.
@@ -48,7 +32,118 @@ The LOD proposal is documentation only and is not advertised here.
   temporal model over time. Births and deaths are exact per frame; USD time samples do not carry
   `gaussian_id` correspondence across samples.
 
+- **`state_at_with_objects(gaussians, objects, t, cutoff)`**, exported at the top level, takes a
+  `GaussianSet`, reconstructs its state at `t` itself, and composes an object layer onto the result
+  in one call. `Scene.state_at` already did this for a decoded streamed scene; this is the same rule
+  for a caller holding the two separately — a set from `scene.gaussians` or an import path, a layer
+  from `read_objects` — and it saves every caller from remembering `ObjectLayer.apply`. It is not a
+  drop-in for indexed output: `read_chunk` returns one chunk's decoded arrays and `IndexedScene`
+  carries no `GaussianSet`, so an indexed caller assembles one before composing. It has no Header to
+  read either, so `cutoff` defaults to `0.05` where `Scene.state_at` passes its own file's
+  `header.cutoff`: a caller whose file declares a different threshold has to pass
+  `scene.header.cutoff`, or the visibility test runs against `0.05` and a different set of gaussians
+  can reach composition.
+- **A ceiling on trajectory and object-track samples.** `MAX_TRAJECTORY_SAMPLES` bounds what one
+  count-prefixed record may ask a reader to allocate before the bytes behind it are shown to exist.
+  Shared by value with the other SDKs, because a ceiling only one implementation has is a file that
+  decodes here and is refused there.
+- **A ceiling on indexed front-matter records.** `MAX_FRONT_MATTER_BYTES` (64 MiB) bounds a Camera,
+  Metadata, provenance, object-layer or Audio Source descriptor record, so a declared length cannot
+  size a transfer the file has not justified. Chunks and audio payloads are not front matter and are
+  unaffected. The check runs when the record is fetched rather than at open: `open_indexed` frames
+  these ranges without reading them, so a file carrying an oversized one still opens and still
+  decodes its chunks — it is the accessor for that record that refuses, where 0.2.0 transferred it.
+
 ### Fixed
+
+- **An empty trajectory or object track is read as though the record were absent** (spec §5.15.4 and
+  §5.15.7), so its pose rules are not applied — not even an interpolation byte outside the registry,
+  which describes how to read samples it does not carry. Rules that are not about the pose still
+  hold: a track naming object 0 is refused whether or not it carries samples, because the same
+  section requires every track to name something to move.
+
+  Two consequences worth stating. A rig-relative sensor naming a zero-sample trajectory is now
+  refused, because the trajectory it references is absent — 0.2.0 kept the empty record and returned
+  the bare extrinsic. And the writer does not refuse a zero-sample record: `check()` validates
+  sample times and not the count, so one encodes with a count of zero.
+
+- **Each gaussian gets the validity window its `window_index` names.** The keyframe-delta reader
+  derived every gaussian's velocity grid from the first validity window (spec §6.3), while the
+  writer forced a single full-duration window and wrote `window_index = 0` for everyone, ignoring
+  the `win_lo` and `win_hi` each gaussian already carried. Both sides are fixed — the writer now
+  round-trips distinct windows and exercises their liveness, and the reader resolves each row
+  against the one its own index names. The reference writer still cannot demonstrate the precision
+  defect because it emits no never-fading gaussian, the case whose velocity grid uses window length.
+
+  The precision half of this is narrower than it sounds. §6.3 takes the velocity grid from the
+  window length only for gaussians flagged as never fading; for every other gaussian the grid comes
+  from its own `sigma_t` and the window never entered it. So the positions that drifted from the
+  bins the encoder wrote were those of never-fading gaussians whose window is a different length
+  from window 0's, and different by enough to land in another precision class. No refusal, just
+  numbers nobody wrote.
+
+  **The liveness half reaches a gaussian that references a window excluding the requested instant.**
+  `reconstruct_at` now drops gaussians outside their own half-open window and `states_json`'s
+  `liveCount` follows, so a probe in that excluded interval returns a different population — where
+  before an expired or not-yet-born gaussian was still reported at an instant it does not exist, at
+  full opacity if it is one that never fades. Merely declaring extra, unreferenced windows changes
+  nothing. Both halves correct code drafted for this release and never tagged: 0.2.0 shipped no
+  whole-file keyframe-delta reader, so there is no 0.2.0 output to compare against — this is for
+  whoever ran the path off `main` before 2026-08-02.
+
+- **A keyframe-delta state carrying no `window_index` is refused by name.** A zero-count keyframe
+  may legally omit every stream, and a delta carries forward only the attributes its reference
+  already had, so a later birth group can compose a non-empty state with no `window_index` column.
+  Reconstruction needs one per row now that each row resolves its own window, so a state without it
+  is refused as `missing-window-index`, naming the §11.5 rule that makes the attribute required,
+  rather than failing as a `KeyError` raised inside reconstruction.
+
+  The column is also range-checked now that it is read. An index outside the Window Table is refused
+  as `window-index-out-of-range` — the code the chunk decoder has raised since 0.2.0 for the same
+  fault — where the draft path never looked at the column and reconstructed everyone against window
+  0, so the same bytes were accepted here and refused on the regular chunk path.
+
+- **Cross-record rules run on a truncated file too, where they can.** `read` now applies the
+  provenance and object-layer checks whatever `recover_truncated` returned, because a duplicate
+  sensor name among records that arrived complete is a fault no later byte could repair. Rules that
+  resolve one record against another are still deferred for a cut file — the record it names may
+  simply not have arrived — unless a Footer went past, which means the record stream was complete
+  and a missing rig or frame is missing for good. **0.2.0 skipped all of these for any truncated
+  file and returned the partial scene.**
+- **A `pose_reference` outside the registry is refused.** The registry defines 0 (scene) and 1
+  (rig); 0.2.0 treated every other value as scene-relative, which puts a sensor somewhere plausible
+  and wrong rather than saying it cannot place it.
+- **Object Table shapes are validated before they are written.** An anchor that is not three values,
+  a dynamics tuple that is not three vectors, or a dynamics vector that is not three values is
+  refused with an identifier naming the object and the field. 0.2.0 wrote short anchors into a
+  structurally shifted record, and a wrong dynamics count surfaced as a bare `ValueError`.
+- **An invalid UTF-8 string names the byte that failed.** The diagnostic pointed at the length
+  prefix, which had decoded fine, sending whoever held the file four bytes short of the problem. It
+  now names the offending byte and its value.
+- **A duplicate attribute stream is refused rather than resolved.** A malformed chunk or
+  keyframe-delta group carrying the same attribute twice decoded last-stream-wins, so the same bytes
+  could yield different memberships or values depending on order. It now refuses with
+  `duplicate-attribute-stream`.
+- **Quaternions near the top of the `f64` range normalize instead of being refused.** Trajectory,
+  object-track and sensor-extrinsic rotations use `math.hypot` rather than a sum of squares, so an
+  input like `[1e308, 0, 0, 0]` no longer overflows on the way to its own norm.
+- **Canonical keyframe-delta JSON writes zero without a negative sign.** A value that rounds from
+  `-0.0` to zero is emitted as `0.0`, so textual `states_json` comparisons no longer differ on a
+  sign that carries no numeric distinction.
+
+- **The Header declares the SH degree the file actually carries.** `sh_bands` caps how many bands
+  the writer emits, but the Header went on declaring the degree the input `GaussianSet` held. A
+  degree-3 scene written with `sh_bands=1` carries three coefficients per component and declared
+  fifteen, so a reader sizing its buffers from the Header read a different number of coefficients
+  than the file contained. The declared degree is now the highest band written (issue #190).
+
+- **The top spherical-harmonic coefficient survives a pitch that does not divide 256.** The `coarse`
+  profile's `step_sh = 3` centred the coefficient 255 on **256**, which no `u8` holds: the reference
+  reader refused the file the reference writer had just produced, and a reader whose stream codec
+  narrows to a byte instead reported the extreme positive coefficient as the extreme negative one.
+  Coefficient rounding now lives in one place, `quantization.coarsen_sh`, and clamps back into the
+  byte range — a move that can only be towards the original, so the declared half-pitch bound is
+  kept (issues #181, #190).
 
 - **Chunk-compressed PLY segment fidelity.** Segmented imports now retain every source gaussian and
   use the `.4dgs` validity window—not temporal-center filtering—to reproduce which segment is
