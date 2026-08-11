@@ -76,7 +76,7 @@ jobs:
           size_kb=$(du -s typescript | cut -f1)
           echo "typescript: ${size_kb} KiB"
           [ "$size_kb" -le 704 ] || { echo "::error::typescript is ${size_kb} KiB, over the 704 KiB budget"; exit 1; }
-      - name: Dart sources under 608 KB
+      - name: Dart sources under 768 KB
         # Sources only, same as TypeScript's and Swift's: this job builds nothing, so
         # .dart_tool and the compiled runners are not here to measure, and a vendored
         # dependency would show up as a budget failure.
@@ -97,10 +97,20 @@ jobs:
         # three quarters of it the tests. The headroom is deliberate and will be spent:
         # the rest of the hostile-input suite is still to be ported here, which is what
         # lets a consumer drop a vendored copy of this decoder for the package.
+        # Raised from 608 to 768 KiB for example/main.dart, the last thing pana was
+        # scoring the package on — 150/160 to 160/160 — and for the hostile-input and
+        # writer work still landing on other branches. One 5 KiB file took the tree to
+        # 612 against a cap of 608, because `du` rounds every file to a 4 KiB block and
+        # a new directory costs a block of its own before its contents. 768 rather than
+        # the next step up from 608 because two other branches have already raised this
+        # same number — feat/dart-resource-bounds took it 608 to 704 for the resource
+        # ceilings, and the writer stack took it 704 to 768 — so all three agreeing makes
+        # the merge a no-op instead of three-way arithmetic. The number is coordinated,
+        # not guessed.
         run: |
           size_kb=$(du -s dart | cut -f1)
           echo "dart: ${size_kb} KiB"
-          [ "$size_kb" -le 608 ] || { echo "::error::dart is ${size_kb} KiB, over the 608 KiB budget"; exit 1; }
+          [ "$size_kb" -le 768 ] || { echo "::error::dart is ${size_kb} KiB, over the 768 KiB budget"; exit 1; }
       - name: Swift sources under 300 KB
         # Sources only, same as TypeScript's: this job builds nothing, so .build is not
         # here to measure and a vendored dependency would show up as a budget failure.
@@ -673,17 +683,23 @@ jobs:
       # the shared one. That is fine — but then everything that runs needs it on the
       # loader's path too, which is what LD_LIBRARY_PATH is for. Apple platforms link the
       # staticlib and need no equivalent.
+      #
+      # No --package-path: the manifest is Package.swift at the repository root, because
+      # SwiftPM looks for it at the top of whatever it clones and a manifest under swift/
+      # cannot be depended on by URL. --scratch-path puts the build products back under
+      # swift/ anyway — tests/conformance/run.py looks for the runners in
+      # swift/.build/release, and SwiftPM's scratch directory is Swift's, not the root's.
       - name: Build
-        run: swift build --package-path swift -Xlinker -L$PWD/target/release
+        run: swift build --scratch-path swift/.build -Xlinker -L$PWD/target/release
       - name: Tests
-        run: LD_LIBRARY_PATH=$PWD/target/release swift test --package-path swift -Xlinker -L$PWD/target/release
+        run: LD_LIBRARY_PATH=$PWD/target/release swift test --scratch-path swift/.build -Xlinker -L$PWD/target/release
 
       # The canonical JSON is a contract between languages, and this is where Swift's half
       # of it is checked — against canonical.py, on a synthetic scene, with no decoding in
       # the way. It means a conformance mismatch is about the decode and nothing else.
       - name: Canonical JSON agrees with canonical.py
         run: |
-          LD_LIBRARY_PATH=$PWD/target/release swift run --package-path swift \
+          LD_LIBRARY_PATH=$PWD/target/release swift run --scratch-path swift/.build \
             -Xlinker -L$PWD/target/release canonical_selftest > /tmp/swift.json
           python3 swift/conformance/selftest.py --compare /tmp/swift.json
 
@@ -696,7 +712,7 @@ jobs:
         run: |
           python3 -m pip install --break-system-packages -e ./python/fourdgs >/dev/null
           python3 tests/conformance/generate.py >/dev/null
-          swift build --package-path swift --configuration release -Xlinker -L$PWD/target/release
+          swift build --scratch-path swift/.build --configuration release -Xlinker -L$PWD/target/release
           variant=$(ls tests/conformance/data/*UseChunkIndex*.4dgs | head -1)
           echo "decoding $variant"
           export LD_LIBRARY_PATH=$PWD/target/release
@@ -730,17 +746,17 @@ jobs:
           cargo build -p fourdgs --release --target aarch64-apple-visionos
           cargo build -p fourdgs --release --target aarch64-apple-ios
       - name: Build for macOS
-        run: swift build --package-path swift -Xlinker -L$PWD/target/release
+        run: swift build --scratch-path swift/.build -Xlinker -L$PWD/target/release
       - name: Build for visionOS and iOS
+        # xcodebuild resolves the package from the working directory, which is the
+        # repository root now that the manifest lives there — there is nothing to cd into.
         run: |
           set -e
-          root="$PWD"
-          cd swift
           for spec in "visionOS aarch64-apple-visionos" "iOS aarch64-apple-ios"; do
             set -- $spec
             echo "::group::$1"
             xcodebuild -scheme FourDGS -destination "generic/platform=$1" \
               -skipPackagePluginValidation \
-              OTHER_LDFLAGS="-L$root/target/$2/release" build | tail -5
+              OTHER_LDFLAGS="-L$PWD/target/$2/release" build | tail -5
             echo "::endgroup::"
           done

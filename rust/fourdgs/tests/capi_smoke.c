@@ -48,6 +48,8 @@ static void check_null_safety(void) {
     fourdgs_scene_free(NULL);
     fourdgs_state_free(NULL);
     check(fourdgs_last_error() != NULL, "the last error is never a null pointer");
+    check(fourdgs_last_refusal_code(NULL, NULL) == FOURDGS_STATUS_INVALID_ARGUMENT,
+          "a null refusal-code out parameter is an invalid argument");
     check(strcmp(fourdgs_status_message(FOURDGS_STATUS_OK), "ok") == 0,
           "status 0 is named ok");
 }
@@ -61,6 +63,28 @@ static void check_bad_magic(void) {
           "a buffer that is not a 4dgs file is an unsupported version");
     check(scene == NULL, "a failed open leaves the out parameter untouched");
     check(strlen(fourdgs_last_error()) > 0, "a failure leaves a message behind");
+
+    /* And which refusal it was, which the status code cannot say. Length-carrying, not
+     * NUL-terminated: compare on the length the accessor gave. */
+    const char *code = NULL;
+    size_t code_len = 0;
+    check(fourdgs_last_refusal_code(&code, &code_len) == FOURDGS_STATUS_OK,
+          "the refusal identifier is readable after a refusal");
+    check(code != NULL && code_len == strlen("magic-mismatch") &&
+              memcmp(code, "magic-mismatch", code_len) == 0,
+          "a bad magic is refused as magic-mismatch");
+
+    /* An error the refusal table does not name exposes none rather than the previous one:
+     * three bytes are shorter than the magic, which is a truncation, not a mismatch. */
+    const uint8_t stub[3] = {0};
+    check(fourdgs_open_memory(stub, sizeof stub, &scene) == FOURDGS_STATUS_TRUNCATED,
+          "a buffer shorter than the magic is truncated");
+    code = NULL;
+    code_len = 1;
+    check(fourdgs_last_refusal_code(&code, &code_len) == FOURDGS_STATUS_OK,
+          "the refusal identifier is readable after any error");
+    check(code == NULL && code_len == 0,
+          "an error the refusal table does not name exposes no identifier");
 }
 
 /* Everything a binding needs to state what it read, exercised the way one would. */

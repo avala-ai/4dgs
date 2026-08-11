@@ -1,0 +1,49 @@
+# Copyright 2026 Avala AI
+# SPDX-License-Identifier: Apache-2.0
+
+# What `find_package(fourdgs-cpp)` finds. The targets file beside it defines
+# fourdgs::fourdgs-cpp; everything here is about the one dependency that file cannot
+# describe on its own.
+
+@PACKAGE_INIT@
+
+# The configuration this package was built in, so a consumer can ask rather than discover
+# it at run time from an error code. Without a core the library still links and every call
+# returns ErrorCode::kNotImplemented — an honest build, but not a decoder.
+set(fourdgs-cpp_HAVE_CORE @FOURDGS_HAVE_CORE@)
+set(fourdgs-cpp_CORE_LIBRARY "@FOURDGS_CORE_LIBRARY@")
+
+# The Rust core is not a CMake package, so there is no find_dependency() to write for it:
+# it was linked by absolute path into the exported target when this package was installed.
+# That path is a build artifact of whatever tree built this package, so it can be gone by
+# the time somebody consumes the install — and what the consumer sees then is a linker
+# naming a file, at the end of a build, with no mention of fourdgs. Say the cause here,
+# where find_package can still refuse.
+if(fourdgs-cpp_HAVE_CORE AND NOT EXISTS "${fourdgs-cpp_CORE_LIBRARY}")
+  set(fourdgs-cpp_FOUND FALSE)
+  set(fourdgs-cpp_NOT_FOUND_MESSAGE
+      "fourdgs-cpp was installed against the Rust core at ${fourdgs-cpp_CORE_LIBRARY}, and that \
+file no longer exists. Rebuild it with `cargo build -p fourdgs --release` in a checkout of \
+avala-ai/4dgs, or reinstall this package with -DFOURDGS_CORE_LIBRARY pointing at the archive.")
+  return()
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/fourdgs-cpp-targets.cmake")
+
+# The name this package documents is fourdgs::cpp, which is what an in-tree
+# add_subdirectory() gets from the alias in CMakeLists.txt. Export namespacing produces
+# fourdgs::fourdgs-cpp instead, so a consumer who copied the target name out of the README
+# would be told there is no such target. Both names, one library, either consumption path.
+if(NOT TARGET fourdgs::cpp)
+  add_library(fourdgs::cpp INTERFACE IMPORTED)
+  set_target_properties(fourdgs::cpp PROPERTIES INTERFACE_LINK_LIBRARIES fourdgs::fourdgs-cpp)
+endif()
+
+if(NOT fourdgs-cpp_HAVE_CORE)
+  message(
+    STATUS
+      "fourdgs-cpp: this install was built without the Rust core, so every call returns "
+      "kNotImplemented and fourdgs::backendAvailable() is false")
+endif()
+
+check_required_components(fourdgs-cpp)

@@ -17,8 +17,18 @@ import fourdgs
 import numpy as np
 import pytest
 from fourdgs.exceptions import BoundViolation
-from fourdgs.quantization import SH_QUANT_HI, SH_QUANT_LO, quantize_sh, sh_bound, sh_coefficient, sh_step
+from fourdgs.opcode import QUANTIZATION, SH_BAND_STREAM
+from fourdgs.quantization import (
+    SH_QUANT_HI,
+    SH_QUANT_LO,
+    coarsen_sh,
+    quantize_sh,
+    sh_bound,
+    sh_coefficient,
+    sh_step,
+)
 from fourdgs.records import Quantization
+from fourdgs.serialization import MAGIC, Cursor, read_record
 from fourdgs.validate import validate
 from test_roundtrip import make_scene
 
@@ -29,6 +39,39 @@ def write(scene, duration=6.0, **kw) -> bytes:
     buf = io.BytesIO()
     fourdgs.write(buf, scene, duration, options=fourdgs.WriteOptions(**kw))
     return buf.getvalue()
+
+
+def _records(blob: bytes):
+    """Every top-level record in a file, as `(opcode, content)`."""
+    cursor = Cursor(blob[len(MAGIC) :])
+    while cursor.remaining() >= 9:
+        try:
+            record = read_record(cursor)
+        except Exception:
+            # The tail of a file is a footer, not a record; stopping there is the walk
+            # finishing rather than an error.
+            break
+        yield record.opcode, record.content
+
+
+def _record(blob: bytes, opcode: int) -> bytes:
+    """The content of the first record with `opcode`. Asserts rather than returning None:
+    a helper that quietly yields nothing turns a broken fixture into a passing test."""
+    for op, content in _records(blob):
+        if op == opcode:
+            return content
+    raise AssertionError(f"the file carries no record with opcode {opcode:#04x}")
+
+
+def _sh_band_records(blob: bytes) -> list[tuple[int, int]]:
+    """`(index, band)` for every SH Band Stream record. The band is the record's first
+    byte (spec section 6.5)."""
+    out = []
+    for i, (op, content) in enumerate(_records(blob)):
+        if op == SH_BAND_STREAM:
+            out.append((i, content[0]))
+    assert out, "the file carries no SH Band Stream records"
+    return out
 
 
 class TestGrid:
@@ -111,6 +154,65 @@ class TestDeclaration:
         assert out.quantization.sh_bit_depths == [8, 8]
         assert out.quantization.step_sh == 1
         assert np.array_equal(np.sort(out.gaussians.sh, axis=0), np.sort(scene.sh, axis=0))
+
+
+class TestTheWriterDeclaresWhatItWrote:
+    """Two writer bugs from issue #190, each hidden by a corpus that varies one setting
+    less than the format allows: every fixture is written at `sh_bands=3` with `step_sh=1`,
+    so a declared degree always matched what was written and the pitch always divided
+    evenly. Both are in the reference, and the other SDKs were written against it."""
+
+    @pytest.mark.parametrize("bands, expected", ((1, 1), (2, 2), (3, 3)))
+    def test_the_declared_degree_is_the_highest_band_written(self, bands, expected):
+        """A Header degree the chunk does not carry is a promise about coefficients that
+        are not there: at `sh_bands=1` a degree-3 scene carries three coefficients per
+        component and declaring 3 promises fifteen."""
+        blob = write(make_scene(sh_degree=3), sh_bands=bands)
+        out = fourdgs.read(blob)
+        written = sorted({band for _, band in _sh_band_records(blob)})
+        assert written == list(range(1, expected + 1)), "the bands the file actually carries"
+        assert out.header.sh_degree == expected, (
+            "the Header must declare the degree the file carries, not the degree the input held"
+        )
+        # Not just self-consistent — the coefficient count has to follow from it, which is
+        # what a reader sizing its buffers from the Header depends on.
+        assert out.gaussians.sh.shape[1] == {1: 9, 2: 24, 3: 45}[expected]
+
+    def test_the_top_coefficient_survives_a_pitch_that_does_not_divide_256(self):
+        """`step_sh = 3` centres the coefficient 255 on 256, which no `u8` holds.
+
+        Before the fix the reference writer produced a `coarse`-profile file its own
+        reader refused outright; an SDK whose stream codec narrows to a byte instead read
+        the extreme positive coefficient as the extreme negative one. Highest value in,
+        lowest out (issues #181, #190).
+        """
+        scene = make_scene(sh_degree=3)
+        # Pin the extremes rather than trusting the PRNG to draw them.
+        scene.sh[0, 0] = 255
+        scene.sh[1, 0] = 254
+        scene.sh[2, 0] = 0
+
+        blob = write(scene, profile="coarse")
+        assert Quantization.parse(_record(blob, QUANTIZATION)).step_sh == 3, "the profile's pitch, unchanged"
+
+        out = fourdgs.read(blob)  # the refusal this used to raise is the regression
+        assert int(out.gaussians.sh.max()) == 255, (
+            "the top coefficient went in at 255 and must come back as 255, not as 0"
+        )
+
+        # And the whole population, not just its extreme. The writer reorders gaussians,
+        # so this is stated per column rather than per row: what the file carries must be
+        # exactly the scene put through the pitch the file declares.
+        expected = coarsen_sh(scene.sh.astype(np.int64), 3)
+        assert np.array_equal(np.sort(out.gaussians.sh.astype(np.int64), axis=0), np.sort(expected, axis=0))
+
+    def test_every_byte_survives_the_coarse_pitch(self):
+        """The grid property itself, over the whole domain rather than one scene's draw."""
+        every = np.arange(256, dtype=np.int64)
+        got = coarsen_sh(every, 3)
+        assert got.min() >= 0 and got.max() <= 255, "a coefficient is a byte at every pitch"
+        assert np.abs(got - every).max() <= 3 // 2, "the declared half-pitch bound still holds"
+        assert np.array_equal(coarsen_sh(got, 3), got), "and the rounding stays idempotent"
 
 
 class TestTolerantParse:

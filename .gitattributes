@@ -5,3 +5,11 @@ tests/conformance/data/** linguist-generated=true
 # so binary fixtures must never be filtered.
 * text=auto
 *.4dgs binary
+
+# These text files are copied into the reproducible corpus artifact. Pin their
+# checkout representation so the same tag archives the same bytes on every OS.
+LICENSE text eol=lf
+NOTICE text eol=lf
+tests/conformance/data/CHECKSUMS.txt text eol=lf
+tests/conformance/data/.gitignore text eol=lf
+tests/conformance/data/**/*.json text eol=lf

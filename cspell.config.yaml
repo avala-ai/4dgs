@@ -130,10 +130,13 @@ words:
   - cdylib
   - staticlib
   - lpthread
+  # `-lfourdgs`, the flag in the link error a consumer without the core sees
+  - lfourdgs
   - clippy
   - MSVC
   - fprintf
   - DFOURDGS
+  - DCMAKE
   # Git and workflow vocabulary
   - reflog
   - oneline
@@ -146,6 +149,8 @@ words:
   - multiset
   - modulemap
   - uncomposed
+  - worktree
+  - worktrees
 ignorePaths:
   - "**/node_modules/**"
   - "**/dist/**"
