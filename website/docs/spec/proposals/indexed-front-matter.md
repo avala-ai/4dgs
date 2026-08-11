@@ -126,9 +126,9 @@ needs a variant and not only a paragraph.
 ### (a) A producer rule — indexed front matter MUST precede the first Chunk
 
 Indexed readers keep stopping at the first `Chunk`; writers are forbidden from putting anything that
-walk collects behind it. The rule covers legacy Audio, Camera, Metadata, Attachment, Audio
-Source/Data pairs and the provenance family. Header, Quantization and Window Table already have
-their own stronger placement requirements.
+walk collects behind it. The rule covers the Window Table, legacy Audio, Camera, Metadata,
+Attachment, Audio Source/Data pairs and the provenance family. Header and Quantization already have
+their own stronger placement requirements; §5.4 does not currently constrain the Window Table.
 
 - **Cost to producers:** none that can be measured. Every writer in this repository already
   complies, and the rule is what §5.15.1 already says these records do.
@@ -261,10 +261,10 @@ Replace:
 with:
 
 > Order is normative only where stated: the Header MUST be the first record, the Footer MUST be the
-> last, the summary MUST be contiguous (§4.5), and legacy Audio, Camera, Metadata, Attachment, every
-> Audio Source and Audio Data pair (§5.17), and every provenance-family record (§5.15) MUST precede
-> the first `Chunk`. Records not constrained here or in their own sections retain free placement,
-> and a reader MUST NOT depend on their position.
+> last, the summary MUST be contiguous (§4.5), and every Window Table, legacy Audio, Camera,
+> Metadata, Attachment, every Audio Source and Audio Data pair (§5.17), and every provenance-family
+> record (§5.15) MUST precede the first `Chunk`. Records not constrained here or in their own
+> sections retain free placement, and a reader MUST NOT depend on their position.
 >
 > A reader that encounters any of those defined records after the first `Chunk` MUST refuse it,
 > naming the opcode and byte offset. This does not override §4.2 for an opcode the reader does not
@@ -292,11 +292,11 @@ One variant, in `data/invalid/`, because after this proposal the file is not a l
   a bad magic, an unknown scheme, a window index out of range — so a record-position refusal is a
   new shape for that directory rather than a variation on one already there.
 - **The rest of the positional family is independently pinned.** Add `LateLegacyAudio`,
-  `LateCamera`, `LateMetadata`, `LateAttachment` and `LateAudioSource` using the same splice. One
-  provenance example cannot prove the branches for unrelated legacy opcodes, and §5.17's existing
-  Audio Source rule currently has no variant either. Each expectation names its opcode and offset;
-  `LateAudioSource` closes the pre-existing §5.17 gap while the other four prevent this proposal
-  from documenting a broader rule than the suite proves.
+  `LateCamera`, `LateMetadata`, `LateAttachment`, `LateWindowTable` and `LateAudioSource` using the
+  same splice. One provenance example cannot prove the branches for unrelated legacy opcodes, and
+  §5.17's existing Audio Source rule currently has no variant either. Each expectation names its
+  opcode and offset; `LateAudioSource` closes the pre-existing §5.17 gap while the other five
+  prevent this proposal from documenting a broader rule than the suite proves.
 - **Why an invalid variant and not a valid one:** a valid variant can only assert that the two paths
   agree, and under this proposal they agree because the file cannot exist. The thing worth pinning
   is the refusal — without it, an implementation that keeps today's silent behaviour passes.
@@ -314,9 +314,9 @@ Neither variant regenerates anything. The corpus gains files; nothing existing m
 
 The proposal's instruction is to say plainly which files this breaks, so:
 
-**Files that become illegal:** any file carrying legacy Audio, Camera, Metadata, Attachment, Audio
-Source/Data, or a record with an opcode in `0x20`–`0x2F` at a byte offset after the first `Chunk`
-record.
+**Files that become illegal:** any file carrying a Window Table, legacy Audio, Camera, Metadata,
+Attachment, Audio Source/Data, or a record with an opcode in `0x20`–`0x2F` at a byte offset after
+the first `Chunk` record.
 
 **Files known to be in that set:** none.
 
@@ -333,10 +333,11 @@ record.
   its own indexed reader silently ignored.
 
 **What is genuinely lost:** the abstract permission. A future producer that wanted to append a
-Coordinate Frame to an already-written file without rewriting it must now rewrite the front matter,
-or carry the information in a Metadata record or an Attachment. That is a real constraint and it is
-the price. It is the same price §5.17 already charged for audio, and the same one §4.5 charged for
-attachments.
+Coordinate Frame to an already-written file must rewrite the front matter for every standardized
+representation: the Coordinate Frame, Metadata and Attachment records are all constrained ahead of
+the first `Chunk` by this rule. A private, unknown opcode retains free placement under §4.2, but it
+has no standardized Coordinate Frame semantics and is not an interoperable substitute. Rewriting is
+the real constraint and the price, the same one §5.17 already charged for audio.
 
 ---
 

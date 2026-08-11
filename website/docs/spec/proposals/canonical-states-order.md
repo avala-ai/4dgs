@@ -291,17 +291,22 @@ rely on it." Everything in this proposal is the conformance reference being held
 
 ## 6. The conformance variants that pin it
 
-Four variants, each with one job and each a new file.
+Four cases, represented by five files; the tied-state case is deliberately a paired encoding.
 
-- **`ObjectTiedGaussians`** — an object-layer scene containing at least one pair of gaussians that
-  tie on every field of the `_stable_order` key at six decimals while differing in exact `position`
-  and `motion`, with a `mu_t` far enough from the probe times that the difference amplifies past the
-  sixth decimal in the composed centre. Built by choosing a `step_pos` and `step_motion` fine enough
-  that two adjacent bins round identically — a quantization choice, not a hand-written float.
+- **`ObjectTiedGaussians` and `ObjectTiedGaussiansReordered`** — two encodings of the same
+  object-layer gaussian multiset, containing at least one pair of gaussians that tie on every field
+  of the `_stable_order` key at six decimals while differing in exact `position` and `motion`, with
+  a `mu_t` far enough from the probe times that the difference amplifies past the sixth decimal in
+  the composed centre. Built by choosing a `step_pos` and `step_motion` fine enough that two
+  adjacent bins round identically — a quantization choice, not a hand-written float. The second file
+  permutes the tied rows' physical/resident order while preserving every decoded value; the
+  generator refuses to emit the pair unless their pre-fix resident-order canonicals differ and their
+  content-order canonicals are identical.
 
-  **What it asserts:** every runner produces the same `states[*].sample` rows. Without fix (1a) two
-  decoders that chunk the scene differently produce different rows, so the variant fails today and
-  passes after — which is the property that makes it worth adding rather than a restatement.
+  **What it asserts:** every runner produces identical `states[*].sample` rows for both encodings.
+  Without fix (1a), the stable sort retains the two different decoded resident orders when its key
+  ties, so at least the reordered file disagrees with the shared expectation. No decoder is assumed
+  to choose its own chunking or order; the two inputs supply both orders explicitly.
 
 - **`ObjectCancellingPositionSum`** — live centres of large opposing sign spread across at least two
   chunks, with resident order grouping signs and content order interleaving them. The generator must
