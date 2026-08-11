@@ -66,35 +66,42 @@ List<double> seekProbeInstants(
   FourdgsChunkIndexEntry entry,
   double Function(double boundary) guardAt,
 ) {
+  List<double> inside(Iterable<double> candidates) => candidates
+      .where((t) => t.isFinite && entry.covers(t))
+      .toList(growable: false);
   final span = entry.t1 - entry.t0;
   if (span.isFinite) {
-    return <double>[
+    return inside(<double>[
       for (final fraction in const <double>[0.13, 0.37, 0.61, 0.89])
         entry.t0 + fraction * span,
-    ];
+    ]);
   }
   if (entry.t0.isFinite) {
     final step = math.max(
       1.0,
       math.max(4.0 * guardAt(entry.t0), entry.t0.abs() * 1e-6),
     );
-    return <double>[
+    return inside(<double>[
       for (final factor in const <double>[0.5, 1.5, 3.5, 7.5])
         entry.t0 + factor * step,
-    ];
+    ]);
   }
   if (entry.t1.isFinite) {
     final step = math.max(
       1.0,
       math.max(4.0 * guardAt(entry.t1), entry.t1.abs() * 1e-6),
     );
-    return <double>[
+    return inside(<double>[
       for (final factor in const <double>[0.5, 1.5, 3.5, 7.5])
         entry.t1 - factor * step,
-    ];
+    ]);
   }
-  return const <double>[-3.5, -0.5, 0.5, 3.5];
+  return inside(const <double>[-3.5, -0.5, 0.5, 3.5]);
 }
+
+/// Largest relative sigma movement caused by half a log-space quantization bin.
+double seekGuardSigmaHalfRelative(double pitch) =>
+    math.exp(0.5 * pitch.abs()) - 1.0;
 
 /// A [FourdgsReadable] that records what it transferred, so a claim about byte
 /// ranges can be checked against the bytes that actually moved.
@@ -249,7 +256,7 @@ Future<int> checkSeekReadsOnlyWhatItNeeds(
   final quantization = scene.quantization;
   final k = supportK(scene.header.cutoff);
   final sigmaLog = quantization.stepSigmaLog;
-  final sigmaHalfRelative = math.exp(0.5 * sigmaLog) - 1.0;
+  final sigmaHalfRelative = seekGuardSigmaHalfRelative(sigmaLog);
   final guardEdges = <({double at, double guard})>[];
   for (int i = 0; i < whole.count; i++) {
     final sigma = whole.sigmaT[i];
@@ -263,11 +270,19 @@ Future<int> checkSeekReadsOnlyWhatItNeeds(
     final rawHi = whole.muT[i] + k * sigma;
     final lo = math.max(rawLo, whole.winLo[i]);
     final hi = math.min(rawHi, whole.winHi[i]);
-    if (rawLo > whole.winLo[i] && slack > 0.0) {
-      guardEdges.add((at: lo, guard: slack));
-    }
-    if (rawHi < whole.winHi[i] && slack > 0.0) {
-      guardEdges.add((at: hi, guard: slack));
+    if (slack > 0.0) {
+      if (rawLo > whole.winLo[i]) {
+        guardEdges.add((at: lo, guard: slack));
+      } else if (whole.winLo[i].isFinite && whole.winLo[i] - rawLo <= slack) {
+        // The authored marginal edge may have been just inside the window before
+        // quantization moved it across. Guard the clipped edge conservatively.
+        guardEdges.add((at: whole.winLo[i], guard: slack));
+      }
+      if (rawHi < whole.winHi[i]) {
+        guardEdges.add((at: hi, guard: slack));
+      } else if (whole.winHi[i].isFinite && rawHi - whole.winHi[i] <= slack) {
+        guardEdges.add((at: whole.winHi[i], guard: slack));
+      }
     }
   }
   final guardByBoundary = <double, double>{};

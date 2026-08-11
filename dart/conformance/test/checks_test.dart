@@ -3,6 +3,7 @@
 
 library;
 
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:fourdgs/fourdgs.dart';
@@ -35,6 +36,22 @@ void main() {
       expect(probes.every((t) => t.isFinite), isTrue);
       expect(probes.every(interval.covers), isTrue);
     }
+  });
+
+  test('rounded finite probes never escape their half-open entry', () {
+    final bits = ByteData(8)..setFloat64(0, 1.0, Endian.host);
+    final oneBits = bits.getUint64(0, Endian.host);
+    bits.setUint64(0, oneBits + 1, Endian.host);
+    final adjacent = entry(t0: 1.0, t1: bits.getFloat64(0, Endian.host));
+    final probes = seekProbeInstants(adjacent, (_) => 0.0);
+    expect(probes.every(adjacent.covers), isTrue);
+  });
+
+  test('sigma-log guard distance uses pitch magnitude', () {
+    final positive = seekGuardSigmaHalfRelative(0.1);
+    expect(positive, greaterThan(0));
+    expect(seekGuardSigmaHalfRelative(-0.1), closeTo(positive, 1e-15));
+    expect(positive, closeTo(math.exp(0.05) - 1.0, 1e-15));
   });
 
   test('seek entry cap is applied after unusable entries are removed', () {

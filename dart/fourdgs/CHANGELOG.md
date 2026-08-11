@@ -111,20 +111,19 @@ happened.
 - Deterministic: two encodes of one scene are byte-identical, including the Header's attribute map,
   whose keys are sorted rather than emitted in whatever order the caller's map iterates.
 - Proved by `dart/encode-roundtrip.sh`, which re-encodes all 46 corpus variants — into as many as 42
-  chunks each — and makes two
-  separate claims about each result. **Fidelity**: the written scene is compared against the scene
-  it was written from, by the Python reference reader, attribute by attribute, against the error
-  bounds the written file itself declares — including the per-gaussian velocity and birth-time
-  pitches, derived the way a decoder derives them, and the presence, degree and shape of the
-  spherical harmonics, which are checked before any coefficient is compared because an encoder that
-  emitted none at all would otherwise skip the comparison entirely. The object-bearing case also
-  pairs and compares both exact source identity lanes. **Agreement**: the Dart, Python and Rust
-  decoders must produce identical canonical JSON from the result, on both read paths each — six
-  readers, three implementations. Neither claim implies the other. Decoders reading one file the
-  same way say nothing about whether that file is the scene that went in, and an encoder checked
-  only by its own decoder proves that two halves of one implementation share an opinion. Every
-  reader is required: a missing one is an error rather than a reader quietly dropped from the
-  comparison. It runs in the conformance workflow.
+  chunks each — and makes two separate claims about each result. **Fidelity**: the written scene is
+  compared against the scene it was written from, by the Python reference reader, attribute by
+  attribute, against the error bounds the written file itself declares — including the per-gaussian
+  velocity and birth-time pitches, derived the way a decoder derives them, and the presence, degree
+  and shape of the spherical harmonics, which are checked before any coefficient is compared because
+  an encoder that emitted none at all would otherwise skip the comparison entirely. The
+  object-bearing case also pairs and compares both exact source identity lanes. **Agreement**: the
+  Dart, Python and Rust decoders must produce identical canonical JSON from the result, on both read
+  paths each — six readers, three implementations. Neither claim implies the other. Decoders reading
+  one file the same way say nothing about whether that file is the scene that went in, and an
+  encoder checked only by its own decoder proves that two halves of one implementation share an
+  opinion. Every reader is required: a missing one is an error rather than a reader quietly dropped
+  from the comparison. It runs in the conformance workflow.
 
 ### Hostile-input hardening
 
