@@ -570,7 +570,7 @@ pub fn write_sequence(
         ));
     }
     let grids = grids_for(samples, duration_sec, kd.profile, kd.cutoff);
-    let quantized: Vec<(Vec<i64>, BTreeMap<u8, BinArray>)> = samples
+    let mut quantized: Vec<(Vec<i64>, BTreeMap<u8, BinArray>)> = samples
         .iter()
         .map(|s| quantize_sample(s, &grids))
         .collect::<Result<_>>()?;
@@ -642,9 +642,9 @@ pub fn write_sequence(
         if is_keyframe(i, kd) {
             // A keyframe reintroduces its complete live population at the keyframe's
             // physical start, regardless of the birth time carried by the input sample.
-            // Keep the sample-grid values used to calculate later deltas untouched, but
-            // write the keyframe's required mu_t column at Chunk.t0 as section 11.5
-            // requires.
+            // The corrected bins are both what this keyframe serializes and the reference
+            // subsequent deltas subtract from. Keeping the input sample's old mu_t here
+            // would make the decoder add those deltas to a different starting state.
             let mut keyframe_bins = bins.clone();
             let sigma = &bins[&op::A_SIGMA_T];
             let flags = &bins[&op::A_FLAGS];
@@ -677,6 +677,7 @@ pub fn write_sequence(
                 depth: 0,
                 live_count: ids.len() as u64,
             });
+            quantized[i].1 = keyframe_bins;
             continue;
         }
 
@@ -1129,23 +1130,33 @@ pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
     let mut windows: Vec<(f64, f64)> = Vec::new();
     let mut chunks: Vec<ChunkInfo> = Vec::new();
     let mut by_offset: BTreeMap<u64, State> = BTreeMap::new();
+    let mut state_seen = false;
 
     for record in Records::new(data, MAGIC.len()) {
         let record = record?;
         match record.opcode {
             op::HEADER => {
                 let parsed = rec::Header::parse(record.content)?;
-                if parsed.temporal_model != "keyframe-delta" {
-                    return Err(Error::Malformed(format!(
-                        "decode_streamed is the keyframe-delta path; this file is {:?}",
-                        parsed.temporal_model
-                    )));
+                check_keyframe_temporal_model(&parsed.temporal_model)?;
+                if !state_seen {
+                    header = Some(parsed);
                 }
-                header = Some(parsed);
             }
-            op::QUANTIZATION => quant = Some(rec::Quantization::parse(record.content)?),
-            op::WINDOW_TABLE => windows = rec::WindowTable::parse(record.content)?.windows,
+            op::QUANTIZATION => {
+                let parsed = rec::Quantization::parse(record.content)?;
+                crate::registry::check_quantization_scheme(&parsed.scheme)?;
+                if !state_seen {
+                    quant = Some(parsed);
+                }
+            }
+            op::WINDOW_TABLE => {
+                let parsed = rec::WindowTable::parse(record.content)?;
+                if !state_seen {
+                    windows = parsed.windows;
+                }
+            }
             op::CHUNK => {
+                state_seen = true;
                 let (head, ids, bins) = keyframe_from_chunk(record.content)?;
                 let state = keyframe_state(ids, bins)?;
                 let quantization = quant.as_ref().ok_or_else(|| {
@@ -1169,6 +1180,7 @@ pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
                 });
             }
             op::DELTA_CHUNK => {
+                state_seen = true;
                 let (head, _) = rec::parse_delta_chunk_records(record.content)?;
                 if head.reference_offset >= record.offset as u64 {
                     return Err(Error::Malformed(format!(
@@ -1304,6 +1316,25 @@ fn ranged_header<R: crate::Readable + ?Sized>(
             Err(error) => return Err(error),
         }
     }
+}
+
+/// Read one front-matter record only after its declared allocation has passed the shared
+/// fixed ceiling. Unlike Header, neither parser can decide it is complete from a small
+/// prefix: Quantization has a variable bounds map and Window Table has a declared row
+/// count, so the bounded record is transferred whole.
+fn ranged_front_matter_content<R: crate::Readable + ?Sized>(
+    source: &mut R,
+    content_at: u64,
+    content_length: u64,
+    what: &str,
+) -> Result<Vec<u8>> {
+    if content_length > crate::indexed_reader::MAX_FRONT_MATTER_BYTES {
+        return Err(Error::Malformed(format!(
+            "the {what} record is {content_length} bytes, past the {} byte ceiling for a single front-matter record",
+            crate::indexed_reader::MAX_FRONT_MATTER_BYTES
+        )));
+    }
+    source.read(content_at, content_length)
 }
 
 fn check_keyframe_temporal_model(model: &str) -> Result<()> {
@@ -1491,16 +1522,15 @@ pub fn open_indexed<R: crate::Readable + ?Sized>(source: &mut R) -> Result<Index
     let mut quant: Option<rec::Quantization> = None;
     let mut windows: Vec<(f64, f64)> = Vec::new();
     let mut at = MAGIC.len() as u64;
-    let mut state_seen = false;
-    // Header declarations remain authoritative wherever they occur, so every copy is
-    // checked even after state begins.  Only nine-byte framing is read for intervening
-    // payload records; later non-Header front matter is deliberately not substituted for
-    // the grid and windows selected before the first state record.
+    // Front matter ends at the first state record. Indexed open must not turn into a
+    // physical-record scan: the tail locates the index, and composition later reads only
+    // the selected chain. The streamed path uses the same pre-state declarations as the
+    // authoritative Header, Quantization and Window Table.
     while at < footer_at {
         let (opcode, content_length) = ranged_framing(source, at, None)?;
         let total = crate::serialization::RECORD_HEADER_SIZE as u64 + content_length;
         if opcode == op::CHUNK || opcode == op::DELTA_CHUNK {
-            state_seen = true;
+            break;
         }
         match opcode {
             op::HEADER => {
@@ -1513,20 +1543,22 @@ pub fn open_indexed<R: crate::Readable + ?Sized>(source: &mut R) -> Result<Index
                 header = Some(parsed);
             }
             op::QUANTIZATION => {
-                let content = source.read(
+                let content = ranged_front_matter_content(
+                    source,
                     at + crate::serialization::RECORD_HEADER_SIZE as u64,
                     content_length,
+                    "Quantization",
                 )?;
                 let parsed = rec::Quantization::parse(&content)?;
                 crate::registry::check_quantization_scheme(&parsed.scheme)?;
-                if !state_seen {
-                    quant = Some(parsed);
-                }
+                quant = Some(parsed);
             }
-            op::WINDOW_TABLE if !state_seen => {
-                let content = source.read(
+            op::WINDOW_TABLE => {
+                let content = ranged_front_matter_content(
+                    source,
                     at + crate::serialization::RECORD_HEADER_SIZE as u64,
                     content_length,
+                    "Window Table",
                 )?;
                 windows = rec::WindowTable::parse(&content)?.windows;
             }
@@ -2267,7 +2299,7 @@ mod hostile_record_tests {
     }
 
     #[test]
-    fn indexed_open_checks_a_header_after_the_first_state_record() {
+    fn indexed_open_does_not_scan_records_after_the_first_state_record() {
         let mut data = empty_indexed_file();
         let old_footer_at =
             data.len() - MAGIC.len() - crate::serialization::RECORD_HEADER_SIZE - 20;
@@ -2292,10 +2324,17 @@ mod hostile_record_tests {
             ..footer_at + crate::serialization::RECORD_HEADER_SIZE + 8]
             .copy_from_slice(&shifted_summary.to_le_bytes());
 
-        let error = open_indexed(&mut BytesReadable::new(&data)).unwrap_err();
-        assert_eq!(
-            error.refusal_code(),
-            Some(crate::error::refusal::UNKNOWN_TEMPORAL_MODEL)
+        let late_at = old_summary_start as u64;
+        let mut source = Watched::new(&data);
+        let sequence = open_indexed(&mut source).unwrap();
+        assert_eq!(sequence.header.temporal_model, "keyframe-delta");
+        assert!(
+            !source
+                .reads
+                .iter()
+                .any(|(offset, length)| *offset == late_at && *length == 9),
+            "indexed open walked into the late Header: {:?}",
+            source.reads
         );
     }
 
@@ -2336,7 +2375,7 @@ mod hostile_record_tests {
     }
 
     #[test]
-    fn indexed_open_checks_a_quantization_after_the_first_state_record() {
+    fn streamed_and_indexed_reads_keep_the_pre_state_window_table() {
         let mut data = empty_indexed_file();
         let old_footer_at =
             data.len() - MAGIC.len() - crate::serialization::RECORD_HEADER_SIZE - 20;
@@ -2346,13 +2385,10 @@ mod hostile_record_tests {
                 .try_into()
                 .unwrap(),
         ) as usize;
-        let mut late_grid = Records::new(&data, MAGIC.len())
-            .filter_map(|record| record.ok())
-            .find(|record| record.opcode == op::QUANTIZATION)
-            .map(|record| rec::Quantization::parse(record.content).unwrap())
-            .unwrap();
-        late_grid.scheme = "future-grid".into();
-        let late = late_grid.encode(&[]);
+        let late = rec::WindowTable {
+            windows: vec![(10.0, 20.0)],
+        }
+        .encode();
         data.splice(old_summary_start..old_summary_start, late.iter().copied());
 
         let footer_at = old_footer_at + late.len();
@@ -2361,10 +2397,33 @@ mod hostile_record_tests {
             ..footer_at + crate::serialization::RECORD_HEADER_SIZE + 8]
             .copy_from_slice(&shifted_summary.to_le_bytes());
 
-        let error = open_indexed(&mut BytesReadable::new(&data)).unwrap_err();
-        assert_eq!(
-            error.refusal_code(),
-            Some(crate::error::refusal::UNKNOWN_QUANTIZATION_SCHEME)
-        );
+        let streamed = decode_streamed(&data).unwrap();
+        let indexed = open_indexed(&mut BytesReadable::new(&data)).unwrap();
+        assert_eq!(streamed.windows, indexed.windows);
+        assert_ne!(streamed.windows, vec![(10.0, 20.0)]);
+    }
+
+    #[test]
+    fn quantization_length_is_bounded_before_the_range_is_read() {
+        struct NoReads;
+        impl Readable for NoReads {
+            fn size(&mut self) -> Result<u64> {
+                Ok(u64::MAX)
+            }
+
+            fn read(&mut self, _offset: u64, _length: u64) -> Result<Vec<u8>> {
+                panic!("the oversized range must be rejected before Readable::read")
+            }
+        }
+
+        let error = ranged_front_matter_content(
+            &mut NoReads,
+            0,
+            crate::indexed_reader::MAX_FRONT_MATTER_BYTES + 1,
+            "Quantization",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Quantization"), "{error}");
+        assert!(error.to_string().contains("ceiling"), "{error}");
     }
 }

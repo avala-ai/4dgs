@@ -1059,20 +1059,23 @@ fn check_keyframe_delta_streamed(data: &[u8], framing: Framing, report: &mut Rep
                         ),
                     ));
                 }
-                header = Some(parsed);
+                if current.is_none() {
+                    header = Some(parsed);
+                }
                 Ok(())
             }),
             op::QUANTIZATION => rec::Quantization::parse(content).and_then(|parsed| {
                 fourdgs::registry::check_quantization_scheme(&parsed.scheme)?;
-                quantization = Some(parsed);
-                Ok(())
-            }),
-            op::WINDOW_TABLE => {
-                if let Ok(table) = rec::WindowTable::parse(content) {
-                    windows = table.windows;
+                if current.is_none() {
+                    quantization = Some(parsed);
                 }
                 Ok(())
-            }
+            }),
+            op::WINDOW_TABLE => rec::WindowTable::parse(content).map(|table| {
+                if current.is_none() {
+                    windows = table.windows;
+                }
+            }),
             op::CHUNK => fourdgs::keyframe_delta_file::decode_keyframe_chunk(content, &windows)
                 .and_then(|(state, head)| {
                     let quantization = quantization.as_ref().ok_or_else(|| {
