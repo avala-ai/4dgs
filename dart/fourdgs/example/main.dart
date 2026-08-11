@@ -26,6 +26,7 @@
 library;
 
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:fourdgs/fourdgs.dart';
 import 'package:fourdgs/io.dart';
@@ -38,14 +39,9 @@ Future<void> main(List<String> args) async {
   }
   final path = args.first;
   final t = args.length > 1 ? double.tryParse(args[1]) : 0.0;
-  if (t == null) {
-    stderr.writeln('4dgs: not a number of seconds: ${args[1]}');
+  if (t == null || !t.isFinite) {
+    stderr.writeln('4dgs: not a finite number of seconds: ${args[1]}');
     exitCode = 64; // EX_USAGE
-    return;
-  }
-  if (!await File(path).exists()) {
-    stderr.writeln('4dgs: no such file: $path');
-    exitCode = 66; // EX_NOINPUT
     return;
   }
 
@@ -55,21 +51,36 @@ Future<void> main(List<String> args) async {
   // the one the front-to-back reader can still recover a prefix of. Giving up
   // on the first refusal would leave the recovery below unreachable in the only
   // case it exists for.
-  final indexedOk = await _indexed(path, t);
-  final wholeFileOk = await _wholeFile(path, t);
-  if (!indexedOk || !wholeFileOk) exitCode = 65; // EX_DATAERR
+  final indexed = await _indexed(path, t);
+  // A transport failure is shared by both paths. Do not print it twice; both
+  // helpers still catch their own I/O because the file can disappear between
+  // these independent passes.
+  final wholeFile =
+      indexed == _ReadResult.inputError
+          ? _ReadResult.inputError
+          : await _wholeFile(path, t);
+  if (indexed == _ReadResult.inputError ||
+      wholeFile == _ReadResult.inputError) {
+    exitCode = 66; // EX_NOINPUT
+  } else if (indexed != _ReadResult.ok || wholeFile != _ReadResult.ok) {
+    exitCode = 65; // EX_DATAERR
+  }
 }
+
+enum _ReadResult { ok, dataError, inputError }
 
 /// Opens the file by byte range and answers `t` out of the index.
 ///
-/// Returns false when the file refused to be read this way.
-Future<bool> _indexed(String path, double t) async {
+/// Returns whether the pass succeeded, refused the bytes, or could not open
+/// the input.
+Future<_ReadResult> _indexed(String path, double t) async {
   // `openFourdgsIndexed` reads the head and the summary at the tail. It does
   // not touch a chunk, so this is the same cost for a 5 MiB file and a 5 GiB
   // one, and it is the right way to answer "what is in here".
-  final source = await FourdgsFileReadable.open(path);
+  FourdgsFileReadable? source;
   bool printed = false;
   try {
+    source = await FourdgsFileReadable.open(path);
     final scene = await openFourdgsIndexed(source);
     final header = scene.header;
     printed = true;
@@ -89,19 +100,24 @@ Future<bool> _indexed(String path, double t) async {
     } else {
       await _readCoveringChunks(source, scene, t);
     }
-    return true;
+    return _ReadResult.ok;
   } on FourdgsException catch (e) {
     // Every refusal says which byte, which record, which value, and what was
     // expected — print it as it comes rather than replacing it with "could not
     // read file", which throws away the only useful part.
     stderr.writeln('4dgs: indexed: $e');
-    return false;
+    return _ReadResult.dataError;
+  } on FileSystemException catch (e) {
+    // Existence checks are a time-of-check/time-of-use race and do not cover
+    // permissions. The operation that actually failed is the diagnosis.
+    stderr.writeln('4dgs: indexed input: $e');
+    return _ReadResult.inputError;
   } finally {
     // Separating the two passes, and only when the first one had something to
     // separate: a file that fails to open has printed nothing, and a stray
     // blank first line is a thing a reader has to stop and explain to itself.
     if (printed) stdout.writeln('');
-    await source.close();
+    await source?.close();
   }
 }
 
@@ -169,10 +185,11 @@ void _priceKeyframeDeltaSeek(FourdgsIndexedScene scene, double t) {
 
 /// Decodes the file front to back, with the whole of it in memory.
 ///
-/// Returns false when the file refused to be read this way.
-Future<bool> _wholeFile(String path, double t) async {
-  final bytes = await File(path).readAsBytes();
+/// Returns whether the pass succeeded, refused the bytes, or could not open
+/// the input.
+Future<_ReadResult> _wholeFile(String path, double t) async {
   try {
+    final bytes = await File(path).readAsBytes();
     // `recoverTruncated` returns what arrived before a cut instead of throwing,
     // with `truncated` set. That is the recovery the indexed open above cannot
     // offer: it needs a tail, and a cut file has none.
@@ -181,7 +198,7 @@ Future<bool> _wholeFile(String path, double t) async {
 
     if (scene.header.temporalModel != 'keyframe-delta') {
       stdout.writeln('streamed: ${scene.gaussians.count} gaussians$cut');
-      return true;
+      return _ReadResult.ok;
     }
 
     // A keyframe-delta file has its own readers, and this is why. Its chunks
@@ -191,29 +208,55 @@ Future<bool> _wholeFile(String path, double t) async {
     // its `gaussians` are the keyframes' alone. `decodeKeyframeDeltaStreamed`
     // composes each chunk onto the state it references, which is the number a
     // caller actually wants.
-    final sequence = decodeKeyframeDeltaStreamed(bytes);
+    // The generic walk above established whether the tail is present. The
+    // keyframe-delta decoder has no recovery flag, but it is deliberately
+    // front-to-back and needs no Footer: give it exactly the complete records
+    // the generic walk recovered, never the half-record after them.
+    final sequence = decodeKeyframeDeltaStreamed(
+      scene.truncated ? _completeRecordPrefix(bytes) : bytes,
+    );
     stdout.writeln('streamed: ${sequence.chunks.length} state chunk(s)$cut');
 
-    // And the seeking client's answer for the same instant:
-    // `decodeKeyframeDeltaIndexed` walks each entry's chain the way §11.8 says
-    // to, and must land on the population the front-to-back pass reaches.
-    final composed = decodeKeyframeDeltaIndexed(bytes).sequence;
+    // A complete file can prove that the seeking decoder reaches the same
+    // state. A prefix cannot be reopened through the index: doing so would
+    // demand the very Footer it lacks and turn successful recovery back into a
+    // refusal, so answer from the front-to-back composition already in hand.
+    final composed =
+        scene.truncated ? sequence : decodeKeyframeDeltaIndexed(bytes).sequence;
     for (final chunk in composed.chunks) {
       if (chunk.t0 <= t && t < chunk.t1) {
         stdout.writeln(
           'composed at t = $t s: ${chunk.state.count} gaussians, '
-          'by walking that chain',
+          '${scene.truncated ? 'from the streamed prefix' : 'by walking that chain'}',
         );
         break;
       }
     }
-    return true;
+    return _ReadResult.ok;
   } on FourdgsException catch (e) {
     // The same treatment the indexed pass gives a refusal. Without it a file
     // that opens cleanly and then names an unsupported codec in some chunk the
     // instant never touched leaves the CLI with an unhandled stack trace and an
     // exit status that means "crashed", not "bad data".
     stderr.writeln('4dgs: streamed: $e');
-    return false;
+    return _ReadResult.dataError;
+  } on FileSystemException catch (e) {
+    stderr.writeln('4dgs: streamed input: $e');
+    return _ReadResult.inputError;
   }
+}
+
+/// The bytes through the last complete framed record in [bytes].
+///
+/// A cut can land in content, in the nine-byte record header, or exactly on a
+/// record boundary. [scanRecordSpans] handles all three without allocating a
+/// record-sized buffer. The returned view retains the input (which this
+/// example already owns) and adds no second file-sized allocation.
+Uint8List _completeRecordPrefix(Uint8List bytes) {
+  int end = fourdgsMagic.length;
+  for (final span in scanRecordSpans(bytes, fourdgsMagic.length)) {
+    if (span.end > bytes.length) break;
+    end = span.end;
+  }
+  return Uint8List.sublistView(bytes, 0, end);
 }
