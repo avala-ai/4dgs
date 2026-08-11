@@ -82,12 +82,67 @@ All notable changes to the Rust crate are documented here, following
   essentially the whole file. `serialization::Crc32` is the same CRC-32 fed in pieces, and `inspect`
   feeds it a megabyte at a time.
 
-- **Three additive library items, each of which exists because a caller wants the verdict rather
-  than the data.** `serialization::Crc32`, above. `keyframe_delta_file::open_indexed` returns an
+- **Five additive library items, each of which exists because a caller wants the verdict rather than
+  the data.** `serialization::Crc32`, above. `keyframe_delta_file::open_indexed` returns an
   `IndexedSequence` — a file's front matter and index with nothing composed — and
   `keyframe_delta_file::compose_chain` composes the chain ending at one index entry.
   `decode_indexed` is those two in a loop and is unchanged; what it cannot do is answer "does every
-  chunk decode?" without keeping every state it decoded.
+  chunk decode?" without keeping every state it decoded. `keyframe_delta_file::check_keyframe_chunk`
+  and `check_delta_chunk` answer the same question for one record of a file that has no index to
+  seek in, and keep nothing.
+
+### Fixed
+
+- **A `keyframe-delta` file declaring an unknown quantization scheme is refused.** The model's
+  reader parsed its Quantization record and never asked the registry about it, so a scheme this
+  build does not implement composed all the way to a state and `validate` printed `valid` — while
+  the gaussian-birth reader refuses the same declaration by name at open. `open_indexed` now checks
+  it as the record is read, exactly as `indexed_reader::open_indexed` does.
+
+- **A `keyframe-delta` index must reach both ends of the timeline.** Spec §11.1 fixes three things:
+  each chunk's `t1` is the next chunk's `t0`, the first `t0` is `0`, and the last `t1` is the
+  Header's `duration_sec`. `check_tiling` implemented the first, which says everything about the
+  interior and nothing about either end — an index covering `[0.4, 0.9)` of a one-second clip is
+  internally adjacent and tiles nothing, and a seek to `t=0` on the file it was told was conforming
+  answers "no state chunk covers t=0". New: `keyframe_delta::check_timeline_endpoints`.
+
+- **A `keyframe-delta` file with no chunk index is read front to back rather than reported
+  invalid.** `open_indexed` starts its index walk at `Footer.summary_start`; on a stream-only file
+  that is zero, so it walked from byte 0, read the file magic as record framing, and returned an
+  error. `validate` now warns that the file can only be read front to back — as it always has for
+  `gaussian-birth` — and checks each keyframe and delta chunk on the way past, keeping none of them.
+
+- **Every SH Band Stream a `keyframe-delta` index declares is decoded.** Composing a chain reads
+  Chunk and Delta Chunk records and nothing else, so a band record was a record the verdict never
+  visited: an unimplemented codec in one of them validated clean. The same rule the gaussian-birth
+  path already holds, on the other model.
+
+- **A refusal inside a chunk's streams is placed by `4dgs decode` and `4dgs info` too.** Only
+  `validate` decoded chunks, so `decode` printed `refusal unknown-stream-codec` with no byte at all
+  — the framing walk cannot find a fault inside a chunk, because stepping over one by its declared
+  length is exactly not looking inside it. The tool's error path now scans the file front to back,
+  one record at a time, and names the first record raising that same refusal.
+
+- **Placing a refusal no longer frames the whole file first.** The error path built a `Frame` per
+  record before examining the front matter, so an early refusal on a large file — the case the
+  refusal exists for — cost memory proportional to that file. The search is streamed and stops at
+  the record it is looking for.
+
+- **The Footer is read twenty bytes at a time, whatever it declares.** `Footer::parse` reads three
+  fields and ignores the rest, which is what keeps a Footer a later revision extends readable; the
+  record's declared length is eight bytes off an untrusted file, and `inspect` was sizing an
+  allocation from it. A Footer naming nearly the whole file as its content is now a number in the
+  length column rather than a buffer.
+
+- **The duplicate of an SH band is told apart from the healthy one.** Nothing in an index forbids
+  two ranges for the same band, and `read_chunk` decodes both — so raising a cap until the read
+  failed named whichever sorted first, an offset pointing at a record with nothing wrong with it.
+  Each range is now decoded on its own.
+
+- **A file cut exactly on a record boundary is reported as cut.** Remove only the eight-byte
+  trailing magic and every record is whole, so the walk reached the end with nothing left over and
+  recorded nothing: `inspect` printed a note and exited **0** for an incomplete file, and `validate`
+  left off the note that says how much of it survives.
 
 ### Changed
 

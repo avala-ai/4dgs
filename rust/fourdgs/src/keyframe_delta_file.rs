@@ -21,8 +21,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::{Error, Result};
 use crate::keyframe_delta::{
-    apply_delta, chain_for, check_tiling, keyframe_state, BinArray, State, ABSOLUTE_IN_UPDATE,
-    GOP_INVARIANT,
+    apply_delta, chain_for, check_tiling, check_timeline_endpoints, keyframe_state, BinArray,
+    State, ABSOLUTE_IN_UPDATE, GOP_INVARIANT,
 };
 use crate::model::GaussianSet;
 use crate::opcode as op;
@@ -888,6 +888,40 @@ fn compose_delta(reference: &State, content: &[u8]) -> Result<(State, rec::Delta
     Ok((state, head))
 }
 
+/// Decode one keyframe chunk's streams, check the state they make, and keep neither.
+///
+/// What a validator needs from a keyframe chunk of a file it cannot seek: whether the
+/// streams decode and whether the window indices they carry are answerable. It is the
+/// question [`decode_streamed`] answers by building a `DecodedSequence` — every state
+/// resident at once — for a caller that only wanted a verdict.
+pub fn check_keyframe_chunk(content: &[u8], windows: &[(f64, f64)]) -> Result<()> {
+    let (ids, bins) = keyframe_from_chunk(content)?;
+    let state = keyframe_state(ids, bins)?;
+    check_window_indices(&state, windows)
+}
+
+/// The same for one delta chunk, without the reference state it would compose against.
+///
+/// A delta chunk's three groups are streams like any other, so an unimplemented codec or a
+/// corrupt payload in one of them is found by decoding it — no reference needed, and a
+/// file read front to back has none to give until the chain is walked. The window indices a
+/// group carries are checked here too: births bring their own, and a birth naming a window
+/// the table cannot answer is refused on the indexed path.
+pub fn check_delta_chunk(content: &[u8], windows: &[(f64, f64)]) -> Result<()> {
+    let (_, updates, births, deaths) = rec::parse_delta_chunk(content)?;
+    let table_len = crate::chunk::window_table_or_default(windows).len();
+    for group in [updates, births, deaths] {
+        let (_, bins) = decode_group(group)?;
+        let Some(window_index) = bins.get(&op::A_WINDOW_INDEX) else {
+            continue;
+        };
+        for value in &window_index.values {
+            crate::chunk::check_window_index(*value, table_len)?;
+        }
+    }
+    Ok(())
+}
+
 /// Front to back: decode each chunk and compose it onto the state it references.
 pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
     check_magic(data)?;
@@ -1069,6 +1103,18 @@ pub struct IndexedSequence {
 }
 
 /// Read the Footer and the index, and check that the index tiles the timeline.
+///
+/// The quantization scheme is checked against the registry as the record is read, exactly as
+/// [`crate::indexed_reader::open_indexed`] checks it on the gaussian-birth path. Parsing a
+/// Quantization record is not the same as understanding it: a file declaring a scheme this
+/// build does not implement parses perfectly and dequantizes to nothing meaningful, and this
+/// path used to carry it all the way to a composed state — so `4dgs validate` printed
+/// `valid` for a file the other model's reader refuses by name.
+///
+/// The *temporal* model is deliberately not checked here. `registry::KNOWN_TEMPORAL_MODELS`
+/// is the gaussian-birth reader's list and does not contain `keyframe-delta`, because a name
+/// belongs there only when the reader that consults it can decode it. This module is the
+/// reader that decodes this model, so the check would refuse every file it exists for.
 pub fn open_indexed(data: &[u8]) -> Result<IndexedSequence> {
     check_magic(data)?;
     let mut header: Option<rec::Header> = None;
@@ -1079,7 +1125,11 @@ pub fn open_indexed(data: &[u8]) -> Result<IndexedSequence> {
         let record = record?;
         match record.opcode {
             op::HEADER => header = Some(rec::Header::parse(record.content)?),
-            op::QUANTIZATION => quant = Some(rec::Quantization::parse(record.content)?),
+            op::QUANTIZATION => {
+                let parsed = rec::Quantization::parse(record.content)?;
+                crate::registry::check_quantization_scheme(&parsed.scheme)?;
+                quant = Some(parsed);
+            }
             op::WINDOW_TABLE => windows = rec::WindowTable::parse(record.content)?.windows,
             op::FOOTER => {
                 footer = Some(rec::Footer::parse(record.content)?);
@@ -1107,6 +1157,7 @@ pub fn open_indexed(data: &[u8]) -> Result<IndexedSequence> {
         }
     }
     check_tiling(&index)?;
+    check_timeline_endpoints(&index, header.duration_sec)?;
 
     Ok(IndexedSequence {
         header,

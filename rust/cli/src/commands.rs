@@ -337,6 +337,15 @@ impl Coverage {
 /// reporting on it, so the checksum is fed in blocks of this size instead (principle 1).
 const CRC_BLOCK: u64 = 1024 * 1024;
 
+/// The Footer's three fields: `summary_start`, `summary_offset_start`, `summary_crc`.
+///
+/// `Footer::parse` reads exactly these twenty bytes and ignores whatever follows — which is
+/// what makes a Footer a later revision extends still readable here. So twenty bytes is all
+/// this command reads of one, and the record's own declared length, eight bytes off an
+/// untrusted file, never sizes an allocation: a Footer that declares the rest of the file as
+/// its content is a fact `inspect` prints in the length column, not a buffer it makes.
+const FOOTER_FIELDS: u64 = 20;
+
 /// Read the Footer and check the summary it declares.
 ///
 /// `None` when the file declares no summary checksum, which is a property of the file
@@ -345,13 +354,13 @@ const CRC_BLOCK: u64 = 1024 * 1024;
 /// the walk lists that record because its declared length is the fault, but its content is
 /// not in the file, and a read of it would end `inspect` through the error path with the
 /// intact-prefix report unprinted. Which is exactly the file this command exists for.
-fn coverage(source: &mut FileReadable, walk: &crate::refusal::Walk) -> Result<Option<Coverage>> {
+fn coverage(source: &mut dyn Readable, walk: &crate::refusal::Walk) -> Result<Option<Coverage>> {
     let Some(frame) = walk.first_intact(op::FOOTER) else {
         return Ok(None);
     };
     let content = source.read(
         frame.offset + fourdgs::serialization::RECORD_HEADER_SIZE as u64,
-        frame.length,
+        frame.length.min(FOOTER_FIELDS),
     )?;
     let footer = fourdgs::records::Footer::parse(&content)?;
     if footer.summary_crc == 0 || footer.summary_start == 0 || footer.summary_start > frame.offset {
@@ -655,4 +664,133 @@ fn extent(centers: &[f32]) -> [f64; 6] {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fourdgs::serialization::{crc32, MAGIC, RECORD_HEADER_SIZE};
+    use fourdgs::BytesReadable;
+
+    /// A reader that remembers the largest single read asked of it.
+    ///
+    /// The claim under test is about an allocation, and an allocation here is exactly one
+    /// `read` with a length taken from the file. So the way to test it is to watch the
+    /// lengths: no assertion about peak memory tells a bounded loop from an unbounded one,
+    /// and this does.
+    struct Watched<'a> {
+        inner: BytesReadable<'a>,
+        largest: std::cell::Cell<u64>,
+    }
+
+    impl<'a> Watched<'a> {
+        fn new(data: &'a [u8]) -> Watched<'a> {
+            Watched {
+                inner: BytesReadable::new(data),
+                largest: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl Readable for Watched<'_> {
+        fn size(&mut self) -> fourdgs::Result<u64> {
+            self.inner.size()
+        }
+
+        fn read(&mut self, offset: u64, length: u64) -> fourdgs::Result<Vec<u8>> {
+            self.largest.set(self.largest.get().max(length));
+            self.inner.read(offset, length)
+        }
+    }
+
+    /// A file whose Footer declares far more content than its three fields occupy.
+    ///
+    /// Legal framing, and forward-compatible by design: `Footer::parse` reads twenty bytes
+    /// and ignores the rest, so a Footer a later revision extends still reads here. That
+    /// declared length is eight bytes off an untrusted file, though, and a file can name
+    /// nearly the whole of itself in it.
+    fn footer_declaring(padding: usize) -> Vec<u8> {
+        let summary = fourdgs::records::Statistics {
+            gaussian_count: 0,
+            chunk_count: 0,
+            duration_sec: 1.0,
+            aabb: vec![0.0; 6],
+        }
+        .encode();
+        let mut out = MAGIC.to_vec();
+        out.extend_from_slice(
+            &fourdgs::records::Header {
+                duration_sec: 1.0,
+                aabb: vec![0.0; 6],
+                temporal_model: "gaussian-birth".into(),
+                ..Default::default()
+            }
+            .encode(&[]),
+        );
+        let summary_start = out.len() as u64;
+        out.extend_from_slice(&summary);
+
+        // The Footer's three fields, then the padding its declared length covers.
+        let mut body = Vec::new();
+        body.extend_from_slice(&summary_start.to_le_bytes());
+        body.extend_from_slice(&0u64.to_le_bytes());
+        body.extend_from_slice(&crc32(&summary).to_le_bytes());
+        body.resize(20 + padding, 0);
+        out.push(op::FOOTER);
+        out.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&MAGIC);
+        out
+    }
+
+    #[test]
+    fn the_footer_is_read_twenty_bytes_at_a_time_whatever_it_declares() {
+        // A Footer declaring the rest of the file as its content used to size one
+        // allocation from that declaration: `inspect` on a hostile file buffered nearly
+        // the whole of it to read three fields out of the front.
+        let padding = 4096;
+        let data = footer_declaring(padding);
+        let mut source = Watched::new(&data);
+        let walk = crate::refusal::walk(&mut source).expect("a walk");
+        let frame = walk
+            .first_intact(op::FOOTER)
+            .expect("the file ends with a Footer");
+        assert_eq!(
+            frame.length,
+            (20 + padding) as u64,
+            "the fixture's Footer declares more than its fields occupy"
+        );
+
+        source.largest.set(0);
+        let coverage = coverage(&mut source, &walk).expect("a coverage verdict");
+        assert!(
+            coverage.is_some_and(|c| c.ok),
+            "the fixture's summary checksum agrees"
+        );
+        assert!(
+            source.largest.get() <= FOOTER_FIELDS.max(CRC_BLOCK),
+            "one read asked for {} bytes; the Footer is read {FOOTER_FIELDS} bytes at a \
+             time and the summary {CRC_BLOCK} at a time",
+            source.largest.get()
+        );
+        assert!(
+            source.largest.get() < frame.length,
+            "a read was sized from the Footer's own declared length"
+        );
+    }
+
+    #[test]
+    fn a_footer_shorter_than_its_fields_is_still_refused() {
+        // The bound is a `min`, so a Footer declaring less than twenty bytes is read as far
+        // as it goes and then fails to parse — the same answer as before, and not a read
+        // that runs past the record.
+        let mut data = footer_declaring(0);
+        let footer_at = data.len() - (RECORD_HEADER_SIZE + 20 + MAGIC.len());
+        data[footer_at + 1] = 12;
+        data.truncate(footer_at + RECORD_HEADER_SIZE + 12);
+        data.extend_from_slice(&MAGIC);
+        let mut source = BytesReadable::new(&data);
+        let walk = crate::refusal::walk(&mut source).expect("a walk");
+        assert!(coverage(&mut source, &walk).is_err());
+    }
 }

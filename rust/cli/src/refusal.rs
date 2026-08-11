@@ -135,6 +135,20 @@ pub fn walk(source: &mut dyn Readable) -> Result<Walk> {
     loop {
         let remaining = size.saturating_sub(at);
         if remaining == 0 {
+            // The file ended on a record boundary, so nothing here is malformed — and
+            // nothing here is the trailing magic either. A whole file ends with those eight
+            // bytes; a file that ends without them is cut, most simply by removing only the
+            // magic, and the cut is exactly here. Without this the walk reports no cut at
+            // all: `inspect` printed a note and exited 0 for a file it had just walked to
+            // the end of the wrong thing, and `validate` left off the intact-prefix note
+            // that says how much of it survives.
+            if !out.trailing_magic {
+                out.cut = Some(Cut {
+                    at,
+                    reason: "the file ends here, with no trailing magic".into(),
+                    inside_a_record: false,
+                });
+            }
             break;
         }
         // A whole file ends with the magic, so its last eight bytes are not a record.
@@ -191,6 +205,154 @@ pub fn walk(source: &mut dyn Readable) -> Result<Walk> {
         }
     }
     Ok(out)
+}
+
+/// Framing, one record at a time, holding none of it.
+///
+/// [`walk`] answers "what is in this file?", and keeping a `Frame` per record is how it
+/// answers. The questions on this side are narrower — "which record carries the value that
+/// was refused?", "which chunk does not decode?" — and a caller asking one of those stops at
+/// the answer. So nothing is retained: a file with a million small records costs what a file
+/// with one costs, which is what keeps an early refusal on a large file an early refusal
+/// (principle 1).
+///
+/// The records it yields are the whole ones, in file order. A record the file was cut inside
+/// ends the walk without being yielded — a reader never parsed it either, so it cannot be
+/// the record that refused.
+struct Streamed<'a> {
+    source: &'a mut dyn Readable,
+    size: u64,
+    at: u64,
+    done: bool,
+}
+
+impl<'a> Streamed<'a> {
+    /// Check the magic and stand at the first record.
+    fn open(source: &'a mut dyn Readable) -> Result<Streamed<'a>> {
+        let size = source.size()?;
+        let head = source.read(0, (MAGIC.len() as u64).min(size))?;
+        fourdgs::serialization::check_magic(&head)?;
+        Ok(Streamed {
+            source,
+            size,
+            at: MAGIC.len() as u64,
+            done: false,
+        })
+    }
+
+    fn next_frame(&mut self) -> Option<Frame> {
+        if self.done {
+            return None;
+        }
+        // A whole file ends with the magic, so its last eight bytes are not a record; a cut
+        // one has too few bytes left to frame one. Either way there is no next record.
+        if self.size.saturating_sub(self.at) <= MAGIC.len() as u64 {
+            self.done = true;
+            return None;
+        }
+        let framing = match self.source.read(self.at, RECORD_HEADER_SIZE as u64) {
+            Ok(framing) if framing.len() == RECORD_HEADER_SIZE => framing,
+            _ => {
+                self.done = true;
+                return None;
+            }
+        };
+        let frame = Frame {
+            opcode: framing[0],
+            offset: self.at,
+            length: u64::from_le_bytes([
+                framing[1], framing[2], framing[3], framing[4], framing[5], framing[6], framing[7],
+                framing[8],
+            ]),
+        };
+        match self.at.checked_add(frame.total()) {
+            Some(end) if end <= self.size => {
+                self.at = end;
+                Some(frame)
+            }
+            // The declared length runs off the end. The record is not whole, so it is not
+            // yielded, and there is nothing after it to frame.
+            _ => {
+                self.done = true;
+                None
+            }
+        }
+    }
+
+    /// One record's content. `None` when the file stopped answering.
+    fn content(&mut self, frame: &Frame) -> Option<Vec<u8>> {
+        self.source
+            .read(frame.offset + RECORD_HEADER_SIZE as u64, frame.length)
+            .ok()
+    }
+}
+
+/// The byte a refusal fired at, found without holding the file or a walk of it.
+///
+/// The tool's error path calls this: a command has just been refused, and the only thing
+/// left to add to the library's message is where. A walk would answer the same question by
+/// building a `Frame` for every record in the file first — including the ones after the one
+/// that refused, which no reader ever reached — and an early refusal on a large file would
+/// cost memory proportional to that file. This stops at the record it is looking for.
+///
+/// Two shapes of refusal are placed, and they are placed differently because they are found
+/// differently:
+///
+/// * **Front matter** — an unimplemented temporal model or quantization scheme — is placed
+///   by streaming the framing and asking each Header or Quantization record whether its own
+///   declared value is the refused one. The first that says yes is the record the reader
+///   refused at, in the order the reader met them.
+/// * **A chunk's streams** — an unimplemented stream codec, a window index outside the
+///   table — cannot be found from framing at all, because stepping over a chunk by its
+///   declared length is exactly not looking inside it. So the file is decoded front to back,
+///   one record at a time, and the first record that raises **this same refusal** is the
+///   site. Same refusal, because a scan that stopped at a different one would be answering a
+///   different question, and an offset that points at the wrong record is worse than none.
+pub fn locate_streaming(source: &mut dyn Readable, code: &str) -> Option<Site> {
+    match code {
+        // Known without a walk: the magic is the first eight bytes, and a walk cannot start
+        // until they pass.
+        id::MAGIC_MISMATCH | id::UNSUPPORTED_MAJOR_VERSION => Some(Site {
+            offset: 0,
+            what: "the magic".into(),
+        }),
+        id::UNKNOWN_TEMPORAL_MODEL => {
+            first_declaring(source, op::HEADER, "the Header record", header_refuses)
+        }
+        id::UNKNOWN_QUANTIZATION_SCHEME => first_declaring(
+            source,
+            op::QUANTIZATION,
+            "the Quantization record",
+            quantization_refuses,
+        ),
+        id::UNKNOWN_STREAM_CODEC | id::WINDOW_INDEX_OUT_OF_RANGE => match scan_streamed(source) {
+            Err((error, site)) if error.refusal_code() == Some(code) => site,
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The first whole record of this kind whose own declared value is the one being refused.
+fn first_declaring(
+    source: &mut dyn Readable,
+    opcode: u8,
+    what: &str,
+    refuses: fn(&[u8]) -> bool,
+) -> Option<Site> {
+    let mut records = Streamed::open(source).ok()?;
+    while let Some(frame) = records.next_frame() {
+        if frame.opcode != opcode {
+            continue;
+        }
+        if records.content(&frame).is_some_and(|c| refuses(&c)) {
+            return Some(Site {
+                offset: frame.offset,
+                what: what.into(),
+            });
+        }
+    }
+    None
 }
 
 /// The byte a refusal fired at, and what sits there.
@@ -304,11 +466,10 @@ fn quantization_refuses(content: &[u8]) -> bool {
 /// is a file that does not decode. Capping the bands here would report it `valid`.
 pub fn scan_chunks(
     data: &[u8],
-    walk: &Walk,
     scene: &IndexedScene,
 ) -> std::result::Result<(), (Error, Option<Site>)> {
     if scene.index.is_empty() {
-        return scan_front_to_back(data, walk);
+        return scan_streamed(&mut BytesReadable::new(data));
     }
     let mut source = BytesReadable::new(data);
     for (i, entry) in scene.index.iter().enumerate() {
@@ -330,9 +491,17 @@ pub fn scan_chunks(
 /// reader to a stream that is perfectly healthy.
 ///
 /// `read_chunk` fetches the chunk and every band the cap admits in one call, which is what
-/// a reader wants. Raising the cap until it starts failing is therefore how to tell the two
-/// apart without restating the library's fetch here and drifting from it. It costs a second
-/// decode of one chunk, and it only ever runs on the file that has already refused.
+/// a reader wants. So the two are told apart by asking it narrower questions — the chunk
+/// with no bands at all, then one band range at a time — rather than by restating the
+/// library's fetch here and drifting from it. It costs a second decode of one chunk, and it
+/// only ever runs on the file that has already refused.
+///
+/// **One range at a time, not one band at a time.** Nothing in the index forbids two ranges
+/// for the same band, and `read_chunk` decodes both of them — it keys the results by band,
+/// so the second merely overwrites the first. Raising a cap therefore cannot distinguish
+/// them: the cap that admits the bad duplicate admits the good one with it, and the offset
+/// reported would be whichever sorted first. Handing `read_chunk` an entry carrying exactly
+/// one range asks about exactly that range.
 fn refusing_record(
     source: &mut BytesReadable,
     scene: &IndexedScene,
@@ -343,15 +512,21 @@ fn refusing_record(
         offset: entry.chunk_offset,
         what: format!("the Chunk record at index entry {i}"),
     };
-    if read_chunk(source, scene, entry, 0).is_err() {
+    // The chunk's own streams, with no band record admitted at all. Emptying the list is
+    // what a cap of zero cannot do: a hostile index may declare a range for band 0, and a
+    // cap of zero admits it — so the Chunk would be blamed for a band record's fault.
+    let mut bare = entry.clone();
+    bare.bands.clear();
+    if read_chunk(source, scene, &bare, 0).is_err() {
         return chunk();
     }
-    let mut bands: Vec<(u8, u64)> = entry.bands.iter().map(|(b, at, _)| (*b, *at)).collect();
-    bands.sort_unstable();
-    for (band, at) in bands {
-        // The cap admits every band up to `band`, and everything below it has already
-        // decoded, so the first cap that fails names the band that failed.
-        if read_chunk(source, scene, entry, band).is_err() {
+    let mut ranges = entry.bands.clone();
+    ranges.sort_by_key(|(band, at, _)| (*band, *at));
+    for range in ranges {
+        let (band, at, _) = range;
+        let mut only = entry.clone();
+        only.bands = vec![range];
+        if read_chunk(source, scene, &only, band).is_err() {
             return Site {
                 offset: at,
                 what: format!("the SH Band Stream for band {band} of the Chunk at index entry {i}"),
@@ -363,15 +538,23 @@ fn refusing_record(
 
 /// The same scan for a file with no index, which has no per-chunk addressing to seek with.
 ///
-/// Front to back over the framing the walk already produced, decoding each Chunk and each
-/// SH Band Stream on its own and keeping neither. The library's streamed reader assembles
-/// the scene as it goes — which is what a *reader* wants and what a validator must not do —
-/// so this drives the same decode primitives directly and throws each result away.
+/// Front to back over the framing, decoding each Chunk and each SH Band Stream on its own
+/// and keeping neither. The library's streamed reader assembles the scene as it goes — which
+/// is what a *reader* wants and what a validator must not do — so this drives the same
+/// decode primitives directly and throws each result away.
 ///
 /// Being framing-driven, it also places the refusal: an unindexed file used to report the
 /// identifier with no byte at all, because "every chunk or none" was the only answer the
 /// whole-file decode could give.
-fn scan_front_to_back(data: &[u8], walk: &Walk) -> std::result::Result<(), (Error, Option<Site>)> {
+///
+/// Streamed rather than handed a walk, because the other caller is the tool's error path,
+/// which has a file it has just been refused and no reason to hold either the file or a
+/// `Frame` per record of it. Nothing here outlives one record.
+pub fn scan_streamed(source: &mut dyn Readable) -> std::result::Result<(), (Error, Option<Site>)> {
+    let mut records = match Streamed::open(source) {
+        Ok(records) => records,
+        Err(error) => return Err((error, None)),
+    };
     let mut quantization: Option<rec::Quantization> = None;
     let mut windows: Vec<(f64, f64)> = Vec::new();
     let mut cutoff = fourdgs::quantization::DEFAULT_CUTOFF;
@@ -379,10 +562,11 @@ fn scan_front_to_back(data: &[u8], walk: &Walk) -> std::result::Result<(), (Erro
     // precedes them and are sized against it (spec §5.7).
     let mut count = 0usize;
 
-    for frame in walk.intact_records() {
-        let Some(content) = frame.content(data) else {
+    while let Some(frame) = records.next_frame() {
+        let Some(content) = records.content(&frame) else {
             continue;
         };
+        let content = content.as_slice();
         let here = || {
             Some(Site {
                 offset: frame.offset,
@@ -439,6 +623,43 @@ fn scan_front_to_back(data: &[u8], walk: &Walk) -> std::result::Result<(), (Erro
         }
     }
     Ok(())
+}
+
+/// One SH Band Stream record, decoded and dropped.
+///
+/// The indexed gaussian-birth path gets this from `read_chunk`, which fetches a chunk and
+/// the bands its index entry names in one call. There is no equivalent on the
+/// `keyframe-delta` path — composing a chain reads Chunk and Delta Chunk records and nothing
+/// else — so a band record there is reachable only by asking for it directly, which is what
+/// this is. `count` is the entry's own `gaussian_count`: a band stream is sized against the
+/// chunk it belongs to (spec §5.7), and a stream that disagrees is a fault of its own.
+pub fn decode_band_record(data: &[u8], at: u64, length: u64, count: usize) -> Result<()> {
+    let start = usize::try_from(at).map_err(|_| out_of_file(at))?;
+    let end = usize::try_from(length)
+        .ok()
+        .and_then(|length| start.checked_add(length))
+        .filter(|end| *end <= data.len())
+        .ok_or_else(|| out_of_file(at))?;
+    let mut record = Cursor::new(&data[start..end]);
+    let opcode = record.u8()?;
+    if opcode != op::SH_BAND_STREAM {
+        return Err(Error::Malformed(format!(
+            "a chunk index entry names byte {at} as an SH Band Stream; the record there is {}",
+            op::name(opcode)
+        )));
+    }
+    let mut content = Cursor::new(record.blob()?);
+    // The band index, which the record carries and the stream header does not: a band
+    // stream's `attribute_id` is 0x07 and collides with `mu_t` (§5.7).
+    content.u8()?;
+    decode_stream(&mut content, Some(count))?;
+    Ok(())
+}
+
+fn out_of_file(at: u64) -> Error {
+    Error::Truncated(format!(
+        "a chunk index entry names an SH Band Stream at byte {at}, past the end of the file"
+    ))
 }
 
 /// Everything the tool can say about one refusal: the identifier and the byte.
@@ -513,6 +734,120 @@ mod tests {
         );
         assert!(walk.records.len() < whole.records.len());
         assert!(!walk.trailing_magic);
+    }
+
+    #[test]
+    fn a_file_cut_exactly_on_a_record_boundary_is_still_a_cut() {
+        // The simplest truncation there is: remove only the trailing magic. Every record is
+        // whole, the walk reaches the end of the last one with nothing left over — and it
+        // used to leave through the `remaining == 0` door without recording a cut at all.
+        // `inspect` then printed a note and exited 0 for an incomplete file, and `validate`
+        // left off the intact-prefix note that says how much of it survives.
+        let whole = valid();
+        let data = &whole[..whole.len() - MAGIC.len()];
+        let walk = walk(&mut BytesReadable::new(data)).unwrap();
+        assert!(!walk.trailing_magic);
+        let cut = walk
+            .cut
+            .as_ref()
+            .expect("a file with no trailing magic is cut");
+        assert_eq!(cut.at, data.len() as u64, "the cut is at the end");
+        assert!(
+            !cut.inside_a_record,
+            "every record is whole; it is the magic that is missing"
+        );
+        // And nothing is lost: the prefix is the whole record list, which is what the
+        // recovery note counts.
+        assert_eq!(walk.intact(), walk.records.len());
+    }
+
+    #[test]
+    fn a_whole_file_is_not_reported_as_cut() {
+        // The other half of the rule above, because a cut invented for a conforming file
+        // would take `inspect` to exit 1 on every good file in the corpus.
+        let walk = walk(&mut BytesReadable::new(&valid())).unwrap();
+        assert!(walk.trailing_magic);
+        assert!(walk.cut.is_none());
+    }
+
+    /// A reader that remembers how far into the file it was asked to look.
+    ///
+    /// Placing a refusal is supposed to stop at the record that carries it. Nothing about
+    /// peak memory can be asserted directly, but "which bytes were asked for" can, and it
+    /// is the same claim: a walk that keeps a `Frame` per record has to visit every record
+    /// to build them.
+    struct Watched<'a> {
+        inner: BytesReadable<'a>,
+        furthest: u64,
+    }
+
+    impl<'a> Watched<'a> {
+        fn new(data: &'a [u8]) -> Watched<'a> {
+            Watched {
+                inner: BytesReadable::new(data),
+                furthest: 0,
+            }
+        }
+    }
+
+    impl Readable for Watched<'_> {
+        fn size(&mut self) -> Result<u64> {
+            self.inner.size()
+        }
+
+        fn read(&mut self, offset: u64, length: u64) -> Result<Vec<u8>> {
+            self.furthest = self.furthest.max(offset.saturating_add(length));
+            self.inner.read(offset, length)
+        }
+    }
+
+    #[test]
+    fn placing_a_front_matter_refusal_stops_at_the_record_that_carries_it() {
+        // The Header is the first record in the file, and an unimplemented temporal model
+        // is refused there — so the tool has its answer nine bytes in. Walking the rest of
+        // the file to say so is what turned a bounded early refusal into memory
+        // proportional to the file, on exactly the files that cannot be held.
+        let mut data = crate::validate::sample_file(Vec::new());
+        // A model this build does not implement, written over the one it does. Both names
+        // are fourteen characters, so nothing in the file moves.
+        let at = data
+            .windows(14)
+            .position(|w| w == b"gaussian-birth")
+            .expect("the sample declares its temporal model");
+        data[at..at + 14].copy_from_slice(b"frame-sequence");
+
+        let mut source = Watched::new(&data);
+        let site = locate_streaming(&mut source, id::UNKNOWN_TEMPORAL_MODEL)
+            .expect("the Header is the record that declares it");
+        assert_eq!(site.offset, MAGIC.len() as u64);
+        let header_end = MAGIC.len() as u64
+            + RECORD_HEADER_SIZE as u64
+            + walk(&mut BytesReadable::new(&data))
+                .unwrap()
+                .first_intact(op::HEADER)
+                .unwrap()
+                .length;
+        assert!(
+            source.furthest <= header_end,
+            "read to byte {} of a {}-byte file to place a refusal in the first record, \
+             which ends at {header_end}",
+            source.furthest,
+            data.len()
+        );
+    }
+
+    #[test]
+    fn placing_a_refusal_reports_no_byte_rather_than_the_wrong_one() {
+        // A conforming file carries no refusing record, and the search says so instead of
+        // naming whichever record it stopped at. An offset is believed; a missing one is
+        // merely unhelpful.
+        let data = valid();
+        assert!(
+            locate_streaming(&mut BytesReadable::new(&data), id::UNKNOWN_TEMPORAL_MODEL).is_none()
+        );
+        assert!(
+            locate_streaming(&mut BytesReadable::new(&data), id::UNKNOWN_STREAM_CODEC).is_none()
+        );
     }
 
     #[test]

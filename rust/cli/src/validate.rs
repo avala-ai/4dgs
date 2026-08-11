@@ -460,7 +460,7 @@ pub fn validate(data: &[u8]) -> Report {
         fetch: &fetch,
     };
     if keyframe_delta {
-        check_keyframe_delta(data, framing, &mut report);
+        check_keyframe_delta(data, framing, index.is_empty(), &mut report);
     } else {
         check_gaussian_birth(data, framing, &mut report);
     }
@@ -491,7 +491,7 @@ fn check_gaussian_birth(data: &[u8], framing: Framing, report: &mut Report) {
             return;
         }
     };
-    if let Err((error, site)) = refusal::scan_chunks(data, framing.walk, &scene) {
+    if let Err((error, site)) = refusal::scan_chunks(data, &scene) {
         report.refused("a chunk does not decode: ", &error, Some(framing), site);
     }
 }
@@ -508,7 +508,16 @@ fn check_gaussian_birth(data: &[u8], framing: Framing, report: &mut Report) {
 /// refuses is an entry whose **offset** the report can name. `decode_indexed` keeps every
 /// state — which is right for a caller that wants the states and wrong for one that wants
 /// the verdict — so this drives `compose_chain` itself and drops each state as it goes.
-fn check_keyframe_delta(data: &[u8], framing: Framing, report: &mut Report) {
+/// `unindexed` is the file with no chunk index at all, which is a legal `keyframe-delta`
+/// file read front to back. `open_indexed` starts its index walk at `Footer.summary_start`,
+/// so on such a file it walked from byte 0, read the file magic as record framing and
+/// returned an error — and every stream-only keyframe-delta file was reported invalid for a
+/// fault that belonged to the tool. The gaussian-birth branch has always had the other path;
+/// this one now has it too.
+fn check_keyframe_delta(data: &[u8], framing: Framing, unindexed: bool, report: &mut Report) {
+    if unindexed {
+        return check_keyframe_delta_streamed(data, framing, report);
+    }
     let sequence = match fourdgs::keyframe_delta_file::open_indexed(data) {
         Ok(sequence) => sequence,
         Err(error) => {
@@ -522,6 +531,11 @@ fn check_keyframe_delta(data: &[u8], framing: Framing, report: &mut Report) {
         }
     };
     for (i, entry) in sequence.index.iter().enumerate() {
+        let what = if entry.kind == 0 {
+            "Chunk"
+        } else {
+            "DeltaChunk"
+        };
         // The composed state is dropped here, at the end of the iteration.
         let composed = fourdgs::keyframe_delta_file::compose_chain(
             data,
@@ -530,11 +544,6 @@ fn check_keyframe_delta(data: &[u8], framing: Framing, report: &mut Report) {
             &sequence.windows,
         );
         if let Err(error) = composed {
-            let what = if entry.kind == 0 {
-                "Chunk"
-            } else {
-                "DeltaChunk"
-            };
             report.refused(
                 "a chunk does not decode: ",
                 &error,
@@ -546,6 +555,75 @@ fn check_keyframe_delta(data: &[u8], framing: Framing, report: &mut Report) {
             );
             // One chain's failure is every later chain's failure — they share links — so
             // the first is the finding and the rest would be the same fault restated.
+            return;
+        }
+        // Composing a chain reads Chunk and Delta Chunk records and nothing else, so an SH
+        // Band Stream this entry names is a record the verdict never visited. A band is a
+        // stream like any other: a codec this build does not implement in one of them is a
+        // file that does not decode, and it was reported `valid`. The gaussian-birth path
+        // decodes every band the index declares; this is the same rule on this model.
+        for range in &entry.bands {
+            let (band, at, length) = *range;
+            if let Err(error) =
+                refusal::decode_band_record(data, at, length, entry.gaussian_count as usize)
+            {
+                report.refused(
+                    "a chunk does not decode: ",
+                    &error,
+                    Some(framing),
+                    Some(refusal::Site {
+                        offset: at,
+                        what: format!(
+                            "the SH Band Stream for band {band} of the {what} at index entry {i}"
+                        ),
+                    }),
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// The same verdict for a `keyframe-delta` file with no index, which has to be read front to
+/// back.
+///
+/// Record by record, decoding each keyframe chunk and each delta chunk on its own and
+/// keeping neither — the shape the gaussian-birth branch already uses, for the same reason:
+/// `decode_streamed` composes the whole sequence and holds a state per chunk, which is what
+/// a *reader* wants and what a validator must not do.
+///
+/// A delta is checked without the reference it would compose against. Its three groups are
+/// streams like any other, so an unimplemented codec or a corrupt payload is found by
+/// decoding them, and the window indices a birth carries are checked against the table. What
+/// this does not do is compose — an unindexed file has no chain to walk until one is built,
+/// and building it is the resident-scene decode this exists to avoid.
+fn check_keyframe_delta_streamed(data: &[u8], framing: Framing, report: &mut Report) {
+    let mut windows: Vec<(f64, f64)> = Vec::new();
+    for frame in framing.walk.intact_records() {
+        let Some(content) = frame.content(data) else {
+            continue;
+        };
+        let outcome = match frame.opcode {
+            op::WINDOW_TABLE => {
+                if let Ok(table) = rec::WindowTable::parse(content) {
+                    windows = table.windows;
+                }
+                continue;
+            }
+            op::CHUNK => fourdgs::keyframe_delta_file::check_keyframe_chunk(content, &windows),
+            op::DELTA_CHUNK => fourdgs::keyframe_delta_file::check_delta_chunk(content, &windows),
+            _ => continue,
+        };
+        if let Err(error) = outcome {
+            report.refused(
+                "a chunk does not decode: ",
+                &error,
+                Some(framing),
+                Some(refusal::Site {
+                    offset: frame.offset,
+                    what: format!("the {} record", op::name(frame.opcode)),
+                }),
+            );
             return;
         }
     }

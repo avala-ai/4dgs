@@ -653,6 +653,440 @@ fn the_corpus_is_present_in_ci() {
             "no corpus variant matches {name}; the corpus was renamed under this suite"
         );
     }
+    // The keyframe-delta variants live in their own subdirectory and are selected by it
+    // rather than by name, so they need their own guard. Six tests below are about that
+    // model, and a moved subdirectory would take all six out of the run in silence.
+    assert!(
+        !keyframe_files().is_empty(),
+        "no keyframe-delta variants; the corpus subdirectory moved under this suite"
+    );
+    assert!(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/conformance/data/invalid/UnknownStreamCodec.4dgs")
+            .exists(),
+        "no invalid corpus; the refusal tests below would skip themselves green"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Files no encoder writes.
+//
+// Every fixture below starts as a real corpus file and has one thing changed, because a
+// fixture written from scratch tests the fixture. What is rewritten is the *summary region*
+// — the run of chunk-index entries between `Footer.summary_start` and the Footer record —
+// which is the only part of a file that can be replaced without moving a chunk: nothing
+// points forward into it, and the Footer that follows it is rebuilt with its checksum.
+
+/// The `keyframe-delta` corpus variants, which live in their own subdirectory.
+fn keyframe_files() -> Vec<PathBuf> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/conformance/data/keyframe");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "4dgs"))
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// The first one, in name order. `None` only when the corpus has not been generated, which
+/// `the_corpus_is_present_in_ci` refuses to let happen where it matters.
+fn keyframe_file() -> Option<PathBuf> {
+    keyframe_files().into_iter().next()
+}
+
+/// Where a file's summary region begins and ends.
+///
+/// Both read out of the file: the Footer names `summary_start`, and the Footer record is
+/// the last one before the trailing magic.
+fn summary_bounds(data: &[u8]) -> (usize, usize) {
+    let footer_at = data.len() - (9 + 20 + 8);
+    assert_eq!(data[footer_at], 0x02, "the last record is the Footer");
+    let footer = fourdgs::records::Footer::parse(&data[footer_at + 9..]).unwrap();
+    (footer.summary_start as usize, footer_at)
+}
+
+/// A file made of this front matter and this summary, with a Footer that describes them.
+///
+/// An empty summary produces a file with no index at all — `summary_start` zero, no
+/// checksum — which is the legal stream-only shape and not something the encoder emits.
+fn rebuilt(front: &[u8], summary: &[u8]) -> Vec<u8> {
+    let mut out = front.to_vec();
+    out.extend_from_slice(summary);
+    out.extend_from_slice(
+        &fourdgs::records::Footer {
+            summary_start: if summary.is_empty() {
+                0
+            } else {
+                front.len() as u64
+            },
+            summary_offset_start: 0,
+            summary_crc: if summary.is_empty() {
+                0
+            } else {
+                fourdgs::serialization::crc32(summary)
+            },
+        }
+        .encode(),
+    );
+    out.extend_from_slice(&fourdgs::serialization::MAGIC);
+    out
+}
+
+/// The index entries of a file, and whatever else its summary region holds after them.
+///
+/// The remainder is returned verbatim rather than re-encoded — it is the Statistics record
+/// on every variant that has one — so a fixture changes the entries and nothing else.
+fn summary_parts(data: &[u8]) -> (Vec<fourdgs::records::ChunkIndexEntry>, Vec<u8>) {
+    let (start, end) = summary_bounds(data);
+    let mut entries = Vec::new();
+    let mut at = start;
+    for record in fourdgs::serialization::Records::new(&data[..end], start) {
+        let record = record.expect("the summary region parses");
+        if record.opcode != 0x08 {
+            break;
+        }
+        entries.push(fourdgs::records::ChunkIndexEntry::parse(record.content).expect("an entry"));
+        at = record.offset + 9 + record.content.len();
+    }
+    // Re-encoding has to be byte-stable, or every offset a fixture computes is wrong.
+    let re: Vec<u8> = entries.iter().flat_map(|e| e.encode()).collect();
+    assert_eq!(
+        re.as_slice(),
+        &data[start..at],
+        "an index entry does not round-trip; the fixtures below rely on it"
+    );
+    (entries, data[at..end].to_vec())
+}
+
+/// An SH Band Stream record whose stream declares a codec no build implements.
+///
+/// Hand-written because no encoder emits one, and because the fault has to be the codec
+/// rather than the framing: everything before the codec byte is well-formed, so a reader
+/// that gets as far as decoding the stream is what this catches.
+fn undecodable_band(band: u8, count: u32) -> Vec<u8> {
+    let mut content = vec![band];
+    content.push(0x07); // attribute id: the SH band attribute
+    content.push(1); // symbol width
+    content.push(0); // mode: raw
+    content.push(0xEE); // codec: not one this build implements
+    content.push(1); // channels
+    content.extend_from_slice(&count.to_le_bytes());
+    content.extend_from_slice(&1u64.to_le_bytes()); // payload length
+    content.push(0);
+    let mut out = vec![0x07u8]; // opcode: SH Band Stream
+    out.extend_from_slice(&(content.len() as u64).to_le_bytes());
+    out.extend_from_slice(&content);
+    out
+}
+
+/// Write a fixture to the temporary directory and hand back its path.
+fn fixture(name: &str, data: &[u8]) -> PathBuf {
+    let path = std::env::temp_dir().join(name);
+    std::fs::write(&path, data).unwrap();
+    path
+}
+
+#[test]
+fn a_keyframe_delta_file_declaring_an_unknown_quantization_scheme_is_refused() {
+    // The keyframe-delta reader parsed its Quantization record and never asked the registry
+    // about it, so a scheme this build does not implement composed all the way to a state
+    // and the tool printed `valid`, exit 0 — while the gaussian-birth reader refuses the
+    // same declaration by name at open. Two readers of one format disagreeing about which
+    // files they can read is the divergence this repository exists to prevent.
+    let Some(source) = keyframe_file() else {
+        return;
+    };
+    let mut data = std::fs::read(&source).unwrap();
+    // The declared scheme, overwritten with one nobody implements. Both names are ten
+    // characters, so the record's length is unchanged and nothing in the file moves.
+    let at = data
+        .windows(10)
+        .position(|w| w == b"uniform-v1")
+        .expect("the file declares a quantization scheme");
+    data[at..at + 10].copy_from_slice(b"uniform-v9");
+    let path = fixture("fourdgs-cli-kd-scheme.4dgs", &data);
+
+    let out = run(&["validate", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains("refusal unknown-quantization-scheme at byte "),
+        "{text}"
+    );
+    assert!(text.contains("(the Quantization record)"), "{text}");
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_keyframe_delta_index_that_does_not_reach_the_ends_is_refused() {
+    // Spec §11.1 is one sentence with three clauses, and `check_tiling` implemented one of
+    // them: it compares neighbours, which says everything about the interior and nothing
+    // about either end. An index starting after zero is internally adjacent, composes every
+    // entry successfully, and validated clean — on a file where a seek to t=0 answers "no
+    // state chunk covers t=0".
+    let Some(source) = keyframe_file() else {
+        return;
+    };
+    let data = std::fs::read(&source).unwrap();
+    let (start, _) = summary_bounds(&data);
+    let (mut entries, rest) = summary_parts(&data);
+    assert!(entries.len() > 1, "the fixture has a timeline to shorten");
+    assert_eq!(entries[0].t0, 0.0, "which starts at zero before the change");
+    entries[0].t0 = entries[0].t1 / 2.0;
+
+    let summary: Vec<u8> = entries
+        .iter()
+        .flat_map(|e| e.encode())
+        .chain(rest)
+        .collect();
+    let path = fixture(
+        "fourdgs-cli-kd-endpoints.4dgs",
+        &rebuilt(&data[..start], &summary),
+    );
+
+    let out = run(&["validate", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains("the state chunks start at ") && text.contains("section 11.1"),
+        "{text}"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn an_undecodable_band_of_a_keyframe_delta_chunk_is_not_reported_valid() {
+    // Composing a chain reads Chunk and Delta Chunk records and nothing else, so an SH Band
+    // Stream the index names was a record the verdict never visited: `valid`, exit 0, for a
+    // file that does not decode. The gaussian-birth path has decoded every declared band
+    // since the last round; this is the same rule on the other model.
+    let Some(source) = keyframe_file() else {
+        return;
+    };
+    let data = std::fs::read(&source).unwrap();
+    let (start, _) = summary_bounds(&data);
+    let (mut entries, rest) = summary_parts(&data);
+
+    // Two passes: the band record sits after the entries, and an entry has to name where.
+    // Adding the range first fixes the entries' encoded length, which is what the offset is
+    // measured from.
+    let count = entries[0].gaussian_count;
+    entries[0].bands.push((1, 0, 0));
+    let entries_len: usize = entries.iter().map(|e| e.encode().len()).sum();
+    let band_at = (start + entries_len) as u64;
+    let band = undecodable_band(1, count);
+    entries[0].bands = vec![(1, band_at, band.len() as u64)];
+
+    let summary: Vec<u8> = entries
+        .iter()
+        .flat_map(|e| e.encode())
+        .chain(band)
+        .chain(rest)
+        .collect();
+    let path = fixture(
+        "fourdgs-cli-kd-band.4dgs",
+        &rebuilt(&data[..start], &summary),
+    );
+
+    let out = run(&["validate", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains(&format!("refusal unknown-stream-codec at byte {band_at} ")),
+        "{text}"
+    );
+    assert!(
+        text.contains("SH Band Stream for band 1 of the Chunk at index entry 0"),
+        "{text}"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_keyframe_delta_file_with_no_index_is_read_front_to_back() {
+    // `open_indexed` starts its index walk at `Footer.summary_start`. On a stream-only file
+    // that is zero, so it walked from byte 0, read the file magic as record framing, and
+    // returned an error — and `validate` reported every conforming stream-only
+    // keyframe-delta file as invalid, for a fault that was the tool's. The gaussian-birth
+    // branch has always had the other path.
+    let Some(source) = keyframe_file() else {
+        return;
+    };
+    let data = std::fs::read(&source).unwrap();
+    let (start, _) = summary_bounds(&data);
+    let path = fixture(
+        "fourdgs-cli-kd-unindexed.4dgs",
+        &rebuilt(&data[..start], &[]),
+    );
+
+    let out = run(&["validate", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    // Valid, with the warning that says what was given up: `2` is this tool's code for
+    // "valid, with warnings", and a warning a script cannot see is a warning nobody acts on.
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("no chunk index"), "{text}");
+    assert!(!text.contains("error:"), "{text}");
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_stream_only_keyframe_delta_file_still_has_its_chunks_decoded() {
+    // The other half of the test above, and the one that matters: reporting a stream-only
+    // file `valid` by not looking at it would pass that test and prove nothing. The same
+    // file with one codec byte changed has to be refused, at the byte.
+    let Some(source) = keyframe_file() else {
+        return;
+    };
+    let data = std::fs::read(&source).unwrap();
+    let (start, _) = summary_bounds(&data);
+    let mut unindexed = rebuilt(&data[..start], &[]);
+    let at = break_the_codec_in(&mut unindexed, 0x05)
+        .expect("a keyframe-delta file carries Chunk records; they are its keyframes");
+    let path = fixture("fourdgs-cli-kd-unindexed-bad.4dgs", &unindexed);
+
+    let out = run(&["validate", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains(&format!("refusal unknown-stream-codec at byte {at} ")),
+        "{text}"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn the_failing_one_of_two_ranges_for_the_same_band_is_the_one_reported() {
+    // Nothing in the index forbids two ranges for the same band, and `read_chunk` decodes
+    // both — it keys its results by band, so the second merely overwrites the first. Raising
+    // a cap until the read fails therefore cannot tell them apart: the cap that admits the
+    // bad duplicate admits the good one with it, and the offset reported was whichever
+    // sorted first. That is a byte pointing at a healthy record, which is worse than no byte.
+    let Some(source) = file(SH_DEGREE_2) else {
+        return;
+    };
+    let data = std::fs::read(&source).unwrap();
+    let (start, _) = summary_bounds(&data);
+    let (mut entries, rest) = summary_parts(&data);
+    let good = *entries[0]
+        .bands
+        .first()
+        .expect("the SHDegree2 variant declares bands");
+    assert!(
+        good.1 < start as u64,
+        "the healthy band record sits before the summary region"
+    );
+
+    let count = entries[0].gaussian_count;
+    entries[0].bands = vec![good, (good.0, 0, 0)];
+    let entries_len: usize = entries.iter().map(|e| e.encode().len()).sum();
+    let band_at = (start + entries_len) as u64;
+    let band = undecodable_band(good.0, count);
+    entries[0].bands = vec![good, (good.0, band_at, band.len() as u64)];
+
+    let summary: Vec<u8> = entries
+        .iter()
+        .flat_map(|e| e.encode())
+        .chain(band)
+        .chain(rest)
+        .collect();
+    let path = fixture(
+        "fourdgs-cli-duplicate-band.4dgs",
+        &rebuilt(&data[..start], &summary),
+    );
+
+    let out = run(&["validate", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains(&format!("refusal unknown-stream-codec at byte {band_at} ")),
+        "the second range is the one that refuses; {text}"
+    );
+    assert!(
+        !text.contains(&format!("at byte {} ", good.1)),
+        "the first range is healthy and must not be named; {text}"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_file_cut_on_a_record_boundary_is_reported_as_cut_rather_than_noted() {
+    // The simplest truncation there is: remove only the eight-byte trailing magic. Every
+    // record is whole, so the walk reached the end with nothing left over and recorded no
+    // cut — `inspect` printed a note about the missing magic and exited **0** for an
+    // incomplete file, and `validate` left off the note that says how much of it survives.
+    let Some(source) = file(INDEXED) else {
+        return;
+    };
+    let data = std::fs::read(&source).unwrap();
+    let path = fixture(
+        "fourdgs-cli-no-magic.4dgs",
+        &data[..data.len() - fourdgs::serialization::MAGIC.len()],
+    );
+
+    let out = run(&["inspect", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an incomplete file is not a whole one: {text}"
+    );
+    assert!(text.contains("truncated at byte"), "{text}");
+    assert!(text.contains("intact prefix"), "{text}");
+
+    let out = run(&["validate", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("does not end with the magic"), "{text}");
+    assert!(
+        text.contains("complete records before it are intact"),
+        "the recovery note says how much survives: {text}"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn decode_places_a_refusal_that_lives_inside_a_chunk() {
+    // `decode` refused an unknown stream codec with the identifier and no byte: the table
+    // that places a refusal from the framing has no entry for a chunk-level code, because
+    // the framing walk steps over a chunk by its declared length and never looks inside it.
+    // The file is scanned front to back instead, one record at a time, and the first record
+    // raising *this same refusal* is the site.
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/conformance/data/invalid");
+    let variant = dir.join("UnknownStreamCodec.4dgs");
+    if !variant.exists() {
+        assert!(std::env::var_os("CI").is_none(), "CI generates the corpus");
+        return;
+    }
+    // The identifier is read out of the corpus rather than restated here, so this test and
+    // the expectation every SDK is scored against cannot drift apart.
+    let expectation = std::fs::read_to_string(dir.join("UnknownStreamCodec.json")).unwrap();
+    let code = expectation
+        .split("\"refused\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').nth(1))
+        .expect("the expectation names the refusal")
+        .to_string();
+
+    let out = run(&["decode", variant.to_str().unwrap()]);
+    let text = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a file that was read and refused: {text}"
+    );
+    let placed = text
+        .lines()
+        .find(|l| l.contains(&format!("refusal {code}")))
+        .unwrap_or_else(|| panic!("no `{code}` refusal in {text}"));
+    assert!(
+        placed.contains(" at byte "),
+        "the refusal is named but not placed: {placed}"
+    );
+    // And the byte names a record, not the top of the file.
+    assert!(!placed.contains(" at byte 0 "), "{placed}");
 }
 
 /// One unsigned field out of the tool's own JSON. Enough for `{"key": 123}` one per line,

@@ -105,28 +105,20 @@ fn main() -> ExitCode {
 
 /// The refusal identifier and the byte, for an error on its way to stderr.
 ///
-/// Best effort by construction: the file has already refused to open, so the walk that
-/// would place the refusal may itself refuse. That costs the byte, not the identifier.
+/// Best effort by construction: the file has already refused to open, so the search that
+/// would place the refusal may itself be refused. That costs the byte, not the identifier.
+///
+/// Streamed, and it stops at the record it is looking for. The refusal this is placing was
+/// raised early — an unimplemented model in the Header, a codec in the first chunk — and a
+/// tool that answered "where?" by first framing every record in the file would turn a
+/// bounded refusal into an allocation proportional to the file, on the path taken by
+/// precisely the files that are too big to hold. See `refusal::locate_streaming`.
 fn locate(path: &str, error: &fourdgs::Error) -> Option<refusal::Named> {
-    error.refusal_code()?;
-    let Ok(mut source) = fourdgs::readable::FileReadable::open(path) else {
-        return refusal::describe(error, None, None);
-    };
-    let walk = refusal::walk(&mut source).ok();
-    // A cell because the fetch is called once per candidate record and a shared closure
-    // cannot hold the reader mutably. Only Header and Quantization records are ever
-    // fetched, and only their content — nothing here reads a payload.
-    let source = std::cell::RefCell::new(source);
-    let fetch = |frame: &refusal::Frame| {
-        use fourdgs::readable::Readable;
-        let at = frame.offset + fourdgs::serialization::RECORD_HEADER_SIZE as u64;
-        source.borrow_mut().read(at, frame.length).ok()
-    };
-    let framing = walk.as_ref().map(|walk| refusal::Framing {
-        walk,
-        fetch: &fetch,
-    });
-    refusal::describe(error, framing, None)
+    let code = error.refusal_code()?;
+    let site = fourdgs::readable::FileReadable::open(path)
+        .ok()
+        .and_then(|mut source| refusal::locate_streaming(&mut source, code));
+    refusal::describe(error, None, site)
 }
 
 /// A count with thousands separators, matching the Python tool's `{:,}`.
