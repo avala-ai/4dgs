@@ -317,4 +317,43 @@ void main() {
       );
     },
   );
+
+  test('resident containment clips support to the scene clock', () async {
+    final rotations = Float32List(8);
+    rotations[3] = 1.0;
+    rotations[7] = 1.0;
+    final authored = FourdgsGaussianSet(
+      positions: Float32List(6),
+      scales: Float32List(6)..fillRange(0, 6, 1e-3),
+      rotations: rotations,
+      colors: Float32List(8),
+      motions: Float32List(6),
+      muT: Float32List.fromList(const <double>[0.0, 0.75]),
+      sigmaT: Float32List.fromList(const <double>[double.infinity, 0.0]),
+      winLo: Float32List.fromList(const <double>[-1.0, 0.0]),
+      winHi: Float32List.fromList(const <double>[0.25, 1.0]),
+    );
+    final bytes = writeFourdgsBytes(
+      authored,
+      1.0,
+      options: const FourdgsWriteOptions(maxDepth: 2, minChunkGaussians: 1),
+    );
+    final source = CountingReadable(FourdgsBytes(bytes));
+    final scene = await openFourdgsIndexed(source);
+    expect(scene.index.length, greaterThan(1));
+    final chunks = <FourdgsDecodedChunk>[
+      for (final entry in scene.index)
+        await readFourdgsChunk(source, scene, entry, maxShBand: 0),
+    ];
+
+    await expectLater(
+      checkSeekReadsOnlyWhatItNeeds(
+        source,
+        scene,
+        assembleGaussians(chunks, 0),
+        decodedChunks: chunks,
+      ),
+      completes,
+    );
+  });
 }

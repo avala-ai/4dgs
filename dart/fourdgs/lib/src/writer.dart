@@ -1219,10 +1219,28 @@ List<_Plan> _planChunks(
   final assigned = Int32List(n)..fillRange(0, n, -1);
   final nodes = <_Node>[];
 
-  /// Push [pool] down the tree, returning the gaussians that could not descend
-  /// because their support straddles a boundary. Those belong to the caller.
-  List<int> descend(double a, double b, int level, List<int> pool) {
-    if (pool.isEmpty || level >= options.maxDepth) return pool;
+  /// Push the half-open range [start, end) of [pool] down the tree in place.
+  ///
+  /// Each level partitions that same typed array into left, staying and right
+  /// ranges. A single-branch scene therefore retains one scene-sized assignment
+  /// table at depth 32, not another growable reference array at every frame.
+  void descend(
+    double a,
+    double b,
+    int level,
+    Int32List pool,
+    int start,
+    int end,
+  ) {
+    if (start == end) return;
+    if (level >= options.maxDepth) {
+      nodes.add(_Node(a, b, level));
+      final node = nodes.length - 1;
+      for (int at = start; at < end; at++) {
+        assigned[pool[at]] = node;
+      }
+      return;
+    }
     final mid = 0.5 * (a + b);
     // An interval can run out of doubles before it runs out of depth. Adjacent
     // `float32` window bounds near 1.0 are about 1.2e-7 apart and collapse after
@@ -1233,40 +1251,71 @@ List<_Plan> _planChunks(
     // is half-open, so nothing can ever select it, and `FourdgsChunkIndexEntry`
     // in this same package refuses to parse it. A node that cannot be halved is
     // a leaf, which is the answer whatever the depth limit says.
-    if (!(mid > a && mid < b)) return pool;
-    final stay = <int>[];
-    final left = <int>[];
-    final right = <int>[];
-    for (final i in pool) {
+    if (!(mid > a && mid < b)) {
+      nodes.add(_Node(a, b, level));
+      final node = nodes.length - 1;
+      for (int at = start; at < end; at++) {
+        assigned[pool[at]] = node;
+      }
+      return;
+    }
+
+    // Dutch-national-flag partition: [start, leftEnd) goes left,
+    // [leftEnd, rightStart) stays here, and [rightStart, end) goes right.
+    int leftEnd = start;
+    int at = start;
+    int rightStart = end;
+    while (at < rightStart) {
+      final i = pool[at];
       // The marginal is visible at exactly its support edge, while the left
       // child's interval excludes `mid`. It can descend left on equality only
       // when its verbatim validity window also ends there, making the gaussian
       // absent at that half-open endpoint.
       if (hi[i] < mid || (hi[i] == mid && g.winHi[i] <= mid)) {
-        left.add(i);
+        final swap = pool[leftEnd];
+        pool[leftEnd] = i;
+        pool[at] = swap;
+        leftEnd++;
+        at++;
       } else if (lo[i] >= mid) {
-        right.add(i);
+        rightStart--;
+        pool[at] = pool[rightStart];
+        pool[rightStart] = i;
       } else {
-        stay.add(i);
+        at++;
       }
     }
-    for (final child in <_Child>[_Child(a, mid, left), _Child(mid, b, right)]) {
-      // A node too small to be worth its own chunk hands its gaussians back to
-      // the parent rather than producing a chunk of four.
-      if (child.members.length < options.minChunkGaussians) {
-        stay.addAll(child.members);
-        continue;
-      }
-      final kept = descend(child.t0, child.t1, level + 1, child.members);
-      if (kept.isNotEmpty) {
-        nodes.add(_Node(child.t0, child.t1, level + 1));
-        for (final i in kept) {
-          assigned[i] = nodes.length - 1;
-        }
+
+    final leftCount = leftEnd - start;
+    final rightCount = end - rightStart;
+    final keepLeft = leftCount > 0 && leftCount < options.minChunkGaussians;
+    final keepRight = rightCount > 0 && rightCount < options.minChunkGaussians;
+    if (!keepLeft) {
+      descend(a, mid, level + 1, pool, start, leftEnd);
+    }
+    if (!keepRight) {
+      descend(mid, b, level + 1, pool, rightStart, end);
+    }
+
+    // Children below the population threshold stay in this node alongside
+    // supports that straddle the split.
+    final staying = rightStart - leftEnd;
+    if (staying == 0 && !keepLeft && !keepRight) return;
+    nodes.add(_Node(a, b, level));
+    final node = nodes.length - 1;
+    if (keepLeft) {
+      for (int p = start; p < leftEnd; p++) {
+        assigned[pool[p]] = node;
       }
     }
-    stay.sort();
-    return stay;
+    for (int p = leftEnd; p < rightStart; p++) {
+      assigned[pool[p]] = node;
+    }
+    if (keepRight) {
+      for (int p = rightStart; p < end; p++) {
+        assigned[pool[p]] = node;
+      }
+    }
   }
 
   // Which window interval each gaussian belongs to, decided in one pass over
@@ -1305,22 +1354,14 @@ List<_Plan> _planChunks(
   for (int w = 0; w + 1 < tops.length; w++) {
     final a = tops[w];
     final b = tops[w + 1];
-    final kept = descend(
+    descend(
       a,
       b,
       0,
-      Int32List.sublistView(
-        intervalMembers,
-        intervalOffsets[w],
-        intervalOffsets[w + 1],
-      ),
+      intervalMembers,
+      intervalOffsets[w],
+      intervalOffsets[w + 1],
     );
-    if (kept.isNotEmpty) {
-      nodes.add(_Node(a, b, 0));
-      for (final i in kept) {
-        assigned[i] = nodes.length - 1;
-      }
-    }
   }
   intervalMembers = null;
 
@@ -1470,16 +1511,6 @@ class _Node {
   final double t0;
   final double t1;
   final int level;
-}
-
-/// A candidate child during the descent: half of a parent's interval, and the
-/// gaussians whose support fits inside it.
-class _Child {
-  const _Child(this.t0, this.t1, this.members);
-
-  final double t0;
-  final double t1;
-  final List<int> members;
 }
 
 /// Reorder a chunk's members for spatial locality, by Morton code over their own

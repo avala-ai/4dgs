@@ -2021,19 +2021,24 @@ void main() {
           ),
         ),
       );
-      // The ceiling itself is a depth, not a refusal: the same scene at the
-      // deepest legal partition still writes.
-      expect(
-        () => writeFourdgsBytes(
-          instant,
+      // The ceiling itself is a depth, not a refusal. Keep a sizeable pool on
+      // one branch through all 32 levels: the planner must partition one typed
+      // assignment table in place rather than retain 32 scene-sized lists.
+      const deepCount = 4096;
+      final deepPool = flatScene(deepCount, winHi: 10.0);
+      deepPool.sigmaT.fillRange(0, deepCount, 0.0);
+      deepPool.muT.fillRange(0, deepCount, 5.0);
+      final decoded = readFourdgsBytes(
+        writeFourdgsBytes(
+          deepPool,
           10.0,
           options: const FourdgsWriteOptions(
             maxDepth: 32,
             minChunkGaussians: 1,
           ),
         ),
-        returnsNormally,
       );
+      expect(decoded.gaussians.count, deepCount);
     });
 
     test('an option outside its range is named here, not by a library', () {

@@ -370,11 +370,12 @@ Future<void> checkBandRangeSkipping(
 /// for — a seek at an instant returns a scene missing gaussians that were
 /// visible at it — and nothing in a whole-scene comparison can see that.
 ///
-/// So this selects. For each probe instant it reads only the entries whose
-/// half-open interval contains it, reconstructs state at that instant from those
-/// chunks alone, and requires it to equal the state the whole scene gives. That
-/// is the seek contract stated as an equality, rather than as a property of the
-/// writer that has to be re-derived.
+/// So this selects. The decoded chunks occupy known row ranges in [whole]; an
+/// event sweep marks those ranges selected exactly while their half-open index
+/// intervals cover a probe, and independently marks rows visible while their
+/// reconstructed support covers it. Every visible row must be selected. This is
+/// the seek contract stated as an equality, without repeatedly concatenating a
+/// deeply nested active population at every probe.
 ///
 /// **Probes near a chunk boundary are skipped, and the guard is derived from the
 /// file rather than chosen.** The partition is planned on the encoder's input
@@ -410,6 +411,23 @@ checkSeekReadsOnlyWhatItNeeds(
     throw ConformanceFailure(
       'the seek proof received ${chunks.length} decoded chunks for '
       '${index.length} index entries',
+    );
+  }
+  final entryRowOffsets = Int32List(index.length + 1);
+  for (int i = 0; i < index.length; i++) {
+    if (chunks[i].count != index[i].gaussianCount) {
+      throw ConformanceFailure(
+        'the chunk at ${index[i].chunkOffset} decoded '
+        '${chunks[i].count} gaussians; its index entry declares '
+        '${index[i].gaussianCount}',
+      );
+    }
+    entryRowOffsets[i + 1] = entryRowOffsets[i] + chunks[i].count;
+  }
+  if (entryRowOffsets.last != whole.count) {
+    throw ConformanceFailure(
+      'the ${chunks.length} decoded chunks contain ${entryRowOffsets.last} '
+      'gaussians; the assembled scene contains ${whole.count}',
     );
   }
 
@@ -473,17 +491,15 @@ checkSeekReadsOnlyWhatItNeeds(
     index,
     isKeyframeDelta: scene.header.temporalModel == 'keyframe-delta',
   );
-  final rowStartByChunkOffset = <int, int>{};
-  int rowStart = 0;
-  for (final entry in index) {
-    rowStartByChunkOffset[entry.chunkOffset] = rowStart;
-    rowStart += entry.gaussianCount;
-  }
+  final rowStartByChunkOffset = <int, int>{
+    for (int i = 0; i < index.length; i++)
+      index[i].chunkOffset: entryRowOffsets[i],
+  };
 
   // Prove every resident's complete decoded support against its owning entry.
-  // Candidate probes then remain a fixed small set per distinct interval;
-  // broad populations with distinct peaks cannot turn this into a quadratic
-  // sequence of full-scene reconstructions.
+  // Candidate probes then remain a fixed small set per distinct interval, and
+  // the event sweep below updates each resident's selected/visible bits only at
+  // its endpoints. Nested intervals cannot cause repeated population copies.
   final support = whole.support(cutoff: scene.header.cutoff);
   final candidates = <double>{};
   for (final entry in probeEntries) {
@@ -491,18 +507,20 @@ checkSeekReadsOnlyWhatItNeeds(
     final residentStart = rowStartByChunkOffset[entry.chunkOffset]!;
     final residentEnd = residentStart + residentCount;
     for (int row = residentStart; row < residentEnd; row++) {
-      if (support.lo[row] <= support.hi[row] &&
-          support.lo[row] < whole.winHi[row]) {
+      // Only support intersecting the Header's scene clock can be sought. A
+      // decoded validity window may begin before zero or end after duration;
+      // requiring those unreachable tails to fit an index entry rejects a
+      // correctly filed resident.
+      final sceneLo = math.max(0.0, support.lo[row]);
+      final sceneHi = math.min(scene.header.durationSec, support.hi[row]);
+      if (sceneLo <= sceneHi &&
+          sceneLo < scene.header.durationSec &&
+          sceneLo < whole.winHi[row]) {
         final guard = residentGuards[row];
-        if (!residentSupportWithinEntry(
-          entry,
-          support.lo[row],
-          support.hi[row],
-          guard,
-        )) {
+        if (!residentSupportWithinEntry(entry, sceneLo, sceneHi, guard)) {
           throw ConformanceFailure(
             'resident gaussian row $row in the chunk at ${entry.chunkOffset} '
-            'has decoded support [${support.lo[row]}, ${support.hi[row]}], '
+            'has scene-clock support [$sceneLo, $sceneHi], '
             'outside [${entry.t0}, ${entry.t1}] beyond its $guard quantization guard',
           );
         }
@@ -519,7 +537,8 @@ checkSeekReadsOnlyWhatItNeeds(
   final entryEnds = <({double at, int index})>[
     for (int i = 0; i < index.length; i++) (at: index[i].t1, index: i),
   ]..sort((a, b) => a.at.compareTo(b.at));
-  final activeEntries = <int>{};
+  final selectedRows = Uint8List(whole.count);
+  int activeEntryCount = 0;
   int nextEntryStart = 0;
   int nextEntryEnd = 0;
 
@@ -534,7 +553,9 @@ checkSeekReadsOnlyWhatItNeeds(
   }
   rowStarts.sort((a, b) => a.at.compareTo(b.at));
   rowEnds.sort((a, b) => a.at.compareTo(b.at));
-  final activeRows = <int>{};
+  final visibleRows = Uint8List(whole.count);
+  int visibleRowCount = 0;
+  int missingVisibleRows = 0;
   int nextRowStart = 0;
   int nextRowEnd = 0;
 
@@ -543,54 +564,62 @@ checkSeekReadsOnlyWhatItNeeds(
   for (final t in orderedCandidates) {
     while (nextEntryStart < entryStarts.length &&
         entryStarts[nextEntryStart].at <= t) {
-      activeEntries.add(entryStarts[nextEntryStart++].index);
+      final entryIndex = entryStarts[nextEntryStart++].index;
+      activeEntryCount++;
+      for (
+        int row = entryRowOffsets[entryIndex];
+        row < entryRowOffsets[entryIndex + 1];
+        row++
+      ) {
+        selectedRows[row] = 1;
+        if (visibleRows[row] != 0) missingVisibleRows--;
+      }
     }
     while (nextEntryEnd < entryEnds.length && entryEnds[nextEntryEnd].at <= t) {
-      activeEntries.remove(entryEnds[nextEntryEnd++].index);
+      final entryIndex = entryEnds[nextEntryEnd++].index;
+      activeEntryCount--;
+      for (
+        int row = entryRowOffsets[entryIndex];
+        row < entryRowOffsets[entryIndex + 1];
+        row++
+      ) {
+        selectedRows[row] = 0;
+        if (visibleRows[row] != 0) missingVisibleRows++;
+      }
     }
     while (nextRowStart < rowStarts.length && rowStarts[nextRowStart].at <= t) {
-      activeRows.add(rowStarts[nextRowStart++].row);
+      final row = rowStarts[nextRowStart++].row;
+      visibleRows[row] = 1;
+      visibleRowCount++;
+      if (selectedRows[row] == 0) missingVisibleRows++;
     }
     while (nextRowEnd < rowEnds.length &&
         (rowEnds[nextRowEnd].at < t ||
             (rowEnds[nextRowEnd].at == t && !rowEnds[nextRowEnd].inclusive))) {
-      activeRows.remove(rowEnds[nextRowEnd++].row);
+      final row = rowEnds[nextRowEnd++].row;
+      if (selectedRows[row] == 0) missingVisibleRows--;
+      visibleRows[row] = 0;
+      visibleRowCount--;
     }
 
-    final fromWhole = _visibleKeysForRows(
-      whole,
-      activeRows,
-      t,
-      scene.header.cutoff,
-    );
     if (_probeInGuardZones(t, guardZones)) {
-      if (fromWhole.isNotEmpty) {
-        guardedVisibleCandidates++;
-      }
+      if (visibleRowCount > 0) guardedVisibleCandidates++;
       continue;
     }
 
-    final selectedIndices = activeEntries;
-    if (selectedIndices.isEmpty) {
+    if (activeEntryCount == 0) {
       throw ConformanceFailure('no chunk index entry covers probe t=$t');
     }
-    final selectedChunks = <FourdgsDecodedChunk>[
-      for (final i in selectedIndices) chunks[i],
-    ];
-    final fromSeek = _visibleKeys(
-      assembleGaussians(selectedChunks, 0),
-      t,
-      scene.header.cutoff,
-    );
-    // Empty on both sides proves only that this instant missed the content,
-    // not that the index filed that content in the right interval.
-    if (fromWhole.isEmpty && fromSeek.isEmpty) continue;
-    if (fromSeek.length != fromWhole.length ||
-        !_sameKeys(fromSeek, fromWhole)) {
+    if (visibleRowCount == 0) continue;
+    if (missingVisibleRows != 0) {
+      int row = 0;
+      while (row < whole.count &&
+          !(visibleRows[row] != 0 && selectedRows[row] == 0)) {
+        row++;
+      }
       throw ConformanceFailure(
-        'a seek at t=$t read ${selectedIndices.length} of ${index.length} chunks and '
-        'found ${fromSeek.length} visible gaussians; the whole scene has '
-        '${fromWhole.length} visible there',
+        'a seek at t=$t omits visible resident gaussian row $row; its chunk '
+        'index interval does not cover that instant',
       );
     }
     probed++;
@@ -739,54 +768,4 @@ bool seekProbeNearAnyBoundary(
     }
   }
   return false;
-}
-
-List<String> _visibleKeysForRows(
-  FourdgsGaussianSet g,
-  Iterable<int> rows,
-  double t,
-  double cutoff,
-) {
-  final keys = <String>[];
-  for (final i in rows) {
-    if (!(g.winLo[i] <= t && t < g.winHi[i])) continue;
-    final sigma = g.sigmaT[i];
-    final marginal =
-        sigma.isFinite
-            ? math.exp(
-              -0.5 * math.pow((t - g.muT[i]) / math.max(sigma, 1e-30), 2),
-            )
-            : 1.0;
-    if (marginal < cutoff) continue;
-    final dt = t - g.muT[i];
-    keys.add(
-      '${g.positions[i * 3] + g.motions[i * 3] * dt},'
-      '${g.positions[i * 3 + 1] + g.motions[i * 3 + 1] * dt},'
-      '${g.positions[i * 3 + 2] + g.motions[i * 3 + 2] * dt},'
-      '${g.colors[i * 4 + 3] * marginal}',
-    );
-  }
-  keys.sort();
-  return keys;
-}
-
-/// Reconstructed state at [t] as sorted keys, so two orderings of one answer
-/// compare equal — a chunk's members are Morton-ordered and a selection of
-/// chunks concatenates in index order, and neither is part of the claim.
-List<String> _visibleKeys(FourdgsGaussianSet g, double t, double cutoff) {
-  final state = g.stateAt(t, cutoff: cutoff);
-  final keys = <String>[
-    for (int j = 0; j < state.count; j++)
-      '${state.centers[j * 3]},${state.centers[j * 3 + 1]},'
-          '${state.centers[j * 3 + 2]},${state.opacity[j]}',
-  ];
-  keys.sort();
-  return keys;
-}
-
-bool _sameKeys(List<String> a, List<String> b) {
-  for (int i = 0; i < a.length; i++) {
-    if (a[i] != b[i]) return false;
-  }
-  return true;
 }
