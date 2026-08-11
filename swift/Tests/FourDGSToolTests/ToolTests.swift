@@ -158,14 +158,16 @@ final class ValidateTests: XCTestCase {
         XCTAssertFalse(result.out.contains("error:"))
     }
 
-    func testAConformingKeyframeDeltaFileIsValid() throws {
+    func testAConformingKeyframeDeltaFileIsReportedIncomplete() throws {
         try requireCorpus()
         let files = variants(corpusDirectory().appendingPathComponent("keyframe"))
         XCTAssertFalse(files.isEmpty)
         for file in files {
             let result = runTool(["validate", file.path])
-            XCTAssertEqual(result.code, exitOk, "\(file.lastPathComponent) said: \(result.out)")
+            XCTAssertEqual(result.code, exitWarnings, "\(file.lastPathComponent) said: \(result.out)")
             XCTAssertFalse(result.out.contains("error:"), result.out)
+            XCTAssertTrue(result.out.contains("identity composition was not checked"), result.out)
+            XCTAssertEqual(result.err, "INCOMPLETE\n")
         }
     }
 
@@ -315,6 +317,20 @@ final class ValidateTests: XCTestCase {
             }, "\(report.findings.map(\.message))")
         XCTAssertTrue(
             report.findings.compactMap(\.refusal).contains { $0.code == .unknownStreamCodec },
+            "\(report.findings.map(\.message))")
+    }
+
+    func testEveryPhysicalChunkDecodeFailureIsInvalid() throws {
+        try requireCorpus()
+        var bytes = try readFixture(
+            corpusDirectory().appendingPathComponent("TenWindows-UseCrc.4dgs"))
+        let chunk = try XCTUnwrap(try walk(bytes).firstIntact(Opcode.chunk))
+        bytes[Int(chunk.offset + recordHeaderSize + 44)] = 99
+
+        let report = validate(bytes)
+        XCTAssertFalse(report.ok)
+        XCTAssertTrue(
+            report.findings.contains { $0.severity == .error },
             "\(report.findings.map(\.message))")
     }
 
@@ -679,7 +695,9 @@ final class ValidateTests: XCTestCase {
             XCTAssertGreaterThan(bytes.count, 4096)
             let recording = RecordingReader(bytes)
             let report = validate(ToolReader(recording))
-            XCTAssertTrue(report.ok, "\(file.lastPathComponent): \(report.findings.map(\.message))")
+            XCTAssertFalse(
+                report.findings.contains { $0.severity == .error },
+                "\(file.lastPathComponent): \(report.findings.map(\.message))")
             XCTAssertLessThan(recording.largestRead, bytes.count, file.lastPathComponent)
         }
     }

@@ -34,8 +34,9 @@ public struct Finding {
 
 public struct Report {
     public var findings: [Finding] = []
+    public var complete = true
 
-    public var ok: Bool { !findings.contains { $0.severity == .error } }
+    public var ok: Bool { complete && !findings.contains { $0.severity == .error } }
     public var worst: Severity? { findings.map(\.severity).max() }
 
     mutating func push(_ severity: Severity, _ message: String, _ refusal: Named?) {
@@ -45,6 +46,10 @@ public struct Report {
     mutating func error(_ message: String) { push(.error, message, nil) }
     mutating func warn(_ message: String) { push(.warning, message, nil) }
     mutating func note(_ message: String) { push(.note, message, nil) }
+    mutating func incomplete(_ message: String) {
+        complete = false
+        warn(message)
+    }
 
     /// Preserve the shared diagnostic sentence while attaching Swift's placed refusal.
     mutating func refused(_ prefix: String, _ error: FourDGSError, _ walk: Walk?, _ site: Site?) {
@@ -485,10 +490,6 @@ private func isExpectedPartialGroupError(_ error: FourDGSError, group: DeltaGrou
     group.name != "birth" && sentence(error).contains("chunk is missing required attributes")
 }
 
-private func isChunkRefusal(_ error: FourDGSError) -> Bool {
-    error.refusalCode == .unknownStreamCodec || error.refusalCode == .windowIndexOutOfRange
-}
-
 private func validatePhysicalRecords(
     _ source: ToolReader, _ walked: Walk, index: [IndexEntry], keyframeDelta: Bool,
     temporalModelOffset: UInt64?, summary: SummaryDeclaration?, indexBoundsSafe: Bool,
@@ -708,16 +709,14 @@ private func validatePhysicalRecords(
                     }
                 } catch {
                     let stateError = asFourDGS(error)
-                    if keyframeDelta || isChunkRefusal(stateError) {
-                        firstStateError = (
-                            stateError,
-                            Site(
-                                offset: frame.offset,
-                                what:
-                                    "the physical \(opcodeName(frame.opcode)) record at byte "
-                                    + "\(frame.offset)")
-                        )
-                    }
+                    firstStateError = (
+                        stateError,
+                        Site(
+                            offset: frame.offset,
+                            what:
+                                "the physical \(opcodeName(frame.opcode)) record at byte "
+                                + "\(frame.offset)")
+                    )
                 }
             })
     } catch {
@@ -1128,6 +1127,9 @@ func validate(_ source: ToolReader) -> Report {
     if keyframeDelta {
         validateKeyframeDeltaIndex(
             index, fields: physical.fields, durationSec: dispatch?.durationSec, report: &report)
+        report.incomplete(
+            "keyframe-delta identity composition was not checked: the current ranged Swift ABI "
+                + "exposes groups and references, but not composed identity state")
     } else {
         checkGaussianBirth(
             source, walked, index, indexSafe: physical.indexSafe,
@@ -1177,9 +1179,13 @@ public func runValidate(_ path: String, _ out: TextOutput, _ err: TextOutput) ->
         out.line("\(finding.severity.name): \(finding.message)")
         if let refusal = finding.refusal { out.line("  \(refusal)") }
     }
-    if !report.ok {
+    if report.findings.contains(where: { $0.severity == .error }) {
         err.line("INVALID")
         return exitFailed
+    }
+    if !report.complete {
+        err.line("INCOMPLETE")
+        return exitWarnings
     }
     out.line(report.findings.isEmpty ? "valid" : "valid (with notes)")
     return report.worst == .warning ? exitWarnings : exitOk
