@@ -484,6 +484,31 @@ void refuseUnusableInterval(double t0, double t1, int at, String what) {
   }
 }
 
+/// How many bytes of a Chunk's content [parseChunkInterval] needs.
+///
+/// `t0`, `t1`, `level` and `count`, in that order and at fixed offsets, ahead of
+/// the first variable-length field.
+const int chunkFixedHeadBytes = 24;
+
+/// A Chunk's interval and count, from the first [chunkFixedHeadBytes] bytes.
+///
+/// For the caller that wants what a chunk *declares* without wanting what it
+/// holds — a validator counting gaussians across a scene, which then decodes
+/// each chunk separately and one at a time. [parseChunk] needs the whole record,
+/// and a chunk is where a file keeps its weight, so asking for the whole record
+/// to read four fields is how a validator comes to hold a scene it never decodes
+/// (AGENTS.md §1).
+({double t0, double t1, int level, int count}) parseChunkInterval(
+  Uint8List head,
+) {
+  final c = FourdgsCursor(head);
+  final intervalAt = c.pos;
+  final t0 = c.f64();
+  final t1 = c.f64();
+  refuseUnusableInterval(t0, t1, intervalAt, 'Chunk');
+  return (t0: t0, t1: t1, level: c.u32(), count: c.u32());
+}
+
 FourdgsChunkBody parseChunk(Uint8List content) {
   final c = FourdgsCursor(content);
   final intervalAt = c.pos;

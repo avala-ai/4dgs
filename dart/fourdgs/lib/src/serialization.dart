@@ -21,6 +21,7 @@ import 'package:archive/archive.dart';
 
 import 'exceptions.dart';
 import 'opcode.dart';
+import 'readable.dart';
 
 /// `0x89 4 D G S 1 CR LF`.
 ///
@@ -736,3 +737,38 @@ int _unzigzag(int u) => (u >> 1) ^ -(u & 1);
 
 /// CRC-32 (IEEE) over [data], as the Footer's `summary_crc` declares it.
 int fourdgsCrc32(Uint8List data) => getCrc32(data);
+
+/// The same checksum, continued over the next block of a region.
+///
+/// The Footer names a byte *range*, and a caller that has to hold the whole
+/// range to check it is a caller that reads a file to check a file (AGENTS.md
+/// §1). CRC-32 is a running state, so a region is checked block by block with
+/// nothing but a 32-bit accumulator resident: `fourdgsCrc32Continue(block, crc)`
+/// for each block, starting from `0`, gives exactly what [fourdgsCrc32] over the
+/// concatenation gives.
+int fourdgsCrc32Continue(Uint8List block, int crc) => getCrc32(block, crc);
+
+/// How much of a checksummed region is read at a time.
+///
+/// A megabyte: large enough that the per-read overhead of an HTTP transport
+/// disappears, small enough that a checksum over a gigabyte of summary costs a
+/// megabyte of memory rather than a gigabyte.
+const int fourdgsCrcBlockBytes = 1 << 20;
+
+/// The checksum of `[start, start + length)` of [source], a block at a time.
+Future<int> fourdgsCrc32Range(
+  FourdgsReadable source,
+  int start,
+  int length,
+) async {
+  int crc = 0;
+  int at = start;
+  final int end = start + length;
+  while (at < end) {
+    final int take =
+        end - at < fourdgsCrcBlockBytes ? end - at : fourdgsCrcBlockBytes;
+    crc = fourdgsCrc32Continue(await source.read(at, take), crc);
+    at += take;
+  }
+  return crc;
+}

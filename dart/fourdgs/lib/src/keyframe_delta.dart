@@ -35,6 +35,7 @@ import 'dart:typed_data';
 import 'exceptions.dart';
 import 'opcode.dart';
 import 'quantization.dart';
+import 'readable.dart';
 import 'records.dart';
 import 'serialization.dart';
 
@@ -90,6 +91,45 @@ class KeyframeDeltaState {
   final Map<int, _Column> _bins;
 
   int get count => ids.length;
+
+  /// Every `window_index` this state names, against the file's Window Table.
+  ///
+  /// Composition is arithmetic on bins and never looks a window up, so a state
+  /// that names a window the file does not carry composes perfectly well; the
+  /// range check happens later, when reconstruction asks the grid for the
+  /// window. A caller that composes without reconstructing — a validator, which
+  /// only wants to know whether the file decodes — would therefore call a file
+  /// valid that reconstruction refuses. This is that check, on its own, so it
+  /// can be made without dequantizing a population.
+  ///
+  /// The refusal is the shared one, so the identifier and the sentence are what
+  /// reconstruction would have produced for the same file.
+  void checkWindows(List<FourdgsWindow> windows) {
+    if (count == 0) return;
+    final column = _bins[attrWindowIndex];
+    if (column == null) {
+      throw const FourdgsMalformedFile(
+        'a non-empty state carries no window_index column; it is a required '
+        'keyframe attribute (section 11.5)',
+      );
+    }
+    // An absent or empty table is one default (0, 0) window, exactly as
+    // reconstruction reads it — so index 0 resolves against it and nothing else
+    // does.
+    final int length = windows.isEmpty ? 1 : windows.length;
+    for (int i = 0; i < count; i++) {
+      final int index = column.values[i];
+      if (index < 0 || index >= length) {
+        // The same builder the grid lookups use, so one refusal has one
+        // spelling however it was reached.
+        throw windowIndexOutOfRange(
+          index,
+          length,
+          gaussian: _Grids._named(ids[i]),
+        );
+      }
+    }
+  }
 }
 
 /// The state a keyframe chunk states outright, with its identities checked.
@@ -678,9 +718,17 @@ decodeKeyframeDeltaIndexed(Uint8List data) {
   checkTiling(index);
 
   final chunks = <KeyframeDeltaChunk>[];
+  // Built once for the whole loop: every chain walk needs it, and rebuilding it
+  // per entry is what makes composing an index quadratic.
+  final byOffset = keyframeDeltaChainIndex(index);
   for (int i = 0; i < index.length; i++) {
     final entry = index[i];
-    final state = composeKeyframeDeltaChain(data, index, entry);
+    final state = composeKeyframeDeltaChain(
+      data,
+      index,
+      entry,
+      byOffset: byOffset,
+    );
     // The index says how many gaussians are live over this interval and the
     // chunks say what they are, and §5.8 calls that duplication a cheap
     // corruption check. It is also the only thing standing between a zero-width
@@ -765,36 +813,91 @@ Uint8List _recordContent(Uint8List data, int offset, int length) {
 /// validator wants only to know that each chain composes at all. Both of those
 /// need one state resident at a time, which is what calling this in a loop and
 /// dropping the result gives them (AGENTS.md §1).
+/// [byOffset] is [keyframeDeltaChainIndex] of the same index, for a caller in a
+/// loop. See that function for why it is worth passing.
 KeyframeDeltaState composeKeyframeDeltaChain(
   Uint8List data,
   List<FourdgsChunkIndexEntry> index,
-  FourdgsChunkIndexEntry entry,
-) {
-  final chain = chainFrom(index, entry);
+  FourdgsChunkIndexEntry entry, {
+  Map<int, FourdgsChunkIndexEntry>? byOffset,
+}) {
+  final chain = chainFrom(index, entry, byOffset: byOffset);
   KeyframeDeltaState? state;
   for (final link in chain) {
-    final content = _recordContent(data, link.chunkOffset, link.chunkLength);
-    if (link.kind == 0) {
-      final decoded = _keyframeFromChunk(content, at: link.chunkOffset);
-      state = _keyframeState(decoded.ids, decoded.bins);
-    } else {
-      if (state == null) {
-        throw const FourdgsMalformedFile(
-          'a keyframe-delta chain begins with a delta chunk',
-        );
-      }
-      state = _composeDelta(
-        state,
-        parseDeltaChunk(content),
-        at: link.chunkOffset,
-      );
-    }
+    state = _composeLink(
+      state,
+      _recordContent(data, link.chunkOffset, link.chunkLength),
+      link,
+    );
   }
+  return _composed(state);
+}
+
+/// The same chain, fetched by byte range instead of from a resident file.
+///
+/// For the caller that has a [FourdgsReadable] and no reason to hold the file:
+/// a chain is a handful of records, and reading each one as the walk reaches it
+/// keeps a chunk resident rather than a scene (AGENTS.md §1). The states this
+/// composes are identical to [composeKeyframeDeltaChain]'s — same records, same
+/// order, same refusals — so the two are interchangeable and a caller picks by
+/// what it already holds.
+Future<KeyframeDeltaState> readKeyframeDeltaChain(
+  FourdgsReadable source,
+  List<FourdgsChunkIndexEntry> index,
+  FourdgsChunkIndexEntry entry, {
+  Map<int, FourdgsChunkIndexEntry>? byOffset,
+}) async {
+  final chain = chainFrom(index, entry, byOffset: byOffset);
+  KeyframeDeltaState? state;
+  for (final link in chain) {
+    final blob = await source.read(link.chunkOffset, link.chunkLength);
+    state = _composeLink(
+      state,
+      _recordContent(blob, 0, link.chunkLength),
+      link,
+    );
+  }
+  return _composed(state);
+}
+
+/// One link of a chain composed onto what came before it.
+KeyframeDeltaState _composeLink(
+  KeyframeDeltaState? state,
+  Uint8List content,
+  FourdgsChunkIndexEntry link,
+) {
+  if (link.kind == 0) {
+    final decoded = _keyframeFromChunk(content, at: link.chunkOffset);
+    return _keyframeState(decoded.ids, decoded.bins);
+  }
+  if (state == null) {
+    throw const FourdgsMalformedFile(
+      'a keyframe-delta chain begins with a delta chunk',
+    );
+  }
+  return _composeDelta(state, parseDeltaChunk(content), at: link.chunkOffset);
+}
+
+KeyframeDeltaState _composed(KeyframeDeltaState? state) {
   if (state == null) {
     throw const FourdgsMalformedFile('an empty keyframe-delta chain');
   }
   return state;
 }
+
+/// Index entries by the byte their chunk starts at, which is what a delta
+/// references (spec §11.8).
+///
+/// Built once and passed to [chainFrom] by a caller that walks more than one
+/// chain. Building it inside the walk is correct and is what a single lookup
+/// does; doing it once per entry of an index makes composing every chain cost
+/// `O(entries²)` map insertions before a single chunk is read, which a
+/// ten-thousand-entry index turns into hundreds of millions of them.
+Map<int, FourdgsChunkIndexEntry> keyframeDeltaChainIndex(
+  List<FourdgsChunkIndexEntry> index,
+) => <int, FourdgsChunkIndexEntry>{
+  for (final entry in index) entry.chunkOffset: entry,
+};
 
 /// State chunks tile the timeline: no overlap, no gap (spec §11.1). This is what
 /// makes the seek predicate a lookup rather than a search.
@@ -838,13 +941,15 @@ List<FourdgsChunkIndexEntry> chainFor(
 /// finite interval and no instant at all for `[0, +Infinity)`: the midpoint is
 /// `+Infinity`, `t < t1` is false there, and a file the streamed path decodes
 /// became one the indexed path could not find its way into.
+/// [byOffset] is the lookup [keyframeDeltaChainIndex] builds. Optional, and
+/// worth passing from a loop: without it every call rebuilds the map, which
+/// turns "walk each entry's chain" from linear into quadratic (AGENTS.md §4).
 List<FourdgsChunkIndexEntry> chainFrom(
   List<FourdgsChunkIndexEntry> index,
-  FourdgsChunkIndexEntry current,
-) {
-  final byOffset = <int, FourdgsChunkIndexEntry>{
-    for (final entry in index) entry.chunkOffset: entry,
-  };
+  FourdgsChunkIndexEntry current, {
+  Map<int, FourdgsChunkIndexEntry>? byOffset,
+}) {
+  final lookup = byOffset ?? keyframeDeltaChainIndex(index);
   final chain = <FourdgsChunkIndexEntry>[current];
   while (chain.first.kind != 0) {
     final head = chain.first;
@@ -854,7 +959,7 @@ List<FourdgsChunkIndexEntry> chainFrom(
         'which is not behind it; references point backwards only',
       );
     }
-    final reference = byOffset[head.referenceOffset];
+    final reference = lookup[head.referenceOffset];
     if (reference == null) {
       throw FourdgsMalformedFile(
         'the chunk at ${head.chunkOffset} references ${head.referenceOffset}, '

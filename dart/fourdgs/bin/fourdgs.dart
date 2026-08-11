@@ -152,11 +152,24 @@ Future<int> _inspect(
         .trimRight(),
   );
   final FourdgsCut? cut = inspection.walk.cut;
-  if (cut == null) return exitOk;
-  // The prefix was recovered and reported; the file is still not a whole one,
-  // and a pipeline that goes on to read it should not be told otherwise.
-  err('fourdgs: $path: truncated at byte ${cut.at}');
-  return exitRefused;
+  if (cut != null) {
+    // The prefix was recovered and reported; the file is still not a whole one,
+    // and a pipeline that goes on to read it should not be told otherwise.
+    err('fourdgs: $path: truncated at byte ${cut.at}');
+    return exitRefused;
+  }
+  // A file cut exactly at a record boundary — after its Footer, say — leaves the
+  // walk nothing to stop on: there are no bytes left, so there is no cut, and
+  // the only evidence is the eight bytes of magic that are not there. The table
+  // says so, and the exit code must too, or a script reading the code alone is
+  // told a truncated file inspected cleanly. `validate` calls the same file an
+  // error; one tool giving two verdicts on whether a file is whole is worse than
+  // either verdict.
+  if (!inspection.walk.trailingMagic) {
+    err('fourdgs: $path: the file does not end with the magic');
+    return exitRefused;
+  }
+  return exitOk;
 }
 
 Future<int> _validate(

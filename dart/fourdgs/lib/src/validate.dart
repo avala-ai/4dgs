@@ -130,12 +130,15 @@ String _say(Object error) =>
 
 /// Every check, in the Python validator's order.
 ///
-/// The file is read whole, as the Python, Rust, TypeScript and C++ validators
-/// read it: the summary checksum covers a byte range, the index points into one,
-/// and "is this file self-consistent" is a question about all of it at once. The
-/// bounded-memory rule is about decode paths, and the decode this performs —
-/// chunk by chunk, band by band, against [source] rather than against the copy
-/// below — keeps one of each resident at a time.
+/// Nothing here holds the file. The Python, Rust, TypeScript and C++ validators
+/// all take the whole thing as a byte array, and this one deliberately does not:
+/// it is the only one of the six whose entry point is a [FourdgsReadable], and a
+/// validator that reads a file to check a file is exactly the API AGENTS.md §1
+/// calls wrong. So the framing walk supplies the record table, each record's
+/// content is fetched by its own range when a check needs it, the summary
+/// checksum is run a block at a time, and the decode passes hold one chunk or
+/// one band. What a multi-gigabyte scene costs to validate is the largest single
+/// chunk in it.
 Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
   final _Report report = _Report();
   // Framing first, and for two reasons: it refuses a file that is not ours
@@ -148,7 +151,6 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
     report.refused('', error);
     return FourdgsValidation(report.findings);
   }
-  final Uint8List data = await source.read(0, walk.size);
 
   if (!walk.trailingMagic) {
     report.error(
@@ -166,6 +168,9 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
   int chunkCount = 0;
   int counted = 0;
   final List<FourdgsChunkIndexEntry> index = <FourdgsChunkIndexEntry>[];
+  // Where each entry's own Chunk Index record sits, so a finding about entry `i`
+  // names the byte the reader would name for the same fault.
+  final List<int> indexRecordOffsets = <int>[];
   final Map<int, FourdgsAudioSourceRecord> audioSources =
       <int, FourdgsAudioSourceRecord>{};
   final Map<int, int> audioData = <int, int>{};
@@ -176,16 +181,28 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
   bool frontMatterRefused = false;
 
   try {
-    for (final FourdgsRecord record in iterRecords(data, fourdgsMagic.length)) {
-      if (firstOpcode < 0) firstOpcode = record.opcode;
-      seen.add(record.opcode);
+    for (final FourdgsFrame frame in walk.records) {
+      // The record the file was cut inside. The walk lists it — the declared
+      // length that runs off the end is the whole fault — but there is nothing
+      // to parse, and the sentence is the one a cursor would have raised
+      // reading it, so the other validators' output is unchanged.
+      if (frame.offset + frame.total > walk.size) {
+        report.error(
+          'stopped reading: need ${frame.length} bytes at offset '
+          '${frame.offset + recordHeaderBytes}, '
+          '${walk.size - frame.offset - recordHeaderBytes} remain',
+        );
+        break;
+      }
+      if (firstOpcode < 0) firstOpcode = frame.opcode;
+      seen.add(frame.opcode);
       // A record whose own body will not parse is a finding rather than an
       // abort: the point of a validator is to say everything that is wrong with
       // a file, not the first thing.
-      switch (record.opcode) {
+      switch (frame.opcode) {
         case opHeader:
           try {
-            header = FourdgsHeader.parse(record.content);
+            header = FourdgsHeader.parse(await _bytesOf(source, frame));
           } on FourdgsException catch (error) {
             // Named against *this* Header, not against the first record with
             // this opcode. Nothing in the framing forbids a second one, and a
@@ -194,7 +211,7 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
             frontMatterRefused |= _refuse(
               report,
               error,
-              record.offset,
+              frame.offset,
               'the Header record',
               'Header does not parse: ',
             );
@@ -202,14 +219,14 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
         case opQuantization:
           try {
             quantization = FourdgsQuantization.parse(
-              record.content,
-              fileOffset: record.offset + recordHeaderBytes,
+              await _bytesOf(source, frame),
+              fileOffset: frame.offset + recordHeaderBytes,
             );
           } on FourdgsException catch (error) {
             frontMatterRefused |= _refuse(
               report,
               error,
-              record.offset,
+              frame.offset,
               'the Quantization record',
               'Quantization does not parse: ',
             );
@@ -219,7 +236,8 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
           // not report this record, and a finding it does not have is a
           // disagreement about a file.
           try {
-            windows = FourdgsWindowTable.parse(record.content).windows;
+            windows =
+                FourdgsWindowTable.parse(await _bytesOf(source, frame)).windows;
           } on FourdgsException catch (error) {
             report.error('Window Table does not parse: ${_say(error)}');
           }
@@ -227,9 +245,16 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
         case opDeltaChunk:
           firstChunkSeen = true;
           chunkCount += 1;
-          if (record.opcode == opChunk) {
+          if (frame.opcode == opChunk) {
             try {
-              counted += parseChunk(record.content).header.count;
+              // The first twenty-four bytes, not the record: a chunk is where a
+              // file keeps its weight, and all this pass wants from one is the
+              // count it declares. What is *in* it is checked by decoding it,
+              // one chunk at a time, further down.
+              counted +=
+                  parseChunkInterval(
+                    await _bytesOf(source, frame, most: chunkFixedHeadBytes),
+                  ).count;
             } on FourdgsException catch (error) {
               report.error('chunk $chunkCount does not parse: ${_say(error)}');
             }
@@ -238,23 +263,24 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
           try {
             index.add(
               FourdgsChunkIndexEntry.parse(
-                record.content,
-                fileOffset: record.offset + recordHeaderBytes,
+                await _bytesOf(source, frame),
+                fileOffset: frame.offset + recordHeaderBytes,
               ),
             );
+            indexRecordOffsets.add(frame.offset);
           } on FourdgsException catch (error) {
             report.error('a chunk index entry does not parse: ${_say(error)}');
           }
         case opFooter:
           try {
-            footer = FourdgsFooter.parse(record.content);
+            footer = FourdgsFooter.parse(await _bytesOf(source, frame));
           } on FourdgsException catch (error) {
             report.error('Footer does not parse: ${_say(error)}');
           }
         case opAudioSource:
           try {
             final FourdgsAudioSourceRecord parsed =
-                FourdgsAudioSourceRecord.parse(record.content);
+                FourdgsAudioSourceRecord.parse(await _bytesOf(source, frame));
             if (firstChunkSeen) {
               report.error(
                 'Audio Source id ${parsed.sourceId} appears after the first Chunk',
@@ -271,8 +297,12 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
           }
         case opAudioData:
           try {
-            final FourdgsAudioData parsed = FourdgsAudioData.parse(
-              record.content,
+            // The id and the declared payload length, not the payload: an
+            // embedded soundtrack is megabytes, and what this pass compares is
+            // the length against the Audio Source's.
+            final ({int sourceId, int length}) parsed = _audioDataHead(
+              await _bytesOf(source, frame, most: audioDataHeadBytes),
+              frame,
             );
             if (firstChunkSeen) {
               report.error(
@@ -284,13 +314,23 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
                 'Audio Data id ${parsed.sourceId} appears more than once',
               );
             }
-            audioData[parsed.sourceId] = parsed.data.length;
+            audioData[parsed.sourceId] = parsed.length;
           } on FourdgsException catch (error) {
             report.error('Audio Data does not parse: ${_say(error)}');
           }
         default:
-          _noteUnread(report, record);
+          _noteUnread(report, frame);
       }
+    }
+    // Bytes after the last whole record that are neither a record nor the
+    // closing magic. The same sentence the record iterator raises, because it is
+    // the same fault.
+    final FourdgsCut? trailing = walk.cut;
+    if (trailing != null && !trailing.insideARecord) {
+      report.error(
+        'stopped reading: ${walk.size - trailing.at} trailing bytes are '
+        'neither a record nor the closing magic',
+      );
     }
   } on FourdgsException catch (error) {
     report.error('stopped reading: ${_say(error)}');
@@ -387,14 +427,23 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
 
   for (int i = 0; i < index.length; i++) {
     final FourdgsChunkIndexEntry entry = index[i];
-    if (entry.chunkOffset + entry.chunkLength > data.length) {
+    // Two bounds, and the second is not implied by the first. A record needs a
+    // nine-byte header before it needs content, so an entry whose offset is the
+    // end of the file and whose length is zero satisfies "the range fits" while
+    // pointing at no byte at all — and reading the opcode there is an
+    // out-of-range crash rather than a finding, which is a validator that falls
+    // over on exactly the input it exists for.
+    if (entry.chunkOffset < 0 ||
+        entry.chunkLength < 0 ||
+        entry.chunkOffset + recordHeaderBytes > walk.size ||
+        entry.chunkOffset + entry.chunkLength > walk.size) {
       report.error('chunk index entry $i points past the end of the file');
       continue;
     }
     // A `keyframe-delta` file indexes both kinds: a Chunk is a keyframe and a
     // Delta Chunk is a difference against one, and an index that could only name
     // the former could not seek the model at all.
-    final int at = data[entry.chunkOffset];
+    final int at = (await source.read(entry.chunkOffset, 1))[0];
     if (at != opChunk && !(keyframeDelta && at == opDeltaChunk)) {
       report.error('chunk index entry $i does not point at a Chunk record');
     }
@@ -403,15 +452,16 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
   if (footer != null && footer.summaryCrc != 0 && footer.summaryStart != 0) {
     // The Footer record itself is not covered: nine bytes of framing plus its
     // twenty bytes of content plus the trailing magic.
-    final int tail =
-        data.length - (recordHeaderBytes + 20 + fourdgsMagic.length);
+    final int tail = walk.size - (recordHeaderBytes + 20 + fourdgsMagic.length);
     if (footer.summaryStart > tail) {
       report.error(
         "the Footer's summary starts at ${footer.summaryStart}, after the "
         'summary ends at $tail',
       );
-    } else if (fourdgsCrc32(
-          Uint8List.sublistView(data, footer.summaryStart, tail),
+    } else if (await fourdgsCrc32Range(
+          source,
+          footer.summaryStart,
+          tail - footer.summaryStart,
         ) !=
         footer.summaryCrc) {
       report.error(
@@ -443,12 +493,45 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
   }
 
   if (!frontMatterRefused) {
+    // Opening the file the way a seeking client would is itself a check, and it
+    // is the same check for both temporal models — the Footer is last, the tail
+    // is where the tail should be, and every index entry obeys §5.8. The
+    // keyframe-delta branch used to skip it and composed its chains straight
+    // from the framing, which meant a delta file with a record after its Footer,
+    // an unknown `chunk_kind` or a zero-width nonempty entry was reported valid
+    // while every reader in the repository refused it.
+    final FourdgsIndexedScene? scene;
+    try {
+      scene = await openFourdgsIndexed(source);
+    } on FourdgsException catch (error) {
+      report.refused(
+        'a seeking reader cannot open this file: ',
+        error,
+        walk: walk,
+      );
+      // A file that will not open will not decode either, and the second error
+      // would say the same thing about the same byte.
+      return FourdgsValidation(report.findings);
+    }
+    // The record families the framing walk steps over and a public decoder
+    // refuses: a truncated ObjectTrack or a malformed CoordinateFrame is a file
+    // `readFourdgsObjects` and `readFourdgsProvenance` decline, so a validator
+    // that only framed them would call it valid.
+    await _checkAuxiliaryRecords(source, scene, report);
     if (keyframeDelta) {
-      _checkKeyframeDelta(data, index, report);
+      await _checkKeyframeDelta(
+        source,
+        walk,
+        scene,
+        report,
+        windows: windows,
+        indexRecordOffsets: indexRecordOffsets,
+      );
     } else {
       await _checkGaussianBirth(
         source,
         walk,
+        scene,
         report,
         quantization: quantization,
         windows: windows,
@@ -458,6 +541,32 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
   }
 
   return FourdgsValidation(report.findings);
+}
+
+/// The object layer and the provenance family, parsed rather than framed.
+///
+/// `openFourdgsIndexed` frames these and remembers their byte ranges; their
+/// bodies are parsed only when a caller asks for them, which is what makes
+/// opening a scene with a thousand-sample rig trajectory cost nothing. A
+/// validator is that caller. Without this a file carrying a truncated
+/// ObjectTrack, two Object Tables, or a CoordinateFrame that will not parse gets
+/// a clean report from the tool and a refusal from the API — the two disagreeing
+/// about the same bytes.
+Future<void> _checkAuxiliaryRecords(
+  FourdgsReadable source,
+  FourdgsIndexedScene scene,
+  _Report report,
+) async {
+  try {
+    await readFourdgsProvenance(source, scene);
+  } on FourdgsException catch (error) {
+    report.error('the provenance records do not decode: ${_say(error)}');
+  }
+  try {
+    await readFourdgsObjects(source, scene);
+  } on FourdgsException catch (error) {
+    report.error('the object layer does not decode: ${_say(error)}');
+  }
 }
 
 /// Reports a record that would not parse, and says whether it was a refusal.
@@ -481,17 +590,18 @@ bool _refuse(
 }
 
 /// A record this validator reads nothing out of, and what to say about it.
-void _noteUnread(_Report report, FourdgsRecord record) {
+void _noteUnread(_Report report, FourdgsFrame frame) {
   final String hex =
-      '0x${record.opcode.toRadixString(16).padLeft(2, '0').toUpperCase()}';
-  if (isPrivateOpcode(record.opcode)) {
+      '0x${frame.opcode.toRadixString(16).padLeft(2, '0').toUpperCase()}';
+  if (isPrivateOpcode(frame.opcode)) {
     report.note(
-      'private record $hex (${record.content.length} bytes) — skipped, as required',
+      'private record $hex (${frame.length} bytes) — skipped, as required',
     );
-  } else if (isSpecifiedOpcode(record.opcode)) {
-    // A record this validator has nothing to say about — provenance, the object
-    // layer, a camera. Framed, stepped over, not remarked on.
-  } else if (isProvenanceOpcode(record.opcode)) {
+  } else if (isSpecifiedOpcode(frame.opcode)) {
+    // A record this pass has nothing to say about. The object layer and
+    // provenance are parsed below, from the ranges the indexed opener framed;
+    // a Camera, a Metadata record or an Attachment is framed and stepped over.
+  } else if (isProvenanceOpcode(frame.opcode)) {
     report.note(
       'reserved provenance record $hex — skipped, as required '
       '(0x26-0x2F, section 5.15.6)',
@@ -501,35 +611,69 @@ void _noteUnread(_Report report, FourdgsRecord record) {
   }
 }
 
-/// The checks only a reader can perform: open the file, then decode it.
+/// How much of an Audio Data record's content [_audioDataHead] needs: the `u32`
+/// source id and the `u64` length in front of the payload.
+const int audioDataHeadBytes = 12;
+
+/// An Audio Data record's id and declared payload length, without its payload.
+({int sourceId, int length}) _audioDataHead(
+  Uint8List head,
+  FourdgsFrame frame,
+) {
+  final FourdgsCursor cursor = FourdgsCursor(head);
+  final int sourceId = cursor.u32();
+  final int length = cursor.u64();
+  // What `blob()` would have refused when it went to take the payload, raised
+  // here instead so that the payload is never transferred to find it out.
+  if (length > frame.length - audioDataHeadBytes) {
+    throw FourdgsTruncatedFile(
+      'need $length bytes at offset $audioDataHeadBytes, '
+      '${frame.length - audioDataHeadBytes} remain',
+    );
+  }
+  return (sourceId: sourceId, length: length);
+}
+
+/// The content of [frame], or the first [most] bytes of it.
 ///
-/// Opening it the way a seeking client would is where the front-matter refusals
-/// fire. Decoding is where the rest do, and there is no substitute for it: the
-/// framing walk steps over a chunk by its declared length, so an unimplemented
-/// stream codec and an out-of-range window index are both invisible to
-/// everything above — and so is a spherical-harmonic band that will not decode,
-/// which is a whole record class a framing walk has nothing to say about.
+/// A record's declared length comes out of the file, so a corrupt or hostile one
+/// can name a length no machine has the memory for. The records this pass parses
+/// whole are front matter and are held to the same ceiling the indexed opener
+/// applies to them; the two records that can legitimately be enormous — a Chunk
+/// and an Audio Data payload — are read as fixed heads instead.
+Future<Uint8List> _bytesOf(
+  FourdgsReadable source,
+  FourdgsFrame frame, {
+  int? most,
+}) {
+  final int want = most == null || most > frame.length ? frame.length : most;
+  if (want > maxFrontMatterBytes) {
+    throw FourdgsMalformedFile(
+      'the ${opcodeName(frame.opcode)} record at byte ${frame.offset} declares '
+      '${fourdgsCommas(frame.length)} bytes, past the '
+      '${fourdgsCommas(maxFrontMatterBytes)}-byte ceiling this reader will hold '
+      'for one record',
+    );
+  }
+  return source.read(frame.offset + recordHeaderBytes, want);
+}
+
+/// The checks only a reader can perform: decode the file it just opened.
+///
+/// There is no substitute for decoding: the framing walk steps over a chunk by
+/// its declared length, so an unimplemented stream codec and an out-of-range
+/// window index are both invisible to everything above — and so is a
+/// spherical-harmonic band that will not decode, which is a whole record class a
+/// framing walk has nothing to say about.
 Future<void> _checkGaussianBirth(
   FourdgsReadable source,
   FourdgsWalk walk,
+  FourdgsIndexedScene scene,
   _Report report, {
   required FourdgsQuantization? quantization,
   required List<FourdgsWindow> windows,
   required double cutoff,
 }) async {
-  final FourdgsIndexedScene scene;
-  try {
-    scene = await openFourdgsIndexed(source);
-  } on FourdgsException catch (error) {
-    report.refused(
-      'a seeking reader cannot open this file: ',
-      error,
-      walk: walk,
-    );
-    // A file that will not open will not decode either, and the second error
-    // would say the same thing about the same byte.
-    return;
-  }
   if (scene.index.isEmpty) {
     await _scanFramedChunks(
       source,
@@ -558,30 +702,16 @@ Future<void> _checkGaussianBirth(
       );
       return;
     }
-    for (final FourdgsBandRange band in entry.bands) {
-      try {
-        decodeShBandRecord(
-          _content(await source.read(band.offset, band.length), opShBandStream),
-          expectedBand: band.band,
-          expectedCount: entry.gaussianCount,
-        );
-      } on FourdgsException catch (error) {
-        // The byte is in the sentence and not only on the refusal line beneath
-        // it, because most of the ways a band record can fail are not refusals
-        // the table names — a payload that will not inflate is a corrupt file,
-        // not an unimplemented rule — and a finding that says only "a band does
-        // not decode" leaves its holder to find which of a scene's bands it was.
-        report.refused(
-          'the ShBandStream record for band ${band.band} at byte '
-          '${fourdgsCommas(band.offset)} does not decode: ',
-          error,
-          site: FourdgsRefusalSite(
-            band.offset,
-            'the ShBandStream record for band ${band.band} of index entry $i',
-          ),
-        );
-        return;
-      }
+    // The count the index promised, which `readFourdgsChunk` has just checked
+    // the chunk's own header against.
+    if (await _checkBands(
+      source,
+      entry,
+      i,
+      report,
+      count: entry.gaussianCount,
+    )) {
+      return;
     }
   }
 }
@@ -660,16 +790,32 @@ Future<void> _scanFramedChunks(
 /// holds every composed state at once, where the question here is only "does it
 /// decode". So each chain is composed and dropped, which bounds the memory and —
 /// because the loop is over index entries — names the entry that failed.
-void _checkKeyframeDelta(
-  Uint8List data,
-  List<FourdgsChunkIndexEntry> index,
-  _Report report,
-) {
+///
+/// Three things the indexed reader checks that composing alone does not, and
+/// that a file therefore used to pass validation without: the population the
+/// index declares against the population the chunks compose to (§5.8), the
+/// spherical-harmonic bands the entry names, and the `window_index` every
+/// composed gaussian carries. The last is the one that reads as valid most
+/// convincingly: composition is arithmetic on bins and never looks a window up,
+/// so a file naming a window it does not carry composes without complaint and
+/// is refused the moment anything reconstructs it.
+Future<void> _checkKeyframeDelta(
+  FourdgsReadable source,
+  FourdgsWalk walk,
+  FourdgsIndexedScene scene,
+  _Report report, {
+  required List<FourdgsWindow> windows,
+  required List<int> indexRecordOffsets,
+}) async {
+  final List<FourdgsChunkIndexEntry> index = scene.index;
   if (index.isEmpty) {
-    // No index means no chain to walk by byte range, so the model's front-to-back
-    // reader is the only path there is.
+    // No index means no chain to walk by byte range, so the model's
+    // front-to-back reader is the only path there is — and it takes the file,
+    // because without an index there is nothing to address a chunk by. This is
+    // the one place this validator holds more than a chunk, and it holds it for
+    // a file that has already been reported as unseekable.
     try {
-      decodeKeyframeDeltaStreamed(data);
+      decodeKeyframeDeltaStreamed(await source.read(0, walk.size));
     } on FourdgsException catch (error) {
       report.refused('this file does not decode as keyframe-delta: ', error);
     }
@@ -681,21 +827,143 @@ void _checkKeyframeDelta(
     report.error('the state chunks do not tile the timeline: ${_say(error)}');
     return;
   }
+  // Built once. Every chain walk needs this lookup, and building it per entry is
+  // what makes validating a ten-thousand-entry index quadratic in the index
+  // before a single chunk is read (AGENTS.md §4).
+  final Map<int, FourdgsChunkIndexEntry> byOffset = keyframeDeltaChainIndex(
+    index,
+  );
   for (int i = 0; i < index.length; i++) {
+    final FourdgsChunkIndexEntry entry = index[i];
+    final String where =
+        i < indexRecordOffsets.length
+            ? 'the Chunk Index record at byte ${indexRecordOffsets[i]} '
+                '(entry $i of ${index.length})'
+            : 'chunk index entry $i';
     try {
-      composeKeyframeDeltaChain(data, index, index[i]);
+      final KeyframeDeltaState state = await readKeyframeDeltaChain(
+        source,
+        index,
+        entry,
+        byOffset: byOffset,
+      );
+      // §5.8 defines `live_count` for every extended entry as the population
+      // after composition, and the reference writers set it on keyframes too, so
+      // both counts are checked — the same two the indexed reader checks, in the
+      // same words, because a file the reader refuses and the validator passes
+      // is the pair disagreeing about one file.
+      if (entry.kind == 0 && entry.liveCount != state.count) {
+        report.error(
+          '$where declares live_count ${entry.liveCount} for a keyframe whose '
+          'chunk holds ${state.count} gaussians; expected the two to agree',
+        );
+      }
+      final int declared = indexEntryPopulation(entry, isKeyframeDelta: true);
+      if (state.count != declared) {
+        report.error(
+          '$where declares $declared live gaussians over [${entry.t0}, '
+          '${entry.t1}), but its chain composes to ${state.count}; expected the '
+          'index and the chunks to agree',
+        );
+      }
+      state.checkWindows(windows);
     } on FourdgsException catch (error) {
       report.refused(
         'a chunk does not compose: ',
         error,
         site: FourdgsRefusalSite(
-          index[i].chunkOffset,
+          entry.chunkOffset,
           'the Chunk record at index entry $i',
         ),
       );
       return;
     }
+    if (await _checkBands(source, entry, i, report)) return;
   }
+}
+
+/// The bands an index entry names, decoded one at a time. True when one refused.
+///
+/// Shared by both models: a band record is a whole record class the framing walk
+/// steps over, and a file whose band will not decode is a file every reader
+/// refuses and a framing validator calls valid — which is what a `keyframe-delta`
+/// file got here until this loop ran for it too.
+///
+/// The count a band must declare is the number of gaussians whose harmonics it
+/// carries: a keyframe chunk's own count, and a Delta Chunk's `birth_count`,
+/// since only a born gaussian brings harmonics with it (spec §11.5).
+Future<bool> _checkBands(
+  FourdgsReadable source,
+  FourdgsChunkIndexEntry entry,
+  int i,
+  _Report report, {
+  int? count,
+}) async {
+  if (entry.bands.isEmpty) return false;
+  final int expectedCount;
+  try {
+    expectedCount = count ?? await _bandPopulation(source, entry);
+  } on FourdgsException catch (error) {
+    report.refused(
+      'the chunk at byte ${fourdgsCommas(entry.chunkOffset)} does not say how '
+      'many gaussians its bands carry: ',
+      error,
+      site: FourdgsRefusalSite(
+        entry.chunkOffset,
+        'the Chunk record at index entry $i',
+      ),
+    );
+    return true;
+  }
+  for (final FourdgsBandRange band in entry.bands) {
+    try {
+      decodeShBandRecord(
+        _content(await source.read(band.offset, band.length), opShBandStream),
+        expectedBand: band.band,
+        expectedCount: expectedCount,
+      );
+    } on FourdgsException catch (error) {
+      // The byte is in the sentence and not only on the refusal line beneath
+      // it, because most of the ways a band record can fail are not refusals
+      // the table names — a payload that will not inflate is a corrupt file,
+      // not an unimplemented rule — and a finding that says only "a band does
+      // not decode" leaves its holder to find which of a scene's bands it was.
+      report.refused(
+        'the ShBandStream record for band ${band.band} at byte '
+        '${fourdgsCommas(band.offset)} does not decode: ',
+        error,
+        site: FourdgsRefusalSite(
+          band.offset,
+          'the ShBandStream record for band ${band.band} of index entry $i',
+        ),
+      );
+      return true;
+    }
+  }
+  return false;
+}
+
+/// How many gaussians the bands of [entry] carry harmonics for.
+Future<int> _bandPopulation(
+  FourdgsReadable source,
+  FourdgsChunkIndexEntry entry,
+) async {
+  if (entry.kind == 0) {
+    // Twenty-four bytes of the chunk's own head, not the chunk.
+    final int want =
+        entry.chunkLength - recordHeaderBytes < chunkFixedHeadBytes
+            ? entry.chunkLength - recordHeaderBytes
+            : chunkFixedHeadBytes;
+    return parseChunkInterval(
+      await source.read(entry.chunkOffset + recordHeaderBytes, want),
+    ).count;
+  }
+  return parseDeltaChunk(
+    _content(
+      await source.read(entry.chunkOffset, entry.chunkLength),
+      opDeltaChunk,
+    ),
+  ).header.birthCount;
 }
 
 /// One framed record's content, checked against the opcode it was fetched as.

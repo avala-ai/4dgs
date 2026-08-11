@@ -16,8 +16,7 @@
 /// answer that question by printing one line and throwing the rest away.
 library;
 
-import 'dart:typed_data';
-
+import 'exceptions.dart';
 import 'opcode.dart';
 import 'readable.dart';
 import 'records.dart';
@@ -54,7 +53,11 @@ class FourdgsSummaryCoverage {
 
 /// Every record a file frames, and what the summary checksum covers.
 class FourdgsInspection {
-  const FourdgsInspection({required this.walk, required this.coverage});
+  const FourdgsInspection({
+    required this.walk,
+    required this.coverage,
+    this.coverageError,
+  });
 
   final FourdgsWalk walk;
 
@@ -62,12 +65,32 @@ class FourdgsInspection {
   /// the file rather than a failure: writing one is an encoder option, and a file
   /// written without it has nothing here to verify.
   final FourdgsSummaryCoverage? coverage;
+
+  /// Why there is no [coverage] when the reason was a fault rather than a
+  /// choice: a Footer that frames cleanly and will not parse.
+  ///
+  /// Reported instead of thrown. The framing walk is the answer this command
+  /// exists to give, and a record that is itself malformed is exactly the case
+  /// its holder ran `inspect` for — throwing here would print no table at all
+  /// for the one file that most needs one.
+  final String? coverageError;
 }
 
 /// Frames every record, then checks the summary region the Footer declares.
 Future<FourdgsInspection> inspectFourdgs(FourdgsReadable source) async {
   final FourdgsWalk walk = await walkFourdgsFraming(source);
-  return FourdgsInspection(walk: walk, coverage: await _coverage(source, walk));
+  try {
+    return FourdgsInspection(
+      walk: walk,
+      coverage: await _coverage(source, walk),
+    );
+  } on FourdgsException catch (error) {
+    return FourdgsInspection(
+      walk: walk,
+      coverage: null,
+      coverageError: error.message,
+    );
+  }
 }
 
 Future<FourdgsSummaryCoverage?> _coverage(
@@ -87,14 +110,21 @@ Future<FourdgsSummaryCoverage?> _coverage(
   // The summary ends where the Footer begins — taken from the walk rather than
   // computed from a Footer's expected size, so a Footer that a later revision
   // extends does not move the region out from under the check.
-  final Uint8List summary = await source.read(
+  //
+  // Checked a block at a time. The region is whatever the Footer says it is, and
+  // a Footer is an untrusted field on a file this command is pointed at
+  // *because* it is suspect: `summary_start` just past the magic makes the
+  // region almost the whole file, and reading it in one allocation is a crafted
+  // Footer away from exhausting memory to check a checksum (AGENTS.md §1).
+  final int actual = await fourdgsCrc32Range(
+    source,
     footer.summaryStart,
     frame.offset - footer.summaryStart,
   );
   return FourdgsSummaryCoverage(
     start: footer.summaryStart,
     end: frame.offset,
-    ok: fourdgsCrc32(summary) == footer.summaryCrc,
+    ok: actual == footer.summaryCrc,
   );
 }
 
@@ -143,7 +173,13 @@ String formatFourdgsInspection(FourdgsInspection inspection) {
   } else if (!walk.trailingMagic) {
     out.writeln('note: the file does not end with the magic');
   }
-  if (coverage == null) {
+  final String? coverageError = inspection.coverageError;
+  if (coverageError != null) {
+    out.writeln(
+      'crc: the Footer frames cleanly but does not parse ($coverageError), so '
+      'nothing here could be checked',
+    );
+  } else if (coverage == null) {
     out.writeln(
       'crc: this file declares no summary checksum, so nothing here is covered',
     );
@@ -177,7 +213,11 @@ String formatFourdgsInspectionJson(FourdgsInspection inspection) {
     out.writeln('  "stopped": ${_jsonString(cut.reason)},');
     out.writeln('  "truncated_at": ${cut.at},');
   }
-  if (coverage == null) {
+  final String? coverageError = inspection.coverageError;
+  if (coverageError != null) {
+    out.writeln('  "summary_crc": null,');
+    out.writeln('  "summary_crc_error": ${_jsonString(coverageError)},');
+  } else if (coverage == null) {
     out.writeln('  "summary_crc": null,');
   } else {
     out.writeln(
