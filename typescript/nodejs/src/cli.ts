@@ -23,7 +23,7 @@
 
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { FourdgsError } from "@4dgs/core";
+import { FourdgsError, MAGIC, checkMagic } from "@4dgs/core";
 import { FileHandleReadable } from "./index.js";
 import { inspectFile, type InspectedRecord, type InspectReport } from "./inspect.js";
 import { validateFile, type Report } from "./validate.js";
@@ -270,6 +270,18 @@ async function inspectText(source: FileHandleReadable, sink: Sink): Promise<Insp
 }
 
 async function inspectJson(source: FileHandleReadable, sink: Sink): Promise<InspectReport> {
+  // `inspectFile` throws on bad magic because there are no 4DGS records to walk. Perform
+  // that preflight before opening the JSON document so a normal file refusal cannot leave
+  // an unterminated fragment on stdout. The size guard mirrors inspectFile's only other
+  // pre-record failure and keeps the same guarantee for an unaddressable resource.
+  const size = await source.size();
+  if (size > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new RangeError(
+      `resource size ${size} exceeds the largest exactly addressable size ` +
+        `${Number.MAX_SAFE_INTEGER} in this implementation`,
+    );
+  }
+  checkMagic(await source.read(0n, BigInt(Math.min(MAGIC.length, Number(size)))));
   sink.out('{"records":[');
   let first = true;
   const report = await inspectFile(source, (record) => {

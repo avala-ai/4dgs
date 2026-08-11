@@ -364,6 +364,12 @@ export class IndexedDecoder {
         throw new MalformedFile(`Audio Data id ${sourceId} has no matching Audio Source record`);
       }
     }
+    const discoveredAudio = legacyAudio !== null || sourceRanges.size > 0 || dataRanges.size > 0;
+    if (!header.hasAudio && discoveredAudio) {
+      throw new MalformedFile(
+        "the Header audio flag is clear, but the file contains an Audio record",
+      );
+    }
     if (deferredDiscoveryComplete && header.hasAudio !== audioSources.length > 0) {
       throw new MalformedFile(
         `the Header audio flag is ${header.hasAudio ? "set" : "clear"}, but the file contains ` +

@@ -252,6 +252,7 @@ export async function validateFile(
     readonly windows: Float64Array;
   } | null = null;
   let decodeOptionsFrozen = false;
+  let deferChunkDecode = false;
 
   try {
     for await (const framed of scanner.records(MAGIC.length)) {
@@ -397,12 +398,21 @@ export async function validateFile(
           physicalBands.set(offset, []);
           currentChunkOffset = offset;
           firstChunkSeen = true;
-          if (!decodeOptionsFrozen) {
-            frozenDecodeOptions =
-              header === null || quantization === null
-                ? null
-                : { header, quantization, windows: windows ?? new Float64Array(0) };
-            decodeOptionsFrozen = true;
+          if (options.decode === true && !decodeOptionsFrozen && !deferChunkDecode) {
+            if (header === null || quantization === null) {
+              // Record order is intentionally loose: only Header, Footer, and the summary
+              // have normative positions. Once one Chunk arrives before its decode grid,
+              // decode every Chunk in a second bounded pass after the walk has found that
+              // grid. Freezing `null` here used to skip every stream in the file.
+              deferChunkDecode = true;
+            } else {
+              frozenDecodeOptions = {
+                header,
+                quantization,
+                windows: windows ?? new Float64Array(0),
+              };
+              decodeOptionsFrozen = true;
+            }
           }
           chunkCount += 1;
           let parsed;
@@ -437,10 +447,7 @@ export async function validateFile(
             ordinal: physicalChunkOffsets.length,
             count: parsed.header.count,
             bands: new Map<number, Int32Array>(),
-            decoded:
-              options.decode === true &&
-              parsed.header.count > 0 &&
-              activeHeader?.temporalModel === "keyframe-delta",
+            decoded: options.decode === true,
           };
           if (Number.isNaN(parsed.header.t0) || Number.isNaN(parsed.header.t1)) {
             found.error(
@@ -465,6 +472,7 @@ export async function validateFile(
           }
           if (
             options.decode === true &&
+            !deferChunkDecode &&
             frozenDecodeOptions !== null &&
             frozenDecodeOptions.header.temporalModel !== "keyframe-delta"
           ) {
@@ -513,7 +521,7 @@ export async function validateFile(
             ordinal: physicalChunkOffsets.length,
             count: parsed.header.birthCount,
             bands: new Map<number, Int32Array>(),
-            decoded: options.decode === true && parsed.header.birthCount > 0,
+            decoded: options.decode === true,
           };
           if (header !== null && header.temporalModel !== "keyframe-delta") {
             found.error(
@@ -770,6 +778,24 @@ export async function validateFile(
   if (decodedShChunk !== null) {
     finalizeDecodedShChunk(decodedShChunk, decodedShDegrees, found);
     decodedShChunk = null;
+  }
+
+  if (
+    options.decode === true &&
+    deferChunkDecode &&
+    header !== null &&
+    quantization !== null &&
+    header.temporalModel !== "keyframe-delta"
+  ) {
+    await decodeGaussianBirthChunks(
+      source,
+      size,
+      header,
+      quantization,
+      windows ?? new Float64Array(0),
+      physicalChunks,
+      found,
+    );
   }
 
   // Decoding each SH stream proves only its framing and codec. The decoded values become
@@ -1336,12 +1362,67 @@ function finalizeDecodedShChunk(
   found: Findings,
 ): void {
   if (chunk === null || !chunk.decoded) return;
+  // An update-only or death-only delta has no born coefficients to infer a degree from.
+  // It may therefore omit bands, but a band that is physically present still has to
+  // assemble against birth_count=0 instead of disappearing behind that inference rule.
+  if (chunk.count === 0 && chunk.bands.size === 0) return;
   try {
     // Keep only the scalar degree. The decoded coefficient arrays can be several times
     // larger than their compressed streams and must die with this chunk.
-    degrees.add(mergeBands(chunk.count, chunk.bands, MAX_SH_DEGREE).degree);
+    const degree = mergeBands(chunk.count, chunk.bands, MAX_SH_DEGREE).degree;
+    if (chunk.count > 0) degrees.add(degree);
   } catch (error) {
     found.error(`chunk ${chunk.ordinal} SH bands do not assemble: ${message(error)}`);
+  }
+}
+
+/**
+ * Decode gaussian-birth streams after a late Quantization record was discovered.
+ *
+ * The pass retains no Chunk bodies: each record is parsed, decoded, and released before
+ * the next framing header is read. `knownChunks` also prevents a record that failed the
+ * structural pass from producing the same parse finding twice.
+ */
+async function decodeGaussianBirthChunks(
+  source: IReadable,
+  size: number,
+  header: Header,
+  quantization: Quantization,
+  windows: Float64Array,
+  knownChunks: ReadonlyMap<number, unknown>,
+  found: Findings,
+): Promise<void> {
+  const scanner = new FrontMatterScanner(source, size, VALIDATION_PROBE_BYTES);
+  let ordinal = 0;
+  try {
+    for await (const framed of scanner.records(MAGIC.length)) {
+      if (framed.opcode === Opcode.DeltaChunk) {
+        ordinal += 1;
+        continue;
+      }
+      if (framed.opcode !== Opcode.Chunk) continue;
+      ordinal += 1;
+      if (!knownChunks.has(framed.offset)) continue;
+      try {
+        const parsed = parseChunk(await scanner.content(framed));
+        const bytes = await chunkStreamBytes(parsed, DEFAULT_CODECS);
+        await decodeChunkStreams(bytes, parsed.header.count, {
+          steps: stepsFrom(quantization),
+          posOrigin: quantization.posOrigin,
+          windows: windowTableOrDefault(windows),
+          supportK: supportK(header.cutoff || DEFAULT_CUTOFF),
+          codecs: DEFAULT_CODECS,
+        });
+      } catch (error) {
+        found.error(`chunk ${ordinal} does not decode: ${message(error)}`);
+        found.refuse(error, framed.offset, "the Chunk record");
+      }
+    }
+  } catch (error) {
+    if (error instanceof RangeError) throw error;
+    // The structural pass already names the framing problem. This sentence distinguishes
+    // a failed second pass without turning a file verdict into an uncaught tool failure.
+    found.error(`stopped deferred chunk decoding: ${message(error)}`);
   }
 }
 

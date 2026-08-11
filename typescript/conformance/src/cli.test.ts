@@ -344,6 +344,23 @@ test("end to end: every deliberately broken file is refused by identifier and by
   }
 });
 
+test("regression: inspect --json preflights magic before writing stdout", async () => {
+  const badMagic = MAGIC.slice();
+  badMagic[0] ^= 0xff;
+  const futureMajor = MAGIC.slice();
+  futureMajor[5] += 1;
+
+  for (const [name, bytes] of [
+    ["BadMagic.4dgs", badMagic],
+    ["FutureMajor.4dgs", futureMajor],
+  ] as const) {
+    const inspected = await run("inspect", file(name, bytes), "--json");
+    assert.equal(inspected.code, EXIT_FAILED);
+    assert.deepEqual(inspected.out, [], `${name} emitted partial JSON`);
+    assert.ok(inspected.err.some((line) => line.startsWith("4dgs: ")));
+  }
+});
+
 test("end to end: a conforming file, a warned file and a broken one, from a shell", (t) => {
   // The three exit codes a script branches on, from the executable itself. `run` cannot
   // prove any of them: it returns what `main` computed, not what the process reported.
@@ -596,6 +613,16 @@ test("regression: an SH band immediately after a Delta Chunk belongs to that sta
     report.findings.map((finding) => finding.message).join("\n"),
   );
 
+  const assembled = await validateFile(splice(deltaFile, delta.offset + delta.length, bandRecord), {
+    decode: true,
+  });
+  assert.ok(
+    assembled.findings.some((finding) =>
+      finding.message.includes("chunk 2 SH bands do not assemble"),
+    ),
+    assembled.findings.map((finding) => finding.message).join("\n"),
+  );
+
   const badCodec = bandRecord.slice();
   badCodec[RECORD_HEADER_BYTES + 1 + 3] = 9;
   const badCodecAt = delta.offset + delta.length;
@@ -610,6 +637,35 @@ test("regression: an SH band immediately after a Delta Chunk belongs to that sta
     nested.findings.some((finding) => finding.message.includes("declares nested attribute_id 0")),
     nested.findings.map((finding) => finding.message).join("\n"),
   );
+});
+
+test("regression: --decode revisits Chunks that precede Quantization", async (t) => {
+  const variant = "invalid/UnknownStreamCodec";
+  if (corpus(variant) === null) return t.skip("corpus not generated");
+  const original = bytesOf(variant);
+  const records = recordsOf(original);
+  const quantization = records.find((record) => record.opcode === Opcode.Quantization)!;
+  const firstChunk = records.find((record) => record.opcode === Opcode.Chunk)!;
+  const quantizationRecord = original.slice(
+    quantization.offset,
+    quantization.offset + quantization.length,
+  );
+  const withoutQuantization = new Uint8Array(original.length - quantization.length);
+  withoutQuantization.set(original.subarray(0, quantization.offset));
+  withoutQuantization.set(
+    original.subarray(quantization.offset + quantization.length),
+    quantization.offset,
+  );
+  const shiftedChunkOffset = firstChunk.offset - quantization.length;
+  const late = splice(
+    withoutQuantization,
+    shiftedChunkOffset + firstChunk.length,
+    quantizationRecord,
+  );
+
+  const report = await validateFile(late, { decode: true });
+  assert.equal(report.refused?.code, "unknown-stream-codec");
+  assert.equal(report.refused?.at, shiftedChunkOffset);
 });
 
 test("regression: keyframe-delta index metadata is checked without and with decoding", async () => {
@@ -1447,6 +1503,16 @@ test("regression: indexed opening discovers legal legacy Audio after a Chunk", a
   audio.set(new TextEncoder().encode("wav"), 4);
   audioView.setFloat64(7, 0, true);
   audioView.setBigUint64(15, 0n, true);
+  const firstChunk = recordsOf(original).find((record) => record.opcode === Opcode.Chunk)!;
+  const earlyAudioWithClearFlag = splice(
+    original.slice(),
+    firstChunk.offset,
+    framedRecord(Opcode.Audio, audio),
+  );
+  await assert.rejects(
+    () => IndexedDecoder.open(new BytesReadable(earlyAudioWithClearFlag), { headProbeBytes: 64 }),
+    /Header audio flag is clear.*Audio record/,
+  );
   const records = [
     MAGIC,
     ...kept,
