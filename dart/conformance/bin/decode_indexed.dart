@@ -76,10 +76,29 @@ Future<String> run(String path) async {
               <Map<int, Uint8List>>[for (final c in chunks) c.shBands],
             );
 
+    final whole = assembleGaussians(chunks, scene.header.shDegree, sh: sh);
+
+    // Everything above this line assembles the whole scene, which is exactly why
+    // it cannot see a gaussian filed in the wrong chunk: the summary carries it
+    // anyway, and both read paths agree about it. This selects instead — only
+    // the entries covering an instant — and requires the state they give to be
+    // the state the whole scene gives. A partition that loses a gaussian from a
+    // seek fails here and nowhere else.
+    //
+    // On a multi-chunk file it must actually run: a check whose every probe was
+    // skipped is a check that reported success without executing.
+    final probes = await checkSeekReadsOnlyWhatItNeeds(source, scene, whole);
+    if (scene.index.length >= 2 && whole.count > 0 && probes == 0) {
+      throw ConformanceFailure(
+        'a ${scene.index.length}-chunk file yielded no usable seek probe; the '
+        'check reported success without running',
+      );
+    }
+
     return canonical(
       summarize(
         header: scene.header,
-        gaussians: assembleGaussians(chunks, scene.header.shDegree, sh: sh),
+        gaussians: whole,
         audioSources: audioSources,
         chunkIntervals: <(double, double)>[
           for (final e in scene.index) (e.t0, e.t1),

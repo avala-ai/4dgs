@@ -1,16 +1,19 @@
 // Copyright 2026 Avala AI
 // SPDX-License-Identifier: Apache-2.0
 
-/// The two things the canonical JSON cannot say.
+/// The things the canonical JSON cannot say.
 ///
 /// Every other row in the feature matrix is proved by a summary matching an
-/// expectation. These two are not, and cannot be: a cut file is a *different*
-/// file, so no expectation describes it; and never transferring a band you will
-/// not evaluate is a fact about the transport, not about any decoded value. So
-/// the checks live in the runner, where a failure exits non-zero and the harness
+/// expectation. These are not, and cannot be: a cut file is a *different* file,
+/// so no expectation describes it; never transferring a band you will not
+/// evaluate is a fact about the transport, not about any decoded value; and a
+/// *selective* seek is a fact about which chunks were read, which a summary
+/// assembled from all of them cannot distinguish from a wrong partition. So the
+/// checks live in the runner, where a failure exits non-zero and the harness
 /// reports it like a diff.
 library;
 
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:fourdgs/fourdgs.dart';
@@ -129,4 +132,138 @@ Future<void> checkBandRangeSkipping(
       }
     }
   }
+}
+
+/// Asserts that a seek reads the chunks an instant needs — and that they hold
+/// every gaussian visible at it.
+///
+/// This is the check the canonical summary cannot make, and the reason is worth
+/// stating plainly: both runners assemble the **whole** scene. The indexed one
+/// walks every index entry and concatenates the result, so a gaussian filed in
+/// the wrong chunk still appears in its summary, at the same values, and the two
+/// read paths still agree. What such a file loses is the only thing an index is
+/// for — a seek at an instant returns a scene missing gaussians that were
+/// visible at it — and nothing in a whole-scene comparison can see that.
+///
+/// So this selects. For each probe instant it reads only the entries whose
+/// half-open interval contains it, reconstructs state at that instant from those
+/// chunks alone, and requires it to equal the state the whole scene gives. That
+/// is the seek contract stated as an equality, rather than as a property of the
+/// writer that has to be re-derived.
+///
+/// **Probes near a chunk boundary are skipped, and the guard is derived from the
+/// file rather than chosen.** The partition is planned on the encoder's input
+/// support while a reader sees the *reconstructed* support, so a gaussian may
+/// sit a little outside its own chunk's interval — by at most half its own
+/// `mu_t` pitch plus `k` times its `sigma_t` quantization error, both of which
+/// this file declares. Within that distance of a boundary the answer is
+/// genuinely ambiguous and the check would be asserting the writer's rounding
+/// rather than its filing. Past it, nothing excuses a missing gaussian.
+///
+/// The number of probes that ran is returned so a caller can insist some did. A
+/// guard that swallowed every instant would otherwise leave this reporting
+/// success for a check that never executed, which is the failure mode every
+/// self-skipping test has.
+Future<int> checkSeekReadsOnlyWhatItNeeds(
+  CountingReadable source,
+  FourdgsIndexedScene scene,
+  FourdgsGaussianSet whole,
+) async {
+  final index = scene.index;
+  if (index.length < 2 || whole.count == 0) return 0;
+
+  // How far from a boundary a gaussian may legitimately sit on the far side of
+  // it. Per gaussian, out of the record's own pitches.
+  final quantization = scene.quantization;
+  final k = supportK(scene.header.cutoff);
+  final sigmaLog = quantization.stepSigmaLog;
+  final sigmaHalfRelative = math.exp(0.5 * sigmaLog) - 1.0;
+  double guard = 0.0;
+  for (int i = 0; i < whole.count; i++) {
+    final sigma = whole.sigmaT[i];
+    final neverFades = !sigma.isFinite;
+    // A never-fading gaussian's support is its validity window, and the Window
+    // Table stores that verbatim: nothing about it was rounded.
+    final sigmaBin =
+        neverFades ? 0 : (math.log(math.max(sigma, 1e-30)) / sigmaLog).round();
+    final mu = muStep(sigmaBin, sigmaLog, neverFades, quantization.stepTime);
+    final slack = 0.5 * mu + (neverFades ? 0.0 : k * sigma * sigmaHalfRelative);
+    if (slack.isFinite && slack > guard) guard = slack;
+  }
+
+  final boundaries =
+      <double>{
+          for (final entry in index) ...<double>[entry.t0, entry.t1],
+        }.toList()
+        ..sort();
+
+  int probed = 0;
+  for (final entry in index) {
+    final span = entry.t1 - entry.t0;
+    if (!span.isFinite || span <= 0.0) continue;
+    for (final fraction in const <double>[0.13, 0.37, 0.61, 0.89]) {
+      final t = entry.t0 + fraction * span;
+      if (!t.isFinite) continue;
+      var tooClose = false;
+      for (final boundary in boundaries) {
+        if ((t - boundary).abs() <= guard) {
+          tooClose = true;
+          break;
+        }
+      }
+      if (tooClose) continue;
+
+      final selected = <FourdgsChunkIndexEntry>[
+        for (final candidate in index)
+          if (candidate.t0 <= t && t < candidate.t1) candidate,
+      ];
+      if (selected.isEmpty) {
+        throw ConformanceFailure(
+          'no chunk index entry covers t=$t, which lies inside '
+          '[${entry.t0}, ${entry.t1})',
+        );
+      }
+      final chunks = <FourdgsDecodedChunk>[
+        for (final e in selected)
+          await readFourdgsChunk(source, scene, e, maxShBand: 0),
+      ];
+      final fromSeek = _visibleKeys(
+        assembleGaussians(chunks, 0),
+        t,
+        scene.header.cutoff,
+      );
+      final fromWhole = _visibleKeys(whole, t, scene.header.cutoff);
+      if (fromSeek.length != fromWhole.length ||
+          !_sameKeys(fromSeek, fromWhole)) {
+        throw ConformanceFailure(
+          'a seek at t=$t read ${selected.length} of ${index.length} chunks and '
+          'found ${fromSeek.length} visible gaussians; the whole scene has '
+          '${fromWhole.length} visible there',
+        );
+      }
+      probed++;
+    }
+  }
+  return probed;
+}
+
+/// Reconstructed state at [t] as sorted keys, so two orderings of one answer
+/// compare equal — a chunk's members are Morton-ordered and a selection of
+/// chunks concatenates in index order, and neither is part of the claim.
+List<String> _visibleKeys(FourdgsGaussianSet g, double t, double cutoff) {
+  final state = g.stateAt(t, cutoff: cutoff);
+  final keys = <String>[
+    for (int j = 0; j < state.count; j++)
+      '${state.centers[j * 3]},${state.centers[j * 3 + 1]},'
+          '${state.centers[j * 3 + 2]},${state.opacity[j]}',
+  ];
+  keys.sort();
+  return keys;
+}
+
+bool _sameKeys(List<String> a, List<String> b) {
+  for (int i = 0; i < a.length; i++) {
+    if (a[i] != b[i]) return false;
+  }
+  return true;
 }

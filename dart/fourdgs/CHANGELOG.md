@@ -26,7 +26,21 @@ happened.
   gaussian goes in the deepest node whose interval fully contains its support, so it is stored
   exactly once however long it lives, and a reader that wants one instant fetches the nodes covering
   it instead of the scene. `maxDepth` and `minChunkGaussians` control the shape; a node too small to
-  be worth its own chunk hands its gaussians back to its parent. Planning costs `O(n log n)` in the
+  be worth its own chunk hands its gaussians back to its parent. A node whose midpoint has run out of
+  doubles — an interval can exhaust `double` before it exhausts the depth limit — is a leaf, because
+  the alternative is a nonempty chunk over a zero-width interval that no seek can ever select. And a
+  partition finer than the `262144` entries an indexed reader will open is refused by name rather
+  than written: the top level is the window table, so a scene giving every gaussian its own validity
+  window sets the floor on the entry count, and the resulting file would be one only the streamed
+  path could read.
+- The Dart indexed conformance runner now makes a **selective** seek on every variant it decodes, not
+  only a whole-scene assembly. For probe instants away from a chunk boundary it reads just the
+  entries whose interval covers the instant and requires the state they reconstruct to equal the
+  state the whole scene gives. This is the claim the canonical summary cannot make: a gaussian filed
+  in the wrong chunk still appears in a whole-scene summary, at the same values, with both read paths
+  agreeing — and is simply missing from a seek. The guard around a boundary is derived from the
+  file's own declared pitches, and the number of probes that ran is asserted, so a guard that
+  swallowed every instant is a failure rather than a green check that never executed. Planning costs `O(n log n)` in the
   gaussian count and not `O(n²)`: a scene that gives every gaussian its own validity window has as
   many top-level intervals as gaussians, and each gaussian finds its interval by binary search over
   the split points rather than by every interval being offered every gaussian.

@@ -31,6 +31,7 @@ import 'package:archive/archive.dart' as archive;
 
 import 'chunk_decoder.dart' show shBandRange;
 import 'exceptions.dart';
+import 'indexed_reader.dart' show maxChunkIndexEntries;
 import 'model.dart';
 import 'opcode.dart';
 import 'quantization.dart';
@@ -237,6 +238,26 @@ void writeFourdgsToSink(
   // strictly inside the clip is a split point; the ends are always present.
   final tops = _tops(windows.windows, durationSec);
   final plans = _planChunks(gaussians, tops, options);
+
+  // The index this partition would produce has to be one this package's own
+  // indexed reader will open. `openFourdgsIndexed` stops at
+  // `maxChunkIndexEntries` — the index has no declared count, so a runaway one
+  // is caught by a ceiling rather than by arithmetic — and the top level of the
+  // tree is the window table, so a scene giving every gaussian its own validity
+  // window produces one entry per window whatever `minChunkGaussians` says. Past
+  // the ceiling the file is still a legal stream, and it is one only the
+  // front-to-back path can read: the seeking path, which is the entire reason to
+  // write an index, refuses it. Saying so here names the count and the ceiling;
+  // `writeIndex: false` writes the same chunks without the claim.
+  if (options.writeIndex && plans.length > maxChunkIndexEntries) {
+    throw FourdgsInvalidInput(
+      'this scene partitions into ${plans.length} chunks, past the '
+      '$maxChunkIndexEntries entries an indexed reader will open — the top '
+      'level of the tree is the window table, so distinct validity windows set '
+      'the floor on the entry count; write fewer windows, or write this scene '
+      'with writeIndex: false',
+    );
+  }
 
   final bands = _bandColumns(gaussians, options.shBands);
 
@@ -1196,6 +1217,16 @@ List<_Plan> _planChunks(
   List<int> descend(double a, double b, int level, List<int> pool) {
     if (pool.isEmpty || level >= options.maxDepth) return pool;
     final mid = 0.5 * (a + b);
+    // An interval can run out of doubles before it runs out of depth. Adjacent
+    // `float32` window bounds near 1.0 are about 1.2e-7 apart and collapse after
+    // roughly twenty-nine bisections, well inside the depth ceiling of 32 — and
+    // once `mid == a`, a gaussian whose support is a single instant at `a` goes
+    // left at every remaining level and comes to rest in a node spanning
+    // `[a, a)`. That chunk is nonempty over a zero-width interval: the seek rule
+    // is half-open, so nothing can ever select it, and `FourdgsChunkIndexEntry`
+    // in this same package refuses to parse it. A node that cannot be halved is
+    // a leaf, which is the answer whatever the depth limit says.
+    if (!(mid > a && mid < b)) return pool;
     final stay = <int>[];
     final left = <int>[];
     final right = <int>[];

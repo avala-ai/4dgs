@@ -877,6 +877,71 @@ void main() {
       writeSummaryOffsets: true,
     );
 
+    // NOT a proof of the unsplittable-midpoint guard in `descend`. It was
+    // written to be one — two adjacent float32 window bounds, a gaussian whose
+    // support is the single instant at the upper end, `maxDepth: 32` — on the
+    // reasoning that bisecting a 1.19e-7 interval collapses `mid` onto an
+    // endpoint after about twenty-nine halvings and the gaussian then comes to
+    // rest in a node spanning `[b, b)`. Removing the guard leaves this test
+    // green, so whatever this scene does, it does not reach that path, and the
+    // guard is unproven defence in depth rather than a pinned fix. What the test
+    // does earn: a partition over an interval this narrow still produces a file
+    // both read paths accept, and no nonempty chunk over a zero-width interval.
+    test(
+      'a window narrower than the depth limit still writes a readable file',
+      () {
+        final lo = Float32List.fromList(<double>[1.0])[0];
+        final hi = Float32List.fromList(<double>[1.0000001])[0];
+        expect(hi, greaterThan(lo), reason: 'the two bounds must differ');
+        expect(
+          (hi - lo) / lo,
+          lessThan(2e-7),
+          reason: 'and be adjacent float32 values, or nothing collapses',
+        );
+
+        const count = 4;
+        final scene = FourdgsGaussianSet(
+          positions: Float32List(count * 3),
+          scales: Float32List(count * 3)..fillRange(0, count * 3, 1e-3),
+          rotations: Float32List.fromList(<double>[
+            for (int i = 0; i < count; i++) ...<double>[0.0, 0.0, 0.0, 1.0],
+          ]),
+          colors: Float32List(count * 4),
+          motions: Float32List(count * 3),
+          // Support is the single instant `hi`: `sigma_t = 0` widens it by
+          // nothing, and the validity window clips it to itself. The preceding
+          // interval `[0, lo]` does not contain it, so it lands in the narrow one.
+          muT: Float32List(count)..fillRange(0, count, hi),
+          sigmaT: Float32List(count),
+          winLo: Float32List(count)..fillRange(0, count, lo),
+          winHi: Float32List(count)..fillRange(0, count, hi),
+        );
+
+        final bytes = writeFourdgsBytes(
+          scene,
+          2.0,
+          options: const FourdgsWriteOptions(
+            maxDepth: 32,
+            minChunkGaussians: 1,
+          ),
+        );
+        // The file has to be readable at all, which is the finding: the index
+        // parser refuses a nonempty entry over a zero-width interval.
+        final decoded = readFourdgsBytes(bytes);
+        expect(decoded.gaussians.count, count);
+        for (final entry in decoded.chunkIndex) {
+          if (entry.gaussianCount == 0) continue;
+          expect(
+            entry.t1,
+            greaterThan(entry.t0),
+            reason:
+                'a nonempty chunk over [${entry.t0}, ${entry.t1}) is '
+                'unreachable by any seek',
+          );
+        }
+      },
+    );
+
     test('a partitioned timeline produces more than one chunk', () {
       final scene = buildScene(count: 512, windows: 8);
       final decoded = readFourdgsBytes(
@@ -1139,11 +1204,18 @@ void main() {
         );
         final decoded = readFourdgsBytes(bytes);
         expect(decoded.header.shDegree, cap, reason: 'shBands: $cap');
+        // Every chunk carries its own band records, so the file's total is
+        // `bands * chunks` and the per-chunk count is what `cap` bounds. Both
+        // are asserted: the index says how many bands each chunk has, and the
+        // record count says the file holds exactly those and no others.
         final bands =
             recordsOf(
               bytes,
             ).where((FourdgsRecord r) => r.opcode == opShBandStream).length;
-        expect(bands, cap, reason: 'shBands: $cap');
+        expect(bands, cap * decoded.chunkIndex.length, reason: 'shBands: $cap');
+        for (final entry in decoded.chunkIndex) {
+          expect(entry.bands.length, cap, reason: 'shBands: $cap');
+        }
         // The two have to agree with each other, which is the whole point: a
         // reader sizes the coefficient row from the degree.
         expect(
@@ -1334,11 +1406,15 @@ void main() {
       final decoded = readFourdgsBytes(bytes);
       expect(decoded.header.shDegree, 2);
       expect(decoded.gaussians.shCoefficients, 8);
+      // Two bands per chunk, whatever the partition turned out to be.
+      for (final entry in decoded.chunkIndex) {
+        expect(entry.bands.length, 2);
+      }
       expect(
         recordsOf(
           bytes,
         ).where((FourdgsRecord r) => r.opcode == opShBandStream).length,
-        2,
+        2 * decoded.chunkIndex.length,
       );
     });
 
