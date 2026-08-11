@@ -951,6 +951,50 @@ void main() {
       expect(decoded.statistics!.chunkCount, decoded.chunkIndex.length);
     });
 
+    test('a support ending at a midpoint remains reachable there', () async {
+      final scene = flatScene(1, winHi: 8.0);
+      scene.muT[0] = 4.0;
+      scene.sigmaT[0] = 0.0;
+      final bytes = writeFourdgsBytes(
+        scene,
+        8.0,
+        options: const FourdgsWriteOptions(maxDepth: 1, minChunkGaussians: 1),
+      );
+      final indexed = await openFourdgsIndexed(FourdgsBytes(bytes));
+      final covering = indexed.index.where(
+        (FourdgsChunkIndexEntry entry) => entry.t0 <= 4.0 && 4.0 < entry.t1,
+      );
+      int visible = 0;
+      for (final entry in covering) {
+        final chunk = await readFourdgsChunk(
+          FourdgsBytes(bytes),
+          indexed,
+          entry,
+        );
+        visible +=
+            assembleGaussians(<FourdgsDecodedChunk>[
+              chunk,
+            ], 0).stateAt(4.0, cutoff: indexed.header.cutoff).count;
+      }
+      expect(visible, 1);
+    });
+
+    test('finite support still partitions an open-ended scene', () {
+      final scene = buildScene(count: 512, windows: 1, duration: 512.0);
+      scene.winLo.fillRange(0, scene.count, 0.0);
+      scene.winHi.fillRange(0, scene.count, double.infinity);
+      scene.sigmaT.fillRange(0, scene.count, 0.05);
+      final decoded = readFourdgsBytes(
+        writeFourdgsBytes(
+          scene,
+          double.infinity,
+          options: const FourdgsWriteOptions(maxDepth: 4, minChunkGaussians: 8),
+        ),
+      );
+      expect(decoded.chunkIndex.length, greaterThan(1));
+      expect(decoded.chunkIndex.any((entry) => entry.t1.isFinite), isTrue);
+    });
+
     test('every gaussian is stored exactly once, however long it lives', () {
       final scene = buildScene(count: 512, windows: 8);
       final decoded = readFourdgsBytes(
@@ -1983,7 +2027,7 @@ void main() {
       );
       expect(decoded.header.durationSec, double.infinity);
       expect(decoded.chunkIndex, isNotEmpty);
-      expect(decoded.chunkIndex.last.t1, double.infinity);
+      expect(decoded.gaussians.count, scene.count);
     });
 
     test('a zero-length quaternion is refused by gaussian', () {

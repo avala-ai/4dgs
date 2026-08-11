@@ -187,7 +187,7 @@ Future<int> checkSeekReadsOnlyWhatItNeeds(
     final sigmaBin =
         neverFades ? 0 : (math.log(math.max(sigma, 1e-30)) / sigmaLog).round();
     final mu = muStep(sigmaBin, sigmaLog, neverFades, quantization.stepTime);
-    final slack = 0.5 * mu + (neverFades ? 0.0 : k * sigma * sigmaHalfRelative);
+    final slack = neverFades ? 0.0 : 0.5 * mu + k * sigma * sigmaHalfRelative;
     if (slack.isFinite && slack > guard) guard = slack;
   }
 
@@ -197,21 +197,47 @@ Future<int> checkSeekReadsOnlyWhatItNeeds(
         }.toList()
         ..sort();
 
+  // This is an optimization/fidelity probe, not another full decode. Bound the
+  // number of global comparisons independently of the accepted index size: a
+  // 262k-entry legal file must not turn this into hundreds of billions of
+  // checks. Sixteen evenly spaced entries still cover the timeline and tree
+  // depths, while the work below stays O(m + n) with a fixed factor.
+  const maxProbeEntries = 16;
+  final probeEntries = <FourdgsChunkIndexEntry>[];
+  if (index.length <= maxProbeEntries) {
+    probeEntries.addAll(index);
+  } else {
+    for (int slot = 0; slot < maxProbeEntries; slot++) {
+      final at = slot * (index.length - 1) ~/ (maxProbeEntries - 1);
+      probeEntries.add(index[at]);
+    }
+  }
+
+  bool nearBoundary(double t) {
+    int low = 0;
+    int high = boundaries.length;
+    while (low < high) {
+      final middle = low + ((high - low) >> 1);
+      if (boundaries[middle] < t) {
+        low = middle + 1;
+      } else {
+        high = middle;
+      }
+    }
+    if (low < boundaries.length && (boundaries[low] - t).abs() <= guard) {
+      return true;
+    }
+    return low > 0 && (boundaries[low - 1] - t).abs() <= guard;
+  }
+
   int probed = 0;
-  for (final entry in index) {
+  for (final entry in probeEntries) {
     final span = entry.t1 - entry.t0;
     if (!span.isFinite || span <= 0.0) continue;
     for (final fraction in const <double>[0.13, 0.37, 0.61, 0.89]) {
       final t = entry.t0 + fraction * span;
       if (!t.isFinite) continue;
-      var tooClose = false;
-      for (final boundary in boundaries) {
-        if ((t - boundary).abs() <= guard) {
-          tooClose = true;
-          break;
-        }
-      }
-      if (tooClose) continue;
+      if (nearBoundary(t)) continue;
 
       final selected = <FourdgsChunkIndexEntry>[
         for (final candidate in index)

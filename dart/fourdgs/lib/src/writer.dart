@@ -1208,6 +1208,7 @@ List<_Plan> _planChunks(
   final support = g.support(cutoff: options.cutoff);
   final lo = support.lo;
   final hi = support.hi;
+  tops = _finiteTailTops(tops, lo, hi);
 
   final assigned = Int32List(n)..fillRange(0, n, -1);
   final nodes = <_Node>[];
@@ -1231,7 +1232,11 @@ List<_Plan> _planChunks(
     final left = <int>[];
     final right = <int>[];
     for (final i in pool) {
-      if (hi[i] <= mid) {
+      // The marginal is visible at exactly its support edge, while the left
+      // child's interval excludes `mid`. It can descend left on equality only
+      // when its verbatim validity window also ends there, making the gaussian
+      // absent at that half-open endpoint.
+      if (hi[i] < mid || (hi[i] == mid && g.winHi[i] <= mid)) {
         left.add(i);
       } else if (lo[i] >= mid) {
         right.add(i);
@@ -1349,6 +1354,31 @@ List<_Plan> _planChunks(
     for (final plan in plans)
       _Plan(plan.t0, plan.t1, plan.level, _mortonOrder(g, plan.members)),
   ];
+}
+
+/// Give an open-ended final window a finite prefix the tree can bisect.
+///
+/// `0.5 * (finite + infinity)` is infinity, so without this boundary an
+/// otherwise finite population in `[a, +inf)` can never descend. The boundary
+/// sits strictly after the last finite support edge: chunk intervals are
+/// half-open while the marginal remains visible at its support endpoint.
+List<double> _finiteTailTops(
+  List<double> tops,
+  Float64List supportLo,
+  Float64List supportHi,
+) {
+  if (tops.length < 2 || tops.last.isFinite) return tops;
+  final start = tops[tops.length - 2];
+  double lastFinite = start;
+  for (int i = 0; i < supportHi.length; i++) {
+    if (supportLo[i] < start || !supportHi[i].isFinite) continue;
+    if (supportHi[i] > lastFinite) lastFinite = supportHi[i];
+  }
+  if (!(lastFinite > start)) return tops;
+  final padding = math.max(1e-9, lastFinite.abs() * 1e-12);
+  final boundary = lastFinite + padding;
+  if (!boundary.isFinite || !(boundary > lastFinite)) return tops;
+  return <double>[...tops.take(tops.length - 1), boundary, tops.last];
 }
 
 /// The first interval of [tops] whose span contains the whole support
