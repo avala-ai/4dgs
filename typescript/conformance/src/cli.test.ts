@@ -32,6 +32,7 @@ import {
   FourdgsError,
   FOOTER_TAIL_BYTES,
   HEADER_FLAG_HAS_AUDIO,
+  IndexedDecoder,
   MAGIC,
   MAX_FRONT_MATTER_BYTES,
   Opcode,
@@ -1225,7 +1226,7 @@ test("unit: inspect and validate range-read instead of retaining the resource", 
   assert.ok(largestRead < data.length, `one range read buffered all ${data.length} bytes`);
 });
 
-test("unit: validation bounds a known record before fetching its body", async () => {
+test("unit: a parser resource ceiling is a tool failure, not an invalid verdict", async () => {
   const contentLength = MAX_FRONT_MATTER_BYTES + 1;
   const metadataAt = MAGIC.length;
   const tailAt = metadataAt + RECORD_HEADER_BYTES + contentLength;
@@ -1251,14 +1252,12 @@ test("unit: validation bounds a known record before fetching its body", async ()
     },
   };
 
-  const report = await validateFile(source);
-  assert.ok(
-    report.findings.some(
-      (finding) =>
-        finding.message.includes(`Metadata record at byte ${metadataAt}`) &&
-        finding.message.includes("ceiling for a single parsed record"),
-    ),
-    report.findings.map((finding) => finding.message).join("\n"),
+  await assert.rejects(
+    () => validateFile(source),
+    (error: unknown) =>
+      error instanceof RangeError &&
+      error.message.includes(`Metadata record at byte ${metadataAt}`) &&
+      error.message.includes("resource limit for a single parsed record"),
   );
   assert.ok(largestRead <= 64 * 1024, `validation requested ${largestRead} bytes at once`);
 });
@@ -1370,6 +1369,30 @@ test("regression: indexed opening discovers legal legacy Audio after a Chunk", a
   assert.equal(report.ok, true, report.findings.map((finding) => finding.message).join("\n"));
   assert.ok(
     report.findings.every((finding) => !finding.message.includes("a seeking reader cannot open")),
+  );
+
+  const lateAudio = [...iterateRecords(indexless, MAGIC.length)].find(
+    (record) => record.opcode === Opcode.Audio,
+  )!;
+  const reads: { offset: number; length: number }[] = [];
+  const source: IReadable = {
+    size: () => Promise.resolve(BigInt(indexless.length)),
+    read: (offset, length) => {
+      const at = Number(offset);
+      const count = Number(length);
+      reads.push({ offset: at, length: count });
+      return Promise.resolve(indexless.subarray(at, at + count));
+    },
+  };
+  const opened = await IndexedDecoder.open(source, { headProbeBytes: 64 });
+  assert.ok(
+    reads.every((read) => read.offset !== lateAudio.offset),
+    "opening range-read the late Audio record before an audio accessor asked for it",
+  );
+  assert.equal((await opened.readAudio())?.codec, "wav");
+  assert.ok(
+    reads.some((read) => read.offset === lateAudio.offset),
+    "the audio accessor did not discover the late Audio record",
   );
 });
 
@@ -1493,6 +1516,91 @@ test("regression: every Statistics record belongs to the declared summary", asyn
     ),
     report.findings.map((finding) => finding.message).join("\n"),
   );
+});
+
+test("regression: Statistics values describe the Header, chunks, and index", async (t) => {
+  const variant = "TenWindows-UseChunkIndex-UseChunks-UseCrc-UseStatistics-UseSummaryOffset";
+  if (corpus(variant) === null) return t.skip("corpus not generated");
+
+  for (const [name, patch, expected] of [
+    [
+      "gaussian_count",
+      (view: DataView, at: number) => view.setBigUint64(at, 999n, true),
+      "declares gaussian_count 999",
+    ],
+    [
+      "chunk_count",
+      (view: DataView, at: number) => view.setUint32(at + 8, 999, true),
+      "declares chunk_count 999",
+    ],
+    [
+      "duration_sec",
+      (view: DataView, at: number) => view.setFloat64(at + 12, 999, true),
+      "declares duration_sec 999",
+    ],
+  ] as const) {
+    const bytes = bytesOf(variant);
+    const statistics = recordsOf(bytes).find((record) => record.opcode === Opcode.Statistics)!;
+    patch(
+      new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength),
+      statistics.offset + RECORD_HEADER_BYTES,
+    );
+    const report = await validateFile(resealSummary(bytes));
+    assert.ok(
+      report.findings.some((finding) => finding.message.includes(expected)),
+      `${name}: ${report.findings.map((finding) => finding.message).join("\n")}`,
+    );
+  }
+});
+
+test("regression: every Summary Offset names a nonempty in-summary range", async (t) => {
+  const variant = "TenWindows-UseChunkIndex-UseChunks-UseCrc-UseStatistics-UseSummaryOffset";
+  if (corpus(variant) === null) return t.skip("corpus not generated");
+
+  for (const [name, patch, expected] of [
+    [
+      "zero",
+      (view: DataView, at: number) => view.setBigUint64(at + 9, 0n, true),
+      "zero-length group",
+    ],
+    [
+      "past-footer",
+      (view: DataView, at: number) => view.setBigUint64(at + 9, 1n << 48n, true),
+      "outside the summary",
+    ],
+  ] as const) {
+    const bytes = bytesOf(variant);
+    const summaryOffset = recordsOf(bytes).find(
+      (record) => record.opcode === Opcode.SummaryOffset,
+    )!;
+    patch(
+      new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength),
+      summaryOffset.offset + RECORD_HEADER_BYTES,
+    );
+    const report = await validateFile(resealSummary(bytes));
+    assert.ok(
+      report.findings.some((finding) => finding.message.includes(expected)),
+      `${name}: ${report.findings.map((finding) => finding.message).join("\n")}`,
+    );
+  }
+});
+
+test("regression: gaussian-birth skips a future Chunk Index suffix", async (t) => {
+  const variant = "TenWindows-UseChunkIndex-UseCrc";
+  if (corpus(variant) === null) return t.skip("corpus not generated");
+  const original = bytesOf(variant);
+  const entry = recordsOf(original).find((record) => record.opcode === Opcode.ChunkIndex)!;
+  const suffix = new Uint8Array(28);
+  suffix[0] = 1; // Would be chunk_kind=delta if this were keyframe-delta.
+  suffix[1] = 1;
+  const extended = splice(original, entry.offset + entry.length, suffix);
+  new DataView(extended.buffer, extended.byteOffset, extended.byteLength).setBigUint64(
+    entry.offset + 1,
+    BigInt(entry.length - RECORD_HEADER_BYTES + suffix.length),
+    true,
+  );
+  const report = await validateFile(resealSummary(extended));
+  assert.equal(report.ok, true, report.findings.map((finding) => finding.message).join("\n"));
 });
 
 interface JsonRecord {

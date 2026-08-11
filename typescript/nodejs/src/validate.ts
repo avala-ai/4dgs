@@ -92,6 +92,8 @@ import {
   type IReadable,
   type Quantization,
   type RefusalCode,
+  type Statistics,
+  type SummaryOffset,
 } from "@4dgs/core";
 
 export type Severity = "error" | "warning" | "note";
@@ -215,6 +217,8 @@ export async function validateFile(
   let firstIndexOffset: number | null = null;
   const statisticsOffsets: number[] = [];
   const summaryOffsetOffsets: number[] = [];
+  const statisticsRecords: { readonly offset: number; readonly value: Statistics }[] = [];
+  const summaryOffsetRecords: { readonly offset: number; readonly value: SummaryOffset }[] = [];
   const physicalChunkOffsets: number[] = [];
   const physicalChunks = new Map<
     number,
@@ -253,6 +257,12 @@ export async function validateFile(
   try {
     for await (const framed of scanner.records(MAGIC.length)) {
       recordCount += 1;
+      if (recordCount > MAX_VALIDATION_RECORDS) {
+        throw new RangeError(
+          `validation stopped after ${MAX_VALIDATION_RECORDS} records; this is the tool's ` +
+            "bounded-memory limit, not a malformed-file verdict",
+        );
+      }
       firstOpcode ??= framed.opcode;
       lastOpcode = framed.opcode;
       const record = {
@@ -264,10 +274,10 @@ export async function validateFile(
       let contentValue: Uint8Array | null = null;
       const content = async (): Promise<Uint8Array> => {
         if (framed.contentLength > MAX_FRONT_MATTER_BYTES) {
-          throw new MalformedFile(
+          throw new RangeError(
             `${opcodeName(framed.opcode)} record at byte ${framed.offset} is ` +
               `${framed.contentLength} bytes, past the ${MAX_FRONT_MATTER_BYTES} byte ` +
-              "ceiling for a single parsed record",
+              "resource limit for a single parsed record",
           );
         }
         contentValue ??= await scanner.content(framed);
@@ -660,13 +670,13 @@ export async function validateFile(
         case Opcode.Statistics:
           statisticsOffsets.push(offset);
           await parseInto(found, "Statistics", offset, async () => {
-            parseStatistics(await content());
+            statisticsRecords.push({ offset, value: parseStatistics(await content()) });
           });
           break;
         case Opcode.SummaryOffset:
           summaryOffsetOffsets.push(offset);
           await parseInto(found, "SummaryOffset", offset, async () => {
-            parseSummaryOffset(await content());
+            summaryOffsetRecords.push({ offset, value: parseSummaryOffset(await content()) });
           });
           break;
         case Opcode.Audio:
@@ -700,6 +710,7 @@ export async function validateFile(
       }
     }
   } catch (error) {
+    if (error instanceof RangeError) throw error;
     found.error(`stopped reading: ${message(error)}`);
   }
   if (decodedShChunk !== null) {
@@ -793,6 +804,33 @@ export async function validateFile(
     }
   }
 
+  for (const { offset, value: statistics } of statisticsRecords) {
+    if (header !== null && statistics.gaussianCount !== header.gaussianCount) {
+      found.error(
+        `Statistics record at byte ${offset} declares gaussian_count ` +
+          `${statistics.gaussianCount}; the Header declares ${header.gaussianCount}`,
+      );
+    }
+    if (header !== null && !Object.is(statistics.durationSec, header.durationSec)) {
+      found.error(
+        `Statistics record at byte ${offset} declares duration_sec ` +
+          `${statistics.durationSec}; the Header declares ${header.durationSec}`,
+      );
+    }
+    if (statistics.chunkCount !== chunkCount) {
+      found.error(
+        `Statistics record at byte ${offset} declares chunk_count ${statistics.chunkCount}; ` +
+          `the physical record walk found ${chunkCount} state chunks`,
+      );
+    }
+    if (index.length > 0 && statistics.chunkCount !== index.length) {
+      found.error(
+        `Statistics record at byte ${offset} declares chunk_count ${statistics.chunkCount}; ` +
+          `the Chunk Index contains ${index.length} entries`,
+      );
+    }
+  }
+
   if (header?.temporalModel === "keyframe-delta") {
     const intervals =
       index.length > 0
@@ -875,9 +913,17 @@ export async function validateFile(
           `chunk index entry ${i} declares ${entry.chunkLength} bytes at ` +
             `${entry.chunkOffset}; the record there is ${physical.length} bytes (§5.8)`,
         );
-      } else if (entry.extended && entry.kind === 1 && physical.opcode !== Opcode.DeltaChunk) {
+      } else if (
+        header?.temporalModel === "keyframe-delta" &&
+        entry.extended &&
+        entry.kind === 1 &&
+        physical.opcode !== Opcode.DeltaChunk
+      ) {
         found.error(`chunk index entry ${i} declares a delta but points at a Chunk record`);
-      } else if ((!entry.extended || entry.kind === 0) && physical.opcode !== Opcode.Chunk) {
+      } else if (
+        (header?.temporalModel !== "keyframe-delta" || !entry.extended || entry.kind === 0) &&
+        physical.opcode !== Opcode.Chunk
+      ) {
         found.error(`chunk index entry ${i} declares a keyframe but points at a Delta Chunk`);
       } else {
         const head = physical.header;
@@ -1070,6 +1116,26 @@ export async function validateFile(
         );
       }
     }
+    for (const { offset, value } of summaryOffsetRecords) {
+      const groupEnd = value.groupStart + value.groupLength;
+      if (value.groupLength === 0) {
+        found.error(
+          `Summary Offset record at byte ${offset} declares a zero-length group for ` +
+            `${opcodeName(value.groupOpcode)}`,
+        );
+      } else if (
+        !Number.isSafeInteger(groupEnd) ||
+        footer.summaryStart === 0 ||
+        value.groupStart < footer.summaryStart ||
+        groupEnd > tail
+      ) {
+        found.error(
+          `Summary Offset record at byte ${offset} declares ` +
+            `${opcodeName(value.groupOpcode)} range [${value.groupStart}, ${groupEnd}), ` +
+            `outside the summary [${footer.summaryStart}, ${tail})`,
+        );
+      }
+    }
     const expectedSummaryOffset = summaryOffsetsInSummary[0] ?? 0;
     if (footer.summaryOffsetStart !== expectedSummaryOffset) {
       found.error(
@@ -1113,17 +1179,16 @@ function checkKeyframeDeltaIndexChains(
   found: Findings,
   keyframeDelta: boolean,
 ): void {
+  if (!keyframeDelta) return;
   const ordered = [...index].sort((a, b) => a.chunkOffset - b.chunkOffset);
   const derived = new Map<number, { depth: number; keyframeOffset: number; kind: number }>();
   let previousOffset: number | null = null;
   for (const entry of ordered) {
     if (!entry.extended) {
-      if (keyframeDelta) {
-        found.error(
-          `the keyframe-delta chunk index entry at ${entry.chunkOffset} omits ` +
-            "chunk_kind, delta reference, depth and live_count fields",
-        );
-      }
+      found.error(
+        `the keyframe-delta chunk index entry at ${entry.chunkOffset} omits ` +
+          "chunk_kind, delta reference, depth and live_count fields",
+      );
       previousOffset = entry.chunkOffset;
       continue;
     }
@@ -1497,6 +1562,7 @@ async function parseInto(
   try {
     await parse();
   } catch (error) {
+    if (error instanceof RangeError) throw error;
     found.error(`${record} record at byte ${offset} does not parse: ${message(error)}`);
   }
 }
@@ -1755,6 +1821,8 @@ const ILLEGAL_TOP_LEVEL_OPCODES: ReadonlySet<number> = new Set<number>([
 
 const VALIDATION_PROBE_BYTES = 64 * 1024;
 const VALIDATION_STRING_BYTES = 4096;
+/** Tool resource policy: cross-record tables never grow past this many rows. */
+const MAX_VALIDATION_RECORDS = 65_536;
 
 function hex(opcode: number): string {
   return `0x${opcode.toString(16).padStart(2, "0").toUpperCase()}`;
