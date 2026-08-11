@@ -849,6 +849,26 @@ void main() {
       expect(decoded.chunkIndex.single.t1, 1e-9);
     });
 
+    test(
+      'a populated static interval is never subdivided away from t=0',
+      () async {
+        final scene = flatScene(128, winHi: 1e-9);
+        scene
+          ..muT.fillRange(0, scene.count, 7.5e-10)
+          ..sigmaT.fillRange(0, scene.count, 0.0);
+        final bytes = writeFourdgsBytes(
+          scene,
+          0.0,
+          options: const FourdgsWriteOptions(maxDepth: 4, minChunkGaussians: 8),
+        );
+        final indexed = await openFourdgsIndexed(FourdgsBytes(bytes));
+
+        expect(indexed.index, hasLength(1));
+        expect(indexed.index.single.t0, 0.0);
+        expect(indexed.index.single.gaussianCount, scene.count);
+      },
+    );
+
     test('a large scene is split before a Chunk buffer can grow with it', () {
       final scene = flatScene(16385);
       final decoded = readFourdgsBytes(writeFourdgsBytes(scene, 1.0));

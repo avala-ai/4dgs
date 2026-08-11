@@ -237,7 +237,12 @@ void writeFourdgsToSink(
   // Window boundaries are the top level of the temporal partition. Anything
   // strictly inside the clip is a split point; the ends are always present.
   final tops = _tops(windows.windows, durationSec);
-  final plans = _planChunks(gaussians, tops, options);
+  final plans = _planChunks(
+    gaussians,
+    tops,
+    options,
+    staticScene: durationSec == 0.0,
+  );
 
   // The index this partition would produce has to be one this package's own
   // indexed reader will open. `openFourdgsIndexed` stops at
@@ -1203,8 +1208,9 @@ class _Plan {
 List<_Plan> _planChunks(
   FourdgsGaussianSet g,
   List<double> tops,
-  FourdgsWriteOptions options,
-) {
+  FourdgsWriteOptions options, {
+  required bool staticScene,
+}) {
   final n = g.count;
   if (n == 0) return const <_Plan>[];
 
@@ -1233,7 +1239,11 @@ List<_Plan> _planChunks(
     int end,
   ) {
     if (start == end) return;
-    if (level >= options.maxDepth) {
+    // `[0, 1e-9)` is only the seekable representation of the single instant in
+    // a duration-zero asset. Subdividing that artificial span can put every
+    // populated leaf strictly after t=0, which the indexed reader correctly
+    // refuses because no scene-clock instant selects it.
+    if (staticScene || level >= options.maxDepth) {
       nodes.add(_Node(a, b, level));
       final node = nodes.length - 1;
       for (int at = start; at < end; at++) {

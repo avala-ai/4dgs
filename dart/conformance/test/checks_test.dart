@@ -134,7 +134,35 @@ void main() {
       winHi: Float32List.fromList(const <double>[0.0, 2.0]),
     );
 
-    expect(hasAnyVisibleSupport(gaussians, 0.05), isFalse);
+    expect(hasAnyVisibleSupport(gaussians, 0.05, 4.0), isFalse);
+  });
+
+  test('visible support is clipped to the Header scene clock', () {
+    final rotations = Float32List(4)..[3] = 1.0;
+    final gaussians = FourdgsGaussianSet(
+      positions: Float32List(3),
+      scales: Float32List(3)..fillRange(0, 3, 1e-3),
+      rotations: rotations,
+      colors: Float32List(4),
+      motions: Float32List(3),
+      muT: Float32List.fromList(const <double>[2.5]),
+      sigmaT: Float32List.fromList(const <double>[double.infinity]),
+      winLo: Float32List.fromList(const <double>[2.0]),
+      winHi: Float32List.fromList(const <double>[3.0]),
+    );
+
+    expect(hasAnyVisibleSupport(gaussians, 0.05, 1.0), isFalse);
+    expect(hasAnyVisibleSupport(gaussians, 0.05, 4.0), isTrue);
+  });
+
+  test('exclusive support ends sort before inclusive ties', () {
+    final ends = <({double at, bool inclusive, int row})>[
+      (at: 0.5, inclusive: true, row: 0),
+      (at: 0.5, inclusive: false, row: 1),
+      (at: 0.25, inclusive: true, row: 2),
+    ]..sort(compareSeekRowEnds);
+
+    expect(ends.map((event) => event.row), <int>[2, 1, 0]);
   });
 
   test('sigma-log guard distance uses pitch magnitude', () {

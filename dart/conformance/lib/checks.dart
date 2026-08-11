@@ -204,23 +204,38 @@ List<({double time, int row})> _seekVisibleProbeRows(
 ///
 /// Empty validity windows carry stored gaussians but no state. This is an
 /// `O(count)` existence check with no allocation proportional to the scene.
-bool hasAnyVisibleSupport(FourdgsGaussianSet gaussians, double cutoff) {
+bool hasAnyVisibleSupport(
+  FourdgsGaussianSet gaussians,
+  double cutoff,
+  double durationSec,
+) {
   final k = supportK(cutoff);
   for (int i = 0; i < gaussians.count; i++) {
     final windowLo = gaussians.winLo[i];
     final windowHi = gaussians.winHi[i];
     if (!(windowLo < windowHi)) continue;
     final storedSigma = gaussians.sigmaT[i];
-    if (!storedSigma.isFinite) return true;
+    if (!storedSigma.isFinite) {
+      final lo = math.max(0.0, windowLo);
+      final hi = math.min(durationSec, windowHi);
+      if (lo < hi || (durationSec == 0.0 && lo == 0.0 && lo < windowHi)) {
+        return true;
+      }
+      continue;
+    }
     final sigma = math.max(storedSigma, 1e-30);
     final mu = gaussians.muT[i];
     final supportLo = mu - k * sigma;
     final supportHi = mu + k * sigma;
-    final lo = math.max(windowLo, supportLo);
-    final hi = math.min(windowHi, supportHi);
+    final lo = math.max(0.0, math.max(windowLo, supportLo));
+    final hi = math.min(durationSec, math.min(windowHi, supportHi));
     // Marginal support is closed; the validity window is [lo, hi). A point at
     // the window's lower edge is visible, while one at its upper edge is not.
-    if (lo <= hi && lo < windowHi) return true;
+    if (lo <= hi &&
+        lo < windowHi &&
+        (lo < durationSec || (durationSec == 0.0 && lo == 0.0))) {
+      return true;
+    }
   }
   return false;
 }
@@ -552,7 +567,7 @@ checkSeekReadsOnlyWhatItNeeds(
     rowEnds.add((at: hi, inclusive: hi < whole.winHi[row], row: row));
   }
   rowStarts.sort((a, b) => a.at.compareTo(b.at));
-  rowEnds.sort((a, b) => a.at.compareTo(b.at));
+  rowEnds.sort(compareSeekRowEnds);
   final visibleRows = Uint8List(whole.count);
   int visibleRowCount = 0;
   int missingVisibleRows = 0;
@@ -625,6 +640,19 @@ checkSeekReadsOnlyWhatItNeeds(
     probed++;
   }
   return (probes: probed, guardedVisibleCandidates: guardedVisibleCandidates);
+}
+
+/// End events at one instant: remove half-open validity ends before retaining
+/// inclusive marginal ends. The sweep stops at the first inclusive event for
+/// `t == at`, so reversing this tie-break leaves later exclusive rows visible.
+int compareSeekRowEnds(
+  ({double at, bool inclusive, int row}) a,
+  ({double at, bool inclusive, int row}) b,
+) {
+  final byTime = a.at.compareTo(b.at);
+  if (byTime != 0) return byTime;
+  if (a.inclusive != b.inclusive) return a.inclusive ? 1 : -1;
+  return a.row.compareTo(b.row);
 }
 
 Map<double, double> _seekBoundaryGuards(
