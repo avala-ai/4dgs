@@ -33,6 +33,7 @@ from .quantization import (
     SH_MIN_BITS,
     Bounds,
     Steps,
+    coarsen_sh,
     dequantize,
     dequantize_rotation,
     life_class,
@@ -450,7 +451,14 @@ def _encode(g: GaussianSet, duration_sec, opts, audio_sources, camera) -> bytes:
             library=opts.library,
             temporal_model=opts.temporal_model,
             cutoff=opts.cutoff,
-            sh_degree=g.sh_degree if sh_cols else 0,
+            # The degree the file actually carries, which is the highest band written and
+            # not the degree the input happened to hold. `sh_bands` caps what is emitted,
+            # so a degree-3 scene written with `sh_bands=1` carries band 1 alone — three
+            # coefficients per component — and declaring 3 there would promise fifteen to
+            # a reader that sizes its buffers from the Header. Bands are whole and a
+            # reader takes them whole (spec section 6.5), so bands 1..D are exactly a
+            # degree-D scene and D is a count of what is present (issue #190).
+            sh_degree=max(sh_cols) if sh_cols else 0,
             flags=header_flags,
             attributes=opts.metadata or {},
         ).encode(trailer=opts.record_trailers.get(op.HEADER, b""))
@@ -609,10 +617,11 @@ def _encode(g: GaussianSet, duration_sec, opts, audio_sources, camera) -> bytes:
             original = g.sh[np.ix_(members, cols)].astype(np.int64)
             if band in depths:
                 vals = quantize_sh(original, depths[band])
-            elif steps.sh > 1:
-                vals = (original // steps.sh) * steps.sh + steps.sh // 2
             else:
-                vals = original
+                # The profile's own pitch, through the same centring-and-clamping the
+                # per-band depths use. Writing the arithmetic out here a second time is
+                # how it came to lack the clamp that `coarsen_sh` documents.
+                vals = coarsen_sh(original, steps.sh)
             # Each band is its own record, so a reader that has capped its SH degree
             # skips the higher ones by byte range and never transfers them.
             payload = put_u8(band) + encode_stream(
