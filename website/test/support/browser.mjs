@@ -231,8 +231,26 @@ function makePage(send, sessionId, targetId) {
       await send("Page.addScriptToEvaluateOnNewDocument", { source }, sessionId);
     },
     async goto(url) {
-      await send("Page.navigate", { url }, sessionId);
-      await page.waitFor(() => document.readyState === "complete");
+      const navigation = await send("Page.navigate", { url }, sessionId);
+      if (navigation.errorText) {
+        throw new Error(`could not navigate to ${url}: ${navigation.errorText}`);
+      }
+
+      // `Page.navigate` acknowledges the request before the new document commits. Waiting
+      // for readyState alone can therefore accept the complete about:blank document this
+      // target started with and hand the test a page whose controls do not exist yet.
+      const deadline = Date.now() + 30000;
+      for (;;) {
+        if (
+          await page.evaluate(
+            (expected) => location.href === expected && document.readyState === "complete",
+            url,
+          )
+        )
+          return;
+        if (Date.now() > deadline) throw new Error(`timed out navigating to: ${url}`);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
     },
     /** Evaluate `fn(...args)` in the page and return its value. */
     async evaluate(fn, ...args) {
