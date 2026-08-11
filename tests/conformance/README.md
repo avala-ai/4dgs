@@ -209,9 +209,11 @@ python3 tests/conformance/run.py \
 ```
 
 The command is split with the quoting rules of the platform the suite is running on — POSIX rules
-elsewhere, Windows rules on Windows, where a backslash is a path separator and not an escape — and
-the variant's file path is appended to it. So a runner sees whatever arguments you wrote, then one
-path, which is the same invocation the built-in runners get.
+elsewhere, and on Windows the rules `CommandLineToArgvW` applies, which is what every program there
+is actually started under — and the variant's file path is appended to it. So a runner sees whatever
+arguments you wrote, then one path, which is the same invocation the built-in runners get. Both
+`python C:\work\decode.py` and `runner.exe --label="two words"` arrive as the two arguments a
+Windows user means by them, rather than as a mangled path or a split-apart option.
 
 ### The capabilities handshake
 
@@ -231,7 +233,7 @@ and no path. The runner answers with one JSON object on stdout and exits 0:
 
 | Key        | Required | Meaning                                                                                                 |
 | ---------- | -------- | ------------------------------------------------------------------------------------------------------- |
-| `protocol` | yes      | the protocol version, `1`. A mismatch is an error naming both numbers                                   |
+| `protocol` | yes      | the protocol version, as the JSON integer `1`. `true` and `"1"` are errors, not versions                |
 | `name`     | yes      | `<family>/<read path>`, printed on every line about this runner                                         |
 | `family`   | no       | defaults to `name` up to the first `/`                                                                  |
 | `readPath` | yes      | `streamed` or `indexed`. An indexed runner is not asked about a variant written without `UseChunkIndex` |
@@ -276,8 +278,10 @@ them.
 
 ### When a runner misbehaves
 
-Each invocation is bounded by `--timeout` (120 seconds by default), and every way an invocation can
-go wrong costs exactly one red variant rather than the run:
+Each invocation is bounded by `--timeout` (120 seconds by default; it must be a finite number of
+seconds above zero, because `nan` and `inf` are numbers a bound cannot be made of and both would let
+a hanging runner hang the suite), and every way an invocation can go wrong costs exactly one red
+variant rather than the run:
 
 ```
 FAIL go/decode_streamed invalid/BadMagic: runner did not answer within 120s

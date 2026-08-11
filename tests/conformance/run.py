@@ -21,6 +21,7 @@ import argparse
 import dataclasses
 import difflib
 import json
+import math
 import os
 import shlex
 import signal
@@ -421,7 +422,13 @@ def declared_capabilities(command: list[str], timeout: float) -> Capabilities:
     if not isinstance(doc, dict):
         raise ProtocolError(f"{CAPABILITIES_ARG} printed {type(doc).__name__}, not a JSON object")
 
+    # `isinstance(True, int)` is true in Python, so a runner that serialized its version as
+    # a boolean — `"protocol": true` — would compare equal to 1 and be scored against a
+    # declaration it never made. The type is checked before the value so that the error
+    # names what arrived rather than reinterpreting it.
     protocol = doc.get("protocol")
+    if isinstance(protocol, bool) or not isinstance(protocol, int):
+        raise ProtocolError(f"declares protocol {protocol!r}; expected the integer {PROTOCOL_VERSION}")
     if protocol != PROTOCOL_VERSION:
         raise ProtocolError(f"declares protocol {protocol!r}; this harness speaks {PROTOCOL_VERSION}")
 
@@ -450,24 +457,99 @@ def declared_capabilities(command: list[str], timeout: float) -> Capabilities:
     )
 
 
+def split_windows_command(text: str) -> list[str]:
+    """Split a command line the way `CommandLineToArgvW` does.
+
+    This is the rule every Windows program is started under, and the only one that agrees
+    with what the user typed. `shlex` cannot stand in for it in either mode: POSIX mode
+    treats a backslash as an escape, so `python C:\\work\\decode.py` arrives as
+    `C:workdecode.py`; non-POSIX mode keeps the backslashes but only recognizes a quote
+    that begins a token, so the everyday `runner.exe --label="two words"` splits into
+    `--label="two` and `words"` instead of the single argument Windows would deliver.
+    Python's own documentation says `shlex.split` is designed for Unix shells.
+
+    The three rules, from the same table `subprocess.list2cmdline` writes for:
+
+    - whitespace separates arguments unless it is inside a quoted run;
+    - `2n` backslashes before a quote are `n` backslashes and the quote is a delimiter;
+      `2n+1` are `n` backslashes and a literal quote. Backslashes not before a quote are
+      literal, which is what makes a path a path;
+    - a quote inside a quoted run, doubled, is one literal quote.
+    """
+    args: list[str] = []
+    i, end = 0, len(text)
+    while i < end:
+        while i < end and text[i] in " \t":
+            i += 1
+        if i >= end:
+            break
+        token: list[str] = []
+        quoted = False
+        while i < end:
+            char = text[i]
+            if char == "\\":
+                run = i
+                while run < end and text[run] == "\\":
+                    run += 1
+                slashes = run - i
+                if run < end and text[run] == '"':
+                    token.append("\\" * (slashes // 2))
+                    if slashes % 2:
+                        token.append('"')
+                        i = run + 1
+                    else:
+                        # Leave the quote to the branch below, which owns both the toggle
+                        # and the doubled-quote case rather than restating either here.
+                        i = run
+                else:
+                    token.append("\\" * slashes)
+                    i = run
+                continue
+            if char == '"':
+                if quoted and i + 1 < end and text[i + 1] == '"':
+                    token.append('"')
+                    i += 2
+                else:
+                    quoted = not quoted
+                    i += 1
+                continue
+            if char in " \t" and not quoted:
+                i += 1
+                break
+            token.append(char)
+            i += 1
+        args.append("".join(token))
+    return args
+
+
 def split_command(text: str) -> list[str]:
     """Split a `--runner-cmd` the way the platform it runs on would.
 
-    `shlex.split` is POSIX by default, and there a backslash escapes the next character.
-    On Windows that silently destroys the ordinary spelling of a path: `python
-    C:\\work\\decode.py` splits into `['python', 'C:workdecode.py']`, and the runner
-    cannot be started at all — for a reason no error message would point at, since the
-    command as written is exactly what a Windows user would type. Non-POSIX mode keeps the
-    backslashes, at the cost of keeping the quotes around a quoted token, which is what
-    the strip below is for.
+    A command line is not a portable notation, and the harness has no business asking an
+    author to spell theirs in another platform's grammar to be scored.
     """
-    if os.name != "nt":
-        return shlex.split(text)
-    tokens = []
-    for raw in shlex.split(text, posix=False):
-        quoted = len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'"
-        tokens.append(raw[1:-1] if quoted else raw)
-    return tokens
+    if os.name == "nt":
+        return split_windows_command(text)
+    return shlex.split(text)
+
+
+def positive_seconds(text: str) -> float:
+    """A `--timeout` that actually bounds an invocation.
+
+    `float("nan")` and `float("inf")` are both accepted by `float()`, and both defeat the
+    bound rather than widening it: `Popen.wait(timeout=nan)` never expires — every
+    comparison against NaN is false — so a single hanging runner hangs the whole suite,
+    which is precisely what the timeout exists to prevent. Zero and negative values are
+    refused here too; they are answerable, but they fail every runner on the first variant
+    for a reason the output would blame on the runner.
+    """
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number of seconds") from None
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError(f"{text!r} does not bound an invocation; give a finite number above zero")
+    return value
 
 
 def builtin_jobs(family_filter: str | None) -> Iterator[tuple[Capabilities, list[str]]]:
@@ -529,7 +611,7 @@ def main(argv=None) -> int:
     )
     parser.add_argument(
         "--timeout",
-        type=float,
+        type=positive_seconds,
         default=DEFAULT_TIMEOUT,
         metavar="SECONDS",
         help=f"seconds one invocation may take before it is failed (default {DEFAULT_TIMEOUT:g})",
