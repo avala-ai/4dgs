@@ -32,7 +32,7 @@
 //!   file; only the citation differed from what §5.15 says today. See the arm that emits
 //!   it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
@@ -131,9 +131,15 @@ impl IdentityCounter {
                 let mut raw = [0u8; 4];
                 match reader.read_exact(&mut raw) {
                     Ok(()) => {
-                        let low =
-                            (u32::from_le_bytes(raw) & ((1u32 << Self::LOW_BITS) - 1)) as usize;
-                        bits[low >> 6] |= 1u64 << (low & 63);
+                        let id = u32::from_le_bytes(raw);
+                        let low = (id & ((1u32 << Self::LOW_BITS) - 1)) as usize;
+                        let mask = 1u64 << (low & 63);
+                        if bits[low >> 6] & mask != 0 {
+                            return Err(fourdgs::Error::Malformed(format!(
+                                "gaussian_id {id} is introduced more than once; an identity may not be reused after death"
+                            )));
+                        }
+                        bits[low >> 6] |= mask;
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
                     Err(error) => return Err(error.into()),
@@ -146,6 +152,21 @@ impl IdentityCounter {
         }
         Ok(total)
     }
+}
+
+fn keyframe_introductions(
+    current: Option<&fourdgs::keyframe_delta::State>,
+    next: &fourdgs::keyframe_delta::State,
+) -> Vec<i64> {
+    let Some(current) = current else {
+        return next.ids.clone();
+    };
+    let live: BTreeSet<i64> = current.ids.iter().copied().collect();
+    next.ids
+        .iter()
+        .copied()
+        .filter(|id| !live.contains(id))
+        .collect()
 }
 
 impl Drop for IdentityCounter {
@@ -612,15 +633,23 @@ fn decode_indexed_delta<R: Readable + ?Sized>(
     source: &mut R,
     entry: &rec::ChunkIndexEntry,
     ordinal: usize,
-    current: Option<&(u64, u16, fourdgs::keyframe_delta::State)>,
-    keyframe: Option<&(u64, fourdgs::keyframe_delta::State)>,
+    current: Option<&(u64, u16, u32, fourdgs::keyframe_delta::State)>,
+    keyframe: Option<&(u64, u32, fourdgs::keyframe_delta::State)>,
     windows: &[(f64, f64)],
     identities: &mut IdentityCounter,
-) -> Result<(fourdgs::keyframe_delta::State, u32)> {
-    let (reference_offset, reference_depth, reference) = match entry.delta_mode {
+) -> Result<(fourdgs::keyframe_delta::State, u32, u32)> {
+    if entry.reference_offset >= entry.chunk_offset {
+        return Err(fourdgs::Error::Malformed(format!(
+            "delta index entry {ordinal} at {} references {}; a Delta Chunk must reference a physically earlier record",
+            entry.chunk_offset, entry.reference_offset
+        )));
+    }
+    let (reference_offset, reference_depth, reference_level, reference) = match entry.delta_mode {
         rec::DELTA_MODE_KEYFRAME => match keyframe {
-            Some((offset, state)) if entry.reference_offset == *offset => (*offset, 0, state),
-            Some((offset, _)) => {
+            Some((offset, level, state)) if entry.reference_offset == *offset => {
+                (*offset, 0, *level, state)
+            }
+            Some((offset, _, _)) => {
                 return Err(fourdgs::Error::Malformed(format!(
                     "delta index entry {ordinal} uses keyframe mode but references {}; its GOP keyframe is at {offset}",
                     entry.reference_offset
@@ -633,10 +662,10 @@ fn decode_indexed_delta<R: Readable + ?Sized>(
             }
         },
         rec::DELTA_MODE_CHAINED => match current {
-            Some((offset, depth, state)) if entry.reference_offset == *offset => {
-                (*offset, *depth, state)
+            Some((offset, depth, level, state)) if entry.reference_offset == *offset => {
+                (*offset, *depth, *level, state)
             }
-            Some((offset, _, _)) => {
+            Some((offset, _, _, _)) => {
                 return Err(fourdgs::Error::Malformed(format!(
                     "delta index entry {ordinal} uses chained mode but references {}; the immediately preceding state is at {offset}",
                     entry.reference_offset
@@ -665,9 +694,15 @@ fn decode_indexed_delta<R: Readable + ?Sized>(
             entry.depth
         )));
     }
-    let (state, head, births) =
+    let (state, head, _births) =
         fourdgs::keyframe_delta_file::read_delta_entry(source, entry, reference, windows)?;
-    let expected_keyframe = keyframe.map(|(offset, _)| *offset).unwrap_or(0);
+    if head.level != reference_level {
+        return Err(fourdgs::Error::Malformed(format!(
+            "delta index entry {ordinal} declares level {}; its reference at {reference_offset} declares level {reference_level}",
+            head.level
+        )));
+    }
+    let expected_keyframe = keyframe.map(|(offset, _, _)| *offset).unwrap_or(0);
     let working = head
         .update_count
         .checked_add(head.birth_count)
@@ -693,8 +728,9 @@ fn decode_indexed_delta<R: Readable + ?Sized>(
             state.count()
         )));
     }
-    identities.add(&births)?;
-    Ok((state, head.birth_count))
+    let introductions = keyframe_introductions(current.map(|(_, _, _, state)| state), &state);
+    identities.add(&introductions)?;
+    Ok((state, head.birth_count, head.level))
 }
 
 /// The same, for the temporal model whose chunks are keyframes and differences.
@@ -735,8 +771,8 @@ fn check_keyframe_delta(data: &[u8], framing: Framing, unindexed: bool, report: 
     let mut ordered: Vec<(usize, &rec::ChunkIndexEntry)> =
         sequence.index.iter().enumerate().collect();
     ordered.sort_by(|(_, a), (_, b)| a.t0.partial_cmp(&b.t0).unwrap_or(std::cmp::Ordering::Equal));
-    let mut current: Option<(u64, u16, fourdgs::keyframe_delta::State)> = None;
-    let mut keyframe: Option<(u64, fourdgs::keyframe_delta::State)> = None;
+    let mut current: Option<(u64, u16, u32, fourdgs::keyframe_delta::State)> = None;
+    let mut keyframe: Option<(u64, u32, fourdgs::keyframe_delta::State)> = None;
     let mut identities = match IdentityCounter::new() {
         Ok(counter) => counter,
         Err(error) => {
@@ -757,6 +793,7 @@ fn check_keyframe_delta(data: &[u8], framing: Framing, unindexed: bool, report: 
             fourdgs::keyframe_delta_file::read_keyframe_entry(
                 &mut source,
                 entry,
+                &sequence.quantization,
                 &sequence.windows,
             )
             .and_then(|(state, head)| {
@@ -766,14 +803,18 @@ fn check_keyframe_delta(data: &[u8], framing: Framing, unindexed: bool, report: 
                     || head.count != entry.gaussian_count
                     || entry.keyframe_offset != entry.chunk_offset
                     || entry.depth != 0
+                    || entry.delta_mode != 0
+                    || entry.reference_offset != 0
                 {
                     return Err(fourdgs::Error::Malformed(format!(
-                        "keyframe index entry {i} disagrees with its Chunk: index interval [{}, {}), count {}, keyframe offset {}, depth {}; record interval [{}, {}), count {}",
+                        "keyframe index entry {i} disagrees with its Chunk: index interval [{}, {}), count {}, keyframe offset {}, depth {}, delta mode {}, reference {}; record interval [{}, {}), count {}",
                         entry.t0,
                         entry.t1,
                         entry.gaussian_count,
                         entry.keyframe_offset,
                         entry.depth,
+                        entry.delta_mode,
+                        entry.reference_offset,
                         head.t0,
                         head.t1,
                         head.count
@@ -786,9 +827,13 @@ fn check_keyframe_delta(data: &[u8], framing: Framing, unindexed: bool, report: 
                         state.count()
                     )));
                 }
-                identities.add(&state.ids)?;
-                keyframe = Some((entry.chunk_offset, state.clone()));
-                current = Some((entry.chunk_offset, 0, state));
+                let introductions = keyframe_introductions(
+                    current.as_ref().map(|(_, _, _, state)| state),
+                    &state,
+                );
+                identities.add(&introductions)?;
+                keyframe = Some((entry.chunk_offset, head.level, state.clone()));
+                current = Some((entry.chunk_offset, 0, head.level, state));
                 Ok(head.count)
             })
         } else if entry.kind == 1 {
@@ -801,8 +846,8 @@ fn check_keyframe_delta(data: &[u8], framing: Framing, unindexed: bool, report: 
                 &sequence.windows,
                 &mut identities,
             )
-            .map(|(state, birth_count)| {
-                current = Some((entry.chunk_offset, entry.depth, state));
+            .map(|(state, birth_count, level)| {
+                current = Some((entry.chunk_offset, entry.depth, level, state));
                 birth_count
             })
         } else {
@@ -875,8 +920,9 @@ fn check_keyframe_delta(data: &[u8], framing: Framing, unindexed: bool, report: 
 fn check_keyframe_delta_streamed(data: &[u8], framing: Framing, report: &mut Report) {
     let mut windows: Vec<(f64, f64)> = Vec::new();
     let mut header: Option<rec::Header> = None;
-    let mut current: Option<(u64, u16, fourdgs::keyframe_delta::State)> = None;
-    let mut keyframe: Option<(u64, fourdgs::keyframe_delta::State)> = None;
+    let mut quantization: Option<rec::Quantization> = None;
+    let mut current: Option<(u64, u16, u32, fourdgs::keyframe_delta::State)> = None;
+    let mut keyframe: Option<(u64, u32, fourdgs::keyframe_delta::State)> = None;
     let mut previous_t1: Option<f64> = None;
     let mut band_count: Option<usize> = None;
     let mut identities = match IdentityCounter::new() {
@@ -909,7 +955,9 @@ fn check_keyframe_delta_streamed(data: &[u8], framing: Framing, report: &mut Rep
                 Ok(())
             }),
             op::QUANTIZATION => rec::Quantization::parse(content).and_then(|parsed| {
-                fourdgs::registry::check_quantization_scheme(&parsed.scheme)
+                fourdgs::registry::check_quantization_scheme(&parsed.scheme)?;
+                quantization = Some(parsed);
+                Ok(())
             }),
             op::WINDOW_TABLE => {
                 if let Ok(table) = rec::WindowTable::parse(content) {
@@ -919,6 +967,16 @@ fn check_keyframe_delta_streamed(data: &[u8], framing: Framing, report: &mut Rep
             }
             op::CHUNK => fourdgs::keyframe_delta_file::decode_keyframe_chunk(content, &windows)
                 .and_then(|(state, head)| {
+                    let quantization = quantization.as_ref().ok_or_else(|| {
+                        fourdgs::Error::Malformed(
+                            "a keyframe Chunk appears before Quantization".into(),
+                        )
+                    })?;
+                    fourdgs::keyframe_delta_file::check_keyframe_mu_t(
+                        &state,
+                        head.t0,
+                        quantization,
+                    )?;
                     if previous_t1.is_none() && head.t0 != 0.0 {
                         return Err(fourdgs::Error::Malformed(format!(
                             "the state chunks start at {}; they tile the timeline from 0 (section 11.1)",
@@ -933,14 +991,24 @@ fn check_keyframe_delta_streamed(data: &[u8], framing: Framing, report: &mut Rep
                             )));
                         }
                     }
-                    identities.add(&state.ids)?;
+                    let introductions = keyframe_introductions(
+                        current.as_ref().map(|(_, _, _, state)| state),
+                        &state,
+                    );
+                    identities.add(&introductions)?;
                     previous_t1 = Some(head.t1);
                     band_count = Some(head.count as usize);
-                    keyframe = Some((frame.offset, state.clone()));
-                    current = Some((frame.offset, 0, state));
+                    keyframe = Some((frame.offset, head.level, state.clone()));
+                    current = Some((frame.offset, 0, head.level, state));
                     Ok(())
                 }),
-            op::DELTA_CHUNK => rec::parse_delta_chunk(content).and_then(|(declared, ..)| {
+            op::DELTA_CHUNK => rec::parse_delta_chunk_records(content).and_then(|(declared, _)| {
+                if declared.reference_offset >= frame.offset {
+                    return Err(fourdgs::Error::Malformed(format!(
+                        "Delta Chunk at {} references {}; a Delta Chunk must reference a physically earlier record",
+                        frame.offset, declared.reference_offset
+                    )));
+                }
                 if let Some(previous) = previous_t1 {
                     if previous != declared.t0 {
                         return Err(fourdgs::Error::Malformed(format!(
@@ -953,10 +1021,12 @@ fn check_keyframe_delta_streamed(data: &[u8], framing: Framing, report: &mut Rep
                         "a streamed keyframe-delta sequence begins with a Delta Chunk".into(),
                     ));
                 }
-                let (reference_depth, reference) = match declared.delta_mode {
+                let (reference_depth, reference_level, reference) = match declared.delta_mode {
                     rec::DELTA_MODE_KEYFRAME => match &keyframe {
-                        Some((offset, state)) if declared.reference_offset == *offset => (0, state),
-                        Some((offset, _)) => {
+                        Some((offset, level, state)) if declared.reference_offset == *offset => {
+                            (0, *level, state)
+                        }
+                        Some((offset, _, _)) => {
                             return Err(fourdgs::Error::Malformed(format!(
                                 "a keyframe-mode delta at {} references {}; its GOP keyframe is at {offset}",
                                 frame.offset, declared.reference_offset
@@ -969,10 +1039,12 @@ fn check_keyframe_delta_streamed(data: &[u8], framing: Framing, report: &mut Rep
                         }
                     },
                     rec::DELTA_MODE_CHAINED => match &current {
-                        Some((offset, depth, state)) if declared.reference_offset == *offset => {
-                            (*depth, state)
+                        Some((offset, depth, level, state))
+                            if declared.reference_offset == *offset =>
+                        {
+                            (*depth, *level, state)
                         }
-                        Some((offset, _, _)) => {
+                        Some((offset, _, _, _)) => {
                             return Err(fourdgs::Error::Malformed(format!(
                                 "a chained delta at {} references {}; the immediately preceding state is at {offset}",
                                 frame.offset, declared.reference_offset
@@ -994,19 +1066,29 @@ fn check_keyframe_delta_streamed(data: &[u8], framing: Framing, report: &mut Rep
                 let expected_depth = reference_depth.checked_add(1).ok_or_else(|| {
                     fourdgs::Error::Malformed("delta chain depth overflows u16".into())
                 })?;
-                let keyframe_offset = keyframe.as_ref().map(|(offset, _)| *offset).unwrap_or(0);
-                if declared.depth != expected_depth || declared.keyframe_offset != keyframe_offset {
+                let keyframe_offset = keyframe
+                    .as_ref()
+                    .map(|(offset, _, _)| *offset)
+                    .unwrap_or(0);
+                if declared.depth != expected_depth
+                    || declared.keyframe_offset != keyframe_offset
+                    || declared.level != reference_level
+                {
                     return Err(fourdgs::Error::Malformed(format!(
-                        "Delta Chunk at {} declares depth {} and keyframe {}; its reference requires depth {expected_depth} and keyframe {keyframe_offset}",
-                        frame.offset, declared.depth, declared.keyframe_offset
+                        "Delta Chunk at {} declares depth {}, keyframe {}, and level {}; its reference requires depth {expected_depth}, keyframe {keyframe_offset}, and level {reference_level}",
+                        frame.offset, declared.depth, declared.keyframe_offset, declared.level
                     )));
                 }
                 fourdgs::keyframe_delta_file::compose_delta_chunk(reference, content, &windows)
-                    .and_then(|(state, head, births)| {
-                        identities.add(&births)?;
+                    .and_then(|(state, head, _births)| {
+                        let introductions = keyframe_introductions(
+                            current.as_ref().map(|(_, _, _, state)| state),
+                            &state,
+                        );
+                        identities.add(&introductions)?;
                         previous_t1 = Some(head.t1);
                         band_count = Some(head.birth_count as usize);
-                        current = Some((frame.offset, head.depth, state));
+                        current = Some((frame.offset, head.depth, head.level, state));
                         Ok(())
                     })
             }),
@@ -1389,6 +1471,31 @@ mod tests {
             .filter(|f| f.severity == Severity::Error)
             .map(|f| f.message.clone())
             .collect()
+    }
+
+    #[test]
+    fn an_identity_introduction_is_never_counted_twice() {
+        let mut identities = IdentityCounter::new().unwrap();
+        identities.add(&[17]).unwrap();
+        identities.add(&[17]).unwrap();
+        let error = identities.finish().unwrap_err();
+        assert!(
+            error.to_string().contains("may not be reused after death"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_later_keyframe_logs_only_newly_live_identities() {
+        let current = fourdgs::keyframe_delta::State {
+            ids: vec![1, 2],
+            bins: Default::default(),
+        };
+        let next = fourdgs::keyframe_delta::State {
+            ids: vec![2, 3],
+            bins: Default::default(),
+        };
+        assert_eq!(keyframe_introductions(Some(&current), &next), vec![3]);
     }
 
     #[test]

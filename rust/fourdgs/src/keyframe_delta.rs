@@ -201,6 +201,15 @@ pub fn apply_delta(
                     ),
                 );
             };
+            if delta.channels != base.channels {
+                return refuse(
+                    "stream-channel-count-mismatch",
+                    format!(
+                        "attribute {attribute} carries {} channels in the update and {} in the referenced state",
+                        delta.channels, base.channels
+                    ),
+                );
+            }
             let channels = base.channels;
             if is_absolute_in_update(*attribute) {
                 for (k, &row) in rows.iter().enumerate() {
@@ -278,6 +287,17 @@ pub fn apply_delta(
             let birth = birth_bins.get(&attribute);
             match state.bins.get(&attribute) {
                 Some(base) => {
+                    if let Some(b) = birth {
+                        if b.channels != base.channels {
+                            return refuse(
+                                "stream-channel-count-mismatch",
+                                format!(
+                                    "attribute {attribute} carries {} channels in the birth and {} in the referenced state",
+                                    b.channels, base.channels
+                                ),
+                            );
+                        }
+                    }
                     let mut values = base.values.clone();
                     if let Some(b) = birth {
                         values.extend_from_slice(&b.values);

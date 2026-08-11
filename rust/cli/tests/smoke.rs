@@ -869,6 +869,126 @@ fn delta_mode_must_name_the_reference_that_mode_defines() {
 }
 
 #[test]
+fn a_keyframe_index_must_clear_its_delta_only_fields() {
+    let Some(source) = keyframe_file() else {
+        return;
+    };
+    let data = std::fs::read(&source).unwrap();
+    let (start, _) = summary_bounds(&data);
+    let (mut entries, rest) = summary_parts(&data);
+    assert_eq!(entries[0].kind, 0);
+    entries[0].delta_mode = fourdgs::records::DELTA_MODE_CHAINED;
+    entries[0].reference_offset = 123;
+
+    let summary: Vec<u8> = entries
+        .iter()
+        .flat_map(|entry| entry.encode())
+        .chain(rest)
+        .collect();
+    let path = fixture(
+        "fourdgs-cli-kd-keyframe-index-fields.4dgs",
+        &rebuilt(&data[..start], &summary),
+    );
+    let out = run(&["validate", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("delta mode 1, reference 123"), "{text}");
+    std::fs::remove_file(path).ok();
+}
+
+#[test]
+fn a_delta_chunk_must_match_its_references_level() {
+    let Some(source) = keyframe_file() else {
+        return;
+    };
+    let mut data = std::fs::read(&source).unwrap();
+    let (start, _) = summary_bounds(&data);
+    let (entries, rest) = summary_parts(&data);
+    let target = entries.iter().find(|entry| entry.kind == 1).unwrap();
+    let content = target.chunk_offset as usize + fourdgs::serialization::RECORD_HEADER_SIZE;
+    data[content + 16..content + 20].copy_from_slice(&1u32.to_le_bytes());
+
+    let summary: Vec<u8> = entries
+        .iter()
+        .flat_map(|entry| entry.encode())
+        .chain(rest)
+        .collect();
+    let path = fixture(
+        "fourdgs-cli-kd-level.4dgs",
+        &rebuilt(&data[..start], &summary),
+    );
+    let out = run(&["validate", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains("declares level 1") && text.contains("declares level 0"),
+        "{text}"
+    );
+    std::fs::remove_file(path).ok();
+}
+
+#[test]
+fn a_delta_reference_must_be_physically_behind_its_chunk() {
+    let Some(source) = keyframe_files().into_iter().find(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("KeyframeDelta-"))
+    }) else {
+        return;
+    };
+    let mut data = std::fs::read(&source).unwrap();
+    let (start, _) = summary_bounds(&data);
+    let (mut entries, rest) = summary_parts(&data);
+    assert!(entries.len() >= 3);
+    assert_eq!((entries[1].kind, entries[2].kind), (1, 1));
+
+    // Put the later physical Delta first on the timeline and make it a legal
+    // keyframe-referenced state. The earlier physical Delta then chains from it: every
+    // timeline relationship is sound, leaving only the backwards-offset invariant to
+    // reject the file.
+    let first_interval = (entries[1].t0, entries[1].t1);
+    let second_interval = (entries[2].t0, entries[2].t1);
+    entries[1].t0 = second_interval.0;
+    entries[1].t1 = second_interval.1;
+    entries[1].delta_mode = fourdgs::records::DELTA_MODE_CHAINED;
+    entries[1].reference_offset = entries[2].chunk_offset;
+    entries[1].depth = 2;
+    entries[2].t0 = first_interval.0;
+    entries[2].t1 = first_interval.1;
+    entries[2].delta_mode = fourdgs::records::DELTA_MODE_KEYFRAME;
+    entries[2].reference_offset = entries[0].chunk_offset;
+    entries[2].depth = 1;
+
+    for &i in &[1usize, 2] {
+        let content = entries[i].chunk_offset as usize + fourdgs::serialization::RECORD_HEADER_SIZE;
+        data[content..content + 8].copy_from_slice(&entries[i].t0.to_le_bytes());
+        data[content + 8..content + 16].copy_from_slice(&entries[i].t1.to_le_bytes());
+        data[content + 20] = entries[i].delta_mode;
+        data[content + 21..content + 29]
+            .copy_from_slice(&entries[i].reference_offset.to_le_bytes());
+        data[content + 37..content + 39].copy_from_slice(&entries[i].depth.to_le_bytes());
+    }
+
+    let summary: Vec<u8> = entries
+        .iter()
+        .flat_map(|entry| entry.encode())
+        .chain(rest)
+        .collect();
+    let path = fixture(
+        "fourdgs-cli-kd-forward-reference.4dgs",
+        &rebuilt(&data[..start], &summary),
+    );
+    let out = run(&["validate", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains("must reference a physically earlier record"),
+        "{text}"
+    );
+    std::fs::remove_file(path).ok();
+}
+
+#[test]
 fn indexed_band_number_must_match_the_physical_record() {
     let Some(source) = keyframe_file() else {
         return;

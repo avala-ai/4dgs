@@ -81,7 +81,9 @@ pub struct Walk {
     pub records: Vec<Frame>,
     pub cut: Option<Cut>,
     /// True when the last eight bytes are the magic, as a whole file's are.
+    #[allow(dead_code)] // retained for the focused framing tests; inspect uses WalkSummary
     pub trailing_magic: bool,
+    #[allow(dead_code)] // retained for the focused framing tests; inspect uses WalkSummary
     pub size: u64,
 }
 
@@ -92,6 +94,7 @@ impl Walk {
     /// inside — its declared length is the fault, and hiding the record would hide the
     /// field that carries it — but that record's content is not in the file, so a caller
     /// that means to read one must not be handed it.
+    #[allow(dead_code)] // coverage tests exercise the former retained-walk caller directly
     pub fn first_intact(&self, opcode: u8) -> Option<Frame> {
         self.intact_records()
             .iter()
@@ -116,6 +119,16 @@ impl Walk {
     }
 }
 
+/// Aggregate framing facts for a pass that does not retain one [`Frame`] per record.
+#[derive(Debug, Clone, Default)]
+pub struct WalkSummary {
+    pub cut: Option<Cut>,
+    pub trailing_magic: bool,
+    pub size: u64,
+    pub record_count: usize,
+    pub intact: usize,
+}
+
 /// Every top-level record, from framing alone.
 ///
 /// Reads nine bytes per record and steps over the content, so this is as cheap on a file
@@ -123,11 +136,30 @@ impl Walk {
 /// a walk over bytes that are not ours would report whatever the first byte happened to
 /// mean as an opcode.
 pub fn walk(source: &mut dyn Readable) -> Result<Walk> {
+    let mut records = Vec::new();
+    let summary = walk_each(source, |frame, _| records.push(frame))?;
+    Ok(Walk {
+        records,
+        cut: summary.cut,
+        trailing_magic: summary.trailing_magic,
+        size: summary.size,
+    })
+}
+
+/// Walk every frame through a callback while retaining only aggregate facts.
+///
+/// `intact` is false only for the final reported frame when the file ends inside that
+/// record. Inspect uses two passes: one finds the Footer/checksum declaration, and one emits
+/// rows directly. Its memory therefore stays constant even for millions of empty records.
+pub fn walk_each(
+    source: &mut dyn Readable,
+    mut visit: impl FnMut(Frame, bool),
+) -> Result<WalkSummary> {
     let size = source.size()?;
     let head = source.read(0, (MAGIC.len() as u64).min(size))?;
     fourdgs::serialization::check_magic(&head)?;
 
-    let mut out = Walk {
+    let mut out = WalkSummary {
         size,
         ..Default::default()
     };
@@ -186,10 +218,16 @@ pub fn walk(source: &mut dyn Readable) -> Result<Walk> {
         };
         // A record is listed either way: a declared length that runs off the end is a fact
         // about that record, and hiding the record hides the field that carries the fault.
-        out.records.push(frame);
         match at.checked_add(frame.total()) {
-            Some(end) if end <= size => at = end,
+            Some(end) if end <= size => {
+                visit(frame, true);
+                out.record_count += 1;
+                out.intact += 1;
+                at = end;
+            }
             _ => {
+                visit(frame, false);
+                out.record_count += 1;
                 out.cut = Some(Cut {
                     at,
                     reason: format!(
@@ -746,6 +784,28 @@ mod tests {
             at += frame.total();
         }
         assert_eq!(at, walk.size - MAGIC.len() as u64);
+    }
+
+    #[test]
+    fn a_streaming_walk_retains_only_aggregate_facts_for_many_records() {
+        let mut data = MAGIC.to_vec();
+        for _ in 0..50_000 {
+            fourdgs::serialization::put_record(&mut data, 0xee, &[]);
+        }
+        data.extend_from_slice(&MAGIC);
+
+        let mut visited = 0usize;
+        let summary = walk_each(&mut BytesReadable::new(&data), |_, intact| {
+            assert!(intact);
+            visited += 1;
+        })
+        .unwrap();
+
+        assert_eq!(visited, 50_000);
+        assert_eq!(summary.record_count, visited);
+        assert_eq!(summary.intact, visited);
+        assert!(summary.trailing_magic);
+        assert!(summary.cut.is_none());
     }
 
     #[test]

@@ -355,8 +355,11 @@ const FOOTER_FIELDS: u64 = 20;
 /// the walk lists that record because its declared length is the fault, but its content is
 /// not in the file, and a read of it would end `inspect` through the error path with the
 /// intact-prefix report unprinted. Which is exactly the file this command exists for.
-fn coverage(source: &mut dyn Readable, walk: &crate::refusal::Walk) -> Result<Option<Coverage>> {
-    let Some(frame) = walk.first_intact(op::FOOTER) else {
+fn coverage(
+    source: &mut dyn Readable,
+    footer_frame: Option<crate::refusal::Frame>,
+) -> Result<Option<Coverage>> {
+    let Some(frame) = footer_frame else {
         return Ok(None);
     };
     let content = source.read(
@@ -404,24 +407,33 @@ fn coverage(source: &mut dyn Readable, walk: &crate::refusal::Walk) -> Result<Op
 /// throwing the rest away.
 pub fn inspect(args: &Args) -> Result<u8> {
     let mut source = FileReadable::open(&args.file)?;
-    let walk = crate::refusal::walk(&mut source)?;
-    let coverage = coverage(&mut source, &walk)?;
+    let mut footer = None;
+    let summary = crate::refusal::walk_each(&mut source, |frame, intact| {
+        if intact && frame.opcode == op::FOOTER && footer.is_none() {
+            footer = Some(frame);
+        }
+    })?;
+    let coverage = coverage(&mut source, footer)?;
 
     if args.json {
-        print_inspect_json(&walk, &coverage);
+        print_inspect_json(&mut source, &summary, &coverage)?;
     } else {
-        print_inspect_text(&walk, &coverage);
+        print_inspect_text(&mut source, &summary, &coverage)?;
     }
     // The prefix was recovered and reported; the file is still not a whole one, and a
     // pipeline that goes on to read it should not be told otherwise.
-    Ok(if walk.cut.is_some() {
+    Ok(if summary.cut.is_some() {
         EXIT_FAILED
     } else {
         EXIT_OK
     })
 }
 
-fn print_inspect_text(walk: &crate::refusal::Walk, coverage: &Option<Coverage>) {
+fn print_inspect_text(
+    source: &mut dyn Readable,
+    walk: &crate::refusal::WalkSummary,
+    coverage: &Option<Coverage>,
+) -> Result<()> {
     out!(
         "{:>12}  {:<18} {:>14}  {:>14}  {}",
         "offset",
@@ -438,7 +450,7 @@ fn print_inspect_text(walk: &crate::refusal::Walk, coverage: &Option<Coverage>) 
         8,
         "-"
     );
-    for frame in &walk.records {
+    crate::refusal::walk_each(source, |frame, _| {
         out!(
             "{:>12}  {:<18} {:>14}  {:>14}  {}",
             commas(frame.offset),
@@ -447,7 +459,7 @@ fn print_inspect_text(walk: &crate::refusal::Walk, coverage: &Option<Coverage>) 
             commas(frame.total()),
             Coverage::cell(coverage, frame.offset, frame.total())
         );
-    }
+    })?;
     if walk.trailing_magic {
         out!(
             "{:>12}  {:<18} {:>14}  {:>14}  {}",
@@ -460,7 +472,7 @@ fn print_inspect_text(walk: &crate::refusal::Walk, coverage: &Option<Coverage>) 
     }
     out!(
         "\n{} records, {} bytes",
-        walk.records.len(),
+        walk.record_count,
         commas(walk.size)
     );
     match &walk.cut {
@@ -469,7 +481,7 @@ fn print_inspect_text(walk: &crate::refusal::Walk, coverage: &Option<Coverage>) 
             out!(
                 "the {} complete records above are the intact prefix, which is what a streamed \
                  reader keeps{}",
-                walk.intact(),
+                walk.intact,
                 if cut.inside_a_record {
                     "; the last row is the record the file was cut inside"
                 } else {
@@ -488,9 +500,14 @@ fn print_inspect_text(walk: &crate::refusal::Walk, coverage: &Option<Coverage>) 
         ),
         None => out!("crc: this file declares no summary checksum, so nothing here is covered"),
     }
+    Ok(())
 }
 
-fn print_inspect_json(walk: &crate::refusal::Walk, coverage: &Option<Coverage>) {
+fn print_inspect_json(
+    source: &mut dyn Readable,
+    walk: &crate::refusal::WalkSummary,
+    coverage: &Option<Coverage>,
+) -> Result<()> {
     out!("{{");
     out!("  \"size\": {},", walk.size);
     out!("  \"trailing_magic\": {},", walk.trailing_magic);
@@ -514,8 +531,10 @@ fn print_inspect_json(walk: &crate::refusal::Walk, coverage: &Option<Coverage>) 
         None => out!("  \"summary_crc\": null,"),
     }
     out!("  \"records\": [");
-    for (i, frame) in walk.records.iter().enumerate() {
-        let comma = if i + 1 == walk.records.len() { "" } else { "," };
+    let mut i = 0usize;
+    crate::refusal::walk_each(source, |frame, _| {
+        i += 1;
+        let comma = if i == walk.record_count { "" } else { "," };
         let crc = Coverage::cell(coverage, frame.offset, frame.total());
         let crc = if crc == "-" {
             "null".to_string()
@@ -530,9 +549,10 @@ fn print_inspect_json(walk: &crate::refusal::Walk, coverage: &Option<Coverage>) 
             frame.length,
             frame.total()
         );
-    }
+    })?;
     out!("  ]");
     out!("}}");
+    Ok(())
 }
 
 /// Report the gaussians visible at an instant.
@@ -769,7 +789,8 @@ mod tests {
         );
 
         source.largest.set(0);
-        let coverage = coverage(&mut source, &walk).expect("a coverage verdict");
+        let coverage =
+            coverage(&mut source, walk.first_intact(op::FOOTER)).expect("a coverage verdict");
         assert!(
             coverage.is_some_and(|c| c.ok),
             "the fixture's summary checksum agrees"
@@ -798,7 +819,7 @@ mod tests {
         data.extend_from_slice(&MAGIC);
         let mut source = BytesReadable::new(&data);
         let walk = crate::refusal::walk(&mut source).expect("a walk");
-        assert!(coverage(&mut source, &walk).is_err());
+        assert!(coverage(&mut source, walk.first_intact(op::FOOTER)).is_err());
     }
 
     #[test]
@@ -811,7 +832,8 @@ mod tests {
 
         let mut source = BytesReadable::new(&data);
         let walk = crate::refusal::walk(&mut source).expect("a framing walk");
-        let error = coverage(&mut source, &walk).expect_err("the checksum range is impossible");
+        let error = coverage(&mut source, walk.first_intact(op::FOOTER))
+            .expect_err("the checksum range is impossible");
         assert!(
             error.to_string().contains("after the Footer itself"),
             "{error}"
