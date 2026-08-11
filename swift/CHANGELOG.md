@@ -10,6 +10,28 @@ All notable changes to the Swift package are documented here, following
 
 ### Added
 
+- `4dgs`, the inspect-and-validate tool, completing the row across all six SDKs. `4dgs inspect`
+  walks a file record by record — offset, opcode by name, content and total length, and whether the
+  Footer's summary checksum covers that record and agrees — and a file that was cut is walked as far
+  as it goes, then reports the byte it stopped at and how many complete records before it a streamed
+  reader keeps. `4dgs validate` names the refusal identifier and the byte it fired at: all seven
+  invalid corpus variants are refused by the identifier their `.json` declares, at bytes 0, 8, 0,
+  154, 659, 8 and 2506 — the same bytes the Rust tool prints. Exit codes are 0 valid, 1 refused or
+  invalid, 2 valid with warnings, and 3 for the tool could not run, which is the absence of an
+  answer rather than an answer about the file.
+
+  The tool is a library plus a three-line executable, so its tests drive the whole of it — arguments
+  in, output and exit code out — without spawning a process. It decodes the chunks, and every band
+  the index declares rather than band 0: an SH Band Stream carrying a codec this build does not
+  implement is a file that does not decode, and a scan that capped the bands would call it valid.
+  When one refuses, the byte names that band's own record.
+
+  Being a binding, it validates a strict subset of what the Python validator checks — framing, the
+  records a file must carry, where the chunk index points, the summary checksum, and everything the
+  reader itself decides. It has no record parsers of its own and does not grow any; the consequence
+  is that on a file it calls valid, Python may still have something to say. It never reports a
+  finding Python contradicts.
+
 - The package can be depended on. `Package.swift` moved to the repository root, because SwiftPM
   clones the URL it is given and looks for a manifest at the top of that clone — a manifest under
   `swift/` is invisible to `.package(url:)`, so nothing could depend on this package at all. The

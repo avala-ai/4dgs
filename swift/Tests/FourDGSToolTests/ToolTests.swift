@@ -1,0 +1,350 @@
+// Copyright 2026 Avala AI
+// SPDX-License-Identifier: Apache-2.0
+
+/// The `4dgs` tool, over the corpus that already knows the answers.
+///
+/// The invalid corpus is seven files, each with a `.json` beside it naming the rule it breaks.
+/// That mapping is not restated here: it is read out of the corpus, so this suite cannot drift
+/// into agreeing with a stale copy of itself, and a corpus that grows an eighth variant fails this
+/// suite until the tool has an answer for it.
+///
+/// The tool is driven through `run(_:out:err:)` with argument strings and a pair of sinks, which
+/// is the whole tool including its exit codes — no subprocess, so this behaves the same wherever
+/// the package builds.
+
+import Foundation
+import FourDGS
+import XCTest
+
+@testable import FourDGSTool
+
+/// One run of the tool: what it printed, and what it exited with.
+private struct Runs {
+    let code: Int32
+    let out: String
+    let err: String
+}
+
+private func runTool(_ arguments: [String]) -> Runs {
+    let out = TextBuffer()
+    let err = TextBuffer()
+    let code = run(arguments, out: out, err: err)
+    return Runs(code: code, out: out.text, err: err.text)
+}
+
+/// A conforming capture carrying provenance records — a coordinate frame, a rig trajectory and
+/// sensor calibrations — which is the variant that would produce spurious "unknown record" notes
+/// if the provenance family were not recognized.
+private let provenanceVariant = "TenWindows-UseChunkIndex-UseCrc-WithFrame-WithRig-WithSensors.4dgs"
+
+/// Where the generated corpus lives. Located from this file rather than from the working
+/// directory, because `swift test` does not promise one.
+private func corpusDirectory() -> URL {
+    if let fromEnvironment = ProcessInfo.processInfo.environment["FOURDGS_CORPUS"] {
+        return URL(fileURLWithPath: fromEnvironment)
+    }
+    var root = URL(fileURLWithPath: #filePath)
+    for _ in 0..<4 { root.deleteLastPathComponent() }
+    return root.appendingPathComponent("tests/conformance/data")
+}
+
+/// Skip when the corpus is not on disk.
+///
+/// The corpus is generated rather than committed, so a developer who has not run the generator
+/// gets skipped tests instead of failures — but CI generates it before this suite runs, and there
+/// a missing corpus is a suite that silently did not run.
+private func requireCorpus() throws {
+    let invalid = corpusDirectory().appendingPathComponent("invalid")
+    if FileManager.default.fileExists(atPath: invalid.path) { return }
+    if ProcessInfo.processInfo.environment["CI"] != nil {
+        XCTFail("the corpus is missing; run tests/conformance/generate.py")
+        return
+    }
+    throw XCTSkip("no corpus; run tests/conformance/generate.py first")
+}
+
+/// Every `.4dgs` in a corpus directory, sorted so a failure names the same file twice running.
+private func variants(_ directory: URL) -> [URL] {
+    let found = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
+    return
+        found
+        .filter { $0.hasSuffix(".4dgs") }
+        .sorted()
+        .map { directory.appendingPathComponent($0) }
+}
+
+/// The `"refused"` member of an expectation file: the identifier the corpus says a reader must
+/// produce for these bytes.
+private func expectedRefusal(_ variant: URL) -> String? {
+    let json = variant.deletingPathExtension().appendingPathExtension("json")
+    guard let data = FileManager.default.contents(atPath: json.path),
+        let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return nil }
+    return object["refused"] as? String
+}
+
+final class ValidateTests: XCTestCase {
+
+    /// The strongest evidence there is that this tool is right, because the corpus already knows
+    /// the answer and the tool had no hand in writing it. "Refused" alone is not the property: a
+    /// reader that refuses every one of these for the wrong reason passes a test that only checks
+    /// the exit code, and that is precisely the failure the invalid corpus was built to catch.
+    func testEveryInvalidVariantIsRefusedByItsOwnIdentifier() throws {
+        try requireCorpus()
+        let files = variants(corpusDirectory().appendingPathComponent("invalid"))
+        XCTAssertEqual(files.count, 7)
+        for file in files {
+            let code = try XCTUnwrap(expectedRefusal(file), "\(file.lastPathComponent)")
+            let result = runTool(["validate", file.path])
+            // Non-zero, and this non-zero: 3 would mean the tool could not read the file at all.
+            XCTAssertEqual(result.code, exitFailed, "\(file.lastPathComponent)")
+            // And the byte, which is the question its holder actually has. Every one of these is
+            // placeable: four in the front matter, two inside a chunk the tool decodes.
+            XCTAssertTrue(
+                result.out.contains("refusal \(code) at byte "),
+                "\(file.lastPathComponent) said: \(result.out)")
+        }
+    }
+
+    func testAConformingCaptureIsValid() throws {
+        try requireCorpus()
+        let file = corpusDirectory().appendingPathComponent(provenanceVariant)
+        let result = runTool(["validate", file.path])
+        XCTAssertEqual(result.code, exitOk, result.out)
+        XCTAssertTrue(result.out.contains("valid"))
+        // Provenance records are specified records, not unknown ones. Reporting them as unknown
+        // would put four notes on every conforming capture that Python says nothing about.
+        XCTAssertFalse(result.out.contains("unknown record"))
+        XCTAssertFalse(result.out.contains("error:"))
+    }
+
+    /// It is not, in the Python validator: every structural check there assumes the
+    /// gaussian-birth chunk shape, so a file whose Chunks are keyframes and whose Delta Chunks
+    /// are differences comes back invalid. The core implements the model — the conformance suite
+    /// proves it — so refusing a file for declaring it was never a statement about the file.
+    func testAConformingKeyframeDeltaFileIsValid() throws {
+        try requireCorpus()
+        let files = variants(corpusDirectory().appendingPathComponent("keyframe"))
+        XCTAssertFalse(files.isEmpty)
+        for file in files {
+            let result = runTool(["validate", file.path])
+            XCTAssertEqual(result.code, exitOk, "\(file.lastPathComponent) said: \(result.out)")
+            XCTAssertFalse(result.out.contains("error:"), result.out)
+        }
+    }
+
+    /// The other half of the corpus's evidence: a validator that refused everything would pass
+    /// the check above and fail this one.
+    func testEveryValidVariantIsValid() throws {
+        try requireCorpus()
+        // The object-layer variants live in their own directory and are conforming files like any
+        // other; a validator that only ever saw the flat directory would not know that.
+        let files =
+            variants(corpusDirectory()) + variants(corpusDirectory().appendingPathComponent("object"))
+        XCTAssertGreaterThanOrEqual(files.count, 40)
+        for file in files {
+            let result = runTool(["validate", file.path])
+            // 0, or 2 for a variant that carries no chunk index and warns about it. Never 1.
+            XCTAssertTrue(
+                result.code == exitOk || result.code == exitWarnings,
+                "\(file.lastPathComponent) said: \(result.out)")
+        }
+    }
+
+    /// A band that will not decode is a file that will not decode.
+    ///
+    /// Spherical harmonics do not enter reconstructed state, so a *renderer* is right to cap them
+    /// — but an SH Band Stream is a stream like any other, and a scan that capped the bands would
+    /// report this file `valid` while a reader asked for its harmonics refuses it. The corpus has
+    /// no variant for it, so this makes one the way `tests/conformance/generator/invalid.py` makes
+    /// its own: one byte, length-preserving, breaking exactly one rule. A stream's codec is the
+    /// fourth byte of its header (spec §5.5), one past the band number an SH Band Stream record
+    /// opens with (§5.7), and the registry reserves 4-127 — so 9 is legal-but-unimplemented rather
+    /// than nonsense.
+    func testABandThatWillNotDecodeIsRefusedAndPlacedAtItsOwnRecord() throws {
+        try requireCorpus()
+        let variant = "MixedLifetimes-SHDegree3-UseChunkIndex-UseCrc.4dgs"
+        var bytes = try readWhole(corpusDirectory().appendingPathComponent(variant).path)
+        XCTAssertTrue(validate(bytes).ok, "the unpatched variant is a conforming file")
+
+        let walked = try walk(bytes)
+        let bands = walked.records.filter { $0.opcode == 0x07 }
+        XCTAssertGreaterThanOrEqual(bands.count, 3)
+        // The second band record of the first chunk, so the narrowing has to walk past a band that
+        // decodes before it reaches the one that does not.
+        let band = bands[1]
+        bytes[Int(band.offset + recordHeaderSize) + 4] = 9
+
+        let report = validate(bytes)
+        XCTAssertFalse(report.ok, "a band that does not decode is not a valid file")
+        let refusal = try XCTUnwrap(report.findings.compactMap(\.refusal).first)
+        XCTAssertEqual(refusal.code, .unknownStreamCodec)
+        // The band's own record, not the Chunk thousands of bytes away.
+        XCTAssertEqual(refusal.site?.offset, band.offset)
+        XCTAssertEqual(
+            refusal.site?.what, "the SH Band Stream for band 2 of the Chunk at index entry 0")
+    }
+
+    /// A cut file is invalid and every finding stands — but records are length-prefixed, so what
+    /// is complete before the cut is intact, and how much of it survived is the question its
+    /// holder actually has.
+    func testACutFileReportsTheIntactPrefixAndTheByte() throws {
+        try requireCorpus()
+        let bytes = try readWhole(corpusDirectory().appendingPathComponent(provenanceVariant).path)
+        let whole = try walk(bytes)
+        let cutBytes = Array(bytes.prefix(bytes.count / 2))
+        let cut = try walk(cutBytes)
+        let where_ = try XCTUnwrap(cut.cut)
+        XCTAssertLessThan(where_.at, UInt64(cutBytes.count))
+        XCTAssertFalse(cut.trailingMagic)
+        // The intact prefix is still framed, and the record the file was cut inside is reported
+        // but is not part of it: hiding that record would hide the declared length that is the
+        // fault.
+        XCTAssertFalse(cut.records.isEmpty)
+        XCTAssertLessThan(cut.records.count, whole.records.count)
+        XCTAssertEqual(cut.intact, cut.records.count - 1)
+
+        let report = validate(cutBytes)
+        XCTAssertFalse(report.ok)
+        XCTAssertTrue(
+            report.findings.contains {
+                $0.severity == .note && $0.message.hasPrefix("the file is cut at byte ")
+            }, "\(report.findings.map(\.message))")
+    }
+}
+
+final class InspectTests: XCTestCase {
+
+    func testAWalkFramesEveryRecordAndEndsOnTheMagic() throws {
+        try requireCorpus()
+        let bytes = try readWhole(corpusDirectory().appendingPathComponent(provenanceVariant).path)
+        let walked = try walk(bytes)
+        XCTAssertTrue(walked.trailingMagic)
+        XCTAssertNil(walked.cut)
+        XCTAssertNotNil(walked.firstIntact(Opcode.header))
+        XCTAssertNotNil(walked.firstIntact(Opcode.footer))
+        // Every record accounted for, back to back: the offsets have to tile the file.
+        var at = UInt64(magic.count)
+        for frame in walked.records {
+            XCTAssertEqual(frame.offset, at)
+            at += frame.total
+        }
+        XCTAssertEqual(at, walked.size - UInt64(magic.count))
+    }
+
+    func testInspectPrintsOneRowPerRecordAndReportsACut() throws {
+        try requireCorpus()
+        let file = corpusDirectory().appendingPathComponent(provenanceVariant)
+        let whole = runTool(["inspect", file.path])
+        XCTAssertEqual(whole.code, exitOk)
+        XCTAssertTrue(whole.out.contains("offset  record"))
+        XCTAssertTrue(whole.out.contains(" records, "))
+        XCTAssertFalse(whole.out.contains("truncated at byte"))
+        // The summary checksum is a fact about a region, so the covered range is named beneath
+        // the table rather than left for the reader to infer from the column.
+        XCTAssertTrue(whole.out.contains("crc: the Footer's summary checksum covers bytes "))
+
+        let json = runTool(["inspect", "--json", file.path])
+        XCTAssertEqual(json.code, exitOk)
+        XCTAssertTrue(json.out.contains("\"records\": ["))
+        XCTAssertTrue(json.out.contains("\"truncated_at\": null"))
+    }
+
+    /// `1` is an answer about a file: it was read, and it is bad. `3` is the absence of an answer,
+    /// and a pipeline that saw `1` for both could not tell a corrupt asset from a typo in a path.
+    func testTheToolCouldNotRunHasItsOwnExitCode() {
+        XCTAssertEqual(runTool(["validate", "/nonexistent-4dgs-file"]).code, exitTool)
+        XCTAssertEqual(runTool(["inspect", "/nonexistent-4dgs-file"]).code, exitTool)
+        XCTAssertEqual(runTool(["frobnicate", "x"]).code, exitTool)
+        XCTAssertEqual(runTool(["validate"]).code, exitTool)
+        XCTAssertEqual(runTool(["validate", "--nonsense", "x"]).code, exitTool)
+        XCTAssertEqual(runTool(["validate", "--json", "x"]).code, exitTool)
+        // A request that was served is not a failure.
+        XCTAssertEqual(runTool(["--help"]).code, exitOk)
+        XCTAssertEqual(runTool([]).code, exitOk)
+        XCTAssertEqual(runTool(["--version"]).code, exitOk)
+    }
+}
+
+final class RefusalPlacementTests: XCTestCase {
+
+    /// A truncated transport is a real error and not a refusal. Inventing a code for it would be
+    /// inventing conformance.
+    func testAnErrorTheRefusalTableDoesNotNameIsNotGivenAnIdentifier() {
+        let truncated = FourDGSError.truncated(
+            offset: 0, record: "magic", needed: 8, available: 3)
+        XCTAssertNil(describe(truncated, walk: Walk(), site: nil))
+    }
+
+    /// And a refusal about the magic is placed at byte zero without a walk, because the walk that
+    /// would find a record cannot start until the magic passes.
+    func testAMagicRefusalIsPlacedAtByteZeroWithoutAWalk() throws {
+        let error = FourDGSError.notFourDGS(offset: 0, found: [0, 1, 2, 3, 4, 5, 6, 7])
+        let named = try XCTUnwrap(describe(error, walk: nil, site: nil))
+        XCTAssertEqual(named.code, .magicMismatch)
+        XCTAssertEqual(named.site?.offset, 0)
+    }
+
+    /// An ambiguous file gets the identifier without a byte. Nothing forbids a second Header, the
+    /// reader refuses at the first one carrying a value it does not implement, and this package
+    /// has no record parser to tell them apart — so it says nothing rather than naming a record
+    /// that may be perfectly good.
+    func testASecondRecordOfTheSameKindLeavesTheRefusalUnplaced() throws {
+        let error = FourDGSError.malformed(
+            offset: 0, record: "Header", field: "temporal_model", reason: "unknown",
+            refusal: .unknownTemporalModel)
+        var one = Walk()
+        one.records = [Frame(opcode: Opcode.header, offset: 8, length: 10)]
+        XCTAssertEqual(try XCTUnwrap(describe(error, walk: one, site: nil)).site?.offset, 8)
+
+        var two = one
+        two.records.append(Frame(opcode: Opcode.header, offset: 27, length: 10))
+        XCTAssertNil(try XCTUnwrap(describe(error, walk: two, site: nil)).site)
+    }
+
+    func testTheDisplayFormCarriesTheCodeAndTheByte() {
+        let named = Named(
+            code: .unknownTemporalModel, site: Site(offset: 8, what: "the Header record"))
+        XCTAssertEqual(
+            "\(named)", "refusal unknown-temporal-model at byte 8 (the Header record)")
+        XCTAssertEqual("\(Named(code: .unknownStreamCodec, site: nil))", "refusal unknown-stream-codec")
+    }
+
+    func testOpcodeNamesCoverTheOpenRanges() {
+        XCTAssertEqual(opcodeName(0x01), "Header")
+        XCTAssertEqual(opcodeName(0x10), "DeltaChunk")
+        XCTAssertEqual(opcodeName(0x25), "ObjectTrack")
+        // The two ranges the specification leaves open, told apart because the fix differs: a
+        // private record is somebody else's business and an unknown one is a later revision's.
+        XCTAssertEqual(opcodeName(0x7D), "Unknown(0x7D)")
+        XCTAssertEqual(opcodeName(0x91), "Private(0x91)")
+        XCTAssertTrue(isSpecified(0x25))
+        XCTAssertFalse(isSpecified(0x26))
+        XCTAssertTrue(isProvenance(0x26))
+        XCTAssertTrue(isPrivate(0x80))
+    }
+
+    func testCommasMatchThePythonToolsThousandsSeparator() {
+        XCTAssertEqual(commas(0), "0")
+        XCTAssertEqual(commas(999), "999")
+        XCTAssertEqual(commas(1000), "1,000")
+        XCTAssertEqual(commas(9896), "9,896")
+        XCTAssertEqual(commas(1_234_567), "1,234,567")
+    }
+
+    /// CRC-32 (IEEE), against the vector every implementation of it is checked with.
+    func testCrc32MatchesTheStandardVector() {
+        XCTAssertEqual(crc32(Array("123456789".utf8)[...]), 0xCBF4_3926)
+    }
+
+    /// A declared length that would wrap `UInt64` is reported as a record running past the end
+    /// rather than as a total that fits — which is what a saturating add is for.
+    func testARecordLengthThatWouldWrapIsACut() throws {
+        let bytes = magic + [Opcode.header] + [UInt8](repeating: 0xFF, count: 8) + magic
+        let walked = try walk(bytes)
+        let cut = try XCTUnwrap(walked.cut)
+        XCTAssertTrue(cut.insideARecord)
+        XCTAssertEqual(cut.at, 8)
+        XCTAssertEqual(walked.intact, 0)
+    }
+}
