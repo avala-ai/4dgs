@@ -28,6 +28,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable, Iterator
 from typing import NamedTuple
 
@@ -316,7 +317,7 @@ def _spawn_kwargs() -> dict:
     return {"start_new_session": True}
 
 
-def _terminate_tree(proc: subprocess.Popen) -> None:
+def _terminate_tree(proc: subprocess.Popen, process_group: int | None = None) -> None:
     """End the runner and everything it started.
 
     A wrapper command — `go run ./cmd/runner`, `dotnet run --project X`, a shell script —
@@ -335,7 +336,12 @@ def _terminate_tree(proc: subprocess.Popen) -> None:
         )
     else:
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            # Save the group id while the direct child is alive and pass it
+            # here. A wrapper may exit after backgrounding its decoder; once
+            # that leader has been reaped `getpgid(proc.pid)` no longer works,
+            # even though descendants still occupy the group and hold our
+            # output pipes open.
+            os.killpg(process_group if process_group is not None else os.getpgid(proc.pid), signal.SIGKILL)
             return
         except (OSError, ProcessLookupError):
             pass
@@ -356,6 +362,10 @@ def invoke(command: list[str], args: list[str], timeout: float) -> Outcome:
     except OSError as exc:
         return Outcome(-1, "", "", f"could not be started: {exc}")
 
+    # `start_new_session=True` makes the child's pid its process-group id on
+    # POSIX. Keep it now, before a short-lived wrapper can exit and make the id
+    # impossible to recover through `getpgid`.
+    process_group = proc.pid if os.name != "nt" else None
     out, err = _Capture(MAX_CAPTURE_BYTES), _Capture(MAX_CAPTURE_BYTES)
     killed = threading.Event()
 
@@ -364,7 +374,7 @@ def invoke(command: list[str], args: list[str], timeout: float) -> Outcome:
         # rather than the whole timeout, and the drain threads see EOF and finish.
         if not killed.is_set():
             killed.set()
-            _terminate_tree(proc)
+            _terminate_tree(proc, process_group)
 
     threads = [
         threading.Thread(target=out.drain, args=(proc.stdout, kill_once), daemon=True),
@@ -378,15 +388,31 @@ def invoke(command: list[str], args: list[str], timeout: float) -> Outcome:
         returncode = proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
-        _terminate_tree(proc)
+        _terminate_tree(proc, process_group)
         try:
             returncode = proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             returncode = -1
+    # One shared bound, not one full wait per pipe: a wrapper that backgrounds a
+    # child commonly leaves both drains open, and paying the bound twice would
+    # add two delays to every variant. A clean process has already closed both
+    # descriptors; one second is ample to consume the bounded tail.
+    drain_deadline = time.monotonic() + 1
     for thread in threads:
-        # Bounded: a grandchild that outlived the group kill can hold the pipe open, and
-        # waiting on it forever would reintroduce the hang the timeout just removed.
-        thread.join(timeout=5)
+        thread.join(timeout=max(0.0, drain_deadline - time.monotonic()))
+
+    unfinished = [thread for thread in threads if thread.is_alive()]
+    if unfinished:
+        # A successful wrapper can background the real decoder and exit before
+        # the invocation timeout. The descendant inherits stdout/stderr, so an
+        # unfinished drain is positive evidence that the invocation tree is
+        # still alive. End the saved group and give the drains one bounded
+        # chance to observe EOF before returning a failure.
+        _terminate_tree(proc, process_group)
+        cleanup_deadline = time.monotonic() + 1
+        for thread in unfinished:
+            thread.join(timeout=max(0.0, cleanup_deadline - time.monotonic()))
+        return Outcome(-1, out.text(), err.text(), "left descendants holding its output pipes open")
 
     if timed_out:
         return Outcome(-1, "", "", f"did not answer within {timeout:g}s")
@@ -437,6 +463,11 @@ def declared_capabilities(command: list[str], timeout: float) -> Capabilities:
     read_path = _declared_str(doc, "readPath")
     if read_path not in ("streamed", "indexed"):
         raise ProtocolError(f"declares readPath {read_path!r}; expected 'streamed' or 'indexed'")
+    expected_name = f"{family}/decode_{read_path}"
+    if name != expected_name:
+        raise ProtocolError(
+            f"declares name {name!r} for family {family!r} and readPath {read_path!r}; expected {expected_name!r}"
+        )
 
     # Absent means no, for both of these. A runner that says nothing about the invalid
     # corpus skips it, exactly as a family absent from REFUSAL_FAMILIES does — silence is
@@ -582,7 +613,10 @@ def external_jobs(commands: list[str], timeout: float) -> list[tuple[Capabilitie
     """
     jobs = []
     for text in commands:
-        command = split_command(text)
+        try:
+            command = split_command(text)
+        except ValueError as exc:
+            raise ProtocolError(f"--runner-cmd {text!r} cannot be parsed: {exc}") from exc
         if not command:
             raise ProtocolError(f"--runner-cmd {text!r} is empty")
         try:

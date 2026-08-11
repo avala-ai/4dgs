@@ -213,7 +213,9 @@ elsewhere, and on Windows the rules `CommandLineToArgvW` applies, which is what 
 is actually started under — and the variant's file path is appended to it. So a runner sees whatever
 arguments you wrote, then one path, which is the same invocation the built-in runners get. Both
 `python C:\work\decode.py` and `runner.exe --label="two words"` arrive as the two arguments a
-Windows user means by them, rather than as a mangled path or a split-apart option.
+Windows user means by them, rather than as a mangled path or a split-apart option. An unmatched
+quote or another command-line parse error is a protocol failure naming the original `--runner-cmd`,
+not a traceback from the harness.
 
 ### The capabilities handshake
 
@@ -234,7 +236,7 @@ and no path. The runner answers with one JSON object on stdout and exits 0:
 | Key        | Required | Meaning                                                                                                 |
 | ---------- | -------- | ------------------------------------------------------------------------------------------------------- |
 | `protocol` | yes      | the protocol version, as the JSON integer `1`. `true` and `"1"` are errors, not versions                |
-| `name`     | yes      | `<family>/<read path>`, printed on every line about this runner                                         |
+| `name`     | yes      | exactly `<family>/decode_<readPath>`, such as `go/decode_indexed`; it must agree with both keys         |
 | `family`   | no       | defaults to `name` up to the first `/`                                                                  |
 | `readPath` | yes      | `streamed` or `indexed`. An indexed runner is not asked about a variant written without `UseChunkIndex` |
 | `refusals` | no       | `true` to be scored on all seven invalid variants. Absent means no, and the seven are skipped           |
@@ -302,7 +304,10 @@ a variant:
 - **The timeout ends the process group, not the process.** `go run ./cmd/runner` and
   `dotnet run --project X` are wrappers: they launch the decoder and are not it. Killing the wrapper
   alone leaves the decoder running, and a corpus of 120 variants against a hanging implementation
-  leaves 120 of them behind. Each invocation gets its own session, and the timeout ends all of it.
+  leaves 120 of them behind. The harness saves the new process-group id before the wrapper can exit.
+  If a wrapper exits successfully after backgrounding a descendant that still holds the output
+  pipes, unfinished drains trigger the same group termination and fail that invocation; a clean
+  wrapper exit cannot leak one decoder per variant.
 - **Captured output is bounded** at 8 MiB per stream, drained continuously so the runner never
   blocks on a full pipe. An answer is one JSON document — the largest expectation in the corpus is
   under 25 KB — so a runner that passes this bound is not going to pass the comparison either, and
