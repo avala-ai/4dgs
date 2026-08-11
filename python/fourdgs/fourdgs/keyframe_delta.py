@@ -122,6 +122,16 @@ def apply_delta(
     _check_unique(birth_ids, "a birth group")
     _check_unique(death_ids, "a death group")
 
+    has_rotation_index = op.A_ROTATION_INDEX in update_bins
+    has_rotation_bins = op.A_ROTATION in update_bins
+    if has_rotation_index != has_rotation_bins:
+        missing = op.A_ROTATION if has_rotation_index else op.A_ROTATION_INDEX
+        raise _refuse(
+            f"an update carries only one half of the smallest-three rotation pair; "
+            f"attribute {missing} is missing",
+            "incomplete-rotation-update",
+        )
+
     for attribute in update_bins:
         if attribute in GOP_INVARIANT:
             raise _refuse(

@@ -41,7 +41,7 @@ import numpy as np
 
 from . import opcode as op
 from . import records as rec
-from .exceptions import FourdgsError
+from .exceptions import FourdgsError, MalformedFile
 from .serialization import MAGIC, check_magic
 
 _RECORD_HEADER = struct.Struct("<BQ")
@@ -415,11 +415,14 @@ def scan_front_to_back(data: bytes, where: Walk) -> ChunkRefusal | None:
     quant: rec.Quantization | None = None
     windows: list[tuple[float, float]] = []
     cutoff = DEFAULT_CUTOFF
+    band_owner_count: int | None = None
 
     for frame in where.intact_records():
         content = frame.content(where.data)
         if content is None:
             continue
+        if frame.opcode not in (op.CHUNK, op.SH_BAND_STREAM):
+            band_owner_count = None
         here = Site(frame.offset, f"the {op.name(frame.opcode)} record")
         try:
             if frame.opcode == op.HEADER:
@@ -434,12 +437,14 @@ def scan_front_to_back(data: bytes, where: Walk) -> ChunkRefusal | None:
         except FourdgsError:
             continue
         if frame.opcode == op.CHUNK:
+            band_owner_count = None
             # A Chunk before the grid it is quantized against is a fault the validator
             # reports itself; there is nothing to decode it with here.
-            if quant is None:
-                continue
             try:
                 head, streams = rec.parse_chunk(content)
+                band_owner_count = int(head.count)
+                if quant is None:
+                    continue
                 # The decoded chunk is dropped when this iteration ends.
                 decode_streams(
                     chunk_stream_bytes(head, streams),
@@ -456,15 +461,25 @@ def scan_front_to_back(data: bytes, where: Walk) -> ChunkRefusal | None:
                 cursor = Cursor(bytes(content))
                 # The band index, which the record carries and the stream header does not:
                 # a band stream's `attribute_id` is 0x07 and collides with `mu_t` (§5.7).
-                cursor.u8()
-                attribute, _values = decode_stream(cursor)
+                band = cursor.u8()
+                attribute, values = decode_stream(cursor)
                 if attribute != op.SH_BAND_STREAM:
-                    from .exceptions import MalformedFile
-
                     raise MalformedFile(
                         f"the SH Band Stream at {frame.offset} declares inner attribute_id "
                         f"{attribute}; version 1 fixes it at {op.SH_BAND_STREAM}",
                         code="index-record-mismatch",
+                    )
+                if band_owner_count is None:
+                    raise MalformedFile(
+                        f"the SH Band Stream at {frame.offset} does not immediately follow a Chunk",
+                        code="index-record-mismatch",
+                    )
+                expected_shape = (band_owner_count, 3 * (2 * band + 1))
+                if values.shape != expected_shape:
+                    raise MalformedFile(
+                        f"the SH Band Stream at {frame.offset} for band {band} decodes to "
+                        f"shape {values.shape}; its owning Chunk requires {expected_shape}",
+                        code="stream-element-count-mismatch",
                     )
             except FourdgsError as exc:
                 return ChunkRefusal(exc, here)

@@ -461,8 +461,16 @@ def validate(data: bytes) -> Report:
 
     named_by_index: dict[int, int] = {}
     for i, entry in enumerate(index):
-        if entry.chunk_offset + entry.chunk_length > len(data):
-            report.error(f"chunk index entry {i} points past the end of the file")
+        if (
+            entry.chunk_offset >= len(data)
+            or entry.chunk_length < 9
+            or entry.chunk_offset + entry.chunk_length > len(data)
+        ):
+            report.error(
+                f"chunk index entry {i} range [{entry.chunk_offset}, "
+                f"{entry.chunk_offset + entry.chunk_length}) does not contain a complete "
+                f"record header inside the {len(data)}-byte file"
+            )
             continue
         # A `keyframe-delta` file indexes both kinds: a Chunk is a keyframe and a Delta
         # Chunk is a difference against one, and an index that could only name the former

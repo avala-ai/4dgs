@@ -642,6 +642,21 @@ class TestTheIndexIsData:
         report = validate(_repack_summary(data, lambda i, e: first if i == 1 else e))
         assert any("both name the chunk at byte" in f.message for f in report.findings), report.findings
 
+    def test_a_zero_length_range_at_eof_is_a_finding_not_an_index_error(self):
+        data = _keyframe_file()
+        report = validate(
+            _repack_summary(
+                data,
+                lambda i, entry: (
+                    _with(entry, chunk_offset=len(data), chunk_length=0) if i == 0 else entry
+                ),
+            )
+        )
+        assert not report.ok
+        assert any("does not contain a complete record header" in f.message for f in report.findings), (
+            report.findings
+        )
+
 
 class TestSHBandStreams:
     def test_a_gaussian_birth_index_cannot_omit_a_physical_band(self):
@@ -695,6 +710,26 @@ class TestSHBandStreams:
             site = next(n.site for n in named if n.code == "unknown-stream-codec")
             assert site is not None and site.offset == band.offset, path.name
             assert "SH Band Stream for band" in site.what, site.what
+
+    @pytest.mark.parametrize("indexed", [False, True])
+    def test_a_gaussian_birth_band_must_match_its_owning_chunk_shape(self, indexed):
+        paths = [
+            p
+            for p in _variants(CORPUS)
+            if "SHDegree2" in p.stem and ("UseChunkIndex" in p.stem) is indexed
+        ]
+        _require_corpus(paths, f"{'indexed' if indexed else 'unindexed'} SH-degree-2 variants")
+        data = bytearray(paths[0].read_bytes())
+        band = _first_record(bytes(data), op.SH_BAND_STREAM)
+        assert band is not None
+        # The stream remains completely framed and its payload length is unchanged. A
+        # zero element count makes it decode to (0, channels), proving the owner-row check
+        # rather than a decompressor or truncation check.
+        stream_at = band.offset + 9 + 1
+        struct.pack_into("<I", data, stream_at + 5, 0)
+        report = validate(bytes(data))
+        assert not report.ok
+        assert any("owning Chunk requires" in f.message for f in report.findings), report.findings
 
 
 class TestProvenanceRecords:

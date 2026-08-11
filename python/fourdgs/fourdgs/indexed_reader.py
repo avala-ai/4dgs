@@ -368,6 +368,13 @@ def read_chunk(source: Readable, scene: IndexedScene, entry: rec.ChunkIndexEntry
                 f"the SH Band Stream at {offset} declares inner attribute_id {attribute}; "
                 f"version 1 fixes it at {op.SH_BAND_STREAM}"
             )
+        expected_shape = (int(head.count), 3 * (2 * band + 1))
+        if values.shape != expected_shape:
+            raise MalformedFile(
+                f"the SH Band Stream at {offset} for band {band} decodes to shape "
+                f"{values.shape}; its owning Chunk requires {expected_shape}",
+                code="stream-element-count-mismatch",
+            )
         decoded["sh"][band] = values
     return decoded
 

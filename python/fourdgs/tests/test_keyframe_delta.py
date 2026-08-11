@@ -194,9 +194,40 @@ def test_rotation_in_an_update_is_absolute_not_a_difference():
     """The smallest-three basis changes when the largest component does, so the three
     stored bins mean different components either side of it. Restating outright is what
     makes the rotation bound the section-6.4 bound with no composition term at all."""
-    state = kd.keyframe_state(np.asarray([1]), {op.A_ROTATION: np.asarray([[100, 200, 300]])})
-    out = _apply(state, updates=([1], {op.A_ROTATION: np.asarray([[7, 8, 9]])}))
+    state = kd.keyframe_state(
+        np.asarray([1]),
+        {
+            op.A_ROTATION_INDEX: np.asarray([[0]]),
+            op.A_ROTATION: np.asarray([[100, 200, 300]]),
+        },
+    )
+    out = _apply(
+        state,
+        updates=(
+            [1],
+            {
+                op.A_ROTATION_INDEX: np.asarray([[2]]),
+                op.A_ROTATION: np.asarray([[7, 8, 9]]),
+            },
+        ),
+    )
+    assert out.bins[op.A_ROTATION_INDEX].tolist() == [[2]]
     assert out.bins[op.A_ROTATION].tolist() == [[7, 8, 9]]
+
+
+@pytest.mark.parametrize("present", [op.A_ROTATION_INDEX, op.A_ROTATION])
+def test_an_update_must_restate_both_halves_of_a_rotation(present):
+    state = kd.keyframe_state(
+        np.asarray([1]),
+        {
+            op.A_ROTATION_INDEX: np.asarray([[0]]),
+            op.A_ROTATION: np.asarray([[100, 200, 300]]),
+        },
+    )
+    value = np.asarray([[1]]) if present == op.A_ROTATION_INDEX else np.asarray([[7, 8, 9]])
+    with pytest.raises(Exception) as caught:
+        _apply(state, updates=([1], {present: value}))
+    assert caught.value.code == "incomplete-rotation-update"
 
 
 @pytest.mark.parametrize(
