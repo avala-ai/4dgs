@@ -426,7 +426,10 @@ def scan_front_to_back(data: bytes, where: Walk) -> ChunkRefusal | None:
             return None
         if declared_degree is not None:
             wanted = list(range(1, declared_degree + 1))
-            if bands != wanted:
+            # Band records carry their own identity and have no prescribed order.
+            # Comparing the sorted list keeps the completeness and uniqueness check
+            # while accepting a conforming run such as [2, 1].
+            if sorted(bands) != wanted:
                 return ChunkRefusal(
                     MalformedFile(
                         f"the Chunk at {band_owner_at} is followed by SH bands {bands}; "

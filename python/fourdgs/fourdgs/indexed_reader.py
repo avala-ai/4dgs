@@ -29,7 +29,7 @@ from .provenance import Provenance
 from .readable import Readable
 from .registry import check_quantization_scheme, check_temporal_model
 from .serialization import MAGIC, Cursor, check_magic, crc32, iter_records, read_record
-from .stream_reader import chunk_stream_bytes, decode_streams, steps_from
+from .stream_reader import check_sh_codes, chunk_stream_bytes, decode_streams, steps_from
 
 #: One read of this size from the front covers the header records of every scene measured
 #: so far. A larger header costs one extra round trip, never a wrong parse.
@@ -375,6 +375,7 @@ def read_chunk(source: Readable, scene: IndexedScene, entry: rec.ChunkIndexEntry
                 f"{values.shape}; its owning Chunk requires {expected_shape}",
                 code="stream-element-count-mismatch",
             )
+        check_sh_codes(values, f"the SH Band Stream at {offset}")
         decoded["sh"][band] = values
     return decoded
 

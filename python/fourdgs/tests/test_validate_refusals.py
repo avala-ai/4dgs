@@ -36,7 +36,9 @@ from fourdgs import records as rec
 from fourdgs import refusal
 from fourdgs.cli import main
 from fourdgs.exceptions import FourdgsError, MalformedFile, UnsupportedCodec
+from fourdgs.indexed_reader import open_indexed, read_chunk
 from fourdgs.keyframe_delta_writer import KeyframeDeltaOptions, Sample
+from fourdgs.readable import BytesReadable
 from fourdgs.serialization import (
     CODEC_DEFLATE,
     MAGIC,
@@ -801,6 +803,23 @@ class TestSHBandStreams:
         assert refused is not None
         assert "followed by SH bands [1]" in str(refused.error)
 
+    def test_indexless_gaussian_birth_bands_may_be_reordered(self):
+        paths = [p for p in _variants(CORPUS) if "SHDegree2" in p.stem and "UseChunkIndex" in p.stem]
+        _require_corpus(paths, "indexed SH-degree-2 variants")
+        data = paths[0].read_bytes()
+        footer_record = _first_record(data, op.FOOTER)
+        footer = rec.Footer.parse(footer_record.content)
+        data = bytearray(data[: footer.summary_start] + rec.Footer().encode() + MAGIC)
+        bands = [record for record in iter_records(bytes(data), len(MAGIC)) if record.opcode == op.SH_BAND_STREAM]
+        assert len(bands) >= 2
+        first, second = bands[:2]
+        first_blob = bytes(data[first.offset : first.offset + 9 + len(first.content)])
+        second_blob = bytes(data[second.offset : second.offset + 9 + len(second.content)])
+        data[first.offset : second.offset + len(second_blob)] = second_blob + first_blob
+
+        walked = refusal.walk(bytes(data), retain_records=False)
+        assert refusal.scan_front_to_back(bytes(data), walked) is None
+
     def test_a_gaussian_birth_index_cannot_omit_a_physical_band(self):
         paths = [p for p in _variants(CORPUS) if "SHDegree2" in p.stem and "UseChunkIndex" in p.stem]
         _require_corpus(paths, "indexed gaussian-birth variants carrying SH bands")
@@ -900,6 +919,21 @@ class TestSHBandStreams:
         streamed = streamed[:after_chunk] + band + streamed[after_chunk:]
         with pytest.raises(MalformedFile, match=r"expected 0\.\.255"):
             list(kdf.scan_streamed(streamed))
+
+    def test_indexed_gaussian_birth_bands_reject_non_byte_codes(self):
+        data = _patch_sh_degree(_real_file(), 1)
+        first = _index_entries(data)[0]
+        values = np.zeros((first.gaussian_count, 9), dtype=np.int64)
+        values[0, 0] = -1
+        band = put_record(
+            op.SH_BAND_STREAM,
+            bytes([1]) + encode_stream(op.SH_BAND_STREAM, values, channels=9, codec=0),
+        )
+        malformed, _ = _insert_indexed_band(data, band)
+        source = BytesReadable(malformed)
+        scene = open_indexed(source)
+        with pytest.raises(MalformedFile, match=r"expected 0\.\.255"):
+            read_chunk(source, scene, scene.index[0], max_sh_band=1)
 
 
 class TestWholeFileCompatibilityGates:
@@ -1376,6 +1410,31 @@ def _insert_single_indexed_band(data: bytes, band: bytes) -> tuple[bytes, int]:
         if record.offset < footer_record.offset and record.opcode != op.CHUNK_INDEX
     ]
     summary = entry.encode() + b"".join(put_record(record.opcode, bytes(record.content)) for record in summary_records)
+    footer.summary_start += len(band)
+    if footer.summary_crc:
+        footer.summary_crc = crc32(summary)
+    return data[:band_at] + band + summary + footer.encode() + MAGIC, band_at
+
+
+def _insert_indexed_band(data: bytes, band: bytes) -> tuple[bytes, int]:
+    """Insert `band` before the summary and attach it to the first index entry."""
+    footer_record = _first_record(data, op.FOOTER)
+    footer = rec.Footer.parse(footer_record.content)
+    band_at = footer.summary_start
+    summary = b""
+    entry_index = 0
+    for record in iter_records(data, footer.summary_start):
+        if record.offset >= footer_record.offset:
+            break
+        if record.opcode == op.CHUNK_INDEX:
+            entry = rec.ChunkIndexEntry.parse(record.content)
+            if entry_index == 0:
+                entry = _with(entry, bands=[*entry.bands, (1, band_at, len(band))])
+            summary += entry.encode()
+            entry_index += 1
+        else:
+            summary += put_record(record.opcode, bytes(record.content))
+    assert entry_index > 0
     footer.summary_start += len(band)
     if footer.summary_crc:
         footer.summary_crc = crc32(summary)
