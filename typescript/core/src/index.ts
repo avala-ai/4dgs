@@ -259,6 +259,7 @@ export {
   decodeKeyframeDeltaIndexed,
   decodeKeyframeDeltaStreamed,
   keyframeDeltaChunkAt,
+  keyframeDeltaValidationRecordOffset,
   validateKeyframeDeltaStreamed,
   keyframeDeltaStatesJson,
   reconstructKeyframeDelta,

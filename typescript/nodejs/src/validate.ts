@@ -24,6 +24,8 @@ import {
   CAMERA_MODEL_COEFFICIENTS,
   Crc32,
   Cursor,
+  DELTA_MODE_CHAINED,
+  DELTA_MODE_KEYFRAME,
   DEFAULT_CODECS,
   DEFAULT_CUTOFF,
   FOOTER_TAIL_BYTES,
@@ -49,6 +51,7 @@ import {
   frameOneStream,
   isPrivateOpcode,
   isProvenanceOpcode,
+  keyframeDeltaValidationRecordOffset,
   mergeBands,
   opcodeName,
   parseAudioSource,
@@ -265,7 +268,11 @@ export async function validateFile(
       }
       // An SH Band Stream belongs only to the Chunk immediately before the run of band
       // records. Any other top-level record ends that run.
-      if (record.opcode !== Opcode.Chunk && record.opcode !== Opcode.ShBandStream) {
+      if (
+        record.opcode !== Opcode.Chunk &&
+        record.opcode !== Opcode.DeltaChunk &&
+        record.opcode !== Opcode.ShBandStream
+      ) {
         currentChunkOffset = null;
       }
       // A record whose own body will not parse is a finding rather than an abort: the point
@@ -409,7 +416,7 @@ export async function validateFile(
         case Opcode.DeltaChunk: {
           physicalChunkOffsets.push(offset);
           physicalBands.set(offset, []);
-          currentChunkOffset = null;
+          currentChunkOffset = offset;
           firstChunkSeen = true;
           let parsed;
           try {
@@ -423,6 +430,12 @@ export async function validateFile(
             length: record.length,
             header: parsed.header,
           });
+          if (header !== null && header.temporalModel !== "keyframe-delta") {
+            found.error(
+              `Delta Chunk at byte ${offset} is not legal under temporal_model ` +
+                `${JSON.stringify(header.temporalModel)}; it belongs only to keyframe-delta`,
+            );
+          }
           if (parsed.header.t1 < parsed.header.t0) {
             found.error(
               `Delta Chunk at byte ${offset} has t1 (${parsed.header.t1}) before t0 ` +
@@ -450,8 +463,8 @@ export async function validateFile(
             }
             if (currentChunkOffset === null) {
               found.error(
-                `SH Band Stream at byte ${offset} does not immediately follow a Chunk or one of ` +
-                  "that Chunk's SH Band Stream records",
+                `SH Band Stream at byte ${offset} does not immediately follow a Chunk, Delta ` +
+                  "Chunk, or one of that state Chunk's SH Band Stream records",
               );
             } else {
               physicalBands.get(currentChunkOffset)!.push({
@@ -729,7 +742,9 @@ export async function validateFile(
       await validateKeyframeDeltaStreamed(source, DEFAULT_CODECS);
     } catch (error) {
       found.error(`keyframe-delta timeline does not decode: ${message(error)}`);
-      found.refuse(error, physicalChunkOffsets[0] ?? MAGIC.length, "the keyframe-delta timeline");
+      const at =
+        keyframeDeltaValidationRecordOffset(error) ?? physicalChunkOffsets[0] ?? MAGIC.length;
+      found.refuse(error, at, "the keyframe-delta state record");
     }
   }
   if (hasLegacyAudio && audioSources.size > 0) {
@@ -843,6 +858,8 @@ export async function validateFile(
       }
     });
   });
+
+  checkKeyframeDeltaIndexChains(index, found);
 
   // An index is a one-for-one description of the physical Chunk records, not merely a
   // collection of individually valid pointers. Missing and duplicate entries both make
@@ -971,6 +988,98 @@ interface PhysicalBandRange {
   readonly band: number;
   readonly offset: number;
   readonly length: number;
+}
+
+/**
+ * Derive depth and GOP identity from the index's references, independently of the duplicated
+ * Delta Chunk headers. Comparing index fields with record fields catches disagreement; this
+ * catches the equally corrupt case where both copies agree on a false seek cost.
+ */
+function checkKeyframeDeltaIndexChains(index: readonly ChunkIndexEntry[], found: Findings): void {
+  const ordered = [...index].sort((a, b) => a.chunkOffset - b.chunkOffset);
+  const derived = new Map<number, { depth: number; keyframeOffset: number; kind: number }>();
+  let previousOffset: number | null = null;
+  for (const entry of ordered) {
+    if (!entry.extended) {
+      previousOffset = entry.chunkOffset;
+      continue;
+    }
+    if (entry.kind === 0) {
+      if (entry.depth !== 0) {
+        found.error(
+          `the keyframe index entry at ${entry.chunkOffset} declares depth ${entry.depth}; ` +
+            "a keyframe has depth 0",
+        );
+      }
+      if (entry.keyframeOffset !== entry.chunkOffset) {
+        found.error(
+          `the keyframe index entry at ${entry.chunkOffset} declares keyframe_offset ` +
+            `${entry.keyframeOffset}; expected its own offset`,
+        );
+      }
+      derived.set(entry.chunkOffset, {
+        depth: 0,
+        keyframeOffset: entry.chunkOffset,
+        kind: entry.kind,
+      });
+      previousOffset = entry.chunkOffset;
+      continue;
+    }
+    if (entry.kind !== 1) {
+      found.error(
+        `chunk index entry at ${entry.chunkOffset} declares chunk_kind ${entry.kind}; expected ` +
+          "0 (keyframe) or 1 (delta)",
+      );
+      previousOffset = entry.chunkOffset;
+      continue;
+    }
+    const reference = derived.get(entry.referenceOffset);
+    if (reference === undefined) {
+      found.error(
+        `the delta index entry at ${entry.chunkOffset} references ${entry.referenceOffset}, ` +
+          "which is not an earlier indexed state chunk",
+      );
+      previousOffset = entry.chunkOffset;
+      continue;
+    }
+    if (entry.deltaMode === DELTA_MODE_KEYFRAME && reference.kind !== 0) {
+      found.error(
+        `the keyframe-referenced delta index entry at ${entry.chunkOffset} references ` +
+          `${entry.referenceOffset}, which is itself a delta`,
+      );
+    } else if (entry.deltaMode === DELTA_MODE_CHAINED && previousOffset !== entry.referenceOffset) {
+      found.error(
+        `the chained delta index entry at ${entry.chunkOffset} references ` +
+          `${entry.referenceOffset}; the immediately preceding state is at ${previousOffset}`,
+      );
+    } else if (entry.deltaMode !== DELTA_MODE_KEYFRAME && entry.deltaMode !== DELTA_MODE_CHAINED) {
+      found.error(
+        `the delta index entry at ${entry.chunkOffset} declares delta_mode ` +
+          `${entry.deltaMode}; expected ${DELTA_MODE_KEYFRAME} (keyframe) or ` +
+          `${DELTA_MODE_CHAINED} (chained)`,
+      );
+    }
+    const expectedDepth = reference.depth + 1;
+    if (entry.depth !== expectedDepth) {
+      found.error(
+        `the delta index entry at ${entry.chunkOffset} declares depth ${entry.depth}, but its ` +
+          `reference chain walks ${expectedDepth} delta chunks`,
+      );
+    }
+    if (entry.keyframeOffset !== reference.keyframeOffset) {
+      found.error(
+        `the delta index entry at ${entry.chunkOffset} declares keyframe_offset ` +
+          `${entry.keyframeOffset}, but its reference chain reaches ` +
+          `${reference.keyframeOffset}`,
+      );
+    }
+    derived.set(entry.chunkOffset, {
+      depth: expectedDepth,
+      keyframeOffset: reference.keyframeOffset,
+      kind: entry.kind,
+    });
+    previousOffset = entry.chunkOffset;
+  }
 }
 
 function finalizeDecodedShChunk(

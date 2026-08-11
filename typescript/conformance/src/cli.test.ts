@@ -35,6 +35,7 @@ import {
   Opcode,
   RECORD_HEADER_BYTES,
   iterateRecords,
+  parseChunkIndexEntry,
   parseFooter,
   parseQuantization,
   shBound,
@@ -51,6 +52,7 @@ import {
   main,
   type Sink,
 } from "@4dgs/nodejs/cli";
+import { MOVING_CHAINED } from "./keyframeDeltaFixtures.js";
 
 const DATA = fileURLToPath(new URL("../../../tests/conformance/data/", import.meta.url));
 
@@ -544,6 +546,82 @@ test("regression: --decode assembles SH bands before accepting them", (t) => {
       line.includes("chunk 1 SH bands do not assemble: SH bands 2, 3 do not form whole degrees"),
     ),
     report.out.join("\n"),
+  );
+});
+
+test("regression: an SH band immediately after a Delta Chunk belongs to that state", async (t) => {
+  const variant = "MixedLifetimes-SHDegree2-UseChunkIndex-UseCrc";
+  if (corpus(variant) === null) return t.skip("corpus not generated");
+  const bandSource = bytesOf(variant);
+  const band = recordsOf(bandSource).find((record) => record.opcode === Opcode.ShBandStream)!;
+  const bandRecord = bandSource.slice(band.offset, band.offset + band.length);
+  const deltaFile = new Uint8Array(Buffer.from(MOVING_CHAINED, "base64"));
+  const delta = recordsOf(deltaFile).find((record) => record.opcode === Opcode.DeltaChunk)!;
+  const report = await validateFile(splice(deltaFile, delta.offset + delta.length, bandRecord));
+  assert.ok(
+    report.findings.some((finding) =>
+      finding.message.includes(`from its Chunk at ${delta.offset}`),
+    ),
+    report.findings.map((finding) => finding.message).join("\n"),
+  );
+  assert.ok(
+    report.findings.every((finding) => !finding.message.includes("does not immediately follow")),
+    report.findings.map((finding) => finding.message).join("\n"),
+  );
+});
+
+test("regression: gaussian-birth rejects a physical Delta Chunk", async () => {
+  const data = new Uint8Array(Buffer.from(MOVING_CHAINED, "base64"));
+  const model = new TextEncoder().encode("keyframe-delta");
+  const replacement = new TextEncoder().encode("gaussian-birth");
+  let at = -1;
+  outer: for (let i = 0; i <= data.length - model.length; i++) {
+    for (let j = 0; j < model.length; j++) {
+      if (data[i + j] !== model[j]) continue outer;
+    }
+    at = i;
+  }
+  assert.notEqual(at, -1);
+  data.set(replacement, at);
+  const report = await validateFile(data);
+  assert.ok(
+    report.findings.some((finding) =>
+      finding.message.includes('is not legal under temporal_model "gaussian-birth"'),
+    ),
+    report.findings.map((finding) => finding.message).join("\n"),
+  );
+});
+
+test("regression: indexed depth is derived even when the record repeats the same lie", async () => {
+  const data = new Uint8Array(Buffer.from(MOVING_CHAINED, "base64"));
+  const records = [...iterateRecords(data, MAGIC.length)];
+  const delta = records.find((record) => record.opcode === Opcode.DeltaChunk)!;
+  const entryRecord = records.find(
+    (record) =>
+      record.opcode === Opcode.ChunkIndex &&
+      parseChunkIndexEntry(record.content).chunkOffset === delta.offset,
+  )!;
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const wrongDepth = view.getUint16(delta.offset + RECORD_HEADER_BYTES + 37, true) + 4;
+  view.setUint16(delta.offset + RECORD_HEADER_BYTES + 37, wrongDepth, true);
+  const bandCount = view.getUint32(entryRecord.offset + RECORD_HEADER_BYTES + 36, true);
+  const indexedDepthAt = entryRecord.offset + RECORD_HEADER_BYTES + 58 + bandCount * (1 + 8 + 8);
+  view.setUint16(indexedDepthAt, wrongDepth, true);
+  const report = await validateFile(resealSummary(data));
+  assert.ok(
+    report.findings.some(
+      (finding) =>
+        finding.message.includes(`the delta index entry at ${delta.offset} declares depth`) &&
+        finding.message.includes("reference chain walks"),
+    ),
+    report.findings.map((finding) => finding.message).join("\n"),
+  );
+  assert.ok(
+    report.findings.every(
+      (finding) =>
+        !finding.message.includes("the Delta Chunk") || !finding.message.includes("depth"),
+    ),
+    "the duplicate-field comparison should pass when both copies carry the same wrong depth",
   );
 });
 

@@ -28,11 +28,14 @@ import {
   keyframeDeltaChunkAt,
   keyframeDeltaStatesJson,
   reconstructKeyframeDelta,
+  keyframeDeltaValidationRecordOffset,
   DEFAULT_CODECS,
   lifeClass,
   motionStep,
   supportK,
+  validateKeyframeDeltaStreamed,
 } from "@4dgs/core";
+import { validateFile } from "@4dgs/nodejs";
 
 import { num } from "./canonical.js";
 import { MOVING_CHAINED } from "./keyframeDeltaFixtures.js";
@@ -679,6 +682,32 @@ test("an out-of-range window index is refused, not clamped", async () => {
   );
 });
 
+test("decoded validation checks window indices and locates the refusing state record", async () => {
+  const file = await oneKeyframeFile({
+    windows: [[0, 1]],
+    windowIndex: 3,
+    motionBinX: 1,
+    duration: 1,
+  });
+  const chunkOffset =
+    MAGIC.length +
+    record(0x01, headerBody(1)).length +
+    record(0x03, quantizationBody()).length +
+    record(0x04, windowTableBody([[0, 1]])).length;
+  let rejected: unknown;
+  try {
+    await validateKeyframeDeltaStreamed(file);
+  } catch (error) {
+    rejected = error;
+  }
+  assert.ok(rejected instanceof MalformedFile);
+  assert.equal(keyframeDeltaValidationRecordOffset(rejected), chunkOffset);
+
+  const report = await validateFile(file, { decode: true });
+  assert.equal(report.refused?.code, "window-index-out-of-range");
+  assert.equal(report.refused?.at, chunkOffset);
+});
+
 // --- chunk-level compression (codex P1 §5.5/§5.18) ------------------------
 
 test("a chunk-level compressed keyframe decodes to the same state as its plain twin", async () => {
@@ -737,6 +766,49 @@ test("checkTiling: adjacency always, coverage only when required", () => {
   assert.throws(() => checkTiling([at(0, 1)], 2, true), MalformedFile); // ends before duration
   assert.throws(() => checkTiling([at(0.5, 1)], 1, true), MalformedFile); // starts after 0
   checkTiling([at(0, 1), at(1, 2)], 2, true); // full coverage: no throw
+});
+
+test("streamed validation checks timeline adjacency after sorting state intervals", async () => {
+  const frontMatter = [
+    MAGIC,
+    record(0x01, headerBody(2)),
+    record(0x03, quantizationBody()),
+    record(0x04, windowTableBody([[0, 2]])),
+  ];
+  const streams = await oneGaussianStreams(0, 0);
+  const file = concat([
+    ...frontMatter,
+    chunkRecord(1, 2, streams, "", streams.length),
+    chunkRecord(0, 1, streams, "", streams.length),
+  ]);
+  assert.equal(await validateKeyframeDeltaStreamed(file), 1);
+});
+
+test("streamed validation refuses a gaussian id reused after a temporal gap", async () => {
+  const frontMatter = [
+    MAGIC,
+    record(0x01, headerBody(3, 0, 2)),
+    record(0x03, quantizationBody()),
+    record(0x04, windowTableBody([[0, 3]])),
+  ];
+  const first = await oneGaussianStreams(0, 0, undefined, { id: 0 });
+  const middle = await oneGaussianStreams(0, 0, undefined, { id: 1 });
+  const last = await oneGaussianStreams(0, 0, undefined, { id: 0 });
+  const firstChunk = chunkRecord(0, 1, first, "", first.length);
+  const middleChunk = chunkRecord(1, 2, middle, "", middle.length);
+  const lastChunk = chunkRecord(2, 3, last, "", last.length);
+  const lastOffset =
+    frontMatter.reduce((sum, part) => sum + part.length, 0) +
+    firstChunk.length +
+    middleChunk.length;
+  const file = concat([...frontMatter, firstChunk, middleChunk, lastChunk]);
+  await assert.rejects(
+    () => validateKeyframeDeltaStreamed(file),
+    (error: unknown) =>
+      error instanceof MalformedFile &&
+      error.message.includes("reintroduces gaussian id 0 after it died") &&
+      keyframeDeltaValidationRecordOffset(error) === lastOffset,
+  );
 });
 
 test("a streamed decode reads a complete prefix and bounds probes to the last chunk", async () => {
@@ -1020,6 +1092,24 @@ test("a Delta Chunk whose group count disagrees with its block is refused", asyn
   const at = offset + 9 + DELTA_UPDATE_COUNT;
   view.setUint32(at, view.getUint32(at, true) + 1, true);
   await assert.rejects(() => decodeKeyframeDeltaStreamed(mutated), MalformedFile);
+});
+
+test("decoded validation derives delta depth from the streamed reference chain", async () => {
+  const { data, offset } = await firstDelta();
+  const mutated = data.slice();
+  const view = new DataView(mutated.buffer, mutated.byteOffset, mutated.byteLength);
+  view.setUint16(
+    offset + 9 + DELTA_DEPTH,
+    view.getUint16(offset + 9 + DELTA_DEPTH, true) + 4,
+    true,
+  );
+  await assert.rejects(
+    () => validateKeyframeDeltaStreamed(mutated),
+    (error: unknown) =>
+      error instanceof MalformedFile &&
+      error.message.includes("reference chain has depth") &&
+      keyframeDeltaValidationRecordOffset(error) === offset,
+  );
 });
 
 test("a delta whose level differs from its reference is refused", async () => {
