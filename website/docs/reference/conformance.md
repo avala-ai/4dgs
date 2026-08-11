@@ -335,12 +335,16 @@ predicate the runners define and the tables the harness reads — is part of #13
 the `supportsVariant` functions in this repository are a statement of intent rather than working
 code, and this section is what they intend.
 
-One thing declining is _not_: **stepping a record over by its length is not declining it.** An SDK
-that skips an unknown record correctly finishes the file, decodes every gaussian, and produces a
-summary missing the key that record contributes — and a diff cannot tell that apart from a decoder
-that read the record and got it wrong. Forward compatibility is the right behaviour for a reader in
-the field and the wrong answer for a runner. Decline the variant, take the skip, and record
-`Planned` or `No` in the feature matrix according to whether that SDK intends to implement it.
+One thing declining is _not_: **stepping an unknown or private record over by its length is not
+declining it.** Those records deliberately contribute no summary key. A conforming runner must skip
+them, finish the file and answer normally; `AddExtraDataToRecords` exists to prove exactly that
+forward-compatible behaviour.
+
+Declining is for an unimplemented _known_ record family that the canonical summary observes. An SDK
+that skips provenance, for example, produces a summary missing the provenance key, and a diff cannot
+tell that apart from a decoder that read the records and got them wrong. Decline that variant, take
+the skip, and record `Planned` or `No` in the feature matrix according to whether the SDK intends to
+implement the family.
 
 ### Refusing a file
 
