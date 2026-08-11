@@ -43,6 +43,8 @@ constexpr std::uint64_t kMagicSize = 8;
 constexpr std::uint64_t kRecordHeaderSize = 9;
 /// A fixed ceiling for the small summary index retained by validation.
 constexpr std::size_t kMaxChunkIndexEntries = 262144;
+/// Largest summary the core indexed opener may materialize during validation.
+constexpr std::uint64_t kMaxValidationSummaryBytes = 64ULL * 1024ULL * 1024ULL;
 
 /// The record opcodes this tool names by hand, spec §5.2.
 ///
@@ -55,6 +57,7 @@ constexpr std::uint8_t kReservedZero = 0x00;
 constexpr std::uint8_t kHeader = 0x01;
 constexpr std::uint8_t kFooter = 0x02;
 constexpr std::uint8_t kQuantization = 0x03;
+constexpr std::uint8_t kWindowTable = 0x04;
 constexpr std::uint8_t kChunk = 0x05;
 /// Attribute Stream has a registry number for use inside Chunk, but is never a wire record.
 constexpr std::uint8_t kAttributeStream = 0x06;
@@ -228,6 +231,10 @@ struct IndexEntry {
   std::uint64_t offset = 0;
   std::uint64_t length = 0;
   std::uint32_t gaussianCount = 0;
+  /// The untrusted count stated in the fixed prefix, retained so validation can
+  /// reject values outside the three-band version-1 registry without trusting
+  /// that count for allocation.
+  std::uint32_t declaredBandCount = 0;
   /// Band 1 upwards, in the order the entry lists them. Empty for a file with no spherical
   /// harmonics, and for one whose encoder wrote none — both of which are ordinary.
   std::vector<BandRange> bands;
@@ -282,6 +289,10 @@ struct SummaryDeclaration {
   /// One past the last covered byte: where the Footer record's opcode sits.
   std::uint64_t end = 0;
 };
+
+/// Whether the core indexed opener may materialize this declared summary under
+/// validation's fixed byte ceiling. Empty and zero summaries need no buffer.
+bool summaryFitsValidationMemory(const std::optional<SummaryDeclaration>& summary);
 
 /// A successful empty value means there is no unique trailing Footer to inspect. A transport
 /// error reading its fixed prefix is preserved so callers cannot describe failed I/O as absence.

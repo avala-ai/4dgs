@@ -150,6 +150,53 @@ void resealSummary(std::vector<std::uint8_t>* bytes) {
   writeU32(bytes, content + 16, crc);
 }
 
+/// Insert a complete top-level record and keep every file-relative index and
+/// Footer pointer aimed at the same logical record as before.
+bool insertTopLevelRecord(std::vector<std::uint8_t>* bytes, std::uint64_t at,
+                          const std::vector<std::uint8_t>& record) {
+  std::vector<fourdgs::tool::Frame> indexes;
+  fourdgs::Result<Walk> walked =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(bytes->data(), bytes->size()),
+                               [&](const fourdgs::tool::Frame& frame, bool complete) {
+                                 if (complete && frame.opcode == fourdgs::tool::op::kChunkIndex)
+                                   indexes.push_back(frame);
+                               });
+  CHECK(walked.ok());
+  if (!walked) return false;
+  fourdgs::tool::BorrowedReadable source(Span<const std::uint8_t>(bytes->data(), bytes->size()));
+  fourdgs::Result<std::vector<fourdgs::tool::IndexEntry>> parsed =
+      fourdgs::tool::chunkIndexEntries(source, *walked);
+  CHECK(parsed.ok());
+  if (!parsed || parsed->size() != indexes.size()) return false;
+  const fourdgs::tool::Frame* footer = walked->firstIntact(fourdgs::tool::op::kFooter);
+  CHECK(footer != nullptr);
+  if (footer == nullptr) return false;
+  const std::size_t oldFooterContent =
+      static_cast<std::size_t>(footer->offset + fourdgs::tool::kRecordHeaderSize);
+  const std::uint64_t oldSummaryStart = readU64(*bytes, oldFooterContent);
+  const std::uint64_t oldSummaryOffsetStart = readU64(*bytes, oldFooterContent + 8);
+
+  bytes->insert(bytes->begin() + static_cast<std::ptrdiff_t>(at), record.begin(), record.end());
+  const std::uint64_t added = record.size();
+  const auto shifted = [&](std::uint64_t value) { return value >= at ? value + added : value; };
+  for (std::size_t i = 0; i < indexes.size(); ++i) {
+    const std::size_t content =
+        static_cast<std::size_t>(shifted(indexes[i].offset) + fourdgs::tool::kRecordHeaderSize);
+    writeU64(bytes, content + 16, shifted((*parsed)[i].offset));
+    for (std::size_t band = 0; band < (*parsed)[i].bands.size(); ++band) {
+      const std::size_t range = content + 40 + band * 17;
+      writeU64(bytes, range + 1, shifted((*parsed)[i].bands[band].offset));
+    }
+  }
+  const std::size_t footerContent =
+      static_cast<std::size_t>(shifted(footer->offset) + fourdgs::tool::kRecordHeaderSize);
+  writeU64(bytes, footerContent, shifted(oldSummaryStart));
+  writeU64(bytes, footerContent + 8,
+           oldSummaryOffsetStart == 0 ? 0 : shifted(oldSummaryOffsetStart));
+  resealSummary(bytes);
+  return true;
+}
+
 /// The `"refused"` member of an expectation file.
 ///
 /// Enough JSON for one string member, which is all the corpus is asked for here. A JSON parser
@@ -1045,6 +1092,40 @@ void indexedBandsMustMatchTheirRecordsAndOwners() {
   }
   CHECK(checkedLabel);
 
+  std::vector<std::uint8_t> outsideDegree = original;
+  const std::size_t firstIndexBand =
+      static_cast<std::size_t>(indexFrames[0].offset + fourdgs::tool::kRecordHeaderSize + 40);
+  outsideDegree[firstIndexBand] = 4;
+  outsideDegree[declaredBand] = 4;
+  resealSummary(&outsideDegree);
+  const Report outsideDegreeReport =
+      fourdgs::tool::validate(Span<const std::uint8_t>(outsideDegree.data(), outsideDegree.size()));
+  bool checkedDegree = false;
+  for (const fourdgs::tool::Finding& finding : outsideDegreeReport.findings) {
+    if (finding.message.find(
+            "declares SH band 4; expected a band in 1 through Header sh_degree 3") !=
+        std::string::npos) {
+      checkedDegree = true;
+    }
+  }
+  CHECK(checkedDegree);
+
+  std::vector<std::uint8_t> tooManyBands = original;
+  const std::size_t bandCount =
+      static_cast<std::size_t>(indexFrames[0].offset + fourdgs::tool::kRecordHeaderSize + 36);
+  writeU32(&tooManyBands, bandCount, 4);
+  resealSummary(&tooManyBands);
+  const Report tooManyReport =
+      fourdgs::tool::validate(Span<const std::uint8_t>(tooManyBands.data(), tooManyBands.size()));
+  bool rejectedCount = false;
+  for (const fourdgs::tool::Finding& finding : tooManyReport.findings) {
+    if (finding.message.find("declares 4 SH band ranges; version 1 defines at most 3") !=
+        std::string::npos) {
+      rejectedCount = true;
+    }
+  }
+  CHECK(rejectedCount);
+
   CHECK(entries[0].bands.size() >= 2);
   if (entries[0].bands.size() >= 2) {
     std::vector<std::uint8_t> duplicate = original;
@@ -1106,12 +1187,139 @@ void indexedBandsMustMatchTheirRecordsAndOwners() {
       fourdgs::tool::validate(Span<const std::uint8_t>(swapped.data(), swapped.size()));
   bool checkedOwner = false;
   for (const fourdgs::tool::Finding& finding : swappedReport.findings) {
-    if (finding.message.find("does not immediately follow its owning state record") !=
+    if (finding.message.find("does not belong to its preceding state record") !=
         std::string::npos) {
       checkedOwner = true;
     }
   }
   CHECK(checkedOwner);
+}
+
+void skippedExtensionsPreservePhysicalBandOwnership() {
+  if (corpusMissing()) return;
+  if (noDecoder()) return;
+  std::vector<std::uint8_t> bytes =
+      readBytes(corpusDirectory() / "MixedLifetimes-SHDegree3-UseChunkIndex-UseCrc.4dgs");
+  CHECK(!bytes.empty());
+  if (bytes.empty()) return;
+  fourdgs::Result<Walk> walked =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  CHECK(walked.ok());
+  if (!walked) return;
+  fourdgs::tool::BorrowedReadable source(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  fourdgs::Result<std::vector<fourdgs::tool::IndexEntry>> entries =
+      fourdgs::tool::chunkIndexEntries(source, *walked);
+  CHECK(entries.ok());
+  if (!entries || entries->empty() || (*entries)[0].bands.empty()) return;
+
+  const std::uint64_t at = (*entries)[0].bands[0].offset;
+  std::vector<std::uint8_t> privateRecord{0x80};
+  appendU64(&privateRecord, 0);
+  CHECK(insertTopLevelRecord(&bytes, at, privateRecord));
+  const Report report =
+      fourdgs::tool::validate(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  bool lostOwner = false;
+  for (const fourdgs::tool::Finding& finding : report.findings) {
+    if (finding.message.find("does not belong to its preceding state record") !=
+        std::string::npos) {
+      lostOwner = true;
+    }
+  }
+  CHECK(!lostOwner);
+  CHECK(report.ok());
+}
+
+void emptyIndexedBandsAreMalformedRatherThanIncomplete() {
+  if (corpusMissing()) return;
+  if (noDecoder()) return;
+  std::vector<std::uint8_t> bytes =
+      readBytes(corpusDirectory() / "MixedLifetimes-SHDegree3-UseChunkIndex-UseCrc.4dgs");
+  CHECK(!bytes.empty());
+  if (bytes.empty()) return;
+  std::vector<fourdgs::tool::Frame> indexes;
+  fourdgs::Result<Walk> walked =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(bytes.data(), bytes.size()),
+                               [&](const fourdgs::tool::Frame& frame, bool complete) {
+                                 if (complete && frame.opcode == fourdgs::tool::op::kChunkIndex)
+                                   indexes.push_back(frame);
+                               });
+  CHECK(walked.ok());
+  if (!walked) return;
+  fourdgs::tool::BorrowedReadable source(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  fourdgs::Result<std::vector<fourdgs::tool::IndexEntry>> entries =
+      fourdgs::tool::chunkIndexEntries(source, *walked);
+  CHECK(entries.ok());
+  if (!entries || entries->empty() || (*entries)[0].bands.empty()) return;
+  const std::uint64_t at = (*entries)[0].bands[0].offset;
+
+  std::vector<std::uint8_t> emptyBand{fourdgs::tool::op::kShBandStream};
+  appendU64(&emptyBand, 0);
+  CHECK(insertTopLevelRecord(&bytes, at, emptyBand));
+  const std::size_t shiftedIndex = static_cast<std::size_t>(indexes[0].offset + emptyBand.size() +
+                                                            fourdgs::tool::kRecordHeaderSize);
+  writeU64(&bytes, shiftedIndex + 40 + 1, at);
+  writeU64(&bytes, shiftedIndex + 40 + 9, emptyBand.size());
+  resealSummary(&bytes);
+
+  const Report report =
+      fourdgs::tool::validate(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  bool malformed = false;
+  for (const fourdgs::tool::Finding& finding : report.findings) {
+    if (finding.message.find("SH Band Stream at byte " + std::to_string(at) +
+                             " declares 0 content bytes; its band label requires at least 1") !=
+        std::string::npos) {
+      malformed = true;
+    }
+  }
+  CHECK(malformed);
+  CHECK(report.hasErrors());
+}
+
+void decodeFrontMatterAfterStateIsRejected() {
+  if (corpusMissing()) return;
+  if (noDecoder()) return;
+  std::vector<std::uint8_t> bytes = readBytes(corpusDirectory() / kProvenanceVariant);
+  CHECK(!bytes.empty());
+  if (bytes.empty()) return;
+  std::vector<fourdgs::tool::Frame> chunks;
+  fourdgs::Result<Walk> walked =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(bytes.data(), bytes.size()),
+                               [&](const fourdgs::tool::Frame& frame, bool complete) {
+                                 if (complete && frame.opcode == fourdgs::tool::op::kChunk)
+                                   chunks.push_back(frame);
+                               });
+  CHECK(walked.ok());
+  if (!walked || chunks.size() < 2) return;
+  const fourdgs::tool::Frame* quantization = walked->firstIntact(fourdgs::tool::op::kQuantization);
+  CHECK(quantization != nullptr);
+  if (quantization == nullptr) return;
+  const auto begin = bytes.begin() + static_cast<std::ptrdiff_t>(quantization->offset);
+  const auto end = begin + static_cast<std::ptrdiff_t>(quantization->total());
+  const std::vector<std::uint8_t> duplicate(begin, end);
+  CHECK(insertTopLevelRecord(&bytes, chunks[1].offset, duplicate));
+
+  const Report report =
+      fourdgs::tool::validate(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  bool rejected = false;
+  for (const fourdgs::tool::Finding& finding : report.findings) {
+    if (finding.message.find("Quantization record at byte " + std::to_string(chunks[1].offset) +
+                             " appears after the first Chunk record") != std::string::npos) {
+      rejected = true;
+    }
+  }
+  CHECK(rejected);
+}
+
+void indexedCoreSummaryMemoryIsBounded() {
+  const std::uint64_t start = 100;
+  fourdgs::tool::SummaryDeclaration exact;
+  exact.start = start;
+  exact.end = start + fourdgs::tool::kMaxValidationSummaryBytes;
+  CHECK(fourdgs::tool::summaryFitsValidationMemory(exact));
+  fourdgs::tool::SummaryDeclaration over = exact;
+  over.end += 1;
+  CHECK(!fourdgs::tool::summaryFitsValidationMemory(over));
+  CHECK(fourdgs::tool::summaryFitsValidationMemory(std::nullopt));
 }
 
 void undersizedChunkIndexesNameTheirDeclaredSize() {
@@ -1752,6 +1960,10 @@ void runTests() {
   indexedBandRangesMustNameWholeTopLevelRecords();
   indexMetadataMustMatchThePointedRecords();
   indexedBandsMustMatchTheirRecordsAndOwners();
+  skippedExtensionsPreservePhysicalBandOwnership();
+  emptyIndexedBandsAreMalformedRatherThanIncomplete();
+  decodeFrontMatterAfterStateIsRejected();
+  indexedCoreSummaryMemoryIsBounded();
   undersizedChunkIndexesNameTheirDeclaredSize();
   summaryPlacementIsCheckedWithoutAChecksum();
   modelSpecificAndBareStructureOpcodesAreRejected();

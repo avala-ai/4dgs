@@ -511,6 +511,7 @@ Result<std::vector<IndexEntry>> chunkIndexEntries(Readable& source, const Walk& 
     // `gaussian_count` then `band_count`, two `u32`s closing the prefix.
     std::uint32_t bands = 0;
     for (int i = 3; i >= 0; --i) bands = (bands << 8) | prefix[36 + i];
+    entry.declaredBandCount = bands;
     // The format defines at most three SH bands. Reading more would only retain an untrusted
     // count's worth of ranges for a record the decoder will refuse independently.
     const std::uint32_t keptBands = bands < 3 ? bands : 3;
