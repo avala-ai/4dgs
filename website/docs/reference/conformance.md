@@ -382,10 +382,13 @@ language could see it. The two files break the same rule from opposite direction
 refuse both under the same name. A useful side effect: the identifier cannot be derived from the
 variant name, which is as it should be, since it names the rule and not the file.
 
-An exception that carries no identifier should print an empty one. `{"refused": ""}` matches no
-expectation and fails with a readable diff, and that is the intended outcome rather than a fallback:
-a refusal a library cannot name is a refusal the suite cannot check, and it should look like a gap
-rather than a pass.
+Only an error carrying one of those six identifiers is a refusal answer. If decoding fails without
+one — a truncated transport, an I/O error, an ordinary parse failure — the runner prints no refusal
+document, writes its diagnosis to stderr and exits non-zero. In particular, `{"refused": ""}` is not
+the representation of an unnamed error: it exits zero and therefore claims the runner produced a
+valid answer, even though the empty string is not an identifier the format defines. The Rust and
+Python runners both preserve this split, so an implementation that cannot name a decoder error must
+fail the invocation rather than turn it into an empty refusal.
 
 Whether any of this runs at all is gated at family granularity by `REFUSAL_FAMILIES`
 ([`run.py:114`](https://github.com/avala-ai/4dgs/blob/main/tests/conformance/run.py#L114)), which
