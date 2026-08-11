@@ -37,7 +37,7 @@ from fourdgs.indexed_reader import (
 from fourdgs.opcode import HEADER
 from fourdgs.readable import FileReadable
 from fourdgs.records import Header
-from fourdgs.serialization import MAGIC, check_magic, iter_records
+from fourdgs.serialization import MAGIC, iter_records
 
 UNSUPPORTED: frozenset[str] = frozenset()
 
@@ -49,8 +49,12 @@ def supports_variant(name: str) -> bool:
 
 
 def _temporal_model(data: bytes) -> str | None:
-    """The Header's temporal model, read without decoding the gaussians."""
-    check_magic(data)
+    """The Header's temporal model, read only to choose the indexed decoder.
+
+    This is dispatch, not validation. In particular it must not check the magic: the
+    selected indexed decoder owns that rule, so the invalid corpus can prove that the
+    indexed path enforces it independently of the streamed path.
+    """
     for record in iter_records(data, len(MAGIC)):
         if record.opcode == HEADER:
             return Header.parse(record.content).temporal_model
