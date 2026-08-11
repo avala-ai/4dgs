@@ -680,7 +680,7 @@ decodeKeyframeDeltaIndexed(Uint8List data) {
   final chunks = <KeyframeDeltaChunk>[];
   for (int i = 0; i < index.length; i++) {
     final entry = index[i];
-    final state = _composeChain(data, index, entry);
+    final state = composeKeyframeDeltaChain(data, index, entry);
     // The index says how many gaussians are live over this interval and the
     // chunks say what they are, and §5.8 calls that duplication a cheap
     // corruption check. It is also the only thing standing between a zero-width
@@ -757,7 +757,15 @@ Uint8List _recordContent(Uint8List data, int offset, int length) {
   return c.take(c.u64());
 }
 
-KeyframeDeltaState _composeChain(
+/// The composed state of one index entry: its chain, walked and telescoped.
+///
+/// Public because a caller does not always want the whole sequence.
+/// [decodeKeyframeDeltaIndexed] answers "what does this file decode to" and so
+/// keeps every composed state; a seeking client wants one instant, and a
+/// validator wants only to know that each chain composes at all. Both of those
+/// need one state resident at a time, which is what calling this in a loop and
+/// dropping the result gives them (AGENTS.md §1).
+KeyframeDeltaState composeKeyframeDeltaChain(
   Uint8List data,
   List<FourdgsChunkIndexEntry> index,
   FourdgsChunkIndexEntry entry,
