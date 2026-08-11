@@ -106,8 +106,11 @@ git worktree add --no-track -b fix/rust-<slug>   ../4dgs-wt-rust   "$UPSTREAM/ma
 #   : "${PR_HEAD_REMOTE:?}"; git push -u "$PR_HEAD_REMOTE" HEAD
 # Stacks on the canonical repo: git push -u "$UPSTREAM" HEAD
 
-# Cleanup — run from PRIMARY clone, not from inside the worktree:
-# cd "$(git rev-parse --show-toplevel)"
+# Cleanup — resolve and enter the primary clone even when this block starts in a linked
+# worktree. `--show-toplevel` would only name the linked worktree itself.
+PRIMARY_GIT_DIR=$(git rev-parse --path-format=absolute --git-common-dir)
+PRIMARY=$(dirname "$PRIMARY_GIT_DIR")
+cd "$PRIMARY"
 state=$(gh pr view <n> --json state --jq .state)
 if [ "$state" = "MERGED" ] || [ "${ABANDON_CONFIRMED:-}" = "1" ]; then
   if [ -n "$(git -C ../4dgs-wt-python status --porcelain 2>/dev/null)" ]; then
@@ -184,15 +187,15 @@ Agents **should** commit as they go **inside their own worktree**.
 
 ## 5. Fast feedback loops (close the loop without full multi-SDK waits)
 
-| Loop                  | Prefer                                                                                                                                                                                                                        |
-| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Python                | Package tests under `python/`. **Format claim:** generate corpus, then `python tests/conformance/run.py --runner python` from repo root (same as CI).                                                                         |
-| Rust                  | Package `cargo test` in `rust/`. **Format claim:** build runners as CI does, generate corpus, then `python tests/conformance/run.py --runner rust`.                                                                           |
-| TypeScript            | **Repo root:** `yarn test` for unit; **format claim:** `yarn build` (produces conformance runners) **then** `yarn conformance` / `python tests/conformance/run.py --runner typescript`. Do not run conformance without build. |
-| Dart                  | Package tests under `dart/`. **Format claim:** build dart runners as CI does, generate corpus, then `python tests/conformance/run.py --runner dart`.                                                                          |
-| C++                   | Package/build tests under `cpp/`. **Format claim:** build runners as CI does, generate corpus, then `python tests/conformance/run.py --runner cpp`.                                                                           |
-| Swift                 | Package tests under `swift/`. **Format claim:** build runners as CI does, generate corpus, then `python tests/conformance/run.py --runner swift`.                                                                             |
-| Vocabulary / concepts | `website/docs/guides/concepts.md` (not normative `website/docs/spec/`)                                                                                                                                                        |
+| Loop                  | Prefer                                                                                                                                                                                                                                                      |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Python                | Package tests under `python/`. **Format claim:** generate corpus, then `python tests/conformance/run.py --runner python` from repo root (same as CI).                                                                                                       |
+| Rust                  | Package `cargo test` in `rust/`. **Format claim:** build runners as CI does, generate corpus, then `python tests/conformance/run.py --runner rust`.                                                                                                         |
+| TypeScript            | **Repo root:** generate the corpus first, then `yarn test`; **format claim:** `python3 tests/conformance/generate.py`, `yarn build`, then `yarn conformance` / `python3 tests/conformance/run.py --runner typescript`. The corpus must precede both checks. |
+| Dart                  | Package tests under `dart/`. **Format claim:** build dart runners as CI does, generate corpus, then `python tests/conformance/run.py --runner dart`.                                                                                                        |
+| C++                   | Package/build tests under `cpp/`. **Format claim:** build runners as CI does, generate corpus, then `python tests/conformance/run.py --runner cpp`.                                                                                                         |
+| Swift                 | Package tests under `swift/`. **Format claim:** build runners as CI does, generate corpus, then `LD_LIBRARY_PATH=$PWD/target/release python3 tests/conformance/run.py --runner swift` (the Linux runner loads `libfourdgs.so` there).                       |
+| Vocabulary / concepts | `website/docs/guides/concepts.md` (not normative `website/docs/spec/`)                                                                                                                                                                                      |
 
 **Close the loop before expanding scope.**
 
