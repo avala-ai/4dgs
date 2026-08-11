@@ -208,9 +208,12 @@ under `--update` does not stop the run; it commits the banner as the expectation
 implementation is then diffed against. Treat `--update` as what it is: a deliberate rewrite of the
 contract, to be read in the diff before it is committed, and never a way to make a red suite green.
 
-**Stderr is free.** The harness captures it, parses none of it, and prints its first 2000 characters
-only when the runner exits non-zero. So stderr is where diagnostics belong — with the caveat that on
-a passing run nobody will ever see them.
+**Stderr is free to carry diagnostics, but it still has to be text the harness can decode.**
+`run.py` captures both streams with Python's `text=True`, using its selected text encoding and
+strict error handling before the return code is inspected. One invalid byte on either stream raises
+`UnicodeDecodeError` and aborts the suite. Within that constraint the harness parses none of stderr
+and prints its first 2000 characters only when the runner exits non-zero. So stderr is where text
+diagnostics belong — with the caveat that on a passing run nobody will ever see them.
 
 ### Exit codes: refused is not crashed
 
@@ -386,9 +389,12 @@ Only an error carrying one of those six identifiers is a refusal answer. If deco
 one — a truncated transport, an I/O error, an ordinary parse failure — the runner prints no refusal
 document, writes its diagnosis to stderr and exits non-zero. In particular, `{"refused": ""}` is not
 the representation of an unnamed error: it exits zero and therefore claims the runner produced a
-valid answer, even though the empty string is not an identifier the format defines. The Rust and
-Python runners both preserve this split, so an implementation that cannot name a decoder error must
-fail the invocation rather than turn it into an empty refusal.
+valid answer, even though the empty string is not an identifier the format defines. The Rust runners
+preserve this split. The two Python runners currently do not: they catch every `FourdgsError`,
+substitute `""` for a missing code and exit zero. That is a runner defect
+([#208](https://github.com/avala-ai/4dgs/issues/208)), not an alternative protocol. An outside
+implementation that cannot name a decoder error must fail the invocation rather than copy Python's
+empty refusal.
 
 Whether any of this runs at all is gated at family granularity by `REFUSAL_FAMILIES`
 ([`run.py:114`](https://github.com/avala-ai/4dgs/blob/main/tests/conformance/run.py#L114)), which
