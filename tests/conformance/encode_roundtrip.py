@@ -7,6 +7,7 @@
     python3 tests/conformance/encode_roundtrip.py --encoder cpp
     python3 tests/conformance/encode_roundtrip.py --encoder swift
     python3 tests/conformance/encode_roundtrip.py --encoder typescript
+    python3 tests/conformance/encode_roundtrip.py --encoder dart
     python3 tests/conformance/encode_roundtrip.py --encoder rust    # self-check
 
 The corpus proves decoders against files the reference *encoder* wrote. This proves an
@@ -18,11 +19,10 @@ reproduce audio, cameras, attachments or provenance a variant happens to carry.
 
 The gate: encode the same variant with `encode_gaussians` (the Rust reference) and with the
 candidate, decode BOTH with the Python reference decoder, and require identical canonical
-JSON. Because the preset is fixed and the encoder is deterministic in its input and options,
-two correct encoders produce files that decode to the same summary — chunk intervals, summary
-offsets and all. For C++ and Swift, which reach the Rust encoder through the C ABI, this
-proves the binding wired the gaussians and options through correctly, not that a second
-encoder agrees. For TypeScript, a genuine second encoder, it proves agreement.
+gaussian state. For C++ and Swift, which reach the Rust encoder through the C ABI, the files
+also have identical layout and derived metadata. Genuine second encoders make independent
+layout, partition and quantization choices; those fields are validated against the candidate's
+own reconstructed state rather than compared byte-for-byte with Rust's choices.
 
 A second pass repeats this for the spherical-harmonic variants at per-band bit depths, where
 the coefficients one encoder coarsened must come back out of the decoder as the same bytes
@@ -34,9 +34,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import struct
 import subprocess
 import sys
 import tempfile
+
+import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "data")
@@ -47,6 +50,12 @@ sys.path.insert(0, HERE)
 
 import fourdgs
 from canonical import canonical, summarize
+from fourdgs import opcode
+from fourdgs.indexed_reader import open_indexed, read_chunk
+from fourdgs.quantization import support_k
+from fourdgs.readable import FileReadable
+from fourdgs.serialization import MAGIC
+from fourdgs.stream_reader import window_table_or_default
 
 EXE = ".exe" if os.name == "nt" else ""
 
@@ -54,6 +63,7 @@ RUST_BIN = os.path.join(ROOT, "target", "release")
 CPP_BUILD = os.path.join(ROOT, "cpp", "build", "conformance")
 SWIFT_BIN = os.path.join(ROOT, "swift", ".build", "release")
 TYPESCRIPT_DIST = os.path.join(ROOT, "typescript", "conformance", "dist")
+DART_BIN = os.path.join(ROOT, "dart", "conformance", "build")
 
 #: The shared baseline every candidate is diffed against.
 REFERENCE = [os.path.join(RUST_BIN, "encode_gaussians" + EXE)]
@@ -65,6 +75,7 @@ ENCODERS = {
     "cpp": [os.path.join(CPP_BUILD, "encode_roundtrip" + EXE)],
     "swift": [os.path.join(SWIFT_BIN, "encode_roundtrip" + EXE)],
     "typescript": ["node", os.path.join(TYPESCRIPT_DIST, "encode_roundtrip.js")],
+    "dart": [os.path.join(DART_BIN, "encode_roundtrip" + EXE)],
 }
 
 #: The per-band depths the SH pass re-encodes at, band 1 first. Passed as a comma-separated
@@ -77,11 +88,21 @@ SH_LADDER = ",".join(str(depth) for depth in SH_LADDER_DEPTHS)
 #: A binding produces byte-identical files to the reference, so the gate compares everything;
 #: a second encoder makes its own byte-layout choices — how well deflate did, which order
 #: gaussians sit in a chunk — that are legitimately its own and are not part of what the file
-#: means. For those, the summary's byte offsets and the producer's `library` string are
-#: dropped before the comparison, which then rests on decoded content: the gaussian values,
-#: the chunk intervals, the statistics, the spherical-harmonic digest.
-SECOND_ENCODERS = frozenset({"typescript"})
+#: means. Summary byte offsets and the producer string are dropped for both. Dart's temporal
+#: partition is also independent, so its intervals and derived chunk count are checked by the
+#: geometry gate rather than compared with Rust's. TypeScript retains the pre-existing exact
+#: interval/count comparison until its own geometry gate proves that feature directly.
+SECOND_ENCODERS = frozenset({"typescript", "dart"})
+#: Encoders whose feature claim includes their own temporal partition. Add a family only
+#: in its language PR, once its writer proves reconstructed support is range-seekable.
+CHUNK_GEOMETRY_ENCODERS = frozenset({"dart"})
+#: Encoders whose Header and Statistics bounds are derived from their independently
+#: reconstructed positions. The geometry check proves those bounds contain exactly the
+#: public f32 state; an exact comparison with Rust's independently quantized positions would
+#: reject valid files while failing to prove the invariant readers rely on.
+AABB_GEOMETRY_ENCODERS = frozenset({"dart"})
 LAYOUT_DEPENDENT_KEYS = ("summaryOffsets", "library")
+RECORD_HEADER = struct.Struct("<BQ")
 
 
 def variants() -> list[str]:
@@ -117,7 +138,14 @@ def encode(command: list[str], source: str, out: str, ladder: str | None) -> Non
 
 
 def compare(
-    reference: list[str], candidate: list[str], source: str, tmp: str, ladder: str | None, second_encoder: bool
+    reference: list[str],
+    candidate: list[str],
+    source: str,
+    tmp: str,
+    ladder: str | None,
+    second_encoder: bool,
+    check_chunk_geometry: bool,
+    check_aabb_geometry: bool,
 ) -> None:
     ref_out = os.path.join(tmp, "reference.4dgs")
     cand_out = os.path.join(tmp, "candidate.4dgs")
@@ -125,30 +153,197 @@ def compare(
     encode(candidate, source, cand_out, ladder)
     ref = json.loads(decode_canonical(ref_out))
     cand = json.loads(decode_canonical(cand_out))
+    if check_chunk_geometry:
+        _check_chunk_geometry(cand_out)
+    if check_aabb_geometry:
+        _check_aabb_geometry(cand_out)
     if second_encoder:
         for key in LAYOUT_DEPENDENT_KEYS:
             ref.pop(key, None)
             cand.pop(key, None)
+        if check_aabb_geometry:
+            for summary in (ref, cand):
+                statistics = summary.get("statistics")
+                if statistics is not None:
+                    statistics.pop("aabb", None)
+        if check_chunk_geometry:
+            for summary in (ref, cand):
+                summary.pop("chunkIntervals", None)
+                statistics = summary.get("statistics")
+                if statistics is not None:
+                    statistics.pop("chunkCount", None)
+        # Dart deliberately clears `capture`: this gaussian-only preset does not
+        # promise the source's original Statistics/multi-chunk capture shape. Rust
+        # preserves the string even though the layout comparison is already removed.
+        # Normalize the two legal spellings before comparing reconstructed state.
+        if {ref.get("profile"), cand.get("profile")} <= {"", "capture"}:
+            ref.pop("profile", None)
+            cand.pop("profile", None)
+        # Gaussian-only authoring surfaces do not reproduce the Object Table. The Rust
+        # reference currently drops object_id with it, while Dart preserves the optional
+        # gaussian lane. Dart's fidelity gate proves that lane one-to-one against the source;
+        # remove the resulting object-derived canonical sections from this agreement check.
+        if ref.get("profile") == "objects" or cand.get("profile") == "objects":
+            for summary in (ref, cand):
+                summary.pop("profile", None)
+                summary.pop("objects", None)
+                summary.pop("states", None)
+                summary.get("sample", {}).pop("objectIds", None)
     if ref != cand:
         raise AssertionError(_diff(json.dumps(ref), json.dumps(cand)))
     if ladder is not None:
         _check_declared_depths(cand_out)
 
 
+def _check_chunk_geometry(path: str) -> None:
+    """Every candidate Chunk is indexed once and its interval contains its support.
+
+    A streamed canonical decode visits every Chunk, so equal reconstructed state alone
+    cannot prove that an indexed seek can find that state. Layout may differ from the
+    reference encoder; this invariant may not.
+    """
+    with FileReadable(path) as source:
+        scene = open_indexed(source)
+        chunk_offsets = _chunk_record_offsets(source)
+        indexed_offsets = [entry.chunk_offset for entry in scene.index]
+        if sorted(indexed_offsets) != sorted(chunk_offsets):
+            raise AssertionError(
+                "the Chunk Index must name every Chunk exactly once; "
+                f"chunks are {chunk_offsets}, index names {indexed_offsets}"
+            )
+
+        table = window_table_or_default(scene.windows)
+        k = support_k(scene.header.cutoff)
+        clock_end = max(scene.header.duration_sec, 1e-9)
+        indexed_gaussians = 0
+        for number, entry in enumerate(scene.index):
+            if not (entry.t0 < entry.t1):
+                raise AssertionError(f"chunk index entry {number} has invalid interval [{entry.t0}, {entry.t1})")
+            chunk = read_chunk(source, scene, entry)
+            count = len(chunk["mu_t"])
+            if count != entry.gaussian_count:
+                raise AssertionError(
+                    f"chunk index entry {number} declares {entry.gaussian_count} gaussians, its Chunk has {count}"
+                )
+            indexed_gaussians += count
+
+            # Canonical gaussian state is f32 even though read_chunk has f64
+            # intermediates. Round first, then widen for the support arithmetic
+            # and apply the same sigma floor as state_at.
+            sigma = np.asarray(chunk["sigma_t"], dtype=np.float32).astype(np.float64)
+            mu = np.asarray(chunk["mu_t"], dtype=np.float32).astype(np.float64)
+            half = np.where(np.isfinite(sigma), k * np.maximum(sigma, 1e-30), np.inf)
+            windows = table[chunk["window_index"]]
+            window_lo = np.maximum(windows[:, 0], 0.0)
+            window_hi = np.minimum(windows[:, 1], clock_end)
+            lo = np.maximum(mu - half, window_lo)
+            hi = np.minimum(mu + half, window_hi)
+            # t1 is half-open. Equality is safe only when the gaussian's own
+            # validity window also ends there, so it is not visible at t1.
+            outside = (lo < entry.t0) | (hi > entry.t1) | ((hi == entry.t1) & (window_hi > entry.t1))
+            if np.any(outside):
+                gaussian = int(np.flatnonzero(outside)[0])
+                raise AssertionError(
+                    f"chunk index entry {number} [{entry.t0}, {entry.t1}) omits support "
+                    f"[{lo[gaussian]}, {hi[gaussian]}] for gaussian {gaussian} in its Chunk"
+                )
+
+        if indexed_gaussians != scene.header.gaussian_count:
+            raise AssertionError(
+                f"the index reaches {indexed_gaussians} gaussians, Header declares {scene.header.gaussian_count}"
+            )
+
+
+def _check_aabb_geometry(path: str) -> None:
+    """Header and Statistics bounds contain the candidate's public f32 positions."""
+    scene = fourdgs.read(path)
+    actual = scene.gaussians.aabb()
+
+    declared = [("Header", scene.header.aabb)]
+    if scene.statistics is not None:
+        declared.append(("Statistics", scene.statistics.aabb))
+        if list(scene.statistics.aabb) != list(scene.header.aabb):
+            raise AssertionError(
+                f"Statistics AABB {scene.statistics.aabb} does not match Header AABB {scene.header.aabb}"
+            )
+
+    for record, bounds in declared:
+        _check_declared_aabb(record, bounds, actual)
+
+
+def _check_declared_aabb(record: str, bounds: list[float], actual: list[float]) -> None:
+    if len(bounds) != 6:
+        raise AssertionError(f"{record} AABB has {len(bounds)} values, expected 6")
+    if not all(np.isfinite(bounds)):
+        raise AssertionError(f"{record} AABB {bounds} contains a non-finite bound")
+    for axis in range(3):
+        if bounds[axis] > bounds[3 + axis]:
+            raise AssertionError(f"{record} AABB {bounds} is inverted on axis {axis}")
+        if bounds[axis] > actual[axis] or bounds[3 + axis] < actual[3 + axis]:
+            raise AssertionError(
+                f"{record} AABB {bounds} excludes reconstructed axis {axis} range [{actual[axis]}, {actual[3 + axis]}]"
+            )
+
+
+def _chunk_record_offsets(source: FileReadable) -> list[int]:
+    """Scan framing headers without retaining record payloads or the whole file."""
+    payload_end = source.size() - len(MAGIC)
+    if payload_end < len(MAGIC) or source.read(payload_end, len(MAGIC)) != MAGIC:
+        raise AssertionError("candidate has no final magic")
+
+    offsets = []
+    offset = len(MAGIC)
+    while offset < payload_end:
+        if offset + RECORD_HEADER.size > payload_end:
+            raise AssertionError(f"record header at offset {offset} overlaps the final magic")
+        record_opcode, length = RECORD_HEADER.unpack(source.read(offset, RECORD_HEADER.size))
+        record_end = offset + RECORD_HEADER.size + length
+        if record_end > payload_end:
+            raise AssertionError(f"record at offset {offset} ends at {record_end}, beyond payload end {payload_end}")
+        if record_opcode == opcode.CHUNK:
+            offsets.append(offset)
+        offset = record_end
+    return offsets
+
+
 def _check_declared_depths(path: str) -> None:
-    """The candidate declared the depths it actually used, and a bound per band.
+    """The candidate declared its depths, per-band bounds, and coarsest fallback fields.
 
     A file whose coefficients and whose declaration disagree passes the canonical diff on its
     data and fails here on its metadata, or the reverse — which is why both are checked.
     """
-    quant = fourdgs.read(path).quantization
-    degree = int(fourdgs.read(path).header.sh_degree)
+    scene = fourdgs.read(path)
+    quant = scene.quantization
+    degree = int(scene.header.sh_degree)
     expected = SH_LADDER_DEPTHS[:degree]
     if quant.sh_bit_depths != expected:
         raise AssertionError(f"declares SH bit depths {quant.sh_bit_depths}, not {expected}")
     missing = [band for band in range(1, degree + 1) if f"sh_band{band}" not in quant.bounds]
     if missing:
         raise AssertionError(f"declares depths but no bound for bands {missing}")
+    wrong = []
+    for band, depth in enumerate(expected, start=1):
+        key = f"sh_band{band}"
+        expected_bound = (1 << (8 - depth)) // 2
+        try:
+            found = float(quant.bounds[key])
+        except (TypeError, ValueError):
+            found = quant.bounds[key]
+        if found != expected_bound:
+            wrong.append(f"band {band}: {found!r}, expected {expected_bound}")
+    if wrong:
+        raise AssertionError("declares the wrong SH bound (" + "; ".join(wrong) + ")")
+
+    coarsest_step = max(1 << (8 - depth) for depth in expected)
+    coarsest_bound = coarsest_step // 2
+    if quant.step_sh != coarsest_step:
+        raise AssertionError(f"declares legacy step_sh {quant.step_sh}, not coarsest-band pitch {coarsest_step}")
+    try:
+        fallback_bound = float(quant.bounds["sh"])
+    except (KeyError, TypeError, ValueError):
+        fallback_bound = quant.bounds.get("sh")
+    if fallback_bound != coarsest_bound:
+        raise AssertionError(f"declares legacy sh bound {fallback_bound!r}, not coarsest-band bound {coarsest_bound}")
 
 
 def _diff(reference: str, candidate: str) -> str:
@@ -184,12 +379,23 @@ def main(argv=None) -> int:
         return 1
 
     second_encoder = args.encoder in SECOND_ENCODERS
+    check_chunk_geometry = args.encoder in CHUNK_GEOMETRY_ENCODERS
+    check_aabb_geometry = args.encoder in AABB_GEOMETRY_ENCODERS
     agreed = graded = failed = 0
     with tempfile.TemporaryDirectory() as tmp:
         for variant in names:
             source = os.path.join(DATA, f"{variant}.4dgs")
             try:
-                compare(REFERENCE, command, source, tmp, None, second_encoder)
+                compare(
+                    REFERENCE,
+                    command,
+                    source,
+                    tmp,
+                    None,
+                    second_encoder,
+                    check_chunk_geometry,
+                    check_aabb_geometry,
+                )
                 agreed += 1
             except (AssertionError, RuntimeError) as exc:
                 failed += 1
@@ -197,7 +403,16 @@ def main(argv=None) -> int:
                 continue
             if "SHDegree" in variant:
                 try:
-                    compare(REFERENCE, command, source, tmp, SH_LADDER, second_encoder)
+                    compare(
+                        REFERENCE,
+                        command,
+                        source,
+                        tmp,
+                        SH_LADDER,
+                        second_encoder,
+                        check_chunk_geometry,
+                        check_aabb_geometry,
+                    )
                     graded += 1
                 except (AssertionError, RuntimeError) as exc:
                     failed += 1

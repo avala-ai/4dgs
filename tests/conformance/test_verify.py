@@ -26,6 +26,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import canonical
+import encode_roundtrip
 import generate
 
 # `generate` puts `python/fourdgs` on the path as it imports, which is why this follows it.
@@ -172,3 +173,21 @@ class TestTheCanonicalFormHasNoSignedZero:
         assert not str(kdf._num(-1e-9)).startswith("-")
         assert kdf._num(-1.5) == -1.5
         assert kdf._num(float("inf")) is None
+
+
+class TestEncodeAabbGeometryGate:
+    def test_a_nan_bound_cannot_bypass_ordered_comparisons(self):
+        with pytest.raises(AssertionError, match="non-finite bound"):
+            encode_roundtrip._check_declared_aabb(
+                "Header",
+                [float("nan"), 0.0, 0.0, 1.0, 1.0, 1.0],
+                [0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            )
+
+    def test_an_inverted_bound_is_named_before_containment(self):
+        with pytest.raises(AssertionError, match="inverted on axis 0"):
+            encode_roundtrip._check_declared_aabb(
+                "Statistics",
+                [2.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+                [2.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            )
