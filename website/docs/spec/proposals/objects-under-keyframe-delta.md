@@ -298,12 +298,14 @@ one.
 > `object_id`, it logically carries an all-zero column, one zero for every live gaussian. An update
 > MAY introduce the stream by restating non-zero ids for any subset; the composer materializes the
 > zero column before applying those absolute replacements, and unmentioned gaussians remain zero.
-> When a birth group first introduces `object_id`, the composer likewise materializes zeros for
-> every surviving reference row before appending the births' absolute values; the resulting column
-> has one value for every row in the composed population, not only for the births. Likewise, a birth
-> group that omits `object_id` gives each birth id zero even when the surviving reference population
-> already carries the column. Physical omission is therefore not an update-attribute mismatch and
-> MUST NOT be refused as one.
+> When the reference already carries `object_id`, omitting it from an update means no restatement:
+> every updated gaussian keeps its reference id, just as it keeps any other attribute absent from
+> the update group. Omission does not replace an existing id with zero. When a birth group first
+> introduces `object_id`, the composer likewise materializes zeros for every surviving reference row
+> before appending the births' absolute values; the resulting column has one value for every row in
+> the composed population, not only for the births. Likewise, a birth group that omits `object_id`
+> gives each birth id zero even when the surviving reference population already carries the column.
+> Physical omission is therefore not an update-attribute mismatch and MUST NOT be refused as one.
 
 ### 5.3 Into §5.18, in the `updates` bullet
 
@@ -329,9 +331,12 @@ and extend the bullet's final sentence:
 > applies to a gaussian at time `t` is the one naming the `object_id` the chain produced for it at
 > `t`, and composition happens once, after reconstruction, per §11.3.
 >
-> Omitting the stream means the logical value zero for every gaussian, including a keyframe whose
-> later update or birth group introduces non-zero ids, and a birth in a state where other gaussians
-> already carry ids. §11.5 defines how that implicit zero column participates in composition.
+> Omitting the stream from a complete keyframe or from a birth means the logical value zero for the
+> gaussians that record introduces. Omitting it from an update means the reference value is carried
+> forward, not reset. Thus a keyframe whose later update or birth group introduces non-zero ids and
+> a birth in a state where other gaussians already carry ids both begin with zero, while a
+> position-only update to object `7` remains on object `7`. §11.5 defines how the implicit zero
+> column and carry-forward rule participate in composition.
 
 ### 5.5 Into §13's changelog table
 
@@ -357,14 +362,14 @@ with the accompanying note:
 decide.
 
 - **Shape:** at least four state chunks so that a delta references a delta (depth ≥ 2), an Object
-  Table naming two objects, and one Object Track for one of them with samples that put a
-  non-identity pose at every probe. The keyframe deliberately omits `object_id`, so its population
-  begins with implicit zero ids. The first delta's **birth group** introduces the stream with object
-  id `7` while the surviving reference rows remain implicit zeros; that delta also assigns one
-  implicit-zero survivor to id `7`. The next delta relabels the born gaussian from `7` to the
-  separately tracked id `12`. A later birth omits the stream and must receive zero even though the
-  composed state now carries non-zero ids. At least one gaussian carries per-gaussian `motion` so
-  that `R * (position + motion * dt) + T` is distinguishable from `R * position + T`.
+  Table naming two objects, and distinguishable Object Tracks for ids `7` and `12`, both with
+  samples that put a non-identity pose at every probe. The keyframe deliberately omits `object_id`,
+  so its population begins with implicit zero ids. The first delta's **birth group** introduces the
+  stream with object id `7` while the surviving reference rows remain implicit zeros; that delta
+  also assigns one implicit-zero survivor to id `7`. The next delta relabels the born gaussian from
+  `7` to the separately tracked id `12`. A later birth omits the stream and must receive zero even
+  though the composed state now carries non-zero ids. At least one gaussian carries per-gaussian
+  `motion` so that `R * (position + motion * dt) + T` is distinguishable from `R * position + T`.
 - **The first birth introduces `object_id`.** Its absolute birth row is appended to a materialized
   zero column for all survivors. This is the inverse transition to an omitted birth after the column
   exists, and catches a generic composer that appends an attribute array containing only the birth
@@ -373,9 +378,15 @@ decide.
   keyframe survivor from implicit zero to `7` proves that an omitted keyframe column is materialized
   instead of refused. Relabelling the born gaussian from non-zero id `7` to non-zero id `12` is what
   proves absolute replacement: the erroneous additive path produces `19`, whereas a zero-to-`12`
-  transition would produce `12` under either algorithm. Under rule (i), id `12`'s track moves that
-  gaussian at the following probe; the untouched gaussian and the later birth that omits the stream
-  remain untracked.
+  transition would produce `12` under either algorithm. The born gaussian is therefore moved first
+  by id `7` only in the intermediate reconstructed state and by id `12` in the later one. A decoder
+  that composes tracks after each delta carries id `7`'s distinguishable transform into the next
+  delta and then applies id `12` as well, while the required post-chain composition applies only id
+  `12` to the final reconstructed base state. The untouched gaussian and the later birth that omits
+  the stream remain untracked.
+- **Omitted update lanes carry forward.** Add a position-only update for a gaussian already on id
+  `7`; its canonical `objectIds` value remains `7` and its track still applies. This distinguishes
+  update omission from the implicit zero assigned by an omitted complete-keyframe or birth lane.
 - **What the canonical must report.** The `keyframe-delta` canonical
   (`keyframe_delta_file.states_json`) has no `objects` member and no `objectIds` today, so it must
   gain both, in the shape `canonical.summarize` already uses for `gaussian-birth`: an `objects`

@@ -291,13 +291,15 @@ One variant, in `data/invalid/`, because after this proposal the file is not a l
   offset. It joins the seven files already in `data/invalid/`, which are all single-value refusals —
   a bad magic, an unknown scheme, a window index out of range — so a record-position refusal is a
   new shape for that directory rather than a variation on one already there.
-- **The rest of the positional family is independently pinned.** Add `LateLegacyAudio`,
-  `LateCamera`, `LateMetadata`, `LateAttachment`, `LateWindowTable`, `LateAudioSource` and
-  `LateAudioData` using the same splice. One provenance example cannot prove the branches for
-  unrelated legacy opcodes, and Audio Source and Audio Data are separate opcodes with separate
-  refusal branches. Each expectation names its opcode and offset; the last two close both halves of
-  the pre-existing §5.17 gap while the other five prevent this proposal from documenting a broader
-  rule than the suite proves.
+- **The rest of the positional family is independently pinned.** Add `LateCoordinateFrame`,
+  `LateSensorCalibration`, `LateRigTrajectory`, `LateGeodeticAnchor`, `LateObjectTable` and
+  `LateObjectTrack`, plus `LateLegacyAudio`, `LateCamera`, `LateMetadata`, `LateAttachment`,
+  `LateWindowTable`, `LateAudioSource` and `LateAudioData`, using the same splice. The six
+  provenance opcodes dispatch through separate parser branches, so Object Track cannot stand in for
+  the other five; likewise, one provenance example cannot prove the branches for unrelated legacy
+  opcodes, and Audio Source and Audio Data have separate refusal branches. Each expectation names
+  its opcode and offset; the last two close both halves of the pre-existing §5.17 gap while the rest
+  prevent this proposal from documenting a broader rule than the suite proves.
 - **Opcode and offset are machine-checked, not prose around a generic refusal.** Before adding the
   variants, the invalid-runner result grows optional `opcode` and `at` fields sourced from the
   structured exception, and these expectations contain all three values, for example
