@@ -206,6 +206,18 @@ bool hasAnyVisibleSupport(FourdgsGaussianSet gaussians, double cutoff) {
 double seekGuardSigmaHalfRelative(double pitch) =>
     math.exp(0.5 * pitch.abs()) - 1.0;
 
+/// Largest birth-time movement caused by half one reconstructed `mu_t` bin.
+///
+/// Malformed quantization is diagnosed by the decoder separately. This proof
+/// still treats a negative finite pitch by magnitude so its boundary guard
+/// cannot disappear before that diagnosis runs.
+double seekGuardMuHalfWidth(
+  int sigmaBin,
+  double sigmaLogPitch,
+  bool neverFades,
+  double timePitch,
+) => 0.5 * muStep(sigmaBin, sigmaLogPitch, neverFades, timePitch).abs();
+
 /// A [FourdgsReadable] that records what it transferred, so a claim about byte
 /// ranges can be checked against the bytes that actually moved.
 class CountingReadable implements FourdgsReadable {
@@ -341,13 +353,16 @@ Future<void> checkBandRangeSkipping(
 /// guard that swallowed every instant would otherwise leave this reporting
 /// success for a check that never executed, which is the failure mode every
 /// self-skipping test has.
-Future<int> checkSeekReadsOnlyWhatItNeeds(
+Future<({int probes, int guardedVisibleCandidates})>
+checkSeekReadsOnlyWhatItNeeds(
   CountingReadable source,
   FourdgsIndexedScene scene,
   FourdgsGaussianSet whole,
 ) async {
   final index = scene.index;
-  if (index.length < 2 || whole.count == 0) return 0;
+  if (index.length < 2 || whole.count == 0) {
+    return (probes: 0, guardedVisibleCandidates: 0);
+  }
 
   // How far from a boundary a gaussian whose support ends there may legitimately
   // sit on the far side of it. Per gaussian, out of the record's own pitches.
@@ -365,8 +380,13 @@ Future<int> checkSeekReadsOnlyWhatItNeeds(
     final sigma = whole.sigmaT[i];
     if (!sigma.isFinite) continue;
     final sigmaBin = seekGuardSigmaBin(sigma, sigmaLog);
-    final muPitch = muStep(sigmaBin, sigmaLog, false, quantization.stepTime);
-    final slack = 0.5 * muPitch + k * sigma * sigmaHalfRelative;
+    final muHalfWidth = seekGuardMuHalfWidth(
+      sigmaBin,
+      sigmaLog,
+      false,
+      quantization.stepTime,
+    );
+    final slack = muHalfWidth + k * sigma * sigmaHalfRelative;
     if (!slack.isFinite) continue;
 
     final rawLo = whole.muT[i] - k * sigma;
@@ -423,6 +443,7 @@ Future<int> checkSeekReadsOnlyWhatItNeeds(
   }
 
   int probed = 0;
+  int guardedVisibleCandidates = 0;
   for (final entry in probeEntries) {
     final span = entry.t1 - entry.t0;
     if (span <= 0.0) continue;
@@ -438,7 +459,12 @@ Future<int> checkSeekReadsOnlyWhatItNeeds(
     };
     for (final t in candidates) {
       if (!t.isFinite) continue;
-      if (seekProbeNearAnyBoundary(t, boundaries, guardEdges)) continue;
+      if (seekProbeNearAnyBoundary(t, boundaries, guardEdges)) {
+        if (_visibleKeys(whole, t, scene.header.cutoff).isNotEmpty) {
+          guardedVisibleCandidates++;
+        }
+        continue;
+      }
 
       final selected = <FourdgsChunkIndexEntry>[
         for (final candidate in index)
@@ -474,7 +500,7 @@ Future<int> checkSeekReadsOnlyWhatItNeeds(
       probed++;
     }
   }
-  return probed;
+  return (probes: probed, guardedVisibleCandidates: guardedVisibleCandidates);
 }
 
 /// Whether [t] lies inside any quantization guard around any chunk boundary.

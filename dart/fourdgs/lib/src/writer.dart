@@ -1350,10 +1350,25 @@ List<_Plan> _planChunks(
       _Plan(tops.first, tops.last, 0, <int>[for (int i = 0; i < n; i++) i]),
     );
   }
-  return <_Plan>[
-    for (final plan in plans)
-      _Plan(plan.t0, plan.t1, plan.level, _mortonOrder(g, plan.members)),
-  ];
+  final bounded = <_Plan>[];
+  for (final plan in plans) {
+    for (
+      int start = 0;
+      start < plan.members.length;
+      start += _maxGaussiansPerChunk
+    ) {
+      final end = math.min(start + _maxGaussiansPerChunk, plan.members.length);
+      bounded.add(
+        _Plan(
+          plan.t0,
+          plan.t1,
+          plan.level,
+          _mortonOrder(g, plan.members.sublist(start, end)),
+        ),
+      );
+    }
+  }
+  return bounded;
 }
 
 /// Give an open-ended final window a finite prefix the tree can bisect.

@@ -130,6 +130,11 @@ void main() {
     expect(positive, closeTo(math.exp(0.05) - 1.0, 1e-15));
   });
 
+  test('birth-time guard distance uses pitch magnitude', () {
+    expect(seekGuardMuHalfWidth(0, 0.0, false, 0.25), greaterThan(0.0));
+    expect(seekGuardMuHalfWidth(0, 0.0, false, -0.25), 0.125);
+  });
+
   test('seek entry cap is applied after unusable entries are removed', () {
     final populated = entry(t0: 100.0, t1: 101.0);
     final index = <FourdgsChunkIndexEntry>[
@@ -187,9 +192,42 @@ void main() {
 
     final whole = readFourdgsBytes(bytes).gaussians;
     expect(
-      await checkSeekReadsOnlyWhatItNeeds(source, indexed, whole),
+      (await checkSeekReadsOnlyWhatItNeeds(source, indexed, whole)).probes,
       greaterThan(0),
     );
+  });
+
+  test('point support confined to guarded boundaries needs no probe', () async {
+    final rotations = Float32List(8);
+    rotations[3] = 1.0;
+    rotations[7] = 1.0;
+    final scene = FourdgsGaussianSet(
+      positions: Float32List(6),
+      scales: Float32List(6)..fillRange(0, 6, 1e-3),
+      rotations: rotations,
+      colors: Float32List(8),
+      motions: Float32List(6),
+      muT: Float32List.fromList(const <double>[0.0, 0.5]),
+      sigmaT: Float32List(2),
+      winLo: Float32List(2),
+      winHi: Float32List(2)..fillRange(0, 2, 1.0),
+    );
+    final bytes = writeFourdgsBytes(
+      scene,
+      1.0,
+      options: const FourdgsWriteOptions(maxDepth: 1, minChunkGaussians: 1),
+    );
+    final source = CountingReadable(FourdgsBytes(bytes));
+    final indexed = await openFourdgsIndexed(source);
+    expect(indexed.index, hasLength(2));
+
+    final result = await checkSeekReadsOnlyWhatItNeeds(
+      source,
+      indexed,
+      readFourdgsBytes(bytes).gaussians,
+    );
+    expect(result.probes, 0);
+    expect(result.guardedVisibleCandidates, greaterThan(0));
   });
 
   test(
@@ -239,11 +277,11 @@ void main() {
       expect(indexed.index.length, greaterThan(1));
 
       expect(
-        await checkSeekReadsOnlyWhatItNeeds(
+        (await checkSeekReadsOnlyWhatItNeeds(
           source,
           indexed,
           readFourdgsBytes(bytes).gaussians,
-        ),
+        )).probes,
         greaterThan(0),
       );
     },
