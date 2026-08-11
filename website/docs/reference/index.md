@@ -32,7 +32,7 @@ identical bytes with no per-language slerp or composition order of its own.
 | Spherical harmonics, degree 1                     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Spherical harmonics, degree 2                     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Spherical harmonics, degree 3                     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| SH band range-skipping                            | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| SH band range-skipping                            | Yes    | Yes        | Yes     | Yes     | Untested | Yes     |
 | SH per-band bit depth, decode                     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | SH per-band bit depth, encode                     | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
 | Spatial audio sources (optional)                  | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
@@ -232,10 +232,12 @@ Swift are proved by the cross-language encode gate below, which runs the same pe
 coefficients each encoder coarsened must come back out of the Python decoder as the same bytes, and
 the appended depths must read as the ones written.
 
-**SH band range-skipping** is proved by a byte count taken at the transport rather than by a decoded
-value: each runner reads a chunk at every band cap and asserts the bytes transferred equal exactly
-what the chunk index declares for the bands at or below it. Never transferring a band you will not
-evaluate is the whole feature, and that is what is measured.
+**SH band range-skipping** is proved for five SDKs by a byte count taken at the transport rather
+than by a decoded value: each of those runners reads a chunk at every band cap and asserts the bytes
+transferred equal exactly what the chunk index declares for the bands at or below it. Never
+transferring a band you will not evaluate is the whole feature, and that is what is measured. Swift
+compares the core's estimates without measuring a capped transport read, so its cell remains
+`Untested`.
 
 **Refusal diagnosis** is a `Yes` only where a runner names _which_ rule a file broke, not merely
 that it refused one. The invalid corpus pairs each deliberately broken file with a refusal
