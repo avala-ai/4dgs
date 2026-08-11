@@ -12,10 +12,14 @@ releases/python/vX.Y.Z
 releases/rust/vX.Y.Z
 releases/dart/vX.Y.Z
 releases/typescript/<package>/vX.Y.Z
+vX.Y.Z                        # Swift, and only Swift — see below
 ```
 
 for example `releases/python/v0.2.0` or `releases/typescript/core/v0.2.0`. Languages that ship one
 package do not repeat its name in the tag; TypeScript ships four, so it does.
+
+Swift is the exception, and it is not a style choice — see
+[Swift tags look repository-wide and are not](#swift-tags-look-repository-wide-and-are-not).
 
 Dart's changelog is `dart/fourdgs/CHANGELOG.md` rather than `dart/CHANGELOG.md`, one level deeper
 than every other language's. That is pub.dev's requirement rather than a preference: it renders the
@@ -50,8 +54,8 @@ there is nothing for the two to disagree about.
 
 | Field      | Value                                                                                          |
 | ---------- | ---------------------------------------------------------------------------------------------- |
-| Tag        | the release tag exactly as pushed, `releases/python/v0.1.0`                                    |
-| Name       | `fourdgs (Python) 0.1.0`, `fourdgs (Rust) 0.1.0`, `@4dgs/core 0.1.0`                           |
+| Tag        | the release tag exactly as pushed, `releases/python/v0.1.0` — or `v0.1.0` for Swift            |
+| Name       | `fourdgs (Python) 0.1.0`, `fourdgs (Rust) 0.1.0`, `fourdgs (Swift) 0.1.0`, `@4dgs/core 0.1.0`  |
 | Body       | `## What's changed`, that version's changelog section, then the install line and registry link |
 | Prerelease | set while the major version is `0`, because the wire format may still change                   |
 | Assets     | none — the artifact of record is on the registry, published with its provenance attestation    |
@@ -80,16 +84,42 @@ one is rather than imply a consistency that does not exist.
 In prose, in the specification, in the CLI and on disk: always `4dgs`. `fourdgs` appears only as a
 package name or a language identifier, and only where a registry or a compiler requires it.
 
-## Swift, before its first release
+## Swift tags look repository-wide and are not
 
-Two decisions are recorded here rather than left to the day someone tries to publish.
+**Swift releases are tagged `vX.Y.Z` on this repository, with no package name in the tag. That tag
+means the Swift package's version. It means nothing about any other package here.**
 
-**Linking.** The package is a binding, so it needs the core's staticlib on the linker's search path
-— today that is `-Xlinker -L…` on the command line, deliberately not an `unsafeFlags` entry in
-`Package.swift`, because that would make the package undependable as a versioned dependency. A
-published package needs one of two answers instead: a prebuilt `.xcframework` as a binary target, or
-a build plugin that compiles the core. **Not yet chosen.** It is not a blocker for anything before a
-release, and it is a blocker for the release itself.
+There is no Swift registry to publish to. SwiftPM resolves a package straight from a Git URL, and it
+reads versions only from plain SemVer tags — `1.2.3` or `v1.2.3`. A `releases/swift/v0.1.0` tag
+offers it no versions at all, so a dependency on this repository could pin a branch or a revision
+and never a version. The tag has to take the one shape SwiftPM reads, on the one repository SwiftPM
+is pointed at, which is this one. `Package.swift` is at the root for the same reason: SwiftPM looks
+for a manifest at the top of whatever it clones.
+
+The trap this creates is worth naming, because it will be read wrong by someone eventually. On a
+repository holding six languages, a bare `v0.4.0` sitting beside `releases/python/v0.3.0` and
+`releases/rust/v0.4.0` **reads like a version of 4dgs** — of the format, of the repository, of all
+of it. There is no such thing: packages here are versioned independently and always have been, the
+specification is versioned separately from every package, and a bare tag is simply the only tag
+shape one consumer's package manager can see. So:
+
+- The GitHub Release for a bare tag is titled `fourdgs (Swift) X.Y.Z`, like every other release
+  here, and its body is `swift/CHANGELOG.md`'s section for that version. The title is the thing that
+  disambiguates the tag on the releases page, so it is not optional.
+- The bare tag's version sequence belongs to the Swift package alone. It does not have to match
+  Python's, Rust's or TypeScript's, and matching by coincidence should not be read as meaning.
+- Never cut a bare tag for anything other than Swift. A second consumer of the bare namespace would
+  make both ambiguous, and the ambiguity would be permanent — a published tag is not retractable.
+
+**Linking, which is not solved.** The package is a binding, so it needs the core's staticlib on the
+linker's search path — today that is `-Xlinker -L…` on the command line, deliberately not an
+`unsafeFlags` entry in `Package.swift`, because that would make the package undependable as a
+versioned dependency. A consumer who resolves the package from its URL has no `target/release` and
+nothing to point `-L` at, so **the package resolves and does not link out of tree**; `Package.swift`
+emits a warning naming exactly that when it finds no built core. The fix is a `binaryTarget`
+pointing at a prebuilt `.xcframework` attached to the GitHub Release with its checksum, built for
+the platforms the manifest declares (visionOS 1, iOS 17, macOS 14). Until that exists, a bare tag
+buys resolution and a readable diagnostic, not a build.
 
 **Platforms.** The core builds for visionOS on stable toolchains — the Apple targets ship a
 distributed standard library, so no nightly and no `-Z build-std`, and CI cross-compiles and links
