@@ -199,11 +199,18 @@ function windowsOf(
 ): [number, number][] {
   const seen = new Set<string>();
   const out: [number, number][] = [];
-  for (const sample of samples) {
+  for (let sampleAt = 0; sampleAt < samples.length; sampleAt++) {
+    const sample = samples[sampleAt]!;
     const g = sample.gaussians;
     for (let i = 0; i < g.count; i++) {
       const lo = g.winLo[i]!;
       const hi = g.winHi[i]!;
+      if (Number.isNaN(lo) || Number.isNaN(hi)) {
+        throw new Error(
+          `sample ${sampleAt}, gaussian ${i} has validity window [${lo}, ${hi}); ` +
+            `window endpoints must not be NaN`,
+        );
+      }
       const key = `${lo},${hi}`;
       if (!seen.has(key)) {
         seen.add(key);
@@ -264,14 +271,17 @@ function medianScaleOf(samples: readonly KeyframeDeltaSample[]): number {
   };
 
   const high = kth(count >> 1);
-  return count % 2 === 1 ? high : 0.5 * (kth((count >> 1) - 1) + high);
+  return count % 2 === 1 ? high : 0.5 * kth((count >> 1) - 1) + 0.5 * high;
 }
 
-/** Validate identity once, count distinct ids, and forbid reuse after a death. */
+function hasId(ids: ArrayLike<number>, wanted: number): boolean {
+  for (let i = 0; i < ids.length; i++) if (ids[i] === wanted) return true;
+  return false;
+}
+
+/** Validate identity and derive lifetime history in bounded passes over caller-owned samples. */
 function validateSequenceIds(samples: readonly KeyframeDeltaSample[]): number {
-  const distinct = new Set<number>();
-  const retired = new Set<number>();
-  let previous = new Set<number>();
+  let distinct = 0;
 
   for (let at = 0; at < samples.length; at++) {
     const sample = samples[at]!;
@@ -293,19 +303,24 @@ function validateSequenceIds(samples: readonly KeyframeDeltaSample[]): number {
           `sample ${at} names gaussian id ${id} twice; ids are unique within a state`,
         );
       }
-      if (retired.has(id)) {
-        throw new Error(
-          `sample ${at} reuses gaussian id ${id} after it died; gaussian_id is never reused ` +
-            `within a sequence`,
-        );
+      const livedPreviously = at > 0 && hasId(samples[at - 1]!.ids, id);
+      if (!livedPreviously) {
+        let seenEarlier = false;
+        for (let earlier = 0; earlier < at - 1 && !seenEarlier; earlier++) {
+          seenEarlier = hasId(samples[earlier]!.ids, id);
+        }
+        if (seenEarlier) {
+          throw new Error(
+            `sample ${at} reuses gaussian id ${id} after it died; gaussian_id is never reused ` +
+              `within a sequence`,
+          );
+        }
+        distinct++;
       }
       current.add(id);
-      distinct.add(id);
     }
-    for (const id of previous) if (!current.has(id)) retired.add(id);
-    previous = current;
   }
-  return distinct.size;
+  return distinct;
 }
 
 function gridsFor(
@@ -555,9 +570,9 @@ function deltaGroups(
 
   const changed = new Array<boolean>(commonRows.length).fill(false);
   for (const [attribute, after] of bins) {
-    // mu_t is restated when another lane causes this gaussian to be stated by the delta;
-    // its timestamp alone must not turn an otherwise untouched gaussian into an update.
-    if (GOP_INVARIANT.includes(attribute) || attribute === Attribute.MuT) continue;
+    // mu_t is part of the stated temporal state. Keeping an earlier anchor changes both a
+    // moving gaussian's centre and its temporal marginal at this sample's instant.
+    if (GOP_INVARIANT.includes(attribute)) continue;
     const before = referenceBins.get(attribute);
     if (before === undefined) continue;
     for (let k = 0; k < commonRows.length; k++) {

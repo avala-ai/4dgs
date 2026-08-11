@@ -103,11 +103,20 @@ function records(data: Uint8Array): { opcode: number; content: Uint8Array }[] {
  * requires the state timestamp. Until that writer is corrected, its corpus summary differs
  * only in the temporal marginal folded into this aggregate.
  */
-function withoutPythonMuAnchorOpacity(summary: Record<string, unknown>): Record<string, unknown> {
+function withoutPythonMuAnchorDifferences(
+  summary: Record<string, unknown>,
+): Record<string, unknown> {
   const copy = structuredClone(summary) as {
-    chunks: { t0: number }[];
+    chunks: { t0: number; kind: string; updateCount?: unknown }[];
     states: { t: number; aggregate: { opacitySum?: number } }[];
   };
+  // The Python reference does not emit an update for a persistent gaussian whose only new
+  // bin is the sample-time mu_t anchor. TypeScript must, because retaining the older anchor
+  // changes reconstructed state. The operational update count therefore differs until the
+  // reference writer adopts the same rule; it is not part of the state comparison here.
+  for (const chunk of copy.chunks) {
+    if (chunk.kind === "delta") delete chunk.updateCount;
+  }
   const firstNonzero = copy.chunks.find((chunk) => chunk.t0 > 0)?.t0;
   if (firstNonzero !== undefined) {
     for (const state of copy.states) {
@@ -137,8 +146,10 @@ for (const variant of KEYFRAME_DELTA_VARIANTS.filter((v) => v.inCorpus)) {
       keyframeDeltaStatesJson((await decodeKeyframeDeltaIndexed(data)).sequence),
     );
     assert.equal(
-      canonical(withoutPythonMuAnchorOpacity(JSON.parse(streamed) as Record<string, unknown>)),
-      canonical(withoutPythonMuAnchorOpacity(JSON.parse(expectation) as Record<string, unknown>)),
+      canonical(withoutPythonMuAnchorDifferences(JSON.parse(streamed) as Record<string, unknown>)),
+      canonical(
+        withoutPythonMuAnchorDifferences(JSON.parse(expectation) as Record<string, unknown>),
+      ),
     );
     assert.equal(indexed, streamed);
   });
@@ -193,6 +204,7 @@ test("a delta entry counts operations; live_count counts the population, keyfram
   assert.equal(index.length, sequence.chunks.length);
 
   let deltas = 0;
+  let discriminatingDeltas = 0;
   for (let i = 0; i < index.length; i++) {
     const entry = index[i]!;
     const chunk = sequence.chunks[i]!;
@@ -205,14 +217,13 @@ test("a delta entry counts operations; live_count counts the population, keyfram
       deltas++;
       const operations = chunk.updateCount! + chunk.birthCount! + chunk.deathCount!;
       assert.equal(entry.gaussianCount, operations, `entry ${i} delta gaussian_count`);
-      // The point of the rule: for this sequence the two are genuinely different numbers,
-      // so an encoder that wrote the population here would still be caught.
-      if (chunk.deathCount === 0 && chunk.birthCount === 0) {
-        assert.notEqual(operations, chunk.state.count, `entry ${i} would not discriminate`);
-      }
+      if (operations !== chunk.state.count) discriminatingDeltas++;
     }
   }
   assert.ok(deltas > 0, "the churn sequence must carry deltas for this to prove anything");
+  // At least one entry must distinguish the operation count from the resulting population,
+  // or writing live_count in both fields would pass this test accidentally.
+  assert.ok(discriminatingDeltas > 0, "the churn sequence must discriminate the two counts");
 });
 
 test("births and deaths land in their own groups", async () => {
@@ -305,31 +316,25 @@ test("a chained delta's depth grows along the chain; a keyframe-referenced one i
   }
 });
 
-test("an unchanged gaussian costs no bytes", async () => {
-  // Two samples, identical population. The delta must carry nothing at all: no updates, no
-  // births, no deaths. That is the property the whole model exists to buy.
+test("a persistent gaussian restates its sample-time anchor", async () => {
+  // Nothing visible changes in the authored lanes, but mu_t is the anchor of the stated
+  // sample. With motion, retaining the keyframe's anchor would move the decoded centre at
+  // the second sample and give the temporal marginal the wrong age.
   const still = pair(0.25, 0.25);
+  for (const sample of still) sample.gaussians.motions = Float32Array.from([2, 0, 0]);
   const { sequence } = await decodeKeyframeDeltaIndexed(
     await encodeKeyframeDeltaSequence(still, DURATION, { keyframeEvery: 8 }),
   );
   const delta = sequence.chunks[1]!;
   assert.equal(delta.kind, 1);
-  assert.equal(delta.updateCount, 0);
+  assert.equal(delta.updateCount, 1);
   assert.equal(delta.birthCount, 0);
   assert.equal(delta.deathCount, 0);
-
-  // And a gaussian that moved by less than one bin is also unchanged: the rule is a bin
-  // difference, not a value difference.
-  const nudged = pair(0.25, 0.25 + 1e-6);
-  const { sequence: same } = await decodeKeyframeDeltaIndexed(
-    await encodeKeyframeDeltaSequence(nudged, DURATION, { keyframeEvery: 8 }),
-  );
-  assert.equal(same.chunks[1]!.updateCount, 0);
 });
 
 test("mu_t is anchored to each sample timestamp", async () => {
-  const samples = pair(0, 1);
-  samples[1]!.gaussians.motions = Float32Array.from([2, 0, 0]);
+  const samples = pair(0, 0);
+  for (const sample of samples) sample.gaussians.motions = Float32Array.from([2, 0, 0]);
   samples[1]!.gaussians.muT = Float32Array.from([0]); // deliberately not sample t0
   const sequence = await decodeKeyframeDeltaStreamed(
     await encodeKeyframeDeltaSequence(samples, DURATION, { keyframeEvery: 8 }),
@@ -340,7 +345,7 @@ test("mu_t is anchored to each sample timestamp", async () => {
     sample: { positions: number[][] };
   }[];
   const center = states.find((state) => state.t === t)!.sample.positions[0]![0]!;
-  assert.ok(Math.abs(center - 1) < 0.01, `centre at sample time: ${center}`);
+  assert.ok(Math.abs(center) < 0.01, `centre at sample time: ${center}`);
 });
 
 test("the file is framed by magic at both ends, and the summary is the index then statistics", async () => {
@@ -377,6 +382,31 @@ test("the Quantization record declares the bounds the file is held to", async ()
   // Every pitch is exactly twice its bound, in the domain that attribute is quantized in.
   assert.ok(Math.abs(quantization.stepPos - 2 * bound("pos")) < 1e-18);
   assert.ok(Math.abs(quantization.stepRot - 2 * bound("rot")) < 1e-18);
+});
+
+test("the even scale median stays finite near Number.MAX_VALUE", async () => {
+  const samples = pair(0, 0);
+  for (const sample of samples) {
+    // Ordinary arrays keep these as finite binary64 values. Adding the middle pair would
+    // overflow, while taking half of each operand before adding does not.
+    sample.gaussians.scales = [Number.MAX_VALUE, Number.MAX_VALUE, Number.MAX_VALUE];
+  }
+  const data = await encodeKeyframeDeltaSequence(samples, DURATION);
+  const quantization = parseQuantization(
+    records(data).find((r) => r.opcode === Opcode.Quantization)!.content,
+  );
+  for (const [name, step] of Object.entries({
+    stepPos: quantization.stepPos,
+    stepScaleLog: quantization.stepScaleLog,
+    stepRot: quantization.stepRot,
+    stepRgb: quantization.stepRgb,
+    stepAlpha: quantization.stepAlpha,
+    stepMotion: quantization.stepMotion,
+    stepTime: quantization.stepTime,
+    stepSigmaLog: quantization.stepSigmaLog,
+  })) {
+    assert.ok(Number.isFinite(step), `${name}: ${step}`);
+  }
 });
 
 test("two encodes of the same sequence are byte-identical", async () => {
@@ -450,6 +480,13 @@ test("a promise the writer cannot keep is refused rather than written", async ()
   await assert.rejects(
     () => encodeKeyframeDeltaSequence(ok, DURATION, { profile: "ultra" }),
     /profile must be one of/,
+  );
+
+  const nanWindow = pair(0, 1);
+  nanWindow[1]!.gaussians.winLo = Float32Array.from([Number.NaN]);
+  await assert.rejects(
+    () => encodeKeyframeDeltaSequence(nanWindow, DURATION),
+    /window endpoints must not be NaN/,
   );
 });
 
