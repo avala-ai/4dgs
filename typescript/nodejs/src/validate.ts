@@ -33,7 +33,6 @@ import {
   FrontMatterScanner,
   HEADER_FLAG_CHUNKS_COMPRESSED,
   HEADER_FLAG_HAS_AUDIO,
-  IndexedDecoder,
   LENGTH_UNIT_METRES,
   MAGIC,
   MAX_FRONT_MATTER_BYTES,
@@ -373,6 +372,18 @@ export async function validateFile(
           // this record, and a finding it does not have is a disagreement about a file.
           try {
             windows = parseWindowTable(await content());
+            if (options.decode === true) {
+              for (let i = 0; i < windows.length; i += 2) {
+                const lo = windows[i]!;
+                const hi = windows[i + 1]!;
+                if (Number.isNaN(lo) || Number.isNaN(hi) || hi < lo) {
+                  found.error(
+                    `Window Table row ${i / 2} is [${spell(lo)}, ${spell(hi)}]; expected ` +
+                      "non-NaN ordered bounds (empty windows and infinities are legal)",
+                  );
+                }
+              }
+            }
           } catch (error) {
             windows = null;
             if (options.decode === true) {
@@ -426,11 +437,30 @@ export async function validateFile(
             ordinal: physicalChunkOffsets.length,
             count: parsed.header.count,
             bands: new Map<number, Int32Array>(),
-            decoded: options.decode === true && activeHeader?.temporalModel === "keyframe-delta",
+            decoded:
+              options.decode === true &&
+              parsed.header.count > 0 &&
+              activeHeader?.temporalModel === "keyframe-delta",
           };
-          if (parsed.header.t1 < parsed.header.t0) {
+          if (Number.isNaN(parsed.header.t0) || Number.isNaN(parsed.header.t1)) {
+            found.error(
+              `chunk ${chunkCount} has a NaN interval endpoint; expected finite or infinite ` +
+                "ordered bounds",
+            );
+          } else if (parsed.header.t1 < parsed.header.t0) {
             found.error(
               `chunk ${chunkCount} has t1 (${parsed.header.t1}) before t0 (${parsed.header.t0})`,
+            );
+          }
+          if (
+            activeHeader?.temporalModel !== "keyframe-delta" &&
+            parsed.header.count > 0 &&
+            parsed.header.t0 === parsed.header.t1
+          ) {
+            found.error(
+              `gaussian-birth chunk ${chunkCount} has ${parsed.header.count} gaussians in ` +
+                `zero-width interval [${parsed.header.t0}, ${parsed.header.t1}); no seek can ` +
+                "select them",
             );
           }
           if (
@@ -447,7 +477,7 @@ export async function validateFile(
                 supportK: supportK(frozenDecodeOptions.header.cutoff || DEFAULT_CUTOFF),
                 codecs: DEFAULT_CODECS,
               });
-              decodedShChunk.decoded = true;
+              decodedShChunk.decoded = parsed.header.count > 0;
             } catch (error) {
               found.error(`chunk ${chunkCount} does not decode: ${message(error)}`);
               found.refuse(error, offset, "the Chunk record");
@@ -483,7 +513,7 @@ export async function validateFile(
             ordinal: physicalChunkOffsets.length,
             count: parsed.header.birthCount,
             bands: new Map<number, Int32Array>(),
-            decoded: options.decode === true,
+            decoded: options.decode === true && parsed.header.birthCount > 0,
           };
           if (header !== null && header.temporalModel !== "keyframe-delta") {
             found.error(
@@ -491,7 +521,12 @@ export async function validateFile(
                 `${JSON.stringify(header.temporalModel)}; it belongs only to keyframe-delta`,
             );
           }
-          if (parsed.header.t1 < parsed.header.t0) {
+          if (Number.isNaN(parsed.header.t0) || Number.isNaN(parsed.header.t1)) {
+            found.error(
+              `Delta Chunk at byte ${offset} has a NaN interval endpoint; expected finite or ` +
+                "infinite ordered bounds",
+            );
+          } else if (parsed.header.t1 < parsed.header.t0) {
             found.error(
               `Delta Chunk at byte ${offset} has t1 (${parsed.header.t1}) before t0 ` +
                 `(${parsed.header.t0})`,
@@ -507,6 +542,7 @@ export async function validateFile(
           // same file valid. The two refusals a chunk's own streams can raise are exactly
           // the two a band's stream can raise, for the same reason.
           let band = 0;
+          let duplicateBand = false;
           try {
             const parsedBand = parseShBandRecord(
               options.decode === true
@@ -526,7 +562,15 @@ export async function validateFile(
                   "Chunk, or one of that state Chunk's SH Band Stream records",
               );
             } else {
-              physicalBands.get(currentChunkOffset)!.push({
+              const ownerBands = physicalBands.get(currentChunkOffset)!;
+              duplicateBand = ownerBands.some((range) => range.band === band);
+              if (duplicateBand) {
+                found.error(
+                  `SH Band Stream at byte ${offset} repeats band ${band} for the state Chunk ` +
+                    `at byte ${currentChunkOffset}; expected each band at most once`,
+                );
+              }
+              ownerBands.push({
                 band,
                 offset,
                 length: record.length,
@@ -543,7 +587,7 @@ export async function validateFile(
               );
             }
             const values = await decodeStream(framedBand, DEFAULT_CODECS);
-            decodedShChunk.bands.set(band, values);
+            if (!duplicateBand) decodedShChunk.bands.set(band, values);
           } catch (error) {
             found.error(
               `SH Band Stream at byte ${offset}: chunk ${chunkCount} SH band ${band} ` +
@@ -1159,17 +1203,6 @@ export async function validateFile(
     found.warn("no chunk index: this file can only be read front to back, not seeked");
   }
 
-  // Opening the gaussian-birth file the way a seeking client would is itself a check. The
-  // keyframe-delta path above performs its own record/index parity checks; this decoder
-  // intentionally declines that temporal model.
-  if (header?.temporalModel !== "keyframe-delta") {
-    try {
-      await IndexedDecoder.open(source);
-    } catch (error) {
-      found.error(`a seeking reader cannot open this file: ${message(error)}`);
-    }
-  }
-
   return report(found);
 }
 
@@ -1449,13 +1482,14 @@ function checkQuantizationFinite(quant: Quantization, found: Findings, ordinal: 
  * coincidence, and on a file with no coefficients that is a false alarm waiting to happen.
  */
 function checkShBitDepths(quant: Quantization, shDegree: number, found: Findings): void {
+  if (shDegree <= 0) return;
   if (quant.shBitDepthsMalformed) {
     found.error(
       "Quantization carries a malformed SH bit-depth declaration; the count must fit the " +
         "record and every depth must be in 3..8 (§5.3)",
     );
   }
-  if (quant.shBitDepths.length === 0 || shDegree <= 0) return;
+  if (quant.shBitDepths.length === 0) return;
   if (quant.shBitDepths.length !== shDegree) {
     found.error(
       `Quantization declares ${quant.shBitDepths.length} SH bit depths; the Header declares ` +
@@ -1495,8 +1529,7 @@ function checkShBitDepths(quant: Quantization, shDegree: number, found: Findings
  * it says nothing about what they are. A Chunk or an Attachment inside the run passes it
  * with a recomputed CRC — and then a streamed reader, which retains the trailing run of
  * summary records precisely because §4.5 promises it is one, has retained the wrong bytes,
- * while `IndexedDecoder.open` reads the whole declared range in one allocation to find an
- * index inside it.
+ * while a seeking reader trusts this range to contain only bounded index metadata.
  */
 async function checkSummaryComposition(
   source: IReadable,

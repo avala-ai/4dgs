@@ -557,6 +557,25 @@ test("regression: --decode assembles SH bands before accepting them", (t) => {
   );
 });
 
+test("regression: a state Chunk cannot repeat an SH band", async (t) => {
+  const variant = "MixedLifetimes-SHDegree2-UseChunkIndex-UseCrc";
+  if (corpus(variant) === null) return t.skip("corpus not generated");
+  const original = bytesOf(variant);
+  const band = recordsOf(original).find((record) => record.opcode === Opcode.ShBandStream)!;
+  const copy = original.slice(band.offset, band.offset + band.length);
+  const duplicated = resealSummary(splice(original, band.offset + band.length, copy), copy.length);
+
+  const report = await validateFile(duplicated, { decode: true });
+  assert.ok(
+    report.findings.some(
+      (finding) =>
+        finding.message.includes(`SH Band Stream at byte ${band.offset + band.length}`) &&
+        finding.message.includes("repeats band 1"),
+    ),
+    report.findings.map((finding) => finding.message).join("\n"),
+  );
+});
+
 test("regression: an SH band immediately after a Delta Chunk belongs to that state", async (t) => {
   const variant = "MixedLifetimes-SHDegree2-UseChunkIndex-UseCrc";
   if (corpus(variant) === null) return t.skip("corpus not generated");
@@ -896,6 +915,65 @@ test("regression: decoded validation reports late malformed windows and every ea
   );
 });
 
+test("regression: decoded validation rejects unordered and NaN Window Table rows", async (t) => {
+  const variant = "TenWindows-UseChunkIndex-UseCrc";
+  if (corpus(variant) === null) return t.skip("corpus not generated");
+  const original = bytesOf(variant);
+  const summary = parseFooter(
+    original.subarray(original.length - FOOTER_TAIL_BYTES + RECORD_HEADER_BYTES),
+  ).summaryStart;
+
+  for (const [name, lo, hi] of [
+    ["Unordered", 2, 1],
+    ["NanLower", Number.NaN, 1],
+    ["NanUpper", 0, Number.NaN],
+  ] as const) {
+    const content = new Uint8Array(20);
+    const view = new DataView(content.buffer);
+    view.setUint32(0, 1, true);
+    view.setFloat64(4, lo, true);
+    view.setFloat64(12, hi, true);
+    const record = framedRecord(Opcode.WindowTable, content);
+    const changed = resealSummary(splice(original, summary, record), record.length);
+    const report = await validateFile(changed, { decode: true });
+    assert.ok(
+      report.findings.some(
+        (finding) =>
+          finding.message.includes("Window Table row 0") &&
+          finding.message.includes("expected non-NaN ordered bounds"),
+      ),
+      `${name}: ${report.findings.map((finding) => finding.message).join("\n")}`,
+    );
+  }
+});
+
+test("regression: gaussian-birth Chunk intervals reject NaN and unreachable populations", async (t) => {
+  const variant = "TenWindows-UseChunkIndex-UseCrc";
+  if (corpus(variant) === null) return t.skip("corpus not generated");
+
+  for (const kind of ["nan", "zero-width"] as const) {
+    const data = bytesOf(variant);
+    const records = recordsOf(data);
+    const chunk = records.find((record) => record.opcode === Opcode.Chunk)!;
+    const index = records.find((record) => record.opcode === Opcode.ChunkIndex)!;
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    const t0 = view.getFloat64(chunk.offset + RECORD_HEADER_BYTES, true);
+    const t1 = kind === "nan" ? Number.NaN : t0;
+    view.setFloat64(chunk.offset + RECORD_HEADER_BYTES + 8, t1, true);
+    view.setFloat64(index.offset + RECORD_HEADER_BYTES + 8, t1, true);
+
+    const report = await validateFile(resealSummary(data), { decode: true });
+    assert.ok(
+      report.findings.some((finding) =>
+        kind === "nan"
+          ? finding.message.includes("has a NaN interval endpoint")
+          : finding.message.includes("gaussians in zero-width interval"),
+      ),
+      `${kind}: ${report.findings.map((finding) => finding.message).join("\n")}`,
+    );
+  }
+});
+
 test("regression: a record after the Footer, a reserved Header flag, a foreign summary record", (t) => {
   // Three normative MUSTs the structural pass could not see: §4 (the Footer is the last
   // record), §4.2 (Header flag bits 2-7 are zero) and §4.5 (the summary is exactly the
@@ -1213,11 +1291,13 @@ test("unit: inspect and validate range-read instead of retaining the resource", 
   if (path === null) return t.skip("corpus not generated");
   const data = new Uint8Array(readFileSync(path));
   let largestRead = 0;
+  const reads: { readonly offset: number; readonly length: number }[] = [];
   const source: IReadable = {
     size: () => Promise.resolve(BigInt(data.length)),
     read: (offset, length) => {
       largestRead = Math.max(largestRead, Number(length));
       const at = Number(offset);
+      reads.push({ offset: at, length: Number(length) });
       return Promise.resolve(data.subarray(at, at + Number(length)));
     },
   };
@@ -1226,9 +1306,21 @@ test("unit: inspect and validate range-read instead of retaining the resource", 
     rows += 1;
   });
   assert.equal(rows, inspected.recordCount);
+  reads.length = 0;
   const validated = await validateFile(source);
   assert.equal(validated.ok, true);
   assert.ok(largestRead < data.length, `one range read buffered all ${data.length} bytes`);
+  const footer = parseFooter(data.subarray(data.length - FOOTER_TAIL_BYTES + RECORD_HEADER_BYTES));
+  const footerAt = data.length - FOOTER_TAIL_BYTES;
+  const wholeSummaryReads = reads.filter(
+    (read) => read.offset === footer.summaryStart && read.length === footerAt - footer.summaryStart,
+  );
+  assert.equal(
+    wholeSummaryReads.length,
+    1,
+    `validation read the whole summary [${footer.summaryStart}, ${footerAt}) more than once; ` +
+      "the single bounded read verifies its CRC",
+  );
 });
 
 test("unit: a parser resource ceiling is a tool failure, not an invalid verdict", async () => {
@@ -1505,6 +1597,24 @@ test("regression: the SH bit depths are checked against the Header's degree", (t
   assert.ok(
     malformedReport.out.some((line) => line.includes("malformed SH bit-depth declaration")),
     malformedReport.out.join("\n"),
+  );
+});
+
+test("regression: sh_degree zero ignores an appended SH bit-depth suffix", async (t) => {
+  const variant = "TenWindows-UseChunkIndex-UseCrc";
+  if (corpus(variant) === null) return t.skip("corpus not generated");
+  const original = bytesOf(variant);
+  const quantization = recordsOf(original).find((record) => record.opcode === Opcode.Quantization)!;
+  const extended = splice(original, quantization.offset + quantization.length, Uint8Array.of(9));
+  new DataView(extended.buffer, extended.byteOffset, extended.byteLength).setBigUint64(
+    quantization.offset + 1,
+    BigInt(quantization.length - RECORD_HEADER_BYTES + 1),
+    true,
+  );
+  const report = await validateFile(resealSummary(extended, 1));
+  assert.ok(
+    report.findings.every((finding) => !finding.message.includes("malformed SH bit-depth")),
+    report.findings.map((finding) => finding.message).join("\n"),
   );
 });
 
