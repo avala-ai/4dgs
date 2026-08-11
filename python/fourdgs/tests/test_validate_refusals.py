@@ -755,6 +755,32 @@ class TestTheIndexIsData:
 
 
 class TestSHBandStreams:
+    def test_keyframe_delta_physical_bands_need_not_be_in_band_number_order(self):
+        paths = [p for p in _variants(CORPUS) if "SHDegree2" in p.stem and "UseChunkIndex" in p.stem]
+        _require_corpus(paths, "indexed SH-degree-2 variants")
+        data = bytearray(paths[0].read_bytes())
+        entries = _index_entries(bytes(data))
+        owner = next(entry for entry in entries if len(entry.bands) >= 2)
+        first_band = next(
+            record for record in iter_records(bytes(data), len(MAGIC)) if record.offset == owner.bands[0][1]
+        )
+        second_band = next(
+            record for record in iter_records(bytes(data), len(MAGIC)) if record.offset == owner.bands[1][1]
+        )
+        first_bytes = bytes(data[first_band.offset : first_band.offset + 9 + len(first_band.content)])
+        second_bytes = bytes(data[second_band.offset : second_band.offset + 9 + len(second_band.content)])
+        data[first_band.offset : second_band.offset + 9 + len(second_band.content)] = second_bytes + first_bytes
+        reordered_bands = [
+            (owner.bands[1][0], first_band.offset, len(second_bytes)),
+            (owner.bands[0][0], first_band.offset + len(second_bytes), len(first_bytes)),
+        ]
+        entries = [
+            _with(entry, bands=reordered_bands) if entry.chunk_offset == owner.chunk_offset else entry
+            for entry in entries
+        ]
+
+        kdf.check_index_bands(bytes(data), entries, 2)
+
     def test_an_indexless_gaussian_birth_chunk_requires_each_declared_band_once(self):
         paths = [p for p in _variants(CORPUS) if "SHDegree2" in p.stem and "UseChunkIndex" in p.stem]
         _require_corpus(paths, "indexed SH-degree-2 variants")
@@ -1152,6 +1178,36 @@ class TestBoundedDecoding:
         assert expected > 1, "the fixture must carry more than one delta for this to prove anything"
         assert calls == expected
 
+    def test_bounded_indexed_identity_fallback_keeps_timeline_order(self, monkeypatch):
+        states = [
+            kdf.State(ids=np.array([0]), bins={}),
+            kdf.State(ids=np.array([2]), bins={}),
+        ]
+
+        def indexed(*_args, **_kwargs):
+            for i, state in enumerate(states):
+                yield rec.ChunkIndexEntry(float(i), float(i + 1), i, 0, 1), state
+
+        def streamed(*_args, **_kwargs):
+            raise AssertionError("an indexed fallback must not switch to physical record order")
+
+        monkeypatch.setattr(kdf, "scan_indexed", indexed)
+        monkeypatch.setattr(kdf, "scan_streamed", streamed)
+        assert kdf.count_distinct_ids_bounded(b"", capacity=1, index=[], windows=[]) == 2
+
+    def test_an_indexed_keyframe_delta_file_keeps_two_states_at_most(self):
+        import weakref
+
+        data = _keyframe_file()
+        opened = kdf.open_indexed(data)
+        seen: list[weakref.ref] = []
+        for _entry, state in kdf.scan_indexed(data, opened.index, opened.windows):
+            seen.append(weakref.ref(state.ids))
+            del state
+            alive = [ref for ref in seen if ref() is not None]
+            assert len(alive) <= 2, f"{len(alive)} states resident at once"
+        assert len(seen) > 2, "the fixture must carry more than two chunks for this to prove anything"
+
     def test_an_unindexed_keyframe_delta_file_keeps_two_states_at_most(self):
         """`decode_streamed` keeps a state per chunk plus a map of every offset a delta
         could reference. §5.18 defines exactly two references — the keyframe at the head of
@@ -1178,6 +1234,18 @@ class TestBoundedDecoding:
         report = validate(bytes(patched))
         assert not report.ok
         assert any("selected reference requires depth" in finding.message for finding in report.findings)
+
+    def test_an_unindexed_delta_must_name_the_keyframe_its_chain_reaches(self):
+        data = bytearray(_keyframe_file(write_index=False))
+        delta = _first_record(bytes(data), op.DELTA_CHUNK)
+        # t0, t1, level, mode, reference_offset, then keyframe_offset.
+        struct.pack_into("<Q", data, delta.offset + 9 + 29, delta.offset)
+        report = validate(bytes(data))
+        assert not report.ok
+        assert any(
+            "declares keyframe_offset" in finding.message and "chain reaches" in finding.message
+            for finding in report.findings
+        )
 
     def test_an_unindexed_delta_level_must_match_its_selected_reference(self):
         data = bytearray(_keyframe_file(write_index=False))

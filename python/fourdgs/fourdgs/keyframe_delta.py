@@ -59,6 +59,7 @@ GOP_INVARIANT = frozenset({op.A_SIGMA_T, op.A_FLAGS, op.A_WINDOW_INDEX})
 #: Attributes an update restates outright rather than differencing.
 ABSOLUTE_IN_UPDATE = frozenset({op.A_ROTATION_INDEX, op.A_ROTATION})
 
+
 @dataclass
 class State:
     """A composed population: identities, and one bin array per attribute.

@@ -1218,14 +1218,24 @@ def check_index_bands(data: bytes, index: list[rec.ChunkIndexEntry], sh_degree: 
                 f"the state chunk at {owner} is not named by the Chunk Index",
                 code="index-record-mismatch",
             )
-        if indexed.bands != following:
+        if len({band for band, _offset, _length in indexed.bands}) != len(indexed.bands):
+            raise MalformedFile(
+                f"the chunk index entry at {owner} names a band more than once",
+                code="index-record-mismatch",
+            )
+        if len({band for band, _offset, _length in following}) != len(following):
+            raise MalformedFile(
+                f"the state chunk at {owner} is followed by duplicate SH band numbers",
+                code="index-record-mismatch",
+            )
+        if set(indexed.bands) != set(following):
             raise MalformedFile(
                 f"the chunk index entry at {owner} declares SH band ranges "
                 f"{indexed.bands}; the physical records following that chunk are {following}",
                 code="index-record-mismatch",
             )
         bands = [band for band, _offset, _length in following]
-        if bands != wanted:
+        if set(bands) != set(wanted):
             raise MalformedFile(
                 f"the state chunk at {owner} is followed by SH bands {bands}; "
                 f"the Header declares degree {sh_degree}, requiring bands {wanted}",
@@ -1397,6 +1407,9 @@ def scan_indexed(
                 )
             level = int(head.level)
             current = (entry.chunk_offset, int(head.depth), level, state)
+            # `current` now owns the newly composed state. Do not leave the previous
+            # population bound in this suspended generator frame across the yield below.
+            reference = None
 
         if entry.extended and entry.live_count != state.count:
             raise MalformedFile(
@@ -1449,7 +1462,7 @@ def scan_streamed(
             return
         if declared_degree is not None:
             wanted = list(range(1, declared_degree + 1))
-            if bands != wanted:
+            if len(set(bands)) != len(bands) or set(bands) != set(wanted):
                 raise MalformedFile(
                     f"the state chunk at {band_owner} is followed by SH bands {bands}; "
                     f"the Header declares degree {declared_degree}, requiring bands {wanted}",
@@ -1507,6 +1520,12 @@ def scan_streamed(
                     f"delta chunk at {record.offset} uses mode {head_peek.delta_mode} and references "
                     f"{head_peek.reference_offset}; that mode requires {expected}",
                     code="broken-reference",
+                )
+            if head_peek.keyframe_offset != keyframe_at:
+                raise MalformedFile(
+                    f"delta chunk at {record.offset} declares keyframe_offset "
+                    f"{head_peek.keyframe_offset}; its chain reaches the keyframe at {keyframe_at}",
+                    code="index-record-mismatch",
                 )
             expected_depth = reference_depth + 1
             if head_peek.depth != expected_depth:
@@ -1630,6 +1649,11 @@ def count_distinct_ids_bounded(
     *,
     capacity: int = 65_536,
     on_record: Callable[[int, int], None] | None = None,
+    index: list[rec.ChunkIndexEntry] | None = None,
+    windows: list[tuple[float, float]] | None = None,
+    on_entry: Callable[[int, rec.ChunkIndexEntry], None] | None = None,
+    on_band: Callable[[int, int], None] | None = None,
+    on_state: Callable[[], None] | None = None,
 ) -> int:
     """Count identities and reject reuse without retaining whole-history identity state.
 
@@ -1651,7 +1675,17 @@ def count_distinct_ids_bounded(
         def belongs(value: int) -> bool:
             return bits == 0 or value >> shift == prefix
 
-        for offset, _kind, state in scan_streamed(data, on_record=on_record):
+        if index is None:
+            states = ((offset, state) for offset, _kind, state in scan_streamed(data, on_record=on_record))
+        else:
+            if windows is None:
+                raise ValueError("indexed identity auditing requires the Window Table")
+            states = (
+                (entry.chunk_offset, state) for entry, state in scan_indexed(data, index, windows, on_entry, on_band)
+            )
+        for offset, state in states:
+            if on_state is not None:
+                on_state()
             current_live: set[int] = set()
             for raw in state.ids:
                 identity = int(raw)

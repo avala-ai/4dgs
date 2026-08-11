@@ -253,8 +253,7 @@ def check_sh_codes(values: np.ndarray, what: str) -> None:
     if bad.any():
         row, channel = (int(value) for value in np.argwhere(bad)[0])
         raise MalformedFile(
-            f"{what} carries coefficient {int(array[row, channel])} at row {row}, "
-            f"channel {channel}; expected 0..255"
+            f"{what} carries coefficient {int(array[row, channel])} at row {row}, channel {channel}; expected 0..255"
         )
 
 

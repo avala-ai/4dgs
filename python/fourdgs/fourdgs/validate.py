@@ -665,6 +665,12 @@ def _check_keyframe_delta(data: bytes, walk: Walk, report: Report, header: rec.H
             nonlocal band_site
             band_site = Site(offset, f"the SH Band Stream for band {band} at index entry {i}")
 
+        def state_ready() -> None:
+            nonlocal band_site
+            # Band callbacks have completed successfully once scan_indexed yields. Any
+            # refusal raised by the identity audit belongs to the owning state record.
+            band_site = None
+
         try:
             for _entry, state in kdf.scan_indexed(
                 data,
@@ -673,6 +679,7 @@ def _check_keyframe_delta(data: bytes, walk: Walk, report: Report, header: rec.H
                 visiting,
                 visiting_band,
             ):
+                state_ready()
                 identity_audit.observe(_entry.chunk_offset, state)
                 # Dropped before the next entry is composed, not merely rebound after it:
                 # the generator retains only current and GOP-keyframe state.
@@ -687,9 +694,25 @@ def _check_keyframe_delta(data: bytes, walk: Walk, report: Report, header: rec.H
 
     if identity_audit.overflowed:
         try:
-            distinct = kdf.count_distinct_ids_bounded(data, on_record=visiting_record)
+            if indexed:
+                distinct = kdf.count_distinct_ids_bounded(
+                    data,
+                    index=opened.index,
+                    windows=opened.windows,
+                    on_entry=visiting,
+                    on_band=visiting_band,
+                    on_state=state_ready,
+                )
+            else:
+                distinct = kdf.count_distinct_ids_bounded(data, on_record=visiting_record)
         except FourdgsError as exc:
-            report.refused("a chunk does not decode: ", exc, walk, current_site)
+            site = current_site
+            if indexed:
+                site = band_site
+                if site is None and entry is not None:
+                    what = "Chunk" if entry.kind == 0 else "DeltaChunk"
+                    site = Site(entry.chunk_offset, f"the {what} record at index entry {i}")
+            report.refused("a chunk does not decode: ", exc, walk, site)
             return
     else:
         distinct = identity_audit.distinct
