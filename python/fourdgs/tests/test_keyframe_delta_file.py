@@ -157,6 +157,38 @@ def test_a_delta_reanchors_only_the_gaussians_it_updates(mode):
     assert all(delta_mu[gaussian_id] == keyframe_mu[gaussian_id] for gaussian_id in [1, 2, 3])
 
 
+def test_reanchoring_mu_t_preserves_a_later_keyframes_moving_centres():
+    samples, duration = _moving_sequence(steps=2, duration=4.0)
+    samples[1].gaussians.positions[:] = 0.0
+    samples[1].gaussians.motions[:] = [1.0, 0.0, 0.0]
+    samples[1].gaussians.mu_t[:] = 0.0
+
+    decoded = kdf.decode_streamed(
+        write_ok(samples, duration, rec.DELTA_MODE_CHAINED, keyframe_every=1)
+    )
+    later = decoded.chunks[1]
+    state = kdf.reconstruct_at(later.state, decoded.grids, later.t0)
+    np.testing.assert_allclose(state["centers"][:, 0], 2.0, atol=decoded.grids.steps.pos)
+
+
+@pytest.mark.parametrize("mode", [rec.DELTA_MODE_CHAINED, rec.DELTA_MODE_KEYFRAME])
+def test_delta_updates_and_births_reanchor_position_with_mu_t(mode):
+    samples, duration = _moving_sequence(steps=3, duration=6.0)
+    target = samples[2]
+    target.gaussians.positions[:] = 10.0
+    target.gaussians.motions[:] = [1.0, 0.0, 0.0]
+    target.gaussians.mu_t[:] = 0.0
+
+    # ID 4 is born in the third sample; the other rows are updates. Both groups
+    # must preserve the centre authored by the old anchor when restated at t0=4.
+    decoded = kdf.decode_streamed(
+        write_ok(samples, duration, mode, keyframe_every=3)
+    )
+    delta = decoded.chunks[2]
+    state = kdf.reconstruct_at(delta.state, decoded.grids, delta.t0)
+    np.testing.assert_allclose(state["centers"][:, 0], 14.0, atol=decoded.grids.steps.pos)
+
+
 def test_composition_reconstructs_each_source_sample():
     """At each sample's t0, the composed population equals the sample the encoder was given."""
     samples, duration = _moving_sequence()

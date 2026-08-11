@@ -244,6 +244,34 @@ def _quantize_sample(sample: Sample, grids: Grids) -> tuple[np.ndarray, dict[int
     return ids, bins
 
 
+def _reanchor_bins(bins: dict[int, np.ndarray], grids: Grids, t0: float) -> dict[int, np.ndarray]:
+    """Restate quantized trajectories at ``t0`` without moving their centres.
+
+    Position and ``mu_t`` are one coupled trajectory anchor.  Changing only the
+    latter changes the reconstructed centre, so keyframes, updates, and births
+    all pass through this operation before they are serialized.
+    """
+    if not bins[op.A_MU_T].size:
+        return dict(bins)
+
+    sigma = bins[op.A_SIGMA_T].reshape(-1)
+    flags = bins[op.A_FLAGS].reshape(-1)
+    never_fades = (flags & op.FLAG_NEVER_FADES) != 0
+    window_index = bins[op.A_WINDOW_INDEX].reshape(-1)
+    motion_step = grids.motion_step(sigma, never_fades, window_index)
+    time_step = grids.mu_step(sigma, never_fades)
+
+    position = dequantize(bins[op.A_POSITION], grids.steps.pos, grids.origin)
+    motion = bins[op.A_MOTION].astype(np.float64) * motion_step[:, None]
+    authored_mu = bins[op.A_MU_T].reshape(-1).astype(np.float64) * time_step
+    centre = position + motion * (float(t0) - authored_mu)[:, None]
+
+    anchored = dict(bins)
+    anchored[op.A_POSITION] = quantize(centre, grids.steps.pos, grids.origin)
+    anchored[op.A_MU_T] = np.rint(float(t0) / time_step).astype(np.int64).reshape(-1, 1)
+    return anchored
+
+
 # --------------------------------------------------------------------------
 # Writing
 # --------------------------------------------------------------------------
@@ -284,7 +312,11 @@ def write_sequence(
         raise ValueError("a keyframe-delta file needs at least one sample")
 
     grids = _grids_for(samples, duration_sec, profile, cutoff)
-    quantized = [_quantize_sample(s, grids) for s in samples]
+    quantized = [
+        (ids, _reanchor_bins(bins, grids, sample.t0))
+        for sample in samples
+        for ids, bins in [_quantize_sample(sample, grids)]
+    ]
     t0s = [float(s.t0) for s in samples]
     t1s = [*t0s[1:], float(duration_sec)]
 
@@ -341,20 +373,10 @@ def write_sequence(
     for i, (ids, bins) in enumerate(quantized):
         t0, t1 = t0s[i], t1s[i]
         if is_keyframe(i, kd):
-            # A keyframe states every live gaussian afresh at its physical interval
-            # start. Keep the shared sample bins unchanged for later delta arithmetic,
-            # but serialize mu_t at Chunk.t0 as spec section 11.3 requires.
-            keyframe_bins = dict(bins)
-            sigma = bins[op.A_SIGMA_T].reshape(-1)
-            never_fades = (bins[op.A_FLAGS].reshape(-1) & op.FLAG_NEVER_FADES) != 0
-            step = grids.mu_step(sigma, never_fades)
-            keyframe_bins[op.A_MU_T] = np.rint(t0 / step).astype(np.int64).reshape(-1, 1)
-            # Deltas must subtract from the state that was actually serialized.  In
-            # particular, a delta following a later keyframe has to undo this t0
-            # anchor when its authored mu_t differs; subtracting from the unmodified
-            # input bins would make the encoded difference telescope to the wrong
-            # absolute value during composition.
-            quantized[i] = (ids, keyframe_bins)
+            # The sample was already restated at this physical interval start.  Position
+            # and mu_t were rebased together, so serializing the new anchor preserves the
+            # trajectory's centre rather than moving it to the old position at a new time.
+            keyframe_bins = bins
             blob = rec.encode_chunk(
                 t0,
                 t1,
@@ -391,43 +413,44 @@ def write_sequence(
             depth = depths[i - 1] + 1
         ref_ids, ref_bins = quantized[ref_sample]
 
-        # mu_t says when a gaussian's state was last stated, not when the caller happened
-        # to anchor its equivalent trajectory.  Ignore that authored anchor while deciding
-        # whether a common gaussian changed: otherwise a sample that keeps mu_t=0 would
-        # spend bytes "updating" every gaussian after a nonzero-time keyframe.  Births are
-        # stated by this delta, so they carry this delta's t0 immediately.
+        # Compare both populations at this delta's t0. Position and mu_t are a coupled
+        # anchor: reanchoring the reference makes an inherited moving trajectory compare
+        # equal when it already reaches the sample's centre at t0. Births and the target
+        # population were normalized to t0 before this loop.
         live = np.isin(ids, ref_ids)
         order = np.argsort(ref_ids, kind="stable")
         ref_rows = order[np.searchsorted(ref_ids[order], ids[live])]
-        sigma = bins[op.A_SIGMA_T].reshape(-1)
-        never_fades = (bins[op.A_FLAGS].reshape(-1) & op.FLAG_NEVER_FADES) != 0
-        stated_mu = np.rint(t0 / grids.mu_step(sigma, never_fades)).astype(np.int64)
-        comparison_bins = dict(bins)
-        comparison_mu = bins[op.A_MU_T].copy().reshape(-1)
-        comparison_mu[live] = ref_bins[op.A_MU_T].reshape(-1)[ref_rows]
-        comparison_mu[~live] = stated_mu[~live]
-        comparison_bins[op.A_MU_T] = comparison_mu.reshape(-1, 1)
+        comparison_ref_bins = _reanchor_bins(ref_bins, grids, t0)
 
         update_ids, update_bins, birth_ids, birth_bins, death_ids = delta_groups(
-            ref_ids, ref_bins, ids, comparison_bins
+            ref_ids, comparison_ref_bins, ids, bins
         )
 
-        # Every updated gaussian is stated at this delta's t0.  delta_groups deliberately
-        # compared common mu_t values as equal above, so replace its zero difference with
-        # the difference from the state actually serialized by the reference.  Retain that
-        # composed anchor in quantized[i] so the next chained delta subtracts from the same
-        # state its decoder will see; untouched gaussians keep the reference anchor.
+        # delta_groups subtracted from the comparison-only t0 anchor. The wire delta must
+        # instead subtract position and mu_t from the state actually serialized by its
+        # reference so composition telescopes to the normalized target exactly.
         updated = np.isin(ids, update_ids)
         if update_ids.size:
             update_ref_rows = order[np.searchsorted(ref_ids[order], update_ids)]
-            update_bins[op.A_MU_T] = (stated_mu[updated] - ref_bins[op.A_MU_T].reshape(-1)[update_ref_rows]).reshape(
-                -1, 1
+            update_bins[op.A_POSITION] = (
+                bins[op.A_POSITION][updated] - ref_bins[op.A_POSITION][update_ref_rows]
             )
+            update_bins[op.A_MU_T] = (
+                bins[op.A_MU_T][updated] - ref_bins[op.A_MU_T][update_ref_rows]
+            )
+
+        # Retain the composed anchors the decoder will see for later chained deltas.
+        # Untouched common rows keep their earlier position/mu_t pair; updated rows and
+        # births use this delta's normalized pair.
         composed_bins = dict(bins)
-        composed_mu = stated_mu.copy()
-        composed_mu[live] = ref_bins[op.A_MU_T].reshape(-1)[ref_rows]
-        composed_mu[updated] = stated_mu[updated]
-        composed_bins[op.A_MU_T] = composed_mu.reshape(-1, 1)
+        composed_position = bins[op.A_POSITION].copy()
+        composed_position[live] = ref_bins[op.A_POSITION][ref_rows]
+        composed_position[updated] = bins[op.A_POSITION][updated]
+        composed_bins[op.A_POSITION] = composed_position
+        composed_mu = bins[op.A_MU_T].copy()
+        composed_mu[live] = ref_bins[op.A_MU_T][ref_rows]
+        composed_mu[updated] = bins[op.A_MU_T][updated]
+        composed_bins[op.A_MU_T] = composed_mu
         quantized[i] = (ids, composed_bins)
         updates = encode_delta_streams(update_ids, update_bins, codec=codec, level=level)
         births = encode_delta_streams(birth_ids, birth_bins, codec=codec, level=level)
