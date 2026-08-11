@@ -106,6 +106,10 @@ git worktree add --no-track -b fix/rust-<slug>   ../4dgs-wt-rust   "$UPSTREAM/ma
 # Cleanup only after MERGED or explicit abandon:
 state=$(gh pr view <n> --json state --jq .state)
 if [ "$state" = "MERGED" ] || [ "${ABANDON_CONFIRMED:-}" = "1" ]; then
+  if [ -n "$(git -C ../4dgs-wt-python status --porcelain 2>/dev/null)" ]; then
+    echo "Worktree ../4dgs-wt-python is dirty — refuse remove. Commit/stash/discard first."
+    exit 1
+  fi
   git worktree remove ../4dgs-wt-python
   git branch -D fix/python-<slug>
 else
