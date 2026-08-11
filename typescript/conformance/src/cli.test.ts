@@ -27,6 +27,7 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
 import {
+  BytesReadable,
   Crc32,
   Cursor,
   FourdgsError,
@@ -521,7 +522,11 @@ test("regression: --decode reaches inside SH band streams, not only chunk stream
   const decoded = validated(broken, "--decode");
   assert.equal(decoded.code, EXIT_FAILED);
   assert.ok(
-    decoded.out.some((line) => /SH band 1 does not decode: stream codec 9/.test(line)),
+    decoded.out.some(
+      (line) =>
+        line.includes(`SH Band Stream at byte ${band.offset}`) &&
+        /SH band 1 does not decode: stream codec 9/.test(line),
+    ),
     decoded.out.join("\n"),
   );
   assert.ok(
@@ -1374,6 +1379,39 @@ test("regression: indexed opening discovers legal legacy Audio after a Chunk", a
   const lateAudio = [...iterateRecords(indexless, MAGIC.length)].find(
     (record) => record.opcode === Opcode.Audio,
   )!;
+  const duplicateAudio = splice(
+    indexless,
+    lateAudio.offset + lateAudio.raw.length,
+    framedRecord(Opcode.Audio, audio),
+  );
+  const duplicateReport = await validateFile(duplicateAudio);
+  assert.ok(
+    duplicateReport.findings.some(
+      (finding) =>
+        finding.message.includes("legacy Audio record 2") &&
+        finding.message.includes(`byte ${lateAudio.offset + lateAudio.raw.length}`),
+    ),
+    duplicateReport.findings.map((finding) => finding.message).join("\n"),
+  );
+
+  const metadata = framedRecord(Opcode.Metadata, new Uint8Array(8));
+  const lateMetadata = new Uint8Array(metadata.length * 3);
+  lateMetadata.set(metadata, 0);
+  lateMetadata.set(metadata, metadata.length);
+  lateMetadata.set(metadata, metadata.length * 2);
+  const footerAt = [...iterateRecords(indexless, MAGIC.length)].find(
+    (record) => record.opcode === Opcode.Footer,
+  )!.offset;
+  const rangeFlood = splice(indexless, footerAt, lateMetadata);
+  const bounded = await IndexedDecoder.open(new BytesReadable(rangeFlood), {
+    headProbeBytes: 64,
+    maxDeferredRecords: 2,
+  });
+  await assert.rejects(
+    () => bounded.readMetadata(),
+    /optional-record discovery stopped after 2 retained records.*bounded-memory limit/,
+  );
+
   const reads: { offset: number; length: number }[] = [];
   const source: IReadable = {
     size: () => Promise.resolve(BigInt(indexless.length)),

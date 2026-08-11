@@ -205,7 +205,7 @@ export async function validateFile(
   let lastOpcode: number | null = null;
   let headerCount = 0;
   let footerCount = 0;
-  let hasLegacyAudio = false;
+  let legacyAudioCount = 0;
   let header: Header | null = null;
   let quantization: Quantization | null = null;
   let quantizationCount = 0;
@@ -460,6 +460,7 @@ export async function validateFile(
           physicalBands.set(offset, []);
           currentChunkOffset = offset;
           firstChunkSeen = true;
+          chunkCount += 1;
           let parsed;
           try {
             parsed =
@@ -544,7 +545,10 @@ export async function validateFile(
             const values = await decodeStream(framedBand, DEFAULT_CODECS);
             decodedShChunk.bands.set(band, values);
           } catch (error) {
-            found.error(`chunk ${chunkCount} SH band ${band} does not decode: ${message(error)}`);
+            found.error(
+              `SH Band Stream at byte ${offset}: chunk ${chunkCount} SH band ${band} ` +
+                `does not decode: ${message(error)}`,
+            );
             found.refuse(error, offset, "the SH Band Stream record");
           }
           break;
@@ -680,7 +684,13 @@ export async function validateFile(
           });
           break;
         case Opcode.Audio:
-          hasLegacyAudio = true;
+          legacyAudioCount += 1;
+          if (legacyAudioCount > 1) {
+            found.error(
+              `legacy Audio record ${legacyAudioCount} appears at byte ${offset}; ` +
+                "a file may carry at most one legacy Audio record",
+            );
+          }
           await parseInto(found, "Audio", offset, async () => {
             await validatePayloadRecord(source, framed, 1, 8);
           });
@@ -779,7 +789,7 @@ export async function validateFile(
     if (header.temporalModel !== "keyframe-delta" && counted !== header.gaussianCount) {
       found.error(`Header declares ${header.gaussianCount} gaussians; chunks contain ${counted}`);
     }
-    const hasAudioRecords = hasLegacyAudio || audioSources.size > 0 || audioData.size > 0;
+    const hasAudioRecords = legacyAudioCount > 0 || audioSources.size > 0 || audioData.size > 0;
     if (header.hasAudio && !hasAudioRecords) {
       found.error(
         "Header says the file has audio, but there is no Audio Source or legacy Audio record",
@@ -870,7 +880,7 @@ export async function validateFile(
       found.refuse(error, at, "the keyframe-delta state record");
     }
   }
-  if (hasLegacyAudio && audioSources.size > 0) {
+  if (legacyAudioCount > 0 && audioSources.size > 0) {
     found.error("legacy Audio and Audio Source records must not be mixed");
   }
   for (const [sourceId, source] of audioSources) {

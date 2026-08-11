@@ -107,6 +107,15 @@ interface ByteRange {
  */
 export const MAX_FRONT_MATTER_BYTES = 64 * 1024 * 1024;
 
+/**
+ * Most optional-record ranges an indexed reader retains while discovering late records.
+ *
+ * This is a reader resource limit, not a format limit. Without a fixed ceiling, a file
+ * containing arbitrarily many tiny Metadata, Attachment, provenance, or audio records
+ * can make one deferred accessor grow the heap in proportion to the whole file.
+ */
+export const MAX_DEFERRED_RECORDS = 65_536;
+
 /** A provenance-family record framed during the front-matter walk (opcode + range). */
 interface ProvenanceRange {
   readonly opcode: number;
@@ -123,9 +132,24 @@ interface IndexedAudioSource {
   readonly legacyStartSec?: number;
 }
 
+function optionalRecordBudget(limit: number): () => void {
+  let retained = 0;
+  return () => {
+    retained += 1;
+    if (retained > limit) {
+      throw new RangeError(
+        `optional-record discovery stopped after ${limit} retained records; this is the ` +
+          "indexed reader's bounded-memory limit, not a malformed-file verdict",
+      );
+    }
+  };
+}
+
 export interface OpenIndexedOptions {
   readonly codecs?: CodecRegistry;
   readonly headProbeBytes?: number;
+  /** Reader resource ceiling for retained optional-record ranges. */
+  readonly maxDeferredRecords?: number;
 }
 
 export interface ReadChunkOptions {
@@ -177,6 +201,7 @@ export class IndexedDecoder {
      */
     private provenanceRanges: ProvenanceRange[],
     private deferredDiscoveryComplete: boolean,
+    private readonly maxDeferredRecords: number,
     readonly statistics: Statistics | null,
     /** Whether the summary CRC matched, or `null` when the file declares none. */
     readonly summaryCrcOk: boolean | null,
@@ -187,6 +212,10 @@ export class IndexedDecoder {
   static async open(source: IReadable, options: OpenIndexedOptions = {}): Promise<IndexedDecoder> {
     const codecs = options.codecs ?? DEFAULT_CODECS;
     const probeSize = options.headProbeBytes ?? HEAD_PROBE_BYTES;
+    const maxDeferredRecords = options.maxDeferredRecords ?? MAX_DEFERRED_RECORDS;
+    if (!Number.isSafeInteger(maxDeferredRecords) || maxDeferredRecords < 1) {
+      throw new RangeError("maxDeferredRecords must be a positive safe integer");
+    }
     const size = Number(await source.size());
     if (size < MAGIC.length + FOOTER_TAIL_BYTES) {
       throw new MalformedFile(`file is ${size} bytes, too short to hold a header and a footer`);
@@ -208,6 +237,7 @@ export class IndexedDecoder {
         attachments: [],
       };
     const provenanceRanges: ProvenanceRange[] = [];
+    const retainOptionalRecord = optionalRecordBudget(maxDeferredRecords);
     let deferredDiscoveryComplete = true;
     for await (const record of scanner.records(MAGIC.length)) {
       // Indexed opening ends where state data begins. Continuing through every physical
@@ -230,6 +260,7 @@ export class IndexedDecoder {
         // The track's bytes are not read here, and neither is the record stepped into: a
         // caller may want the gaussians and never the audio. Only the codec name is
         // parsed, out of a prefix, so a scene with a large track costs nothing to open.
+        retainOptionalRecord();
         legacyAudio = readLegacyAudioRange(
           await scanner.content(record, AUDIO_CODEC_PREFIX_BYTES),
           record.offset,
@@ -240,6 +271,7 @@ export class IndexedDecoder {
         if (sourceRanges.has(sourceId)) {
           throw new MalformedFile(`Audio Source id ${sourceId} appears more than once`);
         }
+        retainOptionalRecord();
         sourceRanges.set(sourceId, { offset: record.offset, length: record.totalLength });
       } else if (record.opcode === Opcode.AudioData) {
         const prefix = new Cursor(await scanner.content(record, 12));
@@ -254,20 +286,25 @@ export class IndexedDecoder {
               `but its record content is only ${record.contentLength} bytes`,
           );
         }
+        retainOptionalRecord();
         dataRanges.set(sourceId, {
           offset: record.offset + RECORD_HEADER_BYTES + 12,
           length: dataLength,
         });
       } else if (record.opcode === Opcode.Camera) {
+        retainOptionalRecord();
         deferred.camera = { offset: record.offset, length: record.totalLength };
       } else if (record.opcode === Opcode.Metadata) {
+        retainOptionalRecord();
         deferred.metadata.push({ offset: record.offset, length: record.totalLength });
       } else if (record.opcode === Opcode.Attachment) {
+        retainOptionalRecord();
         deferred.attachments.push({ offset: record.offset, length: record.totalLength });
       } else if (isProvenanceOpcode(record.opcode)) {
         // Framed, not read. Opening a file learns where provenance lives and stops: a
         // long rig trajectory costs nothing to open, and reserved opcodes in the family
         // (object layer, source timing) stay skippable by their length alone.
+        retainOptionalRecord();
         provenanceRanges.push({
           opcode: record.opcode,
           offset: record.offset,
@@ -377,6 +414,7 @@ export class IndexedDecoder {
       deferred,
       provenanceRanges,
       deferredDiscoveryComplete,
+      maxDeferredRecords,
       statistics,
       summaryCrcOk,
       size,
@@ -404,12 +442,14 @@ export class IndexedDecoder {
         attachments: [],
       };
     const provenanceRanges: ProvenanceRange[] = [];
+    const retainOptionalRecord = optionalRecordBudget(this.maxDeferredRecords);
 
     for await (const record of scanner.records(MAGIC.length)) {
       if (record.opcode === Opcode.Audio) {
         if (legacyAudio !== null) {
           throw new MalformedFile("the file carries more than one legacy Audio record");
         }
+        retainOptionalRecord();
         legacyAudio = readLegacyAudioRange(
           await scanner.content(record, AUDIO_CODEC_PREFIX_BYTES),
           record.offset,
@@ -420,6 +460,7 @@ export class IndexedDecoder {
         if (sourceRanges.has(sourceId)) {
           throw new MalformedFile(`Audio Source id ${sourceId} appears more than once`);
         }
+        retainOptionalRecord();
         sourceRanges.set(sourceId, { offset: record.offset, length: record.totalLength });
       } else if (record.opcode === Opcode.AudioData) {
         const prefix = new Cursor(await scanner.content(record, 12));
@@ -434,17 +475,22 @@ export class IndexedDecoder {
               `but its record content is only ${record.contentLength} bytes`,
           );
         }
+        retainOptionalRecord();
         dataRanges.set(sourceId, {
           offset: record.offset + RECORD_HEADER_BYTES + 12,
           length: dataLength,
         });
       } else if (record.opcode === Opcode.Camera) {
+        retainOptionalRecord();
         deferred.camera = { offset: record.offset, length: record.totalLength };
       } else if (record.opcode === Opcode.Metadata) {
+        retainOptionalRecord();
         deferred.metadata.push({ offset: record.offset, length: record.totalLength });
       } else if (record.opcode === Opcode.Attachment) {
+        retainOptionalRecord();
         deferred.attachments.push({ offset: record.offset, length: record.totalLength });
       } else if (isProvenanceOpcode(record.opcode)) {
+        retainOptionalRecord();
         provenanceRanges.push({
           opcode: record.opcode,
           offset: record.offset,
