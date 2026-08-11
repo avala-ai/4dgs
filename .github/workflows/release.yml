@@ -482,8 +482,11 @@ jobs:
         run: |
           pip install -e ./python/fourdgs
           python3 tests/conformance/generate.py --verify
-          if ! git diff --exit-code -- tests/conformance/data; then
-            echo "::error::the generated expectations differ from the release tag"
+          changes=$(git status --porcelain --untracked-files=all -- tests/conformance/data)
+          if [ -n "$changes" ]; then
+            echo "::error::the generated corpus differs from the release tag"
+            printf '%s\n' "$changes"
+            git diff -- tests/conformance/data
             exit 1
           fi
 

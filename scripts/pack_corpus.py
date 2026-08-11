@@ -209,12 +209,17 @@ stdout. Score it by diffing that document against the variant's `.json`, parsed 
 text:
 
 ```sh
+failed=0
 for f in corpus/*.4dgs corpus/*/*.4dgs; do
   actual=$(your-runner "$f")
   expected=$(cat "${{f%.4dgs}}.json")
-  python3 -c 'import json,sys; sys.exit(json.loads(sys.argv[1]) != json.loads(sys.argv[2]))' \\
-    "$actual" "$expected" || echo "FAIL $f"
+  if ! python3 -c 'import json,sys; sys.exit(json.loads(sys.argv[1]) != json.loads(sys.argv[2]))' \\
+    "$actual" "$expected"; then
+    echo "FAIL $f"
+    failed=1
+  fi
 done
+exit "$failed"
 ```
 
 `MANIFEST.json` says which variants a runner may skip and why: `indexed` is false for a variant no
