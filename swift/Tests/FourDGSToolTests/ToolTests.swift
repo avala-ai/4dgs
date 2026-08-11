@@ -111,6 +111,7 @@ private func withTemporaryFile<T>(_ bytes: [UInt8], _ body: (String) throws -> T
 private final class RecordingReader: ByteRangeReader {
     let bytes: [UInt8]
     private(set) var largestRead = 0
+    private(set) var ranges: [Range<Int>] = []
 
     init(_ bytes: [UInt8]) { self.bytes = bytes }
 
@@ -120,6 +121,7 @@ private final class RecordingReader: ByteRangeReader {
         largestRead = max(largestRead, count)
         let start = min(Int(clamping: offset), bytes.count)
         let end = min(start + count, bytes.count)
+        ranges.append(start..<end)
         return Array(bytes[start..<end])
     }
 }
@@ -1242,6 +1244,76 @@ final class ValidateTests: XCTestCase {
             },
             auxiliaryFindings.map { "\($0.message) [\($0.refusal.map(String.init(describing:)) ?? "-")]" }
                 .joined(separator: "\n"))
+    }
+
+    func testCoordinateFrameUnitDeclarationsMustAgree() throws {
+        try requireCorpus()
+        var bytes = try readFixture(corpusDirectory().appendingPathComponent(provenanceVariant))
+        let frame = try XCTUnwrap(try walk(bytes).firstIntact(Opcode.coordinateFrame))
+        let content = frame.offset + recordHeaderSize
+        let nameLength = UInt64(try XCTUnwrap(readU32(bytes, at: content)))
+        let fixed = content + 4 + nameLength
+        bytes[Int(fixed + 3)] = 1  // metre
+        writeU64(0.01.bitPattern, into: &bytes, at: fixed + 4)
+
+        let findings = validate(bytes).findings
+        XCTAssertTrue(
+            findings.contains {
+                $0.message.contains("length_unit 1 (1.0 m per unit)")
+                    && $0.message.contains("metres_per_unit 0.01")
+            }, findings.map(\.message).joined(separator: "\n"))
+    }
+
+    func testAttachmentValidationSkipsThePayload() throws {
+        let payloadCount = 8 * 1024 * 1024
+        var body = littleU32(0) + littleU32(0) + littleU64(UInt64(payloadCount))
+        body += [UInt8](repeating: 0xA5, count: payloadCount)
+        let bytes = [Opcode.attachment] + littleU64(UInt64(body.count)) + body
+        let frame = Frame(opcode: Opcode.attachment, offset: 0, length: UInt64(body.count))
+        let recording = RecordingReader(bytes)
+
+        try validateAttachmentShape(ToolReader(recording), frame)
+        XCTAssertLessThan(recording.largestRead, payloadCount)
+        let payload = Int(recordHeaderSize) + 16
+        let payloadRange = payload..<(payload + payloadCount)
+        XCTAssertFalse(
+            recording.ranges.contains {
+                $0.lowerBound < payloadRange.upperBound && $0.upperBound > payloadRange.lowerBound
+            })
+
+        let shortBody = littleU32(0) + littleU32(0) + littleU64(1)
+        let malformed = [Opcode.attachment] + littleU64(UInt64(shortBody.count)) + shortBody
+        let malformedFrame = Frame(
+            opcode: Opcode.attachment, offset: 0, length: UInt64(shortBody.count))
+        XCTAssertThrowsError(
+            try validateAttachmentShape(ToolReader(InMemoryReader(malformed)), malformedFrame)
+        ) { error in
+            XCTAssertTrue(sentence(asFourDGS(error)).contains("declares 1 bytes; 0 remain"))
+        }
+    }
+
+    func testConstantValidationColumnsStayCompressed() throws {
+        let channels: UInt8 = 255
+        let rows: UInt32 = 500_000
+        let payload = deflated([UInt8](repeating: 0, count: Int(channels)))
+        let stream =
+            [UInt8(42), 1, 2, 0, channels] + littleU32(rows)
+            + littleU64(UInt64(payload.count)) + payload
+        let recording = RecordingReader(stream)
+        let source = ToolReader(recording)
+        let group = DeltaGroup(
+            name: "update", count: rows, source: source, offset: 0,
+            length: UInt64(stream.count))
+        let frame = Frame(opcode: Opcode.deltaChunk, offset: 0, length: UInt64(stream.count))
+
+        var column = try XCTUnwrap(validationColumn(frame, group, attribute: 42))
+        XCTAssertEqual(column.rowCount, Int(rows))
+        XCTAssertEqual(column.storedValueCount, Int(channels))
+        XCTAssertEqual(column.rowValues(at: Int(rows) - 1), [Int32](repeating: 0, count: 255))
+        column.setRow([Int32](repeating: 1, count: 255), at: Int(rows) - 1)
+        XCTAssertEqual(column.storedValueCount, Int(channels) * 2)
+        XCTAssertEqual(column.rowValues(at: 0), [Int32](repeating: 0, count: 255))
+        XCTAssertEqual(column.rowValues(at: Int(rows) - 1), [Int32](repeating: 1, count: 255))
     }
 
     func testHeaderDegreeAndQuantizationDepthsAreValidatedDirectly() throws {

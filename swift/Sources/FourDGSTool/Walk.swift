@@ -17,6 +17,7 @@ public enum Opcode {
     public static let chunkIndex: UInt8 = 0x08
     public static let audio: UInt8 = 0x09
     public static let statistics: UInt8 = 0x0C
+    public static let attachment: UInt8 = 0x0D
     public static let summaryOffset: UInt8 = 0x0F
     public static let deltaChunk: UInt8 = 0x10
     public static let audioSource: UInt8 = 0x11

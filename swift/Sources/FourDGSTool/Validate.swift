@@ -714,6 +714,78 @@ private func isExpectedPartialGroupError(_ error: FourDGSError, group: DeltaGrou
     group.name != "birth" && sentence(error).contains("chunk is missing required attributes")
 }
 
+private let lengthUnitMetres: [UInt8: Double] = [
+    1: 1.0,
+    2: 0.01,
+    3: 0.001,
+    4: 1000.0,
+    5: 0.3048,
+    6: 0.0254,
+]
+
+/// The core correctly treats the explicit scale as authoritative. Validation additionally names
+/// the writer-side error when the registry enum and that scale disagree (spec section 5.15.2).
+private func coordinateFrameUnitDisagreement(
+    _ source: ToolReader, _ frame: Frame
+) throws -> String? {
+    let content = frame.offset + recordHeaderSize
+    guard frame.length >= 4 else { return nil }
+    let lengthBytes = try source.exactly(
+        offset: content, count: 4, record: "CoordinateFrame name length")
+    let nameLength = UInt64(readU32(lengthBytes, at: 0) ?? 0)
+    guard nameLength <= frame.length - 4, frame.length - 4 - nameLength >= 12 else { return nil }
+    let fixed = try source.exactly(
+        offset: content + 4 + nameLength, count: 12, record: "CoordinateFrame fixed fields")
+    let lengthUnit = fixed[3]
+    guard let declared = lengthUnitMetres[lengthUnit],
+        let metresPerUnit = readF64(fixed, at: 4), metresPerUnit > 0
+    else { return nil }
+    let tolerance = 1e-12 * max(declared, 1.0)
+    guard abs(metresPerUnit - declared) > tolerance else { return nil }
+    return
+        "CoordinateFrame at byte \(frame.offset) declares length_unit \(lengthUnit) "
+        + "(\(declared) m per unit) and metres_per_unit \(metresPerUnit); a writer must make "
+        + "them agree. A consumer handed this file takes metres_per_unit (section 5.15.2)"
+}
+
+private func malformedAttachment(_ frame: Frame, field: String, reason: String) -> FourDGSError {
+    .malformed(
+        offset: Int64(clamping: frame.offset), record: "Attachment", field: field, reason: reason)
+}
+
+/// Validate the two strings and the payload's length frame without ever reading the payload.
+func validateAttachmentShape(_ source: ToolReader, _ frame: Frame) throws {
+    let content = frame.offset + recordHeaderSize
+    var relative: UInt64 = 0
+    for field in ["name", "media_type"] {
+        guard relative <= frame.length, frame.length - relative >= 4 else {
+            throw malformedAttachment(frame, field: field, reason: "the string length is missing")
+        }
+        let lengthBytes = try source.exactly(
+            offset: content + relative, count: 4, record: "Attachment \(field) length")
+        let length = UInt64(readU32(lengthBytes, at: 0) ?? 0)
+        relative += 4
+        guard length <= frame.length - relative else {
+            throw malformedAttachment(frame, field: field, reason: "the string runs past the record")
+        }
+        try validateRecordUTF8(
+            source, frame, offset: content + relative, length: length, field: field)
+        relative += length
+    }
+    guard relative <= frame.length, frame.length - relative >= 8 else {
+        throw malformedAttachment(frame, field: "data", reason: "the byte length is missing")
+    }
+    let lengthBytes = try source.exactly(
+        offset: content + relative, count: 8, record: "Attachment data length")
+    let length = readU64(lengthBytes, at: 0) ?? 0
+    relative += 8
+    guard length == frame.length - relative else {
+        throw malformedAttachment(
+            frame, field: "data",
+            reason: "declares \(length) bytes; \(frame.length - relative) remain")
+    }
+}
+
 private func isAuxiliaryRecord(_ opcode: UInt8) -> Bool {
     (0x0A...0x0F).contains(opcode) || (0x20...0x25).contains(opcode)
 }
@@ -1080,6 +1152,41 @@ private func validatePhysicalRecords(
                     return
                 }
 
+                if frame.opcode == Opcode.attachment {
+                    do {
+                        try validateAttachmentShape(source, frame)
+                    } catch {
+                        if firstAuxiliaryError == nil {
+                            firstAuxiliaryError = (
+                                asFourDGS(error),
+                                Site(
+                                    offset: frame.offset,
+                                    what:
+                                        "the physical Attachment record at byte \(frame.offset)")
+                            )
+                        }
+                    }
+                    return
+                }
+
+                if frame.opcode == Opcode.coordinateFrame {
+                    do {
+                        if let disagreement = try coordinateFrameUnitDisagreement(source, frame) {
+                            scanReport.error(disagreement)
+                        }
+                    } catch {
+                        if firstAuxiliaryError == nil {
+                            firstAuxiliaryError = (
+                                asFourDGS(error),
+                                Site(
+                                    offset: frame.offset,
+                                    what:
+                                        "the physical CoordinateFrame record at byte \(frame.offset)")
+                            )
+                        }
+                    }
+                }
+
                 if isAuxiliaryRecord(frame.opcode) {
                     if auxiliaryRecords.count < maximumRetainedValidationRecords {
                         auxiliaryRecords.append(frame)
@@ -1439,9 +1546,113 @@ private func validatePhysicalRecords(
 private let maximumIdentityStreamBytes: UInt64 = 1 << 30
 private let maximumValidationColumnBytes: UInt64 = 512 * 1024 * 1024
 
-private struct ValidationColumn {
-    let channels: Int
+private struct ValidationColumnPiece {
+    var rowCount: Int
+    let constant: Bool
     var values: [Int32]
+    var overrides: [Int: [Int32]] = [:]
+}
+
+struct ValidationColumn {
+    let channels: Int
+    private var pieces: [ValidationColumnPiece]
+
+    var rowCount: Int { pieces.reduce(0) { $0 + $1.rowCount } }
+    var storedValueCount: Int {
+        pieces.reduce(0) { total, piece in
+            total + piece.values.count + piece.overrides.values.reduce(0) { $0 + $1.count }
+        }
+    }
+
+    init(channels: Int, rowCount: Int, values: [Int32], constant: Bool) {
+        self.channels = channels
+        self.pieces = [
+            ValidationColumnPiece(rowCount: rowCount, constant: constant, values: values)
+        ]
+    }
+
+    init(repeating row: [Int32], rowCount: Int) {
+        self.init(channels: row.count, rowCount: rowCount, values: row, constant: true)
+    }
+
+    func rowValues(at row: Int) -> [Int32] {
+        precondition(row >= 0 && row < rowCount)
+        var relative = row
+        for piece in pieces {
+            if relative >= piece.rowCount {
+                relative -= piece.rowCount
+                continue
+            }
+            if let override = piece.overrides[relative] { return override }
+            if piece.constant { return piece.values }
+            let start = relative * channels
+            return Array(piece.values[start..<(start + channels)])
+        }
+        preconditionFailure("validated row was not present in its column")
+    }
+
+    mutating func setRow(_ rowValues: [Int32], at row: Int) {
+        precondition(rowValues.count == channels && row >= 0 && row < rowCount)
+        var relative = row
+        for i in pieces.indices {
+            if relative >= pieces[i].rowCount {
+                relative -= pieces[i].rowCount
+                continue
+            }
+            if pieces[i].constant {
+                if rowValues == pieces[i].values {
+                    pieces[i].overrides.removeValue(forKey: relative)
+                } else {
+                    pieces[i].overrides[relative] = rowValues
+                }
+            } else {
+                let start = relative * channels
+                pieces[i].values.replaceSubrange(
+                    start..<(start + channels), with: rowValues)
+            }
+            return
+        }
+        preconditionFailure("validated row was not present in its column")
+    }
+
+    mutating func retainRows(_ keeping: [Bool]) {
+        precondition(keeping.count == rowCount)
+        var retained: [ValidationColumnPiece] = []
+        var global = 0
+        for piece in pieces {
+            var keptRows: [Int] = []
+            keptRows.reserveCapacity(piece.rowCount)
+            for local in 0..<piece.rowCount where keeping[global + local] {
+                keptRows.append(local)
+            }
+            global += piece.rowCount
+            guard !keptRows.isEmpty else { continue }
+            if piece.constant {
+                var next = ValidationColumnPiece(
+                    rowCount: keptRows.count, constant: true, values: piece.values)
+                for (newRow, oldRow) in keptRows.enumerated() {
+                    if let value = piece.overrides[oldRow] { next.overrides[newRow] = value }
+                }
+                retained.append(next)
+            } else {
+                var values: [Int32] = []
+                values.reserveCapacity(keptRows.count * channels)
+                for oldRow in keptRows {
+                    let start = oldRow * channels
+                    values.append(contentsOf: piece.values[start..<(start + channels)])
+                }
+                retained.append(
+                    ValidationColumnPiece(
+                        rowCount: keptRows.count, constant: false, values: values))
+            }
+        }
+        pieces = retained
+    }
+
+    mutating func append(_ other: ValidationColumn) {
+        precondition(channels == other.channels)
+        pieces.append(contentsOf: other.pieces)
+    }
 }
 
 private struct ValidationColumnState {
@@ -1478,7 +1689,7 @@ private func validationGroupAttributes(_ frame: Frame, _ group: DeltaGroup) thro
 /// Decode one requested column without retaining its siblings. The inflated byte planes and the
 /// resulting Int32 column are each capped before allocation, so replaying a chain remains bounded
 /// by one attribute rather than the product of every attribute and every state record.
-private func validationColumn(
+func validationColumn(
     _ frame: Frame, _ group: DeltaGroup, attribute wanted: UInt8
 ) throws -> ValidationColumn? {
     var relative: UInt64 = 0
@@ -1522,7 +1733,6 @@ private func validationColumn(
             frame,
             "the \(group.name) group declares \(group.count) rows, but attribute \(wanted) carries \(count)")
     }
-    if count == 0 { return ValidationColumn(channels: Int(channels64), values: []) }
     guard width == 1 || width == 2 || width == 4 else {
         throw malformedStateStreams(
             frame, "attribute \(wanted) declares symbol width \(width); expected 1, 2, or 4")
@@ -1533,6 +1743,9 @@ private func validationColumn(
     }
     guard channels64 > 0, let channels = Int(exactly: channels64) else {
         throw malformedStateStreams(frame, "attribute \(wanted) declares zero channels")
+    }
+    if count == 0 {
+        return ValidationColumn(channels: channels, rowCount: 0, values: [], constant: mode == 2)
     }
     guard codec == 0 else {
         throw FourDGSError.unsupportedCodec(
@@ -1545,10 +1758,10 @@ private func validationColumn(
     let (decodedBytes, byteOverflow) = symbols.multipliedReportingOverflow(by: width)
     let (producedSymbols, producedOverflow) = count.multipliedReportingOverflow(by: channels64)
     let (producedBytes, producedByteOverflow) = producedSymbols.multipliedReportingOverflow(by: 4)
-    guard !symbolOverflow, !byteOverflow, !producedOverflow, !producedByteOverflow,
-        decodedBytes <= maximumValidationColumnBytes,
-        producedBytes <= maximumValidationColumnBytes,
-        let producedCount = Int(exactly: producedSymbols)
+    guard !symbolOverflow, !byteOverflow, decodedBytes <= maximumValidationColumnBytes,
+        !producedOverflow, !producedByteOverflow,
+        mode == 2 || producedBytes <= maximumValidationColumnBytes,
+        let storedCount = Int(exactly: symbols), let rowCount = Int(exactly: count)
     else {
         throw malformedStateStreams(
             frame,
@@ -1558,7 +1771,7 @@ private func validationColumn(
         group.source, offset: wantedPayloadOffset, length: wantedPayloadLength,
         expected: decodedBytes, frame: frame)
 
-    var stored = [Int32](repeating: 0, count: Int(symbols))
+    var stored = [Int32](repeating: 0, count: storedCount)
     var previous = [Int64](repeating: 0, count: channels)
     let blockSymbols: UInt64 = 16 * 1024
     var start: UInt64 = 0
@@ -1597,13 +1810,8 @@ private func validationColumn(
         start += blockCount
     }
 
-    if mode != 2 { return ValidationColumn(channels: channels, values: stored) }
-    var repeated = [Int32](repeating: 0, count: producedCount)
-    for row in 0..<Int(count) {
-        repeated.replaceSubrange(
-            row * channels..<(row + 1) * channels, with: stored[0..<channels])
-    }
-    return ValidationColumn(channels: channels, values: repeated)
+    return ValidationColumn(
+        channels: channels, rowCount: rowCount, values: stored, constant: mode == 2)
 }
 
 private func orderedValidationIDs(_ frame: Frame, _ group: DeltaGroup) throws -> [UInt32] {
@@ -1612,9 +1820,10 @@ private func orderedValidationIDs(_ frame: Frame, _ group: DeltaGroup) throws ->
         throw malformedIdentity(frame, "the \(group.name) group carries no one-channel gaussian_id stream")
     }
     var ids: [UInt32] = []
-    ids.reserveCapacity(column.values.count)
+    ids.reserveCapacity(column.rowCount)
     var unique: Set<UInt32> = []
-    for value in column.values {
+    for row in 0..<column.rowCount {
+        let value = column.rowValues(at: row)[0]
         let id = UInt32(bitPattern: value)
         guard unique.insert(id).inserted else {
             throw malformedIdentity(
@@ -1629,20 +1838,9 @@ private func removeValidationRows(
     _ state: inout ValidationColumnState, deaths: Set<UInt32>
 ) {
     guard !deaths.isEmpty else { return }
-    var keptIDs: [UInt32] = []
-    keptIDs.reserveCapacity(state.ids.count)
-    var keptValues: [Int32] = []
-    if let column = state.column {
-        keptValues.reserveCapacity(column.values.count)
-        for (row, id) in state.ids.enumerated() where !deaths.contains(id) {
-            keptIDs.append(id)
-            keptValues += column.values[row * column.channels..<(row + 1) * column.channels]
-        }
-        state.column = ValidationColumn(channels: column.channels, values: keptValues)
-    } else {
-        keptIDs = state.ids.filter { !deaths.contains($0) }
-    }
-    state.ids = keptIDs
+    let keeping = state.ids.map { !deaths.contains($0) }
+    state.column?.retainRows(keeping)
+    state.ids = zip(state.ids, keeping).compactMap { pair in pair.1 ? pair.0 : nil }
 }
 
 private func applyValidationDelta(
@@ -1686,22 +1884,23 @@ private func applyValidationDelta(
                 throw malformedIdentity(
                     frame, "the delta updates gaussian_id \(id), which is not live at its reference")
             }
+            var composed = base.rowValues(at: row)
+            let incoming = update.rowValues(at: updateRow)
             for channel in 0..<base.channels {
-                let destination = row * base.channels + channel
-                let incoming = update.values[updateRow * base.channels + channel]
                 if attribute == 2 || attribute == 3 || attribute == 14 {
-                    base.values[destination] = incoming
+                    composed[channel] = incoming[channel]
                 } else {
-                    let sum = Int64(base.values[destination]) + Int64(incoming)
+                    let sum = Int64(composed[channel]) + Int64(incoming[channel])
                     guard sum >= Int64(Int32.min), sum <= Int64(Int32.max) else {
                         throw malformedStateStreams(
                             frame,
                             "composing attribute \(attribute) for gaussian_id \(id) leaves the signed 32-bit range"
                         )
                     }
-                    base.values[destination] = Int32(sum)
+                    composed[channel] = Int32(sum)
                 }
             }
+            base.setRow(composed, at: row)
         }
         state.column = base
     }
@@ -1716,9 +1915,12 @@ private func applyValidationDelta(
                     "a birth gives attribute \(attribute) \(birth.channels) channels; the referenced state carries \(base.channels)"
                 )
             }
-            base.values += birth.values
+            base.append(birth)
         } else if attribute == 14 {
-            base.values += [Int32](repeating: 0, count: birthIDs.count * base.channels)
+            base.append(
+                ValidationColumn(
+                    repeating: [Int32](repeating: 0, count: base.channels),
+                    rowCount: birthIDs.count))
         } else {
             throw malformedStateStreams(
                 frame, "the birth group carries no value for attribute \(attribute)")
@@ -1730,9 +1932,10 @@ private func applyValidationDelta(
                 frame,
                 "a birth introduces attribute \(attribute) after the referenced state omitted it")
         }
-        var values = [Int32](repeating: 0, count: state.ids.count * birth.channels)
-        values += birth.values
-        state.column = ValidationColumn(channels: birth.channels, values: values)
+        var column = ValidationColumn(
+            repeating: [Int32](repeating: 0, count: birth.channels), rowCount: state.ids.count)
+        column.append(birth)
+        state.column = column
     }
     state.ids += birthIDs
 }
@@ -1755,8 +1958,7 @@ private func validationState(
         ids: try orderedValidationIDs(keyframe, keyframeGroup),
         column: try validationColumn(keyframe, keyframeGroup, attribute: attribute))
     if state.column == nil, attribute == 14 {
-        state.column = ValidationColumn(
-            channels: 1, values: [Int32](repeating: 0, count: state.ids.count))
+        state.column = ValidationColumn(repeating: [0], rowCount: state.ids.count)
     }
     for frame in chain.dropLast().reversed() {
         try applyValidationDelta(&state, source: source, frame: frame, attribute: attribute)
@@ -2414,7 +2616,7 @@ private func malformedAudio(_ frame: Frame, field: String, reason: String) -> Fo
         reason: reason)
 }
 
-private func validateAudioUTF8(
+private func validateRecordUTF8(
     _ source: ToolReader, _ frame: Frame, offset: UInt64, length: UInt64, field: String
 ) throws {
     var at: UInt64 = 0
@@ -2424,7 +2626,7 @@ private func validateAudioUTF8(
     while at < length {
         let count = Int(min(UInt64(4096), length - at))
         let bytes = try source.exactly(
-            offset: offset + at, count: count, record: "Audio Source \(field)")
+            offset: offset + at, count: count, record: "\(opcodeName(frame.opcode)) \(field)")
         for byte in bytes {
             if continuation == 0 {
                 switch byte {
@@ -2487,7 +2689,7 @@ private func audioSourceSummary(_ source: ToolReader, _ frame: Frame) throws -> 
             throw malformedAudio(frame, field: field, reason: "the string runs past the record")
         }
         let offset = content + relative
-        try validateAudioUTF8(source, frame, offset: offset, length: length, field: field)
+        try validateRecordUTF8(source, frame, offset: offset, length: length, field: field)
         relative += length
         return (offset, length)
     }
@@ -2646,7 +2848,7 @@ private func validateLegacyAudio(_ source: ToolReader, _ frame: Frame) throws {
     guard codecLength != 0 else {
         throw malformedAudio(frame, field: "codec", reason: "the string is empty")
     }
-    try validateAudioUTF8(
+    try validateRecordUTF8(
         source, frame, offset: content + 4, length: codecLength, field: "codec")
     let relative = 4 + codecLength
     guard relative <= frame.length, frame.length - relative >= 16 else {
