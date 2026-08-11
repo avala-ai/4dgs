@@ -70,8 +70,9 @@ from .serialization import (
 from .stream_reader import check_window_indices
 
 #: Matches `tests/conformance/canonical.py`: integers are strings so a 64-bit value
-#: survives a double-backed JSON parser, floats are rounded before comparison, and a
-#: non-finite value is `null` rather than a sentinel a decoder could produce by accident.
+#: survives a double-backed JSON parser, floats are rounded before comparison, a
+#: non-finite value is `null` rather than a sentinel a decoder could produce by accident,
+#: and a zero has no sign.
 FLOAT_DECIMALS = 6
 SAMPLE = 16
 
@@ -84,7 +85,15 @@ def _num(value):
     if value is None:
         return None
     v = float(value)
-    return None if not math.isfinite(v) else round(v, FLOAT_DECIMALS)
+    if not math.isfinite(v):
+        return None
+    # `+ 0.0` is not a no-op: IEEE 754 makes `-0.0 + 0.0` equal `+0.0` and leaves every
+    # other value untouched. Which sign a composed value at the noise floor picks up is a
+    # property of the platform's arithmetic and not of the scene, and this summary is
+    # committed to the corpus as text, so keeping it would make the corpus unregenerable
+    # on another machine (issue #153). `canonical.canonical` normalizes on the way out as
+    # well; this keeps `states_json` right for anyone who calls it directly.
+    return round(v, FLOAT_DECIMALS) + 0.0
 
 
 # --------------------------------------------------------------------------

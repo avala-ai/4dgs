@@ -7,16 +7,21 @@ on:
 
 jobs:
   corpus:
-    # Regenerates the corpus, asserts the committed checksums, and asserts that two
-    # generator runs are byte-identical — the check that catches nondeterminism in an
-    # encoder before it becomes somebody else's failing CI.
+    # Regenerates the corpus, asserts the committed checksums and expectations, and
+    # asserts that two generator runs are byte-identical — the check that catches
+    # nondeterminism in an encoder before it becomes somebody else's failing CI.
+    #
+    # `test_verify.py` is the gate's own test suite: it plants the mutations `--verify`
+    # exists to catch — a signed zero, an expectation no variant produces — in a corpus of
+    # its own and requires the gate to go red. A gate nobody tests is a gate that passes.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: |
-          pip install -e ./python/fourdgs
+          pip install -e './python/fourdgs[dev]'
+          python -m pytest tests/conformance/test_verify.py -q
           python tests/conformance/generate.py --verify
 
   python:
