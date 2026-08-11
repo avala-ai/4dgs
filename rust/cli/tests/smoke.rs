@@ -1143,6 +1143,75 @@ fn an_undecodable_band_of_a_keyframe_delta_chunk_is_not_reported_valid() {
 }
 
 #[test]
+fn a_keyframe_delta_header_degree_requires_every_band() {
+    let Some(source) = keyframe_file() else {
+        return;
+    };
+    let mut data = std::fs::read(&source).unwrap();
+    let sh_degree_at = {
+        let header = fourdgs::serialization::Records::new(&data, 8)
+            .map(|record| record.unwrap())
+            .find(|record| record.opcode == 0x01)
+            .expect("a Header");
+        let mut cursor = fourdgs::serialization::Cursor::new(header.content);
+        cursor.string().unwrap();
+        cursor.string().unwrap();
+        cursor.f64().unwrap();
+        cursor.u64().unwrap();
+        cursor.f64().unwrap();
+        cursor.string().unwrap();
+        cursor.f64s(6).unwrap();
+        header.offset + 9 + cursor.position()
+    };
+    assert_eq!(data[sh_degree_at], 0, "the fixture starts without SH");
+    data[sh_degree_at] = 1;
+    let path = fixture("fourdgs-cli-kd-missing-band.4dgs", &data);
+
+    let out = run(&["validate", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains("requires exactly [1]") && text.contains("SH bands []"),
+        "{text}"
+    );
+    std::fs::remove_file(path).ok();
+}
+
+#[test]
+fn every_physical_keyframe_delta_state_has_one_index_entry() {
+    let Some(source) = keyframe_file() else {
+        return;
+    };
+    let data = std::fs::read(&source).unwrap();
+    let (start, _) = summary_bounds(&data);
+    let extra = {
+        let record = fourdgs::serialization::Records::new(&data[..start], 8)
+            .map(|record| record.unwrap())
+            .find(|record| record.opcode == 0x05)
+            .expect("a keyframe Chunk");
+        data[record.offset..record.offset + 9 + record.content.len()].to_vec()
+    };
+    let (entries, rest) = summary_parts(&data);
+    let summary: Vec<u8> = entries
+        .iter()
+        .flat_map(|entry| entry.encode())
+        .chain(rest)
+        .collect();
+    let mut front = data[..start].to_vec();
+    front.extend_from_slice(&extra);
+    let path = fixture(
+        "fourdgs-cli-kd-unindexed-state.4dgs",
+        &rebuilt(&front, &summary),
+    );
+
+    let out = run(&["validate", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("has no Chunk Index entry"), "{text}");
+    std::fs::remove_file(path).ok();
+}
+
+#[test]
 fn a_keyframe_delta_file_with_no_index_is_read_front_to_back() {
     // `open_indexed` starts its index walk at `Footer.summary_start`. On a stream-only file
     // that is zero, so it walked from byte 0, read the file magic as record framing, and
@@ -1192,6 +1261,41 @@ fn a_stream_only_keyframe_delta_file_still_has_its_chunks_decoded() {
         "{text}"
     );
     std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_stream_only_delta_cannot_reverse_its_interval() {
+    let Some(data) = keyframe_files().into_iter().find_map(|source| {
+        let data = std::fs::read(source).ok()?;
+        let (start, _) = summary_bounds(&data);
+        fourdgs::serialization::Records::new(&data[..start], 8)
+            .filter_map(|record| record.ok())
+            .any(|record| record.opcode == 0x12)
+            .then_some(data)
+    }) else {
+        return;
+    };
+    let (start, _) = summary_bounds(&data);
+    let mut unindexed = rebuilt(&data[..start], &[]);
+    let interval = fourdgs::serialization::Records::new(&unindexed, 8)
+        .map(|record| record.unwrap())
+        .find(|record| record.opcode == 0x12)
+        .map(|record| {
+            let t0 = f64::from_le_bytes(record.content[..8].try_into().unwrap());
+            (record.offset + 9 + 8, t0)
+        })
+        .expect("the fixture has a Delta Chunk");
+    unindexed[interval.0..interval.0 + 8].copy_from_slice(&(interval.1 - 1.0).to_le_bytes());
+    let path = fixture("fourdgs-cli-kd-reversed-delta.4dgs", &unindexed);
+
+    let out = run(&["validate", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains("Delta Chunk") && text.contains("before t0"),
+        "{text}"
+    );
+    std::fs::remove_file(path).ok();
 }
 
 #[test]

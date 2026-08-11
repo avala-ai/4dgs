@@ -527,6 +527,29 @@ fn validate_checked(data: &[u8]) -> Result<Report> {
         .as_ref()
         .is_some_and(|h| h.temporal_model == "keyframe-delta");
 
+    if keyframe_delta && !index.is_empty() {
+        let mut indexed_offsets = BTreeSet::new();
+        for (i, entry) in index.iter().enumerate() {
+            if !indexed_offsets.insert(entry.chunk_offset) {
+                report.error(format!(
+                    "chunk index entry {i} repeats state record byte {}; every physical state record has exactly one index entry",
+                    entry.chunk_offset
+                ));
+            }
+        }
+        for record in Records::new(data, MAGIC.len()).filter_map(|record| record.ok()) {
+            if matches!(record.opcode, op::CHUNK | op::DELTA_CHUNK)
+                && !indexed_offsets.contains(&(record.offset as u64))
+            {
+                report.error(format!(
+                    "the {} record at byte {} has no Chunk Index entry; streamed and indexed reads must see the same state records",
+                    op::name(record.opcode),
+                    record.offset
+                ));
+            }
+        }
+    }
+
     if let Some(header) = &header {
         // `gaussian_count` counts distinct gaussians over the whole sequence under
         // `keyframe-delta`, and every keyframe carries a full population — so the sum
@@ -936,6 +959,27 @@ fn check_keyframe_delta(
                 return Ok(());
             }
         };
+        if band_count != 0 && sequence.header.sh_degree != 0 {
+            let expected: Vec<u8> = (1..=sequence.header.sh_degree).collect();
+            let mut actual: Vec<u8> = entry.bands.iter().map(|(band, _, _)| *band).collect();
+            actual.sort_unstable();
+            if actual != expected {
+                let error = fourdgs::Error::Malformed(format!(
+                    "the {what} at index entry {i} has SH bands {actual:?}; its Header degree {} requires exactly {expected:?}",
+                    sequence.header.sh_degree
+                ));
+                report.refused(
+                    "a chunk does not decode: ",
+                    &error,
+                    Some(framing),
+                    Some(refusal::Site {
+                        offset: entry.chunk_offset,
+                        what: format!("the {what} record at index entry {i}"),
+                    }),
+                );
+                return Ok(());
+            }
+        }
         // Composing a chain reads Chunk and Delta Chunk records and nothing else, so an SH
         // Band Stream this entry names is a record the verdict never visited. A band is a
         // stream like any other: a codec this build does not implement in one of them is a
@@ -1067,6 +1111,12 @@ fn check_keyframe_delta_streamed(data: &[u8], framing: Framing, report: &mut Rep
                     Ok(())
                 }),
             op::DELTA_CHUNK => rec::parse_delta_chunk_records(content).and_then(|(declared, _)| {
+                if declared.t1 < declared.t0 {
+                    return Err(fourdgs::Error::Malformed(format!(
+                        "Delta Chunk at {} has t1 ({}) before t0 ({})",
+                        frame.offset, declared.t1, declared.t0
+                    )));
+                }
                 if declared.reference_offset >= frame.offset {
                     return Err(fourdgs::Error::Malformed(format!(
                         "Delta Chunk at {} references {}; a Delta Chunk must reference a physically earlier record",
@@ -1205,12 +1255,21 @@ fn check_keyframe_delta_streamed(data: &[u8], framing: Framing, report: &mut Rep
         }
     }
 
-    if let (Some(header), Some(end)) = (&header, previous_t1) {
-        if end != header.duration_sec {
-            report.error(format!(
-                "the state chunks end at {end}; the Header declares a duration of {}, and they tile the whole of it (section 11.1)",
-                header.duration_sec
-            ));
+    if let Some(header) = &header {
+        match previous_t1 {
+            Some(end) if end != header.duration_sec => {
+                report.error(format!(
+                    "the state chunks end at {end}; the Header declares a duration of {}, and they tile the whole of it (section 11.1)",
+                    header.duration_sec
+                ));
+            }
+            None if header.duration_sec > 0.0 => {
+                report.error(format!(
+                    "the file has no state chunks; the Header declares a positive duration of {}, which state chunks must tile from 0 (section 11.1)",
+                    header.duration_sec
+                ));
+            }
+            _ => {}
         }
         match identities.finish() {
             Ok(count) if count != header.gaussian_count => report.error(format!(
@@ -1578,6 +1637,20 @@ mod tests {
         let report = validate(&minimal_file(&grids()));
         assert!(report.ok(), "{:?}", errors(&report));
         assert!(errors(&report).is_empty(), "{:?}", errors(&report));
+    }
+
+    #[test]
+    fn a_positive_keyframe_delta_duration_requires_a_state_timeline() {
+        let report = validate(&minimal_file_headed(&["keyframe-delta"], &[grids()]));
+        assert!(!report.ok());
+        assert!(
+            errors(&report)
+                .iter()
+                .any(|message| message.contains("no state chunks")
+                    && message.contains("positive duration")),
+            "{:?}",
+            errors(&report)
+        );
     }
 
     #[test]

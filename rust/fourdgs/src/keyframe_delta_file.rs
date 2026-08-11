@@ -1273,6 +1273,39 @@ fn ranged_record<R: crate::Readable + ?Sized>(
     Ok((opcode, source.read(content_at, content_length)?))
 }
 
+/// Parse the known Header prefix without transferring an appended extension.
+///
+/// `Header::parse` deliberately ignores an unread trailer, so a prefix is sufficient as
+/// soon as all required length-prefixed fields are present. Grow the range geometrically
+/// up to the same fixed front-matter ceiling as the ordinary indexed reader; the record's
+/// declared length still tells the caller where the next record starts.
+fn ranged_header<R: crate::Readable + ?Sized>(
+    source: &mut R,
+    content_at: u64,
+    content_length: u64,
+) -> Result<rec::Header> {
+    const HEADER_PROBE: u64 = 8 * 1024;
+    let cap = content_length.min(crate::indexed_reader::MAX_FRONT_MATTER_BYTES);
+    let mut length = cap.min(HEADER_PROBE);
+    loop {
+        let prefix = source.read(content_at, length)?;
+        match rec::Header::parse(&prefix) {
+            Ok(header) => return Ok(header),
+            Err(Error::Truncated(message)) if length < cap => {
+                length = length.saturating_mul(2).max(1).min(cap);
+                let _ = message;
+            }
+            Err(Error::Truncated(message)) if content_length > cap => {
+                return Err(Error::Malformed(format!(
+                    "the Header's required fields do not fit in the {} byte front-matter ceiling: {message}",
+                    crate::indexed_reader::MAX_FRONT_MATTER_BYTES
+                )))
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn check_keyframe_temporal_model(model: &str) -> Result<()> {
     if model == "keyframe-delta" {
         return Ok(());
@@ -1471,11 +1504,11 @@ pub fn open_indexed<R: crate::Readable + ?Sized>(source: &mut R) -> Result<Index
         }
         match opcode {
             op::HEADER => {
-                let content = source.read(
+                let parsed = ranged_header(
+                    source,
                     at + crate::serialization::RECORD_HEADER_SIZE as u64,
                     content_length,
                 )?;
-                let parsed = rec::Header::parse(&content)?;
                 check_keyframe_temporal_model(&parsed.temporal_model)?;
                 header = Some(parsed);
             }
@@ -2263,6 +2296,42 @@ mod hostile_record_tests {
         assert_eq!(
             error.refusal_code(),
             Some(crate::error::refusal::UNKNOWN_TEMPORAL_MODEL)
+        );
+    }
+
+    #[test]
+    fn indexed_open_skips_an_extensible_header_trailer() {
+        let mut data = empty_indexed_file();
+        let old_footer_at =
+            data.len() - MAGIC.len() - crate::serialization::RECORD_HEADER_SIZE - 20;
+        let old_summary_start = u64::from_le_bytes(
+            data[old_footer_at + crate::serialization::RECORD_HEADER_SIZE
+                ..old_footer_at + crate::serialization::RECORD_HEADER_SIZE + 8]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let trailer = vec![0u8; 1024 * 1024];
+        let late = rec::Header {
+            duration_sec: 1.0,
+            aabb: vec![0.0; 6],
+            temporal_model: "keyframe-delta".into(),
+            ..Default::default()
+        }
+        .encode(&trailer);
+        data.splice(old_summary_start..old_summary_start, late.iter().copied());
+
+        let footer_at = old_footer_at + late.len();
+        let shifted_summary = (old_summary_start + late.len()) as u64;
+        data[footer_at + crate::serialization::RECORD_HEADER_SIZE
+            ..footer_at + crate::serialization::RECORD_HEADER_SIZE + 8]
+            .copy_from_slice(&shifted_summary.to_le_bytes());
+
+        let mut source = Watched::new(&data);
+        open_indexed(&mut source).unwrap();
+        assert!(
+            source.reads.iter().all(|(_, length)| *length <= 8 * 1024),
+            "the Header trailer was transferred: {:?}",
+            source.reads
         );
     }
 
