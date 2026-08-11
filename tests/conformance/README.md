@@ -19,10 +19,10 @@ the committed expectation.
 
 The `.4dgs` files are **generated, not committed** — `data/.gitignore` excludes them, and
 `generate.py` reconstructs them deterministically before every run. What is committed is the JSON
-expectations plus `data/CHECKSUMS.txt`, a SHA-256 per variant.
+expectations plus `data/CHECKSUMS.txt`, a SHA-256 for every generated file and expectation.
 
 `generate.py --verify` is the gate: it regenerates the corpus, asserts every checksum matches, and
-asserts that **two consecutive generator runs produce byte-identical files**. That second check is
+asserts that **two consecutive generator runs produce byte-identical outputs**. That second check is
 the one that catches accidental nondeterminism in an encoder — iteration order, a timestamp, a hash
 seed — which is otherwise invisible until someone else's CI fails.
 

@@ -12,11 +12,16 @@ releases/python/vX.Y.Z
 releases/rust/vX.Y.Z
 releases/dart/vX.Y.Z
 releases/typescript/<package>/vX.Y.Z
+releases/corpus/vX.Y.Z
 vX.Y.Z                        # Swift, and only Swift — see below
 ```
 
 for example `releases/python/v0.2.0` or `releases/typescript/core/v0.2.0`. Languages that ship one
 package do not repeat its name in the tag; TypeScript ships four, so it does.
+
+`releases/corpus/vX.Y.Z` is not a package. It publishes the conformance corpus as a downloadable
+archive, and it has its own namespace because the corpus changes when variants are added — which has
+nothing to do with any SDK's version, and would be misrepresented by borrowing one.
 
 Swift is the exception, and it is not a style choice — see
 [Swift tags look repository-wide and are not](#swift-tags-look-repository-wide-and-are-not).
@@ -63,6 +68,49 @@ there is nothing for the two to disagree about.
 **A missing changelog section fails the release.** `scripts/changelog_section.py` runs before the
 build, so a version nobody wrote notes for never reaches a registry; a release with an empty body is
 the drift this rule exists to prevent, and it is easier to refuse the tag than to fix it afterwards.
+
+## The conformance corpus
+
+The corpus is released like a package and is not one. It publishes to no registry, so the release
+_is_ the publication and the assets on it are the artifact of record — the one job here that
+attaches anything, for exactly the reason the others attach nothing.
+
+| Field      | Value                                                                                            |
+| ---------- | ------------------------------------------------------------------------------------------------ |
+| Tag        | `releases/corpus/vX.Y.Z`                                                                         |
+| Version    | `CORPUS_VERSION` in [`scripts/pack_corpus.py`](scripts/pack_corpus.py), asserted against the tag |
+| Changelog  | [`tests/conformance/CHANGELOG.md`](tests/conformance/CHANGELOG.md)                               |
+| Name       | `Conformance corpus 0.1.0`                                                                       |
+| Assets     | `4dgs-conformance-corpus-X.Y.Z.tar.gz` and its `.sha256`                                         |
+| Prerelease | set while the major version is `0`, as for every package                                         |
+
+To cut one:
+
+1. Add variants, regenerate, and let `generate.py --verify` and the conformance suite go green on
+   `main` — the corpus is published from `main` like everything else.
+2. Bump `CORPUS_VERSION` and write the section in `tests/conformance/CHANGELOG.md`. That file says
+   what a major, minor and patch bump each mean here; the short version is that a major changes the
+   archive's shape, a minor changes which variants are in it, and a patch repacks the same bytes.
+3. Read what the release will say, then tag:
+
+   ```sh
+   python scripts/changelog_section.py tests/conformance/CHANGELOG.md 0.1.0
+   python3 tests/conformance/generate.py && python3 scripts/pack_corpus.py --out dist --check /tmp/corpus
+   ```
+
+   The second command is what the job runs: it builds the archive, unpacks it somewhere else, and
+   verifies every checksum in its manifest. Build it locally before tagging and you will know what
+   the release page is going to carry.
+
+4. Push the tag. The job regenerates and verifies the corpus, builds the archive, unpacks it, scores
+   the reference implementation **against the unpacked copy**, and only then creates the release. An
+   archive nobody has decoded from is unverified, so that step is a gate rather than a nicety.
+5. Add the line to the release log in [CHANGELOG.md](CHANGELOG.md), as for a package.
+
+The version starts at **0.1.0** rather than 1.0.0 because the corpus is a rendering of a draft wire
+format: its bytes are determined by a specification whose minor versions may still change, so it
+cannot promise more stability than the thing it encodes. It goes to 1.0.0 when version 1 of the
+specification is declared stable.
 
 ## Naming
 
