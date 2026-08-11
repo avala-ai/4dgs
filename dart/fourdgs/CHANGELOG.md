@@ -92,6 +92,45 @@ Each ceiling names the byte, the record, the value and the expectation, so
 as `FourdgsChunkIndexEntry` already did, and the chunk parsers report where their stream blocks
 start.
 
+### Inspect and validate
+
+- **A `fourdgs` command.** `dart pub global activate fourdgs` puts `fourdgs inspect` and
+  `fourdgs validate` on the PATH. `inspect` walks the records — opcode by name, byte offset, content
+  and total length, and whether the Footer's summary checksum covers that record — reading nine
+  bytes per record and never a record's content, so it costs the same on a file carrying an hour of
+  audio as on one carrying none. `validate` checks a file against the specification and, for the
+  rules whose whole content is a refusal, names **which** rule and **which byte**. The identifiers
+  and the offsets are the ones the Python, Rust, TypeScript and C++ tools print for the same files;
+  the sentences around them are this decoder's own. The command lives in `bin/` and reaches for
+  `package:fourdgs/io.dart`, so the decoder itself stays free of `dart:io`.
+- **Exit codes a pipeline can act on**: `0` fine, `1` refused or invalid, `2` valid with warnings,
+  `3` the tool itself could not run. The last one is the point of the set — a tool that exits `1`
+  both for "I read the file and it is not conforming" and for "I fell over" is indistinguishable
+  from a broken tool, and nothing downstream can tell those apart after the fact.
+- **The validator decodes the chunks, one at a time.** A framing walk steps _over_ a chunk by its
+  declared length, which is exactly not looking inside it, so an unimplemented stream codec and an
+  out-of-range window index are invisible to it — and both are in the invalid corpus. Each chunk is
+  fetched by byte range from the index, decoded, and dropped before the next one, so a file larger
+  than memory is still validatable (AGENTS.md §1). A file with no index is walked frame by frame and
+  its chunks decoded the same way, rather than handed to the front-to-back reader, which would keep
+  every one of them.
+- **And their spherical-harmonic bands.** Each declared band record is decoded on its own, so a band
+  that will not decode is named at _its_ byte rather than at the chunk's. A validator that never
+  opened a whole record class would call a file with a corrupt band `valid`.
+- **`keyframe-delta` is validated against its own model.** The Header's declared model selects the
+  reader, and each chain is composed and dropped in turn — `composeKeyframeDeltaChain` is now public
+  for exactly that, since `decodeKeyframeDeltaIndexed` answers "what does this file decode to" and
+  therefore holds every composed state at once. Without this a conforming keyframe-delta file was
+  reported as broken for declaring a model this package implements.
+- **A truncated file reports what survived.** Records are length-prefixed, so everything complete
+  before the cut is intact and the streamed reader keeps it. Both commands say which byte the file
+  was cut at and how many whole records precede it, rather than printing one line and throwing the
+  rest away.
+- **`inspectFourdgs`, `validateFourdgs`, `walkFourdgsFraming` and `describeFourdgsRefusal`** are
+  exported from the library and take a `FourdgsReadable`, so everything the command does is
+  something a caller can do — which is what keeps a command-line tool from becoming a second,
+  undocumented implementation of the format.
+
 ### Refusal diagnosis
 
 - **Refusals say which rule was broken.** Every exception in this package now carries an optional

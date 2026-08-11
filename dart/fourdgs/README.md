@@ -133,6 +133,65 @@ Everything this package throws is a `FourdgsException`, which extends `FormatExc
 subtypes separate the cases worth telling apart: `FourdgsTruncatedFile`,
 `FourdgsUnsupportedVersion`, `FourdgsUnsupportedCodec` and `FourdgsMalformedFile`.
 
+## Inspect and validate from a shell
+
+`dart pub global activate fourdgs` puts a `fourdgs` command on the PATH, so a file a Flutter
+application will not open can be diagnosed without leaving the toolchain that application is built
+in.
+
+```console
+$ fourdgs inspect scene.4dgs
+      offset  record                    content           total  crc
+           0  (magic)                                         8  -
+           8  Header                        137             146  -
+         154  Quantization                  324             333  -
+         487  WindowTable                    20              29  -
+         516  Chunk                       1,849           1,858  -
+       2,374  ChunkIndex                     40              49  ok
+       2,423  Footer                         20              29  -
+       2,452  (magic)                                         8  -
+
+6 records, 2,460 bytes
+crc: the Footer's summary checksum covers bytes 2,374..2,423; `-` is a record it does not cover
+
+$ fourdgs validate broken.4dgs
+error: a chunk does not decode: window index 1 is outside the 1-entry window table
+  refusal window-index-out-of-range at byte 2506 (the Chunk record at index entry 1)
+INVALID
+```
+
+Exit codes, because they are the only part of a tool another program reads: `0` fine, `1` refused or
+invalid, `2` valid with warnings, `3` the tool itself could not run — a usage error, an unreadable
+path. A tool that exits `1` both for "I read the file and it is not conforming" and for "I fell
+over" is indistinguishable from a broken one.
+
+`validate` decodes every chunk and every declared spherical-harmonic band, one at a time, because a
+framing walk steps _over_ a chunk by its declared length and an unimplemented stream codec or an
+out-of-range window index lives inside one. `inspect` reads nine bytes per record and never touches
+a record's content, so it costs the same on a file with an embedded audio track as on one without. A
+truncated file is walked as far as it goes and then says where it was cut and how much of it a
+streamed reader still recovers.
+
+The same answers are available without the shell: `inspectFourdgs`, `validateFourdgs`,
+`walkFourdgsFraming` and `describeFourdgsRefusal` are exported from `package:fourdgs/fourdgs.dart`,
+and take a `FourdgsReadable` rather than a path.
+
+### Where this reports less than the Python validator
+
+The findings, their severities and their order are
+[`python/fourdgs/fourdgs/validate.py`](https://github.com/avala-ai/4dgs/blob/main/python/fourdgs/fourdgs/validate.py)'s,
+and the refusal identifiers and byte offsets are the same in every SDK. Two places where this one
+says less, deliberately, rather than saying something different:
+
+- **Non-finite quantization parameters, inverted chunk intervals and malformed Audio Source fields**
+  are refused by this package's record parsers rather than reported field by field, because Dart's
+  `double.floor()` on a NaN throws from inside arithmetic three call levels below the reader. So a
+  file Python reports five findings about arrives here as one `does not parse` error naming the
+  record. Same verdict, fewer sentences.
+- **The provenance registry checks** — a `metres_per_unit` that disagrees with its declared unit, a
+  principal point outside its image — need the parsed provenance records, and are not ported here,
+  exactly as they are not ported to the Rust, TypeScript or C++ validators.
+
 ## Scope
 
 Decoding ends at reconstructed gaussian state and reconstructed audio-source state at time `t`.
