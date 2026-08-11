@@ -202,6 +202,11 @@ void main() {
       // authored maximum rounds outward to the 1e-4 bin, so an AABB taken from
       // the input would exclude the point the file actually reconstructs.
       scene.positions[3] = 0.000075;
+      // The bin arithmetic is double but the decoder's lane is float32. Its
+      // negative maximum rounds upward on that final narrowing, so the AABB has
+      // to be measured after the same conversion rather than just from bins.
+      scene.positions[1] = -227.37311;
+      scene.positions[4] = -227.37305;
       final decoded = readFourdgsBytes(
         writeFourdgsBytes(
           scene,

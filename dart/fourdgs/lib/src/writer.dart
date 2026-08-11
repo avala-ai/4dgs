@@ -1317,11 +1317,18 @@ class _IndexEntry {
 List<double> _encodedAabb(Int32List positionBins, int count, _Grid grid) {
   if (count == 0) return List<double>.filled(6, 0.0);
   final out = List<double>.filled(6, 0.0);
+  final decoded = Float32List(1);
   for (int axis = 0; axis < 3; axis++) {
     double lo = double.infinity;
     double hi = double.negativeInfinity;
     for (int i = 0; i < count; i++) {
-      final v = positionBins[i * 3 + axis] * grid.stepPos + grid.origin[axis];
+      // `decodeChunk` lands positions in a Float32List. The bin arithmetic is
+      // double, and a negative maximum can round upward when narrowed; recording
+      // its pre-narrowing value would then advertise a maximum below the value
+      // the decoder actually returns.
+      decoded[0] =
+          positionBins[i * 3 + axis] * grid.stepPos + grid.origin[axis];
+      final v = decoded[0];
       if (v < lo) lo = v;
       if (v > hi) hi = v;
     }
