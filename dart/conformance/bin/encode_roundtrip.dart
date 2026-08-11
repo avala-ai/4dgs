@@ -23,6 +23,16 @@ import 'dart:io';
 
 import 'package:fourdgs/fourdgs.dart';
 
+/// The source's profile, unless it is one this preset cannot keep.
+///
+/// A profile is a promise about the file's contents, and this runner writes the
+/// gaussians alone — so `objects`, which promises an `object_id` stream and an
+/// Object Table, is a promise the output would break. Dropping it is the same
+/// choice the preset already makes about audio, cameras and attachments: what
+/// cannot be reproduced is not claimed, and the writer refuses the profile
+/// rather than writing a Header that says otherwise.
+String _writableProfile(String profile) => profile == 'objects' ? '' : profile;
+
 /// The gaussians alone: no audio, no camera, no metadata records, no
 /// attachments, no provenance. That is the whole point of this baseline — these
 /// authoring surfaces write gaussians, and a gate that compared whole scenes
@@ -39,7 +49,7 @@ String run(String input, String output) {
       writeSummaryOffsets: true,
       writeCrc: true,
       shBands: 3,
-      sceneProfile: scene.header.profile,
+      sceneProfile: _writableProfile(scene.header.profile),
       attributes: scene.header.attributes,
     ),
   );
@@ -58,7 +68,7 @@ String run(String input, String output) {
       writeSummaryOffsets: true,
       writeCrc: true,
       shBands: 3,
-      sceneProfile: scene.header.profile,
+      sceneProfile: _writableProfile(scene.header.profile),
       attributes: scene.header.attributes,
     ),
   );

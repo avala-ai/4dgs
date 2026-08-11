@@ -589,6 +589,95 @@ void main() {
       });
     }
 
+    test('the Header declares the highest band actually written', () {
+      // `shBands` caps what is emitted. The Header's degree is a statement about
+      // what the file carries, so it has to follow the cap: a degree-3 scene
+      // written with `shBands: 1` carries band 1 alone, and declaring 3 there
+      // would promise fifteen coefficients per component where three were
+      // written. Bands are whole and a reader takes them whole (spec §6.5).
+      final scene = buildScene(count: 32, shDegree: 3);
+      for (final cap in <int>[1, 2, 3]) {
+        final bytes = writeFourdgsBytes(
+          scene,
+          8.0,
+          options: FourdgsWriteOptions(shBands: cap),
+        );
+        final decoded = readFourdgsBytes(bytes);
+        expect(decoded.header.shDegree, cap, reason: 'shBands: $cap');
+        final bands =
+            recordsOf(
+              bytes,
+            ).where((FourdgsRecord r) => r.opcode == opShBandStream).length;
+        expect(bands, cap, reason: 'shBands: $cap');
+        // The two have to agree with each other, which is the whole point: a
+        // reader sizes the coefficient row from the degree.
+        expect(
+          decoded.gaussians.shCoefficients,
+          shBandRange[cap]!.last,
+          reason: 'shBands: $cap',
+        );
+      }
+    });
+
+    test('the coarse profile puts coefficients on the pitch it declares', () {
+      // `step_sh` is an encode-side value (spec §6.5): a decoder does nothing
+      // with it, which is exactly why the encoder must. A file that declares a
+      // pitch of 3 and writes every byte through has said something about
+      // itself that is not true, and the profile's SH allowance buys nothing.
+      final scene = buildScene(count: 64, shDegree: 2);
+      final coarse = readFourdgsBytes(
+        writeFourdgsBytes(
+          scene,
+          8.0,
+          options: const FourdgsWriteOptions(profile: 'coarse'),
+        ),
+      );
+      expect(coarse.quantization.stepSh, 3);
+      expect(coarse.quantization.bounds['sh'], '1');
+      final sh = coarse.gaussians.sh!;
+      for (int i = 0; i < sh.length; i++) {
+        // A bin centre, or the top of the byte range — the last bin's centre is
+        // 256 at this pitch, and a coefficient that left the byte would arrive
+        // at a reader as zero: the extreme positive coefficient read as the
+        // extreme negative one.
+        expect(
+          sh[i] % 3 == 1 || sh[i] == 255,
+          isTrue,
+          reason: 'coefficient $i is ${sh[i]}, off the pitch of 3 declared',
+        );
+      }
+      // Half the pitch is the promise, and it is kept against the input.
+      final pairing = _pairByPosition(scene, coarse.gaussians);
+      final row = 3 * scene.shCoefficients;
+      int worst = 0;
+      for (int j = 0; j < pairing.length; j++) {
+        final i = pairing[j];
+        for (int k = 0; k < row; k++) {
+          final d = (sh[j * row + k] - scene.sh![i * row + k]).abs();
+          if (d > worst) worst = d;
+        }
+      }
+      expect(worst, lessThanOrEqualTo(1));
+
+      // And the identity where the pitch is 1, which is what the other two
+      // profiles declare — the byte is stored as it arrived.
+      final fine = readFourdgsBytes(
+        writeFourdgsBytes(
+          scene,
+          8.0,
+          options: const FourdgsWriteOptions(profile: 'fine'),
+        ),
+      );
+      expect(fine.quantization.stepSh, 1);
+      final finePairing = _pairByPosition(scene, fine.gaussians);
+      for (int j = 0; j < finePairing.length; j++) {
+        final i = finePairing[j];
+        for (int k = 0; k < row; k++) {
+          expect(fine.gaussians.sh![j * row + k], scene.sh![i * row + k]);
+        }
+      }
+    });
+
     test('a scene with no harmonics declares degree 0 and writes no bands', () {
       final bytes = writeFourdgsBytes(buildScene(), 8.0);
       expect(readFourdgsBytes(bytes).header.shDegree, 0);
@@ -688,6 +777,101 @@ void main() {
           ),
         ),
       );
+    });
+
+    test('an inverted window is refused, an empty one is not', () {
+      // Visibility is gated on `lo <= t < hi`, so a window whose lower bound is
+      // above its upper covers no instant and the gaussian disappears from a
+      // file that otherwise looks well-formed — and this package's own reader
+      // refuses the Window Table record that carries it. Without this check the
+      // encoder hands back a file neither of its read paths will reopen.
+      final inverted = buildScene(count: 8);
+      inverted.winLo[6] = 5.0;
+      inverted.winHi[6] = 1.0;
+      expect(
+        () => writeFourdgsBytes(inverted, 8.0),
+        throwsA(
+          isA<FourdgsInvalidInput>().having(
+            (FourdgsInvalidInput e) => e.message,
+            'message',
+            allOf(contains('gaussian 6'), contains('5.0'), contains('1.0')),
+          ),
+        ),
+      );
+      // `lo == hi` stays legal: it is what a static asset's window says, and the
+      // NoData fixture is exactly that.
+      final empty = buildScene(count: 8);
+      empty.winLo[2] = 3.0;
+      empty.winHi[2] = 3.0;
+      expect(() => writeFourdgsBytes(empty, 8.0), returnsNormally);
+    });
+
+    test('a mu_t of a different length is a differently sized scene', () {
+      // `count` is `muT.length`, so `mu_t` is the ruler and not a lane that can
+      // disagree with it: passing a shorter or longer one describes a smaller or
+      // larger scene, and every other lane is then the wrong length. What has to
+      // hold is that this is *diagnosed by name* rather than reaching the
+      // quantizer and coming back as a RangeError about an index.
+      final scene = buildScene(count: 8);
+      for (final wrong in <int>[7, 9]) {
+        final bad = FourdgsGaussianSet(
+          positions: scene.positions,
+          scales: scene.scales,
+          rotations: scene.rotations,
+          colors: scene.colors,
+          motions: scene.motions,
+          muT: Float32List(wrong),
+          sigmaT: scene.sigmaT,
+          winLo: scene.winLo,
+          winHi: scene.winHi,
+        );
+        expect(bad.count, wrong);
+        expect(
+          () => writeFourdgsBytes(bad, 8.0),
+          throwsA(
+            isA<FourdgsInvalidInput>().having(
+              (FourdgsInvalidInput e) => e.message,
+              'message',
+              allOf(contains('positions'), contains('${wrong * 3}')),
+            ),
+          ),
+          reason:
+              'mu_t of length $wrong against 8 gaussians of everything else',
+        );
+      }
+    });
+
+    test('the objects profile is refused until its records are written', () {
+      // A profile is a promise about what the file contains. `objects` promises
+      // an object_id stream in every non-empty chunk and one Object Table, and
+      // this writer emits neither — so the Header would carry a promise the
+      // bytes below it do not keep, and no reader today enforces it.
+      expect(
+        () => writeFourdgsBytes(
+          buildScene(count: 8),
+          8.0,
+          options: const FourdgsWriteOptions(sceneProfile: 'objects'),
+        ),
+        throwsA(
+          isA<FourdgsInvalidInput>().having(
+            (FourdgsInvalidInput e) => e.message,
+            'message',
+            allOf(contains('objects'), contains('Object Table')),
+          ),
+        ),
+      );
+      // The profiles this writer can keep are unaffected.
+      for (final profile in <String>['', 'capture', 'baked']) {
+        expect(
+          () => writeFourdgsBytes(
+            buildScene(count: 8),
+            8.0,
+            options: FourdgsWriteOptions(sceneProfile: profile),
+          ),
+          returnsNormally,
+          reason: profile,
+        );
+      }
     });
 
     test('a NaN window is refused, an infinite one is not', () {

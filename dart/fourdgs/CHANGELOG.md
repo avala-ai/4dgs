@@ -28,16 +28,36 @@ happened.
   which summary records to write, and the Header's `profile`, `library` and attributes. The defaults
   are the reference encoders'.
 - Refusals name the field and the gaussian, not just the failure: a non-finite value in a lane that
-  lands on a grid, a NaN validity window, a NaN or `-inf` sigma, a bin outside the signed 32-bit
-  symbols a stream carries, an unknown profile, a cutoff outside `(0, 1]`. `+inf` is a value in
-  three places and is written as one — a never-fading `sigma_t`, and a `win_lo`/`win_hi` that says a
-  gaussian is present at every instant.
+  lands on a grid, a NaN validity window, a validity window whose lower bound is above its upper, a
+  NaN or `-inf` sigma, a bin outside the signed 32-bit symbols a stream carries, an unknown profile,
+  a cutoff outside `(0, 1]`. `+inf` is a value in three places and is written as one — a
+  never-fading `sigma_t`, and a `win_lo`/`win_hi` that says a gaussian is present at every instant.
+  An inverted window is refused rather than written because visibility is gated on `lo <= t < hi`:
+  it would cover no instant, and this package's own reader refuses the record carrying it, so
+  writing one produces a file neither read path can reopen.
+- The scene profile `objects` is refused. A profile is a promise about what the file contains, and
+  that one promises an `object_id` stream in every non-empty chunk and an Object Table (registry,
+  Profiles); this writer emits neither, so accepting it would put a claim in the Header that the
+  bytes below it do not keep.
+- The Header declares the spherical-harmonic degree the file actually carries, which is the highest
+  band written rather than the degree the input held: `shBands` caps what is emitted, and bands are
+  whole (§6.5), so a degree-3 scene written with `shBands: 1` is a degree-1 file.
+- Coefficients are quantized onto the pitch the Quantization record declares. `step_sh` is an
+  encode-side value — a decoder does nothing with it (§6.5) — which is exactly why the encoder must
+  apply it: the `coarse` profile declares a pitch of 3 and now writes on it. The top bin's centre is
+  clamped back into a byte, because at that pitch the coefficient 255 centres on 256 and would reach
+  a reader as 0, the extreme positive coefficient read as the extreme negative one.
 - Deterministic: two encodes of one scene are byte-identical, including the Header's attribute map,
   whose keys are sorted rather than emitted in whatever order the caller's map iterates.
-- Proved by `dart/encode-roundtrip.sh`, which re-encodes all 46 corpus variants and requires the
-  Dart and Python decoders to produce identical canonical JSON from every result, on both read paths
-  in each language. It runs in the conformance workflow. An encoder checked only by its own decoder
-  proves that two halves of one implementation share an opinion.
+- Proved by `dart/encode-roundtrip.sh`, which re-encodes all 46 corpus variants and makes two
+  separate claims about each result. **Fidelity**: the written scene is compared against the scene
+  it was written from, by the Python reference reader, attribute by attribute, against the error
+  bounds the written file itself declares — including the per-gaussian velocity and birth-time
+  pitches, derived the way a decoder derives them. **Agreement**: the Dart and Python decoders must
+  produce identical canonical JSON from the result, on both read paths in each language. Neither
+  implies the other. Four decoders reading one file the same way say nothing about whether that file
+  is the scene that went in, and an encoder checked only by its own decoder proves that two halves
+  of one implementation share an opinion. It runs in the conformance workflow.
 
 ### Hostile-input hardening
 

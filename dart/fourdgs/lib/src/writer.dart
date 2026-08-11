@@ -145,6 +145,22 @@ Uint8List writeFourdgsBytes(
       'write deflate, which every reader implements',
     );
   }
+  // A profile is a promise about what the file contains, made so a consumer can
+  // reject an unsuitable file up front rather than discovering the absence
+  // mid-decode. `objects` promises an `object_id` stream in every non-empty
+  // chunk and one Object Table (registry, Profiles), and this writer emits
+  // neither record — it has no code to. Writing the string anyway would put a
+  // promise in the Header that the bytes below it do not keep, and no reader
+  // today enforces it, so the file would circulate as an objects file and fail
+  // whenever something finally checked. Refusing names what is missing;
+  // silently downgrading to "" would throw away what the caller asked for.
+  if (options.sceneProfile == 'objects') {
+    throw FourdgsInvalidInput(
+      'the scene profile "objects" promises an object_id stream in every '
+      'non-empty chunk and one Object Table, and this writer emits neither; '
+      'write the object layer first or leave the profile empty',
+    );
+  }
   _checkInput(gaussians, options.cutoff);
 
   final n = gaussians.count;
@@ -161,12 +177,18 @@ Uint8List writeFourdgsBytes(
 
   final out = _ByteWriter(4096);
   out.bytes(fourdgsMagic);
+  // The degree the file actually carries, which is the highest band written and
+  // not the degree the input happened to hold. `shBands` caps what is emitted,
+  // so a degree-3 scene written with `shBands: 1` carries band 1 alone — three
+  // coefficients per component — and declaring 3 there would promise fifteen.
+  // Bands are whole and a reader takes them whole (spec §6.5): bands 1..D give
+  // exactly a degree-D scene, so D is a count of what is present.
   out.bytes(
     _header(
       gaussians,
       durationSec,
       options,
-      bands.isEmpty ? 0 : gaussians.shDegree,
+      bands.isEmpty ? 0 : bands.last.band,
     ),
   );
   out.bytes(_quantizationRecord(grid, windows));
@@ -197,7 +219,13 @@ Uint8List writeFourdgsBytes(
 
     final entryBands = <_IndexBand>[];
     for (final band in bands) {
-      final blob = _bandRecord(gaussians, band, plan.members, options);
+      final blob = _bandRecord(
+        gaussians,
+        band,
+        plan.members,
+        options,
+        grid.stepSh,
+      );
       final at = out.length;
       out.bytes(blob);
       entryBands.add(_IndexBand(band.band, at, blob.length));
@@ -271,6 +299,13 @@ void _checkInput(FourdgsGaussianSet g, double cutoff) {
   _checkLength('rotations', g.rotations.length, n * 4);
   _checkLength('colors', g.colors.length, n * 4);
   _checkLength('motions', g.motions.length, n * 3);
+  // `mu_t` is deliberately absent from this list, and it is the one lane that
+  // cannot be checked here: `FourdgsGaussianSet.count` *is* `muT.length`, so it
+  // is the ruler the other eight are measured against rather than another lane
+  // to measure. A caller who passes a short `mu_t` has described a smaller
+  // scene, and every other lane is then too long — which is caught above, by
+  // name, on the first one. There is no length it can hold that reaches the
+  // quantizer unchecked.
   _checkLength('sigma_t', g.sigmaT.length, n);
   _checkLength('win_lo', g.winLo.length, n);
   _checkLength('win_hi', g.winHi.length, n);
@@ -312,6 +347,26 @@ void _checkInput(FourdgsGaussianSet g, double cutoff) {
           'comparison false, so the gaussian silently never appears',
         );
       }
+    }
+  }
+
+  // Ordering, which the NaN check above does not imply. Visibility is gated on
+  // `lo <= t < hi`, so an inverted window covers no instant and the gaussian
+  // disappears from a file that otherwise looks entirely well-formed. This
+  // reader refuses such a window when it reads one back
+  // (`FourdgsWindowTable.parse`), so without this check the encoder can hand
+  // back a file neither of its own read paths will reopen — the one output a
+  // writer must never produce. `lo == hi` stays legal: the empty window is how
+  // a static asset's index spells "no extent", and the NoData fixture is
+  // exactly that.
+  for (int i = 0; i < n; i++) {
+    if (g.winHi[i] < g.winLo[i]) {
+      throw FourdgsInvalidInput(
+        'gaussian $i has the validity window [${g.winLo[i]}, ${g.winHi[i]}), '
+        'whose lower bound is above its upper; visibility is gated on '
+        'lo <= t < hi, so it would cover no instant and this reader refuses '
+        'the Window Table record it would be written into',
+      );
     }
   }
 }
@@ -866,6 +921,7 @@ Uint8List _bandRecord(
   _BandColumns band,
   List<int> members,
   FourdgsWriteOptions options,
+  int stepSh,
 ) {
   final sh = g.sh!;
   final row = g.shCoefficients * 3;
@@ -873,7 +929,7 @@ Uint8List _bandRecord(
   int at = 0;
   for (final i in members) {
     for (final column in band.columns) {
-      values[at++] = sh[i * row + column];
+      values[at++] = _coarsenSh(sh[i * row + column], stepSh);
     }
   }
   final payload = _ByteWriter(values.length + 32);
@@ -882,6 +938,37 @@ Uint8List _bandRecord(
     _encodeStream(opShBandStream, values, band.columns.length, options),
   );
   return _record(opShBandStream, payload.finish());
+}
+
+/// One coefficient byte on the pitch the Quantization record declares.
+///
+/// `step_sh` is an encode-side value (spec §6.5): a decoder does nothing with
+/// it, and the stored byte is the coefficient. That is exactly why it has to be
+/// applied here — the record declares the pitch the encoder used, so an encoder
+/// that declares 3 and writes every byte through has written a number about
+/// itself that is not true, and the `coarse` profile's SH allowance buys
+/// nothing. `fine` and `default` declare a bound of 0 and a pitch of 1, where
+/// this is the identity.
+///
+/// Rounding is to the bin centre, which is what makes the bound half the pitch
+/// rather than the whole of it, and it makes the operation idempotent: a
+/// coefficient already on the grid is left where it is. The floor is taken
+/// rather than a truncation so a negative code — which a version-1 file cannot
+/// hold, since coefficients are `u8`, but a caller can pass — lands on the same
+/// grid as a positive one.
+///
+/// The result is clamped back into a byte, and that is not defensive. The top
+/// bin's centre is above the top of the range whenever the pitch does not
+/// divide 256: at a pitch of 3, the coefficient 255 centres on 256, which
+/// travels through the stream as a 32-bit symbol and arrives at a reader as
+/// **zero** — the extreme positive coefficient read as the extreme negative
+/// one, in a file that decodes without complaint. Clamping moves the value
+/// towards the original, so the declared half-pitch bound is kept a fortiori.
+int _coarsenSh(int value, int step) {
+  if (step <= 1) return value;
+  final floored = (value >= 0 ? value : value - step + 1) ~/ step;
+  final centred = floored * step + step ~/ 2;
+  return centred < 0 ? 0 : (centred > 255 ? 255 : centred);
 }
 
 // --------------------------------------------------------------------------
