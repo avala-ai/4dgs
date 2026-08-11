@@ -324,6 +324,12 @@ One variant, in `data/invalid/`, because after this proposal the file is not a l
   observe the late record; an implementation that scans farther may instead issue the specified
   refusal. Both behaviours conform. The suite therefore pins the streamed refusal only rather than
   turning the indexed reader's permission to stop early into a requirement to skip the record.
+- **Both temporal-model stream loops are exercised.** At least one late Window Table case is built
+  once with a `gaussian-birth` Header and once with a `keyframe-delta` Header. The latter is decoded
+  through the keyframe-delta front-to-back entry point, whose record loop is independent of the
+  ordinary streamed decoder. Both expectations name the late opcode and offset. This prevents a
+  shared corpus rule from being "implemented" only in the path reached by the other late-record
+  files while keyframe-delta silently skips the same misplaced front matter.
 
 Neither variant regenerates anything. The corpus gains files; nothing existing moves.
 

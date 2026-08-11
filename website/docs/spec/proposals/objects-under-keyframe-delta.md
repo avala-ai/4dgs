@@ -296,16 +296,22 @@ one.
 >
 > The optional-stream rule in §6.6 applies to every composed state: when the reference state omits
 > `object_id`, it logically carries an all-zero column, one zero for every live gaussian. An update
-> MAY introduce the stream by restating non-zero ids for any subset; the composer materializes the
-> zero column before applying those absolute replacements, and unmentioned gaussians remain zero.
-> When the reference already carries `object_id`, omitting it from an update means no restatement:
-> every updated gaussian keeps its reference id, just as it keeps any other attribute absent from
-> the update group. Omission does not replace an existing id with zero. When a birth group first
-> introduces `object_id`, the composer likewise materializes zeros for every surviving reference row
-> before appending the births' absolute values; the resulting column has one value for every row in
-> the composed population, not only for the births. Likewise, a birth group that omits `object_id`
-> gives each birth id zero even when the surviving reference population already carries the column.
-> Physical omission is therefore not an update-attribute mismatch and MUST NOT be refused as one.
+> MAY introduce the stream for any subset of the live population by including those gaussians in its
+> single `gaussian_id` stream. Once the update group physically carries `object_id`, however, that
+> stream has exactly `update_count` rows, aligned one-for-one with the id stream like every other
+> present update attribute (§5.18). It restates a value for **every** gaussian in the group: rows
+> whose id is unchanged repeat their reference value, including zero. There is no shorter
+> `object_id` sub-lane and no sentinel for "unmentioned" inside a present stream. Gaussians omitted
+> from the update group keep their reference values. The composer materializes the implicit zero
+> column before applying the aligned absolute replacements. When the reference already carries
+> `object_id`, omitting it from an update means no restatement: every updated gaussian keeps its
+> reference id, just as it keeps any other attribute absent from the update group. Omission does not
+> replace an existing id with zero. When a birth group first introduces `object_id`, the composer
+> likewise materializes zeros for every surviving reference row before appending the births'
+> absolute values; the resulting column has one value for every row in the composed population, not
+> only for the births. Likewise, a birth group that omits `object_id` gives each birth id zero even
+> when the surviving reference population already carries the column. Physical omission is therefore
+> not an update-attribute mismatch and MUST NOT be refused as one.
 >
 > A producer deriving a delta from two complete states MUST normalize omission on **both** sides
 > before differencing: an absent `object_id` column is a full zero column in the reference and in
@@ -400,6 +406,11 @@ carries every corner the rules above decide.
 - **Omitted update lanes carry forward.** Add a position-only update for a gaussian already on id
   `7`; its canonical `objectIds` value remains `7` and its track still applies. This distinguishes
   update omission from the implicit zero assigned by an omitted complete-keyframe or birth lane.
+- **Present update lanes cover the whole group.** In one mixed two-gaussian update, change only the
+  position of gaussian A and relabel only gaussian B. The shared `gaussian_id` stream names A and B,
+  so the present `object_id` stream has two rows: A repeats its absolute reference id (zero in the
+  introduction case) and B states its new id. The expectation catches both a writer that emits a
+  one-row object lane and a reader that applies B's value to A by treating the lane as sparse.
 - **Omitted complete-state lanes normalize to zero.** After the same gaussian reaches id `12`, the
   next complete source sample omits `object_id`. The writer must detect the nonzero-to-zero change
   and physically emit an absolute zero update; the canonical state becomes untracked. This is the

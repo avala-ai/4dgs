@@ -8,7 +8,7 @@ goes instead, and §5.4 says why none of it belongs in [the specification](../in
 
 The canonical form promises that nothing it emits depends on decoded order. Its `states` member —
 the post-track reconstruction the object layer exists to prove — breaks that promise in two places,
-and this proposal recommends one fix for each.
+and this proposal recommends a portable fix for each.
 
 ---
 
@@ -165,38 +165,37 @@ port.
   `(s + a) + b` and `(s + b) + a` are not equal in general. Fix (1a) narrows that run to rows whose
   emitted values are identical; it does not make the _unrounded_ addends identical.
 
-**(2b) Make the sum provably order-free by sorting the addends.** Sort each axis's values and sum
-ascending. The result then depends only on the multiset of addends: equal values permute without
-effect, so any reordering gives the identical total.
+**(2b) Sum exact canonical integer units.** First apply the canonical form's existing
+`FLOAT_DECIMALS` rounding to each addend, convert the result to a signed integer count of
+`10^-FLOAT_DECIMALS` units, and add those integers exactly. Convert the final integer back only when
+serializing the aggregate. The sum then depends only on the multiset of values the canonical form
+actually emits, not on row order or a language's floating-point addition.
 
-- Cost: an `O(n log n)` sort per axis per probe in six languages, and a rule ("ascending, ties
-  irrelevant") that every port must implement identically. Real, and small.
-- This is the only option that actually discharges the promise. It is not recommended **now** only
-  because nothing can detect the difference between it and (2a) until a variant exists that ties,
-  and a rule nobody can test is a rule that drifts.
+- Cost: one rounding and integer conversion per addend, with an accumulator wide enough for the
+  corpus limit. Each port must use the same already-shared canonical rounding rule and reject an
+  aggregate whose declared population could overflow its accumulator. This is `O(n)` and needs no
+  sort.
+- This is the only option here that discharges both parts of the promise. Sorting raw floats is not
+  sufficient: equivalent cross-language computations may differ in their last bits, which can change
+  both the sorted order of close addends and a non-associative result.
 
-**(2c) Exactly-rounded summation** (`math.fsum` and its equivalents). Order-free by construction,
-and the most expensive: only Python has it in the standard library, and hand-rolling exact summation
-in six languages is the easiest of these three to get subtly different between ports. Rejected on
-cost.
+**(2c) Exact binary floating-point summation** (`math.fsum` and equivalents). Order-free for one
+fixed collection of binary inputs, but not portable when independently computed inputs differ in
+their last bits. Only Python has it in the standard library, too. Rejected on portability and cost.
 
 ---
 
 ## 4. Recommendation
 
-**Adopt (1a) and (2a). Name (2b) as the follow-up that a residual-sum variant would justify.**
+**Adopt (1a) and (2b).**
 
 - **(1a)** because it is the only fix that restores `_stable_order`'s argument at the level where
   the values are emitted, and it does so without touching the rounding that makes the key portable.
-- **(2a)** because it makes the reference internally consistent — the defect #95 actually names —
-  and costs one expression per aggregate. It does not fully discharge the promise, and §5.2's text
-  says that in the docstring rather than leaving a future reader to assume otherwise.
-- **(2b) deferred**, with a named trigger: once a corpus variant contains rows that still tie after
-  the secondary emitted-row key while their unrounded addends make the two summation orders cross a
-  six-decimal boundary, (2a)'s residual becomes detectable. At that point sorting the addends is
-  worth the separate language changes. Doing it before then means shipping a rule nothing checks.
+- **(2b)** because summing exact canonical units makes the aggregate a function of the emitted
+  multiset and gives all six languages the same arithmetic. The adversarial tied-row pair in §6
+  makes the rule observable, so it does not ship as an untested convention.
 
-### What regenerating expectations costs: nothing, and this was measured
+### What regeneration costs, and what was measured
 
 The corpus was regenerated into a scratch directory and every variant carrying a `states` member was
 examined. `states` is emitted only when a file carries the object layer (`canonical.py:183-187`),
@@ -218,7 +217,11 @@ the format says means nothing — and it is **currently harmless**, because thes
 well-conditioned enough that both orders round to the same six decimals. And there are no ties
 anywhere, so (1a) reorders nothing.
 
-So the cost of (1a) and (2a) is: **zero existing expectation bytes**, in any of the six languages.
+So the measured cost of (1a) and the weaker (2a) is zero existing expectation bytes. The recommended
+(2b) deliberately changes how each addend is rounded before aggregation; the bottom implementation
+PR must regenerate and review the four affected expectations rather than assuming that this
+measurement covers the stronger arithmetic.
+
 Delivery follows the repository's stacked-PR rule: the corpus, reference canonical and Python runner
 form the bottom layer; Rust, TypeScript, Dart, C++ and Swift each get their own language-only layer,
 targeting the branch below. Merge and rebase them bottom-up. The affected ports are
@@ -236,9 +239,9 @@ same fix regenerate its new expectation.
 
 > **Nothing here may depend on decoded order.** Gaussians may be reordered freely by an encoder and
 > readers must not rely on their order, so a summary that did would be asking two correct decoders
-> to disagree. Everything per-gaussian — the sample, the aggregates, the spherical harmonic digest —
-> is taken in the content order defined by `_stable_order`, which is derived from decoded values
-> alone.
+> to disagree. Per-gaussian rows and the spherical harmonic digest use the content order defined by
+> `_stable_order`; aggregates sum exact integer units after the same canonical rounding used for
+> emitted values, so their result is a function of the multiset rather than an iteration order.
 >
 > That order rounds to `FLOAT_DECIMALS` before comparing, which is deliberate — two implementations
 > can compute a decoded value to different last bits, and an order keyed on exact values would
@@ -252,16 +255,11 @@ same fix regenerate its new expectation.
 
 ### 5.2 `canonical.py`, as a comment on the `states` aggregate
 
-> Summed over the content-ordered live rows, not over the resident ones, matching the root aggregate
-> at the top of `summarize`. Resident order is the order the file stored, which §6.1 says means
-> nothing, and floating-point addition is not associative: two files differing only by a legal
-> reordering would otherwise reach different totals.
->
-> This narrows the exposure rather than removing it. Rows that tie on the content key form a
-> contiguous run, and permuting a run of addends can still change a total — `(s + a) + b` is not
-> `(s + b) + a` in general. Making the sum provably order-free means sorting the addends and summing
-> ascending, so the result depends only on their multiset. That is deferred until a variant exists
-> that can tell the two apart; a rule nothing checks is a rule that drifts.
+> Each addend is rounded by the canonical `num` rule and converted to an integer count of
+> `10^-FLOAT_DECIMALS` units before summation. The integer sum is exact and therefore depends only
+> on the multiset, never resident or decoded order. Sorting and then adding raw floats would still
+> be non-portable: equivalent computations in different languages may differ in their last bits and
+> therefore sort or sum differently.
 
 ### 5.3 `tests/conformance/README.md`, replacing the "nothing depends on decoded order" bullet
 
@@ -271,8 +269,9 @@ same fix regenerate its new expectation.
 >   on it and still hold different exact values — harmless wherever the emitted values are the keyed
 >   fields, and not harmless in `states`, whose rows are composed at a probe time from inputs the
 >   key sees only rounded. The `states` block therefore orders by the content key and then by the
->   rounded values it emits, and sums its aggregates over that order rather than over the order the
->   file stored.
+>   rounded values it emits. Its aggregates round each addend to canonical integer units and sum
+>   those units exactly, making them independent of both storage order and floating-point addition
+>   order.
 
 ### 5.4 Nothing in `website/docs/spec/index.md`
 
