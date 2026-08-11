@@ -32,6 +32,7 @@ library;
 export 'src/chunk_decoder.dart';
 export 'src/exceptions.dart';
 export 'src/indexed_reader.dart';
+export 'src/inspect.dart';
 export 'src/keyframe_delta.dart';
 export 'src/model.dart';
 export 'src/objects.dart';
@@ -40,8 +41,10 @@ export 'src/provenance.dart';
 export 'src/quantization.dart';
 export 'src/readable.dart';
 export 'src/records.dart';
+export 'src/refusal.dart';
 export 'src/serialization.dart';
 export 'src/stream_reader.dart';
+export 'src/validate.dart';
 
 /// This package's version, and the single source of truth for it.
 ///
