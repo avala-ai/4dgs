@@ -127,6 +127,24 @@ interface Column {
   readonly values: Int32Array;
 }
 
+/** One immutable append in a persistent SH band. */
+interface ShBandSegment {
+  readonly values: Int32Array;
+  readonly previous: ShBandSegment | null;
+}
+
+/**
+ * A band's rows without flattening every inherited coefficient after each birth.
+ *
+ * Delta states are retained in a decoded sequence. A flat array would therefore copy the
+ * whole live band for every birth and turn a one-row-at-a-time chain into quadratic retained
+ * memory. Each state instead owns one constant-size tail node and shares its immutable prefix.
+ */
+interface ShBandColumn {
+  readonly tail: ShBandSegment | null;
+  readonly length: number;
+}
+
 function columnRows(column: Column): number {
   return column.channels === 0 ? 0 : column.values.length / column.channels;
 }
@@ -142,7 +160,7 @@ function columnRows(column: Column): number {
  * a language feature will do.
  */
 let binsOf!: (state: KeyframeDeltaState) => Map<number, Column>;
-let bandsOf!: (state: KeyframeDeltaState) => Map<number, Int32Array>;
+let bandsOf!: (state: KeyframeDeltaState) => Map<number, ShBandColumn>;
 
 /**
  * A composed population: identities, one bin column per attribute, and stored SH bands.
@@ -155,7 +173,7 @@ let bandsOf!: (state: KeyframeDeltaState) => Map<number, Int32Array>;
  */
 export class KeyframeDeltaState {
   readonly #bins: Map<number, Column>;
-  readonly #bands: Map<number, Int32Array>;
+  readonly #bands: Map<number, ShBandColumn>;
 
   static {
     binsOf = (state) => state.#bins;
@@ -165,7 +183,7 @@ export class KeyframeDeltaState {
   constructor(
     readonly ids: Int32Array,
     bins: Map<number, Column>,
-    bands: Map<number, Int32Array> = new Map(),
+    bands: Map<number, ShBandColumn> = new Map(),
   ) {
     this.#bins = bins;
     this.#bands = bands;
@@ -255,7 +273,7 @@ function applyDelta(
   // --- deaths -----------------------------------------------------------
   let ids = state.ids;
   let bins = new Map<number, Column>(binsOf(state));
-  let bands = new Map<number, Int32Array>();
+  let bands = new Map<number, ShBandColumn>();
 
   if (deathIds.length > 0) {
     const live = new Set<number>(ids);
@@ -274,7 +292,11 @@ function applyDelta(
     for (const [attribute, column] of bins) kept.set(attribute, selectRows(column, keep));
     bins = kept;
     for (const [band, values] of bandsOf(state)) {
-      bands.set(band, selectBandRows(values, coefficientsInBand(band) * 3, keep));
+      const selected = selectBandRows(values, coefficientsInBand(band) * 3, keep);
+      bands.set(band, {
+        tail: { values: selected, previous: null },
+        length: selected.length,
+      });
     }
   } else {
     // Copied because updates mutate columns in place, and the reference must not change
@@ -423,14 +445,60 @@ function selectRows(column: Column, rows: readonly number[]): Column {
   return { channels: ch, values: out };
 }
 
-function selectBandRows(values: Int32Array, channels: number, rows: readonly number[]): Int32Array {
+function selectBandRows(
+  column: ShBandColumn,
+  channels: number,
+  rows: readonly number[],
+): Int32Array {
   const out = new Int32Array(rows.length * channels);
+  const segments: ShBandSegment[] = [];
+  for (let segment = column.tail; segment !== null; segment = segment.previous) {
+    segments.push(segment);
+  }
+  segments.reverse();
+  const starts: number[] = [];
+  let total = 0;
+  for (const segment of segments) {
+    starts.push(total);
+    total += segment.values.length;
+  }
+  if (total !== column.length) {
+    throw new MalformedFile(
+      `an internal SH band chain carries ${total} values, its state records ${column.length}`,
+    );
+  }
   for (let r = 0; r < rows.length; r++) {
     const src = rows[r]! * channels;
     const dst = r * channels;
-    out.set(values.subarray(src, src + channels), dst);
+    let lo = 0;
+    let hi = starts.length;
+    while (lo + 1 < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (starts[mid]! <= src) lo = mid;
+      else hi = mid;
+    }
+    const segment = segments[lo];
+    if (segment === undefined || src + channels > starts[lo]! + segment.values.length) {
+      throw new MalformedFile(
+        `SH row ${rows[r]} is outside a ${column.length / channels}-row composed band`,
+      );
+    }
+    const within = src - starts[lo]!;
+    out.set(segment.values.subarray(within, within + channels), dst);
   }
   return out;
+}
+
+function selectedBands(
+  state: KeyframeDeltaState,
+  rows: readonly number[],
+): Map<number, Int32Array> {
+  return new Map(
+    [...bandsOf(state)].map(([band, column]) => [
+      band,
+      selectBandRows(column, coefficientsInBand(band) * 3, rows),
+    ]),
+  );
 }
 
 function checkUnique(ids: Int32Array, what: string): void {
@@ -620,10 +688,10 @@ function attachShBand(
         `of ${channels} channels`,
     );
   }
-  const merged = new Int32Array((priorRows + addedRows) * channels);
-  if (inherited !== undefined) merged.set(inherited, 0);
-  merged.set(values, priorRows * channels);
-  bands.set(band, merged);
+  bands.set(band, {
+    tail: { values, previous: inherited?.tail ?? null },
+    length: (inherited?.length ?? 0) + values.length,
+  });
 }
 
 /** Every state carries exactly the contiguous band set its Header declares. */
@@ -1594,7 +1662,14 @@ async function attachIndexedShBands(
   codecs: CodecRegistry,
 ): Promise<void> {
   const attached = new Set<number>();
+  let expectedOffset = entry.chunkOffset + entry.chunkLength;
   for (const range of entry.bands) {
+    if (range.offset !== expectedOffset) {
+      throw new MalformedFile(
+        `state chunk at byte ${entry.chunkOffset} indexes SH band ${range.band} at byte ` +
+          `${range.offset}, but its trailing SH records place that band at byte ${expectedOffset}`,
+      );
+    }
     const record = await read(range.offset, range.length);
     if (record.opcode !== Opcode.ShBandStream) {
       throw new MalformedFile(
@@ -1620,6 +1695,7 @@ async function attachIndexedShBands(
       where,
       attached,
     );
+    expectedOffset += range.length;
   }
 }
 
@@ -1870,7 +1946,7 @@ export function reconstructKeyframeDelta(
     const emptySh =
       sequence.header.shDegree === 0
         ? null
-        : mergeBands(0, bandsOf(state), sequence.header.shDegree);
+        : mergeBands(0, selectedBands(state, []), sequence.header.shDegree);
     return {
       t,
       count: 0,
@@ -1936,16 +2012,7 @@ export function reconstructKeyframeDelta(
   const composedSh =
     sequence.header.shDegree === 0
       ? null
-      : mergeBands(
-          visible,
-          new Map(
-            [...bandsOf(state)].map(([band, values]) => [
-              band,
-              selectBandRows(values, coefficientsInBand(band) * 3, order),
-            ]),
-          ),
-          sequence.header.shDegree,
-        );
+      : mergeBands(visible, selectedBands(state, order), sequence.header.shDegree);
   if (composedSh !== null && composedSh.degree !== sequence.header.shDegree) {
     throw new MalformedFile(
       `state chunk at byte ${chunk.offset} reconstructs SH degree ${composedSh.degree}, the ` +
