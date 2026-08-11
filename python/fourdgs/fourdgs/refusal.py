@@ -410,7 +410,7 @@ def scan_front_to_back(data: bytes, where: Walk) -> ChunkRefusal | None:
     """
     from .quantization import DEFAULT_CUTOFF
     from .serialization import Cursor, decode_stream
-    from .stream_reader import chunk_stream_bytes, decode_streams, steps_from
+    from .stream_reader import check_sh_codes, chunk_stream_bytes, decode_streams, steps_from
 
     quant: rec.Quantization | None = None
     windows: list[tuple[float, float]] = []
@@ -509,6 +509,7 @@ def scan_front_to_back(data: bytes, where: Walk) -> ChunkRefusal | None:
                         f"shape {values.shape}; its owning Chunk requires {expected_shape}",
                         code="stream-element-count-mismatch",
                     )
+                check_sh_codes(values, f"the SH Band Stream at {frame.offset}")
                 bands.append(band)
             except FourdgsError as exc:
                 return ChunkRefusal(exc, here)

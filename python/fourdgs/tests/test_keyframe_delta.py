@@ -310,6 +310,27 @@ def test_a_gap_or_an_overlap_in_the_tiling_is_refused():
         assert caught.value.code == "non-tiling-chunks"
 
 
+def test_an_inverted_index_interval_is_refused_before_adjacency():
+    with pytest.raises(MalformedFile) as caught:
+        kd.check_tiling([_entry(0.0, 2.0, 100), _entry(2.0, 1.0, 200)])
+    assert caught.value.code == "non-tiling-chunks"
+    assert "expected finite t0 and t1 >= t0" in str(caught.value)
+
+
+def test_absolute_bins_stay_in_the_signed_i32_domain():
+    too_large = np.iinfo(np.int32).max + 1
+    with pytest.raises(MalformedFile) as caught:
+        kd.keyframe_state(np.array([7]), {op.A_POSITION: np.array([[too_large, 0, 0]])})
+    assert caught.value.code == "bin-overflow"
+
+
+def test_rotation_indexes_are_checked_on_composed_state():
+    with pytest.raises(MalformedFile) as caught:
+        kd.keyframe_state(np.array([7]), {op.A_ROTATION_INDEX: np.array([[4]])})
+    assert caught.value.code == "rotation-index-out-of-range"
+    assert "expected 0..3" in str(caught.value)
+
+
 def test_a_forward_reference_is_refused():
     index = [_entry(0.0, 1.0, 100), _entry(1.0, 2.0, 200, kind=1, reference=300, keyframe=100, depth=1)]
     with pytest.raises(Exception) as caught:

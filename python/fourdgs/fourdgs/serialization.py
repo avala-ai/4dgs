@@ -408,5 +408,25 @@ def decode_stream(cursor: Cursor) -> tuple[int, np.ndarray]:
     return attribute_id, vals
 
 
+def decode_stream_or_skip(cursor: Cursor, known: set[int] | frozenset[int]) -> tuple[int, np.ndarray | None]:
+    """Decode a known attribute, or skip an unknown one by its framed payload.
+
+    Unknown attributes are the format's extension seam. Their codec, symbol
+    width, mode, and channel semantics belong to the revision that defines the
+    attribute; this reader needs only the common header's ``payload_len`` to
+    reach the next stream without interpreting any of them.
+    """
+    if cursor.remaining() < _STREAM_HEADER.size:
+        cursor.take(_STREAM_HEADER.size)  # raises the ordinary truncated-stream diagnosis
+    attribute_id = int(cursor.buf[cursor.pos])
+    if attribute_id in known:
+        return decode_stream(cursor)
+    head = cursor.take(_STREAM_HEADER.size)
+    unpacked = _STREAM_HEADER.unpack_from(head)
+    payload_len = int(unpacked[-1])
+    cursor.take(payload_len)
+    return attribute_id, None
+
+
 def crc32(data: bytes) -> int:
     return zlib.crc32(data) & 0xFFFFFFFF

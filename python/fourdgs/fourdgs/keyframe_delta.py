@@ -59,7 +59,6 @@ GOP_INVARIANT = frozenset({op.A_SIGMA_T, op.A_FLAGS, op.A_WINDOW_INDEX})
 #: Attributes an update restates outright rather than differencing.
 ABSOLUTE_IN_UPDATE = frozenset({op.A_ROTATION_INDEX, op.A_ROTATION})
 
-
 @dataclass
 class State:
     """A composed population: identities, and one bin array per attribute.
@@ -93,7 +92,10 @@ def keyframe_state(ids: np.ndarray, bins: dict[int, np.ndarray]) -> State:
                 f"attribute {attribute} carries {values.shape[0]} rows, the keyframe declares {ids.shape[0]} gaussians",
                 "stream-element-count-mismatch",
             )
-    return State(ids=ids, bins={a: np.asarray(v, dtype=np.int64) for a, v in bins.items()})
+        _check_absolute_bins(attribute, values, "a keyframe")
+    state = State(ids=ids, bins={a: np.asarray(v, dtype=np.int64) for a, v in bins.items()})
+    _check_rotation_indexes(state)
+    return state
 
 
 def apply_delta(
@@ -170,6 +172,7 @@ def apply_delta(
                     "unknown-attribute-in-update",
                 )
             if attribute in ABSOLUTE_IN_UPDATE:
+                _check_absolute_bins(attribute, delta, "an absolute update")
                 state.bins[attribute][rows] = delta
             else:
                 state.bins[attribute][rows] = _add_checked(state.bins[attribute][rows], delta, attribute, update_ids)
@@ -196,6 +199,7 @@ def apply_delta(
                     f"declares {birth_ids.shape[0]}",
                     "stream-element-count-mismatch",
                 )
+            _check_absolute_bins(attribute, values, "a birth group")
         state = State(
             ids=np.concatenate([state.ids, birth_ids]),
             bins={
@@ -206,7 +210,36 @@ def apply_delta(
             },
         )
 
+    _check_rotation_indexes(state)
     return state
+
+
+def _check_absolute_bins(attribute: int, values: np.ndarray, what: str) -> None:
+    """Refuse an absolute stream code outside the shared signed-i32 domain."""
+    array = np.asarray(values, dtype=np.int64)
+    bad = (array < BIN_MIN) | (array > BIN_MAX)
+    if bad.any():
+        row = int(np.argwhere(bad)[0][0])
+        raise _refuse(
+            f"{what} carries attribute {attribute} row {row} outside the signed 32-bit "
+            "range an absolute bin must stay inside",
+            "bin-overflow",
+        )
+
+
+def _check_rotation_indexes(state: State) -> None:
+    values = state.bins.get(op.A_ROTATION_INDEX)
+    if values is None:
+        return
+    indexes = np.asarray(values, dtype=np.int64).reshape(-1)
+    bad = (indexes < 0) | (indexes > 3)
+    if bad.any():
+        row = int(np.flatnonzero(bad)[0])
+        identity = int(state.ids[row]) if row < state.count else row
+        raise _refuse(
+            f"gaussian id {identity} carries rotation_index {int(indexes[row])}; expected 0..3",
+            "rotation-index-out-of-range",
+        )
 
 
 def _add_checked(base: np.ndarray, delta: np.ndarray, attribute: int, ids: np.ndarray) -> np.ndarray:
@@ -286,6 +319,12 @@ def check_tiling(index, duration_sec: float | None = None) -> None:
     this package passes it.
     """
     ordered = sorted(index, key=lambda e: e.t0)
+    for entry in ordered:
+        if not np.isfinite(entry.t0) or not np.isfinite(entry.t1) or entry.t1 < entry.t0:
+            raise _refuse(
+                f"state chunk has unusable interval [{entry.t0}, {entry.t1}); expected finite t0 and t1 >= t0",
+                "non-tiling-chunks",
+            )
     for previous, entry in pairwise(ordered):
         if previous.t1 != entry.t0:
             what = "overlap" if entry.t0 < previous.t1 else "leave a gap"

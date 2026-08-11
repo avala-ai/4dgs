@@ -41,6 +41,7 @@ from .serialization import (
     check_magic,
     crc32,
     decode_stream,
+    decode_stream_or_skip,
     decompress,
     iter_records,
 )
@@ -139,20 +140,24 @@ def decode_streams(
     """
     cursor = Cursor(streams)
     got: dict[int, np.ndarray] = {}
+    seen: set[int] = set()
+    known = frozenset(op.ATTRIBUTE_CHANNELS)
     while cursor.remaining() > 0:
-        attribute_id, values = decode_stream(cursor)
+        attribute_id, values = decode_stream_or_skip(cursor, known)
         # The format defines one stream per attribute, so a second is a chunk that cannot
         # say which stream defines its gaussians. Overwriting resolved it silently — and
         # differently per SDK: this reader, Rust and TypeScript kept the last stream while
         # Dart kept the first, so one malformed chunk decoded to two memberships. It is
         # the duplicate-name failure section 5.15.2 refuses for records, spelled with
         # attribute ids.
-        if attribute_id in got:
+        if attribute_id in seen:
             raise MalformedFile(
                 f"a chunk carries attribute {attribute_id} twice; the format defines one stream per attribute",
                 code="duplicate-attribute-stream",
             )
-        got[attribute_id] = values
+        seen.add(attribute_id)
+        if values is not None:
+            got[attribute_id] = values
 
     missing = [a for a in op.REQUIRED_ATTRIBUTES if a not in got]
     if missing and count:
@@ -241,6 +246,18 @@ def decode_streams(
 SH_BAND_RANGE = {1: (0, 3), 2: (3, 8), 3: (8, 15)}
 
 
+def check_sh_codes(values: np.ndarray, what: str) -> None:
+    """Require version-1 SH coefficient codes to fit their unsigned byte."""
+    array = np.asarray(values, dtype=np.int64)
+    bad = (array < 0) | (array > 255)
+    if bad.any():
+        row, channel = (int(value) for value in np.argwhere(bad)[0])
+        raise MalformedFile(
+            f"{what} carries coefficient {int(array[row, channel])} at row {row}, "
+            f"channel {channel}; expected 0..255"
+        )
+
+
 def merge_chunk_bands(counts: list[int], chunk_bands: list[dict[int, np.ndarray]]):
     """Merge per-chunk SH band streams into one scene-wide `(n, 3 * coeffs)` array.
 
@@ -267,8 +284,7 @@ def merge_chunk_bands(counts: list[int], chunk_bands: list[dict[int, np.ndarray]
             if values.size != count * 3 * width:
                 raise MalformedFile(f"SH band {band} decoded {values.size} values, expected {count * 3 * width}")
             values = values.reshape(count, 3 * width)
-            if values.min(initial=0) < 0 or values.max(initial=0) > 255:
-                raise MalformedFile("an SH coefficient is outside the 0..255 range this version stores")
+            check_sh_codes(values, f"SH band {band}")
             for c in range(3):
                 out[at : at + count, c * coeffs + first : c * coeffs + last] = values[:, c * width : (c + 1) * width]
         at += count

@@ -66,11 +66,12 @@ from .serialization import (
     check_magic,
     crc32,
     decode_stream,
+    decode_stream_or_skip,
     decompress,
     encode_stream,
     iter_records,
 )
-from .stream_reader import check_window_indices, chunk_stream_bytes
+from .stream_reader import check_sh_codes, check_window_indices, chunk_stream_bytes
 
 #: Matches `tests/conformance/canonical.py`: integers are strings so a 64-bit value
 #: survives a double-backed JSON parser, floats are rounded before comparison, a
@@ -595,24 +596,28 @@ def _decode_group(stream_bytes) -> tuple[np.ndarray, dict[int, np.ndarray]]:
     """One length-framed sub-block: its ids, and a bin array per other attribute."""
     cursor = Cursor(bytes(stream_bytes))
     got: dict[int, np.ndarray] = {}
+    seen: set[int] = set()
+    known = frozenset(op.ATTRIBUTE_CHANNELS)
     while cursor.remaining() > 0:
-        attribute_id, values = decode_stream(cursor)
+        attribute_id, values = decode_stream_or_skip(cursor, known)
         # One stream per attribute here too. The regular chunk path refuses a second;
         # this path had its own loop and was still resolving it silently, so the same
         # malformed file was refused as a chunk and accepted as a delta group.
-        if attribute_id in got:
+        if attribute_id in seen:
             raise MalformedFile(
                 f"a keyframe-delta group carries attribute {attribute_id} twice; the format "
                 f"defines one stream per attribute",
                 code="duplicate-attribute-stream",
             )
-        got[attribute_id] = values
+        seen.add(attribute_id)
+        if values is not None:
+            got[attribute_id] = values
     _check_channel_counts(got)
     if not len(stream_bytes):
         return np.zeros(0, np.int64), {}
     if op.A_GAUSSIAN_ID not in got:
         raise MalformedFile("a keyframe-delta group carries no gaussian_id stream", code="missing-gaussian-id")
-    ids = got.pop(op.A_GAUSSIAN_ID)[:, 0].astype(np.int64)
+    ids = _gaussian_ids(got.pop(op.A_GAUSSIAN_ID)[:, 0])
     return ids, got
 
 
@@ -620,18 +625,22 @@ def _keyframe_from_chunk(content) -> tuple[np.ndarray, dict[int, np.ndarray]]:
     head, streams = rec.parse_chunk(content)
     cursor = Cursor(chunk_stream_bytes(head, streams))
     got: dict[int, np.ndarray] = {}
+    seen: set[int] = set()
+    known = frozenset(op.ATTRIBUTE_CHANNELS)
     while cursor.remaining() > 0:
-        attribute_id, values = decode_stream(cursor)
+        attribute_id, values = decode_stream_or_skip(cursor, known)
         # One stream per attribute here too. The regular chunk path refuses a second;
         # this path had its own loop and was still resolving it silently, so the same
         # malformed file was refused as a chunk and accepted as a delta group.
-        if attribute_id in got:
+        if attribute_id in seen:
             raise MalformedFile(
                 f"a keyframe-delta group carries attribute {attribute_id} twice; the format "
                 f"defines one stream per attribute",
                 code="duplicate-attribute-stream",
             )
-        got[attribute_id] = values
+        seen.add(attribute_id)
+        if values is not None:
+            got[attribute_id] = values
     if op.A_GAUSSIAN_ID not in got:
         raise MalformedFile("a keyframe-delta chunk carries no gaussian_id stream", code="missing-gaussian-id")
     # Against the count the record declares, exactly as `decode_streams` does for a
@@ -640,11 +649,24 @@ def _keyframe_from_chunk(content) -> tuple[np.ndarray, dict[int, np.ndarray]]:
     # different number of elements than its header declares was refused as a
     # gaussian-birth chunk and composed as a keyframe.
     _check_element_counts(got, int(head.count), "the keyframe chunk")
-    ids = got.pop(op.A_GAUSSIAN_ID)[:, 0].astype(np.int64)
+    ids = _gaussian_ids(got.pop(op.A_GAUSSIAN_ID)[:, 0])
     missing = [a for a in _REQUIRED if a not in got]
     if missing and head.count:
         raise MalformedFile(f"keyframe chunk is missing required attributes {missing}")
     return ids, got
+
+
+def _gaussian_ids(values: np.ndarray) -> np.ndarray:
+    """Interpret gaussian_id's signed stream codes as the registry's u32."""
+    codes = np.asarray(values, dtype=np.int64).reshape(-1)
+    bad = (codes < np.iinfo(np.int32).min) | (codes > np.iinfo(np.int32).max)
+    if bad.any():
+        row = int(np.flatnonzero(bad)[0])
+        raise MalformedFile(
+            f"gaussian_id element {row} has signed stream code {int(codes[row])}; expected a signed 32-bit code",
+            code="gaussian-id-out-of-range",
+        )
+    return codes.astype(np.int32).view(np.uint32).astype(np.int64)
 
 
 def _check_element_counts(bins: dict[int, np.ndarray], count: int, what: str) -> None:
@@ -1160,6 +1182,7 @@ def _decode_index_bands(
                 f"({expected_rows}, {expected_channels})",
                 code="stream-element-count-mismatch",
             )
+        check_sh_codes(values, f"the SH Band Stream at {offset}")
 
 
 def check_index_bands(data: bytes, index: list[rec.ChunkIndexEntry], sh_degree: int) -> None:
@@ -1533,6 +1556,7 @@ def scan_streamed(
                     f"shape {values.shape}; its owning state record requires {expected_shape}",
                     code="stream-element-count-mismatch",
                 )
+            check_sh_codes(values, f"the SH Band Stream at {record.offset}")
             bands.append(band_number)
             continue
         else:

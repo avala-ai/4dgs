@@ -45,6 +45,7 @@ from fourdgs.serialization import (
     compress,
     crc32,
     decode_stream,
+    decode_stream_or_skip,
     encode_stream,
     iter_records,
     put_blob,
@@ -632,6 +633,17 @@ class TestKeyframeDelta:
         with pytest.raises(MalformedFile, match="attribute 13 declares 2 channels; the registry says 1"):
             kdf._decode_group(group)
 
+    def test_gaussian_identity_stream_codes_are_reinterpreted_as_u32(self):
+        group = encode_stream(
+            op.A_GAUSSIAN_ID,
+            np.array([[np.iinfo(np.int32).min]], dtype=np.int64),
+            channels=1,
+            codec=0,
+        )
+        ids, bins = kdf._decode_group(group)
+        assert bins == {}
+        assert ids.tolist() == [0x80000000]
+
     def test_a_window_index_outside_the_table_is_refused_at_composition(self):
         """Composition produces bins and stops there, so nothing on this path looked at
         `window_index`: the bound was proved during reconstruction, on the one instant
@@ -839,8 +851,46 @@ class TestSHBandStreams:
         assert not report.ok
         assert any("owning Chunk requires" in f.message for f in report.findings), report.findings
 
+    def test_indexed_and_streamed_keyframe_delta_bands_reject_non_byte_codes(self):
+        band = put_record(
+            op.SH_BAND_STREAM,
+            bytes([1])
+            + encode_stream(
+                op.SH_BAND_STREAM,
+                np.array([[-1] + [0] * 8], dtype=np.int64),
+                channels=9,
+                codec=0,
+            ),
+        )
+
+        indexed = _patch_sh_degree(_single_keyframe_file(write_index=True), 1)
+        indexed, _band_at = _insert_single_indexed_band(indexed, band)
+        with pytest.raises(MalformedFile, match=r"expected 0\.\.255"):
+            kdf.compose_chain(indexed, _index_entries(indexed), _index_entries(indexed)[0])
+
+        streamed = _patch_sh_degree(_single_keyframe_file(write_index=False), 1)
+        chunk = _first_record(streamed, op.CHUNK)
+        after_chunk = chunk.offset + 9 + len(chunk.content)
+        streamed = streamed[:after_chunk] + band + streamed[after_chunk:]
+        with pytest.raises(MalformedFile, match=r"expected 0\.\.255"):
+            list(kdf.scan_streamed(streamed))
+
 
 class TestWholeFileCompatibilityGates:
+    def test_an_unknown_attribute_is_skipped_without_dispatching_its_codec(self):
+        stream = bytearray(encode_stream(0x7F, np.array([[1]], dtype=np.int64), channels=1, codec=0))
+        stream[1] = 3  # unknown symbol width
+        stream[2] = 0xFF  # unknown mode
+        stream[3] = 9  # unknown codec
+        stream[4] = 0  # unknown channel semantics
+        cursor = Cursor(bytes(stream))
+
+        attribute, values = decode_stream_or_skip(cursor, frozenset(op.ATTRIBUTE_CHANNELS))
+
+        assert attribute == 0x7F
+        assert values is None
+        assert cursor.remaining() == 0
+
     @pytest.mark.parametrize(
         ("opcode", "mutate", "code"),
         [
