@@ -32,6 +32,7 @@ library;
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+import 'chunk_decoder.dart' show maxChunkDecodedBytes;
 import 'exceptions.dart';
 import 'opcode.dart';
 import 'quantization.dart';
@@ -64,6 +65,15 @@ const Set<int> keyframeDeltaGopInvariant = <int>{
 const Set<int> keyframeDeltaAbsoluteInUpdate = <int>{
   attrRotationIndex,
   attrRotation,
+};
+
+/// Optional identity lanes use zero as the value for rows that predate the
+/// lane or whose birth omits it. Once a later group introduces one, the public
+/// column must still remain aligned with the complete composed population.
+const Set<int> _zeroDefaultIdentityAttributes = <int>{
+  attrSourceGroup,
+  attrSourceIndex,
+  attrObjectId,
 };
 
 /// One attribute's bins for a whole population: [channels] per gaussian, packed
@@ -237,7 +247,8 @@ KeyframeDeltaState _applyDelta(
     }
     final absent = <int>[
       for (final attribute in bins.keys)
-        if (!birthBins.containsKey(attribute) && attribute != attrObjectId)
+        if (!birthBins.containsKey(attribute) &&
+            !_zeroDefaultIdentityAttributes.contains(attribute))
           attribute,
     ]..sort();
     if (absent.isNotEmpty) {
@@ -263,7 +274,8 @@ KeyframeDeltaState _applyDelta(
     for (final attribute in attributes) {
       final existing = bins[attribute];
       final added = birthBins[attribute];
-      if (added == null && attribute != attrObjectId) {
+      if (added == null &&
+          !_zeroDefaultIdentityAttributes.contains(attribute)) {
         throw FourdgsMalformedFile(
           'a birth group carries no value for attribute $attribute; a birth is '
           'absolute state, not a delta',
@@ -272,12 +284,12 @@ KeyframeDeltaState _applyDelta(
       final ch = existing?.channels ?? added!.channels;
       final before =
           existing?.values ??
-          (attribute == attrObjectId
+          (_zeroDefaultIdentityAttributes.contains(attribute)
               ? Int32List(ids.length * ch)
               : Int32List(0));
       final after =
           added?.values ??
-          (attribute == attrObjectId
+          (_zeroDefaultIdentityAttributes.contains(attribute)
               ? Int32List(birthIds.length * ch)
               : Int32List(0));
       final merged =
@@ -1161,6 +1173,24 @@ KeyframeDeltaPopulation keyframeDeltaPopulation(
 
 KeyframeDeltaPopulation _population(KeyframeDeltaState state, _Grids grids) {
   final n = state.count;
+  // Composition already retains the aligned bin columns. Account for those,
+  // the retained id lane, and every public output array before allocating any
+  // of the latter. Constant-mode streams can state millions of rows in a tiny
+  // file, so per-stream limits do not bound this aggregate peak.
+  var bytesPerGaussian = 164; // retained id + fixed public output arrays
+  for (final column in state._bins.values) {
+    bytesPerGaussian += column.channels * Int32List.bytesPerElement;
+  }
+  for (final attribute in _zeroDefaultIdentityAttributes) {
+    if (state._bins.containsKey(attribute)) {
+      bytesPerGaussian += Int32List.bytesPerElement;
+    }
+  }
+  if (n > maxChunkDecodedBytes ~/ bytesPerGaussian) {
+    throw FourdgsMalformedFile(
+      'a composed keyframe-delta state declares $n gaussians, which would retain and dequantize to more than $maxChunkDecodedBytes bytes ($bytesPerGaussian per gaussian)',
+    );
+  }
   // Attribute streams use signed symbols internally, but gaussian_id is u32 on
   // the wire and at the public API. Uint32List preserves the same bits while
   // exposing values in the format's 0 through 0xffffffff identity domain.
@@ -1175,7 +1205,13 @@ KeyframeDeltaPopulation _population(KeyframeDeltaState state, _Grids grids) {
   final windowIndexOut = Int32List(n);
   Int32List? signedIdentity(int attribute) {
     final column = state._bins[attribute];
-    return column == null ? null : Int32List.fromList(column.values);
+    if (column == null) return null;
+    if (column.channels != 1 || column.rows != n) {
+      throw FourdgsMalformedFile(
+        'optional identity attribute $attribute carries ${column.rows} rows at ${column.channels} channels; the composed population has $n gaussians and requires one aligned value per row',
+      );
+    }
+    return Int32List.fromList(column.values);
   }
 
   final sourceGroup = signedIdentity(attrSourceGroup);

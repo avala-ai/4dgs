@@ -524,14 +524,16 @@ int _kdCheckLifecycles(List<FourdgsSample> samples) {
     // Remember at most the current sample. An identity introduced now may have
     // appeared in any non-adjacent earlier sample, so check those samples again
     // instead of retaining an unbounded scene-wide set of retired identities.
-    for (int prior = 0; prior + 1 < i; prior++) {
-      for (final id in samples[prior].ids) {
-        if (introductions.contains(id)) {
-          throw FourdgsInvalidInput(
-            'sample $i reuses gaussian id $id after its death; section 11.2 '
-            'requires an identity to remain retired because consumers may keep '
-            'identity-based state after it disappears',
-          );
+    if (introductions.isNotEmpty) {
+      for (int prior = 0; prior + 1 < i; prior++) {
+        for (final id in samples[prior].ids) {
+          if (introductions.contains(id)) {
+            throw FourdgsInvalidInput(
+              'sample $i reuses gaussian id $id after its death; section 11.2 '
+              'requires an identity to remain retired because consumers may keep '
+              'identity-based state after it disappears',
+            );
+          }
         }
       }
     }
