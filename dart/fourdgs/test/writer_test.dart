@@ -1354,6 +1354,24 @@ void main() {
           reason: profile,
         );
       }
+      expect(
+        () => writeFourdgsBytes(
+          buildScene(count: 8),
+          8.0,
+          options: const FourdgsWriteOptions(sceneProfile: 'captuer'),
+        ),
+        throwsA(
+          isA<FourdgsInvalidInput>().having(
+            (FourdgsInvalidInput e) => e.message,
+            'message',
+            allOf(
+              contains('unknown scene profile "captuer"'),
+              contains('registered profiles'),
+              contains('only "" or baked'),
+            ),
+          ),
+        ),
+      );
     });
 
     test('the writer never emits a Window Table its reader refuses', () {

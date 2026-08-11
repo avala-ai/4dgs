@@ -209,6 +209,13 @@ void writeFourdgsToSink(
       'three promises, so leave the scene profile empty',
     );
   }
+  if (options.sceneProfile != '' && options.sceneProfile != 'baked') {
+    throw FourdgsInvalidInput(
+      'unknown scene profile "${options.sceneProfile}"; the registered '
+      'profiles are "", baked, capture, keyframed, objects, relightable, and '
+      'this writer can emit only "" or baked',
+    );
+  }
   _checkInput(gaussians, options.cutoff);
 
   final n = gaussians.count;
