@@ -145,6 +145,11 @@ Uint8List writeFourdgsBytes(
       'write deflate, which every reader implements',
     );
   }
+  if (options.level < 0 || options.level > 9) {
+    throw FourdgsInvalidInput(
+      'deflate level is ${options.level}; expected an integer from 0 through 9',
+    );
+  }
   // A profile is a promise about what the file contains, made so a consumer can
   // reject an unsuitable file up front rather than discovering the absence
   // mid-decode. `objects` promises an `object_id` stream in every non-empty

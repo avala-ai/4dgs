@@ -157,6 +157,25 @@ void main() {
       expect(opcodes, contains(opChunk));
     });
 
+    test('invalid deflate levels are authoring errors', () {
+      for (final level in const <int>[-1, 10]) {
+        expect(
+          () => writeFourdgsBytes(
+            buildScene(),
+            8.0,
+            options: FourdgsWriteOptions(level: level),
+          ),
+          throwsA(
+            isA<FourdgsInvalidInput>().having(
+              (FourdgsInvalidInput e) => e.message,
+              'message',
+              allOf(contains('deflate level'), contains('0 through 9')),
+            ),
+          ),
+        );
+      }
+    });
+
     test('the Header states the scene, not a chunk', () {
       final scene = buildScene(count: 96);
       final bytes = writeFourdgsBytes(
