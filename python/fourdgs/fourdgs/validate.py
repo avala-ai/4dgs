@@ -604,6 +604,7 @@ def _check_keyframe_delta(data: bytes, walk: Walk, report: Report, header: rec.H
     else:
         try:
             opened = kdf.open_indexed(data)
+            kdf.check_index_bands(data, opened.index, opened.header.sh_degree)
         except FourdgsError as exc:
             report.refused("a seeking reader cannot open this file: ", exc, walk)
             return
@@ -636,8 +637,11 @@ def _check_keyframe_delta(data: bytes, walk: Walk, report: Report, header: rec.H
 
 
 def _window_table(walk: Walk, data: bytes) -> list[tuple[float, float]]:
-    """The Window Table a streamed reader would have when it meets a chunk."""
-    frame = walk.first_intact(op.WINDOW_TABLE)
+    """The effective Window Table, matching the streamed decoder's last-one-wins rule."""
+    frame = next(
+        (record for record in reversed(walk.intact_records()) if record.opcode == op.WINDOW_TABLE),
+        None,
+    )
     if frame is None:
         return []
     content = frame.content(data)

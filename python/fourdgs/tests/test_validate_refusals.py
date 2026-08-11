@@ -35,7 +35,7 @@ from fourdgs import opcode as op
 from fourdgs import records as rec
 from fourdgs import refusal
 from fourdgs.cli import main
-from fourdgs.exceptions import UnsupportedCodec
+from fourdgs.exceptions import MalformedFile, UnsupportedCodec
 from fourdgs.keyframe_delta_writer import KeyframeDeltaOptions, Sample
 from fourdgs.serialization import (
     CODEC_DEFLATE,
@@ -395,6 +395,33 @@ class TestKeyframeDelta:
         with pytest.raises(UnsupportedCodec, match="unknown stream codec 9"):
             kdf.compose_chain(data + band_blob, index, indexed)
 
+    def test_an_index_cannot_omit_a_physical_keyframe_delta_band(self):
+        data = _keyframe_file()
+        header_record = _first_record(data, op.HEADER)
+        header = rec.Header.parse(header_record.content)
+        header.sh_degree = 1
+        data = (
+            data[: header_record.offset]
+            + header.encode()
+            + data[header_record.offset + 9 + len(header_record.content) :]
+        )
+
+        footer_record = _first_record(data, op.FOOTER)
+        footer = rec.Footer.parse(footer_record.content)
+        band = put_record(
+            op.SH_BAND_STREAM,
+            bytes([1]) + encode_stream(op.SH_BAND_STREAM, np.zeros((0, 9), dtype=np.int64), channels=9),
+        )
+        summary = data[footer.summary_start : footer_record.offset]
+        footer.summary_start += len(band)
+        data = data[: footer_record.offset - len(summary)] + band + summary + footer.encode() + MAGIC
+
+        report = validate(data)
+        assert not report.ok
+        assert any("physical records following that chunk" in finding.message for finding in report.findings), (
+            report.findings
+        )
+
     def test_the_index_and_the_composed_population_must_agree(self):
         """`live_count` is the one index field only a decode can settle: the population
         after composition, which is the number a seeking consumer budgets against. The
@@ -436,6 +463,18 @@ class TestKeyframeDelta:
         assert not report.ok
         assert any("its header declares" in f.message for f in report.findings), report.findings
 
+    def test_keyframe_and_delta_group_streams_use_registry_channel_counts(self):
+        keyframe_streams = encode_stream(op.A_GAUSSIAN_ID, np.array([[7]], dtype=np.int64), channels=1) + encode_stream(
+            op.A_POSITION, np.array([[1]], dtype=np.int64), channels=1
+        )
+        keyframe = next(iter_records(rec.encode_chunk(0.0, 1.0, 0, 1, keyframe_streams)))
+        with pytest.raises(MalformedFile, match="attribute 0 declares 1 channels; the registry says 3"):
+            kdf._keyframe_from_chunk(keyframe.content)
+
+        group = encode_stream(op.A_GAUSSIAN_ID, np.array([[7, 8]], dtype=np.int64), channels=2)
+        with pytest.raises(MalformedFile, match="attribute 13 declares 2 channels; the registry says 1"):
+            kdf._decode_group(group)
+
     def test_a_window_index_outside_the_table_is_refused_at_composition(self):
         """Composition produces bins and stops there, so nothing on this path looked at
         `window_index`: the bound was proved during reconstruction, on the one instant
@@ -447,6 +486,16 @@ class TestKeyframeDelta:
         patched = bytearray(data)
         struct.pack_into("<I", patched, table.offset + 9, 1)  # the table now declares one
         report = validate(bytes(patched))
+        assert not report.ok
+        assert any("window index" in f.message for f in report.findings), report.findings
+
+    def test_indexless_validation_uses_the_last_window_table_like_reconstruction(self):
+        data = _keyframe_file(two_windows=True, write_index=False)
+        second = next(iter_records(rec.WindowTable(windows=[(0.0, 8.0)]).encode()))
+        data = _splice(data, second)
+        assert len(kdf.decode_streamed(data).windows) == 1
+
+        report = validate(data)
         assert not report.ok
         assert any("window index" in f.message for f in report.findings), report.findings
 

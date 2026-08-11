@@ -604,6 +604,7 @@ def _decode_group(stream_bytes) -> tuple[np.ndarray, dict[int, np.ndarray]]:
                 code="duplicate-attribute-stream",
             )
         got[attribute_id] = values
+    _check_channel_counts(got)
     if not len(stream_bytes):
         return np.zeros(0, np.int64), {}
     if op.A_GAUSSIAN_ID not in got:
@@ -653,11 +654,23 @@ def _check_element_counts(bins: dict[int, np.ndarray], count: int, what: str) ->
     between a group's id stream and its value streams — which is what a delta *is* — rests
     on a number nobody checked.
     """
+    _check_channel_counts(bins)
     for attribute, values in sorted(bins.items()):
         if values.shape[0] != count:
             raise MalformedFile(
                 f"attribute {attribute} carries {values.shape[0]} elements; {what} declares {count}",
                 code="stream-element-count-mismatch",
+            )
+
+
+def _check_channel_counts(bins: dict[int, np.ndarray]) -> None:
+    """Known attributes have the one interleaving width fixed by the registry."""
+    for attribute, values in sorted(bins.items()):
+        channels = op.ATTRIBUTE_CHANNELS.get(attribute)
+        if channels is not None and values.shape[1] != channels:
+            raise MalformedFile(
+                f"attribute {attribute} declares {values.shape[1]} channels; the registry says {channels}",
+                code="stream-channel-count-mismatch",
             )
 
 
@@ -1054,6 +1067,54 @@ def _decode_index_bands(data: bytes, entry: rec.ChunkIndexEntry) -> None:
                 code="index-record-mismatch",
             )
         decode_stream(band_content)
+
+
+def check_index_bands(data: bytes, index: list[rec.ChunkIndexEntry], sh_degree: int) -> None:
+    """Require the index to name exactly the physical bands following every state chunk.
+
+    A validator cannot discover an omitted band by following the index: the omission is
+    precisely what keeps it from reading that record. Walk the top-level framing once,
+    associate the consecutive SH Band Streams with the Chunk or Delta Chunk immediately
+    before them, and compare the resulting byte ranges with the summary. The walk retains
+    only offsets and lengths; no band payload is accumulated.
+    """
+    physical: dict[int, list[tuple[int, int, int]]] = {}
+    owner: int | None = None
+    for record in iter_records(data, len(MAGIC)):
+        if record.opcode in (op.CHUNK, op.DELTA_CHUNK):
+            owner = record.offset
+            physical[owner] = []
+            continue
+        if record.opcode == op.SH_BAND_STREAM:
+            if owner is None:
+                raise MalformedFile(
+                    f"SH Band Stream at byte {record.offset} does not immediately follow a state chunk",
+                    code="index-record-mismatch",
+                )
+            band = Cursor(record.content).u8()
+            physical[owner].append((band, record.offset, 9 + len(record.content)))
+            continue
+        owner = None
+
+    for entry in index:
+        following = physical.get(entry.chunk_offset, [])
+        if entry.bands != following:
+            raise MalformedFile(
+                f"the chunk index entry at {entry.chunk_offset} declares SH band ranges "
+                f"{entry.bands}; the physical records following that chunk are {following}",
+                code="index-record-mismatch",
+            )
+
+    for entry in index:
+        following = physical.get(entry.chunk_offset, [])
+        bands = [band for band, _offset, _length in following]
+        wanted = list(range(1, sh_degree + 1))
+        if bands != wanted:
+            raise MalformedFile(
+                f"the state chunk at {entry.chunk_offset} is followed by SH bands {bands}; "
+                f"the Header declares degree {sh_degree}, requiring bands {wanted}",
+                code="index-record-mismatch",
+            )
 
 
 def scan_streamed(data: bytes):
