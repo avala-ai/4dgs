@@ -19,6 +19,7 @@ computes keyframe-delta summaries in the core, the provenance-JSON accessor does
 provenance family, and the objects-JSON pair does it for the object layer, so every binding emits
 identical bytes with no per-language slerp or composition order of its own.
 
+<!-- prettier-ignore -->
 | Feature                                           | Python | TypeScript | Rust    | C++     | Swift   | Dart    |
 | ------------------------------------------------- | ------ | ---------- | ------- | ------- | ------- | ------- |
 | Streaming decode                                  | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
