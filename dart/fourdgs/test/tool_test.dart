@@ -274,6 +274,22 @@ void main() {
       },
     );
 
+    test('an unindexed gaussian-birth Chunk is still decoded', () async {
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(_gaussianBirthWithMalformedUnindexedChunk()),
+      );
+      expect(report.ok, isFalse);
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(
+          allOf(
+            startsWith('the Chunk record at byte'),
+            contains('does not decode'),
+          ),
+        ),
+      );
+    });
+
     test('an unknown record is a note rather than a failure', () async {
       final FourdgsValidation report = await validateFourdgs(
         FourdgsBytes(_minimal(extra: _record(0x7F, Uint8List(3)))),
@@ -404,6 +420,32 @@ void main() {
         );
       },
     );
+
+    test('post-chunk Camera records are parsed, not only framed', () async {
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(
+          _keyframeDelta(afterChunk: _record(opCamera, Uint8List(3))),
+        ),
+      );
+      expect(report.ok, isFalse);
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(startsWith('the Camera record at byte')),
+      );
+    });
+
+    test('post-chunk Metadata records are parsed, not only framed', () async {
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(
+          _keyframeDelta(afterChunk: _record(opMetadata, Uint8List(3))),
+        ),
+      );
+      expect(report.ok, isFalse);
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(startsWith('the Metadata records do not decode:')),
+      );
+    });
 
     test('the SH-depth append is checked against Header degree', () async {
       final FourdgsValidation report = await validateFourdgs(
@@ -625,9 +667,87 @@ void main() {
       );
       expect(_messages(report, FourdgsSeverity.error), isEmpty);
     });
+
+    test('each delta group must contain its declared population', () async {
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(
+          _keyframeDeltaWithEmptyDelta(updateCount: 1, indexGaussianCount: 1),
+        ),
+      );
+      expect(report.ok, isFalse);
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(contains('declares 1 update operations')),
+      );
+    });
+
+    test('a delta must preserve its reference level', () async {
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(_keyframeDeltaWithEmptyDelta(deltaLevel: 1)),
+      );
+      expect(report.ok, isFalse);
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(contains('a delta preserves its reference level')),
+      );
+    });
+
+    test('Header gaussian_count is the number of distinct ids', () async {
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(_keyframeDelta(headerGaussianCount: 2)),
+      );
+      expect(report.ok, isFalse);
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(contains('Header declares 2 distinct gaussian ids')),
+      );
+    });
+
+    test('registry attributes keep their declared channel count', () async {
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(_keyframeDelta(positionChannels: 2)),
+      );
+      expect(report.ok, isFalse);
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(contains('attribute 0 of the keyframe chunk at byte')),
+      );
+    });
+
+    test('an indexed SH band must belong to the named Chunk', () async {
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(_keyframesWithSwappedBands()),
+      );
+      expect(report.ok, isFalse);
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(contains('does not belong to the Chunk at byte')),
+      );
+    });
+
+    test('a gaussian id cannot be born again after it dies', () async {
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(_keyframeDeltaWithRetiredIdReuse()),
+      );
+      expect(report.ok, isFalse);
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(contains('births retired gaussian id 0')),
+      );
+    });
   });
 
   group('a checksum over a range is not a copy of the range', () {
+    test('an appended Footer still ends the summary at its opcode', () async {
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(_minimalWithExtendedFooterCrc()),
+      );
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        isNot(contains(contains('summary CRC mismatch'))),
+      );
+    });
+
     test('block by block gives what the whole buffer gives', () async {
       // The Footer names a byte range and the range is whatever the Footer says
       // it is — `summary_start` just past the magic makes it almost the whole
@@ -791,6 +911,38 @@ void main() {
         expect(code, tool.exitToolFailed);
       },
     );
+
+    test('a mid-command I/O failure exits 3 and names the path', () async {
+      final List<String> errors = <String>[];
+      final int code = await tool.run(
+        <String>['validate', 'disconnected.4dgs'],
+        (_) {},
+        errors.add,
+        openReadable:
+            (_) async => (source: _IoFailureReadable(), close: () async {}),
+      );
+      expect(code, tool.exitToolFailed);
+      expect(errors.single, contains('disconnected.4dgs'));
+      expect(errors.single, contains('read failed'));
+    });
+
+    test('a close failure exits 3 and names the path', () async {
+      final List<String> errors = <String>[];
+      final int code = await tool.run(
+        <String>['validate', 'close-failure.4dgs'],
+        (_) {},
+        errors.add,
+        openReadable:
+            (_) async => (
+              source: FourdgsBytes(_minimal()),
+              close:
+                  () async => throw const FileSystemException('close failed'),
+            ),
+      );
+      expect(code, tool.exitToolFailed);
+      expect(errors.single, contains('close-failure.4dgs'));
+      expect(errors.single, contains('close failed'));
+    });
 
     test('a usage error is the tool failing too', () async {
       expect(
@@ -998,6 +1150,400 @@ Uint8List _minimal({
   return out.toBytes();
 }
 
+/// A conforming Footer with forward-compatible appended fields and a checksum
+/// over the bytes ending at the Footer opcode.
+Uint8List _minimalWithExtendedFooterCrc() {
+  final BytesBuilder prefix =
+      BytesBuilder()
+        ..add(fourdgsMagic)
+        ..add(_record(opHeader, _headerContent()))
+        ..add(_record(opQuantization, _quantizationContent()))
+        ..add(_record(opWindowTable, _windowTableContent()))
+        ..add(_record(0x81, Uint8List.fromList(<int>[1, 2, 3, 4])));
+  final Uint8List beforeFooter = prefix.toBytes();
+  final int summaryStart = fourdgsMagic.length;
+  final int crc = fourdgsCrc32(
+    Uint8List.sublistView(beforeFooter, summaryStart),
+  );
+  final Uint8List footer =
+      (BytesBuilder()
+            ..add(_u64(summaryStart))
+            ..add(_u64(0))
+            ..add(_u32(crc))
+            // Future fields which the current parser is required to ignore.
+            ..add(<int>[0xAA, 0xBB, 0xCC, 0xDD]))
+          .toBytes();
+  return (BytesBuilder()
+        ..add(beforeFooter)
+        ..add(_record(opFooter, footer))
+        ..add(fourdgsMagic))
+      .toBytes();
+}
+
+/// One indexed gaussian-birth chunk followed by an omitted, malformed chunk.
+/// The omitted chunk has zero declared gaussians so the Header and index totals
+/// still agree; only a pass over every framed Chunk can find its broken body.
+Uint8List _gaussianBirthWithMalformedUnindexedChunk() {
+  final Uint8List head =
+      (BytesBuilder()
+            ..add(fourdgsMagic)
+            ..add(_record(opHeader, _headerContent(gaussianCount: 1)))
+            ..add(_record(opQuantization, _quantizationContent()))
+            ..add(_record(opWindowTable, _windowTableContent())))
+          .toBytes();
+  Uint8List chunk(Uint8List streams, int count) => _record(
+    opChunk,
+    (BytesBuilder()
+          ..add(_f64(0.0))
+          ..add(_f64(1.0))
+          ..add(_u32(0))
+          ..add(_u32(count))
+          ..add(_string(''))
+          ..add(_u64(0))
+          ..add(_u64(streams.length))
+          ..add(streams))
+        .toBytes(),
+  );
+
+  final Uint8List indexed = chunk(_keyframeStreams(windowIndex: 0), 1);
+  final Uint8List malformed = chunk(Uint8List.fromList(<int>[attrPosition]), 0);
+  final int chunkOffset = head.length;
+  final int indexOffset = chunkOffset + indexed.length + malformed.length;
+  final Uint8List index = _record(
+    opChunkIndex,
+    (BytesBuilder()
+          ..add(_f64(0.0))
+          ..add(_f64(1.0))
+          ..add(_u64(chunkOffset))
+          ..add(_u64(indexed.length))
+          ..add(_u32(1))
+          ..add(_u32(0)))
+        .toBytes(),
+  );
+  final Uint8List footer = _record(
+    opFooter,
+    (BytesBuilder()
+          ..add(_u64(indexOffset))
+          ..add(_u64(0))
+          ..add(_u32(0)))
+        .toBytes(),
+  );
+  return (BytesBuilder()
+        ..add(head)
+        ..add(indexed)
+        ..add(malformed)
+        ..add(index)
+        ..add(footer)
+        ..add(fourdgsMagic))
+      .toBytes();
+}
+
+/// Two equal-sized bands whose index ranges have been exchanged. Both decode
+/// in isolation, so only associating the framing sequence with its Chunk
+/// detects that indexed and streamed reads would attach different coefficients.
+Uint8List _keyframesWithSwappedBands() {
+  final Uint8List head =
+      (BytesBuilder()
+            ..add(fourdgsMagic)
+            ..add(
+              _record(
+                opHeader,
+                _headerContent(
+                  temporalModel: 'keyframe-delta',
+                  durationSec: 2.0,
+                  gaussianCount: 1,
+                ),
+              ),
+            )
+            ..add(_record(opQuantization, _quantizationContent()))
+            ..add(_record(opWindowTable, _windowTableContent())))
+          .toBytes();
+  final Uint8List streams = _keyframeStreams(windowIndex: 0);
+  Uint8List chunk(double t0, double t1) => _record(
+    opChunk,
+    (BytesBuilder()
+          ..add(_f64(t0))
+          ..add(_f64(t1))
+          ..add(_u32(0))
+          ..add(_u32(1))
+          ..add(_string(''))
+          ..add(_u64(0))
+          ..add(_u64(streams.length))
+          ..add(streams))
+        .toBytes(),
+  );
+  final Uint8List first = chunk(0.0, 1.0);
+  final Uint8List firstBand = _shBandRecord(1, 0);
+  final Uint8List second = chunk(1.0, 2.0);
+  final Uint8List secondBand = _shBandRecord(1, 1);
+  final int firstOffset = head.length;
+  final int firstBandOffset = firstOffset + first.length;
+  final int secondOffset = firstBandOffset + firstBand.length;
+  final int secondBandOffset = secondOffset + second.length;
+  final int indexOffset = secondBandOffset + secondBand.length;
+
+  Uint8List entry({
+    required double t0,
+    required double t1,
+    required int chunkOffset,
+    required int chunkLength,
+    required int keyframeOffset,
+    required int bandOffset,
+    required int bandLength,
+  }) => _record(
+    opChunkIndex,
+    (BytesBuilder()
+          ..add(_f64(t0))
+          ..add(_f64(t1))
+          ..add(_u64(chunkOffset))
+          ..add(_u64(chunkLength))
+          ..add(_u32(1))
+          ..add(_u32(1))
+          ..addByte(1)
+          ..add(_u64(bandOffset))
+          ..add(_u64(bandLength))
+          ..addByte(0)
+          ..addByte(deltaModeKeyframe)
+          ..add(_u64(0))
+          ..add(_u64(keyframeOffset))
+          ..add(_u16(0))
+          ..add(_u64(1)))
+        .toBytes(),
+  );
+  final Uint8List footer = _record(
+    opFooter,
+    (BytesBuilder()
+          ..add(_u64(indexOffset))
+          ..add(_u64(0))
+          ..add(_u32(0)))
+        .toBytes(),
+  );
+  return (BytesBuilder()
+        ..add(head)
+        ..add(first)
+        ..add(firstBand)
+        ..add(second)
+        ..add(secondBand)
+        ..add(
+          entry(
+            t0: 0.0,
+            t1: 1.0,
+            chunkOffset: firstOffset,
+            chunkLength: first.length,
+            keyframeOffset: firstOffset,
+            bandOffset: secondBandOffset,
+            bandLength: secondBand.length,
+          ),
+        )
+        ..add(
+          entry(
+            t0: 1.0,
+            t1: 2.0,
+            chunkOffset: secondOffset,
+            chunkLength: second.length,
+            keyframeOffset: secondOffset,
+            bandOffset: firstBandOffset,
+            bandLength: firstBand.length,
+          ),
+        )
+        ..add(footer)
+        ..add(fourdgsMagic))
+      .toBytes();
+}
+
+Uint8List _shBandRecord(int count, int value) {
+  final int channels = shBandChannels[1]!;
+  final Uint8List payload = Uint8List.fromList(
+    zlib.encode(List<int>.filled(count * channels, value)),
+  );
+  return _record(
+    opShBandStream,
+    (BytesBuilder()
+          ..addByte(1)
+          ..addByte(0)
+          ..addByte(1)
+          ..addByte(modeRaw)
+          ..addByte(codecDeflate)
+          ..addByte(channels)
+          ..add(_u32(count))
+          ..add(_u64(payload.length))
+          ..add(payload))
+        .toBytes(),
+  );
+}
+
+/// Keyframe(id 0), death(id 0), birth(id 0): every individual state is valid,
+/// but identity 0 is illegally reused in the third state.
+Uint8List _keyframeDeltaWithRetiredIdReuse() {
+  final Uint8List head =
+      (BytesBuilder()
+            ..add(fourdgsMagic)
+            ..add(
+              _record(
+                opHeader,
+                _headerContent(
+                  temporalModel: 'keyframe-delta',
+                  durationSec: 3.0,
+                  gaussianCount: 1,
+                ),
+              ),
+            )
+            ..add(_record(opQuantization, _quantizationContent()))
+            ..add(_record(opWindowTable, _windowTableContent())))
+          .toBytes();
+  final Uint8List streams = _keyframeStreams(windowIndex: 0);
+  final Uint8List keyframe = _record(
+    opChunk,
+    (BytesBuilder()
+          ..add(_f64(0.0))
+          ..add(_f64(1.0))
+          ..add(_u32(0))
+          ..add(_u32(1))
+          ..add(_string(''))
+          ..add(_u64(0))
+          ..add(_u64(streams.length))
+          ..add(streams))
+        .toBytes(),
+  );
+  final int keyframeOffset = head.length;
+
+  Uint8List delta({
+    required double t0,
+    required double t1,
+    required int referenceOffset,
+    required int depth,
+    required Uint8List births,
+    required Uint8List deaths,
+  }) {
+    final Uint8List groups =
+        (BytesBuilder()
+              ..add(_u64(0))
+              ..add(_u64(births.length))
+              ..add(births)
+              ..add(_u64(deaths.length))
+              ..add(deaths))
+            .toBytes();
+    return _record(
+      opDeltaChunk,
+      (BytesBuilder()
+            ..add(_f64(t0))
+            ..add(_f64(t1))
+            ..add(_u32(0))
+            ..addByte(deltaModeChained)
+            ..add(_u64(referenceOffset))
+            ..add(_u64(keyframeOffset))
+            ..add(_u16(depth))
+            ..add(_u32(0))
+            ..add(_u32(births.isEmpty ? 0 : 1))
+            ..add(_u32(deaths.isEmpty ? 0 : 1))
+            ..add(_string(''))
+            ..add(_u64(0))
+            ..add(_u64(groups.length))
+            ..add(groups))
+          .toBytes(),
+    );
+  }
+
+  final Uint8List death = delta(
+    t0: 1.0,
+    t1: 2.0,
+    referenceOffset: keyframeOffset,
+    depth: 1,
+    births: Uint8List(0),
+    deaths: _constStream(attrGaussianId, 1, 1, 0),
+  );
+  final int deathOffset = keyframeOffset + keyframe.length;
+  final Uint8List birth = delta(
+    t0: 2.0,
+    t1: 3.0,
+    referenceOffset: deathOffset,
+    depth: 2,
+    births: streams,
+    deaths: Uint8List(0),
+  );
+  final int birthOffset = deathOffset + death.length;
+  final int indexOffset = birthOffset + birth.length;
+
+  Uint8List entry({
+    required double t0,
+    required double t1,
+    required int chunkOffset,
+    required int chunkLength,
+    required int kind,
+    required int referenceOffset,
+    required int depth,
+    required int liveCount,
+  }) => _record(
+    opChunkIndex,
+    (BytesBuilder()
+          ..add(_f64(t0))
+          ..add(_f64(t1))
+          ..add(_u64(chunkOffset))
+          ..add(_u64(chunkLength))
+          ..add(_u32(1))
+          ..add(_u32(0))
+          ..addByte(kind)
+          ..addByte(kind == 0 ? deltaModeKeyframe : deltaModeChained)
+          ..add(_u64(referenceOffset))
+          ..add(_u64(keyframeOffset))
+          ..add(_u16(depth))
+          ..add(_u64(liveCount)))
+        .toBytes(),
+  );
+  final Uint8List footer = _record(
+    opFooter,
+    (BytesBuilder()
+          ..add(_u64(indexOffset))
+          ..add(_u64(0))
+          ..add(_u32(0)))
+        .toBytes(),
+  );
+  return (BytesBuilder()
+        ..add(head)
+        ..add(keyframe)
+        ..add(death)
+        ..add(birth)
+        ..add(
+          entry(
+            t0: 0.0,
+            t1: 1.0,
+            chunkOffset: keyframeOffset,
+            chunkLength: keyframe.length,
+            kind: 0,
+            referenceOffset: 0,
+            depth: 0,
+            liveCount: 1,
+          ),
+        )
+        ..add(
+          entry(
+            t0: 1.0,
+            t1: 2.0,
+            chunkOffset: deathOffset,
+            chunkLength: death.length,
+            kind: 1,
+            referenceOffset: keyframeOffset,
+            depth: 1,
+            liveCount: 0,
+          ),
+        )
+        ..add(
+          entry(
+            t0: 2.0,
+            t1: 3.0,
+            chunkOffset: birthOffset,
+            chunkLength: birth.length,
+            kind: 1,
+            referenceOffset: deathOffset,
+            depth: 2,
+            liveCount: 1,
+          ),
+        )
+        ..add(footer)
+        ..add(fourdgsMagic))
+      .toBytes();
+}
+
 /// A whole one-chunk `keyframe-delta` file, with an index and a Footer.
 ///
 /// Handmade for the same reason everything else here is: this package has no
@@ -1019,6 +1565,8 @@ Uint8List _keyframeDelta({
   int? indexChunkOffset,
   Uint8List? afterChunk,
   bool extraUnindexedKeyframe = false,
+  int headerGaussianCount = 1,
+  int positionChannels = 3,
 }) {
   final Uint8List head =
       (BytesBuilder()
@@ -1026,14 +1574,20 @@ Uint8List _keyframeDelta({
             ..add(
               _record(
                 opHeader,
-                _headerContent(temporalModel: 'keyframe-delta'),
+                _headerContent(
+                  temporalModel: 'keyframe-delta',
+                  gaussianCount: headerGaussianCount,
+                ),
               ),
             )
             ..add(_record(opQuantization, _quantizationContent()))
             ..add(_record(opWindowTable, _windowTableContent())))
           .toBytes();
 
-  final Uint8List streams = _keyframeStreams(windowIndex: windowIndex);
+  final Uint8List streams = _keyframeStreams(
+    windowIndex: windowIndex,
+    positionChannels: positionChannels,
+  );
   final BytesBuilder chunk =
       BytesBuilder()
         ..add(_f64(0.0)) // t0
@@ -1120,6 +1674,10 @@ Uint8List _keyframeDelta({
 Uint8List _keyframeDeltaWithEmptyDelta({
   int indexGaussianCount = 0,
   int? indexReferenceOffset,
+  int updateCount = 0,
+  int birthCount = 0,
+  int deathCount = 0,
+  int deltaLevel = 0,
 }) {
   final Uint8List head =
       (BytesBuilder()
@@ -1130,6 +1688,7 @@ Uint8List _keyframeDeltaWithEmptyDelta({
                 _headerContent(
                   temporalModel: 'keyframe-delta',
                   durationSec: 2.0,
+                  gaussianCount: 1,
                 ),
               ),
             )
@@ -1162,14 +1721,14 @@ Uint8List _keyframeDeltaWithEmptyDelta({
     (BytesBuilder()
           ..add(_f64(1.0))
           ..add(_f64(2.0))
-          ..add(_u32(0))
+          ..add(_u32(deltaLevel))
           ..addByte(deltaModeChained)
           ..add(_u64(keyframeOffset))
           ..add(_u64(keyframeOffset))
           ..add(_u16(1))
-          ..add(_u32(0))
-          ..add(_u32(0))
-          ..add(_u32(0))
+          ..add(_u32(updateCount))
+          ..add(_u32(birthCount))
+          ..add(_u32(deathCount))
           ..add(_string(''))
           ..add(_u64(0))
           ..add(_u64(groupBytes.length))
@@ -1270,7 +1829,10 @@ Uint8List _constStream(int attributeId, int channels, int count, int value) {
 
 /// A one-gaussian keyframe chunk's streams: the required set, plus the identity
 /// a `keyframe-delta` chunk must carry (spec §11.2).
-Uint8List _keyframeStreams({required int windowIndex}) {
+Uint8List _keyframeStreams({
+  required int windowIndex,
+  int positionChannels = 3,
+}) {
   const Map<int, int> channels = <int, int>{
     attrPosition: 3,
     attrScale: 3,
@@ -1289,7 +1851,7 @@ Uint8List _keyframeStreams({required int windowIndex}) {
     out.add(
       _constStream(
         id,
-        channels[id]!,
+        id == attrPosition ? positionChannels : channels[id]!,
         1,
         id == attrWindowIndex ? windowIndex : 0,
       ),
@@ -1327,6 +1889,16 @@ class _CountingReadable implements FourdgsReadable {
   }
 }
 
+class _IoFailureReadable implements FourdgsReadable {
+  @override
+  Future<int> size() async => fourdgsMagic.length;
+
+  @override
+  Future<Uint8List> read(int offset, int length) async {
+    throw const FileSystemException('read failed');
+  }
+}
+
 /// A Chunk Index entry naming a zero-length chunk at [offset].
 Uint8List _entryAt(int offset) {
   final BytesBuilder out =
@@ -1353,13 +1925,14 @@ Uint8List _headerContent({
   String temporalModel = 'gaussian-birth',
   int shDegree = 0,
   double durationSec = 1.0,
+  int gaussianCount = 0,
 }) {
   final BytesBuilder body =
       BytesBuilder()
         ..add(_string('')) // profile
         ..add(_string('')) // library
         ..add(_f64(durationSec)) // duration_sec
-        ..add(_u64(0)) // gaussian_count
+        ..add(_u64(gaussianCount))
         ..add(_f64(0.05)) // cutoff
         ..add(_string(temporalModel));
   for (int i = 0; i < 6; i++) {

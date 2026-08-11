@@ -164,6 +164,7 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
   FourdgsQuantization? quantization;
   List<FourdgsWindow> windows = const <FourdgsWindow>[];
   FourdgsFooter? footer;
+  int footerOffset = -1;
   int firstOpcode = -1;
   int chunkCount = 0;
   int counted = 0;
@@ -275,6 +276,7 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
         case opFooter:
           try {
             footer = FourdgsFooter.parse(await _bytesOf(source, frame));
+            footerOffset = frame.offset;
           } on FourdgsException catch (error) {
             report.error('Footer does not parse: ${_say(error)}');
           }
@@ -453,10 +455,14 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
     }
   }
 
-  if (footer != null && footer.summaryCrc != 0 && footer.summaryStart != 0) {
-    // The Footer record itself is not covered: nine bytes of framing plus its
-    // twenty bytes of content plus the trailing magic.
-    final int tail = walk.size - (recordHeaderBytes + 20 + fourdgsMagic.length);
+  if (footer != null &&
+      footerOffset >= 0 &&
+      footer.summaryCrc != 0 &&
+      footer.summaryStart != 0) {
+    // The summary ends exactly where the framed Footer begins. Deriving this
+    // from a fixed Footer size would include appended, forward-compatible
+    // Footer fields in the CRC range (§4.2).
+    final int tail = footerOffset;
     if (footer.summaryStart > tail) {
       report.error(
         "the Footer's summary starts at ${footer.summaryStart}, after the "
@@ -575,7 +581,12 @@ Future<void> _checkAuxiliaryRecords(
     audioSourceRanges: scene.audioSourceRanges,
     summaryCrcOk: scene.summaryCrcOk,
     cameraRange: scene.cameraRange,
-    metadataRanges: scene.metadataRanges,
+    metadataRanges: <({int offset, int length})>[
+      for (final FourdgsFrame frame in walk.records)
+        if (frame.opcode == opMetadata &&
+            frame.offset + frame.total <= walk.size)
+          (offset: frame.offset, length: frame.total),
+    ],
     attachmentRanges: scene.attachmentRanges,
     provenanceRanges: <({int opcode, int offset, int length})>[
       for (final FourdgsFrame frame in walk.records)
@@ -595,6 +606,28 @@ Future<void> _checkAuxiliaryRecords(
     await readFourdgsObjects(source, complete);
   } on FourdgsException catch (error) {
     report.error('the object layer does not decode: ${_say(error)}');
+  }
+  // Camera is singular in the indexed scene model, but validation walks every
+  // framed record so a malformed later Camera cannot hide behind the first.
+  for (final FourdgsFrame frame in walk.records) {
+    if (frame.opcode != opCamera || frame.offset + frame.total > walk.size) {
+      continue;
+    }
+    try {
+      FourdgsCamera.parse(
+        await _bytesOf(source, frame),
+        fileOffset: frame.offset + recordHeaderBytes,
+      );
+    } on FourdgsException catch (error) {
+      report.error(
+        'the Camera record at byte ${frame.offset} does not decode: ${_say(error)}',
+      );
+    }
+  }
+  try {
+    await readFourdgsMetadata(source, complete);
+  } on FourdgsException catch (error) {
+    report.error('the Metadata records do not decode: ${_say(error)}');
   }
 }
 
@@ -747,16 +780,31 @@ Future<void> _checkGaussianBirth(
   required List<FourdgsWindow> windows,
   required double cutoff,
 }) async {
-  if (scene.index.isEmpty) {
-    await _scanFramedChunks(
-      source,
-      walk,
-      report,
-      quantization: quantization,
-      windows: windows,
-      cutoff: cutoff,
-    );
+  final Map<int, List<FourdgsBandRange>> framedBands =
+      <int, List<FourdgsBandRange>>{};
+  if (await _scanFramedChunks(
+    source,
+    walk,
+    report,
+    quantization: quantization,
+    windows: windows,
+    cutoff: cutoff,
+    framedBands: framedBands,
+  )) {
     return;
+  }
+  if (scene.index.isEmpty) return;
+
+  final Set<int> indexedOffsets = <int>{
+    for (final FourdgsChunkIndexEntry entry in scene.index) entry.chunkOffset,
+  };
+  for (final int offset in framedBands.keys) {
+    if (!indexedOffsets.contains(offset)) {
+      report.error(
+        'the Chunk record at byte $offset is a complete gaussian-birth chunk '
+        'the Chunk Index does not name',
+      );
+    }
   }
   for (int i = 0; i < scene.index.length; i++) {
     final FourdgsChunkIndexEntry entry = scene.index[i];
@@ -784,6 +832,7 @@ Future<void> _checkGaussianBirth(
       report,
       count: entry.gaussianCount,
       resourceSize: walk.size,
+      framedBands: framedBands[entry.chunkOffset],
     )) {
       return;
     }
@@ -799,19 +848,22 @@ Future<void> _checkGaussianBirth(
 /// is the same answer for a fraction of the memory, and it can name the byte
 /// where a validator that handed the whole file to the streamed reader could
 /// not.
-Future<void> _scanFramedChunks(
+Future<bool> _scanFramedChunks(
   FourdgsReadable source,
   FourdgsWalk walk,
   _Report report, {
   required FourdgsQuantization? quantization,
   required List<FourdgsWindow> windows,
   required double cutoff,
+  required Map<int, List<FourdgsBandRange>> framedBands,
 }) async {
-  if (quantization == null) return; // already reported as missing
+  if (quantization == null) return false; // already reported as missing
   int count = 0;
+  int chunkOffset = -1;
   for (final FourdgsFrame frame in walk.records) {
     if (frame.opcode != opChunk && frame.opcode != opShBandStream) continue;
     if (frame.offset + frame.total > walk.size) continue; // the cut record
+    int? framedBand;
     try {
       final Uint8List content = _content(
         await source.read(frame.offset, frame.total),
@@ -820,6 +872,8 @@ Future<void> _scanFramedChunks(
       if (frame.opcode == opChunk) {
         final FourdgsChunkBody body = parseChunk(content);
         count = body.header.count;
+        chunkOffset = frame.offset;
+        framedBands.putIfAbsent(chunkOffset, () => <FourdgsBandRange>[]);
         decodeChunkStreams(
           body.streams,
           count,
@@ -836,15 +890,31 @@ Future<void> _scanFramedChunks(
       } else if (content.isNotEmpty) {
         // Bands belong to the chunk that precedes them; that adjacency is the
         // only thing that says which chunk's gaussians they colour.
+        framedBand = content[0];
         decodeShBandRecord(
           content,
-          expectedBand: content[0],
+          expectedBand: framedBand,
           expectedCount: count,
         );
+        if (chunkOffset >= 0) {
+          framedBands
+              .putIfAbsent(chunkOffset, () => <FourdgsBandRange>[])
+              .add(
+                FourdgsBandRange(
+                  band: framedBand,
+                  offset: frame.offset,
+                  length: frame.total,
+                ),
+              );
+        }
       }
     } on FourdgsException catch (error) {
+      final String record =
+          frame.opcode == opShBandStream
+              ? 'ShBandStream record for band ${framedBand ?? "?"}'
+              : '${opcodeName(frame.opcode)} record';
       report.refused(
-        'the ${opcodeName(frame.opcode)} record at byte '
+        'the $record at byte '
         '${fourdgsCommas(frame.offset)} does not decode: ',
         error,
         site: FourdgsRefusalSite(
@@ -852,9 +922,10 @@ Future<void> _scanFramedChunks(
           'the ${opcodeName(frame.opcode)} record',
         ),
       );
-      return;
+      return true;
     }
   }
+  return false;
 }
 
 /// The same, for the temporal model whose chunks are keyframes and differences.
@@ -911,11 +982,21 @@ Future<void> _checkKeyframeDelta(
 
   final Set<int> framedStateOffsets = <int>{};
   final Map<int, int> bandPopulationAt = <int, int>{};
+  final Map<int, List<FourdgsBandRange>> framedBandsAt =
+      <int, List<FourdgsBandRange>>{};
+  // The Header is the file's declared upper bound on identities. Keeping one
+  // entry per identity is therefore bounded by a value parsed and validated
+  // before any chunk is decoded; refuse before growing past it. The same set
+  // proves both the scene-wide distinct count and the no-reuse-after-death
+  // rule, without accumulating a second whole-file set.
+  final Set<int> seenIds = <int>{};
   KeyframeDeltaState? keyframeState;
   KeyframeDeltaState? previousState;
   int keyframeOffset = -1;
+  int keyframeLevel = -1;
   int previousOffset = -1;
   int previousDepth = 0;
+  int previousLevel = -1;
   int bandPopulation = -1;
 
   for (final FourdgsFrame frame in walk.records) {
@@ -944,6 +1025,17 @@ Future<void> _checkKeyframeDelta(
           expectedBand: framedBand,
           expectedCount: bandPopulation,
         );
+        if (previousOffset >= 0) {
+          framedBandsAt
+              .putIfAbsent(previousOffset, () => <FourdgsBandRange>[])
+              .add(
+                FourdgsBandRange(
+                  band: framedBand,
+                  offset: frame.offset,
+                  length: frame.total,
+                ),
+              );
+        }
         continue;
       }
 
@@ -960,9 +1052,31 @@ Future<void> _checkKeyframeDelta(
       if (frame.opcode == opChunk) {
         final FourdgsChunkBody body = parseChunk(content);
         state = keyframeDeltaStateFromChunk(content, chunkOffset: frame.offset);
+        final Set<int> liveBefore = <int>{
+          if (previousState != null) ...previousState.ids,
+        };
+        for (final int id in state.ids) {
+          if (liveBefore.contains(id)) continue;
+          if (seenIds.contains(id)) {
+            throw FourdgsMalformedFile(
+              'the keyframe at byte ${frame.offset} reuses retired gaussian id '
+              '$id; an id is never reused after a death',
+            );
+          }
+          if (seenIds.length >= scene.header.gaussianCount) {
+            throw FourdgsMalformedFile(
+              'Header declares ${scene.header.gaussianCount} distinct gaussian '
+              'ids, but the keyframe at byte ${frame.offset} introduces id $id '
+              'after that many identities were already seen',
+            );
+          }
+          seenIds.add(id);
+        }
         keyframeState = state;
         keyframeOffset = frame.offset;
+        keyframeLevel = body.header.level;
         previousDepth = 0;
+        previousLevel = body.header.level;
         bandPopulation = body.header.count;
         if (entry != null) {
           if (entry.kind != 0 ||
@@ -996,6 +1110,8 @@ Future<void> _checkKeyframeDelta(
                 : previousOffset;
         final int expectedDepth =
             head.deltaMode == deltaModeKeyframe ? 1 : previousDepth + 1;
+        final int expectedLevel =
+            head.deltaMode == deltaModeKeyframe ? keyframeLevel : previousLevel;
         if (reference == null ||
             head.referenceOffset != expectedReference ||
             head.keyframeOffset != keyframeOffset ||
@@ -1009,12 +1125,38 @@ Future<void> _checkKeyframeDelta(
             '$expectedDepth',
           );
         }
+        if (head.level != expectedLevel) {
+          throw FourdgsMalformedFile(
+            'the delta chunk at byte ${frame.offset} declares level '
+            '${head.level}, but its reference at byte $expectedReference has '
+            'level $expectedLevel; a delta preserves its reference level',
+          );
+        }
         state = applyKeyframeDeltaBody(
           reference,
           body,
           chunkOffset: frame.offset,
         );
+        final Set<int> before = <int>{for (final int id in reference.ids) id};
+        final Set<int> after = <int>{for (final int id in state.ids) id};
+        for (final int id in after.difference(before)) {
+          if (seenIds.contains(id)) {
+            throw FourdgsMalformedFile(
+              'the delta chunk at byte ${frame.offset} births retired gaussian '
+              'id $id; an id is never reused after a death',
+            );
+          }
+          if (seenIds.length >= scene.header.gaussianCount) {
+            throw FourdgsMalformedFile(
+              'Header declares ${scene.header.gaussianCount} distinct gaussian '
+              'ids, but the delta chunk at byte ${frame.offset} births id $id '
+              'after that many identities were already seen',
+            );
+          }
+          seenIds.add(id);
+        }
         previousDepth = head.depth;
+        previousLevel = head.level;
         bandPopulation = head.birthCount;
         if (entry != null) {
           final int operations =
@@ -1062,6 +1204,7 @@ Future<void> _checkKeyframeDelta(
       }
       state.checkWindows(windows);
       bandPopulationAt[frame.offset] = bandPopulation;
+      framedBandsAt.putIfAbsent(frame.offset, () => <FourdgsBandRange>[]);
       previousState = state;
       previousOffset = frame.offset;
     } on FourdgsException catch (error) {
@@ -1099,9 +1242,16 @@ Future<void> _checkKeyframeDelta(
       report,
       count: bandPopulationAt[entry.chunkOffset],
       resourceSize: walk.size,
+      framedBands: framedBandsAt[entry.chunkOffset],
     )) {
       return;
     }
+  }
+  if (seenIds.length != scene.header.gaussianCount) {
+    report.error(
+      'Header declares ${scene.header.gaussianCount} distinct gaussian ids; '
+      'keyframes and births contain ${seenIds.length}',
+    );
   }
 }
 
@@ -1127,6 +1277,7 @@ Future<bool> _checkBands(
   _Report report, {
   int? count,
   required int resourceSize,
+  List<FourdgsBandRange>? framedBands,
 }) async {
   if (entry.bands.isEmpty) return false;
   final int expectedCount;
@@ -1152,6 +1303,20 @@ Future<bool> _checkBands(
         'the ShBandStream range for band ${band.band} of index entry $i '
         'spans [${band.offset}, ${band.offset + band.length}), outside the '
         '$resourceSize-byte resource',
+      );
+      return true;
+    }
+    if (framedBands != null &&
+        !framedBands.any(
+          (FourdgsBandRange framed) =>
+              framed.band == band.band &&
+              framed.offset == band.offset &&
+              framed.length == band.length,
+        )) {
+      report.error(
+        'the Chunk Index range for SH band ${band.band} at '
+        '[${band.offset}, ${band.offset + band.length}) does not belong to the '
+        'Chunk at byte ${entry.chunkOffset}',
       );
       return true;
     }

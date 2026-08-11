@@ -236,6 +236,12 @@ KeyframeDeltaState _applyDelta(
           'an update touches attribute $attribute, which the referenced state does not carry',
         );
       }
+      if (target.channels != delta.channels) {
+        throw FourdgsMalformedFile(
+          'an update carries ${delta.channels} channels for attribute '
+          '$attribute, but its referenced column carries ${target.channels}',
+        );
+      }
       final ch = target.channels;
       final absolute = keyframeDeltaAbsoluteInUpdate.contains(attribute);
       for (int r = 0; r < rows.length; r++) {
@@ -298,6 +304,12 @@ KeyframeDeltaState _applyDelta(
     for (final attribute in attributes) {
       final existing = bins[attribute];
       final added = birthBins[attribute]!;
+      if (existing != null && existing.channels != added.channels) {
+        throw FourdgsMalformedFile(
+          'a birth carries ${added.channels} channels for attribute $attribute, '
+          'but the live population carries ${existing.channels}',
+        );
+      }
       final ch = added.channels;
       final before = existing?.values ?? Int32List(0);
       final merged =
@@ -448,6 +460,14 @@ Map<int, _Column> _decodeStreams(FourdgsCursor cursor, int at) {
         'per attribute',
       );
     }
+    final int? expectedChannels = _keyframeDeltaChannels(header.attributeId);
+    if (expectedChannels != null && header.channels != expectedChannels) {
+      throw FourdgsMalformedFile(
+        'attribute ${header.attributeId} of the keyframe-delta stream at byte '
+        '$offset declares ${header.channels} channels, the registry says '
+        '$expectedChannels',
+      );
+    }
     framed.add((header: header, payload: payload, offset: offset));
   }
 
@@ -463,6 +483,30 @@ Map<int, _Column> _decodeStreams(FourdgsCursor cursor, int at) {
   return got;
 }
 
+/// Channels for every registry-defined attribute the keyframe-delta path reads.
+int? _keyframeDeltaChannels(int attributeId) {
+  switch (attributeId) {
+    case attrPosition:
+    case attrScale:
+    case attrRotation:
+    case attrColor:
+    case attrMotion:
+      return 3;
+    case attrRotationIndex:
+    case attrOpacity:
+    case attrMuT:
+    case attrSigmaT:
+    case attrFlags:
+    case attrWindowIndex:
+    case attrSourceGroup:
+    case attrSourceIndex:
+    case attrObjectId:
+    case attrGaussianId:
+      return 1;
+    default:
+      return null;
+  }
+}
 Int32List _idsOf(_Column gaussianId) {
   final n = gaussianId.rows;
   final out = Int32List(n);
@@ -629,9 +673,22 @@ KeyframeDeltaState _composeDelta(
   required int at,
 }) {
   final content = at + recordHeaderBytes;
+  final what = 'the delta chunk at byte $at';
   final updates = _decodeGroup(body.updates, content + body.updatesOffset);
   final births = _decodeGroup(body.births, content + body.birthsOffset);
   final deaths = _decodeGroup(body.deaths, content + body.deathsOffset);
+  void checkCount(String group, int actual, int declared) {
+    if (actual != declared) {
+      throw FourdgsMalformedFile(
+        '$what declares $declared $group operations, but its $group group '
+        'decodes to $actual gaussian ids',
+      );
+    }
+  }
+
+  checkCount('update', updates.ids.length, body.header.updateCount);
+  checkCount('birth', births.ids.length, body.header.birthCount);
+  checkCount('death', deaths.ids.length, body.header.deathCount);
   return _applyDelta(
     reference,
     updateIds: updates.ids,

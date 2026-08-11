@@ -45,6 +45,15 @@ const int exitWarnings = 2;
 /// indistinguishable from a broken one.
 const int exitToolFailed = 3;
 
+/// A transport opened for one CLI invocation.
+typedef FourdgsOpenedReadable =
+    ({FourdgsReadable source, Future<void> Function() close});
+
+/// Opens a transport for [run]. The injection point keeps operational read and
+/// close failures testable without relying on a racy filesystem mutation.
+typedef FourdgsOpenReadable =
+    Future<FourdgsOpenedReadable> Function(String path);
+
 const String usage = '''
 fourdgs — inspect and validate .4dgs files
 
@@ -75,8 +84,9 @@ Future<void> main(List<String> argv) async {
 Future<int> run(
   List<String> argv,
   void Function(String) out,
-  void Function(String) err,
-) async {
+  void Function(String) err, {
+  FourdgsOpenReadable? openReadable,
+}) async {
   if (argv.isEmpty || argv.first == '--help' || argv.first == '-h') {
     out(usage.trimRight());
     return exitOk;
@@ -107,28 +117,47 @@ Future<int> run(
     return _usageError(err, '--json applies to inspect');
   }
 
-  final FourdgsFileReadable source;
+  final FourdgsOpenedReadable opened;
   try {
-    source = await FourdgsFileReadable.open(path);
+    opened = await (openReadable ?? _openFile)(path);
   } on FileSystemException catch (error) {
     // Not the file's fault as a 4dgs file, and not a refusal: nothing was read.
     err('fourdgs: $path: ${error.osError?.message ?? error.message}');
     return exitToolFailed;
   }
+  final FourdgsReadable source = opened.source;
+  int result = exitToolFailed;
   try {
-    return command == 'inspect'
-        ? await _inspect(source, path, json, out, err)
-        : await _validate(source, out, err);
-  } on FourdgsException catch (error) {
-    // A refusal that reached here is a verdict about the file: the magic check
-    // is the one refusal that leaves nothing to walk.
-    err('fourdgs: $path: ${error.message}');
-    final FourdgsNamedRefusal? named = describeFourdgsRefusal(error);
-    if (named != null) err('fourdgs: $named');
-    return exitRefused;
+    try {
+      result =
+          command == 'inspect'
+              ? await _inspect(source, path, json, out, err)
+              : await _validate(source, out, err);
+    } on FourdgsException catch (error) {
+      // A refusal that reached here is a verdict about the file: the magic
+      // check is the one refusal that leaves nothing to walk.
+      err('fourdgs: $path: ${error.message}');
+      final FourdgsNamedRefusal? named = describeFourdgsRefusal(error);
+      if (named != null) err('fourdgs: $named');
+      result = exitRefused;
+    } on FileSystemException catch (error) {
+      err('fourdgs: $path: ${error.osError?.message ?? error.message}');
+      result = exitToolFailed;
+    }
   } finally {
-    await source.close();
+    try {
+      await opened.close();
+    } on FileSystemException catch (error) {
+      err('fourdgs: $path: ${error.osError?.message ?? error.message}');
+      result = exitToolFailed;
+    }
   }
+  return result;
+}
+
+Future<FourdgsOpenedReadable> _openFile(String path) async {
+  final FourdgsFileReadable source = await FourdgsFileReadable.open(path);
+  return (source: source, close: source.close);
 }
 
 int _usageError(void Function(String) err, String message) {
@@ -138,7 +167,7 @@ int _usageError(void Function(String) err, String message) {
 }
 
 Future<int> _inspect(
-  FourdgsFileReadable source,
+  FourdgsReadable source,
   String path,
   bool json,
   void Function(String) out,
@@ -173,7 +202,7 @@ Future<int> _inspect(
 }
 
 Future<int> _validate(
-  FourdgsFileReadable source,
+  FourdgsReadable source,
   void Function(String) out,
   void Function(String) err,
 ) async {
