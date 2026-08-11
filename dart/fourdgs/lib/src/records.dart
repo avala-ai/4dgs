@@ -211,6 +211,7 @@ class FourdgsQuantization {
     required this.stepSigmaLog,
     required this.stepSh,
     required this.bounds,
+    this.shBitDepths = const <int>[],
   });
 
   final String scheme;
@@ -231,6 +232,12 @@ class FourdgsQuantization {
   final double stepSigmaLog;
   final int stepSh;
 
+  /// Per-band spherical-harmonic bit depths, band 1 first.
+  ///
+  /// This optional append follows the record's original fields. An empty list
+  /// therefore also represents a record written before the append existed.
+  final List<int> shBitDepths;
+
   /// Declared maximum deviation per attribute, as decimal strings.
   final Map<String, String> bounds;
 
@@ -249,6 +256,7 @@ class FourdgsQuantization {
     final steps = c.f64s(8);
     final stepSh = c.u8();
     final bounds = c.strMap();
+    final shBitDepths = _readShBitDepths(c);
     // `object_id` is an exact label (section 6.6), not a metric value, so there
     // is no meaningful error bound between two different labels — section 6.5
     // makes a bound for it a refusal rather than something to ignore.
@@ -286,8 +294,31 @@ class FourdgsQuantization {
       stepSigmaLog: steps[7],
       stepSh: stepSh,
       bounds: bounds,
+      shBitDepths: shBitDepths,
     );
   }
+}
+
+/// Read the optional SH-depth append without claiming future trailing fields.
+///
+/// The declaration does not affect decoding. A short count or a value outside
+/// the registry's 3..8 range can therefore be bytes belonging to a later
+/// append, and is treated as absent rather than making an older reader reject a
+/// forward-compatible Quantization record.
+List<int> _readShBitDepths(FourdgsCursor c) {
+  if (c.remaining < 1) return const <int>[];
+  final int at = c.pos;
+  final int count = c.u8();
+  if (count == 0 || c.remaining < count) {
+    c.pos = at;
+    return const <int>[];
+  }
+  final List<int> depths = <int>[for (int i = 0; i < count; i++) c.u8()];
+  if (depths.any((int depth) => depth < 3 || depth > 8)) {
+    c.pos = at;
+    return const <int>[];
+  }
+  return depths;
 }
 
 /// Quantization schemes this build implements.
@@ -499,10 +530,11 @@ const int chunkFixedHeadBytes = 24;
 /// to read four fields is how a validator comes to hold a scene it never decodes
 /// (AGENTS.md §1).
 ({double t0, double t1, int level, int count}) parseChunkInterval(
-  Uint8List head,
-) {
+  Uint8List head, {
+  int fileOffset = 0,
+}) {
   final c = FourdgsCursor(head);
-  final intervalAt = c.pos;
+  final intervalAt = fileOffset + c.pos;
   final t0 = c.f64();
   final t1 = c.f64();
   refuseUnusableInterval(t0, t1, intervalAt, 'Chunk');

@@ -254,6 +254,7 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
               counted +=
                   parseChunkInterval(
                     await _bytesOf(source, frame, most: chunkFixedHeadBytes),
+                    fileOffset: frame.offset + recordHeaderBytes,
                   ).count;
             } on FourdgsException catch (error) {
               report.error('chunk $chunkCount does not parse: ${_say(error)}');
@@ -362,6 +363,9 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
   final bool keyframeDelta = header?.temporalModel == 'keyframe-delta';
 
   if (header != null) {
+    if (quantization != null) {
+      _checkShBitDepths(quantization, header.shDegree, report);
+    }
     // `gaussian_count` counts distinct gaussians over the whole sequence under
     // `keyframe-delta`, and every keyframe carries a full population — so the
     // sum across chunks is a larger number by design, not a disagreement.
@@ -517,7 +521,7 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
     // refuses: a truncated ObjectTrack or a malformed CoordinateFrame is a file
     // `readFourdgsObjects` and `readFourdgsProvenance` decline, so a validator
     // that only framed them would call it valid.
-    await _checkAuxiliaryRecords(source, scene, report);
+    await _checkAuxiliaryRecords(source, scene, walk, report);
     if (keyframeDelta) {
       await _checkKeyframeDelta(
         source,
@@ -555,17 +559,86 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
 Future<void> _checkAuxiliaryRecords(
   FourdgsReadable source,
   FourdgsIndexedScene scene,
+  FourdgsWalk walk,
   _Report report,
 ) async {
+  // The indexed opener intentionally stops its front-matter scan at the first
+  // Chunk. Validation is about every record, including legal auxiliary opcodes
+  // that appear later, so give the deferred readers the complete framing walk.
+  final FourdgsIndexedScene complete = FourdgsIndexedScene(
+    header: scene.header,
+    quantization: scene.quantization,
+    windows: scene.windows,
+    index: scene.index,
+    headerBytes: scene.headerBytes,
+    resourceBytes: scene.resourceBytes,
+    audioSourceRanges: scene.audioSourceRanges,
+    summaryCrcOk: scene.summaryCrcOk,
+    cameraRange: scene.cameraRange,
+    metadataRanges: scene.metadataRanges,
+    attachmentRanges: scene.attachmentRanges,
+    provenanceRanges: <({int opcode, int offset, int length})>[
+      for (final FourdgsFrame frame in walk.records)
+        if (isProvenanceOpcode(frame.opcode) &&
+            frame.offset + frame.total <= walk.size)
+          (opcode: frame.opcode, offset: frame.offset, length: frame.total),
+    ],
+    statistics: scene.statistics,
+    summaryOffsets: scene.summaryOffsets,
+  );
   try {
-    await readFourdgsProvenance(source, scene);
+    await readFourdgsProvenance(source, complete);
   } on FourdgsException catch (error) {
     report.error('the provenance records do not decode: ${_say(error)}');
   }
   try {
-    await readFourdgsObjects(source, scene);
+    await readFourdgsObjects(source, complete);
   } on FourdgsException catch (error) {
     report.error('the object layer does not decode: ${_say(error)}');
+  }
+}
+
+/// Validate the optional per-band SH-depth declaration against Header degree.
+void _checkShBitDepths(
+  FourdgsQuantization quantization,
+  int shDegree,
+  _Report report,
+) {
+  final List<int> depths = quantization.shBitDepths;
+  if (depths.isEmpty || shDegree <= 0) return;
+  if (depths.length != shDegree) {
+    report.error(
+      'Quantization declares ${depths.length} SH bit depths; the Header '
+      'declares degree $shDegree, and there is one band per degree (§6.5)',
+    );
+  }
+  final int compared = depths.length < shDegree ? depths.length : shDegree;
+  int coarsest = 0;
+  for (int i = 0; i < compared; i++) {
+    final int band = i + 1;
+    final int step = 1 << (8 - depths[i]);
+    final int bound = step ~/ 2;
+    if (step > coarsest) coarsest = step;
+    final String key = 'sh_band$band';
+    final String? declared = quantization.bounds[key];
+    if (declared == null) {
+      report.warn(
+        'Quantization declares ${depths[i]} bits for SH band $band but no '
+        '`$key` bound (§5.3)',
+      );
+    } else if (declared != '$bound') {
+      report.warn(
+        'Quantization declares `$key` as $declared; ${depths[i]} bits gives a '
+        'bound of $bound (§6.5)',
+      );
+    }
+  }
+  if (compared > 0 && quantization.stepSh != coarsest) {
+    report.warn(
+      'Quantization step_sh is ${quantization.stepSh}; the coarsest declared '
+      'band has a pitch of $coarsest, which is what a consumer that reads only '
+      'step_sh has to be given (§6.5)',
+    );
   }
 }
 
@@ -710,6 +783,7 @@ Future<void> _checkGaussianBirth(
       i,
       report,
       count: entry.gaussianCount,
+      resourceSize: walk.size,
     )) {
       return;
     }
@@ -785,11 +859,11 @@ Future<void> _scanFramedChunks(
 
 /// The same, for the temporal model whose chunks are keyframes and differences.
 ///
-/// Composition is the model's own reader, chain by chain:
-/// [decodeKeyframeDeltaIndexed] answers "what does this file decode to" and so
-/// holds every composed state at once, where the question here is only "does it
-/// decode". So each chain is composed and dropped, which bounds the memory and —
-/// because the loop is over index entries — names the entry that failed.
+/// Composition follows the complete framing walk once. The only two references
+/// the model permits are the current GOP keyframe and the immediately previous
+/// state, so retaining those two states validates either delta mode in linear
+/// time and bounded memory. It also reaches state chunks an index omitted and
+/// works unchanged when the file has no index at all.
 ///
 /// Three things the indexed reader checks that composing alone does not, and
 /// that a file therefore used to pass validation without: the population the
@@ -808,79 +882,233 @@ Future<void> _checkKeyframeDelta(
   required List<int> indexRecordOffsets,
 }) async {
   final List<FourdgsChunkIndexEntry> index = scene.index;
-  if (index.isEmpty) {
-    // No index means no chain to walk by byte range, so the model's
-    // front-to-back reader is the only path there is — and it takes the file,
-    // because without an index there is nothing to address a chunk by. This is
-    // the one place this validator holds more than a chunk, and it holds it for
-    // a file that has already been reported as unseekable.
+  if (index.isNotEmpty) {
     try {
-      decodeKeyframeDeltaStreamed(await source.read(0, walk.size));
+      checkTiling(index);
     } on FourdgsException catch (error) {
-      report.refused('this file does not decode as keyframe-delta: ', error);
+      report.error('the state chunks do not tile the timeline: ${_say(error)}');
+      return;
     }
-    return;
   }
-  try {
-    checkTiling(index);
-  } on FourdgsException catch (error) {
-    report.error('the state chunks do not tile the timeline: ${_say(error)}');
-    return;
-  }
-  // Built once. Every chain walk needs this lookup, and building it per entry is
-  // what makes validating a ten-thousand-entry index quadratic in the index
-  // before a single chunk is read (AGENTS.md §4).
-  final Map<int, FourdgsChunkIndexEntry> byOffset = keyframeDeltaChainIndex(
-    index,
-  );
+
+  // One forward pass is enough for both temporal modes: a delta may reference
+  // only the current GOP keyframe or the immediately previous state. Retaining
+  // those two states keeps memory bounded and avoids recomposing a growing
+  // chain from its keyframe once for every index entry.
+  final Map<int, ({FourdgsChunkIndexEntry entry, int index})> indexedAt =
+      <int, ({FourdgsChunkIndexEntry entry, int index})>{};
   for (int i = 0; i < index.length; i++) {
-    final FourdgsChunkIndexEntry entry = index[i];
-    final String where =
-        i < indexRecordOffsets.length
-            ? 'the Chunk Index record at byte ${indexRecordOffsets[i]} '
-                '(entry $i of ${index.length})'
-            : 'chunk index entry $i';
-    try {
-      final KeyframeDeltaState state = await readKeyframeDeltaChain(
-        source,
-        index,
-        entry,
-        byOffset: byOffset,
+    final previous = indexedAt[index[i].chunkOffset];
+    if (previous != null) {
+      report.error(
+        'chunk index entries ${previous.index} and $i both name the state '
+        'chunk at byte ${index[i].chunkOffset}',
       );
-      // §5.8 defines `live_count` for every extended entry as the population
-      // after composition, and the reference writers set it on keyframes too, so
-      // both counts are checked — the same two the indexed reader checks, in the
-      // same words, because a file the reader refuses and the validator passes
-      // is the pair disagreeing about one file.
-      if (entry.kind == 0 && entry.liveCount != state.count) {
+    } else {
+      indexedAt[index[i].chunkOffset] = (entry: index[i], index: i);
+    }
+  }
+
+  final Set<int> framedStateOffsets = <int>{};
+  final Map<int, int> bandPopulationAt = <int, int>{};
+  KeyframeDeltaState? keyframeState;
+  KeyframeDeltaState? previousState;
+  int keyframeOffset = -1;
+  int previousOffset = -1;
+  int previousDepth = 0;
+  int bandPopulation = -1;
+
+  for (final FourdgsFrame frame in walk.records) {
+    if (frame.offset + frame.total > walk.size) continue;
+    if (frame.opcode != opChunk &&
+        frame.opcode != opDeltaChunk &&
+        frame.opcode != opShBandStream) {
+      continue;
+    }
+    int? framedBand;
+    try {
+      final Uint8List content = _content(
+        await source.read(frame.offset, frame.total),
+        frame.opcode,
+      );
+      if (frame.opcode == opShBandStream) {
+        if (bandPopulation < 0 || content.isEmpty) {
+          throw FourdgsMalformedFile(
+            'the ShBandStream record at byte ${frame.offset} does not follow '
+            'a state chunk whose band population is known',
+          );
+        }
+        framedBand = content[0];
+        decodeShBandRecord(
+          content,
+          expectedBand: framedBand,
+          expectedCount: bandPopulation,
+        );
+        continue;
+      }
+
+      framedStateOffsets.add(frame.offset);
+      final indexed = indexedAt[frame.offset];
+      final FourdgsChunkIndexEntry? entry = indexed?.entry;
+      final int entryIndex = indexed?.index ?? -1;
+      final String where =
+          entry == null
+              ? 'the unindexed state chunk at byte ${frame.offset}'
+              : _indexWhere(entryIndex, index.length, indexRecordOffsets);
+      final KeyframeDeltaState state;
+
+      if (frame.opcode == opChunk) {
+        final FourdgsChunkBody body = parseChunk(content);
+        state = keyframeDeltaStateFromChunk(content, chunkOffset: frame.offset);
+        keyframeState = state;
+        keyframeOffset = frame.offset;
+        previousDepth = 0;
+        bandPopulation = body.header.count;
+        if (entry != null) {
+          if (entry.kind != 0 ||
+              entry.t0 != body.header.t0 ||
+              entry.t1 != body.header.t1 ||
+              entry.gaussianCount != body.header.count ||
+              entry.keyframeOffset != frame.offset ||
+              entry.depth != 0) {
+            report.error(
+              '$where disagrees with its keyframe Chunk; duplicated interval, '
+              'count, kind, keyframe_offset and depth fields must agree',
+            );
+          }
+        }
+      } else {
+        final FourdgsDeltaChunkBody body = parseDeltaChunk(content);
+        final FourdgsDeltaChunkHeader head = body.header;
+        if (head.deltaMode != deltaModeKeyframe &&
+            head.deltaMode != deltaModeChained) {
+          throw FourdgsMalformedFile(
+            'the delta chunk at byte ${frame.offset} declares delta_mode '
+            '${head.deltaMode}; expected $deltaModeKeyframe (keyframe) or '
+            '$deltaModeChained (chained)',
+          );
+        }
+        final KeyframeDeltaState? reference =
+            head.deltaMode == deltaModeKeyframe ? keyframeState : previousState;
+        final int expectedReference =
+            head.deltaMode == deltaModeKeyframe
+                ? keyframeOffset
+                : previousOffset;
+        final int expectedDepth =
+            head.deltaMode == deltaModeKeyframe ? 1 : previousDepth + 1;
+        if (reference == null ||
+            head.referenceOffset != expectedReference ||
+            head.keyframeOffset != keyframeOffset ||
+            head.depth != expectedDepth ||
+            head.referenceOffset >= frame.offset) {
+          throw FourdgsMalformedFile(
+            'the delta chunk at byte ${frame.offset} declares reference_offset '
+            '${head.referenceOffset}, keyframe_offset ${head.keyframeOffset}, '
+            'and depth ${head.depth}; its ${head.deltaMode == deltaModeKeyframe ? "keyframe" : "chained"} '
+            'position requires $expectedReference, $keyframeOffset, and '
+            '$expectedDepth',
+          );
+        }
+        state = applyKeyframeDeltaBody(
+          reference,
+          body,
+          chunkOffset: frame.offset,
+        );
+        previousDepth = head.depth;
+        bandPopulation = head.birthCount;
+        if (entry != null) {
+          final int operations =
+              head.updateCount + head.birthCount + head.deathCount;
+          if (entry.kind != 1 ||
+              entry.t0 != head.t0 ||
+              entry.t1 != head.t1 ||
+              entry.deltaMode != head.deltaMode ||
+              entry.referenceOffset != head.referenceOffset ||
+              entry.keyframeOffset != head.keyframeOffset ||
+              entry.depth != head.depth ||
+              entry.gaussianCount != operations) {
+            report.error(
+              '$where disagrees with its Delta Chunk; duplicated interval, '
+              'kind, delta_mode, reference_offset, keyframe_offset, depth and '
+              'gaussian_count fields must agree (the chunk carries '
+              '$operations update, birth, and death operations)',
+            );
+          }
+        }
+      }
+
+      if (index.isNotEmpty && entry == null) {
         report.error(
-          '$where declares live_count ${entry.liveCount} for a keyframe whose '
-          'chunk holds ${state.count} gaussians; expected the two to agree',
+          'the ${opcodeName(frame.opcode)} record at byte ${frame.offset} is a '
+          'state chunk the Chunk Index does not name',
         );
       }
-      final int declared = indexEntryPopulation(entry, isKeyframeDelta: true);
-      if (state.count != declared) {
-        report.error(
-          '$where declares $declared live gaussians over [${entry.t0}, '
-          '${entry.t1}), but its chain composes to ${state.count}; expected the '
-          'index and the chunks to agree',
-        );
+      if (entry != null) {
+        if (entry.kind == 0 && entry.liveCount != state.count) {
+          report.error(
+            '$where declares live_count ${entry.liveCount} for a keyframe '
+            'whose chunk holds ${state.count} gaussians; expected the two to '
+            'agree',
+          );
+        }
+        final int declared = indexEntryPopulation(entry, isKeyframeDelta: true);
+        if (state.count != declared) {
+          report.error(
+            '$where declares $declared live gaussians over [${entry.t0}, '
+            '${entry.t1}), but its chain composes to ${state.count}; expected '
+            'the index and the chunks to agree',
+          );
+        }
       }
       state.checkWindows(windows);
+      bandPopulationAt[frame.offset] = bandPopulation;
+      previousState = state;
+      previousOffset = frame.offset;
     } on FourdgsException catch (error) {
+      final String record =
+          frame.opcode == opShBandStream
+              ? 'ShBandStream record for band ${framedBand ?? "?"}'
+              : '${opcodeName(frame.opcode)} record';
       report.refused(
-        'a chunk does not compose: ',
+        'the $record at byte '
+        '${fourdgsCommas(frame.offset)} does not compose: ',
         error,
         site: FourdgsRefusalSite(
-          entry.chunkOffset,
-          'the Chunk record at index entry $i',
+          frame.offset,
+          'the ${opcodeName(frame.opcode)} record',
         ),
       );
       return;
     }
-    if (await _checkBands(source, entry, i, report)) return;
+  }
+
+  for (int i = 0; i < index.length; i++) {
+    final FourdgsChunkIndexEntry entry = index[i];
+    if (!framedStateOffsets.contains(entry.chunkOffset)) {
+      report.error(
+        '${_indexWhere(i, index.length, indexRecordOffsets)} names byte '
+        '${entry.chunkOffset}, where the framing walk found no complete state '
+        'chunk',
+      );
+      continue;
+    }
+    if (await _checkBands(
+      source,
+      entry,
+      i,
+      report,
+      count: bandPopulationAt[entry.chunkOffset],
+      resourceSize: walk.size,
+    )) {
+      return;
+    }
   }
 }
+
+String _indexWhere(int i, int length, List<int> offsets) =>
+    i < offsets.length
+        ? 'the Chunk Index record at byte ${offsets[i]} (entry $i of $length)'
+        : 'chunk index entry $i';
 
 /// The bands an index entry names, decoded one at a time. True when one refused.
 ///
@@ -898,6 +1126,7 @@ Future<bool> _checkBands(
   int i,
   _Report report, {
   int? count,
+  required int resourceSize,
 }) async {
   if (entry.bands.isEmpty) return false;
   final int expectedCount;
@@ -916,6 +1145,16 @@ Future<bool> _checkBands(
     return true;
   }
   for (final FourdgsBandRange band in entry.bands) {
+    if (band.offset < 0 ||
+        band.length < recordHeaderBytes ||
+        band.offset + band.length > resourceSize) {
+      report.error(
+        'the ShBandStream range for band ${band.band} of index entry $i '
+        'spans [${band.offset}, ${band.offset + band.length}), outside the '
+        '$resourceSize-byte resource',
+      );
+      return true;
+    }
     try {
       decodeShBandRecord(
         _content(await source.read(band.offset, band.length), opShBandStream),
@@ -956,6 +1195,7 @@ Future<int> _bandPopulation(
             : chunkFixedHeadBytes;
     return parseChunkInterval(
       await source.read(entry.chunkOffset + recordHeaderBytes, want),
+      fileOffset: entry.chunkOffset + recordHeaderBytes,
     ).count;
   }
   return parseDeltaChunk(

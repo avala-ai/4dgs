@@ -642,6 +642,28 @@ KeyframeDeltaState _composeDelta(
   );
 }
 
+/// Decode one keyframe Chunk into composed keyframe-delta state.
+///
+/// Kept as a one-record operation so validators and streaming transports can
+/// hold one chunk rather than materializing a complete file.
+KeyframeDeltaState keyframeDeltaStateFromChunk(
+  Uint8List content, {
+  required int chunkOffset,
+}) {
+  final decoded = _keyframeFromChunk(content, at: chunkOffset);
+  return _keyframeState(decoded.ids, decoded.bins);
+}
+
+/// Compose one already-parsed Delta Chunk onto its selected reference state.
+///
+/// The caller chooses the reference from the chunk's declared mode and offset;
+/// this operation owns decoding and applying its three bounded groups.
+KeyframeDeltaState applyKeyframeDeltaBody(
+  KeyframeDeltaState reference,
+  FourdgsDeltaChunkBody body, {
+  required int chunkOffset,
+}) => _composeDelta(reference, body, at: chunkOffset);
+
 /// Read the Footer, then the index, then compose each chunk by byte range.
 ///
 /// The composed state per chunk is produced by walking that chunk's chain (spec
@@ -809,10 +831,9 @@ Uint8List _recordContent(Uint8List data, int offset, int length) {
 ///
 /// Public because a caller does not always want the whole sequence.
 /// [decodeKeyframeDeltaIndexed] answers "what does this file decode to" and so
-/// keeps every composed state; a seeking client wants one instant, and a
-/// validator wants only to know that each chain composes at all. Both of those
-/// need one state resident at a time, which is what calling this in a loop and
-/// dropping the result gives them (AGENTS.md §1).
+/// keeps every composed state, while a seeking client wants one instant. The
+/// latter needs one state resident at a time, which is what this operation
+/// provides (AGENTS.md §1).
 /// [byOffset] is [keyframeDeltaChainIndex] of the same index, for a caller in a
 /// loop. See that function for why it is worth passing.
 KeyframeDeltaState composeKeyframeDeltaChain(
@@ -848,9 +869,26 @@ Future<KeyframeDeltaState> readKeyframeDeltaChain(
   Map<int, FourdgsChunkIndexEntry>? byOffset,
 }) async {
   final chain = chainFrom(index, entry, byOffset: byOffset);
+  final int size = await source.size();
   KeyframeDeltaState? state;
   for (final link in chain) {
-    final blob = await source.read(link.chunkOffset, link.chunkLength);
+    if (link.chunkOffset < 0 ||
+        link.chunkLength < recordHeaderBytes ||
+        link.chunkOffset + link.chunkLength > size) {
+      throw FourdgsMalformedFile(
+        'the chunk at ${link.chunkOffset} declares a ${link.chunkLength}-byte '
+        'range outside the $size-byte resource',
+      );
+    }
+    final Uint8List blob;
+    try {
+      blob = await source.read(link.chunkOffset, link.chunkLength);
+    } on RangeError catch (error) {
+      throw FourdgsMalformedFile(
+        'the chunk at ${link.chunkOffset} could not be read as its declared '
+        '${link.chunkLength}-byte range: $error',
+      );
+    }
     state = _composeLink(
       state,
       _recordContent(blob, 0, link.chunkLength),
@@ -867,6 +905,8 @@ KeyframeDeltaState _composeLink(
   FourdgsChunkIndexEntry link,
 ) {
   if (link.kind == 0) {
+    final FourdgsChunkBody body = parseChunk(content);
+    _checkKeyframeIndexAgreement(link, body.header);
     final decoded = _keyframeFromChunk(content, at: link.chunkOffset);
     return _keyframeState(decoded.ids, decoded.bins);
   }
@@ -875,7 +915,49 @@ KeyframeDeltaState _composeLink(
       'a keyframe-delta chain begins with a delta chunk',
     );
   }
-  return _composeDelta(state, parseDeltaChunk(content), at: link.chunkOffset);
+  final FourdgsDeltaChunkBody body = parseDeltaChunk(content);
+  _checkDeltaIndexAgreement(link, body.header);
+  return _composeDelta(state, body, at: link.chunkOffset);
+}
+
+void _checkKeyframeIndexAgreement(
+  FourdgsChunkIndexEntry entry,
+  FourdgsChunkHeader chunk,
+) {
+  if (entry.t0 != chunk.t0 ||
+      entry.t1 != chunk.t1 ||
+      entry.gaussianCount != chunk.count) {
+    throw FourdgsMalformedFile(
+      'the index entry for the keyframe at ${entry.chunkOffset} declares '
+      '[${entry.t0}, ${entry.t1}) and ${entry.gaussianCount} gaussians, but '
+      'the Chunk declares [${chunk.t0}, ${chunk.t1}) and ${chunk.count}; '
+      'duplicated fields must agree',
+    );
+  }
+}
+
+void _checkDeltaIndexAgreement(
+  FourdgsChunkIndexEntry entry,
+  FourdgsDeltaChunkHeader chunk,
+) {
+  final int operations =
+      chunk.updateCount + chunk.birthCount + chunk.deathCount;
+  if (entry.t0 != chunk.t0 ||
+      entry.t1 != chunk.t1 ||
+      entry.deltaMode != chunk.deltaMode ||
+      entry.referenceOffset != chunk.referenceOffset ||
+      entry.keyframeOffset != chunk.keyframeOffset ||
+      entry.depth != chunk.depth ||
+      entry.gaussianCount != operations) {
+    throw FourdgsMalformedFile(
+      'the index entry for the delta at ${entry.chunkOffset} disagrees with '
+      'its Delta Chunk: expected interval [${chunk.t0}, ${chunk.t1}), '
+      'delta_mode ${chunk.deltaMode}, reference_offset '
+      '${chunk.referenceOffset}, keyframe_offset ${chunk.keyframeOffset}, '
+      'depth ${chunk.depth}, and gaussian_count $operations; duplicated fields '
+      'must agree',
+    );
+  }
 }
 
 KeyframeDeltaState _composed(KeyframeDeltaState? state) {

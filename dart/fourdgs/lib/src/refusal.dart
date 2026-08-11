@@ -106,6 +106,14 @@ class FourdgsWalk {
   }
 }
 
+/// The most top-level records a framing walk retains.
+///
+/// Records are at least nine bytes, but each retained frame is a heap object.
+/// A ceiling keeps a hostile file made entirely of empty records from turning
+/// a bounded nine-byte scan into unbounded object accumulation. One million is
+/// far beyond a practical scene's record count while remaining a fixed cost.
+const int maxFramedRecords = 1000000;
+
 /// Every top-level record, from framing alone.
 ///
 /// Reads nine bytes per record and steps over the content, so this is as cheap
@@ -156,6 +164,12 @@ Future<FourdgsWalk> walkFourdgsFraming(FourdgsReadable source) async {
     // A record is listed either way: a declared length that runs off the end is
     // a fact about that record, and hiding the record hides the field that
     // carries the fault.
+    if (out.records.length >= maxFramedRecords) {
+      throw FourdgsMalformedFile(
+        'the file carries more than ${fourdgsCommas(maxFramedRecords)} records; '
+        'the framing table is capped before another record is retained',
+      );
+    }
     out.records.add(frame);
     final int end = at + frame.total;
     if (end > size) {

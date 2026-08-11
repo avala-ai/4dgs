@@ -388,6 +388,49 @@ void main() {
         contains(startsWith('the object layer does not decode:')),
       );
     });
+
+    test(
+      'post-chunk auxiliary records are parsed from the complete walk',
+      () async {
+        final FourdgsValidation report = await validateFourdgs(
+          FourdgsBytes(
+            _keyframeDelta(afterChunk: _record(opObjectTable, Uint8List(3))),
+          ),
+        );
+        expect(report.ok, isFalse);
+        expect(
+          _messages(report, FourdgsSeverity.error),
+          contains(startsWith('the object layer does not decode:')),
+        );
+      },
+    );
+
+    test('the SH-depth append is checked against Header degree', () async {
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(_minimal(shDegree: 2, shBitDepths: const <int>[8])),
+      );
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(contains('declares 1 SH bit depths')),
+      );
+    });
+
+    test('a detached Chunk head still reports its file byte', () {
+      final Uint8List head = Uint8List(chunkFixedHeadBytes);
+      final ByteData view = ByteData.sublistView(head);
+      view.setFloat64(0, 2.0, Endian.little);
+      view.setFloat64(8, 1.0, Endian.little);
+      expect(
+        () => parseChunkInterval(head, fileOffset: 1234),
+        throwsA(
+          isA<FourdgsMalformedFile>().having(
+            (FourdgsMalformedFile error) => error.message,
+            'message',
+            contains('Chunk at byte 1234'),
+          ),
+        ),
+      );
+    });
   });
 
   group('a keyframe-delta file is validated against its own model', () {
@@ -478,6 +521,109 @@ void main() {
           contains('band 1 carries 7 gaussians, the chunk holds 1'),
         ),
       );
+    });
+
+    test('a no-index file is composed one record at a time', () async {
+      final Uint8List data = _keyframeDelta(
+        writeIndex: false,
+        afterChunk: _record(0x81, Uint8List(fourdgsHeadProbeBytes * 2)),
+      );
+      final _CountingReadable source = _CountingReadable(data);
+      final FourdgsValidation report = await validateFourdgs(source);
+      expect(report.ok, isTrue);
+      expect(source.largestRead, lessThan(data.length));
+    });
+
+    test('a no-index file still validates its framed SH bands', () async {
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(_keyframeDelta(writeIndex: false, bandElementCount: 7)),
+      );
+      expect(report.ok, isFalse);
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(contains('band 1 carries 7 gaussians, the chunk holds 1')),
+      );
+    });
+
+    test('an indexed band range outside the resource is a finding', () async {
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(
+          _keyframeDelta(bandElementCount: 1, indexBandOffset: 1 << 30),
+        ),
+      );
+      expect(report.ok, isFalse);
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(contains('outside the')),
+      );
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(contains('ShBandStream range for band 1')),
+      );
+    });
+
+    test(
+      'an indexed chunk range outside the resource does not crash',
+      () async {
+        final FourdgsValidation report = await validateFourdgs(
+          FourdgsBytes(_keyframeDelta(indexChunkOffset: 1 << 30)),
+        );
+        expect(report.ok, isFalse);
+        expect(
+          _messages(report, FourdgsSeverity.error),
+          contains('chunk index entry 0 points past the end of the file'),
+        );
+      },
+    );
+
+    test('a complete state chunk omitted from the index is rejected', () async {
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(_keyframeDelta(extraUnindexedKeyframe: true)),
+      );
+      expect(report.ok, isFalse);
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(contains('state chunk the Chunk Index does not name')),
+      );
+    });
+
+    test(
+      'delta metadata duplicated in the index must match the chunk',
+      () async {
+        final FourdgsValidation report = await validateFourdgs(
+          FourdgsBytes(
+            _keyframeDeltaWithEmptyDelta(indexReferenceOffset: 123456),
+          ),
+        );
+        expect(report.ok, isFalse);
+        expect(
+          _messages(report, FourdgsSeverity.error),
+          contains(contains('disagrees with its Delta Chunk')),
+        );
+      },
+    );
+
+    test(
+      'delta gaussian_count is the sum of its three operation groups',
+      () async {
+        final FourdgsValidation report = await validateFourdgs(
+          FourdgsBytes(_keyframeDeltaWithEmptyDelta(indexGaussianCount: 7)),
+        );
+        expect(report.ok, isFalse);
+        expect(
+          _messages(report, FourdgsSeverity.error),
+          contains(
+            contains('chunk carries 0 update, birth, and death operations'),
+          ),
+        );
+      },
+    );
+
+    test('the forward validator accepts a conforming chained delta', () async {
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(_keyframeDeltaWithEmptyDelta()),
+      );
+      expect(_messages(report, FourdgsSeverity.error), isEmpty);
     });
   });
 
@@ -814,14 +960,26 @@ Uint8List _minimal({
   int summaryStart = 0,
   int summaryCrc = 0,
   int footerContentBytes = 20,
+  int shDegree = 0,
+  List<int> shBitDepths = const <int>[],
 }) {
   final BytesBuilder out =
       BytesBuilder()
         ..add(fourdgsMagic)
-        ..add(_record(opHeader, _headerContent(temporalModel: temporalModel)));
+        ..add(
+          _record(
+            opHeader,
+            _headerContent(temporalModel: temporalModel, shDegree: shDegree),
+          ),
+        );
   if (secondHeader != null) out.add(_record(opHeader, secondHeader));
   out
-    ..add(_record(opQuantization, _quantizationContent(scheme: scheme)))
+    ..add(
+      _record(
+        opQuantization,
+        _quantizationContent(scheme: scheme, shBitDepths: shBitDepths),
+      ),
+    )
     ..add(_record(opWindowTable, _windowTableContent()));
   if (extra != null) out.add(extra);
   final BytesBuilder footer =
@@ -856,6 +1014,11 @@ Uint8List _keyframeDelta({
   int kind = 0,
   Uint8List? afterFooter,
   int? bandElementCount,
+  bool writeIndex = true,
+  int? indexBandOffset,
+  int? indexChunkOffset,
+  Uint8List? afterChunk,
+  bool extraUnindexedKeyframe = false,
 }) {
   final Uint8List head =
       (BytesBuilder()
@@ -886,6 +1049,10 @@ Uint8List _keyframeDelta({
 
   Uint8List bandRecord = Uint8List(0);
   if (bandElementCount != null) {
+    final int channels = shBandChannels[1]!;
+    final Uint8List payload = Uint8List.fromList(
+      zlib.encode(List<int>.filled(bandElementCount * channels, 0)),
+    );
     final BytesBuilder band =
         BytesBuilder()
           ..addByte(1) // band
@@ -893,26 +1060,32 @@ Uint8List _keyframeDelta({
           ..addByte(1) // symbol width
           ..addByte(modeRaw)
           ..addByte(codecDeflate)
-          ..addByte(shBandChannels[1]!)
+          ..addByte(channels)
           ..add(_u32(bandElementCount))
-          ..add(_u64(0));
+          ..add(_u64(payload.length))
+          ..add(payload);
     bandRecord = _record(opShBandStream, band.toBytes());
   }
   final int bandOffset = chunkOffset + chunkRecord.length;
 
-  final int indexOffset = bandOffset + bandRecord.length;
+  final BytesBuilder between = BytesBuilder()..add(bandRecord);
+  if (afterChunk != null) between.add(afterChunk);
+  if (extraUnindexedKeyframe) between.add(chunkRecord);
+  final Uint8List betweenRecords = between.toBytes();
+  final int indexOffset =
+      chunkOffset + chunkRecord.length + betweenRecords.length;
   final BytesBuilder entry =
       BytesBuilder()
         ..add(_f64(0.0))
         ..add(_f64(1.0))
-        ..add(_u64(chunkOffset))
+        ..add(_u64(indexChunkOffset ?? chunkOffset))
         ..add(_u64(chunkRecord.length))
         ..add(_u32(1)) // gaussian_count
         ..add(_u32(bandElementCount == null ? 0 : 1));
   if (bandElementCount != null) {
     entry
       ..addByte(1)
-      ..add(_u64(bandOffset))
+      ..add(_u64(indexBandOffset ?? bandOffset))
       ..add(_u64(bandRecord.length));
   }
   entry
@@ -926,21 +1099,154 @@ Uint8List _keyframeDelta({
 
   final BytesBuilder footer =
       BytesBuilder()
-        ..add(_u64(indexOffset))
+        ..add(_u64(writeIndex ? indexOffset : 0))
         ..add(_u64(0))
         ..add(_u32(0));
   final BytesBuilder out =
       BytesBuilder()
         ..add(head)
         ..add(chunkRecord)
-        ..add(bandRecord)
-        ..add(indexRecord)
-        ..add(_record(opFooter, footer.toBytes()));
+        ..add(betweenRecords);
+  if (writeIndex) out.add(indexRecord);
+  out.add(_record(opFooter, footer.toBytes()));
   // After the Footer, which the format does not allow: the Footer is last. The
   // magic still closes the file, so nothing but the tail read can see it.
   if (afterFooter != null) out.add(afterFooter);
   out.add(fourdgsMagic);
   return out.toBytes();
+}
+
+/// A keyframe followed by one chained, zero-operation delta.
+Uint8List _keyframeDeltaWithEmptyDelta({
+  int indexGaussianCount = 0,
+  int? indexReferenceOffset,
+}) {
+  final Uint8List head =
+      (BytesBuilder()
+            ..add(fourdgsMagic)
+            ..add(
+              _record(
+                opHeader,
+                _headerContent(
+                  temporalModel: 'keyframe-delta',
+                  durationSec: 2.0,
+                ),
+              ),
+            )
+            ..add(_record(opQuantization, _quantizationContent()))
+            ..add(_record(opWindowTable, _windowTableContent())))
+          .toBytes();
+  final Uint8List streams = _keyframeStreams(windowIndex: 0);
+  final Uint8List keyframe = _record(
+    opChunk,
+    (BytesBuilder()
+          ..add(_f64(0.0))
+          ..add(_f64(1.0))
+          ..add(_u32(0))
+          ..add(_u32(1))
+          ..add(_string(''))
+          ..add(_u64(0))
+          ..add(_u64(streams.length))
+          ..add(streams))
+        .toBytes(),
+  );
+  final int keyframeOffset = head.length;
+  final BytesBuilder groups =
+      BytesBuilder()
+        ..add(_u64(0))
+        ..add(_u64(0))
+        ..add(_u64(0));
+  final Uint8List groupBytes = groups.toBytes();
+  final Uint8List delta = _record(
+    opDeltaChunk,
+    (BytesBuilder()
+          ..add(_f64(1.0))
+          ..add(_f64(2.0))
+          ..add(_u32(0))
+          ..addByte(deltaModeChained)
+          ..add(_u64(keyframeOffset))
+          ..add(_u64(keyframeOffset))
+          ..add(_u16(1))
+          ..add(_u32(0))
+          ..add(_u32(0))
+          ..add(_u32(0))
+          ..add(_string(''))
+          ..add(_u64(0))
+          ..add(_u64(groupBytes.length))
+          ..add(groupBytes))
+        .toBytes(),
+  );
+  final int deltaOffset = keyframeOffset + keyframe.length;
+
+  Uint8List entry({
+    required double t0,
+    required double t1,
+    required int chunkOffset,
+    required int chunkLength,
+    required int gaussianCount,
+    required int kind,
+    required int referenceOffset,
+    required int depth,
+  }) =>
+      (BytesBuilder()
+            ..add(_f64(t0))
+            ..add(_f64(t1))
+            ..add(_u64(chunkOffset))
+            ..add(_u64(chunkLength))
+            ..add(_u32(gaussianCount))
+            ..add(_u32(0))
+            ..addByte(kind)
+            ..addByte(kind == 0 ? deltaModeKeyframe : deltaModeChained)
+            ..add(_u64(referenceOffset))
+            ..add(_u64(keyframeOffset))
+            ..add(_u16(depth))
+            ..add(_u64(1)))
+          .toBytes();
+
+  final Uint8List firstIndex = _record(
+    opChunkIndex,
+    entry(
+      t0: 0.0,
+      t1: 1.0,
+      chunkOffset: keyframeOffset,
+      chunkLength: keyframe.length,
+      gaussianCount: 1,
+      kind: 0,
+      referenceOffset: 0,
+      depth: 0,
+    ),
+  );
+  final Uint8List secondIndex = _record(
+    opChunkIndex,
+    entry(
+      t0: 1.0,
+      t1: 2.0,
+      chunkOffset: deltaOffset,
+      chunkLength: delta.length,
+      gaussianCount: indexGaussianCount,
+      kind: 1,
+      referenceOffset: indexReferenceOffset ?? keyframeOffset,
+      depth: 1,
+    ),
+  );
+  final int indexOffset = deltaOffset + delta.length;
+  final Uint8List footer = _record(
+    opFooter,
+    (BytesBuilder()
+          ..add(_u64(indexOffset))
+          ..add(_u64(0))
+          ..add(_u32(0)))
+        .toBytes(),
+  );
+  return (BytesBuilder()
+        ..add(head)
+        ..add(keyframe)
+        ..add(delta)
+        ..add(firstIndex)
+        ..add(secondIndex)
+        ..add(footer)
+        ..add(fourdgsMagic))
+      .toBytes();
 }
 
 /// One constant-mode stream carrying [value] in every channel.
@@ -1043,12 +1349,16 @@ Uint8List _record(int opcode, Uint8List content) {
   return out.toBytes();
 }
 
-Uint8List _headerContent({String temporalModel = 'gaussian-birth'}) {
+Uint8List _headerContent({
+  String temporalModel = 'gaussian-birth',
+  int shDegree = 0,
+  double durationSec = 1.0,
+}) {
   final BytesBuilder body =
       BytesBuilder()
         ..add(_string('')) // profile
         ..add(_string('')) // library
-        ..add(_f64(1.0)) // duration_sec
+        ..add(_f64(durationSec)) // duration_sec
         ..add(_u64(0)) // gaussian_count
         ..add(_f64(0.05)) // cutoff
         ..add(_string(temporalModel));
@@ -1056,13 +1366,16 @@ Uint8List _headerContent({String temporalModel = 'gaussian-birth'}) {
     body.add(_f64(0.0)); // aabb
   }
   body
-    ..addByte(0) // sh_degree
+    ..addByte(shDegree) // sh_degree
     ..addByte(0) // flags
     ..add(_u32(0)); // empty attribute map
   return body.toBytes();
 }
 
-Uint8List _quantizationContent({String scheme = 'uniform-v1'}) {
+Uint8List _quantizationContent({
+  String scheme = 'uniform-v1',
+  List<int> shBitDepths = const <int>[],
+}) {
   final BytesBuilder body = BytesBuilder()..add(_string(scheme));
   for (int i = 0; i < 3; i++) {
     body.add(_f64(0.0)); // pos_origin
@@ -1073,6 +1386,11 @@ Uint8List _quantizationContent({String scheme = 'uniform-v1'}) {
   body
     ..addByte(1) // step_sh
     ..add(_u32(0)); // empty bounds map
+  if (shBitDepths.isNotEmpty) {
+    body
+      ..addByte(shBitDepths.length)
+      ..add(shBitDepths);
+  }
   return body.toBytes();
 }
 

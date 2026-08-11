@@ -278,6 +278,13 @@ void main() {
       double.infinity,
       Endian.little,
     );
+    // The interval is duplicated in the Delta Chunk as a cheap corruption
+    // check (§5.8), so a conforming open-ended fixture changes both copies.
+    view.setFloat64(
+      result.index.last.chunkOffset + recordHeaderBytes + 8,
+      double.infinity,
+      Endian.little,
+    );
 
     final reopened = decodeKeyframeDeltaIndexed(patched);
     expect(reopened.sequence.header.durationSec, double.infinity);
