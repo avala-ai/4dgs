@@ -1112,8 +1112,6 @@ void main() {
       final bytes = writeFourdgsBytes(scene, 8.0, options: chunked);
       final indexed = await openFourdgsIndexed(FourdgsBytes(bytes));
       final k = math.sqrt(-2.0 * math.log(indexed.header.cutoff));
-      final boundTime = declared(indexed.quantization, 'time');
-      final boundSigmaRel = declared(indexed.quantization, 'sigma_rel');
 
       for (final entry in indexed.index) {
         final chunk = await readFourdgsChunk(
@@ -1130,15 +1128,11 @@ void main() {
           // whose interval fully contains its support. Break it and an instant
           // inside [t0, t1) is served without a gaussian visible there.
           //
-          // The tolerance is the file's own, not a fudge. The partition is built
-          // on the support the caller handed in; what comes back out is rebuilt
-          // from the birth-time and sigma bins, so an edge may move by the
-          // declared `time` bound plus the declared relative `sigma_rel` bound
-          // applied to the half-width. Anything beyond that is a filing error.
-          final slack =
-              boundTime + (sigma.isFinite ? k * sigma * boundSigmaRel : 0.0);
-          expect(lo, greaterThanOrEqualTo(entry.t0 - slack));
-          expect(hi, lessThanOrEqualTo(entry.t1 + slack));
+          // Assignment is built from these reconstructed values, so no
+          // quantization tolerance belongs here: an edge past the interval is
+          // an instant the streamed path can see and the indexed path can miss.
+          expect(lo, greaterThanOrEqualTo(entry.t0));
+          expect(hi, lessThanOrEqualTo(entry.t1));
         }
       }
     });
@@ -1154,15 +1148,9 @@ void main() {
       // seek rule is half-open — `t0 <= t < t1` — so a point strictly inside an
       // interval is served by exactly the entries that should serve it.
       //
-      // Not the midpoint. A node's midpoint is precisely where it splits its
-      // children, so it is the one instant in the interval where a gaussian's
-      // *reconstructed* support can sit on the far side of a boundary its
-      // *input* support did not cross — by less than the file's declared time
-      // bound, but enough to be counted here and not there. That is a property
-      // of quantizing after partitioning, not a filing error, and probing a
-      // boundary would test it rather than the seek.
       final probes = <double>{
         0.0,
+        for (final entry in indexed.index) entry.t0,
         for (final entry in indexed.index)
           entry.t0 + 0.37 * (entry.t1 - entry.t0),
         8.0 - 1e-6,

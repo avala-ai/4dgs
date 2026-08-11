@@ -241,6 +241,8 @@ void writeFourdgsToSink(
     gaussians,
     tops,
     options,
+    grid: grid,
+    windows: windows,
     staticScene: durationSec == 0.0,
   );
 
@@ -1209,15 +1211,20 @@ List<_Plan> _planChunks(
   FourdgsGaussianSet g,
   List<double> tops,
   FourdgsWriteOptions options, {
+  required _Grid grid,
+  required _WindowTable windows,
   required bool staticScene,
 }) {
   final n = g.count;
   if (n == 0) return const <_Plan>[];
 
-  // Support, clipped to each gaussian's own validity window and computed with
-  // the file's own cutoff — the same threshold the Header declares, so the
-  // partition a reader would derive is the partition the encoder built.
-  final support = g.support(cutoff: options.cutoff);
+  // Partition the state the file will reconstruct, not the authored values on
+  // the near side of quantization. A mu_t or sigma_t bin may move a support edge
+  // across a tree boundary. Filing by the authored edge then lets the streamed
+  // reader see a gaussian at an instant whose indexed seek does not fetch its
+  // chunk. This bounded pass repeats only those two scalar grids and narrows
+  // them to float32 exactly where the public decoder does.
+  final support = _reconstructedSupport(g, grid, windows, options.cutoff);
   final lo = support.lo;
   final hi = support.hi;
   tops = _finiteTailTops(tops, lo, hi);
@@ -1431,6 +1438,50 @@ List<_Plan> _planChunks(
     }
   }
   return plans;
+}
+
+/// Per-gaussian support after the exact sigma and birth-time reconstruction a
+/// reader performs.
+///
+/// The returned pair is the planner's two scene-sized typed arrays. Everything
+/// else is scalar or the two-float narrowing scratch, so quantization does not
+/// add another retained lane to the writer's bounded-memory partition.
+({Float64List lo, Float64List hi}) _reconstructedSupport(
+  FourdgsGaussianSet g,
+  _Grid grid,
+  _WindowTable table,
+  double cutoff,
+) {
+  final lo = Float64List(g.count);
+  final hi = Float64List(g.count);
+  final narrowed = Float32List(2);
+  final k = supportK(cutoff);
+
+  for (int i = 0; i < g.count; i++) {
+    final neverFades = !g.sigmaT[i].isFinite;
+    final sigmaBin =
+        neverFades
+            ? 0
+            : _bin(
+              math.log(g.sigmaT[i] == 0.0 ? 1e-30 : g.sigmaT[i]) /
+                  grid.stepSigmaLog,
+              'sigma_t',
+              i,
+            );
+    narrowed[0] =
+        neverFades ? double.infinity : math.exp(sigmaBin * grid.stepSigmaLog);
+    final sigma = narrowed[0];
+    final step = muStep(sigmaBin, grid.stepSigmaLog, neverFades, grid.stepTime);
+    final muBin = _bin(g.muT[i] / step, 'mu_t', i);
+    narrowed[1] = muBin * step;
+    final mu = narrowed[1];
+
+    final window = table.windows[table.rank(g.winLo[i], g.winHi[i])];
+    final half = sigma.isFinite ? k * math.max(sigma, 1e-30) : double.infinity;
+    lo[i] = math.max(mu - half, window[0]);
+    hi[i] = math.min(mu + half, window[1]);
+  }
+  return (lo: lo, hi: hi);
 }
 
 /// Give an open-ended final window a finite prefix the tree can bisect.
