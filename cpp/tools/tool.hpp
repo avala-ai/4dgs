@@ -50,6 +50,8 @@ constexpr std::size_t kMaxChunkIndexEntries = 262144;
 /// kinds, the index and the two open ranges. The wire numbers are the one part of the format
 /// that never moves, and a tool that walks framing has to know them to walk anything.
 namespace op {
+/// Reserved sentinel. Section 4.3 says writers never emit it as a record opcode.
+constexpr std::uint8_t kReservedZero = 0x00;
 constexpr std::uint8_t kHeader = 0x01;
 constexpr std::uint8_t kFooter = 0x02;
 constexpr std::uint8_t kQuantization = 0x03;
@@ -221,8 +223,11 @@ struct BandRange {
 
 /// One chunk index entry: where its chunk sits, and where each of its bands does.
 struct IndexEntry {
+  double t0 = 0.0;
+  double t1 = 0.0;
   std::uint64_t offset = 0;
   std::uint64_t length = 0;
+  std::uint32_t gaussianCount = 0;
   /// Band 1 upwards, in the order the entry lists them. Empty for a file with no spherical
   /// harmonics, and for one whose encoder wrote none — both of which are ordinary.
   std::vector<BandRange> bands;
@@ -265,7 +270,7 @@ std::vector<IndexEntry> chunkIndexEntries(Readable& source, const Walk& walk);
 
 /// The Header's temporal model, range-parsed through its length-framed profile and library.
 /// Empty when the Header is absent or malformed.
-std::string temporalModel(Readable& source, const Walk& walk);
+Result<std::string> temporalModel(Readable& source, const Walk& walk);
 
 /// What the Footer declares about the summary checksum, and where the summary ends.
 struct SummaryDeclaration {

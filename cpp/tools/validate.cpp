@@ -38,6 +38,7 @@
 ///   the model — the conformance suite proves it — so refusing a file for declaring it was never
 ///   a statement about the file.
 
+#include <cstring>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -97,14 +98,35 @@ void noteTheCut(Report* report, const Walk& walk) {
                    " complete records before it are intact, and a streamed reader recovers them");
 }
 
-bool readExactly(Readable& source, std::uint64_t offset, std::uint8_t* into, std::size_t length) {
+Result<void> readExactly(Readable& source, std::uint64_t offset, std::uint8_t* into,
+                         std::size_t length) {
   Result<std::size_t> got = source.read(offset, Span<std::uint8_t>(into, length));
-  return got.ok() && *got == length;
+  if (!got) return got.error();
+  if (*got != length) {
+    return Error(ErrorCode::kIo, "short range read at byte " + std::to_string(offset) +
+                                     ": wanted " + std::to_string(length) + " bytes, got " +
+                                     std::to_string(*got));
+  }
+  return Result<void>();
 }
 
 std::uint32_t readU32(const std::uint8_t* at) {
   std::uint32_t value = 0;
   for (int i = 3; i >= 0; --i) value = (value << 8) | at[i];
+  return value;
+}
+
+std::uint64_t readU64(const std::uint8_t* at) {
+  std::uint64_t value = 0;
+  for (int i = 7; i >= 0; --i) value = (value << 8) | at[i];
+  return value;
+}
+
+double readF64(const std::uint8_t* at) {
+  const std::uint64_t bits = readU64(at);
+  double value = 0.0;
+  static_assert(sizeof(value) == sizeof(bits), "f64 and uint64 must have equal width");
+  std::memcpy(&value, &bits, sizeof(value));
   return value;
 }
 
@@ -162,31 +184,38 @@ void checkKeyframeDelta(Report* report) {
 /// A fixed head probe is unrelated to the wire format: `profile` and `library` are legal strings
 /// of any framed length, so either can move `temporal_model` past such a probe. Only the model's
 /// own bytes are read here; large preceding strings are skipped by their validated lengths.
-std::string rangeParsedModel(Readable& source, const Walk& walk) {
+Result<std::string> rangeParsedModel(Readable& source, const Walk& walk) {
   const Frame* header = walk.firstIntact(op::kHeader);
   if (header == nullptr) return std::string();
   const std::uint64_t start = header->offset + kRecordHeaderSize;
   const std::uint64_t limit = start + header->length;
   if (limit < start) return std::string();
   std::uint64_t at = start;
-  auto skipString = [&]() -> bool {
+  auto skipString = [&]() -> Result<bool> {
     if (at > limit || limit - at < 4) return false;
     std::uint8_t lengthBytes[4];
-    if (!readExactly(source, at, lengthBytes, sizeof(lengthBytes))) return false;
+    Result<void> read = readExactly(source, at, lengthBytes, sizeof(lengthBytes));
+    if (!read) return read.error();
     const std::uint64_t length = readU32(lengthBytes);
     at += 4;
     if (at > limit || length > limit - at) return false;
     at += length;
     return true;
   };
-  if (!skipString() || !skipString()) return std::string();
+  Result<bool> profile = skipString();
+  if (!profile) return profile.error();
+  if (!*profile) return std::string();
+  Result<bool> library = skipString();
+  if (!library) return library.error();
+  if (!*library) return std::string();
   // duration_sec, gaussian_count, cutoff.
   constexpr std::uint64_t kFixedBeforeModel = 8 + 8 + 8;
   if (at > limit || kFixedBeforeModel > limit - at) return std::string();
   at += kFixedBeforeModel;
   if (at > limit || limit - at < 4) return std::string();
   std::uint8_t lengthBytes[4];
-  if (!readExactly(source, at, lengthBytes, sizeof(lengthBytes))) return std::string();
+  Result<void> readLength = readExactly(source, at, lengthBytes, sizeof(lengthBytes));
+  if (!readLength) return readLength.error();
   const std::uint64_t length = readU32(lengthBytes);
   at += 4;
   if (at > limit || length > limit - at) return std::string();
@@ -194,7 +223,8 @@ std::string rangeParsedModel(Readable& source, const Walk& walk) {
   constexpr std::size_t kKeyframeDeltaLength = sizeof(kKeyframeDelta) - 1;
   if (length != kKeyframeDeltaLength) return std::string("other");
   std::uint8_t model[kKeyframeDeltaLength];
-  if (!readExactly(source, at, model, sizeof(model))) return std::string();
+  Result<void> readModel = readExactly(source, at, model, sizeof(model));
+  if (!readModel) return readModel.error();
   for (std::size_t i = 0; i < kKeyframeDeltaLength; ++i) {
     if (model[i] != static_cast<std::uint8_t>(kKeyframeDelta[i])) return std::string("other");
   }
@@ -203,7 +233,7 @@ std::string rangeParsedModel(Readable& source, const Walk& walk) {
 
 }  // namespace
 
-std::string temporalModel(Readable& source, const Walk& walk) {
+Result<std::string> temporalModel(Readable& source, const Walk& walk) {
   return rangeParsedModel(source, walk);
 }
 
@@ -243,7 +273,13 @@ Report validate(Readable& source) {
 
   // Framing first, and for two reasons: it refuses a file that is not ours before anything reads
   // a byte as an opcode, and it is what gives every later refusal a byte to point at.
-  Result<Walk> walked = walk(source);
+  std::optional<Frame> undersizedIndex;
+  Result<Walk> walked = walk(source, [&](const Frame& frame, bool complete) {
+    if (complete && frame.opcode == op::kChunkIndex && frame.length < 40 &&
+        !undersizedIndex.has_value()) {
+      undersizedIndex = frame;
+    }
+  });
   if (!walked) {
     refused(&report, "", walked.error(), nullptr, std::nullopt);
     return report;
@@ -274,7 +310,11 @@ Report validate(Readable& source) {
     if (count == 0) continue;
     const std::uint8_t opcode = static_cast<std::uint8_t>(value);
     const Frame* first = walk.firstIntact(opcode);
-    if (opcode == op::kAttributeStream) {
+    if (opcode == op::kReservedZero) {
+      error(&report, "the top-level record at byte " +
+                         std::to_string(first == nullptr ? 0 : first->offset) +
+                         " uses reserved opcode 0x00; section 4.3 says it is never emitted");
+    } else if (opcode == op::kAttributeStream) {
       // Its registry number is used inside Chunk; the structural error is emitted below.
       continue;
     } else if (opcode == op::kAttachmentIndex) {
@@ -344,11 +384,20 @@ Report validate(Readable& source) {
   // Asked of the reader rather than parsed here: this is the one field the whole branch turns
   // on, and a tool that read it out of the Header itself could disagree with the reader about
   // which model a file declares — which is the one disagreement that would matter.
-  const std::string model = temporalModel(source, walk);
-  const bool keyframeDelta = model == "keyframe-delta";
+  Result<std::string> model = temporalModel(source, walk);
+  if (!model) {
+    incomplete(&report, "cannot range-read the Header temporal_model: " + model.error().message);
+    return report;
+  }
+  const bool keyframeDelta = *model == "keyframe-delta";
 
   const std::vector<IndexEntry> index = chunkIndexEntries(source, walk);
   const std::uint64_t physicalIndexCount = walk.intactOpcodeCounts[op::kChunkIndex];
+  if (undersizedIndex.has_value()) {
+    error(&report, "the Chunk Index record at byte " + std::to_string(undersizedIndex->offset) +
+                       " declares " + std::to_string(undersizedIndex->length) +
+                       " content bytes; the fixed version-1 prefix requires at least 40");
+  }
   const bool completeIndex = physicalIndexCount <= kMaxChunkIndexEntries;
   if (!completeIndex) {
     incomplete(&report, "index validation is incomplete: the file carries more than " +
@@ -366,6 +415,7 @@ Report validate(Readable& source) {
     std::size_t entry = 0;
     BandRange range;
     std::optional<Frame> physical;
+    std::optional<std::uint64_t> physicalOwner;
   };
   std::vector<IndexedBand> indexedBands;
   std::unordered_map<std::uint64_t, std::vector<std::size_t>> wantedBands;
@@ -378,7 +428,7 @@ Report validate(Readable& source) {
     }
     for (const BandRange& range : index[i].bands) {
       const std::size_t at = indexedBands.size();
-      indexedBands.push_back(IndexedBand{i, range, std::nullopt});
+      indexedBands.push_back(IndexedBand{i, range, std::nullopt, std::nullopt});
       wantedBands[range.offset].push_back(at);
       indexedBandOffsets.insert(range.offset);
     }
@@ -396,10 +446,17 @@ Report validate(Readable& source) {
     }
     const auto foundBands = wantedBands.find(frame.offset);
     if (foundBands != wantedBands.end()) {
-      for (std::size_t i : foundBands->second) indexedBands[i].physical = frame;
+      for (std::size_t i : foundBands->second) {
+        indexedBands[i].physical = frame;
+        indexedBands[i].physicalOwner = physicalStateOwner;
+      }
     }
     const bool state = frame.opcode == op::kChunk || frame.opcode == op::kDeltaChunk;
-    if (state) physicalStateOwner = frame.offset;
+    if (state) {
+      physicalStateOwner = frame.offset;
+    } else if (frame.opcode != op::kShBandStream) {
+      physicalStateOwner.reset();
+    }
     if (!keyframeDelta && frame.opcode == op::kDeltaChunk && !firstGaussianBirthDelta.has_value()) {
       firstGaussianBirthDelta = frame;
     }
@@ -433,15 +490,49 @@ Report validate(Readable& source) {
     } else if (!physical[i].has_value() ||
                (physical[i]->opcode != op::kChunk &&
                 !(keyframeDelta && physical[i]->opcode == op::kDeltaChunk))) {
-      error(&report, "chunk index entry " + std::to_string(i) +
-                         " does not point at the start of a " +
-                         (keyframeDelta ? "top-level Chunk or Delta Chunk record"
-                                        : "top-level Chunk record"));
+      error(
+          &report,
+          "chunk index entry " + std::to_string(i) + " does not point at the start of a " +
+              (keyframeDelta ? "top-level Chunk or Delta Chunk record" : "top-level Chunk record"));
     } else if (physical[i]->total() != entry.length) {
       error(&report, "chunk index entry " + std::to_string(i) + " declares " +
                          std::to_string(entry.length) + " bytes at " +
                          std::to_string(entry.offset) + "; the record there is " +
                          std::to_string(physical[i]->total()) + " bytes");
+    }
+    if (!overflows && physical[i].has_value() && physical[i]->opcode == op::kChunk &&
+        physical[i]->total() == entry.length) {
+      constexpr std::size_t kChunkPrefix = 8 + 8 + 4 + 4;
+      if (physical[i]->length < kChunkPrefix) {
+        error(&report, "the Chunk at byte " + std::to_string(entry.offset) + " declares " +
+                           std::to_string(physical[i]->length) +
+                           " content bytes; its fixed header requires 24");
+      } else {
+        std::uint8_t prefix[kChunkPrefix];
+        Result<void> read =
+            readExactly(source, entry.offset + kRecordHeaderSize, prefix, sizeof(prefix));
+        if (!read) {
+          incomplete(&report, "cannot range-read the Chunk header at byte " +
+                                  std::to_string(entry.offset) + ": " + read.error().message);
+          return report;
+        }
+        const double chunkT0 = readF64(prefix);
+        const double chunkT1 = readF64(prefix + 8);
+        const std::uint32_t chunkCount = readU32(prefix + 20);
+        if (chunkT0 != entry.t0 || chunkT1 != entry.t1) {
+          error(&report, "chunk index entry " + std::to_string(i) + " declares interval [" +
+                             std::to_string(entry.t0) + ", " + std::to_string(entry.t1) +
+                             "); the Chunk at byte " + std::to_string(entry.offset) +
+                             " declares [" + std::to_string(chunkT0) + ", " +
+                             std::to_string(chunkT1) + ")");
+        }
+        if (chunkCount != entry.gaussianCount) {
+          error(&report, "chunk index entry " + std::to_string(i) + " declares " +
+                             std::to_string(entry.gaussianCount) +
+                             " gaussians; the Chunk at byte " + std::to_string(entry.offset) +
+                             " declares " + std::to_string(chunkCount));
+        }
+      }
     }
   }
   for (const IndexedBand& band : indexedBands) {
@@ -460,6 +551,28 @@ Report validate(Readable& source) {
                          std::to_string(band.range.length) + " bytes at " +
                          std::to_string(band.range.offset) + "; the record there is " +
                          std::to_string(band.physical->total()) + " bytes");
+    } else {
+      if (!band.physicalOwner.has_value() || *band.physicalOwner != index[band.entry].offset) {
+        error(&report, "SH band " + std::to_string(band.range.band) + " at index entry " +
+                           std::to_string(band.entry) + " points at byte " +
+                           std::to_string(band.range.offset) +
+                           ", which does not immediately follow its owning state record at byte " +
+                           std::to_string(index[band.entry].offset));
+      }
+      std::uint8_t declaredBand = 0;
+      Result<void> read = readExactly(source, band.range.offset + kRecordHeaderSize, &declaredBand,
+                                      sizeof(declaredBand));
+      if (!read) {
+        incomplete(&report, "cannot range-read the SH Band Stream at byte " +
+                                std::to_string(band.range.offset) + ": " + read.error().message);
+        return report;
+      }
+      if (declaredBand != band.range.band) {
+        error(&report, "SH band " + std::to_string(band.range.band) + " at index entry " +
+                           std::to_string(band.entry) + " points at byte " +
+                           std::to_string(band.range.offset) + ", whose record declares band " +
+                           std::to_string(declaredBand));
+      }
     }
   }
   if (firstUnindexedState.has_value()) {

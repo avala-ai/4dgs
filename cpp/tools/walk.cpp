@@ -20,6 +20,7 @@
 /// invalid corpus's seven files clean.
 
 #include <cstdio>
+#include <cstring>
 #include <memory>
 
 #include "tool.hpp"
@@ -42,6 +43,20 @@ constexpr const char* kUnknownQuantizationScheme = "unknown-quantization-scheme"
 std::uint64_t readU64(const std::uint8_t* at) {
   std::uint64_t value = 0;
   for (int i = 7; i >= 0; --i) value = (value << 8) | at[i];
+  return value;
+}
+
+std::uint32_t readU32(const std::uint8_t* at) {
+  std::uint32_t value = 0;
+  for (int i = 3; i >= 0; --i) value = (value << 8) | at[i];
+  return value;
+}
+
+double readF64(const std::uint8_t* at) {
+  const std::uint64_t bits = readU64(at);
+  double value = 0.0;
+  static_assert(sizeof(value) == sizeof(bits), "f64 and uint64 must have equal width");
+  std::memcpy(&value, &bits, sizeof(value));
   return value;
 }
 
@@ -318,8 +333,8 @@ Result<Walk> walk(Readable& source, const FrameVisitor& visitor) {
       if (*tailRead != remaining) {
         Cut cut;
         cut.at = at;
-        cut.reason = "the last " + commas(remaining) + " bytes returned only " +
-                     commas(*tailRead) + " bytes";
+        cut.reason = "the last " + commas(remaining) + " bytes returned only " + commas(*tailRead) +
+                     " bytes";
         out.cut = cut;
         break;
       }
@@ -346,14 +361,14 @@ Result<Walk> walk(Readable& source, const FrameVisitor& visitor) {
     // Nine bytes or none. A short read here would otherwise be parsed as a record: whatever byte
     // arrived becomes an opcode and the unread remainder becomes a declared length, so the walk
     // would report an invented record instead of naming the byte the file stops at.
-    Result<std::size_t> framingRead = source.read(
-        at, Span<std::uint8_t>(framing, static_cast<std::size_t>(kRecordHeaderSize)));
+    Result<std::size_t> framingRead =
+        source.read(at, Span<std::uint8_t>(framing, static_cast<std::size_t>(kRecordHeaderSize)));
     if (!framingRead) return framingRead.error();
     if (*framingRead != kRecordHeaderSize) {
       Cut cut;
       cut.at = at;
-      cut.reason = "the record header at this byte returned only " +
-                   commas(*framingRead) + " of " + commas(kRecordHeaderSize) + " bytes";
+      cut.reason = "the record header at this byte returned only " + commas(*framingRead) + " of " +
+                   commas(kRecordHeaderSize) + " bytes";
       out.cut = cut;
       break;
     }
@@ -473,8 +488,11 @@ std::vector<IndexEntry> chunkIndexEntries(Readable& source, const Walk& framing)
     if (frame.length < kPrefix) return;
     if (!readExactly(source, content, prefix, kPrefix)) return;
     IndexEntry entry;
+    entry.t0 = readF64(prefix);
+    entry.t1 = readF64(prefix + 8);
     entry.offset = readU64(prefix + kOffsetField);
     entry.length = readU64(prefix + kOffsetField + 8);
+    entry.gaussianCount = readU32(prefix + 32);
     // `gaussian_count` then `band_count`, two `u32`s closing the prefix.
     std::uint32_t bands = 0;
     for (int i = 3; i >= 0; --i) bands = (bands << 8) | prefix[36 + i];
