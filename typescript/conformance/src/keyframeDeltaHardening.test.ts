@@ -85,12 +85,12 @@ const STEPS = {
   sigmaLog: 0.01,
 };
 
-function headerBody(durationSec: number, shDegree = 0): Uint8Array {
+function headerBody(durationSec: number, shDegree = 0, gaussianCount = 1): Uint8Array {
   return concat([
     str(""), // profile
     str(""), // library
     f64(durationSec),
-    u64(1), // gaussian_count
+    u64(gaussianCount),
     f64(0.05), // cutoff
     str("keyframe-delta"),
     f64(0),
@@ -216,6 +216,34 @@ function deltaChunkRecord(options: {
   return record(0x10, body);
 }
 
+function updateDeltaChunkRecord(options: {
+  t0: number;
+  t1: number;
+  referenceOffset: number;
+  updates: Uint8Array;
+}): Uint8Array {
+  const blob = concat([u64(options.updates.length), options.updates, u64(0), u64(0)]);
+  return record(
+    0x10,
+    concat([
+      f64(options.t0),
+      f64(options.t1),
+      u32(0),
+      new Uint8Array([0]),
+      u64(options.referenceOffset),
+      u64(options.referenceOffset),
+      new Uint8Array([1, 0]),
+      u32(1),
+      u32(0),
+      u32(0),
+      str(""),
+      u64(blob.length),
+      u64(blob.length),
+      blob,
+    ]),
+  );
+}
+
 /**
  * A keyframe with one gaussian and no `object_id`, then a delta that births one with it.
  *
@@ -225,10 +253,11 @@ function deltaChunkRecord(options: {
  */
 async function keyframeThenBirthFile(options: {
   born: number;
-  objectId: number;
+  objectId?: number;
+  keyframeObjectId?: number;
   birthIdChannels?: number;
 }): Promise<Uint8Array> {
-  const keyframeStreams = await oneGaussianStreams(0, 0);
+  const keyframeStreams = await oneGaussianStreams(0, 0, options.keyframeObjectId);
   const keyframe = chunkRecord(0, 0.5, keyframeStreams, "", keyframeStreams.length);
   const front = concat([
     MAGIC,
@@ -287,12 +316,13 @@ function chunkRecord(
   blob: Uint8Array,
   compression: string,
   uncompressedSize: number,
+  count = 1,
 ): Uint8Array {
   const body = concat([
     f64(t0),
     f64(t1),
     u32(0), // level
-    u32(1), // count
+    u32(count),
     str(compression),
     u64(uncompressedSize),
     u64(blob.length),
@@ -670,6 +700,66 @@ test("a birth that introduces object_id defaults the rows that came before it", 
   const after = reconstructKeyframeDelta(sequence, sequence.chunks[1]!, 0.75);
   assert.deepEqual([...after.ids], [0, born], "ascending gaussian_id");
   assert.deepEqual([...after.objectId!], [0, objectId]);
+});
+
+test("a birth that omits object_id defaults its new row to background", async () => {
+  const existingObject = 42;
+  const born = 7;
+  const file = await keyframeThenBirthFile({ born, keyframeObjectId: existingObject });
+  const sequence = await decodeKeyframeDeltaStreamed(file);
+  const after = reconstructKeyframeDelta(sequence, sequence.chunks[1]!, 0.75);
+  assert.deepEqual([...after.ids], [0, born]);
+  assert.deepEqual([...after.objectId!], [existingObject, 0]);
+});
+
+test("a streamless empty keyframe reconstructs as empty state", async () => {
+  const empty = new Uint8Array(0);
+  const file = concat([
+    MAGIC,
+    record(0x01, headerBody(1, 0, 0)),
+    record(0x03, quantizationBody()),
+    record(0x04, windowTableBody([[0, 1]])),
+    chunkRecord(0, 1, empty, "", 0, 0),
+  ]);
+  const sequence = await decodeKeyframeDeltaStreamed(file);
+  const reconstructed = reconstructKeyframeDelta(sequence, sequence.chunks[0]!, 0.5);
+  assert.equal(reconstructed.count, 0);
+  assert.equal(reconstructed.ids.byteLength, 0);
+  assert.equal(reconstructed.centers.byteLength, 0);
+  assert.equal(reconstructed.sh, null);
+});
+
+test("an update restates rotation_index and rotation together", async () => {
+  const keyframeStreams = await oneGaussianStreams(0, 0);
+  const keyframe = chunkRecord(0, 0.5, keyframeStreams, "", keyframeStreams.length);
+  const front = concat([
+    MAGIC,
+    record(0x01, headerBody(1)),
+    record(0x03, quantizationBody()),
+    record(0x04, windowTableBody([[0, 1]])),
+  ]);
+  const updates = concat(
+    await Promise.all([
+      encodeTestStream({ attributeId: Attribute.GaussianId, values: [0], channels: 1 }),
+      encodeTestStream({ attributeId: Attribute.RotationIndex, values: [2], channels: 1 }),
+    ]),
+  );
+  const file = concat([
+    front,
+    keyframe,
+    updateDeltaChunkRecord({
+      t0: 0.5,
+      t1: 1,
+      referenceOffset: front.length,
+      updates,
+    }),
+  ]);
+  await assert.rejects(
+    () => decodeKeyframeDeltaStreamed(file),
+    (error: unknown) =>
+      error instanceof MalformedFile &&
+      /restate rotation_index and all three rotation bins together/.test(error.message),
+  );
 });
 
 test("an attribute stream whose channel width is not the registry's is refused", async () => {

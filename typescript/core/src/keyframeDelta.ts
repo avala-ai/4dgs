@@ -233,6 +233,15 @@ function applyDelta(
   checkUnique(birthIds, "a birth group");
   checkUnique(deathIds, "a death group");
 
+  const hasRotationIndex = updateBins.has(Attribute.RotationIndex);
+  const hasRotationBins = updateBins.has(Attribute.Rotation);
+  if (hasRotationIndex !== hasRotationBins) {
+    throw new MalformedFile(
+      "an update must restate rotation_index and all three rotation bins together; one is " +
+        "present and the other is absent",
+    );
+  }
+
   for (const attribute of updateBins.keys()) {
     if (GOP_INVARIANT.has(attribute)) {
       throw new MalformedFile(
@@ -343,7 +352,9 @@ function applyDelta(
       }
     }
     const absent: number[] = [];
-    for (const attribute of bins.keys()) if (!birthBins.has(attribute)) absent.push(attribute);
+    for (const attribute of bins.keys()) {
+      if (attribute !== Attribute.ObjectId && !birthBins.has(attribute)) absent.push(attribute);
+    }
     if (absent.length > 0) {
       absent.sort((a, b) => a - b);
       throw new MalformedFile(
@@ -368,7 +379,7 @@ function applyDelta(
     const grown = new Map<number, Column>();
     for (const attribute of attributes) {
       const existing = bins.get(attribute);
-      const added = birthBins.get(attribute)!;
+      const added = birthBins.get(attribute);
       // A birth may introduce a column the referenced state does not carry: `object_id`
       // is optional per gaussian and per chunk, so a background keyframe legitimately
       // omits it and a later birth legitimately supplies membership. The rows already in
@@ -377,11 +388,16 @@ function applyDelta(
       // merged column is `birth_count` rows long against `count` ids, so the birth's
       // membership lands on the first pre-existing gaussian and the birth itself reads
       // past the end: two gaussians in the wrong object, silently.
-      const before = existing?.values ?? new Int32Array(ids.length * added.channels);
-      const merged = new Int32Array(before.length + added.values.length);
+      const channels = existing?.channels ?? added!.channels;
+      const before = existing?.values ?? new Int32Array(ids.length * channels);
+      // The inverse case is just as important: when an existing object_id
+      // column meets a birth that omits membership, §6.6 supplies background
+      // id 0 for the appended rows rather than making the birth malformed.
+      const after = added?.values ?? new Int32Array(birthIds.length * channels);
+      const merged = new Int32Array(before.length + after.length);
       merged.set(before, 0);
-      merged.set(added.values, before.length);
-      grown.set(attribute, { channels: added.channels, values: merged });
+      merged.set(after, before.length);
+      grown.set(attribute, { channels, values: merged });
     }
     ids = grownIds;
     bins = grown;
@@ -1842,15 +1858,6 @@ export function reconstructKeyframeDelta(
   const state = chunk.state;
   const n = state.count;
   checkCompleteSh(state, sequence.header.shDegree, `state chunk at byte ${chunk.offset}`);
-  const composedSh =
-    sequence.header.shDegree === 0 ? null : mergeBands(n, bandsOf(state), sequence.header.shDegree);
-  if (composedSh !== null && composedSh.degree !== sequence.header.shDegree) {
-    throw new MalformedFile(
-      `state chunk at byte ${chunk.offset} reconstructs SH degree ${composedSh.degree}, the ` +
-        `Header declares ${sequence.header.shDegree}`,
-    );
-  }
-  const shStride = composedSh === null ? 0 : composedSh.coefficients * 3;
   const bins = binsOf(state);
   const objectIdColumn = bins.get(Attribute.ObjectId);
   if (objectIdColumn !== undefined && objectIdColumn.channels !== 1) {
@@ -1858,6 +1865,24 @@ export function reconstructKeyframeDelta(
       `the object_id column of the keyframe-delta chunk at byte ${chunk.offset} declares ` +
         `${objectIdColumn.channels} channels, the format defines 1`,
     );
+  }
+  if (n === 0) {
+    const emptySh =
+      sequence.header.shDegree === 0
+        ? null
+        : mergeBands(0, bandsOf(state), sequence.header.shDegree);
+    return {
+      t,
+      count: 0,
+      ids: new Int32Array(0),
+      centers: new Float64Array(0),
+      scales: new Float64Array(0),
+      rotations: new Float64Array(0),
+      rgb: new Float64Array(0),
+      opacity: new Float64Array(0),
+      sh: emptySh,
+      objectId: objectIdColumn === undefined ? null : new Uint32Array(0),
+    };
   }
 
   // A composed state that has lost a required column is refused by name rather than read
@@ -1908,13 +1933,31 @@ export function reconstructKeyframeDelta(
   order.sort((a, b) => state.ids[a]! - state.ids[b]!);
 
   const visible = order.length;
+  const composedSh =
+    sequence.header.shDegree === 0
+      ? null
+      : mergeBands(
+          visible,
+          new Map(
+            [...bandsOf(state)].map(([band, values]) => [
+              band,
+              selectBandRows(values, coefficientsInBand(band) * 3, order),
+            ]),
+          ),
+          sequence.header.shDegree,
+        );
+  if (composedSh !== null && composedSh.degree !== sequence.header.shDegree) {
+    throw new MalformedFile(
+      `state chunk at byte ${chunk.offset} reconstructs SH degree ${composedSh.degree}, the ` +
+        `Header declares ${sequence.header.shDegree}`,
+    );
+  }
   const ids = new Int32Array(visible);
   const centers = new Float64Array(visible * 3);
   const scales = new Float64Array(visible * 3);
   const rotations = new Float64Array(visible * 4);
   const rgb = new Float64Array(visible * 3);
   const opacity = new Float64Array(visible);
-  const shValues = new Uint8Array(visible * shStride);
   const objectId = objectIdColumn === undefined ? null : new Uint32Array(visible);
 
   let out = 0;
@@ -1964,9 +2007,6 @@ export function reconstructKeyframeDelta(
     const alpha = clamp(opacityBins[i]! * steps.alpha, 0, 1);
     const marginal = sigma === Infinity ? 1 : Math.exp(-0.5 * (dt / sigma) * (dt / sigma));
     opacity[out] = alpha * marginal;
-    if (composedSh !== null) {
-      shValues.set(composedSh.values.subarray(i * shStride, (i + 1) * shStride), out * shStride);
-    }
     if (objectId !== null) objectId[out] = objectIdBins![i]!;
     out++;
   }
@@ -1980,16 +2020,7 @@ export function reconstructKeyframeDelta(
     rotations,
     rgb,
     opacity,
-    sh:
-      composedSh === null
-        ? null
-        : {
-            degree: composedSh.degree,
-            coefficients: composedSh.coefficients,
-            count: out,
-            values: shValues,
-            bands: composedSh.bands,
-          },
+    sh: composedSh,
     objectId,
   };
 }
