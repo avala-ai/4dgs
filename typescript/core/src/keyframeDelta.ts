@@ -952,6 +952,19 @@ export async function decodeKeyframeDeltaStreamed(
     }
     if (next.done) break;
     const record = next.value;
+    if (
+      currentChunk !== null &&
+      record.opcode !== Opcode.Chunk &&
+      record.opcode !== Opcode.DeltaChunk &&
+      record.opcode !== Opcode.ShBandStream
+    ) {
+      // SH Band Streams are a physical suffix of the state record they extend. Once any
+      // unrelated record begins, that suffix is over: a later band must not be attached
+      // across metadata, a private extension, or any other top-level record.
+      finishCurrentBands();
+      currentChunk = null;
+      currentBands = new Set();
+    }
     if (record.opcode === Opcode.Header) {
       header = parseHeader(record.content);
       if (header.temporalModel !== "keyframe-delta") {
@@ -1563,12 +1576,6 @@ async function readRangeBackedIndexedRecord(
         `${framedLength}`,
     );
   }
-  if (contentLength > MAX_KEYFRAME_DELTA_RECORD_BYTES) {
-    throw new MalformedFile(
-      `indexed record opcode ${opcode} at byte ${offset} declares ${contentLength} content ` +
-        `bytes, past the ${MAX_KEYFRAME_DELTA_RECORD_BYTES}-byte per-record reader limit`,
-    );
-  }
   return indexedRecordFromBytes(await readExact(source, offset, length), offset, length);
 }
 
@@ -2004,7 +2011,15 @@ export function reconstructKeyframeDelta(
     );
     const winLo = windows[windowIndex * 2]!;
     const winHi = windows[windowIndex * 2 + 1]!;
-    if (winLo <= t && t < winHi) order.push(i);
+    if (winLo <= t && t < winHi) {
+      const sigmaBin = sigmaBinsCol[i]!;
+      const neverFades = (flags[i]! & GAUSSIAN_FLAG_NEVER_FADES) !== 0;
+      const sigma = neverFades ? Infinity : Math.exp(sigmaBin * steps.sigmaLog);
+      const mu = muBins[i]! * muStep(sigmaBin, steps.sigmaLog, neverFades, steps.time);
+      const dt = t - mu;
+      const marginal = sigma === Infinity ? 1 : Math.exp(-0.5 * (dt / sigma) * (dt / sigma));
+      if (marginal >= sequence.header.cutoff) order.push(i);
+    }
   }
   order.sort((a, b) => state.ids[a]! - state.ids[b]!);
 

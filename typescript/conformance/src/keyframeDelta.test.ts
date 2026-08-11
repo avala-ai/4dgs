@@ -363,6 +363,49 @@ test("range-backed seeks probe record framing before fetching an indexed length"
   );
 });
 
+test("range-backed state records are not limited by the front-matter cap", async () => {
+  const data = bytes(MOVING_CHAINED);
+  const oversizedLength = 64 * 1024 * 1024 + RECORD_HEADER_BYTES + 1;
+  const frame = new Uint8Array(RECORD_HEADER_BYTES);
+  frame[0] = Opcode.Chunk;
+  new DataView(frame.buffer).setBigUint64(1, BigInt(oversizedLength - RECORD_HEADER_BYTES), true);
+  const source = new (class extends BytesReadable {
+    targetOffset = -1;
+    armed = false;
+    readonly ranges: { offset: number; length: number }[] = [];
+
+    override read(offset: bigint, length: bigint): Promise<Uint8Array> {
+      const at = Number(offset);
+      const count = Number(length);
+      if (this.armed && at === this.targetOffset) {
+        this.ranges.push({ offset: at, length: count });
+        // A deliberately short sparse response proves the decoder attempted the valid
+        // large state range after probing its frame. The transport owns how that exact
+        // range is provided; the front-matter retention limit does not apply here.
+        return Promise.resolve(frame);
+      }
+      return super.read(offset, length);
+    }
+  })(data);
+  const decoder = await KeyframeDeltaIndexedDecoder.open(source, { headProbeBytes: 64 });
+  const entry = decoder.index[0]!;
+  source.targetOffset = entry.chunkOffset;
+  source.armed = true;
+  (entry as unknown as { chunkLength: number }).chunkLength = oversizedLength;
+  (decoder as unknown as { size: number }).size = entry.chunkOffset + oversizedLength;
+
+  await assert.rejects(
+    () => decoder.reconstructAt((entry.t0 + entry.t1) / 2),
+    (error: unknown) =>
+      error instanceof MalformedFile &&
+      error.message.includes(`returned ${RECORD_HEADER_BYTES} bytes, expected ${oversizedLength}`),
+  );
+  assert.deepEqual(source.ranges, [
+    { offset: entry.chunkOffset, length: RECORD_HEADER_BYTES },
+    { offset: entry.chunkOffset, length: oversizedLength },
+  ]);
+});
+
 // The streamed and indexed sequences expose the same header, a small sanity tie.
 test("both read paths report the same header", async () => {
   const streamed: KeyframeDeltaSequence = await decodeKeyframeDeltaStreamed(bytes(MOVING_KEYFRAME));

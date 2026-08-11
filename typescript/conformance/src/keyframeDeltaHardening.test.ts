@@ -145,7 +145,14 @@ async function oneGaussianStreams(
   windowIndex: number,
   motionBinX: number,
   objectId?: number,
-  options: { id?: number; idChannels?: number; rotationChannels?: number } = {},
+  options: {
+    id?: number;
+    idChannels?: number;
+    rotationChannels?: number;
+    muTBin?: number;
+    sigmaTBin?: number;
+    flags?: number;
+  } = {},
 ): Promise<Uint8Array> {
   const s = (attributeId: number, values: number[], channels: number) =>
     encodeTestStream({ attributeId, values, channels });
@@ -169,9 +176,9 @@ async function oneGaussianStreams(
       s(Attribute.Color, [0, 0, 0], 3),
       s(Attribute.Opacity, [0], 1),
       s(Attribute.Motion, [motionBinX, 0, 0], 3),
-      s(Attribute.MuT, [0], 1),
-      s(Attribute.SigmaT, [0], 1),
-      s(Attribute.Flags, [1], 1), // never fades
+      s(Attribute.MuT, [options.muTBin ?? 0], 1),
+      s(Attribute.SigmaT, [options.sigmaTBin ?? 0], 1),
+      s(Attribute.Flags, [options.flags ?? 1], 1), // never fades by default
       s(Attribute.WindowIndex, [windowIndex], 1),
     ]),
   );
@@ -387,6 +394,9 @@ async function oneKeyframeFile(options: {
   objectId?: number;
   idChannels?: number;
   rotationChannels?: number;
+  muTBin?: number;
+  sigmaTBin?: number;
+  flags?: number;
 }): Promise<Uint8Array> {
   const rawStreams = await oneGaussianStreams(
     options.windowIndex,
@@ -397,6 +407,9 @@ async function oneKeyframeFile(options: {
       ...(options.rotationChannels === undefined
         ? {}
         : { rotationChannels: options.rotationChannels }),
+      ...(options.muTBin === undefined ? {} : { muTBin: options.muTBin }),
+      ...(options.sigmaTBin === undefined ? {} : { sigmaTBin: options.sigmaTBin }),
+      ...(options.flags === undefined ? {} : { flags: options.flags }),
     },
   );
   const blob = options.compress ? await deflate(rawStreams) : rawStreams;
@@ -522,6 +535,26 @@ test("a gaussian whose validity window has closed is absent, not transparent", a
   assert.equal(absent.rotations.buffer.byteLength, 0);
 });
 
+test("a gaussian below the temporal marginal cutoff is absent inside its window", async () => {
+  // The hard validity window admits this row for the whole second. Its finite temporal
+  // Gaussian is centred at zero and narrow, so near the end the marginal is below
+  // the Header cutoff and the reconstructed state must omit it rather than retain a
+  // practically transparent row.
+  const file = await oneKeyframeFile({
+    windows: [[0, 1]],
+    windowIndex: 0,
+    motionBinX: 0,
+    duration: 1,
+    muTBin: 0,
+    sigmaTBin: -100,
+    flags: 0,
+  });
+  const sequence = await decodeKeyframeDeltaStreamed(file);
+  const chunk = keyframeDeltaChunkAt(sequence, 0.95);
+  assert.equal(reconstructKeyframeDelta(sequence, chunk, 0).count, 1);
+  assert.equal(reconstructKeyframeDelta(sequence, chunk, 0.95).count, 0);
+});
+
 test("object membership is carried through the reconstruction where a chunk has it", async () => {
   // `object_id` is optional on a keyframe-delta chunk (spec §6.6), so the reconstruction
   // reports `null` for a file without it and the ids themselves for a file with it — not a
@@ -579,6 +612,23 @@ test("keyframe-delta reconstruction preserves SH on both paths and across a birt
       ...Array.from({ length: 9 }, (_, i) => i + 1),
       ...Array.from({ length: 9 }, (_, i) => 101 + i),
     ],
+  );
+});
+
+test("a streamed SH band must immediately follow the state record it extends", async () => {
+  const data = await oneKeyframeShFile();
+  const band = [...iterateRecords(data, MAGIC.length)].find((item) => item.opcode === 0x07)!;
+  const unrelated = record(0x80, new Uint8Array([1]));
+  const interleaved = concat([
+    data.subarray(0, band.offset),
+    unrelated,
+    data.subarray(band.offset),
+  ]);
+
+  await assert.rejects(
+    () => decodeKeyframeDeltaStreamed(interleaved),
+    (error: unknown) =>
+      error instanceof MalformedFile && error.message.includes("carries SH bands none"),
   );
 });
 
