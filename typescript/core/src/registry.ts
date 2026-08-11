@@ -21,7 +21,7 @@
  * and the conformance suite compares refusals across languages by identifier.
  */
 
-import { UnsupportedCodec } from "./errors.js";
+import { Refusal, UnsupportedCodec } from "./errors.js";
 
 /**
  * Temporal models this reader implements.
@@ -45,6 +45,7 @@ export function checkTemporalModel(model: string): void {
     throw new UnsupportedCodec(
       `the Header declares temporal model '${model}', which this reader does not implement ` +
         `(it implements ${listed(KNOWN_TEMPORAL_MODELS)})`,
+      { refusalCode: Refusal.UnknownTemporalModel },
     );
   }
 }
@@ -54,6 +55,7 @@ export function checkQuantizationScheme(scheme: string): void {
     throw new UnsupportedCodec(
       `the Quantization record declares scheme '${scheme}', which this reader does not implement ` +
         `(it implements ${listed(KNOWN_QUANTIZATION_SCHEMES)})`,
+      { refusalCode: Refusal.UnknownQuantizationScheme },
     );
   }
 }

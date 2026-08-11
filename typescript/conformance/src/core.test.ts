@@ -17,7 +17,13 @@ import {
   BytesReadable,
   Crc32,
   Cursor,
+  FourdgsError,
   MalformedFile,
+  Refusal,
+  checkQuantizationScheme,
+  checkTemporalModel,
+  checkWindowIndex,
+  decompressorFor,
   MAX_TRAJECTORY_SAMPLES,
   TruncatedFile,
   parseRigTrajectory,
@@ -145,6 +151,72 @@ test("magic checking separates a foreign file from a future version", () => {
   assert.throws(() => checkMagic(future), /major version 9 is not supported/);
   assert.throws(() => checkMagic(new Uint8Array(8)), /not a 4dgs file/);
   assert.throws(() => checkMagic(new Uint8Array(3)), TruncatedFile);
+
+  // Only the version byte may differ for this to be a version problem. A corrupted
+  // sentinel used to read as "unsupported version 1", which sends the file's holder
+  // looking for a newer reader that would not have helped.
+  const guard = Uint8Array.from(MAGIC);
+  guard[0] = 0x88;
+  assert.throws(() => checkMagic(guard), /not a 4dgs file/);
+  const lineEnding = Uint8Array.from(MAGIC);
+  lineEnding[6] = 0x0a;
+  assert.throws(() => checkMagic(lineEnding), /not a 4dgs file/);
+});
+
+test("a named refusal carries the identifier every SDK is compared on", () => {
+  // The identifier, not the class: `UnsupportedCodec` covers an unknown temporal model,
+  // an unknown quantization scheme and an unknown stream codec alike, so "it threw
+  // UnsupportedCodec" cannot tell a decoder that refused for the right reason from one
+  // that refused for the wrong one. These are the strings the invalid corpus diffs.
+  const refusalOf = (fn: () => unknown): string | undefined => {
+    try {
+      fn();
+    } catch (error) {
+      assert.ok(error instanceof FourdgsError, `not a FourdgsError: ${String(error)}`);
+      return error.refusalCode;
+    }
+    return assert.fail("expected a refusal");
+  };
+
+  const guard = Uint8Array.from(MAGIC);
+  guard[0] = 0x88;
+  assert.equal(
+    refusalOf(() => checkMagic(guard)),
+    Refusal.MagicMismatch,
+  );
+  const future = Uint8Array.from(MAGIC);
+  future[5] = 0x39;
+  assert.equal(
+    refusalOf(() => checkMagic(future)),
+    Refusal.UnsupportedMajorVersion,
+  );
+  assert.equal(
+    refusalOf(() => checkTemporalModel("frame-sequence")),
+    Refusal.UnknownTemporalModel,
+  );
+  assert.equal(
+    refusalOf(() => checkTemporalModel("")),
+    Refusal.UnknownTemporalModel,
+  );
+  assert.equal(
+    refusalOf(() => checkQuantizationScheme("uniform-v9")),
+    Refusal.UnknownQuantizationScheme,
+  );
+  assert.equal(
+    refusalOf(() => decompressorFor(9, DEFAULT_CODECS)),
+    Refusal.UnknownStreamCodec,
+  );
+  assert.equal(
+    refusalOf(() => checkWindowIndex(3, 1)),
+    Refusal.WindowIndexOutOfRange,
+  );
+
+  // An error the refusal table does not name carries no identifier — that is "not one of
+  // the refusals the corpus compares", not "no error".
+  assert.equal(
+    refusalOf(() => checkMagic(new Uint8Array(3))),
+    undefined,
+  );
 });
 
 test("CRC-32 matches the IEEE values the footer is written with", () => {

@@ -10,6 +10,7 @@
 
 #include <cstring>
 #include <new>
+#include <optional>
 
 #include "backend.hpp"
 #include "fourdgs.h"
@@ -55,16 +56,38 @@ ErrorCode translate(int status) {
   }
 }
 
+/// Which of the specification's named refusals the last error was, or nothing.
+///
+/// NOT NUL-terminated: the ABI returns a pointer and a length, and exactly `length` bytes are
+/// copied. `strlen` or a `std::string` built from the pointer alone reads past the end of a
+/// static string — which is the ABI-string bug this shape exists to prevent, and which showed
+/// up on Windows CI once already.
+///
+/// A null identifier is an answer, not a failure: truncation, an I/O error and a null
+/// argument are real errors that the refusal table does not name, and the accessor reports
+/// them by writing null and still returning OK. The bytes are `'static`, so nothing is freed
+/// — but they name whatever failed last on this thread, so they are copied here and not held.
+std::optional<std::string> lastRefusal() {
+  const char* data = nullptr;
+  std::size_t length = 0;
+  // Sequenced deliberately, like every two-out-parameter call on this surface: the status is
+  // read first, the out parameters only after it is OK.
+  const int status = fourdgs_last_refusal_code(&data, &length);
+  if (status != FOURDGS_STATUS_OK || data == nullptr || length == 0) return std::nullopt;
+  return std::string(data, length);
+}
+
 /// A failed call, with the core's diagnosis rather than a category name.
 ///
 /// `fourdgs_last_error()` is thread-local and borrowed until the next failure on this
-/// thread, so it is copied here and not held.
+/// thread, so it is copied here and not held. The refusal identifier beside it is written by
+/// the same failing call, so the pair always describes one failure.
 Result<void> failure(int status) {
   const char* message = fourdgs_last_error();
   std::string detail = (message != nullptr && message[0] != '\0')
                            ? std::string(message)
                            : std::string(fourdgs_status_message(status));
-  return Error(translate(status), std::move(detail));
+  return Error(translate(status), std::move(detail), lastRefusal());
 }
 
 Result<void> check(int status) {

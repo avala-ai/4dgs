@@ -60,6 +60,36 @@ void voidResultReportsBothWays() {
   CHECK_EQ(bad.error().code, ErrorCode::kUnsupported);
 }
 
+/// The refusal identifier is optional, and absent is a real answer.
+///
+/// `code` says what kind of thing went wrong and `refusal` says which rule fired, so the two
+/// are not the same field: `kUnsupported` alone covers three of the six named refusals, and
+/// plenty of genuine failures — a truncated file, a transport that gave up — name no rule at
+/// all. Absent is therefore not "no error"; `Result::ok()` is what answers that.
+void refusalIsOptionalAndTravelsWithTheError() {
+  Result<int> unnamed(ErrorCode::kTruncated, "the file ends inside chunk 3");
+  CHECK(!unnamed.error().refusal.has_value());
+
+  Result<void> named(Error(ErrorCode::kUnsupported,
+                           "the Header declares temporal model 'frame-sequence'",
+                           std::string("unknown-temporal-model")));
+  CHECK(!named.ok());
+  CHECK(named.error().refusal.has_value());
+  CHECK_EQ(*named.error().refusal, std::string("unknown-temporal-model"));
+
+  // A caller who asked for exceptions gets the identifier too, rather than having to parse
+  // it back out of `what()`.
+  bool threw = false;
+  try {
+    named.value();
+  } catch (const Exception& error) {
+    threw = true;
+    CHECK(error.error().refusal.has_value());
+    CHECK_EQ(*error.error().refusal, std::string("unknown-temporal-model"));
+  }
+  CHECK(threw);
+}
+
 void codesHaveNames() {
   CHECK_EQ(std::string(fourdgs::toString(ErrorCode::kBadMagic)), std::string("kBadMagic"));
   CHECK_EQ(std::string(fourdgs::toString(ErrorCode::kOk)), std::string("kOk"));
@@ -70,6 +100,7 @@ void runTests() {
   carriesAnError();
   valueThrowsForCallersWhoWantThat();
   voidResultReportsBothWays();
+  refusalIsOptionalAndTravelsWithTheError();
   codesHaveNames();
 }
 

@@ -33,7 +33,10 @@ fourdgs::Span<const std::uint8_t> bytesOf(const std::vector<std::uint8_t>& bytes
 }
 
 void versionsAreReported() {
-  CHECK(std::string(fourdgs::version()) == std::string("0.0.0"));
+  // The literal is the point: `version()` is compiled from `PROJECT_VERSION`, so this is
+  // what fails when the CMake project version moves and the changelog section naming it
+  // does not.
+  CHECK(std::string(fourdgs::version()) == std::string("0.1.0"));
   if (fourdgs::backendAvailable()) {
     CHECK(fourdgs::coreVersion() != nullptr);
   } else {

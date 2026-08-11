@@ -30,6 +30,7 @@ import {
   Crc32,
   audioSourceStateAt,
   crc32,
+  type FourdgsError,
   ObjectLayer as ObjectLayerClass,
   poseApply,
   poseAt,
@@ -725,6 +726,22 @@ function sortable(value: number): number {
 /** Stable JSON: sorted keys, two-space indent, the shape the expectations are stored in. */
 export function canonical(summary: unknown): string {
   return JSON.stringify(sortKeys(summary), null, 2);
+}
+
+/**
+ * The canonical answer for a file this reader refused.
+ *
+ * A refusal is a result, not a crash: the runner prints this on stdout and exits 0, and
+ * the harness diffs it against the expectation like any other answer. Exiting non-zero
+ * instead would collapse "refused for the right reason" and "fell over" into one outcome,
+ * and telling those two apart is the whole point of the invalid corpus.
+ *
+ * An error carrying no identifier prints an empty one, which matches no expectation and
+ * fails with a readable diff. That is deliberate: a refusal the library cannot name is a
+ * refusal the suite cannot check, and it should look like a gap rather than a pass.
+ */
+export function refusalJson(error: FourdgsError): string {
+  return canonical({ refused: error.refusalCode ?? "" });
 }
 
 function sortKeys(value: unknown): unknown {

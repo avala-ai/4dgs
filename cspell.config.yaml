@@ -130,15 +130,20 @@ words:
   - cdylib
   - staticlib
   - lpthread
+  # `-lfourdgs`, the flag in the link error a consumer without the core sees
+  - lfourdgs
   - clippy
   - MSVC
   - fprintf
   - DFOURDGS
   # Python standard-library names that appear in release notes
   - hypot
+  - DCMAKE
   # Git and workflow vocabulary
   - reflog
   - oneline
+  - worktree
+  - worktrees
 ignorePaths:
   - "**/node_modules/**"
   - "**/dist/**"

@@ -30,6 +30,110 @@ Every scene is synthetic, generated from a fixed seed, and audio payloads are ge
 The spatial cases include fixed and moving sources; there is no captured data in the repository. The
 corpus has to be redistributable without a licence question and reproducible without a download.
 
+## Download the corpus
+
+Generating the corpus is right for this repository and wrong for everybody else: it makes a Python
+generator and a clone of six SDKs the price of testing a decoder written somewhere else. So the
+generated corpus is also published, as one archive attached to a GitHub Release.
+
+```sh
+curl -LO https://github.com/avala-ai/4dgs/releases/download/releases%2Fcorpus%2Fv0.1.0/4dgs-conformance-corpus-0.1.0.tar.gz
+tar -xzf 4dgs-conformance-corpus-0.1.0.tar.gz
+```
+
+That URL is stable in the sense that matters for a checksummed artifact: the bytes behind it never
+change. There is deliberately no `latest` link — a conformance score is only meaningful beside the
+corpus version it was taken against, so citing a version is part of citing a result. To find the
+newest one:
+
+```sh
+gh release list --repo avala-ai/4dgs | grep releases/corpus/
+```
+
+The corpus is versioned on its own tag, `releases/corpus/vX.Y.Z`, and released independently of
+every SDK — it changes when variants are added, which has nothing to do with any package's version.
+Its changelog is
+[`tests/conformance/CHANGELOG.md`](https://github.com/avala-ai/4dgs/blob/main/tests/conformance/CHANGELOG.md),
+and it says what a major, minor and patch bump each mean for a score taken against it.
+
+### What is inside
+
+```
+4dgs-conformance-corpus-0.1.0/
+  README.md          the same orientation as this section, offline
+  LICENSE  NOTICE    Apache-2.0
+  MANIFEST.json      machine-readable index of every variant
+  corpus/            byte-for-byte `tests/conformance/data` in the repository
+    CHECKSUMS.txt    SHA-256 per generated file, `sha256sum -c` compatible
+    <variant>.4dgs   the file
+    <variant>.json   exactly what a correct decoder must produce from it
+    keyframe/        the keyframe-delta temporal model
+    object/          the object layer: an Object Table and SE(3) tracks
+    invalid/         files a conforming reader must refuse
+```
+
+`corpus/` being byte-for-byte the generated directory is the point rather than a coincidence: an
+unpacked corpus is a drop-in replacement for a generated one, so nothing that already reads
+`tests/conformance/data` needs to learn a second layout.
+
+`MANIFEST.json` is what a harness that is not `run.py` reads. Per variant it carries both paths,
+both SHA-256s, the byte length, the temporal model, whether a runner reading through the chunk index
+may be asked it at all, and — for an invalid variant — the refusal identifier a conforming reader
+must produce. Those last two are the rules the harness applies when it decides what to skip, written
+down as data so an outside harness does not have to reimplement them by reading Python.
+
+### Verify it
+
+```sh
+cd 4dgs-conformance-corpus-0.1.0/corpus && sha256sum -c CHECKSUMS.txt
+```
+
+`CHECKSUMS.txt` is not written for the download. It is the manifest committed at
+[`tests/conformance/data/CHECKSUMS.txt`](https://github.com/avala-ai/4dgs/blob/main/tests/conformance/data/CHECKSUMS.txt),
+packed verbatim, and its format was already `sha256sum`'s. So the digests can be read out of git at
+the tag and compared without trusting the archive at all, and a corpus that verifies here is the
+same corpus the `--verify` gate asserts on every pull request.
+
+The archive itself has a `.sha256` beside it on the release page, and it is reproducible: every
+member is written with a fixed mtime, uid, gid and mode in sorted order, and gzipped with no
+timestamp, so rebuilding the same corpus at the same version produces the same digest rather than
+one you have to take on faith.
+
+`MANIFEST.json` carries the same per-variant digests together with the metadata a harness needs.
+
+### Point a runner at an unpacked corpus
+
+A runner takes one `.4dgs` path and prints one JSON document on stdout; scoring it is diffing that
+document against the variant's `.json`, parsed rather than compared as text. The full contract —
+invocation, stdout and stderr, exit codes, what declining and refusing mean, and the canonical JSON
+rules — is the runner section further down this page, and it is written to be implementable without
+reading any source here.
+
+The harness in this repository can be driven against a download rather than a generated corpus,
+because the two directories are the same shape:
+
+```sh
+mv tests/conformance/data tests/conformance/data.generated
+ln -s /path/to/4dgs-conformance-corpus-0.1.0/corpus tests/conformance/data
+python3 tests/conformance/run.py --runner python
+```
+
+The release job does exactly this before it attaches anything: it unpacks its own tarball and scores
+the reference implementation against the unpacked copy. An archive whose checksums verify proves
+only that the bytes survived the tar, which is not the same as proving they are still a corpus.
+
+### Licence
+
+**Apache-2.0, the same as the repository, and there is nothing else to clear.** This is worth
+stating where somebody is deciding whether they may use the download, because for most conformance
+corpora the answer is complicated and here it is not.
+
+The corpus is redistributable by construction rather than by permission. Every scene is synthetic,
+generated from a fixed seed by `generator/scenarios.py`; every audio payload is a generated sine
+sweep; there is no captured data of any kind anywhere in it — no scan, no recording, no photograph,
+no third-party asset, and so no third party with a claim on it. It may be vendored into another
+project's test suite, mirrored, or baked into a product's CI image, and none of that needs asking.
+
 ## Runners
 
 Each implementation ships small command-line runners that read a `.4dgs` and print canonical JSON to
@@ -62,6 +166,20 @@ non-zero exit would make "refused correctly" indistinguishable from "fell over".
 The identifier matters more than it looks. "Both decoders raised an error" is not agreement: one of
 them may have refused for the wrong reason, which is precisely the failure a negative test exists to
 catch. The identifier names the rule, and it is the same string in every language.
+
+The two **indexed** refusal-answering runners inspect the version prefix before Header dispatch. If
+it is the exact version-1 magic, they read through the Header's length-prefixed `profile` and
+`library` fields to choose the gaussian-birth or keyframe-delta indexed decoder. If the prefix
+differs — including `BadMagic` and `FutureMajorVersion` — they bypass that Header read and route to
+the gaussian-birth indexed opener. The selected opener owns the magic rule, so it produces the
+refusal without asking dispatch code to parse an unrecognized layout.
+
+For a recognized version-1 file, the Header pre-read is still dispatch rather than the validation
+this suite credits. Mutation pins that distinction: deleting `check_magic` from either indexed
+opener turns exactly the two prefix variants red; deleting its temporal-model or quantization-scheme
+check turns their variants red; and deleting the shared window-index or stream-codec check turns the
+corresponding variant red on both paths. The streamed runners still validate magic while selecting
+the streamed decoder; this claim is about the indexed path.
 
 Every rule in this corpus already existed in version 1 — nothing here is new specification, so the
 contract is proved against rules that predate it. It found three real faults on its first run:
