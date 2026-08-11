@@ -32,6 +32,7 @@ and the declared depths must read as the ones that were written.
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
 import struct
@@ -224,11 +225,18 @@ def _check_chunk_geometry(path: str) -> None:
             )
 
         indexed_bands = sorted(band_range for entry in scene.index for band_range in entry.bands)
-        if indexed_bands != sorted(physical_bands):
+        all_physical_bands = sorted(band for bands in physical_bands.values() for band in bands)
+        if indexed_bands != all_physical_bands:
             raise AssertionError(
                 "the Chunk Index must name every complete SH band range exactly once; "
-                f"bands are {sorted(physical_bands)}, index names {indexed_bands}"
+                f"bands are {all_physical_bands}, index names {indexed_bands}"
             )
+
+        if scene.statistics is not None and scene.statistics.chunk_count != len(chunks):
+            raise AssertionError(
+                f"Statistics declares {scene.statistics.chunk_count} chunks, the candidate contains {len(chunks)}"
+            )
+        _check_summary_offset_geometry(source, scene.summary_offsets)
 
         table = window_table_or_default(scene.windows)
         k = support_k(scene.header.cutoff)
@@ -242,6 +250,13 @@ def _check_chunk_geometry(path: str) -> None:
                 raise AssertionError(
                     f"chunk index entry {number} declares interval [{entry.t0}, {entry.t1}), "
                     f"its Chunk declares [{physical_t0}, {physical_t1})"
+                )
+
+            owned_bands = sorted(physical_bands.get(entry.chunk_offset, []))
+            if sorted(entry.bands) != owned_bands:
+                raise AssertionError(
+                    f"chunk index entry {number} names SH ranges {sorted(entry.bands)}, "
+                    f"but the Chunk at {entry.chunk_offset} owns {owned_bands}"
                 )
 
             expected_bands = set(range(1, int(scene.header.sh_degree) + 1))
@@ -325,7 +340,7 @@ def _check_declared_aabb(record: str, bounds: list[float], actual: list[float]) 
 
 def _physical_geometry(
     source: FileReadable,
-) -> tuple[dict[int, tuple[int, float, float]], list[tuple[int, int, int]]]:
+) -> tuple[dict[int, tuple[int, float, float]], dict[int, list[tuple[int, int, int]]]]:
     """Return physical Chunk and SH ranges from a bounded framing scan.
 
     Only the 16-byte Chunk interval and one-byte SH label are read from payloads. The
@@ -336,7 +351,8 @@ def _physical_geometry(
         raise AssertionError("candidate has no final magic")
 
     chunks: dict[int, tuple[int, float, float]] = {}
-    bands: list[tuple[int, int, int]] = []
+    bands: dict[int, list[tuple[int, int, int]]] = {}
+    band_owner: int | None = None
     offset = len(MAGIC)
     while offset < payload_end:
         if offset + RECORD_HEADER.size > payload_end:
@@ -350,13 +366,67 @@ def _physical_geometry(
                 raise AssertionError(f"Chunk at offset {offset} is {length} bytes, too short for its interval")
             t0, t1 = struct.unpack("<dd", source.read(offset + RECORD_HEADER.size, 16))
             chunks[offset] = (RECORD_HEADER.size + length, t0, t1)
+            bands[offset] = []
+            band_owner = offset
         elif record_opcode == opcode.SH_BAND_STREAM:
             if length < 1:
                 raise AssertionError(f"SH band at offset {offset} has no band label")
+            if band_owner is None:
+                raise AssertionError(f"SH band at offset {offset} does not follow a Chunk")
             band = source.read(offset + RECORD_HEADER.size, 1)[0]
-            bands.append((band, offset, RECORD_HEADER.size + length))
+            bands[band_owner].append((band, offset, RECORD_HEADER.size + length))
+        else:
+            band_owner = None
         offset = record_end
     return chunks, bands
+
+
+def _check_summary_offset_geometry(source: FileReadable, declared: list) -> None:
+    """Every candidate Summary Offset frames its own complete summary-record class."""
+    footer_offset = source.size() - len(MAGIC) - RECORD_HEADER.size - 20
+    footer_opcode, footer_length = RECORD_HEADER.unpack(source.read(footer_offset, RECORD_HEADER.size))
+    if footer_opcode != opcode.FOOTER or footer_length < 20:
+        raise AssertionError(f"candidate Footer at {footer_offset} is not a complete Footer record")
+    summary_start = struct.unpack("<Q", source.read(footer_offset + RECORD_HEADER.size, 8))[0]
+    physical: dict[int, list[tuple[int, int]]] = {}
+    offset = summary_start
+    while offset < footer_offset:
+        if offset + RECORD_HEADER.size > footer_offset:
+            raise AssertionError(f"summary record header at {offset} overlaps the Footer")
+        record_opcode, length = RECORD_HEADER.unpack(source.read(offset, RECORD_HEADER.size))
+        end = offset + RECORD_HEADER.size + length
+        if end > footer_offset:
+            raise AssertionError(f"summary record at {offset} extends into the Footer")
+        physical.setdefault(record_opcode, []).append((offset, end - offset))
+        offset = end
+
+    seen: set[int] = set()
+    for number, summary_offset in enumerate(declared):
+        group_opcode = summary_offset.group_opcode
+        if group_opcode in seen:
+            raise AssertionError(f"Summary Offset {number} repeats group opcode {group_opcode:#04x}")
+        seen.add(group_opcode)
+        start = summary_offset.group_start
+        length = summary_offset.group_length
+        end = start + length
+        if length <= 0 or start < summary_start or end > footer_offset:
+            raise AssertionError(
+                f"Summary Offset {number} range [{start}, {end}) is not a nonempty range "
+                f"inside summary [{summary_start}, {footer_offset})"
+            )
+        expected = physical.get(group_opcode, [])
+        if not expected:
+            raise AssertionError(
+                f"Summary Offset {number} names opcode {group_opcode:#04x}, "
+                "but the summary contains no record of that class"
+            )
+        if expected[0][0] != start or expected[-1][0] + expected[-1][1] != end:
+            raise AssertionError(
+                f"Summary Offset {number} range [{start}, {end}) does not frame all "
+                f"opcode {group_opcode:#04x} records {expected}"
+            )
+        if any(at + record_length != next_at for (at, record_length), (next_at, _) in itertools.pairwise(expected)):
+            raise AssertionError(f"Summary Offset {number} opcode {group_opcode:#04x} records are not contiguous")
 
 
 def _check_declared_depths(path: str) -> None:
