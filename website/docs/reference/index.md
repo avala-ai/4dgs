@@ -328,10 +328,10 @@ their own bindings. See
 [the fuzzing notes](https://github.com/avala-ai/4dgs/blob/main/tests/fuzz/README.md) and
 `rust/fourdgs/tests/fuzz.rs`.
 
-**Swift**'s band-skipping check asserts the byte **count**, not that the call succeeded. A cache
-that answers a narrow cap from a wider entry returns the wider count while looking perfectly healthy
-— that bug existed in the core and was fixed — so the runner requires that capping harmonics away
-costs strictly fewer bytes than carrying them, and that no cap ever moves more than a wider one.
+**Swift**'s current band-skipping check compares `bytesForChunk` estimates computed from the index.
+It proves that the estimates shrink monotonically as bands are capped, but it neither loads a chunk
+nor observes the cache or transport. That is why the matrix records the binding as `Untested` for
+range-skipping even though the core implements it.
 
 **Convert from PLY frame sequences** and **Inspect and validate** are tools rather than wire-format
 features, so the conformance suite does not cover them; they are marked from their own tests, which

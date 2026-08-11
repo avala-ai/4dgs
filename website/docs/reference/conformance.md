@@ -165,8 +165,9 @@ flag will point at.
 
 ### Invocation
 
-The harness spawns the runner as a child process, once per variant, and appends exactly one argument
-to its command line: the path of the `.4dgs` file to read. Nothing else is passed.
+The harness spawns the runner as a child process once per variant that the harness says it supports,
+and appends exactly one argument to its command line: the path of the `.4dgs` file to read. An
+unsupported variant is skipped before the process starts. Nothing else is passed.
 
 The path is absolute, so the runner's working directory is irrelevant — deliberately, because the
 harness does not set one, and a runner that resolved a relative path would work only when the suite
@@ -254,13 +255,14 @@ both over the same corpus, diffing both against the same committed expectation:
 
 The middle column describes the decoder being exercised, not every byte the runner process itself
 touches. Five indexed runners currently materialize the file once to inspect `temporal_model` before
-they construct the ranged reader; the TypeScript runner uses a bounded probe. The byte counters in
-most indexed runners begin at the ranged reader, so a passing corpus proves that their counted reads
-skip unrequested SH bands. Swift is the exception: its extra check compares the core's
-`bytesForChunk` estimates and does not perform a capped load through a counting transport, so it
-does not prove that the binding honors `bandCap` when reading. None of these counters includes the
-command's model-dispatch pre-read. An outside runner should keep dispatch bounded; the current
-harness does not observe or enforce it.
+they construct the ranged reader; their byte counters begin after that pre-read. The TypeScript
+runner uses a bounded probe through its counting transport, so its total includes dispatch, but each
+per-cap measurement snapshots the counter afterwards and isolates only the capped load. A passing
+corpus therefore proves that the measured chunk reads skip unrequested SH bands. Swift is the
+exception: its extra check compares the core's `bytesForChunk` estimates and does not perform a
+capped load through a counting transport, so it does not prove that the binding honors `bandCap`
+when reading. An outside runner should keep dispatch bounded; the current per-cap measurements do
+not enforce it.
 
 They are driven separately rather than left to whichever path a core would pick, because **they have
 to be able to disagree**. A streamed reader arrives at the Header front to back; an indexed one
@@ -296,10 +298,11 @@ of the corpus, which is why it is recorded here rather than treated as coverage.
 
 Encoding is proved by a different program — `tests/conformance/encode_roundtrip.py`, which drives an
 `<encoder> <in.4dgs> <out.4dgs> [sh-bit-depths]` CLI and diffs its output against the Rust reference
-encoder through the Python decoder. The input and output paths are required. For each variant whose
-name contains `SHDegree`, the gate makes a second call with the optional comma-separated depths
-`6,4,3`, band 1 first. Encoding is not part of this runner protocol, and as far as `run.py` is
-concerned a decoder-only implementation is a complete one.
+encoder through the Python decoder. The input and output paths are required. After the ordinary pass
+succeeds, each variant whose name contains `SHDegree` gets a second call with the optional
+comma-separated depths `6,4,3`, band 1 first; an ordinary failure skips that variant's graded call.
+Encoding is not part of this runner protocol, and as far as `run.py` is concerned a decoder-only
+implementation is a complete one.
 
 ### Declining a variant
 
