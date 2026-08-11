@@ -48,10 +48,31 @@ public enum Runner {
             let json = try summarize(path: path, mode: mode)
             print(json.serialized())
             exit(0)
+        } catch let error as FourDGSError {
+            print(refusal(error).serialized())
+            exit(0)
         } catch {
             FileHandle.standardError.write(Data("\(error)\n".utf8))
             exit(1)
         }
+    }
+
+    /// The canonical answer for a file this reader refused.
+    ///
+    /// A refusal is a result, not a crash: it goes to stdout and the process exits 0, so the
+    /// harness diffs it against the expectation like any other answer. Exiting non-zero
+    /// would make "refused the right file for the right reason" and "fell over somewhere in
+    /// the same file" the same observation, and telling those apart is the entire purpose of
+    /// the invalid corpus — a decoder must not be able to pass by crashing in the right
+    /// place.
+    ///
+    /// An error the package cannot name prints an empty identifier, which matches no
+    /// expectation and fails with a readable diff. That is deliberate: a refusal the SDK
+    /// cannot name is a refusal the suite cannot check, and it should read as a gap rather
+    /// than as a pass. It is also what a genuine fault on a *valid* variant looks like here,
+    /// and that too should be red.
+    static func refusal(_ error: FourDGSError) -> JSON {
+        .object(["refused": .string(error.refusalCode?.rawValue ?? "")])
     }
 
     static func summarize(path: String, mode: Mode) throws -> JSON {

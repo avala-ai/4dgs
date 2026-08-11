@@ -16,6 +16,15 @@ All notable changes to the Swift package are documented here, following
   sources did not move; every target names its own path under `swift/`.
 - `fourdgsPackageVersion`, the one place this package's version is written, asserted against the
   release tag before anything is built.
+- Named refusals: `RefusalCode` gives the six identifiers the specification's refusal table defines,
+  and `FourDGSError.refusalCode` answers which rule a file broke — `nil` when the table does not
+  name the failure, which truncation and I/O errors legitimately are. The identifier comes from the
+  core through `fourdgs_last_refusal_code`, read as the pointer-and-length pair the ABI returns
+  rather than as a C string, and rides on three existing cases as a trailing associated value
+  defaulted to `nil` — see the breaking-change note below for what that default does and does not
+  buy. The `decode_streamed` and `decode_indexed` runners print `{"refused": "<id>"}` and exit 0 for
+  a file they refuse, which adds the invalid corpus to Swift's conformance run: 105 comparisons
+  become 119.
 - keyframe-delta decode: `peekTemporalModel` and `keyframeDeltaStatesJson`, binding the core's
   additive states-JSON C ABI through `CoreSeam`. The summary is computed in the Rust core, so the
   binding does no arithmetic of its own; the `decode_streamed` and `decode_indexed` runners peek the
@@ -50,6 +59,15 @@ All notable changes to the Swift package are documented here, following
   nothing about the platforms this package exists for.
 
 ### Changed
+
+- **Source-breaking:** `FourDGSError.malformed`, `.unsupportedCodec` and `.core` each gained a
+  trailing `refusal: RefusalCode?` associated value. The `= nil` default keeps every _construction_
+  compiling, but a default has no bearing on a _pattern_: code that binds these cases with the
+  previous arity — `case .malformed(let offset, let record, let field, let reason)` — now fails to
+  compile with "tuple pattern has the wrong length", and gains a `_` for the new element. No
+  exhaustive `switch` over `FourDGSError` breaks, because no case was added or removed; that is why
+  the identifier rides on the existing cases rather than arriving as a seventh one. Nothing is
+  released and no package registry entry exists, so nothing depended on the old arity.
 
 - `StreamedReader` and `IndexedReader` are replaced by one `SceneReader`. The ABI opens a file and
   chooses its own read path; two types that could not actually differ would have been a claim the
