@@ -188,6 +188,8 @@ class FourdgsIndexedScene {
 Future<FourdgsIndexedScene> openFourdgsIndexed(
   FourdgsReadable source, {
   int probeBytes = fourdgsHeadProbeBytes,
+  int? framedFooterOffset,
+  int? framedFooterLength,
 }) async {
   final size = await source.size();
   if (size <= 0) throw const FourdgsTruncatedFile('resource is empty');
@@ -211,26 +213,64 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
     );
   }
 
-  // Footer record (9 + 20 bytes) then the trailing magic.
-  final footerBytes = recordHeaderBytes + 20 + fourdgsMagic.length;
-  if (size < footerBytes) {
+  // The ordinary seeking path finds the version-1 Footer from its fixed tail.
+  // Validation already owns a complete bounded framing walk, so it can supply
+  // the exact range of an extended Footer and keep appended fields legal.
+  const int footerFixedContentBytes = 20;
+  final int minimumTail = recordHeaderBytes + footerFixedContentBytes;
+  if (size < minimumTail + fourdgsMagic.length) {
     throw const FourdgsTruncatedFile('file is too short to hold a footer');
   }
-  final tail = await source.read(size - footerBytes, footerBytes);
+  final Uint8List tail = await source.read(
+    size - fourdgsMagic.length,
+    fourdgsMagic.length,
+  );
   for (int i = 0; i < fourdgsMagic.length; i++) {
-    if (tail[tail.length - fourdgsMagic.length + i] != fourdgsMagic[i]) {
+    if (tail[i] != fourdgsMagic[i]) {
       throw const FourdgsMalformedFile(
         'file does not end with the magic; it may be truncated',
       );
     }
   }
-  final footerRecord = readRecord(FourdgsCursor(tail));
-  if (footerRecord.opcode != opFooter) {
-    throw FourdgsMalformedFile(
-      'expected a Footer at the tail, found opcode 0x${footerRecord.opcode.toRadixString(16)}',
+  if ((framedFooterOffset == null) != (framedFooterLength == null)) {
+    throw ArgumentError(
+      '4dgs: framedFooterOffset and framedFooterLength must be supplied together',
     );
   }
-  final footer = FourdgsFooter.parse(footerRecord.content);
+  final int footerAt =
+      framedFooterOffset ?? size - fourdgsMagic.length - minimumTail;
+  final int footerLength = framedFooterLength ?? footerFixedContentBytes;
+  if (footerAt < 0 ||
+      footerLength < footerFixedContentBytes ||
+      footerAt + recordHeaderBytes + footerLength !=
+          size - fourdgsMagic.length) {
+    throw FourdgsMalformedFile(
+      'the framed Footer range [$footerAt, '
+      '${footerAt + recordHeaderBytes + footerLength}) does not end at the '
+      'closing magic at ${size - fourdgsMagic.length}',
+    );
+  }
+  // Only the framing and the fixed fields. An extension can be large, but no
+  // current reader needs to transfer it merely to find the summary.
+  final FourdgsCursor footerCursor = FourdgsCursor(
+    await source.read(footerAt, recordHeaderBytes + footerFixedContentBytes),
+  );
+  final int footerOpcode = footerCursor.u8();
+  final int declaredFooterLength = footerCursor.u64();
+  if (footerOpcode != opFooter) {
+    throw FourdgsMalformedFile(
+      'expected a Footer at the tail, found opcode 0x${footerOpcode.toRadixString(16)}',
+    );
+  }
+  if (declaredFooterLength != footerLength) {
+    throw FourdgsMalformedFile(
+      'the Footer at byte $footerAt declares $declaredFooterLength content '
+      'bytes, but its framed range contains $footerLength',
+    );
+  }
+  final footer = FourdgsFooter.parse(
+    footerCursor.take(footerFixedContentBytes),
+  );
 
   final index = <FourdgsChunkIndexEntry>[];
   // Where each entry above came from. A refusal that can only say which interval
@@ -241,7 +281,7 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
   FourdgsStatistics? statistics;
   bool? crcOk;
   if (footer.summaryStart != 0) {
-    final summaryLength = size - footerBytes - footer.summaryStart;
+    final summaryLength = footerAt - footer.summaryStart;
     if (summaryLength < 0) {
       throw const FourdgsMalformedFile(
         'the footer points its summary past the end of the file',

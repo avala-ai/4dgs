@@ -443,7 +443,7 @@ void main() {
       expect(report.ok, isFalse);
       expect(
         _messages(report, FourdgsSeverity.error),
-        contains(startsWith('the Metadata records do not decode:')),
+        contains(startsWith('the Metadata record at byte')),
       );
     });
 
@@ -788,6 +788,46 @@ void main() {
       },
     );
 
+    test('an indexed Chunk length must match its framing', () async {
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(_keyframeDelta(indexChunkLengthExtra: 1)),
+      );
+      expect(report.ok, isFalse);
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(contains('its framing declares')),
+      );
+    });
+
+    test('every keyframe mu_t names its interval start', () async {
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(
+          _keyframeDelta(
+            writeIndex: false,
+            chunkT0: 1.0,
+            chunkT1: 2.0,
+            headerDuration: 2.0,
+          ),
+        ),
+      );
+      expect(report.ok, isFalse);
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(contains('its Chunk t0 1.0 requires bin 32')),
+      );
+    });
+
+    test('SH bands cover the degree declared by the Header', () async {
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(_keyframeDelta(headerShDegree: 1)),
+      );
+      expect(report.ok, isFalse);
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        contains(contains('Header declares degree 1 and requires [1]')),
+      );
+    });
+
     test('a complete state chunk omitted from the index is rejected', () async {
       final FourdgsValidation report = await validateFourdgs(
         FourdgsBytes(_keyframeDelta(extraUnindexedKeyframe: true)),
@@ -912,9 +952,11 @@ void main() {
       final FourdgsValidation report = await validateFourdgs(
         FourdgsBytes(_minimalWithExtendedFooterCrc()),
       );
+      final List<String> errors = _messages(report, FourdgsSeverity.error);
+      expect(errors, isNot(contains(contains('summary CRC mismatch'))));
       expect(
-        _messages(report, FourdgsSeverity.error),
-        isNot(contains(contains('summary CRC mismatch'))),
+        errors,
+        isNot(contains(startsWith('a seeking reader cannot open this file:'))),
       );
     });
 
@@ -1452,14 +1494,14 @@ Uint8List _keyframesWithSwappedBands() {
                   temporalModel: 'keyframe-delta',
                   durationSec: 2.0,
                   gaussianCount: 1,
+                  shDegree: 1,
                 ),
               ),
             )
             ..add(_record(opQuantization, _quantizationContent()))
             ..add(_record(opWindowTable, _windowTableContent())))
           .toBytes();
-  final Uint8List streams = _keyframeStreams(windowIndex: 0);
-  Uint8List chunk(double t0, double t1) => _record(
+  Uint8List chunk(double t0, double t1, int muTBin) => _record(
     opChunk,
     (BytesBuilder()
           ..add(_f64(t0))
@@ -1468,13 +1510,13 @@ Uint8List _keyframesWithSwappedBands() {
           ..add(_u32(1))
           ..add(_string(''))
           ..add(_u64(0))
-          ..add(_u64(streams.length))
-          ..add(streams))
+          ..add(_u64(_keyframeStreams(windowIndex: 0, muTBin: muTBin).length))
+          ..add(_keyframeStreams(windowIndex: 0, muTBin: muTBin)))
         .toBytes(),
   );
-  final Uint8List first = chunk(0.0, 1.0);
+  final Uint8List first = chunk(0.0, 1.0, 0);
   final Uint8List firstBand = _shBandRecord(1, 0);
-  final Uint8List second = chunk(1.0, 2.0);
+  final Uint8List second = chunk(1.0, 2.0, 32);
   final Uint8List secondBand = _shBandRecord(1, 1);
   final int firstOffset = head.length;
   final int firstBandOffset = firstOffset + first.length;
@@ -1637,7 +1679,7 @@ Uint8List _keyframeDeltaWithRetiredIdReuse() {
             ..add(_u32(births.isEmpty ? 0 : 1))
             ..add(_u32(deaths.isEmpty ? 0 : 1))
             ..add(_string(''))
-            ..add(_u64(0))
+            ..add(_u64(groups.length))
             ..add(_u64(groups.length))
             ..add(groups))
           .toBytes(),
@@ -1763,6 +1805,7 @@ Uint8List _keyframeDelta({
   bool writeIndex = true,
   int? indexBandOffset,
   int? indexChunkOffset,
+  int indexChunkLengthExtra = 0,
   Uint8List? beforeChunk,
   Uint8List? afterChunk,
   bool extraUnindexedKeyframe = false,
@@ -1771,6 +1814,7 @@ Uint8List _keyframeDelta({
   double headerDuration = 1.0,
   double chunkT0 = 0.0,
   double chunkT1 = 1.0,
+  int? headerShDegree,
 }) {
   final BytesBuilder headBuilder =
       BytesBuilder()
@@ -1782,6 +1826,7 @@ Uint8List _keyframeDelta({
               temporalModel: 'keyframe-delta',
               durationSec: headerDuration,
               gaussianCount: headerGaussianCount,
+              shDegree: headerShDegree ?? (bandElementCount == null ? 0 : 1),
             ),
           ),
         )
@@ -1839,7 +1884,7 @@ Uint8List _keyframeDelta({
         ..add(_f64(chunkT0))
         ..add(_f64(chunkT1))
         ..add(_u64(indexChunkOffset ?? chunkOffset))
-        ..add(_u64(chunkRecord.length))
+        ..add(_u64(chunkRecord.length + indexChunkLengthExtra))
         ..add(_u32(1)) // gaussian_count
         ..add(_u32(bandElementCount == null ? 0 : 1));
   if (bandElementCount != null) {
@@ -1936,7 +1981,7 @@ Uint8List _keyframeDeltaWithEmptyDelta({
           ..add(_u32(birthCount))
           ..add(_u32(deathCount))
           ..add(_string(''))
-          ..add(_u64(0))
+          ..add(_u64(groupBytes.length))
           ..add(_u64(groupBytes.length))
           ..add(groupBytes))
         .toBytes(),
@@ -2038,6 +2083,7 @@ Uint8List _constStream(int attributeId, int channels, int count, int value) {
 Uint8List _keyframeStreams({
   required int windowIndex,
   int positionChannels = 3,
+  int muTBin = 0,
 }) {
   const Map<int, int> channels = <int, int>{
     attrPosition: 3,
@@ -2059,7 +2105,11 @@ Uint8List _keyframeStreams({
         id,
         id == attrPosition ? positionChannels : channels[id]!,
         1,
-        id == attrWindowIndex ? windowIndex : 0,
+        id == attrWindowIndex
+            ? windowIndex
+            : id == attrMuT
+            ? muTBin
+            : 0,
       ),
     );
   }

@@ -938,7 +938,24 @@ FourdgsDeltaChunkBody parseDeltaChunk(Uint8List content) {
   // wanted alone — is reachable by stepping over two lengths.
   final blockLength = c.u64();
   final blockAt = c.pos;
-  final records = FourdgsCursor(c.take(blockLength));
+  final Uint8List block = c.take(blockLength);
+  if (head.compression.isNotEmpty) {
+    // Match ordinary Chunk handling: whole-block compression is a registry
+    // feature this pure-Dart decoder does not implement, so never reinterpret
+    // compressed bytes as raw group framing merely because they happen to fit.
+    throw FourdgsUnsupportedCodec(
+      'the Delta Chunk uses chunk-level "${head.compression}" compression, '
+      'which is not supported by this decoder',
+      refusalCode: refusalUnknownStreamCodec,
+    );
+  }
+  if (head.uncompressedSize != blockLength) {
+    throw FourdgsMalformedFile(
+      'the uncompressed Delta Chunk declares ${head.uncompressedSize} record '
+      'bytes but carries $blockLength',
+    );
+  }
+  final records = FourdgsCursor(block);
   final updates = records.take(records.u64());
   final updatesAt = records.pos - updates.length;
   final births = records.take(records.u64());

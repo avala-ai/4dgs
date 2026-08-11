@@ -278,7 +278,7 @@ KeyframeDeltaState _applyDelta(
       }
     }
     final absent = <int>[
-      for (final attribute in bins.keys)
+      for (final attribute in requiredAttributes)
         if (!birthBins.containsKey(attribute)) attribute,
     ]..sort();
     if (absent.isNotEmpty) {
@@ -436,7 +436,14 @@ void _checkGroupsDisjoint(Int32List a, Int32List b, Int32List d) {
       );
     }
   }
-  return (ids: _idsOf(gaussianId), bins: streams);
+  final Int32List ids = _idsOf(gaussianId);
+  if (ids.length != body.header.count) {
+    throw FourdgsMalformedFile(
+      'the keyframe Chunk at byte $at declares ${body.header.count} gaussians, '
+      'but its gaussian_id stream carries ${ids.length}',
+    );
+  }
+  return (ids: ids, bins: streams);
 }
 
 /// Frames every stream in a group and only then decodes it.
@@ -719,6 +726,40 @@ KeyframeDeltaState keyframeDeltaStateFromChunk(
 }) {
   final decoded = _keyframeFromChunk(content, at: chunkOffset);
   return _keyframeState(decoded.ids, decoded.bins);
+}
+
+/// Require every keyframe gaussian's encoded birth-time bin to name its t0.
+void checkKeyframeDeltaMuT(
+  KeyframeDeltaState state,
+  double t0,
+  FourdgsQuantization quantization,
+) {
+  if (state.count == 0) return;
+  final _Column? mu = state._bins[attrMuT];
+  final _Column? sigma = state._bins[attrSigmaT];
+  final _Column? flags = state._bins[attrFlags];
+  if (mu == null || sigma == null || flags == null) {
+    throw const FourdgsMalformedFile(
+      'a nonempty keyframe is missing mu_t, sigma_t, or flags',
+    );
+  }
+  final FourdgsSteps steps = FourdgsSteps.of(quantization);
+  for (int row = 0; row < state.count; row++) {
+    final bool neverFades = flags.values[row] & flagNeverFades != 0;
+    final double step = muStep(
+      sigma.values[row],
+      steps.sigmaLog,
+      neverFades,
+      steps.time,
+    );
+    final int expected = (t0 / step).round();
+    if (mu.values[row] != expected) {
+      throw FourdgsMalformedFile(
+        'keyframe gaussian_id ${state.ids[row]} has mu_t bin '
+        '${mu.values[row]}; its Chunk t0 $t0 requires bin $expected',
+      );
+    }
+  }
 }
 
 /// Compose one already-parsed Delta Chunk onto its selected reference state.
