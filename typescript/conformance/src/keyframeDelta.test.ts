@@ -218,6 +218,15 @@ test("the range-backed indexed decoder reads only the requested chain", async ()
   assert.deepEqual([...ranged.ids], [...expected.ids]);
   assert.deepEqual([...ranged.centers], [...expected.centers]);
   assert.deepEqual([...ranged.rotations], [...expected.rotations]);
+
+  const atEnd = await decoder.reconstructAt(decoder.header.durationSec);
+  const expectedAtEnd = reconstructKeyframeDelta(
+    whole,
+    keyframeDeltaChunkAt(whole, whole.header.durationSec),
+    whole.header.durationSec,
+  );
+  assert.deepEqual([...atEnd.ids], [...expectedAtEnd.ids]);
+  assert.deepEqual([...atEnd.centers], [...expectedAtEnd.centers]);
 });
 
 test("the range-backed decoder refuses an oversized total summary before scanning it", async () => {

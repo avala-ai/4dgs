@@ -1250,19 +1250,41 @@ export class KeyframeDeltaIndexedDecoder {
 
   /** Compose only the indexed chain covering `t`. */
   async chunkAt(t: number): Promise<KeyframeDeltaChunkInfo> {
-    const chain = chainFor(this.index, t);
-    const entry = chain[chain.length - 1]!;
-    const cached = new Map<string, Promise<IndexedRecord>>();
-    const read: IndexedRecordReader = (offset, length) => {
-      const key = `${offset}:${length}`;
-      let pending = cached.get(key);
-      if (pending === undefined) {
-        pending = (async () => {
-          return readRangeBackedIndexedRecord(this.source, this.size, offset, length);
-        })();
-        cached.set(key, pending);
+    let selected: ChunkIndexEntry | undefined;
+    for (const candidate of this.index) {
+      if (candidate.t0 <= t && t < candidate.t1) {
+        selected = candidate;
+        break;
       }
-      return pending;
+    }
+    if (selected === undefined) {
+      let last = this.index[0];
+      for (const candidate of this.index) {
+        if (last === undefined || candidate.t1 > last.t1) last = candidate;
+      }
+      if (
+        last === undefined ||
+        !Number.isFinite(t) ||
+        t < last.t1 ||
+        last.t1 !== this.header.durationSec
+      ) {
+        throw new MalformedFile(`no state chunk covers t=${t}`);
+      }
+      selected = last;
+    }
+    const chain = chainEndingAt(this.index, selected);
+    const entry = chain[chain.length - 1]!;
+    // Only the selected state record is parsed twice (composition, then the
+    // public operation counts). Holding every record promise until the seek
+    // returned made aggregate memory grow with GOP depth despite the per-record
+    // bound. Other links and SH bands become collectible after composition.
+    let selectedRecord: Promise<IndexedRecord> | null = null;
+    const read: IndexedRecordReader = (offset, length) => {
+      if (offset === entry.chunkOffset && length === entry.chunkLength) {
+        selectedRecord ??= readRangeBackedIndexedRecord(this.source, this.size, offset, length);
+        return selectedRecord;
+      }
+      return readRangeBackedIndexedRecord(this.source, this.size, offset, length);
     };
     const state = await composeChainFromReader(
       read,
@@ -1819,12 +1841,6 @@ export function reconstructKeyframeDelta(
 ): KeyframeDeltaGaussians {
   const state = chunk.state;
   const n = state.count;
-  const ids = new Int32Array(n);
-  const centers = new Float64Array(n * 3);
-  const scales = new Float64Array(n * 3);
-  const rotations = new Float64Array(n * 4);
-  const rgb = new Float64Array(n * 3);
-  const opacity = new Float64Array(n);
   checkCompleteSh(state, sequence.header.shDegree, `state chunk at byte ${chunk.offset}`);
   const composedSh =
     sequence.header.shDegree === 0 ? null : mergeBands(n, bandsOf(state), sequence.header.shDegree);
@@ -1835,7 +1851,6 @@ export function reconstructKeyframeDelta(
     );
   }
   const shStride = composedSh === null ? 0 : composedSh.coefficients * 3;
-  const shValues = new Uint8Array(n * shStride);
   const bins = binsOf(state);
   const objectIdColumn = bins.get(Attribute.ObjectId);
   if (objectIdColumn !== undefined && objectIdColumn.channels !== 1) {
@@ -1843,14 +1858,6 @@ export function reconstructKeyframeDelta(
       `the object_id column of the keyframe-delta chunk at byte ${chunk.offset} declares ` +
         `${objectIdColumn.channels} channels, the format defines 1`,
     );
-  }
-  const objectId = objectIdColumn === undefined ? null : new Uint32Array(n);
-  if (n === 0) {
-    const sh =
-      composedSh === null
-        ? null
-        : { ...composedSh, count: 0, values: shValues, bands: composedSh.bands };
-    return { t, count: 0, ids, centers, scales, rotations, rgb, opacity, sh, objectId };
   }
 
   // A composed state that has lost a required column is refused by name rather than read
@@ -1883,16 +1890,12 @@ export function reconstructKeyframeDelta(
   const windowCount = windows.length >>> 1;
   const k = supportK(sequence.header.cutoff);
 
-  const order = Array.from({ length: n }, (_, i) => i).sort(
-    (a, b) => state.ids[a]! - state.ids[b]!,
-  );
-
-  let out = 0;
-  for (const i of order) {
-    // A never-fading gaussian's velocity grid is derived from the length of its own
-    // validity window (spec §6.3), so the pitch is selected per gaussian from its
-    // window_index rather than from a single shared window; an out-of-range index is
-    // refused, not clamped, and refused for every row whether or not this instant keeps it.
+  // Validate every row's window reference, then retain only rows present at
+  // this instant. Public buffers are sized from that visible population so a
+  // sparse seek does not keep full-population backing stores through subarray
+  // views.
+  const order: number[] = [];
+  for (let i = 0; i < n; i++) {
     const windowIndex = checkWindowIndex(
       windowBins[i]!,
       windowCount,
@@ -1900,7 +1903,29 @@ export function reconstructKeyframeDelta(
     );
     const winLo = windows[windowIndex * 2]!;
     const winHi = windows[windowIndex * 2 + 1]!;
-    if (!(winLo <= t && t < winHi)) continue;
+    if (winLo <= t && t < winHi) order.push(i);
+  }
+  order.sort((a, b) => state.ids[a]! - state.ids[b]!);
+
+  const visible = order.length;
+  const ids = new Int32Array(visible);
+  const centers = new Float64Array(visible * 3);
+  const scales = new Float64Array(visible * 3);
+  const rotations = new Float64Array(visible * 4);
+  const rgb = new Float64Array(visible * 3);
+  const opacity = new Float64Array(visible);
+  const shValues = new Uint8Array(visible * shStride);
+  const objectId = objectIdColumn === undefined ? null : new Uint32Array(visible);
+
+  let out = 0;
+  for (const i of order) {
+    // A never-fading gaussian's velocity grid is derived from the length of its own
+    // validity window (spec §6.3), so the pitch is selected per gaussian from its
+    // window_index rather than from a single shared window; an out-of-range index is
+    // refused, not clamped, and refused for every row whether or not this instant keeps it.
+    const windowIndex = windowBins[i]!;
+    const winLo = windows[windowIndex * 2]!;
+    const winHi = windows[windowIndex * 2 + 1]!;
 
     const sigmaBin = sigmaBinsCol[i]!;
     const neverFades = (flags[i]! & GAUSSIAN_FLAG_NEVER_FADES) !== 0;
@@ -1946,17 +1971,15 @@ export function reconstructKeyframeDelta(
     out++;
   }
 
-  // Views, not copies: nothing was dropped in the ordinary case, and where a window has
-  // closed the tail is simply not part of the answer.
   return {
     t,
     count: out,
-    ids: ids.subarray(0, out),
-    centers: centers.subarray(0, out * 3),
-    scales: scales.subarray(0, out * 3),
-    rotations: rotations.subarray(0, out * 4),
-    rgb: rgb.subarray(0, out * 3),
-    opacity: opacity.subarray(0, out),
+    ids,
+    centers,
+    scales,
+    rotations,
+    rgb,
+    opacity,
     sh:
       composedSh === null
         ? null
@@ -1964,10 +1987,10 @@ export function reconstructKeyframeDelta(
             degree: composedSh.degree,
             coefficients: composedSh.coefficients,
             count: out,
-            values: shValues.subarray(0, out * shStride),
+            values: shValues,
             bands: composedSh.bands,
           },
-    objectId: objectId === null ? null : objectId.subarray(0, out),
+    objectId,
   };
 }
 

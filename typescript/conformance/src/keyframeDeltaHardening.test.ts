@@ -429,7 +429,11 @@ test("a gaussian whose validity window has closed is absent, not transparent", a
   assert.equal(sequence.chunks[0]!.state.count, 1);
   const chunk = keyframeDeltaChunkAt(sequence, 0.5);
   assert.equal(reconstructKeyframeDelta(sequence, chunk, 0.01).count, 1);
-  assert.equal(reconstructKeyframeDelta(sequence, chunk, 0.5).count, 0);
+  const absent = reconstructKeyframeDelta(sequence, chunk, 0.5);
+  assert.equal(absent.count, 0);
+  assert.equal(absent.ids.buffer.byteLength, 0);
+  assert.equal(absent.centers.buffer.byteLength, 0);
+  assert.equal(absent.rotations.buffer.byteLength, 0);
 });
 
 test("object membership is carried through the reconstruction where a chunk has it", async () => {
