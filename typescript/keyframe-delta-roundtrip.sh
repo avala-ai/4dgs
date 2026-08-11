@@ -323,6 +323,13 @@ reference = summaries[reference_name]
 def without_python_mu_anchor_opacity(summary):
     """Remove only the known §11.3 writer divergence from a comparison copy."""
     copy = json.loads(json.dumps(summary))
+    # The TypeScript writer advances mu_t to the sample timestamp and therefore emits an
+    # update for a persistent gaussian whose authored lanes are otherwise unchanged. The
+    # Python corpus writer retains the source anchor. Until it adopts §11.3's anchor rule,
+    # operation counts differ even though the state comparison below is normalized too.
+    for chunk in copy["chunks"]:
+        if chunk["kind"] == "delta":
+            chunk.pop("updateCount", None)
     first_nonzero = next((float(c["t0"]) for c in copy["chunks"] if float(c["t0"]) > 0), None)
     if first_nonzero is not None:
         for state in copy["states"]:

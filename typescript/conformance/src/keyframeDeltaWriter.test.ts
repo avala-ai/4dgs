@@ -608,4 +608,20 @@ test("a GOP-invariant attribute that changes mid-group is refused", async () => 
     index.map((e) => e.kind),
     [0, 0],
   );
+
+  const empty = { ...one(0), count: 0 };
+  const bornAfterKeyframe = [
+    { t0: 0, ids: [] as number[], gaussians: empty },
+    { t0: 1, ids: [7], gaussians: one(0) },
+    { t0: 2, ids: [7], gaussians: one(0) },
+  ];
+  bornAfterKeyframe[2]!.gaussians.sigmaT = Float32Array.from([3]);
+  await assert.rejects(
+    () =>
+      encodeKeyframeDeltaSequence(bornAfterKeyframe, 3, {
+        keyframeEvery: 8,
+        deltaMode: DELTA_MODE_KEYFRAME,
+      }),
+    /changes attribute 8 between samples/,
+  );
 });

@@ -517,6 +517,34 @@ function rowsDiffer(a: Column, rowA: number, b: Column, rowB: number): boolean {
   return false;
 }
 
+function checkGopInvariants(
+  referenceIds: readonly number[],
+  referenceBins: Bins,
+  ids: readonly number[],
+  bins: Bins,
+  at: number,
+): void {
+  const referenceRow = new Map<number, number>();
+  for (let i = 0; i < referenceIds.length; i++) referenceRow.set(referenceIds[i]!, i);
+  for (let row = 0; row < ids.length; row++) {
+    const beforeRow = referenceRow.get(ids[row]!);
+    if (beforeRow === undefined) continue;
+    for (const attribute of GOP_INVARIANT) {
+      const before = referenceBins.get(attribute);
+      const after = bins.get(attribute);
+      if (before === undefined || after === undefined) continue;
+      if (rowsDiffer(before, beforeRow, after, row)) {
+        throw new Error(
+          `sample ${at}: gaussian id ${ids[row]} changes attribute ${attribute} between ` +
+            `samples, which is fixed for a gaussian's lifetime within a group: the per-gaussian ` +
+            `grids for velocity and birth time are derived from it. Emit a keyframe, or a death ` +
+            `and a birth.`,
+        );
+      }
+    }
+  }
+}
+
 /**
  * Split one sample against its reference into updates, births and deaths.
  *
@@ -530,6 +558,7 @@ function deltaGroups(
   bins: Bins,
   at: number,
 ): DeltaGroups {
+  checkGopInvariants(referenceIds, referenceBins, ids, bins, at);
   const referenceRow = new Map<number, number>();
   for (let i = 0; i < referenceIds.length; i++) referenceRow.set(referenceIds[i]!, i);
   const live = new Set<number>(ids);
@@ -547,26 +576,6 @@ function deltaGroups(
   const birthBins = gather(bins, birthRows);
   const commonIds = commonRows.map((i) => ids[i]!);
   const referenceRows = commonIds.map((id) => referenceRow.get(id)!);
-
-  // Refuse a sequence that changes a per-gaussian grid mid-group. The result of
-  // differencing across such a change is not an approximation, it is a number with no
-  // meaning — and it decodes silently into a wrong velocity rather than into an error,
-  // which is why this is the encoder's job to catch rather than the decoder's to survive.
-  for (const attribute of GOP_INVARIANT) {
-    const before = referenceBins.get(attribute);
-    const after = bins.get(attribute);
-    if (before === undefined || after === undefined) continue;
-    for (let k = 0; k < commonRows.length; k++) {
-      if (rowsDiffer(before, referenceRows[k]!, after, commonRows[k]!)) {
-        throw new Error(
-          `sample ${at}: gaussian id ${commonIds[k]} changes attribute ${attribute} between ` +
-            `samples, which is fixed for a gaussian's lifetime within a group: the per-gaussian ` +
-            `grids for velocity and birth time are derived from it. Emit a keyframe, or a death ` +
-            `and a birth.`,
-        );
-      }
-    }
-  }
 
   const changed = new Array<boolean>(commonRows.length).fill(false);
   for (const [attribute, after] of bins) {
@@ -912,7 +921,7 @@ export async function encodeKeyframeDeltaSequence(
       keyframeOffset = at;
       previousOffset = at;
       previousDepth = 0;
-      previous = deltaMode === DELTA_MODE_CHAINED ? current : null;
+      previous = current;
       gopReference = deltaMode === DELTA_MODE_KEYFRAME ? current : null;
       index.push({
         t0,
@@ -938,6 +947,12 @@ export async function encodeKeyframeDeltaSequence(
     if (depth > U16_MAX) {
       throw new Error(`sample ${i} has depth ${depth}, past the u16 maximum ${U16_MAX}`);
     }
+    // In keyframe-reference mode a gaussian born after the GOP keyframe is absent
+    // from the encoded reference. Its lifetime invariants still compare with the
+    // preceding temporal sample, where it is live.
+    if (previous !== null && previous !== reference) {
+      checkGopInvariants(previous.ids, previous.bins, ids, bins, i);
+    }
     const groups = deltaGroups(reference.ids, reference.bins, ids, bins, i);
     const blob = encodeDeltaChunk(
       t0,
@@ -955,7 +970,7 @@ export async function encodeKeyframeDeltaSequence(
     out.bytes(blob);
     previousOffset = at;
     previousDepth = depth;
-    if (deltaMode === DELTA_MODE_CHAINED) previous = current;
+    previous = current;
     index.push({
       t0,
       t1,
