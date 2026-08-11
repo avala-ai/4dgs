@@ -76,7 +76,7 @@ jobs:
           size_kb=$(du -s typescript | cut -f1)
           echo "typescript: ${size_kb} KiB"
           [ "$size_kb" -le 704 ] || { echo "::error::typescript is ${size_kb} KiB, over the 704 KiB budget"; exit 1; }
-      - name: Dart sources under 608 KB
+      - name: Dart sources under 768 KB
         # Sources only, same as TypeScript's and Swift's: this job builds nothing, so
         # .dart_tool and the compiled runners are not here to measure, and a vendored
         # dependency would show up as a budget failure.
@@ -97,10 +97,20 @@ jobs:
         # three quarters of it the tests. The headroom is deliberate and will be spent:
         # the rest of the hostile-input suite is still to be ported here, which is what
         # lets a consumer drop a vendored copy of this decoder for the package.
+        # Raised from 608 to 768 KiB for example/main.dart, the last thing pana was
+        # scoring the package on — 150/160 to 160/160 — and for the hostile-input and
+        # writer work still landing on other branches. One 5 KiB file took the tree to
+        # 612 against a cap of 608, because `du` rounds every file to a 4 KiB block and
+        # a new directory costs a block of its own before its contents. 768 rather than
+        # the next step up from 608 because two other branches have already raised this
+        # same number — feat/dart-resource-bounds took it 608 to 704 for the resource
+        # ceilings, and the writer stack took it 704 to 768 — so all three agreeing makes
+        # the merge a no-op instead of three-way arithmetic. The number is coordinated,
+        # not guessed.
         run: |
           size_kb=$(du -s dart | cut -f1)
           echo "dart: ${size_kb} KiB"
-          [ "$size_kb" -le 608 ] || { echo "::error::dart is ${size_kb} KiB, over the 608 KiB budget"; exit 1; }
+          [ "$size_kb" -le 768 ] || { echo "::error::dart is ${size_kb} KiB, over the 768 KiB budget"; exit 1; }
       - name: Swift sources under 300 KB
         # Sources only, same as TypeScript's: this job builds nothing, so .build is not
         # here to measure and a vendored dependency would show up as a budget failure.
