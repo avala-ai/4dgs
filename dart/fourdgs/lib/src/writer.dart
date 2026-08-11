@@ -167,6 +167,13 @@ Uint8List writeFourdgsBytes(
       'extension, and a version-1 writer MUST NOT emit it',
     );
   }
+  if (options.sceneProfile == 'keyframed') {
+    throw const FourdgsInvalidInput(
+      'the scene profile "keyframed" promises a keyframe-delta temporal model '
+      'with indexed state chunks and Statistics, while this writer emits the '
+      'gaussian-birth model; use the sequence writer or leave the profile empty',
+    );
+  }
   _checkInput(gaussians, options.cutoff);
 
   final n = gaussians.count;
@@ -303,6 +310,11 @@ void _checkInput(FourdgsGaussianSet g, double cutoff) {
   // Reading the Header's own threshold back is what the decoder does; refusing
   // it here means the encoder cannot write a file whose cutoff its own decoder
   // would reject.
+  if (cutoff.isNaN || !cutoff.isFinite || cutoff <= 0.0 || cutoff > 1.0) {
+    throw FourdgsInvalidInput(
+      'cutoff is $cutoff; authoring input must be finite and in (0, 1]',
+    );
+  }
   supportK(cutoff);
 
   final n = g.count;

@@ -113,6 +113,24 @@ source_scene = fourdgs.read(source)
 src = source_scene.gaussians
 scene = fourdgs.read(encoded)
 enc = scene.gaussians
+expected_profile = "" if source_scene.header.profile == "objects" else source_scene.header.profile
+if scene.header.duration_sec != source_scene.header.duration_sec:
+    fail(
+        f"duration_sec changed from {source_scene.header.duration_sec} "
+        f"to {scene.header.duration_sec}"
+    )
+if scene.header.cutoff != source_scene.header.cutoff:
+    fail(f"cutoff changed from {source_scene.header.cutoff} to {scene.header.cutoff}")
+if dict(scene.header.attributes) != dict(source_scene.header.attributes):
+    fail(
+        f"Header attributes changed from {dict(source_scene.header.attributes)} "
+        f"to {dict(scene.header.attributes)}"
+    )
+if scene.header.profile != expected_profile:
+    fail(
+        f"scene profile is {scene.header.profile!r}, expected {expected_profile!r} "
+        "after the gaussian-only preset's documented downgrade"
+    )
 if enc.count != src.count:
     fail(f"the encoder wrote {enc.count} gaussians for {src.count}")
 if enc.count == 0:

@@ -1137,6 +1137,20 @@ void main() {
         () => writeFourdgsBytes(
           buildScene(count: 8),
           8.0,
+          options: const FourdgsWriteOptions(sceneProfile: 'keyframed'),
+        ),
+        throwsA(
+          isA<FourdgsInvalidInput>().having(
+            (FourdgsInvalidInput e) => e.message,
+            'message',
+            allOf(contains('keyframed'), contains('keyframe-delta')),
+          ),
+        ),
+      );
+      expect(
+        () => writeFourdgsBytes(
+          buildScene(count: 8),
+          8.0,
           options: const FourdgsWriteOptions(sceneProfile: 'relightable'),
         ),
         throwsA(
@@ -1339,7 +1353,13 @@ void main() {
             8.0,
             options: const FourdgsWriteOptions(cutoff: 0.0),
           ),
-          throwsA(isA<FourdgsMalformedFile>()),
+          throwsA(
+            isA<FourdgsInvalidInput>().having(
+              (FourdgsInvalidInput e) => e.message,
+              'message',
+              allOf(contains('cutoff'), contains('(0, 1]')),
+            ),
+          ),
         );
       },
     );
