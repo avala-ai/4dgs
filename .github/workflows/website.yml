@@ -47,6 +47,24 @@ jobs:
       - name: Build
         run: yarn workspace website build
 
+      # The viewer decodes real `.4dgs` files, so its tests need the corpus the six SDKs are
+      # diffed against. It is generated rather than committed; the tests fail rather than
+      # skip when it is absent, so this step is not optional.
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Generate the conformance corpus
+        run: |
+          pip install -e ./python/fourdgs
+          python tests/conformance/generate.py
+
+      # Both halves run against what was just built: the decode tests drive the viewer's
+      # own decode layer over every corpus variant, and the browser tests drive the built
+      # site in the Chrome this runner image already carries.
+      - name: Test the viewer
+        run: yarn workspace website test
+        env:
+          CHROME_PATH: /usr/bin/google-chrome
+
       - uses: actions/upload-pages-artifact@v5
         with:
           path: website/build
