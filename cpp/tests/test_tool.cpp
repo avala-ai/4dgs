@@ -604,6 +604,89 @@ void anOrphanChunkIsDecodedByTheStreamedValidationPass() {
   CHECK(foundOrphan);
 }
 
+void anUnindexedPhysicalBandIsRejected() {
+  if (corpusMissing()) return;
+  if (noDecoder()) return;
+  std::vector<std::uint8_t> bytes =
+      readBytes(corpusDirectory() / "MixedLifetimes-SHDegree3-UseChunkIndex-UseCrc.4dgs");
+  fourdgs::Result<Walk> walked =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  CHECK(walked.ok());
+  if (!walked) return;
+  const fourdgs::tool::Frame* index = walked->firstIntact(fourdgs::tool::op::kChunkIndex);
+  CHECK(index != nullptr);
+  if (index == nullptr) return;
+
+  // band_count is the last u32 in the fixed 40-byte index prefix. Leave the
+  // physical band records in place while making the indexed path omit them.
+  const std::size_t bandCount =
+      static_cast<std::size_t>(index->offset + fourdgs::tool::kRecordHeaderSize + 36);
+  writeU32(&bytes, bandCount, 0);
+  resealSummary(&bytes);
+  const Report report =
+      fourdgs::tool::validate(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  bool found = false;
+  for (const fourdgs::tool::Finding& finding : report.findings) {
+    if (finding.message.find("physical SH Band Stream record") != std::string::npos &&
+        finding.message.find("absent from the Chunk Index") != std::string::npos) {
+      found = true;
+    }
+  }
+  CHECK(found);
+}
+
+void duplicateFootersAndIndexEntriesAreRejected() {
+  if (corpusMissing()) return;
+  if (noDecoder()) return;
+  const std::vector<std::uint8_t> original = readBytes(corpusDirectory() / kProvenanceVariant);
+  fourdgs::Result<Walk> walked =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(original.data(), original.size()));
+  CHECK(walked.ok());
+  if (!walked) return;
+  const fourdgs::tool::Frame* footer = walked->firstIntact(fourdgs::tool::op::kFooter);
+  CHECK(footer != nullptr);
+  if (footer == nullptr) return;
+
+  const std::size_t footerAt = static_cast<std::size_t>(footer->offset);
+  const std::size_t footerEnd = footerAt + static_cast<std::size_t>(footer->total());
+  std::vector<std::uint8_t> duplicateFooter(original.begin(), original.begin() + footerAt);
+  duplicateFooter.insert(duplicateFooter.end(), original.begin() + footerAt,
+                         original.begin() + footerEnd);
+  duplicateFooter.insert(duplicateFooter.end(), original.begin() + footerAt, original.end());
+  const Report footerReport = fourdgs::tool::validate(
+      Span<const std::uint8_t>(duplicateFooter.data(), duplicateFooter.size()));
+  bool foundFooter = false;
+  for (const fourdgs::tool::Finding& finding : footerReport.findings) {
+    if (finding.message.find("Footer records; the Footer must be unique") != std::string::npos) {
+      foundFooter = true;
+    }
+  }
+  CHECK(foundFooter);
+
+  std::vector<fourdgs::tool::Frame> indexes;
+  (void)fourdgs::tool::walkBytes(Span<const std::uint8_t>(original.data(), original.size()),
+                                 [&](const fourdgs::tool::Frame& frame, bool complete) {
+                                   if (complete && frame.opcode == fourdgs::tool::op::kChunkIndex)
+                                     indexes.push_back(frame);
+                                 });
+  CHECK(indexes.size() >= 2);
+  if (indexes.size() < 2) return;
+  std::vector<std::uint8_t> duplicateIndex = original;
+  const std::size_t firstOffset =
+      static_cast<std::size_t>(indexes[0].offset + fourdgs::tool::kRecordHeaderSize + 16);
+  const std::size_t secondOffset =
+      static_cast<std::size_t>(indexes[1].offset + fourdgs::tool::kRecordHeaderSize + 16);
+  writeU64(&duplicateIndex, secondOffset, readU64(original, firstOffset));
+  resealSummary(&duplicateIndex);
+  const Report indexReport = fourdgs::tool::validate(
+      Span<const std::uint8_t>(duplicateIndex.data(), duplicateIndex.size()));
+  bool foundIndex = false;
+  for (const fourdgs::tool::Finding& finding : indexReport.findings) {
+    if (finding.message.find("duplicates physical chunk") != std::string::npos) foundIndex = true;
+  }
+  CHECK(foundIndex);
+}
+
 void inspectReadsRangesRatherThanTheWholeFile() {
   // Cross-SDK principle 1, checked at the transport rather than argued in a comment: `inspect` is
   // framing plus the summary checksum, so what it transfers is nine bytes per record and the
@@ -759,6 +842,18 @@ void modelSpecificAndBareStructureOpcodesAreRejected() {
     }
   }
   CHECK(rejectedAttribute);
+
+  std::vector<std::uint8_t> attachmentIndex = original;
+  attachmentIndex[static_cast<std::size_t>(chunk->offset)] = fourdgs::tool::op::kAttachmentIndex;
+  const Report attachmentIndexReport = fourdgs::tool::validate(
+      Span<const std::uint8_t>(attachmentIndex.data(), attachmentIndex.size()));
+  bool rejectedAttachmentIndex = false;
+  for (const fourdgs::tool::Finding& finding : attachmentIndexReport.findings) {
+    if (finding.message.find("reserved opcode 0x0e") != std::string::npos) {
+      rejectedAttachmentIndex = true;
+    }
+  }
+  CHECK(rejectedAttachmentIndex);
 }
 
 class FailingSummaryReadable : public fourdgs::Readable {
@@ -1095,6 +1190,8 @@ void runTests() {
   anUnindexedKeyframeDeltaUsesTheStreamedDecoder();
   anEmbeddedChunkOpcodeIsNotARecordBoundary();
   anOrphanChunkIsDecodedByTheStreamedValidationPass();
+  anUnindexedPhysicalBandIsRejected();
+  duplicateFootersAndIndexEntriesAreRejected();
   inspectReadsRangesRatherThanTheWholeFile();
   keyframeDeltaValidationDoesNotReadTheWholeResource();
   indexedBandRangesMustNameWholeTopLevelRecords();

@@ -277,6 +277,11 @@ Report validate(Readable& source) {
     if (opcode == op::kAttributeStream) {
       // Its registry number is used inside Chunk; the structural error is emitted below.
       continue;
+    } else if (opcode == op::kAttachmentIndex) {
+      error(&report, "the top-level Attachment Index at byte " +
+                         std::to_string(first == nullptr ? 0 : first->offset) +
+                         " uses reserved opcode 0x0e; its body is undefined and writers "
+                         "MUST NOT emit it (section 5.13)");
     } else if (isPrivate(opcode)) {
       if (count == 1 && first != nullptr) {
         note(&report, "private record " + hex2(opcode) + " (" + std::to_string(first->length) +
@@ -313,6 +318,10 @@ Report validate(Readable& source) {
   if (!header) error(&report, "no Header record");
   if (!quantization) error(&report, "no Quantization record");
   if (!footer) error(&report, "no Footer record");
+  if (walk.intactOpcodeCounts[op::kFooter] > 1) {
+    error(&report, "the file carries " + std::to_string(walk.intactOpcodeCounts[op::kFooter]) +
+                       " Footer records; the Footer must be unique and final");
+  }
   // The other half of the same normative sentence (spec §4: "the Header MUST be the first record,
   // the Footer MUST be the last"), and a note rather than an error on purpose.
   //
@@ -352,6 +361,7 @@ Report validate(Readable& source) {
   std::vector<std::optional<Frame>> physical(index.size());
   std::unordered_map<std::uint64_t, std::vector<std::size_t>> wanted;
   std::unordered_set<std::uint64_t> indexedChunkOffsets;
+  std::unordered_set<std::uint64_t> indexedBandOffsets;
   struct IndexedBand {
     std::size_t entry = 0;
     BandRange range;
@@ -361,15 +371,23 @@ Report validate(Readable& source) {
   std::unordered_map<std::uint64_t, std::vector<std::size_t>> wantedBands;
   for (std::size_t i = 0; i < index.size(); ++i) {
     wanted[index[i].offset].push_back(i);
-    indexedChunkOffsets.insert(index[i].offset);
+    if (!indexedChunkOffsets.insert(index[i].offset).second) {
+      error(&report, "chunk index entry " + std::to_string(i) + " duplicates physical chunk " +
+                         std::to_string(index[i].offset) +
+                         "; each state record must have exactly one index entry");
+    }
     for (const BandRange& range : index[i].bands) {
       const std::size_t at = indexedBands.size();
       indexedBands.push_back(IndexedBand{i, range, std::nullopt});
       wantedBands[range.offset].push_back(at);
+      indexedBandOffsets.insert(range.offset);
     }
   }
   std::optional<Frame> firstUnindexedState;
+  std::optional<Frame> firstUnindexedBand;
+  std::optional<std::uint64_t> firstUnindexedBandOwner;
   std::optional<Frame> firstGaussianBirthDelta;
+  std::optional<std::uint64_t> physicalStateOwner;
   (void)fourdgs::tool::walk(source, [&](const Frame& frame, bool complete) {
     if (!complete) return;
     const auto found = wanted.find(frame.offset);
@@ -381,6 +399,7 @@ Report validate(Readable& source) {
       for (std::size_t i : foundBands->second) indexedBands[i].physical = frame;
     }
     const bool state = frame.opcode == op::kChunk || frame.opcode == op::kDeltaChunk;
+    if (state) physicalStateOwner = frame.offset;
     if (!keyframeDelta && frame.opcode == op::kDeltaChunk && !firstGaussianBirthDelta.has_value()) {
       firstGaussianBirthDelta = frame;
     }
@@ -388,6 +407,12 @@ Report validate(Readable& source) {
         indexedChunkOffsets.find(frame.offset) == indexedChunkOffsets.end() &&
         !firstUnindexedState.has_value()) {
       firstUnindexedState = frame;
+    }
+    if (frame.opcode == op::kShBandStream && physicalIndexCount > 0 && completeIndex &&
+        indexedBandOffsets.find(frame.offset) == indexedBandOffsets.end() &&
+        !firstUnindexedBand.has_value()) {
+      firstUnindexedBand = frame;
+      firstUnindexedBandOwner = physicalStateOwner;
     }
   });
   for (std::size_t i = 0; i < index.size(); ++i) {
@@ -439,6 +464,15 @@ Report validate(Readable& source) {
   if (firstUnindexedState.has_value()) {
     error(&report, "the physical " + opcodeName(firstUnindexedState->opcode) + " record at byte " +
                        std::to_string(firstUnindexedState->offset) +
+                       " is absent from the Chunk Index");
+  }
+  if (firstUnindexedBand.has_value()) {
+    std::string owner =
+        firstUnindexedBandOwner.has_value()
+            ? " following state record at byte " + std::to_string(*firstUnindexedBandOwner)
+            : " with no preceding state record";
+    error(&report, "the physical SH Band Stream record at byte " +
+                       std::to_string(firstUnindexedBand->offset) + owner +
                        " is absent from the Chunk Index");
   }
   if (firstGaussianBirthDelta.has_value()) {

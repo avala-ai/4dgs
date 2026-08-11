@@ -59,6 +59,8 @@ constexpr std::uint8_t kAttributeStream = 0x06;
 constexpr std::uint8_t kShBandStream = 0x07;
 constexpr std::uint8_t kChunkIndex = 0x08;
 constexpr std::uint8_t kStatistics = 0x0C;
+/// Reserved Attachment Index: the format assigns the number but no body.
+constexpr std::uint8_t kAttachmentIndex = 0x0E;
 constexpr std::uint8_t kSummaryOffset = 0x0F;
 /// A keyframe-delta file's delta chunks. Deliberately not a flag on Chunk: a Chunk is
 /// independently decodable and a Delta Chunk is exactly the record that is not.

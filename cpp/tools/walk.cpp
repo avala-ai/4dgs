@@ -132,7 +132,8 @@ bool isProvenance(std::uint8_t opcode) {
 }
 
 bool isSpecified(std::uint8_t opcode) {
-  return ((opcode >= op::kHeader && opcode <= op::kAudioData) && opcode != op::kAttributeStream) ||
+  return ((opcode >= op::kHeader && opcode <= op::kAudioData) && opcode != op::kAttributeStream &&
+          opcode != op::kAttachmentIndex) ||
          (opcode >= op::kCoordinateFrame && opcode <= op::kObjectTrack);
 }
 
@@ -529,8 +530,14 @@ std::optional<ChunkRefusal> scanChunks(Readable& source, const std::vector<Index
 }
 
 std::optional<SummaryDeclaration> summaryDeclaration(Readable& source, const Walk& walk) {
-  const Frame* frame = walk.firstIntact(op::kFooter);
-  if (frame == nullptr) return std::nullopt;
+  // A summary declaration belongs to the unique trailing Footer. Reading the
+  // first Footer lets an earlier counterfeit suppress or redirect the checksum
+  // while a second Footer satisfies the last-record shape.
+  if (walk.intactOpcodeCounts[op::kFooter] != 1 || !walk.lastIntactRecord.has_value() ||
+      walk.lastIntactRecord->opcode != op::kFooter) {
+    return std::nullopt;
+  }
+  const Frame* frame = &*walk.lastIntactRecord;
   // `summary_start`, `summary_offset_start`, `summary_crc` — twenty bytes, and the only record
   // this tool reads the content of. A Footer a later revision extends still parses: the fields
   // this needs are the first three and they do not move.
