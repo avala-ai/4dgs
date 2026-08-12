@@ -575,7 +575,13 @@ def validate(data: bytes) -> Report:
 
     if keyframe_delta:
         assert header is not None  # `keyframe_delta` is read off it
-        _check_keyframe_delta(data, walk, report, header, bool(index))
+        # A *usable* index, not merely the presence of parsed Chunk Index records. The
+        # indexed branch opens the file with `open_indexed`, which needs the Footer to
+        # name a summary; a file whose `summary_start` is 0 carries index records that
+        # no seeking reader can reach, and sending it down that branch refuses it with
+        # "a seeking reader cannot open this file" and decodes nothing. §5.2 calls that
+        # file indexless, and the streamed branch is the one that reads it.
+        _check_keyframe_delta(data, walk, report, header, footer_selects_summary and bool(index))
     else:
         _check_gaussian_birth(data, walk, report)
 

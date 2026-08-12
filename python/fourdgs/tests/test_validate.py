@@ -221,6 +221,32 @@ class TestRefusals:
         assert not any("lies outside the Footer-selected summary index" in m for m in errors(report))
         assert any("chunk index entry 0" in m for m in errors(report))
 
+    def test_a_keyframe_delta_file_naming_no_summary_is_still_decoded(self):
+        """Keeping the index records must not send the file down the seeking branch.
+
+        `_check_keyframe_delta` opens the file with `open_indexed` when it is told the
+        file is indexed, and that needs the Footer to name a summary. Passing it
+        `bool(index)` meant a `summary_start` of 0 — §5.2's indexless file, which may
+        still carry Chunk Index records nothing can reach — was answered with one
+        "a seeking reader cannot open this file" and no chunk decoded at all. The
+        streamed branch reads it, and that is the branch it belongs on.
+        """
+        import pathlib
+
+        corpus = pathlib.Path(__file__).resolve().parents[3] / "tests/conformance/data/keyframe"
+        source = corpus / "KeyframeDelta-UseChunkIndex-UseCrc-UseStatistics.4dgs"
+        if not source.exists():
+            import pytest
+
+            pytest.skip("the generated corpus is not present")
+        data = bytearray(source.read_bytes())
+        data[-(20 + len(MAGIC)) : -(len(MAGIC) + 12)] = (0).to_bytes(8, "little")
+        data[-(len(MAGIC) + 4) : -len(MAGIC)] = (0).to_bytes(4, "little")
+
+        report = validate(bytes(data))
+
+        assert not any("a seeking reader cannot open this file" in m for m in errors(report))
+
     def test_a_non_finite_quantization_step_is_an_error(self):
         # Spec §5.3: every step and origin must be finite. This is the corrupt field that
         # ruins every gaussian rather than one — each bin times an infinite step decodes to
