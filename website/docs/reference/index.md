@@ -3,9 +3,11 @@
 Support in this project is **per feature, not per language**. A partial SDK is a deliberate,
 documented state — not a defect — and this table is the public contract that says so.
 
-**A `Yes` means the conformance suite proves it.** Each SDK declares the variants it supports via
-`supportsVariant()`, the harness runs exactly those, and this table is kept in lockstep with those
-declarations. Nothing is marked `Yes` on the strength of code existing.
+**A `Yes` means the conformance suite proves it.** Each SDK answers the variants it supports, the
+harness skips the rest —
+[which variants those are, and who decides, is the runner protocol](./conformance.md#declining-a-variant)
+— and this table is kept in lockstep with what runs. Nothing is marked `Yes` on the strength of code
+existing.
 
 Every row is filled in from a suite that runs: 46 valid variants and 7 invalid ones, plus 4
 keyframe-delta and 3 object-layer variants in their own subdirectories, over two read paths
@@ -17,6 +19,7 @@ computes keyframe-delta summaries in the core, the provenance-JSON accessor does
 provenance family, and the objects-JSON pair does it for the object layer, so every binding emits
 identical bytes with no per-language slerp or composition order of its own.
 
+<!-- prettier-ignore -->
 | Feature                                           | Python | TypeScript | Rust    | C++     | Swift   | Dart    |
 | ------------------------------------------------- | ------ | ---------- | ------- | ------- | ------- | ------- |
 | Streaming decode                                  | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
@@ -30,7 +33,7 @@ identical bytes with no per-language slerp or composition order of its own.
 | Spherical harmonics, degree 1                     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Spherical harmonics, degree 2                     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Spherical harmonics, degree 3                     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| SH band range-skipping                            | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| SH band range-skipping                            | Yes    | Yes        | Yes     | Untested | Untested | Yes     |
 | SH per-band bit depth, decode                     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | SH per-band bit depth, encode                     | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
 | Spatial audio sources (optional)                  | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
@@ -230,10 +233,13 @@ Swift are proved by the cross-language encode gate below, which runs the same pe
 coefficients each encoder coarsened must come back out of the Python decoder as the same bytes, and
 the appended depths must read as the ones written.
 
-**SH band range-skipping** is proved by a byte count taken at the transport rather than by a decoded
-value: each runner reads a chunk at every band cap and asserts the bytes transferred equal exactly
-what the chunk index declares for the bands at or below it. Never transferring a band you will not
-evaluate is the whole feature, and that is what is measured.
+**SH band range-skipping** is proved for four SDKs by a byte count taken at the transport rather
+than by a decoded value: each of those runners reads a chunk at every band cap and asserts the bytes
+transferred equal exactly what the chunk index declares for the bands at or below it. Never
+transferring a band you will not evaluate is the whole feature, and that is what is measured. The
+C++ and Swift bindings compare byte-count expectations derived from the same Rust binding that
+performs the read, rather than independently measuring capped transport reads, so both cells remain
+`Untested`.
 
 **Refusal diagnosis** is a `Yes` only where a runner names _which_ rule a file broke, not merely
 that it refused one. The invalid corpus pairs each deliberately broken file with a refusal
@@ -323,10 +329,11 @@ their own bindings. See
 [the fuzzing notes](https://github.com/avala-ai/4dgs/blob/main/tests/fuzz/README.md) and
 `rust/fourdgs/tests/fuzz.rs`.
 
-**Swift**'s band-skipping check asserts the byte **count**, not that the call succeeded. A cache
-that answers a narrow cap from a wider entry returns the wider count while looking perfectly healthy
-— that bug existed in the core and was fixed — so the runner requires that capping harmonics away
-costs strictly fewer bytes than carrying them, and that no cap ever moves more than a wider one.
+**C++** and **Swift** currently check band-skipping against byte-count expectations computed from
+the same Rust binding that performs the capped read. Those checks show that the estimates shrink as
+bands are capped, but they do not independently observe the binding's cache or transport. That is
+why the matrix records both bindings as `Untested` for range-skipping even though the core
+implements it.
 
 **Convert from PLY frame sequences** and **Inspect and validate** are tools rather than wire-format
 features, so the conformance suite does not cover them; they are marked from their own tests, which
