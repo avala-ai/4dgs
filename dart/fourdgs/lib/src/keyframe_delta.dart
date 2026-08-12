@@ -349,7 +349,9 @@ void _checkGroupsDisjoint(Int32List a, Int32List b, Int32List d) {
   final body = parseChunk(content);
   if (body.header.compression.isNotEmpty) {
     throw FourdgsUnsupportedCodec(
-      'chunk-level "${body.header.compression}" compression is not supported',
+      'the keyframe Chunk at byte $at declares chunk-level '
+      '"${body.header.compression}" compression; expected an empty '
+      'chunk-level compression name and per-attribute stream codecs',
       refusalCode: refusalUnknownStreamCodec,
     );
   }

@@ -91,6 +91,7 @@ FourdgsDecodedChunk decodeChunkStreams(
   required double cutoff,
   String compression = '',
   Map<int, Uint8List> shBandRecords = const <int, Uint8List>{},
+  Map<int, int> shBandContentOffsets = const <int, int>{},
   int chunkOffset = 0,
   int streamsOffset = 0,
 }) {
@@ -363,6 +364,7 @@ FourdgsDecodedChunk decodeChunkStreams(
       content,
       expectedBand: band,
       expectedCount: count,
+      fileOffset: shBandContentOffsets[band] ?? 0,
     );
     if (decoded != null) shBands[band] = decoded;
   });
@@ -557,10 +559,14 @@ const Map<int, ({int first, int last})> shBandRange =
 ///
 /// Coefficients are returned as the bytes the producer stored, undecoded. What
 /// those bytes mean is a rendering decision and does not belong to a container.
+/// [fileOffset] is where [content] starts in the file, so a stream-codec
+/// refusal can name the SH Band Stream's exact header byte. Zero is truthful
+/// for callers holding detached record content.
 Uint8List? decodeShBandRecord(
   Uint8List content, {
   required int expectedBand,
   required int expectedCount,
+  int fileOffset = 0,
 }) {
   final cursor = FourdgsCursor(content);
   final band = cursor.u8();
@@ -576,6 +582,7 @@ Uint8List? decodeShBandRecord(
     throw FourdgsTruncatedFile('band $band has a record but no stream in it');
   }
 
+  final streamOffset = fileOffset + cursor.pos;
   final header = readStreamHeader(cursor);
   final channels = shBandChannels[band];
   if (channels == null) {
@@ -594,7 +601,11 @@ Uint8List? decodeShBandRecord(
     );
   }
 
-  final stream = decodeAttributeStreamBody(cursor, header);
+  final stream = decodeAttributeStreamBody(
+    cursor,
+    header,
+    streamOffset: streamOffset,
+  );
   final out = Uint8List(stream.count * stream.channels);
   for (int i = 0; i < out.length; i++) {
     out[i] = stream.values[i] & 0xFF;

@@ -186,6 +186,7 @@ Uint8List _record(int opcode, List<int> content) =>
 Uint8List _keyframeDeltaFile({
   required int gaussianId,
   required int windowIndex,
+  String compression = '',
 }) {
   final streams =
       BytesBuilder()
@@ -198,7 +199,7 @@ Uint8List _keyframeDeltaFile({
         ..add(_f64(1.0)) // t1
         ..add(_u32(0)) // level
         ..add(_u32(1)) // count
-        ..add(_string('')) // compression
+        ..add(_string(compression))
         ..add(_u64(0)) // uncompressed_size
         ..add(_u64(block.length))
         ..add(block);
@@ -322,8 +323,63 @@ void main() {
           contains('stream header at byte 123'),
           contains('Chunk at byte 80'),
           contains('codec 9'),
-          contains('deflate (1)'),
-          contains('zstd (2)'),
+          contains('deflate (0)'),
+          contains('zstd (1)'),
+        ),
+      );
+
+      final zstdMessage = _messageOf(
+        () => decodeChunkStreams(
+          _constStreamWithCodec(codecZstd),
+          1,
+          _unitSteps,
+          const <double>[0.0, 0.0, 0.0],
+          const <FourdgsWindow>[FourdgsWindow(0.0, 1.0)],
+          cutoff: 0.05,
+          streamsOffset: 123,
+        ),
+      );
+      expect(
+        zstdMessage,
+        allOf(
+          contains('declares zstd codec 1'),
+          contains('expected deflate codec 0'),
+        ),
+      );
+
+      final bandStream = _constStream(attrColor, 9, 1, 0)..[3] = 9;
+      final bandMessage = _messageOf(
+        () => decodeShBandRecord(
+          Uint8List.fromList(<int>[1, ...bandStream]),
+          expectedBand: 1,
+          expectedCount: 1,
+          fileOffset: 4096,
+        ),
+      );
+      expect(
+        bandMessage,
+        allOf(
+          contains('attribute $attrColor'),
+          contains('stream header at byte 4097'),
+          contains('codec 9'),
+        ),
+      );
+
+      final keyframeMessage = _messageOf(
+        () => decodeKeyframeDeltaStreamed(
+          _keyframeDeltaFile(
+            gaussianId: 1,
+            windowIndex: 0,
+            compression: 'zstd',
+          ),
+        ),
+      );
+      expect(
+        keyframeMessage,
+        allOf(
+          contains('keyframe Chunk at byte'),
+          contains('"zstd"'),
+          contains('expected an empty chunk-level compression name'),
         ),
       );
     });
@@ -483,6 +539,17 @@ void main() {
             'message',
             contains('not a 4dgs file'),
           ),
+        ),
+      );
+    });
+
+    test('a bad sentinel names its exact byte and values', () {
+      expect(
+        _messageOf(() => checkMagic(_magicWith(7, 0x0D))),
+        allOf(
+          contains('byte 7'),
+          contains('found 0x0d'),
+          contains('expected 0x0a'),
         ),
       );
     });

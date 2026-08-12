@@ -412,6 +412,7 @@ Future<FourdgsDecodedChunk> readFourdgsChunk(
   }
 
   final bandRecords = <int, Uint8List>{};
+  final bandContentOffsets = <int, int>{};
   for (final band in entry.bands) {
     if (band.band > maxShBand) continue;
     _checkRange(scene, band.offset, band.length, 'SH band ${band.band}');
@@ -421,6 +422,7 @@ Future<FourdgsDecodedChunk> readFourdgsChunk(
       opShBandStream,
       'SH band ${band.band}',
     );
+    bandContentOffsets[band.band] = band.offset + recordHeaderBytes;
   }
 
   return decodeChunkStreams(
@@ -432,6 +434,7 @@ Future<FourdgsDecodedChunk> readFourdgsChunk(
     cutoff: scene.header.cutoff,
     compression: body.header.compression,
     shBandRecords: bandRecords,
+    shBandContentOffsets: bandContentOffsets,
     chunkOffset: entry.chunkOffset,
     streamsOffset: entry.chunkOffset + recordHeaderBytes + body.streamsOffset,
   );

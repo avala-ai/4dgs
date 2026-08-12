@@ -349,8 +349,9 @@ void checkMagic(Uint8List head) {
   for (int i = 0; i < fourdgsMagic.length; i++) {
     if (i == _magicVersionAt) continue;
     if (head[i] != fourdgsMagic[i]) {
-      throw const FourdgsUnsupportedVersion(
-        'not a 4dgs file (bad magic)',
+      throw FourdgsUnsupportedVersion(
+        'not a 4dgs file: bad magic at byte $i; found '
+        '${_hexByte(head[i])}, expected ${_hexByte(fourdgsMagic[i])}',
         refusalCode: refusalMagicMismatch,
       );
     }
@@ -366,6 +367,8 @@ void checkMagic(Uint8List head) {
     );
   }
 }
+
+String _hexByte(int byte) => '0x${byte.toRadixString(16).padLeft(2, '0')}';
 
 /// The version byte as a reader would see it: the digit when it is one, and the
 /// raw byte in hex when the file is corrupt enough that it is not.
@@ -601,15 +604,15 @@ Uint8List _decompress(Uint8List body, int codec, int expected, String context) {
     // my stream codec". Which of the two it is belongs in the message, not in
     // the identifier.
     throw FourdgsUnsupportedCodec(
-      '$context declares zstd codec 2, which this build does not implement; '
-      'expected deflate codec 1 for this build',
+      '$context declares zstd codec $codecZstd, which this build does not '
+      'implement; expected deflate codec $codecDeflate for this build',
       refusalCode: refusalUnknownStreamCodec,
     );
   }
   if (codec != codecDeflate) {
     throw FourdgsUnsupportedCodec(
       '$context declares codec $codec; expected a registered stream codec: '
-      'deflate (1) or zstd (2)',
+      'deflate ($codecDeflate) or zstd ($codecZstd)',
       refusalCode: refusalUnknownStreamCodec,
     );
   }

@@ -207,6 +207,7 @@ FourdgsScene readFourdgsBytes(
                 record.content,
                 expectedBand: band,
                 expectedCount: chunkCounts.last,
+                fileOffset: record.offset + recordHeaderBytes,
               );
               if (decoded != null) chunkBands.last[band] = decoded;
             }
