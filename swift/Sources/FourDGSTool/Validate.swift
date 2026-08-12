@@ -2061,7 +2061,9 @@ private func validationState(
 }
 
 /// Prove composition at the same signed-32-bit boundary as the decoders. Each target update is
-/// checked against a replay of its reference chain, one updated attribute at a time.
+/// checked against the state its reference composes to, one updated attribute at a time — carried
+/// forward from the previous target where the order supplies it, replayed from the keyframe where
+/// it does not.
 private func validateKeyframeDeltaBins(
     _ source: ToolReader, physical: PhysicalValidation, report: inout Report
 ) {
@@ -2069,23 +2071,48 @@ private func validateKeyframeDeltaBins(
         if $0.value.t0 == $1.value.t0 { return $0.key < $1.key }
         return $0.value.t0 < $1.value.t0
     }
+    // Replaying every target's chain from its keyframe is quadratic in chain depth, so a legal
+    // 65,535-deep chain would let a small file spend billions of group decodes here. The targets
+    // are already in timeline order, so each one keeps the states it composed and the next one
+    // reuses them when it references that offset, replaying only when the order does not supply
+    // the predecessor — the same shape `walkComposedStates` uses for the identity column.
+    //
+    // The cache holds one column per attribute where the replay held one at a time, so it is
+    // capped at the same total a single column may reach. Past that it simply stops caching and
+    // the file composes exactly as it did before: slower, never larger. Trading the memory
+    // ceiling for the speed is not this function's call to make.
+    var carriedOffset: UInt64?
+    var carried: [UInt8: ValidationColumnState] = [:]
     for (offset, fields) in targets where fields.opcode == Opcode.deltaChunk {
         guard let frame = physical.frames[offset] else { continue }
+        var composed: [UInt8: ValidationColumnState] = [:]
+        var retained: UInt64 = 0
         do {
             let update = try deltaGroups(source, frame)[0]
             let attributes = try validationGroupAttributes(frame, update)
                 .filter { $0 != 13 && $0 != 2 && $0 != 3 }
             for attribute in attributes {
-                guard
-                    var state = try validationState(
-                        source, physical: physical, target: fields.referenceOffset,
-                        attribute: attribute)
-                else { continue }
+                var state: ValidationColumnState
+                if carriedOffset == fields.referenceOffset, let reuse = carried[attribute] {
+                    state = reuse
+                } else if let replayed = try validationState(
+                    source, physical: physical, target: fields.referenceOffset,
+                    attribute: attribute)
+                {
+                    state = replayed
+                } else {
+                    continue
+                }
                 // Deaths and births do not affect an update id because groups are disjoint; apply
                 // only the update to prove its arithmetic against the referenced bins.
                 try applyValidationDelta(
                     &state, source: source, frame: frame, attribute: attribute,
                     includeUpdates: true)
+                let cost = UInt64(state.column?.storedValueCount ?? 0) * 4 + UInt64(state.ids.count) * 4
+                if retained + cost <= maximumValidationColumnBytes {
+                    retained += cost
+                    composed[attribute] = state
+                }
             }
         } catch {
             report.refused(
@@ -2095,6 +2122,8 @@ private func validateKeyframeDeltaBins(
                     what: "the bin chain ending at the DeltaChunk at byte \(offset)"))
             return
         }
+        carriedOffset = offset
+        carried = composed
     }
 }
 
