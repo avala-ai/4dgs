@@ -283,8 +283,15 @@ KeyframeDeltaState _applyDelta(
         );
       }
     }
+    // Every attribute the referenced state carries, not only the required ones.
+    // A birth is absolute state: if the state it joins has an `object_id` — or
+    // a `source_group`, or a `source_index` — then a birth that omits it is not
+    // saying "background", it is failing to say anything, and zero-filling it
+    // invents a membership the file never declared. Python, Rust and TypeScript
+    // all refuse this as `incomplete-birth`; narrowing it to the required list
+    // made the same bytes decode here and refuse there.
     final absent = <int>[
-      for (final attribute in requiredAttributes)
+      for (final attribute in bins.keys)
         if (!birthBins.containsKey(attribute)) attribute,
     ]..sort();
     if (absent.isNotEmpty) {

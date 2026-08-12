@@ -850,7 +850,37 @@ void main() {
       );
     });
 
-    test('unregistered trajectory interpolation is a warning', () async {
+    test('unregistered interpolation on an empty trajectory warns', () async {
+      // Section 5.15.4 reads a zero-sample trajectory as though the record were
+      // absent, so parsing it refuses nothing — not even an interpolation byte
+      // that describes how to read samples it does not carry. The validator can
+      // still say the value is not one the registry defines.
+      final Uint8List trajectory =
+          (BytesBuilder()
+                ..add(_string('rig'))
+                ..addByte(7)
+                ..add(_u32(0)))
+              .toBytes();
+      final FourdgsValidation report = await validateFourdgs(
+        FourdgsBytes(_minimal(extra: _record(opRigTrajectory, trajectory))),
+      );
+      expect(
+        _messages(report, FourdgsSeverity.warning),
+        contains(
+          "trajectory 'rig' names interpolation 7, which is not in the registry",
+        ),
+      );
+      expect(
+        _messages(report, FourdgsSeverity.error),
+        isNot(contains(contains("trajectory 'rig'"))),
+      );
+    });
+
+    test('a sampled trajectory refuses unregistered interpolation', () async {
+      // The same byte, on a record that does carry samples, is a refusal: it says
+      // how to read poses this record has, and a reader that accepts it either
+      // guesses or hands back poses nobody described. Python (`records.py`) and
+      // Rust (`records.rs`) both refuse this at parse; so does this.
       final Uint8List trajectory =
           (BytesBuilder()
                 ..add(_string('rig'))
@@ -868,15 +898,10 @@ void main() {
       final FourdgsValidation report = await validateFourdgs(
         FourdgsBytes(_minimal(extra: _record(opRigTrajectory, trajectory))),
       );
-      expect(
-        _messages(report, FourdgsSeverity.warning),
-        contains(
-          "trajectory 'rig' names interpolation 7, which is not in the registry",
-        ),
-      );
+      expect(report.ok, isFalse);
       expect(
         _messages(report, FourdgsSeverity.error),
-        isNot(contains(contains("trajectory 'rig'"))),
+        contains(contains("trajectory 'rig'")),
       );
     });
 

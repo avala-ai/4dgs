@@ -1167,7 +1167,14 @@ Future<void> _checkProvenanceRecords(
               )) {
             duplicate('RigTrajectory', value.name, '5.15.4');
           }
-          if (value.sampleCount > 0 &&
+          // Only the empty record reaches this. A trajectory that carries samples
+          // and names an interpolation outside the registry is refused when it is
+          // parsed, as Python and Rust refuse it — the value says how to read
+          // samples this record has. The zero-sample record is the one §5.15.4
+          // says to read as though it were absent, so parsing it refuses nothing;
+          // a conformance validator can still say the value is not one the
+          // registry defines.
+          if (value.sampleCount == 0 &&
               value.interpolation != trajectoryLinear &&
               value.interpolation != trajectoryStep) {
             report.warn(

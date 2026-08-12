@@ -97,7 +97,17 @@ Future<FourdgsSummaryCoverage?> _coverage(
   FourdgsReadable source,
   FourdgsWalk walk,
 ) async {
-  final FourdgsFrame? frame = walk.first(opFooter);
+  // The Footer is the file's last record (§4), so the trailing one is the only
+  // one whose summary this can report on. Taking the *first* let a stray early
+  // Footer — two bodies concatenated, or an encoder that emitted one before its
+  // summary — answer for the real one: a zero `summary_crc` there printed "this
+  // file declares no summary checksum" and marked every row uncovered, hiding a
+  // genuine mismatch in the summary that is actually there; a `summary_start`
+  // past its own offset made the tool report that the Footer "does not parse",
+  // which was false, it had parsed fine.
+  final FourdgsFrame? last = walk.last;
+  final FourdgsFrame? frame =
+      last != null && last.opcode == opFooter ? last : null;
   if (frame == null || frame.offset + frame.total > walk.size) return null;
   final FourdgsFooter footer = FourdgsFooter.parse(
     await source.read(

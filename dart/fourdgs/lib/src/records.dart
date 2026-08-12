@@ -1742,8 +1742,15 @@ class FourdgsRigTrajectory {
     // Section 5.15.4: a trajectory with no samples "MUST be read as though the
     // record were absent", so reading one refuses nothing — not even an
     // interpolation byte outside the registry, which describes how to read
-    // samples it does not carry. `check` stays strict for the writer.
-    if (trajectory.times.isNotEmpty) trajectory._checkSamples();
+    // samples it does not carry.
+    //
+    // That carve-out is for the empty record only. A trajectory that does carry
+    // samples gets the whole of `check`, interpolation included: an unknown
+    // interpolation says how to read samples this record has, and a reader that
+    // accepts it either guesses or hands back poses nobody described. Calling
+    // `_checkSamples` alone here dropped that refusal for every trajectory,
+    // where Python (`records.py`) and Rust (`records.rs`) both refuse at parse.
+    if (trajectory.times.isNotEmpty) trajectory.check();
     return trajectory;
   }
 
