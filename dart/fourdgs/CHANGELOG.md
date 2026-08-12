@@ -281,6 +281,83 @@ Each ceiling names the byte, the record, the value and the expectation, so
 as `FourdgsChunkIndexEntry` already did, and the chunk parsers report where their stream blocks
 start.
 
+### Inspect and validate
+
+- **A `fourdgs` command.** `dart pub global activate fourdgs` puts `fourdgs inspect` and
+  `fourdgs validate` on the PATH. `inspect` walks the records — opcode by name, byte offset, content
+  and total length, and whether the Footer's summary checksum covers that record — reading nine
+  bytes per record and never a record's content, so it costs the same on a file carrying an hour of
+  audio as on one carrying none. `validate` checks a file against the specification and, for the
+  rules whose whole content is a refusal, names **which** rule and **which byte**. The identifiers
+  and the offsets are the ones the Python, Rust, TypeScript and C++ tools print for the same files;
+  the sentences around them are this decoder's own. The command lives in `bin/` and reaches for
+  `package:fourdgs/io.dart`, so the decoder itself stays free of `dart:io`.
+- **Exit codes a pipeline can act on**: `0` fine, `1` refused or invalid, `2` valid with warnings,
+  `3` the tool itself could not run. The last one is the point of the set — a tool that exits `1`
+  both for "I read the file and it is not conforming" and for "I fell over" is indistinguishable
+  from a broken tool, and nothing downstream can tell those apart after the fact.
+- **The validator decodes the chunks, one at a time.** A framing walk steps _over_ a chunk by its
+  declared length, which is exactly not looking inside it, so an unimplemented stream codec and an
+  out-of-range window index are invisible to it — and both are in the invalid corpus. Each chunk is
+  fetched by byte range from the index, decoded, and dropped before the next one, so a file larger
+  than memory is still validatable (AGENTS.md §1). A file with no index is walked frame by frame and
+  its chunks decoded the same way, rather than handed to the front-to-back reader, which would keep
+  every one of them.
+- **And their spherical-harmonic bands.** Each declared band record is decoded on its own, so a band
+  that will not decode is named at _its_ byte rather than at the chunk's. A validator that never
+  opened a whole record class would call a file with a corrupt band `valid`.
+- **`keyframe-delta` is validated against its own model.** The Header's declared model selects the
+  reader, and each chain is composed and dropped in turn — `composeKeyframeDeltaChain` is now public
+  for exactly that, since `decodeKeyframeDeltaIndexed` answers "what does this file decode to" and
+  therefore holds every composed state at once. Without this a conforming keyframe-delta file was
+  reported as broken for declaring a model this package implements.
+- **A truncated file reports what survived.** Records are length-prefixed, so everything complete
+  before the cut is intact and the streamed reader keeps it. Both commands say which byte the file
+  was cut at and how many whole records precede it, rather than printing one line and throwing the
+  rest away.
+- **`inspectFourdgs`, `validateFourdgs`, `walkFourdgsFraming` and `describeFourdgsRefusal`** are
+  exported from the library and take a `FourdgsReadable`, so everything the command does is
+  something a caller can do — which is what keeps a command-line tool from becoming a second,
+  undocumented implementation of the format.
+- **Nothing in the validator holds the file.** The Python, Rust, TypeScript and C++ validators all
+  take the whole thing as a byte array; this one is the only one whose entry point is a
+  `FourdgsReadable`, and a validator that reads a file to check a file is the API AGENTS.md §1 calls
+  wrong. So the framing walk supplies the record table, each record's content is fetched by its own
+  range when a check needs it — twenty-four bytes of a Chunk for the count it declares, twelve of an
+  Audio Data record for its id and length — and the summary checksum runs a block at a time through
+  `fourdgsCrc32Range`. What a multi-gigabyte scene costs to validate is its largest single chunk.
+  `inspect` gets the same treatment: `summary_start` is an untrusted field on a file the command is
+  pointed at _because_ it is suspect, and a Footer naming the whole file as its summary region used
+  to be one allocation.
+- **A file whose Footer will not parse still gets its record table.** `inspect` reported nothing at
+  all — no table, no offsets — for exactly the malformed record its holder ran it for. The framing
+  walk is kept and the checksum line says the Footer does not parse.
+- **`inspect` exits 1 for a file with no trailing magic**, not only for one the walk stopped inside.
+  A file cut exactly at a record boundary leaves the walk nothing to stop on, so a script reading
+  the exit code alone was told a truncated file inspected cleanly — while `validate` called the same
+  file an error.
+- **The object layer and the provenance records are parsed, not merely framed.** Opening a scene
+  frames them and stops, which is what makes a thousand-sample rig trajectory cost nothing to open;
+  a validator is the caller that asks for them. Without asking, a file carrying a truncated
+  `ObjectTrack` or two Object Tables was reported valid by the tool and refused by
+  `readFourdgsObjects` — the tool and the API disagreeing about the same bytes.
+- **A `keyframe-delta` file is opened the way a seeking reader would, like every other file.** That
+  branch composed its chains straight from the framing, so a delta file with a record after its
+  Footer, an unknown `chunk_kind` or a nonempty zero-width entry passed validation while every
+  reader in this package refused it. Its composed states are now checked against the `live_count`
+  §5.8 declares, its declared spherical-harmonic bands are decoded, and every composed
+  `window_index` is checked against the Window Table — composition is arithmetic on bins and never
+  looks a window up, so a file naming a window it does not carry composed without complaint and was
+  refused the moment anything reconstructed it.
+- **A chunk index entry pointing at the end of the file is a finding rather than a crash.**
+  `chunk_offset == size` with `chunk_length == 0` satisfies "does the range fit" and points at no
+  byte at all; reading the opcode there threw an uncaught range error, so the tool fell over on
+  exactly the input it exists for.
+- **Walking every chain in an index is linear in the index again.** Each walk rebuilt the map from
+  chunk offset to entry, so composing a ten-thousand-entry index cost hundreds of millions of map
+  insertions before a chunk was read. The lookup is built once and passed
+  (`keyframeDeltaChainIndex`), by the validator and by `decodeKeyframeDeltaIndexed` alike.
+
 ### Refusal diagnosis
 
 - **Refusals say which rule was broken.** Every exception in this package now carries an optional

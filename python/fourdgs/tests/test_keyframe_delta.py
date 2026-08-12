@@ -194,9 +194,40 @@ def test_rotation_in_an_update_is_absolute_not_a_difference():
     """The smallest-three basis changes when the largest component does, so the three
     stored bins mean different components either side of it. Restating outright is what
     makes the rotation bound the section-6.4 bound with no composition term at all."""
-    state = kd.keyframe_state(np.asarray([1]), {op.A_ROTATION: np.asarray([[100, 200, 300]])})
-    out = _apply(state, updates=([1], {op.A_ROTATION: np.asarray([[7, 8, 9]])}))
+    state = kd.keyframe_state(
+        np.asarray([1]),
+        {
+            op.A_ROTATION_INDEX: np.asarray([[0]]),
+            op.A_ROTATION: np.asarray([[100, 200, 300]]),
+        },
+    )
+    out = _apply(
+        state,
+        updates=(
+            [1],
+            {
+                op.A_ROTATION_INDEX: np.asarray([[2]]),
+                op.A_ROTATION: np.asarray([[7, 8, 9]]),
+            },
+        ),
+    )
+    assert out.bins[op.A_ROTATION_INDEX].tolist() == [[2]]
     assert out.bins[op.A_ROTATION].tolist() == [[7, 8, 9]]
+
+
+@pytest.mark.parametrize("present", [op.A_ROTATION_INDEX, op.A_ROTATION])
+def test_an_update_must_restate_both_halves_of_a_rotation(present):
+    state = kd.keyframe_state(
+        np.asarray([1]),
+        {
+            op.A_ROTATION_INDEX: np.asarray([[0]]),
+            op.A_ROTATION: np.asarray([[100, 200, 300]]),
+        },
+    )
+    value = np.asarray([[1]]) if present == op.A_ROTATION_INDEX else np.asarray([[7, 8, 9]])
+    with pytest.raises(Exception) as caught:
+        _apply(state, updates=([1], {present: value}))
+    assert caught.value.code == "incomplete-rotation-update"
 
 
 @pytest.mark.parametrize(
@@ -227,6 +258,82 @@ def test_a_birth_must_carry_every_attribute_the_state_has():
     with pytest.raises(Exception) as caught:
         _apply(state, births=([2], {op.A_POSITION: np.asarray([[1, 1, 1]])}))
     assert caught.value.code == "incomplete-birth"
+
+
+def test_every_composed_column_is_as_tall_as_the_population():
+    """The rows are addressed by position against `ids`, so a short column is not a
+    smaller answer — it is a read of the wrong gaussian, or an `IndexError` on a file.
+
+    An identity lane a birth introduces pads the rows that predate it, because zero is
+    the defined value for a row nothing labelled. Both sides of the lane are exercised:
+    introduced by the birth, and omitted by a birth into a state that already has it.
+    """
+    state = kd.keyframe_state(
+        np.asarray([1, 2]),
+        {op.A_POSITION: np.asarray([[0, 0, 0], [1, 1, 1]])},
+    )
+    grown = _apply(
+        state,
+        births=([3], {op.A_POSITION: np.asarray([[2, 2, 2]]), op.A_OBJECT_ID: np.asarray([[7]])}),
+    )
+    assert grown.count == 3
+    for attribute, column in grown.bins.items():
+        assert column.shape[0] == 3, f"attribute {attribute}: {column.shape}"
+    assert grown.bins[op.A_OBJECT_ID].reshape(-1).tolist() == [0, 0, 7]
+
+    later = _apply(grown, births=([4], {op.A_POSITION: np.asarray([[3, 3, 3]])}))
+    assert later.count == 4
+    assert later.bins[op.A_OBJECT_ID].reshape(-1).tolist() == [0, 0, 7, 0]
+
+
+def test_only_object_id_has_a_value_for_a_row_nothing_gave_one():
+    """§6.6 gives `object_id` a default and no section gives one to the producer lanes.
+
+    "Optional" says a file may omit the stream. It does not say what a composed column
+    holds for a row whose birth omitted it, and zero is a label like any other — reading
+    one that was never written is inventing it. So `object_id` pads and `source_index`
+    is refused, which is where TypeScript and Swift already stand.
+    """
+    with_object = kd.keyframe_state(
+        np.asarray([1]),
+        {op.A_POSITION: np.asarray([[0, 0, 0]]), op.A_OBJECT_ID: np.asarray([[7]])},
+    )
+    grown = _apply(with_object, births=([2], {op.A_POSITION: np.asarray([[1, 1, 1]])}))
+    assert grown.bins[op.A_OBJECT_ID].reshape(-1).tolist() == [7, 0]
+
+    with_source = kd.keyframe_state(
+        np.asarray([1]),
+        {op.A_POSITION: np.asarray([[0, 0, 0]]), op.A_SOURCE_INDEX: np.asarray([[7]])},
+    )
+    with pytest.raises(MalformedFile) as caught:
+        _apply(with_source, births=([2], {op.A_POSITION: np.asarray([[1, 1, 1]])}))
+    assert caught.value.code == "incomplete-birth"
+
+
+def test_a_keyframe_may_state_an_empty_population_and_let_a_birth_fill_it():
+    """Padding no rows invents nothing, so an empty state accepts any attribute.
+
+    The rule below exists to stop zero being written into rows that predate an attribute.
+    Where there are no such rows there is nothing to protect, and refusing here would
+    reject a legal file — a keyframe that states an empty population and leaves the first
+    birth to introduce the geometry. The Swift SDK has always allowed it.
+    """
+    state = kd.keyframe_state(np.asarray([], dtype=np.int64), {})
+    grown = _apply(state, births=([1, 2], {op.A_POSITION: np.asarray([[0, 0, 0], [1, 1, 1]])}))
+    assert grown.count == 2
+    assert grown.bins[op.A_POSITION].shape[0] == 2
+
+
+def test_a_birth_cannot_introduce_an_attribute_that_carries_geometry():
+    """Zero stands for "unlabelled" in an identity lane and for nothing at all in a
+    position. Padding the older rows with it would put those gaussians at the origin."""
+    state = _state([1], [[0, 0, 0]])
+    with pytest.raises(MalformedFile) as caught:
+        _apply(
+            state,
+            births=([2], {op.A_POSITION: np.asarray([[1, 1, 1]]), op.A_OPACITY: np.asarray([[5]])}),
+        )
+    assert caught.value.code == "unknown-attribute-in-birth"
 
 
 # --------------------------------------------------------------------------
@@ -277,6 +384,49 @@ def test_a_gap_or_an_overlap_in_the_tiling_is_refused():
         with pytest.raises(Exception) as caught:
             kd.check_tiling(index)
         assert caught.value.code == "non-tiling-chunks"
+
+
+def test_an_inverted_index_interval_is_refused_before_adjacency():
+    with pytest.raises(MalformedFile) as caught:
+        kd.check_tiling([_entry(0.0, 2.0, 100), _entry(2.0, 1.0, 200)])
+    assert caught.value.code == "non-tiling-chunks"
+    assert "expected finite t0" in str(caught.value)
+
+
+def test_an_open_ended_timeline_accepts_infinity_only_on_its_final_interval():
+    kd.check_tiling(
+        [_entry(0.0, 1.0, 100), _entry(1.0, np.inf, 200)],
+        duration_sec=np.inf,
+    )
+    for index, duration in (
+        ([_entry(0.0, np.inf, 100), _entry(np.inf, np.inf, 200)], np.inf),
+        ([_entry(0.0, np.inf, 100)], 1.0),
+        ([_entry(0.0, np.inf, 100)], None),
+    ):
+        with pytest.raises(MalformedFile, match="unusable interval"):
+            kd.check_tiling(index, duration_sec=duration)
+
+
+def test_an_open_ended_entry_builds_its_chain_without_an_infinite_probe():
+    index = [
+        _entry(0.0, 1.0, 100),
+        _entry(1.0, np.inf, 200, kind=1, reference=100, keyframe=100, depth=1),
+    ]
+    assert [entry.chunk_offset for entry in kd.chain_from(index, index[-1])] == [100, 200]
+
+
+def test_absolute_bins_stay_in_the_signed_i32_domain():
+    too_large = np.iinfo(np.int32).max + 1
+    with pytest.raises(MalformedFile) as caught:
+        kd.keyframe_state(np.array([7]), {op.A_POSITION: np.array([[too_large, 0, 0]])})
+    assert caught.value.code == "bin-overflow"
+
+
+def test_rotation_indexes_are_checked_on_composed_state():
+    with pytest.raises(MalformedFile) as caught:
+        kd.keyframe_state(np.array([7]), {op.A_ROTATION_INDEX: np.array([[4]])})
+    assert caught.value.code == "rotation-index-out-of-range"
+    assert "expected 0..3" in str(caught.value)
 
 
 def test_a_forward_reference_is_refused():

@@ -148,5 +148,26 @@ REQUIRED_ATTRIBUTES = (
     A_WINDOW_INDEX,
 )
 
+#: Registry-defined channel arity for every version-1 gaussian attribute. Unknown and
+#: application attributes are deliberately absent: readers skip what they do not consume,
+#: while a known attribute with another width has no version-1 interpretation.
+ATTRIBUTE_CHANNELS = {
+    A_POSITION: 3,
+    A_SCALE: 3,
+    A_ROTATION_INDEX: 1,
+    A_ROTATION: 3,
+    A_COLOR: 3,
+    A_OPACITY: 1,
+    A_MOTION: 3,
+    A_MU_T: 1,
+    A_SIGMA_T: 1,
+    A_FLAGS: 1,
+    A_WINDOW_INDEX: 1,
+    A_SOURCE_GROUP: 1,
+    A_SOURCE_INDEX: 1,
+    A_GAUSSIAN_ID: 1,
+    A_OBJECT_ID: 1,
+}
+
 #: Bit 0 of the per-gaussian flags attribute.
 FLAG_NEVER_FADES = 1

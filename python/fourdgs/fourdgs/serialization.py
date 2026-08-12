@@ -286,11 +286,22 @@ def decompress(body: bytes, codec: int, expected: int) -> bytes:
     untrusted file should not have to catch `zlib.error` to find out that the file was
     corrupt. Every failure in here comes back as a `MalformedFile`.
     """
+    if expected > MAX_STREAM_BYTES:
+        raise MalformedFile(f"compressed block declares {expected} bytes, past the {MAX_STREAM_BYTES} cap")
     if codec == CODEC_DEFLATE:
         try:
-            out = zlib.decompress(body, bufsize=min(expected, 1 << 20))
+            decoder = zlib.decompressobj()
+            # `zlib.decompress(..., bufsize=...)` treats bufsize only as a growth hint. A
+            # small payload can therefore expand without limit before the length check
+            # below runs. Asking for one byte beyond the declaration both caps allocation
+            # and distinguishes an over-producing stream from one of exactly that size.
+            out = decoder.decompress(body, expected + 1)
         except zlib.error as exc:
             raise MalformedFile(f"deflate stream is corrupt: {exc}") from exc
+        if len(out) > expected or decoder.unconsumed_tail:
+            raise TruncatedFile(f"stream decompresses past the {expected} bytes declared by its header")
+        if not decoder.eof:
+            raise TruncatedFile("deflate stream ends before its end marker")
     elif codec == CODEC_ZSTD:
         try:
             import zstandard
@@ -359,13 +370,21 @@ def decode_stream(cursor: Cursor) -> tuple[int, np.ndarray]:
     """Read one attribute stream, returning `(attribute_id, (n, channels) int64)`."""
     head = cursor.take(_STREAM_HEADER.size)
     attribute_id, width, mode, codec, channels, count, payload_len = _STREAM_HEADER.unpack_from(head)
-    if count == 0:
-        cursor.take(payload_len)
-        return attribute_id, np.zeros((0, channels), dtype=np.int64)
     if width not in (1, 2, 4):
         raise MalformedFile(f"attribute {attribute_id}: bad symbol width {width}")
     if channels == 0:
         raise MalformedFile(f"attribute {attribute_id}: zero channels")
+    if mode not in (MODE_RAW, MODE_DELTA, MODE_CONST):
+        raise TruncatedFile(f"attribute {attribute_id}: unknown stream mode {mode}")
+    # Codec is a property of the known stream header, even when there are no
+    # symbols to decompress. Keep this before the empty fast path so a reserved
+    # codec does not become conditionally legal at element_count zero. Unknown
+    # attributes still bypass this function through decode_stream_or_skip.
+    if codec not in CODEC_NAMES:
+        raise UnsupportedCodec(f"unknown stream codec {codec}", code="unknown-stream-codec")
+    if count == 0:
+        cursor.take(payload_len)
+        return attribute_id, np.zeros((0, channels), dtype=np.int64)
 
     symbols = channels if mode == MODE_CONST else count * channels
     expected = symbols * width
@@ -392,9 +411,27 @@ def decode_stream(cursor: Cursor) -> tuple[int, np.ndarray]:
     vals = unzigzag(sym).reshape(count, channels)
     if mode == MODE_DELTA:
         vals = np.cumsum(vals, axis=0, dtype=np.int64)
-    elif mode != MODE_RAW:
-        raise TruncatedFile(f"attribute {attribute_id}: unknown stream mode {mode}")
     return attribute_id, vals
+
+
+def decode_stream_or_skip(cursor: Cursor, known: set[int] | frozenset[int]) -> tuple[int, np.ndarray | None]:
+    """Decode a known attribute, or skip an unknown one by its framed payload.
+
+    Unknown attributes are the format's extension seam. Their codec, symbol
+    width, mode, and channel semantics belong to the revision that defines the
+    attribute; this reader needs only the common header's ``payload_len`` to
+    reach the next stream without interpreting any of them.
+    """
+    if cursor.remaining() < _STREAM_HEADER.size:
+        cursor.take(_STREAM_HEADER.size)  # raises the ordinary truncated-stream diagnosis
+    attribute_id = int(cursor.buf[cursor.pos])
+    if attribute_id in known:
+        return decode_stream(cursor)
+    head = cursor.take(_STREAM_HEADER.size)
+    unpacked = _STREAM_HEADER.unpack_from(head)
+    payload_len = int(unpacked[-1])
+    cursor.take(payload_len)
+    return attribute_id, None
 
 
 def crc32(data: bytes) -> int:

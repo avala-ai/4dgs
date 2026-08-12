@@ -1556,7 +1556,7 @@ Uint8List _keyframeChunkContent(Uint8List streams) {
         ..add(_u32(0)) // level
         ..add(_u32(0)) // count
         ..add(_string('')) // compression
-        ..add(_u64(0)) // uncompressed size
+        ..add(_u64(streams.length)) // uncompressed size
         ..add(_u64(streams.length))
         ..add(streams);
   return body.toBytes();

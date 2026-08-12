@@ -123,6 +123,8 @@ words:
   - pubspec
   - Wasm
   - writeln
+  # Validator vocabulary: what a tool can say about a file it was handed
+  - validatable
   # Rust and C toolchain vocabulary
   - capi
   - libfourdgs
