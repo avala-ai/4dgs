@@ -244,6 +244,7 @@ jobs:
         run: |
           cargo build -p fourdgs-conformance --release
           dart/encode-roundtrip.sh
+          python tests/conformance/encode_roundtrip.py --encoder dart
 
   swift:
     runs-on: ubuntu-latest

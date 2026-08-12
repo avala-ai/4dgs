@@ -194,7 +194,7 @@ def compare(
         # reference currently drops object_id with it, while Dart preserves the optional
         # gaussian lane. Dart's fidelity gate proves that lane one-to-one against the source;
         # remove the resulting object-derived canonical sections from this agreement check.
-        if ref.get("profile") == "objects" or cand.get("profile") == "objects":
+        if normalize_capture_profile and (ref.get("profile") == "objects" or cand.get("profile") == "objects"):
             for summary in (ref, cand):
                 summary.pop("profile", None)
                 summary.pop("objects", None)
@@ -236,7 +236,7 @@ def _check_chunk_geometry(path: str) -> None:
             raise AssertionError(
                 f"Statistics declares {scene.statistics.chunk_count} chunks, the candidate contains {len(chunks)}"
             )
-        _check_summary_offset_geometry(source, scene.summary_offsets)
+        _check_summary_offset_geometry(source, scene.summary_offsets, require_chunk_index=bool(scene.index))
 
         table = window_table_or_default(scene.windows)
         k = support_k(scene.header.cutoff)
@@ -381,17 +381,27 @@ def _physical_geometry(
     return chunks, bands
 
 
-def _check_summary_offset_geometry(source: FileReadable, declared: list) -> None:
+def _check_summary_offset_geometry(
+    source: FileReadable,
+    declared: list,
+    *,
+    require_chunk_index: bool = False,
+) -> None:
     """Every candidate Summary Offset frames its own complete summary-record class."""
     footer_offset = source.size() - len(MAGIC) - RECORD_HEADER.size - 20
     footer_opcode, footer_length = RECORD_HEADER.unpack(source.read(footer_offset, RECORD_HEADER.size))
     if footer_opcode != opcode.FOOTER or footer_length < 20:
         raise AssertionError(f"candidate Footer at {footer_offset} is not a complete Footer record")
-    summary_start = struct.unpack("<Q", source.read(footer_offset + RECORD_HEADER.size, 8))[0]
+    summary_start, summary_offset_start = struct.unpack("<QQ", source.read(footer_offset + RECORD_HEADER.size, 16))
     if summary_start == 0:
         if declared:
             raise AssertionError("candidate declares Summary Offsets without a summary region")
+        if summary_offset_start != 0:
+            raise AssertionError("candidate Footer declares a summary_offset_start without a summary region")
+        if require_chunk_index:
+            raise AssertionError("candidate writes an index but declares no summary region")
         return
+    summary_opcodes = {opcode.CHUNK_INDEX, opcode.STATISTICS, opcode.SUMMARY_OFFSET}
     physical: dict[int, list[tuple[int, int]]] = {}
     offset = summary_start
     while offset < footer_offset:
@@ -401,8 +411,25 @@ def _check_summary_offset_geometry(source: FileReadable, declared: list) -> None
         end = offset + RECORD_HEADER.size + length
         if end > footer_offset:
             raise AssertionError(f"summary record at {offset} extends into the Footer")
+        if record_opcode not in summary_opcodes:
+            raise AssertionError(
+                f"summary record at {offset} has opcode {record_opcode:#04x}; expected only "
+                "Chunk Index, Statistics, or Summary Offset records"
+            )
         physical.setdefault(record_opcode, []).append((offset, end - offset))
         offset = end
+
+    physical_offsets = physical.get(opcode.SUMMARY_OFFSET, [])
+    expected_offset_start = physical_offsets[0][0] if physical_offsets else 0
+    if summary_offset_start != expected_offset_start:
+        raise AssertionError(f"Footer summary_offset_start is {summary_offset_start}, expected {expected_offset_start}")
+
+    index_declarations = [item for item in declared if item.group_opcode == opcode.CHUNK_INDEX]
+    if require_chunk_index and len(index_declarations) != 1:
+        raise AssertionError(
+            "an indexed Dart preset must declare exactly one Chunk Index Summary Offset; "
+            f"found {len(index_declarations)}"
+        )
 
     seen: set[int] = set()
     for number, summary_offset in enumerate(declared):

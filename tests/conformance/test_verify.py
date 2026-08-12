@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import json
 import os
+import struct
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -202,3 +204,93 @@ class TestEncodeAabbGeometryGate:
 
     def test_the_empty_scene_aabb_is_the_zero_box(self):
         encode_roundtrip._check_declared_aabb("Header", [0.0] * 6, [0.0] * 6)
+
+
+class TestEncodeSummaryOffsetGeometryGate:
+    @staticmethod
+    def _candidate(tmp_path, summary_opcodes, *, pointer=None):
+        def record(number, content=b""):
+            return encode_roundtrip.RECORD_HEADER.pack(number, len(content)) + content
+
+        data = bytearray(encode_roundtrip.MAGIC)
+        summary_start = len(data)
+        offsets = []
+        for number in summary_opcodes:
+            offsets.append(len(data))
+            data.extend(record(number))
+        if pointer is None:
+            pointer = next(
+                (
+                    at
+                    for at, number in zip(offsets, summary_opcodes, strict=True)
+                    if number == encode_roundtrip.opcode.SUMMARY_OFFSET
+                ),
+                0,
+            )
+        data.extend(
+            record(
+                encode_roundtrip.opcode.FOOTER,
+                struct.pack("<QQI", summary_start, pointer, 0),
+            )
+        )
+        data.extend(encode_roundtrip.MAGIC)
+        path = tmp_path / "candidate.4dgs"
+        path.write_bytes(data)
+        return path, summary_start, offsets
+
+    @staticmethod
+    def _declared_index(start):
+        return SimpleNamespace(
+            group_opcode=encode_roundtrip.opcode.CHUNK_INDEX,
+            group_start=start,
+            group_length=encode_roundtrip.RECORD_HEADER.size,
+        )
+
+    def test_footer_points_at_the_first_summary_offset(self, tmp_path):
+        path, summary_start, _ = self._candidate(
+            tmp_path,
+            [encode_roundtrip.opcode.CHUNK_INDEX, encode_roundtrip.opcode.SUMMARY_OFFSET],
+            pointer=0,
+        )
+        with encode_roundtrip.FileReadable(str(path)) as source:
+            with pytest.raises(AssertionError, match="summary_offset_start"):
+                encode_roundtrip._check_summary_offset_geometry(
+                    source,
+                    [self._declared_index(summary_start)],
+                    require_chunk_index=True,
+                )
+
+    def test_non_summary_records_are_rejected_from_the_summary_run(self, tmp_path):
+        path, summary_start, _ = self._candidate(
+            tmp_path,
+            [encode_roundtrip.opcode.CHUNK_INDEX, 0x7D, encode_roundtrip.opcode.SUMMARY_OFFSET],
+        )
+        with encode_roundtrip.FileReadable(str(path)) as source:
+            with pytest.raises(AssertionError, match="expected only Chunk Index"):
+                encode_roundtrip._check_summary_offset_geometry(
+                    source,
+                    [self._declared_index(summary_start)],
+                    require_chunk_index=True,
+                )
+
+    def test_an_index_requires_its_summary_offset_declaration(self, tmp_path):
+        path, _, _ = self._candidate(tmp_path, [encode_roundtrip.opcode.CHUNK_INDEX])
+        with encode_roundtrip.FileReadable(str(path)) as source:
+            with pytest.raises(AssertionError, match="exactly one Chunk Index Summary Offset"):
+                encode_roundtrip._check_summary_offset_geometry(
+                    source,
+                    [],
+                    require_chunk_index=True,
+                )
+
+    def test_a_complete_summary_geometry_is_accepted(self, tmp_path):
+        path, summary_start, _ = self._candidate(
+            tmp_path,
+            [encode_roundtrip.opcode.CHUNK_INDEX, encode_roundtrip.opcode.SUMMARY_OFFSET],
+        )
+        with encode_roundtrip.FileReadable(str(path)) as source:
+            encode_roundtrip._check_summary_offset_geometry(
+                source,
+                [self._declared_index(summary_start)],
+                require_chunk_index=True,
+            )
