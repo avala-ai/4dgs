@@ -57,7 +57,7 @@ jobs:
           echo "rust: ${size_kb} KiB"
           [ "$size_kb" -le 1100 ] || { echo "::error::rust is ${size_kb} KiB, over the 1100 KiB budget"; exit 1; }
 
-      - name: TypeScript sources under 1024 KB
+      - name: TypeScript sources under 1152 KB
         # Sources only: this job installs nothing and builds nothing, so node_modules
         # and dist are not here to measure. A vendored dependency would show up as a
         # budget failure, which is the point.
@@ -98,10 +98,17 @@ jobs:
         # Raised from 960 to 1024 KiB after the validator layer was restacked onto the
         # current core: CI measures 988 KiB, still source-only and below the next 64 KiB
         # boundary. The increase is implementation and regression coverage, not vendoring.
+        # Raised from 1024 to 1152 KiB where this branch met main. Both sides had raised this
+        # same budget for different layers — main 768 -> 896 for the keyframe-delta encoder
+        # (sequence writer, gate fixtures and tests, 872 KiB on their own), this branch
+        # 960 -> 1024 for the validator (988 KiB on its own) — and the higher of the two is
+        # not enough, because the two layers are additive rather than alternative: merged,
+        # they measure 1096 KiB. 1152 is the next 64 KiB step and leaves 56 KiB, which is the
+        # same deliberate headroom the raises above took rather than an exact-size assertion.
         run: |
           size_kb=$(du -s typescript | cut -f1)
           echo "typescript: ${size_kb} KiB"
-          [ "$size_kb" -le 1024 ] || { echo "::error::typescript is ${size_kb} KiB, over the 1024 KiB budget"; exit 1; }
+          [ "$size_kb" -le 1152 ] || { echo "::error::typescript is ${size_kb} KiB, over the 1152 KiB budget"; exit 1; }
       - name: Dart sources under 768 KB
         # Sources only, same as TypeScript's and Swift's: this job builds nothing, so
         # .dart_tool and the compiled runners are not here to measure, and a vendored

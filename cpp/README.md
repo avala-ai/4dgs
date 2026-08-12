@@ -14,6 +14,7 @@ on what a file means. Decode only at v1; rendering is out of scope for this repo
 | Consume  | [CPM, `find_package`, `add_subdirectory`](#consuming-this-package-from-another-project)         |
 | Example  | [`examples/decode_summary.cpp`](examples/decode_summary.cpp), run in CI                         |
 | Runners  | [`conformance/`](conformance/)                                                                  |
+| Tool     | `cpp/build/tools/4dgs inspect\|validate <file>` — see below                                     |
 
 ```cpp
 auto opened = fourdgs::Scene::openPath("scene.4dgs");
@@ -138,6 +139,43 @@ That is the default only in this repository, where the core is one `cargo build`
 before it is a normal thing to do. Anywhere else, a library that refuses every call is not what
 whoever fetched it asked for, so the build stops instead — `-DFOURDGS_ALLOW_NO_CORE=ON` asks for it
 deliberately, which is the only way a consumer should end up with one.
+
+## `4dgs`: inspect and validate
+
+When someone reports a file that will not open, the first question is _where_ it stops being a 4dgs
+file. `cpp/build/tools/4dgs` answers it without a Python environment:
+
+```console
+$ 4dgs inspect scene.4dgs           # offset, record, content, total, crc — nine bytes per record
+$ 4dgs validate scene.4dgs          # every finding, and the rule that refused the file
+error: a chunk does not decode: unsupported codec: stream codec 9 is not a codec this build implements
+  refusal unknown-stream-codec at byte 659 (the Chunk record at index entry 0)
+INVALID
+```
+
+The `refusal` line is the identifier from `Error::refusal` and the byte the tool's own framing walk
+places it at. `validate` decodes the chunks — one resident at a time on the indexed path — because a
+framing walk steps _over_ a chunk rather than into it, and two of the refusals the specification
+names fire inside a chunk's streams. Every spherical-harmonic band the file declares is decoded too,
+for the same reason one step further in: a band is its own record fetched by byte range, so a scan
+capped at band 0 never transfers one, and a refusing band names its own record. A `keyframe-delta`
+file is validated against the model its Header declares rather than against the gaussian-birth chunk
+shape.
+
+Both commands read ranges rather than files. `inspect` transfers nine bytes per record and the
+checksummed region; `validate` opens the scene over the same transport. A `keyframe-delta` file is
+the exception, and the C ABI is why — `fourdgs_keyframe_delta_states_json` takes a pointer and a
+length with no range-reading counterpart.
+
+Exit codes: **0** fine, **1** refused or invalid, **2** valid with warnings, **3** the tool could
+not run — a missing file, an argument it does not understand, or a build with no decoder behind it.
+`1` is an answer about the file; `3` is the absence of one, and a pipeline that could not tell them
+apart could not tell a corrupt asset from a typo in a path.
+
+Because this package is a binding and not a parser, `validate` checks what needs no record parser —
+framing, the records a file must carry, where the chunk index points, the summary checksum — plus
+everything the reader itself decides. It reports a subset of what the Python tool's `4dgs validate`
+says and never contradicts it.
 
 ## Status
 

@@ -113,8 +113,13 @@ function supportK(cutoff: number): number {
   return Math.sqrt(-2 * Math.log(cutoff));
 }
 
-/** Round half to even, the rule every attribute grid but rotation uses. */
-function rint(v: number): number {
+/**
+ * Round half to even, the rule every attribute grid but rotation uses.
+ *
+ * @internal shared with the `keyframe-delta` writer, so one arithmetic serves both
+ * encoders. Not part of the package's API.
+ */
+export function rint(v: number): number {
   const nearest = v < 0 ? -Math.round(-v) : Math.round(v); // half away from zero
   const frac = Math.abs(v - Math.trunc(v));
   if (frac === 0.5 && nearest % 2 !== 0) {
@@ -128,8 +133,8 @@ function roundTiesAway(v: number): number {
   return v >= 0 ? Math.floor(v + 0.5) : Math.ceil(v - 0.5);
 }
 
-/** The median of a slice, the way NumPy takes it. */
-function median(values: ArrayLike<number>): number {
+/** The median of a slice, the way NumPy takes it. @internal */
+export function median(values: ArrayLike<number>): number {
   const n = values.length;
   if (n === 0) return 1e-3;
   const sorted = Array.from(values, (v) => v).sort((a, b) => a - b);
@@ -183,8 +188,15 @@ const REST: readonly (readonly [number, number, number])[] = [
   [0, 1, 2],
 ];
 
-/** The forward smallest-three quaternion transform: largest index and three residual bins. */
-function quantizeRotation(
+/**
+ * The forward smallest-three quaternion transform: largest index and three residual bins.
+ *
+ * @internal Ties round away from zero, which is the Rust reference's rule; Python's
+ * `quantize_rotation` reaches for `np.rint` and rounds them to even. The two disagree only
+ * on a residual that lands exactly on a half-step, and both encoders here take the Rust
+ * rule so that one SDK does not hold two opinions about the same input.
+ */
+export function quantizeRotation(
   q0: number,
   q1: number,
   q2: number,
@@ -205,8 +217,8 @@ function quantizeRotation(
   return [largest, bins];
 }
 
-/** The forward reversible colour transform: store `(g, r - g, b - g)`. */
-function rctForward(r: number, g: number, b: number): [number, number, number] {
+/** The forward reversible colour transform: store `(g, r - g, b - g)`. @internal */
+export function rctForward(r: number, g: number, b: number): [number, number, number] {
   return [g, r - g, b - g];
 }
 
@@ -219,7 +231,8 @@ function quantizeSh(value: number, bits: number): number {
 
 // --- little-endian byte writer -------------------------------------------
 
-class ByteWriter {
+/** @internal a little-endian byte sink, shared by both encoders. */
+export class ByteWriter {
   private buf: Uint8Array;
   private view: DataView;
   private len = 0;
@@ -246,6 +259,12 @@ class ByteWriter {
   u8(v: number): void {
     this.ensure(1);
     this.buf[this.len++] = v & 0xff;
+  }
+
+  u16(v: number): void {
+    this.ensure(2);
+    this.view.setUint16(this.len, v & 0xffff, true);
+    this.len += 2;
   }
 
   u32(v: number): void {
@@ -288,8 +307,8 @@ class ByteWriter {
   }
 }
 
-/** A sorted-key string map, matching the Rust `put_str_map` a determinism gate depends on. */
-function putStrMap(w: ByteWriter, map: Record<string, string>): void {
+/** A sorted-key string map, matching the Rust `put_str_map` a determinism gate depends on. @internal */
+export function putStrMap(w: ByteWriter, map: Record<string, string>): void {
   const body = new ByteWriter();
   for (const key of Object.keys(map).sort()) {
     body.string(key);
@@ -300,7 +319,8 @@ function putStrMap(w: ByteWriter, map: Record<string, string>): void {
   w.bytes(bytes);
 }
 
-function record(opcode: number, content: Uint8Array): Uint8Array {
+/** @internal one opcode-tagged, length-prefixed record. */
+export function record(opcode: number, content: Uint8Array): Uint8Array {
   const w = new ByteWriter(content.length + 9);
   w.u8(opcode);
   w.u64(content.length);
@@ -349,7 +369,7 @@ async function deflate(raw: Uint8Array): Promise<Uint8Array> {
  * chosen. Picking the smallest is a size optimization this encoder forgoes for simplicity —
  * what it must get exactly right is the decoded integers, not the byte count.
  */
-async function encodeStream(
+export async function encodeStream(
   attributeId: number,
   values: number[],
   channels: number,

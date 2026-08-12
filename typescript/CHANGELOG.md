@@ -59,6 +59,28 @@ The four packages version together.
   for the wrong one. `undefined` means "a real error the refusal table does not name", not "no
   error". This is additive: `refusalCode` is a property on the existing `FourdgsError` rather than a
   new subclass, so every `instanceof` check keeps working.
+- **`keyframe-delta` encode in `@4dgs/core`** (spec §11), closing the last writer gap on the
+  TypeScript side: `encodeKeyframeDeltaSequence(samples, durationSec, options)` takes a sequence of
+  populations with identities and writes a whole file — Header, Quantization, Window Table, a
+  keyframe Chunk or a Delta Chunk per sample, the extended Chunk Index, Statistics and the Footer.
+  `KeyframeDeltaWriteOptions` carries cadence (`keyframeEvery`, `keyframeAt`), `deltaMode`, the
+  quantization profile and cutoff, and which summary records to write. Shared grids are derived in
+  bounded passes over the sequence, then only the current population and its reference are quantized
+  at once; a delta is an integer subtraction between bins on one grid, the composition telescopes,
+  and the declared bound holds at any depth.
+- A gaussian is written into a delta only when one of its bins moved, so an unchanged gaussian costs
+  no bytes — the property the model exists to buy. Rotation is restated absolutely rather than
+  differenced, because the smallest-three basis changes with the largest component.
+- The writer refuses what it cannot honestly write, naming the field and the sample: a timeline that
+  does not tile `[0, duration_sec)`, a non-finite duration, an id list that does not match the
+  population, falls outside `u32`, repeats an id or reuses one after death, a chained depth that
+  cannot fit its `u16` field, a `delta_mode` outside `{0, 1}`, an unknown profile, a non-positive or
+  non-finite `sigma_t`, an absolute bin outside `i32`, spherical harmonics (which are never silently
+  dropped even when their degree metadata is missing), and a GOP-invariant attribute — `sigma_t`,
+  `flags`, `window_index` — that changes mid-group, where a bin difference would subtract bins
+  living on two different grids and decode into a wrong value rather than into an error. Valid
+  gaussian ids use the complete `u32` domain through the stream codec's signed two's-complement
+  bridge, and each sample's `mu_t` is anchored to that sample's timestamp as §11.3 requires.
 - **`parseQuantization` reads the appended per-band SH bit depths** into `Quantization.shBitDepths`,
   as the Python and Rust readers already did — TypeScript wrote the field in `encodeScene` and was
   the only reader that could not read it back. `shStep` and `shBound`, the pitch and bound a depth
@@ -79,6 +101,10 @@ The four packages version together.
   full-duration window, which is every keyframe-delta file in the corpus today.
 - `ObjectLayer.apply` accepts either `Float32Array` or `Float64Array` centres and orientations, so
   object tracks compose directly onto `keyframe-delta` reconstruction without a narrowing copy.
+- `writer.ts` now exports its quantization and record-framing internals (`rint`, `median`,
+  `quantizeRotation`, `rctForward`, `ByteWriter`, `putStrMap`, `record`, `encodeStream`) as
+  `@internal`, so both encoders share one arithmetic instead of restating it. They are not
+  re-exported from the package entry point and are not API.
 
 ### Fixed
 
