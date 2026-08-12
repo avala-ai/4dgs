@@ -225,12 +225,16 @@ def _merge_births(state: State, birth_ids: np.ndarray, birth_bins: dict[int, np.
     Zero is a defined value only for the optional identity lanes, so those pad. Any other
     attribute the live population lacks cannot be composed: there is no value zero stands
     for in a position or a scale, and inventing one puts a gaussian somewhere it is not.
+
+    Unless there is nobody to invent it for. A keyframe may state an empty population and
+    leave the first birth to introduce the geometry, and padding no rows invents nothing —
+    so an empty state accepts any attribute, which is what the Swift SDK has always done.
     """
     merged: dict[int, np.ndarray] = {}
     for attribute in set(state.bins) | set(birth_bins):
         existing = state.bins.get(attribute)
         added = None if attribute not in birth_bins else np.asarray(birth_bins[attribute], dtype=np.int64)
-        if existing is None and attribute not in ZERO_DEFAULT_IDENTITY:
+        if existing is None and state.count and attribute not in ZERO_DEFAULT_IDENTITY:
             raise _refuse(
                 f"a birth group carries attribute {attribute}, which the live population does not; "
                 f"a composed column has one value per gaussian and zero is not one for this attribute",

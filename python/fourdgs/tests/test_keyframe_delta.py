@@ -286,6 +286,20 @@ def test_every_composed_column_is_as_tall_as_the_population():
     assert later.bins[op.A_OBJECT_ID].reshape(-1).tolist() == [0, 0, 7, 0]
 
 
+def test_a_keyframe_may_state_an_empty_population_and_let_a_birth_fill_it():
+    """Padding no rows invents nothing, so an empty state accepts any attribute.
+
+    The rule below exists to stop zero being written into rows that predate an attribute.
+    Where there are no such rows there is nothing to protect, and refusing here would
+    reject a legal file — a keyframe that states an empty population and leaves the first
+    birth to introduce the geometry. The Swift SDK has always allowed it.
+    """
+    state = kd.keyframe_state(np.asarray([], dtype=np.int64), {})
+    grown = _apply(state, births=([1, 2], {op.A_POSITION: np.asarray([[0, 0, 0], [1, 1, 1]])}))
+    assert grown.count == 2
+    assert grown.bins[op.A_POSITION].shape[0] == 2
+
+
 def test_a_birth_cannot_introduce_an_attribute_that_carries_geometry():
     """Zero stands for "unlabelled" in an identity lane and for nothing at all in a
     position. Padding the older rows with it would put those gaussians at the origin."""
