@@ -72,6 +72,13 @@ void main(List<String> args) {
   }
   try {
     stdout.writeln(run(args.single));
+  } on FourdgsException catch (error) {
+    // A refusal is an answer, printed on stdout and exiting 0. Only this
+    // library's own exceptions qualify: anything else — a bug in the runner, a
+    // failed check from `checks.dart` — stays a crash, because a decoder must
+    // not be able to pass the invalid corpus by falling over in roughly the
+    // right place.
+    stdout.writeln(refusalJson(error));
   } catch (error) {
     stderr.writeln(error);
     exit(1);

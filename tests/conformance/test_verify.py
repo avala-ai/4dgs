@@ -177,6 +177,18 @@ class TestTheCanonicalFormHasNoSignedZero:
         assert kdf._num(float("inf")) is None
 
 
+def test_keyframe_delta_variants_retain_an_untouched_common_row():
+    for name, data, _ in generate.build_keyframe_delta_corpus():
+        if name.startswith("KeyframeOnly"):
+            continue
+        decoded = kdf.decode_streamed(data)
+        deltas = [chunk for chunk in decoded.chunks if chunk.kind == 1]
+        assert deltas, name
+        assert any(chunk.update_count < len(chunk.state.ids) - chunk.birth_count for chunk in deltas), (
+            f"{name} restates every common row"
+        )
+
+
 class TestEncodeAabbGeometryGate:
     def test_a_nan_bound_cannot_bypass_ordered_comparisons(self):
         with pytest.raises(AssertionError, match="non-finite bound"):
