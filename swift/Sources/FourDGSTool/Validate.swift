@@ -1978,7 +1978,16 @@ private func applyValidationDelta(
             var composed = base.rowValues(at: row)
             let incoming = update.rowValues(at: updateRow)
             for channel in 0..<base.channels {
-                if attribute == 2 || attribute == 3 || attribute == 14 {
+                // Rotation and `rotation_index` only. §11.5 makes those two the absolute
+                // restatement and names no third: the smallest-three coding means the stored
+                // bins denote different components either side of a change, which no other
+                // attribute suffers. `object_id` was restated here as well, and it is not
+                // exempt — a delta is a difference of bins, and §6.6's "exact label, never
+                // dequantized" is about dequantization, not about composition. Restating it
+                // both composed the wrong label wherever a writer emitted a difference and
+                // skipped the range check below, so this validator accepted an overflowing
+                // `object_id` that the Rust, Python, TypeScript and Dart SDKs all refuse.
+                if attribute == 2 || attribute == 3 {
                     composed[channel] = incoming[channel]
                 } else {
                     let sum = Int64(composed[channel]) + Int64(incoming[channel])

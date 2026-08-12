@@ -760,13 +760,14 @@ final class ValidateTests: XCTestCase {
                 $0.message.contains("creates gaussian_id 0, which is already live")
             }, duplicateFindings.map(\.message).joined(separator: "\n"))
 
-        // object_id is an absolute restatement. Repeating Int32.max is legal; adding it to
-        // the prior value would overflow and falsely reject the file.
+        // object_id is differenced like every attribute §11.5 does not name, which is what
+        // the writers here emit: `touched - reference`. Keeping a label therefore means a
+        // delta of zero, and that must not be read as "the label is now zero".
         let objectStreams = keyframeStreams + stream(14, [Int32.max], channels: 1)
         let objectKeyframe = keyframeRecord(objectStreams)
         let objectUpdate =
             stream(13, [0], channels: 1)
-            + stream(14, [Int32.max], channels: 1)
+            + stream(14, [0], channels: 1)
         let objectDelta = deltaRecord(
             t0: 0.5, t1: 1, reference: keyframeOffset, keyframe: keyframeOffset, depth: 1,
             updates: objectUpdate, updateCount: 1)
@@ -776,6 +777,23 @@ final class ValidateTests: XCTestCase {
                 $0.message.contains("composing attribute 14")
                     && $0.message.contains("signed 32-bit range")
             }, objectFindings.map(\.message).joined(separator: "\n"))
+
+        // And the other half of differencing it: a delta that composes past the domain is
+        // refused, exactly as it is for every other attribute. Restating the value skipped
+        // this check entirely, so this file was accepted here and refused by the Rust,
+        // Python, TypeScript and Dart SDKs — the same bytes, two answers.
+        let overflowUpdate =
+            stream(13, [0], channels: 1)
+            + stream(14, [Int32.max], channels: 1)
+        let overflowDelta = deltaRecord(
+            t0: 0.5, t1: 1, reference: keyframeOffset, keyframe: keyframeOffset, depth: 1,
+            updates: overflowUpdate, updateCount: 1)
+        let overflowFindings = validate(front + objectKeyframe + overflowDelta).findings
+        XCTAssertTrue(
+            overflowFindings.contains {
+                $0.message.contains("composing attribute 14")
+                    && $0.message.contains("signed 32-bit range")
+            }, overflowFindings.map(\.message).joined(separator: "\n"))
 
         // gaussian_id is u32 even though its Attribute Stream code is held in Int32. -1 is
         // the wire representation of UInt32.max and must survive both ordered and set decoders.
