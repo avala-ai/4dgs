@@ -38,6 +38,35 @@ export function coefficientsForDegree(degree: number): number {
   return (degree + 1) * (degree + 1) - 1;
 }
 
+/** The narrowest and widest per-band bit depth §6.5 defines. */
+export const SH_MIN_BITS = 3;
+export const SH_MAX_BITS = 8;
+
+/**
+ * The grid pitch, in code units, that a bit depth implies.
+ *
+ * A coefficient is a byte whatever the depth: `n` bits means the byte is rounded onto a
+ * grid of `2^(8 - n)` code units, which leaves `2^n` distinct values in a stream that is
+ * still bytes. Nothing sub-byte is packed, and no decoder changes.
+ *
+ * A depth outside the legal range is clamped rather than refused, because both callers
+ * read one from a file: the encoder has already checked its own ladder, and the validator
+ * is asking what a declared depth would have meant so it can say the declaration is wrong.
+ */
+export function shStep(bits: number): number {
+  return 1 << (SH_MAX_BITS - Math.min(Math.max(bits, SH_MIN_BITS), SH_MAX_BITS));
+}
+
+/**
+ * The maximum deviation, in code units, a bit depth guarantees.
+ *
+ * Exactly half the pitch, which is the same relationship every other attribute's grid has
+ * to its bound. Eight bits is pitch 1 and bound 0: the byte is stored as it arrived.
+ */
+export function shBound(bits: number): number {
+  return shStep(bits) >> 1;
+}
+
 /** The half-open coefficient range band `b` occupies within a component's coefficients. */
 export function bandCoefficientRange(band: number): readonly [number, number] {
   const first = coefficientsForDegree(band - 1);
