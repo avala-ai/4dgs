@@ -3271,31 +3271,34 @@ func validate(_ source: ToolReader) -> Report {
         report.refused("", asFourDGS(error), walked, nil)
         return report
     }
-    // A range only when the Footer actually declared a summary. A file with no Footer, or
-    // one whose `summary_start` is 0 — §5.2's indexless file — declares no range at all,
-    // and reading that as an empty one is wrong twice over. It reports every summary
-    // record as lying outside the declaration, one line per record and thousands on a
-    // real capture, burying the single real fault. And it empties `index`, so every
-    // per-entry check below silently stops running on records that are still sitting
-    // there to be read. The absent Footer is reported on its own. `chunkIndexEntries`
-    // already reads `nil` as "no filtering", which is what an undeclared summary means.
     var indexRange: Range<UInt64>?
     if let summary, summary.start < summary.end {
         indexRange = summary.start..<summary.end
     }
-    if let indexRange {
+    // A summary record outside the range the Footer named — or present at all in a file
+    // whose Footer names none — is orphaned: nothing reaches it by seeking, and saying so
+    // is the point. But a file with no Footer *at all* has no declaration for anything to
+    // be outside of. There the real fault is the missing Footer, reported on its own, and
+    // adding "lies outside the Footer-declared summary" once per summary record buries it
+    // under thousands of lines that name a declaration the file never made.
+    if walked.firstIntact(Opcode.footer) != nil {
+        let declared = indexRange ?? 0..<0
         let summaryOpcodes: Set<UInt8> = [
             Opcode.chunkIndex, Opcode.statistics, Opcode.summaryOffset,
         ]
         for frame in walked.intactRecords where summaryOpcodes.contains(frame.opcode) {
             let (end, overflow) = frame.offset.addingReportingOverflow(frame.total)
-            if overflow || !indexRange.contains(frame.offset) || end > indexRange.upperBound {
+            if overflow || !declared.contains(frame.offset) || end > declared.upperBound {
                 report.error(
                     "\(opcodeName(frame.opcode)) at byte \(frame.offset) lies outside the "
                         + "Footer-declared summary")
             }
         }
     }
+    // Passed as `nil` when no summary was declared, which `chunkIndexEntries` reads as "no
+    // filtering". That is the half of this the orphan report above does not cover: the
+    // entries are still there to be read, and emptying the list silently stopped every
+    // per-entry check below from running on them.
 
     let index: [IndexEntry]
     do {
