@@ -12,12 +12,11 @@ existing.
 Every row is filled in from a suite that runs: 46 valid variants and 7 invalid ones, plus 4
 keyframe-delta and 3 object-layer variants in their own subdirectories, over two read paths
 (streamed and indexed). A language takes the variants it declares support for, and what it declines
-is what this table records — 119 checks passing for Python, TypeScript, Rust, C++ and Swift, and 105
-for Dart. Dart declines the invalid corpus, which asks a decoder to _name_ the refusal rather than
-merely refuse. C++ and Swift read 4DGS through the Rust C ABI: the additive states-JSON accessor
-computes keyframe-delta summaries in the core, the provenance-JSON accessor does the same for the
-provenance family, and the objects-JSON pair does it for the object layer, so every binding emits
-identical bytes with no per-language slerp or composition order of its own.
+is what this table records — 119 checks passing for every SDK. C++ and Swift read 4DGS through the
+Rust C ABI: the additive states-JSON accessor computes keyframe-delta summaries in the core, the
+provenance-JSON accessor does the same for the provenance family, and the objects-JSON pair does it
+for the object layer, so every binding emits identical bytes with no per-language slerp or
+composition order of its own.
 
 <!-- prettier-ignore -->
 | Feature                                           | Python | TypeScript | Rust    | C++     | Swift   | Dart    |
@@ -35,7 +34,7 @@ identical bytes with no per-language slerp or composition order of its own.
 | Spherical harmonics, degree 3                     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | SH band range-skipping                            | Yes    | Yes        | Yes     | Untested | Untested | Yes     |
 | SH per-band bit depth, decode                     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| SH per-band bit depth, encode                     | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
+| SH per-band bit depth, encode                     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Spatial audio sources (optional)                  | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Multiple independent audio sources                | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Moving audio source reconstruction                | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
@@ -55,18 +54,18 @@ identical bytes with no per-language slerp or composition order of its own.
 | Delta composition, keyframe-referenced            | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Births and deaths in deltas                       | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Reconstruction at an instant                      | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Encode `keyframe-delta`                           | Yes    | Yes        | Yes     | Planned | Planned | Planned |
+| Encode `keyframe-delta`                           | Yes    | Yes        | Yes     | Planned | Planned | Yes     |
 | Unknown-record skipping                           | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Refusal diagnosis (named, not merely refused)     | Yes    | Yes        | Yes     | Yes     | Yes     | No      |
+| Refusal diagnosis (named, not merely refused)     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Private-range records                             | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Encode                                            | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
-| Chunked encode                                    | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
-| Summary writing                                   | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
+| Encode                                            | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Chunked encode                                    | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Summary writing                                   | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Convert from PLY frame sequences                  | Yes    | No         | No      | No      | No      | No      |
 | glTF interop (import, snapshot export)            | Yes    | No         | No      | No      | No      | No      |
 | USD interop (import, snapshot export)             | Yes    | No         | No      | No      | No      | No      |
 | USD animated export (keyframe-delta time samples) | Yes    | No         | No      | No      | No      | No      |
-| Inspect and validate                              | Yes    | Planned    | Yes     | Planned | Planned | Planned |
+| Inspect and validate                              | Yes    | Yes        | Yes     | Planned | Planned | Planned |
 
 ¹ On the `gaussian-birth` path. No implementation composes object tracks during `keyframe-delta`
 reconstruction: that path rebuilds base centres and scales from bins and never reads the object
@@ -228,10 +227,12 @@ The encode row is proved the way the other encode rows are: Python's by the corp
 re-encodes every variant and asserts its checksum, and Rust's by `encode-roundtrip.sh`, which now
 re-encodes every SH-bearing variant at per-band depths and requires the Python decoder to agree with
 the Rust one about the result — and, separately, to read back the depths that were declared. A file
-whose coefficients and whose declaration disagree fails one check or the other. TypeScript, C++ and
-Swift are proved by the cross-language encode gate below, which runs the same per-band pass: the
-coefficients each encoder coarsened must come back out of the Python decoder as the same bytes, and
-the appended depths must read as the ones written.
+whose coefficients and whose declaration disagree fails one check or the other. TypeScript, C++,
+Swift and Dart are proved by the cross-language encode gate below, which runs the same per-band
+pass: the coefficients each encoder coarsened must come back out of the Python decoder as the same
+bytes, and the appended depths must read as the ones written. Dart's unit suite additionally pins
+the named ladders and checks every emitted coefficient against the exact per-band grid and bound it
+declares.
 
 **SH band range-skipping** is proved for four SDKs by a byte count taken at the transport rather
 than by a decoded value: each of those runners reads a chunk at every band cap and asserts the bytes
@@ -253,16 +254,18 @@ through `fourdgs_last_refusal_code`; it is a `std::optional`, because a truncate
 transport that failed are real errors the refusal table does not name. Swift carries the same
 identifier on `FourDGSError.refusalCode`, fetched from the core through `fourdgs_last_refusal_code`
 — a binding reports the rule the one decoder applied rather than inferring one from a status code,
-and `FOURDGS_STATUS_UNSUPPORTED_CODEC` alone stands for three of the six. A consumer can branch on
-any of these refusals without reading its prose. Dart's remaining `No` is the honest state: it
-refuses these files today, and nothing here proves it refuses them for the right reason.
+and `FOURDGS_STATUS_UNSUPPORTED_CODEC` alone stands for three of the six. Dart carries the optional
+identifier on `FourdgsException.refusalCode`, from the constants its `exceptions` library exports. A
+consumer can branch on any of these refusals without reading its prose.
 
 The row was also the first thing to find a gap in the reference: neither an unknown `temporal_model`
 nor an unknown quantization `scheme` was refused at all before it existed, despite the registry
-requiring both. Each decoded as though it carried the known value. It found one more on the way into
-TypeScript, where a file with a corrupted first magic byte was reported as an unsupported major
-version — the reader tested only that bytes 1-4 read `4DGS`. Both refusals are the same class and
-carry the same sentence's worth of prose, so nothing short of comparing identifiers could see it.
+requiring both. Each decoded as though it carried the known value. On the way into TypeScript and
+Dart, it found that a corrupted first magic byte was reported as an unsupported major version — the
+readers tested only that bytes 1-4 read `4DGS`. Both refusals are the same class and carry the same
+sentence's worth of prose, so nothing short of comparing identifiers could see it. Dart's
+`gaussian-birth` decoder also clamped an out-of-range window index instead of refusing it, which
+substitutes one gaussian's lifetime for another's and renders a scene rather than raising anything.
 
 **Truncated-file recovery** is the one row no expectation can carry, because a cut file is a
 different file. Each runner decodes its variant twice more — once cut before the trailing magic,
@@ -301,20 +304,36 @@ is about to declare — so the Quantization record's numbers are checked on ever
 scene rather than sampled. The chunk tree is exercised by the same run: the corpus scenes partition
 into up to 42 chunks each.
 
-TypeScript, C++ and Swift are proved by the cross-language encode gate,
+Dart's is proved the way Rust's is, and for the same reason: it is a second encoder rather than a
+binding, sharing no code with the other five. `dart/encode-roundtrip.sh` re-encodes every variant
+with the Dart writer and then requires the **Dart and Python decoders to produce identical canonical
+JSON** from the result, on both read paths in each language, asserting byte-identical output across
+two encodes on the way. Both paths, because they reach the same state differently: the streamed one
+walks records from the front while the indexed one opens through the Footer and Chunk Index. That
+agreement alone does not prove instant-seek coverage, because the canonical indexed runner reads
+every entry; the cross-language gate below adds the missing geometry invariant. **Chunked encode**
+rides both gates: the writer emits up to 42 chunks on the ten-window variants, all four decodes
+agree, and the candidate's own index is checked against its reconstructed support. The
+Python-decoder gate stays because it is the one that survives a machine with no Rust toolchain.
+
+TypeScript, C++, Swift and Dart are proved by the cross-language encode gate,
 `tests/conformance/encode_roundtrip.py`. It re-encodes every variant's decoded gaussians twice —
 once with the language under test, once with a shared Rust reference that writes gaussians alone
 (`encode_gaussians`) — and requires the Python decoder to read both files to the same summary. What
 "the same" means depends on the encoder. C++ and Swift reach the Rust writer through the C ABI
 (`fourdgs_writer_*`), so their files match the reference on every field; the gate therefore proves
 the binding wired the gaussians and options through correctly, which is the only thing a binding can
-get wrong. TypeScript is a genuine second encoder, so it makes its own byte-layout choices — how
-well `deflate` did, which order gaussians sit in a chunk — that a decoder cannot see and the
-specification does not fix; those fields are set aside and the diff rests on decoded content: the
-gaussian values, the chunk intervals, the statistics, the spherical-harmonic digest. The chunked and
-summary rows ride the same gate — the small chunk threshold the preset uses partitions the corpus
-scenes into a tree whose intervals both encoders must agree on, and the statistics record they both
-write carries the chunk count.
+get wrong. TypeScript and Dart are genuine second encoders, so they make their own byte-layout
+choices — how well `deflate` did, which order gaussians sit in a chunk — that a decoder cannot see
+and the specification does not fix; those fields are set aside and the diff rests on decoded
+content: the gaussian values, the non-layout statistics and the spherical-harmonic digest. Different
+correct partition heuristics do not have to produce the same intervals or chunk count.
+
+For Dart, the gate checks the candidate's geometry before setting those layout fields aside. A
+bounded framing scan requires every emitted Chunk to be indexed exactly once; each index population
+must match its decoded Chunk; every reconstructed support, clipped to its validity window, must fit
+the indexed half-open interval; and the indexed total must equal the Header population. The chunked
+row therefore claims a complete, range-seekable partition, not equality with the Rust writer's tree.
 
 **Fuzzed** is a property of an implementation, not a feature of the format, so it is not a row in
 this table — a row would imply the format has something called fuzzing that an SDK can support.
@@ -369,11 +388,13 @@ something a decode suite can see.
 `SceneWriter.encode` binding the core's `fourdgs_writer_*` functions rather than reimplementing the
 quantizer. Swift targets visionOS and iOS.
 
-**Dart** is an independent decoder rather than a binding: pure Dart, no Flutter dependency, sharing
-no code with the other five. That is what makes its agreement with them worth something — the row it
-fills in is a sixth derivation from the specification, not a sixth caller of the same one. It runs
-on the Dart VM, inside Flutter, and compiled to JavaScript or Wasm, and its `dart:io` transport is a
-separate import so the decoder itself stays platform-free.
+**Dart** is an independent implementation rather than a binding: pure Dart, no Flutter dependency,
+sharing no code with the other five. That is what makes its agreement with them worth something —
+the row it fills in is a sixth derivation from the specification, not a sixth caller of the same
+one. It runs on the Dart VM, inside Flutter, and compiled to JavaScript or Wasm, and its `dart:io`
+transport is a separate import so the decoder itself stays platform-free. It now writes as well as
+reads, and the writer is the same kind of thing: a second encoder that lands on the same integer
+bins, not a wrapper over one that already existed.
 
 Its arrival moved no other cell, but it did find one: the velocity precision class is derived from
 the Header's `cutoff`, and a decoder that assumes the default 0.05 decodes a minority of gaussians'

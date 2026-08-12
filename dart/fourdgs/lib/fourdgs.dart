@@ -22,6 +22,13 @@
 /// the edges, so the decoder can be tested without a network and shipped
 /// without a platform.
 ///
+/// Writing goes the other way through the same primitives:
+/// [writeFourdgsToSink] and [writeKeyframeDeltaToSink] emit bounded records;
+/// [writeFourdgsBytes] and [writeKeyframeDeltaBytes] are their in-memory
+/// conveniences. They encode gaussian state in their own right rather than
+/// wrapping another SDK, which is what makes their agreement with those SDKs
+/// worth something.
+///
 /// Reading a file from disk needs one more import: `package:fourdgs/io.dart`
 /// carries the `dart:io` transport, kept out of this library so the decoder
 /// itself stays platform-free and usable in a browser.
@@ -42,6 +49,7 @@ export 'src/readable.dart';
 export 'src/records.dart';
 export 'src/serialization.dart';
 export 'src/stream_reader.dart';
+export 'src/writer.dart';
 
 /// This package's version, and the single source of truth for it.
 ///

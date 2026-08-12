@@ -243,12 +243,25 @@ jobs:
           mkdir -p build
           dart compile exe bin/decode_streamed.dart -o build/decode_streamed
           dart compile exe bin/decode_indexed.dart -o build/decode_indexed
+          dart compile exe bin/encode_roundtrip.dart -o build/encode_roundtrip
+          dart compile exe bin/encode_keyframe_delta.dart -o build/encode_keyframe_delta
       # `run.py --runner dart` fails if no Dart runner executed, so a build that
       # silently produced nothing is a red suite rather than a green one.
       - run: |
           pip install -e ./python/fourdgs
           python tests/conformance/generate.py
           python tests/conformance/run.py --runner dart
+
+      # The other direction: Dart writes gaussian and keyframe-delta scenes, and three
+      # decoders — its own, the Python reference and the Rust reference — have to read the
+      # result as the same scene on both read paths. The keyframe-delta pass also checks
+      # every lane against the written file's declared bounds and compares the corpus
+      # sequences with expectations produced by Python. Every reader is required.
+      - name: Dart encodes files the Python and Rust references agree with
+        run: |
+          cargo build -p fourdgs-conformance --release
+          dart/encode-roundtrip.sh
+          python tests/conformance/encode_roundtrip.py --encoder dart
 
   swift:
     runs-on: ubuntu-latest
