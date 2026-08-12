@@ -500,7 +500,12 @@ func summaryDeclaration(_ source: ToolReader, _ walk: Walk) throws -> SummaryDec
     guard let start = readU64(bytes, at: 0),
         let offsetStart = readU64(bytes, at: 8), let crc = readU32(bytes, at: 16)
     else { return nil }
-    guard start != 0 || offsetStart != 0 else { return nil }
+    // §5.2: `summary_start` 0 is the file saying it has no summary, and that settles it.
+    // Accepting a declaration whenever `summary_offset_start` happened to be nonzero gave
+    // back a range of `0..<footerOffset` — every record in the file, the magic and the
+    // Header included, read as "inside the summary" and fed to the CRC as though the
+    // Footer had named them.
+    guard start != 0 else { return nil }
     return SummaryDeclaration(
         start: start, offsetStart: offsetStart, crc: crc, end: frame.offset)
 }

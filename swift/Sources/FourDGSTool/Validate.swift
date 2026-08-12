@@ -3271,21 +3271,29 @@ func validate(_ source: ToolReader) -> Report {
         report.refused("", asFourDGS(error), walked, nil)
         return report
     }
-    let indexRange: Range<UInt64>
+    // A range only when the Footer actually declared a summary. A file with no Footer, or
+    // one whose `summary_start` is 0 — §5.2's indexless file — declares no range at all,
+    // and reading that as an empty one is wrong twice over. It reports every summary
+    // record as lying outside the declaration, one line per record and thousands on a
+    // real capture, burying the single real fault. And it empties `index`, so every
+    // per-entry check below silently stops running on records that are still sitting
+    // there to be read. The absent Footer is reported on its own. `chunkIndexEntries`
+    // already reads `nil` as "no filtering", which is what an undeclared summary means.
+    var indexRange: Range<UInt64>?
     if let summary, summary.start < summary.end {
         indexRange = summary.start..<summary.end
-    } else {
-        indexRange = 0..<0
     }
-    let summaryOpcodes: Set<UInt8> = [
-        Opcode.chunkIndex, Opcode.statistics, Opcode.summaryOffset,
-    ]
-    for frame in walked.intactRecords where summaryOpcodes.contains(frame.opcode) {
-        let (end, overflow) = frame.offset.addingReportingOverflow(frame.total)
-        if overflow || !indexRange.contains(frame.offset) || end > indexRange.upperBound {
-            report.error(
-                "\(opcodeName(frame.opcode)) at byte \(frame.offset) lies outside the "
-                    + "Footer-declared summary")
+    if let indexRange {
+        let summaryOpcodes: Set<UInt8> = [
+            Opcode.chunkIndex, Opcode.statistics, Opcode.summaryOffset,
+        ]
+        for frame in walked.intactRecords where summaryOpcodes.contains(frame.opcode) {
+            let (end, overflow) = frame.offset.addingReportingOverflow(frame.total)
+            if overflow || !indexRange.contains(frame.offset) || end > indexRange.upperBound {
+                report.error(
+                    "\(opcodeName(frame.opcode)) at byte \(frame.offset) lies outside the "
+                        + "Footer-declared summary")
+            }
         }
     }
 
