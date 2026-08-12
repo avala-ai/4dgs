@@ -70,6 +70,7 @@ constexpr std::uint8_t kSummaryOffset = 0x0F;
 /// A keyframe-delta file's delta chunks. Deliberately not a flag on Chunk: a Chunk is
 /// independently decodable and a Delta Chunk is exactly the record that is not.
 constexpr std::uint8_t kDeltaChunk = 0x10;
+constexpr std::uint8_t kAudioSource = 0x11;
 constexpr std::uint8_t kAudioData = 0x12;
 constexpr std::uint8_t kCoordinateFrame = 0x20;
 constexpr std::uint8_t kObjectTrack = 0x25;

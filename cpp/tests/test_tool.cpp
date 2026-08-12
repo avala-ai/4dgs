@@ -505,6 +505,62 @@ class FailingRangeReadable : public fourdgs::Readable {
   std::uint64_t failAt_;
 };
 
+/// A transport that fails when a requested range reaches one chosen payload byte.
+class FailingCoveredByteReadable : public fourdgs::Readable {
+ public:
+  FailingCoveredByteReadable(std::vector<std::uint8_t> bytes, std::uint64_t failAt)
+      : bytes_(std::move(bytes)), failAt_(failAt) {}
+
+  fourdgs::Result<std::uint64_t> size() override { return bytes_.size(); }
+
+  fourdgs::Result<std::size_t> read(std::uint64_t offset, Span<std::uint8_t> into) override {
+    const std::uint64_t end = offset + into.size();
+    if (end >= offset && offset <= failAt_ && failAt_ < end) {
+      return Error(ErrorCode::kIo, "injected chunk payload transport failure");
+    }
+    if (offset >= bytes_.size()) return static_cast<std::size_t>(0);
+    const std::size_t take =
+        std::min(into.size(), bytes_.size() - static_cast<std::size_t>(offset));
+    std::copy_n(bytes_.begin() + static_cast<std::size_t>(offset), take, into.data());
+    return take;
+  }
+
+ private:
+  std::vector<std::uint8_t> bytes_;
+  std::uint64_t failAt_;
+};
+
+/// A transport that fails only after an earlier range walk has succeeded.
+///
+/// Validation walks the framing once to establish the structure and again to resolve indexed
+/// offsets. A failure on the second visit proves that a later transport error cannot disappear
+/// behind facts retained from the first successful pass.
+class FailingRepeatedRangeReadable : public fourdgs::Readable {
+ public:
+  FailingRepeatedRangeReadable(std::vector<std::uint8_t> bytes, std::uint64_t failAt,
+                               std::size_t failOnVisit)
+      : bytes_(std::move(bytes)), failAt_(failAt), failOnVisit_(failOnVisit) {}
+
+  fourdgs::Result<std::uint64_t> size() override { return bytes_.size(); }
+
+  fourdgs::Result<std::size_t> read(std::uint64_t offset, Span<std::uint8_t> into) override {
+    if (offset == failAt_ && ++visits_ == failOnVisit_) {
+      return Error(ErrorCode::kIo, "injected repeated transport failure");
+    }
+    if (offset >= bytes_.size()) return static_cast<std::size_t>(0);
+    const std::size_t take =
+        std::min(into.size(), bytes_.size() - static_cast<std::size_t>(offset));
+    std::copy_n(bytes_.begin() + static_cast<std::size_t>(offset), take, into.data());
+    return take;
+  }
+
+ private:
+  std::vector<std::uint8_t> bytes_;
+  std::uint64_t failAt_;
+  std::size_t failOnVisit_;
+  std::size_t visits_ = 0;
+};
+
 void aWalkRetainsBoundedFactsForUnboundedPrivateRecords() {
   constexpr std::size_t kRecords = 50000;
   std::vector<std::uint8_t> bytes;
@@ -614,7 +670,64 @@ void aChunkIndexTransportFailureMakesValidationIncomplete() {
   CHECK(propagated);
 }
 
-void anUnindexedKeyframeDeltaUsesTheStreamedDecoder() {
+void aLaterIndexResolutionTransportFailureMakesValidationIncomplete() {
+  if (corpusMissing()) return;
+  if (noDecoder()) return;
+  std::vector<std::uint8_t> bytes = readBytes(corpusDirectory() / kProvenanceVariant);
+  CHECK(!bytes.empty());
+  if (bytes.empty()) return;
+
+  // The first visit is the framing pass; Chunk Index parsing performs the second walk; indexed
+  // range resolution is the third.
+  FailingRepeatedRangeReadable failing(std::move(bytes), 0, 3);
+  const Report report = fourdgs::tool::validate(failing);
+  CHECK(!report.ok());
+  CHECK(!report.hasErrors());
+  CHECK(!report.complete);
+  bool propagated = false;
+  for (const fourdgs::tool::Finding& finding : report.findings) {
+    if (finding.message.find("cannot resolve indexed ranges") != std::string::npos &&
+        finding.message.find("injected repeated transport failure") != std::string::npos) {
+      propagated = true;
+    }
+  }
+  CHECK(propagated);
+}
+
+void aCoreChunkTransportFailureMakesValidationIncomplete() {
+  if (corpusMissing()) return;
+  if (noDecoder()) return;
+  std::vector<std::uint8_t> bytes = readBytes(corpusDirectory() / kProvenanceVariant);
+  CHECK(!bytes.empty());
+  if (bytes.empty()) return;
+  fourdgs::Result<Walk> walked =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  CHECK(walked.ok());
+  if (!walked) return;
+  const fourdgs::tool::Frame* chunk = walked->firstIntact(fourdgs::tool::op::kChunk);
+  CHECK(chunk != nullptr);
+  if (chunk == nullptr) return;
+
+  // Structural validation reads the 24-byte Chunk prefix. The following payload byte is first
+  // needed by the core decoder, after all range and index checks have succeeded.
+  const std::uint64_t payload = chunk->offset + fourdgs::tool::kRecordHeaderSize + 8 + 8 + 4 + 4;
+  FailingCoveredByteReadable failing(std::move(bytes), payload);
+  const Report report = fourdgs::tool::validate(failing);
+  CHECK(!report.ok());
+  CHECK(!report.hasErrors());
+  CHECK(!report.complete);
+  bool propagated = false;
+  for (const fourdgs::tool::Finding& finding : report.findings) {
+    if (finding.message.find("chunk payload validation could not read the file") !=
+            std::string::npos ||
+        finding.message.find("a seeking reader could not obtain the file") != std::string::npos) {
+      propagated = true;
+    }
+  }
+  CHECK(propagated);
+}
+
+void anUnindexedKeyframeDeltaStopsBeforePayloadDecode() {
   if (corpusMissing()) return;
   if (noDecoder()) return;
   std::vector<std::uint8_t> bytes = readBytes(
@@ -641,8 +754,9 @@ void anUnindexedKeyframeDeltaUsesTheStreamedDecoder() {
     unindexed[newFooter + fourdgs::tool::kRecordHeaderSize + i] = 0;
   }
 
-  const Report report =
-      fourdgs::tool::validate(Span<const std::uint8_t>(unindexed.data(), unindexed.size()));
+  fourdgs::MemoryReadable inner(Span<const std::uint8_t>(unindexed.data(), unindexed.size()));
+  fourdgs::CountingReadable counting(&inner);
+  const Report report = fourdgs::tool::validate(counting);
   CHECK(!report.ok());
   CHECK(!report.hasErrors());
   CHECK(!report.complete);
@@ -653,6 +767,7 @@ void anUnindexedKeyframeDeltaUsesTheStreamedDecoder() {
     }
   }
   CHECK(warnedOnly);
+  CHECK(counting.bytesRead() < unindexed.size());
 }
 
 void anUnindexedFileStillReceivesAFrontMatterVerdict() {
@@ -1140,13 +1255,18 @@ void indexedBandsMustMatchTheirRecordsAndOwners() {
     const Report duplicateReport =
         fourdgs::tool::validate(Span<const std::uint8_t>(duplicate.data(), duplicate.size()));
     bool checkedDuplicate = false;
+    bool checkedMissing = false;
     for (const fourdgs::tool::Finding& finding : duplicateReport.findings) {
       if (finding.message.find("declares SH band " + std::to_string(repeated) +
                                " more than once") != std::string::npos) {
         checkedDuplicate = true;
       }
+      if (finding.message.find("chunk index entry 0 omits SH band 2") != std::string::npos) {
+        checkedMissing = true;
+      }
     }
     CHECK(checkedDuplicate);
+    CHECK(checkedMissing);
   }
 
   std::size_t leftEntry = entries.size();
@@ -1304,6 +1424,80 @@ void decodeFrontMatterAfterStateIsRejected() {
   for (const fourdgs::tool::Finding& finding : report.findings) {
     if (finding.message.find("Quantization record at byte " + std::to_string(chunks[1].offset) +
                              " appears after the first Chunk record") != std::string::npos) {
+      rejected = true;
+    }
+  }
+  CHECK(rejected);
+}
+
+void modernAudioAfterStateIsRejected() {
+  if (corpusMissing()) return;
+  if (noDecoder()) return;
+  std::vector<std::uint8_t> bytes = readBytes(corpusDirectory() / kProvenanceVariant);
+  CHECK(!bytes.empty());
+  if (bytes.empty()) return;
+  bool sawState = false;
+  std::optional<fourdgs::tool::Frame> late;
+  fourdgs::Result<Walk> walked = fourdgs::tool::walkBytes(
+      Span<const std::uint8_t>(bytes.data(), bytes.size()),
+      [&](const fourdgs::tool::Frame& frame, bool complete) {
+        if (!complete) return;
+        if (frame.opcode == fourdgs::tool::op::kChunk ||
+            frame.opcode == fourdgs::tool::op::kDeltaChunk) {
+          sawState = true;
+        } else if (sawState && frame.opcode == fourdgs::tool::op::kChunkIndex &&
+                   !late.has_value()) {
+          late = frame;
+        }
+      });
+  CHECK(walked.ok());
+  CHECK(late.has_value());
+  if (!walked || !late.has_value()) return;
+  bytes[static_cast<std::size_t>(late->offset)] = fourdgs::tool::op::kAudioSource;
+  resealSummary(&bytes);
+
+  const Report report =
+      fourdgs::tool::validate(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  bool rejected = false;
+  for (const fourdgs::tool::Finding& finding : report.findings) {
+    if (finding.message.find("Audio Source record at byte " + std::to_string(late->offset) +
+                             " appears after the first Chunk record") != std::string::npos) {
+      rejected = true;
+    }
+  }
+  CHECK(rejected);
+}
+
+void reservedHeaderFlagBitsAreRejected() {
+  if (corpusMissing()) return;
+  if (noDecoder()) return;
+  std::vector<std::uint8_t> bytes = readBytes(corpusDirectory() / kProvenanceVariant);
+  CHECK(!bytes.empty());
+  if (bytes.empty()) return;
+  fourdgs::Result<Walk> walked =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  CHECK(walked.ok());
+  if (!walked) return;
+  const fourdgs::tool::Frame* header = walked->firstIntact(fourdgs::tool::op::kHeader);
+  CHECK(header != nullptr);
+  if (header == nullptr) return;
+
+  std::size_t at = static_cast<std::size_t>(header->offset + fourdgs::tool::kRecordHeaderSize);
+  for (int field = 0; field < 2; ++field) at += 4 + readU32(bytes, at);
+  at += 8 + 8 + 8;
+  at += 4 + readU32(bytes, at);
+  at += 6 * 8;
+  const std::size_t flags = at + 1;
+  CHECK(flags < bytes.size());
+  if (flags >= bytes.size()) return;
+  bytes[flags] = static_cast<std::uint8_t>(bytes[flags] | 0x04);
+
+  const Report report =
+      fourdgs::tool::validate(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  bool rejected = false;
+  for (const fourdgs::tool::Finding& finding : report.findings) {
+    if (finding.message.find("Header flags is ") != std::string::npos &&
+        finding.message.find("bits 2-7 are reserved") != std::string::npos) {
       rejected = true;
     }
   }
@@ -1948,7 +2142,9 @@ void runTests() {
   aLongHeaderIsRangeParsedThroughItsTemporalModel();
   aTemporalModelTransportFailureMakesValidationIncomplete();
   aChunkIndexTransportFailureMakesValidationIncomplete();
-  anUnindexedKeyframeDeltaUsesTheStreamedDecoder();
+  aLaterIndexResolutionTransportFailureMakesValidationIncomplete();
+  aCoreChunkTransportFailureMakesValidationIncomplete();
+  anUnindexedKeyframeDeltaStopsBeforePayloadDecode();
   anUnindexedFileStillReceivesAFrontMatterVerdict();
   duplicateHeadersAreRejectedBeforeModelDispatch();
   anEmbeddedChunkOpcodeIsNotARecordBoundary();
@@ -1963,6 +2159,8 @@ void runTests() {
   skippedExtensionsPreservePhysicalBandOwnership();
   emptyIndexedBandsAreMalformedRatherThanIncomplete();
   decodeFrontMatterAfterStateIsRejected();
+  modernAudioAfterStateIsRejected();
+  reservedHeaderFlagBitsAreRejected();
   indexedCoreSummaryMemoryIsBounded();
   undersizedChunkIndexesNameTheirDeclaredSize();
   summaryPlacementIsCheckedWithoutAChecksum();
