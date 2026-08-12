@@ -401,24 +401,30 @@ def validate(data: bytes) -> Report:
     if footer is None:
         report.error("no Footer record")
 
-    # The indexed reader consumes only the consecutive Chunk Index records at
-    # the Footer-selected start of the contiguous summary. A stray index in
-    # front matter, after Statistics, or beside a zero summary is not coverage:
-    # treating it as such lets a physical Chunk evade both the omission check
-    # and the payload scan even though a seeking reader never sees that entry.
+    # Select exactly the index records in the Footer-selected summary. Summary records
+    # are contiguous but not grouped by opcode: Statistics and Summary Offset records may
+    # sit between Chunk Index records, and the indexed reader walks the whole selected
+    # range. Keep this pass lazy just like the framing walk; retaining a Frame per record
+    # would let a hostile run of tiny records turn bounded framing into unbounded memory.
     selected_index_offsets: set[int] = set()
     if footer is not None and footer_offset is not None and footer.summary_start:
-        frames = list(walk.intact_records())
-        start = next((i for i, frame in enumerate(frames) if frame.offset == footer.summary_start), None)
-        if start is None or frames[start].opcode != op.CHUNK_INDEX:
-            report.error(
-                f"the Footer's summary_start {footer.summary_start} does not name the first Chunk Index record"
-            )
-        else:
-            for frame in frames[start:]:
-                if frame.offset >= footer_offset or frame.opcode != op.CHUNK_INDEX:
+        selected_start_seen = False
+        for frame in walk.intact_records():
+            if frame.offset < footer.summary_start:
+                continue
+            if frame.offset >= footer_offset:
+                break
+            if not selected_start_seen:
+                if frame.offset != footer.summary_start:
                     break
+                selected_start_seen = True
+            if frame.opcode == op.CHUNK_INDEX:
                 selected_index_offsets.add(frame.offset)
+        if not selected_start_seen:
+            report.error(
+                f"the Footer's summary_start {footer.summary_start} does not name a complete summary record "
+                f"before the Footer at byte {footer_offset}"
+            )
     for offset in index_record_offsets:
         if offset not in selected_index_offsets:
             report.error(f"the Chunk Index record at byte {offset} lies outside the Footer-selected summary index")

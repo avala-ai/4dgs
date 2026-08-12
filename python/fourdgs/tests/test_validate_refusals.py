@@ -800,7 +800,7 @@ class TestKeyframeDelta:
 
 
 class TestTheIndexIsData:
-    def test_only_the_footer_selected_index_proves_physical_chunk_coverage(self):
+    def test_the_footer_selected_index_continues_after_statistics(self):
         data = _real_file()
         entries = _index_entries(data)
         assert len(entries) >= 2
@@ -810,18 +810,52 @@ class TestTheIndexIsData:
             lambda i, entry: None if i == len(entries) - 1 else entry,
         )
         footer = _first_record(without, op.FOOTER)
-        # A Statistics separator ends the consecutive index run consumed by
-        # open_indexed. The stray entry after it still names the omitted Chunk,
-        # but a seeking reader never sees it.
-        stray = put_record(op.STATISTICS, b"") + omitted.encode()
-        malformed = without[: footer.offset] + stray + without[footer.offset :]
-        report = validate(malformed)
-        assert not report.ok
-        assert any("lies outside the Footer-selected summary index" in f.message for f in report.findings)
-        assert any(
-            f"Chunk record at byte {omitted.chunk_offset} is not named by any chunk index entry" in f.message
-            for f in report.findings
-        ), report.findings
+        # Summary records are contiguous, but indexes need not form one opcode run. The
+        # indexed reader scans this complete Footer-selected range and sees the entry after
+        # Statistics, so validation must use that same index.
+        stray = omitted.encode()
+        parsed_footer = rec.Footer.parse(footer.content)
+        summary = without[parsed_footer.summary_start : footer.offset] + stray
+        if parsed_footer.summary_crc:
+            parsed_footer.summary_crc = crc32(summary)
+        separated = without[: footer.offset] + stray + parsed_footer.encode() + MAGIC
+        report = validate(separated)
+        assert report.ok, report.findings
+
+    def test_zero_count_keyframe_with_only_an_optional_stream_does_not_need_mu_t(self):
+        header = rec.Header(
+            duration_sec=1.0,
+            gaussian_count=0,
+            aabb=[0.0] * 6,
+            temporal_model="keyframe-delta",
+        )
+        quant = rec.Quantization(
+            scheme="uniform-v1",
+            pos_origin=[0.0, 0.0, 0.0],
+            step_pos=1e-4,
+            step_scale_log=0.04,
+            step_rot=0.004,
+            step_rgb=0.008,
+            step_alpha=0.008,
+            step_motion=2e-4,
+            step_time=0.004,
+            step_sigma_log=0.04,
+            step_sh=1,
+        )
+        empty_ids = encode_stream(op.A_GAUSSIAN_ID, np.zeros((0, 1), dtype=np.int64), channels=1)
+        optional = encode_stream(op.A_OBJECT_ID, np.zeros((0, 1), dtype=np.int64), channels=1)
+        chunk = rec.encode_chunk(0.0, 1.0, 0, 0, empty_ids + optional)
+        data = (
+            MAGIC
+            + header.encode()
+            + quant.encode()
+            + rec.WindowTable(windows=[(0.0, 1.0)]).encode()
+            + chunk
+            + rec.Footer().encode()
+            + MAGIC
+        )
+        report = validate(data)
+        assert report.ok, report.findings
 
     """An index entry is data, and data in an untrusted file can say anything.
 

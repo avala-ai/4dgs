@@ -290,7 +290,7 @@ def _keyframe_mu_bins(t0: float, bins: dict[int, np.ndarray], grids: Grids) -> n
 
 def _check_keyframe_mu_t(t0: float, bins: dict[int, np.ndarray], grids: Grids) -> None:
     """Refuse a keyframe whose decoded temporal origin is not its Chunk timestamp."""
-    if not bins or bins[op.A_MU_T].shape[0] == 0:
+    if op.A_MU_T not in bins or bins[op.A_MU_T].shape[0] == 0:
         return
     actual = bins[op.A_MU_T][:, 0]
     expected = _keyframe_mu_bins(t0, bins, grids)[:, 0]
