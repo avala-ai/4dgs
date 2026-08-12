@@ -364,6 +364,7 @@ class FourdgsGaussianSet {
     this.shDegree = 0,
     this.sh,
     this.shCoefficients = 0,
+    this.sourceGroup,
     this.sourceIndex,
     this.objectId,
   });
@@ -405,6 +406,9 @@ class FourdgsGaussianSet {
   /// Coefficients per colour component: 3 at degree 1, 8 at degree 2, 15 at
   /// degree 3. Zero when the scene carries no harmonics.
   final int shCoefficients;
+
+  /// Optional producer-side grouping ids, when the file carried them.
+  final Int32List? sourceGroup;
 
   /// Optional producer-side stable ids, when the file carried them.
   final Int32List? sourceIndex;

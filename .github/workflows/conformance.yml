@@ -243,12 +243,24 @@ jobs:
           mkdir -p build
           dart compile exe bin/decode_streamed.dart -o build/decode_streamed
           dart compile exe bin/decode_indexed.dart -o build/decode_indexed
+          dart compile exe bin/encode_roundtrip.dart -o build/encode_roundtrip
       # `run.py --runner dart` fails if no Dart runner executed, so a build that
       # silently produced nothing is a red suite rather than a green one.
       - run: |
           pip install -e ./python/fourdgs
           python tests/conformance/generate.py
           python tests/conformance/run.py --runner dart
+
+      # The other direction: Dart re-encodes each variant's gaussians, and three decoders —
+      # its own, the Python reference and the Rust reference — have to read the result as
+      # the same scene, on both read paths each. An encoder checked only by its own decoder
+      # proves that two halves of one implementation share an opinion; two implementations
+      # can still share a misreading. The script requires every one of those readers and
+      # fails if one is missing, so this build step is not optional.
+      - name: Dart encodes files the Python and Rust references agree with
+        run: |
+          cargo build -p fourdgs-conformance --release
+          dart/encode-roundtrip.sh
 
   swift:
     runs-on: ubuntu-latest

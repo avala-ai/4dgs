@@ -694,4 +694,7 @@ Uint32List _unshuffle(Uint8List raw, int width, int symbols) {
 int _unzigzag(int u) => (u >> 1) ^ -(u & 1);
 
 /// CRC-32 (IEEE) over [data], as the Footer's `summary_crc` declares it.
-int fourdgsCrc32(Uint8List data) => getCrc32(data);
+///
+/// Pass the previous result as [crc] to continue over another bounded block;
+/// this lets a writer checksum summary records without retaining the summary.
+int fourdgsCrc32(Uint8List data, [int crc = 0]) => getCrc32(data, crc);
