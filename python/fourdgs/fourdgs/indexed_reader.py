@@ -388,8 +388,28 @@ def read_chunk(source: Readable, scene: IndexedScene, entry: rec.ChunkIndexEntry
         if band > max_sh_band:
             continue
         band_blob = _read_range(source, offset, length, f"index band {band}")
-        cur = Cursor(band_blob, 9)
-        cur.u8()  # band index, already known from the index
+        # The frame, before its contents. The scan path checks all three of these and this
+        # one checked none, so an entry pointing at a record that is not an SH Band Stream,
+        # or whose declared length runs past the record and into the next one, was refused
+        # by `validate` and read here — the same scan-versus-seek split the rest of this
+        # reader closes. Skipping nine bytes is not the same as reading a record header.
+        framed = Cursor(band_blob)
+        opcode = framed.u8()
+        content_length = framed.u64()
+        if opcode != op.SH_BAND_STREAM or content_length + 9 != len(band_blob):
+            raise MalformedFile(
+                f"the chunk index entry at {entry.chunk_offset} points SH band {band} at "
+                f"{offset}, which is not one complete SH Band Stream record",
+                code="index-record-mismatch",
+            )
+        cur = Cursor(framed.take(content_length))
+        record_band = cur.u8()
+        if record_band != band:
+            raise MalformedFile(
+                f"the chunk index entry at {entry.chunk_offset} declares SH band {band}; "
+                f"the record at {offset} declares band {record_band}",
+                code="index-record-mismatch",
+            )
         from .serialization import decode_stream
 
         attribute, values = decode_stream(cur)

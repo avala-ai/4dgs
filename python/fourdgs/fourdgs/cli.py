@@ -10,6 +10,7 @@ do is something a caller can do.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import json
 import os
@@ -443,8 +444,27 @@ def _is_departed_reader(exc: OSError) -> bool:
     return sys.platform == "win32" and exc.errno == errno.EINVAL
 
 
-def _silence(fd: int) -> None:
-    """Point a descriptor at the void, so a later flush of it cannot fail."""
+def _silence(stream) -> None:
+    """Point the descriptor *this* stream failed on at the void.
+
+    The interpreter flushes the standard streams again on the way out, and a flush that
+    fails there raises where nothing can catch it: Python prints `Exception ignored` and
+    exits 120, losing the code the command chose. Redirecting the descriptor is the
+    documented way to let that last flush succeed silently.
+
+    It asks the stream which descriptor that is rather than assuming 1 and 2. `main` is a
+    callable API, and a caller that runs it under `redirect_stdout` to a pipe of its own
+    has a broken descriptor that is not this process's stdout — the earlier spelling
+    pointed the *host's* stdout at the void instead, so every later `print` in that caller
+    succeeded and wrote nothing.
+    """
+    try:
+        fd = stream.fileno()
+    except (AttributeError, OSError, ValueError):
+        # A stream with no descriptor cannot be flushed by the interpreter at exit
+        # either — `io.StringIO` under a test harness, most often — so there is nothing
+        # here to protect against.
+        return
     try:
         null = os.open(os.devnull, os.O_WRONLY)
     except OSError:
@@ -466,32 +486,41 @@ def main(argv: list[str] | None = None) -> int:
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
     args = build_parser().parse_args(argv)
-    sys.stdout, sys.stderr = _PipeTolerantStream(sys.stdout), _PipeTolerantStream(sys.stderr)
+    out, err = _PipeTolerantStream(sys.stdout), _PipeTolerantStream(sys.stderr)
+    sys.stdout, sys.stderr = out, err
     try:
-        return args.func(args)
+        code = args.func(args)
     except OSError as exc:
         # Narrow on purpose: a transport that would not answer, and nothing else. A
         # malformed file is a verdict and stays exit 1; a bug in this package should still
         # come out as a traceback, because a tool that reports its own defects as though
         # they were the file's is worse than one that crashes.
         print(f"4dgs: {exc.filename or ''}: {exc.strerror or exc}".replace(": : ", ": "), file=sys.stderr)
-        return EXIT_TOOL_FAILURE
+        code = EXIT_TOOL_FAILURE
     finally:
-        # Flush here, while a `BrokenPipeError` still lands somewhere that can hold it.
-        # Piped output is block-buffered, so a short report never reaches the pipe until
-        # the interpreter flushes it on the way out — and a flush that fails there raises
-        # where nothing can catch it: Python prints `Exception ignored` and exits 120,
-        # losing the code we just chose. Draining first, then pointing the descriptor at
-        # the void, is what lets the verdict be the exit status in both bufferings.
-        for wrapper, fd in ((sys.stdout, 1), (sys.stderr, 2)):
-            if isinstance(wrapper, _PipeTolerantStream):
-                wrapper.flush()
-                if wrapper.broken:
-                    _silence(fd)
-        if isinstance(sys.stdout, _PipeTolerantStream):
-            sys.stdout = sys.stdout._stream
-        if isinstance(sys.stderr, _PipeTolerantStream):
-            sys.stderr = sys.stderr._stream
+        # Restoring is all this block does, because it is the one part that must not fail.
+        # The draining below used to live here, and an `OSError` it could not classify —
+        # a full disk — escaped from the `finally` and took the chosen exit code with it,
+        # leaving the caller's `sys.stdout` replaced by a wrapper for good measure.
+        sys.stdout, sys.stderr = out._stream, err._stream
+    # Drain now, while a failure still lands somewhere that can hold it. Piped output is
+    # block-buffered, so a short report does not reach the pipe until something flushes it.
+    problem: OSError | None = None
+    for wrapper in (out, err):
+        try:
+            wrapper.flush()
+        except OSError as exc:
+            problem = problem or exc
+        if wrapper.broken:
+            _silence(wrapper)
+    if problem is not None:
+        # The report did not reach where it was going, which is a failure of this tool and
+        # not a verdict about the file. Exit 3 says so; exit 1 would have claimed the file
+        # was invalid, and a traceback would have claimed this package was broken.
+        with contextlib.suppress(OSError):
+            print(f"4dgs: could not write the report: {problem.strerror or problem}", file=sys.stderr)
+        return EXIT_TOOL_FAILURE
+    return code
 
 
 if __name__ == "__main__":

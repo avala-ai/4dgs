@@ -18,6 +18,8 @@ is worse than one that failed.
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import io
 import json
 import math
@@ -184,6 +186,54 @@ class TestTheCommandLine:
             status = tool.wait(timeout=300)
             assert status == 1, f"unbuffered={unbuffered}: exit {status}, stderr {err!r}"
             assert "Broken pipe" not in err, f"unbuffered={unbuffered}: {err!r}"
+
+    def test_a_departed_reader_costs_the_caller_nothing_but_its_own_stream(self, tmp_path, capsys):
+        """`main` is a callable API, so what it silences must be what broke.
+
+        A caller running this under `redirect_stdout` to a pipe of its own has a broken
+        descriptor that is not this process's stdout. Pointing 1 at `/dev/null` because
+        *something* broke took the host's stdout with it: every later `print` in that
+        caller succeeded and wrote nothing, and it kept doing so after `main` returned.
+        """
+        path = tmp_path / "truncated.4dgs"
+        path.write_bytes(MAGIC + b"\x00" * 512)
+        before = os.fstat(1)
+        read_end, write_end = os.pipe()
+        os.close(read_end)  # the caller's reader has gone; this process's stdout has not
+        departed = os.fdopen(write_end, "w")
+        try:
+            with contextlib.redirect_stdout(departed):
+                code = main(["validate", str(path)])
+        finally:
+            with contextlib.suppress(OSError):
+                departed.close()
+        after = os.fstat(1)
+        assert code == 1, code
+        assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino), (
+            "main() pointed this process's stdout at /dev/null because a stream it was "
+            "handed broke; only the descriptor that broke may be silenced"
+        )
+
+    def test_a_report_that_cannot_be_written_is_this_tool_failing(self, tmp_path, monkeypatch):
+        """A full disk is not a verdict about the file, and it is not a bug in this
+        package either. It was reported as both: the `OSError` escaped from the `finally`
+        that drained the stream, discarding the code the command had already chosen, so
+        the process died with a traceback and exit 1 — "your file is invalid".
+        """
+        path = tmp_path / "good.4dgs"
+        path.write_bytes(_real_file())
+
+        class FullDisk(io.StringIO):
+            def flush(self):
+                raise OSError(errno.ENOSPC, "No space left on device")
+
+        stdout, stderr = sys.stdout, sys.stderr
+        monkeypatch.setattr(sys, "stdout", FullDisk())
+        code = main(["validate", str(path)])
+        monkeypatch.setattr(sys, "stdout", stdout)
+        assert code == 3, f"a report that could not be written is exit 3, got {code}"
+        # And the caller gets its streams back, rather than a wrapper that outlives the call.
+        assert sys.stderr is stderr
 
 
 class TestTheInvalidCorpus:
@@ -1307,6 +1357,37 @@ class TestSHBandStreams:
         with pytest.raises(MalformedFile, match=r"expected 0\.\.255"):
             read_chunk(source, scene, scene.index[0], max_sh_band=1)
 
+    def test_the_seeking_band_read_checks_the_frame_the_scan_checks(self):
+        """`validate` walks to the band and reads a record header; this path skipped nine
+        bytes and trusted them. So an entry pointing at a record that is not an SH Band
+        Stream — or one whose declared length runs past it into the next record — was a
+        refusal on one path and decoded coefficients on the other, which is the split
+        this reader exists to close.
+        """
+        data = _patch_sh_degree(_real_file(), 1)
+        first = _index_entries(data)[0]
+        values = np.zeros((first.gaussian_count, 9), dtype=np.int64)
+        band = put_record(
+            op.SH_BAND_STREAM,
+            bytes([1]) + encode_stream(op.SH_BAND_STREAM, values, channels=9, codec=0),
+        )
+
+        # An entry whose length claims more than the record frames: the tail belongs to
+        # whatever follows, and a reader that decodes it is reading the next record's bytes.
+        long_entry, _ = _insert_indexed_band(data, band, extra_length=8)
+        source = BytesReadable(long_entry)
+        scene = open_indexed(source)
+        with pytest.raises(MalformedFile, match="not one complete SH Band Stream record"):
+            read_chunk(source, scene, scene.index[0], max_sh_band=1)
+
+        # And an entry aimed at a record of another kind entirely.
+        not_a_band = put_record(op.STATISTICS, bytes([1]) + b"\x00" * 32)
+        wrong_kind, _ = _insert_indexed_band(data, not_a_band)
+        source = BytesReadable(wrong_kind)
+        scene = open_indexed(source)
+        with pytest.raises(MalformedFile, match="not one complete SH Band Stream record"):
+            read_chunk(source, scene, scene.index[0], max_sh_band=1)
+
     def test_an_entry_pointing_at_the_wrong_record_says_so(self):
         """Two faults shared one message, and it only ever described the other one.
 
@@ -1858,8 +1939,11 @@ def _insert_single_indexed_band(data: bytes, band: bytes) -> tuple[bytes, int]:
     return data[:band_at] + band + summary + footer.encode() + MAGIC, band_at
 
 
-def _insert_indexed_band(data: bytes, band: bytes) -> tuple[bytes, int]:
-    """Insert `band` before the summary and attach it to the first index entry."""
+def _insert_indexed_band(data: bytes, band: bytes, extra_length: int = 0) -> tuple[bytes, int]:
+    """Insert `band` before the summary and attach it to the first index entry.
+
+    `extra_length` overstates the entry's declared length without moving anything, which
+    is how a band range that runs past its record into the next one is built."""
     footer_record = _first_record(data, op.FOOTER)
     footer = rec.Footer.parse(footer_record.content)
     band_at = footer.summary_start
@@ -1871,7 +1955,7 @@ def _insert_indexed_band(data: bytes, band: bytes) -> tuple[bytes, int]:
         if record.opcode == op.CHUNK_INDEX:
             entry = rec.ChunkIndexEntry.parse(record.content)
             if entry_index == 0:
-                entry = _with(entry, bands=[*entry.bands, (1, band_at, len(band))])
+                entry = _with(entry, bands=[*entry.bands, (1, band_at, len(band) + extra_length)])
             summary += entry.encode()
             entry_index += 1
         else:
