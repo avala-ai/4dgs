@@ -65,7 +65,7 @@ composition order of its own.
 | glTF interop (import, snapshot export)            | Yes    | No         | No      | No      | No      | No      |
 | USD interop (import, snapshot export)             | Yes    | No         | No      | No      | No      | No      |
 | USD animated export (keyframe-delta time samples) | Yes    | No         | No      | No      | No      | No      |
-| Inspect and validate                              | Yes    | Yes        | Yes     | Planned | Planned | Yes     |
+| Inspect and validate                              | Yes    | Yes        | Yes     | Planned | Yes     | Yes     |
 
 ¹ On the `gaussian-birth` path. No implementation composes object tracks during `keyframe-delta`
 reconstruction: that path rebuilds base centres and scales from bins and never reads the object
@@ -355,11 +355,11 @@ why the matrix records both bindings as `Untested` for range-skipping even thoug
 implements it.
 
 **Convert from PLY frame sequences** and **Inspect and validate** are tools rather than wire-format
-features, so the conformance suite does not cover them; they are marked from their own tests, which
-now exist. The converter's fixtures are PLY frames generated into a temporary directory from a fixed
-seed — the corpus rule applied to a different file format — and the validator is tested against
-files built byte by byte, because a validator tested only on files its own encoder wrote is a
-validator tested against nothing.
+features, so the conformance suite does not cover them. The converter's fixtures are PLY frames
+generated into a temporary directory from a fixed seed — the corpus rule applied to a different file
+format — and validators are tested against hostile files built byte by byte. Swift's validator is
+implemented: it checks both temporal models with bounded range reads, composes keyframe-delta
+identity history, and reports a structurally clean file as valid.
 
 **Rust**'s `Yes` on that row is marked from `rust/cli/tests/smoke.rs`, and the assertion that earns
 it is `every_invalid_variant_is_refused_by_its_own_identifier`: each of the seven invalid variants

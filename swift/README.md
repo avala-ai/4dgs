@@ -88,6 +88,31 @@ manifest warns about the missing library instead of pointing at it.
 `conformance/` builds `decode_streamed` and `decode_indexed`, registered in
 `tests/conformance/run.py` and skipped until built.
 
+## `4dgs`, the tool
+
+Two commands over the same binding, for the moment somebody is holding a file that will not open and
+wants to know _where_ it stops being a 4dgs file.
+
+```bash
+LD_LIBRARY_PATH="$PWD/target/release${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  swift run -Xlinker -L"$PWD/target/release" 4dgs inspect scene.4dgs
+LD_LIBRARY_PATH="$PWD/target/release${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  swift run -Xlinker -L"$PWD/target/release" 4dgs validate scene.4dgs
+```
+
+`inspect` walks the records — offset, opcode, content and total length, and whether the Footer's
+summary checksum covers that record and agrees. `--json` prints the same walk for a script. A file
+that was cut is walked as far as it goes and then says at which byte, and how many complete records
+before it a streamed reader keeps.
+
+`validate` checks the file and, when the reader refuses it, prints the refusal identifier and the
+byte it fired at beneath the finding it belongs to — the same identifiers the conformance corpus is
+written against, and the same bytes the Rust and C++ tools print. Exit codes: `0` valid, `1` refused
+or invalid, `2` warnings or incomplete validation, `3` the tool could not run.
+
+The tool's own tests run it in-process, so `swift test` covers the commands and their exit codes;
+they read the generated corpus and skip themselves when it is not on disk.
+
 ### Platforms
 
 The core builds for visionOS, iOS, macOS and Linux on stable toolchains — the Apple targets ship a

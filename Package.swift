@@ -50,7 +50,11 @@ let package = Package(
     name: "FourDGS",
     platforms: [.visionOS(.v1), .iOS(.v17), .macOS(.v14)],
     products: [
-        .library(name: "FourDGS", targets: ["FourDGS"])
+        .library(name: "FourDGS", targets: ["FourDGS"]),
+        // `4dgs`, the same name the Rust and C++ tools install under. The product carries the
+        // name because a Swift module cannot start with a digit; the executable a user runs is
+        // what the name is for.
+        .executable(name: "4dgs", targets: ["FourDGSCommand"]),
     ],
     targets: [
         // The C ABI, imported from rust/fourdgs/include/fourdgs.h through a module map
@@ -66,6 +70,19 @@ let package = Package(
         .systemLibrary(name: "CFourDGS", path: "swift/Sources/CFourDGS"),
         .target(name: "FourDGS", dependencies: ["CFourDGS"], path: "swift/Sources/FourDGS"),
         .testTarget(name: "FourDGSTests", dependencies: ["FourDGS"], path: "swift/Tests/FourDGSTests"),
+
+        // `4dgs`, the inspect-and-validate tool. A library plus a three-line executable, so
+        // the tests drive the whole tool — arguments in, output and exit code out — without
+        // spawning a process.
+        .target(
+            name: "FourDGSTool", dependencies: ["FourDGS", "CFourDGS"],
+            path: "swift/Sources/FourDGSTool"),
+        .executableTarget(
+            name: "FourDGSCommand", dependencies: ["FourDGSTool"],
+            path: "swift/Sources/FourDGSCommand"),
+        .testTarget(
+            name: "FourDGSToolTests", dependencies: ["FourDGSTool", "FourDGS", "CFourDGS"],
+            path: "swift/Tests/FourDGSToolTests"),
 
         // The conformance runners. Two executables, because the suite tests two read paths
         // and they have to be able to disagree.
