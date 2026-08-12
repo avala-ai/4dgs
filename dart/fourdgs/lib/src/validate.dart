@@ -94,21 +94,49 @@ class FourdgsValidation {
 
 class _Report {
   static const int _detailedNoteLimit = 64;
+  static const int _detailedFindingLimit = 256;
 
   final List<FourdgsFinding> findings = <FourdgsFinding>[];
+  int _detailedFindings = 0;
+  int _omittedFindings = 0;
+  int? _omittedFindingAt;
+  FourdgsSeverity _worstOmitted = FourdgsSeverity.note;
   int _detailedNotes = 0;
   int _omittedNotes = 0;
   int? _omittedNoteAt;
 
+  void _retain(FourdgsFinding finding) {
+    if (_detailedFindings < _detailedFindingLimit) {
+      findings.add(finding);
+      _detailedFindings += 1;
+      return;
+    }
+    _omittedFindings += 1;
+    if (finding.severity.index > _worstOmitted.index) {
+      _worstOmitted = finding.severity;
+    }
+    final summary = FourdgsFinding(
+      _worstOmitted,
+      '$_omittedFindings additional validation findings omitted after the '
+      'first $_detailedFindingLimit; validation still checked every record',
+    );
+    if (_omittedFindingAt == null) {
+      _omittedFindingAt = findings.length;
+      findings.add(summary);
+    } else {
+      findings[_omittedFindingAt!] = summary;
+    }
+  }
+
   void error(String message) =>
-      findings.add(FourdgsFinding(FourdgsSeverity.error, message));
+      _retain(FourdgsFinding(FourdgsSeverity.error, message));
 
   void warn(String message) =>
-      findings.add(FourdgsFinding(FourdgsSeverity.warning, message));
+      _retain(FourdgsFinding(FourdgsSeverity.warning, message));
 
   void note(String message) {
     if (_detailedNotes < _detailedNoteLimit) {
-      findings.add(FourdgsFinding(FourdgsSeverity.note, message));
+      _retain(FourdgsFinding(FourdgsSeverity.note, message));
       _detailedNotes += 1;
       return;
     }
@@ -119,8 +147,13 @@ class _Report {
       '$_detailedNoteLimit; validation still checked every record',
     );
     if (_omittedNoteAt == null) {
-      _omittedNoteAt = findings.length;
-      findings.add(finding);
+      if (_detailedFindings < _detailedFindingLimit) {
+        _omittedNoteAt = findings.length;
+        findings.add(finding);
+        _detailedFindings += 1;
+      } else {
+        _retain(finding);
+      }
     } else {
       findings[_omittedNoteAt!] = finding;
     }
@@ -138,7 +171,7 @@ class _Report {
     Object error, {
     FourdgsWalk? walk,
     FourdgsRefusalSite? site,
-  }) => findings.add(
+  }) => _retain(
     FourdgsFinding(
       FourdgsSeverity.error,
       '$prefix${_say(error)}',
@@ -153,6 +186,12 @@ String _say(Object error) =>
     error is FourdgsException ? error.message : error.toString();
 
 typedef _StateInterval = ({double t0, double t1, int offset});
+typedef _SummaryOffsetAt = ({FourdgsSummaryOffset value, int offset});
+
+/// Offset lists are diagnostic samples, not a second record table. The framing
+/// walk already retains a bounded table and replays every omitted record; these
+/// lists need only enough entries to make an error actionable.
+const int _retainedOffsetLimit = 64;
 
 /// Every check, in the Python validator's order.
 ///
@@ -202,6 +241,9 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
   // Where each entry's own Chunk Index record sits, so a finding about entry `i`
   // names the byte the reader would name for the same fault.
   final List<int> indexRecordOffsets = <int>[];
+  final List<_SummaryOffsetAt> summaryOffsets = <_SummaryOffsetAt>[];
+  bool indexLimitReported = false;
+  bool summaryOffsetLimitReported = false;
   // Pairing needs only the source id and its declared payload length. Parsed
   // descriptors (especially their keyframe arrays and strings) are released
   // before the next record is read.
@@ -233,10 +275,14 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
       if (frame.opcode == opChunkIndex ||
           frame.opcode == opStatistics ||
           frame.opcode == opSummaryOffset) {
-        summaryFrameOffsets.add(frame.offset);
+        if (summaryFrameOffsets.length < _retainedOffsetLimit) {
+          summaryFrameOffsets.add(frame.offset);
+        }
       }
       if (frame.opcode == opSummaryOffset) {
-        summaryOffsetFrameOffsets.add(frame.offset);
+        if (summaryOffsetFrameOffsets.isEmpty) {
+          summaryOffsetFrameOffsets.add(frame.offset);
+        }
       }
       if (isSpecifiedOpcode(frame.opcode) &&
           !isLegalTopLevelOpcode(frame.opcode)) {
@@ -251,7 +297,10 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
       switch (frame.opcode) {
         case opHeader:
           try {
-            header = FourdgsHeader.parse(await _bytesOf(source, frame));
+            header = FourdgsHeader.parse(
+              await _bytesOf(source, frame),
+              fileOffset: frame.offset + recordHeaderBytes,
+            );
           } on FourdgsException catch (error) {
             // Named against *this* Header, not against the first record with
             // this opcode. Nothing in the framing forbids a second one, and a
@@ -322,17 +371,48 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
             report.error('chunk $chunkCount does not parse: ${_say(error)}');
           }
         case opChunkIndex:
-          indexFrameOffsets.add(frame.offset);
+          if (indexFrameOffsets.length < _retainedOffsetLimit) {
+            indexFrameOffsets.add(frame.offset);
+          }
+          if (index.length >= maxChunkIndexEntries) {
+            if (!indexLimitReported) {
+              report.error(
+                'the chunk index holds more than $maxChunkIndexEntries entries; '
+                'later entries are framed but not retained',
+              );
+              indexLimitReported = true;
+            }
+          } else {
+            try {
+              index.add(
+                FourdgsChunkIndexEntry.parse(
+                  await _bytesOf(source, frame),
+                  fileOffset: frame.offset + recordHeaderBytes,
+                ),
+              );
+              indexRecordOffsets.add(frame.offset);
+            } on FourdgsException catch (error) {
+              report.error(
+                'a chunk index entry does not parse: ${_say(error)}',
+              );
+            }
+          }
+        case opSummaryOffset:
           try {
-            index.add(
-              FourdgsChunkIndexEntry.parse(
-                await _bytesOf(source, frame),
-                fileOffset: frame.offset + recordHeaderBytes,
-              ),
+            final FourdgsSummaryOffset parsed = FourdgsSummaryOffset.parse(
+              await _bytesOf(source, frame),
             );
-            indexRecordOffsets.add(frame.offset);
+            if (summaryOffsets.length < maxChunkIndexEntries) {
+              summaryOffsets.add((value: parsed, offset: frame.offset));
+            } else if (!summaryOffsetLimitReported) {
+              report.error(
+                'validation retains at most $maxChunkIndexEntries Summary '
+                'Offset declarations; later records are still framed',
+              );
+              summaryOffsetLimitReported = true;
+            }
           } on FourdgsException catch (error) {
-            report.error('a chunk index entry does not parse: ${_say(error)}');
+            report.error('a Summary Offset does not parse: ${_say(error)}');
           }
         case opFooter:
           try {
@@ -669,7 +749,8 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
     if (footer.summaryStart == 0 && summaryFrameOffsets.isNotEmpty) {
       report.error(
         'the Footer declares summary_start 0 (no index), but the framing walk '
-        'found ${summaryFrameOffsets.length} summary record(s) at '
+        'found ${walk.count(opChunkIndex) + walk.count(opStatistics) + walk.count(opSummaryOffset)} '
+        'summary record(s), beginning at '
         '${summaryFrameOffsets.join(", ")}',
       );
     } else if (footer.summaryStart != 0) {
@@ -679,9 +760,9 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
         opSummaryOffset,
       };
       await for (final FourdgsFrame frame in walkFourdgsFrames(source, walk)) {
-        if (footer.summaryStart <= frame.offset &&
-            frame.offset < footerOffset &&
-            !summaryOpcodes.contains(frame.opcode)) {
+        final bool inSummary =
+            footer.summaryStart <= frame.offset && frame.offset < footerOffset;
+        if (inSummary && !summaryOpcodes.contains(frame.opcode)) {
           report.error(
             'the Footer summary range [${footer.summaryStart}, $footerOffset) '
             'contains ${opcodeName(frame.opcode)} at byte ${frame.offset}; only '
@@ -689,16 +770,12 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
             'the complete summary run',
           );
         }
-      }
-      final List<int> orphaned = <int>[
-        for (final int offset in summaryFrameOffsets)
-          if (offset < footer.summaryStart || offset >= footerOffset) offset,
-      ];
-      if (orphaned.isNotEmpty) {
-        report.error(
-          'summary records at ${orphaned.join(", ")} sit outside the Footer '
-          'summary range [${footer.summaryStart}, $footerOffset)',
-        );
+        if (!inSummary && summaryOpcodes.contains(frame.opcode)) {
+          report.error(
+            '${opcodeName(frame.opcode)} at byte ${frame.offset} sits outside '
+            'the Footer summary range [${footer.summaryStart}, $footerOffset)',
+          );
+        }
       }
       if (indexFrameOffsets.isEmpty ||
           indexFrameOffsets.first != footer.summaryStart) {
@@ -706,6 +783,20 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
           'the Footer declares the Chunk Index at ${footer.summaryStart}, but '
           'the complete framing walk found Chunk Index records at '
           '${indexFrameOffsets.isEmpty ? "no offsets" : indexFrameOffsets.join(", ")}',
+        );
+      }
+    }
+
+    for (final _SummaryOffsetAt declaration in summaryOffsets) {
+      final String? problem = await _summaryOffsetProblem(
+        source,
+        declaration.value,
+        footer.summaryStart,
+        footerOffset,
+      );
+      if (problem != null) {
+        report.error(
+          'the Summary Offset record at byte ${declaration.offset} $problem',
         );
       }
     }
@@ -793,6 +884,72 @@ Future<FourdgsValidation> validateFourdgs(FourdgsReadable source) async {
   }
 
   return FourdgsValidation(report.findings);
+}
+
+/// Validates the range one Summary Offset advertises without materializing it.
+///
+/// The declaration exists so a reader can fetch only this group, so its range
+/// must itself be sufficient proof: nonempty, wholly inside the framed
+/// summary, beginning on a record boundary, and containing only the opcode it
+/// names. Walking fixed headers keeps the check bounded by one record header.
+Future<String?> _summaryOffsetProblem(
+  FourdgsReadable source,
+  FourdgsSummaryOffset declaration,
+  int summaryStart,
+  int footerOffset,
+) async {
+  final int start = declaration.groupStart;
+  final int length = declaration.groupLength;
+  if (summaryStart == 0) {
+    return 'declares a group while the Footer declares no summary';
+  }
+  if (start == 0) {
+    return 'declares group_start 0; expected a framed group inside the summary';
+  }
+  if (length == 0) {
+    return 'declares group_length 0; expected at least one referenced record';
+  }
+  if (start < summaryStart ||
+      start >= footerOffset ||
+      length > footerOffset - start) {
+    return 'declares group range [$start, ${start + length}), outside the '
+        'Footer summary range [$summaryStart, $footerOffset)';
+  }
+
+  final int end = start + length;
+  int at = start;
+  bool referenced = false;
+  const Set<int> legalSummaryOpcodes = <int>{
+    opChunkIndex,
+    opStatistics,
+    opSummaryOffset,
+  };
+  while (at < end) {
+    if (end - at < recordHeaderBytes) {
+      return 'ends with ${end - at} bytes at byte $at, too few for a record '
+          'header';
+    }
+    final FourdgsCursor framing = FourdgsCursor(
+      await source.read(at, recordHeaderBytes),
+    );
+    final int opcode = framing.u8();
+    final int contentLength = framing.u64();
+    final int total = recordHeaderBytes + contentLength;
+    if (total > end - at) {
+      return 'ends at $end inside the ${opcodeName(opcode)} record at byte '
+          '$at, whose framing ends at ${at + total}';
+    }
+    if (!legalSummaryOpcodes.contains(opcode)) {
+      return 'includes ${opcodeName(opcode)} at byte $at, which is not a '
+          'summary record';
+    }
+    referenced |= opcode == declaration.groupOpcode;
+    at += total;
+  }
+  if (!referenced) {
+    return 'does not reference any ${opcodeName(declaration.groupOpcode)} record';
+  }
+  return null;
 }
 
 /// The object layer and the provenance family, parsed rather than framed.

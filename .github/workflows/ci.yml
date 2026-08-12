@@ -78,7 +78,7 @@ jobs:
           size_kb=$(du -s typescript | cut -f1)
           echo "typescript: ${size_kb} KiB"
           [ "$size_kb" -le 768 ] || { echo "::error::typescript is ${size_kb} KiB, over the 768 KiB budget"; exit 1; }
-      - name: Dart sources under 960 KB
+      - name: Dart sources under 1024 KB
         # Sources only, same as TypeScript's and Swift's: this job builds nothing, so
         # .dart_tool and the compiled runners are not here to measure, and a vendored
         # dependency would show up as a budget failure.
@@ -120,10 +120,15 @@ jobs:
         # Audio header scans, index/Footer agreement, physical interval coverage,
         # top-level opcode legality, and temporal identity checks. The clean tree is
         # 880 KiB, with the added space again dominated by hostile-input regressions.
+        # Raised from 960 to 1024 KiB for the final bounded-validation review:
+        # retained findings and index entries now have ceilings, ranged chains prove
+        # their reference semantics, and Footer/Summary Offset ranges regain bounded
+        # seeks and full validation. The clean tree measures 972 KiB; 1024 keeps one
+        # ordinary review round of headroom without hiding a vendored dependency.
         run: |
           size_kb=$(du -s dart | cut -f1)
           echo "dart: ${size_kb} KiB"
-          [ "$size_kb" -le 960 ] || { echo "::error::dart is ${size_kb} KiB, over the 960 KiB budget"; exit 1; }
+          [ "$size_kb" -le 1024 ] || { echo "::error::dart is ${size_kb} KiB, over the 1024 KiB budget"; exit 1; }
       - name: Swift sources under 300 KB
         # Sources only, same as TypeScript's: this job builds nothing, so .build is not
         # here to measure and a vendored dependency would show up as a budget failure.

@@ -979,6 +979,13 @@ FourdgsDeltaChunkBody parseDeltaChunk(Uint8List content) {
   final birthsAt = records.pos - births.length;
   final deaths = records.take(records.u64());
   final deathsAt = records.pos - deaths.length;
+  if (records.remaining != 0) {
+    throw FourdgsMalformedFile(
+      'the Delta Chunk records block has ${records.remaining} trailing bytes '
+      'after its update, birth, and death groups; expected exactly those '
+      'three length-framed groups',
+    );
+  }
   return FourdgsDeltaChunkBody(
     head,
     updates,

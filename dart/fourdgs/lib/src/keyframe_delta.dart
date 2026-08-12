@@ -1061,9 +1061,10 @@ KeyframeDeltaState composeKeyframeDeltaChain(
 }) {
   final chain = chainFrom(index, entry, byOffset: byOffset);
   KeyframeDeltaState? state;
+  int? referenceLevel;
   for (final link in chain) {
     final int expectedOpcode = _stateOpcode(link);
-    state = _composeLink(
+    final composed = _composeLink(
       state,
       _recordContent(
         data,
@@ -1072,7 +1073,10 @@ KeyframeDeltaState composeKeyframeDeltaChain(
         expectedOpcode: expectedOpcode,
       ),
       link,
+      referenceLevel: referenceLevel,
     );
+    state = composed.state;
+    referenceLevel = composed.level;
   }
   return _composed(state);
 }
@@ -1094,6 +1098,7 @@ Future<KeyframeDeltaState> readKeyframeDeltaChain(
   final chain = chainFrom(index, entry, byOffset: byOffset);
   final int size = await source.size();
   KeyframeDeltaState? state;
+  int? referenceLevel;
   for (final link in chain) {
     final int expectedOpcode = _stateOpcode(link);
     if (link.chunkOffset < 0 ||
@@ -1132,7 +1137,7 @@ Future<KeyframeDeltaState> readKeyframeDeltaChain(
         '${link.chunkLength}-byte range: $error',
       );
     }
-    state = _composeLink(
+    final composed = _composeLink(
       state,
       _recordContent(
         blob,
@@ -1142,31 +1147,49 @@ Future<KeyframeDeltaState> readKeyframeDeltaChain(
         fileOffset: link.chunkOffset,
       ),
       link,
+      referenceLevel: referenceLevel,
     );
+    state = composed.state;
+    referenceLevel = composed.level;
   }
   return _composed(state);
 }
 
-/// One link of a chain composed onto what came before it.
-KeyframeDeltaState _composeLink(
+/// One link of a chain composed onto what came before it, plus the level the
+/// next delta must preserve.
+({KeyframeDeltaState state, int level}) _composeLink(
   KeyframeDeltaState? state,
   Uint8List content,
-  FourdgsChunkIndexEntry link,
-) {
+  FourdgsChunkIndexEntry link, {
+  required int? referenceLevel,
+}) {
   if (link.kind == 0) {
     final FourdgsChunkBody body = parseChunk(content);
     _checkKeyframeIndexAgreement(link, body.header);
     final decoded = _keyframeFromChunk(content, at: link.chunkOffset);
-    return _keyframeState(decoded.ids, decoded.bins);
+    return (
+      state: _keyframeState(decoded.ids, decoded.bins),
+      level: body.header.level,
+    );
   }
-  if (state == null) {
+  if (state == null || referenceLevel == null) {
     throw const FourdgsMalformedFile(
       'a keyframe-delta chain begins with a delta chunk',
     );
   }
   final FourdgsDeltaChunkBody body = parseDeltaChunk(content);
   _checkDeltaIndexAgreement(link, body.header);
-  return _composeDelta(state, body, at: link.chunkOffset);
+  if (body.header.level != referenceLevel) {
+    throw FourdgsMalformedFile(
+      'the delta chunk at byte ${link.chunkOffset} declares level '
+      '${body.header.level}, but its selected reference has level '
+      '$referenceLevel; a delta preserves its reference level',
+    );
+  }
+  return (
+    state: _composeDelta(state, body, at: link.chunkOffset),
+    level: body.header.level,
+  );
 }
 
 void _checkKeyframeIndexAgreement(
@@ -1189,6 +1212,14 @@ void _checkDeltaIndexAgreement(
   FourdgsChunkIndexEntry entry,
   FourdgsDeltaChunkHeader chunk,
 ) {
+  if (chunk.deltaMode != deltaModeKeyframe &&
+      chunk.deltaMode != deltaModeChained) {
+    throw FourdgsMalformedFile(
+      'the delta chunk at byte ${entry.chunkOffset} declares delta_mode '
+      '${chunk.deltaMode}; expected $deltaModeKeyframe (keyframe) or '
+      '$deltaModeChained (chained)',
+    );
+  }
   final int operations =
       chunk.updateCount + chunk.birthCount + chunk.deathCount;
   if (entry.t0 != chunk.t0 ||
@@ -1301,6 +1332,20 @@ List<FourdgsChunkIndexEntry> chainFrom(
   final chain = <FourdgsChunkIndexEntry>[current];
   while (chain.first.kind != 0) {
     final head = chain.first;
+    if (head.kind != 1) {
+      throw FourdgsMalformedFile(
+        'the index entry at byte ${head.chunkOffset} declares chunk_kind '
+        '${head.kind}; expected 0 (keyframe) or 1 (delta)',
+      );
+    }
+    if (head.deltaMode != deltaModeKeyframe &&
+        head.deltaMode != deltaModeChained) {
+      throw FourdgsMalformedFile(
+        'the delta index entry at byte ${head.chunkOffset} declares '
+        'delta_mode ${head.deltaMode}; expected $deltaModeKeyframe '
+        '(keyframe) or $deltaModeChained (chained)',
+      );
+    }
     if (head.referenceOffset >= head.chunkOffset) {
       throw FourdgsMalformedFile(
         'the chunk at ${head.chunkOffset} references ${head.referenceOffset}, '
@@ -1314,10 +1359,40 @@ List<FourdgsChunkIndexEntry> chainFrom(
         'which the index does not name',
       );
     }
+    if (head.deltaMode == deltaModeKeyframe && reference.kind != 0) {
+      throw FourdgsMalformedFile(
+        'the keyframe-mode delta at byte ${head.chunkOffset} references the '
+        'delta at byte ${reference.chunkOffset}; expected its GOP keyframe',
+      );
+    }
+    final int expectedKeyframeOffset =
+        reference.kind == 0 ? reference.chunkOffset : reference.keyframeOffset;
+    final int expectedDepth =
+        head.deltaMode == deltaModeKeyframe ? 1 : reference.depth + 1;
+    if (head.keyframeOffset != expectedKeyframeOffset ||
+        head.depth != expectedDepth) {
+      throw FourdgsMalformedFile(
+        'the delta at byte ${head.chunkOffset} declares keyframe_offset '
+        '${head.keyframeOffset} and depth ${head.depth}; its selected '
+        'reference requires $expectedKeyframeOffset and $expectedDepth',
+      );
+    }
     chain.insert(0, reference);
     if (chain.length > index.length) {
       throw const FourdgsMalformedFile('the chain does not reach a keyframe');
     }
+  }
+
+  final FourdgsChunkIndexEntry keyframe = chain.first;
+  if (keyframe.depth != 0 ||
+      keyframe.referenceOffset != 0 ||
+      keyframe.keyframeOffset != keyframe.chunkOffset) {
+    throw FourdgsMalformedFile(
+      'the keyframe index entry at byte ${keyframe.chunkOffset} declares '
+      'reference_offset ${keyframe.referenceOffset}, keyframe_offset '
+      '${keyframe.keyframeOffset}, and depth ${keyframe.depth}; expected 0, '
+      '${keyframe.chunkOffset}, and 0',
+    );
   }
 
   if (chain.length - 1 != current.depth) {

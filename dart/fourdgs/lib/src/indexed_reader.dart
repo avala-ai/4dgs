@@ -453,6 +453,22 @@ Future<({int offset, int length})> _locateFooter(
   int magicAt,
   int fixedContentBytes,
 ) async {
+  // The version-1 Footer is normally exactly its fixed fields. Probe that
+  // bounded tail first: it makes an indexed open independent of the number of
+  // chunks preceding the summary. A different length can be an extended
+  // Footer, so only that ambiguous case falls back to the boundary walk below.
+  final int fixedFooterAt = magicAt - recordHeaderBytes - fixedContentBytes;
+  if (fixedFooterAt >= fourdgsMagic.length) {
+    final FourdgsCursor candidate = FourdgsCursor(
+      await source.read(fixedFooterAt, recordHeaderBytes + fixedContentBytes),
+    );
+    final int candidateOpcode = candidate.u8();
+    final int candidateLength = candidate.u64();
+    if (candidateOpcode == opFooter && candidateLength == fixedContentBytes) {
+      return (offset: fixedFooterAt, length: fixedContentBytes);
+    }
+  }
+
   int at = fourdgsMagic.length;
   while (at < magicAt) {
     if (at + recordHeaderBytes > magicAt) {

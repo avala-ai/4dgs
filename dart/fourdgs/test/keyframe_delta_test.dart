@@ -25,6 +25,27 @@ import 'package:test/test.dart';
 
 Uint8List _bytes(String b64) => base64.decode(b64);
 
+FourdgsChunkIndexEntry _copyEntry(
+  FourdgsChunkIndexEntry entry, {
+  int? deltaMode,
+  int? referenceOffset,
+  int? depth,
+}) => FourdgsChunkIndexEntry(
+  t0: entry.t0,
+  t1: entry.t1,
+  chunkOffset: entry.chunkOffset,
+  chunkLength: entry.chunkLength,
+  gaussianCount: entry.gaussianCount,
+  bands: entry.bands,
+  extended: entry.extended,
+  kind: entry.kind,
+  deltaMode: deltaMode ?? entry.deltaMode,
+  referenceOffset: referenceOffset ?? entry.referenceOffset,
+  keyframeOffset: entry.keyframeOffset,
+  depth: depth ?? entry.depth,
+  liveCount: entry.liveCount,
+);
+
 Map<String, Object?> _statesStreamed(String b64) =>
     keyframeDeltaStatesJson(decodeKeyframeDeltaStreamed(_bytes(b64)));
 
@@ -95,6 +116,76 @@ void main() {
       expect(source.largestRead, recordHeaderBytes);
     },
   );
+
+  test(
+    'a ranged chain validates mode, selected reference, and depth',
+    () async {
+      final Uint8List data = _bytes(_movingChained);
+      final decoded = decodeKeyframeDeltaIndexed(data);
+      final FourdgsChunkIndexEntry current = decoded.index.last;
+      final FourdgsChunkIndexEntry prior =
+          decoded.index[decoded.index.length - 2];
+      expect(
+        prior.kind,
+        1,
+        reason: 'the fixture must contain a delta reference',
+      );
+
+      Future<void> refused(
+        FourdgsChunkIndexEntry replacement,
+        String fragment,
+      ) async {
+        final List<FourdgsChunkIndexEntry> index = <FourdgsChunkIndexEntry>[
+          ...decoded.index.take(decoded.index.length - 1),
+          replacement,
+        ];
+        await expectLater(
+          readKeyframeDeltaChain(FourdgsBytes(data), index, replacement),
+          throwsA(
+            isA<FourdgsMalformedFile>().having(
+              (FourdgsMalformedFile error) => error.message,
+              'message',
+              contains(fragment),
+            ),
+          ),
+        );
+      }
+
+      await refused(_copyEntry(current, deltaMode: 9), 'delta_mode 9');
+      await refused(
+        _copyEntry(
+          current,
+          deltaMode: deltaModeKeyframe,
+          referenceOffset: prior.chunkOffset,
+        ),
+        'expected its GOP keyframe',
+      );
+      await refused(
+        _copyEntry(current, depth: current.depth + 1),
+        'selected reference requires',
+      );
+    },
+  );
+
+  test('a ranged delta preserves the parsed reference level', () async {
+    final Uint8List data = Uint8List.fromList(_bytes(_movingChained));
+    final decoded = decodeKeyframeDeltaIndexed(data);
+    final FourdgsChunkIndexEntry current = decoded.index.last;
+    ByteData.sublistView(
+      data,
+    ).setUint32(current.chunkOffset + recordHeaderBytes + 16, 1, Endian.little);
+
+    await expectLater(
+      readKeyframeDeltaChain(FourdgsBytes(data), decoded.index, current),
+      throwsA(
+        isA<FourdgsMalformedFile>().having(
+          (FourdgsMalformedFile error) => error.message,
+          'message',
+          contains('a delta preserves its reference level'),
+        ),
+      ),
+    );
+  });
 
   test('a wrong temporal model is refused on the keyframe-delta path', () {
     // A gaussian-birth file names a different model in its Header. The

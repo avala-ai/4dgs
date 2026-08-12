@@ -436,6 +436,42 @@ void main() {
       );
     });
 
+    test(
+      'errors and refusals share a bounded retained-finding limit',
+      () async {
+        final BytesBuilder extras = BytesBuilder();
+        for (int i = 0; i < 400; i++) {
+          extras.add(_record(0x26, Uint8List(0)));
+        }
+        final FourdgsValidation report = await validateFourdgs(
+          FourdgsBytes(_minimal(extra: extras.toBytes())),
+        );
+        expect(report.ok, isFalse);
+        expect(report.findings.length, lessThanOrEqualTo(257));
+        expect(
+          _messages(report, FourdgsSeverity.error),
+          contains(
+            allOf(
+              contains('additional validation findings omitted'),
+              contains('validation still checked every record'),
+            ),
+          ),
+        );
+      },
+    );
+
+    test('a fixed Footer is found from the tail in bounded reads', () async {
+      final BytesBuilder chunks = BytesBuilder();
+      for (int i = 0; i < 1000; i++) {
+        chunks.add(_record(opChunk, Uint8List(0)));
+      }
+      final _CountingReadable source = _CountingReadable(
+        _minimal(extra: chunks.toBytes()),
+      );
+      await openFourdgsIndexed(source);
+      expect(source.reads, lessThan(10));
+    });
+
     test('reserved provenance opcodes are invalid in version 1', () async {
       final FourdgsValidation report = await validateFourdgs(
         FourdgsBytes(_minimal(extra: _record(0x26, Uint8List(0)))),
@@ -652,6 +688,60 @@ void main() {
         contains(contains('first Summary Offset')),
       );
     });
+
+    test(
+      'every Summary Offset names a nonempty framed summary group',
+      () async {
+        final int summaryStart =
+            fourdgsMagic.length +
+            _record(opHeader, _headerContent()).length +
+            _record(opQuantization, _quantizationContent()).length +
+            _record(opWindowTable, _windowTableContent()).length;
+        final Uint8List index = _record(opChunkIndex, _entryAt(0));
+
+        Future<List<String>> validateRange(
+          int groupStart,
+          int groupLength,
+        ) async {
+          final Uint8List offset = _record(
+            opSummaryOffset,
+            (BytesBuilder()
+                  ..addByte(opChunkIndex)
+                  ..add(_u64(groupStart))
+                  ..add(_u64(groupLength)))
+                .toBytes(),
+          );
+          final Uint8List summary =
+              (BytesBuilder()
+                    ..add(index)
+                    ..add(offset))
+                  .toBytes();
+          final FourdgsValidation report = await validateFourdgs(
+            FourdgsBytes(
+              _minimal(
+                extra: summary,
+                summaryStart: summaryStart,
+                summaryOffsetStart: summaryStart + index.length,
+              ),
+            ),
+          );
+          return _messages(report, FourdgsSeverity.error);
+        }
+
+        expect(
+          await validateRange(0, index.length),
+          contains(contains('declares group_start 0')),
+        );
+        expect(
+          await validateRange(summaryStart, 0),
+          contains(contains('declares group_length 0')),
+        );
+        expect(
+          await validateRange(summaryStart, index.length + 27),
+          contains(contains('outside the Footer summary range')),
+        );
+      },
+    );
 
     test('an earlier Footer cannot hide behind the final Footer', () async {
       final Uint8List footer =
@@ -1225,6 +1315,43 @@ void main() {
       expect(_messages(report, FourdgsSeverity.error), isEmpty);
     });
 
+    test('a Delta Chunk block ends after its death group', () {
+      final Uint8List groups =
+          (BytesBuilder()
+                ..add(_u64(0))
+                ..add(_u64(0))
+                ..add(_u64(0))
+                ..addByte(0xAA))
+              .toBytes();
+      final Uint8List content =
+          (BytesBuilder()
+                ..add(_f64(0.0))
+                ..add(_f64(1.0))
+                ..add(_u32(0))
+                ..addByte(deltaModeKeyframe)
+                ..add(_u64(0))
+                ..add(_u64(0))
+                ..add(_u16(1))
+                ..add(_u32(0))
+                ..add(_u32(0))
+                ..add(_u32(0))
+                ..add(_string(''))
+                ..add(_u64(groups.length))
+                ..add(_u64(groups.length))
+                ..add(groups))
+              .toBytes();
+      expect(
+        () => parseDeltaChunk(content),
+        throwsA(
+          isA<FourdgsMalformedFile>().having(
+            (FourdgsMalformedFile error) => error.message,
+            'message',
+            allOf(contains('1 trailing bytes'), contains('death groups')),
+          ),
+        ),
+      );
+    });
+
     test('each delta group must contain its declared population', () async {
       final FourdgsValidation report = await validateFourdgs(
         FourdgsBytes(
@@ -1424,6 +1551,7 @@ void main() {
         gaussianCount: 1,
         bands: const <FourdgsBandRange>[],
         extended: true,
+        keyframeOffset: 100,
         liveCount: 1,
       );
       final FourdgsChunkIndexEntry delta = FourdgsChunkIndexEntry(
