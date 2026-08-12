@@ -349,8 +349,14 @@ def _pair_with_source(enc, src) -> np.ndarray:
     return pair
 
 
-def check_fidelity(source: str, written: str) -> None:
-    """Hold a written file against the scene it was written from. Raises on any deviation."""
+def check_fidelity(source: str, written: str, gaussians_only_profile: bool = False) -> None:
+    """Hold a written file against the scene it was written from. Raises on any deviation.
+
+    `gaussians_only_profile` is for an authoring surface whose preset writes gaussians and
+    nothing else: clearing the source's `capture` or `objects` profile is then the honest
+    thing to do, because the records that profile promises are not in the file. Clearing it
+    to something *other* than empty is still a changed field and still refused.
+    """
     source_scene = fourdgs.read(source)
     src = source_scene.gaussians
     scene = fourdgs.read(written)
@@ -366,6 +372,8 @@ def check_fidelity(source: str, written: str) -> None:
         "attributes": (dict(source_scene.header.attributes), dict(scene.header.attributes)),
     }
     changed_header = {name: values for name, values in header_fields.items() if values[0] != values[1]}
+    if gaussians_only_profile and changed_header.get("profile", (None, None))[1] == "":
+        changed_header.pop("profile")
     if changed_header:
         raise AssertionError(f"the encoder changed source Header fields: {changed_header}")
     if enc.count != src.count:
@@ -720,7 +728,7 @@ def compare(
 
     # Fidelity first, and on the candidate's own file: a candidate that displaced the scene
     # should be told that, not told that it disagrees with an encoder that did not.
-    check_fidelity(source, cand_out)
+    check_fidelity(source, cand_out, normalize_capture_profile)
     check_index_counts(cand_out)
     if check_chunk_geometry:
         _check_chunk_geometry(cand_out)
@@ -733,17 +741,16 @@ def compare(
         for key in LAYOUT_DEPENDENT_KEYS:
             ref.pop(key, None)
             cand.pop(key, None)
+        # Named against the flattened keys: `flatten` turns `statistics` into
+        # `statistics.aabb` and `statistics.chunkCount`, so reaching for a nested dict
+        # here finds nothing and drops nothing.
         if check_aabb_geometry:
             for summary in (ref, cand):
-                statistics = summary.get("statistics")
-                if statistics is not None:
-                    statistics.pop("aabb", None)
+                summary.pop("statistics.aabb", None)
         if check_chunk_geometry:
             for summary in (ref, cand):
                 summary.pop("chunkIntervals", None)
-                statistics = summary.get("statistics")
-                if statistics is not None:
-                    statistics.pop("chunkCount", None)
+                summary.pop("statistics.chunkCount", None)
         # Dart deliberately clears `capture`: this gaussian-only preset does not promise
         # the source's original Statistics/multi-chunk capture shape. Rust preserves the
         # string even though the layout comparison is already removed. Normalize the two
@@ -758,9 +765,9 @@ def compare(
         if normalize_capture_profile and (ref.get("profile") == "objects" or cand.get("profile") == "objects"):
             for summary in (ref, cand):
                 summary.pop("profile", None)
-                summary.pop("objects", None)
-                summary.pop("states", None)
-                summary.get("sample", {}).pop("objectIds", None)
+                summary.pop("sample.objectIds", None)
+                for key in [k for k in summary if k in ("objects", "states") or k.startswith(("objects.", "states."))]:
+                    summary.pop(key, None)
     differing = [key for key in sorted(set(ref) | set(cand)) if ref.get(key) != cand.get(key)]
     variant = os.path.basename(source).removesuffix(".4dgs")
     notes = {
