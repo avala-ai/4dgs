@@ -42,7 +42,7 @@ public func walk(_ bytes: [UInt8]) throws -> Walk {
 
 /// Walk every record while retaining none of them. `visit` receives each frame and whether it was
 /// intact; the returned `Walk` still carries the counts, the cut and the trailing-magic answer.
-public func walk(_ bytes: [UInt8], visit: (Frame, Bool) -> Void) throws -> Walk {
+public func walk(_ bytes: [UInt8], visit: @escaping (Frame, Bool) -> Void) throws -> Walk {
     try walk(ToolReader(InMemoryReader(bytes)), retaining: { _ in false }, visit: visit)
 }
 
