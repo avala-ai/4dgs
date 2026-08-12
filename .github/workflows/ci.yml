@@ -65,7 +65,7 @@ jobs:
           echo "rust: ${size_kb} KiB"
           [ "$size_kb" -le 1360 ] || { echo "::error::rust is ${size_kb} KiB, over the 1360 KiB budget"; exit 1; }
 
-      - name: TypeScript sources under 896 KB
+      - name: TypeScript sources under 1152 KB
         # Sources only: this job installs nothing and builds nothing, so node_modules
         # and dist are not here to measure. A vendored dependency would show up as a
         # budget failure, which is the point.
@@ -82,14 +82,41 @@ jobs:
         # left — the next file would have tripped it whatever it contained.
         # Raised from 704 to 768 KiB for full keyframe-delta reconstruction: SH composition,
         # streamed-prefix recovery, indexed-chain checks and the hostile-input tests that pin them.
-        # Raised from 768 to 896 KiB for the keyframe-delta encoder: the sequence writer, gate
-        # fixtures and tests land on top of the decoder and measure 872 KiB in a clean checkout.
-        # Keep one coordinated ceiling for the combined package; `du` rounds each file to a
-        # 4 KiB block, so 24 KiB of headroom is six files.
+        # Raised from 704 to 768 KiB for the `4dgs` command-line tool: the record walk,
+        # the structural validator and the tests that drive both. Measured 740 KiB, so
+        # this is not headroom being taken speculatively — 680 against 704 left six
+        # filesystem blocks, and a tool is four files before it does anything. The Rust
+        # budget went 500 -> 600 for exactly this, when its `4dgs` tool became a third
+        # crate; that raise is the precedent this one follows.
+        # Raised from 768 to 832 KiB for the review findings on that tool: the Quantization
+        # record's appended SH bit depths, which core did not parse and so no validator here
+        # could check; the provenance and object-layer records the validator now parses for
+        # the cross-record rules `scene.ts` already enforces; four normative checks (§4 the
+        # Footer is last, §4.2 reserved Header flags, §4.5 the summary's composition, §5.8
+        # an index entry framing a whole record); and the seven tests that pin them. That
+        # measured 768 against 768 — the exact cap, which is the same no-headroom position
+        # 640 was in before the object layer raised it.
+        # Raised from 832 to 896 KiB for validator parity review: streamed live-count
+        # checks, timeline coverage outside the decode gate, Delta Chunk SH validation,
+        # summary/depth diagnostics, and the regressions that pin those rules. The prior
+        # review pass already measured 848 KiB against 832 before these follow-ups.
+        # Raised from 896 to 960 KiB after that same review layer measured 900 KiB in CI,
+        # before its final four bounded-validation fixes. Those fixes add no source file;
+        # the completed layer measures 904 KiB, leaving the usual deliberate headroom.
+        # Raised from 960 to 1024 KiB after the validator layer was restacked onto the
+        # current core: CI measures 988 KiB, still source-only and below the next 64 KiB
+        # boundary. The increase is implementation and regression coverage, not vendoring.
+        # Raised from 1024 to 1152 KiB where this branch met main. Both sides had raised this
+        # same budget for different layers — main 768 -> 896 for the keyframe-delta encoder
+        # (sequence writer, gate fixtures and tests, 872 KiB on their own), this branch
+        # 960 -> 1024 for the validator (988 KiB on its own) — and the higher of the two is
+        # not enough, because the two layers are additive rather than alternative: merged,
+        # they measure 1096 KiB. 1152 is the next 64 KiB step and leaves 56 KiB, which is the
+        # same deliberate headroom the raises above took rather than an exact-size assertion.
         run: |
           size_kb=$(du -s typescript | cut -f1)
           echo "typescript: ${size_kb} KiB"
-          [ "$size_kb" -le 896 ] || { echo "::error::typescript is ${size_kb} KiB, over the 896 KiB budget"; exit 1; }
+          [ "$size_kb" -le 1152 ] || { echo "::error::typescript is ${size_kb} KiB, over the 1152 KiB budget"; exit 1; }
       - name: Dart sources under 1280 KB
         # Sources only, same as TypeScript's and Swift's: this job builds nothing, so
         # .dart_tool and the compiled runners are not here to measure, and a vendored
@@ -130,15 +157,20 @@ jobs:
         # reconstructed-support planning, selective-seek proofs and regressions take a clean
         # tree from the parent's 776 KiB to 864 KiB. The next 64 KiB step leaves 32 KiB of
         # headroom while keeping the budget tied to the feature this layer adds.
-        # Raised from 896 to 1280 KiB by this tool's own review rounds: the validator
+        # Raised from 896 to 960 KiB because main is already over it: #174 landed the Dart
+        # refusal diagnostics after #173 set this number, taking a clean tree to 932, and
+        # `size-budget` has been failing on main since. Not this branch's growth — it adds
+        # no Dart — but every PR that merges main inherits the red job.
+        # Raised from 960 to 1280 KiB by this tool's own review rounds: the validator
         # reads records by range instead of holding the file, the band and chain checks
         # are shared by both temporal models, every physically framed record proves its
         # own structure, and retained findings and index entries carry ceilings. Over
         # half the added source is hostile-input regressions. The earlier spelling of
         # this chain here counted from 768 and 832, which were this branch's guesses at
-        # where main would be; main landed 832 and 896, so the raise is stated from
-        # there. The merged tree measures 1224 KiB, so 1280 is the step that holds it
-        # with the usual headroom rather than as an exact-size assertion.
+        # where main would be; main has since landed 832, 896 and 960, so the raise is
+        # stated from where main actually is. The merged tree measures 1224 KiB, so 1280
+        # is the step that holds it with the usual headroom rather than as an exact-size
+        # assertion.
         run: |
           size_kb=$(du -s dart | cut -f1)
           echo "dart: ${size_kb} KiB"
