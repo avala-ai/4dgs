@@ -50,14 +50,52 @@ void main() {
   test('a narrow support protrusion needs its own quantization guard', () {
     final interval = entry(t0: 0.0, t1: 1.0);
     expect(
-      residentSupportWithinEntry(interval, 0.25, 1.000001, 0.0),
+      residentSupportWithinEntry(
+        interval,
+        0.25,
+        1.000001,
+        0.0,
+        supportHiInclusive: true,
+      ),
       isFalse,
       reason: 'a successful peak probe at 0.5 cannot prove the exposed edge',
     );
     expect(
-      residentSupportWithinEntry(interval, 0.25, 1.000001, 0.000002),
+      residentSupportWithinEntry(
+        interval,
+        0.25,
+        1.000001,
+        0.000002,
+        supportHiInclusive: true,
+      ),
       isTrue,
       reason: 'the row-specific quantization guard excuses only its own slack',
+    );
+  });
+
+  test('resident containment respects the support endpoint kind', () {
+    final interval = entry(t0: 0.0, t1: 1.0);
+    expect(
+      residentSupportWithinEntry(
+        interval,
+        0.25,
+        1.0,
+        0.0,
+        supportHiInclusive: true,
+      ),
+      isFalse,
+      reason: 'a marginal endpoint is visible at the excluded entry end',
+    );
+    expect(
+      residentSupportWithinEntry(
+        interval,
+        0.25,
+        1.0,
+        0.0,
+        supportHiInclusive: false,
+      ),
+      isTrue,
+      reason: 'a validity-window endpoint is itself excluded',
     );
   });
 

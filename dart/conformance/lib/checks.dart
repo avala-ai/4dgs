@@ -266,8 +266,13 @@ bool residentSupportWithinEntry(
   FourdgsChunkIndexEntry entry,
   double supportLo,
   double supportHi,
-  double guard,
-) => supportLo >= entry.t0 - guard && supportHi <= entry.t1 + guard;
+  double guard, {
+  required bool supportHiInclusive,
+}) =>
+    supportLo >= entry.t0 - guard &&
+    (supportHiInclusive
+        ? supportHi < entry.t1 + guard
+        : supportHi <= entry.t1 + guard);
 
 /// A [FourdgsReadable] that records what it transferred, so a claim about byte
 /// ranges can be checked against the bytes that actually moved.
@@ -532,7 +537,16 @@ checkSeekReadsOnlyWhatItNeeds(
           sceneLo < scene.header.durationSec &&
           sceneLo < whole.winHi[row]) {
         final guard = residentGuards[row];
-        if (!residentSupportWithinEntry(entry, sceneLo, sceneHi, guard)) {
+        final sceneHiInclusive =
+            support.hi[row] < whole.winHi[row] &&
+            support.hi[row] < scene.header.durationSec;
+        if (!residentSupportWithinEntry(
+          entry,
+          sceneLo,
+          sceneHi,
+          guard,
+          supportHiInclusive: sceneHiInclusive,
+        )) {
           throw ConformanceFailure(
             'resident gaussian row $row in the chunk at ${entry.chunkOffset} '
             'has scene-clock support [$sceneLo, $sceneHi], '
