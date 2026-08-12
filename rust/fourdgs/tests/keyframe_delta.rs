@@ -502,3 +502,46 @@ fn a_rust_written_multi_window_sequence_round_trips() {
     // quantized against — it would be a test that cannot fail. The grid's dependence on
     // the window is covered directly in `keyframe_delta_file`'s own unit test.
 }
+
+#[test]
+fn a_delta_after_a_nonzero_keyframe_uses_the_serialized_keyframe_bins() {
+    use fourdgs::keyframe_delta_file::{
+        decode_streamed, write_sequence, KeyframeDeltaOptions, Sample,
+    };
+    use fourdgs::model::GaussianSet;
+
+    let gaussian = GaussianSet {
+        positions: vec![0.0, 0.0, 0.0],
+        scales: vec![0.1, 0.1, 0.1],
+        rotations: vec![0.0, 0.0, 0.0, 1.0],
+        colors: vec![0.5, 0.5, 0.5, 1.0],
+        motions: vec![0.0, 0.0, 0.0],
+        mu_t: vec![0.0],
+        sigma_t: vec![0.2],
+        win_lo: vec![0.0],
+        win_hi: vec![4.0],
+        ..Default::default()
+    };
+    let samples: Vec<Sample> = (0..4)
+        .map(|i| Sample {
+            t0: i as f64,
+            ids: vec![7],
+            gaussians: gaussian.clone(),
+        })
+        .collect();
+    let options = KeyframeDeltaOptions {
+        keyframe_every: 2,
+        ..Default::default()
+    };
+
+    let bytes = write_sequence(&samples, 4.0, &options).unwrap();
+    let sequence = decode_streamed(&bytes).unwrap();
+    let mu = |chunk: usize| &sequence.chunks[chunk].state.bins[&op::A_MU_T].values;
+
+    assert_ne!(mu(2), mu(0), "the keyframe at t=2 must restate mu_t at t0");
+    assert_eq!(
+        mu(3),
+        mu(0),
+        "the next delta must return to the sample's mu_t=0 from the serialized keyframe"
+    );
+}

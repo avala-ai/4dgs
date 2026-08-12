@@ -338,3 +338,28 @@ pub fn crc32(data: &[u8]) -> u32 {
     crc.update(data);
     crc.sum()
 }
+
+/// The same checksum, over bytes that arrive in pieces.
+///
+/// `crc32` needs its whole region resident, and the region the summary checksum covers is
+/// named by the file: a Footer can declare `summary_start` as byte 8, and a caller that
+/// sizes one allocation from that has let an untrusted field ask for the file. Feeding
+/// this in bounded blocks computes the same value with a bound the caller chooses, which
+/// is what principle 1 asks of every allocation sized from a value off the wire.
+#[derive(Debug, Default)]
+pub struct Crc32(flate2::Crc);
+
+impl Crc32 {
+    pub fn new() -> Crc32 {
+        Crc32(flate2::Crc::new())
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        self.0.update(data);
+    }
+
+    /// The checksum of everything fed so far.
+    pub fn finish(&self) -> u32 {
+        self.0.sum()
+    }
+}

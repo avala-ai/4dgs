@@ -66,7 +66,7 @@ identical bytes with no per-language slerp or composition order of its own.
 | glTF interop (import, snapshot export)            | Yes    | No         | No      | No      | No      | No      |
 | USD interop (import, snapshot export)             | Yes    | No         | No      | No      | No      | No      |
 | USD animated export (keyframe-delta time samples) | Yes    | No         | No      | No      | No      | No      |
-| Inspect and validate                              | Yes    | Planned    | Planned | Planned | Planned | Planned |
+| Inspect and validate                              | Yes    | Planned    | Yes     | Planned | Planned | Planned |
 
 ¹ On the `gaussian-birth` path. No implementation composes object tracks during `keyframe-delta`
 reconstruction: that path rebuilds base centres and scales from bins and never reads the object
@@ -341,6 +341,16 @@ now exist. The converter's fixtures are PLY frames generated into a temporary di
 seed — the corpus rule applied to a different file format — and the validator is tested against
 files built byte by byte, because a validator tested only on files its own encoder wrote is a
 validator tested against nothing.
+
+**Rust**'s `Yes` on that row is marked from `rust/cli/tests/smoke.rs`, and the assertion that earns
+it is `every_invalid_variant_is_refused_by_its_own_identifier`: each of the seven invalid variants
+must be refused **by the identifier the corpus declares for it**, with the byte it fired at, and the
+expectation is read out of the corpus rather than written into the test. "Both readers raised an
+error" is not the property — a reader that refuses all seven for the wrong reason passes a test that
+only checks the exit code, and that is the failure the invalid corpus exists to catch. The Rust
+validator is also the only one that decodes chunks, so it is the only one that reports the two
+refusals living inside a chunk's streams; the Python validator walks the framing and calls those
+files clean, which is the gap the Python side of the epic closes.
 
 **Rust** decodes and encodes. Its decode rows are filled in from the same suite on the same terms as
 the other two; its encode rows come from the cross-implementation gate described above. Python

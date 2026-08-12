@@ -590,8 +590,25 @@ pub fn read_chunk<R: Readable + ?Sized>(
         let blob = source.read(*offset, *length)?;
         let content = record_content(&blob, op::SH_BAND_STREAM)?;
         let mut cursor = Cursor::new(content);
-        cursor.u8()?; // the band index, already known from the index
+        let physical_band = cursor.u8()?;
+        if !(1..=3).contains(&physical_band) {
+            return Err(Error::Malformed(format!(
+                "the SH Band Stream at byte {offset} declares band {physical_band}; only bands 1 through 3 are defined"
+            )));
+        }
+        if physical_band != *band {
+            return Err(Error::Malformed(format!(
+                "the index labels the SH Band Stream at byte {offset} as band {band}; the record declares band {physical_band}"
+            )));
+        }
         let (_, values) = decode_stream(&mut cursor, Some(head.count as usize))?;
+        let expected_channels = 3 * (2 * physical_band as usize + 1);
+        if values.channels != expected_channels {
+            return Err(Error::Malformed(format!(
+                "the SH Band Stream at byte {offset} for band {physical_band} declares {} channels; band {physical_band} requires {expected_channels}",
+                values.channels
+            )));
+        }
         bands.insert(*band, values);
     }
     decoded.bands = bands;
