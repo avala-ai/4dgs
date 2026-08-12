@@ -31,6 +31,7 @@ import 'package:archive/archive.dart' as archive;
 
 import 'chunk_decoder.dart' show shBandRange;
 import 'exceptions.dart';
+import 'indexed_reader.dart' show maxChunkIndexEntries;
 import 'model.dart';
 import 'opcode.dart';
 import 'quantization.dart';
@@ -76,6 +77,8 @@ class FourdgsWriteOptions {
     this.cutoff = fourdgsDefaultCutoff,
     this.codec = codecDeflate,
     this.level = 6,
+    this.maxDepth = 6,
+    this.minChunkGaussians = 2048,
     this.writeIndex = true,
     this.writeStatistics = false,
     this.writeSummaryOffsets = false,
@@ -99,8 +102,20 @@ class FourdgsWriteOptions {
   /// which is why it is the default everywhere.
   final int codec;
 
-  /// Deflate compression level, 0–9.
+  /// Deflate compression level: `-1` for the codec's own default, or `0`–`9`
+  /// from fastest to smallest. Anything else is refused by name.
   final int level;
+
+  /// Depth of the temporal partition below each window, `0` to `32`. `0` writes
+  /// one chunk per window interval, which is the coarsest partition that is
+  /// still a partition. The ceiling is there because the descent is recursive
+  /// and a gaussian that lives for one instant never stops descending.
+  final int maxDepth;
+
+  /// The population a subdivision has to reach to be worth its own chunk, at
+  /// least `1`. Below it a node hands its gaussians back to its parent, so a
+  /// deep tree over a small scene does not turn into hundreds of chunks of four.
+  final int minChunkGaussians;
 
   final bool writeIndex;
   final bool writeStatistics;
@@ -169,11 +184,7 @@ void writeFourdgsToSink(
       'write deflate, which every reader implements',
     );
   }
-  if (options.level < 0 || options.level > 9) {
-    throw FourdgsInvalidInput(
-      'deflate level is ${options.level}; expected an integer from 0 through 9',
-    );
-  }
+  _checkOptions(options);
   // A profile is a promise about what the file contains, made so a consumer can
   // reject an unsuitable file up front rather than discovering the absence
   // mid-decode. `objects` promises an `object_id` stream in every non-empty
@@ -226,7 +237,34 @@ void writeFourdgsToSink(
   // Window boundaries are the top level of the temporal partition. Anything
   // strictly inside the clip is a split point; the ends are always present.
   final tops = _tops(windows.windows, durationSec);
-  final plans = _planChunks(gaussians, tops, options);
+  final plans = _planChunks(
+    gaussians,
+    tops,
+    options,
+    grid: grid,
+    windows: windows,
+    staticScene: durationSec == 0.0,
+  );
+
+  // The index this partition would produce has to be one this package's own
+  // indexed reader will open. `openFourdgsIndexed` stops at
+  // `maxChunkIndexEntries` — the index has no declared count, so a runaway one
+  // is caught by a ceiling rather than by arithmetic — and the top level of the
+  // tree is the window table, so a scene giving every gaussian its own validity
+  // window produces one entry per window whatever `minChunkGaussians` says. Past
+  // the ceiling the file is still a legal stream, and it is one only the
+  // front-to-back path can read: the seeking path, which is the entire reason to
+  // write an index, refuses it. Saying so here names the count and the ceiling;
+  // `writeIndex: false` writes the same chunks without the claim.
+  if (options.writeIndex && plans.length > maxChunkIndexEntries) {
+    throw FourdgsInvalidInput(
+      'this scene partitions into ${plans.length} chunks, past the '
+      '$maxChunkIndexEntries entries an indexed reader will open — the top '
+      'level of the tree is the window table, so distinct validity windows set '
+      'the floor on the entry count; write fewer windows, or write this scene '
+      'with writeIndex: false',
+    );
+  }
 
   final bands = _bandColumns(gaussians, options.shBands);
 
@@ -252,12 +290,16 @@ void writeFourdgsToSink(
 
   final index = <_IndexEntry>[];
   for (final plan in plans) {
+    // Spatial order is materialized for this one bounded chunk and released
+    // after it is written. The plan retains only a view into one packed i32
+    // assignment table shared by the whole partition.
+    final members = plan.members(gaussians);
     // Quantized columns are bounded by one Chunk. Keeping the whole scene's
     // eleven lanes here would make the sink API retain memory in proportion to
     // output size even though every framed record is released immediately.
     final quantized = _quantize(
       gaussians,
-      plan.members,
+      members,
       grid,
       windows,
       options.cutoff,
@@ -273,35 +315,32 @@ void writeFourdgsToSink(
       plan.t0,
       plan.t1,
       plan.level,
-      plan.members.length,
+      members.length,
       streams.finish(),
     );
     out.bytes(chunk);
 
-    final entryBands = <_IndexBand>[];
+    final List<_IndexBand>? entryBands =
+        options.writeIndex ? <_IndexBand>[] : null;
     for (final band in bands) {
-      final blob = _bandRecord(
-        gaussians,
-        band,
-        plan.members,
-        options,
-        grid.stepSh,
-      );
+      final blob = _bandRecord(gaussians, band, members, options, grid.stepSh);
       final at = out.length;
       out.bytes(blob);
-      entryBands.add(_IndexBand(band.band, at, blob.length));
+      entryBands?.add(_IndexBand(band.band, at, blob.length));
     }
 
-    index.add(
-      _IndexEntry(
-        t0: plan.t0,
-        t1: plan.t1,
-        chunkOffset: chunkOffset,
-        chunkLength: chunk.length,
-        gaussianCount: plan.members.length,
-        bands: entryBands,
-      ),
-    );
+    if (options.writeIndex) {
+      index.add(
+        _IndexEntry(
+          t0: plan.t0,
+          t1: plan.t1,
+          chunkOffset: chunkOffset,
+          chunkLength: chunk.length,
+          gaussianCount: members.length,
+          bands: entryBands!,
+        ),
+      );
+    }
   }
 
   // The summary (spec §4.5): the Chunk Index, then Statistics, then the Summary
@@ -353,6 +392,56 @@ void writeFourdgsToSink(
 // --------------------------------------------------------------------------
 // Input validation
 // --------------------------------------------------------------------------
+
+/// The deepest temporal partition this encoder will build below a window.
+///
+/// Not a taste limit. A window split this far is intervals of nanoseconds even
+/// on a scene measured in days — orders of magnitude below the finest time grid
+/// any quantization profile declares — and a chunk index with `2^32` entries per
+/// window is not a file anybody can read. Past here the depth buys nothing and
+/// costs a stack frame per level.
+const int _maxChunkTreeDepth = 32;
+
+/// The values a caller chose, before any of them is acted on.
+///
+/// Every one of these is a caller's mistake rather than a file's, which is what
+/// [FourdgsInvalidInput] is for, and each message names the value it got and the
+/// range it wanted (AGENTS.md §6). The alternative is what these used to do: an
+/// out-of-range deflate level surfaced as `RangeError` from inside a compression
+/// library, and an out-of-range depth surfaced as `StackOverflowError` from
+/// inside the chunk planner — two diagnoses that name neither the option nor the
+/// caller who set it.
+void _checkOptions(FourdgsWriteOptions options) {
+  if (options.level < -1 || options.level > 9) {
+    throw FourdgsInvalidInput(
+      'deflate level is ${options.level}; the levels are -1 for the codec\'s '
+      'own default and 0 to 9 from fastest to smallest',
+    );
+  }
+  // The descent below a window is one stack frame per level, and a gaussian
+  // whose support is a single instant never straddles a midpoint, so it never
+  // stops descending: with `minChunkGaussians: 1` a large depth is a
+  // `StackOverflowError` rather than a file or a diagnosis.
+  if (options.maxDepth < 0 || options.maxDepth > _maxChunkTreeDepth) {
+    throw FourdgsInvalidInput(
+      'max_depth is ${options.maxDepth}; the temporal partition runs from 0 '
+      'levels below each window interval to $_maxChunkTreeDepth',
+    );
+  }
+  if (options.minChunkGaussians < 1) {
+    throw FourdgsInvalidInput(
+      'min_chunk_gaussians is ${options.minChunkGaussians}; a chunk holds at '
+      'least one gaussian, so the population that earns a subdivision its own '
+      'chunk is at least 1',
+    );
+  }
+  if (options.shBands < 0) {
+    throw FourdgsInvalidInput(
+      'sh_bands is ${options.shBands}; the highest band to write is 0 for none '
+      'or a positive band number, capped further by the scene\'s own degree',
+    );
+  }
+}
 
 /// Per-gaussian lanes that land on a grid, so a non-finite value in one either
 /// sets a non-finite grid parameter or rounds to a meaningless bin.
@@ -1093,32 +1182,396 @@ int _binRotation(double v, int gaussian) {
 // Chunk planning
 // --------------------------------------------------------------------------
 
-/// One chunk: its interval, its depth in the temporal tree, and its members.
+/// One chunk: interval metadata plus a view into one packed assignment table.
 class _Plan {
-  _Plan(this.t0, this.t1, this.level, this.members);
+  _Plan(this.t0, this.t1, this.level, this._packed, this.start, this.end);
 
   final double t0;
   final double t1;
   final int level;
-  final List<int> members;
+  final Int32List _packed;
+  final int start;
+  final int end;
+
+  List<int> members(FourdgsGaussianSet g) =>
+      _mortonOrder(g, Int32List.sublistView(_packed, start, end));
 }
 
-/// Bounded spatial chunks spanning the whole partitioned timeline.
+/// Assign gaussians to the nodes of a temporal interval tree.
 ///
-/// Temporal splitting is issue #117, so a seek still reads every one of these
-/// overlapping entries. The fixed population cap exists for the sink contract:
-/// one record's streams and framing copy are bounded independently of scene
-/// size, and each member list is released before the next one is made.
-Iterable<_Plan> _planChunks(
+/// A gaussian goes in the deepest node whose interval fully contains its
+/// support, so it is stored exactly once however long it lives, and a reader
+/// that wants one instant fetches the nodes covering it instead of the scene.
+///
+/// The top level is the window table rather than a power-of-two split of the
+/// whole timeline, and that is the part worth stating: gaussians fitted over one
+/// window straddle the boundaries of an even split, so every one of them would
+/// be pushed up to the root and the tree would have one node in it.
+List<_Plan> _planChunks(
   FourdgsGaussianSet g,
   List<double> tops,
-  FourdgsWriteOptions options,
-) sync* {
-  for (int start = 0; start < g.count; start += _maxGaussiansPerChunk) {
-    final end = math.min(start + _maxGaussiansPerChunk, g.count);
-    final members = <int>[for (int i = start; i < end; i++) i];
-    yield _Plan(tops.first, tops.last, 0, _mortonOrder(g, members));
+  FourdgsWriteOptions options, {
+  required _Grid grid,
+  required _WindowTable windows,
+  required bool staticScene,
+}) {
+  final n = g.count;
+  if (n == 0) return const <_Plan>[];
+
+  // Partition the state the file will reconstruct, not the authored values on
+  // the near side of quantization. A mu_t or sigma_t bin may move a support edge
+  // across a tree boundary. Filing by the authored edge then lets the streamed
+  // reader see a gaussian at an instant whose indexed seek does not fetch its
+  // chunk. This bounded pass repeats only those two scalar grids and narrows
+  // them to float32 exactly where the public decoder does.
+  final support = _reconstructedSupport(g, grid, windows, options.cutoff);
+  final lo = support.lo;
+  final hi = support.hi;
+  tops = _finiteTailTops(tops, lo, hi);
+
+  final assigned = Int32List(n)..fillRange(0, n, -1);
+  final nodes = <_Node>[];
+
+  /// Push the half-open range [start, end) of [pool] down the tree in place.
+  ///
+  /// Each level partitions that same typed array into left, staying and right
+  /// ranges. A single-branch scene therefore retains one scene-sized assignment
+  /// table at depth 32, not another growable reference array at every frame.
+  void descend(
+    double a,
+    double b,
+    int level,
+    Int32List pool,
+    int start,
+    int end,
+  ) {
+    if (start == end) return;
+    // `[0, 1e-9)` is only the seekable representation of the single instant in
+    // a duration-zero asset. Subdividing that artificial span can put every
+    // populated leaf strictly after t=0, which the indexed reader correctly
+    // refuses because no scene-clock instant selects it.
+    if (staticScene || level >= options.maxDepth) {
+      nodes.add(_Node(a, b, level));
+      final node = nodes.length - 1;
+      for (int at = start; at < end; at++) {
+        assigned[pool[at]] = node;
+      }
+      return;
+    }
+    final mid = 0.5 * (a + b);
+    // An interval can run out of doubles before it runs out of depth. Adjacent
+    // `float32` window bounds near 1.0 are about 1.2e-7 apart and collapse after
+    // roughly twenty-nine bisections, well inside the depth ceiling of 32 — and
+    // once `mid == a`, a gaussian whose support is a single instant at `a` goes
+    // left at every remaining level and comes to rest in a node spanning
+    // `[a, a)`. That chunk is nonempty over a zero-width interval: the seek rule
+    // is half-open, so nothing can ever select it, and `FourdgsChunkIndexEntry`
+    // in this same package refuses to parse it. A node that cannot be halved is
+    // a leaf, which is the answer whatever the depth limit says.
+    if (!(mid > a && mid < b)) {
+      nodes.add(_Node(a, b, level));
+      final node = nodes.length - 1;
+      for (int at = start; at < end; at++) {
+        assigned[pool[at]] = node;
+      }
+      return;
+    }
+
+    // Dutch-national-flag partition: [start, leftEnd) goes left,
+    // [leftEnd, rightStart) stays here, and [rightStart, end) goes right.
+    int leftEnd = start;
+    int at = start;
+    int rightStart = end;
+    while (at < rightStart) {
+      final i = pool[at];
+      // The marginal is visible at exactly its support edge, while the left
+      // child's interval excludes `mid`. It can descend left on equality only
+      // when its verbatim validity window also ends there, making the gaussian
+      // absent at that half-open endpoint.
+      if (hi[i] < mid || (hi[i] == mid && g.winHi[i] <= mid)) {
+        final swap = pool[leftEnd];
+        pool[leftEnd] = i;
+        pool[at] = swap;
+        leftEnd++;
+        at++;
+      } else if (lo[i] >= mid) {
+        rightStart--;
+        pool[at] = pool[rightStart];
+        pool[rightStart] = i;
+      } else {
+        at++;
+      }
+    }
+
+    final leftCount = leftEnd - start;
+    final rightCount = end - rightStart;
+    final keepLeft = leftCount > 0 && leftCount < options.minChunkGaussians;
+    final keepRight = rightCount > 0 && rightCount < options.minChunkGaussians;
+    if (!keepLeft) {
+      descend(a, mid, level + 1, pool, start, leftEnd);
+    }
+    if (!keepRight) {
+      descend(mid, b, level + 1, pool, rightStart, end);
+    }
+
+    // Children below the population threshold stay in this node alongside
+    // supports that straddle the split.
+    final staying = rightStart - leftEnd;
+    if (staying == 0 && !keepLeft && !keepRight) return;
+    nodes.add(_Node(a, b, level));
+    final node = nodes.length - 1;
+    if (keepLeft) {
+      for (int p = start; p < leftEnd; p++) {
+        assigned[pool[p]] = node;
+      }
+    }
+    for (int p = leftEnd; p < rightStart; p++) {
+      assigned[pool[p]] = node;
+    }
+    if (keepRight) {
+      for (int p = rightStart; p < end; p++) {
+        assigned[pool[p]] = node;
+      }
+    }
   }
+
+  // Which window interval each gaussian belongs to, decided in one pass over
+  // the scene rather than by asking every interval about every gaussian.
+  //
+  // The scan this replaces was quadratic the moment a scene gives its gaussians
+  // their own validity windows: every distinct window puts its endpoints in
+  // `tops`, so the interval count and the gaussian count grow together and this
+  // module's promise that "nothing here is quadratic in the gaussian count"
+  // stopped being true — 128k gaussians took half a minute to plan.
+  //
+  // The answer is the same one. A gaussian went to the first interval that
+  // contained its whole support, because the intervals were visited in order
+  // and an assigned gaussian was skipped by every later one; `tops` ascends, so
+  // that interval can be found by two binary searches instead of a scan. Members
+  // are appended in ascending `i`, which is the order the comprehension built
+  // them in.
+  final intervalCounts = Int32List(tops.length - 1);
+  for (int i = 0; i < n; i++) {
+    final w = _firstContainingInterval(tops, lo[i], hi[i], g.winHi[i]);
+    assigned[i] = w;
+    if (w >= 0) intervalCounts[w]++;
+  }
+  final intervalOffsets = Int32List(intervalCounts.length + 1);
+  for (int w = 0; w < intervalCounts.length; w++) {
+    intervalOffsets[w + 1] = intervalOffsets[w] + intervalCounts[w];
+  }
+  Int32List? intervalMembers = Int32List(intervalOffsets.last);
+  final intervalCursor = Int32List.fromList(intervalOffsets);
+  for (int i = 0; i < n; i++) {
+    final w = assigned[i];
+    if (w >= 0) intervalMembers[intervalCursor[w]++] = i;
+  }
+  assigned.fillRange(0, n, -1);
+
+  for (int w = 0; w + 1 < tops.length; w++) {
+    final a = tops[w];
+    final b = tops[w + 1];
+    descend(
+      a,
+      b,
+      0,
+      intervalMembers,
+      intervalOffsets[w],
+      intervalOffsets[w + 1],
+    );
+  }
+  intervalMembers = null;
+
+  // Whatever no window interval contained — a gaussian whose support crosses a
+  // window boundary, or one clipped by nothing at all. It belongs to the root,
+  // which spans the whole partitioned timeline.
+  if (assigned.any((node) => node < 0)) {
+    nodes.add(_Node(tops.first, tops.last, -1));
+    final root = nodes.length - 1;
+    for (int i = 0; i < n; i++) {
+      if (assigned[i] < 0) assigned[i] = root;
+    }
+  }
+
+  // Pack the assignment once. Plans below retain only offsets into this i32
+  // table, not one growable object list per node and then a second Morton-
+  // ordered copy per bounded chunk.
+  final nodeCounts = Int32List(nodes.length);
+  for (int i = 0; i < n; i++) {
+    nodeCounts[assigned[i]]++;
+  }
+  final nodeOffsets = Int32List(nodes.length + 1);
+  for (int node = 0; node < nodes.length; node++) {
+    nodeOffsets[node + 1] = nodeOffsets[node] + nodeCounts[node];
+  }
+  final packed = Int32List(n);
+  final nodeCursor = Int32List.fromList(nodeOffsets);
+  for (int i = 0; i < n; i++) {
+    final node = assigned[i];
+    packed[nodeCursor[node]++] = i;
+  }
+
+  final nodeOrder = <int>[for (int node = 0; node < nodes.length; node++) node]
+    ..sort((a, b) {
+      final left = nodes[a];
+      final right = nodes[b];
+      return left.level != right.level
+          ? left.level - right.level
+          : left.t0.compareTo(right.t0);
+    });
+  final plans = <_Plan>[];
+  for (final node in nodeOrder) {
+    final first = nodeOffsets[node];
+    final stop = nodeOffsets[node + 1];
+    for (int start = first; start < stop; start += _maxGaussiansPerChunk) {
+      final end = math.min(start + _maxGaussiansPerChunk, stop);
+      plans.add(
+        _Plan(
+          nodes[node].t0,
+          nodes[node].t1,
+          math.max(nodes[node].level, 0),
+          packed,
+          start,
+          end,
+        ),
+      );
+    }
+  }
+  return plans;
+}
+
+/// Per-gaussian support after the exact sigma and birth-time reconstruction a
+/// reader performs.
+///
+/// The returned pair is the planner's two scene-sized typed arrays. Everything
+/// else is scalar or the two-float narrowing scratch, so quantization does not
+/// add another retained lane to the writer's bounded-memory partition.
+({Float64List lo, Float64List hi}) _reconstructedSupport(
+  FourdgsGaussianSet g,
+  _Grid grid,
+  _WindowTable table,
+  double cutoff,
+) {
+  final lo = Float64List(g.count);
+  final hi = Float64List(g.count);
+  final narrowed = Float32List(2);
+  final k = supportK(cutoff);
+
+  for (int i = 0; i < g.count; i++) {
+    final neverFades = !g.sigmaT[i].isFinite;
+    final sigmaBin =
+        neverFades
+            ? 0
+            : _bin(
+              math.log(g.sigmaT[i] == 0.0 ? 1e-30 : g.sigmaT[i]) /
+                  grid.stepSigmaLog,
+              'sigma_t',
+              i,
+            );
+    narrowed[0] =
+        neverFades ? double.infinity : math.exp(sigmaBin * grid.stepSigmaLog);
+    final sigma = narrowed[0];
+    final step = muStep(sigmaBin, grid.stepSigmaLog, neverFades, grid.stepTime);
+    final muBin = _bin(g.muT[i] / step, 'mu_t', i);
+    narrowed[1] = muBin * step;
+    final mu = narrowed[1];
+
+    final window = table.windows[table.rank(g.winLo[i], g.winHi[i])];
+    final half = sigma.isFinite ? k * math.max(sigma, 1e-30) : double.infinity;
+    lo[i] = math.max(mu - half, window[0]);
+    hi[i] = math.min(mu + half, window[1]);
+  }
+  return (lo: lo, hi: hi);
+}
+
+/// Give an open-ended final window a finite prefix the tree can bisect.
+///
+/// `0.5 * (finite + infinity)` is infinity, so without this boundary an
+/// otherwise finite population in `[a, +inf)` can never descend. The boundary
+/// sits strictly after the last finite support edge: chunk intervals are
+/// half-open while the marginal remains visible at its support endpoint.
+List<double> _finiteTailTops(
+  List<double> tops,
+  Float64List supportLo,
+  Float64List supportHi,
+) {
+  if (tops.length < 2 || tops.last.isFinite) return tops;
+  final start = tops[tops.length - 2];
+  double lastFinite = start;
+  bool haveFinite = false;
+  for (int i = 0; i < supportHi.length; i++) {
+    if (supportLo[i] < start || !supportHi[i].isFinite) continue;
+    haveFinite = true;
+    if (supportHi[i] > lastFinite) lastFinite = supportHi[i];
+  }
+  if (!haveFinite) return tops;
+  final padding = math.max(1e-9, lastFinite.abs() * 1e-12);
+  final boundary = lastFinite + padding;
+  if (!boundary.isFinite || !(boundary > lastFinite)) return tops;
+  return <double>[...tops.take(tops.length - 1), boundary, tops.last];
+}
+
+/// The first interval of [tops] whose span contains the whole support
+/// `[lo, hi]`, or `-1` when no interval does.
+///
+/// [tops] ascends, which is what makes two binary searches equivalent to the
+/// scan: the intervals whose start clears `lo` are a prefix of it, and those
+/// whose end covers `hi` are a suffix, so the first interval that does both is
+/// where the suffix begins — if it begins inside the prefix at all.
+///
+/// Containment is exact. A tolerance here can file support ending just beyond
+/// `b` into `[a, b)`, after which a seek at `b` omits a gaussian the streamed
+/// path still sees. The support endpoint itself is inclusive unless the
+/// gaussian's validity window ends there, which [windowHi] distinguishes.
+int _firstContainingInterval(
+  List<double> tops,
+  double lo,
+  double hi,
+  double windowHi,
+) {
+  // The last interval whose start clears `lo`.
+  int last = -1;
+  int low = 0;
+  int high = tops.length - 2;
+  while (low <= high) {
+    final mid = (low + high) >> 1;
+    if (lo >= tops[mid]) {
+      last = mid;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  if (last < 0) return -1;
+
+  // The first interval whose end covers `hi`, looked for only among those, so
+  // that "the suffix starts past the prefix" comes back as no interval at all.
+  int first = -1;
+  low = 0;
+  high = last;
+  while (low <= high) {
+    final mid = (low + high) >> 1;
+    final end = tops[mid + 1];
+    // A marginal includes its support endpoint. Equality fits a half-open
+    // interval only when the verbatim validity window also ends there, making
+    // the gaussian absent at the interval's excluded endpoint.
+    if (hi < end || (hi == end && windowHi <= end)) {
+      first = mid;
+      high = mid - 1;
+    } else {
+      low = mid + 1;
+    }
+  }
+  return first;
+}
+
+/// One node of the interval tree: its span and its depth below the window level.
+class _Node {
+  const _Node(this.t0, this.t1, this.level);
+
+  final double t0;
+  final double t1;
+  final int level;
 }
 
 /// Reorder a chunk's members for spatial locality, by Morton code over their own

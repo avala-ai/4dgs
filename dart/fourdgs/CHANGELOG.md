@@ -20,6 +20,30 @@ happened.
   attribute streams, spherical-harmonic band records, and Footer. A second encoder rather than a
   binding — it shares no code with the other five SDKs and lands on the same integer bins, so a
   decoder cannot tell its output from theirs once decoded.
+- Chunked encode. The timeline is partitioned into an interval tree whose top level is the window
+  table rather than an even split — gaussians fitted over one window straddle the boundaries of an
+  even split, so all of them would be pushed to the root and the tree would have one node in it. A
+  gaussian goes in the deepest node whose interval fully contains its support, so it is stored
+  exactly once however long it lives, and a reader that wants one instant fetches the nodes covering
+  it instead of the scene. `maxDepth` and `minChunkGaussians` control the shape; a node too small to
+  be worth its own chunk hands its gaussians back to its parent. A node whose midpoint has run out
+  of doubles — an interval can exhaust `double` before it exhausts the depth limit — is a leaf,
+  because the alternative is a nonempty chunk over a zero-width interval that no seek can ever
+  select. And a partition finer than the `262144` entries an indexed reader will open is refused by
+  name rather than written: the top level is the window table, so a scene giving every gaussian its
+  own validity window sets the floor on the entry count, and the resulting file would be one only
+  the streamed path could read.
+- The Dart indexed conformance runner now makes a **selective** seek on every variant it decodes,
+  not only a whole-scene assembly. For probe instants away from a chunk boundary it reads just the
+  entries whose interval covers the instant and requires the state they reconstruct to equal the
+  state the whole scene gives. This is the claim the canonical summary cannot make: a gaussian filed
+  in the wrong chunk still appears in a whole-scene summary, at the same values, with both read
+  paths agreeing — and is simply missing from a seek. The guard around a boundary is derived from
+  the file's own declared pitches, and the number of probes that ran is asserted, so a guard that
+  swallowed every instant is a failure rather than a green check that never executed. Planning costs
+  `O(n log n)` in the gaussian count and not `O(n²)`: a scene that gives every gaussian its own
+  validity window has as many top-level intervals as gaussians, and each gaussian finds its interval
+  by binary search over the split points rather than by every interval being offered every gaussian.
 - Summary writing, in the shape spec §4.5 requires: the Chunk Index, then Statistics, then the
   Summary Offset, one contiguous run immediately before the Footer with nothing else inside it. That
   contiguity is what lets a streamed reader verify `summary_crc` by retaining the trailing records
@@ -36,6 +60,14 @@ happened.
   An inverted window is refused rather than written because visibility is gated on `lo <= t < hi`:
   it would cover no instant, and this package's own reader refuses the record carrying it, so
   writing one produces a file neither read path can reopen.
+- Every option has a range and is checked against it before anything acts on it: `level` is `-1` or
+  `0`–`9`, `maxDepth` is `0`–`32`, `minChunkGaussians` is at least `1`, `shBands` is not negative.
+  Each is a `FourdgsInvalidInput` naming the option, the value and the range, because the
+  alternative is what these did before — an out-of-range deflate level surfacing as a `RangeError`
+  from inside a compression package, and an unbounded `maxDepth` surfacing as a `StackOverflowError`
+  from inside the chunk planner, where a gaussian that lives for a single instant never straddles a
+  midpoint and so never stops descending. Neither names the option or the caller who set it, and
+  neither is catchable as one of this library's own exceptions.
 - Three lanes that a domain repair would otherwise change silently are refused instead: an rgb or
 - Three lanes that a domain repair would otherwise change silently are refused instead: an rgb or
   opacity component outside `[0, 1]`, which `decodeChunk` clamps back into the range, so a channel
@@ -78,20 +110,20 @@ happened.
   a reader as 0, the extreme positive coefficient read as the extreme negative one.
 - Deterministic: two encodes of one scene are byte-identical, including the Header's attribute map,
   whose keys are sorted rather than emitted in whatever order the caller's map iterates.
-- Proved by `dart/encode-roundtrip.sh`, which re-encodes all 46 corpus variants and makes two
-  separate claims about each result. **Fidelity**: the written scene is compared against the scene
-  it was written from, by the Python reference reader, attribute by attribute, against the error
-  bounds the written file itself declares — including the per-gaussian velocity and birth-time
-  pitches, derived the way a decoder derives them, and the presence, degree and shape of the
-  spherical harmonics, which are checked before any coefficient is compared because an encoder that
-  emitted none at all would otherwise skip the comparison entirely. The object-bearing case also
-  pairs and compares both exact source identity lanes. **Agreement**: the Dart, Python and Rust
-  decoders must produce identical canonical JSON from the result, on both read paths each — six
-  readers, three implementations. Neither claim implies the other. Decoders reading one file the
-  same way say nothing about whether that file is the scene that went in, and an encoder checked
-  only by its own decoder proves that two halves of one implementation share an opinion. Every
-  reader is required: a missing one is an error rather than a reader quietly dropped from the
-  comparison. It runs in the conformance workflow.
+- Proved by `dart/encode-roundtrip.sh`, which re-encodes all 46 corpus variants — into as many as 42
+  chunks each — and makes two separate claims about each result. **Fidelity**: the written scene is
+  compared against the scene it was written from, by the Python reference reader, attribute by
+  attribute, against the error bounds the written file itself declares — including the per-gaussian
+  velocity and birth-time pitches, derived the way a decoder derives them, and the presence, degree
+  and shape of the spherical harmonics, which are checked before any coefficient is compared because
+  an encoder that emitted none at all would otherwise skip the comparison entirely. The
+  object-bearing case also pairs and compares both exact source identity lanes. **Agreement**: the
+  Dart, Python and Rust decoders must produce identical canonical JSON from the result, on both read
+  paths each — six readers, three implementations. Neither claim implies the other. Decoders reading
+  one file the same way say nothing about whether that file is the scene that went in, and an
+  encoder checked only by its own decoder proves that two halves of one implementation share an
+  opinion. Every reader is required: a missing one is an error rather than a reader quietly dropped
+  from the comparison. It runs in the conformance workflow.
 
 ### Hostile-input hardening
 

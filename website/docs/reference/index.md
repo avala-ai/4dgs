@@ -59,7 +59,7 @@ composition order of its own.
 | Refusal diagnosis (named, not merely refused)     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Private-range records                             | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Encode                                            | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Chunked encode                                    | Yes    | Yes        | Yes     | Yes     | Yes     | Planned |
+| Chunked encode                                    | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Summary writing                                   | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Convert from PLY frame sequences                  | Yes    | No         | No      | No      | No      | No      |
 | glTF interop (import, snapshot export)            | Yes    | No         | No      | No      | No      | No      |
@@ -308,8 +308,9 @@ with the Dart writer and then requires the **Dart and Python decoders to produce
 JSON** from the result, on both read paths in each language, asserting byte-identical output across
 two encodes on the way. Both paths, because they fail differently: the streamed one never looks at
 the index, so a file with a wrong summary offset or a wrong chunk range still decodes there and only
-the indexed one notices. That is what carries **Encode** and **Summary writing**; **Chunked encode**
-is a separate claim and stays `Planned` until the Dart writer partitions a timeline.
+the indexed one notices. **Chunked encode** rides the same gate: the writer partitions each scene
+into the same interval tree the reference builds — up to 42 chunks on the ten-window variants — so
+every one of those decodes is a seek across a multi-chunk file rather than a read of a single one.
 
 TypeScript, C++ and Swift are proved by the cross-language encode gate,
 `tests/conformance/encode_roundtrip.py`. It re-encodes every variant's decoded gaussians twice —

@@ -81,6 +81,8 @@ String run(String input, String output) {
     scene.header.durationSec,
     options: FourdgsWriteOptions(
       cutoff: scene.header.cutoff,
+      maxDepth: 4,
+      minChunkGaussians: 8,
       writeIndex: true,
       writeStatistics: true,
       writeSummaryOffsets: true,
@@ -100,6 +102,8 @@ String run(String input, String output) {
     scene.header.durationSec,
     options: FourdgsWriteOptions(
       cutoff: scene.header.cutoff,
+      maxDepth: 4,
+      minChunkGaussians: 8,
       writeIndex: true,
       writeStatistics: true,
       writeSummaryOffsets: true,

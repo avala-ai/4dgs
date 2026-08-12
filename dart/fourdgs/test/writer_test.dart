@@ -192,7 +192,7 @@ void main() {
     });
 
     test('invalid deflate levels are authoring errors', () {
-      for (final level in const <int>[-1, 10]) {
+      for (final level in const <int>[-2, 10]) {
         expect(
           () => writeFourdgsBytes(
             buildScene(),
@@ -203,7 +203,7 @@ void main() {
             isA<FourdgsInvalidInput>().having(
               (FourdgsInvalidInput e) => e.message,
               'message',
-              allOf(contains('deflate level'), contains('0 through 9')),
+              allOf(contains('deflate level'), contains('0 to 9')),
             ),
           ),
         );
@@ -849,6 +849,26 @@ void main() {
       expect(decoded.chunkIndex.single.t1, 1e-9);
     });
 
+    test(
+      'a populated static interval is never subdivided away from t=0',
+      () async {
+        final scene = flatScene(128, winHi: 1e-9);
+        scene
+          ..muT.fillRange(0, scene.count, 7.5e-10)
+          ..sigmaT.fillRange(0, scene.count, 0.0);
+        final bytes = writeFourdgsBytes(
+          scene,
+          0.0,
+          options: const FourdgsWriteOptions(maxDepth: 4, minChunkGaussians: 8),
+        );
+        final indexed = await openFourdgsIndexed(FourdgsBytes(bytes));
+
+        expect(indexed.index, hasLength(1));
+        expect(indexed.index.single.t0, 0.0);
+        expect(indexed.index.single.gaussianCount, scene.count);
+      },
+    );
+
     test('a large scene is split before a Chunk buffer can grow with it', () {
       final scene = flatScene(16385);
       final decoded = readFourdgsBytes(writeFourdgsBytes(scene, 1.0));
@@ -864,6 +884,409 @@ void main() {
         ),
         scene.count,
       );
+    });
+  });
+
+  group('the chunk tree', () {
+    // The chunking preset the cross-language encode gate uses: small enough that a
+    // few hundred gaussians exercise the tree rather than landing in one node.
+    const chunked = FourdgsWriteOptions(
+      maxDepth: 4,
+      minChunkGaussians: 8,
+      writeStatistics: true,
+      writeSummaryOffsets: true,
+    );
+
+    // NOT a proof of the unsplittable-midpoint guard in `descend`. It was
+    // written to be one — two adjacent float32 window bounds, a gaussian whose
+    // support is the single instant at the upper end, `maxDepth: 32` — on the
+    // reasoning that bisecting a 1.19e-7 interval collapses `mid` onto an
+    // endpoint after about twenty-nine halvings and the gaussian then comes to
+    // rest in a node spanning `[b, b)`. Removing the guard leaves this test
+    // green, so whatever this scene does, it does not reach that path, and the
+    // guard is unproven defence in depth rather than a pinned fix. What the test
+    // does earn: a partition over an interval this narrow still produces a file
+    // both read paths accept, and no nonempty chunk over a zero-width interval.
+    test(
+      'a window narrower than the depth limit still writes a readable file',
+      () {
+        final lo = Float32List.fromList(<double>[1.0])[0];
+        final hi = Float32List.fromList(<double>[1.0000001])[0];
+        expect(hi, greaterThan(lo), reason: 'the two bounds must differ');
+        expect(
+          (hi - lo) / lo,
+          lessThan(2e-7),
+          reason: 'and be adjacent float32 values, or nothing collapses',
+        );
+
+        const count = 4;
+        final scene = FourdgsGaussianSet(
+          positions: Float32List(count * 3),
+          scales: Float32List(count * 3)..fillRange(0, count * 3, 1e-3),
+          rotations: Float32List.fromList(<double>[
+            for (int i = 0; i < count; i++) ...<double>[0.0, 0.0, 0.0, 1.0],
+          ]),
+          colors: Float32List(count * 4),
+          motions: Float32List(count * 3),
+          // Support is the single instant `hi`: `sigma_t = 0` widens it by
+          // nothing, and the validity window clips it to itself. The preceding
+          // interval `[0, lo]` does not contain it, so it lands in the narrow one.
+          muT: Float32List(count)..fillRange(0, count, hi),
+          sigmaT: Float32List(count),
+          winLo: Float32List(count)..fillRange(0, count, lo),
+          winHi: Float32List(count)..fillRange(0, count, hi),
+        );
+
+        final bytes = writeFourdgsBytes(
+          scene,
+          2.0,
+          options: const FourdgsWriteOptions(
+            maxDepth: 32,
+            minChunkGaussians: 1,
+          ),
+        );
+        // The file has to be readable at all, which is the finding: the index
+        // parser refuses a nonempty entry over a zero-width interval.
+        final decoded = readFourdgsBytes(bytes);
+        expect(decoded.gaussians.count, count);
+        for (final entry in decoded.chunkIndex) {
+          if (entry.gaussianCount == 0) continue;
+          expect(
+            entry.t1,
+            greaterThan(entry.t0),
+            reason:
+                'a nonempty chunk over [${entry.t0}, ${entry.t1}) is '
+                'unreachable by any seek',
+          );
+        }
+      },
+    );
+
+    test('a partitioned timeline produces more than one chunk', () {
+      final scene = buildScene(count: 512, windows: 8);
+      final decoded = readFourdgsBytes(
+        writeFourdgsBytes(scene, 8.0, options: chunked),
+      );
+      expect(decoded.chunkIndex.length, greaterThan(1));
+      expect(decoded.statistics!.chunkCount, decoded.chunkIndex.length);
+    });
+
+    test('a support ending at a midpoint remains reachable there', () async {
+      final scene = flatScene(1, winHi: 8.0);
+      scene.muT[0] = 4.0;
+      scene.sigmaT[0] = 0.0;
+      final bytes = writeFourdgsBytes(
+        scene,
+        8.0,
+        options: const FourdgsWriteOptions(maxDepth: 1, minChunkGaussians: 1),
+      );
+      final indexed = await openFourdgsIndexed(FourdgsBytes(bytes));
+      final covering = indexed.index.where(
+        (FourdgsChunkIndexEntry entry) => entry.t0 <= 4.0 && 4.0 < entry.t1,
+      );
+      int visible = 0;
+      for (final entry in covering) {
+        final chunk = await readFourdgsChunk(
+          FourdgsBytes(bytes),
+          indexed,
+          entry,
+        );
+        visible +=
+            assembleGaussians(<FourdgsDecodedChunk>[
+              chunk,
+            ], 0).stateAt(4.0, cutoff: indexed.header.cutoff).count;
+      }
+      expect(visible, 1);
+    });
+
+    test('sub-nanosecond support beyond an interval stays reachable', () async {
+      const boundary = 1e-6;
+      final scene = flatScene(2, winHi: 1.0);
+      scene.sigmaT.fillRange(0, scene.count, double.infinity);
+      scene.winHi[0] = boundary;
+      scene.winHi[1] = boundary + 5e-10;
+      final bytes = writeFourdgsBytes(
+        scene,
+        1.0,
+        options: const FourdgsWriteOptions(maxDepth: 0, minChunkGaussians: 1),
+      );
+      final indexed = await openFourdgsIndexed(FourdgsBytes(bytes));
+      final chunks = <FourdgsDecodedChunk>[];
+      for (final entry in indexed.index) {
+        if (entry.t0 <= boundary && boundary < entry.t1) {
+          chunks.add(
+            await readFourdgsChunk(FourdgsBytes(bytes), indexed, entry),
+          );
+        }
+      }
+      expect(
+        assembleGaussians(
+          chunks,
+          0,
+        ).stateAt(boundary, cutoff: indexed.header.cutoff).count,
+        1,
+      );
+    });
+
+    test(
+      'planning uses the same minimum sigma as state reconstruction',
+      () async {
+        final scene = flatScene(2, winHi: 1.0);
+        scene.sigmaT[0] = 1e-35;
+        scene.muT[0] = 0.0;
+        // This second validity window introduces a split between the authored
+        // sigma edge and stateAt's 1e-30 effective-sigma edge.
+        scene.sigmaT[1] = double.infinity;
+        scene.winHi[1] = 1e-31;
+        final bytes = writeFourdgsBytes(
+          scene,
+          1.0,
+          options: const FourdgsWriteOptions(maxDepth: 0, minChunkGaussians: 1),
+        );
+        final indexed = await openFourdgsIndexed(FourdgsBytes(bytes));
+        const probe = 5e-31;
+        final chunks = <FourdgsDecodedChunk>[];
+        for (final entry in indexed.index) {
+          if (entry.covers(probe)) {
+            chunks.add(
+              await readFourdgsChunk(FourdgsBytes(bytes), indexed, entry),
+            );
+          }
+        }
+        expect(
+          assembleGaussians(
+            chunks,
+            0,
+          ).stateAt(probe, cutoff: indexed.header.cutoff).count,
+          1,
+        );
+      },
+    );
+
+    test('finite support still partitions an open-ended scene', () {
+      final scene = buildScene(count: 512, windows: 1, duration: 512.0);
+      scene.winLo.fillRange(0, scene.count, 0.0);
+      scene.winHi.fillRange(0, scene.count, double.infinity);
+      scene.sigmaT.fillRange(0, scene.count, 0.05);
+      final decoded = readFourdgsBytes(
+        writeFourdgsBytes(
+          scene,
+          double.infinity,
+          options: const FourdgsWriteOptions(maxDepth: 4, minChunkGaussians: 8),
+        ),
+      );
+      expect(decoded.chunkIndex.length, greaterThan(1));
+      expect(decoded.chunkIndex.any((entry) => entry.t1.isFinite), isTrue);
+    });
+
+    test('point support at an open tail start still earns a finite chunk', () {
+      final scene = flatScene(128, winHi: double.infinity);
+      scene.sigmaT.fillRange(0, scene.count, 0.0);
+      scene.muT.fillRange(0, scene.count, 0.0);
+      final decoded = readFourdgsBytes(
+        writeFourdgsBytes(
+          scene,
+          double.infinity,
+          options: const FourdgsWriteOptions(maxDepth: 4, minChunkGaussians: 8),
+        ),
+      );
+      expect(decoded.chunkIndex.any((entry) => entry.t1.isFinite), isTrue);
+    });
+
+    test('every gaussian is stored exactly once, however long it lives', () {
+      final scene = buildScene(count: 512, windows: 8);
+      final decoded = readFourdgsBytes(
+        writeFourdgsBytes(scene, 8.0, options: chunked),
+      );
+      int total = 0;
+      for (final entry in decoded.chunkIndex) {
+        total += entry.gaussianCount;
+      }
+      expect(total, scene.count);
+      expect(decoded.header.gaussianCount, scene.count);
+      expect(decoded.gaussians.count, scene.count);
+    });
+
+    test("a chunk's interval contains the support of everything in it", () async {
+      final scene = buildScene(count: 512, windows: 8);
+      final bytes = writeFourdgsBytes(scene, 8.0, options: chunked);
+      final indexed = await openFourdgsIndexed(FourdgsBytes(bytes));
+      final k = math.sqrt(-2.0 * math.log(indexed.header.cutoff));
+
+      for (final entry in indexed.index) {
+        final chunk = await readFourdgsChunk(
+          FourdgsBytes(bytes),
+          indexed,
+          entry,
+        );
+        for (int i = 0; i < chunk.count; i++) {
+          final sigma = chunk.sigmaT[i];
+          final half = sigma.isFinite ? k * sigma : double.infinity;
+          final lo = math.max(chunk.muT[i] - half, chunk.winLo[i]);
+          final hi = math.min(chunk.muT[i] + half, chunk.winHi[i]);
+          // The tree's whole invariant: a gaussian goes in the deepest node
+          // whose interval fully contains its support. Break it and an instant
+          // inside [t0, t1) is served without a gaussian visible there.
+          //
+          // Assignment is built from these reconstructed values, so no
+          // quantization tolerance belongs here: an edge past the interval is
+          // an instant the streamed path can see and the indexed path can miss.
+          expect(lo, greaterThanOrEqualTo(entry.t0));
+          expect(hi, lessThanOrEqualTo(entry.t1));
+        }
+      }
+    });
+
+    test('seeking an instant finds every gaussian visible at it', () async {
+      final scene = buildScene(count: 512, windows: 8);
+      final bytes = writeFourdgsBytes(scene, 8.0, options: chunked);
+      final whole = readFourdgsBytes(bytes);
+      final indexed = await openFourdgsIndexed(FourdgsBytes(bytes));
+      final cutoff = indexed.header.cutoff;
+
+      // A probe inside every index interval, plus the ends of the timeline. The
+      // seek rule is half-open — `t0 <= t < t1` — so a point strictly inside an
+      // interval is served by exactly the entries that should serve it.
+      //
+      final probes = <double>{
+        0.0,
+        for (final entry in indexed.index) entry.t0,
+        for (final entry in indexed.index)
+          entry.t0 + 0.37 * (entry.t1 - entry.t0),
+        8.0 - 1e-6,
+      };
+
+      for (final t in probes) {
+        final expected = whole.gaussians.stateAt(t, cutoff: cutoff).count;
+        int found = 0;
+        for (final entry in indexed.index) {
+          if (!(entry.t0 <= t && t < entry.t1)) continue;
+          final chunk = await readFourdgsChunk(
+            FourdgsBytes(bytes),
+            indexed,
+            entry,
+          );
+          for (int i = 0; i < chunk.count; i++) {
+            if (!(chunk.winLo[i] <= t && t < chunk.winHi[i])) continue;
+            final sigma = chunk.sigmaT[i];
+            final marginal =
+                sigma.isFinite
+                    ? math.exp(
+                      -0.5 *
+                          math.pow(
+                            (t - chunk.muT[i]) / math.max(sigma, 1e-30),
+                            2,
+                          ),
+                    )
+                    : 1.0;
+            if (marginal >= cutoff) found++;
+          }
+        }
+        expect(
+          found,
+          expected,
+          reason:
+              'at t = $t the covering chunks must hold every visible gaussian',
+        );
+      }
+    });
+
+    test('depth 0 writes one chunk per window interval', () {
+      final scene = buildScene(count: 256, windows: 4);
+      final decoded = readFourdgsBytes(
+        writeFourdgsBytes(
+          scene,
+          8.0,
+          options: const FourdgsWriteOptions(maxDepth: 0, minChunkGaussians: 1),
+        ),
+      );
+      // Four windows, each fully inside its own top-level interval.
+      expect(decoded.chunkIndex.length, 4);
+      for (final entry in decoded.chunkIndex) {
+        expect(entry.t1 - entry.t0, closeTo(2.0, 1e-9));
+      }
+    });
+
+    test('a node too small for its own chunk goes back to its parent', () {
+      final scene = buildScene(count: 256, windows: 4);
+      final deep = readFourdgsBytes(
+        writeFourdgsBytes(
+          scene,
+          8.0,
+          options: const FourdgsWriteOptions(maxDepth: 6, minChunkGaussians: 4),
+        ),
+      );
+      final shallow = readFourdgsBytes(
+        writeFourdgsBytes(
+          scene,
+          8.0,
+          options: const FourdgsWriteOptions(
+            maxDepth: 6,
+            minChunkGaussians: 1 << 20,
+          ),
+        ),
+      );
+      expect(deep.chunkIndex.length, greaterThan(shallow.chunkIndex.length));
+      expect(shallow.gaussians.count, scene.count);
+      expect(deep.gaussians.count, scene.count);
+    });
+
+    test('a window per gaussian still puts each one in its own window', () {
+      // The shape the interval search exists for. Every distinct window puts its
+      // endpoints in the top-level split points, so a scene that gives each
+      // gaussian its own window has as many intervals as gaussians — and the
+      // scan this replaced asked every interval about every gaussian, which is
+      // the quadratic this module promises it does not contain.
+      //
+      // 256 windows over 8 seconds so that every boundary is a multiple of
+      // 2^-5 and survives the trip through `float32` exactly: a test that has
+      // to reason about which side of a boundary a value landed on is testing
+      // the rounding, not the partition.
+      const count = 256;
+      final scene = buildScene(count: count, windows: count);
+      final decoded = readFourdgsBytes(
+        writeFourdgsBytes(
+          scene,
+          8.0,
+          options: const FourdgsWriteOptions(maxDepth: 0, minChunkGaussians: 1),
+        ),
+      );
+      // One chunk per window and no root chunk. A gaussian whose interval was
+      // found wrongly lands either in a chunk that does not contain its support
+      // or, if no interval was found at all, in the root — one extra chunk
+      // spanning the whole timeline, which is what this count would catch.
+      expect(decoded.chunkIndex.length, count);
+      int total = 0;
+      for (final entry in decoded.chunkIndex) {
+        expect(entry.gaussianCount, 1);
+        total += entry.gaussianCount;
+      }
+      expect(total, count);
+      expect(decoded.gaussians.count, count);
+    });
+
+    test('every chunk in a multi-chunk file is framed by its index entry', () {
+      final bytes = writeFourdgsBytes(
+        buildScene(count: 512, windows: 8, shDegree: 2),
+        8.0,
+        options: chunked,
+      );
+      final decoded = readFourdgsBytes(bytes);
+      expect(decoded.chunkIndex.length, greaterThan(1));
+      for (final entry in decoded.chunkIndex) {
+        expect(bytes[entry.chunkOffset], opChunk);
+        expect(
+          entry.chunkLength,
+          recordHeaderBytes + _contentLength(bytes, entry.chunkOffset),
+        );
+        for (final band in entry.bands) {
+          expect(bytes[band.offset], opShBandStream);
+          expect(
+            band.length,
+            recordHeaderBytes + _contentLength(bytes, band.offset),
+          );
+        }
+      }
     });
   });
 
@@ -911,11 +1334,18 @@ void main() {
         );
         final decoded = readFourdgsBytes(bytes);
         expect(decoded.header.shDegree, cap, reason: 'shBands: $cap');
+        // Every chunk carries its own band records, so the file's total is
+        // `bands * chunks` and the per-chunk count is what `cap` bounds. Both
+        // are asserted: the index says how many bands each chunk has, and the
+        // record count says the file holds exactly those and no others.
         final bands =
             recordsOf(
               bytes,
             ).where((FourdgsRecord r) => r.opcode == opShBandStream).length;
-        expect(bands, cap, reason: 'shBands: $cap');
+        expect(bands, cap * decoded.chunkIndex.length, reason: 'shBands: $cap');
+        for (final entry in decoded.chunkIndex) {
+          expect(entry.bands.length, cap, reason: 'shBands: $cap');
+        }
         // The two have to agree with each other, which is the whole point: a
         // reader sizes the coefficient row from the degree.
         expect(
@@ -1106,11 +1536,15 @@ void main() {
       final decoded = readFourdgsBytes(bytes);
       expect(decoded.header.shDegree, 2);
       expect(decoded.gaussians.shCoefficients, 8);
+      // Two bands per chunk, whatever the partition turned out to be.
+      for (final entry in decoded.chunkIndex) {
+        expect(entry.bands.length, 2);
+      }
       expect(
         recordsOf(
           bytes,
         ).where((FourdgsRecord r) => r.opcode == opShBandStream).length,
-        2,
+        2 * decoded.chunkIndex.length,
       );
     });
 
@@ -1568,6 +2002,88 @@ void main() {
       expect((actual / source - 1.0).abs(), lessThanOrEqualTo(bound));
     });
 
+    test('a partition depth the stack cannot hold is refused by name', () {
+      // A gaussian whose support is a single instant never straddles a midpoint,
+      // so it is offered every level there is and takes all of them. The descent
+      // is recursive, so before the ceiling this was a `StackOverflowError` from
+      // inside the planner: an error that names neither the option nor the
+      // caller who set it, and one no `catch` on this library's own exceptions
+      // would see.
+      final instant = flatScene(4, winHi: 10.0);
+      instant.sigmaT.fillRange(0, 4, 0.0);
+      instant.muT.fillRange(0, 4, 5.0);
+      expect(
+        () => writeFourdgsBytes(
+          instant,
+          10.0,
+          options: const FourdgsWriteOptions(
+            maxDepth: 10000,
+            minChunkGaussians: 1,
+          ),
+        ),
+        throwsA(
+          isA<FourdgsInvalidInput>().having(
+            (FourdgsInvalidInput e) => e.message,
+            'message',
+            allOf(contains('max_depth'), contains('10000'), contains('32')),
+          ),
+        ),
+      );
+      // The ceiling itself is a depth, not a refusal. Keep a sizeable pool on
+      // one branch through all 32 levels: the planner must partition one typed
+      // assignment table in place rather than retain 32 scene-sized lists.
+      const deepCount = 4096;
+      final deepPool = flatScene(deepCount, winHi: 10.0);
+      deepPool.sigmaT.fillRange(0, deepCount, 0.0);
+      deepPool.muT.fillRange(0, deepCount, 5.0);
+      final decoded = readFourdgsBytes(
+        writeFourdgsBytes(
+          deepPool,
+          10.0,
+          options: const FourdgsWriteOptions(
+            maxDepth: 32,
+            minChunkGaussians: 1,
+          ),
+        ),
+      );
+      expect(decoded.gaussians.count, deepCount);
+    });
+
+    test('an option outside its range is named here, not by a library', () {
+      // Each of these used to leave the encoder as somebody else's error or as
+      // no error at all — an out-of-range deflate level as a `RangeError` from
+      // inside the compression package, a nonsensical chunk population as a
+      // silently different partition.
+      const cases = <FourdgsWriteOptions>[
+        FourdgsWriteOptions(level: 42),
+        FourdgsWriteOptions(level: -2),
+        FourdgsWriteOptions(maxDepth: -1),
+        FourdgsWriteOptions(maxDepth: 33),
+        FourdgsWriteOptions(minChunkGaussians: 0),
+        FourdgsWriteOptions(minChunkGaussians: -5),
+        FourdgsWriteOptions(shBands: -1),
+      ];
+      for (final options in cases) {
+        expect(
+          () => writeFourdgsBytes(buildScene(count: 8), 8.0, options: options),
+          throwsA(isA<FourdgsInvalidInput>()),
+          reason:
+              'level=${options.level} max_depth=${options.maxDepth} '
+              'min_chunk_gaussians=${options.minChunkGaussians} '
+              'sh_bands=${options.shBands}',
+        );
+      }
+      // `-1` is the deflate codec's own default. It is a level, not a mistake.
+      expect(
+        () => writeFourdgsBytes(
+          buildScene(count: 8),
+          8.0,
+          options: const FourdgsWriteOptions(level: -1),
+        ),
+        returnsNormally,
+      );
+    });
+
     test('an unknown profile lists the ones that exist', () {
       expect(
         () => writeFourdgsBytes(
@@ -1602,7 +2118,7 @@ void main() {
       );
       expect(decoded.header.durationSec, double.infinity);
       expect(decoded.chunkIndex, isNotEmpty);
-      expect(decoded.chunkIndex.last.t1, double.infinity);
+      expect(decoded.gaussians.count, scene.count);
     });
 
     test('a zero-length quaternion is refused by gaussian', () {

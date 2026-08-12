@@ -84,10 +84,30 @@ Future<String> run(String path) async {
               <Map<int, Uint8List>>[for (final c in chunks) c.shBands],
             );
 
+    final whole = assembleGaussians(chunks, scene.header.shDegree, sh: sh);
+
+    // Everything above this line assembles the whole scene, which is exactly why
+    // it cannot see a gaussian filed in the wrong chunk: the summary carries it
+    // anyway, and both read paths agree about it. This selects instead — only
+    // the entries covering an instant — and requires the state they give to be
+    // the state the whole scene gives. A partition that loses a gaussian from a
+    // seek fails here and nowhere else.
+    //
+    // This always proves complete per-resident support containment. Candidate
+    // probes are additional evidence where reachable, but a point-supported
+    // scene may need none once every resident is already proved inside its
+    // owning entry.
+    await checkSeekReadsOnlyWhatItNeeds(
+      source,
+      scene,
+      whole,
+      decodedChunks: chunks,
+    );
+
     return canonical(
       summarize(
         header: scene.header,
-        gaussians: assembleGaussians(chunks, scene.header.shDegree, sh: sh),
+        gaussians: whole,
         audioSources: audioSources,
         chunkIntervals: <(double, double)>[
           for (final e in scene.index) (e.t0, e.t1),
