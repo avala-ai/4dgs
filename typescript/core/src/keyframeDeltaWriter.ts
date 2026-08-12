@@ -205,10 +205,15 @@ function windowsOf(
     for (let i = 0; i < g.count; i++) {
       const lo = g.winLo[i]!;
       const hi = g.winHi[i]!;
-      if (Number.isNaN(lo) || Number.isNaN(hi)) {
+      if (
+        typeof lo !== "number" ||
+        typeof hi !== "number" ||
+        Number.isNaN(lo) ||
+        Number.isNaN(hi)
+      ) {
         throw new Error(
           `sample ${sampleAt}, gaussian ${i} has validity window [${lo}, ${hi}); ` +
-            `window endpoints must not be NaN`,
+            `both window endpoints must be numbers and must not be NaN`,
         );
       }
       const key = `${lo},${hi}`;
@@ -416,11 +421,31 @@ function quantizeSample(
     windowIndex.push(row);
 
     for (let a = 0; a < 3; a++) {
-      position.push(rint((g.positions[i * 3 + a]! - grids.origin[a]!) / steps.pos));
+      const positionValue = g.positions[i * 3 + a]!;
+      const positionBin = rint((positionValue - grids.origin[a]!) / steps.pos);
+      const reconstructedPosition = grids.origin[a]! + positionBin * steps.pos;
+      if (!Number.isFinite(reconstructedPosition)) {
+        throw new Error(
+          `sample ${at}, gaussian id ${ids[i]}, position lane ${a}: finite value ` +
+            `${positionValue} rounds to ${reconstructedPosition}; the serialized position ` +
+            `must remain finite`,
+        );
+      }
+      position.push(positionBin);
       // `medianScaleOf` already rejects non-positive and non-finite values. Preserve the
       // complete positive binary64 domain here: flooring a smaller legal scale to 1e-30
       // changes it by orders of magnitude while the file still promises `scale_rel`.
-      scale.push(rint(Math.log(g.scales[i * 3 + a]!) / steps.scaleLog));
+      const scaleValue = g.scales[i * 3 + a]!;
+      const scaleBin = rint(Math.log(scaleValue) / steps.scaleLog);
+      const reconstructedScale = Math.exp(scaleBin * steps.scaleLog);
+      if (!Number.isFinite(reconstructedScale) || reconstructedScale <= 0) {
+        throw new Error(
+          `sample ${at}, gaussian id ${ids[i]}, scale lane ${a}: finite positive value ` +
+            `${scaleValue} rounds to ${reconstructedScale}; the serialized scale must remain ` +
+            `finite and positive`,
+        );
+      }
+      scale.push(scaleBin);
     }
 
     const [largest, bins] = quantizeRotation(
@@ -796,6 +821,12 @@ function aabbOf(samples: readonly KeyframeDeltaSample[], grids: Grids): number[]
         // Reconstruct exactly the value the serialized position bin will produce.
         const bin = rint((g.positions[i * 3 + a]! - grids.origin[a]!) / grids.steps.pos);
         const v = grids.origin[a]! + bin * grids.steps.pos;
+        if (!Number.isFinite(v)) {
+          throw new Error(
+            `serialized position for gaussian ${i}, lane ${a} reconstructs to ${v}; ` +
+              `Header and Statistics AABB values must be finite`,
+          );
+        }
         lo[a] = Math.min(lo[a]!, v);
         hi[a] = Math.max(hi[a]!, v);
       }

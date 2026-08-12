@@ -92,29 +92,20 @@ type Mutable = {
   -readonly [K in keyof KeyframeDeltaSample["gaussians"]]: KeyframeDeltaSample["gaussians"][K];
 };
 
-function records(data: Uint8Array): { opcode: number; content: Uint8Array }[] {
-  return [...iterateRecords(data, MAGIC.length)].map((r) => ({
-    opcode: r.opcode,
-    content: r.content,
-  }));
-}
-
 /**
- * The Python reference writer still preserves source mu_t on nonzero keyframes; §11.3
- * requires the state timestamp. Until that writer is corrected, its corpus summary differs
- * only in the temporal marginal folded into this aggregate.
+ * Strip the two summary fields affected by the Python writer retaining an old wire mu_t.
+ *
+ * Python now computes a target reanchored to each sample t0, but it compares the reference
+ * after reanchoring that reference to t0 as well. A row whose other authored lanes match is
+ * therefore omitted from the delta, leaving its old serialized mu_t in the composed state.
+ * TypeScript emits the required anchor update. Until Python serializes the anchor it
+ * computed, operation counts and the temporal marginal differ for those rows.
  */
-function withoutPythonMuAnchorDifferences(
-  summary: Record<string, unknown>,
-): Record<string, unknown> {
+function withoutPythonRetainedAnchor(summary: Record<string, unknown>): Record<string, unknown> {
   const copy = structuredClone(summary) as {
     chunks: { t0: number; kind: string; updateCount?: unknown }[];
     states: { t: number; aggregate: { opacitySum?: number } }[];
   };
-  // The Python reference does not emit an update for a persistent gaussian whose only new
-  // bin is the sample-time mu_t anchor. TypeScript must, because retaining the older anchor
-  // changes reconstructed state. The operational update count therefore differs until the
-  // reference writer adopts the same rule; it is not part of the state comparison here.
   for (const chunk of copy.chunks) {
     if (chunk.kind === "delta") delete chunk.updateCount;
   }
@@ -125,6 +116,13 @@ function withoutPythonMuAnchorDifferences(
     }
   }
   return copy as unknown as Record<string, unknown>;
+}
+
+function records(data: Uint8Array): { opcode: number; content: Uint8Array }[] {
+  return [...iterateRecords(data, MAGIC.length)].map((r) => ({
+    opcode: r.opcode,
+    content: r.content,
+  }));
 }
 
 // --------------------------------------------------------------------------
@@ -147,10 +145,8 @@ for (const variant of KEYFRAME_DELTA_VARIANTS.filter((v) => v.inCorpus)) {
       keyframeDeltaStatesJson((await decodeKeyframeDeltaIndexed(data)).sequence),
     );
     assert.equal(
-      canonical(withoutPythonMuAnchorDifferences(JSON.parse(streamed) as Record<string, unknown>)),
-      canonical(
-        withoutPythonMuAnchorDifferences(JSON.parse(expectation) as Record<string, unknown>),
-      ),
+      canonical(withoutPythonRetainedAnchor(JSON.parse(streamed) as Record<string, unknown>)),
+      canonical(withoutPythonRetainedAnchor(JSON.parse(expectation) as Record<string, unknown>)),
     );
     assert.equal(indexed, streamed);
   });
@@ -439,6 +435,30 @@ test("the even scale median stays finite near Number.MAX_VALUE", async () => {
   }
 });
 
+test("a scale whose rounded log bin reconstructs to infinity is refused", async () => {
+  const samples = pair(0, 0);
+  for (const sample of samples) {
+    sample.gaussians.scales = [Number.MAX_VALUE, Number.MAX_VALUE, Number.MAX_VALUE];
+  }
+  await assert.rejects(
+    () => encodeKeyframeDeltaSequence(samples, DURATION, { profile: "coarse" }),
+    /scale lane 0: finite positive value .* rounds to Infinity.*must remain finite and positive/,
+  );
+});
+
+test("a finite position whose serialized reconstruction overflows is refused", async () => {
+  const samples = pair(0, 0);
+  samples[0]!.gaussians.positions = [1.7e308, 0, 0];
+  samples[1]!.gaussians.positions = [Number.MAX_VALUE, 0, 0];
+  for (const sample of samples) {
+    sample.gaussians.scales = [1e308, 1e308, 1e308];
+  }
+  await assert.rejects(
+    () => encodeKeyframeDeltaSequence(samples, DURATION),
+    /serialized position for gaussian 0, lane 0 reconstructs to Infinity.*must be finite/,
+  );
+});
+
 test("two encodes of the same sequence are byte-identical", async () => {
   const variant = KEYFRAME_DELTA_VARIANTS[2]!;
   assert.deepEqual([...(await encode(variant))], [...(await encode(variant))]);
@@ -516,7 +536,15 @@ test("a promise the writer cannot keep is refused rather than written", async ()
   nanWindow[1]!.gaussians.winLo = Float32Array.from([Number.NaN]);
   await assert.rejects(
     () => encodeKeyframeDeltaSequence(nanWindow, DURATION),
-    /window endpoints must not be NaN/,
+    /both window endpoints must be numbers and must not be NaN/,
+  );
+
+  const missingWindow = pair(0, 1);
+  missingWindow[0]!.gaussians.winLo = new Float32Array(0);
+  missingWindow[0]!.gaussians.winHi = new Float32Array(0);
+  await assert.rejects(
+    () => encodeKeyframeDeltaSequence(missingWindow, DURATION),
+    /validity window \[undefined, undefined\).*both window endpoints must be numbers/,
   );
 });
 

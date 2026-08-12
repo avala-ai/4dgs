@@ -23,9 +23,9 @@
 #
 # **The corpus statement.** For the four sequences the corpus generator also builds, the
 # summary is additionally compared with `tests/conformance/data/keyframe/<name>.json`, which
-# was produced by the *Python* encoder from the same populations. The Python writer still
-# preserves source `mu_t` on nonzero keyframes instead of applying §11.3's timestamp anchor,
-# so that comparison excludes only the resulting opacity aggregate at affected instants.
+# was produced by the *Python* encoder from the same populations. Python computes a t0
+# anchor but can omit it from the wire when no other lane changed, so this comparison
+# excludes only the resulting update count and opacity aggregate at affected instants.
 #
 # Usage: typescript/keyframe-delta-roundtrip.sh [output-dir]
 
@@ -320,13 +320,14 @@ else:
 reference = summaries[reference_name]
 
 
-def without_python_mu_anchor_opacity(summary):
-    """Remove only the known §11.3 writer divergence from a comparison copy."""
+def without_python_retained_anchor(summary):
+    """Remove the fields affected by the Python writer's retained wire anchor."""
     copy = json.loads(json.dumps(summary))
-    # The TypeScript writer advances mu_t to the sample timestamp and therefore emits an
-    # update for a persistent gaussian whose authored lanes are otherwise unchanged. The
-    # Python corpus writer retains the source anchor. Until it adopts §11.3's anchor rule,
-    # operation counts differ even though the state comparison below is normalized too.
+    # Python now computes a t0-reanchored target, but it also compares the reference after
+    # reanchoring it to t0. A row whose authored lanes otherwise match is consequently not
+    # emitted as an update, and the composed wire state retains the old mu_t. TypeScript
+    # emits that required update, so operation counts and the temporal marginal differ
+    # until the Python writer serializes the anchor it computed.
     for chunk in copy["chunks"]:
         if chunk["kind"] == "delta":
             chunk.pop("updateCount", None)
@@ -342,8 +343,8 @@ def comparison(reader):
     candidate = summaries[reader]
     baseline = reference
     if reader == "corpus.python-encoder":
-        candidate = without_python_mu_anchor_opacity(candidate)
-        baseline = without_python_mu_anchor_opacity(baseline)
+        candidate = without_python_retained_anchor(candidate)
+        baseline = without_python_retained_anchor(baseline)
     return baseline, candidate
 
 
