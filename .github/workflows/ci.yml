@@ -27,7 +27,7 @@ jobs:
             echo "conformance data: ${size_kb} KiB"
             [ "$size_kb" -le 2560 ] || { echo "::error::conformance data over budget"; exit 1; }
           fi
-      - name: Rust sources under 1100 KB
+      - name: Rust sources under 1360 KB
         # Sources only: this job builds nothing, so target/ is not here to measure. A
         # vendored dependency would show up as a budget failure, which is the point —
         # everything these crates need comes from crates.io via Cargo.toml.
@@ -41,8 +41,16 @@ jobs:
         # layer's records, composition module, indexed sampling, and conformance coverage
         # landed together; 1000 after the keyframe-delta model (composition, whole-file
         # write/decode, both read paths, and its encode-roundtrip runners) landed; 1100 after
-        # the object layer's composed-state entry point and its test. A budget
-        # that tight stops being a budget and starts being a tax
+        # the object layer's composed-state entry point and its test; 1200 after the `4dgs`
+        # validator learned to place a refusal — the refusal-placement walk and the
+        # chunk-decode scan are new files beside the tool's own, and the CLI tests that read
+        # their expectations out of the invalid corpus are another; 1280 after the review
+        # round that put a named regression test behind each of those behaviours, which is
+        # most of a hostile-fixture builder and ten tests; 1360 after the indexed-open and
+        # keyframe-reference regressions made that source tree 1300 KiB. A margin smaller
+        # than one deliberate review round is not headroom, it is the next source change
+        # failing a gate about vendored dependencies.
+        # A budget that tight stops being a budget and starts being a tax
         # on the next feature, so each raise leaves a little headroom. The number moves
         # when the tree grows deliberately, which is the one thing it is not meant to
         # catch — it exists so that a vendored dependency, which arrives in hundreds of
@@ -55,9 +63,9 @@ jobs:
         run: |
           size_kb=$(du -s rust | cut -f1)
           echo "rust: ${size_kb} KiB"
-          [ "$size_kb" -le 1100 ] || { echo "::error::rust is ${size_kb} KiB, over the 1100 KiB budget"; exit 1; }
+          [ "$size_kb" -le 1360 ] || { echo "::error::rust is ${size_kb} KiB, over the 1360 KiB budget"; exit 1; }
 
-      - name: TypeScript sources under 704 KB
+      - name: TypeScript sources under 896 KB
         # Sources only: this job installs nothing and builds nothing, so node_modules
         # and dist are not here to measure. A vendored dependency would show up as a
         # budget failure, which is the point.
@@ -74,11 +82,15 @@ jobs:
         # left — the next file would have tripped it whatever it contained.
         # Raised from 704 to 768 KiB for full keyframe-delta reconstruction: SH composition,
         # streamed-prefix recovery, indexed-chain checks and the hostile-input tests that pin them.
+        # Raised from 768 to 896 KiB for the keyframe-delta encoder: the sequence writer, gate
+        # fixtures and tests land on top of the decoder and measure 872 KiB in a clean checkout.
+        # Keep one coordinated ceiling for the combined package; `du` rounds each file to a
+        # 4 KiB block, so 24 KiB of headroom is six files.
         run: |
           size_kb=$(du -s typescript | cut -f1)
           echo "typescript: ${size_kb} KiB"
-          [ "$size_kb" -le 768 ] || { echo "::error::typescript is ${size_kb} KiB, over the 768 KiB budget"; exit 1; }
-      - name: Dart sources under 1024 KB
+          [ "$size_kb" -le 896 ] || { echo "::error::typescript is ${size_kb} KiB, over the 896 KiB budget"; exit 1; }
+      - name: Dart sources under 1280 KB
         # Sources only, same as TypeScript's and Swift's: this job builds nothing, so
         # .dart_tool and the compiled runners are not here to measure, and a vendored
         # dependency would show up as a budget failure.
@@ -109,26 +121,28 @@ jobs:
         # ceilings, and the writer stack took it 704 to 768 — so all three agreeing makes
         # the merge a no-op instead of three-way arithmetic. The number is coordinated,
         # not guessed.
-        # Raised from 768 to 832 KiB by this tool's own review round: the validator's
-        # record pass reads by range instead of holding the file, the band and chain
-        # checks are shared by both temporal models, and every fix carries the test
-        # that goes red without it — about 42 KiB of source, over half of it tests.
-        # 760 became 804, so 768 no longer holds; 832 is the new figure to coordinate
-        # the other Dart branches on rather than each of them raising it again.
-        # Raised from 832 to 960 KiB after the final validator review made every
-        # physically framed record prove its own structure: bounded Attachment and
-        # Audio header scans, index/Footer agreement, physical interval coverage,
-        # top-level opcode legality, and temporal identity checks. The clean tree is
-        # 880 KiB, with the added space again dominated by hostile-input regressions.
-        # Raised from 960 to 1024 KiB for the final bounded-validation review:
-        # retained findings and index entries now have ceilings, ranged chains prove
-        # their reference semantics, and Footer/Summary Offset ranges regain bounded
-        # seeks and full validation. The clean tree measures 972 KiB; 1024 keeps one
-        # ordinary review round of headroom without hiding a vendored dependency.
+        # Raised from 768 to 832 KiB when the completed single-chunk writer measured 776
+        # KiB in a clean checkout. Its bounded streaming sink, identity lanes, fidelity
+        # gate and regressions are the feature this layer claims; 768 was therefore eight
+        # KiB below the source already under review. The next 64 KiB step leaves 56 KiB of
+        # headroom instead of turning the budget into an exact-size assertion again.
+        # Raised from 832 to 896 KiB for the completed chunked writer. Its interval tree,
+        # reconstructed-support planning, selective-seek proofs and regressions take a clean
+        # tree from the parent's 776 KiB to 864 KiB. The next 64 KiB step leaves 32 KiB of
+        # headroom while keeping the budget tied to the feature this layer adds.
+        # Raised from 896 to 1280 KiB by this tool's own review rounds: the validator
+        # reads records by range instead of holding the file, the band and chain checks
+        # are shared by both temporal models, every physically framed record proves its
+        # own structure, and retained findings and index entries carry ceilings. Over
+        # half the added source is hostile-input regressions. The earlier spelling of
+        # this chain here counted from 768 and 832, which were this branch's guesses at
+        # where main would be; main landed 832 and 896, so the raise is stated from
+        # there. The merged tree measures 1224 KiB, so 1280 is the step that holds it
+        # with the usual headroom rather than as an exact-size assertion.
         run: |
           size_kb=$(du -s dart | cut -f1)
           echo "dart: ${size_kb} KiB"
-          [ "$size_kb" -le 1024 ] || { echo "::error::dart is ${size_kb} KiB, over the 1024 KiB budget"; exit 1; }
+          [ "$size_kb" -le 1280 ] || { echo "::error::dart is ${size_kb} KiB, over the 1280 KiB budget"; exit 1; }
       - name: Swift sources under 300 KB
         # Sources only, same as TypeScript's: this job builds nothing, so .build is not
         # here to measure and a vendored dependency would show up as a budget failure.
@@ -622,7 +636,9 @@ jobs:
           cd ../conformance && dart analyze --fatal-infos
 
       - name: Tests
-        run: cd dart/fourdgs && dart test
+        run: |
+          cd dart/fourdgs && dart test
+          cd ../conformance && dart test
 
       # The one gate that would otherwise be discovered on release day. It is cheap, it
       # needs no credentials, and a package that cannot be packed is a package whose first

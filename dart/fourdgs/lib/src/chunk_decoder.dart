@@ -31,6 +31,7 @@ class FourdgsDecodedChunk {
     required this.winLo,
     required this.winHi,
     required this.windowIndex,
+    this.sourceGroup,
     this.sourceIndex,
     this.objectId,
     this.shBands = const <int, Uint8List>{},
@@ -47,6 +48,7 @@ class FourdgsDecodedChunk {
   final Float32List winLo; // count
   final Float32List winHi; // count
   final Int32List windowIndex; // count
+  final Int32List? sourceGroup;
   final Int32List? sourceIndex;
 
   /// Object membership (spec section 6.6), or null when the chunk carries
@@ -356,6 +358,7 @@ FourdgsDecodedChunk decodeChunkStreams(
         mu.values[i] * muStep(sigmaBin, steps.sigmaLog, neverFades, steps.time);
   }
 
+  final sourceGroup = got[attrSourceGroup];
   final source = got[attrSourceIndex];
   final objects = got[attrObjectId];
   final shBands = <int, Uint8List>{};
@@ -381,6 +384,8 @@ FourdgsDecodedChunk decodeChunkStreams(
     winLo: winLo,
     winHi: winHi,
     windowIndex: windowIndex,
+    sourceGroup:
+        sourceGroup == null ? null : Int32List.fromList(sourceGroup.values),
     sourceIndex: source == null ? null : Int32List.fromList(source.values),
     // Reinterpreted rather than truncated: the bits are already right, only
     // their signedness was wrong.
@@ -442,11 +447,11 @@ const int maxChunkDecodedBytes = 512 * 1024 * 1024;
 ///
 /// * the attribute-stream bins, `Int32List`s of `count * channels` — 21
 ///   channels across the eleven required attributes, plus 2 for the optional
-///   source-group and source-index streams: 23 × 4 = 92 bytes;
+///   source-group, source-index and object-id streams: 24 × 4 = 96 bytes;
 /// * the arrays handed back — 21 `Float32List` lanes (position 3, scale 3,
 ///   rotation 4, colour 4, motion 3, and one each of mu_t, sigma_t, window lo
-///   and window hi) plus two `Int32List` lanes (window index, source index):
-///   23 × 4 = 92 bytes;
+///   and window hi) plus four integer lanes (window index, source group,
+///   source index and object id): 25 × 4 = 100 bytes;
 /// * each SH band twice over: its bins as an `Int32List` and its coefficients
 ///   as the `Uint8List` handed back, 5 bytes per coefficient. Bands are
 ///   cumulative — degree 1 is 9 coefficients per gaussian, degree 2 is 24,
@@ -459,11 +464,7 @@ int chunkDecodedBytesPerGaussian(int shDegree) {
   for (int band = 1; band <= shDegree; band++) {
     shCoefficients += shBandChannels[band] ?? 0;
   }
-  // 96 + 96 rather than 92 + 92 since object membership joined the lanes it
-  // budgets for: `object_id` costs one decoded bin lane and one output array,
-  // four bytes each. A guard that under-counts a lane it now decodes is a
-  // guard that lets a crafted count allocate past the ceiling it states.
-  return 96 + 96 + shCoefficients * 5;
+  return 96 + 100 + shCoefficients * 5;
 }
 
 /// Coefficients per gaussian in each spherical-harmonic band, three channels

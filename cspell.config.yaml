@@ -144,9 +144,27 @@ words:
   # Git and workflow vocabulary
   - reflog
   - oneline
+  # Spec-decision proposals (#78, #79, #95): the reference implementation's own
+  # identifiers, the summation vocabulary, and the toolchain names they cite
+  - numpy
+  - ndarray
+  - frozenset
+  - fsum
+  - multiset
+  - modulemap
+  - uncomposed
   - worktree
   - worktrees
   - toplevel
+  - taskkill
+  # Rounding vocabulary: `rint` is the C and NumPy name for round-half-to-even.
+  - rint
+  # Conformance runner protocol: the harness is Python, and the documented contract names
+  # the identifiers a runner author will actually see in `run.py` and `canonical.py`.
+  - returncode
+  - isinstance
+  - parseable
+  - unparseable
 ignorePaths:
   - "**/node_modules/**"
   - "**/dist/**"

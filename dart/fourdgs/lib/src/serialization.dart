@@ -736,17 +736,10 @@ Uint32List _unshuffle(Uint8List raw, int width, int symbols) {
 int _unzigzag(int u) => (u >> 1) ^ -(u & 1);
 
 /// CRC-32 (IEEE) over [data], as the Footer's `summary_crc` declares it.
-int fourdgsCrc32(Uint8List data) => getCrc32(data);
-
-/// The same checksum, continued over the next block of a region.
 ///
-/// The Footer names a byte *range*, and a caller that has to hold the whole
-/// range to check it is a caller that reads a file to check a file (AGENTS.md
-/// §1). CRC-32 is a running state, so a region is checked block by block with
-/// nothing but a 32-bit accumulator resident: `fourdgsCrc32Continue(block, crc)`
-/// for each block, starting from `0`, gives exactly what [fourdgsCrc32] over the
-/// concatenation gives.
-int fourdgsCrc32Continue(Uint8List block, int crc) => getCrc32(block, crc);
+/// Pass the previous result as [crc] to continue over another bounded block;
+/// this lets a writer checksum summary records without retaining the summary.
+int fourdgsCrc32(Uint8List data, [int crc = 0]) => getCrc32(data, crc);
 
 /// How much of a checksummed region is read at a time.
 ///
@@ -756,6 +749,11 @@ int fourdgsCrc32Continue(Uint8List block, int crc) => getCrc32(block, crc);
 const int fourdgsCrcBlockBytes = 1 << 20;
 
 /// The checksum of `[start, start + length)` of [source], a block at a time.
+///
+/// The Footer names a byte *range*, and a caller that has to hold the whole
+/// range to check it is a caller that reads a file to check a file (AGENTS.md
+/// §1). CRC-32 is a running state, so a region is checked block by block with
+/// nothing but a 32-bit accumulator resident.
 Future<int> fourdgsCrc32Range(
   FourdgsReadable source,
   int start,
@@ -767,7 +765,7 @@ Future<int> fourdgsCrc32Range(
   while (at < end) {
     final int take =
         end - at < fourdgsCrcBlockBytes ? end - at : fourdgsCrcBlockBytes;
-    crc = fourdgsCrc32Continue(await source.read(at, take), crc);
+    crc = fourdgsCrc32(await source.read(at, take), crc);
     at += take;
   }
   return crc;

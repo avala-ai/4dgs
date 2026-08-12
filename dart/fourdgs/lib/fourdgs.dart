@@ -22,6 +22,12 @@
 /// the edges, so the decoder can be tested without a network and shipped
 /// without a platform.
 ///
+/// Writing goes the other way through the same primitives:
+/// [writeFourdgsToSink] emits bounded records and [writeFourdgsBytes] is its
+/// in-memory convenience. They encode a [FourdgsGaussianSet] in their own right
+/// rather than wrapping another SDK, which is what makes their agreement with
+/// those SDKs worth something.
+///
 /// Reading a file from disk needs one more import: `package:fourdgs/io.dart`
 /// carries the `dart:io` transport, kept out of this library so the decoder
 /// itself stays platform-free and usable in a browser.
@@ -45,6 +51,7 @@ export 'src/refusal.dart';
 export 'src/serialization.dart';
 export 'src/stream_reader.dart';
 export 'src/validate.dart';
+export 'src/writer.dart';
 
 /// This package's version, and the single source of truth for it.
 ///

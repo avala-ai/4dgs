@@ -106,6 +106,15 @@ jobs:
           python tests/conformance/generate.py
           python tests/conformance/encode_roundtrip.py --encoder typescript
 
+      # The gaussian-birth gate above proves two encoders agree; it cannot prove either one
+      # preserved the scene, because a fault present in both passes it (#189). The
+      # keyframe-delta writer has no second encoder here at all, so its gate makes the
+      # fidelity claim directly — the written file, read back by Python, against the
+      # population that went in and the bounds the file itself declares — before it makes
+      # any agreement claim.
+      - name: keyframe-delta encode
+        run: typescript/keyframe-delta-roundtrip.sh
+
   kaitai:
     # The .ksy grammar is an executable restatement of the spec: if it stops parsing the
     # corpus, the spec and the implementation have diverged.
@@ -171,12 +180,20 @@ jobs:
           python tests/conformance/generate.py
           python tests/conformance/run.py --runner rust
 
-      # The corpus proves decoders against files the reference encoder wrote; this proves
-      # the Rust encoder, by requiring the Rust and Python decoders to agree on files it
-      # wrote. An encoder checked only by its own decoder proves that two halves of one
-      # implementation share an opinion, which is the failure mode this suite exists to
-      # catch. Every encode inside it also runs the encoder's own bound verification.
+      # One Ubuntu leg runs the shared source-fidelity gate over both reference encoders.
+      # Agreement alone cannot expose a defect they share, which is the motivating failure
+      # mode for this gate; its self-test runs beside them so a dead assertion is red too.
+      - name: The two reference encoders preserve their source scenes
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          python tests/conformance/encode_roundtrip.py --self-test
+          python tests/conformance/encode_roundtrip.py --encoder rust
+          python tests/conformance/encode_roundtrip.py --encoder python
+
+      # Keep the existing cross-platform Rust/Python agreement pass on the other legs. Its
+      # independent script exercises both read paths and remains useful platform coverage.
       - name: The encoder writes files another implementation agrees with
+        if: matrix.os != 'ubuntu-latest'
         run: rust/encode-roundtrip.sh
 
   cpp:
@@ -226,12 +243,24 @@ jobs:
           mkdir -p build
           dart compile exe bin/decode_streamed.dart -o build/decode_streamed
           dart compile exe bin/decode_indexed.dart -o build/decode_indexed
+          dart compile exe bin/encode_roundtrip.dart -o build/encode_roundtrip
       # `run.py --runner dart` fails if no Dart runner executed, so a build that
       # silently produced nothing is a red suite rather than a green one.
       - run: |
           pip install -e ./python/fourdgs
           python tests/conformance/generate.py
           python tests/conformance/run.py --runner dart
+
+      # The other direction: Dart re-encodes each variant's gaussians, and three decoders —
+      # its own, the Python reference and the Rust reference — have to read the result as
+      # the same scene, on both read paths each. An encoder checked only by its own decoder
+      # proves that two halves of one implementation share an opinion; two implementations
+      # can still share a misreading. The script requires every one of those readers and
+      # fails if one is missing, so this build step is not optional.
+      - name: Dart encodes files the Python and Rust references agree with
+        run: |
+          cargo build -p fourdgs-conformance --release
+          dart/encode-roundtrip.sh
 
   swift:
     runs-on: ubuntu-latest

@@ -47,6 +47,21 @@ const sidebars = {
         },
         { type: "doc", id: "spec/proposals/object-layer", label: "object layer" },
         { type: "doc", id: "spec/proposals/lod", label: "level-of-detail" },
+        {
+          type: "doc",
+          id: "spec/proposals/indexed-front-matter",
+          label: "front matter ends at the first Chunk",
+        },
+        {
+          type: "doc",
+          id: "spec/proposals/objects-under-keyframe-delta",
+          label: "objects under keyframe-delta",
+        },
+        {
+          type: "doc",
+          id: "spec/proposals/canonical-states-order",
+          label: "canonical states order",
+        },
       ],
     },
   ],

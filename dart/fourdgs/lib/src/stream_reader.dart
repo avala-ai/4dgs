@@ -700,6 +700,10 @@ FourdgsGaussianSet assembleGaussians(
   final sigmaT = Float32List(total);
   final winLo = Float32List(total);
   final winHi = Float32List(total);
+  final haveSourceGroup = chunks.every(
+    (FourdgsDecodedChunk c) => c.sourceGroup != null,
+  );
+  final sourceGroup = haveSourceGroup ? Int32List(total) : null;
   final haveSource = chunks.every(
     (FourdgsDecodedChunk c) => c.sourceIndex != null,
   );
@@ -723,6 +727,9 @@ FourdgsGaussianSet assembleGaussians(
     sigmaT.setRange(at, at + chunk.count, chunk.sigmaT);
     winLo.setRange(at, at + chunk.count, chunk.winLo);
     winHi.setRange(at, at + chunk.count, chunk.winHi);
+    if (sourceGroup != null) {
+      sourceGroup.setRange(at, at + chunk.count, chunk.sourceGroup!);
+    }
     if (sourceIndex != null) {
       sourceIndex.setRange(at, at + chunk.count, chunk.sourceIndex!);
     }
@@ -745,6 +752,7 @@ FourdgsGaussianSet assembleGaussians(
     shDegree: shDegree,
     sh: sh?.values,
     shCoefficients: sh?.coefficients ?? 0,
+    sourceGroup: sourceGroup,
     sourceIndex: sourceIndex,
     objectId: objectId,
   );

@@ -151,7 +151,12 @@ int lifeClass(
   double? k,
 }) {
   final sigma = math.exp(sigmaBin * sigmaLogStep);
-  double half = neverFades ? windowLength : (k ?? kSupport) * sigma;
+  // Equal infinite endpoints are a legal empty validity window. Their
+  // subtraction is NaN, but the lifetime they describe is zero, not an
+  // implementation-defined clamp result. Normalize it before deriving a grid
+  // so every SDK assigns the same velocity pitch.
+  final finiteWindowLength = windowLength.isNaN ? 0.0 : windowLength;
+  double half = neverFades ? finiteWindowLength : (k ?? kSupport) * sigma;
   half = half.clamp(_lifeHalfMin, _lifeHalfMax);
   return _log2(half / _lifeRef).ceil().clamp(_lifeMinClass, _lifeMaxClass);
 }
