@@ -1059,6 +1059,30 @@ def check_window_indices_of(state: State, windows: list[tuple[float, float]]) ->
     check_window_indices(np.asarray(values, dtype=np.int64).reshape(-1), table)
 
 
+def check_index_entry_shape(index: list[rec.ChunkIndexEntry]) -> None:
+    """Every entry carries the keyframe-delta fields, and a chunk_kind the format defines.
+
+    Written once because it was written twice. `compose_chain` and `scan_indexed` each
+    carried this pre-pass verbatim, and duplicated checks drift: the two had already
+    stopped refusing the same files further down, so a seeking client accepted what the
+    validator rejected. That is the divergence AGENTS.md §8 forbids between SDKs, and it
+    is no more defensible inside one.
+    """
+    for entry in index:
+        if not entry.extended:
+            raise MalformedFile(
+                f"the keyframe-delta chunk index entry at {entry.chunk_offset} omits "
+                "chunk_kind, delta reference, depth and live_count fields",
+                code="index-record-mismatch",
+            )
+        if entry.kind not in (0, 1):
+            raise MalformedFile(
+                f"the chunk index entry at {entry.chunk_offset} declares unknown chunk_kind "
+                f"{entry.kind}; expected 0 (keyframe) or 1 (delta)",
+                code="unknown-chunk-kind",
+            )
+
+
 def _check_entry_against_record(entry: rec.ChunkIndexEntry, head: rec.DeltaChunkHeader) -> None:
     """The four fields the index and the Delta Chunk both state (spec §5.8).
 
@@ -1118,27 +1142,40 @@ def compose_chain(
         if windows is None:
             windows = opened.windows
 
-    for indexed in index:
-        if not indexed.extended:
-            raise MalformedFile(
-                f"the keyframe-delta chunk index entry at {indexed.chunk_offset} omits "
-                "chunk_kind, delta reference, depth and live_count fields",
-                code="index-record-mismatch",
-            )
-        if indexed.kind not in (0, 1):
-            raise MalformedFile(
-                f"the chunk index entry at {indexed.chunk_offset} declares unknown chunk_kind "
-                f"{indexed.kind}; expected 0 (keyframe) or 1 (delta)",
-                code="unknown-chunk-kind",
-            )
+    check_index_entry_shape(index)
     chain = chain_from(index, entry)
     keyframe_at = chain[0].chunk_offset
+    # The three rules `scan_indexed` enforces and this path did not. A seeking client
+    # calling `compose_chain` accepted files the validator refused, each with its own
+    # refusal identifier -- so the same bytes were `forward-reference` on one path and
+    # readable on the other.
+    expected_depth = 0
     for link in chain:
         if link.extended and link.keyframe_offset != keyframe_at:
             raise MalformedFile(
                 f"the chunk index entry at {link.chunk_offset} declares keyframe_offset "
                 f"{link.keyframe_offset}; its chain reaches the keyframe at {keyframe_at}",
                 code="index-record-mismatch",
+            )
+        if link.kind == 0:
+            if link.depth != 0 or link.delta_mode != 0 or link.reference_offset != 0:
+                raise MalformedFile(
+                    f"the keyframe index entry at {link.chunk_offset} carries non-keyframe delta fields",
+                    code="index-record-mismatch",
+                )
+            expected_depth = 0
+            continue
+        if link.reference_offset >= link.chunk_offset:
+            raise MalformedFile(
+                f"delta index entry at {link.chunk_offset} references {link.reference_offset}, which is not behind it",
+                code="forward-reference",
+            )
+        expected_depth += 1
+        if link.depth != expected_depth:
+            raise MalformedFile(
+                f"delta index entry at {link.chunk_offset} declares depth {link.depth}; "
+                f"its chain from the keyframe at {keyframe_at} requires depth {expected_depth}",
+                code="depth-mismatch",
             )
     state: State | None = None
     for link in chain:
@@ -1379,19 +1416,7 @@ def scan_indexed(
             raise MalformedFile("keyframe-delta file has no Header or Quantization record")
         grids = _decoded_grids(quantization, windows, header.cutoff)
 
-    for entry in index:
-        if not entry.extended:
-            raise MalformedFile(
-                f"the keyframe-delta chunk index entry at {entry.chunk_offset} omits "
-                "chunk_kind, delta reference, depth and live_count fields",
-                code="index-record-mismatch",
-            )
-        if entry.kind not in (0, 1):
-            raise MalformedFile(
-                f"the chunk index entry at {entry.chunk_offset} declares unknown chunk_kind "
-                f"{entry.kind}; expected 0 (keyframe) or 1 (delta)",
-                code="unknown-chunk-kind",
-            )
+    check_index_entry_shape(index)
 
     current: tuple[int, int, int, State] | None = None
     keyframe: tuple[int, int, State] | None = None

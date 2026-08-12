@@ -356,6 +356,64 @@ class TestKeyframeDelta:
 
         assert state.count == 2
 
+    def test_compose_chain_refuses_what_scan_indexed_refuses(self):
+        """The seeking entry point and the scan must agree on which files are legal.
+
+        `compose_chain` is what a validator is told to call per entry, and it carried
+        neither the forward-reference check, the depth-chain check, nor the rule that a
+        keyframe entry zeroes its delta fields. `scan_indexed` carried all three, so the
+        same bytes were `forward-reference` on one path and readable on the other.
+        """
+        import copy
+
+        duration = 2.0
+        samples = [
+            Sample(
+                t0=float(step),
+                ids=np.array([1, 2]),
+                gaussians=_keyframe_gaussians([[0.1 * step, 0.0, 0.0], [1.0, 0.0, 0.0]], duration, None),
+            )
+            for step in range(2)
+        ]
+        data = kdf.write_sequence(samples, duration, kd=KeyframeDeltaOptions(keyframe_every=0), write_index=True)
+        opened = kdf.open_indexed(data)
+        assert any(e.kind == 1 for e in opened.index), "the fixture must carry a delta entry"
+
+        def verdicts(mutate):
+            index = copy.deepcopy(opened.index)
+            target = mutate(index)
+
+            def code(call):
+                try:
+                    call()
+                    return None
+                except FourdgsError as exc:
+                    return getattr(exc, "code", None)
+
+            return (
+                code(lambda: list(kdf.scan_indexed(data, index, opened.windows))),
+                code(lambda: kdf.compose_chain(data, index, target, opened.windows, opened.grids)),
+            )
+
+        def forward(index):
+            entry = next(e for e in index if e.kind == 1)
+            entry.reference_offset = entry.chunk_offset + 8
+            return entry
+
+        def depth(index):
+            entry = next(e for e in index if e.kind == 1)
+            entry.depth = 99
+            return entry
+
+        def keyframe_fields(index):
+            next(e for e in index if e.kind == 0).depth = 3
+            return next(e for e in index if e.kind == 1)
+
+        for mutate in (forward, depth, keyframe_fields):
+            scanned, composed = verdicts(mutate)
+            assert scanned is not None, "the scan is supposed to refuse this"
+            assert composed == scanned, f"{mutate.__name__}: scan said {scanned}, compose said {composed}"
+
     def test_the_header_gaussian_count_is_checked_against_the_distinct_ids(self):
         """`gaussian_count` counts distinct gaussians over the sequence under this model.
 
