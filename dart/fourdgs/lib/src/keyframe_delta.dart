@@ -353,7 +353,12 @@ KeyframeDeltaState _applyDelta(
       // by position against `ids`. Zero pads an identity lane, where a row without one is
       // a row nothing labelled; it stands for nothing in a position or a scale, and
       // padding those would put the older gaussians at the origin.
+      // Unless there is nobody to invent it for: a keyframe may state an empty population
+      // and leave the first birth to introduce the geometry, and padding no rows invents
+      // nothing. That is the one case this refusal must not take, and it is the case the
+      // Swift SDK spells as `state.ids.isEmpty`.
       if (existing == null &&
+          ids.isNotEmpty &&
           !_zeroDefaultIdentityAttributes.contains(attribute)) {
         throw FourdgsMalformedFile(
           'a birth group carries attribute $attribute, which the live population does '
