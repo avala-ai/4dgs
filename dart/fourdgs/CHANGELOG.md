@@ -37,12 +37,12 @@ happened.
   it would cover no instant, and this package's own reader refuses the record carrying it, so
   writing one produces a file neither read path can reopen.
 - Three lanes that a domain repair would otherwise change silently are refused instead: an rgb or
- - Three lanes that a domain repair would otherwise change silently are refused instead: an rgb or
-   opacity component outside `[0, 1]`, which `decodeChunk` clamps back into the range, so a channel
-   of 1.2 returns as 1.0 in a file declaring an `rgb` bound near 0.004; a scale at or below zero,
-   whose logarithm is undefined; and a finite negative `sigma_t`, which would be floored to a
-   positive lifetime. Every strictly positive Float32 scale, including values below `1e-30`, is
-   quantized from its actual logarithm and stays inside the declared relative bound. A `sigma_t` of
+- Three lanes that a domain repair would otherwise change silently are refused instead: an rgb or
+  opacity component outside `[0, 1]`, which `decodeChunk` clamps back into the range, so a channel
+  of 1.2 returns as 1.0 in a file declaring an `rgb` bound near 0.004; a scale at or below zero,
+  whose logarithm is undefined; and a finite negative `sigma_t`, which would be floored to a
+  positive lifetime. Every strictly positive Float32 scale, including values below `1e-30`, is
+  quantized from its actual logarithm and stays inside the declared relative bound. A `sigma_t` of
   exactly zero stays legal: it is a gaussian whose support is a single instant.
 - Finite authoring input is also checked in the representation the decoder returns. A position or
   velocity whose legal integer bin reconstructs beyond finite `float32` is refused rather than
