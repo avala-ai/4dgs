@@ -251,6 +251,32 @@ if(FOURDGS_BUILD_CONFORMANCE)
   endforeach()
 endif()
 
+option(FOURDGS_BUILD_TOOL "Build the 4dgs command-line tool" ${FOURDGS_IS_TOP_LEVEL})
+
+if(FOURDGS_BUILD_TOOL)
+  # A library plus a three-line `main`, rather than one executable: the tool's tests drive
+  # `fourdgs::tool::run` directly with argument strings and a pair of streams, so they check the
+  # exit code and the printed output together without spawning a process — which is what makes
+  # them work the same on Windows as on Linux.
+  add_library(fourdgs-tool STATIC tools/cli.cpp tools/inspect.cpp tools/validate.cpp
+                                  tools/walk.cpp)
+  target_include_directories(fourdgs-tool PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/tools)
+  target_link_libraries(fourdgs-tool PUBLIC fourdgs-cpp)
+  target_compile_definitions(fourdgs-tool PRIVATE FOURDGS_TOOL_VERSION="${PROJECT_VERSION}")
+  if(MSVC)
+    target_compile_options(fourdgs-tool PRIVATE /W4)
+  else()
+    target_compile_options(fourdgs-tool PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
+
+  add_executable(fourdgs-cli tools/main.cpp)
+  target_link_libraries(fourdgs-cli PRIVATE fourdgs-tool)
+  # The name a shell types. The target cannot be called `4dgs` — a CMake target starting with a
+  # digit is not portable across generators — but the binary can.
+  set_target_properties(fourdgs-cli PROPERTIES OUTPUT_NAME 4dgs)
+  fourdgs_pin_runtime_output(fourdgs-cli ${CMAKE_BINARY_DIR}/tools)
+endif()
+
 option(FOURDGS_BUILD_EXAMPLES "Build the examples" ${FOURDGS_IS_TOP_LEVEL})
 
 if(FOURDGS_BUILD_EXAMPLES)
@@ -276,6 +302,19 @@ if(FOURDGS_BUILD_TESTS)
     test_decode PRIVATE
     FOURDGS_CORPUS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../tests/conformance/data")
 
+  if(FOURDGS_BUILD_TOOL)
+    add_executable(test_tool tests/test_tool.cpp)
+    target_link_libraries(test_tool PRIVATE fourdgs-tool)
+    target_include_directories(test_tool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    # The invalid corpus already knows which rule each of its files breaks, so the tool's
+    # expectations are read out of it rather than restated here. Baking the absolute path in means
+    # the test finds it however it was launched.
+    target_compile_definitions(
+      test_tool PRIVATE
+      FOURDGS_CORPUS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../tests/conformance/data")
+    add_test(NAME test_tool COMMAND test_tool)
+  endif()
+
   if(FOURDGS_BUILD_CONFORMANCE)
     add_executable(test_canonical tests/test_canonical.cpp)
     target_link_libraries(test_canonical PRIVATE fourdgs-canonical)
@@ -288,6 +327,10 @@ include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
 set(FOURDGS_INSTALL_CMAKEDIR ${CMAKE_INSTALL_LIBDIR}/cmake/fourdgs-cpp)
+
+if(FOURDGS_BUILD_TOOL)
+  install(TARGETS fourdgs-cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
 
 install(
   TARGETS fourdgs-cpp
