@@ -349,7 +349,10 @@ void _checkGroupsDisjoint(Int32List a, Int32List b, Int32List d) {
   final body = parseChunk(content);
   if (body.header.compression.isNotEmpty) {
     throw FourdgsUnsupportedCodec(
-      'chunk-level "${body.header.compression}" compression is not supported',
+      'the keyframe Chunk at byte $at declares chunk-level '
+      '"${body.header.compression}" compression; expected an empty '
+      'chunk-level compression name and per-attribute stream codecs',
+      refusalCode: refusalUnknownStreamCodec,
     );
   }
   final streams = _decodeStreams(
@@ -385,7 +388,8 @@ void _checkGroupsDisjoint(Int32List a, Int32List b, Int32List d) {
 /// decoded allocation. Per-stream decoded-size limits remain the cross-SDK
 /// contract; this SDK must not add a differently scoped aggregate refusal.
 Map<int, _Column> _decodeStreams(FourdgsCursor cursor, int at) {
-  final framed = <({FourdgsStreamHeader header, Uint8List payload})>[];
+  final framed =
+      <({FourdgsStreamHeader header, Uint8List payload, int offset})>[];
   final seen = <int>{};
   while (cursor.remaining > 0) {
     final offset = at + cursor.pos;
@@ -404,7 +408,7 @@ Map<int, _Column> _decodeStreams(FourdgsCursor cursor, int at) {
         'per attribute',
       );
     }
-    framed.add((header: header, payload: payload));
+    framed.add((header: header, payload: payload, offset: offset));
   }
 
   final got = <int, _Column>{};
@@ -412,6 +416,7 @@ Map<int, _Column> _decodeStreams(FourdgsCursor cursor, int at) {
     final stream = decodeAttributeStreamBody(
       FourdgsCursor(entry.payload),
       entry.header,
+      streamOffset: entry.offset,
     );
     got[stream.attributeId] = _Column(stream.channels, stream.values);
   }
@@ -492,7 +497,10 @@ KeyframeDeltaSequence decodeKeyframeDeltaStreamed(Uint8List data) {
   for (final record in iterRecords(data, fourdgsMagic.length)) {
     switch (record.opcode) {
       case opHeader:
-        header = FourdgsHeader.parse(record.content);
+        header = FourdgsHeader.parse(
+          record.content,
+          fileOffset: record.offset + recordHeaderBytes,
+        );
         if (header.temporalModel != 'keyframe-delta') {
           throw FourdgsMalformedFile(
             'decodeKeyframeDeltaStreamed is the keyframe-delta path; this file is '
@@ -608,7 +616,10 @@ decodeKeyframeDeltaIndexed(Uint8List data) {
   FourdgsFooter? footer;
   for (final record in iterRecords(data, fourdgsMagic.length)) {
     if (record.opcode == opHeader) {
-      header = FourdgsHeader.parse(record.content);
+      header = FourdgsHeader.parse(
+        record.content,
+        fileOffset: record.offset + recordHeaderBytes,
+      );
     } else if (record.opcode == opQuantization) {
       quantization = FourdgsQuantization.parse(
         record.content,
@@ -878,11 +889,18 @@ class _Grids {
   final List<FourdgsWindow> windows;
   final double cutoff;
 
-  /// The length of the window [index] names, refusing one the table cannot
-  /// answer rather than clamping: clamping substitutes one gaussian's lifetime
-  /// for another's in a file that is already wrong.
-  /// The window [index] names, refusing one the table cannot answer.
-  FourdgsWindow windowAt(int index) {
+  /// The window [index] names, refusing one the table cannot answer rather than
+  /// clamping: clamping substitutes one gaussian's lifetime for another's in a
+  /// file that is already wrong.
+  ///
+  /// [gaussian] is the stable id of the gaussian that named the index, so the
+  /// refusal says which one. A keyframe-delta state restates many gaussians and
+  /// this is reached once per row, so "window index 7 is outside the table" on
+  /// its own is a fact about the file with no way to find it again. The id
+  /// rather than the row, because rows are an artefact of composition order and
+  /// the id is what the file carries (spec §11.5). Null, not a negative number,
+  /// for a caller that has no gaussian to blame — see [_named].
+  FourdgsWindow windowAt(int index, {int? gaussian}) {
     // An absent or empty table is one default (0, 0) window, matching the chunk
     // decoder. Clamping instead would substitute one gaussian's lifetime for
     // another's in a file that is already wrong.
@@ -891,14 +909,16 @@ class _Grids {
             ? const <FourdgsWindow>[FourdgsWindow(0.0, 0.0)]
             : windows;
     if (index < 0 || index >= table.length) {
-      throw FourdgsMalformedFile(
-        'window index $index is outside the ${table.length}-entry window table',
+      throw windowIndexOutOfRange(
+        index,
+        table.length,
+        gaussian: _named(gaussian),
       );
     }
     return table[index];
   }
 
-  double windowLengthAt(int index) {
+  double windowLengthAt(int index, {int? gaussian}) {
     // An absent or empty Window Table is one default (0, 0) window, not an
     // unbounded fallback — the same defaulting the chunk decoder applies. A
     // bare `return 0.0` for an empty table would let any index decode against
@@ -908,12 +928,25 @@ class _Grids {
             ? const <FourdgsWindow>[FourdgsWindow(0.0, 0.0)]
             : windows;
     if (index < 0 || index >= table.length) {
-      throw FourdgsMalformedFile(
-        'window index $index is outside the ${table.length}-entry window table',
+      throw windowIndexOutOfRange(
+        index,
+        table.length,
+        gaussian: _named(gaussian),
       );
     }
     return table[index].hi - table[index].lo;
   }
+
+  /// `"gaussian 12"`, or nothing when the caller had no id to give.
+  ///
+  /// The absent case is `null` rather than a negative number because a negative
+  /// number is a legal id here. `gaussian_id` is a `u32` (spec §11.2) and bins
+  /// are decoded as signed 32-bit in every SDK, so an id at or above `2^31`
+  /// arrives as a negative value — `0xFFFFFFFF` reads as `-1`. A `-1` sentinel
+  /// would therefore silently drop the location from the one refusal that named
+  /// the highest legal id, which is the opposite of what §6 asks for.
+  static String _named(int? gaussian) =>
+      gaussian == null ? '' : 'gaussian $gaussian';
 }
 
 _Grids _gridsFor(KeyframeDeltaSequence sequence) {
@@ -991,7 +1024,7 @@ _Reconstruction _reconstructAt(
   for (final i in order) {
     // Validated, not clamped: a row dropped for being outside a window it never
     // named would make a malformed file look like a valid, emptier one.
-    final w = grids.windowAt(windowIndex[i]);
+    final w = grids.windowAt(windowIndex[i], gaussian: state.ids[i]);
     if (w.lo <= t && t < w.hi) kept.add(i);
   }
 
@@ -1013,7 +1046,7 @@ _Reconstruction _reconstructAt(
         sigmaBin,
         steps.sigmaLog,
         neverFades,
-        grids.windowLengthAt(windowIndex[i]),
+        grids.windowLengthAt(windowIndex[i], gaussian: state.ids[i]),
         k: k,
       ),
       steps.motion,

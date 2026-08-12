@@ -1,0 +1,2434 @@
+// Copyright 2026 Avala AI
+// SPDX-License-Identifier: Apache-2.0
+
+/// The encoder: gaussians in, framed `.4dgs` records out.
+///
+/// A second implementation rather than a binding. Dart authoring — a Flutter
+/// tool, a converter, a test fixture — is the point, so the arithmetic here
+/// mirrors the reference encoders rather than calling into one. Every attribute
+/// lands on the grid the Quantization record declares, the records are framed
+/// by length, the summary is written contiguously ahead of the Footer, and the
+/// magic closes the file as it opened it.
+///
+/// What makes two independent encoders interchangeable is that a decoder cannot
+/// tell their output apart once decoded. The bins computed here are the same
+/// integers the Python and Rust encoders compute for the same input, so the
+/// decoded values agree to the last bit. Byte layout below that — how well
+/// `deflate` did, whether a stream came out smaller raw or delta-coded — is an
+/// encoder's own business and is not part of what the file means.
+///
+/// Bounded like the decoders (AGENTS.md §1): nothing here is quadratic in the
+/// gaussian count, no chunk's streams are held after its record is emitted, and
+/// [writeFourdgsToSink] never retains the complete file. [writeFourdgsBytes] is
+/// the explicit in-memory convenience for callers that already need one buffer.
+library;
+
+import 'dart:convert';
+import 'dart:math' as math;
+import 'dart:typed_data';
+
+import 'package:archive/archive.dart' as archive;
+
+import 'chunk_decoder.dart' show shBandRange;
+import 'exceptions.dart';
+import 'indexed_reader.dart' show maxChunkIndexEntries;
+import 'model.dart';
+import 'opcode.dart';
+import 'quantization.dart';
+import 'records.dart' show maxWindowsPerScene;
+import 'serialization.dart';
+
+/// The caller handed the encoder something no conforming file can be written
+/// from.
+///
+/// Distinct from [FourdgsMalformedFile], which is about bytes that arrived:
+/// this one is about values that were passed in, and the fix is on the calling
+/// side. The message names the field and the gaussian, because "a value is not
+/// finite" without either is a diagnosis the caller cannot act on (AGENTS.md
+/// §6).
+class FourdgsInvalidInput extends FourdgsException {
+  const FourdgsInvalidInput(super.message);
+}
+
+/// The reference lifetime the velocity grid is expressed against (spec §6.3).
+const double _lifeRef = 0.5;
+
+/// Maximum population whose encoded attribute streams share one Chunk record.
+///
+/// A Chunk is framed by its total byte length, so its streams must be encoded
+/// before its header can be emitted. Keeping this fixed makes the record buffer
+/// bounded even when the caller supplies a much larger validated scene.
+const int _maxGaussiansPerChunk = 16384;
+
+/// Quantization profiles, as `(k, scaleRel, rot, rgb255, time, sigmaRel, sh)`.
+///
+/// `k` scales the position tolerance by the scene's own median gaussian radius,
+/// so a profile means the same thing on a tabletop capture and on a city block.
+const Map<String, List<double>> _profiles = <String, List<double>>{
+  'fine': <double>[0.02, 0.005, 0.0005, 0.5, 0.0005, 0.005, 0],
+  'default': <double>[0.05, 0.02, 0.002, 1.0, 0.002, 0.02, 0],
+  'coarse': <double>[0.20, 0.06, 0.006, 3.0, 0.008, 0.06, 1],
+};
+
+/// How a scene is written. The defaults are the reference encoders' own.
+class FourdgsWriteOptions {
+  const FourdgsWriteOptions({
+    this.profile = 'default',
+    this.cutoff = fourdgsDefaultCutoff,
+    this.codec = codecDeflate,
+    this.level = 6,
+    this.maxDepth = 6,
+    this.minChunkGaussians = 2048,
+    this.writeIndex = true,
+    this.writeStatistics = false,
+    this.writeSummaryOffsets = false,
+    this.writeCrc = true,
+    this.shBands = 3,
+    this.shBitDepths = const <int>[],
+    this.verify = true,
+    this.library = '4dgs-dart encoder',
+    this.sceneProfile = '',
+    this.attributes = const <String, String>{},
+  });
+
+  /// The quantization profile: `fine`, `default` or `coarse`. It selects the
+  /// error bounds, and through them every grid pitch the file declares.
+  final String profile;
+
+  /// The Header's marginal visibility threshold. Not only metadata: it sets the
+  /// support constant the per-gaussian velocity grid is derived from, so encoder
+  /// and decoder must agree on it, and they do by reading it from the file.
+  final double cutoff;
+
+  /// The stream codec. Only [codecDeflate] is available to a pure-Dart build,
+  /// which is why it is the default everywhere.
+  final int codec;
+
+  /// Deflate compression level: `-1` for the codec's own default, or `0`–`9`
+  /// from fastest to smallest. Anything else is refused by name.
+  final int level;
+
+  /// Depth of the temporal partition below each window, `0` to `32`. `0` writes
+  /// one chunk per window interval, which is the coarsest partition that is
+  /// still a partition. The ceiling is there because the descent is recursive
+  /// and a gaussian that lives for one instant never stops descending.
+  final int maxDepth;
+
+  /// The population a subdivision has to reach to be worth its own chunk, at
+  /// least `1`. Below it a node hands its gaussians back to its parent, so a
+  /// deep tree over a small scene does not turn into hundreds of chunks of four.
+  final int minChunkGaussians;
+
+  final bool writeIndex;
+  final bool writeStatistics;
+  final bool writeSummaryOffsets;
+  final bool writeCrc;
+
+  /// Highest spherical-harmonic band to write, capped further by the scene's
+  /// own degree.
+  final int shBands;
+
+  /// Per-band spherical-harmonic bit depths, band 1 first.
+  ///
+  /// Named choices live in [fourdgsShLadders]; for example,
+  /// `fourdgsShLadders['balanced']!` is the balanced list to pass here.
+  ///
+  /// Empty applies no per-band depth: coefficients remain their exact eight-bit
+  /// values, the appended field is not emitted, and a profile's `step_sh`
+  /// remains compatibility metadata rather than an implicit coefficient grid.
+  final List<int> shBitDepths;
+
+  /// Decode each band record back and measure the deviation before declaring a
+  /// bound for it.
+  ///
+  /// On by default, because a bound nobody verified is worse than no bound:
+  /// consumers will trust it. The arithmetic that produced these bytes is three
+  /// lines and would agree with itself if it were wrong, so what is measured is
+  /// what came back out of the record.
+  final bool verify;
+
+  /// Free-form producer identification, written to the Header.
+  final String library;
+
+  /// The Header's `profile` field — a well-known scene profile name, which is a
+  /// different thing from the quantization [profile] above.
+  final String sceneProfile;
+
+  /// The Header's free-form attribute map.
+  final Map<String, String> attributes;
+}
+
+/// Encode [gaussians] as one in-memory `.4dgs` file.
+///
+/// [durationSec] is the scene length; playback covers `[0, durationSec)`. A
+/// static asset is `0`, and the index it produces is the single half-open
+/// interval `[0, 1e-9)` the reference encoders write for one — a seek at `t=0`
+/// has to land somewhere, and an empty interval covers no instant at all.
+Uint8List writeFourdgsBytes(
+  FourdgsGaussianSet gaussians,
+  double durationSec, {
+  FourdgsWriteOptions options = const FourdgsWriteOptions(),
+}) {
+  final collector = _ByteCollector();
+  writeFourdgsToSink(collector, gaussians, durationSec, options: options);
+  return collector.finish();
+}
+
+/// Encode [gaussians] to [sink], one complete framed record at a time.
+///
+/// The sink is borrowed and is not closed. The writer retains the quantized
+/// gaussian lanes and the small Chunk Index, but releases each Chunk and SH Band
+/// record after [Sink.add] returns; memory does not grow with the output file.
+/// A sink that performs I/O belongs in a transport package at the application
+/// edge, while tests and browsers can supply any other `Sink<List<int>>`.
+void writeFourdgsToSink(
+  Sink<List<int>> sink,
+  FourdgsGaussianSet gaussians,
+  double durationSec, {
+  FourdgsWriteOptions options = const FourdgsWriteOptions(),
+}) {
+  if (durationSec.isNaN || durationSec < 0.0) {
+    throw FourdgsInvalidInput(
+      'duration_sec is $durationSec; expected a value >= 0, or +Infinity for '
+      'an open-ended scene (a static asset says so with 0)',
+    );
+  }
+  if (!_profiles.containsKey(options.profile)) {
+    throw FourdgsInvalidInput(
+      'unknown quantization profile "${options.profile}"; '
+      'the profiles are ${_profiles.keys.toList()..sort()}',
+    );
+  }
+  if (options.codec != codecDeflate) {
+    throw FourdgsUnsupportedCodec(
+      'stream codec ${options.codec} is not available to a pure-Dart build; '
+      'write deflate, which every reader implements',
+    );
+  }
+  _checkOptions(options);
+  // A profile is a promise about what the file contains, made so a consumer can
+  // reject an unsuitable file up front rather than discovering the absence
+  // mid-decode. `objects` promises an `object_id` stream in every non-empty
+  // chunk and one Object Table (registry, Profiles). This writer can emit the
+  // stream when the gaussian set supplies it, but its API has no Object Table
+  // input at all. Writing the string anyway would put a promise in the Header
+  // that the bytes below it do not keep. Refusing names the unsupported record;
+  // silently downgrading to "" would throw away what the caller asked for.
+  if (options.sceneProfile == 'objects') {
+    throw FourdgsInvalidInput(
+      'the scene profile "objects" promises one Object Table, but this writer '
+      'has no Object Table input; write the object layer first or leave the '
+      'profile empty',
+    );
+  }
+  if (options.sceneProfile == 'relightable') {
+    throw FourdgsInvalidInput(
+      'the scene profile "relightable" is reserved for a future relighting '
+      'extension, and a version-1 writer MUST NOT emit it',
+    );
+  }
+  if (options.sceneProfile == 'keyframed') {
+    throw const FourdgsInvalidInput(
+      'the scene profile "keyframed" promises a keyframe-delta temporal model '
+      'with indexed state chunks and Statistics, while this writer emits the '
+      'gaussian-birth model; use the sequence writer or leave the profile empty',
+    );
+  }
+  if (options.sceneProfile == 'capture') {
+    throw const FourdgsInvalidInput(
+      'the scene profile "capture" promises finite windows, multiple indexed '
+      'chunks, and Statistics; this reference writer does not yet enforce all '
+      'three promises, so leave the scene profile empty',
+    );
+  }
+  if (options.sceneProfile != '' && options.sceneProfile != 'baked') {
+    throw FourdgsInvalidInput(
+      'unknown scene profile "${options.sceneProfile}"; the registered '
+      'profiles are "", baked, capture, keyframed, objects, relightable, and '
+      'this writer can emit only "" or baked',
+    );
+  }
+  _checkInput(gaussians, options.cutoff);
+
+  final n = gaussians.count;
+  // These are small option-derived tables, and option errors should win before
+  // grid derivation or chunk planning touches a large scene.
+  final bands = _bandColumns(gaussians, options.shBands);
+  final depths = _resolveShDepths(options.shBitDepths, bands);
+  final grid = _Grid.forScene(gaussians, options.profile);
+  final windows = _WindowTable.of(gaussians);
+  final encodedAabb = _encodedAabb(gaussians, grid);
+
+  // Window boundaries are the top level of the temporal partition. Anything
+  // strictly inside the clip is a split point; the ends are always present.
+  final tops = _tops(windows.windows, durationSec);
+  final planningSupport = _planningSupport(
+    gaussians,
+    grid,
+    windows,
+    options.cutoff,
+  );
+  final plans = _planChunks(
+    gaussians,
+    planningSupport,
+    tops,
+    options,
+    staticScene: durationSec == 0.0,
+  );
+
+  // The index this partition would produce has to be one this package's own
+  // indexed reader will open. `openFourdgsIndexed` stops at
+  // `maxChunkIndexEntries` — the index has no declared count, so a runaway one
+  // is caught by a ceiling rather than by arithmetic — and the top level of the
+  // tree is the window table, so a scene giving every gaussian its own validity
+  // window produces one entry per window whatever `minChunkGaussians` says. Past
+  // the ceiling the file is still a legal stream, and it is one only the
+  // front-to-back path can read: the seeking path, which is the entire reason to
+  // write an index, refuses it. Saying so here names the count and the ceiling;
+  // `writeIndex: false` writes the same chunks without the claim.
+  if (options.writeIndex && plans.length > maxChunkIndexEntries) {
+    throw FourdgsInvalidInput(
+      'this scene partitions into ${plans.length} chunks, past the '
+      '$maxChunkIndexEntries entries an indexed reader will open — the top '
+      'level of the tree is the window table, so distinct validity windows set '
+      'the floor on the entry count; write fewer windows, or write this scene '
+      'with writeIndex: false',
+    );
+  }
+
+  final out = _SinkWriter(sink);
+  out.bytes(fourdgsMagic);
+  // The degree the file actually carries, which is the highest band written and
+  // not the degree the input happened to hold. `shBands` caps what is emitted,
+  // so a degree-3 scene written with `shBands: 1` carries band 1 alone — three
+  // coefficients per component — and declaring 3 there would promise fifteen.
+  // Bands are whole and a reader takes them whole (spec §6.5): bands 1..D give
+  // exactly a degree-D scene, so D is a count of what is present.
+  out.bytes(
+    _header(
+      gaussians,
+      durationSec,
+      options,
+      bands.isEmpty ? 0 : bands.last.band,
+      encodedAabb,
+    ),
+  );
+  out.bytes(_quantizationRecord(grid, depths));
+  out.bytes(_windowTableRecord(windows));
+
+  final index = <_IndexEntry>[];
+  for (final plan in plans) {
+    // Spatial order is materialized for this one bounded chunk and released
+    // after it is written. The plan retains only a view into one packed i32
+    // assignment table shared by the whole partition.
+    final members = plan.members(gaussians);
+    // Quantized columns are bounded by one Chunk. Keeping the whole scene's
+    // eleven lanes here would make the sink API retain memory in proportion to
+    // output size even though every framed record is released immediately.
+    final quantized = _quantize(
+      gaussians,
+      members,
+      grid,
+      windows,
+      options.cutoff,
+    );
+    final streams = _ByteWriter(4096);
+    for (final lane in quantized.lanes) {
+      streams.bytes(
+        _encodeStream(lane.attributeId, lane.values, lane.channels, options),
+      );
+    }
+    final chunkOffset = out.length;
+    final chunk = _chunkRecord(
+      plan.t0,
+      plan.t1,
+      plan.level,
+      members.length,
+      streams.finish(),
+    );
+    out.bytes(chunk);
+
+    final List<_IndexBand>? entryBands =
+        options.writeIndex ? <_IndexBand>[] : null;
+    for (final band in bands) {
+      final blob = _bandRecord(gaussians, band, members, depths, options);
+      final at = out.length;
+      out.bytes(blob);
+      entryBands?.add(_IndexBand(band.band, at, blob.length));
+    }
+
+    if (options.writeIndex) {
+      index.add(
+        _IndexEntry(
+          t0: plan.t0,
+          t1: plan.t1,
+          chunkOffset: chunkOffset,
+          chunkLength: chunk.length,
+          gaussianCount: members.length,
+          bands: entryBands!,
+        ),
+      );
+    }
+  }
+
+  // The summary (spec §4.5): the Chunk Index, then Statistics, then the Summary
+  // Offset, contiguous and immediately before the Footer. Nothing else may sit
+  // inside that run, because the Footer's `summary_start` names its first byte
+  // and the CRC covers precisely that range — which is what lets a streamed
+  // reader verify the checksum by retaining the trailing records rather than
+  // the file.
+  int summaryStart = 0;
+  int summaryOffsetStart = 0;
+  int summaryLength = 0;
+  int summaryCrc = 0;
+  void emitSummary(Uint8List record) {
+    out.bytes(record);
+    if (options.writeCrc) {
+      summaryCrc = fourdgsCrc32(record, summaryCrc);
+    }
+  }
+
+  if (options.writeIndex && index.isNotEmpty) {
+    summaryStart = out.length;
+    final groupStart = summaryStart;
+    for (final entry in index) {
+      emitSummary(entry.encode());
+    }
+    // Taken here, before anything else is appended. A Summary Offset frames one
+    // *class* of summary record, so that a consumer can range-read the index
+    // without the rest of the summary; measuring the group after Statistics has
+    // been written declares a range whose tail is a different record class,
+    // which is the one thing the record exists to prevent.
+    final groupEnd = out.length;
+    if (options.writeStatistics) {
+      emitSummary(_statisticsRecord(n, index.length, durationSec, encodedAabb));
+    }
+    if (options.writeSummaryOffsets) {
+      summaryOffsetStart = out.length;
+      emitSummary(
+        _summaryOffsetRecord(opChunkIndex, groupStart, groupEnd - groupStart),
+      );
+    }
+    summaryLength = out.length - summaryStart;
+  }
+
+  final crc = options.writeCrc && summaryLength > 0 ? summaryCrc : 0;
+  out.bytes(_footerRecord(summaryStart, summaryOffsetStart, crc));
+  out.bytes(fourdgsMagic);
+}
+
+// --------------------------------------------------------------------------
+// Input validation
+// --------------------------------------------------------------------------
+
+/// The deepest temporal partition this encoder will build below a window.
+///
+/// Not a taste limit. A window split this far is intervals of nanoseconds even
+/// on a scene measured in days — orders of magnitude below the finest time grid
+/// any quantization profile declares — and a chunk index with `2^32` entries per
+/// window is not a file anybody can read. Past here the depth buys nothing and
+/// costs a stack frame per level.
+const int _maxChunkTreeDepth = 32;
+
+/// The values a caller chose, before any of them is acted on.
+///
+/// Every one of these is a caller's mistake rather than a file's, which is what
+/// [FourdgsInvalidInput] is for, and each message names the value it got and the
+/// range it wanted (AGENTS.md §6). The alternative is what these used to do: an
+/// out-of-range deflate level surfaced as `RangeError` from inside a compression
+/// library, and an out-of-range depth surfaced as `StackOverflowError` from
+/// inside the chunk planner — two diagnoses that name neither the option nor the
+/// caller who set it.
+void _checkOptions(FourdgsWriteOptions options) {
+  if (options.level < -1 || options.level > 9) {
+    throw FourdgsInvalidInput(
+      'deflate level is ${options.level}; the levels are -1 for the codec\'s '
+      'own default and 0 to 9 from fastest to smallest',
+    );
+  }
+  // The descent below a window is one stack frame per level, and a gaussian
+  // whose support is a single instant never straddles a midpoint, so it never
+  // stops descending: with `minChunkGaussians: 1` a large depth is a
+  // `StackOverflowError` rather than a file or a diagnosis.
+  if (options.maxDepth < 0 || options.maxDepth > _maxChunkTreeDepth) {
+    throw FourdgsInvalidInput(
+      'max_depth is ${options.maxDepth}; the temporal partition runs from 0 '
+      'levels below each window interval to $_maxChunkTreeDepth',
+    );
+  }
+  if (options.minChunkGaussians < 1) {
+    throw FourdgsInvalidInput(
+      'min_chunk_gaussians is ${options.minChunkGaussians}; a chunk holds at '
+      'least one gaussian, so the population that earns a subdivision its own '
+      'chunk is at least 1',
+    );
+  }
+  if (options.shBands < 0) {
+    throw FourdgsInvalidInput(
+      'sh_bands is ${options.shBands}; the highest band to write is 0 for none '
+      'or a positive band number, capped further by the scene\'s own degree',
+    );
+  }
+}
+
+/// Per-gaussian lanes that land on a grid, so a non-finite value in one either
+/// sets a non-finite grid parameter or rounds to a meaningless bin.
+void _checkInput(FourdgsGaussianSet g, double cutoff) {
+  // Reading the Header's own threshold back is what the decoder does; refusing
+  // it here means the encoder cannot write a file whose cutoff its own decoder
+  // would reject.
+  if (cutoff.isNaN || !cutoff.isFinite || cutoff <= 0.0 || cutoff > 1.0) {
+    throw FourdgsInvalidInput(
+      'cutoff is $cutoff; authoring input must be finite and in (0, 1]',
+    );
+  }
+  supportK(cutoff);
+
+  final n = g.count;
+  _checkLength('positions', g.positions.length, n * 3);
+  _checkLength('scales', g.scales.length, n * 3);
+  _checkLength('rotations', g.rotations.length, n * 4);
+  _checkLength('colors', g.colors.length, n * 4);
+  _checkLength('motions', g.motions.length, n * 3);
+  // `mu_t` is deliberately absent from this list, and it is the one lane that
+  // cannot be checked here: `FourdgsGaussianSet.count` *is* `muT.length`, so it
+  // is the ruler the other eight are measured against rather than another lane
+  // to measure. A caller who passes a short `mu_t` has described a smaller
+  // scene, and every other lane is then too long — which is caught above, by
+  // name, on the first one. There is no length it can hold that reaches the
+  // quantizer unchecked.
+  _checkLength('sigma_t', g.sigmaT.length, n);
+  _checkLength('win_lo', g.winLo.length, n);
+  _checkLength('win_hi', g.winHi.length, n);
+  final sourceGroup = g.sourceGroup;
+  if (sourceGroup != null) _checkLength('source_group', sourceGroup.length, n);
+  final sourceIndex = g.sourceIndex;
+  if (sourceIndex != null) _checkLength('source_index', sourceIndex.length, n);
+  final objectId = g.objectId;
+  if (objectId != null) _checkLength('object_id', objectId.length, n);
+  _checkSh(g, n);
+  if (n == 0) return;
+
+  _checkFinite('positions', g.positions, 3);
+  _checkFinite('scales', g.scales, 3);
+  _checkFinite('rotations', g.rotations, 4);
+  _checkFinite('colors', g.colors, 4);
+  _checkFinite('motions', g.motions, 3);
+  _checkFinite('mu_t', g.muT, 1);
+
+  for (int i = 0; i < n; i++) {
+    double largest = 0.0;
+    for (int c = 0; c < 4; c++) {
+      largest = math.max(largest, g.rotations[i * 4 + c].abs());
+    }
+    if (largest == 0.0) {
+      throw FourdgsInvalidInput(
+        'rotation has zero length at gaussian $i; a zero quaternion has no '
+        'orientation to encode',
+      );
+    }
+  }
+
+  // These lanes have domains the quantizer cannot repair. Colour is read back
+  // through `.clamp(0.0, 1.0)`, so an input of 1.2 returns as 1.0 while the file
+  // declares an `rgb` bound near 0.004. Scale is quantized in the log domain,
+  // which is defined for every positive Float32 value and for nothing at or
+  // below zero. Refusing outside those domains names the lane and gaussian;
+  // flooring would quietly store a value nobody authored (AGENTS.md §6).
+  for (int i = 0; i < n; i++) {
+    for (int c = 0; c < 4; c++) {
+      final v = g.colors[i * 4 + c];
+      if (v < 0.0 || v > 1.0) {
+        throw FourdgsInvalidInput(
+          '${c == 3 ? "opacity" : "color"} is $v at gaussian $i; linear rgb and '
+          'opacity are stored in [0, 1] and a decoder clamps to it, so a value '
+          'outside it comes back changed by far more than this file declares',
+        );
+      }
+    }
+    for (int axis = 0; axis < 3; axis++) {
+      final scale = g.scales[i * 3 + axis];
+      if (scale <= 0.0) {
+        throw FourdgsInvalidInput(
+          'scale is $scale at gaussian $i; a gaussian extent is quantized in the '
+          'log domain against a relative bound, which a value at or below zero '
+          'has no meaning in',
+        );
+      }
+    }
+  }
+
+  // `sigma_t` is not on the finite list: `+inf` is its documented spelling for a
+  // gaussian that never fades (spec §3), and it survives encode and decode as
+  // infinity. NaN and `-inf` are refused, because a decoder reads every
+  // non-finite sigma as never-fading and a NaN there becomes a
+  // deliberate-looking value. A finite negative one is refused for the reason
+  // above: it is a standard deviation and would be stored as a positive
+  // lifetime nobody wrote.
+  // Zero stays legal — it is a gaussian whose support is a single instant, which
+  // is a shape the chunk planner has to handle. The encoder uses `1e-30` only
+  // as zero's finite logarithmic spelling; every positive Float32 value has a
+  // defined logarithm of its own and must retain the declared relative bound.
+  for (int i = 0; i < n; i++) {
+    final sigma = g.sigmaT[i];
+    if (sigma.isNaN || sigma == double.negativeInfinity) {
+      throw FourdgsInvalidInput(
+        'sigma_t is $sigma at gaussian $i; use +inf for a gaussian that never fades',
+      );
+    }
+    if (sigma < 0.0) {
+      throw FourdgsInvalidInput(
+        'sigma_t is $sigma at gaussian $i; it is a temporal standard deviation, '
+        'so a negative one has no lifetime to encode and would be stored as a '
+        'positive one nobody wrote',
+      );
+    }
+  }
+
+  // `win_lo` and `win_hi` are excluded from the finite check on purpose. The
+  // validity window goes into the Window Table as `f64` verbatim (spec §5.4),
+  // touching no grid at all, so `win_hi = +inf` is how a static asset says it is
+  // present at every instant — which is exactly what a glTF import writes. Only
+  // NaN is refused, and for a sharper reason than untidiness: a NaN window makes
+  // every visibility comparison false, so the gaussian silently never appears.
+  for (final name in const <String>['win_lo', 'win_hi']) {
+    final values = name == 'win_lo' ? g.winLo : g.winHi;
+    for (int i = 0; i < n; i++) {
+      if (values[i].isNaN) {
+        throw FourdgsInvalidInput(
+          '$name is NaN at gaussian $i; a NaN window makes every visibility '
+          'comparison false, so the gaussian silently never appears',
+        );
+      }
+    }
+  }
+
+  // Ordering, which the NaN check above does not imply. Visibility is gated on
+  // `lo <= t < hi`, so an inverted window covers no instant and the gaussian
+  // disappears from a file that otherwise looks entirely well-formed. This
+  // reader refuses such a window when it reads one back
+  // (`FourdgsWindowTable.parse`), so without this check the encoder can hand
+  // back a file neither of its own read paths will reopen — the one output a
+  // writer must never produce. `lo == hi` stays legal: the empty window is how
+  // a static asset's index spells "no extent", and the NoData fixture is
+  // exactly that. Equal *infinite* endpoints are refused below: their
+  // subtraction is NaN, and the other version-1 SDKs do not yet share Dart's
+  // normalization of that empty span when deriving a motion grid.
+  for (int i = 0; i < n; i++) {
+    if (g.winHi[i] < g.winLo[i]) {
+      throw FourdgsInvalidInput(
+        'gaussian $i has the validity window [${g.winLo[i]}, ${g.winHi[i]}), '
+        'whose lower bound is above its upper; visibility is gated on '
+        'lo <= t < hi, so it would cover no instant and this reader refuses '
+        'the Window Table record it would be written into',
+      );
+    }
+    if (g.winHi[i] == g.winLo[i] && !g.winLo[i].isFinite) {
+      throw FourdgsInvalidInput(
+        'gaussian $i has the infinite empty validity window '
+        '[${g.winLo[i]}, ${g.winHi[i]}); its length is NaN and the version-1 '
+        'decoders do not share one motion-grid interpretation for it',
+      );
+    }
+  }
+}
+
+/// The coefficient counts a whole degree has: 3 at degree 1, 8 at 2, 15 at 3.
+const List<int> _wholeDegrees = <int>[3, 8, 15];
+
+/// The spherical-harmonic row is whole degrees, and the buffer is the size that
+/// row implies.
+///
+/// Bands are whole and a reader takes them whole (spec §6.5), which cuts both
+/// ways: `decodeShBandRecord` refuses a band record that does not carry all of
+/// its band's channels, so a row of four coefficients — a whole degree-1 band
+/// and two fifths of a degree-2 one — cannot be written as one. Before this
+/// check the writer built band 2 out of the single column it had and declared
+/// three channels where the band defines fifteen, and the file it returned could
+/// not be reopened by either of this package's read paths. A buffer of the wrong
+/// size is refused here for the same reason `positions` is: the alternative is a
+/// `RangeError` from the gather loop, which names neither the lane nor the
+/// gaussian.
+void _checkSh(FourdgsGaussianSet g, int n) {
+  final sh = g.sh;
+  if (sh == null) return;
+  if (!_wholeDegrees.contains(g.shCoefficients)) {
+    throw FourdgsInvalidInput(
+      'sh_coefficients is ${g.shCoefficients}; a spherical-harmonic row is '
+      'whole degrees, so it holds $_wholeDegrees coefficients per colour '
+      'component and nothing between them',
+    );
+  }
+  final declaredCoefficients = switch (g.shDegree) {
+    0 => 0,
+    1 => 3,
+    2 => 8,
+    3 => 15,
+    _ => -1,
+  };
+  if (declaredCoefficients < 0) {
+    throw FourdgsInvalidInput(
+      'sh_degree is ${g.shDegree}; version 1 defines only degrees 0 through 3',
+    );
+  }
+  if (g.shCoefficients > declaredCoefficients) {
+    throw FourdgsInvalidInput(
+      'sh_coefficients is ${g.shCoefficients}, deeper than sh_degree '
+      '${g.shDegree} can declare ($declaredCoefficients); writing only the '
+      'declared bands would silently discard supplied coefficients',
+    );
+  }
+  _checkLength('sh', sh.length, n * 3 * g.shCoefficients);
+}
+
+void _checkLength(String name, int got, int want) {
+  if (got != want) {
+    throw FourdgsInvalidInput(
+      '$name holds $got values, expected $want for this gaussian count',
+    );
+  }
+}
+
+void _checkFinite(String name, List<double> values, int width) {
+  for (int i = 0; i < values.length; i++) {
+    if (!values[i].isFinite) {
+      throw FourdgsInvalidInput(
+        '$name is ${values[i]} at gaussian ${i ~/ width}; it is quantized onto '
+        'a grid, and a non-finite value there violates spec §5.3',
+      );
+    }
+  }
+}
+
+// --------------------------------------------------------------------------
+// The grid
+// --------------------------------------------------------------------------
+
+/// The error bounds a profile declares and the grid pitches they imply.
+///
+/// Each pitch is exactly twice its bound, in the appropriate domain, so
+/// `|decoded - original| <= bound` holds by construction rather than by testing.
+class _Grid {
+  _Grid({
+    required this.origin,
+    required this.boundPos,
+    required this.boundScaleRel,
+    required this.boundRot,
+    required this.boundRgb,
+    required this.boundTime,
+    required this.boundSigmaRel,
+    required this.boundSh,
+  });
+
+  factory _Grid.forScene(FourdgsGaussianSet g, String profile) {
+    final constants = _profiles[profile]!;
+    final medianScale = g.count == 0 ? 1e-3 : _medianFloat32(g.scales);
+    final origin = Float64List(3);
+    if (g.count > 0) {
+      for (int axis = 0; axis < 3; axis++) {
+        double lowest = double.infinity;
+        for (int i = 0; i < g.count; i++) {
+          final v = g.positions[i * 3 + axis];
+          if (v < lowest) lowest = v;
+        }
+        origin[axis] = lowest;
+      }
+    }
+    return _Grid(
+      origin: origin,
+      boundPos: constants[0] * medianScale,
+      boundScaleRel: constants[1],
+      boundRot: constants[2],
+      boundRgb: constants[3] / 255.0,
+      boundTime: constants[4],
+      boundSigmaRel: constants[5],
+      boundSh: constants[6].toInt(),
+    );
+  }
+
+  final Float64List origin;
+  final double boundPos;
+  final double boundScaleRel;
+  final double boundRot;
+  final double boundRgb;
+  final double boundTime;
+  final double boundSigmaRel;
+  final int boundSh;
+
+  /// The promise on velocity is about displacement, not speed: this is the
+  /// velocity bound for a gaussian of the reference lifetime.
+  double get boundMotion => boundPos / _lifeRef;
+
+  double get stepPos => 2.0 * boundPos;
+  double get stepScaleLog => 2.0 * _log1p(boundScaleRel);
+  double get stepRot => 2.0 * boundRot;
+  double get stepRgb => 2.0 * boundRgb;
+  double get stepAlpha => 2.0 * boundRgb;
+  double get stepMotion => 2.0 * boundMotion;
+  double get stepTime => 2.0 * boundTime;
+  double get stepSigmaLog => 2.0 * _log1p(boundSigmaRel);
+  int get stepSh => math.max(1, 2 * boundSh + 1);
+
+  /// The bounds map the file declares, keyed as the specification names them.
+  ///
+  /// The values are decimal strings, and every reference writer spells them with
+  /// its own language's shortest round-trip formatting — Python writes `5e-05`
+  /// where Rust writes `5e-5` and Dart writes `0.00005`. Three spellings of one
+  /// number: what a consumer reads is the number, and nothing in the format
+  /// pins the notation.
+  ///
+  /// [depths] adds one `sh_band<n>` entry per band that declares a bit depth,
+  /// beside the single `sh` the record has always carried.
+  Map<String, String> declaredBounds(Map<int, int> depths) => <String, String>{
+    'pos': _decimal(boundPos),
+    'scale_rel': _decimal(boundScaleRel),
+    'rot': _decimal(boundRot),
+    'rgb': _decimal(boundRgb),
+    'alpha': _decimal(boundRgb),
+    'motion': _decimal(boundMotion),
+    'time': _decimal(boundTime),
+    'sigma_rel': _decimal(boundSigmaRel),
+    'sh': '${_declaredShBound(depths)}',
+    for (final band in depths.keys.toList()..sort())
+      'sh_band$band': '${fourdgsShBound(depths[band]!)}',
+  };
+
+  /// The single `sh` bound, which predates per-band depths.
+  ///
+  /// The coarsest band's is the only honest answer once bands differ: a consumer
+  /// that reads this and not the appended per-band field then holds an upper
+  /// bound rather than a number that is true of some bands and wrong for others.
+  int _declaredShBound(Map<int, int> depths) {
+    if (depths.isEmpty) return boundSh;
+    int worst = 0;
+    for (final bits in depths.values) {
+      worst = math.max(worst, fourdgsShBound(bits));
+    }
+    return worst;
+  }
+
+  /// `step_sh`, by the same rule and for the same reason as the bound above.
+  int declaredStepSh(Map<int, int> depths) {
+    if (depths.isEmpty) return stepSh;
+    int coarsest = 1;
+    for (final bits in depths.values) {
+      coarsest = math.max(coarsest, fourdgsShStep(bits));
+    }
+    return coarsest;
+  }
+}
+
+/// The narrowest and widest a spherical-harmonic band may declare (spec §6.5).
+///
+/// Eight is the coefficient as stored, so a band that declares it is exact;
+/// three leaves eight levels, which is the point at which a band stops
+/// describing a direction and starts describing a mood.
+const int fourdgsShMinBits = 3;
+const int fourdgsShMaxBits = 8;
+
+/// Named per-band ladders, band 1 first, as `website/docs/reference/compression.md`
+/// measures them.
+///
+/// Band energy falls with degree, so every ladder here spends fewer bits as the
+/// band index rises; a producer may pass any list in the legal range.
+const Map<String, List<int>> fourdgsShLadders = <String, List<int>>{
+  'flat': <int>[8, 8, 8],
+  'balanced': <int>[8, 6, 5],
+  'aggressive': <int>[6, 4, 3],
+};
+
+/// The grid pitch, in code units, that a bit depth implies.
+///
+/// A coefficient is a byte whatever the depth: `n` bits means the byte is
+/// rounded onto a grid of `2^(8 - n)` code units, which leaves `2^n` distinct
+/// values in a stream that is still bytes. Nothing sub-byte is packed and no
+/// decoder changes — the saving is realized by the stream codec, which has that
+/// many fewer symbols to code, and by `step_sh` never being applied at decode.
+int fourdgsShStep(int bits) {
+  if (bits < fourdgsShMinBits || bits > fourdgsShMaxBits) {
+    throw FourdgsInvalidInput(
+      'an SH bit depth must be $fourdgsShMinBits..$fourdgsShMaxBits, got $bits',
+    );
+  }
+  return 1 << (fourdgsShMaxBits - bits);
+}
+
+/// The maximum deviation, in code units, a bit depth guarantees.
+///
+/// Exactly half the pitch, which is the relationship every other attribute's
+/// grid has to its bound. Eight bits is pitch 1 and bound 0: the byte is stored
+/// as it arrived.
+int fourdgsShBound(int bits) => fourdgsShStep(bits) ~/ 2;
+
+/// Round one coefficient byte onto the grid [bits] names, at bin centres.
+///
+/// Centring is what makes the bound half the pitch rather than the whole of it,
+/// and it keeps the operation idempotent: a coefficient already on the grid is
+/// left alone, so re-encoding a file at the depth it already carries changes no
+/// byte.
+int fourdgsQuantizeSh(int value, int bits) {
+  final step = fourdgsShStep(bits);
+  if (step == 1) return value;
+  return (value ~/ step) * step + step ~/ 2;
+}
+
+/// Resolve the option into `{band: bit depth}` for the bands actually written.
+///
+/// A ladder shorter than the file's degree is an error rather than a default:
+/// the depth of the highest band decides most of the size, and silently filling
+/// it in with eight bits hands back a file that quietly ignored what was asked
+/// for.
+Map<int, int> _resolveShDepths(List<int> requested, List<_BandColumns> bands) {
+  if (requested.isEmpty || bands.isEmpty) return const <int, int>{};
+  if (requested.length < bands.length) {
+    throw FourdgsInvalidInput(
+      'shBitDepths declares ${requested.length} bands; '
+      'this scene writes ${bands.length}',
+    );
+  }
+  final out = <int, int>{};
+  for (int i = 0; i < bands.length; i++) {
+    final bits = requested[i];
+    if (bits < fourdgsShMinBits || bits > fourdgsShMaxBits) {
+      throw FourdgsInvalidInput(
+        'an SH bit depth must be $fourdgsShMinBits..$fourdgsShMaxBits, got $bits',
+      );
+    }
+    out[bands[i].band] = bits;
+  }
+  return out;
+}
+
+String _decimal(double v) => v.toString();
+
+/// The median of positive float32 values without copying or sorting the lane.
+///
+/// Positive IEEE-754 bit patterns have the same order as their values. Four
+/// fixed 256-bin radix passes therefore select one order statistic with 1 KiB
+/// of scratch, however large the scene is. An even population selects its two
+/// middle values separately and averages them in double precision, matching
+/// NumPy without retaining another population-sized buffer.
+double _medianFloat32(Float32List values) {
+  if (values.isEmpty) return 1e-3;
+  final bits = Uint32List.view(
+    values.buffer,
+    values.offsetInBytes,
+    values.length,
+  );
+
+  double select(int rank) {
+    final counts = Uint64List(256);
+    int prefix = 0;
+    int prefixMask = 0;
+    for (final shift in const <int>[24, 16, 8, 0]) {
+      counts.fillRange(0, counts.length, 0);
+      for (final value in bits) {
+        if ((value & prefixMask) == prefix) {
+          counts[(value >> shift) & 0xff]++;
+        }
+      }
+      int before = 0;
+      int bucket = 0;
+      for (; bucket < counts.length; bucket++) {
+        final through = before + counts[bucket];
+        if (rank < through) break;
+        before = through;
+      }
+      rank -= before;
+      prefix |= bucket << shift;
+      prefixMask |= 0xff << shift;
+    }
+    final word = Uint32List(1);
+    word[0] = prefix;
+    return Float32List.view(word.buffer).single;
+  }
+
+  final mid = values.length ~/ 2;
+  if (values.length.isOdd) return select(mid);
+  return 0.5 * (select(mid - 1) + select(mid));
+}
+
+/// `log(1 + x)`, which `dart:math` does not carry.
+///
+/// The identity is Kahan's: `log(1 + x) = log(u) * x / (u - 1)` where
+/// `u = 1 + x`, which cancels the rounding of the sum instead of letting it
+/// dominate for small `x`. It reproduces libm's `log1p` bit for bit at the two
+/// relative bounds the `fine` and `default` profiles use, and is within one unit
+/// in the last place at `coarse`'s.
+double _log1p(double x) {
+  final u = 1.0 + x;
+  if (u == 1.0) return x;
+  return math.log(u) * x / (u - 1.0);
+}
+
+/// Round half to even, the rule every attribute grid but rotation uses.
+double _rint(double v) {
+  final nearest = v.roundToDouble();
+  if ((v - v.truncateToDouble()).abs() == 0.5 &&
+      nearest.remainder(2.0) != 0.0) {
+    return nearest - v.sign;
+  }
+  return nearest;
+}
+
+/// [_rint], refused rather than truncated when the bin leaves the symbol domain.
+///
+/// An attribute stream carries signed 32-bit symbols, so a bin outside that
+/// range is unwritable. Saying so here names the attribute and the gaussian; the
+/// stream coder, which sees only a symbol width, cannot.
+int _bin(double v, String attribute, int gaussian) {
+  final rounded = _rint(v);
+  if (!(rounded >= -2147483648.0 && rounded <= 2147483647.0)) {
+    throw FourdgsInvalidInput(
+      '$attribute quantizes to bin $rounded at gaussian $gaussian, outside the '
+      'signed 32-bit symbols an attribute stream carries; the error bound is '
+      'too tight for this data',
+    );
+  }
+  return rounded.toInt();
+}
+
+// --------------------------------------------------------------------------
+// The window table
+// --------------------------------------------------------------------------
+
+/// Distinct validity windows and a per-gaussian index into them.
+///
+/// Windows repeat heavily — one per span the scene was fitted over — so the
+/// per-gaussian cost is an index rather than two floats.
+class _WindowTable {
+  _WindowTable(this.windows);
+
+  factory _WindowTable.of(FourdgsGaussianSet g) {
+    // Retain only distinct windows while scanning. A list pair per gaussian
+    // made even a scene with one shared window allocate and sort millions of
+    // temporary heap objects before the sink could emit its first record.
+    final pairs = <(double, double)>{};
+    for (int i = 0; i < g.count; i++) {
+      pairs.add((g.winLo[i], g.winHi[i]));
+      if (pairs.length > maxWindowsPerScene) {
+        throw FourdgsInvalidInput(
+          'the scene contains more than $maxWindowsPerScene distinct validity '
+          'windows; this SDK cannot read a larger Window Table',
+        );
+      }
+    }
+    if (pairs.isEmpty) pairs.add((0.0, 0.0));
+    final distinct = <List<double>>[
+      for (final (lo, hi) in pairs) <double>[lo, hi],
+    ]..sort(
+      (a, b) => a[0] != b[0] ? a[0].compareTo(b[0]) : a[1].compareTo(b[1]),
+    );
+    return _WindowTable(distinct);
+  }
+
+  final List<List<double>> windows;
+
+  int rank(double lo, double hi) {
+    int low = 0;
+    int high = windows.length - 1;
+    while (low < high) {
+      final mid = (low + high) ~/ 2;
+      final w = windows[mid];
+      if (w[0] < lo || (w[0] == lo && w[1] < hi)) {
+        low = mid + 1;
+      } else {
+        high = mid;
+      }
+    }
+    return low;
+  }
+}
+
+/// The split points the top level of the temporal partition uses.
+List<double> _tops(List<List<double>> windows, double durationSec) {
+  final seen = <double>{0.0, durationSec};
+  for (final window in windows) {
+    for (final v in window) {
+      if (v > 0.0 && v < durationSec) seen.add(v);
+    }
+  }
+  final tops = seen.toList()..sort();
+  if (tops.length < 2) {
+    // A zero-length scene still has a start, and a seek at `t = 0` has to land
+    // somewhere: an interval of `[0, 0)` covers no instant, so the reference
+    // encoders open it by the smallest amount that is still a number.
+    return <double>[0.0, math.max(durationSec, 1e-9)];
+  }
+  return tops;
+}
+
+// --------------------------------------------------------------------------
+// Quantization
+// --------------------------------------------------------------------------
+
+/// One attribute stream's worth of bins, ready to be gathered per chunk.
+class _Lane {
+  const _Lane(this.attributeId, this.channels, this.values);
+
+  final int attributeId;
+  final int channels;
+  final Int32List values;
+}
+
+class _Quantized {
+  const _Quantized(this.lanes);
+
+  final List<_Lane> lanes;
+}
+
+/// The three quaternion components that survive when the one at `largest` is
+/// dropped, in ascending index order.
+const List<List<int>> _rest = <List<int>>[
+  <int>[1, 2, 3],
+  <int>[0, 2, 3],
+  <int>[0, 1, 3],
+  <int>[0, 1, 2],
+];
+
+_Quantized _quantize(
+  FourdgsGaussianSet g,
+  List<int> members,
+  _Grid grid,
+  _WindowTable table,
+  double cutoff,
+) {
+  final n = members.length;
+  final pos = Int32List(n * 3);
+  final scale = Int32List(n * 3);
+  final rotationIndex = Int32List(n);
+  final rotation = Int32List(n * 3);
+  final rgb = Int32List(n * 3);
+  final alpha = Int32List(n);
+  final motion = Int32List(n * 3);
+  final mu = Int32List(n);
+  final sigma = Int32List(n);
+  final flags = Int32List(n);
+  final windowIndex = Int32List(n);
+
+  final k = supportK(cutoff);
+  final stepScaleLog = grid.stepScaleLog;
+  final stepSigmaLog = grid.stepSigmaLog;
+  final narrowedMotion = Float32List(1);
+
+  for (int row = 0; row < n; row++) {
+    final i = members[row];
+    for (int axis = 0; axis < 3; axis++) {
+      pos[row * 3 + axis] = _bin(
+        (g.positions[i * 3 + axis] - grid.origin[axis]) / grid.stepPos,
+        'position',
+        i,
+      );
+      // Input validation already proved this Float32 value is finite and
+      // strictly positive. Preserve its actual logarithm: flooring a legal
+      // sub-1e-30 scale would violate the Header's relative error promise.
+      scale[row * 3 + axis] = _bin(
+        math.log(g.scales[i * 3 + axis]) / stepScaleLog,
+        'scale',
+        i,
+      );
+    }
+
+    _quantizeRotation(g, i, row, grid.stepRot, rotationIndex, rotation);
+
+    // The colour transform stores `(g, r - g, b - g)`. Exact in the integer
+    // domain, so it changes the compressed size and never the error bound.
+    final r = _bin(g.colors[i * 4] / grid.stepRgb, 'color', i);
+    final green = _bin(g.colors[i * 4 + 1] / grid.stepRgb, 'color', i);
+    final b = _bin(g.colors[i * 4 + 2] / grid.stepRgb, 'color', i);
+    rgb[row * 3] = green;
+    rgb[row * 3 + 1] = r - green;
+    rgb[row * 3 + 2] = b - green;
+    alpha[row] = _bin(g.colors[i * 4 + 3] / grid.stepAlpha, 'opacity', i);
+
+    final neverFades = !g.sigmaT[i].isFinite;
+    final sigmaBin =
+        neverFades
+            ? 0
+            : _bin(
+              math.log(g.sigmaT[i] == 0.0 ? 1e-30 : g.sigmaT[i]) / stepSigmaLog,
+              'sigma_t',
+              i,
+            );
+    sigma[row] = sigmaBin;
+    flags[row] = neverFades ? flagNeverFades : 0;
+
+    final w = table.rank(g.winLo[i], g.winHi[i]);
+    windowIndex[row] = w;
+    final window = table.windows[w];
+
+    // Both per-gaussian pitches are recomputed at decode from the sigma bin, so
+    // the encoder derives them from the value it is about to write rather than
+    // from the sigma it started with. Deriving them from the original is the
+    // mistake that produces a file whose velocities nobody wrote.
+    final mStep = motionStep(
+      lifeClass(
+        sigmaBin,
+        stepSigmaLog,
+        neverFades,
+        window[1] - window[0],
+        k: k,
+      ),
+      grid.stepMotion,
+    );
+    for (int axis = 0; axis < 3; axis++) {
+      final bin = _bin(g.motions[i * 3 + axis] / mStep, 'motion', i);
+      motion[row * 3 + axis] = bin;
+      // `decodeChunk` writes the product into a Float32List. A finite authored
+      // velocity can therefore quantize to a perfectly legal i32 bin and still
+      // reconstruct as infinity; test the value in the representation the
+      // public decoder actually returns.
+      narrowedMotion[0] = bin * mStep;
+      if (!narrowedMotion[0].isFinite) {
+        throw FourdgsInvalidInput(
+          'motion bin $bin at gaussian $i axis $axis reconstructs outside the '
+          'finite float32 range; the decoded velocity would be '
+          '${narrowedMotion[0]}',
+        );
+      }
+    }
+    mu[row] = _bin(
+      g.muT[i] / muStep(sigmaBin, stepSigmaLog, neverFades, grid.stepTime),
+      'mu_t',
+      i,
+    );
+  }
+
+  // The optional identity lanes, written when — and only when — the set
+  // carries them. Neither is quantized: they are labels, and §6.6 says so in as
+  // many words about `object_id` ("the id is exact and is never dequantized").
+  //
+  // They are here because dropping them is a decision, not a default. §6.6:
+  // "The Object Table, Object Tracks and `object_id` stream are independently
+  // optional. A file with ids and no table still groups gaussians … None is a
+  // reason to invent or discard another." Before this, decoding a file that
+  // carried producer-side stable ids and writing it straight back out returned a
+  // file with none, and the identity those fields exist to preserve was gone
+  // with nothing said anywhere.
+  //
+  // `object_id` owns the whole unsigned 32-bit domain while an attribute
+  // stream's symbols are signed, so the bridge is the same-bits two's-complement
+  // view §6.6 defines: `0xFFFF_FFFF` is written as `-1` and read back as
+  // `0xFFFF_FFFF`. Bijective, and not a grid. Delta coding stays available
+  // because `_deltaCandidate` computes in 64 bits and drops any candidate that
+  // does not fit a 32-bit symbol, which is exactly the condition §6.6 attaches
+  // to it; the Python reference disables delta here instead, because in NumPy
+  // the same subtraction wraps silently.
+  final lanes = <_Lane>[
+    _Lane(attrPosition, 3, pos),
+    _Lane(attrScale, 3, scale),
+    _Lane(attrRotationIndex, 1, rotationIndex),
+    _Lane(attrRotation, 3, rotation),
+    _Lane(attrColor, 3, rgb),
+    _Lane(attrOpacity, 1, alpha),
+    _Lane(attrMotion, 3, motion),
+    _Lane(attrMuT, 1, mu),
+    _Lane(attrSigmaT, 1, sigma),
+    _Lane(attrFlags, 1, flags),
+    _Lane(attrWindowIndex, 1, windowIndex),
+  ];
+  final sourceGroup = g.sourceGroup;
+  if (sourceGroup != null) {
+    lanes.add(
+      _Lane(
+        attrSourceGroup,
+        1,
+        Int32List.fromList(<int>[for (final i in members) sourceGroup[i]]),
+      ),
+    );
+  }
+  final sourceIndex = g.sourceIndex;
+  if (sourceIndex != null) {
+    lanes.add(
+      _Lane(
+        attrSourceIndex,
+        1,
+        Int32List.fromList(<int>[for (final i in members) sourceIndex[i]]),
+      ),
+    );
+  }
+  final objectId = g.objectId;
+  if (objectId != null) {
+    final codes = Int32List(n);
+    for (int row = 0; row < n; row++) {
+      codes[row] = objectId[members[row]].toSigned(32);
+    }
+    lanes.add(_Lane(attrObjectId, 1, codes));
+  }
+  return _Quantized(lanes);
+}
+
+/// Smallest-three: drop the largest-magnitude component and canonicalize the
+/// sign so it is positive, which is what lets a decoder recover it as a square
+/// root.
+///
+/// The residuals round half away from zero rather than half to even. That is not
+/// an oversight: it is what the reference encoders do here and nowhere else, and
+/// a decoder cannot tell which rule produced a bin — but an encoder that used
+/// the other one would land a hair off theirs on exact ties.
+void _quantizeRotation(
+  FourdgsGaussianSet g,
+  int gaussian,
+  int row,
+  double step,
+  Int32List largestOut,
+  Int32List binsOut,
+) {
+  final q = <double>[
+    g.rotations[gaussian * 4],
+    g.rotations[gaussian * 4 + 1],
+    g.rotations[gaussian * 4 + 2],
+    g.rotations[gaussian * 4 + 3],
+  ];
+  double scale = 0.0;
+  for (final v in q) {
+    scale = math.max(scale, v.abs());
+  }
+  double scaledSquareSum = 0.0;
+  for (final v in q) {
+    final scaled = v / scale;
+    scaledSquareSum += scaled * scaled;
+  }
+  final norm = scale * math.sqrt(scaledSquareSum);
+  for (int c = 0; c < 4; c++) {
+    q[c] = q[c] / norm;
+  }
+  int largest = 0;
+  for (int c = 1; c < 4; c++) {
+    if (q[c].abs() > q[largest].abs()) largest = c;
+  }
+  final sign = q[largest] < 0.0 ? -1.0 : 1.0;
+  largestOut[row] = largest;
+  final rest = _rest[largest];
+  for (int c = 0; c < 3; c++) {
+    binsOut[row * 3 + c] = _binRotation(q[rest[c]] * sign / step, gaussian);
+  }
+}
+
+int _binRotation(double v, int gaussian) {
+  final rounded = v.roundToDouble();
+  if (!(rounded >= -2147483648.0 && rounded <= 2147483647.0)) {
+    throw FourdgsInvalidInput(
+      'rotation quantizes to bin $rounded at gaussian $gaussian, outside the '
+      'signed 32-bit symbols an attribute stream carries',
+    );
+  }
+  return rounded.toInt();
+}
+
+// --------------------------------------------------------------------------
+// Chunk planning
+// --------------------------------------------------------------------------
+
+class _PlanningSupport {
+  const _PlanningSupport(this.lo, this.hi, this.windowHi);
+
+  final Float64List lo;
+  final Float64List hi;
+  final Float64List windowHi;
+}
+
+/// Exact reconstructed temporal support, without retaining encoded lanes.
+///
+/// The two endpoints are the global metadata the interval tree needs before a
+/// Header can be emitted. All eleven attribute lanes remain bounded to the
+/// current Chunk in [_quantize].
+_PlanningSupport _planningSupport(
+  FourdgsGaussianSet g,
+  _Grid grid,
+  _WindowTable windows,
+  double cutoff,
+) {
+  final lo = Float64List(g.count);
+  final hi = Float64List(g.count);
+  final windowHi = Float64List(g.count);
+  final reconstructed = Float32List(4);
+  final k = supportK(cutoff);
+  for (int i = 0; i < g.count; i++) {
+    final neverFades = !g.sigmaT[i].isFinite;
+    final sigmaBin =
+        neverFades
+            ? 0
+            : _bin(
+              math.log(g.sigmaT[i] == 0.0 ? 1e-30 : g.sigmaT[i]) /
+                  grid.stepSigmaLog,
+              'sigma_t',
+              i,
+            );
+    final muPitch = muStep(
+      sigmaBin,
+      grid.stepSigmaLog,
+      neverFades,
+      grid.stepTime,
+    );
+    final muBin = _bin(g.muT[i] / muPitch, 'mu_t', i);
+    final window = windows.windows[windows.rank(g.winLo[i], g.winHi[i])];
+    reconstructed[0] =
+        neverFades ? double.infinity : math.exp(sigmaBin * grid.stepSigmaLog);
+    reconstructed[1] = muBin * muPitch;
+    reconstructed[2] = window[0];
+    reconstructed[3] = window[1];
+    final sigma = reconstructed[0];
+    final mu = reconstructed[1];
+    final half = sigma.isFinite ? k * math.max(sigma, 1e-30) : double.infinity;
+    lo[i] = math.max(mu - half, reconstructed[2]);
+    hi[i] = math.min(mu + half, reconstructed[3]);
+    windowHi[i] = reconstructed[3];
+  }
+  return _PlanningSupport(lo, hi, windowHi);
+}
+
+/// One chunk: interval metadata plus a view into one packed assignment table.
+class _Plan {
+  _Plan(this.t0, this.t1, this.level, this._packed, this.start, this.end);
+
+  final double t0;
+  final double t1;
+  final int level;
+  final Int32List _packed;
+  final int start;
+  final int end;
+
+  List<int> members(FourdgsGaussianSet g) =>
+      _mortonOrder(g, Int32List.sublistView(_packed, start, end));
+}
+
+/// Assign gaussians to the nodes of a temporal interval tree.
+///
+/// A gaussian goes in the deepest node whose interval fully contains its
+/// support, so it is stored exactly once however long it lives, and a reader
+/// that wants one instant fetches the nodes covering it instead of the scene.
+///
+/// The top level is the window table rather than a power-of-two split of the
+/// whole timeline, and that is the part worth stating: gaussians fitted over one
+/// window straddle the boundaries of an even split, so every one of them would
+/// be pushed up to the root and the tree would have one node in it.
+List<_Plan> _planChunks(
+  FourdgsGaussianSet g,
+  _PlanningSupport support,
+  List<double> tops,
+  FourdgsWriteOptions options, {
+  required bool staticScene,
+}) {
+  final n = g.count;
+  if (n == 0) return const <_Plan>[];
+
+  // Exact reconstructed support, clipped to each gaussian's own validity
+  // window. Planning from the pre-quantized input can file a gaussian on one
+  // side of a boundary that its decoded state crosses.
+  final lo = support.lo;
+  final hi = support.hi;
+  final windowHi = support.windowHi;
+  tops = _finiteTailTops(tops, lo, hi);
+
+  final assigned = Int32List(n)..fillRange(0, n, -1);
+  final nodes = <_Node>[];
+
+  /// Push the half-open range [start, end) of [pool] down the tree in place.
+  ///
+  /// Each level partitions that same typed array into left, staying and right
+  /// ranges. A single-branch scene therefore retains one scene-sized assignment
+  /// table at depth 32, not another growable reference array at every frame.
+  void descend(
+    double a,
+    double b,
+    int level,
+    Int32List pool,
+    int start,
+    int end,
+  ) {
+    if (start == end) return;
+    // `[0, 1e-9)` is only the seekable representation of the single instant in
+    // a duration-zero asset. Subdividing that artificial span can put every
+    // populated leaf strictly after t=0, which the indexed reader correctly
+    // refuses because no scene-clock instant selects it.
+    if (staticScene || level >= options.maxDepth) {
+      nodes.add(_Node(a, b, level));
+      final node = nodes.length - 1;
+      for (int at = start; at < end; at++) {
+        assigned[pool[at]] = node;
+      }
+      return;
+    }
+    final mid = 0.5 * (a + b);
+    // An interval can run out of doubles before it runs out of depth. Adjacent
+    // `float32` window bounds near 1.0 are about 1.2e-7 apart and collapse after
+    // roughly twenty-nine bisections, well inside the depth ceiling of 32 — and
+    // once `mid == a`, a gaussian whose support is a single instant at `a` goes
+    // left at every remaining level and comes to rest in a node spanning
+    // `[a, a)`. That chunk is nonempty over a zero-width interval: the seek rule
+    // is half-open, so nothing can ever select it, and `FourdgsChunkIndexEntry`
+    // in this same package refuses to parse it. A node that cannot be halved is
+    // a leaf, which is the answer whatever the depth limit says.
+    if (!(mid > a && mid < b)) {
+      nodes.add(_Node(a, b, level));
+      final node = nodes.length - 1;
+      for (int at = start; at < end; at++) {
+        assigned[pool[at]] = node;
+      }
+      return;
+    }
+
+    // Dutch-national-flag partition: [start, leftEnd) goes left,
+    // [leftEnd, rightStart) stays here, and [rightStart, end) goes right.
+    int leftEnd = start;
+    int at = start;
+    int rightStart = end;
+    while (at < rightStart) {
+      final i = pool[at];
+      // The marginal is visible at exactly its support edge, while the left
+      // child's interval excludes `mid`. It can descend left on equality only
+      // when its verbatim validity window also ends there, making the gaussian
+      // absent at that half-open endpoint.
+      if (hi[i] < mid || (hi[i] == mid && windowHi[i] <= mid)) {
+        final swap = pool[leftEnd];
+        pool[leftEnd] = i;
+        pool[at] = swap;
+        leftEnd++;
+        at++;
+      } else if (lo[i] >= mid) {
+        rightStart--;
+        pool[at] = pool[rightStart];
+        pool[rightStart] = i;
+      } else {
+        at++;
+      }
+    }
+
+    final leftCount = leftEnd - start;
+    final rightCount = end - rightStart;
+    final keepLeft = leftCount > 0 && leftCount < options.minChunkGaussians;
+    final keepRight = rightCount > 0 && rightCount < options.minChunkGaussians;
+    if (!keepLeft) {
+      descend(a, mid, level + 1, pool, start, leftEnd);
+    }
+    if (!keepRight) {
+      descend(mid, b, level + 1, pool, rightStart, end);
+    }
+
+    // Children below the population threshold stay in this node alongside
+    // supports that straddle the split.
+    final staying = rightStart - leftEnd;
+    if (staying == 0 && !keepLeft && !keepRight) return;
+    nodes.add(_Node(a, b, level));
+    final node = nodes.length - 1;
+    if (keepLeft) {
+      for (int p = start; p < leftEnd; p++) {
+        assigned[pool[p]] = node;
+      }
+    }
+    for (int p = leftEnd; p < rightStart; p++) {
+      assigned[pool[p]] = node;
+    }
+    if (keepRight) {
+      for (int p = rightStart; p < end; p++) {
+        assigned[pool[p]] = node;
+      }
+    }
+  }
+
+  // Which window interval each gaussian belongs to, decided in one pass over
+  // the scene rather than by asking every interval about every gaussian.
+  //
+  // The scan this replaces was quadratic the moment a scene gives its gaussians
+  // their own validity windows: every distinct window puts its endpoints in
+  // `tops`, so the interval count and the gaussian count grow together and this
+  // module's promise that "nothing here is quadratic in the gaussian count"
+  // stopped being true — 128k gaussians took half a minute to plan.
+  //
+  // The answer is the same one. A gaussian went to the first interval that
+  // contained its whole support, because the intervals were visited in order
+  // and an assigned gaussian was skipped by every later one; `tops` ascends, so
+  // that interval can be found by two binary searches instead of a scan. Members
+  // are appended in ascending `i`, which is the order the comprehension built
+  // them in.
+  final intervalCounts = Int32List(tops.length - 1);
+  for (int i = 0; i < n; i++) {
+    final w = _firstContainingInterval(tops, lo[i], hi[i], windowHi[i]);
+    assigned[i] = w;
+    if (w >= 0) intervalCounts[w]++;
+  }
+  final intervalOffsets = Int32List(intervalCounts.length + 1);
+  for (int w = 0; w < intervalCounts.length; w++) {
+    intervalOffsets[w + 1] = intervalOffsets[w] + intervalCounts[w];
+  }
+  Int32List? intervalMembers = Int32List(intervalOffsets.last);
+  final intervalCursor = Int32List.fromList(intervalOffsets);
+  for (int i = 0; i < n; i++) {
+    final w = assigned[i];
+    if (w >= 0) intervalMembers[intervalCursor[w]++] = i;
+  }
+  assigned.fillRange(0, n, -1);
+
+  for (int w = 0; w + 1 < tops.length; w++) {
+    final a = tops[w];
+    final b = tops[w + 1];
+    descend(
+      a,
+      b,
+      0,
+      intervalMembers,
+      intervalOffsets[w],
+      intervalOffsets[w + 1],
+    );
+  }
+  intervalMembers = null;
+
+  // Whatever no window interval contained — a gaussian whose support crosses a
+  // window boundary, or one clipped by nothing at all. It belongs to the root,
+  // which spans the whole partitioned timeline.
+  if (assigned.any((node) => node < 0)) {
+    nodes.add(_Node(tops.first, tops.last, -1));
+    final root = nodes.length - 1;
+    for (int i = 0; i < n; i++) {
+      if (assigned[i] < 0) assigned[i] = root;
+    }
+  }
+
+  // Pack the assignment once. Plans below retain only offsets into this i32
+  // table, not one growable object list per node and then a second Morton-
+  // ordered copy per bounded chunk.
+  final nodeCounts = Int32List(nodes.length);
+  for (int i = 0; i < n; i++) {
+    nodeCounts[assigned[i]]++;
+  }
+  final nodeOffsets = Int32List(nodes.length + 1);
+  for (int node = 0; node < nodes.length; node++) {
+    nodeOffsets[node + 1] = nodeOffsets[node] + nodeCounts[node];
+  }
+  final packed = Int32List(n);
+  final nodeCursor = Int32List.fromList(nodeOffsets);
+  for (int i = 0; i < n; i++) {
+    final node = assigned[i];
+    packed[nodeCursor[node]++] = i;
+  }
+
+  final nodeOrder = <int>[for (int node = 0; node < nodes.length; node++) node]
+    ..sort((a, b) {
+      final left = nodes[a];
+      final right = nodes[b];
+      return left.level != right.level
+          ? left.level - right.level
+          : left.t0.compareTo(right.t0);
+    });
+  final plans = <_Plan>[];
+  for (final node in nodeOrder) {
+    final first = nodeOffsets[node];
+    final stop = nodeOffsets[node + 1];
+    for (int start = first; start < stop; start += _maxGaussiansPerChunk) {
+      final end = math.min(start + _maxGaussiansPerChunk, stop);
+      plans.add(
+        _Plan(
+          nodes[node].t0,
+          nodes[node].t1,
+          math.max(nodes[node].level, 0),
+          packed,
+          start,
+          end,
+        ),
+      );
+    }
+  }
+  return plans;
+}
+
+/// Give an open-ended final window a finite prefix the tree can bisect.
+///
+/// `0.5 * (finite + infinity)` is infinity, so without this boundary an
+/// otherwise finite population in `[a, +inf)` can never descend. The boundary
+/// sits strictly after the last finite support edge: chunk intervals are
+/// half-open while the marginal remains visible at its support endpoint.
+List<double> _finiteTailTops(
+  List<double> tops,
+  Float64List supportLo,
+  Float64List supportHi,
+) {
+  if (tops.length < 2 || tops.last.isFinite) return tops;
+  final start = tops[tops.length - 2];
+  double lastFinite = start;
+  bool haveFinite = false;
+  for (int i = 0; i < supportHi.length; i++) {
+    if (supportLo[i] < start || !supportHi[i].isFinite) continue;
+    haveFinite = true;
+    if (supportHi[i] > lastFinite) lastFinite = supportHi[i];
+  }
+  if (!haveFinite) return tops;
+  final padding = math.max(1e-9, lastFinite.abs() * 1e-12);
+  final boundary = lastFinite + padding;
+  if (!boundary.isFinite || !(boundary > lastFinite)) return tops;
+  return <double>[...tops.take(tops.length - 1), boundary, tops.last];
+}
+
+/// The first interval of [tops] whose span contains the whole support
+/// `[lo, hi]`, or `-1` when no interval does.
+int _firstContainingInterval(
+  List<double> tops,
+  double lo,
+  double hi,
+  double windowHi,
+) {
+  int last = -1;
+  int low = 0;
+  int high = tops.length - 2;
+  while (low <= high) {
+    final mid = (low + high) >> 1;
+    if (lo >= tops[mid]) {
+      last = mid;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  if (last < 0) return -1;
+
+  int first = -1;
+  low = 0;
+  high = last;
+  while (low <= high) {
+    final mid = (low + high) >> 1;
+    final end = tops[mid + 1];
+    // A marginal includes its support endpoint. Equality fits a half-open
+    // interval only when the reconstructed validity window also ends there.
+    if (hi < end || (hi == end && windowHi <= end)) {
+      first = mid;
+      high = mid - 1;
+    } else {
+      low = mid + 1;
+    }
+  }
+  return first;
+}
+
+/// One node of the interval tree: its span and its depth below the window level.
+class _Node {
+  const _Node(this.t0, this.t1, this.level);
+
+  final double t0;
+  final double t1;
+  final int level;
+}
+
+/// Reorder a chunk's members for spatial locality, by Morton code over their own
+/// bounding box.
+///
+/// An encoder technique and nothing else: spatial locality is what makes the
+/// position delta stream small, no decoder knows which ordering was used, and
+/// none may assume one.
+List<int> _mortonOrder(FourdgsGaussianSet g, List<int> members) {
+  if (members.isEmpty) return members;
+  final lo = Float64List(3)..fillRange(0, 3, double.infinity);
+  final hi = Float64List(3)..fillRange(0, 3, double.negativeInfinity);
+  for (final i in members) {
+    for (int axis = 0; axis < 3; axis++) {
+      final v = g.positions[i * 3 + axis];
+      if (v < lo[axis]) lo[axis] = v;
+      if (v > hi[axis]) hi[axis] = v;
+    }
+  }
+  final span = Float64List(3);
+  for (int axis = 0; axis < 3; axis++) {
+    span[axis] = hi[axis] - lo[axis] <= 0.0 ? 1.0 : hi[axis] - lo[axis];
+  }
+
+  const scale = 2097151.0; // (1 << 21) - 1
+  final codes = <int, int>{};
+  for (final i in members) {
+    int code = 0;
+    for (int axis = 0; axis < 3; axis++) {
+      final t = ((g.positions[i * 3 + axis] - lo[axis]) / span[axis]).clamp(
+        0.0,
+        1.0,
+      );
+      code |= _part1by2(_rint(t * scale).toInt()) << axis;
+    }
+    codes[i] = code;
+  }
+  final ordered = List<int>.from(members);
+  // A stable sort keyed on the code alone, so two gaussians at one point keep
+  // the order they arrived in and two runs of this encoder agree.
+  ordered.sort(
+    (a, b) =>
+        codes[a]! != codes[b]!
+            ? codes[a]!.compareTo(codes[b]!)
+            : a.compareTo(b),
+  );
+  return ordered;
+}
+
+/// Spread the low 21 bits of [x] out to every third bit.
+int _part1by2(int x) {
+  int v = x & 0x1FFFFF;
+  v = (v | (v << 32)) & 0x1F00000000FFFF;
+  v = (v | (v << 16)) & 0x1F0000FF0000FF;
+  v = (v | (v << 8)) & 0x100F00F00F00F00F;
+  v = (v | (v << 4)) & 0x10C30C30C30C30C3;
+  v = (v | (v << 2)) & 0x1249249249249249;
+  return v;
+}
+
+// --------------------------------------------------------------------------
+// Spherical harmonics
+// --------------------------------------------------------------------------
+
+/// One band's columns within a scene's coefficient row, component-major.
+class _BandColumns {
+  const _BandColumns(this.band, this.columns);
+
+  final int band;
+  final List<int> columns;
+}
+
+List<_BandColumns> _bandColumns(FourdgsGaussianSet g, int maxBands) {
+  final sh = g.sh;
+  if (sh == null || g.shDegree <= 0 || g.shCoefficients <= 0) {
+    return const <_BandColumns>[];
+  }
+  final out = <_BandColumns>[];
+  for (int band = 1; band <= math.min(g.shDegree, maxBands); band++) {
+    final range = shBandRange[band];
+    if (range == null) continue;
+    // Whole bands only. A row that stops inside a band carries none of it: the
+    // record would declare fewer channels than the band defines and every reader
+    // here refuses that. A Header naming a degree its bands do not reach is a
+    // legal thing to have decoded — the merge takes bands 1..k and reports the
+    // coefficients they hold — so this stops rather than refuses, and the Header
+    // below then declares the last band that fit.
+    if (range.last > g.shCoefficients) break;
+    out.add(
+      _BandColumns(band, <int>[
+        for (int component = 0; component < 3; component++)
+          for (int k = range.first; k < range.last; k++)
+            component * g.shCoefficients + k,
+      ]),
+    );
+  }
+  return out;
+}
+
+/// One SH Band Stream record: a `u8 band`, then the band's coefficients as one
+/// attribute stream.
+///
+/// Each band is its own record so that a reader which has capped its degree
+/// skips the higher ones by byte range and never transfers them.
+Uint8List _bandRecord(
+  FourdgsGaussianSet g,
+  _BandColumns band,
+  List<int> members,
+  Map<int, int> depths,
+  FourdgsWriteOptions options,
+) {
+  final sh = g.sh!;
+  final row = g.shCoefficients * 3;
+  final size = members.length * band.columns.length;
+  final original = Uint8List(size);
+  final values = Int32List(size);
+  final bits = depths[band.band];
+  int at = 0;
+  for (final i in members) {
+    for (final column in band.columns) {
+      final raw = sh[i * row + column];
+      original[at] = raw;
+      values[at] = bits != null ? fourdgsQuantizeSh(raw, bits) : raw;
+      at++;
+    }
+  }
+  final payload = _ByteWriter(values.length + 32);
+  payload.u8(band.band);
+  payload.bytes(
+    _encodeStream(opShBandStream, values, band.columns.length, options),
+  );
+  final blob = _record(opShBandStream, payload.finish());
+  if (options.verify && bits != null) {
+    _verifyBand(blob, original, fourdgsShBound(bits), band.band);
+  }
+  return blob;
+}
+
+/// Decode the band record just written and check the bound it is about to claim.
+///
+/// Decoded rather than computed: the arithmetic that produced these bytes is
+/// three lines and would agree with itself if it were wrong. What the file will
+/// hand a consumer is what came back out of the record, so that is what the
+/// declared bound is measured against — every coefficient of every gaussian in
+/// the chunk, not a sample.
+void _verifyBand(Uint8List blob, Uint8List original, int bound, int band) {
+  final cursor = FourdgsCursor(
+    blob,
+    recordHeaderBytes + 1,
+  ); // opcode, length, band
+  final stream = decodeAttributeStream(cursor);
+  if (stream.values.length != original.length) {
+    throw FourdgsInvalidInput(
+      'encoder verification failed: SH band $band decoded '
+      '${stream.values.length} coefficients, wrote ${original.length}',
+    );
+  }
+  int worst = 0;
+  for (int i = 0; i < original.length; i++) {
+    final deviation = (stream.values[i] - original[i]).abs();
+    if (deviation > worst) worst = deviation;
+  }
+  if (worst > bound) {
+    throw FourdgsInvalidInput(
+      'encoder verification failed: SH band $band deviated $worst code units, '
+      'bound is $bound',
+    );
+  }
+}
+
+// --------------------------------------------------------------------------
+// Records
+// --------------------------------------------------------------------------
+
+Uint8List _header(
+  FourdgsGaussianSet g,
+  double durationSec,
+  FourdgsWriteOptions options,
+  int shDegree,
+  List<double> aabb,
+) {
+  final w = _ByteWriter(256);
+  w.string(options.sceneProfile);
+  w.string(options.library);
+  w.f64(durationSec);
+  // "Total across all chunks" under `gaussian-birth`, where a file's gaussians
+  // are a set and this is that set's size. Under `keyframe-delta` chunks restate
+  // the same gaussians, and the field is the number of distinct ids instead
+  // (spec §5.1) — which is why this counts the input rather than summing the
+  // chunk populations.
+  w.u64(g.count);
+  w.f64(options.cutoff);
+  w.string('gaussian-birth');
+  for (final v in aabb) {
+    w.f64(v);
+  }
+  w.u8(shDegree);
+  w.u8(0); // flags: this writer emits no audio
+  w.strMap(options.attributes);
+  return _record(opHeader, w.finish());
+}
+
+Uint8List _quantizationRecord(_Grid grid, Map<int, int> depths) {
+  final w = _ByteWriter(384);
+  w.string('uniform-v1');
+  for (final v in grid.origin) {
+    w.f64(v);
+  }
+  w.f64(grid.stepPos);
+  w.f64(grid.stepScaleLog);
+  w.f64(grid.stepRot);
+  w.f64(grid.stepRgb);
+  w.f64(grid.stepAlpha);
+  w.f64(grid.stepMotion);
+  w.f64(grid.stepTime);
+  w.f64(grid.stepSigmaLog);
+  w.u8(grid.declaredStepSh(depths));
+  w.strMap(grid.declaredBounds(depths));
+  // Appended after the record's original fields (spec §5.3), so a Quantization
+  // record that declares no depths has its pre-field spelling — an empty list is
+  // written as no bytes at all, not as a zero count.
+  if (depths.isNotEmpty) {
+    final bands = depths.keys.toList()..sort();
+    w.u8(bands.length);
+    for (final band in bands) {
+      w.u8(depths[band]!);
+    }
+  }
+  return _record(opQuantization, w.finish());
+}
+
+Uint8List _windowTableRecord(_WindowTable table) {
+  final w = _ByteWriter(16 + 16 * table.windows.length);
+  w.u32(table.windows.length);
+  for (final window in table.windows) {
+    w.f64(window[0]);
+    w.f64(window[1]);
+  }
+  return _record(opWindowTable, w.finish());
+}
+
+Uint8List _chunkRecord(
+  double t0,
+  double t1,
+  int level,
+  int count,
+  Uint8List streams,
+) {
+  final w = _ByteWriter(streams.length + 64);
+  w.f64(t0);
+  w.f64(t1);
+  w.u32(level);
+  w.u32(count);
+  w.string(''); // chunk-level compression: the streams carry their own
+  w.u64(streams.length);
+  w.blob(streams);
+  return _record(opChunk, w.finish());
+}
+
+Uint8List _statisticsRecord(
+  int gaussianCount,
+  int chunkCount,
+  double durationSec,
+  List<double> aabb,
+) {
+  final w = _ByteWriter(64);
+  w.u64(gaussianCount);
+  w.u32(chunkCount);
+  w.f64(durationSec);
+  for (final v in aabb) {
+    w.f64(v);
+  }
+  return _record(opStatistics, w.finish());
+}
+
+Uint8List _summaryOffsetRecord(
+  int groupOpcode,
+  int groupStart,
+  int groupLength,
+) {
+  final w = _ByteWriter(32);
+  w.u8(groupOpcode);
+  w.u64(groupStart);
+  w.u64(groupLength);
+  return _record(opSummaryOffset, w.finish());
+}
+
+Uint8List _footerRecord(int summaryStart, int summaryOffsetStart, int crc) {
+  final w = _ByteWriter(32);
+  w.u64(summaryStart);
+  w.u64(summaryOffsetStart);
+  w.u32(crc);
+  return _record(opFooter, w.finish());
+}
+
+class _IndexBand {
+  const _IndexBand(this.band, this.offset, this.length);
+
+  final int band;
+  final int offset;
+  final int length;
+}
+
+/// One Chunk Index entry.
+///
+/// Every offset and length written here frames a **whole record**, opcode byte
+/// and content length included (spec §5.8), so a reader fetches
+/// `[offset, offset + length)` and parses it exactly as it would parse that
+/// record mid-stream. The offsets are taken before each record is appended and
+/// the lengths are the framed blob's own, which is what makes that true by
+/// construction rather than by arithmetic somebody has to keep right.
+class _IndexEntry {
+  const _IndexEntry({
+    required this.t0,
+    required this.t1,
+    required this.chunkOffset,
+    required this.chunkLength,
+    required this.gaussianCount,
+    required this.bands,
+  });
+
+  final double t0;
+  final double t1;
+  final int chunkOffset;
+  final int chunkLength;
+  final int gaussianCount;
+  final List<_IndexBand> bands;
+
+  Uint8List encode() {
+    final w = _ByteWriter(48 + 17 * bands.length);
+    w.f64(t0);
+    w.f64(t1);
+    w.u64(chunkOffset);
+    w.u64(chunkLength);
+    w.u32(gaussianCount);
+    w.u32(bands.length);
+    for (final band in bands) {
+      w.u8(band.band);
+      w.u64(band.offset);
+      w.u64(band.length);
+    }
+    return _record(opChunkIndex, w.finish());
+  }
+}
+
+List<double> _encodedAabb(FourdgsGaussianSet g, _Grid grid) {
+  if (g.count == 0) return List<double>.filled(6, 0.0);
+  final out = List<double>.filled(6, 0.0);
+  final reconstructed = Float32List(1);
+  for (int axis = 0; axis < 3; axis++) {
+    double lo = double.infinity;
+    double hi = double.negativeInfinity;
+    for (int i = 0; i < g.count; i++) {
+      // `decodeChunk` lands positions in a Float32List. The bin arithmetic is
+      // double, and a negative maximum can round upward when narrowed; recording
+      // its pre-narrowing value would then advertise a maximum below the value
+      // the decoder actually returns.
+      final bin = _bin(
+        (g.positions[i * 3 + axis] - grid.origin[axis]) / grid.stepPos,
+        'position',
+        i,
+      );
+      reconstructed[0] = bin * grid.stepPos + grid.origin[axis];
+      final v = reconstructed[0];
+      if (!v.isFinite) {
+        throw FourdgsInvalidInput(
+          'position bin $bin at gaussian $i axis '
+          '$axis reconstructs outside the finite float32 range; the decoded '
+          'position would be $v',
+        );
+      }
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+    }
+    out[axis] = lo;
+    out[3 + axis] = hi;
+  }
+  return out;
+}
+
+Uint8List _record(int opcode, Uint8List content) {
+  final w = _ByteWriter(content.length + recordHeaderBytes);
+  w.u8(opcode);
+  w.u64(content.length);
+  w.bytes(content);
+  return w.finish();
+}
+
+// --------------------------------------------------------------------------
+// Attribute streams
+// --------------------------------------------------------------------------
+
+/// Serialize signed integer bins as one Attribute Stream.
+///
+/// Raw, delta and constant coding are all tried and the smallest kept, with the
+/// choice recorded in the header — a decoder never has to infer which one was
+/// used, and the values it reads back are the same whichever won.
+Uint8List _encodeStream(
+  int attributeId,
+  Int32List values,
+  int channels,
+  FourdgsWriteOptions options,
+) {
+  final count = channels == 0 ? 0 : values.length ~/ channels;
+  if (count == 0) {
+    return _streamHeader(
+      attributeId,
+      1,
+      modeRaw,
+      options.codec,
+      channels,
+      0,
+      0,
+    );
+  }
+
+  if (count > 1 && _allRowsEqual(values, channels, count)) {
+    final body = _codeSymbols(
+      Int32List.sublistView(values, 0, channels),
+      options,
+      attributeId,
+    );
+    return _concat(
+      _streamHeader(
+        attributeId,
+        body.width,
+        modeConst,
+        options.codec,
+        channels,
+        count,
+        body.payload.length,
+      ),
+      body.payload,
+    );
+  }
+
+  var best = _codeSymbols(values, options, attributeId);
+  var bestMode = modeRaw;
+  final deltas = count > 1 ? _deltaCandidate(values, channels) : null;
+  if (deltas != null) {
+    final candidate = _codeSymbols(deltas, options, attributeId);
+    if (candidate.payload.length < best.payload.length) {
+      best = candidate;
+      bestMode = modeDelta;
+    }
+  }
+  return _concat(
+    _streamHeader(
+      attributeId,
+      best.width,
+      bestMode,
+      options.codec,
+      channels,
+      count,
+      best.payload.length,
+    ),
+    best.payload,
+  );
+}
+
+/// The delta-coded view of [values], or null when it cannot be represented.
+///
+/// A delta between two bins at opposite ends of the signed 32-bit range needs 33
+/// bits, and an attribute stream's symbols are 32. Dart stores that silently
+/// truncated, and truncated is the dangerous word: the stream then decodes to a
+/// different number, and whether anything notices depends on where the running
+/// sum lands. Returning null drops the candidate instead — raw mode is always
+/// representable, so a stream that cannot be delta-coded is still written, and
+/// written correctly.
+Int32List? _deltaCandidate(Int32List values, int channels) {
+  final deltas = Int32List(values.length);
+  for (int c = 0; c < channels; c++) {
+    deltas[c] = values[c];
+  }
+  for (int i = channels; i < values.length; i++) {
+    final delta = values[i] - values[i - channels];
+    if (delta < -2147483648 || delta > 2147483647) return null;
+    deltas[i] = delta;
+  }
+  return deltas;
+}
+
+bool _allRowsEqual(Int32List values, int channels, int count) {
+  for (int i = 1; i < count; i++) {
+    for (int c = 0; c < channels; c++) {
+      if (values[i * channels + c] != values[c]) return false;
+    }
+  }
+  return true;
+}
+
+class _CodedSymbols {
+  const _CodedSymbols(this.width, this.payload);
+
+  final int width;
+  final Uint8List payload;
+}
+
+/// Zigzag, narrow to the smallest symbol width that fits, byte-plane shuffle,
+/// compress.
+_CodedSymbols _codeSymbols(
+  Int32List symbols,
+  FourdgsWriteOptions options,
+  int attributeId,
+) {
+  final zig = Float64List(symbols.length);
+  double widest = 0;
+  for (int i = 0; i < symbols.length; i++) {
+    final v = symbols[i];
+    final z = v >= 0 ? v * 2.0 : -v * 2.0 - 1.0;
+    zig[i] = z;
+    if (z > widest) widest = z;
+  }
+  final int width;
+  if (widest <= 0xFF) {
+    width = 1;
+  } else if (widest <= 0xFFFF) {
+    width = 2;
+  } else if (widest <= 0xFFFFFFFF) {
+    width = 4;
+  } else {
+    throw FourdgsInvalidInput(
+      'attribute $attributeId needs a symbol of $widest, past the 32 bits an '
+      'attribute stream carries; the error bound is too tight for this data',
+    );
+  }
+
+  // Byte-plane shuffle: every symbol's least significant byte, then the next
+  // plane, and so on. Grouping the near-constant high bytes together is most of
+  // what makes a general-purpose codec effective on quantized attributes.
+  final raw = Uint8List(zig.length * width);
+  if (width == 1) {
+    for (int i = 0; i < zig.length; i++) {
+      raw[i] = zig[i].toInt();
+    }
+  } else {
+    double divisor = 1.0;
+    for (int plane = 0; plane < width; plane++) {
+      final base = plane * zig.length;
+      for (int i = 0; i < zig.length; i++) {
+        raw[base + i] = ((zig[i] ~/ divisor) % 256).toInt();
+      }
+      divisor *= 256.0;
+    }
+  }
+  return _CodedSymbols(width, _compress(raw, options));
+}
+
+Uint8List _compress(Uint8List raw, FourdgsWriteOptions options) {
+  if (options.codec != codecDeflate) {
+    throw FourdgsUnsupportedCodec(
+      'stream codec ${options.codec} is not available to a pure-Dart build',
+    );
+  }
+  // A zlib frame, not a bare deflate block: the format's deflate carries the
+  // RFC 1950 wrapper, and the decoder checks its Adler-32.
+  return Uint8List.fromList(
+    archive.ZLibEncoder().encodeBytes(raw, level: options.level),
+  );
+}
+
+Uint8List _streamHeader(
+  int attributeId,
+  int width,
+  int mode,
+  int codec,
+  int channels,
+  int count,
+  int payloadLength,
+) {
+  final w = _ByteWriter(streamHeaderBytes);
+  w.u8(attributeId);
+  w.u8(width);
+  w.u8(mode);
+  w.u8(codec);
+  w.u8(channels);
+  w.u32(count);
+  w.u64(payloadLength);
+  return w.finish();
+}
+
+Uint8List _concat(Uint8List head, Uint8List tail) {
+  final out = Uint8List(head.length + tail.length);
+  out.setRange(0, head.length, head);
+  out.setRange(head.length, out.length, tail);
+  return out;
+}
+
+// --------------------------------------------------------------------------
+// A little-endian byte sink
+// --------------------------------------------------------------------------
+
+/// Counts bytes while forwarding each completed record to the caller's sink.
+class _SinkWriter {
+  _SinkWriter(this._sink);
+
+  final Sink<List<int>> _sink;
+  int _length = 0;
+
+  int get length => _length;
+
+  void bytes(Uint8List bytes) {
+    _sink.add(bytes);
+    _length += bytes.length;
+  }
+}
+
+/// The deliberately whole-file adapter behind [writeFourdgsBytes].
+class _ByteCollector implements Sink<List<int>> {
+  final _parts = <Uint8List>[];
+  int _length = 0;
+
+  @override
+  void add(List<int> data) {
+    final bytes = data is Uint8List ? data : Uint8List.fromList(data);
+    _parts.add(bytes);
+    _length += bytes.length;
+  }
+
+  @override
+  void close() {}
+
+  Uint8List finish() {
+    final out = Uint8List(_length);
+    int at = 0;
+    for (final part in _parts) {
+      out.setRange(at, at + part.length, part);
+      at += part.length;
+    }
+    return out;
+  }
+}
+
+class _ByteWriter {
+  _ByteWriter([int capacity = 256]) : _buf = Uint8List(math.max(capacity, 16)) {
+    _view = ByteData.sublistView(_buf);
+  }
+
+  Uint8List _buf;
+  late ByteData _view;
+  int _length = 0;
+
+  int get length => _length;
+
+  void _ensure(int extra) {
+    if (_length + extra <= _buf.length) return;
+    int next = _buf.length * 2;
+    while (next < _length + extra) {
+      next *= 2;
+    }
+    final grown = Uint8List(next);
+    grown.setRange(0, _length, _buf);
+    _buf = grown;
+    _view = ByteData.sublistView(_buf);
+  }
+
+  void u8(int v) {
+    _ensure(1);
+    _buf[_length++] = v & 0xFF;
+  }
+
+  void u32(int v) {
+    _ensure(4);
+    _view.setUint32(_length, v, Endian.little);
+    _length += 4;
+  }
+
+  /// A `u64`, written as two `u32`s for the same reason the reader reads it that
+  /// way: `ByteData.setUint64` is unsupported when Dart compiles to JavaScript,
+  /// so a writer that used it would work in tests and on Wasm and throw in a
+  /// JS-compiled build.
+  void u64(int v) {
+    _ensure(8);
+    _view.setUint32(_length, v % 0x100000000, Endian.little);
+    _view.setUint32(_length + 4, v ~/ 0x100000000, Endian.little);
+    _length += 8;
+  }
+
+  void f64(double v) {
+    _ensure(8);
+    _view.setFloat64(_length, v, Endian.little);
+    _length += 8;
+  }
+
+  void bytes(Uint8List b) {
+    _ensure(b.length);
+    _buf.setRange(_length, _length + b.length, b);
+    _length += b.length;
+  }
+
+  /// `u32` byte length then that many UTF-8 bytes. Not NUL-terminated.
+  void string(String s) {
+    final encoded = utf8.encode(s);
+    u32(encoded.length);
+    bytes(encoded);
+  }
+
+  /// `u64` byte length then that many bytes.
+  void blob(Uint8List b) {
+    u64(b.length);
+    bytes(b);
+  }
+
+  /// `u32` byte length of the whole block, then `string` key / `string` value
+  /// pairs filling exactly that block.
+  ///
+  /// Keys are sorted. A map has no order and a file does, so writing the pairs
+  /// in whatever order the caller's map iterates makes two encodes of one scene
+  /// differ — which is the difference between a deterministic encoder and one
+  /// that merely looks deterministic on the machine it was written on.
+  void strMap(Map<String, String> map) {
+    final body = _ByteWriter(64);
+    for (final key in map.keys.toList()..sort()) {
+      body.string(key);
+      body.string(map[key]!);
+    }
+    final bytes = body.finish();
+    u32(bytes.length);
+    this.bytes(bytes);
+  }
+
+  /// A view of everything written from [start] on. Valid until the next write.
+  Uint8List viewFrom(int start) => Uint8List.sublistView(_buf, start, _length);
+
+  Uint8List finish() => Uint8List.sublistView(_buf, 0, _length);
+}

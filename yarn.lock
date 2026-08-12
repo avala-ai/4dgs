@@ -64,6 +64,8 @@ __metadata:
   resolution: "@4dgs/nodejs@workspace:typescript/nodejs"
   dependencies:
     "@4dgs/core": "workspace:^"
+  bin:
+    4dgs: ./dist/cli.js
   languageName: unknown
   linkType: soft
 

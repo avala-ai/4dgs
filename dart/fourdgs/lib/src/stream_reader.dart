@@ -159,7 +159,10 @@ FourdgsScene readFourdgsBytes(
     for (final record in iterRecords(data, fourdgsMagic.length)) {
       switch (record.opcode) {
         case opHeader:
-          header = FourdgsHeader.parse(record.content);
+          header = FourdgsHeader.parse(
+            record.content,
+            fileOffset: record.offset + recordHeaderBytes,
+          );
         case opQuantization:
           quantization = FourdgsQuantization.parse(
             record.content,
@@ -183,6 +186,9 @@ FourdgsScene readFourdgsBytes(
               windows,
               cutoff: header?.cutoff ?? fourdgsDefaultCutoff,
               compression: body.header.compression,
+              chunkOffset: record.offset,
+              streamsOffset:
+                  record.offset + recordHeaderBytes + body.streamsOffset,
             ),
           );
           chunkCounts.add(body.header.count);
@@ -201,6 +207,7 @@ FourdgsScene readFourdgsBytes(
                 record.content,
                 expectedBand: band,
                 expectedCount: chunkCounts.last,
+                fileOffset: record.offset + recordHeaderBytes,
               );
               if (decoded != null) chunkBands.last[band] = decoded;
             }
@@ -693,6 +700,10 @@ FourdgsGaussianSet assembleGaussians(
   final sigmaT = Float32List(total);
   final winLo = Float32List(total);
   final winHi = Float32List(total);
+  final haveSourceGroup = chunks.every(
+    (FourdgsDecodedChunk c) => c.sourceGroup != null,
+  );
+  final sourceGroup = haveSourceGroup ? Int32List(total) : null;
   final haveSource = chunks.every(
     (FourdgsDecodedChunk c) => c.sourceIndex != null,
   );
@@ -716,6 +727,9 @@ FourdgsGaussianSet assembleGaussians(
     sigmaT.setRange(at, at + chunk.count, chunk.sigmaT);
     winLo.setRange(at, at + chunk.count, chunk.winLo);
     winHi.setRange(at, at + chunk.count, chunk.winHi);
+    if (sourceGroup != null) {
+      sourceGroup.setRange(at, at + chunk.count, chunk.sourceGroup!);
+    }
     if (sourceIndex != null) {
       sourceIndex.setRange(at, at + chunk.count, chunk.sourceIndex!);
     }
@@ -738,6 +752,7 @@ FourdgsGaussianSet assembleGaussians(
     shDegree: shDegree,
     sh: sh?.values,
     shCoefficients: sh?.coefficients ?? 0,
+    sourceGroup: sourceGroup,
     sourceIndex: sourceIndex,
     objectId: objectId,
   );

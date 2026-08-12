@@ -17,6 +17,7 @@
 mod out;
 mod args;
 mod commands;
+mod refusal;
 mod validate;
 
 use std::process::ExitCode;
@@ -30,6 +31,14 @@ use args::{Args, Command};
 pub const EXIT_OK: u8 = 0;
 pub const EXIT_FAILED: u8 = 1;
 pub const EXIT_WARNINGS: u8 = 2;
+/// The tool could not do its job: no such file, no permission, an argument it does not
+/// understand.
+///
+/// Separate from `EXIT_FAILED` because the two mean opposite things to whatever is reading
+/// them. `1` is an answer about the file — it was read, and it is bad. `3` is the absence
+/// of an answer, and a pipeline that treats them alike cannot tell a corrupt asset from a
+/// typo in a path. A tool that exits 1 for both is indistinguishable from a broken one.
+pub const EXIT_TOOL: u8 = 3;
 
 const USAGE: &str = "\
 4dgs — read and inspect .4dgs files
@@ -37,7 +46,7 @@ const USAGE: &str = "\
 usage:
   4dgs info <file> [--names]         summarize a file and what seeking it costs
   4dgs validate <file>               check a file against the specification
-  4dgs inspect <file> [--json]       walk the records: offset, opcode, length
+  4dgs inspect <file> [--json]       walk the records: offset, opcode, length, crc
   4dgs decode <file> [-t <sec>]      report the gaussians visible at an instant
   4dgs --version
   4dgs --help
@@ -49,7 +58,8 @@ options:
   -t, --time      the instant to decode, in seconds (default 0)
 
 exit codes:
-  0  fine       1  refused, or invalid       2  valid, with warnings
+  0  fine                       2  valid, with warnings
+  1  refused, or invalid        3  the tool could not run (no such file, bad usage)
 ";
 
 fn main() -> ExitCode {
@@ -61,7 +71,7 @@ fn main() -> ExitCode {
         Err(message) => {
             eprintln!("4dgs: {message}");
             eprintln!("\n{USAGE}");
-            return ExitCode::from(EXIT_FAILED);
+            return ExitCode::from(EXIT_TOOL);
         }
     };
 
@@ -77,9 +87,38 @@ fn main() -> ExitCode {
             // The library's errors already name the field, the value and what was
             // expected, so the file is the only thing left to add.
             eprintln!("4dgs: {}: {error}", args.file);
-            ExitCode::from(EXIT_FAILED)
+            // And the identifier, plus the byte, for the refusals the specification names.
+            // Placing the byte costs a second framing walk over a file that has already
+            // been refused, which is a few reads and only ever happens on the way out.
+            if let Some(named) = locate(&args.file, &error) {
+                eprintln!("4dgs: {named}");
+            }
+            // A transport that failed is not a verdict on the file. Everything else is:
+            // the reader read the bytes and would not have them.
+            ExitCode::from(match error {
+                fourdgs::Error::Io(_) => EXIT_TOOL,
+                _ => EXIT_FAILED,
+            })
         }
     }
+}
+
+/// The refusal identifier and the byte, for an error on its way to stderr.
+///
+/// Best effort by construction: the file has already refused to open, so the search that
+/// would place the refusal may itself be refused. That costs the byte, not the identifier.
+///
+/// Streamed, and it stops at the record it is looking for. The refusal this is placing was
+/// raised early — an unimplemented model in the Header, a codec in the first chunk — and a
+/// tool that answered "where?" by first framing every record in the file would turn a
+/// bounded refusal into an allocation proportional to the file, on the path taken by
+/// precisely the files that are too big to hold. See `refusal::locate_streaming`.
+fn locate(path: &str, error: &fourdgs::Error) -> Option<refusal::Named> {
+    let code = error.refusal_code()?;
+    let site = fourdgs::readable::FileReadable::open(path)
+        .ok()
+        .and_then(|mut source| refusal::locate_streaming(&mut source, code));
+    refusal::describe(error, None, site)
 }
 
 /// A count with thousands separators, matching the Python tool's `{:,}`.
