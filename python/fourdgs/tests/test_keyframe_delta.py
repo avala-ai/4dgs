@@ -286,6 +286,30 @@ def test_every_composed_column_is_as_tall_as_the_population():
     assert later.bins[op.A_OBJECT_ID].reshape(-1).tolist() == [0, 0, 7, 0]
 
 
+def test_only_object_id_has_a_value_for_a_row_nothing_gave_one():
+    """§6.6 gives `object_id` a default and no section gives one to the producer lanes.
+
+    "Optional" says a file may omit the stream. It does not say what a composed column
+    holds for a row whose birth omitted it, and zero is a label like any other — reading
+    one that was never written is inventing it. So `object_id` pads and `source_index`
+    is refused, which is where TypeScript and Swift already stand.
+    """
+    with_object = kd.keyframe_state(
+        np.asarray([1]),
+        {op.A_POSITION: np.asarray([[0, 0, 0]]), op.A_OBJECT_ID: np.asarray([[7]])},
+    )
+    grown = _apply(with_object, births=([2], {op.A_POSITION: np.asarray([[1, 1, 1]])}))
+    assert grown.bins[op.A_OBJECT_ID].reshape(-1).tolist() == [7, 0]
+
+    with_source = kd.keyframe_state(
+        np.asarray([1]),
+        {op.A_POSITION: np.asarray([[0, 0, 0]]), op.A_SOURCE_INDEX: np.asarray([[7]])},
+    )
+    with pytest.raises(MalformedFile) as caught:
+        _apply(with_source, births=([2], {op.A_POSITION: np.asarray([[1, 1, 1]])}))
+    assert caught.value.code == "incomplete-birth"
+
+
 def test_a_keyframe_may_state_an_empty_population_and_let_a_birth_fill_it():
     """Padding no rows invents nothing, so an empty state accepts any attribute.
 
