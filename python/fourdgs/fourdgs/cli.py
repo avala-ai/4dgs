@@ -10,6 +10,7 @@ do is something a caller can do.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import sys
@@ -114,6 +115,12 @@ def cmd_validate(args) -> int:
         report = validate(fh.read())
     for finding in report.findings:
         print(finding)
+        # Indented, and with a prefix of its own, so that a caller filtering the findings
+        # on `error:`/`warning:`/`note:` — which is how this tool and the Rust one are
+        # compared — sees exactly what it saw before. Naming which rule fired is a
+        # validator's whole job, and the vocabulary was already on the exception.
+        if finding.refusal is not None:
+            print(f"  {finding.refusal}")
     if report.ok:
         print("valid" if not report.findings else "valid (with notes)")
         return 0
@@ -373,6 +380,83 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+#: The tool could not run at all — the file was not there, or could not be read. Distinct
+#: from `1`, which is a verdict about a file this tool did read: a caller that gets the
+#: same code for "your file is invalid" and "I never opened your file" cannot tell a
+#: refusal from a typo in a path, and a pipeline gating on the exit status treats a broken
+#: mount as a fleet of malformed files. `2` is argparse's usage error, so this is `3`,
+#: which is also what the Rust tool returns for the same thing.
+EXIT_TOOL_FAILURE = 3
+
+
+class _PipeTolerantStream:
+    """A stream that stops writing once its reader has gone.
+
+    `4dgs validate big.4dgs | head -1` closes the pipe after the first line, and the
+    next `print` raises `BrokenPipeError` — an `OSError`, so the handler below would
+    call it a transport failure and return `EXIT_TOOL_FAILURE`. It is neither. Who was
+    listening is not a fact about the file, and a verdict that changes when a reader
+    leaves early is not a verdict. Dropping the rest of the writes keeps the command's
+    own return value, which is what the Swift tool does with the same shape of failure.
+    """
+
+    def __init__(self, stream) -> None:
+        self._stream = stream
+        self.broken = False
+
+    def write(self, text: str) -> int:
+        if self.broken:
+            return len(text)
+        try:
+            return self._stream.write(text)
+        except OSError as exc:
+            if not _is_departed_reader(exc):
+                raise
+            self.broken = True
+            return len(text)
+
+    def flush(self) -> None:
+        if self.broken:
+            return
+        try:
+            self._stream.flush()
+        except OSError as exc:
+            if not _is_departed_reader(exc):
+                raise
+            self.broken = True
+
+    def __getattr__(self, name: str):
+        return getattr(self._stream, name)
+
+
+def _is_departed_reader(exc: OSError) -> bool:
+    """Whether this write failed because nobody is reading any more.
+
+    POSIX says `EPIPE` and Python raises `BrokenPipeError` for it. Windows reports the
+    same situation as `EINVAL` on the flush that follows the failed write, which is why
+    that errno is admitted there and only there: on Windows a write to stdout has no
+    other plausible way to be handed an invalid argument, and the alternative is the
+    interpreter exiting 120 with a traceback in place of the tool's verdict.
+    """
+    if isinstance(exc, BrokenPipeError):
+        return True
+    return sys.platform == "win32" and exc.errno == errno.EINVAL
+
+
+def _silence(fd: int) -> None:
+    """Point a descriptor at the void, so a later flush of it cannot fail."""
+    try:
+        null = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        return
+    try:
+        os.dup2(null, fd)
+    except OSError:
+        pass
+    finally:
+        os.close(null)
+
+
 def main(argv: list[str] | None = None) -> int:
     # The tool's output is UTF-8 wherever it goes. Unpiped, Python already does
     # this; piped on Windows it falls back to the locale encoding, so the same
@@ -382,7 +466,32 @@ def main(argv: list[str] | None = None) -> int:
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
     args = build_parser().parse_args(argv)
-    return args.func(args)
+    sys.stdout, sys.stderr = _PipeTolerantStream(sys.stdout), _PipeTolerantStream(sys.stderr)
+    try:
+        return args.func(args)
+    except OSError as exc:
+        # Narrow on purpose: a transport that would not answer, and nothing else. A
+        # malformed file is a verdict and stays exit 1; a bug in this package should still
+        # come out as a traceback, because a tool that reports its own defects as though
+        # they were the file's is worse than one that crashes.
+        print(f"4dgs: {exc.filename or ''}: {exc.strerror or exc}".replace(": : ", ": "), file=sys.stderr)
+        return EXIT_TOOL_FAILURE
+    finally:
+        # Flush here, while a `BrokenPipeError` still lands somewhere that can hold it.
+        # Piped output is block-buffered, so a short report never reaches the pipe until
+        # the interpreter flushes it on the way out — and a flush that fails there raises
+        # where nothing can catch it: Python prints `Exception ignored` and exits 120,
+        # losing the code we just chose. Draining first, then pointing the descriptor at
+        # the void, is what lets the verdict be the exit status in both bufferings.
+        for wrapper, fd in ((sys.stdout, 1), (sys.stderr, 2)):
+            if isinstance(wrapper, _PipeTolerantStream):
+                wrapper.flush()
+                if wrapper.broken:
+                    _silence(fd)
+        if isinstance(sys.stdout, _PipeTolerantStream):
+            sys.stdout = sys.stdout._stream
+        if isinstance(sys.stderr, _PipeTolerantStream):
+            sys.stderr = sys.stderr._stream
 
 
 if __name__ == "__main__":

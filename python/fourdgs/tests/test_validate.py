@@ -198,6 +198,90 @@ class TestRefusals:
         assert not report.ok
         assert any("chunk index entry 0" in m for m in errors(report))
 
+    def test_a_footer_naming_no_summary_still_checks_the_index_entries(self):
+        """`summary_start` 0 selects no summary, and the entries are still checkable.
+
+        Two separate answers are owed about such a file. Its Chunk Index records are
+        orphaned — nothing reaches them by seeking — and saying so is right; Swift's
+        `testFooterAndChunkIndexPlacementArePhysicalRules` pins the same rule. But
+        emptying the entry list on top of that stopped every per-entry check below from
+        running on records still sitting there to be read, so the entry corrupted here,
+        whose range runs off the end of the file, went unreported. Both answers now
+        arrive.
+        """
+        data = bytearray(real_file())
+        summary_start = rec.Footer.parse(bytes(data[-(20 + len(MAGIC)) : -len(MAGIC)])).summary_start
+        # The first index record's chunk_offset field: past the record header, past t0/t1.
+        at = summary_start + 9 + 16
+        data[at : at + 8] = (len(data) - 4).to_bytes(8, "little")
+        # Now say the file carries no summary, without moving a single record.
+        data[-(20 + len(MAGIC)) : -(len(MAGIC) + 12)] = (0).to_bytes(8, "little")
+
+        report = validate(bytes(data))
+
+        assert any("lies outside the Footer-selected summary index" in m for m in errors(report))
+        assert any("chunk index entry 0" in m for m in errors(report))
+
+    def test_a_file_with_no_footer_does_not_name_a_selection_it_never_made(self):
+        """The other half: with no Footer there is no declaration to be outside of.
+
+        The missing Footer is the fault and is reported on its own. Saying every Chunk
+        Index record "lies outside the Footer-selected summary index" adds one misleading
+        line per record — thousands on a real capture — naming a selection the file never
+        made, on top of the one line that matters.
+        """
+        data = bytearray(real_file())
+        footer_at = len(data) - (20 + 9 + len(MAGIC))  # content, record header, trailing magic
+        without_footer = bytes(data[:footer_at]) + MAGIC
+
+        report = validate(without_footer)
+
+        assert any("no Footer record" in m for m in errors(report))
+        assert not any("lies outside the Footer-selected summary index" in m for m in errors(report))
+
+    def test_a_keyframe_delta_file_naming_no_summary_is_still_decoded(self):
+        """Keeping the index records must not send the file down the seeking branch.
+
+        `_check_keyframe_delta` opens the file with `open_indexed` when it is told the
+        file is indexed, and that needs the Footer to name a summary. Passing it
+        `bool(index)` meant a `summary_start` of 0 — §5.2's indexless file, which may
+        still carry Chunk Index records nothing can reach — was answered with one
+        "a seeking reader cannot open this file" and no chunk decoded at all. The
+        streamed branch reads it, and that is the branch it belongs on.
+        """
+        import pathlib
+
+        corpus = pathlib.Path(__file__).resolve().parents[3] / "tests/conformance/data/keyframe"
+        source = corpus / "KeyframeDelta-UseChunkIndex-UseCrc-UseStatistics.4dgs"
+        if not source.exists():
+            import pytest
+
+            pytest.skip("the generated corpus is not present")
+        data = bytearray(source.read_bytes())
+        data[-(20 + len(MAGIC)) : -(len(MAGIC) + 12)] = (0).to_bytes(8, "little")
+        data[-(len(MAGIC) + 4) : -len(MAGIC)] = (0).to_bytes(4, "little")
+
+        report = validate(bytes(data))
+
+        assert not any("a seeking reader cannot open this file" in m for m in errors(report))
+
+    def test_an_out_of_range_sh_degree_does_not_abandon_the_walk(self):
+        """A reader refuses such a Header and stops. A validator has one pass.
+
+        `Header.parse` raising out of the record loop left `header`, `quant` and `footer`
+        all unset, so the report carried three "no X record" errors about records the
+        file plainly holds, and lost every finding after the first record.
+        """
+        head = rec.Header(duration_sec=1.0, gaussian_count=0, aabb=[0.0] * 6)
+        head.sh_degree = 4
+        data = MAGIC + head.encode() + rec.Footer().encode() + MAGIC
+
+        report = validate(data)
+
+        assert any("sh_degree 4" in m for m in errors(report))
+        assert not any("no Header record" in m for m in errors(report))
+        assert not any("no Footer record" in m for m in errors(report))
+
     def test_a_non_finite_quantization_step_is_an_error(self):
         # Spec §5.3: every step and origin must be finite. This is the corrupt field that
         # ruins every gaussian rather than one — each bin times an infinite step decodes to

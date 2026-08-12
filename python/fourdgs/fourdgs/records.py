@@ -80,6 +80,23 @@ class Header:
 
     @staticmethod
     def parse(content) -> Header:
+        header = Header.decode_fields(content)
+        problem = header.sh_degree_problem()
+        if problem is not None:
+            raise MalformedFile(problem)
+        return header
+
+    @staticmethod
+    def decode_fields(content) -> Header:
+        """The fields, without the range checks `parse` refuses on.
+
+        A reader refuses such a file and stops, which is right. A *validator* has one
+        walk over the records and wants to say everything true about the file, so it
+        needs the Header it just read even when one of its fields is out of range —
+        otherwise a single bad `sh_degree` aborts the walk and the report says "no
+        Header record" about a Header sitting on disk, plus the same about the
+        Quantization and Footer records the loop never reached.
+        """
         c = Cursor(content)
         return Header(
             profile=c.string(),
@@ -93,6 +110,12 @@ class Header:
             flags=c.u8(),
             attributes=c.str_map(),
         )
+
+    def sh_degree_problem(self) -> str | None:
+        """The refusal `sh_degree` earns, or `None`. Shared so both spellings agree."""
+        if not 0 <= self.sh_degree <= 3:
+            return f"the Header declares sh_degree {self.sh_degree}; version 1 defines 0 through 3"
+        return None
 
 
 @dataclass
@@ -336,7 +359,8 @@ def encode_delta_chunk(
     return put_record(op.DELTA_CHUNK, body)
 
 
-def parse_delta_chunk(content) -> tuple[DeltaChunkHeader, memoryview, memoryview, memoryview]:
+def parse_delta_chunk_block(content) -> tuple[DeltaChunkHeader, memoryview]:
+    """Parse a Delta Chunk header and return its still-compressed records block."""
     c = Cursor(content)
     head = DeltaChunkHeader(
         t0=c.f64(),
@@ -352,7 +376,19 @@ def parse_delta_chunk(content) -> tuple[DeltaChunkHeader, memoryview, memoryview
         compression=c.string(),
         uncompressed_size=c.u64(),
     )
-    records = Cursor(c.take(c.u64()))
+    return head, c.take(c.u64())
+
+
+def parse_delta_chunk(content) -> tuple[DeltaChunkHeader, memoryview, memoryview, memoryview]:
+    """Parse an uncompressed Delta Chunk into its three framed groups.
+
+    Readers that support the record-level ``compression`` field first call
+    :func:`parse_delta_chunk_block`, decompress the returned block, and frame the three
+    groups from those bytes. This convenience remains the reference encoder's empty-codec
+    path and keeps the record module independent of codec implementations.
+    """
+    head, block = parse_delta_chunk_block(content)
+    records = Cursor(block)
     return head, records.take(records.u64()), records.take(records.u64()), records.take(records.u64())
 
 

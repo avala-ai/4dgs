@@ -27,14 +27,15 @@ uses.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import numpy as np
 
 from . import opcode as op
 from . import records as rec
-from .exceptions import MalformedFile
-from .keyframe_delta import State, apply_delta, chain_for, check_tiling, keyframe_state
+from .exceptions import FourdgsError, MalformedFile, UnsupportedCodec
+from .keyframe_delta import State, apply_delta, chain_from, check_tiling, keyframe_state
 from .keyframe_delta_writer import (
     KeyframeDeltaOptions,
     Sample,
@@ -59,15 +60,18 @@ from .quantization import (
 )
 from .serialization import (
     CODEC_DEFLATE,
+    CODEC_ZSTD,
     MAGIC,
     Cursor,
     check_magic,
     crc32,
     decode_stream,
+    decode_stream_or_skip,
+    decompress,
     encode_stream,
     iter_records,
 )
-from .stream_reader import check_window_indices
+from .stream_reader import check_sh_codes, check_window_indices, chunk_stream_bytes
 
 #: Matches `tests/conformance/canonical.py`: integers are strings so a 64-bit value
 #: survives a double-backed JSON parser, floats are rounded before comparison, a
@@ -274,6 +278,35 @@ def _reanchor_bins(bins: dict[int, np.ndarray], grids: Grids, t0: float) -> dict
     return anchored
 
 
+def _keyframe_mu_bins(t0: float, bins: dict[int, np.ndarray], grids: Grids) -> np.ndarray:
+    """The one `mu_t` bin each keyframe row must use for its own timestamp."""
+    sigma_bins = bins[op.A_SIGMA_T][:, 0]
+    never_fades = bins[op.A_FLAGS][:, 0] != 0
+    step = grids.mu_step(sigma_bins, never_fades)
+    if np.any(~np.isfinite(step)) or np.any(step <= 0):
+        raise MalformedFile("the keyframe mu_t grid has a non-finite or non-positive step")
+    return np.rint(float(t0) / step).astype(np.int64).reshape(-1, 1)
+
+
+def _check_keyframe_mu_t(t0: float, bins: dict[int, np.ndarray], grids: Grids) -> None:
+    """Refuse a keyframe whose decoded temporal origin is not its Chunk timestamp."""
+    if op.A_MU_T not in bins or bins[op.A_MU_T].shape[0] == 0:
+        return
+    actual = bins[op.A_MU_T][:, 0]
+    expected = _keyframe_mu_bins(t0, bins, grids)[:, 0]
+    mismatch = np.flatnonzero(actual != expected)
+    if mismatch.size:
+        row = int(mismatch[0])
+        sigma_bins = bins[op.A_SIGMA_T][:, 0]
+        never_fades = bins[op.A_FLAGS][:, 0] != 0
+        step = grids.mu_step(sigma_bins, never_fades)
+        decoded = float(actual[row]) * float(step[row])
+        raise MalformedFile(
+            f"keyframe Chunk at t0={t0} row {row} decodes mu_t={decoded}; expected the Chunk timestamp {t0}",
+            code="keyframe-mu-t-mismatch",
+        )
+
+
 # --------------------------------------------------------------------------
 # Writing
 # --------------------------------------------------------------------------
@@ -321,6 +354,12 @@ def write_sequence(
     ]
     t0s = [float(s.t0) for s in samples]
     t1s = [*t0s[1:], float(duration_sec)]
+    # A keyframe states every gaussian anew at its own t0 (§11.3). Keep the quantized
+    # reference state and the bytes emitted from it identical, even when a caller's input
+    # GaussianSet retained a temporal origin from an earlier sample.
+    for i, (ids, bins) in enumerate(quantized):
+        if is_keyframe(i, kd) and ids.size:
+            bins[op.A_MU_T] = _keyframe_mu_bins(t0s[i], bins, grids)
 
     distinct_ids: set[int] = set()
     for ids, _ in quantized:
@@ -567,8 +606,18 @@ class DecodedSequence:
 
     @property
     def grids(self) -> Grids:
-        q = self.quantization
-        steps = Steps(
+        return _decoded_grids(self.quantization, self.windows, self.header.cutoff)
+
+
+def _decoded_grids(
+    quantization: rec.Quantization,
+    windows: list[tuple[float, float]],
+    cutoff: float,
+) -> Grids:
+    """Rebuild the shared grids from the records a decoder has already parsed."""
+    q = quantization
+    return Grids(
+        steps=Steps(
             pos=q.step_pos,
             scale_log=q.step_scale_log,
             rot=q.step_rot,
@@ -578,70 +627,157 @@ class DecodedSequence:
             time=q.step_time,
             sigma_log=q.step_sigma_log,
             sh=q.step_sh,
-        )
-        return Grids(
-            steps=steps,
-            bounds=None,
-            origin=np.asarray(q.pos_origin, dtype=np.float64),
-            windows=list(self.windows),
-            cutoff=self.header.cutoff,
-        )
+        ),
+        bounds=None,
+        origin=np.asarray(q.pos_origin, dtype=np.float64),
+        windows=list(windows),
+        cutoff=cutoff,
+    )
 
 
 def _decode_group(stream_bytes) -> tuple[np.ndarray, dict[int, np.ndarray]]:
     """One length-framed sub-block: its ids, and a bin array per other attribute."""
     cursor = Cursor(bytes(stream_bytes))
     got: dict[int, np.ndarray] = {}
+    seen: set[int] = set()
+    known = frozenset(op.ATTRIBUTE_CHANNELS)
     while cursor.remaining() > 0:
-        attribute_id, values = decode_stream(cursor)
+        attribute_id, values = decode_stream_or_skip(cursor, known)
         # One stream per attribute here too. The regular chunk path refuses a second;
         # this path had its own loop and was still resolving it silently, so the same
         # malformed file was refused as a chunk and accepted as a delta group.
-        if attribute_id in got:
+        if attribute_id in seen:
             raise MalformedFile(
                 f"a keyframe-delta group carries attribute {attribute_id} twice; the format "
                 f"defines one stream per attribute",
                 code="duplicate-attribute-stream",
             )
-        got[attribute_id] = values
+        seen.add(attribute_id)
+        if values is not None:
+            got[attribute_id] = values
+    _check_channel_counts(got)
     if not len(stream_bytes):
         return np.zeros(0, np.int64), {}
     if op.A_GAUSSIAN_ID not in got:
         raise MalformedFile("a keyframe-delta group carries no gaussian_id stream", code="missing-gaussian-id")
-    ids = got.pop(op.A_GAUSSIAN_ID)[:, 0].astype(np.int64)
+    ids = _gaussian_ids(got.pop(op.A_GAUSSIAN_ID)[:, 0])
     return ids, got
 
 
-def _keyframe_from_chunk(content) -> tuple[np.ndarray, dict[int, np.ndarray]]:
+def _keyframe_from_chunk(content, grids: Grids | None = None) -> tuple[np.ndarray, dict[int, np.ndarray]]:
     head, streams = rec.parse_chunk(content)
-    cursor = Cursor(bytes(streams))
+    cursor = Cursor(chunk_stream_bytes(head, streams))
     got: dict[int, np.ndarray] = {}
+    seen: set[int] = set()
+    known = frozenset(op.ATTRIBUTE_CHANNELS)
     while cursor.remaining() > 0:
-        attribute_id, values = decode_stream(cursor)
+        attribute_id, values = decode_stream_or_skip(cursor, known)
         # One stream per attribute here too. The regular chunk path refuses a second;
         # this path had its own loop and was still resolving it silently, so the same
         # malformed file was refused as a chunk and accepted as a delta group.
-        if attribute_id in got:
+        if attribute_id in seen:
             raise MalformedFile(
                 f"a keyframe-delta group carries attribute {attribute_id} twice; the format "
                 f"defines one stream per attribute",
                 code="duplicate-attribute-stream",
             )
-        got[attribute_id] = values
+        seen.add(attribute_id)
+        if values is not None:
+            got[attribute_id] = values
     if op.A_GAUSSIAN_ID not in got:
         raise MalformedFile("a keyframe-delta chunk carries no gaussian_id stream", code="missing-gaussian-id")
-    ids = got.pop(op.A_GAUSSIAN_ID)[:, 0].astype(np.int64)
+    # Against the count the record declares, exactly as `decode_streams` does for a
+    # gaussian-birth chunk. A keyframe chunk is a Chunk record and `count` is the same
+    # field there — but this path never looked at it, so a chunk whose streams carry a
+    # different number of elements than its header declares was refused as a
+    # gaussian-birth chunk and composed as a keyframe.
+    _check_element_counts(got, int(head.count), "the keyframe chunk")
+    ids = _gaussian_ids(got.pop(op.A_GAUSSIAN_ID)[:, 0])
     missing = [a for a in _REQUIRED if a not in got]
     if missing and head.count:
         raise MalformedFile(f"keyframe chunk is missing required attributes {missing}")
+    if grids is not None:
+        _check_keyframe_mu_t(head.t0, got, grids)
     return ids, got
 
 
+def _gaussian_ids(values: np.ndarray) -> np.ndarray:
+    """Interpret gaussian_id's signed stream codes as the registry's u32."""
+    codes = np.asarray(values, dtype=np.int64).reshape(-1)
+    bad = (codes < np.iinfo(np.int32).min) | (codes > np.iinfo(np.int32).max)
+    if bad.any():
+        row = int(np.flatnonzero(bad)[0])
+        raise MalformedFile(
+            f"gaussian_id element {row} has signed stream code {int(codes[row])}; expected a signed 32-bit code",
+            code="gaussian-id-out-of-range",
+        )
+    return codes.astype(np.int32).view(np.uint32).astype(np.int64)
+
+
+def _check_element_counts(bins: dict[int, np.ndarray], count: int, what: str) -> None:
+    """Every stream in a group carries exactly the elements its header declares.
+
+    §5.18: "a stream whose `element_count` disagrees with its group's count is a refusal
+    rather than an allocation". The counts are in the record header so a streamed reader
+    can size its working set before it decompresses anything; a reader that instead takes
+    the size from whatever arrived has given the header no meaning, and the alignment
+    between a group's id stream and its value streams — which is what a delta *is* — rests
+    on a number nobody checked.
+    """
+    _check_channel_counts(bins)
+    for attribute, values in sorted(bins.items()):
+        if values.shape[0] != count:
+            raise MalformedFile(
+                f"attribute {attribute} carries {values.shape[0]} elements; {what} declares {count}",
+                code="stream-element-count-mismatch",
+            )
+
+
+def _check_channel_counts(bins: dict[int, np.ndarray]) -> None:
+    """Known attributes have the one interleaving width fixed by the registry."""
+    for attribute, values in sorted(bins.items()):
+        channels = op.ATTRIBUTE_CHANNELS.get(attribute)
+        if channels is not None and values.shape[1] != channels:
+            raise MalformedFile(
+                f"attribute {attribute} declares {values.shape[1]} channels; the registry says {channels}",
+                code="stream-channel-count-mismatch",
+            )
+
+
 def _compose_delta(reference: State, content) -> tuple[State, rec.DeltaChunkHeader]:
-    head, updates, births, deaths = rec.parse_delta_chunk(content)
+    head, updates, births, deaths = _delta_chunk_groups(content)
     update_ids, update_bins = _decode_group(updates)
     birth_ids, birth_bins = _decode_group(births)
-    death_ids, _ = _decode_group(deaths)
+    death_ids, death_bins = _decode_group(deaths)
+    missing_birth = [attribute for attribute in _REQUIRED if attribute not in birth_bins]
+    if missing_birth and head.birth_count:
+        raise MalformedFile(
+            f"the delta chunk's births group is missing required attributes {missing_birth}; "
+            "a birth carries complete absolute state",
+            code="incomplete-birth",
+        )
+    if death_bins:
+        raise MalformedFile(
+            f"the delta chunk's deaths group carries attributes {sorted(death_bins)}; "
+            "deaths contain exactly one gaussian_id stream",
+            code="unexpected-death-attribute",
+        )
+    # The three declared sizes, against the three groups that arrived. `apply_delta` sizes
+    # everything from the decoded id arrays, so without this the declared counts were
+    # parsed and then never used for anything — and a Delta Chunk that says it updates
+    # nine hundred gaussians and carries three composed silently.
+    for ids, bins, declared, group in (
+        (update_ids, update_bins, int(head.update_count), "updates"),
+        (birth_ids, birth_bins, int(head.birth_count), "births"),
+        (death_ids, death_bins, int(head.death_count), "deaths"),
+    ):
+        if int(ids.shape[0]) != declared:
+            raise MalformedFile(
+                f"the delta chunk's {group} group carries {int(ids.shape[0])} gaussians; "
+                f"its header declares {declared}",
+                code="stream-element-count-mismatch",
+            )
+        _check_element_counts(bins, declared, f"the delta chunk's {group} group")
     state = apply_delta(
         reference,
         update_ids=update_ids,
@@ -651,6 +787,37 @@ def _compose_delta(reference: State, content) -> tuple[State, rec.DeltaChunkHead
         death_ids=death_ids,
     )
     return state, head
+
+
+def _delta_chunk_groups(content) -> tuple[rec.DeltaChunkHeader, memoryview, memoryview, memoryview]:
+    """Parse a Delta Chunk and honour compression on its three-group records block."""
+    head, stored = rec.parse_delta_chunk_block(content)
+    if head.compression == "":
+        records = bytes(stored)
+        if len(records) != head.uncompressed_size:
+            raise MalformedFile(
+                f"delta chunk at t0={head.t0} declares uncompressed_size "
+                f"{head.uncompressed_size}; its records block contains {len(records)} bytes",
+                code="decompressed-size-mismatch",
+            )
+    else:
+        codec = {"deflate": CODEC_DEFLATE, "zstd": CODEC_ZSTD}.get(head.compression)
+        if codec is None:
+            raise UnsupportedCodec(
+                f"delta chunk at t0={head.t0} is compressed with {head.compression!r}, which this build does not know",
+                code="unknown-stream-codec",
+            )
+        records = decompress(bytes(stored), codec, head.uncompressed_size)
+    groups = Cursor(records)
+    updates = groups.take(groups.u64())
+    births = groups.take(groups.u64())
+    deaths = groups.take(groups.u64())
+    if groups.remaining():
+        raise MalformedFile(
+            f"delta chunk at t0={head.t0} has {groups.remaining()} bytes after its deaths group",
+            code="delta-group-framing-mismatch",
+        )
+    return head, updates, births, deaths
 
 
 def decode_streamed(data: bytes) -> DecodedSequence:
@@ -674,7 +841,12 @@ def decode_streamed(data: bytes) -> DecodedSequence:
         elif record.opcode == op.WINDOW_TABLE:
             windows = rec.WindowTable.parse(record.content).windows
         elif record.opcode == op.CHUNK:
-            ids, bins = _keyframe_from_chunk(record.content)
+            if header is None or quant is None:
+                raise MalformedFile("a keyframe Chunk appears before the Header or Quantization record")
+            ids, bins = _keyframe_from_chunk(
+                record.content,
+                _decoded_grids(quant, windows, header.cutoff),
+            )
             state = keyframe_state(ids, bins)
             by_offset[record.offset] = state
             chunks.append(
@@ -683,7 +855,7 @@ def decode_streamed(data: bytes) -> DecodedSequence:
                 )
             )
         elif record.opcode == op.DELTA_CHUNK:
-            head_peek = rec.parse_delta_chunk(record.content)[0]
+            head_peek = rec.parse_delta_chunk_block(record.content)[0]
             reference = by_offset.get(head_peek.reference_offset)
             if reference is None:
                 raise MalformedFile(
@@ -729,13 +901,27 @@ def _t1(content) -> float:
     return c.f64()
 
 
-def decode_indexed(data: bytes) -> tuple[DecodedSequence, list[rec.ChunkIndexEntry]]:
-    """Read the Footer, then the index, then compose each chunk by byte range.
+@dataclass
+class IndexedSequence:
+    """A file's front matter and its index, with nothing composed.
 
-    The composed state per chunk is produced by walking that chunk's chain (spec §11.8),
-    which is the seeking client's path and must reach the same population `decode_streamed`
-    reaches front to back.
+    What `decode_indexed` reads before it decodes anything, split out because two callers
+    want only this much: one that means to compose a single instant, and one — the
+    validator — that means to check each chunk in turn and keep none of them.
     """
+
+    header: rec.Header
+    quantization: rec.Quantization
+    windows: list[tuple[float, float]]
+    index: list[rec.ChunkIndexEntry]
+
+    @property
+    def grids(self) -> Grids:
+        return _decoded_grids(self.quantization, self.windows, self.header.cutoff)
+
+
+def open_indexed(data: bytes) -> IndexedSequence:
+    """Read the Footer and the index, and check that the index tiles the timeline."""
     check_magic(data)
     header = quant = None
     windows: list[tuple[float, float]] = []
@@ -753,6 +939,17 @@ def decode_indexed(data: bytes) -> tuple[DecodedSequence, list[rec.ChunkIndexEnt
         raise MalformedFile("file has no Footer")
     if header is None or quant is None:
         raise MalformedFile("keyframe-delta file has no Header or Quantization record")
+    # A Footer whose `summary_start` is 0 is a file with no summary at all (§5.2), which is
+    # the indexless file the streamed path exists for — not an index that happens to begin
+    # at byte 0. Reading records from there parses the magic as framing and reports
+    # whatever the eight magic bytes happen to mean as a record length, which is a
+    # diagnosis about nothing.
+    if not footer.summary_start:
+        raise MalformedFile(
+            "this file carries no chunk index, so it cannot be read by seeking; "
+            "a streamed reader decodes it front to back",
+            code="no-chunk-index",
+        )
 
     index: list[rec.ChunkIndexEntry] = []
     for record in iter_records(data, footer.summary_start):
@@ -760,18 +957,34 @@ def decode_indexed(data: bytes) -> tuple[DecodedSequence, list[rec.ChunkIndexEnt
             index.append(rec.ChunkIndexEntry.parse(record.content))
         else:
             break
-    check_tiling(index)
+    check_tiling(index, header.duration_sec)
+    return IndexedSequence(header=header, quantization=quant, windows=windows, index=index)
+
+
+def decode_indexed(data: bytes) -> tuple[DecodedSequence, list[rec.ChunkIndexEntry]]:
+    """Read the Footer, then the index, then compose each chunk by byte range.
+
+    The composed state per chunk is produced by walking that chunk's chain (spec §11.8),
+    which is the seeking client's path and must reach the same population `decode_streamed`
+    reaches front to back.
+
+    This returns every state at once, which is what a caller that wants the states wants
+    and what a caller that wants a verdict must not ask for — `compose_chain` is that
+    caller's entry point.
+    """
+    opened = open_indexed(data)
+    index = opened.index
 
     # Compose each entry by walking its chain, so both read paths are exercised.
     chunks: list[ChunkInfo] = []
     for entry in index:
-        state = _compose_chain(data, index, entry)
+        state = compose_chain(data, index, entry, opened.windows, opened.grids)
         update_count = birth_count = death_count = None
         if entry.kind:
             # The counts are not in the index — there `gaussian_count` is their sum — so a
             # reader that wants the split reads the delta chunk's own header. The chain walk
             # already fetched this record; parsing its header again is cheap.
-            head = rec.parse_delta_chunk(_record_at(data, entry.chunk_offset, entry.chunk_length))[0]
+            head = rec.parse_delta_chunk_block(_record_at(data, entry.chunk_offset, entry.chunk_length))[0]
             update_count, birth_count, death_count = head.update_count, head.birth_count, head.death_count
         chunks.append(
             ChunkInfo(
@@ -788,11 +1001,27 @@ def decode_indexed(data: bytes) -> tuple[DecodedSequence, list[rec.ChunkIndexEnt
                 state,
             )
         )
-    return DecodedSequence(header=header, quantization=quant, windows=windows, chunks=chunks), index
+    return DecodedSequence(
+        header=opened.header, quantization=opened.quantization, windows=opened.windows, chunks=chunks
+    ), index
 
 
 def _record_at(data: bytes, offset: int, length: int):
-    return rec_content(data[offset : offset + length])
+    if offset < 0 or length < 9 or offset + length > len(data):
+        raise MalformedFile(
+            f"indexed state range [{offset}, {offset + length}) is outside the {len(data)}-byte file",
+            code="index-record-mismatch",
+        )
+    framed = Cursor(data[offset : offset + length])
+    framed.u8()
+    content_length = framed.u64()
+    if content_length + 9 != length:
+        raise MalformedFile(
+            f"the chunk index range at {offset} declares {length} bytes; the record there "
+            f"frames exactly {content_length + 9}",
+            code="index-record-mismatch",
+        )
+    return framed.take(content_length)
 
 
 def rec_content(record_bytes: bytes):
@@ -801,19 +1030,910 @@ def rec_content(record_bytes: bytes):
     return c.take(c.u64())
 
 
-def _compose_chain(data: bytes, index: list[rec.ChunkIndexEntry], entry: rec.ChunkIndexEntry) -> State:
-    chain = chain_for(index, (entry.t0 + entry.t1) / 2.0)
-    state: State | None = None
+def check_window_indices_of(state: State, windows: list[tuple[float, float]]) -> None:
+    """Refuse a `window_index` the table cannot answer, on either read path.
+
+    The table defaults to a single `(0, 0)` entry when a file declares none, so index 0
+    stays legal for a file with no Window Table — validating against the raw count would
+    refuse those files on one path while the other decoded them.
+
+    Composition produces bins and stops there, so nothing on this path used to look at
+    `window_index` at all: the bound was proved during reconstruction, several calls
+    later, on the one instant somebody asked for. A file whose keyframe carries an index
+    outside its table therefore composed cleanly and refused when it was rendered — the
+    same fault the gaussian-birth path refuses at decode.
+    """
+    table = len(windows) or 1
+    values = state.bins.get(op.A_WINDOW_INDEX)
+    if values is None:
+        # A zero-count keyframe may omit every stream, and `apply_delta` carries forward
+        # only the attributes the reference already had — so a later birth can compose a
+        # non-empty state with no window_index column at all. Reconstruction indexes it,
+        # so this is a refusal here rather than an IndexError there.
+        if state.count:
+            raise MalformedFile(
+                "a composed state carries no window_index column; it is a required keyframe attribute (section 11.5)",
+                code="missing-window-index",
+            )
+        return
+    check_window_indices(np.asarray(values, dtype=np.int64).reshape(-1), table)
+
+
+def check_index_entry_shape(index: list[rec.ChunkIndexEntry]) -> None:
+    """Every entry carries the keyframe-delta fields, and a chunk_kind the format defines.
+
+    Written once because it was written twice. `compose_chain` and `scan_indexed` each
+    carried this pre-pass verbatim, and duplicated checks drift: the two had already
+    stopped refusing the same files further down, so a seeking client accepted what the
+    validator rejected. That is the divergence AGENTS.md §8 forbids between SDKs, and it
+    is no more defensible inside one.
+    """
+    for entry in index:
+        if not entry.extended:
+            raise MalformedFile(
+                f"the keyframe-delta chunk index entry at {entry.chunk_offset} omits "
+                "chunk_kind, delta reference, depth and live_count fields",
+                code="index-record-mismatch",
+            )
+        if entry.kind not in (0, 1):
+            raise MalformedFile(
+                f"the chunk index entry at {entry.chunk_offset} declares unknown chunk_kind "
+                f"{entry.kind}; expected 0 (keyframe) or 1 (delta)",
+                code="unknown-chunk-kind",
+            )
+
+
+def _check_entry_against_record(entry: rec.ChunkIndexEntry, head: rec.DeltaChunkHeader) -> None:
+    """The four fields the index and the Delta Chunk both state (spec §5.8).
+
+    "A reader MUST refuse a file where the index and the record disagree, naming the
+    field" — the duplication is deliberate and it is only a corruption check if somebody
+    performs it. Nothing did: the chain is built from the index and the record was parsed
+    for its group counts, so a file whose index and records describe two different
+    sequences was read as whichever one the reader happened to consult.
+    """
+    for field_name, in_index, in_record in (
+        ("delta_mode", entry.delta_mode, head.delta_mode),
+        ("reference_offset", entry.reference_offset, head.reference_offset),
+        ("keyframe_offset", entry.keyframe_offset, head.keyframe_offset),
+        ("depth", entry.depth, head.depth),
+        ("t0", entry.t0, head.t0),
+        ("t1", entry.t1, head.t1),
+    ):
+        if in_index != in_record:
+            raise MalformedFile(
+                f"the chunk index entry at {entry.chunk_offset} declares {field_name} {in_index}; "
+                f"the Delta Chunk record there declares {in_record}",
+                code="index-record-mismatch",
+            )
+    declared = int(head.update_count) + int(head.birth_count) + int(head.death_count)
+    if entry.gaussian_count != declared:
+        raise MalformedFile(
+            f"the chunk index entry at {entry.chunk_offset} declares gaussian_count {entry.gaussian_count}; "
+            f"the Delta Chunk record there declares {declared} gaussians across its three groups",
+            code="index-record-mismatch",
+        )
+
+
+def compose_chain(
+    data: bytes,
+    index: list[rec.ChunkIndexEntry],
+    entry: rec.ChunkIndexEntry,
+    windows: list[tuple[float, float]] | None = None,
+    grids: Grids | None = None,
+) -> State:
+    """Compose the chain ending at `entry`, and check the state it produces.
+
+    Public because composing one entry is the whole of what a validator needs: it asks
+    whether each chunk decodes, not what any of them decoded to, and holding every state
+    to answer that costs many times the file. A caller that wants the states wants
+    `decode_indexed`; a caller that wants the verdict calls this per entry and drops what
+    it returns.
+    """
+    # Both defaults come from the file, and for the same reason: an omitted argument means
+    # "read it from `data`", not "the file has none". `windows=[]` would mean the latter --
+    # `check_window_indices_of` reads an empty table as the single implicit window a file
+    # with no Window Table carries -- so defaulting to it would refuse every multi-window
+    # file through the entry point this function documents for validators.
+    if grids is None or windows is None:
+        opened = open_indexed(data)
+        if grids is None:
+            grids = opened.grids
+        if windows is None:
+            windows = opened.windows
+
+    check_index_entry_shape(index)
+    chain = chain_from(index, entry)
+    keyframe_at = chain[0].chunk_offset
+    # The three rules `scan_indexed` enforces and this path did not. A seeking client
+    # calling `compose_chain` accepted files the validator refused, each with its own
+    # refusal identifier -- so the same bytes were `forward-reference` on one path and
+    # readable on the other.
+    expected_depth = 0
+    previous_at = keyframe_at
     for link in chain:
-        content = _record_at(data, link.chunk_offset, link.chunk_length)
+        if link.extended and link.keyframe_offset != keyframe_at:
+            raise MalformedFile(
+                f"the chunk index entry at {link.chunk_offset} declares keyframe_offset "
+                f"{link.keyframe_offset}; its chain reaches the keyframe at {keyframe_at}",
+                code="index-record-mismatch",
+            )
         if link.kind == 0:
+            if link.depth != 0 or link.delta_mode != 0 or link.reference_offset != 0:
+                raise MalformedFile(
+                    f"the keyframe index entry at {link.chunk_offset} carries non-keyframe delta fields",
+                    code="index-record-mismatch",
+                )
+            expected_depth = 0
+            previous_at = link.chunk_offset
+            continue
+        if link.reference_offset >= link.chunk_offset:
+            raise MalformedFile(
+                f"delta index entry at {link.chunk_offset} references {link.reference_offset}, which is not behind it",
+                code="forward-reference",
+            )
+        # §5.18 defines two references and no others, and which one a delta means is the
+        # difference between composing onto the GOP keyframe and composing onto the chunk
+        # before it. `chain_from` follows `reference_offset` without reading the mode, so a
+        # keyframe-mode delta pointing at another delta walked a chain the file does not
+        # describe — and `scan_indexed` refused the same bytes.
+        if link.delta_mode not in (rec.DELTA_MODE_KEYFRAME, rec.DELTA_MODE_CHAINED):
+            raise MalformedFile(
+                f"delta index entry at {link.chunk_offset} declares delta_mode {link.delta_mode}; expected 0 or 1",
+                code="index-record-mismatch",
+            )
+        wanted_reference = keyframe_at if link.delta_mode == rec.DELTA_MODE_KEYFRAME else previous_at
+        if link.reference_offset != wanted_reference:
+            keyframe_mode = link.delta_mode == rec.DELTA_MODE_KEYFRAME
+            named = "keyframe-mode" if keyframe_mode else "chained"
+            reaches = "its GOP keyframe is at" if keyframe_mode else "the previous state is at"
+            raise MalformedFile(
+                f"{named} delta at {link.chunk_offset} references {link.reference_offset}; "
+                f"{reaches} {wanted_reference}",
+                code="broken-reference",
+            )
+        previous_at = link.chunk_offset
+        expected_depth += 1
+        if link.depth != expected_depth:
+            raise MalformedFile(
+                f"delta index entry at {link.chunk_offset} declares depth {link.depth}; "
+                f"its chain from the keyframe at {keyframe_at} requires depth {expected_depth}",
+                code="depth-mismatch",
+            )
+    state: State | None = None
+    # Both are set by the keyframe branch below, which the `state is None` guard in the
+    # delta branch is what guarantees runs first. Bound here so that reading them is not
+    # a question a reader has to answer by tracing the loop.
+    composed_at = keyframe_at
+    reference_level = 0
+    for link in chain:
+        if link.kind not in (0, 1):
+            raise MalformedFile(
+                f"the chunk index entry at {link.chunk_offset} declares unknown chunk_kind "
+                f"{link.kind}; expected 0 (keyframe) or 1 (delta)",
+                code="unknown-chunk-kind",
+            )
+        content = _record_at(data, link.chunk_offset, link.chunk_length)
+        opcode = data[link.chunk_offset] if link.chunk_offset < len(data) else None
+        want = op.CHUNK if link.kind == 0 else op.DELTA_CHUNK
+        if opcode != want:
+            raise MalformedFile(
+                f"the chunk index entry at {link.chunk_offset} declares chunk_kind {link.kind}, but the "
+                f"record there is {op.name(opcode) if opcode is not None else 'past the end of the file'} "
+                f"rather than {op.name(want)}",
+                code="index-record-mismatch",
+            )
+        if link.kind == 0:
+            head = rec.parse_chunk(content)[0]
             ids, bins = _keyframe_from_chunk(content)
             state = keyframe_state(ids, bins)
+            if link.t0 != head.t0 or link.t1 != head.t1:
+                raise MalformedFile(
+                    f"the chunk index entry at {link.chunk_offset} declares interval "
+                    f"[{link.t0}, {link.t1}); the keyframe Chunk record there declares "
+                    f"[{head.t0}, {head.t1})",
+                    code="index-record-mismatch",
+                )
+            if link.extended and link.gaussian_count != state.count:
+                raise MalformedFile(
+                    f"the chunk index entry at {link.chunk_offset} declares gaussian_count "
+                    f"{link.gaussian_count}; the keyframe chunk there carries {state.count}",
+                    code="index-record-mismatch",
+                )
+            _check_keyframe_mu_t(head.t0, bins, grids)
+            reference_level = int(head.level)
+            composed_at = link.chunk_offset
         else:
-            assert state is not None
-            state, _ = _compose_delta(state, content)
-    assert state is not None
+            if state is None:
+                raise MalformedFile("a chain begins with a delta chunk", code="chain-without-keyframe")
+            reference_at = composed_at
+            composed_at = link.chunk_offset
+            state, head = _compose_delta(state, content)
+            if link.extended:
+                _check_entry_against_record(link, head)
+            # `level` is a chunk field and not an index one, so this is the first place on
+            # this path that can see it. A delta composed onto a reference at another level
+            # is a difference between bins on two different grids: it decodes, and what it
+            # decodes to is wrong. `scan_indexed` has always refused it.
+            if int(head.level) != reference_level:
+                raise MalformedFile(
+                    f"delta at {link.chunk_offset} declares level {head.level}; "
+                    f"its reference at {reference_at} declares level {reference_level}",
+                    code="index-record-mismatch",
+                )
+    if state is None:
+        raise MalformedFile("a chain with no chunks in it", code="chain-without-keyframe")
+    # `live_count` is the population after composition — the number a seeking consumer
+    # budgets against — and it is the one index field only a decode can check.
+    if entry.extended and entry.live_count != state.count:
+        raise MalformedFile(
+            f"the chunk index entry at {entry.chunk_offset} declares live_count {entry.live_count}; "
+            f"composing its chain produces {state.count} gaussians",
+            code="index-record-mismatch",
+        )
+    check_window_indices_of(state, windows)
+    _decode_index_bands(data, entry)
     return state
+
+
+def _decode_index_bands(
+    data: bytes,
+    entry: rec.ChunkIndexEntry,
+    on_band: Callable[[int, int], None] | None = None,
+) -> None:
+    """Decode and discard every SH band the entry declares."""
+    state_content = _record_at(data, entry.chunk_offset, entry.chunk_length)
+    expected_rows = (
+        int(rec.parse_chunk(state_content)[0].count)
+        if entry.kind == 0
+        else int(rec.parse_delta_chunk_block(state_content)[0].birth_count)
+    )
+    for declared_band, offset, length in entry.bands:
+        if offset < 0 or length < 9 or offset + length > len(data):
+            raise MalformedFile(
+                f"the chunk index entry at {entry.chunk_offset} points SH band "
+                f"{declared_band} outside the file at [{offset}, {offset + length})",
+                code="index-record-mismatch",
+            )
+        framed = Cursor(data[offset : offset + length])
+        opcode = framed.u8()
+        content_length = framed.u64()
+        if opcode != op.SH_BAND_STREAM or content_length + 9 != length:
+            raise MalformedFile(
+                f"the chunk index entry at {entry.chunk_offset} points SH band "
+                f"{declared_band} at {offset}, which is not one complete SH Band Stream record",
+                code="index-record-mismatch",
+            )
+        band_content = Cursor(framed.take(content_length))
+        record_band = band_content.u8()
+        if record_band != declared_band:
+            raise MalformedFile(
+                f"the chunk index entry at {entry.chunk_offset} declares SH band "
+                f"{declared_band}; the record at {offset} declares band {record_band}",
+                code="index-record-mismatch",
+            )
+        if on_band is not None:
+            on_band(declared_band, offset)
+        attribute, values = decode_stream(band_content)
+        if attribute != op.SH_BAND_STREAM:
+            raise MalformedFile(
+                f"the SH Band Stream at {offset} declares inner attribute_id {attribute}; "
+                f"version 1 fixes it at {op.SH_BAND_STREAM}",
+                code="index-record-mismatch",
+            )
+        expected_channels = 3 * (2 * declared_band + 1)
+        if values.shape != (expected_rows, expected_channels):
+            raise MalformedFile(
+                f"the SH Band Stream at {offset} for band {declared_band} decodes to "
+                f"shape {values.shape}; its owning state record requires "
+                f"({expected_rows}, {expected_channels})",
+                code="stream-element-count-mismatch",
+            )
+        check_sh_codes(values, f"the SH Band Stream at {offset}")
+
+
+def check_index_bands(data: bytes, index: list[rec.ChunkIndexEntry], sh_degree: int) -> None:
+    """Require the index to name exactly the physical bands following every state chunk.
+
+    A validator cannot discover an omitted band by following the index: the omission is
+    precisely what keeps it from reading that record. Walk the top-level framing once,
+    associate the consecutive SH Band Streams with the Chunk or Delta Chunk immediately
+    before them, and compare the resulting byte ranges with the summary. The walk retains
+    only offsets and lengths; no band payload is accumulated.
+    """
+    by_offset: dict[int, rec.ChunkIndexEntry] = {}
+    for entry in index:
+        if entry.chunk_offset in by_offset:
+            raise MalformedFile(
+                f"two chunk index entries name the state chunk at {entry.chunk_offset}",
+                code="index-record-mismatch",
+            )
+        by_offset[entry.chunk_offset] = entry
+
+    wanted = list(range(1, sh_degree + 1))
+    seen: set[int] = set()
+    owner: int | None = None
+    # Rows the owner actually *births*: a keyframe's population, a delta's birth count.
+    # Bands ride with born gaussians (§5.18), so a chunk that births none carries no
+    # coefficients and conformingly emits no band.
+    owner_rows = 0
+    indexed: rec.ChunkIndexEntry | None = None
+    following: list[tuple[int, int, int]] = []
+    following_bands: set[int] = set()
+
+    def finish_owner() -> None:
+        nonlocal owner, owner_rows, indexed, following, following_bands
+        if owner is None:
+            return
+        if indexed is None:
+            raise MalformedFile(
+                f"the state chunk at {owner} is not named by the Chunk Index",
+                code="index-record-mismatch",
+            )
+        if len({band for band, _offset, _length in indexed.bands}) != len(indexed.bands):
+            raise MalformedFile(
+                f"the chunk index entry at {owner} names a band more than once",
+                code="index-record-mismatch",
+            )
+        if set(indexed.bands) != set(following):
+            raise MalformedFile(
+                f"the chunk index entry at {owner} declares SH band ranges "
+                f"{indexed.bands}; the physical records following that chunk are {following}",
+                code="index-record-mismatch",
+            )
+        bands = [band for band, _offset, _length in following]
+        expected = wanted if owner_rows else []
+        if set(bands) != set(expected):
+            raise MalformedFile(
+                f"the state chunk at {owner} is followed by SH bands {bands}; "
+                f"the Header declares degree {sh_degree}, requiring bands {expected}",
+                code="index-record-mismatch",
+            )
+        seen.add(owner)
+        owner = None
+        indexed = None
+        following = []
+        following_bands = set()
+
+    for record in iter_records(data, len(MAGIC)):
+        if record.opcode in (op.CHUNK, op.DELTA_CHUNK):
+            finish_owner()
+            owner = record.offset
+            try:
+                owner_rows = (
+                    int(rec.parse_chunk(record.content)[0].count)
+                    if record.opcode == op.CHUNK
+                    else int(rec.parse_delta_chunk_block(record.content)[0].birth_count)
+                )
+            except FourdgsError:
+                # A head this check cannot read is not this check's fault to report: the
+                # chunk's own decode says so, in the right words and at the right byte.
+                # Assume it births rows, so the band rule stays exactly as strict as it
+                # was for a record whose population is unknown.
+                owner_rows = 1
+            indexed = by_offset.get(owner)
+            following = []
+            following_bands = set()
+            continue
+        if record.opcode == op.SH_BAND_STREAM:
+            if owner is None:
+                raise MalformedFile(
+                    f"SH Band Stream at byte {record.offset} does not immediately follow a state chunk",
+                    code="index-record-mismatch",
+                )
+            band = Cursor(record.content).u8()
+            if band not in wanted:
+                raise MalformedFile(
+                    f"the state chunk at {owner} is followed by SH band {band}; "
+                    f"the Header declares degree {sh_degree}, requiring bands {wanted}",
+                    code="index-record-mismatch",
+                )
+            if band in following_bands:
+                raise MalformedFile(
+                    f"the state chunk at {owner} is followed by SH band {band} more than once",
+                    code="index-record-mismatch",
+                )
+            following_bands.add(band)
+            following.append((band, record.offset, 9 + len(record.content)))
+            continue
+        finish_owner()
+
+    finish_owner()
+    for entry in index:
+        if entry.chunk_offset not in seen:
+            raise MalformedFile(
+                f"the chunk index entry at {entry.chunk_offset} does not name a physical state chunk",
+                code="index-record-mismatch",
+            )
+
+
+def scan_indexed(
+    data: bytes,
+    index: list[rec.ChunkIndexEntry],
+    windows: list[tuple[float, float]],
+    on_entry: Callable[[int, rec.ChunkIndexEntry], None] | None = None,
+    on_band: Callable[[int, int], None] | None = None,
+    grids: Grids | None = None,
+):
+    """Compose an indexed timeline once, retaining only current and GOP-keyframe state.
+
+    This is the validator path.  A seeking client legitimately calls `compose_chain` for
+    one selected entry; calling it for every entry repeats both the index scan and every
+    chained prefix.  Timeline order lets the validator prove the same references in one
+    front-to-back pass.
+    """
+    if grids is None:
+        header = quantization = None
+        for record in iter_records(data, len(MAGIC)):
+            if record.opcode == op.HEADER:
+                header = rec.Header.parse(record.content)
+            elif record.opcode == op.QUANTIZATION:
+                quantization = rec.Quantization.parse(record.content)
+            elif record.opcode in (op.CHUNK, op.DELTA_CHUNK):
+                break
+        if header is None or quantization is None:
+            raise MalformedFile("keyframe-delta file has no Header or Quantization record")
+        grids = _decoded_grids(quantization, windows, header.cutoff)
+
+    check_index_entry_shape(index)
+
+    current: tuple[int, int, int, State] | None = None
+    keyframe: tuple[int, int, State] | None = None
+    for ordinal, entry in enumerate(sorted(index, key=lambda item: item.t0)):
+        if on_entry is not None:
+            on_entry(ordinal, entry)
+        content = _record_at(data, entry.chunk_offset, entry.chunk_length)
+        opcode = data[entry.chunk_offset] if entry.chunk_offset < len(data) else None
+        expected_opcode = op.CHUNK if entry.kind == 0 else op.DELTA_CHUNK
+        if opcode != expected_opcode:
+            raise MalformedFile(
+                f"the chunk index entry at {entry.chunk_offset} declares chunk_kind {entry.kind}, "
+                f"but the record there is {op.name(opcode) if opcode is not None else 'past the end of the file'}",
+                code="index-record-mismatch",
+            )
+
+        if entry.kind == 0:
+            head = rec.parse_chunk(content)[0]
+            ids, bins = _keyframe_from_chunk(content)
+            state = keyframe_state(ids, bins)
+            if entry.t0 != head.t0 or entry.t1 != head.t1:
+                raise MalformedFile(
+                    f"the chunk index entry at {entry.chunk_offset} declares interval "
+                    f"[{entry.t0}, {entry.t1}); the keyframe Chunk record there declares "
+                    f"[{head.t0}, {head.t1})",
+                    code="index-record-mismatch",
+                )
+            if entry.gaussian_count != state.count:
+                raise MalformedFile(
+                    f"the chunk index entry at {entry.chunk_offset} declares gaussian_count "
+                    f"{entry.gaussian_count}; the keyframe chunk there carries {state.count}",
+                    code="index-record-mismatch",
+                )
+            _check_keyframe_mu_t(head.t0, bins, grids)
+            if entry.extended and (
+                entry.keyframe_offset != entry.chunk_offset
+                or entry.depth != 0
+                or entry.delta_mode != 0
+                or entry.reference_offset != 0
+            ):
+                raise MalformedFile(
+                    f"the keyframe index entry at {entry.chunk_offset} carries non-keyframe delta fields",
+                    code="index-record-mismatch",
+                )
+            level = int(head.level)
+            keyframe = (entry.chunk_offset, level, state)
+            current = (entry.chunk_offset, 0, level, state)
+        else:
+            head = rec.parse_delta_chunk_block(content)[0]
+            if entry.reference_offset >= entry.chunk_offset:
+                raise MalformedFile(
+                    f"delta index entry at {entry.chunk_offset} references "
+                    f"{entry.reference_offset}, which is not behind it",
+                    code="forward-reference",
+                )
+            if entry.delta_mode == rec.DELTA_MODE_KEYFRAME:
+                if keyframe is None or entry.reference_offset != keyframe[0]:
+                    expected = None if keyframe is None else keyframe[0]
+                    raise MalformedFile(
+                        f"keyframe-mode delta at {entry.chunk_offset} references {entry.reference_offset}; "
+                        f"its GOP keyframe is at {expected}",
+                        code="broken-reference",
+                    )
+                reference_at, reference_depth, reference_level, reference = (
+                    keyframe[0],
+                    0,
+                    keyframe[1],
+                    keyframe[2],
+                )
+            elif entry.delta_mode == rec.DELTA_MODE_CHAINED:
+                if current is None or entry.reference_offset != current[0]:
+                    expected = None if current is None else current[0]
+                    raise MalformedFile(
+                        f"chained delta at {entry.chunk_offset} references {entry.reference_offset}; "
+                        f"the previous state is at {expected}",
+                        code="broken-reference",
+                    )
+                reference_at, reference_depth, reference_level, reference = current
+            else:
+                raise MalformedFile(
+                    f"delta index entry at {entry.chunk_offset} declares delta_mode "
+                    f"{entry.delta_mode}; expected 0 or 1",
+                    code="index-record-mismatch",
+                )
+            keyframe_at = keyframe[0] if keyframe is not None else 0
+            if entry.keyframe_offset != keyframe_at:
+                raise MalformedFile(
+                    f"the chunk index entry at {entry.chunk_offset} declares keyframe_offset "
+                    f"{entry.keyframe_offset}; its chain reaches the keyframe at {keyframe_at}",
+                    code="index-record-mismatch",
+                )
+            expected_depth = reference_depth + 1
+            if entry.depth != expected_depth:
+                raise MalformedFile(
+                    f"delta index entry at {entry.chunk_offset} declares depth {entry.depth}; "
+                    f"its reference at {reference_at} requires depth {expected_depth}",
+                    code="depth-mismatch",
+                )
+            state, head = _compose_delta(reference, content)
+            _check_entry_against_record(entry, head)
+            if int(head.level) != reference_level:
+                raise MalformedFile(
+                    f"delta at {entry.chunk_offset} declares level {head.level}; "
+                    f"its reference at {reference_at} declares level {reference_level}",
+                    code="index-record-mismatch",
+                )
+            level = int(head.level)
+            current = (entry.chunk_offset, int(head.depth), level, state)
+            # `current` now owns the newly composed state. Do not leave the previous
+            # population bound in this suspended generator frame across the yield below.
+            reference = None
+
+        if entry.extended and entry.live_count != state.count:
+            raise MalformedFile(
+                f"the chunk index entry at {entry.chunk_offset} declares live_count {entry.live_count}; "
+                f"composition produces {state.count} gaussians",
+                code="index-record-mismatch",
+            )
+        check_window_indices_of(state, windows)
+        _decode_index_bands(data, entry, on_band)
+        yield entry, state
+
+
+def scan_streamed(
+    data: bytes,
+    on_record: Callable[[int, int], None] | None = None,
+    on_state: Callable[[int, float, float], None] | None = None,
+    *,
+    sh_degree: int | None = None,
+):
+    """Every state a front-to-back reader composes, one at a time, keeping none.
+
+    `decode_streamed` keeps a state per chunk and a map of every offset a delta could
+    reference, which is right for a caller that wants the states and wrong for one that
+    only wants to know whether the file decodes: on a sequence with a thousand chunks it
+    holds a thousand populations. This yields each composed state and retains exactly two
+    — the head of the current group of pictures, which a keyframe-referenced delta points
+    at, and the previous chunk, which a chained delta points at. Those are the only two
+    references §5.18 defines, so a reference to anything else is a fault named here rather
+    than a third state kept in case.
+
+    Yields `(offset, kind, state)`. The caller is expected to drop each state before
+    asking for the next; nothing here holds on to it.
+    """
+    check_magic(data)
+    keyframe_at: int | None = None
+    keyframe_state_: State | None = None
+    keyframe_level: int | None = None
+    previous_at: int | None = None
+    previous_state: State | None = None
+    previous_depth: int | None = None
+    previous_level: int | None = None
+    declared_degree = sh_degree
+    band_owner: int | None = None
+    band_rows = 0
+    bands: list[int] = []
+    quantization: rec.Quantization | None = None
+    windows: list[tuple[float, float]] = []
+    cutoff = 0.05
+
+    def finish_bands() -> None:
+        nonlocal band_owner, band_rows, bands
+        if band_owner is None:
+            return
+        if declared_degree is not None:
+            # Bands ride with the gaussians whose coefficients they carry: a keyframe's
+            # population, and a delta's *births* (§5.18, "a born gaussian's spherical
+            # harmonics ride in SH Band Stream records following this Delta Chunk").
+            # A delta that only updates and kills births nothing, so it has no
+            # coefficients to put in a band and conformingly emits none. Requiring the
+            # full set after it refused a legal file that Swift accepts.
+            wanted = list(range(1, declared_degree + 1)) if band_rows else []
+            if len(set(bands)) != len(bands) or set(bands) != set(wanted):
+                raise MalformedFile(
+                    f"the state chunk at {band_owner} is followed by SH bands {bands}; "
+                    f"the Header declares degree {declared_degree}, requiring bands {wanted}",
+                    code="index-record-mismatch",
+                )
+        band_owner = None
+        band_rows = 0
+        bands = []
+
+    for record in iter_records(data, len(MAGIC)):
+        if record.opcode != op.SH_BAND_STREAM:
+            finish_bands()
+        if record.opcode == op.HEADER:
+            parsed_header = rec.Header.parse(record.content)
+            cutoff = parsed_header.cutoff
+            if sh_degree is None:
+                declared_degree = parsed_header.sh_degree
+            continue
+        if record.opcode == op.QUANTIZATION:
+            quantization = rec.Quantization.parse(record.content)
+            continue
+        if record.opcode == op.WINDOW_TABLE:
+            windows = rec.WindowTable.parse(record.content).windows
+            continue
+        if record.opcode == op.CHUNK:
+            if on_record is not None:
+                on_record(record.offset, record.opcode)
+            if quantization is None:
+                raise MalformedFile("a keyframe Chunk appears before the Quantization record")
+            head = rec.parse_chunk(record.content)[0]
+            ids, bins = _keyframe_from_chunk(
+                record.content,
+                _decoded_grids(quantization, windows, cutoff),
+            )
+            state = keyframe_state(ids, bins)
+            keyframe_at, keyframe_state_ = record.offset, state
+            keyframe_level = int(head.level)
+            depth = 0
+            level = keyframe_level
+            t0, t1 = head.t0, head.t1
+            band_owner = record.offset
+            band_rows = int(head.count)
+        elif record.opcode == op.DELTA_CHUNK:
+            if on_record is not None:
+                on_record(record.offset, record.opcode)
+            head_peek = rec.parse_delta_chunk_block(record.content)[0]
+            if head_peek.reference_offset >= record.offset:
+                raise MalformedFile(
+                    f"delta chunk at {record.offset} references {head_peek.reference_offset}, which is not behind it",
+                    code="forward-reference",
+                )
+            if head_peek.delta_mode == rec.DELTA_MODE_KEYFRAME:
+                reference = keyframe_state_ if head_peek.reference_offset == keyframe_at else None
+                reference_depth = 0 if reference is not None else None
+                reference_level = keyframe_level if reference is not None else None
+            elif head_peek.delta_mode == rec.DELTA_MODE_CHAINED:
+                reference = previous_state if head_peek.reference_offset == previous_at else None
+                reference_depth = previous_depth if reference is not None else None
+                reference_level = previous_level if reference is not None else None
+            else:
+                raise MalformedFile(
+                    f"delta chunk at {record.offset} declares delta_mode {head_peek.delta_mode}; "
+                    "expected 0 (keyframe) or 1 (chained)",
+                    code="index-record-mismatch",
+                )
+            if reference is None or reference_depth is None or reference_level is None:
+                expected = keyframe_at if head_peek.delta_mode == rec.DELTA_MODE_KEYFRAME else previous_at
+                raise MalformedFile(
+                    f"delta chunk at {record.offset} uses mode {head_peek.delta_mode} and references "
+                    f"{head_peek.reference_offset}; that mode requires {expected}",
+                    code="broken-reference",
+                )
+            if head_peek.keyframe_offset != keyframe_at:
+                raise MalformedFile(
+                    f"delta chunk at {record.offset} declares keyframe_offset "
+                    f"{head_peek.keyframe_offset}; its chain reaches the keyframe at {keyframe_at}",
+                    code="index-record-mismatch",
+                )
+            expected_depth = reference_depth + 1
+            if head_peek.depth != expected_depth:
+                raise MalformedFile(
+                    f"delta chunk at {record.offset} declares depth {head_peek.depth}; "
+                    f"its selected reference requires depth {expected_depth}",
+                    code="depth-mismatch",
+                )
+            state, head = _compose_delta(reference, record.content)
+            if int(head.level) != reference_level:
+                raise MalformedFile(
+                    f"delta at {record.offset} declares level {head.level}; "
+                    f"its reference at {head.reference_offset} declares level {reference_level}",
+                    code="index-record-mismatch",
+                )
+            depth = int(head.depth)
+            level = int(head.level)
+            t0, t1 = head.t0, head.t1
+            band_owner = record.offset
+            band_rows = int(head.birth_count)
+            # Dropped here rather than left bound in this frame: a generator is suspended
+            # at its yield for as long as the caller holds what it yielded, so a name
+            # still bound is a population still resident — and this one is the state
+            # before last, which nothing else needs once the composition is done.
+            reference = None
+        elif record.opcode == op.SH_BAND_STREAM:
+            if on_record is not None:
+                on_record(record.offset, record.opcode)
+            if band_owner is None:
+                raise MalformedFile(
+                    f"SH Band Stream at byte {record.offset} does not immediately follow a state chunk",
+                    code="index-record-mismatch",
+                )
+            band = Cursor(record.content)
+            band_number = band.u8()
+            maximum = declared_degree if declared_degree is not None else 3
+            if band_number < 1 or band_number > maximum:
+                raise MalformedFile(
+                    f"the state chunk at {band_owner} is followed by SH band {band_number}; "
+                    f"the Header declares degree {declared_degree}, requiring bands "
+                    f"{list(range(1, maximum + 1))}",
+                    code="index-record-mismatch",
+                )
+            if band_number in bands:
+                raise MalformedFile(
+                    f"the state chunk at {band_owner} is followed by SH band {band_number} more than once",
+                    code="index-record-mismatch",
+                )
+            attribute, values = decode_stream(band)
+            if attribute != op.SH_BAND_STREAM:
+                raise MalformedFile(
+                    f"the SH Band Stream at {record.offset} declares inner attribute_id "
+                    f"{attribute}; version 1 fixes it at {op.SH_BAND_STREAM}",
+                    code="index-record-mismatch",
+                )
+            expected_shape = (band_rows, 3 * (2 * band_number + 1))
+            if values.shape != expected_shape:
+                raise MalformedFile(
+                    f"the SH Band Stream at {record.offset} for band {band_number} decodes to "
+                    f"shape {values.shape}; its owning state record requires {expected_shape}",
+                    code="stream-element-count-mismatch",
+                )
+            check_sh_codes(values, f"the SH Band Stream at {record.offset}")
+            bands.append(band_number)
+            continue
+        else:
+            continue
+        previous_at, previous_state, previous_depth, previous_level = (
+            record.offset,
+            state,
+            depth,
+            level,
+        )
+        if on_state is not None:
+            on_state(record.offset, t0, t1)
+        yield record.offset, (0 if record.opcode == op.CHUNK else 1), state
+
+    finish_bands()
+
+
+class _IdentityPartitionFull(Exception):
+    """Internal signal to split one fixed-capacity identity pass."""
+
+
+class BoundedIdentityAudit:
+    """One-pass identity audit until a fixed history partition reaches capacity."""
+
+    def __init__(self, capacity: int = 65_536) -> None:
+        if capacity < 1:
+            raise ValueError("identity partition capacity must be positive")
+        self.capacity = capacity
+        self._seen: set[int] = set()
+        self._previous_live: set[int] = set()
+        self.overflowed = False
+
+    @property
+    def distinct(self) -> int:
+        if self.overflowed:
+            raise RuntimeError("an overflowed identity audit has no exact distinct count")
+        return len(self._seen)
+
+    def observe(self, offset: int, state: State) -> None:
+        """Consume one timeline state; retain no decoded arrays from it."""
+        if self.overflowed:
+            return
+        current_live: set[int] = set()
+        for raw in state.ids:
+            identity = int(raw)
+            if identity < 0 or identity > 0xFFFF_FFFF:
+                raise MalformedFile(
+                    f"state chunk at {offset} carries gaussian_id {identity}; ids are u32 values",
+                    code="gaussian-id-out-of-range",
+                )
+            current_live.add(identity)
+            if identity in self._previous_live:
+                continue
+            if identity in self._seen:
+                raise MalformedFile(
+                    f"state chunk at {offset} reintroduces gaussian id {identity} after it died; "
+                    "gaussian_id values are never reused",
+                    code="gaussian-id-reused",
+                )
+            if len(self._seen) >= self.capacity:
+                self.overflowed = True
+                self._seen.clear()
+                self._previous_live.clear()
+                return
+            self._seen.add(identity)
+        self._previous_live = current_live
+
+
+def count_distinct_ids_bounded(
+    data: bytes,
+    *,
+    capacity: int = 65_536,
+    on_record: Callable[[int, int], None] | None = None,
+    index: list[rec.ChunkIndexEntry] | None = None,
+    windows: list[tuple[float, float]] | None = None,
+    on_entry: Callable[[int, rec.ChunkIndexEntry], None] | None = None,
+    on_band: Callable[[int, int], None] | None = None,
+    on_state: Callable[[], None] | None = None,
+) -> int:
+    """Count identities and reject reuse without retaining whole-history identity state.
+
+    A single set of every id ever observed grows with cumulative births, even though the
+    decoder itself needs only the current state. This audits a fixed-size numeric
+    partition at a time. If a partition contains more than ``capacity`` distinct ids it
+    is split by the next high bit and the file is streamed again for each half. The only
+    retained keys are one partition's bounded history and the previous live population;
+    the result is an integer sum, never a scene-wide identity map.
+    """
+    if capacity < 1:
+        raise ValueError("identity partition capacity must be positive")
+
+    def audit(prefix: int, bits: int) -> int:
+        seen: set[int] = set()
+        previous_live: set[int] = set()
+        shift = 32 - bits
+
+        def belongs(value: int) -> bool:
+            return bits == 0 or value >> shift == prefix
+
+        if index is None:
+            states = ((offset, state) for offset, _kind, state in scan_streamed(data, on_record=on_record))
+        else:
+            if windows is None:
+                raise ValueError("indexed identity auditing requires the Window Table")
+            states = (
+                (entry.chunk_offset, state) for entry, state in scan_indexed(data, index, windows, on_entry, on_band)
+            )
+        for offset, state in states:
+            if on_state is not None:
+                on_state()
+            current_live: set[int] = set()
+            for raw in state.ids:
+                identity = int(raw)
+                if identity < 0 or identity > 0xFFFF_FFFF:
+                    raise MalformedFile(
+                        f"state chunk at {offset} carries gaussian_id {identity}; ids are u32 values",
+                        code="gaussian-id-out-of-range",
+                    )
+                if not belongs(identity):
+                    continue
+                current_live.add(identity)
+                if identity in previous_live:
+                    continue
+                if identity in seen:
+                    raise MalformedFile(
+                        f"state chunk at {offset} reintroduces gaussian id {identity} after it died; "
+                        "gaussian_id values are never reused",
+                        code="gaussian-id-reused",
+                    )
+                if len(seen) >= capacity:
+                    raise _IdentityPartitionFull
+                seen.add(identity)
+            previous_live = current_live
+            del state
+        return len(seen)
+
+    def split(prefix: int, bits: int) -> int:
+        try:
+            return audit(prefix, bits)
+        except _IdentityPartitionFull:
+            if bits == 32:
+                raise AssertionError("one u32 identity exceeded a positive partition capacity") from None
+            return split(prefix << 1, bits + 1) + split((prefix << 1) | 1, bits + 1)
+
+    return split(0, 0)
 
 
 # --------------------------------------------------------------------------

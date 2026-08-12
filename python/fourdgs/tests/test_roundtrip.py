@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import io
 import math
+import struct
 
 import fourdgs
 import numpy as np
@@ -412,6 +413,13 @@ class TestStreams:
         attribute_id, out = decode_stream(Cursor(blob))
         assert attribute_id == 3
         np.testing.assert_array_equal(out, np.asarray(values).reshape(-1, channels))
+
+    @pytest.mark.parametrize(("field", "value", "message"), [(1, 3, "bad symbol width"), (2, 9, "unknown stream mode")])
+    def test_an_empty_stream_still_validates_its_fixed_header(self, field, value, message):
+        blob = bytearray(struct.pack("<BBBBBIQ", 3, 1, 0, 0, 3, 0, 0))
+        blob[field] = value
+        with pytest.raises(fourdgs.FourdgsError, match=message):
+            decode_stream(Cursor(blob))
 
 
 class TestSemantics:

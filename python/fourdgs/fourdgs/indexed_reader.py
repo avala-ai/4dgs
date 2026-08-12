@@ -29,7 +29,7 @@ from .provenance import Provenance
 from .readable import Readable
 from .registry import check_quantization_scheme, check_temporal_model
 from .serialization import MAGIC, Cursor, check_magic, crc32, iter_records, read_record
-from .stream_reader import chunk_stream_bytes, decode_streams, steps_from
+from .stream_reader import check_sh_codes, chunk_stream_bytes, decode_streams, steps_from
 
 #: One read of this size from the front covers the header records of every scene measured
 #: so far. A larger header costs one extra round trip, never a wrong parse.
@@ -344,7 +344,37 @@ def open_indexed(source: Readable) -> IndexedScene:
 def read_chunk(source: Readable, scene: IndexedScene, entry: rec.ChunkIndexEntry, *, max_sh_band: int = 0) -> dict:
     """Fetch and decode one chunk, plus only the SH bands asked for."""
     blob = _read_range(source, entry.chunk_offset, entry.chunk_length, "a chunk index entry")
-    head, streams = rec.parse_chunk(Cursor(blob, 9).take(len(blob) - 9))
+    framed = Cursor(blob)
+    opcode = framed.u8()
+    content_length = framed.u64()
+    # Two faults, and they were reported as one. An entry pointing at a Delta Chunk whose
+    # framing happens to match its declared length produced "declares 512 bytes; the record
+    # there frames exactly 512" — a complaint that contradicts itself, and never names the
+    # thing that is actually wrong.
+    if opcode != op.CHUNK:
+        raise MalformedFile(
+            f"the chunk index entry at {entry.chunk_offset} points at "
+            f"{op.name(opcode)} rather than {op.name(op.CHUNK)}",
+            code="index-record-mismatch",
+        )
+    if content_length + 9 != len(blob):
+        raise MalformedFile(
+            f"the chunk index entry at {entry.chunk_offset} declares {entry.chunk_length} "
+            f"bytes; the record there frames exactly {content_length + 9}",
+            code="index-record-mismatch",
+        )
+    head, streams = rec.parse_chunk(framed.take(content_length))
+    for field_name, indexed, actual in (
+        ("t0", entry.t0, head.t0),
+        ("t1", entry.t1, head.t1),
+        ("gaussian_count", entry.gaussian_count, head.count),
+    ):
+        if indexed != actual:
+            raise MalformedFile(
+                f"the chunk index entry at {entry.chunk_offset} declares {field_name} "
+                f"{indexed}; the Chunk record there declares {actual}",
+                code="index-record-mismatch",
+            )
     decoded = decode_streams(
         chunk_stream_bytes(head, streams),
         head.count,
@@ -362,7 +392,20 @@ def read_chunk(source: Readable, scene: IndexedScene, entry: rec.ChunkIndexEntry
         cur.u8()  # band index, already known from the index
         from .serialization import decode_stream
 
-        _, values = decode_stream(cur)
+        attribute, values = decode_stream(cur)
+        if attribute != op.SH_BAND_STREAM:
+            raise MalformedFile(
+                f"the SH Band Stream at {offset} declares inner attribute_id {attribute}; "
+                f"version 1 fixes it at {op.SH_BAND_STREAM}"
+            )
+        expected_shape = (int(head.count), 3 * (2 * band + 1))
+        if values.shape != expected_shape:
+            raise MalformedFile(
+                f"the SH Band Stream at {offset} for band {band} decodes to shape "
+                f"{values.shape}; its owning Chunk requires {expected_shape}",
+                code="stream-element-count-mismatch",
+            )
+        check_sh_codes(values, f"the SH Band Stream at {offset}")
         decoded["sh"][band] = values
     return decoded
 

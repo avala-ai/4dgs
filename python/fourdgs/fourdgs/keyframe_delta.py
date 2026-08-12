@@ -59,6 +59,20 @@ GOP_INVARIANT = frozenset({op.A_SIGMA_T, op.A_FLAGS, op.A_WINDOW_INDEX})
 #: Attributes an update restates outright rather than differencing.
 ABSOLUTE_IN_UPDATE = frozenset({op.A_ROTATION_INDEX, op.A_ROTATION})
 
+#: The attribute a row may lack and still have a value: §6.6 says a chunk omitting
+#: `object_id` "is read as though every gaussian in that chunk carried `0`". That is the
+#: only such rule in the specification, so it is the only lane that pads here.
+#:
+#: `source_group` and `source_index` are *not* in this set, though §6.1 calls them optional
+#: too. Optional says a file may omit the stream; it does not say what a composed column
+#: holds for a row whose birth omitted it, and no section supplies a value the way §6.6
+#: does for `object_id`. Padding them with zero would be this reader inventing a label
+#: rather than reading one. TypeScript and Swift exempt `object_id` alone; Dart also
+#: exempts the two producer lanes and Rust exempts nothing at all, so the six do not yet
+#: agree and §5.18 — a birth carries "the full required attribute set", which excludes all
+#: three — does not settle which of them is right. That is a specification question.
+ZERO_DEFAULT_IDENTITY = frozenset({op.A_OBJECT_ID})
+
 
 @dataclass
 class State:
@@ -93,7 +107,10 @@ def keyframe_state(ids: np.ndarray, bins: dict[int, np.ndarray]) -> State:
                 f"attribute {attribute} carries {values.shape[0]} rows, the keyframe declares {ids.shape[0]} gaussians",
                 "stream-element-count-mismatch",
             )
-    return State(ids=ids, bins={a: np.asarray(v, dtype=np.int64) for a, v in bins.items()})
+        _check_absolute_bins(attribute, values, "a keyframe")
+    state = State(ids=ids, bins={a: np.asarray(v, dtype=np.int64) for a, v in bins.items()})
+    _check_rotation_indexes(state)
+    return state
 
 
 def apply_delta(
@@ -121,6 +138,15 @@ def apply_delta(
     _check_unique(update_ids, "an update group")
     _check_unique(birth_ids, "a birth group")
     _check_unique(death_ids, "a death group")
+
+    has_rotation_index = op.A_ROTATION_INDEX in update_bins
+    has_rotation_bins = op.A_ROTATION in update_bins
+    if has_rotation_index != has_rotation_bins:
+        missing = op.A_ROTATION if has_rotation_index else op.A_ROTATION_INDEX
+        raise _refuse(
+            f"an update carries only one half of the smallest-three rotation pair; attribute {missing} is missing",
+            "incomplete-rotation-update",
+        )
 
     for attribute in update_bins:
         if attribute in GOP_INVARIANT:
@@ -161,6 +187,7 @@ def apply_delta(
                     "unknown-attribute-in-update",
                 )
             if attribute in ABSOLUTE_IN_UPDATE:
+                _check_absolute_bins(attribute, delta, "an absolute update")
                 state.bins[attribute][rows] = delta
             else:
                 state.bins[attribute][rows] = _add_checked(state.bins[attribute][rows], delta, attribute, update_ids)
@@ -174,7 +201,7 @@ def apply_delta(
                 f"ids are unique within a state and are not reused after a death",
                 "duplicate-gaussian-id",
             )
-        absent = sorted(set(state.bins) - set(birth_bins))
+        absent = sorted(set(state.bins) - set(birth_bins) - ZERO_DEFAULT_IDENTITY)
         if absent:
             raise _refuse(
                 f"a birth group carries no value for attributes {absent}; a birth is absolute state, not a delta",
@@ -187,17 +214,80 @@ def apply_delta(
                     f"declares {birth_ids.shape[0]}",
                     "stream-element-count-mismatch",
                 )
-        state = State(
-            ids=np.concatenate([state.ids, birth_ids]),
-            bins={
-                attribute: np.concatenate([state.bins[attribute], np.asarray(birth_bins[attribute], dtype=np.int64)])
-                if attribute in state.bins
-                else np.asarray(birth_bins[attribute], dtype=np.int64)
-                for attribute in (set(state.bins) | set(birth_bins))
-            },
+            _check_absolute_bins(attribute, values, "a birth group")
+        state = State(ids=np.concatenate([state.ids, birth_ids]), bins=_merge_births(state, birth_ids, birth_bins))
+
+    _check_rotation_indexes(state)
+    return state
+
+
+def _merge_births(state: State, birth_ids: np.ndarray, birth_bins: dict[int, np.ndarray]) -> dict[int, np.ndarray]:
+    """The composed columns after a birth group joins the live population.
+
+    Every column has to come out `len(state.ids) + len(birth_ids)` rows tall, because the
+    rows are addressed by position against `ids`. Taking a birth-only column whole left it
+    as tall as the birth group alone, and the next update read row `n` of a column that had
+    `n - k` of them — an `IndexError` on a file, or a silent read of the wrong gaussian.
+
+    Zero is a defined value only for the optional identity lanes, so those pad. Any other
+    attribute the live population lacks cannot be composed: there is no value zero stands
+    for in a position or a scale, and inventing one puts a gaussian somewhere it is not.
+
+    Unless there is nobody to invent it for. A keyframe may state an empty population and
+    leave the first birth to introduce the geometry, and padding no rows invents nothing —
+    so an empty state accepts any attribute, which is what the Swift SDK has always done.
+    """
+    merged: dict[int, np.ndarray] = {}
+    for attribute in set(state.bins) | set(birth_bins):
+        existing = state.bins.get(attribute)
+        added = None if attribute not in birth_bins else np.asarray(birth_bins[attribute], dtype=np.int64)
+        if existing is None and state.count and attribute not in ZERO_DEFAULT_IDENTITY:
+            raise _refuse(
+                f"a birth group carries attribute {attribute}, which the live population does not; "
+                f"a composed column has one value per gaussian and zero is not one for this attribute",
+                "unknown-attribute-in-birth",
+            )
+        # Beside it, and not instead of it: an attribute on both sides must agree on its
+        # channel count, or the composed column is two shapes at once.
+        if existing is not None and added is not None and existing.shape[1:] != added.shape[1:]:
+            raise _refuse(
+                f"a birth carries {added.shape[1:]} channels for attribute {attribute}, "
+                f"but the live population carries {existing.shape[1:]}",
+                "stream-element-count-mismatch",
+            )
+        channels = (existing if existing is not None else added).shape[1:]
+        before = existing if existing is not None else np.zeros((state.count, *channels), dtype=np.int64)
+        after = added if added is not None else np.zeros((birth_ids.shape[0], *channels), dtype=np.int64)
+        merged[attribute] = np.concatenate([before, after])
+    return merged
+
+
+def _check_absolute_bins(attribute: int, values: np.ndarray, what: str) -> None:
+    """Refuse an absolute stream code outside the shared signed-i32 domain."""
+    array = np.asarray(values, dtype=np.int64)
+    bad = (array < BIN_MIN) | (array > BIN_MAX)
+    if bad.any():
+        row = int(np.argwhere(bad)[0][0])
+        raise _refuse(
+            f"{what} carries attribute {attribute} row {row} outside the signed 32-bit "
+            "range an absolute bin must stay inside",
+            "bin-overflow",
         )
 
-    return state
+
+def _check_rotation_indexes(state: State) -> None:
+    values = state.bins.get(op.A_ROTATION_INDEX)
+    if values is None:
+        return
+    indexes = np.asarray(values, dtype=np.int64).reshape(-1)
+    bad = (indexes < 0) | (indexes > 3)
+    if bad.any():
+        row = int(np.flatnonzero(bad)[0])
+        identity = int(state.ids[row]) if row < state.count else row
+        raise _refuse(
+            f"gaussian id {identity} carries rotation_index {int(indexes[row])}; expected 0..3",
+            "rotation-index-out-of-range",
+        )
 
 
 def _add_checked(base: np.ndarray, delta: np.ndarray, attribute: int, ids: np.ndarray) -> np.ndarray:
@@ -258,13 +348,33 @@ def _check_groups_disjoint(update_ids: np.ndarray, birth_ids: np.ndarray, death_
 # --------------------------------------------------------------------------
 
 
-def check_tiling(index) -> None:
-    """State chunks tile the timeline: no overlap, no gap.
+def check_tiling(index, duration_sec: float | None = None) -> None:
+    """State chunks tile the timeline: no overlap, no gap, and no uncovered end.
 
     This is what makes the seek predicate a lookup rather than a search, and it is a real
     constraint — under `gaussian-birth` chunks may overlap freely, and here they may not.
+
+    §11.1 states the rule in three parts, and adjacency is only the middle one: "sorted by
+    `t0`, each chunk's `t1` equals the next chunk's `t0`; the first `t0` is `0`; the last
+    `t1` is the Header's `duration_sec`". Checking adjacency alone passes a file whose
+    chunks are perfectly adjacent over the middle of its timeline and cover neither end —
+    and a single-entry index, which has no adjacent pair at all, was checked by nothing.
+    A reader asked for an instant in the uncovered part then refuses a file the validator
+    called clean, which is the report being wrong rather than the file being unusual.
+
+    `duration_sec` is optional because a caller may hold an index before it holds the
+    Header — the ends cannot be checked against a duration nobody passed. Every caller in
+    this package passes it.
     """
     ordered = sorted(index, key=lambda e: e.t0)
+    for ordinal, entry in enumerate(ordered):
+        open_ended_final = ordinal == len(ordered) - 1 and duration_sec == np.inf and entry.t1 == np.inf
+        if not np.isfinite(entry.t0) or (not np.isfinite(entry.t1) and not open_ended_final) or entry.t1 < entry.t0:
+            raise _refuse(
+                f"state chunk has unusable interval [{entry.t0}, {entry.t1}); expected finite t0 and "
+                "t1 >= t0 (except +Infinity for the final interval of an open-ended timeline)",
+                "non-tiling-chunks",
+            )
     for previous, entry in pairwise(ordered):
         if previous.t1 != entry.t0:
             what = "overlap" if entry.t0 < previous.t1 else "leave a gap"
@@ -272,6 +382,21 @@ def check_tiling(index) -> None:
                 f"state chunks {what}: [{previous.t0}, {previous.t1}) is followed by [{entry.t0}, {entry.t1})",
                 "non-tiling-chunks",
             )
+    if duration_sec is None or not ordered:
+        return
+    if ordered[0].t0 != 0.0:
+        raise _refuse(
+            f"state chunks leave a gap: the timeline starts at 0 and the first chunk covers "
+            f"[{ordered[0].t0}, {ordered[0].t1})",
+            "non-tiling-chunks",
+        )
+    if ordered[-1].t1 != duration_sec:
+        what = "overlap" if ordered[-1].t1 > duration_sec else "leave a gap"
+        raise _refuse(
+            f"state chunks {what}: the last chunk covers [{ordered[-1].t0}, {ordered[-1].t1}) and the "
+            f"Header declares a duration of {duration_sec}",
+            "non-tiling-chunks",
+        )
 
 
 def chain_for(index, t: float) -> list:
@@ -282,11 +407,23 @@ def chain_for(index, t: float) -> list:
     byte cost is the sum of the entries' `chunk_length`, so a consumer can budget a seek
     before it issues a request.
     """
-    by_offset = {entry.chunk_offset: entry for entry in index}
     current = next((entry for entry in index if entry.t0 <= t < entry.t1), None)
     if current is None:
         raise _refuse(f"no state chunk covers t={t}", "non-tiling-chunks")
 
+    return chain_from(index, current)
+
+
+def chain_from(index, current) -> list:
+    """The keyframe and deltas that reconstruct an already-selected entry.
+
+    Indexed callers already hold the entry they intend to compose. Building its
+    chain directly avoids inventing a midpoint, which is not finite for the legal
+    final interval ``[t0, +Infinity)`` and can also re-select the wrong entry in an
+    index that has not yet had its tiling diagnosed.
+    """
+
+    by_offset = {entry.chunk_offset: entry for entry in index}
     chain = [current]
     while chain[0].kind != 0:
         head = chain[0]

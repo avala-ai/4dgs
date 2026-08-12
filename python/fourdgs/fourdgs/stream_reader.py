@@ -41,6 +41,7 @@ from .serialization import (
     check_magic,
     crc32,
     decode_stream,
+    decode_stream_or_skip,
     decompress,
     iter_records,
 )
@@ -139,20 +140,31 @@ def decode_streams(
     """
     cursor = Cursor(streams)
     got: dict[int, np.ndarray] = {}
+    seen: set[int] = set()
+    known = frozenset(op.ATTRIBUTE_CHANNELS)
     while cursor.remaining() > 0:
-        attribute_id, values = decode_stream(cursor)
+        attribute_id, values = decode_stream_or_skip(cursor, known)
         # The format defines one stream per attribute, so a second is a chunk that cannot
         # say which stream defines its gaussians. Overwriting resolved it silently — and
         # differently per SDK: this reader, Rust and TypeScript kept the last stream while
         # Dart kept the first, so one malformed chunk decoded to two memberships. It is
         # the duplicate-name failure section 5.15.2 refuses for records, spelled with
         # attribute ids.
-        if attribute_id in got:
+        if attribute_id in seen:
             raise MalformedFile(
                 f"a chunk carries attribute {attribute_id} twice; the format defines one stream per attribute",
                 code="duplicate-attribute-stream",
             )
-        got[attribute_id] = values
+        seen.add(attribute_id)
+        if values is not None:
+            got[attribute_id] = values
+
+    if op.A_GAUSSIAN_ID in seen:
+        raise MalformedFile(
+            "a gaussian-birth chunk carries gaussian_id; that attribute exists only "
+            "under the keyframe-delta temporal model",
+            code="unexpected-gaussian-id",
+        )
 
     missing = [a for a in op.REQUIRED_ATTRIBUTES if a not in got]
     if missing and count:
@@ -163,6 +175,17 @@ def decode_streams(
                 f"attribute {attribute} decoded to {values.shape[0]}x{values.shape[1]}, "
                 f"the chunk declares {count} gaussians",
                 code="stream-element-count-mismatch",
+            )
+        expected_channels = op.ATTRIBUTE_CHANNELS.get(attribute)
+        if expected_channels is not None and values.shape[1] != expected_channels:
+            if attribute == op.A_OBJECT_ID:
+                raise MalformedFile(
+                    f"the object_id stream declares {values.shape[1]} channels, the format defines 1",
+                    code="invalid-object-id-stream",
+                )
+            raise MalformedFile(
+                f"attribute {attribute} declares {values.shape[1]} channels; the registry says {expected_channels}",
+                code="stream-channel-count-mismatch",
             )
     if not count:
         empty = np.zeros((0, 3), dtype=np.float64)
@@ -193,11 +216,6 @@ def decode_streams(
     object_id = None
     if op.A_OBJECT_ID in got:
         codes = got[op.A_OBJECT_ID]
-        if codes.shape[1] != 1:
-            raise MalformedFile(
-                f"the object_id stream declares {codes.shape[1]} channels, the format defines 1",
-                code="invalid-object-id-stream",
-            )
         codes = codes[:, 0]
         if np.any(codes < np.iinfo(np.int32).min) or np.any(codes > np.iinfo(np.int32).max):
             index = int(np.flatnonzero((codes < np.iinfo(np.int32).min) | (codes > np.iinfo(np.int32).max))[0])
@@ -235,6 +253,17 @@ def decode_streams(
 SH_BAND_RANGE = {1: (0, 3), 2: (3, 8), 3: (8, 15)}
 
 
+def check_sh_codes(values: np.ndarray, what: str) -> None:
+    """Require version-1 SH coefficient codes to fit their unsigned byte."""
+    array = np.asarray(values, dtype=np.int64)
+    bad = (array < 0) | (array > 255)
+    if bad.any():
+        row, channel = (int(value) for value in np.argwhere(bad)[0])
+        raise MalformedFile(
+            f"{what} carries coefficient {int(array[row, channel])} at row {row}, channel {channel}; expected 0..255"
+        )
+
+
 def merge_chunk_bands(counts: list[int], chunk_bands: list[dict[int, np.ndarray]]):
     """Merge per-chunk SH band streams into one scene-wide `(n, 3 * coeffs)` array.
 
@@ -261,8 +290,7 @@ def merge_chunk_bands(counts: list[int], chunk_bands: list[dict[int, np.ndarray]
             if values.size != count * 3 * width:
                 raise MalformedFile(f"SH band {band} decoded {values.size} values, expected {count * 3 * width}")
             values = values.reshape(count, 3 * width)
-            if values.min(initial=0) < 0 or values.max(initial=0) > 255:
-                raise MalformedFile("an SH coefficient is outside the 0..255 range this version stores")
+            check_sh_codes(values, f"SH band {band}")
             for c in range(3):
                 out[at : at + count, c * coeffs + first : c * coeffs + last] = values[:, c * width : (c + 1) * width]
         at += count
@@ -306,6 +334,12 @@ def chunk_stream_bytes(head: rec.ChunkHeader, streams) -> bytes:
     they were attribute streams, which produces wrong gaussians instead of an error.
     """
     if head.compression == "":
+        if len(streams) != head.uncompressed_size:
+            raise MalformedFile(
+                f"chunk at t0={head.t0} declares uncompressed_size "
+                f"{head.uncompressed_size}; its records block contains {len(streams)} bytes",
+                code="decompressed-size-mismatch",
+            )
         return streams
     codec = {"deflate": CODEC_DEFLATE, "zstd": CODEC_ZSTD}.get(head.compression)
     if codec is None:
@@ -374,7 +408,12 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
                     band_cursor = Cursor(record.content)
                     band = band_cursor.u8()
                     if band <= max_sh_band:
-                        _, values = decode_stream(band_cursor)
+                        attribute, values = decode_stream(band_cursor)
+                        if attribute != op.SH_BAND_STREAM:
+                            raise MalformedFile(
+                                f"the SH Band Stream at {record.offset} declares inner attribute_id "
+                                f"{attribute}; version 1 fixes it at {op.SH_BAND_STREAM}"
+                            )
                         chunk_bands[-1][band] = values
             elif record.opcode == op.AUDIO:
                 if first_audio_record is None:
