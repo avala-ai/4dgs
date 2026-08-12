@@ -507,13 +507,6 @@ Map<int, _Column> _decodeStreams(FourdgsCursor cursor, int at, String what) {
     // complete stream is malformed; a repeated header whose payload runs past
     // the group is truncated, and taking this view allocates no decoded bins.
     final payload = cursor.take(header.payloadLength);
-    final wanted = _keyframeDeltaChannelsFor(header.attributeId);
-    if (wanted != null && header.channels != wanted) {
-      throw FourdgsMalformedFile(
-        'attribute ${header.attributeId} declares ${header.channels} channels, '
-        'the registry says $wanted',
-      );
-    }
     // One stream per attribute here too: the regular chunk path refuses a
     // second, and this path had its own loop that was still resolving it
     // silently.
@@ -524,6 +517,9 @@ Map<int, _Column> _decodeStreams(FourdgsCursor cursor, int at, String what) {
         'per attribute',
       );
     }
+    // The same check arrived from both sides of the merge. This is the one that
+    // survives: it names the record and the byte its stream header sits at, which is
+    // the whole point of this branch. The other said only which attribute disagreed.
     final int? expectedChannels = _keyframeDeltaChannelsFor(header.attributeId);
     if (expectedChannels != null && header.channels != expectedChannels) {
       throw FourdgsMalformedFile(
