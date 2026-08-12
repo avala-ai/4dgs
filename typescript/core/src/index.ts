@@ -257,3 +257,9 @@ export {
   keyframeDeltaStatesJson,
   reconstructKeyframeDelta,
 } from "./keyframeDelta.js";
+
+export {
+  type KeyframeDeltaSample,
+  type KeyframeDeltaWriteOptions,
+  encodeKeyframeDeltaSequence,
+} from "./keyframeDeltaWriter.js";
