@@ -364,6 +364,7 @@ class FourdgsGaussianSet {
     this.shDegree = 0,
     this.sh,
     this.shCoefficients = 0,
+    this.sourceGroup,
     this.sourceIndex,
     this.objectId,
   });
@@ -405,6 +406,9 @@ class FourdgsGaussianSet {
   /// Coefficients per colour component: 3 at degree 1, 8 at degree 2, 15 at
   /// degree 3. Zero when the scene carries no harmonics.
   final int shCoefficients;
+
+  /// Optional producer-side grouping ids, when the file carried them.
+  final Int32List? sourceGroup;
 
   /// Optional producer-side stable ids, when the file carried them.
   final Int32List? sourceIndex;
@@ -508,7 +512,12 @@ class FourdgsGaussianSet {
     final hi = Float64List(count);
     for (int i = 0; i < count; i++) {
       final sigma = sigmaT[i];
-      final half = sigma.isFinite ? k * sigma : double.infinity;
+      // State reconstruction floors finite sigma at 1e-30 before evaluating
+      // the marginal. Support is the inverse of that same calculation: using
+      // the authored sub-floor value here would let a chunker file a gaussian
+      // into an interval where stateAt can still see it outside the interval.
+      final half =
+          sigma.isFinite ? k * math.max(sigma, 1e-30) : double.infinity;
       lo[i] = math.max(muT[i] - half, winLo[i]);
       hi[i] = math.min(muT[i] + half, winHi[i]);
     }

@@ -912,7 +912,8 @@ int fourdgs_peek_temporal_model(const uint8_t *data, size_t length, const char *
  * `indexed == 0` walks the file front to back, composing each chunk onto the last; a non-zero
  * `indexed` reads the index and walks only each instant's chain. The two must agree. On
  * success `out` owns a string freed with fourdgs_string_free. A file whose Header is not
- * keyframe-delta is reported FOURDGS_STATUS_MALFORMED on the streamed path.
+ * keyframe-delta is reported FOURDGS_STATUS_UNSUPPORTED_CODEC on either path: it declares
+ * a legal temporal model handled by a different reader, not a malformed file.
  */
 int fourdgs_keyframe_delta_states_json(const uint8_t *data, size_t length, int indexed,
                                        const char **out, size_t *out_len);

@@ -2325,7 +2325,8 @@ pub unsafe extern "C" fn fourdgs_peek_temporal_model(
 /// `indexed != 0` reads the index and walks only each instant's chain. Both MUST agree, and
 /// the harness proves it by running this on both paths. On success `out` owns a string freed
 /// with `fourdgs_string_free`. A file whose Header is not `keyframe-delta` is reported
-/// `FOURDGS_STATUS_MALFORMED` on the streamed path — it is the wrong reader for that file.
+/// `FOURDGS_STATUS_UNSUPPORTED_CODEC` on either path — it is a legal model handled by a
+/// different reader, not a malformed file.
 #[no_mangle]
 pub unsafe extern "C" fn fourdgs_keyframe_delta_states_json(
     data: *const u8,
