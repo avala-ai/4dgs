@@ -200,7 +200,7 @@ Uint8List _keyframeDeltaFile({
         ..add(_u32(0)) // level
         ..add(_u32(1)) // count
         ..add(_string(compression))
-        ..add(_u64(0)) // uncompressed_size
+        ..add(_u64(block.length)) // uncompressed_size
         ..add(_u64(block.length))
         ..add(block);
   final windowTable =

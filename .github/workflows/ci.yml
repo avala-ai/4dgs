@@ -117,7 +117,7 @@ jobs:
           size_kb=$(du -s typescript | cut -f1)
           echo "typescript: ${size_kb} KiB"
           [ "$size_kb" -le 1152 ] || { echo "::error::typescript is ${size_kb} KiB, over the 1152 KiB budget"; exit 1; }
-      - name: Dart sources under 1152 KB
+      - name: Dart sources under 1472 KB
         # Sources only, same as TypeScript's and Swift's: this job builds nothing, so
         # .dart_tool and the compiled runners are not here to measure, and a vendored
         # dependency would show up as a budget failure.
@@ -169,10 +169,22 @@ jobs:
         # Raised from 1088 to 1152 KiB when the SH layer below came up the stack: the
         # merged tree measures 1108, and 1088 was set before that layer was in it. The
         # next 64 KiB step, 44 KiB of headroom.
+        # Raised to 1472 KiB by this tool's own review rounds: the validator
+        # reads records by range instead of holding the file, the band and chain checks
+        # are shared by both temporal models, every physically framed record proves its
+        # own structure, and retained findings and index entries carry ceilings. Over
+        # half the added source is hostile-input regressions. The earlier spelling of
+        # this chain here counted from 768 and 832, which were this branch's guesses at
+        # where main would be; main has since landed 832, 896 and 960, so the raise is
+        # stated from where main actually is. The merged tree measures 1224 KiB, so 1280
+        # is the step that holds it. Restated again once #198's encode layer landed on
+        # main: the merged tree is 1404 KiB, and the next step up from there, 1408, would
+        # leave four KiB — an exact-size assertion in all but name, which the raises above
+        # exist not to be. 1472 leaves 68.
         run: |
           size_kb=$(du -s dart | cut -f1)
           echo "dart: ${size_kb} KiB"
-          [ "$size_kb" -le 1152 ] || { echo "::error::dart is ${size_kb} KiB, over the 1152 KiB budget"; exit 1; }
+          [ "$size_kb" -le 1472 ] || { echo "::error::dart is ${size_kb} KiB, over the 1472 KiB budget"; exit 1; }
       - name: Swift sources under 300 KB
         # Sources only, same as TypeScript's: this job builds nothing, so .build is not
         # here to measure and a vendored dependency would show up as a budget failure.

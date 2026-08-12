@@ -36,6 +36,7 @@ import 'chunk_decoder.dart' show maxChunkDecodedBytes;
 import 'exceptions.dart';
 import 'opcode.dart';
 import 'quantization.dart';
+import 'readable.dart';
 import 'records.dart';
 import 'serialization.dart';
 
@@ -100,6 +101,51 @@ class KeyframeDeltaState {
   final Map<int, _Column> _bins;
 
   int get count => ids.length;
+
+  /// Whether this composed population carries [attribute].
+  ///
+  /// Validators use this to enforce profile promises without exposing the
+  /// private bin storage or reconstructing the population to floating point.
+  bool hasAttribute(int attribute) => _bins.containsKey(attribute);
+
+  /// Every `window_index` this state names, against the file's Window Table.
+  ///
+  /// Composition is arithmetic on bins and never looks a window up, so a state
+  /// that names a window the file does not carry composes perfectly well; the
+  /// range check happens later, when reconstruction asks the grid for the
+  /// window. A caller that composes without reconstructing — a validator, which
+  /// only wants to know whether the file decodes — would therefore call a file
+  /// valid that reconstruction refuses. This is that check, on its own, so it
+  /// can be made without dequantizing a population.
+  ///
+  /// The refusal is the shared one, so the identifier and the sentence are what
+  /// reconstruction would have produced for the same file.
+  void checkWindows(List<FourdgsWindow> windows) {
+    if (count == 0) return;
+    final column = _bins[attrWindowIndex];
+    if (column == null) {
+      throw const FourdgsMalformedFile(
+        'a non-empty state carries no window_index column; it is a required '
+        'keyframe attribute (section 11.5)',
+      );
+    }
+    // An absent or empty table is one default (0, 0) window, exactly as
+    // reconstruction reads it — so index 0 resolves against it and nothing else
+    // does.
+    final int length = windows.isEmpty ? 1 : windows.length;
+    for (int i = 0; i < count; i++) {
+      final int index = column.values[i];
+      if (index < 0 || index >= length) {
+        // The same builder the grid lookups use, so one refusal has one
+        // spelling however it was reached.
+        throw windowIndexOutOfRange(
+          index,
+          length,
+          gaussian: _Grids._named(ids[i]),
+        );
+      }
+    }
+  }
 }
 
 /// The state a keyframe chunk states outright, with its identities checked.
@@ -210,6 +256,12 @@ KeyframeDeltaState _applyDelta(
           'an update touches attribute $attribute, which the referenced state does not carry',
         );
       }
+      if (target.channels != delta.channels) {
+        throw FourdgsMalformedFile(
+          'an update carries ${delta.channels} channels for attribute '
+          '$attribute, but its referenced column carries ${target.channels}',
+        );
+      }
       final ch = target.channels;
       final absolute = keyframeDeltaAbsoluteInUpdate.contains(attribute);
       for (int r = 0; r < rows.length; r++) {
@@ -245,8 +297,22 @@ KeyframeDeltaState _applyDelta(
         );
       }
     }
+    // Two sources, and both are needed. §5.18 makes a birth state "the full
+    // required attribute set of a keyframe chunk, plus gaussian_id", so the
+    // eleven required ids are wanted whatever the reference happens to carry —
+    // a keyframe with `count == 0` carries none of them, and asking only what
+    // the reference has accepted a birth stating position alone. And every
+    // attribute the reference *does* carry is wanted too: a birth that omits
+    // the state's `object_id` is not saying "background", it is failing to say
+    // anything. The zero-default ids are the exemption to both.
+    //
+    // Getting this wrong is not a diagnosis lost. The column merged below is
+    // sized from the attributes present, so a birth missing one produced a
+    // column shorter than the id array, and the next delta indexed off the end
+    // of it — `4dgs validate` died with a RangeError on a file it was reading.
+    final wanted = <int>{...requiredAttributes, ...bins.keys};
     final absent = <int>[
-      for (final attribute in bins.keys)
+      for (final attribute in wanted)
         if (!birthBins.containsKey(attribute) &&
             !_zeroDefaultIdentityAttributes.contains(attribute))
           attribute,
@@ -281,17 +347,40 @@ KeyframeDeltaState _applyDelta(
           'absolute state, not a delta',
         );
       }
+      // The other direction, and the same rule. A birth carrying an attribute the live
+      // population lacks left `before` empty, so the composed column came out as tall as
+      // the birth group alone while `ids` grew by the whole of it — and rows are addressed
+      // by position against `ids`. Zero pads an identity lane, where a row without one is
+      // a row nothing labelled; it stands for nothing in a position or a scale, and
+      // padding those would put the older gaussians at the origin.
+      // Unless there is nobody to invent it for: a keyframe may state an empty population
+      // and leave the first birth to introduce the geometry, and padding no rows invents
+      // nothing. That is the one case this refusal must not take, and it is the case the
+      // Swift SDK spells as `state.ids.isEmpty`.
+      if (existing == null &&
+          ids.isNotEmpty &&
+          !_zeroDefaultIdentityAttributes.contains(attribute)) {
+        throw FourdgsMalformedFile(
+          'a birth group carries attribute $attribute, which the live population does '
+          'not; a composed column has one value per gaussian and zero is not one for '
+          'this attribute',
+        );
+      }
+      // Beside it, and not instead of it: an attribute present on both sides must
+      // agree on its channel count, or the composed column is two shapes at once.
+      if (existing != null &&
+          added != null &&
+          existing.channels != added.channels) {
+        throw FourdgsMalformedFile(
+          'a birth carries ${added.channels} channels for attribute $attribute, '
+          'but the live population carries ${existing.channels}',
+        );
+      }
       final ch = existing?.channels ?? added!.channels;
-      final before =
-          existing?.values ??
-          (_zeroDefaultIdentityAttributes.contains(attribute)
-              ? Int32List(ids.length * ch)
-              : Int32List(0));
-      final after =
-          added?.values ??
-          (_zeroDefaultIdentityAttributes.contains(attribute)
-              ? Int32List(birthIds.length * ch)
-              : Int32List(0));
+      // Both fallbacks are now reachable only for an identity lane, which the two checks
+      // above are what makes true: every other attribute is present on both sides.
+      final before = existing?.values ?? Int32List(ids.length * ch);
+      final after = added?.values ?? Int32List(birthIds.length * ch);
       final merged =
           Int32List(before.length + after.length)
             ..setRange(0, before.length, before)
@@ -355,11 +444,15 @@ void _checkGroupsDisjoint(Int32List a, Int32List b, Int32List d) {
 /// rather than gating on the `gaussian-birth` registry the chunk decoder uses:
 /// an update group carries a subset of the required attributes, a death group
 /// carries only the identity, and both must decode.
-({Int32List ids, Map<int, _Column> bins}) _decodeGroup(Uint8List blob, int at) {
+({Int32List ids, Map<int, _Column> bins}) _decodeGroup(
+  Uint8List blob,
+  int at,
+  String what,
+) {
   if (blob.isEmpty) {
     return (ids: Int32List(0), bins: <int, _Column>{});
   }
-  final streams = _decodeStreams(FourdgsCursor(blob), at);
+  final streams = _decodeStreams(FourdgsCursor(blob), at, what);
   final gaussianId = streams.remove(attrGaussianId);
   if (gaussianId == null) {
     throw const FourdgsMalformedFile(
@@ -386,6 +479,7 @@ void _checkGroupsDisjoint(Int32List a, Int32List b, Int32List d) {
   final streams = _decodeStreams(
     FourdgsCursor(body.streams),
     at + recordHeaderBytes + body.streamsOffset,
+    'the keyframe chunk at byte $at',
   );
   final gaussianId = streams.remove(attrGaussianId);
   if (gaussianId == null) {
@@ -407,7 +501,14 @@ void _checkGroupsDisjoint(Int32List a, Int32List b, Int32List d) {
       );
     }
   }
-  return (ids: _idsOf(gaussianId), bins: streams);
+  final Int32List ids = _idsOf(gaussianId);
+  if (ids.length != body.header.count) {
+    throw FourdgsMalformedFile(
+      'the keyframe Chunk at byte $at declares ${body.header.count} gaussians, '
+      'but its gaussian_id stream carries ${ids.length}',
+    );
+  }
+  return (ids: ids, bins: streams);
 }
 
 /// Frames every stream in a group and only then decodes it.
@@ -415,7 +516,7 @@ void _checkGroupsDisjoint(Int32List a, Int32List b, Int32List d) {
 /// The framing pass proves every declared payload is present before the first
 /// decoded allocation. Per-stream decoded-size limits remain the cross-SDK
 /// contract; this SDK must not add a differently scoped aggregate refusal.
-Map<int, _Column> _decodeStreams(FourdgsCursor cursor, int at) {
+Map<int, _Column> _decodeStreams(FourdgsCursor cursor, int at, String what) {
   final framed =
       <({FourdgsStreamHeader header, Uint8List payload, int offset})>[];
   final seen = <int>{};
@@ -426,13 +527,6 @@ Map<int, _Column> _decodeStreams(FourdgsCursor cursor, int at) {
     // complete stream is malformed; a repeated header whose payload runs past
     // the group is truncated, and taking this view allocates no decoded bins.
     final payload = cursor.take(header.payloadLength);
-    final wanted = _keyframeDeltaChannelsFor(header.attributeId);
-    if (wanted != null && header.channels != wanted) {
-      throw FourdgsMalformedFile(
-        'attribute ${header.attributeId} declares ${header.channels} channels, '
-        'the registry says $wanted',
-      );
-    }
     // One stream per attribute here too: the regular chunk path refuses a
     // second, and this path had its own loop that was still resolving it
     // silently.
@@ -441,6 +535,17 @@ Map<int, _Column> _decodeStreams(FourdgsCursor cursor, int at) {
         'a keyframe-delta group carries attribute ${header.attributeId} twice; '
         'the second header is at byte $offset and the format defines one stream '
         'per attribute',
+      );
+    }
+    // The same check arrived from both sides of the merge. This is the one that
+    // survives: it names the record and the byte its stream header sits at, which is
+    // the whole point of this branch. The other said only which attribute disagreed.
+    final int? expectedChannels = _keyframeDeltaChannelsFor(header.attributeId);
+    if (expectedChannels != null && header.channels != expectedChannels) {
+      throw FourdgsMalformedFile(
+        'attribute ${header.attributeId} of $what declares ${header.channels} '
+        'channels, the registry says $expectedChannels; its stream header is '
+        'at byte $offset',
       );
     }
     framed.add((header: header, payload: payload, offset: offset));
@@ -458,6 +563,7 @@ Map<int, _Column> _decodeStreams(FourdgsCursor cursor, int at) {
   return got;
 }
 
+/// Channels for every registry-defined attribute the keyframe-delta path reads.
 int? _keyframeDeltaChannelsFor(int attribute) {
   switch (attribute) {
     case attrPosition:
@@ -648,9 +754,63 @@ KeyframeDeltaState _composeDelta(
   required int at,
 }) {
   final content = at + recordHeaderBytes;
-  final updates = _decodeGroup(body.updates, content + body.updatesOffset);
-  final births = _decodeGroup(body.births, content + body.birthsOffset);
-  final deaths = _decodeGroup(body.deaths, content + body.deathsOffset);
+  final what = 'the delta chunk at byte $at';
+  final updates = _decodeGroup(
+    body.updates,
+    content + body.updatesOffset,
+    what,
+  );
+  final births = _decodeGroup(body.births, content + body.birthsOffset, what);
+  final deaths = _decodeGroup(body.deaths, content + body.deathsOffset, what);
+  void checkCount(String group, int actual, int declared) {
+    if (actual != declared) {
+      throw FourdgsMalformedFile(
+        '$what declares $declared $group operations, but its $group group '
+        'decodes to $actual gaussian ids',
+      );
+    }
+  }
+
+  checkCount('update', updates.ids.length, body.header.updateCount);
+  checkCount('birth', births.ids.length, body.header.birthCount);
+  checkCount('death', deaths.ids.length, body.header.deathCount);
+  void checkColumnCounts(
+    String group,
+    Map<int, _Column> columns,
+    int declared,
+  ) {
+    for (final MapEntry<int, _Column> column in columns.entries) {
+      if (column.value.rows != declared) {
+        throw FourdgsMalformedFile(
+          '$what declares $declared $group operations, but attribute '
+          '${column.key} in its $group group decodes to '
+          '${column.value.rows} rows',
+        );
+      }
+    }
+  }
+
+  // The composer has no ids to iterate when a group declares zero operations.
+  // Check every lane explicitly so a non-empty attribute stream cannot hide in
+  // an otherwise empty group and be silently discarded.
+  checkColumnCounts('update', updates.bins, body.header.updateCount);
+  checkColumnCounts('birth', births.bins, body.header.birthCount);
+  checkColumnCounts('death', deaths.bins, body.header.deathCount);
+  final hasRotationIndex = updates.bins.containsKey(attrRotationIndex);
+  final hasRotationBins = updates.bins.containsKey(attrRotation);
+  if (hasRotationIndex != hasRotationBins) {
+    throw FourdgsMalformedFile(
+      '$what must restate rotation_index and rotation together in an update; '
+      'one is present and the other is absent',
+    );
+  }
+  if (deaths.bins.isNotEmpty) {
+    final attributes = deaths.bins.keys.toList()..sort();
+    throw FourdgsMalformedFile(
+      '$what death group carries non-identity attributes $attributes; a death '
+      'group contains exactly one gaussian_id stream',
+    );
+  }
   return _applyDelta(
     reference,
     updateIds: updates.ids,
@@ -660,6 +820,62 @@ KeyframeDeltaState _composeDelta(
     deathIds: deaths.ids,
   );
 }
+
+/// Decode one keyframe Chunk into composed keyframe-delta state.
+///
+/// Kept as a one-record operation so validators and streaming transports can
+/// hold one chunk rather than materializing a complete file.
+KeyframeDeltaState keyframeDeltaStateFromChunk(
+  Uint8List content, {
+  required int chunkOffset,
+}) {
+  final decoded = _keyframeFromChunk(content, at: chunkOffset);
+  return _keyframeState(decoded.ids, decoded.bins);
+}
+
+/// Require every keyframe gaussian's encoded birth-time bin to name its t0.
+void checkKeyframeDeltaMuT(
+  KeyframeDeltaState state,
+  double t0,
+  FourdgsQuantization quantization,
+) {
+  if (state.count == 0) return;
+  final _Column? mu = state._bins[attrMuT];
+  final _Column? sigma = state._bins[attrSigmaT];
+  final _Column? flags = state._bins[attrFlags];
+  if (mu == null || sigma == null || flags == null) {
+    throw const FourdgsMalformedFile(
+      'a nonempty keyframe is missing mu_t, sigma_t, or flags',
+    );
+  }
+  final FourdgsSteps steps = FourdgsSteps.of(quantization);
+  for (int row = 0; row < state.count; row++) {
+    final bool neverFades = flags.values[row] & flagNeverFades != 0;
+    final double step = muStep(
+      sigma.values[row],
+      steps.sigmaLog,
+      neverFades,
+      steps.time,
+    );
+    final int expected = (t0 / step).round();
+    if (mu.values[row] != expected) {
+      throw FourdgsMalformedFile(
+        'keyframe gaussian_id ${state.ids[row]} has mu_t bin '
+        '${mu.values[row]}; its Chunk t0 $t0 requires bin $expected',
+      );
+    }
+  }
+}
+
+/// Compose one already-parsed Delta Chunk onto its selected reference state.
+///
+/// The caller chooses the reference from the chunk's declared mode and offset;
+/// this operation owns decoding and applying its three bounded groups.
+KeyframeDeltaState applyKeyframeDeltaBody(
+  KeyframeDeltaState reference,
+  FourdgsDeltaChunkBody body, {
+  required int chunkOffset,
+}) => _composeDelta(reference, body, at: chunkOffset);
 
 /// Read the Footer, then the index, then compose each chunk by byte range.
 ///
@@ -737,9 +953,17 @@ decodeKeyframeDeltaIndexed(Uint8List data) {
   checkTiling(index);
 
   final chunks = <KeyframeDeltaChunk>[];
+  // Built once for the whole loop: every chain walk needs it, and rebuilding it
+  // per entry is what makes composing an index quadratic.
+  final byOffset = keyframeDeltaChainIndex(index);
   for (int i = 0; i < index.length; i++) {
     final entry = index[i];
-    final state = _composeChain(data, index, entry);
+    final state = composeKeyframeDeltaChain(
+      data,
+      index,
+      entry,
+      byOffset: byOffset,
+    );
     // The index says how many gaussians are live over this interval and the
     // chunks say what they are, and §5.8 calls that duplication a cheap
     // corruption check. It is also the only thing standing between a zero-width
@@ -776,7 +1000,12 @@ decodeKeyframeDeltaIndexed(Uint8List data) {
       // cheap.
       final head =
           parseDeltaChunk(
-            _recordContent(data, entry.chunkOffset, entry.chunkLength),
+            _recordContent(
+              data,
+              entry.chunkOffset,
+              entry.chunkLength,
+              expectedOpcode: opDeltaChunk,
+            ),
           ).header;
       updateCount = head.updateCount;
       birthCount = head.birthCount;
@@ -810,47 +1039,303 @@ decodeKeyframeDeltaIndexed(Uint8List data) {
   );
 }
 
-Uint8List _recordContent(Uint8List data, int offset, int length) {
-  final c = FourdgsCursor(Uint8List.sublistView(data, offset, offset + length));
-  c.u8();
-  return c.take(c.u64());
+Uint8List _recordContent(
+  Uint8List data,
+  int offset,
+  int length, {
+  required int expectedOpcode,
+  int? fileOffset,
+}) {
+  if (offset < 0 ||
+      length < recordHeaderBytes ||
+      offset + length > data.length) {
+    throw FourdgsMalformedFile(
+      'the indexed state record at byte ${fileOffset ?? offset} declares a '
+      '$length-byte '
+      'range outside the ${data.length}-byte buffer',
+    );
+  }
+  final int contentLength = _checkStateRecordHeader(
+    Uint8List.sublistView(data, offset, offset + recordHeaderBytes),
+    fileOffset: fileOffset ?? offset,
+    rangeLength: length,
+    expectedOpcode: expectedOpcode,
+  );
+  return Uint8List.sublistView(
+    data,
+    offset + recordHeaderBytes,
+    offset + recordHeaderBytes + contentLength,
+  );
 }
 
-KeyframeDeltaState _composeChain(
+int _checkStateRecordHeader(
+  Uint8List header, {
+  required int fileOffset,
+  required int rangeLength,
+  required int expectedOpcode,
+}) {
+  final c = FourdgsCursor(header);
+  final int opcode = c.u8();
+  final int contentLength = c.u64();
+  if (opcode != expectedOpcode) {
+    throw FourdgsMalformedFile(
+      'the indexed state record at byte $fileOffset is ${opcodeName(opcode)}; '
+      'expected ${opcodeName(expectedOpcode)}',
+    );
+  }
+  if (recordHeaderBytes + contentLength != rangeLength) {
+    throw FourdgsMalformedFile(
+      'the indexed state range at byte $fileOffset declares $rangeLength '
+      'bytes, but '
+      'its ${opcodeName(opcode)} framing declares '
+      '${recordHeaderBytes + contentLength}; the index must name exactly one '
+      'record',
+    );
+  }
+  return contentLength;
+}
+
+int _stateOpcode(FourdgsChunkIndexEntry entry) {
+  if (entry.kind == 0) return opChunk;
+  if (entry.kind == 1) return opDeltaChunk;
+  throw FourdgsMalformedFile(
+    'the index entry at byte ${entry.chunkOffset} declares chunk_kind '
+    '${entry.kind}; expected 0 (keyframe) or 1 (delta)',
+  );
+}
+
+/// The composed state of one index entry: its chain, walked and telescoped.
+///
+/// Public because a caller does not always want the whole sequence.
+/// [decodeKeyframeDeltaIndexed] answers "what does this file decode to" and so
+/// keeps every composed state, while a seeking client wants one instant. The
+/// latter needs one state resident at a time, which is what this operation
+/// provides (AGENTS.md §1).
+/// [byOffset] is [keyframeDeltaChainIndex] of the same index, for a caller in a
+/// loop. See that function for why it is worth passing.
+KeyframeDeltaState composeKeyframeDeltaChain(
   Uint8List data,
   List<FourdgsChunkIndexEntry> index,
-  FourdgsChunkIndexEntry entry,
-) {
-  final chain = chainFrom(index, entry);
+  FourdgsChunkIndexEntry entry, {
+  Map<int, FourdgsChunkIndexEntry>? byOffset,
+}) {
+  final chain = chainFrom(index, entry, byOffset: byOffset);
   KeyframeDeltaState? state;
+  int? referenceLevel;
   for (final link in chain) {
-    final content = _recordContent(data, link.chunkOffset, link.chunkLength);
-    if (link.kind == 0) {
-      final decoded = _keyframeFromChunk(content, at: link.chunkOffset);
-      state = _keyframeState(decoded.ids, decoded.bins);
-    } else {
-      if (state == null) {
-        throw const FourdgsMalformedFile(
-          'a keyframe-delta chain begins with a delta chunk',
-        );
-      }
-      state = _composeDelta(
-        state,
-        parseDeltaChunk(content),
-        at: link.chunkOffset,
+    final int expectedOpcode = _stateOpcode(link);
+    final composed = _composeLink(
+      state,
+      _recordContent(
+        data,
+        link.chunkOffset,
+        link.chunkLength,
+        expectedOpcode: expectedOpcode,
+      ),
+      link,
+      referenceLevel: referenceLevel,
+    );
+    state = composed.state;
+    referenceLevel = composed.level;
+  }
+  return _composed(state);
+}
+
+/// The same chain, fetched by byte range instead of from a resident file.
+///
+/// For the caller that has a [FourdgsReadable] and no reason to hold the file:
+/// a chain is a handful of records, and reading each one as the walk reaches it
+/// keeps a chunk resident rather than a scene (AGENTS.md §1). The states this
+/// composes are identical to [composeKeyframeDeltaChain]'s — same records, same
+/// order, same refusals — so the two are interchangeable and a caller picks by
+/// what it already holds.
+Future<KeyframeDeltaState> readKeyframeDeltaChain(
+  FourdgsReadable source,
+  List<FourdgsChunkIndexEntry> index,
+  FourdgsChunkIndexEntry entry, {
+  Map<int, FourdgsChunkIndexEntry>? byOffset,
+}) async {
+  final chain = chainFrom(index, entry, byOffset: byOffset);
+  final int size = await source.size();
+  KeyframeDeltaState? state;
+  int? referenceLevel;
+  for (final link in chain) {
+    final int expectedOpcode = _stateOpcode(link);
+    if (link.chunkOffset < 0 ||
+        link.chunkLength < recordHeaderBytes ||
+        link.chunkOffset + link.chunkLength > size) {
+      throw FourdgsMalformedFile(
+        'the chunk at ${link.chunkOffset} declares a ${link.chunkLength}-byte '
+        'range outside the $size-byte resource',
       );
     }
+    final Uint8List header;
+    try {
+      header = await source.read(link.chunkOffset, recordHeaderBytes);
+    } on RangeError catch (error) {
+      throw FourdgsMalformedFile(
+        'the state record at ${link.chunkOffset} could not be read as a '
+        '$recordHeaderBytes-byte framing header: $error',
+      );
+    }
+    // Price the indexed range only after its fixed-size framing proves it is
+    // exactly one state record. Otherwise a forged chunk_length can make this
+    // public range API allocate nearly the whole file before noticing that the
+    // first record in it was small.
+    _checkStateRecordHeader(
+      header,
+      fileOffset: link.chunkOffset,
+      rangeLength: link.chunkLength,
+      expectedOpcode: expectedOpcode,
+    );
+    final Uint8List blob;
+    try {
+      blob = await source.read(link.chunkOffset, link.chunkLength);
+    } on RangeError catch (error) {
+      throw FourdgsMalformedFile(
+        'the chunk at ${link.chunkOffset} could not be read as its declared '
+        '${link.chunkLength}-byte range: $error',
+      );
+    }
+    final composed = _composeLink(
+      state,
+      _recordContent(
+        blob,
+        0,
+        link.chunkLength,
+        expectedOpcode: expectedOpcode,
+        fileOffset: link.chunkOffset,
+      ),
+      link,
+      referenceLevel: referenceLevel,
+    );
+    state = composed.state;
+    referenceLevel = composed.level;
   }
+  return _composed(state);
+}
+
+/// One link of a chain composed onto what came before it, plus the level the
+/// next delta must preserve.
+({KeyframeDeltaState state, int level}) _composeLink(
+  KeyframeDeltaState? state,
+  Uint8List content,
+  FourdgsChunkIndexEntry link, {
+  required int? referenceLevel,
+}) {
+  if (link.kind == 0) {
+    final FourdgsChunkBody body = parseChunk(content);
+    _checkKeyframeIndexAgreement(link, body.header);
+    final decoded = _keyframeFromChunk(content, at: link.chunkOffset);
+    return (
+      state: _keyframeState(decoded.ids, decoded.bins),
+      level: body.header.level,
+    );
+  }
+  if (state == null || referenceLevel == null) {
+    throw const FourdgsMalformedFile(
+      'a keyframe-delta chain begins with a delta chunk',
+    );
+  }
+  final FourdgsDeltaChunkBody body = parseDeltaChunk(content);
+  _checkDeltaIndexAgreement(link, body.header);
+  if (body.header.level != referenceLevel) {
+    throw FourdgsMalformedFile(
+      'the delta chunk at byte ${link.chunkOffset} declares level '
+      '${body.header.level}, but its selected reference has level '
+      '$referenceLevel; a delta preserves its reference level',
+    );
+  }
+  return (
+    state: _composeDelta(state, body, at: link.chunkOffset),
+    level: body.header.level,
+  );
+}
+
+void _checkKeyframeIndexAgreement(
+  FourdgsChunkIndexEntry entry,
+  FourdgsChunkHeader chunk,
+) {
+  if (entry.t0 != chunk.t0 ||
+      entry.t1 != chunk.t1 ||
+      entry.gaussianCount != chunk.count) {
+    throw FourdgsMalformedFile(
+      'the index entry for the keyframe at ${entry.chunkOffset} declares '
+      '[${entry.t0}, ${entry.t1}) and ${entry.gaussianCount} gaussians, but '
+      'the Chunk declares [${chunk.t0}, ${chunk.t1}) and ${chunk.count}; '
+      'duplicated fields must agree',
+    );
+  }
+}
+
+void _checkDeltaIndexAgreement(
+  FourdgsChunkIndexEntry entry,
+  FourdgsDeltaChunkHeader chunk,
+) {
+  if (chunk.deltaMode != deltaModeKeyframe &&
+      chunk.deltaMode != deltaModeChained) {
+    throw FourdgsMalformedFile(
+      'the delta chunk at byte ${entry.chunkOffset} declares delta_mode '
+      '${chunk.deltaMode}; expected $deltaModeKeyframe (keyframe) or '
+      '$deltaModeChained (chained)',
+    );
+  }
+  final int operations =
+      chunk.updateCount + chunk.birthCount + chunk.deathCount;
+  if (entry.t0 != chunk.t0 ||
+      entry.t1 != chunk.t1 ||
+      entry.deltaMode != chunk.deltaMode ||
+      entry.referenceOffset != chunk.referenceOffset ||
+      entry.keyframeOffset != chunk.keyframeOffset ||
+      entry.depth != chunk.depth ||
+      entry.gaussianCount != operations) {
+    throw FourdgsMalformedFile(
+      'the index entry for the delta at ${entry.chunkOffset} disagrees with '
+      'its Delta Chunk: expected interval [${chunk.t0}, ${chunk.t1}), '
+      'delta_mode ${chunk.deltaMode}, reference_offset '
+      '${chunk.referenceOffset}, keyframe_offset ${chunk.keyframeOffset}, '
+      'depth ${chunk.depth}, and gaussian_count $operations; duplicated fields '
+      'must agree',
+    );
+  }
+}
+
+KeyframeDeltaState _composed(KeyframeDeltaState? state) {
   if (state == null) {
     throw const FourdgsMalformedFile('an empty keyframe-delta chain');
   }
   return state;
 }
 
+/// Index entries by the byte their chunk starts at, which is what a delta
+/// references (spec §11.8).
+///
+/// Built once and passed to [chainFrom] by a caller that walks more than one
+/// chain. Building it inside the walk is correct and is what a single lookup
+/// does; doing it once per entry of an index makes composing every chain cost
+/// `O(entries²)` map insertions before a single chunk is read, which a
+/// ten-thousand-entry index turns into hundreds of millions of them.
+Map<int, FourdgsChunkIndexEntry> keyframeDeltaChainIndex(
+  List<FourdgsChunkIndexEntry> index,
+) => <int, FourdgsChunkIndexEntry>{
+  for (final entry in index) entry.chunkOffset: entry,
+};
+
 /// State chunks tile the timeline: no overlap, no gap (spec §11.1). This is what
 /// makes the seek predicate a lookup rather than a search.
-void checkTiling(List<FourdgsChunkIndexEntry> index) {
+void checkTiling(List<FourdgsChunkIndexEntry> index, {double? durationSec}) {
   final ordered = index.toList()..sort((a, b) => a.t0.compareTo(b.t0));
+  if (ordered.isEmpty) {
+    throw const FourdgsMalformedFile(
+      'a keyframe-delta file contains no indexed state chunks',
+    );
+  }
+  if (ordered.first.t0 != 0.0) {
+    throw FourdgsMalformedFile(
+      'state chunks start at ${ordered.first.t0}; expected the first interval '
+      'to start at 0',
+    );
+  }
   for (int i = 1; i < ordered.length; i++) {
     final previous = ordered[i - 1];
     final entry = ordered[i];
@@ -861,6 +1346,12 @@ void checkTiling(List<FourdgsChunkIndexEntry> index) {
         '[${entry.t0}, ${entry.t1})',
       );
     }
+  }
+  if (durationSec != null && ordered.last.t1 != durationSec) {
+    throw FourdgsMalformedFile(
+      'state chunks end at ${ordered.last.t1}; the Header duration_sec is '
+      '$durationSec',
+    );
   }
 }
 
@@ -889,33 +1380,79 @@ List<FourdgsChunkIndexEntry> chainFor(
 /// finite interval and no instant at all for `[0, +Infinity)`: the midpoint is
 /// `+Infinity`, `t < t1` is false there, and a file the streamed path decodes
 /// became one the indexed path could not find its way into.
+/// [byOffset] is the lookup [keyframeDeltaChainIndex] builds. Optional, and
+/// worth passing from a loop: without it every call rebuilds the map, which
+/// turns "walk each entry's chain" from linear into quadratic (AGENTS.md §4).
 List<FourdgsChunkIndexEntry> chainFrom(
   List<FourdgsChunkIndexEntry> index,
-  FourdgsChunkIndexEntry current,
-) {
-  final byOffset = <int, FourdgsChunkIndexEntry>{
-    for (final entry in index) entry.chunkOffset: entry,
-  };
+  FourdgsChunkIndexEntry current, {
+  Map<int, FourdgsChunkIndexEntry>? byOffset,
+}) {
+  final lookup = byOffset ?? keyframeDeltaChainIndex(index);
   final chain = <FourdgsChunkIndexEntry>[current];
   while (chain.first.kind != 0) {
     final head = chain.first;
+    if (head.kind != 1) {
+      throw FourdgsMalformedFile(
+        'the index entry at byte ${head.chunkOffset} declares chunk_kind '
+        '${head.kind}; expected 0 (keyframe) or 1 (delta)',
+      );
+    }
+    if (head.deltaMode != deltaModeKeyframe &&
+        head.deltaMode != deltaModeChained) {
+      throw FourdgsMalformedFile(
+        'the delta index entry at byte ${head.chunkOffset} declares '
+        'delta_mode ${head.deltaMode}; expected $deltaModeKeyframe '
+        '(keyframe) or $deltaModeChained (chained)',
+      );
+    }
     if (head.referenceOffset >= head.chunkOffset) {
       throw FourdgsMalformedFile(
         'the chunk at ${head.chunkOffset} references ${head.referenceOffset}, '
         'which is not behind it; references point backwards only',
       );
     }
-    final reference = byOffset[head.referenceOffset];
+    final reference = lookup[head.referenceOffset];
     if (reference == null) {
       throw FourdgsMalformedFile(
         'the chunk at ${head.chunkOffset} references ${head.referenceOffset}, '
         'which the index does not name',
       );
     }
+    if (head.deltaMode == deltaModeKeyframe && reference.kind != 0) {
+      throw FourdgsMalformedFile(
+        'the keyframe-mode delta at byte ${head.chunkOffset} references the '
+        'delta at byte ${reference.chunkOffset}; expected its GOP keyframe',
+      );
+    }
+    final int expectedKeyframeOffset =
+        reference.kind == 0 ? reference.chunkOffset : reference.keyframeOffset;
+    final int expectedDepth =
+        head.deltaMode == deltaModeKeyframe ? 1 : reference.depth + 1;
+    if (head.keyframeOffset != expectedKeyframeOffset ||
+        head.depth != expectedDepth) {
+      throw FourdgsMalformedFile(
+        'the delta at byte ${head.chunkOffset} declares keyframe_offset '
+        '${head.keyframeOffset} and depth ${head.depth}; its selected '
+        'reference requires $expectedKeyframeOffset and $expectedDepth',
+      );
+    }
     chain.insert(0, reference);
     if (chain.length > index.length) {
       throw const FourdgsMalformedFile('the chain does not reach a keyframe');
     }
+  }
+
+  final FourdgsChunkIndexEntry keyframe = chain.first;
+  if (keyframe.depth != 0 ||
+      keyframe.referenceOffset != 0 ||
+      keyframe.keyframeOffset != keyframe.chunkOffset) {
+    throw FourdgsMalformedFile(
+      'the keyframe index entry at byte ${keyframe.chunkOffset} declares '
+      'reference_offset ${keyframe.referenceOffset}, keyframe_offset '
+      '${keyframe.keyframeOffset}, and depth ${keyframe.depth}; expected 0, '
+      '${keyframe.chunkOffset}, and 0',
+    );
   }
 
   if (chain.length - 1 != current.depth) {

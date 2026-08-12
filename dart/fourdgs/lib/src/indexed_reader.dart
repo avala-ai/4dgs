@@ -188,6 +188,8 @@ class FourdgsIndexedScene {
 Future<FourdgsIndexedScene> openFourdgsIndexed(
   FourdgsReadable source, {
   int probeBytes = fourdgsHeadProbeBytes,
+  int? framedFooterOffset,
+  int? framedFooterLength,
 }) async {
   final size = await source.size();
   if (size <= 0) throw const FourdgsTruncatedFile('resource is empty');
@@ -203,6 +205,9 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
       'the file has no Header or no Quantization record before its first chunk',
     );
   }
+  // An absent or empty Window Table is the one default `(0, 0)` row from
+  // section 5.4. Chunk decoding applies that same default, so opening must not
+  // reject a resource the range reader can decode unambiguously.
   final audioSourceRanges = _pairIndexedAudioSources(front);
   if (front.header!.hasAudio != audioSourceRanges.isNotEmpty) {
     throw FourdgsMalformedFile(
@@ -211,26 +216,79 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
     );
   }
 
-  // Footer record (9 + 20 bytes) then the trailing magic.
-  final footerBytes = recordHeaderBytes + 20 + fourdgsMagic.length;
-  if (size < footerBytes) {
+  // The ordinary seeking path finds the version-1 Footer from its fixed tail.
+  // Validation already owns a complete bounded framing walk, so it can supply
+  // the exact range of an extended Footer and keep appended fields legal.
+  const int footerFixedContentBytes = 20;
+  final int minimumTail = recordHeaderBytes + footerFixedContentBytes;
+  if (size < minimumTail + fourdgsMagic.length) {
     throw const FourdgsTruncatedFile('file is too short to hold a footer');
   }
-  final tail = await source.read(size - footerBytes, footerBytes);
+  final Uint8List tail = await source.read(
+    size - fourdgsMagic.length,
+    fourdgsMagic.length,
+  );
   for (int i = 0; i < fourdgsMagic.length; i++) {
-    if (tail[tail.length - fourdgsMagic.length + i] != fourdgsMagic[i]) {
+    if (tail[i] != fourdgsMagic[i]) {
       throw const FourdgsMalformedFile(
         'file does not end with the magic; it may be truncated',
       );
     }
   }
-  final footerRecord = readRecord(FourdgsCursor(tail));
-  if (footerRecord.opcode != opFooter) {
-    throw FourdgsMalformedFile(
-      'expected a Footer at the tail, found opcode 0x${footerRecord.opcode.toRadixString(16)}',
+  if ((framedFooterOffset == null) != (framedFooterLength == null)) {
+    throw ArgumentError(
+      '4dgs: framedFooterOffset and framedFooterLength must be supplied together',
     );
   }
-  final footer = FourdgsFooter.parse(footerRecord.content);
+  final ({int offset, int length}) locatedFooter;
+  if (framedFooterOffset != null) {
+    locatedFooter = (offset: framedFooterOffset, length: framedFooterLength!);
+  } else {
+    locatedFooter = await _locateFooter(
+      source,
+      size - fourdgsMagic.length,
+      footerFixedContentBytes,
+    );
+  }
+  final int footerAt = locatedFooter.offset;
+  final int footerLength = locatedFooter.length;
+  if (footerAt < 0 ||
+      footerLength < footerFixedContentBytes ||
+      footerAt + recordHeaderBytes + footerLength !=
+          size - fourdgsMagic.length) {
+    throw FourdgsMalformedFile(
+      'the framed Footer range [$footerAt, '
+      '${footerAt + recordHeaderBytes + footerLength}) does not end at the '
+      'closing magic at ${size - fourdgsMagic.length}',
+    );
+  }
+  // Only the framing and the fixed fields. An extension can be large, but no
+  // current reader needs to transfer it merely to find the summary.
+  final FourdgsCursor footerCursor = FourdgsCursor(
+    await source.read(footerAt, recordHeaderBytes + footerFixedContentBytes),
+  );
+  final int footerOpcode = footerCursor.u8();
+  final int declaredFooterLength = footerCursor.u64();
+  if (footerOpcode != opFooter) {
+    throw FourdgsMalformedFile(
+      'expected a Footer at the tail, found opcode 0x${footerOpcode.toRadixString(16)}',
+    );
+  }
+  if (declaredFooterLength != footerLength) {
+    throw FourdgsMalformedFile(
+      'the Footer at byte $footerAt declares $declaredFooterLength content '
+      'bytes, but its framed range contains $footerLength',
+    );
+  }
+  final footer = FourdgsFooter.parse(
+    footerCursor.take(footerFixedContentBytes),
+  );
+  if (footer.summaryStart == 0 && footer.summaryCrc != 0) {
+    throw FourdgsMalformedFile(
+      'the Footer declares summary_crc ${footer.summaryCrc}, but '
+      'summary_start is 0 and there is no summary range to checksum',
+    );
+  }
 
   final index = <FourdgsChunkIndexEntry>[];
   // Where each entry above came from. A refusal that can only say which interval
@@ -241,7 +299,7 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
   FourdgsStatistics? statistics;
   bool? crcOk;
   if (footer.summaryStart != 0) {
-    final summaryLength = size - footerBytes - footer.summaryStart;
+    final summaryLength = footerAt - footer.summaryStart;
     if (summaryLength < 0) {
       throw const FourdgsMalformedFile(
         'the footer points its summary past the end of the file',
@@ -379,6 +437,77 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
     provenanceRanges: front.provenanceRanges,
     statistics: statistics,
     summaryOffsets: summaryOffsets,
+  );
+}
+
+/// Locate the variable-width final Footer from top-level record boundaries.
+///
+/// Version-1 fields occupy the first 20 content bytes, while later minor
+/// revisions may append more. The content length therefore cannot be inferred
+/// from a fixed distance to the closing magic, and an opcode-shaped sequence
+/// inside an append is not a record header. Walk only nine-byte framing headers
+/// from the opening magic, skipping payloads by their validated lengths. This
+/// touches no Chunk contents and retains one header however large the file is.
+Future<({int offset, int length})> _locateFooter(
+  FourdgsReadable source,
+  int magicAt,
+  int fixedContentBytes,
+) async {
+  // The version-1 Footer is normally exactly its fixed fields. Probe that
+  // bounded tail first: it makes an indexed open independent of the number of
+  // chunks preceding the summary. A different length can be an extended
+  // Footer, so only that ambiguous case falls back to the boundary walk below.
+  final int fixedFooterAt = magicAt - recordHeaderBytes - fixedContentBytes;
+  if (fixedFooterAt >= fourdgsMagic.length) {
+    final FourdgsCursor candidate = FourdgsCursor(
+      await source.read(fixedFooterAt, recordHeaderBytes + fixedContentBytes),
+    );
+    final int candidateOpcode = candidate.u8();
+    final int candidateLength = candidate.u64();
+    if (candidateOpcode == opFooter && candidateLength == fixedContentBytes) {
+      return (offset: fixedFooterAt, length: fixedContentBytes);
+    }
+  }
+
+  int at = fourdgsMagic.length;
+  while (at < magicAt) {
+    if (at + recordHeaderBytes > magicAt) {
+      throw FourdgsMalformedFile(
+        'the record header at byte $at overlaps the closing magic at $magicAt',
+      );
+    }
+    final FourdgsCursor header = FourdgsCursor(
+      await source.read(at, recordHeaderBytes),
+    );
+    final int recordOpcode = header.u8();
+    final int length = header.u64();
+    final int end = at + recordHeaderBytes + length;
+    if (end > magicAt) {
+      throw FourdgsMalformedFile(
+        '${opcodeName(recordOpcode)} at byte $at ends at $end, past the '
+        'closing magic at $magicAt',
+      );
+    }
+    if (end == magicAt) {
+      if (recordOpcode != opFooter || length < fixedContentBytes) {
+        throw FourdgsMalformedFile(
+          'the final record before the closing magic is '
+          '${opcodeName(recordOpcode)} at byte $at with $length content bytes; '
+          'expected a Footer with at least $fixedContentBytes',
+        );
+      }
+      return (offset: at, length: length);
+    }
+    if (recordOpcode == opFooter) {
+      throw FourdgsMalformedFile(
+        'the Footer at byte $at is followed by another top-level record; the '
+        'Footer must be final',
+      );
+    }
+    at = end;
+  }
+  throw const FourdgsMalformedFile(
+    'the final record before the closing magic is not a framed Footer',
   );
 }
 

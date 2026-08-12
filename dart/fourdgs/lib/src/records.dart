@@ -170,6 +170,8 @@ const Set<String> _knownTemporalModels = <String>{
 };
 
 /// Opcode `0x02`. The tail pointer that makes the file seekable.
+const int footerFixedBytes = 20;
+
 class FourdgsFooter {
   const FourdgsFooter({
     required this.summaryStart,
@@ -211,6 +213,8 @@ class FourdgsQuantization {
     required this.stepSigmaLog,
     required this.stepSh,
     required this.bounds,
+    this.shBitDepths = const <int>[],
+    this.shBitDepthsMalformed = false,
   });
 
   final String scheme;
@@ -231,6 +235,16 @@ class FourdgsQuantization {
   final double stepSigmaLog;
   final int stepSh;
 
+  /// Per-band spherical-harmonic bit depths, band 1 first.
+  ///
+  /// This optional append follows the record's original fields. An empty list
+  /// therefore also represents a record written before the append existed.
+  final List<int> shBitDepths;
+
+  /// True when trailing bytes looked like an SH-depth append but were invalid.
+  /// Decoders keep the legacy empty-depth fallback; validators report it.
+  final bool shBitDepthsMalformed;
+
   /// Declared maximum deviation per attribute, as decimal strings.
   final Map<String, String> bounds;
 
@@ -249,6 +263,7 @@ class FourdgsQuantization {
     final steps = c.f64s(8);
     final stepSh = c.u8();
     final bounds = c.strMap();
+    final shDepths = _readShBitDepths(c);
     // `object_id` is an exact label (section 6.6), not a metric value, so there
     // is no meaningful error bound between two different labels — section 6.5
     // makes a bound for it a refusal rather than something to ignore.
@@ -286,8 +301,36 @@ class FourdgsQuantization {
       stepSigmaLog: steps[7],
       stepSh: stepSh,
       bounds: bounds,
+      shBitDepths: shDepths.depths,
+      shBitDepthsMalformed: shDepths.malformed,
     );
   }
+}
+
+/// Read the optional SH-depth append without claiming future trailing fields.
+///
+/// The declaration does not affect decoding. A short count or a value outside
+/// the registry's 3..8 range can therefore be bytes belonging to a later
+/// append, and is treated as absent rather than making an older reader reject a
+/// forward-compatible Quantization record.
+({List<int> depths, bool malformed}) _readShBitDepths(FourdgsCursor c) {
+  if (c.remaining < 1) return (depths: const <int>[], malformed: false);
+  final int at = c.pos;
+  final int count = c.u8();
+  if (count == 0) {
+    c.pos = at;
+    return (depths: const <int>[], malformed: false);
+  }
+  if (c.remaining < count) {
+    c.pos = at;
+    return (depths: const <int>[], malformed: true);
+  }
+  final List<int> depths = <int>[for (int i = 0; i < count; i++) c.u8()];
+  if (depths.any((int depth) => depth < 3 || depth > 8)) {
+    c.pos = at;
+    return (depths: const <int>[], malformed: true);
+  }
+  return (depths: depths, malformed: false);
 }
 
 /// Quantization schemes this build implements.
@@ -484,6 +527,32 @@ void refuseUnusableInterval(double t0, double t1, int at, String what) {
   }
 }
 
+/// How many bytes of a Chunk's content [parseChunkInterval] needs.
+///
+/// `t0`, `t1`, `level` and `count`, in that order and at fixed offsets, ahead of
+/// the first variable-length field.
+const int chunkFixedHeadBytes = 24;
+
+/// A Chunk's interval and count, from the first [chunkFixedHeadBytes] bytes.
+///
+/// For the caller that wants what a chunk *declares* without wanting what it
+/// holds — a validator counting gaussians across a scene, which then decodes
+/// each chunk separately and one at a time. [parseChunk] needs the whole record,
+/// and a chunk is where a file keeps its weight, so asking for the whole record
+/// to read four fields is how a validator comes to hold a scene it never decodes
+/// (AGENTS.md §1).
+({double t0, double t1, int level, int count}) parseChunkInterval(
+  Uint8List head, {
+  int fileOffset = 0,
+}) {
+  final c = FourdgsCursor(head);
+  final intervalAt = fileOffset + c.pos;
+  final t0 = c.f64();
+  final t1 = c.f64();
+  refuseUnusableInterval(t0, t1, intervalAt, 'Chunk');
+  return (t0: t0, t1: t1, level: c.u32(), count: c.u32());
+}
+
 FourdgsChunkBody parseChunk(Uint8List content) {
   final c = FourdgsCursor(content);
   final intervalAt = c.pos;
@@ -499,7 +568,14 @@ FourdgsChunkBody parseChunk(Uint8List content) {
     uncompressedSize: c.u64(),
   );
   final length = c.u64();
-  return FourdgsChunkBody(head, c.take(length), streamsOffset: c.pos - length);
+  final records = c.take(length);
+  if (head.compression.isEmpty && head.uncompressedSize != records.length) {
+    throw FourdgsMalformedFile(
+      'the uncompressed Chunk declares ${head.uncompressedSize} record bytes '
+      'but carries ${records.length}',
+    );
+  }
+  return FourdgsChunkBody(head, records, streamsOffset: c.pos - length);
 }
 
 /// A spherical-harmonic band's own byte range within the file.
@@ -879,13 +955,37 @@ FourdgsDeltaChunkBody parseDeltaChunk(Uint8List content) {
   // wanted alone — is reachable by stepping over two lengths.
   final blockLength = c.u64();
   final blockAt = c.pos;
-  final records = FourdgsCursor(c.take(blockLength));
+  final Uint8List block = c.take(blockLength);
+  if (head.compression.isNotEmpty) {
+    // Match ordinary Chunk handling: whole-block compression is a registry
+    // feature this pure-Dart decoder does not implement, so never reinterpret
+    // compressed bytes as raw group framing merely because they happen to fit.
+    throw FourdgsUnsupportedCodec(
+      'the Delta Chunk uses chunk-level "${head.compression}" compression, '
+      'which is not supported by this decoder',
+      refusalCode: refusalUnknownStreamCodec,
+    );
+  }
+  if (head.uncompressedSize != blockLength) {
+    throw FourdgsMalformedFile(
+      'the uncompressed Delta Chunk declares ${head.uncompressedSize} record '
+      'bytes but carries $blockLength',
+    );
+  }
+  final records = FourdgsCursor(block);
   final updates = records.take(records.u64());
   final updatesAt = records.pos - updates.length;
   final births = records.take(records.u64());
   final birthsAt = records.pos - births.length;
   final deaths = records.take(records.u64());
   final deathsAt = records.pos - deaths.length;
+  if (records.remaining != 0) {
+    throw FourdgsMalformedFile(
+      'the Delta Chunk records block has ${records.remaining} trailing bytes '
+      'after its update, birth, and death groups; expected exactly those '
+      'three length-framed groups',
+    );
+  }
   return FourdgsDeltaChunkBody(
     head,
     updates,
@@ -1155,6 +1255,15 @@ class FourdgsCamera {
       positions.add(c.f64s(3));
       targets.add(c.f64s(3));
     }
+    final interpolation = c.string();
+    final loopAt = fileOffset + c.pos;
+    final loop = c.u8();
+    if (loop > 1) {
+      throw FourdgsMalformedFile(
+        'the Camera record at byte $fileOffset carries loop value $loop at '
+        'byte $loopAt; expected 0 or 1',
+      );
+    }
     return FourdgsCamera(
       fovYDeg: fov,
       position: position,
@@ -1162,8 +1271,8 @@ class FourdgsCamera {
       times: times,
       positions: positions,
       targets: targets,
-      interpolation: c.string(),
-      loop: c.u8() != 0,
+      interpolation: interpolation,
+      loop: loop == 1,
     );
   }
 }
@@ -1633,10 +1742,15 @@ class FourdgsRigTrajectory {
     // Section 5.15.4: a trajectory with no samples "MUST be read as though the
     // record were absent", so reading one refuses nothing — not even an
     // interpolation byte outside the registry, which describes how to read
-    // samples it does not carry. `check` stays strict for the writer.
-    if (trajectory.times.isNotEmpty) {
-      trajectory.check();
-    }
+    // samples it does not carry.
+    //
+    // That carve-out is for the empty record only. A trajectory that does carry
+    // samples gets the whole of `check`, interpolation included: an unknown
+    // interpolation says how to read samples this record has, and a reader that
+    // accepts it either guesses or hands back poses nobody described. Calling
+    // `_checkSamples` alone here dropped that refusal for every trajectory,
+    // where Python (`records.py`) and Rust (`records.rs`) both refuse at parse.
+    if (trajectory.times.isNotEmpty) trajectory.check();
     return trajectory;
   }
 
@@ -1649,6 +1763,10 @@ class FourdgsRigTrajectory {
         '(step)',
       );
     }
+    _checkSamples();
+  }
+
+  void _checkSamples() {
     for (int i = 0; i < times.length; i++) {
       final t = times[i];
       if (!t.isFinite) {

@@ -61,6 +61,63 @@ const int opPrivateStart = 0x80;
 
 bool isPrivateOpcode(int opcode) => opcode >= opPrivateStart;
 
+/// The names in [_opcodeNames], plus the two ranges a reader steps over.
+///
+/// Character for character what `rust/fourdgs/src/opcode.rs` answers, because
+/// these names are what the inspect tables in six SDKs print for the same
+/// record. A row that reads `WindowTable` in one tool and `Window Table` in
+/// another is a diff a reader has to squint at before deciding it means nothing.
+String opcodeName(int opcode) {
+  final String? known = _opcodeNames[opcode];
+  if (known != null) return known;
+  final String hex = opcode.toRadixString(16).padLeft(2, '0').toUpperCase();
+  return isPrivateOpcode(opcode) ? 'Private(0x$hex)' : 'Unknown(0x$hex)';
+}
+
+const Map<int, String> _opcodeNames = <int, String>{
+  opHeader: 'Header',
+  opFooter: 'Footer',
+  opQuantization: 'Quantization',
+  opWindowTable: 'WindowTable',
+  opChunk: 'Chunk',
+  opAttributeStream: 'AttributeStream',
+  opShBandStream: 'ShBandStream',
+  opChunkIndex: 'ChunkIndex',
+  opAudio: 'Audio',
+  opCamera: 'Camera',
+  opMetadata: 'Metadata',
+  opStatistics: 'Statistics',
+  opAttachment: 'Attachment',
+  opAttachmentIndex: 'AttachmentIndex',
+  opSummaryOffset: 'SummaryOffset',
+  opDeltaChunk: 'DeltaChunk',
+  opAudioSource: 'Audio Source',
+  opAudioData: 'Audio Data',
+  opCoordinateFrame: 'CoordinateFrame',
+  opSensorCalibration: 'SensorCalibration',
+  opRigTrajectory: 'RigTrajectory',
+  opGeodeticAnchor: 'GeodeticAnchor',
+  opObjectTable: 'ObjectTable',
+  opObjectTrack: 'ObjectTrack',
+};
+
+/// True for the opcodes this version of the specification defines.
+///
+/// Everything else is either the application range or a record from a revision
+/// this build does not implement, and both are skipped rather than refused.
+bool isSpecifiedOpcode(int opcode) => _opcodeNames.containsKey(opcode);
+
+/// True when a specified opcode is itself a top-level record.
+///
+/// Attribute Stream is an embedded structure inside a Chunk or delta group,
+/// and Attachment Index remains reserved with an explicit writer prohibition.
+/// Keeping their registry names is useful to inspection output; it does not
+/// make either legal in the outer record sequence.
+bool isLegalTopLevelOpcode(int opcode) =>
+    isSpecifiedOpcode(opcode) &&
+    opcode != opAttributeStream &&
+    opcode != opAttachmentIndex;
+
 // Attribute ids carried by Attribute Stream records.
 const int attrPosition = 0;
 const int attrScale = 1;
@@ -86,6 +143,14 @@ const int attrGaussianId = 13;
 /// / unassigned. Optional: a chunk without it carries gaussians that belong to
 /// no object.
 const int attrObjectId = 14;
+
+/// The first and last id of the reserved extension pool, registry §"Attribute
+/// ids". Ids 15–63 are reserved and a version-1 writer MUST NOT emit them; ids
+/// 64–127 are private and application-defined. A reader skips both the same
+/// way, by `payload_length`, which is what forward compatibility requires — but
+/// only one of the two is a file a conformance validator should accept.
+const int attrReservedFirst = 15;
+const int attrReservedLast = 63;
 
 /// Ids every chunk must carry. 11 and 12 are optional producer-side identities
 /// and readers that do not need them skip the streams.
