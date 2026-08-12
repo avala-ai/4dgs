@@ -57,7 +57,7 @@ jobs:
           echo "rust: ${size_kb} KiB"
           [ "$size_kb" -le 1100 ] || { echo "::error::rust is ${size_kb} KiB, over the 1100 KiB budget"; exit 1; }
 
-      - name: TypeScript sources under 896 KB
+      - name: TypeScript sources under 960 KB
         # Sources only: this job installs nothing and builds nothing, so node_modules
         # and dist are not here to measure. A vendored dependency would show up as a
         # budget failure, which is the point.
@@ -92,10 +92,13 @@ jobs:
         # checks, timeline coverage outside the decode gate, Delta Chunk SH validation,
         # summary/depth diagnostics, and the regressions that pin those rules. The prior
         # review pass already measured 848 KiB against 832 before these follow-ups.
+        # Raised from 896 to 960 KiB after that same review layer measured 900 KiB in CI,
+        # before its final four bounded-validation fixes. Those fixes add no source file;
+        # the completed layer measures 904 KiB, leaving the usual deliberate headroom.
         run: |
           size_kb=$(du -s typescript | cut -f1)
           echo "typescript: ${size_kb} KiB"
-          [ "$size_kb" -le 896 ] || { echo "::error::typescript is ${size_kb} KiB, over the 896 KiB budget"; exit 1; }
+          [ "$size_kb" -le 960 ] || { echo "::error::typescript is ${size_kb} KiB, over the 960 KiB budget"; exit 1; }
       - name: Dart sources under 768 KB
         # Sources only, same as TypeScript's and Swift's: this job builds nothing, so
         # .dart_tool and the compiled runners are not here to measure, and a vendored

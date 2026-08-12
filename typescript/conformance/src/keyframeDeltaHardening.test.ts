@@ -31,7 +31,6 @@ import {
   keyframeDeltaStatesJson,
   reconstructKeyframeDelta,
   keyframeDeltaValidationRecordOffset,
-  iterateRecords,
   parseChunkIndexEntry,
   DEFAULT_CODECS,
   lifeClass,

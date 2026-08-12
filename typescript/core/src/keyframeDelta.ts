@@ -54,7 +54,6 @@ import {
   muStep,
   rctInverse,
   supportK,
-  type Steps,
 } from "./quantization.js";
 import {
   DELTA_MODE_CHAINED,
@@ -1181,7 +1180,7 @@ export async function validateKeyframeDeltaStreamed(
     intervals.push({ t0: next.t0, t1: next.t1, offset });
   };
   const rememberWindowIndices = (state: KeyframeDeltaState, offset: number): void => {
-    const column = state.column(Attribute.WindowIndex);
+    const column = binsOf(state).get(Attribute.WindowIndex);
     if (column === undefined) return;
     for (const value of column.values) {
       if (value < 0) {

@@ -179,6 +179,18 @@ function resealSummary(data: Uint8Array, shift = 0): Uint8Array {
   return data;
 }
 
+/** Frame a summary-free, indexless file from already-framed top-level records. */
+function indexlessFile(records: readonly Uint8Array[]): Uint8Array {
+  const parts = [MAGIC, ...records, framedRecord(Opcode.Footer, new Uint8Array(20)), MAGIC];
+  const out = new Uint8Array(parts.reduce((size, part) => size + part.length, 0));
+  let at = 0;
+  for (const part of parts) {
+    out.set(part, at);
+    at += part.length;
+  }
+  return out;
+}
+
 /**
  * `4dgs validate <file>` in its own process: the lines it printed and the code it exited
  * with, which are the two things the next person to break one of these will see.
@@ -668,6 +680,55 @@ test("regression: --decode revisits Chunks that precede Quantization", async (t)
   assert.equal(report.refused?.at, shiftedChunkOffset);
 });
 
+test("regression: --decode waits for a Window Table that follows the Chunks", async (t) => {
+  const variant = "TenWindows-UseChunkIndex-UseCrc";
+  if (corpus(variant) === null) return t.skip("corpus not generated");
+  const original = bytesOf(variant);
+  const records = [...iterateRecords(original, MAGIC.length)];
+  const window = records.find((record) => record.opcode === Opcode.WindowTable)!.raw.slice();
+  const body = records
+    .filter(
+      (record) =>
+        record.opcode !== Opcode.WindowTable &&
+        record.opcode !== Opcode.ChunkIndex &&
+        record.opcode !== Opcode.Statistics &&
+        record.opcode !== Opcode.SummaryOffset &&
+        record.opcode !== Opcode.Footer,
+    )
+    .map((record) => record.raw.slice());
+  const report = await validateFile(indexlessFile([...body, window]), { decode: true });
+  assert.equal(report.refused, null);
+  assert.equal(report.ok, true, report.findings.map((finding) => finding.message).join("\n"));
+});
+
+test("regression: an oversized compression name is a validator resource limit", async (t) => {
+  const variant = "TenWindows-UseChunkIndex-UseCrc";
+  if (corpus(variant) === null) return t.skip("corpus not generated");
+  const original = bytesOf(variant);
+  const chunk = recordsOf(original).find((record) => record.opcode === Opcode.Chunk)!;
+  const nameLengthAt = chunk.offset + RECORD_HEADER_BYTES + 24;
+  const oldView = new DataView(original.buffer, original.byteOffset, original.byteLength);
+  const oldLength = oldView.getUint32(nameLengthAt, true);
+  const limitCrossingLength = 4097;
+  const added = limitCrossingLength - oldLength;
+  assert.ok(added > 0);
+  const changed = splice(original, nameLengthAt + 4 + oldLength, new Uint8Array(added));
+  const view = new DataView(changed.buffer, changed.byteOffset, changed.byteLength);
+  view.setUint32(nameLengthAt, limitCrossingLength, true);
+  view.setBigUint64(
+    chunk.offset + 1,
+    view.getBigUint64(chunk.offset + 1, true) + BigInt(added),
+    true,
+  );
+  await assert.rejects(
+    () => validateFile(changed),
+    (error: unknown) =>
+      error instanceof RangeError &&
+      error.message.includes("bounded-memory string limit") &&
+      error.message.includes("not a malformed-file verdict"),
+  );
+});
+
 test("regression: keyframe-delta index metadata is checked without and with decoding", async () => {
   const original = new Uint8Array(Buffer.from(MOVING_CHAINED, "base64"));
   const records = [...iterateRecords(original, MAGIC.length)];
@@ -718,6 +779,35 @@ test("regression: keyframe-delta index metadata is checked without and with deco
       finding.message.includes("keyframe-delta timeline does not tile the scene clock"),
     ),
     timelineReport.findings.map((finding) => finding.message).join("\n"),
+  );
+});
+
+test("regression: indexless delta references are checked without decoding", async () => {
+  const original = new Uint8Array(Buffer.from(MOVING_CHAINED, "base64"));
+  const body = [...iterateRecords(original, MAGIC.length)]
+    .filter(
+      (record) =>
+        record.opcode !== Opcode.ChunkIndex &&
+        record.opcode !== Opcode.Statistics &&
+        record.opcode !== Opcode.SummaryOffset &&
+        record.opcode !== Opcode.Footer,
+    )
+    .map((record) => record.raw.slice());
+  const indexless = indexlessFile(body);
+  const delta = recordsOf(indexless).find((record) => record.opcode === Opcode.DeltaChunk)!;
+  new DataView(indexless.buffer, indexless.byteOffset, indexless.byteLength).setBigUint64(
+    delta.offset + RECORD_HEADER_BYTES + 21,
+    BigInt(delta.offset + delta.length),
+    true,
+  );
+  const report = await validateFile(indexless);
+  assert.ok(
+    report.findings.some(
+      (finding) =>
+        finding.message.includes(`Delta Chunk at ${delta.offset} references`) &&
+        finding.message.includes("not an earlier physical state chunk"),
+    ),
+    report.findings.map((finding) => finding.message).join("\n"),
   );
 });
 
@@ -1589,6 +1679,33 @@ test("regression: indexed opening discovers legal legacy Audio after a Chunk", a
   assert.ok(
     reads.some((read) => read.offset === lateAudio.offset),
     "the audio accessor did not discover the late Audio record",
+  );
+});
+
+test("regression: deferred indexed discovery rejects modern audio after state", async (t) => {
+  const variant = "OneWindow-UseChunkIndex-UseCrc-WithSpatialAudio";
+  if (corpus(variant) === null) return t.skip("corpus not generated");
+  const original = bytesOf(variant);
+  const records = [...iterateRecords(original, MAGIC.length)];
+  const audio = records
+    .filter((record) => record.opcode === Opcode.AudioSource || record.opcode === Opcode.AudioData)
+    .map((record) => record.raw.slice());
+  const state = records
+    .filter(
+      (record) =>
+        record.opcode !== Opcode.AudioSource &&
+        record.opcode !== Opcode.AudioData &&
+        record.opcode !== Opcode.ChunkIndex &&
+        record.opcode !== Opcode.Statistics &&
+        record.opcode !== Opcode.SummaryOffset &&
+        record.opcode !== Opcode.Footer,
+    )
+    .map((record) => record.raw.slice());
+  const late = indexlessFile([...state, ...audio]);
+  const opened = await IndexedDecoder.open(new BytesReadable(late), { headProbeBytes: 64 });
+  await assert.rejects(
+    () => opened.readAudioSources(),
+    /Audio Source id \d+ appears after the first Chunk/,
   );
 });
 

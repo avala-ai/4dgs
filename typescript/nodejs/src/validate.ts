@@ -246,13 +246,6 @@ export async function validateFile(
     decoded: boolean;
   } | null = null;
   const decodedShDegrees = new Set<number>();
-  let frozenDecodeOptions: {
-    readonly header: Header;
-    readonly quantization: Quantization;
-    readonly windows: Float64Array;
-  } | null = null;
-  let decodeOptionsFrozen = false;
-  let deferChunkDecode = false;
 
   try {
     for await (const framed of scanner.records(MAGIC.length)) {
@@ -398,33 +391,15 @@ export async function validateFile(
           physicalBands.set(offset, []);
           currentChunkOffset = offset;
           firstChunkSeen = true;
-          if (options.decode === true && !decodeOptionsFrozen && !deferChunkDecode) {
-            if (header === null || quantization === null) {
-              // Record order is intentionally loose: only Header, Footer, and the summary
-              // have normative positions. Once one Chunk arrives before its decode grid,
-              // decode every Chunk in a second bounded pass after the walk has found that
-              // grid. Freezing `null` here used to skip every stream in the file.
-              deferChunkDecode = true;
-            } else {
-              frozenDecodeOptions = {
-                header,
-                quantization,
-                windows: windows ?? new Float64Array(0),
-              };
-              decodeOptionsFrozen = true;
-            }
-          }
           chunkCount += 1;
           let parsed;
           try {
-            parsed =
-              options.decode === true
-                ? parseChunk(await scanner.content(framed))
-                : {
-                    header: await parseChunkRecordHeader(source, framed),
-                    streams: new Uint8Array(),
-                  };
+            parsed = {
+              header: await parseChunkRecordHeader(source, framed),
+              streams: new Uint8Array(),
+            };
           } catch (error) {
+            if (error instanceof RangeError) throw error;
             found.error(`chunk ${chunkCount} does not parse: ${message(error)}`);
             break;
           }
@@ -470,27 +445,6 @@ export async function validateFile(
                 "select them",
             );
           }
-          if (
-            options.decode === true &&
-            !deferChunkDecode &&
-            frozenDecodeOptions !== null &&
-            frozenDecodeOptions.header.temporalModel !== "keyframe-delta"
-          ) {
-            try {
-              const bytes = await chunkStreamBytes(parsed, DEFAULT_CODECS);
-              await decodeChunkStreams(bytes, parsed.header.count, {
-                steps: stepsFrom(frozenDecodeOptions.quantization),
-                posOrigin: frozenDecodeOptions.quantization.posOrigin,
-                windows: windowTableOrDefault(frozenDecodeOptions.windows),
-                supportK: supportK(frozenDecodeOptions.header.cutoff || DEFAULT_CUTOFF),
-                codecs: DEFAULT_CODECS,
-              });
-              decodedShChunk.decoded = parsed.header.count > 0;
-            } catch (error) {
-              found.error(`chunk ${chunkCount} does not decode: ${message(error)}`);
-              found.refuse(error, offset, "the Chunk record");
-            }
-          }
           break;
         }
         case Opcode.DeltaChunk: {
@@ -509,6 +463,7 @@ export async function validateFile(
                     records: new Uint8Array(),
                   };
           } catch (error) {
+            if (error instanceof RangeError) throw error;
             found.error(`Delta Chunk at byte ${offset} does not parse: ${message(error)}`);
             break;
           }
@@ -782,7 +737,6 @@ export async function validateFile(
 
   if (
     options.decode === true &&
-    deferChunkDecode &&
     header !== null &&
     quantization !== null &&
     header.temporalModel !== "keyframe-delta"
@@ -1078,6 +1032,13 @@ export async function validateFile(
   });
 
   checkKeyframeDeltaIndexChains(index, found, header?.temporalModel === "keyframe-delta");
+  if (index.length === 0) {
+    checkKeyframeDeltaPhysicalChains(
+      physicalChunks,
+      found,
+      header?.temporalModel === "keyframe-delta",
+    );
+  }
 
   // An index is a one-for-one description of the physical Chunk records, not merely a
   // collection of individually valid pointers. Missing and duplicate entries both make
@@ -1348,6 +1309,78 @@ function checkKeyframeDeltaIndexChains(
       kind: entry.kind,
     });
     previousOffset = entry.chunkOffset;
+  }
+}
+
+/** Validate the fixed state-record chain when no Chunk Index duplicates that metadata. */
+function checkKeyframeDeltaPhysicalChains(
+  chunks: ReadonlyMap<
+    number,
+    {
+      readonly opcode: number;
+      readonly header: ChunkHeader | DeltaChunkHeader;
+    }
+  >,
+  found: Findings,
+  keyframeDelta: boolean,
+): void {
+  if (!keyframeDelta) return;
+  const ordered = [...chunks.entries()].sort(([a], [b]) => a - b);
+  const derived = new Map<number, { depth: number; keyframeOffset: number; kind: number }>();
+  let previousOffset: number | null = null;
+  for (const [offset, chunk] of ordered) {
+    if (chunk.opcode === Opcode.Chunk) {
+      derived.set(offset, { depth: 0, keyframeOffset: offset, kind: 0 });
+      previousOffset = offset;
+      continue;
+    }
+
+    const delta = chunk.header as DeltaChunkHeader;
+    const reference = derived.get(delta.referenceOffset);
+    if (reference === undefined) {
+      found.error(
+        `the Delta Chunk at ${offset} references ${delta.referenceOffset}, which is not an ` +
+          "earlier physical state chunk",
+      );
+      previousOffset = offset;
+      continue;
+    }
+    if (delta.deltaMode === DELTA_MODE_KEYFRAME && reference.kind !== 0) {
+      found.error(
+        `the keyframe-referenced Delta Chunk at ${offset} references ${delta.referenceOffset}, ` +
+          "which is itself a delta",
+      );
+    } else if (delta.deltaMode === DELTA_MODE_CHAINED && previousOffset !== delta.referenceOffset) {
+      found.error(
+        `the chained Delta Chunk at ${offset} references ${delta.referenceOffset}; the ` +
+          `immediately preceding state is at ${previousOffset}`,
+      );
+    } else if (delta.deltaMode !== DELTA_MODE_KEYFRAME && delta.deltaMode !== DELTA_MODE_CHAINED) {
+      found.error(
+        `the Delta Chunk at ${offset} declares delta_mode ${delta.deltaMode}; expected ` +
+          `${DELTA_MODE_KEYFRAME} (keyframe) or ${DELTA_MODE_CHAINED} (chained)`,
+      );
+    }
+
+    const expectedDepth = reference.depth + 1;
+    if (delta.depth !== expectedDepth) {
+      found.error(
+        `the Delta Chunk at ${offset} declares depth ${delta.depth}, but its reference chain ` +
+          `walks ${expectedDepth} delta chunks`,
+      );
+    }
+    if (delta.keyframeOffset !== reference.keyframeOffset) {
+      found.error(
+        `the Delta Chunk at ${offset} declares keyframe_offset ${delta.keyframeOffset}, but ` +
+          `its reference chain reaches ${reference.keyframeOffset}`,
+      );
+    }
+    derived.set(offset, {
+      depth: expectedDepth,
+      keyframeOffset: reference.keyframeOffset,
+      kind: 1,
+    });
+    previousOffset = offset;
   }
 }
 
@@ -1799,8 +1832,9 @@ async function boundedStringAt(
   ).u32();
   at += 4;
   if (length > VALIDATION_STRING_BYTES) {
-    throw new MalformedFile(
-      `${field} declares ${length} bytes, past the ${VALIDATION_STRING_BYTES}-byte string ceiling`,
+    throw new RangeError(
+      `${field} declares ${length} bytes, past this tool's ${VALIDATION_STRING_BYTES}-byte ` +
+        "bounded-memory string limit; this is not a malformed-file verdict",
     );
   }
   const bytes = await fixedRecordBytes(source, at, length, end, field);

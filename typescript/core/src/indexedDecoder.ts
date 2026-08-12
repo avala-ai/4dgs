@@ -449,9 +449,12 @@ export class IndexedDecoder {
       };
     const provenanceRanges: ProvenanceRange[] = [];
     const retainOptionalRecord = optionalRecordBudget(this.maxDeferredRecords);
+    let stateDataSeen = false;
 
     for await (const record of scanner.records(MAGIC.length)) {
-      if (record.opcode === Opcode.Audio) {
+      if (record.opcode === Opcode.Chunk || record.opcode === Opcode.DeltaChunk) {
+        stateDataSeen = true;
+      } else if (record.opcode === Opcode.Audio) {
         if (legacyAudio !== null) {
           throw new MalformedFile("the file carries more than one legacy Audio record");
         }
@@ -463,6 +466,9 @@ export class IndexedDecoder {
         );
       } else if (record.opcode === Opcode.AudioSource) {
         const sourceId = readSourceId(await scanner.content(record, 4), "Audio Source");
+        if (stateDataSeen) {
+          throw new MalformedFile(`Audio Source id ${sourceId} appears after the first Chunk`);
+        }
         if (sourceRanges.has(sourceId)) {
           throw new MalformedFile(`Audio Source id ${sourceId} appears more than once`);
         }
@@ -472,6 +478,9 @@ export class IndexedDecoder {
         const prefix = new Cursor(await scanner.content(record, 12));
         const sourceId = prefix.u32();
         const dataLength = prefix.u64();
+        if (stateDataSeen) {
+          throw new MalformedFile(`Audio Data id ${sourceId} appears after the first Chunk`);
+        }
         if (dataRanges.has(sourceId)) {
           throw new MalformedFile(`Audio Data id ${sourceId} appears more than once`);
         }
