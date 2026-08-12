@@ -178,6 +178,14 @@ def test_keyframe_delta_variants_retain_an_untouched_common_row():
     for name, data, _ in generate.build_keyframe_delta_corpus():
         if name.startswith("KeyframeOnly"):
             continue
+        # `KeyframeDeltaMultiWindow` drifts every row's position and rotation at every
+        # step, by construction: it exists to prove the validity-window gate on a
+        # population where nothing but the window can remove a gaussian from a probe, so
+        # it has no untouched row to keep and cannot carry this claim. The claim is about
+        # the corpus rather than about each variant, and the three variants above still
+        # make it — a decoder that drops untouched identities still fails here.
+        if name.startswith("KeyframeDeltaMultiWindow"):
+            continue
         decoded = kdf.decode_streamed(data)
         deltas = [chunk for chunk in decoded.chunks if chunk.kind == 1]
         assert deltas, name
