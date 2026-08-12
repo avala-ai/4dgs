@@ -274,7 +274,16 @@ def validate(data: bytes) -> Report:
                 first_opcode = record.opcode
             seen.add(record.opcode)
             if record.opcode == op.HEADER:
-                header = rec.Header.parse(record.content)
+                # Decoded, then checked, rather than parsed-or-raised. `Header.parse`
+                # refuses an out-of-range `sh_degree`, which is right for a reader and
+                # wrong here: this loop is the validator's only pass over the records,
+                # and letting that refusal out of it abandoned every finding after the
+                # first record — then reported "no Header record", "no Quantization
+                # record" and "no Footer record" about three records the file carries.
+                header = rec.Header.decode_fields(record.content)
+                problem = header.sh_degree_problem()
+                if problem is not None:
+                    report.error(problem)
             elif record.opcode == op.QUANTIZATION:
                 quant = rec.Quantization.parse(record.content)
                 # Checked here, as the record is met, rather than once at the end on

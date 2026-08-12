@@ -265,6 +265,23 @@ class TestRefusals:
 
         assert not any("a seeking reader cannot open this file" in m for m in errors(report))
 
+    def test_an_out_of_range_sh_degree_does_not_abandon_the_walk(self):
+        """A reader refuses such a Header and stops. A validator has one pass.
+
+        `Header.parse` raising out of the record loop left `header`, `quant` and `footer`
+        all unset, so the report carried three "no X record" errors about records the
+        file plainly holds, and lost every finding after the first record.
+        """
+        head = rec.Header(duration_sec=1.0, gaussian_count=0, aabb=[0.0] * 6)
+        head.sh_degree = 4
+        data = MAGIC + head.encode() + rec.Footer().encode() + MAGIC
+
+        report = validate(data)
+
+        assert any("sh_degree 4" in m for m in errors(report))
+        assert not any("no Header record" in m for m in errors(report))
+        assert not any("no Footer record" in m for m in errors(report))
+
     def test_a_non_finite_quantization_step_is_an_error(self):
         # Spec §5.3: every step and origin must be finite. This is the corrupt field that
         # ruins every gaussian rather than one — each bin times an infinite step decodes to

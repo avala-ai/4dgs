@@ -80,8 +80,25 @@ class Header:
 
     @staticmethod
     def parse(content) -> Header:
+        header = Header.decode_fields(content)
+        problem = header.sh_degree_problem()
+        if problem is not None:
+            raise MalformedFile(problem)
+        return header
+
+    @staticmethod
+    def decode_fields(content) -> Header:
+        """The fields, without the range checks `parse` refuses on.
+
+        A reader refuses such a file and stops, which is right. A *validator* has one
+        walk over the records and wants to say everything true about the file, so it
+        needs the Header it just read even when one of its fields is out of range —
+        otherwise a single bad `sh_degree` aborts the walk and the report says "no
+        Header record" about a Header sitting on disk, plus the same about the
+        Quantization and Footer records the loop never reached.
+        """
         c = Cursor(content)
-        header = Header(
+        return Header(
             profile=c.string(),
             library=c.string(),
             duration_sec=c.f64(),
@@ -93,9 +110,12 @@ class Header:
             flags=c.u8(),
             attributes=c.str_map(),
         )
-        if not 0 <= header.sh_degree <= 3:
-            raise MalformedFile(f"the Header declares sh_degree {header.sh_degree}; version 1 defines 0 through 3")
-        return header
+
+    def sh_degree_problem(self) -> str | None:
+        """The refusal `sh_degree` earns, or `None`. Shared so both spellings agree."""
+        if not 0 <= self.sh_degree <= 3:
+            return f"the Header declares sh_degree {self.sh_degree}; version 1 defines 0 through 3"
+        return None
 
 
 @dataclass

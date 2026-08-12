@@ -1557,7 +1557,13 @@ def scan_streamed(
         if band_owner is None:
             return
         if declared_degree is not None:
-            wanted = list(range(1, declared_degree + 1))
+            # Bands ride with the gaussians whose coefficients they carry: a keyframe's
+            # population, and a delta's *births* (§5.18, "a born gaussian's spherical
+            # harmonics ride in SH Band Stream records following this Delta Chunk").
+            # A delta that only updates and kills births nothing, so it has no
+            # coefficients to put in a band and conformingly emits none. Requiring the
+            # full set after it refused a legal file that Swift accepts.
+            wanted = list(range(1, declared_degree + 1)) if band_rows else []
             if len(set(bands)) != len(bands) or set(bands) != set(wanted):
                 raise MalformedFile(
                     f"the state chunk at {band_owner} is followed by SH bands {bands}; "
