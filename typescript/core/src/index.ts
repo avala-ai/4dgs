@@ -111,6 +111,7 @@ export {
   type Statistics,
   type SummaryOffset,
   BACKGROUND_OBJECT,
+  bytesEqual,
   checkCoordinateFrame,
   checkGeodeticAnchor,
   checkMagic,
@@ -200,11 +201,15 @@ export {
 
 export {
   MAX_SH_DEGREE,
+  SH_MAX_BITS,
+  SH_MIN_BITS,
   type ShCoefficients,
   bandCoefficientRange,
   coefficientsForDegree,
   coefficientsInBand,
   mergeBands,
+  shBound,
+  shStep,
 } from "./sh.js";
 
 export {
@@ -230,6 +235,8 @@ export { type AudioPayloadChunk, type DecodeOptions, type Scene, decodeScene } f
 
 export {
   HEAD_PROBE_BYTES,
+  MAX_DEFERRED_RECORDS,
+  MAX_FRONT_MATTER_BYTES,
   IndexedDecoder,
   type IndexedChunk,
   type OpenIndexedOptions,
@@ -254,6 +261,8 @@ export {
   decodeKeyframeDeltaIndexed,
   decodeKeyframeDeltaStreamed,
   keyframeDeltaChunkAt,
+  keyframeDeltaValidationRecordOffset,
+  validateKeyframeDeltaStreamed,
   keyframeDeltaStatesJson,
   reconstructKeyframeDelta,
 } from "./keyframeDelta.js";

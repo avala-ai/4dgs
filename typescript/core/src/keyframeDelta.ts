@@ -58,6 +58,7 @@ import {
 import {
   DELTA_MODE_CHAINED,
   FOOTER_TAIL_BYTES,
+  DELTA_MODE_KEYFRAME,
   MAGIC,
   RECORD_HEADER_BYTES,
   type ChunkIndexEntry,
@@ -79,7 +80,7 @@ import {
   parseWindowTable,
   readRecord,
 } from "./records.js";
-import type { IReadable } from "./readable.js";
+import { BytesReadable, type IReadable } from "./readable.js";
 import { Opcode } from "./opcodes.js";
 import { coefficientsInBand, mergeBands, type ShCoefficients } from "./sh.js";
 import { decodeStream, frameOneStream, frameStreams, type RawStream } from "./streams.js";
@@ -94,6 +95,30 @@ import { decodeStream, frameOneStream, frameStreams, type RawStream } from "./st
  */
 export const KEYFRAME_DELTA_BIN_MIN = -2147483648;
 export const KEYFRAME_DELTA_BIN_MAX = 2147483647;
+
+/**
+ * Validation retains only interval endpoints, never decoded states, but even that metadata
+ * needs a hard ceiling when records come from an untrusted stream. This is the same practical
+ * ceiling the other SDKs place on a Chunk Index: large enough for more than two days at 30 fps,
+ * and small enough to size before accepting another entry.
+ */
+const MAX_VALIDATION_INTERVALS = 262_144;
+
+const validationRecordOffsets = new WeakMap<object, number>();
+
+function attachValidationRecordOffset(error: unknown, offset: number): void {
+  if ((typeof error === "object" && error !== null) || typeof error === "function") {
+    validationRecordOffsets.set(error, offset);
+  }
+}
+
+/** The state-record byte at which streamed keyframe-delta validation refused a file. */
+export function keyframeDeltaValidationRecordOffset(error: unknown): number | undefined {
+  if ((typeof error !== "object" || error === null) && typeof error !== "function") {
+    return undefined;
+  }
+  return validationRecordOffsets.get(error);
+}
 
 /**
  * Attributes a delta's update group MUST NOT carry. The per-gaussian grids for velocity
@@ -1082,6 +1107,255 @@ export async function decodeKeyframeDeltaStreamed(
   return { header, quantization, windows, chunks };
 }
 
+/**
+ * Decode and check a keyframe-delta stream without retaining reconstructed timeline rows.
+ *
+ * Validation needs the same composition rules as the public decoder but not its sequence
+ * result. It retains only the GOP keyframe and immediately previous state; interval metadata
+ * has a fixed ceiling, and identity metadata is bounded by the Header's declared population.
+ */
+export async function validateKeyframeDeltaStreamed(
+  input: IReadable | Uint8Array,
+  codecs: CodecRegistry = DEFAULT_CODECS,
+  onState?: ((offset: number, liveCount: number) => void) | undefined,
+): Promise<number> {
+  const source = input instanceof Uint8Array ? new BytesReadable(input) : input;
+  const sizeBig = await source.size();
+  if (sizeBig > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new RangeError(`keyframe-delta resource size ${sizeBig} exceeds 2^53`);
+  }
+  const size = Number(sizeBig);
+  const scanner = new FrontMatterScanner(source, size, 64 * 1024);
+  checkMagic(await scanner.head(MAGIC.length));
+
+  let header: Header | null = null;
+  let windows = new Float64Array(0);
+  const intervals: (Interval & { readonly offset: number })[] = [];
+  const identities = new Map<
+    number,
+    { firstT0: number; lastT0: number; count: number; lastOffset: number }
+  >();
+  let largestWindowIndex: { value: number; offset: number } | null = null;
+  interface RetainedState {
+    readonly offset: number;
+    readonly state: KeyframeDeltaState;
+    readonly level: number;
+    readonly depth: number;
+  }
+  let gopKeyframe: RetainedState | null = null;
+  let previousState: RetainedState | null = null;
+
+  const remember = (state: KeyframeDeltaState, interval: Interval, offset: number): void => {
+    for (const id of state.ids) {
+      const lifetime = identities.get(id);
+      if (lifetime === undefined) {
+        identities.set(id, {
+          firstT0: interval.t0,
+          lastT0: interval.t0,
+          count: 1,
+          lastOffset: offset,
+        });
+      } else {
+        lifetime.firstT0 = Math.min(lifetime.firstT0, interval.t0);
+        if (interval.t0 >= lifetime.lastT0) {
+          lifetime.lastT0 = interval.t0;
+          lifetime.lastOffset = offset;
+        }
+        lifetime.count += 1;
+      }
+      if (header !== null && identities.size > header.gaussianCount) {
+        throw new MalformedFile(
+          `keyframe-delta states introduce more than the Header's ` +
+            `${header.gaussianCount} distinct gaussian ids`,
+        );
+      }
+    }
+  };
+  const rememberInterval = (next: Interval, offset: number): void => {
+    if (intervals.length >= MAX_VALIDATION_INTERVALS) {
+      throw new RangeError(
+        `keyframe-delta validation exceeds the ${MAX_VALIDATION_INTERVALS}-state-chunk limit`,
+      );
+    }
+    intervals.push({ t0: next.t0, t1: next.t1, offset });
+  };
+  const rememberWindowIndices = (state: KeyframeDeltaState, offset: number): void => {
+    const column = binsOf(state).get(Attribute.WindowIndex);
+    if (column === undefined) return;
+    for (const value of column.values) {
+      if (value < 0) {
+        checkWindowIndex(value, 1, `state chunk at ${offset}`);
+      }
+      if (largestWindowIndex === null || value > largestWindowIndex.value) {
+        largestWindowIndex = { value, offset };
+      }
+    }
+  };
+
+  for await (const record of scanner.records(MAGIC.length)) {
+    try {
+      if (record.opcode === Opcode.Header) {
+        header = parseHeader(await scanner.content(record));
+        if (header.temporalModel !== "keyframe-delta") {
+          throw new MalformedFile(
+            `validateKeyframeDeltaStreamed is the keyframe-delta path; this file is ` +
+              `"${header.temporalModel}"`,
+          );
+        }
+      } else if (record.opcode === Opcode.WindowTable) {
+        windows = parseWindowTable(await scanner.content(record));
+      } else if (record.opcode === Opcode.Chunk) {
+        if (header === null) {
+          throw new MalformedFile(`keyframe chunk at ${record.offset} precedes the Header record`);
+        }
+        const content = await scanner.content(record);
+        const parsed = parseChunk(content);
+        if (parsed.header.count > header.gaussianCount) {
+          throw new MalformedFile(
+            `keyframe chunk at ${record.offset} declares ${parsed.header.count} gaussians, more ` +
+              `than the Header's ${header.gaussianCount} distinct gaussian ids`,
+          );
+        }
+        const decoded = await keyframeFromChunk(content, codecs);
+        const state = keyframeState(decoded.ids, decoded.bins);
+        if (state.count !== parsed.header.count) {
+          throw new MalformedFile(
+            `keyframe chunk at ${record.offset} declares ${parsed.header.count} gaussians; ` +
+              `its decoded attribute streams carry ${state.count}`,
+          );
+        }
+        // A keyframe begins a new GOP. A conforming later delta can address this keyframe or
+        // the immediately previous state, never an obsolete state from the current GOP.
+        const retained = {
+          offset: record.offset,
+          state,
+          level: parsed.header.level,
+          depth: 0,
+        };
+        gopKeyframe = retained;
+        previousState = retained;
+        onState?.(record.offset, state.count);
+        remember(state, parsed.header, record.offset);
+        rememberWindowIndices(state, record.offset);
+        rememberInterval(parsed.header, record.offset);
+      } else if (record.opcode === Opcode.DeltaChunk) {
+        if (header === null) {
+          throw new MalformedFile(`delta chunk at ${record.offset} precedes the Header record`);
+        }
+        const parsed = parseDeltaChunk(await scanner.content(record));
+        const groupCount =
+          parsed.header.updateCount + parsed.header.birthCount + parsed.header.deathCount;
+        if (!Number.isSafeInteger(groupCount) || groupCount > header.gaussianCount) {
+          throw new MalformedFile(
+            `delta chunk at ${record.offset} declares ${groupCount} ids across its groups, more ` +
+              `than the Header's ${header.gaussianCount} distinct gaussian ids`,
+          );
+        }
+        if (parsed.header.referenceOffset >= record.offset) {
+          throw new MalformedFile(
+            `delta chunk at ${record.offset} references ${parsed.header.referenceOffset}, which ` +
+              `is not behind it`,
+          );
+        }
+        let reference: RetainedState | null;
+        if (parsed.header.deltaMode === DELTA_MODE_KEYFRAME) {
+          reference = gopKeyframe;
+        } else if (parsed.header.deltaMode === DELTA_MODE_CHAINED) {
+          reference = previousState;
+        } else {
+          throw new MalformedFile(
+            `delta chunk at ${record.offset} declares delta_mode ` +
+              `${parsed.header.deltaMode}; expected ${DELTA_MODE_KEYFRAME} (keyframe) or ` +
+              `${DELTA_MODE_CHAINED} (chained)`,
+          );
+        }
+        if (reference === null || parsed.header.referenceOffset !== reference.offset) {
+          const expected = reference === null ? "a preceding state" : String(reference.offset);
+          throw new MalformedFile(
+            `delta chunk at ${record.offset} references ${parsed.header.referenceOffset}; its ` +
+              `delta_mode requires ${expected}`,
+          );
+        }
+        if (gopKeyframe === null || parsed.header.keyframeOffset !== gopKeyframe.offset) {
+          const expected =
+            gopKeyframe === null ? "a preceding keyframe" : String(gopKeyframe.offset);
+          throw new MalformedFile(
+            `delta chunk at ${record.offset} declares keyframe_offset ` +
+              `${parsed.header.keyframeOffset}; expected ${expected}`,
+          );
+        }
+        const expectedDepth: number =
+          parsed.header.deltaMode === DELTA_MODE_KEYFRAME ? 1 : reference.depth + 1;
+        if (parsed.header.depth !== expectedDepth) {
+          throw new MalformedFile(
+            `delta chunk at ${record.offset} declares depth ${parsed.header.depth}, but its ` +
+              `reference chain has depth ${expectedDepth}`,
+          );
+        }
+        checkLevelMatch(
+          reference.level,
+          parsed.header.level,
+          record.offset,
+          parsed.header.referenceOffset,
+        );
+        const state = await composeDelta(reference.state, parsed, codecs);
+        previousState = {
+          offset: record.offset,
+          state,
+          level: parsed.header.level,
+          depth: expectedDepth,
+        };
+        onState?.(record.offset, state.count);
+        remember(state, parsed.header, record.offset);
+        rememberWindowIndices(state, record.offset);
+        rememberInterval(parsed.header, record.offset);
+      }
+    } catch (error) {
+      attachValidationRecordOffset(error, record.offset);
+      throw error;
+    }
+  }
+
+  if (header === null) throw new MalformedFile("keyframe-delta file has no Header record");
+  checkTiling(intervals, header.durationSec, true);
+  const intervalRank = new Map<number, number>();
+  [...intervals]
+    .sort((a, b) => a.t0 - b.t0)
+    .forEach((interval, rank) => intervalRank.set(interval.t0, rank));
+  for (const [id, lifetime] of identities) {
+    const firstRank = intervalRank.get(lifetime.firstT0)!;
+    const lastRank = intervalRank.get(lifetime.lastT0)!;
+    if (lastRank - firstRank + 1 !== lifetime.count) {
+      const error = new MalformedFile(
+        `state chunk at ${lifetime.lastOffset} reintroduces gaussian id ${id} after it died; ` +
+          `ids may not be reused`,
+      );
+      attachValidationRecordOffset(error, lifetime.lastOffset);
+      throw error;
+    }
+  }
+  const widestWindowIndex = largestWindowIndex as { value: number; offset: number } | null;
+  if (widestWindowIndex !== null) {
+    try {
+      checkWindowIndex(
+        widestWindowIndex.value,
+        windowTableOrDefault(windows).length / 2,
+        `state chunk at ${widestWindowIndex.offset}`,
+      );
+    } catch (error) {
+      attachValidationRecordOffset(error, widestWindowIndex.offset);
+      throw error;
+    }
+  }
+  if (identities.size !== header.gaussianCount) {
+    throw new MalformedFile(
+      `Header declares ${header.gaussianCount} distinct gaussian ids; keyframe-delta states ` +
+        `introduce ${identities.size}`,
+    );
+  }
+  return identities.size;
+}
+
 /** The result of the indexed read path: the sequence and the index it walked. */
 export interface KeyframeDeltaIndexedResult {
   readonly sequence: KeyframeDeltaSequence;
@@ -1734,6 +2008,26 @@ export function checkTiling(
   requireFullCoverage = false,
 ): void {
   const ordered = [...intervals].sort((a, b) => a.t0 - b.t0);
+  for (let i = 0; i < ordered.length; i++) {
+    const entry = ordered[i]!;
+    // §11.1's timeline may be open-ended: the final interval of a file whose Header
+    // declares `duration_sec = +Infinity` may itself end at `+Infinity`. Every t0, and
+    // every other t1, must still be finite. Python's `check_tiling` carves out exactly
+    // this case and Dart asserts such a file decodes, so refusing it unconditionally
+    // here made the same bytes readable in two SDKs and unreadable in this one.
+    const openEndedFinal =
+      i === ordered.length - 1 && durationSec === Infinity && entry.t1 === Infinity;
+    if (
+      !Number.isFinite(entry.t0) ||
+      (!Number.isFinite(entry.t1) && !openEndedFinal) ||
+      entry.t1 < entry.t0
+    ) {
+      throw new MalformedFile(
+        `state chunk has unusable interval [${entry.t0}, ${entry.t1}); expected finite t0 ` +
+          "and t1 >= t0 (except +Infinity for the final interval of an open-ended timeline)",
+      );
+    }
+  }
   for (let i = 1; i < ordered.length; i++) {
     const previous = ordered[i - 1]!;
     const entry = ordered[i]!;

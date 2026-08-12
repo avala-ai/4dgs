@@ -17,6 +17,7 @@ import {
   AUDIO_SOURCE_FLAG_SPATIAL,
   HEADER_FLAG_HAS_AUDIO,
 } from "./opcodes.js";
+import { SH_MAX_BITS, SH_MIN_BITS } from "./sh.js";
 
 /**
  * `0x89 4 D G S 1 CR LF`.
@@ -191,6 +192,16 @@ export interface Quantization {
   readonly stepSh: number;
   /** Declared maximum deviation per attribute, as the decimal strings the file carries. */
   readonly bounds: ReadonlyMap<string, string>;
+  /**
+   * Per-band spherical harmonic bit depths, band 1 first, or empty.
+   *
+   * Appended after the record's original fields, so a file that declares none is
+   * byte-identical to one written before the field existed — an empty list is written as
+   * no bytes at all, not as a zero count.
+   */
+  readonly shBitDepths: readonly number[];
+  /** True when appended bytes look like an SH depth list but do not frame a legal one. */
+  readonly shBitDepthsMalformed: boolean;
 }
 
 export function parseQuantization(content: Uint8Array): Quantization {
@@ -198,6 +209,9 @@ export function parseQuantization(content: Uint8Array): Quantization {
   const scheme = c.string();
   const posOrigin = c.f64s(3);
   const steps = c.f64s(8);
+  const stepSh = c.u8();
+  const bounds = c.stringMap();
+  const parsedDepths = shBitDepths(c);
   const quantization: Quantization = {
     scheme,
     posOrigin,
@@ -209,8 +223,10 @@ export function parseQuantization(content: Uint8Array): Quantization {
     stepMotion: steps[5]!,
     stepTime: steps[6]!,
     stepSigmaLog: steps[7]!,
-    stepSh: c.u8(),
-    bounds: c.stringMap(),
+    stepSh,
+    bounds,
+    shBitDepths: parsedDepths.values,
+    shBitDepthsMalformed: parsedDepths.malformed,
   };
   // `object_id` is an exact label (spec section 6.6), not a metric value, so there is no
   // meaningful error bound between two different labels — section 6.5 makes a bound for it
@@ -223,6 +239,41 @@ export function parseQuantization(content: Uint8Array): Quantization {
     );
   }
   return quantization;
+}
+
+/**
+ * Read the appended per-band SH bit depths, or nothing.
+ *
+ * Deliberately tolerant, exactly as the Python and Rust readers are. Appended fields are
+ * positional, so anything sitting after the bounds map lands where this field is —
+ * including bytes a *different* newer writer appended, or the arbitrary trailer a
+ * forward-compatibility fixture puts there. The declaration describes encoding that
+ * already happened and no decoded value depends on it, so a count the record is too short
+ * for, or a depth outside the legal range, is read as "this file declares none" rather
+ * than as a corrupt file (spec §5.3).
+ */
+function shBitDepths(c: Cursor): {
+  readonly values: readonly number[];
+  readonly malformed: boolean;
+} {
+  if (c.remaining < 1) return { values: [], malformed: false };
+  const at = c.pos;
+  const count = c.u8();
+  if (count === 0) {
+    c.pos = at;
+    return { values: [], malformed: false };
+  }
+  if (c.remaining < count) {
+    c.pos = at;
+    return { values: [], malformed: true };
+  }
+  const depths: number[] = [];
+  for (let i = 0; i < count; i++) depths.push(c.u8());
+  if (depths.some((bits) => bits < SH_MIN_BITS || bits > SH_MAX_BITS)) {
+    c.pos = at;
+    return { values: [], malformed: true };
+  }
+  return { values: depths, malformed: false };
 }
 
 /** Validity windows, as `[lo, hi]` pairs flattened into one array. */
