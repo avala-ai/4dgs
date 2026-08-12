@@ -400,22 +400,25 @@ class TestKeyframeDelta:
         """
         import copy
 
-        duration = 2.0
+        duration = 3.0
         samples = [
             Sample(
                 t0=float(step),
                 ids=np.array([1, 2]),
                 gaussians=_keyframe_gaussians([[0.1 * step, 0.0, 0.0], [1.0, 0.0, 0.0]], duration, None),
             )
-            for step in range(2)
+            # Three, so that the chain reaches depth two and a delta exists whose reference
+            # is another delta — the only shape in which "keyframe-mode" is a lie.
+            for step in range(3)
         ]
         data = kdf.write_sequence(samples, duration, kd=KeyframeDeltaOptions(keyframe_every=0), write_index=True)
         opened = kdf.open_indexed(data)
-        assert any(e.kind == 1 for e in opened.index), "the fixture must carry a delta entry"
+        assert sum(1 for e in opened.index if e.kind == 1) >= 2, "the fixture must carry two delta entries"
 
-        def verdicts(mutate):
+        def verdicts(mutate, patch=None):
             index = copy.deepcopy(opened.index)
             target = mutate(index)
+            body = data if patch is None else patch(data)
 
             def code(call):
                 try:
@@ -425,8 +428,8 @@ class TestKeyframeDelta:
                     return getattr(exc, "code", None)
 
             return (
-                code(lambda: list(kdf.scan_indexed(data, index, opened.windows))),
-                code(lambda: kdf.compose_chain(data, index, target, opened.windows, opened.grids)),
+                code(lambda: list(kdf.scan_indexed(body, index, opened.windows))),
+                code(lambda: kdf.compose_chain(body, index, target, opened.windows, opened.grids)),
             )
 
         def forward(index):
@@ -443,10 +446,40 @@ class TestKeyframeDelta:
             next(e for e in index if e.kind == 0).depth = 3
             return next(e for e in index if e.kind == 1)
 
-        for mutate in (forward, depth, keyframe_fields):
+        def unknown_mode(index):
+            entry = next(e for e in index if e.kind == 1)
+            entry.delta_mode = 7
+            return entry
+
+        def mode_disagrees_with_reference(index):
+            # The second delta is chained onto the first. Calling it keyframe-mode claims a
+            # reference it does not have, and the two modes compose onto different states.
+            entry = [e for e in index if e.kind == 1][-1]
+            entry.delta_mode = rec.DELTA_MODE_KEYFRAME
+            return entry
+
+        for mutate in (forward, depth, keyframe_fields, unknown_mode, mode_disagrees_with_reference):
             scanned, composed = verdicts(mutate)
             assert scanned is not None, "the scan is supposed to refuse this"
             assert composed == scanned, f"{mutate.__name__}: scan said {scanned}, compose said {composed}"
+
+        # `level` lives in the record and not in the index, so this one patches the file.
+        # A delta at another level than its reference is a difference between bins on two
+        # different grids: it composes, and what it composes to is wrong.
+        last_delta = [e for e in opened.index if e.kind == 1][-1]
+
+        def level(_index):
+            return last_delta
+
+        def raise_the_level(body):
+            patched = bytearray(body)
+            # Delta Chunk content: f64 t0, f64 t1, u32 level, ...
+            struct.pack_into("<I", patched, last_delta.chunk_offset + 9 + 16, 3)
+            return bytes(patched)
+
+        scanned, composed = verdicts(level, raise_the_level)
+        assert scanned == "index-record-mismatch", f"the scan is supposed to refuse this: {scanned}"
+        assert composed == scanned, f"level: scan said {scanned}, compose said {composed}"
 
     def test_the_header_gaussian_count_is_checked_against_the_distinct_ids(self):
         """`gaussian_count` counts distinct gaussians over the sequence under this model.

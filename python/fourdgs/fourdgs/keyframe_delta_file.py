@@ -1150,6 +1150,7 @@ def compose_chain(
     # refusal identifier -- so the same bytes were `forward-reference` on one path and
     # readable on the other.
     expected_depth = 0
+    previous_at = keyframe_at
     for link in chain:
         if link.extended and link.keyframe_offset != keyframe_at:
             raise MalformedFile(
@@ -1164,12 +1165,34 @@ def compose_chain(
                     code="index-record-mismatch",
                 )
             expected_depth = 0
+            previous_at = link.chunk_offset
             continue
         if link.reference_offset >= link.chunk_offset:
             raise MalformedFile(
                 f"delta index entry at {link.chunk_offset} references {link.reference_offset}, which is not behind it",
                 code="forward-reference",
             )
+        # §5.18 defines two references and no others, and which one a delta means is the
+        # difference between composing onto the GOP keyframe and composing onto the chunk
+        # before it. `chain_from` follows `reference_offset` without reading the mode, so a
+        # keyframe-mode delta pointing at another delta walked a chain the file does not
+        # describe — and `scan_indexed` refused the same bytes.
+        if link.delta_mode not in (rec.DELTA_MODE_KEYFRAME, rec.DELTA_MODE_CHAINED):
+            raise MalformedFile(
+                f"delta index entry at {link.chunk_offset} declares delta_mode {link.delta_mode}; expected 0 or 1",
+                code="index-record-mismatch",
+            )
+        wanted_reference = keyframe_at if link.delta_mode == rec.DELTA_MODE_KEYFRAME else previous_at
+        if link.reference_offset != wanted_reference:
+            keyframe_mode = link.delta_mode == rec.DELTA_MODE_KEYFRAME
+            named = "keyframe-mode" if keyframe_mode else "chained"
+            reaches = "its GOP keyframe is at" if keyframe_mode else "the previous state is at"
+            raise MalformedFile(
+                f"{named} delta at {link.chunk_offset} references {link.reference_offset}; "
+                f"{reaches} {wanted_reference}",
+                code="broken-reference",
+            )
+        previous_at = link.chunk_offset
         expected_depth += 1
         if link.depth != expected_depth:
             raise MalformedFile(
@@ -1178,6 +1201,11 @@ def compose_chain(
                 code="depth-mismatch",
             )
     state: State | None = None
+    # Both are set by the keyframe branch below, which the `state is None` guard in the
+    # delta branch is what guarantees runs first. Bound here so that reading them is not
+    # a question a reader has to answer by tracing the loop.
+    composed_at = keyframe_at
+    reference_level = 0
     for link in chain:
         if link.kind not in (0, 1):
             raise MalformedFile(
@@ -1213,12 +1241,26 @@ def compose_chain(
                     code="index-record-mismatch",
                 )
             _check_keyframe_mu_t(head.t0, bins, grids)
+            reference_level = int(head.level)
+            composed_at = link.chunk_offset
         else:
             if state is None:
                 raise MalformedFile("a chain begins with a delta chunk", code="chain-without-keyframe")
+            reference_at = composed_at
+            composed_at = link.chunk_offset
             state, head = _compose_delta(state, content)
             if link.extended:
                 _check_entry_against_record(link, head)
+            # `level` is a chunk field and not an index one, so this is the first place on
+            # this path that can see it. A delta composed onto a reference at another level
+            # is a difference between bins on two different grids: it decodes, and what it
+            # decodes to is wrong. `scan_indexed` has always refused it.
+            if int(head.level) != reference_level:
+                raise MalformedFile(
+                    f"delta at {link.chunk_offset} declares level {head.level}; "
+                    f"its reference at {reference_at} declares level {reference_level}",
+                    code="index-record-mismatch",
+                )
     if state is None:
         raise MalformedFile("a chain with no chunks in it", code="chain-without-keyframe")
     # `live_count` is the population after composition — the number a seeking consumer
