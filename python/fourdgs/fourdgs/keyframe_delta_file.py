@@ -1106,8 +1106,17 @@ def compose_chain(
     `decode_indexed`; a caller that wants the verdict calls this per entry and drops what
     it returns.
     """
-    if grids is None:
-        grids = open_indexed(data).grids
+    # Both defaults come from the file, and for the same reason: an omitted argument means
+    # "read it from `data`", not "the file has none". `windows=[]` would mean the latter --
+    # `check_window_indices_of` reads an empty table as the single implicit window a file
+    # with no Window Table carries -- so defaulting to it would refuse every multi-window
+    # file through the entry point this function documents for validators.
+    if grids is None or windows is None:
+        opened = open_indexed(data)
+        if grids is None:
+            grids = opened.grids
+        if windows is None:
+            windows = opened.windows
 
     for indexed in index:
         if not indexed.extended:
@@ -1183,7 +1192,7 @@ def compose_chain(
             f"composing its chain produces {state.count} gaussians",
             code="index-record-mismatch",
         )
-    check_window_indices_of(state, windows if windows is not None else [])
+    check_window_indices_of(state, windows)
     _decode_index_bands(data, entry)
     return state
 

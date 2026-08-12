@@ -198,6 +198,29 @@ class TestRefusals:
         assert not report.ok
         assert any("chunk index entry 0" in m for m in errors(report))
 
+    def test_a_footer_naming_no_summary_still_checks_the_index_entries(self):
+        """`summary_start` 0 is §5.2's indexless file, so it selects no summary.
+
+        Reading "selects nothing" as "nothing is valid" was wrong twice over. It reported
+        every Chunk Index record in the file as lying outside the selection — one line per
+        record, thousands of them on a real capture, and not one of them the actual fault.
+        And it emptied the entry list, so every per-entry check below silently stopped
+        running on records still sitting there to be read: the entry corrupted here, whose
+        range runs off the end of the file, went unreported.
+        """
+        data = bytearray(real_file())
+        summary_start = rec.Footer.parse(bytes(data[-(20 + len(MAGIC)) : -len(MAGIC)])).summary_start
+        # The first index record's chunk_offset field: past the record header, past t0/t1.
+        at = summary_start + 9 + 16
+        data[at : at + 8] = (len(data) - 4).to_bytes(8, "little")
+        # Now say the file carries no summary, without moving a single record.
+        data[-(20 + len(MAGIC)) : -(len(MAGIC) + 12)] = (0).to_bytes(8, "little")
+
+        report = validate(bytes(data))
+
+        assert not any("lies outside the Footer-selected summary index" in m for m in errors(report))
+        assert any("chunk index entry 0" in m for m in errors(report))
+
     def test_a_non_finite_quantization_step_is_an_error(self):
         # Spec §5.3: every step and origin must be finite. This is the corrupt field that
         # ruins every gaussian rather than one — each bin times an infinite step decodes to

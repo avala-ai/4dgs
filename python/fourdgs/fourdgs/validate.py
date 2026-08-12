@@ -406,8 +406,16 @@ def validate(data: bytes) -> Report:
     # sit between Chunk Index records, and the indexed reader walks the whole selected
     # range. Keep this pass lazy just like the framing walk; retaining a Frame per record
     # would let a hostile run of tiny records turn bounded framing into unbounded memory.
+    # Only meaningful when the Footer actually named a summary. A file with no Footer, or
+    # one whose `summary_start` is 0 -- the indexless file of §5.2 -- selects nothing, and
+    # reading that as "nothing is selected" is wrong twice over: it buries the real fault
+    # under one line per Chunk Index record, thousands of them on a real capture, and it
+    # empties `index` so every per-entry check below silently stops running on records that
+    # are still sitting there to be checked. The absent Footer is already reported above.
+    footer_selects_summary = False
     selected_index_offsets: set[int] = set()
     if footer is not None and footer_offset is not None and footer.summary_start:
+        footer_selects_summary = True
         selected_start_seen = False
         for frame in walk.intact_records():
             if frame.offset < footer.summary_start:
@@ -425,12 +433,13 @@ def validate(data: bytes) -> Report:
                 f"the Footer's summary_start {footer.summary_start} does not name a complete summary record "
                 f"before the Footer at byte {footer_offset}"
             )
-    for offset in index_record_offsets:
-        if offset not in selected_index_offsets:
-            report.error(f"the Chunk Index record at byte {offset} lies outside the Footer-selected summary index")
-    index = [
-        entry for offset, entry in zip(index_record_offsets, index, strict=True) if offset in selected_index_offsets
-    ]
+    if footer_selects_summary:
+        for offset in index_record_offsets:
+            if offset not in selected_index_offsets:
+                report.error(f"the Chunk Index record at byte {offset} lies outside the Footer-selected summary index")
+        index = [
+            entry for offset, entry in zip(index_record_offsets, index, strict=True) if offset in selected_index_offsets
+        ]
 
     try:
         provenance.check()

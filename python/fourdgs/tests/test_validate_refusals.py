@@ -324,6 +324,38 @@ class TestKeyframeDelta:
         )
         assert state.count == 1
 
+    def test_compose_chain_reads_the_window_table_when_it_is_not_passed_one(self):
+        """An omitted `windows` means "read it from `data`", not "the file has none".
+
+        `check_window_indices_of` reads an empty table as the single implicit window a
+        file with no Window Table carries, so defaulting to `[]` made this entry point —
+        the one its own docstring offers to validators — refuse every multi-window file
+        it was handed. `grids` had a real fallback from the same `open_indexed` call all
+        along; `windows` now comes from beside it.
+        """
+        duration = 2.0
+        sample = Sample(
+            t0=0.0,
+            ids=np.array([7, 8]),
+            gaussians=_keyframe_gaussians(
+                [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+                duration,
+                [(0.0, 1.0), (1.0, 2.0)],
+            ),
+        )
+        data = kdf.write_sequence(
+            [sample],
+            duration,
+            kd=KeyframeDeltaOptions(keyframe_every=1),
+            write_index=True,
+        )
+        opened = kdf.open_indexed(data)
+        assert len(opened.windows) == 2, "the fixture has to be multi-window to prove anything"
+
+        state = kdf.compose_chain(data, opened.index, opened.index[-1])
+
+        assert state.count == 2
+
     def test_the_header_gaussian_count_is_checked_against_the_distinct_ids(self):
         """`gaussian_count` counts distinct gaussians over the sequence under this model.
 
