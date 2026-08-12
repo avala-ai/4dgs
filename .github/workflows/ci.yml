@@ -12,12 +12,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Total tree size under 8 MB
+      - name: Total tree size under 9 MB
+        # Raised from 8192 once the inspect-and-validate tools landed: #191 brought the
+        # Dart validator and #188 the Swift one, and the tree they leave measures 8696 KiB.
+        # The gate went red on the merge itself rather than on either pull request, because
+        # each was measured against a main that did not yet have the other. 9216 is the step
+        # that holds the merged tree with room, and this is the whole-tree gate — the
+        # per-language sub-budgets below are still what say which language grew.
         run: |
           size_kb=$(du -s --exclude=.git . | cut -f1)
           echo "tree: ${size_kb} KiB"
-          if [ "$size_kb" -gt 8192 ]; then
-            echo "::error::tree is ${size_kb} KiB, over the 8192 KiB budget"
+          if [ "$size_kb" -gt 9216 ]; then
+            echo "::error::tree is ${size_kb} KiB, over the 9216 KiB budget"
             exit 1
           fi
       - name: Conformance data under 2.5 MB
