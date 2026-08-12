@@ -144,6 +144,14 @@ const int attrGaussianId = 13;
 /// no object.
 const int attrObjectId = 14;
 
+/// The first and last id of the reserved extension pool, registry §"Attribute
+/// ids". Ids 15–63 are reserved and a version-1 writer MUST NOT emit them; ids
+/// 64–127 are private and application-defined. A reader skips both the same
+/// way, by `payload_length`, which is what forward compatibility requires — but
+/// only one of the two is a file a conformance validator should accept.
+const int attrReservedFirst = 15;
+const int attrReservedLast = 63;
+
 /// Ids every chunk must carry. 11 and 12 are optional producer-side identities
 /// and readers that do not need them skip the streams.
 const List<int> requiredAttributes = <int>[

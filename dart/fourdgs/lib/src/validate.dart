@@ -1118,6 +1118,18 @@ Future<void> _checkProvenanceRecords(
           )) {
             duplicate('SensorCalibration', value.name, '5.15.3');
           }
+          // Parsing keeps an unknown model rather than refusing it, which is
+          // right: the value is legal, and a later registry entry may define
+          // it. But silence here lets the tool exit 0 on a file it cannot
+          // actually project, so say so — as a warning, because the record is
+          // well formed and only its model is unknown.
+          if (!cameraModelCoefficients.containsKey(value.cameraModel)) {
+            report.warn(
+              "sensor '${value.name}' names camera model ${value.cameraModel}, "
+              'which is not in the registry; a reader that cannot project with '
+              'it must decline rather than apply part of it (section 5.15.3)',
+            );
+          }
           if (value.poseReference != poseToScene &&
               value.poseReference != poseToRig) {
             throw FourdgsMalformedFile(
@@ -1756,6 +1768,11 @@ Future<bool> _scanFramedChunks(
   int count = 0;
   int chunkOffset = -1;
   List<FourdgsBandRange> chunkBands = <FourdgsBandRange>[];
+  // The Header bounds a legal run to one record per declared band, so the run
+  // is checked as it is read rather than when it closes. Waiting for the close
+  // lets a chunk followed by millions of valid copies of the same band grow
+  // `chunkBands` without limit first, and the answer is the same either way.
+  Set<int> chunkBandNumbers = <int>{};
 
   bool finishChunk() {
     if (chunkOffset < 0) return false;
@@ -1808,6 +1825,20 @@ Future<bool> _scanFramedChunks(
             );
           }
           if (stream.attributeId == attrObjectId) hasObjectId = true;
+          // Skipping stays right — that is the forward-compatibility rule, and
+          // it is what the decoder does with a private id too. What the
+          // validator owes on top of it is the distinction: a private id is a
+          // file doing something legal this reader does not know, a reserved id
+          // is a file a version-1 writer was forbidden to produce.
+          if (stream.attributeId >= attrReservedFirst &&
+              stream.attributeId <= attrReservedLast) {
+            report.error(
+              'the Chunk at byte ${frame.offset} carries an Attribute Stream '
+              'with reserved attribute id ${stream.attributeId}; ids '
+              '$attrReservedFirst through $attrReservedLast are reserved and a '
+              'version-1 writer must not emit them',
+            );
+          }
           skipStreamPayload(streamCursor, stream);
         }
         if (requireObjectId && count > 0 && !hasObjectId) {
@@ -1819,6 +1850,7 @@ Future<bool> _scanFramedChunks(
         }
         chunkOffset = frame.offset;
         chunkBands = <FourdgsBandRange>[];
+        chunkBandNumbers = <int>{};
         decodeChunkStreams(
           body.streams,
           count,
@@ -1852,6 +1884,16 @@ Future<bool> _scanFramedChunks(
           expectedBand: framedBand,
           expectedCount: count,
         );
+        if (count == 0 ||
+            framedBand < 1 ||
+            framedBand > degree ||
+            !chunkBandNumbers.add(framedBand)) {
+          throw FourdgsMalformedFile(
+            'the Chunk at byte $chunkOffset is followed by SH band $framedBand '
+            'more than its declared population and degree permit; expected '
+            'each band from 1 through $degree once',
+          );
+        }
         chunkBands.add(
           FourdgsBandRange(
             band: framedBand,
