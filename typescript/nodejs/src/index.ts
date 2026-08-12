@@ -7,10 +7,29 @@
  * A readable with `pread` semantics, so one open file can serve concurrent range reads
  * without a shared seek position, and a writable for the byte sinks around a decoder —
  * extracting audio source payloads, splitting an attachment out of a scene.
+ *
+ * Also the home of the `4dgs` command-line tool, for the same reason: inspecting and
+ * validating a file means opening one. Everything the tool prints comes from the two
+ * functions re-exported below, so a caller can ask the same questions in process.
  */
 
 import { open, type FileHandle } from "node:fs/promises";
 import type { IReadable } from "@4dgs/core";
+
+export {
+  inspectFile,
+  type InspectReport,
+  type InspectedRecord,
+  type SummaryCrc,
+} from "./inspect.js";
+export {
+  validateFile,
+  type Finding,
+  type Refused,
+  type Report,
+  type Severity,
+  type ValidateOptions,
+} from "./validate.js";
 
 /**
  * A local file, read by range.

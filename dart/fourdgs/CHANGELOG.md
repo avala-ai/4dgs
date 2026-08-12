@@ -49,9 +49,24 @@ happened.
   contiguity is what lets a streamed reader verify `summary_crc` by retaining the trailing records
   rather than the whole file, so it is asserted on the written bytes rather than assumed. Every
   offset and length in the index frames a whole record, opcode byte included (§5.8).
+- Per-band spherical-harmonic bit depths, spec §6.5. `shBitDepths` takes a list, band 1 first; named
+  lists are available as `fourdgsShLadders['balanced']!` (and `flat` or `aggressive`), the ladders
+  `website/docs/reference/compression.md` measures. `n` bits rounds a coefficient byte onto a grid
+  of `2^(8 - n)` code units at bin centres, so nothing sub-byte is packed, no decoder changes, and
+  the saving is realized by the stream codec having that many fewer symbols to code. The depths are
+  appended to the Quantization record, each band's bound is declared as `sh_band<n>`, and the single
+  `step_sh` and `sh` the record has always carried take the coarsest band's value — an upper bound
+  for a consumer that reads them and not the appended field, rather than a number that is true of
+  one band and wrong for the others. A Quantization record that declares no depths appends no bytes
+  at all and preserves coefficient bytes exactly; profile-wide `step_sh` remains compatibility
+  metadata, not an implicit grid. A ladder shorter than the scene's degree is refused rather than
+  filled in with eight bits.
+- The encoder verifies each band's declared bound by decoding the record it just wrote and measuring
+  every coefficient of every gaussian, rather than trusting the three lines of arithmetic that
+  produced it. A bound nobody verified is worse than no bound, because consumers will trust it.
 - `FourdgsWriteOptions` carries the quantization profile, the Header's `cutoff`, the deflate level,
-  which summary records to write, and the Header's `profile`, `library` and attributes. The defaults
-  are the reference encoders'.
+  the chunking, the SH bit depths, which summary records to write, and the Header's `profile`,
+  `library` and attributes. The defaults are the reference encoders'.
 - Refusals name the field and the gaussian, not just the failure: a non-finite value in a lane that
   lands on a grid, a NaN validity window, a validity window whose lower bound is above its upper, a
   NaN or `-inf` sigma, a bin outside the signed 32-bit symbols a stream carries, an unknown profile,
@@ -103,11 +118,6 @@ happened.
 - The Header declares the spherical-harmonic degree the file actually carries, which is the highest
   band written rather than the degree the input held: `shBands` caps what is emitted, and bands are
   whole (§6.5), so a degree-3 scene written with `shBands: 1` is a degree-1 file.
-- Coefficients are quantized onto the pitch the Quantization record declares. `step_sh` is an
-  encode-side value — a decoder does nothing with it (§6.5) — which is exactly why the encoder must
-  apply it: the `coarse` profile declares a pitch of 3 and now writes on it. The top bin's centre is
-  clamped back into a byte, because at that pitch the coefficient 255 centres on 256 and would reach
-  a reader as 0, the extreme positive coefficient read as the extreme negative one.
 - Deterministic: two encodes of one scene are byte-identical, including the Header's attribute map,
   whose keys are sorted rather than emitted in whatever order the caller's map iterates.
 - Proved by `dart/encode-roundtrip.sh`, which re-encodes all 46 corpus variants — into as many as 42
@@ -123,7 +133,14 @@ happened.
   one file the same way say nothing about whether that file is the scene that went in, and an
   encoder checked only by its own decoder proves that two halves of one implementation share an
   opinion. Every reader is required: a missing one is an error rather than a reader quietly dropped
-  from the comparison. It runs in the conformance workflow.
+  from the comparison. `tests/conformance/encode_roundtrip.py --encoder dart` also puts the same
+  gaussians through this encoder and through the shared Rust reference and requires the Python
+  decoder to read both files as the same scene, including a pass at per-band depths. Before ignoring
+  layout-dependent interval choices, that gate also checks that every emitted Chunk is indexed
+  exactly once, the population agrees, and its reconstructed support fits the indexed interval. Both
+  run in the conformance workflow.
+- The tests pin every named ladder, the pitch and bound each bit depth declares, and the maximum
+  coefficient deviation after this encoder writes and decodes every band.
 
 ### Hostile-input hardening
 

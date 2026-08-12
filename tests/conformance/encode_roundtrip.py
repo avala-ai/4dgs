@@ -143,12 +143,12 @@ SH_LADDER = ",".join(str(depth) for depth in SH_LADDER_DEPTHS)
 RECORD_HEADER = struct.Struct("<BQ")
 
 SECOND_ENCODERS = frozenset({"dart", "python", "typescript"})
-#: Encoders whose round-trip CLI accepts the optional per-band depth argument. Dart's
-#: first independent writer proves its fixed quantization preset here; its CLI does not
-#: yet expose graded SH depths, so passing a third argument would test argv parsing rather
-#: than an encoder feature it claims. The SH layer above this one adds it and puts Dart
-#: back in the set.
-SH_LADDER_ENCODERS = frozenset(set(ENCODERS) - {"dart"})
+#: Encoders whose round-trip CLI accepts the optional per-band depth argument. The layer
+#: below this one holds Dart out of the set: its first independent writer proves a fixed
+#: quantization preset and its CLI takes no third argument, so asking for one would test
+#: argv parsing rather than a feature it claims. This is the layer that adds graded SH
+#: depths, so Dart comes back in here.
+SH_LADDER_ENCODERS = frozenset(ENCODERS)
 #: Gaussian-only Dart output deliberately clears the source's capture profile. Keep that
 #: compatibility normalization local to Dart: TypeScript's profile is part of the state
 #: its independent encoder must preserve.
