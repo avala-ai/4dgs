@@ -297,6 +297,23 @@ private func frontMatterSlices(
     return slices
 }
 
+/// A Footer carrying no summary, and deliberately no trailing magic.
+///
+/// The auxiliary records are spliced into a synthetic stream. Without a Footer that stream looks
+/// cut, and the streamed reader then defers every provenance reference a later record could still
+/// have supplied — so a complete file whose Sensor Calibration names a rig it does not carry, or
+/// whose Geodetic Anchor names no Coordinate Frame, would be reported valid. A Footer says the
+/// record stream ended, which is what makes those cross-record checks run.
+///
+/// The trailing magic is withheld on purpose. The reader treats "Footer seen, magic missing" as a
+/// complete record stream in a cut file, so the provenance rules run while the checks that depend
+/// on records this slice set never contained — the audio pairing above all — stay deferred and
+/// cannot fire on a file that is perfectly well formed.
+private func syntheticFooterSlice() -> SourceSlice {
+    let body = littleU64Bytes(0) + littleU64Bytes(0) + littleU32Bytes(0)
+    return SourceSlice(literal: [Opcode.footer] + littleU64Bytes(UInt64(body.count)) + body)
+}
+
 private func singleChunkReader(
     _ source: ToolReader, header: Frame, quantization: Frame, windowTable: Frame?, chunk: Frame,
     temporalModelOffset: UInt64? = nil, bands: [Frame] = []
@@ -364,9 +381,20 @@ private final class TemporaryFileReader: ByteRangeReader {
     }
 }
 
+/// Ceiling on what a single deflate stream may declare it inflates to. `uncompressed_size` is
+/// attacker-controlled, so without this the only bound on the temporary file is the declaration
+/// itself and a small high-ratio payload can fill the host's temporary directory.
+private let maximumInflatedStreamBytes: UInt64 = 1 << 30
+
 private func inflatedReader(
-    _ source: ToolReader, offset: UInt64, length: UInt64, expected: UInt64, frame: Frame
+    _ source: ToolReader, offset: UInt64, length: UInt64, expected: UInt64,
+    limit: UInt64 = maximumInflatedStreamBytes, frame: Frame
 ) throws -> ToolReader {
+    guard expected <= limit else {
+        throw malformedStateStreams(
+            frame,
+            "the declared \(expected)-byte inflated size exceeds the \(limit)-byte validator limit")
+    }
     var stream = z_stream()
     let initialized = inflateInit_(&stream, zlibVersion(), Int32(MemoryLayout<z_stream>.size))
     guard initialized == Z_OK else {
@@ -1432,6 +1460,7 @@ private func validatePhysicalRecords(
         for frame in auxiliaryRecords {
             slices.append(SourceSlice(offset: frame.offset, length: frame.total))
         }
+        slices.append(syntheticFooterSlice())
         do {
             _ = try SceneReader(SlicedReader(source: source, slices: slices), path: .streamed)
         } catch {
@@ -1462,6 +1491,7 @@ private func validatePhysicalRecords(
                     for frame in auxiliaryRecords where frame.offset != candidate.offset {
                         trial.append(SourceSlice(offset: frame.offset, length: frame.total))
                     }
+                    trial.append(syntheticFooterSlice())
                     do {
                         _ = try SceneReader(
                             SlicedReader(source: source, slices: trial), path: .streamed)
@@ -1816,7 +1846,7 @@ func validationColumn(
     }
     let decoded = try inflatedReader(
         group.source, offset: wantedPayloadOffset, length: wantedPayloadLength,
-        expected: decodedBytes, frame: frame)
+        expected: decodedBytes, limit: maximumValidationColumnBytes, frame: frame)
 
     var stored = [Int32](repeating: 0, count: storedCount)
     var previous = [Int64](repeating: 0, count: channels)
@@ -1890,6 +1920,20 @@ private func removeValidationRows(
     state.ids = zip(state.ids, keeping).compactMap { pair in pair.1 ? pair.0 : nil }
 }
 
+/// The retained reference state is rebuilt in memory, so every growth of a column has to be
+/// measured against the cap — not just the ones an update produces. A chain whose birth deltas
+/// each individually fit under the limit can otherwise aggregate into gigabytes.
+private func enforceRetainedColumnLimit(
+    _ column: ValidationColumn, attribute: UInt8, _ frame: Frame
+) throws {
+    guard UInt64(column.storedValueCount) <= maximumValidationColumnBytes / 4 else {
+        throw malformedStateStreams(
+            frame,
+            "composed attribute \(attribute) exceeds the \(maximumValidationColumnBytes)-byte retained-column limit"
+        )
+    }
+}
+
 private func applyValidationDelta(
     _ state: inout ValidationColumnState, source: ToolReader, frame: Frame, attribute: UInt8,
     includeUpdates: Bool = true
@@ -1948,12 +1992,7 @@ private func applyValidationDelta(
                 }
             }
             base.setRow(composed, at: row)
-            guard UInt64(base.storedValueCount) <= maximumValidationColumnBytes / 4 else {
-                throw malformedStateStreams(
-                    frame,
-                    "composed attribute \(attribute) exceeds the \(maximumValidationColumnBytes)-byte retained-column limit"
-                )
-            }
+            try enforceRetainedColumnLimit(base, attribute: attribute, frame)
         }
         state.column = base
     }
@@ -1978,6 +2017,7 @@ private func applyValidationDelta(
             throw malformedStateStreams(
                 frame, "the birth group carries no value for attribute \(attribute)")
         }
+        try enforceRetainedColumnLimit(base, attribute: attribute, frame)
         state.column = base
     } else if let birth {
         guard state.ids.isEmpty || attribute == 14 else {
@@ -1988,6 +2028,7 @@ private func applyValidationDelta(
         var column = ValidationColumn(
             repeating: [Int32](repeating: 0, count: birth.channels), rowCount: state.ids.count)
         column.append(birth)
+        try enforceRetainedColumnLimit(column, attribute: attribute, frame)
         state.column = column
     }
     state.ids += birthIDs
@@ -2147,7 +2188,7 @@ private func gaussianIDs(_ frame: Frame, _ group: DeltaGroup) throws -> Set<UInt
     }
     let decoded = try inflatedReader(
         group.source, offset: identityPayloadOffset, length: identityPayloadLength,
-        expected: expectedBytes, frame: frame)
+        expected: expectedBytes, limit: maximumIdentityStreamBytes, frame: frame)
 
     var ids: Set<UInt32> = []
     ids.reserveCapacity(Int(group.count))
@@ -2227,8 +2268,9 @@ private func applyIdentityDelta(
     return reference.subtracting(deaths).union(births)
 }
 
-/// Rebuild each target from its own backwards chain. This deliberately trades repeated reads for
-/// bounded memory: at most one composed identity set is resident, regardless of file length.
+/// Rebuild a target from its own backwards chain only when the timeline order does not already
+/// supply its predecessor. At most one composed identity set is resident regardless of file
+/// length, and a chained sequence costs one delta application per target rather than a replay.
 private enum IdentityPartitionFull: Error { case full }
 
 private func validateKeyframeDeltaIdentity(
@@ -2269,9 +2311,39 @@ private func validateKeyframeDeltaIdentity(
         return state
     }
 
-    for target in targets {
-        do {
-            guard let state = try compose(target) else { continue }
+    // Composing every target from its own keyframe is quadratic in chain depth, so a legal
+    // 65,535-deep chain would let a small file spend billions of group decodes here. The targets
+    // are already in timeline order, so carry one rolling state forward and apply a single delta
+    // whenever the next target references the one just composed, falling back to a full replay
+    // only when the order does not supply the predecessor.
+    var composingTarget: UInt64 = 0
+    func walkComposedStates(_ body: (UInt64, Frame, Set<UInt32>) throws -> Void) throws {
+        var rollingOffset: UInt64?
+        var rolling: Set<UInt32> = []
+        for target in targets {
+            guard let frame = physical.frames[target], let fields = physical.fields[target] else {
+                continue
+            }
+            composingTarget = target
+            let state: Set<UInt32>
+            if fields.opcode == Opcode.chunk {
+                state = try gaussianIDs(frame, keyframeGroup(source, frame))
+            } else if let previous = rollingOffset, fields.referenceOffset == previous {
+                state = try applyIdentityDelta(
+                    rolling, frame: frame, groups: deltaGroups(source, frame))
+            } else if let composed = try compose(target) {
+                state = composed
+            } else {
+                continue
+            }
+            rollingOffset = target
+            rolling = state
+            try body(target, frame, state)
+        }
+    }
+
+    do {
+        try walkComposedStates { target, _, state in
             for (i, entry) in indexed[target] ?? [] where entry.extended {
                 if entry.liveCount != UInt64(state.count) {
                     report.error(
@@ -2279,14 +2351,15 @@ private func validateKeyframeDeltaIdentity(
                             + "the state at byte \(target) produces \(state.count) live gaussians")
                 }
             }
-        } catch {
-            report.refused(
-                "keyframe-delta identity composition failed: ", asFourDGS(error), nil,
-                Site(
-                    offset: target,
-                    what: "the identity chain ending at the state record at byte \(target)"))
-            return
         }
+    } catch {
+        let target = composingTarget
+        report.refused(
+            "keyframe-delta identity composition failed: ", asFourDGS(error), nil,
+            Site(
+                offset: target,
+                what: "the identity chain ending at the state record at byte \(target)"))
+        return
     }
 
     // A global identity set would grow with cumulative births. Audit one fixed-capacity
@@ -2300,10 +2373,7 @@ private func validateKeyframeDeltaIdentity(
         func belongs(_ id: UInt32) -> Bool {
             bits == 0 || id >> (32 - bits) == prefix
         }
-        for target in targets {
-            guard let state = try compose(target), let frame = physical.frames[target] else {
-                continue
-            }
+        try walkComposedStates { _, frame, state in
             var currentLive: Set<UInt32> = []
             for id in state where belongs(id) {
                 currentLive.insert(id)
@@ -3053,6 +3123,10 @@ func validate(_ source: ToolReader) -> Report {
                     report.error(
                         "AttributeStream at byte \(frame.offset) is a bare Chunk structure, not a "
                             + "top-level record")
+                } else if opcode == Opcode.attachmentIndex {
+                    report.error(
+                        "AttachmentIndex at byte \(frame.offset) is reserved without a defined "
+                            + "body; writers must not emit it")
                 } else if isPrivate(opcode) {
                     if firstPrivate == nil { firstPrivate = (opcode, frame.length) }
                     if privateCount < UInt64.max { privateCount += 1 }
@@ -3248,7 +3322,17 @@ func validate(_ source: ToolReader) -> Report {
                 "chunk index entry \(i) carries keyframe-delta fields in a gaussian-birth file")
             indexBoundsSafe = false
         }
+        // One index entry addresses each SH band at most once. If a band number repeats, both
+        // address tokens can be satisfied by the single stored SH Band Stream, so the physical
+        // scan sees every token resolved and validation accepts a band_count larger than the
+        // number of bands the file actually stores.
+        var namedBands: Set<UInt8> = []
         for band in entry.bands {
+            guard namedBands.insert(band.band).inserted else {
+                report.error("chunk index entry \(i) names band \(band.band) more than once")
+                indexBoundsSafe = false
+                continue
+            }
             let (bandEnd, bandOverflow) = band.offset.addingReportingOverflow(band.length)
             if bandOverflow || bandEnd > walked.size || band.offset >= walked.size {
                 report.error(

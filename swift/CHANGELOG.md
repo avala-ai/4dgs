@@ -8,15 +8,16 @@ All notable changes to the Swift package are documented here, following
 
 ### Added
 
-- `4dgs`, the inspect-and-validate tool, completing the row across all six SDKs. `4dgs inspect`
-  walks a file record by record — offset, opcode by name, content and total length, and whether the
-  Footer's summary checksum covers that record and agrees — and a file that was cut is walked as far
-  as it goes, then reports the byte it stopped at and how many complete records before it a streamed
-  reader keeps. `4dgs validate` names the refusal identifier and the byte it fired at: all seven
-  invalid corpus variants are refused by the identifier their `.json` declares, at bytes 0, 8, 0,
-  154, 659, 8 and 2506 — the same bytes the Rust tool prints. Exit codes are 0 valid, 1 refused or
-  invalid, 2 valid with warnings, and 3 for the tool could not run, which is the absence of an
-  answer rather than an answer about the file.
+- `4dgs`, the inspect-and-validate tool, turning the Swift cell of that row from Planned to Yes;
+  TypeScript, Rust, C++ and Dart still read Planned. `4dgs inspect` walks a file record by record —
+  offset, opcode by name, content and total length, and whether the Footer's summary checksum covers
+  that record and agrees — and a file that was cut is walked as far as it goes, then reports the
+  byte it stopped at and how many complete records before it a streamed reader keeps.
+  `4dgs validate` names the refusal identifier and the byte it fired at: all seven invalid corpus
+  variants are refused by the identifier their `.json` declares, at bytes 0, 8, 0, 154, 659, 8 and
+  2506 — the same bytes the Rust tool prints. Exit codes are 0 valid, 1 refused or invalid, 2 valid
+  with warnings, and 3 for the tool could not run, which is the absence of an answer rather than an
+  answer about the file.
 
   The tool is a library plus a three-line executable, so its tests drive the whole of it — arguments
   in, output and exit code out — without spawning a process. It decodes the chunks, and every band

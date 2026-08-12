@@ -15,12 +15,35 @@
 
 import FourDGS
 
-func walk(_ source: ToolReader) throws -> Walk {
-    try walk(source, retaining: { _ in true })
-}
+/// Retaining one `Frame` per record is unbounded on untrusted input: a file built from zero-length
+/// records amplifies its already-buffered bytes into hundreds of megabytes of metadata. The
+/// retaining helper refuses past the same ceiling the validator uses, and callers that genuinely
+/// want every record use the visitor overload below, which retains none of them.
+public let maximumRetainedWalkRecords = 262_144
 
 public func walk(_ bytes: [UInt8]) throws -> Walk {
-    try walk(ToolReader(InMemoryReader(bytes)))
+    var seen = 0
+    let walked = try walk(
+        ToolReader(InMemoryReader(bytes)),
+        retaining: { _ in
+            seen += 1
+            return seen <= maximumRetainedWalkRecords
+        })
+    guard seen <= maximumRetainedWalkRecords else {
+        throw FourDGSError.malformed(
+            offset: Int64(clamping: walked.records.last?.offset ?? 0), record: "record walk",
+            field: "record count",
+            reason:
+                "the file carries more than \(maximumRetainedWalkRecords) records; walk it with "
+                + "the visiting overload rather than retaining every frame")
+    }
+    return walked
+}
+
+/// Walk every record while retaining none of them. `visit` receives each frame and whether it was
+/// intact; the returned `Walk` still carries the counts, the cut and the trailing-magic answer.
+public func walk(_ bytes: [UInt8], visit: (Frame, Bool) -> Void) throws -> Walk {
+    try walk(ToolReader(InMemoryReader(bytes)), retaining: { _ in false }, visit: visit)
 }
 
 /// One table row, in the column widths the Rust and C++ tools print. The tools are expected to

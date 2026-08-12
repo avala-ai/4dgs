@@ -18,6 +18,7 @@ public enum Opcode {
     public static let audio: UInt8 = 0x09
     public static let statistics: UInt8 = 0x0C
     public static let attachment: UInt8 = 0x0D
+    public static let attachmentIndex: UInt8 = 0x0E
     public static let summaryOffset: UInt8 = 0x0F
     public static let deltaChunk: UInt8 = 0x10
     public static let audioSource: UInt8 = 0x11
@@ -65,8 +66,12 @@ public func isProvenance(_ opcode: UInt8) -> Bool {
     opcode >= Opcode.coordinateFrame && opcode < Opcode.provenanceEnd
 }
 
+/// Attachment Index is reserved without a defined body and writers MUST NOT emit it, so it is not
+/// a record an implementation can claim to support; AttributeStream is a bare Chunk structure
+/// rather than a top-level record. Neither counts as specified.
 public func isSpecified(_ opcode: UInt8) -> Bool {
-    (opcode >= Opcode.header && opcode <= Opcode.audioData && opcode != Opcode.attributeStream)
+    (opcode >= Opcode.header && opcode <= Opcode.audioData && opcode != Opcode.attributeStream
+        && opcode != Opcode.attachmentIndex)
         || (opcode >= Opcode.coordinateFrame && opcode <= Opcode.objectTrack)
 }
 
