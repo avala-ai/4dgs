@@ -27,7 +27,7 @@ jobs:
             echo "conformance data: ${size_kb} KiB"
             [ "$size_kb" -le 2560 ] || { echo "::error::conformance data over budget"; exit 1; }
           fi
-      - name: Rust sources under 1100 KB
+      - name: Rust sources under 1360 KB
         # Sources only: this job builds nothing, so target/ is not here to measure. A
         # vendored dependency would show up as a budget failure, which is the point —
         # everything these crates need comes from crates.io via Cargo.toml.
@@ -41,8 +41,16 @@ jobs:
         # layer's records, composition module, indexed sampling, and conformance coverage
         # landed together; 1000 after the keyframe-delta model (composition, whole-file
         # write/decode, both read paths, and its encode-roundtrip runners) landed; 1100 after
-        # the object layer's composed-state entry point and its test. A budget
-        # that tight stops being a budget and starts being a tax
+        # the object layer's composed-state entry point and its test; 1200 after the `4dgs`
+        # validator learned to place a refusal — the refusal-placement walk and the
+        # chunk-decode scan are new files beside the tool's own, and the CLI tests that read
+        # their expectations out of the invalid corpus are another; 1280 after the review
+        # round that put a named regression test behind each of those behaviours, which is
+        # most of a hostile-fixture builder and ten tests; 1360 after the indexed-open and
+        # keyframe-reference regressions made that source tree 1300 KiB. A margin smaller
+        # than one deliberate review round is not headroom, it is the next source change
+        # failing a gate about vendored dependencies.
+        # A budget that tight stops being a budget and starts being a tax
         # on the next feature, so each raise leaves a little headroom. The number moves
         # when the tree grows deliberately, which is the one thing it is not meant to
         # catch — it exists so that a vendored dependency, which arrives in hundreds of
@@ -55,9 +63,9 @@ jobs:
         run: |
           size_kb=$(du -s rust | cut -f1)
           echo "rust: ${size_kb} KiB"
-          [ "$size_kb" -le 1100 ] || { echo "::error::rust is ${size_kb} KiB, over the 1100 KiB budget"; exit 1; }
+          [ "$size_kb" -le 1360 ] || { echo "::error::rust is ${size_kb} KiB, over the 1360 KiB budget"; exit 1; }
 
-      - name: TypeScript sources under 704 KB
+      - name: TypeScript sources under 896 KB
         # Sources only: this job installs nothing and builds nothing, so node_modules
         # and dist are not here to measure. A vendored dependency would show up as a
         # budget failure, which is the point.
@@ -74,11 +82,15 @@ jobs:
         # left — the next file would have tripped it whatever it contained.
         # Raised from 704 to 768 KiB for full keyframe-delta reconstruction: SH composition,
         # streamed-prefix recovery, indexed-chain checks and the hostile-input tests that pin them.
+        # Raised from 768 to 896 KiB for the keyframe-delta encoder: the sequence writer, gate
+        # fixtures and tests land on top of the decoder and measure 872 KiB in a clean checkout.
+        # Keep one coordinated ceiling for the combined package; `du` rounds each file to a
+        # 4 KiB block, so 24 KiB of headroom is six files.
         run: |
           size_kb=$(du -s typescript | cut -f1)
           echo "typescript: ${size_kb} KiB"
-          [ "$size_kb" -le 768 ] || { echo "::error::typescript is ${size_kb} KiB, over the 768 KiB budget"; exit 1; }
-      - name: Dart sources under 768 KB
+          [ "$size_kb" -le 896 ] || { echo "::error::typescript is ${size_kb} KiB, over the 896 KiB budget"; exit 1; }
+      - name: Dart sources under 960 KB
         # Sources only, same as TypeScript's and Swift's: this job builds nothing, so
         # .dart_tool and the compiled runners are not here to measure, and a vendored
         # dependency would show up as a budget failure.
@@ -109,10 +121,19 @@ jobs:
         # ceilings, and the writer stack took it 704 to 768 — so all three agreeing makes
         # the merge a no-op instead of three-way arithmetic. The number is coordinated,
         # not guessed.
+        # Raised from 768 to 832 KiB when the completed single-chunk writer measured 776
+        # KiB in a clean checkout. Its bounded streaming sink, identity lanes, fidelity
+        # gate and regressions are the feature this layer claims; 768 was therefore eight
+        # KiB below the source already under review. The next 64 KiB step leaves 56 KiB of
+        # headroom instead of turning the budget into an exact-size assertion again.
+        # Raised from 832 to 896 KiB for the completed chunked writer. Its interval tree,
+        # reconstructed-support planning, selective-seek proofs and regressions take a clean
+        # tree from the parent's 776 KiB to 864 KiB. The next 64 KiB step leaves 32 KiB of
+        # headroom while keeping the budget tied to the feature this layer adds.
         run: |
           size_kb=$(du -s dart | cut -f1)
           echo "dart: ${size_kb} KiB"
-          [ "$size_kb" -le 768 ] || { echo "::error::dart is ${size_kb} KiB, over the 768 KiB budget"; exit 1; }
+          [ "$size_kb" -le 960 ] || { echo "::error::dart is ${size_kb} KiB, over the 960 KiB budget"; exit 1; }
       - name: Swift sources under 640 KB
         # Sources only, same as TypeScript's: this job builds nothing, so .build is not
         # here to measure and a vendored dependency would show up as a budget failure.
@@ -612,7 +633,9 @@ jobs:
           cd ../conformance && dart analyze --fatal-infos
 
       - name: Tests
-        run: cd dart/fourdgs && dart test
+        run: |
+          cd dart/fourdgs && dart test
+          cd ../conformance && dart test
 
       # The one gate that would otherwise be discovered on release day. It is cheap, it
       # needs no credentials, and a package that cannot be packed is a package whose first

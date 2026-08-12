@@ -172,3 +172,15 @@ class TestTheCanonicalFormHasNoSignedZero:
         assert not str(kdf._num(-1e-9)).startswith("-")
         assert kdf._num(-1.5) == -1.5
         assert kdf._num(float("inf")) is None
+
+
+def test_keyframe_delta_variants_retain_an_untouched_common_row():
+    for name, data, _ in generate.build_keyframe_delta_corpus():
+        if name.startswith("KeyframeOnly"):
+            continue
+        decoded = kdf.decode_streamed(data)
+        deltas = [chunk for chunk in decoded.chunks if chunk.kind == 1]
+        assert deltas, name
+        assert any(chunk.update_count < len(chunk.state.ids) - chunk.birth_count for chunk in deltas), (
+            f"{name} restates every common row"
+        )

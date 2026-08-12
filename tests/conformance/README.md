@@ -316,6 +316,88 @@ a variant:
   runner whose stdout is not text fails one variant with its output quoted, rather than ending the
   run in a `UnicodeDecodeError` that names neither the runner nor the variant.
 
+## The encode gate: three claims about a written file
+
+`encode_roundtrip.py` proves an **encoder**, and it does it without a second corpus. Every encode
+family ships one CLI — `<encoder> <in.4dgs> <out.4dgs> [sh-bit-depths]` — that decodes a variant,
+re-encodes the gaussians it yielded with a fixed option preset, and writes the result. The preset is
+declared once, in `rust/conformance/src/bin/encode_gaussians.rs`, and every encoder reproduces it.
+
+```sh
+python3 tests/conformance/encode_roundtrip.py --encoder python   # the reference itself
+python3 tests/conformance/encode_roundtrip.py --encoder rust
+python3 tests/conformance/encode_roundtrip.py --encoder cpp
+python3 tests/conformance/encode_roundtrip.py --encoder swift
+python3 tests/conformance/encode_roundtrip.py --encoder typescript
+python3 tests/conformance/encode_roundtrip.py --encoder dart
+python3 tests/conformance/encode_roundtrip.py --references        # the two references, diffed
+python3 tests/conformance/encode_roundtrip.py --self-test         # the gate's own tests
+```
+
+Three claims are then made about that file, and none of them implies another:
+
+| Claim            | Question it answers                                          |
+| ---------------- | ------------------------------------------------------------ |
+| **Fidelity**     | is this the scene that went in?                              |
+| **Agreement**    | does this encoder mean the same thing as the reference?      |
+| **Index counts** | does the file's own index describe the records it points at? |
+
+**Fidelity** compares the written file against its source lane by lane, inside the error bounds the
+written file **itself declares**. The tolerance is read out of the file rather than chosen by the
+harness: re-encoding quantizes a second time, so exact equality is the wrong test, and a hardcoded
+epsilon either passes everything or fails a legitimate ladder. The same scene written at a coarser
+quantization profile declares looser numbers and is held to those. Velocity and birth time have no
+per-file pitch at all — theirs is per gaussian — so those are derived the way a decoder derives
+them, from the sigma bins, the window length and the cutoff the file declares, and each gaussian is
+held to half of its own.
+
+This is the claim agreement cannot make. Until it existed the source was never a term in the
+comparison beyond the gaussian count, so a fault present in **both** encoders passed and a faithful
+port of a buggy reference was indistinguishable from a correct one — two writer bugs in the Python
+reference lived for months behind a green gate for exactly that reason.
+
+**Agreement** is the older claim and is kept: the reference and the candidate must decode to
+identical canonical JSON. It catches divergence, which fidelity cannot see — two encoders can each
+be inside their declared bounds and still build different chunk trees. For a second encoder the
+summary's byte offsets and the producer's `library` string are dropped first, because how well
+deflate did is legitimately its own business.
+
+**Index counts** check what nothing else does: an index states what a seek will cost and how many
+gaussians it will yield, and every reader takes the population off the composed state instead. Under
+`gaussian-birth` each entry's `gaussian_count` is checked against the chunk it points at and the
+total against the Header. Under `keyframe-delta` an entry's `gaussian_count` counts **operations**
+while `live_count` counts the **population** after composition — two different numbers, stated for
+keyframe entries as well — and the Header counts **distinct ids** rather than a sum over chunks.
+
+### The two references against each other
+
+`--references` runs the Python and Rust reference encoders against each other over the corpus rather
+than a candidate against one of them. It compares the decoded summary and, separately, what the file
+_declares_ — the bounds map as the bytes spell it, the steps, the profile — because a bound written
+`5e-05` against `5e-5` is invisible to a comparison of decoded meaning.
+
+It is opt-in, and the divergences it finds are listed in `KNOWN_REFERENCE_DIVERGENCES` with the
+issue that owns each one. That list is not a list of things that are fine: it is a list of things
+that have an issue number, which is the difference between a known divergence and an unnoticed one.
+It shrinks to nothing as those issues are answered, and the mode goes red on anything not in it.
+
+The same list applies when the Python reference is run as a candidate (`--encoder python`), because
+Python against Rust is that comparison whichever direction it is driven from. Every tolerated
+divergence is printed and counted on each run.
+
+### The gate's own tests
+
+`--self-test` proves each check bites, because a gate with no tests rots exactly like the code it
+guards. It asserts that the tolerance really does follow the file's declared bounds (the same scene
+at a fine and a coarse profile, and the coarse encode's real deviation is past what the fine file
+declares); that fidelity names each lane it can fail on; that agreement still reports a divergence
+fidelity is blind to; and that the index-count checks catch a swapped count on both temporal models.
+
+The keyframe-delta half of that last one matters: the encode corpus is `gaussian-birth` only, so
+that branch would otherwise never execute, and a check that never reaches the path it claims to
+cover is not coverage. It is run against the committed keyframe fixtures instead. A missing fixture
+is a failure there, never a skip.
+
 ## Platforms
 
 The suite runs on GitHub-hosted runners for Python, TypeScript and Rust on Linux, macOS and Windows;

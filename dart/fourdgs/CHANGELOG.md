@@ -12,6 +12,119 @@ mention its own version — and because the release gate extracts this section a
 so it has to exist before the tag rather than after it. There is no date: the release has not
 happened.
 
+### The writer
+
+- `writeFourdgsToSink` encodes a `FourdgsGaussianSet` one complete framed record at a time without
+  retaining the output file; `writeFourdgsBytes` is the explicit in-memory convenience over that
+  sink API. Both write the magic at both ends, Header, Quantization, Window Table, Chunks and their
+  attribute streams, spherical-harmonic band records, and Footer. A second encoder rather than a
+  binding — it shares no code with the other five SDKs and lands on the same integer bins, so a
+  decoder cannot tell its output from theirs once decoded.
+- Chunked encode. The timeline is partitioned into an interval tree whose top level is the window
+  table rather than an even split — gaussians fitted over one window straddle the boundaries of an
+  even split, so all of them would be pushed to the root and the tree would have one node in it. A
+  gaussian goes in the deepest node whose interval fully contains its support, so it is stored
+  exactly once however long it lives, and a reader that wants one instant fetches the nodes covering
+  it instead of the scene. `maxDepth` and `minChunkGaussians` control the shape; a node too small to
+  be worth its own chunk hands its gaussians back to its parent. A node whose midpoint has run out
+  of doubles — an interval can exhaust `double` before it exhausts the depth limit — is a leaf,
+  because the alternative is a nonempty chunk over a zero-width interval that no seek can ever
+  select. And a partition finer than the `262144` entries an indexed reader will open is refused by
+  name rather than written: the top level is the window table, so a scene giving every gaussian its
+  own validity window sets the floor on the entry count, and the resulting file would be one only
+  the streamed path could read.
+- The Dart indexed conformance runner now makes a **selective** seek on every variant it decodes,
+  not only a whole-scene assembly. For probe instants away from a chunk boundary it reads just the
+  entries whose interval covers the instant and requires the state they reconstruct to equal the
+  state the whole scene gives. This is the claim the canonical summary cannot make: a gaussian filed
+  in the wrong chunk still appears in a whole-scene summary, at the same values, with both read
+  paths agreeing — and is simply missing from a seek. The guard around a boundary is derived from
+  the file's own declared pitches, and the number of probes that ran is asserted, so a guard that
+  swallowed every instant is a failure rather than a green check that never executed. Planning costs
+  `O(n log n)` in the gaussian count and not `O(n²)`: a scene that gives every gaussian its own
+  validity window has as many top-level intervals as gaussians, and each gaussian finds its interval
+  by binary search over the split points rather than by every interval being offered every gaussian.
+- Summary writing, in the shape spec §4.5 requires: the Chunk Index, then Statistics, then the
+  Summary Offset, one contiguous run immediately before the Footer with nothing else inside it. That
+  contiguity is what lets a streamed reader verify `summary_crc` by retaining the trailing records
+  rather than the whole file, so it is asserted on the written bytes rather than assumed. Every
+  offset and length in the index frames a whole record, opcode byte included (§5.8).
+- `FourdgsWriteOptions` carries the quantization profile, the Header's `cutoff`, the deflate level,
+  which summary records to write, and the Header's `profile`, `library` and attributes. The defaults
+  are the reference encoders'.
+- Refusals name the field and the gaussian, not just the failure: a non-finite value in a lane that
+  lands on a grid, a NaN validity window, a validity window whose lower bound is above its upper, a
+  NaN or `-inf` sigma, a bin outside the signed 32-bit symbols a stream carries, an unknown profile,
+  a cutoff outside `(0, 1]`. `+inf` is a value in three places and is written as one — a
+  never-fading `sigma_t`, and a `win_lo`/`win_hi` that says a gaussian is present at every instant.
+  An inverted window is refused rather than written because visibility is gated on `lo <= t < hi`:
+  it would cover no instant, and this package's own reader refuses the record carrying it, so
+  writing one produces a file neither read path can reopen.
+- Every option has a range and is checked against it before anything acts on it: `level` is `-1` or
+  `0`–`9`, `maxDepth` is `0`–`32`, `minChunkGaussians` is at least `1`, `shBands` is not negative.
+  Each is a `FourdgsInvalidInput` naming the option, the value and the range, because the
+  alternative is what these did before — an out-of-range deflate level surfacing as a `RangeError`
+  from inside a compression package, and an unbounded `maxDepth` surfacing as a `StackOverflowError`
+  from inside the chunk planner, where a gaussian that lives for a single instant never straddles a
+  midpoint and so never stops descending. Neither names the option or the caller who set it, and
+  neither is catchable as one of this library's own exceptions.
+- Three lanes that a domain repair would otherwise change silently are refused instead: an rgb or
+- Three lanes that a domain repair would otherwise change silently are refused instead: an rgb or
+  opacity component outside `[0, 1]`, which `decodeChunk` clamps back into the range, so a channel
+  of 1.2 returns as 1.0 in a file declaring an `rgb` bound near 0.004; a scale at or below zero,
+  whose logarithm is undefined; and a finite negative `sigma_t`, which would be floored to a
+  positive lifetime. Every strictly positive Float32 scale, including values below `1e-30`, is
+  quantized from its actual logarithm and stays inside the declared relative bound. A `sigma_t` of
+  exactly zero stays legal: it is a gaussian whose support is a single instant.
+- Finite authoring input is also checked in the representation the decoder returns. A position or
+  velocity whose legal integer bin reconstructs beyond finite `float32` is refused rather than
+  emitted as infinity. Equal infinite window endpoints are temporarily refused by the writer: the
+  wire value is a legal empty span, but version-1 SDKs do not yet share one motion-grid
+  interpretation for `Infinity - Infinity`.
+- A spherical-harmonic row must be whole degrees — 3, 8 or 15 coefficients per colour component —
+  and its buffer must be the size that row implies. Bands are whole and a reader takes them whole
+  (§6.5), so a row of four coefficients cannot be written as a degree-2 band, and building one out
+  of the columns that happen to be there produced a band record declaring three channels where the
+  band defines fifteen: a file neither of this package's read paths could reopen.
+- The optional identity streams `source_group`, `source_index` and `object_id` are decoded and
+  written when the set carries them, rather than dropped. §6.6: "The Object Table, Object Tracks and
+  `object_id` stream are independently optional … None is a reason to invent or discard another."
+  `object_id` crosses to the stream's signed symbols by the same-bits two's-complement view §6.6
+  defines, so the whole unsigned 32-bit domain survives; delta coding stays available because a
+  candidate that will not fit a 32-bit symbol is dropped rather than truncated.
+- The Summary Offset's declared range ends where the Chunk Index ends. Measured after Statistics had
+  been appended, it advertised `chunk-index` over a run whose tail was a Statistics record — which
+  defeats the one thing the record exists for, letting a consumer range-read a single class of
+  summary record.
+- The scene profile `objects` is refused. A profile is a promise about what the file contains, and
+  that one promises an `object_id` stream in every non-empty chunk and an Object Table (registry,
+  Profiles); this writer emits neither, so accepting it would put a claim in the Header that the
+  bytes below it do not keep.
+- The Header declares the spherical-harmonic degree the file actually carries, which is the highest
+  band written rather than the degree the input held: `shBands` caps what is emitted, and bands are
+  whole (§6.5), so a degree-3 scene written with `shBands: 1` is a degree-1 file.
+- Coefficients are quantized onto the pitch the Quantization record declares. `step_sh` is an
+  encode-side value — a decoder does nothing with it (§6.5) — which is exactly why the encoder must
+  apply it: the `coarse` profile declares a pitch of 3 and now writes on it. The top bin's centre is
+  clamped back into a byte, because at that pitch the coefficient 255 centres on 256 and would reach
+  a reader as 0, the extreme positive coefficient read as the extreme negative one.
+- Deterministic: two encodes of one scene are byte-identical, including the Header's attribute map,
+  whose keys are sorted rather than emitted in whatever order the caller's map iterates.
+- Proved by `dart/encode-roundtrip.sh`, which re-encodes all 46 corpus variants — into as many as 42
+  chunks each — and makes two separate claims about each result. **Fidelity**: the written scene is
+  compared against the scene it was written from, by the Python reference reader, attribute by
+  attribute, against the error bounds the written file itself declares — including the per-gaussian
+  velocity and birth-time pitches, derived the way a decoder derives them, and the presence, degree
+  and shape of the spherical harmonics, which are checked before any coefficient is compared because
+  an encoder that emitted none at all would otherwise skip the comparison entirely. The
+  object-bearing case also pairs and compares both exact source identity lanes. **Agreement**: the
+  Dart, Python and Rust decoders must produce identical canonical JSON from the result, on both read
+  paths each — six readers, three implementations. Neither claim implies the other. Decoders reading
+  one file the same way say nothing about whether that file is the scene that went in, and an
+  encoder checked only by its own decoder proves that two halves of one implementation share an
+  opinion. Every reader is required: a missing one is an error rather than a reader quietly dropped
+  from the comparison. It runs in the conformance workflow.
+
 ### Hostile-input hardening
 
 The decoder refuses a class of file it previously accepted — values that decode into
@@ -92,8 +205,60 @@ Each ceiling names the byte, the record, the value and the expectation, so
 as `FourdgsChunkIndexEntry` already did, and the chunk parsers report where their stream blocks
 start.
 
+### Refusal diagnosis
+
+- **Refusals say which rule was broken.** Every exception in this package now carries an optional
+  `refusalCode`, and the six identifiers the specification's refusal table names — `magic-mismatch`,
+  `unsupported-major-version`, `unknown-temporal-model`, `unknown-quantization-scheme`,
+  `unknown-stream-codec`, `window-index-out-of-range` — are exported as named constants rather than
+  written as literals at the raise sites, because six implementations are compared on those strings
+  and a typo in one reads in CI like a decoder bug. The exception class alone was too coarse to
+  compare on: `FourdgsUnsupportedCodec` covers an unknown temporal model, an unknown quantization
+  scheme and an unknown stream codec alike, so "it threw `FourdgsUnsupportedCodec`" cannot tell a
+  decoder that refused for the right reason from one that refused for the wrong one. `null` means "a
+  real error the refusal table does not name", not "no error" — which is why `FourdgsTruncatedFile`,
+  the one refusal that is recoverable rather than refusable, offers nowhere to put an identifier.
+  This is additive: `refusalCode` is a property on the existing `FourdgsException` rather than a new
+  class, so every `catch` and every `is` check keeps working, and `FourdgsException` still extends
+  `FormatException`.
+
 ### Fixed
 
+- **A file whose magic is corrupted anywhere but the version byte is no longer reported as an
+  unsupported version.** `checkMagic` tested only that bytes 1-4 read `4DGS`, so flipping the
+  leading `0x89` sentinel — the byte that stops byte-oriented tooling treating a 4dgs file as text —
+  produced "4dgs major version 1 is not supported by this reader". That sends the file's holder
+  looking for a newer reader, which would not have helped. The version byte must now be the only
+  difference, which also catches the mangled `CR LF` the sentinel exists alongside. Nothing inside
+  Dart could see this, because both answers are a `FourdgsUnsupportedVersion` carrying a plausible
+  sentence; it took giving the two answers different names.
+- **A window index outside the Window Table is refused rather than clamped.** The `gaussian-birth`
+  chunk decoder clamped an out-of-range index to the nearest window, which substitutes one
+  gaussian's lifetime for another's in a file that is already wrong in some way nobody has diagnosed
+  — the scene renders and the fault is gone. Python and Rust have always refused it, and this
+  package's own `keyframe-delta` path already did, so one file decoded two ways depending on its
+  temporal model. An absent or empty Window Table is still one default `(0, 0)` window (spec §5.4),
+  so index 0 resolves and everything past it does not. The refusal names the offending record and
+  not only the offending value: the identifier says which rule broke, but a file has many chunks and
+  all of them decode through one function, so "window index 7 is outside the 1-entry window table"
+  left its holder a whole file to search. It is built in one place now — three sites reach it, the
+  chunk decoder and both keyframe-delta grid lookups — and reads
+  `gaussian 5 of the chunk at byte 4096 names window index 7, …` on the chunk path and
+  `gaussian 77 names …` on the keyframe-delta path, where the stable id is what the file carries and
+  the row is an artefact of composition order.
+- **Every refusal a chunk raises says which chunk.** `decodeChunkStreams` takes the chunk record's
+  file offset and names it in all of them — the duplicate attribute stream, the element and channel
+  count mismatches, the missing required attributes, the decoded-size ceiling, the chunk-level codec
+  and the two per-gaussian refusals. None of them could be placed in a multi-chunk file, and fixing
+  one of them would have left the rest to be found the same way a second time.
+- **The keyframe-delta window refusal names the gaussian even when its id is in the top half of the
+  `u32` range.** `gaussian_id` is a `u32` (spec §11.2) and bins decode as signed 32-bit in every
+  SDK, so `0xFFFFFFFF` arrives as `-1` — and "no gaussian supplied" was spelled `-1` too. The one
+  gaussian whose id was the largest the format allows was therefore the one gaussian whose refusal
+  silently lost its location. The absent case is a `null` now, which no id can collide with. The id
+  is still printed as the signed value the decoder holds, because that is the value this package's
+  `states` JSON carries and the value Python and Rust print for the same file; a message naming an
+  id that appears nowhere else would be a worse diagnosis than a negative one.
 - **A truncated Header is not an unsupported one.** A Header that ended after its `temporal_model`
   string was refused for naming a model this build does not implement, when what it actually is, is
   incomplete — sending whoever holds it to add codec support for a file that needs none. Every

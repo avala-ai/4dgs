@@ -58,6 +58,21 @@ String crcOf(List<int> data) =>
 String canonical(Map<String, Object?> summary) =>
     const JsonEncoder.withIndent('  ').convert(_sorted(summary));
 
+/// The canonical answer for a file this reader refused.
+///
+/// A refusal is a result, not a crash: the runner prints this on stdout and
+/// exits 0, and the harness diffs it against the expectation like any other
+/// answer. Exiting non-zero instead would collapse "refused for the right
+/// reason" and "fell over" into one outcome, and telling those two apart is the
+/// whole point of the invalid corpus.
+///
+/// An error carrying no identifier prints an empty one, which matches no
+/// expectation and fails with a readable diff. That is deliberate: a refusal the
+/// library cannot name is a refusal the suite cannot check, and it should look
+/// like a gap rather than a pass.
+String refusalJson(FourdgsException error) =>
+    canonical(<String, Object?>{'refused': error.refusalCode ?? ''});
+
 Object? _sorted(Object? value) {
   if (value is Map<String, Object?>) {
     return SplayTreeMap<String, Object?>.from(

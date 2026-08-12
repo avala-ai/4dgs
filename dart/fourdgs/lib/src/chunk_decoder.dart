@@ -31,6 +31,7 @@ class FourdgsDecodedChunk {
     required this.winLo,
     required this.winHi,
     required this.windowIndex,
+    this.sourceGroup,
     this.sourceIndex,
     this.objectId,
     this.shBands = const <int, Uint8List>{},
@@ -47,6 +48,7 @@ class FourdgsDecodedChunk {
   final Float32List winLo; // count
   final Float32List winHi; // count
   final Int32List windowIndex; // count
+  final Int32List? sourceGroup;
   final Int32List? sourceIndex;
 
   /// Object membership (spec section 6.6), or null when the chunk carries
@@ -71,6 +73,17 @@ class FourdgsDecodedChunk {
 /// marginal threshold, so a decoder that guessed either would decode velocities
 /// the encoder never wrote — on a minority of gaussians, silently. Making them
 /// impossible to omit is the fix; remembering to pass them is not.
+///
+/// [chunkOffset] is where this chunk's record begins in the file. Every refusal
+/// below names it, because a file has many chunks and they all decode through
+/// here: "gaussian 5 names window index 7" is a sentence about some gaussian 5
+/// somewhere, and the person holding the file has no way to narrow it down
+/// (AGENTS.md §6). Defaulted rather than required, for the same reason
+/// [FourdgsQuantization.parse] defaults its `fileOffset` — a caller holding a
+/// bare chunk buffer has no file to be relative to, and says so with `0`.
+/// [streamsOffset] is the file offset of the first attribute stream header.
+/// Keeping it separate from [chunkOffset] lets a stream-codec refusal identify
+/// both the enclosing record and the exact stream that declared the codec.
 FourdgsDecodedChunk decodeChunkStreams(
   Uint8List streams,
   int count,
@@ -80,14 +93,27 @@ FourdgsDecodedChunk decodeChunkStreams(
   required double cutoff,
   String compression = '',
   Map<int, Uint8List> shBandRecords = const <int, Uint8List>{},
+  Map<int, int> shBandContentOffsets = const <int, int>{},
+  int chunkOffset = 0,
+  int streamsOffset = 0,
 }) {
+  final chunkAt = 'the chunk at byte $chunkOffset';
   if (compression.isNotEmpty) {
     // The registry allows a chunk to compress its whole records block, and the
     // reference encoder never does — streams carry their own codec. Reading one
     // that did would interpret compressed bytes as stream headers and decode
     // convincing rubbish, so it is named and refused instead.
+    //
+    // The same refusal as an unknown codec id on a stream, reached by the other
+    // route a file has to it: a chunk names its codec, a stream numbers it. The
+    // invalid corpus only takes the numbered route, so nothing in the suite
+    // holds this line down — it is here because one broken rule should not be
+    // diagnosed by name or anonymously depending on which of its two spellings
+    // the file used.
     throw FourdgsUnsupportedCodec(
-      'chunk-level "$compression" compression is not supported by this decoder',
+      '$chunkAt uses chunk-level "$compression" compression, which is not '
+      'supported by this decoder',
+      refusalCode: refusalUnknownStreamCodec,
     );
   }
 
@@ -113,7 +139,8 @@ FourdgsDecodedChunk decodeChunkStreams(
   // performed — `count` is attacker-chosen and 64-bit.
   if (count < 0 || count > maxChunkDecodedBytes ~/ perGaussian) {
     throw FourdgsMalformedFile(
-      'a chunk declares $count gaussians, which would decode to more than $maxChunkDecodedBytes bytes ($perGaussian per gaussian at this SH degree)',
+      '$chunkAt declares $count gaussians, which would decode to more than '
+      '$maxChunkDecodedBytes bytes ($perGaussian per gaussian at this SH degree)',
     );
   }
 
@@ -136,6 +163,7 @@ FourdgsDecodedChunk decodeChunkStreams(
   final got = <int, FourdgsAttributeStream>{};
   final cursor = FourdgsCursor(streams);
   while (cursor.remaining > 0) {
+    final streamOffset = streamsOffset + cursor.pos;
     final header = readStreamHeader(cursor);
     final wanted = _channelsFor(header.attributeId);
     // The format defines one stream per attribute, so a second is a chunk that
@@ -146,7 +174,7 @@ FourdgsDecodedChunk decodeChunkStreams(
     // records, spelled with attribute ids.
     if (got.containsKey(header.attributeId)) {
       throw FourdgsMalformedFile(
-        'a chunk carries attribute ${header.attributeId} twice; the format '
+        '$chunkAt carries attribute ${header.attributeId} twice; the format '
         'defines one stream per attribute',
       );
     }
@@ -158,15 +186,22 @@ FourdgsDecodedChunk decodeChunkStreams(
     }
     if (header.count != count) {
       throw FourdgsMalformedFile(
-        'attribute ${header.attributeId} declares ${header.count} elements, the chunk declares $count',
+        'attribute ${header.attributeId} of $chunkAt declares ${header.count} '
+        'elements, the chunk declares $count',
       );
     }
     if (header.channels != wanted) {
       throw FourdgsMalformedFile(
-        'attribute ${header.attributeId} declares ${header.channels} channels, the registry says $wanted',
+        'attribute ${header.attributeId} of $chunkAt declares '
+        '${header.channels} channels, the registry says $wanted',
       );
     }
-    got[header.attributeId] = decodeAttributeStreamBody(cursor, header);
+    got[header.attributeId] = decodeAttributeStreamBody(
+      cursor,
+      header,
+      streamOffset: streamOffset,
+      chunkOffset: chunkOffset,
+    );
   }
 
   if (count == 0) {
@@ -188,7 +223,9 @@ FourdgsDecodedChunk decodeChunkStreams(
   final missing =
       requiredAttributes.where((int a) => !got.containsKey(a)).toList();
   if (missing.isNotEmpty) {
-    throw FourdgsMalformedFile('chunk is missing required attributes $missing');
+    throw FourdgsMalformedFile(
+      '$chunkAt is missing required attributes $missing',
+    );
   }
 
   // Shapes were checked as the streams were read, so by here every entry has
@@ -223,7 +260,12 @@ FourdgsDecodedChunk decodeChunkStreams(
   final oy = posOrigin[1];
   final oz = posOrigin[2];
   final rgbOut = List<int>.filled(3, 0);
-  final lastWindow = windows.length - 1;
+  // An absent or empty Window Table is one default `(0, 0)` window (spec
+  // section 5.4) — degenerate, well defined, and not an error. It is a real row
+  // for the purpose of the bound below, so that index 0 resolves against it and
+  // every other index is still out of range; a table of length zero would make
+  // every index out of range, including the only legal one.
+  final windowCount = windows.isEmpty ? 1 : windows.length;
   // Derived once per chunk from the Header's own threshold. A file that declares
   // something other than the default was encoded against that number, so a
   // decoder that assumed 0.05 would put a minority of gaussians in the wrong
@@ -243,16 +285,16 @@ FourdgsDecodedChunk decodeChunkStreams(
     scales[i3 + 2] = math.exp(scale.values[i3 + 2] * steps.scaleLog);
 
     // Which quaternion component was dropped, and therefore which three the
-    // stream carries. Unlike the window index below — advisory geometry, so a
-    // bad one is clamped to the nearest window — this is structural: it says
-    // how to read the other three values. Outside 0..3 no component is ever
+    // stream carries. Structural, like the window index below: it says how to
+    // read the other three values. Outside 0..3 no component is ever
     // restored from `big`, and dequantizeRotation reads the third residual
     // twice, producing a quaternion that normalizes cleanly and is simply
     // wrong. Silently wrong orientations are worse than a refused file.
     final largest = rotIndex.values[i];
     if (largest < 0 || largest > 3) {
       throw FourdgsMalformedFile(
-        'gaussian $i names quaternion component $largest as its largest; only 0-3 exist',
+        'gaussian $i of $chunkAt names quaternion component $largest as its '
+        'largest; only 0-3 exist',
       );
     }
     dequantizeRotation(
@@ -281,14 +323,23 @@ FourdgsDecodedChunk decodeChunkStreams(
     sigmaT[i] =
         neverFades ? double.infinity : math.exp(sigmaBin * steps.sigmaLog);
 
-    // A window index out of range is clamped rather than fatal, matching the
-    // reference: the window table is advisory geometry, and refusing a whole
-    // scene over one bad index would be a worse answer than the nearest window.
+    // Refused rather than clamped, which is what this used to do and what the
+    // keyframe-delta path has always refused to do. Clamping substitutes one
+    // gaussian's lifetime for another's, in a file that is already wrong in
+    // some way nobody has diagnosed — it turns a detectable fault into
+    // plausible wrong output, and the scene renders. The specification makes
+    // this a refusal for that reason; Python and Rust have always made it one.
     final wi = window.values[i];
+    if (wi < 0 || wi >= windowCount) {
+      throw windowIndexOutOfRange(
+        wi,
+        windowCount,
+        gaussian: 'gaussian $i of $chunkAt',
+      );
+    }
     windowIndex[i] = wi;
-    final safe = lastWindow < 0 ? -1 : wi.clamp(0, lastWindow);
-    final lo = safe < 0 ? 0.0 : windows[safe].lo;
-    final hi = safe < 0 ? 0.0 : windows[safe].hi;
+    final lo = windows.isEmpty ? 0.0 : windows[wi].lo;
+    final hi = windows.isEmpty ? 0.0 : windows[wi].hi;
     winLo[i] = lo;
     winHi[i] = hi;
 
@@ -307,6 +358,7 @@ FourdgsDecodedChunk decodeChunkStreams(
         mu.values[i] * muStep(sigmaBin, steps.sigmaLog, neverFades, steps.time);
   }
 
+  final sourceGroup = got[attrSourceGroup];
   final source = got[attrSourceIndex];
   final objects = got[attrObjectId];
   final shBands = <int, Uint8List>{};
@@ -315,6 +367,7 @@ FourdgsDecodedChunk decodeChunkStreams(
       content,
       expectedBand: band,
       expectedCount: count,
+      fileOffset: shBandContentOffsets[band] ?? 0,
     );
     if (decoded != null) shBands[band] = decoded;
   });
@@ -331,6 +384,8 @@ FourdgsDecodedChunk decodeChunkStreams(
     winLo: winLo,
     winHi: winHi,
     windowIndex: windowIndex,
+    sourceGroup:
+        sourceGroup == null ? null : Int32List.fromList(sourceGroup.values),
     sourceIndex: source == null ? null : Int32List.fromList(source.values),
     // Reinterpreted rather than truncated: the bits are already right, only
     // their signedness was wrong.
@@ -392,11 +447,11 @@ const int maxChunkDecodedBytes = 512 * 1024 * 1024;
 ///
 /// * the attribute-stream bins, `Int32List`s of `count * channels` — 21
 ///   channels across the eleven required attributes, plus 2 for the optional
-///   source-group and source-index streams: 23 × 4 = 92 bytes;
+///   source-group, source-index and object-id streams: 24 × 4 = 96 bytes;
 /// * the arrays handed back — 21 `Float32List` lanes (position 3, scale 3,
 ///   rotation 4, colour 4, motion 3, and one each of mu_t, sigma_t, window lo
-///   and window hi) plus two `Int32List` lanes (window index, source index):
-///   23 × 4 = 92 bytes;
+///   and window hi) plus four integer lanes (window index, source group,
+///   source index and object id): 25 × 4 = 100 bytes;
 /// * each SH band twice over: its bins as an `Int32List` and its coefficients
 ///   as the `Uint8List` handed back, 5 bytes per coefficient. Bands are
 ///   cumulative — degree 1 is 9 coefficients per gaussian, degree 2 is 24,
@@ -409,11 +464,7 @@ int chunkDecodedBytesPerGaussian(int shDegree) {
   for (int band = 1; band <= shDegree; band++) {
     shCoefficients += shBandChannels[band] ?? 0;
   }
-  // 96 + 96 rather than 92 + 92 since object membership joined the lanes it
-  // budgets for: `object_id` costs one decoded bin lane and one output array,
-  // four bytes each. A guard that under-counts a lane it now decodes is a
-  // guard that lets a crafted count allocate past the ceiling it states.
-  return 96 + 96 + shCoefficients * 5;
+  return 96 + 100 + shCoefficients * 5;
 }
 
 /// Coefficients per gaussian in each spherical-harmonic band, three channels
@@ -509,10 +560,14 @@ const Map<int, ({int first, int last})> shBandRange =
 ///
 /// Coefficients are returned as the bytes the producer stored, undecoded. What
 /// those bytes mean is a rendering decision and does not belong to a container.
+/// [fileOffset] is where [content] starts in the file, so a stream-codec
+/// refusal can name the SH Band Stream's exact header byte. Zero is truthful
+/// for callers holding detached record content.
 Uint8List? decodeShBandRecord(
   Uint8List content, {
   required int expectedBand,
   required int expectedCount,
+  int fileOffset = 0,
 }) {
   final cursor = FourdgsCursor(content);
   final band = cursor.u8();
@@ -528,6 +583,7 @@ Uint8List? decodeShBandRecord(
     throw FourdgsTruncatedFile('band $band has a record but no stream in it');
   }
 
+  final streamOffset = fileOffset + cursor.pos;
   final header = readStreamHeader(cursor);
   final channels = shBandChannels[band];
   if (channels == null) {
@@ -546,7 +602,11 @@ Uint8List? decodeShBandRecord(
     );
   }
 
-  final stream = decodeAttributeStreamBody(cursor, header);
+  final stream = decodeAttributeStreamBody(
+    cursor,
+    header,
+    streamOffset: streamOffset,
+  );
   final out = Uint8List(stream.count * stream.channels);
   for (int i = 0; i < out.length; i++) {
     out[i] = stream.values[i] & 0xFF;
