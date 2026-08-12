@@ -417,7 +417,10 @@ function quantizeSample(
 
     for (let a = 0; a < 3; a++) {
       position.push(rint((g.positions[i * 3 + a]! - grids.origin[a]!) / steps.pos));
-      scale.push(rint(Math.log(Math.max(g.scales[i * 3 + a]!, 1e-30)) / steps.scaleLog));
+      // `medianScaleOf` already rejects non-positive and non-finite values. Preserve the
+      // complete positive binary64 domain here: flooring a smaller legal scale to 1e-30
+      // changes it by orders of magnitude while the file still promises `scale_rel`.
+      scale.push(rint(Math.log(g.scales[i * 3 + a]!) / steps.scaleLog));
     }
 
     const [largest, bins] = quantizeRotation(
@@ -780,7 +783,7 @@ function checkDepthPlan(
   }
 }
 
-function aabbOf(samples: readonly KeyframeDeltaSample[]): number[] {
+function aabbOf(samples: readonly KeyframeDeltaSample[], grids: Grids): number[] {
   const lo = [Infinity, Infinity, Infinity];
   const hi = [-Infinity, -Infinity, -Infinity];
   let any = false;
@@ -789,7 +792,10 @@ function aabbOf(samples: readonly KeyframeDeltaSample[]): number[] {
     for (let i = 0; i < g.count; i++) {
       any = true;
       for (let a = 0; a < 3; a++) {
-        const v = g.positions[i * 3 + a]!;
+        // Metadata describes the state in the file, not the source before quantization.
+        // Reconstruct exactly the value the serialized position bin will produce.
+        const bin = rint((g.positions[i * 3 + a]! - grids.origin[a]!) / grids.steps.pos);
+        const v = grids.origin[a]! + bin * grids.steps.pos;
         lo[a] = Math.min(lo[a]!, v);
         hi[a] = Math.max(hi[a]!, v);
       }
@@ -864,7 +870,7 @@ export async function encodeKeyframeDeltaSequence(
   const out = new ByteWriter(8192);
   out.bytes(MAGIC);
 
-  const aabb = aabbOf(samples);
+  const aabb = aabbOf(samples, grids);
   const header = new ByteWriter(256);
   header.string(profile);
   header.string(library);

@@ -170,16 +170,13 @@ export interface KeyframeDeltaVariant {
   /**
    * True when the reconstruction summary may be compared across languages.
    *
-   * False only for `Textured`, and for a decoder defect this pull request does not own:
-   * **#185**, where the Python reference applies §3's validity-window gate during
-   * `keyframe-delta` reconstruction and Rust and TypeScript do not. A sequence whose windows
-   * do not all cover the clip therefore reconstructs to a different population in Python than
-   * here — at `t = 0` Python reports three gaussians and this decoder six — and the two
-   * summaries differ over a difference in *decoding*, not in what the encoder wrote. Its
-   * chunk rows, which is everything the writer decides, agree exactly. Both read paths in
-   * each language are still required to agree, and the fidelity check below still runs
-   * through the Python decoder, so the multi-window lanes are covered by the claim that can
-   * carry them. Set this true when #185 lands.
+   * False only for `Textured`. Python's keyframe-delta reconstruction now applies each
+   * row's validity window, but unlike `GaussianSet.stateAt` and the TypeScript decoder it
+   * still does not remove a row whose temporal marginal is below the Header cutoff. At
+   * `t=7.999999` Python therefore retains three rows and TypeScript the specified two.
+   * Both read paths in each language and the writer's Python-decoded fidelity check still
+   * run; set this true once the Python keyframe-delta path applies the other half of §3's
+   * visibility rule in its own language PR.
    */
   readonly crossLanguage: boolean;
 }

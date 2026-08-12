@@ -30,6 +30,7 @@ import {
   decodeKeyframeDeltaStreamed,
   encodeKeyframeDeltaSequence,
   iterateRecords,
+  reconstructKeyframeDelta,
   keyframeDeltaStatesJson,
   parseChunkIndexEntry,
   parseHeader,
@@ -382,6 +383,35 @@ test("the Quantization record declares the bounds the file is held to", async ()
   // Every pitch is exactly twice its bound, in the domain that attribute is quantized in.
   assert.ok(Math.abs(quantization.stepPos - 2 * bound("pos")) < 1e-18);
   assert.ok(Math.abs(quantization.stepRot - 2 * bound("rot")) < 1e-18);
+});
+
+test("Header and Statistics bound the serialized positions", async () => {
+  const samples = pair(0, 0.003);
+  const data = await encodeKeyframeDeltaSequence(samples, DURATION);
+  const framed = records(data);
+  const quantization = parseQuantization(
+    framed.find((r) => r.opcode === Opcode.Quantization)!.content,
+  );
+  const expected = [0, 0, 0, quantization.stepPos, 0, 0];
+  const header = parseHeader(framed.find((r) => r.opcode === Opcode.Header)!.content);
+  const statistics = parseStatistics(framed.find((r) => r.opcode === Opcode.Statistics)!.content);
+  assert.deepEqual(header.aabb, expected);
+  assert.deepEqual(statistics.aabb, expected);
+});
+
+test("positive scales below 1e-30 keep the declared relative error", async () => {
+  const samples = pair(0, 0);
+  const tiny = 1e-35;
+  for (const sample of samples) {
+    sample.gaussians.scales = [tiny, 0.05, 0.05];
+  }
+  const data = await encodeKeyframeDeltaSequence(samples, DURATION);
+  const sequence = await decodeKeyframeDeltaStreamed(data);
+  const reconstructed = reconstructKeyframeDelta(sequence, sequence.chunks[0]!, 0);
+  const source = samples[0]!.gaussians.scales[0]!;
+  const relativeError = Math.abs(reconstructed.scales[0]! / source - 1);
+  const declared = Number(sequence.quantization.bounds.get("scale_rel"));
+  assert.ok(relativeError <= declared, `${relativeError} exceeds ${declared}`);
 });
 
 test("the even scale median stays finite near Number.MAX_VALUE", async () => {
