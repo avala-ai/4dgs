@@ -247,8 +247,8 @@ transport that failed are real errors the refusal table does not name. Swift car
 identifier on `FourDGSError.refusalCode`, fetched from the core through `fourdgs_last_refusal_code`
 — a binding reports the rule the one decoder applied rather than inferring one from a status code,
 and `FOURDGS_STATUS_UNSUPPORTED_CODEC` alone stands for three of the six. Dart carries the optional
-identifier on `FourdgsException.refusalCode`, from the constants its `exceptions` library exports.
-A consumer can branch on any of these refusals without reading its prose.
+identifier on `FourdgsException.refusalCode`, from the constants its `exceptions` library exports. A
+consumer can branch on any of these refusals without reading its prose.
 
 The row was also the first thing to find a gap in the reference: neither an unknown `temporal_model`
 nor an unknown quantization `scheme` was refused at all before it existed, despite the registry
