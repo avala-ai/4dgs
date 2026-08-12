@@ -59,6 +59,13 @@ GOP_INVARIANT = frozenset({op.A_SIGMA_T, op.A_FLAGS, op.A_WINDOW_INDEX})
 #: Attributes an update restates outright rather than differencing.
 ABSOLUTE_IN_UPDATE = frozenset({op.A_ROTATION_INDEX, op.A_ROTATION})
 
+#: Optional identity lanes, where zero is the value for a row that predates the lane or
+#: whose birth omits it. They carry no geometry, so a row without one is a row that is
+#: simply unlabelled — unlike a position, where no such value exists. Once a later group
+#: introduces one, the composed column still has to line up with the whole population.
+#: The Dart SDK names the same three, and §8 asks the six to agree.
+ZERO_DEFAULT_IDENTITY = frozenset({op.A_SOURCE_GROUP, op.A_SOURCE_INDEX, op.A_OBJECT_ID})
+
 
 @dataclass
 class State:
@@ -187,7 +194,7 @@ def apply_delta(
                 f"ids are unique within a state and are not reused after a death",
                 "duplicate-gaussian-id",
             )
-        absent = sorted(set(state.bins) - set(birth_bins))
+        absent = sorted(set(state.bins) - set(birth_bins) - ZERO_DEFAULT_IDENTITY)
         if absent:
             raise _refuse(
                 f"a birth group carries no value for attributes {absent}; a birth is absolute state, not a delta",
@@ -201,18 +208,47 @@ def apply_delta(
                     "stream-element-count-mismatch",
                 )
             _check_absolute_bins(attribute, values, "a birth group")
-        state = State(
-            ids=np.concatenate([state.ids, birth_ids]),
-            bins={
-                attribute: np.concatenate([state.bins[attribute], np.asarray(birth_bins[attribute], dtype=np.int64)])
-                if attribute in state.bins
-                else np.asarray(birth_bins[attribute], dtype=np.int64)
-                for attribute in (set(state.bins) | set(birth_bins))
-            },
-        )
+        state = State(ids=np.concatenate([state.ids, birth_ids]), bins=_merge_births(state, birth_ids, birth_bins))
 
     _check_rotation_indexes(state)
     return state
+
+
+def _merge_births(state: State, birth_ids: np.ndarray, birth_bins: dict[int, np.ndarray]) -> dict[int, np.ndarray]:
+    """The composed columns after a birth group joins the live population.
+
+    Every column has to come out `len(state.ids) + len(birth_ids)` rows tall, because the
+    rows are addressed by position against `ids`. Taking a birth-only column whole left it
+    as tall as the birth group alone, and the next update read row `n` of a column that had
+    `n - k` of them — an `IndexError` on a file, or a silent read of the wrong gaussian.
+
+    Zero is a defined value only for the optional identity lanes, so those pad. Any other
+    attribute the live population lacks cannot be composed: there is no value zero stands
+    for in a position or a scale, and inventing one puts a gaussian somewhere it is not.
+    """
+    merged: dict[int, np.ndarray] = {}
+    for attribute in set(state.bins) | set(birth_bins):
+        existing = state.bins.get(attribute)
+        added = None if attribute not in birth_bins else np.asarray(birth_bins[attribute], dtype=np.int64)
+        if existing is None and attribute not in ZERO_DEFAULT_IDENTITY:
+            raise _refuse(
+                f"a birth group carries attribute {attribute}, which the live population does not; "
+                f"a composed column has one value per gaussian and zero is not one for this attribute",
+                "unknown-attribute-in-birth",
+            )
+        # Beside it, and not instead of it: an attribute on both sides must agree on its
+        # channel count, or the composed column is two shapes at once.
+        if existing is not None and added is not None and existing.shape[1:] != added.shape[1:]:
+            raise _refuse(
+                f"a birth carries {added.shape[1:]} channels for attribute {attribute}, "
+                f"but the live population carries {existing.shape[1:]}",
+                "stream-element-count-mismatch",
+            )
+        channels = (existing if existing is not None else added).shape[1:]
+        before = existing if existing is not None else np.zeros((state.count, *channels), dtype=np.int64)
+        after = added if added is not None else np.zeros((birth_ids.shape[0], *channels), dtype=np.int64)
+        merged[attribute] = np.concatenate([before, after])
+    return merged
 
 
 def _check_absolute_bins(attribute: int, values: np.ndarray, what: str) -> None:

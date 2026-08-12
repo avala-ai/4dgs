@@ -260,6 +260,44 @@ def test_a_birth_must_carry_every_attribute_the_state_has():
     assert caught.value.code == "incomplete-birth"
 
 
+def test_every_composed_column_is_as_tall_as_the_population():
+    """The rows are addressed by position against `ids`, so a short column is not a
+    smaller answer — it is a read of the wrong gaussian, or an `IndexError` on a file.
+
+    An identity lane a birth introduces pads the rows that predate it, because zero is
+    the defined value for a row nothing labelled. Both sides of the lane are exercised:
+    introduced by the birth, and omitted by a birth into a state that already has it.
+    """
+    state = kd.keyframe_state(
+        np.asarray([1, 2]),
+        {op.A_POSITION: np.asarray([[0, 0, 0], [1, 1, 1]])},
+    )
+    grown = _apply(
+        state,
+        births=([3], {op.A_POSITION: np.asarray([[2, 2, 2]]), op.A_OBJECT_ID: np.asarray([[7]])}),
+    )
+    assert grown.count == 3
+    for attribute, column in grown.bins.items():
+        assert column.shape[0] == 3, f"attribute {attribute}: {column.shape}"
+    assert grown.bins[op.A_OBJECT_ID].reshape(-1).tolist() == [0, 0, 7]
+
+    later = _apply(grown, births=([4], {op.A_POSITION: np.asarray([[3, 3, 3]])}))
+    assert later.count == 4
+    assert later.bins[op.A_OBJECT_ID].reshape(-1).tolist() == [0, 0, 7, 0]
+
+
+def test_a_birth_cannot_introduce_an_attribute_that_carries_geometry():
+    """Zero stands for "unlabelled" in an identity lane and for nothing at all in a
+    position. Padding the older rows with it would put those gaussians at the origin."""
+    state = _state([1], [[0, 0, 0]])
+    with pytest.raises(MalformedFile) as caught:
+        _apply(
+            state,
+            births=([2], {op.A_POSITION: np.asarray([[1, 1, 1]]), op.A_OPACITY: np.asarray([[5]])}),
+        )
+    assert caught.value.code == "unknown-attribute-in-birth"
+
+
 # --------------------------------------------------------------------------
 # Seeking
 # --------------------------------------------------------------------------
