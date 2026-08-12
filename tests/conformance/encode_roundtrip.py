@@ -143,6 +143,12 @@ SH_LADDER = ",".join(str(depth) for depth in SH_LADDER_DEPTHS)
 RECORD_HEADER = struct.Struct("<BQ")
 
 SECOND_ENCODERS = frozenset({"dart", "python", "typescript"})
+#: Encoders whose round-trip CLI accepts the optional per-band depth argument. Dart's
+#: first independent writer proves its fixed quantization preset here; its CLI does not
+#: yet expose graded SH depths, so passing a third argument would test argv parsing rather
+#: than an encoder feature it claims. The SH layer above this one adds it and puts Dart
+#: back in the set.
+SH_LADDER_ENCODERS = frozenset(set(ENCODERS) - {"dart"})
 #: Gaussian-only Dart output deliberately clears the source's capture profile. Keep that
 #: compatibility normalization local to Dart: TypeScript's profile is part of the state
 #: its independent encoder must preserve.
@@ -1664,7 +1670,8 @@ def run_encoder(encoder: str) -> int:
     with tempfile.TemporaryDirectory() as tmp:
         for variant in names:
             source = os.path.join(DATA, f"{variant}.4dgs")
-            for ladder in [None] + ([SH_LADDER] if "SHDegree" in variant else []):
+            graded_pass = "SHDegree" in variant and encoder in SH_LADDER_ENCODERS
+            for ladder in [None] + ([SH_LADDER] if graded_pass else []):
                 label = variant if ladder is None else f"{variant} @ {ladder}"
                 try:
                     notes = compare(
