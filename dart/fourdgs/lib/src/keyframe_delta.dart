@@ -297,15 +297,22 @@ KeyframeDeltaState _applyDelta(
         );
       }
     }
-    // Every attribute the referenced state carries, not only the required ones.
-    // A birth is absolute state: if the state it joins has an `object_id` — or
-    // a `source_group`, or a `source_index` — then a birth that omits it is not
-    // saying "background", it is failing to say anything, and zero-filling it
-    // invents a membership the file never declared. Python, Rust and TypeScript
-    // all refuse this as `incomplete-birth`; narrowing it to the required list
-    // made the same bytes decode here and refuse there.
+    // Two sources, and both are needed. §5.18 makes a birth state "the full
+    // required attribute set of a keyframe chunk, plus gaussian_id", so the
+    // eleven required ids are wanted whatever the reference happens to carry —
+    // a keyframe with `count == 0` carries none of them, and asking only what
+    // the reference has accepted a birth stating position alone. And every
+    // attribute the reference *does* carry is wanted too: a birth that omits
+    // the state's `object_id` is not saying "background", it is failing to say
+    // anything. The zero-default ids are the exemption to both.
+    //
+    // Getting this wrong is not a diagnosis lost. The column merged below is
+    // sized from the attributes present, so a birth missing one produced a
+    // column shorter than the id array, and the next delta indexed off the end
+    // of it — `4dgs validate` died with a RangeError on a file it was reading.
+    final wanted = <int>{...requiredAttributes, ...bins.keys};
     final absent = <int>[
-      for (final attribute in bins.keys)
+      for (final attribute in wanted)
         if (!birthBins.containsKey(attribute) &&
             !_zeroDefaultIdentityAttributes.contains(attribute))
           attribute,
