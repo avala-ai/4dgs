@@ -106,6 +106,16 @@ def build(scenario, flags, *, read_back: bool = True, **overrides) -> tuple[byte
         win_hi=np.asarray(raw["win_hi"], dtype=np.float32),
         sh=(np.arange(n * coeffs, dtype=np.int64) % 251).astype(np.uint8).reshape(n, coeffs) if coeffs else None,
         sh_degree=sh_degree,
+        # The one object-bearing top-level variant also carries all exact
+        # producer-side identity lanes. Distinct nontrivial values make a
+        # decode/re-encode loss observable instead of merely proving that all
+        # readers agree on the degraded file.
+        source_group=(
+            (np.arange(n, dtype=np.int64) * np.int64(31) - np.int64(1009)) if "WithObjects" in flags else None
+        ),
+        source_index=(
+            (np.arange(n, dtype=np.uint32) * np.uint32(104729) + np.uint32(17)) if "WithObjects" in flags else None
+        ),
         object_id=(np.where(np.arange(n) % 3 == 0, 7, 0).astype(np.uint32) if "WithObjects" in flags else None),
     )
 
@@ -220,6 +230,7 @@ def build(scenario, flags, *, read_back: bool = True, **overrides) -> tuple[byte
         write_statistics="UseStatistics" in flags,
         write_summary_offsets="UseSummaryOffset" in flags,
         write_crc="UseCrc" in flags,
+        preserve_source_ids="WithObjects" in flags,
         library="4dgs conformance generator",
         scene_profile="objects" if "WithObjects" in flags else ("baked" if scenario.long_lived else "capture"),
         metadata={"scenario": scenario.name} if "WithMetadata" in flags else None,
