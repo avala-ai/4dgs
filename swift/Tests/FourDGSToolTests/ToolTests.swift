@@ -1112,6 +1112,23 @@ final class ValidateTests: XCTestCase {
         }
         XCTAssertEqual(repeated.count, 1, "\(repeated.map(\.message))")
         XCTAssertTrue(repeated[0].message.contains("20 Footer records"))
+
+        // A record after the Footer breaks §4, and that is the whole of what it breaks. The
+        // Footer still names its summary, so the summary records are still covered by it.
+        // Holding the last *record* instead of the last Footer resolved no summary at all
+        // here, and every ChunkIndex, Statistics and SummaryOffset record came back orphaned
+        // — three wrong findings on top of the one true one, and the CRC never checked.
+        var trailingRecord = original
+        trailingRecord.insert(
+            contentsOf: [Opcode.privateStart] + littleU64(4) + [UInt8](repeating: 0, count: 4),
+            at: trailingRecord.count - magic.count)
+        let afterFooter = validate(trailingRecord).findings
+        XCTAssertTrue(
+            afterFooter.contains { $0.message.contains("is not final") },
+            "\(afterFooter.map(\.message))")
+        XCTAssertFalse(
+            afterFooter.contains { $0.message.contains("lies outside the Footer-declared summary") },
+            "\(afterFooter.map(\.message))")
     }
 
     func testGaussianBirthHeaderAndIndexMetadataMatchPhysicalState() throws {

@@ -157,13 +157,19 @@ public struct Walk {
     public var size: UInt64 = 0
     public var recordCount = 0
 
-    /// The last intact record the walk saw, tracked whatever the retention predicate said.
+    /// The last intact Footer the walk saw, tracked whatever the retention predicate said.
     ///
     /// The Footer is the file's last record (§4), and a caller that wants *that* Footer cannot
     /// ask `records` for it: `inspect` and `validate` both retain only the first, so
     /// `firstIntact(Opcode.footer)` answers with an early stray one on a file that carries two.
-    /// One frame, held regardless of retention, is what makes the trailing record reachable.
-    public var lastIntact: Frame?
+    /// One frame, held regardless of retention, is what makes the trailing one reachable.
+    ///
+    /// The last *record* is the wrong thing to hold. A file with anything after its Footer —
+    /// two bodies concatenated, or an encoder that appended — would then resolve no summary at
+    /// all, and `validate` would call every ChunkIndex, Statistics and SummaryOffset record
+    /// orphaned and skip the CRC entirely. Such a file is malformed and `validate` says so on
+    /// its own; that is not a reason to stop reading the summary the Footer does name.
+    public var lastIntactFooter: Frame?
     fileprivate var intactRecordCount = 0
     fileprivate var retainedIntactCount = 0
 
@@ -264,7 +270,7 @@ func walk(
             out.retainedIntactCount += 1
         }
         out.intactRecordCount += 1
-        out.lastIntact = frame
+        if frame.opcode == Opcode.footer { out.lastIntactFooter = frame }
         visit?(frame, true)
         at = end
     }
@@ -504,7 +510,7 @@ func summaryDeclaration(_ source: ToolReader, _ walk: Walk) throws -> SummaryDec
     // and marked every row uncovered, hiding a real mismatch in the summary that is there.
     // `validate` reports a non-final Footer as an error of its own; `inspect` does not, and
     // this is the same defect PR #191 fixed in Dart's `_coverage`.
-    guard let frame = walk.lastIntact, frame.opcode == Opcode.footer else { return nil }
+    guard let frame = walk.lastIntactFooter else { return nil }
     let fields: UInt64 = 20
     let content = frame.offset + recordHeaderSize
     guard frame.length >= fields else {
