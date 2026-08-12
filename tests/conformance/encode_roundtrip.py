@@ -388,6 +388,10 @@ def _check_summary_offset_geometry(source: FileReadable, declared: list) -> None
     if footer_opcode != opcode.FOOTER or footer_length < 20:
         raise AssertionError(f"candidate Footer at {footer_offset} is not a complete Footer record")
     summary_start = struct.unpack("<Q", source.read(footer_offset + RECORD_HEADER.size, 8))[0]
+    if summary_start == 0:
+        if declared:
+            raise AssertionError("candidate declares Summary Offsets without a summary region")
+        return
     physical: dict[int, list[tuple[int, int]]] = {}
     offset = summary_start
     while offset < footer_offset:
