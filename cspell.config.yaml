@@ -154,6 +154,7 @@ words:
   - worktree
   - worktrees
   - toplevel
+  - taskkill
   # Conformance runner protocol: the harness is Python, and the documented contract names
   # the identifiers a runner author will actually see in `run.py` and `canonical.py`.
   - returncode

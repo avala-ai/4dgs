@@ -157,11 +157,40 @@ SDKs here happen to be built. Everything in it is what
 the harness is stricter or looser than it means to be, that is said plainly instead of smoothed
 over, because a runner author will meet the behaviour and not the intention.
 
-One limit belongs at the top, because it decides what is worth building today: `run.py` drives the
-runners named in its own `RUNNERS` table and no others. A program that satisfies every rule below is
-still not reachable from an unmodified harness — the flag that would point it at an out-of-tree
-runner is [issue #137](https://github.com/avala-ai/4dgs/issues/137), and this is the contract that
-flag will point at.
+`run.py` drives both the six built-in families in its `RUNNERS` table and runners from another
+repository. `--runner <family>` selects a built-in family; repeatable `--runner-cmd <command>`
+selects out-of-tree entry points instead. Both become the same internal capability record and go
+through the same support predicate, invocation and JSON comparison. An external runner may be scored
+against the committed expectations and may not rewrite them with `--update`.
+
+### Capabilities handshake
+
+Before scoring an out-of-tree runner, the harness starts it once with `--capabilities` as its only
+argument. It must exit zero and print one JSON object:
+
+```json
+{
+  "protocol": 1,
+  "name": "go/decode_streamed",
+  "family": "go",
+  "readPath": "streamed",
+  "refusals": true,
+  "declines": ["WithObjects"]
+}
+```
+
+`protocol` is the integer `1`; a boolean is rejected even though Python normally compares `true`
+equal to `1`. `readPath` is `streamed` or `indexed`, and `name` must be exactly
+`<family>/decode_<readPath>`. `family` may be omitted when it is the part of `name` before the first
+slash. `refusals` defaults to false and says whether the runner answers all seven invalid variants.
+`declines` defaults to an empty list and contains nonempty variant-name fragments for known valid
+features the runner does not implement. A malformed declaration, a non-zero exit, or a command that
+cannot start fails the run; it is not silently treated as an implementation that supports nothing.
+
+Pass one `--runner-cmd` per read path. The harness does not infer or manufacture the other path, and
+it does not require a pair, so the command list is also the record of which paths were actually
+scored. Command text is split with the platform's own command-line rules: POSIX shell quoting on
+Unix and `CommandLineToArgvW`-compatible quoting on Windows.
 
 ### Invocation
 
@@ -183,9 +212,14 @@ is inside the file.
 
 There is no stdin. The harness neither writes to it nor closes it, so the runner inherits whatever
 the harness inherited; a runner that reads stdin will block or read something unrelated to its job.
-There is no process timeout either: a blocked runner hangs the whole conformance run indefinitely,
-and no later exit-code diagnostic is produced. No environment variable carries part of the request
-and no configuration file is consulted.
+No environment variable carries part of the request and no configuration file is consulted.
+
+Every capabilities probe and file invocation has a timeout: 120 seconds by default, configurable
+with `--timeout <seconds>`. The value must be finite and above zero. On POSIX the harness gives the
+runner its own process group; on Windows it uses a new process group and `taskkill /T`, so a timeout
+ends wrapper commands and their decoder descendants rather than leaving the real work behind. A
+wrapper that exits but leaves a descendant holding stdout or stderr open is also failed after a
+bounded drain, not allowed to hang the suite.
 
 Each invocation is a fresh process handling one file. Nothing may be carried between variants, and
 nothing needs to be — the corpus is sixty files, so a runner is allowed to be slow to start and is
@@ -197,11 +231,10 @@ not allowed to be stateful.
 and parses the result as a single JSON document. A progress line, a banner, a warning or a second
 document all make that text unparseable.
 
-Unparseable stdout is worse than a failing variant, and this is the first place the harness is
-rougher than its intent: `run.py` hands whatever a zero-exit runner printed straight to `json.loads`
-without guarding it, so the exception escapes and the whole run stops with a traceback rather than
-one variant going red. A stray debug print does not cost a runner author one variant; it costs them
-the run.
+Unparseable stdout fails that runner and variant, quoting the first 200 characters, and the suite
+continues. The same is true when Python's JSON implementation rejects excessive integer length or
+nesting: parser limits are reported against the invocation rather than escaping as a harness
+traceback.
 
 **Except under `--update`, where it costs them the corpus.** That mode writes the runner's stdout to
 the expectation file and counts the variant as passed without parsing it at all — the write happens
@@ -210,12 +243,12 @@ under `--update` does not stop the run; it commits the banner as the expectation
 implementation is then diffed against. Treat `--update` as what it is: a deliberate rewrite of the
 contract, to be read in the diff before it is committed, and never a way to make a red suite green.
 
-**Stderr is free to carry diagnostics, but it still has to be text the harness can decode.**
-`run.py` captures both streams with Python's `text=True`, using its selected text encoding and
-strict error handling before the return code is inspected. One invalid byte on either stream raises
-`UnicodeDecodeError` and aborts the suite. Within that constraint the harness parses none of stderr
-and prints its first 2000 characters only when the runner exits non-zero. So stderr is where text
-diagnostics belong — with the caveat that on a passing run nobody will ever see them.
+**Stderr is free to carry diagnostics.** The harness parses none of it and prints its first 2000
+characters only when the runner exits non-zero. Both streams are drained as bytes and decoded as
+UTF-8 with replacement for an invalid sequence, so arbitrary diagnostic bytes do not crash the
+harness. Each stream has an 8 MiB capture ceiling; crossing it ends the runner tree and fails that
+variant by name. The ceiling is deliberately far above the largest expectation while keeping a
+program that prints forever from becoming an unbounded allocation.
 
 ### Exit codes: refused is not crashed
 
@@ -314,27 +347,22 @@ failure, a partial implementation would be indistinguishable from a broken one, 
 to a green suite would be to implement everything before landing anything — which is how
 implementations get abandoned rather than finished.
 
-Here is where an outside author will trip, and it is worth stating bluntly: **the decision is the
-harness's, not the runner's.** This page used to say that a runner declares a
-`supportsVariant(variant)` predicate, and three runners in this repository do define one —
-`supports_variant` in both Python runners, an exported `supportsVariant` in the TypeScript indexed
-runner. `run.py` calls none of them. The predicate that actually decides is `supports()` in the
-harness, and it consults three things:
+The predicate that decides is `supports()` in the harness. Built-in runners receive capabilities
+derived from the tables in `run.py`; out-of-tree runners receive the same record from their
+`--capabilities` answer. The predicate consults three things:
 
-1. `FAMILY_DECLINES`, a table mapping a language family to name fragments it has not implemented; a
-   variant containing one of that family's fragments is skipped. The table is empty today — every
-   family decodes provenance and the object layer — but it is the mechanism a partial SDK uses, and
-   `Object` was the fragment in it until the last family that needed it stopped. (`OBJECT_TOKENS`
-   still sits beside the table, now unused, as the fossil of that.)
-2. `REFUSAL_FAMILIES`, the set of families whose runners answer refusal expectations. A family
-   absent from it skips the whole invalid corpus. See [Refusing a file](#refusing-a-file).
-3. The `decode_indexed` rule above.
+1. `declines`: `FAMILY_DECLINES[family]` for a built-in or the external declaration's list. A valid
+   variant containing one of those fragments is skipped. The built-in table is empty today because
+   every family decodes provenance and the object layer.
+2. `refusals`: membership in `REFUSAL_FAMILIES` for a built-in or the external declaration's
+   boolean. False skips the whole invalid corpus. A decline fragment never reaches into that corpus,
+   even if an invalid filename happens to contain the same word.
+3. `indexed`: derived from the built-in runner name or the external `readPath`. An indexed runner
+   skips a valid variant without `UseChunkIndex`.
 
-So "declining" today is a fact the harness records about a family, not something a runner declares
-about itself, and an out-of-tree runner has no way to express it at all. Reconciling the two — the
-predicate the runners define and the tables the harness reads — is part of #137. Until that happens,
-the `supportsVariant` functions in this repository are a statement of intent rather than working
-code, and this section is what they intend.
+Some built-in entry points still define their own `supportsVariant` function. `run.py` does not call
+it; the capability record is authoritative. That keeps support decisions outside file invocation,
+where a skipped variant costs no process and cannot be confused with a decoder failure.
 
 One thing declining is _not_: **stepping an unknown or private record over by its length is not
 declining it.** Those records deliberately contribute no summary key. A conforming runner must skip
@@ -413,15 +441,12 @@ same handling misclassifies an unnamed decoder error as an answered refusal. Tha
 implementation that cannot name a decoder error must fail the invocation rather than copy those
 empty refusals.
 
-Whether any of this runs at all is gated at family granularity by `REFUSAL_FAMILIES`
-([`run.py:114`](https://github.com/avala-ai/4dgs/blob/main/tests/conformance/run.py#L114)), which
+For built-ins, whether any of this runs is gated at family granularity by `REFUSAL_FAMILIES`, which
 today holds `python`, `rust`, `typescript`, `cpp` and `swift`; Dart is the only built-in family that
-skips the invalid corpus. A family absent from the set skips all seven invalid variants exactly as
-it would skip any variant it declines — 105 checks rather than 119 — and the feature matrix is where
-that shows up publicly. The consequence for an outside implementation is sharp: a runner that
-answers every refusal perfectly proves nothing until its family is named in that set, which today
-means editing the harness. It is the hardest edge an out-of-tree runner meets, and the clearest
-thing #137 has to solve.
+skips the invalid corpus. A family absent from the set skips all seven invalid variants — 105 checks
+rather than 119 — and the feature matrix is where that shows up publicly. An out-of-tree runner
+makes the same claim with `"refusals": true` in its capabilities object, so it needs no harness edit
+and is held to all seven or none of them.
 
 The Python and Rust **indexed** runners inspect the version prefix before Header dispatch. If it is
 the exact version-1 magic, they read through the Header's length-prefixed `profile` and `library`
@@ -473,10 +498,10 @@ compares the parsed values:
 if json.loads(actual) == json.loads(expected):
 ```
 
-That is [`run.py:207`](https://github.com/avala-ai/4dgs/blob/main/tests/conformance/run.py#L207),
-and it is the whole comparison: recursive value equality over two parsed documents, with no
-tolerance and no text matching. The unified diff printed on a failure is generated afterwards, from
-the text, purely so that a human can read the disagreement; it decides nothing.
+That equality in [`run.py`](https://github.com/avala-ai/4dgs/blob/main/tests/conformance/run.py) is
+the whole comparison: recursive value equality over two parsed documents, with no tolerance and no
+text matching. The unified diff printed on a failure is generated afterwards, from the text, purely
+so that a human can read the disagreement; it decides nothing.
 
 Several rules follow from that one line, and they are what an implementer actually needs.
 
@@ -593,6 +618,11 @@ who wrote them, not a requirement on anyone reading them.
 ```sh
 python3 tests/conformance/generate.py
 python3 tests/conformance/run.py --runner python
+
+# One out-of-tree command per read path; each answers `--capabilities` first.
+python3 tests/conformance/run.py \
+  --runner-cmd 'go run ./cmd/decode_streamed' \
+  --runner-cmd 'go run ./cmd/decode_indexed'
 ```
 
 Swap `--runner` for the language you are working on. A language with a build step needs its entry
@@ -603,9 +633,16 @@ entry point is missing is skipped with a note rather than reported as a wall of 
 family asked for by name that never ran is an error, because a green suite that proved nothing is
 worse than a red one.
 
+`--runner` and `--runner-cmd` are mutually exclusive. The latter is repeatable and replaces the
+built-in table for that run; the capabilities handshake is its build/liveness check, so the harness
+does not apply the built-in "last command element exists" shortcut to commands such as `go run` or
+`dotnet run`. `--timeout` changes the per-probe and per-variant limit for either kind of runner.
+
 `--update` rewrites the expectations from the current runner output. Use it when you have decided
 that a change to the format or the summary is correct — never to make a red suite green, which is
 the one use that turns the expectations from a contract into a record of the last thing anyone ran.
+It is rejected with `--runner-cmd`: an implementation outside this repository may be compared with
+the contract and may not silently become the contract.
 
 ## Known gaps
 
