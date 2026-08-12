@@ -38,7 +38,15 @@ String? temporalModel(Uint8List data) {
 
 Future<String> run(String path) async {
   final data = File(path).readAsBytesSync();
-  if (temporalModel(data) == 'keyframe-delta') {
+  bool keyframeDelta = false;
+  try {
+    keyframeDelta = temporalModel(data) == 'keyframe-delta';
+  } on FourdgsException {
+    // This probe chooses between two indexed decoders; it is not validation.
+    // If the leading bytes or Header are invalid, fall through to the ordinary
+    // indexed opener so the advertised indexed refusal is actually exercised.
+  }
+  if (keyframeDelta) {
     // Read the Footer, then the index, then compose each chunk by walking its
     // chain — the seeking client's path — and emit the same states canonical the
     // streamed runner does. Agreeing across the two paths is most of what makes
@@ -106,6 +114,12 @@ Future<void> main(List<String> args) async {
   }
   try {
     stdout.writeln(await run(args.single));
+  } on FourdgsException catch (error) {
+    // Both read paths answer the invalid corpus, and they reach the Header by
+    // different routes — one front to back, one through the Footer. A check
+    // placed on only one of them refuses half the files it should, and only
+    // running both can show that.
+    stdout.writeln(refusalJson(error));
   } catch (error) {
     stderr.writeln(error);
     exit(1);
