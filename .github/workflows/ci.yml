@@ -117,7 +117,7 @@ jobs:
           size_kb=$(du -s typescript | cut -f1)
           echo "typescript: ${size_kb} KiB"
           [ "$size_kb" -le 1152 ] || { echo "::error::typescript is ${size_kb} KiB, over the 1152 KiB budget"; exit 1; }
-      - name: Dart sources under 960 KB
+      - name: Dart sources under 1152 KB
         # Sources only, same as TypeScript's and Swift's: this job builds nothing, so
         # .dart_tool and the compiled runners are not here to measure, and a vendored
         # dependency would show up as a budget failure.
@@ -161,10 +161,18 @@ jobs:
         # refusal diagnostics after #173 set this number, taking a clean tree to 932, and
         # `size-budget` has been failing on main since. Not this branch's growth — it adds
         # no Dart — but every PR that merges main inherits the red job.
+        # Raised from 896 to 1024 KiB for keyframe-delta encode: the sequence writer, its
+        # lane-by-lane verification, the unit suite, and the conformance sequence runner.
+        # Raised from 1024 to 1088 KiB after review completed bounded composition and the
+        # sequence regressions. The final pre-restack tree measured 1040 KiB; the next
+        # 64 KiB step leaves 48 KiB of headroom while keeping the vendoring tripwire tight.
+        # Raised from 1088 to 1152 KiB when the SH layer below came up the stack: the
+        # merged tree measures 1108, and 1088 was set before that layer was in it. The
+        # next 64 KiB step, 44 KiB of headroom.
         run: |
           size_kb=$(du -s dart | cut -f1)
           echo "dart: ${size_kb} KiB"
-          [ "$size_kb" -le 960 ] || { echo "::error::dart is ${size_kb} KiB, over the 960 KiB budget"; exit 1; }
+          [ "$size_kb" -le 1152 ] || { echo "::error::dart is ${size_kb} KiB, over the 1152 KiB budget"; exit 1; }
       - name: Swift sources under 300 KB
         # Sources only, same as TypeScript's: this job builds nothing, so .build is not
         # here to measure and a vendored dependency would show up as a budget failure.

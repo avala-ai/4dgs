@@ -142,6 +142,65 @@ happened.
 - The tests pin every named ladder, the pitch and bound each bit depth declares, and the maximum
   coefficient deviation after this encoder writes and decodes every band.
 
+### The `keyframe-delta` writer
+
+- `writeKeyframeDeltaBytes` encodes a sequence of `FourdgsSample`s — a population, with identities,
+  at a sequence of instants — into a complete `keyframe-delta` file: a keyframe Chunk or a Delta
+  Chunk per sample, the extended Chunk Index, Statistics and a Footer. Dart could play temporal
+  scenes back and could not produce them; it can now. `writeKeyframeDeltaToSink` emits the same
+  framed records without retaining the completed file in memory.
+- Every sample is quantized when it is emitted, on grids derived from the whole sequence, so a delta
+  is an integer subtraction between two bins on the same grid. The composition telescopes and the
+  bin at any depth is the bin an absolute statement of that instant would have carried, which is
+  what makes the declared bounds hold after the second delta rather than only after the first.
+- `FourdgsKeyframeDeltaOptions` carries the cadence (`keyframeEvery`, `keyframeAt`), the reference
+  mode (`deltaMode`: chained, or the group's keyframe), the quantization profile, the cutoff, the
+  deflate level, which summary records to write, and whether to verify. The defaults are the
+  reference encoders'.
+- The counting rules the format actually states, rather than the ones that read naturally. The
+  Header's `gaussian_count` is the number of **distinct ids**, not a sum over chunks — under this
+  model the chunks restate the same gaussians. A delta index entry's `gaussian_count` counts
+  **operations** — updates plus births plus deaths — and its `live_count` is the population those
+  compose to. `live_count` is stated on keyframe entries too, because §5.8 defines it for every
+  extended entry and this package's indexed reader cross-checks it: a writer that left it zero would
+  produce files this SDK refuses.
+- A sequence that does not tile `[0, duration_sec)` is refused rather than written: instants that
+  start after zero or go backwards, and a zero-width interval with a population behind it — one the
+  half-open seek rule could never select. So is a change to `sigma_t`, `flags` or `window_index`
+  between two samples of one group, which would subtract bins living on two different grids; the
+  refusal names the gaussian and says a keyframe or a death and a birth is the fix.
+- Rotation is restated outright in an update rather than differenced: the smallest-three basis
+  changes whenever the largest quaternion component does, so the three stored bins mean different
+  components either side of it. Births state all eleven attributes absolutely; deaths are identity
+  and nothing else; an empty group is zero bytes.
+- Every keyframe, update and birth states its position at that sample's `t0`. A moving row whose raw
+  position and motion bins repeat is therefore still updated when inheriting the older anchor would
+  advect it away from the new sample. Strictly positive Float32 scales are quantized from their
+  actual logarithm, including values below `1e-30`; equal infinite window endpoints are refused
+  because their NaN length gives version-1 decoders different motion grids.
+- The encoder decodes the file it just wrote, on **both** read paths, and checks every lane of every
+  sample against the bounds that file declares — position against `pos`, scale and `sigma_t` in the
+  log domain, velocity and birth time against the per-gaussian pitches a decoder recomputes, colour
+  and opacity against `rgb` and `alpha`, the quaternion against the dot product a per-component
+  bound implies, and the validity window for equality. Two encoders agreeing proves they share an
+  opinion; this is what proves the scene survived.
+- `keyframeDeltaPopulation` is the decode-side accessor that check needs and a consumer wanted: the
+  composed bins of a chunk as rest-state gaussian values, in `double`, without the reconstruction
+  step. It is what an exporter reads when it needs the state rather than a summary.
+- The index's own numbers are checked against the chunks they describe, with the Python SDK rather
+  than with Dart's reader. Issue #195: nothing in the canonical summary comes off the index —
+  `liveCount` there is read from the composed state — so an entry can carry the wrong
+  `gaussian_count` and every reader in the project reconstructs the scene correctly while the file
+  lies about the seek cost. Verified by injection: corrupting a delta entry's `gaussian_count` alone
+  passes all six readers and is caught only here; swapping it with `live_count` is caught earlier
+  still, by Dart's own indexed reader.
+- Proved against the corpus's own expectations. `dart/encode-roundtrip.sh` rebuilds the four corpus
+  sequences, writes them with this encoder, and requires the states JSON to equal the expectation a
+  **Python**-written file of the same sequence produced — read back by Dart, Python and Rust, on
+  both paths in each. Three more sequences the corpus does not carry go through the same gate: two
+  validity windows, a never-fading population, and one with real velocity, birth times and
+  orientations.
+
 ### Hostile-input hardening
 
 The decoder refuses a class of file it previously accepted — values that decode into

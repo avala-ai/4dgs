@@ -32,6 +32,7 @@ library;
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+import 'chunk_decoder.dart' show maxChunkDecodedBytes;
 import 'exceptions.dart';
 import 'opcode.dart';
 import 'quantization.dart';
@@ -64,6 +65,15 @@ const Set<int> keyframeDeltaGopInvariant = <int>{
 const Set<int> keyframeDeltaAbsoluteInUpdate = <int>{
   attrRotationIndex,
   attrRotation,
+};
+
+/// Optional identity lanes use zero as the value for rows that predate the
+/// lane or whose birth omits it. Once a later group introduces one, the public
+/// column must still remain aligned with the complete composed population.
+const Set<int> _zeroDefaultIdentityAttributes = <int>{
+  attrSourceGroup,
+  attrSourceIndex,
+  attrObjectId,
 };
 
 /// One attribute's bins for a whole population: [channels] per gaussian, packed
@@ -190,7 +200,11 @@ KeyframeDeltaState _applyDelta(
           'attribute $attribute carries ${delta.rows} rows, the update group declares ${updateIds.length}',
         );
       }
-      final target = bins[attribute];
+      var target = bins[attribute];
+      if (target == null && attribute == attrObjectId) {
+        target = _Column(1, Int32List(ids.length));
+        bins[attribute] = target;
+      }
       if (target == null) {
         throw FourdgsMalformedFile(
           'an update touches attribute $attribute, which the referenced state does not carry',
@@ -233,7 +247,9 @@ KeyframeDeltaState _applyDelta(
     }
     final absent = <int>[
       for (final attribute in bins.keys)
-        if (!birthBins.containsKey(attribute)) attribute,
+        if (!birthBins.containsKey(attribute) &&
+            !_zeroDefaultIdentityAttributes.contains(attribute))
+          attribute,
     ]..sort();
     if (absent.isNotEmpty) {
       throw FourdgsMalformedFile(
@@ -257,17 +273,29 @@ KeyframeDeltaState _applyDelta(
     final grown = <int, _Column>{};
     for (final attribute in attributes) {
       final existing = bins[attribute];
-      final added = birthBins[attribute]!;
-      final ch = added.channels;
-      final before = existing?.values ?? Int32List(0);
+      final added = birthBins[attribute];
+      if (added == null &&
+          !_zeroDefaultIdentityAttributes.contains(attribute)) {
+        throw FourdgsMalformedFile(
+          'a birth group carries no value for attribute $attribute; a birth is '
+          'absolute state, not a delta',
+        );
+      }
+      final ch = existing?.channels ?? added!.channels;
+      final before =
+          existing?.values ??
+          (_zeroDefaultIdentityAttributes.contains(attribute)
+              ? Int32List(ids.length * ch)
+              : Int32List(0));
+      final after =
+          added?.values ??
+          (_zeroDefaultIdentityAttributes.contains(attribute)
+              ? Int32List(birthIds.length * ch)
+              : Int32List(0));
       final merged =
-          Int32List(before.length + added.values.length)
+          Int32List(before.length + after.length)
             ..setRange(0, before.length, before)
-            ..setRange(
-              before.length,
-              before.length + added.values.length,
-              added.values,
-            );
+            ..setRange(before.length, before.length + after.length, after);
       grown[attribute] = _Column(ch, merged);
     }
     ids = grownIds;
@@ -398,6 +426,13 @@ Map<int, _Column> _decodeStreams(FourdgsCursor cursor, int at) {
     // complete stream is malformed; a repeated header whose payload runs past
     // the group is truncated, and taking this view allocates no decoded bins.
     final payload = cursor.take(header.payloadLength);
+    final wanted = _keyframeDeltaChannelsFor(header.attributeId);
+    if (wanted != null && header.channels != wanted) {
+      throw FourdgsMalformedFile(
+        'attribute ${header.attributeId} declares ${header.channels} channels, '
+        'the registry says $wanted',
+      );
+    }
     // One stream per attribute here too: the regular chunk path refuses a
     // second, and this path had its own loop that was still resolving it
     // silently.
@@ -421,6 +456,30 @@ Map<int, _Column> _decodeStreams(FourdgsCursor cursor, int at) {
     got[stream.attributeId] = _Column(stream.channels, stream.values);
   }
   return got;
+}
+
+int? _keyframeDeltaChannelsFor(int attribute) {
+  switch (attribute) {
+    case attrPosition:
+    case attrScale:
+    case attrRotation:
+    case attrColor:
+    case attrMotion:
+      return 3;
+    case attrRotationIndex:
+    case attrOpacity:
+    case attrMuT:
+    case attrSigmaT:
+    case attrFlags:
+    case attrWindowIndex:
+    case attrSourceGroup:
+    case attrSourceIndex:
+    case attrGaussianId:
+    case attrObjectId:
+      return 1;
+    default:
+      return null;
+  }
 }
 
 Int32List _idsOf(_Column gaussianId) {
@@ -1073,6 +1132,230 @@ _Reconstruction _reconstructAt(
     opacity[outRow] = alpha * marginal;
   }
   return _Reconstruction(ids, centers, scales, opacity);
+}
+
+/// A composed population as gaussian state, dequantized once from its bins.
+///
+/// Everything here is a rest-state value — the position a gaussian holds at its
+/// own `mu_t`, not the centre it is advected to at some instant. Advection and
+/// the visibility rules belong to reconstruction, and [keyframeDeltaPopulation]
+/// stops short of them on purpose: this is what a chunk *says*, which is the
+/// thing a producer checks its own output against and the thing an exporter
+/// needs whole.
+///
+/// The lanes are `double`, not `float`: they are the numbers the file's grids
+/// produce, and narrowing them here would put a rounding step between a declared
+/// error bound and the value it is a bound on.
+class KeyframeDeltaPopulation {
+  KeyframeDeltaPopulation._({
+    required this.ids,
+    required this.positions,
+    required this.scales,
+    required this.rotations,
+    required this.colors,
+    required this.motions,
+    required this.muT,
+    required this.sigmaT,
+    required this.windowIndex,
+    required this.sourceGroup,
+    required this.sourceIndex,
+    required this.objectId,
+  });
+
+  /// Aligned with every lane below, in the state's own row order — which is an
+  /// implementation detail of composition and not something a file declares.
+  final Uint32List ids;
+
+  final Float64List positions; // count * 3
+  final Float64List scales; // count * 3
+  final Float64List rotations; // count * 4, xyzw
+  final Float64List colors; // count * 4, linear rgb then alpha
+  final Float64List motions; // count * 3, units per second
+  final Float64List muT; // count
+  final Float64List sigmaT; // count; infinity means "never fades"
+  final Int32List windowIndex; // count, a row of the Window Table
+
+  /// Exact optional producer and object identities, aligned when present.
+  final Int32List? sourceGroup;
+  final Int32List? sourceIndex;
+  final Uint32List? objectId;
+
+  int get count => ids.length;
+}
+
+/// The population [chunk] composes to, as gaussian state on the file's grids.
+///
+/// The same arithmetic §5.6 and §6 give a `gaussian-birth` chunk, applied to the
+/// composed bins — which is the whole claim the model rests on: a bin reached by
+/// telescoping deltas dequantizes exactly as an absolute statement of the same
+/// instant would.
+KeyframeDeltaPopulation keyframeDeltaPopulation(
+  KeyframeDeltaSequence sequence,
+  KeyframeDeltaChunk chunk,
+) {
+  if (sequence.header.shDegree != 0) {
+    throw FourdgsUnsupportedFeature(
+      'keyframeDeltaPopulation cannot expose complete gaussian state for '
+      'sh_degree ${sequence.header.shDegree}: this API does not yet retain '
+      'aligned SH Band Stream records while composing a keyframe-delta chain; '
+      'refusing to return a population with its spherical harmonics missing',
+    );
+  }
+  return _population(chunk.state, _gridsFor(sequence));
+}
+
+KeyframeDeltaPopulation _population(KeyframeDeltaState state, _Grids grids) {
+  final n = state.count;
+  // Composition already retains the aligned bin columns. Account for those,
+  // the retained id lane, and every public output array before allocating any
+  // of the latter. Constant-mode streams can state millions of rows in a tiny
+  // file, so per-stream limits do not bound this aggregate peak.
+  var bytesPerGaussian = 164; // retained id + fixed public output arrays
+  for (final column in state._bins.values) {
+    bytesPerGaussian += column.channels * Int32List.bytesPerElement;
+  }
+  for (final attribute in _zeroDefaultIdentityAttributes) {
+    if (state._bins.containsKey(attribute)) {
+      bytesPerGaussian += Int32List.bytesPerElement;
+    }
+  }
+  if (n > maxChunkDecodedBytes ~/ bytesPerGaussian) {
+    throw FourdgsMalformedFile(
+      'a composed keyframe-delta state declares $n gaussians, which would retain and dequantize to more than $maxChunkDecodedBytes bytes ($bytesPerGaussian per gaussian)',
+    );
+  }
+  // Attribute streams use signed symbols internally, but gaussian_id is u32 on
+  // the wire and at the public API. Uint32List preserves the same bits while
+  // exposing values in the format's 0 through 0xffffffff identity domain.
+  final ids = Uint32List.fromList(state.ids);
+  final positions = Float64List(n * 3);
+  final scales = Float64List(n * 3);
+  final rotations = Float64List(n * 4);
+  final colors = Float64List(n * 4);
+  final motions = Float64List(n * 3);
+  final muT = Float64List(n);
+  final sigmaT = Float64List(n);
+  final windowIndexOut = Int32List(n);
+  Int32List? signedIdentity(int attribute) {
+    final column = state._bins[attribute];
+    if (column == null) return null;
+    if (column.channels != 1 || column.rows != n) {
+      throw FourdgsMalformedFile(
+        'optional identity attribute $attribute carries ${column.rows} rows at ${column.channels} channels; the composed population has $n gaussians and requires one aligned value per row',
+      );
+    }
+    return Int32List.fromList(column.values);
+  }
+
+  final sourceGroup = signedIdentity(attrSourceGroup);
+  final sourceIndex = signedIdentity(attrSourceIndex);
+  final objectCodes = state._bins[attrObjectId];
+  final objectId =
+      objectCodes == null ? null : Uint32List.fromList(objectCodes.values);
+  if (n == 0) {
+    return KeyframeDeltaPopulation._(
+      ids: ids,
+      positions: positions,
+      scales: scales,
+      rotations: rotations,
+      colors: colors,
+      motions: motions,
+      muT: muT,
+      sigmaT: sigmaT,
+      windowIndex: windowIndexOut,
+      sourceGroup: sourceGroup,
+      sourceIndex: sourceIndex,
+      objectId: objectId,
+    );
+  }
+
+  _Column column(int attribute) {
+    final got = state._bins[attribute];
+    if (got == null) {
+      throw FourdgsMalformedFile(
+        'a non-empty state carries no column for attribute $attribute; the '
+        'eleven required attributes are stated by every keyframe (section 11.5)',
+      );
+    }
+    return got;
+  }
+
+  final position = column(attrPosition).values;
+  final scaleBins = column(attrScale).values;
+  final rotationIndex = column(attrRotationIndex).values;
+  final rotationBins = column(attrRotation).values;
+  final colorBins = column(attrColor).values;
+  final opacityBins = column(attrOpacity).values;
+  final motionBins = column(attrMotion).values;
+  final muBins = column(attrMuT).values;
+  final sigmaBins = column(attrSigmaT).values;
+  final flags = column(attrFlags).values;
+  final windowIndex = column(attrWindowIndex).values;
+
+  final steps = grids.steps;
+  final k = supportK(grids.cutoff);
+  final rgb = List<int>.filled(3, 0);
+  for (int i = 0; i < n; i++) {
+    final sigmaBin = sigmaBins[i];
+    final neverFades = flags[i] & flagNeverFades != 0;
+    sigmaT[i] =
+        neverFades ? double.infinity : math.exp(sigmaBin * steps.sigmaLog);
+    final mStep = motionStep(
+      lifeClass(
+        sigmaBin,
+        steps.sigmaLog,
+        neverFades,
+        grids.windowLengthAt(windowIndex[i]),
+        k: k,
+      ),
+      steps.motion,
+    );
+    muT[i] =
+        muBins[i] * muStep(sigmaBin, steps.sigmaLog, neverFades, steps.time);
+    windowIndexOut[i] = windowIndex[i];
+
+    final i3 = i * 3;
+    for (int c = 0; c < 3; c++) {
+      positions[i3 + c] = position[i3 + c] * steps.pos + grids.origin[c];
+      scales[i3 + c] = math.exp(scaleBins[i3 + c] * steps.scaleLog);
+      motions[i3 + c] = motionBins[i3 + c] * mStep;
+    }
+    final omitted = rotationIndex[i];
+    if (omitted < 0 || omitted > 3) {
+      throw FourdgsMalformedFile(
+        'rotation_index is $omitted at gaussian $i in the composed population; '
+        'expected an omitted quaternion component in 0..3',
+      );
+    }
+    dequantizeRotation(
+      omitted,
+      rotationBins[i3],
+      rotationBins[i3 + 1],
+      rotationBins[i3 + 2],
+      steps.rot,
+      rotations,
+      i * 4,
+    );
+    rctInverse(colorBins[i3], colorBins[i3 + 1], colorBins[i3 + 2], rgb);
+    for (int c = 0; c < 3; c++) {
+      colors[i * 4 + c] = (rgb[c] * steps.rgb).clamp(0.0, 1.0);
+    }
+    colors[i * 4 + 3] = (opacityBins[i] * steps.alpha).clamp(0.0, 1.0);
+  }
+  return KeyframeDeltaPopulation._(
+    ids: ids,
+    positions: positions,
+    scales: scales,
+    rotations: rotations,
+    colors: colors,
+    motions: motions,
+    muT: muT,
+    sigmaT: sigmaT,
+    windowIndex: windowIndexOut,
+    sourceGroup: sourceGroup,
+    sourceIndex: sourceIndex,
+    objectId: objectId,
+  );
 }
 
 /// Decimals a float is rounded to before comparison, matching

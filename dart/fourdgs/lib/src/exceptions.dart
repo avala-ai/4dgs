@@ -90,6 +90,14 @@ class FourdgsUnsupportedCodec extends FourdgsException {
   const FourdgsUnsupportedCodec(super.message, {super.refusalCode});
 }
 
+/// A legal file feature that this particular high-level API cannot preserve.
+///
+/// This is distinct from malformed input: adding support, rather than repairing
+/// the file, is what makes the operation possible.
+class FourdgsUnsupportedFeature extends FourdgsException {
+  const FourdgsUnsupportedFeature(super.message);
+}
+
 /// The framing held but the content did not make sense — a required record
 /// missing, an attribute absent from a chunk, a field out of range.
 class FourdgsMalformedFile extends FourdgsException {
