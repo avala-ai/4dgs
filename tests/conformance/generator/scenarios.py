@@ -40,6 +40,18 @@ FLAGS = (
     # coefficients stay bytes; what changes is how many distinct values they take.
     "SHBitsHigh",  # (8, 7, 6) — near-lossless, and the band-1 entry is exact
     "SHBitsLow",  # (5, 4, 3) — the coarse end of the legal range
+    # Write fewer bands than the scene holds. Every other variant leaves `sh_bands` at its
+    # default 3, so the degree a file declares has always coincided with the highest band
+    # it carries and a writer could confuse the two without any fixture noticing — which is
+    # exactly what the reference did (issue #190). Here they must differ: a degree-3 scene
+    # written with `sh_bands = 1` carries band 1 alone and must declare degree 1.
+    "SHBandsCapped",
+    # Fill the coefficients across the whole byte range instead of the generator's usual
+    # `% 251`. That modulus keeps 251..255 out of every fixture, and at the `coarse`
+    # profile's `step_sh = 3` exactly one input overflows: 255 centres on 256, which no
+    # `u8` holds. Paired with `Quantized` this is the only variant whose coefficients reach
+    # the top of the grid the file declares (issues #181, #190).
+    "SHTopCoefficients",
     "DeltaStreams",  # delta-coded attribute streams rather than raw
     "WithSpatialAudio",  # embed one positioned audio source
     "WithMultipleAudioSources",  # independent static and moving sources
@@ -206,6 +218,23 @@ def variants() -> list[tuple[Scenario, tuple[str, ...]]]:
     # in — the SH digest is what proves a decoder read what was stored rather than what
     # it expected. The `Quantized` pairing is the precedence case: that profile sets the
     # uniform `step_sh` as well, and the per-band depths are what must win.
+    # The two SH settings the corpus never varied, and which between them hid both writer
+    # bugs in issue #190.
+    #
+    # `SHBandsCapped` is the only variant where the degree a file declares can differ from
+    # the highest band it carries: everywhere else `sh_bands` is the default 3 and the two
+    # coincide, so a writer that declared the input's degree instead of the file's was
+    # indistinguishable from a correct one.
+    #
+    # `SHTopCoefficients` with `Quantized` is the only variant whose coefficients reach the
+    # top of the pitch the file declares. A coarse-profile file with spherical harmonics
+    # already existed — `MixedLifetimes-Quantized-SHDegree2-…` carries `step_sh = 3` — but
+    # the generator fills coefficients with `% 251`, and at that pitch exactly one input
+    # value overflows its own encoding: 255 centres on 256. The corpus had the profile and
+    # was missing the one byte that breaks it.
+    add(mixed, "SHDegree3", "SHBandsCapped")
+    add(mixed, "SHDegree3", "SHTopCoefficients", "Quantized")
+
     add(mixed, "SHDegree2", "SHBitsHigh")
     add(mixed, "SHDegree2", "SHBitsLow")
     add(mixed, "SHDegree2", "SHBitsLow", "Quantized")
