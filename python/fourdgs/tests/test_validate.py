@@ -199,14 +199,15 @@ class TestRefusals:
         assert any("chunk index entry 0" in m for m in errors(report))
 
     def test_a_footer_naming_no_summary_still_checks_the_index_entries(self):
-        """`summary_start` 0 is §5.2's indexless file, so it selects no summary.
+        """`summary_start` 0 selects no summary, and the entries are still checkable.
 
-        Reading "selects nothing" as "nothing is valid" was wrong twice over. It reported
-        every Chunk Index record in the file as lying outside the selection — one line per
-        record, thousands of them on a real capture, and not one of them the actual fault.
-        And it emptied the entry list, so every per-entry check below silently stopped
-        running on records still sitting there to be read: the entry corrupted here, whose
-        range runs off the end of the file, went unreported.
+        Two separate answers are owed about such a file. Its Chunk Index records are
+        orphaned — nothing reaches them by seeking — and saying so is right; Swift's
+        `testFooterAndChunkIndexPlacementArePhysicalRules` pins the same rule. But
+        emptying the entry list on top of that stopped every per-entry check below from
+        running on records still sitting there to be read, so the entry corrupted here,
+        whose range runs off the end of the file, went unreported. Both answers now
+        arrive.
         """
         data = bytearray(real_file())
         summary_start = rec.Footer.parse(bytes(data[-(20 + len(MAGIC)) : -len(MAGIC)])).summary_start
@@ -218,8 +219,25 @@ class TestRefusals:
 
         report = validate(bytes(data))
 
-        assert not any("lies outside the Footer-selected summary index" in m for m in errors(report))
+        assert any("lies outside the Footer-selected summary index" in m for m in errors(report))
         assert any("chunk index entry 0" in m for m in errors(report))
+
+    def test_a_file_with_no_footer_does_not_name_a_selection_it_never_made(self):
+        """The other half: with no Footer there is no declaration to be outside of.
+
+        The missing Footer is the fault and is reported on its own. Saying every Chunk
+        Index record "lies outside the Footer-selected summary index" adds one misleading
+        line per record — thousands on a real capture — naming a selection the file never
+        made, on top of the one line that matters.
+        """
+        data = bytearray(real_file())
+        footer_at = len(data) - (20 + 9 + len(MAGIC))  # content, record header, trailing magic
+        without_footer = bytes(data[:footer_at]) + MAGIC
+
+        report = validate(without_footer)
+
+        assert any("no Footer record" in m for m in errors(report))
+        assert not any("lies outside the Footer-selected summary index" in m for m in errors(report))
 
     def test_a_keyframe_delta_file_naming_no_summary_is_still_decoded(self):
         """Keeping the index records must not send the file down the seeking branch.

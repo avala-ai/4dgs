@@ -433,10 +433,19 @@ def validate(data: bytes) -> Report:
                 f"the Footer's summary_start {footer.summary_start} does not name a complete summary record "
                 f"before the Footer at byte {footer_offset}"
             )
-    if footer_selects_summary:
+    # A Chunk Index record outside the range the Footer named — or present at all in a file
+    # whose Footer names no summary — is orphaned: nothing reaches it by seeking, and saying
+    # so is the point. A file with no Footer at all is the different case: there is no
+    # declaration for anything to be outside of, the real fault is the missing Footer and it
+    # is reported above, and adding a line per index record buries it.
+    if footer is not None:
         for offset in index_record_offsets:
             if offset not in selected_index_offsets:
                 report.error(f"the Chunk Index record at byte {offset} lies outside the Footer-selected summary index")
+    # Narrowed only when a summary was actually named. Otherwise the entries stay, because
+    # they are still there to be read: emptying the list silently stopped every per-entry
+    # check below from running on records whose own contents may be the fault.
+    if footer_selects_summary:
         index = [
             entry for offset, entry in zip(index_record_offsets, index, strict=True) if offset in selected_index_offsets
         ]
