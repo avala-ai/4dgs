@@ -1307,6 +1307,27 @@ class TestSHBandStreams:
         with pytest.raises(MalformedFile, match=r"expected 0\.\.255"):
             read_chunk(source, scene, scene.index[0], max_sh_band=1)
 
+    def test_an_entry_pointing_at_the_wrong_record_says_so(self):
+        """Two faults shared one message, and it only ever described the other one.
+
+        An entry aimed at a record whose framing agrees with the length it declares got
+        "declares N bytes; the record there frames exactly N" — a complaint that refutes
+        itself and never names what is wrong, which is that a Chunk is not there at all.
+        """
+        data = _real_file()
+        source = BytesReadable(data)
+        scene = open_indexed(source)
+        quantization = _first_record(data, op.QUANTIZATION)
+        entry = _with(
+            scene.index[0],
+            chunk_offset=quantization.offset,
+            chunk_length=9 + len(quantization.content),
+        )
+        with pytest.raises(MalformedFile) as caught:
+            read_chunk(source, scene, entry)
+        assert "points at Quantization rather than Chunk" in str(caught.value), str(caught.value)
+        assert "frames exactly" not in str(caught.value), str(caught.value)
+
 
 class TestWholeFileCompatibilityGates:
     def test_an_unknown_attribute_is_skipped_without_dispatching_its_codec(self):

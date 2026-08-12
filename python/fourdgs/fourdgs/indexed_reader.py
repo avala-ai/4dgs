@@ -347,7 +347,17 @@ def read_chunk(source: Readable, scene: IndexedScene, entry: rec.ChunkIndexEntry
     framed = Cursor(blob)
     opcode = framed.u8()
     content_length = framed.u64()
-    if opcode != op.CHUNK or content_length + 9 != len(blob):
+    # Two faults, and they were reported as one. An entry pointing at a Delta Chunk whose
+    # framing happens to match its declared length produced "declares 512 bytes; the record
+    # there frames exactly 512" — a complaint that contradicts itself, and never names the
+    # thing that is actually wrong.
+    if opcode != op.CHUNK:
+        raise MalformedFile(
+            f"the chunk index entry at {entry.chunk_offset} points at "
+            f"{op.name(opcode)} rather than {op.name(op.CHUNK)}",
+            code="index-record-mismatch",
+        )
+    if content_length + 9 != len(blob):
         raise MalformedFile(
             f"the chunk index entry at {entry.chunk_offset} declares {entry.chunk_length} "
             f"bytes; the record there frames exactly {content_length + 9}",
