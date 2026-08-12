@@ -156,6 +156,14 @@ public struct Walk {
     public var trailingMagic = false
     public var size: UInt64 = 0
     public var recordCount = 0
+
+    /// The last intact record the walk saw, tracked whatever the retention predicate said.
+    ///
+    /// The Footer is the file's last record (§4), and a caller that wants *that* Footer cannot
+    /// ask `records` for it: `inspect` and `validate` both retain only the first, so
+    /// `firstIntact(Opcode.footer)` answers with an early stray one on a file that carries two.
+    /// One frame, held regardless of retention, is what makes the trailing record reachable.
+    public var lastIntact: Frame?
     fileprivate var intactRecordCount = 0
     fileprivate var retainedIntactCount = 0
 
@@ -256,6 +264,7 @@ func walk(
             out.retainedIntactCount += 1
         }
         out.intactRecordCount += 1
+        out.lastIntact = frame
         visit?(frame, true)
         at = end
     }
@@ -488,7 +497,14 @@ public struct SummaryDeclaration {
 }
 
 func summaryDeclaration(_ source: ToolReader, _ walk: Walk) throws -> SummaryDeclaration? {
-    guard let frame = walk.firstIntact(Opcode.footer) else { return nil }
+    // The trailing Footer, not the first. §4 makes the Footer the file's last record, so an
+    // earlier one is a stray — two bodies concatenated, or an encoder that emitted a Footer
+    // before its summary — and answering from it made `inspect` read the wrong record's
+    // fields: a zero `summary_crc` there printed "this file declares no summary checksum"
+    // and marked every row uncovered, hiding a real mismatch in the summary that is there.
+    // `validate` reports a non-final Footer as an error of its own; `inspect` does not, and
+    // this is the same defect PR #191 fixed in Dart's `_coverage`.
+    guard let frame = walk.lastIntact, frame.opcode == Opcode.footer else { return nil }
     let fields: UInt64 = 20
     let content = frame.offset + recordHeaderSize
     guard frame.length >= fields else {

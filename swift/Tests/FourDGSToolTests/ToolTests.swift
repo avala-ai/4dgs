@@ -1859,7 +1859,7 @@ final class InspectTests: XCTestCase {
         XCTAssertEqual(runTool(["--version"]).code, exitOk)
     }
 
-    func testAClosedOutputPipeIsSuccessful() {
+    func testAClosedOutputPipeKeepsTheVerdict() {
         let pipe = Pipe()
         pipe.fileHandleForReading.closeFile()
         let out = StandardStream(pipe.fileHandleForWriting)
@@ -1870,7 +1870,11 @@ final class InspectTests: XCTestCase {
 
         let diagnostics = Pipe()
         let err = StandardStream(diagnostics.fileHandleForWriting)
-        XCTAssertEqual(processExit(exitFailed, out: out, err: err), exitOk)
+        // A reader walking away is a successful pipeline, so it manufactures no failure...
+        XCTAssertEqual(processExit(exitOk, out: out, err: err), exitOk)
+        // ...and it erases none either. The code is a verdict about the file, reached before
+        // any of it was written: `4dgs validate corrupt.4dgs | head -1` still exits non-zero.
+        XCTAssertEqual(processExit(exitFailed, out: out, err: err), exitFailed)
         diagnostics.fileHandleForWriting.closeFile()
         diagnostics.fileHandleForReading.closeFile()
     }

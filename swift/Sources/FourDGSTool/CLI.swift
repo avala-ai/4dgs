@@ -135,8 +135,14 @@ public final class StandardStream: TextOutput {
 
 /// Turn buffered stream state into the process result. A downstream reader closing a pipe is a
 /// successful pipeline; every other output failure is diagnosed and remains a tool failure.
+///
+/// A broken pipe does not manufacture a failure, and it does not erase one either. The exit code
+/// is a verdict about the *file*, reached before any of it was written, and `head` walking away
+/// changes nothing about the file. Returning `exitOk` here meant
+/// `4dgs validate corrupt.4dgs | head -1` exited 0 — so a CI step piping this tool through
+/// `head`, `grep -m1`, or any early-exiting reader was told a corrupt file was fine.
 public func processExit(_ code: Int32, out: StandardStream, err: StandardStream) -> Int32 {
-    if out.brokenPipe || err.brokenPipe { return exitOk }
+    if out.brokenPipe || err.brokenPipe { return code }
     guard let failure = out.failure ?? err.failure else { return code }
     err.line("4dgs: cannot write output: \(failure)")
     return exitTool
