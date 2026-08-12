@@ -298,143 +298,268 @@ fn seek_cost(scene: &IndexedScene) {
     }
 }
 
-/// Walk the records: offset, opcode, length.
+/// What the Footer's summary checksum covers, and whether it agrees.
 ///
-/// Framing only. A record's content is never read, so this is as cheap on a file with an
-/// embedded audio payloads as on one without, and an opcode nobody here has heard of is
-/// stepped over by its own declared length — which is the whole forward-compatibility
-/// story, exercised rather than described.
+/// The only checksum the format defines: `summary_crc` over the bytes from
+/// `summary_start` to where the Footer begins. So a record's "CRC status" is a fact about
+/// the region it sits in rather than a field of its own — covered and agreeing, covered
+/// and not, or covered by nothing at all — and saying so per record is what tells a reader
+/// whether the checksum has anything to say about the record they are looking at.
+#[derive(Debug)]
+struct Coverage {
+    start: u64,
+    /// One past the last covered byte: where the Footer record's opcode sits.
+    end: u64,
+    ok: bool,
+}
+
+impl Coverage {
+    /// The cell for a record, in the vocabulary `info` already prints for the file as a
+    /// whole.
+    fn cell(this: &Option<Coverage>, at: u64, total: u64) -> &'static str {
+        match this {
+            Some(c) if at >= c.start && at.saturating_add(total) <= c.end => {
+                if c.ok {
+                    "ok"
+                } else {
+                    "MISMATCH"
+                }
+            }
+            _ => "-",
+        }
+    }
+}
+
+/// How much of the summary is read at once while its checksum is computed.
+///
+/// The region is `[summary_start, footer_start)`, and `summary_start` is eight bytes off an
+/// untrusted file: a Footer may name byte 8, which makes the region the whole file. Sizing
+/// one allocation from it is how a tool asked to look at a bad file runs out of memory
+/// reporting on it, so the checksum is fed in blocks of this size instead (principle 1).
+const CRC_BLOCK: u64 = 1024 * 1024;
+
+/// The Footer's three fields: `summary_start`, `summary_offset_start`, `summary_crc`.
+///
+/// `Footer::parse` reads exactly these twenty bytes and ignores whatever follows — which is
+/// what makes a Footer a later revision extends still readable here. So twenty bytes is all
+/// this command reads of one, and the record's own declared length, eight bytes off an
+/// untrusted file, never sizes an allocation: a Footer that declares the rest of the file as
+/// its content is a fact `inspect` prints in the length column, not a buffer it makes.
+const FOOTER_FIELDS: u64 = 20;
+
+/// Read the Footer and check the summary it declares.
+///
+/// `None` when the file declares no summary checksum, which is a property of the file
+/// rather than a failure: `write_crc` is an encoder option and a file written without it
+/// has nothing here to verify. `None` too when the file was cut inside its own Footer —
+/// the walk lists that record because its declared length is the fault, but its content is
+/// not in the file, and a read of it would end `inspect` through the error path with the
+/// intact-prefix report unprinted. Which is exactly the file this command exists for.
+fn coverage(
+    source: &mut dyn Readable,
+    footer_frame: Option<crate::refusal::Frame>,
+) -> Result<Option<Coverage>> {
+    let Some(frame) = footer_frame else {
+        return Ok(None);
+    };
+    let content = source.read(
+        frame.offset + fourdgs::serialization::RECORD_HEADER_SIZE as u64,
+        frame.length.min(FOOTER_FIELDS),
+    )?;
+    let footer = fourdgs::records::Footer::parse(&content)?;
+    if footer.summary_crc == 0 || footer.summary_start == 0 {
+        return Ok(None);
+    }
+    if footer.summary_start > frame.offset {
+        return Err(fourdgs::Error::Malformed(format!(
+            "the Footer says its checksummed summary starts at {}, after the Footer itself at {}",
+            footer.summary_start, frame.offset
+        )));
+    }
+    // The summary ends where the Footer begins — taken from the walk rather than computed
+    // from a footer's expected size, so a Footer that a later revision extends does not
+    // move the region out from under the check.
+    let mut crc = fourdgs::serialization::Crc32::new();
+    let mut at = footer.summary_start;
+    while at < frame.offset {
+        let take = (frame.offset - at).min(CRC_BLOCK);
+        crc.update(&source.read(at, take)?);
+        at += take;
+    }
+    Ok(Some(Coverage {
+        start: footer.summary_start,
+        end: frame.offset,
+        ok: crc.finish() == footer.summary_crc,
+    }))
+}
+
+/// Walk the records: offset, opcode, length, CRC status.
+///
+/// Framing only, plus the summary region the Footer names. A record's content is never
+/// read, so this is as cheap on a file with an embedded audio payload as on one without,
+/// and an opcode nobody here has heard of is stepped over by its own declared length —
+/// which is the whole forward-compatibility story, exercised rather than described.
+///
+/// A file that was cut is walked as far as it goes and then says so. That is what the
+/// library does with one — records are length-prefixed, so everything complete before the
+/// cut is intact and a streamed reader keeps it — and a tool whose job is to say where a
+/// file stops being a 4dgs file should not answer that question by printing one line and
+/// throwing the rest away.
 pub fn inspect(args: &Args) -> Result<u8> {
     let mut source = FileReadable::open(&args.file)?;
-    let size = source.size()?;
-    let head = source.read(0, fourdgs::MAGIC.len().min(size as usize) as u64)?;
-    fourdgs::serialization::check_magic(&head)?;
-
-    let mut rows: Vec<(u64, u8, u64)> = Vec::new();
-    let mut at = fourdgs::MAGIC.len() as u64;
-    let mut trailing_magic = false;
-    let mut stopped: Option<String> = None;
-    loop {
-        let remaining = size.saturating_sub(at);
-        if remaining == 0 {
-            break;
-        }
-        // The file ends with the magic, so the last eight bytes are not a record.
-        if remaining <= fourdgs::MAGIC.len() as u64 {
-            trailing_magic = source.read(at, remaining)? == fourdgs::MAGIC;
-            break;
-        }
-        if remaining < fourdgs::serialization::RECORD_HEADER_SIZE as u64 {
-            stopped = Some(format!("{remaining} bytes at {at} are not a record header"));
-            break;
-        }
-        let framing = source.read(at, fourdgs::serialization::RECORD_HEADER_SIZE as u64)?;
-        let opcode = framing[0];
-        let length = u64::from_le_bytes([
-            framing[1], framing[2], framing[3], framing[4], framing[5], framing[6], framing[7],
-            framing[8],
-        ]);
-        let total = match length.checked_add(fourdgs::serialization::RECORD_HEADER_SIZE as u64) {
-            Some(total) if at.checked_add(total).is_some_and(|end| end <= size) => total,
-            _ => {
-                stopped = Some(format!(
-                    "the {} record at {at} declares {length} bytes, past the end of a {size}-byte file",
-                    op::name(opcode)
-                ));
-                rows.push((at, opcode, length));
-                break;
-            }
-        };
-        rows.push((at, opcode, length));
-        at += total;
-    }
+    let (summary, footer) = inspection_walk(&mut source)?;
+    let coverage = coverage(&mut source, footer)?;
 
     if args.json {
-        print_inspect_json(&rows, size, trailing_magic, stopped.as_deref());
+        print_inspect_json(&mut source, &summary, &coverage)?;
     } else {
-        print_inspect_text(&rows, size, trailing_magic, stopped.as_deref());
+        print_inspect_text(&mut source, &summary, &coverage)?;
     }
-    Ok(if stopped.is_some() {
+    // The prefix was recovered and reported; the file is still not a whole one, and a
+    // pipeline that goes on to read it should not be told otherwise.
+    Ok(if summary.cut.is_some() {
         EXIT_FAILED
     } else {
         EXIT_OK
     })
 }
 
+fn inspection_walk(
+    source: &mut dyn Readable,
+) -> Result<(crate::refusal::WalkSummary, Option<crate::refusal::Frame>)> {
+    let mut footer = None;
+    let summary = crate::refusal::walk_each(source, |frame, intact| {
+        if intact && frame.opcode == op::FOOTER {
+            footer = Some(frame);
+        }
+    })?;
+    Ok((summary, footer))
+}
+
 fn print_inspect_text(
-    rows: &[(u64, u8, u64)],
-    size: u64,
-    trailing_magic: bool,
-    stopped: Option<&str>,
-) {
+    source: &mut dyn Readable,
+    walk: &crate::refusal::WalkSummary,
+    coverage: &Option<Coverage>,
+) -> Result<()> {
     out!(
-        "{:>12}  {:<18} {:>14}  {:>14}",
+        "{:>12}  {:<18} {:>14}  {:>14}  {}",
         "offset",
         "record",
         "content",
-        "total"
+        "total",
+        "crc"
     );
-    out!("{:>12}  {:<18} {:>14}  {:>14}", 0, "(magic)", "", 8);
-    for (at, opcode, length) in rows {
+    out!(
+        "{:>12}  {:<18} {:>14}  {:>14}  {}",
+        0,
+        "(magic)",
+        "",
+        8,
+        "-"
+    );
+    crate::refusal::walk_each(source, |frame, _| {
         out!(
-            "{:>12}  {:<18} {:>14}  {:>14}",
-            commas(*at),
-            op::name(*opcode),
-            commas(*length),
-            commas(length + fourdgs::serialization::RECORD_HEADER_SIZE as u64)
+            "{:>12}  {:<18} {:>14}  {:>14}  {}",
+            commas(frame.offset),
+            op::name(frame.opcode),
+            commas(frame.length),
+            commas(frame.total()),
+            Coverage::cell(coverage, frame.offset, frame.total())
         );
-    }
-    if trailing_magic {
+    })?;
+    if walk.trailing_magic {
         out!(
-            "{:>12}  {:<18} {:>14}  {:>14}",
-            commas(size - 8),
+            "{:>12}  {:<18} {:>14}  {:>14}  {}",
+            commas(walk.size - 8),
             "(magic)",
             "",
-            8
+            8,
+            "-"
         );
     }
     out!(
-        "\n{} records, {} bytes{}",
-        rows.len(),
-        commas(size),
-        if stopped.is_some() {
-            " (the last record is incomplete)"
-        } else {
-            ""
-        }
+        "\n{} records, {} bytes",
+        walk.record_count,
+        commas(walk.size)
     );
-    if !trailing_magic && stopped.is_none() {
-        out!("note: the file does not end with the magic");
+    match &walk.cut {
+        Some(cut) => {
+            out!("truncated at byte {}: {}", commas(cut.at), cut.reason);
+            out!(
+                "the {} complete records above are the intact prefix, which is what a streamed \
+                 reader keeps{}",
+                walk.intact,
+                if cut.inside_a_record {
+                    "; the last row is the record the file was cut inside"
+                } else {
+                    ""
+                }
+            );
+        }
+        None if !walk.trailing_magic => out!("note: the file does not end with the magic"),
+        None => {}
     }
-    if let Some(reason) = stopped {
-        eprintln!("4dgs: stopped: {reason}");
+    match coverage {
+        Some(c) => out!(
+            "crc: the Footer's summary checksum covers bytes {}..{}; `-` is a record it does not cover",
+            commas(c.start),
+            commas(c.end)
+        ),
+        None => out!("crc: this file declares no summary checksum, so nothing here is covered"),
     }
+    Ok(())
 }
 
 fn print_inspect_json(
-    rows: &[(u64, u8, u64)],
-    size: u64,
-    trailing_magic: bool,
-    stopped: Option<&str>,
-) {
+    source: &mut dyn Readable,
+    walk: &crate::refusal::WalkSummary,
+    coverage: &Option<Coverage>,
+) -> Result<()> {
     out!("{{");
-    out!("  \"size\": {size},");
-    out!("  \"trailing_magic\": {trailing_magic},");
-    match stopped {
-        Some(reason) => out!("  \"stopped\": {},", json_string(reason)),
-        None => out!("  \"stopped\": null,"),
+    out!("  \"size\": {},", walk.size);
+    out!("  \"trailing_magic\": {},", walk.trailing_magic);
+    match &walk.cut {
+        Some(cut) => {
+            out!("  \"stopped\": {},", json_string(&cut.reason));
+            out!("  \"truncated_at\": {},", cut.at);
+        }
+        None => {
+            out!("  \"stopped\": null,");
+            out!("  \"truncated_at\": null,");
+        }
+    }
+    match coverage {
+        Some(c) => out!(
+            "  \"summary_crc\": {{\"start\": {}, \"end\": {}, \"ok\": {}}},",
+            c.start,
+            c.end,
+            c.ok
+        ),
+        None => out!("  \"summary_crc\": null,"),
     }
     out!("  \"records\": [");
-    for (i, (at, opcode, length)) in rows.iter().enumerate() {
-        let comma = if i + 1 == rows.len() { "" } else { "," };
+    let mut i = 0usize;
+    crate::refusal::walk_each(source, |frame, _| {
+        i += 1;
+        let comma = if i == walk.record_count { "" } else { "," };
+        let crc = Coverage::cell(coverage, frame.offset, frame.total());
+        let crc = if crc == "-" {
+            "null".to_string()
+        } else {
+            json_string(&crc.to_lowercase())
+        };
         out!(
-            "    {{\"offset\": {at}, \"opcode\": {opcode}, \"name\": {}, \"content_length\": {length}, \"total_length\": {}}}{comma}",
-            json_string(&op::name(*opcode)),
-            length + fourdgs::serialization::RECORD_HEADER_SIZE as u64
+            "    {{\"offset\": {}, \"opcode\": {}, \"name\": {}, \"content_length\": {}, \"total_length\": {}, \"crc\": {crc}}}{comma}",
+            frame.offset,
+            frame.opcode,
+            json_string(&op::name(frame.opcode)),
+            frame.length,
+            frame.total()
         );
-    }
+    })?;
     out!("  ]");
     out!("}}");
+    Ok(())
 }
 
 /// Report the gaussians visible at an instant.
@@ -573,4 +698,167 @@ fn extent(centers: &[f32]) -> [f64; 6] {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fourdgs::serialization::{crc32, MAGIC, RECORD_HEADER_SIZE};
+    use fourdgs::BytesReadable;
+
+    /// A reader that remembers the largest single read asked of it.
+    ///
+    /// The claim under test is about an allocation, and an allocation here is exactly one
+    /// `read` with a length taken from the file. So the way to test it is to watch the
+    /// lengths: no assertion about peak memory tells a bounded loop from an unbounded one,
+    /// and this does.
+    struct Watched<'a> {
+        inner: BytesReadable<'a>,
+        largest: std::cell::Cell<u64>,
+    }
+
+    impl<'a> Watched<'a> {
+        fn new(data: &'a [u8]) -> Watched<'a> {
+            Watched {
+                inner: BytesReadable::new(data),
+                largest: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl Readable for Watched<'_> {
+        fn size(&mut self) -> fourdgs::Result<u64> {
+            self.inner.size()
+        }
+
+        fn read(&mut self, offset: u64, length: u64) -> fourdgs::Result<Vec<u8>> {
+            self.largest.set(self.largest.get().max(length));
+            self.inner.read(offset, length)
+        }
+    }
+
+    /// A file whose Footer declares far more content than its three fields occupy.
+    ///
+    /// Legal framing, and forward-compatible by design: `Footer::parse` reads twenty bytes
+    /// and ignores the rest, so a Footer a later revision extends still reads here. That
+    /// declared length is eight bytes off an untrusted file, though, and a file can name
+    /// nearly the whole of itself in it.
+    fn footer_declaring(padding: usize) -> Vec<u8> {
+        let summary = fourdgs::records::Statistics {
+            gaussian_count: 0,
+            chunk_count: 0,
+            duration_sec: 1.0,
+            aabb: vec![0.0; 6],
+        }
+        .encode();
+        let mut out = MAGIC.to_vec();
+        out.extend_from_slice(
+            &fourdgs::records::Header {
+                duration_sec: 1.0,
+                aabb: vec![0.0; 6],
+                temporal_model: "gaussian-birth".into(),
+                ..Default::default()
+            }
+            .encode(&[]),
+        );
+        let summary_start = out.len() as u64;
+        out.extend_from_slice(&summary);
+
+        // The Footer's three fields, then the padding its declared length covers.
+        let mut body = Vec::new();
+        body.extend_from_slice(&summary_start.to_le_bytes());
+        body.extend_from_slice(&0u64.to_le_bytes());
+        body.extend_from_slice(&crc32(&summary).to_le_bytes());
+        body.resize(20 + padding, 0);
+        out.push(op::FOOTER);
+        out.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&MAGIC);
+        out
+    }
+
+    #[test]
+    fn the_footer_is_read_twenty_bytes_at_a_time_whatever_it_declares() {
+        // A Footer declaring the rest of the file as its content used to size one
+        // allocation from that declaration: `inspect` on a hostile file buffered nearly
+        // the whole of it to read three fields out of the front.
+        let padding = 4096;
+        let data = footer_declaring(padding);
+        let mut source = Watched::new(&data);
+        let walk = crate::refusal::walk(&mut source).expect("a walk");
+        let frame = walk
+            .first_intact(op::FOOTER)
+            .expect("the file ends with a Footer");
+        assert_eq!(
+            frame.length,
+            (20 + padding) as u64,
+            "the fixture's Footer declares more than its fields occupy"
+        );
+
+        source.largest.set(0);
+        let coverage =
+            coverage(&mut source, walk.first_intact(op::FOOTER)).expect("a coverage verdict");
+        assert!(
+            coverage.is_some_and(|c| c.ok),
+            "the fixture's summary checksum agrees"
+        );
+        assert!(
+            source.largest.get() <= FOOTER_FIELDS.max(CRC_BLOCK),
+            "one read asked for {} bytes; the Footer is read {FOOTER_FIELDS} bytes at a \
+             time and the summary {CRC_BLOCK} at a time",
+            source.largest.get()
+        );
+        assert!(
+            source.largest.get() < frame.length,
+            "a read was sized from the Footer's own declared length"
+        );
+    }
+
+    #[test]
+    fn a_footer_shorter_than_its_fields_is_still_refused() {
+        // The bound is a `min`, so a Footer declaring less than twenty bytes is read as far
+        // as it goes and then fails to parse — the same answer as before, and not a read
+        // that runs past the record.
+        let mut data = footer_declaring(0);
+        let footer_at = data.len() - (RECORD_HEADER_SIZE + 20 + MAGIC.len());
+        data[footer_at + 1] = 12;
+        data.truncate(footer_at + RECORD_HEADER_SIZE + 12);
+        data.extend_from_slice(&MAGIC);
+        let mut source = BytesReadable::new(&data);
+        let walk = crate::refusal::walk(&mut source).expect("a walk");
+        assert!(coverage(&mut source, walk.first_intact(op::FOOTER)).is_err());
+    }
+
+    #[test]
+    fn a_checksummed_summary_cannot_start_after_its_footer() {
+        let mut data = footer_declaring(0);
+        let footer_at = data.len() - (RECORD_HEADER_SIZE + 20 + MAGIC.len());
+        let impossible = (footer_at as u64 + 1).to_le_bytes();
+        let start = footer_at + RECORD_HEADER_SIZE;
+        data[start..start + 8].copy_from_slice(&impossible);
+
+        let mut source = BytesReadable::new(&data);
+        let walk = crate::refusal::walk(&mut source).expect("a framing walk");
+        let error = coverage(&mut source, walk.first_intact(op::FOOTER))
+            .expect_err("the checksum range is impossible");
+        assert!(
+            error.to_string().contains("after the Footer itself"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn inspection_uses_the_final_intact_footer() {
+        let mut data = footer_declaring(0);
+        let final_at = data.len() - (RECORD_HEADER_SIZE + 20 + MAGIC.len());
+        let earlier = fourdgs::records::Footer::default().encode();
+        data.splice(final_at..final_at, earlier.iter().copied());
+
+        let (_, footer) = inspection_walk(&mut BytesReadable::new(&data)).unwrap();
+        assert_eq!(
+            footer.unwrap().offset,
+            (final_at + earlier.len()) as u64,
+            "the authoritative Footer is the last intact one"
+        );
+    }
 }

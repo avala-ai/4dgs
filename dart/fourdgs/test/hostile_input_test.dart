@@ -248,6 +248,18 @@ void main() {
       );
     });
 
+    test('header diagnostics use the record content offset from the file', () {
+      expectDiagnostic(
+        () => FourdgsHeader.parse(
+          _headerContent(temporalModel: 'nope'),
+          fileOffset: 4096,
+        ),
+        // Two empty strings and the three fixed-width fields before
+        // temporal_model occupy 32 bytes.
+        mentions: <String>['Header at byte 4128', 'temporal_model', 'nope'],
+      );
+    });
+
     test('the window table names the entry, the byte and the rule', () {
       expectDiagnostic(
         () => FourdgsWindowTable.parse(_windowTableContent(lo: 5.0, hi: 1.0)),
@@ -866,6 +878,40 @@ void main() {
       expect(indexed.header.durationSec, 0.0);
       expect(indexed.index.single.t1, 1e-9);
     });
+
+    test(
+      'an absent Window Table uses the default window when indexed',
+      () async {
+        final BytesBuilder out =
+            BytesBuilder()
+              ..add(fourdgsMagic)
+              ..add(
+                _record(
+                  opHeader,
+                  _headerContent(durationSec: 1.0, gaussianCount: 1),
+                ),
+              )
+              ..add(_record(opQuantization, _quantizationContent()));
+        final int summaryStart = out.length;
+        out.add(
+          _record(opChunkIndex, _chunkIndexEntryContent(t0: 0.0, t1: 1.0)),
+        );
+        final BytesBuilder footer =
+            BytesBuilder()
+              ..add(_u64(summaryStart))
+              ..add(_u64(0))
+              ..add(_u32(0));
+        out
+          ..add(_record(opFooter, footer.toBytes()))
+          ..add(fourdgsMagic);
+
+        final FourdgsIndexedScene indexed = await openFourdgsIndexed(
+          FourdgsBytes(out.toBytes()),
+        );
+        expect(indexed.windows, isEmpty);
+        expect(indexed.index.single.gaussianCount, 1);
+      },
+    );
   });
 
   group('an entry just past zero is not out of clock', () {

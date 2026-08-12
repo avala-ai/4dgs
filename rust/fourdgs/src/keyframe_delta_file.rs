@@ -17,12 +17,13 @@
 //! Dequantization happens once, at the end, on the composed state, by the same arithmetic a
 //! `gaussian-birth` chunk uses.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::{Error, Result};
 use crate::keyframe_delta::{
-    apply_delta, chain_for, check_tiling, keyframe_state, BinArray, State, ABSOLUTE_IN_UPDATE,
-    GOP_INVARIANT,
+    apply_delta, chain_for, check_tiling, check_timeline_endpoints, keyframe_state, BinArray,
+    State, ABSOLUTE_IN_UPDATE, GOP_INVARIANT,
 };
 use crate::model::GaussianSet;
 use crate::opcode as op;
@@ -30,7 +31,7 @@ use crate::quantization::{
     life_class, motion_step, mu_step, rct_forward, rint, support_k, Bounds, Profile, Steps,
 };
 use crate::records as rec;
-use crate::serialization::{check_magic, crc32, Cursor, Records, MAGIC};
+use crate::serialization::{check_magic, crc32, Cursor, Records, MAGIC, MAX_STREAM_BYTES};
 use crate::stream::{decode_stream, encode_stream, DecodedStream};
 
 /// How many gaussians appear in full in a probe's sample.
@@ -569,7 +570,7 @@ pub fn write_sequence(
         ));
     }
     let grids = grids_for(samples, duration_sec, kd.profile, kd.cutoff);
-    let quantized: Vec<(Vec<i64>, BTreeMap<u8, BinArray>)> = samples
+    let mut quantized: Vec<(Vec<i64>, BTreeMap<u8, BinArray>)> = samples
         .iter()
         .map(|s| quantize_sample(s, &grids))
         .collect::<Result<_>>()?;
@@ -639,7 +640,22 @@ pub fn write_sequence(
         let (ids, bins) = &quantized[i];
         let (t0, t1) = (t0s[i], t1s[i]);
         if is_keyframe(i, kd) {
-            let streams = keyframe_streams(ids, bins, kd.codec, kd.level)?;
+            // A keyframe reintroduces its complete live population at the keyframe's
+            // physical start, regardless of the birth time carried by the input sample.
+            // The corrected bins are both what this keyframe serializes and the reference
+            // subsequent deltas subtract from. Keeping the input sample's old mu_t here
+            // would make the decoder add those deltas to a different starting state.
+            let mut keyframe_bins = bins.clone();
+            let sigma = &bins[&op::A_SIGMA_T];
+            let flags = &bins[&op::A_FLAGS];
+            let mu_t = (0..ids.len())
+                .map(|row| {
+                    let never_fades = flags.values[row] & op::FLAG_NEVER_FADES != 0;
+                    rint(t0 / grids.mu_step_for(sigma.values[row], never_fades))
+                })
+                .collect();
+            keyframe_bins.insert(op::A_MU_T, BinArray::new(mu_t, 1));
+            let streams = keyframe_streams(ids, &keyframe_bins, kd.codec, kd.level)?;
             let blob = rec::encode_chunk(t0, t1, 0, ids.len() as u32, &streams);
             let at = out.len() as u64;
             out.extend_from_slice(&blob);
@@ -661,6 +677,7 @@ pub fn write_sequence(
                 depth: 0,
                 live_count: ids.len() as u64,
             });
+            quantized[i].1 = keyframe_bins;
             continue;
         }
 
@@ -805,15 +822,51 @@ fn bin_array(stream: &DecodedStream) -> BinArray {
     BinArray::new(values, stream.channels)
 }
 
+fn expected_attribute_channels(attribute: u8) -> Option<usize> {
+    match attribute {
+        op::A_POSITION | op::A_SCALE | op::A_ROTATION | op::A_COLOR | op::A_MOTION => Some(3),
+        op::A_ROTATION_INDEX
+        | op::A_OPACITY
+        | op::A_MU_T
+        | op::A_SIGMA_T
+        | op::A_FLAGS
+        | op::A_WINDOW_INDEX
+        | op::A_SOURCE_GROUP
+        | op::A_SOURCE_INDEX
+        | op::A_GAUSSIAN_ID
+        | op::A_OBJECT_ID => Some(1),
+        _ => None,
+    }
+}
+
+fn check_attribute_channels(attribute: u8, stream: &DecodedStream) -> Result<()> {
+    let Some(expected) = expected_attribute_channels(attribute) else {
+        return Ok(());
+    };
+    if stream.channels != expected {
+        return Err(Error::Malformed(format!(
+            "attribute {attribute} declares {} channels; the format defines {expected}",
+            stream.channels
+        )));
+    }
+    Ok(())
+}
+
 /// One length-framed sub-block: its ids, and a bin array per other attribute.
-fn decode_group(bytes: &[u8]) -> Result<(Vec<i64>, BTreeMap<u8, BinArray>)> {
+fn decode_group(bytes: &[u8], expected_count: usize) -> Result<(Vec<i64>, BTreeMap<u8, BinArray>)> {
     if bytes.is_empty() {
+        if expected_count != 0 {
+            return Err(Error::Malformed(format!(
+                "a keyframe-delta group declares {expected_count} gaussians but carries no streams"
+            )));
+        }
         return Ok((Vec::new(), BTreeMap::new()));
     }
     let mut got: BTreeMap<u8, DecodedStream> = BTreeMap::new();
     let mut cursor = Cursor::new(bytes);
     while cursor.remaining() > 0 {
-        let (attribute_id, values) = decode_stream(&mut cursor, None)?;
+        let (attribute_id, values) = decode_stream(&mut cursor, Some(expected_count))?;
+        check_attribute_channels(attribute_id, &values)?;
         // One stream per attribute here too: the regular chunk path refuses a second,
         // and this path had its own loop that was still resolving it silently.
         if got.contains_key(&attribute_id) {
@@ -834,12 +887,15 @@ fn decode_group(bytes: &[u8]) -> Result<(Vec<i64>, BTreeMap<u8, BinArray>)> {
     Ok((ids, bins))
 }
 
-fn keyframe_from_chunk(content: &[u8]) -> Result<(Vec<i64>, BTreeMap<u8, BinArray>)> {
+fn keyframe_from_chunk(
+    content: &[u8],
+) -> Result<(rec::ChunkHeader, Vec<i64>, BTreeMap<u8, BinArray>)> {
     let (head, streams) = rec::parse_chunk(content)?;
     let mut got: BTreeMap<u8, DecodedStream> = BTreeMap::new();
     let mut cursor = Cursor::new(streams);
     while cursor.remaining() > 0 {
-        let (attribute_id, values) = decode_stream(&mut cursor, None)?;
+        let (attribute_id, values) = decode_stream(&mut cursor, Some(head.count as usize))?;
+        check_attribute_channels(attribute_id, &values)?;
         // One stream per attribute here too: the regular chunk path refuses a second,
         // and this path had its own loop that was still resolving it silently.
         if got.contains_key(&attribute_id) {
@@ -869,23 +925,201 @@ fn keyframe_from_chunk(content: &[u8]) -> Result<(Vec<i64>, BTreeMap<u8, BinArra
         }
     }
     let bins = got.iter().map(|(a, s)| (*a, bin_array(s))).collect();
-    Ok((ids, bins))
+    Ok((head, ids, bins))
 }
 
-fn compose_delta(reference: &State, content: &[u8]) -> Result<(State, rec::DeltaChunkHeader)> {
-    let (head, updates, births, deaths) = rec::parse_delta_chunk(content)?;
-    let (update_ids, update_bins) = decode_group(updates)?;
-    let (birth_ids, birth_bins) = decode_group(births)?;
-    let (death_ids, _) = decode_group(deaths)?;
+struct DecodedDelta {
+    head: rec::DeltaChunkHeader,
+    update_ids: Vec<i64>,
+    update_bins: BTreeMap<u8, BinArray>,
+    birth_ids: Vec<i64>,
+    birth_bins: BTreeMap<u8, BinArray>,
+    death_ids: Vec<i64>,
+}
+
+fn delta_record_bytes<'a>(
+    head: &rec::DeltaChunkHeader,
+    records: &'a [u8],
+) -> Result<Cow<'a, [u8]>> {
+    let expected = usize::try_from(head.uncompressed_size).map_err(|_| {
+        Error::Malformed(format!(
+            "the Delta Chunk at t0={} declares {} uncompressed bytes, more than this platform can address",
+            head.t0, head.uncompressed_size
+        ))
+    })?;
+    if head.uncompressed_size > MAX_STREAM_BYTES {
+        return Err(Error::Malformed(format!(
+            "the Delta Chunk at t0={} declares {} uncompressed record bytes, past the {MAX_STREAM_BYTES} byte cap",
+            head.t0, head.uncompressed_size
+        )));
+    }
+    if head.compression.is_empty() {
+        if records.len() != expected {
+            return Err(Error::Malformed(format!(
+                "the uncompressed Delta Chunk at t0={} declares {expected} record bytes but carries {}",
+                head.t0,
+                records.len()
+            )));
+        }
+        return Ok(Cow::Borrowed(records));
+    }
+    let numeric = crate::codec::codec_from_name(&head.compression).ok_or_else(|| {
+        Error::refused(
+            crate::error::refusal::UNKNOWN_STREAM_CODEC,
+            crate::error::RefusalKind::UnsupportedCodec,
+            format!(
+                "the Delta Chunk at t0={} is compressed with {:?}, which this build does not know",
+                head.t0, head.compression
+            ),
+        )
+    })?;
+    Ok(Cow::Owned(crate::codec::decompress(
+        records, numeric, expected,
+    )?))
+}
+
+fn decode_delta(content: &[u8]) -> Result<DecodedDelta> {
+    let (head, encoded_records) = rec::parse_delta_chunk_records(content)?;
+    let records = delta_record_bytes(&head, encoded_records)?;
+    let mut framed = Cursor::new(&records);
+    let updates = framed.blob()?;
+    let births = framed.blob()?;
+    let deaths = framed.blob()?;
+    if framed.remaining() != 0 {
+        return Err(Error::Malformed(
+            "a Delta Chunk carries bytes after its death group".into(),
+        ));
+    }
+    let (update_ids, update_bins) = decode_group(updates, head.update_count as usize)?;
+    let (birth_ids, birth_bins) = decode_group(births, head.birth_count as usize)?;
+    let (death_ids, death_bins) = decode_group(deaths, head.death_count as usize)?;
+    if !birth_ids.is_empty() {
+        let missing: Vec<u8> = REQUIRED
+            .iter()
+            .copied()
+            .filter(|attribute| !birth_bins.contains_key(attribute))
+            .collect();
+        if !missing.is_empty() {
+            return Err(Error::Malformed(format!(
+                "a non-empty birth group is missing required attributes {missing:?}"
+            )));
+        }
+    }
+    if !death_bins.is_empty() {
+        return Err(Error::Malformed(format!(
+            "a death group carries attributes {:?}; it may carry only gaussian_id",
+            death_bins.keys().collect::<Vec<_>>()
+        )));
+    }
+    Ok(DecodedDelta {
+        head,
+        update_ids,
+        update_bins,
+        birth_ids,
+        birth_bins,
+        death_ids,
+    })
+}
+
+fn compose_delta(
+    reference: &State,
+    content: &[u8],
+) -> Result<(State, rec::DeltaChunkHeader, Vec<i64>)> {
+    let decoded = decode_delta(content)?;
     let state = apply_delta(
         reference,
-        &update_ids,
-        &update_bins,
-        &birth_ids,
-        &birth_bins,
-        &death_ids,
+        &decoded.update_ids,
+        &decoded.update_bins,
+        &decoded.birth_ids,
+        &decoded.birth_bins,
+        &decoded.death_ids,
     )?;
+    Ok((state, decoded.head, decoded.birth_ids))
+}
+
+/// Decode one keyframe chunk's streams, check the state they make, and keep neither.
+///
+/// What a validator needs from a keyframe chunk of a file it cannot seek: whether the
+/// streams decode and whether the window indices they carry are answerable. It is the
+/// question [`decode_streamed`] answers by building a `DecodedSequence` — every state
+/// resident at once — for a caller that only wanted a verdict.
+pub fn check_keyframe_chunk(content: &[u8], windows: &[(f64, f64)]) -> Result<()> {
+    decode_keyframe_chunk(content, windows).map(|_| ())
+}
+
+/// Decode one keyframe record content into its state and parsed header.
+pub fn decode_keyframe_chunk(
+    content: &[u8],
+    windows: &[(f64, f64)],
+) -> Result<(State, rec::ChunkHeader)> {
+    let (head, ids, bins) = keyframe_from_chunk(content)?;
+    let state = keyframe_state(ids, bins)?;
+    check_window_indices(&state, windows)?;
     Ok((state, head))
+}
+
+/// Require every keyframe gaussian's encoded birth-time bin to name the Chunk's `t0`.
+pub fn check_keyframe_mu_t(state: &State, t0: f64, quantization: &rec::Quantization) -> Result<()> {
+    if state.count() == 0 {
+        return Ok(());
+    }
+    let mu = state
+        .bins
+        .get(&op::A_MU_T)
+        .ok_or_else(|| Error::Malformed("a non-empty keyframe carries no mu_t stream".into()))?;
+    let sigma = state
+        .bins
+        .get(&op::A_SIGMA_T)
+        .ok_or_else(|| Error::Malformed("a non-empty keyframe carries no sigma_t stream".into()))?;
+    let flags = state
+        .bins
+        .get(&op::A_FLAGS)
+        .ok_or_else(|| Error::Malformed("a non-empty keyframe carries no flags stream".into()))?;
+    let steps = quantization.steps();
+    for row in 0..state.count() {
+        let never_fades = flags.values[row] & op::FLAG_NEVER_FADES != 0;
+        let step = mu_step(sigma.values[row], steps.sigma_log, never_fades, steps.time);
+        let expected = rint(t0 / step);
+        if mu.values[row] != expected {
+            return Err(Error::Malformed(format!(
+                "keyframe gaussian_id {} has mu_t bin {}; its Chunk t0 {t0} requires bin {expected}",
+                state.ids[row], mu.values[row]
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The same for one delta chunk, without the reference state it would compose against.
+///
+/// A delta chunk's three groups are streams like any other, so an unimplemented codec or a
+/// corrupt payload in one of them is found by decoding it — no reference needed, and a
+/// file read front to back has none to give until the chain is walked. The window indices a
+/// group carries are checked here too: births bring their own, and a birth naming a window
+/// the table cannot answer is refused on the indexed path.
+pub fn check_delta_chunk(content: &[u8], windows: &[(f64, f64)]) -> Result<()> {
+    let decoded = decode_delta(content)?;
+    let table_len = crate::chunk::window_table_or_default(windows).len();
+    for bins in [&decoded.update_bins, &decoded.birth_bins] {
+        let Some(window_index) = bins.get(&op::A_WINDOW_INDEX) else {
+            continue;
+        };
+        for value in &window_index.values {
+            crate::chunk::check_window_index(*value, table_len)?;
+        }
+    }
+    Ok(())
+}
+
+/// Compose one delta record content onto a previously decoded reference state.
+pub fn compose_delta_chunk(
+    reference: &State,
+    content: &[u8],
+    windows: &[(f64, f64)],
+) -> Result<(State, rec::DeltaChunkHeader, Vec<i64>)> {
+    let (state, head, births) = compose_delta(reference, content)?;
+    check_window_indices(&state, windows)?;
+    Ok((state, head, births))
 }
 
 /// Front to back: decode each chunk and compose it onto the state it references.
@@ -896,26 +1130,39 @@ pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
     let mut windows: Vec<(f64, f64)> = Vec::new();
     let mut chunks: Vec<ChunkInfo> = Vec::new();
     let mut by_offset: BTreeMap<u64, State> = BTreeMap::new();
+    let mut state_seen = false;
 
     for record in Records::new(data, MAGIC.len()) {
         let record = record?;
         match record.opcode {
             op::HEADER => {
                 let parsed = rec::Header::parse(record.content)?;
-                if parsed.temporal_model != "keyframe-delta" {
-                    return Err(Error::Malformed(format!(
-                        "decode_streamed is the keyframe-delta path; this file is {:?}",
-                        parsed.temporal_model
-                    )));
+                check_keyframe_temporal_model(&parsed.temporal_model)?;
+                if !state_seen {
+                    header = Some(parsed);
                 }
-                header = Some(parsed);
             }
-            op::QUANTIZATION => quant = Some(rec::Quantization::parse(record.content)?),
-            op::WINDOW_TABLE => windows = rec::WindowTable::parse(record.content)?.windows,
+            op::QUANTIZATION => {
+                let parsed = rec::Quantization::parse(record.content)?;
+                crate::registry::check_quantization_scheme(&parsed.scheme)?;
+                if !state_seen {
+                    quant = Some(parsed);
+                }
+            }
+            op::WINDOW_TABLE => {
+                let parsed = rec::WindowTable::parse(record.content)?;
+                if !state_seen {
+                    windows = parsed.windows;
+                }
+            }
             op::CHUNK => {
-                let (ids, bins) = keyframe_from_chunk(record.content)?;
-                let (head, _) = rec::parse_chunk(record.content)?;
+                state_seen = true;
+                let (head, ids, bins) = keyframe_from_chunk(record.content)?;
                 let state = keyframe_state(ids, bins)?;
+                let quantization = quant.as_ref().ok_or_else(|| {
+                    Error::Malformed("a keyframe appears before Quantization".into())
+                })?;
+                check_keyframe_mu_t(&state, head.t0, quantization)?;
                 check_window_indices(&state, &windows)?;
                 by_offset.insert(record.offset as u64, state.clone());
                 chunks.push(ChunkInfo {
@@ -933,7 +1180,8 @@ pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
                 });
             }
             op::DELTA_CHUNK => {
-                let (head, ..) = rec::parse_delta_chunk(record.content)?;
+                state_seen = true;
+                let (head, _) = rec::parse_delta_chunk_records(record.content)?;
                 if head.reference_offset >= record.offset as u64 {
                     return Err(Error::Malformed(format!(
                         "delta chunk at {} references {}, which is not behind it",
@@ -946,7 +1194,7 @@ pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
                         record.offset, head.reference_offset
                     )));
                 };
-                let (state, head) = compose_delta(reference, record.content)?;
+                let (state, head, _) = compose_delta(reference, record.content)?;
                 // Births in a delta group carry their own `window_index`, so the check
                 // belongs on this branch too — not only where a keyframe is read. The
                 // indexed path validates the composed state for every chunk, so leaving
@@ -984,15 +1232,123 @@ pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
     })
 }
 
-fn record_content(data: &[u8], offset: u64, length: u64) -> Result<&[u8]> {
-    let start = offset as usize;
-    let end = start
-        .checked_add(length as usize)
-        .filter(|e| *e <= data.len())
-        .ok_or_else(|| Error::Truncated(format!("record at {offset} runs past the file")))?;
-    let mut c = Cursor::new(&data[start..end]);
-    c.u8()?;
-    c.blob()
+fn ranged_framing<R: crate::Readable + ?Sized>(
+    source: &mut R,
+    offset: u64,
+    declared_length: Option<u64>,
+) -> Result<(u8, u64)> {
+    let size = source.size()?;
+    let header_end = offset
+        .checked_add(crate::serialization::RECORD_HEADER_SIZE as u64)
+        .filter(|end| *end <= size)
+        .ok_or_else(|| {
+            Error::Truncated(format!("record framing at {offset} runs past the file"))
+        })?;
+    let framing = source.read(offset, header_end - offset)?;
+    let opcode = framing[0];
+    let content_length = u64::from_le_bytes(framing[1..9].try_into().expect("nine-byte framing"));
+    let total = content_length
+        .checked_add(crate::serialization::RECORD_HEADER_SIZE as u64)
+        .ok_or_else(|| {
+            Error::Truncated(format!(
+                "the {} record at {offset} has a length that overflows",
+                op::name(opcode)
+            ))
+        })?;
+    if let Some(declared) = declared_length {
+        if declared != total {
+            return Err(Error::Malformed(format!(
+                "the index declares {declared} bytes for the {} record at {offset}; its framing declares {total}",
+                op::name(opcode)
+            )));
+        }
+    }
+    let content_at = offset + crate::serialization::RECORD_HEADER_SIZE as u64;
+    content_at.checked_add(content_length).filter(|end| *end <= size).ok_or_else(
+        || {
+            Error::Truncated(format!(
+                "the {} record at {offset} declares {content_length} bytes past the end of the {size}-byte file",
+                op::name(opcode)
+            ))
+        },
+    )?;
+    Ok((opcode, content_length))
+}
+
+fn ranged_record<R: crate::Readable + ?Sized>(
+    source: &mut R,
+    offset: u64,
+    declared_length: Option<u64>,
+) -> Result<(u8, Vec<u8>)> {
+    let (opcode, content_length) = ranged_framing(source, offset, declared_length)?;
+    let content_at = offset + crate::serialization::RECORD_HEADER_SIZE as u64;
+    Ok((opcode, source.read(content_at, content_length)?))
+}
+
+/// Parse the known Header prefix without transferring an appended extension.
+///
+/// `Header::parse` deliberately ignores an unread trailer, so a prefix is sufficient as
+/// soon as all required length-prefixed fields are present. Grow the range geometrically
+/// up to the same fixed front-matter ceiling as the ordinary indexed reader; the record's
+/// declared length still tells the caller where the next record starts.
+fn ranged_header<R: crate::Readable + ?Sized>(
+    source: &mut R,
+    content_at: u64,
+    content_length: u64,
+) -> Result<rec::Header> {
+    const HEADER_PROBE: u64 = 8 * 1024;
+    let cap = content_length.min(crate::indexed_reader::MAX_FRONT_MATTER_BYTES);
+    let mut length = cap.min(HEADER_PROBE);
+    loop {
+        let prefix = source.read(content_at, length)?;
+        match rec::Header::parse(&prefix) {
+            Ok(header) => return Ok(header),
+            Err(Error::Truncated(message)) if length < cap => {
+                length = length.saturating_mul(2).max(1).min(cap);
+                let _ = message;
+            }
+            Err(Error::Truncated(message)) if content_length > cap => {
+                return Err(Error::Malformed(format!(
+                    "the Header's required fields do not fit in the {} byte front-matter ceiling: {message}",
+                    crate::indexed_reader::MAX_FRONT_MATTER_BYTES
+                )))
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Read one front-matter record only after its declared allocation has passed the shared
+/// fixed ceiling. Unlike Header, neither parser can decide it is complete from a small
+/// prefix: Quantization has a variable bounds map and Window Table has a declared row
+/// count, so the bounded record is transferred whole.
+fn ranged_front_matter_content<R: crate::Readable + ?Sized>(
+    source: &mut R,
+    content_at: u64,
+    content_length: u64,
+    what: &str,
+) -> Result<Vec<u8>> {
+    if content_length > crate::indexed_reader::MAX_FRONT_MATTER_BYTES {
+        return Err(Error::Malformed(format!(
+            "the {what} record is {content_length} bytes, past the {} byte ceiling for a single front-matter record",
+            crate::indexed_reader::MAX_FRONT_MATTER_BYTES
+        )));
+    }
+    source.read(content_at, content_length)
+}
+
+fn check_keyframe_temporal_model(model: &str) -> Result<()> {
+    if model == "keyframe-delta" {
+        return Ok(());
+    }
+    Err(Error::refused(
+        crate::error::refusal::UNKNOWN_TEMPORAL_MODEL,
+        crate::error::RefusalKind::UnsupportedModel,
+        format!(
+            "the Header declares temporal model '{model}', which this reader does not implement \
+             (it implements keyframe-delta)"
+        ),
+    ))
 }
 
 /// Refuse a `window_index` the table cannot answer, on either read path.
@@ -1023,24 +1379,74 @@ fn check_window_indices(state: &State, windows: &[(f64, f64)]) -> Result<()> {
     Ok(())
 }
 
-fn compose_chain(
-    data: &[u8],
+/// Fetch and decode one indexed keyframe through the caller's range source.
+///
+/// The returned state is one chunk's population. A sequential validator can retain it as
+/// its current/GOP reference, advance once, and never accumulate a state per index entry.
+pub fn read_keyframe_entry<R: crate::Readable + ?Sized>(
+    source: &mut R,
+    entry: &rec::ChunkIndexEntry,
+    quantization: &rec::Quantization,
+    windows: &[(f64, f64)],
+) -> Result<(State, rec::ChunkHeader)> {
+    let (opcode, content) = ranged_record(source, entry.chunk_offset, Some(entry.chunk_length))?;
+    if opcode != op::CHUNK {
+        return Err(Error::Malformed(format!(
+            "the keyframe index entry at {} points at {}",
+            entry.chunk_offset,
+            op::name(opcode)
+        )));
+    }
+    let (state, head) = decode_keyframe_chunk(&content, windows)?;
+    check_keyframe_mu_t(&state, head.t0, quantization)?;
+    Ok((state, head))
+}
+
+/// Fetch and compose one indexed delta through the caller's range source.
+///
+/// `birth_ids` is returned with the state so a bounded full-file validator can stream
+/// identity-introduction events to its fixed-memory counter without decoding the record a
+/// second time.
+pub fn read_delta_entry<R: crate::Readable + ?Sized>(
+    source: &mut R,
+    entry: &rec::ChunkIndexEntry,
+    reference: &State,
+    windows: &[(f64, f64)],
+) -> Result<(State, rec::DeltaChunkHeader, Vec<i64>)> {
+    let (opcode, content) = ranged_record(source, entry.chunk_offset, Some(entry.chunk_length))?;
+    if opcode != op::DELTA_CHUNK {
+        return Err(Error::Malformed(format!(
+            "the delta index entry at {} points at {}",
+            entry.chunk_offset,
+            op::name(opcode)
+        )));
+    }
+    compose_delta_chunk(reference, &content, windows)
+}
+
+/// Compose the chain ending at `entry`, and check the state it produces.
+///
+/// Public because a range-seeking caller may want one instant without materializing the
+/// asset. A full-file validator should instead walk entries once with
+/// [`read_keyframe_entry`] and [`read_delta_entry`], retaining only its current/GOP states;
+/// calling this for every chained entry would decode the same prefixes repeatedly.
+pub fn compose_chain<R: crate::Readable + ?Sized>(
+    source: &mut R,
     index: &[rec::ChunkIndexEntry],
     entry: &rec::ChunkIndexEntry,
+    quantization: &rec::Quantization,
     windows: &[(f64, f64)],
 ) -> Result<State> {
     let chain = chain_for(index, (entry.t0 + entry.t1) / 2.0)?;
     let mut state: Option<State> = None;
     for link in &chain {
-        let content = record_content(data, link.chunk_offset, link.chunk_length)?;
         if link.kind == 0 {
-            let (ids, bins) = keyframe_from_chunk(content)?;
-            state = Some(keyframe_state(ids, bins)?);
+            state = Some(read_keyframe_entry(source, link, quantization, windows)?.0);
         } else {
             let reference = state
                 .take()
                 .ok_or_else(|| Error::Malformed("a chain begins with a delta chunk".into()))?;
-            state = Some(compose_delta(&reference, content)?.0);
+            state = Some(read_delta_entry(source, link, &reference, windows)?.0);
         }
     }
     let state = state.ok_or_else(|| Error::Malformed("an empty chain".into()))?;
@@ -1048,29 +1454,126 @@ fn compose_chain(
     Ok(state)
 }
 
-/// Read the Footer, then the index, then compose each chunk by walking its chain.
-pub fn decode_indexed(data: &[u8]) -> Result<(DecodedSequence, Vec<rec::ChunkIndexEntry>)> {
-    check_magic(data)?;
+/// A `keyframe-delta` file's front matter and its index, with nothing composed.
+///
+/// What [`decode_indexed`] reads before it decodes anything, split out because two callers
+/// want only this much: one that means to compose a single instant, and one that means to
+/// check each chunk in turn and keep none of them.
+#[derive(Debug, Clone)]
+pub struct IndexedSequence {
+    pub header: rec::Header,
+    pub quantization: rec::Quantization,
+    pub windows: Vec<(f64, f64)>,
+    pub index: Vec<rec::ChunkIndexEntry>,
+}
+
+/// Read the Footer and the index, and check that the index tiles the timeline.
+///
+/// The quantization scheme is checked against the registry as the record is read, exactly as
+/// [`crate::indexed_reader::open_indexed`] checks it on the gaussian-birth path. Parsing a
+/// Quantization record is not the same as understanding it: a file declaring a scheme this
+/// build does not implement parses perfectly and dequantizes to nothing meaningful, and this
+/// path used to carry it all the way to a composed state — so `4dgs validate` printed
+/// `valid` for a file the other model's reader refuses by name.
+///
+/// Every Header is checked here too. The shared temporal-model registry belongs to the
+/// gaussian-birth reader and therefore does not list `keyframe-delta`; this model-specific
+/// reader performs the equivalent named check against the one model it implements. Doing
+/// so per record matters when duplicate Headers disagree.
+pub fn open_indexed<R: crate::Readable + ?Sized>(source: &mut R) -> Result<IndexedSequence> {
+    let size = source.size()?;
+    let head = source.read(0, (MAGIC.len() as u64).min(size))?;
+    check_magic(&head)?;
+    const FOOTER_CONTENT: u64 = 20;
+    let footer_total = crate::serialization::RECORD_HEADER_SIZE as u64 + FOOTER_CONTENT;
+    let fixed_tail = footer_total + MAGIC.len() as u64;
+    if size < MAGIC.len() as u64 + fixed_tail {
+        return Err(Error::Truncated(
+            "the file is too short to contain a Header, Footer, and both magic values".into(),
+        ));
+    }
+    let footer_at = size - fixed_tail;
+    let tail = source.read(footer_at, fixed_tail)?;
+    if tail[footer_total as usize..] != MAGIC {
+        return Err(Error::Malformed(
+            "file does not end with the magic; it may be truncated".into(),
+        ));
+    }
+    if tail[0] != op::FOOTER {
+        return Err(Error::Malformed(format!(
+            "the final record is {}; expected Footer",
+            op::name(tail[0])
+        )));
+    }
+    let footer_length = u64::from_le_bytes(
+        tail[1..crate::serialization::RECORD_HEADER_SIZE]
+            .try_into()
+            .expect("nine-byte Footer framing"),
+    );
+    if footer_length != FOOTER_CONTENT {
+        return Err(Error::Malformed(format!(
+            "the final Footer declares {footer_length} content bytes; this version defines {FOOTER_CONTENT}"
+        )));
+    }
+    let footer =
+        rec::Footer::parse(&tail[crate::serialization::RECORD_HEADER_SIZE..footer_total as usize])?;
+
     let mut header: Option<rec::Header> = None;
     let mut quant: Option<rec::Quantization> = None;
     let mut windows: Vec<(f64, f64)> = Vec::new();
-    let mut footer: Option<rec::Footer> = None;
-    for record in Records::new(data, MAGIC.len()) {
-        let record = record?;
-        match record.opcode {
-            op::HEADER => header = Some(rec::Header::parse(record.content)?),
-            op::QUANTIZATION => quant = Some(rec::Quantization::parse(record.content)?),
-            op::WINDOW_TABLE => windows = rec::WindowTable::parse(record.content)?.windows,
-            op::FOOTER => {
-                footer = Some(rec::Footer::parse(record.content)?);
-                break;
+    let mut at = MAGIC.len() as u64;
+    // Front matter ends at the first state record. Indexed open must not turn into a
+    // physical-record scan: the tail locates the index, and composition later reads only
+    // the selected chain. The streamed path uses the same pre-state declarations as the
+    // authoritative Header, Quantization and Window Table.
+    while at < footer_at {
+        let (opcode, content_length) = ranged_framing(source, at, None)?;
+        let total = crate::serialization::RECORD_HEADER_SIZE as u64 + content_length;
+        if opcode == op::CHUNK || opcode == op::DELTA_CHUNK {
+            break;
+        }
+        match opcode {
+            op::HEADER => {
+                let parsed = ranged_header(
+                    source,
+                    at + crate::serialization::RECORD_HEADER_SIZE as u64,
+                    content_length,
+                )?;
+                check_keyframe_temporal_model(&parsed.temporal_model)?;
+                header = Some(parsed);
+            }
+            op::QUANTIZATION => {
+                let content = ranged_front_matter_content(
+                    source,
+                    at + crate::serialization::RECORD_HEADER_SIZE as u64,
+                    content_length,
+                    "Quantization",
+                )?;
+                let parsed = rec::Quantization::parse(&content)?;
+                crate::registry::check_quantization_scheme(&parsed.scheme)?;
+                quant = Some(parsed);
+            }
+            op::WINDOW_TABLE => {
+                let content = ranged_front_matter_content(
+                    source,
+                    at + crate::serialization::RECORD_HEADER_SIZE as u64,
+                    content_length,
+                    "Window Table",
+                )?;
+                windows = rec::WindowTable::parse(&content)?.windows;
             }
             _ => {}
         }
+        at = at
+            .checked_add(total)
+            .ok_or_else(|| Error::Truncated("record walk offset overflows".into()))?;
+        if at > footer_at {
+            return Err(Error::Truncated(format!(
+                "the {} record before the final Footer extends to byte {at}, past the Footer at {footer_at}",
+                op::name(opcode)
+            )));
+        }
     }
-    let Some(footer) = footer else {
-        return Err(Error::Malformed("file has no Footer".into()));
-    };
     let (Some(header), Some(quantization)) = (header, quant) else {
         return Err(Error::Malformed(
             "keyframe-delta file has no Header or Quantization record".into(),
@@ -1078,22 +1581,65 @@ pub fn decode_indexed(data: &[u8]) -> Result<(DecodedSequence, Vec<rec::ChunkInd
     };
 
     let mut index: Vec<rec::ChunkIndexEntry> = Vec::new();
-    for record in Records::new(data, footer.summary_start as usize) {
-        let record = record?;
-        if record.opcode == op::CHUNK_INDEX {
-            index.push(rec::ChunkIndexEntry::parse(record.content)?);
-        } else {
+    if footer.summary_start > footer_at {
+        return Err(Error::Malformed(format!(
+            "the footer says the summary starts at {}, past the footer itself at {footer_at}",
+            footer.summary_start
+        )));
+    }
+    let mut summary_at = footer.summary_start;
+    while summary_at != 0 && summary_at < footer_at {
+        let (opcode, content_length) = ranged_framing(source, summary_at, None)?;
+        let total = (crate::serialization::RECORD_HEADER_SIZE as u64)
+            .checked_add(content_length)
+            .ok_or_else(|| Error::Truncated("summary record length overflows".into()))?;
+        let end = summary_at
+            .checked_add(total)
+            .filter(|end| *end <= footer_at)
+            .ok_or_else(|| {
+                Error::Malformed(format!(
+                    "the {} record at {summary_at} extends past the Footer at {footer_at}",
+                    op::name(opcode)
+                ))
+            })?;
+        if opcode != op::CHUNK_INDEX {
             break;
         }
+        let content = source.read(
+            summary_at + crate::serialization::RECORD_HEADER_SIZE as u64,
+            content_length,
+        )?;
+        index.push(rec::ChunkIndexEntry::parse(&content)?);
+        summary_at = end;
     }
     check_tiling(&index)?;
+    check_timeline_endpoints(&index, header.duration_sec)?;
+
+    Ok(IndexedSequence {
+        header,
+        quantization,
+        windows,
+        index,
+    })
+}
+
+/// Read the Footer, then the index, then compose each chunk by walking its chain.
+pub fn decode_indexed(data: &[u8]) -> Result<(DecodedSequence, Vec<rec::ChunkIndexEntry>)> {
+    let mut source = crate::BytesReadable::new(data);
+    let IndexedSequence {
+        header,
+        quantization,
+        windows,
+        index,
+    } = open_indexed(&mut source)?;
 
     let mut chunks: Vec<ChunkInfo> = Vec::with_capacity(index.len());
     for entry in &index {
-        let state = compose_chain(data, &index, entry, &windows)?;
+        let state = compose_chain(&mut source, &index, entry, &quantization, &windows)?;
         let (update_count, birth_count, death_count) = if entry.kind != 0 {
-            let content = record_content(data, entry.chunk_offset, entry.chunk_length)?;
-            let (head, ..) = rec::parse_delta_chunk(content)?;
+            let (_, content) =
+                ranged_record(&mut source, entry.chunk_offset, Some(entry.chunk_length))?;
+            let (head, _) = rec::parse_delta_chunk_records(&content)?;
             (
                 Some(head.update_count),
                 Some(head.birth_count),
@@ -1523,5 +2069,361 @@ mod window_grid_tests {
         let g = grids(Vec::new());
         assert_eq!(g.window_len(0), 0.0);
         assert_eq!(g.window_len(7), 0.0, "the fallback is total, not a panic");
+    }
+}
+
+#[cfg(test)]
+mod hostile_record_tests {
+    use super::*;
+    use crate::codec;
+    use crate::readable::Readable;
+    use crate::serialization::{put_blob, put_f64, put_string, put_u16, put_u32, put_u64};
+    use crate::BytesReadable;
+
+    fn record_content(record: &[u8]) -> &[u8] {
+        &record[crate::serialization::RECORD_HEADER_SIZE..]
+    }
+
+    fn empty_delta_records() -> Vec<u8> {
+        let mut records = Vec::new();
+        put_blob(&mut records, &[]);
+        put_blob(&mut records, &[]);
+        put_blob(&mut records, &[]);
+        records
+    }
+
+    fn delta_content_with_compression(name: &str, payload: &[u8], decoded_size: u64) -> Vec<u8> {
+        let mut body = Vec::new();
+        put_f64(&mut body, 0.0);
+        put_f64(&mut body, 1.0);
+        put_u32(&mut body, 0);
+        body.push(rec::DELTA_MODE_CHAINED);
+        put_u64(&mut body, 8);
+        put_u64(&mut body, 8);
+        put_u16(&mut body, 1);
+        put_u32(&mut body, 0);
+        put_u32(&mut body, 0);
+        put_u32(&mut body, 0);
+        put_string(&mut body, name);
+        put_u64(&mut body, decoded_size);
+        put_blob(&mut body, payload);
+        body
+    }
+
+    #[test]
+    fn delta_chunk_compression_is_decoded_before_group_framing() {
+        let records = empty_delta_records();
+        let compressed = codec::compress(&records, codec::DEFLATE, 6).unwrap();
+        let content = delta_content_with_compression("deflate", &compressed, records.len() as u64);
+        check_delta_chunk(&content, &[]).unwrap();
+    }
+
+    #[test]
+    fn an_unknown_delta_chunk_compression_is_a_named_refusal() {
+        let records = empty_delta_records();
+        let content =
+            delta_content_with_compression("future-codec", &records, records.len() as u64);
+        let error = check_delta_chunk(&content, &[]).unwrap_err();
+        assert_eq!(
+            error.refusal_code(),
+            Some(crate::error::refusal::UNKNOWN_STREAM_CODEC)
+        );
+    }
+
+    #[test]
+    fn a_delta_records_block_cannot_decompress_past_the_fixed_cap() {
+        let content = delta_content_with_compression(
+            "deflate",
+            &[0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01],
+            MAX_STREAM_BYTES + 1,
+        );
+        let error = check_delta_chunk(&content, &[]).unwrap_err();
+        assert!(error.to_string().contains("past the"), "{error}");
+        assert!(error.to_string().contains("byte cap"), "{error}");
+    }
+
+    #[test]
+    fn an_uncompressed_delta_records_block_must_match_its_declared_size() {
+        let records = empty_delta_records();
+        let content = delta_content_with_compression("", &records, records.len() as u64 + 1);
+        let error = check_delta_chunk(&content, &[]).unwrap_err();
+        assert!(error.to_string().contains("declares"), "{error}");
+        assert!(error.to_string().contains("but carries"), "{error}");
+    }
+
+    #[test]
+    fn defined_attributes_must_use_their_defined_channel_count() {
+        let bytes = encode_stream(op::A_POSITION, &[1, 2], 2, codec::DEFLATE, 6, true).unwrap();
+        let error = decode_group(&bytes, 1).unwrap_err();
+        assert!(error.to_string().contains("declares 2 channels"), "{error}");
+    }
+
+    #[test]
+    fn a_nonempty_birth_must_carry_the_full_state() {
+        let births = encode_stream(op::A_GAUSSIAN_ID, &[7], 1, codec::DEFLATE, 6, true).unwrap();
+        let record = rec::encode_delta_chunk(
+            0.0,
+            1.0,
+            0,
+            rec::DELTA_MODE_CHAINED,
+            8,
+            8,
+            1,
+            &[],
+            &births,
+            &[],
+            (0, 1, 0),
+        );
+        let error = check_delta_chunk(record_content(&record), &[]).unwrap_err();
+        assert!(
+            error.to_string().contains("missing required attributes"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_death_group_may_carry_only_gaussian_id() {
+        let mut deaths =
+            encode_stream(op::A_GAUSSIAN_ID, &[7], 1, codec::DEFLATE, 6, true).unwrap();
+        deaths.extend_from_slice(
+            &encode_stream(op::A_OPACITY, &[1], 1, codec::DEFLATE, 6, true).unwrap(),
+        );
+        let record = rec::encode_delta_chunk(
+            0.0,
+            1.0,
+            0,
+            rec::DELTA_MODE_CHAINED,
+            8,
+            8,
+            1,
+            &[],
+            &[],
+            &deaths,
+            (0, 0, 1),
+        );
+        let error = check_delta_chunk(record_content(&record), &[]).unwrap_err();
+        assert!(
+            error.to_string().contains("may carry only gaussian_id"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_keyframe_mu_t_bin_must_represent_its_chunk_t0() {
+        let mut bins = BTreeMap::new();
+        bins.insert(op::A_MU_T, BinArray::new(vec![0], 1));
+        bins.insert(op::A_SIGMA_T, BinArray::new(vec![0], 1));
+        bins.insert(op::A_FLAGS, BinArray::new(vec![0], 1));
+        let state = State { ids: vec![9], bins };
+        let quantization = rec::Quantization {
+            step_time: 0.004,
+            step_sigma_log: 0.04,
+            ..Default::default()
+        };
+        let error = check_keyframe_mu_t(&state, 1.0, &quantization).unwrap_err();
+        assert!(error.to_string().contains("Chunk t0 1"), "{error}");
+    }
+
+    struct Watched<'a> {
+        inner: crate::BytesReadable<'a>,
+        reads: Vec<(u64, u64)>,
+    }
+
+    impl<'a> Watched<'a> {
+        fn new(data: &'a [u8]) -> Self {
+            Self {
+                inner: crate::BytesReadable::new(data),
+                reads: Vec::new(),
+            }
+        }
+    }
+
+    impl Readable for Watched<'_> {
+        fn size(&mut self) -> Result<u64> {
+            self.inner.size()
+        }
+
+        fn read(&mut self, offset: u64, length: u64) -> Result<Vec<u8>> {
+            self.reads.push((offset, length));
+            self.inner.read(offset, length)
+        }
+    }
+
+    fn empty_indexed_file() -> Vec<u8> {
+        write_sequence(
+            &[Sample {
+                t0: 0.0,
+                ids: Vec::new(),
+                gaussians: GaussianSet::default(),
+            }],
+            1.0,
+            &KeyframeDeltaOptions::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn indexed_open_reads_the_fixed_tail_and_never_fetches_chunk_content() {
+        let data = empty_indexed_file();
+        let chunk = Records::new(&data, MAGIC.len())
+            .filter_map(|record| record.ok())
+            .find(|record| record.opcode == op::CHUNK)
+            .unwrap();
+        let content_start = chunk.offset as u64 + crate::serialization::RECORD_HEADER_SIZE as u64;
+        let content_end = content_start + chunk.content.len() as u64;
+
+        let mut source = Watched::new(&data);
+        let sequence = open_indexed(&mut source).unwrap();
+        assert_eq!(sequence.index.len(), 1);
+        assert!(source.reads.iter().all(|(offset, length)| {
+            let end = offset.saturating_add(*length);
+            end <= content_start || *offset >= content_end
+        }));
+    }
+
+    #[test]
+    fn a_hostile_summary_start_never_sizes_one_summary_allocation() {
+        let mut data = empty_indexed_file();
+        let footer_at = data.len() - MAGIC.len() - crate::serialization::RECORD_HEADER_SIZE - 20;
+        data[footer_at + crate::serialization::RECORD_HEADER_SIZE
+            ..footer_at + crate::serialization::RECORD_HEADER_SIZE + 8]
+            .copy_from_slice(&(MAGIC.len() as u64).to_le_bytes());
+
+        let mut source = Watched::new(&data);
+        let _ = open_indexed(&mut source);
+        assert!(
+            source.reads.iter().all(|(_, length)| *length < 1024),
+            "unexpected bulk read: {:?}",
+            source.reads
+        );
+    }
+
+    #[test]
+    fn indexed_open_does_not_scan_records_after_the_first_state_record() {
+        let mut data = empty_indexed_file();
+        let old_footer_at =
+            data.len() - MAGIC.len() - crate::serialization::RECORD_HEADER_SIZE - 20;
+        let old_summary_start = u64::from_le_bytes(
+            data[old_footer_at + crate::serialization::RECORD_HEADER_SIZE
+                ..old_footer_at + crate::serialization::RECORD_HEADER_SIZE + 8]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let late = rec::Header {
+            duration_sec: 1.0,
+            aabb: vec![0.0; 6],
+            temporal_model: "frame-sequence".into(),
+            ..Default::default()
+        }
+        .encode(&[]);
+        data.splice(old_summary_start..old_summary_start, late.iter().copied());
+
+        let footer_at = old_footer_at + late.len();
+        let shifted_summary = (old_summary_start + late.len()) as u64;
+        data[footer_at + crate::serialization::RECORD_HEADER_SIZE
+            ..footer_at + crate::serialization::RECORD_HEADER_SIZE + 8]
+            .copy_from_slice(&shifted_summary.to_le_bytes());
+
+        let late_at = old_summary_start as u64;
+        let mut source = Watched::new(&data);
+        let sequence = open_indexed(&mut source).unwrap();
+        assert_eq!(sequence.header.temporal_model, "keyframe-delta");
+        assert!(
+            !source
+                .reads
+                .iter()
+                .any(|(offset, length)| *offset == late_at && *length == 9),
+            "indexed open walked into the late Header: {:?}",
+            source.reads
+        );
+    }
+
+    #[test]
+    fn indexed_open_skips_an_extensible_header_trailer() {
+        let mut data = empty_indexed_file();
+        let old_footer_at =
+            data.len() - MAGIC.len() - crate::serialization::RECORD_HEADER_SIZE - 20;
+        let old_summary_start = u64::from_le_bytes(
+            data[old_footer_at + crate::serialization::RECORD_HEADER_SIZE
+                ..old_footer_at + crate::serialization::RECORD_HEADER_SIZE + 8]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let trailer = vec![0u8; 1024 * 1024];
+        let late = rec::Header {
+            duration_sec: 1.0,
+            aabb: vec![0.0; 6],
+            temporal_model: "keyframe-delta".into(),
+            ..Default::default()
+        }
+        .encode(&trailer);
+        data.splice(old_summary_start..old_summary_start, late.iter().copied());
+
+        let footer_at = old_footer_at + late.len();
+        let shifted_summary = (old_summary_start + late.len()) as u64;
+        data[footer_at + crate::serialization::RECORD_HEADER_SIZE
+            ..footer_at + crate::serialization::RECORD_HEADER_SIZE + 8]
+            .copy_from_slice(&shifted_summary.to_le_bytes());
+
+        let mut source = Watched::new(&data);
+        open_indexed(&mut source).unwrap();
+        assert!(
+            source.reads.iter().all(|(_, length)| *length <= 8 * 1024),
+            "the Header trailer was transferred: {:?}",
+            source.reads
+        );
+    }
+
+    #[test]
+    fn streamed_and_indexed_reads_keep_the_pre_state_window_table() {
+        let mut data = empty_indexed_file();
+        let old_footer_at =
+            data.len() - MAGIC.len() - crate::serialization::RECORD_HEADER_SIZE - 20;
+        let old_summary_start = u64::from_le_bytes(
+            data[old_footer_at + crate::serialization::RECORD_HEADER_SIZE
+                ..old_footer_at + crate::serialization::RECORD_HEADER_SIZE + 8]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let late = rec::WindowTable {
+            windows: vec![(10.0, 20.0)],
+        }
+        .encode();
+        data.splice(old_summary_start..old_summary_start, late.iter().copied());
+
+        let footer_at = old_footer_at + late.len();
+        let shifted_summary = (old_summary_start + late.len()) as u64;
+        data[footer_at + crate::serialization::RECORD_HEADER_SIZE
+            ..footer_at + crate::serialization::RECORD_HEADER_SIZE + 8]
+            .copy_from_slice(&shifted_summary.to_le_bytes());
+
+        let streamed = decode_streamed(&data).unwrap();
+        let indexed = open_indexed(&mut BytesReadable::new(&data)).unwrap();
+        assert_eq!(streamed.windows, indexed.windows);
+        assert_ne!(streamed.windows, vec![(10.0, 20.0)]);
+    }
+
+    #[test]
+    fn quantization_length_is_bounded_before_the_range_is_read() {
+        struct NoReads;
+        impl Readable for NoReads {
+            fn size(&mut self) -> Result<u64> {
+                Ok(u64::MAX)
+            }
+
+            fn read(&mut self, _offset: u64, _length: u64) -> Result<Vec<u8>> {
+                panic!("the oversized range must be rejected before Readable::read")
+            }
+        }
+
+        let error = ranged_front_matter_content(
+            &mut NoReads,
+            0,
+            crate::indexed_reader::MAX_FRONT_MATTER_BYTES + 1,
+            "Quantization",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Quantization"), "{error}");
+        assert!(error.to_string().contains("ceiling"), "{error}");
     }
 }
