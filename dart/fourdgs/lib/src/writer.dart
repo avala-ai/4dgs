@@ -32,11 +32,19 @@ import 'package:archive/archive.dart' as archive;
 import 'chunk_decoder.dart' show shBandRange;
 import 'exceptions.dart';
 import 'indexed_reader.dart' show maxChunkIndexEntries;
+import 'keyframe_delta.dart';
 import 'model.dart';
 import 'opcode.dart';
 import 'quantization.dart';
-import 'records.dart' show maxWindowsPerScene;
+import 'records.dart';
 import 'serialization.dart';
+
+// The `keyframe-delta` encoder is a part rather than its own library because it
+// is the same encoder: it lands attributes on the grids `_Grid` derives, frames
+// records with `_record`, and codes symbols with `_encodeStream`. Splitting it
+// into a library would mean making that machinery public — a decision about the
+// package's surface taken to satisfy a file boundary.
+part 'keyframe_delta_writer.dart';
 
 /// The caller handed the encoder something no conforming file can be written
 /// from.
@@ -84,6 +92,8 @@ class FourdgsWriteOptions {
     this.writeSummaryOffsets = false,
     this.writeCrc = true,
     this.shBands = 3,
+    this.shBitDepths = const <int>[],
+    this.verify = true,
     this.library = '4dgs-dart encoder',
     this.sceneProfile = '',
     this.attributes = const <String, String>{},
@@ -125,6 +135,25 @@ class FourdgsWriteOptions {
   /// Highest spherical-harmonic band to write, capped further by the scene's
   /// own degree.
   final int shBands;
+
+  /// Per-band spherical-harmonic bit depths, band 1 first.
+  ///
+  /// Named choices live in [fourdgsShLadders]; for example,
+  /// `fourdgsShLadders['balanced']!` is the balanced list to pass here.
+  ///
+  /// Empty applies no per-band depth: coefficients remain their exact eight-bit
+  /// values, the appended field is not emitted, and a profile's `step_sh`
+  /// remains compatibility metadata rather than an implicit coefficient grid.
+  final List<int> shBitDepths;
+
+  /// Decode each band record back and measure the deviation before declaring a
+  /// bound for it.
+  ///
+  /// On by default, because a bound nobody verified is worse than no bound:
+  /// consumers will trust it. The arithmetic that produced these bytes is three
+  /// lines and would agree with itself if it were wrong, so what is measured is
+  /// what came back out of the record.
+  final bool verify;
 
   /// Free-form producer identification, written to the Header.
   final String library;
@@ -230,6 +259,10 @@ void writeFourdgsToSink(
   _checkInput(gaussians, options.cutoff);
 
   final n = gaussians.count;
+  // These are small option-derived tables, and option errors should win before
+  // grid derivation or chunk planning touches a large scene.
+  final bands = _bandColumns(gaussians, options.shBands);
+  final depths = _resolveShDepths(options.shBitDepths, bands);
   final grid = _Grid.forScene(gaussians, options.profile);
   final windows = _WindowTable.of(gaussians);
   final encodedAabb = _encodedAabb(gaussians, grid);
@@ -237,12 +270,17 @@ void writeFourdgsToSink(
   // Window boundaries are the top level of the temporal partition. Anything
   // strictly inside the clip is a split point; the ends are always present.
   final tops = _tops(windows.windows, durationSec);
+  final planningSupport = _planningSupport(
+    gaussians,
+    grid,
+    windows,
+    options.cutoff,
+  );
   final plans = _planChunks(
     gaussians,
+    planningSupport,
     tops,
     options,
-    grid: grid,
-    windows: windows,
     staticScene: durationSec == 0.0,
   );
 
@@ -266,8 +304,6 @@ void writeFourdgsToSink(
     );
   }
 
-  final bands = _bandColumns(gaussians, options.shBands);
-
   final out = _SinkWriter(sink);
   out.bytes(fourdgsMagic);
   // The degree the file actually carries, which is the highest band written and
@@ -285,7 +321,7 @@ void writeFourdgsToSink(
       encodedAabb,
     ),
   );
-  out.bytes(_quantizationRecord(grid, windows));
+  out.bytes(_quantizationRecord(grid, depths));
   out.bytes(_windowTableRecord(windows));
 
   final index = <_IndexEntry>[];
@@ -307,7 +343,13 @@ void writeFourdgsToSink(
     final streams = _ByteWriter(4096);
     for (final lane in quantized.lanes) {
       streams.bytes(
-        _encodeStream(lane.attributeId, lane.values, lane.channels, options),
+        _encodeStream(
+          lane.attributeId,
+          lane.values,
+          lane.channels,
+          options.codec,
+          options.level,
+        ),
       );
     }
     final chunkOffset = out.length;
@@ -323,7 +365,7 @@ void writeFourdgsToSink(
     final List<_IndexBand>? entryBands =
         options.writeIndex ? <_IndexBand>[] : null;
     for (final band in bands) {
-      final blob = _bandRecord(gaussians, band, members, options, grid.stepSh);
+      final blob = _bandRecord(gaussians, band, members, depths, options);
       final at = out.length;
       out.bytes(blob);
       entryBands?.add(_IndexBand(band.band, at, blob.length));
@@ -693,7 +735,6 @@ class _Grid {
   });
 
   factory _Grid.forScene(FourdgsGaussianSet g, String profile) {
-    final constants = _profiles[profile]!;
     final medianScale = g.count == 0 ? 1e-3 : _medianFloat32(g.scales);
     final origin = Float64List(3);
     if (g.count > 0) {
@@ -706,6 +747,21 @@ class _Grid {
         origin[axis] = lowest;
       }
     }
+    return _Grid.forProfile(profile, medianScale, origin);
+  }
+
+  /// The same grid, from statistics a caller already holds.
+  ///
+  /// A `keyframe-delta` sequence derives its median radius and its position
+  /// origin from every sample at once rather than from one population, and the
+  /// two encoders must land on the same pitches from the same numbers — so the
+  /// arithmetic lives here once and the statistics are the argument.
+  factory _Grid.forProfile(
+    String profile,
+    double medianScale,
+    Float64List origin,
+  ) {
+    final constants = _profiles[profile]!;
     return _Grid(
       origin: origin,
       boundPos: constants[0] * medianScale,
@@ -748,7 +804,10 @@ class _Grid {
   /// where Rust writes `5e-5` and Dart writes `0.00005`. Three spellings of one
   /// number: what a consumer reads is the number, and nothing in the format
   /// pins the notation.
-  Map<String, String> declaredBounds() => <String, String>{
+  ///
+  /// [depths] adds one `sh_band<n>` entry per band that declares a bit depth,
+  /// beside the single `sh` the record has always carried.
+  Map<String, String> declaredBounds(Map<int, int> depths) => <String, String>{
     'pos': _decimal(boundPos),
     'scale_rel': _decimal(boundScaleRel),
     'rot': _decimal(boundRot),
@@ -757,8 +816,115 @@ class _Grid {
     'motion': _decimal(boundMotion),
     'time': _decimal(boundTime),
     'sigma_rel': _decimal(boundSigmaRel),
-    'sh': '$boundSh',
+    'sh': '${_declaredShBound(depths)}',
+    for (final band in depths.keys.toList()..sort())
+      'sh_band$band': '${fourdgsShBound(depths[band]!)}',
   };
+
+  /// The single `sh` bound, which predates per-band depths.
+  ///
+  /// The coarsest band's is the only honest answer once bands differ: a consumer
+  /// that reads this and not the appended per-band field then holds an upper
+  /// bound rather than a number that is true of some bands and wrong for others.
+  int _declaredShBound(Map<int, int> depths) {
+    if (depths.isEmpty) return boundSh;
+    int worst = 0;
+    for (final bits in depths.values) {
+      worst = math.max(worst, fourdgsShBound(bits));
+    }
+    return worst;
+  }
+
+  /// `step_sh`, by the same rule and for the same reason as the bound above.
+  int declaredStepSh(Map<int, int> depths) {
+    if (depths.isEmpty) return stepSh;
+    int coarsest = 1;
+    for (final bits in depths.values) {
+      coarsest = math.max(coarsest, fourdgsShStep(bits));
+    }
+    return coarsest;
+  }
+}
+
+/// The narrowest and widest a spherical-harmonic band may declare (spec §6.5).
+///
+/// Eight is the coefficient as stored, so a band that declares it is exact;
+/// three leaves eight levels, which is the point at which a band stops
+/// describing a direction and starts describing a mood.
+const int fourdgsShMinBits = 3;
+const int fourdgsShMaxBits = 8;
+
+/// Named per-band ladders, band 1 first, as `website/docs/reference/compression.md`
+/// measures them.
+///
+/// Band energy falls with degree, so every ladder here spends fewer bits as the
+/// band index rises; a producer may pass any list in the legal range.
+const Map<String, List<int>> fourdgsShLadders = <String, List<int>>{
+  'flat': <int>[8, 8, 8],
+  'balanced': <int>[8, 6, 5],
+  'aggressive': <int>[6, 4, 3],
+};
+
+/// The grid pitch, in code units, that a bit depth implies.
+///
+/// A coefficient is a byte whatever the depth: `n` bits means the byte is
+/// rounded onto a grid of `2^(8 - n)` code units, which leaves `2^n` distinct
+/// values in a stream that is still bytes. Nothing sub-byte is packed and no
+/// decoder changes — the saving is realized by the stream codec, which has that
+/// many fewer symbols to code, and by `step_sh` never being applied at decode.
+int fourdgsShStep(int bits) {
+  if (bits < fourdgsShMinBits || bits > fourdgsShMaxBits) {
+    throw FourdgsInvalidInput(
+      'an SH bit depth must be $fourdgsShMinBits..$fourdgsShMaxBits, got $bits',
+    );
+  }
+  return 1 << (fourdgsShMaxBits - bits);
+}
+
+/// The maximum deviation, in code units, a bit depth guarantees.
+///
+/// Exactly half the pitch, which is the relationship every other attribute's
+/// grid has to its bound. Eight bits is pitch 1 and bound 0: the byte is stored
+/// as it arrived.
+int fourdgsShBound(int bits) => fourdgsShStep(bits) ~/ 2;
+
+/// Round one coefficient byte onto the grid [bits] names, at bin centres.
+///
+/// Centring is what makes the bound half the pitch rather than the whole of it,
+/// and it keeps the operation idempotent: a coefficient already on the grid is
+/// left alone, so re-encoding a file at the depth it already carries changes no
+/// byte.
+int fourdgsQuantizeSh(int value, int bits) {
+  final step = fourdgsShStep(bits);
+  if (step == 1) return value;
+  return (value ~/ step) * step + step ~/ 2;
+}
+
+/// Resolve the option into `{band: bit depth}` for the bands actually written.
+///
+/// A ladder shorter than the file's degree is an error rather than a default:
+/// the depth of the highest band decides most of the size, and silently filling
+/// it in with eight bits hands back a file that quietly ignored what was asked
+/// for.
+Map<int, int> _resolveShDepths(List<int> requested, List<_BandColumns> bands) {
+  if (requested.isEmpty || bands.isEmpty) return const <int, int>{};
+  if (requested.length < bands.length) {
+    throw FourdgsInvalidInput(
+      'shBitDepths declares ${requested.length} bands; '
+      'this scene writes ${bands.length}',
+    );
+  }
+  final out = <int, int>{};
+  for (int i = 0; i < bands.length; i++) {
+    final bits = requested[i];
+    if (bits < fourdgsShMinBits || bits > fourdgsShMaxBits) {
+      throw FourdgsInvalidInput(
+        'an SH bit depth must be $fourdgsShMinBits..$fourdgsShMaxBits, got $bits',
+      );
+    }
+    out[bands[i].band] = bits;
+  }
+  return out;
 }
 
 String _decimal(double v) => v.toString();
@@ -1182,6 +1348,64 @@ int _binRotation(double v, int gaussian) {
 // Chunk planning
 // --------------------------------------------------------------------------
 
+class _PlanningSupport {
+  const _PlanningSupport(this.lo, this.hi, this.windowHi);
+
+  final Float64List lo;
+  final Float64List hi;
+  final Float64List windowHi;
+}
+
+/// Exact reconstructed temporal support, without retaining encoded lanes.
+///
+/// The two endpoints are the global metadata the interval tree needs before a
+/// Header can be emitted. All eleven attribute lanes remain bounded to the
+/// current Chunk in [_quantize].
+_PlanningSupport _planningSupport(
+  FourdgsGaussianSet g,
+  _Grid grid,
+  _WindowTable windows,
+  double cutoff,
+) {
+  final lo = Float64List(g.count);
+  final hi = Float64List(g.count);
+  final windowHi = Float64List(g.count);
+  final reconstructed = Float32List(4);
+  final k = supportK(cutoff);
+  for (int i = 0; i < g.count; i++) {
+    final neverFades = !g.sigmaT[i].isFinite;
+    final sigmaBin =
+        neverFades
+            ? 0
+            : _bin(
+              math.log(g.sigmaT[i] == 0.0 ? 1e-30 : g.sigmaT[i]) /
+                  grid.stepSigmaLog,
+              'sigma_t',
+              i,
+            );
+    final muPitch = muStep(
+      sigmaBin,
+      grid.stepSigmaLog,
+      neverFades,
+      grid.stepTime,
+    );
+    final muBin = _bin(g.muT[i] / muPitch, 'mu_t', i);
+    final window = windows.windows[windows.rank(g.winLo[i], g.winHi[i])];
+    reconstructed[0] =
+        neverFades ? double.infinity : math.exp(sigmaBin * grid.stepSigmaLog);
+    reconstructed[1] = muBin * muPitch;
+    reconstructed[2] = window[0];
+    reconstructed[3] = window[1];
+    final sigma = reconstructed[0];
+    final mu = reconstructed[1];
+    final half = sigma.isFinite ? k * math.max(sigma, 1e-30) : double.infinity;
+    lo[i] = math.max(mu - half, reconstructed[2]);
+    hi[i] = math.min(mu + half, reconstructed[3]);
+    windowHi[i] = reconstructed[3];
+  }
+  return _PlanningSupport(lo, hi, windowHi);
+}
+
 /// One chunk: interval metadata plus a view into one packed assignment table.
 class _Plan {
   _Plan(this.t0, this.t1, this.level, this._packed, this.start, this.end);
@@ -1209,24 +1433,20 @@ class _Plan {
 /// be pushed up to the root and the tree would have one node in it.
 List<_Plan> _planChunks(
   FourdgsGaussianSet g,
+  _PlanningSupport support,
   List<double> tops,
   FourdgsWriteOptions options, {
-  required _Grid grid,
-  required _WindowTable windows,
   required bool staticScene,
 }) {
   final n = g.count;
   if (n == 0) return const <_Plan>[];
 
-  // Partition the state the file will reconstruct, not the authored values on
-  // the near side of quantization. A mu_t or sigma_t bin may move a support edge
-  // across a tree boundary. Filing by the authored edge then lets the streamed
-  // reader see a gaussian at an instant whose indexed seek does not fetch its
-  // chunk. This bounded pass repeats only those two scalar grids and narrows
-  // them to float32 exactly where the public decoder does.
-  final support = _reconstructedSupport(g, grid, windows, options.cutoff);
+  // Exact reconstructed support, clipped to each gaussian's own validity
+  // window. Planning from the pre-quantized input can file a gaussian on one
+  // side of a boundary that its decoded state crosses.
   final lo = support.lo;
   final hi = support.hi;
+  final windowHi = support.windowHi;
   tops = _finiteTailTops(tops, lo, hi);
 
   final assigned = Int32List(n)..fillRange(0, n, -1);
@@ -1288,7 +1508,7 @@ List<_Plan> _planChunks(
       // child's interval excludes `mid`. It can descend left on equality only
       // when its verbatim validity window also ends there, making the gaussian
       // absent at that half-open endpoint.
-      if (hi[i] < mid || (hi[i] == mid && g.winHi[i] <= mid)) {
+      if (hi[i] < mid || (hi[i] == mid && windowHi[i] <= mid)) {
         final swap = pool[leftEnd];
         pool[leftEnd] = i;
         pool[at] = swap;
@@ -1352,7 +1572,7 @@ List<_Plan> _planChunks(
   // them in.
   final intervalCounts = Int32List(tops.length - 1);
   for (int i = 0; i < n; i++) {
-    final w = _firstContainingInterval(tops, lo[i], hi[i], g.winHi[i]);
+    final w = _firstContainingInterval(tops, lo[i], hi[i], windowHi[i]);
     assigned[i] = w;
     if (w >= 0) intervalCounts[w]++;
   }
@@ -1440,50 +1660,6 @@ List<_Plan> _planChunks(
   return plans;
 }
 
-/// Per-gaussian support after the exact sigma and birth-time reconstruction a
-/// reader performs.
-///
-/// The returned pair is the planner's two scene-sized typed arrays. Everything
-/// else is scalar or the two-float narrowing scratch, so quantization does not
-/// add another retained lane to the writer's bounded-memory partition.
-({Float64List lo, Float64List hi}) _reconstructedSupport(
-  FourdgsGaussianSet g,
-  _Grid grid,
-  _WindowTable table,
-  double cutoff,
-) {
-  final lo = Float64List(g.count);
-  final hi = Float64List(g.count);
-  final narrowed = Float32List(2);
-  final k = supportK(cutoff);
-
-  for (int i = 0; i < g.count; i++) {
-    final neverFades = !g.sigmaT[i].isFinite;
-    final sigmaBin =
-        neverFades
-            ? 0
-            : _bin(
-              math.log(g.sigmaT[i] == 0.0 ? 1e-30 : g.sigmaT[i]) /
-                  grid.stepSigmaLog,
-              'sigma_t',
-              i,
-            );
-    narrowed[0] =
-        neverFades ? double.infinity : math.exp(sigmaBin * grid.stepSigmaLog);
-    final sigma = narrowed[0];
-    final step = muStep(sigmaBin, grid.stepSigmaLog, neverFades, grid.stepTime);
-    final muBin = _bin(g.muT[i] / step, 'mu_t', i);
-    narrowed[1] = muBin * step;
-    final mu = narrowed[1];
-
-    final window = table.windows[table.rank(g.winLo[i], g.winHi[i])];
-    final half = sigma.isFinite ? k * math.max(sigma, 1e-30) : double.infinity;
-    lo[i] = math.max(mu - half, window[0]);
-    hi[i] = math.min(mu + half, window[1]);
-  }
-  return (lo: lo, hi: hi);
-}
-
 /// Give an open-ended final window a finite prefix the tree can bisect.
 ///
 /// `0.5 * (finite + infinity)` is infinity, so without this boundary an
@@ -1513,23 +1689,12 @@ List<double> _finiteTailTops(
 
 /// The first interval of [tops] whose span contains the whole support
 /// `[lo, hi]`, or `-1` when no interval does.
-///
-/// [tops] ascends, which is what makes two binary searches equivalent to the
-/// scan: the intervals whose start clears `lo` are a prefix of it, and those
-/// whose end covers `hi` are a suffix, so the first interval that does both is
-/// where the suffix begins — if it begins inside the prefix at all.
-///
-/// Containment is exact. A tolerance here can file support ending just beyond
-/// `b` into `[a, b)`, after which a seek at `b` omits a gaussian the streamed
-/// path still sees. The support endpoint itself is inclusive unless the
-/// gaussian's validity window ends there, which [windowHi] distinguishes.
 int _firstContainingInterval(
   List<double> tops,
   double lo,
   double hi,
   double windowHi,
 ) {
-  // The last interval whose start clears `lo`.
   int last = -1;
   int low = 0;
   int high = tops.length - 2;
@@ -1544,8 +1709,6 @@ int _firstContainingInterval(
   }
   if (last < 0) return -1;
 
-  // The first interval whose end covers `hi`, looked for only among those, so
-  // that "the suffix starts past the prefix" comes back as no interval at all.
   int first = -1;
   low = 0;
   high = last;
@@ -1553,8 +1716,7 @@ int _firstContainingInterval(
     final mid = (low + high) >> 1;
     final end = tops[mid + 1];
     // A marginal includes its support endpoint. Equality fits a half-open
-    // interval only when the verbatim validity window also ends there, making
-    // the gaussian absent at the interval's excluded endpoint.
+    // interval only when the reconstructed validity window also ends there.
     if (hi < end || (hi == end && windowHi <= end)) {
       first = mid;
       high = mid - 1;
@@ -1680,55 +1842,72 @@ Uint8List _bandRecord(
   FourdgsGaussianSet g,
   _BandColumns band,
   List<int> members,
+  Map<int, int> depths,
   FourdgsWriteOptions options,
-  int stepSh,
 ) {
   final sh = g.sh!;
   final row = g.shCoefficients * 3;
-  final values = Int32List(members.length * band.columns.length);
+  final size = members.length * band.columns.length;
+  final original = Uint8List(size);
+  final values = Int32List(size);
+  final bits = depths[band.band];
   int at = 0;
   for (final i in members) {
     for (final column in band.columns) {
-      values[at++] = _coarsenSh(sh[i * row + column], stepSh);
+      final raw = sh[i * row + column];
+      original[at] = raw;
+      values[at] = bits != null ? fourdgsQuantizeSh(raw, bits) : raw;
+      at++;
     }
   }
   final payload = _ByteWriter(values.length + 32);
   payload.u8(band.band);
   payload.bytes(
-    _encodeStream(opShBandStream, values, band.columns.length, options),
+    _encodeStream(
+      opShBandStream,
+      values,
+      band.columns.length,
+      options.codec,
+      options.level,
+    ),
   );
-  return _record(opShBandStream, payload.finish());
+  final blob = _record(opShBandStream, payload.finish());
+  if (options.verify && bits != null) {
+    _verifyBand(blob, original, fourdgsShBound(bits), band.band);
+  }
+  return blob;
 }
 
-/// One coefficient byte on the pitch the Quantization record declares.
+/// Decode the band record just written and check the bound it is about to claim.
 ///
-/// `step_sh` is an encode-side value (spec §6.5): a decoder does nothing with
-/// it, and the stored byte is the coefficient. That is exactly why it has to be
-/// applied here — the record declares the pitch the encoder used, so an encoder
-/// that declares 3 and writes every byte through has written a number about
-/// itself that is not true, and the `coarse` profile's SH allowance buys
-/// nothing. `fine` and `default` declare a bound of 0 and a pitch of 1, where
-/// this is the identity.
-///
-/// Rounding is to the bin centre, which is what makes the bound half the pitch
-/// rather than the whole of it, and it makes the operation idempotent: a
-/// coefficient already on the grid is left where it is. The floor is taken
-/// rather than a truncation so a negative code — which a version-1 file cannot
-/// hold, since coefficients are `u8`, but a caller can pass — lands on the same
-/// grid as a positive one.
-///
-/// The result is clamped back into a byte, and that is not defensive. The top
-/// bin's centre is above the top of the range whenever the pitch does not
-/// divide 256: at a pitch of 3, the coefficient 255 centres on 256, which
-/// travels through the stream as a 32-bit symbol and arrives at a reader as
-/// **zero** — the extreme positive coefficient read as the extreme negative
-/// one, in a file that decodes without complaint. Clamping moves the value
-/// towards the original, so the declared half-pitch bound is kept a fortiori.
-int _coarsenSh(int value, int step) {
-  if (step <= 1) return value;
-  final floored = (value >= 0 ? value : value - step + 1) ~/ step;
-  final centred = floored * step + step ~/ 2;
-  return centred < 0 ? 0 : (centred > 255 ? 255 : centred);
+/// Decoded rather than computed: the arithmetic that produced these bytes is
+/// three lines and would agree with itself if it were wrong. What the file will
+/// hand a consumer is what came back out of the record, so that is what the
+/// declared bound is measured against — every coefficient of every gaussian in
+/// the chunk, not a sample.
+void _verifyBand(Uint8List blob, Uint8List original, int bound, int band) {
+  final cursor = FourdgsCursor(
+    blob,
+    recordHeaderBytes + 1,
+  ); // opcode, length, band
+  final stream = decodeAttributeStream(cursor);
+  if (stream.values.length != original.length) {
+    throw FourdgsInvalidInput(
+      'encoder verification failed: SH band $band decoded '
+      '${stream.values.length} coefficients, wrote ${original.length}',
+    );
+  }
+  int worst = 0;
+  for (int i = 0; i < original.length; i++) {
+    final deviation = (stream.values[i] - original[i]).abs();
+    if (deviation > worst) worst = deviation;
+  }
+  if (worst > bound) {
+    throw FourdgsInvalidInput(
+      'encoder verification failed: SH band $band deviated $worst code units, '
+      'bound is $bound',
+    );
+  }
 }
 
 // --------------------------------------------------------------------------
@@ -1763,7 +1942,7 @@ Uint8List _header(
   return _record(opHeader, w.finish());
 }
 
-Uint8List _quantizationRecord(_Grid grid, _WindowTable table) {
+Uint8List _quantizationRecord(_Grid grid, Map<int, int> depths) {
   final w = _ByteWriter(384);
   w.string('uniform-v1');
   for (final v in grid.origin) {
@@ -1777,8 +1956,18 @@ Uint8List _quantizationRecord(_Grid grid, _WindowTable table) {
   w.f64(grid.stepMotion);
   w.f64(grid.stepTime);
   w.f64(grid.stepSigmaLog);
-  w.u8(grid.stepSh);
-  w.strMap(grid.declaredBounds());
+  w.u8(grid.declaredStepSh(depths));
+  w.strMap(grid.declaredBounds(depths));
+  // Appended after the record's original fields (spec §5.3), so a Quantization
+  // record that declares no depths has its pre-field spelling — an empty list is
+  // written as no bytes at all, not as a zero count.
+  if (depths.isNotEmpty) {
+    final bands = depths.keys.toList()..sort();
+    w.u8(bands.length);
+    for (final band in bands) {
+      w.u8(depths[band]!);
+    }
+  }
   return _record(opQuantization, w.finish());
 }
 
@@ -1870,6 +2059,13 @@ class _IndexEntry {
     required this.chunkLength,
     required this.gaussianCount,
     required this.bands,
+    this.extended = false,
+    this.kind = 0,
+    this.deltaMode = 0,
+    this.referenceOffset = 0,
+    this.keyframeOffset = 0,
+    this.depth = 0,
+    this.liveCount = 0,
   });
 
   final double t0;
@@ -1879,8 +2075,25 @@ class _IndexEntry {
   final int gaussianCount;
   final List<_IndexBand> bands;
 
+  /// True when this entry carries the `keyframe-delta` block below. False for
+  /// every `gaussian-birth` file, whose entries stay byte-identical: a reader
+  /// recognises the block by the bytes left after the band array, so an entry
+  /// that appends nothing parses exactly as it always did.
+  final bool extended;
+  final int kind;
+  final int deltaMode;
+  final int referenceOffset;
+  final int keyframeOffset;
+  final int depth;
+
+  /// Gaussians live over `[t0, t1)` after composition. Stated for keyframe
+  /// entries too, not only deltas: §5.8 defines it for every extended entry, and
+  /// the readers cross-check it against the chunk on both paths — a writer that
+  /// left it zero on keyframes would produce files this SDK refuses.
+  final int liveCount;
+
   Uint8List encode() {
-    final w = _ByteWriter(48 + 17 * bands.length);
+    final w = _ByteWriter(48 + 17 * bands.length + indexDeltaBlockBytes);
     w.f64(t0);
     w.f64(t1);
     w.u64(chunkOffset);
@@ -1892,6 +2105,14 @@ class _IndexEntry {
       w.u64(band.offset);
       w.u64(band.length);
     }
+    if (extended) {
+      w.u8(kind);
+      w.u8(deltaMode);
+      w.u64(referenceOffset);
+      w.u64(keyframeOffset);
+      w.u16(depth);
+      w.u64(liveCount);
+    }
     return _record(opChunkIndex, w.finish());
   }
 }
@@ -1899,7 +2120,7 @@ class _IndexEntry {
 List<double> _encodedAabb(FourdgsGaussianSet g, _Grid grid) {
   if (g.count == 0) return List<double>.filled(6, 0.0);
   final out = List<double>.filled(6, 0.0);
-  final decoded = Float32List(1);
+  final reconstructed = Float32List(1);
   for (int axis = 0; axis < 3; axis++) {
     double lo = double.infinity;
     double hi = double.negativeInfinity;
@@ -1913,8 +2134,8 @@ List<double> _encodedAabb(FourdgsGaussianSet g, _Grid grid) {
         'position',
         i,
       );
-      decoded[0] = bin * grid.stepPos + grid.origin[axis];
-      final v = decoded[0];
+      reconstructed[0] = bin * grid.stepPos + grid.origin[axis];
+      final v = reconstructed[0];
       if (!v.isFinite) {
         throw FourdgsInvalidInput(
           'position bin $bin at gaussian $i axis '
@@ -1952,25 +2173,19 @@ Uint8List _encodeStream(
   int attributeId,
   Int32List values,
   int channels,
-  FourdgsWriteOptions options,
+  int codec,
+  int level,
 ) {
   final count = channels == 0 ? 0 : values.length ~/ channels;
   if (count == 0) {
-    return _streamHeader(
-      attributeId,
-      1,
-      modeRaw,
-      options.codec,
-      channels,
-      0,
-      0,
-    );
+    return _streamHeader(attributeId, 1, modeRaw, codec, channels, 0, 0);
   }
 
   if (count > 1 && _allRowsEqual(values, channels, count)) {
     final body = _codeSymbols(
       Int32List.sublistView(values, 0, channels),
-      options,
+      codec,
+      level,
       attributeId,
     );
     return _concat(
@@ -1978,7 +2193,7 @@ Uint8List _encodeStream(
         attributeId,
         body.width,
         modeConst,
-        options.codec,
+        codec,
         channels,
         count,
         body.payload.length,
@@ -1987,11 +2202,11 @@ Uint8List _encodeStream(
     );
   }
 
-  var best = _codeSymbols(values, options, attributeId);
+  var best = _codeSymbols(values, codec, level, attributeId);
   var bestMode = modeRaw;
   final deltas = count > 1 ? _deltaCandidate(values, channels) : null;
   if (deltas != null) {
-    final candidate = _codeSymbols(deltas, options, attributeId);
+    final candidate = _codeSymbols(deltas, codec, level, attributeId);
     if (candidate.payload.length < best.payload.length) {
       best = candidate;
       bestMode = modeDelta;
@@ -2002,7 +2217,7 @@ Uint8List _encodeStream(
       attributeId,
       best.width,
       bestMode,
-      options.codec,
+      codec,
       channels,
       count,
       best.payload.length,
@@ -2053,7 +2268,8 @@ class _CodedSymbols {
 /// compress.
 _CodedSymbols _codeSymbols(
   Int32List symbols,
-  FourdgsWriteOptions options,
+  int codec,
+  int level,
   int attributeId,
 ) {
   final zig = Float64List(symbols.length);
@@ -2096,19 +2312,19 @@ _CodedSymbols _codeSymbols(
       divisor *= 256.0;
     }
   }
-  return _CodedSymbols(width, _compress(raw, options));
+  return _CodedSymbols(width, _compress(raw, codec, level));
 }
 
-Uint8List _compress(Uint8List raw, FourdgsWriteOptions options) {
-  if (options.codec != codecDeflate) {
+Uint8List _compress(Uint8List raw, int codec, int level) {
+  if (codec != codecDeflate) {
     throw FourdgsUnsupportedCodec(
-      'stream codec ${options.codec} is not available to a pure-Dart build',
+      'stream codec $codec is not available to a pure-Dart build',
     );
   }
   // A zlib frame, not a bare deflate block: the format's deflate carries the
   // RFC 1950 wrapper, and the decoder checks its Adler-32.
   return Uint8List.fromList(
-    archive.ZLibEncoder().encodeBytes(raw, level: options.level),
+    archive.ZLibEncoder().encodeBytes(raw, level: level),
   );
 }
 
@@ -2210,6 +2426,12 @@ class _ByteWriter {
   void u8(int v) {
     _ensure(1);
     _buf[_length++] = v & 0xFF;
+  }
+
+  void u16(int v) {
+    _ensure(2);
+    _view.setUint16(_length, v, Endian.little);
+    _length += 2;
   }
 
   void u32(int v) {

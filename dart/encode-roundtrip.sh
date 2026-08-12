@@ -27,6 +27,15 @@
 # looks at the index, so a file with a wrong summary offset or a wrong chunk range still
 # decodes there and only the indexed path notices.
 #
+# The `keyframe-delta` pass below adds the claim this one cannot make. Agreement between
+# encoders is not fidelity (issue #189): two encoders that lost the same detail agree
+# perfectly. So the sequence encoder verifies every lane of every sample against the
+# bounds the file it just wrote declares — through this package's own readers, on both
+# paths — before it returns, and the four corpus sequences are re-encoded here and diffed
+# against expectations a *Python*-written file produced. What is proved is that a
+# Dart-written sequence reconstructs to the same population, at every probed instant, as
+# the reference encoder's.
+#
 # Usage: dart/encode-roundtrip.sh [output-dir]
 
 set -euo pipefail
@@ -47,6 +56,7 @@ else
 fi
 
 encode="$root/dart/conformance/build/encode_roundtrip$exe"
+encode_sequence="$root/dart/conformance/build/encode_keyframe_delta$exe"
 decode_dart_streamed="$root/dart/conformance/build/decode_streamed$exe"
 decode_dart_indexed="$root/dart/conformance/build/decode_indexed$exe"
 decode_python_streamed="$root/python/conformance/decode_streamed.py"
@@ -59,7 +69,7 @@ decode_rust_indexed="$root/target/release/decode_indexed$exe"
 # green for a run that proved less than it says it did, and the shape of this script — a
 # count printed at the end — is exactly the shape that hides it.
 for binary in \
-  "$encode" "$decode_dart_streamed" "$decode_dart_indexed" \
+  "$encode" "$encode_sequence" "$decode_dart_streamed" "$decode_dart_indexed" \
   "$decode_rust_streamed" "$decode_rust_indexed"; do
   [ -x "$binary" ] || {
     echo "::error::$binary is not built; run dart compile exe in dart/conformance and" \
@@ -369,3 +379,243 @@ if [ "$multi_entry" -ne 1 ]; then
 fi
 
 echo "$agreed variants re-encoded by Dart; every one inside the bounds it declares against its source, and the Dart, Python and Rust decoders agree on it, both read paths each"
+
+# --------------------------------------------------------------------------
+# keyframe-delta
+# --------------------------------------------------------------------------
+#
+# Not a decode-and-re-encode: a sequence is a sequence of samples with identities, and
+# nothing in a decoded file hands one back — the file states a population per interval,
+# not the samples a producer had. So the encoder rebuilds the corpus's own sequences from
+# the same numbers `tests/conformance/generate.py` builds them from, and the expectation
+# beside the corpus file is what a Python-written file of that sequence decodes to.
+
+kd_out="$out/keyframe"
+mkdir -p "$kd_out"
+"$encode_sequence" "$kd_out" >"$out/keyframe.notes"
+
+sequences=0
+while IFS=$'\t' read -r name note; do
+  [ -n "$name" ] || continue
+  file="$kd_out/$name.4dgs"
+  "$decode_dart_streamed" "$file" >"$kd_out/$name.dart.streamed.json"
+  "$decode_dart_indexed" "$file" >"$kd_out/$name.dart.indexed.json"
+  "$python" "$decode_python_streamed" "$file" >"$kd_out/$name.python.streamed.json"
+  "$python" "$decode_python_indexed" "$file" >"$kd_out/$name.python.indexed.json"
+  readers="dart.streamed dart.indexed python.streamed python.indexed rust.streamed rust.indexed"
+  # Rust reads these too, and the `DartTwoWindows` variant is why it is worth saying so.
+  # Issue #185 reports that Python applies section 3's validity-window gate during
+  # keyframe-delta reconstruction and Rust does not, and asks for exactly this file — a
+  # keyframe-delta sequence declaring a window that closes mid-clip — because every
+  # corpus variant carries one full-duration window and the divergence is invisible
+  # under it. The file now exists, and all six readers agree on it: whoever fixed Rust
+  # did so before this landed, and the issue is stale rather than reproduced. It stays
+  # in the gate so the next divergence here is not invisible either.
+  "$decode_rust_streamed" "$file" >"$kd_out/$name.rust.streamed.json"
+  "$decode_rust_indexed" "$file" >"$kd_out/$name.rust.indexed.json"
+  expectation="$root/tests/conformance/data/keyframe/$name.json"
+  [ -f "$expectation" ] || expectation=""
+  "$python" - "$kd_out/$name" "$name" "$readers" "$expectation" <<'PY'
+import json
+import sys
+
+prefix, name, readers, expectation = sys.argv[1], sys.argv[2], sys.argv[3].split(), sys.argv[4]
+summaries = {}
+for reader in readers:
+    with open(f"{prefix}.{reader}.json", encoding="utf-8") as fh:
+        summaries[reader] = json.load(fh)
+
+# The reference is the corpus expectation when there is one — the states JSON a
+# Python-written file of this very sequence produced — and the Python decode of the
+# Dart-written file when there is not.
+if expectation:
+    with open(expectation, encoding="utf-8") as fh:
+        reference = json.load(fh)
+    label = "the corpus expectation, which a Python-written file produced"
+else:
+    reference = summaries["python.streamed"]
+    label = "python.streamed"
+
+# The corpus reference writer preserves the authored `mu_t` on every sample.
+# Dart deliberately anchors each state it writes at that sample's timestamp:
+# otherwise non-zero motion advects the reconstruction away from the position
+# the sample states. The four corpus sources predate that correction and author
+# mu_t=0 throughout, so after a non-initial chunk their Python-written
+# expectations can differ in exactly two places: opacity while a restated row is
+# live, and the number of updates needed to put mu_t back after a keyframe. Keep
+# the exception structural and local to those intervals -- never ignore every
+# opacity or updateCount field. The reference corpus is corrected separately by
+# #210; once that lands, both sets are identical before this exception is applied.
+def anchor_differences(summary):
+    state_indices = set()
+    update_indices = set()
+    chunks = summary.get("chunks", [])
+    previous_kind = None
+    for i, chunk in enumerate(chunks):
+        if chunk.get("kind") != "keyframe" and float(chunk["t0"]) > 0.0:
+            affected = chunk.get("deltaMode") == "keyframe" or previous_kind == "keyframe"
+            if affected:
+                # Every gaussian shared with the reference is touched by the
+                # anchored mu_t. If the Dart file does not state exactly that,
+                # this is not the known divergence and must still fail below.
+                updates = int(chunk["updateCount"])
+                common_live = int(chunk["liveCount"]) - int(chunk["birthCount"])
+                if updates == common_live:
+                    update_indices.add(i)
+        previous_kind = chunk.get("kind")
+
+    for i, state in enumerate(summary.get("states", [])):
+        t = float(state["t"])
+        for chunk in chunks:
+            if (
+                float(chunk["t0"]) > 0.0
+                and float(chunk["t0"]) <= t < float(chunk["t1"])
+                and (
+                    chunk.get("kind") == "keyframe"
+                    or int(chunk.get("updateCount", 0)) > 0
+                    or int(chunk.get("birthCount", 0)) > 0
+                )
+            ):
+                state_indices.add(i)
+                break
+    return state_indices, update_indices
+
+
+def without_anchor_differences(summary, state_indices, update_indices):
+    # JSON values only: this is a compact deep copy and keeps the source objects
+    # intact for the diagnostics below.
+    compared = json.loads(json.dumps(summary))
+    for i in state_indices:
+        compared["states"][i]["aggregate"].pop("opacitySum", None)
+    for i in update_indices:
+        compared["chunks"][i].pop("updateCount", None)
+    return compared
+
+
+if expectation:
+    state_indices, update_indices = anchor_differences(summaries["python.streamed"])
+else:
+    state_indices, update_indices = set(), set()
+compared_reference = without_anchor_differences(reference, state_indices, update_indices)
+disagreed = [
+    r
+    for r in readers
+    if without_anchor_differences(summaries[r], state_indices, update_indices)
+    != compared_reference
+]
+if disagreed:
+    print(f"::error::{name}: {disagreed} disagree with {label} on a sequence the Dart encoder wrote")
+    for reader in disagreed:
+        for key in sorted(set(reference) | set(summaries[reader])):
+            if reference.get(key) != summaries[reader].get(key):
+                print(f"  {key}\n    reference: {json.dumps(reference.get(key))[:400]}")
+                print(f"    {reader}: {json.dumps(summaries[reader].get(key))[:400]}")
+    sys.exit(1)
+PY
+  # The index's own numbers, read with the Python SDK so no Dart code is judging Dart
+  # output. Issue #195: nothing in the canonical summary comes off the index — `liveCount`
+  # there is read from the composed state — so an entry can carry the wrong
+  # `gaussian_count`, or swap it with `live_count`, and every reader in the project
+  # reconstructs the scene correctly and reports the same JSON while the file lies about
+  # the seek cost and the population. Dart's own indexed reader catches the `live_count`
+  # half (PRs #101 and #174); nothing anywhere catches the other half. So it is checked
+  # here, explicitly, against the chunks the entries describe.
+  "$python" - "$file" "$name" "$root" <<'PY'
+import os
+import sys
+
+sys.path.insert(0, os.path.join(sys.argv[3], "python", "fourdgs"))
+from fourdgs import keyframe_delta_file as kdf
+from fourdgs import records as rec
+
+path, name = sys.argv[1], sys.argv[2]
+with open(path, "rb") as fh:
+    data = fh.read()
+
+decoded, index = kdf.decode_indexed(data)
+streamed = kdf.decode_streamed(data)
+problems = []
+
+
+def check(condition, message):
+    if not condition:
+        problems.append(message)
+
+
+# Header `gaussian_count` is the count of distinct ids, not a sum over chunks. Under this
+# model the chunks restate the same gaussians, so the sum over-counts every gaussian once
+# per sample it survives.
+distinct = {int(v) for c in streamed.chunks for v in c.state.ids}
+summed = sum(c.state.count for c in streamed.chunks)
+check(
+    decoded.header.gaussian_count == len(distinct),
+    f"Header gaussian_count is {decoded.header.gaussian_count}, the file names {len(distinct)} distinct ids",
+)
+if summed != len(distinct):
+    check(
+        decoded.header.gaussian_count != summed,
+        f"Header gaussian_count is {summed}, which is the sum over chunks and not the {len(distinct)} distinct ids",
+    )
+
+check(len(index) == len(streamed.chunks), "the index names a different number of chunks than the file holds")
+for i, (entry, chunk) in enumerate(zip(index, streamed.chunks, strict=False)):
+    where = f"entry {i}"
+    check(entry.extended, f"{where} carries no keyframe-delta block")
+    # Two kinds are defined (spec section 5.8). A third is not a forward-compatible
+    # extension, it is a chunk no reader can place in a chain.
+    check(entry.kind in (0, 1), f"{where} declares chunk_kind {entry.kind}; expected 0 or 1")
+    # `live_count` is the population after composition — for a keyframe as much as for a
+    # delta. Left at zero on keyframes it would be a file Dart's own reader refuses.
+    check(
+        entry.live_count == chunk.state.count,
+        f"{where} declares live_count {entry.live_count}, its chain composes to {chunk.state.count}",
+    )
+    if entry.kind == 0:
+        check(
+            entry.gaussian_count == chunk.state.count,
+            f"{where} is a keyframe declaring gaussian_count {entry.gaussian_count} over {chunk.state.count} gaussians",
+        )
+        check(entry.depth == 0, f"{where} is a keyframe at depth {entry.depth}")
+        check(
+            entry.keyframe_offset == entry.chunk_offset,
+            f"{where} is a keyframe whose keyframe_offset is not itself",
+        )
+        continue
+    # A delta entry's `gaussian_count` counts OPERATIONS — updates plus births plus
+    # deaths — which is a different quantity from the population and is routinely a
+    # different number.
+    content = kdf.rec_content(data[entry.chunk_offset : entry.chunk_offset + entry.chunk_length])
+    head = rec.parse_delta_chunk(content)[0]
+    operations = head.update_count + head.birth_count + head.death_count
+    check(
+        entry.gaussian_count == operations,
+        f"{where} declares gaussian_count {entry.gaussian_count}, its chunk performs {operations} operations "
+        f"({head.update_count} updates, {head.birth_count} births, {head.death_count} deaths)",
+    )
+    check(
+        entry.reference_offset < entry.chunk_offset,
+        f"{where} references {entry.reference_offset}, which is not behind it",
+    )
+
+# The tiling rule, from the index alone: no overlap, no gap, starting at 0 and ending at
+# the declared duration.
+ordered = sorted(index, key=lambda e: e.t0)
+check(ordered[0].t0 == 0.0, f"the first interval starts at {ordered[0].t0}, not 0")
+check(
+    ordered[-1].t1 == decoded.header.duration_sec,
+    f"the last interval ends at {ordered[-1].t1}, not the declared {decoded.header.duration_sec}",
+)
+for a, b in zip(ordered, ordered[1:], strict=False):
+    check(a.t1 == b.t0, f"[{a.t0}, {a.t1}) is followed by [{b.t0}, {b.t1})")
+
+if problems:
+    print(f"::error::{name}: the Chunk Index disagrees with the chunks it describes")
+    for problem in problems:
+        print(f"  {problem}")
+    sys.exit(1)
+PY
+  sequences=$((sequences + 1))
+  echo "  $name: $note"
+done <"$out/keyframe.notes"
+
+echo "$sequences keyframe-delta sequences written by Dart; Dart, Python and Rust agree on every one, both read paths, and every lane is inside the bounds each file declares"

@@ -23,10 +23,11 @@
 /// without a platform.
 ///
 /// Writing goes the other way through the same primitives:
-/// [writeFourdgsToSink] emits bounded records and [writeFourdgsBytes] is its
-/// in-memory convenience. They encode a [FourdgsGaussianSet] in their own right
-/// rather than wrapping another SDK, which is what makes their agreement with
-/// those SDKs worth something.
+/// [writeFourdgsToSink] and [writeKeyframeDeltaToSink] emit bounded records;
+/// [writeFourdgsBytes] and [writeKeyframeDeltaBytes] are their in-memory
+/// conveniences. They encode gaussian state in their own right rather than
+/// wrapping another SDK, which is what makes their agreement with those SDKs
+/// worth something.
 ///
 /// Reading a file from disk needs one more import: `package:fourdgs/io.dart`
 /// carries the `dart:io` transport, kept out of this library so the decoder

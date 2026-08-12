@@ -49,9 +49,24 @@ happened.
   contiguity is what lets a streamed reader verify `summary_crc` by retaining the trailing records
   rather than the whole file, so it is asserted on the written bytes rather than assumed. Every
   offset and length in the index frames a whole record, opcode byte included (§5.8).
+- Per-band spherical-harmonic bit depths, spec §6.5. `shBitDepths` takes a list, band 1 first; named
+  lists are available as `fourdgsShLadders['balanced']!` (and `flat` or `aggressive`), the ladders
+  `website/docs/reference/compression.md` measures. `n` bits rounds a coefficient byte onto a grid
+  of `2^(8 - n)` code units at bin centres, so nothing sub-byte is packed, no decoder changes, and
+  the saving is realized by the stream codec having that many fewer symbols to code. The depths are
+  appended to the Quantization record, each band's bound is declared as `sh_band<n>`, and the single
+  `step_sh` and `sh` the record has always carried take the coarsest band's value — an upper bound
+  for a consumer that reads them and not the appended field, rather than a number that is true of
+  one band and wrong for the others. A Quantization record that declares no depths appends no bytes
+  at all and preserves coefficient bytes exactly; profile-wide `step_sh` remains compatibility
+  metadata, not an implicit grid. A ladder shorter than the scene's degree is refused rather than
+  filled in with eight bits.
+- The encoder verifies each band's declared bound by decoding the record it just wrote and measuring
+  every coefficient of every gaussian, rather than trusting the three lines of arithmetic that
+  produced it. A bound nobody verified is worse than no bound, because consumers will trust it.
 - `FourdgsWriteOptions` carries the quantization profile, the Header's `cutoff`, the deflate level,
-  which summary records to write, and the Header's `profile`, `library` and attributes. The defaults
-  are the reference encoders'.
+  the chunking, the SH bit depths, which summary records to write, and the Header's `profile`,
+  `library` and attributes. The defaults are the reference encoders'.
 - Refusals name the field and the gaussian, not just the failure: a non-finite value in a lane that
   lands on a grid, a NaN validity window, a validity window whose lower bound is above its upper, a
   NaN or `-inf` sigma, a bin outside the signed 32-bit symbols a stream carries, an unknown profile,
@@ -103,11 +118,6 @@ happened.
 - The Header declares the spherical-harmonic degree the file actually carries, which is the highest
   band written rather than the degree the input held: `shBands` caps what is emitted, and bands are
   whole (§6.5), so a degree-3 scene written with `shBands: 1` is a degree-1 file.
-- Coefficients are quantized onto the pitch the Quantization record declares. `step_sh` is an
-  encode-side value — a decoder does nothing with it (§6.5) — which is exactly why the encoder must
-  apply it: the `coarse` profile declares a pitch of 3 and now writes on it. The top bin's centre is
-  clamped back into a byte, because at that pitch the coefficient 255 centres on 256 and would reach
-  a reader as 0, the extreme positive coefficient read as the extreme negative one.
 - Deterministic: two encodes of one scene are byte-identical, including the Header's attribute map,
   whose keys are sorted rather than emitted in whatever order the caller's map iterates.
 - Proved by `dart/encode-roundtrip.sh`, which re-encodes all 46 corpus variants — into as many as 42
@@ -123,7 +133,73 @@ happened.
   one file the same way say nothing about whether that file is the scene that went in, and an
   encoder checked only by its own decoder proves that two halves of one implementation share an
   opinion. Every reader is required: a missing one is an error rather than a reader quietly dropped
-  from the comparison. It runs in the conformance workflow.
+  from the comparison. `tests/conformance/encode_roundtrip.py --encoder dart` also puts the same
+  gaussians through this encoder and through the shared Rust reference and requires the Python
+  decoder to read both files as the same scene, including a pass at per-band depths. Before ignoring
+  layout-dependent interval choices, that gate also checks that every emitted Chunk is indexed
+  exactly once, the population agrees, and its reconstructed support fits the indexed interval. Both
+  run in the conformance workflow.
+- The tests pin every named ladder, the pitch and bound each bit depth declares, and the maximum
+  coefficient deviation after this encoder writes and decodes every band.
+
+### The `keyframe-delta` writer
+
+- `writeKeyframeDeltaBytes` encodes a sequence of `FourdgsSample`s — a population, with identities,
+  at a sequence of instants — into a complete `keyframe-delta` file: a keyframe Chunk or a Delta
+  Chunk per sample, the extended Chunk Index, Statistics and a Footer. Dart could play temporal
+  scenes back and could not produce them; it can now. `writeKeyframeDeltaToSink` emits the same
+  framed records without retaining the completed file in memory.
+- Every sample is quantized when it is emitted, on grids derived from the whole sequence, so a delta
+  is an integer subtraction between two bins on the same grid. The composition telescopes and the
+  bin at any depth is the bin an absolute statement of that instant would have carried, which is
+  what makes the declared bounds hold after the second delta rather than only after the first.
+- `FourdgsKeyframeDeltaOptions` carries the cadence (`keyframeEvery`, `keyframeAt`), the reference
+  mode (`deltaMode`: chained, or the group's keyframe), the quantization profile, the cutoff, the
+  deflate level, which summary records to write, and whether to verify. The defaults are the
+  reference encoders'.
+- The counting rules the format actually states, rather than the ones that read naturally. The
+  Header's `gaussian_count` is the number of **distinct ids**, not a sum over chunks — under this
+  model the chunks restate the same gaussians. A delta index entry's `gaussian_count` counts
+  **operations** — updates plus births plus deaths — and its `live_count` is the population those
+  compose to. `live_count` is stated on keyframe entries too, because §5.8 defines it for every
+  extended entry and this package's indexed reader cross-checks it: a writer that left it zero would
+  produce files this SDK refuses.
+- A sequence that does not tile `[0, duration_sec)` is refused rather than written: instants that
+  start after zero or go backwards, and a zero-width interval with a population behind it — one the
+  half-open seek rule could never select. So is a change to `sigma_t`, `flags` or `window_index`
+  between two samples of one group, which would subtract bins living on two different grids; the
+  refusal names the gaussian and says a keyframe or a death and a birth is the fix.
+- Rotation is restated outright in an update rather than differenced: the smallest-three basis
+  changes whenever the largest quaternion component does, so the three stored bins mean different
+  components either side of it. Births state all eleven attributes absolutely; deaths are identity
+  and nothing else; an empty group is zero bytes.
+- Every keyframe, update and birth states its position at that sample's `t0`. A moving row whose raw
+  position and motion bins repeat is therefore still updated when inheriting the older anchor would
+  advect it away from the new sample. Strictly positive Float32 scales are quantized from their
+  actual logarithm, including values below `1e-30`; equal infinite window endpoints are refused
+  because their NaN length gives version-1 decoders different motion grids.
+- The encoder decodes the file it just wrote, on **both** read paths, and checks every lane of every
+  sample against the bounds that file declares — position against `pos`, scale and `sigma_t` in the
+  log domain, velocity and birth time against the per-gaussian pitches a decoder recomputes, colour
+  and opacity against `rgb` and `alpha`, the quaternion against the dot product a per-component
+  bound implies, and the validity window for equality. Two encoders agreeing proves they share an
+  opinion; this is what proves the scene survived.
+- `keyframeDeltaPopulation` is the decode-side accessor that check needs and a consumer wanted: the
+  composed bins of a chunk as rest-state gaussian values, in `double`, without the reconstruction
+  step. It is what an exporter reads when it needs the state rather than a summary.
+- The index's own numbers are checked against the chunks they describe, with the Python SDK rather
+  than with Dart's reader. Issue #195: nothing in the canonical summary comes off the index —
+  `liveCount` there is read from the composed state — so an entry can carry the wrong
+  `gaussian_count` and every reader in the project reconstructs the scene correctly while the file
+  lies about the seek cost. Verified by injection: corrupting a delta entry's `gaussian_count` alone
+  passes all six readers and is caught only here; swapping it with `live_count` is caught earlier
+  still, by Dart's own indexed reader.
+- Proved against the corpus's own expectations. `dart/encode-roundtrip.sh` rebuilds the four corpus
+  sequences, writes them with this encoder, and requires the states JSON to equal the expectation a
+  **Python**-written file of the same sequence produced — read back by Dart, Python and Rust, on
+  both paths in each. Three more sequences the corpus does not carry go through the same gate: two
+  validity windows, a never-fading population, and one with real velocity, birth times and
+  orientations.
 
 ### Hostile-input hardening
 
