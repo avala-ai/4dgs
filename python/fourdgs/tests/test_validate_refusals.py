@@ -151,6 +151,40 @@ class TestTheCommandLine:
         assert "not-here.4dgs" in err and "Traceback" not in err, err
         assert out == "", out
 
+    def test_a_reader_that_leaves_early_does_not_change_the_verdict(self, tmp_path):
+        """`4dgs validate bad.4dgs | head -1` is a verdict about the file, not about who
+        was listening. The closed pipe arrives as `BrokenPipeError` — an `OSError`, and so
+        indistinguishable from an unreadable file unless this tool tells them apart. Both
+        bufferings are exercised: piped output is block-buffered, which defers the failure
+        to interpreter shutdown, where an unhandled one exits 120 rather than the verdict.
+        """
+        path = tmp_path / "truncated.4dgs"
+        path.write_bytes(MAGIC + b"\x00" * 512)
+        root = Path(__file__).resolve().parents[1]
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join(p for p in (str(root), env.get("PYTHONPATH", "")) if p)
+        for unbuffered in (False, True):
+            # A pipe whose read end the parent closes at once, so the tool faces a reader
+            # that has already gone — the state `head -1` leaves behind, without the race
+            # of waiting for the tool to out-write a 64 KiB buffer first.
+            read_end, write_end = os.pipe()
+            argv = [sys.executable, *(["-u"] if unbuffered else []), "-m", "fourdgs.cli"]
+            tool = subprocess.Popen(
+                [*argv, "validate", str(path)],
+                stdout=write_end,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+            )
+            os.close(write_end)
+            os.close(read_end)
+            assert tool.stderr is not None
+            err = tool.stderr.read()
+            tool.stderr.close()
+            status = tool.wait(timeout=300)
+            assert status == 1, f"unbuffered={unbuffered}: exit {status}, stderr {err!r}"
+            assert "Broken pipe" not in err, f"unbuffered={unbuffered}: {err!r}"
+
 
 class TestTheInvalidCorpus:
     def test_every_invalid_variant_is_refused_by_its_own_identifier(self, capsys):

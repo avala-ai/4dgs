@@ -388,6 +388,56 @@ def build_parser() -> argparse.ArgumentParser:
 EXIT_TOOL_FAILURE = 3
 
 
+class _PipeTolerantStream:
+    """A stream that stops writing once its reader has gone.
+
+    `4dgs validate big.4dgs | head -1` closes the pipe after the first line, and the
+    next `print` raises `BrokenPipeError` — an `OSError`, so the handler below would
+    call it a transport failure and return `EXIT_TOOL_FAILURE`. It is neither. Who was
+    listening is not a fact about the file, and a verdict that changes when a reader
+    leaves early is not a verdict. Dropping the rest of the writes keeps the command's
+    own return value, which is what the Swift tool does with the same shape of failure.
+    """
+
+    def __init__(self, stream) -> None:
+        self._stream = stream
+        self.broken = False
+
+    def write(self, text: str) -> int:
+        if self.broken:
+            return len(text)
+        try:
+            return self._stream.write(text)
+        except BrokenPipeError:
+            self.broken = True
+            return len(text)
+
+    def flush(self) -> None:
+        if self.broken:
+            return
+        try:
+            self._stream.flush()
+        except BrokenPipeError:
+            self.broken = True
+
+    def __getattr__(self, name: str):
+        return getattr(self._stream, name)
+
+
+def _silence(fd: int) -> None:
+    """Point a descriptor at the void, so a later flush of it cannot fail."""
+    try:
+        null = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        return
+    try:
+        os.dup2(null, fd)
+    except OSError:
+        pass
+    finally:
+        os.close(null)
+
+
 def main(argv: list[str] | None = None) -> int:
     # The tool's output is UTF-8 wherever it goes. Unpiped, Python already does
     # this; piped on Windows it falls back to the locale encoding, so the same
@@ -397,6 +447,7 @@ def main(argv: list[str] | None = None) -> int:
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
     args = build_parser().parse_args(argv)
+    sys.stdout, sys.stderr = _PipeTolerantStream(sys.stdout), _PipeTolerantStream(sys.stderr)
     try:
         return args.func(args)
     except OSError as exc:
@@ -406,6 +457,22 @@ def main(argv: list[str] | None = None) -> int:
         # they were the file's is worse than one that crashes.
         print(f"4dgs: {exc.filename or ''}: {exc.strerror or exc}".replace(": : ", ": "), file=sys.stderr)
         return EXIT_TOOL_FAILURE
+    finally:
+        # Flush here, while a `BrokenPipeError` still lands somewhere that can hold it.
+        # Piped output is block-buffered, so a short report never reaches the pipe until
+        # the interpreter flushes it on the way out — and a flush that fails there raises
+        # where nothing can catch it: Python prints `Exception ignored` and exits 120,
+        # losing the code we just chose. Draining first, then pointing the descriptor at
+        # the void, is what lets the verdict be the exit status in both bufferings.
+        for wrapper, fd in ((sys.stdout, 1), (sys.stderr, 2)):
+            if isinstance(wrapper, _PipeTolerantStream):
+                wrapper.flush()
+                if wrapper.broken:
+                    _silence(fd)
+        if isinstance(sys.stdout, _PipeTolerantStream):
+            sys.stdout = sys.stdout._stream
+        if isinstance(sys.stderr, _PipeTolerantStream):
+            sys.stderr = sys.stderr._stream
 
 
 if __name__ == "__main__":

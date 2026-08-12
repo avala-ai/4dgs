@@ -34,7 +34,7 @@ import numpy as np
 
 from . import opcode as op
 from . import records as rec
-from .exceptions import MalformedFile, UnsupportedCodec
+from .exceptions import FourdgsError, MalformedFile, UnsupportedCodec
 from .keyframe_delta import State, apply_delta, chain_from, check_tiling, keyframe_state
 from .keyframe_delta_writer import (
     KeyframeDeltaOptions,
@@ -1311,12 +1311,16 @@ def check_index_bands(data: bytes, index: list[rec.ChunkIndexEntry], sh_degree: 
     wanted = list(range(1, sh_degree + 1))
     seen: set[int] = set()
     owner: int | None = None
+    # Rows the owner actually *births*: a keyframe's population, a delta's birth count.
+    # Bands ride with born gaussians (§5.18), so a chunk that births none carries no
+    # coefficients and conformingly emits no band.
+    owner_rows = 0
     indexed: rec.ChunkIndexEntry | None = None
     following: list[tuple[int, int, int]] = []
     following_bands: set[int] = set()
 
     def finish_owner() -> None:
-        nonlocal owner, indexed, following, following_bands
+        nonlocal owner, owner_rows, indexed, following, following_bands
         if owner is None:
             return
         if indexed is None:
@@ -1336,10 +1340,11 @@ def check_index_bands(data: bytes, index: list[rec.ChunkIndexEntry], sh_degree: 
                 code="index-record-mismatch",
             )
         bands = [band for band, _offset, _length in following]
-        if set(bands) != set(wanted):
+        expected = wanted if owner_rows else []
+        if set(bands) != set(expected):
             raise MalformedFile(
                 f"the state chunk at {owner} is followed by SH bands {bands}; "
-                f"the Header declares degree {sh_degree}, requiring bands {wanted}",
+                f"the Header declares degree {sh_degree}, requiring bands {expected}",
                 code="index-record-mismatch",
             )
         seen.add(owner)
@@ -1352,6 +1357,18 @@ def check_index_bands(data: bytes, index: list[rec.ChunkIndexEntry], sh_degree: 
         if record.opcode in (op.CHUNK, op.DELTA_CHUNK):
             finish_owner()
             owner = record.offset
+            try:
+                owner_rows = (
+                    int(rec.parse_chunk(record.content)[0].count)
+                    if record.opcode == op.CHUNK
+                    else int(rec.parse_delta_chunk_block(record.content)[0].birth_count)
+                )
+            except FourdgsError:
+                # A head this check cannot read is not this check's fault to report: the
+                # chunk's own decode says so, in the right words and at the right byte.
+                # Assume it births rows, so the band rule stays exactly as strict as it
+                # was for a record whose population is unknown.
+                owner_rows = 1
             indexed = by_offset.get(owner)
             following = []
             following_bands = set()

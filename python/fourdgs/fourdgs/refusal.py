@@ -425,7 +425,12 @@ def scan_front_to_back(data: bytes, where: Walk) -> ChunkRefusal | None:
         if band_owner_at is None:
             return None
         if declared_degree is not None:
-            wanted = list(range(1, declared_degree + 1))
+            # Bands ride with the gaussians whose coefficients they carry, so a chunk
+            # with no gaussians carries none. Swift's `finishChunkBands` and Dart's
+            # `_checkStateBandCoverage` both exempt it; this was the third of three
+            # Python paths stating the same rule, and the only one still requiring a
+            # band from a chunk that has nothing to put in it.
+            wanted = list(range(1, declared_degree + 1)) if band_owner_count else []
             # Band records carry their own identity and have no prescribed order.
             # Comparing the sorted list keeps the completeness and uniqueness check
             # while accepting a conforming run such as [2, 1].

@@ -212,7 +212,11 @@ def _check_sh_bit_depths(quant: rec.Quantization, sh_degree: int, report: Report
     """
     if not quant.sh_bit_depths or sh_degree <= 0:
         return
-    if len(quant.sh_bit_depths) != sh_degree:
+    # A degree the validator has already refused is not a number to measure a correct
+    # record against. Comparing the depth count with it produced a second error naming
+    # the Quantization record, which had done nothing wrong; the per-band bounds below
+    # are still worth checking, because each of those is about the depth itself.
+    if 0 <= sh_degree <= 3 and len(quant.sh_bit_depths) != sh_degree:
         report.error(
             f"Quantization declares {len(quant.sh_bit_depths)} SH bit depths; "
             f"the Header declares degree {sh_degree}, and there is one band per degree (§6.5)"
