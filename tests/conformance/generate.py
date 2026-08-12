@@ -437,7 +437,10 @@ def _kd_multi_window_gaussians(step: int) -> fourdgs.GaussianSet:
         colors=np.asarray(colors, dtype=np.float32).reshape(n, 4),
         motions=np.asarray(motions, dtype=np.float32).reshape(n, 3),
         mu_t=np.asarray([0.5 * (lo + hi) for lo, hi in windows], dtype=np.float32),
-        sigma_t=np.asarray([0.35 + 0.6 * i for i in range(n)], dtype=np.float32),
+        # Keep every in-window row comfortably above the Header's temporal cutoff for the
+        # full window. This scenario isolates the hard validity-window gate; a narrow sigma
+        # would also test the independent marginal gate and change the intended 4/2/4 count.
+        sigma_t=np.asarray([2.0 + 0.35 * i for i in range(n)], dtype=np.float32),
         win_lo=np.asarray([lo for lo, _ in windows], dtype=np.float32),
         win_hi=np.asarray([hi for _, hi in windows], dtype=np.float32),
     )
