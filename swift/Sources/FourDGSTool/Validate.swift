@@ -2069,6 +2069,43 @@ private func validationState(
     return state
 }
 
+/// The two rules about rotation in an update group, which composition cannot reach.
+///
+/// `rotation_index` and `rotation` are the absolute restatement §11.5 defines, so the pass below
+/// filters them out before composing anything — and with them went the only two rules this
+/// validator had about them, leaving it with none at all. A delta that restated the quaternion
+/// without saying which component it omitted, or that named a component outside the three the
+/// smallest-three coding can omit, was reported valid here and refused by Python
+/// (`incomplete-rotation-update`, `rotation-index-out-of-range`) and by Dart.
+///
+/// Both are about the update group alone: the pair has to arrive together because the three
+/// stored bins mean different components either side of a change (§6.4), and the index has to
+/// name one of four components because that is how many a quaternion has.
+private func checkRotationRestatement(
+    _ frame: Frame, _ update: DeltaGroup, _ present: Set<UInt8>
+) throws {
+    let index: UInt8 = 2
+    let quaternion: UInt8 = 3
+    if present.contains(index) != present.contains(quaternion) {
+        let carried = present.contains(index) ? "rotation_index" : "rotation"
+        let missing = present.contains(index) ? "rotation" : "rotation_index"
+        throw malformedStateStreams(
+            frame,
+            "an update restates \(carried) without \(missing); the smallest-three coding omits "
+                + "the largest component, so the two are one restatement and arrive together")
+    }
+    guard present.contains(index), let column = try validationColumn(frame, update, attribute: index)
+    else { return }
+    for row in 0..<column.rowCount {
+        for value in column.rowValues(at: row) where !(0...3).contains(value) {
+            throw malformedStateStreams(
+                frame,
+                "an update restates rotation_index \(value); a quaternion has four components, "
+                    + "so the omitted one is 0 through 3")
+        }
+    }
+}
+
 /// Prove composition at the same signed-32-bit boundary as the decoders. Each target update is
 /// checked against the state its reference composes to, one updated attribute at a time — carried
 /// forward from the previous target where the order supplies it, replayed from the keyframe where
@@ -2098,8 +2135,9 @@ private func validateKeyframeDeltaBins(
         var retained: UInt64 = 0
         do {
             let update = try deltaGroups(source, frame)[0]
-            let attributes = try validationGroupAttributes(frame, update)
-                .filter { $0 != 13 && $0 != 2 && $0 != 3 }
+            let present = try validationGroupAttributes(frame, update)
+            try checkRotationRestatement(frame, update, present)
+            let attributes = present.filter { $0 != 13 && $0 != 2 && $0 != 3 }
             for attribute in attributes {
                 var state: ValidationColumnState
                 if carriedOffset == fields.referenceOffset, let reuse = carried[attribute] {

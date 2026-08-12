@@ -795,6 +795,37 @@ final class ValidateTests: XCTestCase {
                     && $0.message.contains("signed 32-bit range")
             }, overflowFindings.map(\.message).joined(separator: "\n"))
 
+        // The two rules about restating rotation, which this validator had neither of. The
+        // pair is filtered out before composition because §11.5 makes it absolute, and the
+        // filter was the last thing that looked at it — so a file Python refuses as
+        // `incomplete-rotation-update` and Dart refuses by name printed `valid` here.
+        let halfPair =
+            stream(13, [0], channels: 1)
+            + stream(3, [0, 0, 0], channels: 3)  // rotation, with no rotation_index beside it
+        let halfPairDelta = deltaRecord(
+            t0: 0.5, t1: 1, reference: keyframeOffset, keyframe: keyframeOffset, depth: 1,
+            updates: halfPair, updateCount: 1)
+        let halfPairFindings = validate(front + keyframeRecord(keyframeStreams) + halfPairDelta)
+            .findings
+        XCTAssertTrue(
+            halfPairFindings.contains { $0.message.contains("without rotation_index") },
+            halfPairFindings.map(\.message).joined(separator: "\n"))
+
+        // And an index naming a component a quaternion does not have.
+        let outOfRange =
+            stream(13, [0], channels: 1)
+            + stream(2, [7], channels: 1)
+            + stream(3, [0, 0, 0], channels: 3)
+        let outOfRangeDelta = deltaRecord(
+            t0: 0.5, t1: 1, reference: keyframeOffset, keyframe: keyframeOffset, depth: 1,
+            updates: outOfRange, updateCount: 1)
+        let outOfRangeFindings = validate(
+            front + keyframeRecord(keyframeStreams) + outOfRangeDelta
+        ).findings
+        XCTAssertTrue(
+            outOfRangeFindings.contains { $0.message.contains("restates rotation_index 7") },
+            outOfRangeFindings.map(\.message).joined(separator: "\n"))
+
         // gaussian_id is u32 even though its Attribute Stream code is held in Int32. -1 is
         // the wire representation of UInt32.max and must survive both ordered and set decoders.
         var highIDStreams: [UInt8] = []
