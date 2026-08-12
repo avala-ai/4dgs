@@ -16,12 +16,28 @@
 /// legitimately differs between two encoders, so the gate compares decoded
 /// content rather than bytes.
 ///
-/// Usage: encode_roundtrip <in.4dgs> <out.4dgs>
+/// An optional third argument names per-band spherical-harmonic bit depths,
+/// either as a ladder name or as a comma-separated list, band 1 first.
+///
+/// Usage: encode_roundtrip <in.4dgs> <out.4dgs> [sh-bit-depths]
 library;
 
 import 'dart:io';
 
 import 'package:fourdgs/fourdgs.dart';
+
+/// A registry ladder name, or a comma-separated list of depths, band 1 first.
+List<int> parseDepths(String spec) {
+  final ladder = fourdgsShLadders[spec];
+  if (ladder != null) return ladder;
+  return <int>[
+    for (final part in spec.split(','))
+      int.tryParse(part.trim()) ??
+          (throw FormatException(
+            '$spec: not a ladder name or a list of bit depths',
+          )),
+  ];
+}
 
 /// The source's profile, unless it is one this preset cannot keep.
 ///
@@ -74,13 +90,9 @@ void _checkSourceGroups(FourdgsGaussianSet source, FourdgsGaussianSet encoded) {
 /// attachments, no provenance. That is the whole point of this baseline — these
 /// authoring surfaces write gaussians, and a gate that compared whole scenes
 /// would fail on the extras rather than on the encode.
-String run(String input, String output) {
-  final scene = readFourdgsBytes(File(input).readAsBytesSync());
-  final bytes = writeFourdgsBytes(
-    scene.gaussians,
-    scene.header.durationSec,
-    options: FourdgsWriteOptions(
-      cutoff: scene.header.cutoff,
+FourdgsWriteOptions preset(FourdgsHeader header, List<int> depths) =>
+    FourdgsWriteOptions(
+      cutoff: header.cutoff,
       maxDepth: 4,
       minChunkGaussians: 8,
       writeIndex: true,
@@ -88,9 +100,18 @@ String run(String input, String output) {
       writeSummaryOffsets: true,
       writeCrc: true,
       shBands: 3,
-      sceneProfile: _writableProfile(scene.header.profile),
-      attributes: scene.header.attributes,
-    ),
+      shBitDepths: depths,
+      sceneProfile: _writableProfile(header.profile),
+      attributes: header.attributes,
+    );
+
+String run(String input, String output, List<int> depths) {
+  final scene = readFourdgsBytes(File(input).readAsBytesSync());
+  final options = preset(scene.header, depths);
+  final bytes = writeFourdgsBytes(
+    scene.gaussians,
+    scene.header.durationSec,
+    options: options,
   );
 
   // Two encodes of one scene must be the same bytes. An encoder that iterates a
@@ -100,18 +121,7 @@ String run(String input, String output) {
   final again = writeFourdgsBytes(
     scene.gaussians,
     scene.header.durationSec,
-    options: FourdgsWriteOptions(
-      cutoff: scene.header.cutoff,
-      maxDepth: 4,
-      minChunkGaussians: 8,
-      writeIndex: true,
-      writeStatistics: true,
-      writeSummaryOffsets: true,
-      writeCrc: true,
-      shBands: 3,
-      sceneProfile: _writableProfile(scene.header.profile),
-      attributes: scene.header.attributes,
-    ),
+    options: options,
   );
   if (bytes.length != again.length) {
     throw StateError('two encodes of one scene differ in length');
@@ -132,17 +142,23 @@ String run(String input, String output) {
   _checkSourceGroups(scene.gaussians, reread.gaussians);
 
   File(output).writeAsBytesSync(bytes);
+  final declared = depths.take(reread.header.shDegree).toList();
   return '${reread.gaussians.count} gaussians, '
-      '${reread.chunkIndex.length} chunks, ${bytes.length} bytes, deterministic';
+      '${reread.chunkIndex.length} chunks, ${bytes.length} bytes, '
+      'deterministic, sh bits $declared';
 }
 
 void main(List<String> args) {
-  if (args.length != 2) {
-    stderr.writeln('usage: encode_roundtrip <in.4dgs> <out.4dgs>');
+  if (args.length < 2 || args.length > 3) {
+    stderr.writeln(
+      'usage: encode_roundtrip <in.4dgs> <out.4dgs> [sh-bit-depths]',
+    );
     exit(2);
   }
   try {
-    stdout.writeln(run(args[0], args[1]));
+    stdout.writeln(
+      run(args[0], args[1], args.length == 3 ? parseDepths(args[2]) : <int>[]),
+    );
   } catch (error) {
     stderr.writeln(error);
     exit(1);
