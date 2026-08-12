@@ -154,6 +154,8 @@ words:
   - worktree
   - worktrees
   - toplevel
+  # Rounding vocabulary: `rint` is the C and NumPy name for round-half-to-even.
+  - rint
 ignorePaths:
   - "**/node_modules/**"
   - "**/dist/**"

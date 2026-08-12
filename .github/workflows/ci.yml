@@ -57,7 +57,7 @@ jobs:
           echo "rust: ${size_kb} KiB"
           [ "$size_kb" -le 1100 ] || { echo "::error::rust is ${size_kb} KiB, over the 1100 KiB budget"; exit 1; }
 
-      - name: TypeScript sources under 704 KB
+      - name: TypeScript sources under 896 KB
         # Sources only: this job installs nothing and builds nothing, so node_modules
         # and dist are not here to measure. A vendored dependency would show up as a
         # budget failure, which is the point.
@@ -74,10 +74,14 @@ jobs:
         # left — the next file would have tripped it whatever it contained.
         # Raised from 704 to 768 KiB for full keyframe-delta reconstruction: SH composition,
         # streamed-prefix recovery, indexed-chain checks and the hostile-input tests that pin them.
+        # Raised from 768 to 896 KiB for the keyframe-delta encoder: the sequence writer, gate
+        # fixtures and tests land on top of the decoder and measure 872 KiB in a clean checkout.
+        # Keep one coordinated ceiling for the combined package; `du` rounds each file to a
+        # 4 KiB block, so 24 KiB of headroom is six files.
         run: |
           size_kb=$(du -s typescript | cut -f1)
           echo "typescript: ${size_kb} KiB"
-          [ "$size_kb" -le 768 ] || { echo "::error::typescript is ${size_kb} KiB, over the 768 KiB budget"; exit 1; }
+          [ "$size_kb" -le 896 ] || { echo "::error::typescript is ${size_kb} KiB, over the 896 KiB budget"; exit 1; }
       - name: Dart sources under 768 KB
         # Sources only, same as TypeScript's and Swift's: this job builds nothing, so
         # .dart_tool and the compiled runners are not here to measure, and a vendored
