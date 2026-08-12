@@ -441,6 +441,20 @@ pub type DeltaChunkParts<'a> = (DeltaChunkHeader, &'a [u8], &'a [u8], &'a [u8]);
 /// Parse a Delta Chunk record's content into its header and its three group blobs
 /// (updates, births, deaths).
 pub fn parse_delta_chunk(content: &[u8]) -> Result<DeltaChunkParts<'_>> {
+    let (head, records) = parse_delta_chunk_records(content)?;
+    let mut r = Cursor::new(records);
+    let updates = r.blob()?;
+    let births = r.blob()?;
+    let deaths = r.blob()?;
+    Ok((head, updates, births, deaths))
+}
+
+/// Parse a Delta Chunk through its records blob without interpreting that blob.
+///
+/// Chunk-level compression wraps the three length-framed groups, so a decoder must parse
+/// the fixed header first, decompress `records` when `compression` names a codec, and only
+/// then frame the groups. [`parse_delta_chunk`] remains the zero-compression convenience.
+pub fn parse_delta_chunk_records(content: &[u8]) -> Result<(DeltaChunkHeader, &[u8])> {
     let mut c = Cursor::new(content);
     let head = DeltaChunkHeader {
         t0: c.f64()?,
@@ -457,11 +471,7 @@ pub fn parse_delta_chunk(content: &[u8]) -> Result<DeltaChunkParts<'_>> {
         uncompressed_size: c.u64()?,
     };
     let records = c.blob()?;
-    let mut r = Cursor::new(records);
-    let updates = r.blob()?;
-    let births = r.blob()?;
-    let deaths = r.blob()?;
-    Ok((head, updates, births, deaths))
+    Ok((head, records))
 }
 
 /// Bytes the `keyframe-delta` block appends to a Chunk Index entry. A reader takes the

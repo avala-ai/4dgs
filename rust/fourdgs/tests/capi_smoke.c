@@ -339,8 +339,17 @@ static void check_writer(void) {
         const char *states = NULL;
         size_t states_len = 0;
         check(fourdgs_keyframe_delta_states_json(data, length, 0, &states, &states_len) ==
-                  FOURDGS_STATUS_MALFORMED,
+                  FOURDGS_STATUS_UNSUPPORTED_CODEC,
               "the keyframe-delta decoder refuses a gaussian-birth file on the streamed path");
+        const char *wrong_model_code = NULL;
+        size_t wrong_model_code_len = 0;
+        check(fourdgs_last_refusal_code(&wrong_model_code, &wrong_model_code_len) ==
+                  FOURDGS_STATUS_OK,
+              "the wrong temporal-model refusal identifier is readable");
+        check(wrong_model_code != NULL &&
+                  wrong_model_code_len == strlen("unknown-temporal-model") &&
+                  memcmp(wrong_model_code, "unknown-temporal-model", wrong_model_code_len) == 0,
+              "the wrong keyframe-delta reader reports unknown-temporal-model");
 
         /* Null out parameters are refused; null frees are ignored. */
         check(fourdgs_peek_temporal_model(data, length, NULL, NULL) ==

@@ -201,6 +201,15 @@ pub fn apply_delta(
                     ),
                 );
             };
+            if delta.channels != base.channels {
+                return refuse(
+                    "stream-channel-count-mismatch",
+                    format!(
+                        "attribute {attribute} carries {} channels in the update and {} in the referenced state",
+                        delta.channels, base.channels
+                    ),
+                );
+            }
             let channels = base.channels;
             if is_absolute_in_update(*attribute) {
                 for (k, &row) in rows.iter().enumerate() {
@@ -278,6 +287,17 @@ pub fn apply_delta(
             let birth = birth_bins.get(&attribute);
             match state.bins.get(&attribute) {
                 Some(base) => {
+                    if let Some(b) = birth {
+                        if b.channels != base.channels {
+                            return refuse(
+                                "stream-channel-count-mismatch",
+                                format!(
+                                    "attribute {attribute} carries {} channels in the birth and {} in the referenced state",
+                                    b.channels, base.channels
+                                ),
+                            );
+                        }
+                    }
                     let mut values = base.values.clone();
                     if let Some(b) = birth {
                         values.extend_from_slice(&b.values);
@@ -402,6 +422,51 @@ pub fn check_tiling(index: &[ChunkIndexEntry]) -> Result<(), Refusal> {
                 ),
             );
         }
+    }
+    Ok(())
+}
+
+/// The two ends of that tiling, which the index alone cannot answer for.
+///
+/// Spec §11.1 is one sentence with three clauses: sorted by `t0`, each chunk's `t1` equals
+/// the next chunk's `t0`, **the first `t0` is `0`, and the last `t1` is the Header's
+/// `duration_sec`**. [`check_tiling`] compares neighbours, which is a complete check of the
+/// interior and says nothing about either end — an index whose entries run `[0.4, 0.6)` and
+/// `[0.6, 0.9)` is internally adjacent and tiles none of a one-second clip. A reader that
+/// accepted it would answer a seek to `t=0.1` with "no state chunk covers t=0.1" on a file
+/// it had already called conforming.
+///
+/// Separate from `check_tiling` only because the duration comes from the Header and that
+/// function is handed the index by itself.
+pub fn check_timeline_endpoints(
+    index: &[ChunkIndexEntry],
+    duration_sec: f64,
+) -> Result<(), Refusal> {
+    let mut ordered: Vec<&ChunkIndexEntry> = index.iter().collect();
+    ordered.sort_by(|a, b| a.t0.partial_cmp(&b.t0).unwrap_or(std::cmp::Ordering::Equal));
+    // No entries is no index, which is a different file — one read front to back — and not
+    // a timeline with the wrong ends.
+    let (Some(first), Some(last)) = (ordered.first(), ordered.last()) else {
+        return Ok(());
+    };
+    if first.t0 != 0.0 {
+        return refuse(
+            "non-tiling-chunks",
+            format!(
+                "the state chunks start at {}; they tile the timeline from 0 (section 11.1)",
+                first.t0
+            ),
+        );
+    }
+    if last.t1 != duration_sec {
+        return refuse(
+            "non-tiling-chunks",
+            format!(
+                "the state chunks end at {}; the Header declares a duration of {duration_sec}, \
+                 and they tile the whole of it (section 11.1)",
+                last.t1
+            ),
+        );
     }
     Ok(())
 }
