@@ -303,6 +303,29 @@ void main() {
         ),
         refusalUnknownStreamCodec,
       );
+      final message = _messageOf(
+        () => decodeChunkStreams(
+          _constStreamWithCodec(9),
+          1,
+          _unitSteps,
+          const <double>[0.0, 0.0, 0.0],
+          const <FourdgsWindow>[FourdgsWindow(0.0, 1.0)],
+          cutoff: 0.05,
+          chunkOffset: 80,
+          streamsOffset: 123,
+        ),
+      );
+      expect(
+        message,
+        allOf(
+          contains('attribute $attrPosition'),
+          contains('stream header at byte 123'),
+          contains('Chunk at byte 80'),
+          contains('codec 9'),
+          contains('deflate (1)'),
+          contains('zstd (2)'),
+        ),
+      );
     });
 
     test('a window index outside the table is refused, not clamped', () {

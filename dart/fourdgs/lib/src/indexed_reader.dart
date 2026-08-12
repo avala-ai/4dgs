@@ -203,15 +203,6 @@ Future<FourdgsIndexedScene> openFourdgsIndexed(
       'the file has no Header or no Quantization record before its first chunk',
     );
   }
-  if (front.windows.isEmpty && front.header!.gaussianCount > 0) {
-    // Gaussians reference their validity window by index, so a scene with
-    // gaussians and no table has no windows to resolve them against. Every one
-    // would land on [0, 0] and be invisible at every instant — a file that
-    // opens, decodes, and renders nothing.
-    throw const FourdgsMalformedFile(
-      'the file has gaussians but no Window Table',
-    );
-  }
   final audioSourceRanges = _pairIndexedAudioSources(front);
   if (front.header!.hasAudio != audioSourceRanges.isNotEmpty) {
     throw FourdgsMalformedFile(
@@ -442,6 +433,7 @@ Future<FourdgsDecodedChunk> readFourdgsChunk(
     compression: body.header.compression,
     shBandRecords: bandRecords,
     chunkOffset: entry.chunkOffset,
+    streamsOffset: entry.chunkOffset + recordHeaderBytes + body.streamsOffset,
   );
 }
 
@@ -1135,7 +1127,7 @@ void _applyFrontRecord(
 ) {
   switch (span.opcode) {
     case opHeader:
-      out.header = FourdgsHeader.parse(content);
+      out.header = FourdgsHeader.parse(content, fileOffset: span.contentOffset);
     case opQuantization:
       out.quantization = FourdgsQuantization.parse(
         content,

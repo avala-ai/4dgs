@@ -449,14 +449,22 @@ void skipStreamPayload(FourdgsCursor cursor, FourdgsStreamHeader header) =>
     cursor.skip(header.payloadLength);
 
 /// Reads one attribute stream from [cursor].
-FourdgsAttributeStream decodeAttributeStream(FourdgsCursor cursor) =>
-    decodeAttributeStreamBody(cursor, readStreamHeader(cursor));
+FourdgsAttributeStream decodeAttributeStream(FourdgsCursor cursor) {
+  final streamOffset = cursor.pos;
+  return decodeAttributeStreamBody(
+    cursor,
+    readStreamHeader(cursor),
+    streamOffset: streamOffset,
+  );
+}
 
 /// Decodes the payload of a stream whose header has already been read.
 FourdgsAttributeStream decodeAttributeStreamBody(
   FourdgsCursor cursor,
-  FourdgsStreamHeader header,
-) {
+  FourdgsStreamHeader header, {
+  int streamOffset = 0,
+  int? chunkOffset,
+}) {
   final attributeId = header.attributeId;
   final width = header.width;
   final mode = header.mode;
@@ -501,7 +509,10 @@ FourdgsAttributeStream decodeAttributeStreamBody(
     );
   }
 
-  final raw = _decompress(cursor.take(payloadLength), codec, expected);
+  final context =
+      'attribute $attributeId stream header at byte $streamOffset'
+      '${chunkOffset == null ? '' : ' in the Chunk at byte $chunkOffset'}';
+  final raw = _decompress(cursor.take(payloadLength), codec, expected, context);
   final sym = _unshuffle(raw, width, symbols);
 
   final values = Int32List(count * channels);
@@ -578,7 +589,7 @@ FourdgsAttributeStream decodeAttributeStreamBody(
 /// checksum is worth the four bytes it costs to read: the container's own CRC
 /// covers the index and nothing else, so without it a payload that happens to
 /// inflate to the declared length hands back wrong bins with nothing to say so.
-Uint8List _decompress(Uint8List body, int codec, int expected) {
+Uint8List _decompress(Uint8List body, int codec, int expected, String context) {
   if (codec == codecZstd) {
     // Legal per the specification and appropriate for archival encodes, but it
     // needs a binding this decoder deliberately does not have. Writers default
@@ -589,14 +600,16 @@ Uint8List _decompress(Uint8List body, int codec, int expected) {
     // name; and from the file's side both are "this reader does not implement
     // my stream codec". Which of the two it is belongs in the message, not in
     // the identifier.
-    throw const FourdgsUnsupportedCodec(
-      'this stream is zstd-coded; re-encode with the default deflate codec',
+    throw FourdgsUnsupportedCodec(
+      '$context declares zstd codec 2, which this build does not implement; '
+      'expected deflate codec 1 for this build',
       refusalCode: refusalUnknownStreamCodec,
     );
   }
   if (codec != codecDeflate) {
     throw FourdgsUnsupportedCodec(
-      'unknown stream codec $codec',
+      '$context declares codec $codec; expected a registered stream codec: '
+      'deflate (1) or zstd (2)',
       refusalCode: refusalUnknownStreamCodec,
     );
   }

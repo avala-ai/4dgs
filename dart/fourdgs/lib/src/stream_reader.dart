@@ -159,7 +159,10 @@ FourdgsScene readFourdgsBytes(
     for (final record in iterRecords(data, fourdgsMagic.length)) {
       switch (record.opcode) {
         case opHeader:
-          header = FourdgsHeader.parse(record.content);
+          header = FourdgsHeader.parse(
+            record.content,
+            fileOffset: record.offset + recordHeaderBytes,
+          );
         case opQuantization:
           quantization = FourdgsQuantization.parse(
             record.content,
@@ -184,6 +187,8 @@ FourdgsScene readFourdgsBytes(
               cutoff: header?.cutoff ?? fourdgsDefaultCutoff,
               compression: body.header.compression,
               chunkOffset: record.offset,
+              streamsOffset:
+                  record.offset + recordHeaderBytes + body.streamsOffset,
             ),
           );
           chunkCounts.add(body.header.count);

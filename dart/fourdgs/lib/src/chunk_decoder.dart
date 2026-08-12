@@ -79,6 +79,9 @@ class FourdgsDecodedChunk {
 /// (AGENTS.md §6). Defaulted rather than required, for the same reason
 /// [FourdgsQuantization.parse] defaults its `fileOffset` — a caller holding a
 /// bare chunk buffer has no file to be relative to, and says so with `0`.
+/// [streamsOffset] is the file offset of the first attribute stream header.
+/// Keeping it separate from [chunkOffset] lets a stream-codec refusal identify
+/// both the enclosing record and the exact stream that declared the codec.
 FourdgsDecodedChunk decodeChunkStreams(
   Uint8List streams,
   int count,
@@ -89,6 +92,7 @@ FourdgsDecodedChunk decodeChunkStreams(
   String compression = '',
   Map<int, Uint8List> shBandRecords = const <int, Uint8List>{},
   int chunkOffset = 0,
+  int streamsOffset = 0,
 }) {
   final chunkAt = 'the chunk at byte $chunkOffset';
   if (compression.isNotEmpty) {
@@ -156,6 +160,7 @@ FourdgsDecodedChunk decodeChunkStreams(
   final got = <int, FourdgsAttributeStream>{};
   final cursor = FourdgsCursor(streams);
   while (cursor.remaining > 0) {
+    final streamOffset = streamsOffset + cursor.pos;
     final header = readStreamHeader(cursor);
     final wanted = _channelsFor(header.attributeId);
     // The format defines one stream per attribute, so a second is a chunk that
@@ -188,7 +193,12 @@ FourdgsDecodedChunk decodeChunkStreams(
         '${header.channels} channels, the registry says $wanted',
       );
     }
-    got[header.attributeId] = decodeAttributeStreamBody(cursor, header);
+    got[header.attributeId] = decodeAttributeStreamBody(
+      cursor,
+      header,
+      streamOffset: streamOffset,
+      chunkOffset: chunkOffset,
+    );
   }
 
   if (count == 0) {

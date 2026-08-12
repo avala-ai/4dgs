@@ -386,7 +386,8 @@ void _checkGroupsDisjoint(Int32List a, Int32List b, Int32List d) {
 /// decoded allocation. Per-stream decoded-size limits remain the cross-SDK
 /// contract; this SDK must not add a differently scoped aggregate refusal.
 Map<int, _Column> _decodeStreams(FourdgsCursor cursor, int at) {
-  final framed = <({FourdgsStreamHeader header, Uint8List payload})>[];
+  final framed =
+      <({FourdgsStreamHeader header, Uint8List payload, int offset})>[];
   final seen = <int>{};
   while (cursor.remaining > 0) {
     final offset = at + cursor.pos;
@@ -405,7 +406,7 @@ Map<int, _Column> _decodeStreams(FourdgsCursor cursor, int at) {
         'per attribute',
       );
     }
-    framed.add((header: header, payload: payload));
+    framed.add((header: header, payload: payload, offset: offset));
   }
 
   final got = <int, _Column>{};
@@ -413,6 +414,7 @@ Map<int, _Column> _decodeStreams(FourdgsCursor cursor, int at) {
     final stream = decodeAttributeStreamBody(
       FourdgsCursor(entry.payload),
       entry.header,
+      streamOffset: entry.offset,
     );
     got[stream.attributeId] = _Column(stream.channels, stream.values);
   }
@@ -493,7 +495,10 @@ KeyframeDeltaSequence decodeKeyframeDeltaStreamed(Uint8List data) {
   for (final record in iterRecords(data, fourdgsMagic.length)) {
     switch (record.opcode) {
       case opHeader:
-        header = FourdgsHeader.parse(record.content);
+        header = FourdgsHeader.parse(
+          record.content,
+          fileOffset: record.offset + recordHeaderBytes,
+        );
         if (header.temporalModel != 'keyframe-delta') {
           throw FourdgsMalformedFile(
             'decodeKeyframeDeltaStreamed is the keyframe-delta path; this file is '
@@ -609,7 +614,10 @@ decodeKeyframeDeltaIndexed(Uint8List data) {
   FourdgsFooter? footer;
   for (final record in iterRecords(data, fourdgsMagic.length)) {
     if (record.opcode == opHeader) {
-      header = FourdgsHeader.parse(record.content);
+      header = FourdgsHeader.parse(
+        record.content,
+        fileOffset: record.offset + recordHeaderBytes,
+      );
     } else if (record.opcode == opQuantization) {
       quantization = FourdgsQuantization.parse(
         record.content,

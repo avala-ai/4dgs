@@ -66,11 +66,15 @@ class FourdgsHeader {
   /// soundtrack costs nothing: the bit is clear and there is no record.
   bool get hasAudio => flags & headerFlagHasAudio != 0;
 
-  static FourdgsHeader parse(Uint8List content) {
+  /// [fileOffset] is where [content] begins in the file. It defaults to zero
+  /// for callers parsing a detached record body, while both file readers pass
+  /// the framed record's content offset so every diagnostic names a seekable
+  /// byte in the original resource.
+  static FourdgsHeader parse(Uint8List content, {int fileOffset = 0}) {
     final c = FourdgsCursor(content);
     final profile = c.string();
     final library = c.string();
-    final durationAt = c.pos;
+    final durationAt = fileOffset + c.pos;
     final durationSec = c.f64();
     // Every check here is on a value that decodes into plausible-looking output
     // when it is trusted, rather than into an obvious error. A NaN duration
@@ -93,7 +97,7 @@ class FourdgsHeader {
       );
     }
     final gaussianCount = c.u64();
-    final cutoffAt = c.pos;
+    final cutoffAt = fileOffset + c.pos;
     final cutoff = c.f64();
     // Otherwise only validated where a chunk's motion is decoded against it,
     // which a zero-gaussian file or a metadata-only indexed open never reaches
@@ -104,10 +108,10 @@ class FourdgsHeader {
         'marginal threshold in (0, 1]',
       );
     }
-    final temporalModelAt = c.pos;
+    final temporalModelAt = fileOffset + c.pos;
     final temporalModel = c.string();
     final aabb = c.f64s(6);
-    final shDegreeAt = c.pos;
+    final shDegreeAt = fileOffset + c.pos;
     final shDegree = c.u8();
     // 0-3 is the whole registry. Out of range is not merely unknown: a decoded
     // byte budget prices an unknown band at zero while the coefficient count
