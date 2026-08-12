@@ -10,6 +10,7 @@ do is something a caller can do.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import sys
@@ -408,7 +409,9 @@ class _PipeTolerantStream:
             return len(text)
         try:
             return self._stream.write(text)
-        except BrokenPipeError:
+        except OSError as exc:
+            if not _is_departed_reader(exc):
+                raise
             self.broken = True
             return len(text)
 
@@ -417,11 +420,27 @@ class _PipeTolerantStream:
             return
         try:
             self._stream.flush()
-        except BrokenPipeError:
+        except OSError as exc:
+            if not _is_departed_reader(exc):
+                raise
             self.broken = True
 
     def __getattr__(self, name: str):
         return getattr(self._stream, name)
+
+
+def _is_departed_reader(exc: OSError) -> bool:
+    """Whether this write failed because nobody is reading any more.
+
+    POSIX says `EPIPE` and Python raises `BrokenPipeError` for it. Windows reports the
+    same situation as `EINVAL` on the flush that follows the failed write, which is why
+    that errno is admitted there and only there: on Windows a write to stdout has no
+    other plausible way to be handed an invalid argument, and the alternative is the
+    interpreter exiting 120 with a traceback in place of the tool's verdict.
+    """
+    if isinstance(exc, BrokenPipeError):
+        return True
+    return sys.platform == "win32" and exc.errno == errno.EINVAL
 
 
 def _silence(fd: int) -> None:
