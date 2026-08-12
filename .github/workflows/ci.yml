@@ -158,10 +158,9 @@ jobs:
         # tree from the parent's 776 KiB to 864 KiB. The next 64 KiB step leaves 32 KiB of
         # headroom while keeping the budget tied to the feature this layer adds.
         # Raised from 896 to 960 KiB because main is already over it: #174 landed the Dart
-        # refusal diagnostics after #173 set this number, taking a clean tree to 932 KiB, and
-        # the `size-budget` job has been failing on main since. Not this branch's growth —
-        # this branch adds no Dart — but every PR that merges main inherits the red job, so
-        # the first one through fixes it. 960 is the next 64 KiB step and leaves 28 KiB.
+        # refusal diagnostics after #173 set this number, taking a clean tree to 932, and
+        # `size-budget` has been failing on main since. Not this branch's growth — it adds
+        # no Dart — but every PR that merges main inherits the red job.
         run: |
           size_kb=$(du -s dart | cut -f1)
           echo "dart: ${size_kb} KiB"
