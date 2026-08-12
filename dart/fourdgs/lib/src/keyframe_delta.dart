@@ -347,6 +347,20 @@ KeyframeDeltaState _applyDelta(
           'absolute state, not a delta',
         );
       }
+      // The other direction, and the same rule. A birth carrying an attribute the live
+      // population lacks left `before` empty, so the composed column came out as tall as
+      // the birth group alone while `ids` grew by the whole of it — and rows are addressed
+      // by position against `ids`. Zero pads an identity lane, where a row without one is
+      // a row nothing labelled; it stands for nothing in a position or a scale, and
+      // padding those would put the older gaussians at the origin.
+      if (existing == null &&
+          !_zeroDefaultIdentityAttributes.contains(attribute)) {
+        throw FourdgsMalformedFile(
+          'a birth group carries attribute $attribute, which the live population does '
+          'not; a composed column has one value per gaussian and zero is not one for '
+          'this attribute',
+        );
+      }
       // Beside it, and not instead of it: an attribute present on both sides must
       // agree on its channel count, or the composed column is two shapes at once.
       if (existing != null &&
@@ -358,16 +372,10 @@ KeyframeDeltaState _applyDelta(
         );
       }
       final ch = existing?.channels ?? added!.channels;
-      final before =
-          existing?.values ??
-          (_zeroDefaultIdentityAttributes.contains(attribute)
-              ? Int32List(ids.length * ch)
-              : Int32List(0));
-      final after =
-          added?.values ??
-          (_zeroDefaultIdentityAttributes.contains(attribute)
-              ? Int32List(birthIds.length * ch)
-              : Int32List(0));
+      // Both fallbacks are now reachable only for an identity lane, which the two checks
+      // above are what makes true: every other attribute is present on both sides.
+      final before = existing?.values ?? Int32List(ids.length * ch);
+      final after = added?.values ?? Int32List(birthIds.length * ch);
       final merged =
           Int32List(before.length + after.length)
             ..setRange(0, before.length, before)
