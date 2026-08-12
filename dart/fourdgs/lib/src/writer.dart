@@ -32,11 +32,19 @@ import 'package:archive/archive.dart' as archive;
 import 'chunk_decoder.dart' show shBandRange;
 import 'exceptions.dart';
 import 'indexed_reader.dart' show maxChunkIndexEntries;
+import 'keyframe_delta.dart';
 import 'model.dart';
 import 'opcode.dart';
 import 'quantization.dart';
-import 'records.dart' show maxWindowsPerScene;
+import 'records.dart';
 import 'serialization.dart';
+
+// The `keyframe-delta` encoder is a part rather than its own library because it
+// is the same encoder: it lands attributes on the grids `_Grid` derives, frames
+// records with `_record`, and codes symbols with `_encodeStream`. Splitting it
+// into a library would mean making that machinery public — a decision about the
+// package's surface taken to satisfy a file boundary.
+part 'keyframe_delta_writer.dart';
 
 /// The caller handed the encoder something no conforming file can be written
 /// from.
@@ -335,7 +343,13 @@ void writeFourdgsToSink(
     final streams = _ByteWriter(4096);
     for (final lane in quantized.lanes) {
       streams.bytes(
-        _encodeStream(lane.attributeId, lane.values, lane.channels, options),
+        _encodeStream(
+          lane.attributeId,
+          lane.values,
+          lane.channels,
+          options.codec,
+          options.level,
+        ),
       );
     }
     final chunkOffset = out.length;
@@ -721,7 +735,6 @@ class _Grid {
   });
 
   factory _Grid.forScene(FourdgsGaussianSet g, String profile) {
-    final constants = _profiles[profile]!;
     final medianScale = g.count == 0 ? 1e-3 : _medianFloat32(g.scales);
     final origin = Float64List(3);
     if (g.count > 0) {
@@ -734,6 +747,21 @@ class _Grid {
         origin[axis] = lowest;
       }
     }
+    return _Grid.forProfile(profile, medianScale, origin);
+  }
+
+  /// The same grid, from statistics a caller already holds.
+  ///
+  /// A `keyframe-delta` sequence derives its median radius and its position
+  /// origin from every sample at once rather than from one population, and the
+  /// two encoders must land on the same pitches from the same numbers — so the
+  /// arithmetic lives here once and the statistics are the argument.
+  factory _Grid.forProfile(
+    String profile,
+    double medianScale,
+    Float64List origin,
+  ) {
+    final constants = _profiles[profile]!;
     return _Grid(
       origin: origin,
       boundPos: constants[0] * medianScale,
@@ -1835,7 +1863,13 @@ Uint8List _bandRecord(
   final payload = _ByteWriter(values.length + 32);
   payload.u8(band.band);
   payload.bytes(
-    _encodeStream(opShBandStream, values, band.columns.length, options),
+    _encodeStream(
+      opShBandStream,
+      values,
+      band.columns.length,
+      options.codec,
+      options.level,
+    ),
   );
   final blob = _record(opShBandStream, payload.finish());
   if (options.verify && bits != null) {
@@ -2025,6 +2059,13 @@ class _IndexEntry {
     required this.chunkLength,
     required this.gaussianCount,
     required this.bands,
+    this.extended = false,
+    this.kind = 0,
+    this.deltaMode = 0,
+    this.referenceOffset = 0,
+    this.keyframeOffset = 0,
+    this.depth = 0,
+    this.liveCount = 0,
   });
 
   final double t0;
@@ -2034,8 +2075,25 @@ class _IndexEntry {
   final int gaussianCount;
   final List<_IndexBand> bands;
 
+  /// True when this entry carries the `keyframe-delta` block below. False for
+  /// every `gaussian-birth` file, whose entries stay byte-identical: a reader
+  /// recognises the block by the bytes left after the band array, so an entry
+  /// that appends nothing parses exactly as it always did.
+  final bool extended;
+  final int kind;
+  final int deltaMode;
+  final int referenceOffset;
+  final int keyframeOffset;
+  final int depth;
+
+  /// Gaussians live over `[t0, t1)` after composition. Stated for keyframe
+  /// entries too, not only deltas: §5.8 defines it for every extended entry, and
+  /// the readers cross-check it against the chunk on both paths — a writer that
+  /// left it zero on keyframes would produce files this SDK refuses.
+  final int liveCount;
+
   Uint8List encode() {
-    final w = _ByteWriter(48 + 17 * bands.length);
+    final w = _ByteWriter(48 + 17 * bands.length + indexDeltaBlockBytes);
     w.f64(t0);
     w.f64(t1);
     w.u64(chunkOffset);
@@ -2046,6 +2104,14 @@ class _IndexEntry {
       w.u8(band.band);
       w.u64(band.offset);
       w.u64(band.length);
+    }
+    if (extended) {
+      w.u8(kind);
+      w.u8(deltaMode);
+      w.u64(referenceOffset);
+      w.u64(keyframeOffset);
+      w.u16(depth);
+      w.u64(liveCount);
     }
     return _record(opChunkIndex, w.finish());
   }
@@ -2107,25 +2173,19 @@ Uint8List _encodeStream(
   int attributeId,
   Int32List values,
   int channels,
-  FourdgsWriteOptions options,
+  int codec,
+  int level,
 ) {
   final count = channels == 0 ? 0 : values.length ~/ channels;
   if (count == 0) {
-    return _streamHeader(
-      attributeId,
-      1,
-      modeRaw,
-      options.codec,
-      channels,
-      0,
-      0,
-    );
+    return _streamHeader(attributeId, 1, modeRaw, codec, channels, 0, 0);
   }
 
   if (count > 1 && _allRowsEqual(values, channels, count)) {
     final body = _codeSymbols(
       Int32List.sublistView(values, 0, channels),
-      options,
+      codec,
+      level,
       attributeId,
     );
     return _concat(
@@ -2133,7 +2193,7 @@ Uint8List _encodeStream(
         attributeId,
         body.width,
         modeConst,
-        options.codec,
+        codec,
         channels,
         count,
         body.payload.length,
@@ -2142,11 +2202,11 @@ Uint8List _encodeStream(
     );
   }
 
-  var best = _codeSymbols(values, options, attributeId);
+  var best = _codeSymbols(values, codec, level, attributeId);
   var bestMode = modeRaw;
   final deltas = count > 1 ? _deltaCandidate(values, channels) : null;
   if (deltas != null) {
-    final candidate = _codeSymbols(deltas, options, attributeId);
+    final candidate = _codeSymbols(deltas, codec, level, attributeId);
     if (candidate.payload.length < best.payload.length) {
       best = candidate;
       bestMode = modeDelta;
@@ -2157,7 +2217,7 @@ Uint8List _encodeStream(
       attributeId,
       best.width,
       bestMode,
-      options.codec,
+      codec,
       channels,
       count,
       best.payload.length,
@@ -2208,7 +2268,8 @@ class _CodedSymbols {
 /// compress.
 _CodedSymbols _codeSymbols(
   Int32List symbols,
-  FourdgsWriteOptions options,
+  int codec,
+  int level,
   int attributeId,
 ) {
   final zig = Float64List(symbols.length);
@@ -2251,19 +2312,19 @@ _CodedSymbols _codeSymbols(
       divisor *= 256.0;
     }
   }
-  return _CodedSymbols(width, _compress(raw, options));
+  return _CodedSymbols(width, _compress(raw, codec, level));
 }
 
-Uint8List _compress(Uint8List raw, FourdgsWriteOptions options) {
-  if (options.codec != codecDeflate) {
+Uint8List _compress(Uint8List raw, int codec, int level) {
+  if (codec != codecDeflate) {
     throw FourdgsUnsupportedCodec(
-      'stream codec ${options.codec} is not available to a pure-Dart build',
+      'stream codec $codec is not available to a pure-Dart build',
     );
   }
   // A zlib frame, not a bare deflate block: the format's deflate carries the
   // RFC 1950 wrapper, and the decoder checks its Adler-32.
   return Uint8List.fromList(
-    archive.ZLibEncoder().encodeBytes(raw, level: options.level),
+    archive.ZLibEncoder().encodeBytes(raw, level: level),
   );
 }
 
@@ -2365,6 +2426,12 @@ class _ByteWriter {
   void u8(int v) {
     _ensure(1);
     _buf[_length++] = v & 0xFF;
+  }
+
+  void u16(int v) {
+    _ensure(2);
+    _view.setUint16(_length, v, Endian.little);
+    _length += 2;
   }
 
   void u32(int v) {

@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import io
+import math
 import os
 import sys
 from itertools import zip_longest
@@ -78,6 +79,28 @@ from fourdgs.serialization import put_record
 MAX_DATA_BYTES = 2_500_000
 
 
+def _sh_coefficients(n: int, coeffs: int, flags) -> np.ndarray | None:
+    """The spherical-harmonic coefficient block for a variant, or `None` at degree 0.
+
+    The default fill is `% 251`, and the modulus is load-bearing in a way nobody intended:
+    it is coprime with the 45-column stride, so consecutive gaussians get different
+    coefficients rather than the same ones repeating — but it also keeps **251..255 out of
+    the entire corpus**. At the `coarse` profile's `step_sh = 3` exactly one input value
+    overflows its own encoding: 255 rounds to the bin centre 256, which no `u8` holds. So a
+    coarse-profile file with spherical harmonics already existed and still could not reach
+    the bug (issues #181, #190).
+
+    `SHTopCoefficients` fills `% 256` instead, which reaches 255 and keeps the same
+    stride-coprimality property only incidentally — what matters is that the extreme value
+    is present. Changing the default here instead would move every existing SH fixture's
+    checksum for a property only one variant needs.
+    """
+    if not coeffs:
+        return None
+    modulus = 256 if "SHTopCoefficients" in flags else 251
+    return (np.arange(n * coeffs, dtype=np.int64) % modulus).astype(np.uint8).reshape(n, coeffs)
+
+
 def build(scenario, flags, *, read_back: bool = True, **overrides) -> tuple[bytes, str]:
     """Encode one variant and produce its expectation."""
     raw = scenarios.build_gaussians(scenario)
@@ -104,7 +127,7 @@ def build(scenario, flags, *, read_back: bool = True, **overrides) -> tuple[byte
         sigma_t=np.asarray(raw["sigma_t"], dtype=np.float32),
         win_lo=np.asarray(raw["win_lo"], dtype=np.float32),
         win_hi=np.asarray(raw["win_hi"], dtype=np.float32),
-        sh=(np.arange(n * coeffs, dtype=np.int64) % 251).astype(np.uint8).reshape(n, coeffs) if coeffs else None,
+        sh=_sh_coefficients(n, coeffs, flags),
         sh_degree=sh_degree,
         # The one object-bearing top-level variant also carries both exact
         # producer-side identity lanes. Distinct nontrivial values make a
@@ -241,6 +264,9 @@ def build(scenario, flags, *, read_back: bool = True, **overrides) -> tuple[byte
         record_trailers=trailers,
         cutoff=0.2 if "CustomCutoff" in flags else 0.05,
         sh_bit_depths=sh_bit_depths,
+        # Bands 1..3 unless a variant asks for fewer. Capping is what makes the degree the
+        # file carries differ from the degree the scene holds.
+        sh_bands=1 if "SHBandsCapped" in flags else 3,
         **overrides,
     )
 
@@ -363,6 +389,96 @@ def _kd_drift_sequence() -> list[Sample]:
     return samples
 
 
+#: The validity windows the multi-window sequence declares, in Window Table order: one
+#: that spans the clip, one that closes at 2s, and one that does not open until 4s. Two
+#: gaussians sit in each.
+#:
+#: Every other keyframe-delta variant carries a single window `[0, 8)`, so a gaussian's
+#: window never closes before the scene does and section 3's visibility rule has nothing
+#: to decide. That gap hid three defects: `a4b1efa`, where every gaussian was given the
+#: *first* window's motion grid and reconstructed positions moved in three SDKs at once;
+#: issue #185, the same rule applied on one implementation's reconstruction path and not
+#: another's; and a third sighting while the TypeScript keyframe-delta encoder was written.
+#: All three were invisible because no fixture could express a window that shuts.
+_KD_WINDOWS = ((0.0, _KD_DURATION), (0.0, 2.0), (4.0, _KD_DURATION))
+
+
+#: Gaussians in the multi-window sequence. Two per window.
+_KD_MULTI_WINDOW_COUNT = 6
+
+
+def _kd_multi_window_gaussians(step: int) -> fourdgs.GaussianSet:
+    """The multi-window population at one sample, every attribute distinct per gaussian.
+
+    Uniform attributes would make this variant prove less than it looks like it proves: if
+    every row carried the same scale, rotation and colour, a decoder that kept the *wrong*
+    two rows at 3s would still emit the right numbers, and only the count and the ids could
+    ever disagree. So scale, rotation, colour, velocity, birth time and sigma all differ per
+    gaussian, and position and rotation drift as the clip runs.
+
+    `sigma_t`, `flags` and `window_index` are GOP-invariant (spec section 11.5), so they are
+    a function of the gaussian alone and never of the step; everything that drifts is what
+    the delta chunks carry. `mu_t` sits inside each gaussian's own window, because a birth
+    time outside the window it belongs to would leave the marginal doing the work the window
+    is supposed to do.
+
+    `sigma_t` is finite on every row: this reference writer requires it and writes
+    `never_fades = 0` throughout, which is also why this variant cannot reach the one place
+    a window's *length* changes a grid (the velocity precision class reads the window length
+    only for a never-fading gaussian, spec section 6.3). What it does reach is the
+    visibility rule and `window_index` naming the right row of a three-row table.
+    """
+    n = _KD_MULTI_WINDOW_COUNT
+    windows = [_KD_WINDOWS[i % len(_KD_WINDOWS)] for i in range(n)]
+    positions, scales, rotations, colors, motions = [], [], [], [], []
+    for i in range(n):
+        positions.append([0.3 * i + 0.11 * step, -0.7 + 0.05 * i * step, 0.25 * step - 0.4 * i])
+        scales.append([0.02 + 0.013 * i + 0.004 * a for a in range(3)])
+        # A rotation about a tilted axis, turning as the clip runs, so the smallest-three
+        # coding has a different largest component on different rows.
+        angle = 0.21 * i + 0.37 * step
+        axis = (0.3, 0.6, math.sqrt(1.0 - 0.09 - 0.36))
+        s = math.sin(angle / 2.0)
+        rotations.append([axis[0] * s, axis[1] * s, axis[2] * s, math.cos(angle / 2.0)])
+        colors.append([0.1 + 0.14 * i, 0.9 - 0.11 * i, 0.33 + 0.07 * i, 0.4 + 0.09 * i])
+        motions.append([0.13 * (i - 2), -0.06 * i, 0.21])
+    return fourdgs.GaussianSet(
+        positions=np.asarray(positions, dtype=np.float32).reshape(n, 3),
+        scales=np.asarray(scales, dtype=np.float32).reshape(n, 3),
+        rotations=np.asarray(rotations, dtype=np.float32).reshape(n, 4),
+        colors=np.asarray(colors, dtype=np.float32).reshape(n, 4),
+        motions=np.asarray(motions, dtype=np.float32).reshape(n, 3),
+        mu_t=np.asarray([0.5 * (lo + hi) for lo, hi in windows], dtype=np.float32),
+        # Keep every in-window row comfortably above the Header's temporal cutoff for the
+        # full window. This scenario isolates the hard validity-window gate; a narrow sigma
+        # would also test the independent marginal gate and change the intended 4/2/4 count.
+        sigma_t=np.asarray([2.0 + 0.35 * i for i in range(n)], dtype=np.float32),
+        win_lo=np.asarray([lo for lo, _ in windows], dtype=np.float32),
+        win_hi=np.asarray([hi for _, hi in windows], dtype=np.float32),
+    )
+
+
+def _kd_multi_window_sequence() -> list[Sample]:
+    """A drifting population of six gaussians spread across three validity windows.
+
+    No births and no deaths: every id is live in every chunk, so the composed population is
+    the same six rows throughout and the only thing that can remove a row from a
+    reconstructed instant is its own validity window. That is the point — a decoder that
+    skips the gate reports six gaussians at every probe, while one that applies it reports
+    four before 2s (window 2 has not opened), two from 2s to 4s (window 1 has shut and
+    window 2 is still closed) and four from 4s on.
+    """
+    ids = np.arange(_KD_MULTI_WINDOW_COUNT)
+    return [
+        Sample(
+            t0=float(i) * (_KD_DURATION / _KD_STEPS),
+            ids=ids,
+            gaussians=_kd_multi_window_gaussians(i),
+        )
+        for i in range(_KD_STEPS)
+    ]
+
+
 def _kd_churn_sequence() -> list[Sample]:
     """A drifting population with one birth (id 4) and one death (id 2), so deltas carry
     birth and death groups, not only updates."""
@@ -444,6 +560,12 @@ KEYFRAME_DELTA_VARIANTS = (
     ("KeyframeDelta-UseChunkIndex-UseCrc-UseStatistics", _kd_drift_sequence, 4, DELTA_MODE_CHAINED),
     ("KeyframeDeltaChurn-UseChunkIndex-UseCrc-UseStatistics", _kd_churn_sequence, 4, DELTA_MODE_CHAINED),
     ("KeyframeDeltaModesMixed-UseChunkIndex-UseCrc-UseStatistics", _kd_churn_sequence, 4, DELTA_MODE_KEYFRAME),
+    (
+        "KeyframeDeltaMultiWindow-UseChunkIndex-UseCrc-UseStatistics",
+        _kd_multi_window_sequence,
+        4,
+        DELTA_MODE_CHAINED,
+    ),
 )
 
 
