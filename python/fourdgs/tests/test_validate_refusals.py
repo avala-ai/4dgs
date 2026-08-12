@@ -482,6 +482,9 @@ class TestKeyframeDelta:
                 code(lambda: kdf.compose_chain(body, index, target, opened.windows, opened.grids)),
             )
 
+        def last_of_kind(index, kind):
+            return [e for e in index if e.kind == kind][-1]
+
         def forward(index):
             entry = next(e for e in index if e.kind == 1)
             entry.reference_offset = entry.chunk_offset + 8
@@ -512,6 +515,42 @@ class TestKeyframeDelta:
             scanned, composed = verdicts(mutate)
             assert scanned is not None, "the scan is supposed to refuse this"
             assert composed == scanned, f"{mutate.__name__}: scan said {scanned}, compose said {composed}"
+
+        # Every claim an entry makes, one at a time, rather than the handful someone
+        # thought of. The two paths are near-verbatim copies of one rule set — they have
+        # already drifted twice, each time because a rule was added to one and not the
+        # other — and a fixed list of mutations only catches the drift it was written for.
+        # This one fails on any field where they stop agreeing, including fields added
+        # later, which is the property that actually has to hold.
+        wrong_by_field = {
+            "t0": 0.125,
+            "t1": 99.0,
+            "gaussian_count": 4242,
+            "kind": 0,
+            "delta_mode": 1 - int(last_of_kind(opened.index, 1).delta_mode),
+            "reference_offset": int(opened.index[0].chunk_offset),
+            "keyframe_offset": 4242,
+            "depth": 42,
+            "live_count": 4242,
+        }
+        for name, value in wrong_by_field.items():
+
+            def perturb(index, _name=name, _value=value):
+                entry = last_of_kind(index, 1)
+                setattr(entry, _name, _value)
+                return entry
+
+            scanned, composed = verdicts(perturb)
+            # Agreement on the verdict, not on which rule names it. The scan walks the
+            # index in time order and the seeking path walks one chain by reference, so a
+            # single wrong field can break two rules and each path meets a different one
+            # first — both true, both refusals. What must never differ is whether the file
+            # is legal: a seeking client accepting what the validator rejects is the bug
+            # this pair has produced twice.
+            assert (scanned is None) == (composed is None), (
+                f"{name}={value!r}: the scan said {scanned} and the seeking path said "
+                f"{composed}; one accepted a file the other refused"
+            )
 
         # `level` lives in the record and not in the index, so this one patches the file.
         # A delta at another level than its reference is a difference between bins on two
