@@ -130,6 +130,10 @@ jobs:
         # stack. Its interval tree, reconstructed-support planning, selective-seek proofs and
         # regressions take the clean tree to 916 KiB; the next 64 KiB step leaves 44 KiB of
         # headroom while keeping the budget tied to the feature this layer adds.
+        # Raised from 896 to 960 KiB because main is already over it: #174 landed the Dart
+        # refusal diagnostics after #173 set this number, taking a clean tree to 932, and
+        # `size-budget` has been failing on main since. Not this branch's growth — it adds
+        # no Dart — but every PR that merges main inherits the red job.
         run: |
           size_kb=$(du -s dart | cut -f1)
           echo "dart: ${size_kb} KiB"
