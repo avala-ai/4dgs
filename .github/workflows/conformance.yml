@@ -106,6 +106,15 @@ jobs:
           python tests/conformance/generate.py
           python tests/conformance/encode_roundtrip.py --encoder typescript
 
+      # The gaussian-birth gate above proves two encoders agree; it cannot prove either one
+      # preserved the scene, because a fault present in both passes it (#189). The
+      # keyframe-delta writer has no second encoder here at all, so its gate makes the
+      # fidelity claim directly — the written file, read back by Python, against the
+      # population that went in and the bounds the file itself declares — before it makes
+      # any agreement claim.
+      - name: keyframe-delta encode
+        run: typescript/keyframe-delta-roundtrip.sh
+
   kaitai:
     # The .ksy grammar is an executable restatement of the spec: if it stops parsing the
     # corpus, the spec and the implementation have diverged.

@@ -52,7 +52,7 @@ identical bytes with no per-language slerp or composition order of its own.
 | Delta composition, keyframe-referenced            | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Births and deaths in deltas                       | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Reconstruction at an instant                      | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Encode `keyframe-delta`                           | Yes    | Planned    | Yes     | Planned | Planned | Yes     |
+| Encode `keyframe-delta`                           | Yes    | Yes        | Yes     | Planned | Planned | Yes     |
 | Unknown-record skipping                           | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Refusal diagnosis (named, not merely refused)     | Yes    | Yes        | Yes     | Yes     | Yes     | No      |
 | Private-range records                             | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
