@@ -2008,11 +2008,23 @@ export function checkTiling(
   requireFullCoverage = false,
 ): void {
   const ordered = [...intervals].sort((a, b) => a.t0 - b.t0);
-  for (const entry of ordered) {
-    if (!Number.isFinite(entry.t0) || !Number.isFinite(entry.t1) || entry.t1 < entry.t0) {
+  for (let i = 0; i < ordered.length; i++) {
+    const entry = ordered[i]!;
+    // §11.1's timeline may be open-ended: the final interval of a file whose Header
+    // declares `duration_sec = +Infinity` may itself end at `+Infinity`. Every t0, and
+    // every other t1, must still be finite. Python's `check_tiling` carves out exactly
+    // this case and Dart asserts such a file decodes, so refusing it unconditionally
+    // here made the same bytes readable in two SDKs and unreadable in this one.
+    const openEndedFinal =
+      i === ordered.length - 1 && durationSec === Infinity && entry.t1 === Infinity;
+    if (
+      !Number.isFinite(entry.t0) ||
+      (!Number.isFinite(entry.t1) && !openEndedFinal) ||
+      entry.t1 < entry.t0
+    ) {
       throw new MalformedFile(
         `state chunk has unusable interval [${entry.t0}, ${entry.t1}); expected finite t0 ` +
-          "and t1 >= t0",
+          "and t1 >= t0 (except +Infinity for the final interval of an open-ended timeline)",
       );
     }
   }

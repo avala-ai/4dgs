@@ -237,8 +237,24 @@ export class IndexedDecoder {
         attachments: [],
       };
     const provenanceRanges: ProvenanceRange[] = [];
-    const retainOptionalRecord = optionalRecordBudget(maxDeferredRecords);
     let deferredDiscoveryComplete = true;
+    // The ceiling is a reader resource limit, not a verdict on the file, and opening is
+    // not the moment to spend it. Throwing here made a conforming capture with many
+    // front-matter records — seventy thousand object-layer instances, say — impossible
+    // to open at all, so `readChunk` and `chunksForTime` became unreachable for a caller
+    // that only ever wanted gaussians. Past the ceiling this stops *retaining* and marks
+    // discovery incomplete instead; a caller that does ask for provenance or metadata
+    // pays for the complete walk in `ensureDeferredRecords`, and exceeding the same
+    // ceiling there is a refusal, because there those records are what was asked for.
+    let retainedOptional = 0;
+    const retainOptionalRecord = (): boolean => {
+      if (retainedOptional >= maxDeferredRecords) {
+        deferredDiscoveryComplete = false;
+        return false;
+      }
+      retainedOptional += 1;
+      return true;
+    };
     for await (const record of scanner.records(MAGIC.length)) {
       // Indexed opening ends where state data begins. Continuing through every physical
       // chunk would turn a single bounded head read into one range request per record on
@@ -260,19 +276,21 @@ export class IndexedDecoder {
         // The track's bytes are not read here, and neither is the record stepped into: a
         // caller may want the gaussians and never the audio. Only the codec name is
         // parsed, out of a prefix, so a scene with a large track costs nothing to open.
-        retainOptionalRecord();
-        legacyAudio = readLegacyAudioRange(
-          await scanner.content(record, AUDIO_CODEC_PREFIX_BYTES),
-          record.offset,
-          record.contentLength,
-        );
+        if (retainOptionalRecord()) {
+          legacyAudio = readLegacyAudioRange(
+            await scanner.content(record, AUDIO_CODEC_PREFIX_BYTES),
+            record.offset,
+            record.contentLength,
+          );
+        }
       } else if (record.opcode === Opcode.AudioSource) {
         const sourceId = readSourceId(await scanner.content(record, 4), "Audio Source");
         if (sourceRanges.has(sourceId)) {
           throw new MalformedFile(`Audio Source id ${sourceId} appears more than once`);
         }
-        retainOptionalRecord();
-        sourceRanges.set(sourceId, { offset: record.offset, length: record.totalLength });
+        if (retainOptionalRecord()) {
+          sourceRanges.set(sourceId, { offset: record.offset, length: record.totalLength });
+        }
       } else if (record.opcode === Opcode.AudioData) {
         const prefix = new Cursor(await scanner.content(record, 12));
         const sourceId = prefix.u32();
@@ -286,30 +304,35 @@ export class IndexedDecoder {
               `but its record content is only ${record.contentLength} bytes`,
           );
         }
-        retainOptionalRecord();
-        dataRanges.set(sourceId, {
-          offset: record.offset + RECORD_HEADER_BYTES + 12,
-          length: dataLength,
-        });
+        if (retainOptionalRecord()) {
+          dataRanges.set(sourceId, {
+            offset: record.offset + RECORD_HEADER_BYTES + 12,
+            length: dataLength,
+          });
+        }
       } else if (record.opcode === Opcode.Camera) {
-        retainOptionalRecord();
-        deferred.camera = { offset: record.offset, length: record.totalLength };
+        if (retainOptionalRecord()) {
+          deferred.camera = { offset: record.offset, length: record.totalLength };
+        }
       } else if (record.opcode === Opcode.Metadata) {
-        retainOptionalRecord();
-        deferred.metadata.push({ offset: record.offset, length: record.totalLength });
+        if (retainOptionalRecord()) {
+          deferred.metadata.push({ offset: record.offset, length: record.totalLength });
+        }
       } else if (record.opcode === Opcode.Attachment) {
-        retainOptionalRecord();
-        deferred.attachments.push({ offset: record.offset, length: record.totalLength });
+        if (retainOptionalRecord()) {
+          deferred.attachments.push({ offset: record.offset, length: record.totalLength });
+        }
       } else if (isProvenanceOpcode(record.opcode)) {
         // Framed, not read. Opening a file learns where provenance lives and stops: a
         // long rig trajectory costs nothing to open, and reserved opcodes in the family
         // (object layer, source timing) stay skippable by their length alone.
-        retainOptionalRecord();
-        provenanceRanges.push({
-          opcode: record.opcode,
-          offset: record.offset,
-          length: record.totalLength,
-        });
+        if (retainOptionalRecord()) {
+          provenanceRanges.push({
+            opcode: record.opcode,
+            offset: record.offset,
+            length: record.totalLength,
+          });
+        }
       }
     }
     if (header === null || quantization === null) {
