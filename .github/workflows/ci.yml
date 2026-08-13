@@ -718,6 +718,22 @@ jobs:
             cat "$universal_log"
             grep -q 'cannot produce one universal Rust archive' "$universal_log"
           elif [ "$RUNNER_OS" = "Linux" ]; then
+            # A package manager may expose fetched dependencies read-only. Cargo normally
+            # creates an uncommitted library lockfile beside a workspace manifest, so this
+            # proves the integration stages its Cargo project in the writable build tree
+            # and leaves the source checkout untouched.
+            readonly_source="$RUNNER_TEMP/fourdgs-read-only-source"
+            mkdir -p "$readonly_source"
+            git archive HEAD | tar -x -C "$readonly_source"
+            chmod -R a-w "$readonly_source"
+            cmake -S "$readonly_source/cpp" -B "$RUNNER_TEMP/fourdgs-read-only-build" \
+              -DCMAKE_BUILD_TYPE="$consumer_config" \
+              -DFOURDGS_BUILD_CORE_FROM_SOURCE=ON \
+              -DFOURDGS_BUILD_TESTS=OFF \
+              -DFOURDGS_BUILD_CONFORMANCE=OFF
+            cmake --build "$RUNNER_TEMP/fourdgs-read-only-build" --target fourdgs-cpp -j
+            test ! -e "$readonly_source/Cargo.lock"
+
             # Compiler modes such as -m32 change the target ABI without setting any of
             # CMake's target selectors. Static-library try-compiles let CMake detect the
             # 32-bit pointer width without requiring multilib runtime libraries merely to
@@ -788,6 +804,15 @@ jobs:
             # slash-normalized destination instead of emitting an invalid escape.
             install_libdir="$RUNNER_TEMP/fourdgs:install\\path/lib"
             consumer_generator=(-G Ninja)
+
+            # Prebuilt archives are commonly selected through a stable relative symlink.
+            # Installing only that link would leave it dangling in the relocated package;
+            # the install must carry the real archive bytes instead.
+            symlink_core="$RUNNER_TEMP/fourdgs-symlink-core"
+            mkdir -p "$symlink_core/actual"
+            cp "$core" "$symlink_core/actual/libfourdgs.a"
+            ln -s actual/libfourdgs.a "$symlink_core/libfourdgs.a"
+            core="$symlink_core/libfourdgs.a"
           fi
           cmake -S cpp -B "$RUNNER_TEMP/fourdgs-package" \
             -DCMAKE_BUILD_TYPE="$FOURDGS_CMAKE_CONFIG" \

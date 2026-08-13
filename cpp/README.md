@@ -89,7 +89,9 @@ while the major version is 0 the minor is the compatibility boundary, so a build
 not handed 0.2. The exported target is `fourdgs::fourdgs-cpp` and `fourdgs::cpp` is defined beside
 it, so either name links whichever way the package arrived. The installed package includes the
 static Rust core it was built against; downstream `find_package` consumers need neither this source
-tree nor Cargo, and the core path stays valid if the install prefix moves.
+tree nor Cargo, and the core path stays valid if the install prefix moves. If a prebuilt core was
+named through a symbolic link, installation copies the target archive rather than exporting a link
+whose relative target exists only in the build tree.
 
 ### How the core is obtained
 
@@ -98,6 +100,8 @@ contains that crate, and `FOURDGS_BUILD_CORE_FROM_SOURCE` defaults to `ON` for C
 `add_subdirectory` consumers. It runs the equivalent of
 `cargo rustc -p fourdgs --release --target <triple> --lib --crate-type staticlib` with an isolated
 target directory under the CMake build, then makes the C++ library depend on and link the result.
+The crate manifest and source are staged under that writable build directory as well, so Cargo's
+uncommitted library lockfile never mutates a fetched dependency and read-only source checkouts work.
 Selecting only the static library avoids making a cross build link the crate's unrelated `cdylib`
 with a Cargo linker configuration the CMake toolchain does not control. A native build derives the
 triple from `cargo -vV`; a cross build must name the toolchain's Rust triple with

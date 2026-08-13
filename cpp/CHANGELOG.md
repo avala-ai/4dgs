@@ -29,6 +29,9 @@ All notable changes to the C++ package are documented here, following
   effective destination for backslash-containing paths. An explicit top-level
   `FOURDGS_BUILD_CORE_FROM_SOURCE=ON` takes precedence over the repository's permissive no-core
   default, while an installed no-core package preserves an empty `fourdgs-cpp_CORE_LIBRARY` value.
+  The Cargo project is staged in the build tree so an absent lockfile never makes a read-only
+  fetched source fail, and installing a prebuilt core dereferences symbolic links so the relocated
+  package contains archive bytes rather than a dangling build-tree link.
 
 - **`keyframe-delta` encode** (spec §11):
   `fourdgs::encodeKeyframeDeltaSequence(samples, durationSec, options)`, with `KeyframeDeltaSample`

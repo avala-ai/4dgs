@@ -204,6 +204,17 @@ if(FOURDGS_BUILD_CORE_FROM_SOURCE AND FOURDGS_CORE_LIBRARY STREQUAL "")
     set(FOURDGS_CARGO_TARGET "${FOURDGS_CARGO_HOST_TARGET}")
   endif()
   set(FOURDGS_CORE_SOURCE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
+  # Cargo always places its lockfile beside the manifest, independently of
+  # CARGO_TARGET_DIR. A fetched dependency can be read-only and this repository
+  # intentionally does not commit a library lockfile, so invoking its workspace manifest
+  # would try to mutate the source checkout. Mirror the crate manifest and source into the
+  # CMake build tree instead. The manifest remains the crate's own single declaration of
+  # metadata and dependencies; configure_file also makes CMake regenerate the copy when it
+  # changes.
+  set(FOURDGS_CORE_CARGO_SOURCE_DIR "${CMAKE_CURRENT_BINARY_DIR}/rust-core-source")
+  file(MAKE_DIRECTORY "${FOURDGS_CORE_CARGO_SOURCE_DIR}")
+  configure_file("${FOURDGS_CORE_SOURCE_ROOT}/rust/fourdgs/Cargo.toml"
+                 "${FOURDGS_CORE_CARGO_SOURCE_DIR}/Cargo.toml" COPYONLY)
   set(FOURDGS_CORE_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/rust-core")
   if(MSVC)
     set(FOURDGS_GENERATED_CORE_LIBRARY
@@ -221,12 +232,14 @@ if(FOURDGS_BUILD_CORE_FROM_SOURCE AND FOURDGS_CORE_LIBRARY STREQUAL "")
       # Make/NMake jobserver descriptors are not portable through a custom-command shell;
       # clearing their hint lets Cargo manage its own parallelism instead of warning that
       # CMake advertised file descriptors it could not inherit. Ninja does not set it.
+      "${CMAKE_COMMAND}" -E copy_directory
+      "${FOURDGS_CORE_SOURCE_ROOT}/rust/fourdgs/src" "${FOURDGS_CORE_CARGO_SOURCE_DIR}/src"
+    COMMAND
       "${CMAKE_COMMAND}" -E env "CARGO_TARGET_DIR=${FOURDGS_CORE_TARGET_DIR}" "MAKEFLAGS="
       "${FOURDGS_CARGO_EXECUTABLE}" rustc --manifest-path
-      "${FOURDGS_CORE_SOURCE_ROOT}/Cargo.toml" --package fourdgs --release --target
+      "${FOURDGS_CORE_CARGO_SOURCE_DIR}/Cargo.toml" --package fourdgs --release --target
       "${FOURDGS_CARGO_TARGET}" --lib --crate-type staticlib
     DEPENDS
-      "${FOURDGS_CORE_SOURCE_ROOT}/Cargo.toml"
       "${FOURDGS_CORE_SOURCE_ROOT}/rust/fourdgs/Cargo.toml"
       ${FOURDGS_CORE_RUST_SOURCES}
     WORKING_DIRECTORY "${FOURDGS_CORE_SOURCE_ROOT}"
@@ -553,8 +566,17 @@ install(
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(DIRECTORY include/fourdgs DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 if(FOURDGS_HAVE_CORE)
-  get_filename_component(FOURDGS_CORE_LIBRARY_FILENAME "${FOURDGS_CORE_LIBRARY}" NAME)
-  install(FILES "${FOURDGS_CORE_LIBRARY}" DESTINATION ${FOURDGS_INSTALL_COREDIR})
+  set(FOURDGS_CORE_LIBRARY_TO_INSTALL "${FOURDGS_CORE_LIBRARY}")
+  # install(FILES) preserves a symbolic link but does not copy its target, which would make
+  # a relative prebuilt-core link dangle in the supposedly self-contained package. Generated
+  # source-build archives do not exist yet at configure time and are already real files; an
+  # existing prebuilt archive can safely be dereferenced now.
+  if(EXISTS "${FOURDGS_CORE_LIBRARY_TO_INSTALL}")
+    get_filename_component(FOURDGS_CORE_LIBRARY_TO_INSTALL
+                           "${FOURDGS_CORE_LIBRARY_TO_INSTALL}" REALPATH)
+  endif()
+  get_filename_component(FOURDGS_CORE_LIBRARY_FILENAME "${FOURDGS_CORE_LIBRARY_TO_INSTALL}" NAME)
+  install(FILES "${FOURDGS_CORE_LIBRARY_TO_INSTALL}" DESTINATION ${FOURDGS_INSTALL_COREDIR})
 else()
   set(FOURDGS_CORE_LIBRARY_FILENAME "")
 endif()
