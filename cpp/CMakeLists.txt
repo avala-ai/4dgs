@@ -243,12 +243,24 @@ if(FOURDGS_BUILD_CONFORMANCE)
 
   # The harness invokes a runner as a subprocess with a path, so the entry points live at a
   # fixed place it can name in one line. The decode runners print canonical JSON; the encode
-  # runner re-encodes a variant's gaussians and writes a file the encode gate diffs.
-  foreach(runner decode_streamed decode_indexed encode_roundtrip)
+  # runner re-encodes a variant's gaussians and writes a file the encode gate diffs; the
+  # keyframe-delta one synthesizes a sample sequence, because the model is a whole-file format
+  # with no decoded samples to hand back to a writer.
+  foreach(runner decode_streamed decode_indexed encode_roundtrip encode_keyframe_delta)
     add_executable(${runner} conformance/${runner}.cpp)
     target_link_libraries(${runner} PRIVATE fourdgs-canonical)
     fourdgs_pin_runtime_output(${runner} ${CMAKE_BINARY_DIR}/conformance)
   endforeach()
+
+  # `cpp/keyframe-delta-roundtrip.sh` requires the file this runner writes to equal, byte for
+  # byte, the one the Rust reference writer produces from the same synthesized samples. Both
+  # runners compute those samples from the same integer generator with IEEE double arithmetic,
+  # which is reproducible — unless the compiler contracts `a + b * c` into a fused multiply-add,
+  # which GCC does by default for C++ and which rounds once instead of twice. Off here, so the
+  # comparison is a statement about the binding rather than about a compiler's defaults.
+  if(NOT MSVC)
+    target_compile_options(encode_keyframe_delta PRIVATE -ffp-contract=off)
+  endif()
 endif()
 
 option(FOURDGS_BUILD_TOOL "Build the 4dgs command-line tool" ${FOURDGS_IS_TOP_LEVEL})

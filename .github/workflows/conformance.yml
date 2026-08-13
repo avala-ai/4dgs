@@ -224,6 +224,15 @@ jobs:
           cargo build -p fourdgs-conformance --release
           python tests/conformance/encode_roundtrip.py --encoder cpp
 
+      # keyframe-delta is the other encode surface, and the gate above cannot reach it: it
+      # re-encodes a corpus variant's decoded gaussians, and a keyframe-delta file yields no
+      # decoded sample sequence to hand back to a writer. Its own script synthesizes one and
+      # makes four claims about every file — fidelity against the population that went in,
+      # agreement between the C++ and Python decoders, the index's own counts, and byte
+      # identity with the Rust reference writer, which is what a binding's claim actually is.
+      - name: The binding encodes keyframe-delta sequences the reference agrees with
+        run: cpp/keyframe-delta-roundtrip.sh
+
   dart:
     runs-on: ubuntu-latest
     needs: corpus
