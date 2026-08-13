@@ -433,15 +433,13 @@ If decoding fails without one — a truncated transport, an I/O error, an ordina
 runner prints no refusal document, writes its diagnosis to stderr and exits non-zero. In particular,
 `{"refused": ""}` is not the representation of an unnamed error: it exits zero and therefore claims
 the runner produced a valid answer, even though the empty string is not an identifier the format
-defines. The Rust and C++ runners preserve this split, and so do the TypeScript, Swift and Dart
-ones: each answers only for an error its package names with a refusal identifier, and writes
-anything else to stderr with a non-zero exit. Python currently does not: its two entry points catch
-their package error type, substitute `""` for a missing code and exit zero. An empty identifier
-matches none of today's invalid expectations, so it is red there, but the same handling
-misclassifies an unnamed decoder error as an answered refusal. That is a runner defect
-([#208](https://github.com/avala-ai/4dgs/issues/208)), not an alternative protocol. An outside
-implementation that cannot name a decoder error must fail the invocation rather than copy those
-empty refusals.
+defines. All six built-in runners preserve this split: each answers only for an error its package
+names with a refusal identifier, and writes anything else to stderr with a non-zero exit. The
+handling that does not — catching the package's error type, substituting `""` for a missing code and
+exiting zero — misclassifies an unnamed decoder error as an answered refusal. An empty identifier
+matches none of today's invalid expectations, so it is red there, but the misclassification is a
+runner defect, not an alternative protocol. An outside implementation that cannot name a decoder
+error must fail the invocation rather than copy those empty refusals.
 
 For built-ins, whether any of this runs is gated at family granularity by `REFUSAL_FAMILIES`, which
 today holds every built-in family: `python`, `rust`, `typescript`, `cpp`, `swift` and `dart`. None
