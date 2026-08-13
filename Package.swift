@@ -100,6 +100,14 @@ let package = Package(
         .executableTarget(
             name: "encode_roundtrip", dependencies: ["FourDGS"], path: "swift/conformance/encode_roundtrip"),
 
+        // The same direction for the other temporal model. Separate because it produces a
+        // sequence of populations rather than re-encoding one scene, and because its gate
+        // grades it differently: there is no second keyframe-delta encoder here to diff
+        // against, so the claim is made against the Python reference's decode.
+        .executableTarget(
+            name: "encode_keyframe_delta", dependencies: ["FourDGS"],
+            path: "swift/conformance/encode_keyframe_delta"),
+
         // Prints the canonical JSON for a scene built from a fixed seed, with no decoding
         // involved, so that the Swift emitter can be diffed against canonical.py before
         // there is a decoder. See swift/conformance/selftest.py.

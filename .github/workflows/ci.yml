@@ -191,7 +191,7 @@ jobs:
           size_kb=$(du -s dart | cut -f1)
           echo "dart: ${size_kb} KiB"
           [ "$size_kb" -le 1472 ] || { echo "::error::dart is ${size_kb} KiB, over the 1472 KiB budget"; exit 1; }
-      - name: Swift sources under 640 KB
+      - name: Swift sources under 704 KB
         # Sources only, same as TypeScript's: this job builds nothing, so .build is not
         # here to measure and a vendored dependency would show up as a budget failure.
         # Raised from 300 to 448 KiB for `4dgs`, the inspect-and-validate tool: the
@@ -200,10 +200,16 @@ jobs:
         # are new files in new directories; 384 against 300 is not a rounding error.
         # Raised to 640 KiB for its bounded physical-state validation and adversarial tests;
         # those checks take Swift to 556 KiB under the same block-counting command.
+        # Raised from 640 to 704 KiB for keyframe-delta encode: the writer's public surface,
+        # the seam that carries a whole sample sequence across the C ABI, the unit suite, and
+        # the conformance sequence runner. Swift measures 676 KiB after them, so 704 is the
+        # next step that leaves 28 KiB — a budget with no headroom is an exact-size assertion
+        # in all but name, which the raises above exist not to be. What this gate is for is a
+        # vendored dependency appearing, not deliberate growth being noticed twice.
         run: |
           size_kb=$(du -s swift | cut -f1)
           echo "swift: ${size_kb} KiB"
-          [ "$size_kb" -le 640 ] || { echo "::error::swift is ${size_kb} KiB, over the 640 KiB budget"; exit 1; }
+          [ "$size_kb" -le 704 ] || { echo "::error::swift is ${size_kb} KiB, over the 704 KiB budget"; exit 1; }
 
   no-committed-binaries:
     # The corpus is generated. A committed .4dgs means someone bypassed the generator.
