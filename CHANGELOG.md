@@ -36,6 +36,8 @@ hand-kept index of the same thing, so that the log is readable without leaving t
 | 2026-07-29 | Rust `fourdgs`   | 0.1.0   | [releases/rust/v0.1.0](https://github.com/avala-ai/4dgs/releases/tag/releases%2Frust%2Fv0.1.0)     |
 | 2026-07-29 | Python `fourdgs` | 0.2.0   | [releases/python/v0.2.0](https://github.com/avala-ai/4dgs/releases/tag/releases%2Fpython%2Fv0.2.0) |
 | 2026-07-29 | Rust `fourdgs`   | 0.2.0   | [releases/rust/v0.2.0](https://github.com/avala-ai/4dgs/releases/tag/releases%2Frust%2Fv0.2.0)     |
+| 2026-08-13 | Python `fourdgs` | 0.4.0   | [releases/python/v0.4.0](https://github.com/avala-ai/4dgs/releases/tag/releases%2Fpython%2Fv0.4.0) |
+| 2026-08-13 | Rust `fourdgs`   | 0.5.0   | [releases/rust/v0.5.0](https://github.com/avala-ai/4dgs/releases/tag/releases%2Frust%2Fv0.5.0)     |
 
 `fourdgs 0.0.1` on PyPI, `fourdgs 0.0.1` on crates.io and `@4dgs/core`, `@4dgs/browser`,
 `@4dgs/nodejs` and `@4dgs/codecs` at `0.0.1` on npm are name reservations, published by hand before
@@ -46,8 +48,7 @@ The TypeScript packages are at 0.5.0 in this repository and have written 0.1.0 t
 changelog sections, and are absent from the log above because nothing beyond the 0.0.1 name
 reservation has been published: the release job's OIDC exchange has no trusted publisher to exchange
 with on npm. The tag will be pushed when it can publish, which is the only thing that puts a line
-here. Python 0.4.0 and Rust 0.5.0 follow the same rule — version constants and changelog sections
-land on `main` first; tags and registry lines come after.
+here.
 
 Dart is at 0.1.0 and has the same shape of wait for a different reason: pub.dev will not accept an
 automated publish for a package that does not exist, so `fourdgs` has to be claimed once by hand

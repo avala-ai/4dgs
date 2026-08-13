@@ -986,6 +986,143 @@ int fourdgs_scene_object_states_json(fourdgs_scene *scene, const char **out, siz
  */
 void fourdgs_string_free(const char *data, size_t length);
 
+/* ---------------------------------------------------------------------------
+ * Encoding a keyframe-delta file
+ *
+ * fourdgs_writer_* authors a gaussian-birth file — one population whose gaussians each
+ * carry their own birth time — and there is no way through it to say what this model is
+ * for: the same population, with identity, restated at a sequence of instants. So this is
+ * a second writer handle rather than a mode on the first, for the same reason a Delta
+ * Chunk is its own record and not a flag on Chunk (spec 5.18).
+ *
+ * The arithmetic stays in the core. A delta is a DIFFERENCE OF BINS, never a quantization
+ * of a difference (spec 11.7), which holds only if every sample is quantized up front on
+ * one set of grids derived from the whole sequence. So samples are accumulated by the
+ * handle and encoded in one pass at the end: a binding that assembled deltas itself would
+ * be a second encoder with its own rounding, and its files would not match the reference
+ * byte for byte.
+ *
+ * Two counting rules follow from that and catch implementers reading only the record
+ * layout: the Header's `gaussian_count` under this model is the number of DISTINCT ids
+ * across the sequence, not a sum over chunks; and a delta's update count counts
+ * OPERATIONS, not the population.
+ *
+ * The encoded buffer is the same owned fourdgs_buffer the gaussian-birth writer returns.
+ *
+ * TYPICAL USE
+ *
+ *     fourdgs_kd_writer *writer = fourdgs_kd_writer_new();
+ *     fourdgs_kd_writer_set_duration(writer, 1.0);
+ *     for (uint32_t i = 0; i < frames; i++)
+ *         fourdgs_kd_writer_add_sample(writer, i / (double)frames, count, ids,
+ *                                      positions, scales, rotations, colors,
+ *                                      motions, mu_t, sigma_t, win_lo, win_hi);
+ *
+ *     fourdgs_buffer *out = NULL;
+ *     if (fourdgs_kd_writer_encode(writer, &out) == FOURDGS_STATUS_OK) {
+ *         fwrite(fourdgs_buffer_data(out), 1, fourdgs_buffer_len(out), file);
+ *         fourdgs_buffer_free(out);
+ *     } else {
+ *         fprintf(stderr, "%s\n", fourdgs_last_error());
+ *     }
+ *     fourdgs_kd_writer_free(writer);
+ * ------------------------------------------------------------------------- */
+
+/** A sample sequence being assembled for encoding. Free with fourdgs_kd_writer_free. */
+typedef struct fourdgs_kd_writer fourdgs_kd_writer;
+
+/**
+ * Create an empty keyframe-delta writer with the reference encoder's defaults — a keyframe
+ * every 8 samples, chained deltas, the "default" bound profile, a 0.05 cutoff and deflate
+ * at level 6 — or null on allocation failure.
+ */
+fourdgs_kd_writer *fourdgs_kd_writer_new(void);
+
+/** Release a keyframe-delta writer. Null is ignored. */
+void fourdgs_kd_writer_free(fourdgs_kd_writer *writer);
+
+/**
+ * Scene length in seconds. The last sample's interval ends here, so this is what closes
+ * the tiling the model requires (spec 11.1) rather than a separate advisory field.
+ */
+int fourdgs_kd_writer_set_duration(fourdgs_kd_writer *writer, double duration_sec);
+
+/** The Header's marginal visibility threshold, as on fourdgs_writer_set_cutoff. */
+int fourdgs_kd_writer_set_cutoff(fourdgs_kd_writer *writer, double cutoff);
+
+/**
+ * Cadence and reference mode. `keyframe_every` is samples per group of pictures; 1 writes
+ * every sample as a keyframe, which is legal. `delta_mode` is 0 for keyframe-referenced
+ * and 1 for chained (spec 11.4) — any other value is FOURDGS_STATUS_INVALID_ARGUMENT
+ * rather than a file no reader would accept.
+ */
+int fourdgs_kd_writer_set_cadence(fourdgs_kd_writer *writer, uint32_t keyframe_every,
+                                  uint8_t delta_mode);
+
+/**
+ * Force a keyframe at one sample index, beyond whatever the cadence would place. Call once
+ * per index; order does not matter and a repeat is harmless.
+ */
+int fourdgs_kd_writer_add_keyframe_at(fourdgs_kd_writer *writer, uint32_t sample_index);
+
+/**
+ * The bound profile the whole sequence is quantized against, and the Header's `profile`:
+ * "fine", "default" or "coarse". A (pointer, length) UTF-8 string. Unlike the
+ * gaussian-birth writer, where the Header's `profile` is a free-form promise separate from
+ * the bounds, these are one value under this model — the grids come from it.
+ */
+int fourdgs_kd_writer_set_profile(fourdgs_kd_writer *writer, const char *data, size_t length);
+
+/** The Header's `library`. Same string convention. */
+int fourdgs_kd_writer_set_library(fourdgs_kd_writer *writer, const char *data, size_t length);
+
+/** The stream codec and its level, applied to every chunk's block. Default: deflate at 6. */
+int fourdgs_kd_writer_set_compression(fourdgs_kd_writer *writer, uint8_t codec, uint32_t level);
+
+/**
+ * Append one sample: a population, at one instant, with identity.
+ *
+ * `ids` is aligned with the gaussian columns and is what a delta names them by (spec 11.2).
+ * It is required rather than derived from row order, because the model rests on
+ * correspondence between samples and row order asserts none.
+ *
+ * The columns are copied. Widths are per gaussian, exactly as
+ * fourdgs_writer_set_gaussians: `positions`, `scales` and `motions` are three floats each,
+ * `rotations` and `colors` four, and `mu_t`, `sigma_t`, `win_lo` and `win_hi` one. A null
+ * column — or a null `ids` — is an error unless `count` is zero.
+ *
+ * Samples are appended in time order and must tile the timeline: sample i covers
+ * [t0_i, t0_{i+1}), the first starts at 0 and the last ends at the duration (spec 11.1).
+ * The encoder derives each t1 from the next sample's t0 and does NOT check the endpoints —
+ * that is the caller's to meet, and a sequence that misses it produces a file the indexed
+ * read path refuses as "non-tiling-chunks" while the streamed path accepts it.
+ *
+ * Every sigma_t must be finite. The format allows +inf for a gaussian that never fades and
+ * this reference encoder does not write one; a non-finite value is refused at encode.
+ *
+ * Spherical harmonics are not carried; a file written here declares sh_degree 0.
+ */
+int fourdgs_kd_writer_add_sample(fourdgs_kd_writer *writer, double t0, uint32_t count,
+                                 const uint32_t *ids, const float *positions,
+                                 const float *scales, const float *rotations,
+                                 const float *colors, const float *motions, const float *mu_t,
+                                 const float *sigma_t, const float *win_lo,
+                                 const float *win_hi);
+
+/** How many samples have been appended. 0 for a null writer. */
+uint32_t fourdgs_kd_writer_sample_count(const fourdgs_kd_writer *writer);
+
+/**
+ * Encode the appended sequence into an owned buffer, freed with fourdgs_buffer_free.
+ *
+ * On failure `out` is untouched and fourdgs_last_error names the reason: an empty
+ * sequence, a sample whose id count does not match its gaussian count, a non-finite
+ * sigma_t, or a gaussian whose sigma_t or window changes inside a group — the last refused
+ * rather than written, because those values ARE the grid a bin difference is taken on
+ * (spec 11.5) and a file carrying one decodes silently into a wrong velocity.
+ */
+int fourdgs_kd_writer_encode(fourdgs_kd_writer *writer, fourdgs_buffer **out);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
