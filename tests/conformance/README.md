@@ -62,9 +62,21 @@ A refusal is a **result, not a crash**: the runner prints `{"refused": "<id>"}` 
 correctly" and "fell over" into one outcome, and those are exactly what this corpus exists to tell
 apart.
 
-An exception carrying no identifier prints an empty one, which matches no expectation and fails with
-a readable diff. A refusal a library cannot name is one the suite cannot check, and it should look
-like a gap rather than a pass.
+That answer is for a refusal the reader can **name**. Everything else a decode can fail with — a
+truncated transport, an I/O error, an ordinary parse failure the vocabulary registers no identifier
+for — is not an answer at all: the runner prints no refusal document, writes its diagnosis to
+stderr, and exits non-zero. The harness reports that as a failed invocation naming the runner and
+the variant. All six runners here split it exactly there — each answers only for an error its own
+package names with a refusal identifier — and a runner from outside is held to the same split.
+
+`{"refused": ""}` is the tempting middle, and it is not the representation of an unnamed error. The
+empty string is not an identifier this format defines, yet exiting 0 with it claims the runner
+produced a valid answer. It is red today, because no expectation carries it — but the diff blames a
+mismatched identifier for what is really a runner that could not name its own error, the harness can
+no longer tell "refused for a reason nobody named" from "refused for the wrong reason", and
+`run.py --update` writes whatever a runner prints without parsing it, so an empty identifier can be
+committed as the contract every other implementation is then scored against. A refusal a library
+cannot name is one the suite cannot check: fail the invocation rather than answer it.
 
 `REFUSAL_FAMILIES` in `run.py` lists the families whose runners answer these. A family absent from
 it skips the invalid corpus exactly as it would skip any variant it declines, and the feature matrix

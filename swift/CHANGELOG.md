@@ -35,8 +35,13 @@ All notable changes to the Swift package are documented here, following
 
   Proved by `swift/keyframe-delta-roundtrip.sh`, which writes five sequences and requires the Python
   reference and both Swift read paths to agree on every one; four of them are the corpus generator's
-  own sequences and are additionally held to the committed corpus's population and geometry.
-  Spherical harmonics are not carried, so a file written this way declares `sh_degree` 0.
+  own sequences — the encoder declares which, so a name that drifts is a failure rather than a
+  comparison that quietly stops running — and are additionally held to the committed corpus's
+  population and geometry. Every written file is also held to its own chunk index: the counts an
+  entry declares are not consulted by any reader that composes the chunks it names, so a binding
+  that swapped a delta's operation count for its live population would otherwise reconstruct
+  identically everywhere and still misstate what a seek costs. Spherical harmonics are not carried,
+  so a file written this way declares `sh_degree` 0.
 
 - `4dgs`, the inspect-and-validate tool, turning the Swift cell of that row from Planned to Yes;
   TypeScript, Rust, C++ and Dart still read Planned. `4dgs inspect` walks a file record by record —

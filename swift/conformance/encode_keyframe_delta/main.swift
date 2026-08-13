@@ -16,7 +16,7 @@
 // produced them.
 //
 // Usage: encode_keyframe_delta <out-dir>
-//        prints one `name<TAB>note` line per file written.
+//        prints one `name<TAB>corpus|swift-only<TAB>note` line per file written.
 
 import FourDGS
 import Foundation
@@ -117,18 +117,31 @@ extension Array {
     }
 }
 
-/// `(file name, samples, cadence, delta mode)`. The first four names are the corpus's, so the
-/// gate compares them with `tests/conformance/data/keyframe/<name>.json`.
-let variants: [(name: String, samples: [KeyframeDeltaSample], keyframeEvery: UInt32, mode: DeltaMode)] = [
-    ("KeyframeOnly-UseChunkIndex-UseCrc-UseStatistics", churnSequence(), 1, .chained),
-    ("KeyframeDelta-UseChunkIndex-UseCrc-UseStatistics", driftSequence(), 4, .chained),
-    ("KeyframeDeltaChurn-UseChunkIndex-UseCrc-UseStatistics", churnSequence(), 4, .chained),
-    (
-        "KeyframeDeltaModesMixed-UseChunkIndex-UseCrc-UseStatistics", churnSequence(), 4,
-        .keyframeReferenced
-    ),
-    ("SwiftMultiWindow", multiWindowSequence(), 4, .chained),
-]
+/// `(file name, in corpus, samples, cadence, delta mode)`.
+///
+/// `inCorpus` is the claim the gate holds this variant to, and it is stated here rather than
+/// inferred from whether `tests/conformance/data/keyframe/<name>.json` happens to exist. A
+/// name is the only thing joining a variant to its expectation, and a name that drifts —
+/// renamed here, renamed there, a flag added to the corpus's cross-product — would otherwise
+/// turn the corpus comparison off silently and leave the gate reporting agreement. Declared,
+/// a drift is a missing expectation for a variant that said it had one, which is a failure.
+let variants:
+    [(
+        name: String, inCorpus: Bool, samples: [KeyframeDeltaSample], keyframeEvery: UInt32,
+        mode: DeltaMode
+    )] = [
+        ("KeyframeOnly-UseChunkIndex-UseCrc-UseStatistics", true, churnSequence(), 1, .chained),
+        ("KeyframeDelta-UseChunkIndex-UseCrc-UseStatistics", true, driftSequence(), 4, .chained),
+        (
+            "KeyframeDeltaChurn-UseChunkIndex-UseCrc-UseStatistics", true, churnSequence(), 4,
+            .chained
+        ),
+        (
+            "KeyframeDeltaModesMixed-UseChunkIndex-UseCrc-UseStatistics", true, churnSequence(), 4,
+            .keyframeReferenced
+        ),
+        ("SwiftMultiWindow", false, multiWindowSequence(), 4, .chained),
+    ]
 
 func fail(_ message: String) -> Never {
     FileHandle.standardError.write(Data("encode_keyframe_delta: \(message)\n".utf8))
@@ -168,7 +181,8 @@ for variant in variants {
         fail("\(variant.name): \(error)")
     }
     print(
-        "\(variant.name)\t\(variant.samples.count) samples, cadence \(variant.keyframeEvery), "
+        "\(variant.name)\t\(variant.inCorpus ? "corpus" : "swift-only")\t"
+            + "\(variant.samples.count) samples, cadence \(variant.keyframeEvery), "
             + "\(variant.mode == .chained ? "chained" : "keyframe-referenced"), \(bytes.count) bytes"
     )
 }
