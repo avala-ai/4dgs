@@ -7,13 +7,19 @@
 # `tests/conformance/encode_roundtrip.py` is the gate for the gaussian-birth writer, and it
 # has a known blind spot (#189): it proves two encoders agree, not that either preserved the
 # scene, so a fault present in both passes. A keyframe-delta file has no second encoder here
-# at all, so this script makes three separate claims about every sequence it writes.
+# at all, so this script makes four separate claims about every sequence it writes.
 #
 # **Fidelity.** The written file, decoded by the *Python* reference, is compared lane by lane
 # against the population that went in, against the error bounds the written file itself
 # declares. This is the claim no amount of decoder agreement can make: an encoder that
 # displaced every position or doubled every velocity produces a file every decoder reads the
 # same way, and it is wrong.
+#
+# **Index counts.** What the chunk index and the Statistics record declare, against the
+# records they describe and against the samples the file was written from. No reconstruction
+# can make this claim: every summary below takes the population off the *composed* state, so
+# an entry that swapped its operation count for its live population reads back identically
+# everywhere and still misstates what a seek costs. See "the counting rules" below.
 #
 # **Agreement.** Python and TypeScript each decode the result on both read paths, and all
 # four canonical summaries must be identical. The two read paths fail differently — the
@@ -362,5 +368,13 @@ PY
   checked=$((checked + 1))
   echo "  $name"
 done <"$out/written.txt"
+
+# An encoder that wrote nothing walks straight through the loop above and reaches the summary
+# line below, which then reports zero of everything in the same shape as a pass. A gate that
+# compared nothing has not proved anything, so it says so and exits non-zero.
+[ "$checked" -gt 0 ] || {
+  echo "::error::no keyframe-delta sequences were written"
+  exit 1
+}
 
 echo "$checked sequences written by TypeScript; every one inside the bounds it declares against its source, and both decoders agree on it, both read paths"
