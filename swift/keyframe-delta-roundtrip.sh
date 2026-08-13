@@ -74,6 +74,17 @@ while IFS=$'\t' read -r name in_corpus note; do
   [ -n "$name" ] || continue
   file="$out/$name.4dgs"
 
+  # The encoder declares exactly one of these two relationships. Treating every other
+  # token as Swift-only would make a misspelling on a genuinely Swift-only variant pass
+  # in the same shape as the declaration this gate is meant to enforce.
+  case "$in_corpus" in
+  corpus | swift-only) ;;
+  *)
+    echo "::error::$name: unknown corpus declaration '$in_corpus'; expected corpus or swift-only"
+    exit 1
+    ;;
+  esac
+
   # The counts the chunk index declares, against the records it points at (#195). First,
   # before anything decodes the file, because this is the claim about the file itself.
   #
