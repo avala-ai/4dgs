@@ -5,9 +5,20 @@ cmake_minimum_required(VERSION 3.20)
 project(fourdgs-consumer LANGUAGES CXX)
 
 option(FOURDGS_USE_INSTALLED_PACKAGE "Use find_package instead of fetching the source" OFF)
+option(FOURDGS_EXPECT_NO_CORE_PACKAGE "Require an installed package with no Rust core" OFF)
 
 if(FOURDGS_USE_INSTALLED_PACKAGE)
   find_package(fourdgs-cpp CONFIG REQUIRED)
+  if(FOURDGS_EXPECT_NO_CORE_PACKAGE)
+    if(fourdgs-cpp_HAVE_CORE)
+      message(FATAL_ERROR "The consumer expected an installed package without a Rust core")
+    endif()
+    if(NOT "${fourdgs-cpp_CORE_LIBRARY}" STREQUAL "")
+      message(
+        FATAL_ERROR
+          "A no-core package exported fourdgs-cpp_CORE_LIBRARY=${fourdgs-cpp_CORE_LIBRARY}")
+    endif()
+  endif()
 else()
   include(FetchContent)
 

@@ -622,6 +622,15 @@ jobs:
           ctest --test-dir cpp/build-nocore --build-config "$FOURDGS_CMAKE_CONFIG" \
             --output-on-failure --timeout 120
 
+          # The package's public sentinel remains empty after configure_package_config_file;
+          # a directory path here would make a no-core install look linkable to consumers.
+          cmake --install cpp/build-nocore --prefix "$RUNNER_TEMP/fourdgs-nocore-install" \
+            --config "$FOURDGS_CMAKE_CONFIG"
+          cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-nocore-consumer" \
+            -DFOURDGS_USE_INSTALLED_PACKAGE=ON \
+            -DFOURDGS_EXPECT_NO_CORE_PACKAGE=ON \
+            -Dfourdgs-cpp_DIR="$RUNNER_TEMP/fourdgs-nocore-install/lib/cmake/fourdgs-cpp"
+
       - name: Build and test against the core
         run: |
           cargo build -p fourdgs --release
@@ -648,6 +657,16 @@ jobs:
             # workflow's top-level Release workaround, proves the CRTs agree.
             consumer_config=Debug
           fi
+
+          # Top-level repository builds permit the no-core development configuration by
+          # default. An explicit source-build request must override that permissive fallback
+          # without requiring a second, non-obvious ALLOW_NO_CORE=OFF switch.
+          cmake -S cpp -B "$RUNNER_TEMP/fourdgs-top-level-source-opt-in" \
+            -DCMAKE_BUILD_TYPE="$consumer_config" \
+            -DFOURDGS_BUILD_CORE_FROM_SOURCE=ON \
+            -DFOURDGS_BUILD_TESTS=OFF \
+            -DFOURDGS_BUILD_CONFORMANCE=OFF
+
           cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-consumer" \
             -DCMAKE_BUILD_TYPE="$consumer_config" \
             -DFOURDGS_GIT_REPOSITORY="file://$GITHUB_WORKSPACE" \

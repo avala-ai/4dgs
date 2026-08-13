@@ -122,8 +122,10 @@ that requirement into Debug consumers too (`/MD`, not `/MDd`), because C++ strin
 the binding's public boundary and allocator mismatches are not link-only problems.
 
 `FOURDGS_BUILD_CORE_FROM_SOURCE=OFF` plus `FOURDGS_ALLOW_NO_CORE=ON` remains the deliberate
-no-decoder build: it compiles and every decode call returns `kNotImplemented`. The two options are
-mutually exclusive so a configuration cannot silently ask for both outcomes.
+no-decoder build: it compiles and every decode call returns `kNotImplemented`. Source-building is a
+stronger request than the permission to fall back to no core, so the repository's natural top-level
+opt-in is just `-DFOURDGS_BUILD_CORE_FROM_SOURCE=ON` even though `FOURDGS_ALLOW_NO_CORE` defaults on
+there. A Cargo failure still stops that build; it never silently falls back to the stub.
 
 ## Errors are returned, not thrown
 

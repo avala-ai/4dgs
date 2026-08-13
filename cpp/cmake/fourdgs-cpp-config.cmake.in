@@ -11,8 +11,15 @@
 # it at run time from an error code. Without a core the library still links and every call
 # returns ErrorCode::kNotImplemented — an honest build, but not a decoder.
 set(fourdgs-cpp_HAVE_CORE @FOURDGS_HAVE_CORE@)
-set(fourdgs-cpp_CORE_LIBRARY
-    "@PACKAGE_FOURDGS_INSTALL_COREDIR@/@FOURDGS_CORE_LIBRARY_FILENAME@")
+if(fourdgs-cpp_HAVE_CORE)
+  set(fourdgs-cpp_CORE_LIBRARY
+      "@PACKAGE_FOURDGS_INSTALL_COREDIR@/@FOURDGS_CORE_LIBRARY_FILENAME@")
+else()
+  # Preserve the public no-core sentinel. Appending an empty filename to the install
+  # directory would make this truthy and can cause a consumer to pass a directory to its
+  # linker even though HAVE_CORE correctly says this package has no decoder.
+  set(fourdgs-cpp_CORE_LIBRARY "")
+endif()
 
 # The Rust core is not a CMake package, so there is no find_dependency() to write for it.
 # It is installed beside this config, making an installed fourdgs-cpp package self-contained

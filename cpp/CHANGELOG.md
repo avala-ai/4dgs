@@ -26,7 +26,9 @@ All notable changes to the C++ package are documented here, following
   builds explicitly require a pre-combined core rather than silently linking one thin archive. MSVC
   Debug consumers inherit the Rust archive's `/MD` runtime, and absolute package library directories
   retain Windows drive syntax and legal POSIX colons while generated configs safely match CMake's
-  effective destination for backslash-containing paths.
+  effective destination for backslash-containing paths. An explicit top-level
+  `FOURDGS_BUILD_CORE_FROM_SOURCE=ON` takes precedence over the repository's permissive no-core
+  default, while an installed no-core package preserves an empty `fourdgs-cpp_CORE_LIBRARY` value.
 
 - **`keyframe-delta` encode** (spec §11):
   `fourdgs::encodeKeyframeDeltaSequence(samples, durationSec, options)`, with `KeyframeDeltaSample`

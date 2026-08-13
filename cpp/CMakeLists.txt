@@ -105,12 +105,12 @@ option(FOURDGS_BUILD_CORE_FROM_SOURCE
        "Build the Rust core with Cargo when no prebuilt FOURDGS_CORE_LIBRARY is supplied"
        ${FOURDGS_BUILD_CORE_FROM_SOURCE_DEFAULT})
 
-if(FOURDGS_BUILD_CORE_FROM_SOURCE AND FOURDGS_ALLOW_NO_CORE)
-  message(
-    FATAL_ERROR
-      "FOURDGS_BUILD_CORE_FROM_SOURCE and FOURDGS_ALLOW_NO_CORE are mutually exclusive: "
-      "choose a decoder built by Cargo, or the deliberate no-decoder binding")
-endif()
+# Building the core is a positive request; allowing no core is only permission to fall back
+# to the stub when no backend was requested or found. This distinction matters at the top
+# level, where ALLOW_NO_CORE defaults on: the natural explicit opt-in needs to be the one
+# switch `-DFOURDGS_BUILD_CORE_FROM_SOURCE=ON`, not that switch plus knowledge of a default
+# it must undo. If both are on, source-building therefore takes precedence and any Cargo
+# configuration/build failure remains fatal rather than silently selecting the stub.
 
 # Define the core build before resolving the backend so the generated archive is a normal
 # build dependency even though it does not exist at configure time. The output is isolated
