@@ -971,6 +971,136 @@ void main() {
       );
     });
 
+    test('per-band SH bounds compare as exact decimals', () async {
+      for (final String spelling in <String>[
+        '4.0',
+        '\u20094\u2009',
+        '0.${List<String>.filled(1000, '0').join()}4e1001',
+      ]) {
+        final FourdgsValidation equivalent = await validateFourdgs(
+          FourdgsBytes(
+            _minimal(
+              shDegree: 1,
+              shBitDepths: const <int>[5],
+              shBand1Bound: spelling,
+            ),
+          ),
+        );
+        expect(
+          equivalent.findings.where(
+            (FourdgsFinding finding) =>
+                finding.message.contains('`sh_band1` as'),
+          ),
+          isEmpty,
+          reason: spelling,
+        );
+      }
+
+      for (final String spelling in <String>[
+        '4.0000000000000001',
+        '\ufeff4\ufeff',
+      ]) {
+        final FourdgsValidation different = await validateFourdgs(
+          FourdgsBytes(
+            _minimal(
+              shDegree: 1,
+              shBitDepths: const <int>[5],
+              shBand1Bound: spelling,
+            ),
+          ),
+        );
+        expect(
+          different.findings.where(
+            (FourdgsFinding finding) =>
+                finding.message.contains('`sh_band1` as'),
+          ),
+          isNotEmpty,
+          reason: spelling,
+        );
+      }
+
+      for (final String spelling in <String>[
+        '8_0e-1',
+        '_+008_.0_00',
+        '٨',
+        '٨٠e-۱',
+      ]) {
+        final FourdgsValidation equivalentEight = await validateFourdgs(
+          FourdgsBytes(
+            _minimal(
+              shDegree: 1,
+              shBitDepths: const <int>[4],
+              shBand1Bound: spelling,
+            ),
+          ),
+        );
+        expect(
+          equivalentEight.findings.where(
+            (FourdgsFinding finding) =>
+                finding.message.contains('`sh_band1` as'),
+          ),
+          isEmpty,
+          reason: spelling,
+        );
+      }
+
+      for (final String spelling in <String>[
+        '0e999999999999999999',
+        '0e-1999999999999999997',
+        '0e+000000000000000000',
+        '0.0e1000000000000000000',
+        '0.00e-1999999999999999995',
+        '0.0_e1_000_000_000_000_000_000',
+        '0.0_e-1_999_999_999_999_999_995',
+      ]) {
+        final FourdgsValidation equivalentZero = await validateFourdgs(
+          FourdgsBytes(
+            _minimal(
+              shDegree: 1,
+              shBitDepths: const <int>[8],
+              shBand1Bound: spelling,
+            ),
+          ),
+        );
+        expect(
+          equivalentZero.findings.where(
+            (FourdgsFinding finding) =>
+                finding.message.contains('`sh_band1` as'),
+          ),
+          isEmpty,
+          reason: spelling,
+        );
+      }
+
+      for (final String spelling in <String>[
+        '0e1000000000000000000',
+        '0e-1999999999999999998',
+        '0e+0001000000000000000000',
+        '0.0e-1999999999999999997',
+        '0.0e-1_999_999_999_999_999_997',
+        '_',
+        '⁸',
+      ]) {
+        final FourdgsValidation malformedZero = await validateFourdgs(
+          FourdgsBytes(
+            _minimal(
+              shDegree: 1,
+              shBitDepths: const <int>[8],
+              shBand1Bound: spelling,
+            ),
+          ),
+        );
+        expect(
+          malformedZero.findings.where(
+            (FourdgsFinding finding) =>
+                finding.message.contains('`sh_band1` as'),
+          ),
+          isNotEmpty,
+          reason: spelling,
+        );
+      }
+    });
+
     test('a malformed SH-depth append remains visible to validation', () async {
       final FourdgsValidation report = await validateFourdgs(
         FourdgsBytes(_minimal(shDegree: 1, shBitDepths: const <int>[9])),
@@ -1895,6 +2025,7 @@ Uint8List _minimal({
   int gaussianCount = 0,
   bool writeWindowTable = true,
   List<int> shBitDepths = const <int>[],
+  String? shBand1Bound,
 }) {
   final BytesBuilder out =
       BytesBuilder()
@@ -1915,7 +2046,11 @@ Uint8List _minimal({
   out.add(
     _record(
       opQuantization,
-      _quantizationContent(scheme: scheme, shBitDepths: shBitDepths),
+      _quantizationContent(
+        scheme: scheme,
+        shBitDepths: shBitDepths,
+        shBand1Bound: shBand1Bound,
+      ),
     ),
   );
   if (writeWindowTable) {
@@ -3016,6 +3151,7 @@ Uint8List _headerContent({
 Uint8List _quantizationContent({
   String scheme = 'uniform-v1',
   List<int> shBitDepths = const <int>[],
+  String? shBand1Bound,
 }) {
   final BytesBuilder body = BytesBuilder()..add(_string(scheme));
   for (int i = 0; i < 3; i++) {
@@ -3024,9 +3160,17 @@ Uint8List _quantizationContent({
   for (int i = 0; i < 8; i++) {
     body.add(_f64(1.0)); // step_pos .. step_sigma_log
   }
+  body.addByte(1); // step_sh
+  final BytesBuilder bounds = BytesBuilder();
+  if (shBand1Bound != null) {
+    bounds
+      ..add(_string('sh_band1'))
+      ..add(_string(shBand1Bound));
+  }
+  final Uint8List boundsBytes = bounds.toBytes();
   body
-    ..addByte(1) // step_sh
-    ..add(_u32(0)); // empty bounds map
+    ..add(_u32(boundsBytes.length))
+    ..add(boundsBytes);
   if (shBitDepths.isNotEmpty) {
     body
       ..addByte(shBitDepths.length)
