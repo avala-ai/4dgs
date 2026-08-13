@@ -782,12 +782,12 @@ fn check_sh_bit_depths(quant: &rec::Quantization, sh_degree: u8, report: &mut Re
     for (i, bits) in declared.iter().enumerate() {
         let band = i + 1;
         let key = format!("sh_band{band}");
-        let expected = sh_bound(*bits).to_string();
+        let expected = sh_bound(*bits);
         match quant.bounds.get(&key) {
             None => report.warn(format!(
                 "Quantization declares {bits} bits for SH band {band} but no `{key}` bound (§5.3)"
             )),
-            Some(found) if *found != expected => report.warn(format!(
+            Some(found) if !decimal_equals_integer(found, expected) => report.warn(format!(
                 "Quantization declares `{key}` as {found}; {bits} bits gives a bound of {expected} (§6.5)"
             )),
             Some(_) => {}
@@ -801,6 +801,72 @@ fn check_sh_bit_depths(quant: &rec::Quantization, sh_degree: u8, report: &mut Re
             quant.step_sh
         ));
     }
+}
+
+/// Compare a finite decimal spelling with a small non-negative integer, without binary64.
+fn decimal_equals_integer(value: &str, expected: u8) -> bool {
+    let mut value = value.trim();
+    let negative = if let Some(rest) = value.strip_prefix('-') {
+        value = rest;
+        true
+    } else {
+        value = value.strip_prefix('+').unwrap_or(value);
+        false
+    };
+    let mut exponent_parts = value.split(['e', 'E']);
+    let mantissa = exponent_parts.next().unwrap_or_default();
+    let exponent = match exponent_parts.next() {
+        Some(part) if !part.is_empty() => part,
+        Some(_) => return false,
+        None => "0",
+    };
+    if exponent_parts.next().is_some() {
+        return false;
+    }
+
+    let mut digits = String::with_capacity(mantissa.len());
+    let mut integer_digits = 0usize;
+    let mut saw_decimal = false;
+    for byte in mantissa.bytes() {
+        match byte {
+            b'0'..=b'9' => {
+                digits.push(char::from(byte));
+                if !saw_decimal {
+                    integer_digits += 1;
+                }
+            }
+            b'.' if !saw_decimal => saw_decimal = true,
+            _ => return false,
+        }
+    }
+    if digits.is_empty() {
+        return false;
+    }
+    let Some(first_nonzero) = digits.bytes().position(|byte| byte != b'0') else {
+        return expected == 0;
+    };
+    if negative {
+        return false;
+    }
+
+    let significant = digits[first_nonzero..].trim_end_matches('0');
+    let expected = expected.to_string();
+    let required_exponent =
+        expected.len() as isize - integer_digits as isize + first_nonzero as isize;
+    significant == expected && decimal_integer_equals(exponent, required_exponent)
+}
+
+fn decimal_integer_equals(value: &str, expected: isize) -> bool {
+    let (negative, digits) = if let Some(rest) = value.strip_prefix('-') {
+        (true, rest)
+    } else {
+        (false, value.strip_prefix('+').unwrap_or(value))
+    };
+    let digits = digits.trim_start_matches('0');
+    if digits.is_empty() {
+        return expected == 0;
+    }
+    negative == expected.is_negative() && digits == expected.unsigned_abs().to_string()
 }
 
 /// A non-finite value spelled the way Python spells it, so that the two validators'
@@ -1068,6 +1134,51 @@ mod tests {
         let report = validate(&minimal_file(&grids()));
         assert!(report.ok(), "{:?}", errors(&report));
         assert!(errors(&report).is_empty(), "{:?}", errors(&report));
+    }
+
+    #[test]
+    fn per_band_sh_bounds_compare_as_exact_decimals() {
+        let huge_exponent = format!("0.{}8e1001", "0".repeat(1000));
+        for equivalent in ["8", "8.0", "0.8e1", "80e-1", "+008.000", &huge_exponent] {
+            assert!(decimal_equals_integer(equivalent, 8), "{equivalent}");
+        }
+        for different in [
+            "8.0000000000000001",
+            "7.9999999999999999",
+            "NaN",
+            "Infinity",
+            "8e999999999999999999999999",
+        ] {
+            assert!(!decimal_equals_integer(different, 8), "{different}");
+        }
+
+        let mut quant = grids();
+        quant.sh_bit_depths = vec![4];
+        quant.bounds.insert("sh_band1".into(), "8.0".into());
+        let mut equivalent = Report::default();
+        check_sh_bit_depths(&quant, 1, &mut equivalent);
+        assert!(
+            equivalent
+                .findings
+                .iter()
+                .all(|finding| !finding.message.contains("`sh_band1` as")),
+            "{:?}",
+            equivalent.findings
+        );
+
+        quant
+            .bounds
+            .insert("sh_band1".into(), "8.0000000000000001".into());
+        let mut different = Report::default();
+        check_sh_bit_depths(&quant, 1, &mut different);
+        assert!(
+            different
+                .findings
+                .iter()
+                .any(|finding| finding.message.contains("`sh_band1` as")),
+            "{:?}",
+            different.findings
+        );
     }
 
     #[test]
