@@ -496,6 +496,19 @@ void main() {
         patched,
       ).setFloat64(at + 8, double.infinity, Endian.little);
     }
+    // And the Header's duration with them, as the open-ended test above does. A
+    // scene whose last chunk runs to `+Infinity` while its Header still declares
+    // a finite end is not open-ended, it is a file whose chunks overrun the
+    // duration — `4dgs validate` says so, and so does Python's `open_indexed`.
+    // Leaving it finite was testing a file no writer produces, which is the same
+    // argument this test already makes about patching both interval copies.
+    const int durationAt = 61;
+    final ByteData view = ByteData.sublistView(patched);
+    expect(
+      view.getFloat64(durationAt, Endian.little),
+      result.sequence.header.durationSec,
+    );
+    view.setFloat64(durationAt, double.infinity, Endian.little);
 
     final reopened = decodeKeyframeDeltaIndexed(patched);
     expect(reopened.index.last.t1, double.infinity);

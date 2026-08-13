@@ -68,10 +68,31 @@ const Set<int> keyframeDeltaAbsoluteInUpdate = <int>{
   attrRotation,
 };
 
-/// Optional identity lanes use zero as the value for rows that predate the
-/// lane or whose birth omits it. Once a later group introduces one, the public
-/// column must still remain aligned with the complete composed population.
-const Set<int> _zeroDefaultIdentityAttributes = <int>{
+/// The attribute a row may lack and still have a value: §6.6 says a chunk that
+/// omits `object_id` "is read as though every gaussian in that chunk carried
+/// `0`". That is the only such rule in the specification, so it is the only
+/// lane that pads here — the composed column must still line up with the whole
+/// population, and zero is what §6.6 says fills it.
+///
+/// `source_group` and `source_index` were in this set and are not any more.
+/// §6.1 calls them optional, which says a file may omit the stream; it does not
+/// say what a composed column holds for a row whose birth omitted one, and no
+/// section supplies a value the way §6.6 does. Padding them made this SDK
+/// accept, and silently label `0`, a file that Python, Rust and Swift all
+/// refuse as `incomplete-birth` — one file with two meanings, which AGENTS.md
+/// rule 8 forbids. Whether the specification should give those two lanes a
+/// default is a question for the specification; until it does, this reads what
+/// is written.
+const Set<int> _zeroDefaultIdentityAttributes = <int>{attrObjectId};
+
+/// The optional identity lanes that reach the public API as their own arrays.
+///
+/// A different question from the one above, and it used to be answered by the
+/// same set — so narrowing that one to `object_id` quietly stopped `_population`
+/// from budgeting for the other two, which it still allocates. They are separate
+/// because they mean separate things: this one is "what does a composed
+/// population hand back", and that one is "what may a birth leave out".
+const Set<int> _publicIdentityAttributes = <int>{
   attrSourceGroup,
   attrSourceIndex,
   attrObjectId,
@@ -950,7 +971,11 @@ decodeKeyframeDeltaIndexed(Uint8List data) {
           '${index.length})',
     );
   }
-  checkTiling(index);
+  // With the duration, because §11.1 has two halves and this call took one. The reader
+  // accepted a file whose last chunk stops short of the Header's duration, which its own
+  // validator refuses and Python's `open_indexed` refuses; a player then seeks into the
+  // gap and `chainFor` throws mid-playback on a file this reader had already accepted.
+  checkTiling(index, durationSec: header.durationSec);
 
   final chunks = <KeyframeDeltaChunk>[];
   // Built once for the whole loop: every chain walk needs it, and rebuilding it
@@ -1751,7 +1776,7 @@ KeyframeDeltaPopulation _population(KeyframeDeltaState state, _Grids grids) {
   for (final column in state._bins.values) {
     bytesPerGaussian += column.channels * Int32List.bytesPerElement;
   }
-  for (final attribute in _zeroDefaultIdentityAttributes) {
+  for (final attribute in _publicIdentityAttributes) {
     if (state._bins.containsKey(attribute)) {
       bytesPerGaussian += Int32List.bytesPerElement;
     }
