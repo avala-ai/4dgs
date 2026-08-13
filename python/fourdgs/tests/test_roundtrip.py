@@ -117,6 +117,70 @@ class TestRoundTrip:
         assert intervals(0.05) == [(0.0, 1.0)]
         assert intervals(0.5) == [(0.0, 0.5)]
 
+    def test_chunk_plan_covers_support_after_temporal_quantization(self):
+        from fourdgs.indexed_reader import open_indexed
+        from fourdgs.readable import BytesReadable
+
+        scene = make_scene(n=1, windows=1, duration=1.0, never_fades_fraction=0.0)
+        scene.mu_t[:] = 0.2541
+        scene.sigma_t[:] = 0.2452
+        scene.win_lo[:] = 0.0
+        scene.win_hi[:] = 1.0
+        cutoff = math.exp(-0.5)
+
+        encoded = io.BytesIO()
+        fourdgs.write(
+            encoded,
+            scene,
+            1.0,
+            options=fourdgs.WriteOptions(cutoff=cutoff, max_depth=1, min_chunk_gaussians=1),
+        )
+        data = encoded.getvalue()
+        decoded = fourdgs.read(data)
+        indexed = open_indexed(BytesReadable(data))
+
+        assert scene.support(cutoff)[1][0] < 0.5
+        assert decoded.gaussians.mu_t[0] == pytest.approx(0.256)
+        assert decoded.gaussians.sigma_t[0] == pytest.approx(0.25002763)
+        assert decoded.gaussians.state_at(0.5, cutoff)["indices"].tolist() == [0]
+        assert len(indexed.chunks_for_time(0.5)) == 1
+
+    def test_inclusive_support_endpoint_does_not_enter_a_half_open_child(self):
+        from fourdgs.indexed_reader import open_indexed, read_chunk
+        from fourdgs.readable import BytesReadable
+
+        scene = make_scene(n=1, windows=1, duration=1.0, never_fades_fraction=0.0)
+        scene.mu_t[:] = 0.2541
+        scene.sigma_t[:] = 0.2452
+        cutoff = math.exp(-0.5)
+
+        seed = io.BytesIO()
+        fourdgs.write(seed, scene, 1.0, options=fourdgs.WriteOptions(cutoff=cutoff, max_depth=0))
+        seed_source = BytesReadable(seed.getvalue())
+        seed_index = open_indexed(seed_source)
+        reconstructed = read_chunk(seed_source, seed_index, seed_index.index[0])
+        boundary = float(reconstructed["mu_t"][0] + reconstructed["sigma_t"][0])
+        duration = 2.0 * boundary
+        scene.win_lo = np.array([0.0], dtype=np.float64)
+        scene.win_hi = np.array([duration], dtype=np.float64)
+
+        encoded = io.BytesIO()
+        fourdgs.write(
+            encoded,
+            scene,
+            duration,
+            options=fourdgs.WriteOptions(cutoff=cutoff, max_depth=1, min_chunk_gaussians=1),
+        )
+        data = encoded.getvalue()
+        source = BytesReadable(data)
+        indexed = open_indexed(source)
+        reconstructed = read_chunk(source, indexed, indexed.index[0])
+
+        assert reconstructed["mu_t"][0] + reconstructed["sigma_t"][0] == boundary
+        marginal = math.exp(-0.5 * ((boundary - reconstructed["mu_t"][0]) / reconstructed["sigma_t"][0]) ** 2)
+        assert marginal >= cutoff
+        assert len(indexed.chunks_for_time(boundary)) == 1
+
     @pytest.mark.parametrize("degree", [1, 2, 3])
     def test_spherical_harmonics_degrees(self, degree):
         out = roundtrip(make_scene(sh_degree=degree))

@@ -128,6 +128,34 @@ def _sh_depths(requested, bands: list[int]) -> dict[int, int]:
     return {band: depths[i] for i, band in enumerate(bands)}
 
 
+def _planning_support(q_mu, q_sigma, t_step, sigma_log_step, never_fades, windows, win_index, cutoff):
+    """Containment bounds for the temporal state the file reconstructs.
+
+    Chunk membership is an indexed-read promise, so it must cover the values a decoder
+    sees rather than the unquantized values the caller supplied. The marginal's upper
+    endpoint is inclusive (``marginal >= cutoff``), while a chunk's upper endpoint is not.
+    Advance that bound by one representable float when the marginal ends before the
+    validity window; if the window clips it first, ``win_hi`` is already exclusive.
+    """
+    # GaussianSet is the decoded public state and stores temporal values as f32. Plan
+    # against that representation, then widen for the support arithmetic, exactly as the
+    # encoder geometry gate and state_at do.
+    sigma = np.exp(np.asarray(q_sigma, dtype=np.float64) * sigma_log_step).astype(np.float32).astype(np.float64)
+    mu = (
+        (np.asarray(q_mu, dtype=np.float64) * np.asarray(t_step, dtype=np.float64))
+        .astype(np.float32)
+        .astype(np.float64)
+    )
+    half = np.where(never_fades, np.inf, support_k(cutoff) * sigma)
+    window_lo = np.asarray(windows, dtype=np.float64)[win_index, 0]
+    window_hi = np.asarray(windows, dtype=np.float64)[win_index, 1]
+    marginal_hi = mu + half
+    lo = np.maximum(mu - half, window_lo)
+    hi = np.minimum(marginal_hi, window_hi)
+    hi = np.where(marginal_hi < window_hi, np.nextafter(hi, np.inf), hi)
+    return lo, hi
+
+
 def _plan_chunks(lo, hi, tops, max_depth, min_gaussians):
     """Assign gaussians to nodes of a temporal interval tree.
 
@@ -407,7 +435,11 @@ def _encode(g: GaussianSet, duration_sec, opts, audio_sources, camera) -> bytes:
     tops = sorted({0.0, duration_sec} | {float(v) for w in table for v in w if 0.0 < v < duration_sec})
     if len(tops) < 2:
         tops = [0.0, max(duration_sec, 1e-9)]
-    lo, hi = g.support(opts.cutoff) if n else (np.zeros(0), np.zeros(0))
+    lo, hi = (
+        _planning_support(q_mu, q_sigma, t_step, steps.sigma_log, never_fades, table, win_index, opts.cutoff)
+        if n
+        else (np.zeros(0), np.zeros(0))
+    )
     plans = _plan_chunks(lo, hi, tops, opts.max_depth, opts.min_chunk_gaussians) if n else []
     if n and not plans:
         plans = [(tops[0], tops[-1], 0, np.arange(n))]

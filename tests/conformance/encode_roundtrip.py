@@ -1166,31 +1166,31 @@ def _diff(unaccounted: dict[str, tuple], left: str = "reference", right: str = "
 #: number, which is the difference between a known divergence and an unnoticed one.
 KNOWN_REFERENCE_DIVERGENCES = {
     (
-        "MixedLifetimes-CustomCutoff-UseChunkIndex-UseCrc",
+        "OneWindow-Quantized-UseChunkIndex-UseCrc",
         None,
         "chunkIntervals",
     ): (
-        "30834166acd73413c9ec7ddacc6659f5064664426dff349fee7ae706ce3e320b",
-        "ad2cf5ba91d371a5fb735bb5807685763cda67efd890f916d98fb36fd4721c58",
-        "#182(1): Python's _encode drops opts.cutoff and supports at 0.05; Rust passes it through",
+        "7fc12f4cc38623ae25e9c694a5f2d83349f998ba911110961a92984d0b7c3e4c",
+        "77e5ef9f232ecbc8502e3bea045fe1dcdc517b4cdecf0afb2155b94ae3c488a4",
+        "#182(1): Rust still plans from source lifetimes; Python plans from reconstructed lifetimes",
     ),
     (
-        "MixedLifetimes-CustomCutoff-UseChunkIndex-UseCrc",
+        "OneWindow-Quantized-UseChunkIndex-UseCrc",
         None,
         "statistics.chunkCount",
     ): (
-        "9df59c3d4c39c130062ef9655dac0f0c4179a19c69f40b8db0c0d0ff2c0cc11b",
-        "a04908f573e7a1c9b9f62563bb9a5188334fd250d76875e845de3f24c895eb4b",
-        "#182(1): the same dropped cutoff, counted — Python writes 24 chunks and Rust writes 27",
+        "d10a4bc9e0c1fa4e8f3d7ce2512b8756e47ca5fa451f373c39a1431bb88db49f",
+        "92e9e7e5922d26e17e48f0869ab25cc99499fdab722c065de8e0965c96c68e86",
+        "#182(1): the reconstructed-support mismatch counted — Python writes 5 chunks and Rust writes 6",
     ),
     (
-        "MixedLifetimes-CustomCutoff-UseChunkIndex-UseCrc",
+        "OneWindow-Quantized-UseChunkIndex-UseCrc",
         None,
         "index.chunkCount",
     ): (
-        "c2356069e9d1e79ca924378153cfbbfb4d4416b1f99d41a2940bfdb66c5319db",
-        "670671cd97404156226e507973f2ab8330d3022ca96e0c93bdbdb320c41adcaf",
-        "#182(1): the same dropped cutoff, as the index counts 24 chunks against 27",
+        "ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d",
+        "e7f6c011776e8db7cd330b54174fd76f7d0216b612387a5ffcfb81e6f0919683",
+        "#182(1): the reconstructed-support mismatch as the index counts 5 chunks against 6",
     ),
     **{
         (variant, None, "quantization.bounds"): (
