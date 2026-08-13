@@ -199,7 +199,8 @@ export interface SceneSummaryInput {
 export function summarize(input: SceneSummaryInput): unknown {
   const { header, gaussians, audioSources, chunkIntervals } = input;
   const n = gaussians.count;
-  const order = stableOrder(gaussians);
+  const contentKeys = stableKeys(gaussians);
+  const order = stableOrder(contentKeys);
   const sample = order.slice(0, SAMPLE);
 
   const rows = (array: Float32Array, width: number): (number | null)[][] =>
@@ -276,7 +277,7 @@ export function summarize(input: SceneSummaryInput): unknown {
     // before the layer existed. Membership alone is enough to report — a scene can
     // carry ids and no table.
     ...((input.objects != null && !input.objects.isEmpty) || gaussians.objectId !== null
-      ? objectsAndStates(header, gaussians, input.objects ?? null, order)
+      ? objectsAndStates(header, gaussians, input.objects ?? null, order, contentKeys)
       : {}),
     sh: summarizeSh(gaussians, order),
     sample: {
@@ -385,6 +386,7 @@ function objectsAndStates(
   gaussians: GaussianSet,
   objects: ObjectLayer | null,
   order: readonly number[],
+  contentKeys: readonly (readonly number[])[],
 ): Record<string, unknown> {
   const layer = objects ?? new ObjectLayerClass();
 
@@ -431,11 +433,25 @@ function objectsAndStates(
 
     const rowForIndex = new Map<number, number>();
     base.indices.forEach((index, row) => rowForIndex.set(index, row));
-    const sampleRows: number[] = [];
-    for (const index of order) {
-      const row = rowForIndex.get(index);
-      if (row !== undefined) sampleRows.push(row);
-      if (sampleRows.length === SAMPLE) break;
+    const liveIndices = order.filter((index) => rowForIndex.has(index));
+    const stateKeys = new Array<readonly number[] | undefined>(gaussians.count);
+    for (const index of liveIndices) {
+      stateKeys[index] = stateRowKey(base, rowForIndex.get(index)!);
+    }
+    liveIndices.sort((a, b) => {
+      const content = compareRows(contentKeys[a]!, contentKeys[b]!);
+      if (content !== 0) return content;
+      return compareRows(stateKeys[a]!, stateKeys[b]!);
+    });
+    const liveRows = liveIndices.map((index) => rowForIndex.get(index)!);
+    const sampleRows = liveRows.slice(0, SAMPLE);
+    const positionSum = [0, 0, 0];
+    let opacitySum = 0;
+    for (const row of liveRows) {
+      for (let axis = 0; axis < 3; axis++) {
+        positionSum[axis]! += base.centers[row * 3 + axis]!;
+      }
+      opacitySum += base.opacity[row]!;
     }
 
     const rows = (values: readonly number[], width: number): (number | null)[][] =>
@@ -445,14 +461,6 @@ function objectsAndStates(
         return out;
       });
 
-    const positionSum = [0, 1, 2].map((axis) => {
-      let total = 0;
-      for (let row = 0; row < base.indices.length; row++) total += base.centers[row * 3 + axis]!;
-      return num(total);
-    });
-    let opacitySum = 0;
-    for (const value of base.opacity) opacitySum += value;
-
     return {
       t: num(t),
       liveCount: String(base.indices.length),
@@ -461,7 +469,10 @@ function objectsAndStates(
         orientations: rows(base.orientations, 4),
         objectIds: sampleRows.map((row) => String(base.objectIds[row])),
       },
-      aggregate: { positionSum, opacitySum: num(opacitySum) },
+      aggregate: {
+        positionSum: positionSum.map((value) => num(value)),
+        opacitySum: num(opacitySum),
+      },
     };
   });
 
@@ -481,6 +492,23 @@ interface CanonicalObjectState {
   readonly orientations: number[];
   readonly opacity: number[];
   readonly objectIds: number[];
+}
+
+/** Portable secondary order over exactly the rounded values a state sample emits. */
+function stateRowKey(state: CanonicalObjectState, row: number): number[] {
+  const key: number[] = [];
+  for (const [values, width] of [
+    [state.centers, 3],
+    [state.orientations, 4],
+  ] as const) {
+    for (let axis = 0; axis < width; axis++) {
+      const rounded = num(values[row * width + axis]);
+      if (rounded === null) key.push(1, 0);
+      else key.push(0, rounded);
+    }
+  }
+  key.push(state.objectIds[row]!);
+  return key;
 }
 
 /**
@@ -664,11 +692,11 @@ function summarizeSh(gaussians: GaussianSet, order: readonly number[]): unknown 
  *
  * Chunking and spatial ordering are encoder choices, so decoded order is not part of the
  * contract — but a comparison needs some order. The key is the gaussian's whole decoded
- * state, rounded exactly as the summary rounds it, with its spherical harmonic
- * coefficients last. Two gaussians that tie on all of it are identical in every value
- * this summary emits, so their relative order cannot change the output.
+ * state, rounded exactly as the summary rounds it, with spherical harmonic coefficients
+ * and object membership last. Exact decoded values are deliberately not a tiebreaker:
+ * independently implemented decoders may differ in their last bits.
  */
-function stableOrder(gaussians: GaussianSet): number[] {
+function stableKeys(gaussians: GaussianSet): number[][] {
   const keys: number[][] = new Array<number[]>(gaussians.count);
   const shWidth = gaussians.sh === null ? 0 : gaussians.sh.coefficients * 3;
   for (let i = 0; i < gaussians.count; i++) {
@@ -682,12 +710,14 @@ function stableOrder(gaussians: GaussianSet): number[] {
     ] as const) {
       for (let k = 0; k < width; k++) row.push(sortable(array[i * width + k]!));
     }
-    row.push(
-      sortable(gaussians.muT[i]!),
-      sortable(gaussians.sigmaT[i]!),
-      sortable(gaussians.winLo[i]!),
-      sortable(gaussians.winHi[i]!),
-    );
+    for (const value of [
+      gaussians.muT[i]!,
+      gaussians.sigmaT[i]!,
+      gaussians.winLo[i]!,
+      gaussians.winHi[i]!,
+    ]) {
+      row.push(sortable(value));
+    }
     for (let k = 0; k < shWidth; k++) row.push(gaussians.sh!.values[i * shWidth + k]!);
     // Membership joins the key, after the harmonics and before the index tiebreak, exactly
     // where the Python and Rust references put it. Two gaussians can tie on every rounded
@@ -695,11 +725,15 @@ function stableOrder(gaussians: GaussianSet): number[] {
     // states composed from it, would be ordered by decode order, which differs between two
     // correct readers that chunked the scene differently.
     if (gaussians.objectId !== null) row.push(gaussians.objectId[i]!);
-    row.push(i);
     keys[i] = row;
   }
-  keys.sort(compareRows);
-  return keys.map((row) => row[row.length - 1]!);
+  return keys;
+}
+
+function stableOrder(keys: readonly (readonly number[])[]): number[] {
+  return Array.from({ length: keys.length }, (_, index) => index).sort(
+    (a, b) => compareRows(keys[a]!, keys[b]!) || a - b,
+  );
 }
 
 /**
