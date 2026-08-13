@@ -8,6 +8,17 @@ All notable changes to the C++ package are documented here, following
 
 ### Added
 
+- Out-of-tree CMake source consumers now build the Rust core automatically. CPM, FetchContent and
+  `add_subdirectory` checkouts default `FOURDGS_BUILD_CORE_FROM_SOURCE` on, invoke Cargo for only
+  the `fourdgs` crate in an isolated CMake build directory, and link the resulting static library
+  through an explicit target dependency. A prebuilt `FOURDGS_CORE_LIBRARY` still takes precedence,
+  and the intentional no-core build remains available explicitly. Installing the CMake package now
+  copies the selected core beside its targets and resolves it relative to the install prefix, so a
+  relocated `find_package(fourdgs-cpp)` consumer needs neither the original build tree nor Cargo. CI
+  proves the public path with a fresh out-of-tree FetchContent checkout that builds, links, and
+  crosses the C ABI without a prior repository core build. This completes issue #150's consumer
+  path; Swift and prebuilt release artifacts remain tracked together by #162.
+
 - **`keyframe-delta` encode** (spec §11):
   `fourdgs::encodeKeyframeDeltaSequence(samples, durationSec, options)`, with `KeyframeDeltaSample`
   — a `t0`, a `gaussian_id` stream and a `GaussianView`, all borrowed for the call — and

@@ -86,6 +86,79 @@ option(FOURDGS_ALLOW_NO_CORE
        "Configure without a decoder rather than failing when the core cannot be found"
        ${FOURDGS_ALLOW_NO_CORE_DEFAULT})
 
+# A fetched checkout contains the Rust crate but not its build artifact. In that shape the
+# least surprising package is one that asks Cargo to produce the core as part of the CMake
+# build: the consumer stated the toolchain requirement by choosing the source distribution,
+# and should not have to discover and reproduce this repository's cargo command themselves.
+#
+# Keep the repository's top-level default unchanged. Its explicit no-core build is a tested
+# development configuration, and its ordinary with-core build already runs Cargo first. An
+# out-of-tree CPM/FetchContent/add_subdirectory consumer gets source-building by default; an
+# explicitly supplied archive always wins, and an intentional no-core consumer can disable
+# this option while enabling FOURDGS_ALLOW_NO_CORE.
+if(FOURDGS_IN_REPOSITORY AND NOT FOURDGS_IS_TOP_LEVEL AND NOT FOURDGS_ALLOW_NO_CORE)
+  set(FOURDGS_BUILD_CORE_FROM_SOURCE_DEFAULT ON)
+else()
+  set(FOURDGS_BUILD_CORE_FROM_SOURCE_DEFAULT OFF)
+endif()
+option(FOURDGS_BUILD_CORE_FROM_SOURCE
+       "Build the Rust core with Cargo when no prebuilt FOURDGS_CORE_LIBRARY is supplied"
+       ${FOURDGS_BUILD_CORE_FROM_SOURCE_DEFAULT})
+
+if(FOURDGS_BUILD_CORE_FROM_SOURCE AND FOURDGS_ALLOW_NO_CORE)
+  message(
+    FATAL_ERROR
+      "FOURDGS_BUILD_CORE_FROM_SOURCE and FOURDGS_ALLOW_NO_CORE are mutually exclusive: "
+      "choose a decoder built by Cargo, or the deliberate no-decoder binding")
+endif()
+
+# Define the core build before resolving the backend so the generated archive is a normal
+# build dependency even though it does not exist at configure time. The output is isolated
+# under this CMake build tree: two consumers at different revisions cannot share or overwrite
+# a repository-level target/ directory.
+set(FOURDGS_BUILD_CORE_FROM_SOURCE_ACTIVE OFF)
+if(FOURDGS_BUILD_CORE_FROM_SOURCE AND FOURDGS_CORE_LIBRARY STREQUAL "")
+  if(NOT FOURDGS_IN_REPOSITORY)
+    message(
+      FATAL_ERROR
+        "FOURDGS_BUILD_CORE_FROM_SOURCE requires the repository checkout containing "
+        "rust/fourdgs/Cargo.toml; either fetch avala-ai/4dgs rather than cpp/ alone, or set "
+        "FOURDGS_CORE_HEADER_DIR and FOURDGS_CORE_LIBRARY to a prebuilt core")
+  endif()
+
+  find_program(FOURDGS_CARGO_EXECUTABLE cargo REQUIRED)
+  set(FOURDGS_CORE_SOURCE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
+  set(FOURDGS_CORE_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/rust-core")
+  if(MSVC)
+    set(FOURDGS_GENERATED_CORE_LIBRARY "${FOURDGS_CORE_TARGET_DIR}/release/fourdgs.lib")
+  else()
+    set(FOURDGS_GENERATED_CORE_LIBRARY "${FOURDGS_CORE_TARGET_DIR}/release/libfourdgs.a")
+  endif()
+
+  file(GLOB_RECURSE FOURDGS_CORE_RUST_SOURCES CONFIGURE_DEPENDS
+       "${FOURDGS_CORE_SOURCE_ROOT}/rust/fourdgs/src/*.rs")
+  add_custom_command(
+    OUTPUT "${FOURDGS_GENERATED_CORE_LIBRARY}"
+    COMMAND
+      # Make/NMake jobserver descriptors are not portable through a custom-command shell;
+      # clearing their hint lets Cargo manage its own parallelism instead of warning that
+      # CMake advertised file descriptors it could not inherit. Ninja does not set it.
+      "${CMAKE_COMMAND}" -E env "CARGO_TARGET_DIR=${FOURDGS_CORE_TARGET_DIR}" "MAKEFLAGS="
+      "${FOURDGS_CARGO_EXECUTABLE}" build --manifest-path
+      "${FOURDGS_CORE_SOURCE_ROOT}/Cargo.toml" --package fourdgs --release
+    DEPENDS
+      "${FOURDGS_CORE_SOURCE_ROOT}/Cargo.toml"
+      "${FOURDGS_CORE_SOURCE_ROOT}/rust/fourdgs/Cargo.toml"
+      ${FOURDGS_CORE_RUST_SOURCES}
+    WORKING_DIRECTORY "${FOURDGS_CORE_SOURCE_ROOT}"
+    COMMENT "Building the 4dgs Rust core"
+    VERBATIM
+    USES_TERMINAL)
+  add_custom_target(fourdgs-core-build DEPENDS "${FOURDGS_GENERATED_CORE_LIBRARY}")
+  set(FOURDGS_CORE_LIBRARY "${FOURDGS_GENERATED_CORE_LIBRARY}")
+  set(FOURDGS_BUILD_CORE_FROM_SOURCE_ACTIVE ON)
+endif()
+
 # The seam, resolved: with a core the binding calls the ABI, without one it refuses every
 # call with kNotImplemented. Both configurations build, and both are honest — the package
 # never links against a decoder it does not have.
@@ -158,9 +231,13 @@ else()
     endif()
   endif()
 
-  if(NOT FOURDGS_CORE_LIBRARY STREQUAL "")
+  if(FOURDGS_BUILD_CORE_FROM_SOURCE_ACTIVE OR EXISTS "${FOURDGS_CORE_LIBRARY}")
     set(FOURDGS_HAVE_CORE ON)
     set(FOURDGS_BACKEND_SOURCE src/backend_capi.cpp)
+  elseif(NOT FOURDGS_CORE_LIBRARY STREQUAL "")
+    message(
+      FATAL_ERROR
+        "fourdgs: FOURDGS_CORE_LIBRARY names ${FOURDGS_CORE_LIBRARY}, but that file does not exist")
   elseif(NOT FOURDGS_ALLOW_NO_CORE)
     # The header is committed and the library is not, so this is the message a consumer
     # who fetched this package sees: everything the fetch brought is here except the one
@@ -212,7 +289,13 @@ endif()
 if(FOURDGS_HAVE_CORE)
   target_include_directories(fourdgs-cpp PRIVATE ${FOURDGS_CORE_HEADER_DIR})
   message(STATUS "fourdgs: linking the core from ${FOURDGS_CORE_LIBRARY}")
-  target_link_libraries(fourdgs-cpp PUBLIC "${FOURDGS_CORE_LIBRARY}")
+  # The build links the selected archive directly. The install copies that archive into the
+  # package and its config adds the relocatable installed path; keeping this path inside a
+  # BUILD_INTERFACE prevents an exported target from remembering a temporary build tree.
+  target_link_libraries(fourdgs-cpp PUBLIC "$<BUILD_INTERFACE:${FOURDGS_CORE_LIBRARY}>")
+  if(TARGET fourdgs-core-build)
+    add_dependencies(fourdgs-cpp fourdgs-core-build)
+  endif()
   # A Rust staticlib brings its own runtime requirements; these are what it needs on the
   # platforms this package is built for. The archive does not record them, so a consumer
   # that omits them gets a page of unresolved symbols with no hint of where they came
@@ -339,6 +422,7 @@ include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
 set(FOURDGS_INSTALL_CMAKEDIR ${CMAKE_INSTALL_LIBDIR}/cmake/fourdgs-cpp)
+set(FOURDGS_INSTALL_COREDIR ${CMAKE_INSTALL_LIBDIR}/fourdgs-cpp/core)
 
 if(FOURDGS_BUILD_TOOL)
   install(TARGETS fourdgs-cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
@@ -349,6 +433,14 @@ install(
   EXPORT fourdgs-cpp-targets
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(DIRECTORY include/fourdgs DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+if(FOURDGS_HAVE_CORE)
+  get_filename_component(FOURDGS_CORE_LIBRARY_FILENAME "${FOURDGS_CORE_LIBRARY}" NAME)
+  set(FOURDGS_CORE_INSTALL_RELPATH
+      "${FOURDGS_INSTALL_COREDIR}/${FOURDGS_CORE_LIBRARY_FILENAME}")
+  install(FILES "${FOURDGS_CORE_LIBRARY}" DESTINATION ${FOURDGS_INSTALL_COREDIR})
+else()
+  set(FOURDGS_CORE_INSTALL_RELPATH "")
+endif()
 install(
   EXPORT fourdgs-cpp-targets
   FILE fourdgs-cpp-targets.cmake

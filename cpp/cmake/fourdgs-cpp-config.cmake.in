@@ -11,14 +11,12 @@
 # it at run time from an error code. Without a core the library still links and every call
 # returns ErrorCode::kNotImplemented — an honest build, but not a decoder.
 set(fourdgs-cpp_HAVE_CORE @FOURDGS_HAVE_CORE@)
-set(fourdgs-cpp_CORE_LIBRARY "@FOURDGS_CORE_LIBRARY@")
+set(fourdgs-cpp_CORE_LIBRARY "${PACKAGE_PREFIX_DIR}/@FOURDGS_CORE_INSTALL_RELPATH@")
 
-# The Rust core is not a CMake package, so there is no find_dependency() to write for it:
-# it was linked by absolute path into the exported target when this package was installed.
-# That path is a build artifact of whatever tree built this package, so it can be gone by
-# the time somebody consumes the install — and what the consumer sees then is a linker
-# naming a file, at the end of a build, with no mention of fourdgs. Say the cause here,
-# where find_package can still refuse.
+# The Rust core is not a CMake package, so there is no find_dependency() to write for it.
+# It is installed beside this config, making an installed fourdgs-cpp package self-contained
+# and relocatable: only a source fetch needs Cargo; a downstream find_package consumer does
+# not. Refuse a damaged install here rather than much later in the linker.
 if(fourdgs-cpp_HAVE_CORE AND NOT EXISTS "${fourdgs-cpp_CORE_LIBRARY}")
   set(fourdgs-cpp_FOUND FALSE)
   set(fourdgs-cpp_NOT_FOUND_MESSAGE
@@ -29,6 +27,12 @@ avala-ai/4dgs, or reinstall this package with -DFOURDGS_CORE_LIBRARY pointing at
 endif()
 
 include("${CMAKE_CURRENT_LIST_DIR}/fourdgs-cpp-targets.cmake")
+
+if(fourdgs-cpp_HAVE_CORE)
+  set_property(
+    TARGET fourdgs::fourdgs-cpp APPEND PROPERTY INTERFACE_LINK_LIBRARIES
+                                                  "${fourdgs-cpp_CORE_LIBRARY}")
+endif()
 
 # The name this package documents is fourdgs::cpp, which is what an in-tree
 # add_subdirectory() gets from the alias in CMakeLists.txt. Export namespacing produces
