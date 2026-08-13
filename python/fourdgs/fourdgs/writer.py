@@ -407,7 +407,7 @@ def _encode(g: GaussianSet, duration_sec, opts, audio_sources, camera) -> bytes:
     tops = sorted({0.0, duration_sec} | {float(v) for w in table for v in w if 0.0 < v < duration_sec})
     if len(tops) < 2:
         tops = [0.0, max(duration_sec, 1e-9)]
-    lo, hi = g.support() if n else (np.zeros(0), np.zeros(0))
+    lo, hi = g.support(opts.cutoff) if n else (np.zeros(0), np.zeros(0))
     plans = _plan_chunks(lo, hi, tops, opts.max_depth, opts.min_chunk_gaussians) if n else []
     if n and not plans:
         plans = [(tops[0], tops[-1], 0, np.arange(n))]

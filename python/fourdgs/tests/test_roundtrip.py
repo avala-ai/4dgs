@@ -90,6 +90,33 @@ class TestRoundTrip:
         out = roundtrip(make_scene(n=1, windows=1, never_fades_fraction=0.0), duration=1.0)
         assert out.gaussians.count == 1
 
+    def test_public_cutoff_controls_chunk_intervals(self):
+        from fourdgs.indexed_reader import open_indexed
+        from fourdgs.readable import BytesReadable
+
+        scene = make_scene(n=1, windows=1, duration=1.0, never_fades_fraction=0.0)
+        scene.mu_t[:] = 0.25
+        scene.sigma_t[:] = 0.15
+        scene.win_lo[:] = 0.0
+        scene.win_hi[:] = 1.0
+
+        def intervals(cutoff):
+            encoded = io.BytesIO()
+            fourdgs.write(
+                encoded,
+                scene,
+                1.0,
+                options=fourdgs.WriteOptions(cutoff=cutoff, max_depth=1, min_chunk_gaussians=1),
+            )
+            indexed = open_indexed(BytesReadable(encoded.getvalue()))
+            return [(entry.t0, entry.t1) for entry in indexed.index]
+
+        # The default support crosses 0.5 and stays at the root. A higher cutoff narrows
+        # that same gaussian's support into the left child, so the public option must
+        # affect planning as well as the Header and quantization grids.
+        assert intervals(0.05) == [(0.0, 1.0)]
+        assert intervals(0.5) == [(0.0, 0.5)]
+
     @pytest.mark.parametrize("degree", [1, 2, 3])
     def test_spherical_harmonics_degrees(self, degree):
         out = roundtrip(make_scene(sh_degree=degree))
