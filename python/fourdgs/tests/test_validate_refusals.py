@@ -2017,6 +2017,26 @@ class TestBoundedDecoding:
 
         assert peak < newborn * 24, f"reuse detection used {peak / newborn:.1f} bytes per newborn id"
 
+    def test_a_small_reuse_probe_does_not_rebuild_the_unsettled_tier(self, monkeypatch):
+        """The other side of the size-aware membership check stays cheap.
+
+        One birth per state is why recent ids wait in a set: membership is one hash lookup,
+        not a conversion and sort of every id waiting there. The large-probe fix must not
+        turn that common shape quadratic while keeping its own memory flat.
+        """
+        introduced = kdf._IntroducedIdentities()
+        introduced.add(np.arange(1_000, dtype=np.uint32))
+        calls: list[tuple[int, int]] = []
+        original = kdf._in_sorted
+
+        def measured(haystack, needles):
+            calls.append((int(haystack.size), int(needles.size)))
+            return original(haystack, needles)
+
+        monkeypatch.setattr(kdf, "_in_sorted", measured)
+        assert introduced.first_repeat(np.array([2_000], dtype=np.uint32)) is None
+        assert calls == [(0, 1)], "the whole unsettled tier was rebuilt for one newborn id"
+
     def test_a_sequence_past_the_identity_ceiling_is_refused_not_counted(self, monkeypatch):
         """The audit holds four bytes per distinct id, which is a bound that grows with
         the file rather than a fixed one. §1 allows that only against a limit the reader

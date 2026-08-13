@@ -1890,13 +1890,22 @@ class _IntroducedIdentities:
             return None
         earlier = _in_sorted(self._settled, born)
         if self._unsettled:
-            # `born` can be millions of ids even though `_unsettled` is bounded. Boxing
-            # the large side with `born.tolist()` defeats the ceiling before `add` gets
-            # the chance to route that batch around the Python tier. Convert and sort the
-            # bounded side instead, then keep the membership check in typed arrays.
-            unsettled = np.fromiter(self._unsettled, dtype=np.uint32, count=len(self._unsettled))
-            unsettled.sort()
-            earlier |= _in_sorted(unsettled, born)
+            if born.size <= len(self._unsettled):
+                # The newborn side is the smaller one: preserve the set's O(1) lookup.
+                # This is the one-birth-per-state shape the staging tier exists for, and
+                # rebuilding and sorting that whole tier here would make it quadratic.
+                for position, identity in enumerate(born.tolist()):
+                    if identity in self._unsettled:
+                        earlier[position] = True
+                        break
+            else:
+                # `born` can be millions of ids even though `_unsettled` is bounded.
+                # Boxing the large side defeats the ceiling before `add` can route that
+                # batch around the Python tier, so convert and sort the smaller, bounded
+                # side and keep this membership check in typed arrays.
+                unsettled = np.fromiter(self._unsettled, dtype=np.uint32, count=len(self._unsettled))
+                unsettled.sort()
+                earlier |= _in_sorted(unsettled, born)
         if not earlier.any():
             return None
         return int(born[int(np.argmax(earlier))])
