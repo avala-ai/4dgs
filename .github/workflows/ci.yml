@@ -699,6 +699,23 @@ jobs:
             cat "$universal_log"
             grep -q 'cannot produce one universal Rust archive' "$universal_log"
           elif [ "$RUNNER_OS" = "Linux" ]; then
+            # Compiler modes such as -m32 change the target ABI without setting any of
+            # CMake's target selectors. Static-library try-compiles let CMake detect the
+            # 32-bit pointer width without requiring multilib runtime libraries merely to
+            # exercise this configure-time refusal.
+            multilib_log="$RUNNER_TEMP/fourdgs-m32-no-cargo-target.log"
+            if cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-m32-no-cargo-target" \
+              -DCMAKE_CXX_FLAGS=-m32 \
+              -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+              -DFOURDGS_SOURCE_DIR="$GITHUB_WORKSPACE" >"$multilib_log" 2>&1; then
+              cat "$multilib_log"
+              echo "::error::-m32 configured with Cargo's 64-bit host target"
+              exit 1
+            fi
+            cat "$multilib_log"
+            grep -q '4-byte pointer ABI' "$multilib_log"
+            grep -q FOURDGS_CARGO_TARGET "$multilib_log"
+
             # Clang toolchains can select a target through the compiler driver while
             # leaving CMAKE_CROSSCOMPILING false. The explicit compiler target is still
             # independent of Cargo's host and therefore requires the matching Rust triple.
@@ -744,9 +761,11 @@ jobs:
           install_libdir="$install_root/lib"
           consumer_generator=()
           if [ "$RUNNER_OS" = "Linux" ]; then
-            # A colon is a legal POSIX filename character. Preserve it as one path rather
-            # than feeding it to file(TO_CMAKE_PATH), which treats it as a path-list split.
-            install_libdir="$RUNNER_TEMP/fourdgs:install/lib"
+            # A colon is a legal POSIX filename character, while CMake normalizes a
+            # backslash to its portable path separator in the generated install script.
+            # The installed config must preserve the colon and name that same effective
+            # slash-normalized destination instead of emitting an invalid escape.
+            install_libdir="$RUNNER_TEMP/fourdgs:install\\path/lib"
             consumer_generator=(-G Ninja)
           fi
           cmake -S cpp -B "$RUNNER_TEMP/fourdgs-package" \

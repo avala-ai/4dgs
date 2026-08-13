@@ -1,5 +1,7 @@
 # 4dgs — C++
 
+<!-- cspell:ignore rustc -->
+
 A C++17 binding over the Rust core's C ABI, for engine, DCC and native-viewer integrators. Not a
 second decoder: the bytes are parsed once, in one place, so two implementations cannot drift apart
 on what a file means. Decode only at v1; rendering is out of scope for this repository.
@@ -94,14 +96,17 @@ tree nor Cargo, and the core path stays valid if the install prefix moves.
 This package is a binding over the Rust core's C ABI rather than a second decoder. A source fetch
 contains that crate, and `FOURDGS_BUILD_CORE_FROM_SOURCE` defaults to `ON` for CPM, FetchContent and
 `add_subdirectory` consumers. It runs the equivalent of
-`cargo build -p fourdgs --release --target <triple>` with an isolated target directory under the
-CMake build, then makes the C++ library depend on and link the result. A native build derives the
+`cargo rustc -p fourdgs --release --target <triple> --lib --crate-type staticlib` with an isolated
+target directory under the CMake build, then makes the C++ library depend on and link the result.
+Selecting only the static library avoids making a cross build link the crate's unrelated `cdylib`
+with a Cargo linker configuration the CMake toolchain does not control. A native build derives the
 triple from `cargo -vV`; a cross build must name the toolchain's Rust triple with
 `FOURDGS_CARGO_TARGET`, so it cannot silently build a host archive for a target linker. The same
 requirement applies when `CMAKE_CXX_COMPILER_TARGET`, Visual Studio `-A`, or
-`CMAKE_OSX_ARCHITECTURES` selects a target without setting CMake's cross-compiling flag. A universal
-macOS build needs a pre-combined `FOURDGS_CORE_LIBRARY`; one Cargo target can only produce a thin
-archive. Building the same checkout at two revisions cannot make them share one `target/` tree.
+`CMAKE_OSX_ARCHITECTURES` selects a target without setting CMake's cross-compiling flag, and when a
+compiler mode such as `-m32` changes the detected pointer ABI. A universal macOS build needs a
+pre-combined `FOURDGS_CORE_LIBRARY`; one Cargo target can only produce a thin archive. Building the
+same checkout at two revisions cannot make them share one `target/` tree.
 
 A consumer that already has a core can skip that build by naming it. The header defaults to the one
 in a fetched repository; a vendored copy of `cpp/` alone supplies both paths:

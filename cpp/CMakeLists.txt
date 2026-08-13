@@ -131,6 +131,31 @@ if(FOURDGS_BUILD_CORE_FROM_SOURCE AND FOURDGS_CORE_LIBRARY STREQUAL "")
       ""
       CACHE STRING "Rust target triple used when CMake builds the core from source")
 
+  # Cargo and CMake select targets independently. Read the Cargo host even when CMake has
+  # an explicit selector: besides supplying the native default below, its pointer width is
+  # how a plain compiler mode such as `-m32` is distinguished from the native ABI.
+  execute_process(
+    COMMAND "${FOURDGS_CARGO_EXECUTABLE}" -vV
+    OUTPUT_VARIABLE FOURDGS_CARGO_VERSION
+    RESULT_VARIABLE FOURDGS_CARGO_VERSION_RESULT
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+  if(NOT FOURDGS_CARGO_VERSION_RESULT EQUAL 0
+     OR NOT FOURDGS_CARGO_VERSION MATCHES "(^|\n)host: ([^\n]+)")
+    message(
+      FATAL_ERROR
+        "Could not determine Cargo's host target from `cargo -vV`; set "
+        "-DFOURDGS_CARGO_TARGET=<Rust target triple> explicitly.")
+  endif()
+  set(FOURDGS_CARGO_HOST_TARGET "${CMAKE_MATCH_2}")
+  set(FOURDGS_CARGO_HOST_POINTER_SIZE "")
+  if(FOURDGS_CARGO_HOST_TARGET MATCHES
+     "^(x86_64|aarch64[^-]*|loongarch64|mips64[^-]*|powerpc64[^-]*|riscv64[^-]*|s390x|sparc64)-")
+    set(FOURDGS_CARGO_HOST_POINTER_SIZE 8)
+  elseif(FOURDGS_CARGO_HOST_TARGET MATCHES
+         "^(i[3-6]86|arm[^-]*|mips[^-]*|powerpc|riscv32[^-]*|thumb[^-]*|wasm32)-")
+    set(FOURDGS_CARGO_HOST_POINTER_SIZE 4)
+  endif()
+
   # CMAKE_CROSSCOMPILING catches a different target system, but not every different
   # target architecture. Visual Studio's -A and CMAKE_OSX_ARCHITECTURES can select an
   # architecture on the host OS while leaving CMAKE_CROSSCOMPILING false. Cargo would
@@ -158,6 +183,13 @@ if(FOURDGS_BUILD_CORE_FROM_SOURCE AND FOURDGS_CORE_LIBRARY STREQUAL "")
     endif()
     set(FOURDGS_CARGO_TARGET_REQUIRED_REASON
         "CMAKE_OSX_ARCHITECTURES selects ${CMAKE_OSX_ARCHITECTURES}")
+  elseif(NOT FOURDGS_CARGO_HOST_POINTER_SIZE STREQUAL ""
+         AND NOT CMAKE_SIZEOF_VOID_P EQUAL FOURDGS_CARGO_HOST_POINTER_SIZE)
+    string(
+      CONCAT FOURDGS_CARGO_TARGET_REQUIRED_REASON
+             "CMake's compiler mode produces a ${CMAKE_SIZEOF_VOID_P}-byte pointer ABI while "
+             "Cargo's ${FOURDGS_CARGO_HOST_TARGET} host target uses "
+             "${FOURDGS_CARGO_HOST_POINTER_SIZE}-byte pointers")
   endif()
 
   if(FOURDGS_CARGO_TARGET STREQUAL "")
@@ -169,19 +201,7 @@ if(FOURDGS_BUILD_CORE_FROM_SOURCE AND FOURDGS_CORE_LIBRARY STREQUAL "")
           "CMake architecture (for example aarch64-unknown-linux-gnu or "
           "aarch64-apple-darwin).")
     endif()
-    execute_process(
-      COMMAND "${FOURDGS_CARGO_EXECUTABLE}" -vV
-      OUTPUT_VARIABLE FOURDGS_CARGO_VERSION
-      RESULT_VARIABLE FOURDGS_CARGO_VERSION_RESULT
-      OUTPUT_STRIP_TRAILING_WHITESPACE)
-    if(NOT FOURDGS_CARGO_VERSION_RESULT EQUAL 0
-       OR NOT FOURDGS_CARGO_VERSION MATCHES "(^|\n)host: ([^\n]+)")
-      message(
-        FATAL_ERROR
-          "Could not determine Cargo's host target from `cargo -vV`; set "
-          "-DFOURDGS_CARGO_TARGET=<Rust target triple> explicitly.")
-    endif()
-    set(FOURDGS_CARGO_TARGET "${CMAKE_MATCH_2}")
+    set(FOURDGS_CARGO_TARGET "${FOURDGS_CARGO_HOST_TARGET}")
   endif()
   set(FOURDGS_CORE_SOURCE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
   set(FOURDGS_CORE_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/rust-core")
@@ -202,9 +222,9 @@ if(FOURDGS_BUILD_CORE_FROM_SOURCE AND FOURDGS_CORE_LIBRARY STREQUAL "")
       # clearing their hint lets Cargo manage its own parallelism instead of warning that
       # CMake advertised file descriptors it could not inherit. Ninja does not set it.
       "${CMAKE_COMMAND}" -E env "CARGO_TARGET_DIR=${FOURDGS_CORE_TARGET_DIR}" "MAKEFLAGS="
-      "${FOURDGS_CARGO_EXECUTABLE}" build --manifest-path
+      "${FOURDGS_CARGO_EXECUTABLE}" rustc --manifest-path
       "${FOURDGS_CORE_SOURCE_ROOT}/Cargo.toml" --package fourdgs --release --target
-      "${FOURDGS_CARGO_TARGET}"
+      "${FOURDGS_CARGO_TARGET}" --lib --crate-type staticlib
     DEPENDS
       "${FOURDGS_CORE_SOURCE_ROOT}/Cargo.toml"
       "${FOURDGS_CORE_SOURCE_ROOT}/rust/fourdgs/Cargo.toml"
@@ -517,13 +537,11 @@ include(CMakePackageConfigHelpers)
 
 set(FOURDGS_INSTALL_CMAKEDIR ${CMAKE_INSTALL_LIBDIR}/cmake/fourdgs-cpp)
 set(FOURDGS_INSTALL_COREDIR ${CMAKE_INSTALL_LIBDIR}/fourdgs-cpp/core)
-# An absolute Windows GNUInstallDirs value can arrive as `D:\path`. That spelling is
-# accepted as an install destination, but embedding it in the generated config turns
-# sequences such as `\a` into invalid CMake escapes. PATH_VARS handles absolute versus
-# prefix-relative placement; give it CMake's portable slash spelling to embed.
-if(CMAKE_HOST_WIN32)
-  file(TO_CMAKE_PATH "${FOURDGS_INSTALL_COREDIR}" FOURDGS_INSTALL_COREDIR)
-endif()
+# CMake's generated install script normalizes backslashes to path separators even on
+# POSIX. Apply that same scalar conversion before PATH_VARS embeds this directory in CMake
+# source: the installed archive and its config then name the same effective destination,
+# and a legal POSIX colon stays intact (file(TO_CMAKE_PATH) would split it as a path list).
+string(REPLACE "\\" "/" FOURDGS_INSTALL_COREDIR "${FOURDGS_INSTALL_COREDIR}")
 
 if(FOURDGS_BUILD_TOOL)
   install(TARGETS fourdgs-cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
