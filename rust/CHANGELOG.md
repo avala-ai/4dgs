@@ -6,6 +6,8 @@ All notable changes to the Rust crate are documented here, following
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-13
+
 ### Added
 
 - **A `keyframe-delta` encoder on the C ABI.** `write_sequence` has been the reference for this
