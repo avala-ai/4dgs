@@ -132,10 +132,10 @@ def _planning_support(q_mu, q_sigma, t_step, sigma_log_step, never_fades, window
     """Containment bounds for the temporal state the file reconstructs.
 
     Chunk membership is an indexed-read promise, so it must cover the values a decoder
-    sees rather than the unquantized values the caller supplied. The marginal's upper
-    endpoint is inclusive (``marginal >= cutoff``), while a chunk's upper endpoint is not.
-    Advance that bound by one representable float when the marginal ends before the
-    validity window; if the window clips it first, ``win_hi`` is already exclusive.
+    sees rather than the unquantized values the caller supplied. The marginal comparison
+    is inclusive and computed in floating point, while chunk ``t1`` is exclusive, so the
+    bounds include the complete rounded-visible plateau and are directed away from it.
+    Validity-window ``win_hi`` is already exclusive and remains unchanged.
     """
     # GaussianSet is the decoded public state and stores temporal values as f32. Plan
     # against that representation, then widen for the support arithmetic, exactly as the
@@ -146,23 +146,26 @@ def _planning_support(q_mu, q_sigma, t_step, sigma_log_step, never_fades, window
         .astype(np.float32)
         .astype(np.float64)
     )
-    half = support_k(cutoff) * sigma
-    if cutoff == 1.0:
-        # Mathematically the support is the single instant ``mu``, but state_at performs
-        # the marginal calculation in binary64.  exp(-x) rounds to exactly 1.0 for a
-        # small interval of positive x, so nearby representable times pass ``>= 1.0`` as
-        # well.  Two square roots of one ULP at 1.0 strictly contain that normalized
-        # rounding plateau (including the division and square rounding) without scanning
-        # time or widening support by a scene-scale epsilon.
-        plateau = 2.0 * math.sqrt(math.ulp(1.0)) * np.maximum(sigma, 1e-30)
-        half = plateau
+    # state_at compares the rounded result of exp() with the Header cutoff. Its complete
+    # visible plateau is therefore bounded by the inverse image of the next smaller
+    # marginal, not by advancing the mathematical time endpoint an arbitrary number of
+    # ULPs. This also covers cutoff=1, where the mathematical half-width is zero but the
+    # rounded plateau is not. At the smallest positive cutoff the predecessor is zero and
+    # the only finite conservative inverse is the whole timeline.
+    marginal_floor = np.nextafter(float(cutoff), 0.0)
+    half = np.full_like(sigma, np.inf) if marginal_floor == 0.0 else support_k(float(marginal_floor)) * sigma
     half = np.where(never_fades, np.inf, half)
     window_lo = np.asarray(windows, dtype=np.float64)[win_index, 0]
     window_hi = np.asarray(windows, dtype=np.float64)[win_index, 1]
-    marginal_hi = mu + half
-    lo = np.maximum(mu - half, window_lo)
+    # Round every derived time away from the support before comparing it with a split.
+    # That accounts for the inverse arithmetic and makes the upper bound strictly outside
+    # the inclusive marginal endpoint while retaining the validity window's own [lo, hi)
+    # semantics. It is fixed work per gaussian; no representable-time scan is involved.
+    half = np.nextafter(half, np.inf)
+    marginal_lo = np.nextafter(mu - half, -np.inf)
+    marginal_hi = np.nextafter(mu + half, np.inf)
+    lo = np.maximum(marginal_lo, window_lo)
     hi = np.minimum(marginal_hi, window_hi)
-    hi = np.where(marginal_hi < window_hi, np.nextafter(hi, np.inf), hi)
     return lo, hi
 
 

@@ -214,6 +214,75 @@ class TestRoundTrip:
             assert full_state["indices"].tolist() == [0]
             assert indexed_state["indices"].tolist() == [0]
 
+    @pytest.mark.parametrize("side", ["lower", "upper"])
+    def test_indexed_seek_covers_the_rounded_visibility_endpoint(self, side):
+        from fourdgs.indexed_reader import open_indexed, read_chunk
+        from fourdgs.readable import BytesReadable
+        from fourdgs.stream_reader import _assemble
+
+        scene = make_scene(n=1, windows=1, duration=1.0, never_fades_fraction=0.0)
+        scene.mu_t[:] = 0.5
+        scene.sigma_t[:] = 1.0
+        cutoff = 0.9
+
+        seed = io.BytesIO()
+        fourdgs.write(seed, scene, 1.0, options=fourdgs.WriteOptions(cutoff=cutoff, max_depth=0))
+        reconstructed = fourdgs.read(seed.getvalue()).gaussians
+        mean = float(reconstructed.mu_t[0])
+        half = math.sqrt(-2.0 * math.log(cutoff)) * float(reconstructed.sigma_t[0])
+        if side == "upper":
+            split = np.nextafter(mean + half, np.inf)
+            query = split
+        else:
+            split = mean - half
+            query = np.nextafter(split, -np.inf)
+        duration = 2.0 * split
+        scene.win_lo = np.array([0.0], dtype=np.float64)
+        scene.win_hi = np.array([duration], dtype=np.float64)
+
+        encoded = io.BytesIO()
+        fourdgs.write(
+            encoded,
+            scene,
+            duration,
+            options=fourdgs.WriteOptions(cutoff=cutoff, max_depth=1, min_chunk_gaussians=1),
+        )
+        data = encoded.getvalue()
+        decoded = fourdgs.read(data)
+        source = BytesReadable(data)
+        indexed = open_indexed(source)
+        chunks = [read_chunk(source, indexed, entry) for entry in indexed.chunks_for_time(query)]
+        indexed_gaussians = _assemble(chunks, indexed.windows, indexed.header)
+
+        assert decoded.gaussians.mu_t[0] == mean
+        assert decoded.gaussians.sigma_t[0] == reconstructed.sigma_t[0]
+        assert decoded.gaussians.state_at(query, cutoff)["indices"].tolist() == [0]
+        assert indexed_gaussians.state_at(query, cutoff)["indices"].tolist() == [0]
+
+    def test_planning_support_covers_subtraction_after_endpoint_cancellation(self):
+        from fourdgs.writer import _planning_support
+
+        q_sigma = np.array([1804], dtype=np.int64)
+        reconstructed_sigma = np.exp(q_sigma.astype(np.float64) * 0.02).astype(np.float32)[0]
+        q_mu = np.array([-int(reconstructed_sigma)], dtype=np.int64)
+
+        lo, hi = _planning_support(
+            q_mu,
+            q_sigma,
+            np.array([1.0]),
+            0.02,
+            np.array([False]),
+            np.array([[0.0, 1.0]]),
+            np.array([0]),
+            math.exp(-0.5),
+        )
+
+        # Reconstructed mu + sigma cancels to zero, while state_at's (t - mu) at
+        # t=0.5 rounds back to sigma and remains visible. Planning from the rounded
+        # marginal's inverse must keep the split inside support despite cancellation.
+        assert float(np.float32(q_mu[0]) + reconstructed_sigma) == 0.0
+        assert lo[0] <= 0.5 < hi[0]
+
     @pytest.mark.parametrize("degree", [1, 2, 3])
     def test_spherical_harmonics_degrees(self, degree):
         out = roundtrip(make_scene(sh_degree=degree))
