@@ -55,7 +55,7 @@ else
   python=python
 fi
 
-encode="$root/dart/conformance/build/encode_roundtrip$exe"
+encode="${FOURDGS_DART_ENCODE:-$root/dart/conformance/build/encode_roundtrip$exe}"
 encode_sequence="$root/dart/conformance/build/encode_keyframe_delta$exe"
 decode_dart_streamed="$root/dart/conformance/build/decode_streamed$exe"
 decode_dart_indexed="$root/dart/conformance/build/decode_indexed$exe"
@@ -93,9 +93,31 @@ fi
 
 agreed=0
 multi_entry=0
+expected_object_refusal="4dgs: the objects profile requires one ObjectTable record, but none was supplied"
 for source in "${variants[@]}"; do
   name="$(basename "$source" .4dgs)"
-  "$encode" "$source" "$out/$name.4dgs" >"$out/$name.note"
+  if ! "$encode" "$source" "$out/$name.4dgs" >"$out/$name.note" 2>"$out/$name.error"; then
+    # #182(3), pinned to the one existing objects-profile corpus source: this
+    # gaussian-only runner cannot reproduce its scene-wide Object Table. The
+    # correct result is the same normative refusal Python and Rust make, not a
+    # downgraded Header profile. This transition disappears with the shared
+    # seam once every SDK layer is present; any other variant or diagnostic is
+    # still fatal here.
+    diagnostics=()
+    mapfile -t diagnostics <"$out/$name.error"
+    if [ "$name" = "LongLived-UseChunkIndex-UseCrc-WithObjects" ] &&
+      [ "${#diagnostics[@]}" -eq 1 ] &&
+      [ "${diagnostics[0]}" = "$expected_object_refusal" ]; then
+      echo "  $name: gaussian-only encode correctly refused the missing Object Table"
+      continue
+    fi
+    sed 's/^/::error::/' "$out/$name.error" >&2
+    exit 1
+  fi
+  if [ "$name" = "LongLived-UseChunkIndex-UseCrc-WithObjects" ]; then
+    echo "::error::$name: gaussian-only encode unexpectedly succeeded; expected: $expected_object_refusal" >&2
+    exit 1
+  fi
   # Fidelity: the encoded scene against the scene it was encoded from, before any
   # of the agreement checks below. Four decoders agreeing about one file say
   # nothing about whether that file is the scene that went in — an encoder that
@@ -124,9 +146,7 @@ source_scene = fourdgs.read(source)
 src = source_scene.gaussians
 scene = fourdgs.read(encoded)
 enc = scene.gaussians
-expected_profile = (
-    "" if source_scene.header.profile in {"objects", "capture"} else source_scene.header.profile
-)
+expected_profile = "" if source_scene.header.profile == "capture" else source_scene.header.profile
 if scene.header.duration_sec != source_scene.header.duration_sec:
     fail(
         f"duration_sec changed from {source_scene.header.duration_sec} "

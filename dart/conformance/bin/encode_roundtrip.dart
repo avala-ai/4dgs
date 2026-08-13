@@ -42,13 +42,12 @@ List<int> parseDepths(String spec) {
 /// The source's profile, unless it is one this preset cannot keep.
 ///
 /// A profile is a promise about the file's contents, and this runner writes the
-/// gaussians alone — so `objects`, which promises an Object Table, and
-/// `capture`, which promises a finite multi-chunk timeline with Statistics, are
-/// promises this generic preset cannot keep for every source. Dropping them is
-/// the same choice the preset already makes about audio, cameras and
-/// attachments: what cannot be reproduced is not claimed.
-String _writableProfile(String profile) =>
-    profile == 'objects' || profile == 'capture' ? '' : profile;
+/// gaussians alone. `capture`, which promises a finite multi-chunk timeline with
+/// Statistics, is a promise this generic preset cannot keep for every source.
+/// `objects` is deliberately retained: dropping it silently normalizes away a
+/// broken promise, while retaining it makes the writer name the missing Object
+/// Table exactly as the Python and Rust gaussian-only references do.
+String _writableProfile(String profile) => profile == 'capture' ? '' : profile;
 
 void _checkSourceGroups(FourdgsGaussianSet source, FourdgsGaussianSet encoded) {
   if ((source.sourceGroup == null) != (encoded.sourceGroup == null)) {

@@ -89,11 +89,12 @@ class FourdgsObjectLayer {
   FourdgsObjectTable? table;
   final List<FourdgsObjectTrack> tracks;
 
-  bool get isEmpty => table == null && tracks.isEmpty;
+  bool get isEmpty =>
+      table == null && tracks.every((track) => track.sampleCount == 0);
 
   FourdgsObjectTrack? track(int objectId) {
     for (final track in tracks) {
-      if (track.objectId == objectId) return track;
+      if (track.objectId == objectId && track.sampleCount > 0) return track;
     }
     return null;
   }
@@ -106,6 +107,10 @@ class FourdgsObjectLayer {
   void check() {
     final seen = <int>{};
     for (final track in tracks) {
+      // Section 5.15.7 says a zero-sample Object Track is read as absent. It
+      // therefore cannot conflict with the one live track that actually moves
+      // this object. The record's own id still gets validated by its checker.
+      if (track.sampleCount == 0) continue;
       if (!seen.add(track.objectId)) {
         throw FourdgsMalformedFile(
           'two ObjectTrack records move object ${track.objectId}; a gaussian '
@@ -159,7 +164,7 @@ class FourdgsObjectLayer {
     // moving — and has no pose to apply, so the id scan below would build a set
     // the size of the scene for nothing. The shape checks above still run: a
     // caller passing mismatched arrays is wrong whether or not a track exists.
-    if (tracks.isEmpty) return;
+    if (tracks.every((track) => track.sampleCount == 0)) return;
 
     final referenced = <int>{};
     for (final id in objectIds) {
