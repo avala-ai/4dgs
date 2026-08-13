@@ -29,7 +29,7 @@ from fourdgs.quantization import (
 )
 from fourdgs.records import Quantization
 from fourdgs.serialization import MAGIC, Cursor, read_record
-from fourdgs.validate import validate
+from fourdgs.validate import Report, _check_sh_bit_depths, validate
 from test_roundtrip import make_scene
 
 DEPTHS = (8, 7, 6, 5, 4, 3)
@@ -265,6 +265,20 @@ class TestValidate:
         report = validate(bytes(data))
         assert not report.ok
         assert [f.message for f in report.findings if "SH bit depths" in f.message]
+
+    def test_per_band_bounds_compare_as_exact_decimals(self):
+        quant = Quantization.parse(_record(write(make_scene(sh_degree=1), sh_bit_depths=(4,)), QUANTIZATION))
+        expected = quant.bounds["sh_band1"]
+
+        quant.bounds["sh_band1"] = f"{expected}.0"
+        equivalent = Report()
+        _check_sh_bit_depths(quant, 1, equivalent)
+        assert not equivalent.findings
+
+        quant.bounds["sh_band1"] = f"{expected}.0000000000000001"
+        different = Report()
+        _check_sh_bit_depths(quant, 1, different)
+        assert [finding for finding in different.findings if "sh_band1" in finding.message]
 
 
 class TestVerification:

@@ -302,6 +302,11 @@ names, so that two readers report the same number for the same file.
 `bounds`, and a reader MUST refuse a Quantization record that does: there is no meaningful error
 bound between two different labels.
 
+The decimal strings have no canonical spelling. Consumers compare their numeric values, not their
+UTF-8 bytes: `5e-05`, `5e-5`, and `0.00005` declare the same bound. A writer MAY choose any decimal
+representation that parses to the finite value it verified. This freedom does not extend to the
+map's shape — omitting a key is still different from declaring it — or to changing the value.
+
 **The SH bit depths are a declaration, not an instruction.** A writer that quantizes coefficients by
 bit depth MUST emit one entry per band it writes, in band order, each in the range 3–8, and MUST set
 `bounds.sh_band<b>` from each depth by the rule in §6.5. A reader MAY ignore the field: nothing at

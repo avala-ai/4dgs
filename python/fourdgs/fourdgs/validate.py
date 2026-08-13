@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 
 from . import opcode as op
 from . import records as rec
@@ -224,10 +225,15 @@ def _check_sh_bit_depths(quant: rec.Quantization, sh_degree: int, report: Report
     for i, bits in enumerate(quant.sh_bit_depths[:sh_degree], start=1):
         key = f"sh_band{i}"
         declared = quant.bounds.get(key)
-        expected = str(sh_bound(bits))
+        expected = sh_bound(bits)
         if declared is None:
             report.warn(f"Quantization declares {bits} bits for SH band {i} but no `{key}` bound (§5.3)")
-        elif declared != expected:
+        else:
+            try:
+                agrees = Decimal(declared).is_finite() and Decimal(declared) == Decimal(expected)
+            except InvalidOperation:
+                agrees = False
+        if declared is not None and not agrees:
             report.warn(f"Quantization declares `{key}` as {declared}; {bits} bits gives a bound of {expected} (§6.5)")
     coarsest = max(sh_step(b) for b in quant.sh_bit_depths[:sh_degree])
     if quant.step_sh != coarsest:

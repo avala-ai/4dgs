@@ -75,6 +75,7 @@ import subprocess
 import sys
 import tempfile
 from collections import Counter
+from decimal import Decimal
 
 import numpy as np
 
@@ -1192,14 +1193,6 @@ KNOWN_REFERENCE_DIVERGENCES = {
         "670671cd97404156226e507973f2ab8330d3022ca96e0c93bdbdb320c41adcaf",
         "#182(1): the same dropped cutoff, as the index counts 24 chunks against 27",
     ),
-    **{
-        (variant, None, "quantization.bounds"): (
-            "0b070f1689d4859b268a8439ccc9440caa2b4e327cb822c29151541539994ba1",
-            "d2bf7f31abb65bae4fe22d5db06dbe3d88735cd595687b0e2c03db358ba00bc3",
-            "#182(2): Python spells pos as 5e-05 and Rust as 5e-5",
-        )
-        for variant in ("NoData-Quantized-UseChunkIndex-UseCrc", "NoData-UseChunkIndex-UseCrc")
-    },
 }
 
 #: The keys two different reference encoders cannot agree on by construction, and should not:
@@ -1220,13 +1213,21 @@ def known_reference_divergence(variant: str, ladder: str | None, field: str, pyt
     return note if (_fingerprint(python), _fingerprint(rust)) == (python_hash, rust_hash) else None
 
 
+def _semantic_bounds(bounds: dict[str, str]) -> dict[str, Decimal]:
+    """Compare decimal declarations by value, while retaining their exact key set.
+
+    The format stores strings so writers are not coupled to one language's float formatter.
+    `5e-05`, `5e-5`, and `0.00005` are one bound; a missing key or a different number is not.
+    """
+    return {key: Decimal(value) for key, value in bounds.items()}
+
+
 def _declared_shape(path: str) -> dict:
     """What the file says about itself, beyond what decoding it yields.
 
-    The canonical summary is deliberately about decoded meaning, so it cannot see a bound
-    spelled `5e-05` against `5e-5`, or a bounds map that is present against one that is
-    empty. Those are exactly the writer-side divergences #182 is about, so they are compared
-    here as the bytes spell them.
+    The canonical summary is deliberately about decoded meaning. Declarations still need
+    comparing — an absent bounds map is different from a present one — but decimal spelling
+    is not meaning, so bounds are normalized to their numeric values.
     """
     scene = fourdgs.read(path)
     q = scene.quantization
@@ -1237,7 +1238,7 @@ def _declared_shape(path: str) -> dict:
         "header.attributes": dict(scene.header.attributes),
         "header.temporal_model": scene.header.temporal_model,
         "quantization.scheme": q.scheme,
-        "quantization.bounds": dict(q.bounds),
+        "quantization.bounds": _semantic_bounds(q.bounds),
         "quantization.sh_bit_depths": list(q.sh_bit_depths),
         "quantization.step_sh": int(q.step_sh),
         "quantization.steps": [
@@ -1505,6 +1506,20 @@ def _test_agreement_still_catches_divergence(tmp: str) -> list[str]:
     return [f"agreement still bites: {len(a['chunkIntervals'])} intervals against {len(b['chunkIntervals'])}"]
 
 
+def _test_bound_spellings_compare_by_numeric_value(_tmp: str) -> list[str]:
+    spellings = ({"pos": "5e-05"}, {"pos": "5e-5"}, {"pos": "0.00005"})
+    normalized = [_semantic_bounds(bounds) for bounds in spellings]
+    if not all(bounds == normalized[0] for bounds in normalized[1:]):
+        raise AssertionError(f"equivalent bound spellings diverged: {normalized}")
+    if _semantic_bounds({}) == normalized[0]:
+        raise AssertionError("an absent bound compared equal to a present declaration")
+    if _semantic_bounds({"pos": "0.000051"}) == normalized[0]:
+        raise AssertionError("different numeric bounds compared equal")
+    if _semantic_bounds({"pos": "1"}) == _semantic_bounds({"pos": "1.0000000000000001"}):
+        raise AssertionError("exact decimals beyond binary64 precision compared equal")
+    return ["3 spellings agree; absent, different, and binary64-neighboring decimals do not"]
+
+
 #: An opcode and a u64 length precede every record's content.
 RECORD_HEADER_BYTES = 9
 
@@ -1715,6 +1730,7 @@ def run_self_test() -> int:
         _test_declared_temporal_bounds_bite,
         _test_agreement_still_catches_divergence,
         _test_objects_profile_refusal_agreement,
+        _test_bound_spellings_compare_by_numeric_value,
         _test_index_counts_bite,
     )
     failed = 0
