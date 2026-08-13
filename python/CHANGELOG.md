@@ -6,6 +6,8 @@ All notable changes to the Python package are documented here, following
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-13
+
 ### Fixed
 
 - **`4dgs validate` counts distinct gaussian ids in one decode of the file, not a hundred.** The
