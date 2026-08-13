@@ -31,6 +31,9 @@ use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use crate::error::Error;
+// Renamed at the import: `Sample` alone reads as an audio sample beside `AudioSource`, and
+// this file has both.
+use crate::keyframe_delta_file::{KeyframeDeltaOptions, Sample as KeyframeDeltaSample};
 use crate::model::{AudioSource, GaussianSet, StateAt};
 use crate::readable::{FileReadable, Readable};
 use crate::reader::SceneReader;
@@ -91,8 +94,9 @@ fn status_of(error: &Error) -> c_int {
         Error::UnsupportedModel(_) => FOURDGS_STATUS_UNSUPPORTED_CODEC,
         Error::BoundViolation(_) => FOURDGS_STATUS_MALFORMED,
         Error::UnsupportedOperation(_) => FOURDGS_STATUS_UNSUPPORTED_MODE,
-        // The C ABI exposes no encoder, so this cannot arise through it today; mapped
-        // rather than left to a catch-all so that it stays correct when one is added.
+        // Reachable through the encoders: an empty sample sequence, samples that do not
+        // tile the timeline, or a GOP-invariant attribute changing inside an update group
+        // all arrive here. It is the caller's input that is wrong, not a file.
         Error::InvalidInput(_) => FOURDGS_STATUS_INVALID_ARGUMENT,
         Error::Io(_) => FOURDGS_STATUS_IO,
         // Deferred to the kind, so naming a refusal did not renumber any status a
@@ -2520,4 +2524,368 @@ pub unsafe extern "C" fn fourdgs_string_free(data: *const c_char, length: usize)
         let slice = std::slice::from_raw_parts_mut(data as *mut u8, length);
         drop(Box::from_raw(slice as *mut [u8]));
     }));
+}
+
+// --------------------------------------------------------------------------
+// keyframe-delta: encode a whole file from a sequence of samples
+// --------------------------------------------------------------------------
+//
+// The other half of the additive keyframe-delta surface above. `fourdgs_writer_*` authors a
+// `gaussian-birth` file — one population whose gaussians each carry their own birth time —
+// and there is no way through it to say the thing this model is for: the same population,
+// with identity, restated at a sequence of instants. So this is a second writer handle
+// rather than a mode on the first, for the same reason a Delta Chunk is its own record and
+// not a flag on Chunk (spec §5.18).
+//
+// The arithmetic stays in Rust. A delta is a *difference of bins, never a quantization of a
+// difference* (spec §11.7), which holds only if every sample is quantized up front on one
+// set of grids derived from the whole sequence — so the sequence has to be complete before
+// anything is encoded, and a binding that assembled deltas itself would be a second encoder
+// with its own rounding. Samples are therefore accumulated here and `write_sequence` is
+// called once, which is what makes the bytes a Swift or C++ caller gets identical to the
+// bytes Rust writes for the same input.
+//
+// Additions to a frozen ABI: new symbols, and no signature above changed.
+
+/// A sequence being assembled for `keyframe-delta` encoding. Opaque to C.
+///
+/// Every sample is held until `fourdgs_kd_writer_encode`, because the quantization grids
+/// are derived from the whole sequence.
+pub struct fourdgs_kd_writer {
+    samples: Vec<KeyframeDeltaSample>,
+    duration_sec: f64,
+    options: KeyframeDeltaOptions,
+}
+
+/// Borrow a keyframe-delta writer mutably, or report a null argument.
+macro_rules! kd_writer_mut {
+    ($writer:expr) => {
+        match unsafe { $writer.as_mut() } {
+            Some(w) => w,
+            None => {
+                set_last_error("the keyframe-delta writer pointer is null".into());
+                return FOURDGS_STATUS_INVALID_ARGUMENT;
+            }
+        }
+    };
+}
+
+/// Create an empty keyframe-delta writer with the reference encoder's defaults: a keyframe
+/// every 8 samples, chained deltas, the `default` bound profile, a 0.05 cutoff and deflate
+/// at level 6. Null on allocation failure, which a caller checks exactly as it checks
+/// `fourdgs_writer_new`.
+#[no_mangle]
+pub extern "C" fn fourdgs_kd_writer_new() -> *mut fourdgs_kd_writer {
+    match catch_unwind(AssertUnwindSafe(|| {
+        Box::into_raw(Box::new(fourdgs_kd_writer {
+            samples: Vec::new(),
+            duration_sec: 0.0,
+            options: KeyframeDeltaOptions::default(),
+        }))
+    })) {
+        Ok(ptr) => ptr,
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Release a keyframe-delta writer. Null is accepted and ignored.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_kd_writer_free(writer: *mut fourdgs_kd_writer) {
+    if writer.is_null() {
+        return;
+    }
+    // SAFETY: `writer` came from `Box::into_raw` in `fourdgs_kd_writer_new`.
+    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+        drop(Box::from_raw(writer));
+    }));
+}
+
+/// Scene length in seconds. The last sample's interval ends here, so this is what closes
+/// the tiling the model requires (spec §11.1) rather than a separate advisory field.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_kd_writer_set_duration(
+    writer: *mut fourdgs_kd_writer,
+    duration_sec: f64,
+) -> c_int {
+    guarded(|| {
+        let w = kd_writer_mut!(writer);
+        w.duration_sec = duration_sec;
+        FOURDGS_STATUS_OK
+    })
+}
+
+/// The Header's marginal visibility threshold, with the meaning it has on the
+/// `gaussian-birth` writer: it sets the support constant the per-gaussian velocity grid is
+/// derived from, so encoder and decoder agree on it by its living in the file.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_kd_writer_set_cutoff(
+    writer: *mut fourdgs_kd_writer,
+    cutoff: f64,
+) -> c_int {
+    guarded(|| {
+        let w = kd_writer_mut!(writer);
+        w.options.cutoff = cutoff;
+        FOURDGS_STATUS_OK
+    })
+}
+
+/// Cadence and reference mode. `keyframe_every` is samples per group of pictures — 1 writes
+/// every sample as a keyframe, which is legal and is the shape the registry's
+/// `frame-sequence` reservation describes. `delta_mode` is 0 for keyframe-referenced and 1
+/// for chained (spec §11.4); any other value is refused here rather than written into a
+/// file no reader would accept.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_kd_writer_set_cadence(
+    writer: *mut fourdgs_kd_writer,
+    keyframe_every: u32,
+    delta_mode: u8,
+) -> c_int {
+    guarded(|| {
+        let w = kd_writer_mut!(writer);
+        if delta_mode != crate::records::DELTA_MODE_KEYFRAME
+            && delta_mode != crate::records::DELTA_MODE_CHAINED
+        {
+            set_last_error(format!(
+                "delta_mode {delta_mode} is not a mode; 0 is keyframe-referenced and 1 is chained"
+            ));
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        }
+        w.options.keyframe_every = keyframe_every as usize;
+        w.options.delta_mode = delta_mode;
+        FOURDGS_STATUS_OK
+    })
+}
+
+/// Force a keyframe at one sample index, beyond whatever the cadence would place. A
+/// producer that knows where a cut is calls this so that instant is a whole restatement
+/// however deep into a group it would otherwise have fallen. Call it once per index; the
+/// order does not matter and a repeated index is harmless.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_kd_writer_add_keyframe_at(
+    writer: *mut fourdgs_kd_writer,
+    sample_index: u32,
+) -> c_int {
+    guarded(|| {
+        let w = kd_writer_mut!(writer);
+        w.options.keyframe_at.push(sample_index as usize);
+        FOURDGS_STATUS_OK
+    })
+}
+
+/// The bound profile the whole sequence is quantized against, and the Header's `profile`:
+/// `"fine"`, `"default"` or `"coarse"`. A `(pointer, length)` UTF-8 string, as elsewhere in
+/// this ABI. Unlike the `gaussian-birth` writer — where the Header's `profile` is a
+/// free-form promise separate from the bounds — these are one value under this model,
+/// because the grids every sample is quantized on come from it.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_kd_writer_set_profile(
+    writer: *mut fourdgs_kd_writer,
+    data: *const c_char,
+    length: usize,
+) -> c_int {
+    guarded(|| {
+        let w = kd_writer_mut!(writer);
+        let name = match unsafe { read_utf8(data, length) } {
+            Ok(text) => text,
+            Err(status) => return status,
+        };
+        match crate::quantization::Profile::parse(&name) {
+            Some(profile) => {
+                w.options.profile = profile;
+                FOURDGS_STATUS_OK
+            }
+            None => {
+                set_last_error(format!(
+                    "profile {name:?} is not one this encoder quantizes against; \
+                     expected \"fine\", \"default\" or \"coarse\""
+                ));
+                FOURDGS_STATUS_INVALID_ARGUMENT
+            }
+        }
+    })
+}
+
+/// The Header's `library`: free-form producer identification. The same string convention as
+/// `fourdgs_kd_writer_set_profile`.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_kd_writer_set_library(
+    writer: *mut fourdgs_kd_writer,
+    data: *const c_char,
+    length: usize,
+) -> c_int {
+    guarded(|| {
+        let w = kd_writer_mut!(writer);
+        match unsafe { read_utf8(data, length) } {
+            Ok(text) => {
+                w.options.library = text;
+                FOURDGS_STATUS_OK
+            }
+            Err(status) => status,
+        }
+    })
+}
+
+/// The stream codec and its level, applied to every chunk's block. The default is deflate
+/// at level 6.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_kd_writer_set_compression(
+    writer: *mut fourdgs_kd_writer,
+    codec: u8,
+    level: u32,
+) -> c_int {
+    guarded(|| {
+        let w = kd_writer_mut!(writer);
+        w.options.codec = codec;
+        w.options.level = level;
+        FOURDGS_STATUS_OK
+    })
+}
+
+/// Append one sample: a population, at one instant, with identity.
+///
+/// `ids` is aligned with the gaussian columns and is what a delta names them by (spec
+/// §11.2). It is required rather than derived from row order, because the whole model rests
+/// on correspondence between samples, and a correspondence invented from row order is one
+/// the caller never asserted.
+///
+/// The columns are copied, so the caller's arrays may be released as soon as this returns.
+/// Widths are per gaussian, exactly as `fourdgs_writer_set_gaussians`: `positions`, `scales`
+/// and `motions` are three floats each, `rotations` and `colors` four, and `mu_t`,
+/// `sigma_t`, `win_lo` and `win_hi` one. A null column — or a null `ids` — is an error
+/// unless `count` is zero.
+///
+/// Samples are appended in time order and must tile the timeline: sample `i` covers
+/// `[t0_i, t0_{i+1})`, the first starts at 0 and the last ends at the duration (spec §11.1).
+/// The encoder derives each `t1` from the next sample's `t0` and does not check the
+/// endpoints — that is the caller's to meet, and a sequence that misses it produces a file
+/// the indexed read path refuses as `non-tiling-chunks` while the streamed path accepts it.
+///
+/// Every `sigma_t` must be finite. The format allows `+inf` for a gaussian that never
+/// fades, and this reference encoder does not write one; a non-finite value is refused at
+/// encode rather than rounded into something else.
+///
+/// Spherical harmonics are not carried: this writer emits none, so a file it produces
+/// declares `sh_degree` 0. That is the reference encoder's shape rather than an ABI limit.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn fourdgs_kd_writer_add_sample(
+    writer: *mut fourdgs_kd_writer,
+    t0: f64,
+    count: u32,
+    ids: *const u32,
+    positions: *const f32,
+    scales: *const f32,
+    rotations: *const f32,
+    colors: *const f32,
+    motions: *const f32,
+    mu_t: *const f32,
+    sigma_t: *const f32,
+    win_lo: *const f32,
+    win_hi: *const f32,
+) -> c_int {
+    guarded(|| {
+        let w = kd_writer_mut!(writer);
+        let n = count as usize;
+        macro_rules! column {
+            ($ptr:expr, $width:expr, $name:literal) => {
+                match unsafe { copy_f32($ptr, n * $width) } {
+                    Some(values) => values,
+                    None => {
+                        set_last_error(concat!($name, " is null for a non-empty sample").into());
+                        return FOURDGS_STATUS_INVALID_ARGUMENT;
+                    }
+                }
+            };
+        }
+        let identity: Vec<i64> = if n == 0 {
+            Vec::new()
+        } else if ids.is_null() {
+            set_last_error("ids is null for a non-empty sample".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        } else {
+            // SAFETY: the caller states `ids` points at `count` readable u32s.
+            unsafe { std::slice::from_raw_parts(ids, n) }
+                .iter()
+                .map(|&id| i64::from(id))
+                .collect()
+        };
+        let positions = column!(positions, 3, "positions");
+        let scales = column!(scales, 3, "scales");
+        let rotations = column!(rotations, 4, "rotations");
+        let colors = column!(colors, 4, "colors");
+        let motions = column!(motions, 3, "motions");
+        let mu_t = column!(mu_t, 1, "mu_t");
+        let sigma_t = column!(sigma_t, 1, "sigma_t");
+        let win_lo = column!(win_lo, 1, "win_lo");
+        let win_hi = column!(win_hi, 1, "win_hi");
+
+        w.samples.push(KeyframeDeltaSample {
+            t0,
+            ids: identity,
+            gaussians: GaussianSet {
+                positions,
+                scales,
+                rotations,
+                colors,
+                motions,
+                mu_t,
+                sigma_t,
+                win_lo,
+                win_hi,
+                sh: None,
+                sh_coefficients: 0,
+                sh_degree: 0,
+                source_index: None,
+                // As on the `gaussian-birth` encode surface, this ABI does not carry
+                // object membership; a file written through it groups nothing.
+                object_id: None,
+            },
+        });
+        FOURDGS_STATUS_OK
+    })
+}
+
+/// How many samples have been appended. 0 for a null writer.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_kd_writer_sample_count(writer: *const fourdgs_kd_writer) -> u32 {
+    // SAFETY: null is handled; otherwise the caller guarantees a live writer.
+    match unsafe { writer.as_ref() } {
+        Some(w) => w.samples.len() as u32,
+        None => 0,
+    }
+}
+
+/// Encode the appended sequence into an owned buffer, freed with `fourdgs_buffer_free` —
+/// the same buffer type `fourdgs_writer_encode` returns.
+///
+/// Every sample is quantized first, on grids derived from the whole sequence, and each
+/// non-keyframe sample is then written as the difference of bins against the chunk it
+/// references. On failure the out parameter is left untouched and `fourdgs_last_error`
+/// names the reason: an empty sequence, a sample whose id count does not match its gaussian
+/// count, a non-finite `sigma_t`, or a gaussian whose `sigma_t` or window changes inside a
+/// group — the last refused rather than written, because those values *are* the grid a bin
+/// difference is taken on (spec §11.5) and a file carrying one decodes silently into a
+/// wrong velocity rather than into an error.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_kd_writer_encode(
+    writer: *mut fourdgs_kd_writer,
+    out: *mut *mut fourdgs_buffer,
+) -> c_int {
+    guarded(|| {
+        let w = kd_writer_mut!(writer);
+        if out.is_null() {
+            set_last_error("the out parameter is null".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        }
+        match crate::keyframe_delta_file::write_sequence(&w.samples, w.duration_sec, &w.options) {
+            Ok(bytes) => {
+                let buffer = Box::new(fourdgs_buffer { data: bytes });
+                // SAFETY: `out` was checked non-null; the caller frees the result with
+                // `fourdgs_buffer_free`.
+                unsafe { *out = Box::into_raw(buffer) };
+                FOURDGS_STATUS_OK
+            }
+            Err(e) => report(e),
+        }
+    })
 }

@@ -6,6 +6,27 @@ All notable changes to the Rust crate are documented here, following
 
 ## [Unreleased]
 
+### Added
+
+- **A `keyframe-delta` encoder on the C ABI.** `write_sequence` has been the reference for this
+  model since 0.3.0 and no binding could reach it, which is why the feature matrix recorded C++ and
+  Swift as Planned for encoding it. Eleven additive symbols close that:
+  `fourdgs_kd_writer_new`/`_free`, `_set_duration`, `_set_cutoff`, `_set_cadence`,
+  `_add_keyframe_at`, `_set_profile`, `_set_library`, `_set_compression`, `_add_sample`,
+  `_sample_count` and `_encode`, which returns the same owned `fourdgs_buffer` the gaussian-birth
+  writer does.
+
+  A second handle rather than a mode on `fourdgs_writer`, for the same reason a Delta Chunk is its
+  own record and not a flag on Chunk (spec §5.18): that writer takes one population, and this model
+  is a population restated at a sequence of instants with identity. The handle accumulates samples
+  and encodes once, because a delta is a difference of bins and never a quantization of a difference
+  (§11.7) and that holds only if every sample was quantized on grids derived from the whole sequence
+  — so a binding that assembled deltas itself would be a second encoder with its own rounding rather
+  than a shim. Strings are length-delimited like every other one here.
+  `tests/capi_keyframe_delta_writer.rs` drives the surface the way a binding does, including that
+  the id column is carried rather than invented from row order, that null is safe on every entry
+  point, and that a delta mode which is not a mode is refused before it reaches a file.
+
 ## [0.5.0] - 2026-08-12
 
 ### Added
