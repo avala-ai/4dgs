@@ -81,8 +81,8 @@ class TestExactAggregateTransition:
         assert json_compare.without_exact_aggregates(actual) == json_compare.without_exact_aggregates(expected)
         assert actual["aggregate"]["positionSum"] == [100.0, 200.0, 300.0], "the helper must not mutate runner output"
 
-    def test_rust_child_claims_only_its_proved_implementations(self):
-        proved_families = frozenset({"python", "rust", "typescript"})
+    def test_dart_child_claims_only_its_proved_implementations(self):
+        proved_families = frozenset({"dart", "python", "rust", "typescript"})
         assert conformance_run.EXACT_AGGREGATE_FAMILIES == proved_families
         assert conformance_run.CANONICAL_STATE_ORDER_FAMILIES == proved_families
 
