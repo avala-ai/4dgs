@@ -336,3 +336,11 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           cargo build -p fourdgs-conformance --release
           LD_LIBRARY_PATH=$PWD/target/release python3 tests/conformance/encode_roundtrip.py --encoder swift
+
+      # The gate above covers the gaussian-birth writer, where a second encoder exists to
+      # diff against. keyframe-delta has none here, so its gate makes the claim against the
+      # Python reference instead: files Swift writes, read back by Python and by Swift on
+      # both paths, and — for the four sequences the corpus generator also builds — against
+      # the committed corpus's population and geometry.
+      - name: keyframe-delta encode
+        run: LD_LIBRARY_PATH=$PWD/target/release swift/keyframe-delta-roundtrip.sh

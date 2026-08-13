@@ -58,7 +58,8 @@ String crcOf(List<int> data) =>
 String canonical(Map<String, Object?> summary) =>
     const JsonEncoder.withIndent('  ').convert(_sorted(summary));
 
-/// The canonical answer for a file this reader refused.
+/// The canonical answer for a file this reader refused, or `null` when it is
+/// not one.
 ///
 /// A refusal is a result, not a crash: the runner prints this on stdout and
 /// exits 0, and the harness diffs it against the expectation like any other
@@ -66,12 +67,21 @@ String canonical(Map<String, Object?> summary) =>
 /// reason" and "fell over" into one outcome, and telling those two apart is the
 /// whole point of the invalid corpus.
 ///
-/// An error carrying no identifier prints an empty one, which matches no
-/// expectation and fails with a readable diff. That is deliberate: a refusal the
-/// library cannot name is a refusal the suite cannot check, and it should look
-/// like a gap rather than a pass.
-String refusalJson(FourdgsException error) =>
-    canonical(<String, Object?>{'refused': error.refusalCode ?? ''});
+/// An error the refusal table does not name is not that result, and `null` says
+/// so. The caller turns it into a failed invocation — a diagnosis on stderr, a
+/// non-zero exit — which is the split the Rust and C++ runners already keep
+/// through the same optional identifier. Printing the missing identifier as `''`
+/// instead exits 0 and so claims a valid answer, even though the empty string is
+/// not an identifier the format defines: the harness could no longer tell
+/// "refused for a reason nobody named" from "refused for the wrong reason", and
+/// `run.py --update` — which writes whatever a runner prints, without parsing it
+/// — could commit the empty identifier as the expectation every other SDK is
+/// then scored against.
+String? refusalAnswer(FourdgsException error) {
+  final String? code = error.refusalCode;
+  if (code == null) return null;
+  return canonical(<String, Object?>{'refused': code});
+}
 
 Object? _sorted(Object? value) {
   if (value is Map<String, Object?>) {

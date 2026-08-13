@@ -49,7 +49,15 @@ public enum Runner {
             print(json.serialized())
             exit(0)
         } catch let error as FourDGSError {
-            print(refusal(error).serialized())
+            // Only an error the refusal table names is an answer. Anything else is a failed
+            // invocation and takes the same exit as a runner fault below, because a runner
+            // that answered it with an empty identifier would be claiming a valid answer for
+            // a failure no expectation can check. See `refusal(_:)`.
+            guard let answer = refusal(error) else {
+                FileHandle.standardError.write(Data("\(arguments[1]): \(error)\n".utf8))
+                exit(1)
+            }
+            print(answer.serialized())
             exit(0)
         } catch {
             FileHandle.standardError.write(Data("\(error)\n".utf8))
@@ -57,7 +65,7 @@ public enum Runner {
         }
     }
 
-    /// The canonical answer for a file this reader refused.
+    /// The canonical answer for a file this reader refused, or `nil` when it is not one.
     ///
     /// A refusal is a result, not a crash: it goes to stdout and the process exits 0, so the
     /// harness diffs it against the expectation like any other answer. Exiting non-zero
@@ -66,13 +74,17 @@ public enum Runner {
     /// the invalid corpus — a decoder must not be able to pass by crashing in the right
     /// place.
     ///
-    /// An error the package cannot name prints an empty identifier, which matches no
-    /// expectation and fails with a readable diff. That is deliberate: a refusal the SDK
-    /// cannot name is a refusal the suite cannot check, and it should read as a gap rather
-    /// than as a pass. It is also what a genuine fault on a *valid* variant looks like here,
-    /// and that too should be red.
-    static func refusal(_ error: FourDGSError) -> JSON {
-        .object(["refused": .string(error.refusalCode?.rawValue ?? "")])
+    /// An error the refusal table does not name is not that result, and `nil` says so. The
+    /// caller turns it into a failed invocation — a diagnosis on stderr, a non-zero exit —
+    /// which is the split the Rust and C++ runners already keep through the same optional.
+    /// Printing the missing identifier as `""` instead exits 0, and so claims a valid answer
+    /// for something the format does not define an identifier for: the harness can no longer
+    /// tell "refused for a reason nobody named" from "refused for the wrong reason", and
+    /// `run.py --update` — which writes what a runner prints without parsing it — could
+    /// commit the empty identifier as the expectation every other SDK is scored against.
+    static func refusal(_ error: FourDGSError) -> JSON? {
+        guard let code = error.refusalCode else { return nil }
+        return .object(["refused": .string(code.rawValue)])
     }
 
     static func summarize(path: String, mode: Mode) throws -> JSON {

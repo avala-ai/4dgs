@@ -138,8 +138,15 @@ Future<void> main(List<String> args) async {
     // Both read paths answer the invalid corpus, and they reach the Header by
     // different routes — one front to back, one through the Footer. A check
     // placed on only one of them refuses half the files it should, and only
-    // running both can show that.
-    stdout.writeln(refusalJson(error));
+    // running both can show that. The same rule about what counts as an answer
+    // holds on this route: only an error the refusal table names is one, and
+    // anything else goes to stderr with a non-zero exit. See [refusalAnswer].
+    final String? answer = refusalAnswer(error);
+    if (answer == null) {
+      stderr.writeln('${args.single}: $error');
+      exit(1);
+    }
+    stdout.writeln(answer);
   } catch (error) {
     stderr.writeln(error);
     exit(1);

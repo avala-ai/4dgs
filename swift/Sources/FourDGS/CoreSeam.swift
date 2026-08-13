@@ -636,6 +636,82 @@ enum Core {
         return result
     }
 
+    /// Encode a sequence of samples into a `keyframe-delta` file through the core's writer.
+    ///
+    /// The whole sequence crosses before anything is encoded, because it has to: a delta is a
+    /// difference of bins and never a quantization of a difference (spec §11.7), which holds
+    /// only if every sample was quantized on grids derived from the whole sequence. So this
+    /// pushes each sample into the core's handle and encodes once at the end. Nothing here
+    /// subtracts anything — assembling deltas in Swift would be a second encoder with its own
+    /// rounding, and the point of a binding is that its bytes are the reference's bytes.
+    ///
+    /// Each sample's columns are lent for the length of one call — rule 2 — and the core
+    /// copies them in, so nothing outlives the buffer pointers. The finished bytes are copied
+    /// out before the core's buffer is freed, exactly as ``encode(_:durationSec:options:)``
+    /// does.
+    static func encodeKeyframeDelta(
+        _ samples: [KeyframeDeltaSample], durationSec: Double, options: KeyframeDeltaWriteOptions
+    ) throws -> [UInt8] {
+        guard let writer = fourdgs_kd_writer_new() else {
+            throw FourDGSError.core(
+                code: Int32(FOURDGS_STATUS_INTERNAL.rawValue),
+                message: "the core could not allocate a keyframe-delta writer")
+        }
+        defer { fourdgs_kd_writer_free(writer) }
+
+        try check(fourdgs_kd_writer_set_duration(writer, durationSec))
+        try check(fourdgs_kd_writer_set_cutoff(writer, options.cutoff))
+        try check(
+            fourdgs_kd_writer_set_cadence(writer, options.keyframeEvery, options.deltaMode.rawValue))
+        for index in options.keyframeAt {
+            try check(fourdgs_kd_writer_add_keyframe_at(writer, index))
+        }
+        try setString(options.profile) { fourdgs_kd_writer_set_profile(writer, $0, $1) }
+        if !options.library.isEmpty {
+            try setString(options.library) { fourdgs_kd_writer_set_library(writer, $0, $1) }
+        }
+        try check(
+            fourdgs_kd_writer_set_compression(writer, options.codec, options.compressionLevel))
+
+        for sample in samples {
+            let gaussians = sample.gaussians
+            guard sample.ids.count == gaussians.count else {
+                throw FourDGSError.core(
+                    code: Int32(FOURDGS_STATUS_INVALID_ARGUMENT.rawValue),
+                    message:
+                        "the sample at t0 \(sample.t0) carries \(gaussians.count) gaussians and "
+                        + "\(sample.ids.count) ids; a delta names gaussians by id, so the two are "
+                        + "one list")
+            }
+            // The ids and all nine columns have to be valid at once, because the ABI reads
+            // them in one call — hence the nest, as on the gaussian-birth side.
+            try sample.ids.withUnsafeBufferPointer { identity in
+                try withColumns(
+                    [
+                        gaussians.positions, gaussians.scales, gaussians.rotations, gaussians.colors,
+                        gaussians.motions, gaussians.muT, gaussians.sigmaT, gaussians.winLo,
+                        gaussians.winHi,
+                    ]
+                ) { column in
+                    try check(
+                        fourdgs_kd_writer_add_sample(
+                            writer, sample.t0, UInt32(gaussians.count), identity.baseAddress,
+                            column[0], column[1], column[2], column[3], column[4], column[5],
+                            column[6], column[7], column[8]))
+                }
+            }
+        }
+
+        var buffer: OpaquePointer?
+        let status = fourdgs_kd_writer_encode(writer, &buffer)
+        guard status == ok, let buffer else { throw error(status) }
+        defer { fourdgs_buffer_free(buffer) }
+
+        let length = fourdgs_buffer_len(buffer)
+        guard length > 0, let data = fourdgs_buffer_data(buffer) else { return [] }
+        return Array(UnsafeBufferPointer(start: data, count: length))
+    }
+
     // MARK: - Provenance
 
     /// Canonical provenance JSON for an opened scene (spec §5.15). Empty when the file

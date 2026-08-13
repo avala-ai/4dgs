@@ -77,8 +77,16 @@ void main(List<String> args) {
     // library's own exceptions qualify: anything else — a bug in the runner, a
     // failed check from `checks.dart` — stays a crash, because a decoder must
     // not be able to pass the invalid corpus by falling over in roughly the
-    // right place.
-    stdout.writeln(refusalJson(error));
+    // right place. And not even all of those: an error the refusal table cannot
+    // name is a failed invocation too, because answering it with an empty
+    // identifier would claim a valid answer for a failure no expectation can
+    // check. See [refusalAnswer].
+    final String? answer = refusalAnswer(error);
+    if (answer == null) {
+      stderr.writeln('${args.single}: $error');
+      exit(1);
+    }
+    stdout.writeln(answer);
   } catch (error) {
     stderr.writeln(error);
     exit(1);
