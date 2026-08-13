@@ -9,18 +9,19 @@ Documentation lives at **[4dgs.dev](https://4dgs.dev)** — the specification, p
 and the conformance story, rendered from this repository.
 
 A `.4dgs` file holds a whole moving gaussian-splat scene: gaussians whose position, opacity and
-existence vary continuously over time, plus optional spatial audio sources and a default camera, in
-a single self-contained resource you can range-request and seek like a video. Audio may contain
-multiple fixed or moving sources in the same 3D scene.
+existence vary over time, plus optional spatial audio sources and a default camera, in a single
+self-contained resource you can range-request and seek like a video. Audio may contain multiple
+fixed or moving sources in the same 3D scene.
 
 > This repository is the 4dgs format: its specification, its conformance suite, and SDKs for reading
 > and writing it. Viewers, renderers, engine integrations, and performance tooling are out of scope.
 
 ## What it is
 
-- **Continuous time, not sampled frames.** Each gaussian carries its own birth time, temporal
-  extent, motion and validity window, so the number of live gaussians varies over time with no frame
-  machinery and no fixed splat count.
+- **Time is modelled explicitly.** In `gaussian-birth`, each gaussian carries its own birth time,
+  temporal extent, motion and validity window, so state is reconstructed continuously with no frame
+  machinery. `keyframe-delta` instead tiles the timeline with state chunks and bounded reference
+  chains. Neither model requires a fixed splat count.
 - **Seekable.** A byte-range index maps time to chunks. Displaying an instant reads the index and
   then only that instant's ranges.
 - **Spatial audio is native, and its absence is free.** Each source has independent timing, gain,
