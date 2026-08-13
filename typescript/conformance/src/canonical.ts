@@ -729,19 +729,27 @@ export function canonical(summary: unknown): string {
 }
 
 /**
- * The canonical answer for a file this reader refused.
+ * The canonical answer for a file this reader refused, or `null` when it is not one.
  *
  * A refusal is a result, not a crash: the runner prints this on stdout and exits 0, and
  * the harness diffs it against the expectation like any other answer. Exiting non-zero
  * instead would collapse "refused for the right reason" and "fell over" into one outcome,
  * and telling those two apart is the whole point of the invalid corpus.
  *
- * An error carrying no identifier prints an empty one, which matches no expectation and
- * fails with a readable diff. That is deliberate: a refusal the library cannot name is a
- * refusal the suite cannot check, and it should look like a gap rather than a pass.
+ * An error the refusal table does not name is not that result. `null` says so, and the
+ * caller turns it into a failed invocation — a diagnosis on stderr, a non-zero exit —
+ * which is the same split the Rust and C++ runners keep through their own optional
+ * refusal identifiers. Serializing the missing identifier as `""` instead would exit 0
+ * and so claim a valid answer, even though the
+ * empty string is not an identifier the format defines: the harness could no longer tell
+ * "refused for a reason nobody named" from "refused for the wrong reason", and
+ * `run.py --update` — which writes whatever a runner prints, without parsing it — could
+ * commit the empty identifier as the expectation every other SDK is scored against.
  */
-export function refusalJson(error: FourdgsError): string {
-  return canonical({ refused: error.refusalCode ?? "" });
+export function refusalAnswer(error: FourdgsError): string | null {
+  const code = error.refusalCode;
+  if (code === undefined) return null;
+  return canonical({ refused: code });
 }
 
 function sortKeys(value: unknown): unknown {
