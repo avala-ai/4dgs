@@ -432,10 +432,16 @@ function objectsAndStates(
     const rowForIndex = new Map<number, number>();
     base.indices.forEach((index, row) => rowForIndex.set(index, row));
     const sampleRows: number[] = [];
+    const positionSum = [0, 0, 0];
+    let opacitySum = 0;
     for (const index of order) {
       const row = rowForIndex.get(index);
-      if (row !== undefined) sampleRows.push(row);
-      if (sampleRows.length === SAMPLE) break;
+      if (row === undefined) continue;
+      if (sampleRows.length < SAMPLE) sampleRows.push(row);
+      for (let axis = 0; axis < 3; axis++) {
+        positionSum[axis]! += base.centers[row * 3 + axis]!;
+      }
+      opacitySum += base.opacity[row]!;
     }
 
     const rows = (values: readonly number[], width: number): (number | null)[][] =>
@@ -445,14 +451,6 @@ function objectsAndStates(
         return out;
       });
 
-    const positionSum = [0, 1, 2].map((axis) => {
-      let total = 0;
-      for (let row = 0; row < base.indices.length; row++) total += base.centers[row * 3 + axis]!;
-      return num(total);
-    });
-    let opacitySum = 0;
-    for (const value of base.opacity) opacitySum += value;
-
     return {
       t: num(t),
       liveCount: String(base.indices.length),
@@ -461,7 +459,10 @@ function objectsAndStates(
         orientations: rows(base.orientations, 4),
         objectIds: sampleRows.map((row) => String(base.objectIds[row])),
       },
-      aggregate: { positionSum, opacitySum: num(opacitySum) },
+      aggregate: {
+        positionSum: positionSum.map((value) => num(value)),
+        opacitySum: num(opacitySum),
+      },
     };
   });
 
@@ -664,15 +665,18 @@ function summarizeSh(gaussians: GaussianSet, order: readonly number[]): unknown 
  *
  * Chunking and spatial ordering are encoder choices, so decoded order is not part of the
  * contract — but a comparison needs some order. The key is the gaussian's whole decoded
- * state, rounded exactly as the summary rounds it, with its spherical harmonic
- * coefficients last. Two gaussians that tie on all of it are identical in every value
- * this summary emits, so their relative order cannot change the output.
+ * state, rounded exactly as the summary rounds it, followed by exact decoded floats as
+ * a final content tiebreaker. Spherical harmonic coefficients and object membership keep
+ * their existing positions before that tiebreaker, so rows that never tied retain their
+ * existing order. Two gaussians that tie on the exact values are identical in everything
+ * this summary composes or emits, so their relative order cannot change the output.
  */
 function stableOrder(gaussians: GaussianSet): number[] {
   const keys: number[][] = new Array<number[]>(gaussians.count);
   const shWidth = gaussians.sh === null ? 0 : gaussians.sh.coefficients * 3;
   for (let i = 0; i < gaussians.count; i++) {
     const row: number[] = [];
+    const exact: number[] = [];
     for (const [array, width] of [
       [gaussians.positions, 3],
       [gaussians.scales, 3],
@@ -680,14 +684,21 @@ function stableOrder(gaussians: GaussianSet): number[] {
       [gaussians.colors, 4],
       [gaussians.motions, 3],
     ] as const) {
-      for (let k = 0; k < width; k++) row.push(sortable(array[i * width + k]!));
+      for (let k = 0; k < width; k++) {
+        const value = array[i * width + k]!;
+        row.push(sortable(value));
+        exact.push(...exactSortable(value));
+      }
     }
-    row.push(
-      sortable(gaussians.muT[i]!),
-      sortable(gaussians.sigmaT[i]!),
-      sortable(gaussians.winLo[i]!),
-      sortable(gaussians.winHi[i]!),
-    );
+    for (const value of [
+      gaussians.muT[i]!,
+      gaussians.sigmaT[i]!,
+      gaussians.winLo[i]!,
+      gaussians.winHi[i]!,
+    ]) {
+      row.push(sortable(value));
+      exact.push(...exactSortable(value));
+    }
     for (let k = 0; k < shWidth; k++) row.push(gaussians.sh!.values[i * shWidth + k]!);
     // Membership joins the key, after the harmonics and before the index tiebreak, exactly
     // where the Python and Rust references put it. Two gaussians can tie on every rounded
@@ -695,6 +706,7 @@ function stableOrder(gaussians: GaussianSet): number[] {
     // states composed from it, would be ordered by decode order, which differs between two
     // correct readers that chunked the scene differently.
     if (gaussians.objectId !== null) row.push(gaussians.objectId[i]!);
+    row.push(...exact);
     row.push(i);
     keys[i] = row;
   }
@@ -721,6 +733,15 @@ function sortable(value: number): number {
   if (Number.isNaN(value)) return Infinity;
   if (!Number.isFinite(value)) return value;
   return roundHalfEven(value, FLOAT_DECIMALS);
+}
+
+/** A total order for exact decoded floats after their rounded keys tie. */
+function exactSortable(value: number): readonly [number, number] {
+  if (Number.isNaN(value)) return [3, 0];
+  if (value === -Infinity) return [0, 0];
+  if (value === Infinity) return [2, 0];
+  // The canonical form does not expose signed zero, so it must not distinguish it here.
+  return [1, value + 0];
 }
 
 /** Stable JSON: sorted keys, two-space indent, the shape the expectations are stored in. */
