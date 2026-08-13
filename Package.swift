@@ -94,11 +94,27 @@ let package = Package(
         .executableTarget(
             name: "decode_indexed", dependencies: ["ConformanceSupport"],
             path: "swift/conformance/decode_indexed"),
+        // What those two executables claim about a file they will not decode: a named
+        // refusal is an answer on stdout, and anything else is a failed invocation. The
+        // tests spawn the built binaries, because `Runner.main` ends in `exit` and the
+        // three things the harness reads — stdout, stderr, status — cannot be observed
+        // from inside the process.
+        .testTarget(
+            name: "ConformanceRunnerTests", dependencies: ["ConformanceSupport", "FourDGS"],
+            path: "swift/Tests/ConformanceRunnerTests"),
 
         // The other direction: re-encode a variant's gaussians through the core's writer and
         // write a file the cross-language encode gate diffs against the Rust reference.
         .executableTarget(
             name: "encode_roundtrip", dependencies: ["FourDGS"], path: "swift/conformance/encode_roundtrip"),
+
+        // The same direction for the other temporal model. Separate because it produces a
+        // sequence of populations rather than re-encoding one scene, and because its gate
+        // grades it differently: there is no second keyframe-delta encoder here to diff
+        // against, so the claim is made against the Python reference's decode.
+        .executableTarget(
+            name: "encode_keyframe_delta", dependencies: ["FourDGS"],
+            path: "swift/conformance/encode_keyframe_delta"),
 
         // Prints the canonical JSON for a scene built from a fixed seed, with no decoding
         // involved, so that the Swift emitter can be diffed against canonical.py before

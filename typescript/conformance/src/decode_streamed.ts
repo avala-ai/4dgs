@@ -25,7 +25,7 @@ import {
 } from "@4dgs/core";
 import { FileHandleReadable } from "@4dgs/nodejs";
 
-import { AudioPayloadDigests, canonical, refusalJson, summarize } from "./canonical.js";
+import { AudioPayloadDigests, canonical, refusalAnswer, summarize } from "./canonical.js";
 import { checkStreamedRecords, checkTruncationRecovery } from "./checks.js";
 
 /** Reads small enough that even the smallest variant arrives in several of them. */
@@ -104,5 +104,14 @@ try {
   // failed check in checks.ts — stays a crash, because a decoder must not be able to
   // pass the invalid corpus by falling over in roughly the right place.
   if (!(error instanceof FourdgsError)) throw error;
-  process.stdout.write(refusalJson(error) + "\n");
+  // And not even all of those: an error the refusal table cannot name is a failed
+  // invocation, not a refusal. It goes to stderr with a non-zero exit, because printing
+  // an empty identifier and exiting 0 would claim a valid answer for a failure no
+  // expectation can check. See `refusalAnswer`.
+  const answer = refusalAnswer(error);
+  if (answer === null) {
+    process.stderr.write(`${path}: ${error.message}\n`);
+    process.exit(1);
+  }
+  process.stdout.write(answer + "\n");
 }
