@@ -179,6 +179,45 @@ fn an_inclusive_support_endpoint_does_not_enter_a_half_open_child() {
 }
 
 #[test]
+fn rounded_visibility_below_the_lower_support_endpoint_stays_indexed() {
+    let cutoff = 0.9;
+    let mut g = one_temporal_gaussian(0.5, 1.0, 1.0);
+    let seed = fourdgs::write_to_vec(
+        &g,
+        1.0,
+        &one_gaussian_chunking(cutoff, 0),
+        &SceneExtras::default(),
+    )
+    .expect("seed encode");
+    let reconstructed = fourdgs::read_bytes(&seed).expect("seed decode");
+    let mu = reconstructed.gaussians.mu_t[0] as f64;
+    let sigma = reconstructed.gaussians.sigma_t[0] as f64;
+    let boundary = mu - fourdgs::quantization::support_k(cutoff) * sigma;
+    let duration = 2.0 * boundary;
+    g.win_hi[0] = duration as f32;
+
+    let bytes = fourdgs::write_to_vec(
+        &g,
+        duration,
+        &one_gaussian_chunking(cutoff, 1),
+        &SceneExtras::default(),
+    )
+    .expect("encode");
+    let decoded = fourdgs::read_bytes(&bytes).expect("decode");
+    let mu = decoded.gaussians.mu_t[0] as f64;
+    let sigma = decoded.gaussians.sigma_t[0] as f64;
+    assert_eq!(
+        mu - fourdgs::quantization::support_k(cutoff) * sigma,
+        boundary
+    );
+
+    let below = f64::from_bits(boundary.to_bits() - 1);
+    let z = (below - mu) / sigma.max(1e-30);
+    assert!((-0.5 * z * z).exp() >= cutoff);
+    assert_indexed_gaussian_is_visible(&bytes, below);
+}
+
+#[test]
 fn cutoff_one_indexed_seek_covers_both_neighbors_of_the_mean() {
     let cutoff = 1.0;
     let g = one_temporal_gaussian(0.5, 0.1, 1.0);
@@ -196,6 +235,95 @@ fn cutoff_one_indexed_seek_covers_both_neighbors_of_the_mean() {
 
     assert_indexed_gaussian_is_visible(&bytes, below);
     assert_indexed_gaussian_is_visible(&bytes, above);
+}
+
+#[test]
+fn top_level_containment_does_not_tolerate_support_past_its_t1() {
+    // Gaussian 1 contributes an exact 0.5 top-level split but is absent at that instant.
+    // At cutoff one, gaussian 0 remains visible across a tiny rounded plateau around its
+    // mean. Its conservative upper support is less than 1e-9 past the split: accepting
+    // that support into [0, 0.5) makes the indexed seek at 0.5 miss the only live row.
+    let mut g = GaussianSet {
+        positions: vec![0.0; 6],
+        scales: vec![0.01; 6],
+        rotations: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        colors: vec![0.5, 0.5, 0.5, 1.0, 0.25, 0.25, 0.25, 1.0],
+        motions: vec![0.0; 6],
+        mu_t: vec![0.5, 0.25],
+        sigma_t: vec![0.1, f32::INFINITY],
+        win_lo: vec![0.0, 0.0],
+        win_hi: vec![1.0, 0.5],
+        ..Default::default()
+    };
+    // Keep the two rows distinguishable if a failure needs inspection.
+    g.positions[3] = 1.0;
+
+    let bytes = fourdgs::write_to_vec(
+        &g,
+        1.0,
+        &one_gaussian_chunking(1.0, 1),
+        &SceneExtras::default(),
+    )
+    .expect("encode");
+    assert_indexed_gaussian_is_visible(&bytes, 0.5);
+}
+
+#[test]
+fn support_planning_covers_subtraction_rounding_after_endpoint_cancellation() {
+    let cutoff = (-0.5_f64).exp();
+    let mut options = one_gaussian_chunking(cutoff, 0);
+    options.profile = Profile::Coarse;
+    let seed = fourdgs::write_to_vec(
+        &one_temporal_gaussian(0.0, 10_000_000.0, 1.0),
+        1.0,
+        &options,
+        &SceneExtras::default(),
+    )
+    .expect("seed encode");
+    let seed = fourdgs::read_bytes(&seed).expect("seed decode");
+    let reconstructed = seed.gaussians.sigma_t[0];
+    let magnitude = reconstructed as f64;
+    let ulp = f64::from_bits(magnitude.to_bits() + 1) - magnitude;
+    let duration = 0.5 * ulp;
+    let t = 0.5 * duration;
+
+    let g = one_temporal_gaussian(-reconstructed, reconstructed, duration as f32);
+    options.max_depth = 1;
+    let bytes =
+        fourdgs::write_to_vec(&g, duration, &options, &SceneExtras::default()).expect("encode");
+    let decoded = fourdgs::read_bytes(&bytes).expect("decode");
+    let mu = decoded.gaussians.mu_t[0] as f64;
+    let sigma = decoded.gaussians.sigma_t[0] as f64;
+    assert_eq!(mu, -magnitude);
+    assert_eq!(sigma, magnitude);
+    assert_eq!(mu + sigma, 0.0, "the closed-form endpoint cancels");
+
+    let distance = (t - mu) / sigma;
+    assert_eq!(distance, 1.0, "binary64 subtraction rounds back to sigma");
+    assert!((-0.5 * distance * distance).exp() >= cutoff);
+    assert_indexed_gaussian_is_visible(&bytes, t);
+}
+
+#[test]
+fn support_planning_covers_the_complete_rounded_visibility_plateau() {
+    let cutoff = 0.5;
+    let endpoint = 6_042_103.559_942_351_f64;
+    let g = one_temporal_gaussian(-6_222_906.0, 10_416_940.0, 20_000_000.0);
+    let bytes = fourdgs::write_to_vec(
+        &g,
+        2.0 * endpoint,
+        &one_gaussian_chunking(cutoff, 1),
+        &SceneExtras::default(),
+    )
+    .expect("encode");
+    let decoded = fourdgs::read_bytes(&bytes).expect("decode");
+    assert_eq!(decoded.gaussians.mu_t[0], -6_222_906.0);
+    assert_eq!(decoded.gaussians.sigma_t[0], 10_416_940.0);
+    let mu = decoded.gaussians.mu_t[0] as f64;
+    let sigma = decoded.gaussians.sigma_t[0] as f64;
+    let z = (endpoint - mu) / sigma.max(1e-30);
+    assert_eq!((-0.5 * z * z).exp(), cutoff);
+    assert_indexed_gaussian_is_visible(&bytes, endpoint);
 }
 
 #[test]

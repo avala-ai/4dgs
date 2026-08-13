@@ -373,13 +373,13 @@ fn quantize_scene(g: &GaussianSet, opts: &WriteOptions) -> Result<Quantized> {
 /// Containment bounds for the temporal state this file reconstructs.
 ///
 /// Chunk membership is an indexed-read promise, so plan from decoded public `f32` values,
-/// not from the unquantized values the caller supplied. The marginal's upper endpoint is
-/// inclusive (`marginal >= cutoff`), while a chunk's upper endpoint is not; advance an
-/// unclipped upper bound by one representable `f64` so equality cannot put it in the child
-/// that ends there. A validity window already excludes its own upper endpoint and needs no
-/// such adjustment.
+/// not from the unquantized values the caller supplied. Invert the predecessor of `cutoff`
+/// rather than `cutoff` itself: public visibility evaluates subtraction, division, squaring,
+/// and `exp` in binary64, so a value just below the mathematical threshold can round back to
+/// `cutoff`. The half-width and its endpoints are rounded outwards independently. This also
+/// accounts for catastrophic cancellation in `mu +/- half`, where one ULP of the resulting
+/// endpoint can be far smaller than the rounding lost by the addition.
 fn planning_support(q: &Quantized, cutoff: f64) -> (Vec<f64>, Vec<f64>) {
-    let k = support_k(cutoff);
     let mut lo = Vec::with_capacity(q.mu.len());
     let mut hi = Vec::with_capacity(q.mu.len());
     for i in 0..q.mu.len() {
@@ -391,29 +391,31 @@ fn planning_support(q: &Quantized, cutoff: f64) -> (Vec<f64>, Vec<f64>) {
         };
         let t_step = mu_step(q.sigma[i], q.steps.sigma_log, never_fades, q.steps.time);
         let mu = ((q.mu[i] as f64 * t_step) as f32) as f64;
-        let mut half = if never_fades {
-            f64::INFINITY
-        } else {
-            k * sigma.max(1e-30)
-        };
-        if cutoff == 1.0 && !never_fades {
-            // Mathematically support is the single instant `mu`, but state_at evaluates
-            // the marginal in binary64. `exp(-x)` rounds to exactly 1 over a small interval
-            // around it. This normalized bound strictly contains that rounding plateau,
-            // including the division and square roundings, without a scene-scale epsilon.
-            half = 2.0 * f64::EPSILON.sqrt() * sigma.max(1e-30);
-        }
-
         let window = q.windows[q.window_index[i] as usize];
-        let marginal_hi = mu + half;
-        lo.push((mu - half).max(window.0));
-        let mut upper = marginal_hi.min(window.1);
-        if marginal_hi < window.1 {
-            upper = next_up(upper);
-        }
-        hi.push(upper);
+        let (marginal_lo, marginal_hi) = marginal_support(mu, sigma, cutoff);
+        lo.push(marginal_lo.max(window.0));
+        hi.push(marginal_hi.min(window.1));
     }
     (lo, hi)
+}
+
+fn marginal_support(mu: f64, sigma: f64, cutoff: f64) -> (f64, f64) {
+    let half = if sigma.is_infinite() {
+        f64::INFINITY
+    } else {
+        let marginal_floor = next_down(cutoff);
+        if marginal_floor == 0.0 {
+            f64::INFINITY
+        } else {
+            // `state_at` rounds both `(t - mu)` and the division by sigma before the
+            // marginal comparison. Gamma(2) bounds those two operations in ratio space;
+            // inflate by it before directing the time-domain arithmetic outwards.
+            let unit_roundoff = f64::EPSILON / 2.0;
+            let guard = 2.0 * unit_roundoff / (1.0 - 2.0 * unit_roundoff);
+            next_up(support_k(marginal_floor) * sigma.max(1e-30) * (1.0 + guard))
+        }
+    };
+    (next_down(mu - half), next_up(mu + half))
 }
 
 /// The next representable value toward positive infinity, matching `nextafter(x, +inf)`.
@@ -426,6 +428,18 @@ fn next_up(value: f64) -> f64 {
     }
     let bits = value.to_bits();
     f64::from_bits(if value > 0.0 { bits + 1 } else { bits - 1 })
+}
+
+/// The next representable value toward negative infinity, matching `nextafter(x, -inf)`.
+fn next_down(value: f64) -> f64 {
+    if value.is_nan() || value == f64::NEG_INFINITY {
+        return value;
+    }
+    if value == 0.0 {
+        return -f64::from_bits(1);
+    }
+    let bits = value.to_bits();
+    f64::from_bits(if value > 0.0 { bits - 1 } else { bits + 1 })
 }
 
 /// The median of a slice, taken the way NumPy takes it: the mean of the two middle values
@@ -537,7 +551,7 @@ fn plan_chunks(
     for pair in tops.windows(2) {
         let (a, b) = (pair[0], pair[1]);
         let pool: Vec<usize> = (0..n)
-            .filter(|i| lo[*i] >= a - 1e-9 && hi[*i] <= b + 1e-9 && assigned[*i] == usize::MAX)
+            .filter(|i| lo[*i] >= a && hi[*i] <= b && assigned[*i] == usize::MAX)
             .collect();
         let kept = tree.descend(a, b, 0, pool, &mut nodes, &mut assigned);
         if !kept.is_empty() {
@@ -1358,4 +1372,45 @@ fn assert_bounds(worst: &BTreeMap<&'static str, f64>, bounds: &Bounds) -> Result
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod planning_tests {
+    use super::{marginal_support, next_up};
+    use crate::quantization::support_k;
+
+    #[test]
+    fn directed_support_survives_large_operand_cancellation() {
+        let mu: f64 = -4_672_108_911_132_672.0;
+        let sigma: f64 = 4_672_108_911_132_672.0;
+        let cutoff = (-0.5_f64).exp();
+        let t = 0.5;
+
+        let rounded_distance = (t - mu) / sigma;
+        assert_eq!(rounded_distance, 1.0);
+        assert!((-0.5 * rounded_distance * rounded_distance).exp() >= cutoff);
+        assert!(
+            next_up(mu + support_k(cutoff) * sigma) < t,
+            "one ULP of the cancelled endpoint is not a conservative bound"
+        );
+        let (_, hi) = marginal_support(mu, sigma, cutoff);
+        assert!(hi > t, "the outward bound must contain visible t={t}");
+    }
+
+    #[test]
+    fn directed_support_ends_strictly_outside_the_rounded_plateau() {
+        let mu = -6_222_906.0;
+        let sigma = 10_416_940.0;
+        let cutoff = 0.5;
+        let (lo, hi) = marginal_support(mu, sigma, cutoff);
+
+        for endpoint in [lo, hi] {
+            let z = (endpoint - mu) / sigma;
+            let marginal = (-0.5 * z * z).exp();
+            assert!(
+                marginal < cutoff,
+                "directed endpoint {endpoint} remains visible at marginal {marginal}"
+            );
+        }
+    }
 }
