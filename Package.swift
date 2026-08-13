@@ -94,6 +94,14 @@ let package = Package(
         .executableTarget(
             name: "decode_indexed", dependencies: ["ConformanceSupport"],
             path: "swift/conformance/decode_indexed"),
+        // What those two executables claim about a file they will not decode: a named
+        // refusal is an answer on stdout, and anything else is a failed invocation. The
+        // tests spawn the built binaries, because `Runner.main` ends in `exit` and the
+        // three things the harness reads — stdout, stderr, status — cannot be observed
+        // from inside the process.
+        .testTarget(
+            name: "ConformanceRunnerTests", dependencies: ["ConformanceSupport", "FourDGS"],
+            path: "swift/Tests/ConformanceRunnerTests"),
 
         // The other direction: re-encode a variant's gaussians through the core's writer and
         // write a file the cross-language encode gate diffs against the Rust reference.
