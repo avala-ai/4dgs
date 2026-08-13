@@ -533,14 +533,26 @@ pub fn check_timeline_endpoints(
 /// Answered from the index alone — no chunk is fetched to learn what another references —
 /// and returned oldest first, which is the order [`apply_delta`] composes in.
 pub fn chain_for(index: &[ChunkIndexEntry], t: f64) -> Result<Vec<ChunkIndexEntry>, Refusal> {
+    let current = match index.iter().find(|e| e.t0 <= t && t < e.t1) {
+        Some(e) => e,
+        None => return refuse("non-tiling-chunks", format!("no state chunk covers t={t}")),
+    };
+    chain_ending_at(index, current)
+}
+
+/// The chain ending at one particular index entry.
+///
+/// Full-file validation has an entry already, so it must not recover that entry through a
+/// representative instant: a valid empty `[t, t)` state has no such instant. Instant seeks
+/// still select their entry through [`chain_for`] and then share this reference walk.
+pub(crate) fn chain_ending_at(
+    index: &[ChunkIndexEntry],
+    current: &ChunkIndexEntry,
+) -> Result<Vec<ChunkIndexEntry>, Refusal> {
     let mut by_offset: BTreeMap<u64, &ChunkIndexEntry> = BTreeMap::new();
     for entry in index {
         by_offset.insert(entry.chunk_offset, entry);
     }
-    let current = match index.iter().find(|e| e.t0 <= t && t < e.t1) {
-        Some(e) => e.clone(),
-        None => return refuse("non-tiling-chunks", format!("no state chunk covers t={t}")),
-    };
 
     let mut chain: Vec<ChunkIndexEntry> = vec![current.clone()];
     while chain[0].kind != 0 {

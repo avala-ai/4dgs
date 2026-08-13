@@ -527,6 +527,33 @@ fn an_empty_zero_width_interval_is_still_a_valid_tiling() {
 }
 
 #[test]
+fn a_final_empty_zero_width_interval_round_trips_through_indexed_decode() {
+    use fourdgs::keyframe_delta_file::{decode_indexed, write_sequence, KeyframeDeltaOptions};
+
+    for (samples, duration_sec, expected) in [
+        (
+            vec![sample_at(0.0), sample_at(1.0)],
+            1.0,
+            vec![(0.0, 1.0), (1.0, 1.0)],
+        ),
+        (vec![sample_at(0.0)], 0.0, vec![(0.0, 0.0)]),
+    ] {
+        let bytes = write_sequence(&samples, duration_sec, &KeyframeDeltaOptions::default())
+            .expect("an empty zero-width terminal state is authorable");
+        let decoded = decode_indexed(&bytes)
+            .expect("the indexed decoder can compose the writer's zero-width terminal state");
+        let intervals: Vec<_> = decoded
+            .0
+            .chunks
+            .iter()
+            .map(|chunk| (chunk.t0, chunk.t1))
+            .collect();
+        assert_eq!(intervals, expected);
+        assert_eq!(decoded.0.chunks.last().unwrap().state.count(), 0);
+    }
+}
+
+#[test]
 fn the_writer_refuses_non_finite_timeline_values() {
     let sample = writer_timeline_error(&[0.0, f64::NAN], 2.0);
     assert!(sample.contains("sample 1"), "{sample}");

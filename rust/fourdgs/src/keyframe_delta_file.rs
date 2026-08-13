@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::codec;
 use crate::error::{Error, Result};
 use crate::keyframe_delta::{
-    apply_delta, chain_for, check_tiling, check_timeline_endpoints, keyframe_state, BinArray,
+    apply_delta, chain_ending_at, check_tiling, check_timeline_endpoints, keyframe_state, BinArray,
     State, ABSOLUTE_IN_UPDATE, GOP_INVARIANT,
 };
 use crate::model::GaussianSet;
@@ -1592,7 +1592,9 @@ pub fn compose_chain<R: crate::Readable + ?Sized>(
     quantization: &rec::Quantization,
     windows: &[(f64, f64)],
 ) -> Result<State> {
-    let chain = chain_for(index, (entry.t0 + entry.t1) / 2.0)?;
+    // Compose the entry the caller named. Recovering it via a midpoint is equivalent for
+    // ordinary half-open intervals, but impossible for a valid empty `[t, t)` entry.
+    let chain = chain_ending_at(index, entry)?;
     let mut state: Option<State> = None;
     for link in &chain {
         if link.kind == 0 {
