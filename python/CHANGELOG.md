@@ -33,6 +33,12 @@ All notable changes to the Python package are documented here, following
   gaussian ids than the validator counts is not thereby invalid, so it collects a warning saying
   which check went unmade rather than an error saying the file is broken.
 
+  An outsized file that is _also_ invalid is refused, not excused. Reuse is tested as the pass runs,
+  before the ceiling is consulted, so a file that both reintroduces a dead `gaussian_id` and carries
+  more ids than the reader counts is refused for the reuse — at the chunk where it appears, with
+  that chunk's offset. The first version of this change consulted the ceiling first, which made the
+  reuse refusal unreachable and had `4dgs validate` report a file violating §11.2 as valid, exit 0.
+
 ## [0.4.0] - 2026-08-12
 
 ### Fixed
