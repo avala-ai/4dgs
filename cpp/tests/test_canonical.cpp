@@ -46,15 +46,11 @@ GaussianData scene(std::size_t n, unsigned seed) {
   return data;
 }
 
-/// The same gaussians, visited in a different order.
-GaussianData shuffled(const GaussianData& source, unsigned seed) {
-  std::vector<std::size_t> order(source.count);
-  for (std::size_t i = 0; i < source.count; ++i) order[i] = i;
-  std::mt19937 rng(seed);
-  std::shuffle(order.begin(), order.end(), rng);
-
+/// The same gaussians, visited in the requested order.
+GaussianData permuted(const GaussianData& source, const std::vector<std::size_t>& order) {
   GaussianData out;
   out.resize(source.count, source.shDegree, source.shCoefficients);
+  const std::size_t shWidth = source.shCoefficients * 3;
   for (std::size_t to = 0; to < order.size(); ++to) {
     const std::size_t from = order[to];
     for (std::size_t k = 0; k < 3; ++k) {
@@ -70,9 +66,20 @@ GaussianData shuffled(const GaussianData& source, unsigned seed) {
     out.sigmaT[to] = source.sigmaT[from];
     out.winLo[to] = source.winLo[from];
     out.winHi[to] = source.winHi[from];
-    for (std::size_t k = 0; k < 9; ++k) out.sh[to * 9 + k] = source.sh[from * 9 + k];
+    for (std::size_t k = 0; k < shWidth; ++k) {
+      out.sh[to * shWidth + k] = source.sh[from * shWidth + k];
+    }
   }
   return out;
+}
+
+/// The same gaussians, visited in a different order.
+GaussianData shuffled(const GaussianData& source, unsigned seed) {
+  std::vector<std::size_t> order(source.count);
+  for (std::size_t i = 0; i < source.count; ++i) order[i] = i;
+  std::mt19937 rng(seed);
+  std::shuffle(order.begin(), order.end(), rng);
+  return permuted(source, order);
 }
 
 std::string summarize(const GaussianData& data) {
@@ -99,6 +106,39 @@ void orderCannotChangeTheSummary() {
   for (unsigned seed = 1; seed <= 3; ++seed) {
     CHECK_EQ(summarize(shuffled(original, seed)), first);
   }
+}
+
+/// Exact decoded values are the final content tiebreaker. Both motions round to zero in
+/// the canonical key, so a stable sort alone would preserve the resident order and put
+/// the larger motion first after the permutation.
+void roundedTiesUseExactDecodedValues() {
+  GaussianData original = scene(2, 19);
+  for (std::size_t k = 0; k < 3; ++k) {
+    original.positions[3 + k] = original.positions[k];
+    original.scales[3 + k] = original.scales[k];
+  }
+  for (std::size_t k = 0; k < 4; ++k) {
+    original.rotations[4 + k] = original.rotations[k];
+    original.colors[4 + k] = original.colors[k];
+  }
+  original.motions[0] = 1e-7f;
+  original.motions[1] = original.motions[2] = 0.0f;
+  original.motions[3] = 4e-7f;
+  original.motions[4] = original.motions[5] = 0.0f;
+  original.muT[1] = original.muT[0];
+  original.sigmaT[1] = original.sigmaT[0];
+  original.winLo[1] = original.winLo[0];
+  original.winHi[1] = original.winHi[0];
+  for (std::size_t k = 0; k < 9; ++k) original.sh[9 + k] = original.sh[k];
+
+  const GaussianData reversed = permuted(original, {1, 0});
+  const GaussianView originalView(original);
+  const GaussianView reversedView(reversed);
+  const std::vector<std::size_t> originalOrder = fourdgs::conformance::stableOrder(originalView);
+  const std::vector<std::size_t> reversedOrder = fourdgs::conformance::stableOrder(reversedView);
+
+  CHECK_EQ(originalView.motions[originalOrder[0] * 3], 1e-7f);
+  CHECK_EQ(reversedView.motions[reversedOrder[0] * 3], 1e-7f);
 }
 
 void integersAreStringsAndInfinityIsNull() {
@@ -149,6 +189,7 @@ void stringsAreEscaped() {
 
 void runTests() {
   orderCannotChangeTheSummary();
+  roundedTiesUseExactDecodedValues();
   integersAreStringsAndInfinityIsNull();
   floatsAreRoundedToSixDecimals();
   absentAudioIsAValue();

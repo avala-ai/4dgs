@@ -62,8 +62,9 @@ Json integer(std::int64_t value);
 /// and not merely their length.
 std::string crc32String(const std::uint8_t* data, std::size_t length);
 
-/// The content order both implementations reproduce: the gaussian's whole decoded state,
-/// rounded exactly as the summary rounds it, with its spherical harmonic coefficients last.
+/// The content order every implementation reproduces: the gaussian's whole decoded state,
+/// rounded exactly as the summary rounds it, followed by SH, membership, and exact decoded
+/// floats as the final tiebreaker.
 std::vector<std::size_t> stableOrder(const GaussianView& gaussians);
 
 /// What a summary needs beyond the gaussians. A record that changes nothing here is a record

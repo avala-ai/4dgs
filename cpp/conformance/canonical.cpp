@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <utility>
 
 namespace fourdgs {
 namespace conformance {
@@ -42,6 +43,27 @@ double sortable(double value) {
   if (std::isnan(value)) return std::numeric_limits<double>::infinity();
   if (std::isinf(value)) return value;
   return roundToDecimals(value);
+}
+
+int exactClass(double value) {
+  if (std::isnan(value)) return 3;
+  if (value == -std::numeric_limits<double>::infinity()) return 0;
+  if (value == std::numeric_limits<double>::infinity()) return 2;
+  return 1;
+}
+
+/// A total order for exact decoded floats after their rounded keys tie.
+int compareExact(double a, double b) {
+  const int classA = exactClass(a);
+  const int classB = exactClass(b);
+  if (classA < classB) return -1;
+  if (classB < classA) return 1;
+  if (classA != 1) return 0;
+  // Ordinary comparisons deliberately treat the canonical form's indistinguishable
+  // signed zeros as equal.
+  if (a < b) return -1;
+  if (b < a) return 1;
+  return 0;
 }
 
 std::string escape(const std::string& text) {
@@ -343,14 +365,40 @@ std::vector<std::size_t> stableOrder(const GaussianView& gaussians) {
 
   std::vector<std::size_t> order(n);
   for (std::size_t i = 0; i < n; ++i) order[i] = i;
-  // Stable, so that two gaussians identical in every value the summary emits keep the order
-  // they arrived in — which cannot change any number here, and makes the sort reproducible.
+  // Stability is now reached only for exact decoded duplicates. Their resident order cannot
+  // change any value this summary emits or composes.
   std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
     const double* rowA = keys.data() + a * width;
     const double* rowB = keys.data() + b * width;
     for (std::size_t k = 0; k < width; ++k) {
       if (rowA[k] < rowB[k]) return true;
       if (rowB[k] < rowA[k]) return false;
+    }
+
+    // Preserve the established rounded/SH/membership order above. Exact decoded floats
+    // are only a final tiebreaker, so rows that never tied retain their existing order.
+    // Compare them from the source views here rather than tripling the key allocation.
+    const auto compareAttribute = [&](const Span<const float>& values, std::size_t attributeWidth) {
+      for (std::size_t k = 0; k < attributeWidth; ++k) {
+        const int compared =
+            compareExact(values[a * attributeWidth + k], values[b * attributeWidth + k]);
+        if (compared != 0) return compared;
+      }
+      return 0;
+    };
+    for (const auto& attribute : {
+             std::make_pair(&gaussians.positions, std::size_t{3}),
+             std::make_pair(&gaussians.scales, std::size_t{3}),
+             std::make_pair(&gaussians.rotations, std::size_t{4}),
+             std::make_pair(&gaussians.colors, std::size_t{4}),
+             std::make_pair(&gaussians.motions, std::size_t{3}),
+             std::make_pair(&gaussians.muT, std::size_t{1}),
+             std::make_pair(&gaussians.sigmaT, std::size_t{1}),
+             std::make_pair(&gaussians.winLo, std::size_t{1}),
+             std::make_pair(&gaussians.winHi, std::size_t{1}),
+         }) {
+      const int compared = compareAttribute(*attribute.first, attribute.second);
+      if (compared != 0) return compared < 0;
     }
     return false;
   });
