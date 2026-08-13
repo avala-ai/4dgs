@@ -283,6 +283,28 @@ class TestRoundTrip:
         assert float(np.float32(q_mu[0]) + reconstructed_sigma) == 0.0
         assert lo[0] <= 0.5 < hi[0]
 
+    def test_planning_support_is_strictly_outside_large_time_visibility(self):
+        from fourdgs.writer import _planning_support
+
+        sigma_log_step = math.log(10416940.0) / 408.0
+        cutoff = 0.5
+        lo, hi = _planning_support(
+            np.array([-6222906]),
+            np.array([408]),
+            np.array([1.0]),
+            sigma_log_step,
+            np.array([False]),
+            np.array([[0.0, 20_000_000.0]]),
+            np.array([0]),
+            cutoff,
+        )
+        mu = float(np.float32(-6222906.0))
+        sigma = float(np.float32(np.exp(408 * sigma_log_step)))
+        marginal = math.exp(-0.5 * ((hi[0] - mu) / sigma) ** 2)
+
+        assert lo[0] == 0.0
+        assert marginal < cutoff
+
     def test_planning_support_uses_the_state_sigma_floor(self):
         from fourdgs.writer import _planning_support
 

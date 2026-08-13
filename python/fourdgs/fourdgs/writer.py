@@ -159,6 +159,13 @@ def _planning_support(q_mu, q_sigma, t_step, sigma_log_step, never_fades, window
         if marginal_floor == 0.0
         else support_k(float(marginal_floor)) * effective_sigma
     )
+    # The inverse above bounds the mathematical ratio. state_at obtains that ratio by a
+    # rounded subtraction and division; gamma(2) is the standard forward-error bound for
+    # those two binary64 operations. Inflate once in ratio space so their result cannot
+    # round back inside the visible plateau at large, cancellation-prone scene times.
+    unit_roundoff = np.finfo(np.float64).eps / 2.0
+    arithmetic_guard = 2.0 * unit_roundoff / (1.0 - 2.0 * unit_roundoff)
+    half *= 1.0 + arithmetic_guard
     half = np.where(never_fades, np.inf, half)
     # Window Table records are f64, but GaussianSet exposes the decoded window lanes as
     # f32 and state_at evaluates those values. Plan from that same public state.
