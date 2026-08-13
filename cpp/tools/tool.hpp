@@ -365,6 +365,15 @@ struct Report {
   std::optional<Severity> worst() const;
 };
 
+/// Record why model validation could not finish. Exposed so the tool suite can pin the
+/// distinction among input I/O, bounded-validator limits, internal failures, and scratch I/O.
+void reportKeyframeDeltaToolFailure(Report* report, const char* pathName, const Error& failure,
+                                    bool identitySinkFailed);
+
+/// Turn the failure state left by `ofstream::close` into the bounded scratch-I/O diagnosis.
+/// Exposed so the tool suite can pin delayed close failures without a platform-specific disk.
+Result<void> checkIdentityPartitionClose(const std::ostream& writer, std::size_t bucket);
+
 /// Every check, reading ranges of `source`.
 Report validate(Readable& source);
 

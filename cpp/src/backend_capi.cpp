@@ -100,13 +100,22 @@ Result<void> check(int status) {
 /// not a member of `Handle`.
 struct ReadableBridge {
   Readable* source = nullptr;
+  std::optional<Error>* error = nullptr;
+};
+
+struct IdentityBridge {
+  const std::function<Result<void>(std::uint64_t, std::uint32_t)>* introduce = nullptr;
+  std::optional<Error> error;
 };
 
 int bridgeSize(void* ctx, std::uint64_t* outSize) {
   ReadableBridge* bridge = static_cast<ReadableBridge*>(ctx);
   if (bridge == nullptr || bridge->source == nullptr) return FOURDGS_STATUS_INVALID_ARGUMENT;
   Result<std::uint64_t> size = bridge->source->size();
-  if (!size) return FOURDGS_STATUS_IO;
+  if (!size) {
+    if (bridge->error != nullptr && !bridge->error->has_value()) *bridge->error = size.error();
+    return FOURDGS_STATUS_IO;
+  }
   *outSize = *size;
   return FOURDGS_STATUS_OK;
 }
@@ -125,9 +134,11 @@ int bridgeRead(void* ctx, std::uint64_t offset, std::uint64_t length, std::uint8
     const std::size_t want = static_cast<std::size_t>(remaining);
     Result<std::size_t> got =
         bridge->source->read(offset + done, Span<std::uint8_t>(out + done, want));
-    if (!got)
+    if (!got) {
+      if (bridge->error != nullptr && !bridge->error->has_value()) *bridge->error = got.error();
       return got.error().code == ErrorCode::kInvalidArgument ? FOURDGS_STATUS_TRUNCATED
                                                              : FOURDGS_STATUS_IO;
+    }
     if (*got == 0) return FOURDGS_STATUS_TRUNCATED;
     done += *got;
   }
@@ -135,6 +146,15 @@ int bridgeRead(void* ctx, std::uint64_t offset, std::uint64_t length, std::uint8
 }
 
 void bridgeRelease(void* ctx) { delete static_cast<ReadableBridge*>(ctx); }
+
+int bridgeIdentity(void* ctx, std::uint64_t recordOffset, std::uint32_t id) {
+  IdentityBridge* bridge = static_cast<IdentityBridge*>(ctx);
+  if (bridge == nullptr || bridge->introduce == nullptr) return FOURDGS_STATUS_INVALID_ARGUMENT;
+  Result<void> added = (*bridge->introduce)(recordOffset, id);
+  if (added) return FOURDGS_STATUS_OK;
+  bridge->error = added.error();
+  return added.error().code == ErrorCode::kIo ? FOURDGS_STATUS_IO : FOURDGS_STATUS_INVALID_ARGUMENT;
+}
 
 /// A borrowed (pointer, length) string from the ABI, copied.
 ///
@@ -191,6 +211,41 @@ Result<void> openReadable(Handle& handle, Readable& source, int mode) {
   if (status != FOURDGS_STATUS_OK) return failure(status);
   handle.scene = scene;
   return Result<void>();
+}
+
+Result<std::uint64_t> validateKeyframeDelta(
+    Readable& source, int mode,
+    const std::function<Result<void>(std::uint64_t, std::uint32_t)>& introduce,
+    std::optional<std::uint64_t>* failureOffset) {
+  if (failureOffset != nullptr) failureOffset->reset();
+  ReadableBridge* sourceBridge = new (std::nothrow) ReadableBridge();
+  if (sourceBridge == nullptr)
+    return Error(ErrorCode::kInternal, "out of memory opening keyframe-delta validation");
+  sourceBridge->source = &source;
+  std::optional<Error> sourceError;
+  sourceBridge->error = &sourceError;
+  fourdgs_reader reader;
+  reader.ctx = sourceBridge;
+  reader.size = &bridgeSize;
+  reader.read = &bridgeRead;
+  reader.release = &bridgeRelease;
+
+  IdentityBridge identity;
+  identity.introduce = &introduce;
+  std::uint64_t declared = 0;
+  const int status =
+      fourdgs_validate_keyframe_delta_reader(reader, mode, &identity, &bridgeIdentity, &declared);
+  if (status == FOURDGS_STATUS_OK) return declared;
+  if (failureOffset != nullptr) {
+    std::uint64_t offset = 0;
+    int hasOffset = 0;
+    if (fourdgs_last_error_offset(&offset, &hasOffset) == FOURDGS_STATUS_OK && hasOffset != 0)
+      *failureOffset = offset;
+  }
+  if (identity.error.has_value()) return *identity.error;
+  if (sourceError.has_value()) return *sourceError;
+  Result<void> failed = failure(status);
+  return failed.error();
 }
 
 double durationSec(const Handle& handle) { return fourdgs_scene_duration_sec(asScene(handle)); }
