@@ -34,10 +34,11 @@ multiple fixed or moving sources in the same 3D scene.
 - **Renderer/player-agnostic.** Gaussian decode ends at reconstructed gaussian state. Audio decode
   reconstructs source pose and local time; the player supplies the listener and owns HRTF, panning,
   attenuation, occlusion and mixing.
-- **One temporal model, implemented; three names reserved.** Version 1 implements `gaussian-birth`,
-  where motion and lifetime belong to each gaussian. `frame-sequence`, `keyframe-delta` and
-  `deformation-field` are reserved in the [registry](website/docs/spec/registry.md) and specified
-  far enough to say what each would need — they are not implemented, and nothing here emits them.
+- **Two temporal models, implemented.** `gaussian-birth` carries motion and lifetime on each
+  gaussian. `keyframe-delta` carries keyframes plus bounded reference chains of updates, births and
+  deaths, and both models are conformance-verified across every SDK. `frame-sequence` is a registry
+  tombstone because cadence-one `keyframe-delta` subsumes it; `deformation-field` remains reserved.
+  The [registry](website/docs/spec/registry.md) is the authoritative status for every model name.
 
 ## Specification
 
