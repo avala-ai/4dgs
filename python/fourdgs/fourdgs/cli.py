@@ -488,6 +488,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     out, err = _PipeTolerantStream(sys.stdout), _PipeTolerantStream(sys.stderr)
     sys.stdout, sys.stderr = out, err
+    problem: OSError | None = None
     try:
         code = args.func(args)
     except OSError as exc:
@@ -498,21 +499,24 @@ def main(argv: list[str] | None = None) -> int:
         print(f"4dgs: {exc.filename or ''}: {exc.strerror or exc}".replace(": : ", ": "), file=sys.stderr)
         code = EXIT_TOOL_FAILURE
     finally:
-        # Restoring is all this block does, because it is the one part that must not fail.
-        # The draining below used to live here, and an `OSError` it could not classify —
-        # a full disk — escaped from the `finally` and took the chosen exit code with it,
-        # leaving the caller's `sys.stdout` replaced by a wrapper for good measure.
+        # Draining belongs here, because it has to happen on every way out — including an
+        # exception on its way past. Moving it below the `try` meant a defect in this
+        # package raised through an unflushed broken stream, and the interpreter's own
+        # flush at exit then printed `Exception ignored` and returned 120 in place of the
+        # traceback's 1: the same lost exit code as before, in the one case nobody looks at.
+        #
+        # What it must not do here is *raise*. A `finally` that raises replaces whatever
+        # was on its way out, which is how a full disk came to discard the exit code the
+        # command had already chosen. So a failure is remembered and answered below, on the
+        # path where there is still an exit code to answer with.
+        for wrapper in (out, err):
+            try:
+                wrapper.flush()
+            except OSError as exc:
+                problem = problem or exc
+            if wrapper.broken:
+                _silence(wrapper)
         sys.stdout, sys.stderr = out._stream, err._stream
-    # Drain now, while a failure still lands somewhere that can hold it. Piped output is
-    # block-buffered, so a short report does not reach the pipe until something flushes it.
-    problem: OSError | None = None
-    for wrapper in (out, err):
-        try:
-            wrapper.flush()
-        except OSError as exc:
-            problem = problem or exc
-        if wrapper.broken:
-            _silence(wrapper)
     if problem is not None:
         # The report did not reach where it was going, which is a failure of this tool and
         # not a verdict about the file. Exit 3 says so; exit 1 would have claimed the file

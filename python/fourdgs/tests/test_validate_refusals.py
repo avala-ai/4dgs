@@ -27,6 +27,7 @@ import os
 import struct
 import subprocess
 import sys
+import textwrap
 from dataclasses import replace
 from pathlib import Path
 
@@ -213,6 +214,52 @@ class TestTheCommandLine:
             "main() pointed this process's stdout at /dev/null because a stream it was "
             "handed broke; only the descriptor that broke may be silenced"
         )
+
+    def test_a_defect_on_its_way_out_still_drains_and_restores(self, monkeypatch):
+        """The drain has to run on every way out, including an exception passing through.
+
+        Found by re-reading my own fix: moving it below the `try` left a defect in this
+        package raising through an unflushed broken stream, and the interpreter's flush at
+        exit then printed `Exception ignored` and returned 120 in place of the traceback's
+        1 — the same lost exit code the fix was for, in the one case nobody looks at. It
+        cannot go back in the `finally` naively either: a `finally` that raises replaces
+        whatever was on its way out, which is how a full disk discarded the exit code.
+        """
+        program = textwrap.dedent(
+            """
+            import argparse, os, sys
+            from fourdgs import cli
+
+            def boom(_args):
+                print("a line nobody will read")
+                raise RuntimeError("a defect in this package")
+
+            read_end, write_end = os.pipe()
+            os.close(read_end)          # the reader has gone, as `| head -1` leaves it
+            os.dup2(write_end, 1)
+            os.close(write_end)
+            sys.stdout = os.fdopen(1, "w")
+
+            parser = argparse.ArgumentParser()
+            parser.set_defaults(func=boom)
+            cli.build_parser = lambda: parser
+            cli.main([])
+            """
+        )
+        root = Path(__file__).resolve().parents[1]
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join(p for p in (str(root), env.get("PYTHONPATH", "")) if p)
+        done = subprocess.run(
+            [sys.executable, "-c", program],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=300,
+            check=False,
+        )
+        assert "RuntimeError" in done.stderr, done.stderr
+        assert "Exception ignored" not in done.stderr, done.stderr
+        assert done.returncode == 1, f"exit {done.returncode}: {done.stderr!r}"
 
     def test_a_report_that_cannot_be_written_is_this_tool_failing(self, tmp_path, monkeypatch):
         """A full disk is not a verdict about the file, and it is not a bug in this
