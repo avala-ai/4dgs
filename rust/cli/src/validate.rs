@@ -823,6 +823,13 @@ fn decimal_equals_integer(value: &str, expected: u8) -> bool {
     if exponent_parts.next().is_some() {
         return false;
     }
+    let exponent_digits = exponent
+        .strip_prefix('+')
+        .or_else(|| exponent.strip_prefix('-'))
+        .unwrap_or(exponent);
+    if exponent_digits.is_empty() || !exponent_digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
 
     let mut digits = String::with_capacity(mantissa.len());
     let mut integer_digits = 0usize;
@@ -862,6 +869,9 @@ fn decimal_integer_equals(value: &str, expected: isize) -> bool {
     } else {
         (false, value.strip_prefix('+').unwrap_or(value))
     };
+    if digits.is_empty() {
+        return false;
+    }
     let digits = digits.trim_start_matches('0');
     if digits.is_empty() {
         return expected == 0;
@@ -1147,9 +1157,17 @@ mod tests {
             "7.9999999999999999",
             "NaN",
             "Infinity",
+            "8e+",
+            "8e-",
             "8e999999999999999999999999",
         ] {
             assert!(!decimal_equals_integer(different, 8), "{different}");
+        }
+        for malformed_zero in ["0e+", "0e-", "0eNaN"] {
+            assert!(
+                !decimal_equals_integer(malformed_zero, 0),
+                "{malformed_zero}"
+            );
         }
 
         let mut quant = grids();
