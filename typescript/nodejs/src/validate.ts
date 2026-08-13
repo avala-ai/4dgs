@@ -1613,13 +1613,13 @@ function checkShBitDepths(quant: Quantization, shDegree: number, found: Findings
   const declared = quant.shBitDepths.slice(0, shDegree);
   declared.forEach((bits, i) => {
     const key = `sh_band${i + 1}`;
-    const expected = String(shBound(bits));
+    const expected = shBound(bits);
     const value = quant.bounds.get(key);
     if (value === undefined) {
       found.warn(
         `Quantization declares ${bits} bits for SH band ${i + 1} but no \`${key}\` bound (§5.3)`,
       );
-    } else if (value !== expected) {
+    } else if (!decimalEqualsInteger(value, expected)) {
       found.warn(
         `Quantization declares \`${key}\` as ${value}; ${bits} bits gives a bound of ` +
           `${expected} (§6.5)`,
@@ -1633,6 +1633,31 @@ function checkShBitDepths(quant: Quantization, shDegree: number, found: Findings
         `${coarsest}, which is what a consumer that reads only step_sh has to be given (§6.5)`,
     );
   }
+}
+
+/** Compare a finite decimal spelling with a small non-negative integer, without binary64. */
+function decimalEqualsInteger(value: string, expected: number): boolean {
+  const match = /^\s*([+-]?)(?:(\d+)(?:\.(\d*))?|\.(\d+))(?:[eE]([+-]?\d+))?\s*$/.exec(value);
+  if (match === null) return false;
+
+  const integer = match[2] ?? "";
+  let digits = integer + (match[3] ?? match[4] ?? "");
+  const firstNonzero = digits.search(/[1-9]/);
+  if (firstNonzero < 0) return expected === 0;
+  if (match[1] === "-") return false;
+
+  digits = digits.slice(firstNonzero).replace(/0+$/, "");
+  const expectedDigits = String(expected);
+  const requiredExponent = expectedDigits.length - integer.length + firstNonzero;
+  return digits === expectedDigits && decimalIntegerEquals(match[5] ?? "0", requiredExponent);
+}
+
+function decimalIntegerEquals(value: string, expected: number): boolean {
+  const negative = value.startsWith("-");
+  const digits = value.replace(/^[+-]?0*/, "");
+  if (digits === "") return expected === 0;
+  if (negative !== expected < 0) return false;
+  return digits === String(Math.abs(expected));
 }
 
 /**
