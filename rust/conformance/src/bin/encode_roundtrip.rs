@@ -74,6 +74,22 @@ fn parse_depths(spec: &str) -> Result<Vec<u8>, String> {
 fn run(input: &str, output: &str, sh_bit_depths: Option<Vec<u8>>) -> Result<String, String> {
     let scene = fourdgs::read_path(input).map_err(|e| format!("{input}: {e}"))?;
 
+    let mut object_records = Vec::new();
+    if let Some(table) = &scene.objects.table {
+        object_records.push(
+            table
+                .encode(&[])
+                .map_err(|e| format!("{input}: ObjectTable cannot be re-encoded: {e}"))?,
+        );
+    }
+    for track in &scene.objects.tracks {
+        object_records.push(
+            track
+                .encode(&[])
+                .map_err(|e| format!("{input}: ObjectTrack cannot be re-encoded: {e}"))?,
+        );
+    }
+
     let options = WriteOptions {
         cutoff: scene.header.cutoff,
         // Small on purpose: the corpus scenes are hundreds of gaussians, and the default
@@ -85,6 +101,7 @@ fn run(input: &str, output: &str, sh_bit_depths: Option<Vec<u8>>) -> Result<Stri
         write_summary_offsets: true,
         scene_profile: scene.header.profile.clone(),
         metadata: scene.header.attributes.clone(),
+        extra_records: object_records,
         sh_bit_depths,
         ..Default::default()
     };
