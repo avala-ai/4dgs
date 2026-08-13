@@ -689,6 +689,56 @@ def encode(command: list[str], source: str, out: str, ladder: str | None) -> Non
         raise RuntimeError(f"{' '.join(command)} failed on {os.path.basename(source)}:\n{result.stderr.strip()}")
 
 
+#: The gaussian-only agreement preset deliberately drops scene-wide records. An `objects`
+#: file cannot retain that profile after its Object Table has been dropped: the registry says
+#: the profile promises both `object_id` in every non-empty Chunk and exactly one Object Table.
+#:
+#: #182(3) is being fixed one SDK at a time. During that stack, the reference or candidate may
+#: be the first one to make the normative refusal. Keep this transition pinned to the one corpus
+#: variant and the two exact diagnostics for the profile's two promises: it may tolerate "wrote"
+#: against "refused this invalid request", but it cannot turn an unrelated encoder failure into
+#: a pass. Once every encoder refuses, this seam returns an ordinary success and the transition
+#: can be removed.
+OBJECTS_PROFILE_REFUSAL_TRANSITION = {
+    (
+        "LongLived-UseChunkIndex-UseCrc-WithObjects",
+        None,
+    ): (
+        "the objects profile requires an object_id stream in every non-empty chunk",
+        "the objects profile requires one ObjectTable record",
+    ),
+}
+
+
+def _profile_refusal_transition(
+    variant: str,
+    ladder: str | None,
+    reference_error: RuntimeError | None,
+    candidate_error: RuntimeError | None,
+) -> list[str] | None:
+    """Bridge #182(3) while the stacked SDK fixes land; `None` means compare normally."""
+    patterns = OBJECTS_PROFILE_REFUSAL_TRANSITION.get((variant, ladder))
+    if patterns is None:
+        return None
+
+    for side, error in (("reference", reference_error), ("candidate", candidate_error)):
+        if error is not None and not any(pattern in str(error) for pattern in patterns):
+            raise RuntimeError(
+                f"the {side} failed the objects-profile transition for another reason:\n{error}"
+            ) from None
+
+    if reference_error is None and candidate_error is None:
+        return None
+    if reference_error is not None and candidate_error is not None:
+        return []
+
+    writer = "reference" if reference_error is None else "candidate"
+    return [
+        f"#182(3) transition: the {writer} still writes a gaussian-only `objects` file "
+        "without the required Object Table"
+    ]
+
+
 def flatten(summary: dict) -> dict:
     """One level of nesting into dotted keys: `statistics.chunkCount`, not `statistics`.
 
@@ -722,14 +772,39 @@ def compare(
     """Prove one variant. Returns the known divergences it tolerated; raises on the rest."""
     ref_out = os.path.join(tmp, "reference.4dgs")
     cand_out = os.path.join(tmp, "candidate.4dgs")
-    encode(reference, source, ref_out, ladder)
+    variant = os.path.basename(source).removesuffix(".4dgs")
+    reference_error = None
+    candidate_error = None
+    try:
+        encode(reference, source, ref_out, ladder)
+    except RuntimeError as exc:
+        reference_error = exc
     try:
         encode(candidate, source, cand_out, ladder)
     except RuntimeError as exc:
-        variant = os.path.basename(source).removesuffix(".4dgs")
+        candidate_error = exc
+
+    transition = _profile_refusal_transition(variant, ladder, reference_error, candidate_error)
+    if transition is not None:
+        # A refusal is evidence only about the encoder that refused.  The writer on the
+        # other side still has to produce a readable, faithful file; an exit status of zero
+        # by itself must not satisfy the temporary stack seam.
+        if (reference_error is None) != (candidate_error is None):
+            written = ref_out if reference_error is None else cand_out
+            check_fidelity(source, written, normalize_capture_profile)
+            check_index_counts(written)
+            if check_chunk_geometry:
+                _check_chunk_geometry(written)
+            if check_aabb_geometry:
+                _check_aabb_geometry(written)
+        return transition
+    if reference_error is not None:
+        raise reference_error
+    if candidate_error is not None:
+        exc = candidate_error
         note = known_refusal(variant, ladder, str(exc)) if allow_known_reference_divergences else None
         if note is None:
-            raise
+            raise exc
         return [f"the candidate refused a file the reference wrote — {note}"]
 
     # Fidelity first, and on the candidate's own file: a candidate that displaced the scene
@@ -775,7 +850,6 @@ def compare(
                 for key in [k for k in summary if k in ("objects", "states") or k.startswith(("objects.", "states."))]:
                     summary.pop(key, None)
     differing = [key for key in sorted(set(ref) | set(cand)) if ref.get(key) != cand.get(key)]
-    variant = os.path.basename(source).removesuffix(".4dgs")
     notes = {
         key: known_reference_divergence(variant, ladder, key, cand.get(key), ref.get(key))
         for key in differing
@@ -1196,6 +1270,19 @@ def reference_divergences(source: str, tmp: str, ladder: str | None) -> list[tup
         except RuntimeError as exc:
             refused[name] = str(exc).strip().splitlines()[-1]
     if refused:
+        # During #182(3), one reference refusing is the tracked divergence. Once both make
+        # the exact normative refusal they agree, and keeping the old "Rust writes" note
+        # would report a solved layer as still divergent.
+        if len(refused) == 2:
+            variant = os.path.basename(source).removesuffix(".4dgs")
+            agreement = _profile_refusal_transition(
+                variant,
+                ladder,
+                RuntimeError(refused["rust"]),
+                RuntimeError(refused["python"]),
+            )
+            if agreement == []:
+                return []
         # One of them refused what the other wrote. That is the loudest divergence there is,
         # and there is nothing further to compare on this variant.
         return [("encode", refused.get("python", "wrote the file"), refused.get("rust", "wrote the file"))]
@@ -1609,12 +1696,78 @@ def _test_index_counts_bite(tmp: str) -> list[str]:
     return said
 
 
+def _test_objects_profile_refusal_transition(tmp: str) -> list[str]:
+    """The stack seam accepts only #182(3)'s exact refusal, and disappears at agreement."""
+    variant = "LongLived-UseChunkIndex-UseCrc-WithObjects"
+    refusal = RuntimeError("encoder failed: the objects profile requires one ObjectTable record, but none was supplied")
+    missing_ids = RuntimeError(
+        "encoder failed: the objects profile requires an object_id stream in every non-empty chunk"
+    )
+
+    if _profile_refusal_transition(variant, None, None, None) is not None:
+        raise AssertionError("two legacy writers should continue through the ordinary comparison")
+    if _profile_refusal_transition(variant, None, refusal, refusal) != []:
+        raise AssertionError("two conforming refusals should agree without a transition note")
+
+    notes = _profile_refusal_transition(variant, None, refusal, None)
+    if notes is None or "candidate still writes" not in "\n".join(notes):
+        raise AssertionError(f"one legacy writer was not named by the transition: {notes}")
+    if _profile_refusal_transition(variant, None, refusal, missing_ids) != []:
+        raise AssertionError("the two independent objects-profile promises are both normative refusals")
+
+    unexpected = RuntimeError("encoder crashed while allocating a chunk")
+    try:
+        _profile_refusal_transition(variant, None, unexpected, None)
+    except RuntimeError as exc:
+        if "another reason" not in str(exc):
+            raise AssertionError(f"unexpected refusal lost its diagnosis: {exc}") from None
+        said = str(exc).splitlines()[0]
+    else:
+        raise AssertionError("an unrelated encoder failure was hidden by the transition")
+    if _profile_refusal_transition("MixedLifetimes-UseChunkIndex-UseCrc", None, refusal, None) is not None:
+        raise AssertionError("the transition leaked onto a second corpus variant")
+
+    # Red-on-parent regression for the review finding on #253: a process that exits zero
+    # without creating its promised file is not a successful legacy writer.  Exercise the
+    # public comparison path, rather than merely testing the transition classifier above.
+    work = os.path.join(tmp, "objects-profile-transition")
+    os.makedirs(work)
+    source = os.path.join(DATA, f"{variant}.4dgs")
+    refusing = [
+        sys.executable,
+        "-c",
+        (
+            "import sys; "
+            "print('the objects profile requires one ObjectTable record, but none was supplied', "
+            "file=sys.stderr); sys.exit(1)"
+        ),
+    ]
+    writes_nothing = [sys.executable, "-c", "import sys; sys.exit(0)"]
+    try:
+        compare(
+            refusing,
+            writes_nothing,
+            source,
+            work,
+            None,
+            second_encoder=True,
+            allow_known_reference_divergences=True,
+            normalize_capture_profile=True,
+        )
+    except OSError as exc:
+        missing = str(exc).splitlines()[0]
+    else:
+        raise AssertionError("a candidate that wrote no file passed the refusal transition")
+    return [said, f"zero-exit candidate still validated: {missing}"]
+
+
 def run_self_test() -> int:
     tests = (
         _test_tolerance_is_read_from_the_file,
         _test_fidelity_catches_a_changed_scene,
         _test_declared_temporal_bounds_bite,
         _test_agreement_still_catches_divergence,
+        _test_objects_profile_refusal_transition,
         _test_index_counts_bite,
     )
     failed = 0
