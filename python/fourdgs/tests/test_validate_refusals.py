@@ -18,6 +18,8 @@ is worse than one that failed.
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import io
 import json
 import math
@@ -25,6 +27,7 @@ import os
 import struct
 import subprocess
 import sys
+import textwrap
 from dataclasses import replace
 from pathlib import Path
 
@@ -184,6 +187,100 @@ class TestTheCommandLine:
             status = tool.wait(timeout=300)
             assert status == 1, f"unbuffered={unbuffered}: exit {status}, stderr {err!r}"
             assert "Broken pipe" not in err, f"unbuffered={unbuffered}: {err!r}"
+
+    def test_a_departed_reader_costs_the_caller_nothing_but_its_own_stream(self, tmp_path, capsys):
+        """`main` is a callable API, so what it silences must be what broke.
+
+        A caller running this under `redirect_stdout` to a pipe of its own has a broken
+        descriptor that is not this process's stdout. Pointing 1 at `/dev/null` because
+        *something* broke took the host's stdout with it: every later `print` in that
+        caller succeeded and wrote nothing, and it kept doing so after `main` returned.
+        """
+        path = tmp_path / "truncated.4dgs"
+        path.write_bytes(MAGIC + b"\x00" * 512)
+        before = os.fstat(1)
+        read_end, write_end = os.pipe()
+        os.close(read_end)  # the caller's reader has gone; this process's stdout has not
+        departed = os.fdopen(write_end, "w")
+        try:
+            with contextlib.redirect_stdout(departed):
+                code = main(["validate", str(path)])
+        finally:
+            with contextlib.suppress(OSError):
+                departed.close()
+        after = os.fstat(1)
+        assert code == 1, code
+        assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino), (
+            "main() pointed this process's stdout at /dev/null because a stream it was "
+            "handed broke; only the descriptor that broke may be silenced"
+        )
+
+    def test_a_defect_on_its_way_out_still_drains_and_restores(self, monkeypatch):
+        """The drain has to run on every way out, including an exception passing through.
+
+        Found by re-reading my own fix: moving it below the `try` left a defect in this
+        package raising through an unflushed broken stream, and the interpreter's flush at
+        exit then printed `Exception ignored` and returned 120 in place of the traceback's
+        1 — the same lost exit code the fix was for, in the one case nobody looks at. It
+        cannot go back in the `finally` naively either: a `finally` that raises replaces
+        whatever was on its way out, which is how a full disk discarded the exit code.
+        """
+        program = textwrap.dedent(
+            """
+            import argparse, os, sys
+            from fourdgs import cli
+
+            def boom(_args):
+                print("a line nobody will read")
+                raise RuntimeError("a defect in this package")
+
+            read_end, write_end = os.pipe()
+            os.close(read_end)          # the reader has gone, as `| head -1` leaves it
+            os.dup2(write_end, 1)
+            os.close(write_end)
+            sys.stdout = os.fdopen(1, "w")
+
+            parser = argparse.ArgumentParser()
+            parser.set_defaults(func=boom)
+            cli.build_parser = lambda: parser
+            cli.main([])
+            """
+        )
+        root = Path(__file__).resolve().parents[1]
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join(p for p in (str(root), env.get("PYTHONPATH", "")) if p)
+        done = subprocess.run(
+            [sys.executable, "-c", program],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=300,
+            check=False,
+        )
+        assert "RuntimeError" in done.stderr, done.stderr
+        assert "Exception ignored" not in done.stderr, done.stderr
+        assert done.returncode == 1, f"exit {done.returncode}: {done.stderr!r}"
+
+    def test_a_report_that_cannot_be_written_is_this_tool_failing(self, tmp_path, monkeypatch):
+        """A full disk is not a verdict about the file, and it is not a bug in this
+        package either. It was reported as both: the `OSError` escaped from the `finally`
+        that drained the stream, discarding the code the command had already chosen, so
+        the process died with a traceback and exit 1 — "your file is invalid".
+        """
+        path = tmp_path / "good.4dgs"
+        path.write_bytes(_real_file())
+
+        class FullDisk(io.StringIO):
+            def flush(self):
+                raise OSError(errno.ENOSPC, "No space left on device")
+
+        stdout, stderr = sys.stdout, sys.stderr
+        monkeypatch.setattr(sys, "stdout", FullDisk())
+        code = main(["validate", str(path)])
+        monkeypatch.setattr(sys, "stdout", stdout)
+        assert code == 3, f"a report that could not be written is exit 3, got {code}"
+        # And the caller gets its streams back, rather than a wrapper that outlives the call.
+        assert sys.stderr is stderr
 
 
 class TestTheInvalidCorpus:
@@ -432,6 +529,9 @@ class TestKeyframeDelta:
                 code(lambda: kdf.compose_chain(body, index, target, opened.windows, opened.grids)),
             )
 
+        def last_of_kind(index, kind):
+            return [e for e in index if e.kind == kind][-1]
+
         def forward(index):
             entry = next(e for e in index if e.kind == 1)
             entry.reference_offset = entry.chunk_offset + 8
@@ -462,6 +562,42 @@ class TestKeyframeDelta:
             scanned, composed = verdicts(mutate)
             assert scanned is not None, "the scan is supposed to refuse this"
             assert composed == scanned, f"{mutate.__name__}: scan said {scanned}, compose said {composed}"
+
+        # Every claim an entry makes, one at a time, rather than the handful someone
+        # thought of. The two paths are near-verbatim copies of one rule set — they have
+        # already drifted twice, each time because a rule was added to one and not the
+        # other — and a fixed list of mutations only catches the drift it was written for.
+        # This one fails on any field where they stop agreeing, including fields added
+        # later, which is the property that actually has to hold.
+        wrong_by_field = {
+            "t0": 0.125,
+            "t1": 99.0,
+            "gaussian_count": 4242,
+            "kind": 0,
+            "delta_mode": 1 - int(last_of_kind(opened.index, 1).delta_mode),
+            "reference_offset": int(opened.index[0].chunk_offset),
+            "keyframe_offset": 4242,
+            "depth": 42,
+            "live_count": 4242,
+        }
+        for name, value in wrong_by_field.items():
+
+            def perturb(index, _name=name, _value=value):
+                entry = last_of_kind(index, 1)
+                setattr(entry, _name, _value)
+                return entry
+
+            scanned, composed = verdicts(perturb)
+            # Agreement on the verdict, not on which rule names it. The scan walks the
+            # index in time order and the seeking path walks one chain by reference, so a
+            # single wrong field can break two rules and each path meets a different one
+            # first — both true, both refusals. What must never differ is whether the file
+            # is legal: a seeking client accepting what the validator rejects is the bug
+            # this pair has produced twice.
+            assert (scanned is None) == (composed is None), (
+                f"{name}={value!r}: the scan said {scanned} and the seeking path said "
+                f"{composed}; one accepted a file the other refused"
+            )
 
         # `level` lives in the record and not in the index, so this one patches the file.
         # A delta at another level than its reference is a difference between bins on two
@@ -1307,6 +1443,49 @@ class TestSHBandStreams:
         with pytest.raises(MalformedFile, match=r"expected 0\.\.255"):
             read_chunk(source, scene, scene.index[0], max_sh_band=1)
 
+    def test_the_seeking_band_read_checks_the_frame_the_scan_checks(self):
+        """`validate` walks to the band and reads a record header; this path skipped nine
+        bytes and trusted them. So an entry pointing at a record that is not an SH Band
+        Stream — or one whose declared length runs past it into the next record — was a
+        refusal on one path and decoded coefficients on the other, which is the split
+        this reader exists to close.
+        """
+        data = _patch_sh_degree(_real_file(), 1)
+        first = _index_entries(data)[0]
+        values = np.zeros((first.gaussian_count, 9), dtype=np.int64)
+        band = put_record(
+            op.SH_BAND_STREAM,
+            bytes([1]) + encode_stream(op.SH_BAND_STREAM, values, channels=9, codec=0),
+        )
+
+        # An entry whose length claims more than the record frames: the tail belongs to
+        # whatever follows, and a reader that decodes it is reading the next record's bytes.
+        long_entry, _ = _insert_indexed_band(data, band, extra_length=8)
+        source = BytesReadable(long_entry)
+        scene = open_indexed(source)
+        with pytest.raises(MalformedFile, match="not one complete SH Band Stream record"):
+            read_chunk(source, scene, scene.index[0], max_sh_band=1)
+
+        # A range too short to hold a record header, which both paths must refuse by the
+        # same name. This one surfaced whatever the short read raised, with no refusal
+        # identifier on it, while the scan named the rule.
+        too_short, _ = _insert_indexed_band(data, band, extra_length=-(len(band) - 4))
+        source = BytesReadable(too_short)
+        scene = open_indexed(source)
+        with pytest.raises(MalformedFile) as caught:
+            read_chunk(source, scene, scene.index[0], max_sh_band=1)
+        assert caught.value.code == "index-record-mismatch", caught.value.code
+        scanned = [f.refusal.code for f in validate(too_short).findings if f.refusal is not None]
+        assert scanned[:1] == ["index-record-mismatch"], scanned
+
+        # And an entry aimed at a record of another kind entirely.
+        not_a_band = put_record(op.STATISTICS, bytes([1]) + b"\x00" * 32)
+        wrong_kind, _ = _insert_indexed_band(data, not_a_band)
+        source = BytesReadable(wrong_kind)
+        scene = open_indexed(source)
+        with pytest.raises(MalformedFile, match="not one complete SH Band Stream record"):
+            read_chunk(source, scene, scene.index[0], max_sh_band=1)
+
     def test_an_entry_pointing_at_the_wrong_record_says_so(self):
         """Two faults shared one message, and it only ever described the other one.
 
@@ -1858,8 +2037,11 @@ def _insert_single_indexed_band(data: bytes, band: bytes) -> tuple[bytes, int]:
     return data[:band_at] + band + summary + footer.encode() + MAGIC, band_at
 
 
-def _insert_indexed_band(data: bytes, band: bytes) -> tuple[bytes, int]:
-    """Insert `band` before the summary and attach it to the first index entry."""
+def _insert_indexed_band(data: bytes, band: bytes, extra_length: int = 0) -> tuple[bytes, int]:
+    """Insert `band` before the summary and attach it to the first index entry.
+
+    `extra_length` overstates the entry's declared length without moving anything, which
+    is how a band range that runs past its record into the next one is built."""
     footer_record = _first_record(data, op.FOOTER)
     footer = rec.Footer.parse(footer_record.content)
     band_at = footer.summary_start
@@ -1871,7 +2053,7 @@ def _insert_indexed_band(data: bytes, band: bytes) -> tuple[bytes, int]:
         if record.opcode == op.CHUNK_INDEX:
             entry = rec.ChunkIndexEntry.parse(record.content)
             if entry_index == 0:
-                entry = _with(entry, bands=[*entry.bands, (1, band_at, len(band))])
+                entry = _with(entry, bands=[*entry.bands, (1, band_at, len(band) + extra_length)])
             summary += entry.encode()
             entry_index += 1
         else:
