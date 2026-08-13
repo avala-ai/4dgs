@@ -28,6 +28,9 @@ constexpr int kFloatDecimals = 6;
 std::string renderRounded(double value) {
   char buffer[512];
   std::snprintf(buffer, sizeof(buffer), "%.*f", kFloatDecimals, value);
+  // The sign of a zero describes the platform's floating-point path, not the scene. It
+  // must also agree with compareExact, which deliberately treats both signs as equal.
+  if (std::strtod(buffer, nullptr) == 0.0) return "0.000000";
   return std::string(buffer);
 }
 

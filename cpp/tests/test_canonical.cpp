@@ -141,6 +141,33 @@ void roundedTiesUseExactDecodedValues() {
   CHECK_EQ(reversedView.motions[reversedOrder[0] * 3], 1e-7f);
 }
 
+/// Signed zero is not scene content. Rows that differ only in where its sign appears tie
+/// in the content order, so the emitted form must erase that sign before stable resident
+/// order can become observable.
+void signedZeroCannotExposeResidentOrder() {
+  GaussianData original = scene(2, 23);
+  for (std::size_t k = 0; k < 3; ++k) {
+    original.positions[3 + k] = original.positions[k];
+    original.scales[3 + k] = original.scales[k];
+    original.motions[3 + k] = original.motions[k];
+  }
+  for (std::size_t k = 0; k < 4; ++k) {
+    original.rotations[4 + k] = original.rotations[k];
+    original.colors[4 + k] = original.colors[k];
+  }
+  original.positions[0] = -0.0f;
+  original.positions[1] = 0.0f;
+  original.positions[3] = 0.0f;
+  original.positions[4] = -0.0f;
+  original.muT[1] = original.muT[0];
+  original.sigmaT[1] = original.sigmaT[0];
+  original.winLo[1] = original.winLo[0];
+  original.winHi[1] = original.winHi[0];
+  for (std::size_t k = 0; k < 9; ++k) original.sh[9 + k] = original.sh[k];
+
+  CHECK_EQ(summarize(original), summarize(permuted(original, {1, 0})));
+}
+
 void integersAreStringsAndInfinityIsNull() {
   const std::string json = summarize(scene(8, 3));
   // A 64-bit count survives a JSON parser backed by doubles only as a string.
@@ -154,7 +181,8 @@ void integersAreStringsAndInfinityIsNull() {
 
 void floatsAreRoundedToSixDecimals() {
   CHECK_EQ(fourdgs::conformance::num(1.0 / 3.0).render(), std::string("0.333333"));
-  CHECK_EQ(fourdgs::conformance::num(-0.0000004).render(), std::string("-0.000000"));
+  CHECK_EQ(fourdgs::conformance::num(-0.0000004).render(), std::string("0.000000"));
+  CHECK_EQ(fourdgs::conformance::num(-0.0).render(), std::string("0.000000"));
   CHECK_EQ(fourdgs::conformance::num(2.5).render(), std::string("2.500000"));
 }
 
@@ -190,6 +218,7 @@ void stringsAreEscaped() {
 void runTests() {
   orderCannotChangeTheSummary();
   roundedTiesUseExactDecodedValues();
+  signedZeroCannotExposeResidentOrder();
   integersAreStringsAndInfinityIsNull();
   floatsAreRoundedToSixDecimals();
   absentAudioIsAValue();
