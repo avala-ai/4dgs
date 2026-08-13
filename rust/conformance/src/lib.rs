@@ -18,7 +18,7 @@ use std::fmt::Write as _;
 
 use fourdgs::keyframe_delta_file::DecodedSequence;
 use fourdgs::model::{AudioSource, GaussianSet};
-use fourdgs::object_layer::ObjectLayer;
+use fourdgs::object_layer::{stable_order, ObjectLayer};
 use fourdgs::provenance::{pose_at, Pose, PoseSampled, Provenance};
 use fourdgs::records::{Attachment, Camera, Header, Metadata, Statistics, SummaryOffset};
 use fourdgs::Result;
@@ -489,11 +489,21 @@ fn objects_and_states(
         for (row, index) in state.indices.iter().enumerate() {
             row_for_index[*index] = Some(row);
         }
-        let sample_rows: Vec<usize> = order
-            .iter()
-            .filter_map(|index| row_for_index[*index])
-            .take(SAMPLE)
-            .collect();
+        let mut sample_rows = Vec::with_capacity(SAMPLE.min(state.indices.len()));
+        let mut position_sum = [0.0f64; 3];
+        let mut opacity_sum = 0.0f64;
+        for index in order {
+            let Some(row) = row_for_index[*index] else {
+                continue;
+            };
+            if sample_rows.len() < SAMPLE {
+                sample_rows.push(row);
+            }
+            for (axis, sum) in position_sum.iter_mut().enumerate() {
+                *sum += state.centers[row * 3 + axis];
+            }
+            opacity_sum += state.opacity[row];
+        }
         let rows = |values: &[f64], width: usize| {
             J::Arr(
                 sample_rows
@@ -508,14 +518,6 @@ fn objects_and_states(
                     .collect(),
             )
         };
-        let position_sum = (0..3)
-            .map(|axis| {
-                num((0..state.indices.len())
-                    .map(|row| state.centers[row * 3 + axis])
-                    .sum())
-            })
-            .collect();
-        let opacity_sum = state.opacity.iter().sum();
         states.push(J::obj(vec![
             ("t", num(t)),
             ("liveCount", int(state.indices.len() as u64)),
@@ -538,7 +540,10 @@ fn objects_and_states(
             (
                 "aggregate",
                 J::obj(vec![
-                    ("positionSum", J::Arr(position_sum)),
+                    (
+                        "positionSum",
+                        J::Arr(position_sum.iter().map(|value| num(*value)).collect()),
+                    ),
                     ("opacitySum", num(opacity_sum)),
                 ]),
             ),
@@ -970,77 +975,6 @@ fn spherical_harmonics(gaussians: &GaussianSet, order: &[usize]) -> J {
     ])
 }
 
-/// Sort gaussians into an order both implementations can reproduce.
-///
-/// Chunking and Morton ordering are encoder choices, so decoded order is not part of the
-/// contract — but a comparison needs *some* order. The key is the gaussian's whole decoded
-/// state, rounded exactly as the summary rounds it, with its spherical harmonic
-/// coefficients last. Two gaussians that tie on all of it are identical in every value this
-/// summary emits, so their relative order cannot change the output.
-pub fn stable_order(gaussians: &GaussianSet) -> Vec<usize> {
-    let n = gaussians.count();
-    let sh_width = gaussians
-        .sh
-        .as_ref()
-        .map_or(0, |_| gaussians.sh_coefficients * 3);
-    let mut keys: Vec<(Vec<f64>, usize)> = Vec::with_capacity(n);
-    for i in 0..n {
-        let mut row = Vec::with_capacity(17 + sh_width);
-        for (arr, width) in [
-            (&gaussians.positions, 3usize),
-            (&gaussians.scales, 3),
-            (&gaussians.rotations, 4),
-            (&gaussians.colors, 4),
-            (&gaussians.motions, 3),
-        ] {
-            for k in 0..width {
-                row.push(sortable(arr[i * width + k]));
-            }
-        }
-        row.push(sortable(gaussians.mu_t[i]));
-        row.push(sortable(gaussians.sigma_t[i]));
-        row.push(sortable(gaussians.win_lo[i]));
-        row.push(sortable(gaussians.win_hi[i]));
-        if let Some(sh) = &gaussians.sh {
-            for k in 0..sh_width {
-                row.push(sh[i * sh_width + k] as f64);
-            }
-        }
-        if let Some(object_ids) = &gaussians.object_id {
-            row.push(object_ids[i] as f64);
-        }
-        keys.push((row, i));
-    }
-    // A stable sort, so gaussians that tie on every rounded value keep decode order — the
-    // same tiebreak every other implementation's sort makes.
-    keys.sort_by(|a, b| {
-        a.0.partial_cmp(&b.0)
-            .expect("no key value is NaN; see `sortable`")
-    });
-    keys.into_iter().map(|(_, i)| i).collect()
-}
-
-/// A comparison key: rounded like the summary, with infinity kept as infinity so the two
-/// languages order never-fading gaussians identically.
-fn sortable(value: f32) -> f64 {
-    let v = value as f64;
-    if v.is_nan() {
-        return f64::INFINITY;
-    }
-    if v.is_infinite() {
-        return v;
-    }
-    round_decimals(v)
-}
-
-/// The double nearest to `v` rounded to [`FLOAT_DECIMALS`] places — the same value Python's
-/// `round(v, 6)` produces, reached the same way: correct decimal rounding, then the nearest
-/// double to that decimal.
-fn round_decimals(v: f64) -> f64 {
-    let text = format!("{v:.*}", FLOAT_DECIMALS);
-    text.parse().unwrap_or(v)
-}
-
 // --------------------------------------------------------------------------
 // keyframe-delta: the states summary two implementations are diffed on
 // --------------------------------------------------------------------------
@@ -1057,4 +991,104 @@ pub fn keyframe_delta_states_json(seq: &DecodedSequence) -> String {
     // emits the same bytes this crate does. Delegating keeps the Rust conformance output
     // byte-identical to what it produced when the emitter lived here.
     fourdgs::keyframe_delta_file::keyframe_delta_states_json(seq)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{summarize, Extras};
+    use fourdgs::model::GaussianSet;
+    use fourdgs::object_layer::{canonical_parts, ObjectLayer};
+    use fourdgs::records::Header;
+
+    fn gaussians(positions: &[[f32; 3]], motions: &[[f32; 3]]) -> GaussianSet {
+        let count = positions.len();
+        GaussianSet {
+            positions: positions.iter().flatten().copied().collect(),
+            scales: vec![1.0; count * 3],
+            rotations: (0..count).flat_map(|_| [0.0, 0.0, 0.0, 1.0]).collect(),
+            colors: vec![1.0; count * 4],
+            motions: motions.iter().flatten().copied().collect(),
+            mu_t: vec![0.0; count],
+            sigma_t: vec![f32::INFINITY; count],
+            win_lo: vec![0.0; count],
+            win_hi: vec![4_000_000.0; count],
+            object_id: Some(vec![0; count]),
+            ..Default::default()
+        }
+    }
+
+    fn header(count: usize) -> Header {
+        Header {
+            duration_sec: 4_000_000.0,
+            gaussian_count: count as u64,
+            cutoff: 0.05,
+            aabb: vec![0.0; 6],
+            ..Default::default()
+        }
+    }
+
+    fn summaries(gaussians: &GaussianSet) -> (String, String) {
+        let header = header(gaussians.count());
+        let objects = ObjectLayer::default();
+        let extras = Extras {
+            objects: Some(&objects),
+            ..Default::default()
+        };
+        let runner = summarize(&header, gaussians, &[], &[], &extras).expect("summary");
+        let core = canonical_parts(&header, gaussians, &objects)
+            .expect("core canonical")
+            .states;
+        (runner, core)
+    }
+
+    #[test]
+    fn rounded_key_ties_do_not_fall_back_to_decoded_order() {
+        // The stored motion fields tie after six-decimal rounding, but their composed
+        // centres at the middle probe are 0.2 and 0.8. A stable rounded-only sort would
+        // therefore expose whichever row the decoder happened to return first.
+        let forward = gaussians(
+            &[[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            &[[1e-7, 0.0, 0.0], [4e-7, 0.0, 0.0]],
+        );
+        let reversed = gaussians(
+            &[[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            &[[4e-7, 0.0, 0.0], [1e-7, 0.0, 0.0]],
+        );
+
+        let a = summaries(&forward);
+        let b = summaries(&reversed);
+        assert_eq!(a, b);
+        assert!(
+            a.1.contains("\"positions\":[[0.200000,0.000000,0.000000],[0.800000"),
+            "the exact motion tie-breaker did not choose content order: {}",
+            a.1
+        );
+    }
+
+    #[test]
+    fn state_aggregates_sum_in_content_order() {
+        // These are the same three decoded f32 rows in different resident orders. Widened
+        // f64 addition crosses the canonical six-decimal boundary unless it follows the
+        // content order used by the root aggregate.
+        let values = [1e20, 1.0, -1e20];
+        let zero = [0.0, 0.0, 0.0];
+        let forward = gaussians(&values.map(|x| [x, 0.0, 0.0]), &[zero, zero, zero]);
+        let reversed = gaussians(
+            &[
+                [values[0], 0.0, 0.0],
+                [values[2], 0.0, 0.0],
+                [values[1], 0.0, 0.0],
+            ],
+            &[zero, zero, zero],
+        );
+
+        let a = summaries(&forward);
+        let b = summaries(&reversed);
+        assert_eq!(a, b);
+        assert!(
+            a.1.contains("\"positionSum\":[0.000000,0.000000,0.000000]"),
+            "the state did not sum in content order: {}",
+            a.1
+        );
+    }
 }

@@ -293,12 +293,11 @@ fn sortable(value: f32) -> f64 {
 ///
 /// Gaussians may be reordered freely by an encoder and readers must not rely on their
 /// order, so a summary that did would ask two correct decoders to disagree. Membership
-/// joins the key after the harmonics — two gaussians can tie on every rounded field and
-/// still belong to different objects.
+/// joins the key after the harmonics, followed by the exact decoded floats as a final
+/// tie-breaker. Rows that did not tie keep their established order, while two rows that
+/// also tie exactly are interchangeable in every value the summary composes or emits.
 pub fn stable_order(gaussians: &GaussianSet) -> Vec<usize> {
     let mut order: Vec<usize> = (0..gaussians.count()).collect();
-    // Stable, so two gaussians equal on every field of the key keep the order they arrived
-    // in — which cannot change any value the summary emits, and makes the sort reproducible.
     order.sort_by(|&a, &b| compare_rows(gaussians, a, b));
     order
 }
@@ -353,12 +352,69 @@ fn compare_rows(gaussians: &GaussianSet, a: usize, b: usize) -> Ordering {
             }
         }
     }
-    // Membership last, after the harmonics: two gaussians can tie on every rounded field
-    // and still belong to different objects.
+    // Membership stays after the harmonics, preserving the existing order for rows that
+    // never tied on the rounded key.
     if let Some(object_ids) = &gaussians.object_id {
-        return object_ids[a].cmp(&object_ids[b]);
+        let ord = object_ids[a].cmp(&object_ids[b]);
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+
+    // A rounded tie is not necessarily an emitted-state tie: sub-micro motion can compose
+    // into visibly different centres at a later probe. Compare the same decoded floats at
+    // full f32 precision only after the existing rounded/SH/membership key has tied.
+    for (arr, width) in [
+        (&gaussians.positions, 3usize),
+        (&gaussians.scales, 3),
+        (&gaussians.rotations, 4),
+        (&gaussians.colors, 4),
+        (&gaussians.motions, 3),
+    ] {
+        for k in 0..width {
+            let ord = exact_cmp(arr[a * width + k], arr[b * width + k]);
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+    }
+    for arr in [
+        &gaussians.mu_t,
+        &gaussians.sigma_t,
+        &gaussians.win_lo,
+        &gaussians.win_hi,
+    ] {
+        let ord = exact_cmp(arr[a], arr[b]);
+        if ord != Ordering::Equal {
+            return ord;
+        }
     }
     Ordering::Equal
+}
+
+/// Total ordering for exact decoded floats after the rounded key ties.
+///
+/// Signed zeros are equivalent because the canonical form never exposes their sign. All
+/// NaNs are likewise equivalent because they emit `null`, but they sort after +infinity so
+/// their unordered comparison cannot fall through to stable decoded order.
+fn exact_cmp(a: f32, b: f32) -> Ordering {
+    fn class(value: f32) -> u8 {
+        if value.is_nan() {
+            3
+        } else if value == f32::NEG_INFINITY {
+            0
+        } else if value == f32::INFINITY {
+            2
+        } else {
+            1
+        }
+    }
+    let ord = class(a).cmp(&class(b));
+    if ord != Ordering::Equal || class(a) != 1 {
+        return ord;
+    }
+    a.partial_cmp(&b)
+        .expect("finite exact canonical keys are ordered")
 }
 
 /// Times a summary evaluates an object track at, derived from the track itself.
@@ -619,11 +675,21 @@ pub fn canonical_parts(
         for (row, index) in state.indices.iter().enumerate() {
             row_for_index[*index] = Some(row);
         }
-        let sample_rows: Vec<usize> = order
-            .iter()
-            .filter_map(|index| row_for_index[*index])
-            .take(SAMPLE)
-            .collect();
+        let mut sample_rows = Vec::with_capacity(SAMPLE.min(state.indices.len()));
+        let mut position_sum = [0.0f64; 3];
+        let mut opacity_sum = 0.0f64;
+        for index in &order {
+            let Some(row) = row_for_index[*index] else {
+                continue;
+            };
+            if sample_rows.len() < SAMPLE {
+                sample_rows.push(row);
+            }
+            for (axis, sum) in position_sum.iter_mut().enumerate() {
+                *sum += state.centers[row * 3 + axis];
+            }
+            opacity_sum += state.opacity[row];
+        }
         let rows = |values: &[f64], width: usize| {
             Json::Arr(
                 sample_rows
@@ -638,14 +704,6 @@ pub fn canonical_parts(
                     .collect(),
             )
         };
-        let position_sum: Vec<Json> = (0..3)
-            .map(|axis| {
-                num((0..state.indices.len())
-                    .map(|row| state.centers[row * 3 + axis])
-                    .sum())
-            })
-            .collect();
-        let opacity_sum: f64 = state.opacity.iter().sum();
         states.push(Json::obj(vec![
             ("t", num(t)),
             ("liveCount", int(state.indices.len() as u64)),
@@ -668,7 +726,10 @@ pub fn canonical_parts(
             (
                 "aggregate",
                 Json::obj(vec![
-                    ("positionSum", Json::Arr(position_sum)),
+                    (
+                        "positionSum",
+                        Json::Arr(position_sum.iter().map(|value| num(*value)).collect()),
+                    ),
                     ("opacitySum", num(opacity_sum)),
                 ]),
             ),
