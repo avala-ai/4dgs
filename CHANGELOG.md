@@ -54,10 +54,6 @@ automated publish for a package that does not exist, so `fourdgs` has to be clai
 before its tag can mean anything. The release workflow's `dart` job is disabled deliberately and
 says so, with the two manual steps written where whoever does them will be standing.
 
-Swift is at 0.1.0 and is the one package whose tag *is* the publication — there is no Swift
-registry, so consumers resolve it from this repository's URL and a bare `vX.Y.Z` tag is what they
-resolve. Nothing has to be configured anywhere for that tag to work.
-
 Swift 0.1.0 has a version constant and a changelog section on `main` and no tag yet. When it is cut
 it will be **`v0.1.0`, with no package name in it**, because SwiftPM reads versions only from plain
 SemVer tags and there is no registry between it and this repository. That bare tag is the Swift

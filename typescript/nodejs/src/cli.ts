@@ -113,7 +113,7 @@ function parseArgs(argv: readonly string[]): Args {
  * TypeScript project drags the manifest into the build output. A test asserts the two agree,
  * which is what keeps the duplication from becoming a lie.
  */
-export const VERSION = "0.4.0";
+export const VERSION = "0.5.0";
 
 class UsageError extends Error {}
 /** A request that was answered by printing, rather than one that failed. */
