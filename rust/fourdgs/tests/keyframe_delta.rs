@@ -439,6 +439,25 @@ fn sample_at(t0: f64) -> fourdgs::keyframe_delta_file::Sample {
     }
 }
 
+fn populated_sample_at(t0: f64) -> fourdgs::keyframe_delta_file::Sample {
+    fourdgs::keyframe_delta_file::Sample {
+        t0,
+        ids: vec![7],
+        gaussians: fourdgs::model::GaussianSet {
+            positions: vec![0.0, 0.0, 0.0],
+            scales: vec![0.1, 0.1, 0.1],
+            rotations: vec![0.0, 0.0, 0.0, 1.0],
+            colors: vec![0.5, 0.5, 0.5, 1.0],
+            motions: vec![0.0, 0.0, 0.0],
+            mu_t: vec![0.0],
+            sigma_t: vec![100.0],
+            win_lo: vec![0.0],
+            win_hi: vec![2.0],
+            ..Default::default()
+        },
+    }
+}
+
 fn writer_timeline_error(t0s: &[f64], duration_sec: f64) -> String {
     use fourdgs::keyframe_delta_file::{write_sequence, KeyframeDeltaOptions};
 
@@ -474,6 +493,37 @@ fn the_writer_refuses_an_out_of_order_sample_as_an_overlap() {
     assert!(message.contains("sample 1 at t0=1.5"), "{message}");
     assert!(message.contains("expected sample times"), "{message}");
     assert!(message.contains("overlap"), "{message}");
+}
+
+#[test]
+fn the_writer_refuses_a_populated_zero_width_interval() {
+    use fourdgs::keyframe_delta_file::{write_sequence, KeyframeDeltaOptions};
+
+    let samples = [
+        populated_sample_at(0.0),
+        populated_sample_at(1.0),
+        populated_sample_at(1.0),
+    ];
+    let message = write_sequence(&samples, 2.0, &KeyframeDeltaOptions::default())
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("sample 1"), "{message}");
+    assert!(message.contains("population of 1"), "{message}");
+    assert!(message.contains("zero-width interval [1, 1)"), "{message}");
+    assert!(message.contains("expected 0"), "{message}");
+    assert!(message.contains("half-open seek rule"), "{message}");
+}
+
+#[test]
+fn an_empty_zero_width_interval_is_still_a_valid_tiling() {
+    use fourdgs::keyframe_delta_file::{decode_indexed, write_sequence, KeyframeDeltaOptions};
+
+    let samples = [sample_at(0.0), sample_at(1.0), sample_at(1.0)];
+    let bytes = write_sequence(&samples, 2.0, &KeyframeDeltaOptions::default()).unwrap();
+    let decoded = decode_indexed(&bytes).expect("an empty zero-width state is harmless");
+    let intervals: Vec<_> = decoded.1.iter().map(|entry| (entry.t0, entry.t1)).collect();
+    assert_eq!(intervals, [(0.0, 1.0), (1.0, 1.0), (1.0, 2.0)]);
+    assert_eq!(decoded.1[1].live_count, 0);
 }
 
 #[test]

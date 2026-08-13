@@ -558,6 +558,24 @@ fn aabb(samples: &[Sample]) -> Vec<f64> {
     vec![lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]]
 }
 
+/// Refuse a population no instant can select under the half-open seek rule.
+///
+/// An empty `[t, t)` state is harmless and is permitted by the tiling rule: it covers no
+/// time and carries no unreachable gaussian. A populated one would still count toward the
+/// file while being absent from every reconstruction, so it is not authorable.
+fn check_sample_width(sample: usize, state: &Sample, t1: f64) -> Result<()> {
+    let population = state.gaussians.count();
+    if state.t0 == t1 && population != 0 {
+        return Err(Error::InvalidInput(format!(
+            "sample {sample} has a population of {population} over the zero-width interval \
+             [{}, {t1}); expected 0 there, because the half-open seek rule can never select it \
+             (section 11.1)",
+            state.t0
+        )));
+    }
+    Ok(())
+}
+
 /// Check the part of §11.1 a sequence of sample starts can express.
 ///
 /// [`write_sequence`] derives every interval end from the next sample's `t0`, and derives
@@ -605,6 +623,7 @@ fn check_sample_tiling(samples: &[Sample], duration_sec: f64) -> Result<()> {
                 sample - 1
             )));
         }
+        check_sample_width(sample - 1, &samples[sample - 1], current)?;
     }
 
     let last_sample = samples.len() - 1;
@@ -616,6 +635,7 @@ fn check_sample_tiling(samples: &[Sample], duration_sec: f64) -> Result<()> {
              without being inverted (section 11.1)"
         )));
     }
+    check_sample_width(last_sample, &samples[last_sample], duration_sec)?;
     Ok(())
 }
 

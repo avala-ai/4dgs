@@ -1130,8 +1130,10 @@ int fourdgs_kd_writer_set_compression(fourdgs_kd_writer *writer, uint8_t codec, 
  * [t0_i, t0_{i+1}), the first starts at 0 and the last ends at the duration (spec 11.1).
  * The encoder derives each t1 from the next sample's t0; at encode time it refuses a
  * non-finite or out-of-order start, a first start other than 0, or a final start after the
- * duration. The failure is FOURDGS_STATUS_INVALID_ARGUMENT, and fourdgs_last_error() names
- * the sample and the expected time relationship.
+ * duration. A zero-width interval is accepted only for an empty sample; a populated one
+ * would be unreachable under the half-open seek rule. The failure is
+ * FOURDGS_STATUS_INVALID_ARGUMENT, and fourdgs_last_error() names the sample and the
+ * expected time relationship.
  *
  * Every sigma_t must be finite. The format allows +inf for a gaussian that never fades and
  * this reference encoder does not write one; a non-finite value is refused at encode.
