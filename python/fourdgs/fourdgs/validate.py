@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from . import opcode as op
 from . import records as rec
 from . import refusal
-from .exceptions import FourdgsError
+from .exceptions import ExceedsReaderLimit, FourdgsError
 from .object_layer import ObjectLayer
 from .provenance import LENGTH_UNIT_METRES, Provenance
 from .quantization import sh_bound, sh_step
@@ -778,6 +778,12 @@ def _check_keyframe_delta(data: bytes, walk: Walk, report: Report, header: rec.H
                 )
             else:
                 distinct = kdf.count_distinct_ids_bounded(data, on_record=visiting_record)
+        except ExceedsReaderLimit as exc:
+            # A sequence past the counter's ceiling is not thereby an invalid file, and
+            # saying so would be the second-worst answer available. The check that needed
+            # the number is the one that goes unmade, and the report says which.
+            report.warn(f"{exc}. The Header's gaussian_count is left unchecked")
+            return
         except FourdgsError as exc:
             site = current_site
             if indexed:

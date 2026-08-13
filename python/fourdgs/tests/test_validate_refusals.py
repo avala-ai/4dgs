@@ -1847,7 +1847,90 @@ class TestBoundedDecoding:
 
         monkeypatch.setattr(kdf, "scan_indexed", indexed)
         monkeypatch.setattr(kdf, "scan_streamed", streamed)
-        assert kdf.count_distinct_ids_bounded(b"", capacity=1, index=[], windows=[]) == 2
+        assert kdf.count_distinct_ids_bounded(b"", index=[], windows=[]) == 2
+
+    def test_the_bounded_identity_count_decodes_the_sequence_once(self, monkeypatch):
+        """The partitioned counter this replaced re-decoded the whole file per partition,
+        and every partition that filled doubled their number. 200,000 distinct ids past a
+        65,536-id partition cost forty complete decodes of the file — decompressing and
+        composing every chunk again each time — and a 4M-id capture over a hundred.
+
+        Counted through the two hooks the caller already passes, because they are what a
+        report pays for on every one of those passes: `on_record`/`on_state` fire once per
+        state per scan, so one scan of a four-state sequence is four calls and not eight.
+        """
+        births = [np.arange(i * 50_000, (i + 1) * 50_000, dtype=np.int64) for i in range(4)]
+        scans = 0
+        records: list[int] = []
+        states = 0
+
+        def streamed(_data, on_record=None, **_kwargs):
+            nonlocal scans
+            scans += 1
+            for i, ids in enumerate(births):
+                if on_record is not None:
+                    on_record(i, op.CHUNK)
+                yield i, 0, kdf.State(ids=ids, bins={})
+
+        def seen_state() -> None:
+            nonlocal states
+            states += 1
+
+        monkeypatch.setattr(kdf, "scan_streamed", streamed)
+        distinct = kdf.count_distinct_ids_bounded(
+            b"",
+            on_record=lambda offset, _opcode: records.append(offset),
+            on_state=seen_state,
+        )
+        assert distinct == 200_000
+        assert scans == 1
+        assert records == [0, 1, 2, 3]
+        assert states == 4
+
+    def test_a_reuse_found_after_the_pass_still_names_its_own_record(self, monkeypatch):
+        """Introductions are compared once at the end rather than state by state, so the
+        refusal is raised long after the record that earned it went by. Both the message
+        and the position the caller tracks from `on_record` must name that record, not the
+        last one in the file — a report that disagrees with its own message sends its
+        reader to bytes that are perfectly good (AGENTS.md §6).
+        """
+        sequence = [
+            np.array([7, 8], dtype=np.int64),
+            np.array([8], dtype=np.int64),
+            np.array([8, 7], dtype=np.int64),
+            np.array([8], dtype=np.int64),
+        ]
+        at: list[int] = []
+
+        def streamed(_data, on_record=None, **_kwargs):
+            for i, ids in enumerate(sequence):
+                if on_record is not None:
+                    on_record(i * 100, op.CHUNK if i == 0 else op.DELTA_CHUNK)
+                yield i * 100, (0 if i == 0 else 1), kdf.State(ids=ids, bins={})
+
+        monkeypatch.setattr(kdf, "scan_streamed", streamed)
+        with pytest.raises(fourdgs.MalformedFile) as caught:
+            kdf.count_distinct_ids_bounded(b"", on_record=lambda offset, _opcode: at.append(offset))
+        assert caught.value.code == "gaussian-id-reused"
+        assert "state chunk at 200 reintroduces gaussian id 7" in str(caught.value)
+        assert at[-1] == 200
+
+    def test_a_sequence_past_the_identity_ceiling_is_refused_not_counted(self, monkeypatch):
+        """The one-pass count holds four bytes per distinct id, which is a bound that
+        grows with the file rather than a fixed one. §1 allows that only against a limit
+        the reader declares — so past it the answer is a refusal naming the limit, never a
+        larger allocation chosen by the file's own contents.
+        """
+
+        def streamed(_data, **_kwargs):
+            for i in range(4):
+                yield i, 0, kdf.State(ids=np.arange(i * 1_000, (i + 1) * 1_000, dtype=np.int64), bins={})
+
+        monkeypatch.setattr(kdf, "scan_streamed", streamed)
+        assert kdf.count_distinct_ids_bounded(b"", max_distinct_ids=4_000) == 4_000
+        with pytest.raises(fourdgs.ExceedsReaderLimit) as caught:
+            kdf.count_distinct_ids_bounded(b"", max_distinct_ids=2_500)
+        assert "more than 2500 distinct gaussian ids" in str(caught.value)
 
     def test_an_indexed_keyframe_delta_file_keeps_two_states_at_most(self):
         import weakref

@@ -6,6 +6,33 @@ All notable changes to the Python package are documented here, following
 
 ## [Unreleased]
 
+### Fixed
+
+- **`4dgs validate` counts distinct gaussian ids in one decode of the file, not a hundred.** The
+  count is bounded-memory by design — a set of every id ever seen grows with cumulative births — and
+  it was bounded by auditing one fixed-capacity partition of the id space at a time, splitting by
+  the next high bit and re-streaming the whole file for each half whenever a partition filled. Every
+  split doubled the partitions and every partition drove a fresh scan, so the passes grew with the
+  number of distinct ids: a 400,000-id sequence took 40 complete decodes, and a 4M-id capture well
+  over a hundred, which is a validate that runs for hours and looks hung. It now makes one pass and
+  keeps the ids it is counting, four bytes each. On a 1.3 MiB, 400,000-id file: 6.1s to 0.4s.
+
+### Changed
+
+- **`count_distinct_ids_bounded` bounds itself by a declared ceiling rather than a fixed budget.**
+  Its `capacity` argument, which sized one partition, is now `max_distinct_ids`, which is the number
+  of distinct ids it will count before refusing — 8,388,608 by default, 32 MiB of identities. Exact
+  distinct counting cannot be done in fixed space, and the second thing this function decides,
+  whether an id died and came back, rules out the probabilistic estimators that can. So the honest
+  bound is one this module declares, never one the file's own contents choose (AGENTS.md §1).
+
+### Added
+
+- **`ExceedsReaderLimit`**, for a legal file whose scale is past a ceiling a reader states in
+  advance. Distinct from a malformed file, and reported as such: a sequence carrying more distinct
+  gaussian ids than the validator counts is not thereby invalid, so it collects a warning saying
+  which check went unmade rather than an error saying the file is broken.
+
 ## [0.4.0] - 2026-08-12
 
 ### Fixed
