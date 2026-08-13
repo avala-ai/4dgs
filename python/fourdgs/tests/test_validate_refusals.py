@@ -1466,6 +1466,18 @@ class TestSHBandStreams:
         with pytest.raises(MalformedFile, match="not one complete SH Band Stream record"):
             read_chunk(source, scene, scene.index[0], max_sh_band=1)
 
+        # A range too short to hold a record header, which both paths must refuse by the
+        # same name. This one surfaced whatever the short read raised, with no refusal
+        # identifier on it, while the scan named the rule.
+        too_short, _ = _insert_indexed_band(data, band, extra_length=-(len(band) - 4))
+        source = BytesReadable(too_short)
+        scene = open_indexed(source)
+        with pytest.raises(MalformedFile) as caught:
+            read_chunk(source, scene, scene.index[0], max_sh_band=1)
+        assert caught.value.code == "index-record-mismatch", caught.value.code
+        scanned = [f.refusal.code for f in validate(too_short).findings if f.refusal is not None]
+        assert scanned[:1] == ["index-record-mismatch"], scanned
+
         # And an entry aimed at a record of another kind entirely.
         not_a_band = put_record(op.STATISTICS, bytes([1]) + b"\x00" * 32)
         wrong_kind, _ = _insert_indexed_band(data, not_a_band)

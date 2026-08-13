@@ -387,6 +387,16 @@ def read_chunk(source: Readable, scene: IndexedScene, entry: rec.ChunkIndexEntry
     for band, offset, length in entry.bands:
         if band > max_sh_band:
             continue
+        # A range too short to hold a record header is not a record, and saying so here
+        # rather than letting the read fail is what keeps the two paths speaking the same
+        # vocabulary: the scan refuses this as `index-record-mismatch`, and this one used
+        # to surface whatever the short read raised, with no refusal identifier at all.
+        if offset < 0 or length < 9:
+            raise MalformedFile(
+                f"the chunk index entry at {entry.chunk_offset} points SH band {band} at "
+                f"[{offset}, {offset + length}), which is too short to be a record",
+                code="index-record-mismatch",
+            )
         band_blob = _read_range(source, offset, length, f"index band {band}")
         # The frame, before its contents. The scan path checks all three of these and this
         # one checked none, so an entry pointing at a record that is not an SH Band Stream,
