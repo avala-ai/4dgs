@@ -409,6 +409,25 @@ void duplicateIdsWithinASampleAreRefused() {
   CHECK(encoded.error().message.find("more than once") != std::string::npos);
 }
 
+/// An identity is never reused within one sequence (§11.2): once absent from a sample, it is
+/// dead. The ordinary round-trip fixture above is the positive control — ids 1, 2 and 3 stay
+/// continuously live while id 4 is a genuine new birth. Here id 0 instead skips sample 1 and
+/// reappears in sample 2, which is a new row trying to claim a dead gaussian's identity.
+void anIdThatReappearsAfterDeathIsRefused() {
+  Sequence sequence = threeSamples();
+  sequence.ids[1][0] = 4;
+  sequence.ids[2][3] = 0;
+
+  Result<std::vector<std::uint8_t>> encoded =
+      fourdgs::encodeKeyframeDeltaSequence(spanOf(sequence), 1.0);
+  CHECK(!encoded.ok());
+  if (encoded.ok()) return;
+  CHECK_EQ(encoded.error().code, ErrorCode::kInvalidArgument);
+  CHECK(encoded.error().message.find("sample 2") != std::string::npos);
+  CHECK(encoded.error().message.find("gaussian id 0") != std::string::npos);
+  CHECK(encoded.error().message.find("after it died") != std::string::npos);
+}
+
 /// The nine columns the ABI reads, with the floats each holds per gaussian.
 struct Column {
   fourdgs::Span<const float> GaussianView::* member;
@@ -573,6 +592,7 @@ void runTests() {
     sampleInstantsMustStrictlyIncrease();
     theLastSampleMustStartBeforeDuration();
     duplicateIdsWithinASampleAreRefused();
+    anIdThatReappearsAfterDeathIsRefused();
     aRaggedSampleIsRefused();
     aRaggedSceneIsRefused();
     compressionAndCutoffReachTheCore();

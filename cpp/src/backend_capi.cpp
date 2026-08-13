@@ -677,6 +677,12 @@ Result<void> checkKeyframeDeltaInputs(Span<const KeyframeDeltaSample> samples, d
                      "; its interval must have positive width (spec §11.1)");
   }
 
+  // `seenIds` grows only to the number of distinct identities in the caller's samples, and
+  // `liveIds` only to one sample's population. Keeping both is what distinguishes a genuine
+  // birth (not seen) and continuous survival (still live) from reuse after death (seen, but no
+  // longer live) without retaining another copy of every sample.
+  std::unordered_set<std::uint32_t> seenIds;
+  std::unordered_set<std::uint32_t> liveIds;
   for (std::size_t i = 0; i < samples.size(); ++i) {
     const KeyframeDeltaSample& sample = samples[i];
     Result<void> columns = checkColumns(sample.gaussians, "sample " + std::to_string(i));
@@ -703,6 +709,18 @@ Result<void> checkKeyframeDeltaInputs(Span<const KeyframeDeltaSample> samples, d
                          " more than once; ids are unique within a state (spec §11.2)");
       }
     }
+    // Walk the caller's order for a deterministic diagnosis when more than one dead id is
+    // reused in the same sample; the set above is only for membership.
+    for (std::uint32_t id : sample.ids) {
+      if (seenIds.find(id) != seenIds.end() && liveIds.find(id) == liveIds.end()) {
+        return Error(ErrorCode::kInvalidArgument,
+                     "sample " + std::to_string(i) + " reuses gaussian id " + std::to_string(id) +
+                         " after it died; gaussian_id is never reused within a sequence "
+                         "(spec §11.2)");
+      }
+      seenIds.insert(id);
+    }
+    liveIds.swap(uniqueIds);
   }
   return Result<void>();
 }
