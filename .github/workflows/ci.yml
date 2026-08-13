@@ -703,18 +703,20 @@ jobs:
             # CMake's target selectors. Static-library try-compiles let CMake detect the
             # 32-bit pointer width without requiring multilib runtime libraries merely to
             # exercise this configure-time refusal.
-            multilib_log="$RUNNER_TEMP/fourdgs-m32-no-cargo-target.log"
-            if cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-m32-no-cargo-target" \
-              -DCMAKE_CXX_FLAGS=-m32 \
-              -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
-              -DFOURDGS_SOURCE_DIR="$GITHUB_WORKSPACE" >"$multilib_log" 2>&1; then
+            if [ "$RUNNER_ARCH" = "X64" ]; then
+              multilib_log="$RUNNER_TEMP/fourdgs-m32-no-cargo-target.log"
+              if cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-m32-no-cargo-target" \
+                -DCMAKE_CXX_FLAGS=-m32 \
+                -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+                -DFOURDGS_SOURCE_DIR="$GITHUB_WORKSPACE" >"$multilib_log" 2>&1; then
+                cat "$multilib_log"
+                echo "::error::-m32 configured with Cargo's 64-bit host target"
+                exit 1
+              fi
               cat "$multilib_log"
-              echo "::error::-m32 configured with Cargo's 64-bit host target"
-              exit 1
+              grep -q '4-byte pointer ABI' "$multilib_log"
+              grep -q FOURDGS_CARGO_TARGET "$multilib_log"
             fi
-            cat "$multilib_log"
-            grep -q '4-byte pointer ABI' "$multilib_log"
-            grep -q FOURDGS_CARGO_TARGET "$multilib_log"
 
             # Clang toolchains can select a target through the compiler driver while
             # leaving CMAKE_CROSSCOMPILING false. The explicit compiler target is still
