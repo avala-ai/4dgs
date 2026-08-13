@@ -127,7 +127,9 @@ struct KeyframeDeltaOptions {
 /// `sigma_t`, `flags` or `window_index` in an update group (§11.5).
 ///
 /// `kNotImplemented` when the package was built without the core; `kInvalidArgument` when the
-/// samples break a rule §11 puts on a producer, with the core's message naming the gaussian.
+/// duration is not finite and positive, sample instants do not strictly tile `[0, durationSec)`,
+/// an identity repeats within one sample, or the samples break another producer rule from §11.
+/// The error message names the sample and offending instant or gaussian.
 Result<std::vector<std::uint8_t>> encodeKeyframeDeltaSequence(
     Span<const KeyframeDeltaSample> samples, double durationSec,
     const KeyframeDeltaOptions& options = KeyframeDeltaOptions());
