@@ -8,6 +8,36 @@ All notable changes to the Swift package are documented here, following
 
 ### Added
 
+- **Encoding the `keyframe-delta` temporal model**, turning the Swift cell of that row from Planned
+  to Yes; C++ is now the only one still Planned.
+  `KeyframeDeltaWriter.encode(_:durationSec:options:)` takes a sequence of `KeyframeDeltaSample` — a
+  population, at one instant, with identity — and returns the file bytes. `SceneWriter` could
+  already author the other model, one population whose gaussians each carry their own birth time;
+  what it could not say is the thing this model exists for, the _same_ population restated at a
+  sequence of instants with gaussians entering and leaving.
+
+  Like `SceneWriter` this is a binding, and here that is a correctness property rather than a
+  convenience. A delta is a **difference of bins, never a quantization of a difference** (spec
+  §11.7), which is what makes chained deltas accumulate no error at any depth — and it holds only if
+  every sample was quantized up front on grids derived from the whole sequence. So the whole
+  sequence crosses the C ABI before anything is encoded, and nothing in Swift subtracts anything. An
+  encoder that subtracted here and quantized afterwards would produce a file whose declared bounds
+  mean nothing after the second delta.
+
+  `KeyframeDeltaWriteOptions` carries the cadence (`keyframeEvery`, with `keyframeAt` for a cut a
+  producer knows about), `deltaMode` — `.chained` for deltas that reference the previous chunk and
+  coalesce into one range request, `.keyframeReferenced` for a likely seek target — the bound
+  `profile`, `cutoff`, `library` and the stream codec. Refusals arrive as the same typed errors the
+  reader throws: an empty sequence, a sample whose ids and gaussians are different lengths, a
+  non-finite `sigmaT`, and a gaussian whose `sigmaT` or validity window changes inside a group,
+  which is refused rather than written because those values _derive the grid_ a bin difference is
+  taken on (spec §11.5) and a file carrying such a change decodes silently into a wrong velocity.
+
+  Proved by `swift/keyframe-delta-roundtrip.sh`, which writes five sequences and requires the Python
+  reference and both Swift read paths to agree on every one; four of them are the corpus generator's
+  own sequences and are additionally held to the committed corpus's population and geometry.
+  Spherical harmonics are not carried, so a file written this way declares `sh_degree` 0.
+
 - `4dgs`, the inspect-and-validate tool, turning the Swift cell of that row from Planned to Yes;
   TypeScript, Rust, C++ and Dart still read Planned. `4dgs inspect` walks a file record by record —
   offset, opcode by name, content and total length, and whether the Footer's summary checksum covers

@@ -54,7 +54,7 @@ composition order of its own.
 | Delta composition, keyframe-referenced            | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Births and deaths in deltas                       | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Reconstruction at an instant                      | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
-| Encode `keyframe-delta`                           | Yes    | Yes        | Yes     | Planned | Planned | Yes     |
+| Encode `keyframe-delta`                           | Yes    | Yes        | Yes     | Planned | Yes     | Yes     |
 | Unknown-record skipping                           | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Refusal diagnosis (named, not merely refused)     | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 | Private-range records                             | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
@@ -151,8 +151,16 @@ bindings emit bytes identical to the reference with no arithmetic of their own �
 the `temporal_model` from the bytes, since an opened scene refuses the model, then calls the
 accessor on each read path. **Encode** is `Yes` for Python, whose writer generates the corpus, and
 Rust, whose cross-implementation gate encodes a delta file that Python decodes to an identical
-canonical. The C++ and Swift encode cells stay `Planned`: the C ABI exposes no keyframe-delta
-encoder.
+canonical. Swift's cell is `Yes` on the same additive shape as its decode: the C ABI grew a second
+writer handle — a `gaussian-birth` writer cannot express a population restated at a sequence of
+instants — which accumulates samples and encodes once, because a delta is a difference of bins and
+never a quantization of a difference (§11.7) and that holds only if the whole sequence was quantized
+on grids derived from all of it. `swift/keyframe-delta-roundtrip.sh` grades the result against the
+Python reference on both read paths, and against the committed corpus's population and geometry for
+the four sequences the generator also builds; the aggregate opacity is excluded, and is a legal
+difference rather than slack — where the keyframes fall decides which gaussians have their `mu_t`
+restated at a chunk's `t0` (§11.3), and a birth time that moves moves the marginal. **C++ stays
+`Planned`**: the exports exist now, and the binding over them does not.
 
 **Range-request decode** is a property of the transport an SDK offers, not of the format: every SDK
 can decode from an arbitrary byte-range reader, but only some ship an HTTP one. TypeScript's and
