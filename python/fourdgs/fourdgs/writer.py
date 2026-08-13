@@ -146,7 +146,17 @@ def _planning_support(q_mu, q_sigma, t_step, sigma_log_step, never_fades, window
         .astype(np.float32)
         .astype(np.float64)
     )
-    half = np.where(never_fades, np.inf, support_k(cutoff) * sigma)
+    half = support_k(cutoff) * sigma
+    if cutoff == 1.0:
+        # Mathematically the support is the single instant ``mu``, but state_at performs
+        # the marginal calculation in binary64.  exp(-x) rounds to exactly 1.0 for a
+        # small interval of positive x, so nearby representable times pass ``>= 1.0`` as
+        # well.  Two square roots of one ULP at 1.0 strictly contain that normalized
+        # rounding plateau (including the division and square rounding) without scanning
+        # time or widening support by a scene-scale epsilon.
+        plateau = 2.0 * math.sqrt(math.ulp(1.0)) * np.maximum(sigma, 1e-30)
+        half = plateau
+    half = np.where(never_fades, np.inf, half)
     window_lo = np.asarray(windows, dtype=np.float64)[win_index, 0]
     window_hi = np.asarray(windows, dtype=np.float64)[win_index, 1]
     marginal_hi = mu + half

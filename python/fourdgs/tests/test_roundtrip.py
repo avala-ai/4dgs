@@ -181,6 +181,39 @@ class TestRoundTrip:
         assert marginal >= cutoff
         assert len(indexed.chunks_for_time(boundary)) == 1
 
+    def test_cutoff_one_indexed_seek_covers_both_neighbors_of_the_mean(self):
+        from fourdgs.indexed_reader import open_indexed, read_chunk
+        from fourdgs.readable import BytesReadable
+        from fourdgs.stream_reader import _assemble
+
+        scene = make_scene(n=1, windows=1, duration=1.0, never_fades_fraction=0.0)
+        scene.mu_t[:] = 0.5
+        scene.sigma_t[:] = 0.1
+        cutoff = 1.0
+
+        encoded = io.BytesIO()
+        fourdgs.write(
+            encoded,
+            scene,
+            1.0,
+            options=fourdgs.WriteOptions(cutoff=cutoff, max_depth=1, min_chunk_gaussians=1),
+        )
+        data = encoded.getvalue()
+        decoded = fourdgs.read(data)
+        source = BytesReadable(data)
+        indexed = open_indexed(source)
+        mean = float(decoded.gaussians.mu_t[0])
+        neighbors = [np.nextafter(mean, -np.inf), np.nextafter(mean, np.inf)]
+
+        for t in neighbors:
+            full_state = decoded.gaussians.state_at(t, cutoff)
+            chunks = [read_chunk(source, indexed, entry) for entry in indexed.chunks_for_time(t)]
+            indexed_gaussians = _assemble(chunks, indexed.windows, indexed.header)
+            indexed_state = indexed_gaussians.state_at(t, cutoff)
+
+            assert full_state["indices"].tolist() == [0]
+            assert indexed_state["indices"].tolist() == [0]
+
     @pytest.mark.parametrize("degree", [1, 2, 3])
     def test_spherical_harmonics_degrees(self, degree):
         out = roundtrip(make_scene(sh_degree=degree))
