@@ -65,7 +65,7 @@ composition order of its own.
 | glTF interop (import, snapshot export)            | Yes    | No         | No      | No      | No      | No      |
 | USD interop (import, snapshot export)             | Yes    | No         | No      | No      | No      | No      |
 | USD animated export (keyframe-delta time samples) | Yes    | No         | No      | No      | No      | No      |
-| Inspect and validate                              | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
+| Inspect and validate                              | Yes    | Yes        | Yes     | Partial | Yes     | Yes     |
 
 ¹ On the `gaussian-birth` path. No implementation composes object tracks during `keyframe-delta`
 reconstruction: that path rebuilds base centres and scales from bins and never reads the object
@@ -76,6 +76,8 @@ about the combination — see issue #79.
 ## Reading this table
 
 - **Yes** — implemented, and the conformance suite proves it.
+- **Partial** — the tool ships and proves a useful subset, but deliberately declines to certify a
+  format path its bounded SDK surface cannot validate completely.
 - **Untested** — implemented, and nothing in this repository proves it. A promise with no evidence
   behind it, recorded as such rather than as a `Yes`.
 - **Planned** — intended for this SDK; not implemented yet.
@@ -388,11 +390,13 @@ expectation is read out of the corpus rather than written into the test. "Both r
 error" is not the property — a reader that refuses all seven for the wrong reason passes a test that
 only checks the exit code, and that is the failure the invalid corpus exists to catch.
 
-**C++** earns the same claim in `cpp/tests/test_tool.cpp`: the test reads those seven expectations
-from the corpus and requires the tool to name each identifier and byte. Separate mutation tests
-prove bounded range reads, chunk and SH-band decoding, framing, CRC and truncation diagnostics; the
-valid corpus is also exercised so a tool that refuses every input cannot pass. A build without the
-Rust core returns exit 3 rather than certifying payloads it did not decode.
+**C++** is `Partial`. `cpp/tests/test_tool.cpp` reads the seven invalid expectations from the corpus
+and requires the tool to name each identifier and byte. Separate mutation tests prove bounded range
+reads, chunk and SH-band decoding, framing, CRC and truncation diagnostics; gaussian-birth files are
+also exercised so a tool that refuses every input cannot pass. The bounded C++ core surface cannot
+yet validate keyframe-delta payloads, however, so those files return exit 3 with an incomplete
+verdict rather than being certified from their framing alone. A no-core build uses that same exit
+for every payload.
 
 **Rust** decodes and encodes. Its decode rows are filled in from the same suite on the same terms as
 the other two; its encode rows come from the cross-implementation gate described above. Python
