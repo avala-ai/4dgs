@@ -283,6 +283,45 @@ class TestRoundTrip:
         assert float(np.float32(q_mu[0]) + reconstructed_sigma) == 0.0
         assert lo[0] <= 0.5 < hi[0]
 
+    def test_planning_support_uses_the_state_sigma_floor(self):
+        from fourdgs.writer import _planning_support
+
+        lo, hi = _planning_support(
+            np.array([0]),
+            np.array([-10_000]),
+            np.array([1.0]),
+            0.02,
+            np.array([False]),
+            np.array([[0.0, 2e-30]]),
+            np.array([0]),
+            0.05,
+        )
+
+        # The finite exponential reconstructs below f32 and becomes zero publicly, but
+        # state_at divides by max(sigma, 1e-30), so t=1.5e-30 is still visible.
+        assert np.float32(np.exp(-10_000 * 0.02)) == 0.0
+        assert lo[0] <= 1.5e-30 < hi[0]
+
+    def test_planning_support_uses_public_f32_validity_windows(self):
+        from fourdgs.writer import _planning_support
+
+        stored_lo = np.nextafter(0.50000002, np.inf)
+        public_lo = float(np.float32(stored_lo))
+        query = 0.5 * (public_lo + stored_lo)
+        lo, hi = _planning_support(
+            np.array([0]),
+            np.array([0]),
+            np.array([1.0]),
+            0.02,
+            np.array([True]),
+            np.array([[stored_lo, 1.0]]),
+            np.array([0]),
+            0.05,
+        )
+
+        assert public_lo <= query < stored_lo
+        assert lo[0] <= query < hi[0]
+
     @pytest.mark.parametrize("degree", [1, 2, 3])
     def test_spherical_harmonics_degrees(self, degree):
         out = roundtrip(make_scene(sh_degree=degree))

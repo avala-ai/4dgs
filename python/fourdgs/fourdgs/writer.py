@@ -141,6 +141,7 @@ def _planning_support(q_mu, q_sigma, t_step, sigma_log_step, never_fades, window
     # against that representation, then widen for the support arithmetic, exactly as the
     # encoder geometry gate and state_at do.
     sigma = np.exp(np.asarray(q_sigma, dtype=np.float64) * sigma_log_step).astype(np.float32).astype(np.float64)
+    effective_sigma = np.maximum(sigma, 1e-30)
     mu = (
         (np.asarray(q_mu, dtype=np.float64) * np.asarray(t_step, dtype=np.float64))
         .astype(np.float32)
@@ -153,10 +154,17 @@ def _planning_support(q_mu, q_sigma, t_step, sigma_log_step, never_fades, window
     # rounded plateau is not. At the smallest positive cutoff the predecessor is zero and
     # the only finite conservative inverse is the whole timeline.
     marginal_floor = np.nextafter(float(cutoff), 0.0)
-    half = np.full_like(sigma, np.inf) if marginal_floor == 0.0 else support_k(float(marginal_floor)) * sigma
+    half = (
+        np.full_like(effective_sigma, np.inf)
+        if marginal_floor == 0.0
+        else support_k(float(marginal_floor)) * effective_sigma
+    )
     half = np.where(never_fades, np.inf, half)
-    window_lo = np.asarray(windows, dtype=np.float64)[win_index, 0]
-    window_hi = np.asarray(windows, dtype=np.float64)[win_index, 1]
+    # Window Table records are f64, but GaussianSet exposes the decoded window lanes as
+    # f32 and state_at evaluates those values. Plan from that same public state.
+    decoded_windows = np.asarray(windows, dtype=np.float32).astype(np.float64)
+    window_lo = decoded_windows[win_index, 0]
+    window_hi = decoded_windows[win_index, 1]
     # Round every derived time away from the support before comparing it with a split.
     # That accounts for the inverse arithmetic and makes the upper bound strictly outside
     # the inclusive marginal endpoint while retaining the validity window's own [lo, hi)
