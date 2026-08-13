@@ -163,6 +163,65 @@ function splice(data: Uint8Array, at: number, insert: Uint8Array): Uint8Array {
   return out;
 }
 
+/** Rewrite one Quantization bound and discard the now-stale byte index and summary. */
+function replaceQuantizationBound(
+  data: Uint8Array,
+  wanted: string,
+  replacement: string,
+): Uint8Array {
+  const records = [...iterateRecords(data, MAGIC.length)];
+  const quantization = records.find((entry) => entry.opcode === Opcode.Quantization)!;
+  const content = quantization.raw.subarray(RECORD_HEADER_BYTES);
+  const view = new DataView(content.buffer, content.byteOffset, content.byteLength);
+  let at = 0;
+  const schemeBytes = view.getUint32(at, true);
+  at += 4 + schemeBytes + 3 * 8 + 8 * 8 + 1;
+  const mapLengthAt = at;
+  const mapBytes = view.getUint32(at, true);
+  at += 4;
+  const mapEnd = at + mapBytes;
+  const decoder = new TextDecoder();
+  const encoded = new TextEncoder().encode(replacement);
+  let rewritten: Uint8Array | null = null;
+
+  while (at < mapEnd) {
+    const keyBytes = view.getUint32(at, true);
+    at += 4;
+    const key = decoder.decode(content.subarray(at, at + keyBytes));
+    at += keyBytes;
+    const valueLengthAt = at;
+    const valueBytes = view.getUint32(at, true);
+    at += 4;
+    if (key === wanted) {
+      const delta = encoded.length - valueBytes;
+      rewritten = new Uint8Array(content.length + delta);
+      rewritten.set(content.subarray(0, valueLengthAt));
+      new DataView(rewritten.buffer).setUint32(valueLengthAt, encoded.length, true);
+      rewritten.set(encoded, valueLengthAt + 4);
+      rewritten.set(content.subarray(at + valueBytes), valueLengthAt + 4 + encoded.length);
+      new DataView(rewritten.buffer).setUint32(mapLengthAt, mapBytes + delta, true);
+      break;
+    }
+    at += valueBytes;
+  }
+  assert.notEqual(rewritten, null, `missing Quantization bound ${wanted}`);
+
+  const state = records
+    .filter(
+      (entry) =>
+        entry.opcode !== Opcode.ChunkIndex &&
+        entry.opcode !== Opcode.Statistics &&
+        entry.opcode !== Opcode.SummaryOffset &&
+        entry.opcode !== Opcode.Footer,
+    )
+    .map((entry) =>
+      entry.opcode === Opcode.Quantization
+        ? framedRecord(Opcode.Quantization, rewritten!)
+        : entry.raw.slice(),
+    );
+  return indexlessFile(state);
+}
+
 /**
  * Move the Footer's `summary_start` by `shift` and recompute `summary_crc`.
  *
@@ -1780,6 +1839,28 @@ test("regression: the SH bit depths are checked against the Header's degree", (t
   assert.ok(
     malformedReport.out.some((line) => line.includes("malformed SH bit-depth declaration")),
     malformedReport.out.join("\n"),
+  );
+});
+
+test("regression: per-band SH bounds compare as exact decimals", async (t) => {
+  const variant = "MixedLifetimes-SHBitsLow-SHDegree2-UseChunkIndex-UseCrc";
+  if (corpus(variant) === null) return t.skip("corpus not generated");
+  const original = bytesOf(variant);
+
+  for (const spelling of ["4.0", `0.${"0".repeat(1000)}4e1001`]) {
+    const equivalent = await validateFile(replaceQuantizationBound(original, "sh_band1", spelling));
+    assert.ok(
+      equivalent.findings.every((finding) => !finding.message.includes("`sh_band1` as")),
+      equivalent.findings.map((finding) => finding.message).join("\n"),
+    );
+  }
+
+  const different = await validateFile(
+    replaceQuantizationBound(original, "sh_band1", "4.0000000000000001"),
+  );
+  assert.ok(
+    different.findings.some((finding) => finding.message.includes("`sh_band1` as")),
+    different.findings.map((finding) => finding.message).join("\n"),
   );
 });
 
