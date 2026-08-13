@@ -18,4 +18,10 @@ Result<std::vector<std::uint8_t>> encodeScene(const GaussianView& gaussians, dou
   return detail::encodeScene(gaussians, durationSec, options);
 }
 
+Result<std::vector<std::uint8_t>> encodeKeyframeDeltaSequence(
+    Span<const KeyframeDeltaSample> samples, double durationSec,
+    const KeyframeDeltaOptions& options) {
+  return detail::encodeKeyframeDeltaSequence(samples, durationSec, options);
+}
+
 }  // namespace fourdgs

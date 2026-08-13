@@ -182,4 +182,9 @@ says and never contradicts it.
 Conformance-verified: **79 checks across the 45 valid variants this binding supports**, with the
 read path forced at open rather than left to the opener, so the streamed and indexed rows rest on
 two paths and not one. The [feature matrix](../website/docs/reference/index.md) records exactly what
-that proves; the encode rows stay `Planned` because this package decodes only at v1.
+that proves. Encode is there too, and in both shapes: `fourdgs::encodeScene` authors a
+`gaussian-birth` scene and `fourdgs::encodeKeyframeDeltaSequence` a whole `keyframe-delta` file
+(spec §11) from a sequence of populations with `gaussian_id` identity between them. Both are
+bindings over the core's writer rather than second encoders, so what their gates prove is that the
+gaussians, the samples and the options were wired through — for keyframe-delta, by requiring the
+file to be byte for byte the one the Rust reference writer produces from the same input.

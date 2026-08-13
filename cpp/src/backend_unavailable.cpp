@@ -90,6 +90,11 @@ Result<std::vector<std::uint8_t>> encodeScene(const GaussianView&, double, const
   return notImplemented();
 }
 
+Result<std::vector<std::uint8_t>> encodeKeyframeDeltaSequence(Span<const KeyframeDeltaSample>,
+                                                              double, const KeyframeDeltaOptions&) {
+  return notImplemented();
+}
+
 Result<std::string> peekTemporalModel(Span<const std::uint8_t>) { return notImplemented(); }
 Result<std::string> keyframeDeltaStatesJson(Span<const std::uint8_t>, bool) {
   return notImplemented();
