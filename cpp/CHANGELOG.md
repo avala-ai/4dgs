@@ -19,10 +19,11 @@ All notable changes to the C++ package are documented here, following
   crosses the C ABI without a prior repository core build. This completes issue #150's consumer
   path; Swift and prebuilt release artifacts remain tracked together by #162.
 - Source builds pass an explicit Cargo target triple and require `FOURDGS_CARGO_TARGET` when CMake
-  cross-compiles or selects a same-OS target architecture, preventing a host archive from reaching
-  the target linker. Universal macOS builds explicitly require a pre-combined core rather than
-  silently linking one thin archive. MSVC Debug consumers inherit the Rust archive's `/MD` runtime,
-  and absolute package library directories retain both Windows drive syntax and legal POSIX colons.
+  cross-compiles or selects a target through `CMAKE_CXX_COMPILER_TARGET` or a same-OS architecture,
+  preventing a host archive from reaching the target linker. Universal macOS builds explicitly
+  require a pre-combined core rather than silently linking one thin archive. MSVC Debug consumers
+  inherit the Rust archive's `/MD` runtime, and absolute package library directories retain both
+  Windows drive syntax and legal POSIX colons.
 
 - **`keyframe-delta` encode** (spec §11):
   `fourdgs::encodeKeyframeDeltaSequence(samples, durationSec, options)`, with `KeyframeDeltaSample`

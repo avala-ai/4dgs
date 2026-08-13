@@ -98,10 +98,10 @@ contains that crate, and `FOURDGS_BUILD_CORE_FROM_SOURCE` defaults to `ON` for C
 CMake build, then makes the C++ library depend on and link the result. A native build derives the
 triple from `cargo -vV`; a cross build must name the toolchain's Rust triple with
 `FOURDGS_CARGO_TARGET`, so it cannot silently build a host archive for a target linker. The same
-requirement applies when Visual Studio `-A` or `CMAKE_OSX_ARCHITECTURES` selects an architecture on
-the host OS, because CMake does not classify those builds as cross-compiling. A universal macOS
-build needs a pre-combined `FOURDGS_CORE_LIBRARY`; one Cargo target can only produce a thin archive.
-Building the same checkout at two revisions cannot make them share one `target/` tree.
+requirement applies when `CMAKE_CXX_COMPILER_TARGET`, Visual Studio `-A`, or
+`CMAKE_OSX_ARCHITECTURES` selects a target without setting CMake's cross-compiling flag. A universal
+macOS build needs a pre-combined `FOURDGS_CORE_LIBRARY`; one Cargo target can only produce a thin
+archive. Building the same checkout at two revisions cannot make them share one `target/` tree.
 
 A consumer that already has a core can skip that build by naming it. The header defaults to the one
 in a fetched repository; a vendored copy of `cpp/` alone supplies both paths:

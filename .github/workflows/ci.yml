@@ -699,6 +699,21 @@ jobs:
             cat "$universal_log"
             grep -q 'cannot produce one universal Rust archive' "$universal_log"
           elif [ "$RUNNER_OS" = "Linux" ]; then
+            # Clang toolchains can select a target through the compiler driver while
+            # leaving CMAKE_CROSSCOMPILING false. The explicit compiler target is still
+            # independent of Cargo's host and therefore requires the matching Rust triple.
+            compiler_target_log="$RUNNER_TEMP/fourdgs-compiler-target-no-cargo-target.log"
+            if cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-compiler-target-no-cargo-target" \
+              -DCMAKE_CXX_COMPILER_TARGET=aarch64-unknown-linux-gnu \
+              -DFOURDGS_SOURCE_DIR="$GITHUB_WORKSPACE" >"$compiler_target_log" 2>&1; then
+              cat "$compiler_target_log"
+              echo "::error::CMAKE_CXX_COMPILER_TARGET configured without FOURDGS_CARGO_TARGET"
+              exit 1
+            fi
+            cat "$compiler_target_log"
+            grep -q CMAKE_CXX_COMPILER_TARGET "$compiler_target_log"
+            grep -q FOURDGS_CARGO_TARGET "$compiler_target_log"
+
             # A CMake toolchain changes the target independently of Cargo's host. Without
             # an explicit Rust triple this must stop at configure time, before producing
             # a host archive that fails much later in the cross-linker.
