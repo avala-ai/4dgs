@@ -85,6 +85,19 @@ const Set<int> keyframeDeltaAbsoluteInUpdate = <int>{
 /// is written.
 const Set<int> _zeroDefaultIdentityAttributes = <int>{attrObjectId};
 
+/// The optional identity lanes that reach the public API as their own arrays.
+///
+/// A different question from the one above, and it used to be answered by the
+/// same set — so narrowing that one to `object_id` quietly stopped `_population`
+/// from budgeting for the other two, which it still allocates. They are separate
+/// because they mean separate things: this one is "what does a composed
+/// population hand back", and that one is "what may a birth leave out".
+const Set<int> _publicIdentityAttributes = <int>{
+  attrSourceGroup,
+  attrSourceIndex,
+  attrObjectId,
+};
+
 /// One attribute's bins for a whole population: [channels] per gaussian, packed
 /// `values[i * channels + c]`.
 class _Column {
@@ -1763,7 +1776,7 @@ KeyframeDeltaPopulation _population(KeyframeDeltaState state, _Grids grids) {
   for (final column in state._bins.values) {
     bytesPerGaussian += column.channels * Int32List.bytesPerElement;
   }
-  for (final attribute in _zeroDefaultIdentityAttributes) {
+  for (final attribute in _publicIdentityAttributes) {
     if (state._bins.containsKey(attribute)) {
       bytesPerGaussian += Int32List.bytesPerElement;
     }
