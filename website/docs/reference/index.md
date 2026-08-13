@@ -65,7 +65,7 @@ composition order of its own.
 | glTF interop (import, snapshot export)            | Yes    | No         | No      | No      | No      | No      |
 | USD interop (import, snapshot export)             | Yes    | No         | No      | No      | No      | No      |
 | USD animated export (keyframe-delta time samples) | Yes    | No         | No      | No      | No      | No      |
-| Inspect and validate                              | Yes    | Yes        | Yes     | Planned | Yes     | Yes     |
+| Inspect and validate                              | Yes    | Yes        | Yes     | Yes     | Yes     | Yes     |
 
 ¹ On the `gaussian-birth` path. No implementation composes object tracks during `keyframe-delta`
 reconstruction: that path rebuilds base centres and scales from bins and never reads the object
@@ -386,10 +386,13 @@ it is `every_invalid_variant_is_refused_by_its_own_identifier`: each of the seve
 must be refused **by the identifier the corpus declares for it**, with the byte it fired at, and the
 expectation is read out of the corpus rather than written into the test. "Both readers raised an
 error" is not the property — a reader that refuses all seven for the wrong reason passes a test that
-only checks the exit code, and that is the failure the invalid corpus exists to catch. The Rust
-validator is also the only one that decodes chunks, so it is the only one that reports the two
-refusals living inside a chunk's streams; the Python validator walks the framing and calls those
-files clean, which is the gap the Python side of the epic closes.
+only checks the exit code, and that is the failure the invalid corpus exists to catch.
+
+**C++** earns the same claim in `cpp/tests/test_tool.cpp`: the test reads those seven expectations
+from the corpus and requires the tool to name each identifier and byte. Separate mutation tests
+prove bounded range reads, chunk and SH-band decoding, framing, CRC and truncation diagnostics; the
+valid corpus is also exercised so a tool that refuses every input cannot pass. A build without the
+Rust core returns exit 3 rather than certifying payloads it did not decode.
 
 **Rust** decodes and encodes. Its decode rows are filled in from the same suite on the same terms as
 the other two; its encode rows come from the cross-implementation gate described above. Python
