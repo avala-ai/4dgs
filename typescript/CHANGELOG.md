@@ -8,6 +8,8 @@ The four packages version together.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-12
+
 ### Added
 
 - `reconstructKeyframeDelta` in `@4dgs/core`: the full population at an instant of a
