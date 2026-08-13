@@ -483,6 +483,7 @@ impl Provenance {
 // shared canonical: six-decimal floats, integers as strings, sorted object keys, and the
 // probe poses that exercise clamp and shortest-arc slerp rather than only the stored samples.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
@@ -504,6 +505,7 @@ pub(crate) enum Json {
     Null,
     Bool(bool),
     Num(f64),
+    ExactNum(String),
     Str(String),
     Arr(Vec<Json>),
     Obj(BTreeMap<String, Json>),
@@ -521,6 +523,7 @@ impl Json {
             Json::Num(v) => {
                 let _ = write!(out, "{v:.*}", PROVENANCE_JSON_DECIMALS);
             }
+            Json::ExactNum(token) => out.push_str(token),
             Json::Str(s) => write_json_string(out, s),
             Json::Arr(items) => {
                 out.push('[');
@@ -552,6 +555,133 @@ impl Json {
         self.write(&mut out);
         out
     }
+}
+
+#[derive(Default)]
+struct DecimalAccumulator {
+    negative: bool,
+    // Base ten, least-significant digit first. Six canonical decimal places plus a
+    // finite binary64 value do not fit a machine integer in the general case.
+    digits: Vec<u8>,
+}
+
+impl DecimalAccumulator {
+    fn add_fixed(&mut self, fixed: &str) {
+        let (negative, magnitude) = fixed
+            .strip_prefix('-')
+            .map_or((false, fixed), |s| (true, s));
+        let mut incoming: Vec<u8> = magnitude
+            .bytes()
+            .filter(|byte| byte.is_ascii_digit())
+            .map(|byte| byte - b'0')
+            .rev()
+            .collect();
+        trim_decimal_zeros(&mut incoming);
+        if incoming.is_empty() {
+            return;
+        }
+        if self.digits.is_empty() {
+            self.negative = negative;
+            self.digits = incoming;
+            return;
+        }
+        if self.negative == negative {
+            add_decimal_magnitude(&mut self.digits, &incoming);
+            return;
+        }
+        match compare_decimal_magnitude(&self.digits, &incoming) {
+            Ordering::Greater => subtract_decimal_magnitude(&mut self.digits, &incoming),
+            Ordering::Equal => {
+                self.digits.clear();
+                self.negative = false;
+            }
+            Ordering::Less => {
+                subtract_decimal_magnitude(&mut incoming, &self.digits);
+                self.digits = incoming;
+                self.negative = negative;
+            }
+        }
+    }
+
+    fn token(&self) -> String {
+        let mut digits: String = if self.digits.is_empty() {
+            "0".into()
+        } else {
+            self.digits
+                .iter()
+                .rev()
+                .map(|digit| char::from(b'0' + digit))
+                .collect()
+        };
+        if digits.len() <= PROVENANCE_JSON_DECIMALS {
+            digits.insert_str(0, &"0".repeat(PROVENANCE_JSON_DECIMALS + 1 - digits.len()));
+        }
+        let split = digits.len() - PROVENANCE_JSON_DECIMALS;
+        let mut fraction = digits.split_off(split);
+        while fraction.len() > 1 && fraction.ends_with('0') {
+            fraction.pop();
+        }
+        let sign = if self.negative && !self.digits.is_empty() {
+            "-"
+        } else {
+            ""
+        };
+        format!("{sign}{digits}.{fraction}")
+    }
+}
+
+fn trim_decimal_zeros(digits: &mut Vec<u8>) {
+    while digits.last() == Some(&0) {
+        digits.pop();
+    }
+}
+
+fn compare_decimal_magnitude(a: &[u8], b: &[u8]) -> Ordering {
+    a.len()
+        .cmp(&b.len())
+        .then_with(|| a.iter().rev().cmp(b.iter().rev()))
+}
+
+fn add_decimal_magnitude(accumulator: &mut Vec<u8>, addend: &[u8]) {
+    let mut carry = 0u8;
+    let width = accumulator.len().max(addend.len());
+    accumulator.resize(width, 0);
+    for (index, slot) in accumulator.iter_mut().enumerate() {
+        let sum = *slot + addend.get(index).copied().unwrap_or(0) + carry;
+        *slot = sum % 10;
+        carry = sum / 10;
+    }
+    if carry != 0 {
+        accumulator.push(carry);
+    }
+}
+
+fn subtract_decimal_magnitude(accumulator: &mut Vec<u8>, subtrahend: &[u8]) {
+    debug_assert!(compare_decimal_magnitude(accumulator, subtrahend) != Ordering::Less);
+    let mut borrow = 0i8;
+    for (index, slot) in accumulator.iter_mut().enumerate() {
+        let value = *slot as i8 - subtrahend.get(index).copied().unwrap_or(0) as i8 - borrow;
+        if value < 0 {
+            *slot = (value + 10) as u8;
+            borrow = 1;
+        } else {
+            *slot = value as u8;
+            borrow = 0;
+        }
+    }
+    debug_assert_eq!(borrow, 0);
+    trim_decimal_zeros(accumulator);
+}
+
+pub(crate) fn exact_sum_token(values: impl IntoIterator<Item = f64>) -> Option<String> {
+    let mut total = DecimalAccumulator::default();
+    for value in values {
+        if !value.is_finite() {
+            return None;
+        }
+        total.add_fixed(&format!("{value:.PROVENANCE_JSON_DECIMALS$}"));
+    }
+    Some(total.token())
 }
 
 fn write_json_string(out: &mut String, s: &str) {
@@ -796,6 +926,20 @@ mod tests {
     fn empty_provenance_serializes_to_empty_string() {
         let json = canonical_json(&Provenance::default()).expect("empty is always ok");
         assert_eq!(json, "");
+    }
+
+    #[test]
+    fn exact_decimal_sums_keep_canonical_units() {
+        assert_eq!(
+            exact_sum_token([1e20, -1e20, 3.25]).as_deref(),
+            Some("3.25")
+        );
+        assert_eq!(exact_sum_token([-0.0]).as_deref(), Some("0.0"));
+        assert_eq!(exact_sum_token([f64::NAN]), None);
+        let enormous = exact_sum_token([1e308; 10]).expect("finite values have a sum");
+        assert!(enormous.starts_with("1000000000000000"));
+        assert!(enormous.ends_with(".0"));
+        assert!(enormous.len() > 309);
     }
 
     #[test]
