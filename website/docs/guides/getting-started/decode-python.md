@@ -94,7 +94,9 @@ which CI runs so it cannot rot.
 Failures are typed, and the distinction matters: `MalformedFile` means the bytes are wrong,
 `UnsupportedVersion` and `UnsupportedCodec` mean the file is legal and this build cannot read it,
 `TruncatedFile` means it was cut short, and `BoundViolation` means a declared error bound was not
-met. All derive from `FourdgsError`.
+met. `ExceedsReaderLimit` means the file may be legal but is larger than a ceiling this reader
+declares in advance, so the fix is a larger limit rather than different bytes. All derive from
+`FourdgsError`.
 
 ## From the command line
 

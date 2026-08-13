@@ -1966,6 +1966,33 @@ class TestBoundedDecoding:
             tracemalloc.stop()
         assert peaks[1] < peaks[0] * 2, f"{peaks[0]} B at 1,000 chunks, {peaks[1]} B at 100,000"
 
+    def test_one_large_birth_batch_does_not_burst_the_unsettled_tier(self, monkeypatch):
+        """The staging ceiling applies while a batch is added, not only afterward.
+
+        A keyframe commonly introduces the whole population at once. `set.update` over
+        that batch materialises one Python int per id before the set is folded, so merely
+        checking its size after the update lets a single record burst the declared bound.
+        Lower the threshold to make that opposite case cheap to exercise: the typed batch
+        must bypass the Python set and stay close to its four-byte-per-id representation.
+        """
+        import tracemalloc
+
+        monkeypatch.setattr(kdf, "_UNSETTLED_IDS", 1_024)
+        born = np.arange(100_000, dtype=np.uint32)
+        introduced = kdf._IntroducedIdentities()
+
+        tracemalloc.start()
+        settled = tracemalloc.get_traced_memory()[0]
+        introduced.add(born)
+        peak = tracemalloc.get_traced_memory()[1] - settled
+        tracemalloc.stop()
+
+        assert len(introduced) == 100_000
+        assert not introduced._unsettled
+        assert introduced.first_repeat(np.array([100_000], dtype=np.uint32)) is None
+        assert introduced.first_repeat(np.array([99_999], dtype=np.uint32)) == 99_999
+        assert peak < 2 * 2**20, f"a 391 KiB typed batch peaked at {peak / 2**20:.1f} MiB"
+
     def test_a_sequence_past_the_identity_ceiling_is_refused_not_counted(self, monkeypatch):
         """The audit holds four bytes per distinct id, which is a bound that grows with
         the file rather than a fixed one. §1 allows that only against a limit the reader

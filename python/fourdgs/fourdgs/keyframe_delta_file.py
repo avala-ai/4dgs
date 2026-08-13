@@ -1904,18 +1904,38 @@ class _IntroducedIdentities:
         """Take ids this audit has established are new. `born` must be free of repeats."""
         if born.size == 0:
             return
+
+        # One state can introduce millions of ids. Feeding that array to `set.update`
+        # all at once would first materialise the same number of Python ints and then put
+        # all of them in `_unsettled`; the threshold below would fold the set only after
+        # that unbounded peak had already happened. Large typed batches therefore bypass
+        # the Python tier. If a smaller batch would push an existing tier over its hard
+        # ceiling, fold what is there before accepting it.
+        if born.size >= _UNSETTLED_IDS:
+            self._settle()
+            self._merge_sorted(np.sort(born))
+            return
+        if len(self._unsettled) + int(born.size) > _UNSETTLED_IDS:
+            self._settle()
+
         self._unsettled.update(born.tolist())
         if len(self._unsettled) >= min(_UNSETTLED_IDS, max(1024, int(self._settled.size) >> 2)):
             self._settle()
 
     def _settle(self) -> None:
+        if not self._unsettled:
+            return
         arrived = np.fromiter(self._unsettled, dtype=np.uint32, count=len(self._unsettled))
         arrived.sort()
+        self._merge_sorted(arrived)
+        self._unsettled.clear()
+
+    def _merge_sorted(self, arrived: np.ndarray) -> None:
+        """Merge a non-empty sorted batch known not to overlap `_settled`."""
         if self._settled.size:
             self._settled = np.insert(self._settled, np.searchsorted(self._settled, arrived), arrived)
         else:
             self._settled = arrived
-        self._unsettled.clear()
 
 
 class BoundedIdentityAudit:
