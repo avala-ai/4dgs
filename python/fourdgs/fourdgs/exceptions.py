@@ -67,12 +67,14 @@ class BoundViolation(FourdgsError):
 class ExceedsReaderLimit(FourdgsError):
     """A legal file whose scale is past a ceiling this reader states in advance.
 
-    Not a fault in the file: it is what bounded memory costs. Some questions — how many
-    distinct gaussian ids a sequence carries, and whether any of them was reused — cannot
-    be answered exactly without space proportional to the answer, so a reader that will
-    not allocate without a limit (AGENTS.md §1) must declare one. Past it the honest
-    reply is this, rather than a wrong number or an allocation the file's own contents
-    chose. The fix is a larger limit, not a new file.
+    Not a fault in the file: it is what a bounded one-pass operation costs. Some questions
+    — how many distinct gaussian ids a sequence carries, and whether any of them was reused
+    — cannot be answered exactly in one pass without space proportional to the answer, so
+    a reader that will not allocate without a limit (AGENTS.md §1) must declare one. It may
+    instead spend more passes on fixed-capacity partitions, as validation does. Past the
+    one-pass limit the honest reply is this, rather than a wrong number or an allocation
+    the file's own contents chose. The fix is a larger limit or the partitioned operation,
+    not a new file.
     """
 
 
