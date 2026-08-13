@@ -1890,12 +1890,13 @@ class _IntroducedIdentities:
             return None
         earlier = _in_sorted(self._settled, born)
         if self._unsettled:
-            for position, identity in enumerate(born.tolist()):
-                if identity in self._unsettled:
-                    # Anything later than this cannot be the first, and `argmax` below
-                    # still prefers an earlier hit the sorted tier found.
-                    earlier[position] = True
-                    break
+            # `born` can be millions of ids even though `_unsettled` is bounded. Boxing
+            # the large side with `born.tolist()` defeats the ceiling before `add` gets
+            # the chance to route that batch around the Python tier. Convert and sort the
+            # bounded side instead, then keep the membership check in typed arrays.
+            unsettled = np.fromiter(self._unsettled, dtype=np.uint32, count=len(self._unsettled))
+            unsettled.sort()
+            earlier |= _in_sorted(unsettled, born)
         if not earlier.any():
             return None
         return int(born[int(np.argmax(earlier))])

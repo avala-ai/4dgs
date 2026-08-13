@@ -1993,6 +1993,30 @@ class TestBoundedDecoding:
         assert introduced.first_repeat(np.array([99_999], dtype=np.uint32)) == 99_999
         assert peak < 2 * 2**20, f"a 391 KiB typed batch peaked at {peak / 2**20:.1f} MiB"
 
+    def test_a_large_reuse_probe_does_not_box_every_newborn(self):
+        """Reuse detection stays bounded when the Python tier is non-empty.
+
+        The direct-add test above starts with an empty identity store. In the real audit,
+        a small opening keyframe leaves ids in `_unsettled`; the next large birth batch
+        is checked against them before insertion. Converting that large side to a Python
+        list peaks around 36 bytes per newborn even though `add` itself stays bounded.
+        """
+        import tracemalloc
+
+        opening = 16
+        newborn = 400_000
+        introduced = kdf._IntroducedIdentities()
+        introduced.add(np.arange(opening, dtype=np.uint32))
+        born = np.arange(opening, opening + newborn, dtype=np.uint32)
+
+        tracemalloc.start()
+        settled = tracemalloc.get_traced_memory()[0]
+        assert introduced.first_repeat(born) is None
+        peak = tracemalloc.get_traced_memory()[1] - settled
+        tracemalloc.stop()
+
+        assert peak < newborn * 24, f"reuse detection used {peak / newborn:.1f} bytes per newborn id"
+
     def test_a_sequence_past_the_identity_ceiling_is_refused_not_counted(self, monkeypatch):
         """The audit holds four bytes per distinct id, which is a bound that grows with
         the file rather than a fixed one. §1 allows that only against a limit the reader
