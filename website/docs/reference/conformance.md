@@ -433,11 +433,12 @@ If decoding fails without one — a truncated transport, an I/O error, an ordina
 runner prints no refusal document, writes its diagnosis to stderr and exits non-zero. In particular,
 `{"refused": ""}` is not the representation of an unnamed error: it exits zero and therefore claims
 the runner produced a valid answer, even though the empty string is not an identifier the format
-defines. The Rust and C++ runners preserve this split. Python, TypeScript and Swift currently do
-not: their entry points catch their package error type, substitute `""` for a missing code and exit
-zero. An empty identifier matches none of today's invalid expectations, so it is red there, but the
-same handling misclassifies an unnamed decoder error as an answered refusal. That is a runner defect
-([#208](https://github.com/avala-ai/4dgs/issues/208)), not an alternative protocol. An outside
+defines. The Rust, C++ and Python runners preserve this split: Python's two entry points answer only
+for an identifier `invalid.CODES` registers, and write anything else to stderr with a non-zero exit.
+The TypeScript and Swift runners currently do not: their entry points catch their package error
+type, substitute `""` for a missing code and exit zero. An empty identifier matches none of today's
+invalid expectations, so it is red there, but the same handling misclassifies an unnamed decoder
+error as an answered refusal. That is a runner defect, not an alternative protocol. An outside
 implementation that cannot name a decoder error must fail the invocation rather than copy those
 empty refusals.
 
