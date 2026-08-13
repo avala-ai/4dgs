@@ -666,6 +666,23 @@ def _check_keyframe_delta(data: bytes, walk: Walk, report: Report, header: rec.H
         current_site = Site(offset, f"the {op.name(opcode)} record")
 
     identity_audit = kdf.BoundedIdentityAudit()
+    past_ceiling: ExceedsReaderLimit | None = None
+
+    def audit(offset: int, state) -> None:
+        """One state into the identity audit, from whichever scan this file needs.
+
+        Driven from the walk this function is already doing, so the distinct ids and the
+        reuse check cost no second decode of the file. Passing the audit's ceiling ends
+        the audit and nothing else: the timeline, window and band checks below still have
+        a whole file to make, and a sequence too large to count is not thereby malformed.
+        """
+        nonlocal past_ceiling
+        if past_ceiling is not None:
+            return
+        try:
+            identity_audit.observe(offset, state)
+        except ExceedsReaderLimit as exc:
+            past_ceiling = exc
 
     if not indexed:
         # No index is a legal file, not a broken one: §4 makes the summary optional and
@@ -707,7 +724,7 @@ def _check_keyframe_delta(data: bytes, walk: Walk, report: Report, header: rec.H
                 sh_degree=header.sh_degree,
             ):
                 kdf.check_window_indices_of(state, windows)
-                identity_audit.observe(_offset, state)
+                audit(_offset, state)
                 del state
             if last_t1 != header.duration_sec:
                 raise FourdgsError(
@@ -753,7 +770,7 @@ def _check_keyframe_delta(data: bytes, walk: Walk, report: Report, header: rec.H
                 opened.grids,
             ):
                 state_ready()
-                identity_audit.observe(_entry.chunk_offset, state)
+                audit(_entry.chunk_offset, state)
                 # Dropped before the next entry is composed, not merely rebound after it:
                 # the generator retains only current and GOP-keyframe state.
                 del state
@@ -765,36 +782,18 @@ def _check_keyframe_delta(data: bytes, walk: Walk, report: Report, header: rec.H
             report.refused("a chunk does not decode: ", exc, walk, site)
             return
 
-    if identity_audit.overflowed:
-        try:
-            if indexed:
-                distinct = kdf.count_distinct_ids_bounded(
-                    data,
-                    index=opened.index,
-                    windows=opened.windows,
-                    on_entry=visiting,
-                    on_band=visiting_band,
-                    on_state=state_ready,
-                )
-            else:
-                distinct = kdf.count_distinct_ids_bounded(data, on_record=visiting_record)
-        except ExceedsReaderLimit as exc:
-            # A sequence past the counter's ceiling is not thereby an invalid file, and
-            # saying so would be the second-worst answer available. The check that needed
-            # the number is the one that goes unmade, and the report says which.
-            report.warn(f"{exc}. The Header's gaussian_count is left unchecked")
-            return
-        except FourdgsError as exc:
-            site = current_site
-            if indexed:
-                site = band_site
-                if site is None and entry is not None:
-                    what = "Chunk" if entry.kind == 0 else "DeltaChunk"
-                    site = Site(entry.chunk_offset, f"the {what} record at index entry {i}")
-            report.refused("a chunk does not decode: ", exc, walk, site)
-            return
-    else:
-        distinct = identity_audit.distinct
+    if past_ceiling is not None:
+        # A sequence past the audit's ceiling is not thereby an invalid file, and saying
+        # so would be the second-worst answer available. The worst is calling it valid, so
+        # the warning names *both* checks that stop there — the count and the refusal of
+        # reuse — rather than only the one that wanted the number. Everything before that
+        # state was audited, and a reuse among it has already been reported as an error.
+        report.warn(
+            f"{past_ceiling}. Two checks end there: the Header's gaussian_count is left "
+            "unchecked, and a gaussian_id reintroduced after that point is not refused"
+        )
+        return
+    distinct = identity_audit.distinct
     if distinct != header.gaussian_count:
         report.error(
             f"Header declares {header.gaussian_count} gaussians; the sequence carries {distinct} distinct gaussian ids"

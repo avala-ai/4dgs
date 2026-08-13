@@ -1887,39 +1887,90 @@ class TestBoundedDecoding:
         assert records == [0, 1, 2, 3]
         assert states == 4
 
-    def test_a_reuse_found_after_the_pass_still_names_its_own_record(self, monkeypatch):
-        """Introductions are compared once at the end rather than state by state, so the
-        refusal is raised long after the record that earned it went by. Both the message
-        and the position the caller tracks from `on_record` must name that record, not the
-        last one in the file — a report that disagrees with its own message sends its
-        reader to bytes that are perfectly good (AGENTS.md §6).
+    def test_a_reuse_names_its_own_record(self, monkeypatch):
+        """The refusal must name the state that earned it, and so must the position the
+        caller is tracking from `on_record` when it arrives — a report that disagrees with
+        its own message sends its reader to bytes that are perfectly good (AGENTS.md §6).
+
+        Which is one of the reasons the reuse is decided at the state that commits it
+        rather than by comparing all the introductions once the file has been read: found
+        after the pass, the refusal leaves the caller's position on the last record in the
+        file and has to be walked back there by hand.
         """
-        sequence = [
-            np.array([7, 8], dtype=np.int64),
-            np.array([8], dtype=np.int64),
-            np.array([8, 7], dtype=np.int64),
-            np.array([8], dtype=np.int64),
-        ]
         at: list[int] = []
-
-        def streamed(_data, on_record=None, **_kwargs):
-            for i, ids in enumerate(sequence):
-                if on_record is not None:
-                    on_record(i * 100, op.CHUNK if i == 0 else op.DELTA_CHUNK)
-                yield i * 100, (0 if i == 0 else 1), kdf.State(ids=ids, bins={})
-
-        monkeypatch.setattr(kdf, "scan_streamed", streamed)
+        monkeypatch.setattr(kdf, "scan_streamed", _states([[7, 8], [8], [8, 7], [8]]))
         with pytest.raises(fourdgs.MalformedFile) as caught:
             kdf.count_distinct_ids_bounded(b"", on_record=lambda offset, _opcode: at.append(offset))
         assert caught.value.code == "gaussian-id-reused"
         assert "state chunk at 200 reintroduces gaussian id 7" in str(caught.value)
         assert at[-1] == 200
 
+    def test_a_reuse_is_decided_before_the_rest_of_the_file_is_read(self, monkeypatch):
+        """Refusing at the offending state, rather than after the whole file, is what
+        keeps every later fault from preempting this one.
+
+        The sequence below both reuses id 7 at byte 200 and carries an id outside `u32` at
+        byte 400. Two hundred bytes apart, one file, and the code the caller is handed must
+        not depend on which of them the reader happened to reach first — so the scan must
+        stop at 200 and never compose the state at 400 at all.
+        """
+        decoded: list[int] = []
+        monkeypatch.setattr(kdf, "scan_streamed", _states([[7, 8], [8], [8, 7], [8], [8, 2**40]], decoded))
+        with pytest.raises(fourdgs.MalformedFile) as caught:
+            kdf.count_distinct_ids_bounded(b"")
+        assert caught.value.code == "gaussian-id-reused"
+        assert "state chunk at 200" in str(caught.value)
+        assert decoded == [0, 100, 200], "the states after the refusal were composed anyway"
+
+    def test_one_module_reaches_one_verdict_about_identity(self, monkeypatch):
+        """`BoundedIdentityAudit`, which a validator drives from its own scan, and
+        `count_distinct_ids_bounded`, which decodes for a caller holding only bytes, are
+        one audit and must stay one. Two counters in a module that disagree about the same
+        bytes are two formats (AGENTS.md §8), and a caller cannot tell which it got.
+        """
+        sequence = [[7, 8], [8], [8, 7], [8], [8, 2**40]]
+        monkeypatch.setattr(kdf, "scan_streamed", _states(sequence))
+        with pytest.raises(fourdgs.MalformedFile) as counted:
+            kdf.count_distinct_ids_bounded(b"")
+
+        audit = kdf.BoundedIdentityAudit()
+        with pytest.raises(fourdgs.MalformedFile) as observed:
+            for i, ids in enumerate(sequence):
+                audit.observe(i * 100, kdf.State(ids=np.array(ids, dtype=np.int64), bins={}))
+        assert (observed.value.code, str(observed.value)) == (counted.value.code, str(counted.value))
+
+    def test_the_identity_audit_holds_nothing_per_state_chunk(self, monkeypatch):
+        """§1 forbids unbounded accumulation across chunks, and a counter that keeps one
+        array per state chunk is exactly that whatever it says its ceiling is.
+
+        Four gaussians, alive from the first chunk to the last, over sequences a hundred
+        times apart in length. The audit's answer is four every time, so what it retains
+        must be flat: an implementation holding ~248 bytes a chunk passes a four-id file
+        of a million chunks at 237 MiB while declaring a 32 MiB ceiling it never reaches.
+        """
+        import tracemalloc
+
+        peaks: list[int] = []
+        for chunks in (1_000, 100_000):
+            ids = np.array([1, 2, 3, 4], dtype=np.int64)
+
+            def streamed(_data, _chunks=chunks, _ids=ids, **_kwargs):
+                for i in range(_chunks):
+                    yield i, 0, kdf.State(ids=_ids, bins={})
+
+            monkeypatch.setattr(kdf, "scan_streamed", streamed)
+            tracemalloc.start()
+            settled = tracemalloc.get_traced_memory()[0]
+            assert kdf.count_distinct_ids_bounded(b"") == 4
+            peaks.append(tracemalloc.get_traced_memory()[1] - settled)
+            tracemalloc.stop()
+        assert peaks[1] < peaks[0] * 2, f"{peaks[0]} B at 1,000 chunks, {peaks[1]} B at 100,000"
+
     def test_a_sequence_past_the_identity_ceiling_is_refused_not_counted(self, monkeypatch):
-        """The one-pass count holds four bytes per distinct id, which is a bound that
-        grows with the file rather than a fixed one. §1 allows that only against a limit
-        the reader declares — so past it the answer is a refusal naming the limit, never a
-        larger allocation chosen by the file's own contents.
+        """The audit holds four bytes per distinct id, which is a bound that grows with
+        the file rather than a fixed one. §1 allows that only against a limit the reader
+        declares — so past it the answer is a refusal naming the limit, never a larger
+        allocation chosen by the file's own contents.
         """
 
         def streamed(_data, **_kwargs):
@@ -1931,6 +1982,80 @@ class TestBoundedDecoding:
         with pytest.raises(fourdgs.ExceedsReaderLimit) as caught:
             kdf.count_distinct_ids_bounded(b"", max_distinct_ids=2_500)
         assert "more than 2500 distinct gaussian ids" in str(caught.value)
+
+    def test_the_ceiling_is_one_number_the_module_declares(self, monkeypatch):
+        """Not a default bound into a signature: `MAX_DISTINCT_IDS` is read when the call
+        is made, so one number governs the audit a validator drives and the audit a
+        counting caller drives, and moving it moves both.
+        """
+        monkeypatch.setattr(kdf, "scan_streamed", _states([[1, 2, 3, 4]]))
+        monkeypatch.setattr(kdf, "MAX_DISTINCT_IDS", 3)
+        with pytest.raises(fourdgs.ExceedsReaderLimit):
+            kdf.count_distinct_ids_bounded(b"")
+        with pytest.raises(fourdgs.ExceedsReaderLimit):
+            kdf.BoundedIdentityAudit().observe(0, kdf.State(ids=np.array([1, 2, 3, 4]), bins={}))
+
+    def test_a_reusing_file_past_the_ceiling_is_refused_not_excused(self, monkeypatch):
+        """**The one that must never come back: an invalid file reported valid.**
+
+        A file may do both — reuse a dead id, and carry more identities than this reader
+        counts. Deciding reuse only once the whole file has been read makes the second
+        hide the first: the ceiling is reached at a later state, the pass is abandoned
+        there, the comparison that would have found the reuse never happens, and the
+        validator turns the refusal into a warning and exits 0 on a file that breaks
+        §11.2.
+
+        Below, id 7 is reused at byte 200 and the ceiling is passed at byte 300. Order
+        decides the verdict, so the earlier fault wins.
+        """
+        monkeypatch.setattr(kdf, "scan_streamed", _states([[7, 8], [8], [8, 7], list(range(1_000, 3_000))]))
+        with pytest.raises(fourdgs.MalformedFile) as caught:
+            kdf.count_distinct_ids_bounded(b"", max_distinct_ids=100)
+        assert caught.value.code == "gaussian-id-reused"
+        assert "state chunk at 200" in str(caught.value)
+
+    def test_validate_never_reports_a_file_that_reuses_an_id_as_valid(self, monkeypatch):
+        """The same thing where it is load-bearing: through `validate` and the exit status
+        five other SDKs and every pipeline are written against.
+
+        The ceiling is lowered rather than an eight-million-gaussian file written, which
+        is the reason it is a module constant read at call time. That also means this test
+        cannot be run against the implementation it guards against, where the ceiling was
+        a default argument and nothing outside the function could move it; the two tests
+        above hold that end, and this one holds the exit status.
+        """
+        data = _reusing_keyframe_file()
+        monkeypatch.setattr(kdf, "MAX_DISTINCT_IDS", 6)
+        report = validate(data)
+        assert not report.ok, [str(f) for f in report.findings]
+        refused = [f for f in report.findings if f.severity == "error"]
+        assert any("reintroduces gaussian id 3" in str(f) for f in refused), [str(f) for f in refused]
+        assert any(f.refusal is not None and "gaussian-id-reused" in str(f.refusal) for f in refused)
+
+    def test_the_ceiling_warning_names_every_check_it_ends(self, monkeypatch):
+        """Passing the ceiling is not a fault in the file, so it is a warning — but a
+        warning that understates what went unmade is worse than the refusal it replaces.
+        Two checks stop there, not one: the Header's `gaussian_count` is never compared,
+        and reuse past that point is never refused. A reader deciding whether to trust the
+        `valid` it just got needs both named (AGENTS.md §6).
+        """
+        monkeypatch.setattr(kdf, "MAX_DISTINCT_IDS", 2)
+        report = validate(_keyframe_file())
+        warnings = [str(f) for f in report.findings if f.severity == "warning"]
+        past = next(w for w in warnings if "distinct gaussian ids" in w)
+        assert "gaussian_count is left unchecked" in past
+        assert "reintroduced after that point is not refused" in past
+        assert report.ok, "a sequence larger than the counter is not thereby an invalid file"
+
+    def test_the_command_line_exits_one_on_a_file_that_reuses_an_id(self, monkeypatch, tmp_path, capsys):
+        """In process rather than through `_tool`, because the point is the exit status
+        under a ceiling this file is past, and a subprocess cannot be told where that is.
+        """
+        path = tmp_path / "reused.4dgs"
+        path.write_bytes(_reusing_keyframe_file())
+        monkeypatch.setattr(kdf, "MAX_DISTINCT_IDS", 6)
+        assert main(["validate", str(path)]) == 1
+        assert "INVALID" in capsys.readouterr().err
 
     def test_an_indexed_keyframe_delta_file_keeps_two_states_at_most(self):
         import weakref
@@ -2146,6 +2271,46 @@ def _insert_indexed_band(data: bytes, band: bytes, extra_length: int = 0) -> tup
     if footer.summary_crc:
         footer.summary_crc = crc32(summary)
     return data[:band_at] + band + summary + footer.encode() + MAGIC, band_at
+
+
+def _states(sequence, decoded: list[int] | None = None):
+    """A `scan_streamed` standing in for a decode, yielding these live populations.
+
+    States land a hundred bytes apart so a refusal's offset says which one it means, and
+    `decoded` — when a test passes one — records the states this scan was actually driven
+    to compose, which is how a test sees a refusal arriving before the rest of the file
+    was read rather than after.
+    """
+
+    def streamed(_data, on_record=None, **_kwargs):
+        for i, ids in enumerate(sequence):
+            if on_record is not None:
+                on_record(i * 100, op.CHUNK if i == 0 else op.DELTA_CHUNK)
+            if decoded is not None:
+                decoded.append(i * 100)
+            yield i * 100, (0 if i == 0 else 1), kdf.State(ids=np.array(ids, dtype=np.int64), bins={})
+
+    return streamed
+
+
+def _reusing_keyframe_file() -> bytes:
+    """A `keyframe-delta` file that breaks §11.2: gaussian id 3 dies and is born again.
+
+    Nine distinct ids, and the reuse is the fifth introduction while the last state
+    carries the rest — so a ceiling anywhere between the two is reached *after* the fault,
+    which is the arrangement that once turned this file into `valid`.
+    """
+    duration, samples = 4.0, []
+    for i, ids in enumerate(([0, 1, 2, 3], [0, 1, 2], [0, 1, 2, 3], [0, 1, 2, 3, 10, 11, 12, 13, 14])):
+        positions = [[float(i) * 0.1, float(j), 0.0] for j in range(len(ids))]
+        samples.append(
+            Sample(
+                t0=float(i) * (duration / 4),
+                ids=np.array(ids),
+                gaussians=_keyframe_gaussians(positions, duration, None),
+            )
+        )
+    return kdf.write_sequence(samples, duration, kd=KeyframeDeltaOptions(keyframe_every=4), write_index=False)
 
 
 def _keyframe_file(*, two_windows: bool = False, **options) -> bytes:

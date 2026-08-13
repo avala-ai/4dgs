@@ -1806,87 +1806,220 @@ def scan_streamed(
     finish_bands()
 
 
-#: The most distinct gaussian ids `count_distinct_ids_bounded` counts before it refuses.
-#: One `uint32` per id while the pass runs, plus a sorted copy of the same at the end, so
-#: this ceiling is 32 MiB of identities and 64 MiB for the moment both exist. It is
-#: declared here rather than read from the Header's `gaussian_count`, because that field
-#: is the untrusted claim the count exists to check (AGENTS.md §1). A realistic large
-#: capture sits well inside it — 4M distinct ids costs 16 MiB, less than one composed
-#: population of that size costs the decoder that produced it.
+#: The most distinct gaussian ids an identity audit holds before it refuses to hold more.
+#:
+#: Both questions the audit answers — how many distinct ids a sequence carries, and
+#: whether one was reused after its gaussian died — need the identities themselves, and
+#: neither can be answered exactly in less space than the answer takes (see
+#: `BoundedIdentityAudit`). So there is a number here, and §1 says it is this module's
+#: number: never the Header's `gaussian_count`, which is the untrusted claim the audit
+#: exists to check. One `uint32` per id makes this 32 MiB of identities, and 64 MiB for
+#: the moment a rebuild is copying them. A realistic large capture sits well inside it —
+#: 4M distinct ids costs 16 MiB, less than one composed population of that size costs the
+#: decoder that produced it.
+#:
+#: Read at call time, not bound as a default argument, so that one number governs every
+#: audit in a process and a test can lower it without writing an eight-million-gaussian
+#: file.
+#:
+#: This ceiling is Python's alone, which `records.py` names for what it is: a limit only
+#: one implementation has is a conformance split. It is a pre-existing one rather than a
+#: new one — Rust spills identities to 256 on-disk buckets and has no ceiling,
+#: TypeScript retains a lifetime record per id and has no ceiling, and Dart bounds the
+#: same audit by the file's declared `gaussianCount` and refuses past it — so one very
+#: large file already draws different answers from different SDKs. What this module can
+#: do about that alone is keep the ceiling from changing the *verdict* on anything below
+#: it: reuse is refused where it happens, and passing the ceiling only ends the audit and
+#: says so. Making the four agree is a cross-SDK change, which §9 puts in its own pull
+#: requests.
 MAX_DISTINCT_IDS = 8_388_608
+
+#: How many introductions may sit in the audit's `set` tier before they are folded into
+#: its sorted array. ~2 MiB of Python ints at the top, against the 32 MiB the array
+#: itself is allowed; small enough not to matter beside the ceiling, large enough that a
+#: file at the ceiling folds a couple of hundred times rather than thousands.
+_UNSETTLED_IDS = 65_536
+
+
+def _in_sorted(haystack: np.ndarray, needles: np.ndarray) -> np.ndarray:
+    """A bool mask over `needles`: which of them `haystack`, sorted, contains.
+
+    `np.isin` would sort `haystack` on every call, which is the whole cost when the
+    haystack is large and the needles are few — and is paid even for no needles at all.
+    """
+    if haystack.size == 0 or needles.size == 0:
+        return np.zeros(needles.size, dtype=bool)
+    at = np.searchsorted(haystack, needles)
+    np.clip(at, 0, haystack.size - 1, out=at)
+    return haystack[at] == needles
+
+
+class _IntroducedIdentities:
+    """The gaussian ids introduced so far: four bytes each, and nothing per state chunk.
+
+    Two tiers, because two very different files ask this the same question. `_settled` is
+    a sorted `uint32` array — four bytes an id, against the ~32 a Python `set` spends, and
+    that ratio is what makes a ceiling in the millions affordable at all. Asking it
+    whether it holds any of a state's newborn ids is one vectorised binary search whatever
+    its size.
+
+    Rebuilding that array once per state would be O(n) work per state, which a file with
+    one birth per state turns into O(n²). So the ids introduced since the last rebuild sit
+    in `_unsettled`, a `set`, where a membership test is a hash lookup and an insert is
+    free. It is folded into the array when it reaches a quarter of what is already
+    settled, which keeps the number of rebuilds logarithmic in the ids held, and never
+    grows past `_UNSETTLED_IDS`, which keeps the expensive tier small.
+
+    What this deliberately does *not* keep is anything indexed by state: a sequence of a
+    million chunks over a static four-gaussian population retains four identities
+    (AGENTS.md §1).
+    """
+
+    __slots__ = ("_settled", "_unsettled")
+
+    def __init__(self) -> None:
+        self._settled = np.zeros(0, dtype=np.uint32)
+        self._unsettled: set[int] = set()
+
+    def __len__(self) -> int:
+        return int(self._settled.size) + len(self._unsettled)
+
+    def first_repeat(self, born: np.ndarray) -> int | None:
+        """The first id in `born` — in the order the state carries them — seen before."""
+        if self._settled.size == 0 and not self._unsettled:
+            return None
+        earlier = _in_sorted(self._settled, born)
+        if self._unsettled:
+            for position, identity in enumerate(born.tolist()):
+                if identity in self._unsettled:
+                    # Anything later than this cannot be the first, and `argmax` below
+                    # still prefers an earlier hit the sorted tier found.
+                    earlier[position] = True
+                    break
+        if not earlier.any():
+            return None
+        return int(born[int(np.argmax(earlier))])
+
+    def add(self, born: np.ndarray) -> None:
+        """Take ids this audit has established are new. `born` must be free of repeats."""
+        if born.size == 0:
+            return
+        self._unsettled.update(born.tolist())
+        if len(self._unsettled) >= min(_UNSETTLED_IDS, max(1024, int(self._settled.size) >> 2)):
+            self._settle()
+
+    def _settle(self) -> None:
+        arrived = np.fromiter(self._unsettled, dtype=np.uint32, count=len(self._unsettled))
+        arrived.sort()
+        if self._settled.size:
+            self._settled = np.insert(self._settled, np.searchsorted(self._settled, arrived), arrived)
+        else:
+            self._settled = arrived
+        self._unsettled.clear()
 
 
 class BoundedIdentityAudit:
-    """One-pass identity audit until a fixed history partition reaches capacity."""
+    """Distinct gaussian ids, and the refusal of reuse, over one pass of a timeline.
 
-    def __init__(self, capacity: int = 65_536) -> None:
-        if capacity < 1:
-            raise ValueError("identity partition capacity must be positive")
-        self.capacity = capacity
-        self._seen: set[int] = set()
-        self._previous_live: set[int] = set()
-        self.overflowed = False
+    Two facts set the shape of this. Every id in a conforming file is introduced exactly
+    once — by the keyframe that opens the sequence or by the birth that adds it — so the
+    introductions are the whole audit: how many there are is the distinct count, and a
+    second introduction of one is the reuse §11.2 forbids. And neither answer can be had
+    in less space than the answer itself: an exact distinct count needs the distinct
+    values, a sketch that answers in constant space answers approximately, and the reuse
+    question is strictly harder still because a false positive there condemns a good file.
+
+    Bounding memory by the *live* population instead is therefore not available. What
+    lives now says nothing about what died, and a reused id is precisely one that is not
+    live and was. The only ways to shrink the retained state below the number of distinct
+    ids are to answer approximately (Dart uses a Bloom filter over the same audit and
+    accepts candidates it must go back and confirm) or to size it from the Header's
+    `gaussian_count`, which is the claim being checked and which §1 forbids allocating
+    from. So the state is proportional to the distinct ids and the ceiling stays.
+
+    Reuse is found **at the state that commits it**, while the pass is there, which is
+    what lets the caller's own position tracking name the right record (AGENTS.md §6) and
+    what stops a later refusal from preempting it. The alternative — collect every
+    introduction, sort at the end, look for a repeat — is one clean sort, but it makes the
+    refusal arrive after the whole file has been read, gives two counters in one module
+    two different verdicts on the same bytes, and makes a reuse before the ceiling
+    unreachable behind a limit reached after it.
+
+    One audit is consumed one state at a time by whoever already has a scan running, so a
+    validator that walks the file for its other checks pays no second decode for this one.
+    `count_distinct_ids_bounded` is the same audit for a caller that has only bytes.
+    """
+
+    def __init__(self, max_distinct_ids: int | None = None) -> None:
+        ceiling = MAX_DISTINCT_IDS if max_distinct_ids is None else max_distinct_ids
+        if ceiling < 1:
+            raise ValueError("the distinct identity ceiling must be positive")
+        self.max_distinct_ids = ceiling
+        self.past_ceiling: ExceedsReaderLimit | None = None
+        self._introduced = _IntroducedIdentities()
+        self._previous_live = np.zeros(0, dtype=np.uint32)
 
     @property
     def distinct(self) -> int:
-        if self.overflowed:
-            raise RuntimeError("an overflowed identity audit has no exact distinct count")
-        return len(self._seen)
+        if self.past_ceiling is not None:
+            raise RuntimeError("an audit stopped at its ceiling has no exact distinct count")
+        return len(self._introduced)
 
     def observe(self, offset: int, state: State) -> None:
-        """Consume one timeline state; retain no decoded arrays from it."""
-        if self.overflowed:
+        """Consume one timeline state; retain no decoded arrays from it.
+
+        Raises `MalformedFile` for an id outside `u32` or one reintroduced after a death,
+        and `ExceedsReaderLimit` — once, after which this becomes a no-op and
+        `distinct` refuses to answer — for a sequence past the declared ceiling.
+        """
+        if self.past_ceiling is not None:
             return
-        current_live: set[int] = set()
-        for raw in state.ids:
-            identity = int(raw)
-            if identity < 0 or identity > 0xFFFF_FFFF:
-                raise MalformedFile(
-                    f"state chunk at {offset} carries gaussian_id {identity}; ids are u32 values",
-                    code="gaussian-id-out-of-range",
-                )
-            current_live.add(identity)
-            if identity in self._previous_live:
-                continue
-            if identity in self._seen:
+        ids = np.asarray(state.ids, dtype=np.int64).reshape(-1)
+        if ids.size and (int(ids.min()) < 0 or int(ids.max()) > 0xFFFF_FFFF):
+            # The range is two reductions; which id broke it is a whole extra pass, so it
+            # is built here, on the way out, rather than on every state that is fine.
+            outside = (ids < 0) | (ids > 0xFFFF_FFFF)
+            raise MalformedFile(
+                f"state chunk at {offset} carries gaussian_id {int(ids[outside][0])}; ids are u32 values",
+                code="gaussian-id-out-of-range",
+            )
+        live = ids.astype(np.uint32)
+        # Sorted here rather than at the bottom because the next state's membership test
+        # wants it that way and because it answers the commonest question first: a state
+        # whose population is the one before it introduces nothing and retires nothing, so
+        # there is no audit to do. Long sequences over a settled scene are mostly this.
+        settled = np.sort(live)
+        if settled.size == self._previous_live.size and bool((settled == self._previous_live).all()):
+            return
+        # Ids repeated within one state are already refused where the state is composed
+        # (`duplicate-gaussian-id`), so a newborn id here appears once.
+        born = live if self._previous_live.size == 0 else live[~_in_sorted(self._previous_live, live)]
+        if born.size:
+            identity = self._introduced.first_repeat(born)
+            if identity is not None:
                 raise MalformedFile(
                     f"state chunk at {offset} reintroduces gaussian id {identity} after it died; "
                     "gaussian_id values are never reused",
                     code="gaussian-id-reused",
                 )
-            if len(self._seen) >= self.capacity:
-                self.overflowed = True
-                self._seen.clear()
-                self._previous_live.clear()
-                return
-            self._seen.add(identity)
-        self._previous_live = current_live
-
-
-def _locate_reuse(
-    born_per_state: list[np.ndarray],
-    marks: list[tuple[int, object]],
-    repeated: np.ndarray,
-) -> tuple[tuple[int, object], int]:
-    """The first state, in timeline order, that introduces an id already introduced.
-
-    Only reached on a file that is being refused, and it walks the identities already in
-    hand rather than decoding anything a second time. `repeated` is the handful of ids the
-    sort found twice, so the per-state test is a membership check against a tiny array.
-    """
-    seen: set[int] = set()
-    for where, born in zip(marks, born_per_state, strict=True):
-        for identity in born[np.isin(born, repeated)].tolist():
-            if identity in seen:
-                return where, identity
-            seen.add(identity)
-    raise AssertionError("an identity the sort found twice appears once in the states it came from")
+            # After the reuse test, so that a file which is both invalid and outsized is
+            # refused for being invalid rather than excused for being outsized.
+            if len(self._introduced) + int(born.size) > self.max_distinct_ids:
+                self.past_ceiling = ExceedsReaderLimit(
+                    f"the sequence introduces more than {self.max_distinct_ids} distinct gaussian ids by the "
+                    f"state chunk at {offset}; counting them exactly costs one u32 each, and this reader stops "
+                    "at the ceiling it declares rather than allocating whatever a file asks for"
+                )
+                raise self.past_ceiling
+            self._introduced.add(born)
+        # Nothing but the identities, narrowed to u32, crosses to the next iteration.
+        self._previous_live = settled
 
 
 def count_distinct_ids_bounded(
     data: bytes,
     *,
-    max_distinct_ids: int = MAX_DISTINCT_IDS,
+    max_distinct_ids: int | None = None,
     on_record: Callable[[int, int], None] | None = None,
     index: list[rec.ChunkIndexEntry] | None = None,
     windows: list[tuple[float, float]] | None = None,
@@ -1894,111 +2027,41 @@ def count_distinct_ids_bounded(
     on_band: Callable[[int, int], None] | None = None,
     on_state: Callable[[], None] | None = None,
 ) -> int:
-    """Count distinct identities, and refuse reuse, in one pass under a declared ceiling.
+    """The distinct gaussian ids in one file, in one decode, for a caller holding bytes.
 
-    Two facts set the shape of this. Counting distinct values *exactly* costs space
-    proportional to the number of distinct values — a sketch that answers in constant
-    space answers approximately, and cannot answer the second question here at all:
-    whether an id was live, died, and came back (§11.2 forbids it). And every id in a
-    conforming file is introduced exactly once, by the keyframe that opens the sequence or
-    by the birth that adds it. So the introductions are the whole audit: how many there
-    are is the distinct count, and a repeat among them is the reuse.
+    One `BoundedIdentityAudit` — which is where the reasoning about what this costs and
+    why lives — driven over one scan. Reuse is refused as the pass reaches it, so the
+    record the caller's `on_record`/`on_entry` position is sitting on when the refusal
+    arrives is the record the message names (AGENTS.md §6).
 
-    This collects them — one `uint32` per id, against the ~32 bytes a Python set spends on
-    one — and sorts once at the end. The bound therefore scales with the file rather than
-    being fixed, and that is a real change to what this function promises. It was written
-    the other way: audit one fixed-capacity partition of the id space at a time, split by
-    the next high bit and re-stream the file for each half whenever a partition filled.
-    That holds about 2 MiB whatever arrives, and buys it with whole decodes — each split
-    doubles the partition count, every partition drives a fresh scan, and a conforming
-    4M-id sequence needs well over a hundred complete decompositions of the file. `4dgs
+    A validator that is already walking the file should drive the audit from its own scan
+    instead of calling this, and pay one decode rather than two.
+
+    This replaced a counter that audited one fixed-capacity partition of the id space at a
+    time and re-streamed the whole file for each half whenever a partition filled. That
+    held about 2 MiB whatever arrived, and bought it with whole decodes: each split
+    doubled the partition count, every partition drove a fresh scan, and a conforming
+    4M-id sequence needed well over a hundred complete decompositions of the file. `4dgs
     validate` on a large capture went from minutes to hours and looked hung.
 
-    Raising that capacity was the alternative, and it is the weaker trade in both
-    directions: a partition holding 1M ids is about 32 MiB of Python set — more than the
-    16 MiB this keeps for a 4M-id file — and it still leaves a pass count that grows with
-    the file, seven of them where this does one.
-
-    `max_distinct_ids` is what keeps §1 true across that change: the allocation is capped
-    by a number this module declares, never by one the file supplies, and a sequence
-    carrying more is refused with `ExceedsReaderLimit` rather than counted. The previous
-    state's live population is retained alongside, as it always was, because "introduced"
-    means "not live in the state before" and nothing smaller decides that.
+    `max_distinct_ids` defaults to `MAX_DISTINCT_IDS`, read when the call is made.
     """
-    if max_distinct_ids < 1:
-        raise ValueError("the distinct identity ceiling must be positive")
+    audit = BoundedIdentityAudit(max_distinct_ids)
 
     if index is None:
-
-        def visit():
-            for offset, kind, state in scan_streamed(data, on_record=on_record):
-                yield offset, (op.CHUNK if kind == 0 else op.DELTA_CHUNK), state
-
-        def revisit(offset: int, mark) -> None:
-            if on_record is not None:
-                on_record(offset, mark)
-
+        states = ((offset, state) for offset, _kind, state in scan_streamed(data, on_record=on_record))
     else:
         if windows is None:
             raise ValueError("indexed identity auditing requires the Window Table")
+        states = ((entry.chunk_offset, state) for entry, state in scan_indexed(data, index, windows, on_entry, on_band))
 
-        def visit():
-            for ordinal, (entry, state) in enumerate(scan_indexed(data, index, windows, on_entry, on_band)):
-                yield entry.chunk_offset, (ordinal, entry), state
-
-        def revisit(offset: int, mark) -> None:
-            if on_entry is not None:
-                on_entry(*mark)
-
-    born_per_state: list[np.ndarray] = []
-    marks: list[tuple[int, object]] = []
-    previous_live = np.zeros(0, dtype=np.uint32)
-    introduced = 0
-
-    for offset, mark, state in visit():
+    for offset, state in states:
         if on_state is not None:
             on_state()
-        ids = np.asarray(state.ids, dtype=np.int64).reshape(-1)
-        # The composed population goes before the next one is asked for; nothing but the
-        # identities, narrowed to u32, crosses to the next iteration.
+        audit.observe(offset, state)
+        # The composed population goes before the next one is asked for.
         del state
-        outside = (ids < 0) | (ids > 0xFFFF_FFFF)
-        if outside.any():
-            raise MalformedFile(
-                f"state chunk at {offset} carries gaussian_id {int(ids[outside][0])}; ids are u32 values",
-                code="gaussian-id-out-of-range",
-            )
-        live = ids.astype(np.uint32)
-        born = live[~np.isin(live, previous_live)]
-        introduced += int(born.size)
-        if introduced > max_distinct_ids:
-            raise ExceedsReaderLimit(
-                f"the sequence introduces more than {max_distinct_ids} distinct gaussian ids by the state chunk "
-                f"at {offset}; counting them exactly costs one u32 each, and this reader stops at the ceiling "
-                "it declares rather than allocating whatever a file asks for"
-            )
-        born_per_state.append(born)
-        marks.append((offset, mark))
-        previous_live = live
-
-    if not born_per_state:
-        return 0
-    ordered = np.concatenate(born_per_state)
-    ordered.sort()
-    repeated = ordered[1:][ordered[1:] == ordered[:-1]]
-    if repeated.size:
-        (offset, mark), identity = _locate_reuse(born_per_state, marks, np.unique(repeated))
-        # The caller's position callbacks are driven back to the offending state before
-        # the refusal leaves this function. A report that tracks its site from them would
-        # otherwise name the last record in the file for a fault the message places
-        # thousands of bytes earlier (AGENTS.md §6).
-        revisit(offset, mark)
-        raise MalformedFile(
-            f"state chunk at {offset} reintroduces gaussian id {identity} after it died; "
-            "gaussian_id values are never reused",
-            code="gaussian-id-reused",
-        )
-    return int(ordered.size)
+    return audit.distinct
 
 
 # --------------------------------------------------------------------------
