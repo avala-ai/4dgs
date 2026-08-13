@@ -547,6 +547,146 @@ test("the encoder writes a file that decodes back to what went in", async () => 
   }
 });
 
+function objectGaussianInput(objectId?: readonly number[]) {
+  const count = objectId?.length ?? 2;
+  return {
+    count,
+    positions: Array.from({ length: count * 3 }, (_, i) => (i % 3 === 0 ? i / 3 : 0)),
+    scales: Array.from({ length: count * 3 }, () => 0.1),
+    rotations: Array.from({ length: count }, () => [0, 0, 0, 1]).flat(),
+    colors: Array.from({ length: count }, () => [0.2, 0.4, 0.6, 1]).flat(),
+    motions: Array.from({ length: count * 3 }, () => 0),
+    muT: Array.from({ length: count }, () => 0.5),
+    sigmaT: Array.from({ length: count }, () => Number.POSITIVE_INFINITY),
+    winLo: Array.from({ length: count }, () => 0),
+    winHi: Array.from({ length: count }, () => 1),
+    ...(objectId === undefined ? {} : { objectId }),
+  };
+}
+
+const objectTable = {
+  embeddingDim: 0,
+  entries: [
+    {
+      objectId: 1,
+      label: "object one",
+      anchor: [0, 0, 0],
+      dynamics: null,
+      embedding: null,
+    },
+  ],
+};
+
+test("the objects profile requires object_id on every non-empty Chunk", async () => {
+  const options = { profile: "objects", objects: new ObjectLayer(objectTable) };
+  await assert.rejects(
+    () => encodeScene(objectGaussianInput(), 1, options),
+    /the objects profile requires an object_id stream in every non-empty chunk/,
+  );
+});
+
+test("the objects profile requires exactly one Object Table", async () => {
+  const gaussians = objectGaussianInput([1, 1]);
+  await assert.rejects(
+    () => encodeScene(gaussians, 1, { profile: "objects" }),
+    /the objects profile requires one ObjectTable record/,
+  );
+});
+
+test("object_id preserves the complete unsigned 32-bit domain", async () => {
+  const ids = [0, 0x7fffffff, 0x80000000, 0xffffffff];
+  const gaussians = objectGaussianInput(ids);
+  const options = {
+    profile: "objects",
+    minChunkGaussians: 1,
+    objects: new ObjectLayer(objectTable),
+  };
+  const scene = await decodeScene(new BytesReadable(await encodeScene(gaussians, 1, options)));
+
+  assert.deepEqual([...scene.gaussians.objectId!], ids);
+  assert.equal(scene.objects.table?.entries[0]?.label, "object one");
+});
+
+test("an empty objects-profile scene still requires and writes one Object Table", async () => {
+  const gaussians = objectGaussianInput([]);
+  await assert.rejects(
+    () => encodeScene(gaussians, 0, { profile: "objects" }),
+    /the objects profile requires one ObjectTable record/,
+  );
+
+  const options = { profile: "objects", objects: new ObjectLayer(objectTable) };
+  const scene = await decodeScene(new BytesReadable(await encodeScene(gaussians, 0, options)));
+  assert.equal(scene.gaussians.count, 0);
+  assert.equal(scene.objects.table?.entries.length, 1);
+});
+
+test("object_id length is the gaussian population", async () => {
+  const gaussians = objectGaussianInput([1, 2]);
+  const wrong = { ...gaussians, objectId: [1] };
+  const options = { writeCrc: true, objects: new ObjectLayer(objectTable) };
+  await assert.rejects(() => encodeScene(wrong, 1, options), /object_id has 1 values, expected 2/);
+});
+
+test("the writer preserves Object Table values and Object Tracks", async () => {
+  const table = {
+    embeddingDim: 2,
+    entries: [
+      {
+        objectId: 1,
+        label: "moving object",
+        anchor: [0.25, -0.5, 0.75],
+        dynamics: [
+          [1, 2, 3],
+          [4, 5, 6],
+          [7, 8, 9],
+        ] as [[number, number, number], [number, number, number], [number, number, number]],
+        embedding: [0.125, -0.25],
+      },
+    ],
+  };
+  const track = {
+    objectId: 1,
+    interpolation: 0,
+    times: [0, 1],
+    rotations: [
+      [0, 0, 0, 1],
+      [0, 0, 1, 0],
+    ],
+    translations: [
+      [0, 0, 0],
+      [1, 2, 3],
+    ],
+  };
+  const options = { profile: "objects", objects: new ObjectLayer(table, [track]) };
+  const bytes = await encodeScene(objectGaussianInput([1]), 1, options);
+  const scene = await decodeScene(new BytesReadable(bytes));
+
+  assert.deepEqual(scene.objects.table?.entries[0]?.dynamics, table.entries[0]!.dynamics);
+  assert.deepEqual(scene.objects.table?.entries[0]?.embedding, table.entries[0]!.embedding);
+  assert.deepEqual(scene.objects.tracks, [track]);
+});
+
+test("the writer rejects an Object Track past the decoder sample ceiling", async () => {
+  // Sparse arrays make the declared shape cheap. The ceiling must win before
+  // validation walks them or diagnoses their intentionally absent rows.
+  const declared = MAX_TRAJECTORY_SAMPLES + 1;
+  const track = {
+    objectId: 1,
+    interpolation: 0,
+    times: new Array<number>(declared),
+    rotations: new Array<number[]>(declared),
+    translations: new Array<number[]>(declared),
+  };
+  await assert.rejects(
+    () =>
+      encodeScene(objectGaussianInput([1]), 1, {
+        profile: "objects",
+        objects: new ObjectLayer(objectTable, [track]),
+      }),
+    /ObjectTrack for object 1 declares 1000001 samples, past the 1000000 ceiling/,
+  );
+});
+
 /** Little-endian record bytes for the trajectory tests below. */
 function trajectoryBytes(samples: readonly (readonly number[])[]): Uint8Array {
   const head = [0x03, 0, 0, 0, 0x72, 0x69, 0x67, 0x00]; // "rig" as a u32-prefixed string
@@ -695,6 +835,37 @@ test("an object table embedding must match the space the table declares", () => 
   assert.throws(
     () => checkObjectTable({ embeddingDim: 0, entries: [{ ...entry, embedding: [1, 2, 3] }] }),
     MalformedFile,
+  );
+});
+
+test("the writer rejects an Object Table past the indexed front-matter ceiling", async () => {
+  const embedding = new Proxy(new Array<number>(0xffff), {
+    get(target, property, receiver) {
+      if (property === "length") return 0xffff;
+      if (typeof property === "string" && /^\d+$/.test(property)) {
+        throw new Error("the oversized embedding was materialized");
+      }
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  const table = {
+    embeddingDim: 0xffff,
+    entries: Array.from({ length: 256 }, (_, index) => ({
+      objectId: index + 1,
+      label: "",
+      anchor: [0, 0, 0],
+      dynamics: null,
+      embedding,
+    })),
+  };
+
+  await assert.rejects(
+    () =>
+      encodeScene(objectGaussianInput([1]), 1, {
+        profile: "objects",
+        objects: new ObjectLayer(table),
+      }),
+    /ObjectTable record exceeds the 67108864 byte indexed front-matter ceiling/,
   );
 });
 
