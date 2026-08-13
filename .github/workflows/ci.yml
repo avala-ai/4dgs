@@ -191,6 +191,24 @@ jobs:
           size_kb=$(du -s dart | cut -f1)
           echo "dart: ${size_kb} KiB"
           [ "$size_kb" -le 1472 ] || { echo "::error::dart is ${size_kb} KiB, over the 1472 KiB budget"; exit 1; }
+      - name: C++ sources under 704 KB
+        # New, and the reason it is new is worth stating: every other SDK has had a
+        # sub-budget here for some time and C++ never did, so the whole-tree gate above was
+        # the only thing that would have caught it growing — which is the gate that cannot
+        # say which language grew. A vendored dependency landing in `cpp/` would have been
+        # a whole-tree failure somebody had to bisect by hand.
+        #
+        # Sources only, same as every budget beside it: this job builds nothing, so
+        # `cpp/build` is not here to measure. 704 rather than the measured 608 for the
+        # reason the raises above take a step rather than an exact size — the number exists
+        # to catch a vendored dependency, which arrives in hundreds of KiB, not to fail on
+        # the next file. That 608 includes the keyframe-delta encode binding this budget
+        # arrives with (#122): the public surface, the seam on both backends, the
+        # conformance sequence runner and its gate script.
+        run: |
+          size_kb=$(du -s cpp | cut -f1)
+          echo "cpp: ${size_kb} KiB"
+          [ "$size_kb" -le 704 ] || { echo "::error::cpp is ${size_kb} KiB, over the 704 KiB budget"; exit 1; }
       - name: Swift sources under 640 KB
         # Sources only, same as TypeScript's: this job builds nothing, so .build is not
         # here to measure and a vendored dependency would show up as a budget failure.
@@ -634,6 +652,18 @@ jobs:
           for f in tests/conformance/data/*.4dgs; do
             ./cpp/build-asan/conformance/decode_streamed "$f" > /dev/null || {
               [ "$?" -eq 99 ] && { echo "::error::sanitizer report decoding $f"; exit 1; }
+            }
+          done
+          # The encode side owns two things across the boundary the decode side does not: a
+          # writer handle and the buffer the ABI hands back, both of which the binding frees
+          # itself. The keyframe-delta runner stages seventeen samples through one writer and
+          # encodes twice, so a leak on either shows up here rather than in whatever process
+          # first authors a long sequence.
+          mkdir -p "$RUNNER_TEMP/asan-kd"
+          for shape in chained keyframe cadence-one; do
+            ./cpp/build-asan/conformance/encode_keyframe_delta "$RUNNER_TEMP/asan-kd" "$shape" \
+              > /dev/null || {
+              [ "$?" -eq 99 ] && { echo "::error::sanitizer report encoding $shape"; exit 1; }
             }
           done
         env:

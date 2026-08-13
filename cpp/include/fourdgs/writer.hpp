@@ -60,6 +60,68 @@ struct WriteOptions {
 Result<std::vector<std::uint8_t>> encodeScene(const GaussianView& gaussians, double durationSec,
                                               const WriteOptions& options = WriteOptions());
 
+/// A delta references the keyframe at the head of its group of pictures — spec §11.4.
+constexpr std::uint8_t kDeltaModeKeyframe = 0;
+/// A delta references the state chunk immediately before it. The recommended default.
+constexpr std::uint8_t kDeltaModeChained = 1;
+
+/// One population at one instant, with identity — spec §11.1 and §11.2.
+///
+/// `ids` is the `gaussian_id` stream, one per gaussian and aligned with the columns. It is
+/// the only thing that ties a delta to the gaussian it changes, so a producer that reorders
+/// a population between samples costs nothing: correspondence is by id, never by row.
+///
+/// Both the ids and the gaussians are borrowed for the duration of the encode call and
+/// copied into the core, so a view straight from a decoder's working set is a valid argument.
+struct KeyframeDeltaSample {
+  /// Where this sample's interval starts. Sample `i` covers `[t0_i, t0_{i+1})`, the first
+  /// starts at 0 and the last ends at the sequence's duration — the tiling rule of §11.1.
+  double t0 = 0.0;
+  Span<const std::uint32_t> ids;
+  GaussianView gaussians;
+};
+
+/// How a `keyframe-delta` sequence is written. The defaults are the reference writer's.
+struct KeyframeDeltaOptions {
+  /// Samples per group of pictures. 1 writes every sample as a keyframe, which is the
+  /// shape §11.11 says subsumes the reserved `frame-sequence` name.
+  std::uint32_t keyframeEvery = 8;
+  /// `kDeltaModeChained` or `kDeltaModeKeyframe`, spec §11.4. Chained is smaller and
+  /// adjacent in the file; neither accumulates error, because a delta is a difference of
+  /// bins rather than a quantization of a difference (§11.7).
+  std::uint8_t deltaMode = kDeltaModeChained;
+  /// Sample indices to force a keyframe at, beyond the cadence — a chapter boundary, a shot
+  /// cut, a loop start, made to cost two records however deep into the group it falls.
+  std::vector<std::uint32_t> keyframeAt;
+  /// The quantization profile the whole sequence shares: `fine`, `default` or `coarse`.
+  /// Every sample is quantized on one set of grids, which is what makes a bin difference
+  /// meaningful. Empty leaves the encoder's own default.
+  std::string profile;
+  /// The Header's marginal visibility threshold, as on `WriteOptions`.
+  double cutoff = 0.05;
+  /// The Header's `library`. Empty leaves the encoder's default in place.
+  std::string library;
+  /// The codec every attribute stream is compressed with — 0 deflate, 1 zstd — and its level.
+  std::uint8_t codec = 0;
+  std::uint32_t level = 6;
+};
+
+/// Encode a sequence of populations as a whole `keyframe-delta` file (spec §11).
+///
+/// This is a different shape of encode from `encodeScene`, not an option on it: a
+/// `keyframe-delta` file is a sequence of states with correspondence between them rather than
+/// one population of independently-lived gaussians, so it takes samples rather than
+/// gaussians. The model's arithmetic is entirely the core's — the writer quantizes every
+/// sample on one shared set of grids and each delta carries integer bin differences against
+/// its reference, restating `rotation_index` and `rotation` absolutely and never carrying
+/// `sigma_t`, `flags` or `window_index` in an update group (§11.5).
+///
+/// `kNotImplemented` when the package was built without the core; `kInvalidArgument` when the
+/// samples break a rule §11 puts on a producer, with the core's message naming the gaussian.
+Result<std::vector<std::uint8_t>> encodeKeyframeDeltaSequence(
+    Span<const KeyframeDeltaSample> samples, double durationSec,
+    const KeyframeDeltaOptions& options = KeyframeDeltaOptions());
+
 }  // namespace fourdgs
 
 #endif  // FOURDGS_WRITER_HPP

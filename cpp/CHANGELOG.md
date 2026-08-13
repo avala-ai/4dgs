@@ -6,6 +6,36 @@ All notable changes to the C++ package are documented here, following
 
 ## [Unreleased]
 
+### Added
+
+- **`keyframe-delta` encode** (spec §11):
+  `fourdgs::encodeKeyframeDeltaSequence(samples, durationSec, options)`, with `KeyframeDeltaSample`
+  — a `t0`, a `gaussian_id` stream and a `GaussianView`, all borrowed for the call — and
+  `KeyframeDeltaOptions` for cadence, delta mode, forced keyframe indices, quantization profile,
+  cutoff, `library` and codec. A separate entry point from `encodeScene`, not an option on it: the
+  model is a sequence of populations with correspondence between them rather than one population of
+  independently-lived gaussians, so it takes samples rather than gaussians.
+
+  Like the rest of this package it is a binding, not a second encoder. The model's arithmetic
+  belongs to the core, reached through the `fourdgs_kd_writer_*` exports the layer below adds — a
+  delta is a difference of quantization bins against its reference chunk and never a quantization of
+  a difference (§11.7), rotation is restated absolutely, and `sigma_t`, `flags` and `window_index`
+  never reach an update group (§11.5). The binding stages options and columns and copies bytes out;
+  it computes nothing. What it does check is the one thing the ABI cannot see, because that call
+  takes a single count for both: a sample whose id stream and gaussian columns are different lengths
+  is refused here, where both lengths are still in hand, rather than silently renaming gaussians.
+
+  `cpp/conformance/encode_keyframe_delta` writes three sequences — chained, keyframe-referenced, and
+  the cadence-one shape §11.11 says subsumes `frame-sequence` — each with births, deaths, updates
+  and ids rotated within every sample so that a writer pairing gaussians by row rather than by
+  identity could not pass. `cpp/keyframe-delta-roundtrip.sh` then makes four claims about each: the
+  file is inside the bounds its own declared grid pitches promise against the population that went
+  in; the C++ and Python decoders read it to the same canonical `states`; every count its chunk
+  index declares matches the records it points at; and, given the same samples and options, it is
+  byte for byte the file the Rust reference writer produces — which is the claim a binding is
+  actually making. The feature matrix's `Encode keyframe-delta` cell for C++ moves from `Planned` to
+  `Yes` on that suite (issue #122).
+
 ## [0.1.0] - 2026-08-10
 
 ### Added

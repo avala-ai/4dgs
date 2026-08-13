@@ -555,6 +555,31 @@ struct WriterGuard {
   WriterGuard& operator=(const WriterGuard&) = delete;
 };
 
+/// The same, for the keyframe-delta sequence writer. A separate ABI type because the model
+/// takes samples rather than gaussians, so it is a separate guard.
+struct KeyframeDeltaWriterGuard {
+  fourdgs_kd_writer* writer = fourdgs_kd_writer_new();
+  KeyframeDeltaWriterGuard() = default;
+  ~KeyframeDeltaWriterGuard() { fourdgs_kd_writer_free(writer); }
+  KeyframeDeltaWriterGuard(const KeyframeDeltaWriterGuard&) = delete;
+  KeyframeDeltaWriterGuard& operator=(const KeyframeDeltaWriterGuard&) = delete;
+};
+
+/// Copy an encoded buffer out and free it.
+///
+/// The bytes are the caller's to keep and the ABI's pointer lives only until
+/// `fourdgs_buffer_free`, so the copy has to happen first. One function rather than one copy
+/// per encode path, because a second hand-written version is a second place to forget the
+/// free.
+std::vector<std::uint8_t> takeBuffer(fourdgs_buffer* buffer) {
+  const std::uint8_t* data = fourdgs_buffer_data(buffer);
+  const std::size_t length = fourdgs_buffer_len(buffer);
+  std::vector<std::uint8_t> out(length);
+  if (length != 0 && data != nullptr) std::memcpy(out.data(), data, length);
+  fourdgs_buffer_free(buffer);
+  return out;
+}
+
 Result<std::vector<std::uint8_t>> encodeScene(const GaussianView& gaussians, double durationSec,
                                               const WriteOptions& options) {
   WriterGuard guard;
@@ -614,15 +639,66 @@ Result<std::vector<std::uint8_t>> encodeScene(const GaussianView& gaussians, dou
   fourdgs_buffer* buffer = nullptr;
   const int status = fourdgs_writer_encode(writer, &buffer);
   if (status != FOURDGS_STATUS_OK) return failure(status).error();
+  return takeBuffer(buffer);
+}
 
-  // Copied out before the buffer is freed: the bytes are the caller's to keep, and the ABI's
-  // pointer lives only until fourdgs_buffer_free.
-  const std::uint8_t* data = fourdgs_buffer_data(buffer);
-  const std::size_t length = fourdgs_buffer_len(buffer);
-  std::vector<std::uint8_t> out(length);
-  if (length != 0 && data != nullptr) std::memcpy(out.data(), data, length);
-  fourdgs_buffer_free(buffer);
-  return out;
+Result<std::vector<std::uint8_t>> encodeKeyframeDeltaSequence(
+    Span<const KeyframeDeltaSample> samples, double durationSec,
+    const KeyframeDeltaOptions& options) {
+  KeyframeDeltaWriterGuard guard;
+  if (guard.writer == nullptr) {
+    return Error(ErrorCode::kInternal, "the core could not allocate a keyframe-delta writer");
+  }
+  fourdgs_kd_writer* writer = guard.writer;
+
+  Result<void> staged = check(fourdgs_kd_writer_set_duration(writer, durationSec));
+  if (!staged) return staged.error();
+  staged = check(fourdgs_kd_writer_set_cutoff(writer, options.cutoff));
+  if (!staged) return staged.error();
+  staged = check(fourdgs_kd_writer_set_cadence(writer, options.keyframeEvery, options.deltaMode));
+  if (!staged) return staged.error();
+  for (std::uint32_t index : options.keyframeAt) {
+    staged = check(fourdgs_kd_writer_add_keyframe_at(writer, index));
+    if (!staged) return staged.error();
+  }
+  if (!options.profile.empty()) {
+    staged = check(
+        fourdgs_kd_writer_set_profile(writer, options.profile.data(), options.profile.size()));
+    if (!staged) return staged.error();
+  }
+  if (!options.library.empty()) {
+    staged = check(
+        fourdgs_kd_writer_set_library(writer, options.library.data(), options.library.size()));
+    if (!staged) return staged.error();
+  }
+  staged = check(fourdgs_kd_writer_set_compression(writer, options.codec, options.level));
+  if (!staged) return staged.error();
+
+  // The ids and the columns are aligned element for element — the id stream is what names the
+  // gaussian a delta changes (spec §11.2), so a sample whose lengths disagree would silently
+  // rename gaussians rather than fail. Refused here, where both lengths are still visible: the
+  // ABI takes one count and cannot see the mismatch.
+  for (std::size_t i = 0; i < samples.size(); ++i) {
+    const KeyframeDeltaSample& sample = samples[i];
+    if (sample.ids.size() != sample.gaussians.count) {
+      return Error(ErrorCode::kInvalidArgument,
+                   "sample " + std::to_string(i) + " carries " +
+                       std::to_string(sample.gaussians.count) + " gaussians and " +
+                       std::to_string(sample.ids.size()) +
+                       " ids; gaussian_id is one per gaussian (spec §11.2)");
+    }
+    const GaussianView& g = sample.gaussians;
+    staged = check(fourdgs_kd_writer_add_sample(
+        writer, sample.t0, static_cast<std::uint32_t>(g.count), sample.ids.data(),
+        g.positions.data(), g.scales.data(), g.rotations.data(), g.colors.data(), g.motions.data(),
+        g.muT.data(), g.sigmaT.data(), g.winLo.data(), g.winHi.data()));
+    if (!staged) return staged.error();
+  }
+
+  fourdgs_buffer* buffer = nullptr;
+  const int status = fourdgs_kd_writer_encode(writer, &buffer);
+  if (status != FOURDGS_STATUS_OK) return failure(status).error();
+  return takeBuffer(buffer);
 }
 
 namespace {
