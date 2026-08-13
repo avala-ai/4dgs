@@ -98,10 +98,20 @@ struct KeyframeDeltaOptions {
   /// meaningful. Empty leaves the encoder's own default.
   std::string profile;
   /// The Header's marginal visibility threshold, as on `WriteOptions`.
+  ///
+  /// This and the two compression fields below restate the core's own defaults rather than
+  /// deferring to them, which is the convention every SDK follows — Python's `write_sequence`
+  /// signature and Swift's `KeyframeDeltaOptions` spell out the same three numbers. The cost
+  /// is that there is no way to ask for "whatever the core's default is": these values are
+  /// always sent, so if the core's default moves, this keeps writing the old one until it is
+  /// updated here too. Changing that is a cross-SDK decision rather than this binding's to
+  /// make on its own (AGENTS.md §8), so it is written down instead of quietly diverged from.
   double cutoff = 0.05;
   /// The Header's `library`. Empty leaves the encoder's default in place.
   std::string library;
   /// The codec every attribute stream is compressed with — 0 deflate, 1 zstd — and its level.
+  /// Restated defaults, as `cutoff` above. A codec this build of the core has no encoder for
+  /// is refused as `kUnsupported`: legal, but not implemented here.
   std::uint8_t codec = 0;
   std::uint32_t level = 6;
 };

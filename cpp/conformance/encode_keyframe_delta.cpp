@@ -136,6 +136,13 @@ Population populationAt(std::size_t i) {
     g.sigmaT[row] = static_cast<float>(0.2 + rng.unit() * 0.8);
     // One validity window for the whole sequence. `window_index` is GOP-invariant (§11.5),
     // so a fixture that varied it would be exercising the refusal rather than the encode.
+    //
+    // The reference runner states the same window per gaussian rather than leaving the
+    // columns empty, and that agreement is load-bearing for the byte-identity leg: an empty
+    // column takes two unrelated fallbacks — a synthesized `(0, duration)` table and a
+    // `window_index_of` miss landing on row 0 — to produce the Window Table this reaches by
+    // a real match. Matching by coincidence meant moving this window diverged the two files
+    // and the gate blamed the binding for it.
     g.winLo[row] = 0.0f;
     g.winHi[row] = static_cast<float>(kDuration);
   }
@@ -160,6 +167,30 @@ std::string floatArray(const std::vector<float>& values) {
     out += number(static_cast<double>(values[i]));
   }
   return out + "]";
+}
+
+/// Write a whole buffer to an already-open file and close it, reporting either failure.
+///
+/// Both halves are checked because both fail on a full disk and neither is visible in the
+/// bytes: `fwrite` returns short, and `fclose` is where a buffered write is finally flushed,
+/// so a truncated file can leave `fwrite` looking successful. A runner that dropped them
+/// printed "deterministic, both read paths agree" and exited 0 on ENOSPC — and the gate
+/// around it then either died on a `json.load` traceback under `set -euo pipefail`, with none
+/// of the `::error::` every other failure emits, or reported the truncated `.4dgs` as "the
+/// binding and the Rust reference writer disagree byte for byte". Blaming the binding for a
+/// disk error is worse than either failure it is standing in for.
+Result<void> writeAllAndClose(std::FILE* handle, const std::string& path, const void* data,
+                              std::size_t size) {
+  const std::size_t written = size == 0 ? 0 : std::fwrite(data, 1, size, handle);
+  if (written != size) {
+    std::fclose(handle);
+    return fourdgs::Error(ErrorCode::kIo, "wrote " + std::to_string(written) + " of " +
+                                              std::to_string(size) + " bytes to " + path);
+  }
+  if (std::fclose(handle) != 0) {
+    return fourdgs::Error(ErrorCode::kIo, "cannot flush and close " + path);
+  }
+  return Result<void>();
 }
 
 /// The samples, as the gate reads them back. Hand-written rather than through a JSON library
@@ -188,17 +219,13 @@ Result<void> writeSamplesJson(const std::string& path, const std::vector<Populat
     out += ",\"winHi\":" + floatArray(g.winHi) + "}";
   }
   out += "]}\n";
-  std::fwrite(out.data(), 1, out.size(), handle);
-  std::fclose(handle);
-  return Result<void>();
+  return writeAllAndClose(handle, path, out.data(), out.size());
 }
 
 Result<void> writeWhole(const std::string& path, const std::vector<std::uint8_t>& bytes) {
   std::FILE* handle = std::fopen(path.c_str(), "wb");
   if (handle == nullptr) return fourdgs::Error(ErrorCode::kIo, "cannot open " + path);
-  if (!bytes.empty()) std::fwrite(bytes.data(), 1, bytes.size(), handle);
-  std::fclose(handle);
-  return Result<void>();
+  return writeAllAndClose(handle, path, bytes.data(), bytes.size());
 }
 
 }  // namespace

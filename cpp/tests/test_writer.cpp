@@ -313,6 +313,129 @@ void aMismatchedIdStreamIsRefused() {
   CHECK(encoded.error().message.find("gaussian_id") != std::string::npos);
 }
 
+/// The nine columns the ABI reads, with the floats each holds per gaussian.
+struct Column {
+  fourdgs::Span<const float> GaussianView::* member;
+  const char* name;
+  std::size_t width;
+};
+
+const Column kColumns[] = {
+    {&GaussianView::positions, "positions", 3}, {&GaussianView::scales, "scales", 3},
+    {&GaussianView::rotations, "rotations", 4}, {&GaussianView::colors, "colors", 4},
+    {&GaussianView::motions, "motions", 3},     {&GaussianView::muT, "mu_t", 1},
+    {&GaussianView::sigmaT, "sigma_t", 1},      {&GaussianView::winLo, "win_lo", 1},
+    {&GaussianView::winHi, "win_hi", 1},
+};
+
+/// Copy a column into an exactly-sized allocation one gaussian short of what `count` claims.
+///
+/// Exactly sized on purpose: a span merely shortened over a buffer that is still long enough
+/// would hide the bug from a sanitizer. This is a real heap block that ends where the span
+/// says it does, so a binding that forwarded `count` reads past it and ASAN says so.
+std::vector<float> oneGaussianShort(const GaussianView& view, const Column& column) {
+  const fourdgs::Span<const float> full = view.*column.member;
+  return std::vector<float>(full.data(), full.data() + (view.count - 1) * column.width);
+}
+
+/// A view whose columns are shorter than its `count` is refused rather than read past.
+///
+/// `GaussianView::count` is an independent field: nothing in the type derives it from the
+/// spans beside it, so `count = 4` over a six-float `positions` is a value an ordinary caller
+/// can construct without writing `unsafe` anywhere. The ABI takes the count and a bare
+/// pointer per column and reads `count × width` floats from each, so forwarding one is a heap
+/// read out of bounds — AGENTS.md §1, an allocation sized from a value nobody validated. The
+/// id-stream check above does not catch it: the ids can be exactly as long as `count` says
+/// while a column is not.
+void aRaggedSampleIsRefused() {
+  // One column truncated at a time, so every one of the nine is proved checked rather than
+  // the first standing in for the rest.
+  for (const Column& column : kColumns) {
+    Sequence sequence = threeSamples();
+    GaussianView ragged(sequence.populations[1]);
+    const std::vector<float> truncated = oneGaussianShort(ragged, column);
+    ragged.*column.member = fourdgs::Span<const float>(truncated.data(), truncated.size());
+    sequence.samples[1].gaussians = ragged;
+
+    Result<std::vector<std::uint8_t>> encoded =
+        fourdgs::encodeKeyframeDeltaSequence(spanOf(sequence), 1.0);
+    CHECK(!encoded.ok());
+    if (encoded.ok()) continue;
+    CHECK_EQ(encoded.error().code, ErrorCode::kInvalidArgument);
+    // The message names the sample and the column, because "invalid argument" over nine
+    // columns and three samples is not a diagnosis (AGENTS.md §6).
+    CHECK(encoded.error().message.find("sample 1") != std::string::npos);
+    CHECK(encoded.error().message.find(column.name) != std::string::npos);
+  }
+}
+
+/// The same defect on the older entry point. `encodeScene` reads the same nine columns off
+/// the same public view through the same kind of ABI call, so a ragged view is the same
+/// out-of-bounds read there; it is checked in one place and both paths use it.
+void aRaggedSceneIsRefused() {
+  for (const Column& column : kColumns) {
+    const GaussianData data = tinyScene();
+    GaussianView ragged(data);
+    const std::vector<float> truncated = oneGaussianShort(ragged, column);
+    ragged.*column.member = fourdgs::Span<const float>(truncated.data(), truncated.size());
+
+    Result<std::vector<std::uint8_t>> encoded = fourdgs::encodeScene(ragged, 2.0);
+    CHECK(!encoded.ok());
+    if (encoded.ok()) continue;
+    CHECK_EQ(encoded.error().code, ErrorCode::kInvalidArgument);
+    CHECK(encoded.error().message.find(column.name) != std::string::npos);
+  }
+}
+
+/// `cutoff`, `codec` and `level` are forwarded, not merely stored.
+///
+/// The three are the options whose default this struct restates from the core's, so nothing
+/// in the suite noticed when the value went nowhere: the conformance runner asks for the
+/// defaults, the core applies the same defaults on its own, and the file is identical either
+/// way. Deleting any one of the three forwarding calls left the whole C++ suite green. So
+/// each is set to something that is not the default and the file has to change — which is
+/// the weakest claim that cannot be satisfied by an option that was dropped on the floor.
+void compressionAndCutoffReachTheCore() {
+  const Sequence sequence = threeSamples();
+  KeyframeDeltaOptions defaults;
+  Result<std::vector<std::uint8_t>> base =
+      fourdgs::encodeKeyframeDeltaSequence(spanOf(sequence), 1.0, defaults);
+  CHECK(base.ok());
+  if (!base.ok()) return;
+
+  // `cutoff` is the Header's visibility threshold and the divisor the per-gaussian velocity
+  // grid is derived through (§6.3), so a file written at another one is a different file.
+  KeyframeDeltaOptions coarserCutoff = defaults;
+  coarserCutoff.cutoff = 0.4;
+  Result<std::vector<std::uint8_t>> other =
+      fourdgs::encodeKeyframeDeltaSequence(spanOf(sequence), 1.0, coarserCutoff);
+  CHECK(other.ok());
+  if (other.ok()) CHECK(*other != *base);
+
+  // The level changes what the deflate coder emits for the same input, so the bytes move
+  // while everything they decode to stays put.
+  KeyframeDeltaOptions fastest = defaults;
+  fastest.level = 1;
+  Result<std::vector<std::uint8_t>> cheap =
+      fourdgs::encodeKeyframeDeltaSequence(spanOf(sequence), 1.0, fastest);
+  CHECK(cheap.ok());
+  if (cheap.ok()) CHECK(*cheap != *base);
+
+  // A second codec either writes a different stream or is refused as unimplemented in this
+  // build — both prove the value arrived, and which one it is belongs to the core's cargo
+  // features rather than to this binding. `kUnsupported` is the legal-but-unbuilt half of
+  // the split `result.hpp` draws, so it is checked by name and not merely by "not ok".
+  KeyframeDeltaOptions zstd = defaults;
+  zstd.codec = 1;
+  Result<std::vector<std::uint8_t>> compressed =
+      fourdgs::encodeKeyframeDeltaSequence(spanOf(sequence), 1.0, zstd);
+  if (compressed.ok()) {
+    CHECK(*compressed != *base);
+  } else {
+    CHECK_EQ(compressed.error().code, ErrorCode::kUnsupported);
+  }
+}
+
 /// A mode the format does not define never reaches a record. §5.18 gives `delta_mode` two
 /// values, and a third would be written into a field every reader dispatches on.
 void anUndefinedDeltaModeIsRefused() {
@@ -347,6 +470,9 @@ void runTests() {
     bothDeltaModesReachTheCore();
     aChangedInvariantIsRefused();
     aMismatchedIdStreamIsRefused();
+    aRaggedSampleIsRefused();
+    aRaggedSceneIsRefused();
+    compressionAndCutoffReachTheCore();
     anUndefinedDeltaModeIsRefused();
     anUnknownProfileIsRefused();
   } else {

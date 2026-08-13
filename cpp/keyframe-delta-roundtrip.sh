@@ -73,19 +73,31 @@ done
 checked=0
 # `cadence-one` is the §11.11 shape — every chunk a keyframe, no delta chunk anywhere — and it
 # is here because a writer can reach it by cadence alone and nothing else in this repository
-# proves the C++ binding does. The reference runner has no such mode, so it is the one shape
-# with no byte-identity leg.
+# proves the C++ binding does. The reference runner grew the same shape so that all three
+# carry every claim below: it previously took a delta mode rather than a shape, which left
+# cadence one with no byte-identity leg while this script still counted it among the sequences
+# it reported as byte-verified — a regression reachable only at cadence 1 passed and was
+# announced as checked.
 for shape in chained keyframe cadence-one; do
-  "$encode" "$out" "$shape"
+  # A runner that fails says so as an annotation, like every other failure here. Under
+  # `set -e` a bare call would take the script down with whatever the runner printed on
+  # stderr and no `::error::` line, which is the one failure mode a CI log cannot summarize —
+  # and the runner exits non-zero for a write that failed as readily as for an encode that
+  # did, so this is where a full disk stops being reported as a disagreement about bytes.
+  "$encode" "$out" "$shape" || {
+    echo "::error::$shape: the C++ keyframe-delta runner failed; see its message above"
+    exit 1
+  }
   file="$out/keyframe-delta-$shape.4dgs"
 
-  if [ "$shape" != "cadence-one" ]; then
-    "$reference" "$out/reference-$shape.4dgs" "$shape" >/dev/null
-    cmp -s "$out/reference-$shape.4dgs" "$file" || {
-      echo "::error::$shape: the binding and the Rust reference writer disagree byte for byte"
-      exit 1
-    }
-  fi
+  "$reference" "$out/reference-$shape.4dgs" "$shape" >/dev/null || {
+    echo "::error::$shape: the Rust reference keyframe-delta writer failed; see its message above"
+    exit 1
+  }
+  cmp -s "$out/reference-$shape.4dgs" "$file" || {
+    echo "::error::$shape: the binding and the Rust reference writer disagree byte for byte"
+    exit 1
+  }
 
   "$cpp_streamed" "$file" >"$out/$shape.cpp.streamed.json"
   "$cpp_indexed" "$file" >"$out/$shape.cpp.indexed.json"
@@ -148,11 +160,11 @@ grids = decoded.grids
 if len(decoded.chunks) != len(samples):
     fail(f"the encoder wrote {len(decoded.chunks)} chunks for {len(samples)} samples")
 
-# The shape the options asked for actually arrived. `cadence-one` is the one sequence with no
-# byte-identity leg above — the reference runner has no such mode — so without this the
-# cadence and the delta mode could be dropped on the way to the core and every other claim
-# here would still hold: a file made entirely of keyframes reconstructs correctly, agrees with
-# every decoder, and is not the file that was asked for.
+# The shape the options asked for actually arrived. The byte-identity leg above would catch a
+# dropped cadence too, but only by reporting that two files differ; this says which property
+# of the file is wrong, and it says it about the C++ binding alone rather than about the pair.
+# Every other claim here survives a dropped cadence: a file made entirely of keyframes
+# reconstructs correctly, agrees with every decoder, and is not the file that was asked for.
 kinds = [chunk.kind for chunk in decoded.chunks]
 if shape == "cadence-one":
     if any(kind != 0 for kind in kinds):

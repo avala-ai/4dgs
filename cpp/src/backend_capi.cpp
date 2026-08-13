@@ -580,8 +580,64 @@ std::vector<std::uint8_t> takeBuffer(fourdgs_buffer* buffer) {
   return out;
 }
 
+/// Every column of a `GaussianView` holds `count` gaussians, and the count fits the ABI.
+///
+/// `GaussianView::count` is a public field of its own, derived from nothing: the `Span`s
+/// beside it are independent, so `count = 4` over a six-float `positions` is a value any
+/// caller can build without writing `unsafe` anywhere. Both encode entry points then hand
+/// the ABI that count and a bare `data()` per column, and the ABI reads `count × width`
+/// floats from each — so an unchecked count is a heap read past the end of the caller's own
+/// buffer, from a public API. AGENTS.md §1: nothing untrusted sizes a read that was not
+/// validated first. Checked here rather than at the ABI because this is the last place the
+/// lengths still exist; across the boundary there is only a pointer.
+///
+/// `subject` names what is being described — "the gaussians" for a scene, "sample 3" for a
+/// keyframe-delta sample — so a caller staging seventeen samples learns which one is short.
+/// Written as a division rather than a `count * width` comparison because the product is the
+/// thing that could overflow, and an overflowed bound is a check that passes.
+Result<void> checkColumns(const GaussianView& gaussians, const std::string& subject) {
+  // The ABI's count is 32 bits. A `std::size_t` count above that would be truncated on the
+  // way in and the columns re-read against the wrong length, so it is refused by name
+  // instead of silently becoming a different number.
+  if (gaussians.count > 0xFFFFFFFFull) {
+    return Error(ErrorCode::kInvalidArgument,
+                 subject + " declares " + std::to_string(gaussians.count) +
+                     " gaussians, more than the 32-bit count the core's writer takes");
+  }
+  struct Column {
+    const char* name;
+    std::size_t width;  ///< Floats per gaussian.
+    std::size_t size;
+  };
+  const Column columns[] = {
+      {"positions", 3, gaussians.positions.size()}, {"scales", 3, gaussians.scales.size()},
+      {"rotations", 4, gaussians.rotations.size()}, {"colors", 4, gaussians.colors.size()},
+      {"motions", 3, gaussians.motions.size()},     {"mu_t", 1, gaussians.muT.size()},
+      {"sigma_t", 1, gaussians.sigmaT.size()},      {"win_lo", 1, gaussians.winLo.size()},
+      {"win_hi", 1, gaussians.winHi.size()},
+  };
+  for (const Column& column : columns) {
+    if (gaussians.count > column.size / column.width) {
+      return Error(ErrorCode::kInvalidArgument,
+                   subject + " declares " + std::to_string(gaussians.count) +
+                       " gaussians and its " + column.name + " column holds " +
+                       std::to_string(column.size) + " floats; at " + std::to_string(column.width) +
+                       " per gaussian that column needs " +
+                       std::to_string(static_cast<std::uint64_t>(gaussians.count) * column.width) +
+                       ". GaussianView::count is not derived from the columns, so the two have to "
+                       "agree before the count reaches the core");
+    }
+  }
+  return Result<void>();
+}
+
 Result<std::vector<std::uint8_t>> encodeScene(const GaussianView& gaussians, double durationSec,
                                               const WriteOptions& options) {
+  // Before anything is staged: the columns are the caller's memory, and the count is what
+  // decides how much of it the core reads.
+  Result<void> columns = checkColumns(gaussians, "the gaussians");
+  if (!columns) return columns.error();
+
   WriterGuard guard;
   if (guard.writer == nullptr) {
     return Error(ErrorCode::kInternal, "the core could not allocate a writer");
@@ -677,9 +733,12 @@ Result<std::vector<std::uint8_t>> encodeKeyframeDeltaSequence(
   // The ids and the columns are aligned element for element — the id stream is what names the
   // gaussian a delta changes (spec §11.2), so a sample whose lengths disagree would silently
   // rename gaussians rather than fail. Refused here, where both lengths are still visible: the
-  // ABI takes one count and cannot see the mismatch.
+  // ABI takes one count and cannot see the mismatch. The gaussian columns are checked against
+  // that same count for the same reason — the ABI sees a pointer where a length used to be.
   for (std::size_t i = 0; i < samples.size(); ++i) {
     const KeyframeDeltaSample& sample = samples[i];
+    Result<void> columns = checkColumns(sample.gaussians, "sample " + std::to_string(i));
+    if (!columns) return columns.error();
     if (sample.ids.size() != sample.gaussians.count) {
       return Error(ErrorCode::kInvalidArgument,
                    "sample " + std::to_string(i) + " carries " +

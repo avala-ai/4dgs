@@ -24,6 +24,8 @@ All notable changes to the C++ package are documented here, following
   it computes nothing. What it does check is the one thing the ABI cannot see, because that call
   takes a single count for both: a sample whose id stream and gaussian columns are different lengths
   is refused here, where both lengths are still in hand, rather than silently renaming gaussians.
+  The gaussian columns are held to that same count for the same reason and a stronger one — see the
+  ragged-view fix under **Fixed**.
 
   `cpp/conformance/encode_keyframe_delta` writes three sequences — chained, keyframe-referenced, and
   the cadence-one shape §11.11 says subsumes `frame-sequence` — each with births, deaths, updates
@@ -35,6 +37,28 @@ All notable changes to the C++ package are documented here, following
   byte for byte the file the Rust reference writer produces — which is the claim a binding is
   actually making. The feature matrix's `Encode keyframe-delta` cell for C++ moves from `Planned` to
   `Yes` on that suite (issue #122).
+
+### Fixed
+
+- **A `GaussianView` whose columns are shorter than its `count` is refused rather than read past.**
+  `count` is a public field of its own and the `Span`s beside it are independent, so
+  `GaussianView{count = 4, positions = Span(p, 6), …}` is a value any caller can build without
+  writing `unsafe` anywhere. Both `encodeScene` and `encodeKeyframeDeltaSequence` then handed the C
+  ABI that count and a bare pointer per column, and the ABI reads `count × width` floats from each —
+  a heap read past the end of the caller's own buffer, reachable from a public, safe API, which
+  AddressSanitizer reports as a `heap-buffer-overflow` in `fourdgs_kd_writer_add_sample`. All nine
+  columns are now checked against `count` before anything is staged, on both entry points, and the
+  refusal names the column, what it holds and what it needed. A count too large for the ABI's 32-bit
+  parameter is refused by name instead of being truncated into a different number.
+
+  `encodeScene` had the defect first and `encodeKeyframeDeltaSequence` inherited the pattern; the
+  check is one function and both call it, so neither can drift from the other.
+
+- **`cutoff`, `codec` and `level` are proved to reach the core.** They were forwarded, but nothing
+  noticed if they were not: this struct restates the core's own defaults for all three, so a value
+  that went nowhere produced exactly the file the core would have written anyway, and deleting any
+  of the three forwarding calls left the whole C++ suite green. Each is now set to something other
+  than its default in a test that requires the bytes to move.
 
 ## [0.1.0] - 2026-08-10
 
