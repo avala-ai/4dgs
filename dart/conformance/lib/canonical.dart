@@ -324,10 +324,16 @@ Map<String, Object?> _objectsAndStates(
       rowForIndex[base.indices[row]] = row;
     }
     final sampleRows = <int>[];
+    final totals = <double>[0.0, 0.0, 0.0];
+    double opacitySum = 0.0;
     for (final index in order) {
       final row = rowForIndex[index];
-      if (row != null) sampleRows.add(row);
-      if (sampleRows.length == sampleSize) break;
+      if (row == null) continue;
+      if (sampleRows.length < sampleSize) sampleRows.add(row);
+      for (int axis = 0; axis < 3; axis++) {
+        totals[axis] += base.centers[row * 3 + axis];
+      }
+      opacitySum += base.opacity[row];
     }
 
     List<Object?> rows(Float64List values, int width) => <Object?>[
@@ -340,19 +346,10 @@ Map<String, Object?> _objectsAndStates(
 
     // Accumulated in scalars rather than through a live-count-sized list per
     // axis: a large object scene would otherwise pay peak memory proportional to
-    // the decoded state purely to report a sum. Summed in row order, which is
-    // the canonical gaussian order these rows were built in.
-    final totals = <double>[0.0, 0.0, 0.0];
-    for (int row = 0; row < base.count; row++) {
-      for (int axis = 0; axis < 3; axis++) {
-        totals[axis] += base.centers[row * 3 + axis];
-      }
-    }
+    // the decoded state purely to report a sum. The loop above follows content
+    // order rather than resident row order because floating-point addition is
+    // not associative.
     final positionSum = <Object?>[for (final total in totals) num6(total)];
-    double opacitySum = 0.0;
-    for (final value in base.opacity) {
-      opacitySum += value;
-    }
 
     states.add(<String, Object?>{
       't': num6(t),
@@ -626,24 +623,38 @@ Map<String, Object?>? _sphericalHarmonics(
 /// Chunking and Morton ordering are encoder choices, so decoded order is not
 /// part of the contract — but a comparison needs *some* order. The key is the
 /// gaussian's whole decoded state, rounded exactly as the summary rounds it,
-/// with its spherical harmonic coefficients last. Two gaussians that tie on all
-/// of it are identical in every value this summary emits, so their relative
-/// order cannot change the output.
+/// followed by exact decoded floats as a final content tiebreaker. Spherical
+/// harmonic coefficients and object membership keep their existing positions
+/// before that tiebreaker, so rows that never tied retain their existing order.
+/// Two gaussians that tie on the exact values are identical in everything this
+/// summary composes or emits, so their relative order cannot change the output.
 List<int> _stableOrder(FourdgsGaussianSet g) {
   final sh = g.sh;
   final shWidth = sh == null ? 0 : g.shCoefficients * 3;
   final keys = <(List<double>, int)>[];
   for (int i = 0; i < g.count; i++) {
-    final row = <double>[
-      for (int k = 0; k < 3; k++) _sortable(g.positions[i * 3 + k]),
-      for (int k = 0; k < 3; k++) _sortable(g.scales[i * 3 + k]),
-      for (int k = 0; k < 4; k++) _sortable(g.rotations[i * 4 + k]),
-      for (int k = 0; k < 4; k++) _sortable(g.colors[i * 4 + k]),
-      for (int k = 0; k < 3; k++) _sortable(g.motions[i * 3 + k]),
-      _sortable(g.muT[i]),
-      _sortable(g.sigmaT[i]),
-      _sortable(g.winLo[i]),
-      _sortable(g.winHi[i]),
+    final row = <double>[];
+    for (final (array, width) in <(Float32List, int)>[
+      (g.positions, 3),
+      (g.scales, 3),
+      (g.rotations, 4),
+      (g.colors, 4),
+      (g.motions, 3),
+    ]) {
+      for (int k = 0; k < width; k++) {
+        final value = array[i * width + k];
+        row.add(_sortable(value));
+      }
+    }
+    for (final value in <double>[
+      g.muT[i],
+      g.sigmaT[i],
+      g.winLo[i],
+      g.winHi[i],
+    ]) {
+      row.add(_sortable(value));
+    }
+    row.addAll(<double>[
       if (sh != null)
         for (int k = 0; k < shWidth; k++) sh[i * shWidth + k].toDouble(),
       // Membership joins the key, after the harmonics and before the index
@@ -653,7 +664,7 @@ List<int> _stableOrder(FourdgsGaussianSet g) {
       // it, would be ordered by decode order, which differs between two correct
       // readers that chunked the scene differently.
       if (g.objectId != null) g.objectId![i].toDouble(),
-    ];
+    ]);
     keys.add((row, i));
   }
   // Ties broken by original index. Dart's sort is not stable and Python's is;
@@ -664,6 +675,10 @@ List<int> _stableOrder(FourdgsGaussianSet g) {
       final y = b.$1[k];
       if (x != y) return x < y ? -1 : 1;
     }
+    // Exact decoded fields are only a final tiebreaker. Comparing them lazily
+    // keeps that guarantee without retaining another 42 doubles per gaussian.
+    final exact = _compareExactRows(g, a.$2, b.$2);
+    if (exact != 0) return exact;
     return a.$2.compareTo(b.$2);
   });
   return <int>[for (final k in keys) k.$2];
@@ -675,4 +690,53 @@ double _sortable(double value) {
   if (value.isNaN) return double.infinity;
   if (value.isInfinite) return value;
   return double.parse(value.toStringAsFixed(floatDecimals));
+}
+
+int _compareExactRows(FourdgsGaussianSet g, int a, int b) {
+  var compared = _compareExactArray(g.positions, 3, a, b);
+  if (compared != 0) return compared;
+  compared = _compareExactArray(g.scales, 3, a, b);
+  if (compared != 0) return compared;
+  compared = _compareExactArray(g.rotations, 4, a, b);
+  if (compared != 0) return compared;
+  compared = _compareExactArray(g.colors, 4, a, b);
+  if (compared != 0) return compared;
+  compared = _compareExactArray(g.motions, 3, a, b);
+  if (compared != 0) return compared;
+  compared = _compareExactValue(g.muT[a], g.muT[b]);
+  if (compared != 0) return compared;
+  compared = _compareExactValue(g.sigmaT[a], g.sigmaT[b]);
+  if (compared != 0) return compared;
+  compared = _compareExactValue(g.winLo[a], g.winLo[b]);
+  if (compared != 0) return compared;
+  compared = _compareExactValue(g.winHi[a], g.winHi[b]);
+  if (compared != 0) return compared;
+  return 0;
+}
+
+int _compareExactArray(Float32List values, int width, int a, int b) {
+  for (int k = 0; k < width; k++) {
+    final compared = _compareExactValue(
+      values[a * width + k],
+      values[b * width + k],
+    );
+    if (compared != 0) return compared;
+  }
+  return 0;
+}
+
+/// A total order for exact decoded floats after their rounded keys tie.
+int _compareExactValue(double a, double b) {
+  final aKind = _exactKind(a);
+  final bKind = _exactKind(b);
+  if (aKind != bKind) return aKind.compareTo(bKind);
+  if (aKind != 1 || a == b) return 0;
+  return a < b ? -1 : 1;
+}
+
+int _exactKind(double value) {
+  if (value.isNaN) return 3;
+  if (value == double.negativeInfinity) return 0;
+  if (value == double.infinity) return 2;
+  return 1;
 }
