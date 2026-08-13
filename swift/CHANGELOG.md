@@ -6,6 +6,14 @@ All notable changes to the Swift package are documented here, following
 
 ## [Unreleased]
 
+### Fixed
+
+- Canonical summaries use exact decoded floats as the final tiebreaker after the established
+  rounded, spherical-harmonic, and object-membership key. Permuting rows that differ only below the
+  six-decimal summary precision can no longer change which composed state appears in the sample.
+- Canonical floating-point output normalizes signed zero after six-decimal rounding, so permuting
+  otherwise equivalent rows cannot expose whether a decoded component carried `-0.0` or `+0.0`.
+
 ### Added
 
 - **Encoding the `keyframe-delta` temporal model**, turning the Swift cell of that row from Planned
