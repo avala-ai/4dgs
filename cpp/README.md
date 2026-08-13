@@ -93,9 +93,12 @@ tree nor Cargo, and the core path stays valid if the install prefix moves.
 
 This package is a binding over the Rust core's C ABI rather than a second decoder. A source fetch
 contains that crate, and `FOURDGS_BUILD_CORE_FROM_SOURCE` defaults to `ON` for CPM, FetchContent and
-`add_subdirectory` consumers. It runs the equivalent of `cargo build -p fourdgs --release` with an
-isolated target directory under the CMake build, then makes the C++ library depend on and link the
-result. Building the same checkout at two revisions cannot make them share one `target/` tree.
+`add_subdirectory` consumers. It runs the equivalent of
+`cargo build -p fourdgs --release --target <triple>` with an isolated target directory under the
+CMake build, then makes the C++ library depend on and link the result. A native build derives the
+triple from `cargo -vV`; a cross build must name the toolchain's Rust triple with
+`FOURDGS_CARGO_TARGET`, so it cannot silently build a host archive for a target linker. Building the
+same checkout at two revisions cannot make them share one `target/` tree.
 
 A consumer that already has a core can skip that build by naming it. The header defaults to the one
 in a fetched repository; a vendored copy of `cpp/` alone supplies both paths:
@@ -104,6 +107,11 @@ in a fetched repository; a vendored copy of `cpp/` alone supplies both paths:
 | ------------------------- | -------------------------------------------------------------------------- |
 | `FOURDGS_CORE_HEADER_DIR` | the directory holding `fourdgs.h`                                          |
 | `FOURDGS_CORE_LIBRARY`    | `libfourdgs.a` (or `fourdgs.lib`), from `cargo build -p fourdgs --release` |
+| `FOURDGS_CARGO_TARGET`    | Rust target triple matching a cross-compiling CMake toolchain              |
+
+On MSVC the Rust static library uses the dynamic release runtime. The exported CMake target carries
+that requirement into Debug consumers too (`/MD`, not `/MDd`), because C++ strings and vectors cross
+the binding's public boundary and allocator mismatches are not link-only problems.
 
 `FOURDGS_BUILD_CORE_FROM_SOURCE=OFF` plus `FOURDGS_ALLOW_NO_CORE=ON` remains the deliberate
 no-decoder build: it compiles and every decode call returns `kNotImplemented`. The two options are

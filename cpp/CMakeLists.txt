@@ -127,12 +127,39 @@ if(FOURDGS_BUILD_CORE_FROM_SOURCE AND FOURDGS_CORE_LIBRARY STREQUAL "")
   endif()
 
   find_program(FOURDGS_CARGO_EXECUTABLE cargo REQUIRED)
+  set(FOURDGS_CARGO_TARGET
+      ""
+      CACHE STRING "Rust target triple used when CMake builds the core from source")
+  if(FOURDGS_CARGO_TARGET STREQUAL "")
+    if(CMAKE_CROSSCOMPILING)
+      message(
+        FATAL_ERROR
+          "FOURDGS_BUILD_CORE_FROM_SOURCE is cross-compiling, so the Rust target cannot be "
+          "inferred from the host. Set -DFOURDGS_CARGO_TARGET=<Rust target triple> to the "
+          "target matching the CMake toolchain (for example aarch64-unknown-linux-gnu).")
+    endif()
+    execute_process(
+      COMMAND "${FOURDGS_CARGO_EXECUTABLE}" -vV
+      OUTPUT_VARIABLE FOURDGS_CARGO_VERSION
+      RESULT_VARIABLE FOURDGS_CARGO_VERSION_RESULT
+      OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(NOT FOURDGS_CARGO_VERSION_RESULT EQUAL 0
+       OR NOT FOURDGS_CARGO_VERSION MATCHES "(^|\n)host: ([^\n]+)")
+      message(
+        FATAL_ERROR
+          "Could not determine Cargo's host target from `cargo -vV`; set "
+          "-DFOURDGS_CARGO_TARGET=<Rust target triple> explicitly.")
+    endif()
+    set(FOURDGS_CARGO_TARGET "${CMAKE_MATCH_2}")
+  endif()
   set(FOURDGS_CORE_SOURCE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
   set(FOURDGS_CORE_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/rust-core")
   if(MSVC)
-    set(FOURDGS_GENERATED_CORE_LIBRARY "${FOURDGS_CORE_TARGET_DIR}/release/fourdgs.lib")
+    set(FOURDGS_GENERATED_CORE_LIBRARY
+        "${FOURDGS_CORE_TARGET_DIR}/${FOURDGS_CARGO_TARGET}/release/fourdgs.lib")
   else()
-    set(FOURDGS_GENERATED_CORE_LIBRARY "${FOURDGS_CORE_TARGET_DIR}/release/libfourdgs.a")
+    set(FOURDGS_GENERATED_CORE_LIBRARY
+        "${FOURDGS_CORE_TARGET_DIR}/${FOURDGS_CARGO_TARGET}/release/libfourdgs.a")
   endif()
 
   file(GLOB_RECURSE FOURDGS_CORE_RUST_SOURCES CONFIGURE_DEPENDS
@@ -145,7 +172,8 @@ if(FOURDGS_BUILD_CORE_FROM_SOURCE AND FOURDGS_CORE_LIBRARY STREQUAL "")
       # CMake advertised file descriptors it could not inherit. Ninja does not set it.
       "${CMAKE_COMMAND}" -E env "CARGO_TARGET_DIR=${FOURDGS_CORE_TARGET_DIR}" "MAKEFLAGS="
       "${FOURDGS_CARGO_EXECUTABLE}" build --manifest-path
-      "${FOURDGS_CORE_SOURCE_ROOT}/Cargo.toml" --package fourdgs --release
+      "${FOURDGS_CORE_SOURCE_ROOT}/Cargo.toml" --package fourdgs --release --target
+      "${FOURDGS_CARGO_TARGET}"
     DEPENDS
       "${FOURDGS_CORE_SOURCE_ROOT}/Cargo.toml"
       "${FOURDGS_CORE_SOURCE_ROOT}/rust/fourdgs/Cargo.toml"
@@ -283,6 +311,15 @@ target_include_directories(
 # this directory's targets, but it does not tell a FetchContent or installed-package
 # consumer which language level the headers require.
 target_compile_features(fourdgs-cpp PUBLIC cxx_std_17)
+
+# Cargo's MSVC staticlib is built with the dynamic release CRT even in a CMake Debug
+# configuration. Compile this binding and Debug consumers with the same /MD runtime: the
+# public C++ API crosses std::string and vector ownership boundaries, so merely suppressing
+# LNK2038 would still leave an allocator mismatch. Release already defaults to /MD.
+if(MSVC AND FOURDGS_HAVE_CORE)
+  set_property(TARGET fourdgs-cpp PROPERTY MSVC_RUNTIME_LIBRARY MultiThreadedDLL)
+  target_compile_options(fourdgs-cpp PUBLIC "$<$<CONFIG:Debug>:/MD>")
+endif()
 
 if(MSVC)
   target_compile_options(fourdgs-cpp PRIVATE /W4)
@@ -433,6 +470,17 @@ if(FOURDGS_BUILD_TESTS)
   endif()
 endif()
 
+# GNUInstallDirs converts an untyped command-line cache value with file(TO_CMAKE_PATH),
+# whose input is a path *list*. On POSIX that would split a legal colon in an absolute
+# libdir into a CMake semicolon list before this package ever sees it. Mark the supplied
+# scalar as a PATH without rewriting its bytes; the Windows-only normalization below
+# handles native backslashes after the module has defined the defaulted case.
+if(DEFINED CMAKE_INSTALL_LIBDIR)
+  get_property(FOURDGS_INSTALL_LIBDIR_CACHE_TYPE CACHE CMAKE_INSTALL_LIBDIR PROPERTY TYPE)
+  if(FOURDGS_INSTALL_LIBDIR_CACHE_TYPE STREQUAL "UNINITIALIZED")
+    set_property(CACHE CMAKE_INSTALL_LIBDIR PROPERTY TYPE PATH)
+  endif()
+endif()
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
@@ -442,7 +490,9 @@ set(FOURDGS_INSTALL_COREDIR ${CMAKE_INSTALL_LIBDIR}/fourdgs-cpp/core)
 # accepted as an install destination, but embedding it in the generated config turns
 # sequences such as `\a` into invalid CMake escapes. PATH_VARS handles absolute versus
 # prefix-relative placement; give it CMake's portable slash spelling to embed.
-file(TO_CMAKE_PATH "${FOURDGS_INSTALL_COREDIR}" FOURDGS_INSTALL_COREDIR)
+if(CMAKE_HOST_WIN32)
+  file(TO_CMAKE_PATH "${FOURDGS_INSTALL_COREDIR}" FOURDGS_INSTALL_COREDIR)
+endif()
 
 if(FOURDGS_BUILD_TOOL)
   install(TARGETS fourdgs-cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

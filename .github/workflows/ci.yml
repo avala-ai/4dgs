@@ -641,14 +641,37 @@ jobs:
       - name: A fresh out-of-tree consumer builds and links the core
         run: |
           git update-ref refs/heads/cmake-consumer-test HEAD
+          consumer_config="$FOURDGS_CMAKE_CONFIG"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # The source-built Rust archive always uses /MD. Exercise a normal Debug
+            # consumer here so the target's exported /MD requirement, rather than this
+            # workflow's top-level Release workaround, proves the CRTs agree.
+            consumer_config=Debug
+          fi
           cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-consumer" \
-            -DCMAKE_BUILD_TYPE="$FOURDGS_CMAKE_CONFIG" \
+            -DCMAKE_BUILD_TYPE="$consumer_config" \
             -DFOURDGS_GIT_REPOSITORY="file://$GITHUB_WORKSPACE" \
             -DFOURDGS_GIT_TAG=cmake-consumer-test
           cmake --build "$RUNNER_TEMP/fourdgs-consumer" \
-            --config "$FOURDGS_CMAKE_CONFIG" -j
+            --config "$consumer_config" -j
           ctest --test-dir "$RUNNER_TEMP/fourdgs-consumer" \
-            --build-config "$FOURDGS_CMAKE_CONFIG" --output-on-failure
+            --build-config "$consumer_config" --output-on-failure
+
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            # A CMake toolchain changes the target independently of Cargo's host. Without
+            # an explicit Rust triple this must stop at configure time, before producing
+            # a host archive that fails much later in the cross-linker.
+            cross_log="$RUNNER_TEMP/fourdgs-cross-no-target.log"
+            if cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-cross-no-target" \
+              -DCMAKE_SYSTEM_NAME=Linux \
+              -DFOURDGS_SOURCE_DIR="$GITHUB_WORKSPACE" >"$cross_log" 2>&1; then
+              cat "$cross_log"
+              echo "::error::cross-compiling without FOURDGS_CARGO_TARGET configured"
+              exit 1
+            fi
+            cat "$cross_log"
+            grep -q FOURDGS_CARGO_TARGET "$cross_log"
+          fi
 
       # Exercise the package that `cmake --install` actually emits. An absolute libdir is
       # intentional: packagers use one, and configure_package_config_file must not prefix
@@ -662,19 +685,28 @@ jobs:
             core="$GITHUB_WORKSPACE/target/release/libfourdgs.a"
           fi
           install_root="$RUNNER_TEMP/fourdgs-install"
+          install_libdir="$install_root/lib"
+          consumer_generator=()
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            # A colon is a legal POSIX filename character. Preserve it as one path rather
+            # than feeding it to file(TO_CMAKE_PATH), which treats it as a path-list split.
+            install_libdir="$RUNNER_TEMP/fourdgs:install/lib"
+            consumer_generator=(-G Ninja)
+          fi
           cmake -S cpp -B "$RUNNER_TEMP/fourdgs-package" \
             -DCMAKE_BUILD_TYPE="$FOURDGS_CMAKE_CONFIG" \
             -DCMAKE_INSTALL_PREFIX="$install_root" \
-            -DCMAKE_INSTALL_LIBDIR="$install_root/lib" \
+            -DCMAKE_INSTALL_LIBDIR="$install_libdir" \
             -DFOURDGS_CORE_LIBRARY="$core"
           cmake --build "$RUNNER_TEMP/fourdgs-package" \
             --config "$FOURDGS_CMAKE_CONFIG" -j
           cmake --install "$RUNNER_TEMP/fourdgs-package" \
             --config "$FOURDGS_CMAKE_CONFIG"
-          cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-installed-consumer" \
+          cmake "${consumer_generator[@]}" \
+            -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-installed-consumer" \
             -DCMAKE_BUILD_TYPE="$FOURDGS_CMAKE_CONFIG" \
             -DFOURDGS_USE_INSTALLED_PACKAGE=ON \
-            -Dfourdgs-cpp_DIR="$install_root/lib/cmake/fourdgs-cpp"
+            -Dfourdgs-cpp_DIR="$install_libdir/cmake/fourdgs-cpp"
           cmake --build "$RUNNER_TEMP/fourdgs-installed-consumer" \
             --config "$FOURDGS_CMAKE_CONFIG" -j
           ctest --test-dir "$RUNNER_TEMP/fourdgs-installed-consumer" \
