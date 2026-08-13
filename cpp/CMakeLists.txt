@@ -438,6 +438,11 @@ include(CMakePackageConfigHelpers)
 
 set(FOURDGS_INSTALL_CMAKEDIR ${CMAKE_INSTALL_LIBDIR}/cmake/fourdgs-cpp)
 set(FOURDGS_INSTALL_COREDIR ${CMAKE_INSTALL_LIBDIR}/fourdgs-cpp/core)
+# An absolute Windows GNUInstallDirs value can arrive as `D:\path`. That spelling is
+# accepted as an install destination, but embedding it in the generated config turns
+# sequences such as `\a` into invalid CMake escapes. PATH_VARS handles absolute versus
+# prefix-relative placement; give it CMake's portable slash spelling to embed.
+file(TO_CMAKE_PATH "${FOURDGS_INSTALL_COREDIR}" FOURDGS_INSTALL_COREDIR)
 
 if(FOURDGS_BUILD_TOOL)
   install(TARGETS fourdgs-cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
