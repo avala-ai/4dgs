@@ -130,13 +130,41 @@ if(FOURDGS_BUILD_CORE_FROM_SOURCE AND FOURDGS_CORE_LIBRARY STREQUAL "")
   set(FOURDGS_CARGO_TARGET
       ""
       CACHE STRING "Rust target triple used when CMake builds the core from source")
-  if(FOURDGS_CARGO_TARGET STREQUAL "")
-    if(CMAKE_CROSSCOMPILING)
+
+  # CMAKE_CROSSCOMPILING catches a different target system, but not every different
+  # target architecture. Visual Studio's -A and CMAKE_OSX_ARCHITECTURES can select an
+  # architecture on the host OS while leaving CMAKE_CROSSCOMPILING false. Cargo would
+  # then build its host triple and hand the linker an incompatible archive. Require the
+  # consumer to join those two independently-selected toolchains explicitly.
+  set(FOURDGS_CARGO_TARGET_REQUIRED_REASON "")
+  if(CMAKE_CROSSCOMPILING)
+    set(FOURDGS_CARGO_TARGET_REQUIRED_REASON
+        "CMake is cross-compiling to ${CMAKE_SYSTEM_NAME}/${CMAKE_SYSTEM_PROCESSOR}")
+  elseif(MSVC AND NOT "${CMAKE_GENERATOR_PLATFORM}" STREQUAL "")
+    set(FOURDGS_CARGO_TARGET_REQUIRED_REASON
+        "the Visual Studio generator selects architecture ${CMAKE_GENERATOR_PLATFORM}")
+  elseif(APPLE AND NOT "${CMAKE_OSX_ARCHITECTURES}" STREQUAL "")
+    set(FOURDGS_OSX_ARCHITECTURES ${CMAKE_OSX_ARCHITECTURES})
+    list(LENGTH FOURDGS_OSX_ARCHITECTURES FOURDGS_OSX_ARCHITECTURE_COUNT)
+    if(FOURDGS_OSX_ARCHITECTURE_COUNT GREATER 1)
       message(
         FATAL_ERROR
-          "FOURDGS_BUILD_CORE_FROM_SOURCE is cross-compiling, so the Rust target cannot be "
-          "inferred from the host. Set -DFOURDGS_CARGO_TARGET=<Rust target triple> to the "
-          "target matching the CMake toolchain (for example aarch64-unknown-linux-gnu).")
+          "FOURDGS_BUILD_CORE_FROM_SOURCE cannot produce one universal Rust archive for "
+          "CMAKE_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES}. Build one core per architecture "
+          "and combine them before configuring, then pass the result as FOURDGS_CORE_LIBRARY.")
+    endif()
+    set(FOURDGS_CARGO_TARGET_REQUIRED_REASON
+        "CMAKE_OSX_ARCHITECTURES selects ${CMAKE_OSX_ARCHITECTURES}")
+  endif()
+
+  if(FOURDGS_CARGO_TARGET STREQUAL "")
+    if(NOT FOURDGS_CARGO_TARGET_REQUIRED_REASON STREQUAL "")
+      message(
+        FATAL_ERROR
+          "${FOURDGS_CARGO_TARGET_REQUIRED_REASON}, so Cargo's host target cannot safely be "
+          "used. Set -DFOURDGS_CARGO_TARGET=<Rust target triple> to the target matching the "
+          "CMake architecture (for example aarch64-unknown-linux-gnu or "
+          "aarch64-apple-darwin).")
     endif()
     execute_process(
       COMMAND "${FOURDGS_CARGO_EXECUTABLE}" -vV

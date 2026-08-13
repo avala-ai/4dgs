@@ -657,7 +657,48 @@ jobs:
           ctest --test-dir "$RUNNER_TEMP/fourdgs-consumer" \
             --build-config "$consumer_config" --output-on-failure
 
-          if [ "$RUNNER_OS" = "Linux" ]; then
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # Visual Studio can target another architecture on the same OS without
+            # setting CMAKE_CROSSCOMPILING. The source build must not quietly keep
+            # Cargo's x64 host archive for an ARM64 C++ link.
+            architecture_log="$RUNNER_TEMP/fourdgs-vs-arm64-no-target.log"
+            if cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-vs-arm64-no-target" \
+              -A ARM64 \
+              -DFOURDGS_SOURCE_DIR="$GITHUB_WORKSPACE" >"$architecture_log" 2>&1; then
+              cat "$architecture_log"
+              echo "::error::Visual Studio ARM64 configured without FOURDGS_CARGO_TARGET"
+              exit 1
+            fi
+            cat "$architecture_log"
+            grep -q FOURDGS_CARGO_TARGET "$architecture_log"
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            # CMAKE_OSX_ARCHITECTURES likewise does not make CMAKE_CROSSCOMPILING true.
+            # A selected thin architecture requires an explicit matching Rust triple.
+            architecture_log="$RUNNER_TEMP/fourdgs-macos-arm64-no-target.log"
+            if cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-macos-arm64-no-target" \
+              -DCMAKE_OSX_ARCHITECTURES=arm64 \
+              -DFOURDGS_SOURCE_DIR="$GITHUB_WORKSPACE" >"$architecture_log" 2>&1; then
+              cat "$architecture_log"
+              echo "::error::macOS arm64 configured without FOURDGS_CARGO_TARGET"
+              exit 1
+            fi
+            cat "$architecture_log"
+            grep -q FOURDGS_CARGO_TARGET "$architecture_log"
+
+            # One Cargo target produces a thin archive. Even an explicit triple cannot
+            # satisfy a universal C++ build; require a pre-combined core instead.
+            universal_log="$RUNNER_TEMP/fourdgs-macos-universal.log"
+            if cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-macos-universal" \
+              -DCMAKE_OSX_ARCHITECTURES='x86_64;arm64' \
+              -DFOURDGS_CARGO_TARGET=aarch64-apple-darwin \
+              -DFOURDGS_SOURCE_DIR="$GITHUB_WORKSPACE" >"$universal_log" 2>&1; then
+              cat "$universal_log"
+              echo "::error::a universal macOS build accepted one thin Rust target"
+              exit 1
+            fi
+            cat "$universal_log"
+            grep -q 'cannot produce one universal Rust archive' "$universal_log"
+          elif [ "$RUNNER_OS" = "Linux" ]; then
             # A CMake toolchain changes the target independently of Cargo's host. Without
             # an explicit Rust triple this must stop at configure time, before producing
             # a host archive that fails much later in the cross-linker.
