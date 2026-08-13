@@ -129,6 +129,28 @@ function supportK(cutoff: number): number {
   return Math.sqrt(-2 * Math.log(cutoff));
 }
 
+const adjacentFloat = new DataView(new ArrayBuffer(8));
+
+/** The adjacent binary64 value toward positive infinity. */
+function nextUp(value: number): number {
+  if (Number.isNaN(value) || value === Infinity) return value;
+  if (value === 0) return Number.MIN_VALUE;
+  adjacentFloat.setFloat64(0, value);
+  const bits = adjacentFloat.getBigUint64(0);
+  adjacentFloat.setBigUint64(0, value > 0 ? bits + 1n : bits - 1n);
+  return adjacentFloat.getFloat64(0);
+}
+
+/** The adjacent binary64 value toward negative infinity. */
+function nextDown(value: number): number {
+  if (Number.isNaN(value) || value === -Infinity) return value;
+  if (value === 0) return -Number.MIN_VALUE;
+  adjacentFloat.setFloat64(0, value);
+  const bits = adjacentFloat.getBigUint64(0);
+  adjacentFloat.setBigUint64(0, value > 0 ? bits - 1n : bits + 1n);
+  return adjacentFloat.getFloat64(0);
+}
+
 /**
  * Round half to even, the rule every attribute grid but rotation uses.
  *
@@ -584,16 +606,30 @@ interface Plan {
   members: number[];
 }
 
-function support(g: GaussianInput, cutoff: number): { lo: number[]; hi: number[] } {
-  const k = supportK(cutoff);
-  const lo = new Array<number>(g.count);
-  const hi = new Array<number>(g.count);
-  for (let i = 0; i < g.count; i++) {
-    const sigma = g.sigmaT[i]!;
-    const mu = g.muT[i]!;
-    const half = Number.isFinite(sigma) ? k * sigma : Infinity;
-    lo[i] = Math.max(mu - half, g.winLo[i]!);
-    hi[i] = Math.min(mu + half, g.winHi[i]!);
+/** Containment bounds for the public temporal state this file reconstructs. */
+function planningSupport(q: Quantized, cutoff: number): { lo: number[]; hi: number[] } {
+  const lo = new Array<number>(q.mu.length);
+  const hi = new Array<number>(q.mu.length);
+  const marginalFloor = nextDown(cutoff);
+  // `stateAt` rounds subtraction and division before the marginal comparison. Gamma(2)
+  // bounds those two binary64 operations in ratio space.
+  const unitRoundoff = Number.EPSILON / 2;
+  const arithmeticGuard = (2 * unitRoundoff) / (1 - 2 * unitRoundoff);
+  for (let i = 0; i < q.mu.length; i++) {
+    const neverFades = (q.flags[i]! & 1) !== 0;
+    const sigma = neverFades ? Infinity : Math.fround(Math.exp(q.sigma[i]! * q.steps.sigmaLog));
+    const tStep = muStep(q.sigma[i]!, q.steps.sigmaLog, neverFades, q.grid.stepTime);
+    const mu = Math.fround(q.mu[i]! * tStep);
+    const half =
+      neverFades || marginalFloor === 0
+        ? Infinity
+        : nextUp(supportK(marginalFloor) * Math.max(sigma, 1e-30) * (1 + arithmeticGuard));
+    const [storedLo, storedHi] = q.windows[q.windowIndex[i]!]!;
+    // Window records are f64, while the public GaussianSet lanes used by `stateAt` are f32.
+    const windowLo = Math.fround(storedLo);
+    const windowHi = Math.fround(storedHi);
+    lo[i] = Math.max(nextDown(mu - half), windowLo);
+    hi[i] = Math.min(nextUp(mu + half), windowHi);
   }
   return { lo, hi };
 }
@@ -847,7 +883,7 @@ export async function encodeScene(
   let topsArr = Array.from(tops).sort((a, b) => a - b);
   if (topsArr.length < 2) topsArr = [0, Math.max(durationSec, 1e-9)];
 
-  const { lo, hi } = support(gaussians, cutoff);
+  const { lo, hi } = planningSupport(q, cutoff);
   let plans = n === 0 ? [] : planChunks(lo, hi, topsArr, maxDepth, minChunk);
   if (n > 0 && plans.length === 0) {
     plans = [
@@ -1044,6 +1080,7 @@ export async function encodeScene(
       }
       out.bytes(record(OP_CHUNK_INDEX, e.finish()));
     }
+    const indexGroupLength = out.length - groupStart;
     if (writeStatistics) {
       const s = new ByteWriter();
       s.u64(n);
@@ -1057,7 +1094,7 @@ export async function encodeScene(
       const s = new ByteWriter();
       s.u8(OP_CHUNK_INDEX);
       s.u64(groupStart);
-      s.u64(out.length - groupStart);
+      s.u64(indexGroupLength);
       out.bytes(record(OP_SUMMARY_OFFSET, s.finish()));
     }
     summaryLen = out.length - summaryStart;

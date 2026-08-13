@@ -8,6 +8,13 @@ The four packages version together.
 
 ## [Unreleased]
 
+### Fixed
+
+- The Gaussian-birth writer plans chunks from reconstructed temporal values and contains the full
+  rounded-visible marginal plateau, so an indexed seek cannot miss a Gaussian that the complete
+  decoded state reports as visible at the same instant.
+- Summary Offsets emitted with Statistics now frame only the Chunk Index records they name.
+
 ## [0.5.0] - 2026-08-12
 
 ### Added

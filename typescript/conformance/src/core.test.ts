@@ -40,6 +40,7 @@ import {
   bandCoefficientRange,
   decodeScene,
   encodeScene,
+  IndexedDecoder,
   checkMagic,
   coefficientsForDegree,
   coefficientsInBand,
@@ -688,6 +689,161 @@ test("the writer rejects an Object Track past the decoder sample ceiling", async
       }),
     /ObjectTrack for object 1 declares 1000001 samples, past the 1000000 ceiling/,
   );
+});
+
+function oneTemporalGaussian(muT: number, sigmaT: number, winHi = 1) {
+  return {
+    count: 1,
+    positions: [0, 0, 0],
+    scales: [0.01, 0.01, 0.01],
+    rotations: [0, 0, 0, 1],
+    colors: [0.5, 0.5, 0.5, 1],
+    motions: [0, 0, 0],
+    muT: [muT],
+    sigmaT: [sigmaT],
+    winLo: [0],
+    winHi: [winHi],
+  };
+}
+
+function adjacent(value: number, upward: boolean): number {
+  const view = new DataView(new ArrayBuffer(8));
+  view.setFloat64(0, value);
+  const bits = view.getBigUint64(0);
+  const increment = upward ? value > 0 : value < 0;
+  view.setBigUint64(0, increment ? bits + 1n : bits - 1n);
+  return view.getFloat64(0);
+}
+
+async function assertIndexedGaussianVisible(bytes: Uint8Array, t: number): Promise<void> {
+  const full = await decodeScene(new BytesReadable(bytes));
+  assert.equal(full.gaussians.stateAt(t, full.header.cutoff).indices.length, 1);
+  const indexed = await IndexedDecoder.open(new BytesReadable(bytes));
+  const covering = indexed.chunksForTime(t);
+  assert.equal(covering.length, 1, `no indexed chunk covers visible t=${t}`);
+  assert.equal((await indexed.readChunk(covering[0]!)).gaussians.count, 1);
+}
+
+test("chunk planning covers support after temporal quantization", async () => {
+  const cutoff = Math.exp(-0.5);
+  const gaussian = oneTemporalGaussian(0.2541, 0.2452);
+  const bytes = await encodeScene(gaussian, 1, {
+    cutoff,
+    maxDepth: 1,
+    minChunkGaussians: 1,
+  });
+  const decoded = await decodeScene(new BytesReadable(bytes));
+
+  assert.ok(gaussian.muT[0]! + gaussian.sigmaT[0]! < 0.5);
+  assert.ok(Math.abs(decoded.gaussians.muT[0]! - 0.256) < 1e-7);
+  assert.ok(Math.abs(decoded.gaussians.sigmaT[0]! - 0.25002763) < 1e-7);
+  await assertIndexedGaussianVisible(bytes, 0.5);
+});
+
+test("an inclusive support endpoint stays in an indexed half-open chunk", async () => {
+  const cutoff = Math.exp(-0.5);
+  const gaussian = oneTemporalGaussian(0.2541, 0.2452);
+  const seed = await encodeScene(gaussian, 1, { cutoff, maxDepth: 0 });
+  const reconstructed = await decodeScene(new BytesReadable(seed));
+  const boundary = reconstructed.gaussians.muT[0]! + reconstructed.gaussians.sigmaT[0]!;
+  const duration = 2 * boundary;
+  gaussian.winHi[0] = duration;
+
+  const bytes = await encodeScene(gaussian, duration, {
+    cutoff,
+    maxDepth: 1,
+    minChunkGaussians: 1,
+  });
+  const decoded = await decodeScene(new BytesReadable(bytes));
+  const mu = decoded.gaussians.muT[0]!;
+  const sigma = decoded.gaussians.sigmaT[0]!;
+  assert.equal(mu + sigma, boundary);
+  assert.ok(Math.exp(-0.5 * ((boundary - mu) / sigma) ** 2) >= cutoff);
+  await assertIndexedGaussianVisible(bytes, boundary);
+});
+
+test("rounded visibility below a lower support endpoint stays indexed", async () => {
+  const cutoff = 0.9;
+  const gaussian = oneTemporalGaussian(0.5, 1);
+  const seed = await encodeScene(gaussian, 1, { cutoff, maxDepth: 0 });
+  const reconstructed = await decodeScene(new BytesReadable(seed));
+  const mu = reconstructed.gaussians.muT[0]!;
+  const sigma = reconstructed.gaussians.sigmaT[0]!;
+  const boundary = mu - supportK(cutoff) * sigma;
+  const duration = 2 * boundary;
+  gaussian.winHi[0] = duration;
+
+  const bytes = await encodeScene(gaussian, duration, {
+    cutoff,
+    maxDepth: 1,
+    minChunkGaussians: 1,
+  });
+  const below = adjacent(boundary, false);
+  const z = (below - mu) / sigma;
+  assert.ok(Math.exp(-0.5 * z * z) >= cutoff);
+  await assertIndexedGaussianVisible(bytes, below);
+});
+
+test("cutoff one planning covers both binary64 neighbors of the mean", async () => {
+  const bytes = await encodeScene(oneTemporalGaussian(0.5, 0.1), 1, {
+    cutoff: 1,
+    maxDepth: 1,
+    minChunkGaussians: 1,
+  });
+  const decoded = await decodeScene(new BytesReadable(bytes));
+  const mean = decoded.gaussians.muT[0]!;
+
+  await assertIndexedGaussianVisible(bytes, adjacent(mean, false));
+  await assertIndexedGaussianVisible(bytes, adjacent(mean, true));
+});
+
+test("chunk planning covers a cancellation-prone rounded visibility endpoint", async () => {
+  const cutoff = 0.5;
+  const endpoint = 6_042_103.559_942_351;
+  const gaussian = oneTemporalGaussian(-6_222_906, 10_416_940, 20_000_000);
+  const bytes = await encodeScene(gaussian, 2 * endpoint, {
+    cutoff,
+    maxDepth: 1,
+    minChunkGaussians: 1,
+  });
+  const decoded = await decodeScene(new BytesReadable(bytes));
+  const mu = decoded.gaussians.muT[0]!;
+  const sigma = decoded.gaussians.sigmaT[0]!;
+  const z = (endpoint - mu) / Math.max(sigma, 1e-30);
+
+  assert.equal(mu, -6_222_906);
+  assert.equal(sigma, 10_416_940);
+  assert.equal(Math.exp(-0.5 * z * z), cutoff);
+  await assertIndexedGaussianVisible(bytes, endpoint);
+});
+
+test("the Chunk Index Summary Offset excludes following Statistics", async () => {
+  const bytes = await encodeScene(oneTemporalGaussian(0.5, 0.1), 1, {
+    writeIndex: true,
+    writeStatistics: true,
+    writeSummaryOffsets: true,
+  });
+  const scene = await decodeScene(new BytesReadable(bytes));
+
+  assert.equal(scene.summaryOffsets.length, 1);
+  const summaryOffset = scene.summaryOffsets[0]!;
+  assert.equal(summaryOffset.groupOpcode, Opcode.ChunkIndex);
+  const group = bytes.subarray(
+    summaryOffset.groupStart,
+    summaryOffset.groupStart + summaryOffset.groupLength,
+  );
+  let offset = 0;
+  let records = 0;
+  while (offset < group.length) {
+    assert.equal(group[offset], Opcode.ChunkIndex);
+    const length = Number(
+      new DataView(group.buffer, group.byteOffset + offset + 1, 8).getBigUint64(0, true),
+    );
+    offset += 9 + length;
+    records++;
+  }
+  assert.equal(offset, group.length);
+  assert.ok(records > 0);
 });
 
 /** Little-endian record bytes for the trajectory tests below. */
