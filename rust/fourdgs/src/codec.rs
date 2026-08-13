@@ -34,20 +34,44 @@ pub fn codec_from_name(name: &str) -> Option<u8> {
     }
 }
 
-/// Decompress exactly `expected` bytes, refusing anything that produces more or fewer.
-pub fn decompress(body: &[u8], codec: u8, expected: usize) -> Result<Vec<u8>> {
+/// Check that this build can decode a stream codec without consuming a payload.
+///
+/// Empty Attribute Streams still declare codec semantics. Their decoder fast path has no
+/// compressed bytes to inspect, so callers that preflight a fixed stream header use this to
+/// distinguish a supported empty stream from an extension this build cannot decode.
+pub fn check_decoder(codec: u8) -> Result<()> {
     match codec {
-        DEFLATE => exact(flate2::read::ZlibDecoder::new(body), expected, "deflate"),
-        ZSTD => decompress_zstd(body, expected),
-        // Named, because this is the one a file can trigger: an unknown codec id on a
-        // stream is a conforming file this build cannot read. Its twin below is the
-        // *encoder* refusing its own argument, which no file can cause and the refusal
-        // table therefore does not name.
+        DEFLATE => Ok(()),
+        ZSTD => check_zstd_decoder(),
         other => Err(Error::refused(
             crate::error::refusal::UNKNOWN_STREAM_CODEC,
             crate::error::RefusalKind::UnsupportedCodec,
             format!("stream codec {other} is not a codec this build implements"),
         )),
+    }
+}
+
+#[cfg(feature = "zstd")]
+fn check_zstd_decoder() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(feature = "zstd"))]
+fn check_zstd_decoder() -> Result<()> {
+    Err(Error::refused(
+        crate::error::refusal::UNKNOWN_STREAM_CODEC,
+        crate::error::RefusalKind::UnsupportedCodec,
+        "this file uses zstd streams; rebuild the crate with the 'zstd' feature".into(),
+    ))
+}
+
+/// Decompress exactly `expected` bytes, refusing anything that produces more or fewer.
+pub fn decompress(body: &[u8], codec: u8, expected: usize) -> Result<Vec<u8>> {
+    check_decoder(codec)?;
+    match codec {
+        DEFLATE => exact(flate2::read::ZlibDecoder::new(body), expected, "deflate"),
+        ZSTD => decompress_zstd(body, expected),
+        _ => unreachable!("check_decoder accepted only a defined codec"),
     }
 }
 

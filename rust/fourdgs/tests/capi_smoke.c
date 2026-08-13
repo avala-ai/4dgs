@@ -2,13 +2,8 @@
  * Copyright 2026 Avala AI
  * SPDX-License-Identifier: Apache-2.0
  *
- * A C program that exercises the C ABI the way a binding does.
- *
- * It exists to prove three things a Rust test cannot: that include/fourdgs.h compiles as
- * C, that every symbol it declares actually links, and that the documented null and
- * error behaviour holds when the caller is a C compiler rather than Rust pretending to be
- * one. The C++ and Swift packages bind to this surface, so a drift between the header and
- * the library is their outage, not ours to discover later.
+ * Exercises the C ABI as a binding does: the header compiles as C, every declared symbol
+ * links, and null/error behavior follows the contract.
  *
  * Usage: capi_smoke <file.4dgs>
  */
@@ -50,6 +45,14 @@ static void check_null_safety(void) {
     check(fourdgs_last_error() != NULL, "the last error is never a null pointer");
     check(fourdgs_last_refusal_code(NULL, NULL) == FOURDGS_STATUS_INVALID_ARGUMENT,
           "a null refusal-code out parameter is an invalid argument");
+    check(fourdgs_last_error_offset(NULL, NULL) == FOURDGS_STATUS_INVALID_ARGUMENT,
+          "a null error-offset out parameter is an invalid argument");
+    fourdgs_reader missing_reader = {0};
+    uint64_t declared_count = 0;
+    check(fourdgs_validate_keyframe_delta_reader(missing_reader, FOURDGS_OPEN_INDEXED,
+                                                 NULL, NULL, &declared_count) ==
+              FOURDGS_STATUS_INVALID_ARGUMENT,
+          "the bounded keyframe-delta validator rejects a missing reader");
     check(strcmp(fourdgs_status_message(FOURDGS_STATUS_OK), "ok") == 0,
           "status 0 is named ok");
 }
