@@ -114,6 +114,13 @@ int summaryCrcState(const Handle& handle);
 Result<std::vector<std::uint8_t>> encodeScene(const GaussianView& gaussians, double durationSec,
                                               const WriteOptions& options);
 
+/// Encode a whole `keyframe-delta` file from a sequence of samples (spec §11). Its own
+/// entry point rather than an option on `encodeScene`, because the core's writer for it
+/// takes samples rather than gaussians.
+Result<std::vector<std::uint8_t>> encodeKeyframeDeltaSequence(
+    Span<const KeyframeDeltaSample> samples, double durationSec,
+    const KeyframeDeltaOptions& options);
+
 /// keyframe-delta: a whole-file temporal model an opened scene refuses, decoded through the
 /// core's byte-in / owned-string-out ABI. `peekTemporalModel` names the model without
 /// opening; `keyframeDeltaStatesJson` decodes and returns the canonical states summary the
