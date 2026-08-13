@@ -11,7 +11,8 @@
 # it at run time from an error code. Without a core the library still links and every call
 # returns ErrorCode::kNotImplemented — an honest build, but not a decoder.
 set(fourdgs-cpp_HAVE_CORE @FOURDGS_HAVE_CORE@)
-set(fourdgs-cpp_CORE_LIBRARY "${PACKAGE_PREFIX_DIR}/@FOURDGS_CORE_INSTALL_RELPATH@")
+set(fourdgs-cpp_CORE_LIBRARY
+    "@PACKAGE_FOURDGS_INSTALL_COREDIR@/@FOURDGS_CORE_LIBRARY_FILENAME@")
 
 # The Rust core is not a CMake package, so there is no find_dependency() to write for it.
 # It is installed beside this config, making an installed fourdgs-cpp package self-contained
@@ -29,9 +30,19 @@ endif()
 include("${CMAKE_CURRENT_LIST_DIR}/fourdgs-cpp-targets.cmake")
 
 if(fourdgs-cpp_HAVE_CORE)
+  # The core is one static dependency whose own interface names its platform runtime.
+  # This makes CMake emit `fourdgs-cpp`, then the core archive, then those native
+  # libraries — the left-to-right order required by Unix static linkers.
+  if(NOT TARGET fourdgs::core)
+    add_library(fourdgs::core STATIC IMPORTED)
+    set_target_properties(
+      fourdgs::core
+      PROPERTIES IMPORTED_LOCATION "${fourdgs-cpp_CORE_LIBRARY}"
+                 INTERFACE_LINK_LIBRARIES "@FOURDGS_CORE_NATIVE_LIBRARIES@")
+  endif()
   set_property(
     TARGET fourdgs::fourdgs-cpp APPEND PROPERTY INTERFACE_LINK_LIBRARIES
-                                                  "${fourdgs-cpp_CORE_LIBRARY}")
+                                                  fourdgs::core)
 endif()
 
 # The name this package documents is fourdgs::cpp, which is what an in-tree

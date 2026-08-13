@@ -279,6 +279,10 @@ target_include_directories(
   fourdgs-cpp
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# A consumer compiles these public headers too. Setting CMAKE_CXX_STANDARD above controls
+# this directory's targets, but it does not tell a FetchContent or installed-package
+# consumer which language level the headers require.
+target_compile_features(fourdgs-cpp PUBLIC cxx_std_17)
 
 if(MSVC)
   target_compile_options(fourdgs-cpp PRIVATE /W4)
@@ -305,10 +309,21 @@ if(FOURDGS_HAVE_CORE)
   # macOS needs nothing named: its equivalents are all in libSystem, which is linked
   # already, and asking for them by name is an error rather than a no-op.
   if(WIN32)
-    target_link_libraries(fourdgs-cpp PUBLIC ws2_32 userenv ntdll bcrypt advapi32 kernel32)
+    set(FOURDGS_CORE_NATIVE_LIBRARIES ws2_32 userenv ntdll bcrypt advapi32 kernel32)
   elseif(UNIX AND NOT APPLE)
-    target_link_libraries(fourdgs-cpp PUBLIC pthread dl m)
+    set(FOURDGS_CORE_NATIVE_LIBRARIES pthread dl m)
+  else()
+    set(FOURDGS_CORE_NATIVE_LIBRARIES "")
   endif()
+  # Installed consumers get these from the imported core target in the package config.
+  # Keeping them in BUILD_INTERFACE avoids exporting them before that archive: static
+  # linkers resolve left-to-right, so the archive must precede the native libraries whose
+  # symbols its objects introduce.
+  foreach(native_library IN LISTS FOURDGS_CORE_NATIVE_LIBRARIES)
+    target_link_libraries(fourdgs-cpp PUBLIC "$<BUILD_INTERFACE:${native_library}>")
+  endforeach()
+else()
+  set(FOURDGS_CORE_NATIVE_LIBRARIES "")
 endif()
 
 if(FOURDGS_ASAN)
@@ -435,11 +450,9 @@ install(
 install(DIRECTORY include/fourdgs DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 if(FOURDGS_HAVE_CORE)
   get_filename_component(FOURDGS_CORE_LIBRARY_FILENAME "${FOURDGS_CORE_LIBRARY}" NAME)
-  set(FOURDGS_CORE_INSTALL_RELPATH
-      "${FOURDGS_INSTALL_COREDIR}/${FOURDGS_CORE_LIBRARY_FILENAME}")
   install(FILES "${FOURDGS_CORE_LIBRARY}" DESTINATION ${FOURDGS_INSTALL_COREDIR})
 else()
-  set(FOURDGS_CORE_INSTALL_RELPATH "")
+  set(FOURDGS_CORE_LIBRARY_FILENAME "")
 endif()
 install(
   EXPORT fourdgs-cpp-targets
@@ -452,7 +465,8 @@ install(
 # rules that produce something no consumer can find.
 configure_package_config_file(
   cmake/fourdgs-cpp-config.cmake.in "${CMAKE_CURRENT_BINARY_DIR}/fourdgs-cpp-config.cmake"
-  INSTALL_DESTINATION ${FOURDGS_INSTALL_CMAKEDIR})
+  INSTALL_DESTINATION ${FOURDGS_INSTALL_CMAKEDIR}
+  PATH_VARS FOURDGS_INSTALL_COREDIR)
 
 # SameMinorVersion, because the major version is 0: while it is, SemVer puts the
 # compatibility promise on the minor, so a consumer asking for 0.1.0 must not be handed

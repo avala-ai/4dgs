@@ -650,6 +650,36 @@ jobs:
           ctest --test-dir "$RUNNER_TEMP/fourdgs-consumer" \
             --build-config "$FOURDGS_CMAKE_CONFIG" --output-on-failure
 
+      # Exercise the package that `cmake --install` actually emits. An absolute libdir is
+      # intentional: packagers use one, and configure_package_config_file must not prefix
+      # it a second time. Running the consumer also proves the installed static link order,
+      # including the Rust archive before its native runtime libraries on Linux.
+      - name: An installed package is linkable with an absolute libdir
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            core="$GITHUB_WORKSPACE/target/release/fourdgs.lib"
+          else
+            core="$GITHUB_WORKSPACE/target/release/libfourdgs.a"
+          fi
+          install_root="$RUNNER_TEMP/fourdgs-install"
+          cmake -S cpp -B "$RUNNER_TEMP/fourdgs-package" \
+            -DCMAKE_BUILD_TYPE="$FOURDGS_CMAKE_CONFIG" \
+            -DCMAKE_INSTALL_PREFIX="$install_root" \
+            -DCMAKE_INSTALL_LIBDIR="$install_root/lib" \
+            -DFOURDGS_CORE_LIBRARY="$core"
+          cmake --build "$RUNNER_TEMP/fourdgs-package" \
+            --config "$FOURDGS_CMAKE_CONFIG" -j
+          cmake --install "$RUNNER_TEMP/fourdgs-package" \
+            --config "$FOURDGS_CMAKE_CONFIG"
+          cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-installed-consumer" \
+            -DCMAKE_BUILD_TYPE="$FOURDGS_CMAKE_CONFIG" \
+            -DFOURDGS_USE_INSTALLED_PACKAGE=ON \
+            -Dfourdgs-cpp_DIR="$install_root/lib/cmake/fourdgs-cpp"
+          cmake --build "$RUNNER_TEMP/fourdgs-installed-consumer" \
+            --config "$FOURDGS_CMAKE_CONFIG" -j
+          ctest --test-dir "$RUNNER_TEMP/fourdgs-installed-consumer" \
+            --build-config "$FOURDGS_CMAKE_CONFIG" --output-on-failure
+
       # The binding owns handles that come from across an FFI boundary, so a leak and a read
       # past the end of a buffer the ABI handed over are the two bugs it is exposed to. The
       # runners decode every corpus file here rather than the tests' synthetic data, because
