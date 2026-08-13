@@ -64,6 +64,18 @@ class BoundViolation(FourdgsError):
     file was about to declare. Always a bug in the encoder, never in the input."""
 
 
+class ExceedsReaderLimit(FourdgsError):
+    """A legal file whose scale is past a ceiling this reader states in advance.
+
+    Not a fault in the file: it is what bounded memory costs. Some questions — how many
+    distinct gaussian ids a sequence carries, and whether any of them was reused — cannot
+    be answered exactly without space proportional to the answer, so a reader that will
+    not allocate without a limit (AGENTS.md §1) must declare one. Past it the honest
+    reply is this, rather than a wrong number or an allocation the file's own contents
+    chose. The fix is a larger limit, not a new file.
+    """
+
+
 class InvalidInput(FourdgsError):
     """A caller handed the encoder something it cannot write a conforming file from.
 
