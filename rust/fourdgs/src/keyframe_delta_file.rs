@@ -1579,6 +1579,28 @@ pub fn read_delta_entry<R: crate::Readable + ?Sized>(
     compose_delta_chunk(reference, &content, windows)
 }
 
+/// Check that an indexed entry's declared population is the state composition produced.
+///
+/// A zero-width half-open interval cannot expose a populated state at any instant. Keeping
+/// this check beside composition makes the range-seeking decoder and the full-file validator
+/// enforce the same invariant.
+pub fn check_composed_population(entry: &rec::ChunkIndexEntry, state: &State) -> Result<()> {
+    let composed = state.count() as u64;
+    if entry.live_count != composed {
+        return Err(Error::Malformed(format!(
+            "the index entry at {} declares live_count {}; composing its [{}, {}) state yields {} gaussians",
+            entry.chunk_offset, entry.live_count, entry.t0, entry.t1, composed
+        )));
+    }
+    if entry.t0 == entry.t1 && composed != 0 {
+        return Err(Error::Malformed(format!(
+            "the index entry at {} composes {} gaussians over the zero-width interval [{}, {}); expected 0 because no instant can select a half-open zero-width interval",
+            entry.chunk_offset, composed, entry.t0, entry.t1
+        )));
+    }
+    Ok(())
+}
+
 /// Compose the chain ending at `entry`, and check the state it produces.
 ///
 /// Public because a range-seeking caller may want one instant without materializing the
@@ -1608,6 +1630,7 @@ pub fn compose_chain<R: crate::Readable + ?Sized>(
     }
     let state = state.ok_or_else(|| Error::Malformed("an empty chain".into()))?;
     check_window_indices(&state, windows)?;
+    check_composed_population(entry, &state)?;
     Ok(state)
 }
 
