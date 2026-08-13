@@ -1128,9 +1128,10 @@ int fourdgs_kd_writer_set_compression(fourdgs_kd_writer *writer, uint8_t codec, 
  *
  * Samples are appended in time order and must tile the timeline: sample i covers
  * [t0_i, t0_{i+1}), the first starts at 0 and the last ends at the duration (spec 11.1).
- * The encoder derives each t1 from the next sample's t0 and does NOT check the endpoints —
- * that is the caller's to meet, and a sequence that misses it produces a file the indexed
- * read path refuses as "non-tiling-chunks" while the streamed path accepts it.
+ * The encoder derives each t1 from the next sample's t0; at encode time it refuses a
+ * non-finite or out-of-order start, a first start other than 0, or a final start after the
+ * duration. The failure is FOURDGS_STATUS_INVALID_ARGUMENT, and fourdgs_last_error() names
+ * the sample and the expected time relationship.
  *
  * Every sigma_t must be finite. The format allows +inf for a gaussian that never fades and
  * this reference encoder does not write one; a non-finite value is refused at encode.
@@ -1151,10 +1152,11 @@ uint32_t fourdgs_kd_writer_sample_count(const fourdgs_kd_writer *writer);
  * Encode the appended sequence into an owned buffer, freed with fourdgs_buffer_free.
  *
  * On failure `out` is untouched and fourdgs_last_error names the reason: an empty
- * sequence, a sample whose id count does not match its gaussian count, a non-finite
- * sigma_t, or a gaussian whose sigma_t or window changes inside a group — the last refused
- * rather than written, because those values ARE the grid a bin difference is taken on
- * (spec 11.5) and a file carrying one decodes silently into a wrong velocity.
+ * sequence, a sample whose id count does not match its gaussian count, sample times that
+ * do not tile the duration, a non-finite sigma_t, or a gaussian whose sigma_t or window
+ * changes inside a group — the last refused rather than written, because those values ARE
+ * the grid a bin difference is taken on (spec 11.5) and a file carrying one decodes
+ * silently into a wrong velocity.
  */
 int fourdgs_kd_writer_encode(fourdgs_kd_writer *writer, fourdgs_buffer **out);
 

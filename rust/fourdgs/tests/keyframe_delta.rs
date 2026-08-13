@@ -431,6 +431,75 @@ fn tiling_is_enforced() {
     assert!(check_tiling(&clean).is_ok());
 }
 
+fn sample_at(t0: f64) -> fourdgs::keyframe_delta_file::Sample {
+    fourdgs::keyframe_delta_file::Sample {
+        t0,
+        ids: Vec::new(),
+        gaussians: fourdgs::model::GaussianSet::default(),
+    }
+}
+
+fn writer_timeline_error(t0s: &[f64], duration_sec: f64) -> String {
+    use fourdgs::keyframe_delta_file::{write_sequence, KeyframeDeltaOptions};
+
+    let samples: Vec<_> = t0s.iter().copied().map(sample_at).collect();
+    write_sequence(&samples, duration_sec, &KeyframeDeltaOptions::default())
+        .unwrap_err()
+        .to_string()
+}
+
+#[test]
+fn the_writer_refuses_a_gap_before_the_first_sample() {
+    let message = writer_timeline_error(&[0.25, 1.0], 2.0);
+    assert!(message.contains("sample 0"), "{message}");
+    assert!(message.contains("t0=0.25"), "{message}");
+    assert!(message.contains("expected t0=0"), "{message}");
+    assert!(message.contains("gap at the start"), "{message}");
+}
+
+#[test]
+fn the_writer_refuses_a_sample_before_the_declared_timeline() {
+    let message = writer_timeline_error(&[-0.25, 1.0], 2.0);
+    assert!(message.contains("sample 0"), "{message}");
+    assert!(message.contains("t0=-0.25"), "{message}");
+    assert!(message.contains("expected t0=0"), "{message}");
+    assert!(message.contains("overlaps time before"), "{message}");
+}
+
+#[test]
+fn the_writer_refuses_an_out_of_order_sample_as_an_overlap() {
+    let message = writer_timeline_error(&[0.0, 1.5, 1.0], 2.0);
+    assert!(message.contains("sample 2"), "{message}");
+    assert!(message.contains("t0=1"), "{message}");
+    assert!(message.contains("sample 1 at t0=1.5"), "{message}");
+    assert!(message.contains("expected sample times"), "{message}");
+    assert!(message.contains("overlap"), "{message}");
+}
+
+#[test]
+fn the_writer_refuses_a_final_interval_past_the_declared_end() {
+    let message = writer_timeline_error(&[0.0, 4.0], 3.0);
+    assert!(message.contains("sample 1"), "{message}");
+    assert!(message.contains("t0=4"), "{message}");
+    assert!(message.contains("duration_sec=3"), "{message}");
+    assert!(
+        message.contains("expected its start at or before"),
+        "{message}"
+    );
+    assert!(message.contains("inverted"), "{message}");
+}
+
+#[test]
+fn irregular_sample_cadence_still_tiles_the_duration() {
+    use fourdgs::keyframe_delta_file::{decode_indexed, write_sequence, KeyframeDeltaOptions};
+
+    let samples = [sample_at(0.0), sample_at(0.25), sample_at(9.0)];
+    let bytes = write_sequence(&samples, 10.0, &KeyframeDeltaOptions::default()).unwrap();
+    let decoded = decode_indexed(&bytes).expect("the writer produced a readable tiling");
+    let intervals: Vec<_> = decoded.1.iter().map(|entry| (entry.t0, entry.t1)).collect();
+    assert_eq!(intervals, [(0.0, 0.25), (0.25, 9.0), (9.0, 10.0)]);
+}
+
 // --- the byte-compatibility promise -----------------------------------------
 
 #[test]

@@ -558,6 +558,67 @@ fn aabb(samples: &[Sample]) -> Vec<f64> {
     vec![lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]]
 }
 
+/// Check the part of §11.1 a sequence of sample starts can express.
+///
+/// [`write_sequence`] derives every interval end from the next sample's `t0`, and derives
+/// the final end from `duration_sec`. Interior intervals therefore abut by construction:
+/// this check makes sure they are not inverted, and that the two derived endpoints cover
+/// the declared timeline. Keeping it ahead of grid construction and quantization makes a
+/// bad timeline an authoring error before the writer does work proportional to the scene.
+fn check_sample_tiling(samples: &[Sample], duration_sec: f64) -> Result<()> {
+    if duration_sec.is_nan() || duration_sec == f64::NEG_INFINITY {
+        return Err(Error::InvalidInput(format!(
+            "duration_sec is {duration_sec}; expected a finite timeline end or +inf so the final \
+             sample interval can reach it (section 11.1)"
+        )));
+    }
+
+    for (sample, state) in samples.iter().enumerate() {
+        if !state.t0.is_finite() {
+            return Err(Error::InvalidInput(format!(
+                "sample {sample} has t0={}; expected a finite sample time (section 11.1)",
+                state.t0
+            )));
+        }
+    }
+
+    let first = samples[0].t0;
+    if first != 0.0 {
+        let relation = if first > 0.0 {
+            "leaves a gap at the start"
+        } else {
+            "overlaps time before the declared timeline"
+        };
+        return Err(Error::InvalidInput(format!(
+            "sample 0 starts at t0={first}; expected t0=0, because this {relation} (section 11.1)"
+        )));
+    }
+
+    for sample in 1..samples.len() {
+        let previous = samples[sample - 1].t0;
+        let current = samples[sample].t0;
+        if current < previous {
+            return Err(Error::InvalidInput(format!(
+                "sample {sample} starts at t0={current}, before sample {} at t0={previous}; \
+                 expected sample times in nondecreasing order so their derived intervals abut \
+                 without overlap (section 11.1)",
+                sample - 1
+            )));
+        }
+    }
+
+    let last_sample = samples.len() - 1;
+    let last = samples[last_sample].t0;
+    if last > duration_sec {
+        return Err(Error::InvalidInput(format!(
+            "sample {last_sample} starts at t0={last}, after duration_sec={duration_sec}; expected \
+             its start at or before the declared duration so the final interval reaches that end \
+             without being inverted (section 11.1)"
+        )));
+    }
+    Ok(())
+}
+
 /// Assemble a whole `keyframe-delta` file from a sequence of samples.
 ///
 /// The samples must tile the timeline: sample `i` covers `[t_i, t_{i+1})`, the first starts
@@ -572,6 +633,7 @@ pub fn write_sequence(
             "a keyframe-delta file needs at least one sample".into(),
         ));
     }
+    check_sample_tiling(samples, duration_sec)?;
     let grids = grids_for(samples, duration_sec, kd.profile, kd.cutoff);
     let mut quantized: Vec<(Vec<i64>, BTreeMap<u8, BinArray>)> = samples
         .iter()
