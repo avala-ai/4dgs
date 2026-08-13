@@ -292,8 +292,18 @@ def _objects_and_states(header, gaussians, objects, order) -> dict:
             t=t,
         )
         row_for_index = {int(index): row for row, index in enumerate(base["indices"])}
-        sample_indices = [index for index in order if index in row_for_index][:SAMPLE]
-        sample_rows = [row_for_index[index] for index in sample_indices]
+        sample_rows = []
+        position_sum = [0.0, 0.0, 0.0]
+        opacity_sum = 0.0
+        for index in order:
+            row = row_for_index.get(index)
+            if row is None:
+                continue
+            if len(sample_rows) < SAMPLE:
+                sample_rows.append(row)
+            for axis in range(3):
+                position_sum[axis] += float(centers[row][axis])
+            opacity_sum += float(base["opacity"][row])
         states.append(
             {
                 "t": num(t),
@@ -304,8 +314,8 @@ def _objects_and_states(header, gaussians, objects, order) -> dict:
                     "objectIds": [str(int(base["object_id"][row])) for row in sample_rows],
                 },
                 "aggregate": {
-                    "positionSum": [num(sum(float(row[axis]) for row in centers)) for axis in range(3)],
-                    "opacitySum": num(sum(float(value) for value in base["opacity"])),
+                    "positionSum": [num(value) for value in position_sum],
+                    "opacitySum": num(opacity_sum),
                 },
             }
         )
@@ -553,14 +563,17 @@ def _stable_order(gaussians) -> list[int]:
 
     Chunking and Morton ordering are encoder choices, so decoded order is not part of the
     contract — but a comparison needs *some* order. The key is the gaussian's whole
-    decoded state, rounded exactly as the summary rounds it, with its spherical harmonic
-    coefficients last. Two gaussians that tie on all of it are identical in every value
-    this summary emits, so their relative order cannot change the output.
+    decoded state, rounded exactly as the summary rounds it, followed by the exact decoded
+    floats as a tie-breaker. Spherical harmonic coefficients and object membership stay in
+    their existing positions before that tie-breaker, so rows that never tied keep their
+    existing order. Two gaussians that also tie on the exact values are identical in every
+    value this summary composes or emits, so their relative order cannot change the output.
     """
     sh = getattr(gaussians, "sh", None)
     keys = []
     for i in range(gaussians.count):
         row = []
+        exact = []
         for arr, width in (
             (gaussians.positions, 3),
             (gaussians.scales, 3),
@@ -569,17 +582,21 @@ def _stable_order(gaussians) -> list[int]:
             (gaussians.motions, 3),
         ):
             row += [_sortable(arr[i][k]) for k in range(width)]
-        row += [
-            _sortable(gaussians.mu_t[i]),
-            _sortable(gaussians.sigma_t[i]),
-            _sortable(gaussians.win_lo[i]),
-            _sortable(gaussians.win_hi[i]),
-        ]
+            exact += [_exact_sortable(arr[i][k]) for k in range(width)]
+        for value in (
+            gaussians.mu_t[i],
+            gaussians.sigma_t[i],
+            gaussians.win_lo[i],
+            gaussians.win_hi[i],
+        ):
+            row.append(_sortable(value))
+            exact.append(_exact_sortable(value))
         if sh is not None:
             row += [int(v) for v in sh[i]]
         object_id = getattr(gaussians, "object_id", None)
         if object_id is not None:
             row.append(int(object_id[i]))
+        row += exact
         keys.append((row, i))
     keys.sort(key=lambda k: k[0])
     return [k[1] for k in keys]
@@ -594,3 +611,20 @@ def _sortable(value) -> float:
     if math.isinf(v):
         return v
     return round(v, FLOAT_DECIMALS)
+
+
+def _exact_sortable(value) -> tuple[int, float]:
+    """A total-order key for exact decoded floats after their rounded keys tie.
+
+    The canonical form refuses to expose a signed zero and spells every non-finite value
+    as ``null``. Keep those equivalences here while still ensuring NaN cannot turn a sort
+    comparison into a stable, decoded-order tie.
+    """
+    v = float(value)
+    if math.isnan(v):
+        return (3, 0.0)
+    if v == -math.inf:
+        return (0, 0.0)
+    if v == math.inf:
+        return (2, 0.0)
+    return (1, v + 0.0)

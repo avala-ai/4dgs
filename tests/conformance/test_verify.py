@@ -22,6 +22,7 @@ import struct
 import sys
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -33,6 +34,8 @@ import generate
 
 # `generate` puts `python/fourdgs` on the path as it imports, which is why this follows it.
 from fourdgs import keyframe_delta_file as kdf
+from fourdgs.model import GaussianSet
+from fourdgs.records import Header
 
 #: The expectation the signed zero was found in (#153): two composed values at the noise
 #: floor, which round to `-0.0` where the arithmetic lands a hair below zero.
@@ -175,6 +178,91 @@ class TestTheCanonicalFormHasNoSignedZero:
         assert not str(kdf._num(-1e-9)).startswith("-")
         assert kdf._num(-1.5) == -1.5
         assert kdf._num(float("inf")) is None
+
+
+class TestTheCanonicalFormHasNoDecodedOrder:
+    @staticmethod
+    def _gaussians(positions, motions) -> GaussianSet:
+        positions = np.asarray(positions, dtype=np.float32)
+        motions = np.asarray(motions, dtype=np.float32)
+        count = positions.shape[0]
+        return GaussianSet(
+            positions=positions,
+            scales=np.ones((count, 3), dtype=np.float32),
+            rotations=np.tile(np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32), (count, 1)),
+            colors=np.ones((count, 4), dtype=np.float32),
+            motions=motions,
+            mu_t=np.zeros(count, dtype=np.float32),
+            sigma_t=np.full(count, np.inf, dtype=np.float32),
+            win_lo=np.zeros(count, dtype=np.float32),
+            win_hi=np.full(count, 4_000_000.0, dtype=np.float32),
+            object_id=np.zeros(count, dtype=np.uint32),
+        )
+
+    @staticmethod
+    def _permuted(gaussians: GaussianSet, order) -> GaussianSet:
+        order = np.asarray(order, dtype=np.intp)
+        return GaussianSet(
+            positions=gaussians.positions[order],
+            scales=gaussians.scales[order],
+            rotations=gaussians.rotations[order],
+            colors=gaussians.colors[order],
+            motions=gaussians.motions[order],
+            mu_t=gaussians.mu_t[order],
+            sigma_t=gaussians.sigma_t[order],
+            win_lo=gaussians.win_lo[order],
+            win_hi=gaussians.win_hi[order],
+            object_id=gaussians.object_id[order],
+        )
+
+    @staticmethod
+    def _summary(gaussians: GaussianSet) -> dict:
+        header = Header(
+            duration_sec=4_000_000.0,
+            gaussian_count=gaussians.count,
+            aabb=[0.0] * 6,
+        )
+        return canonical.summarize(header, gaussians, [], [])
+
+    def test_rounded_key_ties_do_not_order_composed_state_samples(self):
+        """Sub-micro motions tie in the emitted stored fields, but not after composition.
+
+        Stable sorting therefore falls back to decoded order unless the content key keeps
+        enough precision to distinguish them. Both rows fit inside the sample: reversing
+        them proves the sample's sequence itself, rather than only its membership.
+        """
+        gaussians = self._gaussians(
+            positions=[[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            motions=[[1e-7, 0.0, 0.0], [4e-7, 0.0, 0.0]],
+        )
+
+        forward = self._summary(gaussians)
+        reversed_ = self._summary(self._permuted(gaussians, [1, 0]))
+
+        assert forward == reversed_
+        assert forward["states"][1]["sample"]["positions"] == [[0.2, 0.0, 0.0], [0.8, 0.0, 0.0]]
+
+    def test_state_aggregates_sum_in_content_order(self):
+        """The same four f32 values sum differently when their decoded order changes."""
+        gaussians = self._gaussians(
+            positions=[
+                [332.6397705078125, 3.0, 0.0],
+                [7.838928940049353e-21, 1.0, 0.0],
+                [1577422159872.0, 4.0, 0.0],
+                [9.658209299783168e-21, 2.0, 0.0],
+            ],
+            motions=np.zeros((4, 3), dtype=np.float32),
+        )
+
+        cancellation_first = self._summary(gaussians)
+        cancellation_last = self._summary(self._permuted(gaussians, [0, 3, 1, 2]))
+
+        assert cancellation_first == cancellation_last
+        assert cancellation_first["states"][0]["aggregate"]["positionSum"] == [
+            1577422160204.6396,
+            10.0,
+            0.0,
+        ]
 
 
 def test_keyframe_delta_variants_retain_an_untouched_common_row():
