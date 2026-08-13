@@ -370,6 +370,64 @@ fn quantize_scene(g: &GaussianSet, opts: &WriteOptions) -> Result<Quantized> {
     Ok(q)
 }
 
+/// Containment bounds for the temporal state this file reconstructs.
+///
+/// Chunk membership is an indexed-read promise, so plan from decoded public `f32` values,
+/// not from the unquantized values the caller supplied. The marginal's upper endpoint is
+/// inclusive (`marginal >= cutoff`), while a chunk's upper endpoint is not; advance an
+/// unclipped upper bound by one representable `f64` so equality cannot put it in the child
+/// that ends there. A validity window already excludes its own upper endpoint and needs no
+/// such adjustment.
+fn planning_support(q: &Quantized, cutoff: f64) -> (Vec<f64>, Vec<f64>) {
+    let k = support_k(cutoff);
+    let mut lo = Vec::with_capacity(q.mu.len());
+    let mut hi = Vec::with_capacity(q.mu.len());
+    for i in 0..q.mu.len() {
+        let never_fades = q.flags[i] & op::FLAG_NEVER_FADES != 0;
+        let sigma = if never_fades {
+            f64::INFINITY
+        } else {
+            ((q.sigma[i] as f64 * q.steps.sigma_log).exp() as f32) as f64
+        };
+        let t_step = mu_step(q.sigma[i], q.steps.sigma_log, never_fades, q.steps.time);
+        let mu = ((q.mu[i] as f64 * t_step) as f32) as f64;
+        let mut half = if never_fades {
+            f64::INFINITY
+        } else {
+            k * sigma.max(1e-30)
+        };
+        if cutoff == 1.0 && !never_fades {
+            // Mathematically support is the single instant `mu`, but state_at evaluates
+            // the marginal in binary64. `exp(-x)` rounds to exactly 1 over a small interval
+            // around it. This normalized bound strictly contains that rounding plateau,
+            // including the division and square roundings, without a scene-scale epsilon.
+            half = 2.0 * f64::EPSILON.sqrt() * sigma.max(1e-30);
+        }
+
+        let window = q.windows[q.window_index[i] as usize];
+        let marginal_hi = mu + half;
+        lo.push((mu - half).max(window.0));
+        let mut upper = marginal_hi.min(window.1);
+        if marginal_hi < window.1 {
+            upper = next_up(upper);
+        }
+        hi.push(upper);
+    }
+    (lo, hi)
+}
+
+/// The next representable value toward positive infinity, matching `nextafter(x, +inf)`.
+fn next_up(value: f64) -> f64 {
+    if value.is_nan() || value == f64::INFINITY {
+        return value;
+    }
+    if value == 0.0 {
+        return f64::from_bits(1);
+    }
+    let bits = value.to_bits();
+    f64::from_bits(if value > 0.0 { bits + 1 } else { bits - 1 })
+}
+
 /// The median of a slice, taken the way NumPy takes it: the mean of the two middle values
 /// on an even count.
 fn median(values: &[f32]) -> f64 {
@@ -704,7 +762,7 @@ fn encode(
         tops = vec![0.0, duration_sec.max(1e-9)];
     }
 
-    let (support_lo, support_hi) = g.support(opts.cutoff);
+    let (support_lo, support_hi) = planning_support(&q, opts.cutoff);
     let mut plans = if n == 0 {
         Vec::new()
     } else {

@@ -86,6 +86,118 @@ fn chunking_options() -> WriteOptions {
     }
 }
 
+fn one_temporal_gaussian(mu_t: f32, sigma_t: f32, win_hi: f32) -> GaussianSet {
+    GaussianSet {
+        positions: vec![0.0; 3],
+        scales: vec![0.01; 3],
+        rotations: vec![0.0, 0.0, 0.0, 1.0],
+        colors: vec![0.5, 0.5, 0.5, 1.0],
+        motions: vec![0.0; 3],
+        mu_t: vec![mu_t],
+        sigma_t: vec![sigma_t],
+        win_lo: vec![0.0],
+        win_hi: vec![win_hi],
+        ..Default::default()
+    }
+}
+
+fn one_gaussian_chunking(cutoff: f64, max_depth: u32) -> WriteOptions {
+    WriteOptions {
+        cutoff,
+        max_depth,
+        min_chunk_gaussians: 1,
+        ..Default::default()
+    }
+}
+
+fn assert_indexed_gaussian_is_visible(bytes: &[u8], t: f64) {
+    let decoded = fourdgs::read_bytes(bytes).expect("streamed decode");
+    assert_eq!(
+        decoded.state_at(t).expect("full state").count(),
+        1,
+        "the complete reconstructed scene is visible at t={t}"
+    );
+
+    let mut indexed = fourdgs::SceneReader::open(fourdgs::BytesReadable::new(bytes))
+        .expect("public indexed open");
+    assert_eq!(
+        indexed.state_at(t, 0).expect("indexed state").count(),
+        1,
+        "the indexed seek must reach the same gaussian at t={t}"
+    );
+}
+
+#[test]
+fn chunk_planning_covers_support_after_temporal_quantization() {
+    let cutoff = (-0.5_f64).exp();
+    let g = one_temporal_gaussian(0.2541, 0.2452, 1.0);
+    let bytes = fourdgs::write_to_vec(
+        &g,
+        1.0,
+        &one_gaussian_chunking(cutoff, 1),
+        &SceneExtras::default(),
+    )
+    .expect("encode");
+    let decoded = fourdgs::read_bytes(&bytes).expect("decode");
+
+    assert!(g.support(cutoff).1[0] < 0.5);
+    assert_eq!(decoded.gaussians.mu_t[0], 0.256);
+    assert!((decoded.gaussians.sigma_t[0] - 0.25002763).abs() < 1e-7);
+    assert_indexed_gaussian_is_visible(&bytes, 0.5);
+}
+
+#[test]
+fn an_inclusive_support_endpoint_does_not_enter_a_half_open_child() {
+    let cutoff = (-0.5_f64).exp();
+    let mut g = one_temporal_gaussian(0.2541, 0.2452, 1.0);
+    let seed = fourdgs::write_to_vec(
+        &g,
+        1.0,
+        &one_gaussian_chunking(cutoff, 0),
+        &SceneExtras::default(),
+    )
+    .expect("seed encode");
+    let reconstructed = fourdgs::read_bytes(&seed).expect("seed decode");
+    let boundary =
+        reconstructed.gaussians.mu_t[0] as f64 + reconstructed.gaussians.sigma_t[0] as f64;
+    let duration = 2.0 * boundary;
+    g.win_hi[0] = duration as f32;
+
+    let bytes = fourdgs::write_to_vec(
+        &g,
+        duration,
+        &one_gaussian_chunking(cutoff, 1),
+        &SceneExtras::default(),
+    )
+    .expect("encode");
+    let decoded = fourdgs::read_bytes(&bytes).expect("decode");
+    let mu = decoded.gaussians.mu_t[0] as f64;
+    let sigma = decoded.gaussians.sigma_t[0] as f64;
+    assert_eq!(mu + sigma, boundary);
+    assert!((-0.5 * ((boundary - mu) / sigma).powi(2)).exp() >= cutoff);
+    assert_indexed_gaussian_is_visible(&bytes, boundary);
+}
+
+#[test]
+fn cutoff_one_indexed_seek_covers_both_neighbors_of_the_mean() {
+    let cutoff = 1.0;
+    let g = one_temporal_gaussian(0.5, 0.1, 1.0);
+    let bytes = fourdgs::write_to_vec(
+        &g,
+        1.0,
+        &one_gaussian_chunking(cutoff, 1),
+        &SceneExtras::default(),
+    )
+    .expect("encode");
+    let decoded = fourdgs::read_bytes(&bytes).expect("decode");
+    let mean = decoded.gaussians.mu_t[0] as f64;
+    let below = f64::from_bits(mean.to_bits() - 1);
+    let above = f64::from_bits(mean.to_bits() + 1);
+
+    assert_indexed_gaussian_is_visible(&bytes, below);
+    assert_indexed_gaussian_is_visible(&bytes, above);
+}
+
 #[test]
 fn a_scene_survives_a_round_trip() {
     let (g, duration) = scene(256);
