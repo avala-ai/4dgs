@@ -477,6 +477,21 @@ fn the_writer_refuses_an_out_of_order_sample_as_an_overlap() {
 }
 
 #[test]
+fn the_writer_refuses_non_finite_timeline_values() {
+    let sample = writer_timeline_error(&[0.0, f64::NAN], 2.0);
+    assert!(sample.contains("sample 1"), "{sample}");
+    assert!(sample.contains("t0=NaN"), "{sample}");
+    assert!(sample.contains("expected a finite sample time"), "{sample}");
+
+    let duration = writer_timeline_error(&[0.0], f64::NAN);
+    assert!(duration.contains("duration_sec is NaN"), "{duration}");
+    assert!(
+        duration.contains("expected a finite timeline end or +inf"),
+        "{duration}"
+    );
+}
+
+#[test]
 fn the_writer_refuses_a_final_interval_past_the_declared_end() {
     let message = writer_timeline_error(&[0.0, 4.0], 3.0);
     assert!(message.contains("sample 1"), "{message}");
