@@ -17,10 +17,19 @@
 # one path is half-checked, and one checked only by its own decoder proves that two halves of
 # one implementation share an opinion.
 #
+# **Index counts.** Every count the chunk index declares, against the records it points at —
+# `check_index_counts` from `tests/conformance/encode_roundtrip.py`, the same check the
+# gaussian-birth gate makes. It is the one claim here that no reconstruction can make: Swift's
+# indexed reader composes the chunks the index names without consulting either count, so an
+# entry that swapped its operation count for its live population reads back identically on
+# every path below while the file misstates what a seek costs.
+#
 # **The corpus statement.** Four of the sequences are the ones `tests/conformance/generate.py`
-# builds, so the reconstruction is additionally compared with the committed
-# `tests/conformance/data/keyframe/<name>.json` — produced by the *Python* encoder from the
-# same populations. Compared: which gaussians are live at each probe, and where they are.
+# builds — the encoder says which, and a variant that claims the corpus and has no expectation
+# is a failure, not a quiet downgrade to agreement — so the reconstruction is additionally
+# compared with the committed `tests/conformance/data/keyframe/<name>.json`, produced by the
+# *Python* encoder from the same populations. Compared: which gaussians are live at each
+# probe, and where they are.
 # Excluded: the aggregate opacity and the per-chunk operation counts. Those are not slack in
 # the claim, they are a real and legal difference — a keyframe restates every live gaussian's
 # `mu_t` at its own `t0` (spec §11.3), the corpus generator anchors `mu_t` itself before
@@ -61,9 +70,53 @@ done
 
 checked=0
 compared=0
-while IFS=$'\t' read -r name note; do
+while IFS=$'\t' read -r name in_corpus note; do
   [ -n "$name" ] || continue
   file="$out/$name.4dgs"
+
+  # The encoder declares exactly one of these two relationships. Treating every other
+  # token as Swift-only would make a misspelling on a genuinely Swift-only variant pass
+  # in the same shape as the declaration this gate is meant to enforce.
+  case "$in_corpus" in
+  corpus | swift-only) ;;
+  *)
+    echo "::error::$name: unknown corpus declaration '$in_corpus'; expected corpus or swift-only"
+    exit 1
+    ;;
+  esac
+
+  # The counts the chunk index declares, against the records it points at (#195). First,
+  # before anything decodes the file, because this is the claim about the file itself.
+  #
+  # Nothing compared further down can see these numbers. Every summary below takes the
+  # population off the *composed* state, so a writer that swapped a delta entry's
+  # `gaussian_count` (its operations) for its `live_count` (the population after
+  # composition) writes a file that reconstructs identically on all three paths and still
+  # misstates what a seek costs — and Swift's own indexed reader composes the chain the
+  # index names without consulting either number, so it reads that file without complaint.
+  #
+  # What does catch it today is the Python reference's `decode_indexed`, which refuses an
+  # index that disagrees with the record it points at. That is a claim the reference happens
+  # to make on its way past rather than one this gate states: it arrives as a traceback out
+  # of a decode step, it names no variant, and it would leave with any future reader swapped
+  # in here. Stated here it is the gate's own claim, it names the entry, and it also reaches
+  # what no decoder checks — that the index is one-to-one with the physical chunks and the
+  # SH bands. Shared with `encode_roundtrip.py` rather than restated, because a rule written
+  # out twice is a rule that can come to differ between its two copies.
+  "$python" - "$file" "$name" "$root" <<'PY'
+import os
+import sys
+
+path, name, root = sys.argv[1:4]
+sys.path.insert(0, os.path.join(root, "tests", "conformance"))
+from encode_roundtrip import check_index_counts  # noqa: E402
+
+try:
+    check_index_counts(path)
+except AssertionError as error:
+    print(f"::error::{name}: {error}")
+    sys.exit(1)
+PY
 
   "$swift_streamed" "$file" >"$out/$name.swift-streamed.json"
   "$swift_indexed" "$file" >"$out/$name.swift-indexed.json"
@@ -72,12 +125,12 @@ while IFS=$'\t' read -r name note; do
   # The verdict is captured rather than streamed so that a failure's diagnosis — which the
   # script below writes to stdout, next to the verdict — is printed with the file it is
   # about, instead of ahead of the line naming it.
-  if ! verdict="$("$python" - "$out" "$name" "$corpus" <<'PY'
+  if ! verdict="$("$python" - "$out" "$name" "$corpus" "$in_corpus" <<'PY'
 import json
 import os
 import sys
 
-out, name, corpus = sys.argv[1], sys.argv[2], sys.argv[3]
+out, name, corpus, in_corpus = sys.argv[1:5]
 
 
 def load(suffix):
@@ -104,11 +157,21 @@ for other_name, other in list(readers.items())[1:]:
             print(f"    {other_name}: {json.dumps(other.get(key))[:300]}")
     sys.exit(1)
 
-# The corpus statement, for the sequences the generator also builds.
+# The corpus statement, for the sequences the generator also builds. Which those are is what
+# the encoder declared on this line, not what happens to be on disk: deciding it by testing
+# for the expectation file makes a renamed variant — here or in the generator's cross-product
+# — turn this comparison off and still report a pass, which is the one outcome a gate must
+# never have.
 committed = os.path.join(corpus, f"{name}.json")
-if not os.path.exists(committed):
+if in_corpus != "corpus":
+    if os.path.exists(committed):
+        print(f"::error::{name}: written as a Swift-only variant, but the corpus has {committed}")
+        sys.exit(1)
     print("agreement")
     sys.exit(0)
+if not os.path.exists(committed):
+    print(f"::error::{name}: declared a corpus variant, and there is no expectation at {committed}")
+    sys.exit(1)
 with open(committed, encoding="utf-8") as fh:
     expected = json.load(fh)
 
@@ -156,6 +219,15 @@ done <"$out/written.txt"
 
 [ "$checked" -gt 0 ] || {
   echo "::error::no keyframe-delta files were written"
+  exit 1
+}
+
+# The same assertion as the one above, about the other claim. `checked` counts files that
+# agreed; `compared` counts the ones additionally held to a second encoder's committed
+# reconstruction, and that is the claim worth the most here — so it is the one whose count
+# has to be greater than zero rather than the one nobody would notice reaching it.
+[ "$compared" -gt 0 ] || {
+  echo "::error::no file was compared against the committed corpus; every variant declared itself Swift-only"
   exit 1
 }
 

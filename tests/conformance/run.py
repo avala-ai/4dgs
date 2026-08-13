@@ -118,10 +118,12 @@ def variants() -> list[str]:
 
 
 #: Families whose runners answer a refusal expectation — printing `{"refused": "<id>"}`
-#: for a file they refuse, rather than exiting non-zero. A family absent here SKIPS the
-#: invalid corpus, exactly as it would skip any variant it declines, and the feature
-#: matrix is where that shows up publicly. Adding a language is one entry here plus the
-#: few lines in its runner that catch the refusal and print its identifier.
+#: for an error their library names with a refusal identifier, rather than exiting
+#: non-zero. A family absent here SKIPS the invalid corpus, exactly as it would skip any
+#: variant it declines, and the feature matrix is where that shows up publicly. Adding a
+#: language is one entry here plus the few lines in its runner that turn a *named* refusal
+#: into that document and leave every other decode error on stderr with a non-zero exit —
+#: an error the vocabulary does not name is a failed invocation, not an empty identifier.
 REFUSAL_FAMILIES = frozenset({"python", "rust", "typescript", "cpp", "swift", "dart"})
 
 
