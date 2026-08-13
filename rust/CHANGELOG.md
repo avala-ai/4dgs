@@ -6,6 +6,8 @@ All notable changes to the Rust crate are documented here, following
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-12
+
 ### Added
 
 - **The refusal identifier on the C ABI.**

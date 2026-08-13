@@ -6,6 +6,8 @@ All notable changes to the Python package are documented here, following
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-12
+
 ### Fixed
 
 - **`4dgs validate` no longer calls two malformed files valid.** `UnknownStreamCodec` and
