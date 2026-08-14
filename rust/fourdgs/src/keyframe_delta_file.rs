@@ -1326,6 +1326,7 @@ pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
                 })?;
                 check_keyframe_mu_t(&state, head.t0, quantization)?;
                 check_window_indices(&state, &windows)?;
+                check_streamed_population(record.offset as u64, head.t0, head.t1, &state)?;
                 by_offset.insert(record.offset as u64, state.clone());
                 chunks.push(ChunkInfo {
                     t0: head.t0,
@@ -1362,6 +1363,7 @@ pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
                 // indexed path validates the composed state for every chunk, so leaving
                 // it off here would accept a birth the other path refuses.
                 check_window_indices(&state, &windows)?;
+                check_streamed_population(record.offset as u64, head.t0, head.t1, &state)?;
                 by_offset.insert(record.offset as u64, state.clone());
                 chunks.push(ChunkInfo {
                     t0: head.t0,
@@ -1596,6 +1598,26 @@ pub fn check_composed_population(entry: &rec::ChunkIndexEntry, state: &State) ->
         return Err(Error::Malformed(format!(
             "the index entry at {} composes {} gaussians over the zero-width interval [{}, {}); expected 0 because no instant can select a half-open zero-width interval",
             entry.chunk_offset, composed, entry.t0, entry.t1
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse populated zero-width state records on the front-to-back path.
+///
+/// An indexed entry carries `live_count`, so [`check_composed_population`] checks both that
+/// declaration and this half-open interval invariant. A streamed record has no separate count;
+/// its composed state is the authoritative population and must obey the same rule.
+pub fn check_streamed_population(
+    record_offset: u64,
+    t0: f64,
+    t1: f64,
+    state: &State,
+) -> Result<()> {
+    let composed = state.count();
+    if t0 == t1 && composed != 0 {
+        return Err(Error::Malformed(format!(
+            "the streamed state record at {record_offset} composes {composed} gaussians over the zero-width interval [{t0}, {t1}); expected 0 because no instant can select a half-open zero-width interval"
         )));
     }
     Ok(())
