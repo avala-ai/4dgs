@@ -125,6 +125,8 @@ words:
   - writeln
   # Validator vocabulary: what a tool can say about a file it was handed
   - validatable
+  # The digits of a decimal, as §5.3's bound grammar names them
+  - significand
   # Rust and C toolchain vocabulary
   - capi
   - libfourdgs

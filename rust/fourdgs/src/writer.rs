@@ -268,7 +268,26 @@ fn extra_object_table_count(records: &[Vec<u8>]) -> Result<usize> {
     Ok(count)
 }
 
+/// Refuse a marginal threshold that is not one.
+///
+/// A threshold outside `(0, 1]` is not a threshold, and it has to be refused here rather
+/// than become a domain error inside a logarithm. `support_k` inverts `ln(cutoff)`, so a
+/// zero or negative value yields `inf` or `NaN`, and both propagate quietly: the velocity
+/// precision class collapses, and in `planning_support` `f64::max`/`f64::min` discard NaN
+/// operands, so a NaN half-width silently reads as "the whole validity window" and the
+/// Chunk Index promises a containment the file does not have. Python refuses the same
+/// domain with the same sentence (`quantization.support_k`).
+fn check_cutoff(cutoff: f64) -> Result<()> {
+    if !(cutoff > 0.0 && cutoff <= 1.0) {
+        return Err(Error::InvalidInput(format!(
+            "the Header's cutoff is {cutoff}; a marginal threshold must be in (0, 1]"
+        )));
+    }
+    Ok(())
+}
+
 fn quantize_scene(g: &GaussianSet, opts: &WriteOptions) -> Result<Quantized> {
+    check_cutoff(opts.cutoff)?;
     check_finite_input(g)?;
     let n = g.count();
     // Position tolerance is a fraction of the median gaussian radius rather than an
@@ -368,6 +387,82 @@ fn quantize_scene(g: &GaussianSet, opts: &WriteOptions) -> Result<Quantized> {
         q.mu.push(rint(g.mu_t[i] as f64 / t_step));
     }
     Ok(q)
+}
+
+/// Containment bounds for the temporal state this file reconstructs.
+///
+/// Chunk membership is an indexed-read promise, so plan from decoded public `f32` values,
+/// not from the unquantized values the caller supplied. Invert the predecessor of `cutoff`
+/// rather than `cutoff` itself: public visibility evaluates subtraction, division, squaring,
+/// and `exp` in binary64, so a value just below the mathematical threshold can round back to
+/// `cutoff`. The half-width and its endpoints are rounded outwards independently. This also
+/// accounts for catastrophic cancellation in `mu +/- half`, where one ULP of the resulting
+/// endpoint can be far smaller than the rounding lost by the addition.
+fn planning_support(q: &Quantized, cutoff: f64) -> (Vec<f64>, Vec<f64>) {
+    let mut lo = Vec::with_capacity(q.mu.len());
+    let mut hi = Vec::with_capacity(q.mu.len());
+    for i in 0..q.mu.len() {
+        let never_fades = q.flags[i] & op::FLAG_NEVER_FADES != 0;
+        let sigma = if never_fades {
+            f64::INFINITY
+        } else {
+            ((q.sigma[i] as f64 * q.steps.sigma_log).exp() as f32) as f64
+        };
+        let t_step = mu_step(q.sigma[i], q.steps.sigma_log, never_fades, q.steps.time);
+        let mu = ((q.mu[i] as f64 * t_step) as f32) as f64;
+        let window = q.windows[q.window_index[i] as usize];
+        let (marginal_lo, marginal_hi) = marginal_support(mu, sigma, cutoff);
+        lo.push(marginal_lo.max(window.0));
+        hi.push(marginal_hi.min(window.1));
+    }
+    (lo, hi)
+}
+
+fn marginal_support(mu: f64, sigma: f64, cutoff: f64) -> (f64, f64) {
+    let half = if sigma.is_infinite() {
+        f64::INFINITY
+    } else {
+        // `cutoff` is already known to be in `(0, 1]` (`check_cutoff`), so the predecessor
+        // is zero for exactly one input: the smallest positive subnormal. There the only
+        // finite conservative inverse is the whole timeline. Every other threshold has a
+        // positive predecessor and a real `support_k`.
+        let marginal_floor = next_down(cutoff);
+        if marginal_floor == 0.0 {
+            f64::INFINITY
+        } else {
+            // `state_at` rounds both `(t - mu)` and the division by sigma before the
+            // marginal comparison. Gamma(2) bounds those two operations in ratio space;
+            // inflate by it before directing the time-domain arithmetic outwards.
+            let unit_roundoff = f64::EPSILON / 2.0;
+            let guard = 2.0 * unit_roundoff / (1.0 - 2.0 * unit_roundoff);
+            next_up(support_k(marginal_floor) * sigma.max(1e-30) * (1.0 + guard))
+        }
+    };
+    (next_down(mu - half), next_up(mu + half))
+}
+
+/// The next representable value toward positive infinity, matching `nextafter(x, +inf)`.
+fn next_up(value: f64) -> f64 {
+    if value.is_nan() || value == f64::INFINITY {
+        return value;
+    }
+    if value == 0.0 {
+        return f64::from_bits(1);
+    }
+    let bits = value.to_bits();
+    f64::from_bits(if value > 0.0 { bits + 1 } else { bits - 1 })
+}
+
+/// The next representable value toward negative infinity, matching `nextafter(x, -inf)`.
+fn next_down(value: f64) -> f64 {
+    if value.is_nan() || value == f64::NEG_INFINITY {
+        return value;
+    }
+    if value == 0.0 {
+        return -f64::from_bits(1);
+    }
+    let bits = value.to_bits();
+    f64::from_bits(if value > 0.0 { bits - 1 } else { bits + 1 })
 }
 
 /// The median of a slice, taken the way NumPy takes it: the mean of the two middle values
@@ -479,7 +574,7 @@ fn plan_chunks(
     for pair in tops.windows(2) {
         let (a, b) = (pair[0], pair[1]);
         let pool: Vec<usize> = (0..n)
-            .filter(|i| lo[*i] >= a - 1e-9 && hi[*i] <= b + 1e-9 && assigned[*i] == usize::MAX)
+            .filter(|i| lo[*i] >= a && hi[*i] <= b && assigned[*i] == usize::MAX)
             .collect();
         let kept = tree.descend(a, b, 0, pool, &mut nodes, &mut assigned);
         if !kept.is_empty() {
@@ -704,7 +799,7 @@ fn encode(
         tops = vec![0.0, duration_sec.max(1e-9)];
     }
 
-    let (support_lo, support_hi) = g.support(opts.cutoff);
+    let (support_lo, support_hi) = planning_support(&q, opts.cutoff);
     let mut plans = if n == 0 {
         Vec::new()
     } else {
@@ -1300,4 +1395,45 @@ fn assert_bounds(worst: &BTreeMap<&'static str, f64>, bounds: &Bounds) -> Result
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod planning_tests {
+    use super::{marginal_support, next_up};
+    use crate::quantization::support_k;
+
+    #[test]
+    fn directed_support_survives_large_operand_cancellation() {
+        let mu: f64 = -4_672_108_911_132_672.0;
+        let sigma: f64 = 4_672_108_911_132_672.0;
+        let cutoff = (-0.5_f64).exp();
+        let t = 0.5;
+
+        let rounded_distance = (t - mu) / sigma;
+        assert_eq!(rounded_distance, 1.0);
+        assert!((-0.5 * rounded_distance * rounded_distance).exp() >= cutoff);
+        assert!(
+            next_up(mu + support_k(cutoff) * sigma) < t,
+            "one ULP of the cancelled endpoint is not a conservative bound"
+        );
+        let (_, hi) = marginal_support(mu, sigma, cutoff);
+        assert!(hi > t, "the outward bound must contain visible t={t}");
+    }
+
+    #[test]
+    fn directed_support_ends_strictly_outside_the_rounded_plateau() {
+        let mu = -6_222_906.0;
+        let sigma = 10_416_940.0;
+        let cutoff = 0.5;
+        let (lo, hi) = marginal_support(mu, sigma, cutoff);
+
+        for endpoint in [lo, hi] {
+            let z = (endpoint - mu) / sigma;
+            let marginal = (-0.5 * z * z).exp();
+            assert!(
+                marginal < cutoff,
+                "directed endpoint {endpoint} remains visible at marginal {marginal}"
+            );
+        }
+    }
 }

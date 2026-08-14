@@ -12,8 +12,8 @@ use std::collections::BTreeMap;
 use std::process::ExitCode;
 
 use fourdgs::indexed_reader::{
-    open_indexed, read_attachments, read_audio_sources, read_camera, read_chunk, read_objects,
-    IndexedScene,
+    open_indexed, read_attachments, read_audio_sources, read_camera, read_chunk, read_chunk_within,
+    read_objects, IndexedScene, ResidentBudget,
 };
 use fourdgs::keyframe_delta_file::decode_indexed as decode_keyframe_delta_indexed;
 use fourdgs::opcode;
@@ -106,10 +106,15 @@ fn run(path: &str) -> Result<String, Failure> {
     };
     let scene = open_indexed(&mut source).map_err(|e| Failure::from_error(path, &e))?;
 
+    // Every chunk stays resident until the scene is assembled, so the ceiling is carried
+    // between the reads rather than reset by each one.
+    let mut budget =
+        ResidentBudget::for_scene(&scene).map_err(|e| Failure::from_error(path, &e))?;
     let mut chunks = Vec::with_capacity(scene.index.len());
     for entry in &scene.index {
         chunks.push(
-            read_chunk(&mut source, &scene, entry, 3).map_err(|e| Failure::from_error(path, &e))?,
+            read_chunk_within(&mut source, &scene, entry, 3, &mut budget)
+                .map_err(|e| Failure::from_error(path, &e))?,
         );
     }
     let audio_sources =
