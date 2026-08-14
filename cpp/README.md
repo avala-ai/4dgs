@@ -163,9 +163,9 @@ file is validated against the model its Header declares rather than against the 
 shape.
 
 Both commands read ranges rather than files. `inspect` transfers nine bytes per record and the
-checksummed region; `validate` opens the scene over the same transport. A `keyframe-delta` file is
-the exception, and the C ABI is why — `fourdgs_keyframe_delta_states_json` takes a pointer and a
-length with no range-reading counterpart.
+checksummed region; `validate` opens the scene over the same transport. For `keyframe-delta`, it
+passes that reader through `fourdgs_validate_keyframe_delta_reader`, whose indexed and sequential
+modes validate the file within their declared bounds without first buffering the whole resource.
 
 Exit codes: **0** fine, **1** refused or invalid, **2** valid with warnings, **3** the tool could
 not run — a missing file, an argument it does not understand, or a build with no decoder behind it.

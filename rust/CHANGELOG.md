@@ -8,6 +8,16 @@ All notable changes to the Rust crate are documented here, following
 
 ### Added
 
+- **Bounded `keyframe-delta` validation on the C ABI.** `fourdgs_validate_keyframe_delta_reader`
+  certifies either the sequential or indexed read path over the existing range-reader abstraction,
+  retaining only the current population and GOP keyframe. Lifetime identity introductions are
+  streamed to a caller-owned sink so a CLI can prove uniqueness with bounded scratch storage at its
+  I/O edge; the declared lifetime count is returned only after the complete path validates. The
+  validator checks the physical ownership and exact set of SH Band Streams as well as their inner
+  attribute, shape, and unsigned-byte coefficient domain. `fourdgs_last_error_offset` exposes the
+  offending record byte without making bindings parse an error sentence. Both symbols are additive,
+  and transferred reader contexts are released exactly once on every success and failure path.
+
 - **A `keyframe-delta` encoder on the C ABI.** `write_sequence` has been the reference for this
   model since 0.3.0 and no binding could reach it, which is why the feature matrix recorded C++ and
   Swift as Planned for encoding it. Eleven additive symbols close that:

@@ -65,6 +65,9 @@ thread_local! {
     /// written only with it, so the message and the identifier a caller reads always
     /// describe the same failure.
     static LAST_REFUSAL: RefCell<Option<&'static str>> = const { RefCell::new(None) };
+    /// Byte of the last failure when the operation can place it. Kept separate from the
+    /// sentence for bindings that need a structured diagnostic rather than text parsing.
+    static LAST_ERROR_OFFSET: RefCell<Option<u64>> = const { RefCell::new(None) };
 }
 
 fn set_last_error(message: String) {
@@ -76,6 +79,9 @@ fn set_last_error(message: String) {
     // past the end — are not named refusals, and a stale identifier left behind by an
     // earlier one would name the wrong error. `report` sets it again for the refusals.
     LAST_REFUSAL.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+    LAST_ERROR_OFFSET.with(|slot| {
         *slot.borrow_mut() = None;
     });
 }
@@ -118,6 +124,14 @@ fn report(error: Error) -> c_int {
     // previous failure left behind, so writing this first would erase it again.
     LAST_REFUSAL.with(|slot| {
         *slot.borrow_mut() = code;
+    });
+    status
+}
+
+fn report_at(error: Error, offset: Option<u64>) -> c_int {
+    let status = report(error);
+    LAST_ERROR_OFFSET.with(|slot| {
+        *slot.borrow_mut() = offset;
     });
     status
 }
@@ -183,6 +197,29 @@ pub unsafe extern "C" fn fourdgs_last_refusal_code(
                     *out_len = 0;
                 }
             }
+        }
+        FOURDGS_STATUS_OK
+    })
+}
+
+/// The byte attached to the last failure on this thread, when the operation can place it.
+///
+/// This mirrors `fourdgs_last_refusal_code`: absence is a successful empty result, and a
+/// null out parameter does not overwrite the diagnosis the caller is trying to read.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_last_error_offset(
+    out_offset: *mut u64,
+    out_has_offset: *mut c_int,
+) -> c_int {
+    guarded(|| {
+        if out_offset.is_null() || out_has_offset.is_null() {
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        }
+        let offset = LAST_ERROR_OFFSET.with(|slot| *slot.borrow());
+        // SAFETY: both pointers were checked non-null.
+        unsafe {
+            *out_has_offset = i32::from(offset.is_some());
+            *out_offset = offset.unwrap_or(0);
         }
         FOURDGS_STATUS_OK
     })
@@ -1211,6 +1248,76 @@ pub unsafe extern "C" fn fourdgs_open_reader_ex(
             return FOURDGS_STATUS_INVALID_ARGUMENT;
         }
         open_from_with(Box::new(CallbackSource { reader }), mode, out)
+    })
+}
+
+/// Validate one `keyframe-delta` read path over a caller-supplied range source.
+///
+/// The core keeps at most the current population and its GOP keyframe. Every lifetime identity
+/// introduction is handed to `identity` with the byte offset of its keyframe or delta record; a
+/// CLI can partition those values onto scratch storage and prove uniqueness without retaining a
+/// scene-sized set. The source context transfers to this call and is released exactly once, on
+/// success or failure.
+#[no_mangle]
+pub unsafe extern "C" fn fourdgs_validate_keyframe_delta_reader(
+    reader: fourdgs_reader,
+    mode: c_int,
+    identity_ctx: *mut c_void,
+    identity: Option<unsafe extern "C" fn(ctx: *mut c_void, record_offset: u64, id: u32) -> c_int>,
+    out_declared_gaussian_count: *mut u64,
+) -> c_int {
+    guarded(|| {
+        // Take ownership before validating any other argument so `release` runs on every
+        // return path, including a bad callback, mode, or out parameter.
+        let mut source = CallbackSource { reader };
+        if source.reader.size.is_none() || source.reader.read.is_none() {
+            drop(source);
+            set_last_error("a reader needs both a size and a read callback".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        }
+        let Some(identity) = identity else {
+            drop(source);
+            set_last_error("the identity callback is null".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        };
+        if out_declared_gaussian_count.is_null() {
+            drop(source);
+            set_last_error("the declared gaussian count out parameter is null".into());
+            return FOURDGS_STATUS_INVALID_ARGUMENT;
+        }
+        let mode = match mode {
+            FOURDGS_OPEN_SEQUENTIAL => crate::keyframe_delta_validate::ValidationMode::Streamed,
+            FOURDGS_OPEN_INDEXED => crate::keyframe_delta_validate::ValidationMode::Indexed,
+            _ => {
+                drop(source);
+                set_last_error(format!(
+                    "{mode} is not a concrete keyframe-delta validation mode"
+                ));
+                return FOURDGS_STATUS_INVALID_ARGUMENT;
+            }
+        };
+        let result =
+            crate::keyframe_delta_validate::validate(&mut source, mode, |record_offset, id| {
+                // SAFETY: the callback and context are supplied by the caller for this call's
+                // duration. It receives a value, not a borrowed pointer.
+                let status = unsafe { identity(identity_ctx, record_offset, id) };
+                if status == FOURDGS_STATUS_OK {
+                    Ok(())
+                } else {
+                    Err(Error::Io(std::io::Error::other(format!(
+                        "the identity callback returned status {status}"
+                    ))))
+                }
+            });
+        drop(source);
+        match result {
+            Ok(summary) => {
+                // SAFETY: checked non-null above; written only after the complete validation.
+                unsafe { *out_declared_gaussian_count = summary.declared_gaussian_count };
+                FOURDGS_STATUS_OK
+            }
+            Err(failure) => report_at(failure.error, failure.offset),
+        }
     })
 }
 
@@ -2806,7 +2913,7 @@ pub unsafe extern "C" fn fourdgs_kd_writer_add_sample(
             // SAFETY: the caller states `ids` points at `count` readable u32s.
             unsafe { std::slice::from_raw_parts(ids, n) }
                 .iter()
-                .map(|&id| i64::from(id))
+                .map(|&id| i64::from(id as i32))
                 .collect()
         };
         let positions = column!(positions, 3, "positions");
