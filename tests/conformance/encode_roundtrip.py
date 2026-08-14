@@ -794,6 +794,7 @@ def compare(
     check_chunk_geometry: bool = False,
     check_aabb_geometry: bool = False,
     normalize_capture_profile: bool = False,
+    candidate_family: str | None = None,
 ) -> list[str]:
     """Prove one variant. Returns the known divergences it tolerated; raises on the rest."""
     ref_out = os.path.join(tmp, "reference.4dgs")
@@ -864,11 +865,23 @@ def compare(
                 for key in [k for k in summary if k in ("objects", "states") or k.startswith(("objects.", "states."))]:
                     summary.pop(key, None)
     differing = [key for key in sorted(set(ref) | set(cand)) if ref.get(key) != cand.get(key)]
-    notes = {
-        key: known_reference_divergence(variant, ladder, key, cand.get(key), ref.get(key))
-        for key in differing
-        if allow_known_reference_divergences
-    }
+    notes = {}
+    for key in differing:
+        note = (
+            known_reference_divergence(variant, ladder, key, cand.get(key), ref.get(key))
+            if allow_known_reference_divergences
+            else None
+        )
+        if note is None and candidate_family is not None:
+            note = known_candidate_divergence(
+                candidate_family,
+                variant,
+                ladder,
+                key,
+                cand.get(key),
+                ref.get(key),
+            )
+        notes[key] = note
     unaccounted = {key: (ref.get(key), cand.get(key)) for key in differing if not notes.get(key)}
     if unaccounted:
         raise AssertionError(_diff(unaccounted))
@@ -1167,34 +1180,62 @@ def _diff(unaccounted: dict[str, tuple], left: str = "reference", right: str = "
 #: number, which is the difference between a known divergence and an unnoticed one.
 KNOWN_REFERENCE_DIVERGENCES = {
     (
-        "MixedLifetimes-CustomCutoff-UseChunkIndex-UseCrc",
+        "OneWindow-Quantized-UseChunkIndex-UseCrc",
         None,
         "chunkIntervals",
     ): (
-        "30834166acd73413c9ec7ddacc6659f5064664426dff349fee7ae706ce3e320b",
-        "ad2cf5ba91d371a5fb735bb5807685763cda67efd890f916d98fb36fd4721c58",
-        "#182(1): Python's _encode drops opts.cutoff and supports at 0.05; Rust passes it through",
+        "7fc12f4cc38623ae25e9c694a5f2d83349f998ba911110961a92984d0b7c3e4c",
+        "77e5ef9f232ecbc8502e3bea045fe1dcdc517b4cdecf0afb2155b94ae3c488a4",
+        "#182(1): Rust still plans from source lifetimes; Python plans from reconstructed lifetimes",
     ),
     (
-        "MixedLifetimes-CustomCutoff-UseChunkIndex-UseCrc",
+        "OneWindow-Quantized-UseChunkIndex-UseCrc",
         None,
         "statistics.chunkCount",
     ): (
-        "9df59c3d4c39c130062ef9655dac0f0c4179a19c69f40b8db0c0d0ff2c0cc11b",
-        "a04908f573e7a1c9b9f62563bb9a5188334fd250d76875e845de3f24c895eb4b",
-        "#182(1): the same dropped cutoff, counted — Python writes 24 chunks and Rust writes 27",
+        "d10a4bc9e0c1fa4e8f3d7ce2512b8756e47ca5fa451f373c39a1431bb88db49f",
+        "92e9e7e5922d26e17e48f0869ab25cc99499fdab722c065de8e0965c96c68e86",
+        "#182(1): the reconstructed-support mismatch counted — Python writes 5 chunks and Rust writes 6",
     ),
     (
-        "MixedLifetimes-CustomCutoff-UseChunkIndex-UseCrc",
+        "OneWindow-Quantized-UseChunkIndex-UseCrc",
         None,
         "index.chunkCount",
     ): (
-        "c2356069e9d1e79ca924378153cfbbfb4d4416b1f99d41a2940bfdb66c5319db",
-        "670671cd97404156226e507973f2ab8330d3022ca96e0c93bdbdb320c41adcaf",
-        "#182(1): the same dropped cutoff, as the index counts 24 chunks against 27",
+        "ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d",
+        "e7f6c011776e8db7cd330b54174fd76f7d0216b612387a5ffcfb81e6f0919683",
+        "#182(1): the reconstructed-support mismatch as the index counts 5 chunks against 6",
     ),
 }
 
+#: Temporary candidate-vs-reference divergences while the one-language #182(1) stack is
+#: in flight. The Rust layer corrects the shared reference before the independent
+#: TypeScript writer can follow, so that middle layer otherwise goes red for the old
+#: six-chunk layout. This is deliberately a second, candidate-family-keyed ledger rather
+#: than a broad exemption: it is dormant while Rust still emits six chunks, matches only
+#: these exact two values once Rust emits five, and is removed by the TypeScript layer.
+KNOWN_CANDIDATE_DIVERGENCES = {
+    (
+        "typescript",
+        "OneWindow-Quantized-UseChunkIndex-UseCrc",
+        None,
+        "chunkIntervals",
+    ): (
+        "77e5ef9f232ecbc8502e3bea045fe1dcdc517b4cdecf0afb2155b94ae3c488a4",
+        "7fc12f4cc38623ae25e9c694a5f2d83349f998ba911110961a92984d0b7c3e4c",
+        "#182(1): TypeScript still writes 6 source-support chunks; the corrected Rust reference writes 5",
+    ),
+    (
+        "typescript",
+        "OneWindow-Quantized-UseChunkIndex-UseCrc",
+        None,
+        "statistics.chunkCount",
+    ): (
+        "92e9e7e5922d26e17e48f0869ab25cc99499fdab722c065de8e0965c96c68e86",
+        "d10a4bc9e0c1fa4e8f3d7ce2512b8756e47ca5fa451f373c39a1431bb88db49f",
+        "#182(1): the temporary TypeScript 6-chunk layout counted against the corrected Rust 5",
+    ),
+}
 #: The keys two different reference encoders cannot agree on by construction, and should not:
 #: each names itself in `library`, and byte offsets follow from each one's own layout.
 REFERENCE_IDENTITY_KEYS = LAYOUT_DEPENDENT_KEYS
@@ -1220,6 +1261,22 @@ def _semantic_bounds(bounds: dict[str, str]) -> dict[str, Decimal]:
     `5e-05`, `5e-5`, and `0.00005` are one bound; a missing key or a different number is not.
     """
     return {key: Decimal(value) for key, value in bounds.items()}
+
+
+def known_candidate_divergence(
+    candidate_family: str,
+    variant: str,
+    ladder: str | None,
+    field: str,
+    candidate,
+    reference,
+) -> str | None:
+    expected = KNOWN_CANDIDATE_DIVERGENCES.get((candidate_family, variant, ladder, field))
+    if expected is None:
+        return None
+    candidate_hash, reference_hash, note = expected
+    fingerprints = (_fingerprint(candidate), _fingerprint(reference))
+    return note if fingerprints == (candidate_hash, reference_hash) else None
 
 
 def _declared_shape(path: str) -> dict:
@@ -1520,6 +1577,45 @@ def _test_bound_spellings_compare_by_numeric_value(_tmp: str) -> list[str]:
     return ["3 spellings agree; absent, different, and binary64-neighboring decimals do not"]
 
 
+def _test_candidate_divergence_fingerprints_are_exact(_tmp: str) -> list[str]:
+    """A temporary stack exemption recognizes its two values and nothing adjacent."""
+    variant = "OneWindow-Quantized-UseChunkIndex-UseCrc"
+    five_intervals = [[0.0, 2.0], [0.0, 1.0], [1.0, 2.0], [0.5, 1.0], [1.5, 2.0]]
+    six_intervals = [
+        [0.0, 2.0],
+        [0.0, 1.0],
+        [1.0, 2.0],
+        [0.0, 0.5],
+        [0.5, 1.0],
+        [1.5, 2.0],
+    ]
+    cases = (
+        ("chunkIntervals", six_intervals, five_intervals, [*six_intervals, [1.75, 2.0]]),
+        ("statistics.chunkCount", "6", "5", "7"),
+    )
+    for field, candidate, reference, stale_candidate in cases:
+        if known_candidate_divergence("typescript", variant, None, field, candidate, reference) is None:
+            raise AssertionError(f"the exact temporary TypeScript {field} divergence was not recognized")
+        for family, ladder, changed_candidate, changed_reference in (
+            ("dart", None, candidate, reference),
+            ("typescript", SH_LADDER, candidate, reference),
+            ("typescript", None, stale_candidate, reference),
+            ("typescript", None, candidate, stale_candidate),
+        ):
+            if known_candidate_divergence(
+                family,
+                variant,
+                ladder,
+                field,
+                changed_candidate,
+                changed_reference,
+            ):
+                raise AssertionError(
+                    f"the temporary TypeScript {field} ledger swallowed a different family, pass, or value"
+                )
+    return ["candidate ledger recognizes 2 exact values and rejects family, pass, and value near-misses"]
+
+
 #: An opcode and a u64 length precede every record's content.
 RECORD_HEADER_BYTES = 9
 
@@ -1731,6 +1827,7 @@ def run_self_test() -> int:
         _test_agreement_still_catches_divergence,
         _test_objects_profile_refusal_agreement,
         _test_bound_spellings_compare_by_numeric_value,
+        _test_candidate_divergence_fingerprints_are_exact,
         _test_index_counts_bite,
     )
     failed = 0
@@ -1801,6 +1898,7 @@ def run_encoder(encoder: str) -> int:
                         check_chunk_geometry,
                         check_aabb_geometry,
                         normalize_capture_profile,
+                        encoder,
                     )
                 except (AssertionError, RuntimeError) as exc:
                     failed += 1
