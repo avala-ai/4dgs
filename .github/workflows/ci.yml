@@ -643,6 +643,22 @@ jobs:
           ctest --test-dir cpp/build --build-config "$FOURDGS_CMAKE_CONFIG" \
             --output-on-failure --timeout 120
 
+      # Every other source-build leg configures into $RUNNER_TEMP, outside the repository —
+      # which is exactly the layout that cannot see this. Cargo resolves a workspace by
+      # walking up from the manifest CMake stages, so a build directory *inside* the
+      # repository finds the root `Cargo.toml` and refuses the staged crate as a member it
+      # is not. `cpp/build` and `cpp/build-nocore` above are in-repo, cpp/README.md tells a
+      # reader to use `cpp/build`, and neither of those builds the core from source. This
+      # step is the one that does both, so the case cannot go untested again.
+      - name: An in-repo build directory builds the core from source
+        run: |
+          cmake -S cpp -B cpp/build-source \
+            -DCMAKE_BUILD_TYPE="$FOURDGS_CMAKE_CONFIG" \
+            -DFOURDGS_BUILD_CORE_FROM_SOURCE=ON
+          cmake --build cpp/build-source --config "$FOURDGS_CMAKE_CONFIG" -j
+          ctest --test-dir cpp/build-source --build-config "$FOURDGS_CMAKE_CONFIG" \
+            --output-on-failure --timeout 120
+
       - name: The example runs, so it cannot rot into a snippet that no longer works
         run: |
           ./cpp/build/examples/decode_summary \

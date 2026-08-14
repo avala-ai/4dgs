@@ -102,11 +102,13 @@ contains that crate, and `FOURDGS_BUILD_CORE_FROM_SOURCE` defaults to `ON` for C
 target directory under the CMake build, then makes the C++ library depend on and link the result.
 The crate manifest and source are staged under that writable build directory as well, so Cargo's
 uncommitted library lockfile never mutates a fetched dependency and read-only source checkouts work.
-Selecting only the static library avoids making a cross build link the crate's unrelated `cdylib`
-with a Cargo linker configuration the CMake toolchain does not control. A native build derives the
-triple from `cargo -vV`; a cross build must name the toolchain's Rust triple with
-`FOURDGS_CARGO_TARGET`, so it cannot silently build a host archive for a target linker. The same
-requirement applies when `CMAKE_CXX_COMPILER_TARGET`, Visual Studio `-A`, or
+The staged manifest gains an empty `[workspace]` table, which is what it is — one crate, built alone
+— and what keeps a build directory inside this repository from being read as a member of the root
+workspace it is not listed in. Selecting only the static library avoids making a cross build link
+the crate's unrelated `cdylib` with a Cargo linker configuration the CMake toolchain does not
+control. A native build derives the triple from `cargo -vV`; a cross build must name the toolchain's
+Rust triple with `FOURDGS_CARGO_TARGET`, so it cannot silently build a host archive for a target
+linker. The same requirement applies when `CMAKE_CXX_COMPILER_TARGET`, Visual Studio `-A`, or
 `CMAKE_OSX_ARCHITECTURES` selects a target without setting CMake's cross-compiling flag, and when a
 compiler mode such as `-m32` changes the detected pointer ABI. A universal macOS build needs a
 pre-combined `FOURDGS_CORE_LIBRARY`; one Cargo target can only produce a thin archive. Building the

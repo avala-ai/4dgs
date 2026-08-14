@@ -240,7 +240,32 @@ if(FOURDGS_BUILD_CORE_FROM_SOURCE AND FOURDGS_CORE_LIBRARY STREQUAL "")
   # changes.
   set(FOURDGS_CORE_CARGO_SOURCE_DIR "${CMAKE_CURRENT_BINARY_DIR}/rust-core-source")
   file(MAKE_DIRECTORY "${FOURDGS_CORE_CARGO_SOURCE_DIR}")
-  configure_file("${FOURDGS_CORE_SOURCE_ROOT}/rust/fourdgs/Cargo.toml"
+  # The staged manifest declares itself its own workspace root.
+  #
+  # Cargo resolves a workspace by walking up from the manifest it was given, so a copy that
+  # lands anywhere under this repository finds the root `Cargo.toml` — whose `[workspace]`
+  # lists three crate paths and not this one — and refuses with "current package believes
+  # it's in a workspace when it's not". That is every in-repo build directory: `cpp/build`
+  # and `cpp/build-nocore`, which CI configures, and `cpp/build`, which cpp/README.md tells
+  # a reader to use. An out-of-tree consumer never saw it, because a build tree outside the
+  # repository walks up past nothing. One crate built alone into an isolated target
+  # directory is not a workspace member, so an empty `[workspace]` table is the accurate
+  # thing to append as well as the fix.
+  set_property(
+    DIRECTORY
+    APPEND
+    PROPERTY CMAKE_CONFIGURE_DEPENDS "${FOURDGS_CORE_SOURCE_ROOT}/rust/fourdgs/Cargo.toml")
+  file(READ "${FOURDGS_CORE_SOURCE_ROOT}/rust/fourdgs/Cargo.toml"
+       FOURDGS_CORE_CARGO_MANIFEST)
+  # Staged and then copied rather than written straight to its destination, so a manifest
+  # that has not changed keeps its timestamp and reconfiguring does not rebuild the core.
+  file(
+    WRITE "${CMAKE_CURRENT_BINARY_DIR}/rust-core-manifest.toml"
+    "${FOURDGS_CORE_CARGO_MANIFEST}\n"
+    "# Appended by cpp/CMakeLists.txt. This copy is built alone, so it is its own\n"
+    "# workspace root rather than a member of the one above it in the source tree.\n"
+    "[workspace]\n")
+  configure_file("${CMAKE_CURRENT_BINARY_DIR}/rust-core-manifest.toml"
                  "${FOURDGS_CORE_CARGO_SOURCE_DIR}/Cargo.toml" COPYONLY)
   set(FOURDGS_CORE_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/rust-core")
   if(FOURDGS_CARGO_WINDOWS_ABI STREQUAL "MSVC")

@@ -31,7 +31,12 @@ All notable changes to the C++ package are documented here, following
   default, while an installed no-core package preserves an empty `fourdgs-cpp_CORE_LIBRARY` value.
   The Cargo project is staged in the build tree so an absent lockfile never makes a read-only
   fetched source fail, and installing a prebuilt core dereferences symbolic links so the relocated
-  package contains archive bytes rather than a dangling build-tree link.
+  package contains archive bytes rather than a dangling build-tree link. The staged manifest
+  declares itself its own workspace root: Cargo resolves a workspace by walking up from the manifest
+  it is given, so a build directory anywhere inside this repository — `cpp/build`, which the README
+  and CI both use — found the root `Cargo.toml` and refused with "current package believes it's in a
+  workspace when it's not". CI now configures a source build into `cpp/build-source` as well as into
+  the runner's temporary directory, so the in-repo layout is covered rather than assumed.
 
 - **Complete bounded validation for `keyframe-delta`.** The tool now certifies the sequential path
   for every file and the indexed path when a Chunk Index is present, through the core's range-reader
