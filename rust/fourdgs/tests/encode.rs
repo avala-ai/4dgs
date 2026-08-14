@@ -327,6 +327,52 @@ fn support_planning_covers_the_complete_rounded_visibility_plateau() {
 }
 
 #[test]
+fn a_cutoff_outside_the_unit_interval_is_refused() {
+    // `support_k` inverts `ln(cutoff)`. Zero and negative thresholds are a domain error
+    // there, and the result does not stay loud: the NaN half-width reaches `f64::max` and
+    // `f64::min`, which return the *other* operand, so support silently becomes the whole
+    // validity window and the Chunk Index claims a containment the file does not have. A
+    // threshold outside `(0, 1]` is not a threshold; it is refused before it is inverted,
+    // the same domain and the same sentence as Python's `quantization.support_k`.
+    for bad in [0.0, -0.0, -0.05, 1.5, f64::INFINITY, f64::NAN] {
+        let result = fourdgs::write_to_vec(
+            &one_temporal_gaussian(0.5, 0.1, 1.0),
+            1.0,
+            &one_gaussian_chunking(bad, 1),
+            &SceneExtras::default(),
+        );
+        let error = result.expect_err("a cutoff outside (0, 1] must be refused");
+        assert!(
+            matches!(error, fourdgs::Error::InvalidInput(_)),
+            "expected InvalidInput for cutoff {bad}, got {error}"
+        );
+        assert!(
+            error.to_string().contains("cutoff") && error.to_string().contains("(0, 1]"),
+            "the error must name the field and its domain: {error}"
+        );
+    }
+}
+
+#[test]
+fn the_smallest_positive_cutoff_plans_the_whole_timeline() {
+    // The one legal threshold whose predecessor is zero. There is no finite `support_k` to
+    // invert, so the conservative bound is the whole timeline — which is what the planner
+    // must use, rather than the `NaN` that an unchecked negative predecessor would give.
+    let cutoff = f64::from_bits(1);
+    assert_eq!(f64::from_bits(cutoff.to_bits() - 1), 0.0);
+    let bytes = fourdgs::write_to_vec(
+        &one_temporal_gaussian(0.5, 0.1, 1.0),
+        1.0,
+        &one_gaussian_chunking(cutoff, 1),
+        &SceneExtras::default(),
+    )
+    .expect("encode");
+    for t in [0.0, 0.25, 0.5, 0.75] {
+        assert_indexed_gaussian_is_visible(&bytes, t);
+    }
+}
+
+#[test]
 fn a_scene_survives_a_round_trip() {
     let (g, duration) = scene(256);
     let bytes = fourdgs::write_to_vec(&g, duration, &chunking_options(), &SceneExtras::default())

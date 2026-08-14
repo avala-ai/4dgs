@@ -268,7 +268,26 @@ fn extra_object_table_count(records: &[Vec<u8>]) -> Result<usize> {
     Ok(count)
 }
 
+/// Refuse a marginal threshold that is not one.
+///
+/// A threshold outside `(0, 1]` is not a threshold, and it has to be refused here rather
+/// than become a domain error inside a logarithm. `support_k` inverts `ln(cutoff)`, so a
+/// zero or negative value yields `inf` or `NaN`, and both propagate quietly: the velocity
+/// precision class collapses, and in `planning_support` `f64::max`/`f64::min` discard NaN
+/// operands, so a NaN half-width silently reads as "the whole validity window" and the
+/// Chunk Index promises a containment the file does not have. Python refuses the same
+/// domain with the same sentence (`quantization.support_k`).
+fn check_cutoff(cutoff: f64) -> Result<()> {
+    if !(cutoff > 0.0 && cutoff <= 1.0) {
+        return Err(Error::InvalidInput(format!(
+            "the Header's cutoff is {cutoff}; a marginal threshold must be in (0, 1]"
+        )));
+    }
+    Ok(())
+}
+
 fn quantize_scene(g: &GaussianSet, opts: &WriteOptions) -> Result<Quantized> {
+    check_cutoff(opts.cutoff)?;
     check_finite_input(g)?;
     let n = g.count();
     // Position tolerance is a fraction of the median gaussian radius rather than an
@@ -403,6 +422,10 @@ fn marginal_support(mu: f64, sigma: f64, cutoff: f64) -> (f64, f64) {
     let half = if sigma.is_infinite() {
         f64::INFINITY
     } else {
+        // `cutoff` is already known to be in `(0, 1]` (`check_cutoff`), so the predecessor
+        // is zero for exactly one input: the smallest positive subnormal. There the only
+        // finite conservative inverse is the whole timeline. Every other threshold has a
+        // positive predecessor and a real `support_k`.
         let marginal_floor = next_down(cutoff);
         if marginal_floor == 0.0 {
             f64::INFINITY
