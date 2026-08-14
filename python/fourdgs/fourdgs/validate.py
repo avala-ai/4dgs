@@ -28,8 +28,8 @@ the Rust validator's, which is what lets the two tools be diffed.
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
-from decimal import Decimal, InvalidOperation
 
 from . import opcode as op
 from . import records as rec
@@ -203,6 +203,47 @@ def _check_provenance(prov: Provenance, report: Report) -> None:
         )
 
 
+#: The whole of the spelling §5.3 allows a `bounds` value: an optional sign, ASCII digits with
+#: an optional point, and an optional exponent. Nothing surrounds it and nothing separates its
+#: digits.
+_BOUND = re.compile(r"([+-]?)(?:([0-9]+)(?:\.([0-9]*))?|\.([0-9]+))(?:[eE]([+-]?[0-9]+))?")
+
+
+def _decimal_equals_integer(value: str, expected: int) -> bool:
+    """Whether the §5.3 bound `value` spells exactly the non-negative integer `expected`.
+
+    Deliberately not `Decimal(value)`. This reference has to agree with the TypeScript, Rust
+    and Dart validators on every input, and `Decimal` accepts a far wider language than §5.3
+    — underscores anywhere, decimal digits from any script, Python's own whitespace set — and
+    refuses exponents outside a range that moves with the interpreter build. Matching the
+    grammar here is what makes the four agree, and comparing digit strings is what lets an
+    exponent of any length be read without building the number or touching binary64.
+    """
+    match = _BOUND.fullmatch(value)
+    if match is None:
+        return False
+    integer = match[2] or ""
+    digits = integer + (match[3] or match[4] or "")
+    first_nonzero = next((i for i, digit in enumerate(digits) if digit != "0"), None)
+    # A significand of zeroes is the value zero, at whatever exponent it carries.
+    if first_nonzero is None:
+        return expected == 0
+    if match[1] == "-":
+        return False
+    significant = digits[first_nonzero:].rstrip("0")
+    required = len(str(expected)) - len(integer) + first_nonzero
+    return significant == str(expected) and _decimal_integer_equals(match[5] or "0", required)
+
+
+def _decimal_integer_equals(value: str, expected: int) -> bool:
+    """Whether the signed digit string `value` is `expected`, without building the number."""
+    negative = value.startswith("-")
+    digits = (value[1:] if value.startswith(("+", "-")) else value).lstrip("0")
+    if not digits:
+        return expected == 0
+    return negative == (expected < 0) and digits == str(abs(expected))
+
+
 def _check_sh_bit_depths(quant: rec.Quantization, sh_degree: int, report: Report) -> None:
     """The per-band SH bit depths, against the degree the Header declares (spec §6.5).
 
@@ -228,12 +269,7 @@ def _check_sh_bit_depths(quant: rec.Quantization, sh_degree: int, report: Report
         expected = sh_bound(bits)
         if declared is None:
             report.warn(f"Quantization declares {bits} bits for SH band {i} but no `{key}` bound (§5.3)")
-        else:
-            try:
-                agrees = Decimal(declared).is_finite() and Decimal(declared) == Decimal(expected)
-            except InvalidOperation:
-                agrees = False
-        if declared is not None and not agrees:
+        elif not _decimal_equals_integer(declared, expected):
             report.warn(f"Quantization declares `{key}` as {declared}; {bits} bits gives a bound of {expected} (§6.5)")
     coarsest = max(sh_step(b) for b in quant.sh_bit_depths[:sh_degree])
     if quant.step_sh != coarsest:
