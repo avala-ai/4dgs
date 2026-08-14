@@ -430,24 +430,43 @@ void aReusedIdentityNamesItsSecondIntroductionRecord() {
     data.winHi = {1.0f};
     return data;
   };
-  std::vector<std::vector<std::uint32_t>> ids{{7}, {}, {7}};
   std::vector<fourdgs::GaussianData> populations{population(1), population(0), population(1)};
-  std::vector<fourdgs::KeyframeDeltaSample> samples;
-  for (std::size_t i = 0; i < ids.size(); ++i) {
-    fourdgs::KeyframeDeltaSample sample;
-    sample.t0 = static_cast<double>(i) / 3.0;
-    sample.ids = Span<const std::uint32_t>(ids[i].data(), ids[i].size());
-    sample.gaussians = fourdgs::GaussianView(populations[i]);
-    samples.push_back(sample);
-  }
+  const auto samplesFor = [&](const std::vector<std::vector<std::uint32_t>>& ids) {
+    std::vector<fourdgs::KeyframeDeltaSample> samples;
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+      fourdgs::KeyframeDeltaSample sample;
+      sample.t0 = static_cast<double>(i) / 3.0;
+      sample.ids = Span<const std::uint32_t>(ids[i].data(), ids[i].size());
+      sample.gaussians = fourdgs::GaussianView(populations[i]);
+      samples.push_back(sample);
+    }
+    return samples;
+  };
   fourdgs::KeyframeDeltaOptions options;
   options.keyframeEvery = 8;
   options.deltaMode = fourdgs::kDeltaModeKeyframe;
+  options.keyframeAt = {2};
+
+  // The writer now correctly refuses an identity that reappears after death, so it cannot be
+  // asked to manufacture the validator's hostile fixture directly. Build two conforming files
+  // with identical layouts instead: 7 -> death -> 8 and 6 -> death -> 7. Copying the donor's
+  // final state record into the first file creates 7 -> death -> 7 without inventing Chunk
+  // framing or coupling this test to the compressed Attribute Stream representation. The index
+  // remains valid because the complete state records have the same length and offset.
+  const std::vector<std::vector<std::uint32_t>> ids{{7}, {}, {8}};
+  const std::vector<std::vector<std::uint32_t>> donorIds{{6}, {}, {7}};
+  const std::vector<fourdgs::KeyframeDeltaSample> samples = samplesFor(ids);
+  const std::vector<fourdgs::KeyframeDeltaSample> donorSamples = samplesFor(donorIds);
   fourdgs::Result<std::vector<std::uint8_t>> encoded = fourdgs::encodeKeyframeDeltaSequence(
       Span<const fourdgs::KeyframeDeltaSample>(samples.data(), samples.size()), 1.0, options);
+  fourdgs::Result<std::vector<std::uint8_t>> donor = fourdgs::encodeKeyframeDeltaSequence(
+      Span<const fourdgs::KeyframeDeltaSample>(donorSamples.data(), donorSamples.size()), 1.0,
+      options);
   CHECK(encoded.ok());
-  if (!encoded) return;
+  CHECK(donor.ok());
+  if (!encoded || !donor) return;
   std::vector<fourdgs::tool::Frame> states;
+  std::vector<fourdgs::tool::Frame> donorStates;
   fourdgs::Result<Walk> walked =
       fourdgs::tool::walkBytes(Span<const std::uint8_t>(encoded->data(), encoded->size()),
                                [&](const fourdgs::tool::Frame& frame, bool complete) {
@@ -456,9 +475,24 @@ void aReusedIdentityNamesItsSecondIntroductionRecord() {
                                    states.push_back(frame);
                                  }
                                });
+  fourdgs::Result<Walk> donorWalked =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(donor->data(), donor->size()),
+                               [&](const fourdgs::tool::Frame& frame, bool complete) {
+                                 if (complete && (frame.opcode == fourdgs::tool::op::kChunk ||
+                                                  frame.opcode == fourdgs::tool::op::kDeltaChunk)) {
+                                   donorStates.push_back(frame);
+                                 }
+                               });
   CHECK(walked.ok());
+  CHECK(donorWalked.ok());
   CHECK_EQ(states.size(), static_cast<std::size_t>(3));
-  if (!walked || states.size() != 3) return;
+  CHECK_EQ(donorStates.size(), states.size());
+  if (!walked || !donorWalked || states.size() != 3 || donorStates.size() != states.size()) return;
+  CHECK_EQ(donorStates[2].total(), states[2].total());
+  if (donorStates[2].total() != states[2].total()) return;
+  std::copy_n(donor->begin() + static_cast<std::ptrdiff_t>(donorStates[2].offset),
+              static_cast<std::size_t>(donorStates[2].total()),
+              encoded->begin() + static_cast<std::ptrdiff_t>(states[2].offset));
 
   const Report report =
       fourdgs::tool::validate(Span<const std::uint8_t>(encoded->data(), encoded->size()));
@@ -470,6 +504,10 @@ void aReusedIdentityNamesItsSecondIntroductionRecord() {
         std::string::npos) {
       placed = true;
     }
+  }
+  if (!placed) {
+    for (const fourdgs::tool::Finding& finding : report.findings)
+      std::fprintf(stderr, "  validator said: %s\n", finding.message.c_str());
   }
   CHECK(placed);
 }
