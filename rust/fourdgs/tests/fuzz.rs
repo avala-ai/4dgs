@@ -307,8 +307,15 @@ fn any_input_decodes_or_fails_cleanly() {
                     }
                 });
 
+                // Alternating transports on purpose. `fourdgs_open_memory` hands the core
+                // a slice that refuses an out-of-range read on its own, which silently
+                // stands in for checks the reader is supposed to make; a host callback
+                // does not, and it is what every C, C++ and Swift consumer supplies. A
+                // length the reader failed to check against the resource is an allocation
+                // on that path and nothing at all on this one.
+                let over_callback = step % 2 == 1;
                 check("the C ABI", seed, step, len, || {
-                    exercise_c_abi(&input);
+                    exercise_c_abi(&input, over_callback);
                 });
             }
         }
@@ -332,13 +339,27 @@ fn any_input_decodes_or_fails_cleanly() {
 ///
 /// A panic here would unwind into C++ or Swift, which is undefined behaviour rather than
 /// an error they can handle — so this is the boundary the invariant matters most at.
-fn exercise_c_abi(input: &[u8]) {
+fn exercise_c_abi(input: &[u8], over_callback: bool) {
     use fourdgs::capi::*;
 
     let mut scene: *mut fourdgs_scene = std::ptr::null_mut();
-    // SAFETY: `input` is a live slice for the duration of the call, and the scene pointer
-    // is freed below on exactly the path that set it.
-    let status = unsafe { fourdgs_open_memory(input.as_ptr(), input.len(), &mut scene) };
+    let status = if over_callback {
+        let host = Box::into_raw(Box::new(HostBytes(input.to_vec())));
+        let reader = fourdgs_reader {
+            ctx: host as *mut std::ffi::c_void,
+            size: Some(host_size),
+            read: Some(host_read),
+            release: Some(host_release),
+        };
+        // SAFETY: the callbacks read only through `ctx`, which is the box just leaked
+        // above and is freed exactly once by `host_release` when the source is dropped —
+        // which happens on a failed open as well as on `fourdgs_scene_free`.
+        unsafe { fourdgs_open_reader(reader, &mut scene) }
+    } else {
+        // SAFETY: `input` is a live slice for the duration of the call, and the scene
+        // pointer is freed below on exactly the path that set it.
+        unsafe { fourdgs_open_memory(input.as_ptr(), input.len(), &mut scene) }
+    };
     if status != FOURDGS_STATUS_OK {
         assert!(
             scene.is_null(),
@@ -412,6 +433,45 @@ fn exercise_c_abi(input: &[u8]) {
         }
         fourdgs_scene_free(scene);
     }
+}
+
+/// The bytes behind a host-supplied range source, owned by the source and released with
+/// it.
+struct HostBytes(Vec<u8>);
+
+unsafe extern "C" fn host_size(ctx: *mut std::ffi::c_void, out_size: *mut u64) -> std::ffi::c_int {
+    // SAFETY: `ctx` is the `HostBytes` leaked into the reader, live until `host_release`.
+    let host = unsafe { &*(ctx as *const HostBytes) };
+    unsafe { *out_size = host.0.len() as u64 };
+    fourdgs::capi::FOURDGS_STATUS_OK
+}
+
+unsafe extern "C" fn host_read(
+    ctx: *mut std::ffi::c_void,
+    offset: u64,
+    length: u64,
+    out: *mut u8,
+) -> std::ffi::c_int {
+    // SAFETY: as above; `out` is a buffer of at least `length` bytes owned by the core.
+    let host = unsafe { &*(ctx as *const HostBytes) };
+    let end = offset.saturating_add(length);
+    if end > host.0.len() as u64 {
+        return fourdgs::capi::FOURDGS_STATUS_TRUNCATED;
+    }
+    // SAFETY: the range was just checked against the resource.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            host.0[offset as usize..end as usize].as_ptr(),
+            out,
+            length as usize,
+        )
+    };
+    fourdgs::capi::FOURDGS_STATUS_OK
+}
+
+unsafe extern "C" fn host_release(ctx: *mut std::ffi::c_void) {
+    // SAFETY: the core calls this exactly once for the box leaked into the reader.
+    drop(unsafe { Box::from_raw(ctx as *mut HostBytes) });
 }
 
 /// A `Readable` over an owned buffer, so the indexed path can be fuzzed without a file.

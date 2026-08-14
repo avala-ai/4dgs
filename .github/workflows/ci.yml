@@ -71,10 +71,26 @@ jobs:
         # keyframe-reference regressions; 1376 after the bounded keyframe-delta validator
         # added fixed-header resource checks, exact record attribution, cross-delta lifetime
         # invariants, and their adversarial regressions; 1392 after its state-stream
-        # preflight, chunk-compression, identity-domain, and signed-bin regressions. A
-        # margin smaller than one deliberate review round is not headroom, it is the next
-        # source change failing a gate about
-        # vendored dependencies.
+        # preflight, chunk-compression, identity-domain, and signed-bin regressions; 1600
+        # after bounded
+        # indexed/streamed prefix reads, decoded working-set accounting, exact range framing,
+        # lazy Audio Source validation, and their hostile reader/C-ABI regressions made the
+        # clean combined Rust tree 1528 KiB; 1664 after the final review pass made
+        # retained prefix values and their collection backing share the decoded-state
+        # envelope, streamed excluded SH bands without buffering, and preflighted indexed
+        # SH reads, taking the final clean tree to 1624 KiB after indexed front-matter,
+        # Attachment, audio, and Delta working-set accounting; 1728 after the exact-review
+        # follow-ups made Delta groups/composition, indexed summary/Metadata/provenance and
+        # streamed decoded collections share those same bounds, preflighted compact Object
+        # Tables, and charged the indexed scene through replacement loads, taking the
+        # measured tree to 1692 KiB; 1792 after the final indexed lazy-family, Audio Source,
+        # Object Layer, and retained-cache aggregation pass took the clean tree to 1732 KiB;
+        # 1856 after exact-review follow-ups preflighted Header/Quantization/Metadata maps,
+        # Window Table and indexed range collections, and completed streamed audio and assembly
+        # scratch accounting, taking the clean tree to 1780 KiB.
+        # A margin smaller
+        # than one deliberate review round is not headroom, it is the next source change
+        # failing a gate about vendored dependencies.
         # A budget that tight stops being a budget and starts being a tax
         # on the next feature, so each raise leaves a little headroom. The number moves when
         # the tree grows deliberately, which is the one thing it is not meant to catch — it

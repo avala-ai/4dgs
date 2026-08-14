@@ -98,6 +98,126 @@ enum LoadKey {
     Chunk(u32),
 }
 
+fn reader_vector_bytes<T>(values: &Vec<T>, what: &str) -> Result<usize> {
+    values
+        .capacity()
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(|| Error::UnsupportedOperation(format!("{what} vector bytes overflow")))
+}
+
+fn reader_hash_bytes<K, V>(capacity: usize, what: &str) -> Result<usize> {
+    std::mem::size_of::<(K, V)>()
+        .checked_add(4 * std::mem::size_of::<usize>())
+        .and_then(|per_entry| capacity.checked_mul(per_entry))
+        .ok_or_else(|| Error::UnsupportedOperation(format!("{what} hash-table bytes overflow")))
+}
+
+fn add_retained_record_bytes(
+    retained: usize,
+    added: usize,
+    limit: usize,
+    what: &str,
+) -> Result<usize> {
+    let total = retained.checked_add(added).ok_or_else(|| {
+        Error::UnsupportedOperation(format!("indexed {what} retained bytes overflow"))
+    })?;
+    if total > limit {
+        return Err(Error::UnsupportedOperation(format!(
+            "the indexed {what} records retain {total} aggregate bytes, past the {limit} byte shared scene ceiling"
+        )));
+    }
+    Ok(total)
+}
+
+fn records_resident_bytes(records: &Records) -> Result<usize> {
+    let mut total = match &records.camera {
+        Some(camera) => indexed_reader::camera_resident_bytes(camera)?,
+        None => 0,
+    };
+    for bytes in [
+        indexed_reader::metadata_collection_resident_bytes(&records.metadata)?,
+        indexed_reader::attachment_collection_resident_bytes(&records.attachments)?,
+        indexed_reader::provenance_resident_bytes(&records.provenance)?,
+    ] {
+        total = total.checked_add(bytes).ok_or_else(|| {
+            Error::UnsupportedOperation("retained lazy-record bytes overflow".into())
+        })?;
+    }
+    Ok(total)
+}
+
+fn indexed_cache_resident_bytes(
+    records: Option<&Records>,
+    provenance_only: Option<&crate::provenance::Provenance>,
+    objects: Option<&crate::object_layer::ObjectLayer>,
+    sampled_object_poses: Option<&SampledObjectPoses>,
+    validated_object_tracks: &HashSet<u64>,
+) -> Result<usize> {
+    let mut total = 0usize;
+    if let Some(records) = records {
+        total = total
+            .checked_add(records_resident_bytes(records)?)
+            .ok_or_else(|| {
+                Error::UnsupportedOperation("indexed retained-cache bytes overflow".into())
+            })?;
+    }
+    if let Some(provenance) = provenance_only {
+        total = total
+            .checked_add(indexed_reader::provenance_resident_bytes(provenance)?)
+            .ok_or_else(|| {
+                Error::UnsupportedOperation("indexed retained-cache bytes overflow".into())
+            })?;
+    }
+    if let Some(objects) = objects {
+        total = total
+            .checked_add(indexed_reader::object_layer_resident_bytes(objects)?)
+            .ok_or_else(|| {
+                Error::UnsupportedOperation("indexed retained-cache bytes overflow".into())
+            })?;
+    }
+    if let Some(sampled) = sampled_object_poses {
+        total = total
+            .checked_add(reader_hash_bytes::<u32, crate::provenance::Pose>(
+                sampled.poses.capacity(),
+                "sampled Object Pose",
+            )?)
+            .ok_or_else(|| {
+                Error::UnsupportedOperation("indexed retained-cache bytes overflow".into())
+            })?;
+    }
+    total = total
+        .checked_add(reader_hash_bytes::<u64, ()>(
+            validated_object_tracks.capacity(),
+            "validated Object Track",
+        )?)
+        .ok_or_else(|| {
+            Error::UnsupportedOperation("indexed retained-cache bytes overflow".into())
+        })?;
+    Ok(total)
+}
+
+fn indexed_load_base_bytes(
+    scene: &IndexedScene,
+    loaded: &GaussianSet,
+    cache_bytes: usize,
+    limit: usize,
+) -> Result<usize> {
+    let total = stream_reader::gaussian_set_resident_bytes(loaded)?
+        .checked_add(indexed_reader::indexed_scene_resident_bytes(scene)?)
+        .and_then(|bytes| bytes.checked_add(cache_bytes))
+        .ok_or_else(|| {
+            Error::UnsupportedOperation(
+                "indexed scene and resident GaussianSet bytes overflow".into(),
+            )
+        })?;
+    if total > limit {
+        return Err(Error::UnsupportedOperation(format!(
+            "the opened indexed scene, previous GaussianSet, and lazy caches retain {total} bytes before a load, past the {limit} byte shared scene ceiling"
+        )));
+    }
+    Ok(total)
+}
+
 impl<R: Readable> SceneReader<R> {
     /// Open a scene, using the index when the file has one.
     pub fn open(source: R) -> Result<SceneReader<R>> {
@@ -113,6 +233,17 @@ impl<R: Readable> SceneReader<R> {
             // a front-to-back read is the defined answer, not a failure.
             OpenMode::Auto => match indexed_reader::open_indexed(&mut source) {
                 Ok(scene) if !scene.index.is_empty() => Some(scene),
+                // A large contiguous summary is an indexed-path transfer limit, not a
+                // scene-size limit: the sequential reader checksums it incrementally and
+                // parses extensible Statistics from a bounded prefix. Other indexed
+                // resource refusals describe work sequential opening would still retain
+                // or decode, so falling through would bypass the shared scene ceiling.
+                Err(error @ Error::UnsupportedOperation(_))
+                    if indexed_limit_allows_sequential_fallback(&error) =>
+                {
+                    None
+                }
+                Err(error @ Error::UnsupportedOperation(_)) => return Err(error),
                 _ => None,
             },
         };
@@ -132,11 +263,15 @@ impl<R: Readable> SceneReader<R> {
                 validated_object_tracks: HashSet::new(),
             });
         }
-        let scene = stream_reader::read_from(
+        let mut scene = stream_reader::read_from(
             SequentialSource::new(&mut source),
             &stream_reader::ReadOptions::default(),
         )?;
-        let loaded = scene.gaussians.clone();
+        // `SceneReader` keeps the streamed front matter beside its resident gaussian
+        // state. Move the assembled columns into that one resident slot: cloning them
+        // here would silently double every decoded vector after `read_from` had already
+        // enforced the complete scene working-set ceiling.
+        let loaded = std::mem::take(&mut scene.gaussians);
         Ok(SceneReader {
             source,
             mode: Mode::Streamed,
@@ -254,11 +389,28 @@ impl<R: Readable> SceneReader<R> {
             let Some(entry) = scene.audio_sources.get(index).cloned() else {
                 return Ok(None);
             };
-            return Ok(Some(indexed_reader::read_audio_source_descriptor(
-                &mut self.source,
+            let cache_bytes = indexed_cache_resident_bytes(
+                self.records.as_ref(),
+                self.provenance_only.as_ref(),
+                self.objects.as_ref(),
+                self.sampled_object_poses.as_ref(),
+                &self.validated_object_tracks,
+            )?;
+            let base = indexed_load_base_bytes(
                 scene,
-                &entry,
-            )?));
+                &self.loaded,
+                cache_bytes,
+                stream_reader::MAX_DECODED_SCENE_BYTES,
+            )?;
+            let remaining = stream_reader::MAX_DECODED_SCENE_BYTES - base;
+            return Ok(Some(
+                indexed_reader::read_audio_source_descriptor_with_limit(
+                    &mut self.source,
+                    scene,
+                    &entry,
+                    remaining,
+                )?,
+            ));
         }
         Ok(self.streamed.as_ref().and_then(|scene| {
             scene.audio_sources.get(index).map(|source| {
@@ -479,11 +631,84 @@ impl<R: Readable> SceneReader<R> {
             return Ok(());
         }
         let records = if let Some(scene) = &self.indexed {
+            let cache_bytes = indexed_cache_resident_bytes(
+                None,
+                self.provenance_only.as_ref(),
+                self.objects.as_ref(),
+                self.sampled_object_poses.as_ref(),
+                &self.validated_object_tracks,
+            )?;
+            let mut retained = indexed_reader::indexed_scene_resident_bytes(scene)?
+                .checked_add(stream_reader::gaussian_set_resident_bytes(&self.loaded)?)
+                .and_then(|bytes| bytes.checked_add(cache_bytes))
+                .ok_or_else(|| {
+                    Error::UnsupportedOperation(
+                        "indexed retained-record base bytes overflow".into(),
+                    )
+                })?;
+            let mut remaining = stream_reader::MAX_DECODED_SCENE_BYTES
+                .checked_sub(retained)
+                .ok_or_else(|| {
+                    Error::UnsupportedOperation(format!(
+                        "the indexed scene and existing caches retain {retained} bytes before lazy records, past the {} byte shared scene ceiling",
+                        stream_reader::MAX_DECODED_SCENE_BYTES
+                    ))
+                })?;
+            let camera =
+                indexed_reader::read_camera_with_limit(&mut self.source, scene, remaining)?;
+            retained = add_retained_record_bytes(
+                retained,
+                match &camera {
+                    Some(value) => indexed_reader::camera_resident_bytes(value)?,
+                    None => 0,
+                },
+                stream_reader::MAX_DECODED_SCENE_BYTES,
+                "Camera",
+            )?;
+
+            remaining = stream_reader::MAX_DECODED_SCENE_BYTES - retained;
+            let metadata =
+                indexed_reader::read_metadata_with_limit(&mut self.source, scene, remaining)?;
+            retained = add_retained_record_bytes(
+                retained,
+                indexed_reader::metadata_collection_resident_bytes(&metadata)?,
+                stream_reader::MAX_DECODED_SCENE_BYTES,
+                "Camera and Metadata",
+            )?;
+
+            remaining = stream_reader::MAX_DECODED_SCENE_BYTES - retained;
+            let attachments =
+                indexed_reader::read_attachments_with_limit(&mut self.source, scene, remaining)?;
+            retained = add_retained_record_bytes(
+                retained,
+                indexed_reader::attachment_collection_resident_bytes(&attachments)?,
+                stream_reader::MAX_DECODED_SCENE_BYTES,
+                "Camera, Metadata, and Attachment",
+            )?;
+
+            let provenance = if self.provenance_only.is_some() {
+                // Already charged in the base above; move the cache rather than cloning it.
+                self.provenance_only
+                    .take()
+                    .expect("checked immediately before taking")
+            } else {
+                remaining = stream_reader::MAX_DECODED_SCENE_BYTES - retained;
+                let value =
+                    indexed_reader::read_provenance_with_limit(&mut self.source, scene, remaining)?;
+                retained = add_retained_record_bytes(
+                    retained,
+                    indexed_reader::provenance_resident_bytes(&value)?,
+                    stream_reader::MAX_DECODED_SCENE_BYTES,
+                    "Camera, Metadata, Attachment, and provenance",
+                )?;
+                debug_assert!(retained <= stream_reader::MAX_DECODED_SCENE_BYTES);
+                value
+            };
             Records {
-                camera: indexed_reader::read_camera(&mut self.source, scene)?,
-                metadata: indexed_reader::read_metadata(&mut self.source, scene)?,
-                attachments: indexed_reader::read_attachments(&mut self.source, scene)?,
-                provenance: indexed_reader::read_provenance(&mut self.source, scene)?,
+                camera,
+                metadata,
+                attachments,
+                provenance,
             }
         } else {
             let scene = self.streamed.as_ref().expect("one path or the other");
@@ -503,7 +728,28 @@ impl<R: Readable> SceneReader<R> {
             return Ok(());
         }
         self.objects = Some(if let Some(scene) = &self.indexed {
-            indexed_reader::read_objects(&mut self.source, scene)?
+            let cache_bytes = indexed_cache_resident_bytes(
+                self.records.as_ref(),
+                self.provenance_only.as_ref(),
+                None,
+                self.sampled_object_poses.as_ref(),
+                &self.validated_object_tracks,
+            )?;
+            let retained = indexed_reader::indexed_scene_resident_bytes(scene)?
+                .checked_add(stream_reader::gaussian_set_resident_bytes(&self.loaded)?)
+                .and_then(|bytes| bytes.checked_add(cache_bytes))
+                .ok_or_else(|| {
+                    Error::UnsupportedOperation("indexed Object Layer base bytes overflow".into())
+                })?;
+            let remaining = stream_reader::MAX_DECODED_SCENE_BYTES
+                .checked_sub(retained)
+                .ok_or_else(|| {
+                    Error::UnsupportedOperation(format!(
+                        "the indexed scene and existing caches retain {retained} bytes before the Object Layer, past the {} byte shared scene ceiling",
+                        stream_reader::MAX_DECODED_SCENE_BYTES
+                    ))
+                })?;
+            indexed_reader::read_objects_with_limit(&mut self.source, scene, remaining)?
         } else {
             self.streamed
                 .as_ref()
@@ -675,19 +921,14 @@ impl<R: Readable> SceneReader<R> {
             return Ok(&self.loaded);
         }
         let scene = self.indexed.as_ref().expect("indexed path");
-        let wanted: Vec<rec::ChunkIndexEntry> = match key {
-            LoadKey::All => scene.index.clone(),
+        let wanted_count = match key {
+            LoadKey::All => scene.index.len(),
             LoadKey::At(bits) => {
                 let t = f64::from_bits(bits);
-                scene
-                    .index
-                    .iter()
-                    .filter(|e| e.covers(t))
-                    .cloned()
-                    .collect()
+                scene.index.iter().filter(|e| e.covers(t)).count()
             }
             LoadKey::Chunk(i) => match scene.index.get(i as usize) {
-                Some(entry) => vec![entry.clone()],
+                Some(_) => 1,
                 None => {
                     return Err(Error::Malformed(format!(
                         "chunk {i} is outside the {}-entry index",
@@ -696,23 +937,123 @@ impl<R: Readable> SceneReader<R> {
                 }
             },
         };
-        let scene = self.indexed.as_ref().expect("indexed path");
-        let mut chunks: Vec<DecodedChunk> = Vec::with_capacity(wanted.len());
+        // A replacement is transactional: a failed range read, decode, or assembly leaves
+        // the prior usable state and its cache key intact. The opened IndexedScene is
+        // equally live throughout every load; charge it, the old state, and the two outer
+        // work collections before allocating any of them.
+        let cache_bytes = indexed_cache_resident_bytes(
+            self.records.as_ref(),
+            self.provenance_only.as_ref(),
+            self.objects.as_ref(),
+            self.sampled_object_poses.as_ref(),
+            &self.validated_object_tracks,
+        )?;
+        let base_bytes = indexed_load_base_bytes(
+            scene,
+            &self.loaded,
+            cache_bytes,
+            stream_reader::MAX_DECODED_SCENE_BYTES,
+        )?;
+        let planned_collection_bytes = wanted_count
+            .checked_mul(std::mem::size_of::<&rec::ChunkIndexEntry>())
+            .and_then(|bytes| {
+                wanted_count
+                    .checked_mul(std::mem::size_of::<DecodedChunk>())
+                    .and_then(|chunks| bytes.checked_add(chunks))
+            })
+            .ok_or_else(|| {
+                Error::UnsupportedOperation("indexed load collection bytes overflow".into())
+            })?;
+        stream_reader::add_decoded_scene_bytes(base_bytes, planned_collection_bytes)?;
+
+        let mut wanted = Vec::new();
+        wanted.try_reserve_exact(wanted_count).map_err(|error| {
+            Error::UnsupportedOperation(format!(
+                "the indexed load could not reserve {wanted_count} Chunk references within the shared scene ceiling: {error}"
+            ))
+        })?;
+        match key {
+            LoadKey::All => wanted.extend(scene.index.iter()),
+            LoadKey::At(bits) => {
+                let t = f64::from_bits(bits);
+                wanted.extend(scene.index.iter().filter(|entry| entry.covers(t)));
+            }
+            LoadKey::Chunk(i) => wanted.push(&scene.index[i as usize]),
+        }
+        let mut chunks: Vec<DecodedChunk> = Vec::new();
+        chunks.try_reserve_exact(wanted_count).map_err(|error| {
+            Error::UnsupportedOperation(format!(
+                "the indexed load could not reserve {wanted_count} decoded Chunk slots within the shared scene ceiling: {error}"
+            ))
+        })?;
+        let collection_bytes = reader_vector_bytes(&wanted, "indexed Chunk references")?
+            .checked_add(reader_vector_bytes(&chunks, "decoded Chunk collection")?)
+            .ok_or_else(|| {
+                Error::UnsupportedOperation("indexed load collection bytes overflow".into())
+            })?;
+        let load_retained_bytes =
+            stream_reader::add_decoded_scene_bytes(base_bytes, collection_bytes)?;
+        let mut decoded_bytes = load_retained_bytes;
         for entry in &wanted {
-            chunks.push(indexed_reader::read_chunk(
+            let remaining = stream_reader::MAX_DECODED_SCENE_BYTES
+                .checked_sub(decoded_bytes)
+                .expect("the retained total was checked after every Chunk");
+            let chunk = indexed_reader::read_chunk_with_limit(
                 &mut self.source,
                 scene,
                 entry,
                 max_sh_band,
-            )?);
+                remaining,
+            )?;
+            let added = stream_reader::decoded_chunk_resident_bytes(&chunk, &chunk.bands)?;
+            decoded_bytes = stream_reader::add_decoded_scene_bytes(decoded_bytes, added)?;
+            chunks.push(chunk);
         }
-        let bands: Vec<BTreeMap<u8, crate::stream::DecodedStream>> =
-            chunks.iter().map(|c| c.bands.clone()).collect();
-        self.loaded = stream_reader::assemble(&chunks, &bands, &scene.windows, &scene.header)?;
+        let planned_band_collection = wanted_count
+            .checked_mul(std::mem::size_of::<
+                BTreeMap<u8, crate::stream::DecodedStream>,
+            >())
+            .ok_or_else(|| {
+                Error::UnsupportedOperation("decoded SH-map collection bytes overflow".into())
+            })?;
+        stream_reader::add_decoded_scene_bytes(decoded_bytes, planned_band_collection)?;
+        let mut bands = Vec::new();
+        bands.try_reserve_exact(wanted_count).map_err(|error| {
+            Error::UnsupportedOperation(format!(
+                "the indexed load could not reserve {wanted_count} decoded SH-map slots within the shared scene ceiling: {error}"
+            ))
+        })?;
+        bands.extend(
+            chunks
+                .iter_mut()
+                .map(|chunk| std::mem::take(&mut chunk.bands)),
+        );
+        let assembly_elsewhere = load_retained_bytes
+            .checked_add(reader_vector_bytes(&bands, "decoded SH-map collection")?)
+            .ok_or_else(|| {
+                Error::UnsupportedOperation("indexed assembly retained bytes overflow".into())
+            })?;
+        let replacement = stream_reader::assemble_with_retained(
+            &chunks,
+            &bands,
+            &scene.windows,
+            &scene.header,
+            assembly_elsewhere,
+        )?;
+        self.loaded = replacement;
         self.loaded_band = max_sh_band;
         self.loaded_key = Some(key);
         Ok(&self.loaded)
     }
+}
+
+fn indexed_limit_allows_sequential_fallback(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::UnsupportedOperation(message)
+            if message.starts_with("the contiguous summary at byte ")
+                && message.ends_with(" byte indexed-reader ceiling")
+    )
 }
 
 /// An `io::Read` over a `Readable`, so the streamed path can run on a byte-range source.
@@ -759,5 +1100,329 @@ impl<R: Readable + ?Sized> Read for SequentialSource<'_, R> {
         out[..n].copy_from_slice(&self.block[self.block_at..self.block_at + n]);
         self.block_at += n;
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::readable::BytesReadable;
+    use crate::serialization::{crc32, MAGIC, RECORD_HEADER_SIZE};
+    use crate::writer::{SceneExtras, WriteOptions};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    struct FailingReadable {
+        data: Vec<u8>,
+        fail_reads: Rc<Cell<bool>>,
+    }
+
+    impl Readable for FailingReadable {
+        fn size(&mut self) -> Result<u64> {
+            Ok(self.data.len() as u64)
+        }
+
+        fn read(&mut self, offset: u64, length: u64) -> Result<Vec<u8>> {
+            if self.fail_reads.get() {
+                return Err(Error::Io(std::io::Error::other(
+                    "injected replacement range failure",
+                )));
+            }
+            BytesReadable::new(&self.data).read(offset, length)
+        }
+    }
+
+    fn one_gaussian_file() -> Vec<u8> {
+        let mut gaussians = GaussianSet::default();
+        gaussians.positions.extend_from_slice(&[0.1, 0.2, 0.3]);
+        gaussians.scales.extend_from_slice(&[0.01, 0.01, 0.01]);
+        gaussians.rotations.extend_from_slice(&[0.0, 0.0, 0.0, 1.0]);
+        gaussians.colors.extend_from_slice(&[0.5, 0.5, 0.5, 0.75]);
+        gaussians.motions.extend_from_slice(&[0.0, 0.0, 0.0]);
+        gaussians.mu_t.push(0.5);
+        gaussians.sigma_t.push(0.1);
+        gaussians.win_lo.push(0.0);
+        gaussians.win_hi.push(1.0);
+        crate::writer::write_to_vec(
+            &gaussians,
+            1.0,
+            &WriteOptions {
+                max_depth: 0,
+                min_chunk_gaussians: 1,
+                ..Default::default()
+            },
+            &SceneExtras::default(),
+        )
+        .expect("encode one gaussian")
+    }
+
+    fn file_with_oversized_statistics_summary() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC);
+        bytes.extend_from_slice(
+            &rec::Header {
+                duration_sec: 1.0,
+                gaussian_count: 0,
+                cutoff: 0.05,
+                aabb: vec![0.0; 6],
+                ..Default::default()
+            }
+            .encode(&[]),
+        );
+        bytes.extend_from_slice(
+            &rec::Quantization {
+                scheme: "uniform-v1".into(),
+                pos_origin: vec![0.0; 3],
+                step_pos: 1e-4,
+                step_scale_log: 0.04,
+                step_rot: 0.004,
+                step_rgb: 2.0 / 255.0,
+                step_alpha: 2.0 / 255.0,
+                step_motion: 4e-4,
+                step_time: 0.004,
+                step_sigma_log: 0.04,
+                step_sh: 1,
+                ..Default::default()
+            }
+            .encode(&[]),
+        );
+        bytes.extend_from_slice(
+            &rec::WindowTable {
+                windows: vec![(0.0, 1.0)],
+            }
+            .encode(),
+        );
+
+        let summary_start = bytes.len() as u64;
+        let mut statistics = rec::Statistics {
+            gaussian_count: 0,
+            chunk_count: 0,
+            duration_sec: 1.0,
+            aabb: vec![0.0; 6],
+        }
+        .encode();
+        let suffix_len = crate::indexed_reader::MAX_FRONT_MATTER_BYTES as usize + 1;
+        statistics.resize(statistics.len() + suffix_len, 0x5a);
+        let content_len = statistics.len() - RECORD_HEADER_SIZE;
+        statistics[1..RECORD_HEADER_SIZE].copy_from_slice(&(content_len as u64).to_le_bytes());
+        let summary_crc = crc32(&statistics);
+        bytes.extend_from_slice(&statistics);
+        bytes.extend_from_slice(
+            &rec::Footer {
+                summary_start,
+                summary_offset_start: 0,
+                summary_crc,
+            }
+            .encode(),
+        );
+        bytes.extend_from_slice(&MAGIC);
+        bytes
+    }
+
+    #[test]
+    fn auto_falls_back_for_a_summary_the_sequential_path_can_stream() {
+        let bytes = file_with_oversized_statistics_summary();
+
+        let indexed_error = SceneReader::open_with(BytesReadable::new(&bytes), OpenMode::Indexed)
+            .err()
+            .expect("the indexed path refuses one contiguous transfer over its ceiling");
+        assert!(
+            indexed_limit_allows_sequential_fallback(&indexed_error),
+            "{indexed_error}"
+        );
+
+        let reader = SceneReader::open_with(BytesReadable::new(&bytes), OpenMode::Auto)
+            .expect("Auto uses the bounded sequential parser for the extensible summary");
+        assert_eq!(reader.mode(), Mode::Streamed);
+        assert_eq!(reader.summary_crc_ok(), Some(true));
+        assert_eq!(reader.statistics().unwrap().duration_sec, 1.0);
+    }
+
+    #[test]
+    fn sequential_open_keeps_exactly_one_resident_gaussian_set() {
+        let bytes = one_gaussian_file();
+        let reader = SceneReader::open_with(BytesReadable::new(&bytes), OpenMode::Sequential)
+            .expect("open sequentially");
+        assert_eq!(reader.loaded.count(), 1);
+        assert!(
+            reader
+                .streamed
+                .as_ref()
+                .expect("streamed scene metadata")
+                .gaussians
+                .is_empty(),
+            "the assembled columns move into the reader cache instead of being cloned"
+        );
+    }
+
+    #[test]
+    fn indexed_load_base_includes_the_open_scene_beside_the_cache() {
+        let scene = IndexedScene {
+            header: rec::Header {
+                profile: "p".repeat(4096),
+                ..Default::default()
+            },
+            quantization: rec::Quantization {
+                scheme: "uniform-v1".into(),
+                ..Default::default()
+            },
+            windows: vec![(0.0, 1.0)],
+            index: vec![rec::ChunkIndexEntry::default()],
+            ..Default::default()
+        };
+        let mut loaded = GaussianSet::default();
+        loaded.positions.reserve_exact(3);
+
+        let scene_bytes = indexed_reader::indexed_scene_resident_bytes(&scene)
+            .expect("measure opened indexed scene");
+        let cache_bytes = stream_reader::gaussian_set_resident_bytes(&loaded)
+            .expect("measure resident GaussianSet");
+        assert!(scene_bytes >= scene.header.profile.capacity());
+        assert_eq!(
+            indexed_load_base_bytes(&scene, &loaded, 0, scene_bytes + cache_bytes)
+                .expect("shared indexed load base"),
+            scene_bytes + cache_bytes
+        );
+        let error = indexed_load_base_bytes(&scene, &loaded, 0, scene_bytes + cache_bytes - 1)
+            .expect_err("one byte below the live indexed scene and cache must refuse");
+        assert!(matches!(error, Error::UnsupportedOperation(_)), "{error}");
+        assert!(error.to_string().contains("before a load"), "{error}");
+    }
+
+    #[test]
+    fn indexed_load_base_includes_every_lazy_and_sampling_cache() {
+        let scene = IndexedScene {
+            header: rec::Header {
+                profile: "cached-scene".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let loaded = GaussianSet::default();
+        let records = Records {
+            camera: Some(rec::Camera {
+                interpolation: "linear".into(),
+                times: vec![0.0],
+                positions: vec![[0.0; 3]],
+                targets: vec![[0.0; 3]],
+                ..Default::default()
+            }),
+            metadata: vec![rec::Metadata {
+                name: "cached metadata".into(),
+                ..Default::default()
+            }],
+            attachments: vec![rec::Attachment {
+                name: "preview".into(),
+                media_type: "image/png".into(),
+                data: vec![0; 32],
+            }],
+            provenance: Default::default(),
+        };
+        let objects = crate::object_layer::ObjectLayer {
+            table: None,
+            tracks: vec![rec::ObjectTrack {
+                object_id: 4,
+                times: vec![0.0],
+                rotations: vec![[0.0, 0.0, 0.0, 1.0]],
+                translations: vec![[0.0; 3]],
+                ..Default::default()
+            }],
+        };
+        let mut poses = HashMap::new();
+        poses.insert(
+            4,
+            crate::provenance::Pose {
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                translation: [0.0; 3],
+            },
+        );
+        let sampled = SampledObjectPoses {
+            t_bits: 0,
+            max_sh_band: 0,
+            poses,
+        };
+        let mut validated = HashSet::new();
+        validated.insert(41);
+        let caches = indexed_cache_resident_bytes(
+            Some(&records),
+            None,
+            Some(&objects),
+            Some(&sampled),
+            &validated,
+        )
+        .expect("measure all retained caches");
+        assert!(caches > 32);
+        let base_without_caches = indexed_reader::indexed_scene_resident_bytes(&scene).unwrap()
+            + stream_reader::gaussian_set_resident_bytes(&loaded).unwrap();
+
+        assert_eq!(
+            indexed_load_base_bytes(&scene, &loaded, caches, base_without_caches + caches)
+                .expect("exact aggregate cache allowance"),
+            base_without_caches + caches
+        );
+        let error =
+            indexed_load_base_bytes(&scene, &loaded, caches, base_without_caches + caches - 1)
+                .expect_err("one byte below all retained caches must refuse before loading");
+        assert!(matches!(error, Error::UnsupportedOperation(_)), "{error}");
+        assert!(error.to_string().contains("lazy caches"), "{error}");
+    }
+
+    #[test]
+    fn indexed_record_families_diminish_one_shared_allowance() {
+        let limit = 100;
+        let after_camera =
+            add_retained_record_bytes(20, 30, limit, "Camera").expect("first family fits");
+        let after_metadata =
+            add_retained_record_bytes(after_camera, 40, limit, "Camera and Metadata")
+                .expect("second family sees the first family");
+        assert_eq!(after_metadata, 90);
+        let error = add_retained_record_bytes(
+            after_metadata,
+            11,
+            limit,
+            "Camera, Metadata, and Attachment",
+        )
+        .expect_err("the third family cannot reuse either earlier allowance");
+        assert!(matches!(error, Error::UnsupportedOperation(_)), "{error}");
+        assert!(error.to_string().contains("101 aggregate"), "{error}");
+    }
+
+    #[test]
+    fn an_invalid_chunk_request_preserves_the_resident_cache() {
+        let bytes = one_gaussian_file();
+        let mut reader = SceneReader::open_with(BytesReadable::new(&bytes), OpenMode::Indexed)
+            .expect("open indexed");
+        reader.load_chunk(0, 0).expect("load the one chunk");
+        let positions = reader.loaded.positions.clone();
+        let loaded_key = reader.loaded_key;
+
+        let error = reader.load_chunk(u32::MAX, 0).unwrap_err();
+        assert!(error.to_string().contains("outside the"), "{error}");
+        assert_eq!(reader.loaded.positions, positions);
+        assert_eq!(reader.loaded_key, loaded_key);
+    }
+
+    #[test]
+    fn a_failed_replacement_decode_preserves_the_resident_cache() {
+        let fail_reads = Rc::new(Cell::new(false));
+        let source = FailingReadable {
+            data: one_gaussian_file(),
+            fail_reads: Rc::clone(&fail_reads),
+        };
+        let mut reader = SceneReader::open_with(source, OpenMode::Indexed).expect("open indexed");
+        reader.load_chunk(0, 0).expect("load the one chunk");
+        let positions = reader.loaded.positions.clone();
+        let loaded_key = reader.loaded_key;
+        let loaded_band = reader.loaded_band;
+
+        fail_reads.set(true);
+        let error = reader.load_chunk(0, 1).unwrap_err();
+        assert!(
+            error.to_string().contains("injected replacement"),
+            "{error}"
+        );
+        assert_eq!(reader.loaded.positions, positions);
+        assert_eq!(reader.loaded_key, loaded_key);
+        assert_eq!(reader.loaded_band, loaded_band);
     }
 }
