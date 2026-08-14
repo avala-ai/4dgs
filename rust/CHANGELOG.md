@@ -6,6 +6,8 @@ All notable changes to the Rust crate are documented here, following
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-13
+
 ### Added
 
 - **Bounded `keyframe-delta` validation on the C ABI.** `fourdgs_validate_keyframe_delta_reader`
