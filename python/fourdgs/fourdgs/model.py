@@ -266,9 +266,20 @@ class GaussianSet:
             np.exp(-0.5 * np.square((t - mu) / np.maximum(sigma, 1e-30))),
             1.0,
         )
-        visible = (self.win_lo <= t) & (t < self.win_hi) & (marginal >= cutoff)
+        # Window Table endpoints are f64 on the wire even though the resident arrays are
+        # normally f32. Widen before comparing: NumPy otherwise narrows a huge finite
+        # scene time to f32 infinity, and a valid `[0, +inf)` row incorrectly fails
+        # `t < win_hi` because both operands become infinity.
+        win_lo = self.win_lo.astype(np.float64)
+        win_hi = self.win_hi.astype(np.float64)
+        visible = (win_lo <= t) & (t < win_hi) & (marginal >= cutoff)
         idx = np.flatnonzero(visible)
-        centers = self.positions[idx].astype(np.float64) + self.motions[idx].astype(np.float64) * (t - mu[idx])[:, None]
+        # A finite encoded scene may reconstruct a non-finite center at an extreme time;
+        # canonical state represents that scalar as null. It is a result, not a warning.
+        with np.errstate(over="ignore", invalid="ignore"):
+            centers = (
+                self.positions[idx].astype(np.float64) + self.motions[idx].astype(np.float64) * (t - mu[idx])[:, None]
+            )
         return {
             "indices": idx,
             "centers": centers,

@@ -417,9 +417,9 @@ is a failure there, never a skip.
 
 The suite runs on GitHub-hosted runners for Python, TypeScript and Rust on Linux, macOS and Windows;
 C++, Swift and Dart run it on Linux. Every platform decodes the same generated corpus and compares
-against the same committed expectations. A fully supporting family makes 135 passing comparisons;
+against the same committed expectations. A fully supporting family makes 139 passing comparisons;
 the single `decode_indexed` variant that declares no chunk index is skipped everywhere. A language
-layer that has not landed exact canonical-unit sums still runs those same 135 checks: the shared
+layer that has not landed exact canonical-unit sums still runs those same 139 checks: the shared
 transition omits only `positionSum` and `opacitySum`, while every other field remains strict.
 
 That the corpus is bytes is the whole reason this is worth doing on more than one platform: a

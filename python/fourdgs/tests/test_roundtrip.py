@@ -438,6 +438,24 @@ class TestSemantics:
         state = scene.state_at(0.5)
         assert set(np.asarray(scene.win_lo)[state["indices"]]) == {0.0}
 
+    def test_a_huge_finite_time_remains_inside_an_infinite_window(self):
+        scene = make_scene(n=2, windows=1, never_fades_fraction=1.0)
+        smaller = np.float32(1.0)
+        larger = np.nextafter(smaller, np.float32(np.inf))
+        scene.positions[:] = 0
+        scene.motions[:] = 0
+        scene.motions[:, 0] = [smaller, larger]
+        scene.mu_t[:] = 0
+        scene.win_lo[:] = 0
+        scene.win_hi[:] = np.inf
+        t = np.finfo(np.float64).max / ((float(smaller) + float(larger)) / 2)
+
+        state = scene.state_at(t)
+
+        assert state["indices"].tolist() == [0, 1]
+        assert math.isfinite(state["centers"][0, 0])
+        assert math.isinf(state["centers"][1, 0])
+
 
 def _opcodes(data: bytes) -> set[int]:
     from fourdgs.serialization import iter_records

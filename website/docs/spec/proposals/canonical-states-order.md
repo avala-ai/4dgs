@@ -448,10 +448,12 @@ encodings.
   but cannot catch a port that applies (2b)'s exact-unit rule to centres alone; this pair makes both
   aggregates and both summary levels part of the immediate (2b) contract in that same bottom layer.
 
-- **`ObjectWideUnitAggregate`** — one finite centre at the maximum f32 value. Its canonical
-  integer-unit value requires roughly 149 bits after scaling by `10^6`. The generator asserts the
-  encoded value remains finite, the scaled total exceeds signed 128-bit, and root plus all composed
-  state aggregates emit the same exact token.
+- **`ObjectWideUnitAggregate`** — finite centres at the maximum f32 value, preceded in portable
+  content order by 16 small rows. The small rows completely fill every ordinary root/state sample;
+  the max-f32 rows remain live only in the aggregates, whose canonical units require more than 128
+  signed bits after scaling by `10^6`. The generator asserts the wide rows stay outside `SAMPLE`,
+  the scaled total exceeds signed 128-bit, and root plus all composed-state aggregates emit the same
+  exact token.
 
   **What it asserts:** every runner can emit the direct JSON number token required by (2b). The
   harness also keeps a direct 10×`1e308` regression for its raw-token serializer and lossless

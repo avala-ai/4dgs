@@ -478,10 +478,23 @@ def test_adversarial_order_cases_are_encoded_corpus_variants():
     assert opacity_summary["states"][1]["aggregate"]["opacitySum"] == 57.071301
 
     wide_summary = json_compare.loads(variants["ObjectWideUnitAggregate-UseChunkIndex-UseCrc"])
-    expected = json_compare.loads("340282346638528859811704183484516925440.0")
+    expected = json_compare.loads("5784799892854990616798971119236787732480.0")
     assert wide_summary["aggregate"]["positionSum"][0] == expected
     assert all(state["aggregate"]["positionSum"][0] == expected for state in wide_summary["states"])
     assert int(expected * 10**canonical.FLOAT_DECIMALS) > 2**127 - 1
+    assert len(wide_summary["sample"]["positions"]) == canonical.SAMPLE
+    assert all(position == [0, 0, 0] for position in wide_summary["sample"]["positions"])
+    assert all(state["liveCount"] == str(2 * canonical.SAMPLE + 1) for state in wide_summary["states"])
+    assert all(
+        all(position == [0, 0, 0] for position in state["sample"]["positions"]) for state in wide_summary["states"]
+    )
+
+    nonfinite = "ObjectTiedNonFiniteRows-UseChunkIndex-UseCrc"
+    nonfinite_reordered = "ObjectTiedNonFiniteRowsReordered-UseChunkIndex-UseCrc"
+    assert variants[nonfinite] == variants[nonfinite_reordered]
+    nonfinite_summary = json_compare.loads(variants[nonfinite])
+    assert nonfinite_summary["states"][2]["sample"]["positions"][0][0].is_finite()
+    assert nonfinite_summary["states"][2]["sample"]["positions"][1][0] is None
 
 
 def test_keyframe_delta_variants_retain_an_untouched_common_row():

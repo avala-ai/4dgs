@@ -623,6 +623,13 @@ def build_keyframe_delta_corpus() -> list[tuple[str, bytes, str]]:
 #: clip — and every file stays well under the corpus size cap.
 _OBJ_DURATION = 4.0
 _OBJ_OPACITY_DURATION = 4.000000021908035
+_OBJ_NONFINITE_MOTIONS = (
+    np.float32(1.0),
+    np.nextafter(np.float32(1.0), np.float32(np.inf)),
+)
+_OBJ_NONFINITE_DURATION = float(
+    np.finfo(np.float64).max / ((float(_OBJ_NONFINITE_MOTIONS[0]) + float(_OBJ_NONFINITE_MOTIONS[1])) / 2)
+)
 
 
 def _obj_gaussians(
@@ -924,9 +931,14 @@ def _obj_opacity_order() -> tuple[fourdgs.GaussianSet, ObjectLayer]:
 def _obj_wide_unit_aggregate() -> tuple[fourdgs.GaussianSet, ObjectLayer]:
     """A finite f32 whose canonical units exceed every signed 128-bit accumulator."""
 
+    wide_rows = canonical_module.SAMPLE + 1
     gaussians = _obj_gaussians(
-        positions=[[float(np.finfo(np.float32).max), 0.0, 0.0]],
-        object_ids=[7],
+        # Sixteen portable zero rows fill the root/state samples. The wide rows are still
+        # live and included in each aggregate, so the fixture tests accumulator width
+        # without making ordinary sampled-f32 spelling part of this contract.
+        positions=[[0.0, 0.0, 0.0]] * canonical_module.SAMPLE
+        + [[float(np.finfo(np.float32).max), 0.0, 0.0]] * wide_rows,
+        object_ids=[7] * (canonical_module.SAMPLE + wide_rows),
     )
     layer = ObjectLayer(
         table=ObjectTable(
@@ -934,7 +946,41 @@ def _obj_wide_unit_aggregate() -> tuple[fourdgs.GaussianSet, ObjectLayer]:
             entries=[ObjectTableEntry(object_id=7, label="wide units", anchor=(0.0, 0.0, 0.0))],
         )
     )
+    # A majority of large, unsampled scales makes the global position pitch wide enough
+    # to encode zero and max-f32 in one Quantization grid. The 16 sampled zero rows keep
+    # their ordinary, small scale values.
+    gaussians.scales[canonical_module.SAMPLE :] = np.float32(1.6e30)
     return gaussians, layer
+
+
+def _obj_tied_nonfinite_rows() -> tuple[fourdgs.GaussianSet, ObjectLayer]:
+    """Rounded motion ties that become one finite and one null center at the last probe."""
+
+    gaussians = _obj_gaussians(
+        positions=[[0.0, 0.0, 0.0]] * 2,
+        object_ids=[7, 7],
+        motions=[
+            [float(_OBJ_NONFINITE_MOTIONS[0]), 0.0, 0.0],
+            [float(_OBJ_NONFINITE_MOTIONS[1]), 0.0, 0.0],
+        ],
+    )
+    # A fine pitch preserves the adjacent f32 motions; both still round to 1.000000 in
+    # the primary content key. Infinite sigma/window keeps them live at the huge f64 probe.
+    gaussians.scales[:] = 2e-6
+    gaussians.sigma_t[:] = np.inf
+    gaussians.win_hi[:] = np.inf
+    layer = ObjectLayer(
+        table=ObjectTable(
+            embedding_dim=0,
+            entries=[ObjectTableEntry(object_id=7, label="non-finite rows", anchor=(0.0, 0.0, 0.0))],
+        )
+    )
+    return gaussians, layer
+
+
+def _obj_tied_nonfinite_rows_reordered() -> tuple[fourdgs.GaussianSet, ObjectLayer]:
+    gaussians, layer = _obj_tied_nonfinite_rows()
+    return _permute_gaussians(gaussians, np.array([1, 0], dtype=np.intp)), layer
 
 
 #: (name, builder). The ordinary decode-and-compose cases are followed by canonical-order,
@@ -948,6 +994,11 @@ OBJECT_VARIANTS = (
     ("ObjectContentOrderSum-UseChunkIndex-UseCrc", _obj_content_order_sum),
     ("ObjectOpacityOrder-UseChunkIndex-UseCrc", _obj_opacity_order),
     ("ObjectWideUnitAggregate-UseChunkIndex-UseCrc", _obj_wide_unit_aggregate),
+    ("ObjectTiedNonFiniteRows-UseChunkIndex-UseCrc", _obj_tied_nonfinite_rows),
+    (
+        "ObjectTiedNonFiniteRowsReordered-UseChunkIndex-UseCrc",
+        _obj_tied_nonfinite_rows_reordered,
+    ),
 )
 
 
@@ -968,9 +1019,15 @@ def build_object_corpus() -> list[tuple[str, bytes, str]]:
     out: list[tuple[str, bytes, str]] = []
     summaries: dict[str, dict] = {}
     resident_tie_rows: dict[str, list] = {}
+    resident_nonfinite_rows: dict[str, list] = {}
     for name, builder in OBJECT_VARIANTS:
         gaussians, layer = builder()
-        duration = _OBJ_OPACITY_DURATION if name.startswith("ObjectOpacityOrder") else _OBJ_DURATION
+        if name.startswith("ObjectOpacityOrder"):
+            duration = _OBJ_OPACITY_DURATION
+        elif name.startswith("ObjectTiedNonFiniteRows"):
+            duration = _OBJ_NONFINITE_DURATION
+        else:
+            duration = _OBJ_DURATION
         options = fourdgs.WriteOptions(
             profile="default",
             cutoff=1e-20 if name.startswith("ObjectOpacityOrder") else DEFAULT_CUTOFF,
@@ -998,6 +1055,21 @@ def build_object_corpus() -> list[tuple[str, bytes, str]]:
                 t=0.5 * _OBJ_DURATION,
             )
             resident_tie_rows[name] = [[canonical_module.num(v) for v in row] for row in centers]
+        if name.startswith("ObjectTiedNonFiniteRows"):
+            keys = canonical_module._stable_keys(scene.gaussians)
+            if len(keys) != 2 or keys[0] != keys[1]:
+                raise AssertionError(f"{name}: the finite/null primary keys do not tie")
+            state = scene.gaussians.state_at(duration, scene.header.cutoff)
+            centers, _ = scene.objects.apply(
+                centers=state["centers"],
+                orientations=state["orientations"],
+                object_ids=state["object_id"],
+                t=duration,
+            )
+            rows = [[canonical_module.num(v) for v in row] for row in centers]
+            if [row[0] is None for row in rows].count(False) != 1 or [row[0] is None for row in rows].count(True) != 1:
+                raise AssertionError(f"{name}: expected one finite and one null row, got {rows!r}")
+            resident_nonfinite_rows[name] = rows
         # The same full summarize the runners call, so the committed expectation matches what
         # a decoder prints — a file written with a CRC and an index reports `summaryCrcOk`
         # and chunk intervals, and omitting those here would diff against every runner.
@@ -1055,10 +1127,18 @@ def build_object_corpus() -> list[tuple[str, bytes, str]]:
             if not isinstance(exact, canonical_module.ExactNumber) or exact.token != "57.071301":
                 raise AssertionError(f"{name}: exact-unit opacity witness moved to {exact!r}")
         if name == "ObjectWideUnitAggregate-UseChunkIndex-UseCrc":
-            expected = "340282346638528859811704183484516925440.0"
-            decoded = float(scene.gaussians.positions[0, 0])
-            if not math.isfinite(decoded):
-                raise AssertionError(f"{name}: wide encoded f32 became non-finite")
+            expected = "5784799892854990616798971119236787732480.0"
+            order = canonical_module._stable_order(scene.gaussians)
+            wide_index = int(np.argmax(scene.gaussians.positions[:, 0]))
+            if wide_index in order[: canonical_module.SAMPLE]:
+                raise AssertionError(f"{name}: wide row leaked into the ordinary root sample")
+            decoded = float(scene.gaussians.positions[wide_index, 0])
+            if not math.isfinite(decoded) or decoded != float(np.finfo(np.float32).max):
+                raise AssertionError(f"{name}: max-f32 encoded row moved to {decoded!r}")
+            if any(position[0] != 0.0 for position in summary["sample"]["positions"]):
+                raise AssertionError(f"{name}: wide row leaked into the ordinary root sample")
+            if any(scale[0] > 1.0 for scale in summary["sample"]["scales"]):
+                raise AssertionError(f"{name}: wide quantization scale leaked into the root sample")
             totals = [summary["aggregate"]["positionSum"][0]] + [
                 state["aggregate"]["positionSum"][0] for state in summary["states"]
             ]
@@ -1067,6 +1147,11 @@ def build_object_corpus() -> list[tuple[str, bytes, str]]:
             units = int(Decimal(expected) * (10**canonical_module.FLOAT_DECIMALS))
             if units <= 2**127 - 1:
                 raise AssertionError(f"{name}: scaled total no longer exceeds signed 128-bit")
+            expected_live = 2 * canonical_module.SAMPLE + 1
+            if any(state["liveCount"] != str(expected_live) for state in summary["states"]):
+                raise AssertionError(f"{name}: wide row is not live in every state aggregate")
+            if any(any(position[0] != 0.0 for position in state["sample"]["positions"]) for state in summary["states"]):
+                raise AssertionError(f"{name}: wide row leaked into an ordinary state sample")
         expectation = canonical(summary)
         out.append((name, data, expectation))
 
@@ -1076,6 +1161,12 @@ def build_object_corpus() -> list[tuple[str, bytes, str]]:
         raise AssertionError("the tied pair's resident-order state rows do not differ")
     if canonical(summaries[tied]) != canonical(summaries[reordered]):
         raise AssertionError("the tied pair does not share one order-independent canonical summary")
+    nonfinite = "ObjectTiedNonFiniteRows-UseChunkIndex-UseCrc"
+    nonfinite_reordered = "ObjectTiedNonFiniteRowsReordered-UseChunkIndex-UseCrc"
+    if resident_nonfinite_rows[nonfinite] == resident_nonfinite_rows[nonfinite_reordered]:
+        raise AssertionError("the finite/null pair's resident-order state rows do not differ")
+    if canonical(summaries[nonfinite]) != canonical(summaries[nonfinite_reordered]):
+        raise AssertionError("the finite/null pair does not share one canonical summary")
     return out
 
 

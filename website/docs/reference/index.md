@@ -10,10 +10,10 @@ harness skips the rest —
 existing.
 
 Every row is filled in from a suite that runs: 48 valid variants and 7 invalid ones, plus 5
-keyframe-delta and 8 object-layer variants in their own subdirectories, over two read paths
+keyframe-delta and 10 object-layer variants in their own subdirectories, over two read paths
 (streamed and indexed). A language takes the variants it declares support for, and what it declines
-is what this table records. Python, the fully supporting reference layer, passes 135 checks; the
-five stacked language layers each pass 32 while explicitly declining the 52 aggregate-bearing
+is what this table records. Python, the fully supporting reference layer, passes 139 checks; the
+five stacked language layers each pass 32 while explicitly declining the 54 aggregate-bearing
 variants until their exact-unit implementation PR lands. C++ and Swift read 4DGS through the Rust C
 ABI: the additive states-JSON accessor computes keyframe-delta summaries in the core, the
 provenance-JSON accessor does the same for the provenance family, and the objects-JSON pair does it
