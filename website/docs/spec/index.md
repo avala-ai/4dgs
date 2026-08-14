@@ -302,6 +302,39 @@ names, so that two readers report the same number for the same file.
 `bounds`, and a reader MUST refuse a Quantization record that does: there is no meaningful error
 bound between two different labels.
 
+**A bound is a decimal number, not a run of bytes.** Every value in `bounds` MUST be spelled by this
+grammar, and consumers compare two bounds by the number it gives them rather than by their UTF-8
+bytes:
+
+```
+bound        ::=  [ sign ] significand [ exponent ]
+sign         ::=  "+" | "-"
+significand  ::=  digits [ "." [ digits ] ] | "." digits
+exponent     ::=  ( "e" | "E" ) [ sign ] digits
+digits       ::=  digit { digit }
+digit        ::=  U+0030 through U+0039
+```
+
+Nothing else is a bound. The grammar admits no surrounding whitespace, no digit-group separator, no
+digit outside U+0030–U+0039, and no `Infinity` or `NaN` spelling. A value that does not match it
+declares no bound at all, and a validator SHOULD report it exactly as it reports a bound that
+disagrees with the record.
+
+Inside the grammar, spelling carries no meaning. `5e-05`, `5e-5`, `0.00005` and `+0.00005` are one
+bound, and a writer MAY choose any of them for the finite value it verified. A significand of zeroes
+is the value zero at every exponent, `0e999999999999999999999999` included. The exponent has no
+range limit, because the comparison never builds the number: a consumer that matches a declared
+bound against an expected one compares digits, exactly, and never through binary64. This freedom
+does not extend to the map's shape — omitting a key is still different from declaring it — or to
+changing the value.
+
+The grammar is deliberately narrower than the string syntax of any one language's decimal type. A
+host library may also accept underscores between digits, decimal digits from other scripts, or
+surrounding whitespace, and may refuse an exponent outside a range that varies with how that library
+was built. A format read by independent implementations can inherit none of that: the set above is
+the largest one all of them accept identically, so an implementation MUST match a bound against this
+grammar itself rather than delegate to whatever its runtime happens to parse.
+
 **The SH bit depths are a declaration, not an instruction.** A writer that quantizes coefficients by
 bit depth MUST emit one entry per band it writes, in band order, each in the range 3–8, and MUST set
 `bounds.sh_band<b>` from each depth by the rule in §6.5. A reader MAY ignore the field: nothing at
@@ -1595,6 +1628,7 @@ and the text was the bug.
 | Registry: reserved attribute ids 32–47 and the `relightable` profile for a future relighting extension; named, not defined                | reserved, rule added      |
 | §3/§5.15.6–§6.6 added: exact `object_id`, Object Table `0x24`, Object Track `0x25`, and base-then-track composition                       | rule added                |
 | §11/§5.18/§5.8 added: the `keyframe-delta` temporal model, Delta Chunk `0x10`, `gaussian_id` (id 13), and six appended Chunk Index fields | rule added                |
+| §5.3 added: the grammar a `bounds` value is spelled by, and that two bounds are compared as numbers rather than as bytes                  | clarification, rule added |
 
 The keyframe-delta row is additive and changes no existing file. `temporal_model` gains a value,
 opcode `0x10` was unassigned, attribute id `13` was reserved, and the six Chunk Index fields append

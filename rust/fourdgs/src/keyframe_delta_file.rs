@@ -35,7 +35,7 @@ use crate::records as rec;
 use crate::serialization::{
     check_magic, crc32, Cursor, Records, MAGIC, MAX_STREAM_BYTES, STREAM_HEADER_SIZE,
 };
-use crate::stream::{decode_stream, encode_stream, DecodedStream};
+use crate::stream::{decode_stream_with_limit, encode_stream, DecodedStream};
 
 /// How many gaussians appear in full in a probe's sample.
 pub const SAMPLE: usize = 16;
@@ -897,16 +897,6 @@ impl DecodedSequence {
     }
 }
 
-fn bin_array(stream: &DecodedStream) -> BinArray {
-    let mut values = Vec::with_capacity(stream.count * stream.channels);
-    for i in 0..stream.count {
-        for c in 0..stream.channels {
-            values.push(stream.get(i, c));
-        }
-    }
-    BinArray::new(values, stream.channels)
-}
-
 fn expected_attribute_channels(attribute: u8) -> Option<usize> {
     match attribute {
         op::A_POSITION | op::A_SCALE | op::A_ROTATION | op::A_COLOR | op::A_MOTION => Some(3),
@@ -939,9 +929,10 @@ fn check_attribute_channels(attribute: u8, stream: &DecodedStream) -> Result<()>
 
 /// Decode a version-1 state stream after checking its fixed header, or skip an unknown
 /// extension by its common payload length without interpreting extension-owned semantics.
-fn decode_state_stream(
+fn decode_state_stream_with_limit(
     cursor: &mut Cursor<'_>,
     expected_count: usize,
+    max_output_bytes: usize,
 ) -> Result<(u8, Option<DecodedStream>)> {
     let head = cursor.rest().get(..STREAM_HEADER_SIZE).ok_or_else(|| {
         Error::Truncated(format!(
@@ -985,7 +976,12 @@ fn decode_state_stream(
             )));
         }
         codec::check_decoder(stream_codec)?;
-        let (decoded_attribute, stream) = decode_stream(cursor, Some(expected_count))?;
+        let (decoded_attribute, stream) = decode_stream_with_limit(
+            cursor,
+            Some(expected_count),
+            expected_attribute_channels(attribute),
+            max_output_bytes,
+        )?;
         debug_assert_eq!(decoded_attribute, attribute);
         check_attribute_channels(attribute, &stream)?;
         if let Some(value) = stream.values.iter().find(|value| {
@@ -1003,76 +999,235 @@ fn decode_state_stream(
     Ok((attribute, None))
 }
 
+fn delta_bin_map_node_bytes(len: usize) -> Result<usize> {
+    let per_node = std::mem::size_of::<(u8, BinArray)>()
+        .checked_add(4 * std::mem::size_of::<usize>())
+        .ok_or_else(|| Error::UnsupportedOperation("delta bin-map row bytes overflow".into()))?;
+    len.checked_mul(per_node)
+        .ok_or_else(|| Error::UnsupportedOperation("delta bin-map bytes overflow".into()))
+}
+
+fn decoded_group_resident_bytes(
+    ids: Option<&Vec<i64>>,
+    bins: &BTreeMap<u8, BinArray>,
+) -> Result<usize> {
+    let mut total = ids
+        .map_or(0, Vec::capacity)
+        .checked_mul(std::mem::size_of::<i64>())
+        .ok_or_else(|| Error::UnsupportedOperation("delta identity bytes overflow".into()))?;
+    total = total
+        .checked_add(delta_bin_map_node_bytes(bins.len())?)
+        .ok_or_else(|| Error::UnsupportedOperation("delta group bytes overflow".into()))?;
+    for values in bins.values() {
+        total = total
+            .checked_add(
+                values
+                    .values
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<i64>())
+                    .ok_or_else(|| {
+                        Error::UnsupportedOperation("delta bin bytes overflow".into())
+                    })?,
+            )
+            .ok_or_else(|| Error::UnsupportedOperation("delta group bytes overflow".into()))?;
+    }
+    Ok(total)
+}
+
 /// One length-framed sub-block: its ids, and a bin array per other attribute.
-fn decode_group(bytes: &[u8], expected_count: usize) -> Result<(Vec<i64>, BTreeMap<u8, BinArray>)> {
+fn decode_group_with_limit(
+    bytes: &[u8],
+    expected_count: usize,
+    max_output_bytes: usize,
+) -> Result<(Vec<i64>, BTreeMap<u8, BinArray>, usize)> {
     if bytes.is_empty() {
         if expected_count != 0 {
             return Err(Error::Malformed(format!(
                 "a keyframe-delta group declares {expected_count} gaussians but carries no streams"
             )));
         }
-        return Ok((Vec::new(), BTreeMap::new()));
+        return Ok((Vec::new(), BTreeMap::new(), 0));
     }
-    let mut got: BTreeMap<u8, DecodedStream> = BTreeMap::new();
-    let mut seen = BTreeSet::new();
+    let mut ids: Option<Vec<i64>> = None;
+    let mut bins: BTreeMap<u8, BinArray> = BTreeMap::new();
+    let mut seen = [false; 256];
+    let mut resident = 0usize;
     let mut cursor = Cursor::new(bytes);
     while cursor.remaining() > 0 {
-        let (attribute_id, values) = decode_state_stream(&mut cursor, expected_count)?;
+        // Once a complete fixed header is present, duplicate taxonomy is independent of
+        // the stream's allocation cost.  Refuse it before applying the shared group
+        // budget, matching the ordinary Chunk path.
+        let next_attribute = cursor
+            .rest()
+            .get(..STREAM_HEADER_SIZE)
+            .map(|header| header[0]);
+        if let Some(attribute) = next_attribute {
+            if seen[attribute as usize] {
+                return Err(Error::Malformed(format!(
+                    "a keyframe-delta group carries attribute {attribute} twice; the \
+                     format defines one stream per attribute"
+                )));
+            }
+        }
+        let planned_node = match next_attribute {
+            Some(attribute)
+                if attribute != op::A_GAUSSIAN_ID
+                    && expected_attribute_channels(attribute).is_some() =>
+            {
+                delta_bin_map_node_bytes(1)?
+            }
+            _ => 0,
+        };
+        let remaining = max_output_bytes
+            .checked_sub(resident)
+            .and_then(|bytes| bytes.checked_sub(planned_node))
+            .ok_or_else(|| {
+                Error::UnsupportedOperation(
+                    "decoded keyframe-delta group exhausted its shared output budget".into(),
+                )
+            })?;
+        let (attribute_id, values) =
+            decode_state_stream_with_limit(&mut cursor, expected_count, remaining)?;
         // One stream per attribute here too: the regular chunk path refuses a second,
         // and this path had its own loop that was still resolving it silently.
-        if !seen.insert(attribute_id) {
+        if std::mem::replace(&mut seen[attribute_id as usize], true) {
             return Err(Error::Malformed(format!(
                 "a keyframe-delta group carries attribute {attribute_id} twice; the \
                  format defines one stream per attribute"
             )));
         }
         if let Some(values) = values {
-            got.insert(attribute_id, values);
+            let values = if values.constant {
+                let expanded_len = values.count.checked_mul(values.channels).ok_or_else(|| {
+                    Error::UnsupportedOperation(format!(
+                        "attribute {attribute_id} expanded symbol count overflows"
+                    ))
+                })?;
+                let planned_capacity = if expanded_len == 0 {
+                    0
+                } else {
+                    expanded_len.max(4)
+                };
+                let planned_bytes = planned_capacity
+                    .checked_mul(std::mem::size_of::<i64>())
+                    .ok_or_else(|| {
+                        Error::UnsupportedOperation(format!(
+                            "attribute {attribute_id} expanded symbol bytes overflow"
+                        ))
+                    })?;
+                let compact_bytes = values
+                    .values
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<i64>())
+                    .ok_or_else(|| {
+                        Error::UnsupportedOperation(format!(
+                            "attribute {attribute_id} compact symbol bytes overflow"
+                        ))
+                    })?;
+                let peak = resident
+                    .checked_add(planned_node)
+                    .and_then(|bytes| bytes.checked_add(compact_bytes))
+                    .and_then(|bytes| bytes.checked_add(planned_bytes))
+                    .ok_or_else(|| {
+                        Error::UnsupportedOperation(
+                            "constant Delta stream expansion bytes overflow".into(),
+                        )
+                    })?;
+                if peak > max_output_bytes {
+                    return Err(Error::UnsupportedOperation(format!(
+                        "attribute {attribute_id} constant expansion needs {peak} bytes beside previously decoded group state, past the {max_output_bytes} byte shared output budget"
+                    )));
+                }
+                let mut expanded = Vec::new();
+                expanded.try_reserve_exact(expanded_len).map_err(|error| {
+                    Error::UnsupportedOperation(format!(
+                        "attribute {attribute_id} could not reserve {expanded_len} expanded symbols within the shared output budget: {error}"
+                    ))
+                })?;
+                let actual_peak = resident
+                    .checked_add(planned_node)
+                    .and_then(|bytes| bytes.checked_add(compact_bytes))
+                    .and_then(|bytes| {
+                        expanded
+                            .capacity()
+                            .checked_mul(std::mem::size_of::<i64>())
+                            .and_then(|expanded| bytes.checked_add(expanded))
+                    })
+                    .ok_or_else(|| {
+                        Error::UnsupportedOperation(
+                            "constant Delta stream allocation bytes overflow".into(),
+                        )
+                    })?;
+                if actual_peak > max_output_bytes {
+                    return Err(Error::UnsupportedOperation(format!(
+                        "attribute {attribute_id} constant expansion retained {actual_peak} bytes beside previously decoded group state, past the {max_output_bytes} byte shared output budget"
+                    )));
+                }
+                for _ in 0..values.count {
+                    expanded.extend_from_slice(&values.values);
+                }
+                expanded
+            } else {
+                values.values
+            };
+            if attribute_id == op::A_GAUSSIAN_ID {
+                ids = Some(values);
+            } else {
+                bins.insert(
+                    attribute_id,
+                    BinArray::new(
+                        values,
+                        expected_attribute_channels(attribute_id).unwrap_or(0),
+                    ),
+                );
+            }
+            resident = decoded_group_resident_bytes(ids.as_ref(), &bins)?;
+            if resident > max_output_bytes {
+                return Err(Error::UnsupportedOperation(format!(
+                    "decoded keyframe-delta group needs {resident} resident bytes, past the {max_output_bytes} bytes remaining in its shared output budget"
+                )));
+            }
         }
     }
-    let Some(id_stream) = got.remove(&op::A_GAUSSIAN_ID) else {
+    let Some(ids) = ids else {
         return Err(Error::Malformed(
             "a keyframe-delta group carries no gaussian_id stream".into(),
         ));
     };
-    let ids: Vec<i64> = (0..id_stream.count).map(|i| id_stream.get(i, 0)).collect();
-    let bins = got.iter().map(|(a, s)| (*a, bin_array(s))).collect();
-    Ok((ids, bins))
+    resident = decoded_group_resident_bytes(Some(&ids), &bins)?;
+    Ok((ids, bins, resident))
 }
 
 fn keyframe_from_chunk(
     content: &[u8],
 ) -> Result<(rec::ChunkHeader, Vec<i64>, BTreeMap<u8, BinArray>)> {
-    let (head, streams) = rec::parse_chunk(content)?;
-    let streams = crate::chunk::chunk_stream_bytes(&head, streams)?;
-    let mut got: BTreeMap<u8, DecodedStream> = BTreeMap::new();
-    let mut seen = BTreeSet::new();
-    let mut cursor = Cursor::new(&streams);
-    while cursor.remaining() > 0 {
-        let (attribute_id, values) = decode_state_stream(&mut cursor, head.count as usize)?;
-        // One stream per attribute here too: the regular chunk path refuses a second,
-        // and this path had its own loop that was still resolving it silently.
-        if !seen.insert(attribute_id) {
-            return Err(Error::Malformed(format!(
-                "a keyframe-delta group carries attribute {attribute_id} twice; the \
-                 format defines one stream per attribute"
-            )));
-        }
-        if let Some(values) = values {
-            got.insert(attribute_id, values);
-        }
-    }
-    let Some(id_stream) = got.remove(&op::A_GAUSSIAN_ID) else {
-        return Err(Error::Malformed(
-            "a keyframe-delta chunk carries no gaussian_id stream".into(),
-        ));
+    let (head, encoded_streams) = rec::parse_chunk(content)?;
+    let unpacked_budget = (MAX_STREAM_BYTES as usize)
+        .checked_sub(content.len())
+        .ok_or_else(|| {
+            Error::UnsupportedOperation(format!(
+                "the keyframe Chunk at t0={} and its encoded content exceed the {MAX_STREAM_BYTES} byte reader working-set ceiling",
+                head.t0
+            ))
+        })?;
+    let streams =
+        crate::chunk::chunk_stream_bytes_with_limit(&head, encoded_streams, unpacked_budget)?;
+    let unpacked_bytes = match &streams {
+        Cow::Borrowed(_) => 0,
+        Cow::Owned(bytes) => bytes.capacity(),
     };
-    let ids: Vec<i64> = (0..id_stream.count).map(|i| id_stream.get(i, 0)).collect();
+    let group_budget = unpacked_budget.checked_sub(unpacked_bytes).ok_or_else(|| {
+        Error::UnsupportedOperation(format!(
+            "the keyframe Chunk at t0={} retains {unpacked_bytes} unpacked bytes, past the {unpacked_budget} bytes available beside its encoded content",
+            head.t0
+        ))
+    })?;
+    let (ids, bins, _) = decode_group_with_limit(&streams, head.count as usize, group_budget)?;
     if head.count > 0 {
         let missing: Vec<u8> = REQUIRED
             .iter()
             .copied()
-            .filter(|a| !got.contains_key(a))
+            .filter(|a| !bins.contains_key(a))
             .collect();
         if !missing.is_empty() {
             return Err(Error::Malformed(format!(
@@ -1080,7 +1235,6 @@ fn keyframe_from_chunk(
             )));
         }
     }
-    let bins = got.iter().map(|(a, s)| (*a, bin_array(s))).collect();
     Ok((head, ids, bins))
 }
 
@@ -1096,47 +1250,274 @@ struct DecodedDelta {
 fn delta_record_bytes<'a>(
     head: &rec::DeltaChunkHeader,
     records: &'a [u8],
+    max_output_bytes: usize,
 ) -> Result<Cow<'a, [u8]>> {
+    if head.compression.is_empty() && records.len() as u64 != head.uncompressed_size {
+        return Err(Error::Malformed(format!(
+            "the uncompressed Delta Chunk at t0={} declares {} record bytes but carries {}",
+            head.t0,
+            head.uncompressed_size,
+            records.len()
+        )));
+    }
+    let numeric = if head.compression.is_empty() {
+        None
+    } else {
+        let numeric = crate::codec::codec_from_name(&head.compression).ok_or_else(|| {
+            Error::refused(
+                crate::error::refusal::UNKNOWN_STREAM_CODEC,
+                crate::error::RefusalKind::UnsupportedCodec,
+                format!(
+                    "the Delta Chunk at t0={} is compressed with {:?}, which this build does not know",
+                    head.t0, head.compression
+                ),
+            )
+        })?;
+        crate::codec::check_decoder(numeric)?;
+        Some(numeric)
+    };
     let expected = usize::try_from(head.uncompressed_size).map_err(|_| {
-        Error::Malformed(format!(
+        Error::UnsupportedOperation(format!(
             "the Delta Chunk at t0={} declares {} uncompressed bytes, more than this platform can address",
             head.t0, head.uncompressed_size
         ))
     })?;
     if head.uncompressed_size > MAX_STREAM_BYTES {
-        return Err(Error::Malformed(format!(
-            "the Delta Chunk at t0={} declares {} uncompressed record bytes, past the {MAX_STREAM_BYTES} byte cap",
+        return Err(Error::UnsupportedOperation(format!(
+            "the Delta Chunk at t0={} declares {} uncompressed record bytes, past the {MAX_STREAM_BYTES} byte reader ceiling",
             head.t0, head.uncompressed_size
         )));
     }
     if head.compression.is_empty() {
-        if records.len() != expected {
-            return Err(Error::Malformed(format!(
-                "the uncompressed Delta Chunk at t0={} declares {expected} record bytes but carries {}",
-                head.t0,
-                records.len()
-            )));
-        }
+        debug_assert_eq!(records.len(), expected);
         return Ok(Cow::Borrowed(records));
     }
-    let numeric = crate::codec::codec_from_name(&head.compression).ok_or_else(|| {
-        Error::refused(
-            crate::error::refusal::UNKNOWN_STREAM_CODEC,
-            crate::error::RefusalKind::UnsupportedCodec,
-            format!(
-                "the Delta Chunk at t0={} is compressed with {:?}, which this build does not know",
-                head.t0, head.compression
-            ),
-        )
-    })?;
+    if expected > max_output_bytes {
+        return Err(Error::UnsupportedOperation(format!(
+            "the compressed Delta Chunk at t0={} needs {expected} decoded record bytes beside its live encoded content and reference state, past the {max_output_bytes} bytes remaining in the reader working-set budget",
+            head.t0
+        )));
+    }
     Ok(Cow::Owned(crate::codec::decompress(
-        records, numeric, expected,
+        records,
+        numeric.expect("a non-empty compression name resolved above"),
+        expected,
     )?))
 }
 
-fn decode_delta(content: &[u8]) -> Result<DecodedDelta> {
+fn state_resident_bytes(state: &State) -> Result<usize> {
+    let mut total = state
+        .ids
+        .capacity()
+        .checked_mul(std::mem::size_of::<i64>())
+        .ok_or_else(|| Error::UnsupportedOperation("reference identity bytes overflow".into()))?;
+    let node_bytes = std::mem::size_of::<(u8, BinArray)>()
+        .checked_add(4 * std::mem::size_of::<usize>())
+        .ok_or_else(|| Error::UnsupportedOperation("reference map row bytes overflow".into()))?;
+    total =
+        total
+            .checked_add(state.bins.len().checked_mul(node_bytes).ok_or_else(|| {
+                Error::UnsupportedOperation("reference map bytes overflow".into())
+            })?)
+            .ok_or_else(|| Error::UnsupportedOperation("reference state bytes overflow".into()))?;
+    for bins in state.bins.values() {
+        total = total
+            .checked_add(
+                bins.values
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<i64>())
+                    .ok_or_else(|| {
+                        Error::UnsupportedOperation("reference bin bytes overflow".into())
+                    })?,
+            )
+            .ok_or_else(|| Error::UnsupportedOperation("reference state bytes overflow".into()))?;
+    }
+    Ok(total)
+}
+
+fn decoded_delta_resident_bytes(delta: &DecodedDelta) -> Result<usize> {
+    let mut total = decoded_group_resident_bytes(Some(&delta.update_ids), &delta.update_bins)?;
+    total = total
+        .checked_add(decoded_group_resident_bytes(
+            Some(&delta.birth_ids),
+            &delta.birth_bins,
+        )?)
+        .and_then(|bytes| {
+            delta
+                .death_ids
+                .capacity()
+                .checked_mul(std::mem::size_of::<i64>())
+                .and_then(|death| bytes.checked_add(death))
+        })
+        .ok_or_else(|| Error::UnsupportedOperation("decoded Delta bytes overflow".into()))?;
+    Ok(total)
+}
+
+fn planned_i64_capacity(len: usize) -> Result<usize> {
+    if len == 0 {
+        return Ok(0);
+    }
+    len.max(4)
+        .checked_mul(std::mem::size_of::<i64>())
+        .ok_or_else(|| Error::UnsupportedOperation("planned i64 vector bytes overflow".into()))
+}
+
+/// Conservative resident bound for the state produced by `apply_delta`.
+///
+/// Deaths are deliberately ignored in the row bound: retaining rows that will actually
+/// die overestimates allocation while avoiding semantic assumptions before composition
+/// validates the groups.  Vec growth for a reference column plus births is bounded by the
+/// larger of the required length and one geometric doubling of the cloned base column.
+fn composed_state_resident_bound(reference: &State, decoded: &DecodedDelta) -> Result<usize> {
+    let id_len = reference
+        .ids
+        .len()
+        .checked_add(decoded.birth_ids.len())
+        .ok_or_else(|| Error::UnsupportedOperation("composed identity count overflows".into()))?;
+    let mut total = planned_i64_capacity(id_len)?;
+    let attributes: BTreeSet<u8> = reference
+        .bins
+        .keys()
+        .copied()
+        .chain(decoded.birth_bins.keys().copied())
+        .collect();
+    total = total
+        .checked_add(delta_bin_map_node_bytes(attributes.len())?)
+        .ok_or_else(|| Error::UnsupportedOperation("composed state bytes overflow".into()))?;
+    for attribute in attributes {
+        let base_len = reference
+            .bins
+            .get(&attribute)
+            .map_or(0, |values| values.values.len());
+        let birth_len = decoded
+            .birth_bins
+            .get(&attribute)
+            .map_or(0, |values| values.values.len());
+        let needed = base_len.checked_add(birth_len).ok_or_else(|| {
+            Error::UnsupportedOperation(format!(
+                "composed attribute {attribute} value count overflows"
+            ))
+        })?;
+        let capacity = if base_len == 0 {
+            needed.max(4)
+        } else {
+            needed.max(base_len.saturating_mul(2)).max(4)
+        };
+        total = total
+            .checked_add(
+                capacity
+                    .checked_mul(std::mem::size_of::<i64>())
+                    .ok_or_else(|| {
+                        Error::UnsupportedOperation(format!(
+                            "composed attribute {attribute} bytes overflow"
+                        ))
+                    })?,
+            )
+            .ok_or_else(|| Error::UnsupportedOperation("composed state bytes overflow".into()))?;
+    }
+    Ok(total)
+}
+
+fn delta_id_set_bytes(len: usize) -> Result<usize> {
+    let node = std::mem::size_of::<i64>()
+        .checked_add(4 * std::mem::size_of::<usize>())
+        .ok_or_else(|| Error::UnsupportedOperation("delta id-set row bytes overflow".into()))?;
+    len.checked_mul(node)
+        .ok_or_else(|| Error::UnsupportedOperation("delta id-set bytes overflow".into()))
+}
+
+fn delta_position_map_bytes(len: usize) -> Result<usize> {
+    let node = std::mem::size_of::<(i64, usize)>()
+        .checked_add(4 * std::mem::size_of::<usize>())
+        .ok_or_else(|| {
+            Error::UnsupportedOperation("delta position-map row bytes overflow".into())
+        })?;
+    len.checked_mul(node)
+        .ok_or_else(|| Error::UnsupportedOperation("delta position-map bytes overflow".into()))
+}
+
+fn check_composition_working_set(
+    reference: &State,
+    decoded: &DecodedDelta,
+    content_bytes: usize,
+) -> Result<()> {
+    check_composition_working_set_with_limit(
+        reference,
+        decoded,
+        content_bytes,
+        MAX_STREAM_BYTES as usize,
+    )
+}
+
+fn check_composition_working_set_with_limit(
+    reference: &State,
+    decoded: &DecodedDelta,
+    content_bytes: usize,
+    limit: usize,
+) -> Result<()> {
+    let reference_bytes = state_resident_bytes(reference)?;
+    let decoded_bytes = decoded_delta_resident_bytes(decoded)?;
+    let output_bound = composed_state_resident_bound(reference, decoded)?;
+    // Birth composition temporarily keeps the grown working state and a second map of
+    // merged columns.  Charging two complete output bounds is conservative (ids are not
+    // duplicated by that map) and keeps this preflight independent of allocator growth.
+    let composed_bytes = if decoded.birth_ids.is_empty() {
+        reference_bytes.max(output_bound)
+    } else {
+        output_bound.checked_mul(2).ok_or_else(|| {
+            Error::UnsupportedOperation("Delta composition output bytes overflow".into())
+        })?
+    };
+    let largest_group = decoded
+        .update_ids
+        .len()
+        .max(decoded.birth_ids.len())
+        .max(decoded.death_ids.len());
+    let update_rows_bytes = planned_i64_capacity(decoded.update_ids.len())?;
+    let keep_rows_bytes = planned_i64_capacity(reference.ids.len())?;
+    let birth_attribute_set_bytes = decoded
+        .birth_bins
+        .len()
+        .checked_add(reference.bins.len())
+        .ok_or_else(|| Error::UnsupportedOperation("Delta birth-attribute count overflows".into()))
+        .and_then(delta_id_set_bytes)?;
+    let temporaries = delta_id_set_bytes(largest_group)?
+        .checked_add(delta_position_map_bytes(reference.ids.len())?)
+        .and_then(|bytes| bytes.checked_add(update_rows_bytes))
+        .and_then(|bytes| bytes.checked_add(keep_rows_bytes))
+        .and_then(|bytes| bytes.checked_add(birth_attribute_set_bytes))
+        .ok_or_else(|| {
+            Error::UnsupportedOperation("Delta composition temporary bytes overflow".into())
+        })?;
+    let peak = reference_bytes
+        .checked_add(decoded_bytes)
+        .and_then(|bytes| bytes.checked_add(content_bytes))
+        .and_then(|bytes| bytes.checked_add(composed_bytes))
+        .and_then(|bytes| bytes.checked_add(temporaries))
+        .ok_or_else(|| {
+            Error::UnsupportedOperation("Delta composition peak bytes overflow".into())
+        })?;
+    if peak > limit {
+        return Err(Error::UnsupportedOperation(format!(
+            "composing the Delta Chunk at t0={} needs at least {peak} bytes across its reference, decoded groups, live encoded content, output state, and temporary indexes, past the {limit} byte reader working-set ceiling",
+            decoded.head.t0
+        )));
+    }
+    Ok(())
+}
+
+fn decode_delta_with_retained(content: &[u8], retained_elsewhere: usize) -> Result<DecodedDelta> {
     let (head, encoded_records) = rec::parse_delta_chunk_records(content)?;
-    let records = delta_record_bytes(&head, encoded_records)?;
+    let max_output_bytes = (MAX_STREAM_BYTES as usize)
+        .checked_sub(retained_elsewhere)
+        .and_then(|remaining| remaining.checked_sub(content.len()))
+        .ok_or_else(|| {
+            Error::UnsupportedOperation(format!(
+                "the Delta Chunk at t0={} and its live reference/encoded content exceed the {MAX_STREAM_BYTES} byte reader working-set ceiling",
+                head.t0
+            ))
+        })?;
+    let records = delta_record_bytes(&head, encoded_records, max_output_bytes)?;
     let mut framed = Cursor::new(&records);
     let updates = framed.blob()?;
     let births = framed.blob()?;
@@ -1146,9 +1527,28 @@ fn decode_delta(content: &[u8]) -> Result<DecodedDelta> {
             "a Delta Chunk carries bytes after its death group".into(),
         ));
     }
-    let (update_ids, update_bins) = decode_group(updates, head.update_count as usize)?;
-    let (birth_ids, birth_bins) = decode_group(births, head.birth_count as usize)?;
-    let (death_ids, death_bins) = decode_group(deaths, head.death_count as usize)?;
+    let record_bytes = match &records {
+        Cow::Borrowed(_) => 0,
+        Cow::Owned(bytes) => bytes.capacity(),
+    };
+    let mut remaining = max_output_bytes.checked_sub(record_bytes).ok_or_else(|| {
+        Error::UnsupportedOperation(format!(
+            "the Delta Chunk at t0={} retains {record_bytes} decompressed record bytes, past the {max_output_bytes} bytes available beside its reference and encoded content",
+            head.t0
+        ))
+    })?;
+    let (update_ids, update_bins, update_bytes) =
+        decode_group_with_limit(updates, head.update_count as usize, remaining)?;
+    remaining = remaining.checked_sub(update_bytes).ok_or_else(|| {
+        Error::UnsupportedOperation("decoded Delta update-group bytes exceed its budget".into())
+    })?;
+    let (birth_ids, birth_bins, birth_bytes) =
+        decode_group_with_limit(births, head.birth_count as usize, remaining)?;
+    remaining = remaining.checked_sub(birth_bytes).ok_or_else(|| {
+        Error::UnsupportedOperation("decoded Delta birth-group bytes exceed its budget".into())
+    })?;
+    let (death_ids, death_bins, _) =
+        decode_group_with_limit(deaths, head.death_count as usize, remaining)?;
     if !birth_ids.is_empty() {
         let missing: Vec<u8> = REQUIRED
             .iter()
@@ -1177,11 +1577,16 @@ fn decode_delta(content: &[u8]) -> Result<DecodedDelta> {
     })
 }
 
+fn decode_delta(content: &[u8]) -> Result<DecodedDelta> {
+    decode_delta_with_retained(content, 0)
+}
+
 fn compose_delta(
     reference: &State,
     content: &[u8],
 ) -> Result<(State, rec::DeltaChunkHeader, Vec<i64>)> {
-    let decoded = decode_delta(content)?;
+    let decoded = decode_delta_with_retained(content, state_resident_bytes(reference)?)?;
+    check_composition_working_set(reference, &decoded, content.len())?;
     let state = apply_delta(
         reference,
         &decoded.update_ids,
@@ -1834,7 +2239,10 @@ pub fn open_indexed<R: crate::Readable + ?Sized>(source: &mut R) -> Result<Index
             summary_at + crate::serialization::RECORD_HEADER_SIZE as u64,
             content_length,
         )?;
-        index.push(rec::ChunkIndexEntry::parse(&content)?);
+        index.push(
+            rec::ChunkIndexEntry::parse(&content)
+                .map_err(|error| error.at_record("Chunk Index record", summary_at))?,
+        );
         summary_at = end;
     }
     check_tiling(&index)?;
@@ -2394,15 +2802,16 @@ mod hostile_record_tests {
             0,
         );
         let error = decode_keyframe_chunk(&content, &[]).unwrap_err();
+        assert!(matches!(error, Error::UnsupportedOperation(_)), "{error}");
         assert!(error.to_string().contains("past the"), "{error}");
-        assert!(error.to_string().contains("byte cap"), "{error}");
+        assert!(error.to_string().contains("reader ceiling"), "{error}");
     }
 
     #[test]
     fn an_unknown_delta_chunk_compression_is_a_named_refusal() {
         let records = empty_delta_records();
         let content =
-            delta_content_with_compression("future-codec", &records, records.len() as u64);
+            delta_content_with_compression("future-codec", &records, MAX_STREAM_BYTES + 1);
         let error = check_delta_chunk(&content, &[]).unwrap_err();
         assert_eq!(
             error.refusal_code(),
@@ -2418,8 +2827,75 @@ mod hostile_record_tests {
             MAX_STREAM_BYTES + 1,
         );
         let error = check_delta_chunk(&content, &[]).unwrap_err();
+        assert!(matches!(error, Error::UnsupportedOperation(_)), "{error}");
         assert!(error.to_string().contains("past the"), "{error}");
-        assert!(error.to_string().contains("byte cap"), "{error}");
+        assert!(error.to_string().contains("reader ceiling"), "{error}");
+    }
+
+    #[test]
+    fn delta_exact_output_is_preflighted_beside_live_encoded_content() {
+        let content = delta_content_with_compression(
+            "deflate",
+            &[0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01],
+            MAX_STREAM_BYTES,
+        );
+        let error = check_delta_chunk(&content, &[]).unwrap_err();
+        assert!(matches!(error, Error::UnsupportedOperation(_)), "{error}");
+        assert!(
+            error.to_string().contains("live encoded content"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("working-set"), "{error}");
+    }
+
+    #[test]
+    fn delta_groups_share_one_decoded_symbol_budget_without_bin_copies() {
+        let mut group = encode_stream(op::A_GAUSSIAN_ID, &[7], 1, codec::DEFLATE, 6, true)
+            .expect("identity stream");
+        group.extend_from_slice(
+            &encode_stream(op::A_POSITION, &[1, 2, 3], 3, codec::DEFLATE, 6, true)
+                .expect("position stream"),
+        );
+        let (ids, bins, resident) = decode_group_with_limit(&group, 1, MAX_STREAM_BYTES as usize)
+            .expect("measure one decoded group");
+        assert_eq!(ids, vec![7]);
+        assert_eq!(bins[&op::A_POSITION].values, vec![1, 2, 3]);
+        assert_eq!(
+            resident,
+            decoded_group_resident_bytes(Some(&ids), &bins).unwrap()
+        );
+
+        let error = decode_group_with_limit(&group, 1, resident - 1).unwrap_err();
+        assert!(matches!(error, Error::UnsupportedOperation(_)), "{error}");
+        assert!(
+            error.to_string().contains("remaining decode budget"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn delta_composition_preflights_output_beside_reference_and_groups() {
+        let reference = State {
+            ids: vec![7],
+            bins: BTreeMap::from([(op::A_POSITION, BinArray::new(vec![1, 2, 3], 3))]),
+        };
+        let decoded = DecodedDelta {
+            head: rec::DeltaChunkHeader {
+                t0: 0.5,
+                ..Default::default()
+            },
+            update_ids: vec![7],
+            update_bins: BTreeMap::from([(op::A_POSITION, BinArray::new(vec![1, 0, -1], 3))]),
+            birth_ids: Vec::new(),
+            birth_bins: BTreeMap::new(),
+            death_ids: Vec::new(),
+        };
+
+        let error = check_composition_working_set_with_limit(&reference, &decoded, 17, 1)
+            .expect_err("the output is refused before apply_delta clones the reference");
+        assert!(matches!(error, Error::UnsupportedOperation(_)), "{error}");
+        assert!(error.to_string().contains("output state"), "{error}");
+        assert!(error.to_string().contains("t0=0.5"), "{error}");
     }
 
     #[test]
@@ -2434,7 +2910,7 @@ mod hostile_record_tests {
     #[test]
     fn defined_attributes_must_use_their_defined_channel_count() {
         let bytes = encode_stream(op::A_POSITION, &[1, 2], 2, codec::DEFLATE, 6, true).unwrap();
-        let error = decode_group(&bytes, 1).unwrap_err();
+        let error = decode_group_with_limit(&bytes, 1, MAX_STREAM_BYTES as usize).unwrap_err();
         assert!(error.to_string().contains("declares 2 channels"), "{error}");
     }
 
@@ -2449,7 +2925,8 @@ mod hostile_record_tests {
             (1 << 20) as u32,
             &[],
         );
-        let error = decode_group(&stream, 1 << 20).unwrap_err();
+        let error =
+            decode_group_with_limit(&stream, 1 << 20, MAX_STREAM_BYTES as usize).unwrap_err();
         assert!(
             error.to_string().contains("declares 255 channels"),
             "{error}"
@@ -2461,7 +2938,7 @@ mod hostile_record_tests {
         let unknown = raw_stream_header(32, 99, 88, 77, 66, 1, &[1, 2, 3]);
         let mut group = encode_stream(op::A_GAUSSIAN_ID, &[7], 1, codec::DEFLATE, 6, true).unwrap();
         group.extend_from_slice(&unknown);
-        let (ids, bins) = decode_group(&group, 1).unwrap();
+        let (ids, bins, _) = decode_group_with_limit(&group, 1, MAX_STREAM_BYTES as usize).unwrap();
         assert_eq!(ids, [7]);
         assert!(bins.is_empty());
 
@@ -2480,7 +2957,12 @@ mod hostile_record_tests {
             ("stream codec", 1, crate::stream::MODE_RAW, 9),
         ] {
             let stream = raw_stream_header(op::A_GAUSSIAN_ID, width, mode, stream_codec, 1, 0, &[]);
-            let error = decode_state_stream(&mut Cursor::new(&stream), 0).unwrap_err();
+            let error = decode_state_stream_with_limit(
+                &mut Cursor::new(&stream),
+                0,
+                MAX_STREAM_BYTES as usize,
+            )
+            .unwrap_err();
             assert!(error.to_string().contains(label), "{label}: {error}");
         }
     }
@@ -2507,7 +2989,9 @@ mod hostile_record_tests {
             2,
             &payload,
         );
-        let error = decode_state_stream(&mut Cursor::new(&stream), 2).unwrap_err();
+        let error =
+            decode_state_stream_with_limit(&mut Cursor::new(&stream), 2, MAX_STREAM_BYTES as usize)
+                .unwrap_err();
         assert!(
             error.to_string().contains("outside the signed 32-bit"),
             "{error}"
@@ -2648,6 +3132,31 @@ mod hostile_record_tests {
             let end = offset.saturating_add(*length);
             end <= content_start || *offset >= content_end
         }));
+    }
+
+    #[test]
+    fn indexed_open_names_an_oversized_band_array_record_and_byte() {
+        let mut data = empty_indexed_file();
+        let index_at = Records::new(&data, MAGIC.len())
+            .find_map(|record| {
+                let record = record.ok()?;
+                (record.opcode == op::CHUNK_INDEX).then_some(record.offset)
+            })
+            .unwrap();
+        const BAND_COUNT_IN_CONTENT: usize = 8 + 8 + 8 + 8 + 4;
+        let band_count_at =
+            index_at + crate::serialization::RECORD_HEADER_SIZE + BAND_COUNT_IN_CONTENT;
+        data[band_count_at..band_count_at + 4].copy_from_slice(&4u32.to_le_bytes());
+
+        let error = open_indexed(&mut BytesReadable::new(&data)).unwrap_err();
+        assert!(matches!(error, Error::Malformed(_)), "{error}");
+        assert!(error.to_string().contains("at most 3"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("Chunk Index record at byte {index_at}")),
+            "{error}"
+        );
     }
 
     #[test]
