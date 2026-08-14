@@ -690,6 +690,21 @@ jobs:
             fi
             cat "$architecture_log"
             grep -q FOURDGS_CARGO_TARGET "$architecture_log"
+
+            # Artifact naming and link compatibility follow the Rust target ABI, not just
+            # the C++ compiler. A GNU Rust target under MSVC must be refused at configure
+            # time instead of waiting for Cargo to emit libfourdgs.a where CMake expected
+            # fourdgs.lib (the reciprocal MinGW/MSVC-host case follows the same check).
+            abi_log="$RUNNER_TEMP/fourdgs-msvc-gnu-rust-target.log"
+            if cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-msvc-gnu-rust-target" \
+              -DFOURDGS_CARGO_TARGET=x86_64-pc-windows-gnu \
+              -DFOURDGS_SOURCE_DIR="$GITHUB_WORKSPACE" >"$abi_log" 2>&1; then
+              cat "$abi_log"
+              echo "::error::MSVC configured with a GNU Rust target"
+              exit 1
+            fi
+            cat "$abi_log"
+            grep -q 'MSVC C++ ABI cannot link the Rust target x86_64-pc-windows-gnu' "$abi_log"
           elif [ "$RUNNER_OS" = "macOS" ]; then
             # CMAKE_OSX_ARCHITECTURES likewise does not make CMAKE_CROSSCOMPILING true.
             # A selected thin architecture requires an explicit matching Rust triple.
@@ -718,6 +733,26 @@ jobs:
             cat "$universal_log"
             grep -q 'cannot produce one universal Rust archive' "$universal_log"
           elif [ "$RUNNER_OS" = "Linux" ]; then
+            # Reproduce the common mixed Windows-toolchain installation without needing
+            # a Windows linker: Clang's GNU Windows target makes CMake select the MinGW ABI,
+            # and static-library try-compiles are enough for configuration. Cargo's MSVC
+            # host target must be rejected before its differently named archive is built.
+            mingw_abi_log="$RUNNER_TEMP/fourdgs-mingw-msvc-rust-target.log"
+            if cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-mingw-msvc-rust-target" \
+              -DCMAKE_SYSTEM_NAME=Windows \
+              -DCMAKE_CXX_COMPILER=clang++ \
+              -DCMAKE_CXX_COMPILER_TARGET=x86_64-w64-windows-gnu \
+              -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+              -DFOURDGS_CARGO_TARGET=x86_64-pc-windows-msvc \
+              -DFOURDGS_SOURCE_DIR="$GITHUB_WORKSPACE" >"$mingw_abi_log" 2>&1; then
+              cat "$mingw_abi_log"
+              echo "::error::MinGW configured with an MSVC Rust target"
+              exit 1
+            fi
+            cat "$mingw_abi_log"
+            grep -q 'GNU Windows C++ ABI cannot link the Rust target x86_64-pc-windows-msvc' \
+              "$mingw_abi_log"
+
             # A package manager may expose fetched dependencies read-only. Cargo normally
             # creates an uncommitted library lockfile beside a workspace manifest, so this
             # proves the integration stages its Cargo project in the writable build tree

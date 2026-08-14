@@ -203,6 +203,33 @@ if(FOURDGS_BUILD_CORE_FROM_SOURCE AND FOURDGS_CORE_LIBRARY STREQUAL "")
     endif()
     set(FOURDGS_CARGO_TARGET "${FOURDGS_CARGO_HOST_TARGET}")
   endif()
+
+  # The archive spelling is a property of Cargo's target ABI, not CMake's compiler.
+  # In particular, a MinGW C++ compiler can run beside the common MSVC Rust host: choosing
+  # `libfourdgs.a` from `MSVC=FALSE` while Cargo actually writes `fourdgs.lib` turns a clear
+  # toolchain mismatch into a missing custom-command output. Name the artifact from the Rust
+  # triple and reject incompatible Windows ABI pairs before starting the build.
+  set(FOURDGS_CARGO_WINDOWS_ABI "")
+  if(FOURDGS_CARGO_TARGET MATCHES "-windows-msvc$")
+    set(FOURDGS_CARGO_WINDOWS_ABI "MSVC")
+  elseif(FOURDGS_CARGO_TARGET MATCHES "-windows-(gnu|gnullvm)$")
+    set(FOURDGS_CARGO_WINDOWS_ABI "GNU")
+  endif()
+  if(MSVC AND NOT "${FOURDGS_CARGO_WINDOWS_ABI}" STREQUAL "MSVC")
+    message(
+      FATAL_ERROR
+        "The MSVC C++ ABI cannot link the Rust target ${FOURDGS_CARGO_TARGET}. Set "
+        "-DFOURDGS_CARGO_TARGET=<architecture>-pc-windows-msvc, or supply a prebuilt "
+        "FOURDGS_CORE_LIBRARY compiled for this C++ toolchain.")
+  elseif(WIN32 AND NOT MSVC AND NOT "${FOURDGS_CARGO_WINDOWS_ABI}" STREQUAL "GNU")
+    message(
+      FATAL_ERROR
+        "The GNU Windows C++ ABI cannot link the Rust target ${FOURDGS_CARGO_TARGET}. Set "
+        "-DFOURDGS_CARGO_TARGET=<architecture>-pc-windows-gnu (or a compatible "
+        "windows-gnullvm target), or supply a prebuilt FOURDGS_CORE_LIBRARY compiled for "
+        "this C++ toolchain.")
+  endif()
+
   set(FOURDGS_CORE_SOURCE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
   # Cargo always places its lockfile beside the manifest, independently of
   # CARGO_TARGET_DIR. A fetched dependency can be read-only and this repository
@@ -216,7 +243,7 @@ if(FOURDGS_BUILD_CORE_FROM_SOURCE AND FOURDGS_CORE_LIBRARY STREQUAL "")
   configure_file("${FOURDGS_CORE_SOURCE_ROOT}/rust/fourdgs/Cargo.toml"
                  "${FOURDGS_CORE_CARGO_SOURCE_DIR}/Cargo.toml" COPYONLY)
   set(FOURDGS_CORE_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/rust-core")
-  if(MSVC)
+  if(FOURDGS_CARGO_WINDOWS_ABI STREQUAL "MSVC")
     set(FOURDGS_GENERATED_CORE_LIBRARY
         "${FOURDGS_CORE_TARGET_DIR}/${FOURDGS_CARGO_TARGET}/release/fourdgs.lib")
   else()
