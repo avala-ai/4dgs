@@ -15,6 +15,7 @@ import type { ChunkGaussians, ShCoefficients } from "@4dgs/core";
 import { BlobReadable, HttpRangeReadable } from "@4dgs/browser";
 
 import { AudioPayloadDigests, canonical, summarize } from "./canonical.js";
+import { stagedBrowserSummary } from "./browserStaged.js";
 
 export interface PageResult {
   readonly variant: string;
@@ -114,14 +115,19 @@ export async function run(variants: readonly string[]): Promise<PageResult[]> {
     ] as const) {
       try {
         const actual = await decode(variant);
-        const same = JSON.stringify(JSON.parse(actual)) === JSON.stringify(JSON.parse(expected));
+        const actualSummary = stagedBrowserSummary(actual);
+        const expectedSummary = stagedBrowserSummary(expected);
+        const same = JSON.stringify(actualSummary) === JSON.stringify(expectedSummary);
         results.push({
           variant,
           path,
           ok: same,
           detail: same
-            ? `${JSON.parse(actual).gaussianCount} gaussians`
-            : firstDifference(expected, actual),
+            ? `${actualSummary["gaussianCount"]} gaussians`
+            : firstDifference(
+                JSON.stringify(expectedSummary, null, 2),
+                JSON.stringify(actualSummary, null, 2),
+              ),
         });
       } catch (error) {
         results.push({
