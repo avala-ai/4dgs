@@ -76,6 +76,7 @@ constexpr std::uint8_t kDeltaModeChained = 1;
 struct KeyframeDeltaSample {
   /// Where this sample's interval starts. Sample `i` covers `[t0_i, t0_{i+1})`, the first
   /// starts at 0 and the last ends at the sequence's duration — the tiling rule of §11.1.
+  /// A duration of positive infinity gives the final sample an open-ended interval.
   double t0 = 0.0;
   Span<const std::uint32_t> ids;
   GaussianView gaussians;
@@ -127,9 +128,10 @@ struct KeyframeDeltaOptions {
 /// `sigma_t`, `flags` or `window_index` in an update group (§11.5).
 ///
 /// `kNotImplemented` when the package was built without the core; `kInvalidArgument` when the
-/// duration is not finite and positive, sample instants do not strictly tile `[0, durationSec)`,
-/// an identity repeats within one sample or reappears after death, or the samples break another
-/// producer rule from §11. The error message names the sample and offending instant or gaussian.
+/// duration is NaN or non-positive, sample instants do not strictly tile `[0, durationSec)`, an
+/// identity repeats within one sample or reappears after death, or the samples break another
+/// producer rule from §11. Positive infinity is a valid open-ended duration. The error message
+/// names the sample and offending instant or gaussian.
 Result<std::vector<std::uint8_t>> encodeKeyframeDeltaSequence(
     Span<const KeyframeDeltaSample> samples, double durationSec,
     const KeyframeDeltaOptions& options = KeyframeDeltaOptions());
