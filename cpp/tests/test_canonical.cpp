@@ -5,6 +5,8 @@
 /// on decoded order.
 
 #include <algorithm>
+#include <clocale>
+#include <cstdio>
 #include <limits>
 #include <random>
 #include <string>
@@ -215,6 +217,80 @@ void stringsAreEscaped() {
   CHECK_EQ(Json::string("a\"b\\c\nd").render(), std::string("\"a\\\"b\\\\c\\nd\""));
 }
 
+/// The substitution itself, asked directly, because the end-to-end check below can only run
+/// on a machine that has a comma-radix locale installed and most CI images do not.
+///
+/// Both directions and both widths: `,` is one byte, and a locale is free to spell its radix
+/// with several — `localeconv()->decimal_point` is a string, not a character, and reading
+/// only its first byte would corrupt the number rather than convert it.
+void theRadixIsRewrittenBothWays() {
+  using fourdgs::conformance::detail::radixFromJson;
+  using fourdgs::conformance::detail::radixToJson;
+
+  CHECK_EQ(radixToJson("-0,050000", ","), std::string("-0.050000"));
+  CHECK_EQ(radixToJson("0.050000", "."), std::string("0.050000"));
+  // Arabic decimal separator U+066B, three bytes in UTF-8.
+  CHECK_EQ(radixToJson("12\xd9\xab"
+                       "500000",
+                       "\xd9\xab"),
+           std::string("12.500000"));
+
+  CHECK_EQ(radixFromJson("-0.050000", ","), std::string("-0,050000"));
+  CHECK_EQ(radixFromJson("0.050000", "."), std::string("0.050000"));
+  CHECK_EQ(radixFromJson("12.500000", "\xd9\xab"), std::string("12\xd9\xab"
+                                                               "500000"));
+
+  // A number with no radix at all is left alone rather than gaining one.
+  CHECK_EQ(radixToJson("-12", ","), std::string("-12"));
+  CHECK_EQ(radixFromJson("-12", ","), std::string("-12"));
+}
+
+/// A summary is JSON, and JSON spells a radix `.` — whatever `LC_NUMERIC` says.
+///
+/// `snprintf` and `strtod` both take the radix from the locale, and this canonicalizer is a
+/// library: linked into a host that calls `setlocale(LC_ALL, "")` — which ICU, Qt and GTK all
+/// do during initialisation — under a comma-radix locale, `num(0.05).render()` produced
+/// `"0,050000"` and every corpus file failed to parse in `run.py`. Rounding is affected too,
+/// through `strtod` in `roundToDecimals`, so the content order moved with it.
+///
+/// The locale is restored before returning: the process runs the rest of the suite after this.
+void theCanonicalRadixIsNotTheLocaleRadix() {
+  const char* saved = std::setlocale(LC_NUMERIC, nullptr);
+  const std::string restore = saved == nullptr ? "C" : saved;
+
+  // No single name is portable, so this asks for several and uses whichever the machine
+  // happens to have. Anything with a comma radix answers the question.
+  const char* candidates[] = {
+      "de_DE.UTF-8", "de_DE.utf8", "fr_FR.UTF-8",         "fr_FR.utf8",
+      "en_DK.UTF-8", "en_DK.utf8", "German_Germany.1252", "de_DE",
+  };
+  std::setlocale(LC_NUMERIC, "C");
+  const std::string underC = summarize(scene(8, 11));
+
+  bool exercised = false;
+  for (const char* name : candidates) {
+    if (std::setlocale(LC_NUMERIC, name) == nullptr) continue;
+    if (std::string(std::localeconv()->decimal_point) == ".") continue;
+    exercised = true;
+
+    CHECK_EQ(fourdgs::conformance::num(0.05).render(), std::string("0.050000"));
+    CHECK_EQ(fourdgs::conformance::num(-2.5).render(), std::string("-2.500000"));
+    CHECK_EQ(fourdgs::conformance::num(-0.0000004).render(), std::string("0.000000"));
+    // The whole document, not one number. `roundToDecimals` reads the rendered text back
+    // through `strtod`, which is as locale-bound as the render was: handed a radix it cannot
+    // parse it stops at the integer part, so the content-order key silently loses every
+    // fractional digit and the rows come out in a different order.
+    CHECK_EQ(summarize(scene(8, 11)), underC);
+    break;
+  }
+  std::setlocale(LC_NUMERIC, restore.c_str());
+  // Not a failure: an image with only C and en_US cannot express the question, and
+  // `theRadixIsRewrittenBothWays` covers the mechanism on every machine.
+  if (!exercised) {
+    std::printf("note: no comma-radix locale installed; the end-to-end radix check did not run\n");
+  }
+}
+
 void runTests() {
   orderCannotChangeTheSummary();
   roundedTiesUseExactDecodedValues();
@@ -225,6 +301,8 @@ void runTests() {
   checksumMatchesTheReference();
   keysAreSorted();
   stringsAreEscaped();
+  theRadixIsRewrittenBothWays();
+  theCanonicalRadixIsNotTheLocaleRadix();
 }
 
 }  // namespace
