@@ -129,6 +129,23 @@ function supportK(cutoff: number): number {
   return Math.sqrt(-2 * Math.log(cutoff));
 }
 
+/**
+ * Refuse a marginal threshold that is not one.
+ *
+ * A threshold outside `(0, 1]` is not a threshold, and it has to be refused here rather
+ * than become a domain error inside a logarithm. `supportK` inverts `Math.log(cutoff)`,
+ * so zero or a negative value yields `Infinity` or `NaN`, and neither stays loud: a `NaN`
+ * half-width makes every containment comparison in `planChunks` false, so the tree
+ * collapses into one degenerate node covering the whole clip and the Chunk Index stops
+ * being a partition anybody can seek with. Python refuses the same domain with the same
+ * sentence (`quantization.support_k`), and Rust with `check_cutoff`.
+ */
+function checkCutoff(cutoff: number): void {
+  if (!(cutoff > 0 && cutoff <= 1)) {
+    throw new Error(`the Header's cutoff is ${cutoff}; a marginal threshold must be in (0, 1]`);
+  }
+}
+
 const adjacentFloat = new DataView(new ArrayBuffer(8));
 
 /** The adjacent binary64 value toward positive infinity. */
@@ -610,6 +627,10 @@ interface Plan {
 function planningSupport(q: Quantized, cutoff: number): { lo: number[]; hi: number[] } {
   const lo = new Array<number>(q.mu.length);
   const hi = new Array<number>(q.mu.length);
+  // `cutoff` is already known to be in `(0, 1]` (`checkCutoff`), so the predecessor is
+  // zero for exactly one input: the smallest positive subnormal. There the only finite
+  // conservative inverse is the whole timeline. Every other threshold has a positive
+  // predecessor and a real `supportK`.
   const marginalFloor = nextDown(cutoff);
   // `stateAt` rounds subtraction and division before the marginal comparison. Gamma(2)
   // bounds those two binary64 operations in ratio space.
@@ -836,6 +857,7 @@ export async function encodeScene(
   options: WriteOptions = {},
 ): Promise<Uint8Array> {
   const cutoff = options.cutoff ?? 0.05;
+  checkCutoff(cutoff);
   const maxDepth = options.maxDepth ?? 6;
   const minChunk = options.minChunkGaussians ?? 2048;
   const writeIndex = options.writeIndex ?? true;

@@ -817,6 +817,34 @@ test("chunk planning covers a cancellation-prone rounded visibility endpoint", a
   await assertIndexedGaussianVisible(bytes, endpoint);
 });
 
+test("the writer refuses a cutoff outside (0, 1]", async () => {
+  // `supportK` inverts `Math.log(cutoff)`. Zero and negative thresholds are a domain error
+  // there, and the NaN half-width that comes back does not stay loud: every containment
+  // comparison in `planChunks` goes false, the tree collapses into one degenerate node,
+  // and the Chunk Index stops being a partition anybody can seek with. A threshold outside
+  // (0, 1] is not a threshold; it is refused before it is inverted, the same domain and
+  // the same sentence as Python's `quantization.support_k` and Rust's `check_cutoff`.
+  for (const bad of [0, -0.05, 1.5, Infinity, NaN]) {
+    await assert.rejects(
+      () => encodeScene(oneTemporalGaussian(0.5, 0.1), 1, { cutoff: bad }),
+      /a marginal threshold must be in \(0, 1\]/,
+      `cutoff ${bad} must be refused`,
+    );
+  }
+});
+
+test("the smallest positive cutoff plans the whole timeline", async () => {
+  // The one legal threshold whose predecessor is zero, and so the boundary of the refusal
+  // above. There is no finite `supportK` to invert; the conservative bound is the whole
+  // timeline, not the NaN an unchecked negative predecessor would produce.
+  const bytes = await encodeScene(oneTemporalGaussian(0.5, 0.1), 1, {
+    cutoff: Number.MIN_VALUE,
+    maxDepth: 1,
+    minChunkGaussians: 1,
+  });
+  for (const t of [0, 0.25, 0.5, 0.75]) await assertIndexedGaussianVisible(bytes, t);
+});
+
 test("the Chunk Index Summary Offset excludes following Statistics", async () => {
   const bytes = await encodeScene(oneTemporalGaussian(0.5, 0.1), 1, {
     writeIndex: true,
