@@ -23,8 +23,8 @@ A variant's name is its scenario followed by the flags it carries, hyphen-separa
 the decode harness matches fragments to select runners, and the encode gate makes its second,
 per-band-depth pass only when the name contains `SHDegree`. Most variants sit at the top of `data/`;
 three families live in subdirectories — `data/keyframe/`, `data/object/` and `data/invalid/` — and a
-variant there is named with its directory as a prefix. Today that is 46 valid variants at the top
-level, 4 keyframe-delta, 3 object-layer and 7 invalid.
+variant there is named with its directory as a prefix. Today that is 48 valid variants at the top
+level, 5 keyframe-delta, 6 object-layer and 7 invalid.
 
 ## The corpus is generated, not committed
 

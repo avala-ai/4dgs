@@ -408,8 +408,8 @@ class TestTheCanonicalFormHasNoDecodedOrder:
         assert forward == reversed_
         assert forward["states"][1]["sample"]["positions"] == [[0.2, 0.0, 0.0], [0.8, 0.0, 0.0]]
 
-    def test_state_aggregates_sum_in_content_order(self):
-        """The same four f32 values sum differently when their decoded order changes."""
+    def test_state_aggregates_sum_in_emitted_content_order(self):
+        """The same four f32 values sum identically after a decoded-order change."""
         gaussians = self._gaussians(
             positions=[
                 [332.6397705078125, 3.0, 0.0],
@@ -429,6 +429,18 @@ class TestTheCanonicalFormHasNoDecodedOrder:
             10.0,
             0.0,
         ]
+
+
+def test_adversarial_order_cases_are_encoded_corpus_variants():
+    variants = {name: expectation for name, _data, expectation in generate.build_object_corpus()}
+    tied = "ObjectTiedGaussians-UseChunkIndex-UseCrc"
+    reordered = "ObjectTiedGaussiansReordered-UseChunkIndex-UseCrc"
+    content_sum = "ObjectContentOrderSum-UseChunkIndex-UseCrc"
+
+    assert variants[tied] == variants[reordered]
+    content_summary = json.loads(variants[content_sum])
+    assert content_summary["states"][1]["sample"]["objectIds"] == ["1", "2", "3"]
+    assert content_summary["states"][1]["aggregate"]["positionSum"] == [3.25, 0.0, 0.0]
 
 
 def test_keyframe_delta_variants_retain_an_untouched_common_row():

@@ -151,10 +151,15 @@ CANONICAL_STATE_ORDER_FAMILIES: frozenset[str] = frozenset()
 #: and a diff cannot tell that apart from a decoder that got it wrong.
 
 FAMILY_DECLINES: dict[str, tuple[str, ...]] = {
-    # Every family now reports provenance (spec §5.15) and decodes the object layer.
-    # TypeScript and Dart compose its tracks natively; C++ and Swift do it through the
-    # Rust C ABI's additive objects/states accessors, so no binding restates the
-    # base-then-track order or the slerp underneath it.
+    # Canonical ordering is delivered as one language per stacked PR.  The Python
+    # reference is the bottom layer; each language removes only its own declaration when
+    # its implementation lands above it.  The encoded variants therefore turn green one
+    # SDK at a time without making the independently mergeable corpus layer red.
+    "typescript": ("ObjectTiedGaussians", "ObjectContentOrderSum"),
+    "rust": ("ObjectTiedGaussians", "ObjectContentOrderSum"),
+    "dart": ("ObjectTiedGaussians", "ObjectContentOrderSum"),
+    "cpp": ("ObjectTiedGaussians", "ObjectContentOrderSum"),
+    "swift": ("ObjectTiedGaussians", "ObjectContentOrderSum"),
 }
 
 

@@ -9,10 +9,10 @@ harness skips the rest —
 — and this table is kept in lockstep with what runs. Nothing is marked `Yes` on the strength of code
 existing.
 
-Every row is filled in from a suite that runs: 46 valid variants and 7 invalid ones, plus 4
-keyframe-delta and 3 object-layer variants in their own subdirectories, over two read paths
+Every row is filled in from a suite that runs: 48 valid variants and 7 invalid ones, plus 5
+keyframe-delta and 6 object-layer variants in their own subdirectories, over two read paths
 (streamed and indexed). A language takes the variants it declares support for, and what it declines
-is what this table records — 119 checks passing for every SDK. C++ and Swift read 4DGS through the
+is what this table records — 131 checks passing for every SDK. C++ and Swift read 4DGS through the
 Rust C ABI: the additive states-JSON accessor computes keyframe-delta summaries in the core, the
 provenance-JSON accessor does the same for the provenance family, and the objects-JSON pair does it
 for the object layer, so every binding emits identical bytes with no per-language slerp or
@@ -307,7 +307,7 @@ directions.
 **Encode**, **Chunked encode** and **Summary writing** are proved by a gate rather than by a runner,
 and the encoders are gated by their role.
 
-Python's is proved by the corpus gate: `generate.py --verify` re-encodes all 46 valid variants,
+Python's is proved by the corpus gate: `generate.py --verify` re-encodes all 48 top-level variants,
 asserts every committed checksum, and asserts that two consecutive runs are byte-identical. Every
 variant is an encode; the chunked and summary-bearing ones are the flags that say so.
 

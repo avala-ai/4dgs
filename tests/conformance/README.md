@@ -34,8 +34,8 @@ the cap.
 A corpus of valid files can only prove that a decoder accepts what it should. It cannot prove that a
 decoder **refuses** what it should — and a large part of this specification is rules whose entire
 content is a refusal: a window index outside its table, a codec this build does not implement, a
-temporal model this reader has never heard of. A decoder that ignores every one of them passes all
-46 valid variants.
+temporal model this reader has never heard of. A decoder that ignores every one of them passes the
+entire valid corpus.
 
 `generator/invalid.py` declares the other half. Each entry is a length-preserving byte mutation of
 one valid base file, chosen so that **exactly one** rule is broken, paired with the **refusal
@@ -129,12 +129,11 @@ corpus must be redistributable without a licence question and reproducible witho
 
 `run.py` lets a whole language family decline the variants carrying a feature it has not
 implemented, through `FAMILY_DECLINES`; a runner from outside this repository declines by listing
-the same name fragments in its own declaration. The object-layer variants are the current users of
-it: C++ and Swift decline them, and the feature matrix records the `No`. TypeScript and Dart used to
-sit in that list and no longer do — they decode the object layer and compose its tracks natively,
-which is what removing a family from `FAMILY_DECLINES` is supposed to look like. Every family
-reports provenance (spec §5.15); C++ and Swift do so through the Rust C ABI's additive
-provenance-JSON accessor.
+the same name fragments in its own declaration. The canonical-order variants are delivered as a
+language stack: the bottom corpus layer declares them for Python, and each language removes its two
+name fragments when its implementation lands above. This is what removing a family from
+`FAMILY_DECLINES` is supposed to look like. Every family reports provenance (spec §5.15) and the
+object layer; C++ and Swift do so through the Rust C ABI's additive JSON accessors.
 
 The alternative to optional keys was worse in a way worth writing down. The canonical summary emits
 its `provenance` section **only when the file carries provenance** — unlike `audioSources`, which is
@@ -211,7 +210,7 @@ why a runner driven with `--runner-cmd` is asked a different question entirely.
 
 An implementation this repository has never heard of is scored with `--runner-cmd`, once per read
 path, and is compared exactly as a built-in family is — same corpus, same expectations, same
-`json.loads(actual) == json.loads(expected)`. Nothing about it is special-cased, and 119/119 is
+`json.loads(actual) == json.loads(expected)`. Nothing about it is special-cased, and a full score is
 reachable from outside without editing this harness at all:
 
 ```sh
@@ -417,12 +416,10 @@ is a failure there, never a skip.
 ## Platforms
 
 The suite runs on GitHub-hosted runners for Python, TypeScript and Rust on Linux, macOS and Windows;
-C++, Swift and Dart run it on Linux. Every platform decodes the same 46 valid variants and compares
-against the same committed expectations — 97 passing comparisons for a family that reports
-provenance but declines the object layer (C++ and Swift), 105 for Rust, TypeScript and Dart, which
-also answer the object variants, and 119 for Python, which answers all of them including the refusal
-expectations. The single `decode_indexed` variant that declares no chunk index is skipped
-everywhere.
+C++, Swift and Dart run it on Linux. Every platform decodes the same generated corpus and compares
+against the same committed expectations. A fully supporting family makes 131 passing comparisons;
+the single `decode_indexed` variant that declares no chunk index is skipped everywhere, and a
+language layer that has not landed yet also skips the named canonical-order variants.
 
 That the corpus is bytes is the whole reason this is worth doing on more than one platform: a
 decoder that agrees with the expectation on Linux and disagrees on Windows is exactly the bug this
@@ -440,9 +437,9 @@ So that two languages can be diffed without arguing about representation:
   reconstruction and payload digest, so absence and multiplicity are visible in every implementation
 - keys are sorted; the harness stable-stringifies before diffing and colourizes the first divergence
 - **nothing depends on decoded order.** Gaussians may be reordered freely by an encoder, so the
-  sample, the aggregates and the spherical harmonic digest are all taken in a content order derived
-  from decoded values alone. Two gaussians that tie on every decoded value are identical in every
-  number the summary emits, so their relative order cannot change it
+  sample and spherical harmonic digest use a rounded content order derived from decoded values. Rows
+  that tie there can diverge after temporal composition, so `states` breaks the tie with the rounded
+  row it emits, and state aggregates add in that emitted order rather than resident order
 - records that are not gaussians are summarized too — the camera, the metadata, the attachments, the
   statistics, the summary offsets, and whether the footer's CRC verified. A record that changes
   nothing here is a record an implementation could ignore entirely and still pass, which is how a

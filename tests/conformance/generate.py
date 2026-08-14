@@ -43,6 +43,7 @@ sys.path.insert(0, os.path.join(HERE, "generator"))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "..", "python", "fourdgs"))
 
+import canonical as canonical_module
 import fourdgs
 import invalid
 import scenarios
@@ -805,13 +806,95 @@ def _obj_track_composed() -> tuple[fourdgs.GaussianSet, ObjectLayer]:
     return gaussians, layer
 
 
-#: (name, builder). Three variants, each a distinct decode-and-compose: a single tracked
-#: object over a static base, a multi-object table with tracked/untracked/background objects,
-#: and a track composed over a base that moves and turns.
+def _obj_fixture_layer(label: str) -> ObjectLayer:
+    """One inert object record for canonical-order arithmetic fixtures."""
+    return ObjectLayer(
+        table=ObjectTable(
+            embedding_dim=0,
+            entries=[ObjectTableEntry(object_id=7, label=label, anchor=(0.0, 0.0, 0.0))],
+        )
+    )
+
+
+def _obj_tied_gaussians() -> tuple[fourdgs.GaussianSet, ObjectLayer]:
+    """Two primary-key ties whose motion becomes visible only after composition."""
+    gaussians = _obj_gaussians(
+        positions=[[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+        object_ids=[7, 7],
+        # Descending emitted-state order on purpose.  The paired encoding reverses it.
+        motions=[[4e-7, 0.0, 0.0], [1e-7, 0.0, 0.0]],
+    )
+    # The position and motion pitches are derived from median scale.  This makes the two
+    # decoded motions adjacent representable bins which round to the same six-decimal
+    # primary key, rather than relying on a hand-written unencodable float.
+    gaussians.scales[:] = 2e-6
+    return gaussians, _obj_fixture_layer("tied gaussians")
+
+
+def _obj_tied_gaussians_reordered() -> tuple[fourdgs.GaussianSet, ObjectLayer]:
+    gaussians, layer = _obj_tied_gaussians()
+    order = np.array([1, 0], dtype=np.intp)
+    return _permute_gaussians(gaussians, order), layer
+
+
+def _permute_gaussians(gaussians: fourdgs.GaussianSet, order: np.ndarray) -> fourdgs.GaussianSet:
+    """Copy one fixture in a different physical order, preserving every decoded field."""
+    return fourdgs.GaussianSet(
+        positions=gaussians.positions[order],
+        scales=gaussians.scales[order],
+        rotations=gaussians.rotations[order],
+        colors=gaussians.colors[order],
+        motions=gaussians.motions[order],
+        mu_t=gaussians.mu_t[order],
+        sigma_t=gaussians.sigma_t[order],
+        win_lo=gaussians.win_lo[order],
+        win_hi=gaussians.win_hi[order],
+        object_id=gaussians.object_id[order],
+    )
+
+
+def _obj_content_order_sum() -> tuple[fourdgs.GaussianSet, ObjectLayer]:
+    """Resident and content orders land on opposite sides of cancellation."""
+    gaussians = _obj_gaussians(
+        positions=[[0.0, 0.0, 0.0]] * 3,
+        # Resident order 3,1,2 sums small,+large,-large.  Content order is 1,2,3.
+        object_ids=[3, 1, 2],
+    )
+    layer = ObjectLayer(
+        table=ObjectTable(
+            embedding_dim=0,
+            entries=[
+                ObjectTableEntry(object_id=1, label="positive", anchor=(0.0, 0.0, 0.0)),
+                ObjectTableEntry(object_id=2, label="negative", anchor=(0.0, 0.0, 0.0)),
+                ObjectTableEntry(object_id=3, label="small", anchor=(0.0, 0.0, 0.0)),
+            ],
+        ),
+        tracks=[
+            ObjectTrack(
+                object_id=object_id,
+                times=[0.0, _OBJ_DURATION],
+                rotations=[[0.0, 0.0, 0.0, 1.0]] * 2,
+                translations=[translation] * 2,
+            )
+            for object_id, translation in (
+                (1, [1e20, 0.0, 0.0]),
+                (2, [-1e20, 0.0, 0.0]),
+                (3, [3.25, 0.0, 0.0]),
+            )
+        ],
+    )
+    return gaussians, layer
+
+
+#: (name, builder). The three ordinary decode-and-compose cases are followed by three
+#: canonical-order adversaries: a physically reordered tied pair and a cancellation sum.
 OBJECT_VARIANTS = (
     ("SingleObject-UseChunkIndex-UseCrc", _obj_single),
     ("MultiObject-UseChunkIndex-UseCrc", _obj_multi),
     ("ObjectTrackComposed-UseChunkIndex-UseCrc", _obj_track_composed),
+    ("ObjectTiedGaussians-UseChunkIndex-UseCrc", _obj_tied_gaussians),
+    ("ObjectTiedGaussiansReordered-UseChunkIndex-UseCrc", _obj_tied_gaussians_reordered),
+    ("ObjectContentOrderSum-UseChunkIndex-UseCrc", _obj_content_order_sum),
 )
 
 
@@ -824,6 +907,8 @@ def build_object_corpus() -> list[tuple[str, bytes, str]]:
     to make, and the statement every SDK that decodes objects is diffed against.
     """
     out: list[tuple[str, bytes, str]] = []
+    summaries: dict[str, dict] = {}
+    resident_tie_rows: dict[str, list] = {}
     for name, builder in OBJECT_VARIANTS:
         gaussians, layer = builder()
         options = fourdgs.WriteOptions(
@@ -840,26 +925,54 @@ def build_object_corpus() -> list[tuple[str, bytes, str]]:
         fourdgs.write(buf, gaussians, _OBJ_DURATION, options=options)
         data = buf.getvalue()
         scene = fourdgs.read(data)
+        if name.startswith("ObjectTiedGaussians"):
+            keys = canonical_module._stable_keys(scene.gaussians)
+            if len(keys) != 2 or keys[0] != keys[1]:
+                raise AssertionError(f"{name}: the adversarial primary keys do not tie")
+            state = scene.gaussians.state_at(0.5 * _OBJ_DURATION, scene.header.cutoff)
+            resident_tie_rows[name] = [[canonical_module.num(v) for v in row] for row in state["centers"]]
         # The same full summarize the runners call, so the committed expectation matches what
         # a decoder prints — a file written with a CRC and an index reports `summaryCrcOk`
         # and chunk intervals, and omitting those here would diff against every runner.
-        expectation = canonical(
-            summarize(
-                scene.header,
-                scene.gaussians,
-                scene.audio_sources,
-                [(e.t0, e.t1) for e in scene.chunk_index],
-                camera=scene.camera,
-                metadata=scene.metadata,
-                attachments=scene.attachments,
-                statistics=scene.statistics,
-                summary_offsets=scene.summary_offsets,
-                summary_crc_ok=scene.summary_crc_ok,
-                provenance=scene.provenance,
-                objects=scene.objects,
-            )
+        summary = summarize(
+            scene.header,
+            scene.gaussians,
+            scene.audio_sources,
+            [(e.t0, e.t1) for e in scene.chunk_index],
+            camera=scene.camera,
+            metadata=scene.metadata,
+            attachments=scene.attachments,
+            statistics=scene.statistics,
+            summary_offsets=scene.summary_offsets,
+            summary_crc_ok=scene.summary_crc_ok,
+            provenance=scene.provenance,
+            objects=scene.objects,
         )
+        summaries[name] = summary
+        if name == "ObjectContentOrderSum-UseChunkIndex-UseCrc":
+            state = scene.gaussians.state_at(0.5 * _OBJ_DURATION, scene.header.cutoff)
+            centers, _ = scene.objects.apply(
+                centers=state["centers"],
+                orientations=state["orientations"],
+                object_ids=state["object_id"],
+                t=0.5 * _OBJ_DURATION,
+            )
+            resident_raw = 0.0
+            for row in centers:
+                resident_raw += float(row[0])
+            resident = canonical_module.num(resident_raw)
+            emitted = summary["states"][1]["aggregate"]["positionSum"][0]
+            if resident == emitted:
+                raise AssertionError(f"{name}: resident and content-order sums no longer differ")
+        expectation = canonical(summary)
         out.append((name, data, expectation))
+
+    tied = "ObjectTiedGaussians-UseChunkIndex-UseCrc"
+    reordered = "ObjectTiedGaussiansReordered-UseChunkIndex-UseCrc"
+    if resident_tie_rows[tied] == resident_tie_rows[reordered]:
+        raise AssertionError("the tied pair's resident-order state rows do not differ")
+    if canonical(summaries[tied]) != canonical(summaries[reordered]):
+        raise AssertionError("the tied pair does not share one order-independent canonical summary")
     return out
 
 
