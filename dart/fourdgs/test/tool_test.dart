@@ -971,6 +971,52 @@ void main() {
       );
     });
 
+    test(
+      'a bound is read by the grammar the specification writes down',
+      () async {
+        for (final (String spelling, int expected)
+            in _equivalentBoundSpellings) {
+          final FourdgsValidation report = await validateFourdgs(
+            FourdgsBytes(
+              _minimal(
+                shDegree: 1,
+                shBitDepths: <int>[_depthForBound(expected)],
+                shBand1Bound: spelling,
+              ),
+            ),
+          );
+          expect(
+            report.findings.where(
+              (FourdgsFinding finding) =>
+                  finding.message.contains('`sh_band1` as'),
+            ),
+            isEmpty,
+            reason: '$spelling should be $expected',
+          );
+        }
+
+        for (final (String spelling, int expected) in _rejectedBoundSpellings) {
+          final FourdgsValidation report = await validateFourdgs(
+            FourdgsBytes(
+              _minimal(
+                shDegree: 1,
+                shBitDepths: <int>[_depthForBound(expected)],
+                shBand1Bound: spelling,
+              ),
+            ),
+          );
+          expect(
+            report.findings.where(
+              (FourdgsFinding finding) =>
+                  finding.message.contains('`sh_band1` as'),
+            ),
+            isNotEmpty,
+            reason: '$spelling should not be $expected',
+          );
+        }
+      },
+    );
+
     test('a malformed SH-depth append remains visible to validation', () async {
       final FourdgsValidation report = await validateFourdgs(
         FourdgsBytes(_minimal(shDegree: 1, shBitDepths: const <int>[9])),
@@ -1880,6 +1926,94 @@ Object _caught(void Function() body) {
 }
 
 /// The smallest thing that is meant to validate: header, grids, windows, footer.
+final String _longFraction = '0.${'0' * 1000}4e1001';
+
+/// The spellings section 5.3's grammar accepts, against the bound each one
+/// declares.
+///
+/// The identical table is checked by the Python, TypeScript and Rust
+/// validators. A row that moves here without moving there is the disagreement
+/// the grammar exists to end, so keep the four in step.
+final List<(String, int)> _equivalentBoundSpellings = <(String, int)>[
+  ('16', 16),
+  ('16.', 16),
+  ('16.0', 16),
+  ('+016.000', 16),
+  ('1.6e1', 16),
+  ('160e-1', 16),
+  ('0.16E2', 16),
+  ('8', 8),
+  ('0.8e1', 8),
+  ('80e-1', 8),
+  ('.4e1', 4),
+  (_longFraction, 4),
+  ('0', 0),
+  ('0.0', 0),
+  ('-0', 0),
+  ('+0.000', 0),
+  ('0e999999999999999999999999', 0),
+  ('0.0e-999999999999999999999999', 0),
+];
+
+/// The spellings section 5.3's grammar refuses, against the bound the record
+/// declares.
+///
+/// Several are accepted by one runtime's decimal type or another: underscores
+/// and other scripts' digits by Python's `Decimal`, U+FEFF by Dart's own
+/// `String.trim`, and U+001C through U+001F by Python's whitespace set. That is
+/// exactly why the grammar is matched here rather than delegated to a runtime.
+const List<(String, int)> _rejectedBoundSpellings = <(String, int)>[
+  ('1_6', 16),
+  ('8_0e-1', 8),
+  ('_16', 16),
+  ('16_', 16),
+  ('\u{0661}\u{0666}', 16), // Arabic-Indic one six
+  ('\u{0668}', 8), // Arabic-Indic eight
+  ('\u{0668}\u{0660}e-\u{06f1}', 8),
+  ('\u{ff11}\u{ff16}', 16), // fullwidth one six
+  ('\u{2078}', 8), // superscript eight, a digit in no grammar
+  ('\u{feff}16', 16), // a byte-order mark is data, not padding
+  ('\u{feff}4', 4),
+  ('16\u{feff}', 16),
+  ('\u{001c}8', 8), // Python's `Decimal` trims U+001C; the grammar does not
+  ('\u{001f}16', 16),
+  (' 16 ', 16),
+  ('\t16', 16),
+  ('16\n', 16),
+  ('\u{2009}16', 16), // thin space
+  ('16.0000000000000001', 16),
+  ('15.9999999999999999', 16),
+  ('1.6', 16),
+  ('16e', 16),
+  ('16e+', 16),
+  ('16e-', 16),
+  ('16eNaN', 16),
+  ('', 16),
+  ('.', 16),
+  ('+', 16),
+  ('_', 0),
+  ('NaN', 0),
+  ('nan', 0),
+  ('Infinity', 16),
+  ('inf', 16),
+  ('-16', 16),
+  ('0e', 0),
+  ('0_0', 0),
+  ('\u{0660}', 0), // Arabic-Indic zero
+  ('\u{feff}0', 0),
+  ('\u{001c}0', 0),
+  ('1', 0),
+];
+
+/// The SH bit depth whose section 6.5 bound is [bound].
+int _depthForBound(int bound) => switch (bound) {
+  16 => 3,
+  8 => 4,
+  4 => 5,
+  0 => 8,
+  _ => throw ArgumentError('no SH bit depth gives a bound of $bound'),
+};
+
 Uint8List _minimal({
   String temporalModel = 'gaussian-birth',
   String profile = '',
@@ -1895,6 +2029,7 @@ Uint8List _minimal({
   int gaussianCount = 0,
   bool writeWindowTable = true,
   List<int> shBitDepths = const <int>[],
+  String? shBand1Bound,
 }) {
   final BytesBuilder out =
       BytesBuilder()
@@ -1915,7 +2050,11 @@ Uint8List _minimal({
   out.add(
     _record(
       opQuantization,
-      _quantizationContent(scheme: scheme, shBitDepths: shBitDepths),
+      _quantizationContent(
+        scheme: scheme,
+        shBitDepths: shBitDepths,
+        shBand1Bound: shBand1Bound,
+      ),
     ),
   );
   if (writeWindowTable) {
@@ -3016,6 +3155,7 @@ Uint8List _headerContent({
 Uint8List _quantizationContent({
   String scheme = 'uniform-v1',
   List<int> shBitDepths = const <int>[],
+  String? shBand1Bound,
 }) {
   final BytesBuilder body = BytesBuilder()..add(_string(scheme));
   for (int i = 0; i < 3; i++) {
@@ -3024,9 +3164,17 @@ Uint8List _quantizationContent({
   for (int i = 0; i < 8; i++) {
     body.add(_f64(1.0)); // step_pos .. step_sigma_log
   }
+  body.addByte(1); // step_sh
+  final BytesBuilder bounds = BytesBuilder();
+  if (shBand1Bound != null) {
+    bounds
+      ..add(_string('sh_band1'))
+      ..add(_string(shBand1Bound));
+  }
+  final Uint8List boundsBytes = bounds.toBytes();
   body
-    ..addByte(1) // step_sh
-    ..add(_u32(0)); // empty bounds map
+    ..add(_u32(boundsBytes.length))
+    ..add(boundsBytes);
   if (shBitDepths.isNotEmpty) {
     body
       ..addByte(shBitDepths.length)

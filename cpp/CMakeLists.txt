@@ -86,6 +86,223 @@ option(FOURDGS_ALLOW_NO_CORE
        "Configure without a decoder rather than failing when the core cannot be found"
        ${FOURDGS_ALLOW_NO_CORE_DEFAULT})
 
+# A fetched checkout contains the Rust crate but not its build artifact. In that shape the
+# least surprising package is one that asks Cargo to produce the core as part of the CMake
+# build: the consumer stated the toolchain requirement by choosing the source distribution,
+# and should not have to discover and reproduce this repository's cargo command themselves.
+#
+# Keep the repository's top-level default unchanged. Its explicit no-core build is a tested
+# development configuration, and its ordinary with-core build already runs Cargo first. An
+# out-of-tree CPM/FetchContent/add_subdirectory consumer gets source-building by default; an
+# explicitly supplied archive always wins, and an intentional no-core consumer can disable
+# this option while enabling FOURDGS_ALLOW_NO_CORE.
+if(FOURDGS_IN_REPOSITORY AND NOT FOURDGS_IS_TOP_LEVEL AND NOT FOURDGS_ALLOW_NO_CORE)
+  set(FOURDGS_BUILD_CORE_FROM_SOURCE_DEFAULT ON)
+else()
+  set(FOURDGS_BUILD_CORE_FROM_SOURCE_DEFAULT OFF)
+endif()
+option(FOURDGS_BUILD_CORE_FROM_SOURCE
+       "Build the Rust core with Cargo when no prebuilt FOURDGS_CORE_LIBRARY is supplied"
+       ${FOURDGS_BUILD_CORE_FROM_SOURCE_DEFAULT})
+
+# Building the core is a positive request; allowing no core is only permission to fall back
+# to the stub when no backend was requested or found. This distinction matters at the top
+# level, where ALLOW_NO_CORE defaults on: the natural explicit opt-in needs to be the one
+# switch `-DFOURDGS_BUILD_CORE_FROM_SOURCE=ON`, not that switch plus knowledge of a default
+# it must undo. If both are on, source-building therefore takes precedence and any Cargo
+# configuration/build failure remains fatal rather than silently selecting the stub.
+
+# Define the core build before resolving the backend so the generated archive is a normal
+# build dependency even though it does not exist at configure time. The output is isolated
+# under this CMake build tree: two consumers at different revisions cannot share or overwrite
+# a repository-level target/ directory.
+set(FOURDGS_BUILD_CORE_FROM_SOURCE_ACTIVE OFF)
+if(FOURDGS_BUILD_CORE_FROM_SOURCE AND FOURDGS_CORE_LIBRARY STREQUAL "")
+  if(NOT FOURDGS_IN_REPOSITORY)
+    message(
+      FATAL_ERROR
+        "FOURDGS_BUILD_CORE_FROM_SOURCE requires the repository checkout containing "
+        "rust/fourdgs/Cargo.toml; either fetch avala-ai/4dgs rather than cpp/ alone, or set "
+        "FOURDGS_CORE_HEADER_DIR and FOURDGS_CORE_LIBRARY to a prebuilt core")
+  endif()
+
+  find_program(FOURDGS_CARGO_EXECUTABLE cargo REQUIRED)
+  set(FOURDGS_CARGO_TARGET
+      ""
+      CACHE STRING "Rust target triple used when CMake builds the core from source")
+
+  # Cargo and CMake select targets independently. Read the Cargo host even when CMake has
+  # an explicit selector: besides supplying the native default below, its pointer width is
+  # how a plain compiler mode such as `-m32` is distinguished from the native ABI.
+  execute_process(
+    COMMAND "${FOURDGS_CARGO_EXECUTABLE}" -vV
+    OUTPUT_VARIABLE FOURDGS_CARGO_VERSION
+    RESULT_VARIABLE FOURDGS_CARGO_VERSION_RESULT
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+  if(NOT FOURDGS_CARGO_VERSION_RESULT EQUAL 0
+     OR NOT FOURDGS_CARGO_VERSION MATCHES "(^|\n)host: ([^\n]+)")
+    message(
+      FATAL_ERROR
+        "Could not determine Cargo's host target from `cargo -vV`; set "
+        "-DFOURDGS_CARGO_TARGET=<Rust target triple> explicitly.")
+  endif()
+  set(FOURDGS_CARGO_HOST_TARGET "${CMAKE_MATCH_2}")
+  set(FOURDGS_CARGO_HOST_POINTER_SIZE "")
+  if(FOURDGS_CARGO_HOST_TARGET MATCHES
+     "^(x86_64|aarch64[^-]*|loongarch64|mips64[^-]*|powerpc64[^-]*|riscv64[^-]*|s390x|sparc64)-")
+    set(FOURDGS_CARGO_HOST_POINTER_SIZE 8)
+  elseif(FOURDGS_CARGO_HOST_TARGET MATCHES
+         "^(i[3-6]86|arm[^-]*|mips[^-]*|powerpc|riscv32[^-]*|thumb[^-]*|wasm32)-")
+    set(FOURDGS_CARGO_HOST_POINTER_SIZE 4)
+  endif()
+
+  # CMAKE_CROSSCOMPILING catches a different target system, but not every different
+  # target architecture. Visual Studio's -A and CMAKE_OSX_ARCHITECTURES can select an
+  # architecture on the host OS while leaving CMAKE_CROSSCOMPILING false. Cargo would
+  # then build its host triple and hand the linker an incompatible archive. Require the
+  # consumer to join those two independently-selected toolchains explicitly.
+  set(FOURDGS_CARGO_TARGET_REQUIRED_REASON "")
+  if(CMAKE_CROSSCOMPILING)
+    set(FOURDGS_CARGO_TARGET_REQUIRED_REASON
+        "CMake is cross-compiling to ${CMAKE_SYSTEM_NAME}/${CMAKE_SYSTEM_PROCESSOR}")
+  elseif(NOT "${CMAKE_CXX_COMPILER_TARGET}" STREQUAL "")
+    set(FOURDGS_CARGO_TARGET_REQUIRED_REASON
+        "CMAKE_CXX_COMPILER_TARGET selects ${CMAKE_CXX_COMPILER_TARGET}")
+  elseif(MSVC AND NOT "${CMAKE_GENERATOR_PLATFORM}" STREQUAL "")
+    set(FOURDGS_CARGO_TARGET_REQUIRED_REASON
+        "the Visual Studio generator selects architecture ${CMAKE_GENERATOR_PLATFORM}")
+  elseif(APPLE AND NOT "${CMAKE_OSX_ARCHITECTURES}" STREQUAL "")
+    set(FOURDGS_OSX_ARCHITECTURES ${CMAKE_OSX_ARCHITECTURES})
+    list(LENGTH FOURDGS_OSX_ARCHITECTURES FOURDGS_OSX_ARCHITECTURE_COUNT)
+    if(FOURDGS_OSX_ARCHITECTURE_COUNT GREATER 1)
+      message(
+        FATAL_ERROR
+          "FOURDGS_BUILD_CORE_FROM_SOURCE cannot produce one universal Rust archive for "
+          "CMAKE_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES}. Build one core per architecture "
+          "and combine them before configuring, then pass the result as FOURDGS_CORE_LIBRARY.")
+    endif()
+    set(FOURDGS_CARGO_TARGET_REQUIRED_REASON
+        "CMAKE_OSX_ARCHITECTURES selects ${CMAKE_OSX_ARCHITECTURES}")
+  elseif(NOT FOURDGS_CARGO_HOST_POINTER_SIZE STREQUAL ""
+         AND NOT CMAKE_SIZEOF_VOID_P EQUAL FOURDGS_CARGO_HOST_POINTER_SIZE)
+    string(
+      CONCAT FOURDGS_CARGO_TARGET_REQUIRED_REASON
+             "CMake's compiler mode produces a ${CMAKE_SIZEOF_VOID_P}-byte pointer ABI while "
+             "Cargo's ${FOURDGS_CARGO_HOST_TARGET} host target uses "
+             "${FOURDGS_CARGO_HOST_POINTER_SIZE}-byte pointers")
+  endif()
+
+  if(FOURDGS_CARGO_TARGET STREQUAL "")
+    if(NOT FOURDGS_CARGO_TARGET_REQUIRED_REASON STREQUAL "")
+      message(
+        FATAL_ERROR
+          "${FOURDGS_CARGO_TARGET_REQUIRED_REASON}, so Cargo's host target cannot safely be "
+          "used. Set -DFOURDGS_CARGO_TARGET=<Rust target triple> to the target matching the "
+          "CMake architecture (for example aarch64-unknown-linux-gnu or "
+          "aarch64-apple-darwin).")
+    endif()
+    set(FOURDGS_CARGO_TARGET "${FOURDGS_CARGO_HOST_TARGET}")
+  endif()
+
+  # The archive spelling is a property of Cargo's target ABI, not CMake's compiler.
+  # In particular, a MinGW C++ compiler can run beside the common MSVC Rust host: choosing
+  # `libfourdgs.a` from `MSVC=FALSE` while Cargo actually writes `fourdgs.lib` turns a clear
+  # toolchain mismatch into a missing custom-command output. Name the artifact from the Rust
+  # triple and reject incompatible Windows ABI pairs before starting the build.
+  set(FOURDGS_CARGO_WINDOWS_ABI "")
+  if(FOURDGS_CARGO_TARGET MATCHES "-windows-msvc$")
+    set(FOURDGS_CARGO_WINDOWS_ABI "MSVC")
+  elseif(FOURDGS_CARGO_TARGET MATCHES "-windows-(gnu|gnullvm)$")
+    set(FOURDGS_CARGO_WINDOWS_ABI "GNU")
+  endif()
+  if(MSVC AND NOT "${FOURDGS_CARGO_WINDOWS_ABI}" STREQUAL "MSVC")
+    message(
+      FATAL_ERROR
+        "The MSVC C++ ABI cannot link the Rust target ${FOURDGS_CARGO_TARGET}. Set "
+        "-DFOURDGS_CARGO_TARGET=<architecture>-pc-windows-msvc, or supply a prebuilt "
+        "FOURDGS_CORE_LIBRARY compiled for this C++ toolchain.")
+  elseif(WIN32 AND NOT MSVC AND NOT "${FOURDGS_CARGO_WINDOWS_ABI}" STREQUAL "GNU")
+    message(
+      FATAL_ERROR
+        "The GNU Windows C++ ABI cannot link the Rust target ${FOURDGS_CARGO_TARGET}. Set "
+        "-DFOURDGS_CARGO_TARGET=<architecture>-pc-windows-gnu (or a compatible "
+        "windows-gnullvm target), or supply a prebuilt FOURDGS_CORE_LIBRARY compiled for "
+        "this C++ toolchain.")
+  endif()
+
+  set(FOURDGS_CORE_SOURCE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
+  # Cargo always places its lockfile beside the manifest, independently of
+  # CARGO_TARGET_DIR. A fetched dependency can be read-only and this repository
+  # intentionally does not commit a library lockfile, so invoking its workspace manifest
+  # would try to mutate the source checkout. Mirror the crate manifest and source into the
+  # CMake build tree instead. The manifest remains the crate's own single declaration of
+  # metadata and dependencies; configure_file also makes CMake regenerate the copy when it
+  # changes.
+  set(FOURDGS_CORE_CARGO_SOURCE_DIR "${CMAKE_CURRENT_BINARY_DIR}/rust-core-source")
+  file(MAKE_DIRECTORY "${FOURDGS_CORE_CARGO_SOURCE_DIR}")
+  # The staged manifest declares itself its own workspace root.
+  #
+  # Cargo resolves a workspace by walking up from the manifest it was given, so a copy that
+  # lands anywhere under this repository finds the root `Cargo.toml` — whose `[workspace]`
+  # lists three crate paths and not this one — and refuses with "current package believes
+  # it's in a workspace when it's not". That is every in-repo build directory: `cpp/build`
+  # and `cpp/build-nocore`, which CI configures, and `cpp/build`, which cpp/README.md tells
+  # a reader to use. An out-of-tree consumer never saw it, because a build tree outside the
+  # repository walks up past nothing. One crate built alone into an isolated target
+  # directory is not a workspace member, so an empty `[workspace]` table is the accurate
+  # thing to append as well as the fix.
+  set_property(
+    DIRECTORY
+    APPEND
+    PROPERTY CMAKE_CONFIGURE_DEPENDS "${FOURDGS_CORE_SOURCE_ROOT}/rust/fourdgs/Cargo.toml")
+  file(READ "${FOURDGS_CORE_SOURCE_ROOT}/rust/fourdgs/Cargo.toml"
+       FOURDGS_CORE_CARGO_MANIFEST)
+  # Staged and then copied rather than written straight to its destination, so a manifest
+  # that has not changed keeps its timestamp and reconfiguring does not rebuild the core.
+  file(
+    WRITE "${CMAKE_CURRENT_BINARY_DIR}/rust-core-manifest.toml"
+    "${FOURDGS_CORE_CARGO_MANIFEST}\n"
+    "# Appended by cpp/CMakeLists.txt. This copy is built alone, so it is its own\n"
+    "# workspace root rather than a member of the one above it in the source tree.\n"
+    "[workspace]\n")
+  configure_file("${CMAKE_CURRENT_BINARY_DIR}/rust-core-manifest.toml"
+                 "${FOURDGS_CORE_CARGO_SOURCE_DIR}/Cargo.toml" COPYONLY)
+  set(FOURDGS_CORE_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/rust-core")
+  if(FOURDGS_CARGO_WINDOWS_ABI STREQUAL "MSVC")
+    set(FOURDGS_GENERATED_CORE_LIBRARY
+        "${FOURDGS_CORE_TARGET_DIR}/${FOURDGS_CARGO_TARGET}/release/fourdgs.lib")
+  else()
+    set(FOURDGS_GENERATED_CORE_LIBRARY
+        "${FOURDGS_CORE_TARGET_DIR}/${FOURDGS_CARGO_TARGET}/release/libfourdgs.a")
+  endif()
+
+  file(GLOB_RECURSE FOURDGS_CORE_RUST_SOURCES CONFIGURE_DEPENDS
+       "${FOURDGS_CORE_SOURCE_ROOT}/rust/fourdgs/src/*.rs")
+  add_custom_command(
+    OUTPUT "${FOURDGS_GENERATED_CORE_LIBRARY}"
+    COMMAND
+      # Make/NMake jobserver descriptors are not portable through a custom-command shell;
+      # clearing their hint lets Cargo manage its own parallelism instead of warning that
+      # CMake advertised file descriptors it could not inherit. Ninja does not set it.
+      "${CMAKE_COMMAND}" -E copy_directory
+      "${FOURDGS_CORE_SOURCE_ROOT}/rust/fourdgs/src" "${FOURDGS_CORE_CARGO_SOURCE_DIR}/src"
+    COMMAND
+      "${CMAKE_COMMAND}" -E env "CARGO_TARGET_DIR=${FOURDGS_CORE_TARGET_DIR}" "MAKEFLAGS="
+      "${FOURDGS_CARGO_EXECUTABLE}" rustc --manifest-path
+      "${FOURDGS_CORE_CARGO_SOURCE_DIR}/Cargo.toml" --package fourdgs --release --target
+      "${FOURDGS_CARGO_TARGET}" --lib --crate-type staticlib
+    DEPENDS
+      "${FOURDGS_CORE_SOURCE_ROOT}/rust/fourdgs/Cargo.toml"
+      ${FOURDGS_CORE_RUST_SOURCES}
+    WORKING_DIRECTORY "${FOURDGS_CORE_SOURCE_ROOT}"
+    COMMENT "Building the 4dgs Rust core"
+    VERBATIM
+    USES_TERMINAL)
+  add_custom_target(fourdgs-core-build DEPENDS "${FOURDGS_GENERATED_CORE_LIBRARY}")
+  set(FOURDGS_CORE_LIBRARY "${FOURDGS_GENERATED_CORE_LIBRARY}")
+  set(FOURDGS_BUILD_CORE_FROM_SOURCE_ACTIVE ON)
+endif()
+
 # The seam, resolved: with a core the binding calls the ABI, without one it refuses every
 # call with kNotImplemented. Both configurations build, and both are honest — the package
 # never links against a decoder it does not have.
@@ -158,9 +375,13 @@ else()
     endif()
   endif()
 
-  if(NOT FOURDGS_CORE_LIBRARY STREQUAL "")
+  if(FOURDGS_BUILD_CORE_FROM_SOURCE_ACTIVE OR EXISTS "${FOURDGS_CORE_LIBRARY}")
     set(FOURDGS_HAVE_CORE ON)
     set(FOURDGS_BACKEND_SOURCE src/backend_capi.cpp)
+  elseif(NOT FOURDGS_CORE_LIBRARY STREQUAL "")
+    message(
+      FATAL_ERROR
+        "fourdgs: FOURDGS_CORE_LIBRARY names ${FOURDGS_CORE_LIBRARY}, but that file does not exist")
   elseif(NOT FOURDGS_ALLOW_NO_CORE)
     # The header is committed and the library is not, so this is the message a consumer
     # who fetched this package sees: everything the fetch brought is here except the one
@@ -202,6 +423,19 @@ target_include_directories(
   fourdgs-cpp
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# A consumer compiles these public headers too. Setting CMAKE_CXX_STANDARD above controls
+# this directory's targets, but it does not tell a FetchContent or installed-package
+# consumer which language level the headers require.
+target_compile_features(fourdgs-cpp PUBLIC cxx_std_17)
+
+# Cargo's MSVC staticlib is built with the dynamic release CRT even in a CMake Debug
+# configuration. Compile this binding and Debug consumers with the same /MD runtime: the
+# public C++ API crosses std::string and vector ownership boundaries, so merely suppressing
+# LNK2038 would still leave an allocator mismatch. Release already defaults to /MD.
+if(MSVC AND FOURDGS_HAVE_CORE)
+  set_property(TARGET fourdgs-cpp PROPERTY MSVC_RUNTIME_LIBRARY MultiThreadedDLL)
+  target_compile_options(fourdgs-cpp PUBLIC "$<$<CONFIG:Debug>:/MD>")
+endif()
 
 if(MSVC)
   target_compile_options(fourdgs-cpp PRIVATE /W4)
@@ -212,7 +446,13 @@ endif()
 if(FOURDGS_HAVE_CORE)
   target_include_directories(fourdgs-cpp PRIVATE ${FOURDGS_CORE_HEADER_DIR})
   message(STATUS "fourdgs: linking the core from ${FOURDGS_CORE_LIBRARY}")
-  target_link_libraries(fourdgs-cpp PUBLIC "${FOURDGS_CORE_LIBRARY}")
+  # The build links the selected archive directly. The install copies that archive into the
+  # package and its config adds the relocatable installed path; keeping this path inside a
+  # BUILD_INTERFACE prevents an exported target from remembering a temporary build tree.
+  target_link_libraries(fourdgs-cpp PUBLIC "$<BUILD_INTERFACE:${FOURDGS_CORE_LIBRARY}>")
+  if(TARGET fourdgs-core-build)
+    add_dependencies(fourdgs-cpp fourdgs-core-build)
+  endif()
   # A Rust staticlib brings its own runtime requirements; these are what it needs on the
   # platforms this package is built for. The archive does not record them, so a consumer
   # that omits them gets a page of unresolved symbols with no hint of where they came
@@ -222,10 +462,21 @@ if(FOURDGS_HAVE_CORE)
   # macOS needs nothing named: its equivalents are all in libSystem, which is linked
   # already, and asking for them by name is an error rather than a no-op.
   if(WIN32)
-    target_link_libraries(fourdgs-cpp PUBLIC ws2_32 userenv ntdll bcrypt advapi32 kernel32)
+    set(FOURDGS_CORE_NATIVE_LIBRARIES ws2_32 userenv ntdll bcrypt advapi32 kernel32)
   elseif(UNIX AND NOT APPLE)
-    target_link_libraries(fourdgs-cpp PUBLIC pthread dl m)
+    set(FOURDGS_CORE_NATIVE_LIBRARIES pthread dl m)
+  else()
+    set(FOURDGS_CORE_NATIVE_LIBRARIES "")
   endif()
+  # Installed consumers get these from the imported core target in the package config.
+  # Keeping them in BUILD_INTERFACE avoids exporting them before that archive: static
+  # linkers resolve left-to-right, so the archive must precede the native libraries whose
+  # symbols its objects introduce.
+  foreach(native_library IN LISTS FOURDGS_CORE_NATIVE_LIBRARIES)
+    target_link_libraries(fourdgs-cpp PUBLIC "$<BUILD_INTERFACE:${native_library}>")
+  endforeach()
+else()
+  set(FOURDGS_CORE_NATIVE_LIBRARIES "")
 endif()
 
 if(FOURDGS_ASAN)
@@ -337,10 +588,27 @@ if(FOURDGS_BUILD_TESTS)
   endif()
 endif()
 
+# GNUInstallDirs converts an untyped command-line cache value with file(TO_CMAKE_PATH),
+# whose input is a path *list*. On POSIX that would split a legal colon in an absolute
+# libdir into a CMake semicolon list before this package ever sees it. Mark the supplied
+# scalar as a PATH without rewriting its bytes; the Windows-only normalization below
+# handles native backslashes after the module has defined the defaulted case.
+if(DEFINED CMAKE_INSTALL_LIBDIR)
+  get_property(FOURDGS_INSTALL_LIBDIR_CACHE_TYPE CACHE CMAKE_INSTALL_LIBDIR PROPERTY TYPE)
+  if(FOURDGS_INSTALL_LIBDIR_CACHE_TYPE STREQUAL "UNINITIALIZED")
+    set_property(CACHE CMAKE_INSTALL_LIBDIR PROPERTY TYPE PATH)
+  endif()
+endif()
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
 set(FOURDGS_INSTALL_CMAKEDIR ${CMAKE_INSTALL_LIBDIR}/cmake/fourdgs-cpp)
+set(FOURDGS_INSTALL_COREDIR ${CMAKE_INSTALL_LIBDIR}/fourdgs-cpp/core)
+# CMake's generated install script normalizes backslashes to path separators even on
+# POSIX. Apply that same scalar conversion before PATH_VARS embeds this directory in CMake
+# source: the installed archive and its config then name the same effective destination,
+# and a legal POSIX colon stays intact (file(TO_CMAKE_PATH) would split it as a path list).
+string(REPLACE "\\" "/" FOURDGS_INSTALL_COREDIR "${FOURDGS_INSTALL_COREDIR}")
 
 if(FOURDGS_BUILD_TOOL)
   install(TARGETS fourdgs-cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
@@ -351,6 +619,21 @@ install(
   EXPORT fourdgs-cpp-targets
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(DIRECTORY include/fourdgs DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+if(FOURDGS_HAVE_CORE)
+  set(FOURDGS_CORE_LIBRARY_TO_INSTALL "${FOURDGS_CORE_LIBRARY}")
+  # install(FILES) preserves a symbolic link but does not copy its target, which would make
+  # a relative prebuilt-core link dangle in the supposedly self-contained package. Generated
+  # source-build archives do not exist yet at configure time and are already real files; an
+  # existing prebuilt archive can safely be dereferenced now.
+  if(EXISTS "${FOURDGS_CORE_LIBRARY_TO_INSTALL}")
+    get_filename_component(FOURDGS_CORE_LIBRARY_TO_INSTALL
+                           "${FOURDGS_CORE_LIBRARY_TO_INSTALL}" REALPATH)
+  endif()
+  get_filename_component(FOURDGS_CORE_LIBRARY_FILENAME "${FOURDGS_CORE_LIBRARY_TO_INSTALL}" NAME)
+  install(FILES "${FOURDGS_CORE_LIBRARY_TO_INSTALL}" DESTINATION ${FOURDGS_INSTALL_COREDIR})
+else()
+  set(FOURDGS_CORE_LIBRARY_FILENAME "")
+endif()
 install(
   EXPORT fourdgs-cpp-targets
   FILE fourdgs-cpp-targets.cmake
@@ -362,7 +645,8 @@ install(
 # rules that produce something no consumer can find.
 configure_package_config_file(
   cmake/fourdgs-cpp-config.cmake.in "${CMAKE_CURRENT_BINARY_DIR}/fourdgs-cpp-config.cmake"
-  INSTALL_DESTINATION ${FOURDGS_INSTALL_CMAKEDIR})
+  INSTALL_DESTINATION ${FOURDGS_INSTALL_CMAKEDIR}
+  PATH_VARS FOURDGS_INSTALL_COREDIR)
 
 # SameMinorVersion, because the major version is 0: while it is, SemVer puts the
 # compatibility promise on the minor, so a consumer asking for 0.1.0 must not be handed

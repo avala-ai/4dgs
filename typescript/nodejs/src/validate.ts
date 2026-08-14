@@ -1613,13 +1613,13 @@ function checkShBitDepths(quant: Quantization, shDegree: number, found: Findings
   const declared = quant.shBitDepths.slice(0, shDegree);
   declared.forEach((bits, i) => {
     const key = `sh_band${i + 1}`;
-    const expected = String(shBound(bits));
+    const expected = shBound(bits);
     const value = quant.bounds.get(key);
     if (value === undefined) {
       found.warn(
         `Quantization declares ${bits} bits for SH band ${i + 1} but no \`${key}\` bound (§5.3)`,
       );
-    } else if (value !== expected) {
+    } else if (!decimalEqualsInteger(value, expected)) {
       found.warn(
         `Quantization declares \`${key}\` as ${value}; ${bits} bits gives a bound of ` +
           `${expected} (§6.5)`,
@@ -1633,6 +1633,51 @@ function checkShBitDepths(quant: Quantization, shDegree: number, found: Findings
         `${coarsest}, which is what a consumer that reads only step_sh has to be given (§6.5)`,
     );
   }
+}
+
+/**
+ * The whole of the spelling §5.3 allows a `bounds` value: an optional sign, ASCII digits
+ * with an optional point, and an optional exponent. Nothing surrounds it.
+ *
+ * Anchored with no `\s` at either end, and spelled `[0-9]` rather than `\d`, because both
+ * shorthands drag in a language the format does not have: JavaScript's `\s` matches U+FEFF, so
+ * a byte-order mark in front of a bound read as padding, while `\d` means ASCII only until
+ * someone adds `/u` and it stops meaning that. The grammar should not turn on a flag.
+ */
+const BOUND = /^([+-]?)(?:([0-9]+)(?:\.([0-9]*))?|\.([0-9]+))(?:[eE]([+-]?[0-9]+))?$/;
+
+/**
+ * Whether the §5.3 bound `value` spells exactly the small non-negative integer `expected`.
+ *
+ * Matched against the grammar rather than handed to a runtime's number parser, so this agrees
+ * with the Python, Rust and Dart validators on every input rather than on the ones their
+ * runtimes happen to read alike. Digits are compared as digits: no exponent is too large to
+ * read, and no value passes through binary64.
+ */
+function decimalEqualsInteger(value: string, expected: number): boolean {
+  const match = BOUND.exec(value);
+  if (match === null) return false;
+
+  const integer = match[2] ?? "";
+  let digits = integer + (match[3] ?? match[4] ?? "");
+  const firstNonzero = digits.search(/[1-9]/);
+  // A significand of zeroes is the value zero, at whatever exponent it carries.
+  if (firstNonzero < 0) return expected === 0;
+  if (match[1] === "-") return false;
+
+  digits = digits.slice(firstNonzero).replace(/0+$/, "");
+  const expectedDigits = String(expected);
+  const requiredExponent = expectedDigits.length - integer.length + firstNonzero;
+  return digits === expectedDigits && decimalIntegerEquals(match[5] ?? "0", requiredExponent);
+}
+
+/** Whether the signed digit string `value` is `expected`, without building the number. */
+function decimalIntegerEquals(value: string, expected: number): boolean {
+  const negative = value.startsWith("-");
+  const digits = value.replace(/^[+-]?0*/, "");
+  if (digits === "") return expected === 0;
+  if (negative !== expected < 0) return false;
+  return digits === String(Math.abs(expected));
 }
 
 /**
@@ -1840,7 +1885,9 @@ async function boundedStringAt(
   const bytes = await fixedRecordBytes(source, at, length, end, field);
   let value: string;
   try {
-    value = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    // `ignoreBOM: true` for the reason `Cursor` gives: a length-prefixed string's leading
+    // U+FEFF is a character, not a preamble, and the default would drop it.
+    value = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
   } catch {
     throw new MalformedFile(`${field} at byte ${at} is not valid UTF-8`);
   }
@@ -1896,7 +1943,7 @@ async function validateStringAt(source: IReadable, at: number, end: number): Pro
   if (at + length > end) {
     throw new Error(`string at byte ${at} declares ${length} bytes, only ${end - at} remain`);
   }
-  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
   try {
     for (let readAt = at; readAt < at + length; readAt += VALIDATION_PROBE_BYTES) {
       decoder.decode(

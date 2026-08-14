@@ -575,13 +575,7 @@ fn validate_delta<R: Readable + ?Sized>(
             "delta index entry {ordinal} disagrees with its Delta Chunk header on its interval, mode, reference, keyframe, depth, or group count"
         )));
     }
-    if entry.live_count != state.count() as u64 {
-        return Err(Error::Malformed(format!(
-            "delta index entry {ordinal} declares {} live gaussians; composition reconstructs {}",
-            entry.live_count,
-            state.count()
-        )));
-    }
+    crate::keyframe_delta_file::check_composed_population(entry, &state)?;
     Ok((state, head, births))
 }
 
@@ -876,16 +870,8 @@ where
                     at,
                 ));
             }
-            if entry.live_count != state.count() as u64 {
-                return Err(ValidationFailure::at(
-                    Error::Malformed(format!(
-                        "keyframe index entry {ordinal} declares {} live gaussians; its Chunk reconstructs {}",
-                        entry.live_count,
-                        state.count()
-                    )),
-                    at,
-                ));
-            }
+            crate::keyframe_delta_file::check_composed_population(entry, &state)
+                .map_err(|error| ValidationFailure::at(error, at))?;
             let ids = introductions(current.as_ref().map(|(_, _, _, state)| state), &state);
             emit_introductions(&ids, at, introduce)?;
             birth_bands.clear();
@@ -1078,6 +1064,9 @@ where
                                 )));
                             }
                         }
+                        crate::keyframe_delta_file::check_streamed_population(
+                            at, head.t0, head.t1, &state,
+                        )?;
                         let ids = introductions(
                             current.as_ref().map(|(_, _, _, state)| state),
                             &state,
@@ -1173,6 +1162,9 @@ where
                     compose_delta_chunk(reference, &content, &windows).and_then(
                         |(state, head, births)| {
                             check_population(at, "composed state", state.count())?;
+                            crate::keyframe_delta_file::check_streamed_population(
+                                at, head.t0, head.t1, &state,
+                            )?;
                             check_repeated_birth_invariants(
                                 current.as_ref().map(|(_, _, _, state)| state),
                                 &state,

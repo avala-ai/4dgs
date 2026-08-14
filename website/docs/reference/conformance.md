@@ -500,20 +500,33 @@ the code, which is the one thing a normative shape may not do.
 compares the parsed values:
 
 ```python
-if json.loads(actual) == json.loads(expected):
+if actual_comparable == expected_comparable:
 ```
 
 That equality in [`run.py`](https://github.com/avala-ai/4dgs/blob/main/tests/conformance/run.py) is
 the whole comparison: recursive value equality over two parsed documents, with no tolerance and no
-text matching. The unified diff printed on a failure is generated afterwards, from the text, purely
+text matching. The two operands come from
+[`json_compare.py`](https://github.com/avala-ai/4dgs/blob/main/tests/conformance/json_compare.py),
+which parses number tokens without narrowing them through binary64 and applies exactly two
+adjustments to what Python's `==` would otherwise say: it keeps the sign of a zero visible (see
+below), and it drops the fields a runner's declared capabilities put under transition. The
+difference list printed on a failure is generated afterwards from those same two documents, purely
 so that a human can read the disagreement; it decides nothing.
 
 Several rules follow from that one line, and they are what an implementer actually needs.
 
 **Spelling is free.** Python writes `50.0` where JavaScript writes `50`; `1e-06` and `0.000001` are
-the same number; `-0.0` and `0` compare equal. None of it needs normalizing in a runner. Key order
-and indentation are free for the same reason — the expectations are pretty-printed with sorted keys
-because a human reads the diff, not because the comparison cares.
+the same number. None of it needs normalizing in a runner. Key order and indentation are free for
+the same reason — the expectations are pretty-printed with sorted keys because a human reads the
+diff, not because the comparison cares.
+
+**The sign of a zero is the one exception.** `-0.0` and `0` parse equal in every language the
+harness compares in, and the harness scores them **unequal** anyway. The canonical form says a zero
+is `0.0` and never `-0.0`: the sign records which side of zero the arithmetic landed on, so keeping
+it would put a platform's floating-point behaviour into a committed expectation. A runner has to
+erase it wherever it renders a rounded float — one line at the emitter, not a rule to apply field by
+field. This is enforced rather than assumed because the assumption failed: three of the six SDKs
+were emitting `-0.000000` on the committed object corpus, and every check was green.
 
 **Type is not spelling.** `"50"` and `50` are not equal, and this is the rule that catches people.
 The summary emits potentially 64-bit counts, lengths and offsets **as strings** — for example

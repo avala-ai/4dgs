@@ -664,6 +664,276 @@ fn the_corpus_is_present_in_ci() {
 // ---------------------------------------------------------------------------------------
 // Files no encoder writes.
 
+/// Where a file's summary region begins and ends.
+///
+/// Both read out of the file: the Footer names `summary_start`, and the Footer record is
+/// the last one before the trailing magic.
+fn summary_bounds(data: &[u8]) -> (usize, usize) {
+    let footer_at = data.len() - (9 + 20 + 8);
+    assert_eq!(data[footer_at], 0x02, "the last record is the Footer");
+    let footer = fourdgs::records::Footer::parse(&data[footer_at + 9..]).unwrap();
+    (footer.summary_start as usize, footer_at)
+}
+
+/// A file made of this front matter and this summary, with a Footer that describes them.
+///
+/// An empty summary produces a file with no index at all — `summary_start` zero, no
+/// checksum — which is the legal stream-only shape and not something the encoder emits.
+fn rebuilt(front: &[u8], summary: &[u8]) -> Vec<u8> {
+    let mut out = front.to_vec();
+    out.extend_from_slice(summary);
+    out.extend_from_slice(
+        &fourdgs::records::Footer {
+            summary_start: if summary.is_empty() {
+                0
+            } else {
+                front.len() as u64
+            },
+            summary_offset_start: 0,
+            summary_crc: if summary.is_empty() {
+                0
+            } else {
+                fourdgs::serialization::crc32(summary)
+            },
+        }
+        .encode(),
+    );
+    out.extend_from_slice(&fourdgs::serialization::MAGIC);
+    out
+}
+
+/// The index entries of a file, and whatever else its summary region holds after them.
+///
+/// The remainder is returned verbatim rather than re-encoded — it is the Statistics record
+/// on every variant that has one — so a fixture changes the entries and nothing else.
+fn summary_parts(data: &[u8]) -> (Vec<fourdgs::records::ChunkIndexEntry>, Vec<u8>) {
+    let (start, end) = summary_bounds(data);
+    let mut entries = Vec::new();
+    let mut at = start;
+    for record in fourdgs::serialization::Records::new(&data[..end], start) {
+        let record = record.expect("the summary region parses");
+        if record.opcode != 0x08 {
+            break;
+        }
+        entries.push(fourdgs::records::ChunkIndexEntry::parse(record.content).expect("an entry"));
+        at = record.offset + 9 + record.content.len();
+    }
+    // Re-encoding has to be byte-stable, or every offset a fixture computes is wrong.
+    let re: Vec<u8> = entries.iter().flat_map(|e| e.encode()).collect();
+    assert_eq!(
+        re.as_slice(),
+        &data[start..at],
+        "an index entry does not round-trip; the fixtures below rely on it"
+    );
+    (entries, data[at..end].to_vec())
+}
+
+/// A writer-produced one-keyframe file rewritten into a hostile zero-duration timeline.
+///
+/// Every copy of the interval and duration is changed together, and the summary checksum
+/// is rebuilt, so its only fault is a populated state over `[0, 0)`.
+fn populated_zero_width_keyframe() -> Vec<u8> {
+    use fourdgs::keyframe_delta_file::{write_sequence, KeyframeDeltaOptions, Sample};
+
+    let sample = Sample {
+        t0: 0.0,
+        ids: vec![7],
+        gaussians: fourdgs::GaussianSet {
+            positions: vec![0.0; 3],
+            scales: vec![0.1; 3],
+            rotations: vec![0.0, 0.0, 0.0, 1.0],
+            colors: vec![0.5, 0.5, 0.5, 1.0],
+            motions: vec![0.0; 3],
+            mu_t: vec![0.0],
+            sigma_t: vec![1.0],
+            win_lo: vec![0.0],
+            win_hi: vec![1.0],
+            ..Default::default()
+        },
+    };
+    let mut data = write_sequence(&[sample], 1.0, &KeyframeDeltaOptions::default())
+        .expect("the populated seed file encodes");
+    let (summary_start, _) = summary_bounds(&data);
+
+    let mut header_duration = None;
+    let mut keyframe_t1 = None;
+    for record in fourdgs::serialization::Records::new(&data[..summary_start], fourdgs::MAGIC.len())
+    {
+        let record = record.expect("the writer produced framed records");
+        match record.opcode {
+            fourdgs::opcode::HEADER => {
+                let mut content = fourdgs::serialization::Cursor::new(record.content);
+                content.string().unwrap();
+                content.string().unwrap();
+                header_duration = Some(
+                    record.offset + fourdgs::serialization::RECORD_HEADER_SIZE + content.position(),
+                );
+            }
+            fourdgs::opcode::CHUNK => {
+                keyframe_t1 = Some(record.offset + fourdgs::serialization::RECORD_HEADER_SIZE + 8);
+            }
+            _ => {}
+        }
+    }
+    for at in [header_duration.unwrap(), keyframe_t1.unwrap()] {
+        data[at..at + 8].copy_from_slice(&0.0f64.to_le_bytes());
+    }
+
+    let (mut entries, rest) = summary_parts(&data);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].live_count, 1);
+    entries[0].t1 = 0.0;
+    let statistics_record = fourdgs::serialization::Records::new(&rest, 0)
+        .next()
+        .expect("the writer emits Statistics")
+        .expect("Statistics is framed");
+    assert_eq!(statistics_record.opcode, fourdgs::opcode::STATISTICS);
+    let mut statistics =
+        fourdgs::records::Statistics::parse(statistics_record.content).expect("Statistics parses");
+    statistics.duration_sec = 0.0;
+    let summary: Vec<u8> = entries
+        .iter()
+        .flat_map(|entry| entry.encode())
+        .chain(statistics.encode())
+        .collect();
+    rebuilt(&data[..summary_start], &summary)
+}
+
+fn populated_sequence(sample_times: &[f64], duration_sec: f64) -> Vec<u8> {
+    use fourdgs::keyframe_delta_file::{write_sequence, KeyframeDeltaOptions, Sample};
+
+    let samples: Vec<_> = sample_times
+        .iter()
+        .copied()
+        .map(|t0| Sample {
+            t0,
+            ids: vec![7],
+            gaussians: fourdgs::GaussianSet {
+                positions: vec![0.0; 3],
+                scales: vec![0.1; 3],
+                rotations: vec![0.0, 0.0, 0.0, 1.0],
+                colors: vec![0.5, 0.5, 0.5, 1.0],
+                motions: vec![0.0; 3],
+                mu_t: vec![t0 as f32],
+                sigma_t: vec![1.0],
+                win_lo: vec![0.0],
+                win_hi: vec![duration_sec as f32],
+                ..Default::default()
+            },
+        })
+        .collect();
+    write_sequence(&samples, duration_sec, &KeyframeDeltaOptions::default())
+        .expect("the populated seed sequence encodes")
+}
+
+fn rewrite_first_keyframe_t1(data: &mut [u8], t1: f64) {
+    let (summary_start, _) = summary_bounds(data);
+    let record = fourdgs::serialization::Records::new(&data[..summary_start], fourdgs::MAGIC.len())
+        .map(|record| record.expect("the writer produced framed records"))
+        .find(|record| record.opcode == fourdgs::opcode::CHUNK)
+        .expect("the sequence begins with a keyframe");
+    let at = record.offset + fourdgs::serialization::RECORD_HEADER_SIZE + 8;
+    data[at..at + 8].copy_from_slice(&t1.to_le_bytes());
+}
+
+#[test]
+fn a_populated_zero_width_keyframe_is_refused_by_both_read_modes_and_validate() {
+    let data = populated_zero_width_keyframe();
+    let error = fourdgs::keyframe_delta_file::decode_indexed(&data)
+        .expect_err("no instant can select the populated state");
+    assert!(
+        error.to_string().contains("zero-width interval [0, 0)"),
+        "{error}"
+    );
+
+    let error = fourdgs::keyframe_delta_file::decode_streamed(&data)
+        .expect_err("the front-to-back reader enforces the same half-open invariant");
+    assert!(
+        error.to_string().contains("zero-width interval [0, 0)"),
+        "{error}"
+    );
+
+    let path = fixture("fourdgs-cli-kd-populated-zero-width.4dgs", &data);
+    let out = run(&["validate", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("zero-width interval [0, 0)"), "{text}");
+    std::fs::remove_file(path).ok();
+
+    let (summary_start, _) = summary_bounds(&data);
+    let unindexed = rebuilt(&data[..summary_start], &[]);
+    let path = fixture(
+        "fourdgs-cli-kd-streamed-populated-zero-width.4dgs",
+        &unindexed,
+    );
+    let out = run(&["validate", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("zero-width interval [0, 0)"), "{text}");
+    std::fs::remove_file(path).ok();
+}
+
+#[test]
+fn indexed_decode_requires_live_count_to_match_the_composed_state() {
+    let data = populated_zero_width_keyframe();
+    let (summary_start, _) = summary_bounds(&data);
+    let (mut entries, rest) = summary_parts(&data);
+    entries[0].live_count = 0;
+    let summary: Vec<u8> = entries
+        .iter()
+        .flat_map(|entry| entry.encode())
+        .chain(rest)
+        .collect();
+    let data = rebuilt(&data[..summary_start], &summary);
+
+    let error = fourdgs::keyframe_delta_file::decode_indexed(&data)
+        .expect_err("the index population must agree with composition");
+    let text = error.to_string();
+    assert!(text.contains("declares live_count 0"), "{text}");
+    assert!(text.contains("yields 1 gaussians"), "{text}");
+}
+
+#[test]
+fn indexed_composition_requires_the_state_record_interval_to_match() {
+    let mut data = populated_sequence(&[0.0], 1.0);
+    rewrite_first_keyframe_t1(&mut data, 0.0);
+
+    let error = fourdgs::keyframe_delta_file::decode_indexed(&data)
+        .expect_err("the index cannot hide a populated zero-width state record");
+    let text = error.to_string();
+    assert!(text.contains("index entry"), "{text}");
+    assert!(text.contains("declares interval [0, 1)"), "{text}");
+    assert!(text.contains("state record declares [0, 0)"), "{text}");
+}
+
+#[test]
+fn a_direct_delta_seek_checks_every_composed_link() {
+    use fourdgs::keyframe_delta_file::{compose_chain, open_indexed};
+
+    let mut data = populated_sequence(&[0.0, 1.0], 2.0);
+    let mut source = fourdgs::BytesReadable::new(&data);
+    let mut sequence = open_indexed(&mut source).expect("the writer's index opens");
+    assert_eq!(sequence.index.len(), 2);
+    assert_eq!(sequence.index[1].kind, 1, "the selected state is a delta");
+
+    rewrite_first_keyframe_t1(&mut data, 0.0);
+    sequence.index[0].t1 = 0.0;
+    let selected = sequence.index[1].clone();
+    let mut source = fourdgs::BytesReadable::new(&data);
+    let error = compose_chain(
+        &mut source,
+        &sequence.index,
+        &selected,
+        &sequence.quantization,
+        &sequence.windows,
+    )
+    .expect_err("a direct seek must validate its populated zero-width reference");
+    let text = error.to_string();
+    assert!(text.contains("index entry"), "{text}");
+    assert!(text.contains("zero-width interval [0, 0)"), "{text}");
+}
+
+/// Write a fixture to the temporary directory and hand back its path.
 fn fixture(name: &str, data: &[u8]) -> PathBuf {
     let path = std::env::temp_dir().join(name);
     std::fs::write(&path, data).unwrap();

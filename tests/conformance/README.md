@@ -467,7 +467,14 @@ has to rediscover it from a checksum mismatch:
 - **A language may spell a number however it likes.** Python writes `50.0` where JavaScript writes
   `50`; `1e-06` and `0.000001` are the same number; `1.0E+2` and `100.0` are the same number. All of
   these compare equal, and none of them needs normalizing in a runner.
-- **`-0.0` and `0` compare equal**, so a runner need not chase the sign of a zero.
+- **The sign of a zero is not free.** `-0.0` and `0` are the one pair of tokens that parse equal and
+  compare **unequal** here. This is the single exception to the rule above, and it is deliberate:
+  the canonical form says a zero is `0.0` and never `-0.0`, because the sign records which side of
+  zero the arithmetic landed on — a property of the platform, not of the scene, and one that changes
+  the committed expectation for whoever regenerates the corpus next. A runner therefore **does**
+  have to erase it, once, wherever it renders a rounded float. Until this was enforced, three of the
+  six SDKs emitted `-0.000000` on the committed object corpus and passed, because `-0.0 == 0.0`
+  holds in every language the harness compares in.
 - **Type is not spelling.** `50` and `"50"` are _not_ equal — one is a number and one is a string.
   This matters because the summary deliberately emits 64-bit integers _as strings_ (so a parser
   backed by doubles cannot round them), and a runner that emits those as JSON numbers fails even
