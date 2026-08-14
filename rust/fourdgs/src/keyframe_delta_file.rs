@@ -1603,6 +1603,25 @@ pub fn check_composed_population(entry: &rec::ChunkIndexEntry, state: &State) ->
     Ok(())
 }
 
+/// Check that an index entry duplicates the interval in the state record it names.
+///
+/// Indexed composition must not substitute the summary's interval for the record's. Doing
+/// so would let the range path expose a populated zero-width record that the streamed path
+/// correctly refuses.
+fn check_indexed_record_interval(
+    entry: &rec::ChunkIndexEntry,
+    record_t0: f64,
+    record_t1: f64,
+) -> Result<()> {
+    if entry.t0 != record_t0 || entry.t1 != record_t1 {
+        return Err(Error::Malformed(format!(
+            "the index entry at {} declares interval [{}, {}), but its state record declares [{}, {}); expected exact agreement",
+            entry.chunk_offset, entry.t0, entry.t1, record_t0, record_t1
+        )));
+    }
+    Ok(())
+}
+
 /// Refuse populated zero-width state records on the front-to-back path.
 ///
 /// An indexed entry carries `live_count`, so [`check_composed_population`] checks both that
@@ -1641,18 +1660,22 @@ pub fn compose_chain<R: crate::Readable + ?Sized>(
     let chain = chain_ending_at(index, entry)?;
     let mut state: Option<State> = None;
     for link in &chain {
-        if link.kind == 0 {
-            state = Some(read_keyframe_entry(source, link, quantization, windows)?.0);
+        let (next, record_t0, record_t1) = if link.kind == 0 {
+            let (next, head) = read_keyframe_entry(source, link, quantization, windows)?;
+            (next, head.t0, head.t1)
         } else {
             let reference = state
                 .take()
                 .ok_or_else(|| Error::Malformed("a chain begins with a delta chunk".into()))?;
-            state = Some(read_delta_entry(source, link, &reference, windows)?.0);
-        }
+            let (next, head, _) = read_delta_entry(source, link, &reference, windows)?;
+            (next, head.t0, head.t1)
+        };
+        check_indexed_record_interval(link, record_t0, record_t1)?;
+        check_composed_population(link, &next)?;
+        state = Some(next);
     }
     let state = state.ok_or_else(|| Error::Malformed("an empty chain".into()))?;
     check_window_indices(&state, windows)?;
-    check_composed_population(entry, &state)?;
     Ok(state)
 }
 
