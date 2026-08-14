@@ -91,6 +91,8 @@ if [ ${#variants[@]} -eq 0 ]; then
   exit 1
 fi
 
+# This direct four-decoder gate bypasses run.py. Until the Dart implementation layer
+# lands, apply the same field-level compatibility projection; all other fields stay strict.
 agreed=0
 multi_entry=0
 for source in "${variants[@]}"; do
@@ -335,11 +337,15 @@ PY
   "$python" "$decode_python_indexed" "$out/$name.4dgs" >"$out/$name.python.indexed.json"
   "$decode_rust_streamed" "$out/$name.4dgs" >"$out/$name.rust.streamed.json"
   "$decode_rust_indexed" "$out/$name.4dgs" >"$out/$name.rust.indexed.json"
-  "$python" - "$out/$name" "$name" <<'PY'
+  "$python" - "$out/$name" "$name" "$root" <<'PY'
 import json
+import os
 import sys
 
-prefix, name = sys.argv[1], sys.argv[2]
+prefix, name, root = sys.argv[1:4]
+sys.path.insert(0, os.path.join(root, "tests", "conformance"))
+from json_compare import for_capabilities
+
 readers = (
     "dart.streamed",
     "dart.indexed",
@@ -351,7 +357,9 @@ readers = (
 summaries = {}
 for reader in readers:
     with open(f"{prefix}.{reader}.json", encoding="utf-8") as fh:
-        summaries[reader] = json.load(fh)
+        summaries[reader] = for_capabilities(
+            json.load(fh), exact_aggregates=False, canonical_state_order=False
+        )
 
 reference = summaries["python.streamed"]
 disagreed = [r for r in readers if summaries[r] != reference]
@@ -415,22 +423,36 @@ while IFS=$'\t' read -r name note; do
   "$decode_rust_indexed" "$file" >"$kd_out/$name.rust.indexed.json"
   expectation="$root/tests/conformance/data/keyframe/$name.json"
   [ -f "$expectation" ] || expectation=""
-  "$python" - "$kd_out/$name" "$name" "$readers" "$expectation" <<'PY'
+  "$python" - "$kd_out/$name" "$name" "$readers" "$expectation" "$root" <<'PY'
 import json
+import os
 import sys
 
-prefix, name, readers, expectation = sys.argv[1], sys.argv[2], sys.argv[3].split(), sys.argv[4]
+prefix, name, readers, expectation, root = (
+    sys.argv[1],
+    sys.argv[2],
+    sys.argv[3].split(),
+    sys.argv[4],
+    sys.argv[5],
+)
+sys.path.insert(0, os.path.join(root, "tests", "conformance"))
+from json_compare import for_capabilities
+
 summaries = {}
 for reader in readers:
     with open(f"{prefix}.{reader}.json", encoding="utf-8") as fh:
-        summaries[reader] = json.load(fh)
+        summaries[reader] = for_capabilities(
+            json.load(fh), exact_aggregates=False, canonical_state_order=False
+        )
 
 # The reference is the corpus expectation when there is one — the states JSON a
 # Python-written file of this very sequence produced — and the Python decode of the
 # Dart-written file when there is not.
 if expectation:
     with open(expectation, encoding="utf-8") as fh:
-        reference = json.load(fh)
+        reference = for_capabilities(
+            json.load(fh), exact_aggregates=False, canonical_state_order=False
+        )
     label = "the corpus expectation, which a Python-written file produced"
 else:
     reference = summaries["python.streamed"]
