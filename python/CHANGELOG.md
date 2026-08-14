@@ -6,6 +6,20 @@ All notable changes to the Python package are documented here, following
 
 ## [Unreleased]
 
+### Changed
+
+- **A per-band SH bound is matched against the spelling spec §5.3 defines, not against everything
+  `decimal.Decimal` parses.** The validator compared `bounds.sh_band<b>` by handing it to `Decimal`,
+  which accepts a much larger language than the format does: underscores anywhere in the number,
+  decimal digits from any script, and Python's own whitespace set, while refusing exponents outside
+  a range that varies with the interpreter build. No other SDK could reproduce that, so the same
+  file drew opposite verdicts from `4dgs validate` in different languages. §5.3 now writes the
+  grammar out — an optional sign, ASCII digits, an optional point and an optional exponent, with
+  nothing around it — and the validator matches it directly. `1_6`, `١٦`, a value led by U+001C and
+  a value padded with spaces are now reported as bounds that disagree with the record;
+  `0e999999999999999999999999` is accepted as the zero it spells. Equivalent spellings such as
+  `5e-05`, `5e-5` and `0.00005` remain one bound.
+
 ## [0.5.0] - 2026-08-13
 
 ### Fixed
