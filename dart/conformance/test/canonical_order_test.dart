@@ -202,6 +202,81 @@ void main() {
     expect(exactSum(<double>[1.0, double.nan]), isNull);
   });
 
+  test('num6 rounds halves to even, the way every other emitter does', () {
+    // `toStringAsFixed` rounds a half away from zero; Python's `round`, Rust's
+    // and C++'s `%.6f`, Swift's `String(format:)` and this file's own
+    // `exactSum` all round it to even. Every value a decoder produces is a
+    // float32, and an odd multiple of 2^-7 is exactly a six-decimal tie — so
+    // the disagreement is not a corner case, it is the whole float32 grid.
+    expect(num6(0.0078125), 0.007812);
+    expect(num6(0.5078125), 0.507812);
+    expect(num6(0.5234375), 0.523438);
+    expect(num6(-0.0078125), -0.007812);
+    expect(num6(-0.5234375), -0.523438);
+    // Not a tie: nothing to decide, and both rules already agreed.
+    expect(num6(1.015625), 1.015625);
+    expect(num6(1.0 / 3.0), 0.333333);
+  });
+
+  test('num6 and exactSum round one value one way', () {
+    // The bug this pins: a sample row said 0.007813 while the aggregate over
+    // the same column said 0.007812, in one document, and the reference said
+    // 0.007812 for both.
+    for (final value in <double>[
+      0.0078125,
+      0.5078125,
+      0.5234375,
+      -0.0078125,
+      -0.5234375,
+    ]) {
+      // Rounding an already-rounded value is a no-op, so the right-hand side is
+      // exactly `num6`'s answer spelled as a token.
+      expect(
+        exactSum(<double>[value])!.token,
+        exactSum(<double>[num6(value)!])!.token,
+        reason: 'num6 and exactSum disagree at $value',
+      );
+    }
+  });
+
+  test('a rounded zero is never signed, in the key or in the output', () {
+    expect(num6(-1e-9), 0.0);
+    expect(num6(-1e-9)!.isNegative, isFalse);
+    expect(num6(-0.0)!.isNegative, isFalse);
+    // `-0.0 == 0.0` is true, so the assertions above need `isNegative` to say
+    // anything. This one is what the harness actually compares.
+    expect(
+      canonical(<String, Object?>{'v': num6(-1e-9)}),
+      contains('"v": 0.0'),
+    );
+    expect(
+      canonical(<String, Object?>{'v': num6(-0.0)}),
+      isNot(contains('-0')),
+    );
+  });
+
+  test('signed zero cannot order a state sample', () {
+    // Two gaussians alike but for where the sign of a zero sits. They tie in
+    // every emitted value, so the two decode orders must produce one document
+    // — which they do not while `compareTo` puts `-0.0` before `0.0`.
+    final gaussians = _gaussians(
+      const <List<double>>[
+        <double>[-0.0, 0.0, 0.0],
+        <double>[0.0, -0.0, 0.0],
+      ],
+      const <List<double>>[
+        <double>[0, 0, 0],
+        <double>[0, 0, 0],
+      ],
+    );
+
+    final forward = _summary(gaussians);
+    final reversed = _summary(_permuted(gaussians, const <int>[1, 0]));
+
+    expect(canonical(forward), canonical(reversed));
+    expect(canonical(forward), isNot(contains('-0.0')));
+  });
+
   test('huge exact totals remain raw non-exponent JSON number tokens', () {
     final sum = exactSum(List<double>.filled(10, 1e308))!;
     final whole = sum.token.split('.').first;

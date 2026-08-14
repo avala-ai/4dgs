@@ -6,6 +6,17 @@ All notable changes to the Rust crate are documented here, following
 
 ## [Unreleased]
 
+### Fixed
+
+- **The canonical object-layer JSON no longer spells the sign of a zero.**
+  `fourdgs_scene_objects_json` and `fourdgs_scene_object_states_json` rendered every value in
+  `(-5e-7, -0.0]` as `-0.000000`, where the reference canonical form emits `0.0` — the canonical
+  form treats the sign of a zero as a property of the arithmetic path rather than of the scene.
+  Three of the committed corpus's object variants carried one, and nothing failed: the conformance
+  harness compared parsed values, and `-0.0 == 0.0`. The C++ and Swift bindings splice these strings
+  into their summaries verbatim, so the same sign was three SDKs' output. No wire-format change; the
+  affected member is a summary the conformance suite consumes.
+
 ## [0.6.0] - 2026-08-13
 
 ### Added
