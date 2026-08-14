@@ -44,11 +44,42 @@ const int rigSamples = 4;
 
 /// Rounds for comparison; a non-finite value becomes `null`, which is the only
 /// thing JSON can say about one.
+///
+/// Rounding is half-to-even on the value's exact binary expansion, and a value
+/// that rounds to zero comes back unsigned.
+///
+/// Neither is a detail. `toStringAsFixed` — the obvious spelling, and the one
+/// this used — rounds a half *away from zero*, while Python's `round`, Rust's
+/// and C++'s `%.6f`, Swift's `String(format:)` and this file's own [exactSum]
+/// all round it to even. The two disagree on every odd multiple of 2^-7, and
+/// every value a decoder produces is a float32, whose exact six-decimal ties are
+/// precisely those numbers: `num6(0.0078125)` said `0.007813` where the
+/// reference said `0.007812`, and [exactSum] over the same column said
+/// `0.007812` in the same document. Sharing [_canonicalUnits] with [exactSum] is
+/// what makes one value round one way here.
+///
+/// The sign of a zero is the canonical form's first rule — it records which side
+/// of zero the arithmetic landed on, which is a property of the platform and not
+/// of the scene. It is erased for free by going through [BigInt], which has no
+/// signed zero, and it has to be erased somewhere: `jsonEncode(-0.0)` is
+/// `-0.0`, and Dart's `compareTo` orders `-0.0` before `0.0` even though `==`
+/// calls them equal, so a surviving sign both changed the emitted text and
+/// reordered the rows it appeared in.
 double? num6(double? value) {
   if (value == null) return null;
   if (!value.isFinite) return null;
-  return double.parse(value.toStringAsFixed(floatDecimals));
+  final units = _canonicalUnits(value, _roundingScratch);
+  return double.parse(_unitsToken(units!));
 }
+
+/// One eight-byte view for every [num6] and [_sortable] call in the process.
+///
+/// [exactSum] keeps its own for the same reason it exists at all: rounding is
+/// per decoded field per gaussian, so a view allocated per value would turn a
+/// constant-space summary into millions of short-lived objects. Nothing here
+/// runs on a second isolate, and the view is dead between calls — its contents
+/// are written before they are read every time.
+final ByteData _roundingScratch = ByteData(8);
 
 /// A canonical JSON number token that must never pass through binary64 again.
 ///
@@ -906,8 +937,12 @@ int _compareRows(List<double> a, List<double> b) {
 
 /// A comparison key: rounded like the summary, with infinity kept as infinity so
 /// two languages order never-fading gaussians identically.
+///
+/// "Rounded like the summary" is the whole contract, so this rounds through
+/// [num6] rather than repeating a rule beside it. It used to repeat it and get
+/// it wrong in the same two ways — see [num6].
 double _sortable(double value) {
   if (value.isNaN) return double.infinity;
   if (value.isInfinite) return value;
-  return double.parse(value.toStringAsFixed(floatDecimals));
+  return num6(value)!;
 }

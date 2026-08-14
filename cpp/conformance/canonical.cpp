@@ -4,14 +4,45 @@
 #include "canonical.hpp"
 
 #include <algorithm>
+#include <clocale>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <string>
 #include <utility>
 
 namespace fourdgs {
 namespace conformance {
+
+namespace detail {
+
+namespace {
+
+/// Replace the first `from` with `to`, or leave the text alone when there is none.
+///
+/// `%f` output holds at most one radix, so one replacement is the whole job. An absent one is
+/// the ordinary case for an integral value and not an error.
+std::string replaceFirst(std::string text, const std::string& from, const std::string& to) {
+  if (from.empty() || from == to) return text;
+  const std::size_t at = text.find(from);
+  if (at == std::string::npos) return text;
+  text.replace(at, from.size(), to);
+  return text;
+}
+
+}  // namespace
+
+std::string radixToJson(std::string rendered, const char* radix) {
+  return replaceFirst(std::move(rendered), radix == nullptr ? "." : radix, ".");
+}
+
+std::string radixFromJson(std::string json, const char* radix) {
+  return replaceFirst(std::move(json), ".", radix == nullptr ? "." : radix);
+}
+
+}  // namespace detail
+
 namespace {
 
 /// How many gaussians appear in full. The aggregates cover the rest, so a decoder cannot
@@ -22,21 +53,60 @@ constexpr std::size_t kCameraKeyframes = 4;
 constexpr std::size_t kAudioKeyframes = 4;
 constexpr int kFloatDecimals = 6;
 
+/// The radix `snprintf` and `strtod` are using in this process right now.
+///
+/// Both read it from `LC_NUMERIC`, which the runner never sets — but this canonicalizer is a
+/// library, and a host that links it may. ICU, Qt and GTK all call `setlocale(LC_ALL, "")`
+/// during initialisation, so the value here is a property of whoever called `main`, not of
+/// this file. Never null: the C standard requires `localeconv` to return a non-empty
+/// `decimal_point`, and the fallback is there so a broken one degrades to the ASCII answer
+/// rather than to an empty search string that matches everywhere.
+const char* localeRadix() {
+  const std::lconv* conventions = std::localeconv();
+  if (conventions == nullptr || conventions->decimal_point == nullptr ||
+      conventions->decimal_point[0] == '\0') {
+    return ".";
+  }
+  return conventions->decimal_point;
+}
+
 /// Six decimals, correctly rounded, then read back — the same value Python's `round(v, 6)`
 /// produces, arrived at the same way rather than by a different arithmetic that agrees most
 /// of the time.
+///
+/// Two normalisations sit on top of `snprintf`, and both are about what the *canonical form*
+/// says rather than about what the platform said:
+///
+/// 1. The radix is `.`, because JSON has no other. Under `LC_NUMERIC=de_DE.UTF-8` this used
+///    to render `0.05` as `"0,050000"`, which `run.py`'s parse rejects for every file in the
+///    corpus at once.
+/// 2. A zero has no sign, because the sign records which side of zero the arithmetic landed
+///    on. That is a property of the platform too, and `compareExact` treats both signs as
+///    equal, so the rendering has to as well.
+///
+/// The sign is erased by dropping the character rather than by returning a spelled-out
+/// `"0.000000"`, which would have quietly stopped honouring `kFloatDecimals` the day it
+/// changed. A rendered fixed-point value is a zero exactly when it holds no digit from one to
+/// nine, which needs no second rendering and no parse.
 std::string renderRounded(double value) {
   char buffer[512];
-  std::snprintf(buffer, sizeof(buffer), "%.*f", kFloatDecimals, value);
-  // The sign of a zero describes the platform's floating-point path, not the scene. It
-  // must also agree with compareExact, which deliberately treats both signs as equal.
-  if (std::strtod(buffer, nullptr) == 0.0) return "0.000000";
-  return std::string(buffer);
+  const int written = std::snprintf(buffer, sizeof(buffer), "%.*f", kFloatDecimals, value);
+  std::string text =
+      written > 0 ? std::string(buffer, static_cast<std::size_t>(written)) : std::string(buffer);
+  text = detail::radixToJson(std::move(text), localeRadix());
+  if (!text.empty() && text[0] == '-' && text.find_first_of("123456789") == std::string::npos) {
+    text.erase(0, 1);
+  }
+  return text;
 }
 
 double roundToDecimals(double value) {
   if (!std::isfinite(value)) return value;
-  return std::strtod(renderRounded(value).c_str(), nullptr);
+  // Back into the locale's spelling before `strtod`, which is as locale-bound as the render
+  // was: handed a `.` under a comma-radix locale it stops at the integer part and silently
+  // truncates every fractional digit out of the comparison key.
+  const std::string text = detail::radixFromJson(renderRounded(value), localeRadix());
+  return std::strtod(text.c_str(), nullptr);
 }
 
 /// A comparison key: rounded like the summary, with infinity kept as infinity so the two

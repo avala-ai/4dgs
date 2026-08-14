@@ -209,6 +209,57 @@ class TestExactAggregateTransition:
         ) != json_compare.for_capabilities(expected, exact_aggregates=False, canonical_state_order=False)
 
 
+class TestTheHarnessCanSeeASignedZero:
+    """`run.py`'s blind spot, and the only place in the suite that could see it.
+
+    `generate.py --verify` compares committed expectations to a fresh Python decode as
+    *text*, so a signed zero in a `.json` file is caught — that is
+    `TestTheExpectationsAreChecked.test_a_signed_zero_fails_even_though_it_parses_equal`.
+    `run.py` compares a runner's stdout to that expectation as *parsed values*, and
+    `-0.0 == 0.0` holds for `float` and for `Decimal` alike. So a runner emitting
+    `-0.000000` where the reference emits `0.0` passed, on the committed corpus, in three
+    of the six SDKs at once — and the canonical form's first rule ("a zero is `0.0` and
+    never `-0.0`") had no test that could fail.
+    """
+
+    @staticmethod
+    def _document(zero: str) -> str:
+        return (
+            '{"cutoff":0.05,'
+            f'"aggregate":{{"opacitySum":{zero},"positionSum":[{zero},0.0,0.0]}},'
+            f'"states":[{{"sample":{{"positions":[[{zero},0.0,0.0]]}}}}]}}'
+        )
+
+    def _compare(self, zero: str, **caps):
+        expected = json_compare.loads(self._document("0.0"))
+        actual = json_compare.loads(self._document(zero))
+        return (
+            json_compare.for_capabilities(actual, **caps),
+            json_compare.for_capabilities(expected, **caps),
+        )
+
+    @pytest.mark.parametrize("zero", ["-0.0", "-0.000000", "-0e-9"])
+    def test_an_ordinary_signed_zero_is_not_an_unsigned_one(self, zero):
+        actual, expected = self._compare(zero, exact_aggregates=False, canonical_state_order=True)
+        assert actual != expected
+
+    @pytest.mark.parametrize("zero", ["-0.0", "-0.000000"])
+    def test_an_exact_aggregate_signed_zero_is_not_an_unsigned_one(self, zero):
+        actual, expected = self._compare(zero, exact_aggregates=True, canonical_state_order=True)
+        assert actual != expected
+
+    def test_an_unsigned_zero_still_compares_equal_to_every_spelling_of_itself(self):
+        for zero in ("0.0", "0.000000", "0e-9"):
+            actual, expected = self._compare(zero, exact_aggregates=True, canonical_state_order=True)
+            assert actual == expected, zero
+
+    def test_the_diagnostic_names_the_sign_rather_than_two_identical_zeros(self):
+        actual, expected = self._compare("-0.0", exact_aggregates=False, canonical_state_order=True)
+        text = "\n".join(json_compare.diagnostic_differences(expected, actual))
+        assert "-0.0" in text, text
+        assert '["cutoff"]' not in text, text
+
+
 @pytest.fixture
 def corpus(tmp_path, monkeypatch):
     """A freshly generated corpus in a directory of its own, committed to disk.
