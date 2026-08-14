@@ -14,6 +14,7 @@
 use std::collections::BTreeMap;
 
 use crate::error::{Error, Result};
+use crate::serialization::MAX_STREAM_BYTES;
 use crate::stream::DecodedStream;
 
 /// Coefficients per colour component that each band carries, as `[first, last)` within a
@@ -35,6 +36,65 @@ pub fn merge_chunk_bands(
     counts: &[usize],
     chunk_bands: &[BTreeMap<u8, DecodedStream>],
 ) -> Result<Option<(Vec<u8>, usize)>> {
+    let Some(coefficients) = validate_chunk_bands(counts, chunk_bands)? else {
+        return Ok(None);
+    };
+    let total = counts.iter().try_fold(0usize, |total, count| {
+        total.checked_add(*count).ok_or_else(|| {
+            Error::UnsupportedOperation("SH gaussian count overflows this platform".into())
+        })
+    })?;
+    let output_length = total
+        .checked_mul(3)
+        .and_then(|value| value.checked_mul(coefficients))
+        .ok_or_else(|| Error::UnsupportedOperation("SH output length overflows".into()))?;
+    if output_length > MAX_STREAM_BYTES as usize {
+        return Err(Error::UnsupportedOperation(format!(
+            "merged SH output needs {output_length} bytes, past the {MAX_STREAM_BYTES} byte decoded-state ceiling"
+        )));
+    }
+    let mut out = vec![0u8; output_length];
+
+    let mut at = 0usize;
+    for (chunk, bands) in counts.iter().zip(chunk_bands.iter()) {
+        let count = *chunk;
+        for (band, stream) in bands {
+            let (first, last) = band_range(*band)
+                .ok_or_else(|| Error::Malformed(format!("SH band {band} is not 1, 2 or 3")))?;
+            let width = last - first;
+            for i in 0..count {
+                for c in 0..3 {
+                    for j in 0..width {
+                        let value = stream.get(i, c * width + j);
+                        if !(0..=255).contains(&value) {
+                            return Err(Error::Malformed(
+                                "an SH coefficient is outside the 0..255 range this version stores"
+                                    .into(),
+                            ));
+                        }
+                        out[(at + i) * 3 * coefficients + c * coefficients + first + j] =
+                            value as u8;
+                    }
+                }
+            }
+        }
+        at += count;
+    }
+    Ok(Some((out, coefficients)))
+}
+
+/// Validate the logical SH layout without allocating its scene-wide output.
+pub(crate) fn validate_chunk_bands(
+    counts: &[usize],
+    chunk_bands: &[BTreeMap<u8, DecodedStream>],
+) -> Result<Option<usize>> {
+    if counts.len() != chunk_bands.len() {
+        return Err(Error::Malformed(format!(
+            "{} chunk counts accompany {} SH band maps",
+            counts.len(),
+            chunk_bands.len()
+        )));
+    }
     let mut present: Vec<u8> = Vec::new();
     for bands in chunk_bands {
         for band in bands.keys() {
@@ -57,10 +117,6 @@ pub fn merge_chunk_bands(
     let coefficients = band_range(*present.last().expect("non-empty"))
         .ok_or_else(|| Error::Malformed(format!("SH band {:?} is not 1, 2 or 3", present.last())))?
         .1;
-    let total: usize = counts.iter().sum();
-    let mut out = vec![0u8; total * 3 * coefficients];
-
-    let mut at = 0usize;
     for (chunk, bands) in counts.iter().zip(chunk_bands.iter()) {
         let count = *chunk;
         for band in &present {
@@ -80,23 +136,7 @@ pub fn merge_chunk_bands(
                     stream.count, stream.channels, 3 * width
                 )));
             }
-            for i in 0..count {
-                for c in 0..3 {
-                    for j in 0..width {
-                        let value = stream.get(i, c * width + j);
-                        if !(0..=255).contains(&value) {
-                            return Err(Error::Malformed(
-                                "an SH coefficient is outside the 0..255 range this version stores"
-                                    .into(),
-                            ));
-                        }
-                        out[(at + i) * 3 * coefficients + c * coefficients + first + j] =
-                            value as u8;
-                    }
-                }
-            }
         }
-        at += count;
     }
-    Ok(Some((out, coefficients)))
+    Ok(Some(coefficients))
 }

@@ -6,6 +6,25 @@ All notable changes to the Rust crate are documented here, following
 
 ## [Unreleased]
 
+### Fixed
+
+- **Scene reading now enforces fixed validated working-set envelopes.** Header, Quantization, Window
+  Table, and lazy descriptor records are parsed from progressively fetched prefixes so legal
+  extension suffixes are stepped over rather than allocated on indexed and streamed paths. Encoded
+  Chunk and SH Band Stream ranges and contiguous summaries are capped before their reads; decoded
+  wire symbols and their wider resident values, gaussian-row amplification, aggregate scene state,
+  streamed retained bytes, and repeatable record counts are checked before the corresponding
+  decompression, output allocation, or collection growth. Indexed state ranges must frame exactly
+  one record. Audio Source bodies are validated without fetching Audio Data payloads, and
+  record-byte-aware incomplete-versus-malformed diagnoses cross the C ABI. Indexed camera, metadata,
+  attachment, provenance, object, and Audio Source parsing now shares the opened scene's diminishing
+  allowance, and replacement loads charge every retained lazy and pose-validation cache before
+  decoding beside the previous gaussian state. Header attribute maps and streamed audio map nodes
+  are checked before allocation, lazy Audio Source descriptors include all `SceneReader` caches, and
+  the public decompressor grows only as validated output actually arrives. Quantization bounds,
+  Metadata maps, Window Table rows, indexed range collections, and assembly scratch storage receive
+  the same pre-allocation checks; truncated orphan audio payloads leave the budget when dropped.
+
 ## [0.6.0] - 2026-08-13
 
 ### Added

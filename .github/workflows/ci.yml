@@ -12,18 +12,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Total tree size under 9 MB
+      - name: Total tree size under 9.5 MB
         # Raised from 8192 once the inspect-and-validate tools landed: #191 brought the
         # Dart validator and #188 the Swift one, and the tree they leave measures 8696 KiB.
         # The gate went red on the merge itself rather than on either pull request, because
-        # each was measured against a main that did not yet have the other. 9216 is the step
-        # that holds the merged tree with room, and this is the whole-tree gate — the
-        # per-language sub-budgets below are still what say which language grew.
+        # each was measured against a main that did not yet have the other. 9216 held that
+        # tree; 9728 holds the current SDK/validator set plus the bounded Rust reader at
+        # 9412 KiB. This is the whole-tree gate — the per-language sub-budgets below are
+        # still what say which language grew.
         run: |
           size_kb=$(du -s --exclude=.git . | cut -f1)
           echo "tree: ${size_kb} KiB"
-          if [ "$size_kb" -gt 9216 ]; then
-            echo "::error::tree is ${size_kb} KiB, over the 9216 KiB budget"
+          if [ "$size_kb" -gt 9728 ]; then
+            echo "::error::tree is ${size_kb} KiB, over the 9728 KiB budget"
             exit 1
           fi
       - name: Conformance data under 2.5 MB
@@ -33,7 +34,7 @@ jobs:
             echo "conformance data: ${size_kb} KiB"
             [ "$size_kb" -le 2560 ] || { echo "::error::conformance data over budget"; exit 1; }
           fi
-      - name: Rust sources under 1392 KB
+      - name: Rust sources under 1856 KB
         # Sources only: this job builds nothing, so target/ is not here to measure. A
         # vendored dependency would show up as a budget failure, which is the point —
         # everything these crates need comes from crates.io via Cargo.toml.
@@ -56,10 +57,26 @@ jobs:
         # keyframe-reference regressions; 1376 after the bounded keyframe-delta validator
         # added fixed-header resource checks, exact record attribution, cross-delta lifetime
         # invariants, and their adversarial regressions; 1392 after its state-stream
-        # preflight, chunk-compression, identity-domain, and signed-bin regressions. A
-        # margin smaller than one deliberate review round is not headroom, it is the next
-        # source change failing a gate about
-        # vendored dependencies.
+        # preflight, chunk-compression, identity-domain, and signed-bin regressions; 1600
+        # after bounded
+        # indexed/streamed prefix reads, decoded working-set accounting, exact range framing,
+        # lazy Audio Source validation, and their hostile reader/C-ABI regressions made the
+        # clean combined Rust tree 1528 KiB; 1664 after the final review pass made
+        # retained prefix values and their collection backing share the decoded-state
+        # envelope, streamed excluded SH bands without buffering, and preflighted indexed
+        # SH reads, taking the final clean tree to 1624 KiB after indexed front-matter,
+        # Attachment, audio, and Delta working-set accounting; 1728 after the exact-review
+        # follow-ups made Delta groups/composition, indexed summary/Metadata/provenance and
+        # streamed decoded collections share those same bounds, preflighted compact Object
+        # Tables, and charged the indexed scene through replacement loads, taking the
+        # measured tree to 1692 KiB; 1792 after the final indexed lazy-family, Audio Source,
+        # Object Layer, and retained-cache aggregation pass took the clean tree to 1732 KiB;
+        # 1856 after exact-review follow-ups preflighted Header/Quantization/Metadata maps,
+        # Window Table and indexed range collections, and completed streamed audio and assembly
+        # scratch accounting, taking the clean tree to 1780 KiB.
+        # A margin smaller
+        # than one deliberate review round is not headroom, it is the next source change
+        # failing a gate about vendored dependencies.
         # A budget that tight stops being a budget and starts being a tax
         # on the next feature, so each raise leaves a little headroom. The number moves when
         # the tree grows deliberately, which is the one thing it is not meant to catch — it
@@ -73,7 +90,7 @@ jobs:
         run: |
           size_kb=$(du -s rust | cut -f1)
           echo "rust: ${size_kb} KiB"
-          [ "$size_kb" -le 1392 ] || { echo "::error::rust is ${size_kb} KiB, over the 1392 KiB budget"; exit 1; }
+          [ "$size_kb" -le 1856 ] || { echo "::error::rust is ${size_kb} KiB, over the 1856 KiB budget"; exit 1; }
 
       - name: TypeScript sources under 1152 KB
         # Sources only: this job installs nothing and builds nothing, so node_modules

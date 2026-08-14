@@ -291,6 +291,26 @@ pub struct Provenance {
     pub anchors: Vec<GeodeticAnchor>,
 }
 
+fn check_unique_record_names<T>(
+    values: &[T],
+    label: &str,
+    section: &str,
+    name: impl Fn(&T) -> &str,
+) -> Result<()> {
+    for (index, value) in values.iter().enumerate() {
+        let value_name = name(value);
+        if values[..index]
+            .iter()
+            .any(|earlier| name(earlier) == value_name)
+        {
+            return Err(Error::Malformed(format!(
+                "two {label} records are named {value_name:?}; these records are referred to by name and nothing else (section {section})"
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl Provenance {
     pub fn is_empty(&self) -> bool {
         self.frames.is_empty()
@@ -384,40 +404,18 @@ impl Provenance {
     /// complete is not one of them — no byte after the cut can make two
     /// `SensorCalibration` records with one name unambiguous — so those still refuse.
     pub fn check_with(&self, truncated: bool) -> Result<()> {
-        let groups: [(&str, Vec<&str>, &str); 4] = [
-            (
-                "CoordinateFrame",
-                self.frames.iter().map(|f| f.name.as_str()).collect(),
-                "5.15.2",
-            ),
-            (
-                "SensorCalibration",
-                self.sensors.iter().map(|s| s.name.as_str()).collect(),
-                "5.15.3",
-            ),
-            (
-                "RigTrajectory",
-                self.trajectories.iter().map(|t| t.name.as_str()).collect(),
-                "5.15.4",
-            ),
-            (
-                "GeodeticAnchor",
-                self.anchors.iter().map(|a| a.frame_name.as_str()).collect(),
-                "5.15.5",
-            ),
-        ];
-        for (label, names, section) in groups {
-            let mut seen: Vec<&str> = Vec::with_capacity(names.len());
-            for name in names {
-                if seen.contains(&name) {
-                    return Err(Error::Malformed(format!(
-                        "two {label} records are named {name:?}; these records are referred to \
-                         by name and nothing else (section {section})"
-                    )));
-                }
-                seen.push(name);
-            }
-        }
+        check_unique_record_names(&self.frames, "CoordinateFrame", "5.15.2", |value| {
+            &value.name
+        })?;
+        check_unique_record_names(&self.sensors, "SensorCalibration", "5.15.3", |value| {
+            &value.name
+        })?;
+        check_unique_record_names(&self.trajectories, "RigTrajectory", "5.15.4", |value| {
+            &value.name
+        })?;
+        check_unique_record_names(&self.anchors, "GeodeticAnchor", "5.15.5", |value| {
+            &value.frame_name
+        })?;
 
         // The registry defines two pose references and no more. An unrecognized value is
         // not a future extension a reader may ignore: it says the extrinsic maps into some

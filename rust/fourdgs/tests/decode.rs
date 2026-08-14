@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use fourdgs::error::Error;
 use fourdgs::opcode as op;
 use fourdgs::quantization::{life_class, mu_step, rint, support_k, Bounds, Profile, Steps};
-use fourdgs::records::{Header, Quantization, RigTrajectory, WindowTable};
+use fourdgs::records::{ChunkIndexEntry, Header, Quantization, RigTrajectory, WindowTable};
 use fourdgs::serialization::{put_record, MAGIC};
 use fourdgs::stream::{unzigzag, zigzag};
 
@@ -109,6 +109,35 @@ fn the_minimal_file_decodes() {
 }
 
 #[test]
+fn a_cut_oversized_summary_record_remains_recoverable_truncation() {
+    let mut data = minimal_file();
+    data.truncate(data.len() - MAGIC.len() - fourdgs::records::Footer::default().encode().len());
+    data.push(op::CHUNK_INDEX);
+    data.extend_from_slice(&(fourdgs::indexed_reader::MAX_FRONT_MATTER_BYTES + 1).to_le_bytes());
+
+    let scene = fourdgs::read_bytes(&data).expect("the complete prefix before the cut is usable");
+    assert!(scene.truncated);
+    assert_eq!(scene.gaussians.count(), 0);
+}
+
+#[test]
+fn streamed_chunk_indexes_reject_more_than_three_band_ranges() {
+    let mut data = minimal_file();
+    let footer_at = data.len() - MAGIC.len() - fourdgs::records::Footer::default().encode().len();
+    let index = ChunkIndexEntry {
+        bands: vec![(1, 0, 0), (2, 0, 0), (3, 0, 0), (4, 0, 0)],
+        ..Default::default()
+    }
+    .encode();
+    data.splice(footer_at..footer_at, index);
+
+    let error = fourdgs::read_bytes(&data).unwrap_err();
+    assert!(matches!(error, Error::Malformed(_)), "{error}");
+    assert!(error.to_string().contains("at most 3"), "{error}");
+    assert!(error.to_string().contains("at byte"), "{error}");
+}
+
+#[test]
 fn unknown_and_private_records_are_stepped_over() {
     let mut data = minimal_file();
     // Splice two records a version-1 reader has never seen in front of the Footer: one
@@ -148,6 +177,32 @@ fn a_record_that_grew_fields_is_still_read() {
 
     let scene = fourdgs::read_bytes(&out).expect("appended fields are stepped over");
     assert_eq!(scene.header.duration_sec, 2.5);
+}
+
+#[test]
+fn streamed_decode_steps_over_a_large_header_suffix() {
+    let trailer = vec![0x5a; fourdgs::indexed_reader::HEAD_PROBE as usize * 128];
+    let mut out = Vec::new();
+    out.extend_from_slice(&MAGIC);
+    out.extend_from_slice(
+        &Header {
+            duration_sec: 2.5,
+            gaussian_count: 0,
+            aabb: vec![0.0; 6],
+            cutoff: 0.05,
+            temporal_model: "gaussian-birth".into(),
+            ..Default::default()
+        }
+        .encode(&trailer),
+    );
+    let base = minimal_file();
+    let header_end =
+        8 + 9 + u64::from_le_bytes(base[9..17].try_into().expect("eight bytes")) as usize;
+    out.extend_from_slice(&base[header_end..]);
+
+    let scene = fourdgs::read_bytes(&out).expect("the large extension suffix stays non-resident");
+    assert_eq!(scene.header.duration_sec, 2.5);
+    assert!(!scene.truncated);
 }
 
 #[test]
