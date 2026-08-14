@@ -1053,7 +1053,7 @@ class _FrontMatter {
 /// before it gives up and reports what it could not find. It is generous because
 /// the scan now runs to the first Chunk: a file may legitimately carry several
 /// records larger than the probe before it, and each costs a round.
-const int _maxFrontMatterReads = 256;
+const int maxFrontMatterReads = 256;
 
 /// Enough of a legacy Audio record to hold its descriptor without its payload.
 const int _legacyAudioPrefixBytes = 512;
@@ -1104,9 +1104,10 @@ Future<_FrontMatter> _readFrontMatter(
   // file. If the round cap is hit first — a file with more oversized-payload records than
   // the cap allows, since the format sets no source-count limit — the front matter is
   // incomplete, and returning it would frame a partial scene the Header still agrees with.
-  // The reader refuses at its stated limit rather than accept that. See `_maxFrontMatterReads`.
+  // The reader refuses at its stated limit rather than accept that. See
+  // [maxFrontMatterReads].
   bool complete = false;
-  for (int round = 0; round < _maxFrontMatterReads; round++) {
+  for (int round = 0; round < maxFrontMatterReads; round++) {
     FourdgsRecordSpan? unread;
     bool sawChunk = false;
     // Where the scan got to, in file coordinates. Tracked rather than inferred
@@ -1219,7 +1220,7 @@ Future<_FrontMatter> _readFrontMatter(
   }
   if (!complete) {
     throw FourdgsMalformedFile(
-      'the front matter needs more than $_maxFrontMatterReads reads to reach the first '
+      'the front matter needs more than $maxFrontMatterReads reads to reach the first '
       'Chunk or the end of the file',
     );
   }

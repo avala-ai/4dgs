@@ -313,6 +313,144 @@ void aMismatchedIdStreamIsRefused() {
   CHECK(encoded.error().message.find("gaussian_id") != std::string::npos);
 }
 
+void invalidDurationsAreRefused() {
+  const double invalid[] = {0.0, -1.0, -std::numeric_limits<double>::infinity(),
+                            std::numeric_limits<double>::quiet_NaN()};
+  for (double duration : invalid) {
+    const Sequence sequence = threeSamples();
+    Result<std::vector<std::uint8_t>> encoded =
+        fourdgs::encodeKeyframeDeltaSequence(spanOf(sequence), duration);
+    CHECK(!encoded.ok());
+    if (encoded.ok()) continue;
+    CHECK_EQ(encoded.error().code, ErrorCode::kInvalidArgument);
+    CHECK(encoded.error().message.find("positive and not NaN") != std::string::npos);
+  }
+}
+
+void aPositiveInfiniteDurationIsAccepted() {
+  const Sequence sequence = threeSamples();
+  Result<std::vector<std::uint8_t>> encoded = fourdgs::encodeKeyframeDeltaSequence(
+      spanOf(sequence), std::numeric_limits<double>::infinity());
+  CHECK(encoded.ok());
+}
+
+void anEmptySequenceIsRefused() {
+  Result<std::vector<std::uint8_t>> encoded =
+      fourdgs::encodeKeyframeDeltaSequence(fourdgs::Span<const KeyframeDeltaSample>(), 1.0);
+  CHECK(!encoded.ok());
+  if (encoded.ok()) return;
+  CHECK_EQ(encoded.error().code, ErrorCode::kInvalidArgument);
+  CHECK(encoded.error().message.find("at least one sample") != std::string::npos);
+}
+
+void aNonFiniteSampleInstantIsRefused() {
+  const double invalid[] = {std::numeric_limits<double>::infinity(),
+                            -std::numeric_limits<double>::infinity(),
+                            std::numeric_limits<double>::quiet_NaN()};
+  for (double instant : invalid) {
+    Sequence sequence = threeSamples();
+    sequence.samples[1].t0 = instant;
+    Result<std::vector<std::uint8_t>> encoded =
+        fourdgs::encodeKeyframeDeltaSequence(spanOf(sequence), 1.0);
+    CHECK(!encoded.ok());
+    if (encoded.ok()) continue;
+    CHECK_EQ(encoded.error().code, ErrorCode::kInvalidArgument);
+    CHECK(encoded.error().message.find("sample 1") != std::string::npos);
+    CHECK(encoded.error().message.find("non-finite") != std::string::npos);
+  }
+}
+
+void aSequenceThatDoesNotStartAtZeroIsRefused() {
+  Sequence sequence = threeSamples();
+  sequence.samples[0].t0 = 0.1;
+  Result<std::vector<std::uint8_t>> encoded =
+      fourdgs::encodeKeyframeDeltaSequence(spanOf(sequence), 1.0);
+  CHECK(!encoded.ok());
+  if (encoded.ok()) return;
+  CHECK_EQ(encoded.error().code, ErrorCode::kInvalidArgument);
+  CHECK(encoded.error().message.find("first sample") != std::string::npos);
+  CHECK(encoded.error().message.find("not 0") != std::string::npos);
+}
+
+void sampleInstantsMustStrictlyIncrease() {
+  const double invalid[] = {0.0, -0.1};
+  for (double instant : invalid) {
+    Sequence sequence = threeSamples();
+    sequence.samples[1].t0 = instant;
+    Result<std::vector<std::uint8_t>> encoded =
+        fourdgs::encodeKeyframeDeltaSequence(spanOf(sequence), 1.0);
+    CHECK(!encoded.ok());
+    if (encoded.ok()) continue;
+    CHECK_EQ(encoded.error().code, ErrorCode::kInvalidArgument);
+    CHECK(encoded.error().message.find("strictly increasing") != std::string::npos);
+  }
+}
+
+void theLastSampleMustStartBeforeDuration() {
+  const double invalid[] = {1.0, 1.1};
+  for (double instant : invalid) {
+    Sequence sequence = threeSamples();
+    sequence.samples[2].t0 = instant;
+    Result<std::vector<std::uint8_t>> encoded =
+        fourdgs::encodeKeyframeDeltaSequence(spanOf(sequence), 1.0);
+    CHECK(!encoded.ok());
+    if (encoded.ok()) continue;
+    CHECK_EQ(encoded.error().code, ErrorCode::kInvalidArgument);
+    CHECK(encoded.error().message.find("last sample") != std::string::npos);
+    CHECK(encoded.error().message.find("not before duration_sec") != std::string::npos);
+  }
+}
+
+void duplicateIdsWithinASampleAreRefused() {
+  Sequence sequence = threeSamples();
+  sequence.ids[1][3] = 1;
+
+  Result<std::vector<std::uint8_t>> encoded =
+      fourdgs::encodeKeyframeDeltaSequence(spanOf(sequence), 1.0);
+  CHECK(!encoded.ok());
+  if (encoded.ok()) return;
+  CHECK_EQ(encoded.error().code, ErrorCode::kInvalidArgument);
+  CHECK(encoded.error().message.find("sample 1") != std::string::npos);
+  CHECK(encoded.error().message.find("gaussian id 1") != std::string::npos);
+  CHECK(encoded.error().message.find("more than once") != std::string::npos);
+}
+
+/// An identity is never reused within one sequence (§11.2): once absent from a sample, it is
+/// dead. The ordinary round-trip fixture above is the positive control — ids 1, 2 and 3 stay
+/// continuously live while id 4 is a genuine new birth. Here id 0 instead skips sample 1 and
+/// reappears in sample 2, which is a new row trying to claim a dead gaussian's identity.
+void anIdThatReappearsAfterDeathIsRefused() {
+  Sequence sequence = threeSamples();
+  sequence.ids[1][0] = 4;
+  sequence.ids[2][3] = 0;
+
+  Result<std::vector<std::uint8_t>> encoded =
+      fourdgs::encodeKeyframeDeltaSequence(spanOf(sequence), 1.0);
+  CHECK(!encoded.ok());
+  if (encoded.ok()) return;
+  CHECK_EQ(encoded.error().code, ErrorCode::kInvalidArgument);
+  CHECK(encoded.error().message.find("sample 2") != std::string::npos);
+  CHECK(encoded.error().message.find("gaussian id 0") != std::string::npos);
+  CHECK(encoded.error().message.find("after it died") != std::string::npos);
+}
+
+void anEmptyPopulationUsesANullIdSpanSafely() {
+  Sequence sequence = threeSamples();
+  sequence.ids[1].clear();
+  sequence.populations[1].resize(0, 0, 0);
+  sequence.samples[1].ids = fourdgs::Span<const std::uint32_t>();
+  sequence.samples[1].gaussians = GaussianView(sequence.populations[1]);
+  sequence.ids[2] = {4, 5, 6, 7};
+  sequence.populations[2] = movingPopulation(sequence.ids[2], 0.2f);
+  sequence.samples[2].ids =
+      fourdgs::Span<const std::uint32_t>(sequence.ids[2].data(), sequence.ids[2].size());
+  sequence.samples[2].gaussians = GaussianView(sequence.populations[2]);
+
+  Result<std::vector<std::uint8_t>> encoded =
+      fourdgs::encodeKeyframeDeltaSequence(spanOf(sequence), 1.0);
+  CHECK(encoded.ok());
+}
+
 /// The nine columns the ABI reads, with the floats each holds per gaussian.
 struct Column {
   fourdgs::Span<const float> GaussianView::* member;
@@ -470,6 +608,16 @@ void runTests() {
     bothDeltaModesReachTheCore();
     aChangedInvariantIsRefused();
     aMismatchedIdStreamIsRefused();
+    invalidDurationsAreRefused();
+    aPositiveInfiniteDurationIsAccepted();
+    anEmptySequenceIsRefused();
+    aNonFiniteSampleInstantIsRefused();
+    aSequenceThatDoesNotStartAtZeroIsRefused();
+    sampleInstantsMustStrictlyIncrease();
+    theLastSampleMustStartBeforeDuration();
+    duplicateIdsWithinASampleAreRefused();
+    anIdThatReappearsAfterDeathIsRefused();
+    anEmptyPopulationUsesANullIdSpanSafely();
     aRaggedSampleIsRefused();
     aRaggedSceneIsRefused();
     compressionAndCutoffReachTheCore();

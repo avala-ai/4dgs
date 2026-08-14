@@ -6,6 +6,8 @@ All notable changes to the Python package are documented here, following
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-13
+
 ### Fixed
 
 - **Validity-window comparisons retain their f64 wire precision.** Decoding narrowed Window Table

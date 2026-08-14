@@ -173,6 +173,15 @@ const char *fourdgs_last_error(void);
  */
 int fourdgs_last_refusal_code(const char **out, size_t *out_len);
 
+/**
+ * The byte attached to the last failure on this thread, when the operation can place it.
+ *
+ * Absence is not an error: `*out_has_offset` is 0 and `*out_offset` is 0. Like
+ * fourdgs_last_refusal_code, null out parameters return INVALID_ARGUMENT without overwriting
+ * the diagnosis being queried.
+ */
+int fourdgs_last_error_offset(uint64_t *out_offset, int *out_has_offset);
+
 /** A short static name for a status code. Never null; valid forever. */
 const char *fourdgs_status_message(int status);
 
@@ -268,6 +277,32 @@ int fourdgs_open_path_ex(const char *path, int mode, fourdgs_scene **out);
  * identically, including when this call fails.
  */
 int fourdgs_open_reader_ex(fourdgs_reader reader, int mode, fourdgs_scene **out);
+
+/**
+ * Called once for every lifetime gaussian identity introduced by keyframe-delta payloads.
+ * `record_offset` is the byte offset of the keyframe or delta record that introduces `id`.
+ */
+typedef int (*fourdgs_identity_sink)(void *ctx, uint64_t record_offset, uint32_t id);
+
+/**
+ * Validate every keyframe-delta payload through one concrete read path over a range source.
+ *
+ * `mode` is FOURDGS_OPEN_SEQUENTIAL or FOURDGS_OPEN_INDEXED; AUTO is deliberately rejected so
+ * a validator states which path it certified. The core retains at most the current population
+ * and its GOP keyframe. It calls `identity` once per lifetime introduction with the introducing
+ * keyframe or delta record's byte offset, allowing the caller to prove uniqueness and compare
+ * the resulting distinct count with
+ * `*out_declared_gaussian_count` using bounded scratch storage at its I/O edge.
+ *
+ * Ownership of `reader.ctx` transfers to this call and `reader.release` is called exactly once,
+ * including on failure. The identity context remains caller-owned. On failure the count output is
+ * untouched; fourdgs_last_error, fourdgs_last_refusal_code, and fourdgs_last_error_offset carry
+ * the diagnosis.
+ */
+int fourdgs_validate_keyframe_delta_reader(fourdgs_reader reader, int mode,
+                                           void *identity_ctx,
+                                           fourdgs_identity_sink identity,
+                                           uint64_t *out_declared_gaussian_count);
 
 /**
  * Release a scene and invalidate every pointer borrowed from it. Null is ignored.

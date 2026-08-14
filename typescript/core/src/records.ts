@@ -1353,6 +1353,16 @@ export function checkObjectTrack(track: ObjectTrack): void {
         "an object that exists (section 5.15.7)",
     );
   }
+  // The streamed and indexed readers enforce this before allocating their
+  // sample arrays. A caller-authored track has to meet the same ceiling before
+  // validation walks the arrays or the writer materializes 64 bytes per row,
+  // otherwise this SDK can write a record it refuses to reopen.
+  if (track.times.length > MAX_TRAJECTORY_SAMPLES) {
+    throw new MalformedFile(
+      `ObjectTrack for object ${track.objectId} declares ${track.times.length} samples, past the ` +
+        `${MAX_TRAJECTORY_SAMPLES} ceiling`,
+    );
+  }
   // The trajectory rules iterate each array on its own, so they cannot see a track whose
   // arrays disagree in length — a shape the parser cannot produce but a caller building a
   // record can. Left to them, `poseAt` reads past the short array and the file comes back

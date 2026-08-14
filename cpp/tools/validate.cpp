@@ -38,13 +38,20 @@
 ///   the model — the conformance suite proves it — so refusing a file for declaring it was never
 ///   a statement about the file.
 
+#include <algorithm>
+#include <array>
+#include <chrono>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <memory>
+#include <new>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
+#include "backend.hpp"
 #include "tool.hpp"
 
 namespace fourdgs {
@@ -194,14 +201,201 @@ void checkGaussianBirth(Readable& source, const Walk& walk, const std::vector<In
   }
 }
 
-/// The keyframe-delta C ABI accepts one contiguous byte span. Calling it here would necessarily
-/// buffer the whole resource, and a validator may not turn a large valid capture into an
-/// allocation attempt. Until the core exposes range-based streamed and indexed composition, say
-/// that the verdict is incomplete instead of certifying bytes this binding could not inspect.
-void checkKeyframeDelta(Report* report) {
-  incomplete(report,
-             "keyframe-delta payload validation is unavailable through the bounded C++ core "
-             "surface; structural checks completed, but neither read mode was certified");
+/// Fixed-memory distinct-id counting for full-file validation.
+///
+/// The high nibble selects one of sixteen temporary files. Each is reduced through one
+/// 2^28-bit bitmap (32 MiB) and discarded before the next is read, so memory never grows with
+/// the number of state records or lifetime identities. Filesystem I/O stays here at the CLI edge.
+class IdentityCounter {
+ public:
+  static Result<std::unique_ptr<IdentityCounter>> create() {
+    std::error_code error;
+    const std::filesystem::path base = std::filesystem::temp_directory_path(error);
+    if (error)
+      return Error(ErrorCode::kIo,
+                   "cannot locate temporary storage for identity validation: " + error.message());
+    const std::uint64_t stamp =
+        static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+    std::filesystem::path directory;
+    for (std::uint32_t attempt = 0; attempt < 100; ++attempt) {
+      const std::filesystem::path candidate =
+          base / ("4dgs-validate-ids-" + std::to_string(stamp) + "-" + std::to_string(attempt));
+      error.clear();
+      if (std::filesystem::create_directory(candidate, error)) {
+        directory = candidate;
+        break;
+      }
+      if (error && error != std::errc::file_exists)
+        return Error(ErrorCode::kIo,
+                     "cannot create temporary identity storage: " + error.message());
+    }
+    if (directory.empty())
+      return Error(ErrorCode::kIo, "cannot reserve unique temporary identity storage");
+    std::unique_ptr<IdentityCounter> counter(new (std::nothrow) IdentityCounter(directory));
+    if (!counter) {
+      std::filesystem::remove_all(directory, error);
+      return Error(ErrorCode::kInternal, "out of memory preparing bounded identity validation");
+    }
+    for (std::size_t bucket = 0; bucket < kBuckets; ++bucket) {
+      counter->writers_[bucket].open(counter->path(bucket),
+                                     std::ios::binary | std::ios::out | std::ios::trunc);
+      if (!counter->writers_[bucket])
+        return Error(ErrorCode::kIo,
+                     "cannot open temporary identity partition " + std::to_string(bucket));
+    }
+    return counter;
+  }
+
+  ~IdentityCounter() {
+    // On Windows an open file cannot be removed. Member destructors run only after this
+    // destructor body, so close the partitions explicitly before removing their directory.
+    // This path also covers setup failures and validation refusals that return before finish().
+    for (std::ofstream& writer : writers_) writer.close();
+    std::error_code ignored;
+    std::filesystem::remove_all(directory_, ignored);
+  }
+
+  Result<void> add(std::uint64_t recordOffset, std::uint32_t id) {
+    const std::size_t bucket = id >> kLowBits;
+    nonempty_[bucket] = true;
+    writers_[bucket].write(reinterpret_cast<const char*>(&id), sizeof(id));
+    writers_[bucket].write(reinterpret_cast<const char*>(&recordOffset), sizeof(recordOffset));
+    if (!writers_[bucket])
+      return Error(ErrorCode::kIo,
+                   "cannot write temporary identity partition " + std::to_string(bucket));
+    return Result<void>();
+  }
+
+  Result<std::uint64_t> finish() {
+    for (std::size_t bucket = 0; bucket < kBuckets; ++bucket) {
+      std::ofstream& writer = writers_[bucket];
+      writer.flush();
+      if (!writer) return Error(ErrorCode::kIo, "cannot flush temporary identity storage");
+      writer.close();
+      Result<void> closed = checkIdentityPartitionClose(writer, bucket);
+      if (!closed) return closed.error();
+    }
+    constexpr std::size_t kWordBits = 64;
+    if (std::none_of(nonempty_.begin(), nonempty_.end(), [](bool value) { return value; }))
+      return std::uint64_t{0};
+    const std::size_t words = std::size_t{1} << (kLowBits - 6);
+    std::unique_ptr<std::uint64_t[]> bits(new (std::nothrow) std::uint64_t[words]);
+    if (!bits)
+      return Error(ErrorCode::kInternal,
+                   "out of memory allocating the fixed identity partition bitmap");
+    std::uint64_t total = 0;
+    for (std::size_t bucket = 0; bucket < kBuckets; ++bucket) {
+      if (!nonempty_[bucket]) continue;
+      std::fill_n(bits.get(), words, std::uint64_t{0});
+      std::ifstream reader(path(bucket), std::ios::binary);
+      if (!reader)
+        return Error(ErrorCode::kIo,
+                     "cannot read temporary identity partition " + std::to_string(bucket));
+      for (;;) {
+        std::uint32_t id = 0;
+        std::uint64_t recordOffset = 0;
+        reader.read(reinterpret_cast<char*>(&id), sizeof(id));
+        if (reader.gcount() == 0 && reader.eof()) break;
+        if (reader.gcount() != static_cast<std::streamsize>(sizeof(id)))
+          return Error(ErrorCode::kIo, "temporary identity partition ended inside an id");
+        reader.read(reinterpret_cast<char*>(&recordOffset), sizeof(recordOffset));
+        if (reader.gcount() != static_cast<std::streamsize>(sizeof(recordOffset)))
+          return Error(ErrorCode::kIo, "temporary identity partition ended inside an offset");
+        const std::size_t low = id & ((std::uint32_t{1} << kLowBits) - 1);
+        const std::uint64_t mask = std::uint64_t{1} << (low & (kWordBits - 1));
+        std::uint64_t& word = bits[low >> 6];
+        if ((word & mask) != 0)
+          return Error(
+              ErrorCode::kMalformed,
+              "gaussian_id " + std::to_string(id) + " is introduced more than once at byte " +
+                  std::to_string(recordOffset) +
+                  " (the keyframe-delta record); an identity may not be reused after death");
+        word |= mask;
+      }
+      for (std::size_t i = 0; i < words; ++i) {
+        std::uint64_t word = bits[i];
+        while (word != 0) {
+          word &= word - 1;
+          ++total;
+        }
+      }
+    }
+    return total;
+  }
+
+ private:
+  static constexpr std::size_t kBuckets = 16;
+  static constexpr std::size_t kLowBits = 28;
+
+  explicit IdentityCounter(std::filesystem::path directory) : directory_(std::move(directory)) {}
+  std::filesystem::path path(std::size_t bucket) const {
+    return directory_ / std::to_string(bucket);
+  }
+
+  std::filesystem::path directory_;
+  std::array<std::ofstream, kBuckets> writers_;
+  std::array<bool, kBuckets> nonempty_{};
+};
+
+void checkKeyframeDeltaPath(Readable& source, const Walk& walk, ReadMode mode, const char* pathName,
+                            Report* report) {
+  Result<std::unique_ptr<IdentityCounter>> made = IdentityCounter::create();
+  if (!made) {
+    incomplete(report, "keyframe-delta " + std::string(pathName) +
+                           " validation could not prepare bounded identity storage: " +
+                           made.error().message);
+    return;
+  }
+  std::unique_ptr<IdentityCounter> identities = std::move(*made);
+  bool identitySinkFailed = false;
+  std::optional<std::uint64_t> offset;
+  Result<std::uint64_t> declared = detail::validateKeyframeDelta(
+      source, static_cast<int>(mode),
+      [&](std::uint64_t recordOffset, std::uint32_t id) {
+        Result<void> added = identities->add(recordOffset, id);
+        if (!added) identitySinkFailed = true;
+        return added;
+      },
+      &offset);
+  if (!declared) {
+    if (declared.error().code == ErrorCode::kIo || declared.error().code == ErrorCode::kInternal ||
+        declared.error().code == ErrorCode::kNotImplemented ||
+        declared.error().code == ErrorCode::kUnsupportedMode) {
+      reportKeyframeDeltaToolFailure(report, pathName, declared.error(), identitySinkFailed);
+    } else {
+      std::optional<Site> site;
+      if (offset.has_value()) site = Site{*offset, "the keyframe-delta record"};
+      const std::string prefix =
+          "keyframe-delta " + std::string(pathName) + " validation refused this file: ";
+      refused(report, prefix.c_str(), declared.error(), &walk, site);
+    }
+    return;
+  }
+  Result<std::uint64_t> distinct = identities->finish();
+  if (!distinct) {
+    if (distinct.error().code != ErrorCode::kMalformed) {
+      incomplete(report, "keyframe-delta " + std::string(pathName) +
+                             " identity validation could not use temporary storage: " +
+                             distinct.error().message);
+    } else {
+      error(report, distinct.error().message);
+    }
+    return;
+  }
+  if (*distinct != *declared) {
+    const Frame* header = walk.firstIntact(op::kHeader);
+    const std::string site =
+        header == nullptr ? std::string()
+                          : " at byte " + std::to_string(header->offset) + " (the Header record)";
+    error(report, "Header declares " + std::to_string(*declared) + " distinct gaussians" + site +
+                      "; keyframes and birth groups introduce " + std::to_string(*distinct));
+  }
+}
+
+void checkKeyframeDelta(Readable& source, const Walk& walk, bool hasIndex, Report* report) {
+  checkKeyframeDeltaPath(source, walk, ReadMode::kSequential, "sequential", report);
+  if (!report->complete || report->hasErrors()) return;
+  if (hasIndex) checkKeyframeDeltaPath(source, walk, ReadMode::kIndexed, "indexed", report);
 }
 
 /// The Header's temporal model, range-parsed through its two variable-length prefixes.
@@ -314,6 +508,39 @@ Result<std::optional<HeaderShape>> rangeParsedHeaderShape(Readable& source, cons
 }
 
 }  // namespace
+
+void reportKeyframeDeltaToolFailure(Report* report, const char* pathName, const Error& failure,
+                                    bool identitySinkFailed) {
+  std::string operation;
+  if (identitySinkFailed) {
+    operation = " identity validation could not use temporary storage: ";
+  } else {
+    switch (failure.code) {
+      case ErrorCode::kIo:
+        operation = " validation could not read the file: ";
+        break;
+      case ErrorCode::kUnsupportedMode:
+        operation = " validation reached a bounded tool limit: ";
+        break;
+      case ErrorCode::kNotImplemented:
+        operation = " validation needs functionality this tool does not implement: ";
+        break;
+      case ErrorCode::kInternal:
+        operation = " validation failed inside the tool: ";
+        break;
+      default:
+        operation = " validation could not finish: ";
+        break;
+    }
+  }
+  incomplete(report, "keyframe-delta " + std::string(pathName) + operation + failure.message);
+}
+
+Result<void> checkIdentityPartitionClose(const std::ostream& writer, std::size_t bucket) {
+  if (writer) return Result<void>();
+  return Error(ErrorCode::kIo,
+               "cannot close temporary identity partition " + std::to_string(bucket));
+}
 
 Result<std::string> temporalModel(Readable& source, const Walk& walk) {
   return rangeParsedModel(source, walk);
@@ -877,7 +1104,7 @@ Report validate(Readable& source) {
   if (walk.cut.has_value()) noteTheCut(&report, walk);
 
   if (keyframeDelta) {
-    checkKeyframeDelta(&report);
+    checkKeyframeDelta(source, walk, physicalIndexCount > 0, &report);
   } else {
     const bool indexedCoreSupportsFooter = !walk.lastIntactRecord.has_value() ||
                                            walk.lastIntactRecord->opcode != op::kFooter ||
