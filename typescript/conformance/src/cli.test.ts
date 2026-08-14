@@ -163,11 +163,105 @@ function splice(data: Uint8Array, at: number, insert: Uint8Array): Uint8Array {
   return out;
 }
 
-/** Rewrite one Quantization bound and discard the now-stale byte index and summary. */
+/**
+ * The spellings section 5.3's grammar accepts, against the bound each one declares.
+ *
+ * The identical table is checked by the Python, Rust and Dart validators. A row that moves
+ * here without moving there is the disagreement the grammar exists to end, so keep the four
+ * in step.
+ */
+const EQUIVALENT_BOUND_SPELLINGS: ReadonlyArray<readonly [string, number]> = [
+  ["16", 16],
+  ["16.", 16],
+  ["16.0", 16],
+  ["+016.000", 16],
+  ["1.6e1", 16],
+  ["160e-1", 16],
+  ["0.16E2", 16],
+  ["8", 8],
+  ["0.8e1", 8],
+  ["80e-1", 8],
+  [".4e1", 4],
+  [`0.${"0".repeat(1000)}4e1001`, 4],
+  ["0", 0],
+  ["0.0", 0],
+  ["-0", 0],
+  ["+0.000", 0],
+  ["0e999999999999999999999999", 0],
+  ["0.0e-999999999999999999999999", 0],
+];
+
+/**
+ * The spellings section 5.3's grammar refuses, against the bound the record declares.
+ *
+ * Several are accepted by one runtime's number parser or another: underscores and other
+ * scripts' digits by Python's `Decimal`, U+FEFF by JavaScript's own whitespace class. That
+ * is exactly why the grammar is matched here rather than delegated to a runtime.
+ */
+const REJECTED_BOUND_SPELLINGS: ReadonlyArray<readonly [string, number]> = [
+  ["1_6", 16],
+  ["8_0e-1", 8],
+  ["_16", 16],
+  ["16_", 16],
+  ["\u0661\u0666", 16], // Arabic-Indic one six
+  ["\u0668", 8], // Arabic-Indic eight
+  ["\u0668\u0660e-\u06f1", 8],
+  ["\uff11\uff16", 16], // fullwidth one six
+  ["\u2078", 8], // superscript eight, a digit in no grammar
+  ["\ufeff16", 16], // a byte-order mark is data, not padding
+  ["\ufeff4", 4],
+  ["16\ufeff", 16],
+  ["\u001c8", 8], // Python's `Decimal` trims U+001C; the grammar does not
+  ["\u001f16", 16],
+  [" 16 ", 16],
+  ["\t16", 16],
+  ["16\n", 16],
+  ["\u200916", 16], // thin space
+  ["16.0000000000000001", 16],
+  ["15.9999999999999999", 16],
+  ["1.6", 16],
+  ["16e", 16],
+  ["16e+", 16],
+  ["16e-", 16],
+  ["16eNaN", 16],
+  ["", 16],
+  [".", 16],
+  ["+", 16],
+  ["_", 0],
+  ["NaN", 0],
+  ["nan", 0],
+  ["Infinity", 16],
+  ["inf", 16],
+  ["-16", 16],
+  ["0e", 0],
+  ["0_0", 0],
+  ["\u0660", 0], // Arabic-Indic zero
+  ["\ufeff0", 0],
+  ["\u001c0", 0],
+  ["1", 0],
+];
+
+/** The SH bit depth whose section 6.5 bound is each expected value. */
+const DEPTH_FOR_BOUND: ReadonlyMap<number, number> = new Map([
+  [16, 3],
+  [8, 4],
+  [4, 5],
+  [0, 8],
+]);
+
+/**
+ * Rewrite one Quantization bound and discard the now-stale byte index and summary.
+ *
+ * `bandOneDepth` also rewrites the first appended SH bit depth, which is what decides the
+ * bound `sh_band1` is checked against: 3 bits expects 16, 4 expects 8, 5 expects 4 and 8
+ * expects 0. Without it a corpus variant can only exercise the one bound it was written
+ * with, and a table of spellings covering every expected value would have nowhere to run.
+ */
 function replaceQuantizationBound(
   data: Uint8Array,
   wanted: string,
   replacement: string,
+  bandOneDepth?: number,
 ): Uint8Array {
   const records = [...iterateRecords(data, MAGIC.length)];
   const quantization = records.find((entry) => entry.opcode === Opcode.Quantization)!;
@@ -205,6 +299,12 @@ function replaceQuantizationBound(
     at += valueBytes;
   }
   assert.notEqual(rewritten, null, `missing Quantization bound ${wanted}`);
+  if (bandOneDepth !== undefined) {
+    // The count byte follows the map, and band 1's depth follows the count.
+    const countAt = mapEnd + (rewritten!.length - content.length);
+    assert.ok(countAt + 1 < rewritten!.length, "the record declares no SH bit depths");
+    rewritten![countAt + 1] = bandOneDepth;
+  }
 
   const state = records
     .filter(
@@ -1862,6 +1962,34 @@ test("regression: per-band SH bounds compare as exact decimals", async (t) => {
     different.findings.some((finding) => finding.message.includes("`sh_band1` as")),
     different.findings.map((finding) => finding.message).join("\n"),
   );
+});
+
+test("regression: a bound is read by the grammar the specification writes down", async (t) => {
+  const variant = "MixedLifetimes-SHBitsLow-SHDegree2-UseChunkIndex-UseCrc";
+  if (corpus(variant) === null) return t.skip("corpus not generated");
+  const original = bytesOf(variant);
+
+  for (const [spelling, expected] of EQUIVALENT_BOUND_SPELLINGS) {
+    const report = await validateFile(
+      replaceQuantizationBound(original, "sh_band1", spelling, DEPTH_FOR_BOUND.get(expected)),
+    );
+    assert.ok(
+      report.findings.every((finding) => !finding.message.includes("`sh_band1` as")),
+      `${JSON.stringify(spelling)} should be ${expected}: ` +
+        report.findings.map((finding) => finding.message).join("\n"),
+    );
+  }
+
+  for (const [spelling, expected] of REJECTED_BOUND_SPELLINGS) {
+    const report = await validateFile(
+      replaceQuantizationBound(original, "sh_band1", spelling, DEPTH_FOR_BOUND.get(expected)),
+    );
+    assert.ok(
+      report.findings.some((finding) => finding.message.includes("`sh_band1` as")),
+      `${JSON.stringify(spelling)} should not be ${expected}: ` +
+        report.findings.map((finding) => finding.message).join("\n"),
+    );
+  }
 });
 
 test("regression: sh_degree zero ignores an appended SH bit-depth suffix", async (t) => {

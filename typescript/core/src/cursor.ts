@@ -11,7 +11,16 @@
 
 import { MalformedFile, TruncatedFile } from "./errors.js";
 
-const textDecoder = new TextDecoder("utf-8", { fatal: true });
+/**
+ * `ignoreBOM: true` is what keeps a leading U+FEFF, and the default would drop it.
+ *
+ * That default is for decoding a text *file*, where a byte-order mark is a preamble. Every
+ * string here is length-prefixed UTF-8 inside a binary record, so U+FEFF is a character the
+ * writer wrote — and dropping it made this reader return a different string from the Python,
+ * Rust and Dart readers for the same bytes. A `bounds` value, a metadata key and an
+ * `object_id` are each a place where that silently changes what the file says.
+ */
+const textDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 export class Cursor {
   readonly bytes: Uint8Array;
