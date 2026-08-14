@@ -89,7 +89,7 @@ import fourdgs
 from canonical import canonical, summarize
 from fourdgs import opcode
 from fourdgs import records as rec
-from fourdgs.indexed_reader import open_indexed, read_chunk
+from fourdgs.indexed_reader import MAX_FRONT_MATTER_BYTES, open_indexed, read_chunk
 from fourdgs.opcode import CHUNK, CHUNK_INDEX, DELTA_CHUNK, HEADER, QUANTIZATION, SH_BAND_STREAM
 from fourdgs.quantization import life_class, motion_steps, mu_steps, support_k
 from fourdgs.readable import FileReadable
@@ -691,6 +691,79 @@ def encode(command: list[str], source: str, out: str, ladder: str | None) -> Non
         raise RuntimeError(f"{' '.join(command)} failed on {os.path.basename(source)}:\n{result.stderr.strip()}")
 
 
+def _objects_profile_refusal(error: RuntimeError | None) -> str | None:
+    """A normative invalid-input diagnostic, independent of a runner's stderr wrapper.
+
+    The independent CLIs expose writer errors through ordinary language-specific shells.
+    The human diagnostic after that wrapper is the cross-SDK vocabulary. A gaussian-only
+    binding may first observe either missing promise: C++ and Swift cannot carry object_id
+    into their GaussianSet, while the other runners retain that lane and then observe the
+    missing Object Table. Both are normative refusals; a shared crash message is not.
+    """
+    if error is None:
+        return None
+    prefixes = (
+        "fourdgs.exceptions.InvalidInput: ",
+        "invalid input: ",
+        "Error: ",
+        "4dgs: ",
+    )
+    messages = {
+        "the objects profile requires an object_id stream in every non-empty chunk, but the GaussianSet carries none",
+        "the objects profile requires one ObjectTable record, but none was supplied",
+    }
+    for line in reversed(str(error).splitlines()):
+        stripped = line.strip()
+        for prefix in prefixes:
+            if prefix not in stripped:
+                continue
+            message = stripped.split(prefix, 1)[1]
+            if message in messages:
+                return message
+    return None
+
+
+def _matching_objects_profile_refusal(
+    reference_error: RuntimeError | None,
+    candidate_error: RuntimeError | None,
+    source_profile: str,
+) -> str | None:
+    """Return agreement only for an incomplete source that actually promises objects.
+
+    Both callers run the gate's fixed gaussian-only authoring preset. The diagnostic is
+    normative for that preset only when the input Header declared the ``objects`` profile;
+    two implementations producing the same false-positive error on an ordinary source are
+    still two broken encoders, not agreement.
+    """
+    if source_profile != "objects":
+        return None
+    reference = _objects_profile_refusal(reference_error)
+    candidate = _objects_profile_refusal(candidate_error)
+    return "objects profile is incomplete" if reference is not None and candidate is not None else None
+
+
+def _source_profile(path: str) -> str:
+    """Read only the first bounded Header record, not the scene it describes."""
+    with open(path, "rb") as source:
+        magic = source.read(len(MAGIC))
+        if magic != MAGIC:
+            raise AssertionError(f"{path} does not begin with the .4dgs magic")
+        framing = source.read(RECORD_HEADER_BYTES)
+        if len(framing) != RECORD_HEADER_BYTES:
+            raise AssertionError(f"{path} ends before its first record header")
+        code, length = struct.unpack("<BQ", framing)
+        if code != HEADER:
+            raise AssertionError(f"{path} begins with opcode {code:#04x}; expected Header {HEADER:#04x}")
+        if length > MAX_FRONT_MATTER_BYTES:
+            raise AssertionError(
+                f"{path} declares a {length} byte Header, past the {MAX_FRONT_MATTER_BYTES} byte ceiling"
+            )
+        content = source.read(length)
+        if len(content) != length:
+            raise AssertionError(f"{path} ends inside its {length} byte Header")
+    return rec.Header.parse(content).profile
+
+
 def flatten(summary: dict) -> dict:
     """One level of nesting into dotted keys: `statistics.chunkCount`, not `statistics`.
 
@@ -724,15 +797,28 @@ def compare(
     """Prove one variant. Returns the known divergences it tolerated; raises on the rest."""
     ref_out = os.path.join(tmp, "reference.4dgs")
     cand_out = os.path.join(tmp, "candidate.4dgs")
-    encode(reference, source, ref_out, ladder)
+    variant = os.path.basename(source).removesuffix(".4dgs")
+    reference_error = None
+    candidate_error = None
+    try:
+        encode(reference, source, ref_out, ladder)
+    except RuntimeError as exc:
+        reference_error = exc
     try:
         encode(candidate, source, cand_out, ladder)
     except RuntimeError as exc:
-        variant = os.path.basename(source).removesuffix(".4dgs")
-        note = known_refusal(variant, ladder, str(exc)) if allow_known_reference_divergences else None
-        if note is None:
-            raise
-        return [f"the candidate refused a file the reference wrote — {note}"]
+        candidate_error = exc
+
+    if (
+        reference_error is not None
+        and candidate_error is not None
+        and _matching_objects_profile_refusal(reference_error, candidate_error, _source_profile(source)) is not None
+    ):
+        return []
+    if reference_error is not None:
+        raise reference_error
+    if candidate_error is not None:
+        raise candidate_error
 
     # Fidelity first, and on the candidate's own file: a candidate that displaced the scene
     # should be told that, not told that it disagrees with an encoder that did not.
@@ -777,7 +863,6 @@ def compare(
                 for key in [k for k in summary if k in ("objects", "states") or k.startswith(("objects.", "states."))]:
                     summary.pop(key, None)
     differing = [key for key in sorted(set(ref) | set(cand)) if ref.get(key) != cand.get(key)]
-    variant = os.path.basename(source).removesuffix(".4dgs")
     notes = {
         key: known_reference_divergence(variant, ladder, key, cand.get(key), ref.get(key))
         for key in differing
@@ -1117,15 +1202,6 @@ KNOWN_REFERENCE_DIVERGENCES = {
     },
 }
 
-#: Refusals that are the divergence: one reference declines to write what the other writes.
-#: Matched on the message rather than on the fact of failing, so that a genuine crash in an
-#: encoder is still a failure and not an exemption.
-KNOWN_ENCODE_REFUSALS = {
-    ("LongLived-UseChunkIndex-UseCrc-WithObjects", None, "the objects profile requires one ObjectTable record"): (
-        "#182(3): the objects profile without an Object Table — Python refuses, Rust writes"
-    ),
-}
-
 #: The keys two different reference encoders cannot agree on by construction, and should not:
 #: each names itself in `library`, and byte offsets follow from each one's own layout.
 REFERENCE_IDENTITY_KEYS = LAYOUT_DEPENDENT_KEYS
@@ -1142,13 +1218,6 @@ def known_reference_divergence(variant: str, ladder: str | None, field: str, pyt
         return None
     python_hash, rust_hash, note = expected
     return note if (_fingerprint(python), _fingerprint(rust)) == (python_hash, rust_hash) else None
-
-
-def known_refusal(variant: str, ladder: str | None, message: str) -> str | None:
-    for (expected_variant, expected_ladder, pattern), note in KNOWN_ENCODE_REFUSALS.items():
-        if variant == expected_variant and ladder == expected_ladder and pattern in message:
-            return note
-    return None
 
 
 def _declared_shape(path: str) -> dict:
@@ -1197,6 +1266,14 @@ def reference_divergences(source: str, tmp: str, ladder: str | None) -> list[tup
         except RuntimeError as exc:
             refused[name] = str(exc).strip().splitlines()[-1]
     if refused:
+        if (
+            len(refused) == 2
+            and _matching_objects_profile_refusal(
+                RuntimeError(refused["rust"]), RuntimeError(refused["python"]), _source_profile(source)
+            )
+            is not None
+        ):
+            return []
         # One of them refused what the other wrote. That is the loudest divergence there is,
         # and there is nothing further to compare on this variant.
         return [("encode", refused.get("python", "wrote the file"), refused.get("rust", "wrote the file"))]
@@ -1232,11 +1309,7 @@ def run_references() -> int:
             for ladder in passes:
                 label = variant if ladder is None else f"{variant} @ {ladder}"
                 for field, py, rs in reference_divergences(source, tmp, ladder):
-                    note = (
-                        known_refusal(variant, ladder, str(py) + str(rs))
-                        if field == "encode"
-                        else known_reference_divergence(variant, ladder, field, py, rs)
-                    )
+                    note = None if field == "encode" else known_reference_divergence(variant, ladder, field, py, rs)
                     if note:
                         known += 1
                         print(f"KNOWN {label}\n  {field}: {note}\n{_diff({field: (py, rs)}, 'python', 'rust')}")
@@ -1604,12 +1677,44 @@ def _test_index_counts_bite(tmp: str) -> list[str]:
     return said
 
 
+def _test_objects_profile_refusal_agreement(_tmp: str) -> list[str]:
+    """Either exact normative refusal agrees; writes and ordinary crashes do not."""
+    message = "the objects profile requires one ObjectTable record, but none was supplied"
+    python = RuntimeError(f"fourdgs.exceptions.InvalidInput: {message}")
+    rust = RuntimeError(f"scene.4dgs: encoding failed: invalid input: {message}")
+    typescript = RuntimeError(f"Error: {message}\n    at encodeScene (writer.js:1:1)")
+    dart = RuntimeError(f"4dgs: {message}")
+    for left, right in itertools.combinations((python, rust, typescript, dart), 2):
+        if _matching_objects_profile_refusal(left, right, "objects") is None:
+            raise AssertionError(f"runner wrappers hid an exact shared refusal:\n{left}\n{right}")
+
+    if _matching_objects_profile_refusal(python, rust, "") is not None:
+        raise AssertionError("matching profile diagnostics on a non-objects source were treated as agreement")
+
+    missing_ids = RuntimeError(
+        "Error: the objects profile requires an object_id stream in every non-empty chunk, "
+        "but the GaussianSet carries none"
+    )
+    if _matching_objects_profile_refusal(python, missing_ids, "objects") is None:
+        raise AssertionError("the two normative objects-profile promises did not agree as refusals")
+    if _matching_objects_profile_refusal(python, None, "objects") is not None:
+        raise AssertionError("one writer refusing while the other writes was treated as agreement")
+    imprecise = RuntimeError("Error: the objects profile requires an object_id stream")
+    if _matching_objects_profile_refusal(python, imprecise, "objects") is not None:
+        raise AssertionError("an imprecise profile diagnostic was treated as normative")
+    crash = RuntimeError("Error: encoder crashed while allocating a chunk")
+    if _matching_objects_profile_refusal(crash, crash, "objects") is not None:
+        raise AssertionError("a shared crash message was treated as a normative refusal")
+    return ["all runner wrappers expose one of two exact objects-profile diagnostics"]
+
+
 def run_self_test() -> int:
     tests = (
         _test_tolerance_is_read_from_the_file,
         _test_fidelity_catches_a_changed_scene,
         _test_declared_temporal_bounds_bite,
         _test_agreement_still_catches_divergence,
+        _test_objects_profile_refusal_agreement,
         _test_index_counts_bite,
     )
     failed = 0
