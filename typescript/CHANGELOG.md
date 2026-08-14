@@ -8,6 +8,22 @@ The four packages version together.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A string on the wire keeps its leading U+FEFF.** `@4dgs/core`'s `Cursor` and the validator's two
+  string readers built their `TextDecoder` without `ignoreBOM`, whose default is to strip a leading
+  byte-order mark. That default is for reading a text file, where the mark is a preamble; every
+  string in this format is length-prefixed UTF-8 inside a binary record, where U+FEFF is a character
+  the writer wrote. So these readers returned a different string from the Python, Rust and Dart
+  readers for the same bytes — silently changing a `bounds` value, a metadata key or an `object_id`.
+
+- **A per-band SH bound is read by the grammar spec §5.3 writes down.** The comparison anchored its
+  pattern with `\s`, which in JavaScript matches U+FEFF, so a bound wrapped in whitespace — or led
+  by a byte-order mark — was accepted as the bare number. The pattern now admits nothing around the
+  number and spells its digits `[0-9]` rather than leaving `\d` to depend on a `/u` flag. Equivalent
+  spellings such as `5e-05`, `5e-5` and `0.00005` remain one bound, and `0e999999999999999999999999`
+  is still the zero it spells.
+
 ## [0.5.0] - 2026-08-12
 
 ### Added
