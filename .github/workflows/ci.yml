@@ -48,7 +48,7 @@ jobs:
             echo "conformance data: ${size_kb} KiB"
             [ "$size_kb" -le 2560 ] || { echo "::error::conformance data over budget"; exit 1; }
           fi
-      - name: Rust sources under 1856 KB
+      - name: Rust sources under 2 MB
         # Sources only: this job builds nothing, so target/ is not here to measure. A
         # vendored dependency would show up as a budget failure, which is the point —
         # everything these crates need comes from crates.io via Cargo.toml.
@@ -102,6 +102,14 @@ jobs:
         # new file costs 4 KiB whatever it contains. Trimming prose does not move this
         # number; adding or removing files does.
         #
+        # 2048 because 1856 was chosen the way every number before it was chosen — to fit
+        # the tree in front of me — and `main` crossed it four KiB later, one `du` block,
+        # on the merge after the one that set it. This is the fourth time this gate has
+        # gone red for that reason. The budget exists to catch a vendored dependency
+        # arriving in hundreds of KiB, not to fail on the next source file, so it is set
+        # with room to be wrong about the next few files rather than exactly right about
+        # today's.
+        #
         # 1856 after the canonical-state work and the bounded-validation branch: `keyframe_delta_states_json` and the
         # order-independent summary it now produces, the exact-aggregate arithmetic that
         # replaced summation order as a source of divergence, and two test files
@@ -112,7 +120,7 @@ jobs:
         run: |
           size_kb=$(du -s rust | cut -f1)
           echo "rust: ${size_kb} KiB"
-          [ "$size_kb" -le 1856 ] || { echo "::error::rust is ${size_kb} KiB, over the 1856 KiB budget"; exit 1; }
+          [ "$size_kb" -le 2048 ] || { echo "::error::rust is ${size_kb} KiB, over the 2048 KiB budget"; exit 1; }
 
       - name: TypeScript sources under 1216 KB
         # Sources only: this job installs nothing and builds nothing, so node_modules
