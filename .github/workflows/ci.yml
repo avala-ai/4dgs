@@ -12,18 +12,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Total tree size under 9 MB
+      - name: Total tree size under 9.5 MB
         # Raised from 8192 once the inspect-and-validate tools landed: #191 brought the
         # Dart validator and #188 the Swift one, and the tree they leave measures 8696 KiB.
         # The gate went red on the merge itself rather than on either pull request, because
         # each was measured against a main that did not yet have the other. 9216 is the step
         # that holds the merged tree with room, and this is the whole-tree gate — the
         # per-language sub-budgets below are still what say which language grew.
+        #
+        # Raised again to 9728 after the canonical-order round: making the composed-state
+        # summaries order-independent touched five SDKs at once, and the conformance
+        # variants that pin the property — non-finite ordering, wide units, the exact
+        # cancellation witness — are corpus expectations rather than code. The tree
+        # measured 9296 with both this gate and the Rust one already red on `main`; the
+        # tree check runs first and fails the job, so the Rust overrun was invisible until
+        # this gate was moved. Both are raised here for that reason, together.
         run: |
           size_kb=$(du -s --exclude=.git . | cut -f1)
           echo "tree: ${size_kb} KiB"
-          if [ "$size_kb" -gt 9216 ]; then
-            echo "::error::tree is ${size_kb} KiB, over the 9216 KiB budget"
+          if [ "$size_kb" -gt 9728 ]; then
+            echo "::error::tree is ${size_kb} KiB, over the 9728 KiB budget"
             exit 1
           fi
       - name: Conformance data under 2.5 MB
@@ -33,7 +41,7 @@ jobs:
             echo "conformance data: ${size_kb} KiB"
             [ "$size_kb" -le 2560 ] || { echo "::error::conformance data over budget"; exit 1; }
           fi
-      - name: Rust sources under 1392 KB
+      - name: Rust sources under 1456 KB
         # Sources only: this job builds nothing, so target/ is not here to measure. A
         # vendored dependency would show up as a budget failure, which is the point —
         # everything these crates need comes from crates.io via Cargo.toml.
@@ -70,10 +78,15 @@ jobs:
         # crate of forty small source files carries roughly 150 KiB of slack and a single
         # new file costs 4 KiB whatever it contains. Trimming prose does not move this
         # number; adding or removing files does.
+        #
+        # 1456 after the canonical-state work: `keyframe_delta_states_json` and the
+        # order-independent summary it now produces, the exact-aggregate arithmetic that
+        # replaced summation order as a source of divergence, and two test files
+        # (`tests/encode.rs`, `tests/keyframe_delta.rs`) that pin them. Measured 1412.
         run: |
           size_kb=$(du -s rust | cut -f1)
           echo "rust: ${size_kb} KiB"
-          [ "$size_kb" -le 1392 ] || { echo "::error::rust is ${size_kb} KiB, over the 1392 KiB budget"; exit 1; }
+          [ "$size_kb" -le 1456 ] || { echo "::error::rust is ${size_kb} KiB, over the 1456 KiB budget"; exit 1; }
 
       - name: TypeScript sources under 1152 KB
         # Sources only: this job installs nothing and builds nothing, so node_modules
