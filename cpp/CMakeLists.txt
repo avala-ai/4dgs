@@ -498,7 +498,9 @@ if(FOURDGS_BUILD_TOOL)
   # them work the same on Windows as on Linux.
   add_library(fourdgs-tool STATIC tools/cli.cpp tools/inspect.cpp tools/validate.cpp
                                   tools/walk.cpp)
-  target_include_directories(fourdgs-tool PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/tools)
+  target_include_directories(
+    fourdgs-tool PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/tools
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(fourdgs-tool PUBLIC fourdgs-cpp)
   target_compile_definitions(fourdgs-tool PRIVATE FOURDGS_TOOL_VERSION="${PROJECT_VERSION}")
   if(MSVC)

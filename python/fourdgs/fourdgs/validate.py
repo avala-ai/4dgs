@@ -783,17 +783,40 @@ def _check_keyframe_delta(data: bytes, walk: Walk, report: Report, header: rec.H
             return
 
     if past_ceiling is not None:
-        # A sequence past the audit's ceiling is not thereby an invalid file, and saying
-        # so would be the second-worst answer available. The worst is calling it valid, so
-        # the warning names *both* checks that stop there — the count and the refusal of
-        # reuse — rather than only the one that wanted the number. Everything before that
-        # state was audited, and a reuse among it has already been reported as an error.
-        report.warn(
-            f"{past_ceiling}. Two checks end there: the Header's gaussian_count is left "
-            "unchecked, and a gaussian_id reintroduced after that point is not refused"
-        )
-        return
-    distinct = identity_audit.distinct
+        # The fast path deliberately stops retaining identities at its declared ceiling.
+        # Validation cannot stop answering there: reuse after that point is still a fault,
+        # and Header.gaussian_count is still a required comparison. Revisit bounded
+        # partitions of the u32 identity space only for this exceptional scale. That may
+        # decode several times, but each pass has the same memory ceiling and the verdict
+        # remains exact.
+        try:
+            if indexed:
+                distinct = kdf.count_distinct_ids_partitioned(
+                    data,
+                    max_ids_per_partition=identity_audit.max_distinct_ids,
+                    index=opened.index,
+                    windows=opened.windows,
+                    on_entry=visiting,
+                    on_band=visiting_band,
+                    on_state=state_ready,
+                )
+            else:
+                distinct = kdf.count_distinct_ids_partitioned(
+                    data,
+                    max_ids_per_partition=identity_audit.max_distinct_ids,
+                    on_record=visiting_record,
+                )
+        except FourdgsError as exc:
+            site = current_site
+            if indexed:
+                site = band_site
+                if site is None and entry is not None:
+                    what = "Chunk" if entry.kind == 0 else "DeltaChunk"
+                    site = Site(entry.chunk_offset, f"the {what} record at index entry {i}")
+            report.refused("a chunk does not decode: ", exc, walk, site)
+            return
+    else:
+        distinct = identity_audit.distinct
     if distinct != header.gaussian_count:
         report.error(
             f"Header declares {header.gaussian_count} gaussians; the sequence carries {distinct} distinct gaussian ids"

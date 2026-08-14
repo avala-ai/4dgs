@@ -33,7 +33,7 @@ jobs:
             echo "conformance data: ${size_kb} KiB"
             [ "$size_kb" -le 2560 ] || { echo "::error::conformance data over budget"; exit 1; }
           fi
-      - name: Rust sources under 1360 KB
+      - name: Rust sources under 1392 KB
         # Sources only: this job builds nothing, so target/ is not here to measure. A
         # vendored dependency would show up as a budget failure, which is the point —
         # everything these crates need comes from crates.io via Cargo.toml.
@@ -53,13 +53,17 @@ jobs:
         # their expectations out of the invalid corpus are another; 1280 after the review
         # round that put a named regression test behind each of those behaviours, which is
         # most of a hostile-fixture builder and ten tests; 1360 after the indexed-open and
-        # keyframe-reference regressions made that source tree 1300 KiB. A margin smaller
-        # than one deliberate review round is not headroom, it is the next source change
-        # failing a gate about vendored dependencies.
+        # keyframe-reference regressions; 1376 after the bounded keyframe-delta validator
+        # added fixed-header resource checks, exact record attribution, cross-delta lifetime
+        # invariants, and their adversarial regressions; 1392 after its state-stream
+        # preflight, chunk-compression, identity-domain, and signed-bin regressions. A
+        # margin smaller than one deliberate review round is not headroom, it is the next
+        # source change failing a gate about
+        # vendored dependencies.
         # A budget that tight stops being a budget and starts being a tax
-        # on the next feature, so each raise leaves a little headroom. The number moves
-        # when the tree grows deliberately, which is the one thing it is not meant to
-        # catch — it exists so that a vendored dependency, which arrives in hundreds of
+        # on the next feature, so each raise leaves a little headroom. The number moves when
+        # the tree grows deliberately, which is the one thing it is not meant to catch — it
+        # exists so that a vendored dependency, which arrives in hundreds of
         # KiB, fails loudly.
         #
         # Worth knowing when it next trips: `du` rounds every file to a 4 KiB block, so a
@@ -69,7 +73,7 @@ jobs:
         run: |
           size_kb=$(du -s rust | cut -f1)
           echo "rust: ${size_kb} KiB"
-          [ "$size_kb" -le 1360 ] || { echo "::error::rust is ${size_kb} KiB, over the 1360 KiB budget"; exit 1; }
+          [ "$size_kb" -le 1392 ] || { echo "::error::rust is ${size_kb} KiB, over the 1392 KiB budget"; exit 1; }
 
       - name: TypeScript sources under 1152 KB
         # Sources only: this job installs nothing and builds nothing, so node_modules

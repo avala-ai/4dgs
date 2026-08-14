@@ -64,26 +64,30 @@ if [ ${#variants[@]} -eq 0 ]; then
   exit 1
 fi
 
+# This direct cross-decoder gate bypasses run.py, so apply the Rust layer's strict
+# capability claims explicitly to both outputs.
 agreed=0
 for source in "${variants[@]}"; do
   name="$(basename "$source" .4dgs)"
   "$encode" "$source" "$out/$name.4dgs" >"$out/$name.note"
   "$decode_rust" "$out/$name.4dgs" >"$out/$name.rust.json"
   "$python" "$decode_python" "$out/$name.4dgs" >"$out/$name.python.json"
-  "$python" - "$out/$name.rust.json" "$out/$name.python.json" "$name" <<'PY'
-import json
+  "$python" - "$out/$name.rust.json" "$out/$name.python.json" "$name" "$root" <<'PY'
+import os
 import sys
 
-rust, python, name = sys.argv[1], sys.argv[2], sys.argv[3]
+rust, python, name, root = sys.argv[1:5]
+sys.path.insert(0, os.path.join(root, "tests", "conformance"))
+from json_compare import diagnostic_differences, for_capabilities, loads
+
 with open(rust, encoding="utf-8") as fh:
-    a = json.load(fh)
+    a = for_capabilities(loads(fh.read()), exact_aggregates=True, canonical_state_order=True)
 with open(python, encoding="utf-8") as fh:
-    b = json.load(fh)
+    b = for_capabilities(loads(fh.read()), exact_aggregates=True, canonical_state_order=True)
 if a != b:
     print(f"::error::{name}: the two decoders disagree on a file the Rust encoder wrote")
-    for key in sorted(set(a) | set(b)):
-        if a.get(key) != b.get(key):
-            print(f"  {key}\n    rust:   {json.dumps(a.get(key))[:300]}\n    python: {json.dumps(b.get(key))[:300]}")
+    for line in diagnostic_differences(b, a):
+        print(f"  {line}")
     sys.exit(1)
 PY
   agreed=$((agreed + 1))
@@ -106,24 +110,24 @@ for source in "${variants[@]}"; do
   "$decode_rust" "$out/$name.sh.4dgs" >"$out/$name.sh.rust.json"
   "$python" "$decode_python" "$out/$name.sh.4dgs" >"$out/$name.sh.python.json"
   "$python" - "$out/$name.sh.rust.json" "$out/$name.sh.python.json" "$out/$name.sh.4dgs" "$name" "$root" <<'PY'
-import json
 import os
 import sys
 
 rust, python, path, name, root = sys.argv[1:6]
 # Installed is the normal case; the path is for a checkout where it is not.
 sys.path.insert(0, os.path.join(root, "python", "fourdgs"))
+sys.path.insert(0, os.path.join(root, "tests", "conformance"))
 import fourdgs
+from json_compare import diagnostic_differences, for_capabilities, loads
 
 with open(rust, encoding="utf-8") as fh:
-    a = json.load(fh)
+    a = for_capabilities(loads(fh.read()), exact_aggregates=True, canonical_state_order=True)
 with open(python, encoding="utf-8") as fh:
-    b = json.load(fh)
+    b = for_capabilities(loads(fh.read()), exact_aggregates=True, canonical_state_order=True)
 if a != b:
     print(f"::error::{name}: the two decoders disagree on a bit-depth-quantized file the Rust encoder wrote")
-    for key in sorted(set(a) | set(b)):
-        if a.get(key) != b.get(key):
-            print(f"  {key}\n    rust:   {json.dumps(a.get(key))[:300]}\n    python: {json.dumps(b.get(key))[:300]}")
+    for line in diagnostic_differences(b, a):
+        print(f"  {line}")
     sys.exit(1)
 
 quant = fourdgs.read(path).quantization
@@ -155,15 +159,19 @@ for mode in chained keyframe; do
   "$encode_kd" "$out/keyframe-delta-$mode.4dgs" "$mode" >"$out/keyframe-delta-$mode.note"
   "$decode_kd_rust" "$out/keyframe-delta-$mode.4dgs" >"$out/keyframe-delta-$mode.rust.json"
   "$python" "$decode_kd_python" "$out/keyframe-delta-$mode.4dgs" >"$out/keyframe-delta-$mode.python.json"
-  "$python" - "$out/keyframe-delta-$mode.rust.json" "$out/keyframe-delta-$mode.python.json" "$mode" <<'PY'
+  "$python" - "$out/keyframe-delta-$mode.rust.json" "$out/keyframe-delta-$mode.python.json" "$mode" "$root" <<'PY'
 import json
+import os
 import sys
 
-rust, python, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+rust, python, mode, root = sys.argv[1:5]
+sys.path.insert(0, os.path.join(root, "tests", "conformance"))
+from json_compare import for_capabilities
+
 with open(rust, encoding="utf-8") as fh:
-    a = json.load(fh)
+    a = for_capabilities(json.load(fh), exact_aggregates=False, canonical_state_order=False)
 with open(python, encoding="utf-8") as fh:
-    b = json.load(fh)
+    b = for_capabilities(json.load(fh), exact_aggregates=False, canonical_state_order=False)
 if a != b:
     print(f"::error::keyframe-delta ({mode}): the two decoders disagree on a file the Rust writer wrote")
     for key in sorted(set(a) | set(b)):

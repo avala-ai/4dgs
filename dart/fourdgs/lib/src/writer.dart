@@ -31,9 +31,15 @@ import 'package:archive/archive.dart' as archive;
 
 import 'chunk_decoder.dart' show shBandRange;
 import 'exceptions.dart';
-import 'indexed_reader.dart' show maxChunkIndexEntries;
+import 'indexed_reader.dart'
+    show
+        fourdgsHeadProbeBytes,
+        maxChunkIndexEntries,
+        maxFrontMatterBytes,
+        maxFrontMatterReads;
 import 'keyframe_delta.dart';
 import 'model.dart';
+import 'objects.dart';
 import 'opcode.dart';
 import 'quantization.dart';
 import 'records.dart';
@@ -97,6 +103,7 @@ class FourdgsWriteOptions {
     this.library = '4dgs-dart encoder',
     this.sceneProfile = '',
     this.attributes = const <String, String>{},
+    this.objects,
   });
 
   /// The quantization profile: `fine`, `default` or `coarse`. It selects the
@@ -164,6 +171,9 @@ class FourdgsWriteOptions {
 
   /// The Header's free-form attribute map.
   final Map<String, String> attributes;
+
+  /// The Object Table and optional SE(3) tracks to write.
+  final FourdgsObjectLayer? objects;
 }
 
 /// Encode [gaussians] as one in-memory `.4dgs` file.
@@ -217,17 +227,20 @@ void writeFourdgsToSink(
   // A profile is a promise about what the file contains, made so a consumer can
   // reject an unsuitable file up front rather than discovering the absence
   // mid-decode. `objects` promises an `object_id` stream in every non-empty
-  // chunk and one Object Table (registry, Profiles). This writer can emit the
-  // stream when the gaussian set supplies it, but its API has no Object Table
-  // input at all. Writing the string anyway would put a promise in the Header
-  // that the bytes below it do not keep. Refusing names the unsupported record;
-  // silently downgrading to "" would throw away what the caller asked for.
+  // chunk and exactly one Object Table (registry, Profiles).
   if (options.sceneProfile == 'objects') {
-    throw FourdgsInvalidInput(
-      'the scene profile "objects" promises one Object Table, but this writer '
-      'has no Object Table input; write the object layer first or leave the '
-      'profile empty',
-    );
+    if (gaussians.count > 0 && gaussians.objectId == null) {
+      throw FourdgsInvalidInput(
+        'the objects profile requires an object_id stream in every non-empty '
+        'chunk, but the GaussianSet carries none',
+      );
+    }
+    if (options.objects?.table == null) {
+      throw FourdgsInvalidInput(
+        'the objects profile requires one ObjectTable record, but none was '
+        'supplied',
+      );
+    }
   }
   if (options.sceneProfile == 'relightable') {
     throw FourdgsInvalidInput(
@@ -249,14 +262,46 @@ void writeFourdgsToSink(
       'three promises, so leave the scene profile empty',
     );
   }
-  if (options.sceneProfile != '' && options.sceneProfile != 'baked') {
+  if (options.sceneProfile != '' &&
+      options.sceneProfile != 'baked' &&
+      options.sceneProfile != 'objects') {
     throw FourdgsInvalidInput(
       'unknown scene profile "${options.sceneProfile}"; the registered '
       'profiles are "", baked, capture, keyframed, objects, relightable, and '
-      'this writer can emit only "" or baked',
+      'this writer can emit "", baked, or objects',
     );
   }
   _checkInput(gaussians, options.cutoff);
+  final objects = options.objects;
+  int? objectTableRecordBytes;
+  if (objects != null) {
+    try {
+      _checkHeaderRecordSize(options);
+      objects.check();
+      final table = objects.table;
+      if (table != null) {
+        objectTableRecordBytes = _checkObjectTableRecordSize(table);
+        table.check();
+      }
+      for (final track in objects.tracks) {
+        // The readers enforce this before allocating their sample arrays. Do
+        // the same before `check()` walks the caller's arrays and before the
+        // record writer reserves 64 bytes per declared sample, so this writer
+        // cannot emit a file its own SDK refuses to reopen.
+        if (track.sampleCount > maxTrajectorySamples) {
+          throw FourdgsInvalidInput(
+            'ObjectTrack for object ${track.objectId} declares '
+            '${track.sampleCount} samples, past the '
+            '$maxTrajectorySamples ceiling',
+          );
+        }
+      }
+    } on FourdgsMalformedFile catch (error) {
+      // These validators are shared with the parser, where malformed bytes are
+      // the right diagnosis. Here the same values are authoring arguments.
+      throw FourdgsInvalidInput(error.message);
+    }
+  }
 
   final n = gaussians.count;
   // These are small option-derived tables, and option errors should win before
@@ -265,7 +310,62 @@ void writeFourdgsToSink(
   final depths = _resolveShDepths(options.shBitDepths, bands);
   final grid = _Grid.forScene(gaussians, options.profile);
   final windows = _WindowTable.of(gaussians);
+  if (objects != null) {
+    _checkWindowTableRecordSize(windows.windows.length);
+  }
   final encodedAabb = _encodedAabb(gaussians, grid);
+  final headerRecord = _header(
+    gaussians,
+    durationSec,
+    options,
+    bands.isEmpty ? 0 : bands.last.band,
+    encodedAabb,
+  );
+  final quantizationRecord = _quantizationRecord(grid, depths);
+  final windowTableRecord = _windowTableRecord(windows);
+
+  if (objects != null) {
+    _checkObjectFrontMatterReads(
+      objects,
+      prefixRecordBytes: <String, int>{
+        'Header': headerRecord.length,
+        'Quantization': quantizationRecord.length,
+        'WindowTable': windowTableRecord.length,
+      },
+      tableRecordBytes: objectTableRecordBytes,
+      terminalBytes:
+          gaussians.count == 0
+              ? _footerRecord(0, 0, 0).length
+              : recordHeaderBytes,
+    );
+    try {
+      for (final track in objects.tracks) {
+        if (track.sampleCount == 0) {
+          // Section 5.15.7 reads a zero-sample track as absent, so its pose
+          // fields cannot make this write fail. Its id is not pose data: the
+          // record parser still requires a wire-representable non-background
+          // object id before treating the track as absent.
+          if (track.objectId < 0 || track.objectId > 0xFFFFFFFF) {
+            throw FourdgsInvalidInput(
+              'ObjectTrack has object_id ${track.objectId}; expected an integer '
+              'in [0, 4294967295]',
+            );
+          }
+          if (track.objectId == backgroundObject) {
+            throw const FourdgsInvalidInput(
+              'an ObjectTrack names object 0, which means background / '
+              'unassigned; a track must move an object that exists '
+              '(section 5.15.7)',
+            );
+          }
+          continue;
+        }
+        track.check();
+      }
+    } on FourdgsMalformedFile catch (error) {
+      throw FourdgsInvalidInput(error.message);
+    }
+  }
 
   // Window boundaries are the top level of the temporal partition. Anything
   // strictly inside the clip is a split point; the ends are always present.
@@ -312,17 +412,18 @@ void writeFourdgsToSink(
   // coefficients per component — and declaring 3 there would promise fifteen.
   // Bands are whole and a reader takes them whole (spec §6.5): bands 1..D give
   // exactly a degree-D scene, so D is a count of what is present.
-  out.bytes(
-    _header(
-      gaussians,
-      durationSec,
-      options,
-      bands.isEmpty ? 0 : bands.last.band,
-      encodedAabb,
-    ),
-  );
-  out.bytes(_quantizationRecord(grid, depths));
-  out.bytes(_windowTableRecord(windows));
+  out.bytes(headerRecord);
+  out.bytes(quantizationRecord);
+  out.bytes(windowTableRecord);
+  if (objects?.table != null) {
+    out.bytes(_objectTableRecord(objects!.table!));
+  }
+  if (objects != null) {
+    for (final track in objects.tracks) {
+      if (track.sampleCount == 0) continue;
+      out.bytes(_objectTrackRecord(track));
+    }
+  }
 
   final index = <_IndexEntry>[];
   for (final plan in plans) {
@@ -1981,6 +2082,230 @@ Uint8List _windowTableRecord(_WindowTable table) {
   return _record(opWindowTable, w.finish());
 }
 
+int _checkObjectTableRecordSize(FourdgsObjectTable table) {
+  // Record header, object_count, and embedding_dim. Add every variable-width
+  // field without encoding it. In particular, counting String.runes allocates
+  // no UTF-8 copy and inspecting an embedding's length does not walk it.
+  int framedBytes = recordHeaderBytes + 4 + 2;
+
+  Never tooLarge(int objectId) =>
+      throw FourdgsInvalidInput(
+        'ObjectTable record exceeds the $maxFrontMatterBytes byte indexed '
+        'front-matter ceiling while encoding object $objectId',
+      );
+
+  void add(int bytes, int objectId) {
+    if (bytes < 0 || bytes > maxFrontMatterBytes - framedBytes) {
+      tooLarge(objectId);
+    }
+    framedBytes += bytes;
+  }
+
+  int utf8Length(String value, int objectId) {
+    int bytes = 0;
+    for (final rune in value.runes) {
+      final width =
+          rune <= 0x7F
+              ? 1
+              : rune <= 0x7FF
+              ? 2
+              : rune <= 0xFFFF
+              ? 3
+              : 4;
+      if (width > maxFrontMatterBytes - framedBytes - bytes) {
+        tooLarge(objectId);
+      }
+      bytes += width;
+    }
+    return bytes;
+  }
+
+  for (final entry in table.entries) {
+    final objectId = entry.objectId;
+    add(4 + 4, objectId); // object_id and label byte count
+    add(utf8Length(entry.label, objectId), objectId);
+    add(entry.anchor.length * 4 + 1, objectId); // anchor and dynamics flag
+    final dynamics = entry.dynamics;
+    if (dynamics != null) {
+      for (final vector in dynamics) {
+        add(vector.length * 4, objectId);
+      }
+    }
+    if (table.embeddingDim > 0) {
+      add(1, objectId); // has_embedding
+      final embedding = entry.embedding;
+      if (embedding != null) add(embedding.length * 4, objectId);
+    }
+  }
+  return framedBytes;
+}
+
+void _checkHeaderRecordSize(FourdgsWriteOptions options) {
+  int framedBytes = recordHeaderBytes;
+
+  Never tooLarge(String field) =>
+      throw FourdgsInvalidInput(
+        'Header record exceeds the $maxFrontMatterBytes byte indexed '
+        'front-matter ceiling while encoding $field',
+      );
+
+  void add(int bytes, String field) {
+    if (bytes < 0 || bytes > maxFrontMatterBytes - framedBytes) {
+      tooLarge(field);
+    }
+    framedBytes += bytes;
+  }
+
+  void string(String value, String field) {
+    add(4, field); // u32 UTF-8 byte count
+    for (final rune in value.runes) {
+      final width =
+          rune <= 0x7F
+              ? 1
+              : rune <= 0x7FF
+              ? 2
+              : rune <= 0xFFFF
+              ? 3
+              : 4;
+      add(width, field);
+    }
+  }
+
+  string(options.sceneProfile, 'profile');
+  string(options.library, 'library');
+  add(8 + 8 + 8, 'fixed scene fields'); // duration, count, cutoff
+  string('gaussian-birth', 'temporal_model');
+  add(6 * 8 + 1 + 1, 'AABB, SH degree, and flags');
+  add(4, 'attributes'); // u32 byte count for the map block
+  for (final entry in options.attributes.entries) {
+    string(entry.key, 'attribute key');
+    string(entry.value, 'attribute ${entry.key}');
+  }
+}
+
+void _checkWindowTableRecordSize(int windowCount) {
+  const fixedBytes = recordHeaderBytes + 4;
+  if (windowCount < 0 ||
+      windowCount > (maxFrontMatterBytes - fixedBytes) ~/ 16) {
+    throw FourdgsInvalidInput(
+      'WindowTable record exceeds the $maxFrontMatterBytes byte indexed '
+      'front-matter ceiling while encoding $windowCount windows',
+    );
+  }
+}
+
+void _checkObjectFrontMatterReads(
+  FourdgsObjectLayer objects, {
+  required Map<String, int> prefixRecordBytes,
+  required int? tableRecordBytes,
+  required int terminalBytes,
+}) {
+  // Mirror the indexed reader's default-probe framing, without encoding or
+  // walking a track. A record that does not fit in the current probe is framed
+  // and skipped in that round; the next round begins at the following record.
+  // After the object layer, one round must remain to observe the first Chunk
+  // (or continue to the end of an empty scene).
+  int rounds = 0;
+  int remaining = fourdgsHeadProbeBytes - fourdgsMagic.length;
+
+  void frame(int framedBytes) {
+    if (framedBytes <= remaining) {
+      remaining -= framedBytes;
+      return;
+    }
+    if (remaining < recordHeaderBytes) {
+      // The scanner cannot frame this record at all. It spends the current
+      // round carrying those partial header bytes forward, then meets the same
+      // record at the start of a fresh probe. Only a visible nine-byte header
+      // permits the arithmetic skip handled below.
+      rounds++;
+      remaining = fourdgsHeadProbeBytes;
+      if (framedBytes <= remaining) {
+        remaining -= framedBytes;
+        return;
+      }
+    }
+    rounds++;
+    remaining = fourdgsHeadProbeBytes;
+  }
+
+  for (final record in prefixRecordBytes.entries) {
+    if (record.value > maxFrontMatterBytes) {
+      throw FourdgsInvalidInput(
+        '${record.key} record declares ${record.value} bytes, past the '
+        '$maxFrontMatterBytes byte indexed front-matter ceiling',
+      );
+    }
+    frame(record.value);
+  }
+  if (tableRecordBytes != null) frame(tableRecordBytes);
+  for (final track in objects.tracks) {
+    if (track.sampleCount == 0) continue;
+    // Framing + object_id + interpolation + sample_count, then one f64 time,
+    // four f64 quaternion values, and three f64 translation values per sample.
+    frame(recordHeaderBytes + 4 + 1 + 4 + track.sampleCount * 64);
+  }
+
+  final needsAnotherRoundToTerminate = remaining < terminalBytes ? 1 : 0;
+  final requiredRounds = rounds + 1 + needsAnotherRoundToTerminate;
+  if (requiredRounds > maxFrontMatterReads) {
+    throw FourdgsInvalidInput(
+      'the object layer would require $requiredRounds indexed front-matter '
+      'reads with the $fourdgsHeadProbeBytes byte default probe, past the '
+      '$maxFrontMatterReads read ceiling',
+    );
+  }
+}
+
+Uint8List _objectTableRecord(FourdgsObjectTable table) {
+  final w = _ByteWriter();
+  w.u32(table.entries.length);
+  w.u16(table.embeddingDim);
+  for (final entry in table.entries) {
+    w.u32(entry.objectId);
+    w.string(entry.label);
+    for (final value in entry.anchor) {
+      w.f32(value);
+    }
+    final dynamics = entry.dynamics;
+    w.u8(dynamics == null ? 0 : 1);
+    if (dynamics != null) {
+      for (final vector in dynamics) {
+        for (final value in vector) {
+          w.f32(value);
+        }
+      }
+    }
+    if (table.embeddingDim > 0) {
+      final embedding = entry.embedding;
+      w.u8(embedding == null ? 0 : 1);
+      if (embedding != null) {
+        for (final value in embedding) {
+          w.f32(value);
+        }
+      }
+    }
+  }
+  return _record(opObjectTable, w.finish());
+}
+
+Uint8List _objectTrackRecord(FourdgsObjectTrack track) {
+  final w = _ByteWriter();
+  w.u32(track.objectId);
+  w.u8(track.interpolation);
+  w.u32(track.sampleCount);
+  for (int i = 0; i < track.sampleCount; i++) {
+    w.f64(track.times[i]);
+    for (final value in track.rotations[i]) {
+      w.f64(value);
+    }
+    for (final value in track.translations[i]) {
+      w.f64(value);
+    }
+  }
+  return _record(opObjectTrack, w.finish());
+}
+
 Uint8List _chunkRecord(
   double t0,
   double t1,
@@ -2455,6 +2780,12 @@ class _ByteWriter {
     _ensure(8);
     _view.setFloat64(_length, v, Endian.little);
     _length += 8;
+  }
+
+  void f32(double v) {
+    _ensure(4);
+    _view.setFloat32(_length, v, Endian.little);
+    _length += 4;
   }
 
   void bytes(Uint8List b) {

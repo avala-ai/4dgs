@@ -1,36 +1,9 @@
 // Copyright 2026 Avala AI
 // SPDX-License-Identifier: Apache-2.0
 
-//! Structural validation.
-//!
-//! This is what makes a third-party encoder possible: a way to find out *why* a file is
-//! wrong that does not involve reading someone else's decoder. Every finding names the
-//! record, the field and what was expected.
-//!
-//! The checks, their severities and their wording are `python/fourdgs/fourdgs/validate.py`'s.
-//! Two validators that disagree about whether a file conforms are worse than one, so where
-//! the two differ the Python module is the reference and this is the bug.
-//!
-//! Four things this validator does that the Python one does not yet, each recorded here
-//! because a divergence nobody wrote down is indistinguishable from a bug:
-//!
-//! * **It prints the refusal identifier and the byte.** The finding lines themselves are
-//!   unchanged and still match Python's word for word; the identifier goes on a line of
-//!   its own beneath the finding it belongs to. Python's exceptions carry the same `code`
-//!   — its CLI simply does not print it.
-//! * **It decodes the chunks.** A framing walk steps over a chunk by its declared length,
-//!   so a fault inside a chunk's streams is invisible to it; two of the invalid corpus's
-//!   seven files are exactly that, and both validators called them clean.
-//! * **It knows `keyframe-delta`.** Both validators used to report a conforming
-//!   keyframe-delta file as invalid, because every structural check assumed the
-//!   gaussian-birth chunk shape. The Rust core implements the model, so its validator now
-//!   validates against the model the file declares.
-//! * **Its reserved-provenance note names the range that is actually reserved.** Both
-//!   tools said `0x24-0x2F, section 5.15.6`, which was true until the object layer was
-//!   assigned `0x24` and `0x25` out of that range. The note fires on the same opcodes in
-//!   both — `0x26`-`0x2F`, the ones neither handles by name — so the two agree about every
-//!   file; only the citation differed from what §5.15 says today. See the arm that emits
-//!   it.
+//! Structural validation aligned with the Python reference's checks, order, and wording.
+//! Rust additionally decodes payloads, supports `keyframe-delta`, prints refusal IDs and
+//! bytes, and cites the currently reserved provenance range.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
@@ -39,7 +12,7 @@ use std::path::PathBuf;
 
 use fourdgs::quantization::{sh_bound, sh_step};
 use fourdgs::serialization::{crc32, Records, MAGIC, RECORD_HEADER_SIZE};
-use fourdgs::{opcode as op, records as rec, BytesReadable, Readable, Result};
+use fourdgs::{opcode as op, records as rec, BytesReadable, Result};
 
 use crate::args::Args;
 use crate::refusal::{self, Framing, Named};
@@ -53,8 +26,16 @@ use crate::{EXIT_FAILED, EXIT_OK, EXIT_TOOL, EXIT_WARNINGS};
 /// identities; only disk does, at this CLI I/O edge. This is the numeric-range strategy
 /// described by the bounded full-file validation rule.
 struct IdentityCounter {
-    directory: PathBuf,
+    directory: ScratchDirectory,
     writers: Option<Vec<BufWriter<File>>>,
+}
+
+struct ScratchDirectory(PathBuf);
+
+impl Drop for ScratchDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 impl IdentityCounter {
@@ -62,6 +43,13 @@ impl IdentityCounter {
     const LOW_BITS: usize = 28;
 
     fn new() -> std::io::Result<Self> {
+        Self::new_with(|path| OpenOptions::new().create_new(true).write(true).open(path))
+    }
+
+    fn new_with<F>(mut open: F) -> std::io::Result<Self>
+    where
+        F: FnMut(&std::path::Path) -> std::io::Result<File>,
+    {
         let base = std::env::temp_dir();
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -82,18 +70,15 @@ impl IdentityCounter {
                 Err(error) => return Err(error),
             }
         }
-        let directory = directory.ok_or_else(|| {
+        let directory = ScratchDirectory(directory.ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 "could not reserve a temporary identity-count directory",
             )
-        })?;
+        })?);
         let mut writers = Vec::with_capacity(Self::BUCKETS);
         for bucket in 0..Self::BUCKETS {
-            let file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(directory.join(format!("{bucket:02x}")))?;
+            let file = open(&directory.0.join(format!("{bucket:02x}")))?;
             writers.push(BufWriter::new(file));
         }
         Ok(Self {
@@ -102,16 +87,11 @@ impl IdentityCounter {
         })
     }
 
-    fn add(&mut self, ids: &[i64]) -> Result<()> {
-        for &id in ids {
-            let id = u32::try_from(id).map_err(|_| {
-                fourdgs::Error::Malformed(format!(
-                    "gaussian_id {id} is outside the u32 range defined by section 11.2"
-                ))
-            })?;
-            let bucket = (id >> Self::LOW_BITS) as usize;
-            self.writers.as_mut().expect("counter is open")[bucket].write_all(&id.to_le_bytes())?;
-        }
+    fn add_one(&mut self, record_offset: u64, id: u32) -> Result<()> {
+        let bucket = (id >> Self::LOW_BITS) as usize;
+        let writer = &mut self.writers.as_mut().expect("counter is open")[bucket];
+        writer.write_all(&id.to_le_bytes())?;
+        writer.write_all(&record_offset.to_le_bytes())?;
         Ok(())
     }
 
@@ -126,17 +106,20 @@ impl IdentityCounter {
         for bucket in 0..Self::BUCKETS {
             let mut bits = vec![0u64; words];
             let mut reader =
-                BufReader::new(File::open(self.directory.join(format!("{bucket:02x}")))?);
+                BufReader::new(File::open(self.directory.0.join(format!("{bucket:02x}")))?);
             loop {
-                let mut raw = [0u8; 4];
+                let mut raw = [0u8; 12];
                 match reader.read_exact(&mut raw) {
                     Ok(()) => {
-                        let id = u32::from_le_bytes(raw);
+                        let id = u32::from_le_bytes(raw[..4].try_into().expect("identity word"));
+                        let record_offset = u64::from_le_bytes(
+                            raw[4..].try_into().expect("identity record offset"),
+                        );
                         let low = (id & ((1u32 << Self::LOW_BITS) - 1)) as usize;
                         let mask = 1u64 << (low & 63);
                         if bits[low >> 6] & mask != 0 {
                             return Err(fourdgs::Error::Malformed(format!(
-                                "gaussian_id {id} is introduced more than once; an identity may not be reused after death"
+                                "gaussian_id {id} is introduced more than once; the reuse at byte {record_offset} is not allowed after death"
                             )));
                         }
                         bits[low >> 6] |= mask;
@@ -154,24 +137,9 @@ impl IdentityCounter {
     }
 }
 
-fn keyframe_introductions(
-    current: Option<&fourdgs::keyframe_delta::State>,
-    next: &fourdgs::keyframe_delta::State,
-) -> Vec<i64> {
-    let Some(current) = current else {
-        return next.ids.clone();
-    };
-    let live: BTreeSet<i64> = current.ids.iter().copied().collect();
-    next.ids
-        .iter()
-        .copied()
-        .filter(|id| !live.contains(id))
-        .collect()
-}
-
 impl Drop for IdentityCounter {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.directory);
+        self.writers.take();
     }
 }
 
@@ -464,22 +432,8 @@ fn validate_checked(data: &[u8]) -> Result<Report> {
                 "private record 0x{opcode:02X} ({} bytes) — skipped, as required",
                 record.content.len()
             )),
-            // The reserved tail of the provenance family, which is a different thing from
-            // an unknown record: the range is spoken for, so a reader that meets one knows
-            // it is looking at a record from a later revision rather than at a byte it
-            // cannot account for.
-            //
-            // The range and the section are the ones spec §5.15 names today: `0x24` and
-            // `0x25` are the Object Table and the Object Track, defined in §5.15.6 and
-            // §5.15.7, and what is reserved is `0x26`-`0x2F` in §5.15.8. Both validators
-            // still said `0x24-0x2F, section 5.15.6`, which was true before the object
-            // layer was assigned out of that range and points a reader at two records
-            // that exist. This is the one place the wording deliberately leads Python's:
-            // the note fires on exactly the same opcodes in both tools — Python handles
-            // `0x20`-`0x25` by name and falls through only for `0x26`-`0x2F`, as this
-            // does — so the two agree about every file and disagree only about a citation
-            // that had gone stale. The Python-side correction belongs with #125's
-            // validator work.
+            // Object Table/Track own 0x24/0x25; only 0x26-0x2F remains reserved by §5.15.8.
+            // Keep this note distinct from wholly unknown opcodes.
             opcode if op::is_provenance(opcode) && !is_specified(opcode) => report.note(format!(
                 "reserved provenance record 0x{opcode:02X} — skipped, as required \
                  (0x26-0x2F, section 5.15.8)"
@@ -715,574 +669,48 @@ fn check_gaussian_birth(data: &[u8], framing: Framing, report: &mut Report) {
     }
 }
 
-fn decode_indexed_delta<R: Readable + ?Sized>(
-    source: &mut R,
-    entry: &rec::ChunkIndexEntry,
-    ordinal: usize,
-    current: Option<&(u64, u16, u32, fourdgs::keyframe_delta::State)>,
-    keyframe: Option<&(u64, u32, fourdgs::keyframe_delta::State)>,
-    windows: &[(f64, f64)],
-    identities: &mut IdentityCounter,
-) -> Result<(fourdgs::keyframe_delta::State, u32, u32)> {
-    if entry.reference_offset >= entry.chunk_offset {
-        return Err(fourdgs::Error::Malformed(format!(
-            "delta index entry {ordinal} at {} references {}; a Delta Chunk must reference a physically earlier record",
-            entry.chunk_offset, entry.reference_offset
-        )));
-    }
-    let (reference_offset, reference_depth, reference_level, reference) = match entry.delta_mode {
-        rec::DELTA_MODE_KEYFRAME => match keyframe {
-            Some((offset, level, state)) if entry.reference_offset == *offset => {
-                (*offset, 0, *level, state)
-            }
-            Some((offset, _, _)) => {
-                return Err(fourdgs::Error::Malformed(format!(
-                    "delta index entry {ordinal} uses keyframe mode but references {}; its GOP keyframe is at {offset}",
-                    entry.reference_offset
-                )))
-            }
-            None => {
-                return Err(fourdgs::Error::Malformed(
-                    "a delta appears before its GOP keyframe".into(),
-                ))
-            }
-        },
-        rec::DELTA_MODE_CHAINED => match current {
-            Some((offset, depth, level, state)) if entry.reference_offset == *offset => {
-                (*offset, *depth, *level, state)
-            }
-            Some((offset, _, _, _)) => {
-                return Err(fourdgs::Error::Malformed(format!(
-                    "delta index entry {ordinal} uses chained mode but references {}; the immediately preceding state is at {offset}",
-                    entry.reference_offset
-                )))
-            }
-            None => {
-                return Err(fourdgs::Error::Malformed(
-                    "a delta appears before any preceding state".into(),
-                ))
-            }
-        },
-        mode => {
-            return Err(fourdgs::Error::Malformed(format!(
-                "delta index entry {ordinal} declares delta_mode {mode}; only 0 (keyframe) and 1 (chained) are defined"
-            )))
-        }
-    };
-    let expected_depth = reference_depth.checked_add(1).ok_or_else(|| {
-        fourdgs::Error::Malformed(format!(
-            "the chain depth before delta index entry {ordinal} overflows u16"
-        ))
-    })?;
-    if entry.depth != expected_depth {
-        return Err(fourdgs::Error::Malformed(format!(
-            "delta index entry {ordinal} declares depth {}; its selected reference at {reference_offset} gives depth {expected_depth}",
-            entry.depth
-        )));
-    }
-    let (state, head, _births) =
-        fourdgs::keyframe_delta_file::read_delta_entry(source, entry, reference, windows)?;
-    if head.level != reference_level {
-        return Err(fourdgs::Error::Malformed(format!(
-            "delta index entry {ordinal} declares level {}; its reference at {reference_offset} declares level {reference_level}",
-            head.level
-        )));
-    }
-    let expected_keyframe = keyframe.map(|(offset, _, _)| *offset).unwrap_or(0);
-    let working = head
-        .update_count
-        .checked_add(head.birth_count)
-        .and_then(|n| n.checked_add(head.death_count));
-    if !entry.extended
-        || head.t0 != entry.t0
-        || head.t1 != entry.t1
-        || head.delta_mode != entry.delta_mode
-        || head.reference_offset != entry.reference_offset
-        || head.keyframe_offset != entry.keyframe_offset
-        || head.depth != entry.depth
-        || head.keyframe_offset != expected_keyframe
-        || working != Some(entry.gaussian_count)
-    {
-        return Err(fourdgs::Error::Malformed(format!(
-            "delta index entry {ordinal} disagrees with its Delta Chunk header on its interval, mode, reference, keyframe, depth, or group count"
-        )));
-    }
-    if entry.live_count != state.count() as u64 {
-        return Err(fourdgs::Error::Malformed(format!(
-            "delta index entry {ordinal} declares {} live gaussians; composition reconstructs {}",
-            entry.live_count,
-            state.count()
-        )));
-    }
-    let introductions = keyframe_introductions(current.map(|(_, _, _, state)| state), &state);
-    identities.add(&introductions)?;
-    Ok((state, head.birth_count, head.level))
-}
-
-/// The same, for the temporal model whose chunks are keyframes and differences.
-///
-/// This is the same statement as the branch above — open the file the way a client would,
-/// then decode what it carries — expressed in the reader the file's declared model actually
-/// needs. The alternative, which is what both validators did until now, is to run the
-/// gaussian-birth reader over it and report its refusal as a fault in the file.
-///
-/// Timeline order, for the two reasons the branch above is: a composed state is a whole
-/// population and holding one per index entry costs many times the file, and an entry that
-/// refuses is an entry whose **offset** the report can name. The walk retains only its
-/// current state and GOP keyframe, so every record is decoded once even in a long chained
-/// GOP; `decode_indexed` remains the API for a caller that actually wants all states.
-/// `unindexed` is the file with no chunk index at all, which is a legal `keyframe-delta`
-/// file read front to back. `open_indexed` starts its index walk at `Footer.summary_start`,
-/// so on such a file it walked from byte 0, read the file magic as record framing and
-/// returned an error — and every stream-only keyframe-delta file was reported invalid for a
-/// fault that belonged to the tool. The gaussian-birth branch has always had the other path;
-/// this one now has it too.
 fn check_keyframe_delta(
     data: &[u8],
     framing: Framing,
     unindexed: bool,
     report: &mut Report,
 ) -> Result<()> {
-    if unindexed {
-        return check_keyframe_delta_streamed(data, framing, report);
-    }
-    let mut source = BytesReadable::new(data);
-    let sequence = match fourdgs::keyframe_delta_file::open_indexed(&mut source) {
-        Ok(sequence) => sequence,
-        Err(error) => {
+    let mode = if unindexed {
+        fourdgs::keyframe_delta_validate::ValidationMode::Streamed
+    } else {
+        fourdgs::keyframe_delta_validate::ValidationMode::Indexed
+    };
+    let mut identities = IdentityCounter::new()?;
+    let result = fourdgs::keyframe_delta_validate::validate(
+        &mut BytesReadable::new(data),
+        mode,
+        |record_offset, id| identities.add_one(record_offset, id),
+    );
+    let summary = match result {
+        Ok(summary) => summary,
+        Err(failure) if matches!(failure.error, fourdgs::Error::Io(_)) => return Err(failure.error),
+        Err(failure) => {
+            let site = failure.offset.map(|offset| refusal::Site {
+                offset,
+                what: "the keyframe-delta record".into(),
+            });
             report.refused(
-                "a seeking reader cannot open this file: ",
-                &error,
+                "a keyframe-delta payload does not decode: ",
+                &failure.error,
                 Some(framing),
-                None,
+                site,
             );
             return Ok(());
         }
     };
-    let mut ordered: Vec<(usize, &rec::ChunkIndexEntry)> =
-        sequence.index.iter().enumerate().collect();
-    ordered.sort_by(|(_, a), (_, b)| a.t0.partial_cmp(&b.t0).unwrap_or(std::cmp::Ordering::Equal));
-    let mut current: Option<(u64, u16, u32, fourdgs::keyframe_delta::State)> = None;
-    let mut keyframe: Option<(u64, u32, fourdgs::keyframe_delta::State)> = None;
-    let mut identities = IdentityCounter::new()?;
-
-    for (i, entry) in ordered {
-        let what = if entry.kind == 0 {
-            "Chunk"
-        } else {
-            "DeltaChunk"
-        };
-        let outcome = if entry.kind == 0 {
-            fourdgs::keyframe_delta_file::read_keyframe_entry(
-                &mut source,
-                entry,
-                &sequence.quantization,
-                &sequence.windows,
-            )
-            .and_then(|(state, head)| {
-                if !entry.extended
-                    || head.t0 != entry.t0
-                    || head.t1 != entry.t1
-                    || head.count != entry.gaussian_count
-                    || entry.keyframe_offset != entry.chunk_offset
-                    || entry.depth != 0
-                    || entry.delta_mode != 0
-                    || entry.reference_offset != 0
-                {
-                    return Err(fourdgs::Error::Malformed(format!(
-                        "keyframe index entry {i} disagrees with its Chunk: index interval [{}, {}), count {}, keyframe offset {}, depth {}, delta mode {}, reference {}; record interval [{}, {}), count {}",
-                        entry.t0,
-                        entry.t1,
-                        entry.gaussian_count,
-                        entry.keyframe_offset,
-                        entry.depth,
-                        entry.delta_mode,
-                        entry.reference_offset,
-                        head.t0,
-                        head.t1,
-                        head.count
-                    )));
-                }
-                if entry.live_count != state.count() as u64 {
-                    return Err(fourdgs::Error::Malformed(format!(
-                        "keyframe index entry {i} declares {} live gaussians; its Chunk reconstructs {}",
-                        entry.live_count,
-                        state.count()
-                    )));
-                }
-                let introductions = keyframe_introductions(
-                    current.as_ref().map(|(_, _, _, state)| state),
-                    &state,
-                );
-                identities.add(&introductions)?;
-                keyframe = Some((entry.chunk_offset, head.level, state.clone()));
-                current = Some((entry.chunk_offset, 0, head.level, state));
-                Ok(head.count)
-            })
-        } else if entry.kind == 1 {
-            decode_indexed_delta(
-                &mut source,
-                entry,
-                i,
-                current.as_ref(),
-                keyframe.as_ref(),
-                &sequence.windows,
-                &mut identities,
-            )
-            .map(|(state, birth_count, level)| {
-                current = Some((entry.chunk_offset, entry.depth, level, state));
-                birth_count
-            })
-        } else {
-            Err(fourdgs::Error::Malformed(format!(
-                "keyframe-delta index entry {i} declares chunk kind {}; only 0 (Chunk) and 1 (Delta Chunk) are defined",
-                entry.kind
-            )))
-        };
-        let band_count = match outcome {
-            Ok(count) => count,
-            Err(error) => {
-                if matches!(error, fourdgs::Error::Io(_)) {
-                    return Err(error);
-                }
-                report.refused(
-                    "a chunk does not decode: ",
-                    &error,
-                    Some(framing),
-                    Some(refusal::Site {
-                        offset: entry.chunk_offset,
-                        what: format!("the {what} record at index entry {i}"),
-                    }),
-                );
-                // One chain's failure is every later chain's failure — they share links — so
-                // the first is the finding and the rest would be the same fault restated.
-                return Ok(());
-            }
-        };
-        if band_count != 0 && sequence.header.sh_degree != 0 {
-            let expected: Vec<u8> = (1..=sequence.header.sh_degree).collect();
-            let mut actual: Vec<u8> = entry.bands.iter().map(|(band, _, _)| *band).collect();
-            actual.sort_unstable();
-            if actual != expected {
-                let error = fourdgs::Error::Malformed(format!(
-                    "the {what} at index entry {i} has SH bands {actual:?}; its Header degree {} requires exactly {expected:?}",
-                    sequence.header.sh_degree
-                ));
-                report.refused(
-                    "a chunk does not decode: ",
-                    &error,
-                    Some(framing),
-                    Some(refusal::Site {
-                        offset: entry.chunk_offset,
-                        what: format!("the {what} record at index entry {i}"),
-                    }),
-                );
-                return Ok(());
-            }
-        }
-        // Composing a chain reads Chunk and Delta Chunk records and nothing else, so an SH
-        // Band Stream this entry names is a record the verdict never visited. A band is a
-        // stream like any other: a codec this build does not implement in one of them is a
-        // file that does not decode, and it was reported `valid`. The gaussian-birth path
-        // decodes every band the index declares; this is the same rule on this model.
-        for range in &entry.bands {
-            let (band, at, length) = *range;
-            if let Err(error) =
-                refusal::decode_band_record(data, at, length, band, band_count as usize)
-            {
-                report.refused(
-                    "a chunk does not decode: ",
-                    &error,
-                    Some(framing),
-                    Some(refusal::Site {
-                        offset: at,
-                        what: format!(
-                            "the SH Band Stream for band {band} of the {what} at index entry {i}"
-                        ),
-                    }),
-                );
-                return Ok(());
-            }
-        }
-    }
-
     match identities.finish() {
-        Ok(count) if count != sequence.header.gaussian_count => report.error(format!(
+        Ok(count) if count != summary.declared_gaussian_count => report.error(format!(
             "Header declares {} distinct gaussians; keyframes and birth groups introduce {count}",
-            sequence.header.gaussian_count
+            summary.declared_gaussian_count
         )),
         Err(error) if matches!(error, fourdgs::Error::Io(_)) => return Err(error),
         Err(error) => report.error(format!("the file's identities are invalid: {error}")),
         _ => {}
-    }
-    Ok(())
-}
-
-/// The same verdict for a `keyframe-delta` file with no index, which has to be read front to
-/// back.
-///
-/// Record by record, retaining only the current state and its GOP keyframe. That is enough
-/// for both delta modes, makes every semantic composition refusal observable, and stays
-/// bounded independently of sequence length.
-fn check_keyframe_delta_streamed(data: &[u8], framing: Framing, report: &mut Report) -> Result<()> {
-    let mut windows: Vec<(f64, f64)> = Vec::new();
-    let mut header: Option<rec::Header> = None;
-    let mut quantization: Option<rec::Quantization> = None;
-    let mut current: Option<(u64, u16, u32, fourdgs::keyframe_delta::State)> = None;
-    let mut keyframe: Option<(u64, u32, fourdgs::keyframe_delta::State)> = None;
-    let mut previous_t1: Option<f64> = None;
-    let mut band_count: Option<usize> = None;
-    let mut identities = IdentityCounter::new()?;
-
-    for record in Records::new(data, MAGIC.len()) {
-        let record = match record {
-            Ok(record) => record,
-            // The structural pass already reports a cut or malformed framing.  Stop at
-            // the same byte without retaining the frames that led here.
-            Err(_) => break,
-        };
-        let frame = refusal::Frame {
-            opcode: record.opcode,
-            offset: record.offset as u64,
-            length: record.content.len() as u64,
-        };
-        let content = record.content;
-        let outcome: Result<()> = match frame.opcode {
-            op::HEADER => rec::Header::parse(content).and_then(|parsed| {
-                if parsed.temporal_model != "keyframe-delta" {
-                    return Err(fourdgs::Error::refused(
-                        fourdgs::error::refusal::UNKNOWN_TEMPORAL_MODEL,
-                        fourdgs::error::RefusalKind::UnsupportedModel,
-                        format!(
-                            "the Header declares temporal model '{}', which this reader does not implement (it implements keyframe-delta)",
-                            parsed.temporal_model
-                        ),
-                    ));
-                }
-                if current.is_none() {
-                    header = Some(parsed);
-                }
-                Ok(())
-            }),
-            op::QUANTIZATION => rec::Quantization::parse(content).and_then(|parsed| {
-                fourdgs::registry::check_quantization_scheme(&parsed.scheme)?;
-                if current.is_none() {
-                    quantization = Some(parsed);
-                }
-                Ok(())
-            }),
-            op::WINDOW_TABLE => rec::WindowTable::parse(content).map(|table| {
-                if current.is_none() {
-                    windows = table.windows;
-                }
-            }),
-            op::CHUNK => fourdgs::keyframe_delta_file::decode_keyframe_chunk(content, &windows)
-                .and_then(|(state, head)| {
-                    let quantization = quantization.as_ref().ok_or_else(|| {
-                        fourdgs::Error::Malformed(
-                            "a keyframe Chunk appears before Quantization".into(),
-                        )
-                    })?;
-                    fourdgs::keyframe_delta_file::check_keyframe_mu_t(
-                        &state,
-                        head.t0,
-                        quantization,
-                    )?;
-                    if previous_t1.is_none() && head.t0 != 0.0 {
-                        return Err(fourdgs::Error::Malformed(format!(
-                            "the state chunks start at {}; they tile the timeline from 0 (section 11.1)",
-                            head.t0
-                        )));
-                    }
-                    if let Some(previous) = previous_t1 {
-                        if previous != head.t0 {
-                            return Err(fourdgs::Error::Malformed(format!(
-                                "state chunks do not tile: the previous state ends at {previous} and this keyframe starts at {}",
-                                head.t0
-                            )));
-                        }
-                    }
-                    let introductions = keyframe_introductions(
-                        current.as_ref().map(|(_, _, _, state)| state),
-                        &state,
-                    );
-                    identities.add(&introductions)?;
-                    previous_t1 = Some(head.t1);
-                    band_count = Some(head.count as usize);
-                    keyframe = Some((frame.offset, head.level, state.clone()));
-                    current = Some((frame.offset, 0, head.level, state));
-                    Ok(())
-                }),
-            op::DELTA_CHUNK => rec::parse_delta_chunk_records(content).and_then(|(declared, _)| {
-                if declared.t1 < declared.t0 {
-                    return Err(fourdgs::Error::Malformed(format!(
-                        "Delta Chunk at {} has t1 ({}) before t0 ({})",
-                        frame.offset, declared.t1, declared.t0
-                    )));
-                }
-                if declared.reference_offset >= frame.offset {
-                    return Err(fourdgs::Error::Malformed(format!(
-                        "Delta Chunk at {} references {}; a Delta Chunk must reference a physically earlier record",
-                        frame.offset, declared.reference_offset
-                    )));
-                }
-                if let Some(previous) = previous_t1 {
-                    if previous != declared.t0 {
-                        return Err(fourdgs::Error::Malformed(format!(
-                            "state chunks do not tile: the previous state ends at {previous} and this delta starts at {}",
-                            declared.t0
-                        )));
-                    }
-                } else {
-                    return Err(fourdgs::Error::Malformed(
-                        "a streamed keyframe-delta sequence begins with a Delta Chunk".into(),
-                    ));
-                }
-                let (reference_depth, reference_level, reference) = match declared.delta_mode {
-                    rec::DELTA_MODE_KEYFRAME => match &keyframe {
-                        Some((offset, level, state)) if declared.reference_offset == *offset => {
-                            (0, *level, state)
-                        }
-                        Some((offset, _, _)) => {
-                            return Err(fourdgs::Error::Malformed(format!(
-                                "a keyframe-mode delta at {} references {}; its GOP keyframe is at {offset}",
-                                frame.offset, declared.reference_offset
-                            )))
-                        }
-                        None => {
-                            return Err(fourdgs::Error::Malformed(
-                                "a delta appears before its GOP keyframe".into(),
-                            ))
-                        }
-                    },
-                    rec::DELTA_MODE_CHAINED => match &current {
-                        Some((offset, depth, level, state))
-                            if declared.reference_offset == *offset =>
-                        {
-                            (*depth, *level, state)
-                        }
-                        Some((offset, _, _, _)) => {
-                            return Err(fourdgs::Error::Malformed(format!(
-                                "a chained delta at {} references {}; the immediately preceding state is at {offset}",
-                                frame.offset, declared.reference_offset
-                            )))
-                        }
-                        None => {
-                            return Err(fourdgs::Error::Malformed(
-                                "a delta appears before any preceding state".into(),
-                            ))
-                        }
-                    },
-                    mode => {
-                        return Err(fourdgs::Error::Malformed(format!(
-                            "Delta Chunk at {} declares delta_mode {mode}; only 0 and 1 are defined",
-                            frame.offset
-                        )))
-                    }
-                };
-                let expected_depth = reference_depth.checked_add(1).ok_or_else(|| {
-                    fourdgs::Error::Malformed("delta chain depth overflows u16".into())
-                })?;
-                let keyframe_offset = keyframe
-                    .as_ref()
-                    .map(|(offset, _, _)| *offset)
-                    .unwrap_or(0);
-                if declared.depth != expected_depth
-                    || declared.keyframe_offset != keyframe_offset
-                    || declared.level != reference_level
-                {
-                    return Err(fourdgs::Error::Malformed(format!(
-                        "Delta Chunk at {} declares depth {}, keyframe {}, and level {}; its reference requires depth {expected_depth}, keyframe {keyframe_offset}, and level {reference_level}",
-                        frame.offset, declared.depth, declared.keyframe_offset, declared.level
-                    )));
-                }
-                fourdgs::keyframe_delta_file::compose_delta_chunk(reference, content, &windows)
-                    .and_then(|(state, head, _births)| {
-                        let introductions = keyframe_introductions(
-                            current.as_ref().map(|(_, _, _, state)| state),
-                            &state,
-                        );
-                        identities.add(&introductions)?;
-                        previous_t1 = Some(head.t1);
-                        band_count = Some(head.birth_count as usize);
-                        current = Some((frame.offset, head.depth, head.level, state));
-                        Ok(())
-                    })
-            }),
-            op::SH_BAND_STREAM => (|| -> Result<()> {
-                let count = band_count.ok_or_else(|| {
-                    fourdgs::Error::Malformed(format!(
-                        "an SH Band Stream at {} appears before a state chunk",
-                        frame.offset
-                    ))
-                })?;
-                let mut cursor = fourdgs::serialization::Cursor::new(content);
-                let band = cursor.u8()?;
-                if !(1..=3).contains(&band) {
-                    return Err(fourdgs::Error::Malformed(format!(
-                        "the SH Band Stream at {} declares band {band}; only bands 1 through 3 are defined",
-                        frame.offset
-                    )));
-                }
-                let (_, stream) = fourdgs::stream::decode_stream(&mut cursor, Some(count))?;
-                let expected_channels = 3 * (2 * band as usize + 1);
-                if stream.channels != expected_channels {
-                    return Err(fourdgs::Error::Malformed(format!(
-                        "the SH Band Stream at {} for band {band} declares {} channels; band {band} requires {expected_channels}",
-                        frame.offset, stream.channels
-                    )));
-                }
-                Ok(())
-            })(),
-            _ => continue,
-        };
-        if let Err(error) = outcome {
-            if matches!(error, fourdgs::Error::Io(_)) {
-                return Err(error);
-            }
-            let prefix = if matches!(frame.opcode, op::HEADER | op::QUANTIZATION) {
-                "a seeking reader cannot open this file: "
-            } else {
-                "a chunk does not decode: "
-            };
-            report.refused(
-                prefix,
-                &error,
-                Some(framing),
-                Some(refusal::Site {
-                    offset: frame.offset,
-                    what: format!("the {} record", op::name(frame.opcode)),
-                }),
-            );
-            return Ok(());
-        }
-    }
-
-    if let Some(header) = &header {
-        match previous_t1 {
-            Some(end) if end != header.duration_sec => {
-                report.error(format!(
-                    "the state chunks end at {end}; the Header declares a duration of {}, and they tile the whole of it (section 11.1)",
-                    header.duration_sec
-                ));
-            }
-            None if header.duration_sec > 0.0 => {
-                report.error(format!(
-                    "the file has no state chunks; the Header declares a positive duration of {}, which state chunks must tile from 0 (section 11.1)",
-                    header.duration_sec
-                ));
-            }
-            _ => {}
-        }
-        match identities.finish() {
-            Ok(count) if count != header.gaussian_count => report.error(format!(
-                "Header declares {} distinct gaussians; keyframes and birth groups introduce {count}",
-                header.gaussian_count
-            )),
-            Err(error) if matches!(error, fourdgs::Error::Io(_)) => return Err(error),
-            Err(error) => report.error(format!("the file's identities are invalid: {error}")),
-            _ => {}
-        }
     }
     Ok(())
 }
@@ -1538,6 +966,22 @@ fn minimal() -> Vec<u8> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn identity_setup_failure_removes_partial_scratch_directory() {
+        let mut opened = 0;
+        let mut directory = None;
+        let result = IdentityCounter::new_with(|path| {
+            opened += 1;
+            directory.get_or_insert_with(|| path.parent().unwrap().to_owned());
+            if opened == 2 {
+                return Err(std::io::Error::other("injected partition failure"));
+            }
+            OpenOptions::new().create_new(true).write(true).open(path)
+        });
+        assert!(result.is_err());
+        assert!(!directory.unwrap().exists());
+    }
+
     /// A well-formed Quantization record, with any field replaceable — the Rust half of
     /// the Python suite's `grids()`, field for field.
     fn grids() -> rec::Quantization {
@@ -1613,26 +1057,10 @@ mod tests {
     #[test]
     fn an_identity_introduction_is_never_counted_twice() {
         let mut identities = IdentityCounter::new().unwrap();
-        identities.add(&[17]).unwrap();
-        identities.add(&[17]).unwrap();
+        identities.add_one(100, 17).unwrap();
+        identities.add_one(240, 17).unwrap();
         let error = identities.finish().unwrap_err();
-        assert!(
-            error.to_string().contains("may not be reused after death"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn a_later_keyframe_logs_only_newly_live_identities() {
-        let current = fourdgs::keyframe_delta::State {
-            ids: vec![1, 2],
-            bins: Default::default(),
-        };
-        let next = fourdgs::keyframe_delta::State {
-            ids: vec![2, 3],
-            bins: Default::default(),
-        };
-        assert_eq!(keyframe_introductions(Some(&current), &next), vec![3]);
+        assert!(error.to_string().contains("reuse at byte 240"), "{error}");
     }
 
     #[test]

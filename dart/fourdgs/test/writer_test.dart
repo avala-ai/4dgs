@@ -17,6 +17,7 @@
 /// the same scene.
 library;
 
+import 'dart:collection';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
@@ -123,6 +124,45 @@ FourdgsGaussianSet flatScene(int count, {double winHi = 1.0}) {
     ]);
 }
 
+FourdgsGaussianSet withObjectIds(FourdgsGaussianSet scene, List<int> ids) =>
+    FourdgsGaussianSet(
+      positions: scene.positions,
+      scales: scene.scales,
+      rotations: scene.rotations,
+      colors: scene.colors,
+      motions: scene.motions,
+      muT: scene.muT,
+      sigmaT: scene.sigmaT,
+      winLo: scene.winLo,
+      winHi: scene.winHi,
+      shDegree: scene.shDegree,
+      sh: scene.sh,
+      shCoefficients: scene.shCoefficients,
+      sourceGroup: scene.sourceGroup,
+      sourceIndex: scene.sourceIndex,
+      objectId: Uint32List.fromList(ids),
+    );
+
+FourdgsObjectTable objectTable({bool complete = false}) => FourdgsObjectTable(
+  embeddingDim: complete ? 2 : 0,
+  entries: <FourdgsObjectEntry>[
+    FourdgsObjectEntry(
+      objectId: 7,
+      label: 'object seven',
+      anchor: <double>[0.25, -0.5, 0.75],
+      dynamics:
+          complete
+              ? <List<double>>[
+                <double>[1, 2, 3],
+                <double>[4, 5, 6],
+                <double>[7, 8, 9],
+              ]
+              : null,
+      embedding: complete ? <double>[0.125, -0.25] : null,
+    ),
+  ],
+);
+
 /// The declared bound for [key], read back out of the file rather than assumed.
 double declared(FourdgsQuantization quantization, String key) =>
     double.parse(quantization.bounds[key]!);
@@ -140,6 +180,55 @@ class _RecordingSink implements Sink<List<int>> {
 
   @override
   void close() => closed = true;
+}
+
+/// A declared list length without allocating the elements behind it.
+///
+/// The writer must reject the decoder's trajectory ceiling before it walks or
+/// materializes the samples, so an over-ceiling regression should not need a
+/// million heap objects merely to prove that ordering.
+class _VirtualDoubleList extends ListBase<double> {
+  _VirtualDoubleList(this._length);
+
+  final int _length;
+
+  @override
+  int get length => _length;
+
+  @override
+  set length(int value) => throw UnsupportedError('fixed-length test list');
+
+  @override
+  double operator [](int index) {
+    RangeError.checkValidIndex(index, this);
+    throw StateError('virtual test list was materialized');
+  }
+
+  @override
+  void operator []=(int index, double value) =>
+      throw UnsupportedError('read-only test list');
+}
+
+class _VirtualList<T> extends ListBase<T> {
+  _VirtualList(this._length);
+
+  final int _length;
+
+  @override
+  int get length => _length;
+
+  @override
+  set length(int value) => throw UnsupportedError('fixed-length test list');
+
+  @override
+  T operator [](int index) {
+    RangeError.checkValidIndex(index, this);
+    throw StateError('virtual test list was materialized');
+  }
+
+  @override
+  void operator []=(int index, T value) =>
+      throw UnsupportedError('read-only test list');
 }
 
 /// The per-band SH bit depths a file declares, read the way a reader that had
@@ -656,6 +745,477 @@ void main() {
         ),
       );
     });
+
+    test('the objects profile requires membership and one Object Table', () {
+      expect(
+        () => writeFourdgsBytes(
+          buildScene(count: 4),
+          1.0,
+          options: FourdgsWriteOptions(
+            sceneProfile: 'objects',
+            objects: FourdgsObjectLayer(table: objectTable()),
+          ),
+        ),
+        throwsA(
+          isA<FourdgsInvalidInput>().having(
+            (FourdgsInvalidInput e) => e.message,
+            'message',
+            contains(
+              'the objects profile requires an object_id stream in every non-empty chunk',
+            ),
+          ),
+        ),
+      );
+
+      expect(
+        () => writeFourdgsBytes(
+          withObjectIds(buildScene(count: 4), <int>[0, 7, 7, 0]),
+          1.0,
+          options: const FourdgsWriteOptions(sceneProfile: 'objects'),
+        ),
+        throwsA(
+          isA<FourdgsInvalidInput>().having(
+            (FourdgsInvalidInput e) => e.message,
+            'message',
+            contains(
+              'the objects profile requires one ObjectTable record, but none was supplied',
+            ),
+          ),
+        ),
+      );
+    });
+
+    test('invalid object options are invalid authoring input', () {
+      final entry = objectTable().entries.single;
+      final duplicateTable = FourdgsObjectTable(
+        embeddingDim: 0,
+        entries: <FourdgsObjectEntry>[entry, entry],
+      );
+      expect(
+        () => writeFourdgsBytes(
+          withObjectIds(buildScene(count: 1), <int>[7]),
+          1.0,
+          options: FourdgsWriteOptions(
+            sceneProfile: 'objects',
+            objects: FourdgsObjectLayer(table: duplicateTable),
+          ),
+        ),
+        throwsA(
+          isA<FourdgsInvalidInput>().having(
+            (FourdgsInvalidInput error) => error.message,
+            'message',
+            contains('two ObjectTable entries describe object 7'),
+          ),
+        ),
+      );
+    });
+
+    test('object tracks stop at the decoder sample ceiling', () {
+      final track = FourdgsObjectTrack(
+        objectId: 7,
+        interpolation: trajectoryLinear,
+        times: _VirtualDoubleList(maxTrajectorySamples + 1),
+        rotations: <List<double>>[],
+        translations: <List<double>>[],
+      );
+      expect(
+        () => writeFourdgsBytes(
+          withObjectIds(buildScene(count: 1), <int>[7]),
+          1.0,
+          options: FourdgsWriteOptions(
+            sceneProfile: 'objects',
+            objects: FourdgsObjectLayer(
+              table: objectTable(),
+              tracks: <FourdgsObjectTrack>[track],
+            ),
+          ),
+        ),
+        throwsA(
+          isA<FourdgsInvalidInput>().having(
+            (FourdgsInvalidInput error) => error.message,
+            'message',
+            allOf(
+              contains('ObjectTrack for object 7 declares 1000001 samples'),
+              contains('past the 1000000 ceiling'),
+            ),
+          ),
+        ),
+      );
+    });
+
+    test('object tables stop at the indexed front-matter ceiling', () {
+      final table = FourdgsObjectTable(
+        embeddingDim: 0xFFFF,
+        entries: <FourdgsObjectEntry>[
+          for (int objectId = 1; objectId <= 256; objectId++)
+            FourdgsObjectEntry(
+              objectId: objectId,
+              label: '',
+              anchor: <double>[0, 0, 0],
+              dynamics: null,
+              embedding: _VirtualDoubleList(0xFFFF),
+            ),
+        ],
+      );
+      expect(
+        () => writeFourdgsBytes(
+          withObjectIds(buildScene(count: 1), <int>[1]),
+          1.0,
+          options: FourdgsWriteOptions(
+            sceneProfile: 'objects',
+            objects: FourdgsObjectLayer(table: table),
+          ),
+        ),
+        throwsA(
+          isA<FourdgsInvalidInput>().having(
+            (FourdgsInvalidInput error) => error.message,
+            'message',
+            allOf(
+              contains('ObjectTable record exceeds the 67108864 byte'),
+              contains('front-matter ceiling'),
+            ),
+          ),
+        ),
+      );
+    });
+
+    test('object-profile Headers stop at the indexed content ceiling', () {
+      // Latin-1 NULs are one UTF-8 byte each. The string itself is the only
+      // large test value: the writer must count it without building a Header
+      // record, then refuse before the range reader would have to do so.
+      final oversizedLibrary = String.fromCharCodes(
+        Uint8List(maxFrontMatterBytes),
+      );
+      expect(
+        () => writeFourdgsBytes(
+          withObjectIds(buildScene(count: 1), <int>[1]),
+          1.0,
+          options: FourdgsWriteOptions(
+            sceneProfile: 'objects',
+            library: oversizedLibrary,
+            objects: FourdgsObjectLayer(table: objectTable()),
+          ),
+        ),
+        throwsA(
+          isA<FourdgsInvalidInput>().having(
+            (FourdgsInvalidInput error) => error.message,
+            'message',
+            allOf(
+              contains('Header record exceeds the 67108864 byte'),
+              contains('while encoding library'),
+            ),
+          ),
+        ),
+      );
+    });
+
+    test('object tracks stop at the indexed front-matter read ceiling', () {
+      const sampleCount = 1024;
+      const readCeiling = 256;
+      final table = FourdgsObjectTable(
+        embeddingDim: 0,
+        entries: <FourdgsObjectEntry>[
+          for (int objectId = 1; objectId <= readCeiling; objectId++)
+            FourdgsObjectEntry(
+              objectId: objectId,
+              label: '',
+              anchor: const <double>[0, 0, 0],
+              dynamics: null,
+              embedding: null,
+            ),
+        ],
+      );
+      final tracks = <FourdgsObjectTrack>[
+        for (int objectId = 1; objectId <= readCeiling; objectId++)
+          FourdgsObjectTrack(
+            objectId: objectId,
+            interpolation: trajectoryLinear,
+            times: _VirtualDoubleList(sampleCount),
+            rotations: _VirtualList<List<double>>(sampleCount),
+            translations: _VirtualList<List<double>>(sampleCount),
+          ),
+      ];
+
+      expect(
+        () => writeFourdgsBytes(
+          withObjectIds(buildScene(count: 1), <int>[1]),
+          1.0,
+          options: FourdgsWriteOptions(
+            sceneProfile: 'objects',
+            objects: FourdgsObjectLayer(table: table, tracks: tracks),
+          ),
+        ),
+        throwsA(
+          isA<FourdgsInvalidInput>().having(
+            (FourdgsInvalidInput error) => error.message,
+            'message',
+            allOf(
+              contains('indexed front-matter reads'),
+              contains('past the 256 read ceiling'),
+            ),
+          ),
+        ),
+      );
+    });
+
+    test('a partial track header counts as its own front-matter read', () {
+      const sampleCount = 1024;
+      const trackCount = 255;
+
+      FourdgsObjectTable table(String firstLabel) => FourdgsObjectTable(
+        embeddingDim: 0,
+        entries: <FourdgsObjectEntry>[
+          for (int objectId = 1; objectId <= trackCount; objectId++)
+            FourdgsObjectEntry(
+              objectId: objectId,
+              label: objectId == 1 ? firstLabel : '',
+              anchor: const <double>[0, 0, 0],
+              dynamics: null,
+              embedding: null,
+            ),
+        ],
+      );
+
+      final baseline = writeFourdgsBytes(
+        withObjectIds(buildScene(count: 1), <int>[1]),
+        1.0,
+        options: FourdgsWriteOptions(
+          sceneProfile: 'objects',
+          objects: FourdgsObjectLayer(table: table('')),
+        ),
+      );
+      final chunkOffset =
+          recordsOf(baseline)
+              .firstWhere((FourdgsRecord record) => record.opcode == opChunk)
+              .offset;
+      final target = fourdgsHeadProbeBytes - 8;
+      final labelBytes =
+          (target -
+              chunkOffset % fourdgsHeadProbeBytes +
+              fourdgsHeadProbeBytes) %
+          fourdgsHeadProbeBytes;
+      final tracks = <FourdgsObjectTrack>[
+        for (int objectId = 1; objectId <= trackCount; objectId++)
+          FourdgsObjectTrack(
+            objectId: objectId,
+            interpolation: trajectoryLinear,
+            times: _VirtualDoubleList(sampleCount),
+            rotations: _VirtualList<List<double>>(sampleCount),
+            translations: _VirtualList<List<double>>(sampleCount),
+          ),
+      ];
+
+      expect(
+        () => writeFourdgsBytes(
+          withObjectIds(buildScene(count: 1), <int>[1]),
+          1.0,
+          options: FourdgsWriteOptions(
+            sceneProfile: 'objects',
+            objects: FourdgsObjectLayer(
+              table: table(List<String>.filled(labelBytes, 'x').join()),
+              tracks: tracks,
+            ),
+          ),
+        ),
+        throwsA(
+          isA<FourdgsInvalidInput>().having(
+            (FourdgsInvalidInput error) => error.message,
+            'message',
+            allOf(
+              contains('would require 257 indexed front-matter reads'),
+              contains('past the 256 read ceiling'),
+            ),
+          ),
+        ),
+      );
+    });
+
+    test('zero-sample tracks are validated but omitted as absent', () {
+      FourdgsObjectTrack track(
+        int objectId, {
+        required bool empty,
+        int interpolation = trajectoryLinear,
+      }) => FourdgsObjectTrack(
+        objectId: objectId,
+        interpolation: interpolation,
+        times: empty ? <double>[] : <double>[0],
+        rotations:
+            empty
+                ? <List<double>>[]
+                : <List<double>>[
+                  <double>[0, 0, 0, 1],
+                ],
+        translations:
+            empty
+                ? <List<double>>[]
+                : <List<double>>[
+                  <double>[1, 2, 3],
+                ],
+      );
+
+      final options = FourdgsWriteOptions(
+        sceneProfile: 'objects',
+        objects: FourdgsObjectLayer(
+          table: objectTable(),
+          tracks: <FourdgsObjectTrack>[
+            // The invalid pose field is irrelevant because this record is
+            // absent. The live track is the only one that reaches the wire.
+            track(7, empty: true, interpolation: 7),
+            track(7, empty: false),
+          ],
+        ),
+      );
+      expect(options.objects!.poseAt(7, 0)!.translation, <double>[1, 2, 3]);
+      final bytes = writeFourdgsBytes(
+        withObjectIds(buildScene(count: 1), <int>[7]),
+        1.0,
+        options: options,
+      );
+      expect(
+        recordsOf(
+          bytes,
+        ).where((FourdgsRecord record) => record.opcode == opObjectTrack),
+        hasLength(1),
+      );
+      expect(readFourdgsBytes(bytes).objects.tracks, hasLength(1));
+
+      expect(
+        () => writeFourdgsBytes(
+          withObjectIds(buildScene(count: 1), <int>[7]),
+          1.0,
+          options: FourdgsWriteOptions(
+            sceneProfile: 'objects',
+            objects: FourdgsObjectLayer(
+              table: objectTable(),
+              tracks: <FourdgsObjectTrack>[track(0, empty: true)],
+            ),
+          ),
+        ),
+        throwsA(
+          isA<FourdgsInvalidInput>().having(
+            (FourdgsInvalidInput error) => error.message,
+            'message',
+            contains('ObjectTrack names object 0'),
+          ),
+        ),
+      );
+
+      for (final invalidId in <int>[-1, 0x100000000]) {
+        expect(
+          () => writeFourdgsBytes(
+            withObjectIds(buildScene(count: 1), <int>[7]),
+            1.0,
+            options: FourdgsWriteOptions(
+              sceneProfile: 'objects',
+              objects: FourdgsObjectLayer(
+                table: objectTable(),
+                tracks: <FourdgsObjectTrack>[
+                  track(invalidId, empty: true, interpolation: 7),
+                ],
+              ),
+            ),
+          ),
+          throwsA(
+            isA<FourdgsInvalidInput>().having(
+              (FourdgsInvalidInput error) => error.message,
+              'message',
+              contains('expected an integer in [0, 4294967295]'),
+            ),
+          ),
+        );
+      }
+    });
+
+    test(
+      'the objects profile writes the complete object layer and u32 ids',
+      () {
+        final table = objectTable(complete: true);
+        final track = FourdgsObjectTrack(
+          objectId: 7,
+          interpolation: trajectoryLinear,
+          times: <double>[0, 1],
+          rotations: <List<double>>[
+            <double>[0, 0, 0, 1],
+            <double>[0, 0, 1, 0],
+          ],
+          translations: <List<double>>[
+            <double>[0, 0, 0],
+            <double>[1, 2, 3],
+          ],
+        );
+        final input = withObjectIds(buildScene(count: 4), <int>[
+          0,
+          7,
+          0x80000000,
+          0xFFFFFFFF,
+        ]);
+        final decoded = readFourdgsBytes(
+          writeFourdgsBytes(
+            input,
+            1.0,
+            options: FourdgsWriteOptions(
+              sceneProfile: 'objects',
+              minChunkGaussians: 1,
+              objects: FourdgsObjectLayer(
+                table: table,
+                tracks: <FourdgsObjectTrack>[track],
+              ),
+            ),
+          ),
+        );
+
+        expect(decoded.header.profile, 'objects');
+        final pairing = _pairByPosition(input, decoded.gaussians);
+        for (int j = 0; j < pairing.length; j++) {
+          expect(decoded.gaussians.objectId![j], input.objectId![pairing[j]]);
+        }
+        expect(decoded.objects.table!.entries.single.label, 'object seven');
+        expect(
+          decoded.objects.table!.entries.single.dynamics,
+          table.entries.single.dynamics,
+        );
+        expect(
+          decoded.objects.table!.entries.single.embedding,
+          table.entries.single.embedding,
+        );
+        expect(decoded.objects.tracks.single.objectId, 7);
+        expect(decoded.objects.tracks.single.times, track.times);
+        expect(decoded.objects.tracks.single.translations, track.translations);
+      },
+    );
+
+    test(
+      'an empty objects-profile scene still requires and writes its table',
+      () {
+        expect(
+          () => writeFourdgsBytes(
+            FourdgsGaussianSet.empty(),
+            0,
+            options: const FourdgsWriteOptions(sceneProfile: 'objects'),
+          ),
+          throwsA(
+            isA<FourdgsInvalidInput>().having(
+              (FourdgsInvalidInput e) => e.message,
+              'message',
+              contains('requires one ObjectTable record'),
+            ),
+          ),
+        );
+
+        final decoded = readFourdgsBytes(
+          writeFourdgsBytes(
+            FourdgsGaussianSet.empty(),
+            0,
+            options: FourdgsWriteOptions(
+              sceneProfile: 'objects',
+              objects: FourdgsObjectLayer(table: objectTable()),
+            ),
+          ),
+        );
+        expect(decoded.gaussians.count, 0);
+        expect(decoded.objects.table!.entries, hasLength(1));
+      },
+    );
   });
 
   group('the summary', () {
@@ -2071,29 +2631,7 @@ void main() {
       }
     });
 
-    test('promissory and reserved scene profiles are refused', () {
-      // A profile is a promise about what the file contains. `objects` promises
-      // an object_id stream in every non-empty chunk and one Object Table, and
-      // this writer emits neither — so the Header would carry a promise the
-      // bytes below it do not keep, and no reader today enforces it.
-      expect(
-        () => writeFourdgsBytes(
-          buildScene(count: 8),
-          8.0,
-          options: const FourdgsWriteOptions(sceneProfile: 'objects'),
-        ),
-        throwsA(
-          isA<FourdgsInvalidInput>().having(
-            (FourdgsInvalidInput e) => e.message,
-            'message',
-            allOf(
-              contains('objects'),
-              contains('Object Table'),
-              isNot(contains('object_id')),
-            ),
-          ),
-        ),
-      );
+    test('unsupported promissory and reserved scene profiles are refused', () {
       expect(
         () => writeFourdgsBytes(
           buildScene(count: 8),
@@ -2161,7 +2699,7 @@ void main() {
             allOf(
               contains('unknown scene profile "captuer"'),
               contains('registered profiles'),
-              contains('only "" or baked'),
+              contains('can emit "", baked, or objects'),
             ),
           ),
         ),

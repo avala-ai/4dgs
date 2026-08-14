@@ -1,0 +1,273 @@
+{
+  "aggregate": {
+    "neverFadesCount": "2",
+    "opacitySum": 1.803922,
+    "positionSum": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "zeroMotionCount": "0"
+  },
+  "attachments": [],
+  "audioSources": [],
+  "camera": null,
+  "chunkIntervals": [
+    [
+      0.0,
+      1.7976930277114614e+308
+    ]
+  ],
+  "cutoff": 0.05,
+  "durationSec": 1.7976930277114614e+308,
+  "gaussianCount": "2",
+  "hasAudio": false,
+  "headerAttributes": {},
+  "library": "4dgs conformance generator",
+  "metadataRecords": [],
+  "objects": {
+    "embeddingDim": 0,
+    "table": [
+      {
+        "anchor": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "dynamics": null,
+        "embeddingCrc": null,
+        "hasEmbedding": false,
+        "label": "non-finite rows",
+        "objectId": "7"
+      }
+    ],
+    "tracks": []
+  },
+  "profile": "objects",
+  "sample": {
+    "colors": [
+      [
+        0.603922,
+        0.4,
+        0.203922,
+        0.901961
+      ],
+      [
+        0.603922,
+        0.4,
+        0.203922,
+        0.901961
+      ]
+    ],
+    "motions": [
+      [
+        1.0,
+        0.0,
+        0.0
+      ],
+      [
+        1.0,
+        0.0,
+        0.0
+      ]
+    ],
+    "muT": [
+      0.0,
+      0.0
+    ],
+    "objectIds": [
+      "7",
+      "7"
+    ],
+    "positions": [
+      [
+        0.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        0.0
+      ]
+    ],
+    "rotations": [
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "scales": [
+      [
+        2e-06,
+        2e-06,
+        2e-06
+      ],
+      [
+        2e-06,
+        2e-06,
+        2e-06
+      ]
+    ],
+    "sigmaT": [
+      null,
+      null
+    ],
+    "winHi": [
+      null,
+      null
+    ],
+    "winLo": [
+      0.0,
+      0.0
+    ]
+  },
+  "sh": null,
+  "shDegree": 0,
+  "states": [
+    {
+      "aggregate": {
+        "opacitySum": 1.803922,
+        "positionSum": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "liveCount": "2",
+      "sample": {
+        "objectIds": [
+          "7",
+          "7"
+        ],
+        "orientations": [
+          [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ]
+        ],
+        "positions": [
+          [
+            0.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.0
+          ]
+        ]
+      },
+      "t": 0.0
+    },
+    {
+      "aggregate": {
+        "opacitySum": 1.803922,
+        "positionSum": [
+          179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819860834936475292719074168444365510704342711559699508093042880177904174497792.0,
+          0.0,
+          0.0
+        ]
+      },
+      "liveCount": "2",
+      "sample": {
+        "objectIds": [
+          "7",
+          "7"
+        ],
+        "orientations": [
+          [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ]
+        ],
+        "positions": [
+          [
+            8.988465138557307e+307,
+            0.0,
+            0.0
+          ],
+          [
+            8.988466210065851e+307,
+            0.0,
+            0.0
+          ]
+        ]
+      },
+      "t": 8.988465138557307e+307
+    },
+    {
+      "aggregate": {
+        "opacitySum": 1.803922,
+        "positionSum": [
+          null,
+          0.0,
+          0.0
+        ]
+      },
+      "liveCount": "2",
+      "sample": {
+        "objectIds": [
+          "7",
+          "7"
+        ],
+        "orientations": [
+          [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ]
+        ],
+        "positions": [
+          [
+            1.7976930277114614e+308,
+            0.0,
+            0.0
+          ],
+          [
+            null,
+            0.0,
+            0.0
+          ]
+        ]
+      },
+      "t": 1.7976930277114614e+308
+    }
+  ],
+  "statistics": null,
+  "summaryCrcOk": true,
+  "summaryOffsets": [],
+  "temporalModel": "gaussian-birth"
+}

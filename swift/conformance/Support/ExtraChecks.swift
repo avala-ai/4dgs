@@ -63,8 +63,9 @@ enum ExtraChecks {
     /// looked perfect, and the feature matrix would claim something no check covers.
     ///
     /// So: somewhere among these probes, at least one gaussian belonging to a tracked
-    /// object must come back from ``SceneReader/stateAt(_:options:)`` at a different place
-    /// than ``Gaussian/state(at:)`` puts it. Aggregated across the probes rather than
+    /// object must come back from ``SceneReader/stateAt(_:options:)`` at a different pose
+    /// than ``Gaussian/state(at:)`` gives it. Position alone is insufficient: a legal
+    /// track may rotate a gaussian in place. Aggregated across the probes rather than
     /// demanded at each, because a track is free to sit at the identity pose for part of
     /// its life — every corpus track does, early on — and a scene whose layer carries no
     /// track at all is excused entirely, since for it the composition *is* the identity.
@@ -90,16 +91,38 @@ enum ExtraChecks {
                 let g = Int(composed.indices[i])
                 guard g < resident.count, resident.objectIds[g] != 0 else { continue }
                 firstMember = firstMember ?? g
-                let byHand = resident[g].state(at: t).position
-                let dx = Double(composed.centers[i * 3] - byHand.x)
-                let dy = Double(composed.centers[i * 3 + 1] - byHand.y)
-                let dz = Double(composed.centers[i * 3 + 2] - byHand.z)
-                if (dx * dx + dy * dy + dz * dz).squareRoot() > 1e-4 { return }
+                let byHand = resident[g].state(at: t)
+                if poseDiffers(composed, at: i, from: byHand) { return }
             }
         }
         if let g = firstMember {
             throw Failure.trackNotComposed(t: times[times.count - 1], gaussian: g)
         }
+    }
+
+    /// Whether composition changed one visible pose from its §3-only reconstruction.
+    ///
+    /// Quaternions have a two-to-one representation: `q` and `-q` encode the same
+    /// rotation. Comparing both signs catches a pure rotational track without treating a
+    /// sign choice made by the core as evidence of composition.
+    static func poseDiffers(
+        _ composed: InstantState, at visibleIndex: Int, from base: Gaussian,
+        tolerance: Double = 1e-4
+    ) -> Bool {
+        let dx = Double(composed.centers[visibleIndex * 3] - base.position.x)
+        let dy = Double(composed.centers[visibleIndex * 3 + 1] - base.position.y)
+        let dz = Double(composed.centers[visibleIndex * 3 + 2] - base.position.z)
+        if (dx * dx + dy * dy + dz * dz).squareRoot() > tolerance { return true }
+
+        var sameSign = 0.0
+        var oppositeSign = 0.0
+        for axis in 0..<4 {
+            let actual = Double(composed.orientations[visibleIndex * 4 + axis])
+            let uncomposed = Double(base.rotation[axis])
+            sameSign += (actual - uncomposed) * (actual - uncomposed)
+            oppositeSign += (actual + uncomposed) * (actual + uncomposed)
+        }
+        return min(sameSign, oppositeSign).squareRoot() > tolerance
     }
 
     static func truncationRecovery(path: String, wholeCount: Int) throws {

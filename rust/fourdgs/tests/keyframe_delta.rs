@@ -244,6 +244,109 @@ fn rotation_is_restated_absolutely_in_an_update() {
     assert_eq!(out.bins[&op::A_ROTATION_INDEX].values, vec![2]);
 }
 
+#[test]
+fn absolute_state_bins_and_rotation_pairs_are_complete_and_i32_bounded() {
+    let empty = BTreeMap::new();
+    let overflow = BIN_MAX + 1;
+    assert_eq!(
+        keyframe_state(
+            vec![1],
+            bins(&[
+                (op::A_ROTATION_INDEX, &[4], 1),
+                (op::A_ROTATION, &[0, 0, 0], 3)
+            ]),
+        )
+        .unwrap_err()
+        .code,
+        "rotation-index-out-of-range"
+    );
+    assert_eq!(
+        keyframe_state(vec![1], bins(&[(op::A_POSITION, &[overflow, 0, 0], 3)]))
+            .unwrap_err()
+            .code,
+        "bin-overflow"
+    );
+
+    let state = keyframe_state(
+        vec![1],
+        bins(&[
+            (op::A_POSITION, &[0, 0, 0], 3),
+            (op::A_ROTATION_INDEX, &[3], 1),
+            (op::A_ROTATION, &[0, 0, 0], 3),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(
+        refusal_code(
+            &state,
+            &[1],
+            &bins(&[(op::A_ROTATION_INDEX, &[2], 1)]),
+            &[],
+            &empty,
+            &[],
+        ),
+        "incomplete-rotation-update"
+    );
+    assert_eq!(
+        refusal_code(
+            &state,
+            &[1],
+            &bins(&[
+                (op::A_ROTATION_INDEX, &[2], 1),
+                (op::A_ROTATION, &[overflow, 0, 0], 3),
+            ]),
+            &[],
+            &empty,
+            &[],
+        ),
+        "bin-overflow"
+    );
+    assert_eq!(
+        refusal_code(
+            &state,
+            &[1],
+            &bins(&[
+                (op::A_ROTATION_INDEX, &[4], 1),
+                (op::A_ROTATION, &[0, 0, 0], 3),
+            ]),
+            &[],
+            &empty,
+            &[],
+        ),
+        "rotation-index-out-of-range"
+    );
+    assert_eq!(
+        refusal_code(
+            &state,
+            &[],
+            &empty,
+            &[2],
+            &bins(&[
+                (op::A_POSITION, &[overflow, 0, 0], 3),
+                (op::A_ROTATION_INDEX, &[3], 1),
+                (op::A_ROTATION, &[0, 0, 0], 3),
+            ]),
+            &[],
+        ),
+        "bin-overflow"
+    );
+    assert_eq!(
+        refusal_code(
+            &state,
+            &[],
+            &empty,
+            &[2],
+            &bins(&[
+                (op::A_POSITION, &[0, 0, 0], 3),
+                (op::A_ROTATION_INDEX, &[4], 1),
+                (op::A_ROTATION, &[0, 0, 0], 3),
+            ]),
+            &[],
+        ),
+        "rotation-index-out-of-range"
+    );
+}
+
 // --- the chain a seek walks --------------------------------------------------
 
 fn entry(t0: f64, t1: f64, offset: u64, kind: u8, reference: u64, depth: u16) -> ChunkIndexEntry {

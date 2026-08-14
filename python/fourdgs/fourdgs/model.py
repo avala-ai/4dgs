@@ -215,8 +215,11 @@ class GaussianSet:
     motions: np.ndarray  # (n, 3) f32, units/second
     mu_t: np.ndarray  # (n,) f32
     sigma_t: np.ndarray  # (n,) f32, inf allowed
-    win_lo: np.ndarray  # (n,) f32
-    win_hi: np.ndarray  # (n,) f32
+    # Window Table endpoints are f64 on the wire (§5.4). Writers may accept f32
+    # arrays, but readers retain the encoded precision so a large finite endpoint is
+    # not silently reinterpreted as infinity.
+    win_lo: np.ndarray  # (n,) f64 when decoded
+    win_hi: np.ndarray  # (n,) f64 when decoded
     sh: np.ndarray | None = None  # (n, coeffs*3) u8
     sh_degree: int = 0
     source_group: np.ndarray | None = None
@@ -266,9 +269,18 @@ class GaussianSet:
             np.exp(-0.5 * np.square((t - mu) / np.maximum(sigma, 1e-30))),
             1.0,
         )
-        visible = (self.win_lo <= t) & (t < self.win_hi) & (marginal >= cutoff)
+        # Keep comparison in f64. Decoded Window Table endpoints already retain their
+        # wire precision; the conversion also supports caller-constructed f32 sets.
+        win_lo = np.asarray(self.win_lo, dtype=np.float64)
+        win_hi = np.asarray(self.win_hi, dtype=np.float64)
+        visible = (win_lo <= t) & (t < win_hi) & (marginal >= cutoff)
         idx = np.flatnonzero(visible)
-        centers = self.positions[idx].astype(np.float64) + self.motions[idx].astype(np.float64) * (t - mu[idx])[:, None]
+        # A finite encoded scene may reconstruct a non-finite center at an extreme time;
+        # canonical state represents that scalar as null. It is a result, not a warning.
+        with np.errstate(over="ignore", invalid="ignore"):
+            centers = (
+                self.positions[idx].astype(np.float64) + self.motions[idx].astype(np.float64) * (t - mu[idx])[:, None]
+            )
         return {
             "indices": idx,
             "centers": centers,

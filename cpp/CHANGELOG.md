@@ -33,6 +33,15 @@ All notable changes to the C++ package are documented here, following
   fetched source fail, and installing a prebuilt core dereferences symbolic links so the relocated
   package contains archive bytes rather than a dangling build-tree link.
 
+- **Complete bounded validation for `keyframe-delta`.** The tool now certifies the sequential path
+  for every file and the indexed path when a Chunk Index is present, through the core's range-reader
+  ABI rather than a whole-file buffer. It retains no sequence: the core keeps only the current
+  population and GOP keyframe, while the CLI partitions lifetime identity introductions into
+  temporary files and reduces one fixed 32 MiB bitmap at a time. Reused identities and a Header
+  lifetime count mismatch are refused, and core failures carry their structured record byte into the
+  tool's diagnosis. Both core and no-core builds keep their existing contract; the latter still
+  reports that validation cannot run.
+
 - **`keyframe-delta` encode** (spec §11):
   `fourdgs::encodeKeyframeDeltaSequence(samples, durationSec, options)`, with `KeyframeDeltaSample`
   — a `t0`, a `gaussian_id` stream and a `GaussianView`, all borrowed for the call — and

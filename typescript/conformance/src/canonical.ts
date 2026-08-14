@@ -129,6 +129,74 @@ export function num(value: number | null | undefined): number | null {
   return roundHalfEven(value, FLOAT_DECIMALS);
 }
 
+/** A JSON number token that must not be narrowed through JavaScript's binary64 parser. */
+export class ExactNumber {
+  constructor(readonly token: string) {}
+}
+
+const CANONICAL_SCALE = 10n ** BigInt(FLOAT_DECIMALS);
+const FLOAT64 = new DataView(new ArrayBuffer(8));
+
+/** Round one finite binary64 addend to exact canonical 10^-6 units. */
+function canonicalUnits(value: number): bigint | null {
+  if (!Number.isFinite(value)) return null;
+  const negative = value < 0;
+  FLOAT64.setFloat64(0, Math.abs(value), false);
+  const high = FLOAT64.getUint32(0, false);
+  const low = FLOAT64.getUint32(4, false);
+  const exponentBits = (high >>> 20) & 0x7ff;
+  const fraction = (BigInt(high & 0xfffff) << 32n) | BigInt(low);
+  if (exponentBits === 0 && fraction === 0n) return 0n;
+
+  const significand = exponentBits === 0 ? fraction : (1n << 52n) | fraction;
+  const exponent = exponentBits === 0 ? -1074 : exponentBits - 1023 - 52;
+  let units: bigint;
+  if (exponent >= 0) {
+    units = (significand * CANONICAL_SCALE) << BigInt(exponent);
+  } else {
+    const denominator = 1n << BigInt(-exponent);
+    const numerator = significand * CANONICAL_SCALE;
+    units = numerator / denominator;
+    const remainder = numerator % denominator;
+    const twice = remainder * 2n;
+    if (twice > denominator || (twice === denominator && units % 2n === 1n)) units += 1n;
+  }
+  return negative ? -units : units;
+}
+
+function exactNumberFromUnits(total: bigint): ExactNumber {
+  const negative = total < 0n;
+  const magnitude = negative ? -total : total;
+  const whole = magnitude / CANONICAL_SCALE;
+  const fraction = (magnitude % CANONICAL_SCALE)
+    .toString()
+    .padStart(FLOAT_DECIMALS, "0")
+    .replace(/0+$/, "");
+  return new ExactNumber(`${negative ? "-" : ""}${whole}.${fraction || "0"}`);
+}
+
+class ExactAccumulator {
+  private total = 0n;
+  private finite = true;
+
+  add(value: number): void {
+    const units = canonicalUnits(value);
+    if (units === null) this.finite = false;
+    else if (this.finite) this.total += units;
+  }
+
+  finish(): ExactNumber | null {
+    return this.finite ? exactNumberFromUnits(this.total) : null;
+  }
+}
+
+/** Sum canonical units exactly; any non-finite addend makes the result `null`. */
+export function exactSum(values: Iterable<number>): ExactNumber | null {
+  const sum = new ExactAccumulator();
+  for (const value of values) sum.add(value);
+  return sum.finish();
+}
+
 /**
  * Round to `decimals` places, halves to even, on the exact value.
  *
@@ -199,7 +267,8 @@ export interface SceneSummaryInput {
 export function summarize(input: SceneSummaryInput): unknown {
   const { header, gaussians, audioSources, chunkIntervals } = input;
   const n = gaussians.count;
-  const order = stableOrder(gaussians);
+  const contentKeys = stableKeys(gaussians);
+  const order = stableOrder(contentKeys);
   const sample = order.slice(0, SAMPLE);
 
   const rows = (array: Float32Array, width: number): (number | null)[][] =>
@@ -209,15 +278,15 @@ export function summarize(input: SceneSummaryInput): unknown {
       return row;
     });
 
-  const positionSum = [0, 0, 0];
-  let alphaSum = 0;
+  const positionSum = [new ExactAccumulator(), new ExactAccumulator(), new ExactAccumulator()];
+  const alphaSum = new ExactAccumulator();
   let neverFades = 0;
   let still = 0;
   for (const i of order) {
-    positionSum[0]! += gaussians.positions[i * 3]!;
-    positionSum[1]! += gaussians.positions[i * 3 + 1]!;
-    positionSum[2]! += gaussians.positions[i * 3 + 2]!;
-    alphaSum += gaussians.colors[i * 4 + 3]!;
+    positionSum[0]!.add(gaussians.positions[i * 3]!);
+    positionSum[1]!.add(gaussians.positions[i * 3 + 1]!);
+    positionSum[2]!.add(gaussians.positions[i * 3 + 2]!);
+    alphaSum.add(gaussians.colors[i * 4 + 3]!);
     if (!Number.isFinite(gaussians.sigmaT[i]!)) neverFades += 1;
     const m = gaussians.motions;
     if (Math.abs(m[i * 3]!) + Math.abs(m[i * 3 + 1]!) + Math.abs(m[i * 3 + 2]!) === 0) still += 1;
@@ -276,7 +345,7 @@ export function summarize(input: SceneSummaryInput): unknown {
     // before the layer existed. Membership alone is enough to report — a scene can
     // carry ids and no table.
     ...((input.objects != null && !input.objects.isEmpty) || gaussians.objectId !== null
-      ? objectsAndStates(header, gaussians, input.objects ?? null, order)
+      ? objectsAndStates(header, gaussians, input.objects ?? null, order, contentKeys)
       : {}),
     sh: summarizeSh(gaussians, order),
     sample: {
@@ -294,8 +363,8 @@ export function summarize(input: SceneSummaryInput): unknown {
         : { objectIds: sample.map((i) => String(gaussians.objectId![i])) }),
     },
     aggregate: {
-      positionSum: positionSum.map((v) => num(v)),
-      opacitySum: num(alphaSum),
+      positionSum: positionSum.map((sum) => sum.finish()),
+      opacitySum: alphaSum.finish(),
       neverFadesCount: String(neverFades),
       zeroMotionCount: String(still),
     },
@@ -385,6 +454,7 @@ function objectsAndStates(
   gaussians: GaussianSet,
   objects: ObjectLayer | null,
   order: readonly number[],
+  contentKeys: readonly (readonly number[])[],
 ): Record<string, unknown> {
   const layer = objects ?? new ObjectLayerClass();
 
@@ -431,11 +501,25 @@ function objectsAndStates(
 
     const rowForIndex = new Map<number, number>();
     base.indices.forEach((index, row) => rowForIndex.set(index, row));
-    const sampleRows: number[] = [];
-    for (const index of order) {
-      const row = rowForIndex.get(index);
-      if (row !== undefined) sampleRows.push(row);
-      if (sampleRows.length === SAMPLE) break;
+    const liveIndices = order.filter((index) => rowForIndex.has(index));
+    const stateKeys = new Array<readonly number[] | undefined>(gaussians.count);
+    for (const index of liveIndices) {
+      stateKeys[index] = stateRowKey(base, rowForIndex.get(index)!);
+    }
+    liveIndices.sort((a, b) => {
+      const content = compareRows(contentKeys[a]!, contentKeys[b]!);
+      if (content !== 0) return content;
+      return compareRows(stateKeys[a]!, stateKeys[b]!);
+    });
+    const liveRows = liveIndices.map((index) => rowForIndex.get(index)!);
+    const sampleRows = liveRows.slice(0, SAMPLE);
+    const positionSum = [new ExactAccumulator(), new ExactAccumulator(), new ExactAccumulator()];
+    const opacitySum = new ExactAccumulator();
+    for (const row of liveRows) {
+      for (let axis = 0; axis < 3; axis++) {
+        positionSum[axis]!.add(base.centers[row * 3 + axis]!);
+      }
+      opacitySum.add(base.opacity[row]!);
     }
 
     const rows = (values: readonly number[], width: number): (number | null)[][] =>
@@ -445,14 +529,6 @@ function objectsAndStates(
         return out;
       });
 
-    const positionSum = [0, 1, 2].map((axis) => {
-      let total = 0;
-      for (let row = 0; row < base.indices.length; row++) total += base.centers[row * 3 + axis]!;
-      return num(total);
-    });
-    let opacitySum = 0;
-    for (const value of base.opacity) opacitySum += value;
-
     return {
       t: num(t),
       liveCount: String(base.indices.length),
@@ -461,7 +537,10 @@ function objectsAndStates(
         orientations: rows(base.orientations, 4),
         objectIds: sampleRows.map((row) => String(base.objectIds[row])),
       },
-      aggregate: { positionSum, opacitySum: num(opacitySum) },
+      aggregate: {
+        positionSum: positionSum.map((sum) => sum.finish()),
+        opacitySum: opacitySum.finish(),
+      },
     };
   });
 
@@ -481,6 +560,23 @@ interface CanonicalObjectState {
   readonly orientations: number[];
   readonly opacity: number[];
   readonly objectIds: number[];
+}
+
+/** Portable secondary order over exactly the rounded values a state sample emits. */
+function stateRowKey(state: CanonicalObjectState, row: number): number[] {
+  const key: number[] = [];
+  for (const [values, width] of [
+    [state.centers, 3],
+    [state.orientations, 4],
+  ] as const) {
+    for (let axis = 0; axis < width; axis++) {
+      const rounded = num(values[row * width + axis]);
+      if (rounded === null) key.push(1, 0);
+      else key.push(0, rounded);
+    }
+  }
+  key.push(state.objectIds[row]!);
+  return key;
 }
 
 /**
@@ -664,11 +760,11 @@ function summarizeSh(gaussians: GaussianSet, order: readonly number[]): unknown 
  *
  * Chunking and spatial ordering are encoder choices, so decoded order is not part of the
  * contract — but a comparison needs some order. The key is the gaussian's whole decoded
- * state, rounded exactly as the summary rounds it, with its spherical harmonic
- * coefficients last. Two gaussians that tie on all of it are identical in every value
- * this summary emits, so their relative order cannot change the output.
+ * state, rounded exactly as the summary rounds it, with spherical harmonic coefficients
+ * and object membership last. Exact decoded values are deliberately not a tiebreaker:
+ * independently implemented decoders may differ in their last bits.
  */
-function stableOrder(gaussians: GaussianSet): number[] {
+function stableKeys(gaussians: GaussianSet): number[][] {
   const keys: number[][] = new Array<number[]>(gaussians.count);
   const shWidth = gaussians.sh === null ? 0 : gaussians.sh.coefficients * 3;
   for (let i = 0; i < gaussians.count; i++) {
@@ -682,12 +778,14 @@ function stableOrder(gaussians: GaussianSet): number[] {
     ] as const) {
       for (let k = 0; k < width; k++) row.push(sortable(array[i * width + k]!));
     }
-    row.push(
-      sortable(gaussians.muT[i]!),
-      sortable(gaussians.sigmaT[i]!),
-      sortable(gaussians.winLo[i]!),
-      sortable(gaussians.winHi[i]!),
-    );
+    for (const value of [
+      gaussians.muT[i]!,
+      gaussians.sigmaT[i]!,
+      gaussians.winLo[i]!,
+      gaussians.winHi[i]!,
+    ]) {
+      row.push(sortable(value));
+    }
     for (let k = 0; k < shWidth; k++) row.push(gaussians.sh!.values[i * shWidth + k]!);
     // Membership joins the key, after the harmonics and before the index tiebreak, exactly
     // where the Python and Rust references put it. Two gaussians can tie on every rounded
@@ -695,11 +793,15 @@ function stableOrder(gaussians: GaussianSet): number[] {
     // states composed from it, would be ordered by decode order, which differs between two
     // correct readers that chunked the scene differently.
     if (gaussians.objectId !== null) row.push(gaussians.objectId[i]!);
-    row.push(i);
     keys[i] = row;
   }
-  keys.sort(compareRows);
-  return keys.map((row) => row[row.length - 1]!);
+  return keys;
+}
+
+function stableOrder(keys: readonly (readonly number[])[]): number[] {
+  return Array.from({ length: keys.length }, (_, index) => index).sort(
+    (a, b) => compareRows(keys[a]!, keys[b]!) || a - b,
+  );
 }
 
 /**
@@ -725,7 +827,44 @@ function sortable(value: number): number {
 
 /** Stable JSON: sorted keys, two-space indent, the shape the expectations are stored in. */
 export function canonical(summary: unknown): string {
-  return JSON.stringify(sortKeys(summary), null, 2);
+  const strings = new Set<string>();
+  const collectStrings = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      value.forEach(collectStrings);
+    } else if (value !== null && typeof value === "object" && !(value instanceof ExactNumber)) {
+      for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+        strings.add(key);
+        collectStrings(item);
+      }
+    } else if (typeof value === "string") {
+      strings.add(value);
+    }
+  };
+  collectStrings(summary);
+
+  let markerPrefix = "\0fourdgs-exact-number\0";
+  while ([...strings].some((value) => value.includes(markerPrefix))) markerPrefix += "#";
+  const replacements = new Map<string, string>();
+  const markExact = (value: unknown): unknown => {
+    if (value instanceof ExactNumber) {
+      const marker = `${markerPrefix}${replacements.size}`;
+      replacements.set(JSON.stringify(marker), value.token);
+      return marker;
+    }
+    if (Array.isArray(value)) return value.map(markExact);
+    if (value !== null && typeof value === "object") {
+      const out: Record<string, unknown> = {};
+      for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+        out[key] = markExact(item);
+      }
+      return out;
+    }
+    return value;
+  };
+
+  let text = JSON.stringify(sortKeys(markExact(summary)), null, 2);
+  for (const [marker, token] of replacements) text = text.replace(marker, token);
+  return text;
 }
 
 /**

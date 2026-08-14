@@ -5,8 +5,10 @@
 #define FOURDGS_SRC_BACKEND_HPP
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -53,6 +55,16 @@ class StateHandle {
 Result<void> openPath(Handle& handle, const std::string& path, int mode);
 Result<void> openMemory(Handle& handle, Span<const std::uint8_t> bytes, int mode);
 Result<void> openReadable(Handle& handle, Readable& source, int mode);
+
+/// Certify one concrete keyframe-delta read path without taking ownership of `source`.
+/// Lifetime identity introductions and their state-record offsets are forwarded to `introduce`,
+/// so the tool can keep filesystem-backed uniqueness accounting at its I/O edge rather than in
+/// the decoder, while still placing a reuse at the record that introduced it again.
+/// `failureOffset` is populated only when the core can place a failure at one record.
+Result<std::uint64_t> validateKeyframeDelta(
+    Readable& source, int mode,
+    const std::function<Result<void>(std::uint64_t, std::uint32_t)>& introduce,
+    std::optional<std::uint64_t>* failureOffset);
 
 /// Header fields, none of which can fail once a scene is open.
 double durationSec(const Handle& handle);

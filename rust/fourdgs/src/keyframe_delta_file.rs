@@ -20,6 +20,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::codec;
 use crate::error::{Error, Result};
 use crate::keyframe_delta::{
     apply_delta, chain_for, check_tiling, check_timeline_endpoints, keyframe_state, BinArray,
@@ -31,7 +32,9 @@ use crate::quantization::{
     life_class, motion_step, mu_step, rct_forward, rint, support_k, Bounds, Profile, Steps,
 };
 use crate::records as rec;
-use crate::serialization::{check_magic, crc32, Cursor, Records, MAGIC, MAX_STREAM_BYTES};
+use crate::serialization::{
+    check_magic, crc32, Cursor, Records, MAGIC, MAX_STREAM_BYTES, STREAM_HEADER_SIZE,
+};
 use crate::stream::{decode_stream, encode_stream, DecodedStream};
 
 /// How many gaussians appear in full in a probe's sample.
@@ -852,6 +855,72 @@ fn check_attribute_channels(attribute: u8, stream: &DecodedStream) -> Result<()>
     Ok(())
 }
 
+/// Decode a version-1 state stream after checking its fixed header, or skip an unknown
+/// extension by its common payload length without interpreting extension-owned semantics.
+fn decode_state_stream(
+    cursor: &mut Cursor<'_>,
+    expected_count: usize,
+) -> Result<(u8, Option<DecodedStream>)> {
+    let head = cursor.rest().get(..STREAM_HEADER_SIZE).ok_or_else(|| {
+        Error::Truncated(format!(
+            "a keyframe-delta group ends before its {STREAM_HEADER_SIZE}-byte Attribute Stream header"
+        ))
+    })?;
+    let attribute = head[0];
+    let width = head[1];
+    let mode = head[2];
+    let stream_codec = head[3];
+    let channels = head[4] as usize;
+    let count = u32::from_le_bytes(head[5..9].try_into().expect("stream count")) as usize;
+    if count != expected_count {
+        return Err(Error::Malformed(format!(
+            "attribute {attribute} carries {count} elements, the group declares {expected_count}"
+        )));
+    }
+    let payload_length = u64::from_le_bytes(head[9..17].try_into().expect("stream payload length"));
+    let payload_length = usize::try_from(payload_length).map_err(|_| {
+        Error::Truncated(format!(
+            "attribute {attribute} declares a payload larger than this platform can address"
+        ))
+    })?;
+    if let Some(expected) = expected_attribute_channels(attribute) {
+        if channels != expected {
+            return Err(Error::Malformed(format!(
+                "attribute {attribute} declares {channels} channels; the format defines {expected}"
+            )));
+        }
+        if !matches!(width, 1 | 2 | 4) {
+            return Err(Error::Malformed(format!(
+                "attribute {attribute}: symbol width {width} is not 1, 2 or 4"
+            )));
+        }
+        if !matches!(
+            mode,
+            crate::stream::MODE_RAW | crate::stream::MODE_DELTA | crate::stream::MODE_CONST
+        ) {
+            return Err(Error::Malformed(format!(
+                "attribute {attribute}: unknown stream mode {mode}"
+            )));
+        }
+        codec::check_decoder(stream_codec)?;
+        let (decoded_attribute, stream) = decode_stream(cursor, Some(expected_count))?;
+        debug_assert_eq!(decoded_attribute, attribute);
+        check_attribute_channels(attribute, &stream)?;
+        if let Some(value) = stream.values.iter().find(|value| {
+            !(crate::keyframe_delta::BIN_MIN..=crate::keyframe_delta::BIN_MAX).contains(value)
+        }) {
+            return Err(Error::Malformed(format!(
+                "attribute {attribute} reconstructs bin {value}, outside the signed 32-bit state domain"
+            )));
+        }
+        return Ok((attribute, Some(stream)));
+    }
+
+    cursor.take(STREAM_HEADER_SIZE)?;
+    cursor.take(payload_length)?;
+    Ok((attribute, None))
+}
+
 /// One length-framed sub-block: its ids, and a bin array per other attribute.
 fn decode_group(bytes: &[u8], expected_count: usize) -> Result<(Vec<i64>, BTreeMap<u8, BinArray>)> {
     if bytes.is_empty() {
@@ -863,19 +932,21 @@ fn decode_group(bytes: &[u8], expected_count: usize) -> Result<(Vec<i64>, BTreeM
         return Ok((Vec::new(), BTreeMap::new()));
     }
     let mut got: BTreeMap<u8, DecodedStream> = BTreeMap::new();
+    let mut seen = BTreeSet::new();
     let mut cursor = Cursor::new(bytes);
     while cursor.remaining() > 0 {
-        let (attribute_id, values) = decode_stream(&mut cursor, Some(expected_count))?;
-        check_attribute_channels(attribute_id, &values)?;
+        let (attribute_id, values) = decode_state_stream(&mut cursor, expected_count)?;
         // One stream per attribute here too: the regular chunk path refuses a second,
         // and this path had its own loop that was still resolving it silently.
-        if got.contains_key(&attribute_id) {
+        if !seen.insert(attribute_id) {
             return Err(Error::Malformed(format!(
                 "a keyframe-delta group carries attribute {attribute_id} twice; the \
                  format defines one stream per attribute"
             )));
         }
-        got.insert(attribute_id, values);
+        if let Some(values) = values {
+            got.insert(attribute_id, values);
+        }
     }
     let Some(id_stream) = got.remove(&op::A_GAUSSIAN_ID) else {
         return Err(Error::Malformed(
@@ -891,20 +962,23 @@ fn keyframe_from_chunk(
     content: &[u8],
 ) -> Result<(rec::ChunkHeader, Vec<i64>, BTreeMap<u8, BinArray>)> {
     let (head, streams) = rec::parse_chunk(content)?;
+    let streams = crate::chunk::chunk_stream_bytes(&head, streams)?;
     let mut got: BTreeMap<u8, DecodedStream> = BTreeMap::new();
-    let mut cursor = Cursor::new(streams);
+    let mut seen = BTreeSet::new();
+    let mut cursor = Cursor::new(&streams);
     while cursor.remaining() > 0 {
-        let (attribute_id, values) = decode_stream(&mut cursor, Some(head.count as usize))?;
-        check_attribute_channels(attribute_id, &values)?;
+        let (attribute_id, values) = decode_state_stream(&mut cursor, head.count as usize)?;
         // One stream per attribute here too: the regular chunk path refuses a second,
         // and this path had its own loop that was still resolving it silently.
-        if got.contains_key(&attribute_id) {
+        if !seen.insert(attribute_id) {
             return Err(Error::Malformed(format!(
                 "a keyframe-delta group carries attribute {attribute_id} twice; the \
                  format defines one stream per attribute"
             )));
         }
-        got.insert(attribute_id, values);
+        if let Some(values) = values {
+            got.insert(attribute_id, values);
+        }
     }
     let Some(id_stream) = got.remove(&op::A_GAUSSIAN_ID) else {
         return Err(Error::Malformed(
@@ -1079,6 +1153,12 @@ pub fn check_keyframe_mu_t(state: &State, t0: f64, quantization: &rec::Quantizat
     for row in 0..state.count() {
         let never_fades = flags.values[row] & op::FLAG_NEVER_FADES != 0;
         let step = mu_step(sigma.values[row], steps.sigma_log, never_fades, steps.time);
+        if !step.is_finite() || step <= 0.0 {
+            return Err(Error::Malformed(format!(
+                "keyframe gaussian_id {} has a non-finite or non-positive mu_t grid step {step}",
+                state.ids[row]
+            )));
+        }
         let expected = rint(t0 / step);
         if mu.values[row] != expected {
             return Err(Error::Malformed(format!(
@@ -1232,7 +1312,7 @@ pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
     })
 }
 
-fn ranged_framing<R: crate::Readable + ?Sized>(
+pub(crate) fn ranged_framing<R: crate::Readable + ?Sized>(
     source: &mut R,
     offset: u64,
     declared_length: Option<u64>,
@@ -1275,7 +1355,7 @@ fn ranged_framing<R: crate::Readable + ?Sized>(
     Ok((opcode, content_length))
 }
 
-fn ranged_record<R: crate::Readable + ?Sized>(
+pub(crate) fn ranged_record<R: crate::Readable + ?Sized>(
     source: &mut R,
     offset: u64,
     declared_length: Option<u64>,
@@ -1285,13 +1365,9 @@ fn ranged_record<R: crate::Readable + ?Sized>(
     Ok((opcode, source.read(content_at, content_length)?))
 }
 
-/// Parse the known Header prefix without transferring an appended extension.
-///
-/// `Header::parse` deliberately ignores an unread trailer, so a prefix is sufficient as
-/// soon as all required length-prefixed fields are present. Grow the range geometrically
-/// up to the same fixed front-matter ceiling as the ordinary indexed reader; the record's
-/// declared length still tells the caller where the next record starts.
-fn ranged_header<R: crate::Readable + ?Sized>(
+/// Parse a geometrically growing Header prefix, capped at the indexed front-matter limit.
+/// Its declared length still locates the next record.
+pub(crate) fn ranged_header<R: crate::Readable + ?Sized>(
     source: &mut R,
     content_at: u64,
     content_length: u64,
@@ -1318,11 +1394,8 @@ fn ranged_header<R: crate::Readable + ?Sized>(
     }
 }
 
-/// Read one front-matter record only after its declared allocation has passed the shared
-/// fixed ceiling. Unlike Header, neither parser can decide it is complete from a small
-/// prefix: Quantization has a variable bounds map and Window Table has a declared row
-/// count, so the bounded record is transferred whole.
-fn ranged_front_matter_content<R: crate::Readable + ?Sized>(
+/// Read variable Quantization or Window Table content after enforcing the shared ceiling.
+pub(crate) fn ranged_front_matter_content<R: crate::Readable + ?Sized>(
     source: &mut R,
     content_at: u64,
     content_length: u64,
@@ -1517,6 +1590,12 @@ pub fn open_indexed<R: crate::Readable + ?Sized>(source: &mut R) -> Result<Index
     }
     let footer =
         rec::Footer::parse(&tail[crate::serialization::RECORD_HEADER_SIZE..footer_total as usize])?;
+    if footer.summary_start > footer_at {
+        return Err(Error::Malformed(format!(
+            "the footer says the summary starts at {}, past the footer itself at {footer_at}",
+            footer.summary_start
+        )));
+    }
 
     let mut header: Option<rec::Header> = None;
     let mut quant: Option<rec::Quantization> = None;
@@ -1581,12 +1660,6 @@ pub fn open_indexed<R: crate::Readable + ?Sized>(source: &mut R) -> Result<Index
     };
 
     let mut index: Vec<rec::ChunkIndexEntry> = Vec::new();
-    if footer.summary_start > footer_at {
-        return Err(Error::Malformed(format!(
-            "the footer says the summary starts at {}, past the footer itself at {footer_at}",
-            footer.summary_start
-        )));
-    }
     let mut summary_at = footer.summary_start;
     while summary_at != 0 && summary_at < footer_at {
         let (opcode, content_length) = ranged_framing(source, summary_at, None)?;
@@ -2110,12 +2183,67 @@ mod hostile_record_tests {
         body
     }
 
+    fn chunk_content_with_compression(
+        name: &str,
+        payload: &[u8],
+        decoded_size: u64,
+        count: u32,
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        put_f64(&mut body, 0.0);
+        put_f64(&mut body, 1.0);
+        put_u32(&mut body, 0);
+        put_u32(&mut body, count);
+        put_string(&mut body, name);
+        put_u64(&mut body, decoded_size);
+        put_blob(&mut body, payload);
+        body
+    }
+
+    fn raw_stream_header(
+        attribute: u8,
+        width: u8,
+        mode: u8,
+        stream_codec: u8,
+        channels: u8,
+        count: u32,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut stream = vec![attribute, width, mode, stream_codec, channels];
+        put_u32(&mut stream, count);
+        put_u64(&mut stream, payload.len() as u64);
+        stream.extend_from_slice(payload);
+        stream
+    }
+
     #[test]
     fn delta_chunk_compression_is_decoded_before_group_framing() {
         let records = empty_delta_records();
         let compressed = codec::compress(&records, codec::DEFLATE, 6).unwrap();
         let content = delta_content_with_compression("deflate", &compressed, records.len() as u64);
         check_delta_chunk(&content, &[]).unwrap();
+    }
+
+    #[test]
+    fn keyframe_chunk_compression_is_decoded_before_stream_framing() {
+        let streams = encode_stream(op::A_GAUSSIAN_ID, &[], 1, codec::DEFLATE, 6, true).unwrap();
+        let compressed = codec::compress(&streams, codec::DEFLATE, 6).unwrap();
+        let content =
+            chunk_content_with_compression("deflate", &compressed, streams.len() as u64, 0);
+        decode_keyframe_chunk(&content, &[]).unwrap();
+    }
+
+    #[test]
+    fn a_compressed_keyframe_cannot_expand_past_the_fixed_cap() {
+        let content = chunk_content_with_compression(
+            "deflate",
+            &[0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01],
+            MAX_STREAM_BYTES + 1,
+            0,
+        );
+        let error = decode_keyframe_chunk(&content, &[]).unwrap_err();
+        assert!(error.to_string().contains("past the"), "{error}");
+        assert!(error.to_string().contains("byte cap"), "{error}");
     }
 
     #[test]
@@ -2156,6 +2284,82 @@ mod hostile_record_tests {
         let bytes = encode_stream(op::A_POSITION, &[1, 2], 2, codec::DEFLATE, 6, true).unwrap();
         let error = decode_group(&bytes, 1).unwrap_err();
         assert!(error.to_string().contains("declares 2 channels"), "{error}");
+    }
+
+    #[test]
+    fn defined_attribute_channels_are_checked_before_payload_decode() {
+        let stream = raw_stream_header(
+            op::A_POSITION,
+            1,
+            crate::stream::MODE_RAW,
+            9,
+            255,
+            (1 << 20) as u32,
+            &[],
+        );
+        let error = decode_group(&stream, 1 << 20).unwrap_err();
+        assert!(
+            error.to_string().contains("declares 255 channels"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn unknown_attributes_are_skipped_without_decoding_extension_semantics() {
+        let unknown = raw_stream_header(32, 99, 88, 77, 66, 1, &[1, 2, 3]);
+        let mut group = encode_stream(op::A_GAUSSIAN_ID, &[7], 1, codec::DEFLATE, 6, true).unwrap();
+        group.extend_from_slice(&unknown);
+        let (ids, bins) = decode_group(&group, 1).unwrap();
+        assert_eq!(ids, [7]);
+        assert!(bins.is_empty());
+
+        let mut keyframe_streams =
+            encode_stream(op::A_GAUSSIAN_ID, &[], 1, codec::DEFLATE, 6, true).unwrap();
+        keyframe_streams.extend_from_slice(&raw_stream_header(32, 99, 88, 77, 66, 0, &[4, 5]));
+        let record = rec::encode_chunk(0.0, 1.0, 0, 0, &keyframe_streams);
+        decode_keyframe_chunk(record_content(&record), &[]).unwrap();
+    }
+
+    #[test]
+    fn empty_defined_attributes_still_validate_their_fixed_header_semantics() {
+        for (label, width, mode, stream_codec) in [
+            ("symbol width", 3, crate::stream::MODE_RAW, codec::DEFLATE),
+            ("stream mode", 1, 9, codec::DEFLATE),
+            ("stream codec", 1, crate::stream::MODE_RAW, 9),
+        ] {
+            let stream = raw_stream_header(op::A_GAUSSIAN_ID, width, mode, stream_codec, 1, 0, &[]);
+            let error = decode_state_stream(&mut Cursor::new(&stream), 0).unwrap_err();
+            assert!(error.to_string().contains(label), "{label}: {error}");
+        }
+    }
+
+    #[test]
+    fn state_stream_delta_runs_cannot_leave_the_i32_domain() {
+        let symbols = [
+            crate::stream::zigzag(i64::from(i32::MAX)),
+            crate::stream::zigzag(1),
+        ];
+        let mut raw = vec![0u8; symbols.len() * 4];
+        for byte in 0..4 {
+            for (i, symbol) in symbols.iter().enumerate() {
+                raw[byte * symbols.len() + i] = (symbol >> (8 * byte)) as u8;
+            }
+        }
+        let payload = codec::compress(&raw, codec::DEFLATE, 6).unwrap();
+        let stream = raw_stream_header(
+            op::A_OPACITY,
+            4,
+            crate::stream::MODE_DELTA,
+            codec::DEFLATE,
+            1,
+            2,
+            &payload,
+        );
+        let error = decode_state_stream(&mut Cursor::new(&stream), 2).unwrap_err();
+        assert!(
+            error.to_string().contains("outside the signed 32-bit"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -2222,6 +2426,19 @@ mod hostile_record_tests {
         };
         let error = check_keyframe_mu_t(&state, 1.0, &quantization).unwrap_err();
         assert!(error.to_string().contains("Chunk t0 1"), "{error}");
+
+        for step_time in [0.0, -0.004] {
+            let quantization = rec::Quantization {
+                step_time,
+                step_sigma_log: 0.04,
+                ..Default::default()
+            };
+            let error = check_keyframe_mu_t(&state, 0.0, &quantization).unwrap_err();
+            assert!(
+                error.to_string().contains("non-positive mu_t grid step"),
+                "{error}"
+            );
+        }
     }
 
     struct Watched<'a> {
