@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
-import difflib
 import json
 import math
 import os
@@ -30,7 +29,12 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
+from decimal import InvalidOperation
 from typing import NamedTuple
+
+from json_compare import diagnostic_differences
+from json_compare import for_capabilities as comparison_document
+from json_compare import loads as load_canonical_json
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "data")
@@ -126,6 +130,14 @@ def variants() -> list[str]:
 #: an error the vocabulary does not name is a failed invocation, not an empty identifier.
 REFUSAL_FAMILIES = frozenset({"python", "rust", "typescript", "cpp", "swift", "dart"})
 
+# Exact canonical-unit aggregation is introduced as a stacked conformance change. The
+# transition is field-level: families absent here still compare every variant and every
+# field except positionSum/opacitySum. Each implementation layer adds only its own family.
+# The transition itself claims no implementation. Each SDK layer adds only its own family
+# after its focused tests and strict corpus pass prove the feature.
+EXACT_AGGREGATE_FAMILIES: frozenset[str] = frozenset()
+CANONICAL_STATE_ORDER_FAMILIES: frozenset[str] = frozenset()
+
 
 #: Record families a language has not implemented, by the variant-name flags that carry
 #: them. A partial implementation is a supported state — the feature matrix is where it
@@ -204,6 +216,10 @@ class Capabilities:
     refusals: bool
     #: Name fragments this runner has not implemented; a variant containing one is skipped.
     declines: tuple[str, ...] = ()
+    #: Whether position/opacity aggregates use exact canonical decimal units.
+    exact_aggregates: bool = False
+    #: Whether composed state samples use portable emitted-value ordering.
+    canonical_state_order: bool = False
 
 
 def builtin_capabilities(family: str, runner_name: str) -> Capabilities:
@@ -219,6 +235,8 @@ def builtin_capabilities(family: str, runner_name: str) -> Capabilities:
         indexed=runner_name.endswith("decode_indexed"),
         refusals=family in REFUSAL_FAMILIES,
         declines=tuple(FAMILY_DECLINES.get(family, ())),
+        exact_aggregates=family in EXACT_AGGREGATE_FAMILIES,
+        canonical_state_order=family in CANONICAL_STATE_ORDER_FAMILIES,
     )
 
 
@@ -484,6 +502,12 @@ def declared_capabilities(command: list[str], timeout: float) -> Capabilities:
     declines = doc.get("declines", [])
     if not isinstance(declines, list) or not all(isinstance(item, str) and item for item in declines):
         raise ProtocolError(f"declares declines {declines!r}; expected a list of name fragments")
+    exact_aggregates = doc.get("exactAggregates", False)
+    if not isinstance(exact_aggregates, bool):
+        raise ProtocolError(f"declares exactAggregates {exact_aggregates!r}; expected true or false")
+    canonical_state_order = doc.get("canonicalStateOrder", False)
+    if not isinstance(canonical_state_order, bool):
+        raise ProtocolError(f"declares canonicalStateOrder {canonical_state_order!r}; expected true or false")
 
     return Capabilities(
         family=family,
@@ -491,6 +515,8 @@ def declared_capabilities(command: list[str], timeout: float) -> Capabilities:
         indexed=read_path == "indexed",
         refusals=refusals,
         declines=tuple(declines),
+        exact_aggregates=exact_aggregates,
+        canonical_state_order=canonical_state_order,
     )
 
 
@@ -587,6 +613,33 @@ def positive_seconds(text: str) -> float:
     if not math.isfinite(value) or value <= 0:
         raise argparse.ArgumentTypeError(f"{text!r} does not bound an invocation; give a finite number above zero")
     return value
+
+
+def compared_documents(actual_json, expected_json, caps: Capabilities):
+    """Build the two documents scored by the harness without leaking parser depth errors."""
+    try:
+        return (
+            comparison_document(
+                actual_json,
+                exact_aggregates=caps.exact_aggregates,
+                canonical_state_order=caps.canonical_state_order,
+            ),
+            comparison_document(
+                expected_json,
+                exact_aggregates=caps.exact_aggregates,
+                canonical_state_order=caps.canonical_state_order,
+            ),
+        ), None
+    except RecursionError as exc:
+        return None, exc
+
+
+def runner_document(text: str):
+    """Parse one untrusted runner response without letting it abort the whole suite."""
+    try:
+        return load_canonical_json(text), None
+    except (ValueError, RecursionError, InvalidOperation) as exc:
+        return None, exc
 
 
 def builtin_jobs(family_filter: str | None) -> Iterator[tuple[Capabilities, list[str]]]:
@@ -724,26 +777,31 @@ def main(argv=None) -> int:
             # Stdout that does not parse is one variant's failure, and the offending text
             # is quoted. Unguarded, a single stray print in a runner ends the whole run
             # with a traceback about the harness rather than about the runner.
-            try:
-                actual_json = json.loads(actual)
-            # As in the capabilities handshake, parser limits can raise plain
-            # ValueError (an oversized integer) or RecursionError (excessive nesting).
-            # Keep that failure on this runner/variant instead of letting it escape the
-            # harness as a traceback.
-            except (ValueError, RecursionError) as exc:
+            actual_json, parse_error = runner_document(actual)
+            if parse_error is not None:
                 failed += 1
-                print(f"FAIL {caps.name} {variant}: stdout is not one JSON document ({exc})")
+                print(f"FAIL {caps.name} {variant}: stdout is not one JSON document ({parse_error})")
                 print(f"  stdout: {actual[:200]!r}")
                 continue
-            if actual_json == json.loads(expected):
+            assert actual_json is not None
+            expected_json = load_canonical_json(expected)
+            compared, comparison_error = compared_documents(actual_json, expected_json, caps)
+            if comparison_error is not None:
+                failed += 1
+                print(
+                    f"FAIL {caps.name} {variant}: stdout exceeds the canonical comparison nesting limit "
+                    f"({comparison_error})"
+                )
+                print(f"  stdout: {actual[:200]!r}")
+                continue
+            assert compared is not None
+            actual_comparable, expected_comparable = compared
+            if actual_comparable == expected_comparable:
                 passed += 1
             else:
                 failed += 1
                 print(f"FAIL {caps.name} {variant}")
-                diff = difflib.unified_diff(
-                    expected.splitlines(), actual.splitlines(), "expected", "actual", lineterm="", n=2
-                )
-                for line in list(diff)[:40]:
+                for line in diagnostic_differences(expected_comparable, actual_comparable):
                     print("  " + line)
 
     print(f"\n{passed} passed, {skipped} skipped (variant not supported), {failed} failed")

@@ -241,18 +241,22 @@ and no path. The runner answers with one JSON object on stdout and exits 0:
   "family": "go",
   "readPath": "indexed",
   "refusals": true,
-  "declines": ["Object", "SHDegree3"]
+  "declines": ["Object", "SHDegree3"],
+  "exactAggregates": true,
+  "canonicalStateOrder": true
 }
 ```
 
-| Key        | Required | Meaning                                                                                                 |
-| ---------- | -------- | ------------------------------------------------------------------------------------------------------- |
-| `protocol` | yes      | the protocol version, as the JSON integer `1`. `true` and `"1"` are errors, not versions                |
-| `name`     | yes      | exactly `<family>/decode_<readPath>`, such as `go/decode_indexed`; it must agree with both keys         |
-| `family`   | no       | defaults to `name` up to the first `/`                                                                  |
-| `readPath` | yes      | `streamed` or `indexed`. An indexed runner is not asked about a variant written without `UseChunkIndex` |
-| `refusals` | no       | `true` to be scored on all seven invalid variants. Absent means no, and the seven are skipped           |
-| `declines` | no       | fragments of a **valid** variant's name this runner has not implemented; a match is skipped, not failed |
+| Key                   | Required | Meaning                                                                                                 |
+| --------------------- | -------- | ------------------------------------------------------------------------------------------------------- |
+| `protocol`            | yes      | the protocol version, as the JSON integer `1`. `true` and `"1"` are errors, not versions                |
+| `name`                | yes      | exactly `<family>/decode_<readPath>`, such as `go/decode_indexed`; it must agree with both keys         |
+| `family`              | no       | defaults to `name` up to the first `/`                                                                  |
+| `readPath`            | yes      | `streamed` or `indexed`. An indexed runner is not asked about a variant written without `UseChunkIndex` |
+| `refusals`            | no       | `true` to be scored on all seven invalid variants. Absent means no, and the seven are skipped           |
+| `declines`            | no       | fragments of a **valid** variant's name this runner has not implemented; a match is skipped, not failed |
+| `exactAggregates`     | no       | `true` makes root/state `positionSum` and `opacitySum` strict; absent means the transition omits them   |
+| `canonicalStateOrder` | no       | `true` makes `states[*].sample` strict; absent means the transition omits it                            |
 
 Two consequences worth stating, because they are what the built-in tables get wrong for an outsider.
 The runner opts into the invalid corpus itself, so it does not need its family added to
@@ -454,10 +458,10 @@ change is correct, never to make a red suite green.
 
 ### How a number is allowed to be spelled
 
-**The harness compares parsed JSON, not text.** `run.py` diffs `json.loads(actual)` against
-`json.loads(expected)`, so a runner is never required to reproduce the expectation file
-byte-for-byte — only to parse to the same values. This is the convention, stated here so nobody has
-to rediscover it from a checksum mismatch:
+**The harness compares parsed JSON, not text.** `run.py` retains JSON number tokens as decimal
+values before comparing them, so a runner is never required to reproduce the expectation file
+byte-for-byte — only to emit the same numeric values. This is the convention, stated here so nobody
+has to rediscover it from a checksum mismatch:
 
 - **A language may spell a number however it likes.** Python writes `50.0` where JavaScript writes
   `50`; `1e-06` and `0.000001` are the same number; `1.0E+2` and `100.0` are the same number. All of
@@ -476,6 +480,17 @@ to rediscover it from a checksum mismatch:
 
 The committed `.json` files are written by the Python generator, so they carry Python's spelling of
 every float. That is an artifact of who wrote them, not a requirement on anyone reading them.
+
+### Canonical-state transition
+
+Canonical position and opacity totals are moving to exact sums of six-decimal units, and composed
+state samples are moving to portable emitted-value ordering, in a stacked SDK change. During that
+stack, `exactAggregates` and `canonicalStateOrder` are runner capabilities. The transition layer
+itself claims neither for any implementation. For an unclaimed feature the shared comparison omits
+only `positionSum`/`opacitySum` or `states[*].sample`; root population counters, state times and
+live counts, objects, audio, camera, metadata, provenance, SH, and every other field of every
+variant remain strict. Each SDK layer adds its family to the corresponding capability set and
+removes the same narrow transition from any direct cross-decoder gate it owns.
 
 ## Fixture variety is a feature to cover, too
 
