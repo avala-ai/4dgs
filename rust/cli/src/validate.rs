@@ -782,12 +782,12 @@ fn check_sh_bit_depths(quant: &rec::Quantization, sh_degree: u8, report: &mut Re
     for (i, bits) in declared.iter().enumerate() {
         let band = i + 1;
         let key = format!("sh_band{band}");
-        let expected = sh_bound(*bits).to_string();
+        let expected = sh_bound(*bits);
         match quant.bounds.get(&key) {
             None => report.warn(format!(
                 "Quantization declares {bits} bits for SH band {band} but no `{key}` bound (§5.3)"
             )),
-            Some(found) if *found != expected => report.warn(format!(
+            Some(found) if !decimal_equals_integer(found, expected) => report.warn(format!(
                 "Quantization declares `{key}` as {found}; {bits} bits gives a bound of {expected} (§6.5)"
             )),
             Some(_) => {}
@@ -801,6 +801,94 @@ fn check_sh_bit_depths(quant: &rec::Quantization, sh_degree: u8, report: &mut Re
             quant.step_sh
         ));
     }
+}
+
+/// Whether the §5.3 bound `value` spells exactly the small non-negative integer `expected`.
+///
+/// Matched against the grammar the specification writes down rather than against whatever a
+/// decimal library parses, which is what makes this agree with the Python, TypeScript and Dart
+/// validators on every input instead of on the ones their runtimes happen to read alike. There
+/// is no trim: §5.3 admits nothing around the number, so `value.trim()` — Unicode `White_Space`,
+/// which is neither Python's set nor JavaScript's — accepted spellings the format does not have.
+///
+/// Digits are compared as digits: no exponent is too large to read, nothing is built from the
+/// exponent, and nothing passes through binary64.
+fn decimal_equals_integer(value: &str, expected: u8) -> bool {
+    let mut value = value;
+    let negative = if let Some(rest) = value.strip_prefix('-') {
+        value = rest;
+        true
+    } else {
+        value = value.strip_prefix('+').unwrap_or(value);
+        false
+    };
+    let mut exponent_parts = value.split(['e', 'E']);
+    let mantissa = exponent_parts.next().unwrap_or_default();
+    let exponent = match exponent_parts.next() {
+        Some(part) if !part.is_empty() => part,
+        Some(_) => return false,
+        None => "0",
+    };
+    if exponent_parts.next().is_some() {
+        return false;
+    }
+    let exponent_digits = exponent
+        .strip_prefix('+')
+        .or_else(|| exponent.strip_prefix('-'))
+        .unwrap_or(exponent);
+    if exponent_digits.is_empty() || !exponent_digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    // The significand: ASCII digits with at most one point, and at least one digit. The
+    // string is bounded by the String Map value it was already read from.
+    let mut digits = String::with_capacity(mantissa.len());
+    let mut integer_digits = 0usize;
+    let mut saw_decimal = false;
+    for byte in mantissa.bytes() {
+        match byte {
+            b'0'..=b'9' => {
+                digits.push(char::from(byte));
+                if !saw_decimal {
+                    integer_digits += 1;
+                }
+            }
+            b'.' if !saw_decimal => saw_decimal = true,
+            _ => return false,
+        }
+    }
+    if digits.is_empty() {
+        return false;
+    }
+    // A significand of zeroes is the value zero, at whatever exponent it carries.
+    let Some(first_nonzero) = digits.bytes().position(|byte| byte != b'0') else {
+        return expected == 0;
+    };
+    if negative {
+        return false;
+    }
+
+    let significant = digits[first_nonzero..].trim_end_matches('0');
+    let expected = expected.to_string();
+    let required_exponent =
+        expected.len() as isize - integer_digits as isize + first_nonzero as isize;
+    significant == expected && decimal_integer_equals(exponent, required_exponent)
+}
+
+/// Whether the signed digit string `value` is `expected`, without building the number.
+fn decimal_integer_equals(value: &str, expected: isize) -> bool {
+    let (negative, digits) = if let Some(rest) = value.strip_prefix('-') {
+        (true, rest)
+    } else {
+        (false, value.strip_prefix('+').unwrap_or(value))
+    };
+    if digits.is_empty() {
+        return false;
+    }
+    let digits = digits.trim_start_matches('0');
+    if digits.is_empty() {
+        return expected == 0;
+    }
+    negative == expected.is_negative() && digits == expected.unsigned_abs().to_string()
 }
 
 /// A non-finite value spelled the way Python spells it, so that the two validators'
@@ -1068,6 +1156,153 @@ mod tests {
         let report = validate(&minimal_file(&grids()));
         assert!(report.ok(), "{:?}", errors(&report));
         assert!(errors(&report).is_empty(), "{:?}", errors(&report));
+    }
+
+    /// The spellings section 5.3's grammar accepts, against the bound each one declares.
+    ///
+    /// The identical table is checked by the Python, TypeScript and Dart validators. A row
+    /// that moves here without moving there is the disagreement the grammar exists to end,
+    /// so keep the four in step.
+    fn equivalent_bound_spellings(long_fraction: &str) -> Vec<(&str, u8)> {
+        vec![
+            ("16", 16),
+            ("16.", 16),
+            ("16.0", 16),
+            ("+016.000", 16),
+            ("1.6e1", 16),
+            ("160e-1", 16),
+            ("0.16E2", 16),
+            ("8", 8),
+            ("0.8e1", 8),
+            ("80e-1", 8),
+            (".4e1", 4),
+            (long_fraction, 4),
+            ("0", 0),
+            ("0.0", 0),
+            ("-0", 0),
+            ("+0.000", 0),
+            ("0e999999999999999999999999", 0),
+            ("0.0e-999999999999999999999999", 0),
+        ]
+    }
+
+    /// The spellings section 5.3's grammar refuses, against the bound the record declares.
+    ///
+    /// Several are accepted by one runtime's decimal type or another: underscores and other
+    /// scripts' digits by Python's `Decimal`, U+FEFF by JavaScript's whitespace class, and
+    /// U+001C through U+001F by Python's. That is exactly why the grammar is matched here
+    /// rather than delegated to a runtime.
+    fn rejected_bound_spellings() -> Vec<(&'static str, u8)> {
+        vec![
+            ("1_6", 16),
+            ("8_0e-1", 8),
+            ("_16", 16),
+            ("16_", 16),
+            ("\u{0661}\u{0666}", 16), // Arabic-Indic one six
+            ("\u{0668}", 8),          // Arabic-Indic eight
+            ("\u{0668}\u{0660}e-\u{06f1}", 8),
+            ("\u{ff11}\u{ff16}", 16), // fullwidth one six
+            ("\u{2078}", 8),          // superscript eight, a digit in no grammar
+            ("\u{feff}16", 16),       // a byte-order mark is data, not padding
+            ("\u{feff}4", 4),
+            ("16\u{feff}", 16),
+            ("\u{001c}8", 8), // Python's `Decimal` trims U+001C; the grammar does not
+            ("\u{001f}16", 16),
+            (" 16 ", 16),
+            ("\t16", 16),
+            ("16\n", 16),
+            ("\u{2009}16", 16), // thin space
+            ("16.0000000000000001", 16),
+            ("15.9999999999999999", 16),
+            ("1.6", 16),
+            ("16e", 16),
+            ("16e+", 16),
+            ("16e-", 16),
+            ("16eNaN", 16),
+            ("", 16),
+            (".", 16),
+            ("+", 16),
+            ("_", 0),
+            ("NaN", 0),
+            ("nan", 0),
+            ("Infinity", 16),
+            ("inf", 16),
+            ("-16", 16),
+            ("0e", 0),
+            ("0_0", 0),
+            ("\u{0660}", 0), // Arabic-Indic zero
+            ("\u{feff}0", 0),
+            ("\u{001c}0", 0),
+            ("1", 0),
+        ]
+    }
+
+    /// The SH bit depth whose section 6.5 bound is `bound`.
+    fn depth_for_bound(bound: u8) -> u8 {
+        match bound {
+            16 => 3,
+            8 => 4,
+            4 => 5,
+            0 => 8,
+            other => panic!("no SH bit depth gives a bound of {other}"),
+        }
+    }
+
+    #[test]
+    fn a_bound_is_read_by_the_grammar_the_specification_writes_down() {
+        let long_fraction = format!("0.{}4e1001", "0".repeat(1000));
+        for (spelling, expected) in equivalent_bound_spellings(&long_fraction) {
+            assert!(
+                decimal_equals_integer(spelling, expected),
+                "{spelling:?} should be {expected}"
+            );
+        }
+        for (spelling, expected) in rejected_bound_spellings() {
+            assert!(
+                !decimal_equals_integer(spelling, expected),
+                "{spelling:?} should not be {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bound_outside_the_grammar_is_reported_against_the_record() {
+        // The comparator is where the grammar lives, but the per-band check is where a
+        // holder of a file meets it, so every row is also driven through that.
+        let long_fraction = format!("0.{}4e1001", "0".repeat(1000));
+        for (spelling, expected) in equivalent_bound_spellings(&long_fraction) {
+            let report = sh_band_one_report(spelling, expected);
+            assert!(
+                report
+                    .findings
+                    .iter()
+                    .all(|finding| !finding.message.contains("`sh_band1` as")),
+                "{spelling:?} should be {expected}: {:?}",
+                report.findings
+            );
+        }
+        for (spelling, expected) in rejected_bound_spellings() {
+            let report = sh_band_one_report(spelling, expected);
+            assert!(
+                report
+                    .findings
+                    .iter()
+                    .any(|finding| finding.message.contains("`sh_band1` as")),
+                "{spelling:?} should not be {expected}: {:?}",
+                report.findings
+            );
+        }
+    }
+
+    /// A per-band check of one Quantization record declaring `spelling` for band 1, at the
+    /// bit depth whose bound is `expected`.
+    fn sh_band_one_report(spelling: &str, expected: u8) -> Report {
+        let mut quant = grids();
+        quant.sh_bit_depths = vec![depth_for_bound(expected)];
+        quant.bounds.insert("sh_band1".into(), spelling.into());
+        let mut report = Report::default();
+        check_sh_bit_depths(&quant, 1, &mut report);
+        report
     }
 
     #[test]

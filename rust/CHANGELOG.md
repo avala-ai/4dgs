@@ -48,6 +48,16 @@ All notable changes to the Rust crate are documented here, following
 
 ### Changed
 
+- **`4dgs validate` reads a per-band SH bound by the grammar spec §5.3 writes down.** The comparison
+  began with `value.trim()`, which removes Unicode `White_Space` — a set that is neither Python's,
+  which additionally accepts U+001C through U+001F, nor JavaScript's, which additionally accepts
+  U+FEFF. It then removed underscores and folded every Unicode `Nd` digit to ASCII, and refused
+  exponents outside CPython's build-dependent `Decimal` range, all to mirror one interpreter's
+  string syntax. §5.3 now states the grammar instead: an optional sign, ASCII digits, an optional
+  point and an optional exponent, with nothing around it. The trim, the 68-entry digit table and the
+  exponent range check are gone. `1_6`, `١٦` and a space-padded bound are now reported as bounds
+  that disagree with the record; `0e999999999999999999999999` is accepted as the zero it spells.
+  Equivalent spellings such as `5e-05`, `5e-5` and `0.00005` remain one bound.
 - `WriteOptions.cutoff` outside `(0, 1]` is refused as `InvalidInput` rather than written. A
   marginal threshold of zero or less has no logarithm to invert, and the `NaN` support half-width
   that came back was discarded by `f64::max`/`f64::min`, silently planning every chunk as though
