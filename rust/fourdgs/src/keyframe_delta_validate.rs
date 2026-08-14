@@ -1882,13 +1882,13 @@ mod tests {
         assert_eq!(gap_failure.offset, Some(index_records[1] as u64));
         assert!(gap_failure.error.to_string().contains("leave a gap"));
 
-        // The same earlier gap must not steal attribution from a later record that fails
-        // before `open_indexed` reaches its timeline checks.
+        // The same earlier gap must not steal attribution from a later bounded-field
+        // failure before `open_indexed` reaches its timeline checks.
         let third_content = index_records[2] + RECORD_HEADER_SIZE;
         bytes[third_content + 36..third_content + 40].copy_from_slice(&u32::MAX.to_le_bytes());
         let failure = failure(&bytes, ValidationMode::Indexed);
         assert_eq!(failure.offset, Some(index_records[2] as u64));
-        assert!(failure.error.to_string().contains("truncated"));
+        assert!(failure.error.to_string().contains("at most 3"));
     }
 
     #[test]
