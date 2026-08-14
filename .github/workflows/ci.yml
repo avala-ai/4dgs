@@ -12,19 +12,33 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Total tree size under 9.5 MB
+      - name: Total tree size under 10 MB
         # Raised from 8192 once the inspect-and-validate tools landed: #191 brought the
         # Dart validator and #188 the Swift one, and the tree they leave measures 8696 KiB.
         # The gate went red on the merge itself rather than on either pull request, because
-        # each was measured against a main that did not yet have the other. 9216 held that
-        # tree; 9728 holds the current SDK/validator set plus the bounded Rust reader at
-        # 9412 KiB. This is the whole-tree gate — the per-language sub-budgets below are
-        # still what say which language grew.
+        # each was measured against a main that did not yet have the other. 9216 is the step
+        # that holds the merged tree with room, and this is the whole-tree gate — the
+        # per-language sub-budgets below are still what say which language grew.
+        #
+        # Raised again to 9728 after the canonical-order round: making the composed-state
+        # summaries order-independent touched five SDKs at once, and the conformance
+        # variants that pin the property — non-finite ordering, wide units, the exact
+        # cancellation witness — are corpus expectations rather than code. The tree
+        # measured 9296 with both this gate and the Rust one already red on `main`; the
+        # tree check runs first and fails the job, so the Rust overrun was invisible until
+        # this gate was moved. Both are raised here for that reason, together.
+        #
+        # 10240 rather than a number that fits `main` today, because the number that fits
+        # today is what put this gate in the state it is in. Each open branch is green
+        # measured against a `main` that lacks the others; test-merging the queue gives
+        # 9408, and adding the bounded-validation branch gives 9772. A budget sized to
+        # `main` alone would go red on the second merge, which is precisely how the 8192
+        # and 9216 steps were each discovered — after the fact, by a red `main`.
         run: |
           size_kb=$(du -s --exclude=.git . | cut -f1)
           echo "tree: ${size_kb} KiB"
-          if [ "$size_kb" -gt 9728 ]; then
-            echo "::error::tree is ${size_kb} KiB, over the 9728 KiB budget"
+          if [ "$size_kb" -gt 10240 ]; then
+            echo "::error::tree is ${size_kb} KiB, over the 10240 KiB budget"
             exit 1
           fi
       - name: Conformance data under 2.5 MB
@@ -87,12 +101,20 @@ jobs:
         # crate of forty small source files carries roughly 150 KiB of slack and a single
         # new file costs 4 KiB whatever it contains. Trimming prose does not move this
         # number; adding or removing files does.
+        #
+        # 1856 after the canonical-state work and the bounded-validation branch: `keyframe_delta_states_json` and the
+        # order-independent summary it now produces, the exact-aggregate arithmetic that
+        # replaced summation order as a source of divergence, and two test files
+        # (`tests/encode.rs`, `tests/keyframe_delta.rs`) that pin them. `main` alone measures
+        # 1412 and the open queue merged measures 1468; #270's bounded indexed validation
+        # takes it to 1832, and that branch sets this same number, so they agree here rather
+        # than conflicting on one line.
         run: |
           size_kb=$(du -s rust | cut -f1)
           echo "rust: ${size_kb} KiB"
           [ "$size_kb" -le 1856 ] || { echo "::error::rust is ${size_kb} KiB, over the 1856 KiB budget"; exit 1; }
 
-      - name: TypeScript sources under 1152 KB
+      - name: TypeScript sources under 1216 KB
         # Sources only: this job installs nothing and builds nothing, so node_modules
         # and dist are not here to measure. A vendored dependency would show up as a
         # budget failure, which is the point.
@@ -143,7 +165,7 @@ jobs:
         run: |
           size_kb=$(du -s typescript | cut -f1)
           echo "typescript: ${size_kb} KiB"
-          [ "$size_kb" -le 1152 ] || { echo "::error::typescript is ${size_kb} KiB, over the 1152 KiB budget"; exit 1; }
+          [ "$size_kb" -le 1216 ] || { echo "::error::typescript is ${size_kb} KiB, over the 1216 KiB budget"; exit 1; }
       - name: Dart sources under 1472 KB
         # Sources only, same as TypeScript's and Swift's: this job builds nothing, so
         # .dart_tool and the compiled runners are not here to measure, and a vendored
