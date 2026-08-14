@@ -90,6 +90,291 @@ class TestRoundTrip:
         out = roundtrip(make_scene(n=1, windows=1, never_fades_fraction=0.0), duration=1.0)
         assert out.gaussians.count == 1
 
+    def test_public_cutoff_controls_chunk_intervals(self):
+        from fourdgs.indexed_reader import open_indexed
+        from fourdgs.readable import BytesReadable
+
+        scene = make_scene(n=1, windows=1, duration=1.0, never_fades_fraction=0.0)
+        scene.mu_t[:] = 0.25
+        scene.sigma_t[:] = 0.15
+        scene.win_lo[:] = 0.0
+        scene.win_hi[:] = 1.0
+
+        def intervals(cutoff):
+            encoded = io.BytesIO()
+            fourdgs.write(
+                encoded,
+                scene,
+                1.0,
+                options=fourdgs.WriteOptions(cutoff=cutoff, max_depth=1, min_chunk_gaussians=1),
+            )
+            indexed = open_indexed(BytesReadable(encoded.getvalue()))
+            return [(entry.t0, entry.t1) for entry in indexed.index]
+
+        # The default support crosses 0.5 and stays at the root. A higher cutoff narrows
+        # that same gaussian's support into the left child, so the public option must
+        # affect planning as well as the Header and quantization grids.
+        assert intervals(0.05) == [(0.0, 1.0)]
+        assert intervals(0.5) == [(0.0, 0.5)]
+
+    def test_chunk_plan_covers_support_after_temporal_quantization(self):
+        from fourdgs.indexed_reader import open_indexed
+        from fourdgs.readable import BytesReadable
+
+        scene = make_scene(n=1, windows=1, duration=1.0, never_fades_fraction=0.0)
+        scene.mu_t[:] = 0.2541
+        scene.sigma_t[:] = 0.2452
+        scene.win_lo[:] = 0.0
+        scene.win_hi[:] = 1.0
+        cutoff = math.exp(-0.5)
+
+        encoded = io.BytesIO()
+        fourdgs.write(
+            encoded,
+            scene,
+            1.0,
+            options=fourdgs.WriteOptions(cutoff=cutoff, max_depth=1, min_chunk_gaussians=1),
+        )
+        data = encoded.getvalue()
+        decoded = fourdgs.read(data)
+        indexed = open_indexed(BytesReadable(data))
+
+        assert scene.support(cutoff)[1][0] < 0.5
+        assert decoded.gaussians.mu_t[0] == pytest.approx(0.256)
+        assert decoded.gaussians.sigma_t[0] == pytest.approx(0.25002763)
+        assert decoded.gaussians.state_at(0.5, cutoff)["indices"].tolist() == [0]
+        assert len(indexed.chunks_for_time(0.5)) == 1
+
+    def test_inclusive_support_endpoint_does_not_enter_a_half_open_child(self):
+        from fourdgs.indexed_reader import open_indexed, read_chunk
+        from fourdgs.readable import BytesReadable
+
+        scene = make_scene(n=1, windows=1, duration=1.0, never_fades_fraction=0.0)
+        scene.mu_t[:] = 0.2541
+        scene.sigma_t[:] = 0.2452
+        cutoff = math.exp(-0.5)
+
+        seed = io.BytesIO()
+        fourdgs.write(seed, scene, 1.0, options=fourdgs.WriteOptions(cutoff=cutoff, max_depth=0))
+        seed_source = BytesReadable(seed.getvalue())
+        seed_index = open_indexed(seed_source)
+        reconstructed = read_chunk(seed_source, seed_index, seed_index.index[0])
+        boundary = float(reconstructed["mu_t"][0] + reconstructed["sigma_t"][0])
+        duration = 2.0 * boundary
+        scene.win_lo = np.array([0.0], dtype=np.float64)
+        scene.win_hi = np.array([duration], dtype=np.float64)
+
+        encoded = io.BytesIO()
+        fourdgs.write(
+            encoded,
+            scene,
+            duration,
+            options=fourdgs.WriteOptions(cutoff=cutoff, max_depth=1, min_chunk_gaussians=1),
+        )
+        data = encoded.getvalue()
+        source = BytesReadable(data)
+        indexed = open_indexed(source)
+        reconstructed = read_chunk(source, indexed, indexed.index[0])
+
+        assert reconstructed["mu_t"][0] + reconstructed["sigma_t"][0] == boundary
+        marginal = math.exp(-0.5 * ((boundary - reconstructed["mu_t"][0]) / reconstructed["sigma_t"][0]) ** 2)
+        assert marginal >= cutoff
+        assert len(indexed.chunks_for_time(boundary)) == 1
+
+    def test_cutoff_one_indexed_seek_covers_both_neighbors_of_the_mean(self):
+        from fourdgs.indexed_reader import open_indexed, read_chunk
+        from fourdgs.readable import BytesReadable
+        from fourdgs.stream_reader import _assemble
+
+        scene = make_scene(n=1, windows=1, duration=1.0, never_fades_fraction=0.0)
+        scene.mu_t[:] = 0.5
+        scene.sigma_t[:] = 0.1
+        cutoff = 1.0
+
+        encoded = io.BytesIO()
+        fourdgs.write(
+            encoded,
+            scene,
+            1.0,
+            options=fourdgs.WriteOptions(cutoff=cutoff, max_depth=1, min_chunk_gaussians=1),
+        )
+        data = encoded.getvalue()
+        decoded = fourdgs.read(data)
+        source = BytesReadable(data)
+        indexed = open_indexed(source)
+        mean = float(decoded.gaussians.mu_t[0])
+        neighbors = [np.nextafter(mean, -np.inf), np.nextafter(mean, np.inf)]
+
+        for t in neighbors:
+            full_state = decoded.gaussians.state_at(t, cutoff)
+            chunks = [read_chunk(source, indexed, entry) for entry in indexed.chunks_for_time(t)]
+            indexed_gaussians = _assemble(chunks, indexed.windows, indexed.header)
+            indexed_state = indexed_gaussians.state_at(t, cutoff)
+
+            assert full_state["indices"].tolist() == [0]
+            assert indexed_state["indices"].tolist() == [0]
+
+    @pytest.mark.parametrize("side", ["lower", "upper"])
+    def test_indexed_seek_covers_the_rounded_visibility_endpoint(self, side):
+        from fourdgs.indexed_reader import open_indexed, read_chunk
+        from fourdgs.readable import BytesReadable
+        from fourdgs.stream_reader import _assemble
+
+        scene = make_scene(n=1, windows=1, duration=1.0, never_fades_fraction=0.0)
+        scene.mu_t[:] = 0.5
+        scene.sigma_t[:] = 1.0
+        cutoff = 0.9
+
+        seed = io.BytesIO()
+        fourdgs.write(seed, scene, 1.0, options=fourdgs.WriteOptions(cutoff=cutoff, max_depth=0))
+        reconstructed = fourdgs.read(seed.getvalue()).gaussians
+        mean = float(reconstructed.mu_t[0])
+        half = math.sqrt(-2.0 * math.log(cutoff)) * float(reconstructed.sigma_t[0])
+        if side == "upper":
+            split = np.nextafter(mean + half, np.inf)
+            query = split
+        else:
+            split = mean - half
+            query = np.nextafter(split, -np.inf)
+        duration = 2.0 * split
+        scene.win_lo = np.array([0.0], dtype=np.float64)
+        scene.win_hi = np.array([duration], dtype=np.float64)
+
+        encoded = io.BytesIO()
+        fourdgs.write(
+            encoded,
+            scene,
+            duration,
+            options=fourdgs.WriteOptions(cutoff=cutoff, max_depth=1, min_chunk_gaussians=1),
+        )
+        data = encoded.getvalue()
+        decoded = fourdgs.read(data)
+        source = BytesReadable(data)
+        indexed = open_indexed(source)
+        chunks = [read_chunk(source, indexed, entry) for entry in indexed.chunks_for_time(query)]
+        indexed_gaussians = _assemble(chunks, indexed.windows, indexed.header)
+
+        assert decoded.gaussians.mu_t[0] == mean
+        assert decoded.gaussians.sigma_t[0] == reconstructed.sigma_t[0]
+        assert decoded.gaussians.state_at(query, cutoff)["indices"].tolist() == [0]
+        assert indexed_gaussians.state_at(query, cutoff)["indices"].tolist() == [0]
+
+    def test_planning_support_covers_subtraction_after_endpoint_cancellation(self):
+        from fourdgs.writer import _planning_support
+
+        q_sigma = np.array([1804], dtype=np.int64)
+        reconstructed_sigma = np.exp(q_sigma.astype(np.float64) * 0.02).astype(np.float32)[0]
+        q_mu = np.array([-int(reconstructed_sigma)], dtype=np.int64)
+
+        lo, hi = _planning_support(
+            q_mu,
+            q_sigma,
+            np.array([1.0]),
+            0.02,
+            np.array([False]),
+            np.array([[0.0, 1.0]]),
+            np.array([0]),
+            math.exp(-0.5),
+        )
+
+        # Reconstructed mu + sigma cancels to zero, while state_at's (t - mu) at
+        # t=0.5 rounds back to sigma and remains visible. Planning from the rounded
+        # marginal's inverse must keep the split inside support despite cancellation.
+        assert float(np.float32(q_mu[0]) + reconstructed_sigma) == 0.0
+        assert lo[0] <= 0.5 < hi[0]
+
+    def test_planning_support_is_strictly_outside_large_time_visibility(self):
+        from fourdgs.writer import _planning_support
+
+        sigma_log_step = math.log(10416940.0) / 408.0
+        cutoff = 0.5
+        lo, hi = _planning_support(
+            np.array([-6222906]),
+            np.array([408]),
+            np.array([1.0]),
+            sigma_log_step,
+            np.array([False]),
+            np.array([[0.0, 20_000_000.0]]),
+            np.array([0]),
+            cutoff,
+        )
+        mu = float(np.float32(-6222906.0))
+        sigma = float(np.float32(np.exp(408 * sigma_log_step)))
+        marginal = math.exp(-0.5 * ((hi[0] - mu) / sigma) ** 2)
+
+        assert lo[0] == 0.0
+        assert marginal < cutoff
+
+    def test_planning_support_uses_the_state_sigma_floor(self):
+        from fourdgs.writer import _planning_support
+
+        lo, hi = _planning_support(
+            np.array([0]),
+            np.array([-10_000]),
+            np.array([1.0]),
+            0.02,
+            np.array([False]),
+            np.array([[0.0, 2e-30]]),
+            np.array([0]),
+            0.05,
+        )
+
+        # The finite exponential reconstructs below f32 and becomes zero publicly, but
+        # state_at divides by max(sigma, 1e-30), so t=1.5e-30 is still visible.
+        assert np.float32(np.exp(-10_000 * 0.02)) == 0.0
+        assert lo[0] <= 1.5e-30 < hi[0]
+
+    def test_planning_support_preserves_public_f64_validity_windows(self):
+        from fourdgs.writer import _planning_support
+
+        stored_lo = np.nextafter(0.50000002, np.inf)
+        public_lo = float(np.float32(stored_lo))
+        query = 0.5 * (public_lo + stored_lo)
+        lo, hi = _planning_support(
+            np.array([0]),
+            np.array([0]),
+            np.array([1.0]),
+            0.02,
+            np.array([True]),
+            np.array([[stored_lo, 1.0]]),
+            np.array([0]),
+            0.05,
+        )
+
+        assert public_lo <= query < stored_lo
+        assert query < lo[0] == stored_lo < hi[0]
+
+    def test_top_level_assignment_does_not_tolerate_support_outside_its_interval(self):
+        from fourdgs.indexed_reader import open_indexed, read_chunk
+        from fourdgs.readable import BytesReadable
+
+        stored_lo = np.nextafter(0.5, np.inf)
+        public_lo = float(np.float32(stored_lo))
+        scene = make_scene(n=1, windows=1, duration=1.0, never_fades_fraction=1.0)
+        scene.win_lo = np.array([stored_lo], dtype=np.float64)
+        scene.win_hi = np.array([1.0], dtype=np.float64)
+
+        encoded = io.BytesIO()
+        fourdgs.write(
+            encoded,
+            scene,
+            1.0,
+            options=fourdgs.WriteOptions(max_depth=1, min_chunk_gaussians=1),
+        )
+        data = encoded.getvalue()
+        decoded = fourdgs.read(data)
+        source = BytesReadable(data)
+        indexed = open_indexed(source)
+
+        assert public_lo < stored_lo
+        assert decoded.gaussians.win_lo[0] == stored_lo
+        assert decoded.gaussians.state_at(public_lo, indexed.header.cutoff)["indices"].tolist() == []
+        assert indexed.chunks_for_time(public_lo) == []
+        assert decoded.gaussians.state_at(stored_lo, indexed.header.cutoff)["indices"].tolist() == [0]
+        selected = indexed.chunks_for_time(stored_lo)
+        assert len(selected) == 1
+        assert read_chunk(source, indexed, selected[0])["positions"].shape[0] == 1
+
     @pytest.mark.parametrize("degree", [1, 2, 3])
     def test_spherical_harmonics_degrees(self, degree):
         out = roundtrip(make_scene(sh_degree=degree))
