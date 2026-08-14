@@ -417,12 +417,10 @@ is a failure there, never a skip.
 
 The suite runs on GitHub-hosted runners for Python, TypeScript and Rust on Linux, macOS and Windows;
 C++, Swift and Dart run it on Linux. Every platform decodes the same generated corpus and compares
-against the same committed expectations. A fully supporting family makes 133 passing comparisons;
-the single `decode_indexed` variant that declares no chunk index is skipped everywhere, and a
-language layer that has not landed yet also skips the 51 aggregate-bearing variants whose
-expectations require exact canonical-unit sums. For the same staged reason, the Rust cross-decoder
-encoder gate omits only the root aggregate until the Rust implementation layer removes that
-temporary decline and compares it with lossless decimal parsing.
+against the same committed expectations. A fully supporting family makes 135 passing comparisons;
+the single `decode_indexed` variant that declares no chunk index is skipped everywhere. A language
+layer that has not landed exact canonical-unit sums still runs those same 135 checks: the shared
+transition omits only `positionSum` and `opacitySum`, while every other field remains strict.
 
 That the corpus is bytes is the whole reason this is worth doing on more than one platform: a
 decoder that agrees with the expectation on Linux and disagrees on Windows is exactly the bug this

@@ -1,0 +1,205 @@
+{
+  "aggregate": {
+    "neverFadesCount": "0",
+    "opacitySum": 0.901961,
+    "positionSum": [
+      340282346638528859811704183484516925440.0,
+      0.0,
+      0.0
+    ],
+    "zeroMotionCount": "1"
+  },
+  "attachments": [],
+  "audioSources": [],
+  "camera": null,
+  "chunkIntervals": [
+    [
+      0.0,
+      4.0
+    ]
+  ],
+  "cutoff": 0.05,
+  "durationSec": 4.0,
+  "gaussianCount": "1",
+  "hasAudio": false,
+  "headerAttributes": {},
+  "library": "4dgs conformance generator",
+  "metadataRecords": [],
+  "objects": {
+    "embeddingDim": 0,
+    "table": [
+      {
+        "anchor": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "dynamics": null,
+        "embeddingCrc": null,
+        "hasEmbedding": false,
+        "label": "wide units",
+        "objectId": "7"
+      }
+    ],
+    "tracks": []
+  },
+  "profile": "objects",
+  "sample": {
+    "colors": [
+      [
+        0.603922,
+        0.4,
+        0.203922,
+        0.901961
+      ]
+    ],
+    "motions": [
+      [
+        0.0,
+        0.0,
+        0.0
+      ]
+    ],
+    "muT": [
+      0.0
+    ],
+    "objectIds": [
+      "7"
+    ],
+    "positions": [
+      [
+        3.4028234663852886e+38,
+        0.0,
+        0.0
+      ]
+    ],
+    "rotations": [
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "scales": [
+      [
+        0.049292,
+        0.049292,
+        0.049292
+      ]
+    ],
+    "sigmaT": [
+      98.90992
+    ],
+    "winHi": [
+      4.0
+    ],
+    "winLo": [
+      0.0
+    ]
+  },
+  "sh": null,
+  "shDegree": 0,
+  "states": [
+    {
+      "aggregate": {
+        "opacitySum": 0.901961,
+        "positionSum": [
+          340282346638528859811704183484516925440.0,
+          0.0,
+          0.0
+        ]
+      },
+      "liveCount": "1",
+      "sample": {
+        "objectIds": [
+          "7"
+        ],
+        "orientations": [
+          [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ]
+        ],
+        "positions": [
+          [
+            3.4028234663852886e+38,
+            0.0,
+            0.0
+          ]
+        ]
+      },
+      "t": 0.0
+    },
+    {
+      "aggregate": {
+        "opacitySum": 0.901776,
+        "positionSum": [
+          340282346638528859811704183484516925440.0,
+          0.0,
+          0.0
+        ]
+      },
+      "liveCount": "1",
+      "sample": {
+        "objectIds": [
+          "7"
+        ],
+        "orientations": [
+          [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ]
+        ],
+        "positions": [
+          [
+            3.4028234663852886e+38,
+            0.0,
+            0.0
+          ]
+        ]
+      },
+      "t": 2.0
+    },
+    {
+      "aggregate": {
+        "opacitySum": 0.901224,
+        "positionSum": [
+          340282346638528859811704183484516925440.0,
+          0.0,
+          0.0
+        ]
+      },
+      "liveCount": "1",
+      "sample": {
+        "objectIds": [
+          "7"
+        ],
+        "orientations": [
+          [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ]
+        ],
+        "positions": [
+          [
+            3.4028234663852886e+38,
+            0.0,
+            0.0
+          ]
+        ]
+      },
+      "t": 3.999999
+    }
+  ],
+  "statistics": null,
+  "summaryCrcOk": true,
+  "summaryOffsets": [],
+  "temporalModel": "gaussian-birth"
+}

@@ -921,8 +921,24 @@ def _obj_opacity_order() -> tuple[fourdgs.GaussianSet, ObjectLayer]:
     return gaussians, layer
 
 
-#: (name, builder). The three ordinary decode-and-compose cases are followed by three
-#: canonical-order adversaries: a physically reordered tied pair and a cancellation sum.
+def _obj_wide_unit_aggregate() -> tuple[fourdgs.GaussianSet, ObjectLayer]:
+    """A finite f32 whose canonical units exceed every signed 128-bit accumulator."""
+
+    gaussians = _obj_gaussians(
+        positions=[[float(np.finfo(np.float32).max), 0.0, 0.0]],
+        object_ids=[7],
+    )
+    layer = ObjectLayer(
+        table=ObjectTable(
+            embedding_dim=0,
+            entries=[ObjectTableEntry(object_id=7, label="wide units", anchor=(0.0, 0.0, 0.0))],
+        )
+    )
+    return gaussians, layer
+
+
+#: (name, builder). The ordinary decode-and-compose cases are followed by canonical-order,
+#: exact-sum and accumulator-width adversaries.
 OBJECT_VARIANTS = (
     ("SingleObject-UseChunkIndex-UseCrc", _obj_single),
     ("MultiObject-UseChunkIndex-UseCrc", _obj_multi),
@@ -931,6 +947,7 @@ OBJECT_VARIANTS = (
     ("ObjectTiedGaussiansReordered-UseChunkIndex-UseCrc", _obj_tied_gaussians_reordered),
     ("ObjectContentOrderSum-UseChunkIndex-UseCrc", _obj_content_order_sum),
     ("ObjectOpacityOrder-UseChunkIndex-UseCrc", _obj_opacity_order),
+    ("ObjectWideUnitAggregate-UseChunkIndex-UseCrc", _obj_wide_unit_aggregate),
 )
 
 
@@ -1037,6 +1054,19 @@ def build_object_corpus() -> list[tuple[str, bytes, str]]:
                 raise AssertionError(f"{name}: content opacity witness moved to {content_raw!r}")
             if not isinstance(exact, canonical_module.ExactNumber) or exact.token != "57.071301":
                 raise AssertionError(f"{name}: exact-unit opacity witness moved to {exact!r}")
+        if name == "ObjectWideUnitAggregate-UseChunkIndex-UseCrc":
+            expected = "340282346638528859811704183484516925440.0"
+            decoded = float(scene.gaussians.positions[0, 0])
+            if not math.isfinite(decoded):
+                raise AssertionError(f"{name}: wide encoded f32 became non-finite")
+            totals = [summary["aggregate"]["positionSum"][0]] + [
+                state["aggregate"]["positionSum"][0] for state in summary["states"]
+            ]
+            if any(not isinstance(total, canonical_module.ExactNumber) or total.token != expected for total in totals):
+                raise AssertionError(f"{name}: wide root/state totals moved to {totals!r}")
+            units = int(Decimal(expected) * (10**canonical_module.FLOAT_DECIMALS))
+            if units <= 2**127 - 1:
+                raise AssertionError(f"{name}: scaled total no longer exceeds signed 128-bit")
         expectation = canonical(summary)
         out.append((name, data, expectation))
 

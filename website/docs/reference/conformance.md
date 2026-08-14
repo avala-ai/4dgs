@@ -24,7 +24,7 @@ the decode harness matches fragments to select runners, and the encode gate make
 per-band-depth pass only when the name contains `SHDegree`. Most variants sit at the top of `data/`;
 three families live in subdirectories — `data/keyframe/`, `data/object/` and `data/invalid/` — and a
 variant there is named with its directory as a prefix. Today that is 48 valid variants at the top
-level, 5 keyframe-delta, 7 object-layer and 7 invalid.
+level, 5 keyframe-delta, 8 object-layer and 7 invalid.
 
 ## The corpus is generated, not committed
 

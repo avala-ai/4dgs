@@ -477,6 +477,12 @@ def test_adversarial_order_cases_are_encoded_corpus_variants():
     opacity_summary = json.loads(variants["ObjectOpacityOrder-UseChunkIndex-UseCrc"])
     assert opacity_summary["states"][1]["aggregate"]["opacitySum"] == 57.071301
 
+    wide_summary = json_compare.loads(variants["ObjectWideUnitAggregate-UseChunkIndex-UseCrc"])
+    expected = json_compare.loads("340282346638528859811704183484516925440.0")
+    assert wide_summary["aggregate"]["positionSum"][0] == expected
+    assert all(state["aggregate"]["positionSum"][0] == expected for state in wide_summary["states"])
+    assert int(expected * 10**canonical.FLOAT_DECIMALS) > 2**127 - 1
+
 
 def test_keyframe_delta_variants_retain_an_untouched_common_row():
     for name, data, _ in generate.build_keyframe_delta_corpus():
