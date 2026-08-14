@@ -640,9 +640,9 @@ Result<void> checkColumns(const GaussianView& gaussians, const std::string& subj
 /// span's length with its GaussianView and reject duplicate identities without first copying the
 /// caller's data into the core, so all of those checks happen before a writer is allocated.
 Result<void> checkKeyframeDeltaInputs(Span<const KeyframeDeltaSample> samples, double durationSec) {
-  if (!std::isfinite(durationSec) || durationSec <= 0.0) {
+  if (std::isnan(durationSec) || durationSec <= 0.0) {
     return Error(ErrorCode::kInvalidArgument,
-                 "duration_sec must be finite and positive; got " + std::to_string(durationSec));
+                 "duration_sec must be positive and not NaN; got " + std::to_string(durationSec));
   }
   if (samples.empty()) {
     return Error(ErrorCode::kInvalidArgument,
@@ -677,11 +677,10 @@ Result<void> checkKeyframeDeltaInputs(Span<const KeyframeDeltaSample> samples, d
                      "; its interval must have positive width (spec §11.1)");
   }
 
-  // `seenIds` grows only to the number of distinct identities in the caller's samples, and
-  // `liveIds` only to one sample's population. Keeping both is what distinguishes a genuine
-  // birth (not seen) and continuous survival (still live) from reuse after death (seen, but no
-  // longer live) without retaining another copy of every sample.
-  std::unordered_set<std::uint32_t> seenIds;
+  // Retain only the immediately preceding population. When a current id is not live there,
+  // scan the caller-owned earlier samples to tell a genuine birth from reuse after death. This
+  // keeps validation memory bounded by adjacent sample populations rather than by all lifetime
+  // births; the reference encoder accepts the extra work in exchange for the bounded guarantee.
   std::unordered_set<std::uint32_t> liveIds;
   for (std::size_t i = 0; i < samples.size(); ++i) {
     const KeyframeDeltaSample& sample = samples[i];
@@ -702,23 +701,35 @@ Result<void> checkKeyframeDeltaInputs(Span<const KeyframeDeltaSample> samples, d
 
     std::unordered_set<std::uint32_t> uniqueIds;
     uniqueIds.reserve(sample.ids.size());
-    for (std::uint32_t id : sample.ids) {
+    for (std::size_t row = 0; row < sample.ids.size(); ++row) {
+      const std::uint32_t id = sample.ids[row];
       if (!uniqueIds.insert(id).second) {
         return Error(ErrorCode::kInvalidArgument,
                      "sample " + std::to_string(i) + " names gaussian id " + std::to_string(id) +
                          " more than once; ids are unique within a state (spec §11.2)");
       }
     }
-    // Walk the caller's order for a deterministic diagnosis when more than one dead id is
-    // reused in the same sample; the set above is only for membership.
-    for (std::uint32_t id : sample.ids) {
-      if (seenIds.find(id) != seenIds.end() && liveIds.find(id) == liveIds.end()) {
+    // Index the spans rather than range-iterating: an empty sample is legal and its default
+    // Span has a null pointer, for which computing `nullptr + 0` as `end()` is undefined.
+    for (std::size_t row = 0; row < sample.ids.size(); ++row) {
+      const std::uint32_t id = sample.ids[row];
+      bool appearedEarlier = false;
+      if (liveIds.find(id) == liveIds.end()) {
+        for (std::size_t earlier = 0; earlier < i && !appearedEarlier; ++earlier) {
+          for (std::size_t priorRow = 0; priorRow < samples[earlier].ids.size(); ++priorRow) {
+            if (samples[earlier].ids[priorRow] == id) {
+              appearedEarlier = true;
+              break;
+            }
+          }
+        }
+      }
+      if (appearedEarlier) {
         return Error(ErrorCode::kInvalidArgument,
                      "sample " + std::to_string(i) + " reuses gaussian id " + std::to_string(id) +
                          " after it died; gaussian_id is never reused within a sequence "
                          "(spec §11.2)");
       }
-      seenIds.insert(id);
     }
     liveIds.swap(uniqueIds);
   }

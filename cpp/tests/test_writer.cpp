@@ -314,8 +314,7 @@ void aMismatchedIdStreamIsRefused() {
 }
 
 void invalidDurationsAreRefused() {
-  const double invalid[] = {0.0, -1.0, std::numeric_limits<double>::infinity(),
-                            -std::numeric_limits<double>::infinity(),
+  const double invalid[] = {0.0, -1.0, -std::numeric_limits<double>::infinity(),
                             std::numeric_limits<double>::quiet_NaN()};
   for (double duration : invalid) {
     const Sequence sequence = threeSamples();
@@ -324,8 +323,15 @@ void invalidDurationsAreRefused() {
     CHECK(!encoded.ok());
     if (encoded.ok()) continue;
     CHECK_EQ(encoded.error().code, ErrorCode::kInvalidArgument);
-    CHECK(encoded.error().message.find("finite and positive") != std::string::npos);
+    CHECK(encoded.error().message.find("positive and not NaN") != std::string::npos);
   }
+}
+
+void aPositiveInfiniteDurationIsAccepted() {
+  const Sequence sequence = threeSamples();
+  Result<std::vector<std::uint8_t>> encoded = fourdgs::encodeKeyframeDeltaSequence(
+      spanOf(sequence), std::numeric_limits<double>::infinity());
+  CHECK(encoded.ok());
 }
 
 void anEmptySequenceIsRefused() {
@@ -426,6 +432,23 @@ void anIdThatReappearsAfterDeathIsRefused() {
   CHECK(encoded.error().message.find("sample 2") != std::string::npos);
   CHECK(encoded.error().message.find("gaussian id 0") != std::string::npos);
   CHECK(encoded.error().message.find("after it died") != std::string::npos);
+}
+
+void anEmptyPopulationUsesANullIdSpanSafely() {
+  Sequence sequence = threeSamples();
+  sequence.ids[1].clear();
+  sequence.populations[1].resize(0, 0, 0);
+  sequence.samples[1].ids = fourdgs::Span<const std::uint32_t>();
+  sequence.samples[1].gaussians = GaussianView(sequence.populations[1]);
+  sequence.ids[2] = {4, 5, 6, 7};
+  sequence.populations[2] = movingPopulation(sequence.ids[2], 0.2f);
+  sequence.samples[2].ids =
+      fourdgs::Span<const std::uint32_t>(sequence.ids[2].data(), sequence.ids[2].size());
+  sequence.samples[2].gaussians = GaussianView(sequence.populations[2]);
+
+  Result<std::vector<std::uint8_t>> encoded =
+      fourdgs::encodeKeyframeDeltaSequence(spanOf(sequence), 1.0);
+  CHECK(encoded.ok());
 }
 
 /// The nine columns the ABI reads, with the floats each holds per gaussian.
@@ -586,6 +609,7 @@ void runTests() {
     aChangedInvariantIsRefused();
     aMismatchedIdStreamIsRefused();
     invalidDurationsAreRefused();
+    aPositiveInfiniteDurationIsAccepted();
     anEmptySequenceIsRefused();
     aNonFiniteSampleInstantIsRefused();
     aSequenceThatDoesNotStartAtZeroIsRefused();
@@ -593,6 +617,7 @@ void runTests() {
     theLastSampleMustStartBeforeDuration();
     duplicateIdsWithinASampleAreRefused();
     anIdThatReappearsAfterDeathIsRefused();
+    anEmptyPopulationUsesANullIdSpanSafely();
     aRaggedSampleIsRefused();
     aRaggedSceneIsRefused();
     compressionAndCutoffReachTheCore();
