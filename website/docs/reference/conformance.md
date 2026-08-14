@@ -24,7 +24,7 @@ the decode harness matches fragments to select runners, and the encode gate make
 per-band-depth pass only when the name contains `SHDegree`. Most variants sit at the top of `data/`;
 three families live in subdirectories — `data/keyframe/`, `data/object/` and `data/invalid/` — and a
 variant there is named with its directory as a prefix. Today that is 48 valid variants at the top
-level, 5 keyframe-delta, 6 object-layer and 7 invalid.
+level, 5 keyframe-delta, 7 object-layer and 7 invalid.
 
 ## The corpus is generated, not committed
 
@@ -544,26 +544,20 @@ error rather than a surprise in somebody else's parser. A never-fading gaussian'
 for exactly this reason, and `null` there means "never fades" rather than "missing".
 
 **Nothing may depend on decoded order.** An encoder may reorder gaussians freely and a reader must
-not rely on their order, so a summary that did would be asking two correct decoders to disagree.
-Everything per-gaussian — the sample, the aggregates, the spherical-harmonic digest — is taken in
-the content order `_stable_order` defines: sort by the gaussian's whole decoded state, rounded
-exactly as the summary rounds it, with its spherical-harmonic coefficients and object id last.
+not rely on their order, so a summary that did would be asking two correct decoders to disagree. The
+sample and spherical-harmonic digest use `_stable_order`: the gaussian's decoded state rounded
+exactly as the summary emits it, with spherical harmonics and object id last. A rounded tie is
+harmless in the root sample, whose emitted values are those keyed fields. In `states`, composition
+can amplify that tie, so live rows compare the rounded content key and then the rounded centre,
+orientation and object id they emit; finite numbers sort before `null`.
 
-That order is not quite total, and the gap is worth stating rather than glossing. The key is the
-_rounded_ state, so two gaussians can tie on every field of it and still hold different exact
-values; the sort is stable, so the tie is then broken by decode order, which is the one thing this
-rule says must not matter. For the `sample` rows it is harmless — their values are the keyed fields,
-so tied rows are interchangeable by construction. The aggregates are where it bites: `positionSum`
-and `opacitySum` accumulate the _unrounded_ values in that order, and floating-point addition is not
-associative, so a legal reordering that produces a different tie-break can in principle move the
-sixth decimal of a total. It is latent rather than live: across the forty-nine valid
-`gaussian-birth` variants no two gaussians tie on that key at all, so nothing today has a tie to
-break. [Issue #95](https://github.com/avala-ai/4dgs/issues/95) tracks it and its sibling in the
-states summary; fixing either means changing the reference all six SDKs are diffed against and
-regenerating every expectation at once, which is why it has not been done as a side effect of
-anything. A runner reproducing `_stable_order` should reproduce it exactly — including the stable
-sort — rather than substitute a total order of its own, because a divergence here would show up as
-an unexplainable diff in the sixth decimal rather than as a clean failure.
+Aggregates do not add binary floats in any order. Each finite addend is rounded by the same
+ties-to-even six-decimal rule, rendered as fixed-point decimal text, parsed as an integer count of
+`10^-6` units and accumulated in an arbitrary-precision signed integer. A non-finite addend makes
+that aggregate `null`. The exact total is serialized by inserting the decimal point into the integer
+digits, never by converting back to binary64. The comparison harness likewise parses JSON number
+tokens losslessly, so even a total beyond binary64 remains a checked number rather than collapsing
+to infinity.
 
 A runner therefore materializes every gaussian and sorts them, which is precisely what the SDK
 underneath it must never do. The runner is not the SDK: bounded memory is a property the decoder has

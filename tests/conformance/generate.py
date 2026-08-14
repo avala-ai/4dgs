@@ -50,6 +50,7 @@ import scenarios
 from canonical import canonical, summarize
 from fourdgs import keyframe_delta_file as kdf
 from fourdgs.keyframe_delta_writer import KeyframeDeltaOptions, Sample
+from fourdgs.model import DEFAULT_CUTOFF
 from fourdgs.object_layer import ObjectLayer
 from fourdgs.opcode import (
     COORDINATE_FRAME,
@@ -620,6 +621,7 @@ def build_keyframe_delta_corpus() -> list[tuple[str, bytes, str]]:
 #: Seconds of the synthetic object scenes. Short — the poses are what matter, not a long
 #: clip — and every file stays well under the corpus size cap.
 _OBJ_DURATION = 4.0
+_OBJ_OPACITY_DURATION = 4.000000021908035
 
 
 def _obj_gaussians(
@@ -896,6 +898,28 @@ def _obj_content_order_sum() -> tuple[fourdgs.GaussianSet, ObjectLayer]:
     return gaussians, layer
 
 
+def _obj_opacity_order() -> tuple[fourdgs.GaussianSet, ObjectLayer]:
+    """Resident and content opacity sums straddle a six-decimal boundary."""
+    count = 64
+    gaussians = _obj_gaussians(
+        positions=[[0.0, 0.0, 0.0]] * count,
+        object_ids=[7] * count,
+    )
+    gaussians.colors[:, 3] = 1.0
+    # Physical order groups permanent, medium and boundary marginals. The portable key
+    # orders the finite sigma values first and never-fading values last.
+    gaussians.sigma_t[:32] = np.inf
+    gaussians.sigma_t[32:63] = 3.0311653
+    gaussians.sigma_t[63] = 1.0
+    layer = ObjectLayer(
+        table=ObjectTable(
+            embedding_dim=0,
+            entries=[ObjectTableEntry(object_id=7, label="opacity order", anchor=(0.0, 0.0, 0.0))],
+        )
+    )
+    return gaussians, layer
+
+
 #: (name, builder). The three ordinary decode-and-compose cases are followed by three
 #: canonical-order adversaries: a physically reordered tied pair and a cancellation sum.
 OBJECT_VARIANTS = (
@@ -905,6 +929,7 @@ OBJECT_VARIANTS = (
     ("ObjectTiedGaussians-UseChunkIndex-UseCrc", _obj_tied_gaussians),
     ("ObjectTiedGaussiansReordered-UseChunkIndex-UseCrc", _obj_tied_gaussians_reordered),
     ("ObjectContentOrderSum-UseChunkIndex-UseCrc", _obj_content_order_sum),
+    ("ObjectOpacityOrder-UseChunkIndex-UseCrc", _obj_opacity_order),
 )
 
 
@@ -921,8 +946,10 @@ def build_object_corpus() -> list[tuple[str, bytes, str]]:
     resident_tie_rows: dict[str, list] = {}
     for name, builder in OBJECT_VARIANTS:
         gaussians, layer = builder()
+        duration = _OBJ_OPACITY_DURATION if name.startswith("ObjectOpacityOrder") else _OBJ_DURATION
         options = fourdgs.WriteOptions(
             profile="default",
+            cutoff=1e-20 if name.startswith("ObjectOpacityOrder") else DEFAULT_CUTOFF,
             min_chunk_gaussians=10**9,
             max_depth=0,
             write_index=True,
@@ -932,7 +959,7 @@ def build_object_corpus() -> list[tuple[str, bytes, str]]:
             objects=layer,
         )
         buf = io.BytesIO()
-        fourdgs.write(buf, gaussians, _OBJ_DURATION, options=options)
+        fourdgs.write(buf, gaussians, duration, options=options)
         data = buf.getvalue()
         scene = fourdgs.read(data)
         if name.startswith("ObjectTiedGaussians"):
@@ -980,6 +1007,23 @@ def build_object_corpus() -> list[tuple[str, bytes, str]]:
             emitted = summary["states"][1]["aggregate"]["positionSum"][0]
             if resident == emitted:
                 raise AssertionError(f"{name}: resident and content-order sums no longer differ")
+        if name == "ObjectOpacityOrder-UseChunkIndex-UseCrc":
+            state = scene.gaussians.state_at(0.5 * duration, scene.header.cutoff)
+            row_for_index = {int(index): row for row, index in enumerate(state["indices"])}
+            resident_raw = 0.0
+            for value in state["opacity"]:
+                resident_raw += float(value)
+            keys = canonical_module._stable_keys(scene.gaussians)
+            content_raw = 0.0
+            for index in sorted(range(scene.gaussians.count), key=keys.__getitem__):
+                content_raw += float(state["opacity"][row_for_index[index]])
+            exact = summary["states"][1]["aggregate"]["opacitySum"]
+            if canonical_module.num(resident_raw) != 57.0713:
+                raise AssertionError(f"{name}: resident opacity witness moved to {resident_raw!r}")
+            if canonical_module.num(content_raw) != 57.071299:
+                raise AssertionError(f"{name}: content opacity witness moved to {content_raw!r}")
+            if not isinstance(exact, canonical_module.ExactNumber) or exact.token != "57.071301":
+                raise AssertionError(f"{name}: exact-unit opacity witness moved to {exact!r}")
         expectation = canonical(summary)
         out.append((name, data, expectation))
 

@@ -257,9 +257,9 @@
     },
     {
       "aggregate": {
-        "opacitySum": 1.803553,
+        "opacitySum": 1.803552,
         "positionSum": [
-          -1e-06,
+          -0.000001,
           0.0,
           0.0
         ]
@@ -301,9 +301,9 @@
     },
     {
       "aggregate": {
-        "opacitySum": 1.802447,
+        "opacitySum": 1.802448,
         "positionSum": [
-          -2e-06,
+          -0.000002,
           0.0,
           0.0
         ]

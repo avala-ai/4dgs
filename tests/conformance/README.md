@@ -417,9 +417,12 @@ is a failure there, never a skip.
 
 The suite runs on GitHub-hosted runners for Python, TypeScript and Rust on Linux, macOS and Windows;
 C++, Swift and Dart run it on Linux. Every platform decodes the same generated corpus and compares
-against the same committed expectations. A fully supporting family makes 131 passing comparisons;
+against the same committed expectations. A fully supporting family makes 133 passing comparisons;
 the single `decode_indexed` variant that declares no chunk index is skipped everywhere, and a
-language layer that has not landed yet also skips the named canonical-order variants.
+language layer that has not landed yet also skips the 51 aggregate-bearing variants whose
+expectations require exact canonical-unit sums. For the same staged reason, the Rust cross-decoder
+encoder gate omits only the root aggregate until the Rust implementation layer removes that
+temporary decline and compares it with lossless decimal parsing.
 
 That the corpus is bytes is the whole reason this is worth doing on more than one platform: a
 decoder that agrees with the expectation on Linux and disagrees on Windows is exactly the bug this
@@ -439,7 +442,9 @@ So that two languages can be diffed without arguing about representation:
 - **nothing depends on decoded order.** Gaussians may be reordered freely by an encoder, so the
   sample and spherical harmonic digest use a rounded content order derived from decoded values. Rows
   that tie there can diverge after temporal composition, so `states` breaks the tie with the rounded
-  row it emits, and state aggregates add in that emitted order rather than resident order
+  row it emits. Root and state aggregates round each addend to canonical arbitrary-precision integer
+  units and sum those units exactly, making them independent of both storage order and
+  floating-point addition order
 - records that are not gaussians are summarized too — the camera, the metadata, the attachments, the
   statistics, the summary offsets, and whether the footer's CRC verified. A record that changes
   nothing here is a record an implementation could ignore entirely and still pass, which is how a

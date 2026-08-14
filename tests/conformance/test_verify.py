@@ -424,11 +424,34 @@ class TestTheCanonicalFormHasNoDecodedOrder:
         cancellation_last = self._summary(self._permuted(gaussians, [0, 3, 1, 2]))
 
         assert cancellation_first == cancellation_last
-        assert cancellation_first["states"][0]["aggregate"]["positionSum"] == [
-            1577422160204.6396,
-            10.0,
-            0.0,
+        assert [value.token for value in cancellation_first["states"][0]["aggregate"]["positionSum"]] == [
+            "1577422160204.639771",
+            "10.0",
+            "0.0",
         ]
+
+    def test_aggregate_addends_are_exact_canonical_units(self):
+        values = [1e20, -1e20, 3.25]
+        forward = canonical._exact_sum(values)
+        reversed_ = canonical._exact_sum(list(reversed(values)))
+
+        assert forward == reversed_
+        assert forward.token == "3.25"
+        assert canonical._exact_sum([1.0, float("inf")]) is None
+
+
+def test_exact_number_tokens_and_comparisons_never_narrow_through_binary64():
+    total = canonical._exact_sum([1e308] * 10)
+    text = canonical.canonical({"total": total})
+    parsed = json_compare.loads(text)
+    nearby = json_compare.loads(text.replace(".0", ".1", 1))
+
+    assert len(total.token.split(".")[0]) == 310
+    assert parsed != nearby
+    message = encode_roundtrip._diff({"total": (parsed["total"], nearby["total"])})
+    assert "total" in message
+    assert "json-number" in message and "adjusted=309" in message
+    assert len(message) <= 8000
 
 
 def test_adversarial_order_cases_are_encoded_corpus_variants():
@@ -446,6 +469,8 @@ def test_adversarial_order_cases_are_encoded_corpus_variants():
     content_summary = json.loads(variants[content_sum])
     assert content_summary["states"][1]["sample"]["objectIds"] == ["1", "2", "3"]
     assert content_summary["states"][1]["aggregate"]["positionSum"] == [3.25, 0.0, 0.0]
+    opacity_summary = json.loads(variants["ObjectOpacityOrder-UseChunkIndex-UseCrc"])
+    assert opacity_summary["states"][1]["aggregate"]["opacitySum"] == 57.071301
 
 
 def test_keyframe_delta_variants_retain_an_untouched_common_row():
