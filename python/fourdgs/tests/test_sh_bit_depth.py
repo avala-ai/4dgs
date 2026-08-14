@@ -29,10 +29,84 @@ from fourdgs.quantization import (
 )
 from fourdgs.records import Quantization
 from fourdgs.serialization import MAGIC, Cursor, read_record
-from fourdgs.validate import validate
+from fourdgs.validate import Report, _check_sh_bit_depths, _decimal_equals_integer, validate
 from test_roundtrip import make_scene
 
 DEPTHS = (8, 7, 6, 5, 4, 3)
+
+#: Spellings §5.3's grammar accepts, against the bound each one declares.
+#:
+#: The same table is checked by the TypeScript, Rust and Dart validators. A row that moves here
+#: without moving there is the disagreement the grammar exists to end, so keep the four in step.
+EQUIVALENT_BOUND_SPELLINGS = (
+    ("16", 16),
+    ("16.", 16),
+    ("16.0", 16),
+    ("+016.000", 16),
+    ("1.6e1", 16),
+    ("160e-1", 16),
+    ("0.16E2", 16),
+    ("8", 8),
+    ("0.8e1", 8),
+    ("80e-1", 8),
+    (".4e1", 4),
+    ("0." + "0" * 1000 + "4e1001", 4),
+    ("0", 0),
+    ("0.0", 0),
+    ("-0", 0),
+    ("+0.000", 0),
+    # A significand of zeroes is zero at every exponent, and the exponent has no range limit.
+    ("0e999999999999999999999999", 0),
+    ("0.0e-999999999999999999999999", 0),
+)
+
+#: Spellings §5.3's grammar refuses, against the bound the record declares.
+#:
+#: Several of these are accepted by one runtime's decimal type or another — underscores and
+#: other scripts' digits by Python's `Decimal`, U+FEFF by JavaScript's `\s` and Dart's `trim`
+#: — which is exactly why the grammar is written out rather than delegated to a runtime.
+REJECTED_BOUND_SPELLINGS = (
+    ("1_6", 16),
+    ("8_0e-1", 8),
+    ("_16", 16),
+    ("16_", 16),
+    ("\u0661\u0666", 16),  # Arabic-Indic one six
+    ("\u0668", 8),  # Arabic-Indic eight
+    ("\u0668\u0660e-\u06f1", 8),
+    ("\uff11\uff16", 16),  # fullwidth one six
+    ("\u2078", 8),  # superscript eight, a digit in no grammar
+    ("\ufeff16", 16),  # a byte-order mark is data, not padding
+    ("\ufeff4", 4),
+    ("16\ufeff", 16),
+    ("\u001c8", 8),  # Python's `Decimal` trims U+001C; the grammar does not
+    ("\u001f16", 16),
+    (" 16 ", 16),
+    ("\t16", 16),
+    ("16\n", 16),
+    ("\u200916", 16),  # thin space
+    ("16.0000000000000001", 16),
+    ("15.9999999999999999", 16),
+    ("1.6", 16),
+    ("16e", 16),
+    ("16e+", 16),
+    ("16e-", 16),
+    ("16eNaN", 16),
+    ("", 16),
+    (".", 16),
+    ("+", 16),
+    ("_", 0),
+    ("NaN", 0),
+    ("nan", 0),
+    ("Infinity", 16),
+    ("inf", 16),
+    ("-16", 16),
+    ("0e", 0),
+    ("0_0", 0),
+    ("\u0660", 0),  # Arabic-Indic zero
+    ("\ufeff0", 0),
+    ("\u001c0", 0),
+    ("1", 0),
+)
 
 
 def write(scene, duration=6.0, **kw) -> bytes:
@@ -265,6 +339,42 @@ class TestValidate:
         report = validate(bytes(data))
         assert not report.ok
         assert [f.message for f in report.findings if "SH bit depths" in f.message]
+
+    def test_per_band_bounds_compare_as_exact_decimals(self):
+        quant = Quantization.parse(_record(write(make_scene(sh_degree=1), sh_bit_depths=(4,)), QUANTIZATION))
+        expected = quant.bounds["sh_band1"]
+
+        quant.bounds["sh_band1"] = f"{expected}.0"
+        equivalent = Report()
+        _check_sh_bit_depths(quant, 1, equivalent)
+        assert not equivalent.findings
+
+        quant.bounds["sh_band1"] = f"{expected}.0000000000000001"
+        different = Report()
+        _check_sh_bit_depths(quant, 1, different)
+        assert [finding for finding in different.findings if "sh_band1" in finding.message]
+
+    @pytest.mark.parametrize(("spelling", "expected"), EQUIVALENT_BOUND_SPELLINGS)
+    def test_an_equivalent_spelling_is_the_same_bound(self, spelling, expected):
+        assert _decimal_equals_integer(spelling, expected), spelling
+
+    @pytest.mark.parametrize(("spelling", "expected"), REJECTED_BOUND_SPELLINGS)
+    def test_a_spelling_outside_the_grammar_is_not_the_bound(self, spelling, expected):
+        assert not _decimal_equals_integer(spelling, expected), spelling
+
+    @pytest.mark.parametrize(("spelling", "expected"), REJECTED_BOUND_SPELLINGS)
+    def test_a_spelling_outside_the_grammar_is_reported(self, spelling, expected):
+        """The grammar is enforced where a reader sees it, not only in the comparator.
+
+        `sh_bound` maps 3, 4, 5 and 8 bits onto the four expected values the table uses, so
+        every row reaches the per-band check with the bound it was written against.
+        """
+        bits = {16: 3, 8: 4, 4: 5, 0: 8}[expected]
+        quant = Quantization.parse(_record(write(make_scene(sh_degree=1), sh_bit_depths=(bits,)), QUANTIZATION))
+        quant.bounds["sh_band1"] = spelling
+        report = Report()
+        _check_sh_bit_depths(quant, 1, report)
+        assert [finding for finding in report.findings if "`sh_band1` as" in finding.message], spelling
 
 
 class TestVerification:

@@ -387,8 +387,9 @@ keyframe entries as well — and the Header counts **distinct ids** rather than 
 
 `--references` runs the Python and Rust reference encoders against each other over the corpus rather
 than a candidate against one of them. It compares the decoded summary and, separately, what the file
-_declares_ — the bounds map as the bytes spell it, the steps, the profile — because a bound written
-`5e-05` against `5e-5` is invisible to a comparison of decoded meaning.
+_declares_ — the bounds map's exact keys and decimal values, the steps, the profile. Decimal
+spelling is deliberately ignored: `5e-05`, `5e-5`, and `0.00005` are one value, while a missing key
+or even a difference beyond binary64 precision is still a divergence.
 
 It is opt-in, and the divergences it finds are listed in `KNOWN_REFERENCE_DIVERGENCES` with the
 issue that owns each one. That list is not a list of things that are fine: it is a list of things
