@@ -20,8 +20,8 @@ The four packages version together.
 
 ### Changed
 
-- `encodeScene` refuses a `cutoff` outside `(0, 1]` instead of writing a file planned from a
-  `NaN` support half-width. A marginal threshold of zero or less has no logarithm to invert.
+- `encodeScene` refuses a `cutoff` outside `(0, 1]` instead of writing a file planned from a `NaN`
+  support half-width. A marginal threshold of zero or less has no logarithm to invert.
 
 ## [0.5.0] - 2026-08-12
 
