@@ -167,9 +167,10 @@ def _planning_support(q_mu, q_sigma, t_step, sigma_log_step, never_fades, window
     arithmetic_guard = 2.0 * unit_roundoff / (1.0 - 2.0 * unit_roundoff)
     half *= 1.0 + arithmetic_guard
     half = np.where(never_fades, np.inf, half)
-    # Window Table records are f64, but GaussianSet exposes the decoded window lanes as
-    # f32 and state_at evaluates those values. Plan from that same public state.
-    decoded_windows = np.asarray(windows, dtype=np.float32).astype(np.float64)
+    # Window Table records and GaussianSet's public validity-window lanes are both f64.
+    # Keep that exact representation: narrowing here can move a window edge across a tree
+    # split and assign a gaussian to an interval where state_at says it is not yet valid.
+    decoded_windows = np.asarray(windows, dtype=np.float64)
     window_lo = decoded_windows[win_index, 0]
     window_hi = decoded_windows[win_index, 1]
     # Round every derived time away from the support before comparing it with a split.
@@ -216,7 +217,7 @@ def _plan_chunks(lo, hi, tops, max_depth, min_gaussians):
 
     for i in range(len(tops) - 1):
         a, b = tops[i], tops[i + 1]
-        pool = np.flatnonzero((lo >= a - 1e-9) & (hi <= b + 1e-9) & (assigned < 0))
+        pool = np.flatnonzero((lo >= a) & (hi <= b) & (assigned < 0))
         kept = recurse(a, b, 0, pool)
         if kept.size:
             nodes.append((a, b, 0))

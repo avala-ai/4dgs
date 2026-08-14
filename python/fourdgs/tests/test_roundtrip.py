@@ -324,7 +324,7 @@ class TestRoundTrip:
         assert np.float32(np.exp(-10_000 * 0.02)) == 0.0
         assert lo[0] <= 1.5e-30 < hi[0]
 
-    def test_planning_support_uses_public_f32_validity_windows(self):
+    def test_planning_support_preserves_public_f64_validity_windows(self):
         from fourdgs.writer import _planning_support
 
         stored_lo = np.nextafter(0.50000002, np.inf)
@@ -342,7 +342,38 @@ class TestRoundTrip:
         )
 
         assert public_lo <= query < stored_lo
-        assert lo[0] <= query < hi[0]
+        assert query < lo[0] == stored_lo < hi[0]
+
+    def test_top_level_assignment_does_not_tolerate_support_outside_its_interval(self):
+        from fourdgs.indexed_reader import open_indexed, read_chunk
+        from fourdgs.readable import BytesReadable
+
+        stored_lo = np.nextafter(0.5, np.inf)
+        public_lo = float(np.float32(stored_lo))
+        scene = make_scene(n=1, windows=1, duration=1.0, never_fades_fraction=1.0)
+        scene.win_lo = np.array([stored_lo], dtype=np.float64)
+        scene.win_hi = np.array([1.0], dtype=np.float64)
+
+        encoded = io.BytesIO()
+        fourdgs.write(
+            encoded,
+            scene,
+            1.0,
+            options=fourdgs.WriteOptions(max_depth=1, min_chunk_gaussians=1),
+        )
+        data = encoded.getvalue()
+        decoded = fourdgs.read(data)
+        source = BytesReadable(data)
+        indexed = open_indexed(source)
+
+        assert public_lo < stored_lo
+        assert decoded.gaussians.win_lo[0] == stored_lo
+        assert decoded.gaussians.state_at(public_lo, indexed.header.cutoff)["indices"].tolist() == []
+        assert indexed.chunks_for_time(public_lo) == []
+        assert decoded.gaussians.state_at(stored_lo, indexed.header.cutoff)["indices"].tolist() == [0]
+        selected = indexed.chunks_for_time(stored_lo)
+        assert len(selected) == 1
+        assert read_chunk(source, indexed, selected[0])["positions"].shape[0] == 1
 
     @pytest.mark.parametrize("degree", [1, 2, 3])
     def test_spherical_harmonics_degrees(self, degree):
