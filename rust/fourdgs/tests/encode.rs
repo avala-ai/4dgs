@@ -243,6 +243,12 @@ fn top_level_containment_does_not_tolerate_support_past_its_t1() {
     // At cutoff one, gaussian 0 remains visible across a tiny rounded plateau around its
     // mean. Its conservative upper support is less than 1e-9 past the split: accepting
     // that support into [0, 0.5) makes the indexed seek at 0.5 miss the only live row.
+    //
+    // `sigma_t` is load-bearing, not decoration. The plateau's half-width is
+    // `support_k(next_down(1)) * sigma`, and `support_k(next_down(1))` is about 1.49e-8,
+    // so the endpoint lands inside a 1e-9 tolerance only while sigma stays under about
+    // 0.067. At `sigma_t = 0.1` the endpoint is 1.5e-9 past the split, wide enough that
+    // even a tolerant containment test rejects it and this stops proving anything.
     let mut g = GaussianSet {
         positions: vec![0.0; 6],
         scales: vec![0.01; 6],
@@ -250,7 +256,7 @@ fn top_level_containment_does_not_tolerate_support_past_its_t1() {
         colors: vec![0.5, 0.5, 0.5, 1.0, 0.25, 0.25, 0.25, 1.0],
         motions: vec![0.0; 6],
         mu_t: vec![0.5, 0.25],
-        sigma_t: vec![0.1, f32::INFINITY],
+        sigma_t: vec![0.05, f32::INFINITY],
         win_lo: vec![0.0, 0.0],
         win_hi: vec![1.0, 0.5],
         ..Default::default()

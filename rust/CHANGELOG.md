@@ -6,6 +6,13 @@ All notable changes to the Rust crate are documented here, following
 
 ## [Unreleased]
 
+### Changed
+
+- `WriteOptions.cutoff` outside `(0, 1]` is refused as `InvalidInput` rather than written. A
+  marginal threshold of zero or less has no logarithm to invert, and the `NaN` support half-width
+  that came back was discarded by `f64::max`/`f64::min`, silently planning every chunk as though
+  each gaussian filled its whole validity window.
+
 ## [0.6.0] - 2026-08-13
 
 ### Added
