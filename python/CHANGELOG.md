@@ -8,12 +8,13 @@ All notable changes to the Python package are documented here, following
 
 ### Fixed
 
-- **Infinite validity windows remain live at huge finite scene times.** `GaussianSet.state_at`
-  compared its resident f32 window arrays directly with the f64 query. NumPy narrowed a query above
-  the f32 range to infinity, so the valid comparison `finite_time < +inf` became `inf < inf` and
-  incorrectly removed the gaussian. Window endpoints are now widened to f64 before comparison;
-  finite inputs that reconstruct a non-finite center at an extreme time remain a valid state whose
-  canonical scalar is `null`.
+- **Validity-window comparisons retain their f64 wire precision.** Decoding narrowed Window Table
+  endpoints to f32, turning a large finite upper bound into infinity, while `GaussianSet.state_at`
+  compared caller-constructed f32 windows directly with an f64 query. Readers now retain decoded
+  endpoints as f64 and comparisons widen caller-provided arrays, so a query after a large finite
+  window is excluded and an infinite window remains live at huge finite times. Finite inputs that
+  reconstruct a non-finite center at an extreme time remain a valid state whose canonical scalar is
+  `null`.
 
 - **`4dgs validate` counts distinct gaussian ids in one decode of the file, not a hundred.** The
   count is bounded-memory by design — a set of every id ever seen grows with cumulative births — and

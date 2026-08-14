@@ -64,6 +64,22 @@ class TestRoundTrip:
         out = roundtrip(scene)
         assert np.isinf(out.gaussians.sigma_t).sum() == int(np.isinf(scene.sigma_t).sum())
 
+    def test_large_finite_window_endpoint_retains_wire_precision(self):
+        scene = make_scene(n=1, windows=1, never_fades_fraction=1.0)
+        finite_hi = np.float64(1e100)
+        scene.win_lo = np.array([0.0], dtype=np.float64)
+        scene.win_hi = np.array([finite_hi], dtype=np.float64)
+
+        out = roundtrip(scene, duration=1e101)
+
+        assert out.gaussians.win_lo.dtype == np.float64
+        assert out.gaussians.win_hi.dtype == np.float64
+        assert out.gaussians.win_hi[0] == finite_hi
+        assert np.asarray(out.gaussians.win_lo, dtype=np.float64) is out.gaussians.win_lo
+        assert np.asarray(out.gaussians.win_hi, dtype=np.float64) is out.gaussians.win_hi
+        assert out.gaussians.state_at(1e99)["indices"].tolist() == [0]
+        assert out.gaussians.state_at(1e101)["indices"].tolist() == []
+
     def test_empty_scene(self):
         scene = make_scene(n=0, windows=1)
         out = roundtrip(scene, duration=1.0)

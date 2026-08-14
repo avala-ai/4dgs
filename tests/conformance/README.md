@@ -129,11 +129,10 @@ corpus must be redistributable without a licence question and reproducible witho
 
 `run.py` lets a whole language family decline the variants carrying a feature it has not
 implemented, through `FAMILY_DECLINES`; a runner from outside this repository declines by listing
-the same name fragments in its own declaration. The canonical-order variants are delivered as a
-language stack: the bottom corpus layer declares them for Python, and each language removes its two
-name fragments when its implementation lands above. This is what removing a family from
-`FAMILY_DECLINES` is supposed to look like. Every family reports provenance (spec §5.15) and the
-object layer; C++ and Swift do so through the Rust C ABI's additive JSON accessors.
+the same name fragments in its own declaration. The built-in table is empty today: every family
+reports provenance (spec §5.15) and the object layer, with C++ and Swift doing so through the Rust C
+ABI's additive JSON accessors. Canonical totals and state order use the narrower field-level
+transition described below, so every SDK still decodes and checks every variant.
 
 The alternative to optional keys was worse in a way worth writing down. The canonical summary emits
 its `provenance` section **only when the file carries provenance** — unlike `audioSources`, which is
@@ -419,8 +418,9 @@ The suite runs on GitHub-hosted runners for Python, TypeScript and Rust on Linux
 C++, Swift and Dart run it on Linux. Every platform decodes the same generated corpus and compares
 against the same committed expectations. A fully supporting family makes 139 passing comparisons;
 the single `decode_indexed` variant that declares no chunk index is skipped everywhere. A language
-layer that has not landed exact canonical-unit sums still runs those same 139 checks: the shared
-transition omits only `positionSum` and `opacitySum`, while every other field remains strict.
+layer that has not landed exact canonical-unit sums and emitted-state ordering still runs those same
+139 checks: the shared transition omits only `positionSum`/`opacitySum` and `states[*].sample`,
+while every other field remains strict.
 
 That the corpus is bytes is the whole reason this is worth doing on more than one platform: a
 decoder that agrees with the expectation on Linux and disagrees on Windows is exactly the bug this

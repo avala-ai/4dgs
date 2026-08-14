@@ -215,8 +215,11 @@ class GaussianSet:
     motions: np.ndarray  # (n, 3) f32, units/second
     mu_t: np.ndarray  # (n,) f32
     sigma_t: np.ndarray  # (n,) f32, inf allowed
-    win_lo: np.ndarray  # (n,) f32
-    win_hi: np.ndarray  # (n,) f32
+    # Window Table endpoints are f64 on the wire (§5.4). Writers may accept f32
+    # arrays, but readers retain the encoded precision so a large finite endpoint is
+    # not silently reinterpreted as infinity.
+    win_lo: np.ndarray  # (n,) f64 when decoded
+    win_hi: np.ndarray  # (n,) f64 when decoded
     sh: np.ndarray | None = None  # (n, coeffs*3) u8
     sh_degree: int = 0
     source_group: np.ndarray | None = None
@@ -266,12 +269,10 @@ class GaussianSet:
             np.exp(-0.5 * np.square((t - mu) / np.maximum(sigma, 1e-30))),
             1.0,
         )
-        # Window Table endpoints are f64 on the wire even though the resident arrays are
-        # normally f32. Widen before comparing: NumPy otherwise narrows a huge finite
-        # scene time to f32 infinity, and a valid `[0, +inf)` row incorrectly fails
-        # `t < win_hi` because both operands become infinity.
-        win_lo = self.win_lo.astype(np.float64)
-        win_hi = self.win_hi.astype(np.float64)
+        # Keep comparison in f64. Decoded Window Table endpoints already retain their
+        # wire precision; the conversion also supports caller-constructed f32 sets.
+        win_lo = np.asarray(self.win_lo, dtype=np.float64)
+        win_hi = np.asarray(self.win_hi, dtype=np.float64)
         visible = (win_lo <= t) & (t < win_hi) & (marginal >= cutoff)
         idx = np.flatnonzero(visible)
         # A finite encoded scene may reconstruct a non-finite center at an extreme time;

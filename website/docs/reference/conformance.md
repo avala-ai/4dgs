@@ -175,7 +175,9 @@ argument. It must exit zero and print one JSON object:
   "family": "go",
   "readPath": "streamed",
   "refusals": true,
-  "declines": ["WithObjects"]
+  "declines": ["WithObjects"],
+  "exactAggregates": true,
+  "canonicalStateOrder": true
 }
 ```
 
@@ -184,8 +186,11 @@ equal to `1`. `readPath` is `streamed` or `indexed`, and `name` must be exactly
 `<family>/decode_<readPath>`. `family` may be omitted when it is the part of `name` before the first
 slash. `refusals` defaults to false and says whether the runner answers all seven invalid variants.
 `declines` defaults to an empty list and contains nonempty variant-name fragments for known valid
-features the runner does not implement. A malformed declaration, a non-zero exit, or a command that
-cannot start fails the run; it is not silently treated as an implementation that supports nothing.
+features the runner does not implement. `exactAggregates` and `canonicalStateOrder` default to false
+and opt into strict comparison of exact root/state totals and composed-state samples. During the
+stacked transition, false omits only those fields; it never skips a variant or relaxes another
+field. A malformed declaration, a non-zero exit, or a command that cannot start fails the run; it is
+not silently treated as an implementation that supports nothing.
 
 Pass one `--runner-cmd` per read path. The harness does not infer or manufacture the other path, and
 it does not require a pair, so the command list is also the record of which paths were actually

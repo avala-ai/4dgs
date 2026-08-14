@@ -81,9 +81,9 @@ class TestExactAggregateTransition:
         assert json_compare.without_exact_aggregates(actual) == json_compare.without_exact_aggregates(expected)
         assert actual["aggregate"]["positionSum"] == [100.0, 200.0, 300.0], "the helper must not mutate runner output"
 
-    def test_transition_claims_no_implementation_before_its_child(self):
-        assert conformance_run.EXACT_AGGREGATE_FAMILIES == frozenset()
-        assert conformance_run.CANONICAL_STATE_ORDER_FAMILIES == frozenset()
+    def test_python_child_claims_only_its_proved_implementation(self):
+        assert conformance_run.EXACT_AGGREGATE_FAMILIES == frozenset({"python"})
+        assert conformance_run.CANONICAL_STATE_ORDER_FAMILIES == frozenset({"python"})
 
     def test_only_exact_aggregate_tokens_use_lossless_decimal_equality(self):
         expected = json_compare.loads(

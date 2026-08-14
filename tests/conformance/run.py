@@ -135,8 +135,8 @@ REFUSAL_FAMILIES = frozenset({"python", "rust", "typescript", "cpp", "swift", "d
 # field except positionSum/opacitySum. Each implementation layer adds only its own family.
 # The transition itself claims no implementation. Each SDK layer adds only its own family
 # after its focused tests and strict corpus pass prove the feature.
-EXACT_AGGREGATE_FAMILIES: frozenset[str] = frozenset()
-CANONICAL_STATE_ORDER_FAMILIES: frozenset[str] = frozenset()
+EXACT_AGGREGATE_FAMILIES = frozenset({"python"})
+CANONICAL_STATE_ORDER_FAMILIES = frozenset({"python"})
 
 
 #: Record families a language has not implemented, by the variant-name flags that carry
