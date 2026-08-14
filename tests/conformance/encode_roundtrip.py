@@ -1236,6 +1236,36 @@ def _semantic_bounds(bounds: dict[str, str]) -> dict[str, Decimal]:
     return {key: Decimal(value) for key, value in bounds.items()}
 
 
+#: Temporary candidate-vs-reference divergences while the one-language #182(1) stack is
+#: in flight. The Rust layer corrects the shared reference before the independent
+#: TypeScript writer can follow, so that middle layer otherwise goes red for the old
+#: six-chunk layout. This is deliberately a second, candidate-family-keyed ledger rather
+#: than a broad exemption: it is dormant while Rust still emits six chunks, matches only
+#: these exact two values once Rust emits five, and is removed by the TypeScript layer.
+KNOWN_CANDIDATE_DIVERGENCES = {
+    (
+        "typescript",
+        "OneWindow-Quantized-UseChunkIndex-UseCrc",
+        None,
+        "chunkIntervals",
+    ): (
+        "77e5ef9f232ecbc8502e3bea045fe1dcdc517b4cdecf0afb2155b94ae3c488a4",
+        "7fc12f4cc38623ae25e9c694a5f2d83349f998ba911110961a92984d0b7c3e4c",
+        "#182(1): TypeScript still writes 6 source-support chunks; the corrected Rust reference writes 5",
+    ),
+    (
+        "typescript",
+        "OneWindow-Quantized-UseChunkIndex-UseCrc",
+        None,
+        "statistics.chunkCount",
+    ): (
+        "92e9e7e5922d26e17e48f0869ab25cc99499fdab722c065de8e0965c96c68e86",
+        "d10a4bc9e0c1fa4e8f3d7ce2512b8756e47ca5fa451f373c39a1431bb88db49f",
+        "#182(1): the temporary TypeScript 6-chunk layout counted against the corrected Rust 5",
+    ),
+}
+
+
 def known_candidate_divergence(
     candidate_family: str,
     variant: str,
