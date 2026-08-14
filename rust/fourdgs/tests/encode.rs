@@ -879,7 +879,7 @@ fn truncation_does_not_excuse_audio_when_the_header_flag_is_clear() {
 }
 
 #[test]
-fn indexed_audio_ranges_validate_descriptor_and_payload_lengths_first() {
+fn indexed_open_validates_audio_descriptor_and_payload_lengths_without_fetching_payload() {
     use fourdgs::serialization::{Cursor, Records, RECORD_HEADER_SIZE};
 
     let (g, duration) = scene(8);
@@ -917,8 +917,7 @@ fn indexed_audio_ranges_validate_descriptor_and_payload_lengths_first() {
     bytes[data_length_at..data_length_at + 8].copy_from_slice(&(declared + 1).to_le_bytes());
 
     let mut source = OwnedSource(bytes);
-    let indexed = fourdgs::indexed_reader::open_indexed(&mut source).expect("indexed open");
-    let error = fourdgs::indexed_reader::read_audio_range(&mut source, &indexed, 1, 0, 1)
+    let error = fourdgs::indexed_reader::open_indexed(&mut source)
         .expect_err("the descriptor disagrees with Audio Data");
     assert!(
         matches!(&error, fourdgs::Error::Malformed(message)

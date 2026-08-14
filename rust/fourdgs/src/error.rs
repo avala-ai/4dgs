@@ -163,6 +163,38 @@ impl Error {
         }
     }
 
+    /// Add the outer record and byte to a parser error without changing its taxonomy or
+    /// refusal identifier.
+    ///
+    /// Record parsers deliberately describe the field they were handed. Range and
+    /// streaming readers know where that field came from, and diagnostics need both
+    /// facts. Keeping the variant intact is what lets the C ABI continue distinguishing
+    /// malformed input, a cut resource, and a legal resource outside an implementation
+    /// ceiling.
+    pub(crate) fn at_record(self, record: &str, offset: u64) -> Error {
+        let context = |message: String| format!("{record} at byte {offset}: {message}");
+        match self {
+            Error::UnsupportedVersion(message) => Error::UnsupportedVersion(context(message)),
+            Error::Truncated(message) => Error::Truncated(context(message)),
+            Error::Malformed(message) => Error::Malformed(context(message)),
+            Error::UnsupportedCodec(message) => Error::UnsupportedCodec(context(message)),
+            Error::UnsupportedModel(message) => Error::UnsupportedModel(context(message)),
+            Error::BoundViolation(message) => Error::BoundViolation(context(message)),
+            Error::UnsupportedOperation(message) => Error::UnsupportedOperation(context(message)),
+            Error::InvalidInput(message) => Error::InvalidInput(context(message)),
+            Error::Refused {
+                code,
+                kind,
+                message,
+            } => Error::Refused {
+                code,
+                kind,
+                message: context(message),
+            },
+            Error::Io(error) => Error::Io(error),
+        }
+    }
+
     /// True when this is "not our file, or a version we do not implement", however it was
     /// raised.
     ///

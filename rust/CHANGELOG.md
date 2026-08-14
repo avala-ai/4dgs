@@ -6,12 +6,57 @@ All notable changes to the Rust crate are documented here, following
 
 ## [Unreleased]
 
+### Fixed
+
+- **Scene reading now enforces fixed validated working-set envelopes.** Header, Quantization, Window
+  Table, and lazy descriptor records are parsed from progressively fetched prefixes so legal
+  extension suffixes are stepped over rather than allocated on indexed and streamed paths. Encoded
+  Chunk and SH Band Stream ranges and contiguous summaries are capped before their reads; decoded
+  wire symbols and their wider resident values, gaussian-row amplification, aggregate scene state,
+  streamed retained bytes, and repeatable record counts are checked before the corresponding
+  decompression, output allocation, or collection growth. Indexed state ranges must frame exactly
+  one record. Audio Source bodies are validated without fetching Audio Data payloads, and
+  record-byte-aware incomplete-versus-malformed diagnoses cross the C ABI. Indexed camera, metadata,
+  attachment, provenance, object, and Audio Source parsing now shares the opened scene's diminishing
+  allowance, and replacement loads charge every retained lazy and pose-validation cache before
+  decoding beside the previous gaussian state. Header attribute maps and streamed audio map nodes
+  are checked before allocation, lazy Audio Source descriptors include all `SceneReader` caches, and
+  the public decompressor grows only as validated output actually arrives. Quantization bounds,
+  Metadata maps, Window Table rows, indexed range collections, and assembly scratch storage receive
+  the same pre-allocation checks; truncated orphan audio payloads leave the budget when dropped.
+- **Indexed Chunk and SH Band Stream ranges are checked against the resource before they are read.**
+  A Chunk Index entry is two numbers with no framing around them, so nothing but this check stands
+  between a declared range and the buffer sized from it. `BytesReadable` and `FileReadable` refuse
+  an out-of-range read on their own and hid the gap; a caller-supplied range source — which is what
+  every C, C++ and Swift consumer provides — sizes the host's buffer before the host sees the
+  offset, so a 512 MiB entry in a 933-byte file allocated 512 MiB, once per index entry and once per
+  SH band range.
+- **A Window Table that arrives after a Chunk is refused rather than applied retroactively.** A
+  window index is validated against the table in force when its Chunk is decoded; a second, shorter
+  table left indices already accepted pointing outside the table assembly was handed, which indexed
+  a `Vec` out of bounds and panicked — `FOURDGS_STATUS_INTERNAL` across the C ABI, an abort under
+  `panic=abort`. Assembly now checks the index it is given as well, so a malformed file is a refusal
+  on both paths.
+- **The indexed decode ceiling accumulates across the chunks a caller keeps.** `read_chunk` gave
+  every call the whole shared scene ceiling, so N reads a caller retains cost N ceilings. It now
+  bounds one read against the opened scene's remaining budget, and `read_chunk_within` carries a
+  `ResidentBudget` across a loop that keeps what it reads.
+- **Duplicate provenance record names are found in linear time.** The check rescanned every earlier
+  name per record, so the record-count ceiling bounded memory but not CPU: 200,000 `CoordinateFrame`
+  records — 6.0 MB of input — took 15.4 s in `read_bytes`, and the ceiling admitted about 26 s. The
+  same file now takes 26 ms.
+
 ### Changed
 
 - `WriteOptions.cutoff` outside `(0, 1]` is refused as `InvalidInput` rather than written. A
   marginal threshold of zero or less has no logarithm to invert, and the `NaN` support half-width
   that came back was discarded by `f64::max`/`f64::min`, silently planning every chunk as though
   each gaussian filled its whole validity window.
+- **A counted record is fetched at the size it declares instead of by doubling towards it.** The
+  prefix loop grew 8 KiB, 16 KiB, 32 KiB … re-reading from the same offset each time, so a lazily
+  read 100,000-sample Object Track cost `2 + log2(L / 8 KiB)` range requests and moved roughly `2L`
+  bytes. Records that declare a row count already state their own length; the prefix now jumps to
+  it, which is two requests and `L` bytes. Records with no counted rows still double.
 
 ## [0.6.0] - 2026-08-13
 

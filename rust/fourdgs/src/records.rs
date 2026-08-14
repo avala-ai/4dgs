@@ -17,6 +17,14 @@ use crate::serialization::{
     put_u64, put_u8, Cursor,
 };
 
+fn cursor_f64_3(cursor: &mut Cursor<'_>) -> Result<[f64; 3]> {
+    Ok([cursor.f64()?, cursor.f64()?, cursor.f64()?])
+}
+
+fn cursor_f64_4(cursor: &mut Cursor<'_>) -> Result<[f64; 4]> {
+    Ok([cursor.f64()?, cursor.f64()?, cursor.f64()?, cursor.f64()?])
+}
+
 /// The Euclidean norm of a quaternion, computed without squaring the components first.
 ///
 /// A component near the top of the double range squares to infinity, so the naive sum
@@ -55,6 +63,127 @@ pub const FLAG_HAS_AUDIO: u8 = 1 << 0;
 pub const FLAG_CHUNKS_COMPRESSED: u8 = 1 << 1;
 pub const AUDIO_SOURCE_SPATIAL: u8 = 1 << 0;
 pub const AUDIO_SOURCE_LOOP: u8 = 1 << 1;
+
+/// The least content bytes the counted fields visible in `prefix` imply.
+///
+/// Two callers want this number and they want it for different reasons. Framing wants it
+/// to catch a record that declares more rows than its own length could hold, which is a
+/// contradiction rather than a truncation. Prefix readers want it to stop guessing: a
+/// record whose rows are all required is fetched at its own size on the next request
+/// instead of at 8 KiB, then 16 KiB, then 32 KiB, each one a round trip and each one
+/// re-reading everything before it.
+///
+/// `None` means the counts are not visible yet, or the record has none.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CountedMinimum {
+    what: &'static str,
+    /// The declared row count, absent when only the fixed header is accounted for.
+    count: Option<u32>,
+    pub(crate) needed: u64,
+}
+
+pub(crate) fn counted_record_minimum_length(
+    opcode: u8,
+    prefix: &[u8],
+) -> Result<Option<CountedMinimum>> {
+    fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
+        let raw: [u8; 4] = bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?;
+        Some(u32::from_le_bytes(raw))
+    }
+
+    fn rows(
+        what: &'static str,
+        count: Option<u32>,
+        fixed_bytes: u64,
+        row_bytes: u64,
+    ) -> Result<Option<CountedMinimum>> {
+        let Some(count) = count else {
+            return Ok(None);
+        };
+        let needed = u64::from(count)
+            .checked_mul(row_bytes)
+            .and_then(|rows| rows.checked_add(fixed_bytes))
+            .ok_or_else(|| {
+                Error::Malformed(format!(
+                    "{what} declares {count} rows whose minimum record length overflows"
+                ))
+            })?;
+        Ok(Some(CountedMinimum {
+            what,
+            count: Some(count),
+            needed,
+        }))
+    }
+
+    match opcode {
+        op::WINDOW_TABLE => rows("Window Table", u32_at(prefix, 0), 4, 16),
+        // Fixed pose + count, then an empty interpolation string and loop byte.
+        op::CAMERA => rows("Camera", u32_at(prefix, 56), 65, 56),
+        op::RIG_TRAJECTORY => {
+            let Some(name_length) = u32_at(prefix, 0) else {
+                return Ok(None);
+            };
+            let count_offset = 4usize
+                .checked_add(name_length as usize)
+                .and_then(|offset| offset.checked_add(1))
+                .ok_or_else(|| Error::Malformed("Rig Trajectory name length overflows".into()))?;
+            let fixed_bytes = (count_offset as u64).checked_add(4).ok_or_else(|| {
+                Error::Malformed("Rig Trajectory fixed field length overflows".into())
+            })?;
+            match u32_at(prefix, count_offset) {
+                Some(count) => rows("Rig Trajectory", Some(count), fixed_bytes, 64),
+                // The name and the count field are themselves a floor, before the count
+                // behind them is readable.
+                None => Ok(Some(CountedMinimum {
+                    what: "Rig Trajectory",
+                    count: None,
+                    needed: fixed_bytes,
+                })),
+            }
+        }
+        op::OBJECT_TABLE => match (u32_at(prefix, 0), prefix.get(4..6)) {
+            (Some(count), Some(embedding)) => {
+                let embedding_dim = u16::from_le_bytes([embedding[0], embedding[1]]);
+                let row_bytes = 21 + u64::from(embedding_dim > 0);
+                rows("Object Table", Some(count), 6, row_bytes)
+            }
+            _ => Ok(None),
+        },
+        op::OBJECT_TRACK => rows("Object Track", u32_at(prefix, 5), 9, 64),
+        _ => Ok(None),
+    }
+}
+
+/// Reject counted known fields that cannot fit inside their complete record framing.
+///
+/// Prefix readers may deliberately stop before a legal extension suffix, but once a
+/// count is visible the full framed length proves whether the declared rows could exist.
+/// That structural contradiction is malformed even when the prefix itself is capped.
+pub(crate) fn preflight_counted_record_length(
+    opcode: u8,
+    prefix: &[u8],
+    full_content_length: u64,
+) -> Result<()> {
+    let Some(minimum) = counted_record_minimum_length(opcode, prefix)? else {
+        return Ok(());
+    };
+    if minimum.needed <= full_content_length {
+        return Ok(());
+    }
+    let CountedMinimum {
+        what,
+        count,
+        needed,
+    } = minimum;
+    Err(Error::Malformed(match count {
+        Some(count) => format!(
+            "{what} declares {count} rows needing at least {needed} content bytes, but its record declares {full_content_length}"
+        ),
+        None => format!(
+            "{what} name and count header need at least {needed} content bytes, but its record declares {full_content_length}"
+        ),
+    }))
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Header {
@@ -193,10 +322,35 @@ pub struct Quantization {
 
 impl Quantization {
     pub fn parse(content: &[u8]) -> Result<Quantization> {
+        Self::parse_prefix(content, true)
+    }
+
+    /// Parse a progressively fetched Quantization prefix without silently dropping an
+    /// appended per-band SH declaration that straddles the current probe boundary.
+    pub(crate) fn parse_prefix(content: &[u8], complete: bool) -> Result<Quantization> {
         let mut c = Cursor::new(content);
         let scheme = c.string()?;
         let pos_origin = c.f64s(3)?;
         let steps = c.f64s(8)?;
+        let step_sh = c.u8()?;
+        let bounds = c.str_map()?;
+        let tail = c.rest();
+        if !complete {
+            if tail.is_empty() {
+                return Err(Error::Truncated(
+                    "the Quantization prefix ends where its optional SH bit-depth declaration may begin"
+                        .into(),
+                ));
+            }
+            let count = tail[0] as usize;
+            if (1..=3).contains(&count) && tail.len() < 1 + count {
+                return Err(Error::Truncated(format!(
+                    "the Quantization prefix carries {}/{} optional SH bit-depth bytes",
+                    tail.len().saturating_sub(1),
+                    count
+                )));
+            }
+        }
         let quantization = Quantization {
             scheme,
             pos_origin,
@@ -208,9 +362,9 @@ impl Quantization {
             step_motion: steps[5],
             step_time: steps[6],
             step_sigma_log: steps[7],
-            step_sh: c.u8()?,
-            bounds: c.str_map()?,
-            sh_bit_depths: sh_bit_depths(c.rest()),
+            step_sh,
+            bounds,
+            sh_bit_depths: sh_bit_depths(tail),
         };
         if let Some(value) = quantization.bounds.get("object_id") {
             return Err(Error::Malformed(format!(
@@ -300,7 +454,21 @@ impl WindowTable {
     pub fn parse(content: &[u8]) -> Result<WindowTable> {
         let mut c = Cursor::new(content);
         let count = c.u32()? as usize;
-        let mut windows = Vec::with_capacity(count.min(1 << 16));
+        let row_bytes = count
+            .checked_mul(2 * std::mem::size_of::<f64>())
+            .ok_or_else(|| Error::Malformed("Window Table row bytes overflow".into()))?;
+        if c.remaining() < row_bytes {
+            return Err(Error::Truncated(format!(
+                "Window Table declares {count} rows needing {row_bytes} bytes, only {} remain",
+                c.remaining()
+            )));
+        }
+        let mut windows = Vec::new();
+        windows.try_reserve_exact(count).map_err(|error| {
+            Error::UnsupportedOperation(format!(
+                "Window Table could not reserve its validated {count} rows: {error}"
+            ))
+        })?;
         for _ in 0..count {
             let lo = c.f64()?;
             let hi = c.f64()?;
@@ -526,6 +694,11 @@ impl ChunkIndexEntry {
             ..Default::default()
         };
         let bands = c.u32()? as usize;
+        if bands > 3 {
+            return Err(Error::Malformed(format!(
+                "the Chunk Index entry declares {bands} SH band ranges; version 1 defines at most 3"
+            )));
+        }
         entry.bands.reserve(bands.min(1 << 12));
         for _ in 0..bands {
             let band = c.u8()?;
@@ -589,6 +762,69 @@ impl Audio {
         })
     }
 
+    /// Consume a streamed record buffer and reuse it for the encoded payload.
+    ///
+    /// The codec and timestamp are small descriptor fields, while the length-prefixed
+    /// payload may occupy almost the entire retained-content allowance. Moving that
+    /// payload in place avoids keeping a second payload-sized allocation beside the
+    /// already validated record buffer.
+    pub(crate) fn into_payload_with_descriptor_budget(
+        mut content: Vec<u8>,
+        descriptor_budget: usize,
+    ) -> Result<(Audio, usize)> {
+        let (codec_start, codec_len, start_sec, start, len) = {
+            let mut c = Cursor::new(&content);
+            let codec_len = c.u32()? as usize;
+            let codec_start = c.position();
+            let codec = c.take(codec_len)?;
+            std::str::from_utf8(codec).map_err(|error| {
+                Error::Malformed(format!("a string field is not valid UTF-8: {error}"))
+            })?;
+            let start_sec = c.f64()?;
+            let data = c.blob()?;
+            let len = data.len();
+            (
+                codec_start,
+                codec_len,
+                start_sec,
+                content.len() - c.remaining() - len,
+                len,
+            )
+        };
+        if codec_len > descriptor_budget {
+            return Err(Error::UnsupportedOperation(format!(
+                "the legacy Audio codec needs {codec_len} retained string bytes, past the {descriptor_budget} bytes remaining in the retained-record budget"
+            )));
+        }
+        let mut codec = String::new();
+        codec.try_reserve_exact(codec_len).map_err(|error| {
+            Error::UnsupportedOperation(format!(
+                "the legacy Audio codec could not reserve {codec_len} bytes within the {descriptor_budget} byte descriptor budget: {error}"
+            ))
+        })?;
+        if codec.capacity() > descriptor_budget {
+            return Err(Error::UnsupportedOperation(format!(
+                "the legacy Audio codec retained {} bytes, past the {descriptor_budget} byte descriptor budget",
+                codec.capacity()
+            )));
+        }
+        codec.push_str(
+            std::str::from_utf8(&content[codec_start..codec_start + codec_len])
+                .expect("the legacy Audio codec was validated above"),
+        );
+        let descriptor_bytes = codec.capacity();
+        content.truncate(start + len);
+        content.drain(..start);
+        Ok((
+            Audio {
+                codec,
+                start_sec,
+                data: content,
+            },
+            descriptor_bytes,
+        ))
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut body = Vec::new();
         put_string(&mut body, &self.codec);
@@ -600,12 +836,7 @@ impl Audio {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct AudioSourceKeyframe {
-    pub time: f64,
-    pub position: [f64; 3],
-    pub rotation: [f64; 4],
-}
+pub type AudioSourceKeyframe = crate::model::AudioSourceKeyframe;
 
 /// The small descriptor in an Audio Source record. Its bytes are in Audio Data.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -635,6 +866,20 @@ impl AudioSource {
     }
 
     pub fn parse(content: &[u8]) -> Result<AudioSource> {
+        Self::parse_prefix(content, true, content.len() as u64)
+    }
+
+    /// Parse a descriptor prefix while a range reader is still growing it.
+    ///
+    /// The keyframe preflight normally diagnoses a count that does not fit the complete
+    /// record as malformed. Against a deliberately partial prefix, the same condition is
+    /// only "need more bytes"; keeping that distinction lets an indexed reader stop at
+    /// its working-set ceiling without calling a conforming large descriptor broken.
+    pub(crate) fn parse_prefix(
+        content: &[u8],
+        complete: bool,
+        full_content_length: u64,
+    ) -> Result<AudioSource> {
         let mut c = Cursor::new(content);
         let source_id = c.u32()?;
         let name = c.string()?;
@@ -645,8 +890,8 @@ impl AudioSource {
         let duration_sec = c.f64()?;
         let gain = c.f64()?;
         let flags = c.u8()?;
-        let position: [f64; 3] = c.f64s(3)?.try_into().expect("three values");
-        let rotation: [f64; 4] = c.f64s(4)?.try_into().expect("four values");
+        let position = cursor_f64_3(&mut c)?;
+        let rotation = cursor_f64_4(&mut c)?;
         let count = c.u32()?;
         let needed = usize::try_from(count)
             .unwrap_or(usize::MAX)
@@ -656,18 +901,44 @@ impl AudioSource {
                     "Audio Source {source_id} keyframe count {count} overflows"
                 ))
             })?;
-        if needed > c.remaining() {
+        let minimum_record_length = (c.position() as u64)
+            .checked_add(needed as u64)
+            // Even an empty interpolation string carries its u32 byte length.
+            .and_then(|length| length.checked_add(4))
+            .ok_or_else(|| {
+                Error::Malformed(format!(
+                    "Audio Source {source_id} keyframe count {count} overflows its record length"
+                ))
+            })?;
+        if minimum_record_length > full_content_length {
             return Err(Error::Malformed(format!(
-                "Audio Source {source_id} declares {count} keyframes needing {needed} bytes, {} remain",
-                c.remaining()
+                "Audio Source {source_id} declares {count} keyframes needing at least {minimum_record_length} content bytes, but its record declares {full_content_length}"
             )));
         }
-        let mut keyframes = Vec::with_capacity(count as usize);
+        if needed > c.remaining() {
+            let message = format!(
+                "Audio Source {source_id} declares {count} keyframes needing {needed} bytes, {} remain",
+                c.remaining()
+            );
+            return Err(if complete {
+                Error::Malformed(message)
+            } else {
+                Error::Truncated(message)
+            });
+        }
+        let mut keyframes = Vec::new();
+        keyframes
+            .try_reserve_exact(count as usize)
+            .map_err(|error| {
+                Error::UnsupportedOperation(format!(
+                    "Audio Source {source_id} could not reserve {count} keyframes: {error}"
+                ))
+            })?;
         for _ in 0..count {
             keyframes.push(AudioSourceKeyframe {
                 time: c.f64()?,
-                position: c.f64s(3)?.try_into().expect("three values"),
-                rotation: c.f64s(4)?.try_into().expect("four values"),
+                position: cursor_f64_3(&mut c)?,
+                rotation: cursor_f64_4(&mut c)?,
             });
         }
         let source = AudioSource {
@@ -872,24 +1143,44 @@ impl Default for Camera {
     }
 }
 
-fn triple(v: Vec<f64>) -> [f64; 3] {
-    [v[0], v[1], v[2]]
-}
-
 impl Camera {
     pub fn parse(content: &[u8]) -> Result<Camera> {
         let mut c = Cursor::new(content);
         let fov_y_deg = c.f64()?;
-        let position = triple(c.f64s(3)?);
-        let target = triple(c.f64s(3)?);
+        let position = cursor_f64_3(&mut c)?;
+        let target = cursor_f64_3(&mut c)?;
         let count = c.u32()? as usize;
-        let mut times = Vec::with_capacity(count.min(1 << 16));
-        let mut positions = Vec::with_capacity(count.min(1 << 16));
-        let mut targets = Vec::with_capacity(count.min(1 << 16));
+        let sample_bytes = count
+            .checked_mul(7 * std::mem::size_of::<f64>())
+            .ok_or_else(|| Error::Malformed("Camera sample-byte count overflows".into()))?;
+        if sample_bytes > c.remaining() {
+            return Err(Error::Truncated(format!(
+                "Camera declares {count} samples needing {sample_bytes} bytes, but {} bytes remain",
+                c.remaining()
+            )));
+        }
+        let mut times = Vec::new();
+        let mut positions = Vec::new();
+        let mut targets = Vec::new();
+        times.try_reserve_exact(count).map_err(|error| {
+            Error::UnsupportedOperation(format!(
+                "Camera could not reserve {count} sample times: {error}"
+            ))
+        })?;
+        positions.try_reserve_exact(count).map_err(|error| {
+            Error::UnsupportedOperation(format!(
+                "Camera could not reserve {count} sample positions: {error}"
+            ))
+        })?;
+        targets.try_reserve_exact(count).map_err(|error| {
+            Error::UnsupportedOperation(format!(
+                "Camera could not reserve {count} sample targets: {error}"
+            ))
+        })?;
         for _ in 0..count {
             times.push(c.f64()?);
-            positions.push(triple(c.f64s(3)?));
-            targets.push(triple(c.f64s(3)?));
+            positions.push(cursor_f64_3(&mut c)?);
+            targets.push(cursor_f64_3(&mut c)?);
         }
         Ok(Camera {
             fov_y_deg,
@@ -995,6 +1286,114 @@ impl Attachment {
             media_type: c.string()?,
             data: c.blob()?.to_vec(),
         })
+    }
+
+    /// Consume a retained record buffer and reuse it for the attachment payload.
+    ///
+    /// The descriptor strings are the only additional allocations this conversion makes.
+    /// Validate and reserve them against the caller's remaining retained-record budget
+    /// before copying either one, so a large legal descriptor cannot overlap the complete
+    /// record buffer without being charged.
+    pub(crate) fn into_payload_with_descriptor_budget(
+        mut content: Vec<u8>,
+        descriptor_budget: usize,
+    ) -> Result<(Attachment, usize)> {
+        let (name_start, name_len, media_type_start, media_type_len, start, len) = {
+            let mut c = Cursor::new(&content);
+            let name_len = c.u32()? as usize;
+            let name_start = c.position();
+            let name = c.take(name_len)?;
+            std::str::from_utf8(name).map_err(|error| {
+                Error::Malformed(format!("a string field is not valid UTF-8: {error}"))
+            })?;
+            let media_type_len = c.u32()? as usize;
+            let media_type_start = c.position();
+            let media_type = c.take(media_type_len)?;
+            std::str::from_utf8(media_type).map_err(|error| {
+                Error::Malformed(format!("a string field is not valid UTF-8: {error}"))
+            })?;
+            let data = c.blob()?;
+            let len = data.len();
+            (
+                name_start,
+                name_len,
+                media_type_start,
+                media_type_len,
+                content.len() - c.remaining() - len,
+                len,
+            )
+        };
+
+        let declared_descriptor_bytes = name_len.checked_add(media_type_len).ok_or_else(|| {
+            Error::UnsupportedOperation("Attachment descriptor byte count overflows".into())
+        })?;
+        if declared_descriptor_bytes > descriptor_budget {
+            return Err(Error::UnsupportedOperation(format!(
+                "the Attachment descriptor needs {declared_descriptor_bytes} retained string bytes, past the {descriptor_budget} bytes remaining in the retained-record budget"
+            )));
+        }
+
+        let mut name = String::new();
+        name.try_reserve_exact(name_len).map_err(|error| {
+            Error::UnsupportedOperation(format!(
+                "the Attachment name could not reserve {name_len} bytes within the {descriptor_budget} byte descriptor budget: {error}"
+            ))
+        })?;
+        if name.capacity() > descriptor_budget {
+            return Err(Error::UnsupportedOperation(format!(
+                "the Attachment name retained {} bytes, past the {descriptor_budget} byte descriptor budget",
+                name.capacity()
+            )));
+        }
+        // SAFETY is not needed: both slices were validated as UTF-8 above while parsing.
+        name.push_str(
+            std::str::from_utf8(&content[name_start..name_start + name_len])
+                .expect("the Attachment name was validated above"),
+        );
+
+        let media_type_budget = descriptor_budget - name.capacity();
+        if media_type_len > media_type_budget {
+            return Err(Error::UnsupportedOperation(format!(
+                "the Attachment descriptors need at least {} retained bytes, past the {descriptor_budget} byte descriptor budget",
+                name.capacity().saturating_add(media_type_len)
+            )));
+        }
+        let mut media_type = String::new();
+        media_type
+            .try_reserve_exact(media_type_len)
+            .map_err(|error| {
+                Error::UnsupportedOperation(format!(
+                    "the Attachment media type could not reserve {media_type_len} bytes within the {media_type_budget} bytes left in its descriptor budget: {error}"
+                ))
+            })?;
+        if media_type.capacity() > media_type_budget {
+            return Err(Error::UnsupportedOperation(format!(
+                "the Attachment media type retained {} bytes, past the {media_type_budget} bytes left in its descriptor budget",
+                media_type.capacity()
+            )));
+        }
+        media_type.push_str(
+            std::str::from_utf8(&content[media_type_start..media_type_start + media_type_len])
+                .expect("the Attachment media type was validated above"),
+        );
+        let descriptor_bytes = name
+            .capacity()
+            .checked_add(media_type.capacity())
+            .ok_or_else(|| {
+                Error::UnsupportedOperation(
+                    "Attachment descriptor allocation bytes overflow".into(),
+                )
+            })?;
+        content.truncate(start + len);
+        content.drain(..start);
+        Ok((
+            Attachment {
+                name,
+                media_type,
+                data: content,
+            },
+            descriptor_bytes,
+        ))
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -1430,17 +1829,53 @@ impl RigTrajectory {
                 trajectory.name
             )));
         }
-        // Bounded like the other count-prefixed records: a crafted count must not size an
-        // allocation before the bytes behind it have been shown to exist.
-        trajectory.times.reserve(count.min(1 << 16));
-        trajectory.rotations.reserve(count.min(1 << 16));
-        trajectory.translations.reserve(count.min(1 << 16));
+        // Bounded like the other count-prefixed records: prove the complete fixed-width
+        // sample block exists before sizing from its count, then reserve its exact three
+        // column allocations.  Geometric growth would otherwise retain nearly twice the
+        // declared trajectory beside the input prefix for counts just above a power of 2.
+        let sample_bytes = count
+            .checked_mul(8 * std::mem::size_of::<f64>())
+            .ok_or_else(|| {
+                Error::Malformed(format!(
+                    "trajectory {:?} sample-byte count overflows",
+                    trajectory.name
+                ))
+            })?;
+        if sample_bytes > c.remaining() {
+            return Err(Error::Truncated(format!(
+                "trajectory {:?} declares {count} samples needing {sample_bytes} bytes, but {} bytes remain",
+                trajectory.name,
+                c.remaining()
+            )));
+        }
+        trajectory.times.try_reserve_exact(count).map_err(|error| {
+            Error::UnsupportedOperation(format!(
+                "trajectory {:?} could not reserve {count} sample times: {error}",
+                trajectory.name
+            ))
+        })?;
+        trajectory
+            .rotations
+            .try_reserve_exact(count)
+            .map_err(|error| {
+                Error::UnsupportedOperation(format!(
+                    "trajectory {:?} could not reserve {count} sample rotations: {error}",
+                    trajectory.name
+                ))
+            })?;
+        trajectory
+            .translations
+            .try_reserve_exact(count)
+            .map_err(|error| {
+                Error::UnsupportedOperation(format!(
+                    "trajectory {:?} could not reserve {count} sample translations: {error}",
+                    trajectory.name
+                ))
+            })?;
         for _ in 0..count {
             trajectory.times.push(c.f64()?);
-            let r = c.f64s(4)?;
-            trajectory.rotations.push([r[0], r[1], r[2], r[3]]);
-            let t = c.f64s(3)?;
-            trajectory.translations.push([t[0], t[1], t[2]]);
+            trajectory.rotations.push(cursor_f64_4(&mut c)?);
+            trajectory.translations.push(cursor_f64_3(&mut c)?);
         }
         // Section 5.15.4: a trajectory with no samples "MUST be read as though the record
         // were absent", so reading one refuses nothing — not even an interpolation byte
@@ -1761,15 +2196,31 @@ impl ObjectTrack {
                 track.object_id
             )));
         }
-        track.times.reserve(count);
-        track.rotations.reserve(count);
-        track.translations.reserve(count);
+        track.times.try_reserve_exact(count).map_err(|error| {
+            Error::UnsupportedOperation(format!(
+                "track for object {} could not reserve {count} sample times: {error}",
+                track.object_id
+            ))
+        })?;
+        track.rotations.try_reserve_exact(count).map_err(|error| {
+            Error::UnsupportedOperation(format!(
+                "track for object {} could not reserve {count} sample rotations: {error}",
+                track.object_id
+            ))
+        })?;
+        track
+            .translations
+            .try_reserve_exact(count)
+            .map_err(|error| {
+                Error::UnsupportedOperation(format!(
+                    "track for object {} could not reserve {count} sample translations: {error}",
+                    track.object_id
+                ))
+            })?;
         for _ in 0..count {
             track.times.push(c.f64()?);
-            let r = c.f64s(4)?;
-            track.rotations.push([r[0], r[1], r[2], r[3]]);
-            let t = c.f64s(3)?;
-            track.translations.push([t[0], t[1], t[2]]);
+            track.rotations.push(cursor_f64_4(&mut c)?);
+            track.translations.push(cursor_f64_3(&mut c)?);
         }
         // Section 5.15.7: a zero-sample track "has no pose and is read as absent", so
         // reading one refuses nothing about its pose. The id is not part of the pose —
