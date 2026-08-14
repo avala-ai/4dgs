@@ -971,135 +971,51 @@ void main() {
       );
     });
 
-    test('per-band SH bounds compare as exact decimals', () async {
-      for (final String spelling in <String>[
-        '4.0',
-        '\u20094\u2009',
-        '0.${List<String>.filled(1000, '0').join()}4e1001',
-      ]) {
-        final FourdgsValidation equivalent = await validateFourdgs(
-          FourdgsBytes(
-            _minimal(
-              shDegree: 1,
-              shBitDepths: const <int>[5],
-              shBand1Bound: spelling,
+    test(
+      'a bound is read by the grammar the specification writes down',
+      () async {
+        for (final (String spelling, int expected)
+            in _equivalentBoundSpellings) {
+          final FourdgsValidation report = await validateFourdgs(
+            FourdgsBytes(
+              _minimal(
+                shDegree: 1,
+                shBitDepths: <int>[_depthForBound(expected)],
+                shBand1Bound: spelling,
+              ),
             ),
-          ),
-        );
-        expect(
-          equivalent.findings.where(
-            (FourdgsFinding finding) =>
-                finding.message.contains('`sh_band1` as'),
-          ),
-          isEmpty,
-          reason: spelling,
-        );
-      }
+          );
+          expect(
+            report.findings.where(
+              (FourdgsFinding finding) =>
+                  finding.message.contains('`sh_band1` as'),
+            ),
+            isEmpty,
+            reason: '$spelling should be $expected',
+          );
+        }
 
-      for (final String spelling in <String>[
-        '4.0000000000000001',
-        '\ufeff4\ufeff',
-      ]) {
-        final FourdgsValidation different = await validateFourdgs(
-          FourdgsBytes(
-            _minimal(
-              shDegree: 1,
-              shBitDepths: const <int>[5],
-              shBand1Bound: spelling,
+        for (final (String spelling, int expected) in _rejectedBoundSpellings) {
+          final FourdgsValidation report = await validateFourdgs(
+            FourdgsBytes(
+              _minimal(
+                shDegree: 1,
+                shBitDepths: <int>[_depthForBound(expected)],
+                shBand1Bound: spelling,
+              ),
             ),
-          ),
-        );
-        expect(
-          different.findings.where(
-            (FourdgsFinding finding) =>
-                finding.message.contains('`sh_band1` as'),
-          ),
-          isNotEmpty,
-          reason: spelling,
-        );
-      }
-
-      for (final String spelling in <String>[
-        '8_0e-1',
-        '_+008_.0_00',
-        '٨',
-        '٨٠e-۱',
-      ]) {
-        final FourdgsValidation equivalentEight = await validateFourdgs(
-          FourdgsBytes(
-            _minimal(
-              shDegree: 1,
-              shBitDepths: const <int>[4],
-              shBand1Bound: spelling,
+          );
+          expect(
+            report.findings.where(
+              (FourdgsFinding finding) =>
+                  finding.message.contains('`sh_band1` as'),
             ),
-          ),
-        );
-        expect(
-          equivalentEight.findings.where(
-            (FourdgsFinding finding) =>
-                finding.message.contains('`sh_band1` as'),
-          ),
-          isEmpty,
-          reason: spelling,
-        );
-      }
-
-      for (final String spelling in <String>[
-        '0e999999999999999999',
-        '0e-1999999999999999997',
-        '0e+000000000000000000',
-        '0.0e1000000000000000000',
-        '0.00e-1999999999999999995',
-        '0.0_e1_000_000_000_000_000_000',
-        '0.0_e-1_999_999_999_999_999_995',
-      ]) {
-        final FourdgsValidation equivalentZero = await validateFourdgs(
-          FourdgsBytes(
-            _minimal(
-              shDegree: 1,
-              shBitDepths: const <int>[8],
-              shBand1Bound: spelling,
-            ),
-          ),
-        );
-        expect(
-          equivalentZero.findings.where(
-            (FourdgsFinding finding) =>
-                finding.message.contains('`sh_band1` as'),
-          ),
-          isEmpty,
-          reason: spelling,
-        );
-      }
-
-      for (final String spelling in <String>[
-        '0e1000000000000000000',
-        '0e-1999999999999999998',
-        '0e+0001000000000000000000',
-        '0.0e-1999999999999999997',
-        '0.0e-1_999_999_999_999_999_997',
-        '_',
-        '⁸',
-      ]) {
-        final FourdgsValidation malformedZero = await validateFourdgs(
-          FourdgsBytes(
-            _minimal(
-              shDegree: 1,
-              shBitDepths: const <int>[8],
-              shBand1Bound: spelling,
-            ),
-          ),
-        );
-        expect(
-          malformedZero.findings.where(
-            (FourdgsFinding finding) =>
-                finding.message.contains('`sh_band1` as'),
-          ),
-          isNotEmpty,
-          reason: spelling,
-        );
-      }
-    });
+            isNotEmpty,
+            reason: '$spelling should not be $expected',
+          );
+        }
+      },
+    );
 
     test('a malformed SH-depth append remains visible to validation', () async {
       final FourdgsValidation report = await validateFourdgs(
@@ -2010,6 +1926,94 @@ Object _caught(void Function() body) {
 }
 
 /// The smallest thing that is meant to validate: header, grids, windows, footer.
+final String _longFraction = '0.${'0' * 1000}4e1001';
+
+/// The spellings section 5.3's grammar accepts, against the bound each one
+/// declares.
+///
+/// The identical table is checked by the Python, TypeScript and Rust
+/// validators. A row that moves here without moving there is the disagreement
+/// the grammar exists to end, so keep the four in step.
+final List<(String, int)> _equivalentBoundSpellings = <(String, int)>[
+  ('16', 16),
+  ('16.', 16),
+  ('16.0', 16),
+  ('+016.000', 16),
+  ('1.6e1', 16),
+  ('160e-1', 16),
+  ('0.16E2', 16),
+  ('8', 8),
+  ('0.8e1', 8),
+  ('80e-1', 8),
+  ('.4e1', 4),
+  (_longFraction, 4),
+  ('0', 0),
+  ('0.0', 0),
+  ('-0', 0),
+  ('+0.000', 0),
+  ('0e999999999999999999999999', 0),
+  ('0.0e-999999999999999999999999', 0),
+];
+
+/// The spellings section 5.3's grammar refuses, against the bound the record
+/// declares.
+///
+/// Several are accepted by one runtime's decimal type or another: underscores
+/// and other scripts' digits by Python's `Decimal`, U+FEFF by Dart's own
+/// `String.trim`, and U+001C through U+001F by Python's whitespace set. That is
+/// exactly why the grammar is matched here rather than delegated to a runtime.
+const List<(String, int)> _rejectedBoundSpellings = <(String, int)>[
+  ('1_6', 16),
+  ('8_0e-1', 8),
+  ('_16', 16),
+  ('16_', 16),
+  ('\u{0661}\u{0666}', 16), // Arabic-Indic one six
+  ('\u{0668}', 8), // Arabic-Indic eight
+  ('\u{0668}\u{0660}e-\u{06f1}', 8),
+  ('\u{ff11}\u{ff16}', 16), // fullwidth one six
+  ('\u{2078}', 8), // superscript eight, a digit in no grammar
+  ('\u{feff}16', 16), // a byte-order mark is data, not padding
+  ('\u{feff}4', 4),
+  ('16\u{feff}', 16),
+  ('\u{001c}8', 8), // Python's `Decimal` trims U+001C; the grammar does not
+  ('\u{001f}16', 16),
+  (' 16 ', 16),
+  ('\t16', 16),
+  ('16\n', 16),
+  ('\u{2009}16', 16), // thin space
+  ('16.0000000000000001', 16),
+  ('15.9999999999999999', 16),
+  ('1.6', 16),
+  ('16e', 16),
+  ('16e+', 16),
+  ('16e-', 16),
+  ('16eNaN', 16),
+  ('', 16),
+  ('.', 16),
+  ('+', 16),
+  ('_', 0),
+  ('NaN', 0),
+  ('nan', 0),
+  ('Infinity', 16),
+  ('inf', 16),
+  ('-16', 16),
+  ('0e', 0),
+  ('0_0', 0),
+  ('\u{0660}', 0), // Arabic-Indic zero
+  ('\u{feff}0', 0),
+  ('\u{001c}0', 0),
+  ('1', 0),
+];
+
+/// The SH bit depth whose section 6.5 bound is [bound].
+int _depthForBound(int bound) => switch (bound) {
+  16 => 3,
+  8 => 4,
+  4 => 5,
+  0 => 8,
+  _ => throw ArgumentError('no SH bit depth gives a bound of $bound'),
+};
+
 Uint8List _minimal({
   String temporalModel = 'gaussian-birth',
   String profile = '',

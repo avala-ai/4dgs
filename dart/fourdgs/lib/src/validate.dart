@@ -1307,22 +1307,34 @@ void _checkShBitDepths(
   }
 }
 
-/// Compare a finite decimal spelling with a small non-negative integer without
-/// first rounding it to binary64.
+/// The whole of the spelling section 5.3 allows a `bounds` value: an optional
+/// sign, ASCII digits with an optional point, and an optional exponent.
+///
+/// Spelled `[0-9]` rather than `\d`, and anchored with no trim at either end,
+/// because both shorthands drag in a language the format does not have. Dart's
+/// `String.trim` removes U+FEFF, which the format treats as data.
+final RegExp _bound = RegExp(
+  r'^([+-]?)(?:([0-9]+)(?:\.([0-9]*))?|\.([0-9]+))(?:[eE]([+-]?[0-9]+))?$',
+);
+
+/// Whether the section 5.3 bound [value] spells exactly the small non-negative
+/// integer [expected].
+///
+/// Matched against the grammar the specification writes down rather than
+/// against whatever a runtime parses, which is what makes this agree with the
+/// Python, TypeScript and Rust validators on every input instead of on the ones
+/// their runtimes happen to read alike. Digits are compared as digits: no
+/// exponent is too large to read, and nothing passes through binary64.
 bool _decimalEqualsInteger(String value, int expected) {
-  final String trimmed = _trimDecimalWhitespace(value);
-  final String normalized = _normalizeDecimalSpelling(trimmed);
-  final RegExpMatch? match = RegExp(
-    r'^([+-]?)(?:(\d+)(?:\.(\d*))?|\.(\d+))(?:[eE]([+-]?\d+))?$',
-  ).firstMatch(normalized);
+  final RegExpMatch? match = _bound.firstMatch(value);
   if (match == null) return false;
 
   final String integer = match.group(2) ?? '';
   final String fraction = match.group(3) ?? match.group(4) ?? '';
   String digits = integer + fraction;
   final String exponent = match.group(5) ?? '0';
-  if (!_decimalExponentInRange(exponent, fraction.length)) return false;
   final int firstNonzero = digits.indexOf(RegExp('[1-9]'));
+  // A significand of zeroes is the value zero, at whatever exponent it carries.
   if (firstNonzero < 0) return expected == 0;
   if (match.group(1) == '-') return false;
 
@@ -1334,156 +1346,8 @@ bool _decimalEqualsInteger(String value, int expected) {
       _decimalIntegerEquals(exponent, requiredExponent);
 }
 
-String _trimDecimalWhitespace(String value) {
-  // Python Decimal accepts exactly Python's surrounding whitespace set. Dart's
-  // String.trim additionally removes U+FEFF, which Decimal treats as data.
-  bool accepted(int unit) =>
-      (unit >= 0x09 && unit <= 0x0d) ||
-      (unit >= 0x1c && unit <= 0x20) ||
-      unit == 0x85 ||
-      unit == 0xa0 ||
-      unit == 0x1680 ||
-      (unit >= 0x2000 && unit <= 0x200a) ||
-      unit == 0x2028 ||
-      unit == 0x2029 ||
-      unit == 0x202f ||
-      unit == 0x205f ||
-      unit == 0x3000;
-
-  int start = 0;
-  int end = value.length;
-  while (start < end && accepted(value.codeUnitAt(start))) {
-    start++;
-  }
-  while (end > start && accepted(value.codeUnitAt(end - 1))) {
-    end--;
-  }
-  return start == 0 && end == value.length
-      ? value
-      : value.substring(start, end);
-}
-
-String _normalizeDecimalSpelling(String value) {
-  // Python Decimal removes ASCII underscores and accepts every Unicode Nd
-  // digit. Avoid the copy for the usual ASCII spelling; the allocated case
-  // remains bounded by the already-read String Map value.
-  if (!value.contains('_') &&
-      value.codeUnits.every((int unit) => unit < 0x80)) {
-    return value;
-  }
-  final StringBuffer normalized = StringBuffer();
-  for (final int rune in value.runes) {
-    if (rune != 0x5f) normalized.writeCharCode(_decimalAsciiDigit(rune));
-  }
-  return normalized.toString();
-}
-
-int _decimalAsciiDigit(int rune) {
-  // Starts of every ten-code-point Unicode Nd run accepted by Python 3.12.
-  const List<int> zeroes = <int>[
-    0x0030,
-    0x0660,
-    0x06f0,
-    0x07c0,
-    0x0966,
-    0x09e6,
-    0x0a66,
-    0x0ae6,
-    0x0b66,
-    0x0be6,
-    0x0c66,
-    0x0ce6,
-    0x0d66,
-    0x0de6,
-    0x0e50,
-    0x0ed0,
-    0x0f20,
-    0x1040,
-    0x1090,
-    0x17e0,
-    0x1810,
-    0x1946,
-    0x19d0,
-    0x1a80,
-    0x1a90,
-    0x1b50,
-    0x1bb0,
-    0x1c40,
-    0x1c50,
-    0xa620,
-    0xa8d0,
-    0xa900,
-    0xa9d0,
-    0xa9f0,
-    0xaa50,
-    0xabf0,
-    0xff10,
-    0x104a0,
-    0x10d30,
-    0x11066,
-    0x110f0,
-    0x11136,
-    0x111d0,
-    0x112f0,
-    0x11450,
-    0x114d0,
-    0x11650,
-    0x116c0,
-    0x11730,
-    0x118e0,
-    0x11950,
-    0x11c50,
-    0x11d50,
-    0x11da0,
-    0x11f50,
-    0x16a60,
-    0x16ac0,
-    0x16b50,
-    0x1d7ce,
-    0x1d7d8,
-    0x1d7e2,
-    0x1d7ec,
-    0x1d7f6,
-    0x1e140,
-    0x1e2f0,
-    0x1e4f0,
-    0x1e950,
-    0x1fbf0,
-  ];
-  for (final int zero in zeroes) {
-    if (rune < zero) break;
-    final int digit = rune - zero;
-    if (digit < 10) return 0x30 + digit;
-  }
-  return rune;
-}
-
-/// Whether Python's reference `Decimal` parser can represent [value] after
-/// accounting for [fractionalDigits].
-///
-/// Leading zeroes are removed before conversion, and a value wider than the
-/// adjusted reference limits is rejected first. `BigInt.parse` therefore sees
-/// at most about 20 digits rather than an untrusted declaration-sized integer.
-bool _decimalExponentInRange(String value, int fractionalDigits) {
-  final BigInt minimum = BigInt.parse('-1999999999999999997');
-  final BigInt maximum = BigInt.parse('999999999999999999');
-  final BigInt shift = BigInt.from(fractionalDigits);
-  final BigInt minimumLiteral = minimum + shift;
-  final BigInt maximumLiteral = maximum + shift;
-  final bool negative = value.startsWith('-');
-  final String digits = value.replaceFirst(RegExp(r'^[+-]?0*'), '');
-  if (digits.isEmpty) {
-    return BigInt.zero >= minimumLiteral && BigInt.zero <= maximumLiteral;
-  }
-  final int minimumWidth = minimumLiteral.abs().toString().length;
-  final int maximumWidth = maximumLiteral.abs().toString().length;
-  final int widestLimit =
-      minimumWidth > maximumWidth ? minimumWidth : maximumWidth;
-  if (digits.length > widestLimit) return false;
-  final BigInt literal = BigInt.parse('${negative ? '-' : ''}$digits');
-  return literal >= minimumLiteral && literal <= maximumLiteral;
-}
-
+/// Whether the signed digit string [value] is [expected], without building the
+/// number, so an exponent of any length is read exactly.
 bool _decimalIntegerEquals(String value, int expected) {
   final bool negative = value.startsWith('-');
   final String digits = value.replaceFirst(RegExp(r'^[+-]?0*'), '');

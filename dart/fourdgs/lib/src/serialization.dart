@@ -175,12 +175,22 @@ class FourdgsCursor {
   /// a reader that refuses a record says which byte is wrong (AGENTS.md §6),
   /// and pointing four bytes upstream at a length that decoded fine sends
   /// whoever is holding the file to the wrong place in it.
+  ///
+  /// A leading U+FEFF is put back after decoding. `utf8.decode` skips one, which
+  /// is right for reading a text *file*, where a byte-order mark is a preamble;
+  /// every string here is length-prefixed UTF-8 inside a binary record, where
+  /// U+FEFF is a character the writer wrote. Skipping it made this reader return
+  /// a different string from the Python and Rust readers for the same bytes — a
+  /// `bounds` value, a metadata key or an `object_id` silently changed.
   String string() {
     final length = u32();
     final at = pos;
     final raw = take(length);
     try {
-      return utf8.decode(raw);
+      final String decoded = utf8.decode(raw);
+      final bool hadMark =
+          raw.length >= 3 && raw[0] == 0xef && raw[1] == 0xbb && raw[2] == 0xbf;
+      return hadMark ? '\u{feff}$decoded' : decoded;
     } on FormatException catch (error) {
       final offset = error.offset;
       final where = offset == null ? '' : ': byte ${at + offset}';
