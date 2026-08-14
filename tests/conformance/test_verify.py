@@ -454,6 +454,11 @@ def test_exact_number_tokens_and_comparisons_never_narrow_through_binary64():
     assert len(message) <= 8000
 
 
+def test_fixture_witness_compares_float_and_exact_number_in_one_decimal_domain():
+    assert generate._same_canonical_decimal(3.25, canonical.ExactNumber("3.250000"))
+    assert not generate._same_canonical_decimal(3.25, canonical.ExactNumber("3.250001"))
+
+
 def test_adversarial_order_cases_are_encoded_corpus_variants():
     variants = {name: expectation for name, _data, expectation in generate.build_object_corpus()}
     tied = "ObjectTiedGaussians-UseChunkIndex-UseCrc"

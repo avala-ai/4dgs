@@ -28,6 +28,7 @@ import io
 import math
 import os
 import sys
+from decimal import Decimal
 from itertools import zip_longest
 from typing import NamedTuple
 
@@ -933,6 +934,12 @@ OBJECT_VARIANTS = (
 )
 
 
+def _same_canonical_decimal(rounded: float, exact: canonical_module.ExactNumber) -> bool:
+    """Compare rounded and exact JSON numbers without either type's equality rules."""
+
+    return Decimal(str(rounded)) == Decimal(exact.token)
+
+
 def build_object_corpus() -> list[tuple[str, bytes, str]]:
     """Every object-layer variant: `(name, bytes, expectation)`.
 
@@ -1005,7 +1012,13 @@ def build_object_corpus() -> list[tuple[str, bytes, str]]:
                 resident_raw += float(row[0])
             resident = canonical_module.num(resident_raw)
             emitted = summary["states"][1]["aggregate"]["positionSum"][0]
-            if resident == emitted:
+            if not isinstance(emitted, canonical_module.ExactNumber):
+                raise AssertionError(f"{name}: exact-unit position witness is not exact: {emitted!r}")
+            # Compare the rounded resident sum and exact-unit result in one decimal
+            # domain. ExactNumber deliberately does not compare equal to a float, so a
+            # direct comparison here could never detect a fixture that had drifted until
+            # the two strategies produced the same number.
+            if _same_canonical_decimal(resident, emitted):
                 raise AssertionError(f"{name}: resident and content-order sums no longer differ")
         if name == "ObjectOpacityOrder-UseChunkIndex-UseCrc":
             state = scene.gaussians.state_at(0.5 * duration, scene.header.cutoff)
