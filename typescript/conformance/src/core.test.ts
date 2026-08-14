@@ -500,6 +500,9 @@ test("rounding matches Python's round, including the ties a float32 can hit", ()
     [640.0078125, 640.007812],
     [2.5e-6, 3e-6],
     [1.5e-6, 2e-6],
+    // Re-parsing the rounded decimal is significant here: scaling the binary64 and
+    // rounding that product directly picks the adjacent, more-negative unit.
+    [-1816130890.8634775, -1816130890.863477],
   ];
   for (const [input, expected] of cases) {
     assert.equal(roundHalfEven(input, 6), expected, `round(${input}, 6)`);
