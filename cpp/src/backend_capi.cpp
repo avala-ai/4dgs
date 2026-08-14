@@ -8,9 +8,11 @@
 /// message, borrowed pointers become `Span`s with the lifetime the header states, and a C++
 /// `Readable` becomes the callback struct the decoder reads through.
 
+#include <cmath>
 #include <cstring>
 #include <new>
 #include <optional>
+#include <unordered_set>
 
 #include "backend.hpp"
 #include "fourdgs.h"
@@ -686,6 +688,109 @@ Result<void> checkColumns(const GaussianView& gaussians, const std::string& subj
   return Result<void>();
 }
 
+/// Refuse a sequence the C ABI cannot prove is a conforming keyframe-delta timeline.
+///
+/// The ABI deliberately accepts borrowed pointers and a single count, and its sequence writer
+/// does not validate the timeline endpoints. This is the last layer that can compare each id
+/// span's length with its GaussianView and reject duplicate identities without first copying the
+/// caller's data into the core, so all of those checks happen before a writer is allocated.
+Result<void> checkKeyframeDeltaInputs(Span<const KeyframeDeltaSample> samples, double durationSec) {
+  if (std::isnan(durationSec) || durationSec <= 0.0) {
+    return Error(ErrorCode::kInvalidArgument,
+                 "duration_sec must be positive and not NaN; got " + std::to_string(durationSec));
+  }
+  if (samples.empty()) {
+    return Error(ErrorCode::kInvalidArgument,
+                 "a keyframe-delta sequence needs at least one sample");
+  }
+
+  for (std::size_t i = 0; i < samples.size(); ++i) {
+    if (!std::isfinite(samples[i].t0)) {
+      return Error(ErrorCode::kInvalidArgument,
+                   "sample " + std::to_string(i) + " starts at a non-finite instant");
+    }
+  }
+  if (samples[0].t0 != 0.0) {
+    return Error(ErrorCode::kInvalidArgument,
+                 "the first sample starts at " + std::to_string(samples[0].t0) +
+                     ", not 0; a keyframe-delta timeline tiles [0, duration_sec) "
+                     "(spec §11.1)");
+  }
+  for (std::size_t i = 1; i < samples.size(); ++i) {
+    if (!(samples[i].t0 > samples[i - 1].t0)) {
+      return Error(ErrorCode::kInvalidArgument,
+                   "sample " + std::to_string(i) + " starts at " + std::to_string(samples[i].t0) +
+                       ", not after sample " + std::to_string(i - 1) + " at " +
+                       std::to_string(samples[i - 1].t0) +
+                       "; sample instants must be strictly increasing (spec §11.1)");
+    }
+  }
+  if (!(samples[samples.size() - 1].t0 < durationSec)) {
+    return Error(ErrorCode::kInvalidArgument,
+                 "the last sample starts at " + std::to_string(samples[samples.size() - 1].t0) +
+                     ", not before duration_sec " + std::to_string(durationSec) +
+                     "; its interval must have positive width (spec §11.1)");
+  }
+
+  // Retain only the immediately preceding population. When a current id is not live there,
+  // scan the caller-owned earlier samples to tell a genuine birth from reuse after death. This
+  // keeps validation memory bounded by adjacent sample populations rather than by all lifetime
+  // births; the reference encoder accepts the extra work in exchange for the bounded guarantee.
+  std::unordered_set<std::uint32_t> liveIds;
+  for (std::size_t i = 0; i < samples.size(); ++i) {
+    const KeyframeDeltaSample& sample = samples[i];
+    Result<void> columns = checkColumns(sample.gaussians, "sample " + std::to_string(i));
+    if (!columns) return columns.error();
+    if (sample.ids.size() != sample.gaussians.count) {
+      return Error(ErrorCode::kInvalidArgument,
+                   "sample " + std::to_string(i) + " carries " +
+                       std::to_string(sample.gaussians.count) + " gaussians and " +
+                       std::to_string(sample.ids.size()) +
+                       " ids; gaussian_id is one per gaussian (spec §11.2)");
+    }
+    if (!sample.ids.empty() && sample.ids.data() == nullptr) {
+      return Error(ErrorCode::kInvalidArgument,
+                   "sample " + std::to_string(i) +
+                       " has a null gaussian_id span for a non-empty population");
+    }
+
+    std::unordered_set<std::uint32_t> uniqueIds;
+    uniqueIds.reserve(sample.ids.size());
+    for (std::size_t row = 0; row < sample.ids.size(); ++row) {
+      const std::uint32_t id = sample.ids[row];
+      if (!uniqueIds.insert(id).second) {
+        return Error(ErrorCode::kInvalidArgument,
+                     "sample " + std::to_string(i) + " names gaussian id " + std::to_string(id) +
+                         " more than once; ids are unique within a state (spec §11.2)");
+      }
+    }
+    // Index the spans rather than range-iterating: an empty sample is legal and its default
+    // Span has a null pointer, for which computing `nullptr + 0` as `end()` is undefined.
+    for (std::size_t row = 0; row < sample.ids.size(); ++row) {
+      const std::uint32_t id = sample.ids[row];
+      bool appearedEarlier = false;
+      if (liveIds.find(id) == liveIds.end()) {
+        for (std::size_t earlier = 0; earlier < i && !appearedEarlier; ++earlier) {
+          for (std::size_t priorRow = 0; priorRow < samples[earlier].ids.size(); ++priorRow) {
+            if (samples[earlier].ids[priorRow] == id) {
+              appearedEarlier = true;
+              break;
+            }
+          }
+        }
+      }
+      if (appearedEarlier) {
+        return Error(ErrorCode::kInvalidArgument,
+                     "sample " + std::to_string(i) + " reuses gaussian id " + std::to_string(id) +
+                         " after it died; gaussian_id is never reused within a sequence "
+                         "(spec §11.2)");
+      }
+    }
+    liveIds.swap(uniqueIds);
+  }
+  return Result<void>();
+}
+
 Result<std::vector<std::uint8_t>> encodeScene(const GaussianView& gaussians, double durationSec,
                                               const WriteOptions& options) {
   // Before anything is staged: the columns are the caller's memory, and the count is what
@@ -756,6 +861,9 @@ Result<std::vector<std::uint8_t>> encodeScene(const GaussianView& gaussians, dou
 Result<std::vector<std::uint8_t>> encodeKeyframeDeltaSequence(
     Span<const KeyframeDeltaSample> samples, double durationSec,
     const KeyframeDeltaOptions& options) {
+  Result<void> inputs = checkKeyframeDeltaInputs(samples, durationSec);
+  if (!inputs) return inputs.error();
+
   KeyframeDeltaWriterGuard guard;
   if (guard.writer == nullptr) {
     return Error(ErrorCode::kInternal, "the core could not allocate a keyframe-delta writer");
@@ -785,22 +893,10 @@ Result<std::vector<std::uint8_t>> encodeKeyframeDeltaSequence(
   staged = check(fourdgs_kd_writer_set_compression(writer, options.codec, options.level));
   if (!staged) return staged.error();
 
-  // The ids and the columns are aligned element for element — the id stream is what names the
-  // gaussian a delta changes (spec §11.2), so a sample whose lengths disagree would silently
-  // rename gaussians rather than fail. Refused here, where both lengths are still visible: the
-  // ABI takes one count and cannot see the mismatch. The gaussian columns are checked against
-  // that same count for the same reason — the ABI sees a pointer where a length used to be.
+  // Every borrowed span and the complete timeline were validated before the writer was
+  // allocated. The ABI can now copy exactly the rows each sample declares.
   for (std::size_t i = 0; i < samples.size(); ++i) {
     const KeyframeDeltaSample& sample = samples[i];
-    Result<void> columns = checkColumns(sample.gaussians, "sample " + std::to_string(i));
-    if (!columns) return columns.error();
-    if (sample.ids.size() != sample.gaussians.count) {
-      return Error(ErrorCode::kInvalidArgument,
-                   "sample " + std::to_string(i) + " carries " +
-                       std::to_string(sample.gaussians.count) + " gaussians and " +
-                       std::to_string(sample.ids.size()) +
-                       " ids; gaussian_id is one per gaussian (spec §11.2)");
-    }
     const GaussianView& g = sample.gaussians;
     staged = check(fourdgs_kd_writer_add_sample(
         writer, sample.t0, static_cast<std::uint32_t>(g.count), sample.ids.data(),
