@@ -21,6 +21,15 @@
  */
 
 import { crc32 } from "./codec.js";
+import { MAX_FRONT_MATTER_BYTES } from "./indexedDecoder.js";
+import type { ObjectLayer } from "./objects.js";
+import {
+  checkObjectTable,
+  checkObjectTrack,
+  RECORD_HEADER_BYTES,
+  type ObjectTable,
+  type ObjectTrack,
+} from "./records.js";
 import { SH_MAX_BITS, SH_MIN_BITS, bandCoefficientRange, shBound, shStep } from "./sh.js";
 
 /** The gaussians to encode, structure-of-arrays — the shape a decoder hands back. */
@@ -39,6 +48,8 @@ export interface GaussianInput {
   readonly sh?: Uint8Array | null;
   readonly shDegree?: number;
   readonly shCoefficients?: number;
+  /** Exact per-gaussian object membership, or null when the scene has no object layer. */
+  readonly objectId?: Uint32Array | readonly number[] | null;
 }
 
 /** How a scene is written. The defaults are the reference encoder's own. */
@@ -56,6 +67,8 @@ export interface WriteOptions {
   profile?: string;
   library?: string;
   attributes?: Record<string, string>;
+  /** The Object Table and optional SE(3) tracks to write. */
+  objects?: ObjectLayer | null;
 }
 
 // Opcodes and attribute ids (spec §4.2, §6.1).
@@ -68,6 +81,8 @@ const OP_SH_BAND_STREAM = 0x07;
 const OP_CHUNK_INDEX = 0x08;
 const OP_STATISTICS = 0x0c;
 const OP_SUMMARY_OFFSET = 0x0f;
+const OP_OBJECT_TABLE = 0x24;
+const OP_OBJECT_TRACK = 0x25;
 
 const A_POSITION = 0;
 const A_SCALE = 1;
@@ -80,6 +95,7 @@ const A_MU_T = 7;
 const A_SIGMA_T = 8;
 const A_FLAGS = 9;
 const A_WINDOW_INDEX = 10;
+const A_OBJECT_ID = 14;
 
 const CODEC_DEFLATE = 0;
 const MODE_RAW = 0;
@@ -283,6 +299,12 @@ export class ByteWriter {
     this.ensure(8);
     this.view.setFloat64(this.len, v, true);
     this.len += 8;
+  }
+
+  f32(v: number): void {
+    this.ensure(4);
+    this.view.setFloat32(this.len, v, true);
+    this.len += 4;
   }
 
   bytes(b: Uint8Array): void {
@@ -668,6 +690,104 @@ function gather(values: number[], members: number[], channels: number): number[]
   return out;
 }
 
+function checkedObjectIds(g: GaussianInput): ArrayLike<number> | null {
+  const ids = g.objectId ?? null;
+  if (ids === null) return null;
+  if (ids.length !== g.count) {
+    throw new Error(`object_id has ${ids.length} values, expected ${g.count}`);
+  }
+  for (let i = 0; i < ids.length; i++) {
+    const value = ids[i]!;
+    if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) {
+      throw new Error(`object_id[${i}] is ${value}; expected an exact integer in [0, 4294967295]`);
+    }
+  }
+  return ids;
+}
+
+function utf8ByteLength(value: string): number {
+  let bytes = 0;
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code <= 0x7f) {
+      bytes += 1;
+    } else if (code <= 0x7ff) {
+      bytes += 2;
+    } else if (code >= 0xd800 && code <= 0xdbff) {
+      const low = value.charCodeAt(i + 1);
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        bytes += 4;
+        i++;
+      } else {
+        bytes += 3; // TextEncoder replaces a lone surrogate with U+FFFD.
+      }
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
+}
+
+function checkObjectTableRecordSize(table: ObjectTable): void {
+  let framedBytes = RECORD_HEADER_BYTES + 4 + 2;
+  const add = (bytes: number, objectId: number): void => {
+    if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > MAX_FRONT_MATTER_BYTES - framedBytes) {
+      throw new Error(
+        `ObjectTable record exceeds the ${MAX_FRONT_MATTER_BYTES} byte indexed ` +
+          `front-matter ceiling while encoding object ${objectId}`,
+      );
+    }
+    framedBytes += bytes;
+  };
+
+  for (const entry of table.entries) {
+    add(4 + 4 + utf8ByteLength(entry.label), entry.objectId); // object_id and label
+    add(entry.anchor.length * 4 + 1, entry.objectId); // anchor and dynamics flag
+    if (entry.dynamics !== null) {
+      for (const vector of entry.dynamics) add(vector.length * 4, entry.objectId);
+    }
+    if (table.embeddingDim > 0) {
+      add(1, entry.objectId); // has_embedding
+      if (entry.embedding !== null) add(entry.embedding.length * 4, entry.objectId);
+    }
+  }
+}
+
+function encodeObjectTable(table: ObjectTable): Uint8Array {
+  checkObjectTable(table);
+  const body = new ByteWriter();
+  body.u32(table.entries.length);
+  body.u16(table.embeddingDim);
+  for (const entry of table.entries) {
+    body.u32(entry.objectId);
+    body.string(entry.label);
+    for (const value of entry.anchor) body.f32(value);
+    body.u8(entry.dynamics === null ? 0 : 1);
+    if (entry.dynamics !== null) {
+      for (const vector of entry.dynamics) for (const value of vector) body.f32(value);
+    }
+    if (table.embeddingDim > 0) {
+      body.u8(entry.embedding === null ? 0 : 1);
+      if (entry.embedding !== null) for (const value of entry.embedding) body.f32(value);
+    }
+  }
+  return record(OP_OBJECT_TABLE, body.finish());
+}
+
+function encodeObjectTrack(track: ObjectTrack): Uint8Array {
+  checkObjectTrack(track);
+  const body = new ByteWriter();
+  body.u32(track.objectId);
+  body.u8(track.interpolation);
+  body.u32(track.times.length);
+  for (let i = 0; i < track.times.length; i++) {
+    body.f64(track.times[i]!);
+    for (const value of track.rotations[i]!) body.f64(value);
+    for (const value of track.translations[i]!) body.f64(value);
+  }
+  return record(OP_OBJECT_TRACK, body.finish());
+}
+
 /**
  * Encode a set of gaussians into a `.4dgs` byte buffer.
  *
@@ -691,8 +811,32 @@ export async function encodeScene(
   const profile = options.profile ?? "";
   const library = options.library ?? "4dgs-typescript encoder";
   const attributes = options.attributes ?? {};
+  const objects = options.objects ?? null;
 
   const n = gaussians.count;
+  const objectIds = checkedObjectIds(gaussians);
+  if (profile === "objects") {
+    if (n > 0 && objectIds === null) {
+      throw new Error(
+        "the objects profile requires an object_id stream in every non-empty chunk, " +
+          "but the GaussianInput carries none",
+      );
+    }
+    if (objects?.table == null) {
+      throw new Error("the objects profile requires one ObjectTable record, but none was supplied");
+    }
+  }
+  if (objects !== null) {
+    objects.check();
+    if (objects.table !== null) {
+      // The indexed object path applies this ceiling before allocating a record
+      // from its declared range. Enforce the same bound from lengths alone before
+      // validation walks an embedding or the writer materializes its bytes.
+      checkObjectTableRecordSize(objects.table);
+      checkObjectTable(objects.table);
+    }
+    for (const track of objects.tracks) checkObjectTrack(track);
+  }
   const q = quantizeScene(gaussians, cutoff);
 
   // Window boundaries are the top level of the partition.
@@ -789,6 +933,15 @@ export async function encodeScene(
   }
   out.bytes(record(OP_WINDOW_TABLE, wt.finish()));
 
+  // Advisory object front matter. Membership is still an attribute stream in each Chunk;
+  // the table only names those ids, and the tracks transport their reconstructed state.
+  if (objects?.table !== null && objects?.table !== undefined) {
+    out.bytes(encodeObjectTable(objects.table));
+  }
+  if (objects !== null) {
+    for (const track of objects.tracks) out.bytes(encodeObjectTrack(track));
+  }
+
   // Chunks, each followed by its SH band records.
   interface IndexEntry {
     t0: number;
@@ -819,6 +972,18 @@ export async function encodeScene(
     ];
     for (const [id, values, channels] of columns) {
       streams.bytes(await encodeStream(id, values, channels));
+    }
+    if (objectIds !== null) {
+      // Attribute symbols are signed i32. Reinterpret each u32 label as its two's-
+      // complement code so every bit pattern survives exactly; the decoder reverses
+      // the view without quantization.
+      streams.bytes(
+        await encodeStream(
+          A_OBJECT_ID,
+          members.map((i) => objectIds[i]! | 0),
+          1,
+        ),
+      );
     }
 
     const chunkOffset = out.length; // absolute byte offset of the record

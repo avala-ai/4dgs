@@ -1808,10 +1808,10 @@ def scan_streamed(
 
 #: The most distinct gaussian ids an identity audit holds before it refuses to hold more.
 #:
-#: Both questions the audit answers — how many distinct ids a sequence carries, and
-#: whether one was reused after its gaussian died — need the identities themselves, and
-#: neither can be answered exactly in less space than the answer takes (see
-#: `BoundedIdentityAudit`). So there is a number here, and §1 says it is this module's
+#: Both questions the one-pass audit answers — how many distinct ids a sequence carries,
+#: and whether one was reused after its gaussian died — need the identities themselves,
+#: and neither can be answered exactly in one pass with less space than the answer takes
+#: (see `BoundedIdentityAudit`). So there is a number here, and §1 says it is this module's
 #: number: never the Header's `gaussian_count`, which is the untrusted claim the audit
 #: exists to check. One `uint32` per id makes this 32 MiB of identities, and 64 MiB for
 #: the moment a rebuild is copying them. A realistic large capture sits well inside it —
@@ -1822,16 +1822,11 @@ def scan_streamed(
 #: audit in a process and a test can lower it without writing an eight-million-gaussian
 #: file.
 #:
-#: This ceiling is Python's alone, which `records.py` names for what it is: a limit only
-#: one implementation has is a conformance split. It is a pre-existing one rather than a
-#: new one — Rust spills identities to 256 on-disk buckets and has no ceiling,
-#: TypeScript retains a lifetime record per id and has no ceiling, and Dart bounds the
-#: same audit by the file's declared `gaussianCount` and refuses past it — so one very
-#: large file already draws different answers from different SDKs. What this module can
-#: do about that alone is keep the ceiling from changing the *verdict* on anything below
-#: it: reuse is refused where it happens, and passing the ceiling only ends the audit and
-#: says so. Making the four agree is a cross-SDK change, which §9 puts in its own pull
-#: requests.
+#: This one-pass ceiling is Python's alone. Rust spills identities to on-disk buckets,
+#: TypeScript retains a lifetime record per id, and Dart uses a bounded probabilistic
+#: probe. Validation keeps the ceiling from changing the verdict by falling back to exact
+#: fixed-capacity partitions; the standalone one-pass counter names the limit honestly
+#: with `ExceedsReaderLimit`.
 MAX_DISTINCT_IDS = 8_388_608
 
 #: How many introductions may sit in the audit's `set` tier before they are folded into
@@ -1951,21 +1946,24 @@ class _IntroducedIdentities:
 class BoundedIdentityAudit:
     """Distinct gaussian ids, and the refusal of reuse, over one pass of a timeline.
 
-    Two facts set the shape of this. Every id in a conforming file is introduced exactly
-    once — by the keyframe that opens the sequence or by the birth that adds it — so the
-    introductions are the whole audit: how many there are is the distinct count, and a
-    second introduction of one is the reuse §11.2 forbids. And neither answer can be had
-    in less space than the answer itself: an exact distinct count needs the distinct
-    values, a sketch that answers in constant space answers approximately, and the reuse
-    question is strictly harder still because a false positive there condemns a good file.
+    Two facts set the shape of this one-pass audit. Every id in a conforming file is
+    introduced exactly once — by the keyframe that opens the sequence or by the birth
+    that adds it — so the introductions are the whole audit: how many there are is the
+    distinct count, and a second introduction of one is the reuse §11.2 forbids. And
+    neither answer can be had in one pass with less space than the answer itself: an exact
+    distinct count needs the distinct values, a sketch that answers in constant space
+    answers approximately, and the reuse question is strictly harder still because a
+    false positive there condemns a good file. `count_distinct_ids_partitioned` trades
+    more passes for fixed memory when validation crosses this audit's ceiling.
 
     Bounding memory by the *live* population instead is therefore not available. What
     lives now says nothing about what died, and a reused id is precisely one that is not
-    live and was. The only ways to shrink the retained state below the number of distinct
-    ids are to answer approximately (Dart uses a Bloom filter over the same audit and
-    accepts candidates it must go back and confirm) or to size it from the Header's
-    `gaussian_count`, which is the claim being checked and which §1 forbids allocating
-    from. So the state is proportional to the distinct ids and the ceiling stays.
+    live and was. Without decoding again, the only ways to shrink the retained state below
+    the number of distinct ids are to answer approximately (Dart uses a Bloom filter over
+    the same audit and accepts candidates it must go back and confirm) or to size it from
+    the Header's `gaussian_count`, which is the claim being checked and which §1 forbids
+    allocating from. So the one-pass state is proportional to the distinct ids and the
+    ceiling stays.
 
     Reuse is found **at the state that commits it**, while the pass is there, which is
     what lets the caller's own position tracking name the right record (AGENTS.md §6) and
@@ -1976,8 +1974,9 @@ class BoundedIdentityAudit:
     unreachable behind a limit reached after it.
 
     One audit is consumed one state at a time by whoever already has a scan running, so a
-    validator that walks the file for its other checks pays no second decode for this one.
-    `count_distinct_ids_bounded` is the same audit for a caller that has only bytes.
+    validator that walks the file for its other checks normally pays no second decode for
+    this one. `count_distinct_ids_bounded` is the same audit for a caller that has only
+    bytes; validation alone invokes the partitioned fallback after the ceiling.
     """
 
     def __init__(self, max_distinct_ids: int | None = None) -> None:
@@ -2044,6 +2043,85 @@ class BoundedIdentityAudit:
             self._introduced.add(born)
         # Nothing but the identities, narrowed to u32, crosses to the next iteration.
         self._previous_live = settled
+
+
+class _IdentityPartitionFull(Exception):
+    """Internal signal to split an exact, fixed-capacity identity pass."""
+
+
+def count_distinct_ids_partitioned(
+    data: bytes,
+    *,
+    max_ids_per_partition: int | None = None,
+    on_record: Callable[[int, int], None] | None = None,
+    index: list[rec.ChunkIndexEntry] | None = None,
+    windows: list[tuple[float, float]] | None = None,
+    on_entry: Callable[[int, rec.ChunkIndexEntry], None] | None = None,
+    on_band: Callable[[int, int], None] | None = None,
+    on_state: Callable[[], None] | None = None,
+) -> int:
+    """Count and audit every identity exactly with a bounded, partitioned rescan.
+
+    This is the slow-path complement to :class:`BoundedIdentityAudit`. The normal audit
+    decodes once and stores one ``uint32`` per distinct id up to its declared ceiling.
+    If validation crosses that ceiling it still needs an exact verdict, so this function
+    revisits one prefix of the u32 identity space at a time. A prefix that fills the same
+    bounded audit splits on its next bit; its two children are then scanned separately.
+
+    The number of decodes grows with the number and distribution of identities, which is
+    why this is not the normal path. Memory does not: every pass holds at most
+    ``max_ids_per_partition`` introduced ids plus the composed states the decoder already
+    needs. Reuse is checked within the one partition that owns the id, and the sum of the
+    leaf counts is the exact distinct count.
+    """
+    capacity = MAX_DISTINCT_IDS if max_ids_per_partition is None else max_ids_per_partition
+    if capacity < 1:
+        raise ValueError("the identity partition capacity must be positive")
+    if index is not None and windows is None:
+        raise ValueError("indexed identity auditing requires the Window Table")
+
+    def audit(prefix: int, bits: int) -> int:
+        bounded = BoundedIdentityAudit(capacity)
+        shift = 32 - bits
+        lower = prefix << shift
+        upper = (prefix + 1) << shift
+
+        if index is None:
+            states = ((offset, state) for offset, _kind, state in scan_streamed(data, on_record=on_record))
+        else:
+            assert windows is not None
+            states = (
+                (entry.chunk_offset, state) for entry, state in scan_indexed(data, index, windows, on_entry, on_band)
+            )
+
+        for offset, state in states:
+            if on_state is not None:
+                on_state()
+            ids = np.asarray(state.ids, dtype=np.int64).reshape(-1)
+            del state
+            if ids.size and (int(ids.min()) < 0 or int(ids.max()) > 0xFFFF_FFFF):
+                outside = (ids < 0) | (ids > 0xFFFF_FFFF)
+                raise MalformedFile(
+                    f"state chunk at {offset} carries gaussian_id {int(ids[outside][0])}; ids are u32 values",
+                    code="gaussian-id-out-of-range",
+                )
+            if bits:
+                ids = ids[(ids >= lower) & (ids < upper)]
+            try:
+                bounded.observe(offset, State(ids=ids, bins={}))
+            except ExceedsReaderLimit:
+                raise _IdentityPartitionFull from None
+        return bounded.distinct
+
+    def split(prefix: int, bits: int) -> int:
+        try:
+            return audit(prefix, bits)
+        except _IdentityPartitionFull:
+            if bits == 32:
+                raise AssertionError("one u32 identity exceeded a positive partition capacity") from None
+            return split(prefix << 1, bits + 1) + split((prefix << 1) | 1, bits + 1)
+
+    return split(0, 0)
 
 
 def count_distinct_ids_bounded(

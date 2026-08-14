@@ -629,8 +629,8 @@ def _assemble(chunks: list[dict], windows, header, chunk_bands=None) -> Gaussian
             motions=z3,
             mu_t=np.zeros(0, dtype=np.float32),
             sigma_t=np.zeros(0, dtype=np.float32),
-            win_lo=np.zeros(0, dtype=np.float32),
-            win_hi=np.zeros(0, dtype=np.float32),
+            win_lo=np.zeros(0, dtype=np.float64),
+            win_hi=np.zeros(0, dtype=np.float64),
             sh_degree=header.sh_degree,
         )
     table = window_table_or_default(windows)
@@ -657,8 +657,10 @@ def _assemble(chunks: list[dict], windows, header, chunk_bands=None) -> Gaussian
         motions=np.concatenate([c["motions"] for c in chunks]).astype(np.float32),
         mu_t=np.concatenate([c["mu_t"] for c in chunks]).astype(np.float32),
         sigma_t=np.concatenate([c["sigma_t"] for c in chunks]).astype(np.float32),
-        win_lo=table[idx, 0].astype(np.float32),
-        win_hi=table[idx, 1].astype(np.float32),
+        # Window Table endpoints are f64 on the wire. Retain that precision: narrowing
+        # a large finite endpoint to f32 infinity changes `[lo, hi)` membership.
+        win_lo=np.asarray(table[idx, 0], dtype=np.float64),
+        win_hi=np.asarray(table[idx, 1], dtype=np.float64),
         sh=sh,
         sh_degree=header.sh_degree,
         source_index=np.concatenate(src) if all(s is not None for s in src) else None,

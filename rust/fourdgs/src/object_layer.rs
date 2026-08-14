@@ -251,7 +251,21 @@ pub fn state_at_with_objects(
 // clamp-and-slerp behind each pose — happens once, in one language.
 
 use crate::model::GaussianSet;
-use crate::provenance::{int, num, Json};
+use crate::provenance::{exact_sum_token, int, num, Json};
+
+/// Sum the six-decimal values the canonical form emits without converting the total
+/// back through binary floating point. `None` means at least one addend was non-finite.
+///
+/// Public because the Rust conformance runner summarizes root gaussian fields while the
+/// core summarizes composed object states; both must use one exact implementation.
+#[doc(hidden)]
+pub fn exact_canonical_sum(values: impl IntoIterator<Item = f64>) -> Option<String> {
+    exact_sum_token(values)
+}
+
+fn exact_sum(values: impl IntoIterator<Item = f64>) -> Json {
+    exact_canonical_sum(values).map_or(Json::Null, Json::ExactNum)
+}
 use crate::records::Header;
 use crate::serialization::crc32;
 
@@ -264,12 +278,6 @@ const CANONICAL_DECIMALS: usize = 6;
 /// A comparison key: rounded like the summary, with infinity kept as infinity so every
 /// language orders never-fading gaussians identically.
 ///
-/// Rendered and parsed back rather than scaled and rounded, because the two disagree on
-/// exact halves and a sort key may not. `f64::round` goes half away from zero, so the f32
-/// `0.5078125` — a dyadic value that lands exactly on the boundary — becomes `0.507813`
-/// here while `canonical.py`, C++ and Swift all render `0.507812`. Two gaussians straddling
-/// such a value would then sort one way in the core and the other way in the reference, and
-/// the sampled `states` they produce would disagree even though both decoded correctly.
 fn sortable(value: f32) -> f64 {
     let v = value as f64;
     if v.is_nan() {
@@ -289,16 +297,16 @@ fn sortable(value: f32) -> f64 {
     (v * scale).round_ties_even() / scale
 }
 
-/// Content order: derived from decoded values alone, never from decode order.
+/// Content order: derived from portable rounded values, never exact decoder residue.
 ///
 /// Gaussians may be reordered freely by an encoder and readers must not rely on their
 /// order, so a summary that did would ask two correct decoders to disagree. Membership
-/// joins the key after the harmonics, followed by the exact decoded floats as a final
-/// tie-breaker. Rows that did not tie keep their established order, while two rows that
-/// also tie exactly are interchangeable in every value the summary composes or emits.
+/// joins the key after the harmonics. Exact decoded floats are deliberately not a
+/// tie-breaker: independent decoders may differ in their last bits, while every field the
+/// root summary emits has already been rounded by this key.
 pub fn stable_order(gaussians: &GaussianSet) -> Vec<usize> {
     let mut order: Vec<usize> = (0..gaussians.count()).collect();
-    order.sort_by(|&a, &b| compare_rows(gaussians, a, b));
+    order.sort_by(|&a, &b| compare_content_rows(gaussians, a, b));
     order
 }
 
@@ -310,7 +318,7 @@ pub fn stable_order(gaussians: &GaussianSet) -> Vec<usize> {
 /// on a call whose entire job is to summarize it. Comparing on demand allocates the index
 /// vector and nothing else. It costs repeated rounding, which is why `sortable` is
 /// arithmetic rather than formatting.
-fn compare_rows(gaussians: &GaussianSet, a: usize, b: usize) -> Ordering {
+pub fn compare_content_rows(gaussians: &GaussianSet, a: usize, b: usize) -> Ordering {
     fn cmp(x: f64, y: f64) -> Ordering {
         x.partial_cmp(&y)
             .expect("no key value is NaN; see `sortable`")
@@ -361,60 +369,45 @@ fn compare_rows(gaussians: &GaussianSet, a: usize, b: usize) -> Ordering {
         }
     }
 
-    // A rounded tie is not necessarily an emitted-state tie: sub-micro motion can compose
-    // into visibly different centres at a later probe. Compare the same decoded floats at
-    // full f32 precision only after the existing rounded/SH/membership key has tied.
-    for (arr, width) in [
-        (&gaussians.positions, 3usize),
-        (&gaussians.scales, 3),
-        (&gaussians.rotations, 4),
-        (&gaussians.colors, 4),
-        (&gaussians.motions, 3),
-    ] {
-        for k in 0..width {
-            let ord = exact_cmp(arr[a * width + k], arr[b * width + k]);
+    Ordering::Equal
+}
+
+/// The finite scalar a state sample emits, parsed back for portable ordering.
+///
+/// State composition is binary64, so multiplying by the decimal scale can round before
+/// the ties-to-even step. Rendering is the canonical rule and keeps the comparison equal
+/// to the value actually serialized. The temporary string is bounded by one binary64
+/// scalar and is discarded after each comparison.
+#[doc(hidden)]
+pub fn canonical_state_scalar_key(value: f64) -> Option<f64> {
+    if !value.is_finite() {
+        return None;
+    }
+    Some(
+        format!("{value:.CANONICAL_DECIMALS$}")
+            .parse()
+            .expect("a finite fixed decimal parses as f64"),
+    )
+}
+
+fn compare_state_rows(state: &CanonicalState, a: usize, b: usize) -> Ordering {
+    for (values, width) in [(&state.centers, 3usize), (&state.orientations, 4)] {
+        for axis in 0..width {
+            let ord = match (
+                canonical_state_scalar_key(values[a * width + axis]),
+                canonical_state_scalar_key(values[b * width + axis]),
+            ) {
+                (Some(x), Some(y)) => x.partial_cmp(&y).expect("finite state keys are ordered"),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            };
             if ord != Ordering::Equal {
                 return ord;
             }
         }
     }
-    for arr in [
-        &gaussians.mu_t,
-        &gaussians.sigma_t,
-        &gaussians.win_lo,
-        &gaussians.win_hi,
-    ] {
-        let ord = exact_cmp(arr[a], arr[b]);
-        if ord != Ordering::Equal {
-            return ord;
-        }
-    }
-    Ordering::Equal
-}
-
-/// Total ordering for exact decoded floats after the rounded key ties.
-///
-/// Signed zeros are equivalent because the canonical form never exposes their sign. All
-/// NaNs are likewise equivalent because they emit `null`, but they sort after +infinity so
-/// their unordered comparison cannot fall through to stable decoded order.
-fn exact_cmp(a: f32, b: f32) -> Ordering {
-    fn class(value: f32) -> u8 {
-        if value.is_nan() {
-            3
-        } else if value == f32::NEG_INFINITY {
-            0
-        } else if value == f32::INFINITY {
-            2
-        } else {
-            1
-        }
-    }
-    let ord = class(a).cmp(&class(b));
-    if ord != Ordering::Equal || class(a) != 1 {
-        return ord;
-    }
-    a.partial_cmp(&b)
-        .expect("finite exact canonical keys are ordered")
+    state.object_ids[a].cmp(&state.object_ids[b])
 }
 
 /// Times a summary evaluates an object track at, derived from the track itself.
@@ -665,7 +658,6 @@ pub fn canonical_parts(
         }
     };
 
-    let order = stable_order(gaussians);
     let duration = header.duration_sec.max(0.0);
     let mut states = Vec::with_capacity(3);
     for t in [0.0, 0.5 * duration, (duration - 1e-6).max(0.0)] {
@@ -675,21 +667,21 @@ pub fn canonical_parts(
         for (row, index) in state.indices.iter().enumerate() {
             row_for_index[*index] = Some(row);
         }
-        let mut sample_rows = Vec::with_capacity(SAMPLE.min(state.indices.len()));
-        let mut position_sum = [0.0f64; 3];
-        let mut opacity_sum = 0.0f64;
-        for index in &order {
-            let Some(row) = row_for_index[*index] else {
-                continue;
-            };
-            if sample_rows.len() < SAMPLE {
-                sample_rows.push(row);
-            }
-            for (axis, sum) in position_sum.iter_mut().enumerate() {
-                *sum += state.centers[row * 3 + axis];
-            }
-            opacity_sum += state.opacity[row];
-        }
+        let mut live_indices = state.indices.clone();
+        live_indices.sort_by(|&a, &b| {
+            compare_content_rows(gaussians, a, b).then_with(|| {
+                compare_state_rows(
+                    &state,
+                    row_for_index[a].expect("a live index has a row"),
+                    row_for_index[b].expect("a live index has a row"),
+                )
+            })
+        });
+        let live_rows: Vec<usize> = live_indices
+            .iter()
+            .map(|index| row_for_index[*index].expect("a live index has a row"))
+            .collect();
+        let sample_rows: Vec<usize> = live_rows.iter().copied().take(SAMPLE).collect();
         let rows = |values: &[f64], width: usize| {
             Json::Arr(
                 sample_rows
@@ -728,9 +720,20 @@ pub fn canonical_parts(
                 Json::obj(vec![
                     (
                         "positionSum",
-                        Json::Arr(position_sum.iter().map(|value| num(*value)).collect()),
+                        Json::Arr(
+                            (0..3)
+                                .map(|axis| {
+                                    exact_sum(
+                                        live_rows.iter().map(|row| state.centers[row * 3 + axis]),
+                                    )
+                                })
+                                .collect(),
+                        ),
                     ),
-                    ("opacitySum", num(opacity_sum)),
+                    (
+                        "opacitySum",
+                        exact_sum(live_rows.iter().map(|row| state.opacity[*row])),
+                    ),
                 ]),
             ),
         ]));
@@ -749,7 +752,20 @@ pub fn canonical_parts(
 
 #[cfg(test)]
 mod tests {
-    use super::sortable;
+    use super::{canonical_state_scalar_key, sortable};
+
+    #[test]
+    fn binary64_state_keys_follow_the_emitted_decimal() {
+        let value = -1_816_130_890.863_477_5;
+        assert_eq!(
+            canonical_state_scalar_key(value),
+            Some(-1_816_130_890.863_477)
+        );
+        assert_ne!(
+            canonical_state_scalar_key(value),
+            Some((value * 1_000_000.0).round_ties_even() / 1_000_000.0)
+        );
+    }
 
     /// The canonical rounding rule is render-then-parse, and exact halves are where the
     /// alternatives part company.

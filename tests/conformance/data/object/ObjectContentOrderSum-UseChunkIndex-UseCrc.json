@@ -1,0 +1,597 @@
+{
+  "aggregate": {
+    "neverFadesCount": "0",
+    "opacitySum": 2.705883,
+    "positionSum": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "zeroMotionCount": "3"
+  },
+  "attachments": [],
+  "audioSources": [],
+  "camera": null,
+  "chunkIntervals": [
+    [
+      0.0,
+      4.0
+    ]
+  ],
+  "cutoff": 0.05,
+  "durationSec": 4.0,
+  "gaussianCount": "3",
+  "hasAudio": false,
+  "headerAttributes": {},
+  "library": "4dgs conformance generator",
+  "metadataRecords": [],
+  "objects": {
+    "embeddingDim": 0,
+    "table": [
+      {
+        "anchor": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "dynamics": null,
+        "embeddingCrc": null,
+        "hasEmbedding": false,
+        "label": "positive",
+        "objectId": "1"
+      },
+      {
+        "anchor": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "dynamics": null,
+        "embeddingCrc": null,
+        "hasEmbedding": false,
+        "label": "negative",
+        "objectId": "2"
+      },
+      {
+        "anchor": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "dynamics": null,
+        "embeddingCrc": null,
+        "hasEmbedding": false,
+        "label": "small",
+        "objectId": "3"
+      }
+    ],
+    "tracks": [
+      {
+        "interpolation": 0,
+        "objectId": "1",
+        "posesAt": [
+          {
+            "rotation": [
+              0.0,
+              0.0,
+              0.0,
+              1.0
+            ],
+            "time": -0.5,
+            "translation": [
+              1e+20,
+              0.0,
+              0.0
+            ]
+          },
+          {
+            "rotation": [
+              0.0,
+              0.0,
+              0.0,
+              1.0
+            ],
+            "time": 0.0,
+            "translation": [
+              1e+20,
+              0.0,
+              0.0
+            ]
+          },
+          {
+            "rotation": [
+              0.0,
+              0.0,
+              0.0,
+              1.0
+            ],
+            "time": 2.0,
+            "translation": [
+              1e+20,
+              0.0,
+              0.0
+            ]
+          },
+          {
+            "rotation": [
+              0.0,
+              0.0,
+              0.0,
+              1.0
+            ],
+            "time": 4.0,
+            "translation": [
+              1e+20,
+              0.0,
+              0.0
+            ]
+          },
+          {
+            "rotation": [
+              0.0,
+              0.0,
+              0.0,
+              1.0
+            ],
+            "time": 4.5,
+            "translation": [
+              1e+20,
+              0.0,
+              0.0
+            ]
+          }
+        ],
+        "sampleCount": "2"
+      },
+      {
+        "interpolation": 0,
+        "objectId": "2",
+        "posesAt": [
+          {
+            "rotation": [
+              0.0,
+              0.0,
+              0.0,
+              1.0
+            ],
+            "time": -0.5,
+            "translation": [
+              -1e+20,
+              0.0,
+              0.0
+            ]
+          },
+          {
+            "rotation": [
+              0.0,
+              0.0,
+              0.0,
+              1.0
+            ],
+            "time": 0.0,
+            "translation": [
+              -1e+20,
+              0.0,
+              0.0
+            ]
+          },
+          {
+            "rotation": [
+              0.0,
+              0.0,
+              0.0,
+              1.0
+            ],
+            "time": 2.0,
+            "translation": [
+              -1e+20,
+              0.0,
+              0.0
+            ]
+          },
+          {
+            "rotation": [
+              0.0,
+              0.0,
+              0.0,
+              1.0
+            ],
+            "time": 4.0,
+            "translation": [
+              -1e+20,
+              0.0,
+              0.0
+            ]
+          },
+          {
+            "rotation": [
+              0.0,
+              0.0,
+              0.0,
+              1.0
+            ],
+            "time": 4.5,
+            "translation": [
+              -1e+20,
+              0.0,
+              0.0
+            ]
+          }
+        ],
+        "sampleCount": "2"
+      },
+      {
+        "interpolation": 0,
+        "objectId": "3",
+        "posesAt": [
+          {
+            "rotation": [
+              0.0,
+              0.0,
+              0.0,
+              1.0
+            ],
+            "time": -0.5,
+            "translation": [
+              3.25,
+              0.0,
+              0.0
+            ]
+          },
+          {
+            "rotation": [
+              0.0,
+              0.0,
+              0.0,
+              1.0
+            ],
+            "time": 0.0,
+            "translation": [
+              3.25,
+              0.0,
+              0.0
+            ]
+          },
+          {
+            "rotation": [
+              0.0,
+              0.0,
+              0.0,
+              1.0
+            ],
+            "time": 2.0,
+            "translation": [
+              3.25,
+              0.0,
+              0.0
+            ]
+          },
+          {
+            "rotation": [
+              0.0,
+              0.0,
+              0.0,
+              1.0
+            ],
+            "time": 4.0,
+            "translation": [
+              3.25,
+              0.0,
+              0.0
+            ]
+          },
+          {
+            "rotation": [
+              0.0,
+              0.0,
+              0.0,
+              1.0
+            ],
+            "time": 4.5,
+            "translation": [
+              3.25,
+              0.0,
+              0.0
+            ]
+          }
+        ],
+        "sampleCount": "2"
+      }
+    ]
+  },
+  "profile": "objects",
+  "sample": {
+    "colors": [
+      [
+        0.603922,
+        0.4,
+        0.203922,
+        0.901961
+      ],
+      [
+        0.603922,
+        0.4,
+        0.203922,
+        0.901961
+      ],
+      [
+        0.603922,
+        0.4,
+        0.203922,
+        0.901961
+      ]
+    ],
+    "motions": [
+      [
+        0.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        0.0
+      ]
+    ],
+    "muT": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "objectIds": [
+      "1",
+      "2",
+      "3"
+    ],
+    "positions": [
+      [
+        0.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        0.0
+      ]
+    ],
+    "rotations": [
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "scales": [
+      [
+        0.049292,
+        0.049292,
+        0.049292
+      ],
+      [
+        0.049292,
+        0.049292,
+        0.049292
+      ],
+      [
+        0.049292,
+        0.049292,
+        0.049292
+      ]
+    ],
+    "sigmaT": [
+      98.90992,
+      98.90992,
+      98.90992
+    ],
+    "winHi": [
+      4.0,
+      4.0,
+      4.0
+    ],
+    "winLo": [
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "sh": null,
+  "shDegree": 0,
+  "states": [
+    {
+      "aggregate": {
+        "opacitySum": 2.705883,
+        "positionSum": [
+          3.25,
+          0.0,
+          0.0
+        ]
+      },
+      "liveCount": "3",
+      "sample": {
+        "objectIds": [
+          "1",
+          "2",
+          "3"
+        ],
+        "orientations": [
+          [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ]
+        ],
+        "positions": [
+          [
+            1e+20,
+            0.0,
+            0.0
+          ],
+          [
+            -1e+20,
+            0.0,
+            0.0
+          ],
+          [
+            3.25,
+            0.0,
+            0.0
+          ]
+        ]
+      },
+      "t": 0.0
+    },
+    {
+      "aggregate": {
+        "opacitySum": 2.705328,
+        "positionSum": [
+          3.25,
+          0.0,
+          0.0
+        ]
+      },
+      "liveCount": "3",
+      "sample": {
+        "objectIds": [
+          "1",
+          "2",
+          "3"
+        ],
+        "orientations": [
+          [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ]
+        ],
+        "positions": [
+          [
+            1e+20,
+            0.0,
+            0.0
+          ],
+          [
+            -1e+20,
+            0.0,
+            0.0
+          ],
+          [
+            3.25,
+            0.0,
+            0.0
+          ]
+        ]
+      },
+      "t": 2.0
+    },
+    {
+      "aggregate": {
+        "opacitySum": 2.703672,
+        "positionSum": [
+          3.25,
+          0.0,
+          0.0
+        ]
+      },
+      "liveCount": "3",
+      "sample": {
+        "objectIds": [
+          "1",
+          "2",
+          "3"
+        ],
+        "orientations": [
+          [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ]
+        ],
+        "positions": [
+          [
+            1e+20,
+            0.0,
+            0.0
+          ],
+          [
+            -1e+20,
+            0.0,
+            0.0
+          ],
+          [
+            3.25,
+            0.0,
+            0.0
+          ]
+        ]
+      },
+      "t": 3.999999
+    }
+  ],
+  "statistics": null,
+  "summaryCrcOk": true,
+  "summaryOffsets": [],
+  "temporalModel": "gaussian-birth"
+}

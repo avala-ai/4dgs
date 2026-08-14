@@ -82,6 +82,14 @@ pub fn chunk_stream_bytes<'a>(
             head.t0, head.uncompressed_size
         ))
     })?;
+    if head.uncompressed_size > crate::serialization::MAX_STREAM_BYTES {
+        return Err(Error::Malformed(format!(
+            "the chunk at t0={} declares {} uncompressed record bytes, past the {} byte cap",
+            head.t0,
+            head.uncompressed_size,
+            crate::serialization::MAX_STREAM_BYTES
+        )));
+    }
     Ok(std::borrow::Cow::Owned(codec::decompress(
         streams, numeric, expected,
     )?))

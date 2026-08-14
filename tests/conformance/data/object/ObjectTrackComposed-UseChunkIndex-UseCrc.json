@@ -1,7 +1,7 @@
 {
   "aggregate": {
     "neverFadesCount": "0",
-    "opacitySum": 5.411765,
+    "opacitySum": 5.411766,
     "positionSum": [
       2.5,
       2.5,
@@ -341,7 +341,7 @@
   "states": [
     {
       "aggregate": {
-        "opacitySum": 5.411765,
+        "opacitySum": 5.411766,
         "positionSum": [
           2.5,
           2.5,
@@ -433,7 +433,7 @@
     },
     {
       "aggregate": {
-        "opacitySum": 5.410659,
+        "opacitySum": 5.410656,
         "positionSum": [
           13.2,
           9.1,
@@ -525,11 +525,11 @@
     },
     {
       "aggregate": {
-        "opacitySum": 5.407341,
+        "opacitySum": 5.407344,
         "positionSum": [
           20.699995,
-          3.700003,
-          -1.400002
+          3.700004,
+          -1.400003
         ]
       },
       "liveCount": "6",

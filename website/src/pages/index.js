@@ -42,11 +42,11 @@ const properties = [
 ];
 
 const languages = [
-  { name: "Python", to: "/docs/guides/getting-started/encode-python" },
-  { name: "TypeScript", to: "/docs/guides/getting-started/decode-web" },
-  { name: "Rust", to: "/docs/guides/getting-started/decode-rust" },
-  { name: "C++", to: "/docs/guides/getting-started/decode-cpp" },
-  { name: "Swift", to: "/docs/guides/getting-started/decode-swift" },
+  { name: "Python", to: "/guides/getting-started/encode-python" },
+  { name: "TypeScript", to: "/guides/getting-started/decode-web" },
+  { name: "Rust", to: "/guides/getting-started/decode-rust" },
+  { name: "C++", to: "/guides/getting-started/decode-cpp" },
+  { name: "Swift", to: "/guides/getting-started/decode-swift" },
 ];
 
 export default function Home() {
@@ -71,10 +71,10 @@ export default function Home() {
             Apache-2.0.
           </p>
           <div className={styles.buttons}>
-            <Link className="button button--primary button--lg" to="/docs/guides/">
+            <Link className="button button--primary button--lg" to="/guides/">
               Read the guides
             </Link>
-            <Link className="button button--secondary button--lg" to="/docs/spec/">
+            <Link className="button button--secondary button--lg" to="/spec/">
               Read the specification
             </Link>
           </div>
@@ -108,9 +108,9 @@ export default function Home() {
             </div>
             <p>
               Support is stated per feature, not per language: the{" "}
-              <Link to="/docs/reference/">feature support matrix</Link> records only what the{" "}
-              <Link to="/docs/reference/conformance">conformance suite</Link> proves, and a partial
-              SDK is a documented state rather than a defect.
+              <Link to="/reference/">feature support matrix</Link> records only what the{" "}
+              <Link to="/reference/conformance">conformance suite</Link> proves, and a partial SDK
+              is a documented state rather than a defect.
             </p>
           </div>
         </section>

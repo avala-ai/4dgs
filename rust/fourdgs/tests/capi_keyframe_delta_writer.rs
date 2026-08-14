@@ -158,8 +158,14 @@ fn the_id_column_is_carried_and_not_invented_from_row_order() {
     // is by id, so nothing was born and nothing died — a writer that numbered rows instead
     // would see four deaths and four births and compose a different population.
     let rows = [[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]];
-    let straight = Columns::new(&[0, 1, 2, 3], &rows, 8.0);
-    let rotated = Columns::new(&[3, 0, 1, 2], &[rows[3], rows[0], rows[1], rows[2]], 8.0);
+    // Include the top of the C ABI's unsigned id domain: the wire stream is signed i32,
+    // and preserving these bits is what makes the two domains interoperate losslessly.
+    let straight = Columns::new(&[0, u32::MAX, 2, 3], &rows, 8.0);
+    let rotated = Columns::new(
+        &[3, 0, u32::MAX, 2],
+        &[rows[3], rows[0], rows[1], rows[2]],
+        8.0,
+    );
     // SAFETY: as above.
     let bytes = unsafe {
         let writer = fourdgs_kd_writer_new();

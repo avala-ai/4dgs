@@ -139,3 +139,19 @@ final class ConformanceRunnerTests: XCTestCase {
             JSON.object(["refused": .string("magic-mismatch")]).serialized())
     }
 }
+
+final class ObjectCompositionCheckTests: XCTestCase {
+    func testPureRotationIsCompositionAndQuaternionSignIsEquivalent() {
+        let base = Gaussian(
+            position: .zero, scale: SIMD3(repeating: 1), rotation: Quaternion(0, 0, 0, 1),
+            color: SIMD4(repeating: 1), motion: .zero, muT: 0, sigmaT: .infinity,
+            winLo: 0, winHi: .infinity)
+        let rotated = InstantState(
+            indices: [0], centers: [0, 0, 0], orientations: [0, 0, 1, 0], opacity: [1])
+        let equivalentSign = InstantState(
+            indices: [0], centers: [0, 0, 0], orientations: [0, 0, 0, -1], opacity: [1])
+
+        XCTAssertTrue(ExtraChecks.poseDiffers(rotated, at: 0, from: base))
+        XCTAssertFalse(ExtraChecks.poseDiffers(equivalentSign, at: 0, from: base))
+    }
+}

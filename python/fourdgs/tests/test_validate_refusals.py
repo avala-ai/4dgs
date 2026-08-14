@@ -1847,7 +1847,7 @@ class TestBoundedDecoding:
 
         monkeypatch.setattr(kdf, "scan_indexed", indexed)
         monkeypatch.setattr(kdf, "scan_streamed", streamed)
-        assert kdf.count_distinct_ids_bounded(b"", index=[], windows=[]) == 2
+        assert kdf.count_distinct_ids_partitioned(b"", max_ids_per_partition=1, index=[], windows=[]) == 2
 
     def test_the_bounded_identity_count_decodes_the_sequence_once(self, monkeypatch):
         """The partitioned counter this replaced re-decoded the whole file per partition,
@@ -2103,20 +2103,28 @@ class TestBoundedDecoding:
         assert any("reintroduces gaussian id 3" in str(f) for f in refused), [str(f) for f in refused]
         assert any(f.refusal is not None and "gaussian-id-reused" in str(f.refusal) for f in refused)
 
-    def test_the_ceiling_warning_names_every_check_it_ends(self, monkeypatch):
-        """Passing the ceiling is not a fault in the file, so it is a warning — but a
-        warning that understates what went unmade is worse than the refusal it replaces.
-        Two checks stop there, not one: the Header's `gaussian_count` is never compared,
-        and reuse past that point is never refused. A reader deciding whether to trust the
-        `valid` it just got needs both named (AGENTS.md §6).
+    def test_validate_refuses_identity_reuse_after_the_fast_audit_ceiling(self, monkeypatch):
+        """An oversized sequence still gets a complete §11.2 verdict.
+
+        The opening population crosses the lowered fast-path ceiling. Id 3 then dies and
+        returns, so only the bounded exact fallback can see the fault.
         """
         monkeypatch.setattr(kdf, "MAX_DISTINCT_IDS", 2)
-        report = validate(_keyframe_file())
-        warnings = [str(f) for f in report.findings if f.severity == "warning"]
-        past = next(w for w in warnings if "distinct gaussian ids" in w)
-        assert "gaussian_count is left unchecked" in past
-        assert "reintroduced after that point is not refused" in past
-        assert report.ok, "a sequence larger than the counter is not thereby an invalid file"
+        report = validate(_reusing_keyframe_file())
+        assert not report.ok, [str(f) for f in report.findings]
+        assert any(
+            finding.refusal is not None and "gaussian-id-reused" in str(finding.refusal) for finding in report.findings
+        )
+
+    def test_validate_checks_header_gaussian_count_after_the_fast_audit_ceiling(self, monkeypatch):
+        """The exact fallback supplies the required Header comparison too."""
+        monkeypatch.setattr(kdf, "MAX_DISTINCT_IDS", 2)
+        report = validate(_patch_gaussian_count(_keyframe_file(), 999))
+        assert not report.ok, [str(f) for f in report.findings]
+        assert any(
+            "Header declares 999 gaussians; the sequence carries 4 distinct gaussian ids" in str(finding)
+            for finding in report.findings
+        )
 
     def test_the_command_line_exits_one_on_a_file_that_reuses_an_id(self, monkeypatch, tmp_path, capsys):
         """In process rather than through `_tool`, because the point is the exit status
@@ -2124,7 +2132,7 @@ class TestBoundedDecoding:
         """
         path = tmp_path / "reused.4dgs"
         path.write_bytes(_reusing_keyframe_file())
-        monkeypatch.setattr(kdf, "MAX_DISTINCT_IDS", 6)
+        monkeypatch.setattr(kdf, "MAX_DISTINCT_IDS", 2)
         assert main(["validate", str(path)]) == 1
         assert "INVALID" in capsys.readouterr().err
 

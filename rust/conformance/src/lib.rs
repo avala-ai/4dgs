@@ -13,12 +13,16 @@
 //! two correct decoders to disagree. Everything per-gaussian is taken in the content order
 //! defined by [`stable_order`], which is derived from decoded values alone.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use fourdgs::keyframe_delta_file::DecodedSequence;
 use fourdgs::model::{AudioSource, GaussianSet};
-use fourdgs::object_layer::{stable_order, ObjectLayer};
+use fourdgs::object_layer::{
+    canonical_state_scalar_key, compare_content_rows, exact_canonical_sum, stable_order,
+    ObjectLayer,
+};
 use fourdgs::provenance::{pose_at, Pose, PoseSampled, Provenance};
 use fourdgs::records::{Attachment, Camera, Header, Metadata, Statistics, SummaryOffset};
 use fourdgs::Result;
@@ -78,6 +82,7 @@ pub enum J {
     Null,
     Bool(bool),
     Num(f64),
+    ExactNum(String),
     Str(String),
     Arr(Vec<J>),
     Obj(BTreeMap<String, J>),
@@ -97,6 +102,7 @@ impl J {
             J::Num(v) => {
                 let _ = write!(out, "{v:.*}", FLOAT_DECIMALS);
             }
+            J::ExactNum(token) => out.push_str(token),
             J::Str(s) => write_string(out, s),
             J::Arr(items) => {
                 out.push('[');
@@ -128,6 +134,10 @@ impl J {
         self.write(&mut out);
         out
     }
+}
+
+fn exact_sum(values: impl IntoIterator<Item = f64>) -> J {
+    exact_canonical_sum(values).map_or(J::Null, J::ExactNum)
 }
 
 fn write_string(out: &mut String, s: &str) {
@@ -215,15 +225,9 @@ pub fn summarize(
     };
     let scalars = |arr: &[f32]| -> J { J::Arr(sample.iter().map(|i| numf(arr[*i])).collect()) };
 
-    let mut total_pos = [0.0f64; 3];
-    let mut alpha_sum = 0.0f64;
     let mut never_fades = 0u64;
     let mut still = 0u64;
     for i in &order {
-        for (k, slot) in total_pos.iter_mut().enumerate() {
-            *slot += gaussians.positions[i * 3 + k] as f64;
-        }
-        alpha_sum += gaussians.colors[i * 4 + 3] as f64;
         if !gaussians.sigma_t[*i].is_finite() {
             never_fades += 1;
         }
@@ -365,9 +369,21 @@ pub fn summarize(
             J::obj(vec![
                 (
                     "positionSum",
-                    J::Arr(total_pos.iter().map(|v| num(*v)).collect()),
+                    J::Arr(
+                        (0..3)
+                            .map(|axis| {
+                                exact_sum(
+                                    (0..n)
+                                        .map(|index| gaussians.positions[index * 3 + axis] as f64),
+                                )
+                            })
+                            .collect(),
+                    ),
                 ),
-                ("opacitySum", num(alpha_sum)),
+                (
+                    "opacitySum",
+                    exact_sum((0..n).map(|index| gaussians.colors[index * 4 + 3] as f64)),
+                ),
                 ("neverFadesCount", int(never_fades)),
                 ("zeroMotionCount", int(still)),
             ]),
@@ -390,7 +406,7 @@ pub fn summarize(
     let empty_objects = ObjectLayer::default();
     let objects = extras.objects.unwrap_or(&empty_objects);
     if !objects.is_empty() || gaussians.object_id.is_some() {
-        let (object_summary, states) = objects_and_states(header, gaussians, objects, &order)?;
+        let (object_summary, states) = objects_and_states(header, gaussians, objects)?;
         pairs.push(("objects", object_summary));
         pairs.push(("states", states));
     }
@@ -403,7 +419,6 @@ fn objects_and_states(
     header: &Header,
     gaussians: &GaussianSet,
     layer: &ObjectLayer,
-    order: &[usize],
 ) -> Result<(J, J)> {
     let mut tracks = Vec::with_capacity(layer.tracks.len());
     for track in &layer.tracks {
@@ -489,21 +504,21 @@ fn objects_and_states(
         for (row, index) in state.indices.iter().enumerate() {
             row_for_index[*index] = Some(row);
         }
-        let mut sample_rows = Vec::with_capacity(SAMPLE.min(state.indices.len()));
-        let mut position_sum = [0.0f64; 3];
-        let mut opacity_sum = 0.0f64;
-        for index in order {
-            let Some(row) = row_for_index[*index] else {
-                continue;
-            };
-            if sample_rows.len() < SAMPLE {
-                sample_rows.push(row);
-            }
-            for (axis, sum) in position_sum.iter_mut().enumerate() {
-                *sum += state.centers[row * 3 + axis];
-            }
-            opacity_sum += state.opacity[row];
-        }
+        let mut live_indices = state.indices.clone();
+        live_indices.sort_by(|&a, &b| {
+            compare_content_rows(gaussians, a, b).then_with(|| {
+                compare_state_rows(
+                    &state,
+                    row_for_index[a].expect("a live index has a row"),
+                    row_for_index[b].expect("a live index has a row"),
+                )
+            })
+        });
+        let live_rows: Vec<usize> = live_indices
+            .iter()
+            .map(|index| row_for_index[*index].expect("a live index has a row"))
+            .collect();
+        let sample_rows: Vec<usize> = live_rows.iter().copied().take(SAMPLE).collect();
         let rows = |values: &[f64], width: usize| {
             J::Arr(
                 sample_rows
@@ -542,9 +557,20 @@ fn objects_and_states(
                 J::obj(vec![
                     (
                         "positionSum",
-                        J::Arr(position_sum.iter().map(|value| num(*value)).collect()),
+                        J::Arr(
+                            (0..3)
+                                .map(|axis| {
+                                    exact_sum(
+                                        live_rows.iter().map(|row| state.centers[row * 3 + axis]),
+                                    )
+                                })
+                                .collect(),
+                        ),
                     ),
-                    ("opacitySum", num(opacity_sum)),
+                    (
+                        "opacitySum",
+                        exact_sum(live_rows.iter().map(|row| state.opacity[*row])),
+                    ),
                 ]),
             ),
         ]));
@@ -559,6 +585,26 @@ struct CanonicalObjectState {
     orientations: Vec<f64>,
     opacity: Vec<f64>,
     object_ids: Vec<u32>,
+}
+
+fn compare_state_rows(state: &CanonicalObjectState, a: usize, b: usize) -> Ordering {
+    for (values, width) in [(&state.centers, 3usize), (&state.orientations, 4)] {
+        for axis in 0..width {
+            let ord = match (
+                canonical_state_scalar_key(values[a * width + axis]),
+                canonical_state_scalar_key(values[b * width + axis]),
+            ) {
+                (Some(x), Some(y)) => x.partial_cmp(&y).expect("finite state keys are ordered"),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            };
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+    }
+    state.object_ids[a].cmp(&state.object_ids[b])
 }
 
 /// Reconstruct in f64 for the canonical six-decimal comparison. Production state arrays
@@ -1066,10 +1112,9 @@ mod tests {
     }
 
     #[test]
-    fn state_aggregates_sum_in_content_order() {
-        // These are the same three decoded f32 rows in different resident orders. Widened
-        // f64 addition crosses the canonical six-decimal boundary unless it follows the
-        // content order used by the root aggregate.
+    fn state_aggregates_sum_exact_canonical_units() {
+        // These are the same three decoded f32 rows in different resident orders. Exact
+        // fixed-decimal units retain the small addend without depending on either order.
         let values = [1e20, 1.0, -1e20];
         let zero = [0.0, 0.0, 0.0];
         let forward = gaussians(&values.map(|x| [x, 0.0, 0.0]), &[zero, zero, zero]);
@@ -1086,9 +1131,20 @@ mod tests {
         let b = summaries(&reversed);
         assert_eq!(a, b);
         assert!(
-            a.1.contains("\"positionSum\":[0.000000,0.000000,0.000000]"),
-            "the state did not sum in content order: {}",
+            a.1.contains("\"positionSum\":[1.0,0.0,0.0]"),
+            "the state did not sum exact canonical units: {}",
             a.1
         );
+    }
+
+    #[test]
+    fn exact_sum_never_narrows_through_binary64() {
+        let enormous = super::exact_sum([1e308; 10]).to_json();
+        assert!(enormous.starts_with("1000000000000000"));
+        assert!(enormous.ends_with(".0"));
+        assert!(enormous.len() > 309);
+        assert_eq!(super::exact_sum([1e20, -1e20, 3.25]).to_json(), "3.25");
+        assert_eq!(super::exact_sum([-0.0]).to_json(), "0.0");
+        assert_eq!(super::exact_sum([f64::INFINITY]).to_json(), "null");
     }
 }

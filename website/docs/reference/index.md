@@ -9,14 +9,16 @@ harness skips the rest —
 — and this table is kept in lockstep with what runs. Nothing is marked `Yes` on the strength of code
 existing.
 
-Every row is filled in from a suite that runs: 46 valid variants and 7 invalid ones, plus 4
-keyframe-delta and 3 object-layer variants in their own subdirectories, over two read paths
+Every row is filled in from a suite that runs: 48 valid variants and 7 invalid ones, plus 5
+keyframe-delta and 10 object-layer variants in their own subdirectories, over two read paths
 (streamed and indexed). A language takes the variants it declares support for, and what it declines
-is what this table records — 119 checks passing for every SDK. C++ and Swift read 4DGS through the
-Rust C ABI: the additive states-JSON accessor computes keyframe-delta summaries in the core, the
-provenance-JSON accessor does the same for the provenance family, and the objects-JSON pair does it
-for the object layer, so every binding emits identical bytes with no per-language slerp or
-composition order of its own.
+is what this table records. Every language layer runs 139 checks; while the canonical-state stack is
+landing, a capability-gated comparison omits only exact totals and composed-state samples from SDKs
+whose implementations have not landed yet. It never skips a variant or weakens unrelated fields. C++
+and Swift read 4DGS through the Rust C ABI: the additive states-JSON accessor computes
+keyframe-delta summaries in the core, the provenance-JSON accessor does the same for the provenance
+family, and the objects-JSON pair does it for the object layer, so every binding emits identical
+bytes with no per-language slerp or composition order of its own.
 
 <!-- prettier-ignore -->
 | Feature                                           | Python | TypeScript | Rust    | C++     | Swift   | Dart    |
@@ -65,7 +67,7 @@ composition order of its own.
 | glTF interop (import, snapshot export)            | Yes    | No         | No      | No      | No      | No      |
 | USD interop (import, snapshot export)             | Yes    | No         | No      | No      | No      | No      |
 | USD animated export (keyframe-delta time samples) | Yes    | No         | No      | No      | No      | No      |
-| Inspect and validate                              | Yes    | Yes        | Yes     | Planned | Yes     | Yes     |
+| Inspect and validate                              | Yes    | Yes        | Yes     | Partial | Yes     | Yes     |
 
 ¹ On the `gaussian-birth` path. No implementation composes object tracks during `keyframe-delta`
 reconstruction: that path rebuilds base centres and scales from bins and never reads the object
@@ -76,6 +78,10 @@ about the combination — see issue #79.
 ## Reading this table
 
 - **Yes** — implemented, and the conformance suite proves it.
+- **Partial** — the tool ships and proves a useful subset, but does not satisfy the full row
+  contract. Its detailed notes name where it declines certification, reports a conforming input
+  invalid, or has not yet enforced bounded allocation; do not infer `Yes` guarantees outside the
+  proved subset.
 - **Untested** — implemented, and nothing in this repository proves it. A promise with no evidence
   behind it, recorded as such rather than as a `Yes`.
 - **Planned** — intended for this SDK; not implemented yet.
@@ -307,7 +313,7 @@ directions.
 **Encode**, **Chunked encode** and **Summary writing** are proved by a gate rather than by a runner,
 and the encoders are gated by their role.
 
-Python's is proved by the corpus gate: `generate.py --verify` re-encodes all 46 valid variants,
+Python's is proved by the corpus gate: `generate.py --verify` re-encodes all 48 top-level variants,
 asserts every committed checksum, and asserts that two consecutive runs are byte-identical. Every
 variant is an encode; the chunked and summary-bearing ones are the flags that say so.
 
@@ -383,13 +389,45 @@ identity history, and reports a structurally clean file as valid.
 
 **Rust**'s `Yes` on that row is marked from `rust/cli/tests/smoke.rs`, and the assertion that earns
 it is `every_invalid_variant_is_refused_by_its_own_identifier`: each of the seven invalid variants
-must be refused **by the identifier the corpus declares for it**, with the byte it fired at, and the
-expectation is read out of the corpus rather than written into the test. "Both readers raised an
+must be refused **by the identifier the corpus declares for it** and include a byte location, and
+the expectation is read out of the corpus rather than written into the test. "Both readers raised an
 error" is not the property — a reader that refuses all seven for the wrong reason passes a test that
-only checks the exit code, and that is the failure the invalid corpus exists to catch. The Rust
-validator is also the only one that decodes chunks, so it is the only one that reports the two
-refusals living inside a chunk's streams; the Python validator walks the framing and calls those
-files clean, which is the gap the Python side of the epic closes.
+only checks the exit code, and that is the failure the invalid corpus exists to catch.
+
+**C++** is `Partial`. `cpp/tests/test_tool.cpp` reads the seven invalid expectations from the corpus
+and requires the tool to name each identifier and include a byte location. Separate mutation tests
+prove chunk and SH-band decoding, framing and truncation diagnostics, streamed keyframe-delta
+validation, and lifetime-identity accounting. Representative indexed keyframe-delta and indexed
+gaussian-birth files are accepted too, so a tool that refuses every input cannot pass; the current
+mutations do not yet pin an indexed-only malformed-payload rejection.
+
+Known partial boundaries include the following; this is not an exhaustive acceptance contract.
+Indexed gaussian-birth validation returns an incomplete verdict for a Footer extended beyond its
+version-1 prefix or a summary above the validator's 64 MiB resource ceiling. Its indexed opener does
+not yet enforce one bounded working set for every conforming input: it reads a Header, Quantization,
+Window Table, index-declared Chunk, or SH Band Stream range in full before the later parse or
+decoded size checks, and retains per-record or per-identity state for Metadata, Attachment,
+Provenance, Audio Source, Audio Data, and Object Track records. Memory can therefore grow with both
+encoded payload size and repeated-record count. A legal gaussian-birth file without an index is
+likewise incomplete because the C++ surface cannot yet walk that payload sequentially. The validator
+also does not parse every lazily retained front-matter body: for example, malformed Audio Source
+pose, duration, flags, or interpolation fields can pass this partial check.
+
+For keyframe-delta, an extended Footer is not yet accepted by the fixed-tail indexed core. Otherwise
+legal resources return incomplete above these validator ceilings: 65,536 Chunk Index entries, 4,096
+bytes in one extended Chunk Index record, 512 MiB of encoded content in one state record, 512 MiB
+plus the fixed 17-byte stream header and one-byte band identifier in one SH Band Stream, or
+1,048,576 rows in one state. Other ceilings are currently classified as malformed, so the tool
+reports an otherwise legal resource invalid rather than incomplete: a Header whose required fields
+extend past the 64 MiB front-matter prefix or a Quantization or Window Table record above 64 MiB.
+The decoded-size rejections are shared with gaussian-birth: in either temporal model, a Chunk
+declaring more than 512 MiB of uncompressed record bytes or an Attribute Stream declaring more than
+512 MiB of decoded bytes is classified malformed; the same applies to a Delta Chunk under
+keyframe-delta. The C++ common index pre-check also reports a conforming `sh_degree > 0` Delta Chunk
+with no births and no SH Band Streams invalid, so a pure-update or pure-death delta can be rejected
+before model-specific validation. The common path returns incomplete above 262,144 retained Chunk
+Index records for either temporal model, although keyframe-delta reaches its stricter 65,536-entry
+limit first. A no-core build cannot examine the file and therefore returns no validation verdict.
 
 **Rust** decodes and encodes. Its decode rows are filled in from the same suite on the same terms as
 the other two; its encode rows come from the cross-implementation gate described above. Python

@@ -151,8 +151,11 @@ def run(path: str) -> str:
             motions=np.concatenate([c["motions"] for c in chunks]).astype(np.float32),
             mu_t=np.concatenate([c["mu_t"] for c in chunks]).astype(np.float32),
             sigma_t=np.concatenate([c["sigma_t"] for c in chunks]).astype(np.float32),
-            win_lo=table[idx, 0].astype(np.float32),
-            win_hi=table[idx, 1].astype(np.float32),
+            # Window Table endpoints are f64 on the wire. Match streamed assembly:
+            # narrowing a large finite endpoint to f32 infinity changes `[lo, hi)`
+            # membership and makes the two read paths reconstruct different states.
+            win_lo=np.asarray(table[idx, 0], dtype=np.float64),
+            win_hi=np.asarray(table[idx, 1], dtype=np.float64),
             sh=sh,
             sh_degree=scene.header.sh_degree,
             object_id=object_id,
@@ -167,8 +170,8 @@ def run(path: str) -> str:
             motions=z3,
             mu_t=np.zeros(0, dtype=np.float32),
             sigma_t=np.zeros(0, dtype=np.float32),
-            win_lo=np.zeros(0, dtype=np.float32),
-            win_hi=np.zeros(0, dtype=np.float32),
+            win_lo=np.zeros(0, dtype=np.float64),
+            win_hi=np.zeros(0, dtype=np.float64),
             sh_degree=scene.header.sh_degree,
         )
 

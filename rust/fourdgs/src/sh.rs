@@ -3,10 +3,8 @@
 
 //! Spherical harmonic bands.
 //!
-//! A scene declares one degree for all of its gaussians, and each degree above the
-//! constant term is stored in its own SH Band Stream record. Bands are whole and a reader
-//! takes them whole: bands 1..D give exactly a degree-D scene, and a reader never
-//! assembles a partial degree out of part of a band.
+//! A scene declares one degree; each nonconstant band has its own SH Band Stream.
+//! Readers take bands whole: 1..D gives exactly a degree-D scene.
 //!
 //! Coefficients are `u8`, stored as written and consumed as read. `step_sh` in the
 //! Quantization record describes what the encoder did before it stored them and is **not**

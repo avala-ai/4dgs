@@ -17,11 +17,13 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
 
 #include "check.hpp"
+#include "fourdgs/writer.hpp"
 #include "tool.hpp"
 
 namespace {
@@ -227,6 +229,19 @@ std::vector<std::filesystem::path> variants(const std::filesystem::path& directo
   return out;
 }
 
+std::set<std::filesystem::path> identityScratchDirectories() {
+  std::set<std::filesystem::path> out;
+  std::error_code error;
+  const std::filesystem::path temporary = std::filesystem::temp_directory_path(error);
+  if (error) return out;
+  for (std::filesystem::directory_iterator entries(temporary, error), end; !error && entries != end;
+       entries.increment(error)) {
+    const std::string name = entries->path().filename().string();
+    if (name.rfind("4dgs-validate-ids-", 0) == 0) out.insert(entries->path());
+  }
+  return out;
+}
+
 /// A conforming capture carrying provenance records — a coordinate frame, a rig trajectory and
 /// sensor calibrations — which is the variant that would produce spurious "unknown record" notes
 /// if the provenance family were not recognized.
@@ -273,22 +288,228 @@ void aConformingCaptureIsValid() {
 }
 
 void aConformingKeyframeDeltaFileIsNotMisclassified() {
-  // The C ABI's keyframe-delta entry point accepts a whole byte span. The tool must not buffer a
-  // capture to reach it, so it reports the bounded structural result as incomplete rather than
-  // calling a conforming file invalid or certifying payloads it did not decode.
+  // Both concrete paths are certified through the range-reader ABI, rather than by handing the
+  // core a whole-file byte span. A conforming file therefore receives a complete verdict.
   if (corpusMissing()) return;
   if (noDecoder()) return;
   const std::vector<std::filesystem::path> files = variants(corpusDirectory() / "keyframe");
   CHECK(!files.empty());
   for (const std::filesystem::path& file : files) {
     const Run result = run({"validate", file.string()});
-    CHECK_EQ(result.code, fourdgs::tool::kExitTool);
+    CHECK_EQ(result.code, fourdgs::tool::kExitOk);
+    CHECK(result.outContains("valid"));
     CHECK(!result.outContains("error:"));
-    CHECK(result.outContains("neither read mode was certified"));
     if (result.outContains("error:")) {
       std::fprintf(stderr, "  %s said: %s", file.filename().string().c_str(), result.out.c_str());
     }
   }
+}
+
+void keyframeDeltaHeaderCountIsTheLifetimeDistinctIdentityCount() {
+  if (corpusMissing()) return;
+  if (noDecoder()) return;
+  std::vector<std::uint8_t> bytes = readBytes(
+      corpusDirectory() / "keyframe" / "KeyframeDelta-UseChunkIndex-UseCrc-UseStatistics.4dgs");
+  CHECK(!bytes.empty());
+  if (bytes.empty()) return;
+  fourdgs::Result<Walk> walked =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  CHECK(walked.ok());
+  if (!walked) return;
+  const fourdgs::tool::Frame* header = walked->firstIntact(fourdgs::tool::op::kHeader);
+  CHECK(header != nullptr);
+  if (header == nullptr) return;
+  std::size_t at = static_cast<std::size_t>(header->offset + fourdgs::tool::kRecordHeaderSize);
+  for (int field = 0; field < 2; ++field) {
+    const std::uint32_t length = readU32(bytes, at);
+    at += 4 + length;
+  }
+  at += 8;  // duration_sec
+  const std::uint64_t declared = readU64(bytes, at);
+  writeU64(&bytes, at, declared + 1);
+
+  const Report report =
+      fourdgs::tool::validate(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  CHECK(!report.ok());
+  CHECK(report.hasErrors());
+  bool found = false;
+  for (const fourdgs::tool::Finding& finding : report.findings) {
+    if (finding.message.find("Header declares " + std::to_string(declared + 1) +
+                             " distinct gaussians at byte " + std::to_string(header->offset) +
+                             " (the Header record); keyframes and birth groups introduce " +
+                             std::to_string(declared)) != std::string::npos) {
+      found = true;
+    }
+  }
+  CHECK(found);
+}
+
+void identitySinkIoIsNotCalledAnInputReadFailure() {
+  Report report;
+  fourdgs::tool::reportKeyframeDeltaToolFailure(
+      &report, "sequential", Error(ErrorCode::kIo, "cannot write temporary identity partition 0"),
+      true);
+  CHECK(!report.complete);
+  CHECK_EQ(report.findings.size(), static_cast<std::size_t>(1));
+  CHECK(report.findings[0].message.find("identity validation could not use temporary storage") !=
+        std::string::npos);
+  CHECK(report.findings[0].message.find("could not read the file") == std::string::npos);
+}
+
+void validatorToolFailuresNameTheirActualCause() {
+  struct Case {
+    ErrorCode code;
+    const char* expected;
+  };
+  for (const Case& test : {
+           Case{ErrorCode::kIo, "could not read the file"},
+           Case{ErrorCode::kUnsupportedMode, "reached a bounded tool limit"},
+           Case{ErrorCode::kNotImplemented, "functionality this tool does not implement"},
+           Case{ErrorCode::kInternal, "failed inside the tool"},
+       }) {
+    Report report;
+    fourdgs::tool::reportKeyframeDeltaToolFailure(&report, "indexed",
+                                                  Error(test.code, "injected diagnosis"), false);
+    CHECK(!report.complete);
+    CHECK_EQ(report.findings.size(), static_cast<std::size_t>(1));
+    CHECK(report.findings[0].message.find(test.expected) != std::string::npos);
+    if (test.code != ErrorCode::kIo) {
+      CHECK(report.findings[0].message.find("could not read the file") == std::string::npos);
+    }
+  }
+}
+
+void identityPartitionCloseFailureIsIo() {
+  std::ofstream failed;
+  failed.setstate(std::ios::badbit);
+  fourdgs::Result<void> closed = fourdgs::tool::checkIdentityPartitionClose(failed, 3);
+  CHECK(!closed.ok());
+  if (!closed) {
+    CHECK_EQ(closed.error().code, ErrorCode::kIo);
+    CHECK(closed.error().message.find("close temporary identity partition 3") != std::string::npos);
+  }
+}
+
+void anEarlyKeyframeRefusalRemovesIdentityScratchStorage() {
+  // Identity validation opens its bounded disk partitions before asking the core to decode.
+  // This malformed first state makes that decode return before finish() closes the streams.
+  // Windows does not permit an open file to be unlinked, so the destructor must close the
+  // partitions before removing their directory rather than relying on POSIX unlink semantics.
+  if (corpusMissing()) return;
+  if (noDecoder()) return;
+  std::vector<std::uint8_t> bytes = readBytes(
+      corpusDirectory() / "keyframe" / "KeyframeDelta-UseChunkIndex-UseCrc-UseStatistics.4dgs");
+  CHECK(!bytes.empty());
+  if (bytes.empty()) return;
+  fourdgs::Result<Walk> walked =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  CHECK(walked.ok());
+  if (!walked) return;
+  const fourdgs::tool::Frame* keyframe = walked->firstIntact(fourdgs::tool::op::kChunk);
+  CHECK(keyframe != nullptr);
+  if (keyframe == nullptr) return;
+  bytes[static_cast<std::size_t>(keyframe->offset)] = fourdgs::tool::op::kDeltaChunk;
+
+  const std::set<std::filesystem::path> before = identityScratchDirectories();
+  const Report report =
+      fourdgs::tool::validate(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  CHECK(!report.ok());
+  CHECK_EQ(identityScratchDirectories(), before);
+}
+
+void aReusedIdentityNamesItsSecondIntroductionRecord() {
+  if (noDecoder()) return;
+  const auto population = [](std::size_t count) {
+    fourdgs::GaussianData data;
+    data.resize(count, 0, 0);
+    if (count == 0) return data;
+    data.scales = {0.05f, 0.05f, 0.05f};
+    data.rotations = {0.0f, 0.0f, 0.0f, 1.0f};
+    data.colors = {0.5f, 0.25f, 0.75f, 0.9f};
+    data.sigmaT = {0.5f};
+    data.winHi = {1.0f};
+    return data;
+  };
+  std::vector<fourdgs::GaussianData> populations{population(1), population(0), population(1)};
+  const auto samplesFor = [&](const std::vector<std::vector<std::uint32_t>>& ids) {
+    std::vector<fourdgs::KeyframeDeltaSample> samples;
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+      fourdgs::KeyframeDeltaSample sample;
+      sample.t0 = static_cast<double>(i) / 3.0;
+      sample.ids = Span<const std::uint32_t>(ids[i].data(), ids[i].size());
+      sample.gaussians = fourdgs::GaussianView(populations[i]);
+      samples.push_back(sample);
+    }
+    return samples;
+  };
+  fourdgs::KeyframeDeltaOptions options;
+  options.keyframeEvery = 8;
+  options.deltaMode = fourdgs::kDeltaModeKeyframe;
+  options.keyframeAt = {2};
+
+  // The writer now correctly refuses an identity that reappears after death, so it cannot be
+  // asked to manufacture the validator's hostile fixture directly. Build two conforming files
+  // with identical layouts instead: 7 -> death -> 8 and 6 -> death -> 7. Copying the donor's
+  // final state record into the first file creates 7 -> death -> 7 without inventing Chunk
+  // framing or coupling this test to the compressed Attribute Stream representation. The index
+  // remains valid because the complete state records have the same length and offset.
+  const std::vector<std::vector<std::uint32_t>> ids{{7}, {}, {8}};
+  const std::vector<std::vector<std::uint32_t>> donorIds{{6}, {}, {7}};
+  const std::vector<fourdgs::KeyframeDeltaSample> samples = samplesFor(ids);
+  const std::vector<fourdgs::KeyframeDeltaSample> donorSamples = samplesFor(donorIds);
+  fourdgs::Result<std::vector<std::uint8_t>> encoded = fourdgs::encodeKeyframeDeltaSequence(
+      Span<const fourdgs::KeyframeDeltaSample>(samples.data(), samples.size()), 1.0, options);
+  fourdgs::Result<std::vector<std::uint8_t>> donor = fourdgs::encodeKeyframeDeltaSequence(
+      Span<const fourdgs::KeyframeDeltaSample>(donorSamples.data(), donorSamples.size()), 1.0,
+      options);
+  CHECK(encoded.ok());
+  CHECK(donor.ok());
+  if (!encoded || !donor) return;
+  std::vector<fourdgs::tool::Frame> states;
+  std::vector<fourdgs::tool::Frame> donorStates;
+  fourdgs::Result<Walk> walked =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(encoded->data(), encoded->size()),
+                               [&](const fourdgs::tool::Frame& frame, bool complete) {
+                                 if (complete && (frame.opcode == fourdgs::tool::op::kChunk ||
+                                                  frame.opcode == fourdgs::tool::op::kDeltaChunk)) {
+                                   states.push_back(frame);
+                                 }
+                               });
+  fourdgs::Result<Walk> donorWalked =
+      fourdgs::tool::walkBytes(Span<const std::uint8_t>(donor->data(), donor->size()),
+                               [&](const fourdgs::tool::Frame& frame, bool complete) {
+                                 if (complete && (frame.opcode == fourdgs::tool::op::kChunk ||
+                                                  frame.opcode == fourdgs::tool::op::kDeltaChunk)) {
+                                   donorStates.push_back(frame);
+                                 }
+                               });
+  CHECK(walked.ok());
+  CHECK(donorWalked.ok());
+  CHECK_EQ(states.size(), static_cast<std::size_t>(3));
+  CHECK_EQ(donorStates.size(), states.size());
+  if (!walked || !donorWalked || states.size() != 3 || donorStates.size() != states.size()) return;
+  CHECK_EQ(donorStates[2].total(), states[2].total());
+  if (donorStates[2].total() != states[2].total()) return;
+  std::copy_n(donor->begin() + static_cast<std::ptrdiff_t>(donorStates[2].offset),
+              static_cast<std::size_t>(donorStates[2].total()),
+              encoded->begin() + static_cast<std::ptrdiff_t>(states[2].offset));
+
+  const Report report =
+      fourdgs::tool::validate(Span<const std::uint8_t>(encoded->data(), encoded->size()));
+  CHECK(!report.ok());
+  bool placed = false;
+  for (const fourdgs::tool::Finding& finding : report.findings) {
+    if (finding.message.find("gaussian_id 7 is introduced more than once at byte " +
+                             std::to_string(states[2].offset) + " (the keyframe-delta record)") !=
+        std::string::npos) {
+      placed = true;
+    }
+  }
+  if (!placed) {
+    for (const fourdgs::tool::Finding& finding : report.findings)
+      std::fprintf(stderr, "  validator said: %s\n", finding.message.c_str());
+  }
+  CHECK(placed);
 }
 
 void everyValidVariantIsValid() {
@@ -561,6 +782,24 @@ class FailingRepeatedRangeReadable : public fourdgs::Readable {
   std::size_t visits_ = 0;
 };
 
+class LargestRangeReadable : public fourdgs::Readable {
+ public:
+  explicit LargestRangeReadable(Span<const std::uint8_t> bytes) : inner_(bytes) {}
+
+  fourdgs::Result<std::uint64_t> size() override { return inner_.size(); }
+
+  fourdgs::Result<std::size_t> read(std::uint64_t offset, Span<std::uint8_t> into) override {
+    largest_ = std::max(largest_, into.size());
+    return inner_.read(offset, into);
+  }
+
+  std::size_t largest() const { return largest_; }
+
+ private:
+  fourdgs::MemoryReadable inner_;
+  std::size_t largest_ = 0;
+};
+
 void aWalkRetainsBoundedFactsForUnboundedPrivateRecords() {
   constexpr std::size_t kRecords = 50000;
   std::vector<std::uint8_t> bytes;
@@ -694,10 +933,11 @@ void aLaterIndexResolutionTransportFailureMakesValidationIncomplete() {
   CHECK(propagated);
 }
 
-void aCoreChunkTransportFailureMakesValidationIncomplete() {
+void aKeyframeDeltaPayloadTransportFailurePreservesCause() {
   if (corpusMissing()) return;
   if (noDecoder()) return;
-  std::vector<std::uint8_t> bytes = readBytes(corpusDirectory() / kProvenanceVariant);
+  std::vector<std::uint8_t> bytes = readBytes(
+      corpusDirectory() / "keyframe" / "KeyframeDelta-UseChunkIndex-UseCrc-UseStatistics.4dgs");
   CHECK(!bytes.empty());
   if (bytes.empty()) return;
   fourdgs::Result<Walk> walked =
@@ -718,16 +958,20 @@ void aCoreChunkTransportFailureMakesValidationIncomplete() {
   CHECK(!report.complete);
   bool propagated = false;
   for (const fourdgs::tool::Finding& finding : report.findings) {
-    if (finding.message.find("chunk payload validation could not read the file") !=
-            std::string::npos ||
-        finding.message.find("a seeking reader could not obtain the file") != std::string::npos) {
+    if (finding.message.find("keyframe-delta sequential validation could not read the file") !=
+            std::string::npos &&
+        finding.message.find("injected chunk payload transport failure") != std::string::npos) {
       propagated = true;
     }
+  }
+  if (!propagated) {
+    for (const fourdgs::tool::Finding& finding : report.findings)
+      std::fprintf(stderr, "  keyframe transport finding: %s\n", finding.message.c_str());
   }
   CHECK(propagated);
 }
 
-void anUnindexedKeyframeDeltaStopsBeforePayloadDecode() {
+void anUnindexedKeyframeDeltaIsCertifiedFrontToBack() {
   if (corpusMissing()) return;
   if (noDecoder()) return;
   std::vector<std::uint8_t> bytes = readBytes(
@@ -757,9 +1001,9 @@ void anUnindexedKeyframeDeltaStopsBeforePayloadDecode() {
   fourdgs::MemoryReadable inner(Span<const std::uint8_t>(unindexed.data(), unindexed.size()));
   fourdgs::CountingReadable counting(&inner);
   const Report report = fourdgs::tool::validate(counting);
-  CHECK(!report.ok());
+  CHECK(report.ok());
   CHECK(!report.hasErrors());
-  CHECK(!report.complete);
+  CHECK(report.complete);
   bool warnedOnly = false;
   for (const fourdgs::tool::Finding& finding : report.findings) {
     if (finding.message.find("can only be read front to back") != std::string::npos) {
@@ -767,7 +1011,6 @@ void anUnindexedKeyframeDeltaStopsBeforePayloadDecode() {
     }
   }
   CHECK(warnedOnly);
-  CHECK(counting.bytesRead() < unindexed.size());
 }
 
 void anUnindexedFileStillReceivesAFrontMatterVerdict() {
@@ -1061,13 +1304,12 @@ void keyframeDeltaValidationDoesNotReadTheWholeResource() {
   CHECK(!bytes.empty());
   if (bytes.empty()) return;
 
-  fourdgs::MemoryReadable inner(Span<const std::uint8_t>(bytes.data(), bytes.size()));
-  fourdgs::CountingReadable counting(&inner);
-  const Report report = fourdgs::tool::validate(counting);
-  CHECK(!report.ok());
+  LargestRangeReadable ranges(Span<const std::uint8_t>(bytes.data(), bytes.size()));
+  const Report report = fourdgs::tool::validate(ranges);
+  CHECK(report.ok());
   CHECK(!report.hasErrors());
-  CHECK(!report.complete);
-  CHECK(counting.bytesRead() < bytes.size());
+  CHECK(report.complete);
+  CHECK(ranges.largest() < bytes.size());
 }
 
 void indexedBandRangesMustNameWholeTopLevelRecords() {
@@ -2129,6 +2371,12 @@ void runTests() {
   everyInvalidVariantIsRefusedByItsOwnIdentifier();
   aConformingCaptureIsValid();
   aConformingKeyframeDeltaFileIsNotMisclassified();
+  keyframeDeltaHeaderCountIsTheLifetimeDistinctIdentityCount();
+  identitySinkIoIsNotCalledAnInputReadFailure();
+  validatorToolFailuresNameTheirActualCause();
+  identityPartitionCloseFailureIsIo();
+  anEarlyKeyframeRefusalRemovesIdentityScratchStorage();
+  aReusedIdentityNamesItsSecondIntroductionRecord();
   everyValidVariantIsValid();
   aWalkFramesEveryRecordAndEndsOnTheMagic();
   aCutFileReportsTheIntactPrefixAndTheByte();
@@ -2143,8 +2391,8 @@ void runTests() {
   aTemporalModelTransportFailureMakesValidationIncomplete();
   aChunkIndexTransportFailureMakesValidationIncomplete();
   aLaterIndexResolutionTransportFailureMakesValidationIncomplete();
-  aCoreChunkTransportFailureMakesValidationIncomplete();
-  anUnindexedKeyframeDeltaStopsBeforePayloadDecode();
+  aKeyframeDeltaPayloadTransportFailurePreservesCause();
+  anUnindexedKeyframeDeltaIsCertifiedFrontToBack();
   anUnindexedFileStillReceivesAFrontMatterVerdict();
   duplicateHeadersAreRejectedBeforeModelDispatch();
   anEmbeddedChunkOpcodeIsNotARecordBoundary();
