@@ -69,7 +69,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import itertools
-import json
 import os
 import struct
 import subprocess
@@ -96,6 +95,9 @@ from fourdgs.quantization import life_class, motion_steps, mu_steps, support_k
 from fourdgs.readable import FileReadable
 from fourdgs.serialization import MAGIC, iter_records
 from fourdgs.stream_reader import window_table_or_default
+from json_compare import compact as compact_json
+from json_compare import diagnostic_differences
+from json_compare import loads as load_canonical_json
 
 EXE = ".exe" if os.name == "nt" else ""
 
@@ -741,8 +743,8 @@ def compare(
     if check_aabb_geometry:
         _check_aabb_geometry(cand_out)
 
-    ref = flatten(json.loads(decode_canonical(ref_out)))
-    cand = flatten(json.loads(decode_canonical(cand_out)))
+    ref = flatten(load_canonical_json(decode_canonical(ref_out)))
+    cand = flatten(load_canonical_json(decode_canonical(cand_out)))
     if second_encoder:
         for key in LAYOUT_DEPENDENT_KEYS:
             ref.pop(key, None)
@@ -1061,10 +1063,9 @@ def _check_declared_depths(path: str) -> None:
 
 def _diff(unaccounted: dict[str, tuple], left: str = "reference", right: str = "candidate") -> str:
     lines = [f"the {left} and the {right} decode differently:"]
-    for key, (a, b) in unaccounted.items():
-        lines.append(f"  {key}")
-        lines.append(f"    {left}: {json.dumps(a)[:300]}")
-        lines.append(f"    {right}: {json.dumps(b)[:300]}")
+    expected = {key: values[0] for key, values in unaccounted.items()}
+    actual = {key: values[1] for key, values in unaccounted.items()}
+    lines.extend(f"  {line}" for line in diagnostic_differences(expected, actual))
     return "\n".join(lines)
 
 
@@ -1131,7 +1132,7 @@ REFERENCE_IDENTITY_KEYS = LAYOUT_DEPENDENT_KEYS
 
 
 def _fingerprint(value) -> str:
-    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    encoded = compact_json(value).encode()
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -1201,8 +1202,8 @@ def reference_divergences(source: str, tmp: str, ladder: str | None) -> list[tup
         return [("encode", refused.get("python", "wrote the file"), refused.get("rust", "wrote the file"))]
 
     found = []
-    py_json = flatten(json.loads(decode_canonical(py_out)))
-    rs_json = flatten(json.loads(decode_canonical(rs_out)))
+    py_json = flatten(load_canonical_json(decode_canonical(py_out)))
+    rs_json = flatten(load_canonical_json(decode_canonical(rs_out)))
     for key in REFERENCE_IDENTITY_KEYS:
         py_json.pop(key, None)
         rs_json.pop(key, None)
@@ -1238,16 +1239,10 @@ def run_references() -> int:
                     )
                     if note:
                         known += 1
-                        print(
-                            f"KNOWN {label}\n  {field}: {note}\n"
-                            f"    python: {json.dumps(py)[:300]}\n    rust:   {json.dumps(rs)[:300]}"
-                        )
+                        print(f"KNOWN {label}\n  {field}: {note}\n{_diff({field: (py, rs)}, 'python', 'rust')}")
                     else:
                         unknown += 1
-                        print(
-                            f"DIVERGES {label}\n  {field}\n"
-                            f"    python: {json.dumps(py)[:300]}\n    rust:   {json.dumps(rs)[:300]}"
-                        )
+                        print(f"DIVERGES {label}\n{_diff({field: (py, rs)}, 'python', 'rust')}")
     print(f"\n{len(names)} variants; {known} known divergences (#182), {unknown} not accounted for")
     return 1 if unknown else 0
 
@@ -1415,8 +1410,8 @@ def _test_agreement_still_catches_divergence(tmp: str) -> list[str]:
     _write(scene, deep, max_depth=4)
     check_fidelity(source, flat)
     check_fidelity(source, deep)
-    a = flatten(json.loads(decode_canonical(flat)))
-    b = flatten(json.loads(decode_canonical(deep)))
+    a = flatten(load_canonical_json(decode_canonical(flat)))
+    b = flatten(load_canonical_json(decode_canonical(deep)))
     for key in LAYOUT_DEPENDENT_KEYS:  # as `compare` drops them for a second encoder
         a.pop(key, None)
         b.pop(key, None)

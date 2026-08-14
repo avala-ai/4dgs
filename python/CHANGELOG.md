@@ -8,6 +8,14 @@ All notable changes to the Python package are documented here, following
 
 ### Fixed
 
+- **Validity-window comparisons retain their f64 wire precision.** Decoding narrowed Window Table
+  endpoints to f32, turning a large finite upper bound into infinity, while `GaussianSet.state_at`
+  compared caller-constructed f32 windows directly with an f64 query. Readers now retain decoded
+  endpoints as f64 and comparisons widen caller-provided arrays, so a query after a large finite
+  window is excluded and an infinite window remains live at huge finite times. Finite inputs that
+  reconstruct a non-finite center at an extreme time remain a valid state whose canonical scalar is
+  `null`.
+
 - **`4dgs validate` counts distinct gaussian ids in one decode of the file, not a hundred.** The
   count is bounded-memory by design — a set of every id ever seen grows with cumulative births — and
   it was bounded by auditing one fixed-capacity partition of the id space at a time, splitting by
