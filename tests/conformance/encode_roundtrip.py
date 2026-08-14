@@ -158,7 +158,18 @@ SH_LADDER_ENCODERS = frozenset(ENCODERS)
 CAPTURE_PROFILE_NORMALIZATION_ENCODERS = frozenset({"dart"})
 #: Encoders whose feature claim includes their own temporal partition. Add a family only
 #: in its language PR, once its writer proves reconstructed support is range-seekable.
-CHUNK_GEOMETRY_ENCODERS = frozenset({"dart"})
+CHUNK_GEOMETRY_ENCODERS = frozenset({"dart", "typescript"})
+#: Encoders whose temporal partition may legitimately differ from the reference's, so
+#: `chunkIntervals` and `statistics.chunkCount` leave the comparison and
+#: `_check_chunk_geometry` stands in for them.
+#:
+#: This is a strictly weaker claim than agreeing with the reference, and it is deliberately
+#: *not* implied by being in `CHUNK_GEOMETRY_ENCODERS`. The self-consistency check proves an
+#: index is seekable; only the comparison proves two encoders partition a scene the same
+#: way, which is what §8 of AGENTS.md means by four SDKs behaving as one format. TypeScript
+#: reproduces the reference partition exactly, so it earns the geometry check without the
+#: exemption; Dart's writer chooses its own chunking preset and cannot.
+INDEPENDENT_CHUNK_LAYOUT_ENCODERS = frozenset({"dart"})
 #: Encoders whose Header and Statistics bounds are derived from their independently
 #: reconstructed positions. The geometry check proves those bounds contain exactly the
 #: public f32 state; an exact comparison with Rust's independently quantized positions would
@@ -794,7 +805,7 @@ def compare(
     check_chunk_geometry: bool = False,
     check_aabb_geometry: bool = False,
     normalize_capture_profile: bool = False,
-    candidate_family: str | None = None,
+    allow_independent_chunk_layout: bool = False,
 ) -> list[str]:
     """Prove one variant. Returns the known divergences it tolerated; raises on the rest."""
     ref_out = os.path.join(tmp, "reference.4dgs")
@@ -843,7 +854,7 @@ def compare(
         if check_aabb_geometry:
             for summary in (ref, cand):
                 summary.pop("statistics.aabb", None)
-        if check_chunk_geometry:
+        if allow_independent_chunk_layout:
             for summary in (ref, cand):
                 summary.pop("chunkIntervals", None)
                 summary.pop("statistics.chunkCount", None)
@@ -872,15 +883,6 @@ def compare(
             if allow_known_reference_divergences
             else None
         )
-        if note is None and candidate_family is not None:
-            note = known_candidate_divergence(
-                candidate_family,
-                variant,
-                ladder,
-                key,
-                cand.get(key),
-                ref.get(key),
-            )
         notes[key] = note
     unaccounted = {key: (ref.get(key), cand.get(key)) for key in differing if not notes.get(key)}
     if unaccounted:
@@ -994,8 +996,7 @@ def _check_summary_offset_geometry(
     index_declarations = [item for item in declared if item.group_opcode == opcode.CHUNK_INDEX]
     if require_chunk_index and len(index_declarations) != 1:
         raise AssertionError(
-            "an indexed Dart preset must declare exactly one Chunk Index Summary Offset; "
-            f"found {len(index_declarations)}"
+            f"an indexed candidate must declare exactly one Chunk Index Summary Offset; found {len(index_declarations)}"
         )
 
     seen: set[int] = set()
@@ -1208,6 +1209,33 @@ KNOWN_REFERENCE_DIVERGENCES = {
     ),
 }
 
+#: The keys two different reference encoders cannot agree on by construction, and should not:
+#: each names itself in `library`, and byte offsets follow from each one's own layout.
+REFERENCE_IDENTITY_KEYS = LAYOUT_DEPENDENT_KEYS
+
+
+def _fingerprint(value) -> str:
+    encoded = compact_json(value).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def known_reference_divergence(variant: str, ladder: str | None, field: str, python, rust) -> str | None:
+    expected = KNOWN_REFERENCE_DIVERGENCES.get((variant, ladder, field))
+    if expected is None:
+        return None
+    python_hash, rust_hash, note = expected
+    return note if (_fingerprint(python), _fingerprint(rust)) == (python_hash, rust_hash) else None
+
+
+def _semantic_bounds(bounds: dict[str, str]) -> dict[str, Decimal]:
+    """Compare decimal declarations by value, while retaining their exact key set.
+
+    The format stores strings so writers are not coupled to one language's float formatter.
+    `5e-05`, `5e-5`, and `0.00005` are one bound; a missing key or a different number is not.
+    """
+    return {key: Decimal(value) for key, value in bounds.items()}
+
+
 #: Temporary candidate-vs-reference divergences while the one-language #182(1) stack is
 #: in flight. The Rust layer corrects the shared reference before the independent
 #: TypeScript writer can follow, so that middle layer otherwise goes red for the old
@@ -1236,31 +1264,6 @@ KNOWN_CANDIDATE_DIVERGENCES = {
         "#182(1): the temporary TypeScript 6-chunk layout counted against the corrected Rust 5",
     ),
 }
-#: The keys two different reference encoders cannot agree on by construction, and should not:
-#: each names itself in `library`, and byte offsets follow from each one's own layout.
-REFERENCE_IDENTITY_KEYS = LAYOUT_DEPENDENT_KEYS
-
-
-def _fingerprint(value) -> str:
-    encoded = compact_json(value).encode()
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def known_reference_divergence(variant: str, ladder: str | None, field: str, python, rust) -> str | None:
-    expected = KNOWN_REFERENCE_DIVERGENCES.get((variant, ladder, field))
-    if expected is None:
-        return None
-    python_hash, rust_hash, note = expected
-    return note if (_fingerprint(python), _fingerprint(rust)) == (python_hash, rust_hash) else None
-
-
-def _semantic_bounds(bounds: dict[str, str]) -> dict[str, Decimal]:
-    """Compare decimal declarations by value, while retaining their exact key set.
-
-    The format stores strings so writers are not coupled to one language's float formatter.
-    `5e-05`, `5e-5`, and `0.00005` are one bound; a missing key or a different number is not.
-    """
-    return {key: Decimal(value) for key, value in bounds.items()}
 
 
 def known_candidate_divergence(
@@ -1878,6 +1881,7 @@ def run_encoder(encoder: str) -> int:
     check_chunk_geometry = encoder in CHUNK_GEOMETRY_ENCODERS
     check_aabb_geometry = encoder in AABB_GEOMETRY_ENCODERS
     normalize_capture_profile = encoder in CAPTURE_PROFILE_NORMALIZATION_ENCODERS
+    allow_independent_chunk_layout = encoder in INDEPENDENT_CHUNK_LAYOUT_ENCODERS
 
     agreed = graded = failed = tolerated = 0
     with tempfile.TemporaryDirectory() as tmp:
@@ -1898,7 +1902,7 @@ def run_encoder(encoder: str) -> int:
                         check_chunk_geometry,
                         check_aabb_geometry,
                         normalize_capture_profile,
-                        encoder,
+                        allow_independent_chunk_layout,
                     )
                 except (AssertionError, RuntimeError) as exc:
                     failed += 1

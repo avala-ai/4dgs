@@ -23,6 +23,18 @@ The four packages version together.
   number and spells its digits `[0-9]` rather than leaving `\d` to depend on a `/u` flag. Equivalent
   spellings such as `5e-05`, `5e-5` and `0.00005` remain one bound, and `0e999999999999999999999999`
   is still the zero it spells.
+- The Gaussian-birth writer plans chunks from reconstructed temporal values and contains the full
+  rounded-visible marginal plateau, so an indexed seek cannot miss a Gaussian that the complete
+  decoded state reports as visible at the same instant.
+- Summary Offsets emitted with Statistics now frame only the Chunk Index records they name.
+- Chunk containment is exact. The planner no longer admits a Gaussian into a chunk whose interval
+  ends up to `1e-9` before its support does, which left `chunksForTime` returning a chunk without a
+  Gaussian that `stateAt` reported visible at the same instant.
+
+### Changed
+
+- `encodeScene` refuses a `cutoff` outside `(0, 1]` instead of writing a file planned from a `NaN`
+  support half-width. A marginal threshold of zero or less has no logarithm to invert.
 
 ## [0.5.0] - 2026-08-12
 

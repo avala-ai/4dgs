@@ -36,10 +36,12 @@ import {
   poseAt,
   UnsupportedVersion,
   StreamDecoder,
+  assembleGaussians,
   audioSourceStateAt,
   bandCoefficientRange,
   decodeScene,
   encodeScene,
+  IndexedDecoder,
   checkMagic,
   coefficientsForDegree,
   coefficientsInBand,
@@ -688,6 +690,238 @@ test("the writer rejects an Object Track past the decoder sample ceiling", async
       }),
     /ObjectTrack for object 1 declares 1000001 samples, past the 1000000 ceiling/,
   );
+});
+
+function oneTemporalGaussian(muT: number, sigmaT: number, winHi = 1) {
+  return {
+    count: 1,
+    positions: [0, 0, 0],
+    scales: [0.01, 0.01, 0.01],
+    rotations: [0, 0, 0, 1],
+    colors: [0.5, 0.5, 0.5, 1],
+    motions: [0, 0, 0],
+    muT: [muT],
+    sigmaT: [sigmaT],
+    winLo: [0],
+    winHi: [winHi],
+  };
+}
+
+function adjacent(value: number, upward: boolean): number {
+  const view = new DataView(new ArrayBuffer(8));
+  view.setFloat64(0, value);
+  const bits = view.getBigUint64(0);
+  const increment = upward ? value > 0 : value < 0;
+  view.setBigUint64(0, increment ? bits + 1n : bits - 1n);
+  return view.getFloat64(0);
+}
+
+async function assertIndexedGaussianVisible(bytes: Uint8Array, t: number): Promise<void> {
+  const full = await decodeScene(new BytesReadable(bytes));
+  assert.equal(full.gaussians.stateAt(t, full.header.cutoff).indices.length, 1);
+  const indexed = await IndexedDecoder.open(new BytesReadable(bytes));
+  const covering = indexed.chunksForTime(t);
+  assert.equal(covering.length, 1, `no indexed chunk covers visible t=${t}`);
+  assert.equal((await indexed.readChunk(covering[0]!)).gaussians.count, 1);
+}
+
+test("chunk planning covers support after temporal quantization", async () => {
+  const cutoff = Math.exp(-0.5);
+  const gaussian = oneTemporalGaussian(0.2541, 0.2452);
+  const bytes = await encodeScene(gaussian, 1, {
+    cutoff,
+    maxDepth: 1,
+    minChunkGaussians: 1,
+  });
+  const decoded = await decodeScene(new BytesReadable(bytes));
+
+  assert.ok(gaussian.muT[0]! + gaussian.sigmaT[0]! < 0.5);
+  assert.ok(Math.abs(decoded.gaussians.muT[0]! - 0.256) < 1e-7);
+  assert.ok(Math.abs(decoded.gaussians.sigmaT[0]! - 0.25002763) < 1e-7);
+  await assertIndexedGaussianVisible(bytes, 0.5);
+});
+
+test("an inclusive support endpoint stays in an indexed half-open chunk", async () => {
+  const cutoff = Math.exp(-0.5);
+  const gaussian = oneTemporalGaussian(0.2541, 0.2452);
+  const seed = await encodeScene(gaussian, 1, { cutoff, maxDepth: 0 });
+  const reconstructed = await decodeScene(new BytesReadable(seed));
+  const boundary = reconstructed.gaussians.muT[0]! + reconstructed.gaussians.sigmaT[0]!;
+  const duration = 2 * boundary;
+  gaussian.winHi[0] = duration;
+
+  const bytes = await encodeScene(gaussian, duration, {
+    cutoff,
+    maxDepth: 1,
+    minChunkGaussians: 1,
+  });
+  const decoded = await decodeScene(new BytesReadable(bytes));
+  const mu = decoded.gaussians.muT[0]!;
+  const sigma = decoded.gaussians.sigmaT[0]!;
+  assert.equal(mu + sigma, boundary);
+  assert.ok(Math.exp(-0.5 * ((boundary - mu) / sigma) ** 2) >= cutoff);
+  await assertIndexedGaussianVisible(bytes, boundary);
+});
+
+test("rounded visibility below a lower support endpoint stays indexed", async () => {
+  const cutoff = 0.9;
+  const gaussian = oneTemporalGaussian(0.5, 1);
+  const seed = await encodeScene(gaussian, 1, { cutoff, maxDepth: 0 });
+  const reconstructed = await decodeScene(new BytesReadable(seed));
+  const mu = reconstructed.gaussians.muT[0]!;
+  const sigma = reconstructed.gaussians.sigmaT[0]!;
+  const boundary = mu - supportK(cutoff) * sigma;
+  const duration = 2 * boundary;
+  gaussian.winHi[0] = duration;
+
+  const bytes = await encodeScene(gaussian, duration, {
+    cutoff,
+    maxDepth: 1,
+    minChunkGaussians: 1,
+  });
+  const below = adjacent(boundary, false);
+  const z = (below - mu) / sigma;
+  assert.ok(Math.exp(-0.5 * z * z) >= cutoff);
+  await assertIndexedGaussianVisible(bytes, below);
+});
+
+test("cutoff one planning covers both binary64 neighbors of the mean", async () => {
+  const bytes = await encodeScene(oneTemporalGaussian(0.5, 0.1), 1, {
+    cutoff: 1,
+    maxDepth: 1,
+    minChunkGaussians: 1,
+  });
+  const decoded = await decodeScene(new BytesReadable(bytes));
+  const mean = decoded.gaussians.muT[0]!;
+
+  await assertIndexedGaussianVisible(bytes, adjacent(mean, false));
+  await assertIndexedGaussianVisible(bytes, adjacent(mean, true));
+});
+
+test("chunk planning covers a cancellation-prone rounded visibility endpoint", async () => {
+  const cutoff = 0.5;
+  const endpoint = 6_042_103.559_942_351;
+  const gaussian = oneTemporalGaussian(-6_222_906, 10_416_940, 20_000_000);
+  const bytes = await encodeScene(gaussian, 2 * endpoint, {
+    cutoff,
+    maxDepth: 1,
+    minChunkGaussians: 1,
+  });
+  const decoded = await decodeScene(new BytesReadable(bytes));
+  const mu = decoded.gaussians.muT[0]!;
+  const sigma = decoded.gaussians.sigmaT[0]!;
+  const z = (endpoint - mu) / Math.max(sigma, 1e-30);
+
+  assert.equal(mu, -6_222_906);
+  assert.equal(sigma, 10_416_940);
+  assert.equal(Math.exp(-0.5 * z * z), cutoff);
+  await assertIndexedGaussianVisible(bytes, endpoint);
+});
+
+/** Every gaussian `stateAt(t)` reports visible is reachable through the index at `t`. */
+async function assertIndexedStateAgrees(bytes: Uint8Array, t: number): Promise<void> {
+  const full = await decodeScene(new BytesReadable(bytes));
+  const expected = full.gaussians.stateAt(t, full.header.cutoff).indices.length;
+  assert.ok(expected > 0, `the scene must have something visible at t=${t} to prove anything`);
+  const indexed = await IndexedDecoder.open(new BytesReadable(bytes));
+  let reached = 0;
+  for (const entry of indexed.chunksForTime(t)) {
+    const chunk = await indexed.readChunk(entry);
+    // Assembled rather than counted by hand, so the indexed side answers "visible" with
+    // exactly the rule the streamed side used.
+    const seekable = assembleGaussians([chunk.gaussians], indexed.windows, 0);
+    reached += seekable.stateAt(t, full.header.cutoff).indices.length;
+  }
+  assert.equal(reached, expected, `the indexed seek at t=${t} reached ${reached} of ${expected}`);
+}
+
+test("top-level containment does not tolerate support past its t1", async () => {
+  // Gaussian 1 contributes an exact 0.5 top-level split but is absent at that instant. At
+  // cutoff one, gaussian 0 stays visible across a tiny rounded plateau around its mean,
+  // and its conservative upper support lands less than 1e-9 past that split. A containment
+  // test with 1e-9 of slack admits it into [0, 0.5), and then chunksForTime(0.5) returns a
+  // chunk without it while stateAt(0.5) still reports it visible.
+  //
+  // `sigmaT` is load-bearing, not decoration. The plateau's half-width is
+  // `supportK(nextDown(1)) * sigma`, and `supportK(nextDown(1))` is about 1.49e-8, so the
+  // endpoint lands inside a 1e-9 tolerance only while sigma stays under about 0.067. At
+  // `sigmaT = 0.1` it is 1.5e-9 past the split, wide enough that even a tolerant
+  // containment test rejects it and this stops proving anything.
+  const gaussians = {
+    count: 2,
+    positions: [0, 0, 0, 1, 0, 0],
+    scales: [0.01, 0.01, 0.01, 0.01, 0.01, 0.01],
+    rotations: [0, 0, 0, 1, 0, 0, 0, 1],
+    colors: [0.5, 0.5, 0.5, 1, 0.25, 0.25, 0.25, 1],
+    motions: [0, 0, 0, 0, 0, 0],
+    muT: [0.5, 0.25],
+    sigmaT: [0.05, Infinity],
+    winLo: [0, 0],
+    winHi: [1.0, 0.5],
+  };
+  const bytes = await encodeScene(gaussians, 1, {
+    cutoff: 1,
+    maxDepth: 1,
+    minChunkGaussians: 1,
+  });
+  await assertIndexedStateAgrees(bytes, 0.5);
+});
+
+test("the writer refuses a cutoff outside (0, 1]", async () => {
+  // `supportK` inverts `Math.log(cutoff)`. Zero and negative thresholds are a domain error
+  // there, and the NaN half-width that comes back does not stay loud: every containment
+  // comparison in `planChunks` goes false, the tree collapses into one degenerate node,
+  // and the Chunk Index stops being a partition anybody can seek with. A threshold outside
+  // (0, 1] is not a threshold; it is refused before it is inverted, the same domain and
+  // the same sentence as Python's `quantization.support_k` and Rust's `check_cutoff`.
+  for (const bad of [0, -0.05, 1.5, Infinity, NaN]) {
+    await assert.rejects(
+      () => encodeScene(oneTemporalGaussian(0.5, 0.1), 1, { cutoff: bad }),
+      /a marginal threshold must be in \(0, 1\]/,
+      `cutoff ${bad} must be refused`,
+    );
+  }
+});
+
+test("the smallest positive cutoff plans the whole timeline", async () => {
+  // The one legal threshold whose predecessor is zero, and so the boundary of the refusal
+  // above. There is no finite `supportK` to invert; the conservative bound is the whole
+  // timeline, not the NaN an unchecked negative predecessor would produce.
+  const bytes = await encodeScene(oneTemporalGaussian(0.5, 0.1), 1, {
+    cutoff: Number.MIN_VALUE,
+    maxDepth: 1,
+    minChunkGaussians: 1,
+  });
+  for (const t of [0, 0.25, 0.5, 0.75]) await assertIndexedGaussianVisible(bytes, t);
+});
+
+test("the Chunk Index Summary Offset excludes following Statistics", async () => {
+  const bytes = await encodeScene(oneTemporalGaussian(0.5, 0.1), 1, {
+    writeIndex: true,
+    writeStatistics: true,
+    writeSummaryOffsets: true,
+  });
+  const scene = await decodeScene(new BytesReadable(bytes));
+
+  assert.equal(scene.summaryOffsets.length, 1);
+  const summaryOffset = scene.summaryOffsets[0]!;
+  assert.equal(summaryOffset.groupOpcode, Opcode.ChunkIndex);
+  const group = bytes.subarray(
+    summaryOffset.groupStart,
+    summaryOffset.groupStart + summaryOffset.groupLength,
+  );
+  let offset = 0;
+  let records = 0;
+  while (offset < group.length) {
+    assert.equal(group[offset], Opcode.ChunkIndex);
+    const length = Number(
+      new DataView(group.buffer, group.byteOffset + offset + 1, 8).getBigUint64(0, true),
+    );
+    offset += 9 + length;
+    records++;
+  }
+  assert.equal(offset, group.length);
+  assert.ok(records > 0);
 });
 
 /** Little-endian record bytes for the trajectory tests below. */

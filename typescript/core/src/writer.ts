@@ -130,6 +130,45 @@ function supportK(cutoff: number): number {
 }
 
 /**
+ * Refuse a marginal threshold that is not one.
+ *
+ * A threshold outside `(0, 1]` is not a threshold, and it has to be refused here rather
+ * than become a domain error inside a logarithm. `supportK` inverts `Math.log(cutoff)`,
+ * so zero or a negative value yields `Infinity` or `NaN`, and neither stays loud: a `NaN`
+ * half-width makes every containment comparison in `planChunks` false, so the tree
+ * collapses into one degenerate node covering the whole clip and the Chunk Index stops
+ * being a partition anybody can seek with. Python refuses the same domain with the same
+ * sentence (`quantization.support_k`), and Rust with `check_cutoff`.
+ */
+function checkCutoff(cutoff: number): void {
+  if (!(cutoff > 0 && cutoff <= 1)) {
+    throw new Error(`the Header's cutoff is ${cutoff}; a marginal threshold must be in (0, 1]`);
+  }
+}
+
+const adjacentFloat = new DataView(new ArrayBuffer(8));
+
+/** The adjacent binary64 value toward positive infinity. */
+function nextUp(value: number): number {
+  if (Number.isNaN(value) || value === Infinity) return value;
+  if (value === 0) return Number.MIN_VALUE;
+  adjacentFloat.setFloat64(0, value);
+  const bits = adjacentFloat.getBigUint64(0);
+  adjacentFloat.setBigUint64(0, value > 0 ? bits + 1n : bits - 1n);
+  return adjacentFloat.getFloat64(0);
+}
+
+/** The adjacent binary64 value toward negative infinity. */
+function nextDown(value: number): number {
+  if (Number.isNaN(value) || value === -Infinity) return value;
+  if (value === 0) return -Number.MIN_VALUE;
+  adjacentFloat.setFloat64(0, value);
+  const bits = adjacentFloat.getBigUint64(0);
+  adjacentFloat.setBigUint64(0, value > 0 ? bits - 1n : bits + 1n);
+  return adjacentFloat.getFloat64(0);
+}
+
+/**
  * Round half to even, the rule every attribute grid but rotation uses.
  *
  * @internal shared with the `keyframe-delta` writer, so one arithmetic serves both
@@ -584,16 +623,34 @@ interface Plan {
   members: number[];
 }
 
-function support(g: GaussianInput, cutoff: number): { lo: number[]; hi: number[] } {
-  const k = supportK(cutoff);
-  const lo = new Array<number>(g.count);
-  const hi = new Array<number>(g.count);
-  for (let i = 0; i < g.count; i++) {
-    const sigma = g.sigmaT[i]!;
-    const mu = g.muT[i]!;
-    const half = Number.isFinite(sigma) ? k * sigma : Infinity;
-    lo[i] = Math.max(mu - half, g.winLo[i]!);
-    hi[i] = Math.min(mu + half, g.winHi[i]!);
+/** Containment bounds for the public temporal state this file reconstructs. */
+function planningSupport(q: Quantized, cutoff: number): { lo: number[]; hi: number[] } {
+  const lo = new Array<number>(q.mu.length);
+  const hi = new Array<number>(q.mu.length);
+  // `cutoff` is already known to be in `(0, 1]` (`checkCutoff`), so the predecessor is
+  // zero for exactly one input: the smallest positive subnormal. There the only finite
+  // conservative inverse is the whole timeline. Every other threshold has a positive
+  // predecessor and a real `supportK`.
+  const marginalFloor = nextDown(cutoff);
+  // `stateAt` rounds subtraction and division before the marginal comparison. Gamma(2)
+  // bounds those two binary64 operations in ratio space.
+  const unitRoundoff = Number.EPSILON / 2;
+  const arithmeticGuard = (2 * unitRoundoff) / (1 - 2 * unitRoundoff);
+  for (let i = 0; i < q.mu.length; i++) {
+    const neverFades = (q.flags[i]! & 1) !== 0;
+    const sigma = neverFades ? Infinity : Math.fround(Math.exp(q.sigma[i]! * q.steps.sigmaLog));
+    const tStep = muStep(q.sigma[i]!, q.steps.sigmaLog, neverFades, q.grid.stepTime);
+    const mu = Math.fround(q.mu[i]! * tStep);
+    const half =
+      neverFades || marginalFloor === 0
+        ? Infinity
+        : nextUp(supportK(marginalFloor) * Math.max(sigma, 1e-30) * (1 + arithmeticGuard));
+    const [storedLo, storedHi] = q.windows[q.windowIndex[i]!]!;
+    // Window records are f64, while the public GaussianSet lanes used by `stateAt` are f32.
+    const windowLo = Math.fround(storedLo);
+    const windowHi = Math.fround(storedHi);
+    lo[i] = Math.max(nextDown(mu - half), windowLo);
+    hi[i] = Math.min(nextUp(mu + half), windowHi);
   }
   return { lo, hi };
 }
@@ -640,8 +697,13 @@ function planChunks(
     const a = tops[w]!;
     const b = tops[w + 1]!;
     const pool: number[] = [];
+    // Exact containment, with no tolerance either side. A chunk's `[t0, t1)` is the whole
+    // promise an indexed seek reads: support that reaches 1e-9 past `t1` is support the
+    // chunk does not cover, and admitting it makes `chunksForTime(t1)` return a chunk that
+    // omits a gaussian `stateAt(t1)` reports visible. The bounds arriving here are already
+    // directed outwards by `planningSupport`, so slack here would only undo that.
     for (let i = 0; i < n; i++) {
-      if (lo[i]! >= a - 1e-9 && hi[i]! <= b + 1e-9 && assigned[i] === -1) pool.push(i);
+      if (lo[i]! >= a && hi[i]! <= b && assigned[i] === -1) pool.push(i);
     }
     const kept = descend(a, b, 0, pool);
     if (kept.length > 0) {
@@ -800,6 +862,7 @@ export async function encodeScene(
   options: WriteOptions = {},
 ): Promise<Uint8Array> {
   const cutoff = options.cutoff ?? 0.05;
+  checkCutoff(cutoff);
   const maxDepth = options.maxDepth ?? 6;
   const minChunk = options.minChunkGaussians ?? 2048;
   const writeIndex = options.writeIndex ?? true;
@@ -847,7 +910,7 @@ export async function encodeScene(
   let topsArr = Array.from(tops).sort((a, b) => a - b);
   if (topsArr.length < 2) topsArr = [0, Math.max(durationSec, 1e-9)];
 
-  const { lo, hi } = support(gaussians, cutoff);
+  const { lo, hi } = planningSupport(q, cutoff);
   let plans = n === 0 ? [] : planChunks(lo, hi, topsArr, maxDepth, minChunk);
   if (n > 0 && plans.length === 0) {
     plans = [
@@ -1044,6 +1107,7 @@ export async function encodeScene(
       }
       out.bytes(record(OP_CHUNK_INDEX, e.finish()));
     }
+    const indexGroupLength = out.length - groupStart;
     if (writeStatistics) {
       const s = new ByteWriter();
       s.u64(n);
@@ -1057,7 +1121,7 @@ export async function encodeScene(
       const s = new ByteWriter();
       s.u8(OP_CHUNK_INDEX);
       s.u64(groupStart);
-      s.u64(out.length - groupStart);
+      s.u64(indexGroupLength);
       out.bytes(record(OP_SUMMARY_OFFSET, s.finish()));
     }
     summaryLen = out.length - summaryStart;
