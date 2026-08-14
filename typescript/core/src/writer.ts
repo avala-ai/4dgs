@@ -697,8 +697,13 @@ function planChunks(
     const a = tops[w]!;
     const b = tops[w + 1]!;
     const pool: number[] = [];
+    // Exact containment, with no tolerance either side. A chunk's `[t0, t1)` is the whole
+    // promise an indexed seek reads: support that reaches 1e-9 past `t1` is support the
+    // chunk does not cover, and admitting it makes `chunksForTime(t1)` return a chunk that
+    // omits a gaussian `stateAt(t1)` reports visible. The bounds arriving here are already
+    // directed outwards by `planningSupport`, so slack here would only undo that.
     for (let i = 0; i < n; i++) {
-      if (lo[i]! >= a - 1e-9 && hi[i]! <= b + 1e-9 && assigned[i] === -1) pool.push(i);
+      if (lo[i]! >= a && hi[i]! <= b && assigned[i] === -1) pool.push(i);
     }
     const kept = descend(a, b, 0, pool);
     if (kept.length > 0) {

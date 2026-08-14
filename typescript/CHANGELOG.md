@@ -14,6 +14,9 @@ The four packages version together.
   rounded-visible marginal plateau, so an indexed seek cannot miss a Gaussian that the complete
   decoded state reports as visible at the same instant.
 - Summary Offsets emitted with Statistics now frame only the Chunk Index records they name.
+- Chunk containment is exact. The planner no longer admits a Gaussian into a chunk whose interval
+  ends up to `1e-9` before its support does, which left `chunksForTime` returning a chunk without a
+  Gaussian that `stateAt` reported visible at the same instant.
 
 ### Changed
 
