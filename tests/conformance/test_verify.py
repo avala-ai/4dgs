@@ -438,6 +438,11 @@ def test_adversarial_order_cases_are_encoded_corpus_variants():
     content_sum = "ObjectContentOrderSum-UseChunkIndex-UseCrc"
 
     assert variants[tied] == variants[reordered]
+    tied_summary = json.loads(variants[tied])
+    assert tied_summary["states"][1]["sample"]["positions"] == [
+        [-1e-6, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+    ]
     content_summary = json.loads(variants[content_sum])
     assert content_summary["states"][1]["sample"]["objectIds"] == ["1", "2", "3"]
     assert content_summary["states"][1]["aggregate"]["positionSum"] == [3.25, 0.0, 0.0]

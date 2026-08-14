@@ -807,12 +807,22 @@ def _obj_track_composed() -> tuple[fourdgs.GaussianSet, ObjectLayer]:
 
 
 def _obj_fixture_layer(label: str) -> ObjectLayer:
-    """One inert object record for canonical-order arithmetic fixtures."""
+    """One fixed half-turn track that opposes stored and emitted tie order."""
     return ObjectLayer(
         table=ObjectTable(
             embedding_dim=0,
             entries=[ObjectTableEntry(object_id=7, label=label, anchor=(0.0, 0.0, 0.0))],
-        )
+        ),
+        tracks=[
+            ObjectTrack(
+                object_id=7,
+                times=[0.0, _OBJ_DURATION],
+                # A half-turn around Z reverses X.  Exact ascending motion order is
+                # therefore the opposite of the rounded composed-state order.
+                rotations=[[0.0, 0.0, 1.0, 0.0]] * 2,
+                translations=[[0.0, 0.0, 0.0]] * 2,
+            )
+        ],
     )
 
 
@@ -930,7 +940,13 @@ def build_object_corpus() -> list[tuple[str, bytes, str]]:
             if len(keys) != 2 or keys[0] != keys[1]:
                 raise AssertionError(f"{name}: the adversarial primary keys do not tie")
             state = scene.gaussians.state_at(0.5 * _OBJ_DURATION, scene.header.cutoff)
-            resident_tie_rows[name] = [[canonical_module.num(v) for v in row] for row in state["centers"]]
+            centers, _ = scene.objects.apply(
+                centers=state["centers"],
+                orientations=state["orientations"],
+                object_ids=state["object_id"],
+                t=0.5 * _OBJ_DURATION,
+            )
+            resident_tie_rows[name] = [[canonical_module.num(v) for v in row] for row in centers]
         # The same full summarize the runners call, so the committed expectation matches what
         # a decoder prints — a file written with a CRC and an index reports `summaryCrcOk`
         # and chunk intervals, and omitting those here would diff against every runner.
