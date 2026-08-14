@@ -158,6 +158,17 @@ CAPTURE_PROFILE_NORMALIZATION_ENCODERS = frozenset({"dart"})
 #: Encoders whose feature claim includes their own temporal partition. Add a family only
 #: in its language PR, once its writer proves reconstructed support is range-seekable.
 CHUNK_GEOMETRY_ENCODERS = frozenset({"dart", "typescript"})
+#: Encoders whose temporal partition may legitimately differ from the reference's, so
+#: `chunkIntervals` and `statistics.chunkCount` leave the comparison and
+#: `_check_chunk_geometry` stands in for them.
+#:
+#: This is a strictly weaker claim than agreeing with the reference, and it is deliberately
+#: *not* implied by being in `CHUNK_GEOMETRY_ENCODERS`. The self-consistency check proves an
+#: index is seekable; only the comparison proves two encoders partition a scene the same
+#: way, which is what §8 of AGENTS.md means by four SDKs behaving as one format. TypeScript
+#: reproduces the reference partition exactly, so it earns the geometry check without the
+#: exemption; Dart's writer chooses its own chunking preset and cannot.
+INDEPENDENT_CHUNK_LAYOUT_ENCODERS = frozenset({"dart"})
 #: Encoders whose Header and Statistics bounds are derived from their independently
 #: reconstructed positions. The geometry check proves those bounds contain exactly the
 #: public f32 state; an exact comparison with Rust's independently quantized positions would
@@ -793,6 +804,7 @@ def compare(
     check_chunk_geometry: bool = False,
     check_aabb_geometry: bool = False,
     normalize_capture_profile: bool = False,
+    allow_independent_chunk_layout: bool = False,
 ) -> list[str]:
     """Prove one variant. Returns the known divergences it tolerated; raises on the rest."""
     ref_out = os.path.join(tmp, "reference.4dgs")
@@ -841,7 +853,7 @@ def compare(
         if check_aabb_geometry:
             for summary in (ref, cand):
                 summary.pop("statistics.aabb", None)
-        if check_chunk_geometry:
+        if allow_independent_chunk_layout:
             for summary in (ref, cand):
                 summary.pop("chunkIntervals", None)
                 summary.pop("statistics.chunkCount", None)
@@ -1767,6 +1779,7 @@ def run_encoder(encoder: str) -> int:
     check_chunk_geometry = encoder in CHUNK_GEOMETRY_ENCODERS
     check_aabb_geometry = encoder in AABB_GEOMETRY_ENCODERS
     normalize_capture_profile = encoder in CAPTURE_PROFILE_NORMALIZATION_ENCODERS
+    allow_independent_chunk_layout = encoder in INDEPENDENT_CHUNK_LAYOUT_ENCODERS
 
     agreed = graded = failed = tolerated = 0
     with tempfile.TemporaryDirectory() as tmp:
@@ -1787,6 +1800,7 @@ def run_encoder(encoder: str) -> int:
                         check_chunk_geometry,
                         check_aabb_geometry,
                         normalize_capture_profile,
+                        allow_independent_chunk_layout,
                     )
                 except (AssertionError, RuntimeError) as exc:
                     failed += 1
