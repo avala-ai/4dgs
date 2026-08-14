@@ -1,7 +1,7 @@
 {
   "aggregate": {
     "neverFadesCount": "0",
-    "opacitySum": 7.215686,
+    "opacitySum": 7.215688,
     "positionSum": [
       12.0,
       9.0,
@@ -522,7 +522,7 @@
   "states": [
     {
       "aggregate": {
-        "opacitySum": 7.215686,
+        "opacitySum": 7.215688,
         "positionSum": [
           12.0,
           13.0,
@@ -638,7 +638,7 @@
     },
     {
       "aggregate": {
-        "opacitySum": 7.214211,
+        "opacitySum": 7.214208,
         "positionSum": [
           15.0,
           14.0,
@@ -754,7 +754,7 @@
     },
     {
       "aggregate": {
-        "opacitySum": 7.209788,
+        "opacitySum": 7.209792,
         "positionSum": [
           15.999998,
           17.000001,

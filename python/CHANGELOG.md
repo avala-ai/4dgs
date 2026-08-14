@@ -6,7 +6,17 @@ All notable changes to the Python package are documented here, following
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-13
+
 ### Fixed
+
+- **Validity-window comparisons retain their f64 wire precision.** Decoding narrowed Window Table
+  endpoints to f32, turning a large finite upper bound into infinity, while `GaussianSet.state_at`
+  compared caller-constructed f32 windows directly with an f64 query. Readers now retain decoded
+  endpoints as f64 and comparisons widen caller-provided arrays, so a query after a large finite
+  window is excluded and an infinite window remains live at huge finite times. Finite inputs that
+  reconstruct a non-finite center at an extreme time remain a valid state whose canonical scalar is
+  `null`.
 
 - **`4dgs validate` counts distinct gaussian ids in one decode of the file, not a hundred.** The
   count is bounded-memory by design — a set of every id ever seen grows with cumulative births — and
@@ -16,29 +26,31 @@ All notable changes to the Python package are documented here, following
   number of distinct ids: a 400,000-id sequence took 40 complete decodes, and a 4M-id capture well
   over a hundred, which is a validate that runs for hours and looks hung. It now makes one pass and
   keeps the ids it is counting, four bytes each. On a 1.3 MiB, 400,000-id file: 6.1s to 0.4s.
+  Sequences past the declared one-pass ceiling fall back to the old exact partitioned rescan, so
+  bounded memory never makes validation skip identity reuse or the Header's required distinct-count
+  comparison.
 
 ### Changed
 
 - **`count_distinct_ids_bounded` bounds itself by a declared ceiling rather than a fixed budget.**
   Its `capacity` argument, which sized one partition, is now `max_distinct_ids`, which is the number
   of distinct ids it will count before refusing — 8,388,608 by default, 32 MiB of identities. Exact
-  distinct counting cannot be done in fixed space, and the second thing this function decides,
-  whether an id died and came back, rules out the probabilistic estimators that can. So the honest
-  bound is one this module declares, never one the file's own contents choose (AGENTS.md §1).
+  one-pass distinct counting cannot be done in fixed space, and the second thing this function
+  decides, whether an id died and came back, rules out the probabilistic estimators that can. So the
+  honest bound is one this module declares, never one the file's own contents choose (AGENTS.md §1).
 
 ### Added
 
 - **`ExceedsReaderLimit`**, for a legal file whose scale is past a ceiling a reader states in
-  advance. Distinct from a malformed file, and reported as such: a sequence carrying more distinct
-  gaussian ids than the validator counts is not thereby invalid, so it collects a warning saying
-  which check went unmade rather than an error saying the file is broken.
+  advance. Distinct from a malformed file, and reported as such by the standalone bounded counter.
+  Validation cannot leave a required check unmade, so it changes strategy at that point instead of
+  treating the limit as a finding about the file.
 
   Reuse is tested as the pass reaches each state, before that state's ceiling check, so an earlier
-  reuse is not hidden by a later limit and is refused at the chunk where it appears. Once the limit
-  is passed the reader cannot audit later reuse exactly; the validation warning names that check as
-  incomplete along with the distinct count. The first version consulted the ceiling before testing
-  the state that crossed it, which made even an already-observed reuse unreachable and reported that
-  §11.2 violation as valid, exit 0.
+  reuse is not hidden by a later limit and is refused at the chunk where it appears. Validation then
+  uses a fixed-capacity partitioned rescan if the one-pass audit crosses its limit; reuse after that
+  point and the Header's distinct-count claim still receive exact answers. The first version stopped
+  both checks at the ceiling and could report a later §11.2 violation as valid, exit 0.
 
 ## [0.4.0] - 2026-08-12
 

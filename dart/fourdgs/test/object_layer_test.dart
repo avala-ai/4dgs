@@ -461,12 +461,14 @@ void main() {
     );
     final layer = FourdgsObjectLayer(tracks: <FourdgsObjectTrack>[empty]);
     expect(layer.poseAt(7, 0), isNull);
+    expect(layer.isEmpty, isTrue);
   });
 
   test('a zero-sample object track is read as absent rather than refused', () {
     // The same sentence as section 5.15.4, in section 5.15.7, for the object
-    // layer. Kept, one empty track would make a non-empty object layer and two
-    // empty tracks for an id would be a duplicate check() refuses.
+    // layer. An empty track is absent from layer identity as well as pose
+    // sampling; duplicate empty records therefore cannot create two live
+    // motions for one object.
     final body = Uint8List.fromList(<int>[7, 0, 0, 0, 7, 0, 0, 0, 0]);
     expect(FourdgsObjectTrack.parse(body).sampleCount, 0);
     expect(
@@ -680,6 +682,21 @@ void main() {
       ),
       throwsA(isA<FourdgsMalformedFile>()),
     );
+  });
+
+  test('an empty-track-only layer composes without scanning gaussian ids', () {
+    final emptyTrack = FourdgsObjectTrack.parse(
+      (_Bytes()
+            ..u32(7)
+            ..u8(0)
+            ..u32(0))
+          .done(),
+    );
+    final layer = FourdgsObjectLayer(tracks: <FourdgsObjectTrack>[emptyTrack]);
+    final centers = Float64List.fromList(<double>[1, 0, 0]);
+    final orientations = Float64List.fromList(<double>[0, 0, 0, 1]);
+    layer.apply(centers, orientations, Int32List.fromList(<int>[7]), 2);
+    expect(centers, <double>[1, 0, 0]);
   });
 
   test('a dynamics tuple of the wrong length is a malformed file', () {

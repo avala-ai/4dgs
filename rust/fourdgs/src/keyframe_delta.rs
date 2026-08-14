@@ -125,8 +125,11 @@ pub fn keyframe_state(ids: Vec<i64>, bins: BTreeMap<u8, BinArray>) -> Result<Sta
                 ),
             );
         }
+        check_absolute_bins(*attribute, values, "a keyframe")?;
     }
-    Ok(State { ids, bins })
+    let state = State { ids, bins };
+    check_rotation_indexes(&state)?;
+    Ok(state)
 }
 
 /// Compose one delta onto the state it references.
@@ -146,6 +149,24 @@ pub fn apply_delta(
     check_unique(update_ids, "an update group")?;
     check_unique(birth_ids, "a birth group")?;
     check_unique(death_ids, "a death group")?;
+
+    let has_rotation_index = update_bins.contains_key(&op::A_ROTATION_INDEX);
+    let has_rotation = update_bins.contains_key(&op::A_ROTATION);
+    if has_rotation_index != has_rotation {
+        return refuse(
+            "incomplete-rotation-update",
+            "an update must carry rotation_index and rotation together; smallest-three rotation restates the pair absolutely"
+                .into(),
+        );
+    }
+    for attribute in ABSOLUTE_IN_UPDATE {
+        if let Some(values) = update_bins.get(&attribute) {
+            check_absolute_bins(attribute, values, "an absolute update")?;
+        }
+    }
+    for (attribute, values) in birth_bins {
+        check_absolute_bins(*attribute, values, "a birth group")?;
+    }
 
     for attribute in update_bins.keys() {
         if is_gop_invariant(*attribute) {
@@ -313,7 +334,43 @@ pub fn apply_delta(
         state.bins = merged;
     }
 
+    check_rotation_indexes(&state)?;
     Ok(state)
+}
+
+fn check_absolute_bins(attribute: u8, values: &BinArray, what: &str) -> Result<(), Refusal> {
+    if let Some(value) = values
+        .values
+        .iter()
+        .find(|value| !(BIN_MIN..=BIN_MAX).contains(value))
+    {
+        return refuse(
+            "bin-overflow",
+            format!(
+                "{what} carries absolute attribute {attribute} bin {value}, outside the signed 32-bit range"
+            ),
+        );
+    }
+    Ok(())
+}
+
+fn check_rotation_indexes(state: &State) -> Result<(), Refusal> {
+    let Some(indexes) = state.bins.get(&op::A_ROTATION_INDEX) else {
+        return Ok(());
+    };
+    if let Some(row) = indexes
+        .values
+        .iter()
+        .position(|index| !(0..=3).contains(index))
+    {
+        let index = indexes.values[row];
+        let identity = state.ids.get(row).copied().unwrap_or(row as i64);
+        return refuse(
+            "rotation-index-out-of-range",
+            format!("gaussian id {identity} carries rotation_index {index}; expected 0..3"),
+        );
+    }
+    Ok(())
 }
 
 /// A new state holding only the named rows of `state`, in `keep` order.

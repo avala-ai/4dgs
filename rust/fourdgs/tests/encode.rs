@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 
 use fourdgs::model::{AudioSource, AudioSourceKeyframe, AudioTrack, GaussianSet};
 use fourdgs::quantization::Profile;
+use fourdgs::records::{ObjectTable, ObjectTableEntry};
 use fourdgs::writer::{SceneExtras, WriteOptions};
 
 /// A deterministic scene with mixed temporal behaviour: some gaussians fade, some never
@@ -172,6 +173,170 @@ fn a_scene_with_no_gaussians_is_a_valid_file() {
     assert_eq!(scene.gaussians.count(), 0);
     assert!(scene.chunk_index.is_empty(), "no gaussians means no chunks");
     assert!(!scene.header.has_audio());
+}
+
+fn object_table_record(ids: &[u32]) -> Vec<u8> {
+    ObjectTable {
+        entries: ids
+            .iter()
+            .map(|object_id| ObjectTableEntry {
+                object_id: *object_id,
+                label: format!("object {object_id}"),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    }
+    .encode(&[])
+    .expect("valid Object Table")
+}
+
+#[test]
+fn objects_profile_requires_an_object_table() {
+    let (mut g, duration) = scene(8);
+    g.object_id = Some(vec![7; g.count()]);
+    let err = fourdgs::write_to_vec(
+        &g,
+        duration,
+        &WriteOptions {
+            scene_profile: "objects".into(),
+            ..chunking_options()
+        },
+        &SceneExtras::default(),
+    )
+    .expect_err("an objects-profile file without its one Object Table must be refused");
+    assert!(
+        err.to_string()
+            .contains("the objects profile requires one ObjectTable record"),
+        "{err}"
+    );
+}
+
+#[test]
+fn objects_profile_requires_object_ids_in_every_non_empty_chunk() {
+    let (g, duration) = scene(8);
+    let err = fourdgs::write_to_vec(
+        &g,
+        duration,
+        &WriteOptions {
+            scene_profile: "objects".into(),
+            extra_records: vec![object_table_record(&[7])],
+            ..chunking_options()
+        },
+        &SceneExtras::default(),
+    )
+    .expect_err("a non-empty objects-profile chunk without object_id must be refused");
+    assert!(
+        err.to_string()
+            .contains("the objects profile requires an object_id stream in every non-empty chunk"),
+        "{err}"
+    );
+}
+
+#[test]
+fn object_ids_round_trip_across_the_complete_u32_domain() {
+    let (mut g, duration) = scene(32);
+    let labels = [0, 7, i32::MAX as u32, i32::MAX as u32 + 1, u32::MAX];
+    let object_ids: Vec<u32> = (0..g.count()).map(|i| labels[i % labels.len()]).collect();
+    // A unique, exactly representable x coordinate makes membership association observable
+    // after the writer's Morton permutation, rather than checking only an id multiset.
+    for i in 0..g.count() {
+        g.positions[i * 3] = i as f32;
+    }
+    g.object_id = Some(object_ids.clone());
+    let bytes = fourdgs::write_to_vec(
+        &g,
+        duration,
+        &WriteOptions {
+            scene_profile: "objects".into(),
+            extra_records: vec![object_table_record(&labels[1..])],
+            ..chunking_options()
+        },
+        &SceneExtras::default(),
+    )
+    .expect("encode object membership");
+    let decoded = fourdgs::read_bytes(&bytes).expect("decode object membership");
+
+    let actual = decoded
+        .gaussians
+        .object_id
+        .expect("every non-empty Chunk carries object_id");
+    for (row, actual_id) in actual.iter().enumerate() {
+        let source = decoded.gaussians.positions[row * 3].round() as usize;
+        assert!(source < object_ids.len(), "decoded x names source {source}");
+        assert_eq!(
+            *actual_id, object_ids[source],
+            "object membership moved off source gaussian {source}"
+        );
+    }
+    assert!(decoded.objects.table.is_some(), "the Object Table survives");
+}
+
+#[test]
+fn object_id_count_must_match_the_gaussian_count() {
+    let (mut g, duration) = scene(8);
+    g.object_id = Some(vec![7; g.count() - 1]);
+    let err = fourdgs::write_to_vec(
+        &g,
+        duration,
+        &WriteOptions::default(),
+        &SceneExtras::default(),
+    )
+    .expect_err("an incomplete exact-label lane must be refused before chunk gathering");
+    assert!(
+        err.to_string()
+            .contains("object_id has 7 values, expected 8"),
+        "{err}"
+    );
+}
+
+#[test]
+fn objects_profile_refuses_a_second_object_table() {
+    let (mut g, duration) = scene(8);
+    g.object_id = Some(vec![7; g.count()]);
+    let table = object_table_record(&[7]);
+    let err = fourdgs::write_to_vec(
+        &g,
+        duration,
+        &WriteOptions {
+            scene_profile: "objects".into(),
+            extra_records: vec![table.clone(), table],
+            ..chunking_options()
+        },
+        &SceneExtras::default(),
+    )
+    .expect_err("the objects profile promises exactly one Object Table");
+    assert!(
+        err.to_string().contains(
+            "the objects profile requires exactly one ObjectTable record; 2 were supplied"
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn objects_profile_refuses_a_malformed_object_table() {
+    let (mut g, duration) = scene(8);
+    g.object_id = Some(vec![7; g.count()]);
+    let mut malformed = Vec::new();
+    fourdgs::serialization::put_record(&mut malformed, fourdgs::opcode::OBJECT_TABLE, &[]);
+    let err = fourdgs::write_to_vec(
+        &g,
+        duration,
+        &WriteOptions {
+            scene_profile: "objects".into(),
+            extra_records: vec![malformed],
+            ..chunking_options()
+        },
+        &SceneExtras::default(),
+    )
+    .expect_err("a framed opcode is not enough; the promised Object Table must parse");
+    assert!(
+        err.to_string().contains(
+            "extra_records[0] carries a malformed ObjectTable: truncated: need 4 bytes at offset 0"
+        ),
+        "{err}"
+    );
 }
 
 #[test]

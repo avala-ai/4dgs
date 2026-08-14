@@ -187,6 +187,14 @@ struct Quantized {
 /// false so the gaussian silently never appears.
 fn check_finite_input(g: &GaussianSet) -> Result<()> {
     let n = g.count();
+    if let Some(object_ids) = &g.object_id {
+        if object_ids.len() != n {
+            return Err(Error::InvalidInput(format!(
+                "object_id has {} values, expected {n}; there must be one exact u32 label per gaussian",
+                object_ids.len()
+            )));
+        }
+    }
     if n == 0 {
         return Ok(());
     }
@@ -224,6 +232,40 @@ fn check_finite_input(g: &GaussianSet) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Count Object Table records in the already-framed extension records without buffering or
+/// interpreting their content. The `objects` profile makes their count normative, so an
+/// incomplete extra record cannot be allowed to hide or counterfeit the one required table.
+fn extra_object_table_count(records: &[Vec<u8>]) -> Result<usize> {
+    let mut count = 0usize;
+    for (blob_index, blob) in records.iter().enumerate() {
+        let mut framed = crate::serialization::Records::new(blob, 0);
+        for record in framed.by_ref() {
+            let record = record.map_err(|error| {
+                Error::InvalidInput(format!(
+                    "extra_records[{blob_index}] is not a complete framed record: {error}"
+                ))
+            })?;
+            if record.opcode == op::OBJECT_TABLE {
+                rec::ObjectTable::parse(record.content).map_err(|error| {
+                    Error::InvalidInput(format!(
+                        "extra_records[{blob_index}] carries a malformed ObjectTable: {error}"
+                    ))
+                })?;
+                count = count.checked_add(1).ok_or_else(|| {
+                    Error::InvalidInput("the number of ObjectTable records overflows usize".into())
+                })?;
+            }
+        }
+        if framed.position() != blob.len() {
+            return Err(Error::InvalidInput(format!(
+                "extra_records[{blob_index}] contains {} trailing bytes that do not form a complete record",
+                blob.len() - framed.position()
+            )));
+        }
+    }
+    Ok(count)
 }
 
 fn quantize_scene(g: &GaussianSet, opts: &WriteOptions) -> Result<Quantized> {
@@ -619,6 +661,30 @@ fn encode(
     extras: &SceneExtras,
 ) -> Result<Vec<u8>> {
     let n = g.count();
+    if opts.scene_profile == "objects" {
+        if n > 0 && g.object_id.is_none() {
+            return Err(Error::InvalidInput(
+                "the objects profile requires an object_id stream in every non-empty chunk, \
+                 but the GaussianSet carries none"
+                    .into(),
+            ));
+        }
+        let table_count = extra_object_table_count(&opts.extra_records)?;
+        match table_count {
+            1 => {}
+            0 => {
+                return Err(Error::InvalidInput(
+                    "the objects profile requires one ObjectTable record, but none was supplied"
+                        .into(),
+                ))
+            }
+            count => {
+                return Err(Error::InvalidInput(format!(
+                    "the objects profile requires exactly one ObjectTable record; {count} were supplied"
+                )))
+            }
+        }
+    }
     let q = quantize_scene(g, opts)?;
     let audio_sources = normalized_audio_sources(extras, duration_sec)?;
 
@@ -863,6 +929,24 @@ fn encode(
         ] {
             streams.extend_from_slice(&encode_stream(
                 attribute, &values, channels, opts.codec, opts.level, true,
+            )?);
+        }
+        if let Some(object_ids) = &g.object_id {
+            // Attribute streams carry signed symbols. Reinterpret, rather than convert,
+            // each exact u32 label through i32 so values above i32::MAX retain all bits.
+            // Delta coding is disabled because crossing the signed bridge can need a
+            // 33-bit delta even though every raw code is exactly 32 bits.
+            let values: Vec<i64> = members
+                .iter()
+                .map(|&i| i32::from_le_bytes(object_ids[i].to_le_bytes()) as i64)
+                .collect();
+            streams.extend_from_slice(&encode_stream(
+                op::A_OBJECT_ID,
+                &values,
+                1,
+                opts.codec,
+                opts.level,
+                false,
             )?);
         }
 
@@ -1117,6 +1201,25 @@ fn verify_chunk(
     };
 
     for (row, i) in members.iter().enumerate() {
+        match (&g.object_id, &decoded.object_id) {
+            (Some(expected), Some(actual)) if actual[row] == expected[*i] => {}
+            (Some(expected), Some(actual)) => {
+                return Err(Error::BoundViolation(format!(
+                "encoder verification failed: object_id for gaussian {i} became {} instead of {}",
+                actual[row], expected[*i]
+            )))
+            }
+            (Some(_), None) => {
+                return Err(Error::BoundViolation(format!(
+                    "encoder verification failed: object_id for gaussian {i} was omitted"
+                )))
+            }
+            (None, Some(_)) => return Err(Error::BoundViolation(
+                "encoder verification failed: object_id was invented for a scene that carried none"
+                    .into(),
+            )),
+            (None, None) => {}
+        }
         for axis in 0..3 {
             update(
                 "pos",

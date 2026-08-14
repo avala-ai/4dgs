@@ -20,6 +20,7 @@ import json
 import os
 import struct
 import sys
+from decimal import InvalidOperation
 from types import SimpleNamespace
 
 import numpy as np
@@ -31,6 +32,8 @@ sys.path.insert(0, HERE)
 import canonical
 import encode_roundtrip
 import generate
+import json_compare
+import run as conformance_run
 
 # `generate` puts `python/fourdgs` on the path as it imports, which is why this follows it.
 from fourdgs import keyframe_delta_file as kdf
@@ -40,6 +43,170 @@ from fourdgs.records import Header
 #: The expectation the signed zero was found in (#153): two composed values at the noise
 #: floor, which round to `-0.0` where the arithmetic lands a hair below zero.
 COMPOSED = "object/ObjectTrackComposed-UseChunkIndex-UseCrc"
+
+
+class TestExactAggregateTransition:
+    @staticmethod
+    def _summary():
+        return {
+            "aggregate": {
+                "positionSum": [1.0, 2.0, 3.0],
+                "opacitySum": 4.0,
+                "neverFadesCount": "5",
+                "zeroMotionCount": "6",
+            },
+            "camera": {"fovYDeg": 60.0},
+            "objects": {"table": [{"objectId": "7"}]},
+            "states": [
+                {
+                    "t": 7.0,
+                    "liveCount": "8",
+                    "aggregate": {
+                        "positionSum": [9.0, 10.0, 11.0],
+                        "opacitySum": 12.0,
+                        "contributingCount": "9",
+                    },
+                    "sample": {"positions": [[13.0, 14.0, 15.0]]},
+                }
+            ],
+        }
+
+    def test_only_root_and_state_exact_totals_are_transitional(self):
+        expected = self._summary()
+        actual = self._summary()
+        actual["aggregate"]["positionSum"] = [100.0, 200.0, 300.0]
+        actual["aggregate"]["opacitySum"] = 400.0
+        actual["states"][0]["aggregate"].update({"positionSum": [0.0, 0.0, 0.0], "opacitySum": 0.0})
+
+        assert json_compare.without_exact_aggregates(actual) == json_compare.without_exact_aggregates(expected)
+        assert actual["aggregate"]["positionSum"] == [100.0, 200.0, 300.0], "the helper must not mutate runner output"
+
+    def test_dart_child_claims_only_its_proved_implementations(self):
+        proved_families = frozenset({"dart", "python", "rust", "typescript"})
+        assert conformance_run.EXACT_AGGREGATE_FAMILIES == proved_families
+        assert conformance_run.CANONICAL_STATE_ORDER_FAMILIES == proved_families
+
+    def test_only_exact_aggregate_tokens_use_lossless_decimal_equality(self):
+        expected = json_compare.loads(
+            '{"durationSec":9007199254740992.0,"aggregate":{"opacitySum":9007199254740992.0}}'
+        )
+        actual = json_compare.loads('{"durationSec":9007199254740993.0,"aggregate":{"opacitySum":9007199254740993.0}}')
+
+        # The two duration spellings narrow to the same binary64 value, as ordinary
+        # canonical fields always have. Exact aggregate units must retain the one-unit gap.
+        assert json_compare.for_capabilities(
+            actual, exact_aggregates=False, canonical_state_order=True
+        ) == json_compare.for_capabilities(expected, exact_aggregates=False, canonical_state_order=True)
+        assert json_compare.for_capabilities(
+            actual, exact_aggregates=True, canonical_state_order=True
+        ) != json_compare.for_capabilities(expected, exact_aggregates=True, canonical_state_order=True)
+
+    def test_comparison_depth_is_a_runner_failure_not_a_harness_traceback(self):
+        nested = None
+        for _ in range(sys.getrecursionlimit()):
+            nested = [nested]
+        caps = conformance_run.Capabilities(
+            family="outside",
+            name="outside/decode_streamed",
+            indexed=False,
+            refusals=False,
+        )
+
+        compared, error = conformance_run.compared_documents(nested, {}, caps)
+
+        assert compared is None
+        assert isinstance(error, RecursionError)
+
+    def test_filtered_failure_diagnostic_excludes_transitional_fields(self):
+        expected = self._summary()
+        actual = self._summary()
+        actual["aggregate"]["opacitySum"] = 999.0
+        actual["states"][0]["sample"] = {"positions": [[999.0]]}
+        actual["states"][0]["liveCount"] = "99"
+
+        expected_filtered = json_compare.for_capabilities(expected, exact_aggregates=False, canonical_state_order=False)
+        actual_filtered = json_compare.for_capabilities(actual, exact_aggregates=False, canonical_state_order=False)
+        text = "\n".join(json_compare.diagnostic_differences(expected_filtered, actual_filtered))
+
+        assert "liveCount" in text and "99" in text
+        assert "opacitySum" not in text
+        assert '"sample"' not in text
+
+    def test_diagnostic_is_bounded_for_deep_broad_documents(self):
+        expected = {f"field-{index}": [0] for index in range(10_000)}
+        actual = {key: list(value) for key, value in expected.items()}
+        for index in range(50):
+            actual[f"field-{index}"][0] = 1
+        for _ in range(300):
+            expected = [expected]
+            actual = [actual]
+
+        lines = json_compare.diagnostic_differences(expected, actual, max_lines=12, max_chars=1200)
+
+        assert len(lines) <= 12
+        assert sum(map(len, lines)) <= 1200
+        assert lines
+
+    def test_diagnostic_preserves_json_number_type(self):
+        expected = json_compare.loads('{"aggregate":{"opacitySum":1.0}}')
+        actual = json_compare.loads('{"aggregate":{"opacitySum":"1.0"}}')
+
+        text = "\n".join(json_compare.diagnostic_differences(expected, actual))
+
+        assert "json-number" in text
+        assert "json-string" in text
+
+    def test_unsupported_decimal_exponent_is_a_runner_document_failure(self):
+        document, error = conformance_run.runner_document("1e9999999999999999999")
+
+        assert document is None
+        assert isinstance(error, InvalidOperation)
+
+    def test_unclaimed_state_order_omits_only_the_state_sample(self):
+        expected = self._summary()
+        actual = self._summary()
+        actual["states"][0]["sample"] = {"positions": [[99.0, 99.0, 99.0]]}
+
+        assert json_compare.for_capabilities(
+            actual, exact_aggregates=True, canonical_state_order=False
+        ) == json_compare.for_capabilities(expected, exact_aggregates=True, canonical_state_order=False)
+        assert json_compare.for_capabilities(
+            actual, exact_aggregates=True, canonical_state_order=True
+        ) != json_compare.for_capabilities(expected, exact_aggregates=True, canonical_state_order=True)
+
+    @pytest.mark.parametrize(
+        ("section", "key", "value"),
+        [
+            ("aggregate", "neverFadesCount", "99"),
+            ("aggregate", "zeroMotionCount", "99"),
+            ("camera", "fovYDeg", 75.0),
+            ("objects", "table", []),
+        ],
+    )
+    def test_every_unrelated_root_field_remains_strict(self, section, key, value):
+        expected = self._summary()
+        actual = self._summary()
+        actual[section][key] = value
+        assert json_compare.without_exact_aggregates(actual) != json_compare.without_exact_aggregates(expected)
+
+    @pytest.mark.parametrize(
+        ("path", "value"),
+        [
+            (("states", 0, "t"), 8.0),
+            (("states", 0, "liveCount"), "99"),
+            (("states", 0, "aggregate", "contributingCount"), "99"),
+        ],
+    )
+    def test_unrelated_state_fields_remain_strict(self, path, value):
+        expected = self._summary()
+        actual = self._summary()
+        target = actual
+        for key in path[:-1]:
+            target = target[key]
+        target[path[-1]] = value
+        assert json_compare.for_capabilities(
+            actual, exact_aggregates=False, canonical_state_order=False
+        ) != json_compare.for_capabilities(expected, exact_aggregates=False, canonical_state_order=False)
 
 
 @pytest.fixture
@@ -242,8 +409,8 @@ class TestTheCanonicalFormHasNoDecodedOrder:
         assert forward == reversed_
         assert forward["states"][1]["sample"]["positions"] == [[0.2, 0.0, 0.0], [0.8, 0.0, 0.0]]
 
-    def test_state_aggregates_sum_in_content_order(self):
-        """The same four f32 values sum differently when their decoded order changes."""
+    def test_state_aggregates_sum_in_emitted_content_order(self):
+        """The same four f32 values sum identically after a decoded-order change."""
         gaussians = self._gaussians(
             positions=[
                 [332.6397705078125, 3.0, 0.0],
@@ -258,11 +425,77 @@ class TestTheCanonicalFormHasNoDecodedOrder:
         cancellation_last = self._summary(self._permuted(gaussians, [0, 3, 1, 2]))
 
         assert cancellation_first == cancellation_last
-        assert cancellation_first["states"][0]["aggregate"]["positionSum"] == [
-            1577422160204.6396,
-            10.0,
-            0.0,
+        assert [value.token for value in cancellation_first["states"][0]["aggregate"]["positionSum"]] == [
+            "1577422160204.639771",
+            "10.0",
+            "0.0",
         ]
+
+    def test_aggregate_addends_are_exact_canonical_units(self):
+        values = [1e20, -1e20, 3.25]
+        forward = canonical._exact_sum(values)
+        reversed_ = canonical._exact_sum(list(reversed(values)))
+
+        assert forward == reversed_
+        assert forward.token == "3.25"
+        assert canonical._exact_sum([1.0, float("inf")]) is None
+
+
+def test_exact_number_tokens_and_comparisons_never_narrow_through_binary64():
+    total = canonical._exact_sum([1e308] * 10)
+    text = canonical.canonical({"total": total})
+    parsed = json_compare.loads(text)
+    nearby = json_compare.loads(text.replace(".0", ".1", 1))
+
+    assert len(total.token.split(".")[0]) == 310
+    assert parsed != nearby
+    message = encode_roundtrip._diff({"total": (parsed["total"], nearby["total"])})
+    assert "total" in message
+    assert "json-number" in message and "adjusted=309" in message
+    assert len(message) <= 8000
+
+
+def test_fixture_witness_compares_float_and_exact_number_in_one_decimal_domain():
+    assert generate._same_canonical_decimal(3.25, canonical.ExactNumber("3.250000"))
+    assert not generate._same_canonical_decimal(3.25, canonical.ExactNumber("3.250001"))
+
+
+def test_adversarial_order_cases_are_encoded_corpus_variants():
+    variants = {name: expectation for name, _data, expectation in generate.build_object_corpus()}
+    tied = "ObjectTiedGaussians-UseChunkIndex-UseCrc"
+    reordered = "ObjectTiedGaussiansReordered-UseChunkIndex-UseCrc"
+    content_sum = "ObjectContentOrderSum-UseChunkIndex-UseCrc"
+
+    assert variants[tied] == variants[reordered]
+    tied_summary = json.loads(variants[tied])
+    assert tied_summary["states"][1]["sample"]["positions"] == [
+        [-1e-6, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+    ]
+    content_summary = json.loads(variants[content_sum])
+    assert content_summary["states"][1]["sample"]["objectIds"] == ["1", "2", "3"]
+    assert content_summary["states"][1]["aggregate"]["positionSum"] == [3.25, 0.0, 0.0]
+    opacity_summary = json.loads(variants["ObjectOpacityOrder-UseChunkIndex-UseCrc"])
+    assert opacity_summary["states"][1]["aggregate"]["opacitySum"] == 57.071301
+
+    wide_summary = json_compare.loads(variants["ObjectWideUnitAggregate-UseChunkIndex-UseCrc"])
+    expected = json_compare.loads("5784799892854990616798971119236787732480.0")
+    assert wide_summary["aggregate"]["positionSum"][0] == expected
+    assert all(state["aggregate"]["positionSum"][0] == expected for state in wide_summary["states"])
+    assert int(expected * 10**canonical.FLOAT_DECIMALS) > 2**127 - 1
+    assert len(wide_summary["sample"]["positions"]) == canonical.SAMPLE
+    assert all(position == [0, 0, 0] for position in wide_summary["sample"]["positions"])
+    assert all(state["liveCount"] == str(2 * canonical.SAMPLE + 1) for state in wide_summary["states"])
+    assert all(
+        all(position == [0, 0, 0] for position in state["sample"]["positions"]) for state in wide_summary["states"]
+    )
+
+    nonfinite = "ObjectTiedNonFiniteRows-UseChunkIndex-UseCrc"
+    nonfinite_reordered = "ObjectTiedNonFiniteRowsReordered-UseChunkIndex-UseCrc"
+    assert variants[nonfinite] == variants[nonfinite_reordered]
+    nonfinite_summary = json_compare.loads(variants[nonfinite])
+    assert nonfinite_summary["states"][2]["sample"]["positions"][0][0].is_finite()
+    assert nonfinite_summary["states"][2]["sample"]["positions"][1][0] is None
 
 
 def test_keyframe_delta_variants_retain_an_untouched_common_row():

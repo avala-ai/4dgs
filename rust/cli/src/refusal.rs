@@ -3,24 +3,10 @@
 
 //! Which refusal, and which byte it fired at.
 //!
-//! The library already names its refusals — `Error::refusal_code()` returns a stable
-//! identifier the conformance corpus is written against — and its messages already say
-//! which value was found and what was expected. What neither of them carries is the
-//! **offset**: an error is raised where the value was parsed, not where the bytes sit, and
-//! by then the record's position is several frames up the stack.
-//!
-//! So the tool supplies it. The refusal vocabulary is six identifiers, each of which is
-//! about exactly one kind of record, and a framing walk knows where every record is. That
-//! is the whole mechanism: walk the framing, ask which record this refusal is about, print
-//! the byte.
-//!
-//! Front matter is located from the framing and the bytes it frames: which record, and
-//! then which record *of that kind*, since nothing forbids a second Header and a reader
-//! refuses at the first one carrying a value it does not implement. A refusal that lives
-//! inside a chunk's streams is located by decoding chunks one at a time until one of them
-//! refuses, which is also the only way to *find* those refusals at all — the framing walk
-//! steps over a chunk by its declared length and never looks inside it, which is why the
-//! framing-only validator called two of the invalid corpus's seven files clean.
+//! The library returns stable refusal identifiers and diagnostic values, but parsing has
+//! already lost the source offset. The tool recovers it with a framing walk: front matter
+//! is located by record kind and occurrence, while chunk refusals are found by decoding
+//! one chunk at a time.
 //!
 //! Nothing here holds more than one chunk. That is not an optimization: the files this
 //! tool exists for are the ones nobody can afford to hold, and a validator that answers
@@ -782,66 +768,6 @@ pub fn scan_streamed(source: &mut dyn Readable) -> std::result::Result<(), (Erro
     Ok(())
 }
 
-/// One SH Band Stream record, decoded and dropped.
-///
-/// The indexed gaussian-birth path gets this from `read_chunk`, which fetches a chunk and
-/// the bands its index entry names in one call. There is no equivalent on the
-/// `keyframe-delta` path — composing a chain reads Chunk and Delta Chunk records and nothing
-/// else — so a band record there is reachable only by asking for it directly, which is what
-/// this is. `count` is the entry's own `gaussian_count`: a band stream is sized against the
-/// chunk it belongs to (spec §5.7), and a stream that disagrees is a fault of its own.
-pub fn decode_band_record(
-    data: &[u8],
-    at: u64,
-    length: u64,
-    declared_band: u8,
-    count: usize,
-) -> Result<()> {
-    let start = usize::try_from(at).map_err(|_| out_of_file(at))?;
-    let end = usize::try_from(length)
-        .ok()
-        .and_then(|length| start.checked_add(length))
-        .filter(|end| *end <= data.len())
-        .ok_or_else(|| out_of_file(at))?;
-    let mut record = Cursor::new(&data[start..end]);
-    let opcode = record.u8()?;
-    if opcode != op::SH_BAND_STREAM {
-        return Err(Error::Malformed(format!(
-            "a chunk index entry names byte {at} as an SH Band Stream; the record there is {}",
-            op::name(opcode)
-        )));
-    }
-    let mut content = Cursor::new(record.blob()?);
-    // The band index, which the record carries and the stream header does not: a band
-    // stream's `attribute_id` is 0x07 and collides with `mu_t` (§5.7).
-    let physical_band = content.u8()?;
-    if !(1..=3).contains(&physical_band) {
-        return Err(Error::Malformed(format!(
-            "the SH Band Stream at byte {at} declares band {physical_band}; only bands 1 through 3 are defined"
-        )));
-    }
-    if physical_band != declared_band {
-        return Err(Error::Malformed(format!(
-            "the chunk index labels the SH Band Stream at byte {at} as band {declared_band}; the record declares band {physical_band}"
-        )));
-    }
-    let (_, stream) = decode_stream(&mut content, Some(count))?;
-    let expected_channels = 3 * (2 * physical_band as usize + 1);
-    if stream.channels != expected_channels {
-        return Err(Error::Malformed(format!(
-            "the SH Band Stream at byte {at} for band {physical_band} declares {} channels; band {physical_band} requires {expected_channels}",
-            stream.channels
-        )));
-    }
-    Ok(())
-}
-
-fn out_of_file(at: u64) -> Error {
-    Error::Truncated(format!(
-        "a chunk index entry names an SH Band Stream at byte {at}, past the end of the file"
-    ))
-}
-
 /// Everything the tool can say about one refusal: the identifier and the byte.
 ///
 /// `None` for an error the refusal table does not name — a truncated transport, an
@@ -1097,21 +1023,6 @@ mod tests {
         // would be inventing conformance.
         let error = Error::Truncated("cut".into());
         assert!(describe(&error, None, None).is_none());
-    }
-
-    #[test]
-    fn an_sh_band_stream_must_declare_the_bands_channel_count() {
-        // SH Band Streams use attribute id 7 in their nested stream, which collides
-        // intentionally with mu_t and is disambiguated by the enclosing record.
-        let stream =
-            fourdgs::stream::encode_stream(op::A_MU_T, &[7], 1, fourdgs::codec::DEFLATE, 6, true)
-                .unwrap();
-        let mut content = vec![1];
-        content.extend_from_slice(&stream);
-        let mut record = Vec::new();
-        fourdgs::serialization::put_record(&mut record, op::SH_BAND_STREAM, &content);
-        let error = decode_band_record(&record, 0, record.len() as u64, 1, 1).unwrap_err();
-        assert!(error.to_string().contains("requires 9"), "{error}");
     }
 
     #[test]

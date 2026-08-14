@@ -19,11 +19,14 @@ one of the three in isolation looks the same either way.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
 import sys
 
+import fourdgs
+import numpy as np
 import pytest
 from fourdgs.exceptions import MalformedFile, TruncatedFile
 
@@ -45,6 +48,25 @@ UNNAMED = b"4DG"
 #: it the control: the fix must not turn refusals into failures on its way to turning
 #: failures into failures.
 NAMED = b"NOT4DGS!\n"
+
+
+def _large_finite_window_file() -> bytes:
+    gaussians = fourdgs.GaussianSet(
+        positions=np.zeros((1, 3), dtype=np.float32),
+        scales=np.ones((1, 3), dtype=np.float32),
+        rotations=np.array([[0, 0, 0, 1]], dtype=np.float32),
+        colors=np.ones((1, 4), dtype=np.float32),
+        motions=np.zeros((1, 3), dtype=np.float32),
+        mu_t=np.zeros(1, dtype=np.float32),
+        sigma_t=np.full(1, np.inf, dtype=np.float32),
+        win_lo=np.zeros(1, dtype=np.float64),
+        win_hi=np.full(1, 1e100, dtype=np.float64),
+        sh_degree=0,
+        object_id=np.ones(1, dtype=np.uint32),
+    )
+    output = io.BytesIO()
+    fourdgs.write(output, gaussians, 1e101)
+    return output.getvalue()
 
 
 def _run(runner: str, data: bytes, tmp_path) -> subprocess.CompletedProcess:
@@ -84,6 +106,17 @@ def test_a_named_refusal_is_still_an_answer(runner, tmp_path):
     done = _run(runner, NAMED, tmp_path)
     assert done.returncode == 0, f"{runner} failed the invocation for a refusal it named: {done.stderr!r}"
     assert json.loads(done.stdout) == {"refused": "magic-mismatch"}
+
+
+def test_large_finite_window_endpoint_agrees_on_both_read_paths(tmp_path):
+    answers = []
+    for runner in RUNNERS:
+        done = _run(runner, _large_finite_window_file(), tmp_path)
+        assert done.returncode == 0, f"{runner} failed: {done.stderr}"
+        answers.append(json.loads(done.stdout))
+
+    assert answers[0] == answers[1]
+    assert any(state["t"] > 1e100 and state["liveCount"] == "0" for state in answers[0]["states"])
 
 
 def test_only_a_registered_identifier_is_an_answer():
