@@ -6,14 +6,14 @@ import { test } from "node:test";
 
 import { GaussianSet } from "@4dgs/core";
 
-import { summarize } from "./canonical.js";
+import { canonical, exactSum, ExactNumber, summarize } from "./canonical.js";
 
 const DURATION = 4_000_000;
 
 interface StateSummary {
   readonly states: readonly {
     readonly sample: { readonly positions: readonly (readonly (number | null)[])[] };
-    readonly aggregate: { readonly positionSum: readonly (number | null)[] };
+    readonly aggregate: { readonly positionSum: readonly (ExactNumber | null)[] };
   }[];
 }
 
@@ -114,5 +114,24 @@ test("state aggregates sum in emitted content order", () => {
   const cancellationLast = summary(permuted(gaussians, [1, 2, 0]));
 
   assert.deepEqual(cancellationFirst, cancellationLast);
-  assert.deepEqual(cancellationFirst.states[0]!.aggregate.positionSum, [1577422159872.0002, 0, 0]);
+  assert.deepEqual(
+    cancellationFirst.states[0]!.aggregate.positionSum.map((value) => value?.token ?? null),
+    ["1577422159872.0002", "0.0", "0.0"],
+  );
+});
+
+test("canonical aggregates retain arbitrary precision JSON number tokens", () => {
+  const forward = exactSum([1e16, 1, -1e16]);
+  const reversed = exactSum([-1e16, 1, 1e16]);
+  assert.equal(forward?.token, "1.0");
+  assert.equal(reversed?.token, "1.0");
+  assert.equal(exactSum([-0])?.token, "0.0");
+  assert.equal(exactSum([1, Number.POSITIVE_INFINITY]), null);
+
+  const huge = exactSum(Array.from({ length: 10 }, () => 1e308));
+  assert.ok(huge instanceof ExactNumber);
+  assert.equal(huge.token.split(".")[0]!.length, 310);
+  const text = canonical({ total: huge });
+  assert.ok(text.includes(`"total": ${huge.token}`));
+  assert.ok(!text.includes(`"${huge.token}"`));
 });

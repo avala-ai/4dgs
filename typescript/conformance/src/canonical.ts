@@ -129,6 +129,74 @@ export function num(value: number | null | undefined): number | null {
   return roundHalfEven(value, FLOAT_DECIMALS);
 }
 
+/** A JSON number token that must not be narrowed through JavaScript's binary64 parser. */
+export class ExactNumber {
+  constructor(readonly token: string) {}
+}
+
+const CANONICAL_SCALE = 10n ** BigInt(FLOAT_DECIMALS);
+const FLOAT64 = new DataView(new ArrayBuffer(8));
+
+/** Round one finite binary64 addend to exact canonical 10^-6 units. */
+function canonicalUnits(value: number): bigint | null {
+  if (!Number.isFinite(value)) return null;
+  const negative = value < 0;
+  FLOAT64.setFloat64(0, Math.abs(value), false);
+  const high = FLOAT64.getUint32(0, false);
+  const low = FLOAT64.getUint32(4, false);
+  const exponentBits = (high >>> 20) & 0x7ff;
+  const fraction = (BigInt(high & 0xfffff) << 32n) | BigInt(low);
+  if (exponentBits === 0 && fraction === 0n) return 0n;
+
+  const significand = exponentBits === 0 ? fraction : (1n << 52n) | fraction;
+  const exponent = exponentBits === 0 ? -1074 : exponentBits - 1023 - 52;
+  let units: bigint;
+  if (exponent >= 0) {
+    units = (significand * CANONICAL_SCALE) << BigInt(exponent);
+  } else {
+    const denominator = 1n << BigInt(-exponent);
+    const numerator = significand * CANONICAL_SCALE;
+    units = numerator / denominator;
+    const remainder = numerator % denominator;
+    const twice = remainder * 2n;
+    if (twice > denominator || (twice === denominator && units % 2n === 1n)) units += 1n;
+  }
+  return negative ? -units : units;
+}
+
+function exactNumberFromUnits(total: bigint): ExactNumber {
+  const negative = total < 0n;
+  const magnitude = negative ? -total : total;
+  const whole = magnitude / CANONICAL_SCALE;
+  const fraction = (magnitude % CANONICAL_SCALE)
+    .toString()
+    .padStart(FLOAT_DECIMALS, "0")
+    .replace(/0+$/, "");
+  return new ExactNumber(`${negative ? "-" : ""}${whole}.${fraction || "0"}`);
+}
+
+class ExactAccumulator {
+  private total = 0n;
+  private finite = true;
+
+  add(value: number): void {
+    const units = canonicalUnits(value);
+    if (units === null) this.finite = false;
+    else if (this.finite) this.total += units;
+  }
+
+  finish(): ExactNumber | null {
+    return this.finite ? exactNumberFromUnits(this.total) : null;
+  }
+}
+
+/** Sum canonical units exactly; any non-finite addend makes the result `null`. */
+export function exactSum(values: Iterable<number>): ExactNumber | null {
+  const sum = new ExactAccumulator();
+  for (const value of values) sum.add(value);
+  return sum.finish();
+}
+
 /**
  * Round to `decimals` places, halves to even, on the exact value.
  *
@@ -210,15 +278,15 @@ export function summarize(input: SceneSummaryInput): unknown {
       return row;
     });
 
-  const positionSum = [0, 0, 0];
-  let alphaSum = 0;
+  const positionSum = [new ExactAccumulator(), new ExactAccumulator(), new ExactAccumulator()];
+  const alphaSum = new ExactAccumulator();
   let neverFades = 0;
   let still = 0;
   for (const i of order) {
-    positionSum[0]! += gaussians.positions[i * 3]!;
-    positionSum[1]! += gaussians.positions[i * 3 + 1]!;
-    positionSum[2]! += gaussians.positions[i * 3 + 2]!;
-    alphaSum += gaussians.colors[i * 4 + 3]!;
+    positionSum[0]!.add(gaussians.positions[i * 3]!);
+    positionSum[1]!.add(gaussians.positions[i * 3 + 1]!);
+    positionSum[2]!.add(gaussians.positions[i * 3 + 2]!);
+    alphaSum.add(gaussians.colors[i * 4 + 3]!);
     if (!Number.isFinite(gaussians.sigmaT[i]!)) neverFades += 1;
     const m = gaussians.motions;
     if (Math.abs(m[i * 3]!) + Math.abs(m[i * 3 + 1]!) + Math.abs(m[i * 3 + 2]!) === 0) still += 1;
@@ -295,8 +363,8 @@ export function summarize(input: SceneSummaryInput): unknown {
         : { objectIds: sample.map((i) => String(gaussians.objectId![i])) }),
     },
     aggregate: {
-      positionSum: positionSum.map((v) => num(v)),
-      opacitySum: num(alphaSum),
+      positionSum: positionSum.map((sum) => sum.finish()),
+      opacitySum: alphaSum.finish(),
       neverFadesCount: String(neverFades),
       zeroMotionCount: String(still),
     },
@@ -445,13 +513,13 @@ function objectsAndStates(
     });
     const liveRows = liveIndices.map((index) => rowForIndex.get(index)!);
     const sampleRows = liveRows.slice(0, SAMPLE);
-    const positionSum = [0, 0, 0];
-    let opacitySum = 0;
+    const positionSum = [new ExactAccumulator(), new ExactAccumulator(), new ExactAccumulator()];
+    const opacitySum = new ExactAccumulator();
     for (const row of liveRows) {
       for (let axis = 0; axis < 3; axis++) {
-        positionSum[axis]! += base.centers[row * 3 + axis]!;
+        positionSum[axis]!.add(base.centers[row * 3 + axis]!);
       }
-      opacitySum += base.opacity[row]!;
+      opacitySum.add(base.opacity[row]!);
     }
 
     const rows = (values: readonly number[], width: number): (number | null)[][] =>
@@ -470,8 +538,8 @@ function objectsAndStates(
         objectIds: sampleRows.map((row) => String(base.objectIds[row])),
       },
       aggregate: {
-        positionSum: positionSum.map((value) => num(value)),
-        opacitySum: num(opacitySum),
+        positionSum: positionSum.map((sum) => sum.finish()),
+        opacitySum: opacitySum.finish(),
       },
     };
   });
@@ -759,7 +827,44 @@ function sortable(value: number): number {
 
 /** Stable JSON: sorted keys, two-space indent, the shape the expectations are stored in. */
 export function canonical(summary: unknown): string {
-  return JSON.stringify(sortKeys(summary), null, 2);
+  const strings = new Set<string>();
+  const collectStrings = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      value.forEach(collectStrings);
+    } else if (value !== null && typeof value === "object" && !(value instanceof ExactNumber)) {
+      for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+        strings.add(key);
+        collectStrings(item);
+      }
+    } else if (typeof value === "string") {
+      strings.add(value);
+    }
+  };
+  collectStrings(summary);
+
+  let markerPrefix = "\0fourdgs-exact-number\0";
+  while ([...strings].some((value) => value.includes(markerPrefix))) markerPrefix += "#";
+  const replacements = new Map<string, string>();
+  const markExact = (value: unknown): unknown => {
+    if (value instanceof ExactNumber) {
+      const marker = `${markerPrefix}${replacements.size}`;
+      replacements.set(JSON.stringify(marker), value.token);
+      return marker;
+    }
+    if (Array.isArray(value)) return value.map(markExact);
+    if (value !== null && typeof value === "object") {
+      const out: Record<string, unknown> = {};
+      for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+        out[key] = markExact(item);
+      }
+      return out;
+    }
+    return value;
+  };
+
+  let text = JSON.stringify(sortKeys(markExact(summary)), null, 2);
+  for (const [marker, token] of replacements) text = text.replace(marker, token);
+  return text;
 }
 
 /**

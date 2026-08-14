@@ -15,7 +15,7 @@ import type { ChunkGaussians, ShCoefficients } from "@4dgs/core";
 import { BlobReadable, HttpRangeReadable } from "@4dgs/browser";
 
 import { AudioPayloadDigests, canonical, summarize } from "./canonical.js";
-import { stagedBrowserSummary } from "./browserStaged.js";
+import { comparableCanonicalJson } from "./canonicalJson.js";
 
 export interface PageResult {
   readonly variant: string;
@@ -115,19 +115,20 @@ export async function run(variants: readonly string[]): Promise<PageResult[]> {
     ] as const) {
       try {
         const actual = await decode(variant);
-        const actualSummary = stagedBrowserSummary(actual);
-        const expectedSummary = stagedBrowserSummary(expected);
-        const same = JSON.stringify(actualSummary) === JSON.stringify(expectedSummary);
+        // Normalize JSON tokens without parsing numbers through binary64: Python spells
+        // an ordinary integral float `1.0` where JSON.stringify spells it `1`, while an
+        // exact aggregate may contain hundreds of significant digits.
+        const actualComparable = comparableCanonicalJson(actual);
+        const expectedComparable = comparableCanonicalJson(expected);
+        const same = actualComparable === expectedComparable;
+        const gaussianCount = (JSON.parse(actual) as { gaussianCount: string }).gaussianCount;
         results.push({
           variant,
           path,
           ok: same,
           detail: same
-            ? `${actualSummary["gaussianCount"]} gaussians`
-            : firstDifference(
-                JSON.stringify(expectedSummary, null, 2),
-                JSON.stringify(actualSummary, null, 2),
-              ),
+            ? `${gaussianCount} gaussians`
+            : firstDifference(expectedComparable, actualComparable),
         });
       } catch (error) {
         results.push({
