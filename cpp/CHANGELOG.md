@@ -8,6 +8,36 @@ All notable changes to the C++ package are documented here, following
 
 ### Added
 
+- Out-of-tree CMake source consumers now build the Rust core automatically. CPM, FetchContent and
+  `add_subdirectory` checkouts default `FOURDGS_BUILD_CORE_FROM_SOURCE` on, invoke Cargo for only
+  the `fourdgs` crate in an isolated CMake build directory, and link the resulting static library
+  through an explicit target dependency. A prebuilt `FOURDGS_CORE_LIBRARY` still takes precedence,
+  and the intentional no-core build remains available explicitly. Installing the CMake package now
+  copies the selected core beside its targets and resolves it relative to the install prefix, so a
+  relocated `find_package(fourdgs-cpp)` consumer needs neither the original build tree nor Cargo. CI
+  proves the public path with a fresh out-of-tree FetchContent checkout that builds, links, and
+  crosses the C ABI without a prior repository core build. This completes issue #150's consumer
+  path; Swift and prebuilt release artifacts remain tracked together by #162.
+- Source builds pass an explicit Cargo target triple and require `FOURDGS_CARGO_TARGET` when CMake
+  cross-compiles or selects a target through `CMAKE_CXX_COMPILER_TARGET` or a same-OS architecture,
+  or when a compiler mode such as `-m32` changes the detected pointer ABI, preventing a host archive
+  from reaching the target linker. Cargo emits only the static library this binding consumes, so an
+  unrelated cross-target `cdylib` link cannot fail before that archive is produced. Universal macOS
+  builds explicitly require a pre-combined core rather than silently linking one thin archive. MSVC
+  Debug consumers inherit the Rust archive's `/MD` runtime, and absolute package library directories
+  retain Windows drive syntax and legal POSIX colons while generated configs safely match CMake's
+  effective destination for backslash-containing paths. An explicit top-level
+  `FOURDGS_BUILD_CORE_FROM_SOURCE=ON` takes precedence over the repository's permissive no-core
+  default, while an installed no-core package preserves an empty `fourdgs-cpp_CORE_LIBRARY` value.
+  The Cargo project is staged in the build tree so an absent lockfile never makes a read-only
+  fetched source fail, and installing a prebuilt core dereferences symbolic links so the relocated
+  package contains archive bytes rather than a dangling build-tree link. The staged manifest
+  declares itself its own workspace root: Cargo resolves a workspace by walking up from the manifest
+  it is given, so a build directory anywhere inside this repository — `cpp/build`, which the README
+  and CI both use — found the root `Cargo.toml` and refused with "current package believes it's in a
+  workspace when it's not". CI now configures a source build into `cpp/build-source` as well as into
+  the runner's temporary directory, so the in-repo layout is covered rather than assumed.
+
 - **Complete bounded validation for `keyframe-delta`.** The tool now certifies the sequential path
   for every file and the indexed path when a Chunk Index is present, through the core's range-reader
   ABI rather than a whole-file buffer. It retains no sequence: the core keeps only the current
