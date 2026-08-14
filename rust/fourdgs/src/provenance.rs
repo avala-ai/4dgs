@@ -527,9 +527,7 @@ impl Json {
         match self {
             Json::Null => out.push_str("null"),
             Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-            Json::Num(v) => {
-                let _ = write!(out, "{v:.*}", PROVENANCE_JSON_DECIMALS);
-            }
+            Json::Num(v) => push_canonical_decimal(out, *v),
             Json::ExactNum(token) => out.push_str(token),
             Json::Str(s) => write_json_string(out, s),
             Json::Arr(items) => {
@@ -561,6 +559,31 @@ impl Json {
         let mut out = String::new();
         self.write(&mut out);
         out
+    }
+}
+
+/// Append one finite value at the canonical decimal precision, without the sign of a zero.
+///
+/// The canonical form's first rule is that a zero is `0.0` and never `-0.0` — the sign
+/// records which side of zero the arithmetic landed on, which is a property of the platform
+/// rather than of the scene. `{:.6}` keeps it: `-4e-7` renders as `-0.000000`, and a
+/// composed centre at the noise floor is exactly the value that lands there.
+///
+/// This is the one place it can be erased for the core's canonical members, and erasing it
+/// here also settles it for the C ABI's consumers: `fourdgs_scene_objects_json` and
+/// `fourdgs_scene_object_states_json` hand these strings straight to the C++ and Swift
+/// bindings, which splice them into their summaries verbatim, so a sign left here would
+/// have been three SDKs' output rather than one.
+///
+/// A rendered fixed-point value is a zero exactly when it holds no digit from one to nine,
+/// which is cheaper and less fragile than comparing against a spelled-out `"-0.000000"`
+/// that would silently stop matching if the precision ever changed.
+fn push_canonical_decimal(out: &mut String, value: f64) {
+    let start = out.len();
+    let _ = write!(out, "{value:.*}", PROVENANCE_JSON_DECIMALS);
+    let rendered = &out[start..];
+    if rendered.starts_with('-') && !rendered.bytes().any(|byte| (b'1'..=b'9').contains(&byte)) {
+        out.remove(start);
     }
 }
 
@@ -947,6 +970,23 @@ mod tests {
         assert!(enormous.starts_with("1000000000000000"));
         assert!(enormous.ends_with(".0"));
         assert!(enormous.len() > 309);
+    }
+
+    /// The canonical form has no signed zero, and `{:.6}` has one for every value in
+    /// `(-5e-7, -0.0]`. Rendering is where it has to be erased: `exact_sum_token` already
+    /// erased it, `num` cannot (a signed zero is a perfectly finite `f64`), and the same
+    /// `Json` writes the object layer's members — the ones the C ABI hands to the C++ and
+    /// Swift bindings verbatim.
+    #[test]
+    fn a_rendered_zero_is_never_signed() {
+        let render = |v: f64| Json::Num(v).to_json();
+        assert_eq!(render(-0.0), "0.000000");
+        assert_eq!(render(-1e-9), "0.000000");
+        assert_eq!(render(-4e-7), "0.000000");
+        assert_eq!(render(0.0), "0.000000");
+        // Only a zero loses its sign; the smallest value that survives rounding keeps it.
+        assert_eq!(render(-1e-6), "-0.000001");
+        assert_eq!(render(-1.5), "-1.500000");
     }
 
     #[test]

@@ -99,9 +99,7 @@ impl J {
             J::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
             // Always six decimals: the harness compares parsed values, and a fixed
             // precision is what makes two languages produce the same double.
-            J::Num(v) => {
-                let _ = write!(out, "{v:.*}", FLOAT_DECIMALS);
-            }
+            J::Num(v) => push_canonical_decimal(out, *v),
             J::ExactNum(token) => out.push_str(token),
             J::Str(s) => write_string(out, s),
             J::Arr(items) => {
@@ -133,6 +131,26 @@ impl J {
         let mut out = String::new();
         self.write(&mut out);
         out
+    }
+}
+
+/// Append one finite value at the canonical decimal precision, without the sign of a zero.
+///
+/// `canonical.py` states the rule — "a zero is `0.0` and never `-0.0`" — because the sign
+/// records which side of zero the arithmetic landed on, and that is a property of the
+/// platform rather than of the scene. `{:.6}` keeps it: every value in `(-5e-7, -0.0]`
+/// renders as `-0.000000`, which is precisely where a composed centre at the noise floor
+/// lands. Nothing caught it because `run.py` compared parsed values and `-0.0 == 0.0`.
+///
+/// A rendered fixed-point value is a zero exactly when it holds no digit from one to nine,
+/// which stays correct if `FLOAT_DECIMALS` ever changes — a spelled-out `"-0.000000"`
+/// comparison would not.
+fn push_canonical_decimal(out: &mut String, value: f64) {
+    let start = out.len();
+    let _ = write!(out, "{value:.*}", FLOAT_DECIMALS);
+    let rendered = &out[start..];
+    if rendered.starts_with('-') && !rendered.bytes().any(|byte| (b'1'..=b'9').contains(&byte)) {
+        out.remove(start);
     }
 }
 
@@ -1041,7 +1059,7 @@ pub fn keyframe_delta_states_json(seq: &DecodedSequence) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{summarize, Extras};
+    use super::{summarize, Extras, J};
     use fourdgs::model::GaussianSet;
     use fourdgs::object_layer::{canonical_parts, ObjectLayer};
     use fourdgs::records::Header;
@@ -1085,6 +1103,37 @@ mod tests {
             .expect("core canonical")
             .states;
         (runner, core)
+    }
+
+    /// The runner's own emitter, held to the rule the reference states: a zero is `0.0`
+    /// and never `-0.0`. `{:.6}` keeps the sign for every value in `(-5e-7, -0.0]`, and a
+    /// composed centre at the noise floor is exactly what lands there — three variants of
+    /// the committed corpus carried one before this.
+    #[test]
+    fn a_rendered_zero_is_never_signed() {
+        let render = |v: f64| J::Num(v).to_json();
+        assert_eq!(render(-0.0), "0.000000");
+        assert_eq!(render(-1e-9), "0.000000");
+        assert_eq!(render(-4e-7), "0.000000");
+        assert_eq!(render(0.0), "0.000000");
+        assert_eq!(render(-1e-6), "-0.000001");
+        assert_eq!(render(-1.5), "-1.500000");
+    }
+
+    /// Two rows alike but for where the sign of a zero sits. They tie in every emitted
+    /// value, so the two decode orders have to produce one document — which they do only
+    /// once the emitter refuses to spell the sign.
+    #[test]
+    fn signed_zero_cannot_order_a_summary() {
+        let zero = [0.0f32, 0.0, 0.0];
+        let forward = gaussians(&[[-0.0, 0.0, 0.0], [0.0, -0.0, 0.0]], &[zero, zero]);
+        let reversed = gaussians(&[[0.0, -0.0, 0.0], [-0.0, 0.0, 0.0]], &[zero, zero]);
+
+        let a = summaries(&forward);
+        let b = summaries(&reversed);
+        assert_eq!(a, b);
+        assert!(!a.0.contains("-0.000000"), "{}", a.0);
+        assert!(!a.1.contains("-0.000000"), "{}", a.1);
     }
 
     #[test]

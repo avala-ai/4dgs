@@ -15,6 +15,53 @@ def loads(text: str):
     return json.loads(text, parse_float=Decimal, parse_int=int)
 
 
+class SignedZero:
+    """A negative zero, kept apart from `0.0` so a comparison can see the difference.
+
+    The canonical form's first rule is that a zero is `0.0` and never `-0.0`: the sign is a
+    property of the arithmetic path that produced the value, not of the scene, so two
+    correct decoders on two platforms would otherwise be required to disagree. `canonical.py`
+    states it, `generate.py --verify` enforces it on the committed expectations by comparing
+    text, and until this class existed nothing enforced it on a *runner*.
+
+    That gap is the same one the rule was written for, one level up. `run.py` compares
+    parsed values, and `-0.0 == 0.0` is true of Python's `float`, of `Decimal`, and of every
+    language the suite compares in — so `-0.000000` in a runner's stdout scored equal to
+    `0.0` in the expectation and the variant passed. Three of the six SDKs were emitting one
+    on the committed corpus when this was written.
+
+    A distinct object rather than a raise: a runner is not malformed for emitting one, it is
+    *different from the expectation*, and the harness already has a diagnostic that names a
+    differing field by path. Equal only to another `SignedZero`, so an unsigned zero on
+    either side is a mismatch and two signed zeros still agree.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "-0.0"
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, SignedZero)
+
+    def __hash__(self) -> int:
+        return hash("-0.0")
+
+
+#: The one instance; `SignedZero` carries no state and equality does not depend on identity.
+SIGNED_ZERO = SignedZero()
+
+
+def _is_signed_zero(value: Decimal) -> bool:
+    """True for a finite zero whose token carried a minus sign.
+
+    `is_signed` alone is not enough — it is true of every negative number — and `== 0` alone
+    is not enough either. `is_finite` guards `-0e-999999999`-style tokens, which `Decimal`
+    keeps as zeros, and NaN, whose sign says nothing.
+    """
+    return value.is_finite() and value.is_zero() and value.is_signed()
+
+
 def without_exact_aggregates(summary):
     """Return a copy without the two exact-unit aggregate fields under transition.
 
@@ -61,11 +108,30 @@ def for_capabilities(summary, *, exact_aggregates: bool, canonical_state_order: 
 
 def _ordinary_numbers(value):
     if isinstance(value, Decimal):
-        return float(value)
+        # `float(Decimal("-0.000000"))` is `-0.0`, which then compares equal to every
+        # unsigned zero. Substituting the marker is what makes the sign survive into the
+        # comparison; see `SignedZero`.
+        return SIGNED_ZERO if _is_signed_zero(value) else float(value)
     if isinstance(value, dict):
         return {key: _ordinary_numbers(nested) for key, nested in value.items()}
     if isinstance(value, (list, tuple)):
         return [_ordinary_numbers(nested) for nested in value]
+    return copy.deepcopy(value)
+
+
+def _exact_units(value):
+    """An exact aggregate kept at full decimal precision, minus the sign of a zero.
+
+    `Decimal` is retained here precisely because narrowing loses information — but it does
+    not distinguish `Decimal("-0.0")` from `Decimal("0.0")` under `==` any more than `float`
+    does, so the exact totals needed the same marker as the ordinary numbers around them.
+    """
+    if isinstance(value, Decimal):
+        return SIGNED_ZERO if _is_signed_zero(value) else value
+    if isinstance(value, dict):
+        return {key: _exact_units(nested) for key, nested in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_exact_units(nested) for nested in value]
     return copy.deepcopy(value)
 
 
@@ -75,7 +141,7 @@ def _restore_exact_aggregates(source, target) -> None:
             return
         for key in ("positionSum", "opacitySum"):
             if key in source_block:
-                target_block[key] = copy.deepcopy(source_block[key])
+                target_block[key] = _exact_units(source_block[key])
 
     if not isinstance(source, dict) or not isinstance(target, dict):
         return
@@ -165,6 +231,11 @@ def diagnostic_differences(expected, actual, *, max_lines: int = 40, max_chars: 
     def scalar(value) -> str:  # noqa: PLR0911 - bounded type dispatcher
         if value is missing:
             return "<missing>"
+        if isinstance(value, SignedZero):
+            # Spelled out rather than typed like the others: the whole difference is the
+            # one character, and "expected <json-number 0.0>; actual <SignedZero>" is a
+            # report a reader has to decode before it says anything.
+            return "<json-number -0.0>"
         if isinstance(value, Decimal):
             if not value.is_finite():
                 return f"<json-number {value.number_class()}>"
