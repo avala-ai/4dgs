@@ -56,6 +56,10 @@ All notable changes to the Rust crate are documented here, following
 
 ### Changed
 
+- `WriteOptions.cutoff` outside `(0, 1]` is refused as `InvalidInput` rather than written. A
+  marginal threshold of zero or less has no logarithm to invert, and the `NaN` support half-width
+  that came back was discarded by `f64::max`/`f64::min`, silently planning every chunk as though
+  each gaussian filled its whole validity window.
 - **A counted record is fetched at the size it declares instead of by doubling towards it.** The
   prefix loop grew 8 KiB, 16 KiB, 32 KiB … re-reading from the same offset each time, so a lazily
   read 100,000-sample Object Track cost `2 + log2(L / 8 KiB)` range requests and moved roughly `2L`
