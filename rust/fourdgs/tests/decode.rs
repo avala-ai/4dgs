@@ -330,6 +330,137 @@ fn an_out_of_range_window_index_is_refused_rather_than_clamped() {
     assert_eq!(fourdgs::chunk::check_window_index(1, 2).unwrap(), 1);
 }
 
+/// A file with two validity windows, one gaussian in each, so the Window Table it carries
+/// has two rows and the Chunk references row 1.
+fn two_window_file() -> Vec<u8> {
+    let mut g = fourdgs::model::GaussianSet::default();
+    for (index, window) in [(0.0f32, 1.0f32), (1.0, 2.0)].into_iter().enumerate() {
+        g.positions.extend_from_slice(&[index as f32, 0.0, 0.0]);
+        g.scales.extend_from_slice(&[0.01, 0.01, 0.01]);
+        g.rotations.extend_from_slice(&[1.0, 0.0, 0.0, 0.0]);
+        g.colors.extend_from_slice(&[0.5, 0.5, 0.5, 1.0]);
+        g.motions.extend_from_slice(&[0.0, 0.0, 0.0]);
+        g.mu_t.push(window.0 + 0.5);
+        g.sigma_t.push(0.25);
+        g.win_lo.push(window.0);
+        g.win_hi.push(window.1);
+    }
+    let options = fourdgs::writer::WriteOptions {
+        min_chunk_gaussians: 8,
+        max_depth: 0,
+        ..Default::default()
+    };
+    fourdgs::write_to_vec(&g, 2.0, &options, &Default::default()).expect("the fixture encodes")
+}
+
+/// The byte just past the last Chunk record, so nothing spliced there can be caught by a
+/// later Chunk decoding against it.
+fn after_last_chunk(bytes: &[u8]) -> usize {
+    let mut at = MAGIC.len();
+    let mut last = None;
+    while at + 9 <= bytes.len() {
+        let opcode = bytes[at];
+        let length = u64::from_le_bytes(bytes[at + 1..at + 9].try_into().unwrap()) as usize;
+        let end = at + 9 + length;
+        if opcode == op::CHUNK {
+            last = Some(end);
+        }
+        at = end;
+    }
+    last.expect("the fixture carries a Chunk record")
+}
+
+/// A window index is checked against the table in force when its Chunk is decoded. A
+/// second, shorter Window Table spliced in after that Chunk leaves indices already
+/// accepted pointing outside the table the assembler is handed — which used to index a
+/// `Vec` out of bounds and panic. A panic is not a refusal: across the C ABI it is
+/// undefined behaviour in the caller's runtime rather than a status code, and under
+/// `panic=abort` it takes the process with it. A malformed file has to be refused.
+#[test]
+fn a_window_table_spliced_in_after_a_chunk_is_refused_rather_than_panicking() {
+    let mut bytes = two_window_file();
+    let splice_at = after_last_chunk(&bytes);
+    let shorter = WindowTable {
+        windows: vec![(0.0, 1.0)],
+    }
+    .encode();
+    bytes.splice(splice_at..splice_at, shorter);
+
+    let error = fourdgs::read_bytes(&bytes)
+        .expect_err("a Window Table that cannot apply to the Chunks before it is malformed");
+    assert!(matches!(error, Error::Malformed(_)), "{error}");
+    assert!(error.to_string().contains("Window Table"), "{error}");
+
+    // The same bytes through the automatic open, which is what a consumer calls.
+    let mut source = fourdgs::readable::BytesReadable::new(&bytes);
+    if let Ok(mut reader) = fourdgs::SceneReader::open(&mut source) {
+        let _ = reader.state_at(0.5, 0);
+    }
+}
+
+/// The assembler is a second caller with its own window table, and it must not trust that
+/// an index which fit the decoder's table fits this one.
+#[test]
+fn assembly_refuses_a_window_index_outside_the_table_it_was_handed() {
+    let chunk = fourdgs::chunk::DecodedChunk {
+        count: 1,
+        positions: vec![0.0; 3],
+        scales: vec![0.0; 3],
+        rotations: vec![0.0; 4],
+        colors: vec![0.0; 4],
+        motions: vec![0.0; 3],
+        mu_t: vec![0.0],
+        sigma_t: vec![1.0],
+        window_index: vec![1],
+        ..Default::default()
+    };
+    let error = fourdgs::stream_reader::assemble(
+        std::slice::from_ref(&chunk),
+        &[BTreeMap::new()],
+        &[(0.0, 1.0)],
+        &Header::default(),
+    )
+    .expect_err("index 1 is outside a one-entry table");
+    assert_eq!(
+        error.refusal_code(),
+        Some(fourdgs::error::refusal::WINDOW_INDEX_OUT_OF_RANGE),
+        "{error}"
+    );
+}
+
+/// The indexed ceiling has to be cumulative, not per-call. A caller that keeps what it
+/// reads — which is every caller that assembles a scene, including this repository's own
+/// indexed conformance runner — reads N chunks and holds N of them; a bound that resets on
+/// each call bounds nothing about that caller's memory.
+#[test]
+fn indexed_chunk_reads_charge_one_shared_ceiling() {
+    use fourdgs::indexed_reader::{open_indexed, read_chunk_within, ResidentBudget};
+
+    let bytes = two_window_file();
+    let mut source = fourdgs::readable::BytesReadable::new(&bytes);
+    let scene = open_indexed(&mut source).expect("the fixture is indexed");
+    let entry = scene.index.first().expect("the fixture carries an index");
+
+    let mut budget = ResidentBudget::for_scene(&scene).expect("the opened scene fits its ceiling");
+    let start = budget.remaining();
+    let first = read_chunk_within(&mut source, &scene, entry, 3, &mut budget).expect("first read");
+    let after_one = budget.remaining();
+    let second =
+        read_chunk_within(&mut source, &scene, entry, 3, &mut budget).expect("second read");
+    let after_two = budget.remaining();
+
+    assert_eq!(first.count, second.count, "the same entry, read twice");
+    assert!(
+        after_one < start,
+        "a chunk the caller still holds has to be charged"
+    );
+    assert_eq!(
+        start - after_one,
+        after_one - after_two,
+        "the second copy costs what the first did; the ceiling accumulates rather than resetting"
+    );
+}
+
 #[test]
 fn an_unimplemented_codec_is_refused_by_name() {
     // A different failure from a corrupt file: the file is fine, this build cannot read

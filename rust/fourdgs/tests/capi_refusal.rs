@@ -10,7 +10,7 @@
 //! refusal table does not name.
 
 use std::collections::BTreeMap;
-use std::ffi::{c_char, c_int, CStr};
+use std::ffi::{c_char, c_int, c_void, CStr};
 
 use fourdgs::capi::*;
 use fourdgs::error::refusal;
@@ -523,6 +523,136 @@ fn indexed_c_abi_caps_chunk_and_sh_ranges_before_transport_reads() {
         last_error().contains("indexed SH Band Stream range"),
         "{}",
         last_error()
+    );
+}
+
+/// What a host callback saw, so a test can state what the reader asked for rather than
+/// what it happened to get away with.
+#[derive(Default)]
+struct HostReads {
+    bytes: Vec<u8>,
+    largest_request: u64,
+    beyond_end: Vec<(u64, u64)>,
+}
+
+unsafe extern "C" fn host_size(ctx: *mut c_void, out_size: *mut u64) -> c_int {
+    // SAFETY: `ctx` is the `HostReads` this test handed to `fourdgs_open_reader_ex`, and
+    // `out_size` is the live local the core passes.
+    let host = unsafe { &mut *(ctx as *mut HostReads) };
+    unsafe { *out_size = host.bytes.len() as u64 };
+    FOURDGS_STATUS_OK
+}
+
+unsafe extern "C" fn host_read(ctx: *mut c_void, offset: u64, length: u64, out: *mut u8) -> c_int {
+    // SAFETY: as above; `out` is a buffer of `length` bytes owned by the core.
+    let host = unsafe { &mut *(ctx as *mut HostReads) };
+    host.largest_request = host.largest_request.max(length);
+    let end = offset.saturating_add(length);
+    if end > host.bytes.len() as u64 {
+        host.beyond_end.push((offset, length));
+        return FOURDGS_STATUS_TRUNCATED;
+    }
+    // SAFETY: the range was just checked against the resource, and `out` is at least
+    // `length` bytes.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            host.bytes[offset as usize..end as usize].as_ptr(),
+            out,
+            length as usize,
+        )
+    };
+    FOURDGS_STATUS_OK
+}
+
+/// Open indexed over a caller-supplied range source and reconstruct one instant, the way
+/// every C, C++ and Swift consumer does.
+fn indexed_state_status_over_reader(host: &mut HostReads) -> c_int {
+    let reader = fourdgs_reader {
+        ctx: host as *mut HostReads as *mut c_void,
+        size: Some(host_size),
+        read: Some(host_read),
+        // The scene borrows `host` for its lifetime; nothing to release.
+        release: None,
+    };
+    let mut scene: *mut fourdgs_scene = std::ptr::null_mut();
+    // SAFETY: `host` outlives the scene, which is freed before this function returns.
+    let open = unsafe { fourdgs_open_reader_ex(reader, FOURDGS_OPEN_INDEXED, &mut scene) };
+    assert_eq!(
+        open,
+        FOURDGS_STATUS_OK,
+        "the indexed fixture opens: {}",
+        last_error()
+    );
+    let mut state: *mut fourdgs_state = std::ptr::null_mut();
+    // SAFETY: `scene` came from the successful open and `state` is a live out pointer.
+    let status = unsafe { fourdgs_scene_state_at(scene, 0.5, 3, &mut state) };
+    if !state.is_null() {
+        // SAFETY: the pointer came from this call and is freed once.
+        unsafe { fourdgs_state_free(state) };
+    }
+    // SAFETY: the pointer came from the successful open and is freed once.
+    unsafe { fourdgs_scene_free(scene) };
+    status
+}
+
+/// A Chunk Index entry is two raw numbers with no framing around them, and nothing else
+/// in the file agrees with them. `BytesReadable` and `FileReadable` refuse a range past
+/// their own end and so hide that the reader never checked; a callback source cannot,
+/// because it sizes the buffer the host writes into before the host sees the offset. The
+/// claim under test is therefore about the request, not about which transport survives it:
+/// the reader must not ask for a range the resource does not contain.
+#[test]
+fn indexed_c_abi_never_asks_a_callback_source_for_a_range_past_the_end() {
+    let chunk = fourdgs::records::encode_chunk(0.0, 1.0, 0, 0, &[]);
+
+    // Comfortably inside every ceiling the reader applies to itself, so nothing but the
+    // resource can refuse it — and still 64 MiB asked for by a file of a few hundred
+    // bytes, once per index entry and once per SH band range.
+    const OVERSIZED: u64 = 64 * 1024 * 1024;
+    const { assert!(OVERSIZED < MAX_INDEXED_STATE_RECORD_BYTES) };
+
+    let mut host = HostReads {
+        bytes: file_with_state_ranges(&chunk, OVERSIZED, &[]),
+        ..Default::default()
+    };
+    let file_length = host.bytes.len() as u64;
+    let status = indexed_state_status_over_reader(&mut host);
+    assert_eq!(status, FOURDGS_STATUS_TRUNCATED, "{}", last_error());
+    assert!(
+        last_error().contains("indexed Chunk range"),
+        "{}",
+        last_error()
+    );
+    assert_eq!(
+        host.beyond_end,
+        Vec::new(),
+        "the reader asked a callback source for a range past the end of a {file_length}-byte \
+         resource; the request is what allocates, and the transport is not where the check belongs"
+    );
+    assert!(
+        host.largest_request <= file_length,
+        "the largest range asked for was {} bytes of a {file_length}-byte resource",
+        host.largest_request
+    );
+
+    // The same for an SH Band Stream range, which is read per band and per index entry.
+    let mut host = HostReads {
+        bytes: file_with_state_ranges(&chunk, chunk.len() as u64, &[(1, Vec::new(), OVERSIZED)]),
+        ..Default::default()
+    };
+    let file_length = host.bytes.len() as u64;
+    let status = indexed_state_status_over_reader(&mut host);
+    assert_eq!(status, FOURDGS_STATUS_TRUNCATED, "{}", last_error());
+    assert!(
+        last_error().contains("indexed SH Band Stream range"),
+        "{}",
+        last_error()
+    );
+    assert_eq!(
+        host.beyond_end,
+        Vec::new(),
+        "the reader asked a callback source for an SH range past the end of a \
+         {file_length}-byte resource"
     );
 }
 

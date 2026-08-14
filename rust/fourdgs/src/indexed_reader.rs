@@ -77,6 +77,30 @@ fn check_resource_length(at: u64, length: u64, cap: u64, what: &str) -> Result<(
     Ok(())
 }
 
+/// Refuse a range the summary declares that runs past the end of the resource, before the
+/// transport is asked for it.
+///
+/// The front-matter walk already frames every record against `size`, but a Chunk Index
+/// entry is a pair of raw numbers with no framing around them, and it is untrusted input
+/// like everything else in the file. `BytesReadable` and `FileReadable` happen to bound a
+/// read by their own size and so hide the gap; a transport is only obliged to report a
+/// size and fill a buffer, and the C ABI's callback source allocates the requested length
+/// before the host callback ever sees the offset. Checking the range here is what makes
+/// the bound belong to the reader rather than to whichever transport is underneath it.
+fn check_range_within_resource(size: u64, at: u64, length: u64, what: &str) -> Result<()> {
+    let end = at.checked_add(length).ok_or_else(|| {
+        Error::Malformed(format!(
+            "the {what} at byte {at} overflows while spanning {length} bytes"
+        ))
+    })?;
+    if end > size {
+        return Err(Error::Truncated(format!(
+            "the {what} at byte {at} spans {length} bytes, past the end of a {size}-byte resource"
+        )));
+    }
+    Ok(())
+}
+
 fn check_record_count(count: usize, at: u64, what: &str) -> Result<()> {
     if count > MAX_RETAINED_RECORDS {
         return Err(Error::UnsupportedOperation(format!(
@@ -265,6 +289,23 @@ impl<'a, R: Readable + ?Sized> FrontMatter<'a, R> {
     }
 }
 
+/// The next prefix to ask for when the current one did not satisfy the parser.
+///
+/// Doubling alone turns one range request into `2 + log2(L / 8 KiB)` of them and moves
+/// roughly `2L` bytes, because each attempt re-reads from the same offset. That is the
+/// wrong cost model for a path whose reason to exist is cheap seeking, and it is avoidable:
+/// a record that declares `count` rows of a fixed width has already said how long it is, in
+/// bytes this reader has already fetched. Where it has, jump there; where it has not — an
+/// extensible record with no counted rows — doubling is still the only honest guess.
+fn grown_prefix_length(current: u64, maximum: u64, implied: Option<rec::CountedMinimum>) -> u64 {
+    let doubled = current.max(1).saturating_mul(2);
+    let wanted = match implied {
+        Some(minimum) => doubled.max(minimum.needed),
+        None => doubled,
+    };
+    wanted.min(maximum)
+}
+
 /// Parse the known prefix of one extensible front-matter record.
 ///
 /// The record's framed length remains the authority for finding the next record. Only the
@@ -323,7 +364,12 @@ where
         match parse(&prefix, complete) {
             Ok(value) => return Ok((value, prefix.capacity())),
             Err(Error::Truncated(_)) if prefix_length < maximum => {
-                prefix_length = prefix_length.max(1).saturating_mul(2).min(maximum);
+                prefix_length = grown_prefix_length(
+                    prefix_length,
+                    maximum,
+                    rec::counted_record_minimum_length(record.opcode, &prefix)
+                        .map_err(|error| error.at_record(what, record.offset))?,
+                );
             }
             Err(Error::Truncated(_)) if record.content_length > maximum => {
                 return Err(Error::UnsupportedOperation(format!(
@@ -1607,23 +1653,84 @@ pub fn open_indexed<R: Readable + ?Sized>(source: &mut R) -> Result<IndexedScene
     Ok(scene)
 }
 
+/// What an indexed reader may still allocate, across every read a caller keeps.
+///
+/// One `read_chunk` bounds itself, which is not the same thing as bounding a caller: a
+/// loop over the index that keeps what it reads allocates the whole ceiling once per entry
+/// unless the ceiling is carried between the calls. This budget is that carrier. It starts
+/// at the shared scene ceiling less what the opened [`IndexedScene`] already retains, and
+/// every chunk read through it is both bounded by, and charged against, the remainder.
+///
+/// A caller that drops each chunk before reading the next one wants a fresh budget per
+/// read — which is what [`read_chunk`] is.
+#[derive(Debug, Clone, Copy)]
+pub struct ResidentBudget {
+    remaining: usize,
+}
+
+impl ResidentBudget {
+    /// The bytes left beside an opened scene's own retained state.
+    pub fn for_scene(scene: &IndexedScene) -> Result<ResidentBudget> {
+        let retained = indexed_scene_resident_bytes(scene)?;
+        let remaining = crate::stream_reader::MAX_DECODED_SCENE_BYTES
+            .checked_sub(retained)
+            .ok_or_else(|| {
+                Error::UnsupportedOperation(format!(
+                    "the opened indexed scene retains {retained} bytes, past the {} byte shared scene ceiling",
+                    crate::stream_reader::MAX_DECODED_SCENE_BYTES
+                ))
+            })?;
+        Ok(ResidentBudget { remaining })
+    }
+
+    /// Bytes still available to reads made through this budget.
+    pub fn remaining(&self) -> usize {
+        self.remaining
+    }
+
+    fn charge(&mut self, bytes: usize, what: &str) -> Result<()> {
+        self.remaining = self.remaining.checked_sub(bytes).ok_or_else(|| {
+            Error::UnsupportedOperation(format!(
+                "the {what} retains {bytes} bytes, past the {} bytes left in the indexed scene budget",
+                self.remaining
+            ))
+        })?;
+        Ok(())
+    }
+}
+
 /// Fetch and decode one chunk, plus only the SH bands asked for.
 ///
 /// Never transferring a band you will not evaluate is the whole point of storing each one
 /// in its own record with its own byte range.
+///
+/// This bounds **one** read against the scene's remaining budget and then forgets it. A
+/// caller that retains several chunks at once wants [`read_chunk_within`] and one
+/// [`ResidentBudget`] threaded through the loop, because N reads of the whole ceiling are
+/// N ceilings.
 pub fn read_chunk<R: Readable + ?Sized>(
     source: &mut R,
     scene: &IndexedScene,
     entry: &rec::ChunkIndexEntry,
     max_sh_band: u8,
 ) -> Result<DecodedChunk> {
-    read_chunk_with_limit(
-        source,
-        scene,
-        entry,
-        max_sh_band,
-        crate::stream_reader::MAX_DECODED_SCENE_BYTES,
-    )
+    let mut budget = ResidentBudget::for_scene(scene)?;
+    read_chunk_within(source, scene, entry, max_sh_band, &mut budget)
+}
+
+/// Fetch and decode one chunk against a budget shared with every other chunk the caller is
+/// still holding, charging what this one retains.
+pub fn read_chunk_within<R: Readable + ?Sized>(
+    source: &mut R,
+    scene: &IndexedScene,
+    entry: &rec::ChunkIndexEntry,
+    max_sh_band: u8,
+    budget: &mut ResidentBudget,
+) -> Result<DecodedChunk> {
+    let chunk = read_chunk_with_limit(source, scene, entry, max_sh_band, budget.remaining)?;
+    let retained = crate::stream_reader::decoded_chunk_resident_bytes(&chunk, &chunk.bands)?;
+    budget.charge(retained, "decoded indexed Chunk")?;
+    Ok(chunk)
 }
 
 /// Fetch one indexed Chunk within the remaining resident budget of its scene.
@@ -1661,6 +1768,13 @@ pub(crate) fn read_chunk_with_limit<R: Readable + ?Sized>(
             )));
         }
     }
+    let size = source.size()?;
+    check_range_within_resource(
+        size,
+        entry.chunk_offset,
+        entry.chunk_length,
+        "indexed Chunk range",
+    )?;
     let blob = source.read(entry.chunk_offset, entry.chunk_length)?;
     let content = record_content(&blob, op::CHUNK)?;
     let (head, streams) = rec::parse_chunk(content)?;
@@ -1723,6 +1837,7 @@ pub(crate) fn read_chunk_with_limit<R: Readable + ?Sized>(
                 "the indexed SH Band Stream range at byte {offset} needs {length} encoded bytes beside {decoded_bytes} resident Chunk and SH bytes, past the {max_output_bytes} byte decode working-set budget"
             )));
         }
+        check_range_within_resource(size, *offset, *length, "indexed SH Band Stream range")?;
         let blob = source.read(*offset, *length)?;
         let content = record_content(&blob, op::SH_BAND_STREAM)?;
         let mut cursor = Cursor::new(content);
@@ -3333,7 +3448,12 @@ where
         match parse(&prefix, complete) {
             Ok(value) => return Ok((value, prefix.capacity())),
             Err(Error::Truncated(_)) if prefix_length < maximum => {
-                prefix_length = prefix_length.max(1).saturating_mul(2).min(maximum);
+                prefix_length = grown_prefix_length(
+                    prefix_length,
+                    maximum,
+                    rec::counted_record_minimum_length(opcode, &prefix)
+                        .map_err(|error| error.at_record(what, offset))?,
+                );
             }
             Err(Error::Truncated(_)) if declared > maximum => {
                 return Err(Error::UnsupportedOperation(format!(
@@ -3641,6 +3761,49 @@ mod tests {
             "the {}-byte suffix was stepped over, not fetched; largest read was {}",
             suffix,
             source.largest_read
+        );
+    }
+
+    /// A record whose rows are all required has already said how long it is. Growing a
+    /// prefix towards that number by doubling costs `log2` round trips and re-reads
+    /// everything each time; on the `Readable` abstraction that is latency, not only
+    /// bytes, and the indexed path exists to make seeking cheap.
+    #[test]
+    fn a_counted_record_is_fetched_at_its_own_size_rather_than_by_doubling() {
+        const SAMPLES: usize = 2000;
+        let track = rec::ObjectTrack {
+            object_id: 7,
+            interpolation: 0,
+            times: (0..SAMPLES).map(|i| i as f64 / SAMPLES as f64).collect(),
+            rotations: vec![[1.0, 0.0, 0.0, 0.0]; SAMPLES],
+            translations: vec![[0.0, 0.0, 0.0]; SAMPLES],
+        }
+        .encode(&[])
+        .expect("the track encodes");
+        // Well past the 8 KiB probe, so the prefix has to grow at all.
+        assert!(track.len() > 8 * HEAD_PROBE as usize);
+
+        let mut bytes = indexed_file_with_header_trailer(&[]);
+        let footer_and_magic = rec::Footer::default().encode().len() + MAGIC.len();
+        let insert_at = bytes.len() - footer_and_magic;
+        bytes.splice(insert_at..insert_at, track.iter().copied());
+
+        let mut source = TrackingReadable {
+            bytes,
+            ..Default::default()
+        };
+        let scene = open_indexed(&mut source).expect("the fixture opens");
+        assert_eq!(scene.object_track_ranges.len(), 1, "the track was framed");
+
+        source.reads = 0;
+        source.largest_read = 0;
+        let objects = read_objects(&mut source, &scene).expect("the track reads");
+        assert_eq!(objects.tracks[0].sample_count(), SAMPLES);
+        assert!(
+            source.reads <= 3,
+            "a lazily read Object Track costs a header read, a probe and one sized read; \
+             this took {} range requests",
+            source.reads
         );
     }
 

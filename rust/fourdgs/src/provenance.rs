@@ -17,6 +17,8 @@
 //! never touches a [`Provenance`], and a file that carries none produces an empty one —
 //! which is a value, not an error.
 
+use std::collections::HashSet;
+
 use crate::error::{Error, Result};
 use crate::records::{
     CoordinateFrame, GeodeticAnchor, RigTrajectory, SensorCalibration, POSE_TO_RIG, POSE_TO_SCENE,
@@ -297,12 +299,19 @@ fn check_unique_record_names<T>(
     section: &str,
     name: impl Fn(&T) -> &str,
 ) -> Result<()> {
-    for (index, value) in values.iter().enumerate() {
+    // A set rather than a scan of everything already seen. The record-count ceiling bounds
+    // how many of these there can be, which bounds memory; it only bounds the CPU spent on
+    // them if the work per record is constant, and rescanning the prefix is not.
+    let mut seen: HashSet<&str> = HashSet::new();
+    seen.try_reserve(values.len()).map_err(|error| {
+        Error::UnsupportedOperation(format!(
+            "the {label} name set could not reserve {} entries: {error}",
+            values.len()
+        ))
+    })?;
+    for value in values {
         let value_name = name(value);
-        if values[..index]
-            .iter()
-            .any(|earlier| name(earlier) == value_name)
-        {
+        if !seen.insert(value_name) {
             return Err(Error::Malformed(format!(
                 "two {label} records are named {value_name:?}; these records are referred to by name and nothing else (section {section})"
             )));

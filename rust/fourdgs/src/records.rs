@@ -64,6 +64,96 @@ pub const FLAG_CHUNKS_COMPRESSED: u8 = 1 << 1;
 pub const AUDIO_SOURCE_SPATIAL: u8 = 1 << 0;
 pub const AUDIO_SOURCE_LOOP: u8 = 1 << 1;
 
+/// The least content bytes the counted fields visible in `prefix` imply.
+///
+/// Two callers want this number and they want it for different reasons. Framing wants it
+/// to catch a record that declares more rows than its own length could hold, which is a
+/// contradiction rather than a truncation. Prefix readers want it to stop guessing: a
+/// record whose rows are all required is fetched at its own size on the next request
+/// instead of at 8 KiB, then 16 KiB, then 32 KiB, each one a round trip and each one
+/// re-reading everything before it.
+///
+/// `None` means the counts are not visible yet, or the record has none.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CountedMinimum {
+    what: &'static str,
+    /// The declared row count, absent when only the fixed header is accounted for.
+    count: Option<u32>,
+    pub(crate) needed: u64,
+}
+
+pub(crate) fn counted_record_minimum_length(
+    opcode: u8,
+    prefix: &[u8],
+) -> Result<Option<CountedMinimum>> {
+    fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
+        let raw: [u8; 4] = bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?;
+        Some(u32::from_le_bytes(raw))
+    }
+
+    fn rows(
+        what: &'static str,
+        count: Option<u32>,
+        fixed_bytes: u64,
+        row_bytes: u64,
+    ) -> Result<Option<CountedMinimum>> {
+        let Some(count) = count else {
+            return Ok(None);
+        };
+        let needed = u64::from(count)
+            .checked_mul(row_bytes)
+            .and_then(|rows| rows.checked_add(fixed_bytes))
+            .ok_or_else(|| {
+                Error::Malformed(format!(
+                    "{what} declares {count} rows whose minimum record length overflows"
+                ))
+            })?;
+        Ok(Some(CountedMinimum {
+            what,
+            count: Some(count),
+            needed,
+        }))
+    }
+
+    match opcode {
+        op::WINDOW_TABLE => rows("Window Table", u32_at(prefix, 0), 4, 16),
+        // Fixed pose + count, then an empty interpolation string and loop byte.
+        op::CAMERA => rows("Camera", u32_at(prefix, 56), 65, 56),
+        op::RIG_TRAJECTORY => {
+            let Some(name_length) = u32_at(prefix, 0) else {
+                return Ok(None);
+            };
+            let count_offset = 4usize
+                .checked_add(name_length as usize)
+                .and_then(|offset| offset.checked_add(1))
+                .ok_or_else(|| Error::Malformed("Rig Trajectory name length overflows".into()))?;
+            let fixed_bytes = (count_offset as u64).checked_add(4).ok_or_else(|| {
+                Error::Malformed("Rig Trajectory fixed field length overflows".into())
+            })?;
+            match u32_at(prefix, count_offset) {
+                Some(count) => rows("Rig Trajectory", Some(count), fixed_bytes, 64),
+                // The name and the count field are themselves a floor, before the count
+                // behind them is readable.
+                None => Ok(Some(CountedMinimum {
+                    what: "Rig Trajectory",
+                    count: None,
+                    needed: fixed_bytes,
+                })),
+            }
+        }
+        op::OBJECT_TABLE => match (u32_at(prefix, 0), prefix.get(4..6)) {
+            (Some(count), Some(embedding)) => {
+                let embedding_dim = u16::from_le_bytes([embedding[0], embedding[1]]);
+                let row_bytes = 21 + u64::from(embedding_dim > 0);
+                rows("Object Table", Some(count), 6, row_bytes)
+            }
+            _ => Ok(None),
+        },
+        op::OBJECT_TRACK => rows("Object Track", u32_at(prefix, 5), 9, 64),
+        _ => Ok(None),
+    }
+}
+
 /// Reject counted known fields that cannot fit inside their complete record framing.
 ///
 /// Prefix readers may deliberately stop before a legal extension suffix, but once a
@@ -74,87 +164,25 @@ pub(crate) fn preflight_counted_record_length(
     prefix: &[u8],
     full_content_length: u64,
 ) -> Result<()> {
-    fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
-        let raw: [u8; 4] = bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?;
-        Some(u32::from_le_bytes(raw))
+    let Some(minimum) = counted_record_minimum_length(opcode, prefix)? else {
+        return Ok(());
+    };
+    if minimum.needed <= full_content_length {
+        return Ok(());
     }
-
-    fn check(
-        what: &str,
-        count: u32,
-        fixed_bytes: u64,
-        row_bytes: u64,
-        full_content_length: u64,
-    ) -> Result<()> {
-        let needed = u64::from(count)
-            .checked_mul(row_bytes)
-            .and_then(|rows| rows.checked_add(fixed_bytes))
-            .ok_or_else(|| {
-                Error::Malformed(format!(
-                    "{what} declares {count} rows whose minimum record length overflows"
-                ))
-            })?;
-        if needed > full_content_length {
-            return Err(Error::Malformed(format!(
-                "{what} declares {count} rows needing at least {needed} content bytes, but its record declares {full_content_length}"
-            )));
-        }
-        Ok(())
-    }
-
-    match opcode {
-        op::WINDOW_TABLE => {
-            if let Some(count) = u32_at(prefix, 0) {
-                check("Window Table", count, 4, 16, full_content_length)?;
-            }
-        }
-        op::CAMERA => {
-            if let Some(count) = u32_at(prefix, 56) {
-                // Fixed pose + count, then an empty interpolation string and loop byte.
-                check("Camera", count, 65, 56, full_content_length)?;
-            }
-        }
-        op::RIG_TRAJECTORY => {
-            let Some(name_length) = u32_at(prefix, 0) else {
-                return Ok(());
-            };
-            let count_offset = 4usize
-                .checked_add(name_length as usize)
-                .and_then(|offset| offset.checked_add(1))
-                .ok_or_else(|| Error::Malformed("Rig Trajectory name length overflows".into()))?;
-            let fixed_bytes = (count_offset as u64).checked_add(4).ok_or_else(|| {
-                Error::Malformed("Rig Trajectory fixed field length overflows".into())
-            })?;
-            if fixed_bytes > full_content_length {
-                return Err(Error::Malformed(format!(
-                    "Rig Trajectory name and count header need at least {fixed_bytes} content bytes, but its record declares {full_content_length}"
-                )));
-            }
-            if let Some(count) = u32_at(prefix, count_offset) {
-                check(
-                    "Rig Trajectory",
-                    count,
-                    fixed_bytes,
-                    64,
-                    full_content_length,
-                )?;
-            }
-        }
-        op::OBJECT_TABLE => {
-            if let (Some(count), Some(embedding)) = (u32_at(prefix, 0), prefix.get(4..6)) {
-                let embedding_dim = u16::from_le_bytes([embedding[0], embedding[1]]);
-                let row_bytes = 21 + u64::from(embedding_dim > 0);
-                check("Object Table", count, 6, row_bytes, full_content_length)?;
-            }
-        }
-        op::OBJECT_TRACK => {
-            if let Some(count) = u32_at(prefix, 5) {
-                check("Object Track", count, 9, 64, full_content_length)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
+    let CountedMinimum {
+        what,
+        count,
+        needed,
+    } = minimum;
+    Err(Error::Malformed(match count {
+        Some(count) => format!(
+            "{what} declares {count} rows needing at least {needed} content bytes, but its record declares {full_content_length}"
+        ),
+        None => format!(
+            "{what} name and count header need at least {needed} content bytes, but its record declares {full_content_length}"
+        ),
+    }))
 }
 
 #[derive(Debug, Clone, PartialEq)]

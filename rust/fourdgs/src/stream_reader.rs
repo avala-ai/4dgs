@@ -1044,6 +1044,17 @@ fn read_from_with_limits<R: Read>(
                     quant = Some(parsed);
                 }
                 PrefixRecord::WindowTable(parsed) => {
+                    // A gaussian's window index is checked against the table in force when
+                    // its Chunk is decoded (spec §5.4). A second table arriving after a
+                    // Chunk would reinterpret indices that were already accepted, and a
+                    // shorter one would leave them pointing outside it — so it is refused
+                    // here rather than applied retroactively.
+                    if !chunks.is_empty() {
+                        return Err(Error::Malformed(format!(
+                            "the Window Table at byte {offset} follows {} decoded Chunk record(s); the table a gaussian's window index refers to must precede the Chunk that carries it",
+                            chunks.len()
+                        )));
+                    }
                     retained_record_bytes = replace_streamed_retained_bytes(
                         retained_record_bytes,
                         window_table_resident_bytes,
@@ -2425,8 +2436,14 @@ pub(crate) fn assemble_with_retained(
         out.motions.extend_from_slice(&chunk.motions);
         out.mu_t.extend_from_slice(&chunk.mu_t);
         out.sigma_t.extend_from_slice(&chunk.sigma_t);
+        // Decoding checked these indices against the table it was handed; assembly is a
+        // second caller with its own `windows`, and an index that fits one table need not
+        // fit another. Checking again costs a comparison and turns what would be a panic —
+        // undefined behaviour across the C ABI, an abort under `panic=abort` — into the
+        // refusal §5.4 requires.
         for wi in &chunk.window_index {
-            let (lo, hi) = table[*wi as usize];
+            let index = crate::chunk::check_window_index(i64::from(*wi), table.len())? as usize;
+            let (lo, hi) = table[index];
             out.win_lo.push(lo as f32);
             out.win_hi.push(hi as f32);
         }
