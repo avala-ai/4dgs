@@ -6,6 +6,8 @@ All notable changes to the Python package are documented here, following
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-14
+
 ### Changed
 
 - **A per-band SH bound is matched against the spelling spec §5.3 defines, not against everything

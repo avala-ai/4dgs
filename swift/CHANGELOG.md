@@ -6,6 +6,8 @@ All notable changes to the Swift package are documented here, following
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-14
+
 ### Added
 
 - **Encoding the `keyframe-delta` temporal model**, turning the Swift cell of that row from Planned
