@@ -6,6 +6,8 @@ All notable changes to the Rust crate are documented here, following
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-14
+
 ### Fixed
 
 - **The canonical object-layer JSON no longer spells the sign of a zero.**

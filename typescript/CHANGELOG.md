@@ -8,6 +8,8 @@ The four packages version together.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-14
+
 ### Fixed
 
 - **A string on the wire keeps its leading U+FEFF.** `@4dgs/core`'s `Cursor` and the validator's two

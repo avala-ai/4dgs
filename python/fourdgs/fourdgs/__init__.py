@@ -17,7 +17,7 @@ from __future__ import annotations
 
 #: Single source of truth for the package version; the release workflow asserts this
 #: against the tag it was invoked with.
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 from .compressed_ply import import_scene as from_compressed_ply
 from .compressed_ply import is_compressed_ply, read_compressed_ply, sorted_segments
