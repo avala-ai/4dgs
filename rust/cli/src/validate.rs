@@ -1611,36 +1611,49 @@ mod tests {
 
     #[test]
     fn the_refused_header_is_the_one_that_declares_the_model_not_the_first_one() {
-        // Nothing in the framing forbids a second Header, and a reader checks each one as
-        // it meets it — so a file whose first Header is fine and whose second declares a
-        // model this build does not implement is refused *at the second*. Naming the first
-        // gives a byte that points at a record with nothing wrong with it, which is worse
-        // than no byte: an offset is believed.
+        // The framing DOES now forbid a second Header (spec §4), so this file is refused
+        // for carrying two rather than for the model the second one declares — and that
+        // ordering is deliberate. `check_temporal_model` is a compatibility gate: its
+        // refusal tells the holder to go and find a newer reader. Saying that about a
+        // file that is structurally broken sends them looking for a build that would
+        // refuse it too. "This file carries two Headers" is the true answer.
+        //
+        // What survives from the older test is the property it existed for: the byte in
+        // the refusal points at the offending record and not at an innocent one. Here
+        // that is the second Header, since the first is unobjectionable.
         let data = minimal_file_headed(&["gaussian-birth", "frame-sequence"], &[grids()]);
         let report = validate(&data);
         assert!(!report.ok(), "{:?}", errors(&report));
-        assert_eq!(
-            refused_at(&report, fourdgs::error::refusal::UNKNOWN_TEMPORAL_MODEL),
-            nth_record(&data, op::HEADER, 1),
-            "the second Header is the one that declares the model nobody implements"
+        let second = nth_record(&data, op::HEADER, 1);
+        assert!(
+            errors(&report)
+                .iter()
+                .any(|m| m.contains("a second Header record")
+                    && m.contains(&format!("at byte {second}"))),
+            "the refusal must name the second Header and its byte: {:?}",
+            errors(&report)
         );
     }
 
     #[test]
     fn the_refused_quantization_record_is_the_one_that_declares_the_scheme() {
-        // The same rule, one record along. `check_quantization_scheme` runs per record on
-        // both read paths, so the refusal fires at whichever copy declares the scheme.
+        // The same rule, one record along, and the same reordering: the file is refused
+        // for its second Quantization record rather than for the scheme that record
+        // names. `check_quantization_scheme` is the other compatibility gate, and the
+        // reasoning above applies to it unchanged.
         let mut unknown = grids();
         unknown.scheme = "uniform-v9".into();
         let data = minimal_file_with(&[grids(), unknown]);
         let report = validate(&data);
         assert!(!report.ok());
-        assert_eq!(
-            refused_at(
-                &report,
-                fourdgs::error::refusal::UNKNOWN_QUANTIZATION_SCHEME
-            ),
-            nth_record(&data, op::QUANTIZATION, 1)
+        let second = nth_record(&data, op::QUANTIZATION, 1);
+        assert!(
+            errors(&report)
+                .iter()
+                .any(|m| m.contains("a second Quantization record")
+                    && m.contains(&format!("at byte {second}"))),
+            "the refusal must name the second Quantization record and its byte: {:?}",
+            errors(&report)
         );
     }
 
