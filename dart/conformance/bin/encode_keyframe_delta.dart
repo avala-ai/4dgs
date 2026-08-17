@@ -23,6 +23,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:fourdgs/fourdgs.dart';
+import 'package:fourdgs/writer.dart';
 
 /// Seconds and sample count of the synthetic sequences, matching the generator.
 const int kdSteps = 8;

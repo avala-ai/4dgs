@@ -16,6 +16,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:fourdgs/fourdgs.dart';
+import 'package:fourdgs/writer.dart';
 import 'package:test/test.dart';
 
 const double _duration = 8.0;

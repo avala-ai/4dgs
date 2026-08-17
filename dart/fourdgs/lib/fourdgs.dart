@@ -22,16 +22,23 @@
 /// the edges, so the decoder can be tested without a network and shipped
 /// without a platform.
 ///
-/// Writing goes the other way through the same primitives:
-/// [writeFourdgsToSink] and [writeKeyframeDeltaToSink] emit bounded records;
-/// [writeFourdgsBytes] and [writeKeyframeDeltaBytes] are their in-memory
-/// conveniences. They encode gaussian state in their own right rather than
-/// wrapping another SDK, which is what makes their agreement with those SDKs
-/// worth something.
+/// Writing goes the other way through the same primitives, and lives in
+/// `package:fourdgs/writer.dart`: [writeFourdgsToSink] and
+/// [writeKeyframeDeltaToSink] emit bounded records, [writeFourdgsBytes] and
+/// [writeKeyframeDeltaBytes] are their in-memory conveniences. They encode
+/// gaussian state in their own right rather than wrapping another SDK, which is
+/// what makes their agreement with those SDKs worth something.
+///
+/// The encoder is a separate import because it cannot be compiled for the web
+/// at all — its Morton-code masks are 64-bit values a JavaScript number cannot
+/// represent — and an export is enough to put a file in the compile graph. Kept
+/// here, it made this whole library impossible to build for a browser consumer
+/// that only ever reads. See that library's own documentation for why the masks are
+/// not the thing to change.
 ///
 /// Reading a file from disk needs one more import: `package:fourdgs/io.dart`
-/// carries the `dart:io` transport, kept out of this library so the decoder
-/// itself stays platform-free and usable in a browser.
+/// carries the `dart:io` transport, kept out of this library for the same
+/// reason — so the decoder itself stays platform-free and usable in a browser.
 ///
 /// The normative specification is at <https://github.com/avala-ai/4dgs>.
 library;
@@ -52,7 +59,6 @@ export 'src/refusal.dart';
 export 'src/serialization.dart';
 export 'src/stream_reader.dart';
 export 'src/validate.dart';
-export 'src/writer.dart';
 
 /// This package's version, and the single source of truth for it.
 ///
