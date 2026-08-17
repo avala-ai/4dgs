@@ -138,12 +138,12 @@ only the tail of a file can still identify it and locate the Footer.
 Multiplicity is normative where the diagram shows it. The records drawn without a repetition marker
 — Header, Quantization, Window Table — appear **exactly once**, and **a reader MUST refuse a file
 carrying two of any of them**, naming the record and the byte. These three describe the whole file,
-nothing in the format says which of two copies wins, and the two ways to guess are not equivalent:
-a front-to-back reader that keeps the last and a seeking reader that stops at the first will report
+nothing in the format says which of two copies wins, and the two ways to guess are not equivalent: a
+front-to-back reader that keeps the last and a seeking reader that stops at the first will report
 two different scenes for the same bytes, each silently. That is §5.15.3's reason about duplicate
-sensor names applied to the records the rest of the file is interpreted against, where the
-ambiguity is widest rather than narrowest. A writer has no reason to emit two, so nothing legal is
-lost by refusing.
+sensor names applied to the records the rest of the file is interpreted against, where the ambiguity
+is widest rather than narrowest. A writer has no reason to emit two, so nothing legal is lost by
+refusing.
 
 ### 4.1 Magic
 

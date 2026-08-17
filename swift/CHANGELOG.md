@@ -6,6 +6,20 @@ All notable changes to the Swift package are documented here, following
 
 ## [Unreleased]
 
+### Changed
+
+- **A file carrying two Header, Quantization or Window Table records is refused rather than guessed
+  at.** §4's layout diagram draws all three without a repetition marker, so "exactly one" was
+  already the intent, but no sentence made it a refusal and both read paths quietly guessed —
+  differently. The streamed reader walked every record and kept whichever copy came last; the
+  indexed opener parses the front matter and kept the first. A file with two Quantization records
+  declaring different steps therefore decoded to two different scenes depending on which reader
+  opened it, with nothing raised on either path. §4 now states the multiplicity rule and requires
+  the refusal, which names the record and the byte. A Window Table is tracked with a flag rather
+  than by testing the window list for emptiness: a file may legitimately carry a table with no
+  entries, which is not the same thing as carrying no table at all. Reached through the Rust core's
+  C ABI, so this package inherits the refusal without a change of its own.
+
 ### Fixed
 
 - Canonical summaries use exact decoded floats as the final tiebreaker after the established

@@ -4,13 +4,24 @@ All notable changes to the Dart package are documented here, following
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0]
+## [Unreleased]
 
-Prepared, not published. The heading carries the version rather than `Unreleased` because
-`pubspec.yaml` already declares 0.1.0 and pub refuses to pack a package whose changelog does not
-mention its own version — and because the release gate extracts this section as the release notes,
-so it has to exist before the tag rather than after it. There is no date: the release has not
-happened.
+### Changed
+
+- **A file carrying two Header, Quantization or Window Table records is refused rather than guessed
+  at.** §4's layout diagram draws all three without a repetition marker, so "exactly one" was
+  already the intent, but no sentence made it a refusal and both read paths quietly guessed —
+  differently. `readFourdgsBytes` walked every record and kept whichever copy came last;
+  `openFourdgsIndexed` parses the front matter and kept the first. A file with two Quantization
+  records declaring different steps therefore decoded to two different scenes depending on which
+  reader opened it, with nothing raised on either path. §4 now states the multiplicity rule and
+  requires the refusal, which names the record and the byte. A Window Table is tracked with a flag
+  rather than by testing the window list for emptiness: a file may legitimately carry a table with
+  no entries, which is not the same thing as carrying no table at all.
+
+## [0.1.0] - 2026-08-15
+
+Published to pub.dev under the `avala.ai` publisher.
 
 ### The writer
 
