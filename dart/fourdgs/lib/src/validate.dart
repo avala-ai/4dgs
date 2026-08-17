@@ -1291,7 +1291,7 @@ void _checkShBitDepths(
         'Quantization declares ${depths[i]} bits for SH band $band but no '
         '`$key` bound (§5.3)',
       );
-    } else if (declared != '$bound') {
+    } else if (!_decimalEqualsInteger(declared, bound)) {
       report.warn(
         'Quantization declares `$key` as $declared; ${depths[i]} bits gives a '
         'bound of $bound (§6.5)',
@@ -1305,6 +1305,55 @@ void _checkShBitDepths(
       'step_sh has to be given (§6.5)',
     );
   }
+}
+
+/// The whole of the spelling section 5.3 allows a `bounds` value: an optional
+/// sign, ASCII digits with an optional point, and an optional exponent.
+///
+/// Spelled `[0-9]` rather than `\d`, and anchored with no trim at either end,
+/// because both shorthands drag in a language the format does not have. Dart's
+/// `String.trim` removes U+FEFF, which the format treats as data.
+final RegExp _bound = RegExp(
+  r'^([+-]?)(?:([0-9]+)(?:\.([0-9]*))?|\.([0-9]+))(?:[eE]([+-]?[0-9]+))?$',
+);
+
+/// Whether the section 5.3 bound [value] spells exactly the small non-negative
+/// integer [expected].
+///
+/// Matched against the grammar the specification writes down rather than
+/// against whatever a runtime parses, which is what makes this agree with the
+/// Python, TypeScript and Rust validators on every input instead of on the ones
+/// their runtimes happen to read alike. Digits are compared as digits: no
+/// exponent is too large to read, and nothing passes through binary64.
+bool _decimalEqualsInteger(String value, int expected) {
+  final RegExpMatch? match = _bound.firstMatch(value);
+  if (match == null) return false;
+
+  final String integer = match.group(2) ?? '';
+  final String fraction = match.group(3) ?? match.group(4) ?? '';
+  String digits = integer + fraction;
+  final String exponent = match.group(5) ?? '0';
+  final int firstNonzero = digits.indexOf(RegExp('[1-9]'));
+  // A significand of zeroes is the value zero, at whatever exponent it carries.
+  if (firstNonzero < 0) return expected == 0;
+  if (match.group(1) == '-') return false;
+
+  digits = digits.substring(firstNonzero).replaceFirst(RegExp(r'0+$'), '');
+  final String expectedDigits = '$expected';
+  final int requiredExponent =
+      expectedDigits.length - integer.length + firstNonzero;
+  return digits == expectedDigits &&
+      _decimalIntegerEquals(exponent, requiredExponent);
+}
+
+/// Whether the signed digit string [value] is [expected], without building the
+/// number, so an exponent of any length is read exactly.
+bool _decimalIntegerEquals(String value, int expected) {
+  final bool negative = value.startsWith('-');
+  final String digits = value.replaceFirst(RegExp(r'^[+-]?0*'), '');
+  if (digits.isEmpty) return expected == 0;
+  if (negative != expected.isNegative) return false;
+  return digits == '${expected.abs()}';
 }
 
 /// Reports a record that would not parse, and says whether it was a refusal.

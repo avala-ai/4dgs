@@ -48,7 +48,7 @@ jobs:
             echo "conformance data: ${size_kb} KiB"
             [ "$size_kb" -le 2560 ] || { echo "::error::conformance data over budget"; exit 1; }
           fi
-      - name: Rust sources under 1856 KB
+      - name: Rust sources under 2 MB
         # Sources only: this job builds nothing, so target/ is not here to measure. A
         # vendored dependency would show up as a budget failure, which is the point —
         # everything these crates need comes from crates.io via Cargo.toml.
@@ -102,6 +102,14 @@ jobs:
         # new file costs 4 KiB whatever it contains. Trimming prose does not move this
         # number; adding or removing files does.
         #
+        # 2048 because 1856 was chosen the way every number before it was chosen — to fit
+        # the tree in front of me — and `main` crossed it four KiB later, one `du` block,
+        # on the merge after the one that set it. This is the fourth time this gate has
+        # gone red for that reason. The budget exists to catch a vendored dependency
+        # arriving in hundreds of KiB, not to fail on the next source file, so it is set
+        # with room to be wrong about the next few files rather than exactly right about
+        # today's.
+        #
         # 1856 after the canonical-state work and the bounded-validation branch: `keyframe_delta_states_json` and the
         # order-independent summary it now produces, the exact-aggregate arithmetic that
         # replaced summation order as a source of divergence, and two test files
@@ -112,7 +120,7 @@ jobs:
         run: |
           size_kb=$(du -s rust | cut -f1)
           echo "rust: ${size_kb} KiB"
-          [ "$size_kb" -le 1856 ] || { echo "::error::rust is ${size_kb} KiB, over the 1856 KiB budget"; exit 1; }
+          [ "$size_kb" -le 2048 ] || { echo "::error::rust is ${size_kb} KiB, over the 2048 KiB budget"; exit 1; }
 
       - name: TypeScript sources under 1216 KB
         # Sources only: this job installs nothing and builds nothing, so node_modules
@@ -665,6 +673,15 @@ jobs:
           ctest --test-dir cpp/build-nocore --build-config "$FOURDGS_CMAKE_CONFIG" \
             --output-on-failure --timeout 120
 
+          # The package's public sentinel remains empty after configure_package_config_file;
+          # a directory path here would make a no-core install look linkable to consumers.
+          cmake --install cpp/build-nocore --prefix "$RUNNER_TEMP/fourdgs-nocore-install" \
+            --config "$FOURDGS_CMAKE_CONFIG"
+          cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-nocore-consumer" \
+            -DFOURDGS_USE_INSTALLED_PACKAGE=ON \
+            -DFOURDGS_EXPECT_NO_CORE_PACKAGE=ON \
+            -Dfourdgs-cpp_DIR="$RUNNER_TEMP/fourdgs-nocore-install/lib/cmake/fourdgs-cpp"
+
       - name: Build and test against the core
         run: |
           cargo build -p fourdgs --release
@@ -673,10 +690,250 @@ jobs:
           ctest --test-dir cpp/build --build-config "$FOURDGS_CMAKE_CONFIG" \
             --output-on-failure --timeout 120
 
+      # Every other source-build leg configures into $RUNNER_TEMP, outside the repository —
+      # which is exactly the layout that cannot see this. Cargo resolves a workspace by
+      # walking up from the manifest CMake stages, so a build directory *inside* the
+      # repository finds the root `Cargo.toml` and refuses the staged crate as a member it
+      # is not. `cpp/build` and `cpp/build-nocore` above are in-repo, cpp/README.md tells a
+      # reader to use `cpp/build`, and neither of those builds the core from source. This
+      # step is the one that does both, so the case cannot go untested again.
+      - name: An in-repo build directory builds the core from source
+        run: |
+          cmake -S cpp -B cpp/build-source \
+            -DCMAKE_BUILD_TYPE="$FOURDGS_CMAKE_CONFIG" \
+            -DFOURDGS_BUILD_CORE_FROM_SOURCE=ON
+          cmake --build cpp/build-source --config "$FOURDGS_CMAKE_CONFIG" -j
+          ctest --test-dir cpp/build-source --build-config "$FOURDGS_CMAKE_CONFIG" \
+            --output-on-failure --timeout 120
+
       - name: The example runs, so it cannot rot into a snippet that no longer works
         run: |
           ./cpp/build/examples/decode_summary \
             tests/conformance/data/OneWindow-UseChunkIndex-UseCrc-WithSpatialAudio.4dgs
+
+      # A clean FetchContent checkout has the committed header and no target/ directory.
+      # This is the consumer #150 is about: CMake must drive Cargo itself, link the generated
+      # static core, and run across the ABI without an earlier repository build leaking in.
+      - name: A fresh out-of-tree consumer builds and links the core
+        run: |
+          git update-ref refs/heads/cmake-consumer-test HEAD
+          consumer_config="$FOURDGS_CMAKE_CONFIG"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # The source-built Rust archive always uses /MD. Exercise a normal Debug
+            # consumer here so the target's exported /MD requirement, rather than this
+            # workflow's top-level Release workaround, proves the CRTs agree.
+            consumer_config=Debug
+          fi
+
+          # Top-level repository builds permit the no-core development configuration by
+          # default. An explicit source-build request must override that permissive fallback
+          # without requiring a second, non-obvious ALLOW_NO_CORE=OFF switch.
+          cmake -S cpp -B "$RUNNER_TEMP/fourdgs-top-level-source-opt-in" \
+            -DCMAKE_BUILD_TYPE="$consumer_config" \
+            -DFOURDGS_BUILD_CORE_FROM_SOURCE=ON \
+            -DFOURDGS_BUILD_TESTS=OFF \
+            -DFOURDGS_BUILD_CONFORMANCE=OFF
+
+          cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-consumer" \
+            -DCMAKE_BUILD_TYPE="$consumer_config" \
+            -DFOURDGS_GIT_REPOSITORY="file://$GITHUB_WORKSPACE" \
+            -DFOURDGS_GIT_TAG=cmake-consumer-test
+          cmake --build "$RUNNER_TEMP/fourdgs-consumer" \
+            --config "$consumer_config" -j
+          ctest --test-dir "$RUNNER_TEMP/fourdgs-consumer" \
+            --build-config "$consumer_config" --output-on-failure
+
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # Visual Studio can target another architecture on the same OS without
+            # setting CMAKE_CROSSCOMPILING. The source build must not quietly keep
+            # Cargo's x64 host archive for an ARM64 C++ link.
+            architecture_log="$RUNNER_TEMP/fourdgs-vs-arm64-no-target.log"
+            if cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-vs-arm64-no-target" \
+              -A ARM64 \
+              -DFOURDGS_SOURCE_DIR="$GITHUB_WORKSPACE" >"$architecture_log" 2>&1; then
+              cat "$architecture_log"
+              echo "::error::Visual Studio ARM64 configured without FOURDGS_CARGO_TARGET"
+              exit 1
+            fi
+            cat "$architecture_log"
+            grep -q FOURDGS_CARGO_TARGET "$architecture_log"
+
+            # Artifact naming and link compatibility follow the Rust target ABI, not just
+            # the C++ compiler. A GNU Rust target under MSVC must be refused at configure
+            # time instead of waiting for Cargo to emit libfourdgs.a where CMake expected
+            # fourdgs.lib (the reciprocal MinGW/MSVC-host case follows the same check).
+            abi_log="$RUNNER_TEMP/fourdgs-msvc-gnu-rust-target.log"
+            if cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-msvc-gnu-rust-target" \
+              -DFOURDGS_CARGO_TARGET=x86_64-pc-windows-gnu \
+              -DFOURDGS_SOURCE_DIR="$GITHUB_WORKSPACE" >"$abi_log" 2>&1; then
+              cat "$abi_log"
+              echo "::error::MSVC configured with a GNU Rust target"
+              exit 1
+            fi
+            cat "$abi_log"
+            grep -q 'MSVC C++ ABI cannot link the Rust target x86_64-pc-windows-gnu' "$abi_log"
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            # CMAKE_OSX_ARCHITECTURES likewise does not make CMAKE_CROSSCOMPILING true.
+            # A selected thin architecture requires an explicit matching Rust triple.
+            architecture_log="$RUNNER_TEMP/fourdgs-macos-arm64-no-target.log"
+            if cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-macos-arm64-no-target" \
+              -DCMAKE_OSX_ARCHITECTURES=arm64 \
+              -DFOURDGS_SOURCE_DIR="$GITHUB_WORKSPACE" >"$architecture_log" 2>&1; then
+              cat "$architecture_log"
+              echo "::error::macOS arm64 configured without FOURDGS_CARGO_TARGET"
+              exit 1
+            fi
+            cat "$architecture_log"
+            grep -q FOURDGS_CARGO_TARGET "$architecture_log"
+
+            # One Cargo target produces a thin archive. Even an explicit triple cannot
+            # satisfy a universal C++ build; require a pre-combined core instead.
+            universal_log="$RUNNER_TEMP/fourdgs-macos-universal.log"
+            if cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-macos-universal" \
+              -DCMAKE_OSX_ARCHITECTURES='x86_64;arm64' \
+              -DFOURDGS_CARGO_TARGET=aarch64-apple-darwin \
+              -DFOURDGS_SOURCE_DIR="$GITHUB_WORKSPACE" >"$universal_log" 2>&1; then
+              cat "$universal_log"
+              echo "::error::a universal macOS build accepted one thin Rust target"
+              exit 1
+            fi
+            cat "$universal_log"
+            grep -q 'cannot produce one universal Rust archive' "$universal_log"
+          elif [ "$RUNNER_OS" = "Linux" ]; then
+            # Reproduce the common mixed Windows-toolchain installation without needing
+            # a Windows linker: Clang's GNU Windows target makes CMake select the MinGW ABI,
+            # and static-library try-compiles are enough for configuration. Cargo's MSVC
+            # host target must be rejected before its differently named archive is built.
+            mingw_abi_log="$RUNNER_TEMP/fourdgs-mingw-msvc-rust-target.log"
+            if cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-mingw-msvc-rust-target" \
+              -DCMAKE_SYSTEM_NAME=Windows \
+              -DCMAKE_CXX_COMPILER=clang++ \
+              -DCMAKE_CXX_COMPILER_TARGET=x86_64-w64-windows-gnu \
+              -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+              -DFOURDGS_CARGO_TARGET=x86_64-pc-windows-msvc \
+              -DFOURDGS_SOURCE_DIR="$GITHUB_WORKSPACE" >"$mingw_abi_log" 2>&1; then
+              cat "$mingw_abi_log"
+              echo "::error::MinGW configured with an MSVC Rust target"
+              exit 1
+            fi
+            cat "$mingw_abi_log"
+            grep -q 'GNU Windows C++ ABI cannot link the Rust target x86_64-pc-windows-msvc' \
+              "$mingw_abi_log"
+
+            # A package manager may expose fetched dependencies read-only. Cargo normally
+            # creates an uncommitted library lockfile beside a workspace manifest, so this
+            # proves the integration stages its Cargo project in the writable build tree
+            # and leaves the source checkout untouched.
+            readonly_source="$RUNNER_TEMP/fourdgs-read-only-source"
+            mkdir -p "$readonly_source"
+            git archive HEAD | tar -x -C "$readonly_source"
+            chmod -R a-w "$readonly_source"
+            cmake -S "$readonly_source/cpp" -B "$RUNNER_TEMP/fourdgs-read-only-build" \
+              -DCMAKE_BUILD_TYPE="$consumer_config" \
+              -DFOURDGS_BUILD_CORE_FROM_SOURCE=ON \
+              -DFOURDGS_BUILD_TESTS=OFF \
+              -DFOURDGS_BUILD_CONFORMANCE=OFF
+            cmake --build "$RUNNER_TEMP/fourdgs-read-only-build" --target fourdgs-cpp -j
+            test ! -e "$readonly_source/Cargo.lock"
+
+            # Compiler modes such as -m32 change the target ABI without setting any of
+            # CMake's target selectors. Static-library try-compiles let CMake detect the
+            # 32-bit pointer width without requiring multilib runtime libraries merely to
+            # exercise this configure-time refusal.
+            if [ "$RUNNER_ARCH" = "X64" ]; then
+              multilib_log="$RUNNER_TEMP/fourdgs-m32-no-cargo-target.log"
+              if cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-m32-no-cargo-target" \
+                -DCMAKE_CXX_FLAGS=-m32 \
+                -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+                -DFOURDGS_SOURCE_DIR="$GITHUB_WORKSPACE" >"$multilib_log" 2>&1; then
+                cat "$multilib_log"
+                echo "::error::-m32 configured with Cargo's 64-bit host target"
+                exit 1
+              fi
+              cat "$multilib_log"
+              grep -q '4-byte pointer ABI' "$multilib_log"
+              grep -q FOURDGS_CARGO_TARGET "$multilib_log"
+            fi
+
+            # Clang toolchains can select a target through the compiler driver while
+            # leaving CMAKE_CROSSCOMPILING false. The explicit compiler target is still
+            # independent of Cargo's host and therefore requires the matching Rust triple.
+            compiler_target_log="$RUNNER_TEMP/fourdgs-compiler-target-no-cargo-target.log"
+            if cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-compiler-target-no-cargo-target" \
+              -DCMAKE_CXX_COMPILER_TARGET=aarch64-unknown-linux-gnu \
+              -DFOURDGS_SOURCE_DIR="$GITHUB_WORKSPACE" >"$compiler_target_log" 2>&1; then
+              cat "$compiler_target_log"
+              echo "::error::CMAKE_CXX_COMPILER_TARGET configured without FOURDGS_CARGO_TARGET"
+              exit 1
+            fi
+            cat "$compiler_target_log"
+            grep -q CMAKE_CXX_COMPILER_TARGET "$compiler_target_log"
+            grep -q FOURDGS_CARGO_TARGET "$compiler_target_log"
+
+            # A CMake toolchain changes the target independently of Cargo's host. Without
+            # an explicit Rust triple this must stop at configure time, before producing
+            # a host archive that fails much later in the cross-linker.
+            cross_log="$RUNNER_TEMP/fourdgs-cross-no-target.log"
+            if cmake -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-cross-no-target" \
+              -DCMAKE_SYSTEM_NAME=Linux \
+              -DFOURDGS_SOURCE_DIR="$GITHUB_WORKSPACE" >"$cross_log" 2>&1; then
+              cat "$cross_log"
+              echo "::error::cross-compiling without FOURDGS_CARGO_TARGET configured"
+              exit 1
+            fi
+            cat "$cross_log"
+            grep -q FOURDGS_CARGO_TARGET "$cross_log"
+          fi
+
+      # Exercise the package that `cmake --install` actually emits. An absolute libdir is
+      # intentional: packagers use one, and configure_package_config_file must not prefix
+      # it a second time. Running the consumer also proves the installed static link order,
+      # including the Rust archive before its native runtime libraries on Linux.
+      - name: An installed package is linkable with an absolute libdir
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            core="$GITHUB_WORKSPACE/target/release/fourdgs.lib"
+          else
+            core="$GITHUB_WORKSPACE/target/release/libfourdgs.a"
+          fi
+          install_root="$RUNNER_TEMP/fourdgs-install"
+          install_libdir="$install_root/lib"
+          consumer_generator=()
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            # A colon is a legal POSIX filename character, while CMake normalizes a
+            # backslash to its portable path separator in the generated install script.
+            # The installed config must preserve the colon and name that same effective
+            # slash-normalized destination instead of emitting an invalid escape.
+            install_libdir="$RUNNER_TEMP/fourdgs:install\\path/lib"
+            consumer_generator=(-G Ninja)
+
+            # Prebuilt archives are commonly selected through a stable relative symlink.
+            # Installing only that link would leave it dangling in the relocated package;
+            # the install must carry the real archive bytes instead.
+            symlink_core="$RUNNER_TEMP/fourdgs-symlink-core"
+            mkdir -p "$symlink_core/actual"
+            cp "$core" "$symlink_core/actual/libfourdgs.a"
+            ln -s actual/libfourdgs.a "$symlink_core/libfourdgs.a"
+            core="$symlink_core/libfourdgs.a"
+          fi
+          cmake -S cpp -B "$RUNNER_TEMP/fourdgs-package" \
+            -DCMAKE_BUILD_TYPE="$FOURDGS_CMAKE_CONFIG" \
+            -DCMAKE_INSTALL_PREFIX="$install_root" \
+            -DCMAKE_INSTALL_LIBDIR="$install_libdir" \
+            -DFOURDGS_CORE_LIBRARY="$core"
+          cmake --build "$RUNNER_TEMP/fourdgs-package" \
+            --config "$FOURDGS_CMAKE_CONFIG" -j
+          cmake --install "$RUNNER_TEMP/fourdgs-package" \
+            --config "$FOURDGS_CMAKE_CONFIG"
+          cmake "${consumer_generator[@]}" \
+            -S cpp/tests/consumer -B "$RUNNER_TEMP/fourdgs-installed-consumer" \
+            -DCMAKE_BUILD_TYPE="$FOURDGS_CMAKE_CONFIG" \
+            -DFOURDGS_USE_INSTALLED_PACKAGE=ON \
+            -Dfourdgs-cpp_DIR="$install_libdir/cmake/fourdgs-cpp"
+          cmake --build "$RUNNER_TEMP/fourdgs-installed-consumer" \
+            --config "$FOURDGS_CMAKE_CONFIG" -j
+          ctest --test-dir "$RUNNER_TEMP/fourdgs-installed-consumer" \
+            --build-config "$FOURDGS_CMAKE_CONFIG" --output-on-failure
 
       # The binding owns handles that come from across an FFI boundary, so a leak and a read
       # past the end of a buffer the ABI handed over are the two bugs it is exposed to. The

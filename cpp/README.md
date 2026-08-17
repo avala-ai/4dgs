@@ -1,12 +1,14 @@
 # 4dgs — C++
 
+<!-- cspell:ignore rustc -->
+
 A C++17 binding over the Rust core's C ABI, for engine, DCC and native-viewer integrators. Not a
 second decoder: the bytes are parsed once, in one place, so two implementations cannot drift apart
 on what a file means. Decode only at v1; rendering is out of scope for this repository.
 
 |          |                                                                                                 |
 | -------- | ----------------------------------------------------------------------------------------------- |
-| Standard | C++17, no third-party dependencies                                                              |
+| Standard | C++17; a Rust toolchain builds the core for source consumers                                    |
 | Build    | `cargo build -p fourdgs --release`, then `cmake -S cpp -B cpp/build && cmake --build cpp/build` |
 | Test     | `ctest --test-dir cpp/build`, or `make -C cpp test`                                             |
 | Headers  | [`include/fourdgs/`](include/fourdgs/)                                                          |
@@ -61,9 +63,7 @@ CPMAddPackage(
   SOURCE_SUBDIR cpp             # the manifest is cpp/CMakeLists.txt — without this, CPM
                                 # looks for a CMakeLists.txt at the repository root, finds
                                 # none, and adds nothing at all
-  OPTIONS
-    # Not optional today; see "The core is yours to supply" below.
-    "FOURDGS_CORE_LIBRARY /path/to/libfourdgs.a")
+)
 
 target_link_libraries(my_app PRIVATE fourdgs::cpp)
 ```
@@ -73,7 +73,9 @@ Plain `FetchContent` is the same two lines with the same argument
 `add_subdirectory(third_party/4dgs/cpp)`. All three go through the same manifest, and all three
 build the library alone: the tests, the conformance runners and the examples default to on only when
 this is the top-level project, so consuming the package does not add ten targets and an
-`enable_testing()` to your build.
+`enable_testing()` to your build. When no prebuilt core is named, CMake finds Cargo and builds the
+Rust core into that dependency's CMake build directory. A missing Rust toolchain is therefore a
+configure-time error with its name, not an unresolved symbol at the end of a C++ link.
 
 Against an installed copy — `cmake --install <build dir> --prefix <prefix>` — it is `find_package`:
 
@@ -85,33 +87,51 @@ target_link_libraries(my_app PRIVATE fourdgs::fourdgs-cpp)
 The install carries a config file and a version file, so a version range is a supported request;
 while the major version is 0 the minor is the compatibility boundary, so a build asking for 0.1 is
 not handed 0.2. The exported target is `fourdgs::fourdgs-cpp` and `fourdgs::cpp` is defined beside
-it, so either name links whichever way the package arrived.
+it, so either name links whichever way the package arrived. The installed package includes the
+static Rust core it was built against; downstream `find_package` consumers need neither this source
+tree nor Cargo, and the core path stays valid if the install prefix moves. If a prebuilt core was
+named through a symbolic link, installation copies the target archive rather than exporting a link
+whose relative target exists only in the build tree.
 
-### The core is yours to supply
+### How the core is obtained
 
-**A build outside this repository has to provide the Rust core itself.** This package is a binding
-over that core's C ABI rather than a second decoder, and the core's library is a build artifact: the
-default paths — the committed header at `../rust/fourdgs/include`, the archive where cargo leaves it
-under `../target` — resolve inside a checkout of this repository and nowhere else. There are two
-cache variables for saying where they are instead:
+This package is a binding over the Rust core's C ABI rather than a second decoder. A source fetch
+contains that crate, and `FOURDGS_BUILD_CORE_FROM_SOURCE` defaults to `ON` for CPM, FetchContent and
+`add_subdirectory` consumers. It runs the equivalent of
+`cargo rustc -p fourdgs --release --target <triple> --lib --crate-type staticlib` with an isolated
+target directory under the CMake build, then makes the C++ library depend on and link the result.
+The crate manifest and source are staged under that writable build directory as well, so Cargo's
+uncommitted library lockfile never mutates a fetched dependency and read-only source checkouts work.
+The staged manifest gains an empty `[workspace]` table, which is what it is — one crate, built alone
+— and what keeps a build directory inside this repository from being read as a member of the root
+workspace it is not listed in. Selecting only the static library avoids making a cross build link
+the crate's unrelated `cdylib` with a Cargo linker configuration the CMake toolchain does not
+control. A native build derives the triple from `cargo -vV`; a cross build must name the toolchain's
+Rust triple with `FOURDGS_CARGO_TARGET`, so it cannot silently build a host archive for a target
+linker. The same requirement applies when `CMAKE_CXX_COMPILER_TARGET`, Visual Studio `-A`, or
+`CMAKE_OSX_ARCHITECTURES` selects a target without setting CMake's cross-compiling flag, and when a
+compiler mode such as `-m32` changes the detected pointer ABI. A universal macOS build needs a
+pre-combined `FOURDGS_CORE_LIBRARY`; one Cargo target can only produce a thin archive. Building the
+same checkout at two revisions cannot make them share one `target/` tree.
+
+A consumer that already has a core can skip that build by naming it. The header defaults to the one
+in a fetched repository; a vendored copy of `cpp/` alone supplies both paths:
 
 | Variable                  | What it points at                                                          |
 | ------------------------- | -------------------------------------------------------------------------- |
 | `FOURDGS_CORE_HEADER_DIR` | the directory holding `fourdgs.h`                                          |
 | `FOURDGS_CORE_LIBRARY`    | `libfourdgs.a` (or `fourdgs.lib`), from `cargo build -p fourdgs --release` |
+| `FOURDGS_CARGO_TARGET`    | Rust target triple matching a cross-compiling CMake toolchain              |
 
-A CPM or FetchContent fetch brings the whole repository, so the header is already there and only the
-library is missing — one `cargo build -p fourdgs --release` in the fetched source directory, or an
-archive built anywhere and named with `FOURDGS_CORE_LIBRARY`. Configure without either and the build
-stops with a message saying so; it does not quietly produce the no-decoder library described below,
-which outside this repository is a mistake rather than a configuration.
+On MSVC the Rust static library uses the dynamic release runtime. The exported CMake target carries
+that requirement into Debug consumers too (`/MD`, not `/MDd`), because C++ strings and vectors cross
+the binding's public boundary and allocator mismatches are not link-only problems.
 
-Neither of the two ways to remove that step is implemented yet, and choosing between them is its own
-piece of work rather than a detail of this one:
-[Corrosion](https://github.com/corrosion-rs/corrosion) would drive cargo from CMake so the core is
-built as part of the consumer's build, which costs every consumer a Rust toolchain; fetching a
-prebuilt core for the host platform costs a release process that publishes one. Until then the step
-above is the honest description of what consuming this package takes.
+`FOURDGS_BUILD_CORE_FROM_SOURCE=OFF` plus `FOURDGS_ALLOW_NO_CORE=ON` remains the deliberate
+no-decoder build: it compiles and every decode call returns `kNotImplemented`. Source-building is a
+stronger request than the permission to fall back to no core, so the repository's natural top-level
+opt-in is just `-DFOURDGS_BUILD_CORE_FROM_SOURCE=ON` even though `FOURDGS_ALLOW_NO_CORE` defaults on
+there. A Cargo failure still stops that build; it never silently falls back to the stub.
 
 ## Errors are returned, not thrown
 

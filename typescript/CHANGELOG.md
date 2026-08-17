@@ -8,6 +8,36 @@ The four packages version together.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-14
+
+### Fixed
+
+- **A string on the wire keeps its leading U+FEFF.** `@4dgs/core`'s `Cursor` and the validator's two
+  string readers built their `TextDecoder` without `ignoreBOM`, whose default is to strip a leading
+  byte-order mark. That default is for reading a text file, where the mark is a preamble; every
+  string in this format is length-prefixed UTF-8 inside a binary record, where U+FEFF is a character
+  the writer wrote. So these readers returned a different string from the Python, Rust and Dart
+  readers for the same bytes — silently changing a `bounds` value, a metadata key or an `object_id`.
+
+- **A per-band SH bound is read by the grammar spec §5.3 writes down.** The comparison anchored its
+  pattern with `\s`, which in JavaScript matches U+FEFF, so a bound wrapped in whitespace — or led
+  by a byte-order mark — was accepted as the bare number. The pattern now admits nothing around the
+  number and spells its digits `[0-9]` rather than leaving `\d` to depend on a `/u` flag. Equivalent
+  spellings such as `5e-05`, `5e-5` and `0.00005` remain one bound, and `0e999999999999999999999999`
+  is still the zero it spells.
+- The Gaussian-birth writer plans chunks from reconstructed temporal values and contains the full
+  rounded-visible marginal plateau, so an indexed seek cannot miss a Gaussian that the complete
+  decoded state reports as visible at the same instant.
+- Summary Offsets emitted with Statistics now frame only the Chunk Index records they name.
+- Chunk containment is exact. The planner no longer admits a Gaussian into a chunk whose interval
+  ends up to `1e-9` before its support does, which left `chunksForTime` returning a chunk without a
+  Gaussian that `stateAt` reported visible at the same instant.
+
+### Changed
+
+- `encodeScene` refuses a `cutoff` outside `(0, 1]` instead of writing a file planned from a `NaN`
+  support half-width. A marginal threshold of zero or less has no logarithm to invert.
+
 ## [0.5.0] - 2026-08-12
 
 ### Added

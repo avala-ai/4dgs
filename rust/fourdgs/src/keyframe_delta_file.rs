@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::codec;
 use crate::error::{Error, Result};
 use crate::keyframe_delta::{
-    apply_delta, chain_for, check_tiling, check_timeline_endpoints, keyframe_state, BinArray,
+    apply_delta, chain_ending_at, check_tiling, check_timeline_endpoints, keyframe_state, BinArray,
     State, ABSOLUTE_IN_UPDATE, GOP_INVARIANT,
 };
 use crate::model::GaussianSet;
@@ -558,6 +558,87 @@ fn aabb(samples: &[Sample]) -> Vec<f64> {
     vec![lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]]
 }
 
+/// Refuse a population no instant can select under the half-open seek rule.
+///
+/// An empty `[t, t)` state is harmless and is permitted by the tiling rule: it covers no
+/// time and carries no unreachable gaussian. A populated one would still count toward the
+/// file while being absent from every reconstruction, so it is not authorable.
+fn check_sample_width(sample: usize, state: &Sample, t1: f64) -> Result<()> {
+    let population = state.gaussians.count();
+    if state.t0 == t1 && population != 0 {
+        return Err(Error::InvalidInput(format!(
+            "sample {sample} has a population of {population} over the zero-width interval \
+             [{}, {t1}); expected 0 there, because the half-open seek rule can never select it \
+             (section 11.1)",
+            state.t0
+        )));
+    }
+    Ok(())
+}
+
+/// Check the part of §11.1 a sequence of sample starts can express.
+///
+/// [`write_sequence`] derives every interval end from the next sample's `t0`, and derives
+/// the final end from `duration_sec`. Interior intervals therefore abut by construction:
+/// this check makes sure they are not inverted, and that the two derived endpoints cover
+/// the declared timeline. Keeping it ahead of grid construction and quantization makes a
+/// bad timeline an authoring error before the writer does work proportional to the scene.
+fn check_sample_tiling(samples: &[Sample], duration_sec: f64) -> Result<()> {
+    if duration_sec.is_nan() || duration_sec == f64::NEG_INFINITY {
+        return Err(Error::InvalidInput(format!(
+            "duration_sec is {duration_sec}; expected a finite timeline end or +inf so the final \
+             sample interval can reach it (section 11.1)"
+        )));
+    }
+
+    for (sample, state) in samples.iter().enumerate() {
+        if !state.t0.is_finite() {
+            return Err(Error::InvalidInput(format!(
+                "sample {sample} has t0={}; expected a finite sample time (section 11.1)",
+                state.t0
+            )));
+        }
+    }
+
+    let first = samples[0].t0;
+    if first != 0.0 {
+        let relation = if first > 0.0 {
+            "leaves a gap at the start"
+        } else {
+            "overlaps time before the declared timeline"
+        };
+        return Err(Error::InvalidInput(format!(
+            "sample 0 starts at t0={first}; expected t0=0, because this {relation} (section 11.1)"
+        )));
+    }
+
+    for sample in 1..samples.len() {
+        let previous = samples[sample - 1].t0;
+        let current = samples[sample].t0;
+        if current < previous {
+            return Err(Error::InvalidInput(format!(
+                "sample {sample} starts at t0={current}, before sample {} at t0={previous}; \
+                 expected sample times in nondecreasing order so their derived intervals abut \
+                 without overlap (section 11.1)",
+                sample - 1
+            )));
+        }
+        check_sample_width(sample - 1, &samples[sample - 1], current)?;
+    }
+
+    let last_sample = samples.len() - 1;
+    let last = samples[last_sample].t0;
+    if last > duration_sec {
+        return Err(Error::InvalidInput(format!(
+            "sample {last_sample} starts at t0={last}, after duration_sec={duration_sec}; expected \
+             its start at or before the declared duration so the final interval reaches that end \
+             without being inverted (section 11.1)"
+        )));
+    }
+    check_sample_width(last_sample, &samples[last_sample], duration_sec)?;
+    Ok(())
+}
+
 /// Assemble a whole `keyframe-delta` file from a sequence of samples.
 ///
 /// The samples must tile the timeline: sample `i` covers `[t_i, t_{i+1})`, the first starts
@@ -572,6 +653,7 @@ pub fn write_sequence(
             "a keyframe-delta file needs at least one sample".into(),
         ));
     }
+    check_sample_tiling(samples, duration_sec)?;
     let grids = grids_for(samples, duration_sec, kd.profile, kd.cutoff);
     let mut quantized: Vec<(Vec<i64>, BTreeMap<u8, BinArray>)> = samples
         .iter()
@@ -1649,6 +1731,7 @@ pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
                 })?;
                 check_keyframe_mu_t(&state, head.t0, quantization)?;
                 check_window_indices(&state, &windows)?;
+                check_streamed_population(record.offset as u64, head.t0, head.t1, &state)?;
                 by_offset.insert(record.offset as u64, state.clone());
                 chunks.push(ChunkInfo {
                     t0: head.t0,
@@ -1685,6 +1768,7 @@ pub fn decode_streamed(data: &[u8]) -> Result<DecodedSequence> {
                 // indexed path validates the composed state for every chunk, so leaving
                 // it off here would accept a birth the other path refuses.
                 check_window_indices(&state, &windows)?;
+                check_streamed_population(record.offset as u64, head.t0, head.t1, &state)?;
                 by_offset.insert(record.offset as u64, state.clone());
                 chunks.push(ChunkInfo {
                     t0: head.t0,
@@ -1902,6 +1986,67 @@ pub fn read_delta_entry<R: crate::Readable + ?Sized>(
     compose_delta_chunk(reference, &content, windows)
 }
 
+/// Check that an indexed entry's declared population is the state composition produced.
+///
+/// A zero-width half-open interval cannot expose a populated state at any instant. Keeping
+/// this check beside composition makes the range-seeking decoder and the full-file validator
+/// enforce the same invariant.
+pub fn check_composed_population(entry: &rec::ChunkIndexEntry, state: &State) -> Result<()> {
+    let composed = state.count() as u64;
+    if entry.live_count != composed {
+        return Err(Error::Malformed(format!(
+            "the index entry at {} declares live_count {}; composing its [{}, {}) state yields {} gaussians",
+            entry.chunk_offset, entry.live_count, entry.t0, entry.t1, composed
+        )));
+    }
+    if entry.t0 == entry.t1 && composed != 0 {
+        return Err(Error::Malformed(format!(
+            "the index entry at {} composes {} gaussians over the zero-width interval [{}, {}); expected 0 because no instant can select a half-open zero-width interval",
+            entry.chunk_offset, composed, entry.t0, entry.t1
+        )));
+    }
+    Ok(())
+}
+
+/// Check that an index entry duplicates the interval in the state record it names.
+///
+/// Indexed composition must not substitute the summary's interval for the record's. Doing
+/// so would let the range path expose a populated zero-width record that the streamed path
+/// correctly refuses.
+fn check_indexed_record_interval(
+    entry: &rec::ChunkIndexEntry,
+    record_t0: f64,
+    record_t1: f64,
+) -> Result<()> {
+    if entry.t0 != record_t0 || entry.t1 != record_t1 {
+        return Err(Error::Malformed(format!(
+            "the index entry at {} declares interval [{}, {}), but its state record declares [{}, {}); expected exact agreement",
+            entry.chunk_offset, entry.t0, entry.t1, record_t0, record_t1
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse populated zero-width state records on the front-to-back path.
+///
+/// An indexed entry carries `live_count`, so [`check_composed_population`] checks both that
+/// declaration and this half-open interval invariant. A streamed record has no separate count;
+/// its composed state is the authoritative population and must obey the same rule.
+pub fn check_streamed_population(
+    record_offset: u64,
+    t0: f64,
+    t1: f64,
+    state: &State,
+) -> Result<()> {
+    let composed = state.count();
+    if t0 == t1 && composed != 0 {
+        return Err(Error::Malformed(format!(
+            "the streamed state record at {record_offset} composes {composed} gaussians over the zero-width interval [{t0}, {t1}); expected 0 because no instant can select a half-open zero-width interval"
+        )));
+    }
+    Ok(())
+}
+
 /// Compose the chain ending at `entry`, and check the state it produces.
 ///
 /// Public because a range-seeking caller may want one instant without materializing the
@@ -1915,17 +2060,24 @@ pub fn compose_chain<R: crate::Readable + ?Sized>(
     quantization: &rec::Quantization,
     windows: &[(f64, f64)],
 ) -> Result<State> {
-    let chain = chain_for(index, (entry.t0 + entry.t1) / 2.0)?;
+    // Compose the entry the caller named. Recovering it via a midpoint is equivalent for
+    // ordinary half-open intervals, but impossible for a valid empty `[t, t)` entry.
+    let chain = chain_ending_at(index, entry)?;
     let mut state: Option<State> = None;
     for link in &chain {
-        if link.kind == 0 {
-            state = Some(read_keyframe_entry(source, link, quantization, windows)?.0);
+        let (next, record_t0, record_t1) = if link.kind == 0 {
+            let (next, head) = read_keyframe_entry(source, link, quantization, windows)?;
+            (next, head.t0, head.t1)
         } else {
             let reference = state
                 .take()
                 .ok_or_else(|| Error::Malformed("a chain begins with a delta chunk".into()))?;
-            state = Some(read_delta_entry(source, link, &reference, windows)?.0);
-        }
+            let (next, head, _) = read_delta_entry(source, link, &reference, windows)?;
+            (next, head.t0, head.t1)
+        };
+        check_indexed_record_interval(link, record_t0, record_t1)?;
+        check_composed_population(link, &next)?;
+        state = Some(next);
     }
     let state = state.ok_or_else(|| Error::Malformed("an empty chain".into()))?;
     check_window_indices(&state, windows)?;

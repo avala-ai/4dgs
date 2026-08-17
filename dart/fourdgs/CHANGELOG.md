@@ -377,6 +377,22 @@ start.
 
 ### Fixed
 
+- **A string on the wire keeps its leading U+FEFF.** `Cursor.string` returned `utf8.decode`'s
+  result, and Dart's UTF-8 decoder skips a leading byte-order mark. That is right for reading a text
+  file, where the mark is a preamble; every string here is length-prefixed UTF-8 inside a binary
+  record, where U+FEFF is a character the writer wrote. So this reader returned a different string
+  from the Python and Rust readers for the same bytes — silently changing a `bounds` value, a
+  metadata key or an `object_id`. The mark is now put back after decoding.
+
+- **A per-band SH bound is read by the grammar spec §5.3 writes down.** The comparison trimmed a
+  hand-written whitespace set copied from Python's, folded every Unicode `Nd` digit to ASCII through
+  a 68-entry table, removed underscores, and refused exponents outside CPython's build-dependent
+  `Decimal` range — all to mirror one interpreter's string syntax rather than the format's. §5.3 now
+  states the grammar: an optional sign, ASCII digits, an optional point and an optional exponent,
+  with nothing around it. `1_6`, `١٦` and a space-padded bound are now reported as bounds that
+  disagree with the record; `0e999999999999999999999999` is accepted as the zero it spells.
+  Equivalent spellings such as `5e-05`, `5e-5` and `0.00005` remain one bound.
+
 - **A file whose magic is corrupted anywhere but the version byte is no longer reported as an
   unsupported version.** `checkMagic` tested only that bytes 1-4 read `4DGS`, so flipping the
   leading `0x89` sentinel — the byte that stops byte-oriented tooling treating a 4dgs file as text —

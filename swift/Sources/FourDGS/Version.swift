@@ -10,4 +10,4 @@
 ///
 /// It is also the answer to "which 4dgs is linked into this app?" from inside a shipped binary,
 /// where the tag is no longer around to read.
-public let fourdgsPackageVersion = "0.1.0"
+public let fourdgsPackageVersion = "0.2.0"

@@ -9,7 +9,7 @@
 //! than invented from row order, that the options reach the encoder, and that the refusals
 //! the model depends on arrive as statuses instead of as a file nobody notices is wrong.
 
-use std::ffi::{c_char, c_int};
+use std::ffi::{c_char, c_int, CStr};
 
 use fourdgs::capi::*;
 use fourdgs::keyframe_delta_file as kdf;
@@ -121,6 +121,13 @@ fn drift() -> (Columns, Columns) {
 
 fn lend(text: &str) -> (*const c_char, usize) {
     (text.as_ptr() as *const c_char, text.len())
+}
+
+fn last_error() -> String {
+    // SAFETY: `fourdgs_last_error` always returns a NUL-terminated string.
+    unsafe { CStr::from_ptr(fourdgs_last_error()) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[test]
@@ -283,6 +290,28 @@ fn an_empty_sequence_is_invalid_input_rather_than_an_empty_file() {
             FOURDGS_STATUS_OK
         );
         assert_eq!(encode(writer), Err(FOURDGS_STATUS_INVALID_ARGUMENT));
+        fourdgs_kd_writer_free(writer);
+    }
+}
+
+#[test]
+fn a_non_tiling_sequence_is_a_diagnosed_argument_error_through_the_abi() {
+    let (first, second) = drift();
+    // SAFETY: every pointer is backed by a live local, and the handle is freed once.
+    unsafe {
+        let writer = fourdgs_kd_writer_new();
+        assert_eq!(
+            fourdgs_kd_writer_set_duration(writer, 3.0),
+            FOURDGS_STATUS_OK
+        );
+        assert_eq!(add(writer, 0.0, &first), FOURDGS_STATUS_OK);
+        assert_eq!(add(writer, 4.0, &second), FOURDGS_STATUS_OK);
+        assert_eq!(encode(writer), Err(FOURDGS_STATUS_INVALID_ARGUMENT));
+        let message = last_error();
+        assert!(message.contains("sample 1"), "{message}");
+        assert!(message.contains("t0=4"), "{message}");
+        assert!(message.contains("duration_sec=3"), "{message}");
+        assert!(message.contains("expected"), "{message}");
         fourdgs_kd_writer_free(writer);
     }
 }

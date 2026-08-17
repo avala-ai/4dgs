@@ -14,6 +14,8 @@ All notable changes to the Swift package are documented here, following
 - Canonical floating-point output normalizes signed zero after six-decimal rounding, so permuting
   otherwise equivalent rows cannot expose whether a decoded component carried `-0.0` or `+0.0`.
 
+## [0.2.0] - 2026-08-14
+
 ### Added
 
 - **Encoding the `keyframe-delta` temporal model**, turning the Swift cell of that row from Planned
