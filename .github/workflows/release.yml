@@ -311,8 +311,8 @@ jobs:
 
   dart:
     name: Publish fourdgs to pub.dev
-    # DISABLED ON PURPOSE — do not delete this gate without doing the two manual steps
-    # below first, in this order.
+    # DISABLED ON PURPOSE — do not delete this gate without doing the three manual
+    # steps below first, in this order.
     #
     # pub.dev will not accept an automated publish for a package that does not exist
     # yet. A brand-new package name must be claimed by a human running
@@ -321,20 +321,31 @@ jobs:
     # configured on. So:
     #
     #   1. `cd dart/fourdgs && dart pub publish` — by hand, once. This claims the
-    #      `fourdgs` name and puts 0.1.0 on the registry.
-    #   2. On pub.dev, open the package's Admin tab and enable **Automated
-    #      publishing** for this repository, with the tag pattern
-    #      `releases/dart/v{{version}}`. That is what makes the OIDC exchange below
-    #      succeed; without it every run of this job fails authentication.
-    #   3. Then, and only then, delete this `if: false`.
+    #      `fourdgs` name and puts 0.1.0 on the registry, owned by whoever ran it.
+    #   2. On pub.dev, open the package's Admin tab and **transfer it to the
+    #      `avala.ai` publisher**. None of this is scriptable: `dart pub` has
+    #      `login`, `publish` and `token`, and no subcommand for publisher
+    #      administration, so steps 2 and 3 are the web UI.
+    #   3. Still on the Admin tab, enable **Automated publishing** for this
+    #      repository, with the tag pattern `releases/dart/v{{version}}`. That is what
+    #      makes the OIDC exchange below succeed; without it every run of this job
+    #      fails authentication.
+    #   4. Then, and only then, delete this `if: false`.
     #
     # Flipping the gate before step 2 produces a job that fails on every tag, which is
     # the failure this comment exists to prevent — it looks like a broken workflow
     # rather than a missing setting.
     #
-    # The maintainer intends to take the package to **verified publisher** status under
-    # the `4dgs.dev` domain, which is a separate pub.dev setting from automated
-    # publishing and does not gate this job.
+    # The package goes under the **`avala.ai`** verified publisher, which already exists
+    # on pub.dev and owns no packages yet — `fourdgs` will be its first. An earlier
+    # version of this note said `4dgs.dev`; that domain would have needed its own
+    # verification, and this one is verified today. Publisher ownership is a separate
+    # pub.dev setting from automated publishing and does not gate this job.
+    #
+    # Worth doing before step 1 rather than after: that publisher has a single member,
+    # so until a second admin exists, one lost account is one package nobody can ship a
+    # fix for. pub.dev recovers publisher control through domain verification, not
+    # through support.
     if: false
     # if: startsWith(github.ref, 'refs/tags/releases/dart/')
     runs-on: ubuntu-latest
