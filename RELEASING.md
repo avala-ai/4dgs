@@ -176,8 +176,8 @@ against them. That was the strategy's biggest open question and it is settled.
 ## Dart, before its first release
 
 **Done — `fourdgs` 0.1.0 was published by hand on 2026-08-16, transferred to the `avala.ai`
-publisher, and Automated publishing is enabled with the tag pattern below. Dart now releases the
-way Python and Rust do: stamp the version, push the tag.** The rest of this section is kept as the
+publisher, and Automated publishing is enabled with the tag pattern below. Dart now releases the way
+Python and Rust do: stamp the version, push the tag.** The rest of this section is kept as the
 record of why the first one could not be automated, and as the procedure for the next package this
 repository claims.
 
