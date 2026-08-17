@@ -445,6 +445,21 @@ jobs:
             echo "::error::version mismatch — tag $tag, package.json $manifest"
             exit 1
           fi
+          # The nodejs package carries its version twice: once in the manifest npm
+          # publishes from, and once in `cli.ts` as the string `4dgs --version`
+          # prints. Only the first was checked, so the two could drift and the
+          # release would still be green — shipping a CLI that misreports which
+          # build it is, which is exactly the question `--version` is asked to
+          # settle. Checked here rather than in CI at large because this is where
+          # a version becomes a published artefact.
+          if [ "$package" = "nodejs" ]; then
+            cli=$(node -p "require('fs').readFileSync('typescript/nodejs/src/cli.ts','utf8').match(/export const VERSION = \"([^\"]+)\"/)[1]")
+            echo "cli.ts VERSION=$cli"
+            if [ "$tag" != "$cli" ]; then
+              echo "::error::version mismatch — tag $tag, cli.ts VERSION $cli"
+              exit 1
+            fi
+          fi
 
       - name: Release notes from the changelog
         # The four packages version together and share one changelog, so the
