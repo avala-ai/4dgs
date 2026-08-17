@@ -152,6 +152,7 @@ FourdgsScene readFourdgsBytes(
   bool? summaryCrcOk;
   bool truncated = false;
   bool sawFooter = false;
+  bool sawWindowTable = false;
   final provenance = FourdgsProvenance();
   final objects = FourdgsObjectLayer();
 
@@ -159,16 +160,29 @@ FourdgsScene readFourdgsBytes(
     for (final record in iterRecords(data, fourdgsMagic.length)) {
       switch (record.opcode) {
         case opHeader:
+          if (header != null) {
+            throw duplicateStructuralRecord('Header', record.offset);
+          }
           header = FourdgsHeader.parse(
             record.content,
             fileOffset: record.offset + recordHeaderBytes,
           );
         case opQuantization:
+          if (quantization != null) {
+            throw duplicateStructuralRecord('Quantization', record.offset);
+          }
           quantization = FourdgsQuantization.parse(
             record.content,
             fileOffset: record.offset + recordHeaderBytes,
           );
         case opWindowTable:
+          // Tracked with a flag rather than by testing `windows` for emptiness:
+          // a file may legitimately carry a Window Table with no entries, and
+          // that is not the same thing as carrying no table at all.
+          if (sawWindowTable) {
+            throw duplicateStructuralRecord('Window Table', record.offset);
+          }
+          sawWindowTable = true;
           windows = FourdgsWindowTable.parse(record.content).windows;
         case opChunk:
           if (quantization == null) {

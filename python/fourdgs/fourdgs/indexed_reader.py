@@ -22,7 +22,7 @@ import numpy as np
 
 from . import opcode as op
 from . import records as rec
-from .exceptions import MalformedFile
+from .exceptions import MalformedFile, duplicate_structural_record
 from .model import AudioSource, AudioSourceKeyframe
 from .object_layer import ObjectLayer
 from .provenance import Provenance
@@ -206,6 +206,7 @@ def open_indexed(source: Readable) -> IndexedScene:
 
     header = quant = None
     windows: list[tuple[float, float]] = []
+    saw_window_table = False
     source_ranges: dict[int, tuple[int, int]] = {}
     data_ranges: dict[int, tuple[int, int]] = {}
     legacy_audio: IndexedAudioSource | None = None
@@ -217,12 +218,21 @@ def open_indexed(source: Readable) -> IndexedScene:
         if record.opcode == op.CHUNK:
             break
         if record.opcode == op.HEADER:
+            if header is not None:
+                raise duplicate_structural_record("Header", record.offset)
             header = rec.Header.parse(front.content(record))
             check_temporal_model(header.temporal_model)
         elif record.opcode == op.QUANTIZATION:
+            if quant is not None:
+                raise duplicate_structural_record("Quantization", record.offset)
             quant = rec.Quantization.parse(front.content(record))
             check_quantization_scheme(quant.scheme)
         elif record.opcode == op.WINDOW_TABLE:
+            # A file may legitimately carry a table with no entries, so emptiness does
+            # not answer "was there a table"; a flag does.
+            if saw_window_table:
+                raise duplicate_structural_record("Window Table", record.offset)
+            saw_window_table = True
             windows = rec.WindowTable.parse(front.content(record)).windows
         elif record.opcode == op.AUDIO:
             # The track's bytes are not read here, and the record is not stepped into: a

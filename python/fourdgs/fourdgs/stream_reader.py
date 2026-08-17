@@ -17,7 +17,7 @@ import numpy as np
 
 from . import opcode as op
 from . import records as rec
-from .exceptions import MalformedFile, TruncatedFile, UnsupportedCodec
+from .exceptions import MalformedFile, TruncatedFile, UnsupportedCodec, duplicate_structural_record
 from .model import AudioSource, AudioSourceKeyframe, CameraTrajectory, GaussianSet
 from .object_layer import ObjectLayer
 from .provenance import Provenance
@@ -372,18 +372,30 @@ def read(path_or_bytes, *, recover_truncated: bool = True, max_sh_band: int = 3)
     legacy_audio: rec.Audio | None = None
     first_audio_record: tuple[str, int, int | None] | None = None
 
+    saw_window_table = False
+
     pos = len(MAGIC)
     end = pos
     try:
         for record in iter_records(data, pos):
             end = record.offset + 9 + len(record.content)
             if record.opcode == op.HEADER:
+                if header is not None:
+                    raise duplicate_structural_record("Header", record.offset)
                 header = rec.Header.parse(record.content)
                 check_temporal_model(header.temporal_model)
             elif record.opcode == op.QUANTIZATION:
+                if quant is not None:
+                    raise duplicate_structural_record("Quantization", record.offset)
                 quant = rec.Quantization.parse(record.content)
                 check_quantization_scheme(quant.scheme)
             elif record.opcode == op.WINDOW_TABLE:
+                # Tracked with a flag rather than by testing `windows` for emptiness: a
+                # file may legitimately carry a table with no entries, which is not the
+                # same thing as carrying no table at all.
+                if saw_window_table:
+                    raise duplicate_structural_record("Window Table", record.offset)
+                saw_window_table = True
                 windows = rec.WindowTable.parse(record.content).windows
             elif record.opcode == op.CHUNK:
                 if quant is None:

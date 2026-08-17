@@ -135,6 +135,16 @@ Order is normative only where stated: the Header MUST be the first record, the F
 last, and the summary MUST be contiguous (§4.5). The magic appears at both ends so a reader that has
 only the tail of a file can still identify it and locate the Footer.
 
+Multiplicity is normative where the diagram shows it. The records drawn without a repetition marker
+— Header, Quantization, Window Table — appear **exactly once**, and **a reader MUST refuse a file
+carrying two of any of them**, naming the record and the byte. These three describe the whole file,
+nothing in the format says which of two copies wins, and the two ways to guess are not equivalent:
+a front-to-back reader that keeps the last and a seeking reader that stops at the first will report
+two different scenes for the same bytes, each silently. That is §5.15.3's reason about duplicate
+sensor names applied to the records the rest of the file is interpreted against, where the
+ambiguity is widest rather than narrowest. A writer has no reason to emit two, so nothing legal is
+lost by refusing.
+
 ### 4.1 Magic
 
 8 bytes: `0x89 0x34 0x44 0x47 0x53 0x31 0x0D 0x0A`
@@ -1629,6 +1639,7 @@ and the text was the bug.
 | §3/§5.15.6–§6.6 added: exact `object_id`, Object Table `0x24`, Object Track `0x25`, and base-then-track composition                       | rule added                |
 | §11/§5.18/§5.8 added: the `keyframe-delta` temporal model, Delta Chunk `0x10`, `gaussian_id` (id 13), and six appended Chunk Index fields | rule added                |
 | §5.3 added: the grammar a `bounds` value is spelled by, and that two bounds are compared as numbers rather than as bytes                  | clarification, rule added |
+| §4 added: Header, Quantization and Window Table appear exactly once, and a reader MUST refuse a file carrying two of any of them          | rule added                |
 
 The keyframe-delta row is additive and changes no existing file. `temporal_model` gains a value,
 opcode `0x10` was unassigned, attribute id `13` was reserved, and the six Chunk Index fields append

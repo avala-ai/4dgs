@@ -119,6 +119,29 @@ class FourdgsMalformedFile extends FourdgsException {
 /// the stable id is what the file carries and the row is an artefact of
 /// composition order. Empty for a caller with no record to blame, which drops
 /// the clause rather than printing a dangling `gaussian -1`.
+/// A second Header, Quantization or Window Table record in one file.
+///
+/// These three describe the whole file, and nothing in a `.4dgs` file says
+/// which of two copies wins. A reader that keeps the last silently disagrees
+/// with one that keeps the first — and both of those readers are in this
+/// package: the streamed reader walked every record and kept whichever came
+/// last, while the indexed opener parses the front matter and would keep the
+/// first. Same bytes, two scenes.
+///
+/// That is the outcome §5.14 and §5.15.3 already refuse duplicate coordinate
+/// frame and sensor names to avoid, and the indexed opener already refuses a
+/// second legacy Audio record for. This extends the same rule to the three
+/// records that describe the file itself, where the disagreement is widest.
+///
+/// Refusing costs a producer nothing: no writer here emits two, so a file
+/// carrying two is damaged or is courting exactly this ambiguity.
+FourdgsMalformedFile duplicateStructuralRecord(String name, int offset) {
+  return FourdgsMalformedFile(
+    'a second $name record at byte $offset; a file carries exactly one, and '
+    'nothing says which of two copies a reader should believe',
+  );
+}
+
 FourdgsMalformedFile windowIndexOutOfRange(
   int index,
   int tableLength, {
