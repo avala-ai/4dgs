@@ -235,9 +235,9 @@ public enum Summary {
     /// Nothing in the summary may depend on decoded order — an encoder may reorder
     /// gaussians freely, so a summary that depended on it would ask two correct decoders
     /// to disagree. The key is the gaussian's whole decoded state, rounded exactly as the
-    /// summary rounds it, with its spherical-harmonic coefficients last. Two gaussians
-    /// that tie on all of it are identical in every value the summary emits, so their
-    /// relative order cannot change the output.
+    /// summary rounds it, followed by spherical harmonics, membership, and exact decoded
+    /// floats as the final tiebreaker. Two rows that also tie exactly are interchangeable
+    /// in every value the summary emits or composes.
     static func stableOrder(_ g: GaussianState) -> [Int] {
         let shWidth = g.shCoefficientsPerComponent * 3
         var keys: [(key: [Double], index: Int)] = []
@@ -267,10 +267,15 @@ public enum Summary {
             }
             keys.append((row, i))
         }
-        // Ties broken by original index. Swift's sort is not stable and Python's is; the
-        // tie-break makes the difference invisible rather than relying on it.
         keys.sort { a, b in
             for (x, y) in zip(a.key, b.key) where x != y { return x < y }
+
+            // Preserve the established rounded/SH/membership order above. Exact decoded
+            // floats matter only when that key ties: sub-micro motion, for example, can
+            // compose into visibly different centres at a later probe. Rows equal here are
+            // true decoded duplicates, so their resident order cannot change the summary.
+            let compared = compareExactRows(g, a.index, b.index)
+            if compared != 0 { return compared < 0 }
             return a.index < b.index
         }
         return keys.map(\.index)
@@ -283,5 +288,59 @@ public enum Summary {
         if v.isNaN { return .infinity }
         if v.isInfinite { return v }
         return Double(String(format: "%.6f", v)) ?? v
+    }
+
+    /// Total ordering for exact decoded floats after the rounded key ties.
+    ///
+    /// Signed zeros are equivalent because the canonical form never exposes their sign.
+    /// NaNs likewise all emit `null`; they sort after positive infinity so an unordered
+    /// comparison cannot fall through to resident order.
+    private static func compareExact(_ a: Float, _ b: Float) -> Int {
+        func valueClass(_ value: Float) -> Int {
+            if value.isNaN { return 3 }
+            if value == -.infinity { return 0 }
+            if value == .infinity { return 2 }
+            return 1
+        }
+        let classA = valueClass(a)
+        let classB = valueClass(b)
+        if classA != classB { return classA < classB ? -1 : 1 }
+        if classA != 1 { return 0 }
+        if a < b { return -1 }
+        if b < a { return 1 }
+        return 0
+    }
+
+    /// Compare each fixed-width field in canonical attribute order without retaining a
+    /// second per-gaussian key. The common path never reaches this work; it is only the
+    /// suffix for rows whose established rounded key already tied.
+    private static func compareExactRows(_ g: GaussianState, _ a: Int, _ b: Int) -> Int {
+        func compare(_ values: [Float], _ width: Int) -> Int {
+            for k in 0..<width {
+                let result = compareExact(values[a * width + k], values[b * width + k])
+                if result != 0 { return result }
+            }
+            return 0
+        }
+
+        var result = compare(g.positions, 3)
+        if result != 0 { return result }
+        result = compare(g.scales, 3)
+        if result != 0 { return result }
+        result = compare(g.rotations, 4)
+        if result != 0 { return result }
+        result = compare(g.colors, 4)
+        if result != 0 { return result }
+        result = compare(g.motions, 3)
+        if result != 0 { return result }
+        result = compare(g.muT, 1)
+        if result != 0 { return result }
+        result = compare(g.sigmaT, 1)
+        if result != 0 { return result }
+        result = compare(g.winLo, 1)
+        if result != 0 { return result }
+        result = compare(g.winHi, 1)
+        if result != 0 { return result }
+        return 0
     }
 }
