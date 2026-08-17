@@ -175,6 +175,12 @@ against them. That was the strategy's biggest open question and it is settled.
 
 ## Dart, before its first release
 
+**Done — `fourdgs` 0.1.0 was published by hand on 2026-08-16, transferred to the `avala.ai`
+publisher, and Automated publishing is enabled with the tag pattern below. Dart now releases the way
+Python and Rust do: stamp the version, push the tag.** The rest of this section is kept as the
+record of why the first one could not be automated, and as the procedure for the next package this
+repository claims.
+
 **The first publish must be done by hand, and this is a pub.dev constraint rather than a choice.**
 Every other registry here accepts an OIDC-authenticated publish for a name nobody has claimed;
 pub.dev does not, because automated publishing is configured _on a package_, and until the package

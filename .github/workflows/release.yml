@@ -311,43 +311,20 @@ jobs:
 
   dart:
     name: Publish fourdgs to pub.dev
-    # DISABLED ON PURPOSE — do not delete this gate without doing the three manual
-    # steps below first, in this order.
+    # `fourdgs` 0.1.0 was published by hand on 2026-08-16 — pub.dev accepts no
+    # OIDC publish for a name nobody has claimed, so the first one cannot be
+    # automated. The package was then transferred to the `avala.ai` verified
+    # publisher and Automated publishing enabled for this repository with the tag
+    # pattern `releases/dart/v{{version}}`, gated on the `release` environment this
+    # job declares below. That is what the OIDC exchange in `setup-dart` needs, and
+    # it is why this gate is gone.
     #
-    # pub.dev will not accept an automated publish for a package that does not exist
-    # yet. A brand-new package name must be claimed by a human running
-    # `dart pub publish` from a machine logged in with a Google account; there is no
-    # OIDC path to a first publish, because there is no package for a publisher to be
-    # configured on. So:
-    #
-    #   1. `cd dart/fourdgs && dart pub publish` — by hand, once. This claims the
-    #      `fourdgs` name and puts 0.1.0 on the registry, owned by whoever ran it.
-    #   2. On pub.dev, open the package's Admin tab and **transfer it to the
-    #      `avala.ai` publisher**. None of this is scriptable: `dart pub` has
-    #      `login`, `publish` and `token`, and no subcommand for publisher
-    #      administration, so steps 2 and 3 are the web UI.
-    #   3. Still on the Admin tab, enable **Automated publishing** for this
-    #      repository, with the tag pattern `releases/dart/v{{version}}`. That is what
-    #      makes the OIDC exchange below succeed; without it every run of this job
-    #      fails authentication.
-    #   4. Then, and only then, delete this `if: false`.
-    #
-    # Flipping the gate before step 2 produces a job that fails on every tag, which is
-    # the failure this comment exists to prevent — it looks like a broken workflow
-    # rather than a missing setting.
-    #
-    # The package goes under the **`avala.ai`** verified publisher, which already exists
-    # on pub.dev and owns no packages yet — `fourdgs` will be its first. An earlier
-    # version of this note said `4dgs.dev`; that domain would have needed its own
-    # verification, and this one is verified today. Publisher ownership is a separate
-    # pub.dev setting from automated publishing and does not gate this job.
-    #
-    # Worth doing before step 1 rather than after: that publisher has a single member,
-    # so until a second admin exists, one lost account is one package nobody can ship a
-    # fix for. pub.dev recovers publisher control through domain verification, not
-    # through support.
-    if: false
-    # if: startsWith(github.ref, 'refs/tags/releases/dart/')
+    # This job is deliberately not the reusable `dart-lang/setup-dart` publish
+    # workflow. `setup-dart@v1` already performs the token exchange, and the steps
+    # below add what that workflow does not: the version is asserted against the tag
+    # in all three places Dart states it, and the release notes are the changelog
+    # section rather than a second description written for the occasion.
+    if: startsWith(github.ref, 'refs/tags/releases/dart/')
     runs-on: ubuntu-latest
     environment: release
     permissions:
