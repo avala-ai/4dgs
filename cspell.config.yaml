@@ -140,6 +140,9 @@ words:
   - MSVC
   - fprintf
   - DFOURDGS
+  # The two C library calls whose radix comes from `LC_NUMERIC`, and the call that sets it.
+  - strtod
+  - setlocale
   # Python standard-library names that appear in release notes
   - hypot
   - DCMAKE

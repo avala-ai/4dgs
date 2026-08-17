@@ -79,6 +79,18 @@ All notable changes to the C++ package are documented here, following
 
 ### Fixed
 
+- **The canonical summary is JSON under any `LC_NUMERIC`.** `renderRounded` formatted with
+  `snprintf("%.*f")` and read back with `strtod`, and both take the radix from the locale. Nothing
+  in the conformance runners sets one, so this was latent there and live for anyone linking this
+  canonical form into a host that does — ICU, Qt and GTK all call `setlocale(LC_ALL, "")` while
+  initialising. Under a comma-radix locale `num(0.05).render()` produced `"0,050000"`, which is not
+  JSON, and `run.py` failed to parse every file in the corpus; `roundToDecimals` was affected the
+  same way through `strtod`, stopping at the integer part and dropping every fractional digit out of
+  the content-order key. The render is now rewritten to `.` and the read-back to the locale's own
+  radix, both handling a multi-byte separator, and the zero normalisation drops the sign rather than
+  returning a spelled-out `"0.000000"` — which had hard-coded both the radix and six digits, so a
+  document could carry dotted zeros among comma-spelled numbers.
+
 - **A `GaussianView` whose columns are shorter than its `count` is refused rather than read past.**
   `count` is a public field of its own and the `Span`s beside it are independent, so
   `GaussianView{count = 4, positions = Span(p, 6), …}` is a value any caller can build without
