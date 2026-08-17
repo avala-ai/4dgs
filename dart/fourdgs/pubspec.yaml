@@ -2,7 +2,7 @@ name: fourdgs
 description: >-
   A decoder for the 4dgs container format: 4D gaussian splat scenes with native
   audio in a single seekable file. Streamed and indexed read paths, pure Dart.
-version: 0.1.0
+version: 0.2.0
 homepage: https://4dgs.dev
 repository: https://github.com/avala-ai/4dgs
 issue_tracker: https://github.com/avala-ai/4dgs/issues
