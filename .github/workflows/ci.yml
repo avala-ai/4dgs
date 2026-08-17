@@ -1051,6 +1051,15 @@ jobs:
       #
       # The probe imports the umbrella and nothing else. What it proves is not what the
       # decoder computes but that the read path compiles for the web at all.
+      #
+      # This gate outlives the bug that prompted it. Moving the encoder to its own library
+      # fixed one instance; a 64-bit literal landing in any file the umbrella exports — a
+      # reader optimisation reaching for Morton codes would do it — is the same failure
+      # again, and only this step would catch it.
+      #
+      # Confirm it can fail before trusting it: re-add `export 'src/writer.dart';` to
+      # lib/fourdgs.dart and this step reports the three literals. A gate nobody has
+      # watched fail is a gate nobody should believe.
       - name: The read path compiles for the web
         if: matrix.os == 'ubuntu-latest'
         run: cd dart/conformance && dart compile js -o "$RUNNER_TEMP/web_read_probe.js" bin/web_read_probe.dart

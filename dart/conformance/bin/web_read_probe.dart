@@ -22,6 +22,22 @@
 /// cannot be compiled for the web by design — see that library's documentation
 /// — and its absence from this graph is the property being checked.
 ///
+/// `package:fourdgs/io.dart` is deliberately absent too, for a different
+/// reason. It is not a web surface: it is the `dart:io` transport, and a
+/// browser consumer never imports it. (It does compile under dart2js — that was
+/// checked rather than assumed, since `dart:io` imports are accepted and only
+/// fail at runtime — so its absence here is about scope, not about it being
+/// uncompilable.) It also only *imports* the umbrella and re-exports nothing,
+/// so it cannot widen this library's surface. If it ever does start
+/// re-exporting, the consumer affected is a `dart:io` one, which is native,
+/// where the encoder is fine.
+///
+/// What this probe does cover, and what makes it worth more than the export
+/// change it was written for: any library reachable from the umbrella. A reader
+/// optimisation that reaches for Morton codes and lands a 64-bit mask in an
+/// exported file would be caught here on the first CI run, and the writer
+/// living in its own library would save nobody.
+///
 /// The references below exist so that the read API is genuinely in the compile
 /// graph rather than tree-shaken away before it can be checked. Anything a web
 /// consumer touches belongs in this list.
