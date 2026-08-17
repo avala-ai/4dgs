@@ -1223,12 +1223,9 @@ fn both_validators_refuse_the_invalid_corpus_the_same_way() {
         // anything. That is the property this file exists to hold, and it is what a check
         // present in one implementation and missing from the other breaks.
         //
-        // Two classes are exempt from the wording comparison for now, and both are
-        // recorded as gaps rather than quietly skipped:
+        // One class is exempt from the wording comparison for now, and it is recorded as
+        // a gap rather than quietly skipped:
         //
-        // * the magic and version refusals, which the two word differently — this crate
-        //   prefixes its error kind and Python does not. Closing that means changing
-        //   messages in both languages.
         // * files whose only fault is inside a chunk's streams, such as an unimplemented
         //   stream codec. This validator now decodes the chunks and reports them, named
         //   and placed; the Python one still walks the framing and opens the file the way
@@ -1237,6 +1234,13 @@ fn both_validators_refuse_the_invalid_corpus_the_same_way() {
         //   more, and nothing it says contradicts the other — and #125's Python-side
         //   counterpart is what closes it. `every_invalid_variant_is_refused_by_its_own_-
         //   identifier` is where the added reporting is held to the corpus.
+        //
+        // The magic and version refusals used to be exempt too, because this crate put
+        // its error KIND in front of the sentence and Python did not. That is closed:
+        // `validate.rs` now prints the error's message rather than its `Display`, which
+        // is where the prefix came from, so the two word those refusals identically. The
+        // wording comparison below could widen to every file once the stream-fault class
+        // above is closed as well.
         let wording_is_contract =
             name.contains("TemporalModel") || name.contains("QuantizationScheme");
         if wording_is_contract {

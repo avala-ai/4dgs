@@ -178,6 +178,26 @@ pub struct Report {
     pub findings: Vec<Finding>,
 }
 
+/// An error's message without the kind its `Display` puts in front.
+///
+/// Matched rather than string-stripped so that a variant added later is a compile error
+/// here instead of a sentence that quietly keeps its prefix.
+fn bare_message(error: &fourdgs::Error) -> String {
+    use fourdgs::Error;
+    match error {
+        Error::UnsupportedVersion(m)
+        | Error::Truncated(m)
+        | Error::Malformed(m)
+        | Error::UnsupportedCodec(m)
+        | Error::UnsupportedModel(m)
+        | Error::BoundViolation(m)
+        | Error::UnsupportedOperation(m)
+        | Error::InvalidInput(m) => m.clone(),
+        Error::Refused { message, .. } => message.clone(),
+        Error::Io(e) => e.to_string(),
+    }
+}
+
 impl Report {
     pub fn ok(&self) -> bool {
         !self.findings.iter().any(|f| f.severity == Severity::Error)
@@ -212,6 +232,18 @@ impl Report {
     /// `prefix` is what the message is introduced with, so the sentence stays the one the
     /// other validator prints; the identifier arrives on its own line and changes nothing
     /// about it.
+    ///
+    /// The error's own message is printed, not its `Display` — `Display` puts the error
+    /// KIND in front (`"malformed: "`, `"truncated: "`), which is right when the error is
+    /// the whole of what is being reported and wrong here, where `prefix` has already
+    /// said what could not be done. Doubling them reads "a seeking reader cannot open
+    /// this file: malformed: ...", and worse, it is the divergence
+    /// `both_validators_refuse_the_invalid_corpus_the_same_way` records as a known gap:
+    /// this crate prefixed its kind and the Python validator did not, so the two printed
+    /// different sentences about the same bytes. `UnsupportedModel` was already exempted
+    /// from the kind prefix for exactly this reason, and its doc comment gives the rule —
+    /// where the wording is contract between implementations, the sentence is the
+    /// message alone. Every refusal a validator prints is that kind of wording.
     fn refused(
         &mut self,
         prefix: &str,
@@ -220,7 +252,11 @@ impl Report {
         site: Option<refusal::Site>,
     ) {
         let named = refusal::describe(error, framing, site);
-        self.push(Severity::Error, format!("{prefix}{error}"), named);
+        self.push(
+            Severity::Error,
+            format!("{prefix}{}", bare_message(error)),
+            named,
+        );
     }
 }
 
