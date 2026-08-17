@@ -65,4 +65,4 @@ export 'src/validate.dart';
 /// The release workflow asserts that this constant, `pubspec.yaml` and the
 /// release tag all agree, and refuses the release when they do not — a version
 /// number is the one mistake that cannot be corrected after publication.
-const String fourdgsPackageVersion = '0.1.0';
+const String fourdgsPackageVersion = '0.2.0';
