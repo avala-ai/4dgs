@@ -207,8 +207,8 @@ into a Morton code using 64-bit masks — `0x1249249249249249` and two neighbour
 `int` _is_ a JavaScript number, so those literals are past `2^53` and dart2js rejects them where
 they are written rather than where they are used.
 
-Keeping the encoder in the umbrella library therefore made the whole package unbuildable for the
-web, including for consumers that only ever read. That is not hypothetical: version 0.1.0 shipped
+Keeping the encoder in the umbrella library therefore made the whole package impossible to build
+for the web, including for consumers that only ever read. That is not hypothetical: version 0.1.0 shipped
 that way, and a Flutter web app which never encoded anything could not be built at all.
 `flutter build web --wasm` does not avoid it either — Flutter still emits a dart2js fallback bundle
 for browsers without wasm.

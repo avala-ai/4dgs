@@ -32,8 +32,8 @@
 /// The encoder is a separate import because it cannot be compiled for the web
 /// at all — its Morton-code masks are 64-bit values a JavaScript number cannot
 /// represent — and an export is enough to put a file in the compile graph. Kept
-/// here, it made this whole library unbuildable for a browser consumer that
-/// only ever reads. See that library's own documentation for why the masks are
+/// here, it made this whole library impossible to build for a browser consumer
+/// that only ever reads. See that library's own documentation for why the masks are
 /// not the thing to change.
 ///
 /// Reading a file from disk needs one more import: `package:fourdgs/io.dart`

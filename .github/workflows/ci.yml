@@ -1042,7 +1042,7 @@ jobs:
           cd dart/fourdgs && dart test
           cd ../conformance && dart test
 
-      # The gate whose absence shipped 0.1.0 unbuildable for the web. `dart test` runs on
+      # The gate whose absence shipped 0.1.0 unable to build for the web. `dart test` runs on
       # the VM, where an `int` is a real 64-bit integer; a JavaScript number is not, so a
       # 64-bit literal anywhere in the compile graph is a dart2js error that no VM test can
       # produce. 0.1.0 carried three, in the writer's Morton masks, and the umbrella library
