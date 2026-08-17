@@ -8,6 +8,31 @@ All notable changes to the Dart package are documented here, following
 
 ### Changed
 
+- **BREAKING: the encoder moved out of `package:fourdgs/fourdgs.dart` and into
+  `package:fourdgs/writer.dart`.** Code that writes `.4dgs` files needs one added import; code that
+  only reads needs no change.
+
+  The umbrella library could not be compiled for the web. `_part1by2`, the Morton-code bit-spreader
+  the chunk orderer uses, carries three 64-bit masks — `0x100F00F00F00F00F`, `0x10C30C30C30C30C3`
+  and `0x1249249249249249`. On the web a Dart `int` is a JavaScript number, so a literal past `2^53`
+  is a dart2js error raised where it is written rather than where it is used, and an export is
+  enough to put a file in the compile graph. So a browser consumer that only ever read `.4dgs` still
+  could not build: `mission_control`, a Flutter web app, could not be built at all against 0.1.0.
+  `flutter build web --wasm` did not avoid it either, because Flutter still emits a dart2js fallback
+  bundle for browsers without wasm.
+
+  The masks are unchanged and must stay that way. The values genuinely exceed `2^53`, so computing
+  them at runtime would satisfy the compiler and produce silently wrong Morton codes on the web — a
+  loud build failure traded for corrupt output. The encoder is correct wherever a Dart `int` is a
+  real 64-bit integer, and now says so by being a separate import rather than by failing everyone
+  else's build.
+
+- **CI compiles the read path to JavaScript.** `dart test` runs on the VM, where these literals are
+  perfectly legal, so no amount of testing could have caught this — the suite was green the whole
+  time. `dart/conformance/bin/web_read_probe.dart` imports the umbrella and nothing else, and the
+  Dart job compiles it with `dart compile js`. Reverting the export makes that step fail with the
+  three errors above, which is the check the gate is for.
+
 - **A file carrying two Header, Quantization or Window Table records is refused rather than guessed
   at.** §4's layout diagram draws all three without a repetition marker, so "exactly one" was
   already the intent, but no sentence made it a refusal and both read paths quietly guessed —

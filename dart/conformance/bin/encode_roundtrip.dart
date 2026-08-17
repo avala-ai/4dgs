@@ -25,6 +25,7 @@ library;
 import 'dart:io';
 
 import 'package:fourdgs/fourdgs.dart';
+import 'package:fourdgs/writer.dart';
 
 /// A registry ladder name, or a comma-separated list of depths, band 1 first.
 List<int> parseDepths(String spec) {

@@ -1042,6 +1042,19 @@ jobs:
           cd dart/fourdgs && dart test
           cd ../conformance && dart test
 
+      # The gate whose absence shipped 0.1.0 unbuildable for the web. `dart test` runs on
+      # the VM, where an `int` is a real 64-bit integer; a JavaScript number is not, so a
+      # 64-bit literal anywhere in the compile graph is a dart2js error that no VM test can
+      # produce. 0.1.0 carried three, in the writer's Morton masks, and the umbrella library
+      # exported the writer — so a browser app that only ever READ `.4dgs` could not be
+      # built at all, and nothing here noticed until a consumer did.
+      #
+      # The probe imports the umbrella and nothing else. What it proves is not what the
+      # decoder computes but that the read path compiles for the web at all.
+      - name: The read path compiles for the web
+        if: matrix.os == 'ubuntu-latest'
+        run: cd dart/conformance && dart compile js -o "$RUNNER_TEMP/web_read_probe.js" bin/web_read_probe.dart
+
       # The one gate that would otherwise be discovered on release day. It is cheap, it
       # needs no credentials, and a package that cannot be packed is a package whose first
       # publish fails in front of whoever is doing it by hand.

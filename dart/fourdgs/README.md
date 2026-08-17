@@ -3,8 +3,9 @@
 A decoder for the **4dgs** container: 4D gaussian splat video with native audio, in one
 self-contained file you can range-request and seek.
 
-Pure Dart, no Flutter dependency — the same code runs on the Dart VM, inside a Flutter app, and
-compiled to JavaScript or Wasm.
+Pure Dart, no Flutter dependency — the same **decoder** runs on the Dart VM, inside a Flutter app,
+and compiled to JavaScript or Wasm. The encoder is a separate import and does not compile for the
+web; see [Writing](#writing) below.
 
 The format's specification, the feature matrix and the guides live at
 **[4dgs.dev](https://4dgs.dev)**.
@@ -192,6 +193,34 @@ says less, deliberately, rather than saying something different:
 - **The provenance registry checks** — a `metres_per_unit` that disagrees with its declared unit, a
   principal point outside its image — need the parsed provenance records, and are not ported here,
   exactly as they are not ported to the Rust, TypeScript or C++ validators.
+
+## Writing
+
+Encoding lives in its own library:
+
+```dart
+import 'package:fourdgs/writer.dart';
+```
+
+**It does not compile for the web, and that is deliberate.** The chunk orderer spreads coordinates
+into a Morton code using 64-bit masks — `0x1249249249249249` and two neighbours. On the web a Dart
+`int` _is_ a JavaScript number, so those literals are past `2^53` and dart2js rejects them where
+they are written rather than where they are used.
+
+Keeping the encoder in the umbrella library therefore made the whole package unbuildable for the
+web, including for consumers that only ever read. That is not hypothetical: version 0.1.0 shipped
+that way, and a Flutter web app which never encoded anything could not be built at all.
+`flutter build web --wasm` does not avoid it either — Flutter still emits a dart2js fallback bundle
+for browsers without wasm.
+
+The masks are **not** the thing to change. The values genuinely exceed `2^53`; a JavaScript number
+cannot hold them however they are spelled, so computing them at runtime would silence the compiler
+and make the codes quietly wrong on the web — a build failure traded for corrupt output. The encoder
+is correct wherever a Dart `int` is a real 64-bit integer, which is every native target and wasm,
+and it is honest about being unavailable where one is not.
+
+If you are moving an app off a vendored copy of this decoder, check what that copy left out before
+treating its absences as staleness. A fork with no `writer.dart` is not behind; it is web-safe.
 
 ## Scope
 
