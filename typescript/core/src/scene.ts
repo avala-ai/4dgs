@@ -18,7 +18,7 @@ import {
 } from "./chunk.js";
 import { crc32, DEFAULT_CODECS, type CodecRegistry } from "./codec.js";
 import { Cursor } from "./cursor.js";
-import { MalformedFile, TruncatedFile } from "./errors.js";
+import { duplicateStructuralRecord, MalformedFile, TruncatedFile } from "./errors.js";
 import { assembleGaussians, type GaussianSet } from "./gaussians.js";
 import { Opcode } from "./opcodes.js";
 import { ObjectLayer } from "./objects.js";
@@ -203,6 +203,7 @@ export async function decodeScene(
   let header: Header | null = null;
   let quantization: Quantization | null = null;
   let windows = new Float64Array(0);
+  let sawWindowTable = false;
   let chunkOptions: DecodeChunkOptions | null = null;
 
   const chunks: ChunkGaussians[] = [];
@@ -285,14 +286,25 @@ export async function decodeScene(
       }
       switch (opcode) {
         case Opcode.Header:
+          if (header !== null) throw duplicateStructuralRecord("Header", record.offset);
           header = parseHeader(content);
           checkTemporalModel(header.temporalModel);
           break;
         case Opcode.Quantization:
+          if (quantization !== null) {
+            throw duplicateStructuralRecord("Quantization", record.offset);
+          }
           quantization = parseQuantization(content);
           checkQuantizationScheme(quantization.scheme);
           break;
         case Opcode.WindowTable:
+          // Tracked with a flag rather than by testing `windows` for emptiness: a file
+          // may legitimately carry a table with no entries, which is not the same thing
+          // as carrying no table at all.
+          if (sawWindowTable) {
+            throw duplicateStructuralRecord("Window Table", record.offset);
+          }
+          sawWindowTable = true;
           windows = parseWindowTable(content);
           break;
         case Opcode.Chunk: {

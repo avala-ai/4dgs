@@ -706,3 +706,56 @@ test("a file handle refuses a range that runs off the end", async (t) => {
     await source.close();
   }
 });
+
+/**
+ * Returns `data` with its first record of `opcode` spliced in a second time.
+ *
+ * The copy is byte-identical and sits directly after the original, so the file stays
+ * well-framed. What is wrong with it is only that the record appears twice — which is
+ * the point: nothing about the bytes looks damaged, and a reader that overwrites the
+ * first from the second, or stops at the first, returns a scene that looks sound.
+ */
+function withDuplicateRecord(data: Uint8Array, opcode: number): Uint8Array {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  let at = MAGIC.length;
+  while (at < data.length) {
+    const length = Number(view.getBigUint64(at + 1, true));
+    const end = at + RECORD_HEADER_BYTES + length;
+    if (data[at] === opcode) {
+      return concat([data.subarray(0, end), data.subarray(at, end), data.subarray(end)]);
+    }
+    at = end;
+  }
+  throw new Error(`no record with opcode ${opcode} in the fixture`);
+}
+
+test("a second once-only record is refused on both read paths", async () => {
+  // Spec section 4: the records drawn without a repetition marker — Header,
+  // Quantization, Window Table — appear exactly once.
+  //
+  // Not pedantry about a wasted record. These three are what the rest of the file is
+  // interpreted against, nothing in the format says which of two copies wins, and this
+  // package's own two readers would not have agreed: `decodeScene` walks every record
+  // and kept whichever came last, while `IndexedDecoder` scans the front matter and
+  // would keep the first. A file with two Quantization records declaring different
+  // steps therefore decoded to two different scenes depending on which reader opened
+  // it, with nothing raised on either.
+  const path = corpus("TenWindows-UseChunkIndex-UseCrc");
+  if (path === null) return;
+  const real = new Uint8Array(readFileSync(path));
+
+  for (const [opcode, name] of [
+    [Opcode.Header, "Header"],
+    [Opcode.Quantization, "Quantization"],
+    [Opcode.WindowTable, "Window Table"],
+  ] as const) {
+    const broken = withDuplicateRecord(real, opcode);
+    const names = new RegExp(`a second ${name} record .*byte`);
+    await assert.rejects(() => decodeScene(new BytesReadable(broken)), names, `streamed: ${name}`);
+    await assert.rejects(
+      () => IndexedDecoder.open(new BytesReadable(broken)),
+      names,
+      `indexed: ${name}`,
+    );
+  }
+});

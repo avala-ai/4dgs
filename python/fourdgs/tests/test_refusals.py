@@ -25,7 +25,7 @@ from fourdgs import opcode as op
 from fourdgs import records as rec
 from fourdgs.indexed_reader import open_indexed, read_chunk
 from fourdgs.readable import BytesReadable
-from fourdgs.serialization import Cursor, put_string, put_u8, put_u32
+from fourdgs.serialization import MAGIC, Cursor, put_string, put_u8, put_u32
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "tests", "conformance", "generator"))
 import invalid
@@ -325,3 +325,44 @@ def test_a_chunk_that_carries_one_attribute_twice_is_refused():
             [],
         )
     assert caught.value.code == "duplicate-attribute-stream"
+
+
+def _duplicate_record(data: bytes, opcode: int) -> bytes:
+    """Returns `data` with its first record of `opcode` spliced in a second time.
+
+    The copy is byte-identical and goes directly after the original, so the file stays
+    well-framed and every offset the Footer names still points where it did. What is
+    wrong with it is only that the record appears twice -- which is the point: a reader
+    that skips over the second one, or overwrites the first from it, produces a scene
+    that looks entirely sound.
+    """
+    pos = len(MAGIC)
+    while pos < len(data):
+        length = int.from_bytes(data[pos + 1 : pos + 9], "little")
+        end = pos + 9 + length
+        if data[pos] == opcode:
+            return data[:end] + data[pos:end] + data[end:]
+        pos = end
+    raise AssertionError(f"no record with opcode {opcode:#x} in the fixture")
+
+
+@pytest.mark.parametrize(
+    ("opcode", "name"),
+    [(op.HEADER, "Header"), (op.QUANTIZATION, "Quantization"), (op.WINDOW_TABLE, "Window Table")],
+)
+def test_a_second_structural_record_is_refused_on_both_paths(opcode, name):
+    """Section 4: Header, Quantization and Window Table appear exactly once.
+
+    Not a pedantic check. These three are what the rest of the file is interpreted
+    against, nothing in the format says which of two copies wins, and the two ways to
+    guess disagree: this reader walks front to back and would keep the last, while
+    `open_indexed` parses the front matter and would keep the first. A file carrying two
+    Quantization records with different steps therefore decodes to two different scenes
+    depending on which door the caller came in by, with nothing raised on either.
+    """
+    broken = _duplicate_record(_scene(), opcode)
+    for read in (_read_streamed, _read_indexed):
+        with pytest.raises(fourdgs.MalformedFile) as caught:
+            read(broken)
+        assert f"a second {name} record" in str(caught.value)
+        assert "byte" in str(caught.value), "the refusal must say where the copy is"

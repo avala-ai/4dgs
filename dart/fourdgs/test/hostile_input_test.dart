@@ -1473,6 +1473,61 @@ void main() {
       },
     );
   });
+
+  group('a file carrying two of a once-only record is refused', () {
+    // Spec section 4: the records drawn without a repetition marker — Header,
+    // Quantization, Window Table — appear exactly once.
+    //
+    // The refusal is not pedantry about a wasted record. These three are what
+    // the rest of the file is interpreted against, nothing in the format says
+    // which of two copies wins, and this package's own two readers would not
+    // have agreed: `readFourdgsBytes` walks every record and kept whichever
+    // came last, while `openFourdgsIndexed` parses the front matter and would
+    // have kept the first. A file with two Quantization records declaring
+    // different steps therefore decoded to two different scenes depending on
+    // which reader opened it, with nothing raised on either path.
+    final Uint8List real =
+        File(
+          '../../tests/conformance/data/TenWindows-UseChunkIndex-UseCrc.4dgs',
+        ).readAsBytesSync();
+
+    for (final (int opcode, String name) in <(int, String)>[
+      (opHeader, 'Header'),
+      (opQuantization, 'Quantization'),
+      (opWindowTable, 'Window Table'),
+    ]) {
+      test('a second $name record is refused by both readers', () async {
+        final Uint8List broken = _withDuplicateRecord(real, opcode);
+
+        expect(
+          () => readFourdgsBytes(broken),
+          throwsA(
+            isA<FourdgsMalformedFile>().having(
+              (FourdgsMalformedFile e) => e.toString(),
+              'message',
+              allOf(contains('a second $name record'), contains('byte')),
+            ),
+          ),
+        );
+        await expectLater(
+          openFourdgsIndexed(FourdgsBytes(broken)),
+          throwsA(
+            isA<FourdgsMalformedFile>().having(
+              (FourdgsMalformedFile e) => e.toString(),
+              'message',
+              contains('a second $name record'),
+            ),
+          ),
+        );
+      });
+    }
+
+    test('the untouched file still reads on both paths', () async {
+      // The control: the splice above is the only thing that trips it.
+      expect(readFourdgsBytes(real).gaussians.count, greaterThan(0));
+      expect((await openFourdgsIndexed(FourdgsBytes(real))).index, isNotEmpty);
+    });
+  });
 }
 
 /// `u8 opcode`, `u64 length`, content — the framing every record shares.
@@ -1607,4 +1662,32 @@ int _headerGaussianCountOffset(Uint8List bytes) {
     offset += 9 + length;
   }
   throw StateError('no Header record found');
+}
+
+/// Returns [data] with its first record of [opcode] spliced in a second time.
+///
+/// The copy is byte-identical and sits directly after the original, so the file
+/// stays well-framed. What is wrong with it is only that the record appears
+/// twice — which is the point: nothing about the bytes looks damaged, and a
+/// reader that overwrites the first from the second, or stops at the first,
+/// returns a scene that looks entirely sound.
+Uint8List _withDuplicateRecord(Uint8List data, int opcode) {
+  int offset = fourdgsMagic.length;
+  while (offset < data.length) {
+    final int length = ByteData.sublistView(
+      data,
+      offset + 1,
+      offset + 9,
+    ).getUint64(0, Endian.little);
+    final int end = offset + 9 + length;
+    if (data[offset] == opcode) {
+      return Uint8List.fromList(<int>[
+        ...data.sublist(0, end),
+        ...data.sublist(offset, end),
+        ...data.sublist(end),
+      ]);
+    }
+    offset = end;
+  }
+  throw StateError('no record with opcode $opcode in the fixture');
 }

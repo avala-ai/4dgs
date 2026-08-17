@@ -23,7 +23,7 @@ import {
   stepsFrom,
 } from "./chunk.js";
 import { crc32, DEFAULT_CODECS, type CodecRegistry } from "./codec.js";
-import { MalformedFile } from "./errors.js";
+import { duplicateStructuralRecord, MalformedFile } from "./errors.js";
 import { FrontMatterScanner } from "./frontMatter.js";
 import { isProvenanceOpcode, Opcode } from "./opcodes.js";
 import { ObjectLayer } from "./objects.js";
@@ -227,6 +227,7 @@ export class IndexedDecoder {
     let header: Header | null = null;
     let quantization: Quantization | null = null;
     let windows = new Float64Array(0);
+    let sawWindowTable = false;
     const sourceRanges = new Map<number, ByteRange>();
     const dataRanges = new Map<number, { offset: number; length: number }>();
     let legacyAudio: IndexedAudioSource | null = null;
@@ -265,12 +266,22 @@ export class IndexedDecoder {
         break;
       }
       if (record.opcode === Opcode.Header) {
+        if (header !== null) throw duplicateStructuralRecord("Header", record.offset);
         header = parseHeader(await scanner.content(record));
         checkTemporalModel(header.temporalModel);
       } else if (record.opcode === Opcode.Quantization) {
+        if (quantization !== null) {
+          throw duplicateStructuralRecord("Quantization", record.offset);
+        }
         quantization = parseQuantization(await scanner.content(record));
         checkQuantizationScheme(quantization.scheme);
       } else if (record.opcode === Opcode.WindowTable) {
+        // A file may legitimately carry a table with no entries, so emptiness does not
+        // answer "was there a table"; a flag does.
+        if (sawWindowTable) {
+          throw duplicateStructuralRecord("Window Table", record.offset);
+        }
+        sawWindowTable = true;
         windows = parseWindowTable(await scanner.content(record));
       } else if (record.opcode === Opcode.Audio) {
         // The track's bytes are not read here, and neither is the record stepped into: a

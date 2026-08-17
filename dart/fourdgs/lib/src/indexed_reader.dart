@@ -1028,6 +1028,10 @@ class _FrontMatter {
   FourdgsHeader? header;
   FourdgsQuantization? quantization;
   List<FourdgsWindow> windows = const <FourdgsWindow>[];
+
+  /// Whether a Window Table was seen at all, which an empty [windows] does not
+  /// answer: a file may carry a table with no entries.
+  bool sawWindowTable = false;
   FourdgsIndexedAudioSource? legacyAudio;
   final Map<int, ({int offset, int length})> audioSourceRanges =
       <int, ({int offset, int length})>{};
@@ -1260,13 +1264,23 @@ void _applyFrontRecord(
 ) {
   switch (span.opcode) {
     case opHeader:
+      if (out.header != null) {
+        throw duplicateStructuralRecord('Header', span.offset);
+      }
       out.header = FourdgsHeader.parse(content, fileOffset: span.contentOffset);
     case opQuantization:
+      if (out.quantization != null) {
+        throw duplicateStructuralRecord('Quantization', span.offset);
+      }
       out.quantization = FourdgsQuantization.parse(
         content,
         fileOffset: span.contentOffset,
       );
     case opWindowTable:
+      if (out.sawWindowTable) {
+        throw duplicateStructuralRecord('Window Table', span.offset);
+      }
+      out.sawWindowTable = true;
       out.windows = FourdgsWindowTable.parse(content).windows;
     case opAudio:
       if (out.legacyAudio != null) {

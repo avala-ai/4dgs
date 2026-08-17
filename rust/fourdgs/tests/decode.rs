@@ -582,3 +582,67 @@ fn a_zero_sample_trajectory_is_read_as_absent_rather_than_refused() {
     };
     assert!(written.check().is_err());
 }
+
+/// Returns `data` with its first record of `opcode` spliced in a second time.
+///
+/// The copy is byte-identical and sits directly after the original, so the file stays
+/// well-framed. What is wrong with it is only that the record appears twice — which is
+/// the point: nothing about the bytes looks damaged, and a reader that overwrites the
+/// first from the second, or stops at the first, returns a scene that looks sound.
+fn with_duplicate_record(data: &[u8], opcode: u8) -> Vec<u8> {
+    let mut at = MAGIC.len();
+    while at < data.len() {
+        let length =
+            u64::from_le_bytes(data[at + 1..at + 9].try_into().expect("eight length bytes"))
+                as usize;
+        let end = at + 9 + length;
+        if data[at] == opcode {
+            let mut out = Vec::with_capacity(data.len() + (end - at));
+            out.extend_from_slice(&data[..end]);
+            out.extend_from_slice(&data[at..end]);
+            out.extend_from_slice(&data[end..]);
+            return out;
+        }
+        at = end;
+    }
+    panic!("no record with opcode {opcode:#x} in the fixture");
+}
+
+#[test]
+fn a_second_once_only_record_is_refused() {
+    // Spec §4: the records drawn without a repetition marker — Header, Quantization,
+    // Window Table — appear exactly once.
+    //
+    // Not pedantry about a wasted record. These three are what the rest of the file is
+    // interpreted against, nothing in the format says which of two copies wins, and this
+    // crate's own two readers would not have agreed: the streamed reader replaced its
+    // retained value as each copy arrived, while the indexed opener walks the front
+    // matter and would keep the first. A file with two Quantization records declaring
+    // different steps therefore decoded to two different scenes depending on which
+    // reader opened it, with nothing raised on either.
+    let base = minimal_file();
+    assert!(
+        fourdgs::read_bytes(&base).is_ok(),
+        "the control must be readable, or a refusal below proves nothing"
+    );
+
+    for (opcode, name) in [
+        (op::HEADER, "Header"),
+        (op::QUANTIZATION, "Quantization"),
+        (op::WINDOW_TABLE, "Window Table"),
+    ] {
+        let broken = with_duplicate_record(&base, opcode);
+        let err = fourdgs::read_bytes(&broken)
+            .expect_err("a second {name} record must be refused, not resolved by guessing");
+        assert!(matches!(err, Error::Malformed(_)), "{name}: {err}");
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("a second {name} record")),
+            "{message}"
+        );
+        assert!(
+            message.contains("byte"),
+            "the refusal must say where the copy is: {message}"
+        );
+    }
+}
