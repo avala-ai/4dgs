@@ -181,20 +181,30 @@ pub.dev does not, because automated publishing is configured _on a package_, and
 exists there is nothing to configure it on. So the order is fixed:
 
 1. `cd dart/fourdgs && dart pub publish`, once, from a machine logged in with a Google account. This
-   claims the name and puts the first version on the registry.
-2. On pub.dev, the package's **Admin** tab → **Automated publishing**, enabled for `avala-ai/4dgs`
-   with the tag pattern `releases/dart/v{{version}}`.
-3. Delete the `if: false` on the `dart` job in
+   claims the name and puts the first version on the registry, owned by whoever ran it.
+2. On pub.dev, the package's **Admin** tab → **Transfer to publisher** → `avala.ai`.
+3. Still on the **Admin** tab, **Automated publishing**, enabled for `avala-ai/4dgs` with the tag
+   pattern `releases/dart/v{{version}}`.
+4. Delete the `if: false` on the `dart` job in
    [`.github/workflows/release.yml`](.github/workflows/release.yml).
 
-The gate is there so that step 3 cannot happen before step 2. Flipping it early does not fail loudly
+Only step 1 is scriptable. `dart pub` offers `login`, `publish` and `token` and has no subcommand
+for publisher administration, so steps 2 and 3 are the web UI whether you like it or not.
+
+The gate is there so that step 4 cannot happen before step 3. Flipping it early does not fail loudly
 in a useful way — it produces a job that fails authentication on every tag, which reads as a broken
 workflow rather than as a missing setting on a web page.
 
-**Verified publisher.** The intent is to take `fourdgs` to verified-publisher status under the
-`4dgs.dev` domain, so the package page carries the domain rather than an individual account. That is
-a separate pub.dev setting from automated publishing and gates nothing above; it can be done before
-or after step 2.
+**Verified publisher.** `fourdgs` goes under the **`avala.ai`** publisher, which is verified on
+pub.dev today and owns no packages yet — this will be its first. An earlier version of this section
+named `4dgs.dev`, which would have needed its own domain verification first; `avala.ai` needs none.
+Publisher ownership is a separate setting from automated publishing and gates nothing above.
+
+**Add a second publisher admin before step 1, not after.** `avala.ai` currently has one member. A
+publisher that owns nothing loses little if its sole account goes; a publisher that owns a package
+other code depends on loses the ability to ship a fix, a security update or a retraction. pub.dev
+recovers publisher control through domain verification rather than through support, so the cheap
+moment to fix this is while the publisher is still empty.
 
 ## Pre-1.0
 
