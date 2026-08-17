@@ -242,7 +242,7 @@ jobs:
           size_kb=$(du -s dart | cut -f1)
           echo "dart: ${size_kb} KiB"
           [ "$size_kb" -le 1472 ] || { echo "::error::dart is ${size_kb} KiB, over the 1472 KiB budget"; exit 1; }
-      - name: C++ sources under 704 KB
+      - name: C++ sources under 896 KB
         # New, and the reason it is new is worth stating: every other SDK has had a
         # sub-budget here for some time and C++ never did, so the whole-tree gate above was
         # the only thing that would have caught it growing — which is the gate that cannot
@@ -256,11 +256,18 @@ jobs:
         # the next file. That 608 includes the keyframe-delta encode binding this budget
         # arrives with (#122): the public surface, the seam on both backends, the
         # conformance sequence runner and its gate script.
+        #
+        # 896 after the canonical-order round landed in both bindings (#250, #251). C++
+        # measured 708 against 704 and Swift landed exactly on 704 — the gate went red on
+        # `main` at the merge, not on either pull request, because each was measured
+        # against a `main` that did not yet have the other. Both are raised together and
+        # with room, for the reason the Rust budget above was: a number that fits the tree
+        # in front of you is wrong by the merge after next.
         run: |
           size_kb=$(du -s cpp | cut -f1)
           echo "cpp: ${size_kb} KiB"
-          [ "$size_kb" -le 704 ] || { echo "::error::cpp is ${size_kb} KiB, over the 704 KiB budget"; exit 1; }
-      - name: Swift sources under 704 KB
+          [ "$size_kb" -le 896 ] || { echo "::error::cpp is ${size_kb} KiB, over the 896 KiB budget"; exit 1; }
+      - name: Swift sources under 896 KB
         # Sources only, same as TypeScript's: this job builds nothing, so .build is not
         # here to measure and a vendored dependency would show up as a budget failure.
         # Raised from 300 to 448 KiB for `4dgs`, the inspect-and-validate tool: the
@@ -278,7 +285,7 @@ jobs:
         run: |
           size_kb=$(du -s swift | cut -f1)
           echo "swift: ${size_kb} KiB"
-          [ "$size_kb" -le 704 ] || { echo "::error::swift is ${size_kb} KiB, over the 704 KiB budget"; exit 1; }
+          [ "$size_kb" -le 896 ] || { echo "::error::swift is ${size_kb} KiB, over the 896 KiB budget"; exit 1; }
 
   no-committed-binaries:
     # The corpus is generated. A committed .4dgs means someone bypassed the generator.
