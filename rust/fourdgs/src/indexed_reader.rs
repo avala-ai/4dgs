@@ -790,6 +790,7 @@ pub fn open_indexed<R: Readable + ?Sized>(source: &mut R) -> Result<IndexedScene
 
     let mut header: Option<rec::Header> = None;
     let mut quant: Option<rec::Quantization> = None;
+    let mut saw_window_table = false;
     // Scalar facts let open validate descriptor cross-record claims without retaining
     // every keyframe or fetching one byte of Audio Data payload.
     let mut source_ranges: BTreeMap<u32, AudioSourceFacts> = BTreeMap::new();
@@ -814,6 +815,9 @@ pub fn open_indexed<R: Readable + ?Sized>(source: &mut R) -> Result<IndexedScene
             check_record_count(front_record_count, record.offset, "indexed front matter")?;
             match record.opcode {
                 op::HEADER => {
+                    if header.is_some() {
+                        return Err(Error::duplicate_structural_record("Header", record.offset));
+                    }
                     let live_before_header = indexed_front_live_bytes(
                         &scene,
                         retained_front_bytes,
@@ -871,6 +875,12 @@ pub fn open_indexed<R: Readable + ?Sized>(source: &mut R) -> Result<IndexedScene
                     header = Some(parsed)
                 }
                 op::QUANTIZATION => {
+                    if quant.is_some() {
+                        return Err(Error::duplicate_structural_record(
+                            "Quantization",
+                            record.offset,
+                        ));
+                    }
                     let live_before_quantization = indexed_front_live_bytes(
                         &scene,
                         retained_front_bytes,
@@ -928,6 +938,15 @@ pub fn open_indexed<R: Readable + ?Sized>(source: &mut R) -> Result<IndexedScene
                     quant = Some(parsed)
                 }
                 op::WINDOW_TABLE => {
+                    // A file may legitimately carry a table with no entries, so
+                    // emptiness does not answer "was there a table"; a flag does.
+                    if saw_window_table {
+                        return Err(Error::duplicate_structural_record(
+                            "Window Table",
+                            record.offset,
+                        ));
+                    }
+                    saw_window_table = true;
                     let live_before_windows = indexed_front_live_bytes(
                         &scene,
                         retained_front_bytes,

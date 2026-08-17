@@ -171,6 +171,23 @@ impl Error {
     /// facts. Keeping the variant intact is what lets the C ABI continue distinguishing
     /// malformed input, a cut resource, and a legal resource outside an implementation
     /// ceiling.
+    /// A second Header, Quantization or Window Table record in one file (spec §4).
+    ///
+    /// These three describe the whole file, and nothing in a `.4dgs` file says which of
+    /// two copies wins. A reader that keeps the last silently disagrees with one that
+    /// keeps the first — and both of those readers are in this crate: the streamed
+    /// reader replaced its retained value as each copy arrived, while the indexed opener
+    /// walks the front matter and would keep the first. Same bytes, two scenes.
+    ///
+    /// Spelled once rather than at each of the six call sites, for the reason the
+    /// window-index refusal is spelled once: six spellings is six chances for one of
+    /// them to leave the offset out.
+    pub(crate) fn duplicate_structural_record(record: &str, offset: u64) -> Error {
+        Error::Malformed(format!(
+            "a second {record} record at byte {offset}; a file carries exactly one, and nothing says which of two copies a reader should believe"
+        ))
+    }
+
     pub(crate) fn at_record(self, record: &str, offset: u64) -> Error {
         let context = |message: String| format!("{record} at byte {offset}: {message}");
         match self {

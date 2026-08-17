@@ -598,6 +598,7 @@ fn read_from_with_limits<R: Read>(
     let mut scene = Scene::default();
     let mut header: Option<rec::Header> = None;
     let mut quant: Option<rec::Quantization> = None;
+    let mut saw_window_table = false;
     let mut chunks: Vec<DecodedChunk> = Vec::new();
     let mut chunk_bands: Vec<BTreeMap<u8, DecodedStream>> = Vec::new();
     let mut chunk_band_masks: Vec<u8> = Vec::new();
@@ -1018,6 +1019,9 @@ fn read_from_with_limits<R: Read>(
             }
             match parsed {
                 PrefixRecord::Header(parsed) => {
+                    if header.is_some() {
+                        return Err(Error::duplicate_structural_record("Header", offset));
+                    }
                     crate::registry::check_temporal_model(&parsed.temporal_model)?;
                     retained_record_bytes = replace_streamed_retained_bytes(
                         retained_record_bytes,
@@ -1031,6 +1035,9 @@ fn read_from_with_limits<R: Read>(
                     header = Some(parsed);
                 }
                 PrefixRecord::Quantization(parsed) => {
+                    if quant.is_some() {
+                        return Err(Error::duplicate_structural_record("Quantization", offset));
+                    }
                     crate::registry::check_quantization_scheme(&parsed.scheme)?;
                     retained_record_bytes = replace_streamed_retained_bytes(
                         retained_record_bytes,
@@ -1044,6 +1051,13 @@ fn read_from_with_limits<R: Read>(
                     quant = Some(parsed);
                 }
                 PrefixRecord::WindowTable(parsed) => {
+                    // Tracked with a flag rather than by testing `scene.windows` for
+                    // emptiness: a file may legitimately carry a table with no entries,
+                    // which is not the same thing as carrying no table at all.
+                    if saw_window_table {
+                        return Err(Error::duplicate_structural_record("Window Table", offset));
+                    }
+                    saw_window_table = true;
                     // A gaussian's window index is checked against the table in force when
                     // its Chunk is decoded (spec §5.4). A second table arriving after a
                     // Chunk would reinterpret indices that were already accepted, and a

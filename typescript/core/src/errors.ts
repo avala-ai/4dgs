@@ -98,4 +98,24 @@ export class MalformedFile extends FourdgsError {}
  * Kept distinct from {@link MalformedFile} because the fix is different: an
  * unrecognized-but-legal value needs a codec, a malformed one needs a new file.
  */
+/**
+ * A second Header, Quantization or Window Table record in one file (spec section 4).
+ *
+ * These three describe the whole file, and nothing in a `.4dgs` file says which of two
+ * copies wins. A reader that keeps the last silently disagrees with one that keeps the
+ * first — and both of those readers are in this package: the streamed decoder walks
+ * every record and kept whichever came last, while the indexed decoder scans the front
+ * matter and would keep the first. Same bytes, two scenes.
+ *
+ * Spelled once rather than at each of the six call sites, for the reason the
+ * window-index refusal is spelled once: six spellings is six chances for one of them to
+ * leave the offset out.
+ */
+export function duplicateStructuralRecord(name: string, offset: number): MalformedFile {
+  return new MalformedFile(
+    `a second ${name} record at byte ${offset}; a file carries exactly one, and ` +
+      `nothing says which of two copies a reader should believe`,
+  );
+}
+
 export class UnsupportedCodec extends FourdgsError {}
