@@ -17,6 +17,7 @@ library;
 
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:fourdgs/fourdgs.dart';
@@ -1352,6 +1353,32 @@ void main() {
           Uint8List.sublistView(whole, 0, whole.length - 5),
         ),
         throwsA(isA<FourdgsTruncatedFile>()),
+      );
+    });
+
+    test('a sigma that underflows exp() decodes as the reference does', () {
+      // Not hostile input: a legal file describing a gaussian with a
+      // vanishingly short life. `sigmaBin * sigmaLogStep` drives `exp()` to
+      // exactly zero, `log2(0)` is `-Infinity`, and the clamp below it already
+      // has an answer — the floor class. Dart's `floor()` threw on the
+      // non-finite double before the clamp could run, so this decoder CRASHED
+      // on a file every other SDK reads.
+      //
+      // The expected value is the reference's, not this decoder's previous
+      // output: `mu_steps` in `python/fourdgs/fourdgs/quantization.py` floors to
+      // `-inf` in numpy and clips, giving `stepRef * 2^-10`.
+      expect(muStep(-100000, 1.0, false, 0.004), closeTo(3.90625e-06, 1e-18));
+      expect(muStep(-100000, 1.0, false, 0.004), 0.004 * math.pow(2.0, -10));
+    });
+
+    test('an infinite step still crashes rather than returning infinity', () {
+      // The guard above is deliberately narrow. An infinite `stepRef` is what
+      // §5.3 forbids and the Quantization parse refuses, and it must not be
+      // quietly folded into the floor class — that would return infinity as a
+      // pitch instead of failing.
+      expect(
+        () => muStep(0, 1.0, false, double.infinity),
+        throwsA(isA<UnsupportedError>()),
       );
     });
 

@@ -175,7 +175,32 @@ double muStep(
 ) {
   final sigma = math.exp(sigmaBin * sigmaLogStep);
   final target = neverFades ? stepRef : math.min(stepRef, _muRel * sigma);
-  final cls = _log2(target / stepRef).floor().clamp(_muMinClass, 0);
+  final lg = _log2(target / stepRef);
+  // `-Infinity` when the sigma bin and step drive `exp()` all the way to zero.
+  // That is a legal file describing a gaussian with a vanishingly short life,
+  // not a corrupt one, and the clamp below already has an answer for it: the
+  // floor class. Dart's `floor()` throws `UnsupportedError` on a non-finite
+  // double BEFORE the clamp can run, so this decoder crashed on a file the
+  // reference decodes — `mu_steps` in `quantization.py` floors to `-inf` in
+  // numpy and clips, returning `stepRef * 2^_muMinClass`. Clamped first here so
+  // the two agree; verified numerically against the reference at
+  // `muStep(-100000, 1.0, false, 0.004)`, which is 3.90625e-06 in both.
+  //
+  // `NaN` is deliberately not handled here. It arises when `stepRef` is zero or
+  // negative, which is a degenerate Quantization record rather than a small
+  // gaussian, and what a reader owes such a file is an open question — the
+  // reference propagates `NaN` into every decoded birth time. Left throwing as
+  // it did, and tracked on avala-ai/4dgs#286 rather than settled by a side
+  // effect of this fix.
+  //
+  // Guarded on `stepRef` being finite and positive so that an INFINITE step
+  // keeps crashing rather than quietly returning infinity: §5.3 forbids it, the
+  // Quantization parse refuses it before a file can reach here, and the crash is
+  // what a direct caller gets instead of a silent non-finite pitch.
+  final cls =
+      (lg == double.negativeInfinity && stepRef.isFinite && stepRef > 0)
+          ? _muMinClass
+          : lg.floor().clamp(_muMinClass, 0);
   return stepRef * math.pow(2.0, cls).toDouble();
 }
 
