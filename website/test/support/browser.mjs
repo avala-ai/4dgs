@@ -233,6 +233,19 @@ function makePage(send, sessionId, targetId) {
     async goto(url) {
       await send("Page.navigate", { url }, sessionId);
       await page.waitFor(() => document.readyState === "complete");
+      // `readyState === "complete"` means the document and its subresources loaded, which
+      // on a Docusaurus page is BEFORE React has hydrated: the server-rendered markup is
+      // there, the interactive controls are not. A test that starts driving at that point
+      // races hydration and fails on whichever machine is slow enough that day — locally
+      // it never lost, in CI it lost about a third of the time, with
+      // `Cannot set properties of null (setting 'files')` from a file input that had not
+      // been mounted yet.
+      //
+      // Waiting for the control itself rather than for a timeout: the page is ready when
+      // the thing under test exists, and nothing else is a proxy for that.
+      await page.waitFor(() => document.querySelector('input[type="file"]') !== null, {
+        what: "the viewer's file input to hydrate",
+      });
     },
     /** Evaluate `fn(...args)` in the page and return its value. */
     async evaluate(fn, ...args) {

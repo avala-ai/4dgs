@@ -18,7 +18,10 @@ import {
   Attribute,
   FourdgsError,
   GAUSSIAN_FLAG_NEVER_FADES,
+  MAGIC,
   MalformedFile,
+  Opcode,
+  RECORD_HEADER_BYTES,
   decodeKeyframeDeltaStreamed,
   keyframeDeltaStatesJson,
   stepsFrom,
@@ -217,6 +220,45 @@ describe("keyframe-delta reconstruction matches the canonical statement", () => 
       }
     });
   }
+});
+
+describe("a summary the Footer's CRC disowns is not trusted to seek with", () => {
+  const source = "TenWindows-UseChunkIndex-UseCrc.4dgs";
+
+  /** The offset of the first Chunk Index record's content. */
+  function chunkIndexContentAt(bytes) {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    let at = MAGIC.length;
+    while (at + RECORD_HEADER_BYTES <= bytes.length) {
+      const opcode = view.getUint8(at);
+      const length = Number(view.getBigUint64(at + 1, true));
+      if (opcode === Opcode.ChunkIndex) return at + RECORD_HEADER_BYTES;
+      at += RECORD_HEADER_BYTES + length;
+    }
+    throw new Error("this variant carries no Chunk Index");
+  }
+
+  it("an index whose CRC fails is read front to back instead", async () => {
+    // The dangerous corruption is the quiet one. A byte flipped inside a Chunk Index
+    // entry leaves every chunk offset resolvable and moves the interval they are selected
+    // by, so a reader that trusts the index fetches the wrong chunks for an instant and
+    // draws a scene that looks entirely plausible and is not the file's. The chunks
+    // themselves are untouched, so front-to-back recovers the real scene — which is what
+    // the CRC is for.
+    const whole = variant(source);
+    const bytes = whole.bytes.slice();
+    bytes[chunkIndexContentAt(bytes) + 2] ^= 0xff;
+
+    const untouched = await openScene(new BytesReadable(whole.bytes.slice()));
+    assert.equal(untouched.readMode, "indexed", "the control must actually seek");
+
+    const corrupted = await openScene(new BytesReadable(bytes));
+    assert.equal(corrupted.readMode, "streamed");
+    assert.ok(
+      corrupted.notes.some((line) => line.includes("summary CRC does not match")),
+      `the refusal to trust the index must be stated:\n${corrupted.notes.join("\n")}`,
+    );
+  });
 });
 
 describe("an invalid file is refused in the decoder's own words", () => {

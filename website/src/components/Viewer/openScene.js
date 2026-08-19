@@ -178,8 +178,24 @@ async function openGaussianBirth(source, size) {
   const notes = [];
   try {
     const decoder = await IndexedDecoder.open(source);
-    if (decoder.index.length > 0) return indexedPlayable(decoder, source, notes);
-    notes.push("The file carries no Chunk Index, so it is read front to back instead of seeked.");
+    // A summary CRC that does not match is a reason to stop trusting the index, not a
+    // footnote to render underneath it. The dangerous corruption is the quiet one: an
+    // index whose chunk offsets still resolve but whose `[t0, t1)` have moved selects the
+    // wrong chunks for an instant, and the page draws a scene that looks entirely
+    // plausible and is not the file's. The chunks themselves are untouched in that case,
+    // so reading front to back recovers the real scene — the CRC exists precisely to say
+    // when to do that.
+    if (decoder.summaryCrcOk === false) {
+      notes.push(
+        "The Footer's summary CRC does not match the index it covers, so the index is not " +
+          "trusted and the file is read front to back instead. The chunks are unaffected " +
+          "by that mismatch; only the summary describing them is.",
+      );
+    } else if (decoder.index.length > 0) {
+      return indexedPlayable(decoder, source, notes);
+    } else {
+      notes.push("The file carries no Chunk Index, so it is read front to back instead of seeked.");
+    }
   } catch (error) {
     // An index that cannot be read is a reason to read the file the other way, not a
     // reason to refuse it: a file cut before its Footer has no index and still decodes.
@@ -227,9 +243,6 @@ function indexedPlayable(decoder, source, notes) {
     return set;
   }
 
-  if (decoder.summaryCrcOk === false) {
-    notes.push("The Footer's summary CRC does not match the index it covers.");
-  }
   return {
     readMode: "indexed",
     header,
@@ -437,6 +450,35 @@ async function chunkGateOf(scene, source, size) {
  * about what a Chunk record contains.
  */
 /**
+ * `f64 t0, f64 t1, u32 level, u32 count` — the front of a Chunk record's content (§5.5).
+ *
+ * `parseChunk` is not used for this. It finishes by taking the record's attribute streams
+ * as a length-prefixed blob, so it needs the whole content and throws on a prefix — which
+ * is exactly what must not be read here. A legal file may hold its entire scene in one
+ * chunk, and checking that chunk's interval must not cost the scene a second time after
+ * the streamed decode has already paid for it.
+ *
+ * The three fields this returns are all any caller here wants, and they sit in the first
+ * 24 bytes, ahead of the variable-length compression name.
+ */
+const CHUNK_HEAD_BYTES = 24;
+
+function chunkHeadOf(content) {
+  if (content.length < CHUNK_HEAD_BYTES) {
+    throw new MalformedFile(
+      `a Chunk record's content is ${content.length} bytes, too short for the ` +
+        `${CHUNK_HEAD_BYTES}-byte interval and count at its front`,
+    );
+  }
+  const view = new DataView(content.buffer, content.byteOffset, content.byteLength);
+  return {
+    t0: view.getFloat64(0, true),
+    t1: view.getFloat64(8, true),
+    count: view.getUint32(20, true),
+  };
+}
+
+/**
  * The chunk gate built from the Chunk records themselves, for a file with no index.
  *
  * No index is not the same as no intervals. §5.5 puts `t0` and `t1` at the very front of
@@ -454,11 +496,6 @@ async function chunkGateOf(scene, source, size) {
  * cannot support the gate.
  */
 async function chunkGateFromRecords(source, size, count) {
-  // `parseChunk` reads f64 t0, f64 t1, u32 level, u32 count, a length-prefixed compression
-  // name, then u64 uncompressed_size: 36 bytes plus the name. 128 covers every name the
-  // registry defines with room to spare, and a name longer than that lands in the catch
-  // below as a file this gate declines rather than as a wrong answer.
-  const CHUNK_PREFIX_BYTES = 128;
   const t0 = new Float64Array(count);
   const t1 = new Float64Array(count);
   let at = MAGIC.length;
@@ -474,9 +511,9 @@ async function chunkGateFromRecords(source, size, count) {
       const contentLength = Number(view.getBigUint64(1, true));
       if (contentLength < 0 || at + RECORD_HEADER_BYTES + contentLength > size) break;
       if (opcode === Opcode.Chunk) {
-        const wanted = Math.min(contentLength, CHUNK_PREFIX_BYTES);
+        const wanted = Math.min(contentLength, CHUNK_HEAD_BYTES);
         const prefix = await source.read(BigInt(at + RECORD_HEADER_BYTES), BigInt(wanted));
-        const { header } = parseChunk(prefix);
+        const header = chunkHeadOf(prefix);
         if (filled + header.count > count) {
           return {
             gate: null,
@@ -521,15 +558,21 @@ async function chunkDisagreement(entry, source, size) {
   }
   let parsed;
   try {
-    const blob = await source.read(BigInt(chunkOffset), BigInt(chunkLength));
-    const record = readRecord(new Cursor(blob, 0, chunkOffset));
-    if (record.opcode !== Opcode.Chunk) {
+    // The framing plus the head of the content, never `chunkLength`. This runs to check a
+    // header, and a legal file may hold its whole scene in one chunk — reading that chunk
+    // to look at its first 36 bytes would allocate the scene a second time, after the
+    // streamed decode has already paid for it once.
+    const wanted = Math.min(chunkLength, RECORD_HEADER_BYTES + CHUNK_HEAD_BYTES);
+    const blob = await source.read(BigInt(chunkOffset), BigInt(wanted));
+    const view = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
+    const opcode = view.getUint8(0);
+    if (opcode !== Opcode.Chunk) {
       return (
         `Chunk Index points at offset ${chunkOffset}, which holds opcode ` +
-        `0x${record.opcode.toString(16)} rather than a Chunk.`
+        `0x${opcode.toString(16)} rather than a Chunk.`
       );
     }
-    parsed = parseChunk(record.content);
+    parsed = { header: chunkHeadOf(blob.subarray(RECORD_HEADER_BYTES)) };
   } catch (error) {
     return `Chunk Index entry at offset ${chunkOffset} could not be read back: ${error.message}`;
   }
@@ -630,6 +673,10 @@ async function openKeyframeDeltaIndexed(source) {
       }
       return [];
     },
+    // Required by the playable contract and read every frame by the readout, so omitting
+    // it is not a missing statistic — it throws in the animation loop and freezes
+    // playback on the first frame.
+    transfer: () => transferOf(source),
     notes,
   };
 }
